@@ -13,6 +13,11 @@ find_package(ZLIB REQUIRED)
 
 set(MINIMAP2_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external/minimap2)
 set(MINIMAP2_LIB ${MINIMAP2_DIR}/libminimap2.a)
+if(NOT EXISTS ${MINIMAP2_DIR}/minimap.h OR NOT EXISTS ${MINIMAP2_DIR}/Makefile)
+    message(FATAL_ERROR
+        "Missing minimap2 sources in external/minimap2. "
+        "Run: git submodule update --init --recursive")
+endif()
 find_program(MINIMAP2_MAKE NAMES make gmake REQUIRED)
 set(MINIMAP2_MAKE_ARGS)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64|ARM64)$")
