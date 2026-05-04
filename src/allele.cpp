@@ -2994,18 +2994,7 @@ struct DupRefinementDebug {
         return out;
     }
 
-    auto evaluate = [&](const std::string& query, bool reverse, std::size_t start, std::size_t win_len) {
-        if (win_len == 0 || start >= reference_seq.size() || start + win_len > reference_seq.size()) {
-            return;
-        }
-        const std::string window = reference_seq.substr(start, win_len);
-        const std::size_t max_len = std::max(query.size(), window.size());
-        const int allowed = allowed_max_edits(min_similarity, max_len);
-        const int d = bounded_levenshtein_distance(query, window, allowed);
-        if (d > allowed) {
-            return;
-        }
-        const double sim = 1.0 - (static_cast<double>(d) / static_cast<double>(std::max<std::size_t>(1, max_len)));
+    auto update_best = [&](double sim, int d, bool reverse, std::size_t start, std::size_t win_len) {
         if (!out.found ||
             sim > out.best_similarity + 1e-12 ||
             (std::abs(sim - out.best_similarity) <= 1e-12 && d < out.best_edit_distance)) {
@@ -3018,19 +3007,106 @@ struct DupRefinementDebug {
         }
     };
 
+    auto evaluate = [&](const std::string& query,
+                        const std::vector<std::uint64_t>& query_sketch,
+                        bool use_sketch_eval,
+                        bool reverse,
+                        std::size_t start,
+                        std::size_t win_len,
+                        double approx_min_similarity) {
+        if (win_len == 0 || start >= reference_seq.size() || start + win_len > reference_seq.size()) {
+            return;
+        }
+
+        const std::size_t max_len = std::max(query.size(), win_len);
+        if (use_sketch_eval) {
+            if (query_sketch.empty()) {
+                return;
+            }
+            constexpr std::size_t kSketchK = 15;
+            constexpr std::size_t kSketchSize = 256;
+            const std::string window = reference_seq.substr(start, win_len);
+            const auto window_sketch = build_sequence_minhash_sketch(window, kSketchK, kSketchSize);
+            if (window_sketch.empty()) {
+                return;
+            }
+            const double jacc = sketch_jaccard(query_sketch, window_sketch);
+            const double sim = estimate_identity_from_jaccard(jacc);
+            if (sim + 1e-12 < approx_min_similarity) {
+                return;
+            }
+            const int d_est = static_cast<int>(std::llround(
+                (1.0 - sim) * static_cast<double>(std::max<std::size_t>(1, max_len))));
+            update_best(sim, d_est, reverse, start, win_len);
+            return;
+        }
+
+        const std::string window = reference_seq.substr(start, win_len);
+        const int allowed = allowed_max_edits(min_similarity, max_len);
+        const int d = bounded_levenshtein_distance(query, window, allowed);
+        if (d > allowed) {
+            return;
+        }
+        const double sim = 1.0 - (static_cast<double>(d) / static_cast<double>(std::max<std::size_t>(1, max_len)));
+        update_best(sim, d, reverse, start, win_len);
+    };
+
     auto search_orientation = [&](const std::string& query, bool reverse) {
         const std::size_t qlen = query.size();
-        const std::size_t k = std::clamp<std::size_t>(qlen / 10, 9, 17);
-        std::vector<std::size_t> starts = candidate_dup_starts_from_kmers(query, reference_seq, k, 128);
+        constexpr std::size_t kMaxDpQueryBp = 5000;
+        constexpr std::size_t kSmallSeedCandidates = 128;
+        constexpr std::size_t kLargeSeedCandidates = 24;
+        constexpr double kLargeApproxSlack = 0.05;
 
-        const std::vector<double> len_scales = {0.8, 0.9, 1.0, 1.1, 1.2};
-        const std::size_t jitter = std::max<std::size_t>(4, qlen / 20);
-        const std::vector<long long> shifts = {
-            -static_cast<long long>(2 * jitter),
-            -static_cast<long long>(jitter),
-            0,
-            static_cast<long long>(jitter),
-            static_cast<long long>(2 * jitter)};
+        const bool use_sketch_eval =
+            (qlen > kMaxDpQueryBp || qlen > (reference_seq.size() / 2));
+        const std::size_t max_candidates = use_sketch_eval ? kLargeSeedCandidates : kSmallSeedCandidates;
+        const double approx_min_similarity = std::clamp(min_similarity - kLargeApproxSlack, 0.0, 1.0);
+
+        std::vector<std::uint64_t> query_sketch;
+        if (use_sketch_eval) {
+            constexpr std::size_t kSketchK = 15;
+            constexpr std::size_t kSketchSize = 256;
+            query_sketch = build_sequence_minhash_sketch(query, kSketchK, kSketchSize);
+        }
+
+        const std::size_t k = std::clamp<std::size_t>(qlen / 10, 9, 17);
+        std::vector<std::size_t> starts = candidate_dup_starts_from_kmers(query, reference_seq, k, max_candidates);
+
+        if (use_sketch_eval && starts.empty()) {
+            if (reference_seq.size() > qlen) {
+                const std::size_t max_start = reference_seq.size() - qlen;
+                const std::size_t coarse = 12;
+                const std::size_t step = std::max<std::size_t>(1, max_start / coarse);
+                for (std::size_t s = 0; s <= max_start && starts.size() < coarse; s += step) {
+                    starts.push_back(s);
+                }
+                if (starts.empty() || starts.back() != max_start) {
+                    starts.push_back(max_start);
+                }
+            } else {
+                starts.push_back(0);
+            }
+        }
+
+        const std::vector<double> len_scales = use_sketch_eval
+            ? std::vector<double>{0.9, 1.0, 1.1}
+            : std::vector<double>{0.8, 0.9, 1.0, 1.1, 1.2};
+
+        const std::size_t jitter = use_sketch_eval
+            ? std::max<std::size_t>(8, qlen / 40)
+            : std::max<std::size_t>(4, qlen / 20);
+        const std::vector<long long> shifts = use_sketch_eval
+            ? std::vector<long long>{
+                -static_cast<long long>(jitter),
+                0,
+                static_cast<long long>(jitter)}
+            : std::vector<long long>{
+                -static_cast<long long>(2 * jitter),
+                -static_cast<long long>(jitter),
+                0,
+                static_cast<long long>(jitter),
+                static_cast<long long>(2 * jitter)};
 
         for (const std::size_t base_start : starts) {
             for (const auto scale : len_scales) {
@@ -3045,20 +3121,22 @@ struct DupRefinementDebug {
                     const std::size_t start = (shifted < 0)
                                                   ? 0
                                                   : std::min<std::size_t>(static_cast<std::size_t>(shifted), max_start);
-                    evaluate(query, reverse, start, win_len);
+                    evaluate(query, query_sketch, use_sketch_eval, reverse, start, win_len, approx_min_similarity);
                 }
             }
         }
 
         // Fallback if k-mer seeds miss highly diverged duplicates.
         if (!out.found && qlen <= reference_seq.size()) {
-            const std::size_t step = std::max<std::size_t>(1, qlen / 10);
+            const std::size_t step = use_sketch_eval
+                ? std::max<std::size_t>(1, (reference_seq.size() - qlen) / 12)
+                : std::max<std::size_t>(1, qlen / 10);
             const std::size_t win_len = qlen;
             for (std::size_t start = 0; start + win_len <= reference_seq.size(); start += step) {
-                evaluate(query, reverse, start, win_len);
+                evaluate(query, query_sketch, use_sketch_eval, reverse, start, win_len, approx_min_similarity);
             }
             const std::size_t last_start = reference_seq.size() - win_len;
-            evaluate(query, reverse, last_start, win_len);
+            evaluate(query, query_sketch, use_sketch_eval, reverse, last_start, win_len, approx_min_similarity);
         }
     };
 
@@ -3088,6 +3166,106 @@ struct DupRefinementDebug {
     search_orientation(inserted_seq, false);
     search_orientation(inserted_rc, true);
     return out;
+}
+std::string inserted_sequence_for_event(
+    const AtomicVariantEvent& ev,
+    const std::string& alt_seq) {
+
+    if (!ev.inserted_seq.empty()) {
+        return ev.inserted_seq;
+    }
+    if (ev.alt_offset_end_bp > ev.alt_offset_start_bp &&
+        ev.alt_offset_end_bp <= alt_seq.size()) {
+        return alt_seq.substr(ev.alt_offset_start_bp, ev.alt_offset_end_bp - ev.alt_offset_start_bp);
+    }
+    return {};
+}
+
+void classify_insertion_events(
+    std::vector<AtomicVariantEvent>& events,
+    const std::string& ref_seq,
+    const std::string& alt_seq,
+    bool classify_ins) {
+
+    constexpr double kDupMinSimilarity = 0.75;
+    constexpr std::size_t kTandemWindowBp = 1000;
+    for (auto& ev : events) {
+        if (ev.event_type != "INS") {
+            continue;
+        }
+        if (!classify_ins) {
+            continue;
+        }
+        ev.event_subtype = "NOVEL";
+
+        const std::string inserted_seq = inserted_sequence_for_event(ev, alt_seq);
+        if (inserted_seq.empty()) {
+            continue;
+        }
+        ev.inserted_bp = std::max(ev.inserted_bp, inserted_seq.size());
+
+        const DupSearchResult dup = classify_dup_like_insert(
+            inserted_seq,
+            ref_seq,
+            kDupMinSimilarity);
+        if (!dup.found || dup.ref_end_bp <= dup.ref_start_bp) {
+            continue;
+        }
+
+        ev.has_dup_evidence = true;
+        ev.dup_best_similarity = dup.best_similarity;
+        ev.dup_ref_start_bp = dup.ref_start_bp;
+        ev.dup_ref_end_bp = dup.ref_end_bp;
+        ev.dup_orientation = dup.reverse ? '-' : '+';
+        ev.dup_unit_bp = std::max<std::size_t>(1, dup.ref_end_bp - dup.ref_start_bp);
+
+        const std::size_t anchor = std::min(ev.ref_offset_start_bp, ref_seq.size());
+        const std::size_t local_lo = (anchor > kTandemWindowBp) ? (anchor - kTandemWindowBp) : 0;
+        const std::size_t local_hi = std::min<std::size_t>(ref_seq.size(), anchor + kTandemWindowBp);
+        const bool local_dup =
+            (ev.dup_ref_start_bp < local_hi) && (ev.dup_ref_end_bp > local_lo);
+        if (local_dup) {
+            ev.event_subtype = dup.reverse ? "DUP_TANDEM_INV" : "DUP_TANDEM";
+        } else {
+            ev.event_subtype = dup.reverse ? "DUP_INTERSPERSED_INV" : "DUP_INTERSPERSED";
+        }
+
+        const std::size_t unit_start = std::min(ev.dup_ref_start_bp, ref_seq.size());
+        const std::size_t unit_end = std::min(ev.dup_ref_end_bp, ref_seq.size());
+        std::string unit_seq;
+        if (unit_end > unit_start) {
+            unit_seq = ref_seq.substr(unit_start, unit_end - unit_start);
+        }
+
+        std::size_t ref_cn = 1;
+        std::size_t alt_cn_obs = 0;
+        if (!unit_seq.empty()) {
+            const DupCopyCountEstimate ref_est = estimate_dup_copy_count(unit_seq, ref_seq);
+            const DupCopyCountEstimate alt_est = estimate_dup_copy_count(unit_seq, alt_seq);
+            if (ref_est.valid && ref_est.copy_count > 0) {
+                ref_cn = ref_est.copy_count;
+            }
+            if (alt_est.valid) {
+                alt_cn_obs = alt_est.copy_count;
+            }
+        }
+
+        const std::size_t added_by_length = std::max<std::size_t>(
+            1,
+            static_cast<std::size_t>(std::llround(
+                static_cast<double>(inserted_seq.size()) /
+                static_cast<double>(std::max<std::size_t>(1, ev.dup_unit_bp)))));
+        std::size_t alt_cn = (alt_cn_obs >= ref_cn) ? alt_cn_obs : (ref_cn + added_by_length);
+        alt_cn = std::max<std::size_t>(alt_cn, ref_cn + added_by_length);
+
+        ev.dup_ref_copy_number = ref_cn;
+        ev.dup_alt_copy_number = alt_cn;
+        ev.dup_added_copies = (alt_cn > ref_cn) ? (alt_cn - ref_cn) : 0;
+        ev.dup_copy_ratio = (ref_cn > 0)
+            ? (static_cast<double>(alt_cn) / static_cast<double>(ref_cn))
+            : 0.0;
+        ev.cn_delta = static_cast<int>(ev.dup_added_copies);
+    }
 }
 
 [[maybe_unused]] std::vector<DotplotPoint> collect_dotplot_points(
@@ -4625,8 +4803,18 @@ void write_cluster_pairwise_vcf(
     out << "##INFO=<ID=CLUSTER_ID,Number=1,Type=Integer,Description=\"Cluster identifier within bubble\">\n";
     out << "##INFO=<ID=REF_CLUSTER_ID,Number=1,Type=Integer,Description=\"Reference cluster identifier within bubble\">\n";
     out << "##INFO=<ID=EVENT,Number=1,Type=String,Description=\"panvar event type\">\n";
+    out << "##INFO=<ID=INS_SUBTYPE,Number=1,Type=String,Description=\"INS subtype (NOVEL or DUP-like subtype)\">\n";
     out << "##INFO=<ID=ORIENT,Number=1,Type=String,Description=\"Best orientation of cluster vs reference\">\n";
     out << "##INFO=<ID=BEST_NORM_ED,Number=1,Type=Float,Description=\"Best normalized edit distance to reference cluster\">\n";
+    out << "##INFO=<ID=DUP_SIM,Number=1,Type=Float,Description=\"Best similarity of inserted sequence to duplicated source candidate\">\n";
+    out << "##INFO=<ID=DUP_REF_START,Number=1,Type=Integer,Description=\"1-based start of duplicated source interval on reference\">\n";
+    out << "##INFO=<ID=DUP_REF_END,Number=1,Type=Integer,Description=\"1-based end of duplicated source interval on reference\">\n";
+    out << "##INFO=<ID=DUP_ORIENT,Number=1,Type=String,Description=\"Orientation of duplicated source match (+/-)\">\n";
+    out << "##INFO=<ID=DUP_UNIT_BP,Number=1,Type=Integer,Description=\"Duplicated source unit length in bp\">\n";
+    out << "##INFO=<ID=DUP_REF_CN,Number=1,Type=Integer,Description=\"Estimated reference copy number of duplication unit\">\n";
+    out << "##INFO=<ID=DUP_ALT_CN,Number=1,Type=Integer,Description=\"Estimated ALT copy number of duplication unit\">\n";
+    out << "##INFO=<ID=DUP_ADDED,Number=1,Type=Integer,Description=\"Estimated number of added copies in ALT\">\n";
+    out << "##INFO=<ID=DUP_COPY_RATIO,Number=1,Type=Float,Description=\"Estimated ALT/REF copy ratio for duplication unit\">\n";
     out << "##INFO=<ID=INSSEQ,Number=1,Type=String,Description=\"Inserted sequence\">\n";
     out << "##INFO=<ID=DELSEQ,Number=1,Type=String,Description=\"Deleted sequence from reference\">\n";
     out << "##INFO=<ID=INVSEQ,Number=1,Type=String,Description=\"Inverted reference sequence\">\n";
@@ -4682,8 +4870,22 @@ void write_cluster_pairwise_vcf(
             << ";CLUSTER_ID=" << cluster_id
             << ";REF_CLUSTER_ID=" << reference_cluster_id
             << ";EVENT=" << ev.event_type
+            << ";INS_SUBTYPE=" << ev.event_subtype
             << ";ORIENT=" << orientation
             << ";BEST_NORM_ED=" << std::fixed << std::setprecision(6) << best_norm;
+        if (ev.has_dup_evidence) {
+            const std::size_t dup_start_1based = region_start_1based + ev.dup_ref_start_bp;
+            const std::size_t dup_end_1based = region_start_1based + ev.dup_ref_end_bp;
+            out << ";DUP_SIM=" << std::fixed << std::setprecision(6) << ev.dup_best_similarity
+                << ";DUP_REF_START=" << dup_start_1based
+                << ";DUP_REF_END=" << dup_end_1based
+                << ";DUP_ORIENT=" << ev.dup_orientation
+                << ";DUP_UNIT_BP=" << ev.dup_unit_bp
+                << ";DUP_REF_CN=" << ev.dup_ref_copy_number
+                << ";DUP_ALT_CN=" << ev.dup_alt_copy_number
+                << ";DUP_ADDED=" << ev.dup_added_copies
+                << ";DUP_COPY_RATIO=" << std::fixed << std::setprecision(6) << ev.dup_copy_ratio;
+        }
         if (!event_seq.empty()) {
             if (svtype == "INS") {
                 out << ";INSSEQ=" << event_seq;
@@ -4817,7 +5019,8 @@ VariantBubbleReport write_variant_reports_for_bubble(
     const std::string& minimap_preset,
     std::size_t minimap_best_n,
     bool minimap_emit_secondary,
-    bool split_ins_use_geometric_svlen) {
+    bool split_ins_use_geometric_svlen,
+    bool classify_ins) {
 
     VariantBubbleReport report;
     if (unique_alleles.empty() || clusters.empty()) {
@@ -5139,6 +5342,9 @@ VariantBubbleReport write_variant_reports_for_bubble(
                 ev.cn_delta = 0;
             }
         }
+        if (classify_ins) {
+            classify_insertion_events(atomic_events, ref_seq, cmp_seq, true);
+        }
 
         if (write_debug_files && !cluster_debug_dir.empty()) {
             const std::string dot_svg = cluster_debug_dir + "/dotplot.svg";
@@ -5202,6 +5408,16 @@ VariantBubbleReport write_variant_reports_for_bubble(
                 row.representative_haplotype = representative_haplotype;
                 row.cn_delta = ev.cn_delta;
                 row.preserve_ins_svlen = ev.preserve_ins_svlen;
+                row.has_dup_evidence = ev.has_dup_evidence;
+                row.dup_best_similarity = ev.dup_best_similarity;
+                row.dup_ref_start_bp = ev.dup_ref_start_bp;
+                row.dup_ref_end_bp = ev.dup_ref_end_bp;
+                row.dup_orientation = ev.dup_orientation;
+                row.dup_unit_bp = ev.dup_unit_bp;
+                row.dup_ref_copy_number = ev.dup_ref_copy_number;
+                row.dup_added_copies = ev.dup_added_copies;
+                row.dup_alt_copy_number = ev.dup_alt_copy_number;
+                row.dup_copy_ratio = ev.dup_copy_ratio;
                 report.vcf_rows.push_back(std::move(row));
             }
         }
@@ -5251,6 +5467,7 @@ void write_region_level_vcf(
         std::size_t event_index = 0;
         std::size_t reference_cluster_id = 0;
         std::string event_type;
+        std::string event_subtype = ".";
         std::string orientation;
         long long length_delta = 0;
         double best_norm = 0.0;
@@ -5263,6 +5480,16 @@ void write_region_level_vcf(
         std::string ref_base = "N";
         std::string event_sequence;
         bool preserve_ins_svlen = false;
+        bool has_dup_evidence = false;
+        double dup_best_similarity = 0.0;
+        std::size_t dup_ref_start_bp = 0;
+        std::size_t dup_ref_end_bp = 0;
+        char dup_orientation = '+';
+        std::size_t dup_unit_bp = 0;
+        std::size_t dup_ref_copy_number = 0;
+        std::size_t dup_added_copies = 0;
+        std::size_t dup_alt_copy_number = 0;
+        double dup_copy_ratio = 0.0;
     };
 
     std::string merge_mode_lower = merge_mode;
@@ -5337,6 +5564,7 @@ void write_region_level_vcf(
             pending.event_index = row.event_index;
             pending.reference_cluster_id = bubble.reference_cluster_id;
             pending.event_type = row.event_type;
+            pending.event_subtype = row.event_subtype;
             pending.orientation = row.orientation;
             pending.length_delta = row.length_delta;
             pending.best_norm = row.best_edit_distance_norm;
@@ -5344,6 +5572,16 @@ void write_region_level_vcf(
             pending.support = row.cluster_path_support;
             pending.member_alleles = row.member_alleles;
             pending.preserve_ins_svlen = row.preserve_ins_svlen;
+            pending.has_dup_evidence = row.has_dup_evidence;
+            pending.dup_best_similarity = row.dup_best_similarity;
+            pending.dup_ref_start_bp = row.dup_ref_start_bp;
+            pending.dup_ref_end_bp = row.dup_ref_end_bp;
+            pending.dup_orientation = row.dup_orientation;
+            pending.dup_unit_bp = row.dup_unit_bp;
+            pending.dup_ref_copy_number = row.dup_ref_copy_number;
+            pending.dup_added_copies = row.dup_added_copies;
+            pending.dup_alt_copy_number = row.dup_alt_copy_number;
+            pending.dup_copy_ratio = row.dup_copy_ratio;
 
             const std::size_t start_off = std::min(row.ref_offset_start_bp, row.ref_offset_end_bp);
             const std::size_t end_off = std::max(row.ref_offset_start_bp, row.ref_offset_end_bp);
@@ -5410,6 +5648,10 @@ void write_region_level_vcf(
             return false;
         }
         if (seed.event_type != row.event_type) {
+            return false;
+        }
+        if (seed.event_subtype != row.event_subtype &&
+            (seed.event_subtype != "." || row.event_subtype != ".")) {
             return false;
         }
         const std::size_t pos_gap = (seed.pos_1based > row.pos_1based)
@@ -5479,6 +5721,21 @@ void write_region_level_vcf(
         }
         group.seed.end_1based = std::max(group.seed.end_1based, row.end_1based);
         group.seed.best_norm = std::min(group.seed.best_norm, row.best_norm);
+        if ((!group.seed.has_dup_evidence && row.has_dup_evidence) ||
+            (group.seed.has_dup_evidence && row.has_dup_evidence &&
+             row.dup_best_similarity > group.seed.dup_best_similarity)) {
+            group.seed.event_subtype = row.event_subtype;
+            group.seed.has_dup_evidence = row.has_dup_evidence;
+            group.seed.dup_best_similarity = row.dup_best_similarity;
+            group.seed.dup_ref_start_bp = row.dup_ref_start_bp;
+            group.seed.dup_ref_end_bp = row.dup_ref_end_bp;
+            group.seed.dup_orientation = row.dup_orientation;
+            group.seed.dup_unit_bp = row.dup_unit_bp;
+            group.seed.dup_ref_copy_number = row.dup_ref_copy_number;
+            group.seed.dup_added_copies = row.dup_added_copies;
+            group.seed.dup_alt_copy_number = row.dup_alt_copy_number;
+            group.seed.dup_copy_ratio = row.dup_copy_ratio;
+        }
         if (row.event_type == "INS" &&
             row.preserve_ins_svlen &&
             row.length_delta > group.seed.length_delta) {
@@ -5490,6 +5747,17 @@ void write_region_level_vcf(
             group.seed.length_delta = row.length_delta;
             group.seed.inserted_bp = row.inserted_bp;
             group.seed.preserve_ins_svlen = row.preserve_ins_svlen;
+            group.seed.event_subtype = row.event_subtype;
+            group.seed.has_dup_evidence = row.has_dup_evidence;
+            group.seed.dup_best_similarity = row.dup_best_similarity;
+            group.seed.dup_ref_start_bp = row.dup_ref_start_bp;
+            group.seed.dup_ref_end_bp = row.dup_ref_end_bp;
+            group.seed.dup_orientation = row.dup_orientation;
+            group.seed.dup_unit_bp = row.dup_unit_bp;
+            group.seed.dup_ref_copy_number = row.dup_ref_copy_number;
+            group.seed.dup_added_copies = row.dup_added_copies;
+            group.seed.dup_alt_copy_number = row.dup_alt_copy_number;
+            group.seed.dup_copy_ratio = row.dup_copy_ratio;
         }
     }
 
@@ -5517,9 +5785,19 @@ void write_region_level_vcf(
     out << "##INFO=<ID=BUBBLE_ID,Number=1,Type=Integer,Description=\"panvar bubble identifier\">\n";
     out << "##INFO=<ID=REF_CLUSTER_ID,Number=1,Type=Integer,Description=\"Reference cluster identifier within bubble\">\n";
     out << "##INFO=<ID=EVENT,Number=1,Type=String,Description=\"panvar event type\">\n";
+    out << "##INFO=<ID=INS_SUBTYPE,Number=1,Type=String,Description=\"INS subtype (NOVEL or DUP-like subtype)\">\n";
     out << "##INFO=<ID=ORIENT,Number=1,Type=String,Description=\"Best orientation of cluster vs reference\">\n";
     out << "##INFO=<ID=BEST_NORM_ED,Number=1,Type=Float,Description=\"Best normalized edit distance to reference cluster\">\n";
     out << "##INFO=<ID=INS_BP,Number=1,Type=Integer,Description=\"Inserted bp size\">\n";
+    out << "##INFO=<ID=DUP_SIM,Number=1,Type=Float,Description=\"Best similarity of inserted sequence to duplicated source candidate\">\n";
+    out << "##INFO=<ID=DUP_REF_START,Number=1,Type=Integer,Description=\"1-based start of duplicated source interval on reference\">\n";
+    out << "##INFO=<ID=DUP_REF_END,Number=1,Type=Integer,Description=\"1-based end of duplicated source interval on reference\">\n";
+    out << "##INFO=<ID=DUP_ORIENT,Number=1,Type=String,Description=\"Orientation of duplicated source match (+/-)\">\n";
+    out << "##INFO=<ID=DUP_UNIT_BP,Number=1,Type=Integer,Description=\"Duplicated source unit length in bp\">\n";
+    out << "##INFO=<ID=DUP_REF_CN,Number=1,Type=Integer,Description=\"Estimated reference copy number of duplication unit\">\n";
+    out << "##INFO=<ID=DUP_ALT_CN,Number=1,Type=Integer,Description=\"Estimated ALT copy number of duplication unit\">\n";
+    out << "##INFO=<ID=DUP_ADDED,Number=1,Type=Integer,Description=\"Estimated number of added copies in ALT\">\n";
+    out << "##INFO=<ID=DUP_COPY_RATIO,Number=1,Type=Float,Description=\"Estimated ALT/REF copy ratio for duplication unit\">\n";
     out << "##INFO=<ID=SUPPORT,Number=1,Type=Integer,Description=\"Total path support for merged event\">\n";
     out << "##INFO=<ID=CLUSTERS,Number=.,Type=Integer,Description=\"Cluster IDs carrying this merged event\">\n";
     out << "##INFO=<ID=MERGED_EVENTS,Number=.,Type=String,Description=\"Merged member event IDs (C<cluster>E<event>)\">\n";
@@ -5593,12 +5871,26 @@ void write_region_level_vcf(
             << ";BUBBLE_ID=" << group.seed.bubble_id
             << ";REF_CLUSTER_ID=" << group.seed.reference_cluster_id
             << ";EVENT=" << group.seed.event_type
+            << ";INS_SUBTYPE=" << group.seed.event_subtype
             << ";ORIENT=" << group.seed.orientation
             << ";BEST_NORM_ED=" << std::fixed << std::setprecision(6) << group.seed.best_norm
             << ";INS_BP=" << group.seed.inserted_bp
             << ";SUPPORT=" << group.support_total
             << ";CLUSTERS=" << clusters_csv.str()
             << ";MERGED_EVENTS=" << merged_events_csv.str();
+        if (group.seed.has_dup_evidence) {
+            const std::size_t dup_start_1based = region_start_1based + group.seed.dup_ref_start_bp;
+            const std::size_t dup_end_1based = region_start_1based + group.seed.dup_ref_end_bp;
+            out << ";DUP_SIM=" << std::fixed << std::setprecision(6) << group.seed.dup_best_similarity
+                << ";DUP_REF_START=" << dup_start_1based
+                << ";DUP_REF_END=" << dup_end_1based
+                << ";DUP_ORIENT=" << group.seed.dup_orientation
+                << ";DUP_UNIT_BP=" << group.seed.dup_unit_bp
+                << ";DUP_REF_CN=" << group.seed.dup_ref_copy_number
+                << ";DUP_ALT_CN=" << group.seed.dup_alt_copy_number
+                << ";DUP_ADDED=" << group.seed.dup_added_copies
+                << ";DUP_COPY_RATIO=" << std::fixed << std::setprecision(6) << group.seed.dup_copy_ratio;
+        }
         if (!group.seed.event_sequence.empty()) {
             if (svtype == "INS") {
                 out << ";INSSEQ=" << group.seed.event_sequence;
@@ -6097,7 +6389,8 @@ VariantBubbleReport write_variant_reports_for_bubble(
     const std::string& minimap_preset,
     std::size_t minimap_best_n,
     bool minimap_emit_secondary,
-    bool split_ins_use_geometric_svlen) {
+    bool split_ins_use_geometric_svlen,
+    bool classify_ins) {
     return (*kWriteVariantReportsForBubbleImpl)(
         bubble,
         unique_alleles,
@@ -6114,7 +6407,8 @@ VariantBubbleReport write_variant_reports_for_bubble(
         minimap_preset,
         minimap_best_n,
         minimap_emit_secondary,
-        split_ins_use_geometric_svlen);
+        split_ins_use_geometric_svlen,
+        classify_ins);
 }
 
 void write_region_level_vcf(
@@ -6691,7 +6985,8 @@ void call_alleles_to_csv(
                 options.minimap_preset,
                 options.minimap_best_n,
                 options.minimap_emit_secondary,
-                options.split_ins_use_geometric_svlen);
+                options.split_ins_use_geometric_svlen,
+                options.classify_ins);
 
             summary.debug_reports_written += report.debug_reports_written;
             summary.dotplots_written += report.dotplots_written;

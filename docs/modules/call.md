@@ -19,7 +19,7 @@ For each bubble, cluster representatives are compared to the reference-cluster r
 - `DEL`
 - `INV`
 
-INS subtyping (for example INS vs DUP-like) is intentionally deferred.
+Optional INS subtyping/copy-number annotation can be enabled with `--classify-ins`.
 
 ## Required inputs
 
@@ -48,8 +48,9 @@ For each bubble:
 7. If no SV-sized indel is found but there is a large net length shift, recover one net `INS` or `DEL` from prefix/suffix decomposition.
 8. Add `INV` when reverse orientation is selected with sufficiently low normalized edit distance.
 9. Merge nearby concordant events within the same cluster.
-10. Keep events passing `--min-sv-bp` (default `50`).
-11. Merge equivalent events across clusters before writing VCF (same type, nearby coordinates, similar sequence).
+10. Optional (`--classify-ins`): classify `INS` as `NOVEL` vs DUP-like subtype and estimate copy number fields.
+11. Keep events passing `--min-sv-bp` (default `50`).
+12. Merge equivalent events across clusters before writing VCF (same type, nearby coordinates, similar sequence).
 
 ## Within-cluster merge rule (important)
 
@@ -123,8 +124,10 @@ Notes:
 ## VCF INFO fields (key)
 
 - `SVTYPE`, `SVLEN`, `END`
-- `EVENT`, `ORIENT`, `BEST_NORM_ED`
+- `EVENT`, `INS_SUBTYPE`, `ORIENT`, `BEST_NORM_ED`
 - `INSSEQ` / `DELSEQ` / `INVSEQ`
+- `DUP_SIM`, `DUP_REF_START`, `DUP_REF_END`, `DUP_ORIENT`, `DUP_UNIT_BP`
+- `DUP_REF_CN`, `DUP_ALT_CN`, `DUP_ADDED`, `DUP_COPY_RATIO`
 - `CLUSTERS`, `MERGED_EVENTS`
 - `BUBBLE_ID`, `REF_CLUSTER_ID`, `BUBBLE_SOURCE`, `BUBBLE_SINK`
 
@@ -140,6 +143,7 @@ Notes:
 - `--minimap-best-n <N>` (default `8`)
 - `--minimap-no-secondary`
 - `--split-ins-svlen-mode <query-span|geometric>` (default `geometric`)
+- `--classify-ins` (default off; uses bounded approximate DUP search for large INS via seeded candidates and sketch similarity to preserve sensitivity without pathological runtime)
 - `--vcf-merge-window-bp <N>` (default `20`)
 - `--vcf-merge-mode <strict|lenient>` (default `strict`)
 - `--vcf-merge-lenient-window-bp <N>` (default `100`)

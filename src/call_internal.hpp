@@ -164,7 +164,8 @@ VariantBubbleReport write_variant_reports_for_bubble(
     const std::string& minimap_preset,
     std::size_t minimap_best_n,
     bool minimap_emit_secondary,
-    bool split_ins_use_geometric_svlen);
+    bool split_ins_use_geometric_svlen,
+    bool classify_ins);
 void write_region_level_vcf(
     const std::string& output_path,
     const std::string& reference_path,

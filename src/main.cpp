@@ -106,6 +106,7 @@ void print_call_help() {
         << "      --minimap-best-n <N>         minimap2 best_n chain count (default: 8)\n"
         << "      --minimap-no-secondary       Disable secondary/supplementary alignments in minimap2 output\n"
         << "      --split-ins-svlen-mode <m>   query-span|geometric (default: geometric)\n"
+        << "      --classify-ins               Classify INS as NOVEL/DUP-like and estimate DUP copy numbers\n"
         << "      --vcf-merge-window-bp <N>    Cross-cluster event merge window in bp (default: 20)\n"
         << "      --vcf-merge-mode <m>         strict|lenient (default: strict)\n"
         << "      --vcf-merge-lenient-window-bp <N>\n"
@@ -700,6 +701,10 @@ int run_call(const std::vector<std::string>& args) {
                 parse_split_ins_svlen_geometric(require_value(arg));
             continue;
         }
+        if (arg == "--classify-ins") {
+            options.classify_ins = true;
+            continue;
+        }
         if (arg == "--vcf-merge-window-bp") {
             options.vcf_merge_window_bp = parse_size_arg(arg, require_value(arg));
             continue;
@@ -781,6 +786,7 @@ int run_call(const std::vector<std::string>& args) {
         << "Minimap2 secondary: " << (options.minimap_emit_secondary ? "on" : "off") << "\n"
         << "Split INS SVLEN mode: "
         << (options.split_ins_use_geometric_svlen ? "geometric" : "query-span") << "\n"
+        << "INS classification: " << (options.classify_ins ? "on" : "off") << "\n"
         << "VCF merge window bp: " << options.vcf_merge_window_bp << "\n"
         << "VCF merge mode: " << options.vcf_merge_mode << "\n"
         << "VCF merge lenient window bp: " << options.vcf_merge_lenient_window_bp << "\n"

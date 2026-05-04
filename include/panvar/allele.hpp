@@ -75,6 +75,8 @@ struct AlleleCallOptions {
     //  - true: keep geometric deviation (SVIM-like inter-segment span delta)
     //  - false: derive from realized ALT span in sequence coordinates.
     bool split_ins_use_geometric_svlen = true;
+    // Optional INS subtype/CN annotation pass (NOVEL vs DUP-like classes).
+    bool classify_ins = false;
     // Merge radius (bp) for collapsing equivalent events across clusters in
     // final region-level VCF.
     std::size_t vcf_merge_window_bp = 20;

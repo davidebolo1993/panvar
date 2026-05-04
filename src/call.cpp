@@ -721,7 +721,8 @@ void call_variants_from_precomputed_grouped_impl(
             options.minimap_preset,
             options.minimap_best_n,
             options.minimap_emit_secondary,
-            options.split_ins_use_geometric_svlen);
+            options.split_ins_use_geometric_svlen,
+            options.classify_ins);
 
         summary.debug_reports_written += report.debug_reports_written;
         summary.dotplots_written += report.dotplots_written;
