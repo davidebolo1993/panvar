@@ -92,9 +92,9 @@ When `--snarl-debug-tsv` is enabled, each candidate row includes:
 
 ```bash
 ./build/panvar bubble \
-  -i tests/real_data/lpa.gfa \
-  -o tests/results/lpa/bubble \
-  --snarls-in tests/real_data/lpa.snarls.jsonl
+  -i tests/real_data/c4.gfa \
+  -o tests/results/c4/bubble \
+  --snarls-in tests/real_data/c4.snarls.jsonl
 ```
 
 For clustering behavior details and usage modes, see:

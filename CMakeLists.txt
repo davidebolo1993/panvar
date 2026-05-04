@@ -88,19 +88,10 @@ if(PANVAR_BUILD_TESTING)
         set(PANVAR_SMOKE_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.sh)
         if(EXISTS ${PANVAR_SMOKE_SCRIPT})
             set(PANVAR_C4_GFA ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_data/c4.gfa)
-            set(PANVAR_LPA_GFA ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_data/lpa.gfa)
             add_test(
                 NAME panvar_smoke_c4
                 COMMAND /usr/bin/env bash ${PANVAR_SMOKE_SCRIPT} $<TARGET_FILE:panvar> ${PANVAR_C4_GFA} ${CMAKE_CURRENT_BINARY_DIR}/smoke_c4
             )
-            if(EXISTS ${PANVAR_LPA_GFA})
-                add_test(
-                    NAME panvar_smoke_lpa
-                    COMMAND /usr/bin/env bash ${PANVAR_SMOKE_SCRIPT} $<TARGET_FILE:panvar> ${PANVAR_LPA_GFA} ${CMAKE_CURRENT_BINARY_DIR}/smoke_lpa
-                )
-            else()
-                message(STATUS "Skipping panvar_smoke_lpa: tests/real_data/lpa.gfa not found")
-            endif()
         else()
             message(STATUS "Skipping smoke test registration: tests/smoke.sh not found")
         endif()

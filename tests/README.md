@@ -2,7 +2,7 @@
 
 ## Data
 
-- `real_data/`: bundled loci (`*.gfa`) and precomputed snarls (`*.snarls.jsonl`)
+- `real_data/`: bundled small example dataset (C4: `c4.gfa`, `c4.snarls.jsonl`)
 - `results/`: local outputs (kept out of git except `.gitkeep`)
 
 ## Smoke Test

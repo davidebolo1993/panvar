@@ -10,6 +10,8 @@ build/
 tests/results/**
 tests/results/prepared_inputs/**
 tests/results/minigraph_loci/**
-tests/real_data/lpa.gfa
+tests/real_data/gencode*
+tests/real_data/gstm1*
+tests/real_data/lpa*
 
 !tests/results/.gitkeep

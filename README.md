@@ -111,6 +111,6 @@ Tool binaries from the container (for example `vg`, `odgi`) are available direct
 
 - `src/`, `include/panvar/`: C++ implementation
 - `external/minimap2/`: minimap2 C library source
-- `tests/real_data/`: bundled loci and snarl JSONL inputs
+- `tests/real_data/`: bundled C4 example locus and snarl JSONL input
 - `tests/results/`: local output artifacts
 - `docs/modules/`: module docs

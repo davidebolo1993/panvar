@@ -165,7 +165,7 @@ Merge behavior:
   --clusters-csv-in tests/results/c4/allele.allele_clusters.csv \
   --assignments-csv-in tests/results/c4/allele.allele_assignments.csv \
   --reference-path grch38#1#chr6:31891045-32123783 \
-  --dotplot-gtf tests/real_data/gencode.v49.annotation.gtf.gz \
+  --dotplot-gtf /path/to/gencode.annotation.gtf.gz \
   --dotplot-gene-match C4 \
   --debug
 ```
