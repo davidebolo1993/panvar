@@ -1,0 +1,4 @@
+build/
+tests/results/
+.git/
+.DS_Store
