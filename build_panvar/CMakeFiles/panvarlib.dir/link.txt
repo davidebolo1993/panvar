@@ -1,2 +1,0 @@
-/usr/bin/ar qc libpanvarlib.a CMakeFiles/panvarlib.dir/src/gfa.cpp.o CMakeFiles/panvarlib.dir/src/bubbles.cpp.o CMakeFiles/panvarlib.dir/src/allele.cpp.o CMakeFiles/panvarlib.dir/src/call.cpp.o CMakeFiles/panvarlib.dir/src/describe.cpp.o CMakeFiles/panvarlib.dir/src/output.cpp.o
-/usr/bin/ranlib libpanvarlib.a

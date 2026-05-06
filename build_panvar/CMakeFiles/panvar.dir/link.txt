@@ -1,1 +1,0 @@
-/usr/bin/c++  -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/panvar.dir/src/main.cpp.o -o panvar  libpanvarlib.a /Users/davide.bolognini/panvar/external/minimap2/libminimap2.a /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib/libz.tbd -lm
