@@ -49,6 +49,10 @@ For each bubble:
 8. Add `INV` when reverse orientation is selected with sufficiently low normalized edit distance.
 9. Merge nearby concordant events within the same cluster.
 10. Optional (`--classify-ins`): classify `INS` as `NOVEL` vs DUP-like subtype and estimate copy number fields.
+    - duplicate-source search tries exact forward and reverse-complement matches first
+    - if exact matching fails, bounded approximate matching is used in both orientations
+    - approximate mode uses DP refinement for smaller inserts and sketch-based scoring for large inserts
+      (large trigger: inserted length > 5000 bp or > 50% of bubble reference span)
 11. Keep events passing `--min-sv-bp` (default `50`).
 12. Merge equivalent events across clusters before writing VCF (same type, nearby coordinates, similar sequence).
 
@@ -128,6 +132,12 @@ Notes:
 - `INSSEQ` / `DELSEQ` / `INVSEQ`
 - `DUP_SIM`, `DUP_REF_START`, `DUP_REF_END`, `DUP_ORIENT`, `DUP_UNIT_BP`
 - `DUP_REF_CN`, `DUP_ALT_CN`, `DUP_ADDED`, `DUP_COPY_RATIO`
+
+Notes:
+
+- `ORIENT` describes global cluster-vs-reference orientation for the called allele
+- `DUP_ORIENT` describes local duplicated-source orientation for INS DUP-like matching
+  (they can differ, e.g. `ORIENT=+` with `DUP_ORIENT=-`)
 - `CLUSTERS`, `MERGED_EVENTS`
 - `BUBBLE_ID`, `REF_CLUSTER_ID`, `BUBBLE_SOURCE`, `BUBBLE_SINK`
 

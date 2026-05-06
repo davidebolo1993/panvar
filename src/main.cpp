@@ -4,12 +4,14 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <sstream>
 #include <string>
 #include <vector>
 
 #include "panvar/allele.hpp"
 #include "panvar/bubbles.hpp"
 #include "panvar/call.hpp"
+#include "panvar/describe.hpp"
 #include "panvar/gfa.hpp"
 #include "panvar/output.hpp"
 
@@ -24,7 +26,7 @@ void print_general_help() {
         << "  bubble    Module 1: refine/import sites from 'vg snarls'\n"
         << "  allele    Module 2: allele extraction and clustering from module-1 sites\n"
         << "  call      Module 3: variant calling on module-2 clustered alleles\n"
-        << "  describe  Module 4: haplotype feature summarization (scaffold)\n\n"
+        << "  describe  Module 4: per-bubble haplotype feature description\n\n"
         << "Run 'panvar <subcommand> --help' for options.\n";
 }
 
@@ -122,12 +124,30 @@ void print_call_help() {
 void print_describe_help() {
     std::cout
         << "Usage:\n"
-        << "  panvar describe [options]\n\n"
-        << "Status:\n"
-        << "  Module scaffold only (implementation in progress).\n\n"
-        << "Planned purpose:\n"
-        << "  Emit per-haplotype feature vectors from discovered/called events.\n"
+        << "  panvar describe --vcf-in <call.region.vcf> --out-dir <dir> [options]\n\n"
+        << "Options:\n"
+        << "      --vcf-in <path>              Input region-level VCF from panvar call (required)\n"
+        << "      --out-dir <dir>              Output directory for per-bubble tables\n"
+        << "                                   (default: describe_out)\n"
+        << "      --gtf <path>                 Optional GTF/GTF.GZ for gene-region overlaps\n"
+        << "      --gene-match <expr>          Optional case-insensitive gene regex filter\n"
+        << "                                   (repeat flag to pass multiple patterns)\n"
+        << "      --size-bins <csv>            Size bins as comma-separated bp thresholds\n"
+        << "                                   (default: 100,1000)\n"
+        << "      --quiet                      Disable progress logs\n"
         << "  -h, --help                       Show this help\n";
+}
+
+std::string trim_ascii(const std::string& text) {
+    std::size_t lo = 0;
+    while (lo < text.size() && std::isspace(static_cast<unsigned char>(text[lo]))) {
+        ++lo;
+    }
+    std::size_t hi = text.size();
+    while (hi > lo && std::isspace(static_cast<unsigned char>(text[hi - 1]))) {
+        --hi;
+    }
+    return text.substr(lo, hi - lo);
 }
 
 std::size_t parse_size_arg(const std::string& name, const std::string& value) {
@@ -227,6 +247,29 @@ std::string join_with_comma(const std::vector<std::string>& values) {
         out += values[i];
     }
     return out;
+}
+
+std::vector<std::size_t> parse_size_bins_arg(const std::string& csv) {
+    std::vector<std::size_t> bins;
+    std::string token;
+    std::istringstream iss(csv);
+    while (std::getline(iss, token, ',')) {
+        const std::string trimmed = trim_ascii(token);
+        if (trimmed.empty()) {
+            continue;
+        }
+        const std::size_t v = parse_size_arg("--size-bins", trimmed);
+        if (v == 0) {
+            throw std::runtime_error("--size-bins values must be > 0");
+        }
+        bins.push_back(v);
+    }
+    if (bins.empty()) {
+        throw std::runtime_error("--size-bins requires at least one integer threshold");
+    }
+    std::sort(bins.begin(), bins.end());
+    bins.erase(std::unique(bins.begin(), bins.end()), bins.end());
+    return bins;
 }
 
 panvar::ClusterMode parse_cluster_mode_arg(const std::string& value) {
@@ -819,13 +862,78 @@ int run_call(const std::vector<std::string>& args) {
 }
 
 int run_describe(const std::vector<std::string>& args) {
-    for (const auto& arg : args) {
+    std::string vcf_in_path;
+    std::string out_dir = "describe_out";
+
+    panvar::DescribeOptions options;
+
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const std::string& arg = args[i];
+        auto require_value = [&](const std::string& flag) -> const std::string& {
+            if (i + 1 >= args.size()) {
+                throw std::runtime_error("Missing value after " + flag);
+            }
+            return args[++i];
+        };
+
         if (arg == "-h" || arg == "--help") {
             print_describe_help();
             return 0;
         }
+        if (arg == "--vcf-in") {
+            vcf_in_path = require_value(arg);
+            continue;
+        }
+        if (arg == "--out-dir") {
+            out_dir = require_value(arg);
+            continue;
+        }
+        if (arg == "--gtf") {
+            options.gtf_path = require_value(arg);
+            continue;
+        }
+        if (arg == "--gene-match") {
+            options.gene_match_patterns.push_back(require_value(arg));
+            continue;
+        }
+        if (arg == "--size-bins") {
+            options.size_bins = parse_size_bins_arg(require_value(arg));
+            continue;
+        }
+        if (arg == "--quiet") {
+            options.quiet = true;
+            continue;
+        }
+
+        throw std::runtime_error("Unknown option for describe: " + arg);
     }
-    throw std::runtime_error("Module 'describe' is not implemented yet.");
+
+    if (vcf_in_path.empty()) {
+        throw std::runtime_error("describe requires --vcf-in");
+    }
+
+    options.vcf_in_path = vcf_in_path;
+    options.out_dir = out_dir;
+
+    panvar::DescribeSummary summary;
+    panvar::describe_from_region_vcf(options, &summary);
+
+    std::cout
+        << "Input VCF: " << options.vcf_in_path << "\n"
+        << "Output dir: " << options.out_dir << "\n"
+        << "Bubbles described: " << summary.bubbles << "\n"
+        << "Events processed: " << summary.events << "\n"
+        << "Haplotype rows written: " << summary.haplotype_rows << "\n"
+        << "Files written: " << summary.files_written << "\n";
+
+    if (!options.gtf_path.empty()) {
+        std::cout << "GTF: " << options.gtf_path << "\n";
+    }
+    if (!options.gene_match_patterns.empty()) {
+        std::cout << "Gene filters: " << join_with_comma(options.gene_match_patterns) << "\n";
+    }
+
+    return 0;
 }
 
 } // namespace

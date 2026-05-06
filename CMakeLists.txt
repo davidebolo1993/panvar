@@ -39,6 +39,7 @@ add_library(panvarlib
     src/bubbles.cpp
     src/allele.cpp
     src/call.cpp
+    src/describe.cpp
     src/output.cpp
 )
 
