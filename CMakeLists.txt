@@ -63,6 +63,12 @@ target_link_libraries(panvar PRIVATE panvarlib minimap2 Threads::Threads ZLIB::Z
 if(NOT WIN32)
     target_link_libraries(panvar PRIVATE m)
 endif()
+# GCC 8 and older keep std::filesystem symbols in a separate library.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
+        target_link_libraries(panvar PRIVATE stdc++fs)
+    endif()
+endif()
 
 target_compile_options(panvar
     PRIVATE
