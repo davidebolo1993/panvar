@@ -20,6 +20,7 @@ For each bubble, cluster representatives are compared to the reference-cluster r
 - `INV`
 
 Optional INS subtyping/copy-number annotation can be enabled with `--classify-ins`.
+Optional gene copy-delta annotation can be enabled with `--pangene-bed`.
 
 ## Required inputs
 
@@ -53,8 +54,13 @@ For each bubble:
     - if exact matching fails, bounded approximate matching is used in both orientations
     - approximate mode uses DP refinement for smaller inserts and sketch-based scoring for large inserts
       (large trigger: inserted length > 5000 bp or > 50% of bubble reference span)
-11. Keep events passing `--min-sv-bp` (default `50`).
-12. Merge equivalent events across clusters before writing VCF (same type, nearby coordinates, similar sequence).
+11. Optional (`--pangene-bed`): annotate event clusters with gene copy deltas
+    (representative haplotype vs reference haplotype) and optionally tune INS subtype.
+    - `--pangene-gene-match <expr>` can restrict annotation to genes of interest
+    - `--pangene-tune-ins` sets `INS_SUBTYPE=DUP_PANGENE` when INS has copy-gain support
+      and no stronger local DUP evidence
+12. Keep events passing `--min-sv-bp` (default `50`).
+13. Merge equivalent events across clusters before writing VCF (same type, nearby coordinates, similar sequence).
 
 ## Within-cluster merge rule (important)
 
@@ -93,6 +99,7 @@ Per-sample genotype for merged events:
 ### Main output
 
 - region-level VCF (`--vcf-out`, default `<out>.region.vcf`)
+- optional pangene copy table (`--pangene-copy-tsv`, default `<out>.pangene_copy.tsv` when `--pangene-bed` is enabled)
 
 ### Debug output (`--debug` or `--debug-out-dir <dir>`)
 
@@ -132,12 +139,16 @@ Notes:
 - `INSSEQ` / `DELSEQ` / `INVSEQ`
 - `DUP_SIM`, `DUP_REF_START`, `DUP_REF_END`, `DUP_ORIENT`, `DUP_UNIT_BP`
 - `DUP_REF_CN`, `DUP_ALT_CN`, `DUP_ADDED`, `DUP_COPY_RATIO`
+- `PANGENE_CN_DELTA`, `PANGENE_GAIN_GENES`, `PANGENE_LOSS_GENES`
+- `PANGENE_GAIN_COPIES`, `PANGENE_LOSS_COPIES`
 
 Notes:
 
 - `ORIENT` describes global cluster-vs-reference orientation for the called allele
 - `DUP_ORIENT` describes local duplicated-source orientation for INS DUP-like matching
   (they can differ, e.g. `ORIENT=+` with `DUP_ORIENT=-`)
+- `INS_SUBTYPE=DUP_PANGENE` means INS tuning used pangene copy-gain support
+  (without overriding `SVTYPE=INS`)
 - `CLUSTERS`, `MERGED_EVENTS`
 - `BUBBLE_ID`, `REF_CLUSTER_ID`, `BUBBLE_SOURCE`, `BUBBLE_SINK`
 
@@ -154,6 +165,10 @@ Notes:
 - `--minimap-no-secondary`
 - `--split-ins-svlen-mode <query-span|geometric>` (default `geometric`)
 - `--classify-ins` (default off; uses bounded approximate DUP search for large INS via seeded candidates and sketch similarity to preserve sensitivity without pathological runtime)
+- `--pangene-bed <path>` (optional pangene BED/BED.GZ copy-count annotation layer)
+- `--pangene-gene-match <expr>` (repeatable gene filter for pangene annotation)
+- `--pangene-tune-ins` (optional INS subtype tuning from pangene copy gains)
+- `--pangene-copy-tsv <path>` (optional per-bubble/cluster copy-count table)
 - `--vcf-merge-window-bp <N>` (default `20`)
 - `--vcf-merge-mode <strict|lenient>` (default `strict`)
 - `--vcf-merge-lenient-window-bp <N>` (default `100`)
@@ -181,5 +196,8 @@ Merge behavior:
   --reference-path grch38#1#chr6:31891045-32123783 \
   --dotplot-gtf /path/to/gencode.annotation.gtf.gz \
   --dotplot-gene-match C4 \
+  --pangene-bed tests/real_data/c4.pangene.bed.gz \
+  --pangene-gene-match C4 \
+  --pangene-tune-ins \
   --debug
 ```

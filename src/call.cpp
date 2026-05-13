@@ -1,18 +1,23 @@
 #include "panvar/call.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <optional>
+#include <regex>
 #include <sstream>
+#include <string_view>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include <zlib.h>
 
 #include "call_internal.hpp"
 #include "panvar/output.hpp"
@@ -251,6 +256,288 @@ bool parse_csv_bool(const std::string& value, const std::string& field_name) {
     throw std::runtime_error("Invalid boolean field '" + field_name + "': " + value);
 }
 
+struct PangeneGeneRecord {
+    std::size_t start0 = 0;
+    std::size_t end0 = 0;
+    std::string gene_name;
+    char orientation = '.';
+};
+
+using PangeneGeneIndex = std::unordered_map<std::string, std::vector<PangeneGeneRecord>>;
+using GeneCopyCounts = std::unordered_map<std::string, std::size_t>;
+
+struct CompiledGeneFilter {
+    std::string pattern;
+    bool use_regex = false;
+    std::regex regex;
+    std::string lowercase_pattern;
+};
+
+struct PangeneDeltaSummary {
+    std::string cn_delta;
+    std::string gain_genes;
+    std::string loss_genes;
+    std::size_t gain_copies = 0;
+    std::size_t loss_copies = 0;
+};
+
+std::string ascii_lower(const std::string& input) {
+    std::string out = input;
+    std::transform(
+        out.begin(),
+        out.end(),
+        out.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return out;
+}
+
+std::vector<std::string> split_tab_fields(std::string_view line) {
+    std::vector<std::string> fields;
+    std::size_t start = 0;
+    while (start <= line.size()) {
+        const std::size_t tab = line.find('\t', start);
+        if (tab == std::string_view::npos) {
+            fields.emplace_back(line.substr(start));
+            break;
+        }
+        fields.emplace_back(line.substr(start, tab - start));
+        start = tab + 1;
+    }
+    return fields;
+}
+
+bool has_gz_suffix(const std::string& path) {
+    return path.size() >= 3 && path.substr(path.size() - 3) == ".gz";
+}
+
+PangeneGeneIndex load_pangene_bed(const std::string& bed_path) {
+    PangeneGeneIndex index;
+
+    auto handle_fields = [&](const std::vector<std::string>& fields, std::size_t line_no) {
+        if (fields.size() < 4) {
+            throw std::runtime_error(
+                "Invalid pangene BED line " + std::to_string(line_no) +
+                ": expected at least 4 columns");
+        }
+        std::size_t start0 = 0;
+        std::size_t end0 = 0;
+        try {
+            start0 = static_cast<std::size_t>(std::stoull(fields[2]));
+            end0 = static_cast<std::size_t>(std::stoull(fields[3]));
+        } catch (const std::exception&) {
+            const std::string col0 = ascii_lower(fields[0]);
+            const std::string col2 = ascii_lower(fields[2]);
+            const std::string col3 = ascii_lower(fields[3]);
+            const bool header_like =
+                (col0 == "molecule" || col0 == "path" || col0 == "seqname") &&
+                (col2 == "start") &&
+                (col3 == "end");
+            if (header_like) {
+                return;
+            }
+            throw std::runtime_error(
+                "Invalid pangene BED coordinates on line " + std::to_string(line_no));
+        }
+        if (end0 < start0) {
+            std::swap(start0, end0);
+        }
+        PangeneGeneRecord rec;
+        rec.start0 = start0;
+        rec.end0 = end0;
+        rec.gene_name = fields[1];
+        if (fields.size() >= 5 && !fields[4].empty()) {
+            rec.orientation = fields[4][0];
+        }
+        index[fields[0]].push_back(std::move(rec));
+    };
+
+    if (has_gz_suffix(bed_path)) {
+        gzFile fp = gzopen(bed_path.c_str(), "rb");
+        if (fp == nullptr) {
+            throw std::runtime_error("Failed to open pangene BED: " + bed_path);
+        }
+        constexpr int kBuf = 1 << 20;
+        std::vector<char> buf(static_cast<std::size_t>(kBuf), '\0');
+        std::size_t line_no = 0;
+        while (gzgets(fp, buf.data(), kBuf) != nullptr) {
+            ++line_no;
+            std::string line(buf.data());
+            while (!line.empty() &&
+                   (line.back() == '\n' || line.back() == '\r')) {
+                line.pop_back();
+            }
+            if (line.empty() || line[0] == '#') {
+                continue;
+            }
+            handle_fields(split_tab_fields(line), line_no);
+        }
+        gzclose(fp);
+    } else {
+        std::ifstream in(bed_path);
+        if (!in) {
+            throw std::runtime_error("Failed to open pangene BED: " + bed_path);
+        }
+        std::string line;
+        std::size_t line_no = 0;
+        while (std::getline(in, line)) {
+            ++line_no;
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+            if (line.empty() || line[0] == '#') {
+                continue;
+            }
+            handle_fields(split_tab_fields(line), line_no);
+        }
+    }
+
+    for (auto& [path_name, genes] : index) {
+        (void)path_name;
+        std::sort(genes.begin(), genes.end(), [](const PangeneGeneRecord& lhs, const PangeneGeneRecord& rhs) {
+            if (lhs.start0 != rhs.start0) {
+                return lhs.start0 < rhs.start0;
+            }
+            if (lhs.end0 != rhs.end0) {
+                return lhs.end0 < rhs.end0;
+            }
+            return lhs.gene_name < rhs.gene_name;
+        });
+    }
+    return index;
+}
+
+std::vector<CompiledGeneFilter> compile_gene_filters(
+    const std::vector<std::string>& patterns) {
+
+    std::vector<CompiledGeneFilter> compiled;
+    compiled.reserve(patterns.size());
+    for (const auto& pattern : patterns) {
+        if (pattern.empty()) {
+            continue;
+        }
+        CompiledGeneFilter item;
+        item.pattern = pattern;
+        try {
+            item.regex = std::regex(pattern, std::regex::icase);
+            item.use_regex = true;
+        } catch (const std::regex_error&) {
+            item.use_regex = false;
+            item.lowercase_pattern = ascii_lower(pattern);
+        }
+        compiled.push_back(std::move(item));
+    }
+    return compiled;
+}
+
+bool gene_name_matches_filters(
+    const std::string& gene_name,
+    const std::vector<CompiledGeneFilter>& filters) {
+
+    if (filters.empty()) {
+        return true;
+    }
+    const std::string lower_name = ascii_lower(gene_name);
+    for (const auto& filter : filters) {
+        if (filter.use_regex) {
+            if (std::regex_search(gene_name, filter.regex)) {
+                return true;
+            }
+            continue;
+        }
+        if (!filter.lowercase_pattern.empty() &&
+            lower_name.find(filter.lowercase_pattern) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+GeneCopyCounts count_pangene_copies_for_interval(
+    const PangeneGeneIndex& pangene_index,
+    const std::string& path_name,
+    std::size_t start_bp,
+    std::size_t end_bp,
+    const std::vector<CompiledGeneFilter>& filters) {
+
+    GeneCopyCounts counts;
+    const auto it = pangene_index.find(path_name);
+    if (it == pangene_index.end()) {
+        return counts;
+    }
+    if (end_bp < start_bp) {
+        std::swap(start_bp, end_bp);
+    }
+
+    for (const auto& gene : it->second) {
+        if (gene.end0 <= start_bp) {
+            continue;
+        }
+        if (gene.start0 >= end_bp) {
+            break;
+        }
+        if (!gene_name_matches_filters(gene.gene_name, filters)) {
+            continue;
+        }
+        counts[gene.gene_name] += 1;
+    }
+    return counts;
+}
+
+PangeneDeltaSummary summarize_gene_copy_delta(
+    const GeneCopyCounts& ref_counts,
+    const GeneCopyCounts& alt_counts) {
+
+    PangeneDeltaSummary out;
+    std::unordered_set<std::string> genes;
+    genes.reserve(ref_counts.size() + alt_counts.size() + 1);
+    for (const auto& kv : ref_counts) {
+        genes.insert(kv.first);
+    }
+    for (const auto& kv : alt_counts) {
+        genes.insert(kv.first);
+    }
+
+    std::vector<std::string> sorted_genes(genes.begin(), genes.end());
+    std::sort(sorted_genes.begin(), sorted_genes.end());
+
+    std::vector<std::string> delta_items;
+    std::vector<std::string> gain_items;
+    std::vector<std::string> loss_items;
+    for (const auto& gene : sorted_genes) {
+        const std::size_t ref_cn = (ref_counts.count(gene) > 0) ? ref_counts.at(gene) : 0;
+        const std::size_t alt_cn = (alt_counts.count(gene) > 0) ? alt_counts.at(gene) : 0;
+        if (ref_cn == alt_cn) {
+            continue;
+        }
+        delta_items.push_back(
+            gene + ":" + std::to_string(ref_cn) + ">" + std::to_string(alt_cn));
+        if (alt_cn > ref_cn) {
+            const std::size_t diff = alt_cn - ref_cn;
+            out.gain_copies += diff;
+            gain_items.push_back(gene + "(+" + std::to_string(diff) + ")");
+        } else {
+            const std::size_t diff = ref_cn - alt_cn;
+            out.loss_copies += diff;
+            loss_items.push_back(gene + "(-" + std::to_string(diff) + ")");
+        }
+    }
+
+    auto join_csv = [](const std::vector<std::string>& items) -> std::string {
+        std::string out_csv;
+        for (std::size_t i = 0; i < items.size(); ++i) {
+            if (i > 0) {
+                out_csv.push_back(',');
+            }
+            out_csv += items[i];
+        }
+        return out_csv;
+    };
+    out.cn_delta = join_csv(delta_items);
+    out.gain_genes = join_csv(gain_items);
+    out.loss_genes = join_csv(loss_items);
+    return out;
+}
+
 std::size_t required_csv_column(
     const std::unordered_map<std::string, std::size_t>& index_by_name,
     const std::string& column_name) {
@@ -475,6 +762,30 @@ void call_variants_from_precomputed_grouped_impl(
     if (options.write_debug_reports && !options.dotplot_gtf_path.empty()) {
         dotplot_gene_index = ::panvar::load_gene_annotations_from_gtf(options.dotplot_gtf_path);
         dotplot_gene_ptr = &dotplot_gene_index;
+    }
+
+    const bool use_pangene = !options.pangene_bed_path.empty();
+    PangeneGeneIndex pangene_index;
+    std::vector<CompiledGeneFilter> pangene_gene_filters;
+    std::unordered_map<std::string, std::vector<std::size_t>> prefix_bp_by_path;
+    std::ofstream pangene_copy_out;
+    if (use_pangene) {
+        pangene_index = load_pangene_bed(options.pangene_bed_path);
+        pangene_gene_filters = compile_gene_filters(options.pangene_gene_matches);
+        prefix_bp_by_path.reserve(graph.paths.size() * 2);
+        for (const auto& path : graph.paths) {
+            prefix_bp_by_path[path.name] = prefix_bp(path, graph.nodes);
+        }
+        if (!options.pangene_copy_tsv_path.empty()) {
+            pangene_copy_out.open(options.pangene_copy_tsv_path);
+            if (!pangene_copy_out) {
+                throw std::runtime_error(
+                    "Failed to write pangene copy TSV: " + options.pangene_copy_tsv_path);
+            }
+            pangene_copy_out
+                << "bubble_id\tcluster_id\tpath_name\tis_reference\t"
+                << "step_start\tstep_end\tbp_start\tbp_end\tgene_name\tcopy_count\n";
+        }
     }
 
     std::vector<RegionVcfBubble> region_vcf_bubbles;
@@ -726,6 +1037,164 @@ void call_variants_from_precomputed_grouped_impl(
 
         summary.debug_reports_written += report.debug_reports_written;
         summary.dotplots_written += report.dotplots_written;
+
+        if (use_pangene && report.has_reference_assignment && !report.vcf_rows.empty()) {
+            struct SelectedAssignmentInterval {
+                std::string path_name;
+                std::size_t step_start = 0;
+                std::size_t step_end = 0;
+                bool source_to_sink = true;
+            };
+
+            auto cluster_path_key = [](std::size_t cluster_id, const std::string& path_name) {
+                return std::to_string(cluster_id) + '\t' + path_name;
+            };
+
+            std::unordered_map<std::string, SelectedAssignmentInterval> best_by_cluster_path;
+            std::unordered_map<std::size_t, SelectedAssignmentInterval> best_by_cluster;
+            best_by_cluster_path.reserve(assignments.size() * 2);
+            best_by_cluster.reserve(clusters.size() * 2);
+
+            for (std::size_t i = 0; i < assignments.size(); ++i) {
+                const PathAssignment& assignment = assignments[i];
+                if (i >= assignment_cluster_ids.size()) {
+                    continue;
+                }
+                const std::size_t cluster_id = assignment_cluster_ids[i];
+                if (cluster_id == 0) {
+                    continue;
+                }
+                SelectedAssignmentInterval candidate;
+                candidate.path_name = assignment.path_name;
+                candidate.step_start = assignment.interval_start;
+                candidate.step_end = assignment.interval_end;
+                candidate.source_to_sink = assignment.source_to_sink;
+
+                const std::string key = cluster_path_key(cluster_id, assignment.path_name);
+                auto by_path_it = best_by_cluster_path.find(key);
+                if (by_path_it == best_by_cluster_path.end() ||
+                    (!by_path_it->second.source_to_sink && candidate.source_to_sink)) {
+                    best_by_cluster_path[key] = candidate;
+                }
+
+                auto by_cluster_it = best_by_cluster.find(cluster_id);
+                if (by_cluster_it == best_by_cluster.end() ||
+                    (!by_cluster_it->second.source_to_sink && candidate.source_to_sink) ||
+                    (by_cluster_it->second.source_to_sink == candidate.source_to_sink &&
+                     candidate.path_name < by_cluster_it->second.path_name)) {
+                    best_by_cluster[cluster_id] = std::move(candidate);
+                }
+            }
+
+            auto counts_for_selected = [&](const SelectedAssignmentInterval& selection) -> GeneCopyCounts {
+                auto pref_it = prefix_bp_by_path.find(selection.path_name);
+                if (pref_it == prefix_bp_by_path.end()) {
+                    return {};
+                }
+                const auto& pref = pref_it->second;
+                const std::size_t lo = std::min(selection.step_start, selection.step_end);
+                const std::size_t hi = std::max(selection.step_start, selection.step_end);
+                if (lo >= pref.size() || hi + 1 >= pref.size()) {
+                    return {};
+                }
+                const std::size_t bp_start = pref[lo];
+                const std::size_t bp_end = pref[hi + 1];
+                return count_pangene_copies_for_interval(
+                    pangene_index,
+                    selection.path_name,
+                    bp_start,
+                    bp_end,
+                    pangene_gene_filters);
+            };
+
+            std::unordered_map<std::string, GeneCopyCounts> counts_by_cluster_path;
+            counts_by_cluster_path.reserve(best_by_cluster_path.size() * 2);
+            for (const auto& kv : best_by_cluster_path) {
+                counts_by_cluster_path[kv.first] = counts_for_selected(kv.second);
+            }
+            std::unordered_map<std::size_t, GeneCopyCounts> counts_by_cluster;
+            counts_by_cluster.reserve(best_by_cluster.size() * 2);
+            for (const auto& kv : best_by_cluster) {
+                counts_by_cluster[kv.first] = counts_for_selected(kv.second);
+            }
+
+            const std::string ref_key = cluster_path_key(report.reference_cluster_id, options.reference_path);
+            GeneCopyCounts reference_counts;
+            const auto ref_by_path_it = counts_by_cluster_path.find(ref_key);
+            if (ref_by_path_it != counts_by_cluster_path.end()) {
+                reference_counts = ref_by_path_it->second;
+            } else {
+                const auto ref_by_cluster_it = counts_by_cluster.find(report.reference_cluster_id);
+                if (ref_by_cluster_it != counts_by_cluster.end()) {
+                    reference_counts = ref_by_cluster_it->second;
+                }
+            }
+
+            if (pangene_copy_out) {
+                for (const auto& kv : best_by_cluster) {
+                    const std::size_t cluster_id = kv.first;
+                    const auto& selection = kv.second;
+                    auto pref_it = prefix_bp_by_path.find(selection.path_name);
+                    if (pref_it == prefix_bp_by_path.end()) {
+                        continue;
+                    }
+                    const auto& pref = pref_it->second;
+                    const std::size_t lo = std::min(selection.step_start, selection.step_end);
+                    const std::size_t hi = std::max(selection.step_start, selection.step_end);
+                    if (lo >= pref.size() || hi + 1 >= pref.size()) {
+                        continue;
+                    }
+                    const std::size_t bp_start = pref[lo];
+                    const std::size_t bp_end = pref[hi + 1];
+                    const auto counts_it = counts_by_cluster.find(cluster_id);
+                    if (counts_it == counts_by_cluster.end() || counts_it->second.empty()) {
+                        continue;
+                    }
+                    for (const auto& gene_kv : counts_it->second) {
+                        pangene_copy_out
+                            << bubble.id << '\t'
+                            << cluster_id << '\t'
+                            << selection.path_name << '\t'
+                            << (cluster_id == report.reference_cluster_id ? 1 : 0) << '\t'
+                            << lo << '\t'
+                            << hi << '\t'
+                            << bp_start << '\t'
+                            << bp_end << '\t'
+                            << gene_kv.first << '\t'
+                            << gene_kv.second << '\n';
+                    }
+                }
+            }
+
+            for (auto& row : report.vcf_rows) {
+                GeneCopyCounts alt_counts;
+                const std::string key =
+                    cluster_path_key(row.cluster_id, row.representative_haplotype);
+                const auto by_path_it = counts_by_cluster_path.find(key);
+                if (by_path_it != counts_by_cluster_path.end()) {
+                    alt_counts = by_path_it->second;
+                } else {
+                    const auto by_cluster_it = counts_by_cluster.find(row.cluster_id);
+                    if (by_cluster_it != counts_by_cluster.end()) {
+                        alt_counts = by_cluster_it->second;
+                    }
+                }
+
+                const PangeneDeltaSummary delta =
+                    summarize_gene_copy_delta(reference_counts, alt_counts);
+                row.pangene_cn_delta = delta.cn_delta;
+                row.pangene_gain_genes = delta.gain_genes;
+                row.pangene_loss_genes = delta.loss_genes;
+                row.pangene_gain_copies = delta.gain_copies;
+                row.pangene_loss_copies = delta.loss_copies;
+                if (options.pangene_tune_ins &&
+                    row.event_type == "INS" &&
+                    row.pangene_gain_copies > 0 &&
+                    (row.event_subtype == "." || row.event_subtype == "NOVEL")) {
+                    row.event_subtype = "DUP_PANGENE";
+                }
+            }
+        }
 
         if (options.write_region_vcf &&
             report.has_reference_assignment && !report.vcf_rows.empty()) {

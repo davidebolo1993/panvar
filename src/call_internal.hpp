@@ -116,6 +116,11 @@ struct VariantBubbleReport {
         std::size_t dup_added_copies = 0;
         std::size_t dup_alt_copy_number = 0;
         double dup_copy_ratio = 0.0;
+        std::string pangene_cn_delta;
+        std::string pangene_gain_genes;
+        std::string pangene_loss_genes;
+        std::size_t pangene_gain_copies = 0;
+        std::size_t pangene_loss_copies = 0;
     };
     std::vector<VariantRecordForVcf> vcf_rows;
 };

@@ -2243,6 +2243,249 @@ std::vector<Cluster> cluster_unique_alleles_greedy_threshold(
     return clusters;
 }
 
+void skip_json_whitespace(const std::string& text, std::size_t& pos) {
+    while (pos < text.size() &&
+           std::isspace(static_cast<unsigned char>(text[pos])) != 0) {
+        ++pos;
+    }
+}
+
+std::string parse_json_quoted_string(const std::string& text, std::size_t& pos) {
+    if (pos >= text.size() || text[pos] != '"') {
+        throw std::runtime_error("Invalid predefined cluster JSON: expected quoted string");
+    }
+    ++pos;
+    std::string out;
+    out.reserve(32);
+    while (pos < text.size()) {
+        const char c = text[pos++];
+        if (c == '"') {
+            return out;
+        }
+        if (c != '\\') {
+            out.push_back(c);
+            continue;
+        }
+        if (pos >= text.size()) {
+            throw std::runtime_error("Invalid predefined cluster JSON: dangling escape");
+        }
+        const char esc = text[pos++];
+        switch (esc) {
+            case '"':
+            case '\\':
+            case '/':
+                out.push_back(esc);
+                break;
+            case 'b':
+                out.push_back('\b');
+                break;
+            case 'f':
+                out.push_back('\f');
+                break;
+            case 'n':
+                out.push_back('\n');
+                break;
+            case 'r':
+                out.push_back('\r');
+                break;
+            case 't':
+                out.push_back('\t');
+                break;
+            default:
+                throw std::runtime_error(
+                    "Invalid predefined cluster JSON: unsupported escape sequence");
+        }
+    }
+    throw std::runtime_error("Invalid predefined cluster JSON: unterminated string");
+}
+
+std::unordered_map<std::string, std::string> load_predefined_path_cluster_map_json(
+    const std::string& json_path) {
+
+    std::ifstream in(json_path);
+    if (!in) {
+        throw std::runtime_error("Failed to read predefined clusters JSON: " + json_path);
+    }
+    std::string text(
+        (std::istreambuf_iterator<char>(in)),
+        std::istreambuf_iterator<char>());
+    std::size_t pos = 0;
+    skip_json_whitespace(text, pos);
+    if (pos >= text.size() || text[pos] != '{') {
+        throw std::runtime_error("Invalid predefined clusters JSON: expected top-level object");
+    }
+    ++pos;
+
+    std::unordered_map<std::string, std::string> out;
+    out.reserve(1024);
+
+    while (true) {
+        skip_json_whitespace(text, pos);
+        if (pos >= text.size()) {
+            throw std::runtime_error("Invalid predefined clusters JSON: unexpected EOF");
+        }
+        if (text[pos] == '}') {
+            ++pos;
+            break;
+        }
+
+        const std::string key = parse_json_quoted_string(text, pos);
+        skip_json_whitespace(text, pos);
+        if (pos >= text.size() || text[pos] != ':') {
+            throw std::runtime_error("Invalid predefined clusters JSON: expected ':'");
+        }
+        ++pos;
+        skip_json_whitespace(text, pos);
+        if (pos >= text.size()) {
+            throw std::runtime_error("Invalid predefined clusters JSON: missing value");
+        }
+
+        std::string value;
+        if (text[pos] == '"') {
+            value = parse_json_quoted_string(text, pos);
+        } else {
+            const std::size_t value_start = pos;
+            while (pos < text.size() && text[pos] != ',' && text[pos] != '}') {
+                ++pos;
+            }
+            value = text.substr(value_start, pos - value_start);
+            std::size_t lo = 0;
+            while (lo < value.size() &&
+                   std::isspace(static_cast<unsigned char>(value[lo])) != 0) {
+                ++lo;
+            }
+            std::size_t hi = value.size();
+            while (hi > lo &&
+                   std::isspace(static_cast<unsigned char>(value[hi - 1])) != 0) {
+                --hi;
+            }
+            value = value.substr(lo, hi - lo);
+        }
+        if (value.empty()) {
+            value = "__EMPTY__";
+        }
+        out[key] = value;
+
+        skip_json_whitespace(text, pos);
+        if (pos >= text.size()) {
+            throw std::runtime_error("Invalid predefined clusters JSON: unexpected EOF");
+        }
+        if (text[pos] == ',') {
+            ++pos;
+            continue;
+        }
+        if (text[pos] == '}') {
+            ++pos;
+            break;
+        }
+        throw std::runtime_error("Invalid predefined clusters JSON: expected ',' or '}'");
+    }
+
+    skip_json_whitespace(text, pos);
+    if (pos != text.size()) {
+        throw std::runtime_error("Invalid predefined clusters JSON: trailing content");
+    }
+    return out;
+}
+
+std::vector<Cluster> cluster_unique_alleles_from_predefined_path_labels(
+    const std::vector<UniqueAllele>& unique_alleles,
+    const std::vector<PathAssignment>& assignments,
+    const std::unordered_map<std::string, std::string>& label_by_path,
+    std::size_t* missing_assignment_count_out,
+    std::size_t* missing_path_count_out) {
+
+    if (missing_assignment_count_out != nullptr) {
+        *missing_assignment_count_out = 0;
+    }
+    if (missing_path_count_out != nullptr) {
+        *missing_path_count_out = 0;
+    }
+    if (unique_alleles.empty() || assignments.empty()) {
+        return {};
+    }
+
+    std::unordered_map<std::string, std::vector<std::size_t>> unique_members_by_label;
+    std::unordered_map<std::string, std::size_t> support_by_label;
+    std::unordered_set<std::string> missing_paths;
+    unique_members_by_label.reserve(assignments.size() * 2);
+    support_by_label.reserve(assignments.size() * 2);
+
+    std::size_t missing_assignment_count = 0;
+    for (const auto& assignment : assignments) {
+        auto it = label_by_path.find(assignment.path_name);
+        bool missing = (it == label_by_path.end());
+        std::string label =
+            missing ? ("__UNMAPPED__:" + assignment.path_name) : it->second;
+        if (label.empty()) {
+            label = "__EMPTY__";
+        }
+        if (missing) {
+            ++missing_assignment_count;
+            missing_paths.insert(assignment.path_name);
+        }
+        unique_members_by_label[label].push_back(assignment.unique_idx);
+        support_by_label[label] += 1;
+    }
+    if (missing_assignment_count_out != nullptr) {
+        *missing_assignment_count_out = missing_assignment_count;
+    }
+    if (missing_path_count_out != nullptr) {
+        *missing_path_count_out = missing_paths.size();
+    }
+
+    std::vector<std::string> labels;
+    labels.reserve(unique_members_by_label.size());
+    for (const auto& kv : unique_members_by_label) {
+        labels.push_back(kv.first);
+    }
+    std::sort(labels.begin(), labels.end());
+
+    std::vector<Cluster> clusters;
+    clusters.reserve(labels.size());
+    for (std::size_t i = 0; i < labels.size(); ++i) {
+        const std::string& label = labels[i];
+        auto members = unique_members_by_label[label];
+        std::sort(members.begin(), members.end());
+        members.erase(std::unique(members.begin(), members.end()), members.end());
+        if (members.empty()) {
+            continue;
+        }
+
+        Cluster cluster;
+        cluster.cluster_id = i + 1;
+        cluster.member_unique_idxs = std::move(members);
+        cluster.total_path_support = support_by_label[label];
+        if (cluster.total_path_support == 0) {
+            for (const std::size_t unique_idx : cluster.member_unique_idxs) {
+                cluster.total_path_support += unique_alleles[unique_idx].path_support;
+            }
+        }
+
+        std::size_t rep_idx = cluster.member_unique_idxs.front();
+        for (const std::size_t unique_idx : cluster.member_unique_idxs) {
+            const auto& cand = unique_alleles[unique_idx];
+            const auto& curr = unique_alleles[rep_idx];
+            if (cand.path_support > curr.path_support ||
+                (cand.path_support == curr.path_support && cand.allele_id < curr.allele_id)) {
+                rep_idx = unique_idx;
+            }
+        }
+        cluster.representative_idx = rep_idx;
+
+        std::sort(cluster.member_unique_idxs.begin(), cluster.member_unique_idxs.end(), [&](std::size_t lhs, std::size_t rhs) {
+            if (unique_alleles[lhs].path_support != unique_alleles[rhs].path_support) {
+                return unique_alleles[lhs].path_support > unique_alleles[rhs].path_support;
+            }
+            return unique_alleles[lhs].allele_id < unique_alleles[rhs].allele_id;
+        });
+
+        clusters.push_back(std::move(cluster));
+    }
+
+    return clusters;
+}
+
 struct DotplotPoint {
     std::size_t ref_pos = 0;
     std::size_t query_pos = 0;
@@ -5490,6 +5733,11 @@ void write_region_level_vcf(
         std::size_t dup_added_copies = 0;
         std::size_t dup_alt_copy_number = 0;
         double dup_copy_ratio = 0.0;
+        std::string pangene_cn_delta;
+        std::string pangene_gain_genes;
+        std::string pangene_loss_genes;
+        std::size_t pangene_gain_copies = 0;
+        std::size_t pangene_loss_copies = 0;
     };
 
     std::string merge_mode_lower = merge_mode;
@@ -5582,6 +5830,11 @@ void write_region_level_vcf(
             pending.dup_added_copies = row.dup_added_copies;
             pending.dup_alt_copy_number = row.dup_alt_copy_number;
             pending.dup_copy_ratio = row.dup_copy_ratio;
+            pending.pangene_cn_delta = row.pangene_cn_delta;
+            pending.pangene_gain_genes = row.pangene_gain_genes;
+            pending.pangene_loss_genes = row.pangene_loss_genes;
+            pending.pangene_gain_copies = row.pangene_gain_copies;
+            pending.pangene_loss_copies = row.pangene_loss_copies;
 
             const std::size_t start_off = std::min(row.ref_offset_start_bp, row.ref_offset_end_bp);
             const std::size_t end_off = std::max(row.ref_offset_start_bp, row.ref_offset_end_bp);
@@ -5721,6 +5974,15 @@ void write_region_level_vcf(
         }
         group.seed.end_1based = std::max(group.seed.end_1based, row.end_1based);
         group.seed.best_norm = std::min(group.seed.best_norm, row.best_norm);
+        if ((!row.pangene_cn_delta.empty() && group.seed.pangene_cn_delta.empty()) ||
+            (row.pangene_gain_copies + row.pangene_loss_copies >
+             group.seed.pangene_gain_copies + group.seed.pangene_loss_copies)) {
+            group.seed.pangene_cn_delta = row.pangene_cn_delta;
+            group.seed.pangene_gain_genes = row.pangene_gain_genes;
+            group.seed.pangene_loss_genes = row.pangene_loss_genes;
+            group.seed.pangene_gain_copies = row.pangene_gain_copies;
+            group.seed.pangene_loss_copies = row.pangene_loss_copies;
+        }
         if ((!group.seed.has_dup_evidence && row.has_dup_evidence) ||
             (group.seed.has_dup_evidence && row.has_dup_evidence &&
              row.dup_best_similarity > group.seed.dup_best_similarity)) {
@@ -5758,6 +6020,11 @@ void write_region_level_vcf(
             group.seed.dup_added_copies = row.dup_added_copies;
             group.seed.dup_alt_copy_number = row.dup_alt_copy_number;
             group.seed.dup_copy_ratio = row.dup_copy_ratio;
+            group.seed.pangene_cn_delta = row.pangene_cn_delta;
+            group.seed.pangene_gain_genes = row.pangene_gain_genes;
+            group.seed.pangene_loss_genes = row.pangene_loss_genes;
+            group.seed.pangene_gain_copies = row.pangene_gain_copies;
+            group.seed.pangene_loss_copies = row.pangene_loss_copies;
         }
     }
 
@@ -5798,6 +6065,11 @@ void write_region_level_vcf(
     out << "##INFO=<ID=DUP_ALT_CN,Number=1,Type=Integer,Description=\"Estimated ALT copy number of duplication unit\">\n";
     out << "##INFO=<ID=DUP_ADDED,Number=1,Type=Integer,Description=\"Estimated number of added copies in ALT\">\n";
     out << "##INFO=<ID=DUP_COPY_RATIO,Number=1,Type=Float,Description=\"Estimated ALT/REF copy ratio for duplication unit\">\n";
+    out << "##INFO=<ID=PANGENE_CN_DELTA,Number=1,Type=String,Description=\"pangene gene copy deltas for this event cluster (gene:ref>alt, comma-separated)\">\n";
+    out << "##INFO=<ID=PANGENE_GAIN_GENES,Number=1,Type=String,Description=\"pangene genes with copy gains in event cluster vs reference (gene(+delta), comma-separated)\">\n";
+    out << "##INFO=<ID=PANGENE_LOSS_GENES,Number=1,Type=String,Description=\"pangene genes with copy losses in event cluster vs reference (gene(-delta), comma-separated)\">\n";
+    out << "##INFO=<ID=PANGENE_GAIN_COPIES,Number=1,Type=Integer,Description=\"Total gained gene copies from pangene comparison\">\n";
+    out << "##INFO=<ID=PANGENE_LOSS_COPIES,Number=1,Type=Integer,Description=\"Total lost gene copies from pangene comparison\">\n";
     out << "##INFO=<ID=SUPPORT,Number=1,Type=Integer,Description=\"Total path support for merged event\">\n";
     out << "##INFO=<ID=CLUSTERS,Number=.,Type=Integer,Description=\"Cluster IDs carrying this merged event\">\n";
     out << "##INFO=<ID=MERGED_EVENTS,Number=.,Type=String,Description=\"Merged member event IDs (C<cluster>E<event>)\">\n";
@@ -5890,6 +6162,17 @@ void write_region_level_vcf(
                 << ";DUP_ALT_CN=" << group.seed.dup_alt_copy_number
                 << ";DUP_ADDED=" << group.seed.dup_added_copies
                 << ";DUP_COPY_RATIO=" << std::fixed << std::setprecision(6) << group.seed.dup_copy_ratio;
+        }
+        if (!group.seed.pangene_cn_delta.empty()) {
+            out << ";PANGENE_CN_DELTA=" << group.seed.pangene_cn_delta
+                << ";PANGENE_GAIN_COPIES=" << group.seed.pangene_gain_copies
+                << ";PANGENE_LOSS_COPIES=" << group.seed.pangene_loss_copies;
+            if (!group.seed.pangene_gain_genes.empty()) {
+                out << ";PANGENE_GAIN_GENES=" << group.seed.pangene_gain_genes;
+            }
+            if (!group.seed.pangene_loss_genes.empty()) {
+                out << ";PANGENE_LOSS_GENES=" << group.seed.pangene_loss_genes;
+            }
         }
         if (!group.seed.event_sequence.empty()) {
             if (svtype == "INS") {
@@ -6514,6 +6797,16 @@ void call_alleles_to_csv(
             "Module 'allele' requires --bubbles-csv-in from module 1 ('panvar bubble').");
     }
     const std::vector<Bubble> bubbles = read_bubbles_csv(options.bubbles_csv_in);
+    std::unordered_map<std::string, std::string> predefined_cluster_labels_by_path;
+    const bool use_predefined_clusters = !options.predefined_clusters_json_path.empty();
+    if (use_predefined_clusters) {
+        predefined_cluster_labels_by_path =
+            load_predefined_path_cluster_map_json(options.predefined_clusters_json_path);
+        if (predefined_cluster_labels_by_path.empty()) {
+            throw std::runtime_error(
+                "Predefined clusters JSON is empty: " + options.predefined_clusters_json_path);
+        }
+    }
 
     std::vector<PathIndex> path_indexes;
     path_indexes.reserve(graph.paths.size());
@@ -6632,6 +6925,9 @@ void call_alleles_to_csv(
         }
         std::filesystem::create_directories(options.debug_out_dir);
     }
+
+    std::size_t predefined_missing_assignments_total = 0;
+    std::size_t predefined_missing_paths_total = 0;
 
     for (std::size_t bubble_idx = 0; bubble_idx < bubbles.size(); ++bubble_idx) {
         const auto& bubble = bubbles[bubble_idx];
@@ -6768,40 +7064,68 @@ void call_alleles_to_csv(
             unique_alleles.size() > options.max_upgma_alleles;
         const bool by_sequence_work = sequence_work >= kAutoSequenceFastWorkThreshold;
         const bool auto_sequence_fast =
+            !use_predefined_clusters &&
             options.cluster_mode == ClusterMode::Sequence &&
             options.fast_distance &&
             all_sequence_tokens &&
             (by_allele_cap || by_sequence_work);
 
         const bool use_sequence_fast_clustering =
-            options.cluster_mode == ClusterMode::SequenceFast || auto_sequence_fast;
+            !use_predefined_clusters &&
+            (options.cluster_mode == ClusterMode::SequenceFast || auto_sequence_fast);
         const bool use_threshold_graph_clustering =
+            !use_predefined_clusters &&
             !use_sequence_fast_clustering &&
             options.max_upgma_alleles > 0 &&
             unique_alleles.size() > options.max_upgma_alleles;
 
-        const auto dist_start = std::chrono::steady_clock::now();
-        const DistanceMatrices dists = build_distance_matrices(
-            unique_alleles,
-            options.min_similarity,
-            options.fast_distance,
-            options.exact_distance_max_bp,
-            options.threads,
-            options.show_progress,
-            bubble.id,
-            use_threshold_graph_clustering,
-            use_sequence_fast_clustering);
-        if (options.show_progress) {
-            std::cerr
-                << "[allele] bubble " << bubble.id
-                << " distance matrix computed, elapsed="
-                << std::fixed << std::setprecision(2) << elapsed_seconds(dist_start) << "s\n";
+        const bool need_distance_matrix =
+            !use_predefined_clusters || options.write_similarity_reports;
+        DistanceMatrices dists;
+        if (need_distance_matrix) {
+            const auto dist_start = std::chrono::steady_clock::now();
+            dists = build_distance_matrices(
+                unique_alleles,
+                options.min_similarity,
+                options.fast_distance,
+                options.exact_distance_max_bp,
+                options.threads,
+                options.show_progress,
+                bubble.id,
+                use_threshold_graph_clustering,
+                use_sequence_fast_clustering);
+            if (options.show_progress) {
+                std::cerr
+                    << "[allele] bubble " << bubble.id
+                    << " distance matrix computed, elapsed="
+                    << std::fixed << std::setprecision(2) << elapsed_seconds(dist_start) << "s\n";
+            }
         }
 
         UPGMATree tree;
         bool have_tree = false;
         std::vector<Cluster> clusters;
-        if (use_sequence_fast_clustering) {
+        if (use_predefined_clusters) {
+            std::size_t missing_assignments = 0;
+            std::size_t missing_paths = 0;
+            clusters = cluster_unique_alleles_from_predefined_path_labels(
+                unique_alleles,
+                assignments,
+                predefined_cluster_labels_by_path,
+                &missing_assignments,
+                &missing_paths);
+            predefined_missing_assignments_total += missing_assignments;
+            predefined_missing_paths_total += missing_paths;
+            if (options.show_progress) {
+                std::cerr
+                    << "[allele] bubble " << bubble.id
+                    << " predefined clustering from JSON labels"
+                    << " (clusters=" << clusters.size()
+                    << ", unmapped_assignments=" << missing_assignments
+                    << ", unmapped_paths=" << missing_paths
+                    << ")\n";
+            }
+        } else if (use_sequence_fast_clustering) {
             if (options.show_progress) {
                 std::cerr
                     << "[allele] bubble " << bubble.id
@@ -7221,6 +7545,12 @@ void call_alleles_to_csv(
     }
 
     if (options.show_progress) {
+        if (use_predefined_clusters && predefined_missing_assignments_total > 0) {
+            std::cerr
+                << "[allele] warning: " << predefined_missing_assignments_total
+                << " path assignments (across " << predefined_missing_paths_total
+                << " unique paths) were not found in --clusters-json and were placed in synthetic singleton labels\n";
+        }
         std::cerr
             << "[allele] completed " << bubbles.size() << " bubbles in "
             << std::fixed << std::setprecision(2) << elapsed_seconds(run_start) << "s\n";

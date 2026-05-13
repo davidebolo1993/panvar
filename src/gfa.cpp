@@ -192,7 +192,8 @@ Graph parse_gfa(const std::string& gfa_path, const ParseGfaOptions& options) {
     }
 
     for (const auto& edge : raw_edges) {
-        if (!graph.nodes.contains(edge.from) || !graph.nodes.contains(edge.to)) {
+        if (graph.nodes.find(edge.from) == graph.nodes.end() ||
+            graph.nodes.find(edge.to) == graph.nodes.end()) {
             continue;
         }
 

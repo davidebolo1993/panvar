@@ -73,7 +73,7 @@ For each VCF record:
 ## Example (C4)
 
 ```bash
-./build_panvar/panvar describe \
+./build/panvar describe \
   --vcf-in /tmp/panvar_call_bounded.region.vcf \
   --out-dir /tmp/panvar_describe_c4 \
   --gtf tests/real_data/gencode.v49.annotation.gtf.gz \

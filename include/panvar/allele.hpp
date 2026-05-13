@@ -35,6 +35,9 @@ struct AlleleCallOptions {
     // Optional representative sequence export for each bubble-cluster.
     bool write_cluster_sequences = false;
     std::string cluster_sequences_csv_path;
+    // Optional path->cluster-label JSON map for predefined clustering in module 2.
+    // Expected format: {"path_name":"cluster_label", ...}
+    std::string predefined_clusters_json_path;
 
     // Optional ODGI viz export (per-bubble ordered path list + cluster colors).
     bool write_odgi_viz_inputs = false;
@@ -77,6 +80,16 @@ struct AlleleCallOptions {
     bool split_ins_use_geometric_svlen = true;
     // Optional INS subtype/CN annotation pass (NOVEL vs DUP-like classes).
     bool classify_ins = false;
+    // Optional pangene BED(.gz) to annotate per-event gene copy deltas
+    // (cluster representative haplotype vs reference haplotype).
+    std::string pangene_bed_path;
+    // Optional repeatable regex/term filters for pangene gene names.
+    std::vector<std::string> pangene_gene_matches;
+    // Optional heuristic tuning: when INS lacks local DUP evidence but pangene
+    // indicates gene copy gains, set INS subtype to DUP_PANGENE.
+    bool pangene_tune_ins = false;
+    // Optional TSV export of per-bubble/cluster pangene copy counts.
+    std::string pangene_copy_tsv_path;
     // Merge radius (bp) for collapsing equivalent events across clusters in
     // final region-level VCF.
     std::size_t vcf_merge_window_bp = 20;

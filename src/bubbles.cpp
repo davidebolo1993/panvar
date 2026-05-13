@@ -1208,13 +1208,14 @@ void assign_nesting(std::vector<Bubble>& bubbles) {
             if (node_sets[j].size() <= node_sets[i].size()) {
                 continue;
             }
-            if (!node_sets[j].contains(bubbles[i].source) || !node_sets[j].contains(bubbles[i].sink)) {
+            if (node_sets[j].find(bubbles[i].source) == node_sets[j].end() ||
+                node_sets[j].find(bubbles[i].sink) == node_sets[j].end()) {
                 continue;
             }
 
             bool subset = true;
             for (const auto& node : node_sets[i]) {
-                if (!node_sets[j].contains(node)) {
+                if (node_sets[j].find(node) == node_sets[j].end()) {
                     subset = false;
                     break;
                 }
@@ -1345,7 +1346,7 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
             std::size_t inside_bp = 0;
             for (std::size_t i = 1; i + 1 < steps.size(); ++i) {
                 const auto& step = steps[i];
-                if (!inside_nodes.contains(step.node_id)) {
+                if (inside_nodes.find(step.node_id) == inside_nodes.end()) {
                     continue;
                 }
 
@@ -1401,7 +1402,7 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
         for (const auto& bubble : bubbles) {
             if (bubble.path_support < options.min_path_support) {
                 const std::string key = endpoint_key(bubble.source, bubble.sink);
-                if (!rejection_reason_by_endpoint.contains(key)) {
+                if (rejection_reason_by_endpoint.find(key) == rejection_reason_by_endpoint.end()) {
                     rejection_reason_by_endpoint[key] = "reject:min-path-support";
                 }
             }
@@ -1418,7 +1419,7 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
         for (const auto& bubble : bubbles) {
             if (bubble.long_path_support == 0 && !bubble.inversion_signal) {
                 const std::string key = endpoint_key(bubble.source, bubble.sink);
-                if (!rejection_reason_by_endpoint.contains(key)) {
+                if (rejection_reason_by_endpoint.find(key) == rejection_reason_by_endpoint.end()) {
                     rejection_reason_by_endpoint[key] = "reject:min-variant-bp";
                 }
             }
@@ -1460,7 +1461,7 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
         for (const auto& bubble : bubbles) {
             if (bubble.nesting_level > options.max_nesting_level) {
                 const std::string key = endpoint_key(bubble.source, bubble.sink);
-                if (!rejection_reason_by_endpoint.contains(key)) {
+                if (rejection_reason_by_endpoint.find(key) == rejection_reason_by_endpoint.end()) {
                     rejection_reason_by_endpoint[key] = "reject:max-nesting-level";
                 }
             }
@@ -1497,7 +1498,7 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
                     debug.inside_node_count = metrics_it->second.inside_node_count;
                 }
             }
-            const bool in_final = final_endpoint_keys.contains(key);
+            const bool in_final = final_endpoint_keys.find(key) != final_endpoint_keys.end();
             if (in_final) {
                 if (debug.reason.rfind("accept:", 0) == 0 || debug.reason.empty()) {
                     debug.accepted = true;

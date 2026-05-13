@@ -58,6 +58,7 @@ void print_allele_help() {
         << "      --bubbles-csv-in <path>      Module-1 bubbles CSV input (required)\n"
         << "      --clusters-csv <path>        Explicit allele-cluster CSV output path\n"
         << "      --assignments-csv <path>     Explicit per-path assignment CSV output path\n"
+        << "      --clusters-json <path>       Optional predefined path->cluster-label JSON map\n"
         << "      --cluster-sequences-csv <path> Optional representative sequence per cluster\n"
         << "      --min-similarity <X>         Min similarity in [0,1] or percent (e.g. 0.9 or 90)\n"
         << "                                    (default: 0.90)\n"
@@ -109,6 +110,10 @@ void print_call_help() {
         << "      --minimap-no-secondary       Disable secondary/supplementary alignments in minimap2 output\n"
         << "      --split-ins-svlen-mode <m>   query-span|geometric (default: geometric)\n"
         << "      --classify-ins               Classify INS as NOVEL/DUP-like and estimate DUP copy numbers\n"
+        << "      --pangene-bed <path>         Optional pangene BED/BED.GZ for gene copy annotations\n"
+        << "      --pangene-gene-match <expr>  Optional pangene gene regex/term filter (repeatable)\n"
+        << "      --pangene-tune-ins           Use pangene copy gains to set INS subtype DUP_PANGENE\n"
+        << "      --pangene-copy-tsv <path>    Optional per-bubble/cluster pangene copy-count TSV\n"
         << "      --vcf-merge-window-bp <N>    Cross-cluster event merge window in bp (default: 20)\n"
         << "      --vcf-merge-mode <m>         strict|lenient (default: strict)\n"
         << "      --vcf-merge-lenient-window-bp <N>\n"
@@ -486,6 +491,10 @@ int run_allele(const std::vector<std::string>& args) {
             assignments_csv_path = require_value(arg);
             continue;
         }
+        if (arg == "--clusters-json") {
+            options.predefined_clusters_json_path = require_value(arg);
+            continue;
+        }
         if (arg == "--cluster-sequences-csv") {
             options.cluster_sequences_csv_path = require_value(arg);
             options.write_cluster_sequences = true;
@@ -619,6 +628,9 @@ int run_allele(const std::vector<std::string>& args) {
         << "Min similarity: " << options.min_similarity << "\n"
         << "Cluster mode: " << cluster_mode_label(options.cluster_mode) << "\n"
         << "Distance mode: " << (options.fast_distance ? "auto" : "exact") << "\n"
+        << "Predefined clusters: "
+        << (options.predefined_clusters_json_path.empty() ? "off" : options.predefined_clusters_json_path)
+        << "\n"
         << "Max UPGMA alleles: " << options.max_upgma_alleles << " (0=disabled)\n"
         << "Threads: " << options.threads << " (0=auto)\n"
         << "Bubbles processed: " << summary.bubbles_processed << "\n"
@@ -748,6 +760,22 @@ int run_call(const std::vector<std::string>& args) {
             options.classify_ins = true;
             continue;
         }
+        if (arg == "--pangene-bed") {
+            options.pangene_bed_path = require_value(arg);
+            continue;
+        }
+        if (arg == "--pangene-gene-match") {
+            options.pangene_gene_matches.push_back(require_value(arg));
+            continue;
+        }
+        if (arg == "--pangene-tune-ins") {
+            options.pangene_tune_ins = true;
+            continue;
+        }
+        if (arg == "--pangene-copy-tsv") {
+            options.pangene_copy_tsv_path = require_value(arg);
+            continue;
+        }
         if (arg == "--vcf-merge-window-bp") {
             options.vcf_merge_window_bp = parse_size_arg(arg, require_value(arg));
             continue;
@@ -798,6 +826,9 @@ int run_call(const std::vector<std::string>& args) {
     if (options.write_debug_reports && options.debug_out_dir.empty()) {
         options.debug_out_dir = out_prefix + ".debug";
     }
+    if (!options.pangene_bed_path.empty() && options.pangene_copy_tsv_path.empty()) {
+        options.pangene_copy_tsv_path = out_prefix + ".pangene_copy.tsv";
+    }
     panvar::ParseGfaOptions parse_options;
     parse_options.include_paths = true;
     parse_options.include_sequences = true;
@@ -830,6 +861,8 @@ int run_call(const std::vector<std::string>& args) {
         << "Split INS SVLEN mode: "
         << (options.split_ins_use_geometric_svlen ? "geometric" : "query-span") << "\n"
         << "INS classification: " << (options.classify_ins ? "on" : "off") << "\n"
+        << "Pangene BED: " << (options.pangene_bed_path.empty() ? "off" : options.pangene_bed_path) << "\n"
+        << "Pangene tune INS: " << (options.pangene_tune_ins ? "on" : "off") << "\n"
         << "VCF merge window bp: " << options.vcf_merge_window_bp << "\n"
         << "VCF merge mode: " << options.vcf_merge_mode << "\n"
         << "VCF merge lenient window bp: " << options.vcf_merge_lenient_window_bp << "\n"
@@ -840,6 +873,15 @@ int run_call(const std::vector<std::string>& args) {
         << std::min(options.vcf_merge_max_seq_edit_fraction, 1.0 - options.vcf_merge_min_seq_similarity) << "\n"
         << "Precomputed clusters CSV: " << clusters_csv_in_path << "\n"
         << "Precomputed assignments CSV: " << assignments_csv_in_path << "\n";
+    if (!options.pangene_gene_matches.empty()) {
+        std::cout
+            << "Pangene gene matches: "
+            << join_with_comma(options.pangene_gene_matches)
+            << "\n";
+    }
+    if (!options.pangene_copy_tsv_path.empty()) {
+        std::cout << "Pangene copy TSV: " << options.pangene_copy_tsv_path << "\n";
+    }
     std::cout
         << "Region-level VCF: " << options.region_vcf_path << "\n"
         << "VCF records written: " << summary.region_vcf_records << "\n";

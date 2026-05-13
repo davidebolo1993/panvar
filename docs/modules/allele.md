@@ -12,7 +12,7 @@ Given module-1 sites (`--bubbles-csv-in`), this module:
 
 1. extracts one canonical source-to-sink allele per path per bubble
 2. deduplicates identical alleles
-3. clusters alleles by similarity
+3. clusters alleles by similarity (or by predefined path groups via JSON)
 4. picks one representative allele per cluster
 5. writes cluster and per-path assignment outputs
 
@@ -34,6 +34,13 @@ Optional outputs:
 - similarity diagnostics: `--similarity-out-dir`
 - ODGI viz inputs: `--odgi-viz-out-dir`
 
+Optional clustering input:
+
+- `--clusters-json <path>` path->cluster-label JSON map
+  - expected format: `{"path_name":"cluster_label", ...}`
+  - if provided, module-2 skips distance-based clustering and uses these labels
+  - paths missing from JSON are put in synthetic singleton labels (warning emitted)
+
 ## Algorithm overview
 
 For each bubble:
@@ -41,11 +48,12 @@ For each bubble:
 1. scan all P/W paths and find the best source-to-sink interval crossing the bubble
 2. canonicalize interval orientation to source->sink
 3. build allele signature from oriented node steps and deduplicate
-4. build comparison tokens based on `--cluster-mode`
-5. compute pairwise distances based on `--distance-mode`
-6. cluster alleles
-7. select representative allele (medoid-like tie breaking)
-8. write bubble-level and path-level results
+4. if `--clusters-json` is provided, assign clusters by predefined path label; otherwise:
+5. build comparison tokens based on `--cluster-mode`
+6. compute pairwise distances based on `--distance-mode`
+7. cluster alleles
+8. select representative allele (medoid-like tie breaking)
+9. write bubble-level and path-level results
 
 Best interval means:
 
@@ -117,6 +125,7 @@ Clustering strategy:
 - `--min-similarity <X>`: threshold in `(0,1]` or percent (default `0.90`)
 - `--cluster-mode sequence|walk` (default `sequence`)
 - `--distance-mode auto|exact` (default `auto`)
+- `--clusters-json <path>`: predefined path-group JSON (optional)
 - `--threads <N>`: workers for distance calculations (`0` = auto)
 - `--max-upgma-alleles <N>`: UPGMA cap before threshold-graph fallback (`0` disables)
 - `--quiet`: disable progress logs
@@ -158,6 +167,16 @@ Strict sequence distances:
   --bubbles-csv-in tests/results/c4/bubble.bubbles.csv \
   --cluster-mode sequence \
   --distance-mode exact
+```
+
+Predefined clustering from JSON:
+
+```bash
+./build/panvar allele \
+  -i tests/real_data/c4.gfa \
+  -o tests/results/c4/allele_json \
+  --bubbles-csv-in tests/results/c4/bubble.bubbles.csv \
+  --clusters-json tests/real_data/c4.clusters.json
 ```
 
 ## Module handoff
