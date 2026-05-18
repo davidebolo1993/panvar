@@ -8,7 +8,7 @@ CLI entrypoint:
 
 ## What it does
 
-Given module-1 sites (`--bubbles-csv-in`), this module:
+Given module-1 sites (`--bubble-prefix-in` or `--bubbles-csv-in`), this module:
 
 1. extracts one canonical source-to-sink allele per path per bubble
 2. deduplicates identical alleles
@@ -21,7 +21,11 @@ Given module-1 sites (`--bubbles-csv-in`), this module:
 Required inputs:
 
 1. `--gfa <graph.gfa>`
-2. `--bubbles-csv-in <module1.bubbles.csv>`
+2. one of:
+   - `--bubble-prefix-in <module1-prefix>` (auto uses `<module1-prefix>.bubbles.csv`)
+   - `--bubbles-csv-in <module1.bubbles.csv>`
+
+`allele` accepts both the current simplified module-1 CSV schema and older legacy module-1 schemas.
 
 Core outputs:
 
@@ -34,12 +38,29 @@ Optional outputs:
 - similarity diagnostics: `--similarity-out-dir`
 - ODGI viz inputs: `--odgi-viz-out-dir`
 
+Current module-2 handoff schemas:
+
+- `*.allele_clusters.csv`:
+  - `bubble_id,source,sink,cluster_id,representative_allele_id,total_path_support,member_alleles`
+- `*.allele_assignments.csv`:
+  - `bubble_id,source,sink,path_name,cluster_id,allele_id,allele_length,interval_start,interval_end,source_to_sink`
+
+Notes:
+
+- only fields consumed by downstream modules are retained in these CSVs
+- older module-2 CSVs with extra columns remain acceptable to `panvar call` as long as the required columns above are present
+
 Optional clustering input:
 
 - `--clusters-json <path>` path->cluster-label JSON map
   - expected format: `{"path_name":"cluster_label", ...}`
   - if provided, module-2 skips distance-based clustering and uses these labels
   - paths missing from JSON are put in synthetic singleton labels (warning emitted)
+
+`--cluster-sequences-csv` and `--clusters-json` are independent:
+
+- `--clusters-json` controls how clusters are assigned
+- `--cluster-sequences-csv` only exports representative sequences for whatever clusters were produced
 
 ## Algorithm overview
 
@@ -127,7 +148,10 @@ Clustering strategy:
 - `--distance-mode auto|exact` (default `auto`)
 - `--clusters-json <path>`: predefined path-group JSON (optional)
 - `--threads <N>`: workers for distance calculations (`0` = auto)
-- `--max-upgma-alleles <N>`: UPGMA cap before threshold-graph fallback (`0` disables)
+- `--max-upgma-alleles <N>`: clustering-mode switch threshold (`0` disables)
+  - if unique alleles in one bubble are `<= N`, clustering uses UPGMA tree cutting
+  - if unique alleles are `> N`, clustering switches to threshold-graph connected components
+  - this is not just for tree visualization; it changes the clustering algorithm for that bubble
 - `--quiet`: disable progress logs
 
 ## Performance guidance
@@ -145,7 +169,7 @@ Default sequence clustering:
 ./build/panvar allele \
   -i tests/real_data/c4.gfa \
   -o tests/results/c4/allele \
-  --bubbles-csv-in tests/results/c4/bubble.bubbles.csv
+  --bubble-prefix-in tests/results/c4/bubble
 ```
 
 Walk clustering:
@@ -154,7 +178,7 @@ Walk clustering:
 ./build/panvar allele \
   -i tests/real_data/c4.gfa \
   -o tests/results/c4/allele_walk \
-  --bubbles-csv-in tests/results/c4/bubble.bubbles.csv \
+  --bubble-prefix-in tests/results/c4/bubble \
   --cluster-mode walk
 ```
 
@@ -164,7 +188,7 @@ Strict sequence distances:
 ./build/panvar allele \
   -i tests/real_data/c4.gfa \
   -o tests/results/c4/allele_exact \
-  --bubbles-csv-in tests/results/c4/bubble.bubbles.csv \
+  --bubble-prefix-in tests/results/c4/bubble \
   --cluster-mode sequence \
   --distance-mode exact
 ```
@@ -175,7 +199,7 @@ Predefined clustering from JSON:
 ./build/panvar allele \
   -i tests/real_data/c4.gfa \
   -o tests/results/c4/allele_json \
-  --bubbles-csv-in tests/results/c4/bubble.bubbles.csv \
+  --bubble-prefix-in tests/results/c4/bubble \
   --clusters-json tests/real_data/c4.clusters.json
 ```
 
@@ -183,5 +207,7 @@ Predefined clustering from JSON:
 
 Use module-2 outputs in module-3:
 
-- `panvar call --clusters-csv-in <prefix>.allele_clusters.csv`
-- `panvar call --assignments-csv-in <prefix>.allele_assignments.csv`
+- recommended shortcut: `panvar call --allele-prefix-in <prefix>`
+- explicit files:
+  - `panvar call --clusters-csv-in <prefix>.allele_clusters.csv`
+  - `panvar call --assignments-csv-in <prefix>.allele_assignments.csv`

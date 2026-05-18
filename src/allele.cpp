@@ -5266,9 +5266,137 @@ VariantBubbleReport write_variant_reports_for_bubble(
     bool classify_ins) {
 
     VariantBubbleReport report;
-    if (unique_alleles.empty() || clusters.empty()) {
-        report.status = "skipped:no-clusters";
+    report.clusters_total = clusters.size();
+
+    std::string bubble_debug_dir;
+    if (write_debug_files) {
+        if (debug_output_dir.empty()) {
+            throw std::runtime_error("--debug-out-dir cannot be empty when call debug output is enabled");
+        }
+        bubble_debug_dir = debug_output_dir + "/bubble_" + std::to_string(bubble.id);
+        std::filesystem::create_directories(bubble_debug_dir);
+    }
+
+    auto write_cluster_status_text = [&](const std::string& cluster_debug_dir,
+                                         const VariantBubbleReport::ClusterDebugStatus& status) {
+        if (!write_debug_files || cluster_debug_dir.empty()) {
+            return;
+        }
+        const std::string status_path = cluster_debug_dir + "/status.txt";
+        std::ofstream out(status_path);
+        if (!out) {
+            throw std::runtime_error("Failed to write cluster status text: " + status_path);
+        }
+        out << "bubble_id=" << bubble.id << "\n";
+        out << "cluster_id=" << status.cluster_id << "\n";
+        out << "status=" << status.status << "\n";
+        out << "is_reference_cluster=" << (status.is_reference_cluster ? 1 : 0) << "\n";
+        out << "representative_allele_id=" << status.representative_allele_id << "\n";
+        out << "representative_haplotype=" << status.representative_haplotype << "\n";
+        out << "reference_length_bp=" << status.reference_length_bp << "\n";
+        out << "cluster_length_bp=" << status.cluster_length_bp << "\n";
+        out << "minimap_best_ok=" << (status.minimap_best_ok ? 1 : 0) << "\n";
+        out << "orientation=" << status.orientation << "\n";
+        out << std::fixed << std::setprecision(6);
+        out << "best_norm_ed=" << status.best_edit_distance_norm << "\n";
+        out << "paf_records=" << status.paf_records << "\n";
+        out << "event_count=" << status.event_count << "\n";
+        out << "dotplot_written=" << (status.dotplot_written ? 1 : 0) << "\n";
+        out << "pairwise_vcf_written=" << (status.pairwise_vcf_written ? 1 : 0) << "\n";
+    };
+
+    auto write_bubble_debug_status = [&]() {
+        if (!write_debug_files || bubble_debug_dir.empty()) {
+            return;
+        }
+        const std::string bubble_status_path = bubble_debug_dir + "/bubble_status.tsv";
+        std::ofstream bubble_out(bubble_status_path);
+        if (!bubble_out) {
+            throw std::runtime_error("Failed to write bubble debug status TSV: " + bubble_status_path);
+        }
+        std::size_t ok_clusters = 0;
+        std::size_t clusters_with_events = 0;
+        std::size_t dotplots = 0;
+        std::size_t cluster_vcfs = 0;
+        for (const auto& cluster_status : report.cluster_statuses) {
+            if (cluster_status.minimap_best_ok) {
+                report.clusters_with_minimap_hit += 1;
+            }
+            if (cluster_status.event_count > 0) {
+                clusters_with_events += 1;
+            }
+            if (cluster_status.dotplot_written) {
+                dotplots += 1;
+            }
+            if (cluster_status.pairwise_vcf_written) {
+                cluster_vcfs += 1;
+            }
+            if (cluster_status.status.rfind("ok", 0) == 0) {
+                ok_clusters += 1;
+            }
+        }
+        report.clusters_with_events = clusters_with_events;
+
+        bubble_out
+            << "bubble_id\tstatus\thas_reference_assignment\treference_cluster_id\treference_interval_start\t"
+            << "reference_interval_end\tunique_alleles\tclusters_total\tclusters_observed\tclusters_ok\t"
+            << "clusters_with_minimap_hit\tclusters_with_events\tdotplots_written\tcluster_pairwise_vcfs\t"
+            << "region_vcf_rows\n";
+        bubble_out
+            << bubble.id << '\t'
+            << report.status << '\t'
+            << (report.has_reference_assignment ? 1 : 0) << '\t'
+            << report.reference_cluster_id << '\t'
+            << report.reference_interval_start << '\t'
+            << report.reference_interval_end << '\t'
+            << unique_alleles.size() << '\t'
+            << report.clusters_total << '\t'
+            << report.cluster_statuses.size() << '\t'
+            << ok_clusters << '\t'
+            << report.clusters_with_minimap_hit << '\t'
+            << report.clusters_with_events << '\t'
+            << dotplots << '\t'
+            << cluster_vcfs << '\t'
+            << report.vcf_rows.size() << '\n';
+
+        const std::string cluster_status_path = bubble_debug_dir + "/cluster_status.tsv";
+        std::ofstream cluster_out(cluster_status_path);
+        if (!cluster_out) {
+            throw std::runtime_error("Failed to write cluster debug status TSV: " + cluster_status_path);
+        }
+        cluster_out
+            << "bubble_id\tcluster_id\tstatus\tis_reference_cluster\trepresentative_allele_id\t"
+            << "representative_haplotype\treference_length_bp\tcluster_length_bp\tpaf_records\t"
+            << "minimap_best_ok\torientation\tbest_norm_ed\tevent_count\tdotplot_written\t"
+            << "pairwise_vcf_written\n";
+        for (const auto& cluster_status : report.cluster_statuses) {
+            cluster_out
+                << bubble.id << '\t'
+                << cluster_status.cluster_id << '\t'
+                << cluster_status.status << '\t'
+                << (cluster_status.is_reference_cluster ? 1 : 0) << '\t'
+                << cluster_status.representative_allele_id << '\t'
+                << cluster_status.representative_haplotype << '\t'
+                << cluster_status.reference_length_bp << '\t'
+                << cluster_status.cluster_length_bp << '\t'
+                << cluster_status.paf_records << '\t'
+                << (cluster_status.minimap_best_ok ? 1 : 0) << '\t'
+                << cluster_status.orientation << '\t'
+                << std::fixed << std::setprecision(6) << cluster_status.best_edit_distance_norm << '\t'
+                << cluster_status.event_count << '\t'
+                << (cluster_status.dotplot_written ? 1 : 0) << '\t'
+                << (cluster_status.pairwise_vcf_written ? 1 : 0) << '\n';
+        }
+    };
+
+    auto return_with_status = [&](const std::string& status) -> VariantBubbleReport {
+        report.status = status;
+        write_bubble_debug_status();
         return report;
+    };
+
+    if (unique_alleles.empty() || clusters.empty()) {
+        return return_with_status("skipped:no-clusters");
     }
 
     struct BestPathCluster {
@@ -5309,29 +5437,25 @@ VariantBubbleReport write_variant_reports_for_bubble(
         }
     }
     if (!reference_assignment.has_value()) {
-        report.status = "skipped:no-reference-assignment";
-        return report;
+        return return_with_status("skipped:no-reference-assignment");
     }
     report.has_reference_assignment = true;
     report.reference_interval_start = reference_assignment->interval_start;
     report.reference_interval_end = reference_assignment->interval_end;
 
     if (reference_assignment->unique_idx >= cluster_of_unique.size()) {
-        report.status = "skipped:bad-reference-assignment";
-        return report;
+        return return_with_status("skipped:bad-reference-assignment");
     }
 
     const std::size_t ref_cluster_id = cluster_of_unique[reference_assignment->unique_idx];
     report.reference_cluster_id = ref_cluster_id;
     if (ref_cluster_id == 0) {
-        report.status = "skipped:no-reference-cluster";
-        return report;
+        return return_with_status("skipped:no-reference-cluster");
     }
 
     const std::string& ref_seq = unique_alleles[reference_assignment->unique_idx].sequence;
     if (ref_seq.empty()) {
-        report.status = "skipped:no-reference-sequence";
-        return report;
+        return return_with_status("skipped:no-reference-sequence");
     }
 
     std::string gtf_reference_label = reference_path;
@@ -5347,15 +5471,6 @@ VariantBubbleReport write_variant_reports_for_bubble(
                                   std::to_string(start_1based) + "-" +
                                   std::to_string(end_1based);
         }
-    }
-
-    std::string bubble_debug_dir;
-    if (write_debug_files) {
-        if (debug_output_dir.empty()) {
-            throw std::runtime_error("--debug-out-dir cannot be empty when call debug output is enabled");
-        }
-        bubble_debug_dir = debug_output_dir + "/bubble_" + std::to_string(bubble.id);
-        std::filesystem::create_directories(bubble_debug_dir);
     }
 
     std::unordered_map<std::size_t, std::pair<std::string, bool>> representative_path_by_unique;
@@ -5392,7 +5507,25 @@ VariantBubbleReport write_variant_reports_for_bubble(
                 representative_haplotype = path_it->second.first;
             }
         }
+
+        VariantBubbleReport::ClusterDebugStatus cluster_status;
+        cluster_status.cluster_id = cluster.cluster_id;
+        cluster_status.is_reference_cluster = (cluster.cluster_id == ref_cluster_id);
+        cluster_status.representative_allele_id = rep_allele_id;
+        cluster_status.representative_haplotype = representative_haplotype;
+        cluster_status.reference_length_bp = ref_seq.size();
+        cluster_status.cluster_length_bp = cluster_seq.size();
+
+        std::string cluster_debug_dir;
+        if (write_debug_files) {
+            cluster_debug_dir = bubble_debug_dir + "/cluster_" + std::to_string(cluster.cluster_id);
+            std::filesystem::create_directories(cluster_debug_dir);
+        }
+
         if (cluster_seq.empty()) {
+            cluster_status.status = "skipped:empty-cluster-sequence";
+            write_cluster_status_text(cluster_debug_dir, cluster_status);
+            report.cluster_statuses.push_back(std::move(cluster_status));
             continue;
         }
 
@@ -5416,16 +5549,22 @@ VariantBubbleReport write_variant_reports_for_bubble(
             minimap_best_n,
             minimap_emit_secondary);
         if (!map_result.best.ok) {
+            cluster_status.status = "skipped:no-minimap-best-hit";
+            write_cluster_status_text(cluster_debug_dir, cluster_status);
+            report.cluster_statuses.push_back(std::move(cluster_status));
             continue;
         }
+        cluster_status.minimap_best_ok = true;
 
         const bool rev_better = map_result.best.reverse;
         const std::string orientation = rev_better ? "-" : "+";
+        cluster_status.orientation = orientation;
         const std::string cluster_seq_rc = reverse_complement(cluster_seq);
         const std::string& cmp_seq = rev_better ? cluster_seq_rc : cluster_seq;
         const int best_dist = std::max(0, map_result.best.edit_distance);
         const std::size_t max_len = std::max<std::size_t>(1, std::max(ref_seq.size(), cmp_seq.size()));
         const double best_norm = static_cast<double>(best_dist) / static_cast<double>(max_len);
+        cluster_status.best_edit_distance_norm = best_norm;
         const long long len_delta = static_cast<long long>(cmp_seq.size()) - static_cast<long long>(ref_seq.size());
         const std::size_t lcp_bp = longest_common_prefix_bp(ref_seq, cmp_seq);
         const std::size_t lcs_bp = longest_common_suffix_bp(ref_seq, cmp_seq, lcp_bp);
@@ -5467,12 +5606,9 @@ VariantBubbleReport write_variant_reports_for_bubble(
             coarse.primary = true;
             paf_records.push_back(std::move(coarse));
         }
+        cluster_status.paf_records = paf_records.size();
 
-        std::string cluster_debug_dir;
         if (write_debug_files) {
-            cluster_debug_dir = bubble_debug_dir + "/cluster_" + std::to_string(cluster.cluster_id);
-            std::filesystem::create_directories(cluster_debug_dir);
-
             const std::string reference_fasta = cluster_debug_dir + "/reference.fa";
             const std::string representative_fasta = cluster_debug_dir + "/representative.fa";
             const std::string paf_path = cluster_debug_dir + "/alignment.paf";
@@ -5607,6 +5743,7 @@ VariantBubbleReport write_variant_reports_for_bubble(
 
             ++report.dotplots_written;
             ++report.debug_reports_written;
+            cluster_status.dotplot_written = true;
 
             const std::string cluster_vcf_path = cluster_debug_dir + "/cluster_vs_reference.vcf";
             const ParsedReferencePath debug_ref_meta = parse_reference_path_label(gtf_reference_label);
@@ -5622,6 +5759,7 @@ VariantBubbleReport write_variant_reports_for_bubble(
                 ref_seq,
                 cmp_seq,
                 atomic_events);
+            cluster_status.pairwise_vcf_written = true;
         }
 
         if (!atomic_events.empty()) {
@@ -5664,8 +5802,12 @@ VariantBubbleReport write_variant_reports_for_bubble(
                 report.vcf_rows.push_back(std::move(row));
             }
         }
+        cluster_status.event_count = atomic_events.size();
+        cluster_status.status = atomic_events.empty() ? "ok:no-sv-events" : "ok:sv-events";
+        write_cluster_status_text(cluster_debug_dir, cluster_status);
+        report.cluster_statuses.push_back(std::move(cluster_status));
     }
-
+    write_bubble_debug_status();
     return report;
 }
 
@@ -6627,17 +6769,16 @@ void write_headers(
     std::ofstream& assignments_out,
     std::ofstream* cluster_sequences_out) {
     clusters_out
-        << "bubble_id,source,sink,nesting_level,cluster_id,representative_allele_id,representative_length,"
-        << "representative_mode,member_allele_count,total_path_support,member_alleles,representative_signature\n";
+        << "bubble_id,source,sink,cluster_id,representative_allele_id,total_path_support,member_alleles\n";
 
     assignments_out
-        << "bubble_id,source,sink,path_name,path_type,cluster_id,allele_id,allele_length,interval_start,interval_end,"
-        << "interval_step_count,source_to_sink\n";
+        << "bubble_id,source,sink,path_name,cluster_id,allele_id,allele_length,interval_start,interval_end,"
+        << "source_to_sink\n";
 
     if (cluster_sequences_out != nullptr) {
         (*cluster_sequences_out)
-            << "bubble_id,source,sink,nesting_level,cluster_id,representative_allele_id,"
-            << "member_allele_count,total_path_support,sequence_length,representative_mode,sequence\n";
+            << "bubble_id,source,sink,cluster_id,representative_allele_id,"
+            << "total_path_support,sequence_length,sequence\n";
     }
 }
 
@@ -6937,7 +7078,6 @@ void call_alleles_to_csv(
                 << "[allele] bubble " << (bubble_idx + 1) << "/" << bubbles.size()
                 << " id=" << bubble.id
                 << " inside_nodes=" << bubble.inside.size()
-                << " nesting=" << bubble.nesting_level
                 << "\n";
         }
 
@@ -7010,10 +7150,8 @@ void call_alleles_to_csv(
             PathAssignment assignment;
             assignment.unique_idx = unique_idx;
             assignment.path_name = path.name;
-            assignment.path_type = path.type;
             assignment.interval_start = best_interval->left;
             assignment.interval_end = best_interval->right;
-            assignment.interval_step_count = (best_interval->right - best_interval->left) + 1;
             assignment.source_to_sink = best_interval->source_to_sink;
             assignments.push_back(std::move(assignment));
         }
@@ -7199,15 +7337,10 @@ void call_alleles_to_csv(
                 << bubble.id << ','
                 << csv_escape(bubble.source) << ','
                 << csv_escape(bubble.sink) << ','
-                << bubble.nesting_level << ','
                 << cluster.cluster_id << ','
                 << rep.allele_id << ','
-                << rep.sequence_length << ','
-                << (rep.uses_sequence_similarity ? "sequence" : "walk") << ','
-                << cluster.member_unique_idxs.size() << ','
                 << cluster.total_path_support << ','
-                << csv_escape(join_size_t(member_alleles, ';')) << ','
-                << csv_escape(rep.signature)
+                << csv_escape(join_size_t(member_alleles, ';'))
                 << '\n';
 
             if (options.write_cluster_sequences) {
@@ -7215,13 +7348,10 @@ void call_alleles_to_csv(
                     << bubble.id << ','
                     << csv_escape(bubble.source) << ','
                     << csv_escape(bubble.sink) << ','
-                    << bubble.nesting_level << ','
                     << cluster.cluster_id << ','
                     << rep.allele_id << ','
-                    << cluster.member_unique_idxs.size() << ','
                     << cluster.total_path_support << ','
                     << rep.sequence_length << ','
-                    << (rep.uses_sequence_similarity ? "sequence" : "walk") << ','
                     << csv_escape(rep.sequence)
                     << '\n';
                 summary.cluster_sequences_written += 1;
@@ -7236,13 +7366,11 @@ void call_alleles_to_csv(
                 << csv_escape(bubble.source) << ','
                 << csv_escape(bubble.sink) << ','
                 << csv_escape(assignment.path_name) << ','
-                << assignment.path_type << ','
                 << cluster_id << ','
                 << allele.allele_id << ','
                 << allele.sequence_length << ','
                 << assignment.interval_start << ','
                 << assignment.interval_end << ','
-                << assignment.interval_step_count << ','
                 << (assignment.source_to_sink ? 1 : 0)
                 << '\n';
         }

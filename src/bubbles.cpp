@@ -7,6 +7,7 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <queue>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -182,6 +183,56 @@ std::string endpoint_key(const std::string& a, const std::string& b) {
     return b + "|" + a;
 }
 
+bool is_unsigned_decimal(const std::string& s) {
+    if (s.empty()) {
+        return false;
+    }
+    for (const char c : s) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string_view strip_leading_zeros(std::string_view s) {
+    std::size_t i = 0;
+    while (i + 1 < s.size() && s[i] == '0') {
+        ++i;
+    }
+    return s.substr(i);
+}
+
+bool node_id_less(const std::string& a, const std::string& b) {
+    const bool a_num = is_unsigned_decimal(a);
+    const bool b_num = is_unsigned_decimal(b);
+    if (a_num && b_num) {
+        const std::string_view av = strip_leading_zeros(a);
+        const std::string_view bv = strip_leading_zeros(b);
+        if (av.size() != bv.size()) {
+            return av.size() < bv.size();
+        }
+        if (av != bv) {
+            return av < bv;
+        }
+        return a < b;
+    }
+    if (a_num != b_num) {
+        return a_num;
+    }
+    return a < b;
+}
+
+bool bubble_endpoint_less(const Bubble& a, const Bubble& b) {
+    if (a.source != b.source) {
+        return node_id_less(a.source, b.source);
+    }
+    if (a.sink != b.sink) {
+        return node_id_less(a.sink, b.sink);
+    }
+    return a.inside.size() < b.inside.size();
+}
+
 std::string join_strings(const std::vector<std::string>& values, char sep) {
     std::ostringstream oss;
     for (std::size_t i = 0; i < values.size(); ++i) {
@@ -191,6 +242,200 @@ std::string join_strings(const std::vector<std::string>& values, char sep) {
         oss << values[i];
     }
     return oss.str();
+}
+
+struct NodeAdjacency {
+    std::unordered_map<std::string, std::vector<std::string>> neighbors;
+    std::unordered_map<std::string, std::size_t> node_len_bp;
+};
+
+NodeAdjacency build_node_adjacency(const Graph& graph) {
+    NodeAdjacency out;
+    out.neighbors.reserve(graph.nodes.size() * 2);
+    out.node_len_bp.reserve(graph.nodes.size() * 2);
+
+    for (const auto& [node_id, node] : graph.nodes) {
+        out.node_len_bp[node_id] = std::max<std::size_t>(1, node.sequence.size());
+    }
+
+    auto add_neighbor = [&](const std::string& from, const std::string& to) {
+        auto& vec = out.neighbors[from];
+        vec.push_back(to);
+    };
+
+    for (const auto& [node_id, node] : graph.nodes) {
+        for (const auto& n : node.start) {
+            if (graph.nodes.find(n.node_id) == graph.nodes.end()) {
+                continue;
+            }
+            add_neighbor(node_id, n.node_id);
+            add_neighbor(n.node_id, node_id);
+        }
+        for (const auto& n : node.end) {
+            if (graph.nodes.find(n.node_id) == graph.nodes.end()) {
+                continue;
+            }
+            add_neighbor(node_id, n.node_id);
+            add_neighbor(n.node_id, node_id);
+        }
+    }
+
+    for (auto& [node_id, vec] : out.neighbors) {
+        (void)node_id;
+        std::sort(vec.begin(), vec.end());
+        vec.erase(std::unique(vec.begin(), vec.end()), vec.end());
+    }
+
+    return out;
+}
+
+std::optional<std::vector<std::string>> shortest_node_path_within_bp(
+    const NodeAdjacency& adj,
+    const std::string& from_node,
+    const std::string& to_node,
+    std::size_t max_bp) {
+
+    const auto it_from = adj.node_len_bp.find(from_node);
+    const auto it_to = adj.node_len_bp.find(to_node);
+    if (it_from == adj.node_len_bp.end() || it_to == adj.node_len_bp.end()) {
+        return std::nullopt;
+    }
+
+    const std::size_t start_cost = it_from->second;
+    if (start_cost > max_bp) {
+        return std::nullopt;
+    }
+
+    using HeapItem = std::pair<std::size_t, std::string>;
+    std::priority_queue<HeapItem, std::vector<HeapItem>, std::greater<HeapItem>> heap;
+    std::unordered_map<std::string, std::size_t> dist;
+    std::unordered_map<std::string, std::string> prev;
+    dist.reserve(adj.node_len_bp.size() / 2 + 16);
+    prev.reserve(adj.node_len_bp.size() / 2 + 16);
+
+    dist[from_node] = start_cost;
+    heap.push({start_cost, from_node});
+
+    while (!heap.empty()) {
+        auto [d, node] = heap.top();
+        heap.pop();
+        const auto dist_it = dist.find(node);
+        if (dist_it == dist.end() || d != dist_it->second) {
+            continue;
+        }
+        if (d > max_bp) {
+            continue;
+        }
+        if (node == to_node) {
+            break;
+        }
+
+        const auto neigh_it = adj.neighbors.find(node);
+        if (neigh_it == adj.neighbors.end()) {
+            continue;
+        }
+        for (const auto& nxt : neigh_it->second) {
+            const auto len_it = adj.node_len_bp.find(nxt);
+            if (len_it == adj.node_len_bp.end()) {
+                continue;
+            }
+            const std::size_t nd = d + len_it->second;
+            if (nd > max_bp) {
+                continue;
+            }
+            const auto old_it = dist.find(nxt);
+            if (old_it == dist.end() || nd < old_it->second) {
+                dist[nxt] = nd;
+                prev[nxt] = node;
+                heap.push({nd, nxt});
+            }
+        }
+    }
+
+    const auto to_dist_it = dist.find(to_node);
+    if (to_dist_it == dist.end() || to_dist_it->second > max_bp) {
+        return std::nullopt;
+    }
+
+    std::vector<std::string> path_rev;
+    path_rev.push_back(to_node);
+    while (!path_rev.empty() && path_rev.back() != from_node) {
+        const auto p_it = prev.find(path_rev.back());
+        if (p_it == prev.end()) {
+            return std::nullopt;
+        }
+        path_rev.push_back(p_it->second);
+    }
+    if (path_rev.empty() || path_rev.back() != from_node) {
+        return std::nullopt;
+    }
+    std::reverse(path_rev.begin(), path_rev.end());
+    return path_rev;
+}
+
+std::vector<Bubble> merge_nearby_bubbles(
+    const Graph& graph,
+    const std::vector<Bubble>& input,
+    std::size_t max_bp) {
+
+    if (max_bp == 0 || input.size() < 2) {
+        return input;
+    }
+
+    std::vector<Bubble> bubbles = input;
+    std::sort(bubbles.begin(), bubbles.end(), bubble_endpoint_less);
+
+    const NodeAdjacency adj = build_node_adjacency(graph);
+
+    std::vector<Bubble> merged;
+    merged.reserve(bubbles.size());
+    Bubble current = bubbles.front();
+    for (std::size_t i = 1; i < bubbles.size(); ++i) {
+        const Bubble& next = bubbles[i];
+        const auto path_opt = shortest_node_path_within_bp(adj, current.sink, next.source, max_bp);
+        if (!path_opt.has_value()) {
+            merged.push_back(std::move(current));
+            current = next;
+            continue;
+        }
+
+        std::unordered_set<std::string> inside_set;
+        inside_set.reserve((current.inside.size() + next.inside.size() + path_opt->size()) * 2);
+        for (const auto& n : current.inside) {
+            inside_set.insert(n);
+        }
+        for (const auto& n : next.inside) {
+            inside_set.insert(n);
+        }
+        // Old boundary nodes become internal when two nearby bubbles are fused.
+        inside_set.insert(current.sink);
+        inside_set.insert(next.source);
+        // Include any connector nodes on the shortest path between boundaries.
+        for (std::size_t pi = 1; pi + 1 < path_opt->size(); ++pi) {
+            inside_set.insert((*path_opt)[pi]);
+        }
+
+        Bubble fused = current;
+        fused.sink = next.sink;
+        fused.type = BubbleType::Super;
+        fused.path_support = 0;
+        fused.min_inside_bp = 0;
+        fused.max_inside_bp = 0;
+        fused.long_path_support = 0;
+        fused.inversion_signal = false;
+        fused.inside.clear();
+        fused.inside.reserve(inside_set.size());
+        for (const auto& node_id : inside_set) {
+            if (node_id == fused.source || node_id == fused.sink) {
+                continue;
+            }
+            fused.inside.push_back(node_id);
+        }
+        std::sort(fused.inside.begin(), fused.inside.end());
+        current = std::move(fused);
+    }
+    merged.push_back(std::move(current));
+    return merged;
 }
 
 std::optional<std::uint32_t> find_single_open_handle(
@@ -636,9 +881,6 @@ void collect_snarl_jsonl_candidates(
         throw std::runtime_error("Failed to open snarl JSONL input: " + options.snarls_input_path);
     }
 
-    std::unordered_set<std::string> top_level_with_children;
-    std::unordered_map<std::string, std::vector<std::size_t>> debug_indices_by_endpoint;
-
     std::string line;
     std::size_t candidate_id = 0;
     while (std::getline(snarls_in, line)) {
@@ -648,18 +890,8 @@ void collect_snarl_jsonl_candidates(
         if (line.find("\"start\"") == std::string::npos || line.find("\"end\"") == std::string::npos) {
             continue;
         }
-        // Keep top-level snarls only; nested child snarls are represented via parent links.
+        // Keep top-level snarls only.
         if (line.find("\"parent\"") != std::string::npos) {
-            const std::size_t parent_pos = line.find("\"parent\"");
-            if (parent_pos != std::string::npos) {
-                const std::string parent_chunk = line.substr(parent_pos);
-                const auto parent_source_opt = extract_node_id_for_key(parent_chunk, "start", false);
-                const auto parent_sink_opt = extract_node_id_for_key(parent_chunk, "end", false);
-                if (parent_source_opt.has_value() && parent_sink_opt.has_value() &&
-                    *parent_source_opt != *parent_sink_opt) {
-                    top_level_with_children.insert(endpoint_key(*parent_source_opt, *parent_sink_opt));
-                }
-            }
             continue;
         }
 
@@ -721,14 +953,11 @@ void collect_snarl_jsonl_candidates(
         debug.source = *source_opt;
         debug.sink = *sink_opt;
         debug.inside_node_count = inside.size();
-        const std::string key = endpoint_key(*source_opt, *sink_opt);
-
         if (inside.empty()) {
             if (debug_entries != nullptr) {
                 debug.accepted = false;
                 debug.reason = "reject:empty-inside";
                 debug_entries->push_back(std::move(debug));
-                debug_indices_by_endpoint[key].push_back(debug_entries->size() - 1);
             }
             continue;
         }
@@ -742,23 +971,9 @@ void collect_snarl_jsonl_candidates(
             debug.accepted = kept;
             debug.reason = kept ? "accept:snarl-jsonl" : "reject:duplicate-endpoints-smaller-inside";
             debug_entries->push_back(std::move(debug));
-            debug_indices_by_endpoint[key].push_back(debug_entries->size() - 1);
         }
     }
 
-    if (debug_entries != nullptr && !top_level_with_children.empty()) {
-        for (const auto& key : top_level_with_children) {
-            const auto it = debug_indices_by_endpoint.find(key);
-            if (it == debug_indices_by_endpoint.end()) {
-                continue;
-            }
-            for (const std::size_t idx : it->second) {
-                if (idx < debug_entries->size()) {
-                    (*debug_entries)[idx].nested = true;
-                }
-            }
-        }
-    }
 }
 
 std::optional<std::size_t> pick_reference_path_index_for_snarl_macro(
@@ -1184,74 +1399,6 @@ std::vector<PathStep> canonical_steps_for_bubble(
     return out;
 }
 
-void assign_nesting(std::vector<Bubble>& bubbles) {
-    if (bubbles.empty()) {
-        return;
-    }
-
-    std::vector<std::unordered_set<std::string>> node_sets;
-    node_sets.reserve(bubbles.size());
-
-    for (const auto& bubble : bubbles) {
-        node_sets.push_back(nodes_in_bubble(bubble));
-    }
-
-    std::vector<int> parent_idx(bubbles.size(), -1);
-
-    for (std::size_t i = 0; i < bubbles.size(); ++i) {
-        std::size_t best_parent_size = std::numeric_limits<std::size_t>::max();
-
-        for (std::size_t j = 0; j < bubbles.size(); ++j) {
-            if (i == j) {
-                continue;
-            }
-            if (node_sets[j].size() <= node_sets[i].size()) {
-                continue;
-            }
-            if (node_sets[j].find(bubbles[i].source) == node_sets[j].end() ||
-                node_sets[j].find(bubbles[i].sink) == node_sets[j].end()) {
-                continue;
-            }
-
-            bool subset = true;
-            for (const auto& node : node_sets[i]) {
-                if (node_sets[j].find(node) == node_sets[j].end()) {
-                    subset = false;
-                    break;
-                }
-            }
-            if (!subset) {
-                continue;
-            }
-
-            if (node_sets[j].size() < best_parent_size) {
-                best_parent_size = node_sets[j].size();
-                parent_idx[i] = static_cast<int>(j);
-            }
-        }
-    }
-
-    std::vector<std::size_t> level_cache(bubbles.size(), 0);
-    std::function<std::size_t(std::size_t)> level_of = [&](std::size_t idx) -> std::size_t {
-        if (level_cache[idx] != 0) {
-            return level_cache[idx];
-        }
-        if (parent_idx[idx] < 0) {
-            level_cache[idx] = 1;
-            return 1;
-        }
-        const std::size_t parent_level = level_of(static_cast<std::size_t>(parent_idx[idx]));
-        level_cache[idx] = parent_level + 1;
-        return level_cache[idx];
-    };
-
-    for (std::size_t i = 0; i < bubbles.size(); ++i) {
-        const int p = parent_idx[i];
-        bubbles[i].parent_id = (p < 0) ? 0 : bubbles[static_cast<std::size_t>(p)].id;
-        bubbles[i].nesting_level = level_of(i);
-    }
-}
-
 void assign_ids(std::vector<Bubble>& bubbles) {
     for (std::size_t i = 0; i < bubbles.size(); ++i) {
         bubbles[i].id = i + 1;
@@ -1307,7 +1454,6 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
         Bubble bubble;
         bubble.source = packed.node_ids[cand.source];
         bubble.sink = packed.node_ids[cand.sink];
-        bubble.site_mode = SiteMode::Snarl;
         bubble.inside.reserve(cand.inside.size());
         for (const std::uint32_t inside_idx : cand.inside) {
             bubble.inside.push_back(packed.node_ids[inside_idx]);
@@ -1315,69 +1461,84 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
         bubbles.push_back(std::move(bubble));
     }
 
-    for (auto& bubble : bubbles) {
-        std::size_t supported_paths = 0;
-        std::size_t min_inside_bp = std::numeric_limits<std::size_t>::max();
-        std::size_t max_inside_bp = 0;
-        std::size_t long_path_support = 0;
-        bool has_inside_bp = false;
-        bool inversion_signal = false;
+    const auto compute_bubble_metrics = [&](std::vector<Bubble>& target) {
+        for (auto& bubble : target) {
+            std::size_t supported_paths = 0;
+            std::size_t min_inside_bp = std::numeric_limits<std::size_t>::max();
+            std::size_t max_inside_bp = 0;
+            std::size_t long_path_support = 0;
+            bool has_inside_bp = false;
+            bool inversion_signal = false;
 
-        std::unordered_set<std::string> inside_nodes;
-        inside_nodes.reserve(bubble.inside.size() * 2);
-        for (const auto& n : bubble.inside) {
-            inside_nodes.insert(n);
-        }
-        std::unordered_map<std::string, unsigned char> orientation_mask;
-        orientation_mask.reserve(bubble.inside.size() * 2);
-
-        for (std::size_t p_idx = 0; p_idx < path_indexes.size(); ++p_idx) {
-            const auto interval = find_best_interval(path_indexes[p_idx], bubble);
-            if (!interval.has_value()) {
-                continue;
+            std::unordered_set<std::string> inside_nodes;
+            inside_nodes.reserve(bubble.inside.size() * 2);
+            for (const auto& n : bubble.inside) {
+                inside_nodes.insert(n);
             }
-            ++supported_paths;
+            std::unordered_map<std::string, unsigned char> orientation_mask;
+            orientation_mask.reserve(bubble.inside.size() * 2);
 
-            const auto steps = canonical_steps_for_bubble(graph.paths[p_idx], bubble, *interval);
-            if (steps.size() < 2) {
-                continue;
-            }
+            for (std::size_t p_idx = 0; p_idx < path_indexes.size(); ++p_idx) {
+                const auto interval = find_best_interval(path_indexes[p_idx], bubble);
+                if (!interval.has_value()) {
+                    continue;
+                }
+                ++supported_paths;
 
-            std::size_t inside_bp = 0;
-            for (std::size_t i = 1; i + 1 < steps.size(); ++i) {
-                const auto& step = steps[i];
-                if (inside_nodes.find(step.node_id) == inside_nodes.end()) {
+                const auto steps = canonical_steps_for_bubble(graph.paths[p_idx], bubble, *interval);
+                if (steps.size() < 2) {
                     continue;
                 }
 
-                const auto node_it = graph.nodes.find(step.node_id);
-                if (node_it != graph.nodes.end()) {
-                    inside_bp += node_it->second.sequence.size();
+                std::size_t inside_bp = 0;
+                for (std::size_t i = 1; i + 1 < steps.size(); ++i) {
+                    const auto& step = steps[i];
+                    if (inside_nodes.find(step.node_id) == inside_nodes.end()) {
+                        continue;
+                    }
+
+                    const auto node_it = graph.nodes.find(step.node_id);
+                    if (node_it != graph.nodes.end()) {
+                        inside_bp += node_it->second.sequence.size();
+                    }
+
+                    auto& mask = orientation_mask[step.node_id];
+                    mask |= static_cast<unsigned char>(step.reverse ? 0x2 : 0x1);
+                    if (mask == 0x3) {
+                        inversion_signal = true;
+                    }
                 }
 
-                auto& mask = orientation_mask[step.node_id];
-                mask |= static_cast<unsigned char>(step.reverse ? 0x2 : 0x1);
-                if (mask == 0x3) {
-                    inversion_signal = true;
+                min_inside_bp = std::min(min_inside_bp, inside_bp);
+                max_inside_bp = std::max(max_inside_bp, inside_bp);
+                has_inside_bp = true;
+
+                if (options.min_variant_bp > 0 && inside_bp >= options.min_variant_bp) {
+                    ++long_path_support;
                 }
             }
 
-            min_inside_bp = std::min(min_inside_bp, inside_bp);
-            max_inside_bp = std::max(max_inside_bp, inside_bp);
-            has_inside_bp = true;
-
-            if (options.min_variant_bp > 0 && inside_bp >= options.min_variant_bp) {
-                ++long_path_support;
+            bubble.path_support = supported_paths;
+            if (has_inside_bp) {
+                bubble.min_inside_bp = min_inside_bp;
+                bubble.max_inside_bp = max_inside_bp;
+            } else {
+                bubble.min_inside_bp = 0;
+                bubble.max_inside_bp = 0;
             }
+            bubble.long_path_support = long_path_support;
+            bubble.inversion_signal = inversion_signal;
         }
+    };
 
-        bubble.path_support = supported_paths;
-        if (has_inside_bp) {
-            bubble.min_inside_bp = min_inside_bp;
-            bubble.max_inside_bp = max_inside_bp;
+    compute_bubble_metrics(bubbles);
+
+    std::vector<Bubble> non_snp_bubbles;
+    non_snp_bubbles.reserve(bubbles.size());
+    for (const auto& bubble : bubbles) {
+        if (bubble.max_inside_bp > 1 || bubble.inversion_signal) {
+            non_snp_bubbles.push_back(bubble);
         }
-        bubble.long_path_support = long_path_support;
-        bubble.inversion_signal = inversion_signal;
     }
 
     struct DebugMetrics {
@@ -1434,6 +1595,31 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
             bubbles.end());
     }
 
+    if (options.merge_nearby_bp > 0 && bubbles.size() > 1) {
+        std::unordered_set<std::string> premerge_keys;
+        premerge_keys.reserve(bubbles.size() * 2);
+        for (const auto& bubble : bubbles) {
+            premerge_keys.insert(endpoint_key(bubble.source, bubble.sink));
+        }
+
+        bubbles = merge_nearby_bubbles(graph, bubbles, options.merge_nearby_bp);
+        compute_bubble_metrics(bubbles);
+
+        std::unordered_set<std::string> postmerge_keys;
+        postmerge_keys.reserve(bubbles.size() * 2);
+        for (const auto& bubble : bubbles) {
+            postmerge_keys.insert(endpoint_key(bubble.source, bubble.sink));
+        }
+        for (const auto& key : premerge_keys) {
+            if (postmerge_keys.find(key) != postmerge_keys.end()) {
+                continue;
+            }
+            if (rejection_reason_by_endpoint.find(key) == rejection_reason_by_endpoint.end()) {
+                rejection_reason_by_endpoint[key] = "reject:merged-nearby";
+            }
+        }
+    }
+
     for (auto& bubble : bubbles) {
         if (is_simple_bubble(graph, bubble)) {
             bubble.type = BubbleType::Simple;
@@ -1444,37 +1630,9 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
         }
     }
 
-    std::sort(bubbles.begin(), bubbles.end(), [](const Bubble& a, const Bubble& b) {
-        if (a.source != b.source) {
-            return a.source < b.source;
-        }
-        if (a.sink != b.sink) {
-            return a.sink < b.sink;
-        }
-        return a.inside.size() < b.inside.size();
-    });
+    std::sort(bubbles.begin(), bubbles.end(), bubble_endpoint_less);
 
     assign_ids(bubbles);
-    assign_nesting(bubbles);
-
-    if (options.max_nesting_level > 0) {
-        for (const auto& bubble : bubbles) {
-            if (bubble.nesting_level > options.max_nesting_level) {
-                const std::string key = endpoint_key(bubble.source, bubble.sink);
-                if (rejection_reason_by_endpoint.find(key) == rejection_reason_by_endpoint.end()) {
-                    rejection_reason_by_endpoint[key] = "reject:max-nesting-level";
-                }
-            }
-        }
-        bubbles.erase(
-            std::remove_if(
-                bubbles.begin(),
-                bubbles.end(),
-                [&](const Bubble& b) { return b.nesting_level > options.max_nesting_level; }),
-            bubbles.end());
-        assign_ids(bubbles);
-        assign_nesting(bubbles);
-    }
 
     std::unordered_set<std::string> final_endpoint_keys;
     final_endpoint_keys.reserve(bubbles.size() * 2);
@@ -1484,6 +1642,16 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
     }
 
     if (options.collect_snarl_debug) {
+        std::size_t next_debug_id = 0;
+        std::unordered_set<std::string> debug_endpoint_keys;
+        debug_endpoint_keys.reserve(snarl_debug.size() * 2 + bubbles.size() * 2);
+        for (const auto& debug : snarl_debug) {
+            next_debug_id = std::max(next_debug_id, debug.candidate_id);
+            if (!debug.source.empty() && !debug.sink.empty()) {
+                debug_endpoint_keys.insert(endpoint_key(debug.source, debug.sink));
+            }
+        }
+
         for (auto& debug : snarl_debug) {
             if (debug.source.empty() || debug.sink.empty()) {
                 continue;
@@ -1517,10 +1685,28 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
                 }
             }
         }
+
+        for (const auto& bubble : bubbles) {
+            const std::string key = endpoint_key(bubble.source, bubble.sink);
+            if (debug_endpoint_keys.find(key) != debug_endpoint_keys.end()) {
+                continue;
+            }
+            SnarlDebugEntry synthetic;
+            synthetic.candidate_id = ++next_debug_id;
+            synthetic.source = bubble.source;
+            synthetic.sink = bubble.sink;
+            synthetic.inside_node_count = bubble.inside.size();
+            synthetic.n_paths = bubble.path_support;
+            synthetic.min_inside_bp = bubble.min_inside_bp;
+            synthetic.accepted = true;
+            synthetic.reason = "accept:final-merged";
+            snarl_debug.push_back(std::move(synthetic));
+        }
     }
 
     BubbleCallReport report;
     report.bubbles = std::move(bubbles);
+    report.non_snp_bubbles = std::move(non_snp_bubbles);
     if (options.collect_snarl_debug) {
         report.snarl_debug = std::move(snarl_debug);
     }

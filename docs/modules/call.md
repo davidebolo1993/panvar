@@ -25,12 +25,28 @@ Optional gene copy-delta annotation can be enabled with `--pangene-bed`.
 ## Required inputs
 
 - `--gfa <graph.gfa>`
-- `--bubbles-csv-in <module1.bubbles.csv>`
-- `--clusters-csv-in <module2.allele_clusters.csv>`
-- `--assignments-csv-in <module2.allele_assignments.csv>`
+- one of:
+  - `--bubble-prefix-in <module1-prefix>` (auto uses `<module1-prefix>.bubbles.csv`)
+  - `--bubbles-csv-in <module1.bubbles.csv>`
+- one of:
+  - `--allele-prefix-in <module2-prefix>` (auto uses `<module2-prefix>.allele_clusters.csv` and `<module2-prefix>.allele_assignments.csv`)
+  - both `--clusters-csv-in <module2.allele_clusters.csv>` and `--assignments-csv-in <module2.allele_assignments.csv>`
 - `--reference-path <path>`
 
+`call` accepts both the current simplified module-1 CSV schema and older legacy module-1 schemas.
+
 `call` does not re-cluster alleles.
+
+## Module-2 CSV expectations
+
+`call` expects these required columns in module-2 inputs:
+
+- clusters CSV (`*.allele_clusters.csv`):
+  - `bubble_id,source,sink,cluster_id,representative_allele_id,total_path_support,member_alleles`
+- assignments CSV (`*.allele_assignments.csv`):
+  - `bubble_id,source,sink,path_name,cluster_id,allele_id,allele_length,interval_start,interval_end,source_to_sink`
+
+Extra columns are ignored.
 
 ## Calling algorithm
 
@@ -107,15 +123,22 @@ If debug is enabled, the tool writes per-bubble/per-cluster alignment artifacts 
 
 Layout:
 
+- `<debug>/debug_summary.tsv` (one row per bubble with status and counts)
+- `<debug>/bubble_<id>/bubble_status.tsv`
+- `<debug>/bubble_<id>/cluster_status.tsv`
 - `<debug>/bubble_<id>/cluster_<cluster_id>/reference.fa`
 - `<debug>/bubble_<id>/cluster_<cluster_id>/representative.fa`
 - `<debug>/bubble_<id>/cluster_<cluster_id>/alignment.paf`
 - `<debug>/bubble_<id>/cluster_<cluster_id>/dotplot.svg`
 - `<debug>/bubble_<id>/cluster_<cluster_id>/cluster_vs_reference.vcf`
+- `<debug>/bubble_<id>/cluster_<cluster_id>/status.txt`
 
 Notes:
 
 - no decision traces and no CIGAR interpretation TSVs are emitted in debug mode
+- skipped bubbles/clusters are explicitly annotated:
+  - bubble-level skip reason in `bubble_status.tsv` and `debug_summary.tsv`
+  - cluster-level skip reason in `cluster_status.tsv` and `cluster_<id>/status.txt`
 - `alignment.paf` is emitted from minimap2 C API hits (preset from `--minimap-preset`, default `asm20`; `-c`, `--eqx`)
 - dotplot is drawn from alignment segments (CIGAR-aware), so indels appear as breaks rather than a single forced diagonal
 - called variant breakpoints are overlaid as grey dashed guides:
@@ -176,6 +199,15 @@ Notes:
 - `--vcf-merge-min-seq-sim <X>` (default `0.80`)
 - `--vcf-merge-max-edit-frac <X>` (default `0.35`)
   - effective cap is `min(--vcf-merge-max-edit-frac, 1 - --vcf-merge-min-seq-sim)`
+  - if `--vcf-merge-min-seq-sim=0.80`, the effective max edit fraction cannot exceed `0.20`
+  - this guarantees consistency between the identity threshold and allowed edit budget
+
+How the merge knobs relate:
+
+- `--vcf-merge-min-seq-sim`: primary biological similarity threshold
+- `--vcf-merge-max-edit-frac`: computational cap used in bounded edit-distance comparisons
+- `--vcf-merge-lenient-window-bp`: larger coordinate window used only in `lenient` mode fallback
+- `--vcf-merge-lenient-min-ref-jaccard`: non-INS fallback guard requiring meaningful reference-interval overlap when strict boundary checks fail
 
 Merge behavior:
 
@@ -190,9 +222,8 @@ Merge behavior:
 ./build/panvar call \
   -i tests/real_data/c4.gfa \
   -o tests/results/c4/call \
-  --bubbles-csv-in tests/results/c4/bubble.bubbles.csv \
-  --clusters-csv-in tests/results/c4/allele.allele_clusters.csv \
-  --assignments-csv-in tests/results/c4/allele.allele_assignments.csv \
+  --bubble-prefix-in tests/results/c4/bubble \
+  --allele-prefix-in tests/results/c4/allele \
   --reference-path grch38#1#chr6:31891045-32123783 \
   --dotplot-gtf /path/to/gencode.annotation.gtf.gz \
   --dotplot-gene-match C4 \

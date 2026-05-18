@@ -14,10 +14,8 @@ namespace panvar {
 struct PathAssignment {
     std::size_t unique_idx = 0;
     std::string path_name;
-    char path_type = 'P';
     std::size_t interval_start = 0;
     std::size_t interval_end = 0;
-    std::size_t interval_step_count = 0;
     bool source_to_sink = true;
 };
 
@@ -44,15 +42,10 @@ struct PrecomputedClusterRow {
     std::size_t bubble_id = 0;
     std::string source;
     std::string sink;
-    std::size_t nesting_level = 1;
     std::size_t cluster_id = 0;
     std::size_t representative_allele_id = 0;
-    std::size_t representative_length = 0;
-    std::string representative_mode;
-    std::size_t member_allele_count = 0;
     std::size_t total_path_support = 0;
     std::vector<std::size_t> member_alleles;
-    std::string representative_signature;
 };
 
 struct PrecomputedAssignmentRow {
@@ -60,13 +53,11 @@ struct PrecomputedAssignmentRow {
     std::string source;
     std::string sink;
     std::string path_name;
-    char path_type = 'P';
     std::size_t cluster_id = 0;
     std::size_t allele_id = 0;
     std::size_t allele_length = 0;
     std::size_t interval_start = 0;
     std::size_t interval_end = 0;
-    std::size_t interval_step_count = 0;
     bool source_to_sink = true;
 };
 
@@ -74,6 +65,23 @@ using PrecomputedClustersByBubble = std::unordered_map<std::size_t, std::vector<
 using PrecomputedAssignmentsByBubble = std::unordered_map<std::size_t, std::vector<PrecomputedAssignmentRow>>;
 
 struct VariantBubbleReport {
+    struct ClusterDebugStatus {
+        std::size_t cluster_id = 0;
+        bool is_reference_cluster = false;
+        std::size_t representative_allele_id = 0;
+        std::string representative_haplotype = ".";
+        std::size_t reference_length_bp = 0;
+        std::size_t cluster_length_bp = 0;
+        std::size_t paf_records = 0;
+        bool minimap_best_ok = false;
+        std::string orientation = ".";
+        double best_edit_distance_norm = 0.0;
+        std::size_t event_count = 0;
+        bool dotplot_written = false;
+        bool pairwise_vcf_written = false;
+        std::string status = "pending";
+    };
+
     std::size_t reference_cluster_id = 0;
     std::size_t dotplots_written = 0;
     std::size_t debug_reports_written = 0;
@@ -81,8 +89,12 @@ struct VariantBubbleReport {
     bool has_reference_assignment = false;
     std::size_t reference_interval_start = 0;
     std::size_t reference_interval_end = 0;
+    std::size_t clusters_total = 0;
+    std::size_t clusters_with_minimap_hit = 0;
+    std::size_t clusters_with_events = 0;
     std::unordered_map<std::string, std::size_t> cluster_by_path;
     std::unordered_map<std::string, std::size_t> allele_length_by_path;
+    std::vector<ClusterDebugStatus> cluster_statuses;
     struct VariantRecordForVcf {
         std::size_t cluster_id = 0;
         std::size_t event_index = 0;

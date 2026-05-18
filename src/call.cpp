@@ -578,15 +578,10 @@ std::vector<PrecomputedClusterRow> read_precomputed_clusters_csv(
     const std::size_t idx_bubble = required_csv_column(header_idx, "bubble_id");
     const std::size_t idx_source = required_csv_column(header_idx, "source");
     const std::size_t idx_sink = required_csv_column(header_idx, "sink");
-    const std::size_t idx_nesting = required_csv_column(header_idx, "nesting_level");
     const std::size_t idx_cluster = required_csv_column(header_idx, "cluster_id");
     const std::size_t idx_rep_allele = required_csv_column(header_idx, "representative_allele_id");
-    const std::size_t idx_rep_len = required_csv_column(header_idx, "representative_length");
-    const std::size_t idx_rep_mode = required_csv_column(header_idx, "representative_mode");
-    const std::size_t idx_member_count = required_csv_column(header_idx, "member_allele_count");
     const std::size_t idx_support = required_csv_column(header_idx, "total_path_support");
     const std::size_t idx_members = required_csv_column(header_idx, "member_alleles");
-    const std::size_t idx_signature = required_csv_column(header_idx, "representative_signature");
 
     std::vector<PrecomputedClusterRow> rows;
     std::string line;
@@ -613,19 +608,12 @@ std::vector<PrecomputedClusterRow> read_precomputed_clusters_csv(
         row.bubble_id = parse_csv_size(field_or_throw(idx_bubble, "bubble_id"), "bubble_id");
         row.source = field_or_throw(idx_source, "source");
         row.sink = field_or_throw(idx_sink, "sink");
-        row.nesting_level = parse_csv_size(field_or_throw(idx_nesting, "nesting_level"), "nesting_level");
         row.cluster_id = parse_csv_size(field_or_throw(idx_cluster, "cluster_id"), "cluster_id");
         row.representative_allele_id =
             parse_csv_size(field_or_throw(idx_rep_allele, "representative_allele_id"), "representative_allele_id");
-        row.representative_length =
-            parse_csv_size(field_or_throw(idx_rep_len, "representative_length"), "representative_length");
-        row.representative_mode = field_or_throw(idx_rep_mode, "representative_mode");
-        row.member_allele_count =
-            parse_csv_size(field_or_throw(idx_member_count, "member_allele_count"), "member_allele_count");
         row.total_path_support =
             parse_csv_size(field_or_throw(idx_support, "total_path_support"), "total_path_support");
         row.member_alleles = split_semicolon_size_t(field_or_throw(idx_members, "member_alleles"));
-        row.representative_signature = field_or_throw(idx_signature, "representative_signature");
         rows.push_back(std::move(row));
     }
 
@@ -659,13 +647,11 @@ std::vector<PrecomputedAssignmentRow> read_precomputed_assignments_csv(
     const std::size_t idx_source = required_csv_column(header_idx, "source");
     const std::size_t idx_sink = required_csv_column(header_idx, "sink");
     const std::size_t idx_path = required_csv_column(header_idx, "path_name");
-    const std::size_t idx_path_type = required_csv_column(header_idx, "path_type");
     const std::size_t idx_cluster = required_csv_column(header_idx, "cluster_id");
     const std::size_t idx_allele = required_csv_column(header_idx, "allele_id");
     const std::size_t idx_allele_len = required_csv_column(header_idx, "allele_length");
     const std::size_t idx_interval_start = required_csv_column(header_idx, "interval_start");
     const std::size_t idx_interval_end = required_csv_column(header_idx, "interval_end");
-    const std::size_t idx_interval_steps = required_csv_column(header_idx, "interval_step_count");
     const std::size_t idx_source_to_sink = required_csv_column(header_idx, "source_to_sink");
 
     std::vector<PrecomputedAssignmentRow> rows;
@@ -694,15 +680,11 @@ std::vector<PrecomputedAssignmentRow> read_precomputed_assignments_csv(
         row.source = field_or_throw(idx_source, "source");
         row.sink = field_or_throw(idx_sink, "sink");
         row.path_name = field_or_throw(idx_path, "path_name");
-        const std::string type_field = field_or_throw(idx_path_type, "path_type");
-        row.path_type = type_field.empty() ? 'P' : type_field[0];
         row.cluster_id = parse_csv_size(field_or_throw(idx_cluster, "cluster_id"), "cluster_id");
         row.allele_id = parse_csv_size(field_or_throw(idx_allele, "allele_id"), "allele_id");
         row.allele_length = parse_csv_size(field_or_throw(idx_allele_len, "allele_length"), "allele_length");
         row.interval_start = parse_csv_size(field_or_throw(idx_interval_start, "interval_start"), "interval_start");
         row.interval_end = parse_csv_size(field_or_throw(idx_interval_end, "interval_end"), "interval_end");
-        row.interval_step_count =
-            parse_csv_size(field_or_throw(idx_interval_steps, "interval_step_count"), "interval_step_count");
         row.source_to_sink = parse_csv_bool(field_or_throw(idx_source_to_sink, "source_to_sink"), "source_to_sink");
         rows.push_back(std::move(row));
     }
@@ -757,6 +739,65 @@ void call_variants_from_precomputed_grouped_impl(
         std::filesystem::create_directories(options.debug_out_dir);
     }
 
+    std::ofstream debug_summary_out;
+    if (options.write_debug_reports) {
+        const std::string debug_summary_path = options.debug_out_dir + "/debug_summary.tsv";
+        debug_summary_out.open(debug_summary_path);
+        if (!debug_summary_out) {
+            throw std::runtime_error("Failed to write debug summary TSV: " + debug_summary_path);
+        }
+        debug_summary_out
+            << "bubble_id\tsource\tsink\tstatus\tassignment_rows\tunique_alleles\tclusters\t"
+            << "cluster_status_rows\tclusters_with_minimap_hit\tclusters_with_events\t"
+            << "bubble_vcf_rows\tdotplots_written\tcluster_debug_reports\n";
+    }
+
+    auto write_empty_bubble_debug = [&](const Bubble& bubble, const std::string& status) {
+        if (!options.write_debug_reports) {
+            return;
+        }
+        const std::string bubble_debug_dir = options.debug_out_dir + "/bubble_" + std::to_string(bubble.id);
+        std::filesystem::create_directories(bubble_debug_dir);
+
+        const std::string bubble_status_path = bubble_debug_dir + "/bubble_status.tsv";
+        std::ofstream bubble_out(bubble_status_path);
+        if (!bubble_out) {
+            throw std::runtime_error("Failed to write bubble debug status TSV: " + bubble_status_path);
+        }
+        bubble_out
+            << "bubble_id\tstatus\thas_reference_assignment\treference_cluster_id\treference_interval_start\t"
+            << "reference_interval_end\tunique_alleles\tclusters_total\tclusters_observed\tclusters_ok\t"
+            << "clusters_with_minimap_hit\tclusters_with_events\tdotplots_written\tcluster_pairwise_vcfs\t"
+            << "region_vcf_rows\n";
+        bubble_out
+            << bubble.id << '\t'
+            << status << '\t'
+            << 0 << '\t'
+            << 0 << '\t'
+            << 0 << '\t'
+            << 0 << '\t'
+            << 0 << '\t'
+            << 0 << '\t'
+            << 0 << '\t'
+            << 0 << '\t'
+            << 0 << '\t'
+            << 0 << '\t'
+            << 0 << '\t'
+            << 0 << '\t'
+            << 0 << '\n';
+
+        const std::string cluster_status_path = bubble_debug_dir + "/cluster_status.tsv";
+        std::ofstream cluster_out(cluster_status_path);
+        if (!cluster_out) {
+            throw std::runtime_error("Failed to write cluster debug status TSV: " + cluster_status_path);
+        }
+        cluster_out
+            << "bubble_id\tcluster_id\tstatus\tis_reference_cluster\trepresentative_allele_id\t"
+            << "representative_haplotype\treference_length_bp\tcluster_length_bp\tpaf_records\t"
+            << "minimap_best_ok\torientation\tbest_norm_ed\tevent_count\tdotplot_written\t"
+            << "pairwise_vcf_written\n";
+    };
+
     GeneAnnotationIndex dotplot_gene_index;
     const GeneAnnotationIndex* dotplot_gene_ptr = nullptr;
     if (options.write_debug_reports && !options.dotplot_gtf_path.empty()) {
@@ -799,6 +840,23 @@ void call_variants_from_precomputed_grouped_impl(
         const auto bubble_start = std::chrono::steady_clock::now();
         const auto assign_it = assignments_by_bubble.find(bubble.id);
         if (assign_it == assignments_by_bubble.end() || assign_it->second.empty()) {
+            write_empty_bubble_debug(bubble, "skipped:no-precomputed-assignments");
+            if (debug_summary_out) {
+                debug_summary_out
+                    << bubble.id << '\t'
+                    << bubble.source << '\t'
+                    << bubble.sink << '\t'
+                    << "skipped:no-precomputed-assignments" << '\t'
+                    << 0 << '\t'
+                    << 0 << '\t'
+                    << 0 << '\t'
+                    << 0 << '\t'
+                    << 0 << '\t'
+                    << 0 << '\t'
+                    << 0 << '\t'
+                    << 0 << '\t'
+                    << 0 << '\n';
+            }
             continue;
         }
         const auto& bubble_assign_rows = assign_it->second;
@@ -883,16 +941,31 @@ void call_variants_from_precomputed_grouped_impl(
             PathAssignment assignment;
             assignment.unique_idx = unique_idx;
             assignment.path_name = row.path_name;
-            assignment.path_type = row.path_type;
             assignment.interval_start = row.interval_start;
             assignment.interval_end = row.interval_end;
-            assignment.interval_step_count = row.interval_step_count;
             assignment.source_to_sink = row.source_to_sink;
             assignments.push_back(std::move(assignment));
             assignment_cluster_ids.push_back(row.cluster_id);
         }
 
         if (assignments.empty() || unique_alleles.empty()) {
+            write_empty_bubble_debug(bubble, "skipped:no-usable-assignments");
+            if (debug_summary_out) {
+                debug_summary_out
+                    << bubble.id << '\t'
+                    << bubble.source << '\t'
+                    << bubble.sink << '\t'
+                    << "skipped:no-usable-assignments" << '\t'
+                    << bubble_assign_rows.size() << '\t'
+                    << unique_alleles.size() << '\t'
+                    << 0 << '\t'
+                    << 0 << '\t'
+                    << 0 << '\t'
+                    << 0 << '\t'
+                    << 0 << '\t'
+                    << 0 << '\t'
+                    << 0 << '\n';
+            }
             continue;
         }
 
@@ -1037,6 +1110,23 @@ void call_variants_from_precomputed_grouped_impl(
 
         summary.debug_reports_written += report.debug_reports_written;
         summary.dotplots_written += report.dotplots_written;
+
+        if (debug_summary_out) {
+            debug_summary_out
+                << bubble.id << '\t'
+                << bubble.source << '\t'
+                << bubble.sink << '\t'
+                << report.status << '\t'
+                << assignments.size() << '\t'
+                << unique_alleles.size() << '\t'
+                << clusters.size() << '\t'
+                << report.cluster_statuses.size() << '\t'
+                << report.clusters_with_minimap_hit << '\t'
+                << report.clusters_with_events << '\t'
+                << report.vcf_rows.size() << '\t'
+                << report.dotplots_written << '\t'
+                << report.debug_reports_written << '\n';
+        }
 
         if (use_pangene && report.has_reference_assignment && !report.vcf_rows.empty()) {
             struct SelectedAssignmentInterval {
@@ -1264,7 +1354,8 @@ void call_variants_from_precomputed_alleles(
 
     if (options.bubbles_csv_in.empty()) {
         throw std::runtime_error(
-            "Module 'call' with precomputed alleles still requires --bubbles-csv-in from module 1.");
+            "Module 'call' with precomputed alleles requires module-1 bubbles "
+            "(--bubble-prefix-in <prefix> or --bubbles-csv-in <path>).");
     }
     if (options.reference_path.empty()) {
         throw std::runtime_error("--reference-path is required for module 'call'");
@@ -1325,7 +1416,8 @@ void call_variants_from_precomputed_alleles(
             << " row could not be mapped to bubbles CSV (bubble_id=" << input_bubble_id
             << ", source=" << source
             << ", sink=" << sink << "). "
-            << "Make sure --bubbles-csv-in matches the module-2 CSVs.";
+            << "Make sure module-1 input (--bubble-prefix-in/--bubbles-csv-in) "
+            << "matches module-2 CSVs.";
         throw std::runtime_error(oss.str());
     };
 

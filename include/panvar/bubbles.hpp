@@ -15,20 +15,12 @@ enum class BubbleType {
     Insertion
 };
 
-enum class SiteMode {
-    Superbubble,
-    Snarl
-};
-
 struct Bubble {
     std::size_t id = 0;
     std::string source;
     std::string sink;
     std::vector<std::string> inside;
-    SiteMode site_mode = SiteMode::Snarl;
     BubbleType type = BubbleType::Super;
-    std::size_t parent_id = 0;
-    std::size_t nesting_level = 1;
     std::size_t path_support = 0;
     std::size_t min_inside_bp = 0;
     std::size_t max_inside_bp = 0;
@@ -44,7 +36,9 @@ struct BubbleCallOptions {
     // (unless inversion_signal is detected). Set to 0 to disable size filtering.
     std::size_t min_variant_bp = 50;
     std::size_t min_path_support = 0;
-    std::size_t max_nesting_level = 0;
+    // Optional merge of nearby bubbles on graph distance (bp) between sink/source boundaries.
+    // 0 disables merging.
+    std::size_t merge_nearby_bp = 0;
 };
 
 struct SnarlDebugEntry {
@@ -58,7 +52,6 @@ struct SnarlDebugEntry {
     std::size_t inside_node_count = 0;
     std::size_t n_paths = 0;
     std::size_t min_inside_bp = 0;
-    bool nested = false;
     bool directed_acyclic_net_graph = false;
     bool accepted = false;
     std::string reason;
@@ -67,6 +60,8 @@ struct SnarlDebugEntry {
 
 struct BubbleCallReport {
     std::vector<Bubble> bubbles;
+    // Candidate non-SNP bubbles before final filters (used for overview coloring).
+    std::vector<Bubble> non_snp_bubbles;
     std::vector<SnarlDebugEntry> snarl_debug;
 };
 
@@ -74,7 +69,6 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
 std::vector<Bubble> call_bubbles(const Graph& graph, const BubbleCallOptions& options);
 
 std::string bubble_type_to_string(BubbleType type);
-std::string site_mode_to_string(SiteMode mode);
 
 std::unordered_set<std::string> nodes_in_bubble(const Bubble& bubble);
 

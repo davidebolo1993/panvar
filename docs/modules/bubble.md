@@ -15,8 +15,9 @@ In practice:
 1. load top-level snarl boundaries from `--snarls-in` JSONL
 2. infer bubble-internal nodes from path intervals between source/sink
 3. compute path support and internal sequence span per candidate
-4. apply site filters (`min-variant-bp`, `min-path-support`, nesting cap)
-5. write module handoff and visualization outputs
+4. apply base site filters (`min-variant-bp`, `min-path-support`)
+5. optionally merge nearby bubbles (`--merge-nearby-bp`)
+6. write module handoff and visualization outputs
 
 It does not execute `vg` at runtime.
 
@@ -30,6 +31,8 @@ It does not execute `vg` at runtime.
 - `*.bubbles.csv`: refined bubble/site table used by module 2/3
 - `*.bandage_nodes.csv`: node colors for Bandage
 - optional `--snarl-debug-tsv <path>`: candidate-level diagnostics
+
+Output directories are auto-created when missing.
 
 ## Preparing snarl JSONL (offline)
 
@@ -49,9 +52,9 @@ For each top-level snarl candidate:
 4. measure:
    - number of crossing paths
    - internal bp support across crossing paths
-   - nesting metadata from JSONL hierarchy
-5. apply filters
-6. keep accepted sites and assign bubble IDs / nesting levels
+5. apply base filters (`min-path-support`, `min-variant-bp`)
+6. optionally merge nearby surviving bubbles
+7. assign bubble IDs
 
 ## Filter behavior
 
@@ -64,16 +67,47 @@ For each top-level snarl candidate:
   - keep only candidates with at least `N` crossing paths
   - default `0` (disabled)
 
-- `--max-nesting-level <N>`
-  - keep only candidates up to nesting level `N`
-  - `0` means no cap
+## Optional Nearby Merge
+
+- `--merge-nearby-bp <N>` (default `0`, disabled)
+- merge is applied after `--min-variant-bp` and `--min-path-support` filters
+- if enabled, consecutive surviving bubbles are merged when the shortest-path distance
+  from previous `sink` to next `source` is `<= N` bp
+- distance is computed from node lengths across graph connectivity
+Example:
+
+If bubble A ends at node `2527` and bubble B starts at node `2527`, and node `2527` has length `10 bp`,
+then with `--merge-nearby-bp 20` those bubbles are merged.
 
 ## Key options
 
 - `--min-variant-bp <N>`
 - `--min-path-support <N>`
-- `--max-nesting-level <N>`
+- `--merge-nearby-bp <N>`
 - `--snarl-debug-tsv <path>`
+
+## Bubble CSV Columns
+
+Current schema:
+
+- `bubble_id`
+- `source`
+- `sink`
+- `inside_node_count`
+- `total_node_count`
+- `path_support`
+- `min_inside_bp`
+- `max_inside_bp`
+- `inside_nodes`
+
+Compatibility:
+
+- readers still accept legacy columns (`site_mode`, `type`, `nesting_level`, `parent_id`, `long_path_support`, `inversion_signal`) when present; fields not used by current logic are ignored.
+
+Internal metrics (computed, not emitted in simplified CSV):
+
+- `long_path_support`: count of supporting paths with inside span `>= --min-variant-bp`
+- `inversion_signal`: true when at least one internal node is observed in both orientations across supporting paths
 
 ## Debug TSV columns
 
@@ -84,9 +118,23 @@ When `--snarl-debug-tsv` is enabled, each candidate row includes:
 - `inside_node_count`: number of inferred internal nodes
 - `n_paths`: number of crossing paths
 - `min_inside_bp`: smallest internal bp span among crossing paths
-- `nested`: `1` if this top-level snarl has child snarls in JSONL, else `0`
 - `accepted`: `1` if kept after filters, else `0`
 - `reason`: acceptance/rejection reason (`accept:final`, `reject:min-variant-bp`, etc.)
+
+Common `reason` values:
+
+- `accept:snarl-jsonl`: valid parsed snarl candidate before final filters
+- `accept:final`: candidate survives all enabled filters and merge handling
+- `accept:final-merged`: synthetic accepted row for a final merged bubble endpoint that did not exist as an original single snarl candidate
+- `reject:min-path-support`
+- `reject:min-variant-bp`
+- `reject:merged-nearby`: candidate survived base filters but was fused into a nearby merged bubble
+- `reject:filtered-out`: fallback when removed but no specific reason was recorded
+- parse/import rejects such as `reject:parse-start-end`, `reject:endpoint-not-in-graph`, `reject:empty-inside`, `reject:duplicate-endpoints-smaller-inside`
+
+## CLI summary terms
+
+- `simple|super|insertion`: topology labels computed on retained bubbles for summary only
 
 ## Example
 
@@ -94,8 +142,16 @@ When `--snarl-debug-tsv` is enabled, each candidate row includes:
 ./build/panvar bubble \
   -i tests/real_data/c4.gfa \
   -o tests/results/c4/bubble \
-  --snarls-in tests/real_data/c4.snarls.jsonl
+  --snarls-in tests/real_data/c4.snarls.jsonl \
+  --merge-nearby-bp 20
 ```
+
+## Bandage Colors
+
+Bandage node colors provide context and retained calls:
+
+- blue: nodes in non-SNP candidate bubbles (pre-filter context)
+- red: nodes in retained output bubbles (`*.bubbles.csv`)
 
 For clustering behavior details and usage modes, see:
 
@@ -104,6 +160,11 @@ For clustering behavior details and usage modes, see:
 ## Module handoff
 
 Use bubble output as input to module 2/3:
+
+- `panvar allele --bubble-prefix-in <prefix>`
+- `panvar call --bubble-prefix-in <prefix>`
+
+Equivalent explicit-file form:
 
 - `panvar allele --bubbles-csv-in <prefix>.bubbles.csv`
 - `panvar call --bubbles-csv-in <prefix>.bubbles.csv`

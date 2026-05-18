@@ -1,7 +1,9 @@
 #include "panvar/output.hpp"
 
 #include <algorithm>
+#include <filesystem>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -20,28 +22,6 @@ std::string join_nodes(const std::vector<std::string>& nodes) {
         oss << nodes[i];
     }
     return oss.str();
-}
-
-std::string color_for_level(const std::unordered_map<std::size_t, std::string>& palette, std::size_t level) {
-    if (palette.empty()) {
-        return "#808080";
-    }
-    auto it = palette.find(level);
-    if (it != palette.end()) {
-        return it->second;
-    }
-
-    std::size_t max_level = 0;
-    for (const auto& [k, _v] : palette) {
-        max_level = std::max(max_level, k);
-    }
-    if (max_level == 0) {
-        return "#808080";
-    }
-
-    const std::size_t folded = ((level - 1) % max_level) + 1;
-    auto fallback = palette.find(folded);
-    return fallback == palette.end() ? "#808080" : fallback->second;
 }
 
 std::vector<std::string> split_csv_line(const std::string& line) {
@@ -92,6 +72,14 @@ std::size_t parse_size_field(const std::string& value, const std::string& field_
     }
 }
 
+void ensure_parent_dir(const std::string& output_path) {
+    const std::filesystem::path p(output_path);
+    const auto parent = p.parent_path();
+    if (!parent.empty()) {
+        std::filesystem::create_directories(parent);
+    }
+}
+
 BubbleType parse_bubble_type_field(const std::string& value) {
     if (value == "simple") {
         return BubbleType::Simple;
@@ -105,16 +93,6 @@ BubbleType parse_bubble_type_field(const std::string& value) {
     throw std::runtime_error("Invalid bubble type in CSV: " + value);
 }
 
-SiteMode parse_site_mode_field(const std::string& value) {
-    if (value == "snarl") {
-        return SiteMode::Snarl;
-    }
-    if (value == "superbubble") {
-        return SiteMode::Superbubble;
-    }
-    throw std::runtime_error("Invalid site_mode in CSV: " + value);
-}
-
 std::size_t required_column(
     const std::unordered_map<std::string, std::size_t>& index_by_name,
     const std::string& name) {
@@ -125,45 +103,29 @@ std::size_t required_column(
     return it->second;
 }
 
-} // namespace
-
-std::string site_mode_to_string(SiteMode mode) {
-    switch (mode) {
-        case SiteMode::Snarl:
-            return "snarl";
-        case SiteMode::Superbubble:
-        default:
-            return "superbubble";
+std::optional<std::size_t> optional_column(
+    const std::unordered_map<std::string, std::size_t>& index_by_name,
+    const std::string& name) {
+    const auto it = index_by_name.find(name);
+    if (it == index_by_name.end()) {
+        return std::nullopt;
     }
+    return it->second;
 }
 
-std::unordered_map<std::size_t, std::string> level_palette() {
-    return {
-        {1, "#E41A1C"},
-        {2, "#377EB8"},
-        {3, "#4DAF4A"},
-        {4, "#FF7F00"},
-        {5, "#A65628"},
-        {6, "#F781BF"},
-        {7, "#999999"},
-        {8, "#66C2A5"},
-        {9, "#FC8D62"},
-        {10, "#8DA0CB"},
-        {11, "#E78AC3"},
-        {12, "#A6D854"},
-    };
-}
+} // namespace
 
 void write_bubbles_csv(
     const std::string& output_path,
     const std::vector<Bubble>& bubbles) {
 
+    ensure_parent_dir(output_path);
     std::ofstream out(output_path);
     if (!out) {
         throw std::runtime_error("Failed to write bubbles CSV: " + output_path);
     }
 
-    out << "bubble_id,source,sink,site_mode,type,inside_node_count,total_node_count,nesting_level,parent_id,path_support,min_inside_bp,max_inside_bp,long_path_support,inversion_signal,inside_nodes\n";
+    out << "bubble_id,source,sink,inside_node_count,total_node_count,path_support,min_inside_bp,max_inside_bp,inside_nodes\n";
 
     for (const auto& bubble : bubbles) {
         const std::size_t total_nodes = bubble.inside.size() + 2;
@@ -173,17 +135,11 @@ void write_bubbles_csv(
         out << bubble.id << ','
             << bubble.source << ','
             << bubble.sink << ','
-            << site_mode_to_string(bubble.site_mode) << ','
-            << bubble_type_to_string(bubble.type) << ','
             << bubble.inside.size() << ','
             << total_nodes << ','
-            << bubble.nesting_level << ','
-            << bubble.parent_id << ','
             << bubble.path_support << ','
             << bubble.min_inside_bp << ','
             << bubble.max_inside_bp << ','
-            << bubble.long_path_support << ','
-            << (bubble.inversion_signal ? 1 : 0) << ','
             << '"' << join_nodes(inside) << '"'
             << '\n';
     }
@@ -213,15 +169,12 @@ std::vector<Bubble> read_bubbles_csv(const std::string& input_path) {
     const std::size_t idx_id = required_column(index_by_name, "bubble_id");
     const std::size_t idx_source = required_column(index_by_name, "source");
     const std::size_t idx_sink = required_column(index_by_name, "sink");
-    const std::size_t idx_site_mode = required_column(index_by_name, "site_mode");
-    const std::size_t idx_type = required_column(index_by_name, "type");
-    const std::size_t idx_nesting = required_column(index_by_name, "nesting_level");
-    const std::size_t idx_parent = required_column(index_by_name, "parent_id");
+    const auto idx_type = optional_column(index_by_name, "type");
     const std::size_t idx_path_support = required_column(index_by_name, "path_support");
     const std::size_t idx_min_bp = required_column(index_by_name, "min_inside_bp");
     const std::size_t idx_max_bp = required_column(index_by_name, "max_inside_bp");
-    const std::size_t idx_long_path = required_column(index_by_name, "long_path_support");
-    const std::size_t idx_inversion = required_column(index_by_name, "inversion_signal");
+    const auto idx_long_path = optional_column(index_by_name, "long_path_support");
+    const auto idx_inversion = optional_column(index_by_name, "inversion_signal");
     const std::size_t idx_inside_nodes = required_column(index_by_name, "inside_nodes");
 
     std::vector<Bubble> bubbles;
@@ -249,17 +202,26 @@ std::vector<Bubble> read_bubbles_csv(const std::string& input_path) {
         bubble.id = parse_size_field(require_field(idx_id, "bubble_id"), "bubble_id");
         bubble.source = require_field(idx_source, "source");
         bubble.sink = require_field(idx_sink, "sink");
-        bubble.site_mode = parse_site_mode_field(require_field(idx_site_mode, "site_mode"));
-        bubble.type = parse_bubble_type_field(require_field(idx_type, "type"));
-        bubble.nesting_level = parse_size_field(require_field(idx_nesting, "nesting_level"), "nesting_level");
-        bubble.parent_id = parse_size_field(require_field(idx_parent, "parent_id"), "parent_id");
+        if (idx_type.has_value()) {
+            bubble.type = parse_bubble_type_field(require_field(*idx_type, "type"));
+        } else {
+            bubble.type = BubbleType::Super;
+        }
         bubble.path_support = parse_size_field(require_field(idx_path_support, "path_support"), "path_support");
         bubble.min_inside_bp = parse_size_field(require_field(idx_min_bp, "min_inside_bp"), "min_inside_bp");
         bubble.max_inside_bp = parse_size_field(require_field(idx_max_bp, "max_inside_bp"), "max_inside_bp");
-        bubble.long_path_support =
-            parse_size_field(require_field(idx_long_path, "long_path_support"), "long_path_support");
-        const std::string inversion = require_field(idx_inversion, "inversion_signal");
-        bubble.inversion_signal = (inversion == "1" || inversion == "true" || inversion == "TRUE");
+        if (idx_long_path.has_value()) {
+            bubble.long_path_support =
+                parse_size_field(require_field(*idx_long_path, "long_path_support"), "long_path_support");
+        } else {
+            bubble.long_path_support = 0;
+        }
+        if (idx_inversion.has_value()) {
+            const std::string inversion = require_field(*idx_inversion, "inversion_signal");
+            bubble.inversion_signal = (inversion == "1" || inversion == "true" || inversion == "TRUE");
+        } else {
+            bubble.inversion_signal = false;
+        }
         bubble.inside = split_semicolon(require_field(idx_inside_nodes, "inside_nodes"));
         std::sort(bubble.inside.begin(), bubble.inside.end());
 
@@ -275,40 +237,71 @@ std::vector<Bubble> read_bubbles_csv(const std::string& input_path) {
 
 void write_bandage_node_colors_csv(
     const std::string& output_path,
-    const std::vector<Bubble>& bubbles) {
+    const std::vector<Bubble>& retained_bubbles,
+    const std::vector<Bubble>& non_snp_bubbles) {
 
+    ensure_parent_dir(output_path);
     std::ofstream out(output_path);
     if (!out) {
         throw std::runtime_error("Failed to write Bandage color CSV: " + output_path);
     }
 
-    const auto palette = level_palette();
+    if (non_snp_bubbles.empty()) {
+        std::unordered_set<std::string> retained_nodes;
+        for (const auto& bubble : retained_bubbles) {
+            auto nodes = nodes_in_bubble(bubble);
+            for (const auto& node : nodes) {
+                retained_nodes.insert(node);
+            }
+        }
 
-    struct NodeColorInfo {
-        std::size_t max_level = 0;
-    };
+        std::vector<std::string> node_ids;
+        node_ids.reserve(retained_nodes.size());
+        for (const auto& node_id : retained_nodes) {
+            node_ids.push_back(node_id);
+        }
+        std::sort(node_ids.begin(), node_ids.end());
 
-    std::unordered_map<std::string, NodeColorInfo> by_node;
+        out << "Name,Colour\n";
+        for (const auto& node_id : node_ids) {
+            out << node_id << ",#E41A1C\n";
+        }
+        return;
+    }
 
-    for (const auto& bubble : bubbles) {
+    // New overview mode:
+    // - blue: nodes in non-SNP candidate bubbles
+    // - red: nodes in retained bubbles
+    constexpr const char* kBlue = "#377EB8";
+    constexpr const char* kRed = "#E41A1C";
+
+    std::unordered_map<std::string, int> color_priority_by_node;
+    color_priority_by_node.reserve((non_snp_bubbles.size() + retained_bubbles.size()) * 8);
+    for (const auto& bubble : non_snp_bubbles) {
         auto nodes = nodes_in_bubble(bubble);
         for (const auto& node : nodes) {
-            auto& info = by_node[node];
-            info.max_level = std::max(info.max_level, bubble.nesting_level);
+            auto& pri = color_priority_by_node[node];
+            pri = std::max(pri, 1);
+        }
+    }
+    for (const auto& bubble : retained_bubbles) {
+        auto nodes = nodes_in_bubble(bubble);
+        for (const auto& node : nodes) {
+            color_priority_by_node[node] = 2;
         }
     }
 
     std::vector<std::string> node_ids;
-    node_ids.reserve(by_node.size());
-    for (const auto& [node_id, _info] : by_node) {
-        node_ids.push_back(node_id);
+    node_ids.reserve(color_priority_by_node.size());
+    for (const auto& kv : color_priority_by_node) {
+        node_ids.push_back(kv.first);
     }
     std::sort(node_ids.begin(), node_ids.end());
 
     out << "Name,Colour\n";
     for (const auto& node_id : node_ids) {
-        auto& info = by_node[node_id];
-        out << node_id << ',' << color_for_level(palette, info.max_level) << '\n';
+        const int pri = color_priority_by_node[node_id];
+        out << node_id << ',' << (pri >= 2 ? kRed : kBlue) << '\n';
     }
 }
 
@@ -316,12 +309,13 @@ void write_snarl_debug_tsv(
     const std::string& output_path,
     const std::vector<SnarlDebugEntry>& entries) {
 
+    ensure_parent_dir(output_path);
     std::ofstream out(output_path);
     if (!out) {
         throw std::runtime_error("Failed to write snarl debug TSV: " + output_path);
     }
 
-    out << "candidate_id\tsource\tsink\tinside_node_count\tn_paths\tmin_inside_bp\tnested\taccepted\treason\n";
+    out << "candidate_id\tsource\tsink\tinside_node_count\tn_paths\tmin_inside_bp\taccepted\treason\n";
 
     for (const auto& e : entries) {
         out << e.candidate_id << '\t'
@@ -330,7 +324,6 @@ void write_snarl_debug_tsv(
             << e.inside_node_count << '\t'
             << e.n_paths << '\t'
             << e.min_inside_bp << '\t'
-            << (e.nested ? 1 : 0) << '\t'
             << (e.accepted ? 1 : 0) << '\t'
             << e.reason << '\n';
     }

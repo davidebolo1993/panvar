@@ -11,7 +11,9 @@ This directory contains module-focused documentation for the `panvar` CLI.
 3. `docs/modules/call.md`  
    Module 3 (`panvar call`): SV calling from clustered alleles
 4. `docs/modules/describe.md`  
-   Module 4 (`panvar describe`): per-bubble haplotype feature tables for downstream association workflows
+  Module 4 (`panvar describe`): per-bubble haplotype feature tables for downstream association workflows
+5. `docs/modules/example.md`  
+  Worked sequence-level examples of clustering/calling/merge/debug behavior
 
 ## Doc Structure Convention
 

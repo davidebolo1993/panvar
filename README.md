@@ -31,7 +31,8 @@ Binary:
 ./build/panvar bubble \
   -i tests/real_data/c4.gfa \
   -o tests/results/c4/bubble \
-  --snarls-in tests/real_data/c4.snarls.jsonl
+  --snarls-in tests/real_data/c4.snarls.jsonl \
+  --merge-nearby-bp 20
 ```
 
 2. Allele (default clustering):
@@ -40,7 +41,7 @@ Binary:
 ./build/panvar allele \
   -i tests/real_data/c4.gfa \
   -o tests/results/c4/allele \
-  --bubbles-csv-in tests/results/c4/bubble.bubbles.csv
+  --bubble-prefix-in tests/results/c4/bubble
 ```
 
 3. Allele (predefined path-group JSON):
@@ -49,7 +50,7 @@ Binary:
 ./build/panvar allele \
   -i tests/real_data/c4.gfa \
   -o tests/results/c4/allele_json \
-  --bubbles-csv-in tests/results/c4/bubble.bubbles.csv \
+  --bubble-prefix-in tests/results/c4/bubble \
   --clusters-json tests/real_data/c4.clusters.json
 ```
 
@@ -59,9 +60,8 @@ Binary:
 ./build/panvar call \
   -i tests/real_data/c4.gfa \
   -o tests/results/c4/call \
-  --bubbles-csv-in tests/results/c4/bubble.bubbles.csv \
-  --clusters-csv-in tests/results/c4/allele.allele_clusters.csv \
-  --assignments-csv-in tests/results/c4/allele.allele_assignments.csv \
+  --bubble-prefix-in tests/results/c4/bubble \
+  --allele-prefix-in tests/results/c4/allele \
   --reference-path grch38#1#chr6:31891045-32123783
 ```
 
@@ -71,9 +71,8 @@ Binary:
 ./build/panvar call \
   -i tests/real_data/c4.gfa \
   -o tests/results/c4/call_pangene \
-  --bubbles-csv-in tests/results/c4/bubble.bubbles.csv \
-  --clusters-csv-in tests/results/c4/allele_json.allele_clusters.csv \
-  --assignments-csv-in tests/results/c4/allele_json.allele_assignments.csv \
+  --bubble-prefix-in tests/results/c4/bubble \
+  --allele-prefix-in tests/results/c4/allele_json \
   --reference-path grch38#1#chr6:31891045-32123783 \
   --classify-ins \
   --pangene-bed tests/real_data/c4.pangene.bed.gz \
@@ -98,10 +97,15 @@ Binary:
 ## Useful Options
 
 - `allele`
+  - `--bubble-prefix-in <prefix>`: consume bubble outputs using prefix convention
   - `--clusters-json <path>`: use predefined path->cluster labels
   - `--similarity-out-dir <dir>`: per-bubble clustering diagnostics
+- `bubble`
+  - `--merge-nearby-bp <N>`: optionally fuse nearby bubble candidates by graph bp distance
 - `call`
+  - `--bubble-prefix-in <prefix>` + `--allele-prefix-in <prefix>`: simplified module handoff
   - `--debug --debug-out-dir <dir>`: per-cluster FASTA/PAF/dotplot/VCF
+  - debug status manifests: `<debug>/debug_summary.tsv`, `bubble_<id>/bubble_status.tsv`, `bubble_<id>/cluster_status.tsv`
   - `--minimap-preset asm5|asm10|asm20` (default `asm20`)
   - `--classify-ins`: INS NOVEL vs DUP-like subtype/CN
   - `--pangene-bed <bed(.gz)>`: event-level gene-copy delta annotation
@@ -115,6 +119,7 @@ Binary:
 - [docs/modules/allele.md](docs/modules/allele.md)
 - [docs/modules/call.md](docs/modules/call.md)
 - [docs/modules/describe.md](docs/modules/describe.md)
+- [docs/modules/example.md](docs/modules/example.md)
 
 ## Tests
 
@@ -156,3 +161,7 @@ docker run --rm -v "$PWD":/work -w /work panvar:latest panvar --help
 - `external/minimap2/`: minimap2 C library source
 - `tests/real_data/`: bundled example loci and inputs
 - `docs/modules/`: module docs
+
+## Output Paths
+
+If you pass output prefixes/files inside non-existing directories, `panvar` now creates parent directories automatically.
