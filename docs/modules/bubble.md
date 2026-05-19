@@ -164,7 +164,6 @@ Use bubble output as input to module 2/3:
 - `panvar allele --bubble-prefix-in <prefix>`
 - `panvar call --bubble-prefix-in <prefix>`
 
-Equivalent explicit-file form:
+Equivalent explicit-file form (module 3 only):
 
-- `panvar allele --bubbles-csv-in <prefix>.bubbles.csv`
 - `panvar call --bubbles-csv-in <prefix>.bubbles.csv`

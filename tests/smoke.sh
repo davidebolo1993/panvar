@@ -45,15 +45,14 @@ CALL_PREFIX="$OUT_DIR/call"
 "$PANVAR_BIN" allele \
   -i "$GFA" \
   -o "$ALLELE_PREFIX" \
-  --bubbles-csv-in "$BUBBLE_PREFIX.bubbles.csv" \
+  --bubble-prefix-in "$BUBBLE_PREFIX" \
   --quiet
 
 "$PANVAR_BIN" call \
   -i "$GFA" \
   -o "$CALL_PREFIX" \
-  --bubbles-csv-in "$BUBBLE_PREFIX.bubbles.csv" \
-  --clusters-csv-in "$ALLELE_PREFIX.allele_clusters.csv" \
-  --assignments-csv-in "$ALLELE_PREFIX.allele_assignments.csv" \
+  --bubble-prefix-in "$BUBBLE_PREFIX" \
+  --allele-prefix-in "$ALLELE_PREFIX" \
   --reference-path "$REF_PATH" \
   --quiet
 

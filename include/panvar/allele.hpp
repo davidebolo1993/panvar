@@ -20,11 +20,14 @@ struct AlleleCallOptions {
     std::string bubbles_csv_in;
     // Similarity threshold in [0, 1].
     double min_similarity = 0.90;
-    ClusterMode cluster_mode = ClusterMode::Sequence;
+    ClusterMode cluster_mode = ClusterMode::Walk;
     // Worker threads for pairwise distance computations (0 = auto).
     std::size_t threads = 0;
     // Emit progress logs on stderr while processing bubbles.
     bool show_progress = true;
+    // If true, skip bubble processing when the selected reference path has no
+    // source->sink assignment in that bubble.
+    bool skip_bubbles_without_reference = false;
     // Use fast sketch-guided + bounded distance in auto mode.
     bool fast_distance = true;
     // Legacy knob kept for compatibility (not used in current auto path).
@@ -114,6 +117,7 @@ struct AlleleCallOptions {
 struct AlleleCallSummary {
     std::size_t bubbles_processed = 0;
     std::size_t bubbles_with_assignments = 0;
+    std::size_t bubbles_skipped_no_reference = 0;
     std::size_t unique_alleles = 0;
     std::size_t clusters = 0;
     std::size_t assignments = 0;

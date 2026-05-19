@@ -861,6 +861,42 @@ void call_variants_from_precomputed_grouped_impl(
         }
         const auto& bubble_assign_rows = assign_it->second;
 
+        if (options.skip_bubbles_without_reference) {
+            bool has_reference_assignment = false;
+            for (const auto& row : bubble_assign_rows) {
+                if (row.path_name == options.reference_path) {
+                    has_reference_assignment = true;
+                    break;
+                }
+            }
+            if (!has_reference_assignment) {
+                summary.bubbles_skipped_no_reference += 1;
+                write_empty_bubble_debug(bubble, "skipped:no-reference-assignment-filter");
+                if (debug_summary_out) {
+                    debug_summary_out
+                        << bubble.id << '\t'
+                        << bubble.source << '\t'
+                        << bubble.sink << '\t'
+                        << "skipped:no-reference-assignment-filter" << '\t'
+                        << bubble_assign_rows.size() << '\t'
+                        << 0 << '\t'
+                        << 0 << '\t'
+                        << 0 << '\t'
+                        << 0 << '\t'
+                        << 0 << '\t'
+                        << 0 << '\t'
+                        << 0 << '\t'
+                        << 0 << '\n';
+                }
+                if (options.show_progress) {
+                    std::cerr
+                        << "[call] bubble " << bubble.id
+                        << " skipped by --skip-no-reference-bubbles\n";
+                }
+                continue;
+            }
+        }
+
         if (options.show_progress) {
             std::cerr
                 << "[call] bubble " << (bubble_idx + 1) << "/" << bubbles.size()

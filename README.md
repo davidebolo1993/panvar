@@ -35,7 +35,7 @@ Binary:
   --merge-nearby-bp 20
 ```
 
-2. Allele (default clustering):
+2. Allele (default walk clustering, node-length weighted):
 
 ```bash
 ./build/panvar allele \
@@ -100,6 +100,7 @@ Binary:
   - `--bubble-prefix-in <prefix>`: consume bubble outputs using prefix convention
   - `--clusters-json <path>`: use predefined path->cluster labels
   - `--similarity-out-dir <dir>`: per-bubble clustering diagnostics
+  - `--skip-no-reference-bubbles --reference-path <path>`: drop bubbles not traversed by the reference
 - `bubble`
   - `--merge-nearby-bp <N>`: optionally fuse nearby bubble candidates by graph bp distance
 - `call`

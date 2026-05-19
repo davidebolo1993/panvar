@@ -26,6 +26,8 @@ struct UniqueAllele {
     std::string sequence;
     std::string compare_token;
     std::vector<std::uint64_t> compare_steps;
+    std::vector<int> compare_step_weights;
+    std::size_t compare_steps_weight_sum = 0;
     bool uses_sequence_similarity = false;
     std::size_t path_support = 0;
     std::size_t sequence_length = 0;

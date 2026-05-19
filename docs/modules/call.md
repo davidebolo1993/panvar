@@ -48,6 +48,9 @@ Optional gene copy-delta annotation can be enabled with `--pangene-bed`.
 
 Extra columns are ignored.
 
+Recent `panvar allele` outputs may include additional clarity columns
+(`member_allele_count`), which are optional for `call`.
+
 ## Calling algorithm
 
 For each bubble:
@@ -178,6 +181,7 @@ Notes:
 ## Key options
 
 - `--min-sv-bp <N>`
+- `--skip-no-reference-bubbles`
 - `--vcf-out <path>`
 - `--debug`
 - `--debug-out-dir <dir>`

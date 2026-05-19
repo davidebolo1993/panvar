@@ -4,7 +4,7 @@ Date: 2026-05-15
 
 This page gives small concrete examples for the core `allele` and `call` behaviors.
 
-## Example 1: Allele Clustering (sequence mode)
+## Example 1: Allele Clustering (walk default vs sequence mode)
 
 Bubble has 4 unique alleles:
 
@@ -13,7 +13,8 @@ Bubble has 4 unique alleles:
 - `A3`: `ACCTGAAACTTGG` (1 mismatch vs `A1`)
 - `A4`: `ACCTGCCCCCTTGG` (larger change)
 
-With `--cluster-mode sequence --min-similarity 0.90`:
+With default walk mode (`--cluster-mode walk`, now default), step mismatches are weighted by node bp length.
+For sequence-based behavior, use `--cluster-mode sequence --min-similarity 0.90`:
 
 1. `A1` and `A2` deduplicate first.
 2. Pairwise distances are computed on sequence tokens.
@@ -90,3 +91,16 @@ So missing `dotplot.svg` or absent events are traceable to explicit statuses suc
 - `skipped:no-minimap-best-hit`
 - `ok:no-sv-events`
 - `ok:sv-events`
+
+## Example 6: Why One Allele Can Have Many Paths
+
+In `allele_assignments.csv`, multiple paths can share the same `allele_id` within one bubble.
+This is expected: `allele_id` identifies a deduplicated unique allele walk, while each CSV row is a path assignment.
+
+In `allele_clusters.csv`:
+
+- `member_alleles` / `member_allele_count` refer to unique alleles in that cluster
+- `total_path_support` counts how many paths map to those alleles
+
+So `member_allele_count=1` with `total_path_support=220` means:
+one unique allele sequence/walk is shared by 220 paths.

@@ -73,6 +73,19 @@ struct DistanceMatrices {
     std::vector<std::vector<double>> norm;
 };
 
+struct SimilarityReportPaths {
+    std::string bubble_dir;
+    std::string alleles_tsv;
+    std::string matrix_norm_tsv;
+    std::string matrix_abs_tsv;
+    std::string stats_tsv;
+    std::string cluster_pairwise_norm_tsv;
+    std::string cluster_pairwise_abs_tsv;
+    std::string cluster_membership_tsv;
+    std::string tree_svg;
+    std::string tree_nwk;
+};
+
 constexpr const char* kClusterPalette[] = {
     "#E41A1C",
     "#377EB8",
@@ -120,9 +133,11 @@ int bounded_levenshtein_distance(
     const std::string& b,
     int max_dist);
 
-int bounded_levenshtein_distance(
+int bounded_weighted_levenshtein_distance(
     const std::vector<std::uint64_t>& a,
+    const std::vector<int>& a_weights,
     const std::vector<std::uint64_t>& b,
+    const std::vector<int>& b_weights,
     int max_dist);
 
 std::string csv_escape(const std::string& v) {
@@ -448,9 +463,40 @@ std::vector<std::uint64_t> build_walk_tokens(const std::vector<PathStep>& steps)
     return tokens;
 }
 
+std::vector<int> build_walk_step_weights(
+    const std::vector<PathStep>& steps,
+    const std::unordered_map<std::string, Node>& nodes) {
+
+    std::vector<int> weights;
+    weights.reserve(steps.size());
+    for (const auto& step : steps) {
+        std::size_t len = 1;
+        const auto node_it = nodes.find(step.node_id);
+        if (node_it != nodes.end()) {
+            len = std::max<std::size_t>(1, node_it->second.sequence.size());
+        }
+        const int w = static_cast<int>(std::min<std::size_t>(
+            len,
+            static_cast<std::size_t>(std::numeric_limits<int>::max() / 4)));
+        weights.push_back(std::max(1, w));
+    }
+    return weights;
+}
+
+std::size_t sum_step_weights(const std::vector<int>& weights) {
+    std::size_t sum = 0;
+    for (const int w : weights) {
+        sum += static_cast<std::size_t>(std::max(1, w));
+    }
+    return sum;
+}
+
 std::size_t token_length_for_distance(const UniqueAllele& allele) {
     if (allele.uses_sequence_similarity) {
         return allele.compare_token.size();
+    }
+    if (allele.compare_steps_weight_sum > 0) {
+        return allele.compare_steps_weight_sum;
     }
     return allele.compare_steps.size();
 }
@@ -496,12 +542,31 @@ int exact_levenshtein_distance(const std::string& a, const std::string& b) {
 
 int exact_levenshtein_distance(
     const std::vector<std::uint64_t>& a,
-    const std::vector<std::uint64_t>& b) {
-    const std::size_t max_len = std::max(a.size(), b.size());
-    if (max_len > static_cast<std::size_t>(std::numeric_limits<int>::max() - 1)) {
-        throw std::runtime_error("Allele token list too long for exact distance computation");
+    const std::vector<int>& a_weights,
+    const std::vector<std::uint64_t>& b,
+    const std::vector<int>& b_weights) {
+
+    if (a.size() != a_weights.size() || b.size() != b_weights.size()) {
+        throw std::runtime_error("Weighted walk token/weight length mismatch");
     }
-    return bounded_levenshtein_distance(a, b, static_cast<int>(max_len));
+    std::size_t sum_a = 0;
+    for (const int w : a_weights) {
+        sum_a += static_cast<std::size_t>(std::max(1, w));
+    }
+    std::size_t sum_b = 0;
+    for (const int w : b_weights) {
+        sum_b += static_cast<std::size_t>(std::max(1, w));
+    }
+    const std::size_t upper = sum_a + sum_b;
+    if (upper > static_cast<std::size_t>(std::numeric_limits<int>::max() - 2)) {
+        throw std::runtime_error("Weighted walk token lists too long for exact distance computation");
+    }
+    return bounded_weighted_levenshtein_distance(
+        a,
+        a_weights,
+        b,
+        b_weights,
+        static_cast<int>(upper));
 }
 
 std::size_t resolve_thread_count(std::size_t requested) {
@@ -596,16 +661,13 @@ DistanceMatrices build_distance_matrices(
         const auto& lhs = unique_alleles[i];
         const auto& rhs = unique_alleles[j];
         const bool use_sequence = lhs.uses_sequence_similarity && rhs.uses_sequence_similarity;
-        const std::size_t max_len = use_sequence
-                                        ? std::max(lhs.compare_token.size(), rhs.compare_token.size())
-                                        : std::max(lhs.compare_steps.size(), rhs.compare_steps.size());
+        const std::size_t lhs_len = token_length_for_distance(lhs);
+        const std::size_t rhs_len = token_length_for_distance(rhs);
+        const std::size_t max_len = std::max(lhs_len, rhs_len);
 
         int d_abs = 0;
         bool decided_without_dp = false;
         const int allowed = allowed_max_edits(min_similarity, max_len);
-
-        const std::size_t lhs_len = use_sequence ? lhs.compare_token.size() : lhs.compare_steps.size();
-        const std::size_t rhs_len = use_sequence ? rhs.compare_token.size() : rhs.compare_steps.size();
         const int length_gap = static_cast<int>(
             (lhs_len > rhs_len) ? (lhs_len - rhs_len) : (rhs_len - lhs_len));
         if (length_gap > allowed) {
@@ -659,8 +721,11 @@ DistanceMatrices build_distance_matrices(
                 } else if (approximate_walk_for_large_bubble) {
                     // For very large bubbles in walk mode, avoid DP and use
                     // sketch-estimated distance directly.
+                    const int max_len_i = static_cast<int>(std::min<std::size_t>(
+                        max_len,
+                        static_cast<std::size_t>(std::numeric_limits<int>::max())));
                     const int est_d = static_cast<int>(std::llround((1.0 - est_id) * static_cast<double>(max_len)));
-                    d_abs = std::max(0, est_d);
+                    d_abs = std::clamp(est_d, 0, max_len_i);
                     if (d_abs > allowed) {
                         d_abs = allowed + 1;
                     }
@@ -679,7 +744,11 @@ DistanceMatrices build_distance_matrices(
                 if (use_sequence) {
                     d_abs = exact_levenshtein_distance(lhs.compare_token, rhs.compare_token);
                 } else {
-                    d_abs = exact_levenshtein_distance(lhs.compare_steps, rhs.compare_steps);
+                    d_abs = exact_levenshtein_distance(
+                        lhs.compare_steps,
+                        lhs.compare_step_weights,
+                        rhs.compare_steps,
+                        rhs.compare_step_weights);
                 }
             } else {
                 // In auto mode, use threshold-bounded DP for all uncertain pairs.
@@ -687,7 +756,12 @@ DistanceMatrices build_distance_matrices(
                 if (use_sequence) {
                     d_abs = bounded_levenshtein_distance(lhs.compare_token, rhs.compare_token, allowed);
                 } else {
-                    d_abs = bounded_levenshtein_distance(lhs.compare_steps, rhs.compare_steps, allowed);
+                    d_abs = bounded_weighted_levenshtein_distance(
+                        lhs.compare_steps,
+                        lhs.compare_step_weights,
+                        rhs.compare_steps,
+                        rhs.compare_step_weights,
+                        allowed);
                 }
                 if (d_abs > allowed) {
                     d_abs = allowed + 1;
@@ -696,7 +770,7 @@ DistanceMatrices build_distance_matrices(
         }
 
         const double denom = static_cast<double>(std::max<std::size_t>(1, max_len));
-        const double d_norm = static_cast<double>(d_abs) / denom;
+        const double d_norm = std::min(1.0, static_cast<double>(d_abs) / denom);
         mats.abs[i][j] = d_abs;
         mats.abs[j][i] = d_abs;
         mats.norm[i][j] = d_norm;
@@ -1063,7 +1137,7 @@ void write_similarity_cluster_membership_tsv(
     out << std::fixed << std::setprecision(6);
     out << "cluster_id\trepresentative_allele_id\tallele_id\tpath_support\t"
            "edit_distance_to_representative\tnormalized_distance_to_representative\t"
-           "token_max_len\tallowed_max_edit_for_threshold\twithin_threshold\n";
+           "token_max_units\tallowed_max_distance_for_threshold\twithin_threshold\n";
 
     for (const auto& cluster : clusters) {
         const auto rep_idx = cluster.representative_idx;
@@ -1399,8 +1473,32 @@ void write_upgma_tree_svg(
     out << "</svg>\n";
 }
 
-void write_similarity_reports_for_bubble(
+SimilarityReportPaths similarity_report_paths_for_bubble(
     const std::string& output_dir,
+    std::size_t bubble_id,
+    bool include_tree) {
+
+    SimilarityReportPaths out;
+    out.bubble_dir = output_dir + "/bubble_" + std::to_string(bubble_id);
+    out.alleles_tsv = out.bubble_dir + "/alleles.tsv";
+    out.matrix_norm_tsv = out.bubble_dir + "/distance_matrix_norm.tsv";
+    out.matrix_abs_tsv = out.bubble_dir + "/distance_matrix_abs.tsv";
+    out.stats_tsv = out.bubble_dir + "/cluster_stats.tsv";
+    out.cluster_pairwise_norm_tsv = out.bubble_dir + "/cluster_pairwise_norm.tsv";
+    out.cluster_pairwise_abs_tsv = out.bubble_dir + "/cluster_pairwise_abs.tsv";
+    out.cluster_membership_tsv = out.bubble_dir + "/cluster_membership.tsv";
+    if (include_tree) {
+        out.tree_svg = out.bubble_dir + "/tree.svg";
+        out.tree_nwk = out.bubble_dir + "/upgma.nwk";
+    } else {
+        out.tree_svg = ".";
+        out.tree_nwk = ".";
+    }
+    return out;
+}
+
+void write_similarity_reports_for_bubble(
+    const SimilarityReportPaths& paths,
     const Bubble& bubble,
     const std::vector<UniqueAllele>& unique_alleles,
     const std::vector<Cluster>& clusters,
@@ -1413,40 +1511,31 @@ void write_similarity_reports_for_bubble(
         return;
     }
 
-    const std::string stem = output_dir + "/bubble_" + std::to_string(bubble.id);
-    const std::string alleles_tsv = stem + ".alleles.tsv";
-    const std::string matrix_norm_tsv = stem + ".distance_matrix_norm.tsv";
-    const std::string matrix_abs_tsv = stem + ".distance_matrix_abs.tsv";
-    const std::string stats_tsv = stem + ".cluster_stats.tsv";
-    const std::string cluster_pairwise_norm_tsv = stem + ".cluster_pairwise_norm.tsv";
-    const std::string cluster_pairwise_abs_tsv = stem + ".cluster_pairwise_abs.tsv";
-    const std::string cluster_membership_tsv = stem + ".cluster_membership.tsv";
-    const std::string tree_svg = stem + ".tree.svg";
-    const std::string tree_nwk = stem + ".upgma.nwk";
+    std::filesystem::create_directories(paths.bubble_dir);
 
-    write_similarity_alleles_tsv(alleles_tsv, bubble, unique_alleles, cluster_of_unique);
-    write_similarity_distance_matrix_tsv(matrix_norm_tsv, unique_alleles, dists.norm);
-    write_similarity_distance_matrix_abs_tsv(matrix_abs_tsv, unique_alleles, dists.abs);
+    write_similarity_alleles_tsv(paths.alleles_tsv, bubble, unique_alleles, cluster_of_unique);
+    write_similarity_distance_matrix_tsv(paths.matrix_norm_tsv, unique_alleles, dists.norm);
+    write_similarity_distance_matrix_abs_tsv(paths.matrix_abs_tsv, unique_alleles, dists.abs);
     write_similarity_cluster_stats_tsv(
-        stats_tsv,
+        paths.stats_tsv,
         unique_alleles,
         cluster_of_unique,
         dists.norm,
         dists.abs);
-    write_similarity_cluster_pairwise_tsv(cluster_pairwise_norm_tsv, cluster_of_unique, dists.norm);
-    write_similarity_cluster_pairwise_abs_tsv(cluster_pairwise_abs_tsv, cluster_of_unique, dists.abs);
+    write_similarity_cluster_pairwise_tsv(paths.cluster_pairwise_norm_tsv, cluster_of_unique, dists.norm);
+    write_similarity_cluster_pairwise_abs_tsv(paths.cluster_pairwise_abs_tsv, cluster_of_unique, dists.abs);
     write_similarity_cluster_membership_tsv(
-        cluster_membership_tsv,
+        paths.cluster_membership_tsv,
         unique_alleles,
         clusters,
         dists.abs,
         min_similarity);
     if (tree != nullptr && tree->root >= 0) {
-        write_upgma_tree_svg(tree_svg, bubble.id, unique_alleles, cluster_of_unique, *tree);
+        write_upgma_tree_svg(paths.tree_svg, bubble.id, unique_alleles, cluster_of_unique, *tree);
 
-        std::ofstream tree_out(tree_nwk);
+        std::ofstream tree_out(paths.tree_nwk);
         if (!tree_out) {
-            throw std::runtime_error("Failed to write UPGMA newick: " + tree_nwk);
+            throw std::runtime_error("Failed to write UPGMA newick: " + paths.tree_nwk);
         }
         tree_out << build_upgma_newick(unique_alleles, cluster_of_unique, *tree) << '\n';
     }
@@ -1768,95 +1857,100 @@ int bounded_levenshtein_distance(
     return prev[static_cast<std::size_t>(m - prev_start)];
 }
 
-int bounded_levenshtein_distance(
+int bounded_weighted_levenshtein_distance(
     const std::vector<std::uint64_t>& a,
+    const std::vector<int>& a_weights,
     const std::vector<std::uint64_t>& b,
+    const std::vector<int>& b_weights,
     int max_dist) {
 
-    std::size_t a_begin = 0;
-    std::size_t b_begin = 0;
-    std::size_t a_end = a.size();
-    std::size_t b_end = b.size();
-
-    while (a_begin < a_end && b_begin < b_end && a[a_begin] == b[b_begin]) {
-        ++a_begin;
-        ++b_begin;
-    }
-    while (a_end > a_begin && b_end > b_begin && a[a_end - 1] == b[b_end - 1]) {
-        --a_end;
-        --b_end;
+    if (a.size() != a_weights.size() || b.size() != b_weights.size()) {
+        throw std::runtime_error("Weighted walk token/weight length mismatch");
     }
 
-    const int n = static_cast<int>(a_end - a_begin);
-    const int m = static_cast<int>(b_end - b_begin);
-    if (std::abs(n - m) > max_dist) {
-        return max_dist + 1;
-    }
+    const int inf = std::max(1, max_dist + 1);
+    auto saturating_add = [&](int x, int y) -> int {
+        if (x >= inf || y >= inf) {
+            return inf;
+        }
+        if (x > inf - y) {
+            return inf;
+        }
+        return x + y;
+    };
+
+    const std::size_t n = a.size();
+    const std::size_t m = b.size();
     if (n == 0) {
-        return m;
+        int total = 0;
+        for (const int w : b_weights) {
+            total = saturating_add(total, std::max(1, w));
+            if (total > max_dist) {
+                return max_dist + 1;
+            }
+        }
+        return total;
     }
     if (m == 0) {
-        return n;
-    }
-
-    const int inf = max_dist + 1;
-
-    int prev_start = 0;
-    int prev_end = std::min(m, max_dist);
-    std::vector<int> prev(static_cast<std::size_t>(prev_end - prev_start + 1), inf);
-    for (int j = prev_start; j <= prev_end; ++j) {
-        prev[static_cast<std::size_t>(j - prev_start)] = j;
-    }
-
-    for (int i = 1; i <= n; ++i) {
-        const int curr_start = std::max(0, i - max_dist);
-        const int curr_end = std::min(m, i + max_dist);
-        std::vector<int> curr(static_cast<std::size_t>(curr_end - curr_start + 1), inf);
-
-        int row_best = inf;
-        for (int j = curr_start; j <= curr_end; ++j) {
-            int best = inf;
-            if (j == 0) {
-                best = i;
-            } else {
-                int deletion = inf;
-                int insertion = inf;
-                int substitution = inf;
-
-                if (j >= prev_start && j <= prev_end) {
-                    deletion = prev[static_cast<std::size_t>(j - prev_start)] + 1;
-                }
-                if (j - 1 >= curr_start) {
-                    insertion = curr[static_cast<std::size_t>((j - 1) - curr_start)] + 1;
-                }
-                if (j - 1 >= prev_start && j - 1 <= prev_end) {
-                    const int cost =
-                        (a[a_begin + static_cast<std::size_t>(i - 1)] ==
-                         b[b_begin + static_cast<std::size_t>(j - 1)])
-                            ? 0
-                            : 1;
-                    substitution = prev[static_cast<std::size_t>((j - 1) - prev_start)] + cost;
-                }
-                best = std::min({deletion, insertion, substitution});
+        int total = 0;
+        for (const int w : a_weights) {
+            total = saturating_add(total, std::max(1, w));
+            if (total > max_dist) {
+                return max_dist + 1;
             }
+        }
+        return total;
+    }
 
-            curr[static_cast<std::size_t>(j - curr_start)] = best;
+    int total_a = 0;
+    for (const int w : a_weights) {
+        total_a = saturating_add(total_a, std::max(1, w));
+    }
+    int total_b = 0;
+    for (const int w : b_weights) {
+        total_b = saturating_add(total_b, std::max(1, w));
+    }
+    if (std::abs(total_a - total_b) > max_dist) {
+        return max_dist + 1;
+    }
+
+    std::vector<int> prev(m + 1, inf);
+    prev[0] = 0;
+    for (std::size_t j = 1; j <= m; ++j) {
+        prev[j] = saturating_add(prev[j - 1], std::max(1, b_weights[j - 1]));
+    }
+    if (*std::min_element(prev.begin(), prev.end()) > max_dist) {
+        return max_dist + 1;
+    }
+
+    std::vector<int> curr(m + 1, inf);
+    for (std::size_t i = 1; i <= n; ++i) {
+        const int del_cost = std::max(1, a_weights[i - 1]);
+        curr[0] = saturating_add(prev[0], del_cost);
+        int row_best = curr[0];
+
+        for (std::size_t j = 1; j <= m; ++j) {
+            const int ins_cost = std::max(1, b_weights[j - 1]);
+            const int sub_cost = (a[i - 1] == b[j - 1]) ? 0 : std::max(del_cost, ins_cost);
+
+            const int deletion = saturating_add(prev[j], del_cost);
+            const int insertion = saturating_add(curr[j - 1], ins_cost);
+            const int substitution = saturating_add(prev[j - 1], sub_cost);
+            const int best = std::min({deletion, insertion, substitution});
+            curr[j] = best;
             row_best = std::min(row_best, best);
         }
 
         if (row_best > max_dist) {
             return max_dist + 1;
         }
-
         prev.swap(curr);
-        prev_start = curr_start;
-        prev_end = curr_end;
     }
 
-    if (m < prev_start || m > prev_end) {
+    if (prev[m] > max_dist) {
         return max_dist + 1;
     }
-    return prev[static_cast<std::size_t>(m - prev_start)];
+    return prev[m];
 }
 
 void collect_subtree_leaves(
@@ -6769,7 +6863,8 @@ void write_headers(
     std::ofstream& assignments_out,
     std::ofstream* cluster_sequences_out) {
     clusters_out
-        << "bubble_id,source,sink,cluster_id,representative_allele_id,total_path_support,member_alleles\n";
+        << "bubble_id,source,sink,cluster_id,representative_allele_id,total_path_support,"
+        << "member_allele_count,member_alleles\n";
 
     assignments_out
         << "bubble_id,source,sink,path_name,cluster_id,allele_id,allele_length,interval_start,interval_end,"
@@ -6935,7 +7030,7 @@ void call_alleles_to_csv(
 
     if (options.bubbles_csv_in.empty()) {
         throw std::runtime_error(
-            "Module 'allele' requires --bubbles-csv-in from module 1 ('panvar bubble').");
+            "Module 'allele' requires module-1 bubbles input (use --bubble-prefix-in in CLI).");
     }
     const std::vector<Bubble> bubbles = read_bubbles_csv(options.bubbles_csv_in);
     std::unordered_map<std::string, std::string> predefined_cluster_labels_by_path;
@@ -6972,7 +7067,8 @@ void call_alleles_to_csv(
     const auto graph_paths = path_by_name(graph);
     const PathRecord* reference_path_record = nullptr;
     const bool need_reference_path =
-        options.write_odgi_viz_inputs || options.write_region_vcf || options.write_debug_reports;
+        options.write_odgi_viz_inputs || options.write_region_vcf || options.write_debug_reports ||
+        options.skip_bubbles_without_reference;
     std::vector<std::size_t> reference_prefix_bp;
     std::string reference_sequence;
     ParsedReferencePath reference_meta;
@@ -7032,7 +7128,7 @@ void call_alleles_to_csv(
             throw std::runtime_error("Failed to write ODGI manifest: " + odgi_manifest_path);
         }
         odgi_manifest
-            << "bubble_id\tsource\tsink\trows\tclusters\trange_start_bp\trange_end_bp\t"
+            << "bubble_id\tsource\tsink\tbubble_dir\trows\tclusters\trange_start_bp\trange_end_bp\t"
             << "paths_file\tpath_colors_file\tviz_script\tpng_file\todgi_rc\tstatus\n";
 
         run_all_odgi.open(run_all_script_path);
@@ -7054,7 +7150,7 @@ void call_alleles_to_csv(
             throw std::runtime_error("Failed to write similarity manifest: " + manifest_path);
         }
         similarity_manifest
-            << "bubble_id\tsource\tsink\tunique_alleles\tclusters\t"
+            << "bubble_id\tsource\tsink\tstatus\tunique_alleles\tclusters\tbubble_dir\t"
             << "alleles_tsv\tdistance_matrix_norm_tsv\tdistance_matrix_abs_tsv\t"
             << "cluster_stats_tsv\tcluster_pairwise_norm_tsv\tcluster_pairwise_abs_tsv\t"
             << "cluster_membership_tsv\ttree_svg\tupgma_nwk\n";
@@ -7066,6 +7162,51 @@ void call_alleles_to_csv(
         }
         std::filesystem::create_directories(options.debug_out_dir);
     }
+
+    auto emit_similarity_manifest_skip = [&](const Bubble& bubble, const std::string& status) {
+        if (!options.write_similarity_reports) {
+            return;
+        }
+        const SimilarityReportPaths sim_paths =
+            similarity_report_paths_for_bubble(options.similarity_out_dir, bubble.id, false);
+        similarity_manifest << bubble.id << '\t'
+                            << bubble.source << '\t'
+                            << bubble.sink << '\t'
+                            << status << '\t'
+                            << 0 << '\t'
+                            << 0 << '\t'
+                            << sim_paths.bubble_dir << '\t'
+                            << "." << '\t'
+                            << "." << '\t'
+                            << "." << '\t'
+                            << "." << '\t'
+                            << "." << '\t'
+                            << "." << '\t'
+                            << "." << '\t'
+                            << "." << '\t'
+                            << "." << '\n';
+    };
+
+    auto emit_odgi_manifest_skip = [&](const Bubble& bubble, const std::string& status) {
+        if (!options.write_odgi_viz_inputs) {
+            return;
+        }
+        const std::string bubble_dir = options.odgi_viz_out_dir + "/bubble_" + std::to_string(bubble.id);
+        odgi_manifest << bubble.id << '\t'
+                      << bubble.source << '\t'
+                      << bubble.sink << '\t'
+                      << bubble_dir << '\t'
+                      << 0 << '\t'
+                      << 0 << '\t'
+                      << 0 << '\t'
+                      << 0 << '\t'
+                      << "." << '\t'
+                      << "." << '\t'
+                      << "." << '\t'
+                      << "." << '\t'
+                      << -1 << '\t'
+                      << status << '\n';
+    };
 
     std::size_t predefined_missing_assignments_total = 0;
     std::size_t predefined_missing_paths_total = 0;
@@ -7089,6 +7230,7 @@ void call_alleles_to_csv(
         unique_by_signature.reserve(graph.paths.size() * 2);
         unique_alleles.reserve(graph.paths.size());
         assignments.reserve(graph.paths.size());
+        bool has_reference_assignment = false;
 
         for (std::size_t path_idx = 0; path_idx < graph.paths.size(); ++path_idx) {
             const auto& path = graph.paths[path_idx];
@@ -7122,6 +7264,8 @@ void call_alleles_to_csv(
                     allele.sequence = spell_sequence(graph, allele.steps, has_sequence);
                 }
                 allele.compare_steps = build_walk_tokens(allele.steps);
+                allele.compare_step_weights = build_walk_step_weights(allele.steps, graph.nodes);
+                allele.compare_steps_weight_sum = sum_step_weights(allele.compare_step_weights);
                 if (is_sequence_cluster_mode(options.cluster_mode)) {
                     if (has_sequence) {
                         allele.compare_token = allele.sequence;
@@ -7129,12 +7273,20 @@ void call_alleles_to_csv(
                         allele.uses_sequence_similarity = true;
                     } else {
                         allele.compare_token = allele.signature;
-                        allele.sequence_length = allele.steps.size();
+                        allele.sequence_length =
+                            (allele.compare_steps_weight_sum > 0)
+                                ? allele.compare_steps_weight_sum
+                                : allele.steps.size();
                         allele.uses_sequence_similarity = false;
                     }
                 } else {
                     allele.compare_token = allele.signature;
-                    allele.sequence_length = has_sequence ? allele.sequence.size() : allele.steps.size();
+                    allele.sequence_length =
+                        has_sequence
+                            ? allele.sequence.size()
+                            : ((allele.compare_steps_weight_sum > 0)
+                                   ? allele.compare_steps_weight_sum
+                                   : allele.steps.size());
                     allele.uses_sequence_similarity = false;
                 }
 
@@ -7154,13 +7306,31 @@ void call_alleles_to_csv(
             assignment.interval_end = best_interval->right;
             assignment.source_to_sink = best_interval->source_to_sink;
             assignments.push_back(std::move(assignment));
+            if (!options.reference_path.empty() && path.name == options.reference_path) {
+                has_reference_assignment = true;
+            }
         }
 
         if (assignments.empty()) {
+            emit_similarity_manifest_skip(bubble, "skipped:no-path-assignments");
+            emit_odgi_manifest_skip(bubble, "skipped:no-path-assignments");
             if (options.show_progress) {
                 std::cerr
                     << "[allele] bubble " << bubble.id
                     << " skipped (no source->sink path assignments), elapsed="
+                    << std::fixed << std::setprecision(2) << elapsed_seconds(bubble_start) << "s\n";
+            }
+            continue;
+        }
+
+        if (options.skip_bubbles_without_reference && !has_reference_assignment) {
+            summary.bubbles_skipped_no_reference += 1;
+            emit_similarity_manifest_skip(bubble, "skipped:no-reference-assignment-filter");
+            emit_odgi_manifest_skip(bubble, "skipped:no-reference-assignment-filter");
+            if (options.show_progress) {
+                std::cerr
+                    << "[allele] bubble " << bubble.id
+                    << " skipped by --skip-no-reference-bubbles, elapsed="
                     << std::fixed << std::setprecision(2) << elapsed_seconds(bubble_start) << "s\n";
             }
             continue;
@@ -7305,6 +7475,8 @@ void call_alleles_to_csv(
                 options.min_similarity);
         }
         if (clusters.empty()) {
+            emit_similarity_manifest_skip(bubble, "skipped:no-clusters");
+            emit_odgi_manifest_skip(bubble, "skipped:no-clusters");
             if (options.show_progress) {
                 std::cerr
                     << "[allele] bubble " << bubble.id
@@ -7340,6 +7512,7 @@ void call_alleles_to_csv(
                 << cluster.cluster_id << ','
                 << rep.allele_id << ','
                 << cluster.total_path_support << ','
+                << member_alleles.size() << ','
                 << csv_escape(join_size_t(member_alleles, ';'))
                 << '\n';
 
@@ -7381,19 +7554,11 @@ void call_alleles_to_csv(
         }
 
         if (options.write_similarity_reports) {
-            const std::string stem = options.similarity_out_dir + "/bubble_" + std::to_string(bubble.id);
-            const std::string alleles_tsv = stem + ".alleles.tsv";
-            const std::string matrix_norm_tsv = stem + ".distance_matrix_norm.tsv";
-            const std::string matrix_abs_tsv = stem + ".distance_matrix_abs.tsv";
-            const std::string stats_tsv = stem + ".cluster_stats.tsv";
-            const std::string cluster_pairwise_norm_tsv = stem + ".cluster_pairwise_norm.tsv";
-            const std::string cluster_pairwise_abs_tsv = stem + ".cluster_pairwise_abs.tsv";
-            const std::string cluster_membership_tsv = stem + ".cluster_membership.tsv";
-            const std::string tree_svg = have_tree ? (stem + ".tree.svg") : ".";
-            const std::string tree_nwk = have_tree ? (stem + ".upgma.nwk") : ".";
+            const SimilarityReportPaths sim_paths =
+                similarity_report_paths_for_bubble(options.similarity_out_dir, bubble.id, have_tree);
 
             write_similarity_reports_for_bubble(
-                options.similarity_out_dir,
+                sim_paths,
                 bubble,
                 unique_alleles,
                 clusters,
@@ -7405,17 +7570,19 @@ void call_alleles_to_csv(
             similarity_manifest << bubble.id << '\t'
                                 << bubble.source << '\t'
                                 << bubble.sink << '\t'
+                                << "ok" << '\t'
                                 << unique_alleles.size() << '\t'
                                 << clusters.size() << '\t'
-                                << alleles_tsv << '\t'
-                                << matrix_norm_tsv << '\t'
-                                << matrix_abs_tsv << '\t'
-                                << stats_tsv << '\t'
-                                << cluster_pairwise_norm_tsv << '\t'
-                                << cluster_pairwise_abs_tsv << '\t'
-                                << cluster_membership_tsv << '\t'
-                                << tree_svg << '\t'
-                                << tree_nwk << '\n';
+                                << sim_paths.bubble_dir << '\t'
+                                << sim_paths.alleles_tsv << '\t'
+                                << sim_paths.matrix_norm_tsv << '\t'
+                                << sim_paths.matrix_abs_tsv << '\t'
+                                << sim_paths.stats_tsv << '\t'
+                                << sim_paths.cluster_pairwise_norm_tsv << '\t'
+                                << sim_paths.cluster_pairwise_abs_tsv << '\t'
+                                << sim_paths.cluster_membership_tsv << '\t'
+                                << sim_paths.tree_svg << '\t'
+                                << sim_paths.tree_nwk << '\n';
             summary.similarity_reports_written += 1;
         }
 
@@ -7486,6 +7653,7 @@ void call_alleles_to_csv(
             std::string status = "skipped:no-reference-assignment";
             std::size_t rows_exported = 0;
             std::size_t cluster_count = 0;
+            const std::string bubble_dir = options.odgi_viz_out_dir + "/bubble_" + std::to_string(bubble.id);
 
             const auto ref_row_it = best_by_path.find(options.reference_path);
             if (ref_row_it != best_by_path.end()) {
@@ -7541,11 +7709,11 @@ void call_alleles_to_csv(
                     cluster_count = cluster_ids.size();
                     const auto color_by_cluster = cluster_palette(cluster_ids);
 
-                    const std::string stem = options.odgi_viz_out_dir + "/bubble_" + std::to_string(bubble.id);
-                    paths_file = stem + ".paths.txt";
-                    colors_file = stem + ".path_colors.tsv";
-                    viz_script = stem + ".viz.sh";
-                    png_file = stem + ".png";
+                    std::filesystem::create_directories(bubble_dir);
+                    paths_file = bubble_dir + "/paths.txt";
+                    colors_file = bubble_dir + "/path_colors.tsv";
+                    viz_script = bubble_dir + "/viz.sh";
+                    png_file = bubble_dir + "/plot.png";
 
                     std::ofstream paths_out(paths_file);
                     std::ofstream colors_out(colors_file);
@@ -7608,6 +7776,7 @@ void call_alleles_to_csv(
             odgi_manifest << bubble.id << '\t'
                           << bubble.source << '\t'
                           << bubble.sink << '\t'
+                          << bubble_dir << '\t'
                           << rows_exported << '\t'
                           << cluster_count << '\t'
                           << range_start_bp << '\t'

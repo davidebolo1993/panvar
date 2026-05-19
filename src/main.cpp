@@ -54,13 +54,12 @@ void print_bubble_help() {
 void print_allele_help() {
     std::cout
         << "Usage:\n"
-        << "  panvar allele -i <graph.gfa> [--bubble-prefix-in <module1-prefix> | --bubbles-csv-in <module1.bubbles.csv>] [options]\n\n"
+        << "  panvar allele -i <graph.gfa> --bubble-prefix-in <module1-prefix> [options]\n\n"
         << "Options:\n"
         << "  -i, --gfa <path>                 Input GFA file (required)\n"
         << "  -o, --out-prefix <prefix>        Output prefix (default: allele_calls)\n"
         << "      --bubble-prefix-in <prefix>  Module-1 output prefix from 'panvar bubble'\n"
         << "                                   (auto-uses <prefix>.bubbles.csv)\n"
-        << "      --bubbles-csv-in <path>      Module-1 bubbles CSV input (required if no prefix)\n"
         << "      --clusters-csv <path>        Explicit allele-cluster CSV output path\n"
         << "      --assignments-csv <path>     Explicit per-path assignment CSV output path\n"
         << "      --clusters-json <path>       Optional predefined path->cluster-label JSON map\n"
@@ -68,11 +67,13 @@ void print_allele_help() {
         << "                                   (one representative sequence row per bubble+cluster)\n"
         << "      --min-similarity <X>         Min similarity in [0,1] or percent (e.g. 0.9 or 90)\n"
         << "                                    (default: 0.90)\n"
-        << "      --cluster-mode <mode>        similarity mode: sequence|walk (default: sequence)\n"
+        << "      --cluster-mode <mode>        similarity mode: walk|sequence (default: walk)\n"
         << "      --threads <N>                Worker threads for distance computation (0=auto)\n"
         << "      --distance-mode <mode>       auto|exact (default: auto)\n"
         << "      --max-upgma-alleles <N>      auto-switch to threshold-graph clustering above N unique\n"
         << "                                    alleles per bubble (default: 256, 0=disable)\n"
+        << "      --skip-no-reference-bubbles   Skip bubbles where --reference-path has no assignment\n"
+        << "                                    (useful when preparing call-ready clusters)\n"
         << "      --quiet                      Disable progress logs\n"
         << "      --similarity-out-dir <dir>   Optional per-bubble similarity diagnostics folder\n"
         << "                                    (distance stats, pairwise cluster matrix,\n"
@@ -109,6 +110,7 @@ void print_call_help() {
         << "      --assignments-csv-in <path>  Module-2 per-path assignment CSV input (required if no allele prefix)\n"
         << "      --quiet                      Disable progress logs\n"
         << "      --reference-path <path>      Reference path name (required)\n"
+        << "      --skip-no-reference-bubbles   Skip bubbles where reference has no assignment\n"
         << "      --min-sv-bp <N>              Minimum size for INS/DEL-style calls (default: 50)\n"
         << "      --vcf-out <path>             Region-level multi-sample VCF path (default: <out>.region.vcf)\n"
         << "      --debug                      Write per-cluster debug artifacts (PAF, FASTA, dotplot, VCF)\n"
@@ -509,10 +511,6 @@ int run_allele(const std::vector<std::string>& args) {
             bubble_prefix_in = require_value(arg);
             continue;
         }
-        if (arg == "--bubbles-csv-in") {
-            options.bubbles_csv_in = require_value(arg);
-            continue;
-        }
         if (arg == "--clusters-csv") {
             clusters_csv_path = require_value(arg);
             continue;
@@ -555,6 +553,10 @@ int run_allele(const std::vector<std::string>& args) {
         }
         if (arg == "--max-upgma-alleles") {
             options.max_upgma_alleles = parse_size_arg(arg, require_value(arg));
+            continue;
+        }
+        if (arg == "--skip-no-reference-bubbles") {
+            options.skip_bubbles_without_reference = true;
             continue;
         }
         if (arg == "--quiet") {
@@ -611,20 +613,14 @@ int run_allele(const std::vector<std::string>& args) {
     if (gfa_path.empty()) {
         throw std::runtime_error("Missing required input: --gfa <path>");
     }
-    if (!bubble_prefix_in.empty()) {
-        const std::string derived_bubbles_csv = bubble_prefix_in + ".bubbles.csv";
-        if (options.bubbles_csv_in.empty()) {
-            options.bubbles_csv_in = derived_bubbles_csv;
-        } else if (options.bubbles_csv_in != derived_bubbles_csv) {
-            throw std::runtime_error(
-                "Conflicting bubble inputs: --bubble-prefix-in resolves to '" +
-                derived_bubbles_csv + "' but --bubbles-csv-in is '" + options.bubbles_csv_in + "'");
-        }
-    }
-    if (options.bubbles_csv_in.empty()) {
+    if (bubble_prefix_in.empty()) {
         throw std::runtime_error(
-            "Module 'allele' requires module-1 bubbles: use --bubble-prefix-in <prefix> "
-            "or --bubbles-csv-in <path>.");
+            "Module 'allele' requires module-1 bubbles prefix: use --bubble-prefix-in <prefix>.");
+    }
+    options.bubbles_csv_in = bubble_prefix_in + ".bubbles.csv";
+    if (options.skip_bubbles_without_reference && options.reference_path.empty()) {
+        throw std::runtime_error(
+            "--skip-no-reference-bubbles requires --reference-path in module 'allele'.");
     }
 
     if (options.write_odgi_viz_inputs && options.odgi_viz_out_dir.empty()) {
@@ -674,6 +670,7 @@ int run_allele(const std::vector<std::string>& args) {
         << "Min similarity: " << options.min_similarity << "\n"
         << "Cluster mode: " << cluster_mode_label(options.cluster_mode) << "\n"
         << "Distance mode: " << (options.fast_distance ? "auto" : "exact") << "\n"
+        << "Skip no-reference bubbles: " << (options.skip_bubbles_without_reference ? "yes" : "no") << "\n"
         << "Predefined clusters: "
         << (options.predefined_clusters_json_path.empty() ? "off" : options.predefined_clusters_json_path)
         << "\n"
@@ -681,6 +678,7 @@ int run_allele(const std::vector<std::string>& args) {
         << "Threads: " << options.threads << " (0=auto)\n"
         << "Bubbles processed: " << summary.bubbles_processed << "\n"
         << "Bubbles with haplotype assignments: " << summary.bubbles_with_assignments << "\n"
+        << "Bubbles skipped (no reference assignment): " << summary.bubbles_skipped_no_reference << "\n"
         << "Unique alleles: " << summary.unique_alleles << "\n"
         << "Allele clusters: " << summary.clusters << "\n"
         << "Path assignments: " << summary.assignments << "\n"
@@ -764,6 +762,10 @@ int run_call(const std::vector<std::string>& args) {
         }
         if (arg == "--reference-path") {
             options.reference_path = require_value(arg);
+            continue;
+        }
+        if (arg == "--skip-no-reference-bubbles") {
+            options.skip_bubbles_without_reference = true;
             continue;
         }
         if (arg == "--min-sv-bp") {
@@ -945,6 +947,8 @@ int run_call(const std::vector<std::string>& args) {
         << "Bubbles with haplotype assignments: " << summary.bubbles_with_assignments << "\n"
         << "Allele clusters: " << summary.clusters << "\n"
         << "Path assignments: " << summary.assignments << "\n"
+        << "Skip no-reference bubbles: " << (options.skip_bubbles_without_reference ? "yes" : "no") << "\n"
+        << "Bubbles skipped (no reference assignment): " << summary.bubbles_skipped_no_reference << "\n"
         << "Minimap2 preset: " << options.minimap_preset << "\n"
         << "Minimap2 best_n: " << options.minimap_best_n << "\n"
         << "Minimap2 secondary: " << (options.minimap_emit_secondary ? "on" : "off") << "\n"
