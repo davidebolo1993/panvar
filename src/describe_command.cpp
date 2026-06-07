@@ -1,0 +1,205 @@
+#include "panvar/describe_command.hpp"
+
+#include "panvar/cli_utils.hpp"
+#include "panvar/describe.hpp"
+
+#include <algorithm>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace panvar {
+namespace {
+
+DescribeFeatureMode parse_feature_mode_arg(const std::string& value) {
+    if (value == "all" || value == "kmer" || value == "kmers") {
+        return DescribeFeatureMode::AllKmers;
+    }
+    if (value == "minimizer" || value == "minimizers") {
+        return DescribeFeatureMode::Minimizer;
+    }
+    if (value == "syncmer" || value == "syncmers") {
+        return DescribeFeatureMode::Syncmer;
+    }
+    throw std::runtime_error("--feature-mode must be one of: all, minimizer, syncmer");
+}
+
+std::string feature_mode_label(DescribeFeatureMode mode) {
+    switch (mode) {
+        case DescribeFeatureMode::AllKmers:
+            return "all";
+        case DescribeFeatureMode::Minimizer:
+            return "minimizer";
+        case DescribeFeatureMode::Syncmer:
+            return "syncmer";
+    }
+    return "all";
+}
+
+void print_describe_help() {
+    std::cout
+        << "Usage:\n"
+        << "  panvar describe -i <graph.gfa> --bubble-prefix-in <module1-prefix> --out-dir <dir> [options]\n\n"
+        << "Options:\n"
+        << "  -i, --gfa <path>                 Input GFA file (required)\n"
+        << "      --bubble-prefix-in <prefix>  Module-1 output prefix from 'panvar bubble'\n"
+        << "                                   (auto-uses <prefix>.bubbles.csv)\n"
+        << "      --bubbles-csv <path>         Module-1 bubbles CSV (required if no prefix)\n"
+        << "      --out-dir <dir>              Output directory (default: describe_out)\n"
+        << "      --bubble-id <N>              Restrict to one bubble ID (repeatable)\n"
+        << "      --kmer-size <K>              K-mer size, 1..31 for 2-bit encoding (default: 31)\n"
+        << "      --feature-mode <mode>        all|minimizer|syncmer (default: all)\n"
+        << "      --minimizer-window <W>       Window of k-mers for minimizer mode (default: 15)\n"
+        << "      --syncmer-s <S>              Internal s-mer size for closed syncmer mode (default: auto)\n"
+        << "      --max-wide-features <N>      Skip wide matrix above N features (default: 250000; 0=no cap)\n"
+        << "      --force-wide                 Write wide matrix even above safety cap\n"
+        << "      --no-wide-matrix             Write only feature map + sparse JSONL counts\n"
+        << "      --quiet                      Disable progress logs\n"
+        << "  -h, --help                       Show this help\n";
+}
+
+} // namespace
+
+int run_describe_command(const std::vector<std::string>& args) {
+    std::string bubble_prefix_in;
+    DescribeOptions options;
+
+    for (std::size_t i = 0; i < args.size(); ++i) {
+        const std::string& arg = args[i];
+        auto require_value = [&](const std::string& flag) -> const std::string& {
+            if (i + 1 >= args.size()) {
+                throw std::runtime_error("Missing value after " + flag);
+            }
+            return args[++i];
+        };
+
+        if (arg == "-h" || arg == "--help") {
+            print_describe_help();
+            return 0;
+        }
+        if (arg == "-i" || arg == "--gfa") {
+            options.gfa_path = require_value(arg);
+            continue;
+        }
+        if (arg == "--bubble-prefix-in") {
+            bubble_prefix_in = require_value(arg);
+            continue;
+        }
+        if (arg == "--bubbles-csv") {
+            options.bubbles_csv_in = require_value(arg);
+            continue;
+        }
+        if (arg == "--out-dir") {
+            options.out_dir = require_value(arg);
+            continue;
+        }
+        if (arg == "--bubble-id") {
+            const std::size_t id = cli::parse_size_arg(arg, require_value(arg));
+            if (id == 0) {
+                throw std::runtime_error("--bubble-id must be > 0");
+            }
+            options.bubble_ids.push_back(id);
+            continue;
+        }
+        if (arg == "--kmer-size") {
+            options.kmer_size = cli::parse_size_arg(arg, require_value(arg));
+            continue;
+        }
+        if (arg == "--feature-mode") {
+            options.feature_mode = parse_feature_mode_arg(require_value(arg));
+            continue;
+        }
+        if (arg == "--minimizer-window") {
+            options.minimizer_window = cli::parse_size_arg(arg, require_value(arg));
+            continue;
+        }
+        if (arg == "--syncmer-s") {
+            options.syncmer_s = cli::parse_size_arg(arg, require_value(arg));
+            continue;
+        }
+        if (arg == "--max-wide-features") {
+            options.max_wide_features = cli::parse_size_arg(arg, require_value(arg));
+            continue;
+        }
+        if (arg == "--force-wide") {
+            options.force_wide_matrix = true;
+            continue;
+        }
+        if (arg == "--no-wide-matrix") {
+            options.write_wide_matrix = false;
+            continue;
+        }
+        if (arg == "--quiet") {
+            options.quiet = true;
+            continue;
+        }
+        if (arg == "--vcf-in" || arg == "--gtf" || arg == "--gene-match" || arg == "--size-bins") {
+            throw std::runtime_error(
+                "The describe module is now k-mer based and no longer consumes VCF/GTF inputs; "
+                "use -i/--gfa with --bubble-prefix-in or --bubbles-csv.");
+        }
+
+        throw std::runtime_error("Unknown option for describe: " + arg);
+    }
+
+    if (options.gfa_path.empty()) {
+        throw std::runtime_error("describe requires -i/--gfa <graph.gfa>");
+    }
+    if (!bubble_prefix_in.empty()) {
+        const std::string derived = bubble_prefix_in + ".bubbles.csv";
+        if (options.bubbles_csv_in.empty()) {
+            options.bubbles_csv_in = derived;
+        } else if (options.bubbles_csv_in != derived) {
+            throw std::runtime_error(
+                "Conflicting bubble inputs: --bubble-prefix-in resolves to '" +
+                derived + "' but --bubbles-csv is '" + options.bubbles_csv_in + "'");
+        }
+    }
+    if (options.bubbles_csv_in.empty()) {
+        throw std::runtime_error("describe requires --bubble-prefix-in <prefix> or --bubbles-csv <path>");
+    }
+    if (options.kmer_size == 0 || options.kmer_size > 31) {
+        throw std::runtime_error("--kmer-size must be in [1,31]");
+    }
+    if (options.feature_mode == DescribeFeatureMode::Minimizer && options.minimizer_window == 0) {
+        throw std::runtime_error("--minimizer-window must be > 0");
+    }
+    if (options.feature_mode == DescribeFeatureMode::Syncmer) {
+        const std::size_t syncmer_s =
+            options.syncmer_s == 0 ? std::max<std::size_t>(1, std::min<std::size_t>(11, (options.kmer_size + 2) / 3))
+                                   : options.syncmer_s;
+        if (syncmer_s >= options.kmer_size) {
+            throw std::runtime_error("--syncmer-s must be > 0 and < --kmer-size");
+        }
+    }
+    if (options.force_wide_matrix && !options.write_wide_matrix) {
+        throw std::runtime_error("--force-wide and --no-wide-matrix cannot be used together");
+    }
+
+    DescribeSummary summary;
+    describe_kmers_from_graph(options, &summary);
+
+    std::cout
+        << "Input graph: " << options.gfa_path << "\n"
+        << "Bubble source: " << options.bubbles_csv_in << "\n"
+        << "Output dir: " << options.out_dir << "\n"
+        << "K-mer size: " << options.kmer_size << "\n"
+        << "Feature mode: " << feature_mode_label(options.feature_mode) << "\n"
+        << "Minimizer window: " << options.minimizer_window << "\n"
+        << "Syncmer s: "
+        << (options.syncmer_s == 0 ? std::string("auto") : std::to_string(options.syncmer_s)) << "\n"
+        << "Wide matrix: " << (options.write_wide_matrix ? "on" : "off") << "\n"
+        << "Max wide features: " << options.max_wide_features << " (0=no cap)\n"
+        << "Bubbles processed: " << summary.bubbles_processed << "\n"
+        << "Bubbles with paths: " << summary.bubbles_with_paths << "\n"
+        << "Path rows written: " << summary.paths_written << "\n"
+        << "Discriminative k-mer features: " << summary.features_written << "\n"
+        << "Matrix files written: " << summary.matrix_files_written << "\n"
+        << "JSONL files written: " << summary.jsonl_files_written << "\n"
+        << "Files written: " << summary.files_written << "\n";
+
+    return 0;
+}
+
+} // namespace panvar

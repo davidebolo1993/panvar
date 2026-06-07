@@ -41,6 +41,13 @@ When similarity/ODGI outputs are enabled, files are organized per bubble:
 - similarity: `<similarity-out-dir>/bubble_<id>/...`
 - ODGI: `<odgi-viz-out-dir>/bubble_<id>/...`
 
+Similarity diagnostics include:
+
+- `distance_matrix.tsv`: normalized allele distance matrix
+- `cluster_stats.tsv`: per-cluster support, compactness, separation, and silhouette summary
+- `quality_summary.tsv`: one-row bubble-level clustering quality summary
+- `manifest.tsv`: paths to all per-bubble diagnostics and skip statuses
+
 Current module-2 handoff schemas:
 
 - `*.allele_clusters.csv`:
@@ -99,6 +106,7 @@ Clustering strategy:
 - if `unique_alleles > max_upgma_alleles`, switch to threshold-graph connected components
 - in `--distance-mode auto`, very large sequence bubbles may switch to a sequence fast path:
   greedy threshold assignment using sketch-estimated distances
+- node-length weighting is not needed here because the comparison is already nucleotide-level
 
 ### `--cluster-mode walk`
 
@@ -185,6 +193,26 @@ Clustering strategy:
 - use `sequence + auto` for sequence-centric analyses where nucleotide-level token similarity is preferred
 - use `exact` modes for strict validation on selected loci
 - similarity reports (`--similarity-out-dir`) are useful for debugging but add extra I/O
+
+## Similarity quality metrics
+
+When `--similarity-out-dir` is set, each bubble gets a `quality_summary.tsv`.
+
+Key fields:
+
+- `mean_silhouette`: average silhouette across unique alleles
+- `path_weighted_mean_silhouette`: silhouette weighted by path support, so common haplotypes count more than singleton alleles
+- `negative_silhouette_alleles`: number of unique alleles that are closer, on average, to another cluster than to their assigned cluster
+- `negative_silhouette_fraction`: fraction of unique alleles with negative silhouette
+- `mean_nearest_other_cluster_distance`: average distance to each allele's nearest non-self cluster
+
+Interpretation:
+
+- values near `1` indicate compact, well-separated clusters
+- values near `0` indicate weak separation or boundary cases near the threshold
+- negative values flag alleles that may be assigned to a less natural cluster under the current settings
+
+These metrics are diagnostics rather than hard filters. They are most useful for comparing `walk` vs `sequence`, changing `--min-similarity`, or checking a bubble before using downstream calls.
 
 ## Example
 

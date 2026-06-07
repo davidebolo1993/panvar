@@ -5,9 +5,10 @@
 Modules:
 
 1. `bubble` (Module 1): site extraction/refinement from precomputed `vg snarls`
-2. `allele` (Module 2): allele extraction and clustering from module-1 bubbles
-3. `call` (Module 3): SV calling (`INS`/`DEL`/`INV`) from clustered alleles
-4. `describe` (Module 4): per-bubble haplotype feature tables for downstream association
+2. `inspect` (utility): path FASTA and node traversal matrix for one called bubble
+3. `allele` (Module 2): allele extraction and clustering from module-1 bubbles
+4. `call` (Module 3): SV calling (`INS`/`DEL`/`INV`) from clustered alleles
+5. `describe` (Module 4): per-bubble k-mer feature tables for downstream association
 
 ## Build
 
@@ -35,7 +36,17 @@ Binary:
   --merge-nearby-bp 20
 ```
 
-2. Allele (default walk clustering, node-length weighted):
+2. Inspect one bubble:
+
+```bash
+./build/panvar inspect \
+  -i tests/real_data/c4.gfa \
+  --bubble-prefix-in tests/results/c4/bubble \
+  --bubble-id 1 \
+  -o tests/results/c4/inspect/bubble_1
+```
+
+3. Allele (default walk clustering, node-length weighted):
 
 ```bash
 ./build/panvar allele \
@@ -44,7 +55,7 @@ Binary:
   --bubble-prefix-in tests/results/c4/bubble
 ```
 
-3. Allele (predefined path-group JSON):
+4. Allele (predefined path-group JSON):
 
 ```bash
 ./build/panvar allele \
@@ -54,7 +65,7 @@ Binary:
   --clusters-json tests/real_data/c4.clusters.json
 ```
 
-4. Call (standard):
+5. Call (standard):
 
 ```bash
 ./build/panvar call \
@@ -65,7 +76,7 @@ Binary:
   --reference-path grch38#1#chr6:31891045-32123783
 ```
 
-5. Call (debug dotplots + INS classification + pangene copy annotations):
+6. Call (debug dotplots + INS classification + pangene copy annotations):
 
 ```bash
 ./build/panvar call \
@@ -83,15 +94,15 @@ Binary:
   --debug
 ```
 
-6. Describe:
+7. Describe:
 
 ```bash
 ./build/panvar describe \
-  --vcf-in tests/results/c4/call_pangene.region.vcf \
+  -i tests/real_data/c4.gfa \
+  --bubble-prefix-in tests/results/c4/bubble \
+  --bubble-id 1 \
   --out-dir tests/results/c4/describe \
-  --gtf tests/real_data/gencode.v49.annotation.gtf.gz \
-  --gene-match C4 \
-  --size-bins 100,1000
+  --kmer-size 31
 ```
 
 ## Useful Options
@@ -99,10 +110,12 @@ Binary:
 - `allele`
   - `--bubble-prefix-in <prefix>`: consume bubble outputs using prefix convention
   - `--clusters-json <path>`: use predefined path->cluster labels
-  - `--similarity-out-dir <dir>`: per-bubble clustering diagnostics
+  - `--similarity-out-dir <dir>`: per-bubble clustering diagnostics, including silhouette summaries
   - `--skip-no-reference-bubbles --reference-path <path>`: drop bubbles not traversed by the reference
 - `bubble`
   - `--merge-nearby-bp <N>`: optionally fuse nearby bubble candidates by graph bp distance
+- `inspect`
+  - `--bubble-prefix-in <prefix> --bubble-id <N>`: write bubble path FASTA plus node traversal counts
 - `call`
   - `--bubble-prefix-in <prefix>` + `--allele-prefix-in <prefix>`: simplified module handoff
   - `--debug --debug-out-dir <dir>`: per-cluster FASTA/PAF/dotplot/VCF
@@ -112,11 +125,18 @@ Binary:
   - `--pangene-bed <bed(.gz)>`: event-level gene-copy delta annotation
   - `--pangene-gene-match <expr>` (repeatable): filter pangene genes
   - `--pangene-tune-ins`: set `INS_SUBTYPE=DUP_PANGENE` when pangene copy gain supports duplication
+- `describe`
+  - `--bubble-prefix-in <prefix>`: consume bubble outputs using prefix convention
+  - `--kmer-size <K>`: canonical 2-bit k-mer size (`1..31`, default `31`)
+  - `--feature-mode all|minimizer|syncmer`: optionally sample k-mers to reduce feature count
+  - `--max-wide-features <N>`: skip very wide matrices above a feature cap
+  - `--no-wide-matrix`: keep only compact graph-aware feature map plus sparse JSONL counts
 
 ## Documentation
 
 - [docs/README.md](docs/README.md)
 - [docs/modules/bubble.md](docs/modules/bubble.md)
+- [docs/modules/inspect.md](docs/modules/inspect.md)
 - [docs/modules/allele.md](docs/modules/allele.md)
 - [docs/modules/call.md](docs/modules/call.md)
 - [docs/modules/describe.md](docs/modules/describe.md)
@@ -158,7 +178,10 @@ docker run --rm -v "$PWD":/work -w /work panvar:latest panvar --help
 
 ## Repository Layout
 
-- `src/`, `include/panvar/`: C++ implementation
+- `src/*_command.cpp`, `include/panvar/*_command.hpp`: CLI wrappers for each subcommand
+- `src/cli_utils.cpp`, `include/panvar/cli_utils.hpp`: shared command-line helpers
+- `src/graph_utils.cpp`, `include/panvar/graph_utils.hpp`: shared graph/path/sequence helpers
+- `src/`, `include/panvar/`: module algorithms and public data structures
 - `external/minimap2/`: minimap2 C library source
 - `tests/real_data/`: bundled example loci and inputs
 - `docs/modules/`: module docs

@@ -20,6 +20,7 @@
 #include <zlib.h>
 
 #include "call_internal.hpp"
+#include "panvar/graph_utils.hpp"
 #include "panvar/output.hpp"
 
 namespace panvar {
@@ -79,87 +80,6 @@ struct CandidateInterval {
     std::size_t inside_count = 0;
     bool source_to_sink = true;
 };
-
-std::unordered_map<std::string, const PathRecord*> path_by_name(const Graph& graph) {
-    std::unordered_map<std::string, const PathRecord*> out;
-    out.reserve(graph.paths.size() * 2);
-    for (const auto& path : graph.paths) {
-        out[path.name] = &path;
-    }
-    return out;
-}
-
-std::vector<std::size_t> prefix_bp(
-    const PathRecord& path,
-    const std::unordered_map<std::string, Node>& nodes) {
-
-    std::vector<std::size_t> pref(path.steps.size() + 1, 0);
-    for (std::size_t i = 0; i < path.steps.size(); ++i) {
-        const auto it = nodes.find(path.steps[i].node_id);
-        const std::size_t len = (it == nodes.end()) ? 1 : std::max<std::size_t>(1, it->second.sequence.size());
-        pref[i + 1] = pref[i] + len;
-    }
-    return pref;
-}
-
-std::string reverse_complement(const std::string& sequence) {
-    std::string rc;
-    rc.reserve(sequence.size());
-    for (auto it = sequence.rbegin(); it != sequence.rend(); ++it) {
-        const char c = *it;
-        switch (c) {
-            case 'A':
-            case 'a':
-                rc.push_back('T');
-                break;
-            case 'C':
-            case 'c':
-                rc.push_back('G');
-                break;
-            case 'G':
-            case 'g':
-                rc.push_back('C');
-                break;
-            case 'T':
-            case 't':
-                rc.push_back('A');
-                break;
-            default:
-                rc.push_back('N');
-                break;
-        }
-    }
-    return rc;
-}
-
-std::string spell_sequence(
-    const Graph& graph,
-    const std::vector<PathStep>& steps,
-    bool& complete) {
-
-    complete = true;
-    std::size_t total_len = 0;
-    for (const auto& step : steps) {
-        const auto node_it = graph.nodes.find(step.node_id);
-        if (node_it == graph.nodes.end() || node_it->second.sequence.empty()) {
-            complete = false;
-            return "";
-        }
-        total_len += node_it->second.sequence.size();
-    }
-
-    std::string seq;
-    seq.reserve(total_len);
-    for (const auto& step : steps) {
-        const auto& node_seq = graph.nodes.at(step.node_id).sequence;
-        if (!step.reverse) {
-            seq += node_seq;
-        } else {
-            seq += reverse_complement(node_seq);
-        }
-    }
-    return seq;
-}
 
 std::vector<PathStep> canonical_steps_for_bubble(
     const PathRecord& path,
@@ -709,15 +629,15 @@ void call_variants_from_precomputed_grouped_impl(
         throw std::runtime_error("No outputs requested: enable region VCF and/or --debug output");
     }
 
-    const auto graph_paths = path_by_name(graph);
+    const auto graph_paths = path_records_by_name(graph);
     const auto ref_it = graph_paths.find(options.reference_path);
     if (ref_it == graph_paths.end()) {
         throw std::runtime_error("Reference path not found in graph: " + options.reference_path);
     }
     const PathRecord* reference_path_record = ref_it->second;
-    const std::vector<std::size_t> reference_prefix_bp = prefix_bp(*reference_path_record, graph.nodes);
+    const std::vector<std::size_t> reference_prefix_bp = path_prefix_bp(*reference_path_record, graph.nodes);
     bool complete_ref_sequence = false;
-    std::string reference_sequence = spell_sequence(graph, reference_path_record->steps, complete_ref_sequence);
+    std::string reference_sequence = spell_path_steps_sequence(graph, reference_path_record->steps, &complete_ref_sequence);
     if (!complete_ref_sequence) {
         reference_sequence.clear();
     }
@@ -815,7 +735,7 @@ void call_variants_from_precomputed_grouped_impl(
         pangene_gene_filters = compile_gene_filters(options.pangene_gene_matches);
         prefix_bp_by_path.reserve(graph.paths.size() * 2);
         for (const auto& path : graph.paths) {
-            prefix_bp_by_path[path.name] = prefix_bp(path, graph.nodes);
+            prefix_bp_by_path[path.name] = path_prefix_bp(path, graph.nodes);
         }
         if (!options.pangene_copy_tsv_path.empty()) {
             pangene_copy_out.open(options.pangene_copy_tsv_path);
@@ -953,7 +873,7 @@ void call_variants_from_precomputed_grouped_impl(
 
                 allele.signature = build_walk_signature(allele.steps);
                 bool has_sequence = false;
-                allele.sequence = spell_sequence(graph, allele.steps, has_sequence);
+                allele.sequence = spell_path_steps_sequence(graph, allele.steps, &has_sequence);
                 allele.compare_steps = build_walk_tokens(allele.steps);
                 if (has_sequence) {
                     allele.compare_token = allele.sequence;

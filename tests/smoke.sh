@@ -36,11 +36,31 @@ mkdir -p "$OUT_DIR"
 BUBBLE_PREFIX="$OUT_DIR/bubble"
 ALLELE_PREFIX="$OUT_DIR/allele"
 CALL_PREFIX="$OUT_DIR/call"
+DESCRIBE_DIR="$OUT_DIR/describe"
 
 "$PANVAR_BIN" bubble \
   -i "$GFA" \
   -o "$BUBBLE_PREFIX" \
   --snarls-in "$SNARLS"
+
+FIRST_BUBBLE_ID="$(awk -F ',' 'NR==2 { print $1; exit }' "$BUBBLE_PREFIX.bubbles.csv")"
+if [[ -n "$FIRST_BUBBLE_ID" ]]; then
+  INSPECT_PREFIX="$OUT_DIR/inspect/bubble_${FIRST_BUBBLE_ID}"
+  "$PANVAR_BIN" inspect \
+    -i "$GFA" \
+    --bubble-prefix-in "$BUBBLE_PREFIX" \
+    --bubble-id "$FIRST_BUBBLE_ID" \
+    -o "$INSPECT_PREFIX" >/dev/null
+
+  "$PANVAR_BIN" describe \
+    -i "$GFA" \
+    --bubble-prefix-in "$BUBBLE_PREFIX" \
+    --bubble-id "$FIRST_BUBBLE_ID" \
+    --out-dir "$DESCRIBE_DIR" \
+    --kmer-size 21 \
+    --max-wide-features 0 \
+    --quiet >/dev/null
+fi
 
 "$PANVAR_BIN" allele \
   -i "$GFA" \
@@ -57,6 +77,18 @@ CALL_PREFIX="$OUT_DIR/call"
   --quiet
 
 test -s "$BUBBLE_PREFIX.bubbles.csv"
+if [[ -n "${FIRST_BUBBLE_ID:-}" ]]; then
+  test -s "$INSPECT_PREFIX.bubble_${FIRST_BUBBLE_ID}.paths.fa.gz"
+  test -s "$INSPECT_PREFIX.bubble_${FIRST_BUBBLE_ID}.node_counts.tsv"
+  gzip -t "$INSPECT_PREFIX.bubble_${FIRST_BUBBLE_ID}.paths.fa.gz"
+  test -s "$DESCRIBE_DIR/describe.index.tsv"
+  test -s "$DESCRIBE_DIR/bubble_${FIRST_BUBBLE_ID}.kmer_features.tsv.gz"
+  test -s "$DESCRIBE_DIR/bubble_${FIRST_BUBBLE_ID}.kmer_counts.jsonl.gz"
+  test -s "$DESCRIBE_DIR/bubble_${FIRST_BUBBLE_ID}.kmer_matrix.tsv.gz"
+  gzip -t "$DESCRIBE_DIR/bubble_${FIRST_BUBBLE_ID}.kmer_features.tsv.gz"
+  gzip -t "$DESCRIBE_DIR/bubble_${FIRST_BUBBLE_ID}.kmer_counts.jsonl.gz"
+  gzip -t "$DESCRIBE_DIR/bubble_${FIRST_BUBBLE_ID}.kmer_matrix.tsv.gz"
+fi
 test -s "$ALLELE_PREFIX.allele_clusters.csv"
 test -s "$ALLELE_PREFIX.allele_assignments.csv"
 test -s "$CALL_PREFIX.region.vcf"

@@ -7,6 +7,9 @@
 
 ## Smoke Test
 
+The smoke test runs `bubble -> inspect -> describe -> allele -> call` and checks
+the main handoff files plus compressed inspect/describe outputs.
+
 Run CTest after build:
 
 ```bash
