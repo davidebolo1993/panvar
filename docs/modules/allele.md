@@ -43,10 +43,14 @@ When similarity/ODGI outputs are enabled, files are organized per bubble:
 
 Similarity diagnostics include:
 
-- `distance_matrix.tsv`: normalized allele distance matrix
-- `cluster_stats.tsv`: per-cluster support, compactness, separation, and silhouette summary
-- `quality_summary.tsv`: one-row bubble-level clustering quality summary
+- `alleles.tsv`: one row per deduplicated allele, including cluster ID, path support, mode, and walk signature
+- `distance_matrix_norm.tsv`: normalized allele distance matrix
+- `distance_matrix_abs.tsv`: absolute edit-distance matrix
+- `cluster_stats.tsv`: per-cluster support, compactness, and separation summary
+- `cluster_signatures/cluster_<id>.tsv`: vertical graph-walk signature table for each cluster
 - `manifest.tsv`: paths to all per-bubble diagnostics and skip statuses
+
+Use `scripts/plot_distance_heatmap.R` to plot a clustered heatmap from `distance_matrix_norm.tsv`.
 
 Current module-2 handoff schemas:
 
@@ -125,6 +129,99 @@ Clustering strategy:
   - mismatch substitution cost = `max(weight_a, weight_b)`
   - `d = weighted_edit_bp / max(total_bp_a, total_bp_b)`
 
+## Similarity diagnostics details
+
+### Distance matrices
+
+`distance_matrix_abs.tsv` contains the edit distance used by clustering:
+
+- sequence mode: nucleotide edit distance between allele sequences
+- walk mode: node-length-weighted edit distance between oriented node-step walks
+
+`distance_matrix_norm.tsv` contains:
+
+```text
+distance_abs / max(token_units_a, token_units_b)
+```
+
+For walk mode, `token_units` means bp-weighted graph-walk length, not the raw number of nodes.
+For sequence mode, `token_units` means sequence length in bp.
+
+### Cluster stats
+
+`cluster_stats.tsv` keeps the compactness/separation metrics in one place.
+
+Columns:
+
+- `cluster_id`: cluster identifier used in `alleles.tsv`
+- `member_alleles`: number of unique alleles in the cluster
+- `path_support_sum`: total number of paths represented by the cluster
+- `mean_silhouette`: mean silhouette score across unique alleles in the cluster
+- `path_weighted_mean_silhouette`: same, weighted by allele path support
+- `mean_intra_distance_norm`: mean normalized distance among members of the same cluster
+- `mean_intra_similarity`: `1 - mean_intra_distance_norm`
+- `mean_intra_edit_distance`: mean absolute edit distance among members of the same cluster
+- `max_intra_distance_norm`: largest normalized distance within the cluster
+- `max_intra_edit_distance`: largest absolute edit distance within the cluster
+- `mean_to_other_clusters_distance_norm`: mean distance from this cluster to other clusters
+- `mean_to_other_clusters_similarity`: `1 - mean_to_other_clusters_distance_norm`
+- `mean_to_other_clusters_edit_distance`: mean absolute edit distance from this cluster to other clusters
+- `min_to_other_clusters_distance_norm`: closest mean distance to any other cluster
+- `max_to_other_clusters_distance_norm`: farthest mean distance to any other cluster
+- `min_to_other_clusters_edit_distance`: closest mean absolute edit distance to any other cluster
+- `max_to_other_clusters_edit_distance`: farthest mean absolute edit distance to any other cluster
+- `nearest_other_cluster_id`: cluster ID containing the closest cross-cluster allele pair
+- `nearest_other_min_distance_norm`: normalized distance of the closest cross-cluster allele pair
+- `nearest_other_min_similarity`: `1 - nearest_other_min_distance_norm`
+- `separation_margin_norm`: `nearest_other_min_distance_norm - max_intra_distance_norm`
+- `threshold_margin_norm`: `nearest_other_min_distance_norm - (1 - --min-similarity)`
+- `separation_quality`: simple label: `good`, `borderline`, `poor`, or `single_cluster`
+
+Interpretation:
+
+- high silhouette and high positive `separation_margin_norm` mean clusters are compact and well separated
+- `threshold_margin_norm <= 0` means at least one allele pair in different clusters is within the clustering threshold
+- `separation_quality=poor` flags clusters that are close enough to deserve manual inspection
+- `separation_quality=borderline` flags clusters just above the threshold or only weakly separated
+
+### Cluster signature tables
+
+`cluster_signatures/cluster_<id>.tsv` is a vertical view of the graph walk for all unique alleles in one cluster.
+
+Columns:
+
+- `node_id`
+- one `allele_<id>` column per unique allele in the cluster
+- `node_length_bp`
+
+Cells use:
+
+- `+`: allele traverses the node in forward orientation
+- `-`: allele traverses the node in reverse orientation
+- `|`: allele does not traverse the node
+
+If an allele traverses the same node multiple times inside the bubble interval, the symbols are repeated, for example `++` or `+-`.
+Rows are ordered by the representative allele walk first; nodes found only in other member alleles are appended in member order.
+
+### Heatmap helper
+
+`scripts/plot_distance_heatmap.R` uses base R only and plots a clustered heatmap from the normalized distance matrix.
+If `alleles.tsv` is provided, or found next to the matrix, it adds cluster side colors and allele labels with path support.
+
+Example:
+
+```bash
+scripts/plot_distance_heatmap.R \
+  --matrix similarity/bubble_1/distance_matrix_norm.tsv \
+  --alleles similarity/bubble_1/alleles.tsv \
+  --out similarity/bubble_1/distance_heatmap
+```
+
+This writes:
+
+- `similarity/bubble_1/distance_heatmap.png`
+- `similarity/bubble_1/distance_heatmap.pdf`
+
 ## Distance mode behavior
 
 ### `sequence + exact`
@@ -193,26 +290,6 @@ Clustering strategy:
 - use `sequence + auto` for sequence-centric analyses where nucleotide-level token similarity is preferred
 - use `exact` modes for strict validation on selected loci
 - similarity reports (`--similarity-out-dir`) are useful for debugging but add extra I/O
-
-## Similarity quality metrics
-
-When `--similarity-out-dir` is set, each bubble gets a `quality_summary.tsv`.
-
-Key fields:
-
-- `mean_silhouette`: average silhouette across unique alleles
-- `path_weighted_mean_silhouette`: silhouette weighted by path support, so common haplotypes count more than singleton alleles
-- `negative_silhouette_alleles`: number of unique alleles that are closer, on average, to another cluster than to their assigned cluster
-- `negative_silhouette_fraction`: fraction of unique alleles with negative silhouette
-- `mean_nearest_other_cluster_distance`: average distance to each allele's nearest non-self cluster
-
-Interpretation:
-
-- values near `1` indicate compact, well-separated clusters
-- values near `0` indicate weak separation or boundary cases near the threshold
-- negative values flag alleles that may be assigned to a less natural cluster under the current settings
-
-These metrics are diagnostics rather than hard filters. They are most useful for comparing `walk` vs `sequence`, changing `--min-similarity`, or checking a bubble before using downstream calls.
 
 ## Example
 

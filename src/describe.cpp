@@ -944,10 +944,11 @@ BubbleDescribeResult describe_one_bubble(
 
     BubbleDescribeResult result;
     const std::filesystem::path out_dir(options.out_dir);
-    const std::string prefix = "bubble_" + std::to_string(bubble.id);
-    result.feature_map_path = (out_dir / (prefix + ".kmer_features.tsv.gz")).string();
-    result.matrix_path = (out_dir / (prefix + ".kmer_matrix.tsv.gz")).string();
-    result.counts_jsonl_path = (out_dir / (prefix + ".kmer_counts.jsonl.gz")).string();
+    const std::filesystem::path bubble_dir = out_dir / ("bubble_" + std::to_string(bubble.id));
+    std::filesystem::create_directories(bubble_dir);
+    result.feature_map_path = (bubble_dir / "kmer_features.tsv.gz").string();
+    result.matrix_path = (bubble_dir / "kmer_matrix.tsv.gz").string();
+    result.counts_jsonl_path = (bubble_dir / "kmer_counts.jsonl.gz").string();
 
     std::unordered_map<std::uint64_t, KmerStats> stats;
     stats.reserve(4096);

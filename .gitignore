@@ -15,3 +15,5 @@ tests/real_data/gstm1*
 tests/real_data/lpa*
 
 !tests/results/.gitkeep
+
+c4

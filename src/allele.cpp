@@ -80,12 +80,7 @@ struct SimilarityReportPaths {
     std::string matrix_norm_tsv;
     std::string matrix_abs_tsv;
     std::string stats_tsv;
-    std::string cluster_pairwise_norm_tsv;
-    std::string cluster_pairwise_abs_tsv;
-    std::string cluster_membership_tsv;
-    std::string quality_summary_tsv;
-    std::string tree_svg;
-    std::string tree_nwk;
+    std::string cluster_signatures_dir;
 };
 
 constexpr const char* kClusterPalette[] = {
@@ -921,91 +916,14 @@ std::vector<double> compute_silhouette_scores(
     return scores;
 }
 
-void write_similarity_quality_summary_tsv(
-    const std::string& output_path,
-    const std::vector<UniqueAllele>& unique_alleles,
-    const std::vector<std::size_t>& cluster_of_unique,
-    const std::vector<std::vector<double>>& dist_norm,
-    const std::vector<double>& silhouette_scores) {
-
-    double weighted_sil_sum = 0.0;
-    std::size_t path_support_sum = 0;
-    for (std::size_t i = 0; i < unique_alleles.size(); ++i) {
-        const std::size_t support = unique_alleles[i].path_support;
-        weighted_sil_sum += silhouette_scores[i] * static_cast<double>(support);
-        path_support_sum += support;
-    }
-
-    double mean_sil = 0.0;
-    for (const double s : silhouette_scores) {
-        mean_sil += s;
-    }
-    mean_sil = safe_div(mean_sil, static_cast<double>(silhouette_scores.size()));
-
-    std::size_t negative_sil = 0;
-    for (const double s : silhouette_scores) {
-        if (s < 0.0) {
-            ++negative_sil;
-        }
-    }
-
-    double mean_nearest_other = 0.0;
-    std::size_t nearest_count = 0;
-    std::unordered_map<std::size_t, std::vector<std::size_t>> members;
-    for (std::size_t i = 0; i < cluster_of_unique.size(); ++i) {
-        members[cluster_of_unique[i]].push_back(i);
-    }
-    for (const auto& [cluster_id, idxs] : members) {
-        (void)cluster_id;
-        double nearest = std::numeric_limits<double>::infinity();
-        for (const auto& [other_id, other] : members) {
-            if (other_id == cluster_id) {
-                continue;
-            }
-            double sum = 0.0;
-            std::size_t pairs = 0;
-            for (const std::size_t i : idxs) {
-                for (const std::size_t j : other) {
-                    sum += dist_norm[i][j];
-                    ++pairs;
-                }
-            }
-            if (pairs > 0) {
-                nearest = std::min(nearest, sum / static_cast<double>(pairs));
-            }
-        }
-        if (std::isfinite(nearest)) {
-            mean_nearest_other += nearest;
-            ++nearest_count;
-        }
-    }
-    mean_nearest_other = safe_div(mean_nearest_other, static_cast<double>(nearest_count));
-
-    std::ofstream out(output_path);
-    if (!out) {
-        throw std::runtime_error("Failed to write clustering quality summary: " + output_path);
-    }
-    out << std::fixed << std::setprecision(6);
-    out << "unique_alleles\tclusters\tpath_support_sum\tmean_silhouette\t"
-           "path_weighted_mean_silhouette\tnegative_silhouette_alleles\t"
-           "negative_silhouette_fraction\tmean_nearest_other_cluster_distance\n";
-    out << unique_alleles.size() << '\t'
-        << members.size() << '\t'
-        << path_support_sum << '\t'
-        << mean_sil << '\t'
-        << safe_div(weighted_sil_sum, static_cast<double>(path_support_sum)) << '\t'
-        << negative_sil << '\t'
-        << safe_div(static_cast<double>(negative_sil), static_cast<double>(silhouette_scores.size())) << '\t'
-        << mean_nearest_other << '\n';
-}
-
 void write_similarity_cluster_stats_tsv(
     const std::string& output_path,
     const std::vector<UniqueAllele>& unique_alleles,
     const std::vector<std::size_t>& cluster_of_unique,
     const std::vector<std::vector<double>>& dist_norm,
     const std::vector<double>& silhouette_scores,
-    const std::vector<std::vector<int>>& dist_abs) {
+    const std::vector<std::vector<int>>& dist_abs,
+    double min_similarity) {
 
     std::unordered_map<std::size_t, std::vector<std::size_t>> members;
     for (std::size_t i = 0; i < cluster_of_unique.size(); ++i) {
@@ -1027,20 +945,27 @@ void write_similarity_cluster_stats_tsv(
     out << "cluster_id\tmember_alleles\tpath_support_sum\t"
            "mean_silhouette\tpath_weighted_mean_silhouette\t"
            "mean_intra_distance_norm\tmean_intra_similarity\tmean_intra_edit_distance\t"
+           "max_intra_distance_norm\tmax_intra_edit_distance\t"
            "mean_to_other_clusters_distance_norm\tmean_to_other_clusters_similarity\t"
            "mean_to_other_clusters_edit_distance\t"
            "min_to_other_clusters_distance_norm\tmax_to_other_clusters_distance_norm\t"
-           "min_to_other_clusters_edit_distance\tmax_to_other_clusters_edit_distance\n";
+           "min_to_other_clusters_edit_distance\tmax_to_other_clusters_edit_distance\t"
+           "nearest_other_cluster_id\tnearest_other_min_distance_norm\tnearest_other_min_similarity\t"
+           "separation_margin_norm\tthreshold_margin_norm\tseparation_quality\n";
 
     for (const std::size_t cluster_id : cluster_ids) {
         const auto& idxs = members[cluster_id];
         double intra_sum_norm = 0.0;
         double intra_sum_abs = 0.0;
         std::size_t intra_pairs = 0;
+        double intra_max_norm = 0.0;
+        double intra_max_abs = 0.0;
         for (std::size_t a = 0; a < idxs.size(); ++a) {
             for (std::size_t b = a + 1; b < idxs.size(); ++b) {
                 intra_sum_norm += dist_norm[idxs[a]][idxs[b]];
                 intra_sum_abs += static_cast<double>(dist_abs[idxs[a]][idxs[b]]);
+                intra_max_norm = std::max(intra_max_norm, dist_norm[idxs[a]][idxs[b]]);
+                intra_max_abs = std::max(intra_max_abs, static_cast<double>(dist_abs[idxs[a]][idxs[b]]));
                 ++intra_pairs;
             }
         }
@@ -1054,6 +979,8 @@ void write_similarity_cluster_stats_tsv(
         double between_cluster_max_norm = 0.0;
         double between_cluster_min_abs = std::numeric_limits<double>::infinity();
         double between_cluster_max_abs = 0.0;
+        std::size_t nearest_other_cluster_id = 0;
+        double nearest_other_min_norm = std::numeric_limits<double>::infinity();
         for (const std::size_t other_cluster : cluster_ids) {
             if (other_cluster == cluster_id) {
                 continue;
@@ -1062,10 +989,12 @@ void write_similarity_cluster_stats_tsv(
             double sum_norm = 0.0;
             double sum_abs = 0.0;
             std::size_t pairs = 0;
+            double pair_min_norm = std::numeric_limits<double>::infinity();
             for (const std::size_t i : idxs) {
                 for (const std::size_t j : other) {
                     sum_norm += dist_norm[i][j];
                     sum_abs += static_cast<double>(dist_abs[i][j]);
+                    pair_min_norm = std::min(pair_min_norm, dist_norm[i][j]);
                     ++pairs;
                 }
             }
@@ -1081,6 +1010,10 @@ void write_similarity_cluster_stats_tsv(
             between_cluster_max_norm = std::max(between_cluster_max_norm, m_norm);
             between_cluster_min_abs = std::min(between_cluster_min_abs, m_abs);
             between_cluster_max_abs = std::max(between_cluster_max_abs, m_abs);
+            if (pair_min_norm < nearest_other_min_norm) {
+                nearest_other_min_norm = pair_min_norm;
+                nearest_other_cluster_id = other_cluster;
+            }
         }
         const double between_cluster_mean_norm = safe_div(
             between_cluster_sum_norm,
@@ -1093,6 +1026,24 @@ void write_similarity_cluster_stats_tsv(
         }
         if (!std::isfinite(between_cluster_min_abs)) {
             between_cluster_min_abs = 0.0;
+        }
+        if (!std::isfinite(nearest_other_min_norm)) {
+            nearest_other_min_norm = 0.0;
+            nearest_other_cluster_id = 0;
+        }
+
+        const double max_norm_dist = std::clamp(1.0 - min_similarity, 0.0, 1.0);
+        const double separation_margin_norm = nearest_other_min_norm - intra_max_norm;
+        const double threshold_margin_norm = nearest_other_min_norm - max_norm_dist;
+        std::string separation_quality = "single_cluster";
+        if (cluster_ids.size() > 1) {
+            if (threshold_margin_norm < 0.0 || separation_margin_norm < 0.0) {
+                separation_quality = "poor";
+            } else if (threshold_margin_norm < 0.02 || separation_margin_norm < 0.02) {
+                separation_quality = "borderline";
+            } else {
+                separation_quality = "good";
+            }
         }
 
         std::size_t path_support_sum = 0;
@@ -1113,173 +1064,100 @@ void write_similarity_cluster_stats_tsv(
             << intra_mean_norm << '\t'
             << (1.0 - intra_mean_norm) << '\t'
             << intra_mean_abs << '\t'
+            << intra_max_norm << '\t'
+            << intra_max_abs << '\t'
             << between_cluster_mean_norm << '\t'
             << (1.0 - between_cluster_mean_norm) << '\t'
             << between_cluster_mean_abs << '\t'
             << between_cluster_min_norm << '\t'
             << between_cluster_max_norm << '\t'
             << between_cluster_min_abs << '\t'
-            << between_cluster_max_abs << '\n';
+            << between_cluster_max_abs << '\t'
+            << nearest_other_cluster_id << '\t'
+            << nearest_other_min_norm << '\t'
+            << (1.0 - nearest_other_min_norm) << '\t'
+            << separation_margin_norm << '\t'
+            << threshold_margin_norm << '\t'
+            << separation_quality << '\n';
     }
 }
 
-void write_similarity_cluster_pairwise_tsv(
-    const std::string& output_path,
-    const std::vector<std::size_t>& cluster_of_unique,
-    const std::vector<std::vector<double>>& dist) {
+std::size_t node_length_bp(
+    const std::unordered_map<std::string, Node>& nodes,
+    const std::string& node_id) {
 
-    std::unordered_map<std::size_t, std::vector<std::size_t>> members;
-    for (std::size_t i = 0; i < cluster_of_unique.size(); ++i) {
-        members[cluster_of_unique[i]].push_back(i);
+    const auto it = nodes.find(node_id);
+    if (it == nodes.end() || it->second.sequence.empty()) {
+        return 1;
     }
+    return std::max<std::size_t>(1, it->second.sequence.size());
+}
 
-    std::vector<std::size_t> cluster_ids;
-    cluster_ids.reserve(members.size());
-    for (const auto& [cluster_id, _idxs] : members) {
-        cluster_ids.push_back(cluster_id);
+std::string allele_node_orientation_cell(
+    const UniqueAllele& allele,
+    const std::string& node_id) {
+
+    std::string cell;
+    for (const PathStep& step : allele.steps) {
+        if (step.node_id == node_id) {
+            cell.push_back(step.reverse ? '-' : '+');
+        }
     }
-    std::sort(cluster_ids.begin(), cluster_ids.end());
+    return cell.empty() ? std::string("|") : cell;
+}
 
-    auto mean_distance = [&](std::size_t ca, std::size_t cb) {
-        const auto& a = members.at(ca);
-        const auto& b = members.at(cb);
-        double sum = 0.0;
-        std::size_t pairs = 0;
-        if (ca == cb) {
-            for (std::size_t i = 0; i < a.size(); ++i) {
-                for (std::size_t j = i + 1; j < a.size(); ++j) {
-                    sum += dist[a[i]][a[j]];
-                    ++pairs;
-                }
-            }
-        } else {
-            for (const std::size_t i : a) {
-                for (const std::size_t j : b) {
-                    sum += dist[i][j];
-                    ++pairs;
-                }
+std::vector<std::string> cluster_signature_node_order(
+    const Cluster& cluster,
+    const std::vector<UniqueAllele>& unique_alleles) {
+
+    std::vector<std::string> order;
+    std::unordered_set<std::string> seen;
+
+    auto add_nodes = [&](std::size_t allele_idx) {
+        if (allele_idx >= unique_alleles.size()) {
+            return;
+        }
+        for (const PathStep& step : unique_alleles[allele_idx].steps) {
+            if (seen.insert(step.node_id).second) {
+                order.push_back(step.node_id);
             }
         }
-        return safe_div(sum, static_cast<double>(pairs));
     };
 
-    std::ofstream out(output_path);
-    if (!out) {
-        throw std::runtime_error("Failed to write similarity cluster pairwise matrix: " + output_path);
+    add_nodes(cluster.representative_idx);
+    for (const std::size_t idx : cluster.member_unique_idxs) {
+        add_nodes(idx);
     }
-    out << std::fixed << std::setprecision(6);
-    out << "cluster_id";
-    for (const auto cluster_id : cluster_ids) {
-        out << '\t' << cluster_id;
-    }
-    out << '\n';
-
-    for (const auto cluster_id : cluster_ids) {
-        out << cluster_id;
-        for (const auto other : cluster_ids) {
-            out << '\t' << mean_distance(cluster_id, other);
-        }
-        out << '\n';
-    }
+    return order;
 }
 
-void write_similarity_cluster_pairwise_abs_tsv(
-    const std::string& output_path,
-    const std::vector<std::size_t>& cluster_of_unique,
-    const std::vector<std::vector<int>>& dist_abs) {
-
-    std::unordered_map<std::size_t, std::vector<std::size_t>> members;
-    for (std::size_t i = 0; i < cluster_of_unique.size(); ++i) {
-        members[cluster_of_unique[i]].push_back(i);
-    }
-
-    std::vector<std::size_t> cluster_ids;
-    cluster_ids.reserve(members.size());
-    for (const auto& [cluster_id, _idxs] : members) {
-        cluster_ids.push_back(cluster_id);
-    }
-    std::sort(cluster_ids.begin(), cluster_ids.end());
-
-    auto mean_distance_abs = [&](std::size_t ca, std::size_t cb) {
-        const auto& a = members.at(ca);
-        const auto& b = members.at(cb);
-        double sum = 0.0;
-        std::size_t pairs = 0;
-        if (ca == cb) {
-            for (std::size_t i = 0; i < a.size(); ++i) {
-                for (std::size_t j = i + 1; j < a.size(); ++j) {
-                    sum += static_cast<double>(dist_abs[a[i]][a[j]]);
-                    ++pairs;
-                }
-            }
-        } else {
-            for (const std::size_t i : a) {
-                for (const std::size_t j : b) {
-                    sum += static_cast<double>(dist_abs[i][j]);
-                    ++pairs;
-                }
-            }
-        }
-        return safe_div(sum, static_cast<double>(pairs));
-    };
-
-    std::ofstream out(output_path);
-    if (!out) {
-        throw std::runtime_error("Failed to write similarity cluster pairwise abs matrix: " + output_path);
-    }
-    out << std::fixed << std::setprecision(3);
-    out << "cluster_id";
-    for (const auto cluster_id : cluster_ids) {
-        out << '\t' << cluster_id;
-    }
-    out << '\n';
-
-    for (const auto cluster_id : cluster_ids) {
-        out << cluster_id;
-        for (const auto other : cluster_ids) {
-            out << '\t' << mean_distance_abs(cluster_id, other);
-        }
-        out << '\n';
-    }
-}
-
-void write_similarity_cluster_membership_tsv(
-    const std::string& output_path,
+void write_similarity_cluster_signature_tables(
+    const std::string& output_dir,
+    const std::unordered_map<std::string, Node>& nodes,
     const std::vector<UniqueAllele>& unique_alleles,
-    const std::vector<Cluster>& clusters,
-    const std::vector<std::vector<int>>& dist_abs,
-    double min_similarity) {
+    const std::vector<Cluster>& clusters) {
 
-    std::ofstream out(output_path);
-    if (!out) {
-        throw std::runtime_error("Failed to write cluster membership diagnostics: " + output_path);
-    }
-    out << std::fixed << std::setprecision(6);
-    out << "cluster_id\trepresentative_allele_id\tallele_id\tpath_support\t"
-           "edit_distance_to_representative\tnormalized_distance_to_representative\t"
-           "token_max_units\tallowed_max_distance_for_threshold\twithin_threshold\n";
+    std::filesystem::create_directories(output_dir);
+    for (const Cluster& cluster : clusters) {
+        const std::string output_path = output_dir + "/cluster_" + std::to_string(cluster.cluster_id) + ".tsv";
+        std::ofstream out(output_path);
+        if (!out) {
+            throw std::runtime_error("Failed to write cluster signature table: " + output_path);
+        }
 
-    for (const auto& cluster : clusters) {
-        const auto rep_idx = cluster.representative_idx;
-        const auto rep_id = unique_alleles[rep_idx].allele_id;
-        const auto rep_len = token_length_for_distance(unique_alleles[rep_idx]);
+        out << "node_id";
+        for (const std::size_t idx : cluster.member_unique_idxs) {
+            out << "\tallele_" << unique_alleles[idx].allele_id;
+        }
+        out << "\tnode_length_bp\n";
 
-        for (const auto idx : cluster.member_unique_idxs) {
-            const int d_abs = dist_abs[idx][rep_idx];
-            const std::size_t tok_len = std::max(rep_len, token_length_for_distance(unique_alleles[idx]));
-            const int allowed = allowed_max_edits(min_similarity, tok_len);
-            const double d_norm = safe_div(static_cast<double>(d_abs), static_cast<double>(std::max<std::size_t>(1, tok_len)));
-            const int pass = (d_abs <= allowed) ? 1 : 0;
-
-            out << cluster.cluster_id << '\t'
-                << rep_id << '\t'
-                << unique_alleles[idx].allele_id << '\t'
-                << unique_alleles[idx].path_support << '\t'
-                << d_abs << '\t'
-                << d_norm << '\t'
-                << tok_len << '\t'
-                << allowed << '\t'
-                << pass << '\n';
+        const std::vector<std::string> node_order = cluster_signature_node_order(cluster, unique_alleles);
+        for (const std::string& node_id : node_order) {
+            out << node_id;
+            for (const std::size_t idx : cluster.member_unique_idxs) {
+                out << '\t' << allele_node_orientation_cell(unique_alleles[idx], node_id);
+            }
+            out << '\t' << node_length_bp(nodes, node_id) << '\n';
         }
     }
 }
@@ -1369,234 +1247,9 @@ UPGMATree build_upgma_tree(const std::vector<std::vector<double>>& dist) {
     return tree;
 }
 
-std::string format_branch_length(double value) {
-    if (value < 0.0) {
-        value = 0.0;
-    }
-    std::ostringstream oss;
-    oss << std::fixed << std::setprecision(6) << value;
-    return oss.str();
-}
-
-std::string build_upgma_newick(
-    const std::vector<UniqueAllele>& unique_alleles,
-    const std::vector<std::size_t>& cluster_of_unique,
-    const UPGMATree& tree) {
-
-    if (tree.root < 0) {
-        return "();";
-    }
-
-    std::function<std::string(int)> emit = [&](int node_id) -> std::string {
-        const auto& node = tree.nodes[static_cast<std::size_t>(node_id)];
-        if (node.is_leaf) {
-            const auto allele_id = unique_alleles[node.allele_idx].allele_id;
-            const auto cluster_id = cluster_of_unique[node.allele_idx];
-            return "A" + std::to_string(allele_id) + "_C" + std::to_string(cluster_id);
-        }
-
-        const auto& left = tree.nodes[static_cast<std::size_t>(node.left)];
-        const auto& right = tree.nodes[static_cast<std::size_t>(node.right)];
-        const double left_len = node.height - left.height;
-        const double right_len = node.height - right.height;
-        return "(" + emit(node.left) + ":" + format_branch_length(left_len) + "," +
-               emit(node.right) + ":" + format_branch_length(right_len) + ")";
-    };
-
-    return emit(tree.root) + ";";
-}
-
-void write_upgma_tree_svg(
-    const std::string& output_path,
-    std::size_t bubble_id,
-    const std::vector<UniqueAllele>& unique_alleles,
-    const std::vector<std::size_t>& cluster_of_unique,
-    const UPGMATree& tree) {
-
-    if (tree.root < 0) {
-        return;
-    }
-
-    std::set<std::size_t> cluster_ids;
-    for (const auto cluster_id : cluster_of_unique) {
-        cluster_ids.insert(cluster_id);
-    }
-    const auto color_by_cluster = cluster_palette(cluster_ids);
-
-    std::vector<std::size_t> leaf_order;
-    leaf_order.reserve(unique_alleles.size());
-    std::function<void(int)> collect = [&](int node_id) {
-        const auto& node = tree.nodes[static_cast<std::size_t>(node_id)];
-        if (node.is_leaf) {
-            leaf_order.push_back(node.allele_idx);
-            return;
-        }
-        collect(node.left);
-        collect(node.right);
-    };
-    collect(tree.root);
-
-    const double width = 1400.0;
-    const double margin_left = 340.0;
-    const double margin_right = 60.0;
-    const double margin_top = 70.0;
-    const double margin_bottom = 130.0;
-    const double row_h = 14.0;
-    const double plot_h = std::max(300.0, row_h * static_cast<double>(leaf_order.size()));
-    const double height = margin_top + plot_h + margin_bottom;
-    const double plot_w = width - margin_left - margin_right;
-
-    const double max_height = std::max(1e-8, tree.nodes[static_cast<std::size_t>(tree.root)].height);
-    auto x_of = [&](double h) {
-        return margin_left + (std::max(0.0, h) / max_height) * plot_w;
-    };
-
-    std::vector<double> y_leaf(unique_alleles.size(), margin_top);
-    for (std::size_t i = 0; i < leaf_order.size(); ++i) {
-        y_leaf[leaf_order[i]] = margin_top + (static_cast<double>(i) + 0.5) * row_h;
-    }
-
-    std::vector<double> y_node(tree.nodes.size(), margin_top);
-    std::function<double(int)> place_y = [&](int node_id) -> double {
-        const auto& node = tree.nodes[static_cast<std::size_t>(node_id)];
-        if (node.is_leaf) {
-            const double y = y_leaf[node.allele_idx];
-            y_node[static_cast<std::size_t>(node_id)] = y;
-            return y;
-        }
-        const double yl = place_y(node.left);
-        const double yr = place_y(node.right);
-        const double y = (yl + yr) / 2.0;
-        y_node[static_cast<std::size_t>(node_id)] = y;
-        return y;
-    };
-    place_y(tree.root);
-
-    std::ofstream out(output_path);
-    if (!out) {
-        throw std::runtime_error("Failed to write UPGMA tree SVG: " + output_path);
-    }
-
-    out << "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
-    out << "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"" << width
-        << "\" height=\"" << height << "\" viewBox=\"0 0 " << width << " " << height << "\">\n";
-    out << "<rect x=\"0\" y=\"0\" width=\"" << width << "\" height=\"" << height << "\" fill=\"white\"/>\n";
-    out << "<text x=\"" << margin_left << "\" y=\"28\" font-family=\"Arial, sans-serif\" font-size=\"18\" font-weight=\"bold\">"
-        << "Bubble " << bubble_id << " UPGMA Dendrogram</text>\n";
-    out << "<text x=\"" << margin_left << "\" y=\"48\" font-family=\"Arial, sans-serif\" font-size=\"12\" fill=\"#555\">"
-        << "Branch lengths use normalized edit distance; leaf color = cluster</text>\n";
-
-    out << "<rect x=\"" << margin_left << "\" y=\"" << margin_top << "\" width=\"" << plot_w << "\" height=\"" << plot_h
-        << "\" fill=\"none\" stroke=\"#DDDDDD\"/>\n";
-
-    std::function<void(int)> draw_edges = [&](int node_id) {
-        const auto& node = tree.nodes[static_cast<std::size_t>(node_id)];
-        if (node.is_leaf) {
-            return;
-        }
-
-        const auto& left = tree.nodes[static_cast<std::size_t>(node.left)];
-        const auto& right = tree.nodes[static_cast<std::size_t>(node.right)];
-        const double xp = x_of(node.height);
-        const double xl = x_of(left.height);
-        const double xr = x_of(right.height);
-        const double yl = y_node[static_cast<std::size_t>(node.left)];
-        const double yr = y_node[static_cast<std::size_t>(node.right)];
-
-        out << "<line x1=\"" << xl << "\" y1=\"" << yl << "\" x2=\"" << xp << "\" y2=\"" << yl
-            << "\" stroke=\"#333\" stroke-width=\"1.2\"/>\n";
-        out << "<line x1=\"" << xr << "\" y1=\"" << yr << "\" x2=\"" << xp << "\" y2=\"" << yr
-            << "\" stroke=\"#333\" stroke-width=\"1.2\"/>\n";
-        out << "<line x1=\"" << xp << "\" y1=\"" << yl << "\" x2=\"" << xp << "\" y2=\"" << yr
-            << "\" stroke=\"#333\" stroke-width=\"1.2\"/>\n";
-
-        if (leaf_order.size() <= 40) {
-            const double d_left = node.height - left.height;
-            const double d_right = node.height - right.height;
-            const double x_mid_l = (xl + xp) / 2.0;
-            const double x_mid_r = (xr + xp) / 2.0;
-            const double d_left_pct = std::max(0.0, d_left * 200.0);
-            const double d_right_pct = std::max(0.0, d_right * 200.0);
-            out << "<text x=\"" << x_mid_l << "\" y=\"" << (yl - 2.0)
-                << "\" text-anchor=\"middle\" font-family=\"Arial, sans-serif\" font-size=\"8\" fill=\"#666\">"
-                << std::fixed << std::setprecision(1) << d_left_pct << "%</text>\n";
-            out << "<text x=\"" << x_mid_r << "\" y=\"" << (yr - 2.0)
-                << "\" text-anchor=\"middle\" font-family=\"Arial, sans-serif\" font-size=\"8\" fill=\"#666\">"
-                << std::fixed << std::setprecision(1) << d_right_pct << "%</text>\n";
-        }
-
-        draw_edges(node.left);
-        draw_edges(node.right);
-    };
-    draw_edges(tree.root);
-
-    for (const auto allele_idx : leaf_order) {
-        const auto& allele = unique_alleles[allele_idx];
-        const auto cluster_id = cluster_of_unique[allele_idx];
-        const auto color_it = color_by_cluster.find(cluster_id);
-        const std::string color = (color_it == color_by_cluster.end()) ? "#444444" : color_it->second;
-        const double y = y_leaf[allele_idx];
-        const double x0 = margin_left - 9.0;
-        out << "<rect x=\"" << (x0 - 10.0) << "\" y=\"" << (y - 4.0)
-            << "\" width=\"8\" height=\"8\" fill=\"" << color << "\"/>\n";
-        const std::string label =
-            "A" + std::to_string(allele.allele_id) +
-            " C" + std::to_string(cluster_id) +
-            " n=" + std::to_string(allele.path_support);
-        out << "<text x=\"" << x0 << "\" y=\"" << (y + 3.0)
-            << "\" text-anchor=\"end\" font-family=\"Arial, sans-serif\" font-size=\"9\">"
-            << html_escape(label) << "</text>\n";
-    }
-
-    const double axis_y = margin_top + plot_h + 20.0;
-    out << "<line x1=\"" << margin_left << "\" y1=\"" << axis_y << "\" x2=\"" << (margin_left + plot_w)
-        << "\" y2=\"" << axis_y << "\" stroke=\"#444\" stroke-width=\"1\"/>\n";
-    constexpr std::size_t ticks = 6;
-    for (std::size_t t = 0; t <= ticks; ++t) {
-        const double frac = static_cast<double>(t) / static_cast<double>(ticks);
-        const double x = margin_left + frac * plot_w;
-        const double v = frac * max_height;
-        const double v_pct = std::max(0.0, v * 200.0);
-        out << "<line x1=\"" << x << "\" y1=\"" << axis_y << "\" x2=\"" << x
-            << "\" y2=\"" << (axis_y + 5.0) << "\" stroke=\"#444\" stroke-width=\"1\"/>\n";
-        out << "<text x=\"" << x << "\" y=\"" << (axis_y + 18.0)
-            << "\" text-anchor=\"middle\" font-family=\"Arial, sans-serif\" font-size=\"10\">"
-            << std::fixed << std::setprecision(1) << v_pct << "%</text>\n";
-    }
-    out << "<text x=\"" << (margin_left + (plot_w / 2.0)) << "\" y=\"" << (axis_y + 36.0)
-        << "\" text-anchor=\"middle\" font-family=\"Arial, sans-serif\" font-size=\"11\" fill=\"#333\">"
-        << "Edit distance from identity (%)" << "</text>\n";
-
-    double lx = margin_left;
-    double ly = axis_y + 52.0;
-    for (const auto cluster_id : cluster_ids) {
-        std::size_t members = 0;
-        for (const auto c : cluster_of_unique) {
-            if (c == cluster_id) {
-                ++members;
-            }
-        }
-        const auto color_it = color_by_cluster.find(cluster_id);
-        const std::string color = (color_it == color_by_cluster.end()) ? "#444444" : color_it->second;
-        out << "<rect x=\"" << lx << "\" y=\"" << ly << "\" width=\"10\" height=\"10\" fill=\"" << color << "\"/>\n";
-        const std::string label = "C" + std::to_string(cluster_id) + " (" + std::to_string(members) + " alleles)";
-        out << "<text x=\"" << (lx + 14.0) << "\" y=\"" << (ly + 9.0)
-            << "\" font-family=\"Arial, sans-serif\" font-size=\"10\">"
-            << html_escape(label) << "</text>\n";
-        lx += 120.0;
-        if (lx > width - 170.0) {
-            lx = margin_left;
-            ly += 14.0;
-        }
-    }
-
-    out << "</svg>\n";
-}
-
 SimilarityReportPaths similarity_report_paths_for_bubble(
     const std::string& output_dir,
-    std::size_t bubble_id,
-    bool include_tree) {
+    std::size_t bubble_id) {
 
     SimilarityReportPaths out;
     out.bubble_dir = output_dir + "/bubble_" + std::to_string(bubble_id);
@@ -1604,28 +1257,18 @@ SimilarityReportPaths similarity_report_paths_for_bubble(
     out.matrix_norm_tsv = out.bubble_dir + "/distance_matrix_norm.tsv";
     out.matrix_abs_tsv = out.bubble_dir + "/distance_matrix_abs.tsv";
     out.stats_tsv = out.bubble_dir + "/cluster_stats.tsv";
-    out.cluster_pairwise_norm_tsv = out.bubble_dir + "/cluster_pairwise_norm.tsv";
-    out.cluster_pairwise_abs_tsv = out.bubble_dir + "/cluster_pairwise_abs.tsv";
-    out.cluster_membership_tsv = out.bubble_dir + "/cluster_membership.tsv";
-    out.quality_summary_tsv = out.bubble_dir + "/quality_summary.tsv";
-    if (include_tree) {
-        out.tree_svg = out.bubble_dir + "/tree.svg";
-        out.tree_nwk = out.bubble_dir + "/upgma.nwk";
-    } else {
-        out.tree_svg = ".";
-        out.tree_nwk = ".";
-    }
+    out.cluster_signatures_dir = out.bubble_dir + "/cluster_signatures";
     return out;
 }
 
 void write_similarity_reports_for_bubble(
     const SimilarityReportPaths& paths,
     const Bubble& bubble,
+    const Graph& graph,
     const std::vector<UniqueAllele>& unique_alleles,
     const std::vector<Cluster>& clusters,
     const std::vector<std::size_t>& cluster_of_unique,
     const DistanceMatrices& dists,
-    const UPGMATree* tree,
     double min_similarity) {
 
     if (unique_alleles.empty()) {
@@ -1639,36 +1282,19 @@ void write_similarity_reports_for_bubble(
     write_similarity_alleles_tsv(paths.alleles_tsv, bubble, unique_alleles, cluster_of_unique);
     write_similarity_distance_matrix_tsv(paths.matrix_norm_tsv, unique_alleles, dists.norm);
     write_similarity_distance_matrix_abs_tsv(paths.matrix_abs_tsv, unique_alleles, dists.abs);
-    write_similarity_quality_summary_tsv(
-        paths.quality_summary_tsv,
-        unique_alleles,
-        cluster_of_unique,
-        dists.norm,
-        silhouette_scores);
     write_similarity_cluster_stats_tsv(
         paths.stats_tsv,
         unique_alleles,
         cluster_of_unique,
         dists.norm,
         silhouette_scores,
-        dists.abs);
-    write_similarity_cluster_pairwise_tsv(paths.cluster_pairwise_norm_tsv, cluster_of_unique, dists.norm);
-    write_similarity_cluster_pairwise_abs_tsv(paths.cluster_pairwise_abs_tsv, cluster_of_unique, dists.abs);
-    write_similarity_cluster_membership_tsv(
-        paths.cluster_membership_tsv,
-        unique_alleles,
-        clusters,
         dists.abs,
         min_similarity);
-    if (tree != nullptr && tree->root >= 0) {
-        write_upgma_tree_svg(paths.tree_svg, bubble.id, unique_alleles, cluster_of_unique, *tree);
-
-        std::ofstream tree_out(paths.tree_nwk);
-        if (!tree_out) {
-            throw std::runtime_error("Failed to write UPGMA newick: " + paths.tree_nwk);
-        }
-        tree_out << build_upgma_newick(unique_alleles, cluster_of_unique, *tree) << '\n';
-    }
+    write_similarity_cluster_signature_tables(
+        paths.cluster_signatures_dir,
+        graph.nodes,
+        unique_alleles,
+        clusters);
 }
 
 PathIndex build_path_index(const PathRecord& path) {
@@ -7223,8 +6849,7 @@ void call_alleles_to_csv(
         similarity_manifest
             << "bubble_id\tsource\tsink\tstatus\tunique_alleles\tclusters\tbubble_dir\t"
             << "alleles_tsv\tdistance_matrix_norm_tsv\tdistance_matrix_abs_tsv\t"
-            << "quality_summary_tsv\tcluster_stats_tsv\tcluster_pairwise_norm_tsv\tcluster_pairwise_abs_tsv\t"
-            << "cluster_membership_tsv\ttree_svg\tupgma_nwk\n";
+            << "cluster_stats_tsv\tcluster_signatures_dir\n";
     }
 
     if (options.write_debug_reports) {
@@ -7239,7 +6864,7 @@ void call_alleles_to_csv(
             return;
         }
         const SimilarityReportPaths sim_paths =
-            similarity_report_paths_for_bubble(options.similarity_out_dir, bubble.id, false);
+            similarity_report_paths_for_bubble(options.similarity_out_dir, bubble.id);
         similarity_manifest << bubble.id << '\t'
                             << bubble.source << '\t'
                             << bubble.sink << '\t'
@@ -7247,11 +6872,6 @@ void call_alleles_to_csv(
                             << 0 << '\t'
                             << 0 << '\t'
                             << sim_paths.bubble_dir << '\t'
-                            << "." << '\t'
-                            << "." << '\t'
-                            << "." << '\t'
-                            << "." << '\t'
-                            << "." << '\t'
                             << "." << '\t'
                             << "." << '\t'
                             << "." << '\t'
@@ -7483,7 +7103,6 @@ void call_alleles_to_csv(
         }
 
         UPGMATree tree;
-        bool have_tree = false;
         std::vector<Cluster> clusters;
         if (use_predefined_clusters) {
             std::size_t missing_assignments = 0;
@@ -7539,7 +7158,6 @@ void call_alleles_to_csv(
                 options.min_similarity);
         } else {
             tree = build_upgma_tree(dists.norm);
-            have_tree = true;
             clusters = cluster_unique_alleles_from_tree(
                 unique_alleles,
                 dists.norm,
@@ -7627,16 +7245,16 @@ void call_alleles_to_csv(
 
         if (options.write_similarity_reports) {
             const SimilarityReportPaths sim_paths =
-                similarity_report_paths_for_bubble(options.similarity_out_dir, bubble.id, have_tree);
+                similarity_report_paths_for_bubble(options.similarity_out_dir, bubble.id);
 
             write_similarity_reports_for_bubble(
                 sim_paths,
                 bubble,
+                graph,
                 unique_alleles,
                 clusters,
                 cluster_of_unique,
                 dists,
-                have_tree ? &tree : nullptr,
                 options.min_similarity);
 
             similarity_manifest << bubble.id << '\t'
@@ -7649,13 +7267,8 @@ void call_alleles_to_csv(
                                 << sim_paths.alleles_tsv << '\t'
                                 << sim_paths.matrix_norm_tsv << '\t'
                                 << sim_paths.matrix_abs_tsv << '\t'
-                                << sim_paths.quality_summary_tsv << '\t'
                                 << sim_paths.stats_tsv << '\t'
-                                << sim_paths.cluster_pairwise_norm_tsv << '\t'
-                                << sim_paths.cluster_pairwise_abs_tsv << '\t'
-                                << sim_paths.cluster_membership_tsv << '\t'
-                                << sim_paths.tree_svg << '\t'
-                                << sim_paths.tree_nwk << '\n';
+                                << sim_paths.cluster_signatures_dir << '\n';
             summary.similarity_reports_written += 1;
         }
 

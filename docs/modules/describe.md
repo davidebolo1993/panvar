@@ -65,9 +65,9 @@ Inside `--out-dir`:
 
 - `describe.index.tsv`
 - `describe.params.json`
-- `bubble_<id>.kmer_features.tsv.gz`
-- `bubble_<id>.kmer_matrix.tsv.gz` when enabled and below cap
-- `bubble_<id>.kmer_counts.jsonl.gz`
+- `bubble_<id>/kmer_features.tsv.gz`
+- `bubble_<id>/kmer_matrix.tsv.gz` when enabled and below cap
+- `bubble_<id>/kmer_counts.jsonl.gz`
 
 ### `describe.index.tsv`
 
@@ -83,7 +83,7 @@ One row per processed bubble:
 - `matrix_written`
 - `matrix_reason`
 
-### `bubble_<id>.kmer_features.tsv.gz`
+### `bubble_<id>/kmer_features.tsv.gz`
 
 Feature map columns:
 
@@ -98,7 +98,7 @@ Feature map columns:
 - `node_count`: number of bubble-local graph nodes touched by this k-mer across all paths
 - `nodes`: semicolon-separated node IDs touched by this k-mer across all paths
 
-### `bubble_<id>.kmer_matrix.tsv.gz`
+### `bubble_<id>/kmer_matrix.tsv.gz`
 
 Wide matrix columns:
 
@@ -110,7 +110,7 @@ Wide matrix columns:
 
 Values are k-mer counts. They can be used as binary markers (`count > 0`) or dosage-like numeric features.
 
-### `bubble_<id>.kmer_counts.jsonl.gz`
+### `bubble_<id>/kmer_counts.jsonl.gz`
 
 Sparse representation, one JSON object per path. The `kmers` array stores compact `[feature_id, count]` tuples:
 
@@ -118,7 +118,7 @@ Sparse representation, one JSON object per path. The `kmers` array stores compac
 {"bubble_id":1,"sample":"HG00096","haplotype":"1","path_name":"HG00096#1#...","path_length_bp":7941,"kmers":[[1,7],[2,2]]}
 ```
 
-Use `bubble_<id>.kmer_features.tsv.gz` to map feature IDs back to sequences and to recover the bubble-local node union for each feature. Keeping node provenance in the feature map rather than every JSONL tuple keeps the sparse JSONL much smaller.
+Use `bubble_<id>/kmer_features.tsv.gz` to map feature IDs back to sequences and to recover the bubble-local node union for each feature. Keeping node provenance in the feature map rather than every JSONL tuple keeps the sparse JSONL much smaller.
 
 This JSONL is the sparse representation: absent/zero-count k-mers are omitted from each path row. The wide matrix is still emitted by default because many GWAS and association tools expect dense sample-by-feature tables.
 

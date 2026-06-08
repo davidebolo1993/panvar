@@ -110,7 +110,7 @@ Binary:
 - `allele`
   - `--bubble-prefix-in <prefix>`: consume bubble outputs using prefix convention
   - `--clusters-json <path>`: use predefined path->cluster labels
-  - `--similarity-out-dir <dir>`: per-bubble clustering diagnostics, including silhouette summaries
+  - `--similarity-out-dir <dir>`: per-bubble distance matrices, cluster-separation stats, and heatmap helper
   - `--skip-no-reference-bubbles --reference-path <path>`: drop bubbles not traversed by the reference
 - `bubble`
   - `--merge-nearby-bp <N>`: optionally fuse nearby bubble candidates by graph bp distance
@@ -182,6 +182,7 @@ docker run --rm -v "$PWD":/work -w /work panvar:latest panvar --help
 - `src/cli_utils.cpp`, `include/panvar/cli_utils.hpp`: shared command-line helpers
 - `src/graph_utils.cpp`, `include/panvar/graph_utils.hpp`: shared graph/path/sequence helpers
 - `src/`, `include/panvar/`: module algorithms and public data structures
+- `scripts/plot_distance_heatmap.R`: helper for plotting allele similarity distance matrices
 - `external/minimap2/`: minimap2 C library source
 - `tests/real_data/`: bundled example loci and inputs
 - `docs/modules/`: module docs
