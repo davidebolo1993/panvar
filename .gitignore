@@ -11,6 +11,8 @@ tests/results/**
 tests/results/prepared_inputs/**
 tests/results/minigraph_loci/**
 tests/real_data/gencode*
+tests/real_data/lpa*
+tests/real_data/gstm1*
 
 !tests/results/.gitkeep
 
