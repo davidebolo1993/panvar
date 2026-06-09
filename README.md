@@ -5,7 +5,7 @@
 Modules:
 
 1. `bubble` (Module 1): site extraction/refinement from precomputed `vg snarls`
-2. `inspect` (utility): path FASTA and node traversal matrix for one called bubble
+2. `inspect` (utility): path FASTA and node traversal matrix for one or all called bubbles
 3. `allele` (Module 2): allele extraction and clustering from module-1 bubbles
 4. `call` (Module 3): SV calling (`INS`/`DEL`/`INV`) from clustered alleles
 5. `describe` (Module 4): per-bubble k-mer feature tables for downstream association
@@ -44,6 +44,15 @@ Binary:
   --bubble-prefix-in tests/results/c4/bubble \
   --bubble-id 1 \
   -o tests/results/c4/inspect/bubble_1
+```
+
+Inspect all bubbles by omitting `--bubble-id`:
+
+```bash
+./build/panvar inspect \
+  -i tests/real_data/c4.gfa \
+  --bubble-prefix-in tests/results/c4/bubble \
+  -o tests/results/c4/inspect/all
 ```
 
 3. Allele (default walk clustering, node-length weighted):
@@ -115,7 +124,8 @@ Binary:
 - `bubble`
   - `--merge-nearby-bp <N>`: optionally fuse nearby bubble candidates by graph bp distance
 - `inspect`
-  - `--bubble-prefix-in <prefix> --bubble-id <N>`: write bubble path FASTA plus node traversal counts
+  - `--bubble-prefix-in <prefix> [--bubble-id <N>]`: write bubble path FASTA plus node traversal counts
+  - `scripts/plot_node_coverage_heatmap.R`: plot inspect node-count tables as path-by-node coverage heatmaps
 - `call`
   - `--bubble-prefix-in <prefix>` + `--allele-prefix-in <prefix>`: simplified module handoff
   - `--debug --debug-out-dir <dir>`: per-cluster FASTA/PAF/dotplot/VCF
@@ -163,6 +173,7 @@ The image builds `panvar` and includes related tools from Bioconda:
 - `minimap2`
 - `samtools`
 - `bcftools`
+- `R` + `ggplot2` for helper plotting scripts
 
 Build:
 
@@ -182,7 +193,8 @@ docker run --rm -v "$PWD":/work -w /work panvar:latest panvar --help
 - `src/cli_utils.cpp`, `include/panvar/cli_utils.hpp`: shared command-line helpers
 - `src/graph_utils.cpp`, `include/panvar/graph_utils.hpp`: shared graph/path/sequence helpers
 - `src/`, `include/panvar/`: module algorithms and public data structures
-- `scripts/plot_distance_heatmap.R`: helper for plotting allele similarity distance matrices
+- `scripts/plot_distance_heatmap.R`: ggplot2 helper for plotting allele similarity distance matrices
+- `scripts/plot_node_coverage_heatmap.R`: ggplot2 helper for plotting inspect path-by-node coverage matrices
 - `external/minimap2/`: minimap2 C library source
 - `tests/real_data/`: bundled example loci and inputs
 - `docs/modules/`: module docs

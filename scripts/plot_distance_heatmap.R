@@ -16,6 +16,15 @@ usage <- function(exit_code = 0) {
   quit(save = "no", status = exit_code)
 }
 
+require_ggplot2 <- function() {
+  if (!requireNamespace("ggplot2", quietly = TRUE)) {
+    stop(
+      "This plotting helper requires ggplot2. Install it with: conda install -y -c conda-forge r-ggplot2",
+      call. = FALSE
+    )
+  }
+}
+
 args <- commandArgs(trailingOnly = TRUE)
 if (length(args) == 0 || any(args %in% c("-h", "--help"))) {
   usage(0)
@@ -74,6 +83,8 @@ if (!is.null(alleles_path) && !file.exists(alleles_path)) {
   stop("Alleles table not found: ", alleles_path, call. = FALSE)
 }
 
+require_ggplot2()
+
 mat <- read.table(matrix_path, header = TRUE, sep = "\t", row.names = 1,
                   check.names = FALSE, quote = "", comment.char = "")
 dist_mat <- as.matrix(mat)
@@ -87,9 +98,8 @@ if (n < 2) {
 }
 
 ids <- rownames(dist_mat)
-labels <- paste0("A", ids)
-side_colors <- NULL
-cluster_legend <- NULL
+labels_by_id <- setNames(paste0("A", ids), ids)
+cluster_by_id <- NULL
 cluster_colors <- NULL
 
 if (!is.null(alleles_path)) {
@@ -101,6 +111,10 @@ if (!is.null(alleles_path)) {
     stop("Could not match all matrix allele IDs to alleles.tsv", call. = FALSE)
   }
 
+  labels_by_id <- setNames(
+    paste0("A", alleles$allele_id, " C", alleles$cluster_id, " n=", alleles$path_support),
+    alleles$allele_id
+  )
   clusters <- sort(unique(alleles$cluster_id))
   palette <- c(
     "#4E79A7", "#F28E2B", "#59A14F", "#E15759", "#76B7B2", "#EDC948",
@@ -108,65 +122,108 @@ if (!is.null(alleles_path)) {
   )
   cluster_colors <- setNames(palette[((seq_along(clusters) - 1) %% length(palette)) + 1],
                              as.character(clusters))
-  side_colors <- cluster_colors[as.character(alleles$cluster_id)]
-  cluster_legend <- clusters
-  labels <- paste0("A", alleles$allele_id, " C", alleles$cluster_id, " n=", alleles$path_support)
-}
-
-if (n > 80) {
-  labels <- rep("", n)
+  cluster_by_id <- setNames(as.character(alleles$cluster_id), alleles$allele_id)
 }
 
 hc <- hclust(as.dist(dist_mat), method = "average")
-heat_cols <- grDevices::colorRampPalette(
-  c("#102A43", "#2F80ED", "#F7F7F2", "#F2994A", "#8C1D18")
-)(256)
+ordered_ids <- ids[hc$order]
+ordered_mat <- dist_mat[ordered_ids, ordered_ids, drop = FALSE]
 
-draw_heatmap <- function() {
-  op <- par(no.readonly = TRUE)
-  on.exit(par(op), add = TRUE)
-  par(bg = "white", cex.main = 1.1)
+axis_labels <- labels_by_id[ordered_ids]
+if (n > 80) {
+  axis_labels <- rep("", n)
+}
 
-  heatmap_args <- list(
-    x = dist_mat,
-    Rowv = as.dendrogram(hc),
-    Colv = as.dendrogram(hc),
-    symm = TRUE,
-    scale = "none",
-    revC = TRUE,
-    col = heat_cols,
-    labRow = labels,
-    labCol = labels,
-    margins = c(8, 8),
-    main = "Allele distance heatmap",
-    xlab = "Alleles",
-    ylab = "Alleles"
+row_pos <- seq_len(n)
+col_pos <- seq_len(n)
+plot_df <- data.frame(
+  col_pos = rep(col_pos, each = n),
+  row_pos = rep(row_pos, times = n),
+  distance = as.vector(ordered_mat)
+)
+plot_df$row_y <- n - plot_df$row_pos + 1
+
+sparse_ticks <- function(n, max_ticks) {
+  if (n <= 0) {
+    integer()
+  } else {
+    unique(pmax(1, pmin(n, round(seq(1, n, length.out = min(n, max_ticks))))))
+  }
+}
+
+max_axis_ticks <- if (n <= 40) n else if (n <= 100) 40 else 25
+x_breaks <- sparse_ticks(n, max_axis_ticks)
+y_breaks_original <- sparse_ticks(n, max_axis_ticks)
+y_breaks <- n - y_breaks_original + 1
+
+p <- ggplot2::ggplot(plot_df, ggplot2::aes(x = col_pos, y = row_y, fill = distance)) +
+  ggplot2::geom_raster() +
+  ggplot2::scale_fill_gradientn(
+    colours = c("#102A43", "#2F80ED", "#F7F7F2", "#F2994A", "#8C1D18"),
+    limits = c(0, max(ordered_mat, na.rm = TRUE)),
+    name = "normalized\ndistance"
+  ) +
+  ggplot2::scale_x_continuous(
+    breaks = x_breaks,
+    labels = axis_labels[x_breaks],
+    expand = c(0, 0)
+  ) +
+  ggplot2::scale_y_continuous(
+    breaks = y_breaks,
+    labels = axis_labels[y_breaks_original],
+    expand = c(0, 0)
+  ) +
+  ggplot2::labs(
+    title = "Allele distance heatmap",
+    subtitle = sprintf("%d alleles, average-linkage order", n),
+    x = "Alleles",
+    y = "Alleles"
+  ) +
+  ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    panel.grid = ggplot2::element_blank(),
+    plot.title = ggplot2::element_text(face = "bold"),
+    axis.text.x = ggplot2::element_text(angle = 90, vjust = 0.5, hjust = 1, size = 6),
+    axis.text.y = ggplot2::element_text(size = 6),
+    legend.position = "right"
   )
-  if (!is.null(side_colors)) {
-    heatmap_args$RowSideColors <- side_colors
-    heatmap_args$ColSideColors <- side_colors
-  }
-  do.call(heatmap, heatmap_args)
 
-  if (!is.null(cluster_legend)) {
-    legend("topright",
-           legend = paste0("Cluster ", cluster_legend),
-           fill = cluster_colors[as.character(cluster_legend)],
-           border = NA, bty = "n", cex = 0.8)
-  }
+if (!is.null(cluster_by_id)) {
+  cluster_df <- data.frame(
+    pos = seq_len(n),
+    cluster = factor(cluster_by_id[ordered_ids], levels = names(cluster_colors))
+  )
+  p <- p +
+    ggplot2::geom_point(
+      data = cluster_df,
+      ggplot2::aes(x = pos, y = n + 0.65, colour = cluster),
+      inherit.aes = FALSE,
+      shape = 15,
+      size = 2.1
+    ) +
+    ggplot2::geom_point(
+      data = cluster_df,
+      ggplot2::aes(x = 0.35, y = n - pos + 1, colour = cluster),
+      inherit.aes = FALSE,
+      shape = 15,
+      size = 2.1
+    ) +
+    ggplot2::scale_colour_manual(values = cluster_colors, name = "cluster") +
+    ggplot2::coord_cartesian(xlim = c(0.25, n + 0.5), ylim = c(0.5, n + 0.85), clip = "off") +
+    ggplot2::theme(plot.margin = ggplot2::margin(8, 14, 8, 14))
+}
+
+out_dir <- dirname(out_prefix)
+if (!identical(out_dir, ".") && !dir.exists(out_dir)) {
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 }
 
 png_path <- paste0(out_prefix, ".png")
 pdf_path <- paste0(out_prefix, ".pdf")
-px <- max(1400, min(4200, 45 * n))
+size_in <- max(7, min(18, 4.5 + n * 0.10))
 
-grDevices::png(png_path, width = px, height = px, res = 180)
-draw_heatmap()
-grDevices::dev.off()
-
-grDevices::pdf(pdf_path, width = max(7, min(18, n * 0.16)), height = max(7, min(18, n * 0.16)))
-draw_heatmap()
-grDevices::dev.off()
+ggplot2::ggsave(png_path, p, width = size_in, height = size_in, units = "in", dpi = 180, limitsize = FALSE)
+ggplot2::ggsave(pdf_path, p, width = size_in, height = size_in, units = "in", limitsize = FALSE)
 
 message("Wrote: ", png_path)
 message("Wrote: ", pdf_path)

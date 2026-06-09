@@ -1,5 +1,6 @@
 #include "panvar/allele.hpp"
 
+#include "panvar/bubble_path.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -44,17 +45,6 @@
 
 namespace panvar {
 namespace {
-
-struct PathIndex {
-    std::unordered_map<std::string, std::vector<std::size_t>> positions;
-};
-
-struct CandidateInterval {
-    std::size_t left = 0;
-    std::size_t right = 0;
-    std::size_t inside_count = 0;
-    bool source_to_sink = true;
-};
 
 struct OdgiPathEntry {
     std::string path_name;
@@ -1295,159 +1285,6 @@ void write_similarity_reports_for_bubble(
         graph.nodes,
         unique_alleles,
         clusters);
-}
-
-PathIndex build_path_index(const PathRecord& path) {
-    PathIndex out;
-    out.positions.reserve(path.steps.size());
-    for (std::size_t i = 0; i < path.steps.size(); ++i) {
-        out.positions[path.steps[i].node_id].push_back(i);
-    }
-    return out;
-}
-
-std::vector<std::size_t> collect_inside_positions(const PathIndex& index, const Bubble& bubble) {
-    std::vector<std::size_t> inside;
-    inside.reserve(bubble.inside.size());
-    for (const auto& node : bubble.inside) {
-        const auto it = index.positions.find(node);
-        if (it == index.positions.end()) {
-            continue;
-        }
-        inside.insert(inside.end(), it->second.begin(), it->second.end());
-    }
-    if (inside.empty()) {
-        return inside;
-    }
-    std::sort(inside.begin(), inside.end());
-    inside.erase(std::unique(inside.begin(), inside.end()), inside.end());
-    return inside;
-}
-
-std::size_t count_inside_between(
-    const std::vector<std::size_t>& inside_positions,
-    std::size_t left,
-    std::size_t right) {
-
-    if (inside_positions.empty() || left >= right) {
-        return 0;
-    }
-    const auto begin_it = std::upper_bound(inside_positions.begin(), inside_positions.end(), left);
-    const auto end_it = std::lower_bound(inside_positions.begin(), inside_positions.end(), right);
-    return static_cast<std::size_t>(std::distance(begin_it, end_it));
-}
-
-bool better_candidate(const CandidateInterval& a, const CandidateInterval& b) {
-    if (a.inside_count != b.inside_count) {
-        return a.inside_count > b.inside_count;
-    }
-    const std::size_t a_span = a.right - a.left;
-    const std::size_t b_span = b.right - b.left;
-    if (a_span != b_span) {
-        return a_span < b_span;
-    }
-    return a.left < b.left;
-}
-
-void evaluate_direction_candidates(
-    const std::vector<std::size_t>& start_positions,
-    const std::vector<std::size_t>& end_positions,
-    bool source_to_sink,
-    const std::vector<std::size_t>& inside_positions,
-    std::optional<CandidateInterval>& best) {
-
-    for (const std::size_t start_pos : start_positions) {
-        const auto end_it = std::upper_bound(end_positions.begin(), end_positions.end(), start_pos);
-        if (end_it == end_positions.end()) {
-            continue;
-        }
-        const std::size_t end_pos = *end_it;
-        const std::size_t inside_count = count_inside_between(inside_positions, start_pos, end_pos);
-        if (inside_count == 0) {
-            continue;
-        }
-
-        CandidateInterval candidate;
-        candidate.left = start_pos;
-        candidate.right = end_pos;
-        candidate.inside_count = inside_count;
-        candidate.source_to_sink = source_to_sink;
-
-        if (!best.has_value() || better_candidate(candidate, *best)) {
-            best = candidate;
-        }
-    }
-}
-
-std::optional<CandidateInterval> find_best_interval(
-    const PathIndex& index,
-    const Bubble& bubble) {
-
-    const auto src_it = index.positions.find(bubble.source);
-    const auto sink_it = index.positions.find(bubble.sink);
-    if (src_it == index.positions.end() || sink_it == index.positions.end()) {
-        return std::nullopt;
-    }
-
-    const std::vector<std::size_t> inside_positions = collect_inside_positions(index, bubble);
-    if (inside_positions.empty()) {
-        return std::nullopt;
-    }
-
-    std::optional<CandidateInterval> best;
-
-    evaluate_direction_candidates(
-        src_it->second,
-        sink_it->second,
-        true,
-        inside_positions,
-        best);
-    evaluate_direction_candidates(
-        sink_it->second,
-        src_it->second,
-        false,
-        inside_positions,
-        best);
-
-    return best;
-}
-
-std::vector<PathStep> canonical_steps_for_bubble(
-    const PathRecord& path,
-    const Bubble& bubble,
-    const CandidateInterval& interval) {
-
-    if (interval.left >= path.steps.size() || interval.right >= path.steps.size() || interval.left > interval.right) {
-        return {};
-    }
-
-    std::vector<PathStep> out;
-    out.reserve(interval.right - interval.left + 1);
-
-    if (interval.source_to_sink) {
-        for (std::size_t i = interval.left; i <= interval.right; ++i) {
-            out.push_back(path.steps[i]);
-        }
-        return out;
-    }
-
-    for (std::size_t i = interval.right + 1; i > interval.left; --i) {
-        const PathStep& s = path.steps[i - 1];
-        out.push_back(PathStep{s.node_id, !s.reverse});
-    }
-
-    if (out.empty()) {
-        return out;
-    }
-
-    if (out.front().node_id != bubble.source || out.back().node_id != bubble.sink) {
-        std::reverse(out.begin(), out.end());
-        for (auto& step : out) {
-            step.reverse = !step.reverse;
-        }
-    }
-
-    return out;
 }
 
 std::string build_walk_signature(const std::vector<PathStep>& steps) {
@@ -6741,10 +6578,10 @@ void call_alleles_to_csv(
         }
     }
 
-    std::vector<PathIndex> path_indexes;
+    std::vector<BubblePathIndex> path_indexes;
     path_indexes.reserve(graph.paths.size());
     for (const auto& path : graph.paths) {
-        path_indexes.push_back(build_path_index(path));
+        path_indexes.push_back(build_bubble_path_index(path));
     }
 
     AlleleCallSummary summary;
@@ -6757,9 +6594,7 @@ void call_alleles_to_csv(
         options.write_debug_reports;
 
     std::ofstream odgi_manifest;
-    std::ofstream run_all_odgi;
     std::string odgi_manifest_path;
-    std::string run_all_script_path;
     const std::string odgi_input = options.odgi_input_path;
     const auto graph_paths = path_records_by_name(graph);
     const PathRecord* reference_path_record = nullptr;
@@ -6818,7 +6653,6 @@ void call_alleles_to_csv(
 
         std::filesystem::create_directories(options.odgi_viz_out_dir);
         odgi_manifest_path = options.odgi_viz_out_dir + "/manifest.tsv";
-        run_all_script_path = options.odgi_viz_out_dir + "/run_all_odgi_viz.sh";
 
         odgi_manifest.open(odgi_manifest_path);
         if (!odgi_manifest) {
@@ -6827,12 +6661,6 @@ void call_alleles_to_csv(
         odgi_manifest
             << "bubble_id\tsource\tsink\tbubble_dir\trows\tclusters\trange_start_bp\trange_end_bp\t"
             << "paths_file\tpath_colors_file\tviz_script\tpng_file\todgi_rc\tstatus\n";
-
-        run_all_odgi.open(run_all_script_path);
-        if (!run_all_odgi) {
-            throw std::runtime_error("Failed to write ODGI run script: " + run_all_script_path);
-        }
-        run_all_odgi << "#!/usr/bin/env bash\nset -euo pipefail\n\n";
     }
 
     std::ofstream similarity_manifest;
@@ -6928,12 +6756,12 @@ void call_alleles_to_csv(
             const auto& path = graph.paths[path_idx];
             const auto& index = path_indexes[path_idx];
 
-            const auto best_interval = find_best_interval(index, bubble);
+            const auto best_interval = find_best_bubble_path_interval(index, bubble);
             if (!best_interval.has_value()) {
                 continue;
             }
 
-            std::vector<PathStep> allele_steps = canonical_steps_for_bubble(path, bubble, *best_interval);
+            std::vector<PathStep> allele_steps = canonical_bubble_path_steps(path, bubble, *best_interval);
             if (allele_steps.size() < 2) {
                 continue;
             }
@@ -7444,7 +7272,6 @@ void call_alleles_to_csv(
                             std::filesystem::perms::others_exec,
                         std::filesystem::perm_options::add);
 
-                    run_all_odgi << command << '\n';
                     summary.bubbles_with_odgi_exports += 1;
 
                     if (options.run_odgi) {
@@ -7512,15 +7339,6 @@ void call_alleles_to_csv(
             options.vcf_merge_min_seq_similarity,
             options.vcf_merge_max_seq_edit_fraction,
             &summary.region_vcf_records);
-    }
-
-    if (options.write_odgi_viz_inputs) {
-        run_all_odgi.close();
-        std::filesystem::permissions(
-            run_all_script_path,
-            std::filesystem::perms::owner_exec | std::filesystem::perms::group_exec |
-                std::filesystem::perms::others_exec,
-            std::filesystem::perm_options::add);
     }
 
     if (summary_out != nullptr) {

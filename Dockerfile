@@ -28,6 +28,8 @@ RUN micromamba install --yes --name base --channel conda-forge --channel biocond
     minimap2 \
     samtools \
     bcftools \
+    r-base \
+    r-ggplot2 \
     && micromamba clean --all --yes
 
 USER root

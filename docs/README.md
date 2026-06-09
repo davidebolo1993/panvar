@@ -7,7 +7,7 @@ This directory contains module-focused documentation for the `panvar` CLI.
 1. `docs/modules/bubble.md`
    Module 1 (`panvar bubble`): site extraction/refinement from precomputed `vg snarls`
 2. `docs/modules/inspect.md`
-   Utility (`panvar inspect`): path FASTA and node traversal matrix for one called bubble
+   Utility (`panvar inspect`): path FASTA and node traversal matrix for one or all called bubbles
 3. `docs/modules/allele.md`
    Module 2 (`panvar allele`): allele extraction and clustering per bubble
 4. `docs/modules/call.md`

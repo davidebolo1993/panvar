@@ -205,8 +205,12 @@ Rows are ordered by the representative allele walk first; nodes found only in ot
 
 ### Heatmap helper
 
-`scripts/plot_distance_heatmap.R` uses base R only and plots a clustered heatmap from the normalized distance matrix.
-If `alleles.tsv` is provided, or found next to the matrix, it adds cluster side colors and allele labels with path support.
+`scripts/plot_distance_heatmap.R` uses `ggplot2` and plots a clustered heatmap from the normalized distance matrix.
+If `alleles.tsv` is provided, or found next to the matrix, it adds cluster color strips and allele labels with path support.
+
+Dependency:
+
+- `Rscript` with `ggplot2` (`conda install -y -c conda-forge r-base r-ggplot2`)
 
 Example:
 
