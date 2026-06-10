@@ -11,18 +11,6 @@
 #include <unordered_set>
 
 namespace panvar {
-namespace {
-
-std::string join_nodes(const std::vector<std::string>& nodes) {
-    std::ostringstream oss;
-    for (std::size_t i = 0; i < nodes.size(); ++i) {
-        if (i > 0) {
-            oss << ';';
-        }
-        oss << nodes[i];
-    }
-    return oss.str();
-}
 
 std::vector<std::string> split_csv_line(const std::string& line) {
     std::vector<std::string> fields;
@@ -50,6 +38,19 @@ std::vector<std::string> split_csv_line(const std::string& line) {
     }
     fields.push_back(current);
     return fields;
+}
+
+namespace {
+
+std::string join_nodes(const std::vector<std::string>& nodes) {
+    std::ostringstream oss;
+    for (std::size_t i = 0; i < nodes.size(); ++i) {
+        if (i > 0) {
+            oss << ';';
+        }
+        oss << nodes[i];
+    }
+    return oss.str();
 }
 
 std::vector<std::string> split_semicolon(const std::string& input) {

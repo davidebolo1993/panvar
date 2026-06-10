@@ -9,6 +9,12 @@
 
 namespace panvar::cli {
 
+double elapsed_seconds(const std::chrono::steady_clock::time_point& start) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
+    return static_cast<double>(ms) / 1000.0;
+}
+
 void print_general_help() {
     std::cout
         << "panvar - modular pangenome graph toolkit\n\n"

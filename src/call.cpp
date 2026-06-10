@@ -20,39 +20,12 @@
 #include <zlib.h>
 
 #include "call_internal.hpp"
+#include "panvar/cli_utils.hpp"
 #include "panvar/graph_utils.hpp"
 #include "panvar/output.hpp"
 
 namespace panvar {
 namespace {
-
-std::vector<std::string> split_csv_line(const std::string& line) {
-    std::vector<std::string> fields;
-    std::string current;
-    current.reserve(line.size());
-
-    bool in_quotes = false;
-    for (std::size_t i = 0; i < line.size(); ++i) {
-        const char c = line[i];
-        if (c == '"') {
-            if (in_quotes && i + 1 < line.size() && line[i + 1] == '"') {
-                current.push_back('"');
-                ++i;
-            } else {
-                in_quotes = !in_quotes;
-            }
-            continue;
-        }
-        if (c == ',' && !in_quotes) {
-            fields.push_back(current);
-            current.clear();
-            continue;
-        }
-        current.push_back(c);
-    }
-    fields.push_back(current);
-    return fields;
-}
 
 std::vector<std::size_t> split_semicolon_size_t(const std::string& value) {
     std::vector<std::size_t> out;
@@ -119,44 +92,6 @@ std::vector<PathStep> canonical_steps_for_bubble(
     return out;
 }
 
-std::string build_walk_signature(const std::vector<PathStep>& steps) {
-    std::string sig;
-    sig.reserve(steps.size() * 8);
-    for (std::size_t i = 0; i < steps.size(); ++i) {
-        if (i > 0) {
-            sig.push_back(',');
-        }
-        sig += steps[i].node_id;
-        sig.push_back(steps[i].reverse ? '-' : '+');
-    }
-    return sig;
-}
-
-std::uint64_t hash_step_token(const PathStep& step) {
-    std::uint64_t h = 1469598103934665603ULL;
-    for (const unsigned char c : step.node_id) {
-        h ^= static_cast<std::uint64_t>(c);
-        h *= 1099511628211ULL;
-    }
-    h ^= (step.reverse ? 0xF0ULL : 0x0FULL);
-    h *= 1099511628211ULL;
-    return h;
-}
-
-std::vector<std::uint64_t> build_walk_tokens(const std::vector<PathStep>& steps) {
-    std::vector<std::uint64_t> tokens;
-    tokens.reserve(steps.size());
-    for (const auto& step : steps) {
-        tokens.push_back(hash_step_token(step));
-    }
-    return tokens;
-}
-
-double elapsed_seconds(const std::chrono::steady_clock::time_point& start) {
-    const auto now = std::chrono::steady_clock::now();
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
-    return static_cast<double>(ms) / 1000.0;
-}
 
 std::size_t parse_csv_size(const std::string& value, const std::string& field_name) {
     try {
@@ -1264,8 +1199,8 @@ void call_variants_from_precomputed_grouped_impl(
                 << ", clusters=" << clusters.size()
                 << ", paths=" << assignments.size()
                 << ", elapsed=" << std::fixed << std::setprecision(2)
-                << elapsed_seconds(bubble_start) << "s"
-                << ", total=" << elapsed_seconds(run_start) << "s\n";
+                << cli::elapsed_seconds(bubble_start) << "s"
+                << ", total=" << cli::elapsed_seconds(run_start) << "s\n";
         }
     }
 

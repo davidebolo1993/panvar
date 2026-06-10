@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <string>
 #include <vector>
@@ -7,6 +8,9 @@
 namespace panvar::cli {
 
 void print_general_help();
+
+// Wall-clock seconds elapsed since `start`, used for progress logging.
+double elapsed_seconds(const std::chrono::steady_clock::time_point& start);
 
 std::string trim_ascii(const std::string& text);
 std::size_t parse_size_arg(const std::string& name, const std::string& value);

@@ -39,8 +39,10 @@
 #endif
 
 #include "panvar/bubbles.hpp"
+#include "panvar/cli_utils.hpp"
 #include "panvar/graph_utils.hpp"
 #include "panvar/output.hpp"
+#include "allele_internal.hpp"
 #include "call_internal.hpp"
 
 namespace panvar {
@@ -59,19 +61,6 @@ struct ReferenceWindow {
     std::size_t range_end_bp = 0;
 };
 
-struct DistanceMatrices {
-    std::vector<std::vector<int>> abs;
-    std::vector<std::vector<double>> norm;
-};
-
-struct SimilarityReportPaths {
-    std::string bubble_dir;
-    std::string alleles_tsv;
-    std::string matrix_norm_tsv;
-    std::string matrix_abs_tsv;
-    std::string stats_tsv;
-    std::string cluster_signatures_dir;
-};
 
 constexpr const char* kClusterPalette[] = {
     "#E41A1C",
@@ -243,21 +232,6 @@ std::string html_escape(const std::string& in) {
     return out;
 }
 
-double safe_div(double num, double den) {
-    return den == 0.0 ? 0.0 : (num / den);
-}
-
-std::uint64_t hash_step_token(const PathStep& step) {
-    // 64-bit FNV-1a over node id + orientation.
-    std::uint64_t h = 1469598103934665603ULL;
-    for (const unsigned char c : step.node_id) {
-        h ^= static_cast<std::uint64_t>(c);
-        h *= 1099511628211ULL;
-    }
-    h ^= (step.reverse ? 0xF0ULL : 0x0FULL);
-    h *= 1099511628211ULL;
-    return h;
-}
 
 std::uint64_t splitmix64(std::uint64_t x) {
     x += 0x9e3779b97f4a7c15ULL;
@@ -419,15 +393,6 @@ double estimate_identity_from_jaccard(double jaccard) {
     return std::clamp(id, 0.0, 1.0);
 }
 
-std::vector<std::uint64_t> build_walk_tokens(const std::vector<PathStep>& steps) {
-    std::vector<std::uint64_t> tokens;
-    tokens.reserve(steps.size());
-    for (const auto& step : steps) {
-        tokens.push_back(hash_step_token(step));
-    }
-    return tokens;
-}
-
 std::vector<int> build_walk_step_weights(
     const std::vector<PathStep>& steps,
     const std::unordered_map<std::string, Node>& nodes) {
@@ -470,11 +435,6 @@ bool is_sequence_cluster_mode(ClusterMode mode) {
     return mode == ClusterMode::Sequence || mode == ClusterMode::SequenceFast;
 }
 
-double elapsed_seconds(const std::chrono::steady_clock::time_point& start) {
-    const auto now = std::chrono::steady_clock::now();
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
-    return static_cast<double>(ms) / 1000.0;
-}
 
 int allowed_max_edits(double min_similarity, std::size_t max_len) {
     if (max_len == 0) {
@@ -778,379 +738,6 @@ DistanceMatrices build_distance_matrices(
     return mats;
 }
 
-void write_similarity_alleles_tsv(
-    const std::string& output_path,
-    const Bubble& bubble,
-    const std::vector<UniqueAllele>& unique_alleles,
-    const std::vector<std::size_t>& cluster_of_unique) {
-
-    std::ofstream out(output_path);
-    if (!out) {
-        throw std::runtime_error("Failed to write similarity allele table: " + output_path);
-    }
-
-    out << "bubble_id\tallele_id\tcluster_id\tpath_support\tsequence_length\tmode\tsignature\n";
-    for (std::size_t i = 0; i < unique_alleles.size(); ++i) {
-        const auto& allele = unique_alleles[i];
-        out << bubble.id << '\t'
-            << allele.allele_id << '\t'
-            << cluster_of_unique[i] << '\t'
-            << allele.path_support << '\t'
-            << allele.sequence_length << '\t'
-            << (allele.uses_sequence_similarity ? "sequence" : "walk") << '\t'
-            << allele.signature << '\n';
-    }
-}
-
-void write_similarity_distance_matrix_tsv(
-    const std::string& output_path,
-    const std::vector<UniqueAllele>& unique_alleles,
-    const std::vector<std::vector<double>>& dist) {
-
-    std::ofstream out(output_path);
-    if (!out) {
-        throw std::runtime_error("Failed to write similarity distance matrix: " + output_path);
-    }
-
-    out << std::fixed << std::setprecision(6);
-    out << "allele_id";
-    for (const auto& allele : unique_alleles) {
-        out << '\t' << allele.allele_id;
-    }
-    out << '\n';
-
-    for (std::size_t i = 0; i < unique_alleles.size(); ++i) {
-        out << unique_alleles[i].allele_id;
-        for (std::size_t j = 0; j < unique_alleles.size(); ++j) {
-            out << '\t' << dist[i][j];
-        }
-        out << '\n';
-    }
-}
-
-void write_similarity_distance_matrix_abs_tsv(
-    const std::string& output_path,
-    const std::vector<UniqueAllele>& unique_alleles,
-    const std::vector<std::vector<int>>& dist_abs) {
-
-    std::ofstream out(output_path);
-    if (!out) {
-        throw std::runtime_error("Failed to write absolute distance matrix: " + output_path);
-    }
-
-    out << "allele_id";
-    for (const auto& allele : unique_alleles) {
-        out << '\t' << allele.allele_id;
-    }
-    out << '\n';
-
-    for (std::size_t i = 0; i < unique_alleles.size(); ++i) {
-        out << unique_alleles[i].allele_id;
-        for (std::size_t j = 0; j < unique_alleles.size(); ++j) {
-            out << '\t' << dist_abs[i][j];
-        }
-        out << '\n';
-    }
-}
-
-std::vector<double> compute_silhouette_scores(
-    const std::vector<std::size_t>& cluster_of_unique,
-    const std::vector<std::vector<double>>& dist_norm) {
-
-    const std::size_t n = cluster_of_unique.size();
-    std::vector<double> scores(n, 0.0);
-    if (n <= 1 || dist_norm.size() != n) {
-        return scores;
-    }
-
-    std::unordered_map<std::size_t, std::vector<std::size_t>> members;
-    members.reserve(n * 2);
-    for (std::size_t i = 0; i < n; ++i) {
-        members[cluster_of_unique[i]].push_back(i);
-    }
-    if (members.size() <= 1) {
-        return scores;
-    }
-
-    for (std::size_t i = 0; i < n; ++i) {
-        const auto& own = members.at(cluster_of_unique[i]);
-        double a = 0.0;
-        if (own.size() > 1) {
-            for (const std::size_t j : own) {
-                if (j != i) {
-                    a += dist_norm[i][j];
-                }
-            }
-            a /= static_cast<double>(own.size() - 1);
-        }
-
-        double b = std::numeric_limits<double>::infinity();
-        for (const auto& [cluster_id, idxs] : members) {
-            if (cluster_id == cluster_of_unique[i] || idxs.empty()) {
-                continue;
-            }
-            double mean = 0.0;
-            for (const std::size_t j : idxs) {
-                mean += dist_norm[i][j];
-            }
-            mean /= static_cast<double>(idxs.size());
-            b = std::min(b, mean);
-        }
-        if (!std::isfinite(b)) {
-            scores[i] = 0.0;
-            continue;
-        }
-        const double denom = std::max(a, b);
-        scores[i] = (denom <= 0.0) ? 0.0 : ((b - a) / denom);
-    }
-    return scores;
-}
-
-void write_similarity_cluster_stats_tsv(
-    const std::string& output_path,
-    const std::vector<UniqueAllele>& unique_alleles,
-    const std::vector<std::size_t>& cluster_of_unique,
-    const std::vector<std::vector<double>>& dist_norm,
-    const std::vector<double>& silhouette_scores,
-    const std::vector<std::vector<int>>& dist_abs,
-    double min_similarity) {
-
-    std::unordered_map<std::size_t, std::vector<std::size_t>> members;
-    for (std::size_t i = 0; i < cluster_of_unique.size(); ++i) {
-        members[cluster_of_unique[i]].push_back(i);
-    }
-
-    std::vector<std::size_t> cluster_ids;
-    cluster_ids.reserve(members.size());
-    for (const auto& [cluster_id, _idxs] : members) {
-        cluster_ids.push_back(cluster_id);
-    }
-    std::sort(cluster_ids.begin(), cluster_ids.end());
-
-    std::ofstream out(output_path);
-    if (!out) {
-        throw std::runtime_error("Failed to write similarity cluster stats: " + output_path);
-    }
-    out << std::fixed << std::setprecision(6);
-    out << "cluster_id\tmember_alleles\tpath_support_sum\t"
-           "mean_silhouette\tpath_weighted_mean_silhouette\t"
-           "mean_intra_distance_norm\tmean_intra_similarity\tmean_intra_edit_distance\t"
-           "max_intra_distance_norm\tmax_intra_edit_distance\t"
-           "mean_to_other_clusters_distance_norm\tmean_to_other_clusters_similarity\t"
-           "mean_to_other_clusters_edit_distance\t"
-           "min_to_other_clusters_distance_norm\tmax_to_other_clusters_distance_norm\t"
-           "min_to_other_clusters_edit_distance\tmax_to_other_clusters_edit_distance\t"
-           "nearest_other_cluster_id\tnearest_other_min_distance_norm\tnearest_other_min_similarity\t"
-           "separation_margin_norm\tthreshold_margin_norm\tseparation_quality\n";
-
-    for (const std::size_t cluster_id : cluster_ids) {
-        const auto& idxs = members[cluster_id];
-        double intra_sum_norm = 0.0;
-        double intra_sum_abs = 0.0;
-        std::size_t intra_pairs = 0;
-        double intra_max_norm = 0.0;
-        double intra_max_abs = 0.0;
-        for (std::size_t a = 0; a < idxs.size(); ++a) {
-            for (std::size_t b = a + 1; b < idxs.size(); ++b) {
-                intra_sum_norm += dist_norm[idxs[a]][idxs[b]];
-                intra_sum_abs += static_cast<double>(dist_abs[idxs[a]][idxs[b]]);
-                intra_max_norm = std::max(intra_max_norm, dist_norm[idxs[a]][idxs[b]]);
-                intra_max_abs = std::max(intra_max_abs, static_cast<double>(dist_abs[idxs[a]][idxs[b]]));
-                ++intra_pairs;
-            }
-        }
-        const double intra_mean_norm = safe_div(intra_sum_norm, static_cast<double>(intra_pairs));
-        const double intra_mean_abs = safe_div(intra_sum_abs, static_cast<double>(intra_pairs));
-
-        double between_cluster_sum_norm = 0.0;
-        double between_cluster_sum_abs = 0.0;
-        std::size_t between_cluster_count = 0;
-        double between_cluster_min_norm = std::numeric_limits<double>::infinity();
-        double between_cluster_max_norm = 0.0;
-        double between_cluster_min_abs = std::numeric_limits<double>::infinity();
-        double between_cluster_max_abs = 0.0;
-        std::size_t nearest_other_cluster_id = 0;
-        double nearest_other_min_norm = std::numeric_limits<double>::infinity();
-        for (const std::size_t other_cluster : cluster_ids) {
-            if (other_cluster == cluster_id) {
-                continue;
-            }
-            const auto& other = members[other_cluster];
-            double sum_norm = 0.0;
-            double sum_abs = 0.0;
-            std::size_t pairs = 0;
-            double pair_min_norm = std::numeric_limits<double>::infinity();
-            for (const std::size_t i : idxs) {
-                for (const std::size_t j : other) {
-                    sum_norm += dist_norm[i][j];
-                    sum_abs += static_cast<double>(dist_abs[i][j]);
-                    pair_min_norm = std::min(pair_min_norm, dist_norm[i][j]);
-                    ++pairs;
-                }
-            }
-            if (pairs == 0) {
-                continue;
-            }
-            const double m_norm = sum_norm / static_cast<double>(pairs);
-            const double m_abs = sum_abs / static_cast<double>(pairs);
-            between_cluster_sum_norm += m_norm;
-            between_cluster_sum_abs += m_abs;
-            ++between_cluster_count;
-            between_cluster_min_norm = std::min(between_cluster_min_norm, m_norm);
-            between_cluster_max_norm = std::max(between_cluster_max_norm, m_norm);
-            between_cluster_min_abs = std::min(between_cluster_min_abs, m_abs);
-            between_cluster_max_abs = std::max(between_cluster_max_abs, m_abs);
-            if (pair_min_norm < nearest_other_min_norm) {
-                nearest_other_min_norm = pair_min_norm;
-                nearest_other_cluster_id = other_cluster;
-            }
-        }
-        const double between_cluster_mean_norm = safe_div(
-            between_cluster_sum_norm,
-            static_cast<double>(between_cluster_count));
-        const double between_cluster_mean_abs = safe_div(
-            between_cluster_sum_abs,
-            static_cast<double>(between_cluster_count));
-        if (!std::isfinite(between_cluster_min_norm)) {
-            between_cluster_min_norm = 0.0;
-        }
-        if (!std::isfinite(between_cluster_min_abs)) {
-            between_cluster_min_abs = 0.0;
-        }
-        if (!std::isfinite(nearest_other_min_norm)) {
-            nearest_other_min_norm = 0.0;
-            nearest_other_cluster_id = 0;
-        }
-
-        const double max_norm_dist = std::clamp(1.0 - min_similarity, 0.0, 1.0);
-        const double separation_margin_norm = nearest_other_min_norm - intra_max_norm;
-        const double threshold_margin_norm = nearest_other_min_norm - max_norm_dist;
-        std::string separation_quality = "single_cluster";
-        if (cluster_ids.size() > 1) {
-            if (threshold_margin_norm < 0.0 || separation_margin_norm < 0.0) {
-                separation_quality = "poor";
-            } else if (threshold_margin_norm < 0.02 || separation_margin_norm < 0.02) {
-                separation_quality = "borderline";
-            } else {
-                separation_quality = "good";
-            }
-        }
-
-        std::size_t path_support_sum = 0;
-        double silhouette_sum = 0.0;
-        double weighted_silhouette_sum = 0.0;
-        for (const std::size_t idx : idxs) {
-            path_support_sum += unique_alleles[idx].path_support;
-            silhouette_sum += silhouette_scores[idx];
-            weighted_silhouette_sum +=
-                silhouette_scores[idx] * static_cast<double>(unique_alleles[idx].path_support);
-        }
-
-        out << cluster_id << '\t'
-            << idxs.size() << '\t'
-            << path_support_sum << '\t'
-            << safe_div(silhouette_sum, static_cast<double>(idxs.size())) << '\t'
-            << safe_div(weighted_silhouette_sum, static_cast<double>(path_support_sum)) << '\t'
-            << intra_mean_norm << '\t'
-            << (1.0 - intra_mean_norm) << '\t'
-            << intra_mean_abs << '\t'
-            << intra_max_norm << '\t'
-            << intra_max_abs << '\t'
-            << between_cluster_mean_norm << '\t'
-            << (1.0 - between_cluster_mean_norm) << '\t'
-            << between_cluster_mean_abs << '\t'
-            << between_cluster_min_norm << '\t'
-            << between_cluster_max_norm << '\t'
-            << between_cluster_min_abs << '\t'
-            << between_cluster_max_abs << '\t'
-            << nearest_other_cluster_id << '\t'
-            << nearest_other_min_norm << '\t'
-            << (1.0 - nearest_other_min_norm) << '\t'
-            << separation_margin_norm << '\t'
-            << threshold_margin_norm << '\t'
-            << separation_quality << '\n';
-    }
-}
-
-std::size_t node_length_bp(
-    const std::unordered_map<std::string, Node>& nodes,
-    const std::string& node_id) {
-
-    const auto it = nodes.find(node_id);
-    if (it == nodes.end() || it->second.sequence.empty()) {
-        return 1;
-    }
-    return std::max<std::size_t>(1, it->second.sequence.size());
-}
-
-std::string allele_node_orientation_cell(
-    const UniqueAllele& allele,
-    const std::string& node_id) {
-
-    std::string cell;
-    for (const PathStep& step : allele.steps) {
-        if (step.node_id == node_id) {
-            cell.push_back(step.reverse ? '-' : '+');
-        }
-    }
-    return cell.empty() ? std::string("|") : cell;
-}
-
-std::vector<std::string> cluster_signature_node_order(
-    const Cluster& cluster,
-    const std::vector<UniqueAllele>& unique_alleles) {
-
-    std::vector<std::string> order;
-    std::unordered_set<std::string> seen;
-
-    auto add_nodes = [&](std::size_t allele_idx) {
-        if (allele_idx >= unique_alleles.size()) {
-            return;
-        }
-        for (const PathStep& step : unique_alleles[allele_idx].steps) {
-            if (seen.insert(step.node_id).second) {
-                order.push_back(step.node_id);
-            }
-        }
-    };
-
-    add_nodes(cluster.representative_idx);
-    for (const std::size_t idx : cluster.member_unique_idxs) {
-        add_nodes(idx);
-    }
-    return order;
-}
-
-void write_similarity_cluster_signature_tables(
-    const std::string& output_dir,
-    const std::unordered_map<std::string, Node>& nodes,
-    const std::vector<UniqueAllele>& unique_alleles,
-    const std::vector<Cluster>& clusters) {
-
-    std::filesystem::create_directories(output_dir);
-    for (const Cluster& cluster : clusters) {
-        const std::string output_path = output_dir + "/cluster_" + std::to_string(cluster.cluster_id) + ".tsv";
-        std::ofstream out(output_path);
-        if (!out) {
-            throw std::runtime_error("Failed to write cluster signature table: " + output_path);
-        }
-
-        out << "node_id";
-        for (const std::size_t idx : cluster.member_unique_idxs) {
-            out << "\tallele_" << unique_alleles[idx].allele_id;
-        }
-        out << "\tnode_length_bp\n";
-
-        const std::vector<std::string> node_order = cluster_signature_node_order(cluster, unique_alleles);
-        for (const std::string& node_id : node_order) {
-            out << node_id;
-            for (const std::size_t idx : cluster.member_unique_idxs) {
-                out << '\t' << allele_node_orientation_cell(unique_alleles[idx], node_id);
-            }
-            out << '\t' << node_length_bp(nodes, node_id) << '\n';
-        }
-    }
-}
 
 struct UPGMANode {
     bool is_leaf = false;
@@ -1237,68 +824,6 @@ UPGMATree build_upgma_tree(const std::vector<std::vector<double>>& dist) {
     return tree;
 }
 
-SimilarityReportPaths similarity_report_paths_for_bubble(
-    const std::string& output_dir,
-    std::size_t bubble_id) {
-
-    SimilarityReportPaths out;
-    out.bubble_dir = output_dir + "/bubble_" + std::to_string(bubble_id);
-    out.alleles_tsv = out.bubble_dir + "/alleles.tsv";
-    out.matrix_norm_tsv = out.bubble_dir + "/distance_matrix_norm.tsv";
-    out.matrix_abs_tsv = out.bubble_dir + "/distance_matrix_abs.tsv";
-    out.stats_tsv = out.bubble_dir + "/cluster_stats.tsv";
-    out.cluster_signatures_dir = out.bubble_dir + "/cluster_signatures";
-    return out;
-}
-
-void write_similarity_reports_for_bubble(
-    const SimilarityReportPaths& paths,
-    const Bubble& bubble,
-    const Graph& graph,
-    const std::vector<UniqueAllele>& unique_alleles,
-    const std::vector<Cluster>& clusters,
-    const std::vector<std::size_t>& cluster_of_unique,
-    const DistanceMatrices& dists,
-    double min_similarity) {
-
-    if (unique_alleles.empty()) {
-        return;
-    }
-
-    std::filesystem::create_directories(paths.bubble_dir);
-    const std::vector<double> silhouette_scores =
-        compute_silhouette_scores(cluster_of_unique, dists.norm);
-
-    write_similarity_alleles_tsv(paths.alleles_tsv, bubble, unique_alleles, cluster_of_unique);
-    write_similarity_distance_matrix_tsv(paths.matrix_norm_tsv, unique_alleles, dists.norm);
-    write_similarity_distance_matrix_abs_tsv(paths.matrix_abs_tsv, unique_alleles, dists.abs);
-    write_similarity_cluster_stats_tsv(
-        paths.stats_tsv,
-        unique_alleles,
-        cluster_of_unique,
-        dists.norm,
-        silhouette_scores,
-        dists.abs,
-        min_similarity);
-    write_similarity_cluster_signature_tables(
-        paths.cluster_signatures_dir,
-        graph.nodes,
-        unique_alleles,
-        clusters);
-}
-
-std::string build_walk_signature(const std::vector<PathStep>& steps) {
-    std::string sig;
-    sig.reserve(steps.size() * 8);
-    for (std::size_t i = 0; i < steps.size(); ++i) {
-        if (i > 0) {
-            sig.push_back(',');
-        }
-        sig += steps[i].node_id;
-        sig.push_back(steps[i].reverse ? '-' : '+');
-    }
-    return sig;
-}
 
 int bounded_levenshtein_distance(
     const std::string& a,
@@ -2187,7 +1712,7 @@ std::size_t longest_common_suffix_bp(
     return sfx;
 }
 
-ParsedReferencePath parse_reference_path_label(const std::string& path_name) {
+ParsedReferencePath parse_reference_path_label_impl(const std::string& path_name) {
     ParsedReferencePath out;
     out.chrom = path_name;
 
@@ -3302,7 +2827,6 @@ struct DotplotMatchSegment {
     double query_end_bp = 0.0;
 };
 
-ParsedReferencePath parse_reference_path_label(const std::string& path_name);
 std::vector<CigarRun> parse_extended_cigar(const std::string& cigar);
 
 std::vector<std::string> split_tab_fields(const std::string& line) {
@@ -3399,7 +2923,7 @@ const std::vector<GeneAnnotation>* find_gene_annotations(
     return nullptr;
 }
 
-GeneAnnotationIndex load_gene_annotations_from_gtf(const std::string& gtf_path) {
+GeneAnnotationIndex load_gene_annotations_from_gtf_impl(const std::string& gtf_path) {
     GeneAnnotationIndex index;
     if (gtf_path.empty()) {
         return index;
@@ -3622,7 +3146,7 @@ std::vector<DotplotGeneBand> collect_dotplot_gene_bands(
         return out;
     }
 
-    const ParsedReferencePath ref_meta = parse_reference_path_label(reference_label);
+    const ParsedReferencePath ref_meta = parse_reference_path_label_impl(reference_label);
     if (!ref_meta.has_interval) {
         return out;
     }
@@ -4259,7 +3783,7 @@ void write_dotplot_svg_from_paf(
     }
 
     // Reference coordinate ticks (equally spaced and intentionally sparse).
-    const ParsedReferencePath ref_meta = parse_reference_path_label(ref_for_gtf);
+    const ParsedReferencePath ref_meta = parse_reference_path_label_impl(ref_for_gtf);
     const bool has_ref_interval = ref_meta.has_interval;
     constexpr std::size_t tick_intervals = 5;
     const double axis_y = margin + plot_h;
@@ -4874,7 +4398,7 @@ void write_cluster_pairwise_vcf(
     }
 }
 
-VariantBubbleReport write_variant_reports_for_bubble(
+VariantBubbleReport write_variant_reports_for_bubble_impl(
     const Bubble& bubble,
     const std::vector<UniqueAllele>& unique_alleles,
     const std::vector<Cluster>& clusters,
@@ -5087,7 +4611,7 @@ VariantBubbleReport write_variant_reports_for_bubble(
     }
 
     std::string gtf_reference_label = reference_path;
-    const ParsedReferencePath gtf_ref_meta = parse_reference_path_label(reference_path);
+    const ParsedReferencePath gtf_ref_meta = parse_reference_path_label_impl(reference_path);
     if (!reference_sequence_global.empty() &&
         !ref_seq.empty() &&
         gtf_ref_meta.has_interval) {
@@ -5374,7 +4898,7 @@ VariantBubbleReport write_variant_reports_for_bubble(
             cluster_status.dotplot_written = true;
 
             const std::string cluster_vcf_path = cluster_debug_dir + "/cluster_vs_reference.vcf";
-            const ParsedReferencePath debug_ref_meta = parse_reference_path_label(gtf_reference_label);
+            const ParsedReferencePath debug_ref_meta = parse_reference_path_label_impl(gtf_reference_label);
             write_cluster_pairwise_vcf(
                 cluster_vcf_path,
                 debug_ref_meta,
@@ -5455,7 +4979,7 @@ std::pair<std::string, std::string> vcf_alt_and_type(
     return {"<INS>", "INS"};
 }
 
-void write_region_level_vcf(
+void write_region_level_vcf_impl(
     const std::string& output_path,
     const std::string& reference_path,
     const ParsedReferencePath& reference_meta,
@@ -6411,19 +5935,14 @@ void write_headers(
     }
 }
 
-auto* kParseReferencePathLabelImpl = &parse_reference_path_label;
-auto* kLoadGeneAnnotationsFromGtfImpl = &load_gene_annotations_from_gtf;
-auto* kWriteVariantReportsForBubbleImpl = &write_variant_reports_for_bubble;
-auto* kWriteRegionLevelVcfImpl = &write_region_level_vcf;
-
 } // namespace
 
 ParsedReferencePath parse_reference_path_label(const std::string& path_name) {
-    return (*kParseReferencePathLabelImpl)(path_name);
+    return parse_reference_path_label_impl(path_name);
 }
 
 GeneAnnotationIndex load_gene_annotations_from_gtf(const std::string& gtf_path) {
-    return (*kLoadGeneAnnotationsFromGtfImpl)(gtf_path);
+    return load_gene_annotations_from_gtf_impl(gtf_path);
 }
 
 VariantBubbleReport write_variant_reports_for_bubble(
@@ -6444,7 +5963,7 @@ VariantBubbleReport write_variant_reports_for_bubble(
     bool minimap_emit_secondary,
     bool split_ins_use_geometric_svlen,
     bool classify_ins) {
-    return (*kWriteVariantReportsForBubbleImpl)(
+    return write_variant_reports_for_bubble_impl(
         bubble,
         unique_alleles,
         clusters,
@@ -6480,7 +5999,7 @@ void write_region_level_vcf(
     double min_seq_similarity,
     double max_seq_edit_fraction,
     std::size_t* records_written_out) {
-    (*kWriteRegionLevelVcfImpl)(
+    write_region_level_vcf_impl(
         output_path,
         reference_path,
         reference_meta,
@@ -6838,7 +6357,7 @@ void call_alleles_to_csv(
                 std::cerr
                     << "[allele] bubble " << bubble.id
                     << " skipped (no source->sink path assignments), elapsed="
-                    << std::fixed << std::setprecision(2) << elapsed_seconds(bubble_start) << "s\n";
+                    << std::fixed << std::setprecision(2) << cli::elapsed_seconds(bubble_start) << "s\n";
             }
             continue;
         }
@@ -6851,7 +6370,7 @@ void call_alleles_to_csv(
                 std::cerr
                     << "[allele] bubble " << bubble.id
                     << " skipped by --skip-no-reference-bubbles, elapsed="
-                    << std::fixed << std::setprecision(2) << elapsed_seconds(bubble_start) << "s\n";
+                    << std::fixed << std::setprecision(2) << cli::elapsed_seconds(bubble_start) << "s\n";
             }
             continue;
         }
@@ -6862,7 +6381,7 @@ void call_alleles_to_csv(
                 << " extracted paths=" << assignments.size()
                 << ", unique_alleles=" << unique_alleles.size()
                 << ", elapsed=" << std::fixed << std::setprecision(2)
-                << elapsed_seconds(extract_start) << "s\n";
+                << cli::elapsed_seconds(extract_start) << "s\n";
         }
 
         summary.bubbles_with_assignments += 1;
@@ -6926,7 +6445,7 @@ void call_alleles_to_csv(
                 std::cerr
                     << "[allele] bubble " << bubble.id
                     << " distance matrix computed, elapsed="
-                    << std::fixed << std::setprecision(2) << elapsed_seconds(dist_start) << "s\n";
+                    << std::fixed << std::setprecision(2) << cli::elapsed_seconds(dist_start) << "s\n";
             }
         }
 
@@ -6999,7 +6518,7 @@ void call_alleles_to_csv(
                 std::cerr
                     << "[allele] bubble " << bubble.id
                     << " skipped (0 clusters), elapsed="
-                    << std::fixed << std::setprecision(2) << elapsed_seconds(bubble_start) << "s\n";
+                    << std::fixed << std::setprecision(2) << cli::elapsed_seconds(bubble_start) << "s\n";
             }
             continue;
         }
@@ -7309,8 +6828,8 @@ void call_alleles_to_csv(
                 << ", clusters=" << clusters.size()
                 << ", paths=" << assignments.size()
                 << ", elapsed=" << std::fixed << std::setprecision(2)
-                << elapsed_seconds(bubble_start) << "s"
-                << ", total=" << elapsed_seconds(run_start) << "s\n";
+                << cli::elapsed_seconds(bubble_start) << "s"
+                << ", total=" << cli::elapsed_seconds(run_start) << "s\n";
         }
     }
 
@@ -7354,7 +6873,7 @@ void call_alleles_to_csv(
         }
         std::cerr
             << "[allele] completed " << bubbles.size() << " bubbles in "
-            << std::fixed << std::setprecision(2) << elapsed_seconds(run_start) << "s\n";
+            << std::fixed << std::setprecision(2) << cli::elapsed_seconds(run_start) << "s\n";
     }
 }
 

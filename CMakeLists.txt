@@ -40,6 +40,7 @@ add_library(panvarlib
     src/bubble_path.cpp
     src/bubbles.cpp
     src/allele.cpp
+    src/allele_similarity.cpp
     src/call.cpp
     src/describe.cpp
     src/output.cpp

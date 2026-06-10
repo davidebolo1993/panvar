@@ -49,9 +49,11 @@ void print_describe_help() {
         << "      --out-dir <dir>              Output directory (default: describe_out)\n"
         << "      --bubble-id <N>              Restrict to one bubble ID (repeatable)\n"
         << "      --kmer-size <K>              K-mer size, 1..31 for 2-bit encoding (default: 31)\n"
-        << "      --feature-mode <mode>        all|minimizer|syncmer (default: all)\n"
+        << "      --feature-mode <mode>        all|minimizer|syncmer (default: syncmer)\n"
         << "      --minimizer-window <W>       Window of k-mers for minimizer mode (default: 15)\n"
         << "      --syncmer-s <S>              Internal s-mer size for closed syncmer mode (default: auto)\n"
+        << "      --min-paths <N>              Drop features with min(present,absent) paths <= N,\n"
+        << "                                   keeping copy-number features (default: 1; 0 keeps all)\n"
         << "      --max-wide-features <N>      Skip wide matrix above N features (default: 250000; 0=no cap)\n"
         << "      --force-wide                 Write wide matrix even above safety cap\n"
         << "      --no-wide-matrix             Write only feature map + sparse JSONL counts\n"
@@ -116,6 +118,10 @@ int run_describe_command(const std::vector<std::string>& args) {
         }
         if (arg == "--syncmer-s") {
             options.syncmer_s = cli::parse_size_arg(arg, require_value(arg));
+            continue;
+        }
+        if (arg == "--min-paths") {
+            options.min_feature_paths = cli::parse_size_arg(arg, require_value(arg));
             continue;
         }
         if (arg == "--max-wide-features") {
@@ -191,12 +197,19 @@ int run_describe_command(const std::vector<std::string>& args) {
         << (options.syncmer_s == 0 ? std::string("auto") : std::to_string(options.syncmer_s)) << "\n"
         << "Wide matrix: " << (options.write_wide_matrix ? "on" : "off") << "\n"
         << "Max wide features: " << options.max_wide_features << " (0=no cap)\n"
+        << "Min paths filter (N): " << options.min_feature_paths << " (0=keep all discriminative)\n"
         << "Bubbles processed: " << summary.bubbles_processed << "\n"
         << "Bubbles with paths: " << summary.bubbles_with_paths << "\n"
         << "Path rows written: " << summary.paths_written << "\n"
-        << "Discriminative k-mer features: " << summary.features_written << "\n"
+        << "K-mer features kept/candidates: " << summary.features_written << "/"
+        << summary.features_candidates << " (discarded "
+        << (summary.features_candidates - summary.features_written) << ")\n"
         << "Matrix files written: " << summary.matrix_files_written << "\n"
         << "JSONL files written: " << summary.jsonl_files_written << "\n"
+        << "Node/edge features kept/candidates: " << summary.node_edge_features_written << "/"
+        << summary.node_edge_candidates << " (discarded "
+        << (summary.node_edge_candidates - summary.node_edge_features_written) << ")\n"
+        << "Graph matrix files written: " << summary.graph_matrix_files_written << "\n"
         << "Files written: " << summary.files_written << "\n";
 
     return 0;

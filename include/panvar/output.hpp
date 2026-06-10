@@ -7,6 +7,10 @@
 
 namespace panvar {
 
+// Split a single CSV line into fields, honoring double-quoted fields and
+// escaped (doubled) quotes. Shared by the CSV readers across modules.
+std::vector<std::string> split_csv_line(const std::string& line);
+
 void write_bubbles_csv(
     const std::string& output_path,
     const std::vector<Bubble>& bubbles);

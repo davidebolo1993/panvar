@@ -6,6 +6,8 @@ build/
 *.a
 *.so
 *.dylib
+*.claude/*
+*.claude
 
 tests/results/**
 tests/results/prepared_inputs/**

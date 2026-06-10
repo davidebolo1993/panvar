@@ -1,9 +1,44 @@
 #include "panvar/graph_utils.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <stdexcept>
 
 namespace panvar {
+
+std::uint64_t hash_step_token(const PathStep& step) {
+    // 64-bit FNV-1a over node id + orientation.
+    std::uint64_t h = 1469598103934665603ULL;
+    for (const unsigned char c : step.node_id) {
+        h ^= static_cast<std::uint64_t>(c);
+        h *= 1099511628211ULL;
+    }
+    h ^= (step.reverse ? 0xF0ULL : 0x0FULL);
+    h *= 1099511628211ULL;
+    return h;
+}
+
+std::vector<std::uint64_t> build_walk_tokens(const std::vector<PathStep>& steps) {
+    std::vector<std::uint64_t> tokens;
+    tokens.reserve(steps.size());
+    for (const auto& step : steps) {
+        tokens.push_back(hash_step_token(step));
+    }
+    return tokens;
+}
+
+std::string build_walk_signature(const std::vector<PathStep>& steps) {
+    std::string sig;
+    sig.reserve(steps.size() * 8);
+    for (std::size_t i = 0; i < steps.size(); ++i) {
+        if (i > 0) {
+            sig.push_back(',');
+        }
+        sig += steps[i].node_id;
+        sig.push_back(steps[i].reverse ? '-' : '+');
+    }
+    return sig;
+}
 
 std::unordered_map<std::string, const PathRecord*> path_records_by_name(const Graph& graph) {
     std::unordered_map<std::string, const PathRecord*> out;

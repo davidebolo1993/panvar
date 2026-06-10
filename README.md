@@ -8,7 +8,7 @@ Modules:
 2. `inspect` (utility): path FASTA and node traversal matrix for one or all called bubbles
 3. `allele` (Module 2): allele extraction and clustering from module-1 bubbles
 4. `call` (Module 3): SV calling (`INS`/`DEL`/`INV`) from clustered alleles
-5. `describe` (Module 4): per-bubble k-mer feature tables for downstream association
+5. `describe` (Module 4): per-bubble node/edge dosage tables (primary association substrate) plus complementary k-mer feature tables
 
 ## Build
 
@@ -136,9 +136,11 @@ Inspect all bubbles by omitting `--bubble-id`:
   - `--pangene-gene-match <expr>` (repeatable): filter pangene genes
   - `--pangene-tune-ins`: set `INS_SUBTYPE=DUP_PANGENE` when pangene copy gain supports duplication
 - `describe`
+  - emits per bubble both a node/edge dosage table (`graph_features.tsv.gz` + `graph_matrix.tsv.gz`, the primary association substrate) and the complementary k-mer tables
   - `--bubble-prefix-in <prefix>`: consume bubble outputs using prefix convention
   - `--kmer-size <K>`: canonical 2-bit k-mer size (`1..31`, default `31`)
-  - `--feature-mode all|minimizer|syncmer`: optionally sample k-mers to reduce feature count
+  - `--feature-mode all|minimizer|syncmer`: k-mer sampling mode (default `syncmer`; use `all` for the exhaustive set)
+  - `--min-paths <N>`: MAF-style filter — drop features with `min(present,absent)` paths `<= N`, keeping copy-number features (default `1`; `0` keeps all)
   - `--max-wide-features <N>`: skip very wide matrices above a feature cap
   - `--no-wide-matrix`: keep only compact graph-aware feature map plus sparse JSONL counts
 
@@ -190,8 +192,11 @@ docker run --rm -v "$PWD":/work -w /work panvar:latest panvar --help
 ## Repository Layout
 
 - `src/*_command.cpp`, `include/panvar/*_command.hpp`: CLI wrappers for each subcommand
-- `src/cli_utils.cpp`, `include/panvar/cli_utils.hpp`: shared command-line helpers
-- `src/graph_utils.cpp`, `include/panvar/graph_utils.hpp`: shared graph/path/sequence helpers
+- `src/cli_utils.cpp`, `include/panvar/cli_utils.hpp`: shared command-line helpers (arg parsing, timing)
+- `src/graph_utils.cpp`, `include/panvar/graph_utils.hpp`: shared graph/path/sequence and walk-token/signature helpers
+- `src/output.cpp`, `include/panvar/output.hpp`: shared CSV I/O (including `split_csv_line`)
+- `src/allele.cpp`: allele extraction and clustering core
+- `src/allele_similarity.cpp`, `src/allele_internal.hpp`: per-bubble similarity diagnostics, split out of the clustering core
 - `src/`, `include/panvar/`: module algorithms and public data structures
 - `scripts/plot_distance_heatmap.R`: ggplot2 helper for plotting allele similarity distance matrices
 - `scripts/plot_node_coverage_heatmap.R`: ggplot2 helper for plotting inspect path-by-node coverage matrices

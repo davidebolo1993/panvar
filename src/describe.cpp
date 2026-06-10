@@ -13,6 +13,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -69,13 +70,21 @@ struct SparseKmerEntry {
 
 struct BubbleDescribeResult {
     std::size_t paths = 0;
-    std::size_t features = 0;
+    std::size_t features = 0;            // discriminative k-mers kept
+    std::size_t features_total = 0;      // k-mer candidates before filter
     bool matrix_written = false;
     std::string status = "ok";
     std::string matrix_reason = ".";
     std::string feature_map_path = ".";
     std::string matrix_path = ".";
     std::string counts_jsonl_path = ".";
+    std::size_t node_features = 0;       // discriminative nodes kept
+    std::size_t node_features_total = 0; // node candidates before filter
+    std::size_t edge_features = 0;       // discriminative edges kept
+    std::size_t edge_features_total = 0; // edge candidates before filter
+    bool graph_matrix_written = false;
+    std::string graph_feature_map_path = ".";
+    std::string graph_matrix_path = ".";
 };
 
 class GzipWriter {
@@ -584,17 +593,42 @@ void update_kmer_stats(
     }
 }
 
+// Shared keep rule for both feature layers. A feature is kept when it is
+// informative for association:
+//  - copy-number features (count varies across carrying paths) are always kept;
+//  - otherwise it must pass a symmetric minor-presence (MAF-style) cut:
+//    min(present, absent) > min_paths.
+// min_paths == 0 reproduces the legacy rule (drop only features present in every
+// path with one identical count).
+bool feature_passes_filter(
+    std::size_t present_paths,
+    std::uint32_t min_nonzero_count,
+    std::uint32_t max_count,
+    std::size_t path_count,
+    std::size_t min_paths) {
+
+    if (path_count == 0) {
+        return true;
+    }
+    if (min_nonzero_count != max_count) {
+        return true; // copy-number signal: informative regardless of presence breadth
+    }
+    const std::size_t absent = path_count - present_paths;
+    const std::size_t minor = std::min(present_paths, absent);
+    return minor > min_paths;
+}
+
 std::vector<std::uint64_t> select_discriminative_features(
     const std::unordered_map<std::uint64_t, KmerStats>& stats,
-    std::size_t path_count) {
+    std::size_t path_count,
+    std::size_t min_paths) {
 
     std::vector<std::uint64_t> features;
     features.reserve(stats.size());
     for (const auto& [code, s] : stats) {
-        if (path_count > 0 && s.present_paths == path_count && s.min_nonzero_count == s.max_count) {
-            continue;
+        if (feature_passes_filter(s.present_paths, s.min_nonzero_count, s.max_count, path_count, min_paths)) {
+            features.push_back(code);
         }
-        features.push_back(code);
     }
     std::sort(features.begin(), features.end());
     return features;
@@ -613,6 +647,223 @@ std::unordered_map<std::uint64_t, std::size_t> make_feature_id_map(
         out[features[i]] = i + 1;
     }
     return out;
+}
+
+// --- Node and edge dosage features ----------------------------------------
+// Per-bubble association substrate that parallels the k-mer features but is
+// keyed by graph coordinates: how many times each path traverses each inside
+// node (node dosage) and each oriented step-to-step transition (edge dosage).
+// Shares node IDs with the k-mer feature map and the future graph-native calls.
+//
+// Node dosage is a DESCRIPTIVE traversal count, not a copy-number call: a count
+// > 1 may be a tandem duplication or just the same node revisited elsewhere in
+// the walk. Adjacency (the real tandem signal) is captured by the edge layer -
+// a tandem block repeats an edge, scattered reuse does not. True CN/duplication
+// (adjacent-block detection with motif/region size thresholds) is left to the
+// graph-native variant-calling step.
+
+struct GraphFeatureStat {
+    std::size_t present_paths = 0;
+    std::uint64_t total_count = 0;
+    std::uint32_t min_nonzero_count = std::numeric_limits<std::uint32_t>::max();
+    std::uint32_t max_count = 0;
+};
+
+// Ordered maps give a deterministic feature order (stable N*/E* ids).
+struct GraphDosage {
+    std::map<std::string, std::uint32_t> node_counts;
+    std::map<std::string, std::uint32_t> edge_counts;
+};
+
+std::string node_feature_name(std::size_t feature_id) {
+    return "N" + std::to_string(feature_id);
+}
+
+std::string edge_feature_name(std::size_t feature_id) {
+    return "E" + std::to_string(feature_id);
+}
+
+std::string oriented_node_token(const PathStep& step) {
+    return step.node_id + (step.reverse ? '-' : '+');
+}
+
+std::string edge_key(const PathStep& from, const PathStep& to) {
+    return oriented_node_token(from) + ">" + oriented_node_token(to);
+}
+
+std::vector<PathStep> canonical_steps_for_bubble_path(
+    const Bubble& bubble,
+    const PathRecord& path,
+    const BubblePathIndex& index) {
+
+    const auto interval = find_best_bubble_path_interval(index, bubble);
+    if (!interval.has_value()) {
+        return {};
+    }
+    return canonical_bubble_path_steps(path, bubble, *interval);
+}
+
+GraphDosage count_graph_dosage(const std::vector<PathStep>& steps) {
+    GraphDosage dosage;
+    for (const PathStep& step : steps) {
+        ++dosage.node_counts[step.node_id];
+    }
+    for (std::size_t i = 0; i + 1 < steps.size(); ++i) {
+        ++dosage.edge_counts[edge_key(steps[i], steps[i + 1])];
+    }
+    return dosage;
+}
+
+void update_graph_stats(
+    const std::map<std::string, std::uint32_t>& counts,
+    std::map<std::string, GraphFeatureStat>& stats) {
+
+    for (const auto& [key, count] : counts) {
+        auto& s = stats[key];
+        ++s.present_paths;
+        s.total_count += count;
+        s.min_nonzero_count = std::min(s.min_nonzero_count, count);
+        s.max_count = std::max(s.max_count, count);
+    }
+}
+
+// Drop features present in every path with identical dosage (no variance ->
+// useless for association). Input map iterates sorted, so output is sorted too.
+std::vector<std::string> select_discriminative_graph_features(
+    const std::map<std::string, GraphFeatureStat>& stats,
+    std::size_t path_count,
+    std::size_t min_paths) {
+
+    std::vector<std::string> features;
+    features.reserve(stats.size());
+    for (const auto& [key, s] : stats) {
+        if (feature_passes_filter(s.present_paths, s.min_nonzero_count, s.max_count, path_count, min_paths)) {
+            features.push_back(key);
+        }
+    }
+    return features;
+}
+
+void accumulate_graph_stats(
+    const Graph& graph,
+    const Bubble& bubble,
+    const std::vector<BubblePathIndex>& path_indexes,
+    const std::vector<PathMeta>& paths,
+    std::map<std::string, GraphFeatureStat>& node_stats,
+    std::map<std::string, GraphFeatureStat>& edge_stats) {
+
+    for (const PathMeta& meta : paths) {
+        const std::vector<PathStep> steps = canonical_steps_for_bubble_path(
+            bubble, graph.paths[meta.path_index], path_indexes[meta.path_index]);
+        if (steps.empty()) {
+            continue;
+        }
+        const GraphDosage dosage = count_graph_dosage(steps);
+        update_graph_stats(dosage.node_counts, node_stats);
+        update_graph_stats(dosage.edge_counts, edge_stats);
+    }
+}
+
+void write_graph_feature_map(
+    const std::string& path,
+    const std::vector<std::string>& node_features,
+    const std::vector<std::string>& edge_features,
+    const std::map<std::string, GraphFeatureStat>& node_stats,
+    const std::map<std::string, GraphFeatureStat>& edge_stats,
+    std::size_t path_count) {
+
+    GzipWriter out(path);
+    out.write("feature_id\tfeature_name\tfeature_type\tlabel\tpaths_present\tmin_count\tmax_count\ttotal_count\n");
+
+    auto write_block = [&](const std::vector<std::string>& features,
+                           const std::map<std::string, GraphFeatureStat>& stats,
+                           const char* type,
+                           std::string (*namer)(std::size_t)) {
+        for (std::size_t i = 0; i < features.size(); ++i) {
+            const auto it = stats.find(features[i]);
+            if (it == stats.end()) {
+                continue;
+            }
+            const GraphFeatureStat& s = it->second;
+            const std::uint32_t min_count =
+                (path_count > 0 && s.present_paths == path_count) ? s.min_nonzero_count : 0;
+            out.write(std::to_string(i + 1));
+            out.write("\t");
+            out.write(namer(i + 1));
+            out.write("\t");
+            out.write(type);
+            out.write("\t");
+            out.write(tsv_sanitize(features[i]));
+            out.write("\t");
+            out.write(std::to_string(s.present_paths));
+            out.write("\t");
+            out.write(std::to_string(min_count));
+            out.write("\t");
+            out.write(std::to_string(s.max_count));
+            out.write("\t");
+            out.write(std::to_string(s.total_count));
+            out.write("\n");
+        }
+    };
+
+    write_block(node_features, node_stats, "node", node_feature_name);
+    write_block(edge_features, edge_stats, "edge", edge_feature_name);
+    out.close();
+}
+
+void write_graph_matrix(
+    const std::string& path,
+    const Graph& graph,
+    const Bubble& bubble,
+    const std::vector<BubblePathIndex>& path_indexes,
+    const std::vector<PathMeta>& paths,
+    const std::vector<std::string>& node_features,
+    const std::vector<std::string>& edge_features) {
+
+    GzipWriter out(path);
+    std::string header = "bubble_id\tsample\thaplotype\tpath_name";
+    for (std::size_t i = 0; i < node_features.size(); ++i) {
+        header.push_back('\t');
+        header += node_feature_name(i + 1);
+    }
+    for (std::size_t i = 0; i < edge_features.size(); ++i) {
+        header.push_back('\t');
+        header += edge_feature_name(i + 1);
+    }
+    header.push_back('\n');
+    out.write(header);
+
+    for (const PathMeta& meta : paths) {
+        const std::vector<PathStep> steps = canonical_steps_for_bubble_path(
+            bubble, graph.paths[meta.path_index], path_indexes[meta.path_index]);
+        if (steps.empty()) {
+            continue;
+        }
+        const GraphDosage dosage = count_graph_dosage(steps);
+
+        std::string line;
+        line.reserve(128 + (node_features.size() + edge_features.size()) * 3);
+        line += std::to_string(bubble.id);
+        line.push_back('\t');
+        line += tsv_sanitize(meta.sample);
+        line.push_back('\t');
+        line += tsv_sanitize(meta.haplotype);
+        line.push_back('\t');
+        line += tsv_sanitize(meta.path_name);
+        for (const std::string& key : node_features) {
+            line.push_back('\t');
+            const auto it = dosage.node_counts.find(key);
+            line += (it == dosage.node_counts.end()) ? "0" : std::to_string(it->second);
+        }
+        for (const std::string& key : edge_features) {
+            line.push_back('\t');
+            const auto it = dosage.edge_counts.find(key);
+            line += (it == dosage.edge_counts.end()) ? "0" : std::to_string(it->second);
+        }
+        line.push_back('\n');
+        out.write(line);
+    }
+    out.close();
 }
 
 std::vector<std::string> sorted_nodes(const std::unordered_set<std::string>& nodes) {
@@ -928,6 +1179,9 @@ void write_params_json(const DescribeOptions& options, const std::string& path) 
         << "  \"syncmer_s\": " << effective_syncmer_s(options) << ",\n"
         << "  \"canonical_reverse_complement\": true,\n"
         << "  \"non_discriminative_kmers_removed\": true,\n"
+        << "  \"min_feature_paths\": " << options.min_feature_paths << ",\n"
+        << "  \"copy_number_features_exempt_from_min_paths\": true,\n"
+        << "  \"node_edge_dosage_tables\": true,\n"
         << "  \"node_provenance\": \"feature_map\",\n"
         << "  \"sparse_jsonl_tuple\": \"[feature_id,count]\",\n"
         << "  \"max_wide_features\": " << options.max_wide_features << ",\n"
@@ -949,6 +1203,8 @@ BubbleDescribeResult describe_one_bubble(
     result.feature_map_path = (bubble_dir / "kmer_features.tsv.gz").string();
     result.matrix_path = (bubble_dir / "kmer_matrix.tsv.gz").string();
     result.counts_jsonl_path = (bubble_dir / "kmer_counts.jsonl.gz").string();
+    result.graph_feature_map_path = (bubble_dir / "graph_features.tsv.gz").string();
+    result.graph_matrix_path = (bubble_dir / "graph_matrix.tsv.gz").string();
 
     std::unordered_map<std::uint64_t, KmerStats> stats;
     stats.reserve(4096);
@@ -966,11 +1222,15 @@ BubbleDescribeResult describe_one_bubble(
         result.matrix_path = ".";
         result.counts_jsonl_path = ".";
         result.matrix_reason = "skipped:no-paths";
+        result.graph_feature_map_path = ".";
+        result.graph_matrix_path = ".";
         return result;
     }
 
-    const std::vector<std::uint64_t> features = select_discriminative_features(stats, paths.size());
+    const std::vector<std::uint64_t> features =
+        select_discriminative_features(stats, paths.size(), options.min_feature_paths);
     result.features = features.size();
+    result.features_total = stats.size();
     const auto feature_id_by_code = make_feature_id_map(features);
 
     std::vector<std::unordered_set<std::string>> feature_nodes(features.size() + 1);
@@ -997,6 +1257,29 @@ BubbleDescribeResult describe_one_bubble(
     } else {
         result.matrix_path = ".";
         result.matrix_reason = "skipped:feature-cap";
+    }
+
+    // Node + edge dosage features (association substrate), keyed by the same
+    // graph coordinates as the k-mer node provenance.
+    std::map<std::string, GraphFeatureStat> node_stats;
+    std::map<std::string, GraphFeatureStat> edge_stats;
+    accumulate_graph_stats(graph, bubble, path_indexes, paths, node_stats, edge_stats);
+    const std::vector<std::string> node_features =
+        select_discriminative_graph_features(node_stats, paths.size(), options.min_feature_paths);
+    const std::vector<std::string> edge_features =
+        select_discriminative_graph_features(edge_stats, paths.size(), options.min_feature_paths);
+    result.node_features = node_features.size();
+    result.node_features_total = node_stats.size();
+    result.edge_features = edge_features.size();
+    result.edge_features_total = edge_stats.size();
+    write_graph_feature_map(
+        result.graph_feature_map_path, node_features, edge_features, node_stats, edge_stats, paths.size());
+    if (options.write_wide_matrix) {
+        write_graph_matrix(
+            result.graph_matrix_path, graph, bubble, path_indexes, paths, node_features, edge_features);
+        result.graph_matrix_written = true;
+    } else {
+        result.graph_matrix_path = ".";
     }
 
     return result;
@@ -1060,8 +1343,12 @@ void describe_kmers_from_graph(
         throw std::runtime_error("Failed to write describe index TSV: " + index_path);
     }
     index_out
-        << "bubble_id\tstatus\tpaths\tdiscriminative_features\tfeature_map_tsv_gz\t"
-        << "matrix_tsv_gz\tcounts_jsonl_gz\tmatrix_written\tmatrix_reason\n";
+        << "bubble_id\tstatus\tpaths\t"
+        << "kmer_candidates\tkmer_kept\tkmer_discarded\t"
+        << "feature_map_tsv_gz\tmatrix_tsv_gz\tcounts_jsonl_gz\tmatrix_written\tmatrix_reason\t"
+        << "node_candidates\tnode_kept\tnode_discarded\t"
+        << "edge_candidates\tedge_kept\tedge_discarded\t"
+        << "graph_features_tsv_gz\tgraph_matrix_tsv_gz\tgraph_matrix_written\n";
 
     DescribeSummary summary;
     summary.files_written = 2; // index + params
@@ -1079,10 +1366,18 @@ void describe_kmers_from_graph(
             ++summary.bubbles_with_paths;
             summary.paths_written += result.paths;
             summary.features_written += result.features;
+            summary.features_candidates += result.features_total;
             summary.jsonl_files_written += 1;
             summary.files_written += 2; // feature map + sparse JSONL
             if (result.matrix_written) {
                 summary.matrix_files_written += 1;
+                summary.files_written += 1;
+            }
+            summary.node_edge_features_written += result.node_features + result.edge_features;
+            summary.node_edge_candidates += result.node_features_total + result.edge_features_total;
+            summary.files_written += 1; // graph feature map
+            if (result.graph_matrix_written) {
+                summary.graph_matrix_files_written += 1;
                 summary.files_written += 1;
             }
         }
@@ -1091,12 +1386,23 @@ void describe_kmers_from_graph(
             << bubble.id << '\t'
             << result.status << '\t'
             << result.paths << '\t'
+            << result.features_total << '\t'
             << result.features << '\t'
+            << (result.features_total - result.features) << '\t'
             << result.feature_map_path << '\t'
             << result.matrix_path << '\t'
             << result.counts_jsonl_path << '\t'
             << (result.matrix_written ? "1" : "0") << '\t'
-            << result.matrix_reason << '\n';
+            << result.matrix_reason << '\t'
+            << result.node_features_total << '\t'
+            << result.node_features << '\t'
+            << (result.node_features_total - result.node_features) << '\t'
+            << result.edge_features_total << '\t'
+            << result.edge_features << '\t'
+            << (result.edge_features_total - result.edge_features) << '\t'
+            << result.graph_feature_map_path << '\t'
+            << result.graph_matrix_path << '\t'
+            << (result.graph_matrix_written ? "1" : "0") << '\n';
     }
 
     if (summary_out != nullptr) {
