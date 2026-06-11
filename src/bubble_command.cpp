@@ -136,9 +136,6 @@ int run_bubble_command(const std::vector<std::string>& args) {
         write_snarl_debug_tsv(snarl_debug_tsv_path, report.snarl_debug);
     }
 
-    std::size_t simple = 0;
-    std::size_t super = 0;
-    std::size_t insertion = 0;
     std::size_t inversion_signal_count = 0;
     std::size_t long_path_positive_count = 0;
     for (const auto& bubble : bubbles) {
@@ -147,17 +144,6 @@ int run_bubble_command(const std::vector<std::string>& args) {
         }
         if (bubble.long_path_support > 0) {
             ++long_path_positive_count;
-        }
-        switch (bubble.type) {
-            case BubbleType::Simple:
-                ++simple;
-                break;
-            case BubbleType::Insertion:
-                ++insertion;
-                break;
-            case BubbleType::Super:
-                ++super;
-                break;
         }
     }
 
@@ -169,9 +155,6 @@ int run_bubble_command(const std::vector<std::string>& args) {
         << "P/W paths loaded: " << graph.paths.size()
         << "\n"
         << "Bubbles called: " << bubbles.size() << "\n"
-        << "Bubble topology counts: simple=" << simple
-        << ", super=" << super
-        << ", insertion=" << insertion << "\n"
         << "Min variant bp: " << options.min_variant_bp << " (0 = disabled)\n"
         << "Min path support: " << options.min_path_support << " (0 = disabled)\n"
         << "Merge nearby bp: " << options.merge_nearby_bp << " (0 = disabled)\n"

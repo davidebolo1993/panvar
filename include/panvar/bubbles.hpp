@@ -9,22 +9,17 @@
 
 namespace panvar {
 
-enum class BubbleType {
-    Simple,
-    Super,
-    Insertion
-};
-
 struct Bubble {
     std::size_t id = 0;
     std::string source;
     std::string sink;
     std::vector<std::string> inside;
-    BubbleType type = BubbleType::Super;
     std::size_t path_support = 0;
     std::size_t min_inside_bp = 0;
     std::size_t max_inside_bp = 0;
+    // Supporting paths with inside span >= --min-variant-bp (drives the size filter).
     std::size_t long_path_support = 0;
+    // True when an internal node is seen in both orientations across supporting paths.
     bool inversion_signal = false;
 };
 
@@ -43,19 +38,14 @@ struct BubbleCallOptions {
 
 struct SnarlDebugEntry {
     std::size_t candidate_id = 0;
-    std::string mode;
     std::string source;
     std::string sink;
-    std::size_t component_handle_count = 0;
-    std::size_t component_node_count = 0;
-    std::size_t boundary_node_count = 0;
     std::size_t inside_node_count = 0;
     std::size_t n_paths = 0;
     std::size_t min_inside_bp = 0;
-    bool directed_acyclic_net_graph = false;
+    std::size_t long_path_support = 0;
+    bool inversion_signal = false;
     bool accepted = false;
-    std::string reason;
-    std::string boundary_nodes;
 };
 
 struct BubbleCallReport {
@@ -67,8 +57,6 @@ struct BubbleCallReport {
 
 BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions& options);
 std::vector<Bubble> call_bubbles(const Graph& graph, const BubbleCallOptions& options);
-
-std::string bubble_type_to_string(BubbleType type);
 
 std::unordered_set<std::string> nodes_in_bubble(const Bubble& bubble);
 

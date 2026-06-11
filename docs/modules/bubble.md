@@ -104,41 +104,28 @@ Current schema:
 - `max_inside_bp`
 - `inside_nodes`
 
-Compatibility:
 
-- readers still accept legacy columns (`site_mode`, `type`, `nesting_level`, `parent_id`, `long_path_support`, `inversion_signal`) when present; fields not used by current logic are ignored.
-
-Internal metrics (computed, not emitted in simplified CSV):
+The CSV stays minimal. Two extra per-bubble metrics are also computed — they drive the
+`--min-variant-bp` filter and are surfaced in the optional debug TSV:
 
 - `long_path_support`: count of supporting paths with inside span `>= --min-variant-bp`
-- `inversion_signal`: true when at least one internal node is observed in both orientations across supporting paths
+- `inversion_signal`: true when at least one internal node is observed in both orientations across
+  supporting paths (such a bubble is kept even when no path reaches `--min-variant-bp`)
 
 ## Debug TSV columns
 
-When `--snarl-debug-tsv` is enabled, each candidate row includes:
+When `--snarl-debug-tsv` is enabled, each snarl candidate becomes one row:
 
 - `candidate_id`: candidate index in scan order
 - `source`, `sink`: boundary nodes
 - `inside_node_count`: number of inferred internal nodes
 - `n_paths`: number of crossing paths
 - `min_inside_bp`: smallest internal bp span among crossing paths
-- `accepted`: `1` if kept after filters, else `0`
-- `reason`: acceptance/rejection reason (`accept:final`, `reject:min-variant-bp`, etc.)
+- `long_path_support`, `inversion_signal`: the two metrics above
+- `accepted`: `1` if the candidate is kept after all filters (and merging), else `0`
 
-Common `reason` values:
-
-- `accept:snarl-jsonl`: valid parsed snarl candidate before final filters
-- `accept:final`: candidate survives all enabled filters and merge handling
-- `accept:final-merged`: synthetic accepted row for a final merged bubble endpoint that did not exist as an original single snarl candidate
-- `reject:min-path-support`
-- `reject:min-variant-bp`
-- `reject:merged-nearby`: candidate survived base filters but was fused into a nearby merged bubble
-- `reject:filtered-out`: fallback when removed but no specific reason was recorded
-- parse/import rejects such as `reject:parse-start-end`, `reject:endpoint-not-in-graph`, `reject:empty-inside`, `reject:duplicate-endpoints-smaller-inside`
-
-## CLI summary terms
-
-- `simple|super|insertion`: topology labels computed on retained bubbles for summary only
+Final bubbles produced by `--merge-nearby-bp` have no original candidate row, so one extra
+`accepted=1` row is appended for each.
 
 ## Example
 
@@ -157,17 +144,3 @@ Bandage node colors provide context and retained calls:
 - blue: nodes in non-SNP candidate bubbles (pre-filter context)
 - red: nodes in retained output bubbles (`*.bubbles.csv`)
 
-For clustering behavior details and usage modes, see:
-
-- `docs/modules/allele.md`
-
-## Module handoff
-
-Use bubble output as input to module 2/3:
-
-- `panvar allele --bubble-prefix-in <prefix>`
-- `panvar call --bubble-prefix-in <prefix>`
-
-Equivalent explicit-file form (module 3 only):
-
-- `panvar call --bubbles-csv-in <prefix>.bubbles.csv`

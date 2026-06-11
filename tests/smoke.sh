@@ -103,10 +103,24 @@ fi
 test -s "$PANPHORTE_PREFIX.normalized.gfa"
 test -s "$PANPHORTE_PREFIX.panphorte.report.tsv"
 test -s "$CALL_PREFIX.region.vcf"
+test -s "$CALL_PREFIX.variant_paths.tsv"
+test -s "$CALL_PREFIX.node_track.tsv"
 
-# Optional: validate the VCF parses.
+# The region VCF must be coordinate-sorted (POS non-decreasing) and have unique IDs.
+awk -F '\t' '!/^#/ { if ($2 < prev) { print "VCF not sorted at " $2 " < " prev > "/dev/stderr"; exit 1 } prev=$2 }' \
+  "$CALL_PREFIX.region.vcf"
+if awk -F '\t' '!/^#/ { print $3 }' "$CALL_PREFIX.region.vcf" | sort | uniq -d | grep -q .; then
+  echo "error: duplicate VCF IDs in $CALL_PREFIX.region.vcf" >&2
+  exit 1
+fi
+
+# Optional: validate the VCF parses and is bgzip/tabix-indexable.
 if [[ -n "$BCFTOOLS_BIN" ]]; then
   "$BCFTOOLS_BIN" view "$CALL_PREFIX.region.vcf" >/dev/null
+fi
+if command -v bgzip >/dev/null && command -v tabix >/dev/null; then
+  bgzip -f -c "$CALL_PREFIX.region.vcf" > "$CALL_PREFIX.region.vcf.gz"
+  tabix -f -p vcf "$CALL_PREFIX.region.vcf.gz"
 fi
 
 echo "smoke: OK"

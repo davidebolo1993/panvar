@@ -89,10 +89,16 @@ On the bundled data (threaded, ~1 min/locus):
 - **C4** collapses to the **32738 bp (long) RCCX** unit. At `--min-similarity 0.90` only the long
   modules align (43 haps × 2–3). Lowering to **0.70** pulls the **short** modules into the same REP
   (they align across the HERV-K indel), giving **114 haps** (98 × 2, 16 × 3) — the 98 × 2 tracks the
-  `chr6_…plot.bed.gz` count of ~98 haplotypes with two C4A+C4B modules. Note the long/short (and
-  C4A/C4B) distinction is **not preserved**: every copy is canonicalized to the long-unit sequence.
-  Separating long vs short per copy would require splitting the unit into a core + HERV node (light
-  node-splitting from the long-vs-short alignment gap), which is not done here.
+  `c4.bed` count of ~98 haplotypes with two C4A+C4B modules. Validated against `c4.bed` with
+  `scripts/compare_c4_copy_number.py`: total copy number matches **114/114** of the normalised
+  haplotypes (and **131/131 within ±1** across all haplotypes via the DUP record — the only gap is the
+  17 single-copy haplotypes, which are not tandems and so are never normalised).
+- The long/short split **is** recovered, without node-splitting: although every copy is canonicalized
+  to the long-unit *sequence*, the `region_bp` each copy actually spanned is preserved, so a copy that
+  traversed substantially fewer bases than the long unit (`< 0.90 ×` unit) carries the HERV-K-sized
+  internal deletion and is the **short** form. `copies.tsv` reports this per haplotype as
+  `n_long`/`n_short`, which matches `c4.bed`'s long/short composition **114/114** on C4. (LPA KIV-2 is
+  a single length class, so every row is `n_short=0`.)
 
 **Limitation:** the unit must occur as `>= 2` **adjacent** identical copies in at least one haplotype
 to be seeded. Once seeded, copies in any haplotype may be non-adjacent / divergent.
@@ -108,9 +114,11 @@ to be seeded. Once seeded, copies in any haplotype may be non-adjacent / diverge
     `nodes_collapsed`
 - `<prefix>.panphorte.copies.tsv` (approximate mode), one row per (haplotype, collapsed array) —
   the provenance for downstream calling: `path_name, sample, bubble_id, copies, unit_bp, orientations,
-  mean_identity, region_bp, from_node, to_node`. Reads as "in this haplotype, original walk nodes
-  `from_node..to_node` (`region_bp` bp) collapsed into the unit looped `copies` times (orientation
-  pattern `orientations`, mean alignment identity `mean_identity`)".
+  mean_identity, region_bp, from_node, to_node, n_long, n_short`. Reads as "in this haplotype, original
+  walk nodes `from_node..to_node` (`region_bp` bp) collapsed into the unit looped `copies` times
+  (orientation pattern `orientations`, mean alignment identity `mean_identity`)". `n_long`/`n_short`
+  split those `copies` by per-copy length: a copy spanning `< 0.90 ×` the (long) unit is `short`
+  (carries a large internal deletion such as the C4 short-module HERV-K gap); `n_long + n_short = copies`.
 - Run summary on stdout: bubbles seen / normalized, paths rewritten, nodes removed / added, edges
   added.
 

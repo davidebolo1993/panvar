@@ -31,6 +31,9 @@ void print_call_help() {
         << "      --merge-distance-bp <N>      Coalesce nearby same-type events within a bubble (default: 100)\n"
         << "      --merge-jaccard <X>          Cross-haplotype node-set Jaccard to merge events (default: 0.80)\n"
         << "      --merge-seq-identity <X>     Cross-haplotype event-sequence identity to merge (default: 0.80)\n"
+        << "      --merge-size-ratio <X>       Length-ratio floor for the sequence merge; lower to merge\n"
+        << "                                   same-locus events of different sizes, e.g. STR alleles\n"
+        << "                                   (default: 0 = use --merge-seq-identity)\n"
         << "      --min-haplotypes <N>         Drop records carried by fewer than N haplotypes (default: 1)\n"
         << "      --rescue-min-bp <N>          Floor for sub-threshold events kept for rescue (default: min-sv-bp/2)\n"
         << "      --classify-ins               Refine INS subtype NOVEL/DUP with minimap2\n"
@@ -39,6 +42,7 @@ void print_call_help() {
         << "      --ins-dup-min-identity <X>   Identity for an INS to be subtyped DUP (default: 0.90)\n"
         << "      --bubble-id <N>              Restrict to one bubble ID (repeatable)\n"
         << "      --no-per-bubble-vcf          Only write the concatenated region VCF\n"
+        << "      --no-variant-paths           Skip the variant_paths.tsv + node_track.tsv sidecars\n"
         << "      --quiet                      Disable progress logs\n"
         << "  -h, --help                       Show this help\n";
 }
@@ -100,6 +104,10 @@ int run_call_command(const std::vector<std::string>& args) {
             options.merge_seq_identity = cli::parse_unit_fraction_arg(arg, require_value(arg));
             continue;
         }
+        if (arg == "--merge-size-ratio") {
+            options.merge_size_ratio = cli::parse_unit_fraction_arg(arg, require_value(arg));
+            continue;
+        }
         if (arg == "--min-haplotypes") {
             options.min_haplotypes = cli::parse_size_arg(arg, require_value(arg));
             continue;
@@ -137,6 +145,10 @@ int run_call_command(const std::vector<std::string>& args) {
         }
         if (arg == "--no-per-bubble-vcf") {
             options.write_per_bubble_vcf = false;
+            continue;
+        }
+        if (arg == "--no-variant-paths") {
+            options.write_variant_paths = false;
             continue;
         }
         if (arg == "--quiet") {

@@ -19,3 +19,5 @@ tests/real_data/gstm1*
 !tests/results/.gitkeep
 
 c4
+lpa
+gstm1

@@ -81,19 +81,6 @@ void ensure_parent_dir(const std::string& output_path) {
     }
 }
 
-BubbleType parse_bubble_type_field(const std::string& value) {
-    if (value == "simple") {
-        return BubbleType::Simple;
-    }
-    if (value == "insertion") {
-        return BubbleType::Insertion;
-    }
-    if (value == "super") {
-        return BubbleType::Super;
-    }
-    throw std::runtime_error("Invalid bubble type in CSV: " + value);
-}
-
 std::size_t required_column(
     const std::unordered_map<std::string, std::size_t>& index_by_name,
     const std::string& name) {
@@ -170,7 +157,6 @@ std::vector<Bubble> read_bubbles_csv(const std::string& input_path) {
     const std::size_t idx_id = required_column(index_by_name, "bubble_id");
     const std::size_t idx_source = required_column(index_by_name, "source");
     const std::size_t idx_sink = required_column(index_by_name, "sink");
-    const auto idx_type = optional_column(index_by_name, "type");
     const std::size_t idx_path_support = required_column(index_by_name, "path_support");
     const std::size_t idx_min_bp = required_column(index_by_name, "min_inside_bp");
     const std::size_t idx_max_bp = required_column(index_by_name, "max_inside_bp");
@@ -203,11 +189,6 @@ std::vector<Bubble> read_bubbles_csv(const std::string& input_path) {
         bubble.id = parse_size_field(require_field(idx_id, "bubble_id"), "bubble_id");
         bubble.source = require_field(idx_source, "source");
         bubble.sink = require_field(idx_sink, "sink");
-        if (idx_type.has_value()) {
-            bubble.type = parse_bubble_type_field(require_field(*idx_type, "type"));
-        } else {
-            bubble.type = BubbleType::Super;
-        }
         bubble.path_support = parse_size_field(require_field(idx_path_support, "path_support"), "path_support");
         bubble.min_inside_bp = parse_size_field(require_field(idx_min_bp, "min_inside_bp"), "min_inside_bp");
         bubble.max_inside_bp = parse_size_field(require_field(idx_max_bp, "max_inside_bp"), "max_inside_bp");
@@ -316,7 +297,8 @@ void write_snarl_debug_tsv(
         throw std::runtime_error("Failed to write snarl debug TSV: " + output_path);
     }
 
-    out << "candidate_id\tsource\tsink\tinside_node_count\tn_paths\tmin_inside_bp\taccepted\treason\n";
+    out << "candidate_id\tsource\tsink\tinside_node_count\tn_paths\tmin_inside_bp\t"
+        << "long_path_support\tinversion_signal\taccepted\n";
 
     for (const auto& e : entries) {
         out << e.candidate_id << '\t'
@@ -325,8 +307,9 @@ void write_snarl_debug_tsv(
             << e.inside_node_count << '\t'
             << e.n_paths << '\t'
             << e.min_inside_bp << '\t'
-            << (e.accepted ? 1 : 0) << '\t'
-            << e.reason << '\n';
+            << e.long_path_support << '\t'
+            << (e.inversion_signal ? 1 : 0) << '\t'
+            << (e.accepted ? 1 : 0) << '\n';
     }
 }
 

@@ -13,6 +13,7 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -130,20 +131,25 @@ bool is_inversion(const std::vector<const Tok*>& ref_blk, const std::vector<cons
     return true;
 }
 
-// Global node-token alignment (diagonal only on equal tokens; else gaps), then
-// read off DEL/INS/INV events of the haplotype relative to the reference. DUP/CN
-// is handled separately (count-based), so CN nodes are already excluded from R/H.
-std::vector<Event> diff_walks(
+// Align one sub-range R[r0,r1) vs H[h0,h1) with the node-token DP (diagonal only on
+// equal tokens; else gaps) and append the DEL/INS/INV events to `events`.
+// `preceding_ref_node` anchors an INS that opens the segment (the last matched ref
+// node before it). Bounded by kAlignCellCap; segments between shared anchors are small.
+void diff_segment(
     const Graph& graph,
-    const std::vector<Tok>& R,
-    const std::vector<Tok>& H,
-    const std::string& bubble_source) {
+    const std::vector<Tok>& R, std::size_t r0, std::size_t r1,
+    const std::vector<Tok>& H, std::size_t h0, std::size_t h1,
+    const std::string& preceding_ref_node,
+    std::vector<Event>& events) {
 
-    std::vector<Event> events;
-    const std::size_t m = R.size();
-    const std::size_t n = H.size();
-    if (static_cast<std::size_t>(m) * static_cast<std::size_t>(n) > kAlignCellCap) {
-        return events; // pathologically large bubble; skip (intended input is normalized)
+    const std::size_t m = r1 - r0;
+    const std::size_t n = h1 - h0;
+    if (m == 0 && n == 0) return;
+    if (m * n > kAlignCellCap) {
+        if (std::getenv("PANVAR_CALL_DEBUG")) {
+            std::cerr << "[diff] SKIP segment m=" << m << " n=" << n << " (cap " << kAlignCellCap << ")\n";
+        }
+        return; // unanchored divergent block too large to align; skip
     }
 
     // DP: match (+2) only when tokens equal, gaps (-1). Mismatch diagonals forbidden
@@ -156,26 +162,27 @@ std::vector<Event> diff_walks(
     for (std::size_t j = 1; j <= n; ++j) dp[0][j] = static_cast<int>(j) * kGap;
     for (std::size_t i = 1; i <= m; ++i) {
         for (std::size_t j = 1; j <= n; ++j) {
-            const int diag = (R[i - 1].token == H[j - 1].token) ? dp[i - 1][j - 1] + kMatch : kNeg;
+            const int diag = (R[r0 + i - 1].token == H[h0 + j - 1].token) ? dp[i - 1][j - 1] + kMatch : kNeg;
             const int up = dp[i - 1][j] + kGap;
             const int left = dp[i][j - 1] + kGap;
             dp[i][j] = std::max(diag, std::max(up, left));
         }
     }
 
-    // Traceback into columns (ri, hi); -1 means a gap on that side.
+    // Traceback into columns (ri, hi) into R/H absolute indices; -1 means a gap on that side.
     struct Col { long long ri; long long hi; };
     std::vector<Col> cols;
     std::size_t i = m, j = n;
     while (i > 0 || j > 0) {
-        if (i > 0 && j > 0 && R[i - 1].token == H[j - 1].token && dp[i][j] == dp[i - 1][j - 1] + kMatch) {
-            cols.push_back({static_cast<long long>(i - 1), static_cast<long long>(j - 1)});
+        if (i > 0 && j > 0 && R[r0 + i - 1].token == H[h0 + j - 1].token &&
+            dp[i][j] == dp[i - 1][j - 1] + kMatch) {
+            cols.push_back({static_cast<long long>(r0 + i - 1), static_cast<long long>(h0 + j - 1)});
             --i; --j;
         } else if (i > 0 && dp[i][j] == dp[i - 1][j] + kGap) {
-            cols.push_back({static_cast<long long>(i - 1), -1});
+            cols.push_back({static_cast<long long>(r0 + i - 1), -1});
             --i;
         } else {
-            cols.push_back({-1, static_cast<long long>(j - 1)});
+            cols.push_back({-1, static_cast<long long>(h0 + j - 1)});
             --j;
         }
     }
@@ -183,7 +190,7 @@ std::vector<Event> diff_walks(
 
     // Emit events from maximal gap blocks -> DEL / INS / INV. Track the last matched
     // ref node as the anchor for an INS that follows it.
-    std::string last_ref_node = bubble_source;
+    std::string last_ref_node = preceding_ref_node;
     auto flush_block = [&](std::vector<const Tok*>& ref_blk, std::vector<const Tok*>& hap_blk) {
         if (ref_blk.empty() && hap_blk.empty()) return;
         if (!ref_blk.empty() && !hap_blk.empty() && is_inversion(ref_blk, hap_blk)) {
@@ -245,6 +252,87 @@ std::vector<Event> diff_walks(
         }
     }
     flush_block(ref_blk, hap_blk);
+}
+
+// Read off DEL/INS/INV events of the haplotype vs the reference. To scale to large
+// bubbles (e.g. a 2500-node gene-presence bubble), the two walks are first split at
+// shared **anchor** tokens (nodes appearing exactly once in both walks, chained in a
+// common monotonic order); the quadratic DP then runs only within the small segments
+// between anchors. This bounds cost, removes the whole-bubble cap, and gives consistent
+// breakpoints so the same large event (e.g. a gene deletion) is identical across
+// haplotypes and merges cleanly. DUP/CN is handled separately (CN nodes already excluded).
+std::vector<Event> diff_walks(
+    const Graph& graph,
+    const std::vector<Tok>& R,
+    const std::vector<Tok>& H,
+    const std::string& bubble_source) {
+
+    std::vector<Event> events;
+    const std::size_t m = R.size();
+    const std::size_t n = H.size();
+
+    // Tokens unique within R and within H are anchor candidates.
+    std::unordered_map<std::uint64_t, std::size_t> r_count, h_count;
+    std::unordered_map<std::uint64_t, std::size_t> r_pos, h_pos;
+    for (std::size_t i = 0; i < m; ++i) { ++r_count[R[i].token]; r_pos[R[i].token] = i; }
+    for (std::size_t j = 0; j < n; ++j) { ++h_count[H[j].token]; h_pos[H[j].token] = j; }
+
+    // Candidate anchors ordered by reference index; chain a monotonic subsequence on
+    // the haplotype index (LIS) so anchors are consistent in both walks.
+    std::vector<std::pair<std::size_t, std::size_t>> cand; // (ref_idx, hap_idx)
+    for (std::size_t i = 0; i < m; ++i) {
+        const std::uint64_t tok = R[i].token;
+        if (r_count[tok] == 1) {
+            const auto it = h_count.find(tok);
+            if (it != h_count.end() && it->second == 1) {
+                cand.emplace_back(i, h_pos[tok]);
+            }
+        }
+    }
+    // LIS on hap index (strictly increasing) over cand (already sorted by ref index).
+    std::vector<std::size_t> chain_ref, chain_hap;
+    {
+        std::vector<std::size_t> tails;       // tails[k] = index into cand of smallest tail of an LIS of length k+1
+        std::vector<long long> prev(cand.size(), -1);
+        std::vector<std::size_t> tail_at;     // parallel hap value for binary search
+        for (std::size_t c = 0; c < cand.size(); ++c) {
+            const std::size_t hv = cand[c].second;
+            auto pos = std::lower_bound(tail_at.begin(), tail_at.end(), hv);
+            const std::size_t k = static_cast<std::size_t>(pos - tail_at.begin());
+            if (k > 0) prev[c] = static_cast<long long>(tails[k - 1]);
+            if (pos == tail_at.end()) { tails.push_back(c); tail_at.push_back(hv); }
+            else { tails[k] = c; tail_at[k] = hv; }
+        }
+        if (!tails.empty()) {
+            long long cur = static_cast<long long>(tails.back());
+            while (cur >= 0) {
+                chain_ref.push_back(cand[static_cast<std::size_t>(cur)].first);
+                chain_hap.push_back(cand[static_cast<std::size_t>(cur)].second);
+                cur = prev[static_cast<std::size_t>(cur)];
+            }
+            std::reverse(chain_ref.begin(), chain_ref.end());
+            std::reverse(chain_hap.begin(), chain_hap.end());
+        }
+    }
+
+    if (std::getenv("PANVAR_CALL_DEBUG")) {
+        std::cerr << "[diff] m=" << m << " n=" << n << " anchors=" << chain_ref.size() << "\n";
+    }
+
+    // Walk the anchor chain, aligning each inter-anchor segment independently. The
+    // anchor itself is a match (resets the INS anchor to that ref node).
+    std::size_t r_prev = 0, h_prev = 0;
+    std::string preceding_ref = bubble_source;
+    for (std::size_t a = 0; a <= chain_ref.size(); ++a) {
+        const std::size_t r_end = (a < chain_ref.size()) ? chain_ref[a] : m;
+        const std::size_t h_end = (a < chain_hap.size()) ? chain_hap[a] : n;
+        diff_segment(graph, R, r_prev, r_end, H, h_prev, h_end, preceding_ref, events);
+        if (a < chain_ref.size()) {
+            preceding_ref = R[r_end].node_id; // the anchor node
+            r_prev = r_end + 1;
+            h_prev = h_end + 1;
+        }
+    }
     return events;
 }
 
@@ -327,12 +415,15 @@ double weighted_jaccard(
 }
 
 // Banded alignment identity between two event sequences, gated on a length ratio
-// (so wildly different sizes are not compared). 0 when either is empty.
-double seq_identity(const std::string& a, const std::string& b, double min_id) {
+// (so wildly different sizes are not compared). `len_ratio` is the minimum
+// shorter/longer length ratio to even attempt the comparison; decoupling it from the
+// identity threshold lets the caller merge same-motif events of very different sizes
+// (e.g. STR alleles) when `--merge-size-ratio` is lowered. 0 when either is empty.
+double seq_identity(const std::string& a, const std::string& b, double min_id, double len_ratio) {
     if (a.empty() || b.empty()) return 0.0;
     const std::size_t lo = std::min(a.size(), b.size());
     const std::size_t hi = std::max(a.size(), b.size());
-    if (static_cast<double>(lo) < min_id * static_cast<double>(hi)) return 0.0;
+    if (static_cast<double>(lo) < len_ratio * static_cast<double>(hi)) return 0.0;
     const std::string& shorter = a.size() <= b.size() ? a : b;
     const std::string& longer = a.size() <= b.size() ? b : a;
     const std::size_t band = std::max<std::size_t>(
@@ -347,6 +438,8 @@ struct MergedRecord {
     std::vector<std::string> carriers;                      // haplotype path names with GT=1
     std::unordered_set<std::size_t> member_alleles;         // allele indices already merged in
     std::unordered_map<std::string, std::size_t> sample_cn; // DUP per-sample copy number
+    std::size_t min_size_bp = 0;                            // smallest merged member size (SVLEN_RANGE)
+    std::size_t max_size_bp = 0;                            // largest merged member size
 };
 
 std::string upper_base(char c) {
@@ -406,6 +499,7 @@ void call_variants(
         out << "##INFO=<ID=END,Number=1,Type=Integer,Description=\"End position of the variant\">\n";
         out << "##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"Structural variant type\">\n";
         out << "##INFO=<ID=SVLEN,Number=1,Type=Integer,Description=\"Length difference ALT-REF\">\n";
+        out << "##INFO=<ID=SVLEN_RANGE,Number=2,Type=Integer,Description=\"Min,max event size among merged members (when they differ)\">\n";
         out << "##INFO=<ID=BUBBLE_ID,Number=1,Type=Integer,Description=\"panvar bubble identifier\">\n";
         out << "##INFO=<ID=START_NODE,Number=1,Type=String,Description=\"First graph node of the event\">\n";
         out << "##INFO=<ID=END_NODE,Number=1,Type=String,Description=\"Last graph node of the event\">\n";
@@ -428,11 +522,19 @@ void call_variants(
         out << '\n';
     };
 
-    std::ofstream region_out(options.out_prefix + ".region.vcf");
-    if (!region_out) {
-        throw std::runtime_error("Failed to write region VCF: " + options.out_prefix + ".region.vcf");
-    }
-    write_vcf_header(region_out);
+    // Records are buffered and coordinate-sorted before writing, so the region VCF (and
+    // per-bubble VCFs) are sorted and bgzip/tabix/bcftools-indexable.
+    struct OutRecord {
+        std::size_t pos = 0;
+        std::size_t end = 0;
+        std::size_t bubble_id = 0;
+        std::string id;
+        std::string line;                       // full VCF row (with trailing newline)
+        std::vector<std::string> prov_lines;    // variant_paths.tsv rows for this record
+    };
+    std::vector<OutRecord> out_records;
+    std::unordered_map<std::string, int> id_counts; // disambiguate colliding variant IDs
+    std::vector<std::string> node_track_rows;        // <prefix>.node_track.tsv body (plotting x-axis)
 
     VariantCallSummary summary;
 
@@ -511,6 +613,35 @@ void call_variants(
 
         std::vector<MergedRecord> merged;
         const std::unordered_map<std::string, std::size_t> ref_node_pos = build_ref_node_pos(bubble);
+
+        // ---- node_track.tsv: the per-bubble x-axis for plot_sv_map.R. Every inside node of
+        // the bubble (same set + order as the inspect node_counts columns), ordered by
+        // **numeric node id** — which is the reference order, since the graph was odgi-sorted
+        // along the reference path. Carries each node's bp length + reference/CN flags.
+        {
+            std::vector<std::string> ids(bubble.inside.begin(), bubble.inside.end());
+            auto numeric_less = [](const std::string& a, const std::string& b) {
+                const bool an = !a.empty() && std::all_of(a.begin(), a.end(), [](unsigned char c){ return std::isdigit(c); });
+                const bool bn = !b.empty() && std::all_of(b.begin(), b.end(), [](unsigned char c){ return std::isdigit(c); });
+                if (an && bn) { if (a.size() != b.size()) return a.size() < b.size(); return a < b; }
+                return a < b;
+            };
+            std::sort(ids.begin(), ids.end(), numeric_less);
+            for (std::size_t ord = 0; ord < ids.size(); ++ord) {
+                const std::string& id = ids[ord];
+                const bool in_ref = ref_count.count(id) != 0;
+                std::string gpos;
+                if (in_ref) {
+                    const auto pit = ref_node_pos.find(id);
+                    if (pit != ref_node_pos.end()) gpos = std::to_string(pit->second);
+                }
+                node_track_rows.push_back(
+                    std::to_string(bubble.id) + '\t' + std::to_string(ord) + '\t' + id + '\t' +
+                    std::to_string(node_len(graph, id)) + '\t' + gpos + '\t' +
+                    (in_ref ? "1" : "0") + '\t' + (cn_nodes.count(id) ? "1" : "0"));
+            }
+        }
+
         const std::size_t rescue_floor =
             options.rescue_min_bp != 0 ? options.rescue_min_bp : std::max<std::size_t>(1, options.min_sv_bp / 2);
 
@@ -527,12 +658,19 @@ void call_variants(
             if (a.ref_pos == 0 || b.ref_pos == 0) {
                 // fall back to node/seq only when no coordinate
             } else {
+                // Position window scales with event size: a large insertion/deletion can
+                // attach at a fuzzy breakpoint that varies by kilobases across haplotypes,
+                // yet still be the same event. The sequence/Jaccard gate below keeps this
+                // from over-merging genuinely distinct events at nearby positions.
+                const long long window = static_cast<long long>(options.merge_distance_bp) +
+                    static_cast<long long>(std::min(a.size_bp, b.size_bp));
                 const long long d = static_cast<long long>(a.ref_pos) - static_cast<long long>(b.ref_pos);
-                if (d > static_cast<long long>(options.merge_distance_bp) ||
-                    d < -static_cast<long long>(options.merge_distance_bp)) return false;
+                if (d > window || d < -window) return false;
             }
             if (weighted_jaccard(graph, a.nodes, b.nodes) >= options.merge_jaccard) return true;
-            return seq_identity(a.seq, b.seq, options.merge_seq_identity) >= options.merge_seq_identity;
+            const double len_ratio =
+                options.merge_size_ratio > 0.0 ? options.merge_size_ratio : options.merge_seq_identity;
+            return seq_identity(a.seq, b.seq, options.merge_seq_identity, len_ratio) >= options.merge_seq_identity;
         };
 
         // ---- DUP/CN events: count self-loop traversals per allele vs reference. Merge
@@ -595,6 +733,8 @@ void call_variants(
                 if (grp == nullptr) {
                     MergedRecord mr;
                     mr.seed = e;
+                    mr.min_size_bp = e.size_bp;
+                    mr.max_size_bp = e.size_bp;
                     mr.member_alleles.insert(ai);
                     for (const std::string& m : alleles[ai].members) mr.carriers.push_back(m);
                     merged.push_back(std::move(mr));
@@ -604,6 +744,8 @@ void call_variants(
                         grp->seed = e; // largest member represents the record
                         if (grp->seed.link_id.empty()) grp->seed.link_id = keep_link;
                     }
+                    grp->min_size_bp = std::min(grp->min_size_bp, e.size_bp);
+                    grp->max_size_bp = std::max(grp->max_size_bp, e.size_bp);
                     if (grp->member_alleles.insert(ai).second) {
                         for (const std::string& m : alleles[ai].members) grp->carriers.push_back(m);
                     }
@@ -620,6 +762,8 @@ void call_variants(
                 for (const Event& e : allele_events[ai]) {
                     if (events_match(mr.seed, e)) {
                         mr.member_alleles.insert(ai);
+                        mr.min_size_bp = std::min(mr.min_size_bp, e.size_bp);
+                        mr.max_size_bp = std::max(mr.max_size_bp, e.size_bp);
                         for (const std::string& m : alleles[ai].members) mr.carriers.push_back(m);
                         break;
                     }
@@ -661,14 +805,45 @@ void call_variants(
         if (merged.empty()) continue;
         ++summary.bubbles_with_calls;
 
-        // Emit VCF rows for this bubble (and append to the region VCF).
-        std::ofstream bubble_out;
-        if (options.write_per_bubble_vcf) {
-            const std::string path = options.out_prefix + ".bubble_" + std::to_string(bubble.id) + ".vcf";
-            bubble_out.open(path);
-            if (!bubble_out) throw std::runtime_error("Failed to write bubble VCF: " + path);
-            write_vcf_header(bubble_out);
+        // Map each sample to its allele (for per-carrier sub-walk provenance).
+        std::unordered_map<std::string, std::size_t> sample_to_allele;
+        for (std::size_t ai = 0; ai < alleles.size(); ++ai) {
+            for (const std::string& m : alleles[ai].members) sample_to_allele[m] = ai;
         }
+        // A carrier's realized sub-walk through the event: its canonical bubble steps
+        // between the reference node flanking the event upstream and the first reference
+        // node past the event end, as a GFA-style >node / <node string.
+        auto carrier_subwalk = [&](const std::vector<PathStep>& steps,
+                                   std::size_t epos, std::size_t eend) -> std::string {
+            long long up = -1;
+            for (std::size_t i = 0; i < steps.size(); ++i) {
+                const auto it = ref_node_pos.find(steps[i].node_id);
+                if (it != ref_node_pos.end() && static_cast<long long>(it->second) <= static_cast<long long>(epos)) {
+                    up = static_cast<long long>(i);
+                }
+            }
+            long long down = -1;
+            for (std::size_t i = static_cast<std::size_t>(up < 0 ? 0 : up + 1); i < steps.size(); ++i) {
+                const auto it = ref_node_pos.find(steps[i].node_id);
+                if (it != ref_node_pos.end() && static_cast<long long>(it->second) >= static_cast<long long>(eend)) {
+                    down = static_cast<long long>(i);
+                    break;
+                }
+            }
+            const std::size_t lo = up >= 0 ? static_cast<std::size_t>(up) : 0;
+            std::size_t hi = down >= 0 ? static_cast<std::size_t>(down)
+                                       : (steps.empty() ? 0 : steps.size() - 1);
+            if (hi < lo) hi = lo;
+            std::string out;
+            std::size_t emitted = 0;
+            for (std::size_t i = lo; i <= hi && i < steps.size(); ++i) {
+                if (emitted >= 2000) { out += "..."; break; }
+                out += steps[i].reverse ? '<' : '>';
+                out += steps[i].node_id;
+                ++emitted;
+            }
+            return out;
+        };
 
         for (const MergedRecord& mr : merged) {
             const Event& e = mr.seed;
@@ -701,15 +876,49 @@ void call_variants(
                 end = pos + node_len(graph, e.nodes.empty() ? std::string() : e.nodes.front());
             }
 
+            // Ordered, deduplicated event node set: reference nodes by genomic position,
+            // haplotype-only nodes kept in representative-walk order after them. This gives
+            // a readable START->END progression instead of the raw merge order.
+            std::vector<std::string> ev_nodes;
+            {
+                std::unordered_set<std::string> seen;
+                std::vector<std::pair<long long, std::string>> keyed;
+                for (std::size_t k = 0; k < e.nodes.size(); ++k) {
+                    const std::string& nd = e.nodes[k];
+                    if (!seen.insert(nd).second) continue;
+                    const auto it = ref_node_pos.find(nd);
+                    const long long key = it != ref_node_pos.end()
+                        ? static_cast<long long>(it->second)
+                        : (1LL << 60) + static_cast<long long>(k);
+                    keyed.emplace_back(key, nd);
+                }
+                std::stable_sort(keyed.begin(), keyed.end(),
+                                 [](const auto& a, const auto& b) { return a.first < b.first; });
+                for (auto& p : keyed) ev_nodes.push_back(p.second);
+            }
+            const std::string start_node = ev_nodes.empty() ? e.start_node : ev_nodes.front();
+            const std::string end_node = ev_nodes.empty() ? e.end_node : ev_nodes.back();
+
             std::unordered_set<std::string> carrier_set(mr.carriers.begin(), mr.carriers.end());
 
+            // Unique variant id.
+            const std::string base_id = "bubble" + std::to_string(bubble.id) + "_" + svt + "_" + start_node;
+            const int seen_n = ++id_counts[base_id];
+            const std::string id = seen_n == 1 ? base_id : base_id + "_" + std::to_string(seen_n);
+
             std::ostringstream info;
-            info << "END=" << end << ";SVTYPE=" << svt << ";SVLEN=" << svlen
-                 << ";BUBBLE_ID=" << bubble.id
-                 << ";START_NODE=" << e.start_node << ";END_NODE=" << e.end_node
+            info << "END=" << end << ";SVTYPE=" << svt << ";SVLEN=" << svlen;
+            if (e.type != EvType::Dup && mr.min_size_bp != mr.max_size_bp) {
+                const long long sign = svlen < 0 ? -1 : 1;
+                const long long a = sign * static_cast<long long>(mr.min_size_bp);
+                const long long b = sign * static_cast<long long>(mr.max_size_bp);
+                info << ";SVLEN_RANGE=" << std::min(a, b) << "," << std::max(a, b);
+            }
+            info << ";BUBBLE_ID=" << bubble.id
+                 << ";START_NODE=" << start_node << ";END_NODE=" << end_node
                  << ";NMERGED=" << carrier_set.size();
             info << ";EVENT_NODES=";
-            for (std::size_t k = 0; k < e.nodes.size(); ++k) { if (k) info << ','; info << e.nodes[k]; }
+            for (std::size_t k = 0; k < ev_nodes.size(); ++k) { if (k) info << ','; info << ev_nodes[k]; }
             if (!e.link_id.empty()) info << ";EVENTID=bubble" << bubble.id << "_" << e.link_id;
             if (e.type == EvType::Dup) info << ";REF_CN=" << e.ref_cn;
             if (e.type == EvType::Ins && !e.ins_subtype.empty()) info << ";INS_SUBTYPE=" << e.ins_subtype;
@@ -718,8 +927,6 @@ void call_variants(
                 else if (e.type == EvType::Del) info << ";DELSEQ=" << e.seq;
                 else if (e.type == EvType::Inv) info << ";INVSEQ=" << e.seq;
             }
-
-            const std::string id = "bubble" + std::to_string(bubble.id) + "_" + svt + "_" + e.start_node;
 
             std::ostringstream row;
             row << ref_meta.chrom << '\t' << pos << '\t' << id << '\t' << ref_base
@@ -737,8 +944,25 @@ void call_variants(
                 }
             }
             row << '\n';
-            region_out << row.str();
-            if (options.write_per_bubble_vcf) bubble_out << row.str();
+
+            OutRecord rec;
+            rec.pos = pos;
+            rec.end = end;
+            rec.bubble_id = bubble.id;
+            rec.id = id;
+            rec.line = row.str();
+            if (options.write_variant_paths) {
+                for (const std::string& s : mr.carriers) {
+                    const auto sit = sample_to_allele.find(s);
+                    std::string walk;
+                    if (sit != sample_to_allele.end()) {
+                        walk = carrier_subwalk(alleles[sit->second].steps, pos, end);
+                    }
+                    rec.prov_lines.push_back(
+                        id + '\t' + std::to_string(bubble.id) + '\t' + svt + '\t' + s + "\t1\t" + walk);
+                }
+            }
+            out_records.push_back(std::move(rec));
 
             ++summary.records_written;
             if (e.type == EvType::Del) ++summary.del;
@@ -746,6 +970,53 @@ void call_variants(
             else if (e.type == EvType::Inv) ++summary.inv;
             else ++summary.dup;
         }
+    }
+
+    // ---- Coordinate-sort all records and write the (indexable) region + per-bubble VCFs.
+    std::stable_sort(out_records.begin(), out_records.end(),
+                     [](const OutRecord& a, const OutRecord& b) {
+                         if (a.pos != b.pos) return a.pos < b.pos;
+                         if (a.end != b.end) return a.end < b.end;
+                         return a.id < b.id;
+                     });
+
+    std::ofstream region_out(options.out_prefix + ".region.vcf");
+    if (!region_out) {
+        throw std::runtime_error("Failed to write region VCF: " + options.out_prefix + ".region.vcf");
+    }
+    write_vcf_header(region_out);
+
+    std::map<std::size_t, std::ofstream> bubble_files;
+    for (const OutRecord& rec : out_records) {
+        region_out << rec.line;
+        if (options.write_per_bubble_vcf) {
+            auto& f = bubble_files[rec.bubble_id];
+            if (!f.is_open()) {
+                const std::string path = options.out_prefix + ".bubble_" + std::to_string(rec.bubble_id) + ".vcf";
+                f.open(path);
+                if (!f) throw std::runtime_error("Failed to write bubble VCF: " + path);
+                write_vcf_header(f);
+            }
+            f << rec.line;
+        }
+    }
+
+    if (options.write_variant_paths) {
+        std::ofstream prov_out(options.out_prefix + ".variant_paths.tsv");
+        if (!prov_out) {
+            throw std::runtime_error("Failed to write variant paths TSV: " + options.out_prefix + ".variant_paths.tsv");
+        }
+        prov_out << "variant_id\tbubble_id\tsvtype\tsample\tgt\tsub_walk\n";
+        for (const OutRecord& rec : out_records) {
+            for (const std::string& pl : rec.prov_lines) prov_out << pl << '\n';
+        }
+
+        std::ofstream nt_out(options.out_prefix + ".node_track.tsv");
+        if (!nt_out) {
+            throw std::runtime_error("Failed to write node track TSV: " + options.out_prefix + ".node_track.tsv");
+        }
+        nt_out << "bubble_id\torder\tnode_id\tlength_bp\tgenomic_pos\tin_reference\tis_cn\n";
+        for (const std::string& r : node_track_rows) nt_out << r << '\n';
     }
 
     if (summary_out) *summary_out = summary;
