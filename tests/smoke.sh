@@ -57,7 +57,7 @@ if [[ -n "$FIRST_BUBBLE_ID" ]]; then
   INSPECT_PREFIX="$OUT_DIR/inspect/bubble_${FIRST_BUBBLE_ID}"
   INSPECT_ALL_PREFIX="$OUT_DIR/inspect/all"
   "$PANVAR_BIN" inspect -i "$GFA" --bubble-prefix-in "$BUBBLE_PREFIX" \
-    --bubble-id "$FIRST_BUBBLE_ID" -o "$INSPECT_PREFIX" >/dev/null
+    --bubble-id "$FIRST_BUBBLE_ID" -o "$INSPECT_PREFIX" --cluster >/dev/null
   "$PANVAR_BIN" inspect -i "$GFA" --bubble-prefix-in "$BUBBLE_PREFIX" \
     -o "$INSPECT_ALL_PREFIX" >/dev/null
 
@@ -93,8 +93,11 @@ if [[ -n "${FIRST_BUBBLE_ID:-}" ]]; then
   test -s "$INSPECT_PREFIX.bubble_${FIRST_BUBBLE_ID}.paths.fa.gz"
   test -s "$INSPECT_PREFIX.bubble_${FIRST_BUBBLE_ID}.node_counts.tsv"
   test -s "$INSPECT_PREFIX.bubble_${FIRST_BUBBLE_ID}.edge_counts.tsv"
+  test -s "$INSPECT_PREFIX.bubble_${FIRST_BUBBLE_ID}.node_lengths.tsv"
+  test -s "$INSPECT_PREFIX.bubble_${FIRST_BUBBLE_ID}.clusters.tsv"
   gzip -t "$INSPECT_PREFIX.bubble_${FIRST_BUBBLE_ID}.paths.fa.gz"
   test -s "$INSPECT_ALL_PREFIX.bubble_${FIRST_BUBBLE_ID}.node_counts.tsv"
+  test -s "$INSPECT_ALL_PREFIX.bubble_${FIRST_BUBBLE_ID}.node_lengths.tsv"
   test -s "$DESCRIBE_DIR/describe.index.tsv"
   DESCRIBE_BUBBLE_DIR="$DESCRIBE_DIR/bubble_${FIRST_BUBBLE_ID}"
   test -s "$DESCRIBE_BUBBLE_DIR/kmer_features.tsv.gz"

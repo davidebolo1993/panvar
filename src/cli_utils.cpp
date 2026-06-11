@@ -2,10 +2,18 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <exception>
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
+#include <utility>
+
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace panvar::cli {
 
@@ -13,6 +21,65 @@ double elapsed_seconds(const std::chrono::steady_clock::time_point& start) {
     const auto now = std::chrono::steady_clock::now();
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
     return static_cast<double>(ms) / 1000.0;
+}
+
+namespace {
+
+bool stderr_is_tty() {
+#if defined(_WIN32)
+    return _isatty(_fileno(stderr)) != 0;
+#else
+    return isatty(fileno(stderr)) != 0;
+#endif
+}
+
+} // namespace
+
+ProgressBar::ProgressBar(std::string label, std::size_t total)
+    : label_(std::move(label)), total_(total) {
+    // Only animate on an interactive stderr; skip entirely for empty work.
+    active_ = total_ > 0 && stderr_is_tty();
+    if (active_) {
+        render();
+    }
+}
+
+ProgressBar::~ProgressBar() {
+    done();
+}
+
+void ProgressBar::tick() {
+    if (current_ < total_) {
+        ++current_;
+    }
+    if (active_ && !finished_) {
+        render();
+    }
+}
+
+void ProgressBar::done() {
+    if (finished_) {
+        return;
+    }
+    finished_ = true;
+    if (active_) {
+        current_ = total_;
+        render();
+        std::cerr << '\n';
+        std::cerr.flush();
+    }
+}
+
+void ProgressBar::render() {
+    constexpr std::size_t kWidth = 30;
+    const std::size_t filled =
+        total_ == 0 ? kWidth : (current_ * kWidth) / total_;
+    std::cerr << '\r' << label_ << " [";
+    for (std::size_t i = 0; i < kWidth; ++i) {
+        std::cerr << (i < filled ? '#' : '-');
+    }
+    std::cerr << "] " << current_ << '/' << total_;
+    std::cerr.flush();
 }
 
 void print_general_help() {

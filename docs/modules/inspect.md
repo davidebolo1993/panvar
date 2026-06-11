@@ -8,7 +8,7 @@ CLI entrypoint:
 
 ## What it does
 
-`inspect` is a small utility for checking one called bubble, or all called bubbles, before moving to allele clustering.
+`inspect` is a small utility for checking one called bubble, or all called bubbles, before moving downstream.
 
 Given a GFA and a module-1 bubble CSV, it writes:
 
@@ -43,8 +43,10 @@ Default output paths are derived from `--out-prefix` and the bubble ID:
 - `<out-prefix>.bubble_<N>.paths.fa.gz`
 - `<out-prefix>.bubble_<N>.node_counts.tsv`
 - `<out-prefix>.bubble_<N>.edge_counts.tsv`
+- `<out-prefix>.bubble_<N>.node_lengths.tsv` — per-node bp lengths (see below)
+- `<out-prefix>.bubble_<N>.clusters.tsv` — only when `--cluster` is set (see below)
 
-You can override them explicitly with:
+You can override the first three explicitly with:
 
 - `--fasta-out <path>`
 - `--table-out <path>` (node counts)
@@ -53,6 +55,19 @@ You can override them explicitly with:
 Explicit output paths are only accepted with `--bubble-id`, because all-bubble mode needs one output set per bubble.
 
 Output directories are auto-created when missing.
+
+When inspecting all bubbles, a progress bar is printed to stderr; the machine-readable summary stays on
+stdout. With a single `--bubble-id`, the per-bubble detail is printed instead.
+
+## Node-length sidecar
+
+`<out-prefix>.bubble_<N>.node_lengths.tsv` lists, in the **same order as the `node.*` columns** of the node-count table, each internal node and its bp length:
+
+```text
+node_id	length_bp
+```
+
+It exists so the node coverage heatmap can scale its x-axis by node length (many bubble nodes are SNP-sized) without having to reorder columns. It is always written.
 
 ## FASTA output
 
@@ -67,7 +82,20 @@ Headers include:
 - whether the original best interval was source-to-sink or sink-to-source
 - path-step interval coordinates
 
-If the best interval is found as sink-to-source, `inspect` reverse-complements it so the FASTA is still reported in canonical source-to-sink orientation.
+### Why some records are reverse-complemented
+
+A bubble has a fixed `source` and `sink`, but an individual path can walk *through* it in either
+direction — some paths enter at the `source` and leave at the `sink`, others run the opposite way
+(enter at the `sink`, leave at the `source`). `inspect` searches both directions and records which one
+matched in the `source_to_sink=` header field.
+
+When a path crossed **sink-to-source**, `inspect` reorients that path's *node walk* — it reverses the
+step order and flips each node's strand — so the emitted allele always reads `source → sink`. Because
+the spelled DNA follows the node strands, flipping them yields the reverse-complement of that path's
+raw sequence. This is driven purely by traversal direction, not by sequence content.
+
+The point is comparability: every record (and every node/edge orientation count below) is reported in
+one common `source → sink` frame, so the FASTA alleles line up and can be aligned/clustered directly.
 
 ## Node-count table
 
@@ -87,7 +115,10 @@ For example, `3:2:1` means that, inside this bubble interval only, the path trav
 
 Important: counts are interval-local. If the same path reuses a node elsewhere outside the selected source/sink interval, that outside traversal is not counted for this bubble.
 
-The orientation is counted after canonical source-to-sink normalization, matching allele clustering. A `reverse` count therefore means the node is traversed in reverse orientation in the canonical bubble allele. If the graph has no `-`/`<` path steps in the selected intervals, reverse counts can legitimately be zero.
+Orientation is counted *after* the canonical `source → sink` normalization above. A `reverse` count
+therefore means the node is traversed against the canonical frame in this bubble allele — typically a
+real local inversion — rather than just a path that happened to run the other way. If the graph has no
+`-`/`<` path steps in the selected intervals, reverse counts can legitimately be zero.
 
 ## Edge-count table
 
@@ -107,71 +138,29 @@ the same unit repeats the *same edge*, so a self-loop / back-edge shows up as a 
 copy number). Edge columns are the union of adjacencies observed across all paths, sorted for a stable,
 deterministic column order. As with nodes, counts are interval-local.
 
-## Node Coverage Heatmap
+## Path clustering (`--cluster`)
 
-Use `scripts/plot_node_coverage_heatmap.R` to visualize an inspect node-count table.
+`--cluster` groups the paths crossing a bubble by their `source → sink` walk, so structurally identical
+haplotypes collapse to one representative. It is an inspection aid only — nothing downstream depends on
+it — but it is handy for plotting (see the heatmap `--clusters` option).
 
-Dependency:
+Each path's canonical walk is summarized as an **oriented, bp-weighted token multiset**: every step
+contributes its node's bp length to the token `<node_id><strand>`. Two walks are compared with weighted
+Jaccard — `sum(min) / sum(max)` over the shared tokens — which captures inversions (strand is part of
+the token) and copy number (repeated nodes add weight) while ignoring exact step order. Walks are
+clustered greedily: identical walks collapse first, then each distinct walk joins the most similar
+existing cluster whose representative is at least `--cluster-similarity` similar (default `0.90`), or
+starts a new cluster. The representative is the cluster **medoid** (the walk with the highest mean
+similarity to the rest; ties go to the most-supported walk).
 
-- `Rscript` with `ggplot2` (`conda install -y -c conda-forge r-base r-ggplot2`)
+Output `<out-prefix>.bubble_<N>.clusters.tsv`:
 
-Example:
-
-```bash
-scripts/plot_node_coverage_heatmap.R \
-  --table tests/results/c4/inspect/bubble_1.bubble_1.node_counts.tsv \
-  --out tests/results/c4/inspect/bubble_1.node_coverage
+```text
+cluster_id	n_paths	representative_path	members
 ```
 
-This writes:
-
-- `tests/results/c4/inspect/bubble_1.node_coverage.png`
-- `tests/results/c4/inspect/bubble_1.node_coverage.pdf`
-
-By default, the heatmap uses total node coverage per path. To check only reverse-orientation traversals:
-
-```bash
-scripts/plot_node_coverage_heatmap.R \
-  --table tests/results/c4/inspect/bubble_1.bubble_1.node_counts.tsv \
-  --out tests/results/c4/inspect/bubble_1.reverse_coverage \
-  --value reverse
-```
-
-Useful plotting options:
-
-- `--value total|forward|reverse`
-- `--transform raw|log1p`
-- `--cluster-rows`
-- `--cluster-cols`
-- `--max-paths <N>`
-- `--max-nodes <N>`
-
-## Edge Coverage Heatmap
-
-Use `scripts/plot_edge_coverage_heatmap.R` to visualize an inspect edge-count table — the same
-dependency (`Rscript` + `ggplot2`) and the same interface as the node heatmap, minus `--value` (edge
-cells are plain traversal counts):
-
-```bash
-scripts/plot_edge_coverage_heatmap.R \
-  --table tests/results/c4/inspect/bubble_4.edge_counts.tsv \
-  --out tests/results/c4/inspect/bubble_4.edge_coverage \
-  --transform log1p --cluster-rows --cluster-cols
-```
-
-This writes `<out>.png` and `<out>.pdf`. Options: `--transform raw|log1p`, `--cluster-rows`,
-`--cluster-cols`, `--max-paths <N>`, `--max-edges <N>`, `--width`, `--height`.
-
-## Interval selection
-
-For each path, `inspect` uses the same source/sink interval logic as module 2:
-
-1. find source-to-sink and sink-to-source path intervals
-2. prefer the interval containing the most bubble-internal node traversals
-3. tie-break by shorter span
-4. tie-break again by earlier path interval
-
-Paths without a valid source/sink interval crossing at least one internal node are skipped.
+`members` is a `;`-separated list of path names. Lower `--cluster-similarity` to merge more aggressively,
+raise it to split.
 
 ## Example
 
@@ -206,3 +195,81 @@ This writes one FASTA/table pair per bubble, for example:
 - `tests/results/c4/inspect/all.bubble_2.paths.fa.gz`
 - `tests/results/c4/inspect/all.bubble_2.node_counts.tsv`
 - `tests/results/c4/inspect/all.bubble_2.edge_counts.tsv`
+
+
+## Node Coverage Heatmap
+
+Use `scripts/plot_node_coverage_heatmap.R` to visualize an inspect node-count table.
+
+Dependency:
+
+- `Rscript` with `ggplot2` 
+
+Example:
+
+```bash
+scripts/plot_node_coverage_heatmap.R \
+  --table tests/results/c4/inspect/bubble_1.bubble_1.node_counts.tsv \
+  --out tests/results/c4/inspect/bubble_1.node_coverage
+```
+
+This writes:
+
+- `tests/results/c4/inspect/bubble_1.node_coverage.png`
+- `tests/results/c4/inspect/bubble_1.node_coverage.pdf`
+
+By default, the heatmap uses total node coverage per path. To check only reverse-orientation traversals:
+
+```bash
+scripts/plot_node_coverage_heatmap.R \
+  --table tests/results/c4/inspect/bubble_1.bubble_1.node_counts.tsv \
+  --out tests/results/c4/inspect/bubble_1.reverse_coverage \
+  --value reverse
+```
+
+To scale the x-axis by node length (thin tiles for SNP-sized nodes, wide tiles for long nodes) while
+keeping the column order, pass the node-length sidecar:
+
+```bash
+scripts/plot_node_coverage_heatmap.R \
+  --table tests/results/c4/inspect/all.bubble_4.node_counts.tsv \
+  --node-lengths tests/results/c4/inspect/all.bubble_4.node_lengths.tsv \
+  --out tests/results/c4/inspect/bubble_4.node_coverage
+```
+
+To plot only the cluster representatives, pass the `--cluster` output:
+
+```bash
+scripts/plot_node_coverage_heatmap.R \
+  --table tests/results/c4/inspect/all.bubble_4.node_counts.tsv \
+  --clusters tests/results/c4/inspect/all.bubble_4.clusters.tsv \
+  --out tests/results/c4/inspect/bubble_4.representatives
+```
+
+Useful plotting options:
+
+- `--value total|forward|reverse`
+- `--transform raw|log1p`
+- `--node-lengths <path>` (length-scale x; tile widths via `--length-transform raw|sqrt|log1p`, default `sqrt`)
+- `--clusters <path>` (keep only `--cluster` representative paths)
+- `--cluster-rows`
+- `--cluster-cols`
+- `--max-paths <N>`
+- `--max-nodes <N>`
+
+## Edge Coverage Heatmap
+
+Use `scripts/plot_edge_coverage_heatmap.R` to visualize an inspect edge-count table — the same
+dependency (`Rscript` + `ggplot2`) and the same interface as the node heatmap, minus `--value` (edge
+cells are plain traversal counts):
+
+```bash
+scripts/plot_edge_coverage_heatmap.R \
+  --table tests/results/c4/inspect/bubble_4.edge_counts.tsv \
+  --out tests/results/c4/inspect/bubble_4.edge_coverage \
+  --transform log1p --cluster-rows --cluster-cols
+```
+
+This writes `<out>.png` and `<out>.pdf`. Options: `--transform raw|log1p`, `--clusters <path>`
+(keep only `--cluster` representatives), `--cluster-rows`, `--cluster-cols`, `--max-paths <N>`,
+`--max-edges <N>`, `--width`, `--height`.

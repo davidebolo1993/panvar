@@ -8,8 +8,12 @@
 #include "panvar/output.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <cstddef>
 #include <fstream>
 #include <iostream>
+#include <map>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -34,6 +38,9 @@ void print_inspect_help() {
         << "      --fasta-out <path>           Explicit FASTA.GZ path (requires --bubble-id)\n"
         << "      --table-out <path>           Explicit node-count TSV path (requires --bubble-id)\n"
         << "      --edge-table-out <path>      Explicit edge-count TSV path (requires --bubble-id)\n"
+        << "      --cluster                    Group paths by source->sink walk; write a\n"
+        << "                                   <prefix>.bubble_<N>.clusters.tsv per bubble\n"
+        << "      --cluster-similarity <f>     Walk similarity threshold for --cluster (default: 0.90)\n"
         << "  -h, --help                       Show this help\n";
 }
 
@@ -77,9 +84,20 @@ void gz_write_fasta_record(
 
 struct InspectBubbleResult {
     std::size_t paths_written = 0;
+    std::size_t clusters_written = 0;
     std::string fasta_out_path;
     std::string table_out_path;
     std::string edge_table_out_path;
+    std::string node_lengths_out_path;
+    std::string clusters_out_path;
+};
+
+// Optional sidecar outputs requested for a bubble.
+struct InspectEmit {
+    std::string node_lengths_out_path;  // always written
+    std::string clusters_out_path;      // written only when cluster is true
+    bool cluster = false;
+    double cluster_similarity = 0.90;
 };
 
 // Orientation-aware edge key for a step pair, e.g. "12+>13-". Adjacency-aware so a
@@ -96,12 +114,169 @@ struct InspectPathRow {
     std::unordered_map<std::string, std::size_t> edge_counts;
 };
 
+// --- Path clustering by source->sink walk -----------------------------------
+//
+// A walk is summarized as an oriented, bp-weighted token multiset: each step
+// contributes its node's bp length to the token "<node_id><strand>". Two walks
+// are compared with weighted Jaccard = sum(min) / sum(max) over the token union,
+// which captures inversions (strand in the token) and copy number (repeats add
+// weight) while staying order-insensitive. std::map keeps tokens sorted so the
+// Jaccard merge is a linear two-pointer pass.
+using TokenWeights = std::map<std::string, std::size_t>;
+
+TokenWeights build_token_weights(const Graph& graph, const std::vector<PathStep>& steps) {
+    TokenWeights weights;
+    for (const auto& step : steps) {
+        const auto node_it = graph.nodes.find(step.node_id);
+        const std::size_t len =
+            node_it == graph.nodes.end() ? 1 : std::max<std::size_t>(1, node_it->second.sequence.size());
+        std::string token = step.node_id;
+        token.push_back(step.reverse ? '-' : '+');
+        weights[token] += len;
+    }
+    return weights;
+}
+
+double weighted_jaccard_tokens(const TokenWeights& a, const TokenWeights& b) {
+    std::size_t inter = 0;
+    std::size_t uni = 0;
+    auto ia = a.begin();
+    auto ib = b.begin();
+    while (ia != a.end() && ib != b.end()) {
+        if (ia->first == ib->first) {
+            inter += std::min(ia->second, ib->second);
+            uni += std::max(ia->second, ib->second);
+            ++ia;
+            ++ib;
+        } else if (ia->first < ib->first) {
+            uni += ia->second;
+            ++ia;
+        } else {
+            uni += ib->second;
+            ++ib;
+        }
+    }
+    for (; ia != a.end(); ++ia) {
+        uni += ia->second;
+    }
+    for (; ib != b.end(); ++ib) {
+        uni += ib->second;
+    }
+    return uni == 0 ? 0.0 : static_cast<double>(inter) / static_cast<double>(uni);
+}
+
+// One distinct canonical walk and the paths realizing it.
+struct UniqueWalk {
+    std::string signature;
+    TokenWeights weights;
+    std::vector<std::string> members;  // path names, in encounter order
+};
+
+struct ClusterOut {
+    std::size_t cluster_id = 0;
+    std::size_t n_paths = 0;
+    std::string representative;
+    std::vector<std::string> members;
+};
+
+// Greedy threshold clustering of distinct walks: process in descending support
+// order, attach each walk to the existing cluster whose medoid is most similar
+// (>= threshold) or open a new cluster. Medoids are then refined to the member
+// maximizing mean within-cluster similarity (ties broken by higher support).
+std::vector<ClusterOut> cluster_unique_walks(
+    const std::vector<UniqueWalk>& uniques, double threshold) {
+
+    std::vector<std::size_t> order(uniques.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    std::sort(order.begin(), order.end(), [&](std::size_t x, std::size_t y) {
+        if (uniques[x].members.size() != uniques[y].members.size()) {
+            return uniques[x].members.size() > uniques[y].members.size();
+        }
+        return uniques[x].signature < uniques[y].signature;
+    });
+
+    struct Cluster {
+        std::vector<std::size_t> members;
+        std::size_t medoid = 0;
+    };
+    std::vector<Cluster> clusters;
+    for (const std::size_t ui : order) {
+        double best_sim = -1.0;
+        std::size_t best_c = clusters.size();
+        for (std::size_t ci = 0; ci < clusters.size(); ++ci) {
+            const double s =
+                weighted_jaccard_tokens(uniques[ui].weights, uniques[clusters[ci].medoid].weights);
+            if (s >= threshold && s > best_sim) {
+                best_sim = s;
+                best_c = ci;
+            }
+        }
+        if (best_c == clusters.size()) {
+            clusters.push_back(Cluster{{ui}, ui});
+        } else {
+            clusters[best_c].members.push_back(ui);
+        }
+    }
+
+    for (auto& cluster : clusters) {
+        std::size_t best = cluster.members.front();
+        double best_mean = -1.0;
+        std::size_t best_support = 0;
+        for (const std::size_t a : cluster.members) {
+            double sum = 0.0;
+            std::size_t cnt = 0;
+            for (const std::size_t b : cluster.members) {
+                if (a == b) {
+                    continue;
+                }
+                sum += weighted_jaccard_tokens(uniques[a].weights, uniques[b].weights);
+                ++cnt;
+            }
+            const double mean = cnt == 0 ? 1.0 : sum / static_cast<double>(cnt);
+            const std::size_t support = uniques[a].members.size();
+            if (mean > best_mean + 1e-9 ||
+                (std::abs(mean - best_mean) <= 1e-9 && support > best_support)) {
+                best = a;
+                best_mean = mean;
+                best_support = support;
+            }
+        }
+        cluster.medoid = best;
+    }
+
+    std::vector<ClusterOut> out;
+    out.reserve(clusters.size());
+    for (const auto& cluster : clusters) {
+        ClusterOut co;
+        for (const std::size_t m : cluster.members) {
+            co.n_paths += uniques[m].members.size();
+            for (const auto& name : uniques[m].members) {
+                co.members.push_back(name);
+            }
+        }
+        co.representative = uniques[cluster.medoid].members.front();
+        std::sort(co.members.begin(), co.members.end());
+        out.push_back(std::move(co));
+    }
+    std::sort(out.begin(), out.end(), [](const ClusterOut& a, const ClusterOut& b) {
+        if (a.n_paths != b.n_paths) {
+            return a.n_paths > b.n_paths;
+        }
+        return a.representative < b.representative;
+    });
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        out[i].cluster_id = i;
+    }
+    return out;
+}
+
 InspectBubbleResult write_inspect_outputs_for_bubble(
     const Graph& graph,
     const Bubble& bubble,
     const std::string& fasta_out_path,
     const std::string& table_out_path,
-    const std::string& edge_table_out_path) {
+    const std::string& edge_table_out_path,
+    const InspectEmit& emit) {
 
     cli::ensure_parent_dir_for_file(fasta_out_path);
     cli::ensure_parent_dir_for_file(table_out_path);
@@ -121,6 +296,9 @@ InspectBubbleResult write_inspect_outputs_for_bubble(
     std::vector<InspectPathRow> rows;
     std::vector<std::string> edge_order;          // edge columns, first-seen order
     std::unordered_set<std::string> edge_seen;
+    // Distinct canonical walks, collected only when clustering is requested.
+    std::unordered_map<std::string, std::size_t> sig_to_unique;
+    std::vector<UniqueWalk> uniques;
     try {
         for (const auto& path : graph.paths) {
             const BubblePathIndex index = build_bubble_path_index(path);
@@ -169,6 +347,21 @@ InspectBubbleResult write_inspect_outputs_for_bubble(
                 " interval=" + std::to_string(interval->left) + "-" + std::to_string(interval->right);
             gz_write_fasta_record(fasta, fasta_out_path, fasta_name, sequence);
 
+            if (emit.cluster) {
+                const std::string sig = build_walk_signature(steps);
+                const auto it = sig_to_unique.find(sig);
+                if (it == sig_to_unique.end()) {
+                    sig_to_unique.emplace(sig, uniques.size());
+                    UniqueWalk uw;
+                    uw.signature = sig;
+                    uw.weights = build_token_weights(graph, steps);
+                    uw.members.push_back(row.name);
+                    uniques.push_back(std::move(uw));
+                } else {
+                    uniques[it->second].members.push_back(row.name);
+                }
+            }
+
             rows.push_back(std::move(row));
         }
     } catch (...) {
@@ -206,6 +399,7 @@ InspectBubbleResult write_inspect_outputs_for_bubble(
     result.fasta_out_path = fasta_out_path;
     result.table_out_path = table_out_path;
     result.edge_table_out_path = edge_table_out_path;
+    result.node_lengths_out_path = emit.node_lengths_out_path;
     for (const InspectPathRow& row : rows) {
         table_out << row.name << '\t' << row.sequence_length;
         for (const auto& node_id : bubble.inside) {
@@ -227,6 +421,44 @@ InspectBubbleResult write_inspect_outputs_for_bubble(
         edge_out << '\n';
         ++result.paths_written;
     }
+
+    // Per-node bp lengths, in the same order as the node.* columns above, so the
+    // node coverage heatmap can length-scale its x-axis without reordering.
+    cli::ensure_parent_dir_for_file(emit.node_lengths_out_path);
+    std::ofstream node_lengths_out(emit.node_lengths_out_path);
+    if (!node_lengths_out) {
+        throw std::runtime_error("Failed to write node lengths TSV: " + emit.node_lengths_out_path);
+    }
+    node_lengths_out << "node_id\tlength_bp\n";
+    for (const auto& node_id : bubble.inside) {
+        const auto it = graph.nodes.find(node_id);
+        const std::size_t len = it == graph.nodes.end() ? 0 : it->second.sequence.size();
+        node_lengths_out << tsv_sanitize(node_id) << '\t' << len << '\n';
+    }
+
+    if (emit.cluster) {
+        const std::vector<ClusterOut> clusters =
+            cluster_unique_walks(uniques, emit.cluster_similarity);
+        cli::ensure_parent_dir_for_file(emit.clusters_out_path);
+        std::ofstream clusters_out(emit.clusters_out_path);
+        if (!clusters_out) {
+            throw std::runtime_error("Failed to write clusters TSV: " + emit.clusters_out_path);
+        }
+        clusters_out << "cluster_id\tn_paths\trepresentative_path\tmembers\n";
+        for (const auto& c : clusters) {
+            clusters_out << c.cluster_id << '\t' << c.n_paths << '\t' << c.representative << '\t';
+            for (std::size_t i = 0; i < c.members.size(); ++i) {
+                if (i > 0) {
+                    clusters_out << ';';
+                }
+                clusters_out << c.members[i];
+            }
+            clusters_out << '\n';
+        }
+        result.clusters_written = clusters.size();
+        result.clusters_out_path = emit.clusters_out_path;
+    }
+
     return result;
 }
 
@@ -241,6 +473,8 @@ int run_inspect_command(const std::vector<std::string>& args) {
     std::string table_out_path;
     std::string edge_table_out_path;
     std::size_t bubble_id = 0;
+    bool cluster = false;
+    double cluster_similarity = 0.90;
 
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& arg = args[i];
@@ -285,6 +519,14 @@ int run_inspect_command(const std::vector<std::string>& args) {
         }
         if (arg == "--edge-table-out") {
             edge_table_out_path = require_value(arg);
+            continue;
+        }
+        if (arg == "--cluster") {
+            cluster = true;
+            continue;
+        }
+        if (arg == "--cluster-similarity") {
+            cluster_similarity = cli::parse_similarity_arg(arg, require_value(arg));
             continue;
         }
         throw std::runtime_error("Unknown option: " + arg);
@@ -340,11 +582,18 @@ int run_inspect_command(const std::vector<std::string>& args) {
         selected_bubbles.push_back(&(*bubble_it));
     }
 
+    // Verbose per-bubble block is useful for a single bubble; for an all-bubbles run
+    // it just floods stdout, so we show a progress bar on stderr instead.
+    const bool single_bubble = bubble_id != 0;
+
     std::size_t total_paths_written = 0;
     std::cout
         << "Input graph: " << gfa_path << "\n"
         << "Bubble source: " << bubbles_csv_path << "\n"
         << "Bubbles inspected: " << selected_bubbles.size() << "\n";
+
+    cli::ProgressBar progress(single_bubble ? "" : "Inspecting bubbles",
+                              single_bubble ? 0 : selected_bubbles.size());
 
     for (const Bubble* bubble_ptr : selected_bubbles) {
         const Bubble& bubble = *bubble_ptr;
@@ -361,23 +610,41 @@ int run_inspect_command(const std::vector<std::string>& args) {
             bubble_edge_table_out_path = out_prefix + ".bubble_" + std::to_string(bubble.id) + ".edge_counts.tsv";
         }
 
+        InspectEmit emit;
+        emit.node_lengths_out_path =
+            out_prefix + ".bubble_" + std::to_string(bubble.id) + ".node_lengths.tsv";
+        emit.clusters_out_path =
+            out_prefix + ".bubble_" + std::to_string(bubble.id) + ".clusters.tsv";
+        emit.cluster = cluster;
+        emit.cluster_similarity = cluster_similarity;
+
         const InspectBubbleResult result = write_inspect_outputs_for_bubble(
             graph,
             bubble,
             bubble_fasta_out_path,
             bubble_table_out_path,
-            bubble_edge_table_out_path);
+            bubble_edge_table_out_path,
+            emit);
         total_paths_written += result.paths_written;
+        progress.tick();
 
-        std::cout
-            << "Bubble ID: " << bubble.id << "\n"
-            << "Source/sink: " << bubble.source << "/" << bubble.sink << "\n"
-            << "Inside nodes: " << bubble.inside.size() << "\n"
-            << "Paths written: " << result.paths_written << "\n"
-            << "Wrote: " << result.fasta_out_path << "\n"
-            << "Wrote: " << result.table_out_path << "\n"
-            << "Wrote: " << result.edge_table_out_path << "\n";
+        if (single_bubble) {
+            std::cout
+                << "Bubble ID: " << bubble.id << "\n"
+                << "Source/sink: " << bubble.source << "/" << bubble.sink << "\n"
+                << "Inside nodes: " << bubble.inside.size() << "\n"
+                << "Paths written: " << result.paths_written << "\n"
+                << "Wrote: " << result.fasta_out_path << "\n"
+                << "Wrote: " << result.table_out_path << "\n"
+                << "Wrote: " << result.edge_table_out_path << "\n"
+                << "Wrote: " << result.node_lengths_out_path << "\n";
+            if (emit.cluster) {
+                std::cout << "Clusters: " << result.clusters_written << "\n"
+                          << "Wrote: " << result.clusters_out_path << "\n";
+            }
+        }
     }
+    progress.done();
 
     std::cout << "Total paths written: " << total_paths_written << "\n";
 

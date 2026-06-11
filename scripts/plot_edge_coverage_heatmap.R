@@ -10,6 +10,7 @@ usage <- function(status = 0) {
     "  --table <path>       panvar inspect edge-count table",
     "  --out <prefix>       Output prefix; writes <prefix>.png and <prefix>.pdf",
     "  --transform <mode>   raw or log1p (default: raw)",
+    "  --clusters <path>    panvar inspect clusters.tsv; keep only representative paths",
     "  --cluster-rows       Cluster paths by edge-traversal profile",
     "  --cluster-cols       Cluster edges by traversal profile",
     "  --max-paths <N>      Keep at most N paths, selected by total traversals (default: all)",
@@ -40,6 +41,7 @@ opts <- list(
   table = NULL,
   out = NULL,
   transform = "raw",
+  clusters = NULL,
   cluster_rows = FALSE,
   cluster_cols = FALSE,
   max_paths = 0,
@@ -66,6 +68,9 @@ while (i <= length(args)) {
     i <- i + 2
   } else if (arg == "--transform") {
     opts$transform <- read_value(arg)
+    i <- i + 2
+  } else if (arg == "--clusters") {
+    opts$clusters <- read_value(arg)
     i <- i + 2
   } else if (arg == "--cluster-rows") {
     opts$cluster_rows <- TRUE
@@ -119,6 +124,13 @@ open_input <- function(path) {
   }
 }
 
+# Read a TSV and close its connection (avoids leaked-connection warnings).
+read_tsv <- function(path) {
+  con <- open_input(path)
+  on.exit(close(con))
+  read.delim(con, sep = "\t", header = TRUE, check.names = FALSE, quote = "", comment.char = "")
+}
+
 con <- open_input(opts$table)
 on.exit(close(con), add = TRUE)
 tab <- read.delim(con, sep = "\t", header = TRUE, check.names = FALSE, quote = "", comment.char = "")
@@ -132,6 +144,18 @@ if (length(edge_cols) == 0) {
 }
 if (nrow(tab) == 0) {
   stop("Input table has no path rows", call. = FALSE)
+}
+
+if (!is.null(opts$clusters)) {
+  cl <- read_tsv(opts$clusters)
+  if (!"representative_path" %in% names(cl)) {
+    stop("--clusters table must contain a representative_path column", call. = FALSE)
+  }
+  reps <- unique(as.character(cl$representative_path))
+  tab <- tab[as.character(tab$path_name) %in% reps, , drop = FALSE]
+  if (nrow(tab) == 0) {
+    stop("No path rows match the cluster representatives", call. = FALSE)
+  }
 }
 
 values <- suppressWarnings(as.numeric(as.character(unlist(tab[edge_cols], use.names = FALSE))))

@@ -1,5 +1,7 @@
 #include "panvar/bubbles.hpp"
 
+#include "panvar/cli_utils.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <fstream>
@@ -735,7 +737,8 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
     // Per-bubble support: number of crossing paths, internal bp span (min/max), the count of
     // paths whose internal span reaches --min-variant-bp, and an inversion signal (an internal
     // node seen in both orientations across paths).
-    const auto compute_bubble_metrics = [&](std::vector<Bubble>& target) {
+    const auto compute_bubble_metrics = [&](std::vector<Bubble>& target, const char* progress_label) {
+        cli::ProgressBar progress(progress_label, target.size());
         for (auto& bubble : target) {
             std::size_t supported_paths = 0;
             std::size_t min_inside_bp = std::numeric_limits<std::size_t>::max();
@@ -791,10 +794,11 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
             bubble.max_inside_bp = has_inside_bp ? max_inside_bp : 0;
             bubble.long_path_support = long_path_support;
             bubble.inversion_signal = inversion_signal;
+            progress.tick();
         }
     };
 
-    compute_bubble_metrics(bubbles);
+    compute_bubble_metrics(bubbles, "Scoring bubbles");
 
     std::vector<Bubble> non_snp_bubbles;
     non_snp_bubbles.reserve(bubbles.size());
@@ -837,7 +841,7 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
 
     if (options.merge_nearby_bp > 0 && bubbles.size() > 1) {
         bubbles = merge_nearby_bubbles(graph, bubbles, options.merge_nearby_bp);
-        compute_bubble_metrics(bubbles);
+        compute_bubble_metrics(bubbles, "Rescoring merged");
     }
 
     std::sort(bubbles.begin(), bubbles.end(), bubble_endpoint_less);

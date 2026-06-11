@@ -11,6 +11,9 @@ usage <- function(status = 0) {
     "  --out <prefix>       Output prefix; writes <prefix>.png and <prefix>.pdf",
     "  --value <mode>       total, forward, or reverse (default: total)",
     "  --transform <mode>   raw or log1p (default: raw)",
+    "  --node-lengths <path>  panvar inspect node_lengths.tsv; scales x by node bp length",
+    "  --length-transform <mode>  raw, sqrt, or log1p tile-width scaling (default: sqrt)",
+    "  --clusters <path>    panvar inspect clusters.tsv; keep only representative paths",
     "  --cluster-rows       Cluster paths by coverage profile",
     "  --cluster-cols       Cluster nodes by coverage profile",
     "  --max-paths <N>      Keep at most N paths, selected by total coverage (default: all)",
@@ -42,6 +45,9 @@ opts <- list(
   out = NULL,
   value = "total",
   transform = "raw",
+  node_lengths = NULL,
+  length_transform = "sqrt",
+  clusters = NULL,
   cluster_rows = FALSE,
   cluster_cols = FALSE,
   max_paths = 0,
@@ -71,6 +77,15 @@ while (i <= length(args)) {
     i <- i + 2
   } else if (arg == "--transform") {
     opts$transform <- read_value(arg)
+    i <- i + 2
+  } else if (arg == "--node-lengths") {
+    opts$node_lengths <- read_value(arg)
+    i <- i + 2
+  } else if (arg == "--length-transform") {
+    opts$length_transform <- read_value(arg)
+    i <- i + 2
+  } else if (arg == "--clusters") {
+    opts$clusters <- read_value(arg)
     i <- i + 2
   } else if (arg == "--cluster-rows") {
     opts$cluster_rows <- TRUE
@@ -113,6 +128,9 @@ if (!opts$value %in% c("total", "forward", "reverse")) {
 if (!opts$transform %in% c("raw", "log1p")) {
   stop("--transform must be one of: raw, log1p", call. = FALSE)
 }
+if (!opts$length_transform %in% c("raw", "sqrt", "log1p")) {
+  stop("--length-transform must be one of: raw, sqrt, log1p", call. = FALSE)
+}
 if (is.na(opts$max_paths) || opts$max_paths < 0 || is.na(opts$max_nodes) || opts$max_nodes < 0) {
   stop("--max-paths/--max-nodes must be non-negative integers", call. = FALSE)
 }
@@ -125,6 +143,13 @@ open_input <- function(path) {
   } else {
     file(path, open = "rt")
   }
+}
+
+# Read a TSV and close its connection (avoids leaked-connection warnings).
+read_tsv <- function(path) {
+  con <- open_input(path)
+  on.exit(close(con))
+  read.delim(con, sep = "\t", header = TRUE, check.names = FALSE, quote = "", comment.char = "")
 }
 
 con <- open_input(opts$table)
@@ -140,6 +165,27 @@ if (length(node_cols) == 0) {
 }
 if (nrow(tab) == 0) {
   stop("Input table has no path rows", call. = FALSE)
+}
+
+if (!is.null(opts$clusters)) {
+  cl <- read_tsv(opts$clusters)
+  if (!"representative_path" %in% names(cl)) {
+    stop("--clusters table must contain a representative_path column", call. = FALSE)
+  }
+  reps <- unique(as.character(cl$representative_path))
+  tab <- tab[as.character(tab$path_name) %in% reps, , drop = FALSE]
+  if (nrow(tab) == 0) {
+    stop("No path rows match the cluster representatives", call. = FALSE)
+  }
+}
+
+len_by_node <- NULL
+if (!is.null(opts$node_lengths)) {
+  nl <- read_tsv(opts$node_lengths)
+  if (!all(c("node_id", "length_bp") %in% names(nl))) {
+    stop("--node-lengths table must contain node_id and length_bp columns", call. = FALSE)
+  }
+  len_by_node <- stats::setNames(as.numeric(nl$length_bp), as.character(nl$node_id))
 }
 
 cells <- as.character(unlist(tab[node_cols], use.names = FALSE))
@@ -202,29 +248,63 @@ sparse_ticks <- function(n, max_ticks) {
   }
 }
 
-path_pos <- seq_len(nrow(plot_mat))
-node_pos <- seq_len(ncol(plot_mat))
+n_paths <- nrow(plot_mat)
+n_nodes <- ncol(plot_mat)
+use_length <- !is.null(len_by_node)
+
+# Per-column x extents. Default: unit-width columns (equal-spaced, like geom_raster).
+# With --node-lengths: tile widths = (transformed) node bp, preserving column order.
+if (use_length) {
+  raw_len <- as.numeric(len_by_node[colnames(plot_mat)])
+  w <- switch(opts$length_transform,
+              raw = raw_len,
+              sqrt = sqrt(pmax(raw_len, 0)),
+              log1p = log1p(pmax(raw_len, 0)))
+  pos_min <- suppressWarnings(min(w[is.finite(w) & w > 0]))
+  if (!is.finite(pos_min)) pos_min <- 1
+  w[!is.finite(w) | w <= 0] <- pos_min * 0.25
+  x1 <- cumsum(w)
+  x0 <- x1 - w
+  xmid <- (x0 + x1) / 2
+} else {
+  x0 <- seq_len(n_nodes) - 1
+  x1 <- seq_len(n_nodes)
+  xmid <- seq_len(n_nodes) - 0.5
+}
+
+path_pos <- seq_len(n_paths)
 plot_df <- data.frame(
-  node_pos = rep(node_pos, each = nrow(plot_mat)),
-  path_pos = rep(path_pos, times = ncol(plot_mat)),
+  node_idx = rep(seq_len(n_nodes), each = n_paths),
+  path_pos = rep(path_pos, times = n_nodes),
   value = as.vector(plot_mat)
 )
-plot_df$path_y <- nrow(plot_mat) - plot_df$path_pos + 1
+plot_df$path_y <- n_paths - plot_df$path_pos + 1
+plot_df$xmin <- x0[plot_df$node_idx]
+plot_df$xmax <- x1[plot_df$node_idx]
+plot_df$ymin <- plot_df$path_y - 0.5
+plot_df$ymax <- plot_df$path_y + 0.5
 
-x_breaks <- sparse_ticks(ncol(plot_mat), 30)
-y_breaks_original <- sparse_ticks(nrow(plot_mat), 35)
-y_breaks <- nrow(plot_mat) - y_breaks_original + 1
+x_break_idx <- sparse_ticks(n_nodes, 30)
+x_breaks <- if (use_length) xmid[x_break_idx] else x_break_idx
+x_labels <- colnames(plot_mat)[x_break_idx]
+y_breaks_original <- sparse_ticks(n_paths, 35)
+y_breaks <- n_paths - y_breaks_original + 1
 fill_name <- if (opts$transform == "log1p") "log1p(count)" else "count"
+pal <- c("#ffffff", "#fff1ec", "#fcbba1", "#fb6a4a", "#cb181d", "#67000d")
 
-p <- ggplot2::ggplot(plot_df, ggplot2::aes(x = node_pos, y = path_y, fill = value)) +
-  ggplot2::geom_raster() +
-  ggplot2::scale_fill_gradientn(
-    colours = c("#ffffff", "#fff1ec", "#fcbba1", "#fb6a4a", "#cb181d", "#67000d"),
-    name = fill_name
-  ) +
+if (use_length) {
+  p <- ggplot2::ggplot(plot_df) +
+    ggplot2::geom_rect(ggplot2::aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = value))
+} else {
+  p <- ggplot2::ggplot(plot_df, ggplot2::aes(x = node_idx, y = path_y, fill = value)) +
+    ggplot2::geom_raster()
+}
+
+p <- p +
+  ggplot2::scale_fill_gradientn(colours = pal, name = fill_name) +
   ggplot2::scale_x_continuous(
     breaks = x_breaks,
-    labels = colnames(plot_mat)[x_breaks],
+    labels = x_labels,
     expand = c(0, 0)
   ) +
   ggplot2::scale_y_continuous(
@@ -234,8 +314,9 @@ p <- ggplot2::ggplot(plot_df, ggplot2::aes(x = node_pos, y = path_y, fill = valu
   ) +
   ggplot2::labs(
     title = sprintf("Node %s coverage", opts$value),
-    subtitle = sprintf("%d paths x %d bubble-internal nodes", nrow(plot_mat), ncol(plot_mat)),
-    x = "Bubble-internal nodes",
+    subtitle = sprintf("%d paths x %d bubble-internal nodes%s", n_paths, n_nodes,
+                       if (use_length) " (x scaled by node bp)" else ""),
+    x = if (use_length) "Bubble-internal nodes (width = bp)" else "Bubble-internal nodes",
     y = "Paths"
   ) +
   ggplot2::theme_minimal(base_size = 11) +
