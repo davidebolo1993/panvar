@@ -105,7 +105,7 @@ Current schema:
 - `inside_nodes`
 
 
-The CSV stays minimal. Two extra per-bubble metrics are also computed — they drive the
+Two extra per-bubble metrics are also computed — they drive the
 `--min-variant-bp` filter and are surfaced in the optional debug TSV:
 
 - `long_path_support`: count of supporting paths with inside span `>= --min-variant-bp`
