@@ -27,9 +27,12 @@ void print_call_help() {
         << "      --bubbles-csv-in <path>      Module-1 bubbles CSV (required if no prefix)\n"
         << "      --reference-path <name>      Reference path name used as the diff baseline (required)\n"
         << "  -o, --out-prefix <prefix>        Output prefix for VCFs (required)\n"
-        << "      --min-sv-bp <N>              Minimum event size to report (default: 50)\n"
+        << "      --min-sv-bp <N>              Minimum size of a reported (merged) event (default: 50)\n"
         << "      --merge-distance-bp <N>      Coalesce nearby same-type events within a bubble (default: 100)\n"
         << "      --merge-jaccard <X>          Cross-haplotype node-set Jaccard to merge events (default: 0.80)\n"
+        << "      --merge-seq-identity <X>     Cross-haplotype event-sequence identity to merge (default: 0.80)\n"
+        << "      --min-haplotypes <N>         Drop records carried by fewer than N haplotypes (default: 1)\n"
+        << "      --rescue-min-bp <N>          Floor for sub-threshold events kept for rescue (default: min-sv-bp/2)\n"
         << "      --classify-ins               Refine INS subtype NOVEL/DUP with minimap2\n"
         << "      --minimap-preset <name>      minimap2 preset for INS refinement: asm5|asm10|asm20 (default: asm20)\n"
         << "      --minimap-best-n <N>         minimap2 best_n chains (default: 8)\n"
@@ -91,6 +94,18 @@ int run_call_command(const std::vector<std::string>& args) {
         }
         if (arg == "--merge-jaccard") {
             options.merge_jaccard = cli::parse_unit_fraction_arg(arg, require_value(arg));
+            continue;
+        }
+        if (arg == "--merge-seq-identity") {
+            options.merge_seq_identity = cli::parse_unit_fraction_arg(arg, require_value(arg));
+            continue;
+        }
+        if (arg == "--min-haplotypes") {
+            options.min_haplotypes = cli::parse_size_arg(arg, require_value(arg));
+            continue;
+        }
+        if (arg == "--rescue-min-bp") {
+            options.rescue_min_bp = cli::parse_size_arg(arg, require_value(arg));
             continue;
         }
         if (arg == "--classify-ins") {

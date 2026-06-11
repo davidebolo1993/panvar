@@ -12,9 +12,12 @@ struct VariantCallOptions {
     std::string bubbles_csv_in;          // module-1 bubbles CSV
     std::string reference_path;          // required: graph path used as the diff baseline
     std::string out_prefix;              // writes <prefix>.bubble_<id>.vcf + <prefix>.region.vcf
-    std::size_t min_sv_bp = 50;          // minimum event size to report
+    std::size_t min_sv_bp = 50;          // minimum event size for a reported (merged) record
     std::size_t merge_distance_bp = 100; // within-bubble nearby same-type coalescing distance
     double merge_jaccard = 0.80;         // cross-haplotype length-weighted node-set Jaccard threshold
+    double merge_seq_identity = 0.80;    // cross-haplotype event-sequence identity threshold (alt merge key)
+    std::size_t min_haplotypes = 1;      // drop a record carried by fewer than this many haplotypes
+    std::size_t rescue_min_bp = 0;       // floor for events kept for merge/rescue (0 -> min_sv_bp/2)
     bool classify_ins = false;           // minimap2 INS subtype refinement (NOVEL vs DUP)
     std::string minimap_preset = "asm20";
     std::size_t minimap_best_n = 8;

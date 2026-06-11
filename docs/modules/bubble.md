@@ -39,7 +39,7 @@ Output directories are auto-created when missing.
 ```bash
 #graph building
 pggb -i <haplotypes.fa> -o <pggb.outdir>
-#manipulation
+#manipulating
 odgi paths -i <pggb.outdir>/*smooth.final.og -L | grep <reference.id> > <pggb.outdir>/ref.path.txt
 odgi sort -i <pggb.outdir>/*smooth.final.og -Y -H <pggb.outdir>/ref.path.txt -o - | odgi flip -i - --ref-flips <pggb.outdir>/ref.path.txt -o - | odgi view -i - -g | sed 's/_inv$//g'>  <graph.gfa>
 #snarls calling

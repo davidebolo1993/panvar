@@ -1,5 +1,6 @@
 #include "panvar/variant_call.hpp"
 
+#include "panvar/align.hpp"
 #include "panvar/bubble_path.hpp"
 #include "panvar/bubbles.hpp"
 #include "panvar/cli_utils.hpp"
@@ -45,32 +46,42 @@ std::size_t node_len(const Graph& graph, const std::string& id) {
     return it == graph.nodes.end() ? 0 : it->second.sequence.size();
 }
 
-// One collapsed walk position: a node (oriented), with consecutive self-repeats
-// folded into `count` so a panphorte REP self-loop is a single alignment token.
+// Nodes carrying a self-loop edge (a panphorte REP, or any tandem-unit node):
+// these are copy-number loci even when a haplotype traverses them only once.
+std::unordered_set<std::string> self_loop_nodes(const Graph& graph) {
+    std::unordered_set<std::string> out;
+    for (const auto& [id, node] : graph.nodes) {
+        bool loop = false;
+        for (const Neighbor& nb : node.start) if (nb.node_id == id) { loop = true; break; }
+        if (!loop) for (const Neighbor& nb : node.end) if (nb.node_id == id) { loop = true; break; }
+        if (loop) out.insert(id);
+    }
+    return out;
+}
+
+// One node-token position in a walk (oriented), for the DEL/INS/INV alignment.
 struct Tok {
     std::uint64_t token = 0;
     std::string node_id;
     bool reverse = false;
-    std::size_t count = 1;
-    bool is_cn = false;
 };
 
+// Token walk for the DEL/INS/INV alignment. Copy-number nodes (REP self-loops)
+// are dropped entirely — they are handled separately as count-based DUP/CN events,
+// so a haplotype's extra REP copies are never mistyped as INS.
 std::vector<Tok> collapse_walk(
     const std::vector<PathStep>& steps,
     const std::unordered_set<std::string>& cn_nodes) {
 
     std::vector<Tok> out;
     for (const PathStep& s : steps) {
-        const bool cn = cn_nodes.count(s.node_id) != 0;
-        if (cn && !out.empty() && out.back().node_id == s.node_id && out.back().reverse == s.reverse) {
-            ++out.back().count;
+        if (cn_nodes.count(s.node_id) != 0) {
             continue;
         }
         Tok t;
         t.token = hash_step_token(s);
         t.node_id = s.node_id;
         t.reverse = s.reverse;
-        t.is_cn = cn;
         out.push_back(std::move(t));
     }
     return out;
@@ -86,26 +97,24 @@ struct Event {
     std::size_t ref_cn = 0;           // DUP only
     std::size_t alt_cn = 0;           // DUP only
     std::string ins_subtype;          // INS only: "", "NOVEL", "DUP"
+    std::string link_id;              // shared id for a co-located DEL+INS substitution (EVENTID)
     // Reference anchoring for VCF coordinates.
     std::string anchor_node;          // ref node POS is taken from
     bool anchor_after = false;        // true: POS = last base of anchor (INS); false: first base
     std::size_t size_bp = 0;          // |event| for min_sv filtering / SVLEN magnitude
+    std::size_t ref_pos = 0;          // reference genomic position of the anchor (merge window)
 };
 
-// Spell a collapsed-token run into sequence (each token repeated `count` times).
+// Spell a token run into sequence.
 std::string spell_toks(const Graph& graph, const std::vector<const Tok*>& toks) {
     std::vector<PathStep> steps;
-    for (const Tok* t : toks) {
-        for (std::size_t c = 0; c < t->count; ++c) {
-            steps.push_back(PathStep{t->node_id, t->reverse});
-        }
-    }
+    for (const Tok* t : toks) steps.push_back(PathStep{t->node_id, t->reverse});
     return spell_path_steps_sequence(graph, steps);
 }
 
 std::size_t toks_bp(const Graph& graph, const std::vector<const Tok*>& toks) {
     std::size_t bp = 0;
-    for (const Tok* t : toks) bp += node_len(graph, t->node_id) * t->count;
+    for (const Tok* t : toks) bp += node_len(graph, t->node_id);
     return bp;
 }
 
@@ -122,12 +131,12 @@ bool is_inversion(const std::vector<const Tok*>& ref_blk, const std::vector<cons
 }
 
 // Global node-token alignment (diagonal only on equal tokens; else gaps), then
-// read off DEL/INS/INV/DUP events of the haplotype relative to the reference.
+// read off DEL/INS/INV events of the haplotype relative to the reference. DUP/CN
+// is handled separately (count-based), so CN nodes are already excluded from R/H.
 std::vector<Event> diff_walks(
     const Graph& graph,
     const std::vector<Tok>& R,
     const std::vector<Tok>& H,
-    const std::unordered_map<std::string, std::size_t>& ref_count,
     const std::string& bubble_source) {
 
     std::vector<Event> events;
@@ -172,9 +181,8 @@ std::vector<Event> diff_walks(
     }
     std::reverse(cols.begin(), cols.end());
 
-    // Emit events. Matched columns of a CN node with differing counts -> DUP.
-    // Maximal gap blocks -> DEL / INS / INV. Track the last matched ref node as
-    // the anchor for an INS that follows it.
+    // Emit events from maximal gap blocks -> DEL / INS / INV. Track the last matched
+    // ref node as the anchor for an INS that follows it.
     std::string last_ref_node = bubble_source;
     auto flush_block = [&](std::vector<const Tok*>& ref_blk, std::vector<const Tok*>& hap_blk) {
         if (ref_blk.empty() && hap_blk.empty()) return;
@@ -189,6 +197,11 @@ std::vector<Event> diff_walks(
             e.anchor_node = ref_blk.front()->node_id;
             events.push_back(std::move(e));
         } else {
+            // A gap-block with both ref and hap content is a substitution: emit DEL+INS
+            // but link them with a shared EVENTID so downstream can pair them.
+            const bool substitution = !ref_blk.empty() && !hap_blk.empty();
+            const std::string link =
+                substitution ? ("sub_" + ref_blk.front()->node_id + "_" + hap_blk.front()->node_id) : "";
             if (!ref_blk.empty()) {
                 Event e;
                 e.type = EvType::Del;
@@ -198,6 +211,7 @@ std::vector<Event> diff_walks(
                 e.seq = spell_toks(graph, ref_blk);
                 e.size_bp = toks_bp(graph, ref_blk);
                 e.anchor_node = ref_blk.front()->node_id;
+                e.link_id = link;
                 events.push_back(std::move(e));
             }
             if (!hap_blk.empty()) {
@@ -210,6 +224,7 @@ std::vector<Event> diff_walks(
                 e.size_bp = toks_bp(graph, hap_blk);
                 e.anchor_node = last_ref_node;
                 e.anchor_after = true;
+                e.link_id = link;
                 events.push_back(std::move(e));
             }
         }
@@ -222,23 +237,7 @@ std::vector<Event> diff_walks(
     for (const Col& c : cols) {
         if (c.ri >= 0 && c.hi >= 0) {
             flush_block(ref_blk, hap_blk);
-            const Tok& rt = R[static_cast<std::size_t>(c.ri)];
-            const Tok& ht = H[static_cast<std::size_t>(c.hi)];
-            last_ref_node = rt.node_id;
-            if (rt.is_cn && rt.count != ht.count) {
-                Event e;
-                e.type = EvType::Dup;
-                e.nodes.push_back(rt.node_id);
-                e.start_node = rt.node_id;
-                e.end_node = rt.node_id;
-                e.ref_cn = rt.count;
-                e.alt_cn = ht.count;
-                e.anchor_node = rt.node_id;
-                const std::size_t unit = node_len(graph, rt.node_id);
-                const std::size_t delta = rt.count > ht.count ? rt.count - ht.count : ht.count - rt.count;
-                e.size_bp = unit * delta;
-                events.push_back(std::move(e));
-            }
+            last_ref_node = R[static_cast<std::size_t>(c.ri)].node_id;
         } else if (c.ri >= 0) {
             ref_blk.push_back(&R[static_cast<std::size_t>(c.ri)]);
         } else {
@@ -246,7 +245,6 @@ std::vector<Event> diff_walks(
         }
     }
     flush_block(ref_blk, hap_blk);
-    (void)ref_count;
     return events;
 }
 
@@ -328,12 +326,27 @@ double weighted_jaccard(
     return uni == 0 ? 0.0 : static_cast<double>(inter) / static_cast<double>(uni);
 }
 
+// Banded alignment identity between two event sequences, gated on a length ratio
+// (so wildly different sizes are not compared). 0 when either is empty.
+double seq_identity(const std::string& a, const std::string& b, double min_id) {
+    if (a.empty() || b.empty()) return 0.0;
+    const std::size_t lo = std::min(a.size(), b.size());
+    const std::size_t hi = std::max(a.size(), b.size());
+    if (static_cast<double>(lo) < min_id * static_cast<double>(hi)) return 0.0;
+    const std::string& shorter = a.size() <= b.size() ? a : b;
+    const std::string& longer = a.size() <= b.size() ? b : a;
+    const std::size_t band = std::max<std::size_t>(
+        8, static_cast<std::size_t>((1.0 - min_id) * static_cast<double>(shorter.size())) + 8);
+    const FitAlignResult fa = fit_align(shorter, longer, band);
+    return fa.ok ? fa.identity : 0.0;
+}
+
 // A merged event across haplotypes: a representative event + its carriers.
 struct MergedRecord {
-    Event seed;
-    std::vector<std::string> carriers;                  // haplotype path names with GT=1
+    Event seed;                                             // representative (largest member)
+    std::vector<std::string> carriers;                      // haplotype path names with GT=1
+    std::unordered_set<std::size_t> member_alleles;         // allele indices already merged in
     std::unordered_map<std::string, std::size_t> sample_cn; // DUP per-sample copy number
-    std::size_t nmerged = 0;
 };
 
 std::string upper_base(char c) {
@@ -381,12 +394,15 @@ void call_variants(
     path_indexes.reserve(graph.paths.size());
     for (const PathRecord& p : graph.paths) path_indexes.push_back(build_bubble_path_index(p));
 
+    const std::unordered_set<std::string> selfloops = self_loop_nodes(graph);
+
     cli::ensure_parent_dir_for_file(options.out_prefix + ".region.vcf");
 
     auto write_vcf_header = [&](std::ostream& out) {
         out << "##fileformat=VCFv4.2\n";
         out << "##source=panvar call\n";
         out << "##reference=" << options.reference_path << "\n";
+        out << "##contig=<ID=" << ref_meta.chrom << ">\n";
         out << "##INFO=<ID=END,Number=1,Type=Integer,Description=\"End position of the variant\">\n";
         out << "##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"Structural variant type\">\n";
         out << "##INFO=<ID=SVLEN,Number=1,Type=Integer,Description=\"Length difference ALT-REF\">\n";
@@ -397,6 +413,7 @@ void call_variants(
         out << "##INFO=<ID=INS_SUBTYPE,Number=1,Type=String,Description=\"INS subtype: NOVEL or DUP (minimap2 refined)\">\n";
         out << "##INFO=<ID=REF_CN,Number=1,Type=Integer,Description=\"Reference copy number of the repeat unit (DUP)\">\n";
         out << "##INFO=<ID=NMERGED,Number=1,Type=Integer,Description=\"Haplotype carriers merged into this record\">\n";
+        out << "##INFO=<ID=EVENTID,Number=1,Type=String,Description=\"Shared id linking a co-located DEL+INS substitution\">\n";
         out << "##INFO=<ID=INSSEQ,Number=1,Type=String,Description=\"Inserted sequence\">\n";
         out << "##INFO=<ID=DELSEQ,Number=1,Type=String,Description=\"Deleted reference sequence\">\n";
         out << "##INFO=<ID=INVSEQ,Number=1,Type=String,Description=\"Inverted reference sequence\">\n";
@@ -478,70 +495,168 @@ void call_variants(
             }
         }
 
-        // CN nodes: any node traversed >1x in the reference or any allele walk.
+        // CN nodes: self-loop nodes present in this bubble (a panphorte REP / genuine
+        // tandem unit). They are handled as count-based DUP/CN events and excluded from
+        // the DEL/INS/INV alignment. Ordinary nodes that merely recur (e.g. shared module
+        // content) are NOT copy-number loci and stay in the alignment.
         std::unordered_map<std::string, std::size_t> ref_count;
         for (const PathStep& s : ref_steps) ++ref_count[s.node_id];
         std::unordered_set<std::string> cn_nodes;
-        for (const auto& [id, c] : ref_count) if (c > 1) cn_nodes.insert(id);
+        for (const auto& [id, c] : ref_count) { (void)c; if (selfloops.count(id)) cn_nodes.insert(id); }
         for (const Allele& a : alleles) {
-            std::unordered_map<std::string, std::size_t> cnt;
-            for (const PathStep& s : a.steps) ++cnt[s.node_id];
-            for (const auto& [id, c] : cnt) if (c > 1) cn_nodes.insert(id);
+            for (const PathStep& s : a.steps) if (selfloops.count(s.node_id)) cn_nodes.insert(s.node_id);
         }
 
         const std::vector<Tok> Rtok = collapse_walk(ref_steps, cn_nodes);
 
-        // Type + coalesce events per distinct non-reference allele.
         std::vector<MergedRecord> merged;
         const std::unordered_map<std::string, std::size_t> ref_node_pos = build_ref_node_pos(bubble);
+        const std::size_t rescue_floor =
+            options.rescue_min_bp != 0 ? options.rescue_min_bp : std::max<std::size_t>(1, options.min_sv_bp / 2);
 
-        auto add_to_merged = [&](Event& e, const std::vector<std::string>& members) {
-            // DUP merges on shared REP node; others on length-weighted node Jaccard.
-            for (MergedRecord& mr : merged) {
-                if (mr.seed.type != e.type) continue;
-                bool same = false;
-                if (e.type == EvType::Dup) {
-                    same = (!e.nodes.empty() && !mr.seed.nodes.empty() && e.nodes.front() == mr.seed.nodes.front());
-                } else {
-                    same = weighted_jaccard(graph, mr.seed.nodes, e.nodes) >= options.merge_jaccard;
-                }
-                if (same) {
-                    for (const std::string& m : members) {
-                        mr.carriers.push_back(m);
-                        if (e.type == EvType::Dup) mr.sample_cn[m] = e.alt_cn;
-                    }
-                    mr.nmerged += members.size();
-                    return;
-                }
+        auto ev_ref_pos = [&](const Event& e) -> long long {
+            const auto it = ref_node_pos.find(e.anchor_node);
+            if (it == ref_node_pos.end()) return -1;
+            const std::size_t glen = node_len(graph, e.anchor_node);
+            return static_cast<long long>(it->second + (e.anchor_after && glen > 0 ? glen - 1 : 0));
+        };
+        // Two non-DUP events are the same site: same type, anchors within the window,
+        // and either node sets overlap (Jaccard) OR sequences are similar.
+        auto events_match = [&](const Event& a, const Event& b) {
+            if (a.type != b.type) return false;
+            if (a.ref_pos == 0 || b.ref_pos == 0) {
+                // fall back to node/seq only when no coordinate
+            } else {
+                const long long d = static_cast<long long>(a.ref_pos) - static_cast<long long>(b.ref_pos);
+                if (d > static_cast<long long>(options.merge_distance_bp) ||
+                    d < -static_cast<long long>(options.merge_distance_bp)) return false;
             }
-            MergedRecord mr;
-            mr.seed = e;
-            for (const std::string& m : members) {
-                mr.carriers.push_back(m);
-                if (e.type == EvType::Dup) mr.sample_cn[m] = e.alt_cn;
-            }
-            mr.nmerged = members.size();
-            merged.push_back(std::move(mr));
+            if (weighted_jaccard(graph, a.nodes, b.nodes) >= options.merge_jaccard) return true;
+            return seq_identity(a.seq, b.seq, options.merge_seq_identity) >= options.merge_seq_identity;
         };
 
-        for (const Allele& a : alleles) {
-            const std::string asig = build_walk_signature(a.steps);
-            if (asig == ref_sig) continue; // reference-like allele: no events
-            const std::vector<Tok> Htok = collapse_walk(a.steps, cn_nodes);
-            std::vector<Event> events = diff_walks(graph, Rtok, Htok, ref_count, bubble.source);
+        // ---- DUP/CN events: count self-loop traversals per allele vs reference. Merge
+        // on shared REP node; per-sample CN. Independent of the walk-diff alignment.
+        for (std::size_t ai = 0; ai < alleles.size(); ++ai) {
+            std::unordered_map<std::string, std::size_t> alt_count;
+            for (const PathStep& s : alleles[ai].steps) ++alt_count[s.node_id];
+            for (const std::string& cn : cn_nodes) {
+                const std::size_t rc = ref_count.count(cn) ? ref_count.at(cn) : 0;
+                const std::size_t ac = alt_count.count(cn) ? alt_count.at(cn) : 0;
+                if (rc == ac) continue;
+                const std::size_t unit = node_len(graph, cn);
+                const std::size_t delta = rc > ac ? rc - ac : ac - rc;
+                if (unit * delta < options.min_sv_bp) continue;
+                MergedRecord* grp = nullptr;
+                for (MergedRecord& mr : merged) {
+                    if (mr.seed.type == EvType::Dup && mr.seed.nodes.front() == cn) { grp = &mr; break; }
+                }
+                if (grp == nullptr) {
+                    MergedRecord mr;
+                    mr.seed.type = EvType::Dup;
+                    mr.seed.nodes.push_back(cn);
+                    mr.seed.start_node = cn; mr.seed.end_node = cn;
+                    mr.seed.ref_cn = rc; mr.seed.alt_cn = ac;
+                    mr.seed.anchor_node = bubble.source;
+                    mr.seed.size_bp = unit * delta;
+                    merged.push_back(std::move(mr));
+                    grp = &merged.back();
+                }
+                for (const std::string& m : alleles[ai].members) {
+                    grp->carriers.push_back(m);
+                    grp->sample_cn[m] = ac;
+                }
+            }
+        }
+
+        // ---- DEL/INS/INV events: derive per allele, keep ALL (down to the rescue floor)
+        // for the re-scan, then merge events >= floor by position + sequence/node match.
+        std::vector<std::vector<Event>> allele_events(alleles.size());
+        for (std::size_t ai = 0; ai < alleles.size(); ++ai) {
+            if (build_walk_signature(alleles[ai].steps) == ref_sig) continue;
+            const std::vector<Tok> Htok = collapse_walk(alleles[ai].steps, cn_nodes);
+            std::vector<Event> events = diff_walks(graph, Rtok, Htok, bubble.source);
             coalesce_events(graph, events, ref_node_pos, options.merge_distance_bp);
             for (Event& e : events) {
-                if (e.size_bp < options.min_sv_bp) continue;
-                if (options.classify_ins && e.type == EvType::Ins && !e.seq.empty()) {
-                    const std::string ref_window = spell_path_steps_sequence(graph, ref_steps);
-                    const Minimap2Hit hit = minimap2_best_hit(
-                        "ins", e.seq, "refwin", ref_window, options.minimap_preset, options.minimap_best_n);
-                    e.ins_subtype = (hit.ok && hit.identity() >= options.ins_dup_min_identity &&
-                                     hit.query_end_bp - hit.query_start_bp >= e.seq.size() / 2)
-                                        ? "DUP" : "NOVEL";
-                }
-                add_to_merged(e, a.members);
+                const long long p = ev_ref_pos(e);
+                e.ref_pos = p < 0 ? 0 : static_cast<std::size_t>(p);
             }
+            allele_events[ai] = std::move(events);
+        }
+
+        for (std::size_t ai = 0; ai < alleles.size(); ++ai) {
+            for (const Event& e : allele_events[ai]) {
+                if (e.size_bp < rescue_floor) continue;
+                MergedRecord* grp = nullptr;
+                for (MergedRecord& mr : merged) {
+                    if (mr.seed.type == EvType::Dup) continue;
+                    if (events_match(mr.seed, e)) { grp = &mr; break; }
+                }
+                if (grp == nullptr) {
+                    MergedRecord mr;
+                    mr.seed = e;
+                    mr.member_alleles.insert(ai);
+                    for (const std::string& m : alleles[ai].members) mr.carriers.push_back(m);
+                    merged.push_back(std::move(mr));
+                } else {
+                    if (e.size_bp > grp->seed.size_bp) {
+                        const std::string keep_link = grp->seed.link_id;
+                        grp->seed = e; // largest member represents the record
+                        if (grp->seed.link_id.empty()) grp->seed.link_id = keep_link;
+                    }
+                    if (grp->member_alleles.insert(ai).second) {
+                        for (const std::string& m : alleles[ai].members) grp->carriers.push_back(m);
+                    }
+                }
+            }
+        }
+
+        // ---- Joint re-scan: rescue any haplotype whose walk carries a comparable
+        // signature for a called record, even if its own event was sub-threshold.
+        for (MergedRecord& mr : merged) {
+            if (mr.seed.type == EvType::Dup) continue;
+            for (std::size_t ai = 0; ai < alleles.size(); ++ai) {
+                if (mr.member_alleles.count(ai)) continue;
+                for (const Event& e : allele_events[ai]) {
+                    if (events_match(mr.seed, e)) {
+                        mr.member_alleles.insert(ai);
+                        for (const std::string& m : alleles[ai].members) mr.carriers.push_back(m);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // ---- INS subtype refinement on the representative only (bounded minimap2 calls).
+        if (options.classify_ins) {
+            std::string ref_window;
+            for (MergedRecord& mr : merged) {
+                if (mr.seed.type != EvType::Ins || mr.seed.seq.empty()) continue;
+                if (ref_window.empty()) ref_window = spell_path_steps_sequence(graph, ref_steps);
+                const Minimap2Hit hit = minimap2_best_hit(
+                    "ins", mr.seed.seq, "refwin", ref_window, options.minimap_preset, options.minimap_best_n);
+                mr.seed.ins_subtype = (hit.ok && hit.identity() >= options.ins_dup_min_identity &&
+                                       hit.query_end_bp - hit.query_start_bp >= mr.seed.seq.size() / 2)
+                                          ? "DUP" : "NOVEL";
+            }
+        }
+
+        // ---- Keep records reaching min_sv_bp (by representative) and --min-haplotypes.
+        {
+            std::vector<MergedRecord> kept;
+            for (MergedRecord& mr : merged) {
+                std::unordered_set<std::string> uniq(mr.carriers.begin(), mr.carriers.end());
+                std::size_t support = uniq.size();
+                if (mr.seed.type == EvType::Dup) {
+                    support = 0;
+                    for (const auto& [s, cn] : mr.sample_cn) { (void)s; if (cn != mr.seed.ref_cn) ++support; }
+                } else if (mr.seed.size_bp < options.min_sv_bp) {
+                    continue;
+                }
+                if (support < options.min_haplotypes) continue;
+                kept.push_back(std::move(mr));
+            }
+            merged = std::move(kept);
         }
         if (merged.empty()) continue;
         ++summary.bubbles_with_calls;
@@ -586,13 +701,16 @@ void call_variants(
                 end = pos + node_len(graph, e.nodes.empty() ? std::string() : e.nodes.front());
             }
 
+            std::unordered_set<std::string> carrier_set(mr.carriers.begin(), mr.carriers.end());
+
             std::ostringstream info;
             info << "END=" << end << ";SVTYPE=" << svt << ";SVLEN=" << svlen
                  << ";BUBBLE_ID=" << bubble.id
                  << ";START_NODE=" << e.start_node << ";END_NODE=" << e.end_node
-                 << ";NMERGED=" << mr.carriers.size();
+                 << ";NMERGED=" << carrier_set.size();
             info << ";EVENT_NODES=";
             for (std::size_t k = 0; k < e.nodes.size(); ++k) { if (k) info << ','; info << e.nodes[k]; }
+            if (!e.link_id.empty()) info << ";EVENTID=bubble" << bubble.id << "_" << e.link_id;
             if (e.type == EvType::Dup) info << ";REF_CN=" << e.ref_cn;
             if (e.type == EvType::Ins && !e.ins_subtype.empty()) info << ";INS_SUBTYPE=" << e.ins_subtype;
             if (!e.seq.empty() && e.seq.size() <= 20000) {
@@ -602,7 +720,6 @@ void call_variants(
             }
 
             const std::string id = "bubble" + std::to_string(bubble.id) + "_" + svt + "_" + e.start_node;
-            std::unordered_set<std::string> carrier_set(mr.carriers.begin(), mr.carriers.end());
 
             std::ostringstream row;
             row << ref_meta.chrom << '\t' << pos << '\t' << id << '\t' << ref_base

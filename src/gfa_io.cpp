@@ -1,5 +1,7 @@
 #include "panvar/gfa_io.hpp"
 
+#include "panvar/gz_reader.hpp"
+
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -89,15 +91,15 @@ std::string format_w_steps(const std::vector<PathStep>& steps) {
 } // namespace
 
 GfaModel read_gfa_model(const std::string& gfa_path) {
-    std::ifstream in(gfa_path);
-    if (!in) {
+    GzLineReader in(gfa_path);
+    if (!in.ok()) {
         throw std::runtime_error("Failed to open GFA file: " + gfa_path);
     }
 
     GfaModel model;
     std::string line;
     std::size_t line_no = 0;
-    while (std::getline(in, line)) {
+    while (in.getline(line)) {
         ++line_no;
         if (!line.empty() && line.back() == '\r') {
             line.pop_back();

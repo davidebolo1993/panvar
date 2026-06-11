@@ -1,8 +1,9 @@
 #include "panvar/gfa.hpp"
 
+#include "panvar/gz_reader.hpp"
+
 #include <algorithm>
 #include <cctype>
-#include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -127,8 +128,8 @@ bool Graph::has_edge_between(const std::string& a, const std::string& b) const {
 }
 
 Graph parse_gfa(const std::string& gfa_path, const ParseGfaOptions& options) {
-    std::ifstream in(gfa_path);
-    if (!in) {
+    GzLineReader in(gfa_path);
+    if (!in.ok()) {
         throw std::runtime_error("Failed to open GFA file: " + gfa_path);
     }
 
@@ -137,7 +138,7 @@ Graph parse_gfa(const std::string& gfa_path, const ParseGfaOptions& options) {
 
     std::string line;
     std::size_t line_no = 0;
-    while (std::getline(in, line)) {
+    while (in.getline(line)) {
         ++line_no;
         if (line.empty()) {
             continue;

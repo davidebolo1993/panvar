@@ -8,13 +8,19 @@ CLI entrypoint:
 
 `call` types structural variants directly on the pangenome graph. For each bubble it compares every
 haplotype's source→sink walk to a **designated reference path's** walk and reads the differences off a
-node-level alignment — no per-cluster minimap2/dotplot machinery. It then fights call fragmentation in
+node-level alignment. It then fights call fragmentation in
 two ways and writes a tidy multi-sample VCF:
 
 1. **Within a haplotype**, fragmented same-type events that sit close together are **coalesced** into one
    (`--merge-distance-bp`).
-2. **Across haplotypes**, equivalent events are **merged** by a length-weighted node-set Jaccard
-   (`--merge-jaccard`) into a single multi-sample record.
+2. **Across haplotypes**, equivalent events are **merged** when they share an anchor window and either
+   their node sets overlap (length-weighted Jaccard ≥ `--merge-jaccard`) **or** their sequences are
+   similar (identity ≥ `--merge-seq-identity`). The sequence key consolidates events that are the same
+   biologically but thread different graph nodes (e.g. a microsatellite tangle).
+3. **Sub-threshold rescue**: events are merged *before* the size filter (down to `--rescue-min-bp`), and
+   a joint re-scan checks every haplotype at each called locus — so a 49 bp deletion in one haplotype is
+   rescued (`GT=1`) by a 51 bp call in another instead of being dropped and genotyped `0`. A merged
+   record is reported only if its representative (largest member) reaches `--min-sv-bp`.
 
 Input is expected to be a **panphorte-normalized GFA**, so a tandem duplication is a single repeat-unit
 (`REP`) node traversed N times; copy number then falls straight out of the walk.
@@ -40,9 +46,12 @@ Input is expected to be a **panphorte-normalized GFA**, so a tandem duplication 
 
 ## Key options
 
-- `--min-sv-bp <N>` — minimum event size to report (default `50`)
+- `--min-sv-bp <N>` — minimum size of a reported (merged) event (default `50`)
 - `--merge-distance-bp <N>` — coalesce nearby same-type events within a bubble (default `100`)
 - `--merge-jaccard <X>` — cross-haplotype node-set Jaccard threshold to merge events (default `0.80`)
+- `--merge-seq-identity <X>` — cross-haplotype event-sequence identity to merge (default `0.80`)
+- `--min-haplotypes <N>` — drop records carried by fewer than N haplotypes (default `1` = off)
+- `--rescue-min-bp <N>` — floor for sub-threshold events kept for merge/rescue (default `min-sv-bp/2`)
 - `--classify-ins` — refine INS subtype NOVEL/DUP via minimap2 (`--minimap-preset`, `--minimap-best-n`,
   `--ins-dup-min-identity`)
 - `--bubble-id <N>` — restrict to one bubble (repeatable)
@@ -59,8 +68,10 @@ Both are VCF 4.2. Samples are the **haplotypes** (every P/W path; haploid). For 
 - `FORMAT=GT`: `1` = carrier, `0` = traverses the bubble but reference-like, `.` = does not traverse it.
 - `FORMAT=CN`: per-sample copy number (DUP records; `.` otherwise).
 - `INFO`: `SVTYPE, SVLEN, END, BUBBLE_ID, START_NODE, END_NODE, EVENT_NODES` (the variant node set),
-  `NMERGED` (carrier count), `INS_SUBTYPE` (refined INS only), `REF_CN` (DUP), and the event sequence
-  (`INSSEQ`/`DELSEQ`/`INVSEQ`, omitted when very long).
+  `NMERGED` (carrier count), `EVENTID` (links a co-located DEL+INS substitution), `INS_SUBTYPE`
+  (refined INS only), `REF_CN` (DUP), and the event sequence (`INSSEQ`/`DELSEQ`/`INVSEQ`, omitted when
+  very long). A haplotype that both deletes a reference block and inserts a haplotype block at the same
+  spot (a substitution) yields two records (one DEL, one INS) sharing the same `EVENTID`.
 - `CHROM`/`POS` come from the reference path's genomic label (e.g. `...chr6:31891045-...`) when
   parseable, else a graph-relative offset; the graph **node** ids in `START_NODE`/`END_NODE` are the
   exact anchors regardless of coordinate availability.
@@ -79,8 +90,13 @@ For each bubble:
    DEL / INS / INV / DUP. INV is detected when a haplotype gap-block is the reverse-complement node-walk
    of the opposing reference gap-block.
 4. Coalesce nearby same-type events within the haplotype (`--merge-distance-bp`).
-5. Merge events across haplotypes: same type and length-weighted node-set Jaccard `≥ --merge-jaccard`
-   (DUP merges on shared `REP` node identity, with per-sample CN). Emit one VCF record per merged group.
+5. Merge events across haplotypes (keeping all events down to `--rescue-min-bp`): same type, anchors
+   within the window, and node-set Jaccard `≥ --merge-jaccard` **or** sequence identity
+   `≥ --merge-seq-identity`. The largest member represents the record. DUP merges on shared `REP` node
+   identity, with per-sample CN.
+6. Joint re-scan every haplotype at each merged locus to set `GT` (rescuing sub-threshold carriers),
+   keep records whose representative reaches `--min-sv-bp` and carrier count reaches `--min-haplotypes`,
+   and emit one VCF record per group.
 
 ## Example
 
