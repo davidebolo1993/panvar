@@ -1,6 +1,7 @@
 #include "panvar/minimap2_align.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <limits>
 
