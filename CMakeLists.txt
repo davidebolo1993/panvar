@@ -36,13 +36,16 @@ add_dependencies(minimap2 minimap2_build)
 
 add_library(panvarlib
     src/gfa.cpp
+    src/gfa_io.cpp
+    src/align.cpp
     src/graph_utils.cpp
     src/bubble_path.cpp
     src/bubbles.cpp
-    src/allele.cpp
-    src/allele_similarity.cpp
-    src/call.cpp
+    src/ref_path.cpp
+    src/minimap2_align.cpp
+    src/variant_call.cpp
     src/describe.cpp
+    src/panphorte.cpp
     src/output.cpp
 )
 
@@ -66,9 +69,9 @@ add_executable(panvar
     src/cli_utils.cpp
     src/bubble_command.cpp
     src/inspect.cpp
-    src/allele_command.cpp
     src/call_command.cpp
     src/describe_command.cpp
+    src/panphorte_command.cpp
 )
 target_link_libraries(panvar PRIVATE panvarlib minimap2 Threads::Threads ZLIB::ZLIB)
 if(NOT WIN32)

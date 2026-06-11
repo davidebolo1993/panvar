@@ -3,12 +3,12 @@
 #include <string>
 #include <vector>
 
-#include "panvar/allele_command.hpp"
 #include "panvar/bubble_command.hpp"
 #include "panvar/call_command.hpp"
 #include "panvar/cli_utils.hpp"
 #include "panvar/describe_command.hpp"
 #include "panvar/inspect.hpp"
+#include "panvar/panphorte_command.hpp"
 
 int main(int argc, char** argv) {
     try {
@@ -36,14 +36,14 @@ int main(int argc, char** argv) {
         if (subcommand == "inspect") {
             return panvar::run_inspect_command(args);
         }
-        if (subcommand == "allele") {
-            return panvar::run_allele_command(args);
-        }
         if (subcommand == "call") {
             return panvar::run_call_command(args);
         }
         if (subcommand == "describe") {
             return panvar::run_describe_command(args);
+        }
+        if (subcommand == "panphorte") {
+            return panvar::run_panphorte_command(args);
         }
 
         throw std::runtime_error("Unknown subcommand: " + subcommand);

@@ -19,8 +19,6 @@ In practice:
 5. optionally merge nearby bubbles (`--merge-nearby-bp`)
 6. write module handoff and visualization outputs
 
-It does not execute `vg` at runtime.
-
 ## Required inputs
 
 1. `--gfa <graph.gfa>`
@@ -39,6 +37,12 @@ Output directories are auto-created when missing.
 `snarls.jsonl` is generated before running `panvar bubble`:
 
 ```bash
+#graph building
+pggb -i <haplotypes.fa> -o <pggb.outdir>
+#manipulation
+odgi paths -i <pggb.outdir>/*smooth.final.og -L | grep <reference.id> > <pggb.outdir>/ref.path.txt
+odgi sort -i <pggb.outdir>/*smooth.final.og -Y -H <pggb.outdir>/ref.path.txt -o - | odgi flip -i - --ref-flips <pggb.outdir>/ref.path.txt -o - | odgi view -i - -g | sed 's/_inv$//g'>  <graph.gfa>
+#snarls calling
 vg snarls -A integrated <graph.gfa>  | vg view -R -j - >  <graph>.snarls.jsonl
 ```
 

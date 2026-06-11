@@ -1,0 +1,25 @@
+#pragma once
+
+// Lightweight banded alignment used by panphorte to detect near-identical tandem
+// repeat copies (no external aligner). Unit-cost edit distance.
+
+#include <cstddef>
+#include <string>
+
+namespace panvar {
+
+struct FitAlignResult {
+    bool ok = false;            // false if the optimal path left the band
+    std::size_t edits = 0;      // edit distance (mismatches + indels)
+    std::size_t query_len = 0;  // |query| (all of query is consumed)
+    std::size_t target_consumed = 0; // target bases aligned (copy length in target)
+    double identity = 0.0;      // 1 - edits / max(query_len, target_consumed)
+};
+
+// Fit the entire `query` into `target` starting at target[0] (no leading target
+// gap), with a free end gap on the target, within +/- `band` of the diagonal.
+// Returns the best end position on the target (the copy length) and identity.
+// Linear space (two DP rows).
+FitAlignResult fit_align(const std::string& query, const std::string& target, std::size_t band);
+
+} // namespace panvar

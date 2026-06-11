@@ -5,6 +5,6 @@
 
 namespace panvar {
 
-int run_allele_command(const std::vector<std::string>& args);
+int run_panphorte_command(const std::vector<std::string>& args);
 
 } // namespace panvar

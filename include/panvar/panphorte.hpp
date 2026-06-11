@@ -1,0 +1,35 @@
+#pragma once
+
+#include <cstddef>
+#include <string>
+#include <vector>
+
+namespace panvar {
+
+struct PanphorteOptions {
+    std::string gfa_path;
+    std::string bubbles_csv_in;     // module-1 bubbles CSV
+    std::string out_prefix;         // writes <prefix>.normalized.gfa + <prefix>.panphorte.report.tsv
+    std::size_t min_unit_bp = 50;   // minimum repeat-unit span to normalize
+    std::size_t min_copies = 2;     // minimum tandem copies to normalize
+    double max_interruption_frac = 0.25; // tolerance for interrupting bases within an array
+    // Minimum identity to treat a block as a copy of the repeat unit. 1.0 = exact
+    // (current behavior); < 1.0 enables approximate, similarity-based detection.
+    double min_similarity = 1.0;
+    std::size_t threads = 0;        // 0 = hardware concurrency (approximate detection)
+    std::vector<std::size_t> bubble_ids; // if non-empty, restrict to these bubbles
+    bool quiet = false;
+};
+
+struct PanphorteSummary {
+    std::size_t bubbles_seen = 0;
+    std::size_t bubbles_normalized = 0;
+    std::size_t paths_rewritten = 0;
+    std::size_t nodes_removed = 0;
+    std::size_t nodes_added = 0;
+    std::size_t edges_added = 0;
+};
+
+void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summary_out = nullptr);
+
+} // namespace panvar

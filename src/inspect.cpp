@@ -32,7 +32,8 @@ void print_inspect_help() {
         << "      --bubble-id <N>              Bubble ID to inspect (default: inspect all bubbles)\n"
         << "  -o, --out-prefix <prefix>        Output prefix (default: inspect)\n"
         << "      --fasta-out <path>           Explicit FASTA.GZ path (requires --bubble-id)\n"
-        << "      --table-out <path>           Explicit TSV table path (requires --bubble-id)\n"
+        << "      --table-out <path>           Explicit node-count TSV path (requires --bubble-id)\n"
+        << "      --edge-table-out <path>      Explicit edge-count TSV path (requires --bubble-id)\n"
         << "  -h, --help                       Show this help\n";
 }
 
@@ -78,26 +79,33 @@ struct InspectBubbleResult {
     std::size_t paths_written = 0;
     std::string fasta_out_path;
     std::string table_out_path;
+    std::string edge_table_out_path;
+};
+
+// Orientation-aware edge key for a step pair, e.g. "12+>13-". Adjacency-aware so a
+// tandem self-loop (the same edge traversed repeatedly) shows up as a high count.
+std::string edge_key(const PathStep& a, const PathStep& b) {
+    return a.node_id + (a.reverse ? '-' : '+') + ">" + b.node_id + (b.reverse ? '-' : '+');
+}
+
+// One path's traversal of a bubble: node counts and edge counts.
+struct InspectPathRow {
+    std::string name;
+    std::size_t sequence_length = 0;
+    std::unordered_map<std::string, InspectNodeCount> node_counts;
+    std::unordered_map<std::string, std::size_t> edge_counts;
 };
 
 InspectBubbleResult write_inspect_outputs_for_bubble(
     const Graph& graph,
     const Bubble& bubble,
     const std::string& fasta_out_path,
-    const std::string& table_out_path) {
+    const std::string& table_out_path,
+    const std::string& edge_table_out_path) {
 
     cli::ensure_parent_dir_for_file(fasta_out_path);
     cli::ensure_parent_dir_for_file(table_out_path);
-
-    std::ofstream table_out(table_out_path);
-    if (!table_out) {
-        throw std::runtime_error("Failed to write inspect table: " + table_out_path);
-    }
-    table_out << "path_name\tpath_length_bp";
-    for (const auto& node_id : bubble.inside) {
-        table_out << "\tnode." << tsv_sanitize(node_id);
-    }
-    table_out << "\n";
+    cli::ensure_parent_dir_for_file(edge_table_out_path);
 
     gzFile fasta = gzopen(fasta_out_path.c_str(), "wb");
     if (fasta == nullptr) {
@@ -108,9 +116,11 @@ InspectBubbleResult write_inspect_outputs_for_bubble(
     inside_nodes.reserve(bubble.inside.size() * 2);
     inside_nodes.insert(bubble.inside.begin(), bubble.inside.end());
 
-    InspectBubbleResult result;
-    result.fasta_out_path = fasta_out_path;
-    result.table_out_path = table_out_path;
+    // Pass 1: collect per-path node + edge counts and stream the FASTA. Edge columns
+    // are not known up front, so the matrices are written after the union is built.
+    std::vector<InspectPathRow> rows;
+    std::vector<std::string> edge_order;          // edge columns, first-seen order
+    std::unordered_set<std::string> edge_seen;
     try {
         for (const auto& path : graph.paths) {
             const BubblePathIndex index = build_bubble_path_index(path);
@@ -125,14 +135,15 @@ InspectBubbleResult write_inspect_outputs_for_bubble(
             }
 
             const std::string sequence = spell_path_steps_sequence(graph, steps);
-            const std::size_t sequence_length = sequence.size();
-            std::unordered_map<std::string, InspectNodeCount> counts_by_node;
-            counts_by_node.reserve(bubble.inside.size());
+            InspectPathRow row;
+            row.name = tsv_sanitize(path.name);
+            row.sequence_length = sequence.size();
+            row.node_counts.reserve(bubble.inside.size());
             for (const auto& step : steps) {
                 if (inside_nodes.find(step.node_id) == inside_nodes.end()) {
                     continue;
                 }
-                auto& c = counts_by_node[step.node_id];
+                auto& c = row.node_counts[step.node_id];
                 c.total += 1;
                 if (step.reverse) {
                     c.reverse += 1;
@@ -140,40 +151,81 @@ InspectBubbleResult write_inspect_outputs_for_bubble(
                     c.forward += 1;
                 }
             }
+            for (std::size_t i = 1; i < steps.size(); ++i) {
+                const std::string key = edge_key(steps[i - 1], steps[i]);
+                if (edge_seen.insert(key).second) {
+                    edge_order.push_back(key);
+                }
+                row.edge_counts[key] += 1;
+            }
 
             const std::string fasta_name =
-                tsv_sanitize(path.name) +
+                row.name +
                 " bubble=" + std::to_string(bubble.id) +
                 " source=" + bubble.source +
                 " sink=" + bubble.sink +
-                " length_bp=" + std::to_string(sequence_length) +
+                " length_bp=" + std::to_string(row.sequence_length) +
                 " source_to_sink=" + (interval->source_to_sink ? "1" : "0") +
                 " interval=" + std::to_string(interval->left) + "-" + std::to_string(interval->right);
             gz_write_fasta_record(fasta, fasta_out_path, fasta_name, sequence);
 
-            table_out << tsv_sanitize(path.name) << '\t' << sequence_length;
-            for (const auto& node_id : bubble.inside) {
-                const auto count_it = counts_by_node.find(node_id);
-                if (count_it == counts_by_node.end()) {
-                    table_out << "\t0:0:0";
-                } else {
-                    const auto& c = count_it->second;
-                    table_out << '\t'
-                              << c.total << ':'
-                              << c.forward << ':'
-                              << c.reverse;
-                }
-            }
-            table_out << '\n';
-            ++result.paths_written;
+            rows.push_back(std::move(row));
         }
     } catch (...) {
         gzclose(fasta);
         throw;
     }
-
     if (gzclose(fasta) != Z_OK) {
         throw std::runtime_error("Failed to close compressed FASTA: " + fasta_out_path);
+    }
+
+    // Stable, deterministic edge column order.
+    std::sort(edge_order.begin(), edge_order.end());
+
+    std::ofstream table_out(table_out_path);
+    if (!table_out) {
+        throw std::runtime_error("Failed to write inspect table: " + table_out_path);
+    }
+    std::ofstream edge_out(edge_table_out_path);
+    if (!edge_out) {
+        throw std::runtime_error("Failed to write inspect edge table: " + edge_table_out_path);
+    }
+
+    table_out << "path_name\tpath_length_bp";
+    for (const auto& node_id : bubble.inside) {
+        table_out << "\tnode." << tsv_sanitize(node_id);
+    }
+    table_out << "\n";
+    edge_out << "path_name\tpath_length_bp";
+    for (const auto& key : edge_order) {
+        edge_out << "\tedge." << key;
+    }
+    edge_out << "\n";
+
+    InspectBubbleResult result;
+    result.fasta_out_path = fasta_out_path;
+    result.table_out_path = table_out_path;
+    result.edge_table_out_path = edge_table_out_path;
+    for (const InspectPathRow& row : rows) {
+        table_out << row.name << '\t' << row.sequence_length;
+        for (const auto& node_id : bubble.inside) {
+            const auto it = row.node_counts.find(node_id);
+            if (it == row.node_counts.end()) {
+                table_out << "\t0:0:0";
+            } else {
+                table_out << '\t' << it->second.total << ':' << it->second.forward << ':'
+                          << it->second.reverse;
+            }
+        }
+        table_out << '\n';
+
+        edge_out << row.name << '\t' << row.sequence_length;
+        for (const auto& key : edge_order) {
+            const auto it = row.edge_counts.find(key);
+            edge_out << '\t' << (it == row.edge_counts.end() ? 0 : it->second);
+        }
+        edge_out << '\n';
+        ++result.paths_written;
     }
     return result;
 }
@@ -187,6 +239,7 @@ int run_inspect_command(const std::vector<std::string>& args) {
     std::string out_prefix = "inspect";
     std::string fasta_out_path;
     std::string table_out_path;
+    std::string edge_table_out_path;
     std::size_t bubble_id = 0;
 
     for (std::size_t i = 0; i < args.size(); ++i) {
@@ -230,6 +283,10 @@ int run_inspect_command(const std::vector<std::string>& args) {
             table_out_path = require_value(arg);
             continue;
         }
+        if (arg == "--edge-table-out") {
+            edge_table_out_path = require_value(arg);
+            continue;
+        }
         throw std::runtime_error("Unknown option: " + arg);
     }
 
@@ -249,8 +306,8 @@ int run_inspect_command(const std::vector<std::string>& args) {
     if (bubbles_csv_path.empty()) {
         throw std::runtime_error("Missing required input: --bubbles-csv <path> or --bubble-prefix-in <prefix>");
     }
-    if (bubble_id == 0 && (!fasta_out_path.empty() || !table_out_path.empty())) {
-        throw std::runtime_error("--fasta-out/--table-out require --bubble-id; use --out-prefix when inspecting all bubbles");
+    if (bubble_id == 0 && (!fasta_out_path.empty() || !table_out_path.empty() || !edge_table_out_path.empty())) {
+        throw std::runtime_error("--fasta-out/--table-out/--edge-table-out require --bubble-id; use --out-prefix when inspecting all bubbles");
     }
 
     ParseGfaOptions parse_options;
@@ -293,18 +350,23 @@ int run_inspect_command(const std::vector<std::string>& args) {
         const Bubble& bubble = *bubble_ptr;
         std::string bubble_fasta_out_path = fasta_out_path;
         std::string bubble_table_out_path = table_out_path;
+        std::string bubble_edge_table_out_path = edge_table_out_path;
         if (bubble_fasta_out_path.empty()) {
             bubble_fasta_out_path = out_prefix + ".bubble_" + std::to_string(bubble.id) + ".paths.fa.gz";
         }
         if (bubble_table_out_path.empty()) {
             bubble_table_out_path = out_prefix + ".bubble_" + std::to_string(bubble.id) + ".node_counts.tsv";
         }
+        if (bubble_edge_table_out_path.empty()) {
+            bubble_edge_table_out_path = out_prefix + ".bubble_" + std::to_string(bubble.id) + ".edge_counts.tsv";
+        }
 
         const InspectBubbleResult result = write_inspect_outputs_for_bubble(
             graph,
             bubble,
             bubble_fasta_out_path,
-            bubble_table_out_path);
+            bubble_table_out_path,
+            bubble_edge_table_out_path);
         total_paths_written += result.paths_written;
 
         std::cout
@@ -313,7 +375,8 @@ int run_inspect_command(const std::vector<std::string>& args) {
             << "Inside nodes: " << bubble.inside.size() << "\n"
             << "Paths written: " << result.paths_written << "\n"
             << "Wrote: " << result.fasta_out_path << "\n"
-            << "Wrote: " << result.table_out_path << "\n";
+            << "Wrote: " << result.table_out_path << "\n"
+            << "Wrote: " << result.edge_table_out_path << "\n";
     }
 
     std::cout << "Total paths written: " << total_paths_written << "\n";

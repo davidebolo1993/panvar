@@ -13,13 +13,15 @@ CLI entrypoint:
 Given a GFA and a module-1 bubble CSV, it writes:
 
 1. a compressed multi-FASTA with one record per path crossing that bubble
-2. a TSV matrix describing how each path traverses the bubble-internal nodes
+2. a TSV matrix describing how each path traverses the bubble-internal **nodes**
+3. a TSV matrix describing how each path traverses the bubble-internal **edges** (adjacencies)
 
 This is meant for sanity-checking questions like:
 
 - which paths actually cross this bubble?
 - how long is each path through this bubble?
 - which internal nodes are reused, and in which orientation?
+- which adjacencies (edges) are reused — e.g. a tandem self-loop shows up as a high edge count?
 
 ## Required inputs
 
@@ -40,13 +42,15 @@ Default output paths are derived from `--out-prefix` and the bubble ID:
 
 - `<out-prefix>.bubble_<N>.paths.fa.gz`
 - `<out-prefix>.bubble_<N>.node_counts.tsv`
+- `<out-prefix>.bubble_<N>.edge_counts.tsv`
 
 You can override them explicitly with:
 
 - `--fasta-out <path>`
-- `--table-out <path>`
+- `--table-out <path>` (node counts)
+- `--edge-table-out <path>` (edge counts)
 
-Explicit `--fasta-out` and `--table-out` are only accepted with `--bubble-id`, because all-bubble mode needs one output pair per bubble.
+Explicit output paths are only accepted with `--bubble-id`, because all-bubble mode needs one output set per bubble.
 
 Output directories are auto-created when missing.
 
@@ -84,6 +88,24 @@ For example, `3:2:1` means that, inside this bubble interval only, the path trav
 Important: counts are interval-local. If the same path reuses a node elsewhere outside the selected source/sink interval, that outside traversal is not counted for this bubble.
 
 The orientation is counted after canonical source-to-sink normalization, matching allele clustering. A `reverse` count therefore means the node is traversed in reverse orientation in the canonical bubble allele. If the graph has no `-`/`<` path steps in the selected intervals, reverse counts can legitimately be zero.
+
+## Edge-count table
+
+Columns:
+
+- `path_name`
+- `path_length_bp`
+- one `edge.<from><sign>><to><sign>` column per bubble-internal adjacency, e.g. `edge.1886+>1887+`
+
+Each edge cell is an integer: how many times the path traverses that **directed, orientation-aware
+adjacency** inside the canonical source-to-sink bubble interval. The edge key encodes the orientation
+of both endpoints (`+`/`-`), so a forward and a reverse traversal of the same node pair are distinct
+columns.
+
+The edge matrix is **adjacency-aware**, complementing the node matrix: a tandem repeat that loops over
+the same unit repeats the *same edge*, so a self-loop / back-edge shows up as a cell value `> 1` (the
+copy number). Edge columns are the union of adjacencies observed across all paths, sorted for a stable,
+deterministic column order. As with nodes, counts are interval-local.
 
 ## Node Coverage Heatmap
 
@@ -124,6 +146,22 @@ Useful plotting options:
 - `--max-paths <N>`
 - `--max-nodes <N>`
 
+## Edge Coverage Heatmap
+
+Use `scripts/plot_edge_coverage_heatmap.R` to visualize an inspect edge-count table — the same
+dependency (`Rscript` + `ggplot2`) and the same interface as the node heatmap, minus `--value` (edge
+cells are plain traversal counts):
+
+```bash
+scripts/plot_edge_coverage_heatmap.R \
+  --table tests/results/c4/inspect/bubble_4.edge_counts.tsv \
+  --out tests/results/c4/inspect/bubble_4.edge_coverage \
+  --transform log1p --cluster-rows --cluster-cols
+```
+
+This writes `<out>.png` and `<out>.pdf`. Options: `--transform raw|log1p`, `--cluster-rows`,
+`--cluster-cols`, `--max-paths <N>`, `--max-edges <N>`, `--width`, `--height`.
+
 ## Interval selection
 
 For each path, `inspect` uses the same source/sink interval logic as module 2:
@@ -149,6 +187,7 @@ This writes:
 
 - `tests/results/c4/inspect/bubble_1.bubble_1.paths.fa.gz`
 - `tests/results/c4/inspect/bubble_1.bubble_1.node_counts.tsv`
+- `tests/results/c4/inspect/bubble_1.bubble_1.edge_counts.tsv`
 
 To inspect all bubbles:
 
@@ -163,5 +202,7 @@ This writes one FASTA/table pair per bubble, for example:
 
 - `tests/results/c4/inspect/all.bubble_1.paths.fa.gz`
 - `tests/results/c4/inspect/all.bubble_1.node_counts.tsv`
+- `tests/results/c4/inspect/all.bubble_1.edge_counts.tsv`
 - `tests/results/c4/inspect/all.bubble_2.paths.fa.gz`
 - `tests/results/c4/inspect/all.bubble_2.node_counts.tsv`
+- `tests/results/c4/inspect/all.bubble_2.edge_counts.tsv`

@@ -21,11 +21,11 @@ void print_general_help() {
         << "Usage:\n"
         << "  panvar <subcommand> [options]\n\n"
         << "Subcommands:\n"
-        << "  bubble    Module 1: refine/import sites from 'vg snarls'\n"
-        << "  inspect   Utility: inspect path walks through one called bubble\n"
-        << "  allele    Module 2: allele extraction and clustering from module-1 sites\n"
-        << "  call      Module 3: variant calling on module-2 clustered alleles\n"
-        << "  describe  Module 4: per-bubble k-mer feature description\n\n"
+        << "  bubble     Module 1: refine/import sites from 'vg snarls'\n"
+        << "  inspect    Utility: inspect path walks through one called bubble\n"
+        << "  panphorte  Utility: normalize tandem-repeat bubbles into a compact GFA\n"
+        << "  call       Module 2: graph-native structural variant calling\n"
+        << "  describe   Module 3: per-bubble k-mer feature description\n\n"
         << "Run 'panvar <subcommand> --help' for options.\n";
 }
 

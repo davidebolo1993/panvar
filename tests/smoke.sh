@@ -34,7 +34,6 @@ fi
 mkdir -p "$OUT_DIR"
 
 BUBBLE_PREFIX="$OUT_DIR/bubble"
-ALLELE_PREFIX="$OUT_DIR/allele"
 CALL_PREFIX="$OUT_DIR/call"
 DESCRIBE_DIR="$OUT_DIR/describe"
 
@@ -67,17 +66,10 @@ if [[ -n "$FIRST_BUBBLE_ID" ]]; then
     --quiet >/dev/null
 fi
 
-"$PANVAR_BIN" allele \
-  -i "$GFA" \
-  -o "$ALLELE_PREFIX" \
-  --bubble-prefix-in "$BUBBLE_PREFIX" \
-  --quiet
-
 "$PANVAR_BIN" call \
   -i "$GFA" \
   -o "$CALL_PREFIX" \
   --bubble-prefix-in "$BUBBLE_PREFIX" \
-  --allele-prefix-in "$ALLELE_PREFIX" \
   --reference-path "$REF_PATH" \
   --quiet
 
@@ -98,6 +90,4 @@ if [[ -n "${FIRST_BUBBLE_ID:-}" ]]; then
   gzip -t "$DESCRIBE_BUBBLE_DIR/kmer_counts.jsonl.gz"
   gzip -t "$DESCRIBE_BUBBLE_DIR/kmer_matrix.tsv.gz"
 fi
-test -s "$ALLELE_PREFIX.allele_clusters.csv"
-test -s "$ALLELE_PREFIX.allele_assignments.csv"
 test -s "$CALL_PREFIX.region.vcf"
