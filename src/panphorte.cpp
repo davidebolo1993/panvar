@@ -13,8 +13,11 @@
 #include <cstdint>
 #include <fstream>
 #include <functional>
+#include <iostream>
 #include <limits>
 #include <map>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -335,6 +338,7 @@ std::vector<TandemArray> detect_tandems(
     return arrays;
 }
 
+
 std::string spell_model_path(const GfaModel& model, const GfaPath& path) {
     std::string out;
     for (const PathStep& s : path.steps) {
@@ -487,11 +491,12 @@ std::size_t nearest_step_off(const std::vector<std::size_t>& prefix, std::size_t
     return (bp - prefix[lo] <= prefix[hi] - bp) ? lo : hi;
 }
 
-// Seed the bubble's repeat unit from the exact tandem detector: a unit must come
-// from a clean ADJACENT identical pair (so we get the real repeat period, e.g.
-// the whole ~32 kb C4 module, not a small sub-segment that merely recurs far
-// apart). Across sampled paths, tally each detected unit and return the most
-// supported one (tie-break to the longer unit), or "" if none qualifies.
+// Seed the bubble's repeat unit from the exact tandem detector: a unit must come from a
+// clean ADJACENT identical pair (so we get the real repeat period, e.g. the whole ~32 kb C4
+// long module, not a small sub-segment that merely recurs). The per-path scan runs in
+// parallel; the tally merge is serial in path order, and the winner is the most-supported
+// unit (tie-break to the longer unit, then lexicographic) so the result is identical
+// regardless of thread count.
 std::string pick_reference_unit(
     const Graph& graph,
     const std::unordered_map<std::string, NodeTok>& node_tok,
@@ -499,23 +504,35 @@ std::string pick_reference_unit(
     const Bubble& bubble,
     const PanphorteOptions& options) {
 
-    std::unordered_map<std::string, std::size_t> tally;
-    for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
+    using Cand = std::pair<std::string, std::size_t>; // (unit_seq, copies)
+    std::vector<std::vector<Cand>> per_path(graph.paths.size());
+    run_parallel(graph.paths.size(), options.threads, [&](std::size_t pi) {
         const auto interval = find_best_bubble_path_interval(path_indexes[pi], bubble);
-        if (!interval.has_value()) continue;
+        if (!interval.has_value()) return;
         // Exact tandem arrays only need an adjacent identical pair (min_copies 2),
         // independent of the approximate --min-copies the caller will enforce.
         const auto arrays = detect_tandems(
             graph, node_tok, graph.paths[pi], interval->left, interval->right,
             options.min_unit_bp, 2, options.max_interruption_frac);
+        std::vector<Cand> cands;
         for (const TandemArray& arr : arrays) {
-            if (arr.unit_seq.size() >= options.min_unit_bp) tally[arr.unit_seq] += arr.copies;
+            if (arr.unit_seq.size() >= options.min_unit_bp) {
+                cands.emplace_back(arr.unit_seq, arr.copies);
+            }
         }
+        per_path[pi] = std::move(cands);
+    });
+    std::unordered_map<std::string, std::size_t> tally;
+    for (const auto& v : per_path) {
+        for (const auto& [seq, w] : v) tally[seq] += w;
     }
     std::string best;
     std::size_t best_n = 0;
     for (const auto& [seq, cnt] : tally) {
-        if (cnt > best_n || (cnt == best_n && seq.size() > best.size())) {
+        const bool better = cnt > best_n ||
+                            (cnt == best_n && seq.size() > best.size()) ||
+                            (cnt == best_n && seq.size() == best.size() && seq < best);
+        if (best.empty() || better) {
             best_n = cnt;
             best = seq;
         }
@@ -532,6 +549,9 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
     if (options.out_prefix.empty()) {
         throw std::runtime_error("panphorte requires -o/--out-prefix <prefix>");
     }
+    // Create the output directory up front (like the other modules) so the report /
+    // copies / GFA writers below don't fail when the prefix points at a missing dir.
+    cli::ensure_parent_dir_for_file(options.out_prefix);
 
     ParseGfaOptions parse_opts;
     parse_opts.include_paths = true;
@@ -580,6 +600,16 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
     report << "bubble_id\tnormalized\tunit_bp\tpaths_normalized\tmin_copies\tmax_copies\t"
            << "interruptions_bp\tnodes_collapsed\n";
 
+    std::size_t total_bubbles = 0;
+    for (const Bubble& b : bubbles) {
+        if (bubble_filter.empty() || bubble_filter.find(b.id) != bubble_filter.end()) ++total_bubbles;
+    }
+    // Exact mode: a coarse per-bubble bar. Approximate mode shows a richer per-bubble,
+    // per-haplotype line during alignment (below), so the coarse bar is disabled there.
+    const bool bubble_bar = !options.quiet && !approximate;
+    cli::ProgressBar progress(bubble_bar ? "Normalizing bubbles" : std::string(),
+                              bubble_bar ? total_bubbles : 0);
+
     for (const Bubble& bubble : bubbles) {
         if (!bubble_filter.empty() && bubble_filter.find(bubble.id) == bubble_filter.end()) {
             continue;
@@ -594,6 +624,15 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
         std::unordered_set<std::string> collapsed_nodes;
 
         if (approximate) {
+            // Live, per-bubble progress on stderr (interactive only): makes it obvious
+            // whether time goes into seeding or the per-haplotype alignment, and how far
+            // the alignment has progressed. Suppressed by --quiet / non-TTY.
+            const bool show_detail = !options.quiet && cli::stderr_is_tty();
+            if (show_detail) {
+                std::cerr << "\r[bubble " << bubble.id << "] seeding...                    "
+                          << std::flush;
+            }
+
             // Single-block: seed ONE representative repeat unit for the bubble, then
             // find its near-identical copies (any orientation, not necessarily
             // adjacent) per path by banded sequence alignment, and collapse them to
@@ -601,10 +640,22 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
             // as literal steps, so only the repeat copies lose within-copy detail.
             const std::string ref_unit =
                 pick_reference_unit(graph, node_tok, path_indexes, bubble, options);
+            if (!options.quiet) {
+                // One concise line per bubble (works in non-interactive logs too): what was
+                // seeded and how much alignment work it implies, printed BEFORE the expensive
+                // per-haplotype alignment so it is visible even if that phase is slow.
+                std::cerr << "[bubble " << bubble.id << "] seeded unit_bp=" << ref_unit.size()
+                          << "; aligning across " << graph.paths.size() << " haplotypes\n"
+                          << std::flush;
+            }
             if (ref_unit.size() >= options.min_unit_bp) {
                 struct Mapped { std::size_t off_lo, off_hi; bool rev; double id; };
                 struct Res { bool has = false; std::size_t left = 0; std::vector<Mapped> copies; };
                 std::vector<Res> results(graph.paths.size());
+
+                std::atomic<std::size_t> detect_done{0};
+                std::mutex detail_mtx;
+                const std::size_t n_paths = graph.paths.size();
 
                 auto detect_one = [&](std::size_t pi) {
                     const auto interval = find_best_bubble_path_interval(path_indexes[pi], bubble);
@@ -634,9 +685,25 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                     if (copies.size() >= options.min_copies) {
                         results[pi] = Res{true, left, std::move(copies)};
                     }
+                    if (show_detail) {
+                        const std::size_t d = detect_done.fetch_add(1) + 1;
+                        if ((d & 0x1F) == 0 || d == n_paths) { // throttle redraws
+                            std::lock_guard<std::mutex> lk(detail_mtx);
+                            std::cerr << "\r[bubble " << bubble.id << "] unit_bp=" << ref_unit.size()
+                                      << " aligning " << d << '/' << n_paths << " haplotypes      "
+                                      << std::flush;
+                        }
+                    }
                 };
 
+                if (show_detail) {
+                    std::cerr << "\r[bubble " << bubble.id << "] unit_bp=" << ref_unit.size()
+                              << " aligning 0/" << n_paths << " haplotypes      " << std::flush;
+                }
                 run_parallel(graph.paths.size(), options.threads, detect_one);
+                if (show_detail) {
+                    std::cerr << '\n';
+                }
 
                 // Serial: one REP node per bubble; build PathArrays + copies.tsv rows.
                 std::string rep_id;
@@ -716,6 +783,7 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                    << unit_bp_report << '\t' << paths_norm << '\t'
                    << min_copies_seen << '\t' << max_copies_seen << '\t'
                    << interruptions_bp << '\t' << collapsed_nodes.size() << '\n';
+            progress.tick();
             continue; // bubble fully handled in approximate mode
         }
 
@@ -783,7 +851,9 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                << unit_bp_report << '\t' << paths_norm << '\t'
                << min_copies_seen << '\t' << max_copies_seen << '\t'
                << interruptions_bp << '\t' << collapsed_nodes.size() << '\n';
+        progress.tick();
     }
+    progress.done();
 
     // Splice replacements into each path's steps.
     for (std::size_t pi = 0; pi < model.paths.size(); ++pi) {
@@ -873,7 +943,6 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
     }
 
     const std::string normalized_gfa = options.out_prefix + ".normalized.gfa";
-    cli::ensure_parent_dir_for_file(normalized_gfa);
     write_gfa_model(normalized_gfa, model);
 
     if (summary_out != nullptr) {

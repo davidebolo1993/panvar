@@ -23,8 +23,6 @@ double elapsed_seconds(const std::chrono::steady_clock::time_point& start) {
     return static_cast<double>(ms) / 1000.0;
 }
 
-namespace {
-
 bool stderr_is_tty() {
 #if defined(_WIN32)
     return _isatty(_fileno(stderr)) != 0;
@@ -33,12 +31,11 @@ bool stderr_is_tty() {
 #endif
 }
 
-} // namespace
-
 ProgressBar::ProgressBar(std::string label, std::size_t total)
     : label_(std::move(label)), total_(total) {
-    // Only animate on an interactive stderr; skip entirely for empty work.
-    active_ = total_ > 0 && stderr_is_tty();
+    // Only animate on an interactive stderr; skip entirely for empty work or when
+    // suppressed by an empty label (the mechanism used to honor --quiet).
+    active_ = total_ > 0 && !label_.empty() && stderr_is_tty();
     if (active_) {
         render();
     }

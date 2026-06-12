@@ -34,6 +34,8 @@ struct BubbleCallOptions {
     // Optional merge of nearby bubbles on graph distance (bp) between sink/source boundaries.
     // 0 disables merging.
     std::size_t merge_nearby_bp = 0;
+    // Suppress the stderr progress bar (output files are unaffected).
+    bool quiet = false;
 };
 
 struct SnarlDebugEntry {

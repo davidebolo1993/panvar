@@ -1,0 +1,6 @@
+{"directed_acyclic_net_graph": true, "end": {"node_id": "2"}, "start": {"node_id": "8"}, "start_end_reachable": true, "type": 1}
+{"directed_acyclic_net_graph": true, "end": {"node_id": "3"}, "start": {"node_id": "9"}, "start_end_reachable": true, "type": 1}
+{"directed_acyclic_net_graph": true, "end": {"node_id": "4"}, "end_self_reachable": true, "start": {"node_id": "3"}, "start_end_reachable": true, "start_self_reachable": true}
+{"end": {"node_id": "5"}, "start": {"node_id": "4"}, "start_end_reachable": true}
+{"end": {"node_id": "6"}, "start": {"node_id": "5"}, "start_end_reachable": true}
+{"end": {"node_id": "7"}, "start": {"node_id": "6"}, "start_end_reachable": true}

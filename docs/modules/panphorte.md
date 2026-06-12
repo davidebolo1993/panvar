@@ -13,10 +13,22 @@ node ids); this hides copy number behind raw length and bloats the bubble. `panp
 tandem array and **collapses it to a single repeat unit node with a self-loop**, so copy number
 becomes the number of self-loop traversals.
 
-It is panvar's own efficient, dependency-free take on the "panphorte" idea: it reuses panvar's own
-bubbles (no BubbleGun), detects repeats on the **node-walk** (comparing each step by the sequence it
-spells) rather than scanning the full base sequence (`O(node_count^2)` instead of `O(bp^2)` — a
-~1000x reduction on large bubbles), and uses **no external aligner**.
+### Differences from the original panphorte
+
+This is panvar's own re-implementation of the "panphorte" idea, not a wrapper around it. The original
+tool detects bubbles with **BubbleGun** and works from the full base sequence; this re-implementation
+differs deliberately:
+
+| | Original panphorte | This re-implementation |
+|---|---|---|
+| Bubble source | BubbleGun (external) | panvar's own `bubble` snarls (no extra dependency) |
+| Repeat detection | scans full base sequence (`O(bp^2)`) | scans the **node-walk**, comparing each step by the sequence it spells (`O(node_count^2)` — a ~1000x reduction on large bubbles) |
+| Aligner | external | **none**; banded `fit_align` is built in for the approximate mode |
+| Threading | — | per-haplotype parallel seed scan + copy detection (`--threads`) |
+| Modes | single collapse | explicit **exact (sequence-preserving)** vs **approximate (lossy)** via `--min-similarity` |
+
+The net effect is a dependency-free, multithreaded normalizer that runs on the same bubbles the rest of
+the panvar pipeline already produced.
 
 **Correctness:** in exact mode (default, `--min-similarity 1.0`) every rewrite is
 **sequence-preserving** — each path spells exactly the same sequence through the normalized graph as
@@ -50,7 +62,14 @@ sequence-preserving (`--max-interruption-frac` bounds how much interruption an a
 - `--min-similarity <f>`: minimum identity to treat a block as a copy of the repeat unit (default `1.0`
   = exact, sequence-preserving). Values `< 1.0` enable **approximate, lossy collapse** of
   near-identical (divergent) copies.
-- `--quiet`: disable progress logs
+- `--threads <N>`: worker threads for the approximate seed scan and copy detection (`0` = auto).
+- `--quiet`: disable the progress bar / logs
+
+A progress bar over bubbles is printed to stderr (suppressed by `--quiet`); the run summary stays on
+stdout. In approximate mode a per-bubble line reports the seeded unit size and the per-haplotype
+alignment progress. The per-bubble seed scan and copy detection are both parallelized across
+haplotypes (`--threads`); the graph rewrite is serial, and output is identical regardless of thread
+count.
 
 ## Approximate collapse (`--min-similarity < 1.0`)
 
@@ -62,7 +81,8 @@ unit per bubble, whose near-identical copies are found by **banded sequence alig
 1. **Seed one representative unit** per bubble from the exact tandem detector: the unit must come from
    a clean **adjacent identical pair** somewhere in the cohort (so we recover the true repeat period —
    the whole ~32 kb C4 module, the ~5.5 kb KIV-2 unit — not a small segment that merely recurs). The
-   most-supported unit across all paths wins.
+   most-supported unit across all paths wins (tie-break to the longer unit, so the C4 **long** module is
+   seeded and the short modules then align into it).
 2. **Find copies** per path by aligning the unit (and its reverse complement) into the path's spelled
    bubble sequence: multi-seed 16-mer anchors propose copy starts, then a **banded global alignment**
    (`fit_align`) decides each copy, its extent, and its orientation. The band is `(1 − f)·|unit|`
@@ -101,7 +121,14 @@ On the bundled data (threaded, ~1 min/locus):
   a single length class, so every row is `n_short=0`.)
 
 **Limitation:** the unit must occur as `>= 2` **adjacent** identical copies in at least one haplotype
-to be seeded. Once seeded, copies in any haplotype may be non-adjacent / divergent.
+to be seeded. Once seeded, copies in any haplotype may be non-adjacent / divergent. A duplication with
+no adjacent identical pair anywhere (e.g. paralogs separated by other sequence, or a copy embedded in a
+larger segmental-duplication cluster like GSTM1) is **not** seeded here, so panphorte leaves that bubble
+intact. Such folded duplications are recovered downstream by `call --cn-from-multiplicity`, which reads
+copy number from the **peak node-traversal multiplicity** of the un-collapsed bubble relative to the
+reference path and emits a `DUP` record — no seeding or re-alignment of the (potentially huge) unit
+required. See [call](call.md). (Sequence-based, non-folded novel insertions still surface as INS with
+`INS_SUBTYPE=DUP`.)
 
 ## Outputs
 
@@ -109,6 +136,13 @@ to be seeded. Once seeded, copies in any haplotype may be non-adjacent / diverge
   with a self-loop (`L U + U + 0M`), the supporting paths route through it `copies` times, and
   duplicate-copy nodes are dropped when no longer referenced by any path. Re-run `vg snarls` on this
   GFA before re-running `panvar bubble`; `inspect` only needs the new GFA + a bubbles CSV.
+
+  **Node ordering:** S-lines are emitted in the input's node order minus the dropped duplicate-copy
+  nodes, so every surviving original node keeps its input position — if the input was `odgi sort`ed
+  along the reference, the normalized graph stays sorted. The new REP nodes are the **only** exception:
+  they are **appended at the end**, not placed at their genomic locus. Run `odgi sort` on the
+  normalized GFA (or rely on the re-`vg snarls` + re-`bubble` stage already in the pipeline) if you need
+  the REP nodes repositioned topologically.
 - `<prefix>.panphorte.report.tsv`, one row per bubble:
   - `bubble_id`, `normalized` (yes/no), `unit_bp`, `paths_normalized`, `min_copies`, `max_copies`,
     `nodes_collapsed`

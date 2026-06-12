@@ -41,6 +41,7 @@ void print_inspect_help() {
         << "      --cluster                    Group paths by source->sink walk; write a\n"
         << "                                   <prefix>.bubble_<N>.clusters.tsv per bubble\n"
         << "      --cluster-similarity <f>     Walk similarity threshold for --cluster (default: 0.90)\n"
+        << "      --quiet                      Disable the progress bar\n"
         << "  -h, --help                       Show this help\n";
 }
 
@@ -475,6 +476,7 @@ int run_inspect_command(const std::vector<std::string>& args) {
     std::size_t bubble_id = 0;
     bool cluster = false;
     double cluster_similarity = 0.90;
+    bool quiet = false;
 
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& arg = args[i];
@@ -527,6 +529,10 @@ int run_inspect_command(const std::vector<std::string>& args) {
         }
         if (arg == "--cluster-similarity") {
             cluster_similarity = cli::parse_similarity_arg(arg, require_value(arg));
+            continue;
+        }
+        if (arg == "--quiet") {
+            quiet = true;
             continue;
         }
         throw std::runtime_error("Unknown option: " + arg);
@@ -592,7 +598,7 @@ int run_inspect_command(const std::vector<std::string>& args) {
         << "Bubble source: " << bubbles_csv_path << "\n"
         << "Bubbles inspected: " << selected_bubbles.size() << "\n";
 
-    cli::ProgressBar progress(single_bubble ? "" : "Inspecting bubbles",
+    cli::ProgressBar progress((single_bubble || quiet) ? "" : "Inspecting bubbles",
                               single_bubble ? 0 : selected_bubbles.size());
 
     for (const Bubble* bubble_ptr : selected_bubbles) {

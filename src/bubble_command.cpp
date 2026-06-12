@@ -30,6 +30,7 @@ void print_bubble_help() {
         << "      --merge-nearby-bp <N>        Merge nearby bubbles only after base filters\n"
         << "                                    (min-path/min-variant) when sink->source shortest-path\n"
         << "                                    distance is <= N bp (default: 0, disabled)\n"
+        << "      --quiet                      Disable the progress bar\n"
         << "  -h, --help                       Show this help\n";
 }
 
@@ -92,6 +93,10 @@ int run_bubble_command(const std::vector<std::string>& args) {
         }
         if (arg == "--merge-nearby-bp") {
             options.merge_nearby_bp = cli::parse_size_arg(arg, require_value(arg));
+            continue;
+        }
+        if (arg == "--quiet") {
+            options.quiet = true;
             continue;
         }
         throw std::runtime_error("Unknown option: " + arg);

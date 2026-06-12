@@ -48,7 +48,7 @@ PANPHORTE_PREFIX="$OUT_DIR/panphorte"
 CALL_PREFIX="$OUT_DIR/call"
 
 # 1) bubble
-"$PANVAR_BIN" bubble -i "$GFA" -o "$BUBBLE_PREFIX" --snarls-in "$SNARLS"
+"$PANVAR_BIN" bubble -i "$GFA" -o "$BUBBLE_PREFIX" --snarls-in "$SNARLS" --quiet
 
 FIRST_BUBBLE_ID="$(awk -F ',' 'NR==2 { print $1; exit }' "$BUBBLE_PREFIX.bubbles.csv")"
 
@@ -57,9 +57,9 @@ if [[ -n "$FIRST_BUBBLE_ID" ]]; then
   INSPECT_PREFIX="$OUT_DIR/inspect/bubble_${FIRST_BUBBLE_ID}"
   INSPECT_ALL_PREFIX="$OUT_DIR/inspect/all"
   "$PANVAR_BIN" inspect -i "$GFA" --bubble-prefix-in "$BUBBLE_PREFIX" \
-    --bubble-id "$FIRST_BUBBLE_ID" -o "$INSPECT_PREFIX" --cluster >/dev/null
+    --bubble-id "$FIRST_BUBBLE_ID" -o "$INSPECT_PREFIX" --cluster --quiet >/dev/null
   "$PANVAR_BIN" inspect -i "$GFA" --bubble-prefix-in "$BUBBLE_PREFIX" \
-    -o "$INSPECT_ALL_PREFIX" >/dev/null
+    -o "$INSPECT_ALL_PREFIX" --quiet >/dev/null
 
   # 3) describe
   "$PANVAR_BIN" describe -i "$GFA" --bubble-prefix-in "$BUBBLE_PREFIX" \
@@ -78,13 +78,13 @@ if [[ -n "$VG_BIN" ]]; then
   NORM_SNARLS="$PANPHORTE_PREFIX.normalized.snarls.jsonl"
   NORM_BUBBLE="$OUT_DIR/bubble_norm"
   "$VG_BIN" snarls -A integrated "$NORM_GFA" | "$VG_BIN" view -R -j - > "$NORM_SNARLS"
-  "$PANVAR_BIN" bubble -i "$NORM_GFA" -o "$NORM_BUBBLE" --snarls-in "$NORM_SNARLS"
+  "$PANVAR_BIN" bubble -i "$NORM_GFA" -o "$NORM_BUBBLE" --snarls-in "$NORM_SNARLS" --quiet
   "$PANVAR_BIN" call -i "$NORM_GFA" --bubble-prefix-in "$NORM_BUBBLE" \
-    --reference-path "$REF_PATH" -o "$CALL_PREFIX" --classify-ins --quiet
+    --reference-path "$REF_PATH" -o "$CALL_PREFIX" --classify-ins --cn-from-multiplicity --quiet
 else
   echo "note: vg not found; calling on the original graph (skipping re-snarl stage)"
   "$PANVAR_BIN" call -i "$GFA" --bubble-prefix-in "$BUBBLE_PREFIX" \
-    --reference-path "$REF_PATH" -o "$CALL_PREFIX" --quiet
+    --reference-path "$REF_PATH" -o "$CALL_PREFIX" --cn-from-multiplicity --quiet
 fi
 
 # ---- assertions ----

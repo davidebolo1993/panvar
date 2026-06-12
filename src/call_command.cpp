@@ -40,6 +40,8 @@ void print_call_help() {
         << "      --minimap-preset <name>      minimap2 preset for INS refinement: asm5|asm10|asm20 (default: asm20)\n"
         << "      --minimap-best-n <N>         minimap2 best_n chains (default: 8)\n"
         << "      --ins-dup-min-identity <X>   Identity for an INS to be subtyped DUP (default: 0.90)\n"
+        << "      --cn-from-multiplicity       Emit DUP from peak node multiplicity for folded bubbles\n"
+        << "                                   with no self-loop (e.g. GSTM1) that panphorte left intact\n"
         << "      --bubble-id <N>              Restrict to one bubble ID (repeatable)\n"
         << "      --no-per-bubble-vcf          Only write the concatenated region VCF\n"
         << "      --no-variant-paths           Skip the variant_paths.tsv + node_track.tsv sidecars\n"
@@ -118,6 +120,10 @@ int run_call_command(const std::vector<std::string>& args) {
         }
         if (arg == "--classify-ins") {
             options.classify_ins = true;
+            continue;
+        }
+        if (arg == "--cn-from-multiplicity") {
+            options.cn_from_multiplicity = true;
             continue;
         }
         if (arg == "--minimap-preset") {

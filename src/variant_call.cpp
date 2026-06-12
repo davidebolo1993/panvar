@@ -60,6 +60,36 @@ std::unordered_set<std::string> self_loop_nodes(const Graph& graph) {
     return out;
 }
 
+// Steps of `path` across `bubble` in canonical source->sink orientation. Falls back to
+// an empty-interior allele ([source, sink]) when the path crosses the bubble with no
+// interior node — a pure deletion, or the short side of a pure insertion. The shared
+// inside-node-only interval finder skips those (it requires inside_count >= 1), which
+// would otherwise drop the deleting allele entirely and make single-node indels invisible.
+std::optional<std::vector<PathStep>> bubble_steps(
+    const PathRecord& path, const BubblePathIndex& index, const Bubble& bubble) {
+    const auto iv = find_best_bubble_path_interval(index, bubble);
+    if (iv.has_value()) {
+        std::vector<PathStep> s = canonical_bubble_path_steps(path, bubble, *iv);
+        if (!s.empty()) return s;
+    }
+    const auto si = index.positions.find(bubble.source);
+    const auto ki = index.positions.find(bubble.sink);
+    if (si == index.positions.end() || ki == index.positions.end()) return std::nullopt;
+    const std::unordered_set<std::size_t> sink_pos(ki->second.begin(), ki->second.end());
+    for (const std::size_t p : si->second) {                 // forward: source then sink
+        if (sink_pos.count(p + 1)) return std::vector<PathStep>{ path.steps[p], path.steps[p + 1] };
+    }
+    const std::unordered_set<std::size_t> src_pos(si->second.begin(), si->second.end());
+    for (const std::size_t p : ki->second) {                 // reverse: sink then source -> flip
+        if (src_pos.count(p + 1)) {
+            return std::vector<PathStep>{
+                PathStep{ path.steps[p + 1].node_id, !path.steps[p + 1].reverse },
+                PathStep{ path.steps[p].node_id, !path.steps[p].reverse } };
+        }
+    }
+    return std::nullopt;
+}
+
 // One node-token position in a walk (oriented), for the DEL/INS/INV alignment.
 struct Tok {
     std::uint64_t token = 0;
@@ -104,6 +134,7 @@ struct Event {
     bool anchor_after = false;        // true: POS = last base of anchor (INS); false: first base
     std::size_t size_bp = 0;          // |event| for min_sv filtering / SVLEN magnitude
     std::size_t ref_pos = 0;          // reference genomic position of the anchor (merge window)
+    bool cn_peak = false;             // DUP from peak multiplicity (size_bp is the duplicated bp)
 };
 
 // Spell a token run into sequence.
@@ -462,19 +493,42 @@ void call_variants(
         throw std::runtime_error("call requires -o/--out-prefix");
     }
 
-    // Locate the reference path record.
+    // Locate the reference path record. Accept either the full path name or a
+    // case-insensitive substring (e.g. "grch38" -> "grch38#1#chr6:..."). An exact name
+    // always wins; otherwise the substring must match exactly one path, else we error
+    // (not found, or ambiguous with the candidate list).
     const PathRecord* ref_path = nullptr;
     for (const PathRecord& p : graph.paths) {
         if (p.name == options.reference_path) { ref_path = &p; break; }
     }
     if (ref_path == nullptr) {
-        throw std::runtime_error("Reference path not found in GFA: " + options.reference_path);
+        auto lower = [](std::string s) {
+            std::transform(s.begin(), s.end(), s.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return s;
+        };
+        const std::string needle = lower(options.reference_path);
+        std::vector<const PathRecord*> hits;
+        for (const PathRecord& p : graph.paths) {
+            if (lower(p.name).find(needle) != std::string::npos) hits.push_back(&p);
+        }
+        if (hits.size() == 1) {
+            ref_path = hits.front();
+        } else if (hits.empty()) {
+            throw std::runtime_error("Reference path not found in GFA: " + options.reference_path);
+        } else {
+            std::string msg = "Reference path '" + options.reference_path + "' is ambiguous; matches " +
+                              std::to_string(hits.size()) + " paths:";
+            for (const PathRecord* p : hits) msg += "\n  " + p->name;
+            throw std::runtime_error(msg);
+        }
     }
+    const std::string& ref_name = ref_path->name;
 
     const std::vector<Bubble> bubbles = read_bubbles_csv(options.bubbles_csv_in);
     std::unordered_set<std::size_t> bubble_filter(options.bubble_ids.begin(), options.bubble_ids.end());
 
-    const ParsedReferencePath ref_meta = parse_reference_path_label(options.reference_path);
+    const ParsedReferencePath ref_meta = parse_reference_path_label(ref_name);
     const std::vector<std::size_t> ref_prefix = path_prefix_bp(*ref_path, graph.nodes);
 
     // Fixed sample list: every haplotype path (the reference included).
@@ -494,7 +548,7 @@ void call_variants(
     auto write_vcf_header = [&](std::ostream& out) {
         out << "##fileformat=VCFv4.2\n";
         out << "##source=panvar call\n";
-        out << "##reference=" << options.reference_path << "\n";
+        out << "##reference=" << ref_name << "\n";
         out << "##contig=<ID=" << ref_meta.chrom << ">\n";
         out << "##INFO=<ID=END,Number=1,Type=Integer,Description=\"End position of the variant\">\n";
         out << "##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"Structural variant type\">\n";
@@ -560,19 +614,18 @@ void call_variants(
         // Reference walk through this bubble. path_indexes is parallel to graph.paths.
         std::size_t ref_idx = graph.paths.size();
         for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
-            if (graph.paths[pi].name == options.reference_path) { ref_idx = pi; break; }
+            if (graph.paths[pi].name == ref_name) { ref_idx = pi; break; }
         }
-        const auto ref_iv = (ref_idx < graph.paths.size())
-            ? find_best_bubble_path_interval(path_indexes[ref_idx], bubble)
-            : std::optional<BubblePathInterval>{};
-        if (!ref_iv.has_value()) {
+        std::optional<std::vector<PathStep>> ref_opt =
+            (ref_idx < graph.paths.size())
+                ? bubble_steps(graph.paths[ref_idx], path_indexes[ref_idx], bubble)
+                : std::optional<std::vector<PathStep>>{};
+        if (!ref_opt.has_value() || ref_opt->empty()) {
             continue; // reference does not traverse this bubble; cannot type events
         }
         ++summary.bubbles_with_reference;
 
-        const std::vector<PathStep> ref_steps =
-            canonical_bubble_path_steps(graph.paths[ref_idx], bubble, *ref_iv);
-        if (ref_steps.empty()) continue;
+        const std::vector<PathStep> ref_steps = std::move(*ref_opt);
 
         // Distinct alleles: group paths by canonical-walk signature.
         struct Allele { std::vector<PathStep> steps; std::vector<std::string> members; };
@@ -581,10 +634,9 @@ void call_variants(
         std::unordered_set<std::string> traverses; // path names that cross the bubble
         const std::string ref_sig = build_walk_signature(ref_steps);
         for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
-            const auto iv = find_best_bubble_path_interval(path_indexes[pi], bubble);
-            if (!iv.has_value()) continue;
-            const std::vector<PathStep> steps = canonical_bubble_path_steps(graph.paths[pi], bubble, *iv);
-            if (steps.empty()) continue;
+            const auto steps_opt = bubble_steps(graph.paths[pi], path_indexes[pi], bubble);
+            if (!steps_opt.has_value() || steps_opt->empty()) continue;
+            const std::vector<PathStep>& steps = *steps_opt;
             traverses.insert(graph.paths[pi].name);
             const std::string sig = build_walk_signature(steps);
             auto it = sig_to_allele.find(sig);
@@ -707,6 +759,65 @@ void call_variants(
             }
         }
 
+        // ---- Peak-multiplicity DUP (--cn-from-multiplicity): for a folded bubble that
+        // panphorte could not collapse (no self-loop CN node, e.g. the GSTM1 segdup
+        // cluster), copy number is the per-haplotype PEAK node traversal multiplicity. A
+        // haplotype that folds an extra paralog copy onto a shared node traverses that node
+        // once more than the reference does at its own peak. Firing on the PEAK (not on any
+        // node exceeding the reference) is what rejects cluster background: scattered
+        // per-node excesses reflect paralog presence/absence, the global peak reflects gene
+        // dosage. Validated on GSTM1: only the 2 true dup haplotypes (peak 4 > ref peak 3)
+        // fire, 0 false positives. Skipped entirely when self-loop CN nodes exist, so
+        // panphorte-normalized C4/LPA keep their exact fit_align counts.
+        if (options.cn_from_multiplicity && cn_nodes.empty()) {
+            std::size_t ref_peak = 0;
+            for (const std::string& id : bubble.inside) {
+                const auto it = ref_count.find(id);
+                if (it != ref_count.end() && it->second > ref_peak) ref_peak = it->second;
+            }
+            MergedRecord* peak_grp = nullptr;
+            for (std::size_t ai = 0; ai < alleles.size(); ++ai) {
+                std::unordered_map<std::string, std::size_t> alt_count;
+                for (const PathStep& s : alleles[ai].steps) ++alt_count[s.node_id];
+                // ac_peak / peak_node decide IF this allele duplicates (gene dosage). The
+                // peak node is often tiny, so its length is not the event size; size is the
+                // extra sequence the allele traverses vs the reference, summed over all
+                // folded nodes (excess_bp) — the actual duplicated content (~18.5 kb on the
+                // GSTM1 carriers vs <7 kb for non-firing haplotypes).
+                std::string peak_node;
+                std::size_t ac_peak = 0;
+                std::size_t excess_bp = 0;
+                for (const std::string& id : bubble.inside) {
+                    const auto it = alt_count.find(id);
+                    const std::size_t c = it == alt_count.end() ? 0 : it->second;
+                    if (c > ac_peak) { ac_peak = c; peak_node = id; }
+                    const std::size_t rc_id = ref_count.count(id) ? ref_count.at(id) : 0;
+                    if (c > rc_id) excess_bp += node_len(graph, id) * (c - rc_id);
+                }
+                if (ac_peak < 2 || ac_peak <= ref_peak) continue;
+                if (excess_bp < options.min_sv_bp) continue;
+                if (peak_grp == nullptr) {
+                    MergedRecord mr;
+                    mr.seed.type = EvType::Dup;
+                    mr.seed.nodes.push_back(peak_node);
+                    mr.seed.start_node = peak_node; mr.seed.end_node = peak_node;
+                    mr.seed.ref_cn = ref_peak; mr.seed.alt_cn = ac_peak;
+                    mr.seed.anchor_node = bubble.source;
+                    mr.seed.size_bp = excess_bp;
+                    mr.seed.cn_peak = true;
+                    merged.push_back(std::move(mr));
+                    peak_grp = &merged.back();
+                } else if (ac_peak > peak_grp->seed.alt_cn) {
+                    peak_grp->seed.alt_cn = ac_peak;
+                    peak_grp->seed.size_bp = excess_bp;
+                }
+                for (const std::string& m : alleles[ai].members) {
+                    peak_grp->carriers.push_back(m);
+                    peak_grp->sample_cn[m] = ac_peak;
+                }
+            }
+        }
+
         // ---- DEL/INS/INV events: derive per allele, keep ALL (down to the rescue floor)
         // for the re-scan, then merge events >= floor by position + sequence/node match.
         std::vector<std::vector<Event>> allele_events(alleles.size());
@@ -768,6 +879,43 @@ void call_variants(
                         break;
                     }
                 }
+            }
+        }
+
+        // ---- De-duplicate a folded duplication against its peak-multiplicity DUP. The
+        // walk-diff and the peak DUP both see the extra copy: the DUP as a count, the
+        // walk-diff as an INS of the duplicated content. (The extra copy may traverse
+        // paralogous node ids that are not on this reference path, so it is not recognizable
+        // as "reused reference nodes" — instead it is keyed by being carried by exactly the
+        // DUP's carriers and spanning a comparable number of bp.) When --cn-from-multiplicity
+        // emitted the DUP, drop that INS so the event is reported once, as the DUP. Common
+        // insertions (carriers exceed the DUP's) and small co-incident insertions are kept.
+        if (options.cn_from_multiplicity) {
+            std::vector<std::pair<std::unordered_set<std::string>, std::size_t>> peak_dups;
+            for (const MergedRecord& mr : merged) {
+                if (mr.seed.type == EvType::Dup && mr.seed.cn_peak) {
+                    peak_dups.emplace_back(
+                        std::unordered_set<std::string>(mr.carriers.begin(), mr.carriers.end()),
+                        mr.seed.size_bp);
+                }
+            }
+            if (!peak_dups.empty()) {
+                std::vector<MergedRecord> kept;
+                for (MergedRecord& mr : merged) {
+                    bool drop = false;
+                    if (mr.seed.type == EvType::Ins && !mr.carriers.empty() && mr.seed.size_bp > 0) {
+                        for (const auto& [carriers, dup_bp] : peak_dups) {
+                            bool subset = true;
+                            for (const std::string& c : mr.carriers)
+                                if (!carriers.count(c)) { subset = false; break; }
+                            const double ratio = static_cast<double>(mr.seed.size_bp) /
+                                                 static_cast<double>(dup_bp == 0 ? 1 : dup_bp);
+                            if (subset && ratio >= 0.5 && ratio <= 2.0) { drop = true; break; }
+                        }
+                    }
+                    if (!drop) kept.push_back(std::move(mr));
+                }
+                merged = std::move(kept);
             }
         }
 
@@ -870,7 +1018,11 @@ void call_variants(
             if (e.type == EvType::Del) { svlen = -static_cast<long long>(e.size_bp); end = pos + e.size_bp; }
             else if (e.type == EvType::Ins) { svlen = static_cast<long long>(e.size_bp); end = pos; }
             else if (e.type == EvType::Inv) { svlen = static_cast<long long>(e.size_bp); end = pos + e.size_bp; }
-            else { // DUP
+            else if (e.cn_peak) { // peak-multiplicity DUP: size_bp is the duplicated content bp
+                svlen = static_cast<long long>(e.size_bp);
+                end = pos + e.size_bp;
+            }
+            else { // self-loop DUP: copies x unit length (signed: CN gain or loss vs reference)
                 svlen = (static_cast<long long>(e.alt_cn) - static_cast<long long>(e.ref_cn)) *
                         static_cast<long long>(node_len(graph, e.nodes.empty() ? std::string() : e.nodes.front()));
                 end = pos + node_len(graph, e.nodes.empty() ? std::string() : e.nodes.front());

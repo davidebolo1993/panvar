@@ -9,6 +9,9 @@ namespace panvar::cli {
 
 void print_general_help();
 
+// True when stderr is an interactive terminal (gate live progress so piped logs stay clean).
+bool stderr_is_tty();
+
 // Wall-clock seconds elapsed since `start`, used for progress logging.
 double elapsed_seconds(const std::chrono::steady_clock::time_point& start);
 

@@ -20,6 +20,8 @@ struct VariantCallOptions {
     std::size_t min_haplotypes = 1;      // drop a record carried by fewer than this many haplotypes
     std::size_t rescue_min_bp = 0;       // floor for events kept for merge/rescue (0 -> min_sv_bp/2)
     bool classify_ins = false;           // minimap2 INS subtype refinement (NOVEL vs DUP)
+    bool cn_from_multiplicity = false;    // emit DUP from peak node multiplicity for folded bubbles
+                                         // with no self-loop (e.g. GSTM1) that panphorte could not collapse
     std::string minimap_preset = "asm20";
     std::size_t minimap_best_n = 8;
     double ins_dup_min_identity = 0.90;  // identity for an INS to be subtyped DUP

@@ -1,0 +1,8 @@
+svtype	carriers	note
+DEL	s_del	deletion of DEL1 (60bp)
+INS	s_ins	novel insertion INS1 (70bp)
+INV	s_inv	inversion of INV1 (80bp)
+DUP	s_selfdup	R x3 vs ref x1 (self-loop), REF_CN=1
+DUP	s_peakdup1,s_peakdup2	G x3 vs ref x2 (peak multiplicity, +1), REF_CN=2
+DEL	s_null	G x1 vs ref x2 = deletion, must NOT be a DUP
+DEL	s_confdel	deletion of D; B folded x2 invariant must NOT yield a DUP

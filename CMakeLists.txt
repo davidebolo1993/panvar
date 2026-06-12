@@ -111,6 +111,18 @@ install(EXPORT panvarTargets
 if(PANVAR_BUILD_TESTING)
     include(CTest)
     if(BUILD_TESTING)
+        # Fast, dependency-free smoke on a tiny hand-built graph that exercises every
+        # call event type + confounders with exact-record assertions (no vg needed).
+        set(PANVAR_SYN_SMOKE ${CMAKE_CURRENT_SOURCE_DIR}/tests/synthetic_smoke.sh)
+        if(EXISTS ${PANVAR_SYN_SMOKE})
+            add_test(
+                NAME panvar_smoke_synthetic
+                COMMAND /usr/bin/env bash ${PANVAR_SYN_SMOKE} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_SOURCE_DIR}/tests/synthetic_data ${CMAKE_CURRENT_BINARY_DIR}/smoke_synthetic
+            )
+        endif()
+
+        # Fuller integration smoke on real data (slower; runs the full pipeline incl. vg
+        # re-snarl when vg is on PATH).
         set(PANVAR_SMOKE_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.sh)
         if(EXISTS ${PANVAR_SMOKE_SCRIPT})
             set(PANVAR_C4_GFA ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_data/c4.gfa)

@@ -738,7 +738,8 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
     // paths whose internal span reaches --min-variant-bp, and an inversion signal (an internal
     // node seen in both orientations across paths).
     const auto compute_bubble_metrics = [&](std::vector<Bubble>& target, const char* progress_label) {
-        cli::ProgressBar progress(progress_label, target.size());
+        // An empty label suppresses the bar (honors --quiet).
+        cli::ProgressBar progress(options.quiet ? "" : progress_label, target.size());
         for (auto& bubble : target) {
             std::size_t supported_paths = 0;
             std::size_t min_inside_bp = std::numeric_limits<std::size_t>::max();

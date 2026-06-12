@@ -32,8 +32,17 @@ Input is expected to be a **panphorte-normalized GFA**, so a tandem duplication 
   subtype `INS_SUBTYPE=NOVEL|DUP` (does the inserted sequence map back to the local reference?). The
   primary `SVTYPE` stays `INS`.
 - **INV** — a haplotype run that is the reverse-complement node-walk of a reference run.
-- **DUP** — a `REP` node (self-loop) traversed a different number of times than the reference. `REF_CN`
-  is the reference copy number; per-sample `CN` is reported in `FORMAT`.
+- **DUP** — a copy-number gain. Two sources:
+  - a `REP` node (self-loop) traversed a different number of times than the reference (panphorte's
+    collapsed tandem arrays);
+  - with `--cn-from-multiplicity`, a **folded duplication panphorte left intact** (no self-loop):
+    a bubble where a haplotype's **peak node-traversal multiplicity** exceeds the reference's peak — the
+    extra paralog copy is folded onto shared nodes, so it is traversed once more than the reference does.
+    `SVLEN` is the duplicated content (Σ node_len × excess traversals); the peak (not per-node excess) is
+    what isolates real gene dosage from cluster background. This is how the GSTM1 gene duplication, buried
+    in a ~77 kb segmental-duplication cluster with no adjacent repeat, is called.
+
+  Either way `REF_CN` is the reference copy number and per-sample `CN` is reported in `FORMAT`.
 
 ## Required inputs
 
@@ -41,7 +50,11 @@ Input is expected to be a **panphorte-normalized GFA**, so a tandem duplication 
 - one of:
   - `--bubble-prefix-in <module1-prefix>` (auto uses `<module1-prefix>.bubbles.csv`)
   - `--bubbles-csv-in <module1.bubbles.csv>`
-- `--reference-path <name>` — a path present in the GFA, used as the diff baseline
+- `--reference-path <name>` — the path used as the diff baseline. Accepts either the full path
+  name or a **case-insensitive substring** (e.g. `grch38` → `grch38#1#chr6:...`). An exact name always
+  wins; otherwise the substring must match exactly one path, else `call` errors — "not found" or
+  "ambiguous" with the candidate list (e.g. `grch38` when both `GRCh38_0` and `grch38_1` exist; pass the
+  unambiguous `GRCh38_0`)
 - `-o, --out-prefix <prefix>`
 
 ## Key options
@@ -59,6 +72,8 @@ Input is expected to be a **panphorte-normalized GFA**, so a tandem duplication 
 - `--rescue-min-bp <N>` — floor for sub-threshold events kept for merge/rescue (default `min-sv-bp/2`)
 - `--classify-ins` — refine INS subtype NOVEL/DUP via minimap2 (`--minimap-preset`, `--minimap-best-n`,
   `--ins-dup-min-identity`)
+- `--cn-from-multiplicity` — emit `DUP` from peak node multiplicity for folded bubbles with no self-loop
+  (e.g. GSTM1) that panphorte left intact (see Event types and the section below)
 - `--bubble-id <N>` — restrict to one bubble (repeatable)
 - `--no-per-bubble-vcf` — only write the concatenated region VCF
 - `--no-variant-paths` — skip the `<prefix>.variant_paths.tsv` provenance sidecar
@@ -68,10 +83,17 @@ Input is expected to be a **panphorte-normalized GFA**, so a tandem duplication 
 
 - A **tandem array** (panphorte-normalized into a `REP` self-loop) is a `DUP` record with per-sample
   `CN`. A **copy loss** at such a locus shows up as a sample whose `CN` differs from `REF_CN`.
-- A **non-tandem extra copy** (a segmental duplication that panphorte did not collapse) surfaces as an
-  **INS**; with `--classify-ins` it is labelled `INS_SUBTYPE=DUP` because the inserted sequence maps back
-  to the local reference. Example: against a GSTM1-single-copy reference, the two copy-2 haplotypes emit
-  one ~18.4 kb `INS` with `INS_SUBTYPE=DUP`, carried by exactly those two samples.
+- A **non-tandem extra copy** (a segmental duplication that panphorte did not collapse) can be read two
+  ways. With `--cn-from-multiplicity` it becomes a true **`DUP`** record: the copy is folded onto shared
+  nodes, so the carrier's peak node multiplicity exceeds the reference's and copy number falls out of the
+  walk directly — baseline-corrected, no re-alignment. On the bundled GSTM1 locus (a ~77 kb cluster, no
+  adjacent repeat to seed) this emits one `DUP` (`SVLEN≈18.5 kb`, `REF_CN=3`) carried by exactly the two
+  copy-2 samples (HG01346, NA19240), `CN=4`, with zero false positives across the other 463 haplotypes.
+  Without the flag the same event surfaces as an **INS**; with `--classify-ins` it is labelled
+  `INS_SUBTYPE=DUP` because the inserted sequence maps back to the local reference. When
+  `--cn-from-multiplicity` emits the DUP, the walk-diff's redundant view of the same extra copy (a
+  "duplication insertion" carried by exactly the DUP's carriers, of comparable size) is **dropped**, so
+  the event is reported once — as the DUP — not double-counted as both a DUP and an INS.
 - Note copy number is **reference-relative**: presence/absence reads as `INS` against a reference that
   lacks the copy and as `DEL` against one that has it. For an absolute per-haplotype count, read CN from
   panphorte's `copies.tsv` / the `DUP` record on a relaxed-similarity normalization (see the panphorte
@@ -133,6 +155,19 @@ For each bubble:
 1. Take the reference walk and each haplotype's canonical source→sink walk
    (`canonical_bubble_path_steps`). Group identical walks into **distinct alleles** (call once per
    allele, expand genotypes by membership).
+
+   **Empty-interior alleles (single-node indels).** The shared bubble-path machinery
+   (`find_best_bubble_path_interval`) locates a path's crossing of a bubble by requiring it to traverse
+   at least one **interior** node (`inside_count >= 1`) — sensible for `inspect`/`panphorte`, which act
+   on interior content. But a *pure* deletion's allele goes source→sink directly (no interior node), and
+   a *pure* insertion's reference allele does too — so that allele scored `inside_count = 0` and was read
+   as "does not traverse the bubble." The consequence: a single-node deletion lost its deleting allele
+   entirely (no DEL emitted), and a single-node insertion made the reference itself look absent (the whole
+   bubble was skipped). Complex bubbles hid this, because their alternate alleles still traverse other
+   interior nodes — so it only bit clean two-anchor / one-variable-node sites (common in STR/microsatellite
+   regions). `call` adds a local fallback (`bubble_steps`): when the interval finder returns nothing but
+   the path has the bubble's source immediately adjacent to its sink, it uses the empty-interior allele
+   `[source, sink]`. This is confined to the caller; the shared interval finder is unchanged.
 2. Mark copy-number nodes (any node traversed > 1× in the reference or an allele) and fold their
    consecutive self-repeats into one alignment token (so a `REP` self-loop becomes a single anchor and
    surfaces as a CN delta, not a spurious INS/DEL).
