@@ -40,6 +40,7 @@ fi
 # the core pipeline (call on the original graph).
 VG_BIN="${VG_BIN:-$(command -v vg || true)}"
 BCFTOOLS_BIN="${BCFTOOLS_BIN:-$(command -v bcftools || true)}"
+ODGI_BIN="${ODGI_BIN:-$(command -v odgi || true)}"
 
 mkdir -p "$OUT_DIR"
 BUBBLE_PREFIX="$OUT_DIR/bubble"
@@ -77,6 +78,20 @@ if [[ -n "$VG_BIN" ]]; then
   NORM_GFA="$PANPHORTE_PREFIX.normalized.gfa"
   NORM_SNARLS="$PANPHORTE_PREFIX.normalized.snarls.jsonl"
   NORM_BUBBLE="$OUT_DIR/bubble_norm"
+
+  # panphorte appends new REP nodes at the END of the node list, so numeric node id
+  # no longer follows the reference. odgi sort repositions them topologically along
+  # the reference, restoring the "numeric id == reference order" invariant that
+  # call's node_track.tsv / plotting assume. Optional: skipped when odgi is absent.
+  if [[ -n "$ODGI_BIN" ]]; then
+    SORTED_GFA="$PANPHORTE_PREFIX.normalized.sorted.gfa"
+    "$ODGI_BIN" build -g "$NORM_GFA" -o - | "$ODGI_BIN" sort -i - -o - -p Ygs -P \
+      | "$ODGI_BIN" view -i - -g > "$SORTED_GFA"
+    NORM_GFA="$SORTED_GFA"
+  else
+    echo "note: odgi not found; calling on the unsorted normalized graph (REP nodes appended at end)"
+  fi
+
   "$VG_BIN" snarls -A integrated "$NORM_GFA" | "$VG_BIN" view -R -j - > "$NORM_SNARLS"
   "$PANVAR_BIN" bubble -i "$NORM_GFA" -o "$NORM_BUBBLE" --snarls-in "$NORM_SNARLS" --quiet
   "$PANVAR_BIN" call -i "$NORM_GFA" --bubble-prefix-in "$NORM_BUBBLE" \

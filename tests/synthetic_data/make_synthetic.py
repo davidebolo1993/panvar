@@ -102,5 +102,60 @@ with open("tests/synthetic_data/expected.tsv", "w") as f:
     f.write("DUP\ts_peakdup1,s_peakdup2\tG x3 vs ref x2 (peak multiplicity, +1), REF_CN=2\n")
     f.write("DEL\ts_null\tG x1 vs ref x2 = deletion, must NOT be a DUP\n")
     f.write("DEL\ts_confdel\tdeletion of D; B folded x2 invariant must NOT yield a DUP\n")
+    # syn_w.gfa (W-lines)
+    f.write("INV\ts_winv\t[W-line] inversion of IV (80bp)\n")
+    f.write("DUP\ts_wmixdup\t[W-line] U x3 mixed orientation (+,-,+) vs ref x2, REF_CN=2; one DUP, not an INV\n")
 print("wrote tests/synthetic_data/syn.gfa")
 print(f"nodes={len(order)} edges={len(edges)} paths={len(paths)}")
+
+
+# ---------------------------------------------------------------------------
+# Second graph: W-lines (instead of P-lines) + a multi-copy locus whose copies
+# appear in MIXED orientation (forward/reverse). Exercises W-line parsing and
+# orientation handling end to end.
+# ---------------------------------------------------------------------------
+wnames = {}; wseqs = {}; worder = []
+def wmk(name, length):
+    if name in wnames: return wnames[name]
+    nid = str(len(worder) + 1)
+    wnames[name] = nid; wseqs[nid] = "".join(random.choice("ACGT") for _ in range(length))
+    worder.append(nid); return nid
+
+W = [wmk(f"W{i}", 40) for i in range(3)]
+IV = wmk("IV", 80)   # inversion locus
+U  = wmk("U", 60)    # repeat unit, folded via U-Cc-U (no self-loop)
+Cc = wmk("Cc", 15)
+def wstep(name, rev=False): return (wnames[name], rev)
+
+def wvariant(**kw):
+    p = []
+    p += [wstep("W0")] + kw.get("inv_block", [wstep("IV")]) + [wstep("W1")]
+    p += kw.get("dup_block", [wstep("U"), wstep("Cc"), wstep("U")]) + [wstep("W2")]
+    return p
+
+# walks: reference U x2 (forward); s_winv inverts IV; s_wmixdup has U x3 as +,-,+
+wpaths = {}
+wpaths[("synref", 0)]   = wvariant()
+wpaths[("s_winv", 0)]   = wvariant(inv_block=[wstep("IV", True)])
+wpaths[("s_wmixdup", 0)]= wvariant(dup_block=[wstep("U"), wstep("Cc"), wstep("U", True), wstep("Cc"), wstep("U")])  # +,-,+
+wpaths[("s_wref2", 0)]  = wvariant()
+
+wedges = set()
+for p in wpaths.values():
+    for (na, ra), (nb, rb) in zip(p, p[1:]):
+        wedges.add((na, "-" if ra else "+", nb, "-" if rb else "+"))
+
+with open("tests/synthetic_data/syn_w.gfa", "w") as f:
+    f.write("H\tVN:Z:1.1\n")
+    for nid in worder:
+        f.write(f"S\t{nid}\t{wseqs[nid]}\n")
+    for a, ao, b, bo in sorted(wedges):
+        f.write(f"L\t{a}\t{ao}\t{b}\t{bo}\t0M\n")
+    for (sample, hap), p in wpaths.items():
+        span = sum(len(wseqs[nid]) for nid, _ in p)
+        walk = "".join(("<" if rev else ">") + nid for nid, rev in p)
+        # W  sample  hap  seqid  start  end  walk
+        f.write(f"W\t{sample}\t{hap}\tchrW\t0\t{span}\t{walk}\n")
+
+print("wrote tests/synthetic_data/syn_w.gfa")
+print(f"w-nodes={len(worder)} w-edges={len(wedges)} w-walks={len(wpaths)}")

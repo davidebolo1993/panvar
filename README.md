@@ -37,6 +37,8 @@ XXX
 - [docs/modules/call.md](docs/modules/call.md)
 - [docs/modules/describe.md](docs/modules/describe.md)
 - [docs/modules/example.md](docs/modules/example.md)
+- [docs/gwas_example.md](docs/gwas_example.md) — worked pangenome k-mer GWAS (LPA KIV-2, multiplicity vs presence/absence)
+- [docs/presentation.md](docs/presentation.md) — slide-ready schematics (panphorte + SV types)
 
 ## Tests
 

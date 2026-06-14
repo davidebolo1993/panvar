@@ -35,6 +35,9 @@ void print_call_help() {
         << "                                   same-locus events of different sizes, e.g. STR alleles\n"
         << "                                   (default: 0 = use --merge-seq-identity)\n"
         << "      --min-haplotypes <N>         Drop records carried by fewer than N haplotypes (default: 1)\n"
+        << "      --min-maf <X>                Drop records with AF (carriers/traversing-haps) below X (default: 0=off)\n"
+        << "      --multiallelic-loci          Collapse a bounded locus into ONE multiallelic record (REF+ALT1,ALT2..)\n"
+        << "      --multiallelic-max-bp <N>    Skip multiallelic collapse above this allele size (default: 5000)\n"
         << "      --rescue-min-bp <N>          Floor for sub-threshold events kept for rescue (default: min-sv-bp/2)\n"
         << "      --classify-ins               Refine INS subtype NOVEL/DUP with minimap2\n"
         << "      --minimap-preset <name>      minimap2 preset for INS refinement: asm5|asm10|asm20 (default: asm20)\n"
@@ -42,6 +45,9 @@ void print_call_help() {
         << "      --ins-dup-min-identity <X>   Identity for an INS to be subtyped DUP (default: 0.90)\n"
         << "      --cn-from-multiplicity       Emit DUP from peak node multiplicity for folded bubbles\n"
         << "                                   with no self-loop (e.g. GSTM1) that panphorte left intact\n"
+        << "      --cn-from-coverage           Emit total-module copy number (spelled-bp/unit) on folded\n"
+        << "                                   paralog clusters (reference folds >=2x, e.g. CYP2D6);\n"
+        << "                                   recovers deletions+gains; precedence over --cn-from-multiplicity\n"
         << "      --bubble-id <N>              Restrict to one bubble ID (repeatable)\n"
         << "      --no-per-bubble-vcf          Only write the concatenated region VCF\n"
         << "      --no-variant-paths           Skip the variant_paths.tsv + node_track.tsv sidecars\n"
@@ -114,6 +120,18 @@ int run_call_command(const std::vector<std::string>& args) {
             options.min_haplotypes = cli::parse_size_arg(arg, require_value(arg));
             continue;
         }
+        if (arg == "--min-maf") {
+            options.min_maf = cli::parse_unit_fraction_arg(arg, require_value(arg));
+            continue;
+        }
+        if (arg == "--multiallelic-loci") {
+            options.multiallelic_loci = true;
+            continue;
+        }
+        if (arg == "--multiallelic-max-bp") {
+            options.multiallelic_max_bp = cli::parse_size_arg(arg, require_value(arg));
+            continue;
+        }
         if (arg == "--rescue-min-bp") {
             options.rescue_min_bp = cli::parse_size_arg(arg, require_value(arg));
             continue;
@@ -124,6 +142,10 @@ int run_call_command(const std::vector<std::string>& args) {
         }
         if (arg == "--cn-from-multiplicity") {
             options.cn_from_multiplicity = true;
+            continue;
+        }
+        if (arg == "--cn-from-coverage") {
+            options.cn_from_coverage = true;
             continue;
         }
         if (arg == "--minimap-preset") {

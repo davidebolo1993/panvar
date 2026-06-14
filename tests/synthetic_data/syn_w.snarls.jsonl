@@ -1,0 +1,2 @@
+{"directed_acyclic_net_graph": true, "end": {"node_id": "2"}, "end_self_reachable": true, "start": {"node_id": "1"}, "start_end_reachable": true, "start_self_reachable": true}
+{"end": {"node_id": "3"}, "end_self_reachable": true, "start": {"node_id": "2"}, "start_end_reachable": true, "start_self_reachable": true}

@@ -33,6 +33,17 @@ struct DescribeOptions {
     std::size_t max_wide_features = 250000;
     bool force_wide_matrix = false;
     bool write_wide_matrix = true;
+    // Pooled fsm-lite k-mer file (pyseer --kmers) at <out_dir>/fsm_kmers.txt.gz. On by default.
+    bool pyseer = true;
+    // Restrict k-mer/syncmer generation to called-variation nodes: a call
+    // <prefix>.variant_nodes.tsv. When set, only bubbles in the file are processed and only
+    // their variant nodes contribute k-mers. Empty = whole-bubble behavior.
+    std::string variant_nodes_path;
+    // cosigt-style sample -> haplotype-path table. When set, describe additionally writes a
+    // SAMPLE-level fsm file (<out_dir>/fsm_kmers.samples.txt.gz) whose per-sample value is the
+    // summed dosage over that sample's assigned haplotype paths (diploid CN = CN_A + CN_B).
+    // The per-haplotype fsm_kmers.txt.gz is still written. Requires pyseer output enabled.
+    std::string samples_path;
     bool quiet = false;
 };
 

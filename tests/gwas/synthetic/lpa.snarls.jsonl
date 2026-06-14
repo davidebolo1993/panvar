@@ -1,0 +1,3 @@
+{"start": {"node_id": "1"}, "end": {"node_id": "2"}, "type": 1, "start_end_reachable": true, "directed_acyclic_net_graph": true}
+{"start": {"node_id": "2"}, "end": {"node_id": "3"}, "type": 1, "start_end_reachable": true, "directed_acyclic_net_graph": true}
+{"start": {"node_id": "3"}, "end": {"node_id": "4"}, "type": 1, "start_end_reachable": true, "directed_acyclic_net_graph": true}

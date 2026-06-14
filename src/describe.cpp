@@ -7,8 +7,10 @@
 #include "panvar/output.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -883,12 +885,17 @@ std::string join_nodes(const std::vector<std::string>& nodes) {
     return out;
 }
 
+// When `variant_nodes` is non-null, bases spelled from nodes NOT in the set are replaced
+// by 'N' (same length). Because the k-mer scanner resets its window on any non-ACGT base,
+// this confines all k-mer/syncmer generation to runs of variant nodes — without disturbing
+// segment offsets or node provenance. (`--variant-nodes` restriction.)
 std::string path_sequence_for_bubble(
     const Graph& graph,
     const Bubble& bubble,
     const PathRecord& path,
     const BubblePathIndex& index,
-    bool* complete_out) {
+    bool* complete_out,
+    const std::unordered_set<std::string>* variant_nodes = nullptr) {
 
     if (complete_out != nullptr) {
         *complete_out = false;
@@ -901,19 +908,39 @@ std::string path_sequence_for_bubble(
     if (steps.empty()) {
         return {};
     }
-    bool complete = false;
-    std::string sequence = spell_path_steps_sequence(graph, steps, &complete);
-    if (complete_out != nullptr) {
-        *complete_out = complete;
+    if (variant_nodes == nullptr) {
+        bool complete = false;
+        std::string sequence = spell_path_steps_sequence(graph, steps, &complete);
+        if (complete_out != nullptr) {
+            *complete_out = complete;
+        }
+        return complete ? sequence : std::string{};
     }
-    return complete ? sequence : std::string{};
+    std::string sequence;
+    for (const PathStep& step : steps) {
+        const auto node_it = graph.nodes.find(step.node_id);
+        if (node_it == graph.nodes.end() || node_it->second.sequence.empty()) {
+            return {};
+        }
+        const auto& node_seq = node_it->second.sequence;
+        if (variant_nodes->count(step.node_id)) {
+            sequence += step.reverse ? reverse_complement(node_seq) : node_seq;
+        } else {
+            sequence.append(node_seq.size(), 'N');
+        }
+    }
+    if (complete_out != nullptr) {
+        *complete_out = true;
+    }
+    return sequence;
 }
 
 BubblePathSequence path_sequence_with_segments_for_bubble(
     const Graph& graph,
     const Bubble& bubble,
     const PathRecord& path,
-    const BubblePathIndex& index) {
+    const BubblePathIndex& index,
+    const std::unordered_set<std::string>* variant_nodes = nullptr) {
 
     BubblePathSequence out;
     const auto interval = find_best_bubble_path_interval(index, bubble);
@@ -939,7 +966,9 @@ BubblePathSequence path_sequence_with_segments_for_bubble(
     for (const PathStep& step : steps) {
         const auto& node_seq = graph.nodes.at(step.node_id).sequence;
         const std::size_t start = out.sequence.size();
-        if (step.reverse) {
+        if (variant_nodes != nullptr && variant_nodes->count(step.node_id) == 0) {
+            out.sequence.append(node_seq.size(), 'N');     // masked: no k-mers from non-variant nodes
+        } else if (step.reverse) {
             out.sequence += reverse_complement(node_seq);
         } else {
             out.sequence += node_seq;
@@ -955,7 +984,8 @@ std::vector<PathMeta> collect_path_metadata_and_stats(
     const Bubble& bubble,
     const std::vector<BubblePathIndex>& path_indexes,
     const DescribeOptions& options,
-    std::unordered_map<std::uint64_t, KmerStats>& stats) {
+    std::unordered_map<std::uint64_t, KmerStats>& stats,
+    const std::unordered_set<std::string>* variant_nodes = nullptr) {
 
     std::vector<PathMeta> paths;
     paths.reserve(graph.paths.size());
@@ -963,7 +993,7 @@ std::vector<PathMeta> collect_path_metadata_and_stats(
 
     for (std::size_t i = 0; i < graph.paths.size(); ++i) {
         bool complete = false;
-        const std::string sequence = path_sequence_for_bubble(graph, bubble, graph.paths[i], path_indexes[i], &complete);
+        const std::string sequence = path_sequence_for_bubble(graph, bubble, graph.paths[i], path_indexes[i], &complete, variant_nodes);
         if (!complete) {
             continue;
         }
@@ -1060,7 +1090,8 @@ void write_sparse_jsonl(
     const std::vector<PathMeta>& paths,
     const std::unordered_map<std::uint64_t, std::size_t>& feature_id_by_code,
     const DescribeOptions& options,
-    std::vector<std::unordered_set<std::string>>& feature_nodes) {
+    std::vector<std::unordered_set<std::string>>& feature_nodes,
+    const std::unordered_set<std::string>* variant_nodes = nullptr) {
 
     GzipWriter out(path);
     std::unordered_map<std::uint64_t, KmerPathCount> counts;
@@ -1070,7 +1101,8 @@ void write_sparse_jsonl(
             graph,
             bubble,
             graph.paths[meta.path_index],
-            path_indexes[meta.path_index]);
+            path_indexes[meta.path_index],
+            variant_nodes);
         if (!path_sequence.complete) {
             continue;
         }
@@ -1115,7 +1147,8 @@ void write_wide_matrix(
     const std::vector<BubblePathIndex>& path_indexes,
     const std::vector<PathMeta>& paths,
     const std::vector<std::uint64_t>& features,
-    const DescribeOptions& options) {
+    const DescribeOptions& options,
+    const std::unordered_set<std::string>* variant_nodes = nullptr) {
 
     GzipWriter out(path);
     std::string header = "bubble_id\tsample\thaplotype\tpath_name";
@@ -1134,7 +1167,8 @@ void write_wide_matrix(
             bubble,
             graph.paths[meta.path_index],
             path_indexes[meta.path_index],
-            &complete);
+            &complete,
+            variant_nodes);
         if (!complete) {
             continue;
         }
@@ -1190,11 +1224,81 @@ void write_params_json(const DescribeOptions& options, const std::string& path) 
         << "}\n";
 }
 
+// fsm-lite (pyseer) pool: kmer code -> (path name -> summed count), over discriminative
+// features only, aggregated across bubbles (the same canonical k-mer in two bubbles sums).
+using PyseerPool = std::unordered_map<std::uint64_t, std::unordered_map<std::string, std::uint64_t>>;
+
+void accumulate_pyseer_counts(
+    const Graph& graph,
+    const Bubble& bubble,
+    const std::vector<BubblePathIndex>& path_indexes,
+    const std::vector<PathMeta>& paths,
+    const std::vector<std::uint64_t>& features,
+    const DescribeOptions& options,
+    const std::unordered_set<std::string>* variant_nodes,
+    PyseerPool& pool) {
+
+    const std::unordered_set<std::uint64_t> keep(features.begin(), features.end());
+    if (keep.empty()) {
+        return;
+    }
+    std::unordered_map<std::uint64_t, std::uint32_t> counts;
+    for (const PathMeta& meta : paths) {
+        bool complete = false;
+        const std::string sequence = path_sequence_for_bubble(
+            graph, bubble, graph.paths[meta.path_index], path_indexes[meta.path_index], &complete, variant_nodes);
+        if (!complete) {
+            continue;
+        }
+        count_selected_features(sequence, options, counts);
+        for (const auto& [code, c] : counts) {
+            if (c > 0 && keep.count(code) != 0) {
+                pool[code][meta.path_name] += c;
+            }
+        }
+    }
+}
+
+// Write the pooled fsm-lite k-mer file pyseer --kmers consumes: one line per k-mer
+//   <kmer_sequence> | <path>:<count> <path>:<count> ...
+// listing only carriers (count>0); non-listed paths are implicit absence.
+void write_pyseer_fsm(const std::string& path, const PyseerPool& pool, std::size_t k) {
+    GzipWriter out(path);
+    std::vector<std::uint64_t> codes;
+    codes.reserve(pool.size());
+    for (const auto& kv : pool) {
+        codes.push_back(kv.first);
+    }
+    std::sort(codes.begin(), codes.end());
+    for (const std::uint64_t code : codes) {
+        const auto& carriers = pool.at(code);
+        std::vector<std::string> names;
+        names.reserve(carriers.size());
+        for (const auto& kv : carriers) {
+            names.push_back(kv.first);
+        }
+        std::sort(names.begin(), names.end());
+        std::string line = decode_kmer(code, k);
+        line += " |";
+        for (const std::string& n : names) {
+            line += ' ';
+            line += tsv_sanitize(n);
+            line += ':';
+            line += std::to_string(carriers.at(n));
+        }
+        line += '\n';
+        out.write(line);
+    }
+    out.close();
+}
+
 BubbleDescribeResult describe_one_bubble(
     const DescribeOptions& options,
     const Graph& graph,
     const std::vector<BubblePathIndex>& path_indexes,
-    const Bubble& bubble) {
+    const Bubble& bubble,
+    const std::unordered_set<std::string>* variant_nodes = nullptr,
+    PyseerPool* pyseer_pool = nullptr) {
 
     BubbleDescribeResult result;
     const std::filesystem::path out_dir(options.out_dir);
@@ -1213,7 +1317,8 @@ BubbleDescribeResult describe_one_bubble(
         bubble,
         path_indexes,
         options,
-        stats);
+        stats,
+        variant_nodes);
 
     result.paths = paths.size();
     if (paths.empty()) {
@@ -1242,13 +1347,18 @@ BubbleDescribeResult describe_one_bubble(
         paths,
         feature_id_by_code,
         options,
-        feature_nodes);
+        feature_nodes,
+        variant_nodes);
     write_feature_map(result.feature_map_path, features, stats, feature_nodes, options.kmer_size, paths.size());
+
+    if (pyseer_pool != nullptr) {
+        accumulate_pyseer_counts(graph, bubble, path_indexes, paths, features, options, variant_nodes, *pyseer_pool);
+    }
 
     const bool wide_allowed_by_cap =
         options.max_wide_features == 0 || features.size() <= options.max_wide_features;
     if (options.write_wide_matrix && (options.force_wide_matrix || wide_allowed_by_cap)) {
-        write_wide_matrix(result.matrix_path, graph, bubble, path_indexes, paths, features, options);
+        write_wide_matrix(result.matrix_path, graph, bubble, path_indexes, paths, features, options, variant_nodes);
         result.matrix_written = true;
         result.matrix_reason = "written";
     } else if (!options.write_wide_matrix) {
@@ -1327,6 +1437,37 @@ void describe_kmers_from_graph(
         bubble_filter.insert(id);
     }
 
+    // --variant-nodes: restrict to called-variation nodes. Parse <prefix>.variant_nodes.tsv
+    // (variant_id, bubble_id, svtype, node_ids) into bubble_id -> {node ids}; only those
+    // bubbles are processed and only their variant nodes contribute k-mers.
+    std::unordered_map<std::size_t, std::unordered_set<std::string>> variant_nodes_by_bubble;
+    const bool variant_mode = !options.variant_nodes_path.empty();
+    if (variant_mode) {
+        std::ifstream vn(options.variant_nodes_path);
+        if (!vn) {
+            throw std::runtime_error("Failed to open --variant-nodes file: " + options.variant_nodes_path);
+        }
+        std::string line;
+        bool header = true;
+        while (std::getline(vn, line)) {
+            if (header) { header = false; continue; }  // skip "variant_id\tbubble_id\tsvtype\tnode_ids"
+            if (line.empty()) continue;
+            std::vector<std::string> f;
+            std::size_t start = 0;
+            for (std::size_t p = 0; p <= line.size(); ++p) {
+                if (p == line.size() || line[p] == '\t') { f.push_back(line.substr(start, p - start)); start = p + 1; }
+            }
+            if (f.size() < 4) continue;
+            const std::size_t bid = static_cast<std::size_t>(std::strtoull(f[1].c_str(), nullptr, 10));
+            auto& set = variant_nodes_by_bubble[bid];
+            std::size_t s = 0;
+            const std::string& nodes = f[3];
+            for (std::size_t p = 0; p <= nodes.size(); ++p) {
+                if (p == nodes.size() || nodes[p] == ',') { if (p > s) set.insert(nodes.substr(s, p - s)); s = p + 1; }
+            }
+        }
+    }
+
     std::vector<BubblePathIndex> path_indexes;
     path_indexes.reserve(graph.paths.size());
     for (const auto& path : graph.paths) {
@@ -1353,14 +1494,27 @@ void describe_kmers_from_graph(
     DescribeSummary summary;
     summary.files_written = 2; // index + params
 
+    // bubbles to process (variant mode restricts to bubbles present in variant_nodes.tsv)
+    std::vector<const Bubble*> to_process;
     for (const Bubble& bubble : all_bubbles) {
-        if (!bubble_filter.empty() && bubble_filter.find(bubble.id) == bubble_filter.end()) {
-            continue;
+        if (!bubble_filter.empty() && bubble_filter.find(bubble.id) == bubble_filter.end()) continue;
+        if (variant_mode && variant_nodes_by_bubble.find(bubble.id) == variant_nodes_by_bubble.end()) continue;
+        to_process.push_back(&bubble);
+    }
+
+    PyseerPool pyseer_pool;
+    cli::ProgressBar progress(options.quiet ? "" : "Describing bubbles", to_process.size());
+
+    for (const Bubble* bubble_ptr : to_process) {
+        const Bubble& bubble = *bubble_ptr;
+        progress.tick();
+        const std::unordered_set<std::string>* vnodes = nullptr;
+        if (variant_mode) {
+            const auto it = variant_nodes_by_bubble.find(bubble.id);
+            if (it != variant_nodes_by_bubble.end()) vnodes = &it->second;
         }
-        if (!options.quiet) {
-            std::cerr << "[describe] bubble " << bubble.id << "\n";
-        }
-        BubbleDescribeResult result = describe_one_bubble(options, graph, path_indexes, bubble);
+        BubbleDescribeResult result =
+            describe_one_bubble(options, graph, path_indexes, bubble, vnodes, options.pyseer ? &pyseer_pool : nullptr);
         ++summary.bubbles_processed;
         if (result.paths > 0) {
             ++summary.bubbles_with_paths;
@@ -1403,6 +1557,76 @@ void describe_kmers_from_graph(
             << result.graph_feature_map_path << '\t'
             << result.graph_matrix_path << '\t'
             << (result.graph_matrix_written ? "1" : "0") << '\n';
+    }
+
+    if (options.pyseer) {
+        const std::string fsm_path = (out_dir / "fsm_kmers.txt.gz").string();
+        write_pyseer_fsm(fsm_path, pyseer_pool, options.kmer_size);
+        summary.files_written += 1;
+
+        // --samples (cosigt): aggregate per-haplotype k-mer counts into per-SAMPLE dosage
+        // (sum over the sample's assigned haplotype paths; a haplotype listed twice -> doubled,
+        // i.e. a homozygous diploid genotype). Writes fsm_kmers.samples.txt.gz alongside.
+        if (!options.samples_path.empty()) {
+            std::ifstream sin(options.samples_path);
+            if (!sin) {
+                throw std::runtime_error("Failed to open --samples file: " + options.samples_path);
+            }
+            std::unordered_map<std::string, std::vector<std::string>> path_to_samples;
+            std::string line;
+            bool first = true;
+            std::size_t n_samples = 0;
+            while (std::getline(sin, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
+                if (line.empty()) continue;
+                // split on tabs, then split each field on commas -> [sample, hap, hap, ...]
+                std::vector<std::string> fields;
+                std::size_t start = 0;
+                for (std::size_t p = 0; p <= line.size(); ++p) {
+                    if (p == line.size() || line[p] == '\t') {
+                        fields.push_back(line.substr(start, p - start));
+                        start = p + 1;
+                    }
+                }
+                if (fields.empty()) continue;
+                if (first) {
+                    first = false;
+                    std::string h = fields[0];
+                    for (char& c : h) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    if (h == "sample" || h == "sample.id" || h == "sample_id" || h[0] == '#') {
+                        continue;  // header row
+                    }
+                }
+                const std::string& sample = fields[0];
+                if (sample.empty()) continue;
+                ++n_samples;
+                for (std::size_t fi = 1; fi < fields.size(); ++fi) {
+                    std::size_t s = 0;
+                    const std::string& cell = fields[fi];
+                    for (std::size_t p = 0; p <= cell.size(); ++p) {
+                        if (p == cell.size() || cell[p] == ',') {
+                            if (p > s) path_to_samples[cell.substr(s, p - s)].push_back(sample);
+                            s = p + 1;
+                        }
+                    }
+                }
+            }
+            PyseerPool sample_pool;
+            for (const auto& [code, carriers] : pyseer_pool) {
+                auto& out = sample_pool[code];
+                for (const auto& [path, count] : carriers) {
+                    const auto it = path_to_samples.find(path);
+                    if (it == path_to_samples.end()) continue;
+                    for (const std::string& s : it->second) out[s] += count;
+                }
+            }
+            const std::string sfsm = (out_dir / "fsm_kmers.samples.txt.gz").string();
+            write_pyseer_fsm(sfsm, sample_pool, options.kmer_size);
+            summary.files_written += 1;
+            if (!options.quiet) {
+                std::cerr << "[describe] sample-level fsm: " << n_samples << " samples -> " << sfsm << "\n";
+            }
+        }
     }
 
     if (summary_out != nullptr) {

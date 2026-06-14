@@ -18,8 +18,15 @@ struct VariantCallOptions {
     double merge_seq_identity = 0.80;    // cross-haplotype event-sequence identity threshold (alt merge key)
     double merge_size_ratio = 0.0;       // length-ratio floor for the sequence merge (0 -> use merge_seq_identity)
     std::size_t min_haplotypes = 1;      // drop a record carried by fewer than this many haplotypes
+    double min_maf = 0.0;                 // drop a record with AF (carriers/traversing-haps) below this (0=off)
+    bool multiallelic_loci = false;       // opt-in: collapse a bounded locus into ONE multiallelic record
+                                         // (REF + ALT1,ALT2,... explicit seqs; GT indexes the allele)
+    std::size_t multiallelic_max_bp = 5000; // skip multiallelic collapse if any allele seq exceeds this
     std::size_t rescue_min_bp = 0;       // floor for events kept for merge/rescue (0 -> min_sv_bp/2)
     bool classify_ins = false;           // minimap2 INS subtype refinement (NOVEL vs DUP)
+    bool cn_from_coverage = false;        // emit total-module CN from spelled-bp/unit on folded clusters
+                                         // (ref folds >=2x); recovers deletions+gains; takes precedence
+                                         // over cn_from_multiplicity on those bubbles
     bool cn_from_multiplicity = false;    // emit DUP from peak node multiplicity for folded bubbles
                                          // with no self-loop (e.g. GSTM1) that panphorte could not collapse
     std::string minimap_preset = "asm20";

@@ -121,17 +121,10 @@ if(PANVAR_BUILD_TESTING)
             )
         endif()
 
-        # Fuller integration smoke on real data (slower; runs the full pipeline incl. vg
-        # re-snarl when vg is on PATH).
-        set(PANVAR_SMOKE_SCRIPT ${CMAKE_CURRENT_SOURCE_DIR}/tests/smoke.sh)
-        if(EXISTS ${PANVAR_SMOKE_SCRIPT})
-            set(PANVAR_C4_GFA ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_data/c4.gfa)
-            add_test(
-                NAME panvar_smoke_c4
-                COMMAND /usr/bin/env bash ${PANVAR_SMOKE_SCRIPT} $<TARGET_FILE:panvar> ${PANVAR_C4_GFA} ${CMAKE_CURRENT_BINARY_DIR}/smoke_c4
-            )
-        else()
-            message(STATUS "Skipping smoke test registration: tests/smoke.sh not found")
-        endif()
+        # The fuller real-data integration smoke (tests/smoke.sh, full pipeline incl. vg
+        # re-snarl) is intentionally NOT registered as a ctest: it is large/slow and needs
+        # vg. Run it manually when validating on real loci, e.g.:
+        #   bash tests/smoke.sh ./build/panvar tests/real_data/c4.gfa /tmp/smoke_c4
+        # Only the synthetic smoke runs at the compilation/ctest stage.
     endif()
 endif()

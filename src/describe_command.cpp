@@ -57,7 +57,12 @@ void print_describe_help() {
         << "      --max-wide-features <N>      Skip wide matrix above N features (default: 250000; 0=no cap)\n"
         << "      --force-wide                 Write wide matrix even above safety cap\n"
         << "      --no-wide-matrix             Write only feature map + sparse JSONL counts\n"
-        << "      --quiet                      Disable progress logs\n"
+        << "      --variant-nodes <tsv>        Restrict k-mers to call <prefix>.variant_nodes.tsv\n"
+        << "                                   (only those bubbles' variant nodes contribute)\n"
+        << "      --samples <tsv>              cosigt sample->haplotype-path table; also writes a\n"
+        << "                                   sample-level fsm_kmers.samples.txt.gz (summed dosage)\n"
+        << "      --no-pyseer                  Do not write the pooled fsm_kmers.txt.gz (pyseer --kmers)\n"
+        << "      --quiet                      Disable the progress bar\n"
         << "  -h, --help                       Show this help\n";
 }
 
@@ -134,6 +139,18 @@ int run_describe_command(const std::vector<std::string>& args) {
         }
         if (arg == "--no-wide-matrix") {
             options.write_wide_matrix = false;
+            continue;
+        }
+        if (arg == "--variant-nodes") {
+            options.variant_nodes_path = require_value(arg);
+            continue;
+        }
+        if (arg == "--samples") {
+            options.samples_path = require_value(arg);
+            continue;
+        }
+        if (arg == "--no-pyseer") {
+            options.pyseer = false;
             continue;
         }
         if (arg == "--quiet") {

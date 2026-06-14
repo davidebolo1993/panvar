@@ -46,6 +46,46 @@ odgi sort -i <pggb.outdir>/*smooth.final.og -Y -H <pggb.outdir>/ref.path.txt -o 
 vg snarls -A integrated <graph.gfa>  | vg view -R -j - >  <graph>.snarls.jsonl
 ```
 
+The same `odgi sort` + `vg snarls` re-pass applies **after `panphorte` normalization**, before
+re-running `bubble` on the normalized graph: `panphorte` appends its new `REP` nodes at the end of the
+node list, so the graph must be re-sorted along the reference (then re-snarled) so that downstream `call`
+sees `numeric node id == reference order` again. See the [panphorte](panphorte.md) "Re-sort the normalized
+graph" note for the exact recipe.
+
+## Snarls vs. superbubbles (background)
+
+`bubble` consumes **snarls**, not superbubbles. The difference matters for what variation can be
+represented:
+
+- A **superbubble** (what tools like BubbleGun enumerate) is a single-source / single-sink subgraph that
+  is **directed and acyclic**: every internal node is reachable from the source and reaches the sink, and
+  the only way in or out is through the two boundaries. By construction a superbubble **cannot** contain a
+  cycle or an inversion.
+- A **snarl** (Paten et al.; what `vg snarls` emits) is the more general structure: a pair of boundary
+  nodes whose removal separates an internal subgraph from the rest, defined on the **bidirected** graph.
+  Snarls therefore also capture **inversions, tandem cycles, and tangles** that a superbubble can't, and
+  they **nest** (the snarl tree; the acyclic subclass — "ultrabubbles" — is essentially the superbubble).
+  `-A integrated` reports the nested decomposition; `bubble` takes the **top-level** snarls.
+
+panvar uses snarls because real pangenome variation (the inversions and tandem expansions this toolkit
+targets) lives precisely in the cyclic/inverted sites superbubbles omit.
+
+### Why a snarl need not be crossed by every path
+
+A snarl is a property of the graph **topology**, computed independently of the paths. It is bounded by two
+specific nodes (`source`, `sink`), and a haplotype only "supports" that snarl if its walk visits **both**
+boundaries. In a pangenome many haplotypes don't:
+
+- a haplotype may take a different route that **bypasses a boundary** (e.g. a large deletion that removes
+  the boundary region, or an alternative local structure);
+- an assembly may be **fragmented/partial** and simply not span the locus;
+- with nested snarls, a path can cross the parent yet take a branch that **skips a child** snarl.
+
+So `path_support` is the count of paths whose walk actually crosses `source → sink` (found by
+`find_best_bubble_path_interval`), and it is normally **less than the total number of P/W paths** — that
+is expected, not an error. Downstream, `call` marks a sample that doesn't cross a bubble with genotype
+`.` (vs `0` for "crosses but reference-like" and `1` for a carrier).
+
 ## Algorithm overview
 
 For each top-level snarl candidate:

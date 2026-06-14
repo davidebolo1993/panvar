@@ -1,0 +1,4 @@
+locus	nodes	model	linked	expect
+KIV2_VNTR	5,6	multiplicity	yes	count-significant, P/A-not
+decoy_A	8	presence_absence	no	non-significant (both)
+decoy_B	10	presence_absence	yes	significant (both)

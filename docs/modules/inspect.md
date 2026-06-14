@@ -144,14 +144,24 @@ deterministic column order. As with nodes, counts are interval-local.
 haplotypes collapse to one representative. It is an inspection aid only — nothing downstream depends on
 it — but it is handy for plotting (see the heatmap `--clusters` option).
 
-Each path's canonical walk is summarized as an **oriented, bp-weighted token multiset**: every step
-contributes its node's bp length to the token `<node_id><strand>`. Two walks are compared with weighted
-Jaccard — `sum(min) / sum(max)` over the shared tokens — which captures inversions (strand is part of
-the token) and copy number (repeated nodes add weight) while ignoring exact step order. Walks are
-clustered greedily: identical walks collapse first, then each distinct walk joins the most similar
-existing cluster whose representative is at least `--cluster-similarity` similar (default `0.90`), or
-starts a new cluster. The representative is the cluster **medoid** (the walk with the highest mean
-similarity to the rest; ties go to the most-supported walk).
+Identical walks collapse first. The distinct walks are then clustered by one of two methods:
+
+- **Connected components (default).** Each distinct walk gets a **MinHash sketch** over oriented
+  node-step shingles; two walks' similarity is the sketch-estimated identity. A threshold graph connects
+  every pair at least `--cluster-similarity` similar (default `0.90`), and clusters are its **connected
+  components** — so the grouping is **transitive and order-independent** (if A~B and B~C, A, B, C land in
+  one cluster). This is the fast, non-greedy method (no quadratic exact alignment); for very short walks
+  that cannot be shingled it falls back to the exact bp-weighted Jaccard below. The representative is the
+  member minimizing max-then-mean intra-cluster distance (ties → most-supported walk, then signature).
+- **Greedy (`--cluster-greedy`).** The legacy method: each walk is summarized as an **oriented,
+  bp-weighted token multiset** (every step contributes its node's bp length to `<node_id><strand>`) and
+  walks are compared with weighted Jaccard `sum(min)/sum(max)`. Each distinct walk joins the single most
+  similar existing cluster medoid ≥ `--cluster-similarity`, or starts a new one (so the result is
+  **order-dependent** and a chain of similar walks can be split). Kept for reproducibility.
+
+Both capture inversions (strand is part of the token/shingle) and copy number (repeats add weight). The
+two methods can give different groupings at the same threshold: connected-components tends to merge a chain
+of related walks into one cluster, while greedy may split it.
 
 Output `<out-prefix>.bubble_<N>.clusters.tsv`:
 

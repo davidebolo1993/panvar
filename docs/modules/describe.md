@@ -22,6 +22,29 @@ For each bubble, it:
 5. writes, per bubble, a node/edge dosage feature map + matrix, and a k-mer feature map (with
    graph-node provenance) + matrix + sparse JSONL
 
+It is the **GWAS feature-extraction** step: besides the per-bubble tables it writes a single pooled,
+**pyseer-ready k-mer file** (`<out-dir>/fsm_kmers.txt.gz`). For a full, worked sample-level GWAS
+(LPA KIV-2 copy number → Lp(a), multiplicity vs presence/absence, Manhattan/QQ, traceback) see the
+**[GWAS example](../gwas_example.md)**.
+
+**Sample-level output (`--samples <cosigt.tsv>`):** a GWAS tests **samples**, not haplotypes. Pass a
+cosigt-style table (one sample per line: `sample <tab> hap1 <tab> hap2 …`, haplotype names = graph path
+names) and `describe` additionally writes `<out-dir>/fsm_kmers.samples.txt.gz`, where each strain is a
+**sample** and the value is the **summed dosage over its assigned haplotypes** (diploid KIV-2 dosage =
+CN_A + CN_B; a haplotype listed twice counts twice = homozygous). The per-haplotype `fsm_kmers.txt.gz` is
+still written.
+
+**Two scopes for the k-mer markers:**
+- **whole-graph (default)** — every called bubble is described; markers span all the variable sites.
+- **variant-restricted (`--variant-nodes <call.variant_nodes.tsv>`)** — only the bubbles in that sidecar
+  are processed, and within each, k-mer/syncmer generation is confined to the **called-variation nodes**
+  (bases from other nodes are masked, so no k-mer spans a non-variant node). This is the
+  genotyping/association scope: markers only where `call` found variation. `call` writes
+  `<prefix>.variant_nodes.tsv` (`variant_id, bubble_id, svtype, node_ids`) automatically.
+
+(K-mer specificity is within-bubble only — genome-wide uniqueness is a known gap to enforce when building
+sample-querying markers.)
+
 Both layers share the same two-part keep rule:
 
 1. **Copy-number features are always kept.** A feature whose count *varies across the paths that
@@ -64,7 +87,10 @@ show how much each bubble was reduced, so you can tune `--min-paths` with the ef
 - `--max-wide-features <N>`: skip wide matrix above this number of features (default `250000`; `0` disables cap)
 - `--force-wide`: write the wide matrix even above the cap
 - `--no-wide-matrix`: write only feature map and sparse JSONL counts
-- `--quiet`: disable progress logs
+- `--variant-nodes <tsv>`: restrict k-mer generation to `call`'s `<prefix>.variant_nodes.tsv` (only those
+  bubbles' variant nodes contribute k-mers; see "Two scopes" above)
+- `--no-pyseer`: do not write the pooled `fsm_kmers.txt.gz`
+- `--quiet`: disable the progress bar
 
 ## K-mer Encoding
 
@@ -138,6 +164,30 @@ Inside `--out-dir`:
 - `bubble_<id>/kmer_features.tsv.gz`
 - `bubble_<id>/kmer_matrix.tsv.gz` when enabled and below cap
 - `bubble_<id>/kmer_counts.jsonl.gz`
+- `fsm_kmers.txt.gz` — pooled pyseer k-mer file (unless `--no-pyseer`); see below
+
+### `fsm_kmers.txt.gz` (pyseer `--kmers`)
+
+The discriminative k-mers from every processed bubble, pooled into one **fsm-lite-format** file that
+pyseer's `--kmers` consumes directly. One line per k-mer:
+
+```text
+<kmer_sequence> | <path>:<count> <path>:<count> ...
+```
+
+- The **strain** id is the **path name** (one haplotype = one strain); map your phenotypes to these names.
+- The value is the **true per-strain count** (multiplicity), so copy-number expansions stay faithful;
+  pyseer treats any count `> 0` as present.
+- Only **carriers** (count `> 0`) are listed; a path missing from a line — including one that does not
+  traverse that bubble at all — is implicit **absence (0)**. (fsm-lite has no missing-data state, so
+  "reference allele" and "locus absent" are both encoded as 0.)
+- The k-mer set is exactly the per-bubble **discriminative** features (count varies, or
+  `min(present,absent) > --min-paths`), pooled — not the raw exhaustive k-mer set. The same canonical
+  k-mer seen in two bubbles has its counts summed.
+
+```bash
+pyseer --phenotypes traits.tsv --kmers describe_out/fsm_kmers.txt.gz --uncompressed ... > assoc.tsv
+```
 
 ### `describe.index.tsv`
 

@@ -10,10 +10,13 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <numeric>
+#include <queue>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -41,6 +44,8 @@ void print_inspect_help() {
         << "      --cluster                    Group paths by source->sink walk; write a\n"
         << "                                   <prefix>.bubble_<N>.clusters.tsv per bubble\n"
         << "      --cluster-similarity <f>     Walk similarity threshold for --cluster (default: 0.90)\n"
+        << "      --cluster-greedy             Use the legacy greedy medoid clustering instead of the\n"
+        << "                                   default non-greedy connected-components (MinHash) method\n"
         << "      --quiet                      Disable the progress bar\n"
         << "  -h, --help                       Show this help\n";
 }
@@ -99,6 +104,7 @@ struct InspectEmit {
     std::string clusters_out_path;      // written only when cluster is true
     bool cluster = false;
     double cluster_similarity = 0.90;
+    bool cluster_greedy = false;  // false = connected-components (default); true = legacy greedy
 };
 
 // Orientation-aware edge key for a step pair, e.g. "12+>13-". Adjacency-aware so a
@@ -166,11 +172,100 @@ double weighted_jaccard_tokens(const TokenWeights& a, const TokenWeights& b) {
     return uni == 0 ? 0.0 : static_cast<double>(inter) / static_cast<double>(uni);
 }
 
+// --- Fast non-greedy clustering: walk MinHash sketch + threshold-graph CC ------
+//
+// A faster, order-independent alternative to greedy medoid attachment (ported from
+// the retired `allele` module). Each walk is summarized by a bottom-k MinHash sketch
+// over oriented node-step shingles; sketch Jaccard estimates identity; alleles within
+// `--cluster-similarity` are united with a disjoint-set forest, so clusters are the
+// connected components (transitive, order-independent). 
+std::uint64_t splitmix64(std::uint64_t x) {
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+// hash_step_token (oriented per-step 64-bit hash) comes from graph_utils.hpp.
+
+constexpr std::size_t kWalkSketchShingle = 3;
+constexpr std::size_t kWalkSketchSize = 512;
+
+std::vector<std::uint64_t> build_walk_minhash_sketch(
+    const std::vector<std::uint64_t>& tokens,
+    std::size_t shingle_size,
+    std::size_t sketch_size) {
+
+    if (shingle_size == 0 || sketch_size == 0 || tokens.size() < shingle_size) {
+        return {};
+    }
+    std::priority_queue<std::uint64_t> top_hashes;  // max-heap -> keep the bottom k
+    std::unordered_set<std::uint64_t> seen;
+    for (std::size_t i = 0; i + shingle_size <= tokens.size(); ++i) {
+        std::uint64_t h = 1469598103934665603ULL;
+        for (std::size_t k = 0; k < shingle_size; ++k) {
+            const std::uint64_t v = splitmix64(tokens[i + k] + (0x9e3779b97f4a7c15ULL * (k + 1)));
+            h ^= v;
+            h *= 1099511628211ULL;
+        }
+        h = splitmix64(h);
+        if (!seen.insert(h).second) {
+            continue;
+        }
+        if (top_hashes.size() < sketch_size) {
+            top_hashes.push(h);
+        } else if (h < top_hashes.top()) {
+            top_hashes.pop();
+            top_hashes.push(h);
+        }
+    }
+    std::vector<std::uint64_t> sketch(top_hashes.size());
+    for (std::size_t i = sketch.size(); i > 0; --i) {
+        sketch[i - 1] = top_hashes.top();
+        top_hashes.pop();
+    }
+    std::sort(sketch.begin(), sketch.end());
+    return sketch;
+}
+
+double sketch_jaccard(const std::vector<std::uint64_t>& a, const std::vector<std::uint64_t>& b) {
+    if (a.empty() || b.empty()) {
+        return 0.0;
+    }
+    std::size_t i = 0;
+    std::size_t j = 0;
+    std::size_t inter = 0;
+    while (i < a.size() && j < b.size()) {
+        if (a[i] == b[j]) {
+            ++inter;
+            ++i;
+            ++j;
+        } else if (a[i] < b[j]) {
+            ++i;
+        } else {
+            ++j;
+        }
+    }
+    const std::size_t uni = a.size() + b.size() - inter;
+    return uni == 0 ? 0.0 : static_cast<double>(inter) / static_cast<double>(uni);
+}
+
+// identity ~= 2J / (1 + J) from k-mer/shingle Jaccard.
+double estimate_identity_from_jaccard(double jaccard) {
+    if (jaccard <= 0.0) {
+        return 0.0;
+    }
+    return std::clamp((2.0 * jaccard) / (1.0 + jaccard), 0.0, 1.0);
+}
+
+// DisjointSet (union-find) is shared from graph_utils.hpp.
+
 // One distinct canonical walk and the paths realizing it.
 struct UniqueWalk {
     std::string signature;
     TokenWeights weights;
-    std::vector<std::string> members;  // path names, in encounter order
+    std::vector<std::uint64_t> sketch;  // walk MinHash sketch (for CC clustering)
+    std::vector<std::string> members;   // path names, in encounter order
 };
 
 struct ClusterOut {
@@ -271,6 +366,102 @@ std::vector<ClusterOut> cluster_unique_walks(
     return out;
 }
 
+// Non-greedy connected-components clustering: edge iff sketch-estimated identity >=
+// threshold; clusters = components (transitive). Representative = member minimizing
+// max-then-mean intra-cluster distance, tie-broken by higher support then signature.
+std::vector<ClusterOut> cluster_unique_walks_cc(
+    const std::vector<UniqueWalk>& uniques, double threshold) {
+
+    const std::size_t n = uniques.size();
+    if (n == 0) {
+        return {};
+    }
+    std::vector<std::vector<double>> dist(n, std::vector<double>(n, 0.0));
+    for (std::size_t i = 0; i < n; ++i) {
+        for (std::size_t j = i + 1; j < n; ++j) {
+            // Walks too short to shingle have empty sketches; fall back to the exact
+            // bp-weighted Jaccard so short bubbles still cluster instead of all-singleton.
+            const double id = (uniques[i].sketch.empty() || uniques[j].sketch.empty())
+                ? weighted_jaccard_tokens(uniques[i].weights, uniques[j].weights)
+                : estimate_identity_from_jaccard(sketch_jaccard(uniques[i].sketch, uniques[j].sketch));
+            dist[i][j] = dist[j][i] = 1.0 - id;
+        }
+    }
+
+    const double max_norm_dist = std::clamp(1.0 - threshold, 0.0, 1.0);
+    const double eps = 1e-12;
+    DisjointSet dsu(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        for (std::size_t j = i + 1; j < n; ++j) {
+            if (dist[i][j] <= max_norm_dist + eps) {
+                dsu.unite(i, j);
+            }
+        }
+    }
+
+    std::unordered_map<std::size_t, std::vector<std::size_t>> by_root;
+    for (std::size_t i = 0; i < n; ++i) {
+        by_root[dsu.find(i)].push_back(i);
+    }
+
+    std::vector<ClusterOut> out;
+    out.reserve(by_root.size());
+    for (auto& kv : by_root) {
+        const std::vector<std::size_t>& members = kv.second;
+        std::size_t rep = members.front();
+        double best_max = std::numeric_limits<double>::infinity();
+        double best_mean = std::numeric_limits<double>::infinity();
+        std::size_t best_support = 0;
+        for (const std::size_t a : members) {
+            double sum = 0.0;
+            double mx = 0.0;
+            std::size_t cnt = 0;
+            for (const std::size_t b : members) {
+                if (a == b) {
+                    continue;
+                }
+                sum += dist[a][b];
+                mx = std::max(mx, dist[a][b]);
+                ++cnt;
+            }
+            const double mean = cnt == 0 ? 0.0 : sum / static_cast<double>(cnt);
+            const std::size_t support = uniques[a].members.size();
+            const bool better =
+                mx + eps < best_max ||
+                (std::abs(mx - best_max) <= eps && mean + eps < best_mean) ||
+                (std::abs(mx - best_max) <= eps && std::abs(mean - best_mean) <= eps &&
+                 (support > best_support ||
+                  (support == best_support && uniques[a].signature < uniques[rep].signature)));
+            if (better) {
+                rep = a;
+                best_max = mx;
+                best_mean = mean;
+                best_support = support;
+            }
+        }
+        ClusterOut co;
+        for (const std::size_t m : members) {
+            co.n_paths += uniques[m].members.size();
+            for (const auto& name : uniques[m].members) {
+                co.members.push_back(name);
+            }
+        }
+        co.representative = uniques[rep].members.front();
+        std::sort(co.members.begin(), co.members.end());
+        out.push_back(std::move(co));
+    }
+    std::sort(out.begin(), out.end(), [](const ClusterOut& a, const ClusterOut& b) {
+        if (a.n_paths != b.n_paths) {
+            return a.n_paths > b.n_paths;
+        }
+        return a.representative < b.representative;
+    });
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        out[i].cluster_id = i;
+    }
+    return out;
+}
+
 InspectBubbleResult write_inspect_outputs_for_bubble(
     const Graph& graph,
     const Bubble& bubble,
@@ -356,6 +547,12 @@ InspectBubbleResult write_inspect_outputs_for_bubble(
                     UniqueWalk uw;
                     uw.signature = sig;
                     uw.weights = build_token_weights(graph, steps);
+                    std::vector<std::uint64_t> tokens;
+                    tokens.reserve(steps.size());
+                    for (const auto& step : steps) {
+                        tokens.push_back(hash_step_token(step));
+                    }
+                    uw.sketch = build_walk_minhash_sketch(tokens, kWalkSketchShingle, kWalkSketchSize);
                     uw.members.push_back(row.name);
                     uniques.push_back(std::move(uw));
                 } else {
@@ -439,7 +636,8 @@ InspectBubbleResult write_inspect_outputs_for_bubble(
 
     if (emit.cluster) {
         const std::vector<ClusterOut> clusters =
-            cluster_unique_walks(uniques, emit.cluster_similarity);
+            emit.cluster_greedy ? cluster_unique_walks(uniques, emit.cluster_similarity)
+                                : cluster_unique_walks_cc(uniques, emit.cluster_similarity);
         cli::ensure_parent_dir_for_file(emit.clusters_out_path);
         std::ofstream clusters_out(emit.clusters_out_path);
         if (!clusters_out) {
@@ -476,6 +674,7 @@ int run_inspect_command(const std::vector<std::string>& args) {
     std::size_t bubble_id = 0;
     bool cluster = false;
     double cluster_similarity = 0.90;
+    bool cluster_greedy = false;
     bool quiet = false;
 
     for (std::size_t i = 0; i < args.size(); ++i) {
@@ -529,6 +728,10 @@ int run_inspect_command(const std::vector<std::string>& args) {
         }
         if (arg == "--cluster-similarity") {
             cluster_similarity = cli::parse_similarity_arg(arg, require_value(arg));
+            continue;
+        }
+        if (arg == "--cluster-greedy") {
+            cluster_greedy = true;
             continue;
         }
         if (arg == "--quiet") {
@@ -623,6 +826,7 @@ int run_inspect_command(const std::vector<std::string>& args) {
             out_prefix + ".bubble_" + std::to_string(bubble.id) + ".clusters.tsv";
         emit.cluster = cluster;
         emit.cluster_similarity = cluster_similarity;
+        emit.cluster_greedy = cluster_greedy;
 
         const InspectBubbleResult result = write_inspect_outputs_for_bubble(
             graph,
