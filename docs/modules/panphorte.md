@@ -103,27 +103,25 @@ reference path and emits a `DUP` record. See [call](call.md).
 
 - `<prefix>.normalized.gfa`: the rewritten graph. Each collapsed array becomes a repeat-unit node
   with a self-loop (`L U + U + 0M`), the supporting paths route through it `copies` times, and
-  duplicate-copy nodes are dropped when no longer referenced by any path. Re-run `vg snarls` on this
-  GFA before re-running `panvar bubble`; `inspect` only needs the new GFA + a bubbles CSV.
+  duplicate-copy nodes are dropped when no longer referenced by any path.
 
   **Node ordering:** S-lines are emitted in the input's node order minus the dropped duplicate-copy
-  nodes, so every surviving original node keeps its input position — if the input was `odgi sort`ed
-  along the reference, the normalized graph stays sorted. The new REP nodes are the **only** exception:
-  they are **appended at the end**, not placed at their genomic locus.
+  nodes; the new REP nodes are **appended at the end**, not placed at their genomic locus. Downstream
+  `call` treats **numeric node id == reference order**, so the graph must be re-sorted before calling.
 
-  **Re-sort the normalized graph with `odgi sort` before re-snarling.** Downstream `call` writes
-  `node_track.tsv` ordered by **numeric node id** and treats that as reference order ("the graph is
-  `odgi sort`ed along the reference"); the appended REP nodes break that until the graph is re-sorted.
-  So the intended pipeline is **panphorte → `odgi sort` → `vg snarls` → `bubble` → `call`**:
+- **`--reference-path <name>` makes the output call-ready with no external tools.** When set, panphorte
+  internally sorts+flips the normalized graph along the reference (repositioning the appended REP nodes
+  into reference order and renumbering ids — the `odgi sort` equivalent) and re-snarls it with the
+  cactus finder, writing:
+  - `<prefix>.normalized.sorted.gfa` — the sorted, call-ready graph
+  - `<prefix>.bubbles.csv` — the re-snarled bubbles
+
+  so the whole pipeline is **`bubble → panphorte --reference-path → call`** with no `odgi`/`vg`:
 
   ```bash
-  odgi build -g out/panphorte.normalized.gfa -o - \
-    | odgi sort -i - -o - -p Ygs -P \
-    | odgi view -i - -g > out/panphorte.normalized.sorted.gfa
+  panvar call -i out/panphorte.normalized.sorted.gfa --bubble-prefix-in out/panphorte \
+    --reference-path <name> ...
   ```
-
-  Then run `vg snarls` + `panvar bubble` + `panvar call` on `...normalized.sorted.gfa`. (`odgi sort`
-  repositions the REP nodes topologically along the reference and renumbers ids in sort order.)
 - `<prefix>.panphorte.report.tsv`, one row per bubble:
   - `bubble_id`, `normalized` (yes/no), `unit_bp`, `paths_normalized`, `min_copies`, `max_copies`,
     `nodes_collapsed`
@@ -155,20 +153,20 @@ For each bubble, for each path crossing it:
 ## Example
 
 ```bash
-# normalize tandem-repeat bubbles
+# 1. bubble on the raw graph (internal sort + cactus snarls) -> bubble.sorted.gfa
+panvar bubble -i tests/real_data/c4.gfa --reference-path grch38 -o tests/results/c4/bubble
+
+# 2. normalize tandem-repeat bubbles AND internally re-sort + re-snarl (no odgi/vg)
 panvar panphorte \
-  -i tests/real_data/c4.gfa \
+  -i tests/results/c4/bubble.sorted.gfa \
   --bubble-prefix-in tests/results/c4/bubble \
+  --reference-path grch38 \
   -o tests/results/c4/panphorte
 
-# re-sort the normalized graph so REP nodes are repositioned along the reference
-odgi build -g tests/results/c4/panphorte.normalized.gfa -o - \
-  | odgi sort -i - -o - -p Ygs -P \
-  | odgi view -i - -g > tests/results/c4/panphorte.normalized.sorted.gfa
-
-# re-snarl (see `bubble` docs) then re-bubble on the SORTED graph
-panvar bubble \
+# 3. call directly on the panphorte sorted output
+panvar call \
   -i tests/results/c4/panphorte.normalized.sorted.gfa \
-  --snarls-in tests/results/c4/panphorte.normalized.sorted.snarls.jsonl \
-  -o tests/results/c4/bubble_normalized
+  --bubble-prefix-in tests/results/c4/panphorte \
+  --reference-path grch38 \
+  -o tests/results/c4/call
 ```

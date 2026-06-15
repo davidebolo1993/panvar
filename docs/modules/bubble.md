@@ -8,49 +8,52 @@ CLI entrypoint:
 
 ## What it does
 
-`bubble` refines precomputed snarl boundaries into `panvar` bubble sites for downstream modules.
+`bubble` turns any GFA into `panvar` bubble sites for downstream modules, **with no external tools**
+(no `odgi`, no `vg`). By default it:
 
-In practice:
-
-1. load top-level snarl boundaries from `--snarls-in` JSONL
-2. infer bubble-internal nodes from path intervals between source/sink
-3. compute path support and internal sequence span per candidate
-4. apply base site filters (`min-variant-bp`, `min-path-support`)
-5. optionally merge nearby bubbles (`--merge-nearby-bp`)
-6. write module handoff and visualization outputs
+1. sorts + flips the graph along the reference internally (restores `numeric node id == reference order`)
+2. finds **snarls** internally with a vendored cactus / 3-edge-connected decomposition (matches
+   `vg snarls`; see [snarls vs superbubbles](#snarls-vs-superbubbles-background))
+3. infers bubble-internal nodes from path intervals between each snarl's source/sink
+4. computes path support and internal sequence span per candidate
+5. applies base site filters (`min-variant-bp`, `min-path-support`)
+6. optionally merges nearby bubbles (`--merge-nearby-bp`)
+7. writes the **sorted GFA** + module-handoff + visualization outputs
 
 ## Required inputs
 
-1. `--gfa <graph.gfa>`
-2. `--snarls-in <snarls.jsonl>`
+1. `--gfa <graph.gfa>` (any GFA; it is sorted internally)
+2. `--reference-path <name>` — reference path name or unique case-insensitive substring, used to order
+   the internal sort/flip and snarl finder. (Not needed if you pass `--snarls-in`, the legacy override.)
 
 ## Outputs
 
 - `*.bubbles.csv`: refined bubble/site table used by module 2/3
+- `*.sorted.gfa`: the internally sorted (+flipped) graph — **use this for downstream `panphorte`/`call`**
 - `*.bandage_nodes.csv`: node colors for Bandage
 - optional `--snarl-debug-tsv <path>`: candidate-level diagnostics
+- optional `--emit-snarls-jsonl <path>`: the internal snarls in vg-style JSONL (for inspection)
 
 Output directories are auto-created when missing.
 
-## Preparing snarl JSONL (offline)
+## Input graph (from pggb)
 
-`snarls.jsonl` is generated before running `panvar bubble`:
+A graph is typically produced with `pggb`; no manual `odgi sort`/`odgi flip`/`vg snarls` step is needed
+anymore — `bubble` does the equivalent internally:
 
 ```bash
-#graph building
 pggb -i <haplotypes.fa> -o <pggb.outdir>
-#manipulating
-odgi paths -i <pggb.outdir>/*smooth.final.og -L | grep <reference.id> > <pggb.outdir>/ref.path.txt
-odgi sort -i <pggb.outdir>/*smooth.final.og -Y -H <pggb.outdir>/ref.path.txt -o - | odgi flip -i - --ref-flips <pggb.outdir>/ref.path.txt -o - | odgi view -i - -g | sed 's/_inv$//g'>  <graph.gfa>
-#snarls calling
-vg snarls -A integrated <graph.gfa>  | vg view -R -j - >  <graph>.snarls.jsonl
+odgi view -i <pggb.outdir>/*smooth.final.og -g > <graph.gfa>   # just GFA conversion
+panvar bubble -i <graph.gfa> --reference-path <reference.id> -o out/bubble
 ```
 
-The same `odgi sort` + `vg snarls` re-pass applies **after `panphorte` normalization**, before
-re-running `bubble` on the normalized graph: `panphorte` appends its new `REP` nodes at the end of the
-node list, so the graph must be re-sorted along the reference (then re-snarled) so that downstream `call`
-sees `numeric node id == reference order` again. See the [panphorte](panphorte.md) "Re-sort the normalized
-graph" note for the exact recipe.
+**Legacy override.** To reproduce an exact external `vg snarls` run, pass `--snarls-in <snarls.jsonl>`
+(from `vg snarls -A integrated <graph.gfa> | vg view -R -j -`). In that mode the graph is used **as-is**
+(no internal sort), so the JSONL node ids match. The two modes are mutually exclusive — never combine an
+external snarls file with internal sorting, since sorting renumbers nodes.
+
+No manual re-sort is needed after `panphorte` either: `panphorte --reference-path …` re-sorts and
+re-snarls its normalized output itself (see [panphorte](panphorte.md)).
 
 ## Snarls vs. superbubbles (background)
 
@@ -69,6 +72,12 @@ represented:
 
 panvar uses snarls because real pangenome variation (the inversions and tandem expansions this toolkit
 targets) lives precisely in the cyclic/inverted sites superbubbles omit.
+
+**Internal finder.** panvar reproduces `vg snarls` internally by vendoring vg's cactus / 3-edge-connected
+decomposition (`integrated_snarls.cpp`), so the default top-level snarl set matches vg (validated
+bubble-for-bubble on the bundled c4/lpa/gstm1 graphs). Pass `--superbubbles` to instead emit only the
+acyclic superbubble subset — useful to *see* the difference: on a locus with a tandem cycle or inversion,
+the default snarl mode reports the site while `--superbubbles` omits it.
 
 ### Why a snarl need not be crossed by every path
 
@@ -90,7 +99,7 @@ is expected, not an error. Downstream, `call` marks a sample that doesn't cross 
 
 For each top-level snarl candidate:
 
-1. read `(source, sink)` boundary from JSONL
+1. get `(source, sink)` boundary from the internal cactus finder (or `--snarls-in` JSONL)
 2. find path intervals crossing source->sink (or sink->source, then canonicalize)
 3. collect internal nodes seen between boundaries
 4. measure:
@@ -125,6 +134,13 @@ then with `--merge-nearby-bp 20` those bubbles are merged.
 
 ## Key options
 
+- `--reference-path <name>` — reference for the internal sort/flip + snarl finder (required unless
+  `--snarls-in`)
+- `--superbubbles` — emit only acyclic superbubbles instead of all snarls
+- `--no-flip` — skip reorienting nodes to the reference forward strand (still sorts)
+- `--sorted-gfa-out <path>` — where to write the sorted GFA (default `<prefix>.sorted.gfa`)
+- `--emit-snarls-jsonl <path>` — also write the internal snarls as vg-style JSONL
+- `--snarls-in <path>` — legacy override: use an external `vg snarls` JSONL (graph used as-is, no sort)
 - `--min-variant-bp <N>`
 - `--min-path-support <N>`
 - `--merge-nearby-bp <N>`
@@ -170,11 +186,17 @@ Final bubbles produced by `--merge-nearby-bp` have no original candidate row, so
 ## Example
 
 ```bash
+# Internal pipeline (no vg/odgi): sort + flip + cactus snarls.
 ./build/panvar bubble \
   -i tests/real_data/c4.gfa \
   -o tests/results/c4/bubble \
-  --snarls-in tests/real_data/c4.snarls.jsonl \
+  --reference-path grch38 \
   --merge-nearby-bp 20
+# downstream uses tests/results/c4/bubble.sorted.gfa
+
+# Legacy override with an external vg snarls file (graph used as-is, not re-sorted):
+./build/panvar bubble -i tests/real_data/c4.gfa -o tests/results/c4/bubble \
+  --snarls-in tests/real_data/c4.snarls.jsonl
 ```
 
 ## Bandage Colors

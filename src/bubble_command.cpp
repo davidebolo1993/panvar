@@ -3,11 +3,17 @@
 #include "panvar/bubbles.hpp"
 #include "panvar/cli_utils.hpp"
 #include "panvar/gfa.hpp"
+#include "panvar/gfa_io.hpp"
+#include "panvar/graph_sort.hpp"
+#include "panvar/integrated_snarls.hpp"
 #include "panvar/output.hpp"
 
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace panvar {
@@ -16,10 +22,21 @@ namespace {
 void print_bubble_help() {
     std::cout
         << "Usage:\n"
-        << "  panvar bubble -i <graph.gfa> --snarls-in <snarls.jsonl> [options]\n\n"
+        << "  panvar bubble -i <graph.gfa> --reference-path <name> [options]\n\n"
+        << "By default the graph is sorted+flipped along the reference internally and snarls are\n"
+        << "found internally (no vg/odgi needed). Pass --snarls-in to use an external vg snarls\n"
+        << "JSONL instead (legacy; the graph is then used as-is, not re-sorted).\n\n"
         << "Options:\n"
         << "  -i, --gfa <path>                 Input GFA file (required)\n"
-        << "      --snarls-in <path>           Snarl JSONL from 'vg view -R -j' (required)\n"
+        << "      --reference-path <name>      Reference path name or unique substring; orders the\n"
+        << "                                    internal sort/flip + snarl finder (required unless\n"
+        << "                                    --snarls-in is given)\n"
+        << "      --superbubbles               Emit only acyclic superbubbles (default: all snarls)\n"
+        << "      --no-flip                    Do not reorient nodes to the reference forward strand\n"
+        << "      --sorted-gfa-out <path>      Internally-sorted GFA output (default: <prefix>.sorted.gfa)\n"
+        << "      --emit-snarls-jsonl <path>   Also write the internal snarls as a vg-style JSONL\n"
+        << "      --snarls-in <path>           Override: snarl JSONL from 'vg view -R -j' (skips\n"
+        << "                                    internal sort + finding)\n"
         << "  -o, --out-prefix <prefix>        Output prefix (default: bubble_calls)\n"
         << "      --bubbles-csv <path>         Explicit bubbles CSV output path\n"
         << "      --bandage-csv <path>         Explicit Bandage color CSV output path\n"
@@ -42,6 +59,9 @@ int run_bubble_command(const std::vector<std::string>& args) {
     std::string bubbles_csv_path;
     std::string bandage_csv_path;
     std::string snarl_debug_tsv_path;
+    std::string sorted_gfa_path;
+    std::string emit_snarls_jsonl_path;
+    bool no_flip = false;
 
     BubbleCallOptions options;
 
@@ -76,6 +96,26 @@ int run_bubble_command(const std::vector<std::string>& args) {
         }
         if (arg == "--snarls-in") {
             options.snarls_input_path = require_value(arg);
+            continue;
+        }
+        if (arg == "--reference-path") {
+            options.reference_path = require_value(arg);
+            continue;
+        }
+        if (arg == "--superbubbles") {
+            options.superbubbles_only = true;
+            continue;
+        }
+        if (arg == "--no-flip") {
+            no_flip = true;
+            continue;
+        }
+        if (arg == "--sorted-gfa-out") {
+            sorted_gfa_path = require_value(arg);
+            continue;
+        }
+        if (arg == "--emit-snarls-jsonl") {
+            emit_snarls_jsonl_path = require_value(arg);
             continue;
         }
         if (arg == "--snarl-debug-tsv") {
@@ -119,19 +159,52 @@ int run_bubble_command(const std::vector<std::string>& args) {
         cli::ensure_parent_dir_for_file(snarl_debug_tsv_path);
     }
 
-    if (options.snarls_input_path.empty()) {
-        throw std::runtime_error(
-            "Missing required input: --snarls-in <path> (JSONL from 'vg view -R -j')");
-    }
-
     ParseGfaOptions parse_options;
     parse_options.include_paths = true;
     parse_options.include_sequences = true;
 
-    const Graph graph = parse_gfa(gfa_path, parse_options);
-    if (graph.paths.empty()) {
-        throw std::runtime_error("Input GFA has no P/W paths; snarl refinement requires path walks");
+    std::string site_mode;
+    std::string effective_gfa = gfa_path;
+    Graph graph;
+
+    if (options.snarls_input_path.empty()) {
+        // Default: internally sort+flip along the reference and find snarls (no vg/odgi).
+        if (options.reference_path.empty()) {
+            throw std::runtime_error(
+                "Missing required input: --reference-path <name> (or pass --snarls-in to use vg)");
+        }
+        if (sorted_gfa_path.empty()) {
+            sorted_gfa_path = out_prefix + ".sorted.gfa";
+        }
+        cli::ensure_parent_dir_for_file(sorted_gfa_path);
+
+        GfaModel model = read_gfa_model(gfa_path);
+        GraphSortOptions sort_opts;
+        sort_opts.reference_path = options.reference_path;
+        sort_opts.flip = !no_flip;
+        sort_graph_reference(model, sort_opts);
+        write_gfa_model(sorted_gfa_path, model);
+        effective_gfa = sorted_gfa_path;
+
+        graph = parse_gfa(sorted_gfa_path, parse_options);
+        if (graph.paths.empty()) {
+            throw std::runtime_error("Input GFA has no P/W paths; snarl finding requires path walks");
+        }
+
+        // Find boundary pairs internally with the vg-faithful cactus finder. --superbubbles
+        // then keeps only the acyclic snarls (= superbubbles), filtered in call_bubbles_report.
+        options.snarl_pairs_override = find_top_level_snarls_cactus(snarl_input_from_model(model));
+        site_mode = options.superbubbles_only ? "superbubble (internal, cactus + acyclic)"
+                                              : "snarl (internal, cactus)";
+    } else {
+        // Legacy override: external vg snarls on the graph as-is (no internal sort).
+        graph = parse_gfa(gfa_path, parse_options);
+        if (graph.paths.empty()) {
+            throw std::runtime_error("Input GFA has no P/W paths; snarl refinement requires path walks");
+        }
+        site_mode = "snarl (JSONL import)";
     }
+
     const auto report = call_bubbles_report(graph, options);
     const auto& bubbles = report.bubbles;
 
@@ -139,6 +212,20 @@ int run_bubble_command(const std::vector<std::string>& args) {
     write_bandage_node_colors_csv(bandage_csv_path, bubbles, report.non_snp_bubbles);
     if (!snarl_debug_tsv_path.empty()) {
         write_snarl_debug_tsv(snarl_debug_tsv_path, report.snarl_debug);
+    }
+    if (!emit_snarls_jsonl_path.empty()) {
+        // Emit the internally found (cactus) snarl pairs. In --snarls-in (legacy) mode the
+        // snarls already exist as the input file, so there is nothing new to emit.
+        if (options.snarl_pairs_override.empty()) {
+            std::cerr << "note: --emit-snarls-jsonl is a no-op with --snarls-in (the input IS the snarls)\n";
+        } else {
+            cli::ensure_parent_dir_for_file(emit_snarls_jsonl_path);
+            std::ofstream js(emit_snarls_jsonl_path);
+            for (const auto& [s, t] : options.snarl_pairs_override) {
+                js << "{\"start\": {\"node_id\": \"" << s << "\"}, \"end\": {\"node_id\": \"" << t
+                   << "\"}}\n";
+            }
+        }
     }
 
     std::size_t inversion_signal_count = 0;
@@ -154,8 +241,10 @@ int run_bubble_command(const std::vector<std::string>& args) {
 
     std::cout
         << "Input graph: " << gfa_path << '\n'
-        << "Site mode: snarl (JSONL import)\n"
-        << "Snarl input: " << options.snarls_input_path << "\n"
+        << "Site mode: " << site_mode << "\n"
+        << (options.snarls_input_path.empty()
+                ? ("Sorted graph: " + effective_gfa + "\n")
+                : ("Snarl input: " + options.snarls_input_path + "\n"))
         << "Nodes: " << graph.nodes.size() << "\n"
         << "P/W paths loaded: " << graph.paths.size()
         << "\n"

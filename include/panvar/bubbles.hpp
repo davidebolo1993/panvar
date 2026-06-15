@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "panvar/gfa.hpp"
@@ -21,11 +22,26 @@ struct Bubble {
     std::size_t long_path_support = 0;
     // True when an internal node is seen in both orientations across supporting paths.
     bool inversion_signal = false;
+    // True when the snarl interior is cyclic (a haplotype revisits an interior node within
+    // the snarl, an interior node has a self-loop, or there is an inversion signal). An
+    // acyclic, single-entry/single-exit snarl is a superbubble (ultrabubble); --superbubbles
+    // keeps only `!cyclic` sites.
+    bool cyclic = false;
 };
 
 struct BubbleCallOptions {
-    // Required: JSON-lines from `vg view -R -j <snarls.pb>`.
+    // Optional override: JSON-lines from `vg view -R -j <snarls.pb>`. When empty, snarls are
+    // found internally (cactus finder, integrated_snarls.hpp); when set, these top-level
+    // pairs are used instead.
     std::string snarls_input_path;
+    // Reference path (name or unique substring) used to order the internal snarl finder.
+    std::string reference_path;
+    // Emit only acyclic superbubbles from the internal finder (default: all snarls).
+    bool superbubbles_only = false;
+    // Pre-computed top-level (source,sink) pairs. When non-empty these are used directly
+    // (e.g. the cactus finder run on the sorted GfaModel), overriding both --snarls-in and
+    // the order-based fallback finder.
+    std::vector<std::pair<std::string, std::string>> snarl_pairs_override;
     bool collect_snarl_debug = false;
     // Keep bubbles only if at least one supporting path has inside length >= this threshold
     // (unless inversion_signal is detected). Set to 0 to disable size filtering.

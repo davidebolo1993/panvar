@@ -39,6 +39,10 @@ add_library(panvarlib
     src/gfa_io.cpp
     src/align.cpp
     src/graph_utils.cpp
+    src/graph_sort.cpp
+    src/three_edge_cc.cpp
+    src/union_find.cpp
+    src/integrated_snarls.cpp
     src/bubble_path.cpp
     src/bubbles.cpp
     src/ref_path.cpp

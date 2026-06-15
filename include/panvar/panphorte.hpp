@@ -18,6 +18,11 @@ struct PanphorteOptions {
     double min_similarity = 1.0;
     std::size_t threads = 0;        // 0 = hardware concurrency (approximate detection)
     std::vector<std::size_t> bubble_ids; // if non-empty, restrict to these bubbles
+    // When set, after normalization the graph is internally sorted+flipped along this
+    // reference and re-snarled (cactus), writing <prefix>.normalized.sorted.gfa and
+    // <prefix>.bubbles.csv so `call` can run with no external tools.
+    std::string reference_path;
+    bool no_flip = false;
     bool quiet = false;
 };
 
@@ -28,6 +33,9 @@ struct PanphorteSummary {
     std::size_t nodes_removed = 0;
     std::size_t nodes_added = 0;
     std::size_t edges_added = 0;
+    // Set when --reference-path triggers the internal sort + re-snarl.
+    bool sorted = false;
+    std::size_t resnarled_bubbles = 0;
 };
 
 void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summary_out = nullptr);

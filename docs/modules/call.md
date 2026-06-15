@@ -54,7 +54,8 @@ Input is expected to be a **panphorte-normalized GFA**, so a tandem duplication 
 
 ## Required inputs
 
-- `--gfa <graph.gfa>` / `-i` (ideally panphorte-normalized; re-`vg snarls` + `panvar bubble` it first)
+- `--gfa <graph.gfa>` / `-i` (ideally panphorte-normalized; use `panphorte --reference-path`'s
+  `.normalized.sorted.gfa` so it is already sorted + re-snarled — no `vg`/`odgi` needed)
 - one of:
   - `--bubble-prefix-in <module1-prefix>` (auto uses `<module1-prefix>.bubbles.csv`)
   - `--bubbles-csv-in <module1.bubbles.csv>`
@@ -271,22 +272,23 @@ For each bubble:
 
 ## Example
 
-```bash
-# Normalize tandems, then re-sort + re-snarl + re-bubble the normalized graph.
-# odgi sort repositions panphorte's appended REP nodes along the reference so that
-# numeric node id == reference order again (node_track.tsv / plotting rely on this).
-panvar panphorte -i graph.flp.gfa --bubble-prefix-in out/bubble -o out/panphorte --min-similarity 0.90
-odgi build -g out/panphorte.normalized.gfa -o - | odgi sort -i - -o - -p Ygs -P \
-  | odgi view -i - -g > out/panphorte.normalized.sorted.gfa
-vg snarls ... > out/panphorte.normalized.sorted.snarls.jsonl
-panvar bubble -i out/panphorte.normalized.sorted.gfa -o out/bubble2 \
-  --snarls-in out/panphorte.normalized.sorted.snarls.jsonl
+No external tools (`odgi`/`vg`) are needed: `bubble` and `panphorte` sort and snarl internally. Tandem
+normalization with `panphorte --reference-path` repositions the appended REP nodes along the reference
+(so `numeric node id == reference order` again) and re-snarls, emitting a call-ready graph + bubbles.
 
-# Call structural variants (on the sorted normalized graph)
+```bash
+# 1. sites on the raw graph (internal sort + cactus snarls)
+panvar bubble -i graph.gfa --reference-path grch38 -o out/bubble
+
+# 2. normalize tandems + internally re-sort + re-snarl (writes normalized.sorted.gfa + bubbles.csv)
+panvar panphorte -i out/bubble.sorted.gfa --bubble-prefix-in out/bubble \
+  --reference-path grch38 -o out/panphorte --min-similarity 0.90
+
+# 3. call structural variants on the panphorte sorted output
 panvar call \
   -i out/panphorte.normalized.sorted.gfa \
-  --bubble-prefix-in out/bubble2 \
-  --reference-path "GRCh38#0#chr6:31891045-32123783" \
+  --bubble-prefix-in out/panphorte \
+  --reference-path grch38 \
   -o out/call \
   --merge-distance-bp 100 --merge-jaccard 0.80 --classify-ins
 ```

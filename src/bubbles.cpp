@@ -443,34 +443,14 @@ std::optional<EndpointOnlyInterval> find_best_endpoint_interval(
     return best;
 }
 
-void collect_snarl_jsonl_candidates(
-    const Graph& graph,
-    const PackedGraph& packed,
-    const BubbleCallOptions& options,
-    CandidateMap& dedup,
-    std::vector<SnarlDebugEntry>* debug_entries) {
-
-    if (options.snarls_input_path.empty()) {
-        throw std::runtime_error("Bubble refinement requires --snarls-in");
-    }
-    if (graph.paths.empty()) {
-        throw std::runtime_error(
-            "Bubble refinement requires paths (P/W) loaded; rerun with path-aware parsing enabled");
-    }
-
-    std::vector<PathIndex> path_indexes;
-    path_indexes.reserve(graph.paths.size());
-    for (const auto& path : graph.paths) {
-        path_indexes.push_back(build_path_index(path));
-    }
-
-    std::ifstream snarls_in(options.snarls_input_path);
+// Parse top-level (source,sink) boundary pairs from a vg snarls JSONL (skip nested snarls).
+std::vector<std::pair<std::string, std::string>> read_snarl_pairs_jsonl(const std::string& path) {
+    std::ifstream snarls_in(path);
     if (!snarls_in) {
-        throw std::runtime_error("Failed to open snarl JSONL input: " + options.snarls_input_path);
+        throw std::runtime_error("Failed to open snarl JSONL input: " + path);
     }
-
+    std::vector<std::pair<std::string, std::string>> pairs;
     std::string line;
-    std::size_t candidate_id = 0;
     while (std::getline(snarls_in, line)) {
         if (!line.empty() && line.back() == '\r') {
             line.pop_back();
@@ -478,30 +458,47 @@ void collect_snarl_jsonl_candidates(
         if (line.find("\"start\"") == std::string::npos || line.find("\"end\"") == std::string::npos) {
             continue;
         }
-        // Keep top-level snarls only.
         if (line.find("\"parent\"") != std::string::npos) {
+            continue; // top-level snarls only
+        }
+        const auto source_opt = extract_node_id_for_key(line, "start", true);
+        const auto sink_opt = extract_node_id_for_key(line, "end", false);
+        if (!source_opt.has_value() || !sink_opt.has_value()) {
             continue;
         }
+        pairs.emplace_back(*source_opt, *sink_opt);
+    }
+    return pairs;
+}
 
+// Build bubble candidates from top-level (source,sink) pairs: for each pair, union the
+// inside nodes seen on every path that crosses source->sink. Shared by the internal snarl
+// finder and the --snarls-in override.
+void collect_candidates_for_pairs(
+    const Graph& graph,
+    const PackedGraph& packed,
+    const std::vector<std::pair<std::string, std::string>>& pairs,
+    const std::vector<PathIndex>& path_indexes,
+    CandidateMap& dedup,
+    std::vector<SnarlDebugEntry>* debug_entries) {
+
+    std::size_t candidate_id = 0;
+    for (const auto& [source_id, sink_id] : pairs) {
         ++candidate_id;
         SnarlDebugEntry debug;
         debug.candidate_id = candidate_id;
 
-        const auto source_opt = extract_node_id_for_key(line, "start", true);
-        const auto sink_opt = extract_node_id_for_key(line, "end", false);
-        if (!source_opt.has_value() || !sink_opt.has_value() || *source_opt == *sink_opt) {
-            if (debug_entries != nullptr) {
-                debug_entries->push_back(std::move(debug)); // unparseable: source/sink left empty
-            }
+        if (source_id == sink_id) {
+            if (debug_entries != nullptr) debug_entries->push_back(std::move(debug));
             continue;
         }
 
-        const auto src_idx_it = packed.node_idx_of.find(*source_opt);
-        const auto sink_idx_it = packed.node_idx_of.find(*sink_opt);
+        const auto src_idx_it = packed.node_idx_of.find(source_id);
+        const auto sink_idx_it = packed.node_idx_of.find(sink_id);
         if (src_idx_it == packed.node_idx_of.end() || sink_idx_it == packed.node_idx_of.end()) {
             if (debug_entries != nullptr) {
-                debug.source = *source_opt;
-                debug.sink = *sink_opt;
+                debug.source = source_id;
+                debug.sink = sink_id;
                 debug_entries->push_back(std::move(debug)); // endpoint not in graph
             }
             continue;
@@ -509,7 +506,7 @@ void collect_snarl_jsonl_candidates(
 
         std::unordered_set<std::uint32_t> inside_idx_set;
         for (std::size_t p_idx = 0; p_idx < path_indexes.size(); ++p_idx) {
-            const auto interval = find_best_endpoint_interval(path_indexes[p_idx], *source_opt, *sink_opt);
+            const auto interval = find_best_endpoint_interval(path_indexes[p_idx], source_id, sink_id);
             if (!interval.has_value()) {
                 continue;
             }
@@ -533,8 +530,8 @@ void collect_snarl_jsonl_candidates(
         }
         std::sort(inside.begin(), inside.end());
 
-        debug.source = *source_opt;
-        debug.sink = *sink_opt;
+        debug.source = source_id;
+        debug.sink = sink_id;
         debug.inside_node_count = inside.size();
         if (inside.empty()) {
             if (debug_entries != nullptr) {
@@ -712,13 +709,30 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
     std::vector<SnarlDebugEntry> snarl_debug;
     auto* debug_ptr = options.collect_snarl_debug ? &snarl_debug : nullptr;
 
+    if (graph.paths.empty()) {
+        throw std::runtime_error(
+            "Bubble refinement requires paths (P/W) loaded; rerun with path-aware parsing enabled");
+    }
+
     std::vector<PathIndex> path_indexes;
     path_indexes.reserve(graph.paths.size());
     for (const auto& p : graph.paths) {
         path_indexes.push_back(build_path_index(p));
     }
 
-    collect_snarl_jsonl_candidates(graph, packed, options, dedup, debug_ptr);
+    // Snarl boundary pairs: pre-computed cactus pairs (the internal default, supplied by the
+    // command after sorting) win; otherwise an external vg snarls JSONL.
+    std::vector<std::pair<std::string, std::string>> snarl_pairs;
+    if (!options.snarl_pairs_override.empty()) {
+        snarl_pairs = options.snarl_pairs_override;
+    } else if (!options.snarls_input_path.empty()) {
+        snarl_pairs = read_snarl_pairs_jsonl(options.snarls_input_path);
+    } else {
+        throw std::runtime_error(
+            "call_bubbles_report: no snarls — provide snarl_pairs_override (internal cactus finder) "
+            "or snarls_input_path (--snarls-in)");
+    }
+    collect_candidates_for_pairs(graph, packed, snarl_pairs, path_indexes, dedup, debug_ptr);
 
     std::vector<Bubble> bubbles;
     bubbles.reserve(dedup.size());
@@ -747,10 +761,21 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
             std::size_t long_path_support = 0;
             bool has_inside_bp = false;
             bool inversion_signal = false;
+            bool cyclic = false;
 
             std::unordered_set<std::string> inside_nodes(bubble.inside.begin(), bubble.inside.end());
             std::unordered_map<std::string, unsigned char> orientation_mask;
             orientation_mask.reserve(bubble.inside.size() * 2);
+
+            // An interior node carrying a self-loop edge makes the snarl cyclic (tandem unit).
+            for (const std::string& id : bubble.inside) {
+                const auto nit = graph.nodes.find(id);
+                if (nit == graph.nodes.end()) continue;
+                bool loop = false;
+                for (const Neighbor& nb : nit->second.start) if (nb.node_id == id) { loop = true; break; }
+                if (!loop) for (const Neighbor& nb : nit->second.end) if (nb.node_id == id) { loop = true; break; }
+                if (loop) { cyclic = true; break; }
+            }
 
             for (std::size_t p_idx = 0; p_idx < path_indexes.size(); ++p_idx) {
                 const auto interval = find_best_interval(path_indexes[p_idx], bubble);
@@ -765,6 +790,7 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
                 }
 
                 std::size_t inside_bp = 0;
+                std::unordered_set<std::string> seen_this_path;
                 for (std::size_t i = 1; i + 1 < steps.size(); ++i) {
                     const auto& step = steps[i];
                     if (inside_nodes.find(step.node_id) == inside_nodes.end()) {
@@ -773,6 +799,10 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
                     const auto node_it = graph.nodes.find(step.node_id);
                     if (node_it != graph.nodes.end()) {
                         inside_bp += node_it->second.sequence.size();
+                    }
+                    // A haplotype revisiting an interior node within the snarl = a cycle.
+                    if (!seen_this_path.insert(step.node_id).second) {
+                        cyclic = true;
                     }
                     auto& mask = orientation_mask[step.node_id];
                     mask |= static_cast<unsigned char>(step.reverse ? 0x2 : 0x1);
@@ -795,6 +825,7 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
             bubble.max_inside_bp = has_inside_bp ? max_inside_bp : 0;
             bubble.long_path_support = long_path_support;
             bubble.inversion_signal = inversion_signal;
+            bubble.cyclic = cyclic || inversion_signal;
             progress.tick();
         }
     };
@@ -824,6 +855,13 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
         metrics_by_endpoint[endpoint_key(bubble.source, bubble.sink)] =
             DebugMetrics{bubble.path_support, bubble.min_inside_bp, bubble.inside.size(),
                          bubble.long_path_support, bubble.inversion_signal};
+    }
+
+    // --superbubbles: keep only acyclic (single-entry/single-exit) snarls = superbubbles.
+    if (options.superbubbles_only) {
+        bubbles.erase(std::remove_if(bubbles.begin(), bubbles.end(),
+                                     [&](const Bubble& b) { return b.cyclic; }),
+                      bubbles.end());
     }
 
     if (options.min_path_support > 0) {

@@ -2,10 +2,13 @@
 
 #include "panvar/align.hpp"
 #include "panvar/bubble_path.hpp"
+#include "panvar/bubbles.hpp"
 #include "panvar/cli_utils.hpp"
 #include "panvar/gfa.hpp"
 #include "panvar/gfa_io.hpp"
+#include "panvar/graph_sort.hpp"
 #include "panvar/graph_utils.hpp"
+#include "panvar/integrated_snarls.hpp"
 #include "panvar/output.hpp"
 
 #include <algorithm>
@@ -944,6 +947,34 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
 
     const std::string normalized_gfa = options.out_prefix + ".normalized.gfa";
     write_gfa_model(normalized_gfa, model);
+
+    // Optionally make the output call-ready with no external tools: internally sort+flip
+    // along the reference (placing the appended REP nodes into reference order) and
+    // re-snarl with the cactus finder, writing the sorted GFA + a bubbles CSV.
+    if (!options.reference_path.empty()) {
+        GraphSortOptions sort_opts;
+        sort_opts.reference_path = options.reference_path;
+        sort_opts.flip = !options.no_flip;
+        sort_graph_reference(model, sort_opts);
+
+        const std::string sorted_gfa = options.out_prefix + ".normalized.sorted.gfa";
+        write_gfa_model(sorted_gfa, model);
+
+        BubbleCallOptions bopts;
+        bopts.reference_path = options.reference_path;
+        bopts.snarl_pairs_override = find_top_level_snarls_cactus(snarl_input_from_model(model));
+        bopts.quiet = options.quiet;
+
+        ParseGfaOptions parse_options;
+        parse_options.include_paths = true;
+        parse_options.include_sequences = true;
+        const Graph sorted_graph = parse_gfa(sorted_gfa, parse_options);
+        const BubbleCallReport report = call_bubbles_report(sorted_graph, bopts);
+        write_bubbles_csv(options.out_prefix + ".bubbles.csv", report.bubbles);
+
+        summary.sorted = true;
+        summary.resnarled_bubbles = report.bubbles.size();
+    }
 
     if (summary_out != nullptr) {
         *summary_out = summary;

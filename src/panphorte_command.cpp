@@ -29,6 +29,11 @@ void print_panphorte_help() {
         << "      --min-similarity <f>         Min identity to treat a block as a unit copy\n"
         << "                                   (1.0=exact; <1.0 enables approximate, lossy collapse; default: 1.0)\n"
         << "      --threads <N>                Worker threads for approximate detection (0=auto; default: 0)\n"
+        << "      --reference-path <name>      If set, internally sort+flip the normalized graph along\n"
+        << "                                   this reference and re-snarl (cactus), writing\n"
+        << "                                   <prefix>.normalized.sorted.gfa + <prefix>.bubbles.csv so\n"
+        << "                                   'call' runs with no external vg/odgi tools\n"
+        << "      --no-flip                    With --reference-path, skip reorienting to the ref strand\n"
         << "      --quiet                      Disable progress logs\n"
         << "  -h, --help                       Show this help\n";
 }
@@ -96,6 +101,14 @@ int run_panphorte_command(const std::vector<std::string>& args) {
             options.threads = cli::parse_size_arg(arg, require_value(arg));
             continue;
         }
+        if (arg == "--reference-path") {
+            options.reference_path = require_value(arg);
+            continue;
+        }
+        if (arg == "--no-flip") {
+            options.no_flip = true;
+            continue;
+        }
         if (arg == "--quiet") {
             options.quiet = true;
             continue;
@@ -140,6 +153,15 @@ int run_panphorte_command(const std::vector<std::string>& args) {
         << "Nodes removed: " << summary.nodes_removed << "\n"
         << "Nodes added: " << summary.nodes_added << "\n"
         << "Edges added: " << summary.edges_added << "\n";
+
+    if (summary.sorted) {
+        std::cout
+            << "Sorted GFA: " << options.out_prefix << ".normalized.sorted.gfa\n"
+            << "Bubbles CSV: " << options.out_prefix << ".bubbles.csv\n"
+            << "Re-snarled bubbles: " << summary.resnarled_bubbles << "\n"
+            << "Ready for: panvar call -i " << options.out_prefix
+            << ".normalized.sorted.gfa --bubble-prefix-in " << options.out_prefix << "\n";
+    }
 
     return 0;
 }
