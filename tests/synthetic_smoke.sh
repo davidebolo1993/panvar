@@ -26,6 +26,50 @@ run_case() {  # <gfa> <snarls> <out_prefix>
 run_case "$DATA_DIR/syn.gfa"   "$DATA_DIR/syn.snarls.jsonl"   "$OUT_DIR/p"
 run_case "$DATA_DIR/syn_w.gfa" "$DATA_DIR/syn_w.snarls.jsonl" "$OUT_DIR/w"
 
+# ---- flip check: a graph whose reference traverses a node in reverse -----------
+# The bundled real graphs are already reference-forward, so flip is a no-op there.
+# This tiny graph forces the reverse-complement path: the reference walks node 2 as
+# '2-', so the internal sort+flip must reverse-complement node 2, rewrite the L-lines
+# and path strands, and leave every spelled sequence unchanged.
+FLIP_IN="$OUT_DIR/flip_in.gfa"
+FLIP_OUT="$OUT_DIR/flip_out.sorted.gfa"
+{
+  printf 'H\tVN:Z:1.0\n'
+  printf 'S\t1\tACGT\n'
+  printf 'S\t2\tGGGG\n'
+  printf 'S\t3\tTTAACC\n'
+  printf 'L\t1\t+\t2\t-\t0M\n'
+  printf 'L\t2\t-\t3\t+\t0M\n'
+  printf 'P\tsynref\t1+,2-,3+\t*,*\n'
+  printf 'P\talt\t1+,2-,3+\t*,*\n'
+} > "$FLIP_IN"
+"$PANVAR_BIN" bubble -i "$FLIP_IN" --reference-path synref \
+  -o "$OUT_DIR/flip" --sorted-gfa-out "$FLIP_OUT" --quiet >/dev/null
+
+python3 - "$FLIP_OUT" <<'PY'
+import sys
+def rc(s): return s.translate(str.maketrans("ACGT","TGCA"))[::-1]
+nodes={}; ref=None
+for line in open(sys.argv[1]):
+    f=line.rstrip("\n").split("\t")
+    if f[0]=="S": nodes[f[1]]=f[2]
+    elif f[0]=="P" and f[1]=="synref":
+        ref=[(s[:-1],s[-1]) for s in f[2].split(",")]
+fails=[]
+def check(c,m):
+    print(("ok  " if c else "FAIL")+" "+m)
+    if not c: fails.append(m)
+check(ref is not None, "[flip] reference path 'synref' present in output")
+check(all(o=="+" for _,o in ref), "[flip] reference is all-forward after flip")
+spelled="".join(nodes[n] if o=="+" else rc(nodes[n]) for n,o in ref)
+check(spelled=="ACGTCCCCTTAACC", f"[flip] reference spelling preserved (got {spelled})")
+check("CCCC" in nodes.values() and "GGGG" not in nodes.values(),
+      "[flip] node walked as '2-' was reverse-complemented (GGGG -> CCCC)")
+if fails:
+    print(f"\nFLIP CHECK FAILED ({len(fails)} assertion(s))"); sys.exit(1)
+print("flip check: OK")
+PY
+
 python3 - "$OUT_DIR/p.call.region.vcf" "$OUT_DIR/w.call.region.vcf" <<'PY'
 import sys
 

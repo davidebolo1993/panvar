@@ -5,19 +5,25 @@
 - `real_data/`: bundled small example dataset (C4: `c4.gfa`, `c4.snarls.jsonl`)
 - `results/`: local outputs (kept out of git except `.gitkeep`)
 
-## Smoke Test
+## Smoke Tests
 
-The smoke test runs `bubble -> inspect -> describe -> call` and checks
-the main handoff files plus compressed inspect/describe outputs.
+Two smoke tests:
 
-Run CTest after build:
+- `synthetic_smoke.sh` — fast, dependency-free; exercises every `call` event type on tiny
+  hand-built graphs with exact-record assertions. This is the one registered with CTest.
+- `real_smoke.sh` — fuller integration run of `bubble -> inspect -> describe -> panphorte -> call`
+  on a real locus; checks the main handoff files plus compressed inspect/describe outputs. Not part
+  of CTest (large/slow); run it manually.
+
+Run CTest after build (runs the synthetic smoke):
 
 ```bash
 ctest --test-dir build --output-on-failure
 ```
 
-Run directly:
+Run either directly:
 
 ```bash
-tests/smoke.sh ./build/panvar tests/real_data/c4.gfa /tmp/panvar_smoke_c4
+tests/synthetic_smoke.sh ./build/panvar tests/synthetic_data /tmp/panvar_smoke
+tests/real_smoke.sh ./build/panvar tests/real_data/c4.gfa /tmp/panvar_smoke_c4
 ```

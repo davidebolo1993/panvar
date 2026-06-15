@@ -1,4 +1,4 @@
-# Panphorte Module (bubble repeat normalization)
+# Panphorte Module (Module 2 — bubble repeat normalization)
 
 CLI entrypoint:
 

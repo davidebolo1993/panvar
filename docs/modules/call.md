@@ -1,4 +1,4 @@
-# Call Module (graph-native SV calling)
+# Call Module (Module 3 — graph-native SV calling)
 
 CLI entrypoint:
 

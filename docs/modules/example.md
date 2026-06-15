@@ -38,7 +38,7 @@ panvar bubble -i out/panphorte.normalized.gfa -o out/bubble2 \
 
 A tandem array collapses to one repeat-unit (`REP`) node looped N times, so copy number is explicit.
 
-## 4. Call structural variants (Module 2)
+## 4. Call structural variants (Module 3)
 
 ```bash
 panvar call \

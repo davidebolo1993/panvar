@@ -85,11 +85,11 @@ void print_general_help() {
         << "Usage:\n"
         << "  panvar <subcommand> [options]\n\n"
         << "Subcommands:\n"
-        << "  bubble     Module 1: refine/import sites from 'vg snarls'\n"
-        << "  inspect    Utility: inspect path walks through one called bubble\n"
-        << "  panphorte  Utility: normalize tandem-repeat bubbles into a compact GFA\n"
-        << "  call       Module 2: graph-native structural variant calling\n"
-        << "  describe   Module 3: per-bubble k-mer feature description\n\n"
+        << "  bubble     Module 1: extract/refine bubble sites from a GFA (no external tools)\n"
+        << "  panphorte  Module 2: normalize tandem-repeat bubbles into a compact GFA\n"
+        << "  call       Module 3: graph-native structural variant calling\n"
+        << "  describe   Module 4: per-bubble k-mer feature description\n"
+        << "  inspect    Utility: inspect path walks through one or all called bubbles\n\n"
         << "Run 'panvar <subcommand> --help' for options.\n";
 }
 
