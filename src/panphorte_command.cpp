@@ -14,13 +14,13 @@ namespace {
 void print_panphorte_help() {
     std::cout
         << "Usage:\n"
-        << "  panvar panphorte -i <graph.gfa> --bubble-prefix-in <module1-prefix> -o <out_prefix> [options]\n\n"
+        << "  panvar panphorte -i <graph.gfa> (-b <prefix> | -c <bubbles.csv>) -o <prefix> [options]\n\n"
         << "Normalizes tandem-repeat bubbles into a compact representation (repeat unit + cycle)\n"
         << "and writes a new GFA that can be re-processed by bubble/inspect.\n\n"
         << "Options:\n"
         << "  -i, --gfa <path>                 Input GFA file (required)\n"
-        << "      --bubble-prefix-in <prefix>  Module-1 output prefix (auto-uses <prefix>.bubbles.csv)\n"
-        << "      --bubbles-csv <path>         Module-1 bubbles CSV (required if no prefix)\n"
+        << "  -b, --bubble-prefix-in <prefix>  Module-1 output prefix (auto-uses <prefix>.bubbles.csv)\n"
+        << "  -c, --bubbles-csv <path>         Module-1 bubbles CSV (required if no prefix)\n"
         << "  -o, --out-prefix <prefix>        Output prefix for <prefix>.normalized.gfa + report (required)\n"
         << "      --bubble-id <N>              Restrict to one bubble ID (repeatable)\n"
         << "      --min-unit-bp <N>            Minimum repeat-unit span to normalize (default: 50)\n"
@@ -29,18 +29,23 @@ void print_panphorte_help() {
         << "      --min-similarity <f>         Min identity to treat a block as a unit copy\n"
         << "                                   (1.0=exact; <1.0 enables approximate, lossy collapse; default: 1.0)\n"
         << "      --threads <N>                Worker threads for approximate detection (0=auto; default: 0)\n"
-        << "      --reference-path <name>      If set, internally sort+flip the normalized graph along\n"
+        << "  -r, --reference-path <name>      If set, internally sort+flip the normalized graph along\n"
         << "                                   this reference and re-snarl (cactus), writing\n"
         << "                                   <prefix>.normalized.sorted.gfa + <prefix>.bubbles.csv so\n"
         << "                                   'call' runs with no external vg/odgi tools\n"
         << "      --no-flip                    With --reference-path, skip reorienting to the ref strand\n"
-        << "      --quiet                      Disable progress logs\n"
+        << "  -q, --quiet                      Disable progress logs\n"
         << "  -h, --help                       Show this help\n";
 }
 
 } // namespace
 
 int run_panphorte_command(const std::vector<std::string>& args) {
+    if (args.empty()) {
+        print_panphorte_help();
+        return 0;
+    }
+
     std::string bubble_prefix_in;
     PanphorteOptions options;
 
@@ -61,11 +66,11 @@ int run_panphorte_command(const std::vector<std::string>& args) {
             options.gfa_path = require_value(arg);
             continue;
         }
-        if (arg == "--bubble-prefix-in") {
+        if (arg == "-b" || arg == "--bubble-prefix-in") {
             bubble_prefix_in = require_value(arg);
             continue;
         }
-        if (arg == "--bubbles-csv") {
+        if (arg == "-c" || arg == "--bubbles-csv") {
             options.bubbles_csv_in = require_value(arg);
             continue;
         }
@@ -101,7 +106,7 @@ int run_panphorte_command(const std::vector<std::string>& args) {
             options.threads = cli::parse_size_arg(arg, require_value(arg));
             continue;
         }
-        if (arg == "--reference-path") {
+        if (arg == "-r" || arg == "--reference-path") {
             options.reference_path = require_value(arg);
             continue;
         }
@@ -109,7 +114,7 @@ int run_panphorte_command(const std::vector<std::string>& args) {
             options.no_flip = true;
             continue;
         }
-        if (arg == "--quiet") {
+        if (arg == "-q" || arg == "--quiet") {
             options.quiet = true;
             continue;
         }

@@ -77,7 +77,16 @@ show how much each bubble was reduced, so you can tune `--min-paths` with the ef
 
 ## Key options
 
-- `--out-dir <dir>`: output directory (default `describe_out`)
+Synopsis (required bare, optional in `[ ]`; common flags have a short form):
+
+```text
+panvar describe -i <graph.gfa> (-b <prefix> | -c <bubbles.csv>) [-o <dir>] [options]
+```
+
+Running `panvar describe` with no arguments prints this help. Short forms: `-i`/`--gfa`,
+`-b`/`--bubble-prefix-in`, `-c`/`--bubbles-csv`, `-o`/`--out-dir`, `-k`/`--kmer-size`, `-q`/`--quiet`.
+
+- `-o, --out-dir <dir>`: output directory (default `describe_out`)
 - `--bubble-id <N>`: restrict to a bubble ID; repeatable
 - `--kmer-size <K>`: k-mer size, `1..31` (default `31`)
 - `--feature-mode <all|minimizer|syncmer>`: feature sampling mode (default `syncmer`)

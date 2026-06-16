@@ -30,11 +30,11 @@ namespace {
 void print_inspect_help() {
     std::cout
         << "Usage:\n"
-        << "  panvar inspect -i <graph.gfa> --bubbles-csv <bubble.bubbles.csv> [--bubble-id <N>] [options]\n\n"
+        << "  panvar inspect -i <graph.gfa> (-b <prefix> | -c <bubbles.csv>) [--bubble-id <N>] [options]\n\n"
         << "Options:\n"
         << "  -i, --gfa <path>                 Input GFA file (required)\n"
-        << "      --bubbles-csv <path>         Module-1 bubbles CSV (required if no prefix)\n"
-        << "      --bubble-prefix-in <prefix>  Module-1 output prefix from 'panvar bubble'\n"
+        << "  -c, --bubbles-csv <path>         Module-1 bubbles CSV (required if no prefix)\n"
+        << "  -b, --bubble-prefix-in <prefix>  Module-1 output prefix from 'panvar bubble'\n"
         << "                                   (auto-uses <prefix>.bubbles.csv)\n"
         << "      --bubble-id <N>              Bubble ID to inspect (default: inspect all bubbles)\n"
         << "  -o, --out-prefix <prefix>        Output prefix (default: inspect)\n"
@@ -46,7 +46,7 @@ void print_inspect_help() {
         << "      --cluster-similarity <f>     Walk similarity threshold for --cluster (default: 0.90)\n"
         << "      --cluster-greedy             Use the legacy greedy medoid clustering instead of the\n"
         << "                                   default non-greedy connected-components (MinHash) method\n"
-        << "      --quiet                      Disable the progress bar\n"
+        << "  -q, --quiet                      Disable the progress bar\n"
         << "  -h, --help                       Show this help\n";
 }
 
@@ -664,6 +664,11 @@ InspectBubbleResult write_inspect_outputs_for_bubble(
 } // namespace
 
 int run_inspect_command(const std::vector<std::string>& args) {
+    if (args.empty()) {
+        print_inspect_help();
+        return 0;
+    }
+
     std::string gfa_path;
     std::string bubbles_csv_path;
     std::string bubble_prefix_in;
@@ -694,11 +699,11 @@ int run_inspect_command(const std::vector<std::string>& args) {
             gfa_path = require_value(arg);
             continue;
         }
-        if (arg == "--bubbles-csv") {
+        if (arg == "-c" || arg == "--bubbles-csv") {
             bubbles_csv_path = require_value(arg);
             continue;
         }
-        if (arg == "--bubble-prefix-in") {
+        if (arg == "-b" || arg == "--bubble-prefix-in") {
             bubble_prefix_in = require_value(arg);
             continue;
         }
@@ -734,7 +739,7 @@ int run_inspect_command(const std::vector<std::string>& args) {
             cluster_greedy = true;
             continue;
         }
-        if (arg == "--quiet") {
+        if (arg == "-q" || arg == "--quiet") {
             quiet = true;
             continue;
         }

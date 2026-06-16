@@ -62,7 +62,11 @@ lives in the cyclic or inverted sites that superbubbles omit.
 
 Internally, panvar reproduces `vg snarls` by mirroring vg's cactus / 3-edge-connected decomposition, so
 the default top-level snarl set matches vg; passing `--superbubbles` instead emits only the acyclic
-superbubble subset.
+superbubble subset. This acyclic subset is the same superbubble concept used by tools like 
+[BubbleGun](https://doi.org/10.1093/bioinformatics/btac448), whose detector finds superbubbles
+directly, via the Onodera algorithm (BubbleGun additionally *sub-labels* its
+superbubbles into "simple bubbles", "insertions", and "super" — so its narrow `super` excludes
+simple/insertion sites, whereas panvar's `--superbubbles` keeps **all** of them).
 
 A snarl is a property of the graph **topology**, so it is computed independently of the paths: it is
 bounded by two nodes (`source`, `sink`), and a haplotype only "supports" it when its walk visits **both**
@@ -75,6 +79,16 @@ boundaries. In a pangenome some haplotypes may not, because:
 
 For this reason the number of supporting paths is the number of paths whose walk actually crosses `source → sink`, and can be smaller than the total number of P/W paths. Downstream, `call` records a sample that does not cross a bubble with
 genotype `.` (as opposed to `0` for "crosses but reference-like" and `1` for a carrier).
+
+**References.**
+
+- Onodera, Sadakane, Shibuya. *Detecting Superbubbles in Assembly Graphs.* WABI 2013.
+  (the superbubble concept)
+- Paten, Eizenga, Rosen, Novak, Garrison, Hickey. *Superbubbles, Ultrabubbles, and Cacti.*
+  J. Comput. Biol. 25(7):649–663, 2018. <https://doi.org/10.1089/cmb.2017.0251>
+  (snarls / ultrabubbles / the cactus decomposition behind `vg snarls` and panvar's finder)
+- Dabbaghie, Ebler, Marschall. *BubbleGun: enumerating bubbles and superbubbles in genome graphs.*
+  Bioinformatics 38(17):4217–4219, 2022. <https://doi.org/10.1093/bioinformatics/btac448>
 
 
 ## Algorithm overview
@@ -116,9 +130,15 @@ then with `--merge-nearby-bp 20` those bubbles are merged.
 
 ## Key options
 
-- `--reference-path <name>` — reference for the internal sort/flip + snarl finder (required unless
+```text
+panvar bubble -i <graph.gfa> -r <name> [-o <prefix>] [--superbubbles] [options]
+```
+
+- `-i, --gfa <path>` — input GFA (required)
+- `-r, --reference-path <name>` — reference for the internal sort/flip + snarl finder (required unless
   `--snarls-in`)
-- `--superbubbles` — emit only acyclic superbubbles instead of all snarls
+- `-o, --out-prefix <prefix>` — output prefix (default `bubble_calls`)
+- `-s, --superbubbles` — emit only acyclic superbubbles instead of all snarls
 - `--no-flip` — skip reorienting nodes to the reference forward strand (still sorts)
 - `--sorted-gfa-out <path>` — where to write the sorted GFA (default `<prefix>.sorted.gfa`)
 - `--emit-snarls-jsonl <path>` — also write the internal snarls as vg-style JSONL
@@ -127,6 +147,7 @@ then with `--merge-nearby-bp 20` those bubbles are merged.
 - `--min-path-support <N>`
 - `--merge-nearby-bp <N>`
 - `--snarl-debug-tsv <path>`
+- `-q, --quiet` — disable the progress bar
 
 ## Bubble CSV Columns
 

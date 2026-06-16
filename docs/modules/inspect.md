@@ -36,6 +36,22 @@ Optional:
 
 If `--bubble-id` is omitted, `inspect` writes outputs for every bubble in the input CSV.
 
+## Key options
+
+Synopsis (required bare, optional in `[ ]`; common flags have a short form):
+
+```text
+panvar inspect -i <graph.gfa> (-b <prefix> | -c <bubbles.csv>) [--bubble-id <N>] [options]
+```
+
+Running `panvar inspect` with no arguments prints this help. Short forms: `-i`/`--gfa`,
+`-b`/`--bubble-prefix-in`, `-c`/`--bubbles-csv`, `-o`/`--out-prefix`, `-q`/`--quiet`.
+
+- `--cluster` — group paths by source→sink walk and write `<prefix>.bubble_<N>.clusters.tsv`
+- `--cluster-similarity <f>` — walk-similarity threshold for `--cluster` (default `0.90`)
+- `--cluster-greedy` — use the legacy greedy medoid clustering instead of the default
+  connected-components (MinHash) method
+
 ## Outputs
 
 Default output paths are derived from `--out-prefix` and the bubble ID:

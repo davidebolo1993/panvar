@@ -15,17 +15,16 @@ namespace {
 void print_call_help() {
     std::cout
         << "Usage:\n"
-        << "  panvar call -i <graph.gfa> (--bubble-prefix-in <prefix> | --bubbles-csv-in <path>)\n"
-        << "             --reference-path <name> -o <out_prefix> [options]\n\n"
+        << "  panvar call -i <graph.gfa> (-b <prefix> | -c <bubbles.csv>) -r <name> -o <prefix> [options]\n\n"
         << "Graph-native structural variant caller. Compares each haplotype's bubble walk to a\n"
         << "reference walk, merges fragmented same-type events within a bubble and equivalent\n"
         << "events across haplotypes, and writes a multi-sample VCF per bubble plus a region VCF.\n"
         << "Input is expected to be a panphorte-normalized GFA (a tandem DUP is a REP node looped).\n\n"
         << "Options:\n"
         << "  -i, --gfa <path>                 Input GFA file (required)\n"
-        << "      --bubble-prefix-in <prefix>  Module-1 output prefix (auto-uses <prefix>.bubbles.csv)\n"
-        << "      --bubbles-csv-in <path>      Module-1 bubbles CSV (required if no prefix)\n"
-        << "      --reference-path <name>      Reference path name used as the diff baseline (required)\n"
+        << "  -b, --bubble-prefix-in <prefix>  Module-1 output prefix (auto-uses <prefix>.bubbles.csv)\n"
+        << "  -c, --bubbles-csv-in <path>      Module-1 bubbles CSV (required if no prefix)\n"
+        << "  -r, --reference-path <name>      Reference path name used as the diff baseline (required)\n"
         << "  -o, --out-prefix <prefix>        Output prefix for VCFs (required)\n"
         << "      --min-sv-bp <N>              Minimum size of a reported (merged) event (default: 50)\n"
         << "      --merge-distance-bp <N>      Coalesce nearby same-type events within a bubble (default: 100)\n"
@@ -51,13 +50,18 @@ void print_call_help() {
         << "      --bubble-id <N>              Restrict to one bubble ID (repeatable)\n"
         << "      --no-per-bubble-vcf          Only write the concatenated region VCF\n"
         << "      --no-variant-paths           Skip the variant_paths.tsv + node_track.tsv sidecars\n"
-        << "      --quiet                      Disable progress logs\n"
+        << "  -q, --quiet                      Disable progress logs\n"
         << "  -h, --help                       Show this help\n";
 }
 
 } // namespace
 
 int run_call_command(const std::vector<std::string>& args) {
+    if (args.empty()) {
+        print_call_help();
+        return 0;
+    }
+
     std::string gfa_path;
     std::string bubble_prefix_in;
     std::string out_prefix;
@@ -80,15 +84,15 @@ int run_call_command(const std::vector<std::string>& args) {
             gfa_path = require_value(arg);
             continue;
         }
-        if (arg == "--bubble-prefix-in") {
+        if (arg == "-b" || arg == "--bubble-prefix-in") {
             bubble_prefix_in = require_value(arg);
             continue;
         }
-        if (arg == "--bubbles-csv-in") {
+        if (arg == "-c" || arg == "--bubbles-csv-in") {
             options.bubbles_csv_in = require_value(arg);
             continue;
         }
-        if (arg == "--reference-path") {
+        if (arg == "-r" || arg == "--reference-path") {
             options.reference_path = require_value(arg);
             continue;
         }
@@ -179,7 +183,7 @@ int run_call_command(const std::vector<std::string>& args) {
             options.write_variant_paths = false;
             continue;
         }
-        if (arg == "--quiet") {
+        if (arg == "-q" || arg == "--quiet") {
             options.quiet = true;
             continue;
         }

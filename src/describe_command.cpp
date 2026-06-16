@@ -40,15 +40,15 @@ std::string feature_mode_label(DescribeFeatureMode mode) {
 void print_describe_help() {
     std::cout
         << "Usage:\n"
-        << "  panvar describe -i <graph.gfa> --bubble-prefix-in <module1-prefix> --out-dir <dir> [options]\n\n"
+        << "  panvar describe -i <graph.gfa> (-b <prefix> | -c <bubbles.csv>) [-o <dir>] [options]\n\n"
         << "Options:\n"
         << "  -i, --gfa <path>                 Input GFA file (required)\n"
-        << "      --bubble-prefix-in <prefix>  Module-1 output prefix from 'panvar bubble'\n"
+        << "  -b, --bubble-prefix-in <prefix>  Module-1 output prefix from 'panvar bubble'\n"
         << "                                   (auto-uses <prefix>.bubbles.csv)\n"
-        << "      --bubbles-csv <path>         Module-1 bubbles CSV (required if no prefix)\n"
-        << "      --out-dir <dir>              Output directory (default: describe_out)\n"
+        << "  -c, --bubbles-csv <path>         Module-1 bubbles CSV (required if no prefix)\n"
+        << "  -o, --out-dir <dir>              Output directory (default: describe_out)\n"
         << "      --bubble-id <N>              Restrict to one bubble ID (repeatable)\n"
-        << "      --kmer-size <K>              K-mer size, 1..31 for 2-bit encoding (default: 31)\n"
+        << "  -k, --kmer-size <K>              K-mer size, 1..31 for 2-bit encoding (default: 31)\n"
         << "      --feature-mode <mode>        all|minimizer|syncmer (default: syncmer)\n"
         << "      --minimizer-window <W>       Window of k-mers for minimizer mode (default: 15)\n"
         << "      --syncmer-s <S>              Internal s-mer size for closed syncmer mode (default: auto)\n"
@@ -62,13 +62,18 @@ void print_describe_help() {
         << "      --samples <tsv>              cosigt sample->haplotype-path table; also writes a\n"
         << "                                   sample-level fsm_kmers.samples.txt.gz (summed dosage)\n"
         << "      --no-pyseer                  Do not write the pooled fsm_kmers.txt.gz (pyseer --kmers)\n"
-        << "      --quiet                      Disable the progress bar\n"
+        << "  -q, --quiet                      Disable the progress bar\n"
         << "  -h, --help                       Show this help\n";
 }
 
 } // namespace
 
 int run_describe_command(const std::vector<std::string>& args) {
+    if (args.empty()) {
+        print_describe_help();
+        return 0;
+    }
+
     std::string bubble_prefix_in;
     DescribeOptions options;
 
@@ -89,15 +94,15 @@ int run_describe_command(const std::vector<std::string>& args) {
             options.gfa_path = require_value(arg);
             continue;
         }
-        if (arg == "--bubble-prefix-in") {
+        if (arg == "-b" || arg == "--bubble-prefix-in") {
             bubble_prefix_in = require_value(arg);
             continue;
         }
-        if (arg == "--bubbles-csv") {
+        if (arg == "-c" || arg == "--bubbles-csv") {
             options.bubbles_csv_in = require_value(arg);
             continue;
         }
-        if (arg == "--out-dir") {
+        if (arg == "-o" || arg == "--out-dir") {
             options.out_dir = require_value(arg);
             continue;
         }
@@ -109,7 +114,7 @@ int run_describe_command(const std::vector<std::string>& args) {
             options.bubble_ids.push_back(id);
             continue;
         }
-        if (arg == "--kmer-size") {
+        if (arg == "-k" || arg == "--kmer-size") {
             options.kmer_size = cli::parse_size_arg(arg, require_value(arg));
             continue;
         }
@@ -153,7 +158,7 @@ int run_describe_command(const std::vector<std::string>& args) {
             options.pyseer = false;
             continue;
         }
-        if (arg == "--quiet") {
+        if (arg == "-q" || arg == "--quiet") {
             options.quiet = true;
             continue;
         }

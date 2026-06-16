@@ -51,6 +51,16 @@ sequence-preserving (`--max-interruption-frac` bounds how much interruption an a
 
 ## Key options
 
+Synopsis (required bare, optional in `[ ]`; common flags have a short form):
+
+```text
+panvar panphorte -i <graph.gfa> (-b <prefix> | -c <bubbles.csv>) -o <prefix> [options]
+```
+
+Running `panvar panphorte` with no arguments prints this help. Short forms: `-i`/`--gfa`,
+`-b`/`--bubble-prefix-in`, `-c`/`--bubbles-csv`, `-o`/`--out-prefix`, `-r`/`--reference-path`,
+`-q`/`--quiet`.
+
 - `-o, --out-prefix <prefix>`: writes `<prefix>.normalized.gfa` and `<prefix>.panphorte.report.tsv`
 - `--bubble-id <N>`: restrict to a bubble ID; repeatable
 - `--min-unit-bp <N>`: minimum repeat-unit span to normalize (default `50`)

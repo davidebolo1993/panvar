@@ -68,6 +68,16 @@ Input is expected to be a **panphorte-normalized GFA**, so a tandem duplication 
 
 ## Key options
 
+Synopsis (required bare, optional in `[ ]`; common flags have a short form):
+
+```text
+panvar call -i <graph.gfa> (-b <prefix> | -c <bubbles.csv>) -r <name> -o <prefix> [options]
+```
+
+Running `panvar call` with no arguments prints this help. Short forms: `-i`/`--gfa`,
+`-b`/`--bubble-prefix-in`, `-c`/`--bubbles-csv-in`, `-r`/`--reference-path`, `-o`/`--out-prefix`,
+`-q`/`--quiet`.
+
 - `--min-sv-bp <N>` — minimum size of a reported (merged) event (default `50`)
 - `--merge-distance-bp <N>` — coalesce nearby same-type events within a bubble (default `100`). The gap
   is checked in **both** reference and haplotype sequence space (whichever is closer wins), and it also

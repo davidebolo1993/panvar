@@ -22,18 +22,18 @@ namespace {
 void print_bubble_help() {
     std::cout
         << "Usage:\n"
-        << "  panvar bubble -i <graph.gfa> --reference-path <name> [options]\n\n"
+        << "  panvar bubble -i <graph.gfa> -r <name> [-o <prefix>] [--superbubbles] [options]\n\n"
         << "By default the graph is sorted+flipped along the reference internally and snarls are\n"
         << "found with an internal cactus decomposition (the same 3-edge-connected-component method\n"
-        << "as 'vg snarls'); with --superbubbles only the acyclic snarls (ultrabubbles, found via\n"
-        << "superbubble detection over the reference-ordered DAG) are kept. Pass --snarls-in to use\n"
-        << "an external vg snarls JSONL instead (legacy; the graph is then used as-is, not re-sorted).\n\n"
+        << "as 'vg snarls'); with --superbubbles only the acyclic snarls (ultrabubbles, i.e. the\n"
+        << "acyclic subset of the cactus snarls) are kept. Pass --snarls-in to use an external vg\n"
+        << "snarls JSONL instead.\n\n"
         << "Options:\n"
         << "  -i, --gfa <path>                 Input GFA file (required)\n"
-        << "      --reference-path <name>      Reference path name or unique substring; orders the\n"
+        << "  -r, --reference-path <name>      Reference path name or unique substring; orders the\n"
         << "                                    internal sort/flip + snarl finder (required unless\n"
         << "                                    --snarls-in is given)\n"
-        << "      --superbubbles               Emit only acyclic superbubbles (default: all snarls)\n"
+        << "  -s, --superbubbles               Emit only acyclic superbubbles (default: all snarls)\n"
         << "      --no-flip                    Do not reorient nodes to the reference forward strand\n"
         << "      --sorted-gfa-out <path>      Internally-sorted GFA output (default: <prefix>.sorted.gfa)\n"
         << "      --emit-snarls-jsonl <path>   Also write the internal snarls as a vg-style JSONL\n"
@@ -49,13 +49,18 @@ void print_bubble_help() {
         << "      --merge-nearby-bp <N>        Merge nearby bubbles only after base filters\n"
         << "                                    (min-path/min-variant) when sink->source shortest-path\n"
         << "                                    distance is <= N bp (default: 0, disabled)\n"
-        << "      --quiet                      Disable the progress bar\n"
+        << "  -q, --quiet                      Disable the progress bar\n"
         << "  -h, --help                       Show this help\n";
 }
 
 } // namespace
 
 int run_bubble_command(const std::vector<std::string>& args) {
+    if (args.empty()) {
+        print_bubble_help();
+        return 0;
+    }
+
     std::string gfa_path;
     std::string out_prefix = "bubble_calls";
     std::string bubbles_csv_path;
@@ -100,11 +105,11 @@ int run_bubble_command(const std::vector<std::string>& args) {
             options.snarls_input_path = require_value(arg);
             continue;
         }
-        if (arg == "--reference-path") {
+        if (arg == "-r" || arg == "--reference-path") {
             options.reference_path = require_value(arg);
             continue;
         }
-        if (arg == "--superbubbles") {
+        if (arg == "-s" || arg == "--superbubbles") {
             options.superbubbles_only = true;
             continue;
         }
@@ -137,7 +142,7 @@ int run_bubble_command(const std::vector<std::string>& args) {
             options.merge_nearby_bp = cli::parse_size_arg(arg, require_value(arg));
             continue;
         }
-        if (arg == "--quiet") {
+        if (arg == "-q" || arg == "--quiet") {
             options.quiet = true;
             continue;
         }
