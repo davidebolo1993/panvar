@@ -14,6 +14,8 @@ usage <- function(status = 0) {
     "  --node-lengths <path>  panvar inspect node_lengths.tsv; scales x by node bp length",
     "  --length-transform <mode>  raw, sqrt, or log1p tile-width scaling (default: sqrt)",
     "  --clusters <path>    panvar inspect clusters.tsv; keep only representative paths",
+    "  --cluster-by <path>  panvar inspect clusters.tsv; keep all paths but group/order rows by",
+    "                       cluster (representative first), with a separator between clusters",
     "  --cluster-rows       Cluster paths by coverage profile",
     "  --cluster-cols       Cluster nodes by coverage profile",
     "  --max-paths <N>      Keep at most N paths, selected by total coverage (default: all)",
@@ -48,6 +50,7 @@ opts <- list(
   node_lengths = NULL,
   length_transform = "sqrt",
   clusters = NULL,
+  cluster_by = NULL,
   cluster_rows = FALSE,
   cluster_cols = FALSE,
   max_paths = 0,
@@ -86,6 +89,9 @@ while (i <= length(args)) {
     i <- i + 2
   } else if (arg == "--clusters") {
     opts$clusters <- read_value(arg)
+    i <- i + 2
+  } else if (arg == "--cluster-by") {
+    opts$cluster_by <- read_value(arg)
     i <- i + 2
   } else if (arg == "--cluster-rows") {
     opts$cluster_rows <- TRUE
@@ -150,6 +156,46 @@ read_tsv <- function(path) {
   con <- open_input(path)
   on.exit(close(con))
   read.delim(con, sep = "\t", header = TRUE, check.names = FALSE, quote = "", comment.char = "")
+}
+
+# Reorder a coverage matrix so cluster-mates (from a panvar inspect clusters.tsv) are
+# adjacent: clusters ascending by cluster_id, representative first within each cluster,
+# then path name; any rows absent from the cluster file sort last. Returns the reordered
+# matrix and the mat-row indices (>1) where a new cluster begins (for separator lines).
+order_rows_by_clusters <- function(mat, clusters_path) {
+  cl <- read_tsv(clusters_path)
+  if (!all(c("cluster_id", "members") %in% names(cl))) {
+    stop("--cluster-by table must contain cluster_id and members columns", call. = FALSE)
+  }
+  has_rep <- "representative_path" %in% names(cl)
+  path_cluster <- new.env(parent = emptyenv())
+  path_isrep <- new.env(parent = emptyenv())
+  for (r in seq_len(nrow(cl))) {
+    cid <- suppressWarnings(as.integer(cl$cluster_id[r]))
+    mem <- strsplit(as.character(cl$members[r]), ";", fixed = TRUE)[[1]]
+    mem <- mem[nzchar(mem)]
+    repp <- if (has_rep) as.character(cl$representative_path[r]) else NA_character_
+    for (m in mem) {
+      assign(m, cid, envir = path_cluster)
+      assign(m, identical(m, repp), envir = path_isrep)
+    }
+  }
+  rn <- rownames(mat)
+  cid_vec <- vapply(rn, function(x)
+    if (exists(x, envir = path_cluster, inherits = FALSE)) get(x, envir = path_cluster) else NA_integer_,
+    integer(1))
+  isrep_vec <- vapply(rn, function(x)
+    exists(x, envir = path_isrep, inherits = FALSE) && isTRUE(get(x, envir = path_isrep)),
+    logical(1))
+  cid_sort <- ifelse(is.na(cid_vec), .Machine$integer.max, cid_vec)
+  ord <- order(cid_sort, !isrep_vec, rn)
+  cid_ordered <- cid_sort[ord]
+  boundaries <- if (length(cid_ordered) > 1) {
+    which(cid_ordered[-1] != cid_ordered[-length(cid_ordered)]) + 1
+  } else {
+    integer(0)
+  }
+  list(mat = mat[ord, , drop = FALSE], boundaries = boundaries)
 }
 
 con <- open_input(opts$table)
@@ -217,7 +263,17 @@ if (opts$transform == "log1p") {
   plot_mat <- log1p(plot_mat)
 }
 
-if (opts$cluster_rows && nrow(plot_mat) > 1) {
+cluster_boundaries <- integer(0)
+if (!is.null(opts$cluster_by)) {
+  if (opts$cluster_rows) {
+    warning("--cluster-by overrides --cluster-rows (rows grouped by inspect clusters)", call. = FALSE)
+  }
+  grouped <- order_rows_by_clusters(mat, opts$cluster_by)
+  ord <- match(rownames(grouped$mat), rownames(mat))
+  mat <- grouped$mat
+  plot_mat <- plot_mat[ord, , drop = FALSE]
+  cluster_boundaries <- grouped$boundaries
+} else if (opts$cluster_rows && nrow(plot_mat) > 1) {
   row_order <- hclust(dist(plot_mat))$order
   mat <- mat[row_order, , drop = FALSE]
   plot_mat <- plot_mat[row_order, , drop = FALSE]
@@ -327,6 +383,14 @@ p <- p +
     axis.text.y = ggplot2::element_text(size = 5),
     legend.position = "right"
   )
+
+# Separator lines between adjacent inspect clusters (only with --cluster-by).
+if (length(cluster_boundaries) > 0) {
+  p <- p + ggplot2::geom_hline(
+    yintercept = n_paths - cluster_boundaries + 1.5,
+    colour = "grey30", linewidth = 0.3
+  )
+}
 
 png_path <- paste0(opts$out, ".png")
 pdf_path <- paste0(opts$out, ".pdf")

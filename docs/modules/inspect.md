@@ -49,8 +49,6 @@ Running `panvar inspect` with no arguments prints this help. Short forms: `-i`/`
 
 - `--cluster` — group paths by source→sink walk and write `<prefix>.bubble_<N>.clusters.tsv`
 - `--cluster-similarity <f>` — walk-similarity threshold for `--cluster` (default `0.90`)
-- `--cluster-greedy` — use the legacy greedy medoid clustering instead of the default
-  connected-components (MinHash) method
 
 ## Outputs
 
@@ -160,24 +158,31 @@ deterministic column order. As with nodes, counts are interval-local.
 haplotypes collapse to one representative. It is an inspection aid only — nothing downstream depends on
 it — but it is handy for plotting (see the heatmap `--clusters` option).
 
-Identical walks collapse first. The distinct walks are then clustered by one of two methods:
+Identical walks collapse first. The distinct walks are then clustered by **connected components**:
+each distinct walk gets a **MinHash sketch** over oriented node-step shingles, and two walks' similarity
+is the sketch-estimated identity. A threshold graph connects every pair at least `--cluster-similarity`
+similar (default `0.90`), and clusters are its **connected components** — so the grouping is **transitive
+and order-independent** (if A~B and B~C, then A, B, C land in one cluster). It is fast (no quadratic exact
+alignment); for very short walks that cannot be shingled it falls back to an exact **bp-weighted Jaccard**
+(each step contributes its node's bp length to an oriented `<node_id><strand>` token multiset, compared as
+`sum(min)/sum(max)`). The representative is the member minimizing max-then-mean intra-cluster distance
+(ties → most-supported walk, then signature).
 
-- **Connected components (default).** Each distinct walk gets a **MinHash sketch** over oriented
-  node-step shingles; two walks' similarity is the sketch-estimated identity. A threshold graph connects
-  every pair at least `--cluster-similarity` similar (default `0.90`), and clusters are its **connected
-  components** — so the grouping is **transitive and order-independent** (if A~B and B~C, A, B, C land in
-  one cluster). This is the fast, non-greedy method (no quadratic exact alignment); for very short walks
-  that cannot be shingled it falls back to the exact bp-weighted Jaccard below. The representative is the
-  member minimizing max-then-mean intra-cluster distance (ties → most-supported walk, then signature).
-- **Greedy (`--cluster-greedy`).** The legacy method: each walk is summarized as an **oriented,
-  bp-weighted token multiset** (every step contributes its node's bp length to `<node_id><strand>`) and
-  walks are compared with weighted Jaccard `sum(min)/sum(max)`. Each distinct walk joins the single most
-  similar existing cluster medoid ≥ `--cluster-similarity`, or starts a new one (so the result is
-  **order-dependent** and a chain of similar walks can be split). Kept for reproducibility.
+The sketch is **multiplicity-aware**: a shingle seen *k* times contributes *k* distinct sketch elements,
+so the sketch Jaccard tracks the shingle **multiset**, not just the set. This matters for tandem repeats
+(e.g. LPA KIV-2): copies of the same unit share the same shingle *set* regardless of copy number, so a
+set-based sketch would merge all copy numbers into one cluster — the multiset sketch instead separates
+them by copy number, matching the bp-weighted fallback.
 
-Both capture inversions (strand is part of the token/shingle) and copy number (repeats add weight). The
-two methods can give different groupings at the same threshold: connected-components tends to merge a chain
-of related walks into one cluster, while greedy may split it.
+> **Copy number is a continuum, and connected components is single-linkage.** When a repeat varies over
+> a near-continuous range of copy numbers (KIV-2 spans ~12 kb–184 kb across the panel), adjacent copy
+> numbers are >90% similar, so at the default threshold the whole gradient **chains into one component**.
+> That is expected, not a failure to discriminate: raise `--cluster-similarity` to cut the continuum into
+> finer copy-number bands (on KIV-2, `0.90→0.95→0.97→0.99` yields ~`4→19→47→133` clusters). To *see* the
+> copy-number spectrum directly rather than as hard clusters, use the node-coverage heatmap (its
+> `--cluster-rows`, or `--cluster-by` with this clusters file).
+
+This captures inversions (strand is part of the shingle/token) and copy number (repeats add weight).
 
 Output `<out-prefix>.bubble_<N>.clusters.tsv`:
 
@@ -263,7 +268,8 @@ scripts/plot_node_coverage_heatmap.R \
   --out tests/results/c4/inspect/bubble_4.node_coverage
 ```
 
-To plot only the cluster representatives, pass the `--cluster` output:
+The `--cluster` output (`clusters.tsv`) can drive the heatmap in two ways. To plot **only the cluster
+representatives** (one row per cluster), use `--clusters`:
 
 ```bash
 scripts/plot_node_coverage_heatmap.R \
@@ -272,12 +278,26 @@ scripts/plot_node_coverage_heatmap.R \
   --out tests/results/c4/inspect/bubble_4.representatives
 ```
 
+To keep **all** paths but **group/order the rows by cluster** (representative first, with a thin
+separator line between clusters), use `--cluster-by` instead:
+
+```bash
+scripts/plot_node_coverage_heatmap.R \
+  --table tests/results/c4/inspect/all.bubble_4.node_counts.tsv \
+  --cluster-by tests/results/c4/inspect/all.bubble_4.clusters.tsv \
+  --out tests/results/c4/inspect/bubble_4.by_cluster
+```
+
+`--cluster-by` overrides the coverage-profile `--cluster-rows` ordering (rows follow the inspect
+clusters instead). Paths absent from the cluster file sort last.
+
 Useful plotting options:
 
 - `--value total|forward|reverse`
 - `--transform raw|log1p`
 - `--node-lengths <path>` (length-scale x; tile widths via `--length-transform raw|sqrt|log1p`, default `sqrt`)
 - `--clusters <path>` (keep only `--cluster` representative paths)
+- `--cluster-by <path>` (keep all paths, group/order rows by `--cluster` assignment)
 - `--cluster-rows`
 - `--cluster-cols`
 - `--max-paths <N>`
@@ -297,5 +317,6 @@ scripts/plot_edge_coverage_heatmap.R \
 ```
 
 This writes `<out>.png` and `<out>.pdf`. Options: `--transform raw|log1p`, `--clusters <path>`
-(keep only `--cluster` representatives), `--cluster-rows`, `--cluster-cols`, `--max-paths <N>`,
-`--max-edges <N>`, `--width`, `--height`.
+(keep only `--cluster` representatives), `--cluster-by <path>` (keep all paths, group/order rows by
+`--cluster` assignment), `--cluster-rows`, `--cluster-cols`, `--max-paths <N>`, `--max-edges <N>`,
+`--width`, `--height`.
