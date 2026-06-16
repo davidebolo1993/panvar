@@ -73,8 +73,7 @@ boundaries. In a pangenome some haplotypes may not, because:
 - an assembly may be **fragmented or partial** and simply not span the locus;
 - with nested snarls, a path can cross the parent yet take a branch that **skips a child** snarl.
 
-For this reason `path_support` counts only the paths whose walk actually crosses `source → sink` (found
-by `find_best_bubble_path_interval`), and it is normally **smaller than the total number of P/W paths**. Downstream, `call` records a sample that does not cross a bubble with
+For this reason the number of supporting paths is the number of paths whose walk actually crosses `source → sink`, and can be smaller than the total number of P/W paths. Downstream, `call` records a sample that does not cross a bubble with
 genotype `.` (as opposed to `0` for "crosses but reference-like" and `1` for a carrier).
 
 
