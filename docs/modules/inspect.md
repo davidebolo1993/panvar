@@ -20,7 +20,7 @@ This is meant for sanity-checking questions like:
 
 - which paths actually cross this bubble?
 - how long is each path through this bubble?
-- which internal nodes andadjacencies (edges) are reused, and in which orientation?
+- which internal nodes and edges are reused, and in which orientation?
 
 ## Required inputs
 
