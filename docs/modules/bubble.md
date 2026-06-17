@@ -12,7 +12,7 @@ CLI entrypoint:
 
 1. sorts + flips the graph along the reference internally ( `numeric node id == reference order`)
 2. finds **snarls** internally with a vendored cactus / 3-edge-connected decomposition (matches closely
-   `vg snarls`; see [backround](#snarls-vs-superbubbles-background))
+   `vg snarls`; see [Backround](#snarls-vs-superbubbles-background))
 3. infers bubble-internal nodes from path intervals between each snarl's source/sink
 4. computes path support and internal sequence span per candidate
 5. applies base site filters (`--min-variant-bp`, `--min-path-support`)
@@ -46,7 +46,7 @@ panvar bubble -i <pggb.outdir>/*smooth.final.gfa --reference-path <reference.id>
 
 When run with `--snarls-in <snarls.jsonl>` (from `vg snarls -A integrated <graph.gfa> | vg view -R -j -`), the graph is used **as-is**. 
 
-## Snarls vs. superbubbles (background)
+## Background: Snarls vs. superbubbles
 
 `bubble` consumes **snarls** by default, not superbubbles.
 
