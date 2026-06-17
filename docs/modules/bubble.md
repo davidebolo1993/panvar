@@ -8,14 +8,14 @@ CLI entrypoint:
 
 ## What it does
 
-`bubble` turns any GFA into `panvar` bubble sites for downstream modules. By default it:
+`bubble` turns a pangenome graph (GFA) into `panvar` bubble sites for downstream modules. By default it:
 
 1. sorts + flips the graph along the reference internally ( `numeric node id == reference order`)
 2. finds **snarls** internally with a vendored cactus / 3-edge-connected decomposition (matches closely
-   `vg snarls`; see [snarls vs superbubbles](#snarls-vs-superbubbles-background))
+   `vg snarls`; see [backround](#snarls-vs-superbubbles-background))
 3. infers bubble-internal nodes from path intervals between each snarl's source/sink
 4. computes path support and internal sequence span per candidate
-5. applies base site filters (`min-variant-bp`, `min-path-support`)
+5. applies base site filters (`--min-variant-bp`, `--min-path-support`)
 6. optionally merges nearby bubbles (`--merge-nearby-bp`)
 7. writes the **sorted GFA** + **CSV of bubbles** + **visualization outputs**
 
@@ -28,8 +28,8 @@ CLI entrypoint:
 ## Outputs
 
 - `*.bubbles.csv`: refined bubble/site table used by downstream modules (panphorte/call/describe)
-- `*.sorted.gfa`: the sorted and flipped graph to be used as input for downstream `panphorte`/`call`
-- `*.bandage_nodes.csv`: node colors for Bandage
+- `*.sorted.gfa`: the reference-sorted and -flipped graph to be used as input for downstream `panphorte`/`call`
+- `*.bandage_nodes.csv`: node colors for Bandage visualization
 - optional `--snarl-debug-tsv <path>`: candidate-level diagnostics
 - optional `--emit-snarls-jsonl <path>`: the internal snarls in vg-style JSONL
 
@@ -41,10 +41,10 @@ A graph is typically produced with `pggb`:
 
 ```bash
 pggb -i <haplotypes.fa> -o <pggb.outdir>
-panvar bubble -i <pggb.outdir>/*smooth.final.og --reference-path <reference.id> -o <panvar.outdir>/bubble
+panvar bubble -i <pggb.outdir>/*smooth.final.gfa --reference-path <reference.id> -o <panvar.outdir>/bubble
 ```
 
-When run with `--snarls-in <snarls.jsonl>` (from `vg snarls -A integrated <graph.gfa> | vg view -R -j -`), the graph is used **as-is**, so the JSONL node ids match. The two modes are mutually exclusive.
+When run with `--snarls-in <snarls.jsonl>` (from `vg snarls -A integrated <graph.gfa> | vg view -R -j -`), the graph is used **as-is**. 
 
 ## Snarls vs. superbubbles (background)
 
@@ -52,15 +52,14 @@ When run with `--snarls-in <snarls.jsonl>` (from `vg snarls -A integrated <graph
 
 A **superbubble** is a single-source / single-sink subgraph that is **directed and acyclic**: every
 internal node is reachable from the source and reaches the sink, and the only way in or out is through
-the two boundaries. By construction it **cannot** contain a cycle or an inversion. A **snarl** (Paten
-et al.; what `vg snarls` emits) is the more general structure: a pair of boundary nodes whose removal
+the two boundaries. By construction it **cannot** contain a cycle or an inversion. A **snarl** (*i.e.* what `vg snarls` emits) is the more general structure: a pair of boundary nodes whose removal
 separates an internal subgraph from the rest, defined on the **bidirected** graph. Snarls therefore
-also capture the **inversions, tandem cycles, and tangles** that a superbubble cannot, and they
-**nest**; their acyclic subclass — "ultrabubbles" — is essentially the superbubble. panvar uses snarls
+capture the **inversions, tandem cycles, and tangles** that a superbubble cannot, and they
+**nest**; their acyclic subclass — "ultrabubbles" — is essentially the superbubble. `panvar` uses snarls
 because the pangenome variation this toolkit targets (including inversions and tandem expansions) often
 lives in the cyclic or inverted sites that superbubbles omit.
 
-Internally, panvar reproduces `vg snarls` by mirroring vg's cactus / 3-edge-connected decomposition, so
+Internally, `panvar` reproduces `vg snarls` by mirroring vg's cactus / 3-edge-connected decomposition, so
 the default top-level snarl set matches vg; passing `--superbubbles` instead emits only the acyclic
 superbubble subset. This acyclic subset is the same superbubble concept used by tools like 
 [BubbleGun](https://doi.org/10.1093/bioinformatics/btac448), whose detector finds superbubbles
@@ -101,7 +100,7 @@ For each top-level snarl candidate:
 4. measure:
    - number of crossing paths
    - internal bp support across crossing paths
-5. apply base filters (`min-path-support`, `min-variant-bp`)
+5. apply base filters (`--min-path-support`, `--min-variant-bp`)
 6. optionally merge nearby surviving bubbles
 7. assign bubble IDs
 
@@ -123,10 +122,7 @@ For each top-level snarl candidate:
 - if enabled, consecutive surviving bubbles are merged when the shortest-path distance
   from previous `sink` to next `source` is `<= N` bp
 - distance is computed from node lengths across graph connectivity
-Example:
 
-If bubble A ends at node `2527` and bubble B starts at node `2527`, and node `2527` has length `10 bp`,
-then with `--merge-nearby-bp 20` those bubbles are merged.
 
 ## Key options
 
@@ -168,8 +164,7 @@ Two extra per-bubble metrics are also computed — they drive the
 `--min-variant-bp` filter and are surfaced in the optional debug TSV:
 
 - `long_path_support`: count of supporting paths with inside span `>= --min-variant-bp`
-- `inversion_signal`: true when at least one internal node is observed in both orientations across
-  supporting paths (such a bubble is kept even when no path reaches `--min-variant-bp`)
+- `inversion_signal`: true when at least one internal node is observed in both orientations across supporting paths (such a bubble is kept even when no path reaches `--min-variant-bp`)
 
 ## Debug TSV columns
 
@@ -189,16 +184,14 @@ Final bubbles produced by `--merge-nearby-bp` have no original candidate row, so
 ## Example
 
 ```bash
-# Internal pipeline (no vg/odgi): sort + flip + cactus snarls.
+#compute snarls
 ./build/panvar bubble \
-  -i tests/real_data/c4.gfa \
-  -o tests/results/c4/bubble \
-  --reference-path grch38 \
-  --merge-nearby-bp 20
-# downstream uses tests/results/c4/bubble.sorted.gfa
+  -i tests/real_data/lpa.gfa \
+  -o tests/results/lpa/bubble/bubble \
+  --reference-path grch38
 
-# Override with an external vg snarls file
-./build/panvar bubble -i tests/real_data/c4.gfa -o tests/results/c4/bubble --snarls-in tests/real_data/c4.snarls.jsonl
+#or override with an external vg snarls file
+./build/panvar bubble -i tests/real_data/lpa.gfa -o tests/results/lpa/bubble/bubble --snarls-in tests/real_data/c4.snarls.jsonl
 ```
 
 ## Bandage Colors
