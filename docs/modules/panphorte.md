@@ -27,15 +27,12 @@ differs deliberately:
 | Modes | single collapse | explicit **exact (sequence-preserving)** vs **approximate (lossy)** via `--min-similarity` |
 
 
-**Correctness:** in exact mode (default, `--min-similarity 1.0`) every rewrite is
+In exact mode (default, `--min-similarity 1.0`) every rewrite is
 **sequence-preserving** — each path spells exactly the same sequence through the normalized graph as
 through the original; the tool enforces this internally and aborts if any path's sequence would
 change. Approximate mode (`--min-similarity < 1.0`) is intentionally **lossy** (see below): copies
 are canonicalized to a representative unit, so haplotype sequences change within collapsed repeat
-regions and the invariant is not applied there.
-
-**Scope:** tandem repeats (DUP events) are rewritten — that is the class where linear
-expansion obstructs calling. DEL / INS / INV are already encoded in the walks (a haplotype skipping
+regions and the invariant is not applied there. The scope of this module is to rewrite repeat stretches so that these can be  called downstream as DUP. DEL / INS / INV are already encoded in the walks (a haplotype skipping
 reference nodes is a deletion, extra nodes an insertion, reversed orientation an inversion) - and are
 *read* by downstream variant calling. Arrays of identical copies **and** arrays with short
 interruptions between copies (e.g. `CGG (A) CGG CGG CGG`) are collapsed; the interrupting segment is
@@ -51,15 +48,9 @@ sequence-preserving (`--max-interruption-frac` bounds how much interruption an a
 
 ## Key options
 
-Synopsis (required bare, optional in `[ ]`; common flags have a short form):
-
-```text
+```bash
 panvar panphorte -i <graph.gfa> (-b <prefix> | -c <bubbles.csv>) -o <prefix> [options]
 ```
-
-Running `panvar panphorte` with no arguments prints this help. Short forms: `-i`/`--gfa`,
-`-b`/`--bubble-prefix-in`, `-c`/`--bubbles-csv`, `-o`/`--out-prefix`, `-r`/`--reference-path`,
-`-q`/`--quiet`.
 
 - `-o, --out-prefix <prefix>`: writes `<prefix>.normalized.gfa` and `<prefix>.panphorte.report.tsv`
 - `--bubble-id <N>`: restrict to a bubble ID; repeatable
@@ -98,8 +89,6 @@ unit per bubble, whose near-identical copies are found by **banded sequence alig
    appropriate when copy number is the variant of interest, not the within-copy differences.
    **Per-copy orientation is preserved** (three copies, two forward + one reverse → `REP +,−,+`).
 
-
-
 **Limitation:** the unit must occur as `>= 2` **adjacent** identical copies in at least one haplotype
 to be seeded. Once seeded, copies in any haplotype may be non-adjacent / divergent. A duplication with
 no adjacent identical pair anywhere (e.g. paralogs separated by other sequence, or a copy embedded in a
@@ -119,14 +108,11 @@ reference path and emits a `DUP` record. See [call](call.md).
   nodes; the new REP nodes are **appended at the end**, not placed at their genomic locus. Downstream
   `call` treats **numeric node id == reference order**, so the graph must be re-sorted before calling.
 
-- **`--reference-path <name>` makes the output call-ready with no external tools.** When set, panphorte
-  internally sorts+flips the normalized graph along the reference (repositioning the appended REP nodes
-  into reference order and renumbering ids — the `odgi sort` equivalent) and re-snarls it with the
-  cactus finder, writing:
+- `--reference-path <name>` makes the output **call-ready** (sorts+flips the normalized graph along the reference repositioning the appended REP nodes into reference order and renumbering ids and re-snarls it with the cactus finder) writing:
   - `<prefix>.normalized.sorted.gfa` — the sorted, call-ready graph
   - `<prefix>.bubbles.csv` — the re-snarled bubbles
 
-  so the whole pipeline is **`bubble → panphorte --reference-path → call`** with no `odgi`/`vg`:
+  so the whole pipeline is **`bubble → panphorte --reference-path → call`**:
 
   ```bash
   panvar call -i out/panphorte.normalized.sorted.gfa --bubble-prefix-in out/panphorte \
@@ -141,8 +127,7 @@ reference path and emits a `DUP` record. See [call](call.md).
   walk nodes `from_node..to_node` (`region_bp` bp) collapsed into the unit looped `copies` times
   (orientation pattern `orientations`, mean alignment identity `mean_identity`)". `n_long`/`n_short`
   split those `copies` by per-copy length: a copy spanning `< 0.90 ×` the (long) unit is `short`: `n_long + n_short = copies`.
-- Run summary on stdout: bubbles seen / normalized, paths rewritten, nodes removed / added, edges
-  added.
+- Run summary on stdout: bubbles seen / normalized, paths rewritten, nodes removed / added, edges added.
 
 ## Algorithm overview
 
@@ -163,20 +148,10 @@ For each bubble, for each path crossing it:
 ## Example
 
 ```bash
-# 1. bubble on the raw graph (internal sort + cactus snarls) -> bubble.sorted.gfa
-panvar bubble -i tests/real_data/c4.gfa --reference-path grch38 -o tests/results/c4/bubble
-
-# 2. normalize tandem-repeat bubbles AND internally re-sort + re-snarl (no odgi/vg)
-panvar panphorte \
-  -i tests/results/c4/bubble.sorted.gfa \
-  --bubble-prefix-in tests/results/c4/bubble \
-  --reference-path grch38 \
-  -o tests/results/c4/panphorte
-
-# 3. call directly on the panphorte sorted output
-panvar call \
-  -i tests/results/c4/panphorte.normalized.sorted.gfa \
-  --bubble-prefix-in tests/results/c4/panphorte \
-  --reference-path grch38 \
-  -o tests/results/c4/call
+./build/panvar panphorte \
+  -i tests/results/lpa/bubble/bubble.sorted.gfa \
+  --bubble-prefix-in tests/results/lpa/bubble/bubble \
+  --reference-path grch38_1 \
+  -o tests/results/lpa/panphorte/panphorte \
+  --min-similarity 0.97
 ```

@@ -217,7 +217,7 @@ reads copy number straight off the REP self-loop multiplicity.
 ### Exact vs approximate (`--min-similarity`)
 
 The trace above is **exact** mode (`--min-similarity 1.0`): `block_equal` requires byte-identical copies.
-Real KIV-2 copies differ by SNVs, so the exact pair test fails and nothing is seeded. With
+Real repeats (*e.g.*, KIV-2 in LPA) ofter differ by SNVs or small indels, so the exact pair test fails and nothing is seeded. With
 `--min-similarity 0.90`, panphorte switches to a **single-representative, lossy** mode: it picks one unit
 `U`, then finds its near-copies by multi-seed **banded alignment** of `U` (and its reverse complement)
 against the path's spelled sequence, accepting a copy when `identity ≥ 0.90` and at least half of `U` is
@@ -229,7 +229,7 @@ copy 1: identity 0.98 ✓   copy 2: 0.95 ✓   copy 3: 0.93 ✓   copy 4: 0.97 �
 
 Because alignment (not exact match) bridges a copy, a large *internal indel* between divergent copies is
 also bridged when the threshold is low enough — this is what lets a C4 short module (missing the ~6.4 kb
-HERV-K) fold onto the long one at `--min-similarity 0.70`. The collapse is lossy: the per-copy SNVs are
+HERV-K) fold onto the long one at `--min-similarity 0.70`. The collapse is lossy: the per-copy small events are
 discarded in favour of the single representative `U`.
 
 ---
