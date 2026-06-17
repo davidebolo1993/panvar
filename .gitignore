@@ -14,7 +14,7 @@ tests/real_data/gencode*
 tests/real_data/lpa*
 tests/real_data/gstm1*
 tests/real_data/cypd26*
-out
+tests/results
 
 !tests/results/.gitkeep
 
