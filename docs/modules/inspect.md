@@ -132,7 +132,9 @@ columns. The edge matrix is **adjacency-aware**, complementing the node matrix: 
 
 `--cluster` groups the paths crossing a bubble by their `source → sink` walk, so structurally identical
 haplotypes collapse to one representative. It is an inspection aid only — nothing downstream depends on
-it — but it is handy for plotting (see the heatmap `--clusters` option). Identical walks collapse first. The distinct walks are then clustered by **connected components**: each distinct walk gets a **MinHash sketch** over oriented node-step shingles, and two walks' similarity is the sketch-estimated identity. A threshold graph connects every pair at least `--cluster-similarity` similar (default `0.90`), and clusters are its **connected components** — so the grouping is **transitive
+it — but it is handy for plotting (see the heatmap `--clusters` option). The shingles, MinHash sketch and
+connected-component grouping are traced on a tiny worked dataset in
+[algorithm_example.md](../algorithm_example.md). Identical walks collapse first. The distinct walks are then clustered by **connected components**: each distinct walk gets a **MinHash sketch** over oriented node-step shingles, and two walks' similarity is the sketch-estimated identity. A threshold graph connects every pair at least `--cluster-similarity` similar (default `0.90`), and clusters are its **connected components** — so the grouping is **transitive
 and order-independent** (if A~B and B~C, then A, B, C land in one cluster). It is fast (no quadratic exact
 alignment); for very short walks that cannot be shingled it falls back to an exact **bp-weighted Jaccard**
 (each step contributes its node's bp length to an oriented `<node_id><strand>` token multiset, compared as
@@ -154,6 +156,8 @@ raise it to split.
 
 ## Example
 
+Use the **sorted GFA from `bubble`** (its node ids match the bubble CSV).
+
 ```bash
 ./build/panvar inspect \
   -i tests/results/lpa/bubble/bubble.sorted.gfa \
@@ -161,17 +165,18 @@ raise it to split.
   --bubble-id 7 \
   -o tests/results/lpa/inspect/inspect \
   --cluster \
-  --cluster-similarity 0.95
+  --cluster-similarity 0.97
 ```
 
 This writes:
 
 - `tests/results/lpa/inspect/inspect.bubble_7.paths.fa.gz`
-- `tests/results/c4/inspect/inspect.bubble_7.node_counts.tsv`
-- `tests/results/c4/inspect/inspect.bubble_7.edge_counts.tsv`
+- `tests/results/lpa/inspect/inspect.bubble_7.node_counts.tsv`
+- `tests/results/lpa/inspect/inspect.bubble_7.edge_counts.tsv`
 - `tests/results/lpa/inspect/inspect.bubble_7.clusters.tsv`
 
-To inspect all bubbles:
+To inspect all bubbles, drop `--bubble-id`; `inspect` writes one FASTA/table set per bubble
+(`inspect.bubble_1.*`, `inspect.bubble_2.*`, …):
 
 ```bash
 ./build/panvar inspect \
@@ -180,19 +185,10 @@ To inspect all bubbles:
   -o tests/results/lpa/inspect/inspect
 ```
 
-This writes one FASTA/table pair per bubble, for example:
-
-- `tests/results/lpa/inspect/inspect.bubble_1.paths.fa.gz`
-- `tests/results/lpa/inspect/inspect.bubble_1.node_counts.tsv`
-- `tests/results/lpa/inspect/inspect.bubble_1.edge_counts.tsv`
-- `tests/results/lpa/inspect/inspect.bubble_2.paths.fa.gz`
-- `tests/results/lpa/inspect/inspect.bubble_2.node_counts.tsv`
-- `tests/results/lpa/inspect/inspect.bubble_2.edge_counts.tsv`
-
 
 ## Node Coverage Heatmap
 
-Use `scripts/plot_node_coverage_heatmap.R` to visualize an inspect node-count table.
+Use `Rscript scripts/plot_node_coverage_heatmap.R` to visualize an inspect node-count table.
 
 Dependency:
 
@@ -201,7 +197,7 @@ Dependency:
 Example:
 
 ```bash
-scripts/plot_node_coverage_heatmap.R \
+Rscript scripts/plot_node_coverage_heatmap.R \
   --table tests/results/lpa/inspect/inspect.bubble_7.node_counts.tsv \
   --out tests/results/lpa/inspect/inspect.bubble_7.node_coverage
 ```
@@ -216,7 +212,7 @@ To scale the x-axis by node length (thin tiles for SNP-sized nodes, wide tiles f
 keeping the column order, pass the node-length sidecar:
 
 ```bash
-scripts/plot_node_coverage_heatmap.R \
+Rscript scripts/plot_node_coverage_heatmap.R \
   --table tests/results/lpa/inspect/inspect.bubble_7.node_counts.tsv \
   --out tests/results/lpa/inspect/inspect.bubble_7.node_coverage \
   --node-lengths tests/results/lpa/inspect/inspect.bubble_7.node_lengths.tsv
@@ -226,7 +222,7 @@ The `--cluster` output (`clusters.tsv`) can drive the heatmap in two ways. To pl
 representatives** (one row per cluster), use `--clusters`:
 
 ```bash
-scripts/plot_node_coverage_heatmap.R \
+Rscript scripts/plot_node_coverage_heatmap.R \
   --table tests/results/lpa/inspect/inspect.bubble_7.node_counts.tsv \
   --out tests/results/lpa/inspect/inspect.bubble_7.node_coverage
   --node-lengths tests/results/lpa/inspect/inspect.bubble_7.node_lengths.tsv \
@@ -236,7 +232,7 @@ scripts/plot_node_coverage_heatmap.R \
 To **group/order the rows by cluster** (representative first, with a thin separator line between clusters), use `--cluster-by` instead:
 
 ```bash
-scripts/plot_node_coverage_heatmap.R \
+Rscript scripts/plot_node_coverage_heatmap.R \
   --table tests/results/lpa/inspect/inspect.bubble_7.node_counts.tsv \
   --out tests/results/lpa/inspect/inspect.bubble_7.node_coverage \
   --node-lengths tests/results/lpa/inspect/inspect.bubble_7.node_lengths.tsv \
@@ -261,11 +257,11 @@ Useful plotting options:
 
 ## Edge Coverage Heatmap
 
-Use `scripts/plot_edge_coverage_heatmap.R` to visualize an inspect edge-count table — the same
+Use `Rscript scripts/plot_edge_coverage_heatmap.R` to visualize an inspect edge-count table — the same
 dependency and the same interface as the node heatmap, minus `--value` (edge cells are plain traversal counts) and `--node-lengths`
 
 ```bash
-scripts/plot_edge_coverage_heatmap.R \
+Rscript scripts/plot_edge_coverage_heatmap.R \
   --table tests/results/lpa/inspect/inspect.bubble_7.edge_counts.tsv \
   --out tests/results/lpa/inspect/inspect.bubble_7.edge_coverage \
   --clusters tests/results/lpa/inspect/inspect.bubble_7.clusters.tsv \

@@ -218,8 +218,6 @@ std::string feature_mode_name(DescribeFeatureMode mode) {
     switch (mode) {
         case DescribeFeatureMode::AllKmers:
             return "all";
-        case DescribeFeatureMode::Minimizer:
-            return "minimizer";
         case DescribeFeatureMode::Syncmer:
             return "syncmer";
     }
@@ -302,50 +300,6 @@ bool is_closed_syncmer(std::uint64_t code, std::size_t k, std::size_t s) {
     return best_at_end;
 }
 
-void select_minimizer_indices_for_run(
-    const std::vector<KmerOccurrence>& occurrences,
-    std::size_t begin,
-    std::size_t end,
-    std::size_t window,
-    std::vector<bool>& selected) {
-
-    const std::size_t len = end - begin;
-    if (len == 0) {
-        return;
-    }
-    if (len <= window) {
-        std::size_t best = begin;
-        for (std::size_t i = begin + 1; i < end; ++i) {
-            if (occurrences[i].code < occurrences[best].code) {
-                best = i;
-            }
-        }
-        selected[best] = true;
-        return;
-    }
-
-    std::vector<std::size_t> deque;
-    deque.reserve(window + 1);
-    std::size_t front = 0;
-
-    for (std::size_t i = begin; i < end; ++i) {
-        while (front < deque.size() && deque[front] + window <= i) {
-            ++front;
-        }
-        while (deque.size() > front && occurrences[deque.back()].code > occurrences[i].code) {
-            deque.pop_back();
-        }
-        deque.push_back(i);
-        if (i + 1 - begin >= window) {
-            selected[deque[front]] = true;
-        }
-        if (front > 64 && front * 2 > deque.size()) {
-            deque.erase(deque.begin(), deque.begin() + static_cast<std::ptrdiff_t>(front));
-            front = 0;
-        }
-    }
-}
-
 std::vector<std::size_t> select_feature_occurrence_indices(
     const std::vector<KmerOccurrence>& occurrences,
     const DescribeOptions& options) {
@@ -363,33 +317,11 @@ std::vector<std::size_t> select_feature_occurrence_indices(
         return out;
     }
 
-    if (options.feature_mode == DescribeFeatureMode::Syncmer) {
-        const std::size_t s = effective_syncmer_s(options);
-        out.reserve(occurrences.size() / 8 + 1);
-        for (std::size_t i = 0; i < occurrences.size(); ++i) {
-            if (is_closed_syncmer(occurrences[i].code, options.kmer_size, s)) {
-                out.push_back(i);
-            }
-        }
-        return out;
-    }
-
-    std::vector<bool> selected(occurrences.size(), false);
-    const std::size_t window = std::max<std::size_t>(1, options.minimizer_window);
-    std::size_t run_begin = 0;
-    while (run_begin < occurrences.size()) {
-        std::size_t run_end = run_begin + 1;
-        while (run_end < occurrences.size() &&
-               occurrences[run_end].start == occurrences[run_end - 1].start + 1) {
-            ++run_end;
-        }
-        select_minimizer_indices_for_run(occurrences, run_begin, run_end, window, selected);
-        run_begin = run_end;
-    }
-
-    out.reserve(occurrences.size() / window + 1);
-    for (std::size_t i = 0; i < selected.size(); ++i) {
-        if (selected[i]) {
+    // Syncmer (default): keep closed syncmers only.
+    const std::size_t s = effective_syncmer_s(options);
+    out.reserve(occurrences.size() / 8 + 1);
+    for (std::size_t i = 0; i < occurrences.size(); ++i) {
+        if (is_closed_syncmer(occurrences[i].code, options.kmer_size, s)) {
             out.push_back(i);
         }
     }
@@ -885,17 +817,65 @@ std::string join_nodes(const std::vector<std::string>& nodes) {
     return out;
 }
 
-// When `variant_nodes` is non-null, bases spelled from nodes NOT in the set are replaced
-// by 'N' (same length). Because the k-mer scanner resets its window on any non-ACGT base,
-// this confines all k-mer/syncmer generation to runs of variant nodes — without disturbing
-// segment offsets or node provenance. (`--variant-nodes` restriction.)
+// Per-step keep mask for `--variant-nodes` masking. A step is kept (its real sequence emitted)
+// when it is a variant node, or — with `flank_bp` > 0 — when its bp-distance ALONG THE PATH to the
+// nearest variant node is < flank_bp on either side. Keeping the flanking nodes lets k-mers that
+// span from the variant into its neighbouring sequence (e.g. nearby SNPs) survive the masking, so
+// associations can be compared with and without flanking context. flank_bp == 0 reduces to the
+// strict variant-node-only mask. The mask is path-specific (it depends on this walk's node order
+// and lengths), so it is computed per path rather than once per bubble.
+std::vector<char> variant_keep_mask(
+    const Graph& graph,
+    const std::vector<PathStep>& steps,
+    const std::unordered_set<std::string>& variant_nodes,
+    std::size_t flank_bp) {
+
+    const std::size_t n = steps.size();
+    std::vector<char> is_var(n, 0), keep(n, 0);
+    std::vector<std::size_t> len(n, 0);
+    for (std::size_t i = 0; i < n; ++i) {
+        const auto it = graph.nodes.find(steps[i].node_id);
+        len[i] = (it == graph.nodes.end()) ? 0 : it->second.sequence.size();
+        is_var[i] = variant_nodes.count(steps[i].node_id) ? 1 : 0;
+        keep[i] = is_var[i];
+    }
+    if (flank_bp == 0) {
+        return keep;
+    }
+    // Forward sweep: `gap` is the bp from the right edge of the last variant node to the left edge
+    // of the current node; keep while still within flank_bp. Backward sweep mirrors it for the left
+    // flank. SIZE_MAX marks "no variant node seen yet" so leading/trailing runs are not kept.
+    std::size_t gap = std::numeric_limits<std::size_t>::max();
+    for (std::size_t i = 0; i < n; ++i) {
+        if (is_var[i]) { gap = 0; continue; }
+        if (gap != std::numeric_limits<std::size_t>::max()) {
+            if (gap < flank_bp) keep[i] = 1;
+            gap += len[i];
+        }
+    }
+    gap = std::numeric_limits<std::size_t>::max();
+    for (std::size_t i = n; i-- > 0;) {
+        if (is_var[i]) { gap = 0; continue; }
+        if (gap != std::numeric_limits<std::size_t>::max()) {
+            if (gap < flank_bp) keep[i] = 1;
+            gap += len[i];
+        }
+    }
+    return keep;
+}
+
+// When `variant_nodes` is non-null, bases spelled from nodes outside the keep mask are replaced
+// by 'N' (same length). Because the k-mer scanner resets its window on any non-ACGT base, this
+// confines all k-mer/syncmer generation to the kept runs — without disturbing segment offsets or
+// node provenance. (`--variant-nodes` restriction, optionally widened by `flank_bp`.)
 std::string path_sequence_for_bubble(
     const Graph& graph,
     const Bubble& bubble,
     const PathRecord& path,
     const BubblePathIndex& index,
     bool* complete_out,
-    const std::unordered_set<std::string>* variant_nodes = nullptr) {
+    const std::unordered_set<std::string>* variant_nodes = nullptr,
+    std::size_t flank_bp = 0) {
 
     if (complete_out != nullptr) {
         *complete_out = false;
@@ -916,14 +896,16 @@ std::string path_sequence_for_bubble(
         }
         return complete ? sequence : std::string{};
     }
+    const std::vector<char> keep = variant_keep_mask(graph, steps, *variant_nodes, flank_bp);
     std::string sequence;
-    for (const PathStep& step : steps) {
+    for (std::size_t si = 0; si < steps.size(); ++si) {
+        const PathStep& step = steps[si];
         const auto node_it = graph.nodes.find(step.node_id);
         if (node_it == graph.nodes.end() || node_it->second.sequence.empty()) {
             return {};
         }
         const auto& node_seq = node_it->second.sequence;
-        if (variant_nodes->count(step.node_id)) {
+        if (keep[si]) {
             sequence += step.reverse ? reverse_complement(node_seq) : node_seq;
         } else {
             sequence.append(node_seq.size(), 'N');
@@ -940,7 +922,8 @@ BubblePathSequence path_sequence_with_segments_for_bubble(
     const Bubble& bubble,
     const PathRecord& path,
     const BubblePathIndex& index,
-    const std::unordered_set<std::string>* variant_nodes = nullptr) {
+    const std::unordered_set<std::string>* variant_nodes = nullptr,
+    std::size_t flank_bp = 0) {
 
     BubblePathSequence out;
     const auto interval = find_best_bubble_path_interval(index, bubble);
@@ -961,13 +944,17 @@ BubblePathSequence path_sequence_with_segments_for_bubble(
         total_len += node_it->second.sequence.size();
     }
 
+    const std::vector<char> keep =
+        variant_nodes != nullptr ? variant_keep_mask(graph, steps, *variant_nodes, flank_bp)
+                                 : std::vector<char>{};
     out.sequence.reserve(total_len);
     out.segments.reserve(steps.size());
-    for (const PathStep& step : steps) {
+    for (std::size_t si = 0; si < steps.size(); ++si) {
+        const PathStep& step = steps[si];
         const auto& node_seq = graph.nodes.at(step.node_id).sequence;
         const std::size_t start = out.sequence.size();
-        if (variant_nodes != nullptr && variant_nodes->count(step.node_id) == 0) {
-            out.sequence.append(node_seq.size(), 'N');     // masked: no k-mers from non-variant nodes
+        if (variant_nodes != nullptr && !keep[si]) {
+            out.sequence.append(node_seq.size(), 'N');     // masked: no k-mers from non-kept nodes
         } else if (step.reverse) {
             out.sequence += reverse_complement(node_seq);
         } else {
@@ -993,7 +980,7 @@ std::vector<PathMeta> collect_path_metadata_and_stats(
 
     for (std::size_t i = 0; i < graph.paths.size(); ++i) {
         bool complete = false;
-        const std::string sequence = path_sequence_for_bubble(graph, bubble, graph.paths[i], path_indexes[i], &complete, variant_nodes);
+        const std::string sequence = path_sequence_for_bubble(graph, bubble, graph.paths[i], path_indexes[i], &complete, variant_nodes, options.variant_flank_bp);
         if (!complete) {
             continue;
         }
@@ -1102,7 +1089,8 @@ void write_sparse_jsonl(
             bubble,
             graph.paths[meta.path_index],
             path_indexes[meta.path_index],
-            variant_nodes);
+            variant_nodes,
+            options.variant_flank_bp);
         if (!path_sequence.complete) {
             continue;
         }
@@ -1168,7 +1156,8 @@ void write_wide_matrix(
             graph.paths[meta.path_index],
             path_indexes[meta.path_index],
             &complete,
-            variant_nodes);
+            variant_nodes,
+            options.variant_flank_bp);
         if (!complete) {
             continue;
         }
@@ -1209,7 +1198,6 @@ void write_params_json(const DescribeOptions& options, const std::string& path) 
         << "  \"bubbles_csv\": \"" << json_escape(options.bubbles_csv_in) << "\",\n"
         << "  \"kmer_size\": " << options.kmer_size << ",\n"
         << "  \"feature_mode\": \"" << feature_mode_name(options.feature_mode) << "\",\n"
-        << "  \"minimizer_window\": " << options.minimizer_window << ",\n"
         << "  \"syncmer_s\": " << effective_syncmer_s(options) << ",\n"
         << "  \"canonical_reverse_complement\": true,\n"
         << "  \"non_discriminative_kmers_removed\": true,\n"
@@ -1246,7 +1234,7 @@ void accumulate_pyseer_counts(
     for (const PathMeta& meta : paths) {
         bool complete = false;
         const std::string sequence = path_sequence_for_bubble(
-            graph, bubble, graph.paths[meta.path_index], path_indexes[meta.path_index], &complete, variant_nodes);
+            graph, bubble, graph.paths[meta.path_index], path_indexes[meta.path_index], &complete, variant_nodes, options.variant_flank_bp);
         if (!complete) {
             continue;
         }
@@ -1255,6 +1243,41 @@ void accumulate_pyseer_counts(
             if (c > 0 && keep.count(code) != 0) {
                 pool[code][meta.path_name] += c;
             }
+        }
+    }
+}
+
+// Per-feature, per-haplotype node/edge dosage pool: the graph-substrate analogue of PyseerPool,
+// keyed by the real graph coordinate (a node id, or a "from>to" edge key) so it stays traceable
+// (node features join to call's node_track.tsv by node id). Only discriminative features are pooled.
+using GraphPool = std::map<std::string, std::map<std::string, std::uint32_t>>;
+
+void accumulate_graph_counts(
+    const Graph& graph,
+    const Bubble& bubble,
+    const std::vector<BubblePathIndex>& path_indexes,
+    const std::vector<PathMeta>& paths,
+    const std::vector<std::string>& node_features,
+    const std::vector<std::string>& edge_features,
+    GraphPool& pool) {
+
+    const std::unordered_set<std::string> keep_nodes(node_features.begin(), node_features.end());
+    const std::unordered_set<std::string> keep_edges(edge_features.begin(), edge_features.end());
+    if (keep_nodes.empty() && keep_edges.empty()) {
+        return;
+    }
+    for (const PathMeta& meta : paths) {
+        const std::vector<PathStep> steps = canonical_steps_for_bubble_path(
+            bubble, graph.paths[meta.path_index], path_indexes[meta.path_index]);
+        if (steps.empty()) {
+            continue;
+        }
+        const GraphDosage dosage = count_graph_dosage(steps);
+        for (const auto& [key, c] : dosage.node_counts) {
+            if (c > 0 && keep_nodes.count(key) != 0) pool[key][meta.path_name] += c;
+        }
+        for (const auto& [key, c] : dosage.edge_counts) {
+            if (c > 0 && keep_edges.count(key) != 0) pool[key][meta.path_name] += c;
         }
     }
 }
@@ -1292,13 +1315,40 @@ void write_pyseer_fsm(const std::string& path, const PyseerPool& pool, std::size
     out.close();
 }
 
+// Write a pooled fsm-lite file for string-named features (node/edge dosage), same layout as
+// write_pyseer_fsm but with the feature key used verbatim instead of a decoded k-mer:
+//   <feature> | <path>:<count> ...
+void write_string_fsm(const std::string& path, const GraphPool& pool) {
+    GzipWriter out(path);
+    for (const auto& [feature, carriers] : pool) {  // std::map: features emitted in sorted order
+        std::vector<std::string> names;
+        names.reserve(carriers.size());
+        for (const auto& kv : carriers) {
+            names.push_back(kv.first);
+        }
+        std::sort(names.begin(), names.end());
+        std::string line = tsv_sanitize(feature);
+        line += " |";
+        for (const std::string& n : names) {
+            line += ' ';
+            line += tsv_sanitize(n);
+            line += ':';
+            line += std::to_string(carriers.at(n));
+        }
+        line += '\n';
+        out.write(line);
+    }
+    out.close();
+}
+
 BubbleDescribeResult describe_one_bubble(
     const DescribeOptions& options,
     const Graph& graph,
     const std::vector<BubblePathIndex>& path_indexes,
     const Bubble& bubble,
     const std::unordered_set<std::string>* variant_nodes = nullptr,
-    PyseerPool* pyseer_pool = nullptr) {
+    PyseerPool* pyseer_pool = nullptr,
+    GraphPool* graph_pool = nullptr) {
 
     BubbleDescribeResult result;
     const std::filesystem::path out_dir(options.out_dir);
@@ -1382,6 +1432,9 @@ BubbleDescribeResult describe_one_bubble(
     result.node_features_total = node_stats.size();
     result.edge_features = edge_features.size();
     result.edge_features_total = edge_stats.size();
+    if (graph_pool != nullptr) {
+        accumulate_graph_counts(graph, bubble, path_indexes, paths, node_features, edge_features, *graph_pool);
+    }
     write_graph_feature_map(
         result.graph_feature_map_path, node_features, edge_features, node_stats, edge_stats, paths.size());
     if (options.write_wide_matrix) {
@@ -1409,9 +1462,6 @@ void describe_kmers_from_graph(
     }
     if (options.kmer_size == 0 || options.kmer_size > 31) {
         throw std::runtime_error("Describe k-mer size must be in [1,31]");
-    }
-    if (options.feature_mode == DescribeFeatureMode::Minimizer && options.minimizer_window == 0) {
-        throw std::runtime_error("Describe minimizer window must be > 0");
     }
     if (options.feature_mode == DescribeFeatureMode::Syncmer) {
         const std::size_t s = effective_syncmer_s(options);
@@ -1503,6 +1553,10 @@ void describe_kmers_from_graph(
     }
 
     PyseerPool pyseer_pool;
+    // Per-haplotype node/edge dosage, pooled across bubbles for the sample-level graph GWAS file.
+    // Only needed when --samples aggregation is requested.
+    GraphPool graph_pool;
+    const bool want_graph_pool = !options.samples_path.empty();
     cli::ProgressBar progress(options.quiet ? "" : "Describing bubbles", to_process.size());
 
     for (const Bubble* bubble_ptr : to_process) {
@@ -1514,7 +1568,9 @@ void describe_kmers_from_graph(
             if (it != variant_nodes_by_bubble.end()) vnodes = &it->second;
         }
         BubbleDescribeResult result =
-            describe_one_bubble(options, graph, path_indexes, bubble, vnodes, options.pyseer ? &pyseer_pool : nullptr);
+            describe_one_bubble(options, graph, path_indexes, bubble, vnodes,
+                                options.pyseer ? &pyseer_pool : nullptr,
+                                want_graph_pool ? &graph_pool : nullptr);
         ++summary.bubbles_processed;
         if (result.paths > 0) {
             ++summary.bubbles_with_paths;
@@ -1563,54 +1619,58 @@ void describe_kmers_from_graph(
         const std::string fsm_path = (out_dir / "fsm_kmers.txt.gz").string();
         write_pyseer_fsm(fsm_path, pyseer_pool, options.kmer_size);
         summary.files_written += 1;
+    }
 
-        // --samples (cosigt): aggregate per-haplotype k-mer counts into per-SAMPLE dosage
-        // (sum over the sample's assigned haplotype paths; a haplotype listed twice -> doubled,
-        // i.e. a homozygous diploid genotype). Writes fsm_kmers.samples.txt.gz alongside.
-        if (!options.samples_path.empty()) {
-            std::ifstream sin(options.samples_path);
-            if (!sin) {
-                throw std::runtime_error("Failed to open --samples file: " + options.samples_path);
-            }
-            std::unordered_map<std::string, std::vector<std::string>> path_to_samples;
-            std::string line;
-            bool first = true;
-            std::size_t n_samples = 0;
-            while (std::getline(sin, line)) {
-                if (!line.empty() && line.back() == '\r') line.pop_back();
-                if (line.empty()) continue;
-                // split on tabs, then split each field on commas -> [sample, hap, hap, ...]
-                std::vector<std::string> fields;
-                std::size_t start = 0;
-                for (std::size_t p = 0; p <= line.size(); ++p) {
-                    if (p == line.size() || line[p] == '\t') {
-                        fields.push_back(line.substr(start, p - start));
-                        start = p + 1;
-                    }
-                }
-                if (fields.empty()) continue;
-                if (first) {
-                    first = false;
-                    std::string h = fields[0];
-                    for (char& c : h) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                    if (h == "sample" || h == "sample.id" || h == "sample_id" || h[0] == '#') {
-                        continue;  // header row
-                    }
-                }
-                const std::string& sample = fields[0];
-                if (sample.empty()) continue;
-                ++n_samples;
-                for (std::size_t fi = 1; fi < fields.size(); ++fi) {
-                    std::size_t s = 0;
-                    const std::string& cell = fields[fi];
-                    for (std::size_t p = 0; p <= cell.size(); ++p) {
-                        if (p == cell.size() || cell[p] == ',') {
-                            if (p > s) path_to_samples[cell.substr(s, p - s)].push_back(sample);
-                            s = p + 1;
-                        }
-                    }
+    // --samples (cosigt): aggregate any per-haplotype pool into per-SAMPLE dosage by summing over
+    // the sample's assigned haplotype paths (a haplotype listed twice -> doubled, i.e. a homozygous
+    // diploid genotype). Parsed once and reused for the k-mer and node/edge sample files.
+    if (!options.samples_path.empty()) {
+        std::ifstream sin(options.samples_path);
+        if (!sin) {
+            throw std::runtime_error("Failed to open --samples file: " + options.samples_path);
+        }
+        std::unordered_map<std::string, std::vector<std::string>> path_to_samples;
+        std::string line;
+        bool first = true;
+        std::size_t n_samples = 0;
+        while (std::getline(sin, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.empty()) continue;
+            // split on tabs, then split each field on commas -> [sample, hap, hap, ...]
+            std::vector<std::string> fields;
+            std::size_t start = 0;
+            for (std::size_t p = 0; p <= line.size(); ++p) {
+                if (p == line.size() || line[p] == '\t') {
+                    fields.push_back(line.substr(start, p - start));
+                    start = p + 1;
                 }
             }
+            if (fields.empty()) continue;
+            if (first) {
+                first = false;
+                std::string h = fields[0];
+                for (char& c : h) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (h == "sample" || h == "sample.id" || h == "sample_id" || h[0] == '#') {
+                    continue;  // header row
+                }
+            }
+            const std::string& sample = fields[0];
+            if (sample.empty()) continue;
+            ++n_samples;
+            for (std::size_t fi = 1; fi < fields.size(); ++fi) {
+                std::size_t s = 0;
+                const std::string& cell = fields[fi];
+                for (std::size_t p = 0; p <= cell.size(); ++p) {
+                    if (p == cell.size() || cell[p] == ',') {
+                        if (p > s) path_to_samples[cell.substr(s, p - s)].push_back(sample);
+                        s = p + 1;
+                    }
+                }
+            }
+        }
+
+        // K-mer substrate (the tested, primary GWAS layer): fsm_kmers.samples.txt.gz.
+        if (options.pyseer) {
             PyseerPool sample_pool;
             for (const auto& [code, carriers] : pyseer_pool) {
                 auto& out = sample_pool[code];
@@ -1624,8 +1684,26 @@ void describe_kmers_from_graph(
             write_pyseer_fsm(sfsm, sample_pool, options.kmer_size);
             summary.files_written += 1;
             if (!options.quiet) {
-                std::cerr << "[describe] sample-level fsm: " << n_samples << " samples -> " << sfsm << "\n";
+                std::cerr << "[describe] sample-level k-mer fsm: " << n_samples << " samples -> " << sfsm << "\n";
             }
+        }
+
+        // Node/edge substrate (complementary graph-local layer): fsm_graph.samples.txt.gz, same
+        // diploid summation, keyed by node id / edge so it joins to call's node_track.tsv.
+        GraphPool graph_sample_pool;
+        for (const auto& [feature, carriers] : graph_pool) {
+            auto& out = graph_sample_pool[feature];
+            for (const auto& [path, count] : carriers) {
+                const auto it = path_to_samples.find(path);
+                if (it == path_to_samples.end()) continue;
+                for (const std::string& s : it->second) out[s] += count;
+            }
+        }
+        const std::string gfsm = (out_dir / "fsm_graph.samples.txt.gz").string();
+        write_string_fsm(gfsm, graph_sample_pool);
+        summary.files_written += 1;
+        if (!options.quiet) {
+            std::cerr << "[describe] sample-level node/edge fsm: " << n_samples << " samples -> " << gfsm << "\n";
         }
     }
 

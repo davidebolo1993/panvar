@@ -685,7 +685,11 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                         copies.push_back({lo, hi, c.rev, c.identity});
                         prev_hi = hi;
                     }
-                    if (copies.size() >= options.min_copies) {
+                    // Record any path with >=1 detected copy. The bubble-level min_copies gate is
+                    // applied below: once an array is confirmed (some path reaches min_copies), even
+                    // single-copy haplotypes are folded through the REP node so their copy number is
+                    // 1 rather than 0 (they would otherwise bypass the REP node entirely).
+                    if (!copies.empty()) {
                         results[pi] = Res{true, left, std::move(copies)};
                     }
                     if (show_detail) {
@@ -708,9 +712,20 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                     std::cerr << '\n';
                 }
 
+                // Confirm this is a real tandem array before folding anything: at least one path
+                // must carry >= min_copies copies of the unit. (The unit was seeded from an exact
+                // adjacent tandem pair, so this is virtually always true, but it is the correct
+                // guard and keeps --min-copies meaningful as the array definition.) Once confirmed,
+                // every path with >=1 copy is folded below, including single-copy haplotypes.
+                std::size_t max_copies_path = 0;
+                for (const Res& r : results) {
+                    if (r.has) max_copies_path = std::max(max_copies_path, r.copies.size());
+                }
+                const bool array_confirmed = max_copies_path >= options.min_copies;
+
                 // Serial: one REP node per bubble; build PathArrays + copies.tsv rows.
                 std::string rep_id;
-                for (std::size_t pi = 0; pi < results.size(); ++pi) {
+                for (std::size_t pi = 0; array_confirmed && pi < results.size(); ++pi) {
                     if (!results[pi].has) continue;
                     const std::size_t left = results[pi].left;
                     const std::vector<Mapped>& copies = results[pi].copies;
@@ -945,13 +960,14 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
         model.edges = std::move(kept_edges);
     }
 
-    const std::string normalized_gfa = options.out_prefix + ".normalized.gfa";
-    write_gfa_model(normalized_gfa, model);
-
-    // Optionally make the output call-ready with no external tools: internally sort+flip
-    // along the reference (placing the appended REP nodes into reference order) and
-    // re-snarl with the cactus finder, writing the sorted GFA + a bubbles CSV.
-    if (!options.reference_path.empty()) {
+    // When a reference is given we make the output call-ready with no external tools: internally
+    // sort+flip along the reference (placing the appended REP nodes into reference order) and
+    // re-snarl with the cactus finder, writing only the sorted GFA + a bubbles CSV + Bandage colors.
+    // The unsorted normalized GFA is written only when no reference is supplied (nothing to sort by).
+    if (options.reference_path.empty()) {
+        const std::string normalized_gfa = options.out_prefix + ".normalized.gfa";
+        write_gfa_model(normalized_gfa, model);
+    } else {
         GraphSortOptions sort_opts;
         sort_opts.reference_path = options.reference_path;
         sort_opts.flip = !options.no_flip;
@@ -971,6 +987,8 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
         const Graph sorted_graph = parse_gfa(sorted_gfa, parse_options);
         const BubbleCallReport report = call_bubbles_report(sorted_graph, bopts);
         write_bubbles_csv(options.out_prefix + ".bubbles.csv", report.bubbles);
+        write_bandage_node_colors_csv(options.out_prefix + ".bandage_nodes.csv",
+                                      report.bubbles, report.non_snp_bubbles);
 
         summary.sorted = true;
         summary.resnarled_bubbles = report.bubbles.size();

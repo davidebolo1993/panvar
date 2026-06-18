@@ -8,7 +8,6 @@ namespace panvar {
 
 enum class DescribeFeatureMode {
     AllKmers,
-    Minimizer,
     Syncmer
 };
 
@@ -21,7 +20,6 @@ struct DescribeOptions {
     // Syncmer sampling is the default: a compact, evenly distributed,
     // substitution-robust marker set. Use AllKmers for the exhaustive set.
     DescribeFeatureMode feature_mode = DescribeFeatureMode::Syncmer;
-    std::size_t minimizer_window = 15;
     // 0 selects an automatic closed-syncmer s-mer size from k.
     std::size_t syncmer_s = 0;
     // Symmetric minor-presence (MAF-style) filter: drop a feature when
@@ -39,6 +37,10 @@ struct DescribeOptions {
     // <prefix>.variant_nodes.tsv. When set, only bubbles in the file are processed and only
     // their variant nodes contribute k-mers. Empty = whole-bubble behavior.
     std::string variant_nodes_path;
+    // Only meaningful with --variant-nodes. Also keep (do not mask) any node whose path-distance
+    // to the nearest variant node is <= variant_flank_bp on either side, so k-mers spanning the
+    // variant's flanking sequence (e.g. nearby SNPs) are retained. 0 = strict variant-node-only.
+    std::size_t variant_flank_bp = 0;
     // cosigt-style sample -> haplotype-path table. When set, describe additionally writes a
     // SAMPLE-level fsm file (<out_dir>/fsm_kmers.samples.txt.gz) whose per-sample value is the
     // summed dosage over that sample's assigned haplotype paths (diploid CN = CN_A + CN_B).

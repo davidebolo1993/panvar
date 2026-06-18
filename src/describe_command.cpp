@@ -16,21 +16,16 @@ DescribeFeatureMode parse_feature_mode_arg(const std::string& value) {
     if (value == "all" || value == "kmer" || value == "kmers") {
         return DescribeFeatureMode::AllKmers;
     }
-    if (value == "minimizer" || value == "minimizers") {
-        return DescribeFeatureMode::Minimizer;
-    }
     if (value == "syncmer" || value == "syncmers") {
         return DescribeFeatureMode::Syncmer;
     }
-    throw std::runtime_error("--feature-mode must be one of: all, minimizer, syncmer");
+    throw std::runtime_error("--feature-mode must be one of: all, syncmer");
 }
 
 std::string feature_mode_label(DescribeFeatureMode mode) {
     switch (mode) {
         case DescribeFeatureMode::AllKmers:
             return "all";
-        case DescribeFeatureMode::Minimizer:
-            return "minimizer";
         case DescribeFeatureMode::Syncmer:
             return "syncmer";
     }
@@ -42,15 +37,15 @@ void print_describe_help() {
         << "Usage:\n"
         << "  panvar describe -i <graph.gfa> (-b <prefix> | -c <bubbles.csv>) [-o <dir>] [options]\n\n"
         << "Options:\n"
-        << "  -i, --gfa <path>                 Input GFA file (required)\n"
-        << "  -b, --bubble-prefix-in <prefix>  Module-1 output prefix from 'panvar bubble'\n"
+        << "  -i, --gfa <path>                 panphorte-normalized/sorted GFA, i.e.\n"
+        << "                                   <panphorte_prefix>.normalized.sorted.gfa (required)\n"
+        << "  -b, --bubble-prefix-in <prefix>  panphorte output prefix\n"
         << "                                   (auto-uses <prefix>.bubbles.csv)\n"
-        << "  -c, --bubbles-csv <path>         Module-1 bubbles CSV (required if no prefix)\n"
+        << "  -c, --bubbles-csv <path>         panphorte bubbles CSV (required if no prefix)\n"
         << "  -o, --out-dir <dir>              Output directory (default: describe_out)\n"
         << "      --bubble-id <N>              Restrict to one bubble ID (repeatable)\n"
         << "  -k, --kmer-size <K>              K-mer size, 1..31 for 2-bit encoding (default: 31)\n"
-        << "      --feature-mode <mode>        all|minimizer|syncmer (default: syncmer)\n"
-        << "      --minimizer-window <W>       Window of k-mers for minimizer mode (default: 15)\n"
+        << "      --feature-mode <mode>        all|syncmer (default: syncmer)\n"
         << "      --syncmer-s <S>              Internal s-mer size for closed syncmer mode (default: auto)\n"
         << "      --min-paths <N>              Drop features with min(present,absent) paths <= N,\n"
         << "                                   keeping copy-number features (default: 1; 0 keeps all)\n"
@@ -59,6 +54,8 @@ void print_describe_help() {
         << "      --no-wide-matrix             Write only feature map + sparse JSONL counts\n"
         << "      --variant-nodes <tsv>        Restrict k-mers to call <prefix>.variant_nodes.tsv\n"
         << "                                   (only those bubbles' variant nodes contribute)\n"
+        << "      --variant-flank-bp <N>       With --variant-nodes, also keep nodes within N bp of a\n"
+        << "                                   variant node so flanking-SNP k-mers are retained (default: 0)\n"
         << "      --samples <tsv>              cosigt sample->haplotype-path table; also writes a\n"
         << "                                   sample-level fsm_kmers.samples.txt.gz (summed dosage)\n"
         << "      --no-pyseer                  Do not write the pooled fsm_kmers.txt.gz (pyseer --kmers)\n"
@@ -122,10 +119,6 @@ int run_describe_command(const std::vector<std::string>& args) {
             options.feature_mode = parse_feature_mode_arg(require_value(arg));
             continue;
         }
-        if (arg == "--minimizer-window") {
-            options.minimizer_window = cli::parse_size_arg(arg, require_value(arg));
-            continue;
-        }
         if (arg == "--syncmer-s") {
             options.syncmer_s = cli::parse_size_arg(arg, require_value(arg));
             continue;
@@ -148,6 +141,10 @@ int run_describe_command(const std::vector<std::string>& args) {
         }
         if (arg == "--variant-nodes") {
             options.variant_nodes_path = require_value(arg);
+            continue;
+        }
+        if (arg == "--variant-flank-bp") {
+            options.variant_flank_bp = cli::parse_size_arg(arg, require_value(arg));
             continue;
         }
         if (arg == "--samples") {
@@ -190,9 +187,6 @@ int run_describe_command(const std::vector<std::string>& args) {
     if (options.kmer_size == 0 || options.kmer_size > 31) {
         throw std::runtime_error("--kmer-size must be in [1,31]");
     }
-    if (options.feature_mode == DescribeFeatureMode::Minimizer && options.minimizer_window == 0) {
-        throw std::runtime_error("--minimizer-window must be > 0");
-    }
     if (options.feature_mode == DescribeFeatureMode::Syncmer) {
         const std::size_t syncmer_s =
             options.syncmer_s == 0 ? std::max<std::size_t>(1, std::min<std::size_t>(11, (options.kmer_size + 2) / 3))
@@ -214,12 +208,14 @@ int run_describe_command(const std::vector<std::string>& args) {
         << "Output dir: " << options.out_dir << "\n"
         << "K-mer size: " << options.kmer_size << "\n"
         << "Feature mode: " << feature_mode_label(options.feature_mode) << "\n"
-        << "Minimizer window: " << options.minimizer_window << "\n"
         << "Syncmer s: "
         << (options.syncmer_s == 0 ? std::string("auto") : std::to_string(options.syncmer_s)) << "\n"
         << "Wide matrix: " << (options.write_wide_matrix ? "on" : "off") << "\n"
         << "Max wide features: " << options.max_wide_features << " (0=no cap)\n"
         << "Min paths filter (N): " << options.min_feature_paths << " (0=keep all discriminative)\n"
+        << "Variant nodes: " << (options.variant_nodes_path.empty() ? std::string("(all bubble nodes)")
+                                                                     : options.variant_nodes_path) << "\n"
+        << "Variant flank (bp): " << options.variant_flank_bp << "\n"
         << "Bubbles processed: " << summary.bubbles_processed << "\n"
         << "Bubbles with paths: " << summary.bubbles_with_paths << "\n"
         << "Path rows written: " << summary.paths_written << "\n"

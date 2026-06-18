@@ -21,6 +21,7 @@
 #include <map>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -495,9 +496,13 @@ struct MergedRecord {
     Event seed;                                             // representative (largest member)
     std::vector<std::string> carriers;                      // haplotype path names with GT=1
     std::unordered_set<std::size_t> member_alleles;         // allele indices already merged in
+    std::set<std::string> member_nodes;                     // union of every merged member event's
+                                                            // nodes (describe handoff; ordered set)
     std::unordered_map<std::string, std::size_t> sample_cn; // DUP per-sample copy number
     std::size_t min_size_bp = 0;                            // smallest merged member size (SVLEN_RANGE)
     std::size_t max_size_bp = 0;                            // largest merged member size
+    double merge_max_jaccard = -1.0;                        // strongest node-set Jaccard that merged a member (-1 = none)
+    double merge_max_seqid = -1.0;                          // strongest sequence identity that merged a member (-1 = none)
 };
 
 std::string upper_base(char c) {
@@ -588,6 +593,9 @@ void call_variants(
         out << "##INFO=<ID=INS_SUBTYPE,Number=1,Type=String,Description=\"INS subtype: NOVEL or DUP (minimap2 refined)\">\n";
         out << "##INFO=<ID=REF_CN,Number=1,Type=Integer,Description=\"Reference copy number of the repeat unit (DUP)\">\n";
         out << "##INFO=<ID=NMERGED,Number=1,Type=Integer,Description=\"Haplotype carriers merged into this record\">\n";
+        out << "##INFO=<ID=MERGE_JACCARD,Number=1,Type=Float,Description=\"Strongest node-set Jaccard that merged a member into this record (cross-haplotype merge evidence)\">\n";
+        out << "##INFO=<ID=MERGE_SEQID,Number=1,Type=Float,Description=\"Strongest sequence identity that merged a member into this record, when the Jaccard gate did not decide it\">\n";
+        out << "##INFO=<ID=MERGE_SIZE_RATIO,Number=1,Type=Float,Description=\"Smallest/largest member size among merged members (min,max also in SVLEN_RANGE)\">\n";
         out << "##INFO=<ID=NS,Number=1,Type=Integer,Description=\"Haplotypes with data here (traverse the bubble)\">\n";
         out << "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele number = haplotypes traversing the bubble\">\n";
         out << "##INFO=<ID=AC,Number=1,Type=Integer,Description=\"Allele count = carrier haplotypes\">\n";
@@ -741,7 +749,13 @@ void call_variants(
         };
         // Two non-DUP events are the same site: same type, anchors within the window,
         // and either node sets overlap (Jaccard) OR sequences are similar.
-        auto events_match = [&](const Event& a, const Event& b) {
+        // Returns whether a and b are the same event. When out_jac/out_seq are given, they
+        // receive the node-set Jaccard and (only if the Jaccard gate did not already decide it)
+        // the sequence identity actually computed, so a merged record can report the evidence.
+        auto events_match = [&](const Event& a, const Event& b,
+                                double* out_jac = nullptr, double* out_seq = nullptr) {
+            if (out_jac) *out_jac = -1.0;
+            if (out_seq) *out_seq = -1.0;
             if (a.type != b.type) return false;
             if (a.ref_pos == 0 || b.ref_pos == 0) {
                 // fall back to node/seq only when no coordinate
@@ -755,10 +769,14 @@ void call_variants(
                 const long long d = static_cast<long long>(a.ref_pos) - static_cast<long long>(b.ref_pos);
                 if (d > window || d < -window) return false;
             }
-            if (weighted_jaccard(graph, a.nodes, b.nodes) >= options.merge_jaccard) return true;
+            const double jac = weighted_jaccard(graph, a.nodes, b.nodes);
+            if (out_jac) *out_jac = jac;
+            if (jac >= options.merge_jaccard) return true;
             const double len_ratio =
                 options.merge_size_ratio > 0.0 ? options.merge_size_ratio : options.merge_seq_identity;
-            return seq_identity(a.seq, b.seq, options.merge_seq_identity, len_ratio) >= options.merge_seq_identity;
+            const double sid = seq_identity(a.seq, b.seq, options.merge_seq_identity, len_ratio);
+            if (out_seq) *out_seq = sid;
+            return sid >= options.merge_seq_identity;
         };
 
         // ---- DUP/CN events: count self-loop traversals per allele vs reference. Merge
@@ -957,6 +975,9 @@ void call_variants(
             std::sort(ord.begin(), ord.end(), [&](std::size_t a, std::size_t b) {
                 return cands[a].e->ref_pos < cands[b].e->ref_pos;
             });
+            // Per-candidate strongest merge evidence (over the edges that joined it), carried
+            // into the record so it can report why members were merged.
+            std::vector<double> best_jac(cands.size(), -1.0), best_seq(cands.size(), -1.0);
             for (std::size_t a = 0; a < ord.size(); ++a) {
                 const std::size_t i = ord[a];
                 const Event& ei = *cands[i].e;
@@ -969,7 +990,12 @@ void call_variants(
                                 static_cast<long long>(ei.size_bp))
                         break;
                     if (dsu.find(i) == dsu.find(j)) continue;
-                    if (events_match(ei, ej)) dsu.unite(i, j);
+                    double jac = -1.0, sid = -1.0;
+                    if (events_match(ei, ej, &jac, &sid)) {
+                        dsu.unite(i, j);
+                        best_jac[i] = std::max(best_jac[i], jac); best_jac[j] = std::max(best_jac[j], jac);
+                        best_seq[i] = std::max(best_seq[i], sid); best_seq[j] = std::max(best_seq[j], sid);
+                    }
                 }
             }
 
@@ -995,7 +1021,10 @@ void call_variants(
                     const Event& e = *cands[k].e;
                     mr.min_size_bp = std::min(mr.min_size_bp, e.size_bp);
                     mr.max_size_bp = std::max(mr.max_size_bp, e.size_bp);
+                    mr.merge_max_jaccard = std::max(mr.merge_max_jaccard, best_jac[k]);
+                    mr.merge_max_seqid = std::max(mr.merge_max_seqid, best_seq[k]);
                     if (link.empty() && !e.link_id.empty()) link = e.link_id;
+                    mr.member_nodes.insert(e.nodes.begin(), e.nodes.end());
                     if (mr.member_alleles.insert(cands[k].ai).second)
                         for (const std::string& m : alleles[cands[k].ai].members)
                             mr.carriers.push_back(m);
@@ -1021,10 +1050,14 @@ void call_variants(
             for (std::size_t ai = 0; ai < alleles.size(); ++ai) {
                 if (mr.member_alleles.count(ai)) continue;
                 for (const Event& e : allele_events[ai]) {
-                    if (events_match(mr.seed, e)) {
+                    double jac = -1.0, sid = -1.0;
+                    if (events_match(mr.seed, e, &jac, &sid)) {
                         mr.member_alleles.insert(ai);
                         mr.min_size_bp = std::min(mr.min_size_bp, e.size_bp);
                         mr.max_size_bp = std::max(mr.max_size_bp, e.size_bp);
+                        mr.merge_max_jaccard = std::max(mr.merge_max_jaccard, jac);
+                        mr.merge_max_seqid = std::max(mr.merge_max_seqid, sid);
+                        mr.member_nodes.insert(e.nodes.begin(), e.nodes.end());
                         for (const std::string& m : alleles[ai].members) mr.carriers.push_back(m);
                         break;
                     }
@@ -1297,6 +1330,28 @@ void call_variants(
             const std::string start_node = ev_nodes.empty() ? e.start_node : ev_nodes.front();
             const std::string end_node = ev_nodes.empty() ? e.end_node : ev_nodes.back();
 
+            // The describe handoff (variant_nodes.tsv) needs every node any carrier traverses for
+            // this event, so each carrier's own allele sequence is sketched (not just the
+            // representative's). Use the union of all merged member events' nodes, ordered like
+            // ev_nodes; DUP records carry only the single REP node, so fall back to ev_nodes.
+            std::vector<std::string> var_nodes;
+            if (mr.member_nodes.empty()) {
+                var_nodes = ev_nodes;
+            } else {
+                std::vector<std::pair<long long, std::string>> keyed;
+                long long tail = 1LL << 60;
+                for (const std::string& nd : mr.member_nodes) {
+                    const auto it = ref_node_pos.find(nd);
+                    const long long key = it != ref_node_pos.end()
+                        ? static_cast<long long>(it->second)
+                        : tail++;
+                    keyed.emplace_back(key, nd);
+                }
+                std::stable_sort(keyed.begin(), keyed.end(),
+                                 [](const auto& a, const auto& b) { return a.first < b.first; });
+                for (auto& p : keyed) var_nodes.push_back(p.second);
+            }
+
             std::unordered_set<std::string> carrier_set(mr.carriers.begin(), mr.carriers.end());
 
             // Unique variant id.
@@ -1311,6 +1366,21 @@ void call_variants(
                 const long long a = sign * static_cast<long long>(mr.min_size_bp);
                 const long long b = sign * static_cast<long long>(mr.max_size_bp);
                 info << ";SVLEN_RANGE=" << std::min(a, b) << "," << std::max(a, b);
+                if (mr.max_size_bp > 0) {
+                    char buf[32];
+                    std::snprintf(buf, sizeof(buf), "%.4g",
+                                  static_cast<double>(mr.min_size_bp) / static_cast<double>(mr.max_size_bp));
+                    info << ";MERGE_SIZE_RATIO=" << buf;
+                }
+            }
+            // Cross-haplotype merge evidence (only set when ≥2 events were actually merged).
+            if (e.type != EvType::Dup && mr.merge_max_jaccard >= 0.0) {
+                char buf[32]; std::snprintf(buf, sizeof(buf), "%.4g", mr.merge_max_jaccard);
+                info << ";MERGE_JACCARD=" << buf;
+            }
+            if (e.type != EvType::Dup && mr.merge_max_seqid >= 0.0) {
+                char buf[32]; std::snprintf(buf, sizeof(buf), "%.4g", mr.merge_max_seqid);
+                info << ";MERGE_SEQID=" << buf;
             }
             const std::size_t an = traverses.size();
             const std::size_t ac = carrier_set.size();
@@ -1369,7 +1439,7 @@ void call_variants(
 
             if (options.write_variant_paths) {
                 std::string nodes;
-                for (std::size_t k = 0; k < ev_nodes.size(); ++k) { if (k) nodes += ','; nodes += ev_nodes[k]; }
+                for (std::size_t k = 0; k < var_nodes.size(); ++k) { if (k) nodes += ','; nodes += var_nodes[k]; }
                 variant_nodes_rows.push_back(
                     id + '\t' + std::to_string(bubble.id) + '\t' + svt + '\t' + nodes);
             }

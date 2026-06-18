@@ -1,6 +1,6 @@
 # Describe Module (Module 4)
 
-Date: 2026-06-07
+Date: 2026-06-18
 
 CLI entrypoint:
 
@@ -14,25 +14,24 @@ in two parallel layers that share the same graph coordinates:
 For each bubble, it:
 
 1. extracts the canonical source-to-sink walk (and its sequence) for every path crossing the bubble
-2. **node + edge dosage** (primary association substrate): counts how many times each path traverses
-   each node and each oriented step-to-step edge
-3. **k-mer features** (complementary): counts canonical k-mers in each path sequence, sampled with
-   closed syncmers by default (or all k-mers / minimizers on request)
+2. **k-mer features** (primary association substrate): counts canonical k-mers in each path sequence, sampled with closed syncmers by default (or all k-mers); read-queryable and the tested GWAS substrate
+3. **node + edge dosage** (complementary): counts how many times each path traverses each node and each oriented step-to-step edge; graph-local, mapping straight to a node/edge and the variant `call` makes there
 4. removes non-discriminative features from both layers
-5. writes, per bubble, a node/edge dosage feature map + matrix, and a k-mer feature map (with
-   graph-node provenance) + matrix + sparse JSONL
+5. writes, per bubble, a k-mer feature map (with graph-node provenance) + matrix + sparse JSONL, and a node/edge dosage feature map + matrix
 
-It is the **GWAS feature-extraction** step: besides the per-bubble tables it writes a single pooled,
-**pyseer-ready k-mer file** (`<out-dir>/fsm_kmers.txt.gz`). For a full, worked sample-level GWAS
-(LPA KIV-2 copy number → Lp(a), multiplicity vs presence/absence, Manhattan/QQ, traceback) see the
-**[GWAS example](../gwas_example.md)**.
+It is the **GWAS feature-extraction** step: besides the per-bubble tables it writes a single pooled
+k-mer file (`<out-dir>/fsm_kmers.txt.gz`, the `<feature> | strain:count` fsm-lite text format that
+count-based and presence/absence-based association tools read directly). For a full, worked sample-level
+GWAS (copy number → quantitative trait, multiplicity vs presence/absence, Manhattan/QQ, traceback) see
+the **[GWAS example](../gwas_example.md)**.
 
 **Sample-level output (`--samples <cosigt.tsv>`):** a GWAS tests **samples**, not haplotypes. Pass a
 cosigt-style table (one sample per line: `sample <tab> hap1 <tab> hap2 …`, haplotype names = graph path
-names) and `describe` additionally writes `<out-dir>/fsm_kmers.samples.txt.gz`, where each strain is a
-**sample** and the value is the **summed dosage over its assigned haplotypes** (diploid KIV-2 dosage =
-CN_A + CN_B; a haplotype listed twice counts twice = homozygous). The per-haplotype `fsm_kmers.txt.gz` is
-still written.
+names) and `describe` additionally writes a per-**sample** file for **each** substrate —
+`<out-dir>/fsm_kmers.samples.txt.gz` (k-mers) and `<out-dir>/fsm_graph.samples.txt.gz` (node/edge
+dosage) — where each strain is a **sample** and the value is the **summed dosage over its assigned
+haplotypes** (a haplotype listed twice counts twice = homozygous). The per-haplotype tables are still
+written.
 
 **Two scopes for the k-mer markers:**
 - **whole-graph (default)** — every called bubble is described; markers span all the variable sites.
@@ -40,21 +39,27 @@ still written.
   are processed, and within each, k-mer/syncmer generation is confined to the **called-variation nodes**
   (bases from other nodes are masked, so no k-mer spans a non-variant node). This is the
   genotyping/association scope: markers only where `call` found variation. `call` writes
-  `<prefix>.variant_nodes.tsv` (`variant_id, bubble_id, svtype, node_ids`) automatically.
-
-(K-mer specificity is within-bubble only — genome-wide uniqueness is a known gap to enforce when building
-sample-querying markers.)
+  `<prefix>.variant_nodes.tsv` (`variant_id, bubble_id, svtype, node_ids`) automatically — its node set
+  per variant is the **candidate pool**: every node any merged carrier's allele uses for that variant.
+  Masking is then applied **per path**: each haplotype is sketched on `(its own walk) ∩ (the pool)`, i.e.
+  **its own** variant nodes — the pool only supplies candidates, so a node a haplotype does not traverse
+  has no effect on it. (This is also what makes deletions testable: the deleted nodes sit in the pool, the
+  reference-like haplotypes keep them and the deletion carriers mask them, giving the contrast.)
+  - **`--variant-flank-bp <N>`** widens the unmasked window: a node is also kept when its path-distance
+    to the nearest variant node is `≤ N` bp on either side, so k-mers spanning the variant's **flanking
+    sequence** (e.g. nearby SNPs) survive the masking. `0` (default) is strict variant-node-only.
+    Running the association with `--variant-flank-bp 0` vs a positive value shows how much flanking
+    context adds.
 
 Both layers share the same two-part keep rule:
 
-1. **Copy-number features are always kept.** A feature whose count *varies across the paths that
-   carry it* (`min_nonzero_count != max_count`) is informative — it tracks copy number — and is
-   retained even when present in every path.
-2. **Otherwise a symmetric minor-presence (MAF-style) cut applies.** A feature is dropped when
-   `min(present_paths, absent_paths) <= N`, where `N = --min-paths` (default `1`). This removes
-   features with no contrast: those present in every path with one identical count, singletons
-   (one path), and near-ubiquitous ones (all-but-one path). `--min-paths 0` disables the cut and
-   keeps every discriminative feature (the previous behavior).
+1. **Copy-number features are always kept.** A feature whose count *varies across the paths that carry it*
+   is informative — it tracks copy number — and is retained even when present in every path.
+2. **Otherwise a symmetric minor-presence (MAF-style) cut applies.** A feature is dropped when the smaller
+   of {paths carrying it, paths lacking it} is `≤ --min-paths` (default `1`). This removes features with no
+   contrast: those present in every path with one identical count, singletons (one path), and
+   near-ubiquitous ones (all-but-one path). `--min-paths 0` disables the cut and keeps every discriminative
+   feature.
 
 Because both layers are keyed by node IDs, a significant k-mer maps to nodes via its provenance, and
 both map to the same graph location — and to the future graph-native variant call at that bubble.
@@ -62,35 +67,29 @@ both map to the same graph location — and to the future graph-native variant c
 The per-bubble `kept`/`candidates`/`discarded` counts in `describe.index.tsv` (and the run summary)
 show how much each bubble was reduced, so you can tune `--min-paths` with the effect visible.
 
-> **Scope of "discriminative".** Specificity here is evaluated *within a bubble*: a k-mer is
-> kept when it distinguishes the bubble's own paths. `describe` does **not** check whether a
-> k-mer is unique elsewhere in the genome. Enforcing genome-wide k-mer specificity — needed when
-> querying a sequencing sample and attributing a hit back to a node/variant — is a planned
-> follow-up tied to the variant-calling rework.
-
 ## Required inputs
 
-- `--gfa <graph.gfa>` / `-i <graph.gfa>`
+`describe` runs after `panphorte`, so its graph is the **panphorte-normalized/sorted GFA** and its
+bubbles come from the **panphorte** prefix:
+
+- `--gfa <panphorte_prefix.normalized.sorted.gfa>` / `-i`
 - one of:
-  - `--bubble-prefix-in <module1-prefix>` (auto uses `<module1-prefix>.bubbles.csv`)
-  - `--bubbles-csv <module1.bubbles.csv>`
+  - `--bubble-prefix-in <panphorte_prefix>` (auto uses `<panphorte_prefix>.bubbles.csv`)
+  - `--bubbles-csv <panphorte_prefix.bubbles.csv>`
 
 ## Key options
 
-Synopsis (required bare, optional in `[ ]`; common flags have a short form):
-
 ```text
-panvar describe -i <graph.gfa> (-b <prefix> | -c <bubbles.csv>) [-o <dir>] [options]
+panvar describe -i <panphorte.normalized.sorted.gfa> (-b <panphorte_prefix> | -c <bubbles.csv>) [-o <dir>] [options]
 ```
 
-Running `panvar describe` with no arguments prints this help. Short forms: `-i`/`--gfa`,
-`-b`/`--bubble-prefix-in`, `-c`/`--bubbles-csv`, `-o`/`--out-dir`, `-k`/`--kmer-size`, `-q`/`--quiet`.
-
+- `-i, --gfa <path>`: panphorte-normalized/sorted GFA (required)
+- `-b, --bubble-prefix-in <prefix>`: panphorte output prefix (auto-uses `<prefix>.bubbles.csv`)
+- `-c, --bubbles-csv <path>`: panphorte bubbles CSV (required if no prefix)
 - `-o, --out-dir <dir>`: output directory (default `describe_out`)
 - `--bubble-id <N>`: restrict to a bubble ID; repeatable
-- `--kmer-size <K>`: k-mer size, `1..31` (default `31`)
-- `--feature-mode <all|minimizer|syncmer>`: feature sampling mode (default `syncmer`)
-- `--minimizer-window <W>`: window of consecutive k-mers for minimizer mode (default `15`)
+- `-k, --kmer-size <K>`: k-mer size, `1..31` (default `31`)
+- `--feature-mode <all|syncmer>`: feature sampling mode (default `syncmer`)
 - `--syncmer-s <S>`: internal s-mer size for closed syncmer mode (default auto)
 - `--min-paths <N>`: drop features with `min(present, absent)` paths `<= N`, keeping copy-number features (default `1`; `0` keeps all discriminative features)
 - `--max-wide-features <N>`: skip wide matrix above this number of features (default `250000`; `0` disables cap)
@@ -98,6 +97,9 @@ Running `panvar describe` with no arguments prints this help. Short forms: `-i`/
 - `--no-wide-matrix`: write only feature map and sparse JSONL counts
 - `--variant-nodes <tsv>`: restrict k-mer generation to `call`'s `<prefix>.variant_nodes.tsv` (only those
   bubbles' variant nodes contribute k-mers; see "Two scopes" above)
+- `--variant-flank-bp <N>`: with `--variant-nodes`, also keep nodes within `N` bp of a variant node so
+  flanking-SNP k-mers are retained (default `0` = strict variant-node-only)
+- `--samples <cosigt.tsv>`: write per-sample dosage files for both substrates (see "Sample-level output")
 - `--no-pyseer`: do not write the pooled `fsm_kmers.txt.gz`
 - `--quiet`: disable the progress bar
 
@@ -111,29 +113,24 @@ The matrix uses compact feature names (`K1`, `K2`, ...). The feature map resolve
 
 Because of canonicalization, `describe` does not keep separate forward and reverse-complement features. If a forward k-mer is discriminative, its reverse-complement representation maps to the same feature ID. This avoids duplicating equivalent markers.
 
-## Feature Sampling Modes
+## Feature mode and k
 
-`--feature-mode syncmer` is the default and keeps closed syncmers: a k-mer is retained when the smallest internal s-mer is located at either end of the canonical k-mer. This gives an even sequence-space sampling, avoids the window-boundary dependence of minimizers, and degrades gracefully under substitutions (a single base change disturbs only the syncmers overlapping it). Use `--syncmer-s` to tune density; smaller `s` generally keeps more k-mers. When `--syncmer-s` is unset, `s` is chosen automatically from `k` as `max(1, min(11, (k+2)/3))`.
+Two sampling modes, set with `--feature-mode`:
 
-`--feature-mode all` counts every canonical k-mer. It is the most complete representation, but large bubbles can produce many features; use it when you want the exhaustive marker set rather than a sampled one.
+- **`syncmer` (default)** keeps closed syncmers: a k-mer is retained when its smallest internal s-mer
+  sits at either end of the canonical k-mer. This samples sequence space evenly and degrades gracefully
+  under substitutions (a single base change disturbs only the syncmers overlapping it). `--syncmer-s`
+  tunes density (smaller `s` keeps more k-mers); unset, `s` is chosen from `k` as `max(1, min(11, (k+2)/3))`.
+- **`all`** counts every canonical k-mer — the exhaustive marker set. Use it for fine-mapping a small
+  bubble; large bubbles can produce many features and a wide matrix.
 
-`--feature-mode minimizer` keeps only minimizer k-mers: for each window of `--minimizer-window` consecutive k-mers, the smallest canonical encoded k-mer is selected. The same selected k-mer position is counted once even if overlapping windows choose it repeatedly. This can reduce the feature space roughly by the window size while preserving local anchors.
+The default **`k=31`** is a good fit here: the called bubbles are well over 31 bp, so every variable site
+yields k-mers, and the graph paths are assembled haplotypes (low sequencing error), so there is no
+error-tolerance reason to shorten `k`. Each marker is tested locally at its own bubble, so genome-wide
+k-mer uniqueness is not a concern. Lower `k` only for bubbles shorter than 31 bp, or when you
+intentionally want markers shared across more paths.
 
-## Choosing k and feature mode
-
-- **k-mer size.** The default `k=31` is deliberate: 31 bp is long enough to be (near) unique
-  genome-wide, which matters downstream when a sequencing sample is queried for these markers and
-  each hit must be attributable to this locus rather than a paralog elsewhere. The graph paths
-  `describe` reads are assembled haplotypes (no sequencing error), so there is no error-tolerance
-  reason to shorten `k` for the description itself. Lower `k` only when a bubble is shorter than
-  31 bp or when you intentionally want markers shared across more paths.
-- **Feature mode.** `syncmer` (default) is the right balance for a compact, robust marker set.
-  Switch to `all` when you need every distinguishing k-mer (e.g. exhaustive fine-mapping within a
-  small bubble) and accept a wider matrix. `minimizer` is offered for compatibility but is
-  generally dominated by `syncmer` for this use case.
-
-
-## Node and edge dosage (primary association substrate)
+## Node and edge dosage (complementary association substrate)
 
 For each bubble, `describe` emits a node/edge dosage table built from the same canonical walks used
 for the k-mer features:
@@ -151,16 +148,12 @@ for the k-mer features:
   distinct edge features (the inversion signal lives here, not in the node columns).
 
 The same discriminative filter applies: constant features (e.g. the bubble's source/sink nodes, which
-every path crosses exactly once) are dropped. These tables are the **primary substrate for
-phenotype association** — a node or edge maps directly to a graph location and, downstream, to a
-graph-native variant call at that bubble. The k-mer tables are the complementary sequence-level
-layer (read-queryable, with node provenance). Node dosages match `inspect`'s `node_counts.tsv`
-totals for the same path and node, by construction.
-
-> **Copy number is deferred to variant calling, not decided here.** Real CN/duplication needs tandem
-> detection — finding *adjacent* repeated blocks above a minimum motif and region size, and reporting
-> the run length rather than a raw count. That judgement belongs to the (planned) graph-native calling
-> step. These dosage tables only describe traversals; the edge layer is where adjacency is visible.
+every path crosses exactly once) are dropped. These tables are a **complementary substrate for phenotype
+association** — a node or edge maps directly to a graph location and, downstream, to the variant `call`
+makes at that bubble — alongside the k-mer tables (the primary, read-queryable layer with node provenance).
+With `--samples` they are aggregated to per-sample dosage exactly like the k-mers
+(`fsm_graph.samples.txt.gz`), so the same association tests run on either substrate. Node dosages match
+`inspect`'s `node_counts.tsv` totals for the same path and node, by construction.
 
 ## Outputs
 
@@ -173,20 +166,26 @@ Inside `--out-dir`:
 - `bubble_<id>/kmer_features.tsv.gz`
 - `bubble_<id>/kmer_matrix.tsv.gz` when enabled and below cap
 - `bubble_<id>/kmer_counts.jsonl.gz`
-- `fsm_kmers.txt.gz` — pooled pyseer k-mer file (unless `--no-pyseer`); see below
+- `fsm_kmers.txt.gz` — pooled per-haplotype k-mer file (unless `--no-pyseer`); see below
+- with `--samples`: `fsm_kmers.samples.txt.gz` (per-sample k-mer dosage) and
+  `fsm_graph.samples.txt.gz` (per-sample node/edge dosage) — same fsm-lite layout, keyed by sample
 
-### `fsm_kmers.txt.gz` (pyseer `--kmers`)
+### `fsm_kmers.txt.gz`
 
-The discriminative k-mers from every processed bubble, pooled into one **fsm-lite-format** file that
-pyseer's `--kmers` consumes directly. One line per k-mer:
+The discriminative k-mers from every processed bubble, pooled into one **fsm-lite-format** file — the
+`<feature> | strain:count` text format count-based and presence/absence-based association tools consume
+directly. One line per k-mer:
 
 ```text
 <kmer_sequence> | <path>:<count> <path>:<count> ...
 ```
 
 - The **strain** id is the **path name** (one haplotype = one strain); map your phenotypes to these names.
-- The value is the **true per-strain count** (multiplicity), so copy-number expansions stay faithful;
-  pyseer treats any count `> 0` as present.
+  The `--samples` files use the same layout but the strain id is a **sample** and the count is its
+  diploid dosage (node/edge features in `fsm_graph.samples.txt.gz` use the node id, or `from±>to±` for
+  an edge, as the line label).
+- The value is the **true per-strain count** (multiplicity), so copy-number expansions stay faithful: a
+  count-based tool reads the dosage, a presence/absence tool binarizes any count `> 0` to "present".
 - Only **carriers** (count `> 0`) are listed; a path missing from a line — including one that does not
   traverse that bubble at all — is implicit **absence (0)**. (fsm-lite has no missing-data state, so
   "reference allele" and "locus absent" are both encoded as 0.)
@@ -194,9 +193,8 @@ pyseer's `--kmers` consumes directly. One line per k-mer:
   `min(present,absent) > --min-paths`), pooled — not the raw exhaustive k-mer set. The same canonical
   k-mer seen in two bubbles has its counts summed.
 
-```bash
-pyseer --phenotypes traits.tsv --kmers describe_out/fsm_kmers.txt.gz --uncompressed ... > assoc.tsv
-```
+See the [Association](#association) section for how this is tested, and
+[gwas_example.md](../gwas_example.md) for a worked run.
 
 ### `describe.index.tsv`
 
@@ -271,73 +269,53 @@ Values are k-mer counts. They can be used as binary markers (`count > 0`) or dos
 Sparse representation, one JSON object per path. The `kmers` array stores compact `[feature_id, count]` tuples:
 
 ```json
-{"bubble_id":1,"sample":"HG00096","haplotype":"1","path_name":"HG00096#1#...","path_length_bp":7941,"kmers":[[1,7],[2,2]]}
+{"bubble_id":1,"sample":"sampleA","haplotype":"1","path_name":"sampleA#1#...","path_length_bp":7941,"kmers":[[1,7],[2,2]]}
 ```
 
 Use `bubble_<id>/kmer_features.tsv.gz` to map feature IDs back to sequences and to recover the bubble-local node union for each feature. Keeping node provenance in the feature map rather than every JSONL tuple keeps the sparse JSONL much smaller.
 
 This JSONL is the sparse representation: absent/zero-count k-mers are omitted from each path row. The wide matrix is still emitted by default because many GWAS and association tools expect dense sample-by-feature tables.
 
-## Association Interpretation
+## Association
 
-A k-mer-based association treats each retained k-mer as a marker.
+**The unit is a sample.** A GWAS tests genotyped **samples**, not panel haplotypes. In `panvar`'s model a
+sample's genotype is the **two haplotypes COSIGT assigns it**, and a marker's value for that sample is the
+**sum over those two haplotypes** (a feature on both scores twice = homozygous). For k-mers, `describe
+--samples <cosigt.tsv>` produces exactly this per-sample file (`fsm_kmers.samples.txt.gz`) directly.
 
-- A significant binary association means presence/absence of that sequence word tracks the phenotype.
-- A significant count association means copy number or repeated occurrence of that sequence word tracks the phenotype.
-- The signal may tag an allele, insertion, deletion boundary, duplicated unit, gene-copy state, or another sequence context correlated with the causal change.
+**Primary substrate — k-mers (tested).** The pooled k-mer file is the substrate we test: sequence
+markers, read-queryable, with node provenance. A marker can be read two ways — **presence/absence**
+(binarize count `> 0`) or **count/multiplicity** (the value is local copy number). The distinction is
+decisive at a **copy-number locus**: the repeat-unit k-mer is present in *every* sample, so presence/absence
+has no contrast and misses it, while the **count** test recovers it — the whole point of carrying true
+counts. `scripts/gwas_demo.py` reads the fsm file + a phenotype and runs **both** tests (linear regression
+for a quantitative trait; Fisher exact / Mann–Whitney U for a binary one; Benjamini-Hochberg `q` +
+Bonferroni), as a stand-in for a count-based or presence/absence-based association method. On a
+literature-plausible copy-number phenotype the count test concentrates on the copy-number bubble while
+presence/absence finds nothing there — worked run, Manhattan/QQ and traceback in
+[gwas_example.md](../gwas_example.md). The same fsm-lite file also feeds external association tools;
+`panvar` does not run the association itself.
 
-The k-mer itself is not automatically the causal variant; it is a sequence marker that should be interpreted together with the bubble, allele clusters, dotplots, and gene annotations.
+**Complementary substrate — node/edge dosage.** `graph_matrix.tsv.gz` (`N*`/`E*` columns) is a per-**panel
+haplotype** dosage table that maps directly to a node/edge and the variant `call` makes there (edges carry
+the adjacency/tandem signal, nodes carry presence/abundance). With `--samples` it is aggregated to the same
+COSIGT per-sample dosage as the k-mers (`fsm_graph.samples.txt.gz`), so `scripts/gwas_demo.py
+--substrate graph` runs the identical presence/absence-vs-count tests on it. At a copy-number locus the
+count test localizes the signal to the repeat node and its self-loop edge.
 
-## Using the node/edge matrix for association
-
-`graph_matrix.tsv.gz` is a **graph-path × feature** dosage table (one row per panel haplotype that
-crosses the bubble; columns `N1..`/`E1..`). To associate features with a phenotype across a cohort of
-**genotyped samples**, you go from panel haplotypes to samples and then test each feature:
-
-1. **Project to per-sample dosage.** For each genotyped sample, COSIGT assigns two panel haplotypes
-   (e.g. `sampleX → {HG…#1, HG…#2}`). The sample's dosage for a feature is the **sum of the two
-   assigned haplotypes' rows** for that column (so a feature on both haplotypes scores 2). This gives
-   a sample × feature matrix. *(This projection step is not built into panvar yet — it is the next
-   round-2 task, pending the COSIGT genotype-table format. For now the matrix is per-panel-haplotype.)*
-2. **Join the phenotype** (sample → trait) and **test each feature** against it: logistic regression
-   for a binary trait, linear for a quantitative one, with covariates as needed; correct for multiple
-   testing across features.
-3. **Map hits back:** a significant `N*`/`E*` column → its node/edge in `graph_features.tsv.gz` → a
-   graph location in the bubble → (round 2) the variant called there. Edge hits are the adjacency-aware
-   ones (tandem/junction structure); node hits are presence/abundance.
-
-Illustrative per-feature test in Python (after the projection of step 1 has produced
-`sample_x_feature` and a `phenotype` series):
-
-```python
-import pandas as pd, statsmodels.api as sm
-
-# X: samples (rows) x features (N*/E* columns) of dosages; y: binary phenotype per sample
-X = sample_x_feature            # from step 1 (sum of the 2 COSIGT haplotype rows per sample)
-y = phenotype.loc[X.index]
-
-results = []
-for feat in X.columns:
-    Xf = sm.add_constant(X[[feat]])
-    fit = sm.Logit(y, Xf).fit(disp=0)        # or sm.OLS for a quantitative trait
-    results.append((feat, fit.params[feat], fit.pvalues[feat]))
-
-assoc = pd.DataFrame(results, columns=["feature", "beta", "pval"]).sort_values("pval")
-# then map assoc.feature -> graph_features.tsv.gz (label = node id or from±>to±)
-```
-
-For large cohorts, write the sample × feature matrix in PLINK/BGEN-style dosage format and run a
-proper mixed-model tool (GEMMA, regenie, PLINK) instead of per-feature loops — `describe` deliberately
-emits tables for these external tools rather than computing association itself.
+**Interpretation.** A significant marker is not automatically the causal variant — it is a sequence/graph
+marker. Map a hit back through `kmer_features.tsv.gz` / `graph_features.tsv.gz` to its nodes, the bubble,
+and the variant called there, and read it together with the allele clusters (`inspect`) and annotations.
 
 ## Algorithm overview
 
-For each bubble:
+The encoding, syncmer sampling, and discriminative filter are traced on a tiny worked dataset
+in [algorithm_example.md](../algorithm_example.md). For each bubble:
 
 1. Find each path's best source/sink interval crossing the bubble.
 2. Canonicalize sink-to-source intervals into source-to-sink orientation.
 3. Spell the path sequence from graph node sequences.
-4. Count canonical 2-bit k-mers per path, applying minimizer/syncmer sampling if requested.
+4. Count canonical 2-bit k-mers per path, applying syncmer sampling unless `--feature-mode all`.
 5. Accumulate per-k-mer counts across paths.
 6. Drop k-mers whose count is identical in every path.
 7. Re-scan retained k-mers, collect bubble-local node provenance for the feature map, and write sparse JSONL counts.
@@ -346,38 +324,39 @@ For each bubble:
 
 The implementation streams per bubble: one discovery pass finds retained features, the sparse JSONL pass records only retained k-mer counts while collecting node provenance for the feature map, and the optional wide-matrix pass is written only when requested and below the feature cap. This avoids storing the full path-by-kmer matrix in memory.
 
-## Example (C4)
+## Example
 
 ```bash
+# whole graph, default closed-syncmer markers (k = 31), on the panphorte-normalized graph
 ./build/panvar describe \
-  -i tests/real_data/c4.gfa \
-  --bubble-prefix-in tests/results/c4/bubble \
-  --bubble-id 1 \
-  --out-dir tests/results/c4/describe \
+  -i tests/results/lpa/panphorte/panphorte.normalized.sorted.gfa \
+  --bubble-prefix-in tests/results/lpa/panphorte/panphorte \
+  --out-dir tests/results/lpa/describe \
   --kmer-size 31
 ```
 
-For a smaller quick check:
+Restrict markers to `call`'s variant nodes (genotyping/association scope), keeping 50 bp of flanking
+context, and aggregate to per-sample dosage for both substrates:
 
 ```bash
 ./build/panvar describe \
-  -i tests/real_data/c4.gfa \
-  --bubble-prefix-in tests/results/c4/bubble \
-  --bubble-id 1 \
-  --out-dir /tmp/panvar_describe_c4_b1 \
-  --kmer-size 21 \
-  --max-wide-features 0
+  -i tests/results/lpa/panphorte/panphorte.normalized.sorted.gfa \
+  --bubble-prefix-in tests/results/lpa/panphorte/panphorte \
+  --variant-nodes tests/results/lpa/call/call.variant_nodes.tsv \
+  --variant-flank-bp 50 \
+  --samples tests/results/lpa/gwas/samples.tsv \
+  --out-dir tests/results/lpa/describe
 ```
 
-For a reduced feature set on large bubbles:
+Exhaustive markers for fine-mapping one bubble:
 
 ```bash
 ./build/panvar describe \
-  -i tests/real_data/c4.gfa \
-  --bubble-prefix-in tests/results/c4/bubble \
-  --bubble-id 1 \
-  --out-dir /tmp/panvar_describe_c4_b1_syncmer \
-  --kmer-size 31 \
-  --feature-mode syncmer \
-  --syncmer-s 11
+  -i tests/results/lpa/panphorte/panphorte.normalized.sorted.gfa \
+  --bubble-prefix-in tests/results/lpa/panphorte/panphorte \
+  --bubble-id 7 \
+  --out-dir tests/results/lpa/describe \
+  --feature-mode all \
+  --kmer-size 21 \
+  --max-wide-features 0
 ```

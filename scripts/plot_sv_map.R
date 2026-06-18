@@ -11,7 +11,7 @@
 #   white  = haplotype does not traverse the node (count 0, no event)
 #   grey   = traverses the node, reference-like (no event here)
 #   DEL red / INS-NOVEL green / INS-DUP purple / INV orange
-#   DUP blue (shaded by per-sample CN) / multiallelic teal (shaded by allele index)
+#   DUP blue (shaded by per-node multiplicity = local copy count) / multiallelic teal (allele index)
 #
 # Inputs (one bubble):
 #   --node-counts <path>  inspect <prefix>.bubble_<N>.node_counts.tsv   (required; substrate + order)
@@ -20,7 +20,8 @@
 #   --bubble-id <N>       keep only VCF records with INFO BUBBLE_ID=N (match the node_counts file)
 #   --node-lengths <path> inspect <...>.node_lengths.tsv: scale column widths by node bp
 #   --length-transform    raw | sqrt | log1p column-width scaling (default sqrt)
-#   --clusters <path>     inspect <...>.clusters.tsv: order + annotate rows by walk cluster
+#   --clusters <path>     inspect <...>.clusters.tsv: keep only cluster representative rows
+#   --cluster-by <path>   inspect <...>.clusters.tsv: keep all rows but group/order by cluster
 #   --reference-path <s>  pin this haplotype (substring match) as the top row
 #   --max-nodes <N>       keep at most N node columns (by total coverage)
 #   --max-paths <N>       keep at most N haplotype rows (by total coverage)
@@ -29,17 +30,37 @@
 args <- commandArgs(trailingOnly = TRUE)
 usage <- function(status = 0) {
   cat(paste(c(
+    "plot_sv_map.R - node-level structural-variant map (odgi-viz style).",
+    "  rows = haplotypes, columns = a bubble's internal nodes in reference-sorted order;",
+    "  each cell is colored by the called event the haplotype carries on that node, so the",
+    "  figure lines up 1:1 with the inspect node/edge-coverage heatmaps of the same bubble.",
+    "",
     "Usage:",
-    "  plot_sv_map.R --node-counts <bubble_N.node_counts.tsv> --vcf <call.vcf> --out <prefix>",
-    "                [--bubble-id N] [--node-lengths nl.tsv] [--length-transform sqrt]",
-    "                [--clusters clusters.tsv] [--reference-path NAME] [--max-nodes N]",
-    "                [--max-paths N] [--width in] [--height in]"), collapse = "\n"), "\n")
+    "  Rscript plot_sv_map.R --node-counts <bubble_N.node_counts.tsv> --vcf <call.vcf> --out <prefix> [options]",
+    "",
+    "Required:",
+    "  --node-counts <path>     inspect <prefix>.bubble_<N>.node_counts.tsv (substrate + node order)",
+    "  --vcf <path>             panvar call VCF (events, carriers, GT:CN)",
+    "  --out <prefix>           output prefix; writes <prefix>.png and <prefix>.pdf",
+    "",
+    "Optional:",
+    "  --bubble-id <N>          keep only VCF records with INFO BUBBLE_ID=N (else inferred from filename)",
+    "  --node-lengths <path>    inspect <...>.node_lengths.tsv: scale column widths by node bp",
+    "  --length-transform <t>   raw | sqrt | log1p column-width scaling (default sqrt)",
+    "  --clusters <path>        inspect <...>.clusters.tsv: keep only the cluster representative rows",
+    "  --cluster-by <path>      inspect <...>.clusters.tsv: keep all rows but group/order them by",
+    "                           cluster (representative first), with a separator between clusters",
+    "  --reference-path <s>     pin this haplotype (substring match) as the top row",
+    "  --max-nodes <N>          keep at most N node columns (by total coverage)",
+    "  --max-paths <N>          keep at most N haplotype rows (by total coverage)",
+    "  --width / --height <in>  figure size in inches (default auto)",
+    "  -h, --help               show this help"), collapse = "\n"), "\n")
   quit(status = status)
 }
 if (length(args) == 0 || any(args %in% c("-h", "--help"))) usage(0)
 opts <- list(node_counts = NULL, vcf = NULL, out = NULL, bubble_id = NULL,
              node_lengths = NULL, length_transform = "sqrt", clusters = NULL,
-             reference_path = NULL, max_nodes = 0, max_paths = 0,
+             cluster_by = NULL, reference_path = NULL, max_nodes = 0, max_paths = 0,
              width = NA_real_, height = NA_real_)
 i <- 1
 while (i <= length(args)) {
@@ -51,6 +72,7 @@ while (i <= length(args)) {
   else if (a == "--node-lengths") { opts$node_lengths <- val(); i <- i + 2 }
   else if (a == "--length-transform") { opts$length_transform <- val(); i <- i + 2 }
   else if (a == "--clusters") { opts$clusters <- val(); i <- i + 2 }
+  else if (a == "--cluster-by") { opts$cluster_by <- val(); i <- i + 2 }
   else if (a == "--reference-path") { opts$reference_path <- val(); i <- i + 2 }
   else if (a == "--max-nodes") { opts$max_nodes <- as.integer(val()); i <- i + 2 }
   else if (a == "--max-paths") { opts$max_paths <- as.integer(val()); i <- i + 2 }
@@ -120,22 +142,33 @@ if (opts$max_paths > 0 && nrow(mat) > opts$max_paths) {
   keepr <- sort(order(rowSums(mat), decreasing = TRUE)[seq_len(opts$max_paths)])
   mat <- mat[keepr, , drop = FALSE]
 }
+# --clusters: keep only cluster representative rows (like the coverage heatmaps)
+if (!is.null(opts$clusters)) {
+  ct0 <- read_tsv(opts$clusters)
+  if (!"representative_path" %in% names(ct0)) stop("--clusters table needs a representative_path column")
+  reps <- unique(as.character(ct0$representative_path))
+  keep_rep <- rownames(mat) %in% reps
+  if (!any(keep_rep)) stop("no path rows match the cluster representatives")
+  mat <- mat[keep_rep, , drop = FALSE]
+}
 nodes <- colnames(mat)
 paths <- rownames(mat)
 node_idx <- setNames(seq_along(nodes), nodes)
 
 # ---- category + value per cell: start from coverage (none/ref), overlay events on carriers ----
-# A DUP is encoded with a single representative node (the peak / module source), so painting
-# only EVENT_NODES would render it as one invisible column. Instead a DUP carrier's WHOLE
-# traversed module is shaded by per-node multiplicity (the local copy count from the coverage
-# substrate) -- the "CN palette over the coverage nodes". DEL/INS/INV/MULTI keep their specific
-# EVENT_NODES and are painted AFTER, on top of the DUP background.
+# A DUP is encoded with a single representative node, so painting only EVENT_NODES would render
+# it as one invisible column. Instead a DUP carrier's traversed nodes are shaded by per-node
+# traversal multiplicity (the LOCAL copy count). On a panphorte-normalized graph the repeat-unit
+# (REP) node's multiplicity equals the carrier's called CN, so the copy number reads as a strong
+# band exactly at that node while single-traversal nodes stay light -- keeping the signal
+# localized instead of washing a flat CN across the whole row. DEL/INS/INV/MULTI keep their
+# specific EVENT_NODES and are painted AFTER, on top of the DUP background.
 cat_mat <- ifelse(mat > 0, "ref", "none")            # paths x nodes
-val_mat <- matrix(NA_real_, nrow(mat), ncol(mat), dimnames = dimnames(mat))  # multiplicity / allele index
+val_mat <- matrix(NA_real_, nrow(mat), ncol(mat), dimnames = dimnames(mat))  # per-node multiplicity / allele index
 dup_max <- 1; multi_max <- 1
 carriers_of <- function(r) intersect(names(r$gt)[!is.na(r$gt) & r$gt != "." & r$gt != "0" & r$gt != "0/0"], paths)
 
-# pass 1: DUP background (all traversed module nodes, shade = per-node multiplicity).
+# pass 1: DUP background -- a carrier's traversed nodes shaded by per-node traversal multiplicity.
 # Guard: only a DUP whose representative node belongs to this bubble paints here.
 for (r in V) {
   if (r$svt != "DUP") next
@@ -165,25 +198,37 @@ for (r in V) {
   }
 }
 
-# ---- row ordering: reference pinned top, then clusters, then name ----
-clust <- setNames(rep(NA_integer_, length(paths)), paths)
-if (!is.null(opts$clusters)) {
-  ct <- read_tsv(opts$clusters)
-  if ("members" %in% names(ct) && "cluster_id" %in% names(ct)) {
-    for (k in seq_len(nrow(ct))) {
-      mem <- strsplit(as.character(ct$members[k]), ";")[[1]]
-      clust[intersect(paths, mem)] <- as.integer(ct$cluster_id[k])
-    }
+# ---- row ordering: optional cluster grouping (--cluster-by), then reference pinned on top ----
+# Mirrors the inspect coverage heatmaps: --cluster-by groups cluster-mates adjacently
+# (representative first), with a thin separator line between clusters and NO color sidebar.
+cid_of <- setNames(rep(NA_integer_, length(paths)), paths)
+cluster_boundaries <- integer(0)
+if (!is.null(opts$cluster_by)) {
+  ct <- read_tsv(opts$cluster_by)
+  if (!all(c("cluster_id", "members") %in% names(ct))) stop("--cluster-by table needs cluster_id + members columns")
+  has_rep <- "representative_path" %in% names(ct)
+  isrep_of <- setNames(rep(FALSE, length(paths)), paths)
+  for (k in seq_len(nrow(ct))) {
+    mem <- strsplit(as.character(ct$members[k]), ";", fixed = TRUE)[[1]]; mem <- mem[nzchar(mem)]
+    cid_of[intersect(paths, mem)] <- as.integer(ct$cluster_id[k])
+    if (has_rep) isrep_of[intersect(paths, as.character(ct$representative_path[k]))] <- TRUE
   }
+  cid_sort <- ifelse(is.na(cid_of[paths]), .Machine$integer.max, cid_of[paths])
+  paths <- paths[order(cid_sort, !isrep_of[paths], paths)]
+} else {
+  paths <- paths[order(paths)]
 }
 ref_row <- NA_character_
 if (!is.null(opts$reference_path)) {
   hit <- paths[grepl(opts$reference_path, paths, ignore.case = TRUE, fixed = FALSE)]
   if (length(hit) >= 1) ref_row <- hit[1]
 }
-ord <- order(ifelse(is.na(clust), .Machine$integer.max, clust), paths)
-paths <- paths[ord]
 if (!is.na(ref_row)) paths <- c(ref_row, setdiff(paths, ref_row))
+# separator rows where the cluster id changes, computed on the FINAL order (--cluster-by only)
+if (!is.null(opts$cluster_by)) {
+  fc <- ifelse(is.na(cid_of[paths]), .Machine$integer.max, cid_of[paths])
+  if (length(fc) > 1) cluster_boundaries <- which(fc[-1] != fc[-length(fc)]) + 1
+}
 mat <- mat[paths, , drop = FALSE]; cat_mat <- cat_mat[paths, , drop = FALSE]; val_mat <- val_mat[paths, , drop = FALSE]
 
 # ---- colors ----
@@ -240,20 +285,16 @@ p <- ggplot2::ggplot(df) +
                  axis.text.x = ggplot2::element_text(angle = 90, vjust = 0.5, hjust = 1, size = 5),
                  axis.text.y = ggplot2::element_text(size = 4))
 
-# optional cluster color bar on the left
-if (!is.null(opts$clusters)) {
-  bar_x <- if (use_length) -max(x1) * 0.02 else -1
-  cb <- data.frame(path_y = n_paths - seq_len(n_paths) + 1, cl = factor(clust[paths]))
-  p <- p + ggplot2::geom_tile(data = cb, ggplot2::aes(x = bar_x, y = path_y, color = cl), fill = NA,
-                              width = if (use_length) max(x1) * 0.015 else 0.8, height = 0.9, na.rm = TRUE) +
-    ggplot2::scale_color_discrete(name = "cluster", na.value = "#cccccc") +
-    ggplot2::guides(color = ggplot2::guide_legend(override.aes = list(shape = 15, size = 4)))
+# separator lines between adjacent inspect clusters (only with --cluster-by); no color sidebar
+if (length(cluster_boundaries) > 0) {
+  p <- p + ggplot2::geom_hline(yintercept = n_paths - cluster_boundaries + 1.5,
+                               colour = "grey30", linewidth = 0.3)
 }
 
 # manual SV color legend
 legend_levels <- c("not traversed" = COL[["none"]], "reference-like" = COL[["ref"]],
                    "DEL" = COL[["DEL"]], "INV" = COL[["INV"]], "INS/NOVEL" = COL[["INS_NOVEL"]],
-                   "INS/DUP" = COL[["INS_DUP"]], "DUP (shade=copies)" = dup_ramp(3)[3],
+                   "INS/DUP" = COL[["INS_DUP"]], "DUP (shade=local copies)" = dup_ramp(3)[3],
                    "multiallelic" = multi_ramp(3)[3])
 leg <- data.frame(lab = factor(names(legend_levels), levels = names(legend_levels)), x = NA_real_, y = NA_real_)
 p <- p + ggplot2::geom_point(data = leg, ggplot2::aes(x = x, y = y, shape = lab), na.rm = TRUE) +

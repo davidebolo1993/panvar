@@ -22,7 +22,7 @@ differs deliberately:
 | | Original panphorte | This re-implementation |
 |---|---|---|
 | Repeat detection | scans full base sequence (`O(bp^2)`) | scans the **node-walk**, comparing each step by the sequence it spells (`O(node_count^2)` — a ~1000x reduction on large bubbles) |
-| Aligner | external | **none**; banded `fit_align` is built in for the approximate mode |
+| Aligner | external | **none**; a banded aligner is built in for the approximate mode |
 | Threading | — | per-haplotype parallel seed scan + copy detection (`--threads`) |
 | Modes | single collapse | explicit **exact (sequence-preserving)** vs **approximate (lossy)** via `--min-similarity` |
 
@@ -52,7 +52,10 @@ sequence-preserving (`--max-interruption-frac` bounds how much interruption an a
 panvar panphorte -i <graph.gfa> (-b <prefix> | -c <bubbles.csv>) -o <prefix> [options]
 ```
 
-- `-o, --out-prefix <prefix>`: writes `<prefix>.normalized.gfa` and `<prefix>.panphorte.report.tsv`
+- `-o, --out-prefix <prefix>`: writes the normalized GFA and `<prefix>.panphorte.report.tsv` (see Outputs
+  for which GFA, depending on `--reference-path`)
+- `-r, --reference-path <name>`: sort + re-snarl the normalized graph along this reference so the output
+  is call-ready in one step (see Outputs)
 - `--bubble-id <N>`: restrict to a bubble ID; repeatable
 - `--min-unit-bp <N>`: minimum repeat-unit span to normalize (default `50`)
 - `--min-copies <N>`: minimum tandem copies to normalize (default `2`)
@@ -66,51 +69,54 @@ panvar panphorte -i <graph.gfa> (-b <prefix> | -c <bubbles.csv>) -o <prefix> [op
 
 ## Approximate collapse (`--min-similarity < 1.0`)
 
-Exact collapse only merges byte-identical adjacent copies, which misses divergent repeats (e.g. LPA
-KIV-2 copies differ by SNVs; C4 A/B modules differ by small indels and come in long/short forms). With
-`--min-similarity <f>` panphorte does **single-block, lossy** collapse: one representative repeat
-unit per bubble, whose near-identical copies are found by **banded sequence alignment**.
+Exact collapse only merges byte-identical adjacent copies, so it misses **divergent** repeats — copies
+that differ by SNVs or small indels, or that come in long and short forms. With `--min-similarity <f>`
+panphorte does **single-block, lossy** collapse: one representative repeat unit per bubble, whose
+near-identical copies are found by **banded sequence alignment**. A small worked trace is in
+[algorithm_example.md](../algorithm_example.md).
 
-1. **Seed one representative unit** per bubble from the exact tandem detector: the unit must come from
-   a clean **adjacent identical pair** somewhere in the cohort (so it recovers the true repeat period — the ~5.5 kb KIV-2 unit in LPA, for instance, or the whole ~32 kb in C4). The
-   most-supported unit across all paths wins (for instnace the C4 **long** form is
-   seeded and the short modules then align into it).
+1. **Seed one representative unit** per bubble from the exact tandem detector: the unit must come from a
+   clean **adjacent identical pair** somewhere in the cohort, so it recovers the true repeat period. The
+   most-supported unit across all paths wins — when copies come in long and short forms, the **long** form
+   is seeded and the short copies align into it.
 2. **Find copies** per path by aligning the unit (and its reverse complement) into the path's spelled
-   bubble sequence: multi-seed 16-mer anchors propose copy starts, then a **banded global alignment**
-   (`fit_align`) decides each copy, its extent, and its orientation. The band is `(1 − f)·|unit|`
-   (uncapped), so a copy that differs from the unit by a **large internal indel** still aligns when
-   `f` is low enough — this is what lets a C4 **short** module (missing the ~6.4 kb HERV-K, ≈ 20 % of
-   the long unit) align to the long unit at `--min-similarity 0.70`. Copies need **not be adjacent**
-   within a haplotype; sequence between accepted copies is kept as literal nodes (so only the copies
-   themselves lose detail).
-3. **Collapse** the copies to **one REP node** (the representative unit) traversed once per copy —
-   a self-loop when copies are adjacent, edges through flanking literals when they are not. This is
-   **lossy**: within-copy SNVs/small indels are discarded (collapsed copies become identical),
-   appropriate when copy number is the variant of interest, not the within-copy differences.
-   **Per-copy orientation is preserved** (three copies, two forward + one reverse → `REP +,−,+`).
+   bubble sequence: short k-mer anchors propose copy starts, then a **banded global alignment** decides
+   each copy, its extent, and its orientation. The band width is `(1 − f)·|unit|` (uncapped), so a copy
+   that differs from the unit by a **large internal indel** still aligns when `f` is low enough — this is
+   what lets a short copy (missing an internal block) align to the long unit at a low `--min-similarity`.
+   Copies need **not be adjacent** within a haplotype; sequence between accepted copies is kept as literal
+   nodes, so only the copies themselves lose detail.
+3. **Collapse** the copies to **one REP node** (the representative unit) traversed once per copy — a
+   self-loop when copies are adjacent, edges through flanking literals when they are not. This is
+   **lossy**: within-copy SNVs/small indels are discarded (collapsed copies become identical), appropriate
+   when copy number is the variant of interest, not the within-copy differences. **Per-copy orientation is
+   preserved** (three copies, two forward + one reverse → `REP +,−,+`).
 
-**Limitation:** the unit must occur as `>= 2` **adjacent** identical copies in at least one haplotype
-to be seeded. Once seeded, copies in any haplotype may be non-adjacent / divergent. A duplication with
-no adjacent identical pair anywhere (e.g. paralogs separated by other sequence, or a copy embedded in a
-larger segmental-duplication cluster like GSTM1) is **not** seeded here, so the `panphorte` module leaves that bubble
-intact. Such folded duplications are recovered downstream by `call`, which reads
-copy number from the **peak node-traversal multiplicity** of the un-collapsed bubble relative to the
-reference path and emits a `DUP` record. See [call](call.md).
+**Limitation:** the unit must occur as `≥ 2` **adjacent** identical copies in at least one haplotype to be
+seeded. Once seeded, copies in any haplotype may be non-adjacent / divergent. A duplication with **no**
+adjacent identical pair anywhere — e.g. paralogs separated by other sequence, or a copy embedded in a
+larger segmental-duplication cluster — is **not** seeded here, so panphorte leaves that bubble intact.
+Such folded duplications are recovered downstream by `call`, which reads copy number from the un-collapsed
+bubble's node-traversal multiplicity and emits a `DUP` record. See [call](call.md).
 
 
 ## Outputs
 
-- `<prefix>.normalized.gfa`: the rewritten graph. Each collapsed array becomes a repeat-unit node
-  with a self-loop (`L U + U + 0M`), the supporting paths route through it `copies` times, and
-  duplicate-copy nodes are dropped when no longer referenced by any path.
+The rewritten graph collapses each array into a repeat-unit node with a self-loop (`L U + U + 0M`); the
+supporting paths route through it `copies` times, and duplicate-copy nodes are dropped when no longer
+referenced. **What is written depends on `--reference-path`:**
 
-  **Node ordering:** S-lines are emitted in the input's node order minus the dropped duplicate-copy
-  nodes; the new REP nodes are **appended at the end**, not placed at their genomic locus. Downstream
-  `call` treats **numeric node id == reference order**, so the graph must be re-sorted before calling.
+- **Without `--reference-path`** → `<prefix>.normalized.gfa` only. S-lines keep the input's node order
+  minus the dropped copies, and the new REP nodes are **appended at the end**, not at their genomic locus.
+  Downstream `call` treats **numeric node id == reference order**, so this graph must still be re-sorted
+  before calling.
 
-- `--reference-path <name>` makes the output **call-ready** (sorts+flips the normalized graph along the reference repositioning the appended REP nodes into reference order and renumbering ids and re-snarls it with the cactus finder) writing:
+- **With `--reference-path <name>`** → the output is made **call-ready** in one step: the normalized graph
+  is sorted + flipped along the reference (repositioning the appended REP nodes into reference order and
+  renumbering ids) and re-snarled. Only the sorted form is written (the unsorted `normalized.gfa` is not):
   - `<prefix>.normalized.sorted.gfa` — the sorted, call-ready graph
   - `<prefix>.bubbles.csv` — the re-snarled bubbles
+  - `<prefix>.bandage_nodes.csv` — node colors for Bandage inspection
 
   so the whole pipeline is **`bubble → panphorte --reference-path → call`**:
 
@@ -133,9 +139,8 @@ reference path and emits a `DUP` record. See [call](call.md).
 
 For each bubble, for each path crossing it:
 
-1. Take the path's source-to-sink node-walk (reusing the bubble-path machinery) and tokenize each
-   step by a hash of the sequence it spells (orientation-aware), so identical-sequence copies match
-   even when they are distinct node ids.
+1. Take the path's source-to-sink node-walk and tokenize each step by a hash of the sequence it spells
+   (orientation-aware), so identical-sequence copies match even when they are distinct node ids.
 2. Find non-overlapping tandem arrays: establish the unit from a clean adjacent pair, then extend
    bidirectionally collecting further copies, **tolerating short interruptions** between them (kept
    as nested literal steps). A run is accepted when the unit spans `>= --min-unit-bp`, repeats

@@ -21,7 +21,7 @@ void print_panphorte_help() {
         << "  -i, --gfa <path>                 Input GFA file (required)\n"
         << "  -b, --bubble-prefix-in <prefix>  Module-1 output prefix (auto-uses <prefix>.bubbles.csv)\n"
         << "  -c, --bubbles-csv <path>         Module-1 bubbles CSV (required if no prefix)\n"
-        << "  -o, --out-prefix <prefix>        Output prefix for <prefix>.normalized.gfa + report (required)\n"
+        << "  -o, --out-prefix <prefix>        Output prefix for the normalized GFA + report (required)\n"
         << "      --bubble-id <N>              Restrict to one bubble ID (repeatable)\n"
         << "      --min-unit-bp <N>            Minimum repeat-unit span to normalize (default: 50)\n"
         << "      --min-copies <N>             Minimum tandem copies to normalize (default: 2)\n"
@@ -30,9 +30,10 @@ void print_panphorte_help() {
         << "                                   (1.0=exact; <1.0 enables approximate, lossy collapse; default: 1.0)\n"
         << "      --threads <N>                Worker threads for approximate detection (0=auto; default: 0)\n"
         << "  -r, --reference-path <name>      If set, internally sort+flip the normalized graph along\n"
-        << "                                   this reference and re-snarl (cactus), writing\n"
-        << "                                   <prefix>.normalized.sorted.gfa + <prefix>.bubbles.csv so\n"
-        << "                                   'call' runs with no external vg/odgi tools\n"
+        << "                                   this reference and re-snarl (cactus), writing only\n"
+        << "                                   <prefix>.normalized.sorted.gfa + <prefix>.bubbles.csv +\n"
+        << "                                   <prefix>.bandage_nodes.csv so 'call' runs with no\n"
+        << "                                   external vg/odgi tools (the unsorted GFA is not written)\n"
         << "      --no-flip                    With --reference-path, skip reorienting to the ref strand\n"
         << "  -q, --quiet                      Disable progress logs\n"
         << "  -h, --help                       Show this help\n";
@@ -150,7 +151,6 @@ int run_panphorte_command(const std::vector<std::string>& args) {
     std::cout
         << "Input graph: " << options.gfa_path << "\n"
         << "Bubble source: " << options.bubbles_csv_in << "\n"
-        << "Output GFA: " << options.out_prefix << ".normalized.gfa\n"
         << "Report: " << options.out_prefix << ".panphorte.report.tsv\n"
         << "Bubbles seen: " << summary.bubbles_seen << "\n"
         << "Bubbles normalized: " << summary.bubbles_normalized << "\n"
@@ -163,9 +163,12 @@ int run_panphorte_command(const std::vector<std::string>& args) {
         std::cout
             << "Sorted GFA: " << options.out_prefix << ".normalized.sorted.gfa\n"
             << "Bubbles CSV: " << options.out_prefix << ".bubbles.csv\n"
+            << "Bandage colors: " << options.out_prefix << ".bandage_nodes.csv\n"
             << "Re-snarled bubbles: " << summary.resnarled_bubbles << "\n"
             << "Ready for: panvar call -i " << options.out_prefix
             << ".normalized.sorted.gfa --bubble-prefix-in " << options.out_prefix << "\n";
+    } else {
+        std::cout << "Output GFA: " << options.out_prefix << ".normalized.gfa\n";
     }
 
     return 0;

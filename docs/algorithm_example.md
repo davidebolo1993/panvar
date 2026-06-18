@@ -253,21 +253,27 @@ anchors (unique, increasing in both):  A … B … D … E … F
 segment between B and D:   ref = [C]      hap = []        → gap block
 ```
 
-### Step 2 — read events off the gap blocks (`diff_segment`)
+### Step 2 — read each event off a gap block
 
-A maximal gap block becomes:
+Each maximal gap block between two anchors becomes **one typed event**. Reference walk `R = A B C D E F`
+in every row; only the haplotype changes:
 
 ```text
-ref-only block              → DEL   (nodes = ref nodes,  anchor = first ref node)
-hap-only block              → INS   (nodes = hap nodes,  anchored AFTER the last matched ref node)
-hap block == revcomp(ref)   → INV   (one event over the reference nodes)
-both ref & hap present       → substitution: emit DEL + INS, linked by a shared EVENTID
+haplotype          gap block (ref vs hap)         event emitted
+A B   D E F        ref=[C]   hap=[]         →      DEL {C}                       (deletes C)
+A B P Q C D E F    ref=[]    hap=[P,Q]      →      INS {P,Q}     anchored after B
+A B c̅ D E F        hap=[c̅] == revcomp(C)   →      INV over {C}                  (orientation flip)
+A B X D E F        ref=[C]   hap=[X]        →      substitution: DEL{C}+INS{X}, one shared EVENTID
 ```
 
-For `hX` the `[C]` ref-only block → **DEL `{C}`**. A haplotype that instead inserted `P Q` between `B`
-and `D` would give **INS `{P,Q}`** anchored after `B`.
+- **DEL** = reference-only nodes the haplotype skips; **INS** = haplotype-only nodes, pinned to the last
+  matched reference node.
+- **INV** fires only when the haplotype block is the exact reverse-complement node-walk of the reference
+  block — an orientation flip, not merely different sequence.
+- **substitution** = a block with content on *both* sides; emitted as a linked DEL + INS so each side
+  keeps its own size and sequence, joined by one `EVENTID`.
 
-### Step 3 — coalesce fragments within a haplotype (`coalesce_events`)
+### Step 3 — coalesce fragments within a haplotype
 
 Consecutive **same-type** events merge when their gap is `≤ --merge-distance-bp` (default 100) in
 **either** of two coordinate spaces:
@@ -275,25 +281,49 @@ Consecutive **same-type** events merge when their gap is `≤ --merge-distance-b
 - **reference bp** — `cur_lo − prev_hi`, using each node's reference start;
 - **haplotype bp** — the inserted nodes' own positions in *this* haplotype's walk.
 
-The hap-space clause catches same-type events that are far apart on the reference (a deletion sits
-between them) yet contiguous in the sample's own sequence. Example — `hZ = A D E F` deletes both `B` and
-`C`:
+**(a) reference space.** `hZ = A D E F` deletes both `B` and `C`:
 
 ```text
 raw:   DEL{B}  (ref bp [100,160))   DEL{C}  (ref bp [160,210))
 gap = 160 − 160 = 0 ≤ 100, same type   →   merge → DEL{B,C}
 ```
 
-### Step 4 — cluster across haplotypes (transitive single-linkage)
-
-Every surviving event (size `≥` a rescue floor) becomes a node; two are joined when `events_match`:
+**(b) haplotype space — two insertions "far apart on the reference because a deletion sits between
+them."** An insertion has no width on the reference, so each is pinned to a single reference
+coordinate (the end of the node it is anchored to). Picture a haplotype that, in one stretch, both
+**deletes** a large reference block and makes **two** insertions:
 
 ```text
-events_match(a,b) =  same SVTYPE
-                  AND |a.ref_pos − b.ref_pos| ≤ merge_distance_bp + min(a.size, b.size)   (position window)
-                  AND ( weighted_jaccard(a.nodes, b.nodes) ≥ --merge-jaccard (0.80)        (node-set overlap)
-                        OR  seq_identity(a.seq, b.seq) ≥ --merge-seq-identity (0.80),       (sequence)
-                            gated by a length ratio so wildly different sizes aren't compared )
+reference:    1[0–10]  2[10–210]  3[210–220]  4 (sink)        node 2 = 200 bp, node 3 = 10 bp
+hap walk:     1 — INS5(60bp) — 3 — INS6(60bp) — 4             node 2 deleted; 5,6 inserted
+events:       DEL{2}            INS{5}            INS{6}       (deleted block flushes first)
+```
+
+`INS5` is anchored after node 1 → reference point **10**; `INS6` is anchored after node 3 → reference
+point **220**. The 200 bp deletion of node 2 sits between them and inflates the reference gap:
+
+```text
+reference gap : 220 − 10  = 210  > 100   → reference clause FAILS
+haplotype gap : node5 ends at hap pos 70, node6 starts at 80 (only node3=10bp between)
+                80 − 70   = 10   ≤ 100   → haplotype clause FIRES  → merge → INS{5,6} (120 bp)
+```
+
+The two inserted blocks are one near-contiguous insertion in the sample; only the intervening deletion
+made them look distant on the reference. (`DEL{2}` stays its own event — the hap-space metric is
+defined only for INS, whose nodes actually lie on the haplotype walk; DEL/INV nodes are reference-only,
+so they fall back to the reference gap.) On this worked input nodes 5 and 6 emerge as **one**
+`INS SVLEN=120 EVENT_NODES=5,6`, with the 200 bp DEL reported separately.
+
+### Step 4 — cluster across haplotypes (transitive single-linkage)
+
+Every surviving event (size `≥` a rescue floor) becomes a node; two are joined when they **match**:
+
+```text
+match(a, b) =  same SVTYPE
+            AND |a.pos − b.pos| ≤ --merge-distance-bp + min(a.size, b.size)   (position window)
+            AND ( node-set overlap (length-weighted Jaccard) ≥ --merge-jaccard (0.80)
+                  OR  sequence identity ≥ --merge-seq-identity (0.80),
+                      but only when the size ratio clears --merge-size-ratio )
 ```
 
 Clusters are the **connected components** of that graph (union-find), so merging is transitive — *not*
@@ -316,11 +346,88 @@ components: {e1, e2, e3}  →  ONE locus  (e1–e2–e3 chain), carriers AC=3
 Even though `e1` and `e3` are never directly matched, single-linkage unites all three via `e2` — so the
 same biological STR does not fragment into separate records across haplotypes.
 
-### Step 5 — copy number
+### Step 5 — force-call (sub-threshold rescue)
 
-DUP/CN is computed off the dropped REP/multiplicity nodes (e.g. `--cn-from-multiplicity` reads the REP
-loop count; `--cn-from-coverage` uses spelled-bp / unit on folded paralog clusters), emitted with
-`REF_CN` and per-sample `CN`.
+Clustering (Step 4) only seeds from events `≥` a **rescue floor** (`--rescue-min-bp`, default
+`min_sv_bp / 2`), and a record is finally kept only if its **representative** — the largest member —
+reaches `--min-sv-bp`. That leaves a gap: a haplotype may carry a genuine but *small* version of a
+variant that, on its own, never clears the threshold. The force-call pass closes it. For every kept
+record, it re-reads **every non-member haplotype's own events** (the full per-haplotype event list is
+retained, not just the `≥ floor` subset) and adds the haplotype as a carrier when its walk-diff
+**matches** the record's fixed representative.
+
+Worked example — two haplotypes insert the same motif at one anchor, `hap_big` 60 bp and `hap_small`
+48 bp (same sequence). With the rescue floor raised to 50, the 48 bp event is **excluded** from the
+clustering candidates, so only force-call can recover it:
+
+```text
+record seeded from hap_big        : INS 60 bp   (representative, ≥ min_sv 50)
+hap_small INS 48 bp               : < floor → not a clustering candidate
+force-call: does the 60bp seed match the 48bp event?
+   sequence identity high, length ratio 48/60 = 0.80 ≥ gate  → MATCH
+   → add hap_small as carrier
+result: ONE record, SVLEN=60, SVLEN_RANGE=48,60, NMERGED=2, AC=2  (hap_small GT=1)
+```
+
+Two properties make this safe:
+
+- **It demands the haplotype's *own* diff to register the event** — not mere node-set containment. A
+  *dissimilar* 48 bp insertion at the same spot does **not** match, so it is **not** rescued (`AC` stays
+  `1`, `hap_small` GT=`0`). This is deliberate: on folded paralog loci the inserted nodes are shared
+  across nearly all walks, so a pure containment test would force-call essentially every haplotype.
+- **It is monotone and single-pass** — the representative is fixed before this pass, so adding carriers
+  never changes what any other haplotype is tested against; one sweep reaches the fixpoint with no
+  re-alignment.
+
+### Step 6 — copy number
+
+Copy number is read straight off the walk (no re-alignment), one of three ways depending on how the
+locus is folded in the graph. `REF_CN` and per-sample `CN` are reported on a `DUP` record.
+
+**(a) clean tandem (self-loop `REP`).** `panphorte` already collapsed an adjacent repeat into a `REP`
+node with a self-loop; copy number is just the loop count.
+
+```text
+reference walks REP 3×   → REF_CN = 3
+sample hY walks REP 2×   → CN = 2   (one copy lost)
+```
+
+**(b) folded paralogs, reference has several copies (`--cn-from-coverage`).** Two near-identical genes
+(e.g. CYP2D6 / CYP2D7) are folded onto the **same shared nodes**, so a path carrying both genes walks
+those nodes more than once — including the reference. We can't spot a *loss* from any single node (a
+deleted copy needn't touch the busiest one), so we measure **total sequence** and divide by one copy.
+The size of one copy is calibrated from the reference itself:
+
+```text
+reference spells 10,000 bp through the bubble, folding ref_fold = 2× over the shared nodes
+  unit (one copy) = ref_spelled_bp / ref_fold = 10,000 / 2 = 5,000 bp
+  REF_CN          = ref_fold                                = 2
+
+per haplotype:  copies ≈ (bp it spells through the bubble) / unit
+  hapA spells 15,000 bp  → 15,000 / 5,000 = 3   → CN = 3   (gain)
+  hapB spells  5,000 bp  →  5,000 / 5,000 = 1   → CN = 1   (loss)
+  hapC spells 10,000 bp  → 10,000 / 5,000 = 2   → CN = 2   (reference-like)
+```
+
+Because it uses *all* the traversed sequence, it recovers losses and gains alike. It reports the
+**total module** count (2D6 + 2D7 together), not which paralog is which. When it fires it replaces that
+bubble's folded walk-diff with this single CN record.
+
+**(c) folded single extra copy, reference does not fold (`--cn-from-multiplicity`).** Here the reference
+is single-copy — every node visited once (`ref_peak = 1`). A haplotype carrying an **extra** copy folds
+it back onto the shared nodes, so its busiest node is visited twice. No division: just compare the
+**peak** node-visit count.
+
+```text
+reference visits every node 1×          → ref_peak = 1, REF_CN = 1
+hapD visits its busiest node 2×         → ac_peak = 2 > ref_peak  → DUP, CN = 2
+   SVLEN = duplicated content = Σ node_len × excess visits
+hapE visits every node 1×               → ac_peak = 1 = ref_peak  → no DUP
+```
+
+The **peak** (single busiest node), not per-node excess, is the dosage signal: in a messy cluster many
+nodes pick up extra visits just from paralog presence/absence, but the global peak reflects a real
+gained copy.
 
 **Resulting records (sketch):**
 
@@ -329,8 +436,37 @@ SVTYPE  EVENT_NODES   carriers       AC   note
 DEL     C             hX, hW         2    Jaccard merge (a)
 DEL     B,C           hZ             1    coalesced in hZ; distinct site
 INS     <STR motif>   h1, h2, h3     3    transitive seq-identity merge (b)
-DUP     <REP>         hY (CN=2)      1    from multiplicity
+DUP     <REP>         hY (CN=2)      1    self-loop loop count (6a)
+DUP     <module>      hA,hB (CN=3,1) 2    coverage total-module CN (6b)
+DUP     <peak node>   hD (CN=2)      1    peak multiplicity (6c)
 ```
+
+### Step 7 — when the merge parameters change the call
+
+Each knob flips one specific decision. When a record actually merges ≥2 events, the evidence is written
+back as `MERGE_JACCARD` / `MERGE_SEQID` / `MERGE_SIZE_RATIO`, so you can see *why* it merged.
+
+```text
+--merge-distance-bp   two same-type DELs 90 bp apart on the reference (within one haplotype):
+                        =100 (default) → 90 ≤ 100 → coalesced into ONE DEL  (Step 3)
+                        =50            → 90 > 50  → TWO separate DELs
+
+--merge-jaccard       DEL{2} (60bp) and DEL{2,3} (90bp) share node 2 → length-weighted Jaccard 60/90 = 0.67:
+                        =0.80 (default) → 0.67 < 0.80 → two records
+                        =0.60          → 0.67 ≥ 0.60 → ONE record   (MERGE_JACCARD=0.67)
+
+--merge-seq-identity  two 60bp insertions, different nodes (Jaccard 0), sequences 92% identical:
+                        =0.95          → 0.92 < 0.95 → two records
+                        =0.80 (default)→ 0.92 ≥ 0.80 → ONE record   (MERGE_SEQID=0.92)
+
+--merge-size-ratio    same motif inserted at 60 bp and 108 bp (Jaccard 0, identity high):
+                        default (floor = --merge-seq-identity = 0.80): 60/108 = 0.56 < 0.80
+                            → sizes too different to even compare → two records (size classes kept apart)
+                        =0.5           → 0.56 ≥ 0.5 → compared → ONE record spanning both
+                                         (SVLEN_RANGE=60,108, MERGE_SIZE_RATIO=0.56)
+```
+
+The `MERGE_*` fields appear only on records that merged at least two events; a singleton record has none.
 
 ---
 
@@ -359,16 +495,8 @@ CACG                CA, AC, CG                     AC @ offset 1     DROP (middl
 
 So `GACACG` contributes **one** syncmer feature: `ACAC`.
 
-**Other sampling modes.** `--feature-mode all` keeps every canonical k-mer (3 here: `GACA, ACAC, CACG`).
-`--feature-mode minimizer` slides a window of `--minimizer-window` consecutive k-mers and keeps the
-**smallest canonical** k-mer in each window (a position chosen by overlapping windows is counted once).
-With window `W = 2` over the canonical codes `GACA(132), ACAC(17), CACG(70)`:
-
-```text
-window [GACA,ACAC] → min = ACAC (17)
-window [ACAC,CACG] → min = ACAC (17)   (same position, counted once)
-kept minimizers: { ACAC }
-```
+**The other mode.** `--feature-mode all` keeps every canonical k-mer (3 here: `GACA, ACAC, CACG`) — the
+exhaustive set, versus the one sampled syncmer above.
 
 ### Counting + the discriminative filter
 
@@ -399,4 +527,4 @@ contrast. `--min-paths 0` disables rule 2 (keeps every feature that is non-const
 Because k-mers are spelled from the bubble's node sequences, each kept k-mer records the set of
 **graph nodes** its occurrences touch (written in the feature map). So a significant marker downstream
 maps straight back to a node/edge in the bubble — and to the variant `call` makes there. The pooled
-survivors across bubbles are written to the pyseer-ready `fsm_kmers.txt.gz`.
+survivors across bubbles are written to the fsm-lite `fsm_kmers.txt.gz`.

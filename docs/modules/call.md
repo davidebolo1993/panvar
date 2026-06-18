@@ -20,14 +20,14 @@ two ways and writes a tidy multi-sample VCF:
    set (length-weighted Jaccard ≥ `--merge-jaccard`) **or** in sequence (identity ≥
    `--merge-seq-identity`), and each connected component becomes one record. Transitivity matters — if A
    matches B and B matches C but A does not match C, all three still collapse into one record instead of
-   fragmenting across haplotypes (the old greedy first-fit could split them). The sequence key
+   fragmenting across haplotypes. The sequence key
    consolidates events that are the same biologically but thread different graph nodes (e.g. a
    microsatellite tangle); the largest member represents the record.
 3. **Graph-level force-call (sub-threshold rescue)**: events are clustered *before* the size filter (down
    to `--rescue-min-bp`), then every non-carrier haplotype is interrogated at each called locus against
    its **own walk-diff** — so a 49 bp deletion in one haplotype is rescued (`GT=1`) by a 51 bp call in
    another instead of being dropped and genotyped `0`. Because the representative is fixed and carriers
-   only accrue, this is a single pass (no re-iteration) and adds no re-alignment. A merged record is
+   only accrue, this is a single pass. A merged record is
    reported only if its representative (largest member) reaches `--min-sv-bp`.
 
 Input is expected to be a **panphorte-normalized GFA**, so a tandem duplication is a single repeat-unit
@@ -40,43 +40,41 @@ Input is expected to be a **panphorte-normalized GFA**, so a tandem duplication 
   subtype `INS_SUBTYPE=NOVEL|DUP` (does the inserted sequence map back to the local reference?). The
   primary `SVTYPE` stays `INS`.
 - **INV** — a haplotype run that is the reverse-complement node-walk of a reference run.
-- **DUP** — a copy-number gain. Two sources:
+- **DUP** — a copy-number gain or loss. Three sources (tried per bubble in a fixed precedence; see the
+  copy-number section below):
   - a `REP` node (self-loop) traversed a different number of times than the reference (panphorte's
     collapsed tandem arrays);
-  - with `--cn-from-multiplicity`, a **folded duplication panphorte left intact** (no self-loop):
-    a bubble where a haplotype's **peak node-traversal multiplicity** exceeds the reference's peak — the
-    extra paralog copy is folded onto shared nodes, so it is traversed once more than the reference does.
-    `SVLEN` is the duplicated content (Σ node_len × excess traversals); the peak (not per-node excess) is
-    what isolates real gene dosage from cluster background. This is how the GSTM1 gene duplication, buried
-    in a ~77 kb segmental-duplication cluster with no adjacent repeat, is called.
+  - with `--cn-from-coverage`, a **folded paralog cluster** the reference itself traverses ≥2× — copy
+    number is the total sequence each haplotype spells through the module divided by one copy's bp, so it
+    recovers losses as well as gains;
+  - with `--cn-from-multiplicity`, a **folded duplication panphorte left intact** (no self-loop) where the
+    reference does *not* fold: a haplotype's **peak node-traversal multiplicity** exceeds the reference's
+    peak. `SVLEN` is the duplicated content (Σ node_len × excess traversals); the peak (not per-node
+    excess) isolates real dosage from cluster background.
 
-  Either way `REF_CN` is the reference copy number and per-sample `CN` is reported in `FORMAT`.
+  In every case `REF_CN` is the reference copy number and per-sample `CN` is reported in `FORMAT`.
 
 ## Required inputs
 
 - `--gfa <graph.gfa>` / `-i` (ideally panphorte-normalized; use `panphorte --reference-path`'s
-  `.normalized.sorted.gfa` so it is already sorted + re-snarled — no `vg`/`odgi` needed)
+  `.normalized.sorted.gfa`)
 - one of:
-  - `--bubble-prefix-in <module1-prefix>` (auto uses `<module1-prefix>.bubbles.csv`)
-  - `--bubbles-csv-in <module1.bubbles.csv>`
+  - `--bubble-prefix-in <panphorte-prefix>` (auto uses `<panphorte-prefix>.bubbles.csv`)
+  - `--bubbles-csv-in <panphorte-prefix.bubbles.csv>`
 - `--reference-path <name>` — the path used as the diff baseline. Accepts either the full path
-  name or a **case-insensitive substring** (e.g. `grch38` → `grch38#1#chr6:...`). An exact name always
-  wins; otherwise the substring must match exactly one path, else `call` errors — "not found" or
-  "ambiguous" with the candidate list (e.g. `grch38` when both `GRCh38_0` and `grch38_1` exist; pass the
-  unambiguous `GRCh38_0`)
+  name or a **case-insensitive substring** of it (a short unique tag, e.g. a sample or contig name). An
+  exact name always wins; otherwise the substring must match exactly one path, else `call` errors —
+  "not found" or "ambiguous" with the candidate list
 - `-o, --out-prefix <prefix>`
 
 ## Key options
 
-Synopsis (required bare, optional in `[ ]`; common flags have a short form):
 
-```text
+```bash
 panvar call -i <graph.gfa> (-b <prefix> | -c <bubbles.csv>) -r <name> -o <prefix> [options]
 ```
 
-Running `panvar call` with no arguments prints this help. Short forms: `-i`/`--gfa`,
-`-b`/`--bubble-prefix-in`, `-c`/`--bubbles-csv-in`, `-r`/`--reference-path`, `-o`/`--out-prefix`,
-`-q`/`--quiet`.
+Running `panvar call` with no arguments prints this help. 
 
 - `--min-sv-bp <N>` — minimum size of a reported (merged) event (default `50`)
 - `--merge-distance-bp <N>` — coalesce nearby same-type events within a bubble (default `100`). The gap
@@ -90,18 +88,17 @@ Running `panvar call` with no arguments prints this help. Short forms: `-i`/`--g
   several different-length deletions of one STR/microsatellite, or insertion size-classes — into a single
   record (the record then carries `INFO=SVLEN_RANGE`). The default keeps distinct sizes separate.
 - `--min-haplotypes <N>` — drop records carried by fewer than N haplotypes (default `1` = off)
-- `--min-maf <X>` — drop records with allele frequency `AF = AC/AN` below X, where `AN` is the number of
-  haplotypes that **traverse the bubble** (so `.`-genotyped haplotypes are excluded from the denominator).
-  Complements the count-based `--min-haplotypes`. Default `0` = off.
+- `--min-maf <X>` — drop records whose carrier frequency `AF = AC/AN` is below X, where `AN` is the number
+  of haplotypes that **traverse the bubble** (`.`-genotyped haplotypes are excluded from the denominator).
+  `AF` is the **ALT (carrier) frequency and is not folded**, so this drops near-absent variants but keeps
+  near-fixed ones (`AF≈0.99` passes a `0.05` cut). Complements the count-based `--min-haplotypes`.
+  Default `0` = off.
 - `--rescue-min-bp <N>` — floor for sub-threshold events kept for merge/rescue (default `min-sv-bp/2`)
 - `--classify-ins` — refine INS subtype NOVEL/DUP via minimap2 (`--minimap-preset`, `--minimap-best-n`,
   `--ins-dup-min-identity`)
-- `--cn-from-multiplicity` — emit `DUP` from peak node multiplicity for folded bubbles with no self-loop
-  (e.g. GSTM1) that panphorte left intact (see Event types and the section below)
-- `--cn-from-coverage` — emit **total-module copy number** on folded paralog clusters where the reference
-  itself traverses the module ≥2× (e.g. CYP2D6/2D7); see the copy-number section below
-- `--multiallelic-loci` — collapse a bounded locus (e.g. an STR/VNTR) into ONE multiallelic record
-  (`REF` + `ALT1,ALT2,…` explicit sequences, per-sample `GT` indexing the allele); `--multiallelic-max-bp`
+- `--cn-from-multiplicity` — emit `DUP` from peak node multiplicity for folded bubbles with no self-loop that panphorte left intact (see Event types and the section below)
+- `--cn-from-coverage` — emit **total-module copy number** on folded paralog clusters where the reference itself traverses the module ≥2×; see the copy-number section below
+- `--multiallelic-loci` — collapse a bounded locus (e.g. an STR/VNTR) into ONE multiallelic record `REF` + `ALT1,ALT2,…` explicit sequences, per-sample `GT` indexing the allele); `--multiallelic-max-bp`
   (default 5000) bounds it so large SVs keep their typed per-event records
 - `--bubble-id <N>` — restrict to one bubble (repeatable)
 - `--no-per-bubble-vcf` — only write the concatenated region VCF
@@ -110,55 +107,79 @@ Running `panvar call` with no arguments prints this help. Short forms: `-i`/`--g
 
 ### Copy-number gains/losses and segmental duplications
 
-- A **tandem array** (panphorte-normalized into a `REP` self-loop) is a `DUP` record with per-sample
-  `CN`. A **copy loss** at such a locus shows up as a sample whose `CN` differs from `REF_CN`.
-- A **non-tandem extra copy** (a segmental duplication that panphorte did not collapse) can be read two
-  ways. With `--cn-from-multiplicity` it becomes a true **`DUP`** record: the copy is folded onto shared
-  nodes, so the carrier's peak node multiplicity exceeds the reference's and copy number falls out of the
-  walk directly — baseline-corrected, no re-alignment. On the bundled GSTM1 locus (a ~77 kb cluster, no
-  adjacent repeat to seed) this emits one `DUP` (`SVLEN≈18.5 kb`, `REF_CN=3`) carried by exactly the two
-  copy-2 samples (HG01346, NA19240), `CN=4`, with zero false positives across the other 463 haplotypes.
-  Without the flag the same event surfaces as an **INS**; with `--classify-ins` it is labelled
-  `INS_SUBTYPE=DUP` because the inserted sequence maps back to the local reference. When
-  `--cn-from-multiplicity` emits the DUP, the walk-diff's redundant view of the same extra copy (a
-  "duplication insertion" carried by exactly the DUP's carriers, of comparable size) is **dropped**, so
-  the event is reported once — as the DUP — not double-counted as both a DUP and an INS.
-- A **folded paralog cluster** where the paralogs are too similar to separate (e.g. CYP2D6/2D7, ~95%
-  identical) collapses into one tangled bubble in which the *reference itself* traverses the module ≥2×.
-  Here peak-multiplicity fails (a gene deletion need not touch the single peak node, so deletions stay at
-  `REF_CN`). `--cn-from-coverage` instead reads **total module copy number** from coverage:
-  `copies ≈ (bp the haplotype spells through the bubble) / (module unit bp)`, with the unit derived
-  graph-only as `ref_spelled_bp / ref_fold`. Because it uses all the traversed sequence it recovers
-  **deletions** (fewer bp → fewer copies) as well as gains. On CYP2D6 it separates the 9 deletions
-  (`CN=2`) from normal (`CN=3`) from gains/trip (`CN≥4`) — monotonic with the pangene total. It is
-  reference-relative and reports the **total module** copy number, not a per-gene (2D6-vs-2D7) count;
-  per-subtype resolution is a future refinement. When it fires for a bubble it replaces that bubble's
-  (folded, unreliable) walk-diff with the single CN record.
+Copy number is read off the graph in three ways. Which one applies depends on how the locus is
+represented after `panphorte`, so the detectors are tried **per bubble in a fixed precedence** and never
+double-count.
 
-  **The three CN detectors are complementary, applied per bubble in this precedence:** (1) panphorte
-  **self-loop DUP** (clean adjacent tandems → exact loop count); else (2) `--cn-from-coverage` total-module
-  CN on folded clusters (`ref_fold ≥ 2`); else (3) `--cn-from-multiplicity` peak DUP (a single extra copy
-  folded onto a high-multiplicity node, e.g. GSTM1). Note: in a bubble panphorte *partially* collapsed (a
-  self-loop exists), the peak/coverage paths are skipped, so any residual un-collapsed copies surface as
-  `INS`/`INS_SUBTYPE=DUP` rather than a DUP.
+**1. Clean tandem array → self-loop `DUP` (always on).** When `panphorte` collapsed an adjacent tandem
+into a `REP` self-loop, copy number is the exact loop count: a `DUP` record with `REF_CN` and per-sample
+`CN`. A **copy loss** is simply a sample whose `CN` is below `REF_CN`; a **gain** is one above it.
+If a carrier's haplotype **bypasses the `REP` node entirely** — `panphorte` did not fold its (often
+divergent) copies onto the shared self-loop — the raw loop count would read 0 even though the haplotype
+carries the locus. For such a carrier the `CN` is instead estimated from the sequence it actually spells
+through the bubble divided by the one-copy size (the same arithmetic as method 2, amortised over the
+reference), so a present haplotype reports ≥ 1 rather than a spurious 0; a haplotype that truly spells no
+interior sequence stays 0 (a genuine full deletion).
 
-  **Passing both `--cn-from-coverage` and `--cn-from-multiplicity` is safe and gives the widest recall** —
-  they do not conflict, they *compose* per bubble. Coverage fires only where the reference itself folds
-  (`ref_fold ≥ 2`) and, where it does, takes precedence and replaces that bubble's walk-diff; peak
-  multiplicity then handles the remaining folded bubbles where the reference does **not** fold. So coverage
-  catches the tangled paralog clusters (CYP2D6) and peak multiplicity catches the single-extra-copy folds
-  (GSTM1), with no double counting.
+**2. Folded paralog cluster → total-module CN from coverage (`--cn-from-coverage`).** When paralogs are
+too similar to separate, the graph folds them onto shared nodes and the **reference itself** traverses
+the module two or more times. Peak multiplicity (method 3) can't help here — a copy loss need not touch
+the single busiest node — so copy number is read from how much sequence each haplotype spells through the
+bubble, normalised to the size of one copy:
 
-  **Roadmap — per-paralog resolution.** Both folded-cluster detectors report **total module** copy number,
-  not per-paralog (2D6 vs 2D7, C4A vs C4B), because pggb folds the conserved backbone onto shared nodes.
-  The intended route to per-copy DEL/INS/CN is an **optional pangene/segdup BED** that *unfolds* the cluster
-  — labelling which nodes belong to which paralog so the cluster can be split and each copy typed
-  independently. That is deliberately not built yet; a dedicated dispersed-segdup module was considered and
-  set aside in favor of the BED-driven unfold.
-- Note copy number is **reference-relative**: presence/absence reads as `INS` against a reference that
-  lacks the copy and as `DEL` against one that has it. For an absolute per-haplotype count, read CN from
-  panphorte's `copies.tsv` / the `DUP` record on a relaxed-similarity normalization (see the panphorte
-  docs), not from a single diff against one reference.
+```text
+copies     ≈ (bp the haplotype spells through the bubble) / (one-copy bp)
+one-copy bp = (bp the reference spells through the bubble) / (times the reference folds over it)
+```
+
+Because it uses *all* the traversed sequence, it recovers **losses** (fewer bp → fewer copies) as well
+as **gains**, monotonically. It reports the **total module** copy number, not a per-paralog count. When
+it fires for a bubble it replaces that bubble's (folded, unreliable) walk-diff with the single CN record.
+
+**3. Single folded extra copy → peak-multiplicity `DUP` (`--cn-from-multiplicity`).** When an extra copy
+was folded onto shared nodes but the *reference* does **not** fold (1 or no copy), the carrier's peak
+node-traversal multiplicity exceeds the reference's, and copy number falls straight out of the walk — no
+re-alignment. `SVLEN` is the duplicated content (Σ node_len × excess traversals). Keying on the **peak**
+multiplicity, rather than any per-node excess, separates true gene dosage from cluster background (per-node
+excesses only reflect which paralog is present). When this emits a `DUP`, the walk-diff's redundant view
+of the same copy — a "duplication insertion" carried by exactly the DUP's carriers, of comparable size —
+is **dropped**, so the event is reported once.
+
+**Precedence and composition.** Per bubble: (1) self-loop `DUP` if a `REP` self-loop exists; else
+(2) coverage CN if the reference folds; else (3) peak-multiplicity `DUP`. Passing both
+`--cn-from-coverage` and `--cn-from-multiplicity` is safe and gives the widest recall — they *compose*
+rather than conflict: coverage handles the bubbles where the reference folds, peak multiplicity handles
+the rest, with no overlap. (In a bubble `panphorte` only *partially* collapsed — a self-loop already
+exists — the coverage/peak paths are skipped, so any residual un-collapsed copies surface as
+`INS` / `INS_SUBTYPE=DUP` rather than a `DUP`.)
+
+**When no CN flag fires**, an extra copy that `panphorte` left intact surfaces through the ordinary
+walk-diff as an **`INS`**; with `--classify-ins` it is labelled `INS_SUBTYPE=DUP` when the inserted
+sequence maps back to the local reference.
+
+**Copy number is reference-relative.** Presence/absence reads as `INS` against a reference that lacks the
+copy and as `DEL` against one that has it; the folded-cluster detectors report the **total module** count,
+not a per-paralog (copy-by-copy) breakdown. For an absolute per-haplotype count, read `CN` from
+panphorte's `copies.tsv` / the `DUP` record on a relaxed-similarity normalization (see the panphorte
+docs), not from a single diff against one reference.
+
+> **Per-paralog resolution.** Both folded-cluster detectors report total-module copy number
+> because the graph folds the conserved backbone onto shared nodes. The intended route to per-copy
+> DEL/INS/CN is an optional pangene BED that *unfolds* the cluster — labelling which nodes belong
+> to which paralog so each copy can be typed independently. In progress.
+
+### Multiallelic loci (`--multiallelic-loci`)
+
+By default every event at a bubble is its own VCF record (one DEL, one INS, …). At a small, bounded locus
+that varies mainly by **which sequence** a haplotype carries — e.g. a short tandem repeat with several
+length alleles — that scatters one site across many records. `--multiallelic-loci` instead collapses such
+a bubble into a **single record** with explicit sequences: `REF` plus `ALT1,ALT2,…`, one per distinct
+interior spelling, with per-sample `GT` indexing the allele each haplotype carries (`NALLELES` counts
+them). This is **not** copy-number specific — it represents ordinary sequence alleles (insertions,
+deletions, substitutions); copy-number `DUP` records keep their `REF_CN` / `CN` form. It fires only when
+the locus is small enough (`--multiallelic-max-bp`, default 5000) and shows real variation (the largest
+allele differs from `REF` by at least `--min-sv-bp`); otherwise the bubble falls back to per-event
+records, so large SVs keep their typed representation.
 
 ## Outputs
 
@@ -185,12 +206,18 @@ The VCFs are VCF 4.2. Samples are the **haplotypes** (every P/W path; haploid). 
 - `FORMAT=CN`: per-sample copy number (DUP records; `.` otherwise).
 - `INFO`: `SVTYPE, SVLEN, END, BUBBLE_ID, START_NODE, END_NODE, EVENT_NODES`, `NMERGED` (carrier count),
   population fields **`NS`** (haplotypes with data = traversing the bubble), **`AN`** (= NS), **`AC`**
-  (carrier count) and **`AF`** (= AC/AN, the allele frequency `--min-maf` filters on),
-  `SVLEN_RANGE` (min,max member size when a merged record spans differing sizes), `EVENTID` (links a
-  co-located DEL+INS substitution), `INS_SUBTYPE` (refined INS only), `REF_CN` (DUP), `NALLELES`
-  (multiallelic records from `--multiallelic-loci`), and the event
-  sequence (`INSSEQ`/`DELSEQ`/`INVSEQ`, omitted when very long). `EVENT_NODES` is **deduplicated and
-  ordered** (reference nodes by genomic position, haplotype-only nodes after them in walk order), so
+  (carrier count) and **`AF`** (= AC/AN). `AF` is the **carrier (ALT) frequency** — the numerator counts
+  carriers, the denominator counts every haplotype that traverses the bubble (so the reference and other
+  reference-like haplotypes are in `AN` but not `AC`). It is **not folded**, so a near-fixed variant reads
+  as `AF≈0.99`, not `0.01`; `--min-maf` drops records below this value.
+  Also: `SVLEN_RANGE` (min,max member size when a merged record spans differing sizes) and the
+  cross-haplotype merge evidence **`MERGE_JACCARD`** (strongest node-set overlap that joined a member),
+  **`MERGE_SEQID`** (strongest sequence identity, when overlap did not decide it) and
+  **`MERGE_SIZE_RATIO`** (smallest/largest merged member size) — all present only on records that actually
+  merged ≥2 events; `EVENTID` (links a co-located DEL+INS substitution), `INS_SUBTYPE` (refined INS only),
+  `REF_CN` (DUP), `NALLELES` (multiallelic records from `--multiallelic-loci`), and the event sequence
+  (`INSSEQ`/`DELSEQ`/`INVSEQ`, omitted when very long). `EVENT_NODES` is **deduplicated and ordered**
+  (reference nodes by genomic position, haplotype-only nodes after them in walk order), so
   `START_NODE`→`END_NODE` reads as a coherent progression; the full per-carrier node walk lives in
   `variant_paths.tsv`. A substitution (same locus deletes a reference block and inserts a haplotype block)
   yields two records (DEL + INS) sharing one `EVENTID`.
@@ -209,96 +236,86 @@ coverage heatmap of the same bubble.
 
 Cell colors: white = node not traversed; grey = traversed, reference-like; **DEL** red, **INS-NOVEL**
 green, **INS-DUP** purple, **INV** orange, **multiallelic** teal (shaded by allele index). A **DUP**
-carrier's whole traversed module is shaded **blue by per-node multiplicity** (the local copy count read
-from the coverage substrate) — so a copy-number gene like GSTM1 or CYP2D6 shows its dosage as blue
-intensity across the module, with DEL/INS painted on top. (DUP is encoded with a single representative
-node in the VCF, so this whole-module shading is what makes the copy number visible.)
+carrier's traversed nodes are shaded **blue by per-node traversal multiplicity** (the *local* copy
+count), with DEL/INS painted on top. Plot against the **panphorte-normalized** `inspect` substrate (its
+node ids match the `call` VCF): there the repeat-unit (`REP`) node's multiplicity **equals the carrier's
+called `CN`**, so the copy number reads as a strong blue band exactly at that node, while single-traversal
+nodes stay light. (Plotting against the un-normalized bubble graph instead spreads the repeat over many
+single-traversal nodes, so the `REP` band is lost — use the normalized substrate for copy-number loci.)
 
 It reads the per-bubble `inspect` `node_counts.tsv` (substrate + node order) and the `call` VCF (events,
 carriers, `GT:CN`). The bubble id is inferred from the `node_counts.tsv` filename (or pass `--bubble-id N`).
-Optional: `--node-lengths <...node_lengths.tsv>` scales column widths by node bp; `--clusters <...clusters.tsv>`
-orders and color-bars the rows by walk cluster (to see whether clusters track the calls);
-`--reference-path NAME` pins that haplotype (substring match) as the top row; `--max-nodes`/`--max-paths`
-cap the figure.
+Optional: `--node-lengths <...node_lengths.tsv>` scales column widths by node bp; the row-clustering flags
+mirror the coverage heatmaps — `--clusters <...clusters.tsv>` keeps only the cluster **representative**
+rows, while `--cluster-by <...clusters.tsv>` keeps all rows but **groups/orders them by walk cluster**
+(representative first, a thin separator between clusters, no color sidebar); `--reference-path NAME` pins
+that haplotype (substring match) as the top row; `--max-nodes`/`--max-paths` cap the figure. Note the
+`inspect` clusters group haplotypes by **walk similarity**, which is not the same as the called **copy
+number** — the latter is shown directly by the DUP blue-intensity shading regardless of row order.
 
 ```bash
-panvar inspect -i graph.gfa --bubble-prefix-in out/bubble --bubble-id 4 --cluster -o out/inspect/b4
+./build/panvar inspect -i tests/results/lpa/panphorte/panphorte.normalized.sorted.gfa \
+  --bubble-prefix-in tests/results/lpa/panphorte/panphorte --bubble-id 7 \
+  --cluster \
+  --cluster-similarity 0.97 \
+  -o tests/results/lpa/inspect_panphorte/inspect
 Rscript scripts/plot_sv_map.R \
-  --node-counts out/inspect/b4.bubble_4.node_counts.tsv \
-  --vcf out/call.region.vcf \
-  --node-lengths out/inspect/b4.bubble_4.node_lengths.tsv \
-  --clusters out/inspect/b4.bubble_4.clusters.tsv \
-  --reference-path grch38 --out out/sv_map_b4
+  --node-counts tests/results/lpa/inspect_panphorte/inspect.bubble_7.node_counts.tsv \
+  --vcf tests/results/lpa/call/call.region.vcf \
+  --node-lengths tests/results/lpa/inspect_panphorte/inspect.bubble_7.node_lengths.tsv \
+  --clusters tests/results/lpa/inspect_panphorte/inspect.bubble_7.clusters.tsv \
+  --cluster-by tests/results/lpa/inspect_panphorte/inspect.bubble_7.clusters.tsv \
+  --reference-path grch38_1 \
+  --out tests/results/lpa/call/call.bubble_7
 ```
 
 ## Algorithm
 
-For each bubble:
+Each step below is traced on a tiny worked dataset in
+[algorithm_example.md](../algorithm_example.md). For each bubble:
 
-1. Take the reference walk and each haplotype's canonical source→sink walk
-   (`canonical_bubble_path_steps`). Group identical walks into **distinct alleles** (call once per
-   allele, expand genotypes by membership).
-
-   **Empty-interior alleles (single-node indels).** The shared bubble-path machinery
-   (`find_best_bubble_path_interval`) locates a path's crossing of a bubble by requiring it to traverse
-   at least one **interior** node (`inside_count >= 1`) — sensible for `inspect`/`panphorte`, which act
-   on interior content. But a *pure* deletion's allele goes source→sink directly (no interior node), and
-   a *pure* insertion's reference allele does too — so that allele scored `inside_count = 0` and was read
-   as "does not traverse the bubble." The consequence: a single-node deletion lost its deleting allele
-   entirely (no DEL emitted), and a single-node insertion made the reference itself look absent (the whole
-   bubble was skipped). Complex bubbles hid this, because their alternate alleles still traverse other
-   interior nodes — so it only bit clean two-anchor / one-variable-node sites (common in STR/microsatellite
-   regions). `call` adds a local fallback (`bubble_steps`): when the interval finder returns nothing but
-   the path has the bubble's source immediately adjacent to its sink, it uses the empty-interior allele
-   `[source, sink]`. This is confined to the caller; the shared interval finder is unchanged.
-2. Mark copy-number nodes (any node traversed > 1× in the reference or an allele) and fold their
-   consecutive self-repeats into one alignment token (so a `REP` self-loop becomes a single anchor and
-   surfaces as a CN delta, not a spurious INS/DEL).
-3. Align the reference and haplotype token walks and read off DEL / INS / INV. To scale to large bubbles
-   (e.g. a ~2500-node gene-presence locus), the two walks are first split at shared **anchor** nodes
-   (tokens appearing exactly once in both walks, chained in a common monotonic order); the quadratic DP
-   then runs only inside the small segments between anchors. This removes the whole-bubble size cap, and
-   because the breakpoints fall on the same anchors for every haplotype, the same large event (a gene
-   deletion/insertion) is identical across haplotypes and merges cleanly. INV is detected when a
-   haplotype gap-block is the reverse-complement node-walk of the opposing reference gap-block.
-4. Coalesce nearby same-type events within the haplotype, merging when the gap is within
-   `--merge-distance-bp` in **reference space OR this haplotype's own sequence space** (the latter
-   catches events split on the reference by an intervening deletion but contiguous in the sample).
-5. Merge events across haplotypes by **transitive single-linkage clustering** (union-find connected
-   components; keeping all events down to `--rescue-min-bp`). Two events are linked when they share a
-   type, sit within a position window, and have node-set Jaccard `≥ --merge-jaccard` **or** sequence
-   identity `≥ --merge-seq-identity`; each component is one record. The position window **scales with
-   event size** (`--merge-distance-bp` plus the smaller event's length), so a large insertion/deletion
-   whose breakpoint floats by kilobases across haplotypes still merges — the sequence/Jaccard gate
-   prevents over-merging distinct events, and connected components make the merge order-independent and
-   transitive (A–B–C collapse even when A and C do not directly match). Edge-building is a
-   position-sorted windowed sweep, so it stays near-linear. The largest member represents the record.
-   DUP merges on shared `REP` node identity, with per-sample CN (handled separately from this clustering).
-6. **Graph-level force-call**: interrogate every non-member haplotype at each merged locus against its
-   own walk-diff (including its sub-threshold events) to set `GT` and rescue sub-threshold carriers — a
-   single pass, since the representative is fixed and carriers only accrue. Keep records whose
-   representative reaches `--min-sv-bp` and carrier count reaches `--min-haplotypes`, and emit one VCF
-   record per group.
+1. **Alleles.** Take the reference walk and each haplotype's source→sink walk; group identical walks into
+   distinct **alleles** and call once per allele (genotypes expand by membership). A *pure* single-node
+   indel — an allele that goes straight from source to sink with no interior node — is handled explicitly,
+   so a lone deletion or insertion at a two-anchor site is not mistaken for "does not traverse the bubble".
+2. **Copy-number nodes.** Mark any node traversed more than once (in the reference or an allele) and fold
+   its consecutive self-repeats into one alignment token, so a `REP` self-loop becomes a single anchor and
+   surfaces as a copy-number change, not a spurious INS/DEL.
+3. **Diff against the reference.** Split the reference and haplotype walks at shared **anchor** nodes
+   (each appearing once in both walks, in a common order) and align only the segments between anchors.
+   This bounds cost on large bubbles and gives the same breakpoints for every haplotype, so identical
+   events merge cleanly. Each gap block becomes a **DEL** (reference-only nodes), **INS** (haplotype-only
+   nodes), **INV** (a haplotype run that is the reverse-complement node-walk of the reference run), or a
+   **substitution** (a co-located DEL + INS sharing one `EVENTID`).
+4. **Coalesce within a haplotype.** Merge consecutive same-type events whose gap is within
+   `--merge-distance-bp`, measured in **either** reference space **or** the haplotype's own sequence space
+   — the latter catches events split on the reference by an intervening deletion but contiguous in the
+   sample.
+5. **Merge across haplotypes.** Cluster equivalent events by **transitive single-linkage** (connected
+   components), keeping events down to `--rescue-min-bp`. Two events link when they share a type, fall in
+   a **position window** (`--merge-distance-bp` widened by the smaller event's size, so a breakpoint that
+   floats across haplotypes still merges), and either overlap in **node set** (length-weighted Jaccard
+   `≥ --merge-jaccard`) **or** in **sequence** (identity `≥ --merge-seq-identity`, comparing only sizes
+   whose shorter/longer ratio clears `--merge-size-ratio`). Connected components make the merge transitive
+   and order-independent — A–B–C collapse into one record even when A and C never match directly. The
+   largest member represents the record, and the evidence that joined the members is reported in
+   `MERGE_JACCARD` / `MERGE_SEQID` / `MERGE_SIZE_RATIO`. Copy-number records merge separately, on shared
+   `REP` node identity.
+6. **Force-call, then filter.** Re-test every non-carrier haplotype at each record against its own diff
+   and add it as a carrier when it matches — so a sub-threshold event in one haplotype is genotyped `1`
+   when a larger matching event is called elsewhere, instead of `0`. One pass suffices (the representative
+   is fixed). Finally keep records whose representative reaches `--min-sv-bp` and whose carrier count
+   reaches `--min-haplotypes`.
 
 ## Example
 
-No external tools (`odgi`/`vg`) are needed: `bubble` and `panphorte` sort and snarl internally. Tandem
-normalization with `panphorte --reference-path` repositions the appended REP nodes along the reference
-(so `numeric node id == reference order` again) and re-snarls, emitting a call-ready graph + bubbles.
-
 ```bash
-# 1. sites on the raw graph (internal sort + cactus snarls)
-panvar bubble -i graph.gfa --reference-path grch38 -o out/bubble
-
-# 2. normalize tandems + internally re-sort + re-snarl (writes normalized.sorted.gfa + bubbles.csv)
-panvar panphorte -i out/bubble.sorted.gfa --bubble-prefix-in out/bubble \
-  --reference-path grch38 -o out/panphorte --min-similarity 0.90
-
-# 3. call structural variants on the panphorte sorted output
-panvar call \
-  -i out/panphorte.normalized.sorted.gfa \
-  --bubble-prefix-in out/panphorte \
-  --reference-path grch38 \
-  -o out/call \
-  --merge-distance-bp 100 --merge-jaccard 0.80 --classify-ins
+./build/panvar call \
+  -i tests/results/lpa/panphorte/panphorte.normalized.sorted.gfa \
+  --bubble-prefix-in tests/results/lpa/panphorte/panphorte \
+  --reference-path grch38_1 \
+  -o tests/results/lpa/call/call \
+  --merge-distance-bp 100 --merge-jaccard 0.80 --classify-ins \
+  --min-maf 0.05 \
+  --cn-from-multiplicity --cn-from-coverage
 ```

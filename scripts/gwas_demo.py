@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
-"""k-mer GWAS harness comparing PRESENCE/ABSENCE vs COUNT (multiplicity) association.
+"""Pangenome association harness: PRESENCE/ABSENCE vs COUNT (multiplicity) on one feature substrate.
 
-Reads panvar describe's pooled `fsm_kmers.txt.gz` (SEQ | strain:count ...) and a phenotype
-table, and tests each discriminative k-mer two ways:
+Reads a panvar describe sample-level fsm file (`<feature> | sample:count ...`) and a phenotype
+table, and tests each discriminative feature two ways:
 
-  presence/absence : binarize count>0 (what pyseer / HAWK-free tools see)
-  count            : use the per-strain k-mer count = local copy number (HAWK-style)
+  presence/absence : binarize count>0  (what a presence/absence-based association method sees)
+  count            : use the per-sample feature count = local copy number (a count-based method)
 
-For a copy-number locus (e.g. LPA KIV-2) the unit k-mer is present in every sample, so the P/A
-test has no contrast and cannot find it, while the count test recovers it. Multiple testing is
-Benjamini-Hochberg (q) + Bonferroni. Optionally annotates each k-mer with its graph nodes
-(describe kmer_features.tsv.gz), a genomic position (call node_track.tsv) and the called variant
-(call variant_nodes.tsv) for a Manhattan plot and traceback.
+The substrate is chosen with --substrate:
+
+  kmer  : k-mer multiplicity (describe fsm_kmers.samples.txt.gz) -- the primary, tested layer
+  graph : node/edge dosage   (describe fsm_graph.samples.txt.gz) -- the complementary layer
+
+For a copy-number locus (e.g. a tandem repeat) the unit feature is present in every sample, so the
+presence/absence test has no contrast and cannot find it, while the count test recovers it. Multiple
+testing is Benjamini-Hochberg (q) + Bonferroni. Features are annotated with their graph node(s), a
+genomic position (call node_track.tsv) and the called variant (call variant_nodes.tsv) for a
+Manhattan plot and traceback.
 
 Outputs <out>.assoc.tsv and prints a summary. numpy + scipy only.
 """
@@ -30,21 +35,34 @@ def open_maybe_gz(path):
 
 
 def parse_fsm(path):
-    """fsm-lite: '<kmer> | strain:count strain:count ...' -> {kmer: {strain: count}}."""
+    """fsm-lite: '<feature> | strain:count strain:count ...' -> {feature: {strain: count}}."""
     out = {}
     with open_maybe_gz(path) as fh:
         for line in fh:
             if "|" not in line:
                 continue
             left, right = line.split("|", 1)
-            kmer = left.split()[0]
+            feature = left.split()[0]
             carriers = {}
             for tok in right.split():
                 s, _, c = tok.rpartition(":")
                 if s:
                     carriers[s] = float(c)
-            out[kmer] = carriers
+            out[feature] = carriers
     return out
+
+
+def feature_nodes(label, substrate, kn):
+    """Graph node id(s) backing a feature, for position/variant annotation.
+
+    kmer  : look up the decoded k-mer in the describe feature map (kmer -> nodes).
+    graph : the feature label IS a graph coordinate -- a node id, or an 'a+>b+' edge key whose two
+            endpoints are the nodes (orientation stripped)."""
+    if substrate == "graph":
+        if ">" in label:
+            return [p.rstrip("+-") for p in label.split(">") if p]
+        return [label.rstrip("+-")]
+    return sorted(kn.get(label, set()), key=lambda x: (len(x), x))
 
 
 def parse_phenotypes(path, id_col, col):
@@ -137,6 +155,9 @@ def main():
     ap.add_argument("--id-col", default="sample",
                     help="phenotype id column matched to the fsm strain ids (default: sample)")
     ap.add_argument("--mode", choices=["continuous", "binary"], required=True)
+    ap.add_argument("--substrate", choices=["kmer", "graph"], default="kmer",
+                    help="feature type in --fsm: kmer (fsm_kmers.samples) or graph node/edge "
+                         "(fsm_graph.samples) (default: kmer)")
     ap.add_argument("--feature-map", help="glob for describe kmer_features.tsv.gz (traceback/position)")
     ap.add_argument("--node-track", help="call node_track.tsv (genomic position)")
     ap.add_argument("--variant-nodes", help="call variant_nodes.tsv (variant annotation)")
@@ -186,7 +207,7 @@ def main():
             g1, g0 = c[y == 1], c[y == 0]
             count_p = stats.mannwhitneyu(g1, g0, alternative="two-sided").pvalue if len(g1) and len(g0) else 1.0
 
-        nodes = sorted(kn.get(kmer, set()), key=lambda x: (len(x), x))
+        nodes = feature_nodes(kmer, args.substrate, kn)
         ps = [npos[nd] for nd in nodes if nd in npos]
         bub = next((nbub[nd] for nd in nodes if nd in nbub), ".")
         pos = float(np.median(ps)) if ps else bub_pos.get(bub, float("nan"))
@@ -220,7 +241,7 @@ def main():
     sig = lambda q: q < 0.05
     n_count = sum(sig(r[13]) for r in recs)
     n_pa = sum(sig(r[12]) for r in recs)
-    print(f"[{args.mode}] {m} testable k-mers | count q<0.05: {n_count} | P/A q<0.05: {n_pa}")
+    print(f"[{args.mode}/{args.substrate}] {m} testable features | count q<0.05: {n_count} | P/A q<0.05: {n_pa}")
     print("  top 5 by count:")
     for r in recs[:5]:
         print(f"    {r[0][:24]}.. nodes={r[4]} var={r[5]} count_q={r[13]:.2e} pa_q={r[12]:.2e} maxCN={r[7]:.0f} carriers={r[6]}/{n}")
