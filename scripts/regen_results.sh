@@ -75,21 +75,30 @@ run_region() {
     "$BIN" inspect -i "$cgfa" --bubble-prefix-in "$cpfx" --bubble-id "$bub" \
       --cluster --cluster-similarity 0.97 -o "$d/inspect/inspect" --quiet || true
   fi
-  # 6) plots (R; skipped if Rscript missing): node + edge coverage heatmaps (odgi-viz style, ordered by
-  #    walk cluster) and the SV map (called events painted on the bubble's nodes), all for the main bubble.
-  if have_r && [[ -n "${bub:-}" ]]; then
-    local ip="$d/inspect/inspect.bubble_${bub}"
-    local nc="$ip.node_counts.tsv" ec="$ip.edge_counts.tsv" nl="$ip.node_lengths.tsv" cl="$ip.clusters.tsv"
-    if [[ -f "$nc" ]]; then
-      "$RS" "$HERE/plot_node_coverage_heatmap.R" --table "$nc" --node-lengths "$nl" \
-        --cluster-by "$cl" --out "$d/plots/${region}_node_heatmap" >/dev/null 2>&1 || echo "  (node heatmap skipped)"
-      "$RS" "$HERE/plot_sv_map.R" --node-counts "$nc" --vcf "$d/call/call.region.vcf" \
-        --node-lengths "$nl" --cluster-by "$cl" --reference-path "$ref" \
-        --out "$d/plots/${region}_sv_map" >/dev/null 2>&1 || echo "  (plot_sv_map skipped)"
+  # 6) plots (R; skipped if Rscript missing). The headline is the whole-VCF variant map (oncoprint
+  #    style: haplotypes x called variants, grouped by bubble), which needs only the VCF. The per-bubble
+  #    node/edge coverage heatmaps + node-order SV map (odgi-viz style, ordered by walk cluster) give the
+  #    graph-structure view of the main event bubble.
+  if have_r; then
+    # whole-VCF variant map in BOTH orientations: default (haplotypes on Y) and flipped (variants on Y).
+    "$RS" "$HERE/plot_vcf_map.R" --vcf "$d/call/call.region.vcf" --reference-path "$ref" \
+      --title "$region variant map" --out "$d/plots/${region}_vcf_map" >/dev/null 2>&1 || echo "  (plot_vcf_map skipped)"
+    "$RS" "$HERE/plot_vcf_map.R" --vcf "$d/call/call.region.vcf" --reference-path "$ref" --flip \
+      --title "$region variant map" --out "$d/plots/${region}_vcf_map_flipped" >/dev/null 2>&1 || echo "  (plot_vcf_map flipped skipped)"
+    if [[ -n "${bub:-}" ]]; then
+      local ip="$d/inspect/inspect.bubble_${bub}"
+      local nc="$ip.node_counts.tsv" ec="$ip.edge_counts.tsv" nl="$ip.node_lengths.tsv" cl="$ip.clusters.tsv"
+      if [[ -f "$nc" ]]; then
+        "$RS" "$HERE/plot_node_coverage_heatmap.R" --table "$nc" --node-lengths "$nl" \
+          --cluster-by "$cl" --out "$d/plots/${region}_node_heatmap" >/dev/null 2>&1 || echo "  (node heatmap skipped)"
+        "$RS" "$HERE/plot_sv_map.R" --node-counts "$nc" --vcf "$d/call/call.region.vcf" \
+          --node-lengths "$nl" --cluster-by "$cl" --reference-path "$ref" \
+          --out "$d/plots/${region}_sv_map" >/dev/null 2>&1 || echo "  (plot_sv_map skipped)"
+      fi
+      [[ -f "$ec" ]] && { "$RS" "$HERE/plot_edge_coverage_heatmap.R" --table "$ec" --cluster-by "$cl" \
+        --out "$d/plots/${region}_edge_heatmap" >/dev/null 2>&1 || echo "  (edge heatmap skipped)"; }
     fi
-    [[ -f "$ec" ]] && { "$RS" "$HERE/plot_edge_coverage_heatmap.R" --table "$ec" --cluster-by "$cl" \
-      --out "$d/plots/${region}_edge_heatmap" >/dev/null 2>&1 || echo "  (edge heatmap skipped)"; }
-  elif ! have_r; then
+  else
     echo "  (R not found; skipping plots)"
   fi
   echo "[$region] done -> $d"

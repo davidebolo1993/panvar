@@ -140,6 +140,7 @@ struct Event {
     std::size_t size_bp = 0;          // |event| for min_sv filtering / SVLEN magnitude
     std::size_t ref_pos = 0;          // reference genomic position of the anchor (merge window)
     bool cn_peak = false;             // DUP from peak multiplicity (size_bp is the duplicated bp)
+    std::size_t ru_len = 0;           // DUP only: repeat-unit length in bp (RU_LEN; one copy)
 };
 
 // Spell a token run into sequence.
@@ -593,6 +594,7 @@ void call_variants(
         out << "##INFO=<ID=EVENT_NODES,Number=.,Type=String,Description=\"Variant node set\">\n";
         out << "##INFO=<ID=INS_SUBTYPE,Number=1,Type=String,Description=\"INS subtype: NOVEL or DUP (minimap2 refined)\">\n";
         out << "##INFO=<ID=REF_CN,Number=1,Type=Integer,Description=\"Reference copy number of the repeat unit (DUP)\">\n";
+        out << "##INFO=<ID=RU_LEN,Number=1,Type=Integer,Description=\"Repeat-unit length in bp, one copy (DUP)\">\n";
         out << "##INFO=<ID=NMERGED,Number=1,Type=Integer,Description=\"Haplotype carriers merged into this record\">\n";
         out << "##INFO=<ID=MERGE_JACCARD,Number=1,Type=Float,Description=\"Strongest node-set Jaccard that merged a member into this record (cross-haplotype merge evidence)\">\n";
         out << "##INFO=<ID=MERGE_SEQID,Number=1,Type=Float,Description=\"Strongest sequence identity that merged a member into this record, when the Jaccard gate did not decide it\">\n";
@@ -851,6 +853,7 @@ void call_variants(
                 mr.seed.ref_cn = ref_copies; mr.seed.alt_cn = ref_copies;
                 mr.seed.anchor_node = bubble.source;
                 mr.seed.size_bp = static_cast<std::size_t>(unit);
+                mr.seed.ru_len = static_cast<std::size_t>(unit);
                 mr.seed.cn_peak = true;
                 for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
                     if (!traverses.count(graph.paths[pi].name)) continue;
@@ -897,6 +900,7 @@ void call_variants(
                     mr.seed.ref_cn = rc; mr.seed.alt_cn = ac;
                     mr.seed.anchor_node = bubble.source;
                     mr.seed.size_bp = unit * delta;
+                    mr.seed.ru_len = unit;
                     merged.push_back(std::move(mr));
                     grp = &merged.back();
                 }
@@ -952,12 +956,14 @@ void call_variants(
                     mr.seed.ref_cn = ref_peak; mr.seed.alt_cn = ac_peak;
                     mr.seed.anchor_node = bubble.source;
                     mr.seed.size_bp = excess_bp;
+                    mr.seed.ru_len = excess_bp / (ac_peak - ref_peak);  // per-copy duplicated content
                     mr.seed.cn_peak = true;
                     merged.push_back(std::move(mr));
                     peak_grp = &merged.back();
                 } else if (ac_peak > peak_grp->seed.alt_cn) {
                     peak_grp->seed.alt_cn = ac_peak;
                     peak_grp->seed.size_bp = excess_bp;
+                    peak_grp->seed.ru_len = excess_bp / (ac_peak - ref_peak);
                 }
                 for (const std::string& m : alleles[ai].members) {
                     peak_grp->carriers.push_back(m);
@@ -1441,6 +1447,7 @@ void call_variants(
             for (std::size_t k = 0; k < ev_nodes.size(); ++k) { if (k) info << ','; info << ev_nodes[k]; }
             if (!e.link_id.empty()) info << ";EVENTID=bubble" << bubble.id << "_" << e.link_id;
             if (e.type == EvType::Dup) info << ";REF_CN=" << e.ref_cn;
+            if (e.type == EvType::Dup && e.ru_len > 0) info << ";RU_LEN=" << e.ru_len;
             if (e.type == EvType::Ins && !e.ins_subtype.empty()) info << ";INS_SUBTYPE=" << e.ins_subtype;
             if (!e.seq.empty() && e.seq.size() <= 20000) {
                 if (e.type == EvType::Ins) info << ";INSSEQ=" << e.seq;

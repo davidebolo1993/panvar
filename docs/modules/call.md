@@ -233,7 +233,8 @@ The VCFs are VCF 4.2. Samples are the **haplotypes** (every P/W path; haploid). 
   **`MERGE_SEQID`** (strongest sequence identity, when overlap did not decide it) and
   **`MERGE_SIZE_RATIO`** (smallest/largest merged member size) — all present only on records that actually
   merged ≥2 events; `EVENTID` (links a co-located DEL+INS substitution), `INS_SUBTYPE` (refined INS only),
-  `REF_CN` (DUP), `NALLELES` (multiallelic records from `--multiallelic-loci`), and the event sequence
+  `REF_CN` and `RU_LEN` (DUP: reference copy number, and repeat-unit length in bp for one copy),
+  `NALLELES` (multiallelic records from `--multiallelic-loci`), and the event sequence
   (`INSSEQ`/`DELSEQ`/`INVSEQ`, omitted when very long). `EVENT_NODES` is **deduplicated and ordered**
   (reference nodes by genomic position, haplotype-only nodes after them in walk order), so
   `START_NODE`→`END_NODE` reads as a coherent progression; the full per-carrier node walk lives in
@@ -244,7 +245,42 @@ The VCFs are VCF 4.2. Samples are the **haplotypes** (every P/W path; haploid). 
 
 ## Plotting
 
-`scripts/plot_sv_map.R` draws a **node-level structural-variant map** in the same `odgi viz` style as the
+### Whole-VCF variant map (`scripts/plot_vcf_map.R`)
+
+The headline figure is a single **oncoprint-style map of the entire VCF**: rows = haplotypes,
+**columns = the called variants grouped by bubble** (one facet per bubble, each column labelled by its
+variant ID), each cell colored by the **called event** the haplotype carries at that variant. It reads
+like the VCF itself rather than like the graph, so it is the at-a-glance answer to "what did `call`
+find, and who carries it?".
+
+Cell colors: grey = reference-like (haplotype does not carry the variant); **DEL** red, **INS-NOVEL**
+green, **INS-DUP** purple, **INV** orange, **multiallelic** teal (shaded by allele index). A **DUP** is
+shaded **blue by the haplotype's absolute copy number** (`FORMAT:CN`) for **every** haplotype — loss
+(light) / reference (mid) / gain (dark) — so the DUP column reads as a copy-number gradient. Rows are
+sorted oncoprint-style so haplotypes with the same event pattern group together (event-free haplotypes
+are dropped); `--reference-path NAME` pins that haplotype on top. It needs only the `call` VCF.
+
+```bash
+Rscript scripts/plot_vcf_map.R \
+  --vcf results/real_data/c4/call/call.region.vcf \
+  --reference-path grch38 \
+  --title "c4 variant map" \
+  --out results/real_data/c4/plots/c4_vcf_map
+```
+
+Optional row controls mirror the coverage heatmaps: `--clusters <...clusters.tsv>` keeps only the cluster
+**representative** rows, `--cluster-by <...clusters.tsv>` groups/orders rows by walk cluster (a thin
+separator between clusters), and `--max-paths N` caps the row count. Two layout flags: `--flip` transposes
+the map (variants on Y, haplotypes on X, legend at the bottom); `--scale` draws each variant's rectangle
+**proportional to its size** along the variant axis — `|SVLEN|` for DEL/INS/INV/multiallelic, and the
+repeat-unit length `RU_LEN` (one copy) for a DUP, so a high-copy DUP is sized by its unit rather than
+ballooning with copy number (`--scale-transform raw|sqrt|log1p`, default `sqrt`). `RU_LEN` is a new DUP
+INFO field carrying the exact repeat-unit bp `call` computes (e.g. LPA KIV-2 = 5547 bp).
+
+### Node-level SV map (`scripts/plot_sv_map.R`)
+
+For the **graph-structure** view of a single bubble, `scripts/plot_sv_map.R` draws a **node-level
+structural-variant map** in the same `odgi viz` style as the
 `inspect` node/edge-coverage heatmaps: rows = haplotypes, **columns = the bubble's internal nodes in
 reference-sorted order** (the same node set and order as the `inspect` `node_counts.tsv` columns), each
 cell colored by the **called event** the haplotype carries on that node. Because each event is painted
