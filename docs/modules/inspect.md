@@ -160,29 +160,29 @@ Use the **sorted GFA from `bubble`** (its node ids match the bubble CSV).
 
 ```bash
 ./build/panvar inspect \
-  -i tests/results/lpa/bubble/bubble.sorted.gfa \
-  --bubble-prefix-in tests/results/lpa/bubble/bubble \
+  -i results/real_data/lpa/bubble/bubble.sorted.gfa \
+  --bubble-prefix-in results/real_data/lpa/bubble/bubble \
   --bubble-id 7 \
-  -o tests/results/lpa/inspect/inspect \
+  -o results/real_data/lpa/inspect/inspect \
   --cluster \
   --cluster-similarity 0.97
 ```
 
 This writes:
 
-- `tests/results/lpa/inspect/inspect.bubble_7.paths.fa.gz`
-- `tests/results/lpa/inspect/inspect.bubble_7.node_counts.tsv`
-- `tests/results/lpa/inspect/inspect.bubble_7.edge_counts.tsv`
-- `tests/results/lpa/inspect/inspect.bubble_7.clusters.tsv`
+- `results/real_data/lpa/inspect/inspect.bubble_7.paths.fa.gz`
+- `results/real_data/lpa/inspect/inspect.bubble_7.node_counts.tsv`
+- `results/real_data/lpa/inspect/inspect.bubble_7.edge_counts.tsv`
+- `results/real_data/lpa/inspect/inspect.bubble_7.clusters.tsv`
 
 To inspect all bubbles, drop `--bubble-id`; `inspect` writes one FASTA/table set per bubble
 (`inspect.bubble_1.*`, `inspect.bubble_2.*`, …):
 
 ```bash
 ./build/panvar inspect \
-  -i tests/results/lpa/bubble/bubble.sorted.gfa \
-  --bubble-prefix-in tests/results/lpa/bubble/bubble \
-  -o tests/results/lpa/inspect/inspect
+  -i results/real_data/lpa/bubble/bubble.sorted.gfa \
+  --bubble-prefix-in results/real_data/lpa/bubble/bubble \
+  -o results/real_data/lpa/inspect/inspect
 ```
 
 
@@ -198,14 +198,14 @@ Example:
 
 ```bash
 Rscript scripts/plot_node_coverage_heatmap.R \
-  --table tests/results/lpa/inspect/inspect.bubble_7.node_counts.tsv \
-  --out tests/results/lpa/inspect/inspect.bubble_7.node_coverage
+  --table results/real_data/lpa/inspect/inspect.bubble_7.node_counts.tsv \
+  --out results/real_data/lpa/inspect/inspect.bubble_7.node_coverage
 ```
 
 This writes:
 
-- `tests/results/lpa/inspect/inspect.bubble_7.node_coverage.png`
-- `tests/results/lpa/inspect/inspect.bubble_7.node_coverage.pdf`
+- `results/real_data/lpa/inspect/inspect.bubble_7.node_coverage.png`
+- `results/real_data/lpa/inspect/inspect.bubble_7.node_coverage.pdf`
 
 
 To scale the x-axis by node length (thin tiles for SNP-sized nodes, wide tiles for long nodes) while
@@ -213,9 +213,9 @@ keeping the column order, pass the node-length sidecar:
 
 ```bash
 Rscript scripts/plot_node_coverage_heatmap.R \
-  --table tests/results/lpa/inspect/inspect.bubble_7.node_counts.tsv \
-  --out tests/results/lpa/inspect/inspect.bubble_7.node_coverage \
-  --node-lengths tests/results/lpa/inspect/inspect.bubble_7.node_lengths.tsv
+  --table results/real_data/lpa/inspect/inspect.bubble_7.node_counts.tsv \
+  --out results/real_data/lpa/inspect/inspect.bubble_7.node_coverage \
+  --node-lengths results/real_data/lpa/inspect/inspect.bubble_7.node_lengths.tsv
 ```
 
 The `--cluster` output (`clusters.tsv`) can drive the heatmap in two ways. To plot **only the cluster
@@ -223,21 +223,21 @@ representatives** (one row per cluster), use `--clusters`:
 
 ```bash
 Rscript scripts/plot_node_coverage_heatmap.R \
-  --table tests/results/lpa/inspect/inspect.bubble_7.node_counts.tsv \
-  --out tests/results/lpa/inspect/inspect.bubble_7.node_coverage
-  --node-lengths tests/results/lpa/inspect/inspect.bubble_7.node_lengths.tsv \
-  --clusters tests/results/lpa/inspect/inspect.bubble_7.clusters.tsv 
+  --table results/real_data/lpa/inspect/inspect.bubble_7.node_counts.tsv \
+  --out results/real_data/lpa/inspect/inspect.bubble_7.node_coverage
+  --node-lengths results/real_data/lpa/inspect/inspect.bubble_7.node_lengths.tsv \
+  --clusters results/real_data/lpa/inspect/inspect.bubble_7.clusters.tsv 
 ```
 
 To **group/order the rows by cluster** (representative first, with a thin separator line between clusters), use `--cluster-by` instead:
 
 ```bash
 Rscript scripts/plot_node_coverage_heatmap.R \
-  --table tests/results/lpa/inspect/inspect.bubble_7.node_counts.tsv \
-  --out tests/results/lpa/inspect/inspect.bubble_7.node_coverage \
-  --node-lengths tests/results/lpa/inspect/inspect.bubble_7.node_lengths.tsv \
-  --clusters tests/results/lpa/inspect/inspect.bubble_7.clusters.tsv \
-  --cluster-by tests/results/lpa/inspect/inspect.bubble_7.clusters.tsv
+  --table results/real_data/lpa/inspect/inspect.bubble_7.node_counts.tsv \
+  --out results/real_data/lpa/inspect/inspect.bubble_7.node_coverage \
+  --node-lengths results/real_data/lpa/inspect/inspect.bubble_7.node_lengths.tsv \
+  --clusters results/real_data/lpa/inspect/inspect.bubble_7.clusters.tsv \
+  --cluster-by results/real_data/lpa/inspect/inspect.bubble_7.clusters.tsv
 ```
 
 `--cluster-by` overrides the coverage-profile `--cluster-rows` ordering (rows follow the inspect
@@ -262,8 +262,8 @@ dependency and the same interface as the node heatmap, minus `--value` (edge cel
 
 ```bash
 Rscript scripts/plot_edge_coverage_heatmap.R \
-  --table tests/results/lpa/inspect/inspect.bubble_7.edge_counts.tsv \
-  --out tests/results/lpa/inspect/inspect.bubble_7.edge_coverage \
-  --clusters tests/results/lpa/inspect/inspect.bubble_7.clusters.tsv \
-  --cluster-by tests/results/lpa/inspect/inspect.bubble_7.clusters.tsv
+  --table results/real_data/lpa/inspect/inspect.bubble_7.edge_counts.tsv \
+  --out results/real_data/lpa/inspect/inspect.bubble_7.edge_coverage \
+  --clusters results/real_data/lpa/inspect/inspect.bubble_7.clusters.tsv \
+  --cluster-by results/real_data/lpa/inspect/inspect.bubble_7.clusters.tsv
 ```

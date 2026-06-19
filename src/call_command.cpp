@@ -51,6 +51,7 @@ void print_call_help() {
         << "      --bubble-id <N>              Restrict to one bubble ID (repeatable)\n"
         << "      --no-per-bubble-vcf          Only write the concatenated region VCF\n"
         << "      --no-variant-paths           Skip the variant_paths.tsv + node_track.tsv sidecars\n"
+        << "      --threads <N>                Worker threads for the per-bubble loop (0 = auto)\n"
         << "  -q, --quiet                      Disable progress logs\n"
         << "  -h, --help                       Show this help\n";
 }
@@ -182,6 +183,10 @@ int run_call_command(const std::vector<std::string>& args) {
         }
         if (arg == "--no-variant-paths") {
             options.write_variant_paths = false;
+            continue;
+        }
+        if (arg == "--threads") {
+            options.threads = cli::parse_size_arg(arg, require_value(arg));
             continue;
         }
         if (arg == "-q" || arg == "--quiet") {

@@ -329,9 +329,9 @@ The implementation streams per bubble: one discovery pass finds retained feature
 ```bash
 # whole graph, default closed-syncmer markers (k = 31), on the panphorte-normalized graph
 ./build/panvar describe \
-  -i tests/results/lpa/panphorte/panphorte.normalized.sorted.gfa \
-  --bubble-prefix-in tests/results/lpa/panphorte/panphorte \
-  --out-dir tests/results/lpa/describe \
+  -i results/real_data/lpa/panphorte/panphorte.normalized.sorted.gfa \
+  --bubble-prefix-in results/real_data/lpa/panphorte/panphorte \
+  --out-dir results/real_data/lpa/describe \
   --kmer-size 31
 ```
 
@@ -340,22 +340,22 @@ context, and aggregate to per-sample dosage for both substrates:
 
 ```bash
 ./build/panvar describe \
-  -i tests/results/lpa/panphorte/panphorte.normalized.sorted.gfa \
-  --bubble-prefix-in tests/results/lpa/panphorte/panphorte \
-  --variant-nodes tests/results/lpa/call/call.variant_nodes.tsv \
+  -i results/real_data/lpa/panphorte/panphorte.normalized.sorted.gfa \
+  --bubble-prefix-in results/real_data/lpa/panphorte/panphorte \
+  --variant-nodes results/real_data/lpa/call/call.variant_nodes.tsv \
   --variant-flank-bp 50 \
-  --samples tests/results/lpa/gwas/samples.tsv \
-  --out-dir tests/results/lpa/describe
+  --samples results/real_data/lpa/gwas/samples.tsv \
+  --out-dir results/real_data/lpa/describe
 ```
 
 Exhaustive markers for fine-mapping one bubble:
 
 ```bash
 ./build/panvar describe \
-  -i tests/results/lpa/panphorte/panphorte.normalized.sorted.gfa \
-  --bubble-prefix-in tests/results/lpa/panphorte/panphorte \
+  -i results/real_data/lpa/panphorte/panphorte.normalized.sorted.gfa \
+  --bubble-prefix-in results/real_data/lpa/panphorte/panphorte \
   --bubble-id 7 \
-  --out-dir tests/results/lpa/describe \
+  --out-dir results/real_data/lpa/describe \
   --feature-mode all \
   --kmer-size 21 \
   --max-wide-features 0

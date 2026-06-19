@@ -11,7 +11,9 @@
 #   white  = haplotype does not traverse the node (count 0, no event)
 #   grey   = traverses the node, reference-like (no event here)
 #   DEL red / INS-NOVEL green / INS-DUP purple / INV orange
-#   DUP blue (shaded by per-node multiplicity = local copy count) / multiallelic teal (allele index)
+#   DUP blue, shaded by the haplotype's ABSOLUTE copy number (VCF FORMAT:CN) -- painted on the REP node
+#       for a self-loop DUP, or across the whole traversed module for a coverage DUP; losses included
+#   multiallelic teal (allele index)
 #
 # Inputs (one bubble):
 #   --node-counts <path>  inspect <prefix>.bubble_<N>.node_counts.tsv   (required; substrate + order)
@@ -128,8 +130,10 @@ for (ln in recs) {
   enodes <- if (is.na(enodes)) character() else strsplit(enodes, ",")[[1]]
   gt <- sub(":.*$", "", f[-(1:9)])
   cn <- suppressWarnings(as.integer(sub("^[^:]*:", "", f[-(1:9)])))
+  ref_cn <- suppressWarnings(as.integer(info_get(info, "REF_CN")))
   V[[length(V) + 1]] <- list(id = f[3], svt = svt, sub = info_get(info, "INS_SUBTYPE"),
-                             nodes = enodes, gt = setNames(gt, vcf_samples), cn = setNames(cn, vcf_samples))
+                             nodes = enodes, ref_cn = ref_cn,
+                             gt = setNames(gt, vcf_samples), cn = setNames(cn, vcf_samples))
 }
 if (length(V) == 0) stop("no VCF records for this bubble (check --bubble-id)")
 
@@ -155,30 +159,41 @@ nodes <- colnames(mat)
 paths <- rownames(mat)
 node_idx <- setNames(seq_along(nodes), nodes)
 
-# ---- category + value per cell: start from coverage (none/ref), overlay events on carriers ----
-# A DUP is encoded with a single representative node, so painting only EVENT_NODES would render
-# it as one invisible column. Instead a DUP carrier's traversed nodes are shaded by per-node
-# traversal multiplicity (the LOCAL copy count). On a panphorte-normalized graph the repeat-unit
-# (REP) node's multiplicity equals the carrier's called CN, so the copy number reads as a strong
-# band exactly at that node while single-traversal nodes stay light -- keeping the signal
-# localized instead of washing a flat CN across the whole row. DEL/INS/INV/MULTI keep their
-# specific EVENT_NODES and are painted AFTER, on top of the DUP background.
+# ---- category + value per cell: start from coverage (none/ref), overlay the called CN / events ----
+# A DUP is shaded by the haplotype's ABSOLUTE copy number (the VCF FORMAT:CN), for EVERY haplotype that
+# traverses the locus -- not just gain/loss carriers -- so losses (CN < REF_CN), reference (CN = REF_CN)
+# and gains (CN > REF_CN) all read as a sequential shade. Two cases, by how the DUP is encoded:
+#   * REP / self-loop DUP: EVENT_NODES is a real inside node (the repeat unit), so the CN is painted on
+#     that column -- one clean copy-number strip (e.g. LPA KIV-2 at the REP node).
+#   * whole-module coverage DUP: the event node is the bubble boundary (not an inside column), so the CN
+#     is painted across every inside node the haplotype traverses -- the whole module row takes one CN
+#     shade, so C4/CYP2D6 copy number reads as horizontal bands.
+# DEL/INS/INV/MULTI keep their specific EVENT_NODES and are painted AFTER, on top of the DUP background.
 cat_mat <- ifelse(mat > 0, "ref", "none")            # paths x nodes
-val_mat <- matrix(NA_real_, nrow(mat), ncol(mat), dimnames = dimnames(mat))  # per-node multiplicity / allele index
+val_mat <- matrix(NA_real_, nrow(mat), ncol(mat), dimnames = dimnames(mat))  # called CN / allele index
 dup_max <- 1; multi_max <- 1
+ref_cn_seen <- NA_integer_
+# carriers (gain/loss, GT=1) -- used only for the DEL/INS/INV layer below
 carriers_of <- function(r) intersect(names(r$gt)[!is.na(r$gt) & r$gt != "." & r$gt != "0" & r$gt != "0/0"], paths)
+# every haplotype that has a CN at this record (carriers explicit, reference-like = REF_CN)
+cn_haps_of <- function(r) intersect(names(r$cn)[!is.na(r$cn)], paths)
 
-# pass 1: DUP background -- a carrier's traversed nodes shaded by per-node traversal multiplicity.
-# Guard: only a DUP whose representative node belongs to this bubble paints here.
+# pass 1: DUP background -- shade by absolute CN (VCF), every CN-bearing haplotype.
 for (r in V) {
   if (r$svt != "DUP") next
-  if (length(intersect(r$nodes, nodes)) == 0) next
-  for (s in carriers_of(r)) {
+  cols_event <- node_idx[intersect(r$nodes, nodes)]   # REP / self-loop node columns, if any
+  for (s in cn_haps_of(r)) {
     ri <- match(s, paths)
-    for (ci in seq_len(ncol(mat))) {
-      if (mat[ri, ci] > 0) { cat_mat[ri, ci] <- "DUP"; val_mat[ri, ci] <- mat[ri, ci]; dup_max <- max(dup_max, mat[ri, ci]) }
+    cn <- r$cn[[s]]; if (is.na(cn)) next
+    if (length(cols_event) > 0) {
+      cols_here <- cols_event                          # REP DUP: the repeat-unit column(s)
+    } else {
+      cols_here <- which(mat[ri, ] > 0)                # coverage DUP: the whole traversed module
     }
+    for (ci in cols_here) { cat_mat[ri, ci] <- "DUP"; val_mat[ri, ci] <- cn }
+    if (cn > dup_max) dup_max <- cn
   }
+  if (is.na(ref_cn_seen) && !is.na(r$ref_cn)) ref_cn_seen <- r$ref_cn
 }
 # pass 2: DEL/INS/INV/MULTI on their specific EVENT_NODES (override the DUP background)
 for (r in V) {
@@ -274,8 +289,9 @@ p <- ggplot2::ggplot(df) +
   ggplot2::scale_x_continuous(breaks = x_breaks, labels = nodes[xt], expand = c(0, 0)) +
   ggplot2::scale_y_continuous(breaks = n_paths - yt + 1, labels = paths[yt], expand = c(0, 0)) +
   ggplot2::labs(title = "Structural-variant map (haplotypes x bubble nodes)",
-                subtitle = sprintf("%d haplotypes x %d nodes%s%s", n_paths, n_nodes,
+                subtitle = sprintf("%d haplotypes x %d nodes%s%s%s", n_paths, n_nodes,
                                    if (use_length) " (x scaled by node bp)" else "",
+                                   if (!is.na(ref_cn_seen)) sprintf("; DUP shade = absolute CN (REF_CN=%d)", ref_cn_seen) else "",
                                    if (!is.na(ref_row)) sprintf("; reference '%s' on top", ref_row) else ""),
                 x = if (use_length) "Bubble nodes (reference-sorted; width = bp)" else "Bubble nodes (reference-sorted)",
                 y = "Haplotypes") +
@@ -294,7 +310,7 @@ if (length(cluster_boundaries) > 0) {
 # manual SV color legend
 legend_levels <- c("not traversed" = COL[["none"]], "reference-like" = COL[["ref"]],
                    "DEL" = COL[["DEL"]], "INV" = COL[["INV"]], "INS/NOVEL" = COL[["INS_NOVEL"]],
-                   "INS/DUP" = COL[["INS_DUP"]], "DUP (shade=local copies)" = dup_ramp(3)[3],
+                   "INS/DUP" = COL[["INS_DUP"]], "DUP (shade=absolute CN)" = dup_ramp(3)[3],
                    "multiallelic" = multi_ramp(3)[3])
 leg <- data.frame(lab = factor(names(legend_levels), levels = names(legend_levels)), x = NA_real_, y = NA_real_)
 p <- p + ggplot2::geom_point(data = leg, ggplot2::aes(x = x, y = y, shape = lab), na.rm = TRUE) +

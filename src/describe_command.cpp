@@ -59,6 +59,7 @@ void print_describe_help() {
         << "      --samples <tsv>              cosigt sample->haplotype-path table; also writes a\n"
         << "                                   sample-level fsm_kmers.samples.txt.gz (summed dosage)\n"
         << "      --no-pyseer                  Do not write the pooled fsm_kmers.txt.gz (pyseer --kmers)\n"
+        << "      --threads <N>                Worker threads for the per-bubble loop (0 = auto)\n"
         << "  -q, --quiet                      Disable the progress bar\n"
         << "  -h, --help                       Show this help\n";
 }
@@ -153,6 +154,10 @@ int run_describe_command(const std::vector<std::string>& args) {
         }
         if (arg == "--no-pyseer") {
             options.pyseer = false;
+            continue;
+        }
+        if (arg == "--threads") {
+            options.threads = cli::parse_size_arg(arg, require_value(arg));
             continue;
         }
         if (arg == "-q" || arg == "--quiet") {

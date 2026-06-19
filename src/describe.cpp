@@ -5,6 +5,7 @@
 #include "panvar/gfa.hpp"
 #include "panvar/graph_utils.hpp"
 #include "panvar/output.hpp"
+#include "panvar/parallel.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -1559,18 +1560,40 @@ void describe_kmers_from_graph(
     const bool want_graph_pool = !options.samples_path.empty();
     cli::ProgressBar progress(options.quiet ? "" : "Describing bubbles", to_process.size());
 
-    for (const Bubble* bubble_ptr : to_process) {
-        const Bubble& bubble = *bubble_ptr;
-        progress.tick();
+    // Process bubbles in parallel: describe_one_bubble writes its own per-bubble files (independent
+    // paths) and accumulates into THREAD-LOCAL pools here; the pools and the index rows are merged
+    // back in bubble order on the main thread, so the output is byte-identical to a single-thread run.
+    std::vector<BubbleDescribeResult> results(to_process.size());
+    std::vector<PyseerPool> task_pyseer(options.pyseer ? to_process.size() : 0);
+    std::vector<GraphPool> task_graph(want_graph_pool ? to_process.size() : 0);
+    run_parallel(to_process.size(), options.threads, [&](std::size_t bi) {
+        const Bubble& bubble = *to_process[bi];
         const std::unordered_set<std::string>* vnodes = nullptr;
         if (variant_mode) {
             const auto it = variant_nodes_by_bubble.find(bubble.id);
             if (it != variant_nodes_by_bubble.end()) vnodes = &it->second;
         }
-        BubbleDescribeResult result =
-            describe_one_bubble(options, graph, path_indexes, bubble, vnodes,
-                                options.pyseer ? &pyseer_pool : nullptr,
-                                want_graph_pool ? &graph_pool : nullptr);
+        results[bi] = describe_one_bubble(options, graph, path_indexes, bubble, vnodes,
+                                          options.pyseer ? &task_pyseer[bi] : nullptr,
+                                          want_graph_pool ? &task_graph[bi] : nullptr);
+    });
+
+    for (std::size_t bi = 0; bi < to_process.size(); ++bi) {
+        const Bubble& bubble = *to_process[bi];
+        progress.tick();
+        if (options.pyseer) {
+            for (auto& [code, carriers] : task_pyseer[bi]) {
+                auto& dst = pyseer_pool[code];
+                for (const auto& [path, c] : carriers) dst[path] += c;
+            }
+        }
+        if (want_graph_pool) {
+            for (auto& [feature, carriers] : task_graph[bi]) {
+                auto& dst = graph_pool[feature];
+                for (const auto& [path, c] : carriers) dst[path] += c;
+            }
+        }
+        const BubbleDescribeResult& result = results[bi];
         ++summary.bubbles_processed;
         if (result.paths > 0) {
             ++summary.bubbles_with_paths;

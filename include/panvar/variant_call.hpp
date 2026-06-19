@@ -35,6 +35,8 @@ struct VariantCallOptions {
     std::vector<std::size_t> bubble_ids; // if non-empty, restrict to these bubbles
     bool write_per_bubble_vcf = true;    // also keep each <prefix>.bubble_<id>.vcf
     bool write_variant_paths = true;     // write <prefix>.variant_paths.tsv (per-variant carrier sub-walks)
+    std::size_t threads = 0;             // worker threads for the per-bubble loop (0 = auto); output is
+                                         // identical regardless of thread count
     bool quiet = false;
 };
 

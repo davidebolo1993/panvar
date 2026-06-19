@@ -396,22 +396,26 @@ sample hY walks REP 2×   → CN = 2   (one copy lost)
 (e.g. CYP2D6 / CYP2D7) are folded onto the **same shared nodes**, so a path carrying both genes walks
 those nodes more than once — including the reference. We can't spot a *loss* from any single node (a
 deleted copy needn't touch the busiest one), so we measure **total sequence** and divide by one copy.
-The size of one copy is calibrated from the reference itself:
+The bp are summed over the **full walk** — the widest source→sink span with every repeated traversal
+counted (a node visited twice contributes its length twice). This is essential: the ordinary
+minimal-span walk visits each distinct node once and so collapses the folded copies, flattening every
+haplotype to the same bp. The size of one copy is calibrated from the reference itself:
 
 ```text
-reference spells 10,000 bp through the bubble, folding ref_fold = 2× over the shared nodes
+reference spells 10,000 bp over its FULL walk, folding ref_fold = 2× over the shared nodes
   unit (one copy) = ref_spelled_bp / ref_fold = 10,000 / 2 = 5,000 bp
   REF_CN          = ref_fold                                = 2
 
-per haplotype:  copies ≈ (bp it spells through the bubble) / unit
+per haplotype:  copies ≈ (bp it spells over the FULL walk) / unit
   hapA spells 15,000 bp  → 15,000 / 5,000 = 3   → CN = 3   (gain)
   hapB spells  5,000 bp  →  5,000 / 5,000 = 1   → CN = 1   (loss)
   hapC spells 10,000 bp  → 10,000 / 5,000 = 2   → CN = 2   (reference-like)
 ```
 
-Because it uses *all* the traversed sequence, it recovers losses and gains alike. It reports the
-**total module** count (2D6 + 2D7 together), not which paralog is which. When it fires it replaces that
-bubble's folded walk-diff with this single CN record.
+Because it uses *all* the traversed sequence, it recovers losses and gains alike, and the reported `CN` is
+the haplotype's **absolute** module count (the reference only sets the unit-bp denominator). It reports the
+**total module** count (2D6 + 2D7 together), not which paralog is which. When it fires it is the authority
+for that bubble — the self-loop and walk-diff paths are skipped.
 
 **(c) folded single extra copy, reference does not fold (`--cn-from-multiplicity`).** Here the reference
 is single-copy — every node visited once (`ref_peak = 1`). A haplotype carrying an **extra** copy folds

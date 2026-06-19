@@ -2,7 +2,7 @@
 
 ## Data
 
-- `real_data/`: bundled small example dataset (C4: `c4.gfa`, `c4.snarls.jsonl`)
+- `real_data/`: bundled small example dataset (C4: `c4.gfa.gz`, `c4.snarls.jsonl`)
 - `results/`: local outputs (kept out of git except `.gitkeep`)
 
 ## Smoke Tests
@@ -25,5 +25,5 @@ Run either directly:
 
 ```bash
 tests/synthetic_smoke.sh ./build/panvar tests/synthetic_data /tmp/panvar_smoke
-tests/real_smoke.sh ./build/panvar tests/real_data/c4.gfa /tmp/panvar_smoke_c4
+tests/real_smoke.sh ./build/panvar tests/real_data/c4.gfa.gz /tmp/panvar_smoke_c4
 ```

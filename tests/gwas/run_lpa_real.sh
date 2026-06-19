@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# LPA pangenome-association demo on the real LPA graph (tests/real_data/lpa.gfa).
+# LPA pangenome-association demo on the real LPA graph (tests/real_data/lpa.gfa.gz).
 #
 # Pipeline: bubble -> panphorte -> call -> describe --samples -> association. KIV-2 copy number is
 # read per real haplotype from panphorte; real haplotypes are paired into diploid samples with a
@@ -22,16 +22,18 @@ PY="${3:-python3}"
 RS="${4:-Rscript}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
-GFA="$REPO/tests/real_data/lpa.gfa"
-SNARLS="$REPO/tests/real_data/lpa.snarls.jsonl"
+GFA="$REPO/tests/real_data/lpa.gfa.gz"
 REAL="$OUT_DIR/real"
 mkdir -p "$OUT_DIR" "$REAL"
-REF="$(awk -F'\t' '($1=="P"||$1=="W")&&!f{print $2;f=1}' "$GFA")"
+# Prefer a GRCh38 path as the reference (else the first path). awk reads all input (no early exit, so
+# no SIGPIPE under `set -o pipefail`).
+REF="$(gzcat "$GFA" | awk -F'\t' '($1=="P"||$1=="W"){n=$2; if(g==""&&n~/[Gg][Rr][Cc]h38/)g=n; if(f=="")f=n} END{print (g!=""?g:f)}')"
 echo "reference path: $REF"
 
 echo "== bubble -> panphorte (KIV-2 copies, normalized+sorted graph) =="
-"$PANVAR_BIN" bubble    -i "$GFA" -o "$OUT_DIR/bub" --snarls-in "$SNARLS" --quiet >/dev/null
-"$PANVAR_BIN" panphorte -i "$GFA" --bubble-prefix-in "$OUT_DIR/bub" -o "$OUT_DIR/pan" \
+"$PANVAR_BIN" bubble    -i "$GFA" -o "$OUT_DIR/bub" -r "$REF" --quiet >/dev/null
+SGFA="$OUT_DIR/bub.sorted.gfa"
+"$PANVAR_BIN" panphorte -i "$SGFA" --bubble-prefix-in "$OUT_DIR/bub" -o "$OUT_DIR/pan" \
   --reference-path "$REF" --min-similarity 0.90 --quiet >/dev/null
 PGFA="$OUT_DIR/pan.normalized.sorted.gfa"   # panphorte graph: the input for call + describe
 "$PY" "$HERE/make_lpa_phenotype.py" "$OUT_DIR/pan.panphorte.copies.tsv" "$REAL" 200
@@ -59,6 +61,13 @@ for sub in kmer graph; do
       --out "$OUT_DIR/plot_${sub}_${m}" --x nodes --title "LPA ($sub, $m)" >/dev/null \
       || echo "  (plot skipped: ggplot2?)"
   done
+  # one faceted figure per substrate: continuous vs binary x count vs presence/absence, so the
+  # stronger-association trait/test reads off the peak heights at a glance.
+  label="k-mer"; [ "$sub" = graph ] && label="graph (node/edge)"
+  "$RS" "$REPO/scripts/plot_gwas_compare.R" --x nodes --title "LPA $label" \
+    --assoc "continuous=$OUT_DIR/gwas_${sub}_continuous.assoc.tsv" \
+    --assoc "binary=$OUT_DIR/gwas_${sub}_binary.assoc.tsv" \
+    --out "$OUT_DIR/gwas_${sub}_compare" >/dev/null || echo "  (compare plot skipped: ggplot2?)"
 done
 
 echo "== sanity: COUNT recovers the KIV-2 locus that PRESENCE/ABSENCE misses =="

@@ -18,3 +18,6 @@ tests/results
 
 !tests/results/.gitkeep
 
+
+# Local regenerated results (scripts/regen_results.sh)
+results/

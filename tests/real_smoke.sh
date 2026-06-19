@@ -86,7 +86,7 @@ if [[ -n "${FIRST_BUBBLE_ID:-}" ]]; then
   test -s "$DESCRIBE_BUBBLE_DIR/kmer_features.tsv.gz"
   gzip -t "$DESCRIBE_BUBBLE_DIR/kmer_features.tsv.gz"
 fi
-test -s "$PANPHORTE_PREFIX.normalized.gfa"
+test -s "$PANPHORTE_PREFIX.normalized.sorted.gfa"   # reference given -> sorted graph (no plain .normalized.gfa)
 test -s "$PANPHORTE_PREFIX.panphorte.report.tsv"
 test -s "$CALL_PREFIX.region.vcf"
 test -s "$CALL_PREFIX.variant_paths.tsv"

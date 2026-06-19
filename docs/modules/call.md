@@ -30,8 +30,15 @@ two ways and writes a tidy multi-sample VCF:
    only accrue, this is a single pass. A merged record is
    reported only if its representative (largest member) reaches `--min-sv-bp`.
 
-Input is expected to be a **panphorte-normalized GFA**, so a tandem duplication is a single repeat-unit
-(`REP`) node traversed N times; copy number then falls straight out of the walk.
+Which graph to call on depends on the locus topology (see the copy-number section):
+
+- **Tandem-repeat regions** (e.g. LPA KIV-2): call on the **panphorte-normalized GFA**, so the variable
+  tandem is a single repeat-unit (`REP`) node traversed N times and copy number falls straight out of the
+  walk.
+- **PGGB-collapsed paralog clusters / CNV loci** (e.g. C4, CYP2D6, GSTM1): call on the **`bubble` sorted
+  GFA** (the unfolded graph). Here the copies live as **node multiplicity** on shared nodes;
+  `panphorte` folding would hide that signal, so it is *not* used as the call substrate for these — its
+  collapse never feeds their variant calling.
 
 ### Event types
 
@@ -44,9 +51,10 @@ Input is expected to be a **panphorte-normalized GFA**, so a tandem duplication 
   copy-number section below):
   - a `REP` node (self-loop) traversed a different number of times than the reference (panphorte's
     collapsed tandem arrays);
-  - with `--cn-from-coverage`, a **folded paralog cluster** the reference itself traverses ≥2× — copy
-    number is the total sequence each haplotype spells through the module divided by one copy's bp, so it
-    recovers losses as well as gains;
+  - with `--cn-from-coverage`, a **PGGB-collapsed paralog cluster** the reference itself traverses ≥2× —
+    copy number is the total sequence each haplotype spells over the **full bubble walk** divided by one
+    copy's bp, so it recovers losses as well as gains, and it counts copies that are collapsed onto shared
+    nodes (interleaved, not a contiguous tandem block);
   - with `--cn-from-multiplicity`, a **folded duplication panphorte left intact** (no self-loop) where the
     reference does *not* fold: a haplotype's **peak node-traversal multiplicity** exceeds the reference's
     peak. `SVLEN` is the duplicated content (Σ node_len × excess traversals); the peak (not per-node
@@ -114,27 +122,35 @@ double-count.
 **1. Clean tandem array → self-loop `DUP` (always on).** When `panphorte` collapsed an adjacent tandem
 into a `REP` self-loop, copy number is the exact loop count: a `DUP` record with `REF_CN` and per-sample
 `CN`. A **copy loss** is simply a sample whose `CN` is below `REF_CN`; a **gain** is one above it.
-If a carrier's haplotype **bypasses the `REP` node entirely** — `panphorte` did not fold its (often
-divergent) copies onto the shared self-loop — the raw loop count would read 0 even though the haplotype
-carries the locus. For such a carrier the `CN` is instead estimated from the sequence it actually spells
-through the bubble divided by the one-copy size (the same arithmetic as method 2, amortised over the
-reference), so a present haplotype reports ≥ 1 rather than a spurious 0; a haplotype that truly spells no
-interior sequence stays 0 (a genuine full deletion).
+`panphorte` folds **single copies** of the unit too (within a confirmed array), so a one-copy haplotype
+traverses the `REP` node once and reads `CN = 1` — not `0`. The only haplotype that reads `CN = 0` is one
+`panphorte` could not fold at all (its unit is too divergent to align to the consensus at
+`--min-similarity`); that is an honest "unresolved", not a deletion call.
 
-**2. Folded paralog cluster → total-module CN from coverage (`--cn-from-coverage`).** When paralogs are
-too similar to separate, the graph folds them onto shared nodes and the **reference itself** traverses
-the module two or more times. Peak multiplicity (method 3) can't help here — a copy loss need not touch
-the single busiest node — so copy number is read from how much sequence each haplotype spells through the
-bubble, normalised to the size of one copy:
+**2. PGGB-collapsed paralog cluster → total-module CN from coverage (`--cn-from-coverage`).** When PGGB
+collapses identical paralog copies (e.g. the C4 long-long / short-short RCCX modules, or CYP2D6/2D7/2D8P)
+onto **shared nodes**, the copies are carried as **node multiplicity** — a 2-copy haplotype re-traverses
+those nodes twice — not as a contiguous tandem block in the spelled sequence, and the **reference itself**
+traverses the module two or more times. Copy number is read from how much sequence each haplotype spells
+over the **full bubble walk**, normalised to one copy:
 
 ```text
-copies     ≈ (bp the haplotype spells through the bubble) / (one-copy bp)
-one-copy bp = (bp the reference spells through the bubble) / (times the reference folds over it)
+copies      ≈ (bp the haplotype spells over the FULL bubble walk) / (one-copy bp)
+one-copy bp  = (bp the reference spells over the full walk) / (times the reference folds over it)
 ```
 
-Because it uses *all* the traversed sequence, it recovers **losses** (fewer bp → fewer copies) as well
-as **gains**, monotonically. It reports the **total module** copy number, not a per-paralog count. When
-it fires for a bubble it replaces that bubble's (folded, unreliable) walk-diff with the single CN record.
+The **full walk** is the widest source→sink span with **all repeats included** — this is the crux. The
+ordinary (minimal-span) bubble walk covers each distinct inside node once and so collapses the repeated
+copies onto a single traversal, flattening every haplotype to the same bp; counting over the full span
+preserves multiplicity == copy number. Because it uses *all* the traversed sequence it recovers
+**losses** (fewer bp → fewer copies) as well as **gains**, monotonically, and works whether or not the
+collapse left a self-loop node. It reports the **total module** copy number, not a per-paralog count. When
+it fires for a bubble it is the **authority** for that bubble — the self-loop and walk-diff paths are
+skipped. The per-sample `CN` is written for **every** haplotype that traverses the module (its absolute
+module count), but `GT=1` (and therefore `AC`/`AF`) marks only the **carriers** — haplotypes whose count
+differs from `REF_CN` (a gain or a loss) — so a copy-invariant module is not emitted as a variant.
+Validated: C4 total CN 131/131 exact; CYP2D6 concordant against the collapsed D6+D7 truth (the residual
+misses carry an extra unannotated CYP2D8P / 2D7-hybrid module the gene BED does not count).
 
 **3. Single folded extra copy → peak-multiplicity `DUP` (`--cn-from-multiplicity`).** When an extra copy
 was folded onto shared nodes but the *reference* does **not** fold (1 or no copy), the carrier's peak
@@ -145,28 +161,30 @@ excesses only reflect which paralog is present). When this emits a `DUP`, the wa
 of the same copy — a "duplication insertion" carried by exactly the DUP's carriers, of comparable size —
 is **dropped**, so the event is reported once.
 
-**Precedence and composition.** Per bubble: (1) self-loop `DUP` if a `REP` self-loop exists; else
-(2) coverage CN if the reference folds; else (3) peak-multiplicity `DUP`. Passing both
-`--cn-from-coverage` and `--cn-from-multiplicity` is safe and gives the widest recall — they *compose*
-rather than conflict: coverage handles the bubbles where the reference folds, peak multiplicity handles
-the rest, with no overlap. (In a bubble `panphorte` only *partially* collapsed — a self-loop already
-exists — the coverage/peak paths are skipped, so any residual un-collapsed copies surface as
-`INS` / `INS_SUBTYPE=DUP` rather than a `DUP`.)
+**Precedence and composition.** Per bubble: (1) **coverage CN** if `--cn-from-coverage` and the reference
+folds over the full walk (≥2×) — it is the authority and the other two are skipped; else (2) self-loop
+`DUP` if a `REP` self-loop exists; else (3) peak-multiplicity `DUP` (`--cn-from-multiplicity`). Passing
+both CN flags is safe and gives the widest recall — they *compose* rather than conflict: coverage handles
+the bubbles where the reference folds, peak multiplicity handles folded duplications the reference does
+not share, with no overlap.
 
 **When no CN flag fires**, an extra copy that `panphorte` left intact surfaces through the ordinary
 walk-diff as an **`INS`**; with `--classify-ins` it is labelled `INS_SUBTYPE=DUP` when the inserted
 sequence maps back to the local reference.
 
-**Copy number is reference-relative.** Presence/absence reads as `INS` against a reference that lacks the
-copy and as `DEL` against one that has it; the folded-cluster detectors report the **total module** count,
-not a per-paralog (copy-by-copy) breakdown. For an absolute per-haplotype count, read `CN` from
-panphorte's `copies.tsv` / the `DUP` record on a relaxed-similarity normalization (see the panphorte
-docs), not from a single diff against one reference.
+**Absolute vs reference-relative.** The DEL/INS walk-diff is reference-relative (presence/absence reads as
+`INS` against a reference that lacks the copy, `DEL` against one that has it). The two folded-cluster
+detectors instead report an **absolute** per-haplotype copy number: `--cn-from-coverage` divides the
+haplotype's full-walk bp by one copy's bp, so the reported `CN` is the haplotype's own module count, not a
+difference against the reference. The reference choice (e.g. GRCh38) sets the unit-bp denominator but does
+not change a haplotype's count — picking a different reference yields the same per-haplotype `CN`.
 
 > **Per-paralog resolution.** Both folded-cluster detectors report total-module copy number
-> because the graph folds the conserved backbone onto shared nodes. The intended route to per-copy
-> DEL/INS/CN is an optional pangene BED that *unfolds* the cluster — labelling which nodes belong
-> to which paralog so each copy can be typed independently. In progress.
+> because PGGB folds the conserved backbone onto shared nodes. They cannot say *which* paralog a copy is
+> (e.g. CYP2D6 vs an extra CYP2D8P): the residual CYP2D6 mismatches are haplotypes carrying an unannotated
+> CYP2D8P / 2D7-hybrid module that the total-module count includes but the gene BED does not. The intended
+> route to per-copy typing is an optional pangene BED that *unfolds* the cluster — labelling which nodes
+> belong to which paralog. In progress.
 
 ### Multiallelic loci (`--multiallelic-loci`)
 
@@ -235,13 +253,14 @@ contiguous colored gap, an insertion as a block at its anchor — and the figure
 coverage heatmap of the same bubble.
 
 Cell colors: white = node not traversed; grey = traversed, reference-like; **DEL** red, **INS-NOVEL**
-green, **INS-DUP** purple, **INV** orange, **multiallelic** teal (shaded by allele index). A **DUP**
-carrier's traversed nodes are shaded **blue by per-node traversal multiplicity** (the *local* copy
-count), with DEL/INS painted on top. Plot against the **panphorte-normalized** `inspect` substrate (its
-node ids match the `call` VCF): there the repeat-unit (`REP`) node's multiplicity **equals the carrier's
-called `CN`**, so the copy number reads as a strong blue band exactly at that node, while single-traversal
-nodes stay light. (Plotting against the un-normalized bubble graph instead spreads the repeat over many
-single-traversal nodes, so the `REP` band is lost — use the normalized substrate for copy-number loci.)
+green, **INS-DUP** purple, **INV** orange, **multiallelic** teal (shaded by allele index). A **DUP** is
+shaded **blue by the haplotype's absolute copy number** (the VCF `FORMAT:CN`), for **every** haplotype
+that traverses the locus — so losses (`CN < REF_CN`, light), reference (`= REF_CN`, mid) and gains
+(`> REF_CN`, dark) all read as a sequential shade — with DEL/INS painted on top. Two encodings are
+handled automatically: a **self-loop / REP DUP** paints the CN on the repeat-unit node (a clean
+copy-number strip — e.g. LPA KIV-2 at the `REP` node), while a **whole-module coverage DUP** (event node
+is the bubble boundary, e.g. C4 / CYP2D6 called on the `bubble` graph) paints the CN across the whole
+traversed module, so each haplotype's copy number reads as a horizontal band.
 
 It reads the per-bubble `inspect` `node_counts.tsv` (substrate + node order) and the `call` VCF (events,
 carriers, `GT:CN`). The bubble id is inferred from the `node_counts.tsv` filename (or pass `--bubble-id N`).
@@ -254,19 +273,19 @@ that haplotype (substring match) as the top row; `--max-nodes`/`--max-paths` cap
 number** — the latter is shown directly by the DUP blue-intensity shading regardless of row order.
 
 ```bash
-./build/panvar inspect -i tests/results/lpa/panphorte/panphorte.normalized.sorted.gfa \
-  --bubble-prefix-in tests/results/lpa/panphorte/panphorte --bubble-id 7 \
+./build/panvar inspect -i results/real_data/lpa/panphorte/panphorte.normalized.sorted.gfa \
+  --bubble-prefix-in results/real_data/lpa/panphorte/panphorte --bubble-id 7 \
   --cluster \
   --cluster-similarity 0.97 \
-  -o tests/results/lpa/inspect_panphorte/inspect
+  -o results/real_data/lpa/inspect_panphorte/inspect
 Rscript scripts/plot_sv_map.R \
-  --node-counts tests/results/lpa/inspect_panphorte/inspect.bubble_7.node_counts.tsv \
-  --vcf tests/results/lpa/call/call.region.vcf \
-  --node-lengths tests/results/lpa/inspect_panphorte/inspect.bubble_7.node_lengths.tsv \
-  --clusters tests/results/lpa/inspect_panphorte/inspect.bubble_7.clusters.tsv \
-  --cluster-by tests/results/lpa/inspect_panphorte/inspect.bubble_7.clusters.tsv \
+  --node-counts results/real_data/lpa/inspect_panphorte/inspect.bubble_7.node_counts.tsv \
+  --vcf results/real_data/lpa/call/call.region.vcf \
+  --node-lengths results/real_data/lpa/inspect_panphorte/inspect.bubble_7.node_lengths.tsv \
+  --clusters results/real_data/lpa/inspect_panphorte/inspect.bubble_7.clusters.tsv \
+  --cluster-by results/real_data/lpa/inspect_panphorte/inspect.bubble_7.clusters.tsv \
   --reference-path grch38_1 \
-  --out tests/results/lpa/call/call.bubble_7
+  --out results/real_data/lpa/call/call.bubble_7
 ```
 
 ## Algorithm
@@ -311,10 +330,10 @@ Each step below is traced on a tiny worked dataset in
 
 ```bash
 ./build/panvar call \
-  -i tests/results/lpa/panphorte/panphorte.normalized.sorted.gfa \
-  --bubble-prefix-in tests/results/lpa/panphorte/panphorte \
+  -i results/real_data/lpa/panphorte/panphorte.normalized.sorted.gfa \
+  --bubble-prefix-in results/real_data/lpa/panphorte/panphorte \
   --reference-path grch38_1 \
-  -o tests/results/lpa/call/call \
+  -o results/real_data/lpa/call/call \
   --merge-distance-bp 100 --merge-jaccard 0.80 --classify-ins \
   --min-maf 0.05 \
   --cn-from-multiplicity --cn-from-coverage

@@ -128,7 +128,7 @@ if(PANVAR_BUILD_TESTING)
         # The fuller real-data integration smoke (tests/real_smoke.sh runs the whole
         # bubble -> inspect -> describe -> panphorte -> call pipeline) is intentionally NOT
         # registered as a ctest: it is large/slow. Run it manually on real loci, e.g.:
-        #   bash tests/real_smoke.sh ./build/panvar tests/real_data/c4.gfa /tmp/smoke_c4
+        #   bash tests/real_smoke.sh ./build/panvar tests/real_data/c4.gfa.gz /tmp/smoke_c4
         # Only the synthetic smoke runs at the compilation/ctest stage.
     endif()
 endif()

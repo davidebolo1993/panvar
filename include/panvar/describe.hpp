@@ -46,6 +46,10 @@ struct DescribeOptions {
     // summed dosage over that sample's assigned haplotype paths (diploid CN = CN_A + CN_B).
     // The per-haplotype fsm_kmers.txt.gz is still written. Requires pyseer output enabled.
     std::string samples_path;
+    // Worker threads for the per-bubble loop (0 = hardware concurrency). Output is identical
+    // regardless of thread count: per-bubble files are independent and the pooled fsm tables are
+    // merged in bubble order on the main thread.
+    std::size_t threads = 0;
     bool quiet = false;
 };
 

@@ -52,7 +52,7 @@ A real-data integration smoke (`tests/real_smoke.sh`) runs the whole `bubble →
 describe → panphorte → call` pipeline on a real locus; it is intentionally not part of `ctest`:
 
 ```bash
-bash tests/real_smoke.sh ./build/panvar tests/real_data/c4.gfa /tmp/smoke_c4
+bash tests/real_smoke.sh ./build/panvar tests/real_data/c4.gfa.gz /tmp/smoke_c4
 ```
 
 ## Documentation

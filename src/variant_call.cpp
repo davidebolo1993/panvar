@@ -7,6 +7,7 @@
 #include "panvar/graph_utils.hpp"
 #include "panvar/minimap2_align.hpp"
 #include "panvar/output.hpp"
+#include "panvar/parallel.hpp"
 #include "panvar/ref_path.hpp"
 
 #include <algorithm>
@@ -14,11 +15,11 @@
 #include <cstddef>
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <set>
@@ -627,11 +628,20 @@ void call_variants(
         std::vector<std::string> prov_lines;    // variant_paths.tsv rows for this record
     };
     std::vector<OutRecord> out_records;
-    std::unordered_map<std::string, int> id_counts; // disambiguate colliding variant IDs
     std::vector<std::string> node_track_rows;        // <prefix>.node_track.tsv body (plotting x-axis)
     std::vector<std::string> variant_nodes_rows;     // <prefix>.variant_nodes.tsv (describe handoff)
 
     VariantCallSummary summary;
+
+    // Per-bubble outputs, computed in parallel and merged in bubble order so the result is identical
+    // regardless of thread count: the region VCF is coordinate-sorted afterwards (total order on
+    // unique ids), and node_track / variant_nodes inherit deterministic bubble order from the merge.
+    struct BubbleOut {
+        VariantCallSummary sum;
+        std::vector<OutRecord> records;
+        std::vector<std::string> node_track;
+        std::vector<std::string> variant_nodes;
+    };
 
     // Genomic 1-based start of a bubble node from the reference path (first occurrence).
     auto build_ref_node_pos = [&](const Bubble& bubble) {
@@ -650,9 +660,19 @@ void call_variants(
 
     // Progress over bubbles (stderr, TTY-gated; empty label = suppressed under --quiet).
     cli::ProgressBar call_progress(options.quiet ? "" : "Calling variants", bubbles.size());
-    for (const Bubble& bubble : bubbles) {
-        call_progress.tick();
-        if (!bubble_filter.empty() && bubble_filter.find(bubble.id) == bubble_filter.end()) continue;
+    std::vector<BubbleOut> bouts(bubbles.size());
+    run_parallel(bubbles.size(), options.threads, [&](std::size_t bubble_idx) {
+        const Bubble& bubble = bubbles[bubble_idx];
+        // Shadow the shared sinks with this bubble's local buffers: the (unchanged) loop body below
+        // writes only through these names, so each bubble accumulates independently. id_counts is
+        // bubble-scoped (variant ids embed the bubble id), so a local map reproduces the ids exactly.
+        BubbleOut& bout = bouts[bubble_idx];
+        VariantCallSummary& summary = bout.sum;
+        std::vector<OutRecord>& out_records = bout.records;
+        std::vector<std::string>& node_track_rows = bout.node_track;
+        std::vector<std::string>& variant_nodes_rows = bout.variant_nodes;
+        std::unordered_map<std::string, int> id_counts;
+        if (!bubble_filter.empty() && bubble_filter.find(bubble.id) == bubble_filter.end()) return;
         ++summary.bubbles_seen;
 
         // Reference walk through this bubble. path_indexes is parallel to graph.paths.
@@ -665,7 +685,7 @@ void call_variants(
                 ? bubble_steps(graph.paths[ref_idx], path_indexes[ref_idx], bubble)
                 : std::optional<std::vector<PathStep>>{};
         if (!ref_opt.has_value() || ref_opt->empty()) {
-            continue; // reference does not traverse this bubble; cannot type events
+            return; // reference does not traverse this bubble; cannot type events
         }
         ++summary.bubbles_with_reference;
 
@@ -779,9 +799,83 @@ void call_variants(
             return sid >= options.merge_seq_identity;
         };
 
+        // ---- bp-coverage CN (--cn-from-coverage): total module/cluster copy number on a
+        // pggb-collapsed paralog cluster, where the reference itself traverses the module >=2x.
+        // PGGB collapses IDENTICAL copies (e.g. the C4 long-long / short-short modules, or the
+        // CYP2D6/2D7/2D8P paralogs) onto shared nodes, so a 2-copy haplotype re-traverses those
+        // nodes twice -- the copy number is carried as NODE MULTIPLICITY, not as a tandem block in
+        // the spelled sequence. Copy number = (full-walk bp through the bubble) / (unit bp), with
+        // unit = ref_full_bp / ref_fold (ref's peak node multiplicity over its own full walk).
+        //
+        // The full walk is the WIDEST source..sink span (all repeats included). This is the crux:
+        // canonical_bubble_path_steps (used everywhere else, incl. the alleles above and the
+        // self-loop counts below) takes the MINIMAL span covering the distinct inside nodes and so
+        // collapses the repeated copies onto one traversal -- which would flatten every haplotype to
+        // the same bp. Counting over the full span preserves the multiplicity == copy number. When
+        // it fires it is the authority for the bubble, so the self-loop / walk-diff paths are skipped.
+        // Validated: C4 total CN 131/131 exact; CYP2D6 ~92% after the paralog baseline (2D7+2D8P)
+        // offset the comparator subtracts. Runs whether or not the collapse left a self-loop node.
+        bool coverage_fired = false;
+        if (options.cn_from_coverage) {
+            const std::unordered_set<std::string> inside_set(bubble.inside.begin(), bubble.inside.end());
+            auto full_walk_bp = [&](std::size_t pi, std::size_t* peak_out) -> std::size_t {
+                const auto& idx = path_indexes[pi].positions;
+                const auto sit = idx.find(bubble.source);
+                const auto kit = idx.find(bubble.sink);
+                if (sit == idx.end() || kit == idx.end()) return 0;
+                // Widest oriented span: forward = first source .. last sink; if the path crosses the
+                // bubble reversed (no source before any sink) = first sink .. last source.
+                const std::size_t s0 = sit->second.front(), s1 = sit->second.back();
+                const std::size_t k0 = kit->second.front(), k1 = kit->second.back();
+                const std::size_t lo = (s0 <= k1) ? s0 : k0;
+                const std::size_t hi = (s0 <= k1) ? k1 : s1;
+                const std::vector<PathStep>& steps = graph.paths[pi].steps;
+                std::size_t bp = 0;
+                std::unordered_map<std::string, std::size_t> cnt;
+                for (std::size_t i = lo; i <= hi && i < steps.size(); ++i) {
+                    const std::string& id = steps[i].node_id;
+                    if (inside_set.count(id)) { bp += node_len(graph, id); if (peak_out) ++cnt[id]; }
+                }
+                if (peak_out) { std::size_t pk = 0; for (const auto& kv : cnt) pk = std::max(pk, kv.second); *peak_out = pk; }
+                return bp;
+            };
+            std::size_t ref_fold = 0;
+            const std::size_t ref_bp = (ref_idx < graph.paths.size()) ? full_walk_bp(ref_idx, &ref_fold) : 0;
+            if (ref_fold >= 2 && ref_bp > 0) {
+                const double unit = static_cast<double>(ref_bp) / static_cast<double>(ref_fold);
+                const std::size_t ref_copies = ref_fold;
+                MergedRecord mr;
+                mr.seed.type = EvType::Dup;
+                mr.seed.nodes.push_back(bubble.source);
+                mr.seed.start_node = bubble.source; mr.seed.end_node = bubble.sink;
+                mr.seed.ref_cn = ref_copies; mr.seed.alt_cn = ref_copies;
+                mr.seed.anchor_node = bubble.source;
+                mr.seed.size_bp = static_cast<std::size_t>(unit);
+                mr.seed.cn_peak = true;
+                for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
+                    if (!traverses.count(graph.paths[pi].name)) continue;
+                    const std::size_t hbp = full_walk_bp(pi, nullptr);
+                    if (hbp == 0) continue;
+                    const std::size_t copies =
+                        static_cast<std::size_t>(std::llround(static_cast<double>(hbp) / unit));
+                    // CN is reported for every traversing haplotype (absolute module count); GT marks a
+                    // CARRIER only when the count differs from the reference's (a gain or a loss), so AC/AF
+                    // stay meaningful instead of flagging every haplotype.
+                    mr.sample_cn[graph.paths[pi].name] = copies;
+                    if (copies != ref_copies) mr.carriers.push_back(graph.paths[pi].name);
+                    if (copies > mr.seed.alt_cn) mr.seed.alt_cn = copies;
+                }
+                if (!mr.carriers.empty()) {  // a CN-invariant module is not a variant record
+                    coverage_fired = true;
+                    merged.push_back(std::move(mr));
+                }
+            }
+        }
+
         // ---- DUP/CN events: count self-loop traversals per allele vs reference. Merge
         // on shared REP node; per-sample CN. Independent of the walk-diff alignment.
-        for (std::size_t ai = 0; ai < alleles.size(); ++ai) {
+        // Skipped when bp-coverage fired (it is the authority for that bubble's copy number).
+        for (std::size_t ai = 0; !coverage_fired && ai < alleles.size(); ++ai) {
             std::unordered_map<std::string, std::size_t> alt_count;
             for (const PathStep& s : alleles[ai].steps) ++alt_count[s.node_id];
             for (const std::string& cn : cn_nodes) {
@@ -809,57 +903,6 @@ void call_variants(
                 for (const std::string& m : alleles[ai].members) {
                     grp->carriers.push_back(m);
                     grp->sample_cn[m] = ac;
-                }
-            }
-        }
-
-        // ---- bp-coverage CN (--cn-from-coverage): total module/cluster copy number on a
-        // FOLDED paralog cluster, where the reference itself traverses the module >=2x (a
-        // pggb-collapsed cluster like CYP2D6: 2D6+2D7+2D8P fold together). Copy number =
-        // (spelled bp the haplotype walks through the bubble) / (module unit bp), with the
-        // unit derived graph-only as ref_spelled_bp / ref_fold (ref's max node multiplicity).
-        // Unlike peak-multiplicity this uses ALL traversed sequence, so it recovers deletions
-        // (fewer bp -> fewer copies) as well as gains. Validated on CYP2D6: est 1/2/3/4 tracks
-        // total module copies incl. the 9 deletions. Takes precedence over peak-mult; when it
-        // fires it replaces the (folded, unreliable) walk-diff for that bubble.
-        bool coverage_fired = false;
-        if (options.cn_from_coverage && cn_nodes.empty()) {
-            std::size_t ref_fold = 0;
-            for (const auto& [id, c] : ref_count) { (void)id; ref_fold = std::max(ref_fold, c); }
-            std::size_t ref_bp = 0;
-            for (const PathStep& s : ref_steps) ref_bp += node_len(graph, s.node_id);
-            if (ref_fold >= 2 && ref_bp > 0) {
-                const double unit = static_cast<double>(ref_bp) / static_cast<double>(ref_fold);
-                const std::size_t ref_copies = ref_fold;
-                MergedRecord* cov = nullptr;
-                for (std::size_t ai = 0; ai < alleles.size(); ++ai) {
-                    std::size_t hbp = 0;
-                    for (const PathStep& s : alleles[ai].steps) hbp += node_len(graph, s.node_id);
-                    const std::size_t copies =
-                        static_cast<std::size_t>(std::llround(static_cast<double>(hbp) / unit));
-                    if (copies == ref_copies) continue;
-                    const std::size_t delta = copies > ref_copies ? copies - ref_copies : ref_copies - copies;
-                    if (static_cast<double>(delta) * unit < static_cast<double>(options.min_sv_bp)) continue;
-                    coverage_fired = true;
-                    if (cov == nullptr) {
-                        MergedRecord mr;
-                        mr.seed.type = EvType::Dup;
-                        mr.seed.nodes.push_back(bubble.source);
-                        mr.seed.start_node = bubble.source; mr.seed.end_node = bubble.sink;
-                        mr.seed.ref_cn = ref_copies; mr.seed.alt_cn = copies;
-                        mr.seed.anchor_node = bubble.source;
-                        mr.seed.size_bp = static_cast<std::size_t>(static_cast<double>(delta) * unit);
-                        mr.seed.cn_peak = true;
-                        merged.push_back(std::move(mr));
-                        cov = &merged.back();
-                    } else if (copies > cov->seed.alt_cn) {
-                        cov->seed.alt_cn = copies;
-                        cov->seed.size_bp = static_cast<std::size_t>(static_cast<double>(delta) * unit);
-                    }
-                    for (const std::string& m : alleles[ai].members) {
-                        cov->carriers.push_back(m);
-                        cov->sample_cn[m] = copies;
-                    }
                 }
             }
         }
@@ -1103,7 +1146,11 @@ void call_variants(
         }
 
         // ---- INS subtype refinement on the representative only (bounded minimap2 calls).
+        // Serialized across bubbles: minimap2 is invoked per record and this path is off by
+        // default, so guarding it keeps the parallel bubble loop safe at no cost to the common case.
         if (options.classify_ins) {
+            static std::mutex minimap_mtx;
+            std::lock_guard<std::mutex> minimap_lock(minimap_mtx);
             std::string ref_window;
             for (MergedRecord& mr : merged) {
                 if (mr.seed.type != EvType::Ins || mr.seed.seq.empty()) continue;
@@ -1139,7 +1186,7 @@ void call_variants(
             }
             merged = std::move(kept);
         }
-        if (merged.empty()) continue;
+        if (merged.empty()) return;
         ++summary.bubbles_with_calls;
 
         // Map each sample to its allele (for per-carrier sub-walk provenance).
@@ -1234,7 +1281,7 @@ void call_variants(
                 rec.id = id; rec.line = row.str();
                 out_records.push_back(std::move(rec));
                 ++summary.records_written;
-                continue; // locus represented by the multiallelic record; skip per-event emission
+                return; // locus represented by the multiallelic record; skip per-event emission
             }
         }
         // A carrier's realized sub-walk through the event: its canonical bubble steps
@@ -1450,6 +1497,23 @@ void call_variants(
             else if (e.type == EvType::Inv) ++summary.inv;
             else ++summary.dup;
         }
+    });
+
+    // Merge per-bubble outputs in bubble order: deterministic regardless of thread count.
+    for (std::size_t bi = 0; bi < bouts.size(); ++bi) {
+        call_progress.tick();
+        BubbleOut& bo = bouts[bi];
+        summary.bubbles_seen += bo.sum.bubbles_seen;
+        summary.bubbles_with_reference += bo.sum.bubbles_with_reference;
+        summary.bubbles_with_calls += bo.sum.bubbles_with_calls;
+        summary.records_written += bo.sum.records_written;
+        summary.del += bo.sum.del;
+        summary.ins += bo.sum.ins;
+        summary.inv += bo.sum.inv;
+        summary.dup += bo.sum.dup;
+        for (OutRecord& r : bo.records) out_records.push_back(std::move(r));
+        for (std::string& s : bo.node_track) node_track_rows.push_back(std::move(s));
+        for (std::string& s : bo.variant_nodes) variant_nodes_rows.push_back(std::move(s));
     }
 
     // ---- Coordinate-sort all records and write the (indexable) region + per-bubble VCFs.

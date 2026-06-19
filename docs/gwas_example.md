@@ -89,7 +89,8 @@ haplotypes into 200 synthetic diploid individuals, and assigns `Lp(a) = base −
 the whole thing across **both substrates** and **both trait codings**:
 
 ```bash
-bash tests/gwas/run_lpa_real.sh build/panvar out/gwas_lpa python3 Rscript
+# python3 needs numpy+scipy; Rscript needs ggplot2 (conda activate base). Also run by scripts/regen_results.sh.
+bash tests/gwas/run_lpa_real.sh build/panvar results/real_data/lpa/gwas python3 Rscript
 ```
 
 It runs `bubble → panphorte → call → describe --samples → gwas_demo.py → plot_gwas.R` and a self-check.
@@ -108,9 +109,22 @@ Both substrates land on the same locus — the called KIV-2 **`DUP`** (`bubble7_
 - **node/edge dosage** localizes it to a handful of features — the repeat node `4790` and its self-loop edge
   `4790+>4790+` — the most direct graph read of copy number.
 
-The binary trait behaves the same way (e.g. k-mer `count_q ≈ 1.3e-12`, `pa_q = 1.0`). The Manhattan
-(`out/gwas_lpa/plot_kmer_continuous.manhattan.png`) shows the KIV-2 peak only in the **count** panel; `--x
-nodes` places the same peak by graph order.
+The binary trait behaves the same way (e.g. k-mer `count_q ≈ 1.3e-12`, `pa_q = 1.0`).
+
+To compare substrates and traits at a glance, `plot_gwas_compare.R` draws one faceted figure per
+substrate — columns = trait (continuous, binary), rows = test (count vs presence/absence) — so a taller
+peak means a stronger association. The KIV-2 copy-number signal is tall in the **count** row and flat in
+**presence/absence**, and continuous beats binary.
+
+k-mer substrate (the count signal spreads across many repeat-unit markers):
+
+![LPA k-mer GWAS comparison](../results/real_data/lpa/gwas/gwas_kmer_compare.png)
+
+node/edge dosage substrate (the same signal localizes to the repeat node and its self-loop edge):
+
+![LPA node/edge GWAS comparison](../results/real_data/lpa/gwas/gwas_graph_compare.png)
+
+(`plot_gwas.R` still writes the per-run two-panel Manhattan + QQ with the genomic-inflation λ.)
 
 ## 6. Reading the outputs
 

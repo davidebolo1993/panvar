@@ -10,6 +10,7 @@
 #include "panvar/graph_utils.hpp"
 #include "panvar/integrated_snarls.hpp"
 #include "panvar/output.hpp"
+#include "panvar/parallel.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -30,32 +31,6 @@
 
 namespace panvar {
 namespace {
-
-// Run fn(i) for i in [0, n) across worker threads (work-stealing on an atomic
-// counter). threads==0 -> hardware concurrency. Results must be written to
-// distinct indices per i (no shared mutation) for thread safety + determinism.
-void run_parallel(std::size_t n, std::size_t threads, const std::function<void(std::size_t)>& fn) {
-    std::size_t nthreads = threads != 0 ? threads : std::thread::hardware_concurrency();
-    if (nthreads == 0) nthreads = 1;
-    if (n > 0) nthreads = std::min(nthreads, n);
-    if (nthreads <= 1) {
-        for (std::size_t i = 0; i < n; ++i) fn(i);
-        return;
-    }
-    std::atomic<std::size_t> next{0};
-    std::vector<std::thread> pool;
-    pool.reserve(nthreads);
-    for (std::size_t t = 0; t < nthreads; ++t) {
-        pool.emplace_back([&] {
-            for (;;) {
-                const std::size_t i = next.fetch_add(1);
-                if (i >= n) break;
-                fn(i);
-            }
-        });
-    }
-    for (std::thread& th : pool) th.join();
-}
 
 constexpr std::size_t kMaxGapSteps = 32; // bound interruption length (steps) between copies
 
@@ -465,6 +440,7 @@ std::vector<ApproxCopy> detect_copies_native(const std::string& s, const std::st
 
     const std::size_t band =
         std::max<std::size_t>(8, static_cast<std::size_t>((1.0 - min_sim) * static_cast<double>(r.size())) + 8);
+
     std::size_t last_end = 0;
     bool have_last = false;
     for (const std::size_t st : anchors) {
@@ -588,7 +564,7 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
             throw std::runtime_error("Failed to write panphorte copies TSV");
         }
         copies_out << "path_name\tsample\tbubble_id\tcopies\tunit_bp\torientations\t"
-                   << "mean_identity\tregion_bp\tfrom_node\tto_node\tn_long\tn_short\n";
+                   << "mean_identity\tregion_bp\tfrom_node\tto_node\n";
     }
 
     std::unordered_map<std::string, std::string> rep_by_unit; // canonical unit seq -> REP node id
@@ -745,28 +721,14 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                     std::size_t prev_hi = copies.front().off_lo;
                     std::string orients;
                     double id_sum = 0.0;
-                    // Per-copy length classes. The reference unit is the long form; a copy
-                    // whose traversed sequence is substantially shorter carries a large
-                    // internal deletion (e.g. the C4 HERV-K ~6.4 kb) and is the SHORT form.
-                    // This recovers the long/short composition the collapse would otherwise
-                    // hide (the short copy is folded onto the same REP node).
-                    constexpr double kShortMaxFrac = 0.90;
-                    std::size_t n_short = 0;
                     for (const Mapped& m : copies) {
                         for (std::size_t off = prev_hi; off < m.off_lo; ++off) {
                             pa.replacement.push_back(graph.paths[pi].steps[left + off]);
                         }
                         pa.replacement.push_back(PathStep{rep_id, m.rev});
-                        std::size_t copy_bp = 0;
                         for (std::size_t off = m.off_lo; off < m.off_hi; ++off) {
                             removal_candidates.insert(graph.paths[pi].steps[left + off].node_id);
                             collapsed_nodes.insert(graph.paths[pi].steps[left + off].node_id);
-                            const auto cit = node_tok.find(graph.paths[pi].steps[left + off].node_id);
-                            if (cit != node_tok.end()) copy_bp += cit->second.len;
-                        }
-                        if (ref_unit.size() > 0 &&
-                            static_cast<double>(copy_bp) < kShortMaxFrac * static_cast<double>(ref_unit.size())) {
-                            ++n_short;
                         }
                         orients += (m.rev ? '-' : '+');
                         id_sum += m.id;
@@ -790,8 +752,7 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                                << orients << '\t' << (id_sum / static_cast<double>(occ)) << '\t'
                                << region_bp << '\t'
                                << graph.paths[pi].steps[left + copies.front().off_lo].node_id << '\t'
-                               << graph.paths[pi].steps[left + copies.back().off_hi - 1].node_id << '\t'
-                               << (occ - n_short) << '\t' << n_short << '\n';
+                               << graph.paths[pi].steps[left + copies.back().off_hi - 1].node_id << '\n';
                 }
             }
 

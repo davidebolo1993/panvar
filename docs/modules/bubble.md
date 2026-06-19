@@ -11,8 +11,7 @@ CLI entrypoint:
 `bubble` turns a pangenome graph (GFA) into `panvar` bubble sites for downstream modules. By default it:
 
 1. sorts + flips the graph along the reference internally
-2. finds **snarls** internally with a vendored cactus / 3-edge-connected decomposition (matches closely
-   `vg snarls`; see [Backround](#snarls-vs-superbubbles-background))
+2. finds **snarls** internally with a vendored cactus / 3-edge-connected decomposition (matches closely `vg snarls`; see [Backround](#snarls-vs-superbubbles-background))
 3. infers bubble-internal nodes from path intervals between each snarl's source/sink
 4. computes path support and internal sequence span per candidate
 5. applies base site filters (`--min-variant-bp`, `--min-path-support`)
@@ -49,29 +48,15 @@ When run with `--snarls-in <snarls.jsonl>` (from `vg snarls -A integrated <graph
 
 `bubble` consumes **snarls** by default, not superbubbles.
 
-A **superbubble** is a single-source / single-sink subgraph that is **directed and acyclic**: every
-internal node is reachable from the source and reaches the sink, and the only way in or out is through
-the two boundaries. By construction it **cannot** contain a cycle or an inversion. A **snarl** (*i.e.* what `vg snarls` emits) is the more general structure: a pair of boundary nodes whose removal
-separates an internal subgraph from the rest, defined on the **bidirected** graph. Snarls therefore
-capture the **inversions, tandem cycles, and tangles** that a superbubble cannot, and they
-**nest**; their acyclic subclass — "ultrabubbles" — is essentially the superbubble. `panvar` uses snarls
-because the pangenome variation this toolkit targets (including inversions and tandem expansions) often
-lives in the cyclic or inverted sites that superbubbles omit.
+A **superbubble** is a single-source / single-sink subgraph that is **directed and acyclic**: every internal node is reachable from the source and reaches the sink, and the only way in or out is through the two boundaries. By construction it **cannot** contain a cycle or an inversion. A **snarl** (*i.e.* what `vg snarls` emits) is the more general structure: a pair of boundary nodes whose removal
+separates an internal subgraph from the rest, defined on the **bidirected** graph. Snarls therefore capture the **inversions, tandem cycles, and tangles** that a superbubble cannot, and they **nest**; their acyclic subclass — "ultrabubbles" — is essentially the superbubble. `panvar` uses snarls because the pangenome variation this toolkit targets (including inversions and tandem expansions) often lives in the cyclic or inverted sites that superbubbles omit.
 
-Internally, `panvar` reproduces `vg snarls` by mirroring vg's cactus / 3-edge-connected decomposition, so
-the default top-level snarl set matches vg; passing `--superbubbles` instead emits only the acyclic
-superbubble subset. This acyclic subset is the same superbubble concept used by tools like 
-[BubbleGun](https://doi.org/10.1093/bioinformatics/btac448), whose detector finds superbubbles
-directly, via the Onodera algorithm (BubbleGun additionally *sub-labels* its
-superbubbles into "simple bubbles", "insertions", and "super" — so its narrow "super" excludes
-simple/insertion sites, whereas panvar's `--superbubbles` keeps **all** of them).
+Internally, `panvar` reproduces `vg snarls` by mirroring vg's cactus/ 3-edge-connected decomposition, so the default top-level snarl set matches vg; passing `--superbubbles` instead emits only the acyclic superbubble subset. This acyclic subset is the same superbubble concept used by tools like 
+[BubbleGun](https://doi.org/10.1093/bioinformatics/btac448), whose detector finds superbubbles directly, via the Onodera algorithm (BubbleGun additionally *sub-labels* its superbubbles into "simple bubbles", "insertions", and "super" — so its narrow "super" excludes simple/insertion sites, whereas panvar's `--superbubbles` keeps **all** of them).
 
-A snarl is a property of the graph **topology**, so it is computed independently of the paths: it is
-bounded by two nodes (`source`, `sink`), and a haplotype only "supports" it when its walk visits **both**
-boundaries. In a pangenome some haplotypes may not, because:
+A snarl is a property of the graph **topology**, so it is computed independently of the paths: it is bounded by two nodes (`source`, `sink`), and a haplotype only "supports" it when its walk visits **both** boundaries. In a pangenome some haplotypes may not, because:
 
-- a haplotype may take a route that **bypasses a boundary** (for example a large deletion that removes
-  the boundary region, or an alternative local structure);
+- a haplotype may take a route that **bypasses a boundary** (for example a large deletion that removes the boundary region, or an alternative local structure);
 - an assembly may be **fragmented or partial** and simply not span the locus;
 - with nested snarls, a path can cross the parent yet take a branch that **skips a child** snarl.
 
@@ -116,8 +101,7 @@ For each top-level snarl candidate:
 
 - `--merge-nearby-bp <N>` (default `0`, disabled)
 - merge is applied after `--min-variant-bp` and `--min-path-support` filters
-- if enabled, consecutive surviving bubbles are merged when the shortest-path distance
-  from previous `sink` to next `source` is `<= N` bp
+- if enabled, consecutive surviving bubbles are merged when the shortest-path distance from previous `sink` to next `source` is `<= N` bp
 - distance is computed from node lengths across graph connectivity
 
 
@@ -157,8 +141,7 @@ Current schema:
 - `inside_nodes`
 
 
-Two extra per-bubble metrics are also computed — they drive the
-`--min-variant-bp` filter and are surfaced in the optional debug TSV:
+Two extra per-bubble metrics are also computed — they drive the `--min-variant-bp` filter and are surfaced in the optional debug TSV:
 
 - `long_path_support`: count of supporting paths with inside span `>= --min-variant-bp`
 - `inversion_signal`: true when at least one internal node is observed in both orientations across supporting paths (such a bubble is kept even when no path reaches `--min-variant-bp`)
@@ -175,19 +158,18 @@ When `--snarl-debug-tsv` is enabled, each snarl candidate becomes one row:
 - `long_path_support`, `inversion_signal`: the two metrics above
 - `accepted`: `1` if the candidate is kept after all filters (and merging), else `0`
 
-Final bubbles produced by `--merge-nearby-bp` have no original candidate row, so one extra
-`accepted=1` row is appended for each.
+Final bubbles produced by `--merge-nearby-bp` have no original candidate row, so one extra `accepted=1` row is appended for each.
 
 ## Example
 
 ```bash
 ./build/panvar bubble \
-  -i tests/real_data/lpa.gfa \
-  -o tests/results/lpa/bubble/bubble \
+  -i tests/real_data/lpa.gfa.gz \
+  -o results/real_data/lpa/bubble/bubble \
   --reference-path grch38_1
 
 #or override with an external vg snarls file
-./build/panvar bubble -i tests/real_data/lpa.gfa -o tests/results/lpa/bubble/bubble --snarls-in tests/real_data/c4.snarls.jsonl
+./build/panvar bubble -i tests/real_data/lpa.gfa.gz -o results/real_data/lpa/bubble/bubble --snarls-in tests/real_data/c4.snarls.jsonl
 ```
 
 ## Bandage Colors

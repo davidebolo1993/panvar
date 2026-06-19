@@ -13,6 +13,13 @@ node ids); this hides copy number behind raw length and bloats the bubble. The `
 tandem array and **collapses it to a single repeat unit node with a self-loop**, so copy number
 becomes the number of self-loop traversals.
 
+> **Scope.** `panphorte` is for **tandem-repeat** loci (a unit repeated in-line within a haplotype, e.g.
+> LPA KIV-2). For **PGGB-collapsed paralog clusters** (C4, CYP2D6) the copies are already folded onto
+> shared nodes as node *multiplicity* — they are not a contiguous tandem to normalize — so their copy
+> number is recovered directly in `call --cn-from-coverage` on the `bubble` graph, **not** from
+> `panphorte`. Running `panphorte` on such a region is harmless but its collapsed graph is not the call
+> substrate there, and its `copies.tsv` is not the copy-number source.
+
 ### Differences from the original panphorte
 
 This is panvar's own re-implementation of the [panphorte](https://github.com/GenoGra/Panphorte) idea. While the original
@@ -58,7 +65,11 @@ panvar panphorte -i <graph.gfa> (-b <prefix> | -c <bubbles.csv>) -o <prefix> [op
   is call-ready in one step (see Outputs)
 - `--bubble-id <N>`: restrict to a bubble ID; repeatable
 - `--min-unit-bp <N>`: minimum repeat-unit span to normalize (default `50`)
-- `--min-copies <N>`: minimum tandem copies to normalize (default `2`)
+- `--min-copies <N>`: minimum tandem copies that must occur in **some** haplotype for a bubble to be
+  treated as an array (default `2`). It defines the array, not the per-haplotype fold threshold: once a
+  bubble is a confirmed array, **every** haplotype with `≥ 1` aligned copy of the unit is folded — so a
+  single-copy haplotype gets a `copies = 1` row and traverses the `REP` node once (downstream `CN = 1`,
+  not `0`).
 - `--max-interruption-frac <f>`: max fraction of an array's bp that may be interruptions (default `0.25`)
 - `--min-similarity <f>`: minimum identity to treat a block as a copy of the repeat unit (default `1.0`
   = exact, sequence-preserving). Values `< 1.0` enable **approximate, lossy collapse** of
@@ -90,7 +101,9 @@ near-identical copies are found by **banded sequence alignment**. A small worked
    self-loop when copies are adjacent, edges through flanking literals when they are not. This is
    **lossy**: within-copy SNVs/small indels are discarded (collapsed copies become identical), appropriate
    when copy number is the variant of interest, not the within-copy differences. **Per-copy orientation is
-   preserved** (three copies, two forward + one reverse → `REP +,−,+`).
+   preserved** (three copies, two forward + one reverse → `REP +,−,+`). Folding applies to **single
+   copies** of the seeded unit as well: a haplotype carrying one copy is routed through the `REP` node once
+   (`copies = 1`), so it is not left un-normalized (which would make `call` read its copy number as `0`).
 
 **Limitation:** the unit must occur as `≥ 2` **adjacent** identical copies in at least one haplotype to be
 seeded. Once seeded, copies in any haplotype may be non-adjacent / divergent. A duplication with **no**
@@ -129,10 +142,9 @@ referenced. **What is written depends on `--reference-path`:**
     `nodes_collapsed`
 - `<prefix>.panphorte.copies.tsv` (approximate mode), one row per (haplotype, collapsed array) —
   the provenance for downstream calling: `path_name, sample, bubble_id, copies, unit_bp, orientations,
-  mean_identity, region_bp, from_node, to_node, n_long, n_short`. Reads as "in this haplotype, original
+  mean_identity, region_bp, from_node, to_node`. Reads as "in this haplotype, original
   walk nodes `from_node..to_node` (`region_bp` bp) collapsed into the unit looped `copies` times
-  (orientation pattern `orientations`, mean alignment identity `mean_identity`)". `n_long`/`n_short`
-  split those `copies` by per-copy length: a copy spanning `< 0.90 ×` the (long) unit is `short`: `n_long + n_short = copies`.
+  (orientation pattern `orientations`, mean alignment identity `mean_identity`)".
 - Run summary on stdout: bubbles seen / normalized, paths rewritten, nodes removed / added, edges added.
 
 ## Algorithm overview
@@ -154,9 +166,9 @@ For each bubble, for each path crossing it:
 
 ```bash
 ./build/panvar panphorte \
-  -i tests/results/lpa/bubble/bubble.sorted.gfa \
-  --bubble-prefix-in tests/results/lpa/bubble/bubble \
+  -i results/real_data/lpa/bubble/bubble.sorted.gfa \
+  --bubble-prefix-in results/real_data/lpa/bubble/bubble \
   --reference-path grch38_1 \
-  -o tests/results/lpa/panphorte/panphorte \
+  -o results/real_data/lpa/panphorte/panphorte \
   --min-similarity 0.97
 ```
