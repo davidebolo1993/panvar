@@ -26,6 +26,7 @@
 #                         (|SVLEN| for DEL/INS/INV/multiallelic; RU_LEN repeat-unit bp for DUP)
 #   --scale-transform <t> raw | sqrt | log1p size->extent scaling for --scale (default sqrt)
 #   --width / --height    figure size (inches; default auto)
+#   --dpi <n>             PNG resolution (default 300)
 
 args <- commandArgs(trailingOnly = TRUE)
 usage <- function(status = 0) {
@@ -51,6 +52,7 @@ usage <- function(status = 0) {
     "  --scale                  scale each variant rectangle by its size (SVLEN; RU_LEN for DUP)",
     "  --scale-transform <t>    raw | sqrt | log1p scaling for --scale (default sqrt)",
     "  --width / --height <in>  figure size in inches (default auto)",
+    "  --dpi <n>                PNG resolution (default 300)",
     "  -h, --help               show this help"), collapse = "\n"), "\n")
   quit(status = status)
 }
@@ -58,7 +60,7 @@ if (length(args) == 0 || any(args %in% c("-h", "--help"))) usage(0)
 opts <- list(vcf = NULL, out = NULL, clusters = NULL, cluster_by = NULL,
              reference_path = NULL, max_paths = 0, title = NULL,
              flip = FALSE, scale = FALSE, scale_transform = "sqrt",
-             width = NA_real_, height = NA_real_)
+             width = NA_real_, height = NA_real_, dpi = 300)
 i <- 1
 while (i <= length(args)) {
   a <- args[[i]]; val <- function() { if (i + 1 > length(args)) stop(paste("missing value after", a)); args[[i + 1]] }
@@ -74,6 +76,7 @@ while (i <= length(args)) {
   else if (a == "--scale-transform") { opts$scale_transform <- val(); i <- i + 2 }
   else if (a == "--width") { opts$width <- as.numeric(val()); i <- i + 2 }
   else if (a == "--height") { opts$height <- as.numeric(val()); i <- i + 2 }
+  else if (a == "--dpi") { opts$dpi <- as.numeric(val()); i <- i + 2 }
   else if (startsWith(a, "-")) stop(paste("unknown option:", a)) else i <- i + 1
 }
 for (r in c("vcf", "out")) if (is.null(opts[[r]])) usage(1)
@@ -312,6 +315,6 @@ if (is.na(opts$width))  opts$width  <- if (!opts$flip) var_in else hap_in
 if (is.na(opts$height)) opts$height <- if (!opts$flip) hap_in else var_in
 
 png_path <- paste0(opts$out, ".png"); pdf_path <- paste0(opts$out, ".pdf")
-ggplot2::ggsave(png_path, p, width = opts$width, height = opts$height, units = "in", dpi = 180, limitsize = FALSE)
+ggplot2::ggsave(png_path, p, width = opts$width, height = opts$height, units = "in", dpi = opts$dpi, limitsize = FALSE)
 ggplot2::ggsave(pdf_path, p, width = opts$width, height = opts$height, units = "in", limitsize = FALSE)
 cat("Wrote:", png_path, "\n"); cat("Wrote:", pdf_path, "\n")
