@@ -130,10 +130,12 @@ node/edge dosage substrate (the same signal localizes to the repeat node and its
 
 - **`*.assoc.tsv`** — one row per tested feature: `kmer, bubble_id, pos, node_min, nodes, variant,
   n_carriers, max_count, pa_p, count_p, pa_bonf, count_bonf, pa_q, count_q` (the first column holds the
-  k-mer sequence or, for `--substrate graph`, the node id / edge key). Sort by `count_q` for the count
-  GWAS, `pa_q` for presence/absence.
-- **Traceback** — the `variant` column already maps each significant feature back through its `nodes` to the
-  `call` variant (here the KIV-2 `DUP`), so a hit reads as a biological variant, not just a sequence.
+  k-mer sequence or, for `--substrate graph`, the node id / edge key), plus a trailing **`genes`** column
+  when `gwas_demo.py --node-genes <call.node_genes.tsv>` is given (the gene[s] the feature's nodes fall in,
+  from `call --gtf`). Sort by `count_q` for the count GWAS, `pa_q` for presence/absence.
+- **Traceback** — the `variant` column maps each significant feature back through its `nodes` to the
+  `call` variant (here the KIV-2 `DUP`), and the `genes` column names the gene it sits in (`LPA`), so a hit
+  reads as a biological variant in a named gene, not just a sequence.
 - **Manhattan / QQ** — `*.manhattan.{png,pdf}` (P/A vs count panels) and `*.qq.{png,pdf}` (λ per method).
 
 ## 7. Caveats (honest limits)

@@ -234,6 +234,7 @@ The VCFs are VCF 4.2. Samples are the **haplotypes** (every P/W path; haploid). 
   **`MERGE_SIZE_RATIO`** (smallest/largest merged member size) — all present only on records that actually
   merged ≥2 events; `EVENTID` (links a co-located DEL+INS substitution), `INS_SUBTYPE` (refined INS only),
   `REF_CN` and `RU_LEN` (DUP: reference copy number, and repeat-unit length in bp for one copy),
+  `GENES` (with `--gtf`: gene(s) overlapping the variant; for a DUP the whole folded module's genes),
   `NALLELES` (multiallelic records from `--multiallelic-loci`), and the event sequence
   (`INSSEQ`/`DELSEQ`/`INVSEQ`, omitted when very long). `EVENT_NODES` is **deduplicated and ordered**
   (reference nodes by genomic position, haplotype-only nodes after them in walk order), so
@@ -323,6 +324,30 @@ Rscript scripts/plot_sv_map.R \
   --reference-path grch38_1 \
   --out results/real_data/lpa/call/call.bubble_7
 ```
+
+## Gene annotation (`--gtf`)
+
+Pass a **reference-coordinate GTF** (Ensembl/GENCODE) and `call` projects genes onto the graph via the
+reference path. This requires a **PanSN** reference name (`sample#hap#chrom:start-end`) so the chromosome
++ absolute start are known; otherwise annotation is skipped with a warning. The GTF chromosome is matched
+to the reference leniently (`chr6` ≡ `6`). **Long non-coding RNAs are not annotated** (they span whole
+loci and blur paralog calls). Three outputs are added:
+
+- **`INFO=GENES`** on each record — the gene(s) it overlaps (for a DUP, the whole folded module).
+- **`<prefix>.node_genes.tsv`** — `node_id → gene(s)`, the bridge consumed by the GWAS gene traceback
+  (`gwas_demo.py --node-genes`).
+- **`<prefix>.dup_gene_cn.tsv`** — per-haplotype **per-gene copy number** for DUPs
+  (`bubble_id, variant_id, sample, gene, gene_cn`), resolved by **competitive realignment**: each gene's
+  reference sequence is mapped (minimap2) to every haplotype and each module copy is assigned to the gene
+  it aligns *best* to. This separates collapsed paralogs that share graph nodes — e.g. it resolves
+  **CYP2D6** deletions/duplications from the stable **CYP2D7/2D8P**, and **GSTM1** nulls from GSTM2/4/5.
+  Near-identical, tandem-adjacent paralogs (**C4A vs C4B**, ~99.9% identical) do *not* separate reliably;
+  there the authoritative module total stays the VCF `FORMAT:CN`, and the per-gene split is best-effort.
+
+Graphs whose paths are not PanSN can be converted in place with `scripts/pansn_rename.py`
+(`SAMPLE_HAP_CONTIG:start-end` → `SAMPLE#HAP#CONTIG:start-end`). `bubble` and `panphorte` accept the same
+`--gtf` and write a Bandage gene CSV (`<prefix>.bandage_genes.csv`, `Name,Colour,Gene`) — both, because
+panphorte's collapse renumbers nodes.
 
 ## Algorithm
 

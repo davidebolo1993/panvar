@@ -17,6 +17,21 @@ std::size_t clamp_i32_to_size(std::int32_t value, std::size_t cap) {
     return std::min<std::size_t>(static_cast<std::size_t>(value), cap);
 }
 
+Minimap2Hit reg_to_hit(const mm_reg1_t& reg, std::size_t qlen, std::size_t tlen) {
+    Minimap2Hit out;
+    out.ok = true;
+    out.reverse = reg.rev != 0;
+    out.query_start_bp = clamp_i32_to_size(reg.qs, qlen);
+    out.query_end_bp = clamp_i32_to_size(reg.qe, qlen);
+    if (out.query_end_bp < out.query_start_bp) std::swap(out.query_start_bp, out.query_end_bp);
+    out.target_start_bp = clamp_i32_to_size(reg.rs, tlen);
+    out.target_end_bp = clamp_i32_to_size(reg.re, tlen);
+    if (out.target_end_bp < out.target_start_bp) std::swap(out.target_start_bp, out.target_end_bp);
+    out.n_matches = reg.mlen > 0 ? static_cast<std::size_t>(reg.mlen) : 0;
+    out.aln_block_len = reg.blen > 0 ? static_cast<std::size_t>(reg.blen) : 0;
+    return out;
+}
+
 } // namespace
 
 Minimap2Hit minimap2_best_hit(
@@ -113,21 +128,7 @@ Minimap2Hit minimap2_best_hit(
     }
 
     if (best_idx >= 0) {
-        const mm_reg1_t& reg = regs[best_idx];
-        out.ok = true;
-        out.reverse = reg.rev != 0;
-        out.query_start_bp = clamp_i32_to_size(reg.qs, query_seq.size());
-        out.query_end_bp = clamp_i32_to_size(reg.qe, query_seq.size());
-        if (out.query_end_bp < out.query_start_bp) {
-            std::swap(out.query_start_bp, out.query_end_bp);
-        }
-        out.target_start_bp = clamp_i32_to_size(reg.rs, target_seq.size());
-        out.target_end_bp = clamp_i32_to_size(reg.re, target_seq.size());
-        if (out.target_end_bp < out.target_start_bp) {
-            std::swap(out.target_start_bp, out.target_end_bp);
-        }
-        out.n_matches = reg.mlen > 0 ? static_cast<std::size_t>(reg.mlen) : 0;
-        out.aln_block_len = reg.blen > 0 ? static_cast<std::size_t>(reg.blen) : 0;
+        out = reg_to_hit(regs[best_idx], query_seq.size(), target_seq.size());
     }
 
     for (int i = 0; i < n_regs; ++i) {
@@ -137,6 +138,59 @@ Minimap2Hit minimap2_best_hit(
     mm_tbuf_destroy(tbuf);
     mm_idx_destroy(idx);
     return out;
+}
+
+std::vector<Minimap2Hit> minimap2_hits(
+    const std::string& query_name,
+    const std::string& query_seq,
+    const std::string& target_name,
+    const std::string& target_seq,
+    const std::string& preset,
+    std::size_t best_n) {
+
+    std::vector<Minimap2Hit> hits;
+    if (query_seq.empty() || target_seq.empty()) return hits;
+    if (query_seq.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+        target_seq.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        return hits;
+    }
+
+    mm_idxopt_t idx_opt;
+    mm_mapopt_t map_opt;
+    if (mm_set_opt(nullptr, &idx_opt, &map_opt) < 0) return hits;
+    const std::string chosen = preset.empty() ? std::string("asm20") : preset;
+    if (mm_set_opt(chosen.c_str(), &idx_opt, &map_opt) < 0) return hits;
+    map_opt.flag |= (MM_F_CIGAR | MM_F_EQX);
+    map_opt.flag &= ~MM_F_OUT_SAM;
+    // Keep secondary alignments (one per paralog copy in the target) and raise the cap.
+    const int want = static_cast<int>(std::min<std::size_t>(
+        static_cast<std::size_t>(std::numeric_limits<int>::max()),
+        std::max<std::size_t>(static_cast<std::size_t>(1), best_n)));
+    map_opt.best_n = std::max(map_opt.best_n, want);
+    map_opt.pri_ratio = 0.5f;   // report secondaries scoring >=50% of the primary
+
+    const char* seq_ptrs[1] = {target_seq.c_str()};
+    const char* name_ptrs[1] = {target_name.c_str()};
+    mm_idx_t* idx = mm_idx_str(idx_opt.w, idx_opt.k,
+                               (idx_opt.flag & MM_I_HPC) != 0 ? 1 : 0,
+                               idx_opt.bucket_bits, 1, seq_ptrs, name_ptrs);
+    if (idx == nullptr) return hits;
+    mm_mapopt_update(&map_opt, idx);
+
+    mm_tbuf_t* tbuf = mm_tbuf_init();
+    if (tbuf == nullptr) { mm_idx_destroy(idx); return hits; }
+
+    int n_regs = 0;
+    mm_reg1_t* regs = mm_map(idx, static_cast<int>(query_seq.size()), query_seq.c_str(),
+                             &n_regs, tbuf, &map_opt, query_name.c_str());
+    for (int i = 0; i < n_regs; ++i) {
+        hits.push_back(reg_to_hit(regs[i], query_seq.size(), target_seq.size()));
+        std::free(regs[i].p);
+    }
+    std::free(regs);
+    mm_tbuf_destroy(tbuf);
+    mm_idx_destroy(idx);
+    return hits;
 }
 
 } // namespace panvar

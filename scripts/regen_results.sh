@@ -21,6 +21,10 @@ RS="${RSCRIPT:-Rscript}"
 DATA="$REPO/tests/real_data"
 OUT="$REPO/results/real_data"
 THREADS="${THREADS:-0}"
+# Optional reference-coordinate GTF for gene annotation (bubble/panphorte Bandage gene CSVs, call
+# GENES + per-gene DUP CN + node_genes.tsv, gwas gene traceback). Skipped if the file is absent.
+GTF="${GTF:-$DATA/Homo_sapiens.GRCh38.116.gtf.gz}"
+GTFOPT=(); [[ -f "$GTF" ]] && GTFOPT=(--gtf "$GTF")
 
 have_r() { command -v "$RS" >/dev/null 2>&1; }
 ref_of() {  # pick a reference path: prefer GRCh38, then CHM13, else the first path
@@ -47,11 +51,11 @@ run_region() {
 
   # 1) bubble: internal sort+flip along the reference + cactus snarl finder. Writes
   #    bubble.sorted.gfa (the reference-oriented graph) which the rest of the pipeline consumes.
-  "$BIN" bubble -i "$gfa" -o "$d/bubble/bubble" -r "$ref" --quiet || return 1
+  "$BIN" bubble -i "$gfa" -o "$d/bubble/bubble" -r "$ref" "${GTFOPT[@]}" --quiet || return 1
   local sgfa="$d/bubble/bubble.sorted.gfa"
   # 2) panphorte on the sorted graph (normalized + re-sorted along the reference)
   "$BIN" panphorte -i "$sgfa" --bubble-prefix-in "$d/bubble/bubble" -o "$d/panphorte/panphorte" \
-    --reference-path "$ref" --threads "$THREADS" --quiet $pan_extra || return 1
+    --reference-path "$ref" --threads "$THREADS" "${GTFOPT[@]}" --quiet $pan_extra || return 1
   local pgfa="$d/panphorte/panphorte.normalized.sorted.gfa"
   # Pick the graph + bubble prefix `call`/`describe`/`inspect` read, per topology.
   local cgfa cpfx
@@ -59,7 +63,7 @@ run_region() {
   else cgfa="$pgfa"; cpfx="$d/panphorte/panphorte"; fi
   # 3) call
   "$BIN" call -i "$cgfa" --bubble-prefix-in "$cpfx" --reference-path "$ref" \
-    -o "$d/call/call" --threads "$THREADS" --quiet $call_extra || return 1
+    -o "$d/call/call" --threads "$THREADS" "${GTFOPT[@]}" --quiet $call_extra || return 1
   # 4) describe (variant-restricted markers)
   "$BIN" describe -i "$cgfa" --bubble-prefix-in "$cpfx" --out-dir "$d/describe" \
     --variant-nodes "$d/call/call.variant_nodes.tsv" --no-wide-matrix --threads "$THREADS" --quiet || return 1

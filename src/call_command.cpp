@@ -48,6 +48,9 @@ void print_call_help() {
         << "      --cn-from-coverage           Emit total-module copy number (spelled-bp/unit) on folded\n"
         << "                                   paralog clusters (reference folds >=2x, e.g. CYP2D6);\n"
         << "                                   recovers deletions+gains; precedence over --cn-from-multiplicity\n"
+        << "      --gtf <path>                 Reference-coordinate GTF: annotate variants with the genes\n"
+        << "                                   they touch (INFO GENES), write <prefix>.node_genes.tsv and a\n"
+        << "                                   per-gene DUP copy-number table; needs a PanSN reference path\n"
         << "      --bubble-id <N>              Restrict to one bubble ID (repeatable)\n"
         << "      --no-per-bubble-vcf          Only write the concatenated region VCF\n"
         << "      --no-variant-paths           Skip the variant_paths.tsv + node_track.tsv sidecars\n"
@@ -148,6 +151,10 @@ int run_call_command(const std::vector<std::string>& args) {
         }
         if (arg == "--cn-from-multiplicity") {
             options.cn_from_multiplicity = true;
+            continue;
+        }
+        if (arg == "--gtf") {
+            options.gtf_path = require_value(arg);
             continue;
         }
         if (arg == "--cn-from-coverage") {

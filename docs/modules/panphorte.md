@@ -130,6 +130,9 @@ referenced. **What is written depends on `--reference-path`:**
   - `<prefix>.normalized.sorted.gfa` — the sorted, call-ready graph
   - `<prefix>.bubbles.csv` — the re-snarled bubbles
   - `<prefix>.bandage_nodes.csv` — node colors for Bandage inspection
+  - with `--gtf <path>` (and a PanSN `--reference-path`): `<prefix>.bandage_genes.csv`
+    (`Name,Colour,Gene`) projecting genes onto the **normalized** graph. panphorte renumbers nodes when
+    it collapses, so this is distinct from `bubble`'s gene CSV; long non-coding RNAs are skipped.
 
   so the whole pipeline is **`bubble → panphorte --reference-path → call`**:
 

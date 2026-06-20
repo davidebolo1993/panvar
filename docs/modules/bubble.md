@@ -28,6 +28,10 @@ CLI entrypoint:
 - `*.bubbles.csv`: refined bubble/site table used by downstream modules (`inspect`, `panphorte`)
 - `*.sorted.gfa`: the reference-sorted/-flipped graph to be used as input for downstream `panphorte`
 - `*.bandage_nodes.csv`: node colors for Bandage visualization
+- optional `--gtf <path>`: with a **PanSN** reference path, projects genes from a reference-coordinate
+  GTF onto the reference nodes and writes `*.bandage_genes.csv` (`Name,Colour,Gene`) to highlight genes
+  per bubble in Bandage. Long non-coding RNAs are skipped. (Convert non-PanSN graphs first with
+  `scripts/pansn_rename.py`.)
 - optional `--snarl-debug-tsv <path>`: candidate-level diagnostics
 - optional `--emit-snarls-jsonl <path>`: the internal snarls in vg-style JSONL
 

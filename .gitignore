@@ -21,3 +21,4 @@ tests/results
 
 # Local regenerated results (scripts/regen_results.sh)
 results/
+tests/real_data/*.gtf.gz

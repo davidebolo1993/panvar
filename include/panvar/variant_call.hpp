@@ -32,6 +32,9 @@ struct VariantCallOptions {
     std::string minimap_preset = "asm20";
     std::size_t minimap_best_n = 8;
     double ins_dup_min_identity = 0.90;  // identity for an INS to be subtyped DUP
+    std::string gtf_path;                // optional reference-coordinate GTF: annotate variants with the
+                                         // genes they touch (INFO GENES), write <prefix>.node_genes.tsv,
+                                         // and a per-gene DUP copy-number table; needs a PanSN reference
     std::vector<std::size_t> bubble_ids; // if non-empty, restrict to these bubbles
     bool write_per_bubble_vcf = true;    // also keep each <prefix>.bubble_<id>.vcf
     bool write_variant_paths = true;     // write <prefix>.variant_paths.tsv (per-variant carrier sub-walks)

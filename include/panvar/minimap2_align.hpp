@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <string>
+#include <vector>
 
 namespace panvar {
 
@@ -34,5 +35,16 @@ Minimap2Hit minimap2_best_hit(
     const std::string& target_seq,
     const std::string& preset = "asm20",
     std::size_t best_n = 8);
+
+// Align query_seq against target_seq and return ALL hit regions (primary + secondary),
+// each as a Minimap2Hit. Used to count paralog copies (one hit per copy in the target).
+// preset/best_n as above. Returns empty on failure or empty/oversized input.
+std::vector<Minimap2Hit> minimap2_hits(
+    const std::string& query_name,
+    const std::string& query_seq,
+    const std::string& target_name,
+    const std::string& target_seq,
+    const std::string& preset = "asm20",
+    std::size_t best_n = 64);
 
 } // namespace panvar

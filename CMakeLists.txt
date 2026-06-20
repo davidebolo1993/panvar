@@ -46,6 +46,7 @@ add_library(panvarlib
     src/bubble_path.cpp
     src/bubbles.cpp
     src/ref_path.cpp
+    src/gtf.cpp
     src/minimap2_align.cpp
     src/variant_call.cpp
     src/describe.cpp

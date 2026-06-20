@@ -5,6 +5,7 @@
 #include "panvar/gfa.hpp"
 #include "panvar/gfa_io.hpp"
 #include "panvar/graph_sort.hpp"
+#include "panvar/gtf.hpp"
 #include "panvar/integrated_snarls.hpp"
 #include "panvar/output.hpp"
 
@@ -42,6 +43,9 @@ void print_bubble_help() {
         << "  -o, --out-prefix <prefix>        Output prefix (default: bubble_calls)\n"
         << "      --bubbles-csv <path>         Explicit bubbles CSV output path\n"
         << "      --bandage-csv <path>         Explicit Bandage color CSV output path\n"
+        << "      --gtf <path>                 Reference-coordinate GTF; project genes onto reference\n"
+        << "                                    nodes and write <prefix>.bandage_genes.csv (Bandage).\n"
+        << "                                    Requires a PanSN reference path; skipped otherwise.\n"
         << "      --snarl-debug-tsv <path>     Optional diagnostics TSV for snarl candidates\n"
         << "      --min-variant-bp <N>         Keep bubbles with at least one path carrying >= N bp\n"
         << "                                    inside the bubble (default: 50, 0=disable)\n"
@@ -68,6 +72,7 @@ int run_bubble_command(const std::vector<std::string>& args) {
     std::string snarl_debug_tsv_path;
     std::string sorted_gfa_path;
     std::string emit_snarls_jsonl_path;
+    std::string gtf_path;
     bool no_flip = false;
 
     BubbleCallOptions options;
@@ -99,6 +104,10 @@ int run_bubble_command(const std::vector<std::string>& args) {
         }
         if (arg == "--bandage-csv") {
             bandage_csv_path = require_value(arg);
+            continue;
+        }
+        if (arg == "--gtf") {
+            gtf_path = require_value(arg);
             continue;
         }
         if (arg == "--snarls-in") {
@@ -217,6 +226,13 @@ int run_bubble_command(const std::vector<std::string>& args) {
 
     write_bubbles_csv(bubbles_csv_path, bubbles);
     write_bandage_node_colors_csv(bandage_csv_path, bubbles, report.non_snp_bubbles);
+    std::string bandage_genes_path;
+    if (!gtf_path.empty()) {
+        bandage_genes_path = out_prefix + ".bandage_genes.csv";
+        if (!emit_gene_annotation(graph, options.reference_path, gtf_path, bandage_genes_path)) {
+            bandage_genes_path.clear();
+        }
+    }
     if (!snarl_debug_tsv_path.empty()) {
         write_snarl_debug_tsv(snarl_debug_tsv_path, report.snarl_debug);
     }
@@ -264,6 +280,9 @@ int run_bubble_command(const std::vector<std::string>& args) {
         << "Non-SNP candidate bubbles (for Bandage context): " << report.non_snp_bubbles.size() << "\n"
         << "Wrote: " << bubbles_csv_path << "\n"
         << "Wrote: " << bandage_csv_path << "\n";
+    if (!bandage_genes_path.empty()) {
+        std::cout << "Wrote: " << bandage_genes_path << "\n";
+    }
     if (!snarl_debug_tsv_path.empty()) {
         std::cout << "Wrote: " << snarl_debug_tsv_path << "\n";
     }

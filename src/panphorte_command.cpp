@@ -1,6 +1,8 @@
 #include "panvar/panphorte_command.hpp"
 
 #include "panvar/cli_utils.hpp"
+#include "panvar/gfa.hpp"
+#include "panvar/gtf.hpp"
 #include "panvar/panphorte.hpp"
 
 #include <iostream>
@@ -35,6 +37,9 @@ void print_panphorte_help() {
         << "                                   <prefix>.bandage_nodes.csv so 'call' runs with no\n"
         << "                                   external vg/odgi tools (the unsorted GFA is not written)\n"
         << "      --no-flip                    With --reference-path, skip reorienting to the ref strand\n"
+        << "      --gtf <path>                 Reference-coordinate GTF; after re-sorting, project genes\n"
+        << "                                   onto the normalized graph's nodes and write\n"
+        << "                                   <prefix>.bandage_genes.csv (needs a PanSN --reference-path)\n"
         << "  -q, --quiet                      Disable progress logs\n"
         << "  -h, --help                       Show this help\n";
 }
@@ -48,6 +53,7 @@ int run_panphorte_command(const std::vector<std::string>& args) {
     }
 
     std::string bubble_prefix_in;
+    std::string gtf_path;
     PanphorteOptions options;
 
     for (std::size_t i = 0; i < args.size(); ++i) {
@@ -115,6 +121,10 @@ int run_panphorte_command(const std::vector<std::string>& args) {
             options.no_flip = true;
             continue;
         }
+        if (arg == "--gtf") {
+            gtf_path = require_value(arg);
+            continue;
+        }
         if (arg == "-q" || arg == "--quiet") {
             options.quiet = true;
             continue;
@@ -167,6 +177,16 @@ int run_panphorte_command(const std::vector<std::string>& args) {
             << "Re-snarled bubbles: " << summary.resnarled_bubbles << "\n"
             << "Ready for: panvar call -i " << options.out_prefix
             << ".normalized.sorted.gfa --bubble-prefix-in " << options.out_prefix << "\n";
+        // Gene annotation on the collapsed graph: node ids differ from the bubble graph, so this
+        // Bandage CSV is distinct from the one bubble emits. Needs a PanSN --reference-path.
+        if (!gtf_path.empty() && !options.reference_path.empty()) {
+            const std::string sorted_gfa = options.out_prefix + ".normalized.sorted.gfa";
+            const std::string genes_csv = options.out_prefix + ".bandage_genes.csv";
+            const Graph g = parse_gfa(sorted_gfa);
+            if (emit_gene_annotation(g, options.reference_path, gtf_path, genes_csv)) {
+                std::cout << "Wrote: " << genes_csv << "\n";
+            }
+        }
     } else {
         std::cout << "Output GFA: " << options.out_prefix << ".normalized.gfa\n";
     }

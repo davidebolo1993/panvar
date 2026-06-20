@@ -39,13 +39,17 @@ PGFA="$OUT_DIR/pan.normalized.sorted.gfa"   # panphorte graph: the input for cal
 "$PY" "$HERE/make_lpa_phenotype.py" "$OUT_DIR/pan.panphorte.copies.tsv" "$REAL" 200
 
 echo "== call -> describe --samples (variant-restricted, both substrates) =="
+# Optional GTF gene annotation: produces call.node_genes.tsv for the gwas gene traceback.
+GTF="${GTF:-$REPO/tests/real_data/Homo_sapiens.GRCh38.116.gtf.gz}"
+GTFOPT=(); [ -f "$GTF" ] && GTFOPT=(--gtf "$GTF")
 "$PANVAR_BIN" call -i "$PGFA" --bubble-prefix-in "$OUT_DIR/pan" --reference-path "$REF" \
-  -o "$OUT_DIR/call" --cn-from-multiplicity --quiet >/dev/null
+  -o "$OUT_DIR/call" --cn-from-multiplicity ${GTFOPT[@]+"${GTFOPT[@]}"} --quiet >/dev/null
 "$PANVAR_BIN" describe -i "$PGFA" --bubble-prefix-in "$OUT_DIR/pan" --out-dir "$OUT_DIR/desc" \
   --kmer-size 31 --no-wide-matrix --variant-nodes "$OUT_DIR/call.variant_nodes.tsv" \
   --samples "$REAL/samples.tsv" --quiet >/dev/null
 
-NT="$OUT_DIR/call.node_track.tsv"; VN="$OUT_DIR/call.variant_nodes.tsv"
+NT="$OUT_DIR/call.node_track.tsv"; VN="$OUT_DIR/call.variant_nodes.tsv"; NG="$OUT_DIR/call.node_genes.tsv"
+NGOPT=(); [ -f "$NG" ] && NGOPT=(--node-genes "$NG")
 KFSM="$OUT_DIR/desc/fsm_kmers.samples.txt.gz"; KFEAT="$OUT_DIR/desc/bubble_*/kmer_features.tsv.gz"
 GFSM="$OUT_DIR/desc/fsm_graph.samples.txt.gz"
 for sub in kmer graph; do
@@ -56,7 +60,7 @@ for sub in kmer graph; do
     echo "== association ($sub / $m) =="
     "$PY" "$REPO/scripts/gwas_demo.py" --fsm "$fsm" --phenotypes "$REAL/phenotypes.tsv" \
       --id-col sample --phenotype-col "$col" --mode "$m" --substrate "$sub" ${extra[@]+"${extra[@]}"} \
-      --node-track "$NT" --variant-nodes "$VN" --out "$OUT_DIR/gwas_${sub}_${m}"
+      --node-track "$NT" --variant-nodes "$VN" ${NGOPT[@]+"${NGOPT[@]}"} --out "$OUT_DIR/gwas_${sub}_${m}"
     "$RS" "$REPO/scripts/plot_gwas.R" --assoc "$OUT_DIR/gwas_${sub}_${m}.assoc.tsv" \
       --out "$OUT_DIR/plot_${sub}_${m}" --x nodes --title "LPA ($sub, $m)" >/dev/null \
       || echo "  (plot skipped: ggplot2?)"

@@ -134,6 +134,20 @@ def load_variant_nodes(vn_path):
     return nv
 
 
+def load_node_genes(ng_path):
+    """node_id -> gene-name string (';'-joined) from call node_genes.tsv (from --gtf)."""
+    ng = {}
+    if not ng_path or not os.path.exists(ng_path):
+        return ng
+    with open(ng_path) as fh:
+        fh.readline()
+        for line in fh:
+            f = line.rstrip("\n").split("\t")
+            if len(f) >= 2 and f[0]:
+                ng[f[0]] = f[1]
+    return ng
+
+
 def bh_q(pvals):
     p = np.asarray(pvals, float)
     n = len(p)
@@ -161,6 +175,7 @@ def main():
     ap.add_argument("--feature-map", help="glob for describe kmer_features.tsv.gz (traceback/position)")
     ap.add_argument("--node-track", help="call node_track.tsv (genomic position)")
     ap.add_argument("--variant-nodes", help="call variant_nodes.tsv (variant annotation)")
+    ap.add_argument("--node-genes", help="call node_genes.tsv (gene traceback, from call --gtf)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -174,6 +189,7 @@ def main():
     kn = load_kmer_nodes(args.feature_map) if args.feature_map else {}
     npos, nbub = load_node_pos(args.node_track)
     nv = load_variant_nodes(args.variant_nodes)
+    ng = load_node_genes(args.node_genes)
     # bubble -> median reference position, so off-reference k-mers still land at their locus
     bub_pos = {}
     for nd, p in npos.items():
@@ -181,6 +197,7 @@ def main():
     bub_pos = {b: float(np.median(v)) for b, v in bub_pos.items()}
 
     recs = []
+    gene_anns = []   # parallel to recs (pre-sort), appended as the trailing 'genes' column
     for kmer, carriers in fsm.items():
         c = np.zeros(n)
         for s, cnt in carriers.items():
@@ -216,6 +233,12 @@ def main():
         # placing EVERY k-mer including those with no reference coordinate.
         num_nodes = [int(nd) for nd in nodes if nd.isdigit()]
         node_min = float(min(num_nodes)) if num_nodes else float("nan")
+        gset = []
+        for nd in nodes:
+            for g in ng.get(nd, "").split(";"):
+                if g and g not in gset:
+                    gset.append(g)
+        gene_anns.append(";".join(sorted(gset)) or ".")
         recs.append([kmer, bub, pos, node_min, ",".join(nodes) or ".", var,
                      int(b.sum()), float(c.max()), pa_p, count_p])
 
@@ -228,15 +251,15 @@ def main():
     count_q = bh_q([r[9] for r in recs])
     m = len(recs)
     for i, r in enumerate(recs):
-        r += [min(1.0, r[8] * m), min(1.0, r[9] * m), pa_q[i], count_q[i]]
-    #                10 pa_bonf 11 count_bonf 12 pa_q 13 count_q
+        r += [min(1.0, r[8] * m), min(1.0, r[9] * m), pa_q[i], count_q[i], gene_anns[i]]
+    #                10 pa_bonf 11 count_bonf 12 pa_q 13 count_q 14 genes
 
     recs.sort(key=lambda r: r[13])  # by count_q
     with open(args.out + ".assoc.tsv", "w") as fh:
         fh.write("kmer\tbubble_id\tpos\tnode_min\tnodes\tvariant\tn_carriers\tmax_count\t"
-                 "pa_p\tcount_p\tpa_bonf\tcount_bonf\tpa_q\tcount_q\n")
+                 "pa_p\tcount_p\tpa_bonf\tcount_bonf\tpa_q\tcount_q\tgenes\n")
         for r in recs:
-            fh.write("{}\t{}\t{:.1f}\t{:.0f}\t{}\t{}\t{}\t{:.0f}\t{:.3e}\t{:.3e}\t{:.3e}\t{:.3e}\t{:.3e}\t{:.3e}\n".format(*r))
+            fh.write("{}\t{}\t{:.1f}\t{:.0f}\t{}\t{}\t{}\t{:.0f}\t{:.3e}\t{:.3e}\t{:.3e}\t{:.3e}\t{:.3e}\t{:.3e}\t{}\n".format(*r))
 
     sig = lambda q: q < 0.05
     n_count = sum(sig(r[13]) for r in recs)

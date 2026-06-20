@@ -5,6 +5,7 @@
 #include "panvar/bubbles.hpp"
 #include "panvar/cli_utils.hpp"
 #include "panvar/graph_utils.hpp"
+#include "panvar/gtf.hpp"
 #include "panvar/minimap2_align.hpp"
 #include "panvar/output.hpp"
 #include "panvar/parallel.hpp"
@@ -565,6 +566,37 @@ void call_variants(
     const ParsedReferencePath ref_meta = parse_reference_path_label(ref_name);
     const std::vector<std::size_t> ref_prefix = path_prefix_bp(*ref_path, graph.nodes);
 
+    // ---- Optional GTF gene annotation. The GTF is in reference coordinates; we read the
+    // reference path's chrom + absolute start (PanSN) and project genes onto reference nodes.
+    // node_genes maps a reference node id -> indices into `genes`. Built once; const in the
+    // parallel loop. Annotation is skipped (genes stays empty) when --gtf is unset or the
+    // reference name is not PanSN.
+    std::vector<GeneFeature> genes;
+    std::unordered_map<std::string, std::vector<int>> node_genes;
+    if (!options.gtf_path.empty()) {
+        if (!is_pansn(ref_name)) {
+            std::cerr << "warning: --gtf given but reference path '" << ref_name
+                      << "' is not PanSN (sample#hap#contig:start-end); skipping gene annotation\n";
+        } else {
+            const std::size_t lo = ref_meta.region_start_1based;
+            const std::size_t hi = lo + (ref_prefix.empty() ? 0 : ref_prefix.back()) - 1;
+            genes = parse_gtf(options.gtf_path, ref_meta.chrom, lo, hi);
+            node_genes = project_genes_to_nodes(graph, *ref_path, ref_meta, genes);
+        }
+    }
+    // Sorted, unique gene names overlapping a set of node ids (for the INFO GENES field).
+    auto genes_for_nodes = [&](const std::vector<std::string>& ids) {
+        std::vector<std::string> names;
+        std::unordered_set<int> seen;
+        for (const std::string& id : ids) {
+            const auto it = node_genes.find(id);
+            if (it == node_genes.end()) continue;
+            for (int gi : it->second) if (seen.insert(gi).second) names.push_back(genes[gi].gene_name);
+        }
+        std::sort(names.begin(), names.end());
+        return names;
+    };
+
     // Fixed sample list: every haplotype path (the reference included).
     std::vector<std::string> sample_names;
     sample_names.reserve(graph.paths.size());
@@ -595,6 +627,8 @@ void call_variants(
         out << "##INFO=<ID=INS_SUBTYPE,Number=1,Type=String,Description=\"INS subtype: NOVEL or DUP (minimap2 refined)\">\n";
         out << "##INFO=<ID=REF_CN,Number=1,Type=Integer,Description=\"Reference copy number of the repeat unit (DUP)\">\n";
         out << "##INFO=<ID=RU_LEN,Number=1,Type=Integer,Description=\"Repeat-unit length in bp, one copy (DUP)\">\n";
+        if (!genes.empty())
+            out << "##INFO=<ID=GENES,Number=.,Type=String,Description=\"Gene(s) overlapping the variant (from --gtf)\">\n";
         out << "##INFO=<ID=NMERGED,Number=1,Type=Integer,Description=\"Haplotype carriers merged into this record\">\n";
         out << "##INFO=<ID=MERGE_JACCARD,Number=1,Type=Float,Description=\"Strongest node-set Jaccard that merged a member into this record (cross-haplotype merge evidence)\">\n";
         out << "##INFO=<ID=MERGE_SEQID,Number=1,Type=Float,Description=\"Strongest sequence identity that merged a member into this record, when the Jaccard gate did not decide it\">\n";
@@ -632,17 +666,27 @@ void call_variants(
     std::vector<OutRecord> out_records;
     std::vector<std::string> node_track_rows;        // <prefix>.node_track.tsv body (plotting x-axis)
     std::vector<std::string> variant_nodes_rows;     // <prefix>.variant_nodes.tsv (describe handoff)
+    std::vector<std::string> dup_gene_cn_rows;       // <prefix>.dup_gene_cn.tsv body (per-gene DUP CN)
 
     VariantCallSummary summary;
 
     // Per-bubble outputs, computed in parallel and merged in bubble order so the result is identical
     // regardless of thread count: the region VCF is coordinate-sorted afterwards (total order on
     // unique ids), and node_track / variant_nodes inherit deterministic bubble order from the merge.
+    // A DUP whose per-gene copy number will be resolved by realignment (post-pass).
+    struct DupGeneTarget {
+        std::size_t bubble_id = 0;
+        std::string variant_id;
+        std::vector<int> gene_idx;   // indices into `genes` of the genes overlapping the bubble
+    };
+    std::vector<DupGeneTarget> dup_targets;
+
     struct BubbleOut {
         VariantCallSummary sum;
         std::vector<OutRecord> records;
         std::vector<std::string> node_track;
         std::vector<std::string> variant_nodes;
+        std::vector<DupGeneTarget> dup_targets;   // DUPs needing per-gene CN (when --gtf is active)
     };
 
     // Genomic 1-based start of a bubble node from the reference path (first occurrence).
@@ -673,6 +717,7 @@ void call_variants(
         std::vector<OutRecord>& out_records = bout.records;
         std::vector<std::string>& node_track_rows = bout.node_track;
         std::vector<std::string>& variant_nodes_rows = bout.variant_nodes;
+        std::vector<DupGeneTarget>& dup_targets = bout.dup_targets;
         std::unordered_map<std::string, int> id_counts;
         if (!bubble_filter.empty() && bubble_filter.find(bubble.id) == bubble_filter.end()) return;
         ++summary.bubbles_seen;
@@ -1201,6 +1246,23 @@ void call_variants(
             for (const std::string& m : alleles[ai].members) sample_to_allele[m] = ai;
         }
 
+        // Genes overlapping this bubble's reference span (for the per-gene DUP table, resolved by
+        // realignment in a post-pass). The GENES INFO field is graph-based (collapsed nodes tag
+        // multiple genes); the per-gene COPY NUMBER is resolved later by competitive realignment,
+        // which separates collapsed paralogs (CYP2D6 vs 2D7) the graph cannot.
+        std::vector<int> bubble_gene_idx;
+        if (!node_genes.empty()) {
+            std::unordered_set<int> seen;
+            std::vector<std::string> bnodes(bubble.inside.begin(), bubble.inside.end());
+            bnodes.push_back(bubble.source); bnodes.push_back(bubble.sink);
+            for (const std::string& id : bnodes) {
+                const auto it = node_genes.find(id);
+                if (it == node_genes.end()) continue;
+                for (int gi : it->second) if (seen.insert(gi).second) bubble_gene_idx.push_back(gi);
+            }
+            std::sort(bubble_gene_idx.begin(), bubble_gene_idx.end());
+        }
+
         // ---- Optional multiallelic-locus record (--multiallelic-loci): collapse a bounded
         // locus (e.g. an STR/VNTR) into ONE record with explicit-sequence alleles
         // (REF + ALT1,ALT2,...), GT indexing the allele a sample carries. Skipped (falls back
@@ -1448,6 +1510,21 @@ void call_variants(
             if (!e.link_id.empty()) info << ";EVENTID=bubble" << bubble.id << "_" << e.link_id;
             if (e.type == EvType::Dup) info << ";REF_CN=" << e.ref_cn;
             if (e.type == EvType::Dup && e.ru_len > 0) info << ";RU_LEN=" << e.ru_len;
+            if (!genes.empty()) {
+                // Genes the variant touches: its reference event nodes; for a DUP (and as a
+                // fallback) the whole bubble's reference span (the folded module).
+                std::vector<std::string> gnames = (e.type == EvType::Dup)
+                    ? std::vector<std::string>{} : genes_for_nodes(ev_nodes);
+                if (gnames.empty()) {
+                    std::vector<std::string> bn(bubble.inside.begin(), bubble.inside.end());
+                    bn.push_back(bubble.source); bn.push_back(bubble.sink);
+                    gnames = genes_for_nodes(bn);
+                }
+                if (!gnames.empty()) {
+                    info << ";GENES=";
+                    for (std::size_t k = 0; k < gnames.size(); ++k) { if (k) info << ','; info << gnames[k]; }
+                }
+            }
             if (e.type == EvType::Ins && !e.ins_subtype.empty()) info << ";INS_SUBTYPE=" << e.ins_subtype;
             if (!e.seq.empty() && e.seq.size() <= 20000) {
                 if (e.type == EvType::Ins) info << ";INSSEQ=" << e.seq;
@@ -1498,6 +1575,11 @@ void call_variants(
                     id + '\t' + std::to_string(bubble.id) + '\t' + svt + '\t' + nodes);
             }
 
+            // Record a per-gene-CN target for this DUP (resolved by realignment post-pass).
+            if (e.type == EvType::Dup && !bubble_gene_idx.empty()) {
+                dup_targets.push_back(DupGeneTarget{bubble.id, id, bubble_gene_idx});
+            }
+
             ++summary.records_written;
             if (e.type == EvType::Del) ++summary.del;
             else if (e.type == EvType::Ins) ++summary.ins;
@@ -1521,6 +1603,7 @@ void call_variants(
         for (OutRecord& r : bo.records) out_records.push_back(std::move(r));
         for (std::string& s : bo.node_track) node_track_rows.push_back(std::move(s));
         for (std::string& s : bo.variant_nodes) variant_nodes_rows.push_back(std::move(s));
+        for (DupGeneTarget& t : bo.dup_targets) dup_targets.push_back(std::move(t));
     }
 
     // ---- Coordinate-sort all records and write the (indexable) region + per-bubble VCFs.
@@ -1577,6 +1660,62 @@ void call_variants(
         }
         vn_out << "variant_id\tbubble_id\tsvtype\tnode_ids\n";
         for (const std::string& r : variant_nodes_rows) vn_out << r << '\n';
+    }
+
+    // GTF annotation sidecars (independent of --no-variant-paths): node->genes map (consumed by
+    // describe/gwas) and the per-gene DUP copy-number table. The table's per-gene copy number is
+    // resolved by COMPETITIVE REALIGNMENT: each gene's reference sequence is mapped to every
+    // haplotype and each module copy locus is assigned to the gene it aligns best to. This is what
+    // separates collapsed paralogs (CYP2D6 vs 2D7) that share graph nodes; graph multiplicity alone
+    // reports only the module total.
+    if (!genes.empty()) {
+        write_node_genes_tsv(options.out_prefix + ".node_genes.tsv", node_genes, genes);
+
+        if (!dup_targets.empty()) {
+            const std::string ref_full_seq = spell_path_steps_sequence(graph, ref_path->steps);
+            const std::size_t region_start = ref_meta.region_start_1based;
+            auto gene_seq_of = [&](int gi) -> std::string {
+                const GeneFeature& g = genes[gi];
+                if (g.start_1based < region_start) return std::string();
+                const std::size_t off = g.start_1based - region_start;
+                if (off >= ref_full_seq.size()) return std::string();
+                const std::size_t len = std::min(g.end_1based - g.start_1based + 1, ref_full_seq.size() - off);
+                return ref_full_seq.substr(off, len);
+            };
+            std::unordered_map<int, std::string> gene_seq_cache;
+            for (const DupGeneTarget& t : dup_targets)
+                for (int gi : t.gene_idx)
+                    if (!gene_seq_cache.count(gi)) gene_seq_cache[gi] = gene_seq_of(gi);
+            // Spell every haplotype once (parallel).
+            std::vector<std::string> hap_seq(graph.paths.size());
+            run_parallel(graph.paths.size(), options.threads, [&](std::size_t pi) {
+                hap_seq[pi] = spell_path_steps_sequence(graph, graph.paths[pi].steps);
+            });
+            for (const DupGeneTarget& t : dup_targets) {
+                std::vector<std::string> gseqs;
+                gseqs.reserve(t.gene_idx.size());
+                for (int gi : t.gene_idx) gseqs.push_back(gene_seq_cache[gi]);
+                std::vector<std::vector<std::string>> per_path(graph.paths.size());
+                run_parallel(graph.paths.size(), options.threads, [&](std::size_t pi) {
+                    const std::vector<int> cn = assign_gene_copies(gseqs, hap_seq[pi]);
+                    for (std::size_t k = 0; k < t.gene_idx.size(); ++k) {
+                        per_path[pi].push_back(
+                            std::to_string(t.bubble_id) + '\t' + t.variant_id + '\t' +
+                            graph.paths[pi].name + '\t' + genes[t.gene_idx[k]].gene_name + '\t' +
+                            std::to_string(cn[k]));
+                    }
+                });
+                for (std::size_t pi = 0; pi < graph.paths.size(); ++pi)
+                    for (std::string& r : per_path[pi]) dup_gene_cn_rows.push_back(std::move(r));
+            }
+        }
+
+        std::ofstream dg_out(options.out_prefix + ".dup_gene_cn.tsv");
+        if (!dg_out) {
+            throw std::runtime_error("Failed to write per-gene DUP CN TSV: " + options.out_prefix + ".dup_gene_cn.tsv");
+        }
+        dg_out << "bubble_id\tvariant_id\tsample\tgene\tgene_cn\n";
+        for (const std::string& r : dup_gene_cn_rows) dg_out << r << '\n';
     }
 
     if (summary_out) *summary_out = summary;
