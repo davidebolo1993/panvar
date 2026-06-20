@@ -156,6 +156,16 @@ for region in "${REGIONS[@]}"; do
       # (unannotated) CYP2D8P / 2D7-hybrid module that the gene BED does not count -- real biology.
       run_region cyp2d6 "$DATA/cyp2d6.gfa.gz" "" bubble "--cn-from-coverage"
       validate_cn cyp2d6 --mode gene-count --truth "$DATA/cyp2d6.bed" --genes CYP2D6,CYP2D7
+      # Resolved per-gene split (reliable genes from --gtf realignment) vs per-gene truth: CYP2D6 and
+      # CYP2D7 separately, absolute (offset 0). Adds CYP2D6/CYP2D7 facets to the concordance plot.
+      if [[ -s "$OUT/cyp2d6/call/call.dup_gene_cn.tsv" ]]; then
+        for g in CYP2D6 CYP2D7; do
+          echo "---- cyp2d6 $g per-gene split vs ground truth ----"
+          "$PY" "$HERE/compare_copy_number.py" --mode per-gene --truth "$DATA/cyp2d6.bed" --genes "$g" \
+            --dup-gene-cn "$OUT/cyp2d6/call/call.dup_gene_cn.tsv" --label "$g" --offset 0 \
+            --dump-tsv "$CN_TABLE" || echo "  (per-gene $g compare skipped)"
+        done
+      fi
       ;;
     synthetic)
       echo "############ synthetic ############"

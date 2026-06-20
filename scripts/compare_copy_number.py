@@ -36,7 +36,7 @@ def strip_inv(name):
 def load_truth(args):
     """Return {molecule -> expected copy number}."""
     exp = collections.Counter()
-    if args.mode == "gene-count":
+    if args.mode in ("gene-count", "per-gene"):
         genes = set(g.strip() for g in args.genes.split(",") if g.strip())
         with open(args.truth) as fh:
             fh.readline()  # header: molecule  gene  start  end  strand
@@ -76,6 +76,23 @@ def load_truth(args):
     return exp
 
 
+def per_gene_called_cn(dup_gene_cn_path, gene):
+    """Per-sample per-gene CN from call's dup_gene_cn.tsv, for a RELIABLE (separable) gene.
+    Columns: bubble_id, variant_id, sample, genes, cn, reliable."""
+    cn = {}
+    with open(dup_gene_cn_path) as fh:
+        hdr = fh.readline().rstrip("\n").split("\t")
+        gi, si, ci, ri = (hdr.index("genes"), hdr.index("sample"),
+                          hdr.index("cn"), hdr.index("reliable"))
+        for line in fh:
+            f = line.rstrip("\n").split("\t")
+            if len(f) <= ri:
+                continue
+            if f[gi] == gene and f[ri] == "1" and f[ci] not in (".", ""):
+                cn[strip_inv(f[si])] = int(f[ci])
+    return cn
+
+
 def biggest_dup_cn(vcf_path):
     """Per-sample CN of the largest DUP record (the gene's copy-number module)."""
     samples, best = [], None
@@ -102,9 +119,10 @@ def biggest_dup_cn(vcf_path):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--mode", required=True, choices=["gene-count", "direct", "repeats"])
+    ap.add_argument("--mode", required=True, choices=["gene-count", "direct", "repeats", "per-gene"])
     ap.add_argument("--truth", required=True, help="ground-truth file (BED / 2-col / repeats table)")
-    ap.add_argument("--vcf", required=True, help="panvar call region VCF")
+    ap.add_argument("--vcf", help="panvar call region VCF (module-CN modes)")
+    ap.add_argument("--dup-gene-cn", help="call dup_gene_cn.tsv (per-gene mode: resolved per-gene CN)")
     ap.add_argument("--genes", default="", help="comma list of target genes (gene-count mode)")
     ap.add_argument("--name-col", default="hapl", help="name column (repeats mode)")
     ap.add_argument("--count-col", default="copies", help="count column (repeats mode)")
@@ -121,7 +139,14 @@ def main():
     args = ap.parse_args()
 
     exp = load_truth(args)
-    cn = biggest_dup_cn(args.vcf)
+    if args.mode == "per-gene":
+        if not args.dup_gene_cn:
+            sys.exit("per-gene mode needs --dup-gene-cn <call.dup_gene_cn.tsv>")
+        cn = per_gene_called_cn(args.dup_gene_cn, args.genes.strip())
+    else:
+        if not args.vcf:
+            sys.exit("module-CN modes need --vcf <call.region.vcf>")
+        cn = biggest_dup_cn(args.vcf)
     # compare on haplotypes present in BOTH the call and the ground truth
     shared = [s for s in cn if s in exp]
     label = args.label or args.mode

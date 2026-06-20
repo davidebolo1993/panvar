@@ -532,3 +532,68 @@ Because k-mers are spelled from the bubble's node sequences, each kept k-mer rec
 **graph nodes** its occurrences touch (written in the feature map). So a significant marker downstream
 maps straight back to a node/edge in the bubble — and to the variant `call` makes there. The pooled
 survivors across bubbles are written to the fsm-lite `fsm_kmers.txt.gz`.
+
+## gene annotation (`--gtf`) — projection, per-gene realignment, reliability
+
+Three steps turn a reference-coordinate GTF into graph-aware gene annotation. The bridge is the
+**reference path**, whose PanSN name (`grch38#1#chr6:31891045-32123783`) gives the chromosome and the
+absolute start; without a PanSN reference the step is skipped.
+
+### Step 1 — project genes onto reference nodes
+
+Walk the reference path accumulating node lengths (`path_prefix_bp`). Node *k* spans reference
+`[start + prefix[k], start + prefix[k+1])`. Intersect each gene interval with those node spans:
+
+```text
+reference start = 31,891,045    (from grch38#1#chr6:31891045-32123783)
+node  prefix_bp   node span (ref bp)            gene (GTF)        -> node_genes
+ 447  0..3843     31,891,045 .. 31,894,887      C2 31,892k..      -> {C2}
+3370  90,946..    31,981,991 .. 32,005,247      C4A 31,981,991..  -> {C4A}
+ ...
+```
+
+A node that the reference visits at two coordinates (a folded paralog) is tagged with **both** genes —
+which is exactly why graph multiplicity alone cannot separate them, and why `call` realigns (Step 2).
+This `node_id → genes` map drives the Bandage CSV (`bubble`/`panphorte`) and the VCF `GENES` field.
+
+### Step 2 — per-gene copy number by competitive realignment (`call`)
+
+For a DUP, graph CN gives the *module* total but not which paralog. So each gene's **reference
+sequence** (spelled from the reference walk over its coordinates) is realigned (minimap2, all hits) to
+each haplotype, and every copy locus is assigned to the gene it matches best.
+
+```text
+query = C4A reference (23,257 bp, contains the 6.4 kb HERV)
+haplotype HG00096#1 has a C4A-long copy and a C4B-short copy (truth: 1 long + 1 short)
+
+minimap2 hits (pri_ratio 0.5 keeps the lower-scoring short copy):
+  hit A  t[90,697..113,955]  q[0..23,257]            -> one full alignment
+  hit B  t[123,552..130,500] q[0..7,000]    \  target-adjacent, query-DISJOINT
+  hit C  t[130,500..137,615] q[13,100..23,257] /  => chained into ONE copy (the short form)
+
+identity used to DETECT a copy = gap-compressed (each indel run counts once):
+  short copy: matches/(matches+mism+gapEvents) = 14,063/(14,063+~150+1) = 0.99   (PASSES 0.90 floor)
+  block identity mlen/blen would be 14,063/20,500 = 0.69 and WRONGLY reject it
+```
+
+Chaining rule: same-gene hits that are **target-adjacent but query-disjoint** are the two halves of one
+copy split around the missing HERV → one copy; hits that **re-use the same query span** are distinct
+copies. Each chained copy then competes across genes by **block identity** (length-aware, so a true
+C4A copy beats a C4B query there) and the winner claims the locus.
+
+### Step 3 — reliability (collapse groups)
+
+Whether the per-gene split can be trusted is decided up front from the **reference sequences alone**:
+cluster genes where one aligns to another at **> 98 % block identity over most of its length**.
+
+```text
+CYP2D6 vs CYP2D7 : 0.95   < 0.98  -> separable
+GSTM1  vs GSTM2  : 1.00   > 0.98  -> collapse {GSTM1, GSTM2}
+C4A    vs C4B    : 0.9992 > 0.98  -> collapse {C4A, C4B}
+```
+
+- **Singleton group ⇒ reliable=1**: report the realigned per-gene CN. Validated vs per-molecule truth:
+  CYP2D6 96.9 % exact (the 9 gene deletions recovered), CYP2D7 98.4 %.
+- **Group of >1 ⇒ reliable=0**: do *not* split. Emit one row listing the collapsing genes
+  (`genes=C4A;C4B`) with the **module total** (VCF `FORMAT:CN`). Validated: the C4A;C4B total is
+  131/131 (100 %) — the total is trustworthy, only the A-vs-B label is not.
