@@ -336,13 +336,20 @@ loci and blur paralog calls). Three outputs are added:
 - **`INFO=GENES`** on each record — the gene(s) it overlaps (for a DUP, the whole folded module).
 - **`<prefix>.node_genes.tsv`** — `node_id → gene(s)`, the bridge consumed by the GWAS gene traceback
   (`gwas_demo.py --node-genes`).
-- **`<prefix>.dup_gene_cn.tsv`** — per-haplotype **per-gene copy number** for DUPs
-  (`bubble_id, variant_id, sample, gene, gene_cn`), resolved by **competitive realignment**: each gene's
-  reference sequence is mapped (minimap2) to every haplotype and each module copy is assigned to the gene
-  it aligns *best* to. This separates collapsed paralogs that share graph nodes — e.g. it resolves
-  **CYP2D6** deletions/duplications from the stable **CYP2D7/2D8P**, and **GSTM1** nulls from GSTM2/4/5.
-  Near-identical, tandem-adjacent paralogs (**C4A vs C4B**, ~99.9% identical) do *not* separate reliably;
-  there the authoritative module total stays the VCF `FORMAT:CN`, and the per-gene split is best-effort.
+- **`<prefix>.dup_gene_cn.tsv`** — per-haplotype copy number for the genes in a DUP
+  (`bubble_id, variant_id, sample, genes, cn, reliable`). Genes are first clustered into **collapse
+  groups** by pairwise reference identity (block identity > 98% over most of a gene → same group):
+  - **Reliable** genes (alone in their group) get a **per-gene** copy number by **competitive
+    realignment**: each gene's reference sequence is mapped (minimap2, all hits) to the haplotype,
+    same-gene hits that are target-adjacent but query-disjoint are **chained** into one copy (so a copy
+    split around a missing insertion still counts once, using a **gap-compressed** identity floor), and
+    each copy is assigned to the gene it aligns *best* to. This separates collapsed paralogs graph
+    multiplicity cannot — e.g. **CYP2D6** deletions/dups from the stable **CYP2D7/2D8P** (`reliable=1`).
+  - **Unreliable** groups (near-identical paralogs the realignment can't tell apart — **C4A/C4B**
+    ~99.9%, **GSTM1/GSTM2** ~100%) are **not split**: one row reports the collapsing genes
+    (`genes=C4A;C4B`) with the **module total** copy number (the VCF `FORMAT:CN`) and `reliable=0`.
+    Validated against the per-molecule truth, the C4A;C4B total is **131/131 (100%)** — the total is
+    trustworthy, only the A-vs-B label is not.
 
 Graphs whose paths are not PanSN can be converted in place with `scripts/pansn_rename.py`
 (`SAMPLE_HAP_CONTIG:start-end` → `SAMPLE#HAP#CONTIG:start-end`). `bubble` and `panphorte` accept the same

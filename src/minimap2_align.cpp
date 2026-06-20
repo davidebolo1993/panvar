@@ -29,6 +29,22 @@ Minimap2Hit reg_to_hit(const mm_reg1_t& reg, std::size_t qlen, std::size_t tlen)
     if (out.target_end_bp < out.target_start_bp) std::swap(out.target_start_bp, out.target_end_bp);
     out.n_matches = reg.mlen > 0 ? static_cast<std::size_t>(reg.mlen) : 0;
     out.aln_block_len = reg.blen > 0 ? static_cast<std::size_t>(reg.blen) : 0;
+    // Gap-compressed identity from the (EQX) cigar: matches / (matches + mismatches + indel events).
+    // Each I/D run is one event regardless of length, so a large structural indel barely affects it.
+    if (reg.p != nullptr && reg.p->n_cigar > 0) {
+        std::size_t m = 0, x = 0, gaps = 0;
+        for (uint32_t i = 0; i < reg.p->n_cigar; ++i) {
+            const uint32_t op = reg.p->cigar[i] & 0xf;
+            const uint32_t len = reg.p->cigar[i] >> 4;
+            if (op == 7) m += len;          // '=' match
+            else if (op == 8) x += len;     // 'X' mismatch
+            else if (op == 1 || op == 2) ++gaps;  // 'I'/'D' indel run (one event)
+        }
+        const std::size_t denom = m + x + gaps;
+        out.gc_identity = denom == 0 ? 0.0 : static_cast<double>(m) / static_cast<double>(denom);
+    } else {
+        out.gc_identity = out.identity();  // no cigar: fall back to block identity
+    }
     return out;
 }
 
@@ -167,7 +183,10 @@ std::vector<Minimap2Hit> minimap2_hits(
         static_cast<std::size_t>(std::numeric_limits<int>::max()),
         std::max<std::size_t>(static_cast<std::size_t>(1), best_n)));
     map_opt.best_n = std::max(map_opt.best_n, want);
-    map_opt.pri_ratio = 0.5f;   // report secondaries scoring >=50% of the primary
+    // Keep moderately low-scoring secondaries so a short paralog copy (e.g. C4 lacking the ~6.4 kb
+    // HERV, ~0.6x a full copy) still surfaces as its own hit, without admitting so many weak paralog
+    // hits that they steal loci in the competition (that degrades CYP2D7/GSTM separation).
+    map_opt.pri_ratio = 0.5f;
 
     const char* seq_ptrs[1] = {target_seq.c_str()};
     const char* name_ptrs[1] = {target_name.c_str()};

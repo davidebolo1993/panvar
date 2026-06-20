@@ -678,6 +678,7 @@ void call_variants(
         std::size_t bubble_id = 0;
         std::string variant_id;
         std::vector<int> gene_idx;   // indices into `genes` of the genes overlapping the bubble
+        std::unordered_map<std::string, std::size_t> sample_cn;  // module CN per haplotype (FORMAT:CN)
     };
     std::vector<DupGeneTarget> dup_targets;
 
@@ -1575,9 +1576,10 @@ void call_variants(
                     id + '\t' + std::to_string(bubble.id) + '\t' + svt + '\t' + nodes);
             }
 
-            // Record a per-gene-CN target for this DUP (resolved by realignment post-pass).
+            // Record a per-gene-CN target for this DUP (resolved by realignment post-pass). Carry the
+            // per-haplotype module CN so unreliable (collapsed) gene groups can report the total.
             if (e.type == EvType::Dup && !bubble_gene_idx.empty()) {
-                dup_targets.push_back(DupGeneTarget{bubble.id, id, bubble_gene_idx});
+                dup_targets.push_back(DupGeneTarget{bubble.id, id, bubble_gene_idx, mr.sample_cn});
             }
 
             ++summary.records_written;
@@ -1695,14 +1697,37 @@ void call_variants(
                 std::vector<std::string> gseqs;
                 gseqs.reserve(t.gene_idx.size());
                 for (int gi : t.gene_idx) gseqs.push_back(gene_seq_cache[gi]);
+                // Collapse near-identical paralogs into groups; a singleton group is reliable (its
+                // per-gene copy number is trustworthy), a multi-gene group is reported as the module
+                // total over the collapsing genes (no per-gene split).
+                const std::vector<int> grp = gene_collapse_groups(gseqs);
+                std::vector<std::vector<int>> members;       // local gene indices per group root
+                std::unordered_map<int, std::size_t> root_to_slot;
+                for (std::size_t k = 0; k < t.gene_idx.size(); ++k) {
+                    auto it = root_to_slot.find(grp[k]);
+                    if (it == root_to_slot.end()) { root_to_slot[grp[k]] = members.size(); members.push_back({}); }
+                    members[root_to_slot[grp[k]]].push_back(static_cast<int>(k));
+                }
                 std::vector<std::vector<std::string>> per_path(graph.paths.size());
                 run_parallel(graph.paths.size(), options.threads, [&](std::size_t pi) {
                     const std::vector<int> cn = assign_gene_copies(gseqs, hap_seq[pi]);
-                    for (std::size_t k = 0; k < t.gene_idx.size(); ++k) {
-                        per_path[pi].push_back(
-                            std::to_string(t.bubble_id) + '\t' + t.variant_id + '\t' +
-                            graph.paths[pi].name + '\t' + genes[t.gene_idx[k]].gene_name + '\t' +
-                            std::to_string(cn[k]));
+                    const std::string& sname = graph.paths[pi].name;
+                    for (const std::vector<int>& grp_members : members) {
+                        const std::string prefix = std::to_string(t.bubble_id) + '\t' + t.variant_id + '\t' + sname + '\t';
+                        if (grp_members.size() == 1) {            // reliable: per-gene realignment CN
+                            const int k = grp_members[0];
+                            per_path[pi].push_back(prefix + genes[t.gene_idx[k]].gene_name + '\t' +
+                                                   std::to_string(cn[k]) + "\t1");
+                        } else {                                  // unreliable: module total + gene list
+                            std::string names;
+                            for (std::size_t m = 0; m < grp_members.size(); ++m) {
+                                if (m) names += ';';
+                                names += genes[t.gene_idx[grp_members[m]]].gene_name;
+                            }
+                            const auto cit = t.sample_cn.find(sname);
+                            const std::string total = cit != t.sample_cn.end() ? std::to_string(cit->second) : ".";
+                            per_path[pi].push_back(prefix + names + '\t' + total + "\t0");
+                        }
                     }
                 });
                 for (std::size_t pi = 0; pi < graph.paths.size(); ++pi)
@@ -1714,7 +1739,7 @@ void call_variants(
         if (!dg_out) {
             throw std::runtime_error("Failed to write per-gene DUP CN TSV: " + options.out_prefix + ".dup_gene_cn.tsv");
         }
-        dg_out << "bubble_id\tvariant_id\tsample\tgene\tgene_cn\n";
+        dg_out << "bubble_id\tvariant_id\tsample\tgenes\tcn\treliable\n";
         for (const std::string& r : dup_gene_cn_rows) dg_out << r << '\n';
     }
 

@@ -17,6 +17,10 @@ struct Minimap2Hit {
     std::size_t target_end_bp = 0;
     std::size_t n_matches = 0;     // mlen: matching bases in the alignment
     std::size_t aln_block_len = 0; // blen: alignment block length (match+mismatch+indel)
+    // Gap-compressed identity (each indel run counts as ONE event, not by length), like minimap2's
+    // `de`. Robust when a long query maps a copy missing a large insertion (e.g. C4 short form lacks
+    // the ~6.4 kb HERV): the structural indel does not deflate identity. 0 when no cigar is available.
+    double gc_identity = 0.0;
 
     // Fraction of the alignment block that matched; 0 when there is no alignment.
     double identity() const {

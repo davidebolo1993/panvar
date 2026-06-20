@@ -9,6 +9,7 @@
 #include <cctype>
 #include <cstdint>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <stdexcept>
 
@@ -210,6 +211,79 @@ void write_bandage_gene_colors_csv(const std::string& output_path,
     }
 }
 
+namespace {
+
+// Total length covered by a set of [lo,hi) intervals after merging overlaps.
+std::size_t union_len(std::vector<std::pair<std::size_t, std::size_t>> iv) {
+    if (iv.empty()) return 0;
+    std::sort(iv.begin(), iv.end());
+    std::size_t total = 0, cur_lo = iv[0].first, cur_hi = iv[0].second;
+    for (std::size_t i = 1; i < iv.size(); ++i) {
+        if (iv[i].first <= cur_hi) { cur_hi = std::max(cur_hi, iv[i].second); }
+        else { total += cur_hi - cur_lo; cur_lo = iv[i].first; cur_hi = iv[i].second; }
+    }
+    return total + (cur_hi - cur_lo);
+}
+
+double interval_overlap_frac(std::size_t a0, std::size_t a1,
+                             const std::vector<std::pair<std::size_t, std::size_t>>& iv) {
+    if (a1 <= a0) return 0.0;
+    std::size_t ov = 0;
+    for (const auto& b : iv) {
+        const std::size_t lo = std::max(a0, b.first), hi = std::min(a1, b.second);
+        if (hi > lo) ov += hi - lo;
+    }
+    return static_cast<double>(ov) / static_cast<double>(a1 - a0);
+}
+
+// One chained copy locus of a single gene on the haplotype.
+struct CopyLocus { std::size_t t0, t1; double identity; double qcov; };
+
+// Chain a gene's minimap2 hits into copy loci: hits that are target-adjacent but cover DISJOINT
+// query regions belong to the same copy (a short copy split around a missing insertion); hits that
+// reuse the same query region are SEPARATE copies (e.g. tandem-adjacent full copies).
+std::vector<CopyLocus> chain_gene_hits(const std::vector<Minimap2Hit>& hits, std::size_t gene_len,
+                                       double min_identity) {
+    // Detect copies with gap-compressed identity (so a short form whose large indel deflates block
+    // identity still passes), but carry BLOCK identity for the cross-gene competition (so near-identical
+    // paralogs do not steal each other's loci just because indels were discounted).
+    struct H { std::size_t qs, qe, ts, te; double id; };  // id = block identity, for competition
+    std::vector<H> hs;
+    for (const Minimap2Hit& h : hits) {
+        if (!h.ok || h.aln_block_len == 0 || h.gc_identity < min_identity) continue;
+        hs.push_back({h.query_start_bp, h.query_end_bp, h.target_start_bp, h.target_end_bp, h.identity()});
+    }
+    std::sort(hs.begin(), hs.end(), [](const H& a, const H& b) { return a.ts < b.ts; });
+    struct Cluster { std::size_t t0, t1; std::vector<std::pair<std::size_t, std::size_t>> q; double idsum, idw; };
+    std::vector<Cluster> clusters;
+    const std::size_t max_gap = gene_len;  // target adjacency window; query-overlap is the real guard
+    for (const H& h : hs) {
+        Cluster* dst = nullptr;
+        for (Cluster& c : clusters) {
+            const bool target_adjacent = h.ts <= c.t1 + max_gap;
+            const bool query_disjoint = interval_overlap_frac(h.qs, h.qe, c.q) < 0.5;
+            if (target_adjacent && query_disjoint) { dst = &c; break; }
+        }
+        const double w = static_cast<double>(h.qe - h.qs);
+        if (dst == nullptr) {
+            clusters.push_back({h.ts, h.te, {{h.qs, h.qe}}, h.id * w, w});
+        } else {
+            dst->t1 = std::max(dst->t1, h.te);
+            dst->t0 = std::min(dst->t0, h.ts);
+            dst->q.emplace_back(h.qs, h.qe);
+            dst->idsum += h.id * w; dst->idw += w;
+        }
+    }
+    std::vector<CopyLocus> loci;
+    for (const Cluster& c : clusters) {
+        const double qcov = gene_len ? static_cast<double>(union_len(c.q)) / static_cast<double>(gene_len) : 0.0;
+        loci.push_back({c.t0, c.t1, c.idw > 0 ? c.idsum / c.idw : 0.0, qcov});
+    }
+    return loci;
+}
+
+} // namespace
+
 std::vector<int> assign_gene_copies(const std::vector<std::string>& gene_seqs,
                                     const std::string& hap_seq,
                                     const std::string& preset,
@@ -218,42 +292,30 @@ std::vector<int> assign_gene_copies(const std::vector<std::string>& gene_seqs,
     std::vector<int> counts(gene_seqs.size(), 0);
     if (hap_seq.empty()) return counts;
 
-    struct Cand { int gene; std::size_t t0, t1; double identity; std::size_t blen; };
+    struct Cand { int gene; std::size_t t0, t1; double identity; };
     std::vector<Cand> cands;
     for (std::size_t gi = 0; gi < gene_seqs.size(); ++gi) {
         const std::string& gs = gene_seqs[gi];
         if (gs.empty()) continue;
-        const std::vector<Minimap2Hit> hits =
-            minimap2_hits("gene", gs, "hap", hap_seq, preset);
-        for (const Minimap2Hit& h : hits) {
-            if (!h.ok || h.aln_block_len == 0) continue;
-            const double qcov = static_cast<double>(h.query_end_bp - h.query_start_bp) /
-                                static_cast<double>(gs.size());
-            if (h.identity() < min_identity || qcov < min_qcov) continue;
-            cands.push_back({static_cast<int>(gi), h.target_start_bp, h.target_end_bp,
-                             h.identity(), h.aln_block_len});
+        const std::vector<Minimap2Hit> hits = minimap2_hits("gene", gs, "hap", hap_seq, preset);
+        for (const CopyLocus& L : chain_gene_hits(hits, gs.size(), min_identity)) {
+            if (L.qcov < min_qcov) continue;
+            cands.push_back({static_cast<int>(gi), L.t0, L.t1, L.identity});
         }
     }
-    // Assign each distinct target locus to its best-identity gene: greedily claim loci in
-    // descending identity, skipping a hit that overlaps an already-claimed locus (>50% of the
-    // shorter interval). The winning gene at each locus gets the copy.
-    std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
-        if (a.identity != b.identity) return a.identity > b.identity;
-        return a.blen > b.blen;
-    });
+    // Competitive assignment: claim loci in descending (block) identity, skipping any that overlaps an
+    // already-claimed locus by >50% of the shorter interval; the winning gene gets the copy.
+    std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.identity > b.identity; });
     std::vector<std::pair<std::size_t, std::size_t>> claimed;
     for (const Cand& c : cands) {
-        bool overlaps = false;
         const std::size_t clen = c.t1 > c.t0 ? c.t1 - c.t0 : 1;
+        bool overlaps = false;
         for (const auto& cl : claimed) {
-            const std::size_t ov_lo = std::max(c.t0, cl.first);
-            const std::size_t ov_hi = std::min(c.t1, cl.second);
+            const std::size_t ov_lo = std::max(c.t0, cl.first), ov_hi = std::min(c.t1, cl.second);
             if (ov_hi <= ov_lo) continue;
-            const std::size_t ov = ov_hi - ov_lo;
             const std::size_t llen = cl.second > cl.first ? cl.second - cl.first : 1;
-            if (static_cast<double>(ov) / static_cast<double>(std::min(clen, llen)) > 0.5) {
-                overlaps = true;
-                break;
+            if (static_cast<double>(ov_hi - ov_lo) / static_cast<double>(std::min(clen, llen)) > 0.5) {
+                overlaps = true; break;
             }
         }
         if (overlaps) continue;
@@ -261,6 +323,29 @@ std::vector<int> assign_gene_copies(const std::vector<std::string>& gene_seqs,
         ++counts[c.gene];
     }
     return counts;
+}
+
+std::vector<int> gene_collapse_groups(const std::vector<std::string>& gene_seqs,
+                                      const std::string& preset,
+                                      double max_identity) {
+    const std::size_t n = gene_seqs.size();
+    std::vector<int> group(n);
+    for (std::size_t i = 0; i < n; ++i) group[i] = static_cast<int>(i);
+    std::function<int(int)> find = [&](int x) { while (group[x] != x) { group[x] = group[group[x]]; x = group[x]; } return x; };
+    for (std::size_t i = 0; i < n; ++i) {
+        if (gene_seqs[i].empty()) continue;
+        for (std::size_t j = i + 1; j < n; ++j) {
+            if (gene_seqs[j].empty()) continue;
+            // Near-identical over most of the shorter gene (block identity) => same collapse group.
+            const Minimap2Hit h = minimap2_best_hit("gj", gene_seqs[j], "gi", gene_seqs[i], preset);
+            if (!h.ok) continue;
+            const double qcov = static_cast<double>(h.query_end_bp - h.query_start_bp) /
+                                static_cast<double>(gene_seqs[j].size());
+            if (h.identity() > max_identity && qcov > 0.5) group[find(static_cast<int>(i))] = find(static_cast<int>(j));
+        }
+    }
+    for (std::size_t i = 0; i < n; ++i) group[i] = find(static_cast<int>(i));  // canonical root per gene
+    return group;
 }
 
 bool emit_gene_annotation(const Graph& graph,
