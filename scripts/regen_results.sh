@@ -88,6 +88,15 @@ run_region() {
     if [[ -n "${bub:-}" ]]; then
       local ip="$d/inspect/inspect.bubble_${bub}"
       local nc="$ip.node_counts.tsv" ec="$ip.edge_counts.tsv" nl="$ip.node_lengths.tsv" cl="$ip.clusters.tsv"
+      # cluster-representative-only variant maps (both orientations): one row per walk cluster.
+      if [[ -f "$cl" ]]; then
+        "$RS" "$HERE/plot_vcf_map.R" --vcf "$d/call/call.region.vcf" --reference-path "$ref" \
+          --clusters "$cl" --title "$region variant map (cluster representatives)" \
+          --out "$d/plots/${region}_vcf_map_clustered" >/dev/null 2>&1 || echo "  (plot_vcf_map clustered skipped)"
+        "$RS" "$HERE/plot_vcf_map.R" --vcf "$d/call/call.region.vcf" --reference-path "$ref" --flip \
+          --clusters "$cl" --title "$region variant map (cluster representatives)" \
+          --out "$d/plots/${region}_vcf_map_clustered_flipped" >/dev/null 2>&1 || echo "  (plot_vcf_map clustered flipped skipped)"
+      fi
       if [[ -f "$nc" ]]; then
         "$RS" "$HERE/plot_node_coverage_heatmap.R" --table "$nc" --node-lengths "$nl" \
           --cluster-by "$cl" --out "$d/plots/${region}_node_heatmap" >/dev/null 2>&1 || echo "  (node heatmap skipped)"
