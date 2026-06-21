@@ -108,6 +108,9 @@ Running `panvar call` with no arguments prints this help.
 - `--cn-from-coverage` — emit **total-module copy number** on folded paralog clusters where the reference itself traverses the module ≥2×; see the copy-number section below
 - `--multiallelic-loci` — collapse a bounded locus (e.g. an STR/VNTR) into ONE multiallelic record `REF` + `ALT1,ALT2,…` explicit sequences, per-sample `GT` indexing the allele); `--multiallelic-max-bp`
   (default 5000) bounds it so large SVs keep their typed per-event records
+- `--gtf <path>` — reference-coordinate GTF; annotate variants with the genes they touch (`INFO=GENES`),
+  write `<prefix>.node_genes.tsv` and the per-gene DUP copy-number table `<prefix>.dup_gene_cn.tsv`. Needs
+  a PanSN `--reference-path`; lncRNAs are skipped. See [Gene annotation (`--gtf`)](#gene-annotation---gtf).
 - `--bubble-id <N>` — restrict to one bubble (repeatable)
 - `--no-per-bubble-vcf` — only write the concatenated region VCF
 - `--no-variant-paths` — skip the `<prefix>.variant_paths.tsv` provenance sidecar

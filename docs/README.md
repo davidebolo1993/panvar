@@ -65,6 +65,22 @@ on `y = x`; GSTM1 (+2: its GSTM2–5 segdup paralogs) and CYP2D6 (+1: CYP2D8P) r
 module, so a constant baseline is removed. CYP2D6's residual scatter is the variable, unannotated
 CYP2D8P/2D7-hybrid copies (see call.md).
 
+### Gene annotation (`--gtf`)
+
+An optional reference-coordinate GTF (Ensembl/GENCODE) projects gene names onto the graph across the
+pipeline. It needs a **PanSN** reference path (`sample#hap#contig:start-end`, so chromosome + absolute
+start are known); convert older underscore-named graphs first with `scripts/pansn_rename.py`. lncRNAs are
+skipped. When supplied:
+
+- `bubble --gtf` and `panphorte --gtf` each write `<prefix>.bandage_genes.csv` (`Name,Colour,Gene`) to
+  highlight genes per bubble in Bandage — both, because panphorte's collapse renumbers nodes.
+- `call --gtf` adds `INFO=GENES` to every record, writes `<prefix>.node_genes.tsv`, and a per-gene DUP
+  copy-number table `<prefix>.dup_gene_cn.tsv` that **separates** paralogs the graph folds together
+  (reliable rows, e.g. CYP2D6 vs CYP2D7/2D8P) and honestly **collapses** near-identical ones it can't
+  resolve (unreliable rows with the module total, e.g. C4A;C4B). See [modules/call.md](modules/call.md).
+- the GWAS traceback (`scripts/gwas_demo.py --node-genes <call.node_genes.tsv>`) names the gene behind an
+  association. `describe` itself is k-mer based and does **not** consume the GTF.
+
 ## Doc Structure Convention
 
 Each module page follows the same structure:

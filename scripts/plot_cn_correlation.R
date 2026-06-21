@@ -39,23 +39,42 @@ labs <- do.call(rbind, lapply(genes, function(g) {
   r <- tryCatch(cor(s$truth_cn, s$gene_cn), error = function(e) NA)
   off <- s$baseline_offset[1]
   data.frame(gene = g,
-             x = min(s$truth_cn), y = max(c(s$gene_cn, s$truth_cn)),
              label = sprintf("r = %.3f\nn = %d\nbaseline %+d", r, nrow(s), off),
              stringsAsFactors = FALSE)
 }))
 
+# per-gene shared range so each panel is exactly square (x and y span the same integer range).
+# invisible anchor points at -0.4 and (sharedmax + 1 headroom) fully define both free axes, so the
+# range is deterministic and identical on x and y (not perturbed by the random jitter of real points).
+lims <- do.call(rbind, lapply(genes, function(g) {
+  s <- d[d$gene == g, ]
+  hi <- max(c(s$truth_cn, s$gene_cn)) + 1   # one unit of headroom above the data
+  data.frame(gene = g, v = c(-0.4, hi), stringsAsFactors = FALSE)
+}))
+
+# integer-only ticks: step 1 for narrow panels, coarser for wide ones (lpa spans ~24) to avoid crowding.
+int_breaks <- function(lim) {
+  hi <- floor(lim[2] + 1e-9)
+  by <- if (hi <= 8) 1 else ceiling(hi / 8)
+  seq(0, hi, by = by)
+}
+
 p <- ggplot(d, aes(truth_cn, gene_cn)) +
   geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60") +
   geom_jitter(aes(colour = ref, size = ref), width = 0.12, height = 0.12, alpha = 0.75) +
-  geom_text(data = labs, aes(x = x, y = y, label = label),
-            hjust = 0, vjust = 1, size = 3.2, colour = "grey20") +
+  geom_blank(data = lims, aes(x = v, y = v)) +
+  # pin the annotation to the upper-left corner of each panel (away from the points)
+  geom_text(data = labs, aes(x = -Inf, y = Inf, label = label),
+            hjust = -0.1, vjust = 1.2, size = 3.2, colour = "grey20") +
   facet_wrap(~ gene, scales = "free") +
+  scale_x_continuous(breaks = int_breaks, expand = expansion(mult = 0.02)) +
+  scale_y_continuous(breaks = int_breaks, expand = expansion(mult = 0.02)) +
   scale_colour_manual(values = c(haplotype = "#2c7fb8", reference = "#d95f02"), name = NULL) +
   scale_size_manual(values = c(haplotype = 1.6, reference = 3.2), guide = "none") +
   labs(x = "ground-truth copy number",
        y = "panvar copy number (paralog baseline removed)") +
   theme_bw(base_size = 12) +
-  theme(legend.position = "top", panel.grid.minor = element_blank())
+  theme(legend.position = "top", panel.grid.minor = element_blank(), aspect.ratio = 1)
 
 png_path <- paste0(out_prefix, ".png")
 ggsave(png_path, p, width = 9, height = 7, dpi = 150)

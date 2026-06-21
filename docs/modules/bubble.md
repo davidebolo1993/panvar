@@ -128,6 +128,9 @@ panvar bubble -i <graph.gfa> -r <name> [-o <prefix>] [--superbubbles] [options]
 - `--min-path-support <N>`
 - `--merge-nearby-bp <N>`
 - `--snarl-debug-tsv <path>`
+- `--gtf <path>` — reference-coordinate GTF; with a **PanSN** `--reference-path`, project its genes onto
+  the reference nodes and write `<prefix>.bandage_genes.csv` (`Name,Colour,Gene`) for Bandage. lncRNAs
+  are skipped; non-PanSN graphs must be converted first with `scripts/pansn_rename.py`. See [Outputs](#outputs).
 - `-q, --quiet` — disable the progress bar
 
 ## Bubble CSV Columns

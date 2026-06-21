@@ -42,7 +42,7 @@ ref_of() {  # pick a reference path: prefer GRCh38, then CHM13, else the first p
 # panphorte is still run for every region (its copies.tsv carries C4's long/short composition), but
 # for the bubble-call regions its graph is not what `call` reads.
 run_region() {
-  local region="$1" gfa="$2" pan_extra="$3" call_graph="$4" call_extra="$5"
+  local region="$1" gfa="$2" pan_extra="$3" call_graph="$4" call_extra="$5" finer_clusters="${6:-0}"
   local d="$OUT/$region"
   echo "############ $region ############"
   mkdir -p "$d"/{bubble,panphorte,call,describe,inspect,plots}
@@ -87,18 +87,34 @@ run_region() {
     # whole-VCF variant map in BOTH orientations: default (haplotypes on Y) and flipped (variants on Y).
     "$RS" "$HERE/plot_vcf_map.R" --vcf "$d/call/call.region.vcf" --reference-path "$ref" \
       --title "$region variant map" --out "$d/plots/${region}_vcf_map" >/dev/null 2>&1 || echo "  (plot_vcf_map skipped)"
-    "$RS" "$HERE/plot_vcf_map.R" --vcf "$d/call/call.region.vcf" --reference-path "$ref" --flip \
+    # flipped map is the slide headline -> render at high DPI
+    "$RS" "$HERE/plot_vcf_map.R" --vcf "$d/call/call.region.vcf" --reference-path "$ref" --flip --dpi 600 \
       --title "$region variant map" --out "$d/plots/${region}_vcf_map_flipped" >/dev/null 2>&1 || echo "  (plot_vcf_map flipped skipped)"
     if [[ -n "${bub:-}" ]]; then
       local ip="$d/inspect/inspect.bubble_${bub}"
       local nc="$ip.node_counts.tsv" ec="$ip.edge_counts.tsv" nl="$ip.node_lengths.tsv" cl="$ip.clusters.tsv"
+      # Clusters for the representative-only variant maps. By default use the call-substrate clusters
+      # ($cl). When finer_clusters=1 (panphorte-substrate regions like LPA, where the collapsed graph
+      # yields very few walk clusters), instead cluster the PRE-panphorte bubble graph's largest repeat
+      # module: it keeps more walk distinctions -> more representative haplotypes to show. The collapse
+      # is presentational only; representatives are real haplotype names, so they match the call VCF.
+      local cl_map="$cl"
+      if [[ "$finer_clusters" == "1" ]]; then
+        local bbub; bbub="$(awk -F',' 'NR>1 && $8+0>m{m=$8+0; b=$1} END{print b}' "$d/bubble/bubble.bubbles.csv")"
+        if [[ -n "$bbub" ]]; then
+          "$BIN" inspect -i "$sgfa" --bubble-prefix-in "$d/bubble/bubble" --bubble-id "$bbub" \
+            --cluster --cluster-similarity 0.97 -o "$d/inspect/inspect_bubblestage" --quiet || true
+          local clb="$d/inspect/inspect_bubblestage.bubble_${bbub}.clusters.tsv"
+          [[ -f "$clb" ]] && cl_map="$clb"
+        fi
+      fi
       # cluster-representative-only variant maps (both orientations): one row per walk cluster.
-      if [[ -f "$cl" ]]; then
+      if [[ -f "$cl_map" ]]; then
         "$RS" "$HERE/plot_vcf_map.R" --vcf "$d/call/call.region.vcf" --reference-path "$ref" \
-          --clusters "$cl" --title "$region variant map (cluster representatives)" \
+          --clusters "$cl_map" --title "$region variant map (cluster representatives)" \
           --out "$d/plots/${region}_vcf_map_clustered" >/dev/null 2>&1 || echo "  (plot_vcf_map clustered skipped)"
         "$RS" "$HERE/plot_vcf_map.R" --vcf "$d/call/call.region.vcf" --reference-path "$ref" --flip \
-          --clusters "$cl" --title "$region variant map (cluster representatives)" \
+          --clusters "$cl_map" --title "$region variant map (cluster representatives)" \
           --out "$d/plots/${region}_vcf_map_clustered_flipped" >/dev/null 2>&1 || echo "  (plot_vcf_map clustered flipped skipped)"
       fi
       if [[ -f "$nc" ]]; then
@@ -134,7 +150,7 @@ for region in "${REGIONS[@]}"; do
   case "$region" in
     lpa)
       # Tandem repeat (KIV-2): panphorte folds the variable tandem; call counts on the REP node.
-      run_region lpa "$DATA/lpa.gfa.gz" "--min-similarity 0.70" panphorte "--cn-from-multiplicity"
+      run_region lpa "$DATA/lpa.gfa.gz" "--min-similarity 0.70" panphorte "--cn-from-multiplicity" 1
       validate_cn lpa --mode repeats --truth "$DATA/lpa.repeats.tsv" --name-col hapl --count-col copies
       # LPA GWAS demo (needs python numpy/scipy); reuses the dedicated driver
       bash "$HERE/../tests/gwas/run_lpa_real.sh" "$BIN" "$OUT/lpa/gwas" "$PY" "$RS" || echo "  (gwas demo skipped)"

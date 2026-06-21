@@ -75,6 +75,10 @@ panvar panphorte -i <graph.gfa> (-b <prefix> | -c <bubbles.csv>) -o <prefix> [op
   = exact, sequence-preserving). Values `< 1.0` enable **approximate, lossy collapse** of
   near-identical (divergent) copies.
 - `--threads <N>`: worker threads for the approximate seed scan and copy detection (`0` = auto).
+- `--gtf <path>`: reference-coordinate GTF; **after re-sorting**, project its genes onto the normalized
+  graph's reference nodes and write `<prefix>.bandage_genes.csv` (needs a PanSN `--reference-path`). This
+  is emitted separately from `bubble --gtf` because panphorte's collapse renumbers nodes, so the gene
+  positions differ on the normalized graph. lncRNAs are skipped.
 - `--quiet`: disable the progress bar / logs
 
 
