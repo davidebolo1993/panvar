@@ -58,9 +58,8 @@ void print_describe_help() {
         << "                                   variant node so junction/flanking k-mers are retained\n"
         << "                                   (default: k-1 under --variant-nodes so short variant nodes\n"
         << "                                   still yield k-mers; pass 0 for strict variant-node-only)\n"
-        << "      --samples <tsv>              cosigt sample->haplotype-path table; also writes a\n"
-        << "                                   sample-level fsm_kmers.samples.txt.gz (summed dosage)\n"
-        << "      --no-pyseer                  Do not write the pooled fsm_{kmers,graph}.txt.gz (pyseer)\n"
+        << "      --samples <tsv>              cosigt sample->haplotype-path table; also writes the\n"
+        << "                                   sample-level bimbam_{kmers,graph}.samples.bimbam.gz (summed dosage)\n"
         << "      --no-bimbam                  Do not write the pooled BIMBAM dosage + feature_annot.tsv.gz\n"
         << "      --only-kmers                 Emit only the k-mer substrate (skip node/edge graph layer)\n"
         << "      --only-graph                 Emit only the node/edge graph substrate (skip k-mers)\n"
@@ -157,10 +156,6 @@ int run_describe_command(const std::vector<std::string>& args) {
         }
         if (arg == "--samples") {
             options.samples_path = require_value(arg);
-            continue;
-        }
-        if (arg == "--no-pyseer") {
-            options.pyseer = false;
             continue;
         }
         if (arg == "--no-bimbam") {

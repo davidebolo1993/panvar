@@ -34,6 +34,14 @@ set_target_properties(minimap2 PROPERTIES
 )
 add_dependencies(minimap2 minimap2_build)
 
+# Eigen (header-only) for the `associate` LMM eigendecomposition / linear algebra.
+set(EIGEN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external/eigen)
+if(NOT EXISTS ${EIGEN_DIR}/Eigen/Dense)
+    message(FATAL_ERROR
+        "Missing Eigen headers in external/eigen. "
+        "Run: git submodule update --init --recursive")
+endif()
+
 add_library(panvarlib
     src/gfa.cpp
     src/gfa_io.cpp
@@ -79,6 +87,7 @@ add_executable(panvar
     src/panphorte_command.cpp
     src/associate_command.cpp
 )
+target_include_directories(panvar PRIVATE ${EIGEN_DIR})
 target_link_libraries(panvar PRIVATE panvarlib minimap2 Threads::Threads ZLIB::ZLIB)
 if(NOT WIN32)
     target_link_libraries(panvar PRIVATE m)

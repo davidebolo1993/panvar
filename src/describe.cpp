@@ -1214,11 +1214,11 @@ void write_params_json(const DescribeOptions& options, const std::string& path) 
         << "}\n";
 }
 
-// fsm-lite (pyseer) pool: kmer code -> (path name -> summed count), over discriminative
-// features only, aggregated across bubbles (the same canonical k-mer in two bubbles sums).
-using PyseerPool = std::unordered_map<std::uint64_t, std::unordered_map<std::string, std::uint64_t>>;
+// K-mer cohort pool: kmer code -> (path name -> summed count), over discriminative features only,
+// aggregated across bubbles (the same canonical k-mer in two bubbles sums). Feeds the BIMBAM export.
+using KmerPool = std::unordered_map<std::uint64_t, std::unordered_map<std::string, std::uint64_t>>;
 
-void accumulate_pyseer_counts(
+void accumulate_kmer_counts(
     const Graph& graph,
     const Bubble& bubble,
     const std::vector<BubblePathIndex>& path_indexes,
@@ -1226,7 +1226,7 @@ void accumulate_pyseer_counts(
     const std::vector<std::uint64_t>& features,
     const DescribeOptions& options,
     const std::unordered_set<std::string>* variant_nodes,
-    PyseerPool& pool) {
+    KmerPool& pool) {
 
     const std::unordered_set<std::uint64_t> keep(features.begin(), features.end());
     if (keep.empty()) {
@@ -1249,7 +1249,7 @@ void accumulate_pyseer_counts(
     }
 }
 
-// Per-feature, per-haplotype node/edge dosage pool: the graph-substrate analogue of PyseerPool,
+// Per-feature, per-haplotype node/edge dosage pool: the graph-substrate analogue of KmerPool,
 // keyed by the real graph coordinate (a node id, or a "from>to" edge key) so it stays traceable
 // (node features join to call's node_track.tsv by node id). Only discriminative features are pooled.
 using GraphPool = std::map<std::string, std::map<std::string, std::uint32_t>>;
@@ -1284,64 +1284,6 @@ void accumulate_graph_counts(
     }
 }
 
-// Write the pooled fsm-lite k-mer file pyseer --kmers consumes: one line per k-mer
-//   <kmer_sequence> | <path>:<count> <path>:<count> ...
-// listing only carriers (count>0); non-listed paths are implicit absence.
-void write_pyseer_fsm(const std::string& path, const PyseerPool& pool, std::size_t k) {
-    GzipWriter out(path);
-    std::vector<std::uint64_t> codes;
-    codes.reserve(pool.size());
-    for (const auto& kv : pool) {
-        codes.push_back(kv.first);
-    }
-    std::sort(codes.begin(), codes.end());
-    for (const std::uint64_t code : codes) {
-        const auto& carriers = pool.at(code);
-        std::vector<std::string> names;
-        names.reserve(carriers.size());
-        for (const auto& kv : carriers) {
-            names.push_back(kv.first);
-        }
-        std::sort(names.begin(), names.end());
-        std::string line = decode_kmer(code, k);
-        line += " |";
-        for (const std::string& n : names) {
-            line += ' ';
-            line += tsv_sanitize(n);
-            line += ':';
-            line += std::to_string(carriers.at(n));
-        }
-        line += '\n';
-        out.write(line);
-    }
-    out.close();
-}
-
-// Write a pooled fsm-lite file for string-named features (node/edge dosage), same layout as
-// write_pyseer_fsm but with the feature key used verbatim instead of a decoded k-mer:
-//   <feature> | <path>:<count> ...
-void write_string_fsm(const std::string& path, const GraphPool& pool) {
-    GzipWriter out(path);
-    for (const auto& [feature, carriers] : pool) {  // std::map: features emitted in sorted order
-        std::vector<std::string> names;
-        names.reserve(carriers.size());
-        for (const auto& kv : carriers) {
-            names.push_back(kv.first);
-        }
-        std::sort(names.begin(), names.end());
-        std::string line = tsv_sanitize(feature);
-        line += " |";
-        for (const std::string& n : names) {
-            line += ' ';
-            line += tsv_sanitize(n);
-            line += ':';
-            line += std::to_string(carriers.at(n));
-        }
-        line += '\n';
-        out.write(line);
-    }
-    out.close();
-}
 
 std::string format_dosage(double d) {
     if (d == std::floor(d) && std::fabs(d) < 1e15) {
@@ -1411,7 +1353,7 @@ BubbleDescribeResult describe_one_bubble(
     const std::vector<BubblePathIndex>& path_indexes,
     const Bubble& bubble,
     const std::unordered_set<std::string>* variant_nodes = nullptr,
-    PyseerPool* pyseer_pool = nullptr,
+    KmerPool* kmer_pool = nullptr,
     GraphPool* graph_pool = nullptr) {
 
     BubbleDescribeResult result;
@@ -1469,8 +1411,8 @@ BubbleDescribeResult describe_one_bubble(
             variant_nodes);
         write_feature_map(result.feature_map_path, features, stats, feature_nodes, options.kmer_size, paths.size());
 
-        if (pyseer_pool != nullptr) {
-            accumulate_pyseer_counts(graph, bubble, path_indexes, paths, features, options, variant_nodes, *pyseer_pool);
+        if (kmer_pool != nullptr) {
+            accumulate_kmer_counts(graph, bubble, path_indexes, paths, features, options, variant_nodes, *kmer_pool);
         }
 
         const bool wide_allowed_by_cap =
@@ -1630,13 +1572,13 @@ void describe_kmers_from_graph(
         to_process.push_back(&bubble);
     }
 
-    PyseerPool pyseer_pool;
-    // Per-haplotype node/edge dosage, pooled across bubbles for fsm_graph, BIMBAM, and --samples.
+    KmerPool kmer_pool;
+    // Per-haplotype node/edge dosage, pooled across bubbles for BIMBAM and --samples.
     GraphPool graph_pool;
-    // Which pooled substrates to accumulate. fsm (pyseer) and BIMBAM both need the cohort pools.
-    const bool want_kmer_pool = options.emit_kmers && (options.pyseer || options.bimbam);
+    // Which pooled substrates to accumulate (the BIMBAM genotype export needs the cohort pools).
+    const bool want_kmer_pool = options.emit_kmers && options.bimbam;
     const bool want_graph_pool =
-        options.emit_graph && (options.pyseer || options.bimbam || !options.samples_path.empty());
+        options.emit_graph && (options.bimbam || !options.samples_path.empty());
     const bool want_bimbam = options.bimbam && (options.emit_kmers || options.emit_graph);
     // For BIMBAM NA: which bubble(s) a feature is discriminative in, and which paths traverse each bubble.
     std::unordered_map<std::uint64_t, std::vector<std::size_t>> feature_bubbles_k;
@@ -1648,7 +1590,7 @@ void describe_kmers_from_graph(
     // paths) and accumulates into THREAD-LOCAL pools here; the pools and the index rows are merged
     // back in bubble order on the main thread, so the output is byte-identical to a single-thread run.
     std::vector<BubbleDescribeResult> results(to_process.size());
-    std::vector<PyseerPool> task_pyseer(want_kmer_pool ? to_process.size() : 0);
+    std::vector<KmerPool> task_kmer(want_kmer_pool ? to_process.size() : 0);
     std::vector<GraphPool> task_graph(want_graph_pool ? to_process.size() : 0);
     run_parallel(to_process.size(), options.threads, [&](std::size_t bi) {
         const Bubble& bubble = *to_process[bi];
@@ -1658,7 +1600,7 @@ void describe_kmers_from_graph(
             if (it != variant_nodes_by_bubble.end()) vnodes = &it->second;
         }
         results[bi] = describe_one_bubble(options, graph, path_indexes, bubble, vnodes,
-                                          want_kmer_pool ? &task_pyseer[bi] : nullptr,
+                                          want_kmer_pool ? &task_kmer[bi] : nullptr,
                                           want_graph_pool ? &task_graph[bi] : nullptr);
     });
 
@@ -1670,8 +1612,8 @@ void describe_kmers_from_graph(
             for (const std::string& p : results[bi].traversing_paths) tset.insert(p);
         }
         if (want_kmer_pool) {
-            for (auto& [code, carriers] : task_pyseer[bi]) {
-                auto& dst = pyseer_pool[code];
+            for (auto& [code, carriers] : task_kmer[bi]) {
+                auto& dst = kmer_pool[code];
                 for (const auto& [path, c] : carriers) dst[path] += c;
                 if (want_bimbam) feature_bubbles_k[code].push_back(bubble.id);
             }
@@ -1728,16 +1670,6 @@ void describe_kmers_from_graph(
             << (result.graph_matrix_written ? "1" : "0") << '\n';
     }
 
-    // Pooled pyseer fsm-lite (one per substrate, mirrored).
-    if (options.pyseer && options.emit_kmers) {
-        write_pyseer_fsm((out_dir / "fsm_kmers.txt.gz").string(), pyseer_pool, options.kmer_size);
-        summary.files_written += 1;
-    }
-    if (options.pyseer && options.emit_graph) {
-        write_string_fsm((out_dir / "fsm_graph.txt.gz").string(), graph_pool);
-        summary.files_written += 1;
-    }
-
     // Pooled BIMBAM mean-genotype dosage (canonical genotype export) + shared feature_annot + sample order.
     if (want_bimbam) {
         std::vector<std::string> sample_order;
@@ -1752,8 +1684,8 @@ void describe_kmers_from_graph(
         annot.write("feature_id\tlayer\tencoding\tbubbles\tnodes\n");
         if (options.emit_kmers) {
             std::vector<BimbamRow> rows;
-            rows.reserve(pyseer_pool.size());
-            for (const auto& [code, carriers] : pyseer_pool) {
+            rows.reserve(kmer_pool.size());
+            for (const auto& [code, carriers] : kmer_pool) {
                 BimbamRow r;
                 r.id = decode_kmer(code, options.kmer_size);
                 r.nodes = ".";  // per-k-mer node provenance lives in the per-bubble kmer_features.tsv.gz
@@ -1836,41 +1768,18 @@ void describe_kmers_from_graph(
             }
         }
 
-        // K-mer substrate (the tested, primary GWAS layer): fsm_kmers.samples.txt.gz.
-        if (options.pyseer) {
-            PyseerPool sample_pool;
-            for (const auto& [code, carriers] : pyseer_pool) {
-                auto& out = sample_pool[code];
+        // Node/edge substrate (complementary graph-local layer): diploid summation, keyed by node id /
+        // edge so it joins to call's node_track.tsv. Built once here, reused for the sample-level BIMBAM.
+        GraphPool graph_sample_pool;
+        if (want_bimbam && options.emit_graph) {
+            for (const auto& [feature, carriers] : graph_pool) {
+                auto& out = graph_sample_pool[feature];
                 for (const auto& [path, count] : carriers) {
                     const auto it = path_to_samples.find(path);
                     if (it == path_to_samples.end()) continue;
                     for (const std::string& s : it->second) out[s] += count;
                 }
             }
-            const std::string sfsm = (out_dir / "fsm_kmers.samples.txt.gz").string();
-            write_pyseer_fsm(sfsm, sample_pool, options.kmer_size);
-            summary.files_written += 1;
-            if (!options.quiet) {
-                std::cerr << "[describe] sample-level k-mer fsm: " << n_samples << " samples -> " << sfsm << "\n";
-            }
-        }
-
-        // Node/edge substrate (complementary graph-local layer): fsm_graph.samples.txt.gz, same
-        // diploid summation, keyed by node id / edge so it joins to call's node_track.tsv.
-        GraphPool graph_sample_pool;
-        for (const auto& [feature, carriers] : graph_pool) {
-            auto& out = graph_sample_pool[feature];
-            for (const auto& [path, count] : carriers) {
-                const auto it = path_to_samples.find(path);
-                if (it == path_to_samples.end()) continue;
-                for (const std::string& s : it->second) out[s] += count;
-            }
-        }
-        const std::string gfsm = (out_dir / "fsm_graph.samples.txt.gz").string();
-        write_string_fsm(gfsm, graph_sample_pool);
-        summary.files_written += 1;
-        if (!options.quiet) {
-            std::cerr << "[describe] sample-level node/edge fsm: " << n_samples << " samples -> " << gfsm << "\n";
         }
 
         // Sample-level BIMBAM (diploid, summed dosage) -- the realistic per-sample genotype input to
@@ -1892,9 +1801,9 @@ void describe_kmers_from_graph(
             }
             GzipWriter annot((out_dir / "feature_annot.samples.tsv.gz").string());
             annot.write("feature_id\tlayer\tencoding\tbubbles\tnodes\n");
-            if (options.emit_kmers && options.pyseer) {
-                PyseerPool sample_pool;
-                for (const auto& [code, carriers] : pyseer_pool) {
+            if (options.emit_kmers) {
+                KmerPool sample_pool;
+                for (const auto& [code, carriers] : kmer_pool) {
                     auto& out = sample_pool[code];
                     for (const auto& [path, count] : carriers) {
                         const auto it = path_to_samples.find(path);

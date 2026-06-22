@@ -21,7 +21,13 @@ thresholds, ready for the Manhattan/QQ plotter.
 
 The phenotype type is auto-detected: a **binary** (0/1) phenotype → **logistic** regression (effect
 reported as `log_or`); anything else → **linear** regression (effect reported as `beta`). Override with
-`--model`.
+`--model`. For a quantitative trait you can also fit a **linear mixed model** (`--model lmm`) that absorbs
+relatedness / population structure through a kinship matrix, or add the top kinship **PCs as covariates**
+(`--pca N`) to the GLM — see [Population structure](#population-structure-pcs-and-the-lmm). Every run also
+reports the **genomic-inflation factor λ** so you can see whether the test is well-calibrated.
+
+New to GWAS? Start with the [GWAS primer](../gwas_primer.md), which explains genotypes/dosage, MAF,
+multiple testing, kinship, λ, and LMM-vs-PCs in plain terms on this exact LPA example.
 
 ## Required inputs
 
@@ -46,24 +52,39 @@ panvar associate --genotypes <bimbam.gz> --samples <samples.txt> --phenotype <ta
 
 - `--feature-annot <tsv.gz>` — `describe`'s `feature_annot.tsv.gz`; adds `layer` / `bubbles` / `nodes`
   (graph provenance) to the output so hits are traceable to the graph and, via `node_genes.tsv`, to genes.
+- `--node-genes <tsv>` — `call`'s `node_genes.tsv` (from `call --gtf`); adds a **`gene` column** to the
+  output by joining the node ids in each feature's `nodes` provenance to gene names. No GTF → omit it (the
+  column is still written, valued `.`).
 - `--min-maf <X>` — drop features whose **minor (non-modal) genotype frequency** is below `X` (default
   `0.01`). This is the "present in the graph but rare/invariant in the cohort" filter: it is computed from
   the **actual sample matrix**, so it removes features that carry no usable variation in *these* samples.
   It is well-defined for both presence/absence (0/1) and copy-number dosage.
-- `--model <auto|linear|logistic>` — default `auto` (binary phenotype → logistic).
+- `--model <auto|linear|logistic|lmm>` — default `auto` (binary → logistic, else linear). `lmm` is a
+  linear mixed model for a **quantitative** trait and needs a kinship source (`--kinship`/`--make-kinship`).
+- `--kinship <path>` — a precomputed `n × n` genetic-relationship matrix (GRM), rows/cols in `--samples`
+  order (whitespace/comma/tab-separated; subset to the used samples automatically). Used by `--model lmm`
+  and `--pca`.
+- `--make-kinship` — build the GRM from the genotype matrix itself (standardize each feature, `K = ZZᵀ/m`).
+  **Caveat:** when the matrix is a single region this GRM is *proximally contaminated* by the very signal
+  you test (it can over-correct); it is appropriate for a **genome-wide-like** marker panel. Prefer an
+  external `--kinship` built from genome-wide markers when you have one.
+- `--pca <N>` — add the top-N kinship **PCs as fixed covariates** to the GLM (cheap structure control; no
+  mixed model). Needs `--kinship` or `--make-kinship`. Works for both linear and logistic.
 - `-q, --quiet`
 
 ## Outputs
 
 - `<prefix>.assoc.tsv` — one row per tested feature, sorted by `p`:
-  `feature_id, layer, bubbles, nodes, n, minor_freq, beta|log_or, se, z, p, p_bonf, q_bh`.
+  `feature_id, layer, bubbles, nodes, n, minor_freq, beta|log_or, se, z, p, p_bonf, q_bh, gene`.
   - `n` — samples used for that feature (after NA-genotype/phenotype/covariate removal).
   - `p_bonf` — Bonferroni-adjusted p (`min(1, p · n_tests)`).
   - `q_bh` — Benjamini-Hochberg FDR q-value.
-- `<prefix>.summary.tsv` — `model`, `phenotype_type`, `covariates`, `samples_used`, `features_tested`,
-  `dropped_min_maf`, `dropped_fit`, the **`bonferroni_threshold` (`0.05 / n_tests`)**, and the counts of
-  features significant at Bonferroni and at FDR<0.05. The plotter reads `features_tested` from here to draw
-  the threshold line.
+  - `gene` — gene name(s) behind the feature's nodes (`.` unless `--node-genes` is given).
+- `<prefix>.summary.tsv` — `model`, `phenotype_type`, `covariates` (incl. any PCs), `pca_covariates`,
+  `samples_used`, `features_tested`, `dropped_min_maf`, `dropped_fit`, the
+  **`bonferroni_threshold` (`0.05 / n_tests`)**, the counts significant at Bonferroni and FDR<0.05, the
+  genomic-inflation **`lambda_gc`**, and (LMM only) the fitted variance ratio `lmm_delta`. The plotter
+  reads `features_tested` from here to draw the threshold line.
 
 ## Multiple testing — why not 5×10⁻⁸
 
@@ -78,6 +99,30 @@ Because k-mers from one node are highly correlated, `n_tests` over-counts the in
 Bonferroni here is *conservative*; an effective-number-of-tests / permutation threshold is a planned
 refinement. The Manhattan plot draws the nominal (`0.05`) and Bonferroni lines, and highlights FDR<0.05
 points, so "before vs after correction" is read directly off the figure.
+
+## Population structure: PCs and the LMM
+
+When a cohort contains **subpopulations** (ancestry groups) that differ both in allele frequencies and in
+the trait mean, a naive test reports spurious associations at any marker whose frequency tracks ancestry —
+the test is **inflated** (genomic-inflation `lambda_gc` > 1). `associate` offers two standard remedies:
+
+- **PCs as covariates** (`--pca N`, or just include ancestry `PC1…PCN` columns in `--phenotype`): condition
+  the regression on the top genetic principal components, so ancestry is regressed out. Cheap, works for
+  linear and logistic.
+- **Linear mixed model** (`--model lmm`): model relatedness as a random effect with covariance `σ²_g·K`
+  (the kinship `K`) plus noise. `associate` uses the fast **EMMAX** approximation — eigendecompose `K`
+  once, estimate the variance ratio `δ = σ²_e/σ²_g` once under the null, then test each feature by
+  generalized least squares in the rotated space. Reported `lmm_delta` is that ratio.
+
+Read calibration off `lambda_gc` (and the QQ plot): ~1 is well-calibrated, >1 flags residual structure.
+
+> **Scope caveat (important).** `lambda_gc` is only meaningful when the matrix has **many independent null
+> markers**. A single pangenome region (e.g. LPA alone) is essentially *one* correlated signal block with no
+> nulls, so its λ is not interpretable and structure correction is neither needed nor diagnostic there — the
+> operative controls for a single region are the **MAF filter** and **region-wide multiple testing** above.
+> PCs/LMM earn their keep once you assemble a **genome-wide** panel of pangenome features (many regions). The
+> [gwas_example.md](../gwas_example.md) shows both: the LPA region scan (KIV-2 recovery) *and* a
+> genome-wide-like panel where a naive λ≈2–4 collapses to ≈1 under `--pca`/`--model lmm`.
 
 ## Genotype encoding
 

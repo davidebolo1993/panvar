@@ -25,13 +25,17 @@ external graph or alignment tools); these are cited for the *ideas*, not as runt
 
 ## Copy-number vs presence/absence association
 
-- Lees JA, Galardini M, Bentley SD, Weiser JN, Corander J. **pyseer: a comprehensive tool for microbial
-  pangenome-wide association studies.** *Bioinformatics* 34(24):4310–4312, 2018. — the fsm-lite
-  `<feature> | strain:count` table `describe` emits is the format such presence/absence-based tools read.
 - Rahman A, Hallgrímsdóttir I, Eisen M, Pachter L. **Association mapping from sequencing reads using
   k-mers.** *eLife* 7:e32920, 2018. — the count/abundance idea behind testing marker *multiplicity*
   (copy number), which presence/absence GWAS cannot see at a fixed-copy repeat. panvar's
-  `scripts/gwas_demo.py` is a transparent stand-in that runs both tests on the same file.
+  `associate` module tests this dosage directly (see [gwas_example.md](gwas_example.md)).
+- Lees JA, Galardini M, Bentley SD, Weiser JN, Corander J. **pyseer: a comprehensive tool for microbial
+  pangenome-wide association studies.** *Bioinformatics* 34(24):4310–4312, 2018. — background on
+  pangenome-wide association; its k-mer mode is presence/absence, which is *why* panvar carries dosage
+  through to BIMBAM and tests multiplicity directly rather than emitting a presence/absence k-mer table.
+- Zhou X, Stephens M. **Genome-wide efficient mixed-model analysis for association studies (GEMMA).**
+  *Nature Genetics* 44:821–824, 2012. — the BIMBAM mean-genotype dosage format `describe` exports and the
+  LMM that `associate --model lmm` mirrors.
 
 ## Lp(a) / KIV-2 biology (the worked example)
 
@@ -39,4 +43,17 @@ external graph or alignment tools); these are cited for the *ideas*, not as runt
   lipoprotein(a).** *Journal of Lipid Research* 57(8):1339–1359, 2016. doi:10.1194/jlr.R067314.
 - Coassin S, Kronenberg F. **Lipoprotein(a) beyond the kringle IV repeat polymorphism: The complexity
   of genetic variation in the LPA gene.** *Atherosclerosis* 349:17–35, 2022.
-  — the inverse relationship between KIV-2 copy number and plasma Lp(a) used in `gwas_example.md`.
+  — the inverse KIV-2 ↔ Lp(a) relationship, the log-normal ~0.3–300 mg/dL (median ~10–12) distribution, and
+  the small-isoform (≤22 KIV) ~5× effect used to ground `make_lpa_phenotype.py`.
+- **Moli-sani** study (Italian / Southern-European cohort): Lipoprotein(a) as an early marker of
+  cardiovascular events. *Frontiers in Cardiovascular Medicine* 12:1571395, 2025. — a Southern-European
+  cohort context for the simulated covariate/Lp(a) ranges; >50 mg/dL marks clinical high risk.
+
+## Population structure / mixed models (the `associate` LMM)
+
+- Kang HM, Sul JH, Service SK, et al. **Variance component model to account for sample structure in
+  genome-wide association studies (EMMAX).** *Nature Genetics* 42:348–354, 2010. — the eigendecompose-once,
+  test-each-marker fast-LMM approximation `panvar associate --model lmm` implements.
+- Price AL, Patterson NJ, Plenge RM, et al. **Principal components analysis corrects for stratification in
+  genome-wide association studies.** *Nature Genetics* 38:904–909, 2006. — the PC-covariate approach behind
+  `--pca`.

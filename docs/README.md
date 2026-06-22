@@ -13,15 +13,17 @@ This directory contains module-focused documentation for the `panvar` CLI.
 4. `docs/modules/describe.md`
    Module 4 (`panvar describe`): per-bubble k-mer / node-edge feature tables + BIMBAM dosage genotype exports
 5. `docs/modules/associate.md`
-   Module 5 (`panvar associate`): GWAS on the describe genotypes vs a phenotype/covariate table (GLM, MAF filter, region-wide multiple-testing correction)
+   Module 5 (`panvar associate`): GWAS on the describe genotypes vs a phenotype/covariate table — GLM or linear mixed model (`--model lmm`), ancestry-PC covariates (`--pca`), MAF filter, region-wide multiple-testing, genomic-inflation λ, and a `--node-genes` gene column
 6. `docs/modules/inspect.md`
    Utility (`panvar inspect`): clustering, path FASTA and node/edge traversal matrices for one or all called bubbles
 
 
 ## Guides
 
+- `docs/gwas_primer.md`
+  **GWAS from scratch** for `associate`: genotype/dosage, covariates, MAF, multiple testing (why not 5e-8), population structure, kinship, genomic-inflation λ, and LMM vs PCs — all on the LPA example.
 - `docs/gwas_example.md`
-  Worked **pangenome association** (LPA KIV-2 copy number → Lp(a)): concepts, sample-level testing via cosigt aggregation, multiplicity vs presence/absence on both the k-mer and node/edge substrates, Manhattan/QQ, and traceback to variants.
+  Worked **pangenome association** (LPA KIV-2 copy number → Lp(a)): literature-grounded structured cohort, sample-level testing via cosigt aggregation, multiplicity vs presence/absence on both substrates, the region scan (KIV-2 recovery) **and** a structure-correction demo (naive λ≫1 → PC/LMM λ≈1), Manhattan/QQ, and gene traceback.
 - `docs/algorithm_example.md`
   Tiny hand-traced datasets that walk through the internals end to end: bubble normalization, the panphorte approximate collapse, the `call` event typing / merge / copy-number arithmetic, and the `describe` syncmer sampling and discriminative filter. Read this to see *how* a result is computed, not just *what* the command prints.
 - `docs/references.md`

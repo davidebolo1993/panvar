@@ -2,42 +2,59 @@
 # LPA pangenome-association demo on the real LPA graph (tests/real_data/lpa.gfa.gz), end to end with
 # the native modules: bubble -> panphorte -> call -> describe --samples -> ASSOCIATE.
 #
-# KIV-2 copy number is read per real haplotype from panphorte; real haplotypes are paired into diploid
-# samples (cosigt-style) with a literature-plausible INVERSE Lp(a) phenotype (synthetic values, real
-# topology) plus synthetic covariates (Age, Sex, PC1-3) and ~5% NA phenotypes. `describe --samples`
-# emits per-sample BIMBAM dosage; `panvar associate` runs the GWAS (GLM + covariates, MAF filter on the
-# final genotypes, region-wide Bonferroni/BH correction). The KIV-2 locus is recovered as the top hit
-# with a NEGATIVE effect (more KIV-2 -> lower Lp(a)).
+# It produces TWO things:
 #
-#   run_lpa_real.sh <panvar_bin> <out_dir> [python] [Rscript]
+#   1. REGION SCAN (panvar on the actual pangenome). cosigt-style diploid samples are built from the
+#      real KIV-2 copy numbers; `describe --samples` emits per-sample BIMBAM dosage; `associate` runs
+#      the GWAS (GLM + ancestry-PC covariates, MAF filter, region-wide Bonferroni/BH). KIV-2 (bubble 7)
+#      is recovered as the top hit with a NEGATIVE effect (more KIV-2 -> lower Lp(a)).
+#
+#   2. STRUCTURE-CORRECTION demo (teaching the LMM/PC/kinship machinery). A single region has no null
+#      markers, so genomic-inflation lambda is not interpretable there. We therefore also test a
+#      SYNTHETIC genome-wide-like panel (the real causal KIV-2 dosage + many subpop-stratified null
+#      SNPs). A naive scan is inflated (lambda >> 1); adding the ancestry PCs (--phenotype with PCs) or
+#      the LMM with a panel-derived GRM (--model lmm --make-kinship) brings lambda ~ 1 while KIV-2
+#      survives. This needs a numpy-capable python (pass it as $3 / $PY).
+#
+#   run_lpa_real.sh <panvar_bin> <out_dir> [python] [Rscript] [--big]
+# Env: N (cohort size; --big sets 10000), SIM (null markers, default 3000), LMM_MAX_N (LMM size cap).
 set -euo pipefail
 
-PANVAR_BIN="${1:?usage: run_lpa_real.sh <panvar_bin> <out_dir> [python] [Rscript]}"
+PANVAR_BIN="${1:?usage: run_lpa_real.sh <panvar_bin> <out_dir> [python] [Rscript] [--big]}"
 OUT_DIR="${2:?need out_dir}"
 PY="${3:-python3}"
 RS="${4:-Rscript}"
+[ "${5:-}" = "--big" ] && N="${N:-10000}"
+N="${N:-300}"
+SIM="${SIM:-3000}"
+LMM_MAX_N="${LMM_MAX_N:-4000}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 GFA="$REPO/tests/real_data/lpa.gfa.gz"
 REAL="$OUT_DIR/real"
 mkdir -p "$OUT_DIR" "$REAL"
 REF="$(gzcat "$GFA" | awk -F'\t' '($1=="P"||$1=="W"){n=$2; if(g==""&&n~/[Gg][Rr][Cc]h38/)g=n; if(f=="")f=n} END{print (g!=""?g:f)}')"
-echo "reference path: $REF"
+echo "reference path: $REF ; cohort N=$N ; sim null markers=$SIM"
 
 echo "== bubble -> panphorte (KIV-2 copies) =="
 "$PANVAR_BIN" bubble    -i "$GFA" -o "$OUT_DIR/bub" -r "$REF" --quiet >/dev/null
 SGFA="$OUT_DIR/bub.sorted.gfa"
 "$PANVAR_BIN" panphorte -i "$SGFA" --bubble-prefix-in "$OUT_DIR/bub" -o "$OUT_DIR/pan" \
-  --reference-path "$REF" --min-similarity 0.90 --quiet >/dev/null
+  --reference-path "$REF" --min-similarity 0.97 --quiet >/dev/null
 PGFA="$OUT_DIR/pan.normalized.sorted.gfa"
-# synthetic cohort: cosigt samples.tsv + pheno.{quant,binary}.tsv (covariates + NA)
-"$PY" "$HERE/make_lpa_phenotype.py" "$OUT_DIR/pan.panphorte.copies.tsv" "$REAL" 200
+
+# structured cohort: cosigt samples.tsv + pheno.{quant,binary}{,.nopc}.tsv (subpops, PCs, NA) +
+# synthetic structure-demo panel; kinship GRM only when N is small enough for a dense matrix file.
+KOPT=(); [ "$N" -le "$LMM_MAX_N" ] && KOPT=(--kinship-out "$REAL/kinship.tsv")
+"$PY" "$HERE/make_lpa_phenotype.py" "$OUT_DIR/pan.panphorte.copies.tsv" "$REAL" \
+  --n "$N" --sim-markers "$SIM" "${KOPT[@]}"
 
 echo "== call -> describe --samples (per-sample BIMBAM dosage) =="
 GTF="${GTF:-$REPO/tests/real_data/Homo_sapiens.GRCh38.116.gtf.gz}"
 GTFOPT=(); [ -f "$GTF" ] && GTFOPT=(--gtf "$GTF")
 "$PANVAR_BIN" call -i "$PGFA" --bubble-prefix-in "$OUT_DIR/pan" --reference-path "$REF" \
   -o "$OUT_DIR/call" --cn-from-multiplicity ${GTFOPT[@]+"${GTFOPT[@]}"} --quiet >/dev/null
+NGOPT=(); [ -f "$OUT_DIR/call.node_genes.tsv" ] && NGOPT=(--node-genes "$OUT_DIR/call.node_genes.tsv")
 "$PANVAR_BIN" describe -i "$PGFA" --bubble-prefix-in "$OUT_DIR/pan" --out-dir "$OUT_DIR/desc" \
   --kmer-size 31 --no-wide-matrix --variant-nodes "$OUT_DIR/call.variant_nodes.tsv" \
   --samples "$REAL/samples.tsv" --quiet >/dev/null
@@ -45,28 +62,59 @@ GTFOPT=(); [ -f "$GTF" ] && GTFOPT=(--gtf "$GTF")
 DESC="$OUT_DIR/desc"
 SAMP="$DESC/bimbam.samples.samples.txt.gz"
 ANNOT="$DESC/feature_annot.samples.tsv.gz"
-# associate: both substrates x both trait codings. graph = node/edge dosage (carries the KIV-2 self-loop
-# REP node); kmer = k-mer multiplicity. quant = Lp(a) level (linear); binary = case/control (logistic).
+plot() {  # plot <assoc_prefix> <title>
+  "$RS" "$REPO/scripts/plot_associate.R" --assoc "$1.assoc.tsv" --summary "$1.summary.tsv" \
+    --out "$1" --title "$2" >/dev/null 2>&1 || echo "  (plot skipped: ggplot2?)"
+}
+
+echo "== 1) REGION SCAN: associate on the real KIV-2 features (PC-adjusted) =="
+# graph = node/edge dosage (carries the KIV-2 self-loop REP node); kmer = k-mer multiplicity.
+# quant = log10 Lp(a) (linear); binary = high-risk case/control (logistic). pheno tables carry PCs.
 for sub in graph kmers; do
   GENO="$DESC/bimbam_${sub}.samples.bimbam.gz"
   for mode in quant binary; do
-    echo "== associate ($sub / $mode) =="
+    echo "   -- associate ($sub / $mode) --"
     "$PANVAR_BIN" associate --genotypes "$GENO" --samples "$SAMP" --feature-annot "$ANNOT" \
-      --phenotype "$REAL/pheno.${mode}.tsv" --min-maf 0.02 -o "$OUT_DIR/assoc_${sub}_${mode}"
-    "$RS" "$REPO/scripts/plot_associate.R" --assoc "$OUT_DIR/assoc_${sub}_${mode}.assoc.tsv" \
-      --summary "$OUT_DIR/assoc_${sub}_${mode}.summary.tsv" --out "$OUT_DIR/assoc_${sub}_${mode}" \
-      --title "LPA Lp(a) ($sub, $mode)" >/dev/null 2>&1 || echo "  (plot skipped: ggplot2?)"
+      "${NGOPT[@]}" --phenotype "$REAL/pheno.${mode}.tsv" --min-maf 0.02 -o "$OUT_DIR/assoc_${sub}_${mode}"
+    plot "$OUT_DIR/assoc_${sub}_${mode}" "LPA Lp(a) ($sub, $mode)"
   done
 done
 
-echo "== sanity: associate recovers the KIV-2 locus (bubble 7) with a negative effect =="
-"$PY" - "$OUT_DIR/assoc_graph_quant.assoc.tsv" <<'PY'
+echo "== 2) STRUCTURE-CORRECTION demo on the synthetic genome-wide-like panel =="
+SGENO="$REAL/geno.sim.bimbam.gz"; SSAMP="$REAL/sim.samples.txt"; SANNOT="$REAL/feature_annot.sim.tsv.gz"
+if [ -f "$SGENO" ]; then
+  echo "   -- naive (Age+Sex, no PCs): expect inflated lambda --"
+  "$PANVAR_BIN" associate --genotypes "$SGENO" --samples "$SSAMP" --feature-annot "$SANNOT" \
+    --phenotype "$REAL/pheno.quant.nopc.tsv" --min-maf 0.02 -o "$OUT_DIR/sim_naive"
+  plot "$OUT_DIR/sim_naive" "LPA structure demo (naive)"
+  echo "   -- + ancestry PC covariates: lambda back toward 1 --"
+  "$PANVAR_BIN" associate --genotypes "$SGENO" --samples "$SSAMP" --feature-annot "$SANNOT" \
+    --phenotype "$REAL/pheno.quant.tsv" --min-maf 0.02 -o "$OUT_DIR/sim_pc"
+  plot "$OUT_DIR/sim_pc" "LPA structure demo (PC-adjusted)"
+  if [ "$N" -le "$LMM_MAX_N" ]; then
+    echo "   -- LMM with panel-derived GRM (--make-kinship): lambda ~ 1 --"
+    "$PANVAR_BIN" associate --genotypes "$SGENO" --samples "$SSAMP" --feature-annot "$SANNOT" \
+      --phenotype "$REAL/pheno.quant.nopc.tsv" --model lmm --make-kinship --min-maf 0.02 -o "$OUT_DIR/sim_lmm"
+    plot "$OUT_DIR/sim_lmm" "LPA structure demo (LMM)"
+  else
+    echo "   (LMM skipped: N=$N > LMM_MAX_N=$LMM_MAX_N; use --pca / PC covariates at this scale)"
+  fi
+fi
+
+echo "== sanity: region scan recovers KIV-2 (bubble 7, negative effect); structure correction lowers lambda =="
+"$PY" - "$OUT_DIR/assoc_graph_quant.assoc.tsv" "$OUT_DIR/sim_naive.summary.tsv" "$OUT_DIR/sim_pc.summary.tsv" <<'PY'
 import sys
 rows = [l.split("\t") for l in open(sys.argv[1]).read().splitlines()[1:]]
-# cols: 0 feature 1 layer 2 bubbles 3 nodes 4 n 5 minor_freq 6 beta 7 se 8 z 9 p 10 p_bonf 11 q_bh
 top = rows[0]
 beta, p_bonf = float(top[6]), float(top[10])
 ok = ("7" in top[2].split(";")) and beta < 0 and p_bonf < 0.05
-print(f"  top feature={top[0]} bubble={top[2]} beta={beta:.3f} p_bonf={p_bonf:.1e}  -> {'PASS' if ok else 'CHECK'}")
+print(f"  region top feature={top[0]} bubble={top[2]} beta={beta:.3f} p_bonf={p_bonf:.1e} -> {'PASS' if ok else 'CHECK'}")
+def lam(p):
+    try:
+        d = dict(l.split("\t") for l in open(p).read().splitlines()[1:]); return float(d["lambda_gc"])
+    except Exception:
+        return float("nan")
+ln, lp = lam(sys.argv[2]), lam(sys.argv[3])
+print(f"  structure-demo lambda: naive={ln:.2f} -> PC-adjusted={lp:.2f} -> {'PASS' if lp < ln else 'CHECK'}")
 PY
-echo "== DONE: $OUT_DIR (assoc_{graph,kmer}_{quant,binary}.{assoc.tsv,summary.tsv,manhattan.png,qq.png}) =="
+echo "== DONE: $OUT_DIR (assoc_*, sim_{naive,pc,lmm}.{assoc.tsv,summary.tsv,manhattan.png,qq.png}) =="

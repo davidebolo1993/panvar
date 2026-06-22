@@ -1,88 +1,254 @@
 #!/usr/bin/env python3
-"""Build a diploid cohort + literature-based Lp(a) phenotype on the REAL LPA graph.
+"""Build a structured diploid cohort + literature-based Lp(a) phenotype on the REAL LPA graph.
 
-Reads panphorte's <prefix>.panphorte.copies.tsv (KIV-2 copies per real haplotype path), pairs
-real haplotypes into synthetic diploid samples (cosigt-style), and assigns an Lp(a) phenotype
-using the published INVERSE relationship between KIV-2 copy number and plasma Lp(a) (more KIV-2
-repeats -> lower Lp(a)). The phenotype values are synthetic but the effect direction/size is
-literature-plausible; the point is to check the GWAS recovers the KIV-2 locus on real topology.
+Reads panphorte's <prefix>.panphorte.copies.tsv (KIV-2 copies per real haplotype path), partitions the
+real haplotypes into a few Southern-European-like SUBPOPULATIONS, and samples diploid individuals by
+drawing a subpopulation and then two haplotypes from it. This injects realistic POPULATION STRUCTURE:
+subpopulations differ both in KIV-2 allele frequency and in a baseline Lp(a) offset that is NOT caused by
+KIV-2 (an ancestry/environment confounder). A naive GWAS that ignores ancestry is therefore inflated
+(genomic inflation lambda > 1); adding the ancestry PCs as covariates (or an LMM with a kinship matrix)
+brings it back to ~1. That before/after is the point of the example.
 
-  Lp(a) = BASE - SLOPE * (CN_A + CN_B) + N(0, SIGMA)        case = Lp(a) > median
+Phenotype (synthetic values, literature-plausible shape and effect direction):
 
-Usage: make_lpa_phenotype.py <copies.tsv> <out_dir> [n_samples] [seed]
-Writes <out_dir>/samples.tsv (sample, hap1, hap2) and <out_dir>/phenotypes.tsv (per sample).
+  log10 Lp(a) = BASE - SLOPE*(CN_A+CN_B) + subpop_offset + age/sex effects + N(0, SIGMA)
+
+so plasma Lp(a) is log-normal (right-skewed, ~0.3-300 mg/dL, median ~10-12; Coassin & Kronenberg 2022)
+with the published INVERSE KIV-2 effect (more KIV-2 repeats -> smaller isoform -> lower Lp(a)). The binary
+trait is the clinical high-risk cut Lp(a) > 50 mg/dL. The quantitative phenotype emitted is log10 Lp(a)
+(so a linear model sees ~normal residuals). Biological caveat: in reality the SMALLER of the two isoforms
+dominates Lp(a); we model the additive summed dosage for a clean, recoverable demo.
+
+Outputs in <out_dir>:
+  samples.tsv             sample <tab> haplotype_1 <tab> haplotype_2     (cosigt-style)
+  pheno.quant.tsv         sample, phenotype(=log10 Lp(a)), Age, Sex, PC1, PC2, PC3   (with ~5% NA)
+  pheno.binary.tsv        sample, phenotype(=high-risk 0/1), Age, Sex, PC1, PC2, PC3
+  pheno.quant.nopc.tsv    same but WITHOUT the PCs (the naive/uncorrected analysis)
+  pheno.binary.nopc.tsv
+  phenotypes.tsv          legacy truth table (kiv2 dosage, raw Lp(a), subpop) for sanity checks
+  kinship.tsv             n x n GRM from haplotype sharing (only if --kinship-out and n is small enough)
+
+Usage:
+  make_lpa_phenotype.py <copies.tsv> <out_dir> [--n N] [--seed S] [--subpops K] [--kinship-out PATH]
+A bare positional 3rd arg is still accepted as N for backward compatibility.
 """
+import argparse
+import math
 import os
 import random
 import statistics
 import sys
 
-copies_tsv = sys.argv[1]
-out_dir = sys.argv[2]
-N_SAMPLES = int(sys.argv[3]) if len(sys.argv) > 3 else 200
-SEED = int(sys.argv[4]) if len(sys.argv) > 4 else 23
-BASE, SLOPE, SIGMA = 150.0, 2.2, 14.0   # Lp(a)-like units; inverse KIV-2 effect
+# ---- literature-grounded constants (see docs/gwas_example.md "Data & literature resources") ----
+BASE_LOG10 = 1.08      # 10**1.08 ~ 12 mg/dL median Lp(a) at the cohort-mean KIV-2 dosage
+SLOPE_LOG10 = 0.022    # per summed-copy decrease in log10 Lp(a) (inverse KIV-2 effect)
+SIGMA_LOG10 = 0.42     # residual sd on log10 scale (KIV-2 leaves substantial unexplained variance)
+AGE_SLOPE_LOG10 = 0.0015   # mild age effect per year
+SEX_EFFECT_LOG10 = 0.05    # mild sex effect
+HIGH_RISK_MGDL = 50.0      # clinical high-risk Lp(a) threshold -> binary case
+NA_FRAC = 0.05             # fraction of phenotypes set to NA (to exercise the missing-data filter)
 
-random.seed(SEED)
-os.makedirs(out_dir, exist_ok=True)
 
-# parse copies.tsv -> per-haplotype CN for the KIV-2 bubble (the one with the largest unit_bp)
-rows = []
-with open(copies_tsv) as fh:
-    hdr = fh.readline().rstrip("\n").split("\t")
-    ci = {c: i for i, c in enumerate(hdr)}
-    for line in fh:
-        f = line.rstrip("\n").split("\t")
-        rows.append((f[ci["path_name"]], int(f[ci["bubble_id"]]), int(f[ci["copies"]]),
-                     int(f[ci["unit_bp"]])))
-if not rows:
-    sys.exit("no rows in copies.tsv (run panphorte --min-similarity 0.90 first)")
-# KIV-2 bubble = the bubble id with the largest unit_bp
-kiv2_bubble = max({(b, ub) for _, b, _, ub in rows}, key=lambda x: x[1])[0]
-cn = {p: c for p, b, c, _ in rows if b == kiv2_bubble}
-haps = sorted(cn)
-print(f"KIV-2 bubble={kiv2_bubble}; {len(haps)} haplotypes; CN range {min(cn.values())}..{max(cn.values())}")
+def parse_args(argv):
+    p = argparse.ArgumentParser(description="structured LPA cohort + Lp(a) phenotype")
+    p.add_argument("copies_tsv")
+    p.add_argument("out_dir")
+    p.add_argument("n_pos", nargs="?", type=int, default=None, help="(legacy positional N)")
+    p.add_argument("seed_pos", nargs="?", type=int, default=None, help="(legacy positional seed)")
+    p.add_argument("--n", type=int, default=None, help="number of diploid individuals (default 200)")
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--subpops", type=int, default=3, help="number of subpopulations (default 3)")
+    p.add_argument("--kinship-out", default=None, help="write an n x n GRM here (skipped if n is large)")
+    p.add_argument("--kinship-max-n", type=int, default=3000, help="skip GRM file above this n")
+    p.add_argument("--sim-markers", type=int, default=0,
+                   help="also emit a synthetic genome-wide-like marker panel (causal KIV-2 + N "
+                        "subpop-stratified null SNPs) for the structure-correction demo (needs numpy)")
+    p.add_argument("--strat-sd", type=float, default=0.15,
+                   help="per-subpop allele-frequency sd for the stratified null markers (default 0.15)")
+    a = p.parse_args(argv)
+    a.n = a.n if a.n is not None else (a.n_pos if a.n_pos is not None else 200)
+    a.seed = a.seed if a.seed is not None else (a.seed_pos if a.seed_pos is not None else 23)
+    return a
 
-# diploid cohort: random pairs of real haplotypes. Covariates (Age, Sex, PC1-3) are synthetic; the
-# phenotype carries the KIV-2 effect PLUS small covariate effects (so covariate adjustment matters),
-# and ~5% of phenotypes are set to NA to exercise associate's missing-data filtering.
-AGE_SLOPE, SEX_EFFECT, NA_FRAC = 0.25, 6.0, 0.05
-samples, prows = [], []
-for i in range(N_SAMPLES):
-    a, b = random.choice(haps), random.choice(haps)
-    dosage = cn[a] + cn[b]
-    age = random.randint(35, 80)
-    sex = random.randint(0, 1)
-    pcs = [round(random.gauss(0, 1), 4) for _ in range(3)]
-    lpa = (BASE - SLOPE * dosage + AGE_SLOPE * (age - 55) + SEX_EFFECT * sex
-           + random.gauss(0, SIGMA))
-    sid = f"ind{i:03d}"
-    samples.append((sid, a, b))
-    prows.append([sid, dosage, lpa, age, sex, pcs])
 
-median_lpa = statistics.median(r[2] for r in prows)
-for r in prows:
-    r.append(1 if r[2] > median_lpa else 0)   # r[6] = case
-na = {i for i in range(N_SAMPLES) if random.random() < NA_FRAC}  # samples with NA phenotype
+def main(argv):
+    a = parse_args(argv)
+    random.seed(a.seed)
+    os.makedirs(a.out_dir, exist_ok=True)
 
-with open(os.path.join(out_dir, "samples.tsv"), "w") as f:
-    f.write("sample\thaplotype_1\thaplotype_2\n")
-    for sid, a, b in samples:
-        f.write(f"{sid}\t{a}\t{b}\n")
-# legacy table (kiv2 truth dosage), kept for the copy-number sanity check
-with open(os.path.join(out_dir, "phenotypes.tsv"), "w") as f:
-    f.write("sample\tkiv2_dosage\tlpa_continuous\tcase_binary\n")
-    for r in prows:
-        f.write(f"{r[0]}\t{r[1]}\t{r[2]:.4f}\t{r[6]}\n")
-# associate input: one phenotype column + covariates; some phenotypes NA (covariates kept).
-def write_pheno(path, pheno_idx, fmt):
-    with open(path, "w") as f:
-        f.write("sample\tphenotype\tAge\tSex\tPC1\tPC2\tPC3\n")
-        for i, r in enumerate(prows):
-            val = "NA" if i in na else fmt(r[pheno_idx])
-            f.write(f"{r[0]}\t{val}\t{r[3]}\t{r[4]}\t{r[5][0]}\t{r[5][1]}\t{r[5][2]}\n")
-write_pheno(os.path.join(out_dir, "pheno.quant.tsv"), 2, lambda v: f"{v:.4f}")
-write_pheno(os.path.join(out_dir, "pheno.binary.tsv"), 6, lambda v: str(v))
-print(f"wrote {out_dir}/samples.tsv + phenotypes.tsv + pheno.{{quant,binary}}.tsv  "
-      f"({len(samples)} diploid samples; dosage {min(r[1] for r in prows)}..{max(r[1] for r in prows)}; "
-      f"cases {sum(r[6] for r in prows)}/{len(prows)}; {len(na)} NA phenotypes)")
+    # parse copies.tsv -> per-haplotype CN for the KIV-2 bubble (the one with the largest unit_bp)
+    rows = []
+    with open(a.copies_tsv) as fh:
+        hdr = fh.readline().rstrip("\n").split("\t")
+        ci = {c: i for i, c in enumerate(hdr)}
+        for line in fh:
+            f = line.rstrip("\n").split("\t")
+            rows.append((f[ci["path_name"]], int(f[ci["bubble_id"]]), int(f[ci["copies"]]),
+                         int(f[ci["unit_bp"]])))
+    if not rows:
+        sys.exit("no rows in copies.tsv (run panphorte first)")
+    kiv2_bubble = max({(b, ub) for _, b, _, ub in rows}, key=lambda x: x[1])[0]
+    cn = {p: c for p, b, c, _ in rows if b == kiv2_bubble}
+    haps = sorted(cn)
+    print(f"KIV-2 bubble={kiv2_bubble}; {len(haps)} haplotypes; CN range "
+          f"{min(cn.values())}..{max(cn.values())}")
+
+    # ---- subpopulations: each favors a different part of the KIV-2 spectrum (structure in allele
+    # frequency) and carries a baseline Lp(a) offset independent of KIV-2 (the confounder). ----
+    K = max(1, a.subpops)
+    cn_lo, cn_hi = min(cn.values()), max(cn.values())
+    cn_mid = 0.5 * (cn_lo + cn_hi)
+    # per-subpop tilt of the CN sampling weights: subpop 0 favors LOW CN (-> high Lp(a)), last favors HIGH
+    tilts = [(-1.0 + 2.0 * k / max(1, K - 1)) for k in range(K)] if K > 1 else [0.0]
+    # per-subpop baseline log10 Lp(a) offset (the confounder: ancestry shifts Lp(a) independently of
+    # KIV-2), spanning ~+-0.4 log units -> strong enough to inflate a naive scan as n grows
+    offsets = [(-0.4 + 0.8 * k / max(1, K - 1)) for k in range(K)] if K > 1 else [0.0]
+    subpop_frac = [0.45, 0.35, 0.20] if K == 3 else [1.0 / K] * K
+
+    def hap_weights(tilt):
+        # exponential tilt over the CN range; tilt>0 favors high CN, tilt<0 favors low CN
+        return [math.exp(tilt * (cn[h] - cn_mid) / max(1.0, cn_hi - cn_mid)) for h in haps]
+
+    pop_weights = [hap_weights(t) for t in tilts]
+
+    # pass 1: draw subpop, haplotypes, covariates (so we can center the KIV-2 effect on the cohort mean)
+    samples, draws = [], []
+    for i in range(a.n):
+        sp = random.choices(range(K), weights=subpop_frac, k=1)[0]
+        w = pop_weights[sp]
+        h1 = random.choices(haps, weights=w, k=1)[0]
+        h2 = random.choices(haps, weights=w, k=1)[0]
+        age = max(35, min(85, int(round(random.gauss(55, 12)))))   # Moli-sani-like adult range
+        sex = random.randint(0, 1)
+        # PCs capture subpop ancestry: a subpop centroid on a circle + individual noise
+        ang = 2.0 * math.pi * sp / K
+        pc = (round(2.0 * math.cos(ang) + random.gauss(0, 0.5), 4),
+              round(2.0 * math.sin(ang) + random.gauss(0, 0.5), 4),
+              round(random.gauss(0, 1), 4))
+        sid = f"ind{i:05d}"
+        samples.append((sid, h1, h2))
+        draws.append(dict(sid=sid, sp=sp, dosage=cn[h1] + cn[h2], age=age, sex=sex, pc=pc))
+    mean_dosage = statistics.mean(d["dosage"] for d in draws)  # center so median Lp(a) ~ 10**BASE
+
+    # pass 2: phenotype = log-normal Lp(a), inverse KIV-2 effect (centered) + subpop confounder + noise
+    prows = []
+    for d in draws:
+        log10lpa = (BASE_LOG10 - SLOPE_LOG10 * (d["dosage"] - mean_dosage) + offsets[d["sp"]]
+                    + AGE_SLOPE_LOG10 * (d["age"] - 55) + SEX_EFFECT_LOG10 * d["sex"]
+                    + random.gauss(0, SIGMA_LOG10))
+        lpa = min(400.0, max(0.1, 10.0 ** log10lpa))            # mg/dL, log-normal, clipped
+        prows.append(dict(sid=d["sid"], sp=d["sp"], dosage=d["dosage"], age=d["age"], sex=d["sex"],
+                          pc=d["pc"], log10lpa=round(math.log10(lpa), 4),
+                          lpa=round(lpa, 3), case=1 if lpa > HIGH_RISK_MGDL else 0))
+
+    na = {i for i in range(a.n) if random.random() < NA_FRAC}
+    ncase = sum(r["case"] for r in prows)
+    print(f"{a.n} individuals across {K} subpops; KIV-2 dosage "
+          f"{min(r['dosage'] for r in prows)}..{max(r['dosage'] for r in prows)}; "
+          f"Lp(a) median {statistics.median(r['lpa'] for r in prows):.1f} mg/dL; "
+          f"high-risk cases {ncase}/{a.n}; {len(na)} NA phenotypes")
+
+    # ---- write tables ----
+    with open(os.path.join(a.out_dir, "samples.tsv"), "w") as f:
+        f.write("sample\thaplotype_1\thaplotype_2\n")
+        for sid, h1, h2 in samples:
+            f.write(f"{sid}\t{h1}\t{h2}\n")
+
+    with open(os.path.join(a.out_dir, "phenotypes.tsv"), "w") as f:
+        f.write("sample\tsubpop\tkiv2_dosage\tlpa_mgdl\tlog10_lpa\tcase_highrisk\n")
+        for r in prows:
+            f.write(f"{r['sid']}\t{r['sp']}\t{r['dosage']}\t{r['lpa']}\t{r['log10lpa']}\t{r['case']}\n")
+
+    def write_pheno(path, key, fmt, with_pc):
+        cols = ["sample", "phenotype", "Age", "Sex"] + (["PC1", "PC2", "PC3"] if with_pc else [])
+        with open(path, "w") as f:
+            f.write("\t".join(cols) + "\n")
+            for i, r in enumerate(prows):
+                val = "NA" if i in na else fmt(r[key])
+                base = [r["sid"], val, str(r["age"]), str(r["sex"])]
+                if with_pc:
+                    base += [str(r["pc"][0]), str(r["pc"][1]), str(r["pc"][2])]
+                f.write("\t".join(base) + "\n")
+
+    qfmt = lambda v: f"{v:.4f}"
+    bfmt = lambda v: str(v)
+    write_pheno(os.path.join(a.out_dir, "pheno.quant.tsv"), "log10lpa", qfmt, True)
+    write_pheno(os.path.join(a.out_dir, "pheno.binary.tsv"), "case", bfmt, True)
+    write_pheno(os.path.join(a.out_dir, "pheno.quant.nopc.tsv"), "log10lpa", qfmt, False)
+    write_pheno(os.path.join(a.out_dir, "pheno.binary.nopc.tsv"), "case", bfmt, False)
+
+    # ---- optional kinship: GRM from haplotype sharing (structure-bearing, NOT region-restricted to the
+    # causal node). Skipped for large n (dense text GRM is impractical) and if numpy is unavailable. ----
+    if a.kinship_out:
+        if a.n > a.kinship_max_n:
+            print(f"  (skipping kinship: n={a.n} > --kinship-max-n={a.kinship_max_n}; "
+                  f"use PC covariates or --make-kinship at this scale)")
+        else:
+            try:
+                import numpy as np
+            except ImportError:
+                print("  (skipping kinship: numpy not available)")
+            else:
+                hidx = {h: j for j, h in enumerate(haps)}
+                Zc = np.zeros((a.n, len(haps)))            # per-sample haplotype dosage (0/1/2)
+                for i, (_, h1, h2) in enumerate(samples):
+                    Zc[i, hidx[h1]] += 1.0
+                    Zc[i, hidx[h2]] += 1.0
+                mean = Zc.mean(axis=0)
+                sd = Zc.std(axis=0)
+                keep = sd > 0
+                Zs = (Zc[:, keep] - mean[keep]) / sd[keep]
+                Kmat = Zs @ Zs.T / Zs.shape[1]
+                with open(a.kinship_out, "w") as f:
+                    for i in range(a.n):
+                        f.write("\t".join(f"{x:.6g}" for x in Kmat[i]) + "\n")
+                print(f"  wrote kinship GRM {a.kinship_out} ({a.n}x{a.n})")
+
+    # ---- optional synthetic genome-wide-like panel for the STRUCTURE-CORRECTION demo ----
+    # A single-region scan has essentially no null markers, so genomic inflation lambda is not
+    # interpretable there. To teach how PCs / LMM control population structure we emit a synthetic
+    # panel: the real causal KIV-2 dosage (so it tops the scan) PLUS many SUBPOP-STRATIFIED null SNPs
+    # whose allele frequency differs by subpopulation. Combined with the subpop Lp(a) offset, the nulls
+    # are spuriously associated under a naive scan (inflated lambda); adding the ancestry PCs or running
+    # the LMM with a panel-derived GRM removes that inflation while KIV-2 survives. (Files: BIMBAM
+    # dosage + sample order + feature_annot; the causal feature uses the real node id 4789.)
+    if a.sim_markers > 0:
+        try:
+            import gzip
+            import numpy as np
+        except ImportError:
+            print("  (skipping --sim-markers: numpy not available)")
+        else:
+            rng = np.random.default_rng(a.seed + 1)
+            sp = np.array([r["sp"] for r in prows])
+            M = a.sim_markers
+            base = rng.uniform(0.1, 0.5, M)                       # baseline allele freq per marker
+            dev = rng.normal(0.0, a.strat_sd, (M, K))             # per-subpop deviation (stratification)
+            half = M // 2
+            dev[:half] = 0.0                                      # half are unstratified (true nulls)
+            freq = np.clip(base[:, None] + dev, 0.02, 0.98)       # M x K allele frequency
+            geno = rng.binomial(2, freq[np.arange(M)[:, None], sp[None, :]])  # M x n null dosages (0/1/2)
+            causal = np.array([r["dosage"] for r in prows], dtype=float)      # real KIV-2 summed CN
+
+            gpath = os.path.join(a.out_dir, "geno.sim.bimbam.gz")
+            apath = os.path.join(a.out_dir, "feature_annot.sim.tsv.gz")
+            spath = os.path.join(a.out_dir, "sim.samples.txt")
+            with open(spath, "w") as f:
+                for r in prows:
+                    f.write(r["sid"] + "\n")
+            with gzip.open(gpath, "wt") as gf, gzip.open(apath, "wt") as af:
+                af.write("feature_id\tlayer\tencoding\tbubbles\tnodes\n")
+                # causal KIV-2 marker first (real node 4789, bubble 7)
+                gf.write("KIV2, A, B, " + ", ".join(f"{x:g}" for x in causal) + "\n")
+                af.write("KIV2\tsim\tcount\t7\t4789\n")
+                for m in range(M):
+                    fid = f"sim{m:05d}"
+                    gf.write(fid + ", A, B, " + ", ".join(str(int(x)) for x in geno[m]) + "\n")
+                    # fake node id = m+1 so the Manhattan spreads the nulls along x
+                    af.write(f"{fid}\tsim\tpa\t.\t{m + 1}\n")
+            print(f"  wrote synthetic structure-demo panel {gpath} ({M} null markers + 1 causal; "
+                  f"{half} unstratified) + {os.path.basename(apath)} + {os.path.basename(spath)}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

@@ -531,7 +531,7 @@ contrast. `--min-paths 0` disables rule 2 (keeps every feature that is non-const
 Because k-mers are spelled from the bubble's node sequences, each kept k-mer records the set of
 **graph nodes** its occurrences touch (written in the feature map). So a significant marker downstream
 maps straight back to a node/edge in the bubble — and to the variant `call` makes there. The pooled
-survivors across bubbles are written to the fsm-lite `fsm_kmers.txt.gz`.
+survivors across bubbles are written as BIMBAM mean-genotype dosage (`bimbam_kmers.bimbam.gz`).
 
 ## gene annotation (`--gtf`) — projection, per-gene realignment, reliability
 

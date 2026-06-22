@@ -58,9 +58,11 @@ before testing. The information is entirely in the **count**. panvar carries the
 through to the genotype, so a **dosage** test recovers KIV-2 that a presence/absence test cannot.
 
 > **Engine.** `panvar associate` ([associate](modules/associate.md)) tests the **dosage** directly
-> (`phenotype ~ genotype + covariates`), so copy-number loci are first-class. The same genotypes are also
-> exported as **BIMBAM** (GEMMA-ready) and **fsm-lite** (pyseer) by `describe`, so an external count- or
-> presence/absence-based tool can be used instead if desired.
+> (`phenotype ~ genotype + covariates`), so copy-number loci are first-class. It can also adjust for
+> population structure with ancestry **PCs** (`--pca`) or a **linear mixed model** (`--model lmm` + a
+> kinship matrix). The same genotypes are exported by `describe` as **BIMBAM** mean-genotype dosage, which
+> is also **GEMMA-ready**, so an external dosage-based tool can be used instead if desired. New to any of
+> these terms? The [GWAS primer](gwas_primer.md) explains them from scratch on this example.
 
 ## 4. The pipeline
 
@@ -80,70 +82,111 @@ The post-`panphorte` modules consume the **panphorte-normalized/sorted graph** a
   Bonferroni threshold lines, FDR points highlighted — i.e. before/after correction in one figure) and the
   QQ with the genomic-inflation λ.
 
-## 5. Example — real LPA graph, literature-based phenotype + covariates
+## 5. Data & literature resources (how the synthetic cohort is grounded)
 
-`tests/gwas/make_lpa_phenotype.py` reads each **real** LPA haplotype's KIV-2 copy number from `panphorte`
-(`copies.tsv`; KIV-2 unit ≈ 5.5 kb, copies **1–32** across 466 haplotypes), pairs real haplotypes into 200
-synthetic diploid individuals, and assigns `Lp(a) = base − slope·(CN_A+CN_B) + age/sex effects + noise`
-(synthetic values, literature-plausible **inverse** KIV-2 effect; case/control by median split). It also
-emits **covariates** (`Age, Sex, PC1–PC3`) and sets ~5% of phenotypes to `NA` to exercise the filters. One
-driver runs the whole thing across **both substrates** and **both trait codings**:
+The phenotypes are **simulated**, but their shape and effect sizes follow the Lp(a)/KIV-2 literature so the
+example behaves like a real Southern-European study (we have no consented individual-level cohort to ship):
+
+- **KIV-2 copy number** ranges ~**1 to >40** per allele, >95% heterozygous, and explains **40–70%** of Lp(a)
+  variance; carriers of *small* isoforms (≤22 KIV repeats) have up to **~5×** higher Lp(a) than large-isoform
+  carriers — the **inverse** dose effect. (Schmidt et al. 2016; Coassin & Kronenberg 2022.) Our real LPA
+  graph carries copies **1–32** across 466 haplotypes.
+- **Plasma Lp(a)** is strongly **right-skewed (log-normal)**, spanning ~**0.3–300 mg/dL** with a population
+  **median ~10–12 mg/dL**, and is somewhat higher in Southern than Northern Europe; **>50 mg/dL** is the
+  common clinical high-risk cut. (Coassin & Kronenberg 2022; the Italian **Moli-sani** cohort, Frontiers
+  Cardiovasc Med 2025.) We use these as the simulation's `BASE`/spread and the binary case threshold.
+- **Covariates** (`Age` ~ adult 35–85, `Sex`, ancestry `PC1–PC3`) mirror an adult cohort design.
+
+Full citations are in [references.md](references.md). `tests/gwas/make_lpa_phenotype.py` encodes these as
+explicit constants (`BASE_LOG10`, `SLOPE_LOG10`, `SIGMA_LOG10`, `HIGH_RISK_MGDL`).
+
+## 6. Example — real LPA graph, structured cohort, two results
+
+`tests/gwas/make_lpa_phenotype.py` reads each real haplotype's KIV-2 copy number, partitions the haplotypes
+into **3 Southern-European-like subpopulations** (differing KIV-2 frequencies **and** a baseline Lp(a)
+offset = an ancestry confounder), and samples diploid individuals. Each gets a **log-normal Lp(a)** with the
+inverse KIV-2 effect plus covariates (`Age, Sex, PC1–3`) and ~5% `NA` phenotypes. It also emits a
+**synthetic genome-wide-like panel** (the real KIV-2 dosage + many subpop-stratified null SNPs) for the
+structure-correction demo. One driver runs everything:
 
 ```bash
-# Rscript needs ggplot2 (conda activate base). Also run by scripts/regen_results.sh.
-bash tests/gwas/run_lpa_real.sh build/panvar results/real_data/lpa/gwas python3 Rscript
+# numpy-capable python for the cohort sim; Rscript needs ggplot2 (conda activate base).
+bash tests/gwas/run_lpa_real.sh build/panvar results/real_data/lpa/gwas python3 Rscript        # small/fast
+bash tests/gwas/run_lpa_real.sh build/panvar results/real_data/lpa/gwas python3 Rscript --big   # ~10k cohort
 ```
 
-It runs `bubble → panphorte → call → describe --samples → panvar associate → plot_associate.R` and a
-self-check. Observed top hits (193 of 200 samples used; 7 NA phenotypes dropped; 5 covariates):
+It runs `bubble → panphorte → call → describe --samples → associate → plot_associate.R` and a self-check,
+producing **two** results:
 
-| run | top feature | bubble | effect | p | p_bonf |
-|-----|-------------|--------|--------|---|--------|
-| graph / quant   | `4789+>4789+` (KIV-2 self-loop) | 7 | β = **−2.18** | 1.5e-52 | 2.6e-49 |
-| kmers / quant   | a KIV-2 k-mer | 7 | β = **−2.18** | 5.4e-53 | 1.1e-49 |
-| graph / binary  | node `4789` | 7 | log OR = **−0.27** | 1.9e-11 | 3.3e-08 |
-| kmers / binary  | a KIV-2 k-mer | 7 | log OR = **−0.26** | 1.7e-11 | 3.3e-08 |
+### 6a. Region scan — recover KIV-2 on the real pangenome
 
-Every run lands on the called KIV-2 locus (**bubble 7**) with the correct **negative** effect (more KIV-2
-→ lower Lp(a)), far past the region-wide Bonferroni line:
+`associate` on the real KIV-2 features (graph & k-mer substrates, quantitative & binary), PC-adjusted, MAF
+`0.02`. Every run lands on the called KIV-2 locus (**bubble 7**) with the correct **negative** effect (more
+KIV-2 → lower Lp(a)), far past the region-wide Bonferroni line:
 
 - **node/edge dosage** localizes the signal to the repeat node `4789` and its **self-loop edge**
   `4789+>4789+` — the most direct graph read of copy number;
-- **k-mers** carry the same signal across the repeat-unit markers.
+- **k-mers** carry the same signal across the repeat-unit markers;
+- with `--node-genes`, the hit is named **`LPA`** in the `gene` column.
 
-The MAF filter (`--min-maf 0.02`) drops the cohort-invariant features (e.g. 1413 of 3180 graph features),
-and the Manhattan/QQ show a clean peak with λ near 1.
+The MAF filter drops the cohort-invariant features. Note that a *single region* is one correlated signal
+block with no null markers, so its λ is **not** interpretable (see the primer) — the operative controls here
+are the MAF filter and region-wide multiple testing, and the job is recovering KIV-2, which it does.
 
-![LPA Lp(a) ~ graph dosage Manhattan](../results/real_data/lpa/gwas/assoc_graph_quant.manhattan.png)
+### 6b. Structure-correction demo — what PCs and the LMM buy you
 
-## 6. Reading the outputs
+On the synthetic genome-wide-like panel (causal KIV-2 + subpop-stratified nulls), the subpopulation
+confounder inflates a naive scan and **buries** the causal signal; adding ancestry PCs, or running the LMM
+with a panel-derived GRM, restores calibration and surfaces KIV-2 (representative run, n≈2 000):
+
+| analysis | covariates | genomic inflation λ | KIV-2 rank | KIV-2 p |
+|----------|-----------|---------------------|-----------|---------|
+| naive            | Age, Sex            | **≈ 4** (inflated) | buried (~450) | recoverable but lost in nulls |
+| + ancestry PCs   | Age, Sex, PC1–3     | **≈ 1.0–1.2**      | **1**         | ~1e-47 |
+| LMM (`--make-kinship`) | Age, Sex (+ random effect) | **≈ 1.0** | **1**  | ~1e-49 |
+
+This is the textbook before/after: a naive λ≫1 collapses to ≈1 once structure is modeled, while the true
+KIV-2 signal rises to the top. (Exact numbers depend on `N`/seed; the driver asserts λ drops after
+correction.)
+
+![LPA structure demo — naive (inflated) vs PC-adjusted Manhattan](../results/real_data/lpa/gwas/sim_naive.manhattan.png)
+
+## 7. Reading the outputs
 
 - **`assoc_<sub>_<mode>.assoc.tsv`** — one row per tested feature, sorted by `p`:
-  `feature_id, layer, bubbles, nodes, n, minor_freq, beta|log_or, se, z, p, p_bonf, q_bh`. `feature_id` is
-  the k-mer sequence (k-mer substrate) or the node id / edge key (graph substrate); `bubbles`/`nodes` give
+  `feature_id, layer, bubbles, nodes, n, minor_freq, beta|log_or, se, z, p, p_bonf, q_bh, gene`. `feature_id`
+  is the k-mer sequence (k-mer substrate) or the node id / edge key (graph substrate); `bubbles`/`nodes` give
   the graph provenance (from `feature_annot`), so a hit traces back through `call`'s `variant_nodes.tsv` to
-  the KIV-2 `DUP` and, with `call --gtf`, to the `LPA` gene.
+  the KIV-2 `DUP`; `gene` names it (`LPA`) when `--node-genes` is supplied.
 - **`assoc_<sub>_<mode>.summary.tsv`** — model, samples used, `features_tested`, `dropped_min_maf`, the
-  `bonferroni_threshold` (`0.05/n_tests`), and significant counts (Bonferroni and FDR<0.05).
+  `bonferroni_threshold` (`0.05/n_tests`), significant counts (Bonferroni and FDR<0.05), the
+  genomic-inflation **`lambda_gc`**, and (LMM) `lmm_delta`.
 - **Manhattan / QQ** — `*.manhattan.{png,pdf}` (raw −log10 p with the nominal `0.05` and Bonferroni lines;
   FDR<0.05 / Bonferroni points highlighted) and `*.qq.{png,pdf}` (genomic-inflation λ).
+- **Structure demo** — `sim_{naive,pc,lmm}.{assoc.tsv,summary.tsv,manhattan.png,qq.png}`: compare the
+  `lambda_gc` across the three.
 
-## 7. Caveats (honest limits)
+## 8. Caveats (honest limits)
 
-- The phenotypes here are **simulated** from the genotype (inverse KIV-2→Lp(a) effect + small age/sex
-  effects + Gaussian noise; binary trait by median split). This demonstrates *recovery of a planted
-  signal*, **not** a real Lp(a) study; the PCs are random, not real ancestry components.
-- `associate` uses a **fixed-effect GLM with covariates**. It does **not** yet model relatedness /
-  population structure with a kinship matrix or mixed model (watch the QQ λ); an **LMM backend** is the
-  planned next step. Multiple-testing is **region-wide** (Bonferroni over the tested features + BH FDR),
-  which is the right scale here — and conservative, since correlated k-mers over-count the independent tests.
-- Markers are **bubble-local**, and that is all the association needs: the per-sample dosage is read from
-  the known graph traversal (`cosigt` assigns the haplotypes; provenance is recorded), so genome-wide
-  uniqueness is irrelevant here — it would only matter if you screened raw reads with these features.
+- The phenotypes are **simulated** (log-normal Lp(a) with the literature-grounded inverse KIV-2 effect +
+  age/sex + a subpopulation offset + noise; high-risk binary at 50 mg/dL). This demonstrates *recovery of a
+  planted signal under realistic structure*, **not** a real Lp(a) study; the subpopulations/PCs are
+  synthetic ancestry, not real components.
+- The **structure-correction panel is synthetic** (a genome-wide-like set of stratified null SNPs alongside
+  the real KIV-2 dosage). It exists *because* a single pangenome region has no null markers — so λ and the
+  PC/LMM correction are only meaningful at genome-wide-like scale. The **region scan** (§6a) is the result on
+  the actual pangenome; its job is KIV-2 recovery via the MAF filter + region-wide multiple testing, not λ.
+- The **LMM** here uses `--make-kinship` on the synthetic panel (a valid genome-wide-like GRM). On a real
+  study, build the kinship from genome-wide markers and pass it via `--kinship`; a region-only `--make-kinship`
+  is proximally contaminated and can over-correct.
+- Markers are **bubble-local**: the per-sample dosage is read from the known graph traversal (`cosigt`
+  assigns the haplotypes; provenance is recorded), so genome-wide uniqueness is irrelevant here — it would
+  only matter if you screened raw reads with these features.
 - Counts are the *graph-derived* per-haplotype multiplicity; with real reads you would carry read-depth
   uncertainty from `cosigt` into the dosage.
 
 ## See also
+- [GWAS primer](gwas_primer.md) — the concepts (dosage, MAF, multiple testing, kinship, λ, LMM vs PCs) from scratch.
 - [associate](modules/associate.md) — the GWAS engine, inputs, multiple-testing, and outputs.
 - [describe](modules/describe.md) — the BIMBAM exports, `--samples` / `--variant-nodes` / `--variant-flank-bp`.
 - [call](modules/call.md) — `node_track.tsv` / `variant_nodes.tsv` used for provenance/traceback.

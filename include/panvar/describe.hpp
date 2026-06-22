@@ -31,11 +31,8 @@ struct DescribeOptions {
     std::size_t max_wide_features = 250000;
     bool force_wide_matrix = false;
     bool write_wide_matrix = true;
-    // Pooled fsm-lite k-mer file (pyseer --kmers) at <out_dir>/fsm_kmers.txt.gz. On by default.
-    // With pyseer on, a mirrored haplotype-level <out_dir>/fsm_graph.txt.gz is also written.
-    bool pyseer = true;
     // Pooled BIMBAM mean-genotype dosage (GEMMA / panvar associate) at <out_dir>/bimbam_{kmers,graph}.bimbam.gz
-    // plus <out_dir>/feature_annot.tsv.gz. The canonical genotype export. On by default.
+    // plus <out_dir>/feature_annot.tsv.gz. The canonical (and only) genotype export. On by default.
     bool bimbam = true;
     // Layer selection. Both on by default; --only-kmers / --only-graph restrict to one substrate.
     bool emit_kmers = true;
@@ -48,13 +45,12 @@ struct DescribeOptions {
     // to the nearest variant node is <= variant_flank_bp on either side, so k-mers spanning the
     // variant's flanking sequence (e.g. nearby SNPs) are retained. 0 = strict variant-node-only.
     std::size_t variant_flank_bp = 0;
-    // cosigt-style sample -> haplotype-path table. When set, describe additionally writes a
-    // SAMPLE-level fsm file (<out_dir>/fsm_kmers.samples.txt.gz) whose per-sample value is the
-    // summed dosage over that sample's assigned haplotype paths (diploid CN = CN_A + CN_B).
-    // The per-haplotype fsm_kmers.txt.gz is still written. Requires pyseer output enabled.
+    // cosigt-style sample -> haplotype-path table. When set, describe additionally writes the
+    // SAMPLE-level BIMBAM (<out_dir>/bimbam_{kmers,graph}.samples.bimbam.gz) whose per-sample value
+    // is the summed dosage over that sample's assigned haplotype paths (diploid CN = CN_A + CN_B).
     std::string samples_path;
     // Worker threads for the per-bubble loop (0 = hardware concurrency). Output is identical
-    // regardless of thread count: per-bubble files are independent and the pooled fsm tables are
+    // regardless of thread count: per-bubble files are independent and the pooled tables are
     // merged in bubble order on the main thread.
     std::size_t threads = 0;
     bool quiet = false;
