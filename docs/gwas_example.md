@@ -189,4 +189,4 @@ correction.)
 - [GWAS primer](gwas_primer.md) — the concepts (dosage, MAF, multiple testing, kinship, λ, LMM vs PCs) from scratch.
 - [associate](modules/associate.md) — the GWAS engine, inputs, multiple-testing, and outputs.
 - [describe](modules/describe.md) — the BIMBAM exports, `--samples` / `--variant-nodes` / `--variant-flank-bp`.
-- [call](modules/call.md) — `node_track.tsv` / `variant_nodes.tsv` used for provenance/traceback.
+- [call](modules/call.md) — `variant_nodes.tsv` / `variant_paths.tsv` used for provenance/traceback.

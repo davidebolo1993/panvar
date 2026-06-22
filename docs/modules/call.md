@@ -123,9 +123,6 @@ So lower `--merge-jaccard` to merge events sharing a graph backbone, and lower `
 - `<prefix>.region.vcf` — all bubble records, coordinate-sorted (POS, then END, then ID) with unique IDs, so it is directly `bgzip` + `tabix -p vcf` / `bcftools index`-able.
 - `<prefix>.bubble_<id>.vcf` — one multi-sample VCF per bubble, also sorted (unless `--no-per-bubble-vcf`)
 - `<prefix>.variant_paths.tsv` — per-variant path provenance (unless `--no-variant-paths`): one row per (variant, carrier haplotype) — `variant_id, bubble_id, svtype, sample, gt, sub_walk` — where `sub_walk` is that carrier's realized walk through the event (between the flanking reference nodes) as a GFA-style `>node`/`<node` string. Joins 1:1 to the VCF `ID`; carrier rows reconcile with `NMERGED`. This is the interpretable bridge for the `describe` module and manual inspection.
-XXX
-- `<prefix>.node_track.tsv` — per-bubble x-axis for plotting (unless `--no-variant-paths`): one row per inside node — `bubble_id, order, node_id, length_bp, genomic_pos, in_reference, is_cn` — giving **every** inside node of the bubble (the same set and order as the `inspect` `node_counts.tsv` columns), ordered by **numeric node id**, which is the reference order because the graph is sorted along the reference. Carries each node's bp length plus reference/CN flags.
-XXX
 - `<prefix>.variant_nodes.tsv` — per-variant node set (unless `--no-variant-paths`): one row per variant — `variant_id, bubble_id, svtype, node_ids` (the deduplicated `EVENT_NODES`). The handoff for the `describe` module: restrict k-mer markers to the nodes that participate in called variation.
 
 The VCFs are VCF 4.2. Samples are the haplotypes (every P/W path haploid). `CHROM`/`POS` come from the reference path's genomic label.
@@ -206,7 +203,6 @@ Each step below is traced on a tiny worked dataset in
   --bubble-prefix-in results/real_data/lpa/panphorte/panphorte \
   --reference-path grch38#1 \
   -o results/real_data/lpa/call/call \
-  --merge-distance-bp 100 \
   --classify-ins \
   --min-maf 0.05 \
   --cn-from-multiplicity \

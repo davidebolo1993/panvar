@@ -663,7 +663,6 @@ void call_variants(
         std::vector<std::string> prov_lines;    // variant_paths.tsv rows for this record
     };
     std::vector<OutRecord> out_records;
-    std::vector<std::string> node_track_rows;        // <prefix>.node_track.tsv body (plotting x-axis)
     std::vector<std::string> variant_nodes_rows;     // <prefix>.variant_nodes.tsv (describe handoff)
     std::vector<std::string> dup_gene_cn_rows;       // <prefix>.dup_gene_cn.tsv body (per-gene DUP CN)
 
@@ -671,7 +670,7 @@ void call_variants(
 
     // Per-bubble outputs, computed in parallel and merged in bubble order so the result is identical
     // regardless of thread count: the region VCF is coordinate-sorted afterwards (total order on
-    // unique ids), and node_track / variant_nodes inherit deterministic bubble order from the merge.
+    // unique ids), and variant_nodes inherits deterministic bubble order from the merge.
     // A DUP whose per-gene copy number will be resolved by realignment (post-pass).
     struct DupGeneTarget {
         std::size_t bubble_id = 0;
@@ -684,7 +683,6 @@ void call_variants(
     struct BubbleOut {
         VariantCallSummary sum;
         std::vector<OutRecord> records;
-        std::vector<std::string> node_track;
         std::vector<std::string> variant_nodes;
         std::vector<DupGeneTarget> dup_targets;   // DUPs needing per-gene CN (when --gtf is active)
     };
@@ -715,7 +713,6 @@ void call_variants(
         BubbleOut& bout = bouts[bubble_idx];
         VariantCallSummary& summary = bout.sum;
         std::vector<OutRecord>& out_records = bout.records;
-        std::vector<std::string>& node_track_rows = bout.node_track;
         std::vector<std::string>& variant_nodes_rows = bout.variant_nodes;
         std::vector<DupGeneTarget>& dup_targets = bout.dup_targets;
         std::unordered_map<std::string, int> id_counts;
@@ -776,34 +773,6 @@ void call_variants(
 
         std::vector<MergedRecord> merged;
         const std::unordered_map<std::string, std::size_t> ref_node_pos = build_ref_node_pos(bubble);
-
-        // ---- node_track.tsv: the per-bubble x-axis for plot_sv_map.R. Every inside node of
-        // the bubble (same set + order as the inspect node_counts columns), ordered by
-        // **numeric node id** — which is the reference order, since the graph was odgi-sorted
-        // along the reference path. Carries each node's bp length + reference/CN flags.
-        {
-            std::vector<std::string> ids(bubble.inside.begin(), bubble.inside.end());
-            auto numeric_less = [](const std::string& a, const std::string& b) {
-                const bool an = !a.empty() && std::all_of(a.begin(), a.end(), [](unsigned char c){ return std::isdigit(c); });
-                const bool bn = !b.empty() && std::all_of(b.begin(), b.end(), [](unsigned char c){ return std::isdigit(c); });
-                if (an && bn) { if (a.size() != b.size()) return a.size() < b.size(); return a < b; }
-                return a < b;
-            };
-            std::sort(ids.begin(), ids.end(), numeric_less);
-            for (std::size_t ord = 0; ord < ids.size(); ++ord) {
-                const std::string& id = ids[ord];
-                const bool in_ref = ref_count.count(id) != 0;
-                std::string gpos;
-                if (in_ref) {
-                    const auto pit = ref_node_pos.find(id);
-                    if (pit != ref_node_pos.end()) gpos = std::to_string(pit->second);
-                }
-                node_track_rows.push_back(
-                    std::to_string(bubble.id) + '\t' + std::to_string(ord) + '\t' + id + '\t' +
-                    std::to_string(node_len(graph, id)) + '\t' + gpos + '\t' +
-                    (in_ref ? "1" : "0") + '\t' + (cn_nodes.count(id) ? "1" : "0"));
-            }
-        }
 
         const std::size_t rescue_floor =
             options.rescue_min_bp != 0 ? options.rescue_min_bp : std::max<std::size_t>(1, options.min_sv_bp / 2);
@@ -1610,7 +1579,6 @@ void call_variants(
         summary.dup += bo.sum.dup;
         summary.multi += bo.sum.multi;
         for (OutRecord& r : bo.records) out_records.push_back(std::move(r));
-        for (std::string& s : bo.node_track) node_track_rows.push_back(std::move(s));
         for (std::string& s : bo.variant_nodes) variant_nodes_rows.push_back(std::move(s));
         for (DupGeneTarget& t : bo.dup_targets) dup_targets.push_back(std::move(t));
     }
@@ -1653,13 +1621,6 @@ void call_variants(
         for (const OutRecord& rec : out_records) {
             for (const std::string& pl : rec.prov_lines) prov_out << pl << '\n';
         }
-
-        std::ofstream nt_out(options.out_prefix + ".node_track.tsv");
-        if (!nt_out) {
-            throw std::runtime_error("Failed to write node track TSV: " + options.out_prefix + ".node_track.tsv");
-        }
-        nt_out << "bubble_id\torder\tnode_id\tlength_bp\tgenomic_pos\tin_reference\tis_cn\n";
-        for (const std::string& r : node_track_rows) nt_out << r << '\n';
 
         // variant_nodes.tsv: per-variant node set, the bridge for `describe --variant-nodes`
         // (restrict k-mer features to nodes participating in called variation).

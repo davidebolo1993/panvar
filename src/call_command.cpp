@@ -53,7 +53,7 @@ void print_call_help() {
         << "                                   per-gene DUP copy-number table; needs a PanSN reference path\n"
         << "      --bubble-id <N>              Restrict to one bubble ID (repeatable)\n"
         << "      --no-per-bubble-vcf          Only write the concatenated region VCF\n"
-        << "      --no-variant-paths           Skip the variant_paths.tsv + node_track.tsv sidecars\n"
+        << "      --no-variant-paths           Skip the variant_paths.tsv sidecar\n"
         << "      --threads <N>                Worker threads for the per-bubble loop (0 = auto)\n"
         << "  -q, --quiet                      Disable progress logs\n"
         << "  -h, --help                       Show this help\n";

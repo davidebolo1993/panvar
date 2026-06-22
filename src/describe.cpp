@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -1251,7 +1252,7 @@ void accumulate_kmer_counts(
 
 // Per-feature, per-haplotype node/edge dosage pool: the graph-substrate analogue of KmerPool,
 // keyed by the real graph coordinate (a node id, or a "from>to" edge key) so it stays traceable
-// (node features join to call's node_track.tsv by node id). Only discriminative features are pooled.
+// (node features join to call's variant_nodes.tsv by node id). Only discriminative features are pooled.
 using GraphPool = std::map<std::string, std::map<std::string, std::uint32_t>>;
 
 void accumulate_graph_counts(
@@ -1769,7 +1770,7 @@ void describe_kmers_from_graph(
         }
 
         // Node/edge substrate (complementary graph-local layer): diploid summation, keyed by node id /
-        // edge so it joins to call's node_track.tsv. Built once here, reused for the sample-level BIMBAM.
+        // edge so it joins to call's variant_nodes.tsv. Built once here, reused for the sample-level BIMBAM.
         GraphPool graph_sample_pool;
         if (want_bimbam && options.emit_graph) {
             for (const auto& [feature, carriers] : graph_pool) {
