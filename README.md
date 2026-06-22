@@ -57,15 +57,11 @@ bash tests/real_smoke.sh ./build/panvar tests/real_data/c4.gfa.gz /tmp/smoke_c4
 
 ## Documentation
 
-- [docs/README.md](docs/README.md) — documentation index
-- [docs/modules/bubble.md](docs/modules/bubble.md)
-- [docs/modules/inspect.md](docs/modules/inspect.md)
-- [docs/modules/panphorte.md](docs/modules/panphorte.md)
-- [docs/modules/call.md](docs/modules/call.md)
-- [docs/modules/describe.md](docs/modules/describe.md)
-- [docs/modules/example.md](docs/modules/example.md)
-- [docs/gwas_example.md](docs/gwas_example.md)
-- [docs/presentation.md](docs/presentation.md)
+- [docs/README.md](docs/README.md) — documentation index (and the copy-number topology table)
+- **Modules (usage):** [bubble](docs/modules/bubble.md) · [panphorte](docs/modules/panphorte.md) · [call](docs/modules/call.md) · [describe](docs/modules/describe.md) · [associate](docs/modules/associate.md) · [inspect](docs/modules/inspect.md)
+- **Algorithms (mechanism + worked traces):** [docs/algorithms/](docs/algorithms/)
+- **GWAS:** [primer](docs/gwas/primer.md) (concepts) · [example](docs/gwas/example.md) (runnable LPA walk-through + GEMMA validation)
+- [docs/references.md](docs/references.md) — tools (GitHub) and papers per module
 
 ## Docker
 

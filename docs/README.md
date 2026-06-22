@@ -1,98 +1,62 @@
 # panvar Documentation
 
-This directory contains module-focused documentation for the `panvar` CLI.
+Documentation for the `panvar` CLI, organized into three subfolders plus a shared bibliography.
 
-## Modules
+| folder / file | what's in it |
+|---------------|--------------|
+| **[modules/](modules/)** | one short **usage** page per module: what it does, inputs, key options, outputs, a runnable example. Start here to *run* a module. |
+| **[algorithms/](algorithms/)** | the matching **mechanism + worked traces** (and deep option semantics) for each module. Read these to understand *how* a result is computed, or when a usage page links a term here. |
+| **[gwas/](gwas/)** | the association workflow: [gwas/primer.md](gwas/primer.md) (GWAS concepts from scratch) and [gwas/example.md](gwas/example.md) (a runnable LPA walk-through + GEMMA validation). |
+| **[references.md](references.md)** | tools (GitHub) and papers behind each module. |
 
-1. `docs/modules/bubble.md`
-   Module 1 (`panvar bubble`): bubble-site extraction/refinement from any GFA via internal sort + cactus snarl finding
-2. `docs/modules/panphorte.md`
-   Module 2 (`panvar panphorte`): normalize tandem-repeat bubbles into a compact, copy-number-explicit GFA, internally re-sorted + re-snarled for `call`
-3. `docs/modules/call.md`
-   Module 3 (`panvar call`): graph-native structural variant calling (DEL/INS/INV/DUP) into a multi-sample VCF
-4. `docs/modules/describe.md`
-   Module 4 (`panvar describe`): per-bubble k-mer / node-edge feature tables + BIMBAM dosage genotype exports
-5. `docs/modules/associate.md`
-   Module 5 (`panvar associate`): GWAS on the describe genotypes vs a phenotype/covariate table — GLM or linear mixed model (`--model lmm`), ancestry-PC covariates (`--pca`), MAF filter, region-wide multiple-testing, genomic-inflation λ, and a `--node-genes` gene column
-6. `docs/modules/inspect.md`
-   Utility (`panvar inspect`): clustering, path FASTA and node/edge traversal matrices for one or all called bubbles
+## Pipeline
 
+`bubble → panphorte → call → describe → associate`, plus the `inspect` utility.
 
-## Guides
-
-- `docs/gwas_primer.md`
-  **GWAS from scratch** for `associate`: genotype/dosage, covariates, MAF, multiple testing (why not 5e-8), population structure, kinship, genomic-inflation λ, and LMM vs PCs — all on the LPA example.
-- `docs/gwas_example.md`
-  Worked **pangenome association** (LPA KIV-2 copy number → Lp(a)): literature-grounded structured cohort, sample-level testing via cosigt aggregation, multiplicity vs presence/absence on both substrates, the region scan (KIV-2 recovery) **and** a structure-correction demo (naive λ≫1 → PC/LMM λ≈1), Manhattan/QQ, and gene traceback.
-- `docs/algorithm_example.md`
-  Tiny hand-traced datasets that walk through the internals end to end: bubble normalization, the panphorte approximate collapse, the `call` event typing / merge / copy-number arithmetic, and the `describe` syncmer sampling and discriminative filter. Read this to see *how* a result is computed, not just *what* the command prints.
-- `docs/references.md`
-  Background literature for the concepts used here (closed syncmers, cactus/ultrabubble snarls, Lp(a)/KIV-2 copy-number biology, copy-number vs presence/absence association).
+1. [modules/bubble.md](modules/bubble.md) — bubble-site extraction from a GFA (internal sort + snarl finder).
+2. [modules/panphorte.md](modules/panphorte.md) — normalize tandem-repeat bubbles into a copy-number-explicit GFA.
+3. [modules/call.md](modules/call.md) — graph-native SV calling (DEL/INS/INV/DUP) into a multi-sample VCF.
+4. [modules/describe.md](modules/describe.md) — per-bubble k-mer / node-edge features + BIMBAM dosage genotypes.
+5. [modules/associate.md](modules/associate.md) — GWAS on the describe genotypes (GLM or LMM, MAF filter, region-wide multiple testing, λ, gene column).
+- [modules/inspect.md](modules/inspect.md) — clustering, path FASTA, and node/edge matrices for a called bubble.
 
 ## Reproducing the results
 
-The example commands write under `results/` (gitignored). Regenerate everything — every gene region
-(`lpa`, `c4`, `gstm1`, `cyp2d6`) plus the synthetic smoke, with plots and copy-number validation — with:
+The per-gene driver scripts regenerate everything under `results/` (gitignored), data only (plotting
+commands are included but commented):
 
 ```bash
-conda activate base            # for Rscript (plots); optional
-bash scripts/regen_results.sh  # or: scripts/regen_results.sh lpa c4 gstm1 cyp2d6 synthetic
+PYTHON=~/miniconda3/bin/python scripts/genes/lpa.sh      # bubble→inspect→panphorte→inspect→call→describe→associate
+scripts/genes/c4.sh ; scripts/genes/gstm1.sh ; scripts/genes/cyp2d6.sh
 ```
 
 Real inputs are the gzipped graphs in `tests/real_data/*.gfa.gz`; copy-number ground truth is in
-`tests/real_data/{c4,cyp2d6,gstm1}.bed` and `lpa.repeats.tsv`.
+`tests/real_data/{c4,cyp2d6,gstm1}.bed` and `lpa.repeats.tsv`. R plots use the `scripts/plot_*.R` helpers
+(need `Rscript` + `ggplot2`).
 
-### Copy number: one method per locus topology
+## Copy number: one method per locus topology
 
-How a locus is represented in the pangenome decides how `call` reads its copy number — and which graph
-it reads. The driver picks the right recipe per gene:
+How a locus is represented in the pangenome decides how `call` reads its copy number — and which graph it
+reads. This table is the canonical reference (the module pages link here):
 
-| Region | Topology | Call substrate | CN method | Concordance vs ground truth |
-|--------|----------|----------------|-----------|------------------------------|
+| Region | Topology | Call substrate | CN method | Concordance vs truth |
+|--------|----------|----------------|-----------|----------------------|
 | **LPA** (KIV-2) | tandem repeat | `panphorte` graph | `--cn-from-multiplicity` (REP self-loop) | **465/465 = 100%** |
 | **C4** (RCCX) | PGGB-collapsed paralog | `bubble` graph | `--cn-from-coverage` (full-walk) | **131/131 = 100%** |
-| **GSTM1** | deletion/CNV (segdup) | `bubble` graph | `--cn-from-multiplicity` (peak) | **159/159 = 100%** (constant paralog baseline) |
+| **GSTM1** | deletion/CNV (segdup) | `bubble` graph | `--cn-from-multiplicity` (peak) | **159/159 = 100%** |
 | **CYP2D6** | PGGB-collapsed paralog | `bubble` graph | `--cn-from-coverage` (full-walk) | concordant vs D6+D7; residual = unannotated CYP2D8P/hybrid |
 
 The principle: PGGB collapses **identical** copies onto shared nodes (copy number = node multiplicity);
-`panphorte` collapses a **variable tandem** into one REP node. So tandem loci are called on the
-`panphorte` graph, while PGGB-collapsed paralog clusters are called on the unfolded `bubble` graph (where
-the multiplicity is intact). The regen driver writes a per-gene concordance dotplot
-(`results/cn_correlation.png`, called CN from the VCF vs the BED, faceted by gene, reference haplotype
-highlighted). See [modules/call.md](modules/call.md) for the full method description.
+`panphorte` collapses a **variable tandem** into one REP node. So tandem loci are called on the `panphorte`
+graph, PGGB-folded paralog clusters on the unfolded `bubble` graph. Mechanics + traces:
+[algorithms/call.md](algorithms/call.md#copy-number--three-ways).
 
-![Copy-number concordance: panvar calls vs ground truth](../results/cn_correlation.png)
+## Gene annotation (`--gtf`)
 
-Each point is a haplotype's recovered **gene** copy number (the absolute VCF count minus the constant
-folded-paralog baseline, annotated per facet) vs the BED truth. LPA and C4 have baseline 0 and sit exactly
-on `y = x`; GSTM1 (+2: its GSTM2–5 segdup paralogs) and CYP2D6 (+1: CYP2D8P) report the total collapsed
-module, so a constant baseline is removed. CYP2D6's residual scatter is the variable, unannotated
-CYP2D8P/2D7-hybrid copies (see call.md).
-
-### Gene annotation (`--gtf`)
-
-An optional reference-coordinate GTF (Ensembl/GENCODE) projects gene names onto the graph across the
-pipeline. It needs a **PanSN** reference path (`sample#hap#contig:start-end`, so chromosome + absolute
-start are known); convert older underscore-named graphs first with `scripts/pansn_rename.py`. lncRNAs are
-skipped. When supplied:
-
-- `bubble --gtf` and `panphorte --gtf` each write `<prefix>.bandage_genes.csv` (`Name,Colour,Gene`) to
-  highlight genes per bubble in Bandage — both, because panphorte's collapse renumbers nodes.
-- `call --gtf` adds `INFO=GENES` to every record, writes `<prefix>.node_genes.tsv`, and a per-gene DUP
-  copy-number table `<prefix>.dup_gene_cn.tsv` that **separates** paralogs the graph folds together
-  (reliable rows, e.g. CYP2D6 vs CYP2D7/2D8P) and honestly **collapses** near-identical ones it can't
-  resolve (unreliable rows with the module total, e.g. C4A;C4B). See [modules/call.md](modules/call.md).
-- `node_genes.tsv` is the node→gene bridge for the GWAS traceback: join it on the `nodes` column of
-  `associate`'s output to name the gene behind a hit. `describe` itself is k-mer based and does **not**
-  consume the GTF.
-
-## Doc Structure Convention
-
-Each module page follows the same structure:
-
-- what it does
-- required inputs
-- key options
-- outputs
-- algorithm overview
-- runnable example (reads a `tests/real_data/*.gfa.gz` graph, writes under `results/real_data/<region>/`)
+An optional reference-coordinate GTF projects gene names onto the graph (needs a **PanSN** reference path;
+lncRNAs skipped). `bubble`/`panphorte` write Bandage gene CSVs; `call --gtf` adds `INFO=GENES`,
+`node_genes.tsv`, and the per-gene DUP table `dup_gene_cn.tsv` (separating resolvable paralogs, collapsing
+near-identical ones). `node_genes.tsv` is the node→gene bridge for the GWAS traceback —
+`associate --node-genes` joins it to emit a `gene` column. Details:
+[modules/call.md](modules/call.md#gene-annotation---gtf), trace:
+[algorithms/call.md](algorithms/call.md#gene-annotation-trace---gtf).

@@ -3,7 +3,7 @@
 This page explains, from scratch, the ideas behind a genome-wide association study (GWAS) and how
 `panvar associate` implements them. It is written for someone who has the genotypes from `describe` and a
 phenotype table and wants to *understand* what each knob does — not just run it. The running example is
-**LPA / KIV-2** (the same one in [gwas_example.md](gwas_example.md)); read that for the worked numbers.
+**LPA / KIV-2** (the same one in [example.md](example.md)); read that for the worked numbers.
 
 ---
 
@@ -69,7 +69,7 @@ this removes. `--min-maf 0.02` (say) drops anything where the minor genotype is 
 
 ---
 
-## 5. Multiple testing: why not p < 0.05, and why not 5×10⁻⁸ either
+## 5. Multiple testing: why not p<0.05, and why not 5e-8 either
 
 You run thousands of tests, so a raw `p < 0.05` would give thousands of false positives (5% of all nulls).
 You must correct for the number of tests. Two standard corrections, both reported:
@@ -186,5 +186,5 @@ panvar associate ... --pca 5 --make-kinship       -o out_pca
 Rscript scripts/plot_associate.R --assoc out.assoc.tsv --summary out.summary.tsv --out out --title "my trait"
 ```
 
-See [gwas_example.md](gwas_example.md) for the full LPA walk-through (with real numbers), and
-[modules/associate.md](modules/associate.md) for the exhaustive flag reference.
+See [example.md](example.md) for the full LPA walk-through (with real numbers), and
+[modules/associate.md](../modules/associate.md) for the exhaustive flag reference.

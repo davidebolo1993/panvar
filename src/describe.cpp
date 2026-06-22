@@ -18,6 +18,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -90,6 +91,7 @@ struct BubbleDescribeResult {
     std::string graph_feature_map_path = ".";
     std::string graph_matrix_path = ".";
     std::vector<std::string> traversing_paths;  // path names that traverse this bubble (for BIMBAM NA)
+    std::unordered_map<std::uint64_t, std::vector<std::string>> kmer_nodes;  // kept k-mer code -> its node set
 };
 
 class GzipWriter {
@@ -628,6 +630,14 @@ std::string edge_key(const PathStep& from, const PathStep& to) {
     return oriented_node_token(from) + ">" + oriented_node_token(to);
 }
 
+// Forward decl (defined below): per-step keep mask for --variant-nodes (+flank). Used by the graph
+// dosage counters here so they honour the variant-restricted scope, same as the k-mer substrate.
+std::vector<char> variant_keep_mask(
+    const Graph& graph,
+    const std::vector<PathStep>& steps,
+    const std::unordered_set<std::string>& variant_nodes,
+    std::size_t flank_bp);
+
 std::vector<PathStep> canonical_steps_for_bubble_path(
     const Bubble& bubble,
     const PathRecord& path,
@@ -640,12 +650,18 @@ std::vector<PathStep> canonical_steps_for_bubble_path(
     return canonical_bubble_path_steps(path, bubble, *interval);
 }
 
-GraphDosage count_graph_dosage(const std::vector<PathStep>& steps) {
+// Count node/edge dosage over a path's bubble walk. When `keep` is non-null (variant-restricted mode)
+// a node is counted only on kept steps, and an edge only when BOTH of its endpoints are kept, so the
+// graph substrate honours --variant-nodes (+flank) exactly like the k-mer substrate.
+GraphDosage count_graph_dosage(const std::vector<PathStep>& steps,
+                               const std::vector<char>* keep = nullptr) {
     GraphDosage dosage;
-    for (const PathStep& step : steps) {
-        ++dosage.node_counts[step.node_id];
+    for (std::size_t i = 0; i < steps.size(); ++i) {
+        if (keep != nullptr && !(*keep)[i]) continue;
+        ++dosage.node_counts[steps[i].node_id];
     }
     for (std::size_t i = 0; i + 1 < steps.size(); ++i) {
+        if (keep != nullptr && (!(*keep)[i] || !(*keep)[i + 1])) continue;
         ++dosage.edge_counts[edge_key(steps[i], steps[i + 1])];
     }
     return dosage;
@@ -687,7 +703,9 @@ void accumulate_graph_stats(
     const std::vector<BubblePathIndex>& path_indexes,
     const std::vector<PathMeta>& paths,
     std::map<std::string, GraphFeatureStat>& node_stats,
-    std::map<std::string, GraphFeatureStat>& edge_stats) {
+    std::map<std::string, GraphFeatureStat>& edge_stats,
+    const std::unordered_set<std::string>* variant_nodes,
+    std::size_t flank_bp) {
 
     for (const PathMeta& meta : paths) {
         const std::vector<PathStep> steps = canonical_steps_for_bubble_path(
@@ -695,7 +713,10 @@ void accumulate_graph_stats(
         if (steps.empty()) {
             continue;
         }
-        const GraphDosage dosage = count_graph_dosage(steps);
+        const std::vector<char> keep =
+            variant_nodes != nullptr ? variant_keep_mask(graph, steps, *variant_nodes, flank_bp)
+                                     : std::vector<char>();
+        const GraphDosage dosage = count_graph_dosage(steps, variant_nodes != nullptr ? &keep : nullptr);
         update_graph_stats(dosage.node_counts, node_stats);
         update_graph_stats(dosage.edge_counts, edge_stats);
     }
@@ -755,7 +776,9 @@ void write_graph_matrix(
     const std::vector<BubblePathIndex>& path_indexes,
     const std::vector<PathMeta>& paths,
     const std::vector<std::string>& node_features,
-    const std::vector<std::string>& edge_features) {
+    const std::vector<std::string>& edge_features,
+    const std::unordered_set<std::string>* variant_nodes,
+    std::size_t flank_bp) {
 
     GzipWriter out(path);
     std::string header = "bubble_id\tsample\thaplotype\tpath_name";
@@ -776,7 +799,10 @@ void write_graph_matrix(
         if (steps.empty()) {
             continue;
         }
-        const GraphDosage dosage = count_graph_dosage(steps);
+        const std::vector<char> keep =
+            variant_nodes != nullptr ? variant_keep_mask(graph, steps, *variant_nodes, flank_bp)
+                                     : std::vector<char>();
+        const GraphDosage dosage = count_graph_dosage(steps, variant_nodes != nullptr ? &keep : nullptr);
 
         std::string line;
         line.reserve(128 + (node_features.size() + edge_features.size()) * 3);
@@ -1262,7 +1288,9 @@ void accumulate_graph_counts(
     const std::vector<PathMeta>& paths,
     const std::vector<std::string>& node_features,
     const std::vector<std::string>& edge_features,
-    GraphPool& pool) {
+    GraphPool& pool,
+    const std::unordered_set<std::string>* variant_nodes,
+    std::size_t flank_bp) {
 
     const std::unordered_set<std::string> keep_nodes(node_features.begin(), node_features.end());
     const std::unordered_set<std::string> keep_edges(edge_features.begin(), edge_features.end());
@@ -1275,7 +1303,10 @@ void accumulate_graph_counts(
         if (steps.empty()) {
             continue;
         }
-        const GraphDosage dosage = count_graph_dosage(steps);
+        const std::vector<char> keep =
+            variant_nodes != nullptr ? variant_keep_mask(graph, steps, *variant_nodes, flank_bp)
+                                     : std::vector<char>();
+        const GraphDosage dosage = count_graph_dosage(steps, variant_nodes != nullptr ? &keep : nullptr);
         for (const auto& [key, c] : dosage.node_counts) {
             if (c > 0 && keep_nodes.count(key) != 0) pool[key][meta.path_name] += c;
         }
@@ -1412,6 +1443,16 @@ BubbleDescribeResult describe_one_bubble(
             variant_nodes);
         write_feature_map(result.feature_map_path, features, stats, feature_nodes, options.kmer_size, paths.size());
 
+        // Carry each kept k-mer's node provenance up to the pooled BIMBAM/feature_annot (so a pooled
+        // k-mer keeps a node link for traceback and gene annotation; per-bubble detail stays in the map).
+        if (kmer_pool != nullptr) {
+            for (const std::uint64_t code : features) {
+                const auto it = feature_id_by_code.find(code);
+                if (it != feature_id_by_code.end() && it->second < feature_nodes.size())
+                    result.kmer_nodes.emplace(code, sorted_nodes(feature_nodes[it->second]));
+            }
+        }
+
         if (kmer_pool != nullptr) {
             accumulate_kmer_counts(graph, bubble, path_indexes, paths, features, options, variant_nodes, *kmer_pool);
         }
@@ -1440,7 +1481,8 @@ BubbleDescribeResult describe_one_bubble(
     if (options.emit_graph) {
         std::map<std::string, GraphFeatureStat> node_stats;
         std::map<std::string, GraphFeatureStat> edge_stats;
-        accumulate_graph_stats(graph, bubble, path_indexes, paths, node_stats, edge_stats);
+        accumulate_graph_stats(graph, bubble, path_indexes, paths, node_stats, edge_stats,
+                               variant_nodes, options.variant_flank_bp);
         const std::vector<std::string> node_features =
             select_discriminative_graph_features(node_stats, paths.size(), options.min_feature_paths);
         const std::vector<std::string> edge_features =
@@ -1450,13 +1492,15 @@ BubbleDescribeResult describe_one_bubble(
         result.edge_features = edge_features.size();
         result.edge_features_total = edge_stats.size();
         if (graph_pool != nullptr) {
-            accumulate_graph_counts(graph, bubble, path_indexes, paths, node_features, edge_features, *graph_pool);
+            accumulate_graph_counts(graph, bubble, path_indexes, paths, node_features, edge_features,
+                                    *graph_pool, variant_nodes, options.variant_flank_bp);
         }
         write_graph_feature_map(
             result.graph_feature_map_path, node_features, edge_features, node_stats, edge_stats, paths.size());
         if (options.write_wide_matrix) {
             write_graph_matrix(
-                result.graph_matrix_path, graph, bubble, path_indexes, paths, node_features, edge_features);
+                result.graph_matrix_path, graph, bubble, path_indexes, paths, node_features, edge_features,
+                variant_nodes, options.variant_flank_bp);
             result.graph_matrix_written = true;
         } else {
             result.graph_matrix_path = ".";
@@ -1584,6 +1628,7 @@ void describe_kmers_from_graph(
     // For BIMBAM NA: which bubble(s) a feature is discriminative in, and which paths traverse each bubble.
     std::unordered_map<std::uint64_t, std::vector<std::size_t>> feature_bubbles_k;
     std::unordered_map<std::string, std::vector<std::size_t>> feature_bubbles_g;
+    std::unordered_map<std::uint64_t, std::set<std::string>> feature_nodes_k;  // pooled k-mer code -> node set
     std::unordered_map<std::size_t, std::unordered_set<std::string>> bubble_traversers;
     cli::ProgressBar progress(options.quiet ? "" : "Describing bubbles", to_process.size());
 
@@ -1617,6 +1662,12 @@ void describe_kmers_from_graph(
                 auto& dst = kmer_pool[code];
                 for (const auto& [path, c] : carriers) dst[path] += c;
                 if (want_bimbam) feature_bubbles_k[code].push_back(bubble.id);
+            }
+            if (want_bimbam) {
+                for (auto& [code, ns] : results[bi].kmer_nodes) {
+                    auto& dst = feature_nodes_k[code];
+                    for (const std::string& n : ns) dst.insert(n);
+                }
             }
         }
         if (want_graph_pool) {
@@ -1689,7 +1740,9 @@ void describe_kmers_from_graph(
             for (const auto& [code, carriers] : kmer_pool) {
                 BimbamRow r;
                 r.id = decode_kmer(code, options.kmer_size);
-                r.nodes = ".";  // per-k-mer node provenance lives in the per-bubble kmer_features.tsv.gz
+                const auto nit = feature_nodes_k.find(code);  // aggregated node provenance (across bubbles)
+                r.nodes = (nit != feature_nodes_k.end() && !nit->second.empty())
+                    ? join_nodes(std::vector<std::string>(nit->second.begin(), nit->second.end())) : ".";
                 const auto fb = feature_bubbles_k.find(code);
                 if (fb != feature_bubbles_k.end()) r.bubbles = fb->second;
                 for (const auto& [path, c] : carriers) r.carriers[path] = static_cast<double>(c);
@@ -1814,7 +1867,10 @@ void describe_kmers_from_graph(
                 }
                 std::vector<BimbamRow> rows; rows.reserve(sample_pool.size());
                 for (const auto& [code, carriers] : sample_pool) {
-                    BimbamRow r; r.id = decode_kmer(code, options.kmer_size); r.nodes = ".";
+                    BimbamRow r; r.id = decode_kmer(code, options.kmer_size);
+                    const auto nit = feature_nodes_k.find(code);
+                    r.nodes = (nit != feature_nodes_k.end() && !nit->second.empty())
+                        ? join_nodes(std::vector<std::string>(nit->second.begin(), nit->second.end())) : ".";
                     const auto fb = feature_bubbles_k.find(code);
                     if (fb != feature_bubbles_k.end()) r.bubbles = fb->second;
                     for (const auto& [s, c] : carriers) r.carriers[s] = static_cast<double>(c);

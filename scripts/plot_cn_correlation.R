@@ -5,8 +5,14 @@
 #
 #   Rscript plot_cn_correlation.R --table cn_table.tsv --out results/cn_correlation
 #
+# Writes TWO plots:
+#   <out>.loci.png   -- the four loci as TOTAL module/gene counts (c4, cyp2d6, gstm1, lpa), 2x2 grid.
+#   <out>.genes.png  -- the resolved CYP2D6 / CYP2D7 per-paralog split, one row of two panels.
+# The two are distinguished by the label case in the table: locus totals are lower-case (cyp2d6),
+# the per-paralog split rows are upper-case (CYP2D6, CYP2D7). Either plot is skipped if it has no rows.
+#
 # Input TSV (produced by scripts/compare_copy_number.py --dump-tsv):
-#   gene  sample  truth_cn  called_cn  is_reference
+#   gene  sample  truth_cn  called_cn  baseline_offset  is_reference
 suppressWarnings(suppressMessages({
   library(ggplot2)
 }))
@@ -27,30 +33,9 @@ if (nrow(d) == 0) stop("no rows in table")
 if (is.null(d$baseline_offset)) d$baseline_offset <- 0
 d$ref <- ifelse(d$is_reference == 1, "reference", "haplotype")
 
-
 # Recovered GENE copy number: absolute VCF CN minus the constant paralog baseline (0 for LPA/C4, where
 # the call already counts the gene; +2 for GSTM1 and +1 for CYP2D6, the always-present folded paralogs).
 d$gene_cn <- d$called_cn - d$baseline_offset
-
-# Per-gene Pearson r + n + the subtracted baseline, placed in each facet.
-genes <- sort(unique(d$gene))
-labs <- do.call(rbind, lapply(genes, function(g) {
-  s <- d[d$gene == g, ]
-  r <- tryCatch(cor(s$truth_cn, s$gene_cn), error = function(e) NA)
-  off <- s$baseline_offset[1]
-  data.frame(gene = g,
-             label = sprintf("r = %.3f\nn = %d\nbaseline %+d", r, nrow(s), off),
-             stringsAsFactors = FALSE)
-}))
-
-# per-gene shared range so each panel is exactly square (x and y span the same integer range).
-# invisible anchor points at -0.4 and (sharedmax + 1 headroom) fully define both free axes, so the
-# range is deterministic and identical on x and y (not perturbed by the random jitter of real points).
-lims <- do.call(rbind, lapply(genes, function(g) {
-  s <- d[d$gene == g, ]
-  hi <- max(c(s$truth_cn, s$gene_cn)) + 1   # one unit of headroom above the data
-  data.frame(gene = g, v = c(-0.4, hi), stringsAsFactors = FALSE)
-}))
 
 # integer-only ticks: step 1 for narrow panels, coarser for wide ones (lpa spans ~24) to avoid crowding.
 int_breaks <- function(lim) {
@@ -59,23 +44,62 @@ int_breaks <- function(lim) {
   seq(0, hi, by = by)
 }
 
-p <- ggplot(d, aes(truth_cn, gene_cn)) +
-  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60") +
-  geom_jitter(aes(colour = ref, size = ref), width = 0.12, height = 0.12, alpha = 0.75) +
-  geom_blank(data = lims, aes(x = v, y = v)) +
-  # pin the annotation to the upper-left corner of each panel (away from the points)
-  geom_text(data = labs, aes(x = -Inf, y = Inf, label = label),
-            hjust = -0.1, vjust = 1.2, size = 3.2, colour = "grey20") +
-  facet_wrap(~ gene, scales = "free") +
-  scale_x_continuous(breaks = int_breaks, expand = expansion(mult = 0.02)) +
-  scale_y_continuous(breaks = int_breaks, expand = expansion(mult = 0.02)) +
-  scale_colour_manual(values = c(haplotype = "#2c7fb8", reference = "#d95f02"), name = NULL) +
-  scale_size_manual(values = c(haplotype = 1.6, reference = 3.2), guide = "none") +
-  labs(x = "ground-truth copy number",
-       y = "panvar copy number (paralog baseline removed)") +
-  theme_bw(base_size = 12) +
-  theme(legend.position = "top", panel.grid.minor = element_blank(), aspect.ratio = 1)
+# Build a faceted concordance plot from a subset of genes (per-facet r, square axes, y=x line).
+make_plot <- function(sub, ncol) {
+  genes <- sort(unique(sub$gene))
+  labs <- do.call(rbind, lapply(genes, function(g) {
+    s <- sub[sub$gene == g, ]
+    r <- suppressWarnings(tryCatch(cor(s$truth_cn, s$gene_cn), error = function(e) NA))
+    # exact-match concordance: fraction of haplotypes whose rounded call equals the truth. This stays
+    # meaningful when truth is constant (e.g. CYP2D7 = 1 everywhere), where Pearson r is undefined.
+    match <- mean(round(s$gene_cn) == s$truth_cn) * 100
+    rlab <- if (is.na(r)) "r = n/a (truth constant)" else sprintf("r = %.3f", r)
+    data.frame(gene = g,
+               label = sprintf("%s\nmatch = %.0f%%\nn = %d", rlab, match, nrow(s)),
+               stringsAsFactors = FALSE)
+  }))
+  # per-gene shared range so each panel is exactly square (invisible anchors define both free axes).
+  lims <- do.call(rbind, lapply(genes, function(g) {
+    s <- sub[sub$gene == g, ]
+    hi <- max(c(s$truth_cn, s$gene_cn)) + 1   # one unit of headroom above the data
+    data.frame(gene = g, v = c(-0.4, hi), stringsAsFactors = FALSE)
+  }))
+  ggplot(sub, aes(truth_cn, gene_cn)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey60") +
+    geom_jitter(aes(colour = ref, size = ref), width = 0.12, height = 0.12, alpha = 0.75) +
+    geom_blank(data = lims, aes(x = v, y = v)) +
+    geom_text(data = labs, aes(x = -Inf, y = Inf, label = label),
+              hjust = -0.1, vjust = 1.2, size = 3.2, colour = "grey20") +
+    facet_wrap(~ gene, scales = "free", ncol = ncol) +
+    scale_x_continuous(breaks = int_breaks, expand = expansion(mult = 0.02)) +
+    scale_y_continuous(breaks = int_breaks, expand = expansion(mult = 0.02)) +
+    scale_colour_manual(values = c(haplotype = "#2c7fb8", reference = "#d95f02"), name = NULL) +
+    scale_size_manual(values = c(haplotype = 1.6, reference = 3.2), guide = "none") +
+    labs(x = "ground-truth copy number",
+         y = "panvar copy number (paralog baseline removed)") +
+    theme_bw(base_size = 12) +
+    theme(legend.position = "top", panel.grid.minor = element_blank(), aspect.ratio = 1)
+}
 
-png_path <- paste0(out_prefix, ".png")
-ggsave(png_path, p, width = 9, height = 7, dpi = 150)
-cat("Wrote:", png_path, "\n")
+# Split by label case: per-paralog split rows are the two upper-case genes; everything else is a locus total.
+paralogs <- c("CYP2D6", "CYP2D7")
+loci <- d[!(d$gene %in% paralogs), ]
+genes <- d[d$gene %in% paralogs, ]
+
+# Plot 1: the four loci as total counts (c4, cyp2d6, gstm1, lpa) in a 2x2 grid.
+if (nrow(loci) > 0) {
+  p_loci <- make_plot(loci, ncol = 2)
+  ggsave(paste0(out_prefix, ".loci.png"), p_loci, width = 8, height = 7, dpi = 150)
+  cat("Wrote:", paste0(out_prefix, ".loci.png"), "\n")
+} else {
+  cat("(no locus-total rows; skipping .loci.png)\n")
+}
+
+# Plot 2: resolved CYP2D6 / CYP2D7 per-paralog split, one row of two panels.
+if (nrow(genes) > 0) {
+  p_genes <- make_plot(genes, ncol = 2)
+  ggsave(paste0(out_prefix, ".genes.png"), p_genes, width = 8, height = 4.2, dpi = 150)
+  cat("Wrote:", paste0(out_prefix, ".genes.png"), "\n")
+} else {
+  cat("(no CYP2D6/CYP2D7 per-gene rows; skipping .genes.png)\n")
+}

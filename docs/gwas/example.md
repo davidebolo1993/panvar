@@ -47,7 +47,7 @@ Three consequences worth internalizing:
 
 - **It is variant-level, not whole-haplotype.** Every feature points back to a bubble/variant; we never test "the whole haplotype" as one blob.
 - **Testing is reference-free.** counts exist for every haplotype whether or not the reference traverses that sequence. A sample whose haplotypes carry a bubble **not spanned by the reference** is still genotyped and tested.
-- **The reference is only for plotting.** A Manhattan needs an x-axis; `plot_associate.R` uses **graph/node order** (pangenome-native, places *every* variant including reference-disjoint ones), with position-less k-mers parked at the left.
+- **The reference is only for plotting.** A Manhattan needs an x-axis; `plot_associate.R` uses **graph/node order** (pangenome-native, places *every* variant including reference-disjoint ones) for graph features, and a per-k-mer index ordered by node id for k-mers (each k-mer carries its node provenance).
 
 ## 3. Why multiplicity (counts), not just presence/absence
 
@@ -57,12 +57,12 @@ SNP- and indel-like variants. It **fails for CNVs** like KIV-2: the repeat-unit 
 before testing. The information is entirely in the **count**. panvar carries the true per-sample dosage
 through to the genotype, so a **dosage** test recovers KIV-2 that a presence/absence test cannot.
 
-> **Engine.** `panvar associate` ([associate](modules/associate.md)) tests the **dosage** directly
+> **Engine.** `panvar associate` ([associate](../modules/associate.md)) tests the **dosage** directly
 > (`phenotype ~ genotype + covariates`), so copy-number loci are first-class. It can also adjust for
 > population structure with ancestry **PCs** (`--pca`) or a **linear mixed model** (`--model lmm` + a
 > kinship matrix). The same genotypes are exported by `describe` as **BIMBAM** mean-genotype dosage, which
 > is also **GEMMA-ready**, so an external dosage-based tool can be used instead if desired. New to any of
-> these terms? The [GWAS primer](gwas_primer.md) explains them from scratch on this example.
+> these terms? The [GWAS primer](primer.md) explains them from scratch on this example.
 
 ## 4. The pipeline
 
@@ -73,14 +73,16 @@ The post-`panphorte` modules consume the **panphorte-normalized/sorted graph** a
   `bimbam_kmers.samples.bimbam.gz` (k-mers) and `bimbam_graph.samples.bimbam.gz` (node/edge) — whose value
   is the summed dosage over the sample's assigned haplotypes (a haplotype listed twice → counted twice =
   homozygous), with `bimbam.samples.samples.txt.gz` (column order) and `feature_annot.samples.tsv.gz`
-  (layer/bubbles/nodes). See [describe](modules/describe.md).
-- **`panvar associate`** ([associate](modules/associate.md)) fits `phenotype ~ genotype + covariates` per
+  (layer/bubbles/nodes). See [describe](../modules/describe.md).
+- **`panvar associate`** ([associate](../modules/associate.md)) fits `phenotype ~ genotype + covariates` per
   feature (linear for a quantitative trait, logistic for a binary one), filters features by **minor
   (non-modal) genotype frequency** computed on the actual cohort, and corrects for multiple testing
   **over the features actually tested** (region-wide Bonferroni `0.05/n_tests` + Benjamini-Hochberg FDR).
-- **`scripts/plot_associate.R`** draws the Manhattan (−log10 p along graph order, with the nominal and
-  Bonferroni threshold lines, FDR points highlighted — i.e. before/after correction in one figure) and the
-  QQ with the genomic-inflation λ.
+- **`scripts/plot_associate.R`** draws the Manhattan as **two stacked panels** — before correction (raw
+  −log10 p, with the nominal 0.05 and region-wide Bonferroni lines) and after correction (Benjamini-Hochberg
+  −log10 q, with the q=0.05 line) — x = node id (graph) or per-k-mer index ordered by node id (k-mers),
+  with significant **genes flagged** (e.g. LPA) via ggrepel labels; plus the QQ with the
+  genomic-inflation λ.
 
 ## 5. Data & literature resources (how the synthetic cohort is grounded)
 
@@ -97,7 +99,7 @@ example behaves like a real Southern-European study (we have no consented indivi
   Cardiovasc Med 2025.) We use these as the simulation's `BASE`/spread and the binary case threshold.
 - **Covariates** (`Age` ~ adult 35–85, `Sex`, ancestry `PC1–PC3`) mirror an adult cohort design.
 
-Full citations are in [references.md](references.md). `tests/gwas/make_lpa_phenotype.py` encodes these as
+Full citations are in [references.md](../references.md). `tests/gwas/make_lpa_phenotype.py` encodes these as
 explicit constants (`BASE_LOG10`, `SLOPE_LOG10`, `SIGMA_LOG10`, `HIGH_RISK_MGDL`).
 
 ## 6. Example — real LPA graph, structured cohort, two results
@@ -149,7 +151,7 @@ This is the textbook before/after: a naive λ≫1 collapses to ≈1 once structu
 KIV-2 signal rises to the top. (Exact numbers depend on `N`/seed; the driver asserts λ drops after
 correction.)
 
-![LPA structure demo — naive (inflated) vs PC-adjusted Manhattan](../results/real_data/lpa/gwas/sim_naive.manhattan.png)
+![LPA structure demo — naive (inflated) vs PC-adjusted Manhattan](../../results/real_data/lpa/gwas/sim_naive.manhattan.png)
 
 ## 7. Reading the outputs
 
@@ -161,8 +163,9 @@ correction.)
 - **`assoc_<sub>_<mode>.summary.tsv`** — model, samples used, `features_tested`, `dropped_min_maf`, the
   `bonferroni_threshold` (`0.05/n_tests`), significant counts (Bonferroni and FDR<0.05), the
   genomic-inflation **`lambda_gc`**, and (LMM) `lmm_delta`.
-- **Manhattan / QQ** — `*.manhattan.{png,pdf}` (raw −log10 p with the nominal `0.05` and Bonferroni lines;
-  FDR<0.05 / Bonferroni points highlighted) and `*.qq.{png,pdf}` (genomic-inflation λ).
+- **Manhattan / QQ** — `*.manhattan.{png,pdf}`: two stacked panels (before correction = raw −log10 p with
+  the nominal `0.05` + Bonferroni lines; after correction = BH −log10 q with the q=0.05 line), points
+  coloured by verdict. `*.qq.{png,pdf}` carries the genomic-inflation λ.
 - **Structure demo** — `sim_{naive,pc,lmm}.{assoc.tsv,summary.tsv,manhattan.png,qq.png}`: compare the
   `lambda_gc` across the three.
 
@@ -185,8 +188,29 @@ correction.)
 - Counts are the *graph-derived* per-haplotype multiplicity; with real reads you would carry read-depth
   uncertainty from `cosigt` into the dosage.
 
+## Validation against GEMMA
+
+`panvar associate` is a from-scratch implementation, so we check it against **GEMMA** (the reference
+mixed-model GWAS tool) on the *same* BIMBAM panel + phenotype/covariates — BIMBAM is GEMMA's native
+mean-genotype format, so the genotypes load unchanged. `tests/gwas/validate_gemma.sh` runs both and reports
+the Pearson correlation of effect size and of −log10 p over the shared features:
+
+| comparison | r(β) | r(−log10 p) | top hit |
+|------------|------|-------------|---------|
+| linear (`associate --model linear` vs GEMMA `-lm`) | **1.0000** | **1.0000** | — |
+| mixed (`associate --model lmm --kinship` vs GEMMA `-lmm`) | **0.9997** | **0.9997** | **match** |
+
+The statistics are effectively identical — the engine is correct. **One revealing difference:** GEMMA
+analyzes 2000 of the 2001 features and **silently drops the KIV-2 copy-number marker**, because its
+allele-frequency model assumes a diploid 0–2 dosage and KIV-2's count (here 14–61) has "allele frequency"
+≫ 1, so its built-in MAF filter discards it. `panvar associate` has no such assumption and tests it
+directly (KIV-2 p ≈ 1e-22). That is precisely why panvar carries the **raw count** through BIMBAM and tests
+multiplicity itself — a generic 0–2 GWAS tool cannot genotype the very locus this example is about. (To
+push a copy-number marker through GEMMA you would have to rescale it into [0,2] first, losing the natural
+count interpretation.)
+
 ## See also
-- [GWAS primer](gwas_primer.md) — the concepts (dosage, MAF, multiple testing, kinship, λ, LMM vs PCs) from scratch.
-- [associate](modules/associate.md) — the GWAS engine, inputs, multiple-testing, and outputs.
-- [describe](modules/describe.md) — the BIMBAM exports, `--samples` / `--variant-nodes` / `--variant-flank-bp`.
-- [call](modules/call.md) — `variant_nodes.tsv` / `variant_paths.tsv` used for provenance/traceback.
+- [GWAS primer](primer.md) — the concepts (dosage, MAF, multiple testing, kinship, λ, LMM vs PCs) from scratch.
+- [associate](../modules/associate.md) — the GWAS engine, inputs, multiple-testing, and outputs.
+- [describe](../modules/describe.md) — the BIMBAM exports, `--samples` / `--variant-nodes` / `--variant-flank-bp`.
+- [call](../modules/call.md) — `variant_nodes.tsv` / `variant_paths.tsv` used for provenance/traceback.

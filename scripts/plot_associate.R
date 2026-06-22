@@ -3,9 +3,10 @@
 #
 #   Rscript plot_associate.R --assoc out.assoc.tsv [--summary out.summary.tsv] --out prefix [--title T]
 #
-# assoc.tsv columns: feature_id, layer, bubbles, nodes, n, minor_freq, beta|log_or, se, z, p, p_bonf, q_bh.
-# Writes <prefix>.manhattan.png/pdf (raw -log10 p with the nominal 0.05 and region-wide Bonferroni
-# threshold lines; points passing FDR<0.05 highlighted) and <prefix>.qq.png/pdf.
+# assoc.tsv columns: feature_id, layer, bubbles, nodes, n, minor_freq, beta|log_or, se, z, p, p_bonf, q_bh, gene.
+# Writes <prefix>.manhattan.png/pdf -- two stacked panels: BEFORE correction (raw -log10 p, nominal +
+# Bonferroni lines) and AFTER correction (BH -log10 q, q=0.05 line). x = node id (graph) or per-k-mer
+# index ordered by node id (k-mers); genes flagged with ggrepel labels from the `gene` column.
 suppressWarnings(suppressMessages(library(ggplot2)))
 
 args <- commandArgs(trailingOnly = TRUE)
@@ -30,33 +31,86 @@ bonf <- 0.05 / n_tests
 fdr_p <- suppressWarnings(max(d$p[is.finite(d$q_bh) & d$q_bh < 0.05]))
 if (!is.finite(fdr_p)) fdr_p <- NA_real_
 
-# x = graph order (first integer in the nodes field); k-mer features (nodes ".") parked at the left
+# x-axis. Graph features ARE node/edge ids -> use the node id (genomic order). k-mers are many-per-node
+# (and several can share a node), so use a per-k-mer INDEX ordered by node id: each k-mer is its own
+# column, grouped by locus, so you can see how many k-mers pop up. The kmer<->node(<->gene) link now
+# lives in feature_annot / the assoc `nodes` & `gene` columns (so this stays traceable).
 first_int <- function(x) suppressWarnings(as.numeric(sub("^[^0-9]*([0-9]+).*$", "\\1", x)))
-d$x <- first_int(d$nodes)
-has_x <- any(is.finite(d$x))
-if (has_x) {
-  rng <- range(d$x[is.finite(d$x)]); span <- max(1, diff(rng))
-  d$x[!is.finite(d$x)] <- rng[1] - 0.05 * span
+node1 <- first_int(d$nodes)
+layer <- if ("layer" %in% names(d)) d$layer else rep(".", nrow(d))
+is_kmer <- sum(layer == "kmer") > sum(layer == "graph")
+if (is_kmer) {
+  ord <- order(ifelse(is.finite(node1), node1, max(node1[is.finite(node1)], 0) + 1), d$p)
+  d$x <- NA_real_; d$x[ord] <- seq_len(nrow(d))   # per-k-mer index, ordered by node id then p
+  xlab <- "k-mer index (ordered by node id)"
 } else {
-  d$x <- seq_len(nrow(d))
+  d$x <- node1
+  if (any(is.finite(d$x))) {
+    rng <- range(d$x[is.finite(d$x)]); d$x[!is.finite(d$x)] <- rng[1] - 0.05 * max(1, diff(rng))
+  } else d$x <- seq_len(nrow(d))
+  xlab <- "graph order (node id)"
 }
 d$logp <- -log10(pmax(d$p, 1e-300))
+d$logq <- -log10(pmax(ifelse(is.finite(d$q_bh), d$q_bh, 1), 1e-300))
 d$sig <- ifelse(d$p < bonf, "Bonferroni",
                 ifelse(is.finite(d$q_bh) & d$q_bh < 0.05, "FDR<0.05", "ns"))
 d$sig <- factor(d$sig, levels = c("ns", "FDR<0.05", "Bonferroni"))
 
+# Two stacked panels on the SAME run: BEFORE correction (raw -log10 p, with the nominal 0.05 and
+# region-wide Bonferroni lines -- every nominally-significant node shows here, LD/structure noise
+# included) and AFTER correction (Benjamini-Hochberg -log10 q, with the q=0.05 line -- only the
+# features that survive multiple-testing stay up; the rest collapse toward 0). Point colour is the
+# overall verdict in both panels, so you can see which 'before' peaks are real vs noise.
+lv <- c("before correction: raw -log10(p)", "after correction: BH -log10(q)")
+long <- rbind(
+  data.frame(x = d$x, y = d$logp, sig = d$sig, panel = lv[1]),
+  data.frame(x = d$x, y = d$logq, sig = d$sig, panel = lv[2]))
+long$panel <- factor(long$panel, levels = lv)
+thr <- data.frame(
+  panel = factor(c(lv[1], lv[1], lv[2]), levels = lv),
+  yint  = c(-log10(0.05), -log10(bonf), -log10(0.05)),
+  col   = c("grey50", "#d95f02", "#2c7fb8"),
+  lty   = c("dotted", "dashed", "dashed"))
+
+# Gene flags: one label per gene, placed at its most-significant feature, in BOTH panels (at its raw
+# -log10 p height in the "before" panel and its -log10 q height in the "after" panel). Only genes whose
+# top feature SURVIVES correction (Bonferroni or BH FDR<0.05) are labelled, so near-nominal neighbours
+# aren't flagged as noise. Needs the `gene` column (`associate --node-genes call.node_genes.tsv`).
+lab <- NULL
+if ("gene" %in% names(d)) {
+  g <- d[!is.na(d$gene) & d$gene != "." & (d$p < bonf | (is.finite(d$q_bh) & d$q_bh < 0.05)), ]
+  if (nrow(g) > 0) {
+    g <- g[order(g$p), ]; g <- g[!duplicated(g$gene), ]   # best feature per gene
+    lab <- rbind(
+      data.frame(x = g$x, y = -log10(pmax(g$p, 1e-300)), gene = g$gene, panel = lv[1]),
+      data.frame(x = g$x, y = -log10(pmax(ifelse(is.finite(g$q_bh), g$q_bh, 1), 1e-300)),
+                 gene = g$gene, panel = lv[2]))
+    lab$panel <- factor(lab$panel, levels = lv)
+  }
+}
+
 cols <- c("ns" = "grey70", "FDR<0.05" = "#2c7fb8", "Bonferroni" = "#d95f02")
-p_man <- ggplot(d, aes(x, logp, colour = sig)) +
-  geom_point(size = 1.4, alpha = 0.8) +
-  geom_hline(yintercept = -log10(0.05), linetype = "dotted", colour = "grey50") +
-  geom_hline(yintercept = -log10(bonf), linetype = "dashed", colour = "#d95f02") +
-  { if (is.finite(fdr_p)) geom_hline(yintercept = -log10(fdr_p), linetype = "dashed", colour = "#2c7fb8") } +
-  scale_colour_manual(values = cols, name = NULL) +
-  labs(title = title, subtitle = sprintf("n=%d tests; Bonferroni 0.05/n = %.2g (dashed orange); nominal 0.05 (dotted)", n_tests, bonf),
-       x = "graph order (node id; k-mers parked left)", y = expression(-log[10](p))) +
+p_man <- ggplot(long, aes(x, y, colour = sig)) +
+  geom_hline(data = thr, aes(yintercept = yint), colour = thr$col, linetype = thr$lty) +
+  geom_point(size = 1.3, alpha = 0.8) +
+  facet_wrap(~panel, ncol = 1, scales = "free_y") +
+  scale_colour_manual(values = cols, name = NULL, drop = FALSE) +
+  labs(title = title,
+       subtitle = sprintf("n=%d tests; Bonferroni 0.05/n = %.2g (dashed orange); nominal/FDR 0.05 (dotted grey / dashed blue)", n_tests, bonf),
+       x = xlab, y = NULL) +
   theme_bw(base_size = 12) + theme(legend.position = "top")
-ggsave(paste0(out, ".manhattan.png"), p_man, width = 10, height = 4.5, dpi = 150)
-ggsave(paste0(out, ".manhattan.pdf"), p_man, width = 10, height = 4.5)
+if (!is.null(lab)) {
+  if (requireNamespace("ggrepel", quietly = TRUE)) {
+    p_man <- p_man + ggrepel::geom_text_repel(data = lab, aes(x, y, label = gene),
+      inherit.aes = FALSE, size = 3, min.segment.length = 0, max.overlaps = 20,
+      box.padding = 0.4, colour = "black")
+  } else {
+    p_man <- p_man + geom_text(data = lab, aes(x, y, label = gene), inherit.aes = FALSE,
+      size = 3, vjust = -0.6, colour = "black")
+  }
+}
+ggsave(paste0(out, ".manhattan.png"), p_man, width = 10, height = 7, dpi = 150)
+ggsave(paste0(out, ".manhattan.pdf"), p_man, width = 10, height = 7)
 
 # QQ with genomic-inflation lambda
 po <- sort(pmax(d$p, 1e-300)); m <- length(po)

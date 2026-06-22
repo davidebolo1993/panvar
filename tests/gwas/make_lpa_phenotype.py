@@ -39,7 +39,7 @@ import random
 import statistics
 import sys
 
-# ---- literature-grounded constants (see docs/gwas_example.md "Data & literature resources") ----
+# ---- literature-grounded constants (see docs/gwas/example.md "Data & literature resources") ----
 BASE_LOG10 = 1.08      # 10**1.08 ~ 12 mg/dL median Lp(a) at the cohort-mean KIV-2 dosage
 SLOPE_LOG10 = 0.022    # per summed-copy decrease in log10 Lp(a) (inverse KIV-2 effect)
 SIGMA_LOG10 = 0.42     # residual sd on log10 scale (KIV-2 leaves substantial unexplained variance)

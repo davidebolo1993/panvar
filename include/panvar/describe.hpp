@@ -37,12 +37,14 @@ struct DescribeOptions {
     // Layer selection. Both on by default; --only-kmers / --only-graph restrict to one substrate.
     bool emit_kmers = true;
     bool emit_graph = true;
-    // Restrict k-mer/syncmer generation to called-variation nodes: a call
-    // <prefix>.variant_nodes.tsv. When set, only bubbles in the file are processed and only
-    // their variant nodes contribute k-mers. Empty = whole-bubble behavior.
+    // Restrict feature generation to called-variation nodes: a call <prefix>.variant_nodes.tsv.
+    // When set, only bubbles in the file are processed and only their variant nodes contribute
+    // features -- BOTH substrates: k-mers (bases from non-variant nodes are masked) and node/edge
+    // dosage (a node is counted only if it is a variant node, an edge only if both its endpoints
+    // are). Empty = whole-bubble behavior.
     std::string variant_nodes_path;
     // Only meaningful with --variant-nodes. Also keep (do not mask) any node whose path-distance
-    // to the nearest variant node is <= variant_flank_bp on either side, so k-mers spanning the
+    // to the nearest variant node is <= variant_flank_bp on either side, so features spanning the
     // variant's flanking sequence (e.g. nearby SNPs) are retained. 0 = strict variant-node-only.
     std::size_t variant_flank_bp = 0;
     // cosigt-style sample -> haplotype-path table. When set, describe additionally writes the
