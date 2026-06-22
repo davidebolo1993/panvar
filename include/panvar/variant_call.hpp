@@ -52,6 +52,7 @@ struct VariantCallSummary {
     std::size_t ins = 0;
     std::size_t inv = 0;
     std::size_t dup = 0;
+    std::size_t multi = 0;  // multiallelic-locus records (--multiallelic-loci)
 };
 
 void call_variants(

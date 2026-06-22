@@ -120,9 +120,6 @@ run_region() {
       if [[ -f "$nc" ]]; then
         "$RS" "$HERE/plot_node_coverage_heatmap.R" --table "$nc" --node-lengths "$nl" \
           --cluster-by "$cl" --out "$d/plots/${region}_node_heatmap" >/dev/null 2>&1 || echo "  (node heatmap skipped)"
-        "$RS" "$HERE/plot_sv_map.R" --node-counts "$nc" --vcf "$d/call/call.region.vcf" \
-          --node-lengths "$nl" --cluster-by "$cl" --reference-path "$ref" \
-          --out "$d/plots/${region}_sv_map" >/dev/null 2>&1 || echo "  (plot_sv_map skipped)"
       fi
       [[ -f "$ec" ]] && { "$RS" "$HERE/plot_edge_coverage_heatmap.R" --table "$ec" --cluster-by "$cl" \
         --out "$d/plots/${region}_edge_heatmap" >/dev/null 2>&1 || echo "  (edge heatmap skipped)"; }

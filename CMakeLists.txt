@@ -77,6 +77,7 @@ add_executable(panvar
     src/call_command.cpp
     src/describe_command.cpp
     src/panphorte_command.cpp
+    src/associate_command.cpp
 )
 target_link_libraries(panvar PRIVATE panvarlib minimap2 Threads::Threads ZLIB::ZLIB)
 if(NOT WIN32)

@@ -323,7 +323,7 @@ if (length(cluster_boundaries) > 0) {
 png_path <- paste0(opts$out, ".png")
 pdf_path <- paste0(opts$out, ".pdf")
 
-ggplot2::ggsave(png_path, p, width = opts$width, height = opts$height, units = "in", dpi = 180, limitsize = FALSE)
+ggplot2::ggsave(png_path, p, width = opts$width, height = opts$height, units = "in", dpi = 300, limitsize = FALSE)
 ggplot2::ggsave(pdf_path, p, width = opts$width, height = opts$height, units = "in", limitsize = FALSE)
 
 cat("Wrote:", png_path, "\n")

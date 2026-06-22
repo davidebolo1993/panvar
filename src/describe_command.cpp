@@ -55,10 +55,15 @@ void print_describe_help() {
         << "      --variant-nodes <tsv>        Restrict k-mers to call <prefix>.variant_nodes.tsv\n"
         << "                                   (only those bubbles' variant nodes contribute)\n"
         << "      --variant-flank-bp <N>       With --variant-nodes, also keep nodes within N bp of a\n"
-        << "                                   variant node so flanking-SNP k-mers are retained (default: 0)\n"
+        << "                                   variant node so junction/flanking k-mers are retained\n"
+        << "                                   (default: k-1 under --variant-nodes so short variant nodes\n"
+        << "                                   still yield k-mers; pass 0 for strict variant-node-only)\n"
         << "      --samples <tsv>              cosigt sample->haplotype-path table; also writes a\n"
         << "                                   sample-level fsm_kmers.samples.txt.gz (summed dosage)\n"
-        << "      --no-pyseer                  Do not write the pooled fsm_kmers.txt.gz (pyseer --kmers)\n"
+        << "      --no-pyseer                  Do not write the pooled fsm_{kmers,graph}.txt.gz (pyseer)\n"
+        << "      --no-bimbam                  Do not write the pooled BIMBAM dosage + feature_annot.tsv.gz\n"
+        << "      --only-kmers                 Emit only the k-mer substrate (skip node/edge graph layer)\n"
+        << "      --only-graph                 Emit only the node/edge graph substrate (skip k-mers)\n"
         << "      --threads <N>                Worker threads for the per-bubble loop (0 = auto)\n"
         << "  -q, --quiet                      Disable the progress bar\n"
         << "  -h, --help                       Show this help\n";
@@ -74,6 +79,7 @@ int run_describe_command(const std::vector<std::string>& args) {
 
     std::string bubble_prefix_in;
     DescribeOptions options;
+    bool variant_flank_set = false;
 
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& arg = args[i];
@@ -146,6 +152,7 @@ int run_describe_command(const std::vector<std::string>& args) {
         }
         if (arg == "--variant-flank-bp") {
             options.variant_flank_bp = cli::parse_size_arg(arg, require_value(arg));
+            variant_flank_set = true;
             continue;
         }
         if (arg == "--samples") {
@@ -154,6 +161,18 @@ int run_describe_command(const std::vector<std::string>& args) {
         }
         if (arg == "--no-pyseer") {
             options.pyseer = false;
+            continue;
+        }
+        if (arg == "--no-bimbam") {
+            options.bimbam = false;
+            continue;
+        }
+        if (arg == "--only-kmers") {
+            options.emit_graph = false;
+            continue;
+        }
+        if (arg == "--only-graph") {
+            options.emit_kmers = false;
             continue;
         }
         if (arg == "--threads") {
@@ -192,6 +211,13 @@ int run_describe_command(const std::vector<std::string>& args) {
     if (options.kmer_size == 0 || options.kmer_size > 31) {
         throw std::runtime_error("--kmer-size must be in [1,31]");
     }
+    // Under --variant-nodes, k-mers are confined to the kept variant runs. With zero flank a variant
+    // node shorter than k yields NO k-mers (no k-window fits), so the k-mer layer comes out empty for
+    // single short-variant bubbles. Default the flank to k-1 so junction-spanning k-mers are retained;
+    // an explicit --variant-flank-bp (including 0 for strict variant-only) always wins.
+    if (!options.variant_nodes_path.empty() && !variant_flank_set) {
+        options.variant_flank_bp = options.kmer_size - 1;
+    }
     if (options.feature_mode == DescribeFeatureMode::Syncmer) {
         const std::size_t syncmer_s =
             options.syncmer_s == 0 ? std::max<std::size_t>(1, std::min<std::size_t>(11, (options.kmer_size + 2) / 3))
@@ -202,6 +228,9 @@ int run_describe_command(const std::vector<std::string>& args) {
     }
     if (options.force_wide_matrix && !options.write_wide_matrix) {
         throw std::runtime_error("--force-wide and --no-wide-matrix cannot be used together");
+    }
+    if (!options.emit_kmers && !options.emit_graph) {
+        throw std::runtime_error("--only-kmers and --only-graph cannot be used together");
     }
 
     DescribeSummary summary;

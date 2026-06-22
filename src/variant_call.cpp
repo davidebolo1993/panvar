@@ -633,7 +633,6 @@ void call_variants(
         out << "##INFO=<ID=MERGE_JACCARD,Number=1,Type=Float,Description=\"Strongest node-set Jaccard that merged a member into this record (cross-haplotype merge evidence)\">\n";
         out << "##INFO=<ID=MERGE_SEQID,Number=1,Type=Float,Description=\"Strongest sequence identity that merged a member into this record, when the Jaccard gate did not decide it\">\n";
         out << "##INFO=<ID=MERGE_SIZE_RATIO,Number=1,Type=Float,Description=\"Smallest/largest member size among merged members (min,max also in SVLEN_RANGE)\">\n";
-        out << "##INFO=<ID=NS,Number=1,Type=Integer,Description=\"Haplotypes with data here (traverse the bubble)\">\n";
         out << "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele number = haplotypes traversing the bubble\">\n";
         out << "##INFO=<ID=AC,Number=1,Type=Integer,Description=\"Allele count = carrier haplotypes\">\n";
         out << "##INFO=<ID=AF,Number=1,Type=Float,Description=\"Allele frequency = AC/AN (over traversing haplotypes)\">\n";
@@ -1269,7 +1268,13 @@ void call_variants(
         // (REF + ALT1,ALT2,...), GT indexing the allele a sample carries. Skipped (falls back
         // to per-event records) when any allele exceeds --multiallelic-max-bp, so large SVs
         // keep their typed representation. Opt-in; default behavior unchanged.
-        if (options.multiallelic_loci) {
+        // A bubble that yielded a copy-number record (coverage CN, self-loop, or peak-multiplicity DUP)
+        // is left typed and NOT collapsed -- otherwise the multiallelic record would silently discard
+        // REF_CN/FORMAT:CN. So multiallelic applies only to pure DEL/INS/INV bubbles.
+        bool bubble_has_cn = coverage_fired;
+        for (const MergedRecord& mr : merged)
+            if (mr.seed.type == EvType::Dup) { bubble_has_cn = true; break; }
+        if (options.multiallelic_loci && !bubble_has_cn) {
             const auto sit = ref_node_pos.find(bubble.source);
             const auto snode = graph.nodes.find(bubble.source);
             auto interior_seq = [&](const std::vector<PathStep>& steps) -> std::string {
@@ -1350,6 +1355,7 @@ void call_variants(
                 rec.id = id; rec.line = row.str();
                 out_records.push_back(std::move(rec));
                 ++summary.records_written;
+                ++summary.multi;
                 return; // locus represented by the multiallelic record; skip per-event emission
             }
         }
@@ -1504,7 +1510,7 @@ void call_variants(
             info << ";BUBBLE_ID=" << bubble.id
                  << ";START_NODE=" << start_node << ";END_NODE=" << end_node
                  << ";NMERGED=" << carrier_set.size()
-                 << ";NS=" << an << ";AN=" << an << ";AC=" << ac;
+                 << ";AN=" << an << ";AC=" << ac;
             { char buf[32]; std::snprintf(buf, sizeof(buf), "%.4g", af); info << ";AF=" << buf; }
             info << ";EVENT_NODES=";
             for (std::size_t k = 0; k < ev_nodes.size(); ++k) { if (k) info << ','; info << ev_nodes[k]; }
@@ -1602,6 +1608,7 @@ void call_variants(
         summary.ins += bo.sum.ins;
         summary.inv += bo.sum.inv;
         summary.dup += bo.sum.dup;
+        summary.multi += bo.sum.multi;
         for (OutRecord& r : bo.records) out_records.push_back(std::move(r));
         for (std::string& s : bo.node_track) node_track_rows.push_back(std::move(s));
         for (std::string& s : bo.variant_nodes) variant_nodes_rows.push_back(std::move(s));
@@ -1750,7 +1757,8 @@ void call_variants(
                   << " with_calls=" << summary.bubbles_with_calls
                   << " records=" << summary.records_written
                   << " (DEL=" << summary.del << " INS=" << summary.ins
-                  << " INV=" << summary.inv << " DUP=" << summary.dup << ")\n";
+                  << " INV=" << summary.inv << " DUP=" << summary.dup
+                  << " MULTI=" << summary.multi << ")\n";
     }
 }
 

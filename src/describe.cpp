@@ -88,6 +88,7 @@ struct BubbleDescribeResult {
     bool graph_matrix_written = false;
     std::string graph_feature_map_path = ".";
     std::string graph_matrix_path = ".";
+    std::vector<std::string> traversing_paths;  // path names that traverse this bubble (for BIMBAM NA)
 };
 
 class GzipWriter {
@@ -1342,6 +1343,68 @@ void write_string_fsm(const std::string& path, const GraphPool& pool) {
     out.close();
 }
 
+std::string format_dosage(double d) {
+    if (d == std::floor(d) && std::fabs(d) < 1e15) {
+        return std::to_string(static_cast<long long>(d));
+    }
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.6g", d);
+    return buf;
+}
+
+// ---- BIMBAM mean-genotype dosage export (GEMMA / panvar associate) ------------------------------
+// One normalized row per feature; carriers hold per-path dosage (k-mer occurrence / node-edge
+// traversal count). The writer renders all cohort samples as columns: a carrier gets its dosage, a
+// sample that traverses the feature's bubble(s) but does not carry it gets 0, and a sample that does
+// NOT traverse any of the feature's bubbles gets NA (genuinely missing, distinct from absent).
+struct BimbamRow {
+    std::string id;                                   // decoded k-mer or node/edge id (globally unique)
+    std::string nodes;                                // provenance ("." for k-mers; the id itself for graph)
+    std::vector<std::size_t> bubbles;                 // bubble(s) the feature was discriminative in
+    std::unordered_map<std::string, double> carriers; // path -> dosage
+};
+
+void write_bimbam_rows(
+    const std::string& bimbam_path,
+    GzipWriter& annot,
+    const std::string& layer,
+    const std::vector<BimbamRow>& rows,
+    const std::vector<std::string>& sample_order,
+    const std::unordered_map<std::size_t, std::unordered_set<std::string>>& bubble_traversers) {
+
+    GzipWriter geno(bimbam_path);
+    for (const BimbamRow& row : rows) {
+        // annotation sidecar: feature_id, layer, encoding, bubbles, nodes
+        std::string a = tsv_sanitize(row.id);
+        a += '\t'; a += layer;
+        a += "\tcount\t";
+        for (std::size_t i = 0; i < row.bubbles.size(); ++i) { if (i) a += ';'; a += std::to_string(row.bubbles[i]); }
+        a += '\t'; a += row.nodes; a += '\n';
+        annot.write(a);
+
+        // BIMBAM mean-genotype line: id, allele1, allele2, dosages...  (missing = NA)
+        std::string line = tsv_sanitize(row.id);
+        line += ", A, B";
+        for (const std::string& s : sample_order) {
+            line += ", ";
+            const auto cit = row.carriers.find(s);
+            if (cit != row.carriers.end()) {
+                line += format_dosage(cit->second);
+            } else {
+                bool covered = false;
+                for (std::size_t b : row.bubbles) {
+                    const auto bt = bubble_traversers.find(b);
+                    if (bt != bubble_traversers.end() && bt->second.count(s)) { covered = true; break; }
+                }
+                line += covered ? "0" : "NA";
+            }
+        }
+        line += '\n';
+        geno.write(line);
+    }
+    geno.close();
+}
+
 BubbleDescribeResult describe_one_bubble(
     const DescribeOptions& options,
     const Graph& graph,
@@ -1382,67 +1445,81 @@ BubbleDescribeResult describe_one_bubble(
         result.graph_matrix_path = ".";
         return result;
     }
+    result.traversing_paths.reserve(paths.size());
+    for (const PathMeta& m : paths) result.traversing_paths.push_back(m.path_name);
 
-    const std::vector<std::uint64_t> features =
-        select_discriminative_features(stats, paths.size(), options.min_feature_paths);
-    result.features = features.size();
-    result.features_total = stats.size();
-    const auto feature_id_by_code = make_feature_id_map(features);
+    // ---- k-mer substrate (skipped under --only-graph) ----
+    if (options.emit_kmers) {
+        const std::vector<std::uint64_t> features =
+            select_discriminative_features(stats, paths.size(), options.min_feature_paths);
+        result.features = features.size();
+        result.features_total = stats.size();
+        const auto feature_id_by_code = make_feature_id_map(features);
 
-    std::vector<std::unordered_set<std::string>> feature_nodes(features.size() + 1);
-    write_sparse_jsonl(
-        result.counts_jsonl_path,
-        graph,
-        bubble,
-        path_indexes,
-        paths,
-        feature_id_by_code,
-        options,
-        feature_nodes,
-        variant_nodes);
-    write_feature_map(result.feature_map_path, features, stats, feature_nodes, options.kmer_size, paths.size());
+        std::vector<std::unordered_set<std::string>> feature_nodes(features.size() + 1);
+        write_sparse_jsonl(
+            result.counts_jsonl_path,
+            graph,
+            bubble,
+            path_indexes,
+            paths,
+            feature_id_by_code,
+            options,
+            feature_nodes,
+            variant_nodes);
+        write_feature_map(result.feature_map_path, features, stats, feature_nodes, options.kmer_size, paths.size());
 
-    if (pyseer_pool != nullptr) {
-        accumulate_pyseer_counts(graph, bubble, path_indexes, paths, features, options, variant_nodes, *pyseer_pool);
-    }
+        if (pyseer_pool != nullptr) {
+            accumulate_pyseer_counts(graph, bubble, path_indexes, paths, features, options, variant_nodes, *pyseer_pool);
+        }
 
-    const bool wide_allowed_by_cap =
-        options.max_wide_features == 0 || features.size() <= options.max_wide_features;
-    if (options.write_wide_matrix && (options.force_wide_matrix || wide_allowed_by_cap)) {
-        write_wide_matrix(result.matrix_path, graph, bubble, path_indexes, paths, features, options, variant_nodes);
-        result.matrix_written = true;
-        result.matrix_reason = "written";
-    } else if (!options.write_wide_matrix) {
-        result.matrix_path = ".";
-        result.matrix_reason = "skipped:disabled";
+        const bool wide_allowed_by_cap =
+            options.max_wide_features == 0 || features.size() <= options.max_wide_features;
+        if (options.write_wide_matrix && (options.force_wide_matrix || wide_allowed_by_cap)) {
+            write_wide_matrix(result.matrix_path, graph, bubble, path_indexes, paths, features, options, variant_nodes);
+            result.matrix_written = true;
+            result.matrix_reason = "written";
+        } else if (!options.write_wide_matrix) {
+            result.matrix_path = ".";
+            result.matrix_reason = "skipped:disabled";
+        } else {
+            result.matrix_path = ".";
+            result.matrix_reason = "skipped:feature-cap";
+        }
     } else {
+        result.feature_map_path = ".";
         result.matrix_path = ".";
-        result.matrix_reason = "skipped:feature-cap";
+        result.counts_jsonl_path = ".";
+        result.matrix_reason = "skipped:only-graph";
     }
 
-    // Node + edge dosage features (association substrate), keyed by the same
-    // graph coordinates as the k-mer node provenance.
-    std::map<std::string, GraphFeatureStat> node_stats;
-    std::map<std::string, GraphFeatureStat> edge_stats;
-    accumulate_graph_stats(graph, bubble, path_indexes, paths, node_stats, edge_stats);
-    const std::vector<std::string> node_features =
-        select_discriminative_graph_features(node_stats, paths.size(), options.min_feature_paths);
-    const std::vector<std::string> edge_features =
-        select_discriminative_graph_features(edge_stats, paths.size(), options.min_feature_paths);
-    result.node_features = node_features.size();
-    result.node_features_total = node_stats.size();
-    result.edge_features = edge_features.size();
-    result.edge_features_total = edge_stats.size();
-    if (graph_pool != nullptr) {
-        accumulate_graph_counts(graph, bubble, path_indexes, paths, node_features, edge_features, *graph_pool);
-    }
-    write_graph_feature_map(
-        result.graph_feature_map_path, node_features, edge_features, node_stats, edge_stats, paths.size());
-    if (options.write_wide_matrix) {
-        write_graph_matrix(
-            result.graph_matrix_path, graph, bubble, path_indexes, paths, node_features, edge_features);
-        result.graph_matrix_written = true;
+    // ---- node + edge dosage substrate (skipped under --only-kmers) ----
+    if (options.emit_graph) {
+        std::map<std::string, GraphFeatureStat> node_stats;
+        std::map<std::string, GraphFeatureStat> edge_stats;
+        accumulate_graph_stats(graph, bubble, path_indexes, paths, node_stats, edge_stats);
+        const std::vector<std::string> node_features =
+            select_discriminative_graph_features(node_stats, paths.size(), options.min_feature_paths);
+        const std::vector<std::string> edge_features =
+            select_discriminative_graph_features(edge_stats, paths.size(), options.min_feature_paths);
+        result.node_features = node_features.size();
+        result.node_features_total = node_stats.size();
+        result.edge_features = edge_features.size();
+        result.edge_features_total = edge_stats.size();
+        if (graph_pool != nullptr) {
+            accumulate_graph_counts(graph, bubble, path_indexes, paths, node_features, edge_features, *graph_pool);
+        }
+        write_graph_feature_map(
+            result.graph_feature_map_path, node_features, edge_features, node_stats, edge_stats, paths.size());
+        if (options.write_wide_matrix) {
+            write_graph_matrix(
+                result.graph_matrix_path, graph, bubble, path_indexes, paths, node_features, edge_features);
+            result.graph_matrix_written = true;
+        } else {
+            result.graph_matrix_path = ".";
+        }
     } else {
+        result.graph_feature_map_path = ".";
         result.graph_matrix_path = ".";
     }
 
@@ -1554,17 +1631,24 @@ void describe_kmers_from_graph(
     }
 
     PyseerPool pyseer_pool;
-    // Per-haplotype node/edge dosage, pooled across bubbles for the sample-level graph GWAS file.
-    // Only needed when --samples aggregation is requested.
+    // Per-haplotype node/edge dosage, pooled across bubbles for fsm_graph, BIMBAM, and --samples.
     GraphPool graph_pool;
-    const bool want_graph_pool = !options.samples_path.empty();
+    // Which pooled substrates to accumulate. fsm (pyseer) and BIMBAM both need the cohort pools.
+    const bool want_kmer_pool = options.emit_kmers && (options.pyseer || options.bimbam);
+    const bool want_graph_pool =
+        options.emit_graph && (options.pyseer || options.bimbam || !options.samples_path.empty());
+    const bool want_bimbam = options.bimbam && (options.emit_kmers || options.emit_graph);
+    // For BIMBAM NA: which bubble(s) a feature is discriminative in, and which paths traverse each bubble.
+    std::unordered_map<std::uint64_t, std::vector<std::size_t>> feature_bubbles_k;
+    std::unordered_map<std::string, std::vector<std::size_t>> feature_bubbles_g;
+    std::unordered_map<std::size_t, std::unordered_set<std::string>> bubble_traversers;
     cli::ProgressBar progress(options.quiet ? "" : "Describing bubbles", to_process.size());
 
     // Process bubbles in parallel: describe_one_bubble writes its own per-bubble files (independent
     // paths) and accumulates into THREAD-LOCAL pools here; the pools and the index rows are merged
     // back in bubble order on the main thread, so the output is byte-identical to a single-thread run.
     std::vector<BubbleDescribeResult> results(to_process.size());
-    std::vector<PyseerPool> task_pyseer(options.pyseer ? to_process.size() : 0);
+    std::vector<PyseerPool> task_pyseer(want_kmer_pool ? to_process.size() : 0);
     std::vector<GraphPool> task_graph(want_graph_pool ? to_process.size() : 0);
     run_parallel(to_process.size(), options.threads, [&](std::size_t bi) {
         const Bubble& bubble = *to_process[bi];
@@ -1574,23 +1658,29 @@ void describe_kmers_from_graph(
             if (it != variant_nodes_by_bubble.end()) vnodes = &it->second;
         }
         results[bi] = describe_one_bubble(options, graph, path_indexes, bubble, vnodes,
-                                          options.pyseer ? &task_pyseer[bi] : nullptr,
+                                          want_kmer_pool ? &task_pyseer[bi] : nullptr,
                                           want_graph_pool ? &task_graph[bi] : nullptr);
     });
 
     for (std::size_t bi = 0; bi < to_process.size(); ++bi) {
         const Bubble& bubble = *to_process[bi];
         progress.tick();
-        if (options.pyseer) {
+        if (want_bimbam && !results[bi].traversing_paths.empty()) {
+            auto& tset = bubble_traversers[bubble.id];
+            for (const std::string& p : results[bi].traversing_paths) tset.insert(p);
+        }
+        if (want_kmer_pool) {
             for (auto& [code, carriers] : task_pyseer[bi]) {
                 auto& dst = pyseer_pool[code];
                 for (const auto& [path, c] : carriers) dst[path] += c;
+                if (want_bimbam) feature_bubbles_k[code].push_back(bubble.id);
             }
         }
         if (want_graph_pool) {
             for (auto& [feature, carriers] : task_graph[bi]) {
                 auto& dst = graph_pool[feature];
                 for (const auto& [path, c] : carriers) dst[path] += c;
+                if (want_bimbam) feature_bubbles_g[feature].push_back(bubble.id);
             }
         }
         const BubbleDescribeResult& result = results[bi];
@@ -1638,10 +1728,62 @@ void describe_kmers_from_graph(
             << (result.graph_matrix_written ? "1" : "0") << '\n';
     }
 
-    if (options.pyseer) {
-        const std::string fsm_path = (out_dir / "fsm_kmers.txt.gz").string();
-        write_pyseer_fsm(fsm_path, pyseer_pool, options.kmer_size);
+    // Pooled pyseer fsm-lite (one per substrate, mirrored).
+    if (options.pyseer && options.emit_kmers) {
+        write_pyseer_fsm((out_dir / "fsm_kmers.txt.gz").string(), pyseer_pool, options.kmer_size);
         summary.files_written += 1;
+    }
+    if (options.pyseer && options.emit_graph) {
+        write_string_fsm((out_dir / "fsm_graph.txt.gz").string(), graph_pool);
+        summary.files_written += 1;
+    }
+
+    // Pooled BIMBAM mean-genotype dosage (canonical genotype export) + shared feature_annot + sample order.
+    if (want_bimbam) {
+        std::vector<std::string> sample_order;
+        sample_order.reserve(graph.paths.size());
+        for (const auto& p : graph.paths) sample_order.push_back(p.name);
+        {
+            GzipWriter sout((out_dir / "bimbam.samples.txt.gz").string());
+            for (const std::string& s : sample_order) { sout.write(s); sout.write("\n"); }
+            sout.close();
+        }
+        GzipWriter annot((out_dir / "feature_annot.tsv.gz").string());
+        annot.write("feature_id\tlayer\tencoding\tbubbles\tnodes\n");
+        if (options.emit_kmers) {
+            std::vector<BimbamRow> rows;
+            rows.reserve(pyseer_pool.size());
+            for (const auto& [code, carriers] : pyseer_pool) {
+                BimbamRow r;
+                r.id = decode_kmer(code, options.kmer_size);
+                r.nodes = ".";  // per-k-mer node provenance lives in the per-bubble kmer_features.tsv.gz
+                const auto fb = feature_bubbles_k.find(code);
+                if (fb != feature_bubbles_k.end()) r.bubbles = fb->second;
+                for (const auto& [path, c] : carriers) r.carriers[path] = static_cast<double>(c);
+                rows.push_back(std::move(r));
+            }
+            write_bimbam_rows((out_dir / "bimbam_kmers.bimbam.gz").string(), annot, "kmer",
+                              rows, sample_order, bubble_traversers);
+            summary.files_written += 1;
+        }
+        if (options.emit_graph) {
+            std::vector<BimbamRow> rows;
+            rows.reserve(graph_pool.size());
+            for (const auto& [feature, carriers] : graph_pool) {
+                BimbamRow r;
+                r.id = feature;
+                r.nodes = feature;  // node/edge id is its own provenance
+                const auto fb = feature_bubbles_g.find(feature);
+                if (fb != feature_bubbles_g.end()) r.bubbles = fb->second;
+                for (const auto& [path, c] : carriers) r.carriers[path] = static_cast<double>(c);
+                rows.push_back(std::move(r));
+            }
+            write_bimbam_rows((out_dir / "bimbam_graph.bimbam.gz").string(), annot, "graph",
+                              rows, sample_order, bubble_traversers);
+            summary.files_written += 1;
+        }
+        annot.close();
+        summary.files_written += 2;  // feature_annot + bimbam.samples
     }
 
     // --samples (cosigt): aggregate any per-haplotype pool into per-SAMPLE dosage by summing over
@@ -1653,6 +1795,7 @@ void describe_kmers_from_graph(
             throw std::runtime_error("Failed to open --samples file: " + options.samples_path);
         }
         std::unordered_map<std::string, std::vector<std::string>> path_to_samples;
+        std::vector<std::string> sample_order_s;  // sample (column) order for sample-level BIMBAM
         std::string line;
         bool first = true;
         std::size_t n_samples = 0;
@@ -1680,6 +1823,7 @@ void describe_kmers_from_graph(
             const std::string& sample = fields[0];
             if (sample.empty()) continue;
             ++n_samples;
+            sample_order_s.push_back(sample);
             for (std::size_t fi = 1; fi < fields.size(); ++fi) {
                 std::size_t s = 0;
                 const std::string& cell = fields[fi];
@@ -1727,6 +1871,68 @@ void describe_kmers_from_graph(
         summary.files_written += 1;
         if (!options.quiet) {
             std::cerr << "[describe] sample-level node/edge fsm: " << n_samples << " samples -> " << gfsm << "\n";
+        }
+
+        // Sample-level BIMBAM (diploid, summed dosage) -- the realistic per-sample genotype input to
+        // `panvar associate`. Coverage (for NA) is lifted from per-haplotype traversers to samples.
+        if (want_bimbam) {
+            std::unordered_map<std::size_t, std::unordered_set<std::string>> bubble_traversers_s;
+            for (const auto& [b, paths] : bubble_traversers) {
+                auto& dst = bubble_traversers_s[b];
+                for (const std::string& path : paths) {
+                    const auto it = path_to_samples.find(path);
+                    if (it == path_to_samples.end()) continue;
+                    for (const std::string& s : it->second) dst.insert(s);
+                }
+            }
+            {
+                GzipWriter sout((out_dir / "bimbam.samples.samples.txt.gz").string());
+                for (const std::string& s : sample_order_s) { sout.write(s); sout.write("\n"); }
+                sout.close();
+            }
+            GzipWriter annot((out_dir / "feature_annot.samples.tsv.gz").string());
+            annot.write("feature_id\tlayer\tencoding\tbubbles\tnodes\n");
+            if (options.emit_kmers && options.pyseer) {
+                PyseerPool sample_pool;
+                for (const auto& [code, carriers] : pyseer_pool) {
+                    auto& out = sample_pool[code];
+                    for (const auto& [path, count] : carriers) {
+                        const auto it = path_to_samples.find(path);
+                        if (it == path_to_samples.end()) continue;
+                        for (const std::string& s : it->second) out[s] += count;
+                    }
+                }
+                std::vector<BimbamRow> rows; rows.reserve(sample_pool.size());
+                for (const auto& [code, carriers] : sample_pool) {
+                    BimbamRow r; r.id = decode_kmer(code, options.kmer_size); r.nodes = ".";
+                    const auto fb = feature_bubbles_k.find(code);
+                    if (fb != feature_bubbles_k.end()) r.bubbles = fb->second;
+                    for (const auto& [s, c] : carriers) r.carriers[s] = static_cast<double>(c);
+                    rows.push_back(std::move(r));
+                }
+                write_bimbam_rows((out_dir / "bimbam_kmers.samples.bimbam.gz").string(), annot, "kmer",
+                                  rows, sample_order_s, bubble_traversers_s);
+                summary.files_written += 1;
+            }
+            if (options.emit_graph) {
+                std::vector<BimbamRow> rows; rows.reserve(graph_sample_pool.size());
+                for (const auto& [feature, carriers] : graph_sample_pool) {
+                    BimbamRow r; r.id = feature; r.nodes = feature;
+                    const auto fb = feature_bubbles_g.find(feature);
+                    if (fb != feature_bubbles_g.end()) r.bubbles = fb->second;
+                    for (const auto& [s, c] : carriers) r.carriers[s] = static_cast<double>(c);
+                    rows.push_back(std::move(r));
+                }
+                write_bimbam_rows((out_dir / "bimbam_graph.samples.bimbam.gz").string(), annot, "graph",
+                                  rows, sample_order_s, bubble_traversers_s);
+                summary.files_written += 1;
+            }
+            annot.close();
+            summary.files_written += 2;
+            if (!options.quiet) {
+                std::cerr << "[describe] sample-level BIMBAM: " << sample_order_s.size()
+                          << " samples -> " << out_dir.string() << "/bimbam_*.samples.bimbam.gz\n";
+            }
         }
     }
 

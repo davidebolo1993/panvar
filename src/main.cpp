@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 
+#include "panvar/associate_command.hpp"
 #include "panvar/bubble_command.hpp"
 #include "panvar/call_command.hpp"
 #include "panvar/cli_utils.hpp"
@@ -44,6 +45,9 @@ int main(int argc, char** argv) {
         }
         if (subcommand == "panphorte") {
             return panvar::run_panphorte_command(args);
+        }
+        if (subcommand == "associate") {
+            return panvar::run_associate_command(args);
         }
 
         throw std::runtime_error("Unknown subcommand: " + subcommand);

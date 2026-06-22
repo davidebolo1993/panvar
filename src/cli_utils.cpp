@@ -89,6 +89,7 @@ void print_general_help() {
         << "  panphorte  Module 2: normalize tandem-repeat bubbles into a compact GFA\n"
         << "  call       Module 3: graph-native structural variant calling\n"
         << "  describe   Module 4: per-bubble k-mer feature description\n"
+        << "  associate  Module 5: GWAS on describe genotypes vs a phenotype/covariate table\n"
         << "  inspect    Utility: inspect path walks through one or all called bubbles\n\n"
         << "Run 'panvar <subcommand> --help' for options.\n";
 }

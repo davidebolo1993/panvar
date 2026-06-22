@@ -249,7 +249,8 @@ int run_call_command(const std::vector<std::string>& args) {
         << "Bubbles with calls: " << summary.bubbles_with_calls << "\n"
         << "VCF records: " << summary.records_written << "\n"
         << "  DEL: " << summary.del << "  INS: " << summary.ins
-        << "  INV: " << summary.inv << "  DUP: " << summary.dup << "\n"
+        << "  INV: " << summary.inv << "  DUP: " << summary.dup
+        << "  MULTI: " << summary.multi << "\n"
         << "Region VCF: " << options.out_prefix << ".region.vcf\n";
     if (options.write_per_bubble_vcf) {
         std::cout << "Per-bubble VCFs: " << options.out_prefix << ".bubble_<id>.vcf\n";

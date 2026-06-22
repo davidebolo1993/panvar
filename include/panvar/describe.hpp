@@ -32,7 +32,14 @@ struct DescribeOptions {
     bool force_wide_matrix = false;
     bool write_wide_matrix = true;
     // Pooled fsm-lite k-mer file (pyseer --kmers) at <out_dir>/fsm_kmers.txt.gz. On by default.
+    // With pyseer on, a mirrored haplotype-level <out_dir>/fsm_graph.txt.gz is also written.
     bool pyseer = true;
+    // Pooled BIMBAM mean-genotype dosage (GEMMA / panvar associate) at <out_dir>/bimbam_{kmers,graph}.bimbam.gz
+    // plus <out_dir>/feature_annot.tsv.gz. The canonical genotype export. On by default.
+    bool bimbam = true;
+    // Layer selection. Both on by default; --only-kmers / --only-graph restrict to one substrate.
+    bool emit_kmers = true;
+    bool emit_graph = true;
     // Restrict k-mer/syncmer generation to called-variation nodes: a call
     // <prefix>.variant_nodes.tsv. When set, only bubbles in the file are processed and only
     // their variant nodes contribute k-mers. Empty = whole-bubble behavior.

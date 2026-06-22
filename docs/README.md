@@ -11,8 +11,10 @@ This directory contains module-focused documentation for the `panvar` CLI.
 3. `docs/modules/call.md`
    Module 3 (`panvar call`): graph-native structural variant calling (DEL/INS/INV/DUP) into a multi-sample VCF
 4. `docs/modules/describe.md`
-   Module 4 (`panvar describe`): per-bubble k-mer feature tables / sample-level GWAS inputs
-5. `docs/modules/inspect.md`
+   Module 4 (`panvar describe`): per-bubble k-mer / node-edge feature tables + BIMBAM dosage genotype exports
+5. `docs/modules/associate.md`
+   Module 5 (`panvar associate`): GWAS on the describe genotypes vs a phenotype/covariate table (GLM, MAF filter, region-wide multiple-testing correction)
+6. `docs/modules/inspect.md`
    Utility (`panvar inspect`): clustering, path FASTA and node/edge traversal matrices for one or all called bubbles
 
 
@@ -78,8 +80,9 @@ skipped. When supplied:
   copy-number table `<prefix>.dup_gene_cn.tsv` that **separates** paralogs the graph folds together
   (reliable rows, e.g. CYP2D6 vs CYP2D7/2D8P) and honestly **collapses** near-identical ones it can't
   resolve (unreliable rows with the module total, e.g. C4A;C4B). See [modules/call.md](modules/call.md).
-- the GWAS traceback (`scripts/gwas_demo.py --node-genes <call.node_genes.tsv>`) names the gene behind an
-  association. `describe` itself is k-mer based and does **not** consume the GTF.
+- `node_genes.tsv` is the node→gene bridge for the GWAS traceback: join it on the `nodes` column of
+  `associate`'s output to name the gene behind a hit. `describe` itself is k-mer based and does **not**
+  consume the GTF.
 
 ## Doc Structure Convention
 

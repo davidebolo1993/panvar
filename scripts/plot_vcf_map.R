@@ -9,7 +9,7 @@
 #
 # Cell colors:
 #   grey   = reference-like (haplotype does not carry this variant)
-#   DEL red / INS-NOVEL green / INS-DUP purple / INV orange / multiallelic teal (allele index)
+#   DEL red / INS-NOVEL green / INS-DUP purple / INV orange / multiallelic yellow-amber (allele index)
 #   DUP blue, shaded by the haplotype's ABSOLUTE copy number (VCF FORMAT:CN) for EVERY haplotype
 #       (loss = light, reference = mid, gain = dark), so the DUP column reads as a CN gradient
 #
@@ -217,7 +217,9 @@ if (!is.null(opts$cluster_by)) {
 COL <- c(ref = "#e8e8e8", DEL = "#cb181d", INV = "#f16913",
          INS_NOVEL = "#238b45", INS_DUP = "#6a51a3")
 dup_ramp <- grDevices::colorRampPalette(c("#c6dbef", "#08306b"))
-multi_ramp <- grDevices::colorRampPalette(c("#a6e3d7", "#00665a"))
+# multiallelic: yellow->amber ramp (shaded by allele index), kept clearly distinct from the DUP blue
+# ramp and the INS green/purple so a multiallelic column does not read like a DUP/INS column.
+multi_ramp <- grDevices::colorRampPalette(c("#fff7bc", "#b8860b"))
 cell_color <- function(cat, v) {
   if (cat == "DUP") { vv <- if (is.na(v) || v < 1) 1 else v; return(dup_ramp(max(2, dup_max))[min(vv, dup_max)]) }
   if (cat == "MULTI") { vv <- if (is.na(v) || v < 1) 1 else v; return(multi_ramp(max(2, multi_max))[min(vv, multi_max)]) }

@@ -47,113 +47,103 @@ Three consequences worth internalizing:
 
 - **It is variant-level, not whole-haplotype.** Every feature points back to a bubble/variant; we never test "the whole haplotype" as one blob.
 - **Testing is reference-free.** counts exist for every haplotype whether or not the reference traverses that sequence. A sample whose haplotypes carry a bubble **not spanned by the reference** is still genotyped and tested.
-- **The reference is only for plotting.** A Manhattan needs an x-axis. panvar offers two (`plot_gwas.R --x ref|nodes`): reference bp (familiar; novel insertions plot at their bubble anchor) or **graph/node order** (pangenome-native; places *every* variant, including reference-disjoint ones).
+- **The reference is only for plotting.** A Manhattan needs an x-axis; `plot_associate.R` uses **graph/node order** (pangenome-native, places *every* variant including reference-disjoint ones), with position-less k-mers parked at the left.
 
 ## 3. Why multiplicity (counts), not just presence/absence
 
 A **presence/absence** association asks only "does this sample contain the feature (yes/no)". That works for
 SNP- and indel-like variants. It **fails for CNVs** like KIV-2: the repeat-unit feature is present in
 *everyone* (CN ≥ 1), so presence/absence has **no contrast** (frequency = 1) and the variant is filtered out
-before testing. The information is entirely in the **count**. panvar's sample-level files carry the true
-per-sample count, so a **count-based** test recovers KIV-2 while a **presence/absence-based** test cannot.
-The example below demonstrates exactly this contrast — on both feature substrates.
+before testing. The information is entirely in the **count**. panvar carries the true per-sample dosage
+through to the genotype, so a **dosage** test recovers KIV-2 that a presence/absence test cannot.
 
-> **Harness.** `scripts/gwas_demo.py` is a small, transparent **scipy** harness that runs *both* a
-> presence/absence test and a count test on the same file, so the comparison is apples-to-apples and
-> reproducible. It stands in for any count-based or presence/absence-based association method; `panvar`
-> emits the standard fsm-lite file (`<feature> | sample:count`) that such tools also read, and does not run
-> the association itself.
+> **Engine.** `panvar associate` ([associate](modules/associate.md)) tests the **dosage** directly
+> (`phenotype ~ genotype + covariates`), so copy-number loci are first-class. The same genotypes are also
+> exported as **BIMBAM** (GEMMA-ready) and **fsm-lite** (pyseer) by `describe`, so an external count- or
+> presence/absence-based tool can be used instead if desired.
 
 ## 4. The pipeline
 
 The post-`panphorte` modules consume the **panphorte-normalized/sorted graph** and the **panphorte** prefix.
 
 - **`describe --samples <cosigt.tsv>`** (one sample per line: `sample <tab> hap1 <tab> hap2 …`; haplotype
-  names must match graph path names) writes a **sample-level file for each substrate** —
-  `fsm_kmers.samples.txt.gz` (k-mers) and `fsm_graph.samples.txt.gz` (node/edge) — whose value is the summed
-  dosage over the sample's assigned haplotypes (a haplotype listed twice → counted twice = homozygous). See
-  [describe](modules/describe.md).
-- **`scripts/gwas_demo.py`** reads an fsm file + a phenotype table and runs, per feature, a
-  **presence/absence** test (binarize count>0) and a **count** test (use the dosage). `--substrate kmer|graph`
-  selects which sample-level file to test; `--mode continuous|binary` selects the trait coding. It writes
-  `*.assoc.tsv` with `pa_q` and `count_q`, plus per-feature `pos` (reference), `node_min` (graph order),
-  `nodes`, and the traced `variant`.
-- **`scripts/plot_gwas.R`** draws the two-panel Manhattan and the QQ (with λ), on either axis.
+  names must match graph path names) writes, per substrate, a **per-sample BIMBAM dosage** matrix —
+  `bimbam_kmers.samples.bimbam.gz` (k-mers) and `bimbam_graph.samples.bimbam.gz` (node/edge) — whose value
+  is the summed dosage over the sample's assigned haplotypes (a haplotype listed twice → counted twice =
+  homozygous), with `bimbam.samples.samples.txt.gz` (column order) and `feature_annot.samples.tsv.gz`
+  (layer/bubbles/nodes). See [describe](modules/describe.md).
+- **`panvar associate`** ([associate](modules/associate.md)) fits `phenotype ~ genotype + covariates` per
+  feature (linear for a quantitative trait, logistic for a binary one), filters features by **minor
+  (non-modal) genotype frequency** computed on the actual cohort, and corrects for multiple testing
+  **over the features actually tested** (region-wide Bonferroni `0.05/n_tests` + Benjamini-Hochberg FDR).
+- **`scripts/plot_associate.R`** draws the Manhattan (−log10 p along graph order, with the nominal and
+  Bonferroni threshold lines, FDR points highlighted — i.e. before/after correction in one figure) and the
+  QQ with the genomic-inflation λ.
 
-## 5. Example — real LPA graph, literature-based phenotype
+## 5. Example — real LPA graph, literature-based phenotype + covariates
 
 `tests/gwas/make_lpa_phenotype.py` reads each **real** LPA haplotype's KIV-2 copy number from `panphorte`
-(`copies.tsv`; the demo finds the KIV-2 unit = 5,547 bp, copies **6–32** across 465 haplotypes), pairs real
-haplotypes into 200 synthetic diploid individuals, and assigns `Lp(a) = base − slope·(CN_A+CN_B) + noise`
-(synthetic values, literature-plausible **inverse** effect; case/control by median split). One driver runs
-the whole thing across **both substrates** and **both trait codings**:
+(`copies.tsv`; KIV-2 unit ≈ 5.5 kb, copies **1–32** across 466 haplotypes), pairs real haplotypes into 200
+synthetic diploid individuals, and assigns `Lp(a) = base − slope·(CN_A+CN_B) + age/sex effects + noise`
+(synthetic values, literature-plausible **inverse** KIV-2 effect; case/control by median split). It also
+emits **covariates** (`Age, Sex, PC1–PC3`) and sets ~5% of phenotypes to `NA` to exercise the filters. One
+driver runs the whole thing across **both substrates** and **both trait codings**:
 
 ```bash
-# python3 needs numpy+scipy; Rscript needs ggplot2 (conda activate base). Also run by scripts/regen_results.sh.
+# Rscript needs ggplot2 (conda activate base). Also run by scripts/regen_results.sh.
 bash tests/gwas/run_lpa_real.sh build/panvar results/real_data/lpa/gwas python3 Rscript
 ```
 
-It runs `bubble → panphorte → call → describe --samples → gwas_demo.py → plot_gwas.R` and a self-check.
-Observed (continuous trait):
+It runs `bubble → panphorte → call → describe --samples → panvar associate → plot_associate.R` and a
+self-check. Observed top hits (193 of 200 samples used; 7 NA phenotypes dropped; 5 covariates):
 
-```
-gwas_kmer_continuous.assoc.tsv    top variant=bubble7_DUP_4790(DUP) count_q=1.4e-29 pa_q=1.0e+00  present-in-all & count-only-sig=921  -> PASS
-gwas_graph_continuous.assoc.tsv   top variant=bubble7_DUP_4790(DUP) count_q=1.5e-26 pa_q=1.0e+00  present-in-all & count-only-sig=16   -> PASS
-```
+| run | top feature | bubble | effect | p | p_bonf |
+|-----|-------------|--------|--------|---|--------|
+| graph / quant   | `4789+>4789+` (KIV-2 self-loop) | 7 | β = **−2.18** | 1.5e-52 | 2.6e-49 |
+| kmers / quant   | a KIV-2 k-mer | 7 | β = **−2.18** | 5.4e-53 | 1.1e-49 |
+| graph / binary  | node `4789` | 7 | log OR = **−0.27** | 1.9e-11 | 3.3e-08 |
+| kmers / binary  | a KIV-2 k-mer | 7 | log OR = **−0.26** | 1.7e-11 | 3.3e-08 |
 
-Both substrates land on the same locus — the called KIV-2 **`DUP`** (`bubble7_DUP_4790`) — through the
-**count** test, while the **presence/absence** test finds nothing there (`pa_q = 1.0`):
+Every run lands on the called KIV-2 locus (**bubble 7**) with the correct **negative** effect (more KIV-2
+→ lower Lp(a)), far past the region-wide Bonferroni line:
 
-- **k-mers** spread the signal across hundreds of repeat-unit markers (≈ 920 present-in-all k-mers that are
-  count-significant but presence/absence-blind);
-- **node/edge dosage** localizes it to a handful of features — the repeat node `4790` and its self-loop edge
-  `4790+>4790+` — the most direct graph read of copy number.
+- **node/edge dosage** localizes the signal to the repeat node `4789` and its **self-loop edge**
+  `4789+>4789+` — the most direct graph read of copy number;
+- **k-mers** carry the same signal across the repeat-unit markers.
 
-The binary trait behaves the same way (e.g. k-mer `count_q ≈ 1.3e-12`, `pa_q = 1.0`).
+The MAF filter (`--min-maf 0.02`) drops the cohort-invariant features (e.g. 1413 of 3180 graph features),
+and the Manhattan/QQ show a clean peak with λ near 1.
 
-To compare substrates and traits at a glance, `plot_gwas_compare.R` draws one faceted figure per
-substrate — columns = trait (continuous, binary), rows = test (count vs presence/absence) — so a taller
-peak means a stronger association. The KIV-2 copy-number signal is tall in the **count** row and flat in
-**presence/absence**, and continuous beats binary.
-
-k-mer substrate (the count signal spreads across many repeat-unit markers):
-
-![LPA k-mer GWAS comparison](../results/real_data/lpa/gwas/gwas_kmer_compare.png)
-
-node/edge dosage substrate (the same signal localizes to the repeat node and its self-loop edge):
-
-![LPA node/edge GWAS comparison](../results/real_data/lpa/gwas/gwas_graph_compare.png)
-
-(`plot_gwas.R` still writes the per-run two-panel Manhattan + QQ with the genomic-inflation λ.)
+![LPA Lp(a) ~ graph dosage Manhattan](../results/real_data/lpa/gwas/assoc_graph_quant.manhattan.png)
 
 ## 6. Reading the outputs
 
-- **`*.assoc.tsv`** — one row per tested feature: `kmer, bubble_id, pos, node_min, nodes, variant,
-  n_carriers, max_count, pa_p, count_p, pa_bonf, count_bonf, pa_q, count_q` (the first column holds the
-  k-mer sequence or, for `--substrate graph`, the node id / edge key), plus a trailing **`genes`** column
-  when `gwas_demo.py --node-genes <call.node_genes.tsv>` is given (the gene[s] the feature's nodes fall in,
-  from `call --gtf`). Sort by `count_q` for the count GWAS, `pa_q` for presence/absence.
-- **Traceback** — the `variant` column maps each significant feature back through its `nodes` to the
-  `call` variant (here the KIV-2 `DUP`), and the `genes` column names the gene it sits in (`LPA`), so a hit
-  reads as a biological variant in a named gene, not just a sequence.
-- **Manhattan / QQ** — `*.manhattan.{png,pdf}` (P/A vs count panels) and `*.qq.{png,pdf}` (λ per method).
+- **`assoc_<sub>_<mode>.assoc.tsv`** — one row per tested feature, sorted by `p`:
+  `feature_id, layer, bubbles, nodes, n, minor_freq, beta|log_or, se, z, p, p_bonf, q_bh`. `feature_id` is
+  the k-mer sequence (k-mer substrate) or the node id / edge key (graph substrate); `bubbles`/`nodes` give
+  the graph provenance (from `feature_annot`), so a hit traces back through `call`'s `variant_nodes.tsv` to
+  the KIV-2 `DUP` and, with `call --gtf`, to the `LPA` gene.
+- **`assoc_<sub>_<mode>.summary.tsv`** — model, samples used, `features_tested`, `dropped_min_maf`, the
+  `bonferroni_threshold` (`0.05/n_tests`), and significant counts (Bonferroni and FDR<0.05).
+- **Manhattan / QQ** — `*.manhattan.{png,pdf}` (raw −log10 p with the nominal `0.05` and Bonferroni lines;
+  FDR<0.05 / Bonferroni points highlighted) and `*.qq.{png,pdf}` (genomic-inflation λ).
 
 ## 7. Caveats (honest limits)
 
-- The phenotypes here are **simulated** from the genotype (a literature-plausible inverse KIV-2→Lp(a)
-  effect, Gaussian noise, binary trait by median split). This demonstrates *recovery of a planted signal*,
-  **not** a real Lp(a) study.
-- The simulation has **no covariates** and the harness uses **fixed-effect, single-predictor** tests with
-  **no covariate or population-structure correction**. Real studies add covariates (age, sex, …) and a
-  kinship/PC or mixed-model correction (watch the QQ λ). `gwas_demo.py` is a transparent illustration, not a
-  production GWAS engine.
+- The phenotypes here are **simulated** from the genotype (inverse KIV-2→Lp(a) effect + small age/sex
+  effects + Gaussian noise; binary trait by median split). This demonstrates *recovery of a planted
+  signal*, **not** a real Lp(a) study; the PCs are random, not real ancestry components.
+- `associate` uses a **fixed-effect GLM with covariates**. It does **not** yet model relatedness /
+  population structure with a kinship matrix or mixed model (watch the QQ λ); an **LMM backend** is the
+  planned next step. Multiple-testing is **region-wide** (Bonferroni over the tested features + BH FDR),
+  which is the right scale here — and conservative, since correlated k-mers over-count the independent tests.
 - Markers are **bubble-local**, and that is all the association needs: the per-sample dosage is read from
   the known graph traversal (`cosigt` assigns the haplotypes; provenance is recorded), so genome-wide
-  uniqueness is irrelevant here — it would only matter if you instead screened raw sequencing reads with
-  these features, which this pipeline does not do.
+  uniqueness is irrelevant here — it would only matter if you screened raw reads with these features.
 - Counts are the *graph-derived* per-haplotype multiplicity; with real reads you would carry read-depth
   uncertainty from `cosigt` into the dosage.
 
 ## See also
-- [describe](modules/describe.md) — the sample-level files and `--samples` / `--variant-nodes` / `--variant-flank-bp` options.
-- [call](modules/call.md) — `node_track.tsv` / `variant_nodes.tsv` used for position and traceback.
+- [associate](modules/associate.md) — the GWAS engine, inputs, multiple-testing, and outputs.
+- [describe](modules/describe.md) — the BIMBAM exports, `--samples` / `--variant-nodes` / `--variant-flank-bp`.
+- [call](modules/call.md) — `node_track.tsv` / `variant_nodes.tsv` used for provenance/traceback.

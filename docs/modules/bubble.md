@@ -11,7 +11,7 @@ CLI entrypoint:
 `bubble` turns a pangenome graph (GFA) into `panvar` bubble sites for downstream modules. By default it:
 
 1. sorts + flips the graph along the reference internally
-2. finds **snarls** internally with a vendored cactus / 3-edge-connected decomposition (matches closely `vg snarls`; see [Backround](#snarls-vs-superbubbles-background))
+2. finds **snarls** internally with a vendored cactus / 3-edge-connected decomposition (matches closely `vg snarls`; see [Background](#snarls-vs-superbubbles-background))
 3. infers bubble-internal nodes from path intervals between each snarl's source/sink
 4. computes path support and internal sequence span per candidate
 5. applies base site filters (`--min-variant-bp`, `--min-path-support`)
@@ -21,19 +21,16 @@ CLI entrypoint:
 ## Required inputs
 
 1. `--gfa <graph.gfa>` (any GFA)
-2. `--reference-path <name>` — reference path name or unique case-insensitive substring, used to order the internal sort/flip and snarl finder (not needed if you pass `--snarls-in`).
+2. `--reference-path <name>` — reference path name or unique case-insensitive substring, used to order the internal sort/flip and snarl finder (not needed when passing `--snarls-in`).
 
 ## Outputs
 
 - `*.bubbles.csv`: refined bubble/site table used by downstream modules (`inspect`, `panphorte`)
 - `*.sorted.gfa`: the reference-sorted/-flipped graph to be used as input for downstream `panphorte`
 - `*.bandage_nodes.csv`: node colors for Bandage visualization
-- optional `--gtf <path>`: with a **PanSN** reference path, projects genes from a reference-coordinate
-  GTF onto the reference nodes and writes `*.bandage_genes.csv` (`Name,Colour,Gene`) to highlight genes
-  per bubble in Bandage. Long non-coding RNAs are skipped. (Convert non-PanSN graphs first with
-  `scripts/pansn_rename.py`.)
+- optional `--gtf <path>`: with a **PanSN** reference path, projects genes from a reference-coordinate GTF onto the reference nodes and writes `*.bandage_genes.csv` (`Name,Colour,Gene`) to highlight genes per bubble in Bandage.
 - optional `--snarl-debug-tsv <path>`: candidate-level diagnostics
-- optional `--emit-snarls-jsonl <path>`: the internal snarls in vg-style JSONL
+- optional `--emit-snarls-jsonl <path>`: the internal snarls in `vg`-style JSONL
 
 Output directories are auto-created when missing.
 
@@ -52,28 +49,13 @@ When run with `--snarls-in <snarls.jsonl>` (from `vg snarls -A integrated <graph
 
 `bubble` consumes **snarls** by default, not superbubbles.
 
-A **superbubble** is a single-source / single-sink subgraph that is **directed and acyclic**: every internal node is reachable from the source and reaches the sink, and the only way in or out is through the two boundaries. By construction it **cannot** contain a cycle or an inversion. A **snarl** (*i.e.* what `vg snarls` emits) is the more general structure: a pair of boundary nodes whose removal
-separates an internal subgraph from the rest, defined on the **bidirected** graph. Snarls therefore capture the **inversions, tandem cycles, and tangles** that a superbubble cannot, and they **nest**; their acyclic subclass — "ultrabubbles" — is essentially the superbubble. `panvar` uses snarls because the pangenome variation this toolkit targets (including inversions and tandem expansions) often lives in the cyclic or inverted sites that superbubbles omit.
-
-Internally, `panvar` reproduces `vg snarls` by mirroring vg's cactus/ 3-edge-connected decomposition, so the default top-level snarl set matches vg; passing `--superbubbles` instead emits only the acyclic superbubble subset. This acyclic subset is the same superbubble concept used by tools like 
-[BubbleGun](https://doi.org/10.1093/bioinformatics/btac448), whose detector finds superbubbles directly, via the Onodera algorithm (BubbleGun additionally *sub-labels* its superbubbles into "simple bubbles", "insertions", and "super" — so its narrow "super" excludes simple/insertion sites, whereas panvar's `--superbubbles` keeps **all** of them).
-
-A snarl is a property of the graph **topology**, so it is computed independently of the paths: it is bounded by two nodes (`source`, `sink`), and a haplotype only "supports" it when its walk visits **both** boundaries. In a pangenome some haplotypes may not, because:
-
-- a haplotype may take a route that **bypasses a boundary** (for example a large deletion that removes the boundary region, or an alternative local structure);
-- an assembly may be **fragmented or partial** and simply not span the locus;
-- with nested snarls, a path can cross the parent yet take a branch that **skips a child** snarl.
-
+A **superbubble** is a single-source/single-sink subgraph that is **directed and acyclic**: every internal node is reachable from the source and reaches the sink, and the only way in or out is through the two boundaries. By construction it **cannot** contain a cycle or an inversion. A **snarl** (*i.e.* what `vg snarls` emits) is the more general structure: a pair of boundary nodes whose removal separates an internal subgraph from the rest, defined on the **bidirected** graph. Snarls therefore capture the **inversions, tandem cycles, and tangles** that a superbubble cannot, and they **nest**; their acyclic subclass — "ultrabubbles" — is essentially the superbubble. `panvar` uses snarls because the pangenome variation this toolkit targets (including inversions and tandem expansions) often lives in the cyclic or inverted sites that superbubbles omit. Internally, `panvar bubble` reproduces `vg snarls` by mirroring `vg`'s cactus/ 3-edge-connected decomposition, so the default top-level snarl set matches `vg`; passing `--superbubbles` instead emits only the acyclic superbubble subset. This acyclic subset is the same superbubble concept used by tools like [BubbleGun](https://doi.org/10.1093/bioinformatics/btac448), whose detector finds superbubbles directly, via the Onodera algorithm (BubbleGun additionally *sub-labels* its superbubbles into "simple bubbles", "insertions", and "super" — so its narrow "super" excludes simple/insertion sites, whereas panvar's `--superbubbles` keeps **all** of them).
 
 **References.**
 
 - Onodera, Sadakane, Shibuya. *Detecting Superbubbles in Assembly Graphs.* WABI 2013.
-  (the superbubble concept)
-- Paten, Eizenga, Rosen, Novak, Garrison, Hickey. *Superbubbles, Ultrabubbles, and Cacti.*
-  J. Comput. Biol. 25(7):649–663, 2018. <https://doi.org/10.1089/cmb.2017.0251>
-  (snarls / ultrabubbles / the cactus decomposition behind `vg snarls` and panvar's finder)
-- Dabbaghie, Ebler, Marschall. *BubbleGun: enumerating bubbles and superbubbles in genome graphs.*
-  Bioinformatics 38(17):4217–4219, 2022. <https://doi.org/10.1093/bioinformatics/btac448>
+- Paten, Eizenga, Rosen, Novak, Garrison, Hickey. *Superbubbles, Ultrabubbles, and Cacti.* J. Comput. Biol. 25(7):649–663, 2018. <https://doi.org/10.1089/cmb.2017.0251>
+- Dabbaghie, Ebler, Marschall. *BubbleGun: enumerating bubbles and superbubbles in genome graphs.* Bioinformatics 38(17):4217–4219, 2022. <https://doi.org/10.1093/bioinformatics/btac448>
 
 
 ## Algorithm overview
@@ -115,22 +97,17 @@ For each top-level snarl candidate:
 panvar bubble -i <graph.gfa> -r <name> [-o <prefix>] [--superbubbles] [options]
 ```
 
-- `-i, --gfa <path>` — input GFA (required)
-- `-r, --reference-path <name>` — reference for the internal sort/flip + snarl finder (required unless
-  `--snarls-in`)
 - `-o, --out-prefix <prefix>` — output prefix (default `bubble_calls`)
 - `-s, --superbubbles` — emit only acyclic superbubbles instead of all snarls
 - `--no-flip` — skip reorienting nodes to the reference forward strand (still sorts)
 - `--sorted-gfa-out <path>` — where to write the sorted GFA (default `<prefix>.sorted.gfa`)
-- `--emit-snarls-jsonl <path>` — also write the internal snarls as vg-style JSONL
+- `--emit-snarls-jsonl <path>` — also write the internal snarls as `vg`-style JSONL
 - `--snarls-in <path>` — legacy override: use an external `vg snarls` JSONL (graph used as-is, no sort)
 - `--min-variant-bp <N>`
 - `--min-path-support <N>`
 - `--merge-nearby-bp <N>`
 - `--snarl-debug-tsv <path>`
-- `--gtf <path>` — reference-coordinate GTF; with a **PanSN** `--reference-path`, project its genes onto
-  the reference nodes and write `<prefix>.bandage_genes.csv` (`Name,Colour,Gene`) for Bandage. lncRNAs
-  are skipped; non-PanSN graphs must be converted first with `scripts/pansn_rename.py`. See [Outputs](#outputs).
+- `--gtf <path>` — reference-coordinate GTF; with a **PanSN** `--reference-path`, project its genes onto the reference nodes and write `<prefix>.bandage_genes.csv` (`Name,Colour,Gene`) for Bandage. See [Outputs](#outputs).
 - `-q, --quiet` — disable the progress bar
 
 ## Bubble CSV Columns
@@ -146,7 +123,6 @@ Current schema:
 - `min_inside_bp`
 - `max_inside_bp`
 - `inside_nodes`
-
 
 Two extra per-bubble metrics are also computed — they drive the `--min-variant-bp` filter and are surfaced in the optional debug TSV:
 
@@ -167,22 +143,24 @@ When `--snarl-debug-tsv` is enabled, each snarl candidate becomes one row:
 
 Final bubbles produced by `--merge-nearby-bp` have no original candidate row, so one extra `accepted=1` row is appended for each.
 
+## Bandage Bubble Colors
+
+Bandage node colors for the called bubbles provide context and retained calls:
+
+- blue: nodes in non-SNP candidate bubbles (pre-filter context)
+- red: nodes in retained output bubbles (`*.bubbles.csv`)
+
 ## Example
 
 ```bash
 ./build/panvar bubble \
   -i tests/real_data/lpa.gfa.gz \
   -o results/real_data/lpa/bubble/bubble \
-  --reference-path grch38_1
+  --reference-path grch38#1
 
 #or override with an external vg snarls file
-./build/panvar bubble -i tests/real_data/lpa.gfa.gz -o results/real_data/lpa/bubble/bubble --snarls-in tests/real_data/c4.snarls.jsonl
+./build/panvar bubble \
+  -i tests/real_data/lpa.gfa.gz \
+  -o results/real_data/lpa/bubble/bubble \
+  --snarls-in tests/real_data/lpa.snarls.jsonl
 ```
-
-## Bandage Colors
-
-Bandage node colors provide context and retained calls:
-
-- blue: nodes in non-SNP candidate bubbles (pre-filter context)
-- red: nodes in retained output bubbles (`*.bubbles.csv`)
-
