@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# LPA (KIV-2) driver: tandem repeat, called on the panphorte graph with --cn-from-multiplicity.
+# LPA (KIV-2) driver: tandem repeat, called on the panphorte graph. CN comes from the always-on REP
+# self-loop; --cn-from-multiplicity is passed only as a fallback for any bubble that did not fold.
 # Runs the data pipeline then the GWAS (cohort sim -> describe --samples -> associate, region scan +
 # structure demo). Needs a numpy-capable python.
 #   PYTHON=~/miniconda3/bin/python scripts/genes/lpa.sh        # env: N (cohort size), SIM (null markers)

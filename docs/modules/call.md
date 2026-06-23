@@ -23,7 +23,7 @@ paralog clusters on the `bubble` graph. See the
 | DEL | reference-only nodes (deleted from the haplotype) |
 | INS | haplotype-only nodes (inserted vs reference); `--classify-ins` adds `INS_SUBTYPE=NOVEL|DUP` |
 | INV | a haplotype run that is the reverse-complement node-walk of a reference run |
-| DUP | a copy-number gain/loss; three sources by precedence (self-loop `REP`, `--cn-from-coverage`, `--cn-from-multiplicity`) — see [algorithms/call.md](../algorithms/call.md#copy-number--three-ways) |
+| DUP | a copy-number gain/loss; three sources by precedence (`--cn-from-coverage`, then the always-on self-loop `REP`, then `--cn-from-multiplicity`) — see [algorithms/call.md](../algorithms/call.md#copy-number--three-ways) |
 
 ## Required inputs
 
@@ -112,8 +112,9 @@ realignment can separate vs near-identical ones reported as a collapsed module t
 
 ## Example
 
-Matches `scripts/genes/lpa.sh` (LPA = tandem → panphorte graph + `--cn-from-multiplicity`; other genes use
-`--cn-from-coverage` on the `bubble` graph — see `scripts/genes/`):
+Matches `scripts/genes/lpa.sh` (LPA = tandem → panphorte graph, CN read from the always-on self-loop `REP`;
+the `--cn-from-multiplicity` below is harmless belt-and-suspenders for any LPA bubble that did not fold. Other
+genes use `--cn-from-coverage` on the `bubble` graph — see `scripts/genes/`):
 
 ```bash
 ./build/panvar call \

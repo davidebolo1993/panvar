@@ -62,7 +62,8 @@ bp   :  ..   60   60   8    60   60   ..
 3. **Accept test.** `copies=4 ≥ 2` ✓; `unit_bp=60 ≥ 50` ✓; interruption `8 ≤ 0.25·(4·60+8)=62` ✓ → collapse.
 4. **Collapse.** One REP node carries `U` with a self-loop; the path becomes `L REP REP x REP REP R` (REP
    traversed 4× total), `x` kept as a literal step. Report row: `unit_bp=60 copies=4 interruption_bp=8`.
-   Downstream `call --cn-from-multiplicity` reads CN straight off the REP self-loop multiplicity.
+   Downstream `call` reads CN straight off the REP self-loop multiplicity (the always-on self-loop path, no
+   flag; `--cn-from-multiplicity` is for folded bubbles that have *no* self-loop).
 
 **Exact vs approximate.** The trace above is exact (`block_equal` requires byte-identical copies). Real
 repeats (KIV-2) differ by SNVs, so the exact pair test fails and nothing seeds. At `--min-similarity 0.90`

@@ -91,7 +91,7 @@ reads. This table is the canonical reference (the module pages link here):
 
 | Region | Topology | Call substrate | CN method | Concordance vs truth |
 |--------|----------|----------------|-----------|----------------------|
-| **LPA** (KIV-2) | tandem repeat | `panphorte` graph | `--cn-from-multiplicity` (REP self-loop) | **465/465 = 100%** |
+| **LPA** (KIV-2) | tandem repeat | `panphorte` graph | self-loop `REP` (always on) | **465/465 = 100%** |
 | **C4** (RCCX) | PGGB-collapsed paralog | `bubble` graph | `--cn-from-coverage` (full-walk) | **131/131 = 100%** |
 | **GSTM1** | deletion/CNV (segdup) | `bubble` graph | `--cn-from-multiplicity` (peak) | **159/159 = 100%** |
 | **CYP2D6** | PGGB-collapsed paralog | `bubble` graph | `--cn-from-coverage` (full-walk) | concordant vs D6+D7; residual = unannotated CYP2D8P/hybrid |

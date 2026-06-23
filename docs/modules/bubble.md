@@ -63,7 +63,7 @@ Matches `scripts/genes/lpa.sh` (run via the per-gene drivers in `scripts/genes/`
 ./build/panvar bubble \
   -i tests/real_data/lpa.gfa.gz \
   -o results/real_data/lpa/bubble/bubble \
-  --reference-path GRCh38 --gtf tests/real_data/Homo_sapiens.GRCh38.116.gtf.gz
+  --reference-path grch38#1 --gtf tests/real_data/Homo_sapiens.GRCh38.116.gtf.gz
 ```
 
 Algorithm & worked example: see [algorithms/bubble.md](../algorithms/bubble.md). References:

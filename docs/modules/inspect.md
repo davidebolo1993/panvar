@@ -70,11 +70,19 @@ to uncomment.)
 Matches `scripts/genes/lpa.sh` (LPA uses `--cluster-similarity 0.95`; the other genes use `0.97`):
 
 ```bash
+#inspect `bubble` output
+./build/panvar inspect \
+  -i results/real_data/lpa/bubble/bubble.sorted.gfa \
+  --bubble-prefix-in results/real_data/lpa/bubble/bubble \
+  --bubble-id 7 -o results/real_data/lpa/inspect_bubble/inspect \
+  --cluster --cluster-similarity 0.95
+
+#inspect `panphorte` output
 ./build/panvar inspect \
   -i results/real_data/lpa/panphorte/panphorte.normalized.sorted.gfa \
   --bubble-prefix-in results/real_data/lpa/panphorte/panphorte \
-  --bubble-id 7 -o results/real_data/lpa/inspect/inspect \
-  --cluster --cluster-similarity 0.95
+  --bubble-id 7 -o results/real_data/lpa/inspect_panphorte/inspect \
+  --cluster --cluster-similarity 0.97
 ```
 
 Drop `--bubble-id` to inspect all bubbles. Clustering algorithm & worked example:

@@ -6,17 +6,22 @@ CLI: `panvar panphorte`
 
 Rewrites tandem-repeat bubbles into a compact, copy-number-explicit form: each detected tandem array is
 collapsed to a single repeat-unit (`REP`) node with a self-loop, so copy number becomes the number of
-self-loop traversals (which `call --cn-from-multiplicity` reads directly). Writes a new GFA for `inspect`/
-`call`.
+self-loop traversals — which `call` reads straight off the self-loop (this path is always on, no flag;
+`--cn-from-multiplicity` is a separate route for folded bubbles that have no self-loop). Writes a new GFA for
+`inspect`/`call`.
 
 Mechanism, exact-vs-approximate collapse, and a worked trace:
 [algorithms/panphorte.md](../algorithms/panphorte.md).
 
-> Scope. For tandem loci (a unit repeated in-line, e.g. LPA KIV-2). Paralog clusters (C4,
-> CYP2D6) are folded by PGGB onto shared nodes — not a contiguous tandem — so their copy number is recovered
-> by `call --cn-from-coverage` on the `bubble` graph, not from panphorte (see the
-> [CN-topology table](../algorithms/call.md#copy-number-one-method-per-locus-topology)). Running panphorte there is
-> harmless but its graph is not the call substrate.
+> Scope. panphorte targets contiguous tandems — a unit repeated in-line, e.g. LPA KIV-2 — folding each to a
+> `REP` self-loop that `call` reads as copy number (always on, no flag). Paralog clusters (C4, CYP2D6) are
+> folded by PGGB onto shared nodes, not laid out as a contiguous tandem, so there is usually no
+> adjacent-identical unit for panphorte to seed; their copy number is recovered by `call --cn-from-coverage`
+> on the `bubble` graph (see the
+> [CN-topology table](../algorithms/call.md#copy-number-one-method-per-locus-topology)). Do not call paralog
+> CN on the panphorte graph: anything panphorte does fold there — more aggressively as `--min-similarity`
+> drops — changes node identity and the per-walk bp that `--cn-from-coverage` measures, so the two substrates
+> are not interchangeable. One substrate per topology.
 
 ## Required inputs
 
@@ -79,8 +84,10 @@ Matches `scripts/genes/lpa.sh`:
 ./build/panvar panphorte \
   -i results/real_data/lpa/bubble/bubble.sorted.gfa \
   --bubble-prefix-in results/real_data/lpa/bubble/bubble \
-  --reference-path GRCh38 -o results/real_data/lpa/panphorte/panphorte \
-  --min-similarity 0.97
+  --reference-path grch38#1 \
+  -o results/real_data/lpa/panphorte/panphorte \
+  --min-similarity 0.97 \
+  --gtf tests/real_data/Homo_sapiens.GRCh38.116.gtf.gz
 ```
 
 Algorithm & worked example: see [algorithms/panphorte.md](../algorithms/panphorte.md). References:
