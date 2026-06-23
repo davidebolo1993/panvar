@@ -22,14 +22,15 @@ FROM mambaorg/micromamba:2.3.2
 ARG MAMBA_DOCKERFILE_ACTIVATE=1
 USER $MAMBA_USER
 
+# Companion tools only: vg (snarls), odgi (inspect graph sort/flip), bcftools (work with the called VCFs),
+# and R for the plotting scripts. minimap2 is NOT installed (panvar links the minimap2 API statically).
 RUN micromamba install --yes --name base --channel conda-forge --channel bioconda \
     vg \
     odgi \
-    minimap2 \
-    samtools \
     bcftools \
     r-base \
     r-ggplot2 \
+    r-ggrepel \
     && micromamba clean --all --yes
 
 USER root

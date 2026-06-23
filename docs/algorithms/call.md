@@ -84,11 +84,28 @@ event (not mere node-set containment), so a *dissimilar* 48 bp insertion at the 
                                                    =0.5 → compared → one (SVLEN_RANGE=60,108)
 ```
 
+## Copy number: one method per locus topology
+
+How a locus is represented in the pangenome decides how `call` reads its copy number — and which graph it
+reads. This table is the canonical reference (the module pages link here):
+
+| Region | Topology | Call substrate | CN method | Concordance vs truth |
+|--------|----------|----------------|-----------|----------------------|
+| **LPA** (KIV-2) | tandem repeat | `panphorte` graph | `--cn-from-multiplicity` (REP self-loop) | **465/465 = 100%** |
+| **C4** (RCCX) | PGGB-collapsed paralog | `bubble` graph | `--cn-from-coverage` (full-walk) | **131/131 = 100%** |
+| **GSTM1** | deletion/CNV (segdup) | `bubble` graph | `--cn-from-multiplicity` (peak) | **159/159 = 100%** |
+| **CYP2D6** | PGGB-collapsed paralog | `bubble` graph | `--cn-from-coverage` (full-walk) | concordant vs D6+D7; residual = unannotated CYP2D8P/hybrid |
+
+The principle: PGGB collapses **identical** copies onto shared nodes (copy number = node multiplicity);
+`panphorte` collapses a **variable tandem** into one REP node. So tandem loci are called on the `panphorte`
+graph, PGGB-folded paralog clusters on the unfolded `bubble` graph; the mechanics of each method are in
+[Copy number — three ways](#copy-number--three-ways) below.
+
 ## Copy number — three ways
 
 Copy number is read straight off the walk (no re-alignment), tried per bubble in a fixed precedence so it is
 never double-counted. The choice depends on locus topology — see the
-[CN-topology table](../README.md#copy-number-one-method-per-locus-topology).
+[table above](#copy-number-one-method-per-locus-topology).
 
 **(a) Clean tandem → self-loop `REP` (always on).** `panphorte` collapsed an adjacent tandem into a `REP`
 self-loop; CN is the loop count. `REF_CN` = reference loops; a sample below it is a loss, above it a gain.

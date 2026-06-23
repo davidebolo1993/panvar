@@ -14,7 +14,8 @@ get <- function(flag, default = NULL) {
   i <- match(flag, args); if (is.na(i) || i == length(args)) return(default); args[i + 1]
 }
 assoc <- get("--assoc"); out <- get("--out"); summary_path <- get("--summary"); title <- get("--title", "panvar associate")
-if (is.null(assoc) || is.null(out)) stop("usage: plot_associate.R --assoc <assoc.tsv> --out <prefix> [--summary s] [--title T]")
+man_w <- as.numeric(get("--width", "10")); man_h <- as.numeric(get("--height", "7")); dpi <- as.numeric(get("--dpi", "150"))
+if (is.null(assoc) || is.null(out)) stop("usage: plot_associate.R --assoc <assoc.tsv> --out <prefix> [--summary s] [--title T] [--width W --height H --dpi D]")
 
 d <- read.delim(assoc, sep = "\t", header = TRUE, check.names = FALSE)
 d <- d[is.finite(d$p), ]
@@ -109,8 +110,8 @@ if (!is.null(lab)) {
       size = 3, vjust = -0.6, colour = "black")
   }
 }
-ggsave(paste0(out, ".manhattan.png"), p_man, width = 10, height = 7, dpi = 150)
-ggsave(paste0(out, ".manhattan.pdf"), p_man, width = 10, height = 7)
+ggsave(paste0(out, ".manhattan.png"), p_man, width = man_w, height = man_h, dpi = dpi)
+ggsave(paste0(out, ".manhattan.pdf"), p_man, width = man_w, height = man_h)
 
 # QQ with genomic-inflation lambda
 po <- sort(pmax(d$p, 1e-300)); m <- length(po)
@@ -122,6 +123,6 @@ p_qq <- ggplot(qq, aes(exp, obs)) +
   labs(title = paste0(title, " - QQ"), subtitle = sprintf("genomic inflation lambda = %.3f", lambda),
        x = expression(expected~-log[10](p)), y = expression(observed~-log[10](p))) +
   theme_bw(base_size = 12)
-ggsave(paste0(out, ".qq.png"), p_qq, width = 5, height = 5, dpi = 150)
+ggsave(paste0(out, ".qq.png"), p_qq, width = 5, height = 5, dpi = dpi)
 ggsave(paste0(out, ".qq.pdf"), p_qq, width = 5, height = 5)
 cat("Wrote:", paste0(out, ".manhattan.png"), "and", paste0(out, ".qq.png"), "\n")

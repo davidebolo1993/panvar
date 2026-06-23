@@ -4,13 +4,13 @@ CLI: `panvar bubble`
 
 ## What it does
 
-Turns a pangenome graph (GFA, typically from `pggb`) into `panvar` **bubble sites** for the downstream
+Turns a pangenome graph (GFA, typically from `pggb`) into `panvar` bubble sites for the downstream
 modules. It sorts/flips the graph along the reference, finds [snarls](../algorithms/bubble.md#terms)
 internally (a vendored cactus / 3-edge-connected decomposition matching `vg snarls`), infers each bubble's
 internal nodes from path intervals, scores path support + internal span, applies size/support filters, and
 writes the sorted GFA + a bubble CSV + Bandage visualization files.
 
-Mechanism, filters, and a worked trace: **[algorithms/bubble.md](../algorithms/bubble.md)**.
+Mechanism, filters, and a worked trace: [algorithms/bubble.md](../algorithms/bubble.md).
 
 ## Required inputs
 
@@ -43,8 +43,17 @@ Mechanism, filters, and a worked trace: **[algorithms/bubble.md](../algorithms/b
 | `<prefix>.bandage_nodes.csv` | Bandage node colors (blue = candidate context, red = retained bubbles) |
 | `<prefix>.bandage_genes.csv` | (with `--gtf`) `Name,Colour,Gene` per bubble |
 
-`bubbles.csv` columns: `bubble_id, source, sink, inside_node_count, total_node_count, path_support,
-min_inside_bp, max_inside_bp, inside_nodes`.
+`bubbles.csv` columns:
+
+| column | meaning |
+|--------|---------|
+| `bubble_id` | unique id for the bubble site |
+| `source`, `sink` | the two boundary node ids that delimit the bubble |
+| `inside_node_count` | number of interior nodes (strictly between the boundaries) |
+| `total_node_count` | interior nodes plus the two boundary nodes |
+| `path_support` | how many paths cross the bubble (visit both boundaries) |
+| `min_inside_bp`, `max_inside_bp` | smallest / largest interior span (bp) across the supporting paths |
+| `inside_nodes` | the interior node ids (`;`-separated) |
 
 ## Example
 

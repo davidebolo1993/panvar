@@ -6,16 +6,13 @@ CLI: `panvar associate`
 
 Runs a region-wide association test of a phenotype against the genotypes from `describe`. Per feature (a
 k-mer, or a node/edge dosage) it fits `phenotype ~ genotype + covariates` and reports a Wald test on the
-genotype term, applies a **MAF filter** on the cohort genotypes, and corrects for multiple testing **over
-the features actually tested** (region-wide Bonferroni + Benjamini–Hochberg FDR — *not* the genome-wide
-`5e-8`). Phenotype type is auto-detected: binary → **logistic** (`log_or`), else **linear** (`beta`).
+genotype term, applies a MAF filter on the cohort genotypes, and corrects for multiple testing over
+the features actually tested (region-wide Bonferroni + Benjamini–Hochberg FDR — not the genome-wide
+`5e-8`). Phenotype type is auto-detected: binary → logistic (`log_or`), else linear (`beta`).
 
-For a quantitative trait it can also fit a **linear mixed model** (`--model lmm`) using a kinship matrix, or
-add the top kinship **PCs as covariates** (`--pca N`), to control population structure; every run reports
-the genomic-inflation **λ**. Math + a worked trace: **[algorithms/associate.md](../algorithms/associate.md)**.
-
-New to GWAS? **[gwas/primer.md](../gwas/primer.md)** explains genotype/dosage, MAF, multiple testing,
-kinship, λ, and LMM-vs-PCs from scratch on this LPA example.
+For a quantitative trait it can also fit a linear mixed model (`--model lmm`) using a kinship matrix, or
+add the top kinship PCs as covariates (`--pca N`), to control population structure; every run reports
+the genomic-inflation λ. Math + a worked trace: [algorithms/associate.md](../algorithms/associate.md).
 
 ## Required inputs
 
@@ -23,7 +20,7 @@ kinship, λ, and LMM-vs-PCs from scratch on this LPA example.
   per-sample `*.samples.bimbam.gz` for a diploid cohort).
 - `--samples <txt[.gz]>` — the sample (column) order (`describe`'s `bimbam.samples[.samples].txt.gz`).
 - `--phenotype <tsv>` — `sample <tab> phenotype [<tab> covariate…]`, header required; cells may be `NA` (a
-  sample with NA phenotype **or** any NA covariate is dropped).
+  sample with NA phenotype or any NA covariate is dropped).
 - `-o, --out-prefix <prefix>`.
 
 ## Key options
@@ -31,22 +28,53 @@ kinship, λ, and LMM-vs-PCs from scratch on this LPA example.
 | flag | what it does | default |
 |------|--------------|---------|
 | `--feature-annot <tsv.gz>` | `describe`'s `feature_annot.tsv.gz`; adds `layer`/`bubbles`/`nodes` provenance | — |
-| `--node-genes <tsv>` | `call`'s `node_genes.tsv` (from `--gtf`); adds a **`gene`** column | — |
+| `--node-genes <tsv>` | `call`'s `node_genes.tsv` (from `--gtf`); adds a `gene` column | — |
 | `--min-maf <X>` | drop features whose [minor non-modal frequency](../algorithms/associate.md#worked-trace--one-quantitative-feature) < X, on the actual cohort | `0.01` |
 | `--model <auto\|linear\|logistic\|lmm>` | `auto` = binary→logistic else linear; `lmm` = mixed model (quantitative; needs a kinship source) | `auto` |
 | `--kinship <path>` | precomputed `n×n` GRM (rows/cols in `--samples` order) for `--model lmm` / `--pca` | — |
-| `--make-kinship` | build the GRM from the genotype matrix (only valid for a **genome-wide-like** panel; region-only is proximally contaminated) | off |
-| `--pca <N>` | add the top-N kinship [PCs as covariates](../gwas/primer.md#7-two-ways-to-correct-structure-pcs-and-the-lmm) to the GLM | off |
+| `--make-kinship` | build the GRM from the genotype matrix (only valid for a genome-wide-like panel; region-only is proximally contaminated) | off |
+| `--pca <N>` | add the top-N kinship [PCs as covariates](../gwas/primer.md#two-ways-to-correct-structure-pcs-and-the-lmm) to the GLM | off |
 | `-q, --quiet` | less logging | off |
 
 ## Outputs
 
 | file | contents |
 |------|----------|
-| `<prefix>.assoc.tsv` | one row per tested feature, sorted by `p`: `feature_id, layer, bubbles, nodes, n, minor_freq, beta\|log_or, se, z, p, p_bonf, q_bh, gene` |
-| `<prefix>.summary.tsv` | `model, phenotype_type, covariates, pca_covariates, samples_used, features_tested, dropped_min_maf, dropped_fit, bonferroni_threshold (0.05/n_tests), significant_bonferroni, significant_fdr05, lambda_gc` (+ `lmm_delta` for LMM) |
+| `<prefix>.assoc.tsv` | one row per tested feature, sorted by `p` (columns below) |
+| `<prefix>.summary.tsv` | run settings + diagnostics, one `key <tab> value` per line (below) |
 
-`gene` is `.` unless `--node-genes` is given. The plotter reads `features_tested` to draw the threshold line.
+`<prefix>.assoc.tsv` columns:
+
+| column | meaning |
+|--------|---------|
+| `feature_id` | the feature tested — k-mer sequence (k-mer substrate) or node id / edge key (graph substrate) |
+| `layer` | `kmer` or `graph` |
+| `bubbles`, `nodes` | graph provenance (from `--feature-annot`): which bubble(s) / node(s) the feature comes from |
+| `n` | number of samples used in this feature's fit |
+| `minor_freq` | minor (non-modal) genotype frequency on the cohort (the MAF-filter quantity) |
+| `beta` \| `log_or` | effect size on the genotype term — `beta` (linear) or `log_or` = log odds ratio (logistic) |
+| `se` | standard error of the effect |
+| `z` | Wald statistic, `effect / se` |
+| `p` | Wald p-value |
+| `p_bonf` | Bonferroni-adjusted p, `min(1, p · features_tested)` |
+| `q_bh` | Benjamini–Hochberg FDR q-value |
+| `gene` | gene name when `--node-genes` is given, else `.` |
+
+`<prefix>.summary.tsv` keys:
+
+| key | meaning |
+|-----|---------|
+| `model`, `phenotype_type` | model used (`linear`/`logistic`/`lmm`) and detected trait type |
+| `covariates`, `pca_covariates` | covariate columns used / PCs added via `--pca` |
+| `samples_used` | samples kept after dropping rows with NA phenotype or covariate |
+| `features_tested` | features that passed the MAF filter and were tested (the multiple-testing denominator) |
+| `dropped_min_maf`, `dropped_fit` | features dropped by the MAF filter / by a failed model fit |
+| `bonferroni_threshold` | the region-wide threshold `0.05 / features_tested` |
+| `significant_bonferroni`, `significant_fdr05` | counts passing Bonferroni / BH FDR < 0.05 |
+| `lambda_gc` | genomic-inflation factor λ |
+| `lmm_delta` | (LMM only) fitted variance ratio δ = σ²ₑ / σ²_g |
+
+The plotter reads `features_tested` to draw the threshold line.
 
 ## Plotting
 
@@ -55,10 +83,18 @@ Rscript scripts/plot_associate.R --assoc <prefix>.assoc.tsv --summary <prefix>.s
   --out <prefix> --title "my trait"
 ```
 
-Writes `*.manhattan.{png,pdf}` — **two stacked panels**, before correction (raw −log10 p with nominal +
+Writes `*.manhattan.{png,pdf}` — two stacked panels, before correction (raw −log10 p with nominal +
 region-wide Bonferroni lines) and after correction (Benjamini-Hochberg −log10 q with the q=0.05 line); x =
-node id (graph) or per-k-mer index ordered by node id (k-mers), with FDR/Bonferroni-significant **genes
-flagged** (ggrepel, from the `gene` column when `--node-genes` was passed) — and `*.qq.{png,pdf}` (with λ).
+node id (graph) or per-k-mer index ordered by node id (k-mers), with FDR/Bonferroni-significant genes
+flagged (ggrepel, from the `gene` column when `--node-genes` was passed) — and `*.qq.{png,pdf}` (with λ).
+
+Script flags (needs `Rscript` + `ggplot2`; `ggrepel` optional, for the gene labels):
+
+- `--assoc <assoc.tsv>` — the association table (required).
+- `--out <prefix>` — output prefix for the PNG/PDF files (required).
+- `--summary <summary.tsv>` — read `features_tested` for the Bonferroni line (recommended).
+- `--title <text>` — plot title.
+- `--width` / `--height` / `--dpi` — Manhattan size (inches) and PNG resolution (defaults 10 / 7 / 150).
 
 ## Example
 

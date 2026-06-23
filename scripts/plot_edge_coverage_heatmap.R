@@ -13,12 +13,11 @@ usage <- function(status = 0) {
     "  --clusters <path>    panvar inspect clusters.tsv; keep only representative paths",
     "  --cluster-by <path>  panvar inspect clusters.tsv; keep all paths but group/order rows by",
     "                       cluster (representative first), with a separator between clusters",
-    "  --cluster-rows       Cluster paths by edge-traversal profile",
-    "  --cluster-cols       Cluster edges by traversal profile",
     "  --max-paths <N>      Keep at most N paths, selected by total traversals (default: all)",
     "  --max-edges <N>      Keep at most N edges, selected by total traversals (default: all)",
     "  --width <inches>     Figure width (default: auto)",
     "  --height <inches>    Figure height (default: auto)",
+    "  --dpi <int>          PNG resolution (default: 300)",
     "  -h, --help           Show this help"
   )
   cat(paste(msg, collapse = "\n"), "\n", sep = "")
@@ -45,12 +44,11 @@ opts <- list(
   transform = "raw",
   clusters = NULL,
   cluster_by = NULL,
-  cluster_rows = FALSE,
-  cluster_cols = FALSE,
   max_paths = 0,
   max_edges = 0,
   width = NA_real_,
-  height = NA_real_
+  height = NA_real_,
+  dpi = 300
 )
 positional <- character()
 
@@ -78,12 +76,6 @@ while (i <= length(args)) {
   } else if (arg == "--cluster-by") {
     opts$cluster_by <- read_value(arg)
     i <- i + 2
-  } else if (arg == "--cluster-rows") {
-    opts$cluster_rows <- TRUE
-    i <- i + 1
-  } else if (arg == "--cluster-cols") {
-    opts$cluster_cols <- TRUE
-    i <- i + 1
   } else if (arg == "--max-paths") {
     opts$max_paths <- as.integer(read_value(arg))
     i <- i + 2
@@ -95,6 +87,9 @@ while (i <= length(args)) {
     i <- i + 2
   } else if (arg == "--height") {
     opts$height <- as.numeric(read_value(arg))
+    i <- i + 2
+  } else if (arg == "--dpi") {
+    opts$dpi <- as.numeric(read_value(arg))
     i <- i + 2
   } else if (startsWith(arg, "-")) {
     stop(paste("Unknown option:", arg), call. = FALSE)
@@ -226,25 +221,14 @@ if (opts$transform == "log1p") {
   plot_mat <- log1p(plot_mat)
 }
 
+# Row order: grouped by the external inspect clusters file when given (no auto-clustering).
 cluster_boundaries <- integer(0)
 if (!is.null(opts$cluster_by)) {
-  if (opts$cluster_rows) {
-    warning("--cluster-by overrides --cluster-rows (rows grouped by inspect clusters)", call. = FALSE)
-  }
   grouped <- order_rows_by_clusters(mat, opts$cluster_by)
   ord <- match(rownames(grouped$mat), rownames(mat))
   mat <- grouped$mat
   plot_mat <- plot_mat[ord, , drop = FALSE]
   cluster_boundaries <- grouped$boundaries
-} else if (opts$cluster_rows && nrow(plot_mat) > 1) {
-  row_order <- hclust(dist(plot_mat))$order
-  mat <- mat[row_order, , drop = FALSE]
-  plot_mat <- plot_mat[row_order, , drop = FALSE]
-}
-if (opts$cluster_cols && ncol(plot_mat) > 1) {
-  col_order <- hclust(dist(t(plot_mat)))$order
-  mat <- mat[, col_order, drop = FALSE]
-  plot_mat <- plot_mat[, col_order, drop = FALSE]
 }
 
 out_dir <- dirname(opts$out)
@@ -323,7 +307,7 @@ if (length(cluster_boundaries) > 0) {
 png_path <- paste0(opts$out, ".png")
 pdf_path <- paste0(opts$out, ".pdf")
 
-ggplot2::ggsave(png_path, p, width = opts$width, height = opts$height, units = "in", dpi = 300, limitsize = FALSE)
+ggplot2::ggsave(png_path, p, width = opts$width, height = opts$height, units = "in", dpi = opts$dpi, limitsize = FALSE)
 ggplot2::ggsave(pdf_path, p, width = opts$width, height = opts$height, units = "in", limitsize = FALSE)
 
 cat("Wrote:", png_path, "\n")

@@ -26,6 +26,10 @@ get <- function(flag, default = NULL) {
 table_path <- get("--table")
 out_prefix <- get("--out", "cn_correlation")
 if (is.null(table_path)) stop("need --table <tsv>")
+# --dpi applies to both plots; --width/--height override the per-plot defaults when given.
+dpi <- as.numeric(get("--dpi", "150"))
+w_arg <- get("--width"); h_arg <- get("--height")
+wnum <- function(x, d) if (is.null(x)) d else as.numeric(x)
 
 d <- read.delim(table_path, stringsAsFactors = FALSE)
 d <- d[!is.na(d$truth_cn) & !is.na(d$called_cn), ]
@@ -89,16 +93,16 @@ genes <- d[d$gene %in% paralogs, ]
 # Plot 1: the four loci as total counts (c4, cyp2d6, gstm1, lpa) in a 2x2 grid.
 if (nrow(loci) > 0) {
   p_loci <- make_plot(loci, ncol = 2)
-  ggsave(paste0(out_prefix, ".loci.png"), p_loci, width = 8, height = 7, dpi = 150)
+  ggsave(paste0(out_prefix, ".loci.png"), p_loci, width = wnum(w_arg, 8), height = wnum(h_arg, 7), dpi = dpi)
   cat("Wrote:", paste0(out_prefix, ".loci.png"), "\n")
 } else {
   cat("(no locus-total rows; skipping .loci.png)\n")
 }
 
-# Plot 2: resolved CYP2D6 / CYP2D7 per-paralog split, one row of two panels.
+# Plot 2: resolved CYP2D6 / CYP2D7 per-paralog split, one column of two stacked panels.
 if (nrow(genes) > 0) {
-  p_genes <- make_plot(genes, ncol = 2)
-  ggsave(paste0(out_prefix, ".genes.png"), p_genes, width = 8, height = 4.2, dpi = 150)
+  p_genes <- make_plot(genes, ncol = 1)
+  ggsave(paste0(out_prefix, ".genes.png"), p_genes, width = wnum(w_arg, 4.6), height = wnum(h_arg, 8), dpi = dpi)
   cat("Wrote:", paste0(out_prefix, ".genes.png"), "\n")
 } else {
   cat("(no CYP2D6/CYP2D7 per-gene rows; skipping .genes.png)\n")

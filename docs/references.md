@@ -65,7 +65,7 @@ and the per-gene competitive realignment behind `dup_gene_cn.tsv`.
 
 GitHub: [genetics-statistics/GEMMA](https://github.com/genetics-statistics/GEMMA) (reference LMM GWAS;
 `describe`'s BIMBAM is its native format — `panvar associate` is validated against it, see
-[gwas/example.md](gwas/example.md#validation-against-gemma)),
+[gwas/example.md](gwas/example.md#6-validation-against-gemma)),
 [libeigen/eigen](https://gitlab.com/libeigen/eigen) (the linear algebra behind the LMM eigendecomposition).
 
 - Zhou X, Stephens M. **Genome-wide efficient mixed-model analysis for association studies.** *Nature
