@@ -1,5 +1,8 @@
 #include "panvar/minimap2_align.hpp"
 
+// Thin wrapper over the minimap2 C API (statically linked submodule) for INS-subtype realignment and
+// per-gene DUP resolution. Li 2018, https://doi.org/10.1093/bioinformatics/bty191
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>

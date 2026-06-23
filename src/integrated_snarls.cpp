@@ -1,10 +1,9 @@
 #include "panvar/integrated_snarls.hpp"
 
-// Near-verbatim port of vg src/integrated_snarl_finder.cpp (MIT). Debug output removed,
-// namespaces changed, and the HandleGraph backing replaced by the in-process HandleShim
-// below. Only the path needed for traverse_decomposition is ported (no SnarlManager,
-// NetGraph, bdsg, or find_snarls_parallel). The cactus/3-edge-connected-component logic
-// is unchanged so the emitted snarls match `vg snarls`.
+// Port of vg's integrated_snarl_finder (MIT) - just the traverse_decomposition path, on an in-process
+// HandleShim. Cactus / 3-edge-connected decomposition unchanged, so snarls match `vg snarls`.
+// Method: Paten et al. 2018, Superbubbles, Ultrabubbles and Cacti (https://doi.org/10.1089/cmb.2017.0251).
+// Upstream: https://github.com/vgteam/vg/blob/master/src/integrated_snarl_finder.cpp
 
 #include "panvar/three_edge_cc.hpp"
 #include "panvar/union_find.hpp"

@@ -1,21 +1,8 @@
 #!/usr/bin/env bash
-# LPA pangenome-association demo on the real LPA graph (tests/real_data/lpa.gfa.gz), end to end with
-# the native modules: bubble -> panphorte -> call -> describe --samples -> ASSOCIATE.
-#
-# It produces TWO things:
-#
-#   1. REGION SCAN (panvar on the actual pangenome). cosigt-style diploid samples are built from the
-#      real KIV-2 copy numbers; `describe --samples` emits per-sample BIMBAM dosage; `associate` runs
-#      the GWAS (GLM + ancestry-PC covariates, MAF filter, region-wide Bonferroni/BH). KIV-2 (bubble 7)
-#      is recovered as the top hit with a NEGATIVE effect (more KIV-2 -> lower Lp(a)).
-#
-#   2. STRUCTURE-CORRECTION demo (teaching the LMM/PC/kinship machinery). A single region has no null
-#      markers, so genomic-inflation lambda is not interpretable there. We therefore also test a
-#      SYNTHETIC genome-wide-like panel (the real causal KIV-2 dosage + many subpop-stratified null
-#      SNPs). A naive scan is inflated (lambda >> 1); adding the ancestry PCs (--phenotype with PCs) or
-#      the LMM with a panel-derived GRM (--model lmm --make-kinship) brings lambda ~ 1 while KIV-2
-#      survives. This needs a numpy-capable python (pass it as $3 / $PY).
-#
+# LPA association demo on the real graph: bubble -> panphorte -> call -> describe --samples -> associate.
+# Produces (1) a region scan that recovers KIV-2 as the top hit, and (2) a structure-correction demo on a
+# synthetic genome-wide panel (naive lambda>>1 -> ~1 with PCs/LMM). See docs/gwas/example.md. Needs a
+# numpy-capable python.
 #   run_lpa_real.sh <panvar_bin> <out_dir> [python] [Rscript] [--big]
 # Env: N (cohort size; --big sets 10000), SIM (null markers, default 3000), LMM_MAX_N (LMM size cap).
 set -euo pipefail

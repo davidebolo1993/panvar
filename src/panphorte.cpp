@@ -358,13 +358,10 @@ struct PathArray {
     std::vector<PathStep> replacement;
 };
 
-// ---- Approximate (similarity-based) single-block collapse ----
-//
-// One representative repeat unit per bubble. Near-identical copies are found by
-// banded alignment of the unit against the path's spelled sequence (so a large
-// indel between divergent copies, e.g. the C4 long/short HERV, is bridged when
-// --min-similarity is low enough), then collapsed (lossy) to one REP node.
-// Per-path detection is multithreaded; the graph mutation is serial.
+// Approximate (similarity-based) collapse: pick one representative repeat unit per bubble, find
+// near-identical copies by banded alignment of the unit against each path (so a divergent copy with a
+// big internal indel, e.g. the C4 long/short HERV, is bridged at low --min-similarity), then collapse
+// them lossily to one REP node. Detection is per-path/multithreaded; the graph mutation is serial.
 
 constexpr std::size_t kAnchorSeeds = 8;     // seeds spread across the unit for anchoring
 
@@ -470,12 +467,10 @@ std::size_t nearest_step_off(const std::vector<std::size_t>& prefix, std::size_t
     return (bp - prefix[lo] <= prefix[hi] - bp) ? lo : hi;
 }
 
-// Seed the bubble's repeat unit from the exact tandem detector: a unit must come from a
-// clean ADJACENT identical pair (so we get the real repeat period, e.g. the whole ~32 kb C4
-// long module, not a small sub-segment that merely recurs). The per-path scan runs in
-// parallel; the tally merge is serial in path order, and the winner is the most-supported
-// unit (tie-break to the longer unit, then lexicographic) so the result is identical
-// regardless of thread count.
+// Seed the repeat unit from the exact tandem detector: a unit must come from a clean adjacent
+// identical pair, so we get the true period (the whole ~32 kb C4 module, not a recurring sub-segment).
+// Per-path scan is parallel; the tally merge is serial in path order and the winner is the
+// most-supported unit (tie-break: longer, then lexicographic) so it's deterministic across threads.
 std::string pick_reference_unit(
     const Graph& graph,
     const std::unordered_map<std::string, NodeTok>& node_tok,

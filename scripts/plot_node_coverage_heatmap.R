@@ -153,10 +153,8 @@ read_tsv <- function(path) {
   read.delim(con, sep = "\t", header = TRUE, check.names = FALSE, quote = "", comment.char = "")
 }
 
-# Reorder a coverage matrix so cluster-mates (from a panvar inspect clusters.tsv) are
-# adjacent: clusters ascending by cluster_id, representative first within each cluster,
-# then path name; any rows absent from the cluster file sort last. Returns the reordered
-# matrix and the mat-row indices (>1) where a new cluster begins (for separator lines).
+# Order rows by the inspect clusters.tsv (cluster_id, rep first, then name; unlisted rows last).
+# Returns the reordered matrix + the row indices where a new cluster starts (for separators).
 order_rows_by_clusters <- function(mat, clusters_path) {
   cl <- read_tsv(clusters_path)
   if (!all(c("cluster_id", "members") %in% names(cl))) {

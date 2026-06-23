@@ -1,12 +1,7 @@
 #!/usr/bin/env bash
-# Shared helpers for the per-gene driver scripts (scripts/genes/<gene>.sh). Sourced, not run directly.
-#
-# Each gene script runs the DATA pipeline only (no plotting):
-#   bubble -> inspect(bubble graph) -> panphorte -> inspect(panphorte graph) -> call -> describe
-# (lpa additionally runs make_lpa_phenotype + associate). Plotting commands are listed but COMMENTED
-# OUT at the end of each script, so you can uncomment the ones you want and run the R scripts yourself.
-#
-# Env overrides: PANVAR_BIN, PYTHON, RSCRIPT, THREADS, GTF (gene annotation; skipped if absent).
+# Shared helpers for the per-gene drivers (scripts/genes/<gene>.sh); sourced, not run directly.
+# Each gene runs the data pipeline (bubble -> inspect -> panphorte -> inspect -> call -> describe);
+# plot commands sit commented at the bottom of each. Env: PANVAR_BIN, PYTHON, RSCRIPT, THREADS, GTF.
 
 set -uo pipefail
 
@@ -36,10 +31,7 @@ main_dup_bubble() {
 # largest repeat bubble id from a bubble.bubbles.csv (column 8 = size-like metric)
 main_bubble_csv() { awk -F',' 'NR>1 && $8+0>m{m=$8+0; b=$1} END{print b}' "$1"; }
 
-# run_gene_data <region> <gfa.gz> <panphorte_min_sim> <call_graph: bubble|panphorte> <call_extra>
-#               <inspect_cluster_sim>
-# Runs bubble -> inspect(bubble) -> panphorte -> inspect(panphorte) -> call -> describe into
-# results/real_data/<region>/. Echoes the chosen reference/graph. Returns non-zero on failure.
+# run_gene_data <region> <gfa.gz> <panphorte_min_sim> <call_graph: bubble|panphorte> <call_extra> [cluster_sim]
 run_gene_data() {
   local region="$1" gfa="$2" pan_sim="$3" call_graph="$4" call_extra="$5" clu="${6:-0.97}"
   local d="$OUT/$region"

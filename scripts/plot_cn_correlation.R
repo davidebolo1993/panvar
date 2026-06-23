@@ -1,18 +1,8 @@
 #!/usr/bin/env Rscript
-# Copy-number concordance: panvar calls (absolute CN from the final region VCF) vs the ground-truth
-# BED, one facet per gene. Each point is a haplotype; the reference haplotype is highlighted. The
-# Pearson correlation (and the y = x line) summarize agreement per gene.
-#
+# Copy-number concordance (called vs ground-truth BED), one facet per gene, from
+# compare_copy_number.py --dump-tsv (cols: gene sample truth_cn called_cn baseline_offset is_reference).
 #   Rscript plot_cn_correlation.R --table cn_table.tsv --out results/cn_correlation
-#
-# Writes TWO plots:
-#   <out>.loci.png   -- the four loci as TOTAL module/gene counts (c4, cyp2d6, gstm1, lpa), 2x2 grid.
-#   <out>.genes.png  -- the resolved CYP2D6 / CYP2D7 per-paralog split, one row of two panels.
-# The two are distinguished by the label case in the table: locus totals are lower-case (cyp2d6),
-# the per-paralog split rows are upper-case (CYP2D6, CYP2D7). Either plot is skipped if it has no rows.
-#
-# Input TSV (produced by scripts/compare_copy_number.py --dump-tsv):
-#   gene  sample  truth_cn  called_cn  baseline_offset  is_reference
+# Writes <out>.loci.png (lower-case locus totals, 2x2) and <out>.genes.png (upper-case CYP2D6/CYP2D7 split).
 suppressWarnings(suppressMessages({
   library(ggplot2)
 }))
@@ -37,8 +27,7 @@ if (nrow(d) == 0) stop("no rows in table")
 if (is.null(d$baseline_offset)) d$baseline_offset <- 0
 d$ref <- ifelse(d$is_reference == 1, "reference", "haplotype")
 
-# Recovered GENE copy number: absolute VCF CN minus the constant paralog baseline (0 for LPA/C4, where
-# the call already counts the gene; +2 for GSTM1 and +1 for CYP2D6, the always-present folded paralogs).
+# gene CN = absolute VCF CN minus the constant paralog baseline (0 LPA/C4, +2 GSTM1, +1 CYP2D6)
 d$gene_cn <- d$called_cn - d$baseline_offset
 
 # integer-only ticks: step 1 for narrow panels, coarser for wide ones (lpa spans ~24) to avoid crowding.
@@ -54,8 +43,7 @@ make_plot <- function(sub, ncol) {
   labs <- do.call(rbind, lapply(genes, function(g) {
     s <- sub[sub$gene == g, ]
     r <- suppressWarnings(tryCatch(cor(s$truth_cn, s$gene_cn), error = function(e) NA))
-    # exact-match concordance: fraction of haplotypes whose rounded call equals the truth. This stays
-    # meaningful when truth is constant (e.g. CYP2D7 = 1 everywhere), where Pearson r is undefined.
+    # exact-match %: stays meaningful when truth is constant (CYP2D7=1), where Pearson r is undefined
     match <- mean(round(s$gene_cn) == s$truth_cn) * 100
     rlab <- if (is.na(r)) "r = n/a (truth constant)" else sprintf("r = %.3f", r)
     data.frame(gene = g,

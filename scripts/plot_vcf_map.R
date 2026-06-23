@@ -1,17 +1,8 @@
 #!/usr/bin/env Rscript
 
-# Whole-VCF variant map (oncoprint / genotype-matrix style): ONE figure for an entire panvar
-# call VCF. Rows = haplotypes, columns = the called variants, GROUPED BY BUBBLE (one facet per
-# bubble), each column labelled by its variant ID. Every cell is the called event the haplotype
-# carries at that variant, so the figure reads like the VCF itself -- not like the graph. (For the
-# node-order / graph-structure view of a single bubble, use plot_sv_map.R + the inspect coverage
-# heatmaps; this map is the at-a-glance whole-VCF summary.)
-#
-# Cell colors:
-#   grey   = reference-like (haplotype does not carry this variant)
-#   DEL red / INS-NOVEL green / INS-DUP purple / INV orange / multiallelic yellow-amber (allele index)
-#   DUP blue, shaded by the haplotype's ABSOLUTE copy number (VCF FORMAT:CN) for EVERY haplotype
-#       (loss = light, reference = mid, gain = dark), so the DUP column reads as a CN gradient
+# Whole-VCF variant map (oncoprint style): rows = haplotypes, columns = called variants faceted by
+# bubble, cells = the event each haplotype carries. DEL red / INS-NOVEL green / INS-DUP purple /
+# INV orange / multiallelic amber (by allele index) / DUP blue shaded by FORMAT:CN / grey = reference.
 #
 # Inputs:
 #   --vcf <path>          panvar call VCF                                  (required; events + GT:CN)
@@ -107,8 +98,7 @@ for (ln in recs) {
   bid <- suppressWarnings(as.integer(info_get(info, "BUBBLE_ID")))
   gt <- sub(":.*$", "", f[-(1:9)])
   cn <- suppressWarnings(as.integer(sub("^[^:]*:", "", f[-(1:9)])))
-  # Variant size for --scale: the representative ALT-allele size = |SVLEN|; for a DUP the REPEAT-UNIT
-  # length (RU_LEN, one copy) instead, so a high-copy DUP is not drawn huge just because of its CN.
+  # --scale size: |SVLEN|, or RU_LEN for a DUP so high-copy DUPs aren't drawn huge by their CN
   svlen <- suppressWarnings(abs(as.numeric(info_get(info, "SVLEN"))))
   ru <- suppressWarnings(as.numeric(info_get(info, "RU_LEN")))
   size_bp <- if (svt == "DUP" && !is.na(ru)) ru else svlen
@@ -137,9 +127,7 @@ if (!is.null(opts$clusters)) {
   paths <- keep
 }
 
-# ---- per-(path,variant) category + value ----
-# DUP: every haplotype is shaded by its absolute CN (loss/ref/gain), not just gain/loss carriers.
-# DEL/INS/INV/MULTI: carriers only (GT calls an alt allele); everyone else is reference-like.
+# per-(path,variant) category: DUP shaded by absolute CN for all; DEL/INS/INV/MULTI carriers only
 is_carrier <- function(g) !is.na(g) & g != "." & g != "0" & g != "0/0" & g != "0|0"
 cat_mat <- matrix("ref", nrow = length(paths), ncol = n_var, dimnames = list(paths, var_ids))
 val_mat <- matrix(NA_real_, nrow = length(paths), ncol = n_var, dimnames = list(paths, var_ids))
@@ -168,8 +156,7 @@ for (j in seq_len(n_var)) {
   }
 }
 
-# drop haplotypes with no event at all (all-reference rows add height but no signal), unless that
-# would empty the plot; keep the reference even if event-free so it can be pinned.
+# drop all-reference rows (no signal), but keep the reference row so it can be pinned
 ref_row <- NA_character_
 if (!is.null(opts$reference_path)) {
   hit <- paths[grepl(opts$reference_path, paths, ignore.case = TRUE)]
@@ -195,8 +182,7 @@ if (!is.null(opts$cluster_by)) {
   cid_sort <- ifelse(is.na(cid_of[paths]), .Machine$integer.max, cid_of[paths])
   paths <- paths[order(cid_sort, !isrep_of[paths], paths)]
 } else {
-  # oncoprint memo-sort: group haplotypes with the same event pattern adjacently. Build a per-row
-  # string key from the column categories (left-to-right, so high-frequency columns dominate).
+  # oncoprint memo-sort: per-row key from column categories (high-frequency columns dominate)
   rank <- c(none = 0, ref = 0, DEL = 1, INV = 2, INS_NOVEL = 3, INS_DUP = 4, MULTI = 5, DUP = 6)
   keymat <- matrix(sprintf("%d", rank[cat_mat]), nrow = nrow(cat_mat))
   key <- apply(keymat, 1, paste, collapse = "")
@@ -217,8 +203,7 @@ if (!is.null(opts$cluster_by)) {
 COL <- c(ref = "#e8e8e8", DEL = "#cb181d", INV = "#f16913",
          INS_NOVEL = "#238b45", INS_DUP = "#6a51a3")
 dup_ramp <- grDevices::colorRampPalette(c("#c6dbef", "#08306b"))
-# multiallelic: yellow->amber ramp (shaded by allele index), kept clearly distinct from the DUP blue
-# ramp and the INS green/purple so a multiallelic column does not read like a DUP/INS column.
+# multiallelic: amber ramp by allele index, kept distinct from the DUP blue / INS green-purple
 multi_ramp <- grDevices::colorRampPalette(c("#fff7bc", "#b8860b"))
 cell_color <- function(cat, v) {
   if (cat == "DUP") { vv <- if (is.na(v) || v < 1) 1 else v; return(dup_ramp(max(2, dup_max))[min(vv, dup_max)]) }
@@ -226,10 +211,8 @@ cell_color <- function(cat, v) {
   COL[[cat]]
 }
 
-# ---- variant-axis layout: each variant gets an extent along its axis (equal, or scaled by size) ----
-# --scale draws each variant's rectangle proportional to its size (|SVLEN| for DEL/INS/INV, RU_LEN for
-# DUP). Positions are GLOBAL cumulative (variants are bubble-ordered), so under facet free-scales each
-# bubble panel clips cleanly to its own contiguous range and space="free" sizes panels by content bp.
+# variant-axis layout: equal extents, or proportional to size under --scale. positions are global
+# cumulative (bubble-ordered) so free-scale facets clip each bubble to its own range.
 n_paths <- length(paths)
 if (opts$scale) {
   sz <- var_size; sz[!is.finite(sz) | sz <= 0] <- NA
@@ -310,8 +293,7 @@ p <- p + ggplot2::geom_point(data = leg, ggplot2::aes(x = x, y = y, shape = lab)
   ggplot2::guides(shape = ggplot2::guide_legend(nrow = if (opts$flip) 1 else NULL,
                                                 override.aes = list(color = unname(legend_levels), size = 5)))
 
-# figure size (unless given): the variant axis grows with variant count, the haplotype axis with
-# haplotype count; default orientation puts variants on X, flipped puts them on Y.
+# auto size: variant axis grows with variant count, haplotype axis with haplotype count
 var_in <- max(7, min(28, 2.5 + n_var * 0.55)); hap_in <- max(4, min(40, 1.8 + n_paths / 11))
 if (is.na(opts$width))  opts$width  <- if (!opts$flip) var_in else hap_in
 if (is.na(opts$height)) opts$height <- if (!opts$flip) hap_in else var_in

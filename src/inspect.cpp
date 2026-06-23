@@ -118,14 +118,10 @@ struct InspectPathRow {
     std::unordered_map<std::string, std::size_t> edge_counts;
 };
 
-// --- Path clustering by source->sink walk -----------------------------------
-//
-// A walk is summarized as an oriented, bp-weighted token multiset: each step
-// contributes its node's bp length to the token "<node_id><strand>". Two walks
-// are compared with weighted Jaccard = sum(min) / sum(max) over the token union,
-// which captures inversions (strand in the token) and copy number (repeats add
-// weight) while staying order-insensitive. std::map keeps tokens sorted so the
-// Jaccard merge is a linear two-pointer pass.
+// Path clustering by source->sink walk: summarize a walk as an oriented, bp-weighted token multiset
+// (token "<node><strand>" weighted by node bp), compared with weighted Jaccard sum(min)/sum(max).
+// Order-insensitive; captures inversion (strand) and copy number (repeat weight). Sorted map so the
+// merge is a linear two-pointer pass.
 using TokenWeights = std::map<std::string, std::size_t>;
 
 TokenWeights build_token_weights(const Graph& graph, const std::vector<PathStep>& steps) {
@@ -169,21 +165,11 @@ double weighted_jaccard_tokens(const TokenWeights& a, const TokenWeights& b) {
     return uni == 0 ? 0.0 : static_cast<double>(inter) / static_cast<double>(uni);
 }
 
-// --- Fast non-greedy clustering: walk MinHash sketch + threshold-graph CC ------
-//
-// A fast, order-independent clusterer. Each walk is summarized by a bottom-k MinHash
-// sketch over oriented node-step shingles; sketch Jaccard estimates identity; walks
-// within `--cluster-similarity` are united with a disjoint-set forest, so clusters are
-// the connected components (transitive, order-independent).
-//
-// The sketch is **multiplicity-aware**: a shingle seen k times contributes k distinct
-// sketch elements (its occurrence index is folded into the hash), so the sketch Jaccard
-// approximates the shingle *multiset* Jaccard rather than the plain set Jaccard. This
-// matters for tandem repeats (e.g. LPA KIV-2): two haplotypes that share the same repeat
-// unit but at different copy numbers have nearly identical shingle *sets* but very
-// different *multisets*, so a set sketch would merge all copy numbers into one cluster
-// while the multiset sketch separates them by copy number — consistent with the
-// copy-number-aware `weighted_jaccard_tokens` fallback used for un-shingleable walks.
+// Fast clustering: each walk -> bottom-k MinHash sketch over oriented node-step shingles; sketch
+// Jaccard estimates identity; walks within --cluster-similarity are unioned (disjoint-set), clusters
+// = connected components. The sketch is multiplicity-aware (a shingle's occurrence index folds into
+// the hash) so it approximates the multiset Jaccard - needed to separate tandem-repeat haplotypes
+// (LPA KIV-2) sharing a unit at different copy numbers. MinHash: Broder 1997; Mash: Ondov et al. 2016.
 std::uint64_t splitmix64(std::uint64_t x) {
     x += 0x9e3779b97f4a7c15ULL;
     x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;

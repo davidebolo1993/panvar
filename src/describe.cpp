@@ -277,6 +277,8 @@ std::vector<KmerOccurrence> collect_canonical_kmer_occurrences(
     return out;
 }
 
+// Closed syncmer: keep a k-mer iff its minimal s-mer is at the first or last position.
+// Edgar 2021, https://doi.org/10.7717/peerj.10805
 bool is_closed_syncmer(std::uint64_t code, std::size_t k, std::size_t s) {
     if (s == 0 || s > k) {
         return false;
@@ -532,13 +534,8 @@ void update_kmer_stats(
     }
 }
 
-// Shared keep rule for both feature layers. A feature is kept when it is
-// informative for association:
-//  - copy-number features (count varies across carrying paths) are always kept;
-//  - otherwise it must pass a symmetric minor-presence (MAF-style) cut:
-//    min(present, absent) > min_paths.
-// min_paths == 0 reproduces the legacy rule (drop only features present in every
-// path with one identical count).
+// Keep a feature if it's informative: copy-number features (count varies) always pass; otherwise it
+// needs a symmetric minor-presence cut min(present, absent) > min_paths. min_paths==0 keeps near-all.
 bool feature_passes_filter(
     std::size_t present_paths,
     std::uint32_t min_nonzero_count,
@@ -588,18 +585,10 @@ std::unordered_map<std::uint64_t, std::size_t> make_feature_id_map(
     return out;
 }
 
-// --- Node and edge dosage features ----------------------------------------
-// Per-bubble association substrate that parallels the k-mer features but is
-// keyed by graph coordinates: how many times each path traverses each inside
-// node (node dosage) and each oriented step-to-step transition (edge dosage).
-// Shares node IDs with the k-mer feature map and the future graph-native calls.
-//
-// Node dosage is a DESCRIPTIVE traversal count, not a copy-number call: a count
-// > 1 may be a tandem duplication or just the same node revisited elsewhere in
-// the walk. Adjacency (the real tandem signal) is captured by the edge layer -
-// a tandem block repeats an edge, scattered reuse does not. True CN/duplication
-// (adjacent-block detection with motif/region size thresholds) is left to the
-// graph-native variant-calling step.
+// Node/edge dosage: the graph-coordinate substrate paralleling the k-mers - per-path traversal counts
+// per inside node and per oriented edge. This is a descriptive count, not a CN call (a node revisited
+// elsewhere also counts >1); the edge layer carries the real adjacency/tandem signal. CN calling lives
+// in variant_call.cpp.
 
 struct GraphFeatureStat {
     std::size_t present_paths = 0;

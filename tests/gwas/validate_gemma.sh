@@ -1,14 +1,7 @@
 #!/usr/bin/env bash
-# Validate `panvar associate` against GEMMA on identical BIMBAM inputs.
-#
-# We feed the SAME synthetic genome-wide-like panel (make_lpa_phenotype.py --sim-markers: real KIV-2 dosage
-# + subpop-stratified null SNPs) and the SAME phenotype/covariates to both engines and compare the genotype
-# effect (beta) and significance (-log10 p) per feature:
-#   * linear model : panvar `associate --model linear` (PC covariates)  vs  GEMMA `-lm 4` (Wald)
-#   * mixed model  : panvar `associate --model lmm --kinship K`         vs  GEMMA `-lmm 4 -k K`
-# Concordance is the Pearson r of beta and of -log10 p over the shared features, plus top-hit agreement.
-# BIMBAM is GEMMA's native mean-genotype format, so no reformatting of the genotypes is needed.
-#
+# Validate `panvar associate` against GEMMA on the same BIMBAM panel + phenotype: linear (vs GEMMA -lm 4)
+# and mixed (vs -lmm 4 -k). Reports Pearson r of beta and -log10 p. See docs/gwas/example.md. Skips if no
+# GEMMA. BIMBAM is GEMMA's native format, so genotypes load unchanged.
 #   validate_gemma.sh <panvar_bin> <out_dir> [python] [gemma_bin] [copies.tsv]
 set -uo pipefail
 

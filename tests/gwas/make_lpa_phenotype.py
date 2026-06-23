@@ -93,15 +93,13 @@ def main(argv):
     print(f"KIV-2 bubble={kiv2_bubble}; {len(haps)} haplotypes; CN range "
           f"{min(cn.values())}..{max(cn.values())}")
 
-    # ---- subpopulations: each favors a different part of the KIV-2 spectrum (structure in allele
-    # frequency) and carries a baseline Lp(a) offset independent of KIV-2 (the confounder). ----
+    # subpopulations: each tilts the KIV-2 frequency and carries an Lp(a) offset independent of KIV-2 (the confounder)
     K = max(1, a.subpops)
     cn_lo, cn_hi = min(cn.values()), max(cn.values())
     cn_mid = 0.5 * (cn_lo + cn_hi)
     # per-subpop tilt of the CN sampling weights: subpop 0 favors LOW CN (-> high Lp(a)), last favors HIGH
     tilts = [(-1.0 + 2.0 * k / max(1, K - 1)) for k in range(K)] if K > 1 else [0.0]
-    # per-subpop baseline log10 Lp(a) offset (the confounder: ancestry shifts Lp(a) independently of
-    # KIV-2), spanning ~+-0.4 log units -> strong enough to inflate a naive scan as n grows
+    # per-subpop baseline log10 Lp(a) offset (the confounder), ~+-0.4 log units -> inflates a naive scan
     offsets = [(-0.4 + 0.8 * k / max(1, K - 1)) for k in range(K)] if K > 1 else [0.0]
     subpop_frac = [0.45, 0.35, 0.20] if K == 3 else [1.0 / K] * K
 
@@ -177,8 +175,7 @@ def main(argv):
     write_pheno(os.path.join(a.out_dir, "pheno.quant.nopc.tsv"), "log10lpa", qfmt, False)
     write_pheno(os.path.join(a.out_dir, "pheno.binary.nopc.tsv"), "case", bfmt, False)
 
-    # ---- optional kinship: GRM from haplotype sharing (structure-bearing, NOT region-restricted to the
-    # causal node). Skipped for large n (dense text GRM is impractical) and if numpy is unavailable. ----
+    # optional kinship GRM from genome-wide haplotype sharing; skipped for large n or no numpy
     if a.kinship_out:
         if a.n > a.kinship_max_n:
             print(f"  (skipping kinship: n={a.n} > --kinship-max-n={a.kinship_max_n}; "
@@ -204,14 +201,9 @@ def main(argv):
                         f.write("\t".join(f"{x:.6g}" for x in Kmat[i]) + "\n")
                 print(f"  wrote kinship GRM {a.kinship_out} ({a.n}x{a.n})")
 
-    # ---- optional synthetic genome-wide-like panel for the STRUCTURE-CORRECTION demo ----
-    # A single-region scan has essentially no null markers, so genomic inflation lambda is not
-    # interpretable there. To teach how PCs / LMM control population structure we emit a synthetic
-    # panel: the real causal KIV-2 dosage (so it tops the scan) PLUS many SUBPOP-STRATIFIED null SNPs
-    # whose allele frequency differs by subpopulation. Combined with the subpop Lp(a) offset, the nulls
-    # are spuriously associated under a naive scan (inflated lambda); adding the ancestry PCs or running
-    # the LMM with a panel-derived GRM removes that inflation while KIV-2 survives. (Files: BIMBAM
-    # dosage + sample order + feature_annot; the causal feature uses the real node id 4789.)
+    # optional synthetic genome-wide panel for the structure-correction demo: real KIV-2 dosage +
+    # subpop-stratified null SNPs. The nulls are spuriously associated under a naive scan (inflated
+    # lambda) but corrected by PCs/LMM, while KIV-2 survives. See docs/gwas/example.md.
     if a.sim_markers > 0:
         try:
             import gzip

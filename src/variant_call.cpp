@@ -66,11 +66,9 @@ std::unordered_set<std::string> self_loop_nodes(const Graph& graph) {
     return out;
 }
 
-// Steps of `path` across `bubble` in canonical source->sink orientation. Falls back to
-// an empty-interior allele ([source, sink]) when the path crosses the bubble with no
-// interior node — a pure deletion, or the short side of a pure insertion. The shared
-// inside-node-only interval finder skips those (it requires inside_count >= 1), which
-// would otherwise drop the deleting allele entirely and make single-node indels invisible.
+// Steps of `path` across `bubble` (canonical source->sink). Falls back to an empty interior
+// ([source, sink]) for paths that cross with no inside node (a pure deletion / short side of an
+// insertion), which the inside-node-only interval finder would otherwise drop.
 std::optional<std::vector<PathStep>> bubble_steps(
     const PathRecord& path, const BubblePathIndex& index, const Bubble& bubble) {
     const auto iv = find_best_bubble_path_interval(index, bubble);
@@ -292,13 +290,9 @@ void diff_segment(
     flush_block(ref_blk, hap_blk);
 }
 
-// Read off DEL/INS/INV events of the haplotype vs the reference. To scale to large
-// bubbles (e.g. a 2500-node gene-presence bubble), the two walks are first split at
-// shared **anchor** tokens (nodes appearing exactly once in both walks, chained in a
-// common monotonic order); the quadratic DP then runs only within the small segments
-// between anchors. This bounds cost, removes the whole-bubble cap, and gives consistent
-// breakpoints so the same large event (e.g. a gene deletion) is identical across
-// haplotypes and merges cleanly. DUP/CN is handled separately (CN nodes already excluded).
+// DEL/INS/INV of haplotype vs reference. Split both walks at shared anchors (tokens unique in both,
+// chained in monotonic order) so the quadratic DP runs only between anchors - bounds cost on huge
+// bubbles and gives identical breakpoints across haplotypes so the same event merges. CN is separate.
 std::vector<Event> diff_walks(
     const Graph& graph,
     const std::vector<Tok>& R,
@@ -476,11 +470,8 @@ double weighted_jaccard(
     return uni == 0 ? 0.0 : static_cast<double>(inter) / static_cast<double>(uni);
 }
 
-// Banded alignment identity between two event sequences, gated on a length ratio
-// (so wildly different sizes are not compared). `len_ratio` is the minimum
-// shorter/longer length ratio to even attempt the comparison; decoupling it from the
-// identity threshold lets the caller merge same-motif events of very different sizes
-// (e.g. STR alleles) when `--merge-size-ratio` is lowered. 0 when either is empty.
+// Banded-alignment identity between two event sequences, gated by len_ratio (min shorter/longer to
+// even compare - decoupled from min_id so same-motif STR alleles of different size can still merge).
 double seq_identity(const std::string& a, const std::string& b, double min_id, double len_ratio) {
     if (a.empty() || b.empty()) return 0.0;
     const std::size_t lo = std::min(a.size(), b.size());

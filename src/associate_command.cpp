@@ -186,7 +186,7 @@ FitResult fit_logistic(const std::vector<double>& X, const std::vector<double>& 
     return r;
 }
 
-// Benjamini-Hochberg q-values for a vector of p-values (NaN entries get NaN q).
+// Benjamini-Hochberg FDR q-values (NaN entries get NaN q). Benjamini & Hochberg 1995, JRSS-B.
 std::vector<double> bh_qvalues(const std::vector<double>& pv) {
     std::vector<std::size_t> idx;
     for (std::size_t i = 0; i < pv.size(); ++i) if (std::isfinite(pv[i])) idx.push_back(i);
@@ -217,9 +217,9 @@ double genomic_lambda(const std::vector<double>& zs) {
 }
 
 // ---- LMM (EMMAX-style) ---------------------------------------------------------------------------
-// Eigendecompose the kinship K once, rotate phenotype + covariates, estimate the variance ratio
-// delta = sigma_e^2 / sigma_g^2 once under the null, then test each feature by GLS in the rotated
-// space with weights 1/(eigenvalue + delta). This is the standard fast-LMM approximation.
+// Eigendecompose the kinship K once, rotate phenotype + covariates, estimate delta = sigma_e^2/sigma_g^2
+// once under the null, then test each feature by GLS in the rotated space with weights 1/(d_i + delta).
+// EMMAX: Kang et al. 2010, https://doi.org/10.1038/ng.548 ; cf. GEMMA, Zhou & Stephens 2012.
 struct LmmNull {
     Eigen::VectorXd d;     // kinship eigenvalues (n)
     Eigen::MatrixXd U;     // kinship eigenvectors (n x n)

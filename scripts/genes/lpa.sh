@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# LPA (KIV-2) per-gene driver -- DATA ONLY (no plots; plot commands commented at the bottom).
-# Topology: tandem repeat -> panphorte folds the KIV-2 tandem into a REP node; call on the
-# PANPHORTE graph with --cn-from-multiplicity. panphorte min-similarity 0.97; inspect clustering 0.95.
-# Then runs the GWAS: synthetic structured cohort -> describe --samples -> associate (region scan +
-# structure-correction demo). The GWAS needs a numpy-capable python (set PYTHON=...).
+# LPA (KIV-2) driver: tandem repeat, called on the panphorte graph with --cn-from-multiplicity.
+# Runs the data pipeline then the GWAS (cohort sim -> describe --samples -> associate, region scan +
+# structure demo). Needs a numpy-capable python.
 #   PYTHON=~/miniconda3/bin/python scripts/genes/lpa.sh        # env: N (cohort size), SIM (null markers)
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; source "$HERE/_common.sh"
 region=lpa; d="$OUT/$region"

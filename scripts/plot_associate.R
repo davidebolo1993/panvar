@@ -1,12 +1,6 @@
 #!/usr/bin/env Rscript
-# Manhattan (before/after multiple-testing correction) + QQ from `panvar associate` output.
-#
+# Manhattan (before/after correction) + QQ for `panvar associate` output. See docs/gwas/primer.md.
 #   Rscript plot_associate.R --assoc out.assoc.tsv [--summary out.summary.tsv] --out prefix [--title T]
-#
-# assoc.tsv columns: feature_id, layer, bubbles, nodes, n, minor_freq, beta|log_or, se, z, p, p_bonf, q_bh, gene.
-# Writes <prefix>.manhattan.png/pdf -- two stacked panels: BEFORE correction (raw -log10 p, nominal +
-# Bonferroni lines) and AFTER correction (BH -log10 q, q=0.05 line). x = node id (graph) or per-k-mer
-# index ordered by node id (k-mers); genes flagged with ggrepel labels from the `gene` column.
 suppressWarnings(suppressMessages(library(ggplot2)))
 
 args <- commandArgs(trailingOnly = TRUE)
@@ -22,20 +16,16 @@ d <- d[is.finite(d$p), ]
 if (nrow(d) == 0) stop("no finite p-values in ", assoc)
 n_tests <- nrow(d)
 
-# region-wide Bonferroni threshold (0.05 / n_tests); read n_tests from summary if given (authoritative)
+# prefer the summary's feature count (authoritative) for the Bonferroni denominator
 if (!is.null(summary_path) && file.exists(summary_path)) {
   s <- read.delim(summary_path, sep = "\t", header = TRUE, check.names = FALSE)
   v <- s$value[s$key == "features_tested"]; if (length(v) == 1) n_tests <- as.numeric(v)
 }
 bonf <- 0.05 / n_tests
-# FDR line: the largest raw p whose q < 0.05 (so points above it pass BH); NA if none
 fdr_p <- suppressWarnings(max(d$p[is.finite(d$q_bh) & d$q_bh < 0.05]))
 if (!is.finite(fdr_p)) fdr_p <- NA_real_
 
-# x-axis. Graph features ARE node/edge ids -> use the node id (genomic order). k-mers are many-per-node
-# (and several can share a node), so use a per-k-mer INDEX ordered by node id: each k-mer is its own
-# column, grouped by locus, so you can see how many k-mers pop up. The kmer<->node(<->gene) link now
-# lives in feature_annot / the assoc `nodes` & `gene` columns (so this stays traceable).
+# x = node id for graph features; for k-mers (many per node) a per-node-ordered index, one column each
 first_int <- function(x) suppressWarnings(as.numeric(sub("^[^0-9]*([0-9]+).*$", "\\1", x)))
 node1 <- first_int(d$nodes)
 layer <- if ("layer" %in% names(d)) d$layer else rep(".", nrow(d))
@@ -57,11 +47,8 @@ d$sig <- ifelse(d$p < bonf, "Bonferroni",
                 ifelse(is.finite(d$q_bh) & d$q_bh < 0.05, "FDR<0.05", "ns"))
 d$sig <- factor(d$sig, levels = c("ns", "FDR<0.05", "Bonferroni"))
 
-# Two stacked panels on the SAME run: BEFORE correction (raw -log10 p, with the nominal 0.05 and
-# region-wide Bonferroni lines -- every nominally-significant node shows here, LD/structure noise
-# included) and AFTER correction (Benjamini-Hochberg -log10 q, with the q=0.05 line -- only the
-# features that survive multiple-testing stay up; the rest collapse toward 0). Point colour is the
-# overall verdict in both panels, so you can see which 'before' peaks are real vs noise.
+# two panels: raw -log10 p (with nominal + Bonferroni lines), then BH -log10 q (q=0.05 line).
+# colour is the overall verdict in both, so noise peaks in the top panel collapse in the bottom.
 lv <- c("before correction: raw -log10(p)", "after correction: BH -log10(q)")
 long <- rbind(
   data.frame(x = d$x, y = d$logp, sig = d$sig, panel = lv[1]),
@@ -73,10 +60,8 @@ thr <- data.frame(
   col   = c("grey50", "#d95f02", "#2c7fb8"),
   lty   = c("dotted", "dashed", "dashed"))
 
-# Gene flags: one label per gene, placed at its most-significant feature, in BOTH panels (at its raw
-# -log10 p height in the "before" panel and its -log10 q height in the "after" panel). Only genes whose
-# top feature SURVIVES correction (Bonferroni or BH FDR<0.05) are labelled, so near-nominal neighbours
-# aren't flagged as noise. Needs the `gene` column (`associate --node-genes call.node_genes.tsv`).
+# one label per gene at its top feature, in both panels; only genes that survive correction (needs
+# the `gene` column from `associate --node-genes`)
 lab <- NULL
 if ("gene" %in% names(d)) {
   g <- d[!is.na(d$gene) & d$gene != "." & (d$p < bonf | (is.finite(d$q_bh) & d$q_bh < 0.05)), ]

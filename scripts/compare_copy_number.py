@@ -178,9 +178,7 @@ def main():
         new = not os.path.exists(args.dump_tsv) or os.path.getsize(args.dump_tsv) == 0
         with open(args.dump_tsv, "a") as out:
             if new:
-                # called_cn = absolute CN from the VCF (total collapsed-module count); baseline_offset =
-                # the constant paralog baseline (called-minus-truth mode) so a plot can show the recovered
-                # GENE copy number called_cn - baseline_offset against truth_cn.
+                # baseline_offset = constant paralog baseline, so a plot shows called_cn - offset vs truth_cn
                 out.write("gene\tsample\ttruth_cn\tcalled_cn\tbaseline_offset\tis_reference\n")
             for s in shared:
                 is_ref = 1 if any(r in s for r in refs) else 0
