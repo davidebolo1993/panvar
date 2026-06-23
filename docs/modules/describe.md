@@ -59,7 +59,7 @@ VCF: the `panphorte`
 | `bubble_<id>/kmer_features.tsv.gz` + `kmer_counts.jsonl.gz` | k-mer map (with `nodes` provenance) + per-path sparse counts |
 | `bubble_<id>/{kmer,graph}_matrix.tsv.gz` | dense feature × path matrices — **only without `--no-wide-matrix`** (the gene drivers pass `--no-wide-matrix`, so these are normally absent; the feature maps + JSONL carry the same information) |
 
-Dosages are raw counts (not rescaled to 0–2), so a CN-50 KIV-2 haplotype shows 50; `NA` = a haplotype
+Dosages are raw counts (not rescaled to 0–2), so a haplotype carrying 50 copies shows 50; `NA` = a haplotype
 that doesn't traverse the feature's bubble (distinct from `0` = traverses but reference).
 
 `feature_annot.tsv.gz` (one row per BIMBAM feature, in row order) carries the provenance of each genotype:

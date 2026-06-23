@@ -140,8 +140,10 @@ node ≥ `--min-sv-bp`, e.g. LPA's 5.5 kb KIV-2 node) — its integer loop count
 Coverage is suppressed only by a real `REP` unit, so an incidental tiny PGGB self-loop (e.g. C4's 22 bp node,
 below `--min-sv-bp`) does not block it — C4/CYP2D6 stay on coverage while LPA uses the exact self-loop. Because
 coverage never overrides a real tandem count, passing both `--cn-from-coverage` and `--cn-from-multiplicity`
-is safe on either graph. With no CN flag, an extra copy surfaces as an `INS`
-(`INS_SUBTYPE=DUP` under `--classify-ins`). The two folded-cluster detectors report **absolute** per-haplotype
+is safe on either graph. The self-loop route is always on, so a `REP` tandem is called as a `DUP` even with
+no CN flag; it is a **folded** extra copy (the coverage/peak topologies) that, without its flag, instead
+surfaces as an `INS` (`INS_SUBTYPE=DUP` under `--classify-ins`) — its duplicated nodes look haplotype-only to
+the walk diff. The two folded-cluster detectors report **absolute** per-haplotype
 CN (reference only sets the unit-bp denominator), unlike the reference-relative DEL/INS/INV diff.
 
 ## Merge keys — Jaccard vs sequence identity

@@ -13,15 +13,14 @@ self-loop traversals — which `call` reads straight off the self-loop (this pat
 Mechanism, exact-vs-approximate collapse, and a worked trace:
 [algorithms/panphorte.md](../algorithms/panphorte.md).
 
-> Scope. panphorte targets contiguous tandems — a unit repeated in-line, e.g. LPA KIV-2 — folding each to a
-> `REP` self-loop that `call` reads as copy number (always on, no flag). Paralog clusters (C4, CYP2D6) are
-> folded by PGGB onto shared nodes, not laid out as a contiguous tandem, so there is usually no
-> adjacent-identical unit for panphorte to seed; their copy number is recovered by `call --cn-from-coverage`
-> on the `bubble` graph (see the
-> [CN-topology table](../algorithms/call.md#copy-number-one-method-per-locus-topology)). Do not call paralog
-> CN on the panphorte graph: anything panphorte does fold there — more aggressively as `--min-similarity`
-> drops — changes node identity and the per-walk bp that `--cn-from-coverage` measures, so the two substrates
-> are not interchangeable. One substrate per topology.
+> Scope. panphorte targets contiguous tandems — a unit repeated in-line — folding each to a `REP` self-loop
+> that `call` reads as copy number (always on, no flag). Paralog clusters folded by PGGB onto shared nodes are
+> not laid out as a contiguous tandem, so there is usually no adjacent-identical unit for panphorte to seed;
+> their copy number is recovered by `call --cn-from-coverage` on the `bubble` graph instead. Do not call
+> paralog CN on the panphorte graph: anything panphorte does fold there — more aggressively as
+> `--min-similarity` drops — changes node identity and the per-walk bp that `--cn-from-coverage` measures, so
+> the two substrates are not interchangeable. One substrate per topology; the per-locus mapping is the
+> [CN-topology table](../algorithms/call.md#copy-number-one-method-per-locus-topology).
 
 ## Required inputs
 

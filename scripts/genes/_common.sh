@@ -41,7 +41,7 @@ run_gene_data() {
   echo "[$region] reference: $ref ; call graph: $call_graph ; panphorte sim: $pan_sim ; inspect cluster: $clu"
 
   # 1) bubble (reference-oriented sort + cactus snarls)
-  "$BIN" bubble -i "$gfa" -o "$d/bubble/bubble" -r "$ref" "${GTFOPT[@]}" --quiet || return 1
+  "$BIN" bubble -i "$gfa" -o "$d/bubble/bubble" -r "$ref" ${GTFOPT[@]+"${GTFOPT[@]}"} --quiet || return 1
   local sgfa="$d/bubble/bubble.sorted.gfa"
 
   # 2) inspect the largest repeat bubble on the BUBBLE graph (pre-panphorte), with walk clustering
@@ -51,7 +51,7 @@ run_gene_data() {
 
   # 3) panphorte (normalized + re-sorted)
   "$BIN" panphorte -i "$sgfa" --bubble-prefix-in "$d/bubble/bubble" -o "$d/panphorte/panphorte" \
-    --reference-path "$ref" --min-similarity "$pan_sim" --threads "$THREADS" "${GTFOPT[@]}" --quiet || return 1
+    --reference-path "$ref" --min-similarity "$pan_sim" --threads "$THREADS" ${GTFOPT[@]+"${GTFOPT[@]}"} --quiet || return 1
   local pgfa="$d/panphorte/panphorte.normalized.sorted.gfa"
 
   # graph + bubble prefix that call/describe read, per topology
@@ -61,7 +61,7 @@ run_gene_data() {
 
   # 4) call
   "$BIN" call -i "$cgfa" --bubble-prefix-in "$cpfx" --reference-path "$ref" \
-    -o "$d/call/call" --threads "$THREADS" "${GTFOPT[@]}" --quiet $call_extra || return 1
+    -o "$d/call/call" --threads "$THREADS" ${GTFOPT[@]+"${GTFOPT[@]}"} --quiet $call_extra || return 1
 
   # 5) inspect the main copy-number bubble on the CALL graph (node ids line up 1:1 with the VCF)
   local cbub; cbub="$(main_dup_bubble "$d/call/call.region.vcf")"

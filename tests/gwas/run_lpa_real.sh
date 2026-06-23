@@ -34,7 +34,7 @@ PGFA="$OUT_DIR/pan.normalized.sorted.gfa"
 # synthetic structure-demo panel; kinship GRM only when N is small enough for a dense matrix file.
 KOPT=(); [ "$N" -le "$LMM_MAX_N" ] && KOPT=(--kinship-out "$REAL/kinship.tsv")
 "$PY" "$HERE/make_lpa_phenotype.py" "$OUT_DIR/pan.panphorte.copies.tsv" "$REAL" \
-  --n "$N" --sim-markers "$SIM" "${KOPT[@]}"
+  --n "$N" --sim-markers "$SIM" ${KOPT[@]+"${KOPT[@]}"}
 
 echo "== call -> describe --samples (per-sample BIMBAM dosage) =="
 GTF="${GTF:-$REPO/tests/real_data/Homo_sapiens.GRCh38.116.gtf.gz}"
@@ -62,7 +62,7 @@ for sub in graph kmers; do
   for mode in quant binary; do
     echo "   -- associate ($sub / $mode) --"
     "$PANVAR_BIN" associate --genotypes "$GENO" --samples "$SAMP" --feature-annot "$ANNOT" \
-      "${NGOPT[@]}" --phenotype "$REAL/pheno.${mode}.tsv" --min-maf 0.02 -o "$OUT_DIR/assoc_${sub}_${mode}"
+      ${NGOPT[@]+"${NGOPT[@]}"} --phenotype "$REAL/pheno.${mode}.tsv" --min-maf 0.02 -o "$OUT_DIR/assoc_${sub}_${mode}"
     plot "$OUT_DIR/assoc_${sub}_${mode}" "LPA Lp(a) ($sub, $mode)"
   done
 done

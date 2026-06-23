@@ -98,8 +98,8 @@ Script flags (needs `Rscript` + `ggplot2`):
 
 Copy-number concordance against ground truth (used by `scripts/regen_results.sh`) is plotted by
 `scripts/plot_cn_correlation.R` (`--table <cn_table.tsv>`, `--out <prefix>`, optional `--width`/`--height`/`--dpi`),
-which writes `<prefix>.loci.png` (the four loci as total counts) and `<prefix>.genes.png` (the resolved
-CYP2D6/CYP2D7 split).
+which writes `<prefix>.loci.png` (per-locus total counts) and `<prefix>.genes.png` (the resolved
+per-paralog split, where genes in a collapsed cluster are separable).
 
 ## Gene annotation (`--gtf`)
 
@@ -112,9 +112,8 @@ realignment can separate vs near-identical ones reported as a collapsed module t
 
 ## Example
 
-Matches `scripts/genes/lpa.sh` (LPA = tandem → panphorte graph, CN read from the always-on self-loop `REP`;
-the `--cn-from-multiplicity` below is harmless belt-and-suspenders for any LPA bubble that did not fold. Other
-genes use `--cn-from-coverage` on the `bubble` graph — see `scripts/genes/`):
+Calling a tandem locus on the panphorte graph; both opt-in CN flags are shown and are safe to pass together.
+Other graph topologies call on the `bubble` graph (see `scripts/genes/` for the per-locus invocations):
 
 ```bash
 ./build/panvar call \

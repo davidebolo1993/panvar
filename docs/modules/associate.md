@@ -101,7 +101,7 @@ Script flags (needs `Rscript` + `ggplot2`; `ggrepel` optional, for the gene labe
 Matches `tests/gwas/run_lpa_real.sh` (region scan, PC-adjusted) and its structure-correction demo:
 
 ```bash
-# region scan: KIV-2 recovery (PCs are covariate columns in the phenotype table)
+# region scan (PCs are covariate columns in the phenotype table)
 ./build/panvar associate \
   --genotypes results/real_data/lpa/gwas/desc/bimbam_graph.samples.bimbam.gz \
   --samples   results/real_data/lpa/gwas/desc/bimbam.samples.samples.txt.gz \

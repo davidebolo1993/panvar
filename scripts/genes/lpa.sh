@@ -20,7 +20,7 @@ pgfa="$d/panphorte/panphorte.normalized.sorted.gfa"; pfx="$d/panphorte/panphorte
 gw="$d/gwas"; real="$gw/real"; mkdir -p "$real"
 KOPT=(); [ "$N" -le "$LMM_MAX_N" ] && KOPT=(--kinship-out "$real/kinship.tsv")
 "$PY" "$HERE/../../tests/gwas/make_lpa_phenotype.py" "$d/panphorte/panphorte.panphorte.copies.tsv" \
-  "$real" --n "$N" --sim-markers "$SIM" "${KOPT[@]}" || exit 1
+  "$real" --n "$N" --sim-markers "$SIM" ${KOPT[@]+"${KOPT[@]}"} || exit 1
 NGOPT=(); [ -f "$d/call/call.node_genes.tsv" ] && NGOPT=(--node-genes "$d/call/call.node_genes.tsv")
 "$BIN" describe -i "$pgfa" --bubble-prefix-in "$pfx" --out-dir "$gw/desc" --kmer-size 31 \
   --no-wide-matrix --variant-nodes "$d/call/call.variant_nodes.tsv" --samples "$real/samples.tsv" --quiet || exit 1
@@ -29,7 +29,7 @@ DESC="$gw/desc"; SAMP="$DESC/bimbam.samples.samples.txt.gz"; ANNOT="$DESC/featur
 echo "[lpa] region scan (associate, PC-adjusted)"
 for sub in graph kmers; do for mode in quant binary; do
   "$BIN" associate --genotypes "$DESC/bimbam_${sub}.samples.bimbam.gz" --samples "$SAMP" \
-    --feature-annot "$ANNOT" "${NGOPT[@]}" --phenotype "$real/pheno.${mode}.tsv" --min-maf 0.02 \
+    --feature-annot "$ANNOT" ${NGOPT[@]+"${NGOPT[@]}"} --phenotype "$real/pheno.${mode}.tsv" --min-maf 0.02 \
     -o "$gw/assoc_${sub}_${mode}"
 done; done
 echo "[lpa] structure-correction demo (naive / PC / LMM) on the synthetic panel"
