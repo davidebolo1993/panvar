@@ -120,8 +120,10 @@ genes use `--cn-from-coverage` on the `bubble` graph — see `scripts/genes/`):
 ./build/panvar call \
   -i results/real_data/lpa/panphorte/panphorte.normalized.sorted.gfa \
   --bubble-prefix-in results/real_data/lpa/panphorte/panphorte \
-  --reference-path GRCh38 -o results/real_data/lpa/call/call \
-  --cn-from-multiplicity --gtf tests/real_data/Homo_sapiens.GRCh38.116.gtf.gz
+  --reference-path grch38#1 -o results/real_data/lpa/call/call \
+  --cn-from-multiplicity \
+  --cn-from-coverage \
+  --gtf tests/real_data/Homo_sapiens.GRCh38.116.gtf.gz
 ```
 
 Algorithm & worked examples: [algorithms/call.md](../algorithms/call.md). References:

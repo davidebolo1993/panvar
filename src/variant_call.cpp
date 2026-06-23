@@ -1633,26 +1633,54 @@ void call_variants(
         write_node_genes_tsv(options.out_prefix + ".node_genes.tsv", node_genes, genes);
 
         if (!dup_targets.empty()) {
-            const std::string ref_full_seq = spell_path_steps_sequence(graph, ref_path->steps);
-            const std::size_t region_start = ref_meta.region_start_1based;
-            auto gene_seq_of = [&](int gi) -> std::string {
-                const GeneFeature& g = genes[gi];
-                if (g.start_1based < region_start) return std::string();
-                const std::size_t off = g.start_1based - region_start;
-                if (off >= ref_full_seq.size()) return std::string();
-                const std::size_t len = std::min(g.end_1based - g.start_1based + 1, ref_full_seq.size() - off);
-                return ref_full_seq.substr(off, len);
+            // A DUP overlapping a SINGLE gene needs no realignment: with no paralog to compete, that
+            // gene's copy number is just the module total (FORMAT:CN) already computed. Competitive
+            // realignment (minimap2 of the gene vs every haplotype) is only meaningful on multi-gene
+            // folded loci (CYP2D6/2D7, C4A/C4B), where graph multiplicity reports the module total but
+            // not the per-gene split. So the costly per-haplotype pass — and even spelling every
+            // haplotype — runs only when some target has >=2 genes. This is what made LPA (one DUP over
+            // LPA alone, across all haplotypes) pay for hundreds of large minimap2 alignments for nothing.
+            const bool any_multi = std::any_of(dup_targets.begin(), dup_targets.end(),
+                [](const DupGeneTarget& t) { return t.gene_idx.size() >= 2; });
+
+            // Emit module-total rows for a target with no per-gene split (single gene, reliable).
+            auto emit_total = [&](const DupGeneTarget& t, const std::string& names, const char* reliable) {
+                for (const PathRecord& p : graph.paths) {
+                    const auto cit = t.sample_cn.find(p.name);
+                    const std::string total = cit != t.sample_cn.end() ? std::to_string(cit->second) : ".";
+                    dup_gene_cn_rows.push_back(std::to_string(t.bubble_id) + '\t' + t.variant_id + '\t' +
+                                               p.name + '\t' + names + '\t' + total + '\t' + reliable);
+                }
             };
+
             std::unordered_map<int, std::string> gene_seq_cache;
-            for (const DupGeneTarget& t : dup_targets)
-                for (int gi : t.gene_idx)
-                    if (!gene_seq_cache.count(gi)) gene_seq_cache[gi] = gene_seq_of(gi);
-            // Spell every haplotype once (parallel).
-            std::vector<std::string> hap_seq(graph.paths.size());
-            run_parallel(graph.paths.size(), options.threads, [&](std::size_t pi) {
-                hap_seq[pi] = spell_path_steps_sequence(graph, graph.paths[pi].steps);
-            });
+            std::vector<std::string> hap_seq;
+            if (any_multi) {
+                const std::string ref_full_seq = spell_path_steps_sequence(graph, ref_path->steps);
+                const std::size_t region_start = ref_meta.region_start_1based;
+                auto gene_seq_of = [&](int gi) -> std::string {
+                    const GeneFeature& g = genes[gi];
+                    if (g.start_1based < region_start) return std::string();
+                    const std::size_t off = g.start_1based - region_start;
+                    if (off >= ref_full_seq.size()) return std::string();
+                    const std::size_t len = std::min(g.end_1based - g.start_1based + 1, ref_full_seq.size() - off);
+                    return ref_full_seq.substr(off, len);
+                };
+                for (const DupGeneTarget& t : dup_targets)
+                    if (t.gene_idx.size() >= 2)
+                        for (int gi : t.gene_idx)
+                            if (!gene_seq_cache.count(gi)) gene_seq_cache[gi] = gene_seq_of(gi);
+                // Spell every haplotype once (parallel).
+                hap_seq.assign(graph.paths.size(), std::string());
+                run_parallel(graph.paths.size(), options.threads, [&](std::size_t pi) {
+                    hap_seq[pi] = spell_path_steps_sequence(graph, graph.paths[pi].steps);
+                });
+            }
             for (const DupGeneTarget& t : dup_targets) {
+                if (t.gene_idx.size() < 2) {   // single gene: the module total IS the gene's copy number
+                    emit_total(t, genes[t.gene_idx[0]].gene_name, "1");
+                    continue;
+                }
                 std::vector<std::string> gseqs;
                 gseqs.reserve(t.gene_idx.size());
                 for (int gi : t.gene_idx) gseqs.push_back(gene_seq_cache[gi]);

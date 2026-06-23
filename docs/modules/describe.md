@@ -5,24 +5,30 @@ CLI: `panvar describe`
 ## What it does
 
 Converts each called bubble into haplotype features for association on two mirrored substrates that share the
-same graph coordinates. The primary, read-queryable substrate is k-mers: canonical k-mers per path,
+same graph coordinates. The first, read-queryable substrate is k-mers: canonical k-mers per path,
 sampled with [closed syncmers](../algorithms/describe.md#terms) by default, each carrying its node
-provenance. The complementary, graph-local substrate is node/edge dosage: traversal counts per node and
+provenance. The second, graph-local substrate is node/edge dosage: traversal counts per node and
 per oriented edge. Features that do not discriminate haplotypes are dropped from both substrates. The pooled
 cohort genotypes are exported as BIMBAM mean-genotype dosage (`bimbam_{kmers,graph}.bimbam.gz`), the
-canonical export read by [`associate`](associate.md) and by GEMMA. Encoding, the discriminative filter, and a
+canonical export read by [`associate`](associate.md) and by tools like [GEMMA](https://github.com/genetics-statistics/GEMMA). Encoding, the discriminative filter, and a
 worked trace: [algorithms/describe.md](../algorithms/describe.md).
 
-Sample-level (`--samples <cosigt.tsv>`): a GWAS tests samples, not haplotypes. Pass a cosigt table
+Sample-level (`--samples <cosigt.tsv>`): a GWAS tests samples, not haplotypes. Pass a [cosigt](https://github.com/davidebolo1993/cosigt) table
 (`sample <tab> hap1 <tab> hap2 …`) and describe also writes per-sample BIMBAM
 (`bimbam_{kmers,graph}.samples.bimbam.gz`) whose value is the summed dosage over the sample's haplotypes
 (diploid CN = CN_A + CN_B). See [gwas/example.md](../gwas/example.md).
 
 ## Required inputs
 
-`describe` runs after `panphorte` (graph = `.normalized.sorted.gfa`, bubbles = the `panphorte` prefix):
+`describe` must run on the **same graph and bubble prefix as `call`** so feature node ids line up with the
+VCF. That substrate is topology-dependent (the same choice `call` makes): the `panphorte`
+`.normalized.sorted.gfa` for tandem loci (e.g. LPA), the `bubble` `.sorted.gfa` for PGGB-folded paralog
+clusters (C4, CYP2D6). See the
+[CN-topology table](../algorithms/call.md#copy-number-one-method-per-locus-topology).
 
 - `-i, --gfa <path>`; one of `-b, --bubble-prefix-in <prefix>` or `-c, --bubbles-csv <path>`.
+- `--variant-nodes <call.variant_nodes.tsv>` to restrict features to `call`'s variant scope (recommended;
+  this is what keeps `describe` and the VCF in lockstep).
 
 ## Key options
 
@@ -74,7 +80,7 @@ feature × path count table.
 ## Association
 
 The BIMBAM exports feed [`panvar associate`](associate.md) directly (it tests the dosage, so copy-number
-loci are first-class) and GEMMA unchanged. A significant marker traces back via `nodes`/`bubbles` →
+loci are first-class). A significant marker traces back via `nodes`/`bubbles` →
 `call`'s `variant_nodes.tsv` → the variant, and (with `call --gtf` + `associate --node-genes`) to a gene.
 Worked end-to-end run: [gwas/example.md](../gwas/example.md); concepts: [gwas/primer.md](../gwas/primer.md).
 

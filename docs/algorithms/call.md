@@ -170,10 +170,13 @@ The bridge is the reference path's PanSN name (`grch38#1#chr6:31891045-32123783`
    `[start+prefix[k], start+prefix[k+1])`; intersect with gene intervals → `node_id → genes`. A node the
    reference visits at two coordinates (a folded paralog) is tagged with **both** genes — which is why
    multiplicity alone can't separate them.
-2. **Per-gene CN by competitive realignment (`call`).** For a DUP, each gene's reference sequence is
+2. **Per-gene CN by competitive realignment (`call`).** Only for a DUP overlapping **≥2 genes** — where
+   graph multiplicity reports the module total but not the per-gene split. Each gene's reference sequence is
    realigned (minimap2, all hits) to each haplotype; same-gene hits that are *target-adjacent but
    query-disjoint* chain into one copy (a copy split around a missing HERV counts once, via a gap-compressed
-   identity floor); each copy competes across genes by block identity and the winner claims the locus.
+   identity floor); each copy competes across genes by block identity and the winner claims the locus. A DUP
+   over a single gene skips realignment entirely: the module total *is* that gene's copy number (so e.g. LPA,
+   one DUP over `LPA` across all haplotypes, costs no per-haplotype alignment).
 3. **Reliability (collapse groups).** Cluster genes where one aligns to another at > 98% block identity over
    most of its length:
    ```text
