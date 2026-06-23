@@ -10,7 +10,7 @@ internally (a vendored cactus / 3-edge-connected decomposition matching `vg snar
 internal nodes from path intervals, scores path support + internal span, applies size/support filters, and
 writes the sorted GFA + a bubble CSV + Bandage visualization files.
 
-Mechanism, filters, and a worked trace: [algorithms/bubble.md](../algorithms/bubble.md).
+Algorithm and worked trace: [algorithms/bubble.md](../algorithms/bubble.md).
 
 ## Required inputs
 
@@ -30,7 +30,7 @@ Mechanism, filters, and a worked trace: [algorithms/bubble.md](../algorithms/bub
 | `--no-flip` | sort but don't reorient nodes to the reference strand | off |
 | `--snarls-in <path>` | use an external `vg snarls` JSONL (graph used as-is, no sort) | — |
 | `--emit-snarls-jsonl <path>` | also write the internal snarls as `vg`-style JSONL | — |
-| `--snarl-debug-tsv <path>` | per-candidate diagnostics ([columns](../algorithms/bubble.md#debug-tsv---snarl-debug-tsv)) | — |
+| `--snarl-debug-tsv <path>` | write per-snarl-candidate diagnostics (`candidate_id, source, sink, inside_node_count, n_paths, min_inside_bp, long_path_support, inversion_signal, accepted`; merged bubbles get an extra `accepted=1` row) | — |
 | `--gtf <path>` | project a reference-coordinate GTF's genes onto reference nodes → `<prefix>.bandage_genes.csv` (needs a [PanSN](https://github.com/pangenome/PanSN-spec) `--reference-path`) | — |
 | `-q, --quiet` | disable the progress bar | off |
 
@@ -57,14 +57,9 @@ Mechanism, filters, and a worked trace: [algorithms/bubble.md](../algorithms/bub
 
 ## Example
 
-Matches `scripts/genes/lpa.sh` (run via the per-gene drivers in `scripts/genes/`):
-
 ```bash
 ./build/panvar bubble \
   -i tests/real_data/lpa.gfa.gz \
   -o results/real_data/lpa/bubble/bubble \
   --reference-path grch38#1 --gtf tests/real_data/Homo_sapiens.GRCh38.116.gtf.gz
 ```
-
-Algorithm & worked example: see [algorithms/bubble.md](../algorithms/bubble.md). References:
-[references.md](../references.md#bubble).

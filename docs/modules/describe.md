@@ -4,18 +4,28 @@ CLI: `panvar describe`
 
 ## What it does
 
-Converts each called bubble into haplotype features for association on two mirrored substrates that share the
-same graph coordinates. The first, read-queryable substrate is k-mers: canonical k-mers per path,
-sampled with [closed syncmers](../algorithms/describe.md#terms) by default, each carrying its node
-provenance. The second, graph-local substrate is node/edge dosage: traversal counts per node and
-per oriented edge. Features that do not discriminate haplotypes are dropped from both substrates. The pooled
-cohort genotypes are exported as BIMBAM mean-genotype dosage (`bimbam_{kmers,graph}.bimbam.gz`), the
-canonical export read by [`associate`](associate.md) and by tools like [GEMMA](https://github.com/genetics-statistics/GEMMA). Encoding, the discriminative filter, and a
-worked trace: [algorithms/describe.md](../algorithms/describe.md).
+Converts the called bubbles into per-haplotype genotype features for association, on three substrates that
+share the same graph coordinates and are each exported as a BIMBAM mean-genotype dosage matrix — the
+canonical input to [`associate`](associate.md) and tools like [GEMMA](https://github.com/genetics-statistics/GEMMA):
+
+- **k-mers** — canonical k-mers per path, [closed-syncmer](../algorithms/describe.md#terms) sampled by
+  default, each carrying its node provenance;
+- **graph** — per-node and per-oriented-edge traversal counts, a graph-local dosage;
+- **variant** — one dosage per SV call from `call`'s VCF (`--variant-vcf`): copy number for a DUP, presence
+  for DEL/INS/INV — the statistically honest GWAS unit, as the features within one variant are correlated.
+
+The k-mer and graph substrates are built from the graph and emitted by default; the variant substrate is
+emitted when its VCF is supplied. Any one can be produced on its own
+(`--only-kmers` / `--only-graph` / `--only-variant`). The k-mer and graph substrates pass through a
+discriminative filter that drops features which do not vary across haplotypes — those present in all (or all
+but `--min-paths`) paths, unless their copy number varies — so only informative markers reach the matrix; the
+variant substrate emits every call and leaves frequency filtering to `associate --min-maf`.
+
+Algorithm and worked trace: [algorithms/describe.md](../algorithms/describe.md).
 
 Sample-level (`--samples <cosigt.tsv>`): a GWAS tests samples, not haplotypes. Pass a [cosigt](https://github.com/davidebolo1993/cosigt) table
-(`sample <tab> hap1 <tab> hap2 …`) and describe also writes per-sample BIMBAM
-(`bimbam_{kmers,graph}.samples.bimbam.gz`) whose value is the summed dosage over the sample's haplotypes
+(`sample <tab> hap1 <tab> hap2 …`) and describe also writes a per-sample BIMBAM for each substrate
+(`bimbam_{kmers,graph,variant}.samples.bimbam.gz`) whose value sums the dosage over the sample's haplotypes
 (diploid CN = CN_A + CN_B). See [gwas/example.md](../gwas/example.md).
 
 ## Required inputs
@@ -39,6 +49,7 @@ VCF: the `panphorte`
 | `--variant-nodes <tsv>` | restrict both substrates to `call`'s variant nodes (the genotyping scope; [masking detail](../algorithms/describe.md#node--edge-dosage-complementary-substrate)) | — |
 | `--variant-flank-bp <N>` | with `--variant-nodes`, also keep nodes within N bp of a variant node | `k-1` |
 | `--samples <cosigt.tsv>` | also write per-sample BIMBAM (diploid summed dosage) | — |
+| `--variant-vcf <vcf>` | also emit a VARIANT-level BIMBAM (one dosage row per SV call) from `call`'s region VCF — the honest GWAS unit for `associate --unit variant` | — |
 | `--only-kmers` / `--only-graph` | emit only one substrate | both |
 | `--no-bimbam` | skip the BIMBAM dosage matrices + `feature_annot.tsv.gz` | off |
 | `--no-wide-matrix` | write only the feature map + sparse JSONL (skip the dense per-bubble matrix) | off |
@@ -53,6 +64,7 @@ VCF: the `panphorte`
 | `feature_annot.tsv.gz` | `feature_id, layer, encoding, bubbles, nodes` sidecar for the BIMBAM rows |
 | `bimbam.samples.txt.gz` | sample (column) order shared by both BIMBAM files |
 | `bimbam_{kmers,graph}.samples.bimbam.gz` + `bimbam.samples.samples.txt.gz` + `feature_annot.samples.tsv.gz` | with `--samples`: per-sample versions |
+| `bimbam_variant.bimbam.gz` + `bimbam_variant.samples.txt.gz` + `feature_annot.variant.tsv.gz` | with `--variant-vcf`: the variant-level dosage (CN for DUP, allele indicator for multiallelic, GT 0/1 otherwise), its column order, and a sidecar adding `svtype, gene, AF, AN`. With `--samples`, also the diploid `bimbam_variant.samples.bimbam.gz` (+ `.samples.samples.txt.gz`) |
 | `describe.index.tsv` | per-bubble kept/candidates/discarded for both substrates |
 | `describe.params.json` | the run's resolved parameters (k, feature mode, filter, wide-matrix flags) |
 | `bubble_<id>/graph_features.tsv.gz` | node and edge dosage map (`feature_type` = node/edge) |
@@ -84,21 +96,17 @@ materialised as a feature × path table and is written only when the wide matrix
 The BIMBAM exports feed [`panvar associate`](associate.md) directly (it tests the dosage, so copy-number
 loci are first-class). A significant marker traces back via `nodes`/`bubbles` →
 `call`'s `variant_nodes.tsv` → the variant, and (with `call --gtf` + `associate --node-genes`) to a gene.
-Worked end-to-end run: [gwas/example.md](../gwas/example.md); concepts: [gwas/primer.md](../gwas/primer.md).
+Worked end-to-end run with the concepts in context: [gwas/example.md](../gwas/example.md).
 
 ## Example
-
-Matches `scripts/genes/lpa.sh` / `tests/gwas/run_lpa_real.sh`:
 
 ```bash
 ./build/panvar describe \
   -i results/real_data/lpa/panphorte/panphorte.normalized.sorted.gfa \
   --bubble-prefix-in results/real_data/lpa/panphorte/panphorte \
-  --out-dir results/real_data/lpa/describe \
+  --out-dir results/real_data/lpa/gwas/desc \
   --kmer-size 31 --no-wide-matrix \
-  --variant-nodes results/real_data/lpa/call/call.variant_nodes.tsv
-# add --samples <cosigt.tsv> for per-sample (diploid) BIMBAM, as the GWAS driver does.
+  --variant-nodes results/real_data/lpa/call/call.variant_nodes.tsv \
+  --variant-vcf results/real_data/lpa/call/call.region.vcf \
+  --samples tests/gwas/lpa/samples.tsv   # per-sample (diploid) BIMBAM across all three substrates
 ```
-
-Algorithm & worked example: [algorithms/describe.md](../algorithms/describe.md). References:
-[references.md](../references.md#describe).

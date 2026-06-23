@@ -1,8 +1,8 @@
 # associate — algorithm & worked example
 
 Mechanism and a hand-traced example for **Module 5**. For usage/flags see [modules/associate.md](../modules/associate.md);
-for the GWAS concepts (MAF, multiple testing, λ, kinship, PCs vs LMM) in plain terms see
-[gwas/primer.md](../gwas/primer.md); citations: [references.md](../references.md#associate).
+for the GWAS concepts (MAF, multiple testing, λ, kinship, PCs vs LMM) explained in context see
+[gwas/example.md](../gwas/example.md); citations: [references.md](../references.md#associate).
 
 ## What it computes
 
@@ -60,8 +60,9 @@ BH q (sorted, q_i = p_i·m/rank, monotone) = [2e-5, 0.004, 0.04, 0.40]
 ```
 
 BH recovers one more than Bonferroni — the expected conservative-vs-FDR trade-off. Because correlated
-features (k-mers from one node) over-count the independent tests, the region-wide Bonferroni here is
-conservative; this is *not* the genome-wide `5e-8` (see [gwas/primer.md](../gwas/primer.md#multiple-testing-not-p005-and-not-5e-8-either)).
+features (k-mers from one node) over-count the independent tests, the raw region-wide Bonferroni is
+conservative; `associate` instead scales the threshold by the effective number of independent tests
+(`Meff` — the variant unit, or the distinct bubbles for feature tests).
 
 ## LMM (EMMAX) — the fast mixed model
 
@@ -78,5 +79,5 @@ fixed-effect rotation is done once (EMMAX), then each feature is a cheap GLS:
 
 This costs one `O(n³)` eigendecomposition plus `O(n·p²)` per feature — orders of magnitude cheaper than
 re-fitting a full mixed model per feature. `--pca N` is the lighter alternative: it adds the top-N
-eigenvectors of `K` as fixed covariates to the GLM, with no variance-component step. See
-[gwas/primer.md](../gwas/primer.md#two-ways-to-correct-structure-pcs-and-the-lmm) for when to use which.
+eigenvectors of `K` as fixed covariates to the GLM, with no variance-component step. Both need an external
+genome-wide `K` (`--kinship`); panvar is local and does not build one from its own region genotypes.

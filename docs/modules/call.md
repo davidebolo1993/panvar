@@ -9,8 +9,7 @@ haplotype's `source → sink` walk against a reference walk and types each diffe
 then reduces fragmentation by coalescing events within a haplotype and clustering equivalent events
 across haplotypes, and recovers sub-threshold carriers. Copy number is read directly off the walk.
 
-Algorithm, copy-number mechanics, merge keys, and worked traces:
-[algorithms/call.md](../algorithms/call.md).
+Algorithm and worked trace: [algorithms/call.md](../algorithms/call.md).
 
 Which graph to call on depends on locus topology — tandem repeats on the `panphorte` graph, PGGB-folded
 paralog clusters on the `bubble` graph. See the
@@ -124,6 +123,3 @@ Other graph topologies call on the `bubble` graph (see `scripts/genes/` for the 
   --cn-from-coverage \
   --gtf tests/real_data/Homo_sapiens.GRCh38.116.gtf.gz
 ```
-
-Algorithm & worked examples: [algorithms/call.md](../algorithms/call.md). References:
-[references.md](../references.md#call).

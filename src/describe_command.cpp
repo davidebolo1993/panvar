@@ -60,9 +60,16 @@ void print_describe_help() {
         << "                                   still yield k-mers; pass 0 for strict variant-node-only)\n"
         << "      --samples <tsv>              cosigt sample->haplotype-path table; also writes the\n"
         << "                                   sample-level bimbam_{kmers,graph}.samples.bimbam.gz (summed dosage)\n"
+        << "      --variant-vcf <vcf>          call region VCF; also emit the VARIANT-level BIMBAM\n"
+        << "                                   (bimbam_variant.* + feature_annot.variant.tsv.gz): one\n"
+        << "                                   dosage row per SV call -- the honest GWAS unit for associate\n"
         << "      --no-bimbam                  Do not write the pooled BIMBAM dosage + feature_annot.tsv.gz\n"
-        << "      --only-kmers                 Emit only the k-mer substrate (skip node/edge graph layer)\n"
-        << "      --only-graph                 Emit only the node/edge graph substrate (skip k-mers)\n"
+        << "      --only-kmers                 Emit only the k-mer substrate\n"
+        << "      --only-graph                 Emit only the node/edge graph substrate\n"
+        << "      --only-variant               Emit only the variant substrate (needs --variant-vcf; no GFA needed)\n"
+        << "      --scale-dosage               Rescale each feature's BIMBAM dosage to 0..2 (per-feature min-max);\n"
+        << "                                   for tools that assume a 0..2 diploid dosage (e.g. GEMMA). Linear-model\n"
+        << "                                   p-values are unchanged; default off (raw counts)\n"
         << "      --threads <N>                Worker threads for the per-bubble loop (0 = auto)\n"
         << "  -q, --quiet                      Disable the progress bar\n"
         << "  -h, --help                       Show this help\n";
@@ -158,16 +165,28 @@ int run_describe_command(const std::vector<std::string>& args) {
             options.samples_path = require_value(arg);
             continue;
         }
+        if (arg == "--variant-vcf") {
+            options.variant_vcf_path = require_value(arg);
+            continue;
+        }
+        if (arg == "--scale-dosage") {
+            options.scale_dosage = true;
+            continue;
+        }
         if (arg == "--no-bimbam") {
             options.bimbam = false;
             continue;
         }
         if (arg == "--only-kmers") {
-            options.emit_graph = false;
+            options.emit_graph = false; options.emit_variant = false;
             continue;
         }
         if (arg == "--only-graph") {
-            options.emit_kmers = false;
+            options.emit_kmers = false; options.emit_variant = false;
+            continue;
+        }
+        if (arg == "--only-variant") {
+            options.emit_kmers = false; options.emit_graph = false;
             continue;
         }
         if (arg == "--threads") {
@@ -187,7 +206,10 @@ int run_describe_command(const std::vector<std::string>& args) {
         throw std::runtime_error("Unknown option for describe: " + arg);
     }
 
-    if (options.gfa_path.empty()) {
+    // The k-mer and graph substrates are built from the GFA; the variant substrate is built only from
+    // call's VCF, so --only-variant needs neither -i nor a bubble source.
+    const bool graph_substrates = options.emit_kmers || options.emit_graph;
+    if (graph_substrates && options.gfa_path.empty()) {
         throw std::runtime_error("describe requires -i/--gfa <graph.gfa>");
     }
     if (!bubble_prefix_in.empty()) {
@@ -200,8 +222,11 @@ int run_describe_command(const std::vector<std::string>& args) {
                 derived + "' but --bubbles-csv is '" + options.bubbles_csv_in + "'");
         }
     }
-    if (options.bubbles_csv_in.empty()) {
+    if (graph_substrates && options.bubbles_csv_in.empty()) {
         throw std::runtime_error("describe requires --bubble-prefix-in <prefix> or --bubbles-csv <path>");
+    }
+    if (options.emit_variant && options.variant_vcf_path.empty() && !graph_substrates) {
+        throw std::runtime_error("--only-variant requires --variant-vcf <call.region.vcf>");
     }
     if (options.kmer_size == 0 || options.kmer_size > 31) {
         throw std::runtime_error("--kmer-size must be in [1,31]");
@@ -224,12 +249,17 @@ int run_describe_command(const std::vector<std::string>& args) {
     if (options.force_wide_matrix && !options.write_wide_matrix) {
         throw std::runtime_error("--force-wide and --no-wide-matrix cannot be used together");
     }
-    if (!options.emit_kmers && !options.emit_graph) {
-        throw std::runtime_error("--only-kmers and --only-graph cannot be used together");
+    if (!options.emit_kmers && !options.emit_graph && !options.emit_variant) {
+        throw std::runtime_error("no substrate selected (the --only-* flags are mutually exclusive)");
     }
 
     DescribeSummary summary;
-    describe_kmers_from_graph(options, &summary);
+    if (graph_substrates) {
+        describe_kmers_from_graph(options, &summary);
+    }
+    if (options.emit_variant && !options.variant_vcf_path.empty()) {
+        describe_variant_from_vcf(options, &summary);
+    }
 
     std::cout
         << "Input graph: " << options.gfa_path << "\n"
@@ -245,6 +275,8 @@ int run_describe_command(const std::vector<std::string>& args) {
         << "Variant nodes: " << (options.variant_nodes_path.empty() ? std::string("(all bubble nodes)")
                                                                      : options.variant_nodes_path) << "\n"
         << "Variant flank (bp): " << options.variant_flank_bp << "\n"
+        << "Variant VCF: " << (options.variant_vcf_path.empty() ? std::string("(none)")
+                                                                : options.variant_vcf_path) << "\n"
         << "Bubbles processed: " << summary.bubbles_processed << "\n"
         << "Bubbles with paths: " << summary.bubbles_with_paths << "\n"
         << "Path rows written: " << summary.paths_written << "\n"

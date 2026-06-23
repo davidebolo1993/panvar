@@ -44,7 +44,7 @@ GTFOPT=(); [ -f "$GTF" ] && GTFOPT=(--gtf "$GTF")
 NGOPT=(); [ -f "$OUT_DIR/call.node_genes.tsv" ] && NGOPT=(--node-genes "$OUT_DIR/call.node_genes.tsv")
 "$PANVAR_BIN" describe -i "$PGFA" --bubble-prefix-in "$OUT_DIR/pan" --out-dir "$OUT_DIR/desc" \
   --kmer-size 31 --no-wide-matrix --variant-nodes "$OUT_DIR/call.variant_nodes.tsv" \
-  --samples "$REAL/samples.tsv" --quiet >/dev/null
+  --variant-vcf "$OUT_DIR/call.region.vcf" --samples "$REAL/samples.tsv" --quiet >/dev/null
 
 DESC="$OUT_DIR/desc"
 SAMP="$DESC/bimbam.samples.samples.txt.gz"
@@ -67,6 +67,18 @@ for sub in graph kmers; do
   done
 done
 
+echo "== 1b) VARIANT-LEVEL scan: one test per SV call (honest unit + LD-clumping) =="
+# The statistically honest unit: tests the SV calls directly, so n_tests = #variants (not correlated
+# k-mers/nodes). --unit auto-detects 'variant' from the variant feature_annot.
+for mode in quant binary; do
+  echo "   -- associate (variant / $mode) --"
+  "$PANVAR_BIN" associate --genotypes "$DESC/bimbam_variant.samples.bimbam.gz" \
+    --samples "$DESC/bimbam_variant.samples.samples.txt.gz" \
+    --feature-annot "$DESC/feature_annot.variant.tsv.gz" \
+    ${NGOPT[@]+"${NGOPT[@]}"} --phenotype "$REAL/pheno.${mode}.tsv" -o "$OUT_DIR/assoc_variant_${mode}"
+  plot "$OUT_DIR/assoc_variant_${mode}" "LPA Lp(a) (variant, $mode)"
+done
+
 echo "== 2) STRUCTURE-CORRECTION demo on the synthetic genome-wide-like panel =="
 SGENO="$REAL/geno.sim.bimbam.gz"; SSAMP="$REAL/sim.samples.txt"; SANNOT="$REAL/feature_annot.sim.tsv.gz"
 if [ -f "$SGENO" ]; then
@@ -78,13 +90,13 @@ if [ -f "$SGENO" ]; then
   "$PANVAR_BIN" associate --genotypes "$SGENO" --samples "$SSAMP" --feature-annot "$SANNOT" \
     --phenotype "$REAL/pheno.quant.tsv" --min-maf 0.02 -o "$OUT_DIR/sim_pc"
   plot "$OUT_DIR/sim_pc" "LPA structure demo (PC-adjusted)"
-  if [ "$N" -le "$LMM_MAX_N" ]; then
-    echo "   -- LMM with panel-derived GRM (--make-kinship): lambda ~ 1 --"
+  if [ "$N" -le "$LMM_MAX_N" ] && [ -f "$REAL/kinship.tsv" ]; then
+    echo "   -- LMM with the genome-wide-like panel GRM (--kinship): lambda ~ 1 --"
     "$PANVAR_BIN" associate --genotypes "$SGENO" --samples "$SSAMP" --feature-annot "$SANNOT" \
-      --phenotype "$REAL/pheno.quant.nopc.tsv" --model lmm --make-kinship --min-maf 0.02 -o "$OUT_DIR/sim_lmm"
+      --phenotype "$REAL/pheno.quant.nopc.tsv" --model lmm --kinship "$REAL/kinship.tsv" --min-maf 0.02 -o "$OUT_DIR/sim_lmm"
     plot "$OUT_DIR/sim_lmm" "LPA structure demo (LMM)"
   else
-    echo "   (LMM skipped: N=$N > LMM_MAX_N=$LMM_MAX_N; use --pca / PC covariates at this scale)"
+    echo "   (LMM skipped: N=$N > LMM_MAX_N=$LMM_MAX_N or no kinship.tsv; use PC covariates at this scale)"
   fi
 fi
 

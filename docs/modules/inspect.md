@@ -10,7 +10,7 @@ allele, a node-count matrix (how each path traverses the internal nodes, with or
 edge-count matrix (adjacencies — the tandem signal), and node lengths. With `--cluster` it also groups
 structurally identical haplotypes (used for representative-only plots).
 
-Clustering mechanism + worked trace: [algorithms/inspect.md](../algorithms/inspect.md).
+Algorithm and worked trace: [algorithms/inspect.md](../algorithms/inspect.md).
 
 ## Required inputs
 
@@ -67,8 +67,6 @@ to uncomment.)
 
 ## Example
 
-Matches `scripts/genes/lpa.sh` (LPA uses `--cluster-similarity 0.95`; the other genes use `0.97`):
-
 ```bash
 #inspect `bubble` output
 ./build/panvar inspect \
@@ -85,5 +83,4 @@ Matches `scripts/genes/lpa.sh` (LPA uses `--cluster-similarity 0.95`; the other 
   --cluster --cluster-similarity 0.97
 ```
 
-Drop `--bubble-id` to inspect all bubbles. Clustering algorithm & worked example:
-[algorithms/inspect.md](../algorithms/inspect.md). References: [references.md](../references.md#inspect).
+Drop `--bubble-id` to inspect all bubbles.

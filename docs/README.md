@@ -6,7 +6,7 @@ Documentation for the `panvar` CLI, organized into three subfolders plus a share
 |---------------|--------------|
 | **[modules/](modules/)** | one short **usage** page per module: what it does, inputs, key options, outputs, a runnable example. Start here to *run* a module. |
 | **[algorithms/](algorithms/)** | the matching **mechanism + worked traces** (and deep option semantics) for each module. Read these to understand *how* a result is computed, or when a usage page links a term here. |
-| **[gwas/](gwas/)** | the association workflow: [gwas/primer.md](gwas/primer.md) (GWAS concepts from scratch) and [gwas/example.md](gwas/example.md) (a runnable LPA walk-through + GEMMA validation). |
+| **[gwas/](gwas/)** | the association workflow: [gwas/example.md](gwas/example.md) — a runnable LPA walk-through that explains each concept and correction in context, with GEMMA validation. |
 | **[references.md](references.md)** | tools (GitHub) and papers behind each module. |
 
 ## Pipeline

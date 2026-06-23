@@ -57,9 +57,3 @@ Resulting `bubbles.csv` row:
 bubble_id  source  sink  inside_node_count  path_support  min_inside_bp  max_inside_bp  inside_nodes
 1          2       5     2                  3             2              3              3,4
 ```
-
-## Debug TSV (`--snarl-debug-tsv`)
-
-One row per snarl candidate: `candidate_id, source, sink, inside_node_count, n_paths, min_inside_bp,
-long_path_support, inversion_signal, accepted`. Bubbles created by `--merge-nearby-bp` have no candidate
-row, so one extra `accepted=1` row is appended per merged bubble.

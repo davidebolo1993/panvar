@@ -1333,7 +1333,8 @@ void write_bimbam_rows(
     const std::string& layer,
     const std::vector<BimbamRow>& rows,
     const std::vector<std::string>& sample_order,
-    const std::unordered_map<std::size_t, std::unordered_set<std::string>>& bubble_traversers) {
+    const std::unordered_map<std::size_t, std::unordered_set<std::string>>& bubble_traversers,
+    bool scale_dosage) {
 
     GzipWriter geno(bimbam_path);
     for (const BimbamRow& row : rows) {
@@ -1345,22 +1346,30 @@ void write_bimbam_rows(
         a += '\t'; a += row.nodes; a += '\n';
         annot.write(a);
 
-        // BIMBAM mean-genotype line: id, allele1, allele2, dosages...  (missing = NA)
-        std::string line = tsv_sanitize(row.id);
-        line += ", A, B";
-        for (const std::string& s : sample_order) {
-            line += ", ";
-            const auto cit = row.carriers.find(s);
+        // Per-sample dosage (NaN = missing/NA): a carrier's count, 0 if it traverses the bubble but
+        // does not carry the feature, else NA.
+        std::vector<double> vals(sample_order.size(), std::numeric_limits<double>::quiet_NaN());
+        double lo = std::numeric_limits<double>::infinity(), hi = -std::numeric_limits<double>::infinity();
+        for (std::size_t i = 0; i < sample_order.size(); ++i) {
+            const auto cit = row.carriers.find(sample_order[i]);
             if (cit != row.carriers.end()) {
-                line += format_dosage(cit->second);
+                vals[i] = cit->second;
             } else {
-                bool covered = false;
                 for (std::size_t b : row.bubbles) {
                     const auto bt = bubble_traversers.find(b);
-                    if (bt != bubble_traversers.end() && bt->second.count(s)) { covered = true; break; }
+                    if (bt != bubble_traversers.end() && bt->second.count(sample_order[i])) { vals[i] = 0.0; break; }
                 }
-                line += covered ? "0" : "NA";
             }
+            if (std::isfinite(vals[i])) { lo = std::min(lo, vals[i]); hi = std::max(hi, vals[i]); }
+        }
+        // BIMBAM mean-genotype line: id, allele1, allele2, dosages... (--scale-dosage maps to 0..2)
+        const bool do_scale = scale_dosage && std::isfinite(lo) && hi > lo;
+        std::string line = tsv_sanitize(row.id);
+        line += ", A, B";
+        for (double v : vals) {
+            line += ", ";
+            if (!std::isfinite(v)) line += "NA";
+            else line += format_dosage(do_scale ? (v - lo) / (hi - lo) * 2.0 : v);
         }
         line += '\n';
         geno.write(line);
@@ -1500,6 +1509,211 @@ BubbleDescribeResult describe_one_bubble(
     }
 
     return result;
+}
+
+// Split on a single delimiter (keeps empty fields).
+std::vector<std::string> split_on(const std::string& s, char delim) {
+    std::vector<std::string> out;
+    std::size_t start = 0;
+    for (std::size_t p = 0; p <= s.size(); ++p) {
+        if (p == s.size() || s[p] == delim) { out.push_back(s.substr(start, p - start)); start = p + 1; }
+    }
+    return out;
+}
+
+// Value of an INFO key ("KEY=val;KEY2=val2" -> val; "" if absent or flag-only).
+std::string info_value(const std::string& info, const std::string& key) {
+    const std::string needle = key + "=";
+    std::size_t p = 0;
+    while (p < info.size()) {
+        std::size_t e = info.find(';', p);
+        if (e == std::string::npos) e = info.size();
+        if (info.compare(p, needle.size(), needle) == 0)
+            return info.substr(p + needle.size(), e - (p + needle.size()));
+        p = e + 1;
+    }
+    return std::string();
+}
+
+// Parse a cosigt sample->haplotype table: "sample<TAB>hap1,hap2<TAB>..." (header row tolerated).
+// Returns (haplotype-path -> samples carrying it, sample column order). Shared by the k-mer/graph
+// SAMPLE-level export and the variant-level export so the diploid summation is defined in one place.
+std::pair<std::unordered_map<std::string, std::vector<std::string>>, std::vector<std::string>>
+read_cosigt_table(const std::string& path) {
+    std::ifstream sin(path);
+    if (!sin) throw std::runtime_error("Failed to open --samples file: " + path);
+    std::unordered_map<std::string, std::vector<std::string>> path_to_samples;
+    std::vector<std::string> sample_order;
+    std::string line;
+    bool first = true;
+    while (std::getline(sin, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+        std::vector<std::string> fields = split_on(line, '\t');
+        if (fields.empty()) continue;
+        if (first) {
+            first = false;
+            std::string h = fields[0];
+            for (char& c : h) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (h == "sample" || h == "sample.id" || h == "sample_id" || (!h.empty() && h[0] == '#')) continue;
+        }
+        const std::string& sample = fields[0];
+        if (sample.empty()) continue;
+        sample_order.push_back(sample);
+        for (std::size_t fi = 1; fi < fields.size(); ++fi)
+            for (const std::string& hap : split_on(fields[fi], ','))
+                if (!hap.empty()) path_to_samples[hap].push_back(sample);
+    }
+    return {std::move(path_to_samples), std::move(sample_order)};
+}
+
+// ---- Variant-level BIMBAM: the SV calls as the GWAS unit ----------------------------------------
+// Reads call's region VCF (samples = haplotype paths; FORMAT GT[:CN]) and writes one dosage row per
+// variant (per ALT allele for multiallelic records). Dosage = CN (DUP) / allele indicator
+// (multiallelic) / GT 0|1 (DEL/INS/INV); a haplotype not traversing the bubble (GT=.) is NA. The row
+// format and NA semantics mirror the k-mer/graph BIMBAM so `associate` reads it identically -- but the
+// unit is the variant, an honest multiple-testing denominator (features within a variant are correlated).
+struct VariantBimbam {
+    std::string id, svtype, bubble, nodes, gene = ".", af = ".", an = ".";
+    std::unordered_map<std::string, double> dose;  // haplotype -> dosage (present only; absent => NA)
+};
+
+void emit_variant_substrate(const DescribeOptions& options, DescribeSummary& summary) {
+    std::ifstream vin(options.variant_vcf_path);
+    if (!vin) throw std::runtime_error("describe --variant-vcf: cannot open " + options.variant_vcf_path);
+    const std::filesystem::path out_dir(options.out_dir);
+    std::filesystem::create_directories(out_dir);
+
+    std::vector<std::string> hap_order;     // VCF sample columns (haplotype paths) = BIMBAM column order
+    std::vector<VariantBimbam> rows;
+    std::string line;
+    while (std::getline(vin, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+        if (line[0] == '#') {
+            if (line.rfind("#CHROM", 0) == 0) {
+                std::vector<std::string> f = split_on(line, '\t');
+                for (std::size_t i = 9; i < f.size(); ++i) hap_order.push_back(f[i]);
+            }
+            continue;
+        }
+        std::vector<std::string> f = split_on(line, '\t');
+        if (f.size() < 10) continue;
+        const std::string& id = f[2];
+        const std::string& info = f[7];
+        const std::string svtype = info_value(info, "SVTYPE");
+        const std::string bubble = info_value(info, "BUBBLE_ID");
+        const std::string nodes = info_value(info, "EVENT_NODES");
+        const std::string gene = info_value(info, "GENES");
+        const std::string af = info_value(info, "AF");
+        const std::string an = info_value(info, "AN");
+        const std::string nalleles_s = info_value(info, "NALLELES");
+        const int nalleles = nalleles_s.empty() ? 1 : std::max(1, std::atoi(nalleles_s.c_str()));
+        const std::vector<std::string> fmt_keys = split_on(f[8], ':');
+        int gt_i = -1, cn_i = -1;
+        for (std::size_t i = 0; i < fmt_keys.size(); ++i) {
+            if (fmt_keys[i] == "GT") gt_i = static_cast<int>(i);
+            else if (fmt_keys[i] == "CN") cn_i = static_cast<int>(i);
+        }
+        const bool is_dup = (svtype == "DUP");
+        const bool is_multi = nalleles > 1;
+        const int n_rows = is_multi ? nalleles : 1;
+        for (int a = 0; a < n_rows; ++a) {
+            VariantBimbam v;
+            v.id = is_multi ? (id + "_a" + std::to_string(a + 1)) : id;
+            v.svtype = svtype.empty() ? "." : svtype;
+            v.bubble = bubble; v.nodes = nodes.empty() ? "." : nodes;
+            v.gene = gene.empty() ? "." : gene;
+            v.af = af.empty() ? "." : af; v.an = an.empty() ? "." : an;
+            for (std::size_t s = 0; s < hap_order.size() && 9 + s < f.size(); ++s) {
+                const std::vector<std::string> sub = split_on(f[9 + s], ':');
+                const std::string gt = (gt_i >= 0 && gt_i < static_cast<int>(sub.size()))
+                                           ? sub[gt_i] : (sub.empty() ? std::string(".") : sub[0]);
+                if (gt == "." || gt.empty()) continue;  // bubble not traversed -> NA (absent)
+                double d;
+                if (is_dup && cn_i >= 0 && cn_i < static_cast<int>(sub.size()) && sub[cn_i] != ".")
+                    d = std::atof(sub[cn_i].c_str());
+                else if (is_multi)
+                    d = (std::atoi(gt.c_str()) == a + 1) ? 1.0 : 0.0;
+                else
+                    d = std::atof(gt.c_str());  // 0/1 presence
+                v.dose[hap_order[s]] = d;
+            }
+            rows.push_back(std::move(v));
+        }
+    }
+
+    auto write_annot = [&](GzipWriter& annot, const VariantBimbam& v) {
+        std::string a = tsv_sanitize(v.id);
+        a += "\tvariant\tdosage\t"; a += v.bubble; a += '\t'; a += v.nodes;
+        a += '\t'; a += v.svtype; a += '\t'; a += v.gene; a += '\t'; a += v.af; a += '\t'; a += v.an; a += '\n';
+        annot.write(a);
+    };
+    const std::string annot_header = "feature_id\tlayer\tencoding\tbubbles\tnodes\tsvtype\tgene\tAF\tAN\n";
+
+    // Haplotype-level BIMBAM + sidecar + column order.
+    {
+        GzipWriter sout((out_dir / "bimbam_variant.samples.txt.gz").string());
+        for (const std::string& s : hap_order) { sout.write(s); sout.write("\n"); }
+        sout.close();
+        GzipWriter annot((out_dir / "feature_annot.variant.tsv.gz").string());
+        annot.write(annot_header);
+        GzipWriter geno((out_dir / "bimbam_variant.bimbam.gz").string());
+        for (const VariantBimbam& v : rows) {
+            write_annot(annot, v);
+            double lo = std::numeric_limits<double>::infinity(), hi = -lo;
+            for (const auto& kv : v.dose) { lo = std::min(lo, kv.second); hi = std::max(hi, kv.second); }
+            const bool do_scale = options.scale_dosage && hi > lo;
+            std::string g = tsv_sanitize(v.id); g += ", A, B";
+            for (const std::string& s : hap_order) {
+                g += ", ";
+                const auto it = v.dose.find(s);
+                if (it == v.dose.end()) g += "NA";
+                else g += format_dosage(do_scale ? (it->second - lo) / (hi - lo) * 2.0 : it->second);
+            }
+            g += '\n';
+            geno.write(g);
+        }
+        geno.close(); annot.close();
+        summary.files_written += 3;
+    }
+
+    // Sample-level (diploid) BIMBAM: sum a sample's haplotype dosages; NA only if no haplotype traverses.
+    if (!options.samples_path.empty()) {
+        const auto cosigt = read_cosigt_table(options.samples_path);
+        const auto& path_to_samples = cosigt.first;
+        const auto& sample_order = cosigt.second;
+        GzipWriter sout((out_dir / "bimbam_variant.samples.samples.txt.gz").string());
+        for (const std::string& s : sample_order) { sout.write(s); sout.write("\n"); }
+        sout.close();
+        GzipWriter geno((out_dir / "bimbam_variant.samples.bimbam.gz").string());
+        for (const VariantBimbam& v : rows) {
+            std::unordered_map<std::string, double> samp;
+            std::unordered_set<std::string> covered;
+            for (const auto& [hap, d] : v.dose) {
+                const auto it = path_to_samples.find(hap);
+                if (it == path_to_samples.end()) continue;
+                for (const std::string& s : it->second) { samp[s] += d; covered.insert(s); }
+            }
+            double lo = std::numeric_limits<double>::infinity(), hi = -lo;
+            for (const std::string& s : covered) { lo = std::min(lo, samp[s]); hi = std::max(hi, samp[s]); }
+            const bool do_scale = options.scale_dosage && hi > lo;
+            std::string g = tsv_sanitize(v.id); g += ", A, B";
+            for (const std::string& s : sample_order) {
+                g += ", ";
+                if (!covered.count(s)) g += "NA";
+                else g += format_dosage(do_scale ? (samp[s] - lo) / (hi - lo) * 2.0 : samp[s]);
+            }
+            g += '\n';
+            geno.write(g);
+        }
+        geno.close();
+        summary.files_written += 2;
+    }
+
+    if (!options.quiet)
+        std::cerr << "[describe] variant substrate: " << rows.size() << " variant rows from "
+                  << options.variant_vcf_path << "\n";
 }
 
 } // namespace
@@ -1738,7 +1952,7 @@ void describe_kmers_from_graph(
                 rows.push_back(std::move(r));
             }
             write_bimbam_rows((out_dir / "bimbam_kmers.bimbam.gz").string(), annot, "kmer",
-                              rows, sample_order, bubble_traversers);
+                              rows, sample_order, bubble_traversers, options.scale_dosage);
             summary.files_written += 1;
         }
         if (options.emit_graph) {
@@ -1754,7 +1968,7 @@ void describe_kmers_from_graph(
                 rows.push_back(std::move(r));
             }
             write_bimbam_rows((out_dir / "bimbam_graph.bimbam.gz").string(), annot, "graph",
-                              rows, sample_order, bubble_traversers);
+                              rows, sample_order, bubble_traversers, options.scale_dosage);
             summary.files_written += 1;
         }
         annot.close();
@@ -1765,51 +1979,9 @@ void describe_kmers_from_graph(
     // the sample's assigned haplotype paths (a haplotype listed twice -> doubled, i.e. a homozygous
     // diploid genotype). Parsed once and reused for the k-mer and node/edge sample files.
     if (!options.samples_path.empty()) {
-        std::ifstream sin(options.samples_path);
-        if (!sin) {
-            throw std::runtime_error("Failed to open --samples file: " + options.samples_path);
-        }
-        std::unordered_map<std::string, std::vector<std::string>> path_to_samples;
-        std::vector<std::string> sample_order_s;  // sample (column) order for sample-level BIMBAM
-        std::string line;
-        bool first = true;
-        std::size_t n_samples = 0;
-        while (std::getline(sin, line)) {
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            if (line.empty()) continue;
-            // split on tabs, then split each field on commas -> [sample, hap, hap, ...]
-            std::vector<std::string> fields;
-            std::size_t start = 0;
-            for (std::size_t p = 0; p <= line.size(); ++p) {
-                if (p == line.size() || line[p] == '\t') {
-                    fields.push_back(line.substr(start, p - start));
-                    start = p + 1;
-                }
-            }
-            if (fields.empty()) continue;
-            if (first) {
-                first = false;
-                std::string h = fields[0];
-                for (char& c : h) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                if (h == "sample" || h == "sample.id" || h == "sample_id" || h[0] == '#') {
-                    continue;  // header row
-                }
-            }
-            const std::string& sample = fields[0];
-            if (sample.empty()) continue;
-            ++n_samples;
-            sample_order_s.push_back(sample);
-            for (std::size_t fi = 1; fi < fields.size(); ++fi) {
-                std::size_t s = 0;
-                const std::string& cell = fields[fi];
-                for (std::size_t p = 0; p <= cell.size(); ++p) {
-                    if (p == cell.size() || cell[p] == ',') {
-                        if (p > s) path_to_samples[cell.substr(s, p - s)].push_back(sample);
-                        s = p + 1;
-                    }
-                }
-            }
-        }
+        const auto cosigt = read_cosigt_table(options.samples_path);
+        const std::unordered_map<std::string, std::vector<std::string>>& path_to_samples = cosigt.first;
+        const std::vector<std::string>& sample_order_s = cosigt.second;  // sample (column) order
 
         // Node/edge substrate (complementary graph-local layer): diploid summation, keyed by node id /
         // edge so it joins to call's variant_nodes.tsv. Built once here, reused for the sample-level BIMBAM.
@@ -1866,7 +2038,7 @@ void describe_kmers_from_graph(
                     rows.push_back(std::move(r));
                 }
                 write_bimbam_rows((out_dir / "bimbam_kmers.samples.bimbam.gz").string(), annot, "kmer",
-                                  rows, sample_order_s, bubble_traversers_s);
+                                  rows, sample_order_s, bubble_traversers_s, options.scale_dosage);
                 summary.files_written += 1;
             }
             if (options.emit_graph) {
@@ -1879,7 +2051,7 @@ void describe_kmers_from_graph(
                     rows.push_back(std::move(r));
                 }
                 write_bimbam_rows((out_dir / "bimbam_graph.samples.bimbam.gz").string(), annot, "graph",
-                                  rows, sample_order_s, bubble_traversers_s);
+                                  rows, sample_order_s, bubble_traversers_s, options.scale_dosage);
                 summary.files_written += 1;
             }
             annot.close();
@@ -1894,6 +2066,14 @@ void describe_kmers_from_graph(
     if (summary_out != nullptr) {
         *summary_out = summary;
     }
+}
+
+// Public entry: variant substrate on its own. Independent of describe_kmers_from_graph so --only-variant
+// emits just the SV-call BIMBAM without loading the GFA. emit_variant_substrate holds the logic.
+void describe_variant_from_vcf(const DescribeOptions& options, DescribeSummary* summary_out) {
+    DescribeSummary local;
+    DescribeSummary& summary = summary_out ? *summary_out : local;
+    emit_variant_substrate(options, summary);
 }
 
 } // namespace panvar

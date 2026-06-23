@@ -4,21 +4,29 @@ CLI: `panvar associate`
 
 ## What it does
 
-Runs a region-wide association test of a phenotype against the genotypes from `describe`. Per feature (a
-k-mer, or a node/edge dosage) it fits `phenotype ~ genotype + covariates` and reports a Wald test on the
-genotype term, applies a MAF filter on the cohort genotypes, and corrects for multiple testing over
-the features actually tested (region-wide Bonferroni + Benjamini–Hochberg FDR — not the genome-wide
-`5e-8`). Phenotype type is auto-detected: binary → logistic (`log_or`), else linear (`beta`).
+Tests a phenotype against the genotypes from `describe` across a pangenome region. For each unit it fits
+`phenotype ~ genotype + covariates`, reports a Wald test on the genotype term, applies a MAF filter on the
+cohort genotypes, and corrects for the number of independent tests in the region. Phenotype type is
+auto-detected: binary → logistic (`log_or`), else linear (`beta`).
 
-For a quantitative trait it can also fit a linear mixed model (`--model lmm`) using a kinship matrix, or
-add the top kinship PCs as covariates (`--pca N`), to control population structure; every run reports
-the genomic-inflation λ. Math + a worked trace: [algorithms/associate.md](../algorithms/associate.md).
+The testable unit is chosen by `--unit`. **Variant** mode tests one genotype per SV call (the
+`describe --variant-vcf` export) — the statistically honest unit, since the k-mers, nodes and edges within one
+variant are correlated rather than independent. Correlated nearby variants are then collapsed by LD-clumping,
+so an LD shadow is not counted as a separate hit. **Feature** mode keeps the fine-grained k-mer/node/edge
+tests but corrects with an effective number of independent tests (`Meff`, the distinct bubbles), because the
+raw feature count over-states how many independent tests were run. Both report Benjamini–Hochberg FDR (the
+primary control) alongside the `Meff`-Bonferroni benchmark and the genomic-inflation λ.
+
+For a quantitative trait it can also add the top kinship PCs as covariates (`--pca N`), or fit a linear mixed
+model (`--model lmm`) against a kinship matrix, to control population structure.
+
+Algorithm and worked trace: [algorithms/associate.md](../algorithms/associate.md).
 
 ## Required inputs
 
-- `--genotypes <bimbam.gz>` — a `describe` BIMBAM matrix (`bimbam_{kmers,graph}.bimbam.gz`, or the
-  per-sample `*.samples.bimbam.gz` for a diploid cohort).
-- `--samples <txt[.gz]>` — the sample (column) order (`describe`'s `bimbam.samples[.samples].txt.gz`).
+- `--genotypes <bimbam.gz>` — a `describe` BIMBAM matrix: `bimbam_{kmers,graph}.bimbam.gz` (feature unit)
+  or `bimbam_variant.bimbam.gz` (variant unit), or the per-sample `*.samples.bimbam.gz` for a diploid cohort.
+- `--samples <txt[.gz]>` — the sample (column) order (`describe`'s matching `*.samples[.samples].txt.gz`).
 - `--phenotype <tsv>` — `sample <tab> phenotype [<tab> covariate…]`, header required; cells may be `NA` (a
   sample with NA phenotype or any NA covariate is dropped).
 - `-o, --out-prefix <prefix>`.
@@ -27,13 +35,15 @@ the genomic-inflation λ. Math + a worked trace: [algorithms/associate.md](../al
 
 | flag | what it does | default |
 |------|--------------|---------|
-| `--feature-annot <tsv.gz>` | `describe`'s `feature_annot.tsv.gz`; adds `layer`/`bubbles`/`nodes` provenance | — |
+| `--feature-annot <tsv.gz>` | `describe`'s `feature_annot.tsv.gz` (feature unit) or `feature_annot.variant.tsv.gz` (variant unit); adds provenance and, for variants, `svtype`/`gene`/`AF`/`AN` | — |
+| `--unit <auto\|variant\|feature>` | multiple-testing unit; `auto` picks `variant` when the feature_annot is the variant sidecar, else `feature` | `auto` |
+| `--ld-r2 <X>` | variant unit: genotype r² above which a variant is an LD shadow of a lead (clumped, not counted in `Meff`) | `0.8` |
+| `--min-ac <N>` | variant unit: flag `low_af` when the observed minority-genotype count < N (underpowered/unstable) | `3` |
 | `--node-genes <tsv>` | `call`'s `node_genes.tsv` (from `--gtf`); adds a `gene` column | — |
 | `--min-maf <X>` | drop features whose [minor non-modal frequency](../algorithms/associate.md#worked-trace--one-quantitative-feature) < X, on the actual cohort | `0.01` |
 | `--model <auto\|linear\|logistic\|lmm>` | `auto` = binary→logistic else linear; `lmm` = mixed model (quantitative; needs a kinship source) | `auto` |
-| `--kinship <path>` | precomputed `n×n` GRM (rows/cols in `--samples` order) for `--model lmm` / `--pca` | — |
-| `--make-kinship` | build the GRM from the genotype matrix (only valid for a genome-wide-like panel; region-only is proximally contaminated) | off |
-| `--pca <N>` | add the top-N kinship [PCs as covariates](../gwas/primer.md#two-ways-to-correct-structure-pcs-and-the-lmm) to the GLM | off |
+| `--kinship <path>` | external (genome-wide) `n×n` GRM (rows/cols in `--samples` order) for `--model lmm` / `--pca`; panvar is local and does not build a GRM itself | — |
+| `--pca <N>` | add the top-N kinship PCs as covariates to the GLM (needs `--kinship`); usually you instead pass ancestry PCs as phenotype-table columns | off |
 | `-q, --quiet` | less logging | off |
 
 ## Outputs
@@ -47,18 +57,22 @@ the genomic-inflation λ. Math + a worked trace: [algorithms/associate.md](../al
 
 | column | meaning |
 |--------|---------|
-| `feature_id` | the feature tested — k-mer sequence (k-mer substrate) or node id / edge key (graph substrate) |
-| `layer` | `kmer` or `graph` |
-| `bubbles`, `nodes` | graph provenance (from `--feature-annot`): which bubble(s) / node(s) the feature comes from |
-| `n` | number of samples used in this feature's fit |
+| `feature_id` | the unit tested — a variant id (variant unit) or a k-mer sequence / node id / edge key (feature unit) |
+| `layer` | `variant`, `kmer`, or `graph` |
+| `bubbles`, `nodes` | graph provenance (from `--feature-annot`): which bubble(s) / node(s) the unit comes from |
+| `n` | number of samples used in this unit's fit |
 | `minor_freq` | minor (non-modal) genotype frequency on the cohort (the MAF-filter quantity) |
 | `beta` \| `log_or` | effect size on the genotype term — `beta` (linear) or `log_or` = log odds ratio (logistic) |
 | `se` | standard error of the effect |
 | `z` | Wald statistic, `effect / se` |
 | `p` | Wald p-value |
-| `p_bonf` | Bonferroni-adjusted p, `min(1, p · features_tested)` |
-| `q_bh` | Benjamini–Hochberg FDR q-value |
-| `gene` | gene name when `--node-genes` is given, else `.` |
+| `p_bonf` | raw Bonferroni-adjusted p, `min(1, p · features_tested)` (over-conservative — kept for reference) |
+| `p_bonf_meff` | effective-tests Bonferroni, `min(1, p · Meff)` — the honest correction |
+| `q_bh` | Benjamini–Hochberg FDR q-value (the primary control) |
+| `af`, `an` | (variant unit) allele frequency / traversing-haplotype count, carried from the VCF |
+| `low_af` | (variant unit) `1` when the minority-genotype count < `--min-ac` (underpowered/unstable), else `0`; `.` otherwise |
+| `clump`, `is_lead` | (variant unit) LD-clump id and whether this is its lead variant (`1`); `.` in feature mode |
+| `gene` | gene name (variant `GENES`, or via `--node-genes`), else `.` |
 
 `<prefix>.summary.tsv` keys:
 
@@ -67,14 +81,16 @@ the genomic-inflation λ. Math + a worked trace: [algorithms/associate.md](../al
 | `model`, `phenotype_type` | model used (`linear`/`logistic`/`lmm`) and detected trait type |
 | `covariates`, `pca_covariates` | covariate columns used / PCs added via `--pca` |
 | `samples_used` | samples kept after dropping rows with NA phenotype or covariate |
-| `features_tested` | features that passed the MAF filter and were tested (the multiple-testing denominator) |
-| `dropped_min_maf`, `dropped_fit` | features dropped by the MAF filter / by a failed model fit |
-| `bonferroni_threshold` | the region-wide threshold `0.05 / features_tested` |
-| `significant_bonferroni`, `significant_fdr05` | counts passing Bonferroni / BH FDR < 0.05 |
+| `features_tested` | units that passed the MAF filter and were tested |
+| `unit` | `variant` or `feature` (the multiple-testing unit used) |
+| `meff` | effective number of independent tests — LD-clump leads (variant) or distinct bubbles (feature) |
+| `independent_variants` \| `distinct_bubbles` | the same `Meff` count, labelled for the active unit |
+| `dropped_min_maf`, `dropped_fit` | units dropped by the MAF filter / by a failed model fit |
+| `bonferroni_threshold` | raw region-wide threshold `0.05 / features_tested` (reference) |
+| `bonferroni_threshold_meff` | the honest threshold `0.05 / Meff` |
+| `significant_bonferroni`, `significant_bonferroni_meff`, `significant_fdr05` | counts passing raw Bonferroni / `Meff`-Bonferroni / BH FDR < 0.05 |
 | `lambda_gc` | genomic-inflation factor λ |
 | `lmm_delta` | (LMM only) fitted variance ratio δ = σ²ₑ / σ²_g |
-
-The plotter reads `features_tested` to draw the threshold line.
 
 ## Plotting
 
@@ -98,23 +114,30 @@ Script flags (needs `Rscript` + `ggplot2`; `ggrepel` optional, for the gene labe
 
 ## Example
 
-Matches `tests/gwas/run_lpa_real.sh` (region scan, PC-adjusted) and its structure-correction demo:
+Uses the committed example phenotype (`tests/gwas/lpa/`, simulated) over the BIMBAM matrices that
+`describe` wrote under `results/real_data/lpa/gwas/desc/` (see the [GWAS example](../gwas/example.md) for the
+full pipeline):
 
 ```bash
-# region scan (PCs are covariate columns in the phenotype table)
+# region scan, feature unit (PC1..PC10 are covariate columns in the phenotype table)
 ./build/panvar associate \
   --genotypes results/real_data/lpa/gwas/desc/bimbam_graph.samples.bimbam.gz \
   --samples   results/real_data/lpa/gwas/desc/bimbam.samples.samples.txt.gz \
   --feature-annot results/real_data/lpa/gwas/desc/feature_annot.samples.tsv.gz \
   --node-genes results/real_data/lpa/call/call.node_genes.tsv \
-  --phenotype results/real_data/lpa/gwas/real/pheno.quant.tsv --min-maf 0.02 \
+  --phenotype tests/gwas/lpa/pheno.quant.tsv --min-maf 0.02 \
   -o results/real_data/lpa/gwas/assoc_graph_quant
 
-# structure correction on a genome-wide-like panel: --model lmm --kinship  (or --pca N)
+# variant unit: test the SV calls directly (describe --variant-vcf export); --unit auto-detects it
+./build/panvar associate \
+  --genotypes results/real_data/lpa/gwas/desc/bimbam_variant.samples.bimbam.gz \
+  --samples   results/real_data/lpa/gwas/desc/bimbam_variant.samples.samples.txt.gz \
+  --feature-annot results/real_data/lpa/gwas/desc/feature_annot.variant.tsv.gz \
+  --phenotype tests/gwas/lpa/pheno.quant.tsv -o results/real_data/lpa/gwas/assoc_variant
+
+# optional: control structure with an EXTERNAL genome-wide GRM (LMM); panvar does not build one itself
 ./build/panvar associate --genotypes <panel.bimbam.gz> --samples <…> --phenotype <…> \
-  --model lmm --kinship results/real_data/lpa/gwas/real/kinship.tsv -o <…>_lmm
+  --model lmm --kinship <genome_wide_grm.tsv> -o <…>_lmm
 ```
 
-Worked end-to-end run (region scan + naive→PC→LMM λ, GEMMA validation): [gwas/example.md](../gwas/example.md).
-Math & worked trace: [algorithms/associate.md](../algorithms/associate.md). References:
-[references.md](../references.md#associate).
+A worked end-to-end run with interpretation is in the [GWAS example](../gwas/example.md).

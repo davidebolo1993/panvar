@@ -23,22 +23,28 @@ KOPT=(); [ "$N" -le "$LMM_MAX_N" ] && KOPT=(--kinship-out "$real/kinship.tsv")
   "$real" --n "$N" --sim-markers "$SIM" ${KOPT[@]+"${KOPT[@]}"} || exit 1
 NGOPT=(); [ -f "$d/call/call.node_genes.tsv" ] && NGOPT=(--node-genes "$d/call/call.node_genes.tsv")
 "$BIN" describe -i "$pgfa" --bubble-prefix-in "$pfx" --out-dir "$gw/desc" --kmer-size 31 \
-  --no-wide-matrix --variant-nodes "$d/call/call.variant_nodes.tsv" --samples "$real/samples.tsv" --quiet || exit 1
+  --no-wide-matrix --variant-nodes "$d/call/call.variant_nodes.tsv" \
+  --variant-vcf "$d/call/call.region.vcf" --samples "$real/samples.tsv" --quiet || exit 1
 
 DESC="$gw/desc"; SAMP="$DESC/bimbam.samples.samples.txt.gz"; ANNOT="$DESC/feature_annot.samples.tsv.gz"
-echo "[lpa] region scan (associate, PC-adjusted)"
+echo "[lpa] region scan (associate, PC-adjusted): feature substrates + the variant unit"
 for sub in graph kmers; do for mode in quant binary; do
   "$BIN" associate --genotypes "$DESC/bimbam_${sub}.samples.bimbam.gz" --samples "$SAMP" \
     --feature-annot "$ANNOT" ${NGOPT[@]+"${NGOPT[@]}"} --phenotype "$real/pheno.${mode}.tsv" --min-maf 0.02 \
     -o "$gw/assoc_${sub}_${mode}"
 done; done
+for mode in quant binary; do   # variant unit: one test per SV call (honest n_tests + LD-clumping)
+  "$BIN" associate --genotypes "$DESC/bimbam_variant.samples.bimbam.gz" \
+    --samples "$DESC/bimbam_variant.samples.samples.txt.gz" --feature-annot "$DESC/feature_annot.variant.tsv.gz" \
+    ${NGOPT[@]+"${NGOPT[@]}"} --phenotype "$real/pheno.${mode}.tsv" -o "$gw/assoc_variant_${mode}"
+done
 echo "[lpa] structure-correction demo (naive / PC / LMM) on the synthetic panel"
 SG="$real/geno.sim.bimbam.gz"; SS="$real/sim.samples.txt"; SA="$real/feature_annot.sim.tsv.gz"
 if [ -f "$SG" ]; then
   "$BIN" associate --genotypes "$SG" --samples "$SS" --feature-annot "$SA" --phenotype "$real/pheno.quant.nopc.tsv" --min-maf 0.02 -o "$gw/sim_naive"
   "$BIN" associate --genotypes "$SG" --samples "$SS" --feature-annot "$SA" --phenotype "$real/pheno.quant.tsv"      --min-maf 0.02 -o "$gw/sim_pc"
-  [ "$N" -le "$LMM_MAX_N" ] && "$BIN" associate --genotypes "$SG" --samples "$SS" --feature-annot "$SA" \
-    --phenotype "$real/pheno.quant.nopc.tsv" --model lmm --make-kinship --min-maf 0.02 -o "$gw/sim_lmm"
+  { [ "$N" -le "$LMM_MAX_N" ] && [ -f "$real/kinship.tsv" ]; } && "$BIN" associate --genotypes "$SG" --samples "$SS" --feature-annot "$SA" \
+    --phenotype "$real/pheno.quant.nopc.tsv" --model lmm --kinship "$real/kinship.tsv" --min-maf 0.02 -o "$gw/sim_lmm"
 fi
 echo "[lpa] GWAS done -> $gw"
 

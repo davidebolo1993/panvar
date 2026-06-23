@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -316,11 +317,13 @@ struct Options {
     std::string node_genes;
     std::string phenotype;
     std::string out_prefix = "associate";
-    std::string kinship;         // precomputed GRM file (--kinship)
-    bool make_kinship = false;   // build GRM from the genotype matrix (--make-kinship)
+    std::string kinship;         // precomputed (genome-wide) GRM file (--kinship)
     int pca = 0;                 // top-N kinship PCs as GLM covariates (--pca)
     double min_maf = 0.01;
     std::string model = "auto";  // auto|linear|logistic|lmm
+    std::string unit = "auto";   // auto|variant|feature -- the multiple-testing unit (see below)
+    double ld_r2 = 0.8;          // variant tier: genotype r^2 above which a variant is an LD shadow of a lead
+    long min_ac = 3;             // variant tier: minor-allele-count floor below which a call is flagged low_af
     bool quiet = false;
 };
 
@@ -357,20 +360,34 @@ void print_help() {
         << "  --feature-annot <path> describe feature_annot.tsv.gz (adds layer/bubbles/nodes to output)\n"
         << "  --node-genes <path>    call node_genes.tsv (call --gtf): adds a `gene` column by node\n"
         << "  --min-maf <X>          drop features whose minor (non-modal) genotype frequency < X (default 0.01)\n"
+        << "  --unit <u>             multiple-testing unit: auto|variant|feature (default auto). variant = one\n"
+        << "                         test per SV call (from describe --variant-vcf): honest n_tests + LD-clumping.\n"
+        << "                         feature = k-mer/node/edge tests with an effective-tests (Meff) Bonferroni.\n"
+        << "                         auto = variant when the feature_annot layer is `variant`, else feature.\n"
+        << "  --ld-r2 <X>            variant tier: r^2 above which a variant is an LD shadow of a lead (default 0.8)\n"
+        << "  --min-ac <N>           variant tier: flag low_af when the minor-allele count < N (default 3)\n"
         << "  --model <m>            auto|linear|logistic|lmm (default auto: binary->logistic, else linear)\n"
-        << "                         lmm = linear mixed model (EMMAX); needs --kinship or --make-kinship.\n"
-        << "  --kinship <path>       precomputed n x n GRM (rows/cols in --samples order) for --model lmm / --pca\n"
-        << "  --make-kinship         build the GRM from the genotype matrix itself (region-proximal; see docs)\n"
-        << "  --pca <N>              add the top-N kinship PCs as covariates to the GLM (cheap structure control)\n"
+        << "                         lmm = linear mixed model (EMMAX); needs an external --kinship GRM.\n"
+        << "  --kinship <path>       precomputed (genome-wide) n x n GRM (rows/cols in --samples order)\n"
+        << "                         for --model lmm / --pca. panvar is local, so it does not build a GRM itself;\n"
+        << "                         supply a genome-wide one, or use PC columns in the phenotype table.\n"
+        << "  --pca <N>              add the top-N kinship PCs as covariates to the GLM (needs --kinship)\n"
         << "  -q, --quiet            less logging\n\n"
-        << "Outputs: <prefix>.assoc.tsv (per-feature beta/se/p/p_bonf/q_bh[/gene]) and <prefix>.summary.tsv\n"
-        << "  (n_tests, Bonferroni threshold 0.05/n_tests, significant counts). Plot with scripts/plot_associate.R.\n";
+        << "Outputs: <prefix>.assoc.tsv (per-feature beta/se/p/p_bonf/p_bonf_meff/q_bh, af/an/low_af,\n"
+        << "  clump/is_lead[/gene]) and <prefix>.summary.tsv (n_tests, meff, Bonferroni thresholds, significant\n"
+        << "  counts, lambda_gc). Plot with scripts/plot_associate.R.\n";
 }
 
 struct FeatureAnnot {
     std::string layer = ".";
     std::string bubbles = ".";
     std::string nodes = ".";
+    // Extra columns present only in the variant sidecar (feature_annot.variant.tsv.gz):
+    // feature_id, layer, encoding, bubbles, nodes, svtype, gene, AF, AN
+    std::string svtype = ".";
+    std::string gene = ".";
+    std::string af = ".";
+    std::string an = ".";
 };
 
 }  // namespace
@@ -391,9 +408,11 @@ int run_associate_command(const std::vector<std::string>& args) {
         else if (a == "--phenotype") opt.phenotype = need(i);
         else if (a == "-o" || a == "--out-prefix") opt.out_prefix = need(i);
         else if (a == "--min-maf") opt.min_maf = std::stod(need(i));
+        else if (a == "--unit") opt.unit = need(i);
+        else if (a == "--ld-r2") opt.ld_r2 = std::stod(need(i));
+        else if (a == "--min-ac") opt.min_ac = std::stol(need(i));
         else if (a == "--model") opt.model = need(i);
         else if (a == "--kinship") opt.kinship = need(i);
-        else if (a == "--make-kinship") opt.make_kinship = true;
         else if (a == "--pca") opt.pca = std::stoi(need(i));
         else if (a == "-q" || a == "--quiet") opt.quiet = true;
         else throw std::runtime_error("Unknown option for associate: " + a);
@@ -402,9 +421,12 @@ int run_associate_command(const std::vector<std::string>& args) {
         throw std::runtime_error("associate requires --genotypes, --samples, --phenotype");
     if (opt.model != "auto" && opt.model != "linear" && opt.model != "logistic" && opt.model != "lmm")
         throw std::runtime_error("--model must be auto|linear|logistic|lmm");
+    if (opt.unit != "auto" && opt.unit != "variant" && opt.unit != "feature")
+        throw std::runtime_error("--unit must be auto|variant|feature");
     const bool need_kinship = (opt.model == "lmm") || (opt.pca > 0);
-    if (need_kinship && opt.kinship.empty() && !opt.make_kinship)
-        throw std::runtime_error("--model lmm / --pca require --kinship <file> or --make-kinship");
+    if (need_kinship && opt.kinship.empty())
+        throw std::runtime_error("--model lmm / --pca require an external --kinship <file> "
+                                 "(panvar is local and does not build a GRM; or use PC covariates)");
 
     // ---- sample (genotype column) order ----
     std::vector<std::string> geno_samples;
@@ -477,64 +499,35 @@ int run_associate_command(const std::vector<std::string>& args) {
     if (model == "lmm" && binary)
         throw std::runtime_error("--model lmm needs a quantitative phenotype (binary->logistic-LMM not yet implemented)");
 
-    // ---- kinship (for --model lmm and/or --pca): build over the used samples ----
-    // K is a GRM in the used-sample order. Either read from --kinship (rows/cols in --samples order,
-    // subset to used) or built from the genotype matrix (--make-kinship: standardize each feature,
-    // K = Z Z^T / m; note this is region-proximal -- see docs). PCs (if --pca) are appended as fixed
-    // GLM covariates; the LMM uses the full K as a random effect.
+    // ---- kinship (for --model lmm and/or --pca): read an external GRM over the used samples ----
+    // K is the GRM in used-sample order, read from --kinship (rows/cols in --samples order, subset to
+    // used). panvar is local, so it does not build a GRM from its own region genotypes (that would be
+    // proximally contaminated); supply a genome-wide GRM. PCs (--pca) are appended as fixed GLM
+    // covariates; the LMM uses the full K as a random effect.
     Eigen::MatrixXd K;
     if (need_kinship) {
         std::vector<std::size_t> used_cols;
         for (std::size_t c = 0; c < geno_samples.size(); ++c) if (col_to_used[c] >= 0) used_cols.push_back(c);
         K = Eigen::MatrixXd::Zero(n_used, n_used);
-        if (!opt.kinship.empty()) {
-            // dense n_geno x n_geno matrix (whitespace/comma), subset to used rows+cols
-            std::vector<std::vector<double>> M;
-            GzLineReader r(opt.kinship);
-            if (!r.ok()) throw std::runtime_error("cannot open --kinship: " + opt.kinship);
-            std::string line;
-            while (r.getline(line)) {
-                if (trim(line).empty()) continue;
-                std::vector<std::string> f = split(line, '\t');
-                if (f.size() < 2) f = split(line, ',');
-                if (f.size() < 2) f = split(line, ' ');
-                std::vector<double> row; row.reserve(f.size());
-                for (const std::string& t : f) { std::string u = trim(t); if (!u.empty()) row.push_back(parse_num(u)); }
-                if (!row.empty()) M.push_back(std::move(row));
-            }
-            if (M.size() < geno_samples.size())
-                throw std::runtime_error("--kinship matrix has fewer rows than samples");
-            for (std::size_t a = 0; a < n_used; ++a)
-                for (std::size_t b = 0; b < n_used; ++b)
-                    K(a, b) = M[used_cols[a]][used_cols[b]];
-        } else {  // --make-kinship: one pass over the genotype matrix
-            GzLineReader gr(opt.genotypes);
-            if (!gr.ok()) throw std::runtime_error("cannot open --genotypes: " + opt.genotypes);
-            std::string line; std::size_t m_feat = 0;
-            while (gr.getline(line)) {
-                if (line.empty()) continue;
-                std::vector<std::string> f = split(line, ',');
-                if (f.size() < 3 + geno_samples.size()) continue;
-                Eigen::VectorXd z(n_used);
-                double sum = 0.0; std::size_t nf = 0;
-                for (std::size_t a = 0; a < n_used; ++a) {
-                    const double v = parse_num(f[3 + used_cols[a]]);
-                    z(a) = v; if (std::isfinite(v)) { sum += v; ++nf; }
-                }
-                if (nf == 0) continue;
-                const double mean = sum / static_cast<double>(nf);
-                for (std::size_t a = 0; a < n_used; ++a) if (!std::isfinite(z(a))) z(a) = mean;  // mean-impute
-                z.array() -= mean;
-                const double sd = std::sqrt(z.squaredNorm() / static_cast<double>(n_used));
-                if (!(sd > 0.0)) continue;
-                z /= sd;
-                K.selfadjointView<Eigen::Lower>().rankUpdate(z);  // K += z z^T
-                ++m_feat;
-            }
-            if (m_feat == 0) throw std::runtime_error("--make-kinship: no usable features to build the GRM");
-            K = K.selfadjointView<Eigen::Lower>();
-            K /= static_cast<double>(m_feat);
+        // dense n_geno x n_geno matrix (whitespace/comma), subset to used rows+cols
+        std::vector<std::vector<double>> M;
+        GzLineReader r(opt.kinship);
+        if (!r.ok()) throw std::runtime_error("cannot open --kinship: " + opt.kinship);
+        std::string line;
+        while (r.getline(line)) {
+            if (trim(line).empty()) continue;
+            std::vector<std::string> f = split(line, '\t');
+            if (f.size() < 2) f = split(line, ',');
+            if (f.size() < 2) f = split(line, ' ');
+            std::vector<double> row; row.reserve(f.size());
+            for (const std::string& t : f) { std::string u = trim(t); if (!u.empty()) row.push_back(parse_num(u)); }
+            if (!row.empty()) M.push_back(std::move(row));
         }
+        if (M.size() < geno_samples.size())
+            throw std::runtime_error("--kinship matrix has fewer rows than samples");
+        for (std::size_t a = 0; a < n_used; ++a)
+            for (std::size_t b = 0; b < n_used; ++b)
+                K(a, b) = M[used_cols[a]][used_cols[b]];
     }
 
     // PCA: append the top-N kinship eigenvectors as fixed covariates (cheap structure control).
@@ -579,8 +572,24 @@ int run_associate_command(const std::vector<std::string>& args) {
             std::vector<std::string> f = split(line, '\t');
             if (f.size() < 5) continue;
             FeatureAnnot a; a.layer = f[1]; a.bubbles = f[3]; a.nodes = f[4];
+            if (f.size() >= 9) {  // variant sidecar carries svtype/gene/AF/AN
+                a.svtype = f[5]; a.gene = f[6]; a.af = f[7]; a.an = f[8];
+            }
             annot[f[0]] = std::move(a);
         }
+    }
+
+    // ---- multiple-testing unit: variant (one test per SV call) vs feature (k-mer/node/edge) ----
+    // Variant mode tests the SV calls directly, so the tests are weakly correlated and n_tests is an
+    // honest Bonferroni denominator (refined by LD-clumping). Feature mode keeps the fine-grained tests
+    // but corrects with an effective-tests count Meff (the features within one variant are correlated).
+    bool variant_mode;
+    if (opt.unit == "variant") variant_mode = true;
+    else if (opt.unit == "feature") variant_mode = false;
+    else {  // auto: variant when the feature_annot is the variant sidecar (its layer is `variant`)
+        std::size_t n_var = 0;
+        for (const auto& kv : annot) if (kv.second.layer == "variant") ++n_var;
+        variant_mode = (!annot.empty() && n_var * 2 >= annot.size());
     }
 
     // ---- optional node -> gene(s) map (call --gtf node_genes.tsv) ----
@@ -615,10 +624,17 @@ int run_associate_command(const std::vector<std::string>& args) {
     // ---- per-feature association over the BIMBAM rows ----
     struct Row {
         std::string id, layer, bubbles, nodes, gene = ".";
+        std::string af = ".", an = ".", svtype = ".";
+        int low_af = -1;          // 1/0 in variant mode (AF/AN known), -1 = unknown -> "." in output
+        int clump = -1;           // LD-clump id (variant mode), -1 -> "."
+        int is_lead = -1;         // 1/0 lead-of-clump (variant mode), -1 -> "."
         std::size_t n = 0;
         double minor_freq = kNaN, beta = kNaN, se = kNaN, z = kNaN, p = kNaN;
     };
     std::vector<Row> rows;
+    // Variant tier only: full-length mean-imputed dosage per retained row, for LD r^2 between variants.
+    // Kept only in variant mode (few variants), so the k-mer substrate never holds a giant matrix.
+    std::vector<Eigen::VectorXd> var_dose;
     std::size_t n_geno_rows = 0, n_dropped_maf = 0, n_dropped_fit = 0;
     const std::size_t p_dim = 2 + ncov_eff;  // intercept + genotype + covariates(+PCs)
     const bool is_lmm = (model == "lmm");
@@ -695,13 +711,45 @@ int run_associate_command(const std::vector<std::string>& args) {
 
         Row row;
         row.id = id;
+        std::string ann_gene;
         if (auto it = annot.find(id); it != annot.end()) {
             row.layer = it->second.layer; row.bubbles = it->second.bubbles; row.nodes = it->second.nodes;
+            row.svtype = it->second.svtype; row.af = it->second.af; row.an = it->second.an;
+            ann_gene = it->second.gene;
         } else { row.layer = "."; row.bubbles = "."; row.nodes = "."; }
-        row.gene = genes_for(row.nodes);
+        // gene: the variant sidecar's GENES if present, else the node->gene join.
+        row.gene = (ann_gene != "." && !ann_gene.empty()) ? ann_gene : genes_for(row.nodes);
+        // low_af: too few minority observations -> underpowered / asymptotically unstable p. Use the
+        // OBSERVED non-modal genotype count (minor_freq * n), not the VCF carrier-AF: for a DUP the
+        // dosage is the continuous CN gradient, so a carrier-AF near 1 still carries ample variance and
+        // must not be flagged. This metric is uniform for binary (0/1) and copy-number genotypes.
+        if (variant_mode)
+            row.low_af = (minor_freq * static_cast<double>(n) < static_cast<double>(opt.min_ac)) ? 1 : 0;
         row.n = n; row.minor_freq = minor_freq;
         row.beta = fr.beta; row.se = fr.se; row.z = fr.z; row.p = fr.p;
         rows.push_back(std::move(row));
+
+        // Retain a full-length mean-imputed dosage for variant-tier LD-clumping (cheap: few variants).
+        if (variant_mode) {
+            Eigen::VectorXd vd(n_used);
+            if (is_lmm) {
+                vd = glmm;  // already full-length, mean-imputed
+            } else {
+                for (std::size_t u = 0; u < n_used; ++u) vd(static_cast<Eigen::Index>(u)) =
+                    std::numeric_limits<double>::quiet_NaN();
+                double sum = 0.0; std::size_t nf = 0;
+                for (std::size_t c = 0; c < geno_samples.size(); ++c) {
+                    if (col_to_used[c] < 0) continue;
+                    const double dose = parse_num(f[3 + c]);
+                    if (!std::isfinite(dose)) continue;
+                    vd(static_cast<Eigen::Index>(col_to_used[c])) = dose; sum += dose; ++nf;
+                }
+                const double mean = nf ? sum / static_cast<double>(nf) : 0.0;
+                for (std::size_t u = 0; u < n_used; ++u)
+                    if (!std::isfinite(vd(static_cast<Eigen::Index>(u)))) vd(static_cast<Eigen::Index>(u)) = mean;
+            }
+            var_dose.push_back(std::move(vd));
+        }
     }
 
     // ---- multiple testing over the ACTUALLY TESTED features (not genome-wide) ----
@@ -709,10 +757,56 @@ int run_associate_command(const std::vector<std::string>& args) {
     std::vector<double> pv(n_tests);
     for (std::size_t i = 0; i < n_tests; ++i) pv[i] = rows[i].p;
     const std::vector<double> qv = bh_qvalues(pv);
+
+    // Effective number of independent tests (Meff). Raw n_tests over-counts because many tests are
+    // correlated -- features within one variant, or variants in LD. Variant mode: greedy LD-clumping
+    // (a lead variant, lowest p, claims neighbours with genotype r^2 > --ld-r2; Meff = #leads). Feature
+    // mode: Meff = number of distinct bubbles the features map to (the correlated block). Bonferroni then
+    // uses Meff; BH-FDR stays the primary control. See docs/gwas/primer.md.
+    std::size_t meff = n_tests;
+    if (variant_mode && n_tests > 0) {
+        // r^2 (squared Pearson) between two full-length imputed dosage vectors.
+        auto r2 = [](const Eigen::VectorXd& a, const Eigen::VectorXd& b) -> double {
+            const double ma = a.mean(), mb = b.mean();
+            const Eigen::VectorXd da = a.array() - ma, db = b.array() - mb;
+            const double na = da.norm(), nb = db.norm();
+            if (na < 1e-12 || nb < 1e-12) return 0.0;
+            const double r = da.dot(db) / (na * nb);
+            return r * r;
+        };
+        std::vector<std::size_t> byp(n_tests);
+        std::iota(byp.begin(), byp.end(), 0);
+        std::sort(byp.begin(), byp.end(), [&](std::size_t a, std::size_t b) {
+            if (!std::isfinite(rows[a].p)) return false;
+            if (!std::isfinite(rows[b].p)) return true;
+            return rows[a].p < rows[b].p;
+        });
+        int next_clump = 0;
+        for (std::size_t oi = 0; oi < n_tests; ++oi) {
+            const std::size_t i = byp[oi];
+            if (rows[i].clump != -1 || !std::isfinite(rows[i].p)) continue;  // shadow or unfittable
+            rows[i].clump = next_clump; rows[i].is_lead = 1;
+            for (std::size_t oj = oi + 1; oj < n_tests; ++oj) {
+                const std::size_t j = byp[oj];
+                if (rows[j].clump != -1 || !std::isfinite(rows[j].p)) continue;
+                if (r2(var_dose[i], var_dose[j]) > opt.ld_r2) { rows[j].clump = next_clump; rows[j].is_lead = 0; }
+            }
+            ++next_clump;
+        }
+        meff = static_cast<std::size_t>(std::max(1, next_clump));
+    } else if (n_tests > 0) {
+        std::unordered_set<std::string> blocks;
+        for (const Row& r : rows)
+            for (const std::string& b : split(r.bubbles, ';')) { const std::string t = trim(b); if (!t.empty() && t != ".") blocks.insert(t); }
+        if (!blocks.empty()) meff = blocks.size();
+    }
+
     const double bonf_threshold = n_tests > 0 ? 0.05 / static_cast<double>(n_tests) : kNaN;
-    std::size_t n_sig_bonf = 0, n_sig_fdr = 0;
+    const double bonf_threshold_meff = meff > 0 ? 0.05 / static_cast<double>(meff) : kNaN;
+    std::size_t n_sig_bonf = 0, n_sig_fdr = 0, n_sig_meff = 0;
     for (std::size_t i = 0; i < n_tests; ++i) {
         if (std::isfinite(rows[i].p) && rows[i].p < bonf_threshold) ++n_sig_bonf;
+        if (std::isfinite(rows[i].p) && rows[i].p < bonf_threshold_meff) ++n_sig_meff;
         if (std::isfinite(qv[i]) && qv[i] < 0.05) ++n_sig_fdr;
     }
     std::vector<double> zs(n_tests);
@@ -732,19 +826,23 @@ int run_associate_command(const std::vector<std::string>& args) {
         std::ostringstream o; o << v; return o.str();
     };
     const std::string effect = (model == "logistic") ? "log_or" : "beta";
+    auto flag = [](int v) { return v < 0 ? std::string(".") : std::to_string(v); };
     {
         std::ofstream out(opt.out_prefix + ".assoc.tsv");
         if (!out) throw std::runtime_error("cannot write " + opt.out_prefix + ".assoc.tsv");
+        // p_bonf = raw 0.05/n_tests scaling; p_bonf_meff = the honest effective-tests scaling (Meff).
         out << "feature_id\tlayer\tbubbles\tnodes\tn\tminor_freq\t" << effect
-            << "\tse\tz\tp\tp_bonf\tq_bh\tgene\n";
+            << "\tse\tz\tp\tp_bonf\tp_bonf_meff\tq_bh\taf\tan\tlow_af\tclump\tis_lead\tgene\n";
         for (std::size_t k = 0; k < n_tests; ++k) {
             const std::size_t i = order[k];
             const Row& r = rows[i];
             const double p_bonf = std::isfinite(r.p) ? std::min(1.0, r.p * static_cast<double>(n_tests)) : kNaN;
+            const double p_bonf_meff = std::isfinite(r.p) ? std::min(1.0, r.p * static_cast<double>(meff)) : kNaN;
             out << r.id << '\t' << r.layer << '\t' << r.bubbles << '\t' << r.nodes << '\t'
                 << r.n << '\t' << fmt(r.minor_freq) << '\t' << fmt(r.beta) << '\t' << fmt(r.se)
-                << '\t' << fmt(r.z) << '\t' << fmt(r.p) << '\t' << fmt(p_bonf) << '\t' << fmt(qv[i])
-                << '\t' << r.gene << '\n';
+                << '\t' << fmt(r.z) << '\t' << fmt(r.p) << '\t' << fmt(p_bonf) << '\t' << fmt(p_bonf_meff)
+                << '\t' << fmt(qv[i]) << '\t' << r.af << '\t' << r.an << '\t' << flag(r.low_af)
+                << '\t' << flag(r.clump) << '\t' << flag(r.is_lead) << '\t' << r.gene << '\n';
         }
     }
     // ---- summary (also the per-plot threshold lines) ----
@@ -758,11 +856,16 @@ int run_associate_command(const std::vector<std::string>& args) {
             << "samples_used\t" << n_used << '\n'
             << "genotype_rows\t" << n_geno_rows << '\n'
             << "features_tested\t" << n_tests << '\n'
+            << "unit\t" << (variant_mode ? "variant" : "feature") << '\n'
+            << "meff\t" << meff << '\n'
+            << (variant_mode ? "independent_variants\t" : "distinct_bubbles\t") << meff << '\n'
             << "dropped_min_maf\t" << n_dropped_maf << '\n'
             << "dropped_fit\t" << n_dropped_fit << '\n'
             << "bonferroni_threshold\t" << fmt(bonf_threshold) << '\n'
+            << "bonferroni_threshold_meff\t" << fmt(bonf_threshold_meff) << '\n'
             << "nominal_threshold\t0.05\n"
             << "significant_bonferroni\t" << n_sig_bonf << '\n'
+            << "significant_bonferroni_meff\t" << n_sig_meff << '\n'
             << "significant_fdr05\t" << n_sig_fdr << '\n'
             << "lambda_gc\t" << fmt(lambda_gc) << '\n';
         if (model == "lmm") out << "lmm_delta\t" << fmt(lmm.delta) << '\n';
@@ -772,10 +875,11 @@ int run_associate_command(const std::vector<std::string>& args) {
         std::cerr << "[associate] model=" << model << " (" << (binary ? "binary" : "quantitative")
                   << "), samples=" << n_used << ", covariates=" << ncov_eff
                   << (opt.pca > 0 ? " (incl. " + std::to_string(opt.pca) + " PCs)" : "") << "\n"
-                  << "[associate] features: tested=" << n_tests << " dropped(maf)=" << n_dropped_maf
+                  << "[associate] unit=" << (variant_mode ? "variant" : "feature")
+                  << " tested=" << n_tests << " Meff=" << meff << " dropped(maf)=" << n_dropped_maf
                   << " dropped(fit)=" << n_dropped_fit << "\n"
-                  << "[associate] Bonferroni threshold (0.05/" << n_tests << ") = " << fmt(bonf_threshold)
-                  << "; significant: Bonferroni=" << n_sig_bonf << " FDR<0.05=" << n_sig_fdr << "\n"
+                  << "[associate] Bonferroni (0.05/Meff=" << meff << ") = " << fmt(bonf_threshold_meff)
+                  << "; significant: Bonferroni(Meff)=" << n_sig_meff << " FDR<0.05=" << n_sig_fdr << "\n"
                   << "[associate] genomic inflation lambda_GC = " << fmt(lambda_gc) << "\n"
                   << "[associate] wrote " << opt.out_prefix << ".assoc.tsv + .summary.tsv\n";
     }

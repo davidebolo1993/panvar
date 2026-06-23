@@ -21,8 +21,8 @@ dominates Lp(a); we model the additive summed dosage for a clean, recoverable de
 
 Outputs in <out_dir>:
   samples.tsv             sample <tab> haplotype_1 <tab> haplotype_2     (cosigt-style)
-  pheno.quant.tsv         sample, phenotype(=log10 Lp(a)), Age, Sex, PC1, PC2, PC3   (with ~5% NA)
-  pheno.binary.tsv        sample, phenotype(=high-risk 0/1), Age, Sex, PC1, PC2, PC3
+  pheno.quant.tsv         sample, phenotype(=log10 Lp(a)), Age, Sex, PC1..PC10   (with ~5% NA)
+  pheno.binary.tsv        sample, phenotype(=high-risk 0/1), Age, Sex, PC1..PC10
   pheno.quant.nopc.tsv    same but WITHOUT the PCs (the naive/uncorrected analysis)
   pheno.binary.nopc.tsv
   phenotypes.tsv          legacy truth table (kiv2 dosage, raw Lp(a), subpop) for sanity checks
@@ -47,6 +47,7 @@ AGE_SLOPE_LOG10 = 0.0015   # mild age effect per year
 SEX_EFFECT_LOG10 = 0.05    # mild sex effect
 HIGH_RISK_MGDL = 50.0      # clinical high-risk Lp(a) threshold -> binary case
 NA_FRAC = 0.05             # fraction of phenotypes set to NA (to exercise the missing-data filter)
+N_PCS = 10                 # ancestry PCs written as covariate columns (top 2 carry the subpop signal)
 
 
 def parse_args(argv):
@@ -118,11 +119,12 @@ def main(argv):
         h2 = random.choices(haps, weights=w, k=1)[0]
         age = max(35, min(85, int(round(random.gauss(55, 12)))))   # Moli-sani-like adult range
         sex = random.randint(0, 1)
-        # PCs capture subpop ancestry: a subpop centroid on a circle + individual noise
+        # PCs capture subpop ancestry: the top 2 are the subpop centroid on a circle (the real signal),
+        # PC3..PC10 are individual noise (as in a real scree plot, only the leading PCs matter).
         ang = 2.0 * math.pi * sp / K
-        pc = (round(2.0 * math.cos(ang) + random.gauss(0, 0.5), 4),
-              round(2.0 * math.sin(ang) + random.gauss(0, 0.5), 4),
-              round(random.gauss(0, 1), 4))
+        pc = tuple([round(2.0 * math.cos(ang) + random.gauss(0, 0.5), 4),
+                    round(2.0 * math.sin(ang) + random.gauss(0, 0.5), 4)]
+                   + [round(random.gauss(0, 1), 4) for _ in range(N_PCS - 2)])
         sid = f"ind{i:05d}"
         samples.append((sid, h1, h2))
         draws.append(dict(sid=sid, sp=sp, dosage=cn[h1] + cn[h2], age=age, sex=sex, pc=pc))
@@ -158,14 +160,14 @@ def main(argv):
             f.write(f"{r['sid']}\t{r['sp']}\t{r['dosage']}\t{r['lpa']}\t{r['log10lpa']}\t{r['case']}\n")
 
     def write_pheno(path, key, fmt, with_pc):
-        cols = ["sample", "phenotype", "Age", "Sex"] + (["PC1", "PC2", "PC3"] if with_pc else [])
+        cols = ["sample", "phenotype", "Age", "Sex"] + ([f"PC{j}" for j in range(1, N_PCS + 1)] if with_pc else [])
         with open(path, "w") as f:
             f.write("\t".join(cols) + "\n")
             for i, r in enumerate(prows):
                 val = "NA" if i in na else fmt(r[key])
                 base = [r["sid"], val, str(r["age"]), str(r["sex"])]
                 if with_pc:
-                    base += [str(r["pc"][0]), str(r["pc"][1]), str(r["pc"][2])]
+                    base += [str(x) for x in r["pc"]]
                 f.write("\t".join(base) + "\n")
 
     qfmt = lambda v: f"{v:.4f}"
@@ -179,7 +181,7 @@ def main(argv):
     if a.kinship_out:
         if a.n > a.kinship_max_n:
             print(f"  (skipping kinship: n={a.n} > --kinship-max-n={a.kinship_max_n}; "
-                  f"use PC covariates or --make-kinship at this scale)")
+                  f"use the PC covariate columns at this scale)")
         else:
             try:
                 import numpy as np

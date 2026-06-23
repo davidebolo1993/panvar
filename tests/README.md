@@ -38,13 +38,17 @@ tests/real_smoke.sh      ./build/panvar tests/real_data/c4.gfa.gz /tmp/panvar_sm
 
 ## GWAS drivers (`tests/gwas/`)
 
-These exercise `describe --samples` and `associate`, which the smoke tests above do not.
+These exercise `describe --samples` / `--variant-vcf` and `associate` (both the variant and feature units),
+which the smoke tests above do not.
 
-- `run_lpa_real.sh` — end-to-end LPA association demo: `bubble -> panphorte -> call -> describe --samples ->
-  associate` on the real LPA graph, plus the population-structure-correction demo and the plots. Needs a
-  numpy/scipy-capable python and (for plots) `Rscript` + `ggplot2`.
-- `make_lpa_phenotype.py` — simulates the LPA/KIV-2 cohort (phenotype, covariates, kinship, and the synthetic
-  genome-wide-like panel) consumed by both drivers here.
+- `lpa/` — committed, **simulated** example inputs (10k cohort, 10 PCs) so the GWAS runs without first
+  generating a cohort: `samples.tsv` (cosigt), `pheno.quant.tsv` / `pheno.binary.tsv` / `pheno.quant.nopc.tsv`.
+  See `lpa/README.md`.
+- `run_lpa_real.sh` — end-to-end LPA association demo: `bubble -> panphorte -> call -> describe (k-mer/graph/
+  variant) -> associate (feature + variant units)` on the real LPA graph, plus the structure-correction demo
+  and the plots. Needs a numpy/scipy-capable python and (for plots) `Rscript` + `ggplot2`.
+- `make_lpa_phenotype.py` — simulates the LPA/KIV-2 cohort (phenotype, covariates, 10 PCs, kinship, and the
+  synthetic genome-wide-like panel); regenerates the committed `lpa/` tables.
 - `validate_gemma.sh` — checks `panvar associate` (linear and LMM) against GEMMA on identical BIMBAM inputs;
   reports the Pearson r of effect size and of −log10 p, and skips cleanly if GEMMA is not installed. It reuses
   the `panphorte.copies.tsv` from an LPA run (default path under `results/`), so run `run_lpa_real.sh` (or
