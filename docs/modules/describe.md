@@ -21,10 +21,8 @@ Sample-level (`--samples <cosigt.tsv>`): a GWAS tests samples, not haplotypes. P
 ## Required inputs
 
 `describe` must run on the **same graph and bubble prefix as `call`** so feature node ids line up with the
-VCF. That substrate is topology-dependent (the same choice `call` makes): the `panphorte`
-`.normalized.sorted.gfa` for tandem loci (e.g. LPA), the `bubble` `.sorted.gfa` for PGGB-folded paralog
-clusters (C4, CYP2D6). See the
-[CN-topology table](../algorithms/call.md#copy-number-one-method-per-locus-topology).
+VCF: the `panphorte`
+`.normalized.sorted.gfa` or the `bubble` `.sorted.gfa`. 
 
 - `-i, --gfa <path>`; one of `-b, --bubble-prefix-in <prefix>` or `-c, --bubbles-csv <path>`.
 - `--variant-nodes <call.variant_nodes.tsv>` to restrict features to `call`'s variant scope (recommended;
@@ -56,8 +54,10 @@ clusters (C4, CYP2D6). See the
 | `bimbam.samples.txt.gz` | sample (column) order shared by both BIMBAM files |
 | `bimbam_{kmers,graph}.samples.bimbam.gz` + `bimbam.samples.samples.txt.gz` + `feature_annot.samples.tsv.gz` | with `--samples`: per-sample versions |
 | `describe.index.tsv` | per-bubble kept/candidates/discarded for both substrates |
-| `bubble_<id>/graph_features.tsv.gz` + `graph_matrix.tsv.gz` | node and edge dosage map + matrix (`feature_type` = node/edge) |
-| `bubble_<id>/kmer_features.tsv.gz` + `kmer_matrix.tsv.gz` + `kmer_counts.jsonl.gz` | k-mer map (with `nodes` provenance) + matrix + sparse counts |
+| `describe.params.json` | the run's resolved parameters (k, feature mode, filter, wide-matrix flags) |
+| `bubble_<id>/graph_features.tsv.gz` | node and edge dosage map (`feature_type` = node/edge) |
+| `bubble_<id>/kmer_features.tsv.gz` + `kmer_counts.jsonl.gz` | k-mer map (with `nodes` provenance) + per-path sparse counts |
+| `bubble_<id>/{kmer,graph}_matrix.tsv.gz` | dense feature × path matrices — **only without `--no-wide-matrix`** (the gene drivers pass `--no-wide-matrix`, so these are normally absent; the feature maps + JSONL carry the same information) |
 
 Dosages are raw counts (not rescaled to 0–2), so a CN-50 KIV-2 haplotype shows 50; `NA` = a haplotype
 that doesn't traverse the feature's bubble (distinct from `0` = traverses but reference).
@@ -74,8 +74,10 @@ that doesn't traverse the feature's bubble (distinct from `0` = traverses but re
 
 The BIMBAM matrices themselves hold `feature_id`, two allele-label columns `A`,`B`, then one dosage column
 per haplotype (or per sample, with `--samples`) in `bimbam.samples.txt.gz` order. The per-bubble
-`*_features.tsv.gz` maps name each feature to its nodes/encoding; the paired `*_matrix.tsv.gz` is the dense
-feature × path count table.
+`*_features.tsv.gz` maps name each feature to its nodes/encoding, and `kmer_counts.jsonl.gz` holds the
+per-path sparse counts (`[feature_id, count]` tuples); the dense `*_matrix.tsv.gz` is the same data
+materialised as a feature × path table and is written only when the wide matrix is enabled (i.e. not under
+`--no-wide-matrix`).
 
 ## Association
 

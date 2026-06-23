@@ -115,9 +115,9 @@ fold reads `CN=0`.
 reference REP ×3 → REF_CN=3 ;  sample hY REP ×2 → CN=2 (one copy lost)
 ```
 
-**(b) PGGB-collapsed paralogs, reference folds ≥2× (`--cn-from-coverage`).** Near-identical paralogs
-(CYP2D6/2D7) fold onto shared nodes, so we can't spot a loss from any single node; we measure **total
-sequence over the full walk** and divide by one copy (calibrated from the reference):
+**(b) PGGB-collapsed paralogs, no `REP` repeat unit, reference folds ≥2× (`--cn-from-coverage`).**
+Near-identical paralogs (CYP2D6/2D7) fold onto shared nodes, so we can't spot a loss from any single node; we
+measure **total sequence over the full walk** and divide by one copy (calibrated from the reference):
 ```text
 one-copy bp = ref_spelled_bp / ref_fold = 10,000/2 = 5,000 ;  REF_CN = ref_fold = 2
 hapA 15,000 bp → 3 (gain) ;  hapB 5,000 → 1 (loss) ;  hapC 10,000 → 2 (ref-like)
@@ -133,9 +133,14 @@ ref_peak=1, REF_CN=1 ;  hapD peak 2 > 1 → DUP, CN=2, SVLEN = Σ node_len × ex
 ```
 The peak (not per-node excess) isolates real dosage from cluster background.
 
-**Precedence/composition.** Per bubble: coverage CN (if `--cn-from-coverage` and the reference folds ≥2×) is
-the authority; else self-loop `DUP`; else peak-multiplicity `DUP` (`--cn-from-multiplicity`). Passing both
-flags is safe — they cover disjoint topologies. With no CN flag, an extra copy surfaces as an `INS`
+**Precedence/composition.** Per bubble, the routes are disjoint by topology and tried in this order: a
+self-loop `REP` `DUP` (always on) wins whenever the bubble carries a genuine `REP` repeat unit (a self-loop
+node ≥ `--min-sv-bp`, e.g. LPA's 5.5 kb KIV-2 node) — its integer loop count is exact; else coverage CN (if
+`--cn-from-coverage` and the reference folds ≥2×); else peak-multiplicity `DUP` (`--cn-from-multiplicity`).
+Coverage is suppressed only by a real `REP` unit, so an incidental tiny PGGB self-loop (e.g. C4's 22 bp node,
+below `--min-sv-bp`) does not block it — C4/CYP2D6 stay on coverage while LPA uses the exact self-loop. Because
+coverage never overrides a real tandem count, passing both `--cn-from-coverage` and `--cn-from-multiplicity`
+is safe on either graph. With no CN flag, an extra copy surfaces as an `INS`
 (`INS_SUBTYPE=DUP` under `--classify-ins`). The two folded-cluster detectors report **absolute** per-haplotype
 CN (reference only sets the unit-bp denominator), unlike the reference-relative DEL/INS/INV diff.
 

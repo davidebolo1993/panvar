@@ -821,9 +821,20 @@ void call_variants(
         // the same bp. Counting over the full span preserves the multiplicity == copy number. When
         // it fires it is the authority for the bubble, so the self-loop / walk-diff paths are skipped.
         // Validated: C4 total CN 131/131 exact; CYP2D6 ~92% after the paralog baseline (2D7+2D8P)
-        // offset the comparator subtracts. Runs whether or not the collapse left a self-loop node.
+        // offset the comparator subtracts.
+        //
+        // Coverage is the route for PGGB-folded paralogs. It is suppressed only when the bubble carries a
+        // genuine panphorte REP self-loop (a repeat unit >= min_sv_bp, e.g. LPA's 5.5 kb KIV-2 node):
+        // there the self-loop's integer traversal count is exact while coverage's bp/unit ratio only
+        // estimates it, so the self-loop must win. An *incidental* tiny PGGB self-loop (e.g. C4's 22 bp
+        // node 1962, well below min_sv_bp) is NOT a repeat unit, so coverage still fires there — keeping
+        // C4/CYP2D6 on coverage while letting LPA use the exact self-loop. This makes the routes disjoint
+        // by topology (self-loop > coverage > peak) so passing both CN flags is safe on either graph.
+        bool has_rep_selfloop = false;
+        for (const std::string& cn : cn_nodes)
+            if (node_len(graph, cn) >= options.min_sv_bp) { has_rep_selfloop = true; break; }
         bool coverage_fired = false;
-        if (options.cn_from_coverage) {
+        if (options.cn_from_coverage && !has_rep_selfloop) {
             const std::unordered_set<std::string> inside_set(bubble.inside.begin(), bubble.inside.end());
             auto full_walk_bp = [&](std::size_t pi, std::size_t* peak_out) -> std::size_t {
                 const auto& idx = path_indexes[pi].positions;
@@ -874,6 +885,12 @@ void call_variants(
                     if (copies > mr.seed.alt_cn) mr.seed.alt_cn = copies;
                 }
                 if (!mr.carriers.empty()) {  // a CN-invariant module is not a variant record
+                    // describe handoff: a coverage DUP's copy-number signal lives in the folded module's
+                    // INSIDE nodes (their per-walk multiplicity), not in the bubble source. EVENT_NODES /
+                    // POS stay the compact source anchor, but variant_nodes.tsv must carry the inside
+                    // nodes so `describe --variant-nodes` retains the dosage features (otherwise it masks
+                    // to the source node, which every haplotype traverses once → no variance → dropped).
+                    mr.member_nodes.insert(bubble.inside.begin(), bubble.inside.end());
                     coverage_fired = true;
                     merged.push_back(std::move(mr));
                 }

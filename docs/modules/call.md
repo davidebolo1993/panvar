@@ -23,7 +23,7 @@ paralog clusters on the `bubble` graph. See the
 | DEL | reference-only nodes (deleted from the haplotype) |
 | INS | haplotype-only nodes (inserted vs reference); `--classify-ins` adds `INS_SUBTYPE=NOVEL|DUP` |
 | INV | a haplotype run that is the reverse-complement node-walk of a reference run |
-| DUP | a copy-number gain/loss; three sources by precedence (`--cn-from-coverage`, then the always-on self-loop `REP`, then `--cn-from-multiplicity`) — see [algorithms/call.md](../algorithms/call.md#copy-number--three-ways) |
+| DUP | a copy-number gain/loss; three sources by precedence (the always-on self-loop `REP`, then `--cn-from-coverage`, then `--cn-from-multiplicity`) — disjoint by topology, see [algorithms/call.md](../algorithms/call.md#copy-number--three-ways) |
 
 ## Required inputs
 
