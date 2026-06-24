@@ -108,7 +108,7 @@ everyone is still informative), and it survives both `q_bh` and the `Meff`-Bonfe
 
 With one test per SV call the scan is sparse, and KIV-2 stands clear of the LD-clumped `Meff`-Bonferroni line:
 
-![LPA region scan — variant substrate, quantitative](../../results/real_data/lpa/gwas/assoc_variant_quant.manhattan.png)
+![LPA region scan — variant substrate, quantitative](img/assoc_variant_quant.manhattan.png)
 
 ## Step 4 — associate the feature substrates (fine-mapping + Meff)
 
@@ -128,12 +128,12 @@ corrects with `Meff` = the number of distinct bubbles (reported as `meff`, with 
 The region scan recovers KIV-2 cleanly — the peak is the repeat node and its self-loop edge, far above the
 `Meff`-Bonferroni line, with the expected **negative** effect (more copies → lower Lp(a)):
 
-![LPA region scan — KIV-2 recovered (graph substrate, quantitative)](../../results/real_data/lpa/gwas/assoc_graph_quant.manhattan.png)
+![LPA region scan — KIV-2 recovered (graph substrate, quantitative)](img/assoc_graph_quant.manhattan.png)
 
 The k-mer substrate tells the same story at finer grain — many more correlated tests (the repeat-unit k-mers),
 all peaking on KIV-2, with `Meff` again collapsing them to the distinct bubbles before the Bonferroni line:
 
-![LPA region scan — KIV-2 recovered (k-mer substrate, quantitative)](../../results/real_data/lpa/gwas/assoc_kmers_quant.manhattan.png)
+![LPA region scan — KIV-2 recovered (k-mer substrate, quantitative)](img/assoc_kmers_quant.manhattan.png)
 
 ## Why these nodes, variants and k-mers light up
 
