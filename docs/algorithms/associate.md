@@ -70,10 +70,10 @@ variant-level, otherwise `feature`; override with `--unit`).
 
 The two units are corrected by **different** mechanisms — this is the key distinction:
 
-| unit | substrates | how `Meff` is computed | LD-clumping? | per-row columns |
-|------|-----------|------------------------|--------------|-----------------|
-| **feature** | **k-mers *and* graph** (nodes/edges) | `Meff` = number of **distinct bubbles** the tested features map to (the `bubbles` column, split on `;`, de-duplicated) | **no** | — |
-| **variant** | SV calls (`describe --variant-vcf`) | `Meff` = number of **LD-clump leads** | **yes** (genotype r²) | `clump`, `is_lead`, `low_af` |
+| unit | substrates | how `Meff` is computed | LD-clumping? | conditioning | per-row columns |
+|------|-----------|------------------------|--------------|--------------|-----------------|
+| **feature** | **k-mers *and* graph** (nodes/edges) | `Meff` = number of **distinct bubbles** the tested features map to (the `bubbles` column, split on `;`, de-duplicated) | **no** | single-lead + collinearity guard | `p_conditional`, `cond_role` |
+| **variant** | SV calls (`describe --variant-vcf`) | `Meff` = number of **LD-clump leads** | **yes** (genotype r²) | forward-stepwise (COJO) | `clump`, `is_lead`, `low_af`, `p_conditional`, `cond_role` |
 
 **Feature unit — membership-based `Meff` (this covers both k-mers and graph features, identically).** k-mer
 counts and node/edge dosages are correlated *by construction*: every feature carries the `bubbles` it came
@@ -88,8 +88,10 @@ sort variants by p ascending; the best unassigned variant becomes a **lead** (`i
 every still-unassigned variant whose genotype r² (squared Pearson on mean-imputed dosage) with that lead
 exceeds `--ld-r2` (default 0.8) is marked its **shadow** (`is_lead=0`, same `clump`); repeat over the
 remaining variants. `Meff` is the number of leads. Only the variant tier retains the full dosage vectors
-needed for r², so clumping is intrinsically variant-only. `low_af` additionally flags a variant whose observed
-minor-allele count (`minor_freq · n`) is below `--min-ac` — a power caveat, independent of `Meff`.
+needed for r², so clumping is intrinsically variant-only. `low_af` flags a variant whose observed
+minor-allele count (`minor_freq · n`) is below `--min-ac` (default 3); a low-AF variant has an unstable r²
+and a fragile asymptotic p, so it is **barred from anchoring a clump** (and thus cannot inflate `Meff`) — it
+can still be claimed as a shadow of a genuine lead.
 
 **What the threshold then does (both units).** `Meff` only rescales the Bonferroni benchmark; BH-FDR is
 unchanged and stays primary:
@@ -102,6 +104,64 @@ q_bh                                # Benjamini–Hochberg FDR — primary contr
 
 The summary reports `unit`, `meff`, both Bonferroni thresholds, and a unit-named alias for the effective
 count: `independent_variants` (variant) or `distinct_bubbles` (feature).
+
+### Conditional / joint analysis (independence) — beyond the threshold
+
+Clumping and `Meff` fix the *threshold*; they do **not** establish that a hit is independent. The reason is
+decisive: a marginal test of a variant that is only weakly correlated with an *extremely* strong locus still
+comes out genome-wide significant — even when its r² is far below `--ld-r2`, so clumping never groups it. A
+conditional refit is the only honest way to separate a true signal from such a shadow, so `associate` runs one
+on every tier and reports `p_conditional` (the conditional Wald p) plus `cond_role` (its status). This is a
+**phenotype-aware** step, deliberately separate from the phenotype-blind `Meff` (so the threshold can't become
+circular).
+
+**Variant tier — forward-stepwise (COJO-style).** Select a set of jointly-independent signals:
+
+1. compute each variant's p **conditioned on the currently-selected set** (its dosage(s) added as covariates;
+   the genotype of interest stays the Wald target);
+2. add the variant with the smallest conditional p **if** it clears the entry threshold `--cojo-p`
+   (default `0.05/Meff`);
+3. repeat until nothing new clears the bar.
+
+Then every variant is reported conditioned on the selected set **minus itself**: a true signal stays
+significant and is tagged `cond_role=signal`; a shadow's `p_conditional` inflates (e.g. a neighbour that only
+tags the lead goes from genome-wide significant to ~null) and is tagged `cond_role=shadow`. The sole signal of
+a single-signal locus has an empty conditioning set, so its `p_conditional` is `NA`. The summary reports
+`cojo_independent_signals`. Linear/logistic only; LMM conditioning (which needs the rotation) is not done.
+
+**Feature tier (k-mer / graph) — single-lead, with a collinearity guard.** Features inside one bubble are
+~perfectly correlated (node `4789`, its self-loop edge, and the repeat-unit k-mers all read the same copy
+number), so conditioning them on the lead feature is numerically degenerate. We therefore condition on the
+single top feature and:
+
+- a feature with genotype r² **> 0.95** against that lead is **same-event redundant** → `cond_role=collinear`,
+  `p_conditional=NA` (flagged, not scored — its degenerate p would be meaningless);
+- every other (cross-bubble) feature gets a real `p_conditional` and `cond_role=conditioned` — if it merely
+  tagged the lead's variant, it collapses;
+- the lead itself is `cond_role=lead`, `p_conditional=NA`.
+
+Full forward-stepwise across thousands of correlated features would be unstable, so COJO stays variant-level;
+the feature tier uses single-lead conditioning purely to expose cross-bubble shadows. Both passes stream the
+genotype file twice so no feature × sample matrix is held in memory.
+
+### Step-by-step (the two correction layers, in order)
+
+```text
+1. TEST       per feature/variant: phenotype ~ genotype + covariates(+PCs)  -> Wald -> marginal p
+2. MAF FILTER drop minor (non-modal) freq < --min-maf
+── Layer A: multiple-testing BURDEN (phenotype-blind) ───────────────────────────────────
+3. Meff       variant: LD-clump by genotype r² > --ld-r2 (low-AF can't lead) -> Meff = #leads
+              feature: Meff = #distinct bubbles  (no clumping, no r²)
+4. p_adj      p_bonf = p·n_tests | p_bonf_meff = p·Meff | q_bh = BH-FDR (primary)
+── Layer B: INDEPENDENCE (phenotype-aware) ──────────────────────────────────────────────
+5. CONDITION  variant: forward-stepwise COJO (entry --cojo-p, default 0.05/Meff) -> signal/shadow
+              feature: condition on top lead; r²>0.95 vs lead -> collinear, else conditioned
+              -> p_conditional, cond_role  (cojo_independent_signals in summary)
+```
+
+`scripts/plot_associate.R` draws three Manhattan panels — raw `-log10(p)`, BH `-log10(q)`, and (when the
+columns are present) `-log10(p_conditional)`, where shadows collapse below the line and only the conditioning
+signal(s) stay tall.
 
 ## LMM (EMMAX) — the fast mixed model
 

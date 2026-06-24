@@ -47,18 +47,35 @@ d$sig <- ifelse(d$p < bonf, "Bonferroni",
                 ifelse(is.finite(d$q_bh) & d$q_bh < 0.05, "FDR<0.05", "ns"))
 d$sig <- factor(d$sig, levels = c("ns", "FDR<0.05", "Bonferroni"))
 
-# two panels: raw -log10 p (with nominal + Bonferroni lines), then BH -log10 q (q=0.05 line).
-# colour is the overall verdict in both, so noise peaks in the top panel collapse in the bottom.
+# panels: raw -log10 p (nominal + Bonferroni lines), BH -log10 q (q=0.05 line), and -- when the
+# conditional/COJO columns are present -- -log10(p_conditional). colour is the verdict, so noise peaks in
+# the top panel collapse in the lower ones; the conditioning anchor(s) stay tall while shadows fall away.
+has_cond <- "p_conditional" %in% names(d) && any(is.finite(d$p_conditional))
+role <- if ("cond_role" %in% names(d)) as.character(d$cond_role) else rep(".", nrow(d))
+levels_sig <- c("ns", "FDR<0.05", "Bonferroni", "conditioning signal")
+d$sig <- factor(as.character(d$sig), levels = levels_sig)
 lv <- c("before correction: raw -log10(p)", "after correction: BH -log10(q)")
+if (has_cond) lv <- c(lv, "after conditioning: -log10(p_conditional)")
 long <- rbind(
   data.frame(x = d$x, y = d$logp, sig = d$sig, panel = lv[1]),
   data.frame(x = d$x, y = d$logq, sig = d$sig, panel = lv[2]))
+if (has_cond) {
+  anchor <- role %in% c("signal", "lead")                       # the conditioning signal(s)
+  yc <- ifelse(anchor, d$logp, -log10(pmax(d$p_conditional, 1e-300)))
+  sc <- ifelse(anchor, "conditioning signal",
+        ifelse(is.finite(d$p_conditional) & d$p_conditional < bonf, "Bonferroni", "ns"))
+  keep <- anchor | is.finite(d$p_conditional)                   # drop collinear / non-anchor NAs
+  long <- rbind(long, data.frame(x = d$x[keep], y = yc[keep],
+    sig = factor(sc[keep], levels = levels_sig), panel = lv[3]))
+}
 long$panel <- factor(long$panel, levels = lv)
 thr <- data.frame(
   panel = factor(c(lv[1], lv[1], lv[2]), levels = lv),
   yint  = c(-log10(0.05), -log10(bonf), -log10(0.05)),
   col   = c("grey50", "#d95f02", "#2c7fb8"),
   lty   = c("dotted", "dashed", "dashed"))
+if (has_cond) thr <- rbind(thr, data.frame(panel = factor(lv[3], levels = lv),
+  yint = -log10(bonf), col = "#d95f02", lty = "dashed"))
 
 # one label per gene at its top feature, in both panels; only genes that survive correction (needs
 # the `gene` column from `associate --node-genes`)
@@ -75,7 +92,7 @@ if ("gene" %in% names(d)) {
   }
 }
 
-cols <- c("ns" = "grey70", "FDR<0.05" = "#2c7fb8", "Bonferroni" = "#d95f02")
+cols <- c("ns" = "grey70", "FDR<0.05" = "#2c7fb8", "Bonferroni" = "#d95f02", "conditioning signal" = "black")
 p_man <- ggplot(long, aes(x, y, colour = sig)) +
   geom_hline(data = thr, aes(yintercept = yint), colour = thr$col, linetype = thr$lty) +
   geom_point(size = 1.3, alpha = 0.8) +
@@ -95,8 +112,9 @@ if (!is.null(lab)) {
       size = 3, vjust = -0.6, colour = "black")
   }
 }
-ggsave(paste0(out, ".manhattan.png"), p_man, width = man_w, height = man_h, dpi = dpi)
-ggsave(paste0(out, ".manhattan.pdf"), p_man, width = man_w, height = man_h)
+plot_h <- if (has_cond) man_h * 1.4 else man_h   # extra room for the third (conditional) panel
+ggsave(paste0(out, ".manhattan.png"), p_man, width = man_w, height = plot_h, dpi = dpi)
+ggsave(paste0(out, ".manhattan.pdf"), p_man, width = man_w, height = plot_h)
 
 # QQ with genomic-inflation lambda
 po <- sort(pmax(d$p, 1e-300)); m <- length(po)

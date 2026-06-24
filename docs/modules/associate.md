@@ -17,6 +17,12 @@ tests but corrects with an effective number of independent tests (`Meff`, the di
 raw feature count over-states how many independent tests were run. Both report Benjamini–Hochberg FDR (the
 primary control) alongside the `Meff`-Bonferroni benchmark and the genomic-inflation λ.
 
+Beyond the threshold, `associate` also tests **independence** by conditioning: refitting each unit with the
+top signal(s) added as covariates, so a hit that merely tags a stronger nearby variant is exposed (its
+`p_conditional` collapses). The variant unit runs a forward-stepwise selection of jointly-independent signals
+(COJO-style); the feature unit conditions on the single top feature with a within-bubble collinearity guard.
+Both add `p_conditional` and `cond_role` columns.
+
 For a quantitative trait it can also add the top kinship PCs as covariates (`--pca N`), or fit a linear mixed
 model (`--model lmm`) against a kinship matrix, to control population structure.
 
@@ -38,7 +44,8 @@ Algorithm and worked trace: [algorithms/associate.md](../algorithms/associate.md
 | `--feature-annot <tsv.gz>` | `describe`'s `feature_annot.tsv.gz` (feature unit) or `feature_annot.variant.tsv.gz` (variant unit); adds provenance and, for variants, `svtype`/`gene`/`AF`/`AN` | — |
 | `--unit <auto\|variant\|feature>` | multiple-testing unit; `auto` picks `variant` when the feature_annot is the variant sidecar, else `feature` | `auto` |
 | `--ld-r2 <X>` | variant unit: genotype r² above which a variant is an LD shadow of a lead (clumped, not counted in `Meff`) | `0.8` |
-| `--min-ac <N>` | variant unit: flag `low_af` when the observed minority-genotype count < N (underpowered/unstable) | `3` |
+| `--min-ac <N>` | variant unit: flag `low_af` when the observed minority-genotype count < N (underpowered/unstable; such a variant also cannot anchor a clump) | `3` |
+| `--cojo-p <X>` | variant unit: entry p for forward-stepwise conditional (COJO) signal selection | `0.05/Meff` |
 | `--node-genes <tsv>` | `call`'s `node_genes.tsv` (from `--gtf`); adds a `gene` column | — |
 | `--min-maf <X>` | drop features whose [minor non-modal frequency](../algorithms/associate.md#worked-trace--one-quantitative-feature) < X, on the actual cohort | `0.01` |
 | `--model <auto\|linear\|logistic\|lmm>` | `auto` = binary→logistic else linear; `lmm` = mixed model (quantitative; needs a kinship source) | `auto` |
@@ -73,6 +80,8 @@ Algorithm and worked trace: [algorithms/associate.md](../algorithms/associate.md
 | `low_af` | (variant unit) `1` when the minority-genotype count < `--min-ac` (underpowered/unstable), else `0`; `.` otherwise |
 | `clump`, `is_lead` | (variant unit) LD-clump id and whether this is its lead variant (`1`); `.` in feature mode |
 | `gene` | gene name (variant `GENES`, or via `--node-genes`), else `.` |
+| `p_conditional` | conditional Wald p (variant: vs the COJO-selected set minus self; feature: vs the top lead); `NA` for a sole signal / the lead / a collinear feature |
+| `cond_role` | variant: `signal` (independent) / `shadow`; feature: `lead` / `collinear` (same-event, r²>0.95, not scored) / `conditioned`; `.` otherwise |
 
 `<prefix>.summary.tsv` keys:
 
@@ -89,6 +98,7 @@ Algorithm and worked trace: [algorithms/associate.md](../algorithms/associate.md
 | `bonferroni_threshold` | raw region-wide threshold `0.05 / features_tested` (reference) |
 | `bonferroni_threshold_meff` | the honest threshold `0.05 / Meff` |
 | `significant_bonferroni`, `significant_bonferroni_meff`, `significant_fdr05` | counts passing raw Bonferroni / `Meff`-Bonferroni / BH FDR < 0.05 |
+| `cojo_independent_signals` | (variant unit) number of jointly-independent signals from forward-stepwise conditioning |
 | `lambda_gc` | genomic-inflation factor λ |
 | `lmm_delta` | (LMM only) fitted variance ratio δ = σ²ₑ / σ²_g |
 
@@ -99,10 +109,12 @@ Rscript scripts/plot_associate.R --assoc <prefix>.assoc.tsv --summary <prefix>.s
   --out <prefix> --title "my trait"
 ```
 
-Writes `*.manhattan.{png,pdf}` — two stacked panels, before correction (raw −log10 p with nominal +
-region-wide Bonferroni lines) and after correction (Benjamini-Hochberg −log10 q with the q=0.05 line); x =
-node id (graph) or per-k-mer index ordered by node id (k-mers), with FDR/Bonferroni-significant genes
-flagged (ggrepel, from the `gene` column when `--node-genes` was passed) — and `*.qq.{png,pdf}` (with λ).
+Writes `*.manhattan.{png,pdf}` — stacked panels: before correction (raw −log10 p with nominal +
+region-wide Bonferroni lines), after correction (Benjamini-Hochberg −log10 q with the q=0.05 line), and —
+when the `p_conditional`/`cond_role` columns are present — after conditioning (−log10 p_conditional, where
+shadows collapse below the line and only the conditioning signal(s) stay tall). x = node id (graph) or
+per-k-mer index ordered by node id (k-mers), with FDR/Bonferroni-significant genes flagged (ggrepel, from the
+`gene` column when `--node-genes` was passed) — and `*.qq.{png,pdf}` (with λ).
 
 Script flags (needs `Rscript` + `ggplot2`; `ggrepel` optional, for the gene labels):
 

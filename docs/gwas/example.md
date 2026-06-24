@@ -161,10 +161,20 @@ columns trace each back through `call`'s `variant_nodes.tsv` to the KIV-2 `DUP`.
   and only leads count toward `Meff`. So a run of neighbouring DELs in LD with KIV-2 is reported once, not as
   several independent findings.
 - **`low_af`** flags variants with too few minority observations to give a stable p — a power caveat, not a
-  significance call.
+  significance call. Such a variant also cannot anchor a clump.
+- **`p_conditional` / `cond_role`** test *independence*, which clumping alone cannot: clumping uses genotype
+  r², but a variant only weakly correlated with KIV-2 (r² far below `--ld-r2`) can still be marginally
+  significant just by tagging such a strong locus. Conditioning refits with the top signal(s) as covariates.
+  In the variant unit a forward-stepwise (COJO) pass selects the jointly-independent signals (`cond_role=signal`)
+  and exposes the rest as `shadow` whose `p_conditional` collapses; the summary's `cojo_independent_signals`
+  counts the signals. In the feature unit, cross-bubble features get a conditional p while features collinear
+  with the lead (same copy-number event) are flagged `cond_role=collinear` rather than scored. Here a nearby
+  PLG insertion is marginally significant (`p ≈ 8e-9`) yet `p_conditional ≈ 0.3` — a KIV-2 shadow, not an
+  independent Lp(a) signal — and `cojo_independent_signals = 1`.
 
-The summary's `unit`, `meff`, and `significant_bonferroni_meff` make the chosen unit and effective test count
-explicit.
+The summary's `unit`, `meff`, `significant_bonferroni_meff` and `cojo_independent_signals` make the chosen
+unit, effective test count, and number of independent signals explicit. The Manhattan plot adds a third
+**after-conditioning** panel where the shadows fall below the line and only the conditioning signal stays up.
 
 ## A word on λ in a single region
 

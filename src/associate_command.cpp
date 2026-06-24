@@ -217,6 +217,17 @@ double genomic_lambda(const std::vector<double>& zs) {
     return med / 0.4549364;
 }
 
+// Squared Pearson correlation between two equal-length dosage vectors: LD r^2 between variants (clumping)
+// and the collinearity guard for feature-tier conditioning. A (near-)constant vector returns 0.
+double r2_vec(const Eigen::VectorXd& a, const Eigen::VectorXd& b) {
+    const double ma = a.mean(), mb = b.mean();
+    const Eigen::VectorXd da = a.array() - ma, db = b.array() - mb;
+    const double na = da.norm(), nb = db.norm();
+    if (na < 1e-12 || nb < 1e-12) return 0.0;
+    const double r = da.dot(db) / (na * nb);
+    return r * r;
+}
+
 // ---- LMM (EMMAX-style) ---------------------------------------------------------------------------
 // Eigendecompose the kinship K once, rotate phenotype + covariates, estimate delta = sigma_e^2/sigma_g^2
 // once under the null, then test each feature by GLS in the rotated space with weights 1/(d_i + delta).
@@ -324,6 +335,7 @@ struct Options {
     std::string unit = "auto";   // auto|variant|feature -- the multiple-testing unit (see below)
     double ld_r2 = 0.8;          // variant tier: genotype r^2 above which a variant is an LD shadow of a lead
     long min_ac = 3;             // variant tier: minor-allele-count floor below which a call is flagged low_af
+    double cojo_p = -1.0;        // variant tier: forward-stepwise (COJO) entry p; <0 -> use 0.05/Meff
     bool quiet = false;
 };
 
@@ -366,6 +378,8 @@ void print_help() {
         << "                         auto = variant when the feature_annot layer is `variant`, else feature.\n"
         << "  --ld-r2 <X>            variant tier: r^2 above which a variant is an LD shadow of a lead (default 0.8)\n"
         << "  --min-ac <N>           variant tier: flag low_af when the minor-allele count < N (default 3)\n"
+        << "  --cojo-p <X>           variant tier: forward-stepwise conditional (COJO) entry p (default 0.05/Meff).\n"
+        << "                         selects independent signals; adds p_conditional + cond_role columns.\n"
         << "  --model <m>            auto|linear|logistic|lmm (default auto: binary->logistic, else linear)\n"
         << "                         lmm = linear mixed model (EMMAX); needs an external --kinship GRM.\n"
         << "  --kinship <path>       precomputed (genome-wide) n x n GRM (rows/cols in --samples order)\n"
@@ -411,6 +425,7 @@ int run_associate_command(const std::vector<std::string>& args) {
         else if (a == "--unit") opt.unit = need(i);
         else if (a == "--ld-r2") opt.ld_r2 = std::stod(need(i));
         else if (a == "--min-ac") opt.min_ac = std::stol(need(i));
+        else if (a == "--cojo-p") opt.cojo_p = std::stod(need(i));
         else if (a == "--model") opt.model = need(i);
         else if (a == "--kinship") opt.kinship = need(i);
         else if (a == "--pca") opt.pca = std::stoi(need(i));
@@ -765,15 +780,6 @@ int run_associate_command(const std::vector<std::string>& args) {
     // uses Meff; BH-FDR stays the primary control. See docs/algorithms/associate.md.
     std::size_t meff = n_tests;
     if (variant_mode && n_tests > 0) {
-        // r^2 (squared Pearson) between two full-length imputed dosage vectors.
-        auto r2 = [](const Eigen::VectorXd& a, const Eigen::VectorXd& b) -> double {
-            const double ma = a.mean(), mb = b.mean();
-            const Eigen::VectorXd da = a.array() - ma, db = b.array() - mb;
-            const double na = da.norm(), nb = db.norm();
-            if (na < 1e-12 || nb < 1e-12) return 0.0;
-            const double r = da.dot(db) / (na * nb);
-            return r * r;
-        };
         std::vector<std::size_t> byp(n_tests);
         std::iota(byp.begin(), byp.end(), 0);
         std::sort(byp.begin(), byp.end(), [&](std::size_t a, std::size_t b) {
@@ -785,11 +791,14 @@ int run_associate_command(const std::vector<std::string>& args) {
         for (std::size_t oi = 0; oi < n_tests; ++oi) {
             const std::size_t i = byp[oi];
             if (rows[i].clump != -1 || !std::isfinite(rows[i].p)) continue;  // shadow or unfittable
+            // AF/MAC floor: a low-AF variant has an unstable r^2 and a fragile p, so it must not ANCHOR a
+            // clump (and so cannot inflate Meff). It can still be claimed as a shadow by a genuine lead.
+            if (rows[i].low_af == 1) continue;
             rows[i].clump = next_clump; rows[i].is_lead = 1;
             for (std::size_t oj = oi + 1; oj < n_tests; ++oj) {
                 const std::size_t j = byp[oj];
                 if (rows[j].clump != -1 || !std::isfinite(rows[j].p)) continue;
-                if (r2(var_dose[i], var_dose[j]) > opt.ld_r2) { rows[j].clump = next_clump; rows[j].is_lead = 0; }
+                if (r2_vec(var_dose[i], var_dose[j]) > opt.ld_r2) { rows[j].clump = next_clump; rows[j].is_lead = 0; }
             }
             ++next_clump;
         }
@@ -799,6 +808,125 @@ int run_associate_command(const std::vector<std::string>& args) {
         for (const Row& r : rows)
             for (const std::string& b : split(r.bubbles, ';')) { const std::string t = trim(b); if (!t.empty() && t != ".") blocks.insert(t); }
         if (!blocks.empty()) meff = blocks.size();
+    }
+
+    // --- variant-tier conditional / joint analysis (forward-stepwise, COJO-style) ---
+    // Marginal r^2-clumping cannot establish independence: a weak genotypic tag of an extremely strong
+    // locus stays genome-wide significant even at r^2 well below --ld-r2. We instead select a set of
+    // jointly-independent signals by forward selection -- repeatedly add the variant with the smallest
+    // p conditioned on the already-selected set, until none clears the entry threshold (--cojo-p, default
+    // 0.05/Meff). Then every variant is reported conditioned on the selected set MINUS itself: a shadow
+    // collapses (large p_conditional), a true independent signal survives and is flagged cond_role=signal.
+    // Variant tier only (one test per event -> no within-event collinearity); linear/logistic (LMM needs
+    // rotation, not done here). Each fit re-uses fit_linear/fit_logistic with the conditioning dosages as
+    // extra covariates; the genotype of interest stays at column 1, so FitResult is its conditional Wald.
+    std::vector<double> p_cond(rows.size(), kNaN);
+    // cond_role: variant tier -> "signal" (COJO-selected) / "shadow"; feature tier -> "lead" /
+    // "collinear" (same-event redundancy, not scored) / "conditioned"; "." when not computed.
+    std::vector<std::string> cond_role(rows.size(), ".");
+    std::size_t cojo_n_signals = 0;
+    if (variant_mode && !is_lmm && rows.size() > 1) {
+        // conditional p of variant i given a set of conditioning dosage vectors (empty -> marginal-style).
+        auto cond_p = [&](std::size_t i, const std::vector<std::size_t>& cond) -> double {
+            const std::size_t pc = p_dim + cond.size();        // intercept, g_i, covariates, |cond|
+            std::vector<double> X(n_used * pc);
+            for (std::size_t u = 0; u < n_used; ++u) {
+                std::size_t col = 0;
+                X[u * pc + col++] = 1.0;
+                X[u * pc + col++] = var_dose[i](static_cast<Eigen::Index>(u));   // target -> column 1
+                for (std::size_t j = 0; j < ncov_eff; ++j) X[u * pc + col++] = Z[u][j];
+                for (std::size_t c : cond) X[u * pc + col++] = var_dose[c](static_cast<Eigen::Index>(u));
+            }
+            const FitResult fc = (model == "logistic") ? fit_logistic(X, y, n_used, pc)
+                                                       : fit_linear(X, y, n_used, pc);
+            return fc.ok ? fc.p : kNaN;
+        };
+        const double entry = opt.cojo_p > 0.0 ? opt.cojo_p
+                                              : (meff > 0 ? 0.05 / static_cast<double>(meff) : 0.05);
+        // forward selection of jointly-independent signals
+        std::vector<std::size_t> selected;
+        std::vector<char> in_sel(rows.size(), 0);
+        for (std::size_t step = 0; step < rows.size(); ++step) {
+            std::size_t best = rows.size(); double best_p = std::numeric_limits<double>::infinity();
+            for (std::size_t i = 0; i < rows.size(); ++i) {
+                if (in_sel[i] || !std::isfinite(rows[i].p)) continue;
+                const double pc_i = cond_p(i, selected);
+                if (std::isfinite(pc_i) && pc_i < best_p) { best_p = pc_i; best = i; }
+            }
+            if (best == rows.size() || !(best_p < entry)) break;   // nothing new clears the bar
+            selected.push_back(best); in_sel[best] = 1;
+        }
+        cojo_n_signals = selected.size();
+        // report each variant conditioned on the selected set minus itself
+        for (std::size_t i = 0; i < rows.size(); ++i) {
+            if (!std::isfinite(rows[i].p)) continue;
+            cond_role[i] = in_sel[i] ? "signal" : "shadow";
+            std::vector<std::size_t> cond;
+            for (std::size_t c : selected) if (c != i) cond.push_back(c);
+            if (!cond.empty()) p_cond[i] = cond_p(i, cond);   // empty cond (the sole signal) -> NA
+        }
+    } else if (!variant_mode && !is_lmm && rows.size() > 1) {
+        // --- feature-tier single-lead conditional p with a within-bubble collinearity guard ---
+        // k-mer / node / edge dosages inside one bubble are ~collinear (they measure the same event), so
+        // conditioning them on the top feature is degenerate -> flag features with r^2 > 0.95 vs the lead
+        // ("collinear") instead of scoring them. Cross-bubble features get a real conditional p: a mere tag
+        // of the lead's variant collapses. Two bounded streaming passes (no feature x sample matrix kept).
+        auto parse_full = [&](const std::vector<std::string>& f, Eigen::VectorXd& vd) -> bool {
+            vd = Eigen::VectorXd::Constant(static_cast<Eigen::Index>(n_used), kNaN);
+            double sum = 0.0; std::size_t nf = 0;
+            for (std::size_t c = 0; c < geno_samples.size(); ++c) {
+                if (col_to_used[c] < 0) continue;
+                const double dose = parse_num(f[3 + c]);
+                if (!std::isfinite(dose)) continue;
+                vd(static_cast<Eigen::Index>(col_to_used[c])) = dose; sum += dose; ++nf;
+            }
+            if (nf == 0) return false;
+            const double mean = sum / static_cast<double>(nf);
+            for (std::size_t u = 0; u < n_used; ++u)
+                if (!std::isfinite(vd(static_cast<Eigen::Index>(u)))) vd(static_cast<Eigen::Index>(u)) = mean;
+            return true;
+        };
+        std::size_t lead_idx = 0; double best_p = std::numeric_limits<double>::infinity();
+        for (std::size_t i = 0; i < rows.size(); ++i)
+            if (std::isfinite(rows[i].p) && rows[i].p < best_p) { best_p = rows[i].p; lead_idx = i; }
+        const std::string lead_id = rows[lead_idx].id;
+        std::unordered_map<std::string, std::size_t> id_to_row;
+        for (std::size_t i = 0; i < rows.size(); ++i) id_to_row[rows[i].id] = i;
+        const std::size_t need_cols = 3 + geno_samples.size();
+        Eigen::VectorXd gl;  // pass 1: capture the lead feature's dosage
+        { GzLineReader g2(opt.genotypes); std::string line;
+          while (g2.getline(line)) {
+              if (line.empty()) continue;
+              std::vector<std::string> f = split(line, ',');
+              if (f.size() < need_cols) continue;
+              if (trim(f[0]) == lead_id) { parse_full(f, gl); break; }
+          } }
+        if (gl.size() == static_cast<Eigen::Index>(n_used)) {
+            const std::size_t pc = p_dim + 1;  // intercept, g_i, covariates, g_lead
+            GzLineReader g3(opt.genotypes); std::string line;
+            while (g3.getline(line)) {
+                if (line.empty()) continue;
+                std::vector<std::string> f = split(line, ',');
+                if (f.size() < need_cols) continue;
+                const auto it = id_to_row.find(trim(f[0]));
+                if (it == id_to_row.end()) continue;
+                const std::size_t i = it->second;
+                if (i == lead_idx) { cond_role[i] = "lead"; continue; }
+                Eigen::VectorXd vd;
+                if (!parse_full(f, vd)) continue;
+                if (r2_vec(vd, gl) > 0.95) { cond_role[i] = "collinear"; continue; }  // same-event redundancy
+                std::vector<double> X(n_used * pc);
+                for (std::size_t u = 0; u < n_used; ++u) {
+                    X[u * pc + 0] = 1.0;
+                    X[u * pc + 1] = vd(static_cast<Eigen::Index>(u));
+                    for (std::size_t j = 0; j < ncov_eff; ++j) X[u * pc + 2 + j] = Z[u][j];
+                    X[u * pc + 2 + ncov_eff] = gl(static_cast<Eigen::Index>(u));
+                }
+                const FitResult fc = (model == "logistic") ? fit_logistic(X, y, n_used, pc)
+                                                           : fit_linear(X, y, n_used, pc);
+                if (fc.ok) { p_cond[i] = fc.p; cond_role[i] = "conditioned"; }
+            }
+        }
     }
 
     const double bonf_threshold = n_tests > 0 ? 0.05 / static_cast<double>(n_tests) : kNaN;
@@ -832,7 +960,8 @@ int run_associate_command(const std::vector<std::string>& args) {
         if (!out) throw std::runtime_error("cannot write " + opt.out_prefix + ".assoc.tsv");
         // p_bonf = raw 0.05/n_tests scaling; p_bonf_meff = the honest effective-tests scaling (Meff).
         out << "feature_id\tlayer\tbubbles\tnodes\tn\tminor_freq\t" << effect
-            << "\tse\tz\tp\tp_bonf\tp_bonf_meff\tq_bh\taf\tan\tlow_af\tclump\tis_lead\tgene\n";
+            << "\tse\tz\tp\tp_bonf\tp_bonf_meff\tq_bh\taf\tan\tlow_af\tclump\tis_lead\tgene"
+               "\tp_conditional\tcond_role\n";
         for (std::size_t k = 0; k < n_tests; ++k) {
             const std::size_t i = order[k];
             const Row& r = rows[i];
@@ -842,7 +971,8 @@ int run_associate_command(const std::vector<std::string>& args) {
                 << r.n << '\t' << fmt(r.minor_freq) << '\t' << fmt(r.beta) << '\t' << fmt(r.se)
                 << '\t' << fmt(r.z) << '\t' << fmt(r.p) << '\t' << fmt(p_bonf) << '\t' << fmt(p_bonf_meff)
                 << '\t' << fmt(qv[i]) << '\t' << r.af << '\t' << r.an << '\t' << flag(r.low_af)
-                << '\t' << flag(r.clump) << '\t' << flag(r.is_lead) << '\t' << r.gene << '\n';
+                << '\t' << flag(r.clump) << '\t' << flag(r.is_lead) << '\t' << r.gene
+                << '\t' << fmt(p_cond[i]) << '\t' << cond_role[i] << '\n';
         }
     }
     // ---- summary (also the per-plot threshold lines) ----
@@ -868,6 +998,7 @@ int run_associate_command(const std::vector<std::string>& args) {
             << "significant_bonferroni_meff\t" << n_sig_meff << '\n'
             << "significant_fdr05\t" << n_sig_fdr << '\n'
             << "lambda_gc\t" << fmt(lambda_gc) << '\n';
+        if (variant_mode) out << "cojo_independent_signals\t" << cojo_n_signals << '\n';
         if (model == "lmm") out << "lmm_delta\t" << fmt(lmm.delta) << '\n';
     }
 
@@ -880,8 +1011,11 @@ int run_associate_command(const std::vector<std::string>& args) {
                   << " dropped(fit)=" << n_dropped_fit << "\n"
                   << "[associate] Bonferroni (0.05/Meff=" << meff << ") = " << fmt(bonf_threshold_meff)
                   << "; significant: Bonferroni(Meff)=" << n_sig_meff << " FDR<0.05=" << n_sig_fdr << "\n"
-                  << "[associate] genomic inflation lambda_GC = " << fmt(lambda_gc) << "\n"
-                  << "[associate] wrote " << opt.out_prefix << ".assoc.tsv + .summary.tsv\n";
+                  << "[associate] genomic inflation lambda_GC = " << fmt(lambda_gc) << "\n";
+        if (variant_mode)
+            std::cerr << "[associate] COJO (forward-stepwise conditional): "
+                      << cojo_n_signals << " jointly-independent signal(s)\n";
+        std::cerr << "[associate] wrote " << opt.out_prefix << ".assoc.tsv + .summary.tsv\n";
     }
     return 0;
 }
