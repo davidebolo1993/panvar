@@ -59,10 +59,49 @@ BH q (sorted, q_i = p_i·m/rank, monotone) = [2e-5, 0.004, 0.04, 0.40]
   FDR < 0.05 → significant: 5e-6, 2e-3, 0.03                              (3 features)
 ```
 
-BH recovers one more than Bonferroni — the expected conservative-vs-FDR trade-off. Because correlated
-features (k-mers from one node) over-count the independent tests, the raw region-wide Bonferroni is
-conservative; `associate` instead scales the threshold by the effective number of independent tests
-(`Meff` — the variant unit, or the distinct bubbles for feature tests).
+BH recovers one more than Bonferroni — the expected conservative-vs-FDR trade-off. But the bigger problem in
+a pangenome locus is that the tests are not independent: many of them tag the *same* underlying variant, so
+the raw `n_tests` over-counts and the region-wide Bonferroni is too conservative. `associate` corrects this
+with an effective number of independent tests, `Meff`, and how `Meff` is derived depends on the testing
+**unit** — auto-detected from the `layer` column of `feature_annot` (`variant` when the majority of rows are
+variant-level, otherwise `feature`; override with `--unit`).
+
+### How the local correction is applied
+
+The two units are corrected by **different** mechanisms — this is the key distinction:
+
+| unit | substrates | how `Meff` is computed | LD-clumping? | per-row columns |
+|------|-----------|------------------------|--------------|-----------------|
+| **feature** | **k-mers *and* graph** (nodes/edges) | `Meff` = number of **distinct bubbles** the tested features map to (the `bubbles` column, split on `;`, de-duplicated) | **no** | — |
+| **variant** | SV calls (`describe --variant-vcf`) | `Meff` = number of **LD-clump leads** | **yes** (genotype r²) | `clump`, `is_lead`, `low_af` |
+
+**Feature unit — membership-based `Meff` (this covers both k-mers and graph features, identically).** k-mer
+counts and node/edge dosages are correlated *by construction*: every feature carries the `bubbles` it came
+from, and all the features inside one bubble are reads of the same local variation. So we don't need genotype
+correlations at all — we collapse each bubble to one effective test and set `Meff` = the number of distinct
+bubbles. There is **no clumping and no r² computation** in feature mode; it is a cheap set-count over the
+`bubbles` column, so it needs no genotype matrix. Both the k-mer run and the graph run use exactly this rule.
+
+**Variant unit — genotype-r² LD-clumping.** Distinct SV calls can still be in linkage disequilibrium across
+*different* bubbles, which bubble-membership can't see, so here we measure correlation directly. Greedy clump:
+sort variants by p ascending; the best unassigned variant becomes a **lead** (`is_lead=1`, new `clump` id);
+every still-unassigned variant whose genotype r² (squared Pearson on mean-imputed dosage) with that lead
+exceeds `--ld-r2` (default 0.8) is marked its **shadow** (`is_lead=0`, same `clump`); repeat over the
+remaining variants. `Meff` is the number of leads. Only the variant tier retains the full dosage vectors
+needed for r², so clumping is intrinsically variant-only. `low_af` additionally flags a variant whose observed
+minor-allele count (`minor_freq · n`) is below `--min-ac` — a power caveat, independent of `Meff`.
+
+**What the threshold then does (both units).** `Meff` only rescales the Bonferroni benchmark; BH-FDR is
+unchanged and stays primary:
+
+```text
+p_bonf      = min(1, p · n_tests)   # raw, over-conservative (ignores correlation)
+p_bonf_meff = min(1, p · Meff)      # the honest effective-tests Bonferroni
+q_bh                                # Benjamini–Hochberg FDR — primary control, no Meff
+```
+
+The summary reports `unit`, `meff`, both Bonferroni thresholds, and a unit-named alias for the effective
+count: `independent_variants` (variant) or `distinct_bubbles` (feature).
 
 ## LMM (EMMAX) — the fast mixed model
 

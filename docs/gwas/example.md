@@ -106,6 +106,10 @@ denominator. The KIV-2 duplication `bubble7_DUP_4789` is the top hit by a wide m
 copy-number gradient in a single test), `is_lead=1` for its LD-clump, `low_af=0` (a DUP carried by almost
 everyone is still informative), and it survives both `q_bh` and the `Meff`-Bonferroni threshold.
 
+With one test per SV call the scan is sparse, and KIV-2 stands clear of the LD-clumped `Meff`-Bonferroni line:
+
+![LPA region scan — variant substrate, quantitative](../../results/real_data/lpa/gwas/assoc_variant_quant.manhattan.png)
+
 ## Step 4 — associate the feature substrates (fine-mapping + Meff)
 
 ```bash
@@ -125,6 +129,11 @@ The region scan recovers KIV-2 cleanly — the peak is the repeat node and its s
 `Meff`-Bonferroni line, with the expected **negative** effect (more copies → lower Lp(a)):
 
 ![LPA region scan — KIV-2 recovered (graph substrate, quantitative)](../../results/real_data/lpa/gwas/assoc_graph_quant.manhattan.png)
+
+The k-mer substrate tells the same story at finer grain — many more correlated tests (the repeat-unit k-mers),
+all peaking on KIV-2, with `Meff` again collapsing them to the distinct bubbles before the Bonferroni line:
+
+![LPA region scan — KIV-2 recovered (k-mer substrate, quantitative)](../../results/real_data/lpa/gwas/assoc_kmers_quant.manhattan.png)
 
 ## Why these nodes, variants and k-mers light up
 
@@ -190,7 +199,10 @@ panvar associate --genotypes <panel.bimbam.gz> --samples <…> --feature-annot <
 ```
 
 This panel is a control to demonstrate the correction; the result on the actual pangenome is the region scan
-above. Compare `lambda_gc` across `sim_naive` / `sim_pc` / `sim_lmm` to see inflation collapse toward 1.
+above. Compare `lambda_gc` across `sim_naive` / `sim_pc` / `sim_lmm` to see inflation collapse toward 1. At
+the ~10k scale shown here the driver runs the PC path (`sim_naive` → `sim_pc`) and skips the LMM demo, since
+the dense GRM is only materialised for smaller cohorts (`N ≤ 4000`); to reproduce `sim_lmm`, run at a capped
+`N` or supply your own external `--kinship` GRM.
 
 ## Validation against GEMMA
 

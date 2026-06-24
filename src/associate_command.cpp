@@ -762,7 +762,7 @@ int run_associate_command(const std::vector<std::string>& args) {
     // correlated -- features within one variant, or variants in LD. Variant mode: greedy LD-clumping
     // (a lead variant, lowest p, claims neighbours with genotype r^2 > --ld-r2; Meff = #leads). Feature
     // mode: Meff = number of distinct bubbles the features map to (the correlated block). Bonferroni then
-    // uses Meff; BH-FDR stays the primary control. See docs/gwas/primer.md.
+    // uses Meff; BH-FDR stays the primary control. See docs/algorithms/associate.md.
     std::size_t meff = n_tests;
     if (variant_mode && n_tests > 0) {
         // r^2 (squared Pearson) between two full-length imputed dosage vectors.

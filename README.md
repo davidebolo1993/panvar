@@ -35,7 +35,7 @@ docker run --rm -v "$PWD":/work -w /work panvar:latest panvar --help
 - [docs/README.md](docs/README.md) — documentation index
 - **Modules (usage):** [bubble](docs/modules/bubble.md) · [panphorte](docs/modules/panphorte.md) · [call](docs/modules/call.md) · [describe](docs/modules/describe.md) · [associate](docs/modules/associate.md) · [inspect](docs/modules/inspect.md)
 - **Algorithms (mechanism + worked traces):** [docs/algorithms/](docs/algorithms/)
-- **GWAS:** [primer](docs/gwas/primer.md) (concepts) · [example](docs/gwas/example.md) (runnable LPA walk-through + GEMMA validation)
+- **GWAS:** [example](docs/gwas/example.md) — runnable LPA walk-through (concepts explained in context) + GEMMA validation
 - [docs/references.md](docs/references.md) — tools (GitHub) and papers per module
 
 ## License

@@ -1,5 +1,5 @@
 #!/usr/bin/env Rscript
-# Manhattan (before/after correction) + QQ for `panvar associate` output. See docs/gwas/primer.md.
+# Manhattan (before/after correction) + QQ for `panvar associate` output. See docs/gwas/example.md.
 #   Rscript plot_associate.R --assoc out.assoc.tsv [--summary out.summary.tsv] --out prefix [--title T]
 suppressWarnings(suppressMessages(library(ggplot2)))
 
