@@ -1193,6 +1193,13 @@ void call_variants(
 
         // ---- Keep records reaching min_sv_bp (by representative) and --min-haplotypes.
         {
+            // Substitution arms share an EVENTID (link_id); size-filter them as a UNIT so a co-located
+            // DEL+INS is kept or dropped together (the event size is the larger arm) and EVENTID is never
+            // left orphaned -- e.g. a 26 bp DEL + 50 bp INS replacement is kept whole, not split.
+            std::unordered_map<std::string, std::size_t> link_max_bp;
+            for (const MergedRecord& mr : merged)
+                if (!mr.seed.link_id.empty())
+                    link_max_bp[mr.seed.link_id] = std::max(link_max_bp[mr.seed.link_id], mr.seed.size_bp);
             std::vector<MergedRecord> kept;
             for (MergedRecord& mr : merged) {
                 std::unordered_set<std::string> uniq(mr.carriers.begin(), mr.carriers.end());
@@ -1200,8 +1207,10 @@ void call_variants(
                 if (mr.seed.type == EvType::Dup) {
                     support = 0;
                     for (const auto& [s, cn] : mr.sample_cn) { (void)s; if (cn != mr.seed.ref_cn) ++support; }
-                } else if (mr.seed.size_bp < options.min_sv_bp) {
-                    continue;
+                } else {
+                    const std::size_t eff_bp = mr.seed.link_id.empty()
+                        ? mr.seed.size_bp : link_max_bp[mr.seed.link_id];
+                    if (eff_bp < options.min_sv_bp) continue;
                 }
                 if (support < options.min_haplotypes) continue;
                 // MAF filter over traversing haplotypes (AN). Drops common/rare by frequency,
@@ -1213,6 +1222,26 @@ void call_variants(
                 kept.push_back(std::move(mr));
             }
             merged = std::move(kept);
+        }
+
+        // ---- enforce the EVENTID contract: a link_id must denote a genuine co-located DEL+INS pair.
+        // A substitution arm can vanish (a sub-threshold micro-arm that never became a record) or a link_id
+        // can have smeared onto a large merged cluster during merging. Strip any link_id that does not have
+        // BOTH a DEL and an INS among the survivors, so EVENTID is never orphaned/spurious (a lone arm is
+        // then reported as a plain INS/DEL; a multiallelic INS with no surviving DEL becomes a plain INS).
+        {
+            std::unordered_map<std::string, std::pair<bool, bool>> link_arms;  // link -> (has_del, has_ins)
+            for (const MergedRecord& mr : merged) {
+                if (mr.seed.link_id.empty()) continue;
+                auto& a = link_arms[mr.seed.link_id];
+                if (mr.seed.type == EvType::Del) a.first = true;
+                else if (mr.seed.type == EvType::Ins) a.second = true;
+            }
+            for (MergedRecord& mr : merged) {
+                if (mr.seed.link_id.empty()) continue;
+                const auto& a = link_arms[mr.seed.link_id];
+                if (!(a.first && a.second)) mr.seed.link_id.clear();
+            }
         }
         if (merged.empty()) return;
         ++summary.bubbles_with_calls;
