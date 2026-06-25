@@ -176,6 +176,39 @@ The summary's `unit`, `meff`, `significant_bonferroni_meff` and `cojo_independen
 unit, effective test count, and number of independent signals explicit. The Manhattan plot adds a third
 **after-conditioning** panel where the shadows fall below the line and only the conditioning signal stays up.
 
+## The association pipeline, stage by stage
+
+`scripts/plot_associate_pipeline.R` draws one Manhattan facet per processing stage, re-colouring the *same*
+markers by what survives each stage, so the funnel from "everything tested" down to "the independent signal"
+is explicit. It needs the normal run plus a `--min-maf 0` run of the same data (so the MAF-dropped markers are
+visible in the first two stages). The driver produces these automatically.
+
+The stages, and what each does:
+
+1. **TEST** — every marker is tested (`phenotype ~ dosage + covariates`); raw `-log10(p)`.
+2. **FILTER MAF** — markers below `--min-maf` are dropped (greyed), the rest kept.
+3. **CLUMP** *(variant tier only)* — variants are grouped by **genotype r² > `--ld-r2`** into leads and LD
+   shadows; the number of leads is `Meff`. The feature tiers skip this — their `Meff` is the number of
+   distinct bubbles, so there is no clumping facet for k-mers / nodes.
+4. **CORRECT** — the two thresholds are drawn together: **Bonferroni·Meff** (orange) and **BH-FDR** (blue);
+   each marker is coloured by the strictest it passes.
+5. **CONDITION** — conditional `-log10(p_conditional)` after COJO: the shadows collapse below the line and
+   only the **independent signal(s)** (magenta) stay up.
+
+**Variant tier** — the honest unit; the CLUMP stage is present, and a single COJO signal (KIV-2 / `LPA`)
+survives conditioning while neighbours like `PLG` collapse:
+
+![LPA association pipeline — variant tier](img/assoc_variant_quant.pipeline.png)
+
+**Graph nodes / edges** — no CLUMP stage (`Meff` = distinct bubbles); conditioning on the top KIV-2 feature
+collapses the rest of the region:
+
+![LPA association pipeline — graph tier](img/assoc_graph_quant.pipeline.png)
+
+**k-mers** — identical machinery to the graph tier (no CLUMP), on per-path k-mer counts:
+
+![LPA association pipeline — k-mer tier](img/assoc_kmers_quant.pipeline.png)
+
 ## A word on λ in a single region
 
 The genomic-inflation factor `lambda_gc` assumes that **most tests are null**. That holds genome-wide, but a
@@ -224,15 +257,14 @@ the same BIMBAM panel and phenotype (BIMBAM is GEMMA's native format, so the gen
 | linear (`--model linear` vs GEMMA `-lm`) | ≈ 1.000 | ≈ 1.000 |
 | mixed (`--model lmm --kinship` vs GEMMA `-lmm`) | ≈ 0.9997 | ≈ 0.9997 |
 
-The statistics match. One revealing difference: GEMMA **silently drops the KIV-2 marker**, because its
-allele-frequency model assumes a diploid 0–2 dosage and the KIV-2 count (well above 2) reads as "allele
-frequency ≫ 1", so its MAF filter discards it. `panvar` makes no such assumption and tests the copy number
-directly — which is the whole point of carrying the raw count through BIMBAM.
-
-If you *do* want GEMMA to test the copy-number markers, regenerate the BIMBAM with
-`describe --scale-dosage`: it rescales each feature to the 0–2 range GEMMA expects. Because that is a
-per-feature linear map, the linear-model p-values are unchanged, so GEMMA then recovers KIV-2 with the same
-significance panvar reports — confirming the engine on the very marker its own filter would otherwise reject.
+The statistics match. The only wrinkle is the **copy-number marker**: GEMMA's allele-frequency model assumes a
+diploid 0–2 dosage, so a *raw* KIV-2 count (well above 2) reads as "allele frequency ≫ 1" and GEMMA mis-handles
+it. This is **not** a failure to validate — GEMMA just needs the dosage in its expected range, which `panvar`
+provides: regenerate the BIMBAM with `describe --scale-dosage` and each feature is rescaled to 0–2 (a
+per-feature linear map, so the linear-model p-values are unchanged). On that scaled BIMBAM **GEMMA tests KIV-2
+too and recovers the same β and significance** `panvar` reports. So the two agree across the board — and on the
+copy-number marker as well, once the dosage is scaled to GEMMA's range. (`panvar` itself makes no 0–2
+assumption and tests the raw copy number directly.)
 
 ## Caveats
 

@@ -124,6 +124,12 @@ Script flags (needs `Rscript` + `ggplot2`; `ggrepel` optional, for the gene labe
 - `--title <text>` — plot title.
 - `--width` / `--height` / `--dpi` — Manhattan size (inches) and PNG resolution (defaults 10 / 7 / 150).
 
+For a per-stage view, `scripts/plot_associate_pipeline.R` draws one facet per processing step —
+**TEST → FILTER MAF → CLUMP (variant tier only) → CORRECT → CONDITION** — re-colouring the markers by what
+survives each step. It takes the normal run (`--assoc`/`--summary`) plus a `--min-maf 0` run of the same data
+(`--unfiltered`) so the MAF-dropped markers are visible, and `--min-maf <X>` to colour the FILTER stage. See
+the [GWAS example](../gwas/example.md#the-association-pipeline-stage-by-stage).
+
 ## Example
 
 Uses the committed example phenotype (`tests/gwas/lpa/`, simulated) over the BIMBAM matrices that
