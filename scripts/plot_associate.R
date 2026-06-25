@@ -77,22 +77,31 @@ thr <- data.frame(
 if (has_cond) thr <- rbind(thr, data.frame(panel = factor(lv[3], levels = lv),
   yint = -log10(bonf), col = "#d95f02", lty = "dashed"))
 
-# one label per gene at its top feature, in both panels; only genes that survive correction (needs
-# the `gene` column from `associate --node-genes`)
+# one label per gene at its top feature; in the corrected panels for genes surviving correction, and in the
+# conditioning panel for the conditioning signal(s). needs the `gene` column from `associate --node-genes`.
 lab <- NULL
 if ("gene" %in% names(d)) {
-  g <- d[!is.na(d$gene) & d$gene != "." & (d$p < bonf | (is.finite(d$q_bh) & d$q_bh < 0.05)), ]
+  has_gene <- !is.na(d$gene) & d$gene != "."
+  g <- d[has_gene & (d$p < bonf | (is.finite(d$q_bh) & d$q_bh < 0.05)), ]
   if (nrow(g) > 0) {
     g <- g[order(g$p), ]; g <- g[!duplicated(g$gene), ]   # best feature per gene
     lab <- rbind(
       data.frame(x = g$x, y = -log10(pmax(g$p, 1e-300)), gene = g$gene, panel = lv[1]),
       data.frame(x = g$x, y = -log10(pmax(ifelse(is.finite(g$q_bh), g$q_bh, 1), 1e-300)),
                  gene = g$gene, panel = lv[2]))
-    lab$panel <- factor(lab$panel, levels = lv)
   }
+  if (has_cond) {                                          # label the conditioning signal(s) in panel 3
+    gc <- d[has_gene & role %in% c("signal", "lead"), ]
+    if (nrow(gc) > 0) {
+      gc <- gc[order(gc$p), ]; gc <- gc[!duplicated(gc$gene), ]
+      lab <- rbind(lab, data.frame(x = gc$x, y = -log10(pmax(gc$p, 1e-300)),
+                                   gene = gc$gene, panel = lv[3]))
+    }
+  }
+  if (!is.null(lab)) lab$panel <- factor(lab$panel, levels = lv)
 }
 
-cols <- c("ns" = "grey70", "FDR<0.05" = "#2c7fb8", "Bonferroni" = "#d95f02", "conditioning signal" = "black")
+cols <- c("ns" = "grey70", "FDR<0.05" = "#2c7fb8", "Bonferroni" = "#d95f02", "conditioning signal" = "#e7298a")
 p_man <- ggplot(long, aes(x, y, colour = sig)) +
   geom_hline(data = thr, aes(yintercept = yint), colour = thr$col, linetype = thr$lty) +
   geom_point(size = 1.3, alpha = 0.8) +

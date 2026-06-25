@@ -38,11 +38,6 @@ docker run --rm -v "$PWD":/work -w /work panvar:latest panvar --help
 - **GWAS:** [example](docs/gwas/example.md) — runnable LPA walk-through (concepts explained in context) + GEMMA validation
 - [docs/references.md](docs/references.md) — tools (GitHub) and papers per module
 
-The `associate` region scan on the LPA example recovers the **KIV-2 copy-number variant** as the top hit
-(graph substrate, ~10k simulated cohort) — the structural signal a linear-reference GWAS misses:
-
-![LPA region scan recovering the KIV-2 copy-number variant as the top association](docs/gwas/img/assoc_graph_quant.manhattan.png)
-
 ## License
 
 MIT — see [LICENSE](LICENSE).

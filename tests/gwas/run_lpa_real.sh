@@ -53,6 +53,14 @@ plot() {  # plot <assoc_prefix> <title>
   "$RS" "$REPO/scripts/plot_associate.R" --assoc "$1.assoc.tsv" --summary "$1.summary.tsv" \
     --out "$1" --title "$2" >/dev/null 2>&1 || echo "  (plot skipped: ggplot2?)"
 }
+# pipeline <real_prefix> <unfiltered_prefix> <min_maf> <title>: faceted per-stage Manhattan
+# (TEST -> FILTER MAF -> [CLUMP] -> CORRECT -> CONDITION). Needs an extra --min-maf 0 run for the
+# TEST/FILTER stages (so the MAF-dropped features are visible).
+pipeline() {
+  "$RS" "$REPO/scripts/plot_associate_pipeline.R" --assoc "$1.assoc.tsv" --unfiltered "$2.assoc.tsv" \
+    --summary "$1.summary.tsv" --min-maf "$3" --out "$1" --title "$4" >/dev/null 2>&1 \
+    || echo "  (pipeline plot skipped: ggplot2?)"
+}
 
 echo "== 1) REGION SCAN: associate on the real KIV-2 features (PC-adjusted) =="
 # graph = node/edge dosage (carries the KIV-2 self-loop REP node); kmer = k-mer multiplicity.
@@ -64,6 +72,11 @@ for sub in graph kmers; do
     "$PANVAR_BIN" associate --genotypes "$GENO" --samples "$SAMP" --feature-annot "$ANNOT" \
       ${NGOPT[@]+"${NGOPT[@]}"} --phenotype "$REAL/pheno.${mode}.tsv" --min-maf 0.02 -o "$OUT_DIR/assoc_${sub}_${mode}"
     plot "$OUT_DIR/assoc_${sub}_${mode}" "LPA Lp(a) ($sub, $mode)"
+    if [ "$mode" = quant ]; then  # extra unfiltered run + per-stage pipeline plot
+      "$PANVAR_BIN" associate --genotypes "$GENO" --samples "$SAMP" --feature-annot "$ANNOT" \
+        ${NGOPT[@]+"${NGOPT[@]}"} --phenotype "$REAL/pheno.quant.tsv" --min-maf 0 -o "$OUT_DIR/assoc_${sub}_quant.unfiltered" >/dev/null
+      pipeline "$OUT_DIR/assoc_${sub}_quant" "$OUT_DIR/assoc_${sub}_quant.unfiltered" 0.02 "LPA Lp(a) ($sub)"
+    fi
   done
 done
 
@@ -77,6 +90,12 @@ for mode in quant binary; do
     --feature-annot "$DESC/feature_annot.variant.tsv.gz" \
     ${NGOPT[@]+"${NGOPT[@]}"} --phenotype "$REAL/pheno.${mode}.tsv" -o "$OUT_DIR/assoc_variant_${mode}"
   plot "$OUT_DIR/assoc_variant_${mode}" "LPA Lp(a) (variant, $mode)"
+  if [ "$mode" = quant ]; then  # extra unfiltered run + per-stage pipeline plot (variant tier has CLUMP)
+    "$PANVAR_BIN" associate --genotypes "$DESC/bimbam_variant.samples.bimbam.gz" \
+      --samples "$DESC/bimbam_variant.samples.samples.txt.gz" --feature-annot "$DESC/feature_annot.variant.tsv.gz" \
+      ${NGOPT[@]+"${NGOPT[@]}"} --phenotype "$REAL/pheno.quant.tsv" --min-maf 0 -o "$OUT_DIR/assoc_variant_quant.unfiltered" >/dev/null
+    pipeline "$OUT_DIR/assoc_variant_quant" "$OUT_DIR/assoc_variant_quant.unfiltered" 0.01 "LPA Lp(a) (variants)"
+  fi
 done
 
 echo "== 2) STRUCTURE-CORRECTION demo on the synthetic genome-wide-like panel =="
