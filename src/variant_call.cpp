@@ -834,6 +834,7 @@ void call_variants(
         for (const std::string& cn : cn_nodes)
             if (node_len(graph, cn) >= options.min_sv_bp) { has_rep_selfloop = true; break; }
         bool coverage_fired = false;
+        double cn_unit_bp = 0.0;   // one-copy bp of the coverage module (set when coverage fires)
         if (options.cn_from_coverage && !has_rep_selfloop) {
             const std::unordered_set<std::string> inside_set(bubble.inside.begin(), bubble.inside.end());
             auto full_walk_bp = [&](std::size_t pi, std::size_t* peak_out) -> std::size_t {
@@ -859,7 +860,11 @@ void call_variants(
             };
             std::size_t ref_fold = 0;
             const std::size_t ref_bp = (ref_idx < graph.paths.size()) ? full_walk_bp(ref_idx, &ref_fold) : 0;
-            if (ref_fold >= 2 && ref_bp > 0) {
+            // Require the one-copy unit to reach min_sv_bp: a sub-threshold fold (e.g. an 8 bp repeat the
+            // reference happens to traverse twice) is not an SV-scale copy-number module and would only add
+            // tiny noise DUPs, so coverage does not fire there.
+            if (ref_fold >= 2 && ref_bp > 0 &&
+                static_cast<double>(ref_bp) / static_cast<double>(ref_fold) >= static_cast<double>(options.min_sv_bp)) {
                 const double unit = static_cast<double>(ref_bp) / static_cast<double>(ref_fold);
                 const std::size_t ref_copies = ref_fold;
                 MergedRecord mr;
@@ -892,6 +897,7 @@ void call_variants(
                     // to the source node, which every haplotype traverses once → no variance → dropped).
                     mr.member_nodes.insert(bubble.inside.begin(), bubble.inside.end());
                     coverage_fired = true;
+                    cn_unit_bp = unit;   // one-copy size, used to drop CN-loss DELs below
                     merged.push_back(std::move(mr));
                 }
             }
@@ -904,6 +910,11 @@ void call_variants(
             std::unordered_map<std::string, std::size_t> alt_count;
             for (const PathStep& s : alleles[ai].steps) ++alt_count[s.node_id];
             for (const std::string& cn : cn_nodes) {
+                // Only a genuine REP repeat unit (self-loop node >= min_sv_bp) anchors a self-loop DUP. An
+                // incidental tiny self-loop (e.g. C4's 22 bp node the reference may not even traverse) would
+                // otherwise emit a spurious DUP with REF_CN=0; with the guard it is simply skipped, so a
+                // mis-chosen CN flag misses rather than corrupts.
+                if (node_len(graph, cn) < options.min_sv_bp) continue;
                 const std::size_t rc = ref_count.count(cn) ? ref_count.at(cn) : 0;
                 const std::size_t ac = alt_count.count(cn) ? alt_count.at(cn) : 0;
                 if (rc == ac) continue;
@@ -996,10 +1007,13 @@ void call_variants(
 
         // ---- DEL/INS/INV events: derive per allele, keep ALL (down to the rescue floor)
         // for the re-scan, then merge events >= floor by position + sequence/node match.
-        // Skipped when bp-coverage fired: that bubble is a folded module whose walk-diff is
-        // unreliable, and the coverage CN record already represents its variation.
+        // These are emitted even when bp-coverage fired: the coverage DUP is a copy-number DOSAGE
+        // for the folded module, but it does not represent sequence-resolved insertions/inversions/
+        // deletions inside the bubble (e.g. a rare gene-unit INS), so suppressing them would silently
+        // drop real calls. The CN-DUP routes (self-loop / peak above) stay gated on !coverage_fired so
+        // copy number is reported once; the walk-diff events coexist with the coverage DUP.
         std::vector<std::vector<Event>> allele_events(alleles.size());
-        for (std::size_t ai = 0; !coverage_fired && ai < alleles.size(); ++ai) {
+        for (std::size_t ai = 0; ai < alleles.size(); ++ai) {
             if (build_walk_signature(alleles[ai].steps) == ref_sig) continue;
             const std::vector<Tok> Htok = collapse_walk(alleles[ai].steps, cn_nodes);
             std::vector<Event> events = diff_walks(graph, Rtok, Htok, bubble.source);
@@ -1227,8 +1241,10 @@ void call_variants(
         // ---- enforce the EVENTID contract: a link_id must denote a genuine co-located DEL+INS pair.
         // A substitution arm can vanish (a sub-threshold micro-arm that never became a record) or a link_id
         // can have smeared onto a large merged cluster during merging. Strip any link_id that does not have
-        // BOTH a DEL and an INS among the survivors, so EVENTID is never orphaned/spurious (a lone arm is
-        // then reported as a plain INS/DEL; a multiallelic INS with no surviving DEL becomes a plain INS).
+        // BOTH a DEL and an INS among the survivors, so EVENTID is never orphaned/spurious. A now-orphaned
+        // arm that ONLY passed the size filter via the substitution unit-rule (its size_bp < min_sv_bp, kept
+        // because its partner was >= min_sv_bp) no longer qualifies once the pair is broken, so it is dropped
+        // -- otherwise a lone sub-threshold arm would surface as a bare INS/DEL.
         {
             std::unordered_map<std::string, std::pair<bool, bool>> link_arms;  // link -> (has_del, has_ins)
             for (const MergedRecord& mr : merged) {
@@ -1237,11 +1253,39 @@ void call_variants(
                 if (mr.seed.type == EvType::Del) a.first = true;
                 else if (mr.seed.type == EvType::Ins) a.second = true;
             }
+            std::vector<MergedRecord> kept;
+            kept.reserve(merged.size());
             for (MergedRecord& mr : merged) {
-                if (mr.seed.link_id.empty()) continue;
-                const auto& a = link_arms[mr.seed.link_id];
-                if (!(a.first && a.second)) mr.seed.link_id.clear();
+                if (!mr.seed.link_id.empty()) {
+                    const auto& a = link_arms[mr.seed.link_id];
+                    if (!(a.first && a.second)) {           // orphaned pair -> strip the link
+                        mr.seed.link_id.clear();
+                        if (mr.seed.type != EvType::Dup && mr.seed.size_bp < options.min_sv_bp)
+                            continue;                        // and drop it if it only survived via the pair
+                    }
+                }
+                kept.push_back(std::move(mr));
             }
+            merged = std::move(kept);
+        }
+
+        // ---- coverage-CN bubble: drop copy-number-LOSS DELs (redundant with the coverage DUP).
+        // A DEL spanning >= half a copy unit is a haplotype carrying fewer folded copies -- the same fact
+        // the coverage DUP already reports as a reduced per-sample CN -- so emitting it too would
+        // double-count the event as both a low CN and a big DEL. Sequence-novel INS/INV, small/local DELs
+        // (< half a unit), and genuine substitution arms (link_id still set after the contract check above)
+        // are kept, so a rare gene-unit insertion in the same module is never lost. Runs after the EVENTID
+        // contract pass so an orphaned (link-cleared) DEL is correctly treated as a lone CN-loss DEL.
+        if (coverage_fired && cn_unit_bp > 0.0) {
+            std::vector<MergedRecord> kept;
+            kept.reserve(merged.size());
+            for (MergedRecord& mr : merged) {
+                if (mr.seed.type == EvType::Del && mr.seed.link_id.empty() &&
+                    static_cast<double>(mr.seed.size_bp) >= 0.5 * cn_unit_bp)
+                    continue;
+                kept.push_back(std::move(mr));
+            }
+            merged = std::move(kept);
         }
         if (merged.empty()) return;
         ++summary.bubbles_with_calls;

@@ -41,9 +41,9 @@ tests/real_smoke.sh      ./build/panvar tests/real_data/c4.gfa.gz /tmp/panvar_sm
 These exercise `describe --samples` / `--variant-vcf` and `associate` (both the variant and feature units),
 which the smoke tests above do not.
 
-- `lpa/` — committed, **simulated** example inputs (10k cohort, 10 PCs) so the GWAS runs without first
-  generating a cohort: `samples.tsv` (cosigt), `pheno.quant.tsv` / `pheno.binary.tsv` / `pheno.quant.nopc.tsv`.
-  See `lpa/README.md`.
+- `lpa/` — committed, **simulated** example inputs (~6k cohort, Moli-sani WGS scale, 10 PCs) so the GWAS runs
+  without first generating a cohort: `samples.tsv` (cosigt), `pheno.quant.tsv` / `pheno.binary.tsv` /
+  `pheno.quant.nopc.tsv`. See `lpa/README.md`.
 - `run_lpa_real.sh` — end-to-end LPA association demo: `bubble -> panphorte -> call -> describe (k-mer/graph/
   variant) -> associate (feature + variant units)` on the real LPA graph, plus the structure-correction demo
   and the plots. Needs a numpy/scipy-capable python and (for plots) `Rscript` + `ggplot2`.

@@ -3,10 +3,11 @@
 Ready-to-use phenotype and cohort tables for the [GWAS example](../../../docs/gwas/example.md), so the real
 `panvar` pipeline can be exercised end-to-end without first generating a cohort.
 
-**These are simulated**, not a real study. A structured cohort of 10,000 diploid individuals is drawn from the
-LPA test graph's haplotypes (`tests/real_data/lpa.gfa.gz`); the Lp(a) phenotype is generated with an inverse
-KIV-2 copy-number effect plus a subpopulation confounder, age/sex, and noise (see `make_lpa_phenotype.py`,
-`--seed 42`). The point is to demonstrate the method and its corrections, not to report a finding.
+**These are simulated**, not a real study. A structured cohort of ~6,000 diploid individuals — the scale of
+the Moli-sani whole-genome cohort genotyped with cosigt — is drawn from the LPA test graph's haplotypes
+(`tests/real_data/lpa.gfa.gz`); the Lp(a) phenotype is generated with an inverse KIV-2 copy-number effect plus
+a subpopulation confounder, age/sex, and noise (see `make_lpa_phenotype.py`, `--seed 42`). The point is to
+demonstrate the method and its corrections, not to report a finding.
 
 | file | contents |
 |------|----------|
@@ -15,5 +16,5 @@ KIV-2 copy-number effect plus a subpopulation confounder, age/sex, and noise (se
 | `pheno.binary.tsv` | same columns, phenotype = high-risk case/control (0/1) |
 | `pheno.quant.nopc.tsv` | quantitative phenotype without the PC columns (the naive, structure-uncorrected analysis) |
 
-Regenerate with: `python3 tests/gwas/make_lpa_phenotype.py <copies.tsv> <out> --n 10000 --seed 42 --sim-markers 0`
+Regenerate with: `python3 tests/gwas/make_lpa_phenotype.py <copies.tsv> <out> --n 6000 --seed 42 --sim-markers 0`
 (`copies.tsv` comes from running `panphorte` on the LPA graph).

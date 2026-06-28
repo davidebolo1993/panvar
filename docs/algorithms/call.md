@@ -122,8 +122,11 @@ measure **total sequence over the full walk** and divide by one copy (calibrated
 one-copy bp = ref_spelled_bp / ref_fold = 10,000/2 = 5,000 ;  REF_CN = ref_fold = 2
 hapA 15,000 bp → 3 (gain) ;  hapB 5,000 → 1 (loss) ;  hapC 10,000 → 2 (ref-like)
 ```
-Reports the **absolute** total-module count (2D6+2D7 together), recovers losses and gains alike; when it
-fires it is the authority for that bubble.
+Reports the **absolute** total-module count (2D6+2D7 together), recovers losses and gains alike. It is the
+authority for the bubble's **copy number** (it sets the `DUP`/`REF_CN`/`FORMAT:CN`, and the self-loop and
+peak `DUP` routes are skipped so CN is reported once) — but it does **not** suppress the bubble's
+sequence-resolved `DEL`/`INS`/`INV` calls. Those are still emitted alongside the coverage `DUP`, so a rare
+gene-unit insertion folded into the same module is not silently dropped.
 
 **(c) Single folded extra copy, reference does not fold (`--cn-from-multiplicity`).** Reference visits every
 node once (`ref_peak=1`); a haplotype with an extra copy folds it back, so its busiest node is visited
@@ -133,18 +136,33 @@ ref_peak=1, REF_CN=1 ;  hapD peak 2 > 1 → DUP, CN=2, SVLEN = Σ node_len × ex
 ```
 The peak (not per-node excess) isolates real dosage from cluster background.
 
-**Precedence/composition.** Per bubble, the routes are disjoint by topology and tried in this order: a
-self-loop `REP` `DUP` (always on) wins whenever the bubble carries a genuine `REP` repeat unit (a self-loop
-node ≥ `--min-sv-bp`, e.g. LPA's 5.5 kb KIV-2 node) — its integer loop count is exact; else coverage CN (if
-`--cn-from-coverage` and the reference folds ≥2×); else peak-multiplicity `DUP` (`--cn-from-multiplicity`).
-Coverage is suppressed only by a real `REP` unit, so an incidental tiny PGGB self-loop (e.g. C4's 22 bp node,
-below `--min-sv-bp`) does not block it — C4/CYP2D6 stay on coverage while LPA uses the exact self-loop. Because
-coverage never overrides a real tandem count, passing both `--cn-from-coverage` and `--cn-from-multiplicity`
-is safe on either graph. The self-loop route is always on, so a `REP` tandem is called as a `DUP` even with
-no CN flag; it is a **folded** extra copy (the coverage/peak topologies) that, without its flag, instead
-surfaces as an `INS` (`INS_SUBTYPE=DUP` under `--classify-ins`) — its duplicated nodes look haplotype-only to
-the walk diff. The two folded-cluster detectors report **absolute** per-haplotype
-CN (reference only sets the unit-bp denominator), unlike the reference-relative DEL/INS/INV diff.
+**Precedence.** Per bubble the routes are tried in a fixed order so copy number is reported once: a self-loop
+`REP` `DUP` (always on) wins whenever the bubble carries a genuine `REP` repeat unit — a self-loop node ≥
+`--min-sv-bp` (e.g. LPA's 5.5 kb KIV-2); its integer loop count is exact. Otherwise coverage CN (with
+`--cn-from-coverage`, when the reference folds ≥2× and one copy is ≥ `--min-sv-bp`); else peak-multiplicity
+`DUP` (with `--cn-from-multiplicity`). An incidental sub-`--min-sv-bp` self-loop (e.g. C4's 22 bp node, which
+the reference may not even traverse) is **not** a `REP` unit, so it neither blocks coverage nor anchors a
+self-loop `DUP` — it is skipped rather than emitted as a spurious `REF_CN=0` record. The self-loop route is
+always on, so a `REP` tandem is a `DUP` even with no CN flag; a *folded* extra copy (coverage/peak topologies)
+without its flag instead surfaces as an `INS` (`INS_SUBTYPE=DUP` under `--classify-ins`). The two
+folded-cluster routes report **absolute** per-haplotype CN (reference only sets the unit-bp denominator).
+
+**Sequence-resolved events are always kept.** Whichever CN route fires, the bubble's `DEL`/`INS`/`INV` calls
+are still emitted and merged (within and across haplotypes) as usual — a CN call never hides them. In a
+coverage bubble the one exception is a **copy-number-loss `DEL`** (≥ half a copy unit): that is the same fact
+the coverage `DUP` already reports as a reduced per-sample CN, so it is dropped to avoid double-counting;
+sequence-novel insertions/inversions and small local deletions are kept.
+
+**The two folded-cluster routes answer different questions — choose per locus.** Coverage reports the
+**total** copy number of the whole folded module (all collapsed paralogs together, e.g. CYP2D6 + CYP2D7, or
+the whole GSTM family); peak-multiplicity reports the **specific** variable copy folded onto a shared node
+(e.g. a single GSTM1 deletion against fixed GSTM paralogs). Use coverage for a whole-module CNV, peak for a
+single gene varying within a paralog family. They are **not** interchangeable and deliberately **not** unified
+into one flag: on a gene-specific locus coverage over-counts (it adds the fixed paralogs) and, taking
+precedence, would win — so combining both does not recover the gene-specific count. A mis-chosen flag
+**misses** the CN (no `DUP`) rather than corrupting it, and the structural variation is still visible in the
+`DEL`/`INS`/`INV` events; when unsure, run both and compare — agreement means the topology is unambiguous,
+while coverage > multiplicity flags a folded paralog family.
 
 ## Merge keys — Jaccard vs sequence identity
 

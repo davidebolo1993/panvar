@@ -4,14 +4,15 @@
 # synthetic genome-wide panel (naive lambda>>1 -> ~1 with PCs/LMM). See docs/gwas/example.md. Needs a
 # numpy-capable python.
 #   run_lpa_real.sh <panvar_bin> <out_dir> [python] [Rscript] [--big]
-# Env: N (cohort size; --big sets 10000), SIM (null markers, default 3000), LMM_MAX_N (LMM size cap).
+# Env: N (cohort size; --big sets 6000, the Moli-sani WGS scale), SIM (null markers, default 3000),
+#      LMM_MAX_N (LMM size cap).
 set -euo pipefail
 
 PANVAR_BIN="${1:?usage: run_lpa_real.sh <panvar_bin> <out_dir> [python] [Rscript] [--big]}"
 OUT_DIR="${2:?need out_dir}"
 PY="${3:-python3}"
 RS="${4:-Rscript}"
-[ "${5:-}" = "--big" ] && N="${N:-10000}"
+[ "${5:-}" = "--big" ] && N="${N:-6000}"   # ~Moli-sani WGS cohort scale
 N="${N:-300}"
 SIM="${SIM:-3000}"
 LMM_MAX_N="${LMM_MAX_N:-4000}"

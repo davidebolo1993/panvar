@@ -32,10 +32,12 @@ structural variation becomes a genotype. `panvar` builds the association inputs 
 
 `tests/gwas/make_lpa_phenotype.py` reads each real haplotype's KIV-2 copy number (from `panphorte`), splits
 the haplotypes into **3 subpopulations** with different KIV-2 frequencies **and** a baseline Lp(a) offset (an
-ancestry confounder), then draws 10,000 diploid individuals. Each individual's Lp(a) is log-normal with the
+ancestry confounder), then draws **~6,000 diploid individuals** — the scale of the Moli-sani whole-genome
+cohort genotyped with cosigt, so the demo mirrors a real run. Each individual's Lp(a) is log-normal with the
 inverse KIV-2 effect, an age and sex term, the subpopulation offset, and noise; ~5% of phenotypes are set to
 `NA`. Ten ancestry components `PC1..PC10` are emitted as covariate columns (only the first two carry the
-subpopulation signal — a realistic scree).
+subpopulation signal — a realistic scree). The phenotype is **simulated** (we model the known KIV-2→Lp(a)
+effect); it is not a real Moli-sani measurement.
 
 The resulting tables are committed under `tests/gwas/lpa/` so the pipeline is runnable directly:
 
@@ -54,7 +56,7 @@ reproduce everything, then read the sections below for what each step does:
 ```bash
 # numpy-capable python for the cohort sim; Rscript needs ggplot2 (e.g. conda activate base)
 bash tests/gwas/run_lpa_real.sh build/panvar results/real_data/lpa/gwas python3 Rscript          # quick
-bash tests/gwas/run_lpa_real.sh build/panvar results/real_data/lpa/gwas python3 Rscript --big     # ~10k cohort
+bash tests/gwas/run_lpa_real.sh build/panvar results/real_data/lpa/gwas python3 Rscript --big     # ~6k cohort (Moli-sani scale)
 ```
 
 The rest of this page walks the same steps one command block at a time.
@@ -243,7 +245,7 @@ panvar associate --genotypes <panel.bimbam.gz> --samples <…> --feature-annot <
 
 This panel is a control to demonstrate the correction; the result on the actual pangenome is the region scan
 above. Compare `lambda_gc` across `sim_naive` / `sim_pc` / `sim_lmm` to see inflation collapse toward 1. At
-the ~10k scale shown here the driver runs the PC path (`sim_naive` → `sim_pc`) and skips the LMM demo, since
+the ~6k scale shown here the driver runs the PC path (`sim_naive` → `sim_pc`) and skips the LMM demo, since
 the dense GRM is only materialised for smaller cohorts (`N ≤ 4000`); to reproduce `sim_lmm`, run at a capped
 `N` or supply your own external `--kinship` GRM.
 

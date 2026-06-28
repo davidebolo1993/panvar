@@ -43,14 +43,20 @@ paralog clusters on the `bubble` graph. See the
 | `--merge-seq-identity <X>` | event-sequence identity to merge | `0.80` |
 | `--merge-size-ratio <X>` | length-ratio floor for the sequence merge (lower to merge differing STR lengths) | `0` (off) |
 | `--min-haplotypes <N>` / `--min-maf <X>` | drop records below N carriers / carrier frequency `AF=AC/AN` | `1` / `0` |
-| `--cn-from-coverage` | total-module CN on folded paralog clusters the reference traverses ≥2× | off |
-| `--cn-from-multiplicity` | `DUP` from peak node multiplicity for folded bubbles with no self-loop | off |
+| `--cn-from-coverage` | **total**-module CN (all collapsed paralogs together) on folded paralog clusters the reference traverses ≥2× | off |
+| `--cn-from-multiplicity` | `DUP` from peak node multiplicity for folded bubbles with no self-loop — the **specific** variable copy | off |
 | `--classify-ins` | refine INS subtype NOVEL/DUP via minimap2 | off |
 | `--multiallelic-loci` | collapse a bounded locus into one multiallelic record ([mechanics](../algorithms/call.md#multiallelic-mechanics---multiallelic-loci)); `--multiallelic-max-bp` (5000) bounds it | off |
 | `--gtf <path>` | gene annotation (needs PanSN `--reference-path`); see [below](#gene-annotation---gtf) | — |
 | `--bubble-id <N>` / `--no-per-bubble-vcf` / `--no-variant-paths` / `-q, --quiet` | scope & output toggles | — |
 
-Both CN flags compose safely (disjoint topologies); pass both for widest recall.
+**Choosing a CN flag.** The two routes measure *different* quantities: coverage = the **total** copies of the
+whole folded module; multiplicity = the **specific** variable copy within it. So pick by locus — coverage for
+a whole-module CNV (CYP2D6+2D7, C4/RCCX), multiplicity for one gene varying inside a paralog family (GSTM1).
+They are **not** unified into one flag, because on a gene-specific locus coverage over-counts (it adds the
+fixed paralogs) and takes precedence. A mis-chosen flag *misses* the CN (no `DUP`) rather than corrupting it,
+and `DEL`/`INS`/`INV` calls are emitted under either flag — so when unsure, run both and compare (coverage >
+multiplicity flags a folded paralog family). See [algorithms/call.md](../algorithms/call.md#copy-number--three-ways).
 
 ## Outputs
 

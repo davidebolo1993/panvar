@@ -26,6 +26,13 @@ run_case() {  # <gfa> <snarls> <out_prefix>
 run_case "$DATA_DIR/syn.gfa"   "$DATA_DIR/syn.snarls.jsonl"   "$OUT_DIR/p"
 run_case "$DATA_DIR/syn_w.gfa" "$DATA_DIR/syn_w.snarls.jsonl" "$OUT_DIR/w"
 
+# Coverage-CN run on the SAME P-line graph: the folded G module (G-C-G, reference G x2, no self-loop) fires
+# the --cn-from-coverage route. Asserts the post-fix behavior: coverage emits a total-module DUP AND keeps
+# the bubble's sequence-resolved INS (not hidden), while a copy-number LOSS (s_null, G x1) is folded into the
+# DUP's per-sample CN and NOT also emitted as a redundant DEL.
+"$PANVAR_BIN" call -i "$DATA_DIR/syn.gfa" --bubble-prefix-in "$OUT_DIR/p.bub" \
+  --reference-path synref -o "$OUT_DIR/p.cov" --cn-from-coverage --classify-ins --quiet
+
 # ---- flip check: a graph whose reference traverses a node in reverse -----------
 # The bundled real graphs are already reference-forward, so flip is a no-op there.
 # This tiny graph forces the reverse-complement path: the reference walks node 2 as
@@ -70,7 +77,7 @@ if fails:
 print("flip check: OK")
 PY
 
-python3 - "$OUT_DIR/p.call.region.vcf" "$OUT_DIR/w.call.region.vcf" <<'PY'
+python3 - "$OUT_DIR/p.call.region.vcf" "$OUT_DIR/w.call.region.vcf" "$OUT_DIR/p.cov.region.vcf" <<'PY'
 import sys
 
 def load(path):
@@ -127,6 +134,19 @@ check(len(mix) == 1 and info(mix[0]).get("REF_CN") == "2",
       "[W] mixed-orientation (+,-,+) multi-copy is a single DUP, REF_CN=2")
 n = sum(1 for f in recs if "s_wmixdup" in carriers(hdr, f))
 check(n == 1, f"[W] s_wmixdup in exactly one record (mixed orientation not double-counted / not an INV), got {n}")
+
+# ---- coverage-CN run (--cn-from-coverage on the folded G module) -------------
+# coverage emits the total-module DUP and KEEPS sequence-resolved events; copy-number LOSS is folded into
+# the DUP (not re-emitted as a redundant DEL).
+hdr, recs = load(sys.argv[3])
+gdup = [f for f in recs if info(f).get("SVTYPE") == "DUP" and info(f).get("REF_CN") == "2"
+        and {"s_peakdup1", "s_peakdup2", "s_null"} <= set(carriers(hdr, f))]
+check(len(gdup) == 1, "[cov] folded G module is ONE coverage DUP (REF_CN=2) carrying gains + the loss s_null")
+check(not any(info(f).get("SVTYPE") == "DEL" and "s_null" in carriers(hdr, f) for f in recs),
+      "[cov] s_null copy-number LOSS is in the DUP, NOT also a redundant DEL (suppressed)")
+gbub = info(gdup[0]).get("BUBBLE_ID") if gdup else None
+check(any(info(f).get("SVTYPE") == "INS" and info(f).get("BUBBLE_ID") == gbub for f in recs),
+      "[cov] a sequence-resolved INS in the coverage bubble is kept (not hidden by --cn-from-coverage)")
 
 print()
 if fails:
