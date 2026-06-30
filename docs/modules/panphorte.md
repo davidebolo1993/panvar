@@ -26,6 +26,7 @@ Algorithm and worked trace: [algorithms/panphorte.md](../algorithms/panphorte.md
 | `--min-similarity <f>` | identity to treat a block as a copy of the unit; `1.0` = exact (sequence-preserving), `< 1.0` = approximate/lossy collapse of divergent copies | `1.0` |
 | `--min-unit-bp <N>` | minimum repeat-unit span to normalize | `50` |
 | `--min-copies <N>` | tandem copies needed (in some haplotype) to treat a bubble as an array; once an array, every haplotype with ≥1 copy folds | `2` |
+| `--min-array-prevalence <f>` | min fraction of bubble-traversing haplotypes that must carry a ≥`min-copies` array for the bubble to fold; separates a true population VNTR (folded; e.g. LPA KIV-2, in ~all haplotypes) from a **rare private duplication of a gene/segmental module** left untouched for `call` (e.g. a CYP2D6×2 in a handful of haplotypes, or the C4/RCCX module carried by a minority) — folding those would collapse paralogs/genes resolved later at call level | `0.5` |
 | `--max-interruption-frac <f>` | max fraction of an array's bp that may be interruptions | `0.25` |
 | `--threads <N>` | workers for the approximate seed scan / copy detection (`0` = auto) | `0` |
 | `--gtf <path>` | after re-sorting, project genes → `<prefix>.bandage_genes.csv` (needs PanSN `--reference-path`); separate from `bubble --gtf` because collapse renumbers nodes | — |

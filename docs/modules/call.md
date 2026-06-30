@@ -43,20 +43,24 @@ paralog clusters on the `bubble` graph. See the
 | `--merge-seq-identity <X>` | event-sequence identity to merge | `0.80` |
 | `--merge-size-ratio <X>` | length-ratio floor for the sequence merge (lower to merge differing STR lengths) | `0` (off) |
 | `--min-haplotypes <N>` / `--min-maf <X>` | drop records below N carriers / carrier frequency `AF=AC/AN` | `1` / `0` |
-| `--cn-from-coverage` | **total**-module CN (all collapsed paralogs together) on folded paralog clusters the reference traverses ≥2× | off |
-| `--cn-from-multiplicity` | `DUP` from peak node multiplicity for folded bubbles with no self-loop — the **specific** variable copy | off |
+| `--cn` | **recommended, locus-agnostic** copy-number calling: enables all CN routes (self-loop REP > coverage > peak, by topology) and emits the **total** copy number of the folded module; with `--gtf` it is reassigned to per-gene CN where the paralogs are separable | off |
+| `--cn-from-coverage` / `--cn-from-multiplicity` | *advanced*: enable only the coverage (total-module) or only the peak-multiplicity route. `--cn` is preferred — a single route alone can mis-call a locus of the other topology | off |
 | `--classify-ins` | refine INS subtype NOVEL/DUP via minimap2 | off |
 | `--multiallelic-loci` | collapse a bounded locus into one multiallelic record ([mechanics](../algorithms/call.md#multiallelic-mechanics---multiallelic-loci)); `--multiallelic-max-bp` (5000) bounds it | off |
 | `--gtf <path>` | gene annotation (needs PanSN `--reference-path`); see [below](#gene-annotation---gtf) | — |
 | `--bubble-id <N>` / `--no-per-bubble-vcf` / `--no-variant-paths` / `-q, --quiet` | scope & output toggles | — |
 
-**Choosing a CN flag.** The two routes measure *different* quantities: coverage = the **total** copies of the
-whole folded module; multiplicity = the **specific** variable copy within it. So pick by locus — coverage for
-a whole-module CNV (CYP2D6+2D7, C4/RCCX), multiplicity for one gene varying inside a paralog family (GSTM1).
-They are **not** unified into one flag, because on a gene-specific locus coverage over-counts (it adds the
-fixed paralogs) and takes precedence. A mis-chosen flag *misses* the CN (no `DUP`) rather than corrupting it,
-and `DEL`/`INS`/`INV` calls are emitted under either flag — so when unsure, run both and compare (coverage >
-multiplicity flags a folded paralog family). See [algorithms/call.md](../algorithms/call.md#copy-number--three-ways).
+**Copy-number calling: use `--cn`.** You do **not** need to know the locus topology in advance. `--cn` enables
+all routes and resolves them by topology (self-loop `REP` > coverage > peak), emitting the **total** copy
+number of the folded module — the same answer regardless of which underlying route fires, with no mis-calls.
+Sequence-resolved `DEL`/`INS`/`INV` are kept alongside the CN call.
+
+What `--cn` reports is the **total** module count (all collapsed paralogs together). With `--gtf` this is
+reassigned to **per-gene** copy number where the paralogs are distinguishable in the graph (e.g. CYP2D6 vs
+CYP2D7). Where a family is *fully* collapsed onto shared nodes — no gene-unique node exists (e.g. GSTM1 and
+GSTM2) — the graph cannot separate the genes, so the module total is the honest answer; the gene-specific
+number then requires a known per-locus paralog baseline. The granular flags remain for advanced control. See
+[algorithms/call.md](../algorithms/call.md#copy-number--three-ways).
 
 ## Outputs
 

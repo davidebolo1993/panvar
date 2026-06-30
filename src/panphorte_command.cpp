@@ -27,6 +27,10 @@ void print_panphorte_help() {
         << "      --bubble-id <N>              Restrict to one bubble ID (repeatable)\n"
         << "      --min-unit-bp <N>            Minimum repeat-unit span to normalize (default: 50)\n"
         << "      --min-copies <N>             Minimum tandem copies to normalize (default: 2)\n"
+        << "      --min-array-prevalence <f>   Min fraction of traversing haplotypes carrying a >=min-copies\n"
+        << "                                   array for a bubble to be folded -- separates true population\n"
+        << "                                   VNTRs (folded) from rare private gene/module dups left for\n"
+        << "                                   `call` (e.g. CYP2D6x2) (default: 0.5)\n"
         << "      --max-interruption-frac <f>  Tolerance for interrupting bases in an array (default: 0.25)\n"
         << "      --min-similarity <f>         Min identity to treat a block as a unit copy\n"
         << "                                   (1.0=exact; <1.0 enables approximate, lossy collapse; default: 1.0)\n"
@@ -103,6 +107,10 @@ int run_panphorte_command(const std::vector<std::string>& args) {
         }
         if (arg == "--max-interruption-frac") {
             options.max_interruption_frac = cli::parse_unit_fraction_arg(arg, require_value(arg));
+            continue;
+        }
+        if (arg == "--min-array-prevalence") {
+            options.min_array_prevalence = cli::parse_unit_fraction_arg(arg, require_value(arg));
             continue;
         }
         if (arg == "--min-similarity") {

@@ -628,12 +628,14 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                 std::vector<Res> results(graph.paths.size());
 
                 std::atomic<std::size_t> detect_done{0};
+                std::atomic<std::size_t> n_traverse{0};   // haplotypes that traverse this bubble
                 std::mutex detail_mtx;
                 const std::size_t n_paths = graph.paths.size();
 
                 auto detect_one = [&](std::size_t pi) {
                     const auto interval = find_best_bubble_path_interval(path_indexes[pi], bubble);
                     if (!interval.has_value()) return;
+                    n_traverse.fetch_add(1);
                     const std::size_t left = interval->left;
                     const std::size_t n = interval->right - left + 1;
                     const std::vector<PathStep> nat(
@@ -688,11 +690,22 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                 // adjacent tandem pair, so this is virtually always true, but it is the correct
                 // guard and keeps --min-copies meaningful as the array definition.) Once confirmed,
                 // every path with >=1 copy is folded below, including single-copy haplotypes.
-                std::size_t max_copies_path = 0;
+                // Cohort-prevalence gate: a real population VNTR is carried by a fraction of the
+                // cohort, whereas a rare private duplication of a gene/segmental module (e.g. a
+                // CYP2D6x2 in a handful of haplotypes) is not -- folding the latter would collapse
+                // genes/paralogs that `call` resolves downstream. Require both a >=min_copies array
+                // somewhere AND that >= min_array_prevalence of traversing haplotypes carry one.
+                std::size_t max_copies_path = 0, haps_with_array = 0;
                 for (const Res& r : results) {
-                    if (r.has) max_copies_path = std::max(max_copies_path, r.copies.size());
+                    if (!r.has) continue;
+                    max_copies_path = std::max(max_copies_path, r.copies.size());
+                    if (r.copies.size() >= options.min_copies) ++haps_with_array;
                 }
-                const bool array_confirmed = max_copies_path >= options.min_copies;
+                const std::size_t traversing = n_traverse.load();
+                const double prevalence =
+                    traversing > 0 ? static_cast<double>(haps_with_array) / static_cast<double>(traversing) : 0.0;
+                const bool array_confirmed = max_copies_path >= options.min_copies &&
+                                             prevalence >= options.min_array_prevalence;
 
                 // Serial: one REP node per bubble; build PathArrays + copies.tsv rows.
                 std::string rep_id;

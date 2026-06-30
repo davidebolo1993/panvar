@@ -142,11 +142,38 @@ struct Event {
     std::size_t ru_len = 0;           // DUP only: repeat-unit length in bp (RU_LEN; one copy)
 };
 
-// Spell a token run into sequence.
+// Spell a token run into sequence. Builds in place with a single reservation -- no throwaway
+// vector<PathStep> and no per-node reverse_complement temporary -- because this is the caller's
+// hot path (one call per gap block per allele) and the allocator becomes the bottleneck under the
+// parallel allele loop. Reverse bytes use the same complement mapping as reverse_complement().
 std::string spell_toks(const Graph& graph, const std::vector<const Tok*>& toks) {
-    std::vector<PathStep> steps;
-    for (const Tok* t : toks) steps.push_back(PathStep{t->node_id, t->reverse});
-    return spell_path_steps_sequence(graph, steps);
+    std::size_t total = 0;
+    for (const Tok* t : toks) {
+        const auto it = graph.nodes.find(t->node_id);
+        if (it == graph.nodes.end() || it->second.sequence.empty()) {
+            // Defer to the canonical speller so the missing-node error is identical.
+            std::vector<PathStep> steps;
+            for (const Tok* u : toks) steps.push_back(PathStep{u->node_id, u->reverse});
+            return spell_path_steps_sequence(graph, steps);
+        }
+        total += it->second.sequence.size();
+    }
+    std::string seq;
+    seq.reserve(total);
+    for (const Tok* t : toks) {
+        const std::string& ns = graph.nodes.at(t->node_id).sequence;
+        if (!t->reverse) { seq += ns; continue; }
+        for (auto it = ns.rbegin(); it != ns.rend(); ++it) {
+            switch (*it) {
+                case 'A': case 'a': seq.push_back('T'); break;
+                case 'C': case 'c': seq.push_back('G'); break;
+                case 'G': case 'g': seq.push_back('C'); break;
+                case 'T': case 't': seq.push_back('A'); break;
+                default: seq.push_back('N'); break;
+            }
+        }
+    }
+    return seq;
 }
 
 std::size_t toks_bp(const Graph& graph, const std::vector<const Tok*>& toks) {
@@ -193,15 +220,19 @@ void diff_segment(
     const int kMatch = 2;
     const int kGap = -1;
     const int kNeg = -1000000;
-    std::vector<std::vector<int>> dp(m + 1, std::vector<int>(n + 1, 0));
-    for (std::size_t i = 1; i <= m; ++i) dp[i][0] = static_cast<int>(i) * kGap;
-    for (std::size_t j = 1; j <= n; ++j) dp[0][j] = static_cast<int>(j) * kGap;
+    // Flat (m+1)x(n+1) DP buffer: one allocation instead of (m+1) row vectors. The full matrix is
+    // retained because the traceback below revisits arbitrary cells.
+    const std::size_t W = n + 1;
+    std::vector<int> dp((m + 1) * W, 0);
+    auto D = [&](std::size_t i, std::size_t j) -> int& { return dp[i * W + j]; };
+    for (std::size_t i = 1; i <= m; ++i) D(i, 0) = static_cast<int>(i) * kGap;
+    for (std::size_t j = 1; j <= n; ++j) D(0, j) = static_cast<int>(j) * kGap;
     for (std::size_t i = 1; i <= m; ++i) {
         for (std::size_t j = 1; j <= n; ++j) {
-            const int diag = (R[r0 + i - 1].token == H[h0 + j - 1].token) ? dp[i - 1][j - 1] + kMatch : kNeg;
-            const int up = dp[i - 1][j] + kGap;
-            const int left = dp[i][j - 1] + kGap;
-            dp[i][j] = std::max(diag, std::max(up, left));
+            const int diag = (R[r0 + i - 1].token == H[h0 + j - 1].token) ? D(i - 1, j - 1) + kMatch : kNeg;
+            const int up = D(i - 1, j) + kGap;
+            const int left = D(i, j - 1) + kGap;
+            D(i, j) = std::max(diag, std::max(up, left));
         }
     }
 
@@ -211,10 +242,10 @@ void diff_segment(
     std::size_t i = m, j = n;
     while (i > 0 || j > 0) {
         if (i > 0 && j > 0 && R[r0 + i - 1].token == H[h0 + j - 1].token &&
-            dp[i][j] == dp[i - 1][j - 1] + kMatch) {
+            D(i, j) == D(i - 1, j - 1) + kMatch) {
             cols.push_back({static_cast<long long>(r0 + i - 1), static_cast<long long>(h0 + j - 1)});
             --i; --j;
-        } else if (i > 0 && dp[i][j] == dp[i - 1][j] + kGap) {
+        } else if (i > 0 && D(i, j) == D(i - 1, j) + kGap) {
             cols.push_back({static_cast<long long>(r0 + i - 1), -1});
             --i;
         } else {
@@ -696,7 +727,11 @@ void call_variants(
     // Progress over bubbles (stderr, TTY-gated; empty label = suppressed under --quiet).
     cli::ProgressBar call_progress(options.quiet ? "" : "Calling variants", bubbles.size());
     std::vector<BubbleOut> bouts(bubbles.size());
-    run_parallel(bubbles.size(), options.threads, [&](std::size_t bubble_idx) {
+    // Bubbles are processed SERIALLY; parallelism lives INSIDE each bubble, over its alleles (the
+    // per-allele walk-diff DP is the hot path). Copy-number/SV loci are typically one dominant folded
+    // bubble that bubble-level parallelism could not split, so this is where the cores are needed.
+    // Each bubble still writes only to its own bouts[bubble_idx], so results are order-deterministic.
+    auto process_bubble = [&](std::size_t bubble_idx) {
         const Bubble& bubble = bubbles[bubble_idx];
         // Shadow the shared sinks with this bubble's local buffers: the (unchanged) loop body below
         // writes only through these names, so each bubble accumulates independently. id_counts is
@@ -954,7 +989,10 @@ void call_variants(
         // dosage. Validated on GSTM1: only the 2 true dup haplotypes (peak 4 > ref peak 3)
         // fire, 0 false positives. Skipped entirely when self-loop CN nodes exist, so
         // panphorte-normalized C4/LPA keep their exact fit_align counts.
-        if (options.cn_from_multiplicity && cn_nodes.empty() && !coverage_fired) {
+        // Gated on the absence of a REP self-loop >= min_sv_bp (not on cn_nodes being empty): an incidental
+        // tiny self-loop (C4's 22 bp node) must NOT block the per-node/peak estimate. The self-loop DUP route
+        // above already guards each loop on size, so the two routes stay disjoint by topology.
+        if (options.cn_from_multiplicity && !has_rep_selfloop && !coverage_fired) {
             std::size_t ref_peak = 0;
             for (const std::string& id : bubble.inside) {
                 const auto it = ref_count.find(id);
@@ -1012,9 +1050,14 @@ void call_variants(
         // deletions inside the bubble (e.g. a rare gene-unit INS), so suppressing them would silently
         // drop real calls. The CN-DUP routes (self-loop / peak above) stay gated on !coverage_fired so
         // copy number is reported once; the walk-diff events coexist with the coverage DUP.
+        // The per-allele walk-diff (diff_walks' O(m*n) segment DP) dominates the whole caller on
+        // large folded bubbles (e.g. the GSTM CNV: ~hundreds of distinct alleles, large inter-anchor
+        // segments). It is pure and writes only to its own allele_events[ai], so run it across cores;
+        // the cross-haplotype merge below consumes the results in the same (allele) order, so output
+        // is independent of thread count.
         std::vector<std::vector<Event>> allele_events(alleles.size());
-        for (std::size_t ai = 0; ai < alleles.size(); ++ai) {
-            if (build_walk_signature(alleles[ai].steps) == ref_sig) continue;
+        run_parallel(alleles.size(), options.threads, [&](std::size_t ai) {
+            if (build_walk_signature(alleles[ai].steps) == ref_sig) return;
             const std::vector<Tok> Htok = collapse_walk(alleles[ai].steps, cn_nodes);
             std::vector<Event> events = diff_walks(graph, Rtok, Htok, bubble.source);
             // Per-haplotype node -> first bp offset along this allele's walk, so coalescing
@@ -1033,7 +1076,7 @@ void call_variants(
                 e.ref_pos = p < 0 ? 0 : static_cast<std::size_t>(p);
             }
             allele_events[ai] = std::move(events);
-        }
+        });
 
         // ---- Cross-haplotype merge by TRANSITIVE single-linkage clustering. Greedy
         // first-fit (each event joins the first matching seed) is not transitive: if A~B
@@ -1130,8 +1173,13 @@ void call_variants(
         // the inserted nodes are shared across nearly all haplotype walks, so it force-called
         // ~every haplotype as a carrier. Requiring the haplotype's own diff to register the
         // event keeps the reference-relative meaning intact.)
-        for (MergedRecord& mr : merged) {
-            if (mr.seed.type == EvType::Dup) continue;
+        // Parallel over records: each MergedRecord is interrogated against every non-member allele
+        // independently and mutates only itself, so this is safe and order-independent. This is the
+        // other hot path on big folded bubbles -- events_match -> seq_identity -> fit_align (banded
+        // O(L^2)) on large CNV event sequences, run records x alleles times.
+        run_parallel(merged.size(), options.threads, [&](std::size_t ri) {
+            MergedRecord& mr = merged[ri];
+            if (mr.seed.type == EvType::Dup) return;
             for (std::size_t ai = 0; ai < alleles.size(); ++ai) {
                 if (mr.member_alleles.count(ai)) continue;
                 for (const Event& e : allele_events[ai]) {
@@ -1148,7 +1196,7 @@ void call_variants(
                     }
                 }
             }
-        }
+        });
 
         // ---- De-duplicate a folded duplication against its peak-multiplicity DUP. The
         // walk-diff and the peak DUP both see the extra copy: the DUP as a count, the
@@ -1644,7 +1692,8 @@ void call_variants(
             else if (e.type == EvType::Inv) ++summary.inv;
             else ++summary.dup;
         }
-    });
+    };
+    for (std::size_t bubble_idx = 0; bubble_idx < bubbles.size(); ++bubble_idx) process_bubble(bubble_idx);
 
     // Merge per-bubble outputs in bubble order: deterministic regardless of thread count.
     for (std::size_t bi = 0; bi < bouts.size(); ++bi) {
@@ -1743,8 +1792,27 @@ void call_variants(
                 }
             };
 
+            auto group_names = [&](const DupGeneTarget& t, const std::vector<int>& grp_members) {
+                std::string names;
+                for (std::size_t m = 0; m < grp_members.size(); ++m) {
+                    if (m) names += ';';
+                    names += genes[t.gene_idx[grp_members[m]]].gene_name;
+                }
+                return names;
+            };
+
+            // Pre-compute, per multi-gene target, the paralog collapse grouping (cheap: only needs the
+            // reference-derived gene sequences). A singleton group is separable -> its per-gene copy
+            // number is resolved by per-haplotype realignment; a multi-gene group is fully collapsed
+            // (e.g. GSTM1 nested in GSTM2, C4A/C4B >0.98) and is reported as the module total with NO
+            // realignment. The costly per-haplotype pass (and even spelling every haplotype) is skipped
+            // entirely for targets whose genes ALL collapse -- there the realignment only ever
+            // reproduced the module total we already have. It runs only where a separable gene exists.
             std::unordered_map<int, std::string> gene_seq_cache;
             std::vector<std::string> hap_seq;
+            std::vector<std::vector<std::vector<int>>> target_members(dup_targets.size());
+            std::vector<char> target_needs_realign(dup_targets.size(), 0);
+            bool need_realign = false;
             if (any_multi) {
                 const std::string ref_full_seq = spell_path_steps_sequence(graph, ref_path->steps);
                 const std::size_t region_start = ref_meta.region_start_1based;
@@ -1756,35 +1824,52 @@ void call_variants(
                     const std::size_t len = std::min(g.end_1based - g.start_1based + 1, ref_full_seq.size() - off);
                     return ref_full_seq.substr(off, len);
                 };
-                for (const DupGeneTarget& t : dup_targets)
-                    if (t.gene_idx.size() >= 2)
-                        for (int gi : t.gene_idx)
-                            if (!gene_seq_cache.count(gi)) gene_seq_cache[gi] = gene_seq_of(gi);
-                // Spell every haplotype once (parallel).
-                hap_seq.assign(graph.paths.size(), std::string());
-                run_parallel(graph.paths.size(), options.threads, [&](std::size_t pi) {
-                    hap_seq[pi] = spell_path_steps_sequence(graph, graph.paths[pi].steps);
-                });
+                for (std::size_t ti = 0; ti < dup_targets.size(); ++ti) {
+                    const DupGeneTarget& t = dup_targets[ti];
+                    if (t.gene_idx.size() < 2) continue;
+                    for (int gi : t.gene_idx)
+                        if (!gene_seq_cache.count(gi)) gene_seq_cache[gi] = gene_seq_of(gi);
+                    std::vector<std::string> gseqs;
+                    gseqs.reserve(t.gene_idx.size());
+                    for (int gi : t.gene_idx) gseqs.push_back(gene_seq_cache[gi]);
+                    const std::vector<int> grp = gene_collapse_groups(gseqs);
+                    std::vector<std::vector<int>> members;       // local gene indices per group root
+                    std::unordered_map<int, std::size_t> root_to_slot;
+                    for (std::size_t k = 0; k < t.gene_idx.size(); ++k) {
+                        auto it = root_to_slot.find(grp[k]);
+                        if (it == root_to_slot.end()) { root_to_slot[grp[k]] = members.size(); members.push_back({}); }
+                        members[root_to_slot[grp[k]]].push_back(static_cast<int>(k));
+                    }
+                    for (const std::vector<int>& g : members)
+                        if (g.size() == 1) { target_needs_realign[ti] = 1; need_realign = true; break; }
+                    target_members[ti] = std::move(members);
+                }
+                // Spell every haplotype once (parallel) -- only if some target actually needs realignment.
+                if (need_realign) {
+                    hap_seq.assign(graph.paths.size(), std::string());
+                    run_parallel(graph.paths.size(), options.threads, [&](std::size_t pi) {
+                        hap_seq[pi] = spell_path_steps_sequence(graph, graph.paths[pi].steps);
+                    });
+                }
             }
-            for (const DupGeneTarget& t : dup_targets) {
+            for (std::size_t ti = 0; ti < dup_targets.size(); ++ti) {
+                const DupGeneTarget& t = dup_targets[ti];
                 if (t.gene_idx.size() < 2) {   // single gene: the module total IS the gene's copy number
                     emit_total(t, genes[t.gene_idx[0]].gene_name, "1");
+                    continue;
+                }
+                const std::vector<std::vector<int>>& members = target_members[ti];
+                if (!target_needs_realign[ti]) {
+                    // All genes collapse -> no per-gene split is recoverable; emit the module total
+                    // (reliable=0) per collapse group. Identical to the realignment path's output, but
+                    // without the (here useless) per-haplotype minimap2 work.
+                    for (const std::vector<int>& grp_members : members)
+                        emit_total(t, group_names(t, grp_members), "0");
                     continue;
                 }
                 std::vector<std::string> gseqs;
                 gseqs.reserve(t.gene_idx.size());
                 for (int gi : t.gene_idx) gseqs.push_back(gene_seq_cache[gi]);
-                // Collapse near-identical paralogs into groups; a singleton group is reliable (its
-                // per-gene copy number is trustworthy), a multi-gene group is reported as the module
-                // total over the collapsing genes (no per-gene split).
-                const std::vector<int> grp = gene_collapse_groups(gseqs);
-                std::vector<std::vector<int>> members;       // local gene indices per group root
-                std::unordered_map<int, std::size_t> root_to_slot;
-                for (std::size_t k = 0; k < t.gene_idx.size(); ++k) {
-                    auto it = root_to_slot.find(grp[k]);
-                    if (it == root_to_slot.end()) { root_to_slot[grp[k]] = members.size(); members.push_back({}); }
-                    members[root_to_slot[grp[k]]].push_back(static_cast<int>(k));
-                }
                 std::vector<std::vector<std::string>> per_path(graph.paths.size());
                 run_parallel(graph.paths.size(), options.threads, [&](std::size_t pi) {
                     const std::vector<int> cn = assign_gene_copies(gseqs, hap_seq[pi]);
@@ -1796,14 +1881,9 @@ void call_variants(
                             per_path[pi].push_back(prefix + genes[t.gene_idx[k]].gene_name + '\t' +
                                                    std::to_string(cn[k]) + "\t1");
                         } else {                                  // unreliable: module total + gene list
-                            std::string names;
-                            for (std::size_t m = 0; m < grp_members.size(); ++m) {
-                                if (m) names += ';';
-                                names += genes[t.gene_idx[grp_members[m]]].gene_name;
-                            }
                             const auto cit = t.sample_cn.find(sname);
                             const std::string total = cit != t.sample_cn.end() ? std::to_string(cit->second) : ".";
-                            per_path[pi].push_back(prefix + names + '\t' + total + "\t0");
+                            per_path[pi].push_back(prefix + group_names(t, grp_members) + '\t' + total + "\t0");
                         }
                     }
                 });

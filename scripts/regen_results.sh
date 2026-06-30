@@ -119,7 +119,7 @@ for region in "${REGIONS[@]}"; do
   case "$region" in
     lpa)
       # Tandem repeat (KIV-2): panphorte folds the variable tandem; call counts on the REP node.
-      run_region lpa "$DATA/lpa.gfa.gz" "--min-similarity 0.70" panphorte "--cn-from-multiplicity" 1
+      run_region lpa "$DATA/lpa.gfa.gz" "--min-similarity 0.70" panphorte "--cn" 1
       validate_cn lpa --mode repeats --truth "$DATA/lpa.repeats.tsv" --name-col hapl --count-col copies
       # LPA GWAS demo (needs python numpy/scipy); reuses the dedicated driver
       bash "$HERE/../tests/gwas/run_lpa_real.sh" "$BIN" "$OUT/lpa/gwas" "$PY" "$RS" || echo "  (gwas demo skipped)"
@@ -127,19 +127,19 @@ for region in "${REGIONS[@]}"; do
     c4)
       # PGGB-collapsed paralog cluster (each RCCX module = one C4 gene). Total CN from full-walk
       # coverage on the bubble graph -> 131/131 exact against the C4A+C4B gene count.
-      run_region c4 "$DATA/c4.gfa.gz" "--min-similarity 0.70" bubble "--cn-from-coverage"
+      run_region c4 "$DATA/c4.gfa.gz" "--min-similarity 0.70" bubble "--cn"
       validate_cn c4 --mode gene-count --truth "$DATA/c4.bed" --genes C4A,C4B
       ;;
     gstm1)
       # Deletion/CNV (ref CN=1): peak node multiplicity over the segdup cluster (bubble graph).
-      run_region gstm1 "$DATA/gstm1.gfa.gz" "--min-similarity 0.70" bubble "--cn-from-multiplicity"
+      run_region gstm1 "$DATA/gstm1.gfa.gz" "--min-similarity 0.70" bubble "--cn"
       validate_cn gstm1 --mode direct --truth "$DATA/gstm1.bed"
       ;;
     cyp2d6)
       # PGGB-collapsed paralog cluster (CYP2D6/2D7/2D8P). Full-walk coverage = total module copies;
       # validated against the collapsed D6+D7 truth. The few residual misses carry an extra
       # (unannotated) CYP2D8P / 2D7-hybrid module that the gene BED does not count -- real biology.
-      run_region cyp2d6 "$DATA/cyp2d6.gfa.gz" "" bubble "--cn-from-coverage"
+      run_region cyp2d6 "$DATA/cyp2d6.gfa.gz" "" bubble "--cn"
       validate_cn cyp2d6 --mode gene-count --truth "$DATA/cyp2d6.bed" --genes CYP2D6,CYP2D7
       # Resolved per-gene split (reliable genes from --gtf realignment) vs per-gene truth: CYP2D6 and
       # CYP2D7 separately, absolute (offset 0). Adds CYP2D6/CYP2D7 facets to the concordance plot.

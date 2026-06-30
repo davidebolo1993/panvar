@@ -43,14 +43,13 @@ void print_call_help() {
         << "      --minimap-preset <name>      minimap2 preset for INS refinement: asm5|asm10|asm20 (default: asm20)\n"
         << "      --minimap-best-n <N>         minimap2 best_n chains (default: 8)\n"
         << "      --ins-dup-min-identity <X>   Identity for an INS to be subtyped DUP (default: 0.90)\n"
-        << "      --cn-from-multiplicity       Peak-multiplicity route: DUP from peak node multiplicity for\n"
-        << "                                   folded bubbles with no self-loop. Reports the SPECIFIC variable\n"
-        << "                                   copy (e.g. GSTM1 within the GSTM family).\n"
-        << "      --cn-from-coverage           Coverage route: TOTAL-module copy number (spelled-bp/unit) on\n"
-        << "                                   folded paralog clusters (reference folds >=2x, e.g. CYP2D6).\n"
-        << "                                   NOTE: the two routes measure different things (specific copy vs\n"
-        << "                                   total module) and coverage takes precedence; choose per locus.\n"
-        << "                                   Either keeps sequence-resolved DEL/INS/INV alongside the CN call.\n"
+        << "      --cn                         Recommended, locus-agnostic copy-number calling: enables all\n"
+        << "                                   routes (self-loop REP > coverage > peak, by topology) and emits\n"
+        << "                                   the TOTAL copy number of the folded module. With --gtf the total\n"
+        << "                                   is reassigned to per-gene copy number. Sequence-resolved\n"
+        << "                                   DEL/INS/INV are kept alongside the CN call.\n"
+        << "      --cn-from-coverage           (advanced) only the coverage route (total-module bp/unit)\n"
+        << "      --cn-from-multiplicity       (advanced) only the peak-multiplicity route\n"
         << "      --gtf <path>                 Reference-coordinate GTF: annotate variants with the genes\n"
         << "                                   they touch (INFO GENES), write <prefix>.node_genes.tsv and a\n"
         << "                                   per-gene DUP copy-number table; needs a PanSN reference path\n"
@@ -150,6 +149,11 @@ int run_call_command(const std::vector<std::string>& args) {
         }
         if (arg == "--classify-ins") {
             options.classify_ins = true;
+            continue;
+        }
+        if (arg == "--cn") {                 // recommended: enable all CN routes (locus-agnostic total CN)
+            options.cn_from_coverage = true;
+            options.cn_from_multiplicity = true;
             continue;
         }
         if (arg == "--cn-from-multiplicity") {

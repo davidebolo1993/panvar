@@ -13,6 +13,13 @@ identical copies match even when they are distinct node ids. For each bubble, fo
    then extend bidirectionally collecting further copies, tolerating short interruptions (kept as nested
    literal steps). Accept a run when `unit_bp ≥ --min-unit-bp`, `copies ≥ --min-copies`, and interruptions
    stay within `--max-interruption-frac`;
+2b. **cohort-prevalence gate** — only fold the bubble if a `≥ --min-copies` array is carried by
+   `≥ --min-array-prevalence` of the bubble-traversing haplotypes. This is what separates a genuine
+   population VNTR (folded; e.g. LPA KIV-2, carried by ~all haplotypes) from a **rare private duplication
+   of a gene/segmental module** (left untouched). A single haplotype with a `CYP2D6×2` tandem, or the
+   C4/RCCX module present in a minority, no longer collapses the whole bubble — those are gene-level
+   events the `call` module resolves per-gene/total downstream, and folding them here would fuse paralogs
+   (e.g. CYP2D6 with CYP2D7/2D8P). Default `0.5` (a real VNTR is carried by a majority);
 3. collapse each array to one **REP node** (deduplicated by canonical unit sequence) with a self-loop;
    reroute the path through it `copies` times; drop now-unused duplicate nodes.
 
