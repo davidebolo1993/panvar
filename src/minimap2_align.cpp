@@ -36,9 +36,11 @@ Minimap2Hit reg_to_hit(const mm_reg1_t& reg, std::size_t qlen, std::size_t tlen)
     // Each I/D run is one event regardless of length, so a large structural indel barely affects it.
     if (reg.p != nullptr && reg.p->n_cigar > 0) {
         std::size_t m = 0, x = 0, gaps = 0;
+        out.cigar.reserve(reg.p->n_cigar);
         for (uint32_t i = 0; i < reg.p->n_cigar; ++i) {
             const uint32_t op = reg.p->cigar[i] & 0xf;
             const uint32_t len = reg.p->cigar[i] >> 4;
+            out.cigar.emplace_back(static_cast<int>(op), static_cast<int>(len));
             if (op == 7) m += len;          // '=' match
             else if (op == 8) x += len;     // 'X' mismatch
             else if (op == 1 || op == 2) ++gaps;  // 'I'/'D' indel run (one event)

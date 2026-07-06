@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace panvar {
@@ -21,6 +22,11 @@ struct Minimap2Hit {
     // `de`. Robust when a long query maps a copy missing a large insertion (e.g. C4 short form lacks
     // the ~6.4 kb HERV): the structural indel does not deflate identity. 0 when no cigar is available.
     double gc_identity = 0.0;
+
+    // Extended (EQX) CIGAR of the alignment as (op, length) pairs, op in {7='=', 8='X', 1='I', 2='D'},
+    // walking query_start_bp/target_start_bp forward. Empty when no cigar was produced. Used to locate the
+    // divergent columns between two near-identical paralog CDS (per-site copy-number resolution).
+    std::vector<std::pair<int, int>> cigar;
 
     // Fraction of the alignment block that matched; 0 when there is no alignment.
     double identity() const {

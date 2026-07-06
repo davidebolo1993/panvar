@@ -55,6 +55,7 @@ add_library(panvarlib
     src/bubbles.cpp
     src/ref_path.cpp
     src/gtf.cpp
+    src/gene_cn_kmer.cpp
     src/minimap2_align.cpp
     src/variant_call.cpp
     src/describe.cpp

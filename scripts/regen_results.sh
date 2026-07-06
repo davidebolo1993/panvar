@@ -130,6 +130,16 @@ for region in "${REGIONS[@]}"; do
       # universal substrate; panphorte leaves this cluster untouched, so it equals the bubble graph).
       run_region c4 "$DATA/c4.gfa.gz" "--min-similarity 0.70" panphorte "--cn"
       validate_cn c4 --mode gene-count --truth "$DATA/c4.bed" --genes C4A,C4B
+      # Resolved per-gene split (C4A/C4B from the k-mer per-site resolver, --gtf) vs per-gene truth,
+      # absolute (offset 0). C4A/C4B are near-identical, so the split rides the per-site consensus.
+      if [[ -s "$OUT/c4/call/call.dup_gene_cn.tsv" ]]; then
+        for g in C4A C4B; do
+          echo "---- c4 $g per-gene split vs ground truth ----"
+          "$PY" "$HERE/compare_copy_number.py" --mode per-gene --truth "$DATA/c4.bed" --genes "$g" \
+            --dup-gene-cn "$OUT/c4/call/call.dup_gene_cn.tsv" --label "$g" --offset 0 \
+            --dump-tsv "$CN_TABLE" || echo "  (per-gene $g compare skipped)"
+        done
+      fi
       ;;
     gstm1)
       # PGGB-collapsed paralog cluster (GSTM1/2/5, reference folds 3x): total-module coverage,
@@ -144,8 +154,8 @@ for region in "${REGIONS[@]}"; do
       # Called on the panphorte graph (leaves this cluster untouched, so it equals the bubble graph).
       run_region cyp2d6 "$DATA/cyp2d6.gfa.gz" "" panphorte "--cn"
       validate_cn cyp2d6 --mode gene-count --truth "$DATA/cyp2d6.bed" --genes CYP2D6,CYP2D7
-      # Resolved per-gene split (reliable genes from --gtf realignment) vs per-gene truth: CYP2D6 and
-      # CYP2D7 separately, absolute (offset 0). Adds CYP2D6/CYP2D7 facets to the concordance plot.
+      # Resolved per-gene split (divergent paralogs, --gtf private-k-mer dosage) vs per-gene truth: CYP2D6
+      # and CYP2D7 separately, absolute (offset 0). Adds CYP2D6/CYP2D7 facets to the concordance plot.
       if [[ -s "$OUT/cyp2d6/call/call.dup_gene_cn.tsv" ]]; then
         for g in CYP2D6 CYP2D7; do
           echo "---- cyp2d6 $g per-gene split vs ground truth ----"

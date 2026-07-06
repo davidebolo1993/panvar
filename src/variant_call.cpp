@@ -4,6 +4,7 @@
 #include "panvar/bubble_path.hpp"
 #include "panvar/bubbles.hpp"
 #include "panvar/cli_utils.hpp"
+#include "panvar/gene_cn_kmer.hpp"
 #include "panvar/graph_utils.hpp"
 #include "panvar/gtf.hpp"
 #include "panvar/minimap2_align.hpp"
@@ -1789,60 +1790,40 @@ void call_variants(
     }
 
     // GTF annotation sidecars (independent of --no-variant-paths): node->genes map (consumed by
-    // describe/gwas) and the per-gene DUP copy-number table. The table's per-gene copy number is
-    // resolved by COMPETITIVE REALIGNMENT: each gene's reference sequence is mapped to every
-    // haplotype and each module copy locus is assigned to the gene it aligns best to. This is what
-    // separates collapsed paralogs (CYP2D6 vs 2D7) that share graph nodes; graph multiplicity alone
-    // reports only the module total.
+    // describe/gwas) and the per-gene DUP copy-number table. Per-gene copy number is resolved by
+    // PRIVATE-K-MER DOSAGE: each gene's discriminative reference sequence (its merged CDS, where paralogs
+    // differ; the gene span when a gene has no CDS) yields a set of canonical k-mers unique to it vs its
+    // paralogs, and a haplotype's per-copy count of those k-mers is the gene's copy number -- no
+    // per-haplotype alignment. This is what separates collapsed paralogs (CYP2D6 vs 2D7) that share graph
+    // nodes; graph multiplicity alone reports only the module total. Evidence (hits / private-set size /
+    // dosage) is written per row so every call is auditable.
     if (!genes.empty()) {
         write_node_genes_tsv(options.out_prefix + ".node_genes.tsv", node_genes, genes);
 
         if (!dup_targets.empty()) {
-            // A DUP overlapping a SINGLE gene needs no realignment: with no paralog to compete, that
-            // gene's copy number is just the module total (FORMAT:CN) already computed. Competitive
-            // realignment (minimap2 of the gene vs every haplotype) is only meaningful on multi-gene
-            // folded loci (CYP2D6/2D7, C4A/C4B), where graph multiplicity reports the module total but
-            // not the per-gene split. So the costly per-haplotype pass — and even spelling every
-            // haplotype — runs only when some target has >=2 genes. This is what made LPA (one DUP over
-            // LPA alone, across all haplotypes) pay for hundreds of large minimap2 alignments for nothing.
+            // Per-gene resolution (spelling every haplotype + building k-mer sets) is only meaningful when
+            // a target folds >=2 genes; a single-gene DUP's copy number is just the module total.
             const bool any_multi = std::any_of(dup_targets.begin(), dup_targets.end(),
                 [](const DupGeneTarget& t) { return t.gene_idx.size() >= 2; });
 
-            // Emit module-total rows for a target with no per-gene split (single gene, reliable).
+            // Module-total row (single gene, or a gene with no private k-mers). Evidence columns are "."
+            // because no per-gene k-mer split was made.
             auto emit_total = [&](const DupGeneTarget& t, const std::string& names, const char* reliable) {
                 for (const PathRecord& p : graph.paths) {
                     const auto cit = t.sample_cn.find(p.name);
                     const std::string total = cit != t.sample_cn.end() ? std::to_string(cit->second) : ".";
                     dup_gene_cn_rows.push_back(std::to_string(t.bubble_id) + '\t' + t.variant_id + '\t' +
-                                               p.name + '\t' + names + '\t' + total + '\t' + reliable);
+                                               p.name + '\t' + names + '\t' + total + '\t' + reliable +
+                                               "\t.\t.\t.");
                 }
             };
 
-            auto group_names = [&](const DupGeneTarget& t, const std::vector<int>& grp_members) {
-                std::string names;
-                for (std::size_t m = 0; m < grp_members.size(); ++m) {
-                    if (m) names += ';';
-                    names += genes[t.gene_idx[grp_members[m]]].gene_name;
-                }
-                return names;
-            };
-
-            // Pre-compute, per multi-gene target, the paralog collapse grouping (cheap: only needs the
-            // reference-derived gene sequences). A singleton group is separable -> its per-gene copy
-            // number is resolved by per-haplotype realignment; a multi-gene group is fully collapsed
-            // (e.g. GSTM1 nested in GSTM2, C4A/C4B >0.98) and is reported as the module total with NO
-            // realignment. The costly per-haplotype pass (and even spelling every haplotype) is skipped
-            // entirely for targets whose genes ALL collapse -- there the realignment only ever
-            // reproduced the module total we already have. It runs only where a separable gene exists.
-            std::unordered_map<int, std::string> gene_seq_cache;
-            std::vector<std::string> hap_seq;
-            std::vector<std::vector<std::vector<int>>> target_members(dup_targets.size());
-            std::vector<char> target_needs_realign(dup_targets.size(), 0);
-            bool need_realign = false;
+            std::vector<std::string> hap_seq;                     // per graph.paths (spelled once)
+            std::unordered_map<int, std::string> marker_cache;    // gene index -> discriminative marker
             if (any_multi) {
                 const std::string ref_full_seq = spell_path_steps_sequence(graph, ref_path->steps);
                 const std::size_t region_start = ref_meta.region_start_1based;
-                auto gene_seq_of = [&](int gi) -> std::string {
+                auto gene_span_of = [&](int gi) -> std::string {
                     const GeneFeature& g = genes[gi];
                     if (g.start_1based < region_start) return std::string();
                     const std::size_t off = g.start_1based - region_start;
@@ -1850,74 +1831,65 @@ void call_variants(
                     const std::size_t len = std::min(g.end_1based - g.start_1based + 1, ref_full_seq.size() - off);
                     return ref_full_seq.substr(off, len);
                 };
-                for (std::size_t ti = 0; ti < dup_targets.size(); ++ti) {
-                    const DupGeneTarget& t = dup_targets[ti];
-                    if (t.gene_idx.size() < 2) continue;
-                    for (int gi : t.gene_idx)
-                        if (!gene_seq_cache.count(gi)) gene_seq_cache[gi] = gene_seq_of(gi);
-                    std::vector<std::string> gseqs;
-                    gseqs.reserve(t.gene_idx.size());
-                    for (int gi : t.gene_idx) gseqs.push_back(gene_seq_cache[gi]);
-                    const std::vector<int> grp =
-                        gene_collapse_groups(gseqs, "asm20", options.gene_collapse_identity);
-                    std::vector<std::vector<int>> members;       // local gene indices per group root
-                    std::unordered_map<int, std::size_t> root_to_slot;
-                    for (std::size_t k = 0; k < t.gene_idx.size(); ++k) {
-                        auto it = root_to_slot.find(grp[k]);
-                        if (it == root_to_slot.end()) { root_to_slot[grp[k]] = members.size(); members.push_back({}); }
-                        members[root_to_slot[grp[k]]].push_back(static_cast<int>(k));
+                auto marker_of = [&](int gi) -> std::string {    // merged CDS, else span (CDS-less genes)
+                    const GeneFeature& g = genes[gi];
+                    if (g.cds.empty()) return gene_span_of(gi);
+                    std::string out;
+                    for (const auto& iv : g.cds) {
+                        if (iv.first < region_start) continue;
+                        const std::size_t off = iv.first - region_start;
+                        if (off >= ref_full_seq.size()) continue;
+                        const std::size_t len = std::min(iv.second - iv.first + 1, ref_full_seq.size() - off);
+                        out += ref_full_seq.substr(off, len);
                     }
-                    for (const std::vector<int>& g : members)
-                        if (g.size() == 1) { target_needs_realign[ti] = 1; need_realign = true; break; }
-                    target_members[ti] = std::move(members);
-                }
-                // Spell every haplotype once (parallel) -- only if some target actually needs realignment.
-                if (need_realign) {
-                    hap_seq.assign(graph.paths.size(), std::string());
-                    run_parallel(graph.paths.size(), options.threads, [&](std::size_t pi) {
-                        hap_seq[pi] = spell_path_steps_sequence(graph, graph.paths[pi].steps);
-                    });
-                }
+                    return out;
+                };
+                for (const DupGeneTarget& t : dup_targets)
+                    if (t.gene_idx.size() >= 2)
+                        for (int gi : t.gene_idx)
+                            if (!marker_cache.count(gi)) marker_cache[gi] = marker_of(gi);
+                hap_seq.assign(graph.paths.size(), std::string());
+                run_parallel(graph.paths.size(), options.threads, [&](std::size_t pi) {
+                    hap_seq[pi] = spell_path_steps_sequence(graph, graph.paths[pi].steps);
+                });
             }
-            for (std::size_t ti = 0; ti < dup_targets.size(); ++ti) {
-                const DupGeneTarget& t = dup_targets[ti];
-                if (t.gene_idx.size() < 2) {   // single gene: the module total IS the gene's copy number
+
+            for (const DupGeneTarget& t : dup_targets) {
+                if (t.gene_idx.size() < 2) {   // single gene: the module total IS its copy number
                     emit_total(t, genes[t.gene_idx[0]].gene_name, "1");
                     continue;
                 }
-                const std::vector<std::vector<int>>& members = target_members[ti];
-                if (!target_needs_realign[ti]) {
-                    // All genes collapse -> no per-gene split is recoverable; emit the module total
-                    // (reliable=0) per collapse group. Identical to the realignment path's output, but
-                    // without the (here useless) per-haplotype minimap2 work.
-                    for (const std::vector<int>& grp_members : members)
-                        emit_total(t, group_names(t, grp_members), "0");
-                    continue;
+                std::vector<std::string> markers;
+                markers.reserve(t.gene_idx.size());
+                for (int gi : t.gene_idx) markers.push_back(marker_cache[gi]);
+                // Module copy number per haplotype (the reliable coverage total), used to split a
+                // near-identical paralog pair by its per-site allele fraction.
+                std::vector<long> total(graph.paths.size(), 0);
+                for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
+                    const auto cit = t.sample_cn.find(graph.paths[pi].name);
+                    if (cit != t.sample_cn.end()) total[pi] = static_cast<long>(cit->second);
                 }
-                std::vector<std::string> gseqs;
-                gseqs.reserve(t.gene_idx.size());
-                for (int gi : t.gene_idx) gseqs.push_back(gene_seq_cache[gi]);
-                std::vector<std::vector<std::string>> per_path(graph.paths.size());
-                run_parallel(graph.paths.size(), options.threads, [&](std::size_t pi) {
-                    const std::vector<int> cn = assign_gene_copies(
-                        gseqs, hap_seq[pi], "asm20",
-                        options.gene_copy_min_identity, options.gene_copy_min_qcov);
+                const std::vector<std::vector<GeneCnEvidence>> ev = resolve_gene_cn(markers, hap_seq, total);
+                for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
                     const std::string& sname = graph.paths[pi].name;
-                    for (const std::vector<int>& grp_members : members) {
-                        const std::string prefix = std::to_string(t.bubble_id) + '\t' + t.variant_id + '\t' + sname + '\t';
-                        if (grp_members.size() == 1) {            // reliable: per-gene realignment CN
-                            const int k = grp_members[0];
-                            per_path[pi].push_back(prefix + genes[t.gene_idx[k]].gene_name + '\t' +
-                                                   std::to_string(cn[k]) + "\t1");
-                        } else {                                  // unreliable: module total + gene list
+                    const std::string prefix =
+                        std::to_string(t.bubble_id) + '\t' + t.variant_id + '\t' + sname + '\t';
+                    for (std::size_t k = 0; k < t.gene_idx.size(); ++k) {
+                        const GeneCnEvidence& e = ev[pi][k];
+                        const std::string gname = genes[t.gene_idx[k]].gene_name;
+                        if (e.separable) {
+                            char dbuf[32];
+                            std::snprintf(dbuf, sizeof(dbuf), "%.2f", e.dosage);
+                            dup_gene_cn_rows.push_back(
+                                prefix + gname + '\t' + std::to_string(e.cn) + "\t1\t" + dbuf + '\t' +
+                                std::to_string(e.hits) + '\t' + std::to_string(e.priv_kmers));
+                        } else {   // no private k-mers -> indistinguishable from a paralog; report total
                             const auto cit = t.sample_cn.find(sname);
                             const std::string total = cit != t.sample_cn.end() ? std::to_string(cit->second) : ".";
-                            per_path[pi].push_back(prefix + group_names(t, grp_members) + '\t' + total + "\t0");
+                            dup_gene_cn_rows.push_back(prefix + gname + '\t' + total + "\t0\t.\t.\t0");
                         }
                     }
-                });
-                for (std::size_t pi = 0; pi < graph.paths.size(); ++pi)
-                    for (std::string& r : per_path[pi]) dup_gene_cn_rows.push_back(std::move(r));
+                }
             }
         }
 
@@ -1925,7 +1897,7 @@ void call_variants(
         if (!dg_out) {
             throw std::runtime_error("Failed to write per-gene DUP CN TSV: " + options.out_prefix + ".dup_gene_cn.tsv");
         }
-        dg_out << "bubble_id\tvariant_id\tsample\tgenes\tcn\treliable\n";
+        dg_out << "bubble_id\tvariant_id\tsample\tgenes\tcn\treliable\tdosage\thits\tpriv_kmers\n";
         for (const std::string& r : dup_gene_cn_rows) dg_out << r << '\n';
     }
 

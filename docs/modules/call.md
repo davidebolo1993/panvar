@@ -45,9 +45,6 @@ Call on the `panphorte` graph (the `bubble` → `panphorte` → `call` path). `p
 | `--classify-ins` | refine INS subtype NOVEL/DUP via minimap2 | off |
 | `--multiallelic-loci` | collapse a bounded locus into one multiallelic record; `--multiallelic-max-bp` (5000) bounds it | off |
 | `--gtf <path>` | gene annotation (needs PanSN `--reference-path`); see [below](#gene-annotation---gtf) | — |
-| `--gene-collapse-identity <X>` | with `--gtf`: two genes are reported as one combined total (`reliable=0`) when one aligns to the other above this block identity — raise to split more paralogs, lower to collapse more | `0.98` |
-| `--gene-copy-min-identity <X>` | with `--gtf`: min gap-compressed identity for a gene's realignment hit to count as one of its copies | `0.90` |
-| `--gene-copy-min-qcov <X>` | with `--gtf`: min fraction of a gene a hit must cover to count as a copy (guards short spurious fragments) | `0.50` |
 | `--bubble-id <N>` / `--no-per-bubble-vcf` / `--no-variant-paths` / `-q, --quiet` | scope and output toggles | — |
 
 
@@ -92,7 +89,7 @@ VCF 4.2; samples = haplotypes. `FORMAT`: `GT` (`1` carrier / `0` ref-like / `.` 
 
 ## Gene annotation (`--gtf`)
 
-A reference-coordinate GTF (Ensembl/GENCODE) projected onto the graph via a PanSN reference (`sample#hap#chrom:start-end`); else skipped with a warning. It adds: `INFO=GENES` per record; `<prefix>.node_genes.tsv` (`node_id → gene(s)`, the bridge for `associate --node-genes`); and `<prefix>.dup_gene_cn.tsv` (per-haplotype per-gene CN with a `reliable` flag — paralogs that competitive realignment can separate vs near-identical ones reported as a collapsed module total).
+A reference-coordinate GTF (Ensembl/GENCODE) projected onto the graph via a PanSN reference (`sample#hap#chrom:start-end`); else skipped with a warning. It adds: `INFO=GENES` per record; `<prefix>.node_genes.tsv` (`node_id → gene(s)`, the bridge for `associate --node-genes`); and `<prefix>.dup_gene_cn.tsv` — the per-haplotype per-gene copy number split of a folded paralog cluster, resolved **from the GTF alone by k-mer dosage** (no per-haplotype realignment). Each gene's coding sequence supplies a set of k-mers private to it vs its paralogs; a haplotype's per-copy count of those k-mers is the gene's copy number. Near-identical pairs (e.g. C4A/C4B) — where a plain count blurs under gene conversion — are split instead by per-site consensus over their divergent coding columns. Each row carries the evidence (`hits`, `priv_kmers`, `dosage`) so the call is auditable, plus a `reliable` flag (`0` only for a gene with no private k-mers, reported as the module total). See [algorithms/call.md](../algorithms/call.md#gene-annotation---gtf).
 
 ## Example
 

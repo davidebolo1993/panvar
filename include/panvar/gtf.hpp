@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "panvar/gfa.hpp"
@@ -18,6 +19,11 @@ struct GeneFeature {
     std::string chrom;       // as written in the GTF (e.g. "6")
     std::size_t start_1based = 0;
     std::size_t end_1based = 0;
+    // Merged coding-exon intervals (1-based, inclusive, reference coords), unioned across all
+    // transcripts and sorted. Empty for a gene with no CDS (e.g. a pseudogene). The per-gene
+    // copy-number resolver sketches discriminative k-mers from the CDS (paralogs differ in coding
+    // sequence), so a paralog cluster is separable from the GTF alone.
+    std::vector<std::pair<std::size_t, std::size_t>> cds;
 };
 
 // True iff `name` looks like PanSN `sample#hap#contig:start-end`: at least two '#'
@@ -58,28 +64,8 @@ void write_bandage_gene_colors_csv(const std::string& output_path,
                                    const std::unordered_map<std::string, std::vector<int>>& node_genes,
                                    const std::vector<GeneFeature>& genes);
 
-// Per-gene copy number for a haplotype by competitive realignment. Each gene's reference sequence
-// (gene_seqs, parallel to the gene set) is aligned to the haplotype; same-gene hits that are
-// target-adjacent but query-DISJOINT are chained into ONE copy (so a copy split around a missing
-// insertion still counts once), while query-OVERLAPPING hits are distinct copies. Detection uses a
-// gap-compressed identity floor (so a structurally truncated copy is not rejected for the indel);
-// each copy is assigned to the gene it aligns BEST to by BLOCK identity (so near-identical paralogs do
-// not steal each other's copies), deduplicated across genes by >50% target overlap. Returns per-gene
-// copy counts. Meaningful only for genes in a reliable (singleton) collapse group.
-std::vector<int> assign_gene_copies(const std::vector<std::string>& gene_seqs,
-                                    const std::string& hap_seq,
-                                    const std::string& preset = "asm20",
-                                    double min_identity = 0.90,
-                                    double min_qcov = 0.50);
-
-// Cluster genes into collapse groups: two genes are in the same group when one's reference aligns to
-// the other at > max_identity (block) over most of its length (near-identical paralogs the realignment
-// cannot tell apart — C4A/C4B ~99.9%, GSTM1/GSTM2 ~100%). Returns a group id per gene. A gene alone in
-// its group is RELIABLE (its per-gene copy number is trustworthy); a group of >1 is UNRELIABLE and
-// should be reported as a combined total over the collapsing genes, not split.
-std::vector<int> gene_collapse_groups(const std::vector<std::string>& gene_seqs,
-                                      const std::string& preset = "asm20",
-                                      double max_identity = 0.98);
+// Per-gene copy number of a folded paralog cluster is resolved by private-k-mer dosage / per-site consensus
+// in gene_cn_kmer.hpp (no per-haplotype realignment); the old span-realignment resolver was removed.
 
 // One-shot annotation for bubble/panphorte: resolve the reference path in `graph` by
 // `ref_query`, gate on PanSN (warn+return false otherwise), parse genes over the reference

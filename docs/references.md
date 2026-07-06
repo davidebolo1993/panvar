@@ -25,7 +25,7 @@ GitHub: [GenoGra/Panphorte](https://github.com/GenoGra/Panphorte) — the origin
 
 ## `call`
 
-GitHub: [lh3/minimap2](https://github.com/lh3/minimap2) — used for INS subtype realignment and the per-gene competitive realignment.
+GitHub: [lh3/minimap2](https://github.com/lh3/minimap2) — used for INS subtype realignment and, in the per-gene copy-number resolver, the one-time reference alignment of a near-identical paralog pair's coding sequences (to locate their divergent columns for the per-site split). Per-haplotype copy number is read by k-mer dosage, without alignment.
 
 - Li H. **Minimap2: pairwise alignment for nucleotide sequences.** *Bioinformatics* 34(18):3094–3100, 2018. <https://doi.org/10.1093/bioinformatics/bty191>.
 
