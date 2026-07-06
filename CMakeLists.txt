@@ -34,6 +34,18 @@ set_target_properties(minimap2 PROPERTIES
 )
 add_dependencies(minimap2 minimap2_build)
 
+# edlib (submodule, MIT) -- bit-parallel (Myers) banded edit distance behind fit_align.
+# Built as its own target so the vendored source is exempt from our strict warning flags.
+set(EDLIB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external/edlib/edlib)
+if(NOT EXISTS ${EDLIB_DIR}/src/edlib.cpp OR NOT EXISTS ${EDLIB_DIR}/include/edlib.h)
+    message(FATAL_ERROR
+        "Missing edlib sources in external/edlib. "
+        "Run: git submodule update --init --recursive")
+endif()
+add_library(edlib STATIC ${EDLIB_DIR}/src/edlib.cpp)
+target_include_directories(edlib PUBLIC $<BUILD_INTERFACE:${EDLIB_DIR}/include>)
+set_target_properties(edlib PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # Eigen (header-only) for the `associate` LMM eigendecomposition / linear algebra.
 set(EIGEN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external/eigen)
 if(NOT EXISTS ${EIGEN_DIR}/Eigen/Dense)
@@ -78,6 +90,11 @@ target_compile_options(panvarlib
         -Wpedantic
 )
 
+# PRIVATE: edlib is an implementation detail of align.cpp, not part of panvarlib's
+# public interface. For a static lib CMake still propagates the symbols to the final
+# executable link, while keeping edlib out of the installed export set.
+target_link_libraries(panvarlib PRIVATE edlib)
+
 add_executable(panvar
     src/main.cpp
     src/cli_utils.cpp
@@ -109,7 +126,7 @@ target_compile_options(panvar
 
 include(GNUInstallDirs)
 
-install(TARGETS panvar panvarlib
+install(TARGETS panvar panvarlib edlib
     EXPORT panvarTargets
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}

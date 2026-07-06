@@ -4,3 +4,6 @@
 [submodule "external/eigen"]
 	path = external/eigen
 	url = https://gitlab.com/libeigen/eigen.git
+[submodule "external/edlib"]
+	path = external/edlib
+	url = https://github.com/Martinsos/edlib.git

@@ -14,7 +14,7 @@ cmake --build build -j
 
 #### Requirements
 
-A C++17 compiler, CMake ≥ 3.16, `make`, and zlib. Two libraries ship as git submodules (hence the `git submodule update --init --recursive` step — nothing extra to install): `minimap2`, statically linked for INS-subtype realignment, and `Eigen`, the header-only linear-algebra library used by the `associate` LMM. A fast smoke test runs with `ctest --test-dir build --output-on-failure`.
+A C++17 compiler, CMake ≥ 3.16, `make`, and zlib. Three libraries ship as git submodules (hence the `git submodule update --init --recursive` step — nothing extra to install): `minimap2`, statically linked for INS-subtype realignment; `Eigen`, the header-only linear-algebra library used by the `associate` LMM; and `edlib`, the bit-parallel edit-distance library behind the banded fit alignment. A fast smoke test runs with `ctest --test-dir build --output-on-failure`.
 
 ## Docker
 
