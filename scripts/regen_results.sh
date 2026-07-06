@@ -146,6 +146,14 @@ for region in "${REGIONS[@]}"; do
       # validated against the GSTM1 count after the paralog baseline. Called on the panphorte graph.
       run_region gstm1 "$DATA/gstm1.gfa.gz" "--min-similarity 0.70" panphorte "--cn"
       validate_cn gstm1 --mode direct --truth "$DATA/gstm1.bed"
+      # Per-gene GSTM1 from the private-k-mer split (--gtf), vs the present/null truth (absolute, offset 0).
+      # This checks the GSTM1-vs-GSTM2 discrimination directly, not the module total minus a fitted offset.
+      if [[ -s "$OUT/gstm1/call/call.dup_gene_cn.tsv" ]]; then
+        echo "---- gstm1 GSTM1 per-gene split vs ground truth ----"
+        "$PY" "$HERE/compare_copy_number.py" --mode per-gene --truth "$DATA/gstm1.bed" --genes GSTM1 \
+          --dup-gene-cn "$OUT/gstm1/call/call.dup_gene_cn.tsv" --label GSTM1 --offset 0 \
+          --dump-tsv "$CN_TABLE" || echo "  (per-gene GSTM1 compare skipped)"
+      fi
       ;;
     cyp2d6)
       # PGGB-collapsed paralog cluster (CYP2D6/2D7/2D8P). Folded-node coverage = total module copies;

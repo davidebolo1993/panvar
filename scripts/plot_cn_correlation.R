@@ -74,7 +74,7 @@ make_plot <- function(sub, ncol) {
 }
 
 # Split by label case: per-gene split rows are the upper-case gene names; everything else is a locus total.
-paralogs <- c("C4A", "C4B", "CYP2D6", "CYP2D7")
+paralogs <- c("C4A", "C4B", "CYP2D6", "CYP2D7", "GSTM1")
 loci <- d[!(d$gene %in% paralogs), ]
 genes <- d[d$gene %in% paralogs, ]
 

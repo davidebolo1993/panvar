@@ -39,7 +39,19 @@ def load_truth(args):
     if args.mode in ("gene-count", "per-gene"):
         genes = set(g.strip() for g in args.genes.split(",") if g.strip())
         with open(args.truth) as fh:
-            fh.readline()  # header: molecule  gene  start  end  strand
+            first = fh.readline().rstrip("\n").split("\t")
+        # A headerless 2-column (molecule<TAB>count) truth already gives the per-gene CN directly
+        # -- e.g. GSTM1, whose only ground truth is the present/null polymorphism. Load it like `direct`.
+        if len(first) == 2 and first[1].lstrip("-").isdigit():
+            with open(args.truth) as fh:
+                for line in fh:
+                    f = line.rstrip("\n").split("\t")
+                    if len(f) >= 2 and f[1].lstrip("-").isdigit():
+                        exp[f[0]] = int(f[1])
+            return exp
+        # Otherwise a pangene BED (molecule  gene  start  end  strand): per-gene CN = # target-gene rows.
+        with open(args.truth) as fh:
+            fh.readline()  # header
             for line in fh:
                 f = line.rstrip("\n").split("\t")
                 if len(f) < 2:
