@@ -1,7 +1,8 @@
 #pragma once
 
-// Lightweight banded alignment used by panphorte to detect near-identical tandem
-// repeat copies (no external aligner). Unit-cost edit distance.
+// Banded fitting alignment (unit-cost edit distance), backed by edlib's bit-parallel
+// (Myers) kernel. Used by panphorte's approximate tandem-copy collapse and by call's
+// cross-haplotype event-merge sequence identity. See src/align.cpp for the edlib adapter.
 
 #include <cstddef>
 #include <string>

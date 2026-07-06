@@ -27,7 +27,10 @@ GitHub: [GenoGra/Panphorte](https://github.com/GenoGra/Panphorte) — the origin
 
 GitHub: [lh3/minimap2](https://github.com/lh3/minimap2) — used for INS subtype realignment and, in the per-gene copy-number resolver, the one-time reference alignment of a near-identical paralog pair's coding sequences (to locate their divergent columns for the per-site split). Per-haplotype copy number is read by k-mer dosage, without alignment.
 
+GitHub: [Martinsos/edlib](https://github.com/Martinsos/edlib) — bit-parallel (Myers) banded edit distance behind the in-process fit alignment used for the cross-haplotype event-merge sequence identity (`--merge-seq-identity`) and `panphorte`'s approximate tandem-copy collapse. Thresholded (`k = band`), so dissimilar pairs bail out early.
+
 - Li H. **Minimap2: pairwise alignment for nucleotide sequences.** *Bioinformatics* 34(18):3094–3100, 2018. <https://doi.org/10.1093/bioinformatics/bty191>.
+- Šošić M, Šikić M. **Edlib: a C/C++ library for fast, exact sequence alignment using edit distance.** *Bioinformatics* 33(9):1394–1395, 2017. <https://doi.org/10.1093/bioinformatics/btw753>.
 
 ## `describe`
 

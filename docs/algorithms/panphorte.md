@@ -21,7 +21,7 @@ Exact (`--min-similarity 1.0`, default) is sequence-preserving — every path sp
 
 #### Approximate collapse
 
-Exact mode misses divergent repeats (copies differing by SNVs/indels). Approximate mode does single-block, lossy collapse via a built-in banded aligner:
+Exact mode misses divergent repeats (copies differing by SNVs/indels). Approximate mode does single-block, lossy collapse via an in-process banded aligner ([edlib](../references.md#call), bit-parallel edit distance — no external aligner process):
 
 1. Seed one representative unit per bubble from the exact detector (must come from a clean adjacent identical pair somewhere in the cohort, so the true period is recovered; most-supported unit wins).
 2. Find copies per path by aligning the unit (and its reverse complement) into the path's spelled sequence: k-mer anchors propose starts, a banded global alignment decides each copy, its extent, and orientation. Band width `(1 − f)·|unit|` (uncapped), so a copy with a large internal indel still aligns when `f` is low. Copies need not be adjacent; sequence between them is kept as literal nodes.
@@ -61,6 +61,6 @@ panvar re-implements the [GenoGra/Panphorte](https://github.com/GenoGra/Panphort
 | | original panphorte | this re-implementation |
 |---|---|---|
 | repeat detection | full base sequence (`O(bp²)`) | node-walk, compared by spelled sequence (`O(node²)`, ~1000× less on big bubbles) |
-| aligner | external | built-in banded aligner (approximate mode) |
+| aligner | external | in-process banded aligner (edlib, approximate mode) |
 | threading | — | per-haplotype parallel seed scan + copy detection (`--threads`) |
 | modes | single collapse | explicit exact (sequence-preserving) vs approximate (lossy) via `--min-similarity` |
