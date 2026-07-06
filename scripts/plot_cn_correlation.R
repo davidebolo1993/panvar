@@ -2,7 +2,7 @@
 # Copy-number concordance (called vs ground-truth BED), one facet per gene, from
 # compare_copy_number.py --dump-tsv (cols: gene sample truth_cn called_cn baseline_offset is_reference).
 #   Rscript plot_cn_correlation.R --table cn_table.tsv --out results/cn_correlation
-# Writes <out>.loci.png (lower-case locus totals, 2x2) and <out>.genes.png (upper-case CYP2D6/CYP2D7 split).
+# Writes <out>.loci.png (lower-case locus totals, 2x2) and <out>.genes.png (upper-case per-gene splits: C4A/C4B, CYP2D6/CYP2D7).
 suppressWarnings(suppressMessages({
   library(ggplot2)
 }))
@@ -73,8 +73,8 @@ make_plot <- function(sub, ncol) {
     theme(legend.position = "top", panel.grid.minor = element_blank(), aspect.ratio = 1)
 }
 
-# Split by label case: per-paralog split rows are the two upper-case genes; everything else is a locus total.
-paralogs <- c("CYP2D6", "CYP2D7")
+# Split by label case: per-gene split rows are the upper-case gene names; everything else is a locus total.
+paralogs <- c("C4A", "C4B", "CYP2D6", "CYP2D7")
 loci <- d[!(d$gene %in% paralogs), ]
 genes <- d[d$gene %in% paralogs, ]
 
@@ -87,10 +87,10 @@ if (nrow(loci) > 0) {
   cat("(no locus-total rows; skipping .loci.png)\n")
 }
 
-# Plot 2: resolved CYP2D6 / CYP2D7 per-paralog split, one column of two stacked panels.
+# Plot 2: the resolved per-gene splits (C4A/C4B, CYP2D6/CYP2D7) in a 2x2 grid.
 if (nrow(genes) > 0) {
-  p_genes <- make_plot(genes, ncol = 1)
-  ggsave(paste0(out_prefix, ".genes.png"), p_genes, width = wnum(w_arg, 4.6), height = wnum(h_arg, 8), dpi = dpi)
+  p_genes <- make_plot(genes, ncol = 2)
+  ggsave(paste0(out_prefix, ".genes.png"), p_genes, width = wnum(w_arg, 8), height = wnum(h_arg, 7), dpi = dpi)
   cat("Wrote:", paste0(out_prefix, ".genes.png"), "\n")
 } else {
   cat("(no CYP2D6/CYP2D7 per-gene rows; skipping .genes.png)\n")
