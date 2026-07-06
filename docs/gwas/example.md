@@ -66,7 +66,7 @@ The rest of this page walks the same steps one command block at a time.
 ```bash
 panvar call -i results/real_data/lpa/panphorte/panphorte.normalized.sorted.gfa \
   --bubble-prefix-in results/real_data/lpa/panphorte/panphorte --reference-path grch38#1 \
-  -o results/real_data/lpa/call/call --cn-from-multiplicity \
+  -o results/real_data/lpa/call/call --cn \
   --gtf tests/real_data/Homo_sapiens.GRCh38.116.gtf.gz
 ```
 

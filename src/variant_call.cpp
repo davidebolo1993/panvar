@@ -870,31 +870,51 @@ void call_variants(
             if (node_len(graph, cn) >= options.min_sv_bp) { has_rep_selfloop = true; break; }
         bool coverage_fired = false;
         double cn_unit_bp = 0.0;   // one-copy bp of the coverage module (set when coverage fires)
-        if (options.cn_from_coverage && !has_rep_selfloop) {
+        if (options.cn && !has_rep_selfloop) {
             const std::unordered_set<std::string> inside_set(bubble.inside.begin(), bubble.inside.end());
-            auto full_walk_bp = [&](std::size_t pi, std::size_t* peak_out) -> std::size_t {
+            // Widest oriented source..sink span of a path over this bubble (all repeats included):
+            // forward = first source .. last sink; reversed crossing = first sink .. last source.
+            auto span_of = [&](std::size_t pi) -> std::pair<std::size_t, std::size_t> {
                 const auto& idx = path_indexes[pi].positions;
                 const auto sit = idx.find(bubble.source);
                 const auto kit = idx.find(bubble.sink);
-                if (sit == idx.end() || kit == idx.end()) return 0;
-                // Widest oriented span: forward = first source .. last sink; if the path crosses the
-                // bubble reversed (no source before any sink) = first sink .. last source.
+                if (sit == idx.end() || kit == idx.end()) return {1, 0};  // empty (lo>hi)
                 const std::size_t s0 = sit->second.front(), s1 = sit->second.back();
                 const std::size_t k0 = kit->second.front(), k1 = kit->second.back();
                 const std::size_t lo = (s0 <= k1) ? s0 : k0;
                 const std::size_t hi = (s0 <= k1) ? k1 : s1;
+                return {lo, hi};
+            };
+            // The FOLDED set = inside nodes the REFERENCE visits >=2x, i.e. the actual repeated unit.
+            // Copy number is measured over these nodes ONLY, so a haplotype's deletion/insertion of
+            // UNIQUE (single-visit) content -- interstitial sequence, or paralog-specific nodes that do
+            // not recur -- is not misread as a copy loss/gain (it stays a DEL/INS). This is
+            // ratio-preserving on genuine folded modules (every folded node recurs with the module) yet
+            // immune to unique-content edits inside the bubble.
+            std::unordered_set<std::string> folded_set;
+            std::size_t ref_fold = 0;
+            std::size_t ref_bp = 0;
+            if (ref_idx < graph.paths.size()) {
+                const auto ref_span = span_of(ref_idx);
+                const std::vector<PathStep>& steps = graph.paths[ref_idx].steps;
+                std::unordered_map<std::string, std::size_t> cnt;
+                for (std::size_t i = ref_span.first; i <= ref_span.second && i < steps.size(); ++i)
+                    if (inside_set.count(steps[i].node_id)) ++cnt[steps[i].node_id];
+                for (const auto& kv : cnt) {
+                    if (kv.second >= 2) folded_set.insert(kv.first);
+                    ref_fold = std::max(ref_fold, kv.second);
+                }
+                for (std::size_t i = ref_span.first; i <= ref_span.second && i < steps.size(); ++i)
+                    if (folded_set.count(steps[i].node_id)) ref_bp += node_len(graph, steps[i].node_id);
+            }
+            auto full_walk_bp = [&](std::size_t pi) -> std::size_t {
+                const auto sp = span_of(pi);
                 const std::vector<PathStep>& steps = graph.paths[pi].steps;
                 std::size_t bp = 0;
-                std::unordered_map<std::string, std::size_t> cnt;
-                for (std::size_t i = lo; i <= hi && i < steps.size(); ++i) {
-                    const std::string& id = steps[i].node_id;
-                    if (inside_set.count(id)) { bp += node_len(graph, id); if (peak_out) ++cnt[id]; }
-                }
-                if (peak_out) { std::size_t pk = 0; for (const auto& kv : cnt) pk = std::max(pk, kv.second); *peak_out = pk; }
+                for (std::size_t i = sp.first; i <= sp.second && i < steps.size(); ++i)
+                    if (folded_set.count(steps[i].node_id)) bp += node_len(graph, steps[i].node_id);
                 return bp;
             };
-            std::size_t ref_fold = 0;
-            const std::size_t ref_bp = (ref_idx < graph.paths.size()) ? full_walk_bp(ref_idx, &ref_fold) : 0;
             // Require the one-copy unit to reach min_sv_bp: a sub-threshold fold (e.g. an 8 bp repeat the
             // reference happens to traverse twice) is not an SV-scale copy-number module and would only add
             // tiny noise DUPs, so coverage does not fire there.
@@ -913,7 +933,7 @@ void call_variants(
                 mr.seed.cn_peak = true;
                 for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
                     if (!traverses.count(graph.paths[pi].name)) continue;
-                    const std::size_t hbp = full_walk_bp(pi, nullptr);
+                    const std::size_t hbp = full_walk_bp(pi);
                     if (hbp == 0) continue;
                     const std::size_t copies =
                         static_cast<std::size_t>(std::llround(static_cast<double>(hbp) / unit));
@@ -992,7 +1012,7 @@ void call_variants(
         // Gated on the absence of a REP self-loop >= min_sv_bp (not on cn_nodes being empty): an incidental
         // tiny self-loop (C4's 22 bp node) must NOT block the per-node/peak estimate. The self-loop DUP route
         // above already guards each loop on size, so the two routes stay disjoint by topology.
-        if (options.cn_from_multiplicity && !has_rep_selfloop && !coverage_fired) {
+        if (options.cn && !has_rep_selfloop && !coverage_fired) {
             std::size_t ref_peak = 0;
             for (const std::string& id : bubble.inside) {
                 const auto it = ref_count.find(id);
@@ -1203,10 +1223,10 @@ void call_variants(
         // walk-diff as an INS of the duplicated content. (The extra copy may traverse
         // paralogous node ids that are not on this reference path, so it is not recognizable
         // as "reused reference nodes" — instead it is keyed by being carried by exactly the
-        // DUP's carriers and spanning a comparable number of bp.) When --cn-from-multiplicity
-        // emitted the DUP, drop that INS so the event is reported once, as the DUP. Common
-        // insertions (carriers exceed the DUP's) and small co-incident insertions are kept.
-        if (options.cn_from_multiplicity) {
+        // DUP's carriers and spanning a comparable number of bp.) When a CN route emitted the DUP,
+        // drop the matching (duplicated-content) INS so the extra copy is reported once, as the DUP.
+        // Genuine novel insertions (carriers exceed the DUP's, or a very different size) are kept.
+        if (options.cn) {
             std::vector<std::pair<std::unordered_set<std::string>, std::size_t>> peak_dups;
             for (const MergedRecord& mr : merged) {
                 if (mr.seed.type == EvType::Dup && mr.seed.cn_peak) {
@@ -1832,7 +1852,8 @@ void call_variants(
                     std::vector<std::string> gseqs;
                     gseqs.reserve(t.gene_idx.size());
                     for (int gi : t.gene_idx) gseqs.push_back(gene_seq_cache[gi]);
-                    const std::vector<int> grp = gene_collapse_groups(gseqs);
+                    const std::vector<int> grp =
+                        gene_collapse_groups(gseqs, "asm20", options.gene_collapse_identity);
                     std::vector<std::vector<int>> members;       // local gene indices per group root
                     std::unordered_map<int, std::size_t> root_to_slot;
                     for (std::size_t k = 0; k < t.gene_idx.size(); ++k) {

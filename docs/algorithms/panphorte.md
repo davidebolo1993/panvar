@@ -1,52 +1,34 @@
-# panphorte — algorithm & worked example
+# Module `panphorte` - algorithm
 
-Mechanism and a hand-traced example for **Module 2**. For usage/flags see
-[modules/panphorte.md](../modules/panphorte.md); citations: [references.md](../references.md#panphorte).
+Mechanism and a hand-traced example for the `panphorte` module. For usage/flags see [modules/panphorte.md](../modules/panphorte.md); References in [references.md](../references.md#panphorte).
+
+## Terms
+
+- **unit (period)** — the tandem repeat (TR) segment an array is built from; its length is `unit_bp`.
+- **interruption** — non-unit steps interspersed in an array, tolerated up to `--max-interruption-frac` and kept as nested literal steps.
+- **REP node** — the single self-looping node an array collapses to; a haplotype's copy number (CN) is the number of self-loop traversals.
 
 ## How it works
 
-Detection runs on the **node-walk**, tokenizing each step by the sequence it spells (orientation-aware), so
-identical copies match even when they are distinct node ids. For each bubble, for each crossing path:
+Detection runs on the node-walk, tokenizing each step by the sequence it spells (orientation-aware), so identical copies match even when they are distinct node ids. For each bubble, for each crossing path:
 
-1. tokenize the source→sink walk by spelled-sequence hash;
-2. find non-overlapping tandem arrays: establish the **unit period** from a clean adjacent identical pair,
-   then extend bidirectionally collecting further copies, tolerating short interruptions (kept as nested
-   literal steps). Accept a run when `unit_bp ≥ --min-unit-bp`, `copies ≥ --min-copies`, and interruptions
-   stay within `--max-interruption-frac`;
-2b. **cohort-prevalence gate** — only fold the bubble if a `≥ --min-copies` array is carried by
-   `≥ --min-array-prevalence` of the bubble-traversing haplotypes. This is what separates a genuine
-   population VNTR (folded; e.g. LPA KIV-2, carried by ~all haplotypes) from a **rare private duplication
-   of a gene/segmental module** (left untouched). A single haplotype with a `CYP2D6×2` tandem, or the
-   C4/RCCX module present in a minority, no longer collapses the whole bubble — those are gene-level
-   events the `call` module resolves per-gene/total downstream, and folding them here would fuse paralogs
-   (e.g. CYP2D6 with CYP2D7/2D8P). Default `0.5` (a real VNTR is carried by a majority);
-3. collapse each array to one **REP node** (deduplicated by canonical unit sequence) with a self-loop;
-   reroute the path through it `copies` times; drop now-unused duplicate nodes.
+1. tokenize the `source→sink` walk by spelled-sequence hash;
+2. find non-overlapping tandem arrays: establish the unit period from a clean adjacent identical pair, then extend bidirectionally collecting further copies, tolerating short interruptions (kept as nested literal steps). Accept a run when `unit_bp ≥ --min-unit-bp`, `copies ≥ --min-copies`, and interruptions stay within `--max-interruption-frac`;
+3. apply a cohort-prevalence gate: fold the bubble only if a `≥ --min-copies` array is carried by `≥ --min-array-prevalence` of the bubble-traversing haplotypes. This separates a genuine population TR (carried by a large fraction of the cohort, folded) from a rare private duplication (carried by only a few haplotypes, left untouched). Default `0.5` (a real TR is carried by a majority);
+4. collapse each array to one `REP` node (deduplicated by canonical unit sequence) with a self-loop; reroute the path through it `copies` times; drop now-unused duplicate nodes.
 
-**Exact (`--min-similarity 1.0`, default)** is sequence-preserving — every path spells exactly the same
-sequence through the normalized graph (enforced internally). **Approximate (`< 1.0`)** is intentionally
-lossy (below).
+Exact (`--min-similarity 1.0`, default) is sequence-preserving — every path spells exactly the same sequence through the normalized graph (enforced internally). Approximate (`< 1.0`) is intentionally lossy.
 
-## Approximate collapse (`--min-similarity < 1.0`)
+#### Approximate collapse
 
-Exact mode misses divergent repeats (copies differing by SNVs/indels). Approximate mode does single-block,
-lossy collapse via a built-in banded aligner:
+Exact mode misses divergent repeats (copies differing by SNVs/indels). Approximate mode does single-block, lossy collapse via a built-in banded aligner:
 
-1. **Seed** one representative unit per bubble from the exact detector (must come from a clean adjacent
-   identical pair somewhere in the cohort, so the true period is recovered; most-supported unit wins).
-2. **Find copies** per path by aligning the unit (and its reverse complement) into the path's spelled
-   sequence: k-mer anchors propose starts, a banded global alignment decides each copy, its extent, and
-   orientation. Band width `(1 − f)·|unit|` (uncapped), so a copy with a large internal indel still aligns
-   when `f` is low. Copies need not be adjacent; sequence between them is kept as literal nodes.
-3. **Collapse** copies to one REP node traversed once per copy (self-loop when adjacent, edges through
-   flanking literals otherwise). Lossy: within-copy SNVs/indels are discarded. Per-copy orientation is
-   preserved (`REP +,−,+`). Single copies of the seeded unit fold too (`copies = 1`).
-4. **Limitation:** the unit must occur as ≥ 2 adjacent identical copies in ≥ 1 haplotype to be seeded. A
-   duplication with no adjacent identical pair anywhere (e.g. paralogs separated by other sequence) is left
-   intact — recovered downstream by `call` from node-traversal multiplicity. See
-   [modules/call.md](../modules/call.md).
+1. Seed one representative unit per bubble from the exact detector (must come from a clean adjacent identical pair somewhere in the cohort, so the true period is recovered; most-supported unit wins).
+2. Find copies per path by aligning the unit (and its reverse complement) into the path's spelled sequence: k-mer anchors propose starts, a banded global alignment decides each copy, its extent, and orientation. Band width `(1 − f)·|unit|` (uncapped), so a copy with a large internal indel still aligns when `f` is low. Copies need not be adjacent; sequence between them is kept as literal nodes.
+3. Collapse copies to one `REP` node traversed once per copy (self-loop when adjacent, edges through flanking literals otherwise). Lossy: within-copy SNVs/indels are discarded. Per-copy orientation is preserved (`REP +,−,+`). Single copies of the seeded unit fold too.
+4. Limitation: the unit must occur as ≥ 2 adjacent identical copies in ≥ 1 haplotype to be seeded. A duplication with no adjacent identical pair anywhere (*e.g.* paralogs separated by other sequence) is left intact — recovered downstream by `call` from node-traversal multiplicity. See [modules/call.md](../modules/call.md).
 
-## Worked trace — tandem-repeat collapse
+## Worked trace
 
 `U` = a 60 bp unit, `x` = an 8 bp interruption, `L`/`R` = flanks. Input path interior:
 
@@ -56,28 +38,21 @@ token:  L    U    U    x    U    U    R
 bp   :  ..   60   60   8    60   60   ..
 ```
 
-1. **Unit period.** Anchor `i=1` (`U`); smallest period `p` with an adjacent identical block is `p=1`
-   (`block_equal(1,2,1)`: U==U). So `unit_bp = 60`.
-2. **Extend, tolerating interruptions.** `copy_starts = {1}` walking right by `p`:
-   ```text
-   1→2 : U==U ✓                                   {1,2}
-   2→3 : token[3]=x ≠ U ✗ → gap g=1: candidate 4, gap_bp=8 ≤ 60 ✓ and U==U ✓   {1,2,4}  (x = interruption)
-   4→5 : U==U ✓                                   {1,2,4,5}
-   5→6 : R ≠ U → stop
-   ```
-   A gap is bridged only while ≤ `kMaxGapSteps` steps **and** cumulative `gap_bp ≤ unit_bp`.
-3. **Accept test.** `copies=4 ≥ 2` ✓; `unit_bp=60 ≥ 50` ✓; interruption `8 ≤ 0.25·(4·60+8)=62` ✓ → collapse.
-4. **Collapse.** One REP node carries `U` with a self-loop; the path becomes `L REP REP x REP REP R` (REP
-   traversed 4× total), `x` kept as a literal step. Report row: `unit_bp=60 copies=4 interruption_bp=8`.
-   Downstream `call` reads CN straight off the REP self-loop multiplicity (the always-on self-loop path, no
-   flag; `--cn-from-multiplicity` is for folded bubbles that have *no* self-loop).
+1. Establish the unit period from a clean adjacent identical pair. Anchoring at step 1 (`U`), the smallest period with an adjacent identical block is 1 — step 1 equals step 2, both `U` — so the repeat unit is `U` and `unit_bp = 60`.
+2. Extend the array by that period, tolerating short interruptions. Rightward: step 2 is another `U`; step 3 is `x`, a one-step / 8 bp gap that is bridged because it stays within the interruption limits (`gap_bp = 8 ≤ unit_bp`); step 4 is `U` again, step 5 is `U`, and step 6 (`R`) ends the array. The copies are steps 1, 2, 4, 5 — the interruption is kept but not counted as a copy.
+3. Accept the array against the thresholds: 4 copies ≥ `--min-copies` (2), `unit_bp` 60 ≥ `--min-unit-bp` (50), and the 8 bp interruption ≤ `--max-interruption-frac` of the array span (`0.25 · 248 = 62`). All pass, so this array is eligible to fold (subject to the cohort-prevalence gate above).
+4. Collapse the copies onto one `REP` node with a self-loop and reroute the path through it once per copy, keeping the interruption as a literal step: the interior becomes `L REP REP x REP REP R` (REP traversed 4× total). Downstream `call --cn` reads the copy number straight off the `REP` self-loop count.
 
-**Exact vs approximate.** The trace above is exact (`block_equal` requires byte-identical copies). Real
-repeats (KIV-2) differ by SNVs, so the exact pair test fails and nothing seeds. At `--min-similarity 0.90`
-copies are found by alignment (`identity 0.98, 0.95, 0.93, 0.97 → 4 copies → one REP=U`); because alignment
-bridges a copy, a large internal indel between divergent copies is also bridged when `f` is low enough
-(this lets a C4 short module fold onto the long one at `--min-similarity 0.70`). The collapse is lossy: the
-per-copy small events are discarded in favour of the single representative.
+Resulting `panphorte.report.tsv` row:
+
+```text
+bubble_id  normalized  unit_bp  paths_normalized  min_copies  max_copies  interruptions_bp
+1          yes         60       1                 4           4           8
+```
+
+#### Exact vs approximate
+
+The trace above is exact — copies must be byte-identical to seed. Real repeat arrays differ between copies, so the exact test fails and nothing seeds; at `--min-similarity 0.90` the copies are instead found by alignment (e.g. identities 0.98, 0.95, 0.93, 0.97 give 4 copies and one `REP = U`), which can also bridge a large internal indel between divergent copies when the band is wide enough. The approximate collapse is lossy: the per-copy small differences are discarded in favour of the single representative.
 
 ## Differences from the original panphorte
 

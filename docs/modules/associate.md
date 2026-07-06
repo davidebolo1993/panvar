@@ -1,40 +1,24 @@
-# Associate Module (Module 5 — GWAS)
+# Module `associate`
 
 CLI: `panvar associate`
 
 ## What it does
 
-Tests a phenotype against the genotypes from `describe` across a pangenome region. For each unit it fits
-`phenotype ~ genotype + covariates`, reports a Wald test on the genotype term, applies a MAF filter on the
-cohort genotypes, and corrects for the number of independent tests in the region. Phenotype type is
-auto-detected: binary → logistic (`log_or`), else linear (`beta`).
+Tests a phenotype against the genotypes from `describe` across a pangenome region. For each unit it fits `phenotype ~ genotype + covariates`, reports a Wald test on the genotype term, applies a MAF filter on the cohort genotypes, and corrects for the number of independent tests in the region. Phenotype type is auto-detected (binary or quantitative).
 
-The testable unit is chosen by `--unit`. **Variant** mode tests one genotype per SV call (the
-`describe --variant-vcf` export) — the statistically honest unit, since the k-mers, nodes and edges within one
-variant are correlated rather than independent. Correlated nearby variants are then collapsed by LD-clumping,
-so an LD shadow is not counted as a separate hit. **Feature** mode keeps the fine-grained k-mer/node/edge
-tests but corrects with an effective number of independent tests (`Meff`, the distinct bubbles), because the
-raw feature count over-states how many independent tests were run. Both report Benjamini–Hochberg FDR (the
-primary control) alongside the `Meff`-Bonferroni benchmark and the genomic-inflation λ.
+The testable unit is chosen by `--unit`. Variant mode tests one genotype per SV call (the `describe --variant-vcf` export) — the statistically honest unit, since the k-mers, nodes and edges within one variant are correlated rather than independent; correlated nearby variants are then collapsed by LD-clumping, so an LD shadow is not counted as a separate hit. Feature mode keeps the fine-grained k-mer/node/edge tests but corrects with an effective number of independent tests (`Meff`, the distinct bubbles), because the raw feature count over-states how many independent tests were run. Both report Benjamini–Hochberg FDR (the primary control) alongside the `Meff`-Bonferroni benchmark and the genomic-inflation λ.
 
-Beyond the threshold, `associate` also tests **independence** by conditioning: refitting each unit with the
-top signal(s) added as covariates, so a hit that merely tags a stronger nearby variant is exposed (its
-`p_conditional` collapses). The variant unit runs a forward-stepwise selection of jointly-independent signals
-(COJO-style); the feature unit conditions on the single top feature with a within-bubble collinearity guard.
-Both add `p_conditional` and `cond_role` columns.
+Beyond the threshold, `associate` also tests independence by conditioning: refitting each unit with the top signal(s) added as covariates, so a hit that merely tags a stronger nearby variant is exposed (its `p_conditional` collapses). The variant unit runs a forward-stepwise selection of jointly-independent signals (COJO-style); the feature unit conditions on the single top feature with a within-bubble collinearity guard. Both add `p_conditional` and `cond_role` columns.
 
-For a quantitative trait it can also add the top kinship PCs as covariates (`--pca N`), or fit a linear mixed
-model (`--model lmm`) against a kinship matrix, to control population structure.
+For a quantitative trait it can also add the top kinship PCs as covariates (`--pca N`), or fit a linear mixed model (`--model lmm`) against a kinship matrix, to control population structure.
 
 Algorithm and worked trace: [algorithms/associate.md](../algorithms/associate.md).
 
 ## Required inputs
 
-- `--genotypes <bimbam.gz>` — a `describe` BIMBAM matrix: `bimbam_{kmers,graph}.bimbam.gz` (feature unit)
-  or `bimbam_variant.bimbam.gz` (variant unit), or the per-sample `*.samples.bimbam.gz` for a diploid cohort.
+- `--genotypes <bimbam.gz>` — a `describe` BIMBAM matrix: `bimbam_{kmers,graph}.bimbam.gz` (feature unit) or `bimbam_variant.bimbam.gz` (variant unit), or the per-sample `*.samples.bimbam.gz` for a diploid cohort.
 - `--samples <txt[.gz]>` — the sample (column) order (`describe`'s matching `*.samples[.samples].txt.gz`).
-- `--phenotype <tsv>` — `sample <tab> phenotype [<tab> covariate…]`, header required; cells may be `NA` (a
-  sample with NA phenotype or any NA covariate is dropped).
+- `--phenotype <tsv>` — `sample <tab> phenotype [<tab> covariate…]`, header required; cells may be `NA` (a sample with NA phenotype or any NA covariate is dropped).
 - `-o, --out-prefix <prefix>`.
 
 ## Key options
@@ -47,7 +31,7 @@ Algorithm and worked trace: [algorithms/associate.md](../algorithms/associate.md
 | `--min-ac <N>` | variant unit: flag `low_af` when the observed minority-genotype count < N (underpowered/unstable; such a variant also cannot anchor a clump) | `3` |
 | `--cojo-p <X>` | variant unit: entry p for forward-stepwise conditional (COJO) signal selection | `0.05/Meff` |
 | `--node-genes <tsv>` | `call`'s `node_genes.tsv` (from `--gtf`); adds a `gene` column | — |
-| `--min-maf <X>` | drop features whose [minor non-modal frequency](../algorithms/associate.md#worked-trace--one-quantitative-feature) < X, on the actual cohort | `0.01` |
+| `--min-maf <X>` | drop features whose [minor non-modal frequency](../algorithms/associate.md#terms) < X, on the actual cohort | `0.01` |
 | `--model <auto\|linear\|logistic\|lmm>` | `auto` = binary→logistic else linear; `lmm` = mixed model (quantitative; needs a kinship source) | `auto` |
 | `--kinship <path>` | external (genome-wide) `n×n` GRM (rows/cols in `--samples` order) for `--model lmm` / `--pca`; panvar is local and does not build a GRM itself | — |
 | `--pca <N>` | add the top-N kinship PCs as covariates to the GLM (needs `--kinship`); usually you instead pass ancestry PCs as phenotype-table columns | off |
@@ -105,18 +89,15 @@ Algorithm and worked trace: [algorithms/associate.md](../algorithms/associate.md
 ## Plotting
 
 ```bash
-Rscript scripts/plot_associate.R --assoc <prefix>.assoc.tsv --summary <prefix>.summary.tsv \
-  --out <prefix> --title "my trait"
+Rscript scripts/plot_associate.R \
+  --assoc <prefix>.assoc.tsv \
+  --summary <prefix>.summary.tsv \
+  --out <prefix>
 ```
 
-Writes `*.manhattan.{png,pdf}` — stacked panels: before correction (raw −log10 p with nominal +
-region-wide Bonferroni lines), after correction (Benjamini-Hochberg −log10 q with the q=0.05 line), and —
-when the `p_conditional`/`cond_role` columns are present — after conditioning (−log10 p_conditional, where
-shadows collapse below the line and only the conditioning signal(s) stay tall). x = node id (graph) or
-per-k-mer index ordered by node id (k-mers), with FDR/Bonferroni-significant genes flagged (ggrepel, from the
-`gene` column when `--node-genes` was passed) — and `*.qq.{png,pdf}` (with λ).
+Writes `*.manhattan.{png,pdf}` — stacked panels: before correction (raw −log10 p with nominal + region-wide Bonferroni lines), after correction (Benjamini-Hochberg −log10 q with the q=0.05 line), and — when the `p_conditional`/`cond_role` columns are present — after conditioning (−log10 p_conditional, where shadows collapse below the line and only the conditioning signal(s) stay tall). x = node id (graph) or per-k-mer index ordered by node id (k-mers), with FDR/Bonferroni-significant genes flagged (ggrepel, from the `gene` column when `--node-genes` was passed) — and `*.qq.{png,pdf}` (with λ).
 
-Script flags (needs `Rscript` + `ggplot2`; `ggrepel` optional, for the gene labels):
+Script flags (need `Rscript` + `ggplot2`; `ggrepel` optional, for the gene labels):
 
 - `--assoc <assoc.tsv>` — the association table (required).
 - `--out <prefix>` — output prefix for the PNG/PDF files (required).
@@ -124,38 +105,30 @@ Script flags (needs `Rscript` + `ggplot2`; `ggrepel` optional, for the gene labe
 - `--title <text>` — plot title.
 - `--width` / `--height` / `--dpi` — Manhattan size (inches) and PNG resolution (defaults 10 / 7 / 150).
 
-For a per-stage view, `scripts/plot_associate_pipeline.R` draws one facet per processing step —
-**TEST → FILTER MAF → CLUMP (variant tier only) → CORRECT → CONDITION** — re-colouring the markers by what
-survives each step. It takes the normal run (`--assoc`/`--summary`) plus a `--min-maf 0` run of the same data
-(`--unfiltered`) so the MAF-dropped markers are visible, and `--min-maf <X>` to colour the FILTER stage. See
-the [GWAS example](../gwas/example.md#the-association-pipeline-stage-by-stage).
+For a per-stage view, `scripts/plot_associate_pipeline.R` draws one facet per processing step — **TEST → FILTER MAF → CLUMP (variant tier only) → CORRECT → CONDITION** — re-colouring the markers by what survives each step. It takes the normal run (`--assoc`/`--summary`) plus a `--min-maf 0` run of the same data (`--unfiltered`) so the MAF-dropped markers are visible, and `--min-maf <X>` to colour the FILTER stage. See the [GWAS example](../gwas/example.md#the-association-pipeline-stage-by-stage).
 
 ## Example
 
-Uses the committed example phenotype (`tests/gwas/lpa/`, simulated) over the BIMBAM matrices that
-`describe` wrote under `results/real_data/lpa/gwas/desc/` (see the [GWAS example](../gwas/example.md) for the
-full pipeline):
+Uses the committed example phenotype (`tests/gwas/lpa/`, simulated) over the BIMBAM matrices that `describe` wrote under `results/real_data/lpa/gwas/desc/` (see the [GWAS example](../gwas/example.md) for the full pipeline):
 
 ```bash
 # region scan, feature unit (PC1..PC10 are covariate columns in the phenotype table)
 ./build/panvar associate \
   --genotypes results/real_data/lpa/gwas/desc/bimbam_graph.samples.bimbam.gz \
-  --samples   results/real_data/lpa/gwas/desc/bimbam.samples.samples.txt.gz \
+  --samples results/real_data/lpa/gwas/desc/bimbam.samples.samples.txt.gz \
   --feature-annot results/real_data/lpa/gwas/desc/feature_annot.samples.tsv.gz \
   --node-genes results/real_data/lpa/call/call.node_genes.tsv \
-  --phenotype tests/gwas/lpa/pheno.quant.tsv --min-maf 0.02 \
+  --phenotype tests/gwas/lpa/pheno.quant.tsv \
+  --min-maf 0.02 \
   -o results/real_data/lpa/gwas/assoc_graph_quant
 
 # variant unit: test the SV calls directly (describe --variant-vcf export); --unit auto-detects it
 ./build/panvar associate \
   --genotypes results/real_data/lpa/gwas/desc/bimbam_variant.samples.bimbam.gz \
-  --samples   results/real_data/lpa/gwas/desc/bimbam_variant.samples.samples.txt.gz \
+  --samples results/real_data/lpa/gwas/desc/bimbam_variant.samples.samples.txt.gz \
   --feature-annot results/real_data/lpa/gwas/desc/feature_annot.variant.tsv.gz \
-  --phenotype tests/gwas/lpa/pheno.quant.tsv -o results/real_data/lpa/gwas/assoc_variant
+  --phenotype tests/gwas/lpa/pheno.quant.tsv \
+  -o results/real_data/lpa/gwas/assoc_variant
 
-# optional: control structure with an EXTERNAL genome-wide GRM (LMM); panvar does not build one itself
-./build/panvar associate --genotypes <panel.bimbam.gz> --samples <…> --phenotype <…> \
-  --model lmm --kinship <genome_wide_grm.tsv> -o <…>_lmm
 ```
 
-A worked end-to-end run with interpretation is in the [GWAS example](../gwas/example.md).

@@ -1,8 +1,6 @@
 # panvar
 
-`panvar` is a modular C++17 toolkit for pangenome-graph analysis from GFA. It runs an end-to-end pipeline —
-snarl finding, tandem-repeat normalization, graph-native structural-variant calling, feature description, and
-association testing: `bubble → panphorte → call → describe → associate`, with the `inspect` utility available
+`panvar` is a modular C++17 toolkit for pangenome-graph SV calling and association testing. It runs an end-to-end pipeline — snarl finding, tandem-repeat normalization, graph-native structural-variant calling, feature description, and association testing: `bubble → panphorte → call → describe → associate`, with the `inspect` utility available
 at any step.
 
 ## Install
@@ -14,10 +12,9 @@ cmake --build build -j
 ./build/panvar --help
 ```
 
-Requirements: a C++17 compiler, CMake ≥ 3.16, `make`, and zlib. Two libraries ship as git submodules (hence
-the `git submodule update --init --recursive` step — nothing extra to install): `minimap2`, statically linked
-for INS-subtype realignment, and `Eigen`, the header-only linear-algebra library used by the `associate` LMM.
-A fast, dependency-free smoke test runs with `ctest --test-dir build --output-on-failure`.
+#### Requirements
+
+A C++17 compiler, CMake ≥ 3.16, `make`, and zlib. Two libraries ship as git submodules (hence the `git submodule update --init --recursive` step — nothing extra to install): `minimap2`, statically linked for INS-subtype realignment, and `Eigen`, the header-only linear-algebra library used by the `associate` LMM. A fast smoke test runs with `ctest --test-dir build --output-on-failure`.
 
 ## Docker
 
@@ -33,10 +30,10 @@ docker run --rm -v "$PWD":/work -w /work panvar:latest panvar --help
 ## Documentation
 
 - [docs/README.md](docs/README.md) — documentation index
-- **Modules (usage):** [bubble](docs/modules/bubble.md) · [panphorte](docs/modules/panphorte.md) · [call](docs/modules/call.md) · [describe](docs/modules/describe.md) · [associate](docs/modules/associate.md) · [inspect](docs/modules/inspect.md)
-- **Algorithms (mechanism + worked traces):** [docs/algorithms/](docs/algorithms/)
-- **GWAS:** [example](docs/gwas/example.md) — runnable LPA walk-through (concepts explained in context) + GEMMA validation
-- [docs/references.md](docs/references.md) — tools (GitHub) and papers per module
+- **Modules:** [bubble](docs/modules/bubble.md) · [panphorte](docs/modules/panphorte.md) · [call](docs/modules/call.md) · [describe](docs/modules/describe.md) · [associate](docs/modules/associate.md) · [inspect](docs/modules/inspect.md)
+- **Algorithms:** [docs/algorithms/](docs/algorithms/)
+- **GWAS:** [example](docs/gwas/example.md) — runnable LPA walk-through
+- [docs/references.md](docs/references.md) — tools and papers per module
 
 ## License
 

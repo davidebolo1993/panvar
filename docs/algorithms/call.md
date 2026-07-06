@@ -1,212 +1,144 @@
-# call — algorithm, copy-number mechanics & worked example
+# Module `call` - algorithm
 
-Mechanism and hand-traced examples for **Module 3**. For usage/flags see [modules/call.md](../modules/call.md);
-citations: [references.md](../references.md#call).
+Mechanism and a hand-traced example for the `call` module. For usage/flags see [modules/call.md](../modules/call.md); References in [references.md](../references.md#call).
 
 ## Terms
 
-- **anchor** — a node token unique in *both* the reference walk and a haplotype walk; a monotonic (LIS)
-  subsequence of anchors aligns the two walks, and only the segments *between* anchors are aligned (fast,
-  localised).
-- **gap block** — a maximal stretch between two anchors where reference and haplotype differ; each becomes
-  one typed event (DEL/INS/INV/substitution).
-- **full walk** — the widest source→sink span with every repeated traversal counted (a node visited twice
-  contributes its length twice); contrast the *minimal-span* walk that visits each distinct node once.
+- **anchor** — a node token unique in *both* the reference walk and a haplotype walk; a monotonic subsequence of anchors aligns the two walks, and only the segments between anchors are aligned.
+- **gap block** — a maximal stretch between two anchors where reference and haplotype differ; each becomes one typed event (DEL/INS/INV/substitution).
+- **full walk** — the widest `source→sink` span with every repeated traversal counted (a node visited twice contributes its length twice); contrast the **minimal-span** walk that visits each distinct node once.
 - **peak multiplicity** — the visit count of a haplotype's single busiest node in the bubble.
 
 ## Algorithm
 
 For each bubble:
 
-1. **Alleles.** Group identical source→sink walks into distinct alleles; call once per allele (genotypes
-   expand by membership).
-2. **Copy-number nodes.** Fold a node's consecutive self-repeats (a `REP` self-loop) into one alignment
-   token, so extra copies surface as copy number, not a spurious INS/DEL.
-3. **Diff vs reference.** Split both walks at shared anchors and align only between them; each gap block →
-   DEL (reference-only nodes), INS (haplotype-only), INV (reverse-complement node-walk of the reference
-   run), or a substitution (co-located DEL+INS sharing one `EVENTID`).
-4. **Coalesce within a haplotype.** Merge consecutive same-type events whose gap is ≤ `--merge-distance-bp`,
-   measured in **either** reference space or the haplotype's own sequence space.
-5. **Merge across haplotypes.** Transitive single-linkage (connected components), seeding from events down
-   to `--rescue-min-bp`; two events link on same type + a position window + (Jaccard ≥ `--merge-jaccard`
-   **or** sequence identity ≥ `--merge-seq-identity`, gated by `--merge-size-ratio`). Largest member
-   represents; `MERGE_*` records the evidence. Copy-number records merge separately on shared `REP` identity.
-6. **Force-call, then filter.** Re-test every non-carrier against its own diff, adding it as a carrier when
-   it matches (sub-threshold events get `GT=1` instead of `0`); one pass (representative is fixed). Keep
-   records whose representative reaches `--min-sv-bp` and carrier count reaches `--min-haplotypes`.
+1. Group identical `source→sink` walks into distinct alleles; call once per allele (genotypes expand by membership).
+2.  Fold a node's consecutive self-repeats (a `REP` self-loop) into one alignment token, so extra copies surface as copy number, not a spurious INS/DEL.
+3. Split both walks at their shared anchors and align only the segments between them. Each gap block becomes one typed event: a `DEL` where only the reference has nodes, an `INS` where only the haplotype does, an `INV` where the haplotype's run is the reverse-complement node-walk of the reference's, or a substitution — a co-located `DEL` and `INS` that share one `EVENTID`.
+4. Merge consecutive same-type events whose gap is ≤ `--merge-distance-bp`, measured in either reference space or the haplotype's own sequence space.
+5. Merge across haplotypes. Transitive single-linkage (connected components), seeding from events down to `--rescue-min-bp`; two events link on same type + a position window + (Jaccard ≥ `--merge-jaccard` or sequence identity ≥ `--merge-seq-identity`, gated by `--merge-size-ratio`). Largest member represents; `MERGE_*` records the evidence. Copy-number records merge separately on shared `REP` identity.
+6. Re-test every non-carrier against its own diff, adding it as a carrier when it matches (sub-threshold events get `GT=1` instead of `0`); one pass (representative is fixed). Keep records whose representative reaches `--min-sv-bp` and carrier count reaches `--min-haplotypes`.
 
-## Worked trace — diff, coalesce, cluster, rescue
+## Worked trace
 
-Reference walk `R = A B C D E F`. Copy-number nodes (REP self-loops) are dropped from this token walk —
-typed separately as DUP — so extra repeat copies are never mistyped as insertions.
-
-**Read events off gap blocks** (R fixed; only the haplotype changes):
+Reference interior `R = A B C D E F` — single-letter node tokens (a `REP` self-loop, if present, is dropped from this walk and typed separately as a `DUP`, so extra copies are never mistyped as an insertion). Four haplotypes cross the bubble:
 
 ```text
-haplotype          gap block (ref vs hap)      event
-A B   D E F        ref=[C]  hap=[]        →     DEL {C}
-A B P Q C D E F    ref=[]   hap=[P,Q]     →     INS {P,Q}   (anchored after B)
-A B c̅ D E F        hap=[c̅]=revcomp(C)     →     INV over {C}
-A B X D E F        ref=[C]  hap=[X]       →     DEL{C}+INS{X}, one EVENTID (substitution)
+ref  : A B C D E F
+hX   : A B   D E F          C missing
+hW   : A B   D E F          C missing (same walk as hX)
+hZ   : A     D E F          B and C missing
+hI   : A B P Q C D E F      P, Q inserted after B
 ```
 
-**Coalesce within a haplotype** (`--merge-distance-bp 100`):
+1. Diff each haplotype against the reference. Anchoring on the tokens the two walks share and aligning only the segments between anchors: `hX` and `hW` each read a `DEL{C}`, `hZ` reads a single `DEL{B,C}` (both missing nodes fall in one gap block), and `hI` reads an `INS{P,Q}` anchored after `B`. A haplotype run that reverse-complemented the reference's would instead type as an `INV`, and a co-located reference-only + haplotype-only pair as a substitution — a `DEL` and `INS` sharing one `EVENTID`.
+2. Coalesce within a haplotype. Same-type events that sit in *different* gap blocks but within `--merge-distance-bp` are joined into one, measured either in reference space or in the haplotype's own sequence space (the latter catches insertions that a large intervening deletion would otherwise push apart). None of these four trigger it.
+3. Cluster across haplotypes by transitive single-linkage. `hX:DEL{C}` and `hW:DEL{C}` have identical node sets (Jaccard 1.0), so they become one record with `AC = 2`; `hZ:DEL{B,C}` shares only `C` (Jaccard `1/2 < --merge-jaccard`), so it stays its own record. Events also link when their **sequences** match, which rescues one allele threaded through different nodes.
+4. Force-call, then filter. Every non-carrier is re-tested against its own diff and added if it matches — so a sub-threshold copy of an event gets `GT = 1` rather than `0` — and a record is kept only if its representative reaches `--min-sv-bp` and its carriers reach `--min-haplotypes`.
 
-- *reference space:* `hZ = A D E F` → `DEL{B}` (ref bp [100,160)) + `DEL{C}` ([160,210)); gap 0 ≤ 100 →
-  `DEL{B,C}`.
-- *haplotype space:* a haplotype deletes node 2 (200 bp) and inserts `INS5`, `INS6` around it. On the
-  reference they are 210 bp apart (the deletion inflates the gap → reference clause FAILS), but on the
-  haplotype walk node5 ends at pos 70 and node6 starts at 80 → gap 10 ≤ 100 → **merge → `INS{5,6}` (120 bp)**.
-  (The 200 bp `DEL{2}` stays its own event — the hap-space metric is defined only for INS.)
-
-**Cluster across haplotypes (transitive single-linkage):**
-
-- *identical deletions:* `hX:DEL{C}`, `hW:DEL{C}` → Jaccard 1.0 → one record, `AC=2`. A third `hZ:DEL{B,C}`
-  has Jaccard `|{C}|/|{B,C}|=0.5 < 0.80` → its own record.
-- *STR allele chain:* `e1(30bp)~e2(33bp)` identity 0.97, ratio 0.91 → edge; `e2~e3(36bp)` 0.96, 0.92 →
-  edge; `e1~e3` ratio 0.83 not compared. Single-linkage unites `{e1,e2,e3}` via e2 → one locus `AC=3`.
-
-**Force-call (sub-threshold rescue).** Clustering seeds only from events ≥ `--rescue-min-bp` and a record is
-kept only if its representative reaches `--min-sv-bp`. With the floor at 50: `hap_big` INS 60 bp seeds the
-record; `hap_small` INS 48 bp (same sequence) is < floor, excluded from clustering. Force-call re-reads
-`hap_small`'s own diff: identity high, length ratio 48/60 = 0.80 ≥ gate → MATCH → add carrier. Result: one
-record `SVLEN=60, SVLEN_RANGE=48,60, NMERGED=2, AC=2`. It demands the haplotype's *own* diff to register the
-event (not mere node-set containment), so a *dissimilar* 48 bp insertion at the same spot is **not** rescued
-— deliberate on folded paralog loci where inserted nodes are shared across nearly all walks.
-
-**When the merge parameters change the call:**
+Resulting records:
 
 ```text
---merge-distance-bp   two same-type DELs 90 bp apart:   =100 → one DEL ; =50 → two DELs
---merge-jaccard       DEL{2}(60bp) vs DEL{2,3}(90bp), J=0.67:  =0.80 → two ; =0.60 → one (MERGE_JACCARD=0.67)
---merge-seq-identity  two 60bp INS, different nodes, 92% identical:  =0.95 → two ; =0.80 → one (MERGE_SEQID=0.92)
---merge-size-ratio    same motif at 60 vs 108 bp:  default floor 0.80 → 0.56 too different, two ;
-                                                   =0.5 → compared → one (SVLEN_RANGE=60,108)
+SVTYPE=DEL  EVENT_NODES=C     AC=2   carriers hX, hW
+SVTYPE=DEL  EVENT_NODES=B,C   AC=1   carrier  hZ
+SVTYPE=INS  EVENT_NODES=P,Q   AC=1   carrier  hI
 ```
 
-## Copy number: one method per locus topology
+## Copy number
 
-How a locus is represented in the pangenome decides how `call` reads its copy number — and which graph it
-reads. This table is the canonical reference (the module pages link here):
+`call --cn` reads copy number straight off the walk and emits it as a `DUP` record carrying a per-sample `CN`. How it reads the number depends on how the locus is folded in the graph. 
 
-| Region | Topology | Call substrate | CN method | Concordance vs truth |
-|--------|----------|----------------|-----------|----------------------|
-| **LPA** (KIV-2) | tandem repeat | `panphorte` graph | self-loop `REP` (always on) | **465/465 = 100%** |
-| **C4** (RCCX) | PGGB-collapsed paralog | `bubble` graph | `--cn-from-coverage` (full-walk) | **131/131 = 100%** |
-| **GSTM1** | deletion/CNV (segdup) | `bubble` graph | `--cn-from-multiplicity` (peak) | **159/159 = 100%** |
-| **CYP2D6** | PGGB-collapsed paralog | `bubble` graph | `--cn-from-coverage` (full-walk) | concordant vs D6+D7; residual = unannotated CYP2D8P/hybrid |
+### Worked trace — a tandem repeat (self-loop `REP`)
 
-The principle: PGGB collapses **identical** copies onto shared nodes (copy number = node multiplicity);
-`panphorte` collapses a **variable tandem** into one REP node. So tandem loci are called on the `panphorte`
-graph, PGGB-folded paralog clusters on the unfolded `bubble` graph; the mechanics of each method are in
-[Copy number — three ways](#copy-number--three-ways) below.
+`panphorte` has folded the tandem array into one `REP` node with a self-loop, so a walk's copy number is simply how many times it loops that node (`L`/`R` are flanks):
 
-## Copy number — three ways
-
-Copy number is read straight off the walk (no re-alignment), tried per bubble in a fixed precedence so it is
-never double-counted. The choice depends on locus topology — see the
-[table above](#copy-number-one-method-per-locus-topology).
-
-**(a) Clean tandem → self-loop `REP` (always on).** `panphorte` collapsed an adjacent tandem into a `REP`
-self-loop; CN is the loop count. `REF_CN` = reference loops; a sample below it is a loss, above it a gain.
-panphorte folds single copies too, so a one-copy haplotype reads `CN=1`; only a haplotype too divergent to
-fold reads `CN=0`.
 ```text
-reference REP ×3 → REF_CN=3 ;  sample hY REP ×2 → CN=2 (one copy lost)
+reference : L REP REP REP R          loops REP ×3
+hapX      : L REP REP R              loops REP ×2
+hapY      : L REP REP REP REP R      loops REP ×4
 ```
 
-**(b) PGGB-collapsed paralogs, no `REP` repeat unit, reference folds ≥2× (`--cn-from-coverage`).**
-Near-identical paralogs (CYP2D6/2D7) fold onto shared nodes, so we can't spot a loss from any single node; we
-measure **total sequence over the full walk** and divide by one copy (calibrated from the reference):
+1. The unit is already a single `REP` self-loop node (≥ `--min-sv-bp`), so its integer loop count is the copy number, exactly. The reference loops it three times, so `REF_CN = 3`.
+2. Count each haplotype's loops: `hapX` traverses `REP` twice (`CN = 2`, one copy lost) and `hapY` four times (`CN = 4`, one gained); a haplotype at three loops is reference-like.
+3. Emit one `DUP` at the bubble with `REF_CN = 3` and a per-sample `CN` from the loop count. `GT = 1` marks only the carriers whose `CN` differs from `REF_CN`, so `AC`/`AF` stay meaningful.
+
 ```text
-one-copy bp = ref_spelled_bp / ref_fold = 10,000/2 = 5,000 ;  REF_CN = ref_fold = 2
-hapA 15,000 bp → 3 (gain) ;  hapB 5,000 → 1 (loss) ;  hapC 10,000 → 2 (ref-like)
+SVTYPE=DUP  REF_CN=3  RU_LEN=<unit bp>     hapX CN=2   hapY CN=4   (reference-like samples CN=3)
 ```
-Reports the **absolute** total-module count (2D6+2D7 together), recovers losses and gains alike. It is the
-authority for the bubble's **copy number** (it sets the `DUP`/`REF_CN`/`FORMAT:CN`, and the self-loop and
-peak `DUP` routes are skipped so CN is reported once) — but it does **not** suppress the bubble's
-sequence-resolved `DEL`/`INS`/`INV` calls. Those are still emitted alongside the coverage `DUP`, so a rare
-gene-unit insertion folded into the same module is not silently dropped.
 
-**(c) Single folded extra copy, reference does not fold (`--cn-from-multiplicity`).** Reference visits every
-node once (`ref_peak=1`); a haplotype with an extra copy folds it back, so its busiest node is visited
-twice. No division — compare the **peak**:
+This is the only reading that fires without `--cn` too: the self-loop route is always on, so a `REP` tandem is a `DUP` regardless of the flag.
+
+### Worked trace — a collapsed paralog cluster (coverage)
+
+Here `pggb` collapsed near-identical paralog copies onto shared nodes, and the reference itself traverses them ≥ 2×. No single node can show a loss, so we measure the total sequence over the folded nodes and calibrate one copy from the reference:
+
 ```text
-ref_peak=1, REF_CN=1 ;  hapD peak 2 > 1 → DUP, CN=2, SVLEN = Σ node_len × excess ;  hapE peak 1 → no DUP
+folded nodes (reference visits each ≥2×):  reference total = 10,000 bp,  ref folds 2×
+hapA : 15,000 bp over the folded nodes
+hapB :  5,000 bp
+hapC : 10,000 bp
 ```
-The peak (not per-node excess) isolates real dosage from cluster background.
 
-**Precedence.** Per bubble the routes are tried in a fixed order so copy number is reported once: a self-loop
-`REP` `DUP` (always on) wins whenever the bubble carries a genuine `REP` repeat unit — a self-loop node ≥
-`--min-sv-bp` (e.g. LPA's 5.5 kb KIV-2); its integer loop count is exact. Otherwise coverage CN (with
-`--cn-from-coverage`, when the reference folds ≥2× and one copy is ≥ `--min-sv-bp`); else peak-multiplicity
-`DUP` (with `--cn-from-multiplicity`). An incidental sub-`--min-sv-bp` self-loop (e.g. C4's 22 bp node, which
-the reference may not even traverse) is **not** a `REP` unit, so it neither blocks coverage nor anchors a
-self-loop `DUP` — it is skipped rather than emitted as a spurious `REF_CN=0` record. The self-loop route is
-always on, so a `REP` tandem is a `DUP` even with no CN flag; a *folded* extra copy (coverage/peak topologies)
-without its flag instead surfaces as an `INS` (`INS_SUBTYPE=DUP` under `--classify-ins`). The two
-folded-cluster routes report **absolute** per-haplotype CN (reference only sets the unit-bp denominator).
+1. Calibrate the one-copy unit from the reference: `one-copy bp = reference folded-node bp / ref_fold = 10,000 / 2 = 5,000`, and `REF_CN = ref_fold = 2`.
+2. Divide each haplotype's folded-node bp by that unit: `hapA` gives 3 (a gain), `hapB` gives 1 (a loss), `hapC` gives 2 (reference-like). One measure recovers both losses and gains.
+3. Emit one `DUP` with `REF_CN = 2` and per-sample `CN` — the absolute total of all the collapsed paralogs together. Measuring over the folded nodes only is what keeps an edit to unique content in the bubble (interstitial sequence, a single-visit paralog) from being misread as copy number.
 
-**Sequence-resolved events are always kept.** Whichever CN route fires, the bubble's `DEL`/`INS`/`INV` calls
-are still emitted and merged (within and across haplotypes) as usual — a CN call never hides them. In a
-coverage bubble the one exception is a **copy-number-loss `DEL`** (≥ half a copy unit): that is the same fact
-the coverage `DUP` already reports as a reduced per-sample CN, so it is dropped to avoid double-counting;
-sequence-novel insertions/inversions and small local deletions are kept.
+```text
+SVTYPE=DUP  REF_CN=2      hapA CN=3   hapB CN=1   hapC CN=2
+```
 
-**The two folded-cluster routes answer different questions — choose per locus.** Coverage reports the
-**total** copy number of the whole folded module (all collapsed paralogs together, e.g. CYP2D6 + CYP2D7, or
-the whole GSTM family); peak-multiplicity reports the **specific** variable copy folded onto a shared node
-(e.g. a single GSTM1 deletion against fixed GSTM paralogs). Use coverage for a whole-module CNV, peak for a
-single gene varying within a paralog family. They are **not** interchangeable and deliberately **not** unified
-into one flag: on a gene-specific locus coverage over-counts (it adds the fixed paralogs) and, taking
-precedence, would win — so combining both does not recover the gene-specific count. A mis-chosen flag
-**misses** the CN (no `DUP`) rather than corrupting it, and the structural variation is still visible in the
-`DEL`/`INS`/`INV` events; when unsure, run both and compare — agreement means the topology is unambiguous,
-while coverage > multiplicity flags a folded paralog family.
+### Worked trace — a single-copy-reference duplication (peak multiplicity)
+
+The reference here visits each inside node once — it does not fold — so there is no reference fold for coverage to calibrate against. This reading covers a haplotype that folds an extra copy back onto those nodes (a duplication where the reference is the single/short allele):
+
+```text
+reference : each inside node ×1            ref_peak = 1
+hapD      : busiest inside node ×2         one extra copy folded back
+hapE      : each inside node ×1            no extra copy
+```
+
+1. `REF_CN = ref_peak = 1`. There is no unit to divide by, so we compare peak multiplicities directly.
+2. Take each haplotype's busiest inside node: `hapD` peaks at 2 (`> 1`) and is interpreted as a gain; `hapE` stays at 1. Using the global peak, not a per-node excess, keeps scattered cluster background from inflating the call.
+3. Emit a `DUP` for `hapD` with `REF_CN = 1`, `CN = 2`, and `SVLEN = Σ node_len × excess` (the duplicated bp). This reading is **gains only** — a loss leaves no extra fold to count.
+
+```text
+SVTYPE=DUP  REF_CN=1      hapD CN=2   (hapE is not a carrier)
+```
+
+### Worked trace — copy number alongside sequence events
+
+A `DUP` never hides the bubble's genuinely-novel `DEL`/`INS`/`INV` calls. Take the coverage bubble above and add a haplotype `hapF` carrying a 300 bp novel insertion inside the module:
+
+1. The coverage `DUP` is emitted exactly as before (the total module `CN` per sample).
+2. `hapF`'s insertion has different carriers and a different size from the duplicated content, so it is kept as its own `INS` record next to the `DUP`.
+3. Only the copy itself is not re-emitted, to avoid counting it twice: a copy-number-loss `DEL` (≥ half a unit) is already the DUP's reduced `CN`, and the duplicated-content `INS` (the extra copy's sequence, carried by the gain samples at ~one-copy size) is already its raised `CN` — so both fold into the `DUP` instead of appearing separately.
+
+```text
+SVTYPE=DUP  REF_CN=2               (module CN per sample)
+SVTYPE=INS  SVLEN=300  hapF        (kept — a novel insertion, not the duplicated copy)
+```
+
+**Without `--cn`.** Only the always-on self-loop `REP` reading fires: a tandem is still a `DUP`, but a folded extra copy (the coverage and peak cases) instead surfaces as a dup-like `INS` (`INS_SUBTYPE=DUP` under `--classify-ins`) with no per-sample copy number, and a loss surfaces as a `DEL`. Run `call --cn` to get `CN`/`REF_CN`; the sequence-resolved `DEL`/`INS`/`INV` are present either way.
 
 ## Merge keys — Jaccard vs sequence identity
 
-Two events merge across haplotypes on the position window + *either* node-set Jaccard (`--merge-jaccard`) or
-sequence identity (`--merge-seq-identity`; tried only if Jaccard misses). They fail in orthogonal ways:
+Two events merge across haplotypes on the position window and either node-set Jaccard (`--merge-jaccard`) or sequence identity (`--merge-seq-identity`; tried only if Jaccard misses). They fail in orthogonal ways:
 
-- **same content, different nodes** → Jaccard low, sequence high (one allele threaded through different
-  graph nodes — a microsatellite tangle). The sequence gate rescues it (its main reason to exist).
-- **same nodes, poorly-aligning sequence** → Jaccard high, sequence low (shared backbone with a big
-  internal indel / low-complexity content). Jaccard rescues it (length-weighted, order/orientation-blind).
-- **different sizes** → only the sequence path is gated by `--merge-size-ratio`; Jaccard has no size gate.
+- **same content, different nodes**: Jaccard low, sequence high (one allele threaded through different graph nodes — a microsatellite tangle). The sequence gate rescues it (its main reason to exist).
+- **same nodes, poorly-aligning sequence**: Jaccard high, sequence low (shared backbone with a big internal indel / low-complexity content). Jaccard rescues it (length-weighted, order/orientation-blind).
+- **different sizes**: only the sequence path is gated by `--merge-size-ratio`; Jaccard has no size gate.
 
-So lower `--merge-jaccard` to merge events sharing a backbone; lower `--merge-seq-identity`/`--merge-size-ratio`
-to merge similar content threading different nodes.
+So lower `--merge-jaccard` to merge events sharing a backbone; lower `--merge-seq-identity`/`--merge-size-ratio` to merge similar content threading different nodes.
 
-## Multiallelic mechanics (`--multiallelic-loci`)
-
-Collapses a small, bounded bubble that varies mainly by *which sequence* a haplotype carries (e.g. a short
-STR with several length alleles) into **one** record: `REF` + `ALT1,ALT2,…` (one per distinct interior
-spelling), per-sample `GT` indexing the allele, `NALLELES` counting them. Pure DEL/INS/INV bubbles only — a
-bubble that yields a copy-number record (self-loop/coverage/multiplicity `DUP`) is left typed, so DUPs keep
-`REF_CN`/`CN`. Fires only when the locus is ≤ `--multiallelic-max-bp` (5000) and the largest allele differs
-from `REF` by ≥ `--min-sv-bp`; otherwise it falls back to per-event records so large SVs stay typed.
 
 ## Gene annotation trace (`--gtf`)
 
-The bridge is the reference path's PanSN name (`grch38#1#chr6:31891045-32123783`), giving chromosome + start.
+With `--gtf`, `call` records which genes each variant touches and, for a copy-number call spanning several genes, tries to split the module total into per-gene copy numbers. The reference path's PanSN name (`sample#hap#chrom:start-end`) supplies the chromosome and start coordinate the projection needs.
 
-1. **Project genes onto reference nodes.** Walk the reference accumulating node lengths; node *k* spans
-   `[start+prefix[k], start+prefix[k+1])`; intersect with gene intervals → `node_id → genes`. A node the
-   reference visits at two coordinates (a folded paralog) is tagged with **both** genes — which is why
-   multiplicity alone can't separate them.
-2. **Per-gene CN by competitive realignment (`call`).** Only for a DUP overlapping **≥2 genes** — where
-   graph multiplicity reports the module total but not the per-gene split. Each gene's reference sequence is
-   realigned (minimap2, all hits) to each haplotype; same-gene hits that are *target-adjacent but
-   query-disjoint* chain into one copy (a copy split around a missing HERV counts once, via a gap-compressed
-   identity floor); each copy competes across genes by block identity and the winner claims the locus. A DUP
-   over a single gene skips realignment entirely: the module total *is* that gene's copy number (so e.g. LPA,
-   one DUP over `LPA` across all haplotypes, costs no per-haplotype alignment).
-3. **Reliability (collapse groups).** Cluster genes where one aligns to another at > 98% block identity over
-   most of its length:
-   ```text
-   CYP2D6 vs CYP2D7 : 0.95 < 0.98 → separable        C4A vs C4B : 0.9992 > 0.98 → collapse {C4A,C4B}
-   ```
-   Singleton group ⇒ `reliable=1` (report the per-gene split; CYP2D6 96.9% / CYP2D7 98.4% exact vs truth).
-   Group > 1 ⇒ `reliable=0`: emit one row with the collapsing genes (`genes=C4A;C4B`) and the **module
-   total** (`FORMAT:CN`) — validated 131/131; only the A-vs-B label is untrustworthy, not the total.
+First the genes are projected onto the reference nodes: walking the reference and accumulating node lengths gives each node a coordinate span, which is intersected with the GTF gene intervals to tag every node with the gene (or genes) it falls in. Where the reference revisits the same nodes at two coordinates — a folded paralog — that node is tagged with both genes, which is precisely why graph multiplicity on its own cannot tell the paralogs apart.
+
+When a `DUP` overlaps two or more genes, `call` resolves the per-gene split by competitive realignment. Each gene's reference sequence is aligned (with minimap2, keeping all hits) to every haplotype; hits of the same gene that are adjacent in the target but cover disjoint parts of the query are chained into a single copy, so a copy split around a missing internal insertion still counts once; and each detected copy is claimed by whichever gene it matches best by block identity. A `DUP` that overlaps only one gene skips this entirely — the module total already *is* that gene's copy number, so no realignment runs.
+
+Finally, `call` flags how trustworthy the split is by collapsing near-identical genes into groups: if one gene aligns to another above `--gene-collapse-identity` block identity (default 0.98) over most of its length, the two are too similar to assign a copy to one rather than the other, so they share a group. Raise the threshold to attempt a split on more paralogs, lower it to collapse more of them into a combined total. A gene alone in its group is reported with its own per-gene copy number (`reliable=1`); a group of two or more is emitted as one row that lists the collapsing genes (`genes=P;Q`) and carries the module total in `FORMAT:CN` with `reliable=0` — there only the per-paralog label is untrustworthy, not the total count.
+

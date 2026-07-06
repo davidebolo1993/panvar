@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # CYP2D6 per-gene driver -- DATA ONLY (no plots; plot commands are commented at the bottom).
-# Topology: PGGB-collapsed paralog cluster (CYP2D6/2D7/2D8P) -> call on the BUBBLE graph with
-# --cn-from-coverage (total-module copy number). panphorte runs at min-similarity 0.97.
+# Topology: PGGB-collapsed paralog cluster (CYP2D6/2D7/2D8P) -> --cn coverage route (total-module
+# copy number). Called on the panphorte graph (universal substrate; panphorte leaves this cluster
+# untouched at min-similarity 0.97, so it equals the bubble graph).
 #   scripts/genes/cyp2d6.sh
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; source "$HERE/_common.sh"
 region=cyp2d6; d="$OUT/$region"
 
-run_gene_data "$region" "$DATA/cyp2d6.gfa.gz" 0.97 bubble "--cn-from-coverage" 0.97 || exit 1
+run_gene_data "$region" "$DATA/cyp2d6.gfa.gz" 0.97 panphorte "--cn" 0.97 || exit 1
 
 # ---- copy-number validation vs ground truth (optional; uncomment) -------------------------------
 # "$PY" "$REPO/scripts/compare_copy_number.py" --vcf "$d/call/call.region.vcf" --label cyp2d6 \

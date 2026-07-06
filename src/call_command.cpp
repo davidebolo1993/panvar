@@ -43,16 +43,17 @@ void print_call_help() {
         << "      --minimap-preset <name>      minimap2 preset for INS refinement: asm5|asm10|asm20 (default: asm20)\n"
         << "      --minimap-best-n <N>         minimap2 best_n chains (default: 8)\n"
         << "      --ins-dup-min-identity <X>   Identity for an INS to be subtyped DUP (default: 0.90)\n"
-        << "      --cn                         Recommended, locus-agnostic copy-number calling: enables all\n"
-        << "                                   routes (self-loop REP > coverage > peak, by topology) and emits\n"
-        << "                                   the TOTAL copy number of the folded module. With --gtf the total\n"
-        << "                                   is reassigned to per-gene copy number. Sequence-resolved\n"
+        << "      --cn                         Copy-number calling (locus-agnostic): enables all routes and\n"
+        << "                                   resolves them by topology (self-loop REP > coverage > peak),\n"
+        << "                                   emitting the TOTAL copy number of the folded module. With --gtf\n"
+        << "                                   the total is reassigned to per-gene copy number. Sequence-resolved\n"
         << "                                   DEL/INS/INV are kept alongside the CN call.\n"
-        << "      --cn-from-coverage           (advanced) only the coverage route (total-module bp/unit)\n"
-        << "      --cn-from-multiplicity       (advanced) only the peak-multiplicity route\n"
         << "      --gtf <path>                 Reference-coordinate GTF: annotate variants with the genes\n"
         << "                                   they touch (INFO GENES), write <prefix>.node_genes.tsv and a\n"
         << "                                   per-gene DUP copy-number table; needs a PanSN reference path\n"
+        << "      --gene-collapse-identity <X> With --gtf: two genes are reported as one combined total\n"
+        << "                                   (reliable=0) when one aligns to the other above this block\n"
+        << "                                   identity; raise to split more paralogs (default: 0.98)\n"
         << "      --bubble-id <N>              Restrict to one bubble ID (repeatable)\n"
         << "      --no-per-bubble-vcf          Only write the concatenated region VCF\n"
         << "      --no-variant-paths           Skip the variant_paths.tsv sidecar\n"
@@ -151,21 +152,12 @@ int run_call_command(const std::vector<std::string>& args) {
             options.classify_ins = true;
             continue;
         }
-        if (arg == "--cn") {                 // recommended: enable all CN routes (locus-agnostic total CN)
-            options.cn_from_coverage = true;
-            options.cn_from_multiplicity = true;
-            continue;
-        }
-        if (arg == "--cn-from-multiplicity") {
-            options.cn_from_multiplicity = true;
+        if (arg == "--cn") {                 // copy-number calling: all routes, resolved by topology
+            options.cn = true;
             continue;
         }
         if (arg == "--gtf") {
             options.gtf_path = require_value(arg);
-            continue;
-        }
-        if (arg == "--cn-from-coverage") {
-            options.cn_from_coverage = true;
             continue;
         }
         if (arg == "--minimap-preset") {
@@ -181,6 +173,10 @@ int run_call_command(const std::vector<std::string>& args) {
         }
         if (arg == "--ins-dup-min-identity") {
             options.ins_dup_min_identity = cli::parse_unit_fraction_arg(arg, require_value(arg));
+            continue;
+        }
+        if (arg == "--gene-collapse-identity") {
+            options.gene_collapse_identity = cli::parse_unit_fraction_arg(arg, require_value(arg));
             continue;
         }
         if (arg == "--bubble-id") {

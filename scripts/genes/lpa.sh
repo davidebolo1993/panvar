@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # LPA (KIV-2) driver: tandem repeat, called on the panphorte graph. CN comes from the always-on REP
-# self-loop; --cn-from-multiplicity is passed only as a fallback for any bubble that did not fold.
+# self-loop; --cn covers any bubble that did not fold via the peak route.
 # Runs the data pipeline then the GWAS (cohort sim -> describe --samples -> associate, region scan +
 # structure demo). Needs a numpy-capable python.
 #   PYTHON=~/miniconda3/bin/python scripts/genes/lpa.sh        # env: N (cohort size), SIM (null markers)
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; source "$HERE/_common.sh"
 region=lpa; d="$OUT/$region"
 
-run_gene_data "$region" "$DATA/lpa.gfa.gz" 0.97 panphorte "--cn-from-multiplicity" 0.95 || exit 1
+run_gene_data "$region" "$DATA/lpa.gfa.gz" 0.97 panphorte "--cn" 0.95 || exit 1
 
 # ---- copy-number validation vs ground truth (optional; uncomment) -------------------------------
 # "$PY" "$REPO/scripts/compare_copy_number.py" --vcf "$d/call/call.region.vcf" --label lpa \

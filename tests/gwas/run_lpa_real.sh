@@ -41,7 +41,7 @@ echo "== call -> describe --samples (per-sample BIMBAM dosage) =="
 GTF="${GTF:-$REPO/tests/real_data/Homo_sapiens.GRCh38.116.gtf.gz}"
 GTFOPT=(); [ -f "$GTF" ] && GTFOPT=(--gtf "$GTF")
 "$PANVAR_BIN" call -i "$PGFA" --bubble-prefix-in "$OUT_DIR/pan" --reference-path "$REF" \
-  -o "$OUT_DIR/call" --cn-from-multiplicity ${GTFOPT[@]+"${GTFOPT[@]}"} --quiet >/dev/null
+  -o "$OUT_DIR/call" --cn ${GTFOPT[@]+"${GTFOPT[@]}"} --quiet >/dev/null
 NGOPT=(); [ -f "$OUT_DIR/call.node_genes.tsv" ] && NGOPT=(--node-genes "$OUT_DIR/call.node_genes.tsv")
 "$PANVAR_BIN" describe -i "$PGFA" --bubble-prefix-in "$OUT_DIR/pan" --out-dir "$OUT_DIR/desc" \
   --kmer-size 31 --no-wide-matrix --variant-nodes "$OUT_DIR/call.variant_nodes.tsv" \

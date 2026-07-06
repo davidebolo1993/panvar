@@ -24,14 +24,15 @@ struct VariantCallOptions {
     std::size_t multiallelic_max_bp = 5000; // skip multiallelic collapse if any allele seq exceeds this
     std::size_t rescue_min_bp = 0;       // floor for events kept for merge/rescue (0 -> min_sv_bp/2)
     bool classify_ins = false;           // minimap2 INS subtype refinement (NOVEL vs DUP)
-    bool cn_from_coverage = false;        // emit total-module CN from spelled-bp/unit on folded clusters
-                                         // (ref folds >=2x); recovers deletions+gains; takes precedence
-                                         // over cn_from_multiplicity on those bubbles
-    bool cn_from_multiplicity = false;    // emit DUP from peak node multiplicity for folded bubbles
-                                         // with no self-loop (e.g. GSTM1) that panphorte could not collapse
+    bool cn = false;                     // copy-number calling: enable all CN routes, resolved by topology
+                                         // (self-loop REP > coverage bp/unit > peak multiplicity). The
+                                         // always-on self-loop REP DUP fires regardless; the two
+                                         // folded-cluster routes fire only under --cn.
     std::string minimap_preset = "asm20";
     std::size_t minimap_best_n = 8;
     double ins_dup_min_identity = 0.90;  // identity for an INS to be subtyped DUP
+    double gene_collapse_identity = 0.98; // --gtf: two genes collapse into one unreliable combined total
+                                         // when one aligns to the other above this block identity
     std::string gtf_path;                // optional reference-coordinate GTF: annotate variants with the
                                          // genes they touch (INFO GENES), write <prefix>.node_genes.tsv,
                                          // and a per-gene DUP copy-number table; needs a PanSN reference

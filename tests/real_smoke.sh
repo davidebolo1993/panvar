@@ -68,7 +68,7 @@ test -s "$NORM_GFA"
 
 # 5) call on the panphorte sorted output
 "$PANVAR_BIN" call -i "$NORM_GFA" --bubble-prefix-in "$PANPHORTE_PREFIX" \
-  --reference-path "$REF_PATH" -o "$CALL_PREFIX" --cn-from-multiplicity --quiet
+  --reference-path "$REF_PATH" -o "$CALL_PREFIX" --cn --quiet
 
 # ---- assertions ----
 test -s "$BUBBLE_PREFIX.bubbles.csv"

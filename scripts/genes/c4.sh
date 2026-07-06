@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # C4 (RCCX) per-gene driver -- DATA ONLY (no plots; plot commands are commented at the bottom).
-# Topology: PGGB-collapsed paralog cluster -> call on the BUBBLE graph with --cn-from-coverage
-# (total-module copy number = C4A+C4B). panphorte still runs (min-similarity 0.97, no over-collapse).
+# Topology: PGGB-collapsed paralog cluster -> --cn coverage route (total-module CN = C4A+C4B).
+# Called on the panphorte graph (universal substrate; panphorte leaves this cluster untouched at
+# min-similarity 0.97, so it equals the bubble graph).
 #   scripts/genes/c4.sh
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; source "$HERE/_common.sh"
 region=c4; d="$OUT/$region"
 
-run_gene_data "$region" "$DATA/c4.gfa.gz" 0.97 bubble "--cn-from-coverage" 0.97 || exit 1
+run_gene_data "$region" "$DATA/c4.gfa.gz" 0.97 panphorte "--cn" 0.97 || exit 1
 
 # ---- copy-number validation vs ground truth (optional; uncomment) -------------------------------
 # "$PY" "$REPO/scripts/compare_copy_number.py" --vcf "$d/call/call.region.vcf" --label c4 \

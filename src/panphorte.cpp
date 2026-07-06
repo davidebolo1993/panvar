@@ -774,20 +774,28 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
             continue; // bubble fully handled in approximate mode
         }
 
+        // Detect per-path tandem arrays first, then apply the SAME cohort-prevalence gate as the
+        // approximate branch: fold the bubble only if a >= min_copies array is carried by
+        // >= --min-array-prevalence of the traversing haplotypes. This keeps a rare private
+        // duplication of a gene/segmental module (e.g. a CYP2D6x2 in a handful of haplotypes) from
+        // being collapsed in exact mode too, so the gate behaves identically at every similarity.
+        std::vector<std::vector<TandemArray>> path_arrays(graph.paths.size());
+        std::size_t n_traverse = 0, haps_with_array = 0;
         for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
             const auto interval = find_best_bubble_path_interval(path_indexes[pi], bubble);
-            if (!interval.has_value()) {
-                continue;
-            }
-
-            const auto arrays = detect_tandems(
+            if (!interval.has_value()) continue;
+            ++n_traverse;
+            auto arrays = detect_tandems(
                 graph, node_tok, graph.paths[pi], interval->left, interval->right,
                 options.min_unit_bp, options.min_copies, options.max_interruption_frac);
-            if (arrays.empty()) {
-                continue;
-            }
-
-            for (const TandemArray& arr : arrays) {
+            if (!arrays.empty()) { ++haps_with_array; path_arrays[pi] = std::move(arrays); }
+        }
+        const double prevalence =
+            n_traverse > 0 ? static_cast<double>(haps_with_array) / static_cast<double>(n_traverse) : 0.0;
+        const bool array_confirmed = prevalence >= options.min_array_prevalence;
+        for (std::size_t pi = 0; array_confirmed && pi < graph.paths.size(); ++pi) {
+            if (path_arrays[pi].empty()) continue;
+            for (const TandemArray& arr : path_arrays[pi]) {
                 const std::string& unit = arr.unit_seq;
                 const std::string rc = reverse_complement(unit);
                 const bool forward = unit <= rc;
