@@ -33,6 +33,10 @@ struct VariantCallOptions {
     double ins_dup_min_identity = 0.90;  // identity for an INS to be subtyped DUP
     double gene_collapse_identity = 0.98; // --gtf: two genes collapse into one unreliable combined total
                                          // when one aligns to the other above this block identity
+    double gene_copy_min_identity = 0.90; // --gtf per-gene split: gap-compressed identity floor for a
+                                         // gene's realignment hit to count as one of its copies
+    double gene_copy_min_qcov = 0.50;     // --gtf per-gene split: min fraction of the gene a hit must
+                                         // cover to count as a copy (guards short spurious fragments)
     std::string gtf_path;                // optional reference-coordinate GTF: annotate variants with the
                                          // genes they touch (INFO GENES), write <prefix>.node_genes.tsv,
                                          // and a per-gene DUP copy-number table; needs a PanSN reference

@@ -46,6 +46,8 @@ Call on the `panphorte` graph (the `bubble` → `panphorte` → `call` path). `p
 | `--multiallelic-loci` | collapse a bounded locus into one multiallelic record; `--multiallelic-max-bp` (5000) bounds it | off |
 | `--gtf <path>` | gene annotation (needs PanSN `--reference-path`); see [below](#gene-annotation---gtf) | — |
 | `--gene-collapse-identity <X>` | with `--gtf`: two genes are reported as one combined total (`reliable=0`) when one aligns to the other above this block identity — raise to split more paralogs, lower to collapse more | `0.98` |
+| `--gene-copy-min-identity <X>` | with `--gtf`: min gap-compressed identity for a gene's realignment hit to count as one of its copies | `0.90` |
+| `--gene-copy-min-qcov <X>` | with `--gtf`: min fraction of a gene a hit must cover to count as a copy (guards short spurious fragments) | `0.50` |
 | `--bubble-id <N>` / `--no-per-bubble-vcf` / `--no-variant-paths` / `-q, --quiet` | scope and output toggles | — |
 
 

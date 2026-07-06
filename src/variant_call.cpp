@@ -1049,6 +1049,12 @@ void call_variants(
                     mr.seed.size_bp = excess_bp;
                     mr.seed.ru_len = excess_bp / (ac_peak - ref_peak);  // per-copy duplicated content
                     mr.seed.cn_peak = true;
+                    // describe handoff: like the coverage route, a peak DUP's copy-number signal lives in
+                    // the folded module's INSIDE nodes (their per-walk multiplicity), not in the single peak
+                    // node. EVENT_NODES / POS stay the compact peak-node anchor, but variant_nodes.tsv must
+                    // carry the inside nodes so `describe --variant-nodes` keeps the dosage features (else it
+                    // masks to one node every haplotype traverses the same way → no variance → dropped).
+                    mr.member_nodes.insert(bubble.inside.begin(), bubble.inside.end());
                     merged.push_back(std::move(mr));
                     peak_grp = &merged.back();
                 } else if (ac_peak > peak_grp->seed.alt_cn) {
@@ -1893,7 +1899,9 @@ void call_variants(
                 for (int gi : t.gene_idx) gseqs.push_back(gene_seq_cache[gi]);
                 std::vector<std::vector<std::string>> per_path(graph.paths.size());
                 run_parallel(graph.paths.size(), options.threads, [&](std::size_t pi) {
-                    const std::vector<int> cn = assign_gene_copies(gseqs, hap_seq[pi]);
+                    const std::vector<int> cn = assign_gene_copies(
+                        gseqs, hap_seq[pi], "asm20",
+                        options.gene_copy_min_identity, options.gene_copy_min_qcov);
                     const std::string& sname = graph.paths[pi].name;
                     for (const std::vector<int>& grp_members : members) {
                         const std::string prefix = std::to_string(t.bubble_id) + '\t' + t.variant_id + '\t' + sname + '\t';

@@ -54,6 +54,10 @@ void print_call_help() {
         << "      --gene-collapse-identity <X> With --gtf: two genes are reported as one combined total\n"
         << "                                   (reliable=0) when one aligns to the other above this block\n"
         << "                                   identity; raise to split more paralogs (default: 0.98)\n"
+        << "      --gene-copy-min-identity <X> With --gtf: min gap-compressed identity for a gene's\n"
+        << "                                   realignment hit to count as a copy (default: 0.90)\n"
+        << "      --gene-copy-min-qcov <X>     With --gtf: min fraction of a gene a hit must cover to\n"
+        << "                                   count as a copy (default: 0.50)\n"
         << "      --bubble-id <N>              Restrict to one bubble ID (repeatable)\n"
         << "      --no-per-bubble-vcf          Only write the concatenated region VCF\n"
         << "      --no-variant-paths           Skip the variant_paths.tsv sidecar\n"
@@ -177,6 +181,14 @@ int run_call_command(const std::vector<std::string>& args) {
         }
         if (arg == "--gene-collapse-identity") {
             options.gene_collapse_identity = cli::parse_unit_fraction_arg(arg, require_value(arg));
+            continue;
+        }
+        if (arg == "--gene-copy-min-identity") {
+            options.gene_copy_min_identity = cli::parse_unit_fraction_arg(arg, require_value(arg));
+            continue;
+        }
+        if (arg == "--gene-copy-min-qcov") {
+            options.gene_copy_min_qcov = cli::parse_unit_fraction_arg(arg, require_value(arg));
             continue;
         }
         if (arg == "--bubble-id") {
