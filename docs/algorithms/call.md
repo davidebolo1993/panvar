@@ -134,13 +134,51 @@ So lower `--merge-jaccard` to merge events sharing a backbone; lower `--merge-se
 
 ## Gene annotation trace (`--gtf`)
 
-With `--gtf`, `call` records which genes each variant touches and, for a copy-number call spanning several genes, splits the module total into per-gene copy numbers — **from the GTF alone, by k-mer dosage, with no per-haplotype alignment**. The reference path's PanSN name (`sample#hap#chrom:start-end`) supplies the chromosome and start coordinate the projection needs.
+With `--gtf`, `call` records which genes each variant touches and splits a copy-number call that spans several genes into per-gene copy numbers — from the GTF alone, by k-mer dosage. The reference path's PanSN name (`sample#hap#chrom:start-end`) supplies the chromosome and start coordinate the projection needs.
 
-First the genes are projected onto the reference nodes: walking the reference and accumulating node lengths gives each node a coordinate span, which is intersected with the GTF gene intervals to tag every node with the gene (or genes) it falls in. Where the reference revisits the same nodes at two coordinates — a folded paralog — that node is tagged with both genes, which is precisely why graph multiplicity on its own cannot tell the paralogs apart.
+First the genes are projected onto the reference nodes: walking the reference and accumulating node lengths gives each node a coordinate span, intersected with the GTF gene intervals to tag every node with the gene (or genes) it falls in. Where the reference revisits the same nodes at two coordinates — a folded paralog — that node is tagged with both genes, which is precisely why graph multiplicity alone cannot tell the paralogs apart. When a `DUP` overlaps two or more genes, each gene's discriminative sketch is its merged coding sequence (the k-mers private to it versus its paralogs), and per-haplotype copy number is the dosage of those private k-mers over the module sub-walk.
 
-When a `DUP` overlaps two or more genes, `call` builds each gene's discriminative sketch from the GTF: the merged **coding sequence** (the span for a gene without CDS, e.g. a pseudogene), reduced to the canonical k-mers **private** to that gene versus its paralogs. Coding sequence is where paralogs differ, so this sketch discriminates from the reference alone. Each haplotype's module sub-walk is then scanned and each private k-mer counted; a gene present in `c` copies carries each of its private k-mers about `c` times, so the per-copy dosage (`hits ÷ private-set size`) rounds to the copy number. A gene with no private k-mers (indistinguishable from a paralog) reports the module total with `reliable=0`.
+### Worked trace — divergent paralogs (private-k-mer dosage)
 
-Pooled dosage suffices for divergent paralogs (CYP2D6 vs 2D7), but blurs on **near-identical** pairs like C4A/C4B: they differ at only a handful of coding sites, and gene conversion makes individual copies mosaics, so two converted C4A copies count like one C4A + one C4B. For a pair the k-mer Jaccard flags as near-identical, `call` instead splits by **per-site consensus**: it aligns the two coding sequences once (reference-side) to enumerate the divergent columns, and at each such site counts the haplotype's A-allele vs B-allele k-mers. Because every copy carries some allele at every site, the two counts sum to the module total, and the **median of the per-site A-fraction across all sites** rejects the odd converted site as an outlier — recovering the per-copy majority vote that a pooled count loses. The module total (the reliable coverage count) is then split by that median.
+A folded cluster carries two coding paralogs `A` and `B` plus a pseudogene `P`. Coding sequence is where paralogs differ, so each gene's sketch is its merged CDS — except `P`, a gene with no CDS, which falls back to its gene span:
 
-Each `dup_gene_cn.tsv` row carries the evidence — `hits`, `priv_kmers`, `dosage` — so a call reads directly (e.g. `C4A hits=47/509, dosage=0.09 → 0` and `C4B hits=210/492, dosage=0.43 → 1` on an A0B1 haplotype), and the copy number carries through the whole spectrum (a deletion → `0`, single copy → `1`, duplication → `2`).
+```text
+gene   marker   private k-mers (unique vs the other paralogs)
+A      CDS      1200
+B      CDS       800
+P      span     4800     (no CDS -> gene span)
+```
+
+1. Build each gene's canonical k-mer set from its marker and keep the k-mers private to it (absent from every paralog in the cluster). These sets discriminate from the reference alone.
+2. Scan a haplotype's module sub-walk and count each gene's private k-mers. A gene present in `c` copies carries each private k-mer about `c` times, so `dosage = hits / private-set size ≈ c`, rounded to the copy number.
+3. Emit one row per gene with its evidence. Keeping a CDS-less gene `P` in the set matters even when its own copy number is not separately validated: its private k-mers absorb its locus, so one of its copies is not mis-counted as a coding paralog.
+
+```text
+one haplotype:  A  hits=990/1200  dosage=0.83  -> CN=1
+                B  hits=560/800   dosage=0.70  -> CN=1
+                P  hits=5500/4800 dosage=1.15  -> CN=1
+```
+
+Across the cohort the calls track biology: the always-present paralogs sit at one copy in every haplotype, while a variable paralog carries the null/single/duplicated range.
+
+### Worked trace — a near-identical pair (per-site consensus)
+
+Pooled dosage suffices for divergent paralogs but blurs on near-identical pairs: two paralogs `A` and `B` that differ at only a handful of coding sites, where gene conversion makes individual copies mosaics — so two converted `A` copies count like one `A` + one `B`. When the pairwise k-mer Jaccard flags a pair as near-identical, `call` splits it by per-site consensus. Take a haplotype whose module total (from coverage) is 2 copies:
+
+```text
+per-site A-allele vs B-allele k-mer fraction, one haplotype (module total = 2):
+  site 1  A=1.0 B=0.0     site 2  A=1.0 B=0.0
+  site 3  A=0.5 B=0.5   <- a copy gene-converted at this site
+  ...     (more sites at A=1.0 B=0.0)
+```
+
+1. Align the two coding sequences once (reference-side) to enumerate the divergent columns; at each column collect the k-mers carrying the A-allele and the B-allele.
+2. Per haplotype, count each site's A-allele vs B-allele k-mers. Because every copy carries some allele at every site, `A + B` sums to the module total, so each site independently reports the split as the fraction `A/(A+B)`.
+3. Take the median of that fraction across all sites: the converted site (`0.5`) is an outlier out-voted by the clean sites (`1.0`), so the median is `1.0`. Split the reliable module total by it → `A = round(2 × 1.0) = 2`, `B = 0`. A pooled count would have read the mosaic as one copy each.
+
+```text
+SVTYPE=DUP ...  gene A CN=2   gene B CN=0     (per-site recovers the mosaic; pooled dosage would miss)
+```
+
+Every `dup_gene_cn.tsv` row carries `hits`, `priv_kmers`, and `dosage`, so the split is auditable and the copy number carries through the whole spectrum — a deletion reads `0`, a single copy `1`, a duplication `2`. A gene with no CDS is sketched from its gene span instead of its coding sequence; a gene with no private k-mers at all (indistinguishable from a paralog) is reported as the module total with `reliable=0`.
 
