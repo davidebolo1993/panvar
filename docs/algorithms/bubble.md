@@ -1,13 +1,13 @@
 # Module `bubble` - algorithm
 
-Mechanism and a hand-traced example for the `bubble` module. For usage/flags see [modules/bubble.md](../modules/bubble.md); References in [references.md](../references.md#bubble).
+Mechanism for the `bubble` module. For usage/flags see [modules/bubble.md](../modules/bubble.md); References in [references.md](../references.md#bubble).
 
 ## Terms
 
-- **snarl** — a pair of boundary nodes whose removal separates an internal subgraph from the rest, defined on the bidirected graph; it can contain cycles and inversions. What `vg snarls` emits.
-- **superbubble** — the acyclic special case: a single-source/single-sink subgraph that is directed and acyclic (no cycle, no inversion). `vg`'s "ultrabubble" ≈ superbubble.
+- **snarl** — a pair of boundary nodes whose removal separates an internal subgraph from the rest, defined on the bidirected graph; it can contain cycles and inversions.
+- **superbubble** — the acyclic special case: a single-source/single-sink subgraph that is directed and acyclic (no cycle, no inversion).
 
-`bubble` consumes snarls because pangenome variation often lives in the cyclic sites a superbubble omits; `--superbubbles` restricts to the acyclic subset. Internally it mirrors `vg`'s cactus/3-edge-connected decomposition, so the default top-level snarl set matches `vg`.
+`bubble` consumes snarls because pangenome variation often lives in the cyclic sites a superbubble omits; `--superbubbles` restricts to the acyclic subset. Internally it mirrors `vg`'s cactus/3-edge-connected decomposition, so the default top-level snarls should match `vg`'s.
 
 ## Algorithm overview
 
@@ -17,40 +17,32 @@ For each top-level snarl candidate:
 2. find path intervals crossing `source→sink` (or `sink→source`, then canonicalize);
 3. collect internal nodes seen between boundaries;
 4. measure number of crossing paths and internal bp support across them;
-5. apply base filters (`--min-path-support`, `--min-variant-bp`);
-6. optionally merge nearby surviving bubbles (`--merge-nearby-bp`); assign bubble IDs.
+5. apply base filters: `--min-variant-bp` (keep a candidate only if some supporting path has internal span ≥ N bp — the size filter, default 50), `--min-path-support` (keep only candidates with ≥ N supporting paths, default 0);
+6. optionally merge nearby surviving bubbles via `--merge-nearby-bp`: consecutive survivors merge when the shortest-path distance from the previous `sink` to the next `source` is ≤ N bp; assign bubble IDs.
 
-#### Filters
-
--  `--min-variant-bp N` (default 50): keep a candidate only if some supporting path has internal span ≥ N (`0` disables). 
--  `--min-path-support N` (default 0): keep only candidates with ≥ N crossing paths. 
-
-#### Merging
-
-- `--merge-nearby-bp N` (default 0, off), applied after the filters: consecutive survivors merge when the shortest-path distance from the previous `sink` to the next `source` is ≤ N bp.
 
 ## Worked trace 
 
 Input graph (one bubble; `+` = forward strand):
 
 ```text
-S  1  T                       flank
-S  2  GG                      source boundary
-S  3  AC                      interior allele "ref"  (2 bp)
-S  4  ATG                     interior allele "alt"  (3 bp)
-S  5  CC                      sink boundary
-S  6  A                       flank
+S  1  T                       #flank
+S  2  GG                      #source boundary
+S  3  AC                      #interior allele "ref"  (2 bp)
+S  4  ATG                     #interior allele "alt"  (3 bp)
+S  5  CC                      #sink boundary
+S  6  A                       #flank
 L  1  +  2  +  0M
 L  2  +  3  +  0M
 L  3  +  5  +  0M
 L  2  +  4  +  0M
 L  4  +  5  +  0M
 L  5  +  6  +  0M
-L  1  +  6  +  0M             bypass edge (hC's deletion)
+L  1  +  6  +  0M             #bypass edge (hC's deletion)
 P  ref  1+,2+,3+,5+,6+  *
 P  hA   1+,2+,4+,5+,6+  *
 P  hB   1+,2+,3+,5+,6+  *
-P  hC   1+,6+           *     deletion that bypasses the locus
+P  hC   1+,6+           *     #deletion that bypasses the locus
 ```
 
 1. The cactus finder returns boundary (`source`, `sink`) = (2, 5) — removing 2 and 5 separates `{3,4}`.

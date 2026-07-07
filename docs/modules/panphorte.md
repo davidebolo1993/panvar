@@ -4,17 +4,17 @@ CLI: `panvar panphorte`
 
 ## What it does
 
-Normalizes contiguous tandem-repeat (TR) bubbles into a compact, copy-number-explicit form. It:
+Normalizes contiguous, tandemly-repeated (TR) bubbles into a compact, copy-number-explicit form. It:
 - collapses each detected tandem array to a single repeat-unit (`REP`) node carrying a self-loop, so a haplotype's copy number (CN) is recorded as the number of self-loop traversals rather than as a spurious insertion
 - writes a new GFA (plus a report and CN-provenance table) for `inspect` and `call`
 
-Collapse is exact by default (byte-identical copies) and can be made approximate to fold divergent copies. Only genuine population TRs are folded, not rare private duplications of a gene/segmental module.
+Collapse is exact by default (byte-identical copies) and can be made approximate to fold divergent copies. Only genuine population TR are folded, not rare duplications.
 
 Algorithm and worked trace: [algorithms/panphorte.md](../algorithms/panphorte.md).
 
 ## Required inputs
 
-- `-i, --gfa <graph.gfa>` — the `bubble` `*.sorted.gfa`.
+- `-i, --gfa <graph.gfa>` — the sorted GFA from `bubble`.
 - one of `-b, --bubble-prefix-in <bubble-prefix>` (auto-uses `<prefix>.bubbles.csv`) or `-c, --bubbles-csv <path>`.
 
 ## Key options
@@ -26,10 +26,10 @@ Algorithm and worked trace: [algorithms/panphorte.md](../algorithms/panphorte.md
 | `--min-similarity <f>` | identity to treat a block as a copy of the unit; `1.0` = exact (sequence-preserving), `< 1.0` = approximate/lossy collapse of divergent copies | `1.0` |
 | `--min-unit-bp <N>` | minimum repeat-unit span to normalize | `50` |
 | `--min-copies <N>` | tandem copies needed (in some haplotype) to treat a bubble as an array; once an array, every haplotype with ≥1 copy folds | `2` |
-| `--min-array-prevalence <f>` | min fraction of bubble-traversing haplotypes that must carry a ≥`min-copies` array for the bubble to fold; separates a true population TR (folded) from a rare private duplication | `0.5` |
+| `--min-array-prevalence <f>` | min fraction of bubble-traversing haplotypes that must carry a ≥`min-copies` array for the bubble to fold; separates a true population TR from a rare/private duplication | `0.5` |
 | `--max-interruption-frac <f>` | max fraction of an array's bp that may be interruptions | `0.25` |
 | `--threads <N>` | workers for the approximate seed scan/CN detection (`0` = auto) | `0` |
-| `--gtf <path>` | after re-sorting, project genes ( `<prefix>.bandage_genes.csv`, needs PanSN `--reference-path`); separate from `bubble --gtf` because collapse renumbers nodes | — |
+| `--gtf <path>` | after re-sorting, project genes ( `<prefix>.bandage_genes.csv`, needs PanSN `--reference-path`); separate from `bubble --gtf` because collapse, if applicable, renumbers nodes | — |
 | `-q, --quiet` | disable progress/logs | off |
 
 ## Outputs
@@ -42,6 +42,7 @@ Algorithm and worked trace: [algorithms/panphorte.md](../algorithms/panphorte.md
 | `<prefix>.panphorte.report.tsv` | one row per bubble (columns below) |
 | `<prefix>.panphorte.copies.tsv` | (approximate mode) one row per (haplotype, array) — the CN provenance for `call` (columns below) |
 | `<prefix>.bandage_nodes.csv` | Bandage node colors |
+| `<prefix>.bandage_genes.csv` | Bandage gene track (with `--gtf` + PanSN `--reference-path`) |
 
 `<prefix>.panphorte.report.tsv` columns:
 

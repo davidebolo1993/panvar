@@ -154,10 +154,19 @@ if(PANVAR_BUILD_TESTING)
             )
         endif()
 
-        # The fuller real-data integration smoke (tests/real_smoke.sh runs the whole
-        # bubble -> inspect -> describe -> panphorte -> call pipeline) is intentionally NOT
-        # registered as a ctest: it is large/slow. Run it manually on real loci, e.g.:
-        #   bash tests/real_smoke.sh ./build/panvar tests/real_data/c4.gfa.gz /tmp/smoke_c4
-        # Only the synthetic smoke runs at the compilation/ctest stage.
+        # Real-data integration smoke: the whole bubble -> inspect -> describe -> panphorte
+        # -> call pipeline on a committed locus, asserting each stage's outputs. Registered on
+        # C4 (the smallest graph, ~3s, no external tools) so the pipeline is exercised end-to-end
+        # by ctest. Labelled "real" so it can be excluded with `ctest -LE real` if desired; the
+        # larger loci (gstm1/lpa) stay manual: bash tests/real_smoke.sh ./build/panvar <gfa> <out>.
+        set(PANVAR_REAL_SMOKE ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_smoke.sh)
+        set(PANVAR_REAL_SMOKE_GFA ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_data/c4.gfa.gz)
+        if(EXISTS ${PANVAR_REAL_SMOKE} AND EXISTS ${PANVAR_REAL_SMOKE_GFA})
+            add_test(
+                NAME panvar_smoke_real_c4
+                COMMAND /usr/bin/env bash ${PANVAR_REAL_SMOKE} $<TARGET_FILE:panvar> ${PANVAR_REAL_SMOKE_GFA} ${CMAKE_CURRENT_BINARY_DIR}/smoke_real_c4
+            )
+            set_tests_properties(panvar_smoke_real_c4 PROPERTIES LABELS "real" TIMEOUT 300)
+        endif()
     endif()
 endif()

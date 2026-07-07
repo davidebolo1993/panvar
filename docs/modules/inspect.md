@@ -16,9 +16,8 @@ Algorithm and worked trace: [algorithms/inspect.md](../algorithms/inspect.md).
 
 ## Required inputs
 
-- `-i, --gfa <graph.gfa>` — use the sorted GFA from `bubble`/`panphorte` (node ids match the CSV).
+- `-i, --gfa <graph.gfa>` — the sorted GFA from `bubble`/`panphorte` (node ids should match the CSV to `-b`).
 - one of `-b, --bubble-prefix-in <prefix>` (auto-uses `<prefix>.bubbles.csv`) or `-c, --bubbles-csv <path>`.
-- `--bubble-id <N>` optional; omit to inspect every bubble (one output set each).
 
 ## Key options
 
@@ -27,7 +26,7 @@ Algorithm and worked trace: [algorithms/inspect.md](../algorithms/inspect.md).
 | `-o, --out-prefix <p>` | output prefix | — |
 | `--bubble-id <N>` | restrict to one bubble | all bubbles |
 | `--cluster` | group crossing paths by `source → sink` [walk](../algorithms/inspect.md#terms) (`<prefix>.bubble_<N>.clusters.tsv`) | off |
-| `--cluster-similarity <f>` | walk-similarity threshold for `--cluster` (higher = finer copy-number bands) | `0.90` |
+| `--cluster-similarity <f>` | walk-similarity threshold for `--cluster` | `0.90` |
 | `--fasta-out` / `--table-out` / `--edge-table-out <path>` | override the FASTA/node-count/edge-count paths (single `--bubble-id` only) | derived |
 
 ## Outputs (per bubble)
@@ -42,25 +41,23 @@ Algorithm and worked trace: [algorithms/inspect.md](../algorithms/inspect.md).
 
 ## Plotting
 
-Two R helpers (need `Rscript` + `ggplot2`) visualize the count tables; both take `--clusters` (plot only cluster representatives) and `--cluster-by` (group/order rows by cluster):
+Two R helpers (need `Rscript` + `ggplot2`) visualize the count tables:
 
 ```bash
 Rscript scripts/plot_node_coverage_heatmap.R \
   --table <…>.node_counts.tsv \
   --node-lengths <…>.node_lengths.tsv \
-  --cluster-by <…>.clusters.tsv \
   --out <…>.node_coverage
 Rscript scripts/plot_edge_coverage_heatmap.R \
   --table <…>.edge_counts.tsv \
-  --cluster-by <…>.clusters.tsv \
   --out <…>.edge_coverage
 ```
 
-Shared flags (both scripts):
+Shared flags:
 
 - `--table <counts.tsv>` — the node- or edge-count matrix (required).
 - `--out <prefix>` — output prefix (required).
-- `--clusters` / `--cluster-by <clusters.tsv>` — plot only cluster representatives / group and order rows by cluster.
+- `--clusters` / `--cluster-by <clusters.tsv>` — plot only cluster representatives/group and order rows by cluster.
 - `--max-paths <N>` — keep at most N paths (by total coverage), to subset dense loci.
 - `--transform <raw|log1p>` — count transform.
 - `--width` / `--height` / `--dpi` — figure size (inches) and PNG resolution (default 300).

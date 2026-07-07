@@ -4,20 +4,20 @@ CLI: `panvar bubble`
 
 ## What it does
 
-Turns a pangenome graph (GFA, from `pggb`) into `panvar` bubble sites for the downstream modules. It:
+Turns a pangenome graph (GFA, from [pggb](https://github.com/pangenome/pggb)) into bubble sites for the downstream modules. It:
 - sorts/flips the graph along the reference
-- finds [snarls](../algorithms/bubble.md#terms) internally (a vendored cactus/3-edge-connected decomposition matching `vg snarls`)
+- finds [snarls](../algorithms/bubble.md#terms) internally (a vendored cactus/3-edge-connected decomposition matching [vg](https://github.com/vgteam/vg) `snarls`)
 -  infers each bubble's internal nodes from path intervals
 -  scores path support and internal span
 -   applies size/support filters
--   writes the sorted GFA, a bubble CSV and Bandage-ready visualization files.
+-   writes the sorted GFA, a bubble CSV and [Bandage](https://github.com/asl/BandageNG)-ready visualization files.
 
 Algorithm and worked trace: [algorithms/bubble.md](../algorithms/bubble.md).
 
 ## Required inputs
 
-- `-i, --gfa <graph.gfa>` — any GFA.
-- `-r, --reference-path <name>` — reference path name or unique case-insensitive substring; orders the internal sort/flip and snarl finder. Not needed with `--snarls-in`.
+- `-i, --gfa <graph.gfa>` — `pggb` GFA
+- `-r, --reference-path <name>` — reference path name (or unique, case-insensitive substring). Orders the internal sort/flip and snarl finder. Not needed with `--snarls-in`.
 
 ## Key options
 
@@ -39,7 +39,7 @@ Algorithm and worked trace: [algorithms/bubble.md](../algorithms/bubble.md).
 
 | file | contents |
 |------|----------|
-| `<prefix>.bubbles.csv` | the bubble table consumed by `inspect` / `panphorte` / `call` (cols below) |
+| `<prefix>.bubbles.csv` | the bubble table consumed by `inspect` / `panphorte` / `call` |
 | `<prefix>.sorted.gfa` | reference-sorted/flipped graph — the input for downstream `panphorte` / `call` |
 | `<prefix>.bandage_nodes.csv` | Bandage node colors (blue = candidate context, red = retained bubbles) |
 | `<prefix>.bandage_genes.csv` | (with `--gtf`) `Name,Colour,Gene` per bubble |
