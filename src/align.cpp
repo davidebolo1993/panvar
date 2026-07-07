@@ -7,15 +7,10 @@
 
 namespace panvar {
 
-// Bit-parallel (Myers) banded fitting alignment via edlib. The public contract is
-// unchanged from the previous scalar banded DP: fit the ENTIRE `query` into `target`
-// starting at target[0] (no leading target gap), with a free end gap on the target,
-// within an edit budget of `band`. edlib's SHW ("prefix") mode is exactly this:
-// the alignment is anchored at target[0], spans all of query, and the gap after the
-// query (trailing target) is not penalized. Passing k = band bounds the search to
-// the same diagonal budget (an edit distance > band cannot stay within a diagonal
-// band of half-width band), so pairs the old DP would reject leave the band here too
-// -- edlib bails early on them, which is the win on the dissimilar-dominated merge.
+// Bit-parallel (Myers) banded fitting alignment via edlib, same contract as the old scalar DP: fit the
+// whole query into target from target[0] (free trailing target gap) within an edit budget `band`.
+// edlib's SHW/prefix mode is exactly this; k = band caps the edit distance to the same budget, so
+// dissimilar pairs bail early (the win on the merge).
 FitAlignResult fit_align(const std::string& query, const std::string& target, std::size_t band) {
     FitAlignResult out;
     out.query_len = query.size();

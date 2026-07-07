@@ -835,13 +835,9 @@ std::string join_nodes(const std::vector<std::string>& nodes) {
     return out;
 }
 
-// Per-step keep mask for `--variant-nodes` masking. A step is kept (its real sequence emitted)
-// when it is a variant node, or — with `flank_bp` > 0 — when its bp-distance ALONG THE PATH to the
-// nearest variant node is < flank_bp on either side. Keeping the flanking nodes lets k-mers that
-// span from the variant into its neighbouring sequence (e.g. nearby SNPs) survive the masking, so
-// associations can be compared with and without flanking context. flank_bp == 0 reduces to the
-// strict variant-node-only mask. The mask is path-specific (it depends on this walk's node order
-// and lengths), so it is computed per path rather than once per bubble.
+// Per-step keep mask for `--variant-nodes`. Keep a step (emit its real sequence) when it is a variant
+// node, or -- with flank_bp > 0 -- within flank_bp along the path of one, so k-mers spanning into the
+// flanking sequence survive. flank_bp == 0 is the strict variant-only mask. Path-specific, so per path.
 std::vector<char> variant_keep_mask(
     const Graph& graph,
     const std::vector<PathStep>& steps,
@@ -1315,11 +1311,9 @@ std::string format_dosage(double d) {
     return buf;
 }
 
-// ---- BIMBAM mean-genotype dosage export (GEMMA / panvar associate) ------------------------------
-// One normalized row per feature; carriers hold per-path dosage (k-mer occurrence / node-edge
-// traversal count). The writer renders all cohort samples as columns: a carrier gets its dosage, a
-// sample that traverses the feature's bubble(s) but does not carry it gets 0, and a sample that does
-// NOT traverse any of the feature's bubbles gets NA (genuinely missing, distinct from absent).
+// BIMBAM mean-genotype dosage export (GEMMA / associate). One normalized row per feature: a carrier
+// holds its dosage, a sample that traverses the feature's bubble(s) but doesn't carry it gets 0, and
+// one that traverses none gets NA (missing, distinct from absent).
 struct BimbamRow {
     std::string id;                                   // decoded k-mer or node/edge id (globally unique)
     std::string nodes;                                // provenance ("." for k-mers; the id itself for graph)
@@ -1567,12 +1561,10 @@ read_cosigt_table(const std::string& path) {
     return {std::move(path_to_samples), std::move(sample_order)};
 }
 
-// ---- Variant-level BIMBAM: the SV calls as the GWAS unit ----------------------------------------
-// Reads call's region VCF (samples = haplotype paths; FORMAT GT[:CN]) and writes one dosage row per
-// variant (per ALT allele for multiallelic records). Dosage = CN (DUP) / allele indicator
-// (multiallelic) / GT 0|1 (DEL/INS/INV); a haplotype not traversing the bubble (GT=.) is NA. The row
-// format and NA semantics mirror the k-mer/graph BIMBAM so `associate` reads it identically -- but the
-// unit is the variant, an honest multiple-testing denominator (features within a variant are correlated).
+// Variant-level BIMBAM: the SV calls as the GWAS unit. Reads call's VCF (FORMAT GT[:CN]), one dosage
+// row per variant (per ALT for multiallelic): CN (DUP) / allele indicator (multiallelic) / GT 0|1 else;
+// GT=. -> NA. Same format/NA semantics as the k-mer/graph BIMBAM, but the unit is the variant -- an
+// honest testing denominator (features within a variant are correlated).
 struct VariantBimbam {
     std::string id, svtype, bubble, nodes, gene = ".", af = ".", an = ".";
     std::unordered_map<std::string, double> dose;  // haplotype -> dosage (present only; absent => NA)

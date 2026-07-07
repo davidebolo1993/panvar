@@ -515,11 +515,9 @@ int run_associate_command(const std::vector<std::string>& args) {
     if (model == "lmm" && binary)
         throw std::runtime_error("--model lmm needs a quantitative phenotype (binary->logistic-LMM not yet implemented)");
 
-    // ---- kinship (for --model lmm and/or --pca): read an external GRM over the used samples ----
-    // K is the GRM in used-sample order, read from --kinship (rows/cols in --samples order, subset to
-    // used). panvar is local, so it does not build a GRM from its own region genotypes (that would be
-    // proximally contaminated); supply a genome-wide GRM. PCs (--pca) are appended as fixed GLM
-    // covariates; the LMM uses the full K as a random effect.
+    // Kinship for --model lmm / --pca: external GRM over used samples (rows/cols in --samples order).
+    // panvar is local and won't build one from region genotypes (proximal contamination) -- supply a
+    // genome-wide GRM. --pca appends PCs as fixed covariates; the LMM uses K as a random effect.
     Eigen::MatrixXd K;
     if (need_kinship) {
         std::vector<std::size_t> used_cols;
@@ -811,16 +809,12 @@ int run_associate_command(const std::vector<std::string>& args) {
         if (!blocks.empty()) meff = blocks.size();
     }
 
-    // --- variant-tier conditional / joint analysis (forward-stepwise, COJO-style) ---
-    // Marginal r^2-clumping cannot establish independence: a weak genotypic tag of an extremely strong
-    // locus stays genome-wide significant even at r^2 well below --ld-r2. We instead select a set of
-    // jointly-independent signals by forward selection -- repeatedly add the variant with the smallest
-    // p conditioned on the already-selected set, until none clears the entry threshold (--cojo-p, default
-    // 0.05/Meff). Then every variant is reported conditioned on the selected set MINUS itself: a shadow
-    // collapses (large p_conditional), a true independent signal survives and is flagged cond_role=signal.
-    // Variant tier only (one test per event -> no within-event collinearity); linear/logistic (LMM needs
-    // rotation, not done here). Each fit re-uses fit_linear/fit_logistic with the conditioning dosages as
-    // extra covariates; the genotype of interest stays at column 1, so FitResult is its conditional Wald.
+    // Variant-tier forward-stepwise conditional/joint (COJO): r^2-clumping can't establish independence
+    // (a weak tag of a very strong locus stays significant below --ld-r2). Add the variant with the
+    // smallest conditional p until none clears --cojo-p (default 0.05/Meff), then report each conditioned
+    // on the selected set minus itself -- shadows collapse, true signals survive (cond_role=signal).
+    // Variant tier only; linear/logistic (LMM needs the rotation). Conditioning dosages go in as extra
+    // covariates with the genotype at column 1, so FitResult is its conditional Wald.
     std::vector<double> p_cond(rows.size(), kNaN);
     // cond_role: variant tier -> "signal" (COJO-selected) / "shadow"; feature tier -> "lead" /
     // "collinear" (same-event redundancy, not scored) / "conditioned"; "." when not computed.

@@ -607,11 +607,9 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                           << std::flush;
             }
 
-            // Single-block: seed ONE representative repeat unit for the bubble, then
-            // find its near-identical copies (any orientation, not necessarily
-            // adjacent) per path by banded sequence alignment, and collapse them to
-            // one REP node looped per-copy (lossy). Sequence between copies is kept
-            // as literal steps, so only the repeat copies lose within-copy detail.
+            // Single-block: seed one representative unit, find its near-identical copies per path (any
+            // orientation, banded alignment), collapse to one REP node looped per copy. Lossy --
+            // within-copy detail is dropped; inter-copy sequence is kept as literal steps.
             const std::string ref_unit =
                 pick_reference_unit(graph, node_tok, path_indexes, bubble, options);
             if (!options.quiet && ref_unit.size() >= options.min_unit_bp) {
@@ -686,16 +684,10 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                     std::cerr << '\n';
                 }
 
-                // Confirm this is a real tandem array before folding anything: at least one path
-                // must carry >= min_copies copies of the unit. (The unit was seeded from an exact
-                // adjacent tandem pair, so this is virtually always true, but it is the correct
-                // guard and keeps --min-copies meaningful as the array definition.) Once confirmed,
-                // every path with >=1 copy is folded below, including single-copy haplotypes.
-                // Cohort-prevalence gate: a real population VNTR is carried by a fraction of the
-                // cohort, whereas a rare private duplication of a gene/segmental module (e.g. a
-                // CYP2D6x2 in a handful of haplotypes) is not -- folding the latter would collapse
-                // genes/paralogs that `call` resolves downstream. Require both a >=min_copies array
-                // somewhere AND that >= min_array_prevalence of traversing haplotypes carry one.
+                // Confirm a real tandem array before folding: some path must carry >= min_copies copies.
+                // Then a cohort-prevalence gate -- require >= min_array_prevalence of traversing
+                // haplotypes to carry one -- so a rare private duplication (a CYP2D6x2 in a few
+                // haplotypes) isn't folded, collapsing genes `call` resolves downstream.
                 std::size_t max_copies_path = 0, haps_with_array = 0;
                 for (const Res& r : results) {
                     if (!r.has) continue;
