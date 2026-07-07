@@ -4,7 +4,7 @@ CLI: `panvar panphorte`
 
 ## What it does
 
-Normalizes contiguous, tandemly-repeated (TR) bubbles into a compact, copy-number-explicit form. It:
+Normalizes contiguous, tandem repeat (TR) bubbles into a compact, copy-number-explicit form. It:
 - collapses each detected tandem array to a single repeat-unit (`REP`) node carrying a self-loop, so a haplotype's copy number (`CN`) is recorded as the number of self-loop traversals rather than as a spurious insertion
 - writes a new GFA (Graphical Fragment Assembly) — plus a report and `CN`-provenance table — for `inspect` and `call`
 
@@ -42,7 +42,7 @@ Algorithm and worked trace: [algorithms/panphorte.md](../algorithms/panphorte.md
 | `<prefix>.panphorte.report.tsv` | one row per bubble (columns below) |
 | `<prefix>.panphorte.copies.tsv` | (approximate mode) one row per (haplotype, array) — the `CN` provenance for `call` (columns below) |
 | `<prefix>.bandage_nodes.csv` | Bandage node colors |
-| `<prefix>.bandage_genes.csv` | Bandage gene track (with `--gtf` + PanSN `--reference-path`) |
+| `<prefix>.bandage_genes.csv` | Bandage gene track (with `--gtf` and PanSN `--reference-path`) |
 
 `<prefix>.panphorte.report.tsv` columns:
 

@@ -12,7 +12,7 @@ Types structural variants on the pangenome graph into a multi-sample VCF (Varian
 
 Algorithm and worked trace: [algorithms/call.md](../algorithms/call.md).
 
-Call on the `panphorte` graph (the `bubble` → `panphorte` → `call` path) should be the first choice. `panphorte` folds genuine tandem repeats into `REP` self-loops — which a tandem needs for an exact count — and leaves paralog clusters and rare duplications untouched. Calling on the `bubble` graph should also work for a non-tandem paralog cluster and gives identical results. 
+Call on the `panphorte` graph (the `bubble` → `panphorte` → `call` path) should be the first choice. `panphorte` folds genuine tandem repeats into `REP` self-loops — which a tandem needs for an exact count — and leaves paralog clusters and rare duplications untouched. Calling on the `bubble` graph should also work for a non-tandem paralog cluster and give identical results. 
 
 #### Event types
 
@@ -25,7 +25,7 @@ Call on the `panphorte` graph (the `bubble` → `panphorte` → `call` path) sho
 
 ## Required inputs
 
-- `-i, --gfa <graph.gfa>` — the call substrate from `panphorte` / `bubble` (in any case, node ids should match the CSV to `-b`)
+- `-i, --gfa <graph.gfa>` — the call substrate from `panphorte`/`bubble` (in any case, node ids should match the CSV to `-b`)
 - one of `-b, --bubble-prefix-in <prefix>` or `-c, --bubbles-csv <path>`
 - `-r, --reference-path <name>` — the diff baseline (full name or unique case-insensitive substring).
 - `-o, --out-prefix <prefix>`.

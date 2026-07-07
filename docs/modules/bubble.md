@@ -39,8 +39,8 @@ Algorithm and worked trace: [algorithms/bubble.md](../algorithms/bubble.md).
 
 | file | contents |
 |------|----------|
-| `<prefix>.bubbles.csv` | the bubble table consumed by `inspect` / `panphorte` / `call` |
-| `<prefix>.sorted.gfa` | reference-sorted/flipped graph — the input for downstream `panphorte` / `call` |
+| `<prefix>.bubbles.csv` | the bubble table consumed by `inspect`/`panphorte`/`call` |
+| `<prefix>.sorted.gfa` | reference-sorted/flipped graph — the input for downstream `panphorte`/`call` |
 | `<prefix>.bandage_nodes.csv` | Bandage node colors (blue = candidate context, red = retained bubbles) |
 | `<prefix>.bandage_genes.csv` | (with `--gtf`) `Name,Colour,Gene` per bubble |
 

@@ -94,7 +94,7 @@ Rscript scripts/plot_associate.R \
   --out <prefix>
 ```
 
-Writes `*.manhattan.{png,pdf}` — stacked panels: before correction (raw −log10 p with nominal + region-wide Bonferroni lines), after correction (Benjamini-Hochberg −log10 q with the q=0.05 line), and — when the `p_conditional`/`cond_role` columns are present — after conditioning (−log10 p_conditional, where shadows collapse below the line and only the conditioning signal(s) stay tall). x = node id (graph) or per-k-mer index ordered by node id (k-mers), with FDR/Bonferroni-significant genes flagged (ggrepel, from the `gene` column when `--node-genes` was passed) — and `*.qq.{png,pdf}` (with `λ`).
+Writes `*.manhattan.{png,pdf}` — stacked panels: before correction (raw −log10 p with nominal and region-wide Bonferroni lines), after correction (Benjamini-Hochberg −log10 q with the q=0.05 line), and — when the `p_conditional`/`cond_role` columns are present — after conditioning (−log10 p_conditional, where shadows collapse below the line and only the conditioning signal(s) stay tall). x = node id (graph) or per-k-mer index ordered by node id (k-mers), with FDR/Bonferroni-significant genes flagged (ggrepel, from the `gene` column when `--node-genes` was passed) — and `*.qq.{png,pdf}` (with `λ`).
 
 Script flags (need `Rscript` + `ggplot2`; `ggrepel` optional, for the gene labels):
 
