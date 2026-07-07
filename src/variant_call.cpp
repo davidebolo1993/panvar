@@ -1937,15 +1937,7 @@ void call_variants(
     }
 
     if (summary_out) *summary_out = summary;
-    if (!options.quiet) {
-        std::cerr << "[call] bubbles=" << summary.bubbles_seen
-                  << " with_ref=" << summary.bubbles_with_reference
-                  << " with_calls=" << summary.bubbles_with_calls
-                  << " records=" << summary.records_written
-                  << " (DEL=" << summary.del << " INS=" << summary.ins
-                  << " INV=" << summary.inv << " DUP=" << summary.dup
-                  << " MULTI=" << summary.multi << ")\n";
-    }
+    // The command layer reports this summary via RunLog; no duplicate print here.
 }
 
 } // namespace panvar

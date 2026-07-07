@@ -4,10 +4,11 @@ Documentation for the `panvar` CLI, organized into three subfolders plus a share
 
 | folder / file | what's in it |
 |---------------|--------------|
-| **[modules/](modules/)** | one short usage page per module: what it does, inputs, key options, outputs, a runnable example. Start here to *run* a module. |
+| **[modules/](modules/)** | one short usage page per module: what it does, inputs, key options, outputs. Start here to *run* a module. |
 | **[algorithms/](algorithms/)** | the matching worked traces for each module. Read these to understand how a result is computed |
+| **[walkthrough.md](walkthrough.md)** | the whole pipeline on one real locus (**LPA**), step by step with commands and plots. Start here to see it all work end-to-end. |
 | **[gwas/](gwas/)** | the association workflow with a runnable LPA walk-through |
-| **[references.md](references.md)** | tools (GitHub) and papers behind each module. |
+| **[references.md](references.md)** | tools and papers behind each module. |
 
 ## Pipeline
 

@@ -253,6 +253,10 @@ int run_describe_command(const std::vector<std::string>& args) {
         throw std::runtime_error("no substrate selected (the --only-* flags are mutually exclusive)");
     }
 
+    cli::RunLog log("describe", options.quiet);
+    log.info("input " + options.gfa_path + " (feature mode " + feature_mode_label(options.feature_mode) +
+             ", k=" + std::to_string(options.kmer_size) + ")");
+
     DescribeSummary summary;
     if (graph_substrates) {
         describe_kmers_from_graph(options, &summary);
@@ -261,36 +265,13 @@ int run_describe_command(const std::vector<std::string>& args) {
         describe_variant_from_vcf(options, &summary);
     }
 
-    std::cout
-        << "Input graph: " << options.gfa_path << "\n"
-        << "Bubble source: " << options.bubbles_csv_in << "\n"
-        << "Output dir: " << options.out_dir << "\n"
-        << "K-mer size: " << options.kmer_size << "\n"
-        << "Feature mode: " << feature_mode_label(options.feature_mode) << "\n"
-        << "Syncmer s: "
-        << (options.syncmer_s == 0 ? std::string("auto") : std::to_string(options.syncmer_s)) << "\n"
-        << "Wide matrix: " << (options.write_wide_matrix ? "on" : "off") << "\n"
-        << "Max wide features: " << options.max_wide_features << " (0=no cap)\n"
-        << "Min paths filter (N): " << options.min_feature_paths << " (0=keep all discriminative)\n"
-        << "Variant nodes: " << (options.variant_nodes_path.empty() ? std::string("(all bubble nodes)")
-                                                                     : options.variant_nodes_path) << "\n"
-        << "Variant flank (bp): " << options.variant_flank_bp << "\n"
-        << "Variant VCF: " << (options.variant_vcf_path.empty() ? std::string("(none)")
-                                                                : options.variant_vcf_path) << "\n"
-        << "Bubbles processed: " << summary.bubbles_processed << "\n"
-        << "Bubbles with paths: " << summary.bubbles_with_paths << "\n"
-        << "Path rows written: " << summary.paths_written << "\n"
-        << "K-mer features kept/candidates: " << summary.features_written << "/"
-        << summary.features_candidates << " (discarded "
-        << (summary.features_candidates - summary.features_written) << ")\n"
-        << "Matrix files written: " << summary.matrix_files_written << "\n"
-        << "JSONL files written: " << summary.jsonl_files_written << "\n"
-        << "Node/edge features kept/candidates: " << summary.node_edge_features_written << "/"
-        << summary.node_edge_candidates << " (discarded "
-        << (summary.node_edge_candidates - summary.node_edge_features_written) << ")\n"
-        << "Graph matrix files written: " << summary.graph_matrix_files_written << "\n"
-        << "Files written: " << summary.files_written << "\n";
-
+    log.info("processed " + std::to_string(summary.bubbles_processed) + " bubbles; kept " +
+             std::to_string(summary.features_written) + "/" + std::to_string(summary.features_candidates) +
+             " k-mer and " + std::to_string(summary.node_edge_features_written) + "/" +
+             std::to_string(summary.node_edge_candidates) + " graph features");
+    log.info("wrote " + std::to_string(summary.files_written) + " files in " + options.out_dir +
+             "/ (index: describe.index.tsv)");
+    log.done();
     return 0;
 }
 

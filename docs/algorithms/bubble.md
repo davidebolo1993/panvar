@@ -13,7 +13,7 @@ Mechanism for the `bubble` module. For usage/flags see [modules/bubble.md](../mo
 
 For each top-level snarl candidate:
 
-1. get `(source, sink)` boundary from the internal cactus finder (or `--snarls-in` JSONL);
+1. get `(source, sink)` boundary from the internal cactus finder (or `--snarls-in` JSONL — JSON Lines);
 2. find path intervals crossing `source→sink` (or `sink→source`, then canonicalize);
 3. collect internal nodes seen between boundaries;
 4. measure number of crossing paths and internal bp support across them;
@@ -26,23 +26,23 @@ For each top-level snarl candidate:
 Input graph (one bubble; `+` = forward strand):
 
 ```text
-S  1  T                       #flank
-S  2  GG                      #source boundary
-S  3  AC                      #interior allele "ref"  (2 bp)
-S  4  ATG                     #interior allele "alt"  (3 bp)
-S  5  CC                      #sink boundary
-S  6  A                       #flank
+S  1  T                       flank
+S  2  GG                      source boundary
+S  3  AC                      interior allele "ref"  (2 bp)
+S  4  ATG                     interior allele "alt"  (3 bp)
+S  5  CC                      sink boundary
+S  6  A                       flank
 L  1  +  2  +  0M
 L  2  +  3  +  0M
 L  3  +  5  +  0M
 L  2  +  4  +  0M
 L  4  +  5  +  0M
 L  5  +  6  +  0M
-L  1  +  6  +  0M             #bypass edge (hC's deletion)
+L  1  +  6  +  0M             bypass edge (hC's deletion)
 P  ref  1+,2+,3+,5+,6+  *
 P  hA   1+,2+,4+,5+,6+  *
 P  hB   1+,2+,3+,5+,6+  *
-P  hC   1+,6+           *     #deletion that bypasses the locus
+P  hC   1+,6+           *     deletion that bypasses the locus
 ```
 
 1. The cactus finder returns boundary (`source`, `sink`) = (2, 5) — removing 2 and 5 separates `{3,4}`.

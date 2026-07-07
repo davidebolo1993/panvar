@@ -4,7 +4,7 @@ CLI: `panvar bubble`
 
 ## What it does
 
-Turns a pangenome graph (GFA, from [pggb](https://github.com/pangenome/pggb)) into bubble sites for the downstream modules. It:
+Turns a pangenome graph (GFA — Graphical Fragment Assembly — from [pggb](https://github.com/pangenome/pggb)) into bubble sites for the downstream modules. It:
 - sorts/flips the graph along the reference
 - finds [snarls](../algorithms/bubble.md#terms) internally (a vendored cactus/3-edge-connected decomposition matching [vg](https://github.com/vgteam/vg) `snarls`)
 -  infers each bubble's internal nodes from path intervals
@@ -29,10 +29,10 @@ Algorithm and worked trace: [algorithms/bubble.md](../algorithms/bubble.md).
 | `--min-path-support <N>` | keep only bubbles crossed by ≥ N paths | `0` (off) |
 | `--merge-nearby-bp <N>` | merge consecutive bubbles ≤ N bp apart (after filters) | `0` (off) |
 | `--no-flip` | sort but don't reorient nodes to the reference strand | off |
-| `--snarls-in <path>` | use an external `vg snarls` JSONL (graph used as-is, no sort) | — |
+| `--snarls-in <path>` | use an external `vg snarls` JSONL (JSON Lines; graph used as-is, no sort) | — |
 | `--emit-snarls-jsonl <path>` | also write the internal snarls as `vg`-style JSONL | — |
 | `--snarl-debug-tsv <path>` | write per-snarl-candidate diagnostics (`candidate_id, source, sink, inside_node_count, n_paths, min_inside_bp, long_path_support, inversion_signal, accepted`; merged bubbles get an extra `accepted=1` row) | — |
-| `--gtf <path>` | project a reference-coordinate GTF's genes onto reference nodes  (`<prefix>.bandage_genes.csv`, needs a [PanSN](https://github.com/pangenome/PanSN-spec) `--reference-path`) | — |
+| `--gtf <path>` | project the genes of a reference-coordinate GTF (Gene Transfer Format) onto reference nodes  (`<prefix>.bandage_genes.csv`, needs a [PanSN](https://github.com/pangenome/PanSN-spec) (Pangenome Sequence Naming) `--reference-path`) | — |
 | `-q, --quiet` | disable the progress bar | off |
 
 ## Outputs
@@ -58,10 +58,4 @@ Algorithm and worked trace: [algorithms/bubble.md](../algorithms/bubble.md).
 
 ## Example
 
-```bash
-./build/panvar bubble \
-  -i tests/real_data/lpa.gfa.gz \
-  -o results/real_data/lpa/bubble/bubble \
-  --reference-path "grch38#1" \
-  --gtf tests/real_data/Homo_sapiens.GRCh38.116.gtf.gz
-```
+See the [LPA walkthrough](../walkthrough.md) for this module in a full end-to-end run.

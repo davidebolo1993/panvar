@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <ctime>
 #include <exception>
 #include <filesystem>
 #include <iostream>
@@ -21,6 +22,70 @@ double elapsed_seconds(const std::chrono::steady_clock::time_point& start) {
     const auto now = std::chrono::steady_clock::now();
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
     return static_cast<double>(ms) / 1000.0;
+}
+
+namespace {
+// Current wall-clock time as HH:MM:SS for log-line prefixes.
+std::string clock_hms() {
+    const std::time_t t = std::time(nullptr);
+    std::tm tm{};
+#if defined(_WIN32)
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    char buf[16];
+    std::strftime(buf, sizeof(buf), "%H:%M:%S", &tm);
+    return std::string(buf);
+}
+} // namespace
+
+RunLog::RunLog(std::string module, bool quiet)
+    : module_(std::move(module)), quiet_(quiet), start_(std::chrono::steady_clock::now()) {}
+
+void RunLog::line(const std::string& message) const {
+    if (quiet_) {
+        return;
+    }
+    std::cerr << '[' << module_ << ' ' << clock_hms() << "] " << message << '\n';
+    std::cerr.flush();
+}
+
+void RunLog::info(const std::string& message) const { line(message); }
+
+void RunLog::wrote(const std::vector<std::string>& paths) const {
+    if (quiet_ || paths.empty()) {
+        return;
+    }
+    // Compact form: if every path shares one parent directory, name it once and list
+    // the basenames; otherwise fall back to the full paths.
+    const std::filesystem::path dir0 = std::filesystem::path(paths.front()).parent_path();
+    bool same_dir = true;
+    for (const std::string& p : paths) {
+        if (std::filesystem::path(p).parent_path() != dir0) {
+            same_dir = false;
+            break;
+        }
+    }
+    std::string joined;
+    for (std::size_t i = 0; i < paths.size(); ++i) {
+        if (i != 0) {
+            joined += ", ";
+        }
+        joined += same_dir ? std::filesystem::path(paths[i]).filename().string() : paths[i];
+    }
+    std::string head = "wrote " + std::to_string(paths.size()) + " file" +
+                       (paths.size() == 1 ? "" : "s");
+    if (same_dir && !dir0.empty()) {
+        head += " in " + dir0.string() + "/";
+    }
+    line(head + ": " + joined);
+}
+
+void RunLog::done() const {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "done in %.1fs", elapsed_seconds(start_));
+    line(buf);
 }
 
 bool stderr_is_tty() {

@@ -5,8 +5,8 @@ CLI: `panvar panphorte`
 ## What it does
 
 Normalizes contiguous, tandemly-repeated (TR) bubbles into a compact, copy-number-explicit form. It:
-- collapses each detected tandem array to a single repeat-unit (`REP`) node carrying a self-loop, so a haplotype's copy number (CN) is recorded as the number of self-loop traversals rather than as a spurious insertion
-- writes a new GFA (plus a report and CN-provenance table) for `inspect` and `call`
+- collapses each detected tandem array to a single repeat-unit (`REP`) node carrying a self-loop, so a haplotype's copy number (`CN`) is recorded as the number of self-loop traversals rather than as a spurious insertion
+- writes a new GFA (Graphical Fragment Assembly) — plus a report and `CN`-provenance table — for `inspect` and `call`
 
 Collapse is exact by default (byte-identical copies) and can be made approximate to fold divergent copies. Only genuine population TR are folded, not rare duplications.
 
@@ -28,8 +28,8 @@ Algorithm and worked trace: [algorithms/panphorte.md](../algorithms/panphorte.md
 | `--min-copies <N>` | tandem copies needed (in some haplotype) to treat a bubble as an array; once an array, every haplotype with ≥1 copy folds | `2` |
 | `--min-array-prevalence <f>` | min fraction of bubble-traversing haplotypes that must carry a ≥`min-copies` array for the bubble to fold; separates a true population TR from a rare/private duplication | `0.5` |
 | `--max-interruption-frac <f>` | max fraction of an array's bp that may be interruptions | `0.25` |
-| `--threads <N>` | workers for the approximate seed scan/CN detection (`0` = auto) | `0` |
-| `--gtf <path>` | after re-sorting, project genes ( `<prefix>.bandage_genes.csv`, needs PanSN `--reference-path`); separate from `bubble --gtf` because collapse, if applicable, renumbers nodes | — |
+| `--threads <N>` | workers for the approximate seed scan/`CN` detection (`0` = auto) | `0` |
+| `--gtf <path>` | after re-sorting, project genes ( `<prefix>.bandage_genes.csv`, needs a PanSN (Pangenome Sequence Naming) `--reference-path`); separate from `bubble --gtf` because collapse, if applicable, renumbers nodes | — |
 | `-q, --quiet` | disable progress/logs | off |
 
 ## Outputs
@@ -40,7 +40,7 @@ Algorithm and worked trace: [algorithms/panphorte.md](../algorithms/panphorte.md
 | `<prefix>.normalized.gfa` | unsorted normalized graph (without `--reference-path`; must be re-sorted before `call`) |
 | `<prefix>.bubbles.csv` | re-snarled bubbles (with `--reference-path`) |
 | `<prefix>.panphorte.report.tsv` | one row per bubble (columns below) |
-| `<prefix>.panphorte.copies.tsv` | (approximate mode) one row per (haplotype, array) — the CN provenance for `call` (columns below) |
+| `<prefix>.panphorte.copies.tsv` | (approximate mode) one row per (haplotype, array) — the `CN` provenance for `call` (columns below) |
 | `<prefix>.bandage_nodes.csv` | Bandage node colors |
 | `<prefix>.bandage_genes.csv` | Bandage gene track (with `--gtf` + PanSN `--reference-path`) |
 
@@ -69,12 +69,4 @@ Algorithm and worked trace: [algorithms/panphorte.md](../algorithms/panphorte.md
 
 ## Example
 
-```bash
-./build/panvar panphorte \
-  -i results/real_data/lpa/bubble/bubble.sorted.gfa \
-  --bubble-prefix-in results/real_data/lpa/bubble/bubble \
-  --reference-path "grch38#1" \
-  -o results/real_data/lpa/panphorte/panphorte \
-  --min-similarity 0.97 \
-  --gtf tests/real_data/Homo_sapiens.GRCh38.116.gtf.gz
-```
+See the [LPA walkthrough](../walkthrough.md) for this module in a full end-to-end run.

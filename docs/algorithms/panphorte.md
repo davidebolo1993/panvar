@@ -6,7 +6,7 @@ Mechanism for the `panphorte` module. For usage/flags see [modules/panphorte.md]
 
 - **unit/period** — the tandem repeat (TR) segment an array is built from.
 - **interruption** — non-unit steps interspersed in an array, tolerated up to `--max-interruption-frac` and kept as nested literal steps.
-- **REP node** — the single self-looping node an array collapses to; a haplotype's copy number (CN) is the number of self-loop traversals.
+- **`REP` node** — the single self-looping node an array collapses to; a haplotype's copy number (`CN`) is the number of self-loop traversals.
 
 ## How it works
 
@@ -39,7 +39,7 @@ bp   :  ..   60   60   8    60   60   ..
 1. Establish the unit period from a clean adjacent identical pair. Anchoring at step 1 (`U`), the smallest period with an adjacent identical block is 1 — step 1 equals step 2, both `U` — so the repeat unit is `U` and the unit length `= 60`.
 2. Extend the array by that period, tolerating short interruptions. Rightward: step 2 is another `U`; step 3 is `x`, a one-step/8 bp gap that is bridged because it stays within the interruption limits (`≤ unit_bp`); step 4 is `U` again, step 5 is `U`, and step 6 (`R`) ends the array. The copies are steps 1, 2, 4, 5 — the interruption is kept but not counted as a copy.
 3. Accept the array against the thresholds: 4 copies ≥ `--min-copies` (2), `unit_bp` 60 ≥ `--min-unit-bp` (50), and the 8 bp interruption ≤ `--max-interruption-frac` of the array span (`0.25 · 248 = 62`). All pass, so this array is eligible to fold (subject to the cohort-prevalence gate above).
-4. Collapse the copies onto one `REP` node with a self-loop and reroute the path through it once per copy, keeping the interruption as a literal step: the interior becomes `L REP REP x REP REP R` (REP traversed 4× total). Downstream `call --cn` reads the copy number straight off the `REP` self-loop count.
+4. Collapse the copies onto one `REP` node with a self-loop and reroute the path through it once per copy, keeping the interruption as a literal step: the interior becomes `L REP REP x REP REP R` (`REP` traversed 4× total). Downstream `call --cn` reads the copy number straight off the `REP` self-loop count.
 
 Resulting `panphorte.report.tsv` row:
 

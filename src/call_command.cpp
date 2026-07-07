@@ -231,27 +231,34 @@ int run_call_command(const std::vector<std::string>& args) {
         throw std::runtime_error("Input GFA has no P/W paths; variant calling requires paths");
     }
 
+    cli::RunLog log("call", options.quiet);
+    log.info("input " + gfa_path + " (" + std::to_string(graph.nodes.size()) + " nodes, " +
+             std::to_string(graph.paths.size()) + " paths); reference " + options.reference_path);
+
     VariantCallSummary summary;
     call_variants(graph, options, &summary);
 
-    std::cout
-        << "Input graph: " << gfa_path << "\n"
-        << "Bubble source: " << options.bubbles_csv_in << "\n"
-        << "Reference path: " << options.reference_path << "\n"
-        << "Nodes: " << graph.nodes.size() << "\n"
-        << "P/W paths loaded: " << graph.paths.size() << "\n"
-        << "Bubbles seen: " << summary.bubbles_seen << "\n"
-        << "Bubbles with reference: " << summary.bubbles_with_reference << "\n"
-        << "Bubbles with calls: " << summary.bubbles_with_calls << "\n"
-        << "VCF records: " << summary.records_written << "\n"
-        << "  DEL: " << summary.del << "  INS: " << summary.ins
-        << "  INV: " << summary.inv << "  DUP: " << summary.dup
-        << "  MULTI: " << summary.multi << "\n"
-        << "Region VCF: " << options.out_prefix << ".region.vcf\n";
-    if (options.write_per_bubble_vcf) {
-        std::cout << "Per-bubble VCFs: " << options.out_prefix << ".bubble_<id>.vcf\n";
-    }
+    log.info("called " + std::to_string(summary.records_written) + " records across " +
+             std::to_string(summary.bubbles_with_calls) + "/" + std::to_string(summary.bubbles_seen) +
+             " bubbles (DEL " + std::to_string(summary.del) + ", INS " + std::to_string(summary.ins) +
+             ", INV " + std::to_string(summary.inv) + ", DUP " + std::to_string(summary.dup) +
+             ", MULTI " + std::to_string(summary.multi) + ")");
 
+    std::vector<std::string> outputs;
+    outputs.push_back(options.out_prefix + ".region.vcf");
+    if (options.write_per_bubble_vcf) {
+        outputs.push_back(options.out_prefix + ".bubble_<id>.vcf");
+    }
+    if (options.write_variant_paths) {
+        outputs.push_back(options.out_prefix + ".variant_paths.tsv");
+    }
+    outputs.push_back(options.out_prefix + ".variant_nodes.tsv");
+    if (!options.gtf_path.empty()) {
+        outputs.push_back(options.out_prefix + ".node_genes.tsv");
+        outputs.push_back(options.out_prefix + ".dup_gene_cn.tsv");
+    }
+    log.wrote(outputs);
+    log.done();
     return 0;
 }
 

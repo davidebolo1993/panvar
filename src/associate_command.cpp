@@ -1,4 +1,5 @@
 #include "panvar/associate_command.hpp"
+#include "panvar/cli_utils.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -1002,21 +1003,18 @@ int run_associate_command(const std::vector<std::string>& args) {
         if (model == "lmm") out << "lmm_delta\t" << fmt(lmm.delta) << '\n';
     }
 
-    if (!opt.quiet) {
-        std::cerr << "[associate] model=" << model << " (" << (binary ? "binary" : "quantitative")
-                  << "), samples=" << n_used << ", covariates=" << ncov_eff
-                  << (opt.pca > 0 ? " (incl. " + std::to_string(opt.pca) + " PCs)" : "") << "\n"
-                  << "[associate] unit=" << (variant_mode ? "variant" : "feature")
-                  << " tested=" << n_tests << " Meff=" << meff << " dropped(maf)=" << n_dropped_maf
-                  << " dropped(fit)=" << n_dropped_fit << "\n"
-                  << "[associate] Bonferroni (0.05/Meff=" << meff << ") = " << fmt(bonf_threshold_meff)
-                  << "; significant: Bonferroni(Meff)=" << n_sig_meff << " FDR<0.05=" << n_sig_fdr << "\n"
-                  << "[associate] genomic inflation lambda_GC = " << fmt(lambda_gc) << "\n";
-        if (variant_mode)
-            std::cerr << "[associate] COJO (forward-stepwise conditional): "
-                      << cojo_n_signals << " jointly-independent signal(s)\n";
-        std::cerr << "[associate] wrote " << opt.out_prefix << ".assoc.tsv + .summary.tsv\n";
-    }
+    cli::RunLog log("associate", opt.quiet);
+    log.info("model " + model + " (" + (binary ? "binary" : "quantitative") + "), " +
+             std::to_string(n_used) + " samples, " + std::to_string(ncov_eff) + " covariates" +
+             (opt.pca > 0 ? " (incl. " + std::to_string(opt.pca) + " PCs)" : ""));
+    log.info("unit " + std::string(variant_mode ? "variant" : "feature") + "; tested " +
+             std::to_string(n_tests) + ", Meff " + std::to_string(meff) + ", dropped " +
+             std::to_string(n_dropped_maf) + " (MAF) + " + std::to_string(n_dropped_fit) + " (fit)");
+    log.info("significant: Bonferroni(Meff=" + std::to_string(meff) + ") " + std::to_string(n_sig_meff) +
+             ", FDR<0.05 " + std::to_string(n_sig_fdr) + "; genomic inflation lambda_GC=" + fmt(lambda_gc) +
+             (variant_mode ? "; COJO signals " + std::to_string(cojo_n_signals) : ""));
+    log.wrote({opt.out_prefix + ".assoc.tsv", opt.out_prefix + ".summary.tsv"});
+    log.done();
     return 0;
 }
 

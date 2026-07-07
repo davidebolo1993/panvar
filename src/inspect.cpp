@@ -696,10 +696,12 @@ int run_inspect_command(const std::vector<std::string>& args) {
     const bool single_bubble = bubble_id != 0;
 
     std::size_t total_paths_written = 0;
-    std::cout
-        << "Input graph: " << gfa_path << "\n"
-        << "Bubble source: " << bubbles_csv_path << "\n"
-        << "Bubbles inspected: " << selected_bubbles.size() << "\n";
+    cli::RunLog log("inspect", quiet);
+    log.info("input " + gfa_path + " (" + std::to_string(selected_bubbles.size()) +
+             (selected_bubbles.size() == 1 ? " bubble)" : " bubbles)"));
+
+    std::vector<std::string> single_outputs;
+    std::string single_info;
 
     cli::ProgressBar progress((single_bubble || quiet) ? "" : "Inspecting bubbles",
                               single_bubble ? 0 : selected_bubbles.size());
@@ -738,24 +740,29 @@ int run_inspect_command(const std::vector<std::string>& args) {
         progress.tick();
 
         if (single_bubble) {
-            std::cout
-                << "Bubble ID: " << bubble.id << "\n"
-                << "Source/sink: " << bubble.source << "/" << bubble.sink << "\n"
-                << "Inside nodes: " << bubble.inside.size() << "\n"
-                << "Paths written: " << result.paths_written << "\n"
-                << "Wrote: " << result.fasta_out_path << "\n"
-                << "Wrote: " << result.table_out_path << "\n"
-                << "Wrote: " << result.edge_table_out_path << "\n"
-                << "Wrote: " << result.node_lengths_out_path << "\n";
+            single_info = "bubble " + std::to_string(bubble.id) + " (source/sink " + bubble.source +
+                          "/" + bubble.sink + ", " + std::to_string(bubble.inside.size()) +
+                          " inside nodes, " + std::to_string(result.paths_written) + " paths" +
+                          (emit.cluster ? ", " + std::to_string(result.clusters_written) + " clusters" : "") +
+                          ")";
+            single_outputs = {result.fasta_out_path, result.table_out_path,
+                              result.edge_table_out_path, result.node_lengths_out_path};
             if (emit.cluster) {
-                std::cout << "Clusters: " << result.clusters_written << "\n"
-                          << "Wrote: " << result.clusters_out_path << "\n";
+                single_outputs.push_back(result.clusters_out_path);
             }
         }
     }
     progress.done();
 
-    std::cout << "Total paths written: " << total_paths_written << "\n";
+    if (single_bubble) {
+        log.info(single_info);
+        log.wrote(single_outputs);
+    } else {
+        log.info("inspected " + std::to_string(selected_bubbles.size()) + " bubbles; " +
+                 std::to_string(total_paths_written) + " paths written");
+        log.info("wrote per-bubble outputs under " + out_prefix + ".bubble_<id>.*");
+    }
+    log.done();
 
     return 0;
 }

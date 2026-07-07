@@ -38,7 +38,9 @@ int_breaks <- function(lim) {
 }
 
 # Build a faceted concordance plot from a subset of genes (per-facet r, square axes, y=x line).
-make_plot <- function(sub, ncol) {
+# ylab differs by plot: loci totals have the fitted paralog baseline removed; per-gene splits are
+# the resolved absolute copy number (offset 0), so nothing is subtracted.
+make_plot <- function(sub, ncol, ylab) {
   genes <- sort(unique(sub$gene))
   labs <- do.call(rbind, lapply(genes, function(g) {
     s <- sub[sub$gene == g, ]
@@ -67,8 +69,7 @@ make_plot <- function(sub, ncol) {
     scale_y_continuous(breaks = int_breaks, expand = expansion(mult = 0.02)) +
     scale_colour_manual(values = c(haplotype = "#2c7fb8", reference = "#d95f02"), name = NULL) +
     scale_size_manual(values = c(haplotype = 1.6, reference = 3.2), guide = "none") +
-    labs(x = "ground-truth copy number",
-         y = "panvar copy number (paralog baseline removed)") +
+    labs(x = "ground-truth copy number", y = ylab) +
     theme_bw(base_size = 12) +
     theme(legend.position = "top", panel.grid.minor = element_blank(), aspect.ratio = 1)
 }
@@ -80,17 +81,18 @@ genes <- d[d$gene %in% paralogs, ]
 
 # Plot 1: the four loci as total counts (c4, cyp2d6, gstm1, lpa) in a 2x2 grid.
 if (nrow(loci) > 0) {
-  p_loci <- make_plot(loci, ncol = 2)
+  p_loci <- make_plot(loci, ncol = 2, ylab = "panvar copy number (paralog baseline removed)")
   ggsave(paste0(out_prefix, ".loci.png"), p_loci, width = wnum(w_arg, 8), height = wnum(h_arg, 7), dpi = dpi)
   cat("Wrote:", paste0(out_prefix, ".loci.png"), "\n")
 } else {
   cat("(no locus-total rows; skipping .loci.png)\n")
 }
 
-# Plot 2: the resolved per-gene splits (C4A/C4B, CYP2D6/CYP2D7) in a 2x2 grid.
+# Plot 2: the resolved per-gene splits (C4A/C4B, CYP2D6/CYP2D7, GSTM1) as a 3-wide grid
+# (5 panels -> 2 rows x 3 cols, which reads better than 3 rows x 2).
 if (nrow(genes) > 0) {
-  p_genes <- make_plot(genes, ncol = 2)
-  ggsave(paste0(out_prefix, ".genes.png"), p_genes, width = wnum(w_arg, 8), height = wnum(h_arg, 7), dpi = dpi)
+  p_genes <- make_plot(genes, ncol = 3, ylab = "panvar per-gene copy number (resolved)")
+  ggsave(paste0(out_prefix, ".genes.png"), p_genes, width = wnum(w_arg, 11), height = wnum(h_arg, 7), dpi = dpi)
   cat("Wrote:", paste0(out_prefix, ".genes.png"), "\n")
 } else {
   cat("(no CYP2D6/CYP2D7 per-gene rows; skipping .genes.png)\n")

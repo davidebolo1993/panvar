@@ -163,28 +163,25 @@ int run_panphorte_command(const std::vector<std::string>& args) {
         throw std::runtime_error("--min-copies must be >= 2");
     }
 
+    cli::RunLog log("panphorte", options.quiet);
+    log.info("input " + options.gfa_path);
+
     PanphorteSummary summary;
     panphorte_normalize(options, &summary);
 
-    std::cout
-        << "Input graph: " << options.gfa_path << "\n"
-        << "Bubble source: " << options.bubbles_csv_in << "\n"
-        << "Report: " << options.out_prefix << ".panphorte.report.tsv\n"
-        << "Bubbles seen: " << summary.bubbles_seen << "\n"
-        << "Bubbles normalized: " << summary.bubbles_normalized << "\n"
-        << "Paths rewritten: " << summary.paths_rewritten << "\n"
-        << "Nodes removed: " << summary.nodes_removed << "\n"
-        << "Nodes added: " << summary.nodes_added << "\n"
-        << "Edges added: " << summary.edges_added << "\n";
+    log.info("normalized " + std::to_string(summary.bubbles_normalized) + "/" +
+             std::to_string(summary.bubbles_seen) + " bubbles (" +
+             std::to_string(summary.paths_rewritten) + " paths rewritten; +" +
+             std::to_string(summary.nodes_added) + " −" + std::to_string(summary.nodes_removed) +
+             " nodes, +" + std::to_string(summary.edges_added) + " edges)");
 
+    std::vector<std::string> outputs;
     if (summary.sorted) {
-        std::cout
-            << "Sorted GFA: " << options.out_prefix << ".normalized.sorted.gfa\n"
-            << "Bubbles CSV: " << options.out_prefix << ".bubbles.csv\n"
-            << "Bandage colors: " << options.out_prefix << ".bandage_nodes.csv\n"
-            << "Re-snarled bubbles: " << summary.resnarled_bubbles << "\n"
-            << "Ready for: panvar call -i " << options.out_prefix
-            << ".normalized.sorted.gfa --bubble-prefix-in " << options.out_prefix << "\n";
+        log.info("sorted along the reference; re-snarled " +
+                 std::to_string(summary.resnarled_bubbles) + " bubbles");
+        outputs.push_back(options.out_prefix + ".normalized.sorted.gfa");
+        outputs.push_back(options.out_prefix + ".bubbles.csv");
+        outputs.push_back(options.out_prefix + ".bandage_nodes.csv");
         // Gene annotation on the collapsed graph: node ids differ from the bubble graph, so this
         // Bandage CSV is distinct from the one bubble emits. Needs a PanSN --reference-path.
         if (!gtf_path.empty() && !options.reference_path.empty()) {
@@ -192,13 +189,16 @@ int run_panphorte_command(const std::vector<std::string>& args) {
             const std::string genes_csv = options.out_prefix + ".bandage_genes.csv";
             const Graph g = parse_gfa(sorted_gfa);
             if (emit_gene_annotation(g, options.reference_path, gtf_path, genes_csv)) {
-                std::cout << "Wrote: " << genes_csv << "\n";
+                outputs.push_back(genes_csv);
             }
         }
     } else {
-        std::cout << "Output GFA: " << options.out_prefix << ".normalized.gfa\n";
+        outputs.push_back(options.out_prefix + ".normalized.gfa");
     }
+    outputs.push_back(options.out_prefix + ".panphorte.report.tsv");
 
+    log.wrote(outputs);
+    log.done();
     return 0;
 }
 

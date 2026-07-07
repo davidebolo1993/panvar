@@ -43,6 +43,27 @@ private:
     bool finished_ = false;
 };
 
+// Consistent, timestamped run logging for the command layer. Every line goes to
+// stderr (so stdout stays free for any machine-readable output) as
+// `[module HH:MM:SS] message`. Honors --quiet (emits nothing when quiet). Construct
+// once per command; call info()/wrote() for events and done() for the closing line.
+class RunLog {
+public:
+    RunLog(std::string module, bool quiet);
+    // One timestamped event line.
+    void info(const std::string& message) const;
+    // "wrote: a, b, c" — the full set of output files, reported together.
+    void wrote(const std::vector<std::string>& paths) const;
+    // Closing line: "done in X.Ys" (wall time since construction).
+    void done() const;
+
+private:
+    void line(const std::string& message) const;
+    std::string module_;
+    bool quiet_ = false;
+    std::chrono::steady_clock::time_point start_;
+};
+
 std::string trim_ascii(const std::string& text);
 std::size_t parse_size_arg(const std::string& name, const std::string& value);
 double parse_similarity_arg(const std::string& name, const std::string& value);

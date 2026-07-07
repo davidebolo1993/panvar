@@ -4,7 +4,7 @@ CLI: `panvar inspect`
 
 ## What it does
 
-A sanity-check utility for one called bubble (or all of them) before going downstream. Given a `bubble` / `panphorte` GFA and its bubble CSV, it writes, per bubble:
+A sanity-check utility for one called bubble (or all of them) before going downstream. Given a `bubble` / `panphorte` GFA (Graphical Fragment Assembly) and its bubble CSV, it writes, per bubble:
 - a multi-FASTA of each crossing path's `source → sink` allele
 - a node-count matrix (how each path traverses the internal nodes, with orientation)
 - an edge-count matrix (adjacencies)
@@ -66,24 +66,4 @@ Node heatmap only: `--node-lengths <node_lengths.tsv>` (scale x by node length),
 
 ## Example
 
-```bash
-#inspect `bubble` output
-./build/panvar inspect \
-  -i results/real_data/lpa/bubble/bubble.sorted.gfa \
-  --bubble-prefix-in results/real_data/lpa/bubble/bubble \
-  --bubble-id 7 \
-  -o results/real_data/lpa/inspect_bubble/inspect \
-  --cluster \
-  --cluster-similarity 0.95
-
-#inspect `panphorte` output
-./build/panvar inspect \
-  -i results/real_data/lpa/panphorte/panphorte.normalized.sorted.gfa \
-  --bubble-prefix-in results/real_data/lpa/panphorte/panphorte \
-  --bubble-id 7 \
-  -o results/real_data/lpa/inspect_panphorte/inspect \
-  --cluster \
-  --cluster-similarity 0.97
-```
-
-Drop `--bubble-id` to inspect all bubbles.
+See the [LPA walkthrough](../walkthrough.md) for this module in a full end-to-end run.

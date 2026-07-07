@@ -262,30 +262,27 @@ int run_bubble_command(const std::vector<std::string>& args) {
         }
     }
 
-    std::cout
-        << "Input graph: " << gfa_path << '\n'
-        << "Site mode: " << site_mode << "\n"
-        << (options.snarls_input_path.empty()
-                ? ("Sorted graph: " + effective_gfa + "\n")
-                : ("Snarl input: " + options.snarls_input_path + "\n"))
-        << "Nodes: " << graph.nodes.size() << "\n"
-        << "P/W paths loaded: " << graph.paths.size()
-        << "\n"
-        << "Bubbles called: " << bubbles.size() << "\n"
-        << "Min variant bp: " << options.min_variant_bp << " (0 = disabled)\n"
-        << "Min path support: " << options.min_path_support << " (0 = disabled)\n"
-        << "Merge nearby bp: " << options.merge_nearby_bp << " (0 = disabled)\n"
-        << "Bubbles with >=min bp path: " << long_path_positive_count << "\n"
-        << "Bubbles kept by inversion signal: " << inversion_signal_count << "\n"
-        << "Non-SNP candidate bubbles (for Bandage context): " << report.non_snp_bubbles.size() << "\n"
-        << "Wrote: " << bubbles_csv_path << "\n"
-        << "Wrote: " << bandage_csv_path << "\n";
+    cli::RunLog log("bubble", options.quiet);
+    log.info("input " + gfa_path + " (" + std::to_string(graph.nodes.size()) + " nodes, " +
+             std::to_string(graph.paths.size()) + " paths; " + site_mode + ")");
+    log.info("found " + std::to_string(bubbles.size()) + " bubbles (" +
+             std::to_string(long_path_positive_count) + " ≥ min-bp, " +
+             std::to_string(inversion_signal_count) + " inversion-flagged)");
+
+    std::vector<std::string> outputs;
+    if (options.snarls_input_path.empty()) {
+        outputs.push_back(effective_gfa);
+    }
+    outputs.push_back(bubbles_csv_path);
+    outputs.push_back(bandage_csv_path);
     if (!bandage_genes_path.empty()) {
-        std::cout << "Wrote: " << bandage_genes_path << "\n";
+        outputs.push_back(bandage_genes_path);
     }
     if (!snarl_debug_tsv_path.empty()) {
-        std::cout << "Wrote: " << snarl_debug_tsv_path << "\n";
+        outputs.push_back(snarl_debug_tsv_path);
     }
+    log.wrote(outputs);
+    log.done();
 
     return 0;
 }

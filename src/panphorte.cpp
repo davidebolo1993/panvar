@@ -614,10 +614,11 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
             // as literal steps, so only the repeat copies lose within-copy detail.
             const std::string ref_unit =
                 pick_reference_unit(graph, node_tok, path_indexes, bubble, options);
-            if (!options.quiet) {
-                // One concise line per bubble (works in non-interactive logs too): what was
+            if (!options.quiet && ref_unit.size() >= options.min_unit_bp) {
+                // One concise line per SEEDED bubble (works in non-interactive logs too): what was
                 // seeded and how much alignment work it implies, printed BEFORE the expensive
-                // per-haplotype alignment so it is visible even if that phase is slow.
+                // per-haplotype alignment so it is visible even if that phase is slow. Bubbles with
+                // no foldable unit (sub-threshold seed) stay silent to keep the log concise.
                 std::cerr << "[bubble " << bubble.id << "] seeded unit_bp=" << ref_unit.size()
                           << "; aligning across " << graph.paths.size() << " haplotypes\n"
                           << std::flush;
