@@ -62,9 +62,9 @@ run_region() {
   # 6) plots (skipped if Rscript missing): whole-VCF variant map + per-bubble coverage heatmaps
   if have_r; then
     "$RS" "$HERE/plot_vcf_map.R" --vcf "$d/call/call.region.vcf" --reference-path "$ref" \
-      --title "$region variant map" --out "$d/plots/${region}_vcf_map" >/dev/null 2>&1 || echo "  (plot_vcf_map skipped)"
+      --out "$d/plots/${region}_vcf_map" >/dev/null 2>&1 || echo "  (plot_vcf_map skipped)"
     "$RS" "$HERE/plot_vcf_map.R" --vcf "$d/call/call.region.vcf" --reference-path "$ref" --flip --dpi 600 \
-      --title "$region variant map" --out "$d/plots/${region}_vcf_map_flipped" >/dev/null 2>&1 || echo "  (plot_vcf_map flipped skipped)"
+      --out "$d/plots/${region}_vcf_map_flipped" >/dev/null 2>&1 || echo "  (plot_vcf_map flipped skipped)"
     if [[ -n "${bub:-}" ]]; then
       local ip="$d/inspect/inspect.bubble_${bub}"
       local nc="$ip.node_counts.tsv" ec="$ip.edge_counts.tsv" nl="$ip.node_lengths.tsv" cl="$ip.clusters.tsv"
@@ -83,10 +83,10 @@ run_region() {
       # cluster-representative-only variant maps (both orientations): one row per walk cluster.
       if [[ -f "$cl_map" ]]; then
         "$RS" "$HERE/plot_vcf_map.R" --vcf "$d/call/call.region.vcf" --reference-path "$ref" \
-          --clusters "$cl_map" --title "$region variant map (cluster representatives)" \
+          --clusters "$cl_map" \
           --out "$d/plots/${region}_vcf_map_clustered" >/dev/null 2>&1 || echo "  (plot_vcf_map clustered skipped)"
         "$RS" "$HERE/plot_vcf_map.R" --vcf "$d/call/call.region.vcf" --reference-path "$ref" --flip \
-          --clusters "$cl_map" --title "$region variant map (cluster representatives)" \
+          --clusters "$cl_map" \
           --out "$d/plots/${region}_vcf_map_clustered_flipped" >/dev/null 2>&1 || echo "  (plot_vcf_map clustered flipped skipped)"
       fi
       if [[ -f "$nc" ]]; then

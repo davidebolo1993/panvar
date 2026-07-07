@@ -629,6 +629,9 @@ void call_variants(
     std::vector<BubblePathIndex> path_indexes;
     path_indexes.reserve(graph.paths.size());
     for (const PathRecord& p : graph.paths) path_indexes.push_back(build_bubble_path_index(p));
+    // name -> path index, for the per-sample FORMAT:CNBP walk-length lookup on DUP records.
+    std::unordered_map<std::string, std::size_t> name_to_pi;
+    for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) name_to_pi.emplace(graph.paths[pi].name, pi);
 
     const std::unordered_set<std::string> selfloops = self_loop_nodes(graph);
 
@@ -670,6 +673,7 @@ void call_variants(
         out << "##ALT=<ID=DUP,Description=\"Copy-number / tandem duplication locus\">\n";
         out << "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"1=carrier, 0=reference-like, .=bubble not traversed\">\n";
         out << "##FORMAT=<ID=CN,Number=1,Type=Integer,Description=\"Copy number of the repeat unit (DUP records)\">\n";
+        out << "##FORMAT=<ID=CNBP,Number=1,Type=Integer,Description=\"Actual linear bp gained(+)/lost(-) by this haplotype across the copy-number module vs the reference, from the spelled walk length (sum of node length x traversal multiplicity over the bubble source->sink, minus the reference's). Recovers the linear SV size that the folded one-copy RU_LEN does not convey; DUP records only.\">\n";
         out << "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT";
         for (const std::string& s : sample_names) out << '\t' << s;
         out << '\n';
@@ -1664,17 +1668,48 @@ void call_variants(
                 else if (e.type == EvType::Inv) info << ";INVSEQ=" << e.seq;
             }
 
+            // FORMAT:CNBP (DUP only) -- the actual linear bp a haplotype gains/loses through this
+            // copy-number module: spelled walk length (node length x traversal multiplicity) minus the
+            // reference's. Unlike RU_LEN (one folded copy) this recovers the real SV size, because the
+            // collapse shares node storage but each haplotype's walk still traverses shared nodes its
+            // own number of times. Uses the WIDEST source..sink span (all repeat traversals), not the
+            // repeat-collapsed `alleles`/bubble_steps span, so the multiplicity that IS the copy number
+            // is spelled out rather than folded to one.
+            const bool is_dup = (e.type == EvType::Dup);
+            const std::unordered_set<std::string> cnbp_inside(bubble.inside.begin(), bubble.inside.end());
+            auto cnbp_walk_bp = [&](std::size_t pi) -> long long {
+                const auto& idx = path_indexes[pi].positions;
+                const auto s_it = idx.find(bubble.source);
+                const auto k_it = idx.find(bubble.sink);
+                if (s_it == idx.end() || k_it == idx.end()) return 0;
+                const std::size_t s0 = s_it->second.front(), s1 = s_it->second.back();
+                const std::size_t k0 = k_it->second.front(), k1 = k_it->second.back();
+                const std::size_t lo = (s0 <= k1) ? s0 : k0;
+                const std::size_t hi = (s0 <= k1) ? k1 : s1;
+                const std::vector<PathStep>& steps = graph.paths[pi].steps;
+                long long bp = 0;
+                for (std::size_t i = lo; i <= hi && i < steps.size(); ++i)
+                    if (cnbp_inside.count(steps[i].node_id)) bp += static_cast<long long>(node_len(graph, steps[i].node_id));
+                return bp;
+            };
+            const long long cnbp_ref_bp = (is_dup && ref_idx < graph.paths.size()) ? cnbp_walk_bp(ref_idx) : 0;
+            auto sample_cnbp = [&](const std::string& s) -> long long {
+                const auto pit = name_to_pi.find(s);
+                return pit == name_to_pi.end() ? 0 : cnbp_walk_bp(pit->second) - cnbp_ref_bp;
+            };
+
             std::ostringstream row;
             row << ref_meta.chrom << '\t' << pos << '\t' << id << '\t' << ref_base
-                << "\t<" << svt << ">\t.\t.\t" << info.str() << "\tGT:CN";
+                << "\t<" << svt << ">\t.\t.\t" << info.str() << (is_dup ? "\tGT:CN:CNBP" : "\tGT:CN");
             for (const std::string& s : sample_names) {
                 row << '\t';
-                if (!traverses.count(s)) { row << ".:."; continue; }
+                if (!traverses.count(s)) { row << (is_dup ? ".:.:." : ".:."); continue; }
                 const bool carrier = carrier_set.count(s) != 0;
                 row << (carrier ? "1" : "0") << ':';
-                if (e.type == EvType::Dup) {
+                if (is_dup) {
                     const auto cit = mr.sample_cn.find(s);
                     row << (cit != mr.sample_cn.end() ? std::to_string(cit->second) : std::to_string(e.ref_cn));
+                    row << ':' << sample_cnbp(s);
                 } else {
                     row << '.';
                 }

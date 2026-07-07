@@ -1,10 +1,10 @@
 # Module `call` - algorithm
 
-Mechanism and a hand-traced example for the `call` module. For usage/flags see [modules/call.md](../modules/call.md); References in [references.md](../references.md#call).
+Mechanism for the `call` module. For usage/flags see [modules/call.md](../modules/call.md); References in [references.md](../references.md#call).
 
 ## Terms
 
-- **anchor** — a node token unique in *both* the reference walk and a haplotype walk; a monotonic subsequence of anchors aligns the two walks, and only the segments between anchors are aligned.
+- **anchor** — a node token unique in both the reference walk and a haplotype walk; a monotonic subsequence of anchors aligns the two walks, and only the segments between anchors are aligned.
 - **gap block** — a maximal stretch between two anchors where reference and haplotype differ; each becomes one typed event (DEL/INS/INV/substitution).
 - **full walk** — the widest `source→sink` span with every repeated traversal counted (a node visited twice contributes its length twice); contrast the **minimal-span** walk that visits each distinct node once.
 - **peak multiplicity** — the visit count of a haplotype's single busiest node in the bubble.

@@ -11,7 +11,6 @@
 #   --cluster-by <path>   inspect <...>.clusters.tsv: keep all rows but group/order them by cluster
 #   --reference-path <s>  pin this haplotype (substring match) as the top (or leftmost, if --flip) row
 #   --max-paths <N>       keep at most N haplotype rows (those carrying the most events)
-#   --title <str>         plot title (optional)
 #   --flip                transpose: variants on Y, haplotypes on X (legend moves to the bottom)
 #   --scale               scale each variant's rectangle along the variant axis by its size
 #                         (|SVLEN| for DEL/INS/INV/multiallelic; RU_LEN repeat-unit bp for DUP)
@@ -38,7 +37,6 @@ usage <- function(status = 0) {
     "  --cluster-by <path>      inspect <...>.clusters.tsv: keep all rows but group/order them by cluster",
     "  --reference-path <s>     pin this haplotype (substring match) as the top/leftmost row",
     "  --max-paths <N>          keep at most N haplotype rows (by number of events carried)",
-    "  --title <str>            plot title",
     "  --flip                   transpose: variants on Y, haplotypes on X (legend at bottom)",
     "  --scale                  scale each variant rectangle by its size (SVLEN; RU_LEN for DUP)",
     "  --scale-transform <t>    raw | sqrt | log1p scaling for --scale (default sqrt)",
@@ -49,7 +47,7 @@ usage <- function(status = 0) {
 }
 if (length(args) == 0 || any(args %in% c("-h", "--help"))) usage(0)
 opts <- list(vcf = NULL, out = NULL, clusters = NULL, cluster_by = NULL,
-             reference_path = NULL, max_paths = 0, title = NULL,
+             reference_path = NULL, max_paths = 0,
              flip = FALSE, scale = FALSE, scale_transform = "sqrt",
              width = NA_real_, height = NA_real_, dpi = 300)
 i <- 1
@@ -61,7 +59,6 @@ while (i <= length(args)) {
   else if (a == "--cluster-by") { opts$cluster_by <- val(); i <- i + 2 }
   else if (a == "--reference-path") { opts$reference_path <- val(); i <- i + 2 }
   else if (a == "--max-paths") { opts$max_paths <- as.integer(val()); i <- i + 2 }
-  else if (a == "--title") { opts$title <- val(); i <- i + 2 }
   else if (a == "--flip") { opts$flip <- TRUE; i <- i + 1 }
   else if (a == "--scale") { opts$scale <- TRUE; i <- i + 1 }
   else if (a == "--scale-transform") { opts$scale_transform <- val(); i <- i + 2 }
@@ -97,7 +94,8 @@ for (ln in recs) {
   if (is.na(svt)) svt <- if (!is.na(info_get(info, "NALLELES"))) "MULTI" else "."
   bid <- suppressWarnings(as.integer(info_get(info, "BUBBLE_ID")))
   gt <- sub(":.*$", "", f[-(1:9)])
-  cn <- suppressWarnings(as.integer(sub("^[^:]*:", "", f[-(1:9)])))
+  # CN is the 2nd FORMAT field (GT:CN[:CNBP...]); capture only it, not any trailing fields.
+  cn <- suppressWarnings(as.integer(sub("^[^:]*:([^:]*).*$", "\\1", f[-(1:9)])))
   # --scale size: |SVLEN|, or RU_LEN for a DUP so high-copy DUPs aren't drawn huge by their CN
   svlen <- suppressWarnings(abs(as.numeric(info_get(info, "SVLEN"))))
   ru <- suppressWarnings(as.numeric(info_get(info, "RU_LEN")))
@@ -245,7 +243,7 @@ ht <- sparse(n_paths, 50)                            # sparse haplotype ticks
 hap_pos <- if (!opts$flip) n_paths - ht + 1 else ht
 out_dir <- dirname(opts$out); if (!identical(out_dir, ".") && !dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
 var_axis_lab <- sprintf("Called variant (grouped by bubble%s)", if (opts$scale) sprintf("; %s width = bp", opts$scale_transform) else "")
-title <- if (!is.null(opts$title)) opts$title else "Variant map (haplotypes x called variants)"
+title <- "Variant map (haplotypes x called variants)"
 
 p <- ggplot2::ggplot(G) +
   ggplot2::geom_rect(ggplot2::aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = fill),
