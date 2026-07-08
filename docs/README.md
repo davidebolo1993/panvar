@@ -4,10 +4,10 @@ Documentation for the `panvar` CLI, organized into three subfolders plus a share
 
 | folder / file | what's in it |
 |---------------|--------------|
-| **[modules/](modules/)** | one short usage page per module: what it does, inputs, key options, outputs. Start here to *run* a module. |
-| **[algorithms/](algorithms/)** | the matching worked traces for each module. Read these to understand how a result is computed |
-| **[walkthrough.md](walkthrough.md)** | the whole pipeline on one real locus (**LPA**), step by step with commands and plots. Start here to see it all work end-to-end. |
-| **[gwas/](gwas/)** | the association (GWAS) worked example on the LPA output: a simulated Lp(a) phenotype, multiple-testing corrections, structure control |
+| **[modules/](modules/)** | one short usage page per module: what it does, inputs, key options, outputs. |
+| **[algorithms/](algorithms/)** | the matching worked traces for each module.|
+| **[walkthrough.md](walkthrough.md)** | the whole pipeline on one real locus (**LPA**), step by step with commands and plots. |
+| **[gwas/](gwas/)** | the association (GWAS) worked example on the LPA output: a simulated Lp(a) phenotype, multiple-testing corrections, structure control. |
 | **[references.md](references.md)** | tools and papers behind each module. |
 
 ## Pipeline
