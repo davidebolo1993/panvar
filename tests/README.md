@@ -2,8 +2,8 @@
 
 Test data, smoke tests, and the GWAS demo/validation drivers for `panvar`. The build registers one fast test
 with CTest (`synthetic_smoke.sh`); everything else is run manually. Together the scripts exercise all six
-subcommands (`bubble`, `panphorte`, `call`, `describe`, `inspect`, `associate`) — see the coverage table at
-the end.
+subcommands (`bubble`, `panphorte`, `call`, `describe`, `inspect`, `benchmark`, `associate`) — see the
+coverage table at the end.
 
 ## Data
 
@@ -27,8 +27,9 @@ Outputs go to an output directory you pass on the command line (e.g. `/tmp/...` 
 - `synthetic_smoke.sh` — fast, dependency-free; runs `bubble` + `call` on the synthetic graphs and asserts
   every `call` event type (DEL/INS/INV/DUP, substitution, and the flip case) against exact records.
   Registered with CTest.
-- `real_smoke.sh` — fuller integration run of `bubble -> inspect -> describe -> panphorte -> call` on a real
-  locus; checks the main handoff files plus the compressed inspect/describe outputs. Not in CTest (slower).
+- `real_smoke.sh` — fuller integration run of `bubble -> inspect -> describe -> panphorte -> call -> benchmark`
+  on a real locus; checks the main handoff files plus the compressed inspect/describe outputs and the
+  benchmark QV tables. Not in CTest (slower).
 
 ```bash
 ctest --test-dir build --output-on-failure                          # runs synthetic_smoke
@@ -71,4 +72,5 @@ bash tests/gwas/validate_gemma.sh ./build/panvar /tmp/gemma_check python3 gemma
 | `call`      | ✓ | ✓ | ✓ |   |
 | `describe`  |   | ✓ | ✓ |   |
 | `inspect`   |   | ✓ |   |   |
+| `benchmark` |   | ✓ |   |   |
 | `associate` |   |   | ✓ | ✓ |

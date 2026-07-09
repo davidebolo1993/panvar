@@ -70,6 +70,11 @@ test -s "$NORM_GFA"
 "$PANVAR_BIN" call -i "$NORM_GFA" --bubble-prefix-in "$PANPHORTE_PREFIX" \
   --reference-path "$REF_PATH" -o "$CALL_PREFIX" --cn --quiet
 
+# 6) benchmark: round-trip QV of the calls (uses call's variant_nodes.tsv + the panphorte graph)
+BENCH_PREFIX="$OUT_DIR/benchmark"
+"$PANVAR_BIN" benchmark -i "$NORM_GFA" --bubble-prefix-in "$PANPHORTE_PREFIX" \
+  --reference-path "$REF_PATH" --variant-nodes "$CALL_PREFIX.variant_nodes.tsv" -o "$BENCH_PREFIX" --quiet
+
 # ---- assertions ----
 test -s "$BUBBLE_PREFIX.bubbles.csv"
 if [[ -n "${FIRST_BUBBLE_ID:-}" ]]; then
@@ -90,6 +95,12 @@ test -s "$PANPHORTE_PREFIX.normalized.sorted.gfa"   # reference given -> sorted 
 test -s "$PANPHORTE_PREFIX.panphorte.report.tsv"
 test -s "$CALL_PREFIX.region.vcf"
 test -s "$CALL_PREFIX.variant_nodes.tsv"   # the describe --variant-nodes and benchmark handoff
+test -s "$BENCH_PREFIX.qv.tsv"
+test -s "$BENCH_PREFIX.qv_by_haplotype.tsv"
+test -s "$BENCH_PREFIX.qv_summary.tsv"
+# the summary must carry the length-fair quintile block (5 bands) and per-haplotype QV rows
+awk -F '\t' '$1=="quintile" { n++ } END { exit(n >= 5 ? 0 : 1) }' "$BENCH_PREFIX.qv_summary.tsv"
+awk -F '\t' 'NR>1 { r++ } END { exit(r >= 1 ? 0 : 1) }' "$BENCH_PREFIX.qv_by_haplotype.tsv"
 
 # The region VCF must be coordinate-sorted (POS non-decreasing) and have unique IDs.
 awk -F '\t' '!/^#/ { if ($2 < prev) { print "VCF not sorted at " $2 " < " prev > "/dev/stderr"; exit 1 } prev=$2 }' \
