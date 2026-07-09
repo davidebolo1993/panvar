@@ -182,7 +182,7 @@ Every haplotype across every locus reconstructs at >99.9% identity. On LPA, the 
 
 ## Not just LPA — the other duplicated loci
 
-The same pipeline is validated on C4 (C4A/C4B), GSTM1 (GSTM1/2/5), and CYP2D6 (CYP2D6/2D7/2D8P). `scripts/regen_results.sh` runs all of them and checks copy number against the pangene ground truth:
+The same pipeline is validated on C4 (C4A/C4B), GSTM1 (GSTM1/2/5), CYP2D6 (CYP2D6/2D7/2D8P), and ACOT (ACOT1/ACOT2 on chr14). `scripts/regen_results.sh` runs all of them and checks copy number against the pangene ground truth:
 
 ```bash
 scripts/regen_results.sh              # all loci + validation + plots
@@ -199,4 +199,4 @@ Per-gene split for the paralog clusters:
 
 ![Per-gene CN correlation](img/cn_correlation_genes.png)
 
-Every point on the diagonal is an exactly-correct call. Locus totals are exact (LPA 465/465, C4 131/131, GSTM1 159/159); the per-gene splits land C4A/C4B at 96.2%, CYP2D6 99.2%, CYP2D7 100%, and the whole GSTM cluster (GSTM1, GSTM2, GSTM4, GSTM5) at 466/466 each — the off-diagonal C4/CYP handful are gene-conversion mosaics and unannotated pseudogene/hybrid modules. GSTM3 is stable single-copy and sits outside the folded module, so it is not resolved.
+Every point on the diagonal is an exactly-correct call. Locus totals are exact (LPA 465/465, C4 131/131, GSTM1 159/159, ACOT 467/467); the per-gene splits land C4A/C4B at 96.2%, CYP2D6 99.2%, CYP2D7 100%, the whole GSTM cluster (GSTM1, GSTM2, GSTM4, GSTM5) at 466/466 each, and ACOT1/ACOT2 at 99.6% (100% within ±1) — the off-diagonal C4/CYP/ACOT handful are gene-conversion mosaics and unannotated pseudogene/hybrid modules. Stable single-copy genes outside the folded module (GSTM3, ACOT4, ACOT6) have nothing to resolve, so they are not split out.

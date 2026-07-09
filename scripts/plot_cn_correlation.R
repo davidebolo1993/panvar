@@ -45,11 +45,12 @@ make_plot <- function(sub, ncol, ylab) {
   labs <- do.call(rbind, lapply(genes, function(g) {
     s <- sub[sub$gene == g, ]
     r <- suppressWarnings(tryCatch(cor(s$truth_cn, s$gene_cn), error = function(e) NA))
-    # exact-match %: stays meaningful when truth is constant (CYP2D7=1), where Pearson r is undefined
+    # exact-match %: stays meaningful when truth is constant (CYP2D7=1), where Pearson r is undefined.
+    # 1 decimal so a near-perfect split (e.g. 465/467 = 99.6%) is not rounded up to a misleading "100%".
     match <- mean(round(s$gene_cn) == s$truth_cn) * 100
     rlab <- if (is.na(r)) "r = n/a (truth constant)" else sprintf("r = %.3f", r)
     data.frame(gene = g,
-               label = sprintf("%s\nmatch = %.0f%%\nn = %d", rlab, match, nrow(s)),
+               label = sprintf("%s\nmatch = %.1f%%\nn = %d", rlab, match, nrow(s)),
                stringsAsFactors = FALSE)
   }))
   # per-gene shared range so each panel is exactly square (invisible anchors define both free axes).
@@ -75,7 +76,7 @@ make_plot <- function(sub, ncol, ylab) {
 }
 
 # Split by label case: per-gene split rows are the upper-case gene names; everything else is a locus total.
-paralogs <- c("C4A", "C4B", "CYP2D6", "CYP2D7", "GSTM1", "GSTM2", "GSTM4", "GSTM5")
+paralogs <- c("C4A", "C4B", "CYP2D6", "CYP2D7", "GSTM1", "GSTM2", "GSTM4", "GSTM5", "ACOT1", "ACOT2")
 loci <- d[!(d$gene %in% paralogs), ]
 genes <- d[d$gene %in% paralogs, ]
 

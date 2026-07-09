@@ -118,7 +118,7 @@ validate_cn() {  # <region> <compare args...>
     || echo "  (validation could not run)"
 }
 
-REGIONS=("$@"); [[ ${#REGIONS[@]} -eq 0 ]] && REGIONS=(lpa c4 gstm1 cyp2d6 synthetic)
+REGIONS=("$@"); [[ ${#REGIONS[@]} -eq 0 ]] && REGIONS=(lpa c4 gstm1 cyp2d6 acot synthetic)
 mkdir -p "$REPO/results"; rm -f "$CN_TABLE"
 
 for region in "${REGIONS[@]}"; do
@@ -177,6 +177,22 @@ for region in "${REGIONS[@]}"; do
           echo "---- cyp2d6 $g per-gene split vs ground truth ----"
           "$PY" "$HERE/compare_copy_number.py" --mode per-gene --truth "$DATA/cyp2d6.bed" --genes "$g" \
             --dup-gene-cn "$OUT/cyp2d6/call/call.dup_gene_cn.tsv" --label "$g" --offset 0 \
+            --dump-tsv "$CN_TABLE" || echo "  (per-gene $g compare skipped)"
+        done
+      fi
+      ;;
+    acot)
+      # chr14 ACOT paralog cluster: panphorte folds ACOT1/ACOT2 into one ~14.5 kb RU. Total module CN vs
+      # the ACOT1+ACOT2 gene count is exact, and the private-k-mer split (--gtf) resolves the two variable
+      # paralogs -- ACOT1 (a common presence/null, 0-3 copies) and ACOT2 (mostly single). ACOT4/ACOT6 are
+      # stable single-copy outside the folded module (like GSTM3), so they are not resolved.
+      run_region acot "$DATA/acot.gfa.gz" "--min-similarity 0.70" panphorte "--cn"
+      validate_cn acot --mode gene-count --truth "$DATA/acot.bed" --genes ACOT1,ACOT2
+      if [[ -s "$OUT/acot/call/call.dup_gene_cn.tsv" ]]; then
+        for g in ACOT1 ACOT2; do
+          echo "---- acot $g per-gene split vs ground truth ----"
+          "$PY" "$HERE/compare_copy_number.py" --mode per-gene --truth "$DATA/acot.bed" --genes "$g" \
+            --dup-gene-cn "$OUT/acot/call/call.dup_gene_cn.tsv" --label "$g" --offset 0 \
             --dump-tsv "$CN_TABLE" || echo "  (per-gene $g compare skipped)"
         done
       fi
