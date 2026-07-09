@@ -89,8 +89,7 @@ fi
 test -s "$PANPHORTE_PREFIX.normalized.sorted.gfa"   # reference given -> sorted graph (no plain .normalized.gfa)
 test -s "$PANPHORTE_PREFIX.panphorte.report.tsv"
 test -s "$CALL_PREFIX.region.vcf"
-test -s "$CALL_PREFIX.variant_paths.tsv"
-test -s "$CALL_PREFIX.variant_nodes.tsv"   # the describe --variant-nodes handoff
+test -s "$CALL_PREFIX.variant_nodes.tsv"   # the describe --variant-nodes and benchmark handoff
 
 # The region VCF must be coordinate-sorted (POS non-decreasing) and have unique IDs.
 awk -F '\t' '!/^#/ { if ($2 < prev) { print "VCF not sorted at " $2 " < " prev > "/dev/stderr"; exit 1 } prev=$2 }' \

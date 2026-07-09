@@ -159,6 +159,27 @@ Association (`phenotype ~ genotype`, multiple-testing correction, conditional in
 
 ---
 
+## 8. `benchmark` — round-trip QV of the calls
+
+How faithfully do the calls reconstruct the haplotypes? For each called bubble and each haplotype, `benchmark` rebuilds the haplotype from the reference walk with*only the called events applied (which nodes each call explains comes from `variant_nodes.tsv`), aligns that to the haplotype's true graph walk, and scores a cosigt-style `QV = -10·log10(max(0.5, δ)/S)`. Uncalled variation (SNPs, sub-50 bp indels) is exactly what keeps it short of perfect. 
+
+```bash
+./build/panvar benchmark \
+  -i "$OUT/panphorte/panphorte.normalized.sorted.gfa" \
+  --bubble-prefix-in "$OUT/panphorte/panphorte" \
+  --reference-path "$REF" \
+  --variant-nodes "$OUT/call/call.variant_nodes.tsv" \
+  -o "$OUT/call/benchmark"
+```
+
+Because a perfect reconstruction of a short region can't reach a high absolute QV, the length-fair headline is per-haplotype reconstruction identity (`1 − Σδ/ΣS`). `scripts/plot_benchmark_qv.R --category dist` draws it per locus, on a "nines" axis:
+
+![Round-trip reconstruction identity](img/benchmark_qv_dist.png)
+
+Every haplotype across every locus reconstructs at >99.9% identity. On LPA, the copy number lands exactly (the DUP module scores δ=0), so the residual is small sub-threshold variation — e.g. a ~32 bp insertion at one bubble that sits just under `--min-sv-bp=50`. CYP2D6 is near-perfect; GSTM1 sits lowest (its paralog stack is dense with small paralogous sequence variants) but is still >99.9%. This confirms the calls round-trip the haplotypes.
+
+---
+
 ## Not just LPA — the other duplicated loci
 
 The same pipeline is validated on C4 (C4A/C4B), GSTM1 (GSTM1/2/5), and CYP2D6 (CYP2D6/2D7/2D8P). `scripts/regen_results.sh` runs all of them and checks copy number against the pangene ground truth:
