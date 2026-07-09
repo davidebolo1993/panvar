@@ -1490,17 +1490,21 @@ void call_variants(
             const std::string start_node = ev_nodes.empty() ? e.start_node : ev_nodes.front();
             const std::string end_node = ev_nodes.empty() ? e.end_node : ev_nodes.back();
 
-            // The describe handoff (variant_nodes.tsv) needs every node any carrier traverses for
-            // this event, so each carrier's own allele sequence is sketched (not just the
-            // representative's). Use the union of all merged member events' nodes, ordered like
-            // ev_nodes; DUP records carry only the single REP node, so fall back to ev_nodes.
+            // The describe handoff (variant_nodes.tsv) needs every node any carrier traverses for this
+            // event, so each carrier's own allele sequence is sketched (not just the representative's).
+            // Use the union of all merged member events' nodes together with the representative ev_nodes,
+            // so the VCF EVENT_NODES is always a subset of variant_nodes -- a coverage DUP folds the whole
+            // module's inside nodes into member_nodes, and its POS anchor would otherwise be missing when
+            // that anchor is a bubble boundary node. A self-loop DUP has empty member_nodes -> ev_nodes.
             std::vector<std::string> var_nodes;
             if (mr.member_nodes.empty()) {
                 var_nodes = ev_nodes;
             } else {
+                std::set<std::string> all(mr.member_nodes.begin(), mr.member_nodes.end());
+                all.insert(ev_nodes.begin(), ev_nodes.end());
                 std::vector<std::pair<long long, std::string>> keyed;
                 long long tail = 1LL << 60;
-                for (const std::string& nd : mr.member_nodes) {
+                for (const std::string& nd : all) {
                     const auto it = ref_node_pos.find(nd);
                     const long long key = it != ref_node_pos.end()
                         ? static_cast<long long>(it->second)
