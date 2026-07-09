@@ -50,6 +50,12 @@ run_region() {
   # 4) describe (variant-restricted markers)
   "$BIN" describe -i "$cgfa" --bubble-prefix-in "$cpfx" --out-dir "$d/describe" \
     --variant-nodes "$d/call/call.variant_nodes.tsv" --no-wide-matrix --threads "$THREADS" --quiet || return 1
+  # 4b) benchmark: round-trip QV of the calls (cosigt-style bands), if variant nodes were written
+  if [[ -s "$d/call/call.variant_nodes.tsv" ]]; then
+    "$BIN" benchmark -i "$cgfa" --bubble-prefix-in "$cpfx" --reference-path "$ref" \
+      --variant-nodes "$d/call/call.variant_nodes.tsv" -o "$d/call/benchmark" \
+      --threads "$THREADS" --quiet || echo "  (benchmark skipped)"
+  fi
   # 5) inspect the largest-DUP bubble (the CN module) on the call graph, with walk clustering
   local bub; bub="$(awk -F'\t' '/SVTYPE=DUP/{
       sv=$8; sub(/.*SVLEN=/,"",sv); sub(/;.*/,"",sv); if(sv<0)sv=-sv;
@@ -146,13 +152,15 @@ for region in "${REGIONS[@]}"; do
       # validated against the GSTM1 count after the paralog baseline. Called on the panphorte graph.
       run_region gstm1 "$DATA/gstm1.gfa.gz" "--min-similarity 0.70" panphorte "--cn"
       validate_cn gstm1 --mode direct --truth "$DATA/gstm1.bed"
-      # Per-gene GSTM1 from the private-k-mer split (--gtf), vs the present/null truth (absolute, offset 0).
-      # This checks the GSTM1-vs-GSTM2 discrimination directly, not the module total minus a fitted offset.
+      # Per-gene split (--gtf) vs the full pangene truth (gstm.bed, per-molecule gene counts), absolute
+      # (offset 0). We resolve GSTM1/2/4/5; GSTM3 is stable single-copy outside the module, so not scored.
       if [[ -s "$OUT/gstm1/call/call.dup_gene_cn.tsv" ]]; then
-        echo "---- gstm1 GSTM1 per-gene split vs ground truth ----"
-        "$PY" "$HERE/compare_copy_number.py" --mode per-gene --truth "$DATA/gstm1.bed" --genes GSTM1 \
-          --dup-gene-cn "$OUT/gstm1/call/call.dup_gene_cn.tsv" --label GSTM1 --offset 0 \
-          --dump-tsv "$CN_TABLE" || echo "  (per-gene GSTM1 compare skipped)"
+        for g in GSTM1 GSTM2 GSTM4 GSTM5; do
+          echo "---- gstm1 $g per-gene split vs ground truth ----"
+          "$PY" "$HERE/compare_copy_number.py" --mode per-gene --truth "$DATA/gstm.bed" --genes "$g" \
+            --dup-gene-cn "$OUT/gstm1/call/call.dup_gene_cn.tsv" --label "$g" --offset 0 \
+            --dump-tsv "$CN_TABLE" || echo "  (per-gene $g compare skipped)"
+        done
       fi
       ;;
     cyp2d6)
@@ -189,5 +197,19 @@ if [[ -s "$CN_TABLE" ]] && have_r; then
     || echo "  (cn_correlation plot skipped)"
 elif [[ -s "$CN_TABLE" ]]; then
   echo "  (R not found; skipping cn_correlation plot; table at $CN_TABLE)"
+fi
+
+# Round-trip QV summary: combine each locus's per-haplotype benchmark, then a cosigt-style stacked bar.
+QV_TABLE="$REPO/results/benchmark_qv.tsv"
+printf 'locus\tsample\tsum_delta\tsum_aln_len\tqv\tband\tqv_ratio\tquintile\tidentity\n' > "$QV_TABLE"
+for region in "${REGIONS[@]}"; do
+  bh="$OUT/$region/call/benchmark.qv_by_haplotype.tsv"
+  [[ -s "$bh" ]] && awk -F'\t' -v L="$region" 'NR>1{print L"\t"$1"\t"$3"\t"$4"\t"$5"\t"$6"\t"$8"\t"$9"\t"$10}' "$bh" >> "$QV_TABLE"
+done
+if [[ $(wc -l < "$QV_TABLE") -gt 1 ]] && have_r; then
+  for cat in dist quintile band identity; do
+    "$RS" "$HERE/plot_benchmark_qv.R" --table "$QV_TABLE" --out "$REPO/results/benchmark_qv" --category "$cat" \
+      || echo "  (benchmark_qv $cat plot skipped)"
+  done
 fi
 echo "ALL DONE -> $REPO/results"

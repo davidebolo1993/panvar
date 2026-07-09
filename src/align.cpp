@@ -56,4 +56,28 @@ FitAlignResult fit_align(const std::string& query, const std::string& target, st
     return out;
 }
 
+// Global align both sequences end-to-end; TASK_PATH so alignmentLength (the number of
+// alignment columns, S) is populated alongside editDistance (delta).
+NwAlign nw_edit_distance(const std::string& a, const std::string& b) {
+    NwAlign out;
+    if (a.empty() && b.empty()) return out;
+    if (a.empty()) { out.edits = b.size(); out.aln_len = b.size(); return out; }
+    if (b.empty()) { out.edits = a.size(); out.aln_len = a.size(); return out; }
+
+    const EdlibAlignConfig cfg = edlibNewAlignConfig(-1, EDLIB_MODE_NW, EDLIB_TASK_PATH, nullptr, 0);
+    EdlibAlignResult res = edlibAlign(a.data(), static_cast<int>(a.size()),
+                                      b.data(), static_cast<int>(b.size()), cfg);
+    if (res.status != EDLIB_STATUS_OK || res.editDistance < 0) {
+        // Should not happen for NW without a band; fall back to the length envelope.
+        edlibFreeAlignResult(res);
+        out.edits = std::max(a.size(), b.size());
+        out.aln_len = std::max(a.size(), b.size());
+        return out;
+    }
+    out.edits = static_cast<std::size_t>(res.editDistance);
+    out.aln_len = static_cast<std::size_t>(res.alignmentLength);
+    edlibFreeAlignResult(res);
+    return out;
+}
+
 } // namespace panvar

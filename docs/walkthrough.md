@@ -178,4 +178,4 @@ Per-gene split for the paralog clusters:
 
 ![Per-gene CN correlation](img/cn_correlation_genes.png)
 
-Every point on the diagonal is an exactly-correct call. Locus totals are exact (LPA 465/465, C4 131/131, GSTM1 159/159); the per-gene splits land C4A/C4B at 96.2%, CYP2D6 99.2%, CYP2D7 100%, GSTM1 159/159 — the off-diagonal handful are possibly gene-conversion mosaics and unannotated pseudogene/hybrid modules.
+Every point on the diagonal is an exactly-correct call. Locus totals are exact (LPA 465/465, C4 131/131, GSTM1 159/159); the per-gene splits land C4A/C4B at 96.2%, CYP2D6 99.2%, CYP2D7 100%, and the whole GSTM cluster (GSTM1, GSTM2, GSTM4, GSTM5) at 466/466 each — the off-diagonal C4/CYP handful are gene-conversion mosaics and unannotated pseudogene/hybrid modules. GSTM3 is stable single-copy and sits outside the folded module, so it is not resolved.

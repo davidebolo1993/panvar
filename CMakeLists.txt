@@ -101,6 +101,7 @@ add_executable(panvar
     src/bubble_command.cpp
     src/inspect.cpp
     src/call_command.cpp
+    src/benchmark_command.cpp
     src/describe_command.cpp
     src/panphorte_command.cpp
     src/associate_command.cpp

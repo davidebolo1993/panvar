@@ -23,4 +23,14 @@ struct FitAlignResult {
 // Linear space (two DP rows).
 FitAlignResult fit_align(const std::string& query, const std::string& target, std::size_t band);
 
+struct NwAlign {
+    std::size_t edits = 0;    // global edit distance (delta)
+    std::size_t aln_len = 0;  // total alignment length in columns (S)
+};
+
+// Global (Needleman-Wunsch) edit distance with the alignment length, via edlib
+// EDLIB_MODE_NW + EDLIB_TASK_PATH. Used by benchmark's round-trip QV:
+// QV = -10*log10(max(0.5, edits) / aln_len).
+NwAlign nw_edit_distance(const std::string& a, const std::string& b);
+
 } // namespace panvar

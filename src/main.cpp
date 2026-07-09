@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "panvar/associate_command.hpp"
+#include "panvar/benchmark_command.hpp"
 #include "panvar/bubble_command.hpp"
 #include "panvar/call_command.hpp"
 #include "panvar/cli_utils.hpp"
@@ -39,6 +40,9 @@ int main(int argc, char** argv) {
         }
         if (subcommand == "call") {
             return panvar::run_call_command(args);
+        }
+        if (subcommand == "benchmark") {
+            return panvar::run_benchmark_command(args);
         }
         if (subcommand == "describe") {
             return panvar::run_describe_command(args);

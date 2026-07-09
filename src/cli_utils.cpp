@@ -155,7 +155,8 @@ void print_general_help() {
         << "  call       Module 3: graph-native structural variant calling\n"
         << "  describe   Module 4: per-bubble k-mer feature description\n"
         << "  associate  Module 5: GWAS on describe genotypes vs a phenotype/covariate table\n"
-        << "  inspect    Utility: inspect path walks through one or all called bubbles\n\n"
+        << "  inspect    Utility: inspect path walks through one or all called bubbles\n"
+        << "  benchmark  Utility: round-trip QV of the caller's own output (cosigt-style bands)\n\n"
         << "Run 'panvar <subcommand> --help' for options.\n";
 }
 

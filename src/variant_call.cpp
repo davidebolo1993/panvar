@@ -135,7 +135,7 @@ struct Event {
     std::string ins_subtype;          // INS only: "", "NOVEL", "DUP"
     std::string link_id;              // shared id for a co-located DEL+INS substitution (EVENTID)
     // Reference anchoring for VCF coordinates.
-    std::string anchor_node;          // ref node POS is taken from
+    std::string anchor_node;          // ref node POS is taken from (the walk-order flank)
     bool anchor_after = false;        // true: POS = last base of anchor (INS); false: first base
     std::size_t size_bp = 0;          // |event| for min_sv filtering / SVLEN magnitude
     std::size_t ref_pos = 0;          // reference genomic position of the anchor (merge window)
@@ -678,7 +678,6 @@ void call_variants(
         std::size_t bubble_id = 0;
         std::string id;
         std::string line;                       // full VCF row (with trailing newline)
-        std::vector<std::string> prov_lines;    // variant_paths.tsv rows for this record
     };
     std::vector<OutRecord> out_records;
     std::vector<std::string> variant_nodes_rows;     // <prefix>.variant_nodes.tsv (describe handoff)
@@ -1402,57 +1401,53 @@ void call_variants(
                 return; // locus represented by the multiallelic record; skip per-event emission
             }
         }
-        // A carrier's realized sub-walk through the event: its canonical bubble steps
-        // between the reference node flanking the event upstream and the first reference
-        // node past the event end, as a GFA-style >node / <node string.
-        auto carrier_subwalk = [&](const std::vector<PathStep>& steps,
-                                   std::size_t epos, std::size_t eend) -> std::string {
-            long long up = -1;
-            for (std::size_t i = 0; i < steps.size(); ++i) {
-                const auto it = ref_node_pos.find(steps[i].node_id);
-                if (it != ref_node_pos.end() && static_cast<long long>(it->second) <= static_cast<long long>(epos)) {
-                    up = static_cast<long long>(i);
-                }
-            }
-            long long down = -1;
-            for (std::size_t i = static_cast<std::size_t>(up < 0 ? 0 : up + 1); i < steps.size(); ++i) {
-                const auto it = ref_node_pos.find(steps[i].node_id);
-                if (it != ref_node_pos.end() && static_cast<long long>(it->second) >= static_cast<long long>(eend)) {
-                    down = static_cast<long long>(i);
-                    break;
-                }
-            }
-            const std::size_t lo = up >= 0 ? static_cast<std::size_t>(up) : 0;
-            std::size_t hi = down >= 0 ? static_cast<std::size_t>(down)
-                                       : (steps.empty() ? 0 : steps.size() - 1);
-            if (hi < lo) hi = lo;
-            std::string out;
-            std::size_t emitted = 0;
-            for (std::size_t i = lo; i <= hi && i < steps.size(); ++i) {
-                if (emitted >= 2000) { out += "..."; break; }
-                out += steps[i].reverse ? '<' : '>';
-                out += steps[i].node_id;
-                ++emitted;
-            }
-            return out;
-        };
-
         for (const MergedRecord& mr : merged) {
             const Event& e = mr.seed;
-            // POS / REF base from the reference node map.
+            // POS / REF base from the reference node map. Anchor orientation-independently: a
+            // reverse-oriented bubble (source genomically downstream of sink) is walked in decreasing
+            // coordinate, so the walk-order anchor would point the wrong way. Take the genomically
+            // upstream reference node of the event; END then extends in increasing coordinate.
+            auto rpos = [&](const std::string& n) -> long long {
+                const auto it = ref_node_pos.find(n);
+                return it == ref_node_pos.end() ? -1 : static_cast<long long>(it->second);
+            };
+            std::string anchor = e.anchor_node;
+            bool anchor_after = e.anchor_after;
+            if (e.type == EvType::Del || e.type == EvType::Inv) {
+                // First (genomically-lowest) reference node of the event.
+                long long best = -1;
+                for (const std::string& n : e.nodes) {
+                    const long long p = rpos(n);
+                    if (p >= 0 && (best < 0 || p < best)) { best = p; anchor = n; }
+                }
+                anchor_after = false;
+            } else if (e.type == EvType::Ins) {
+                // anchor_node is the walk-order flank of the insertion. In a forward bubble it is the
+                // genomically-upstream flank (POS = its last base); in a reverse-oriented bubble it is
+                // the downstream flank, so POS is its first base (the insertion sits just before it).
+                const long long ps = rpos(bubble.source), pk = rpos(bubble.sink);
+                const bool reverse_bubble = (ps >= 0 && pk >= 0 && pk < ps);
+                anchor_after = !reverse_bubble;
+            } else {
+                // DUP: genomically upstream of the bubble's source/sink boundary.
+                const long long ps = rpos(bubble.source), pk = rpos(bubble.sink);
+                if (pk >= 0 && (ps < 0 || pk < ps)) anchor = bubble.sink;
+                else anchor = bubble.source;
+                anchor_after = false;
+            }
             std::size_t pos = 1;
             std::string ref_base = "N";
-            const auto ait = ref_node_pos.find(e.anchor_node);
+            const auto ait = ref_node_pos.find(anchor);
             if (ait != ref_node_pos.end()) {
-                const std::size_t glen = node_len(graph, e.anchor_node);
-                if (e.anchor_after && glen > 0) {
-                    pos = ait->second + glen - 1; // last base of preceding ref node
+                const std::size_t glen = node_len(graph, anchor);
+                if (anchor_after && glen > 0) {
+                    pos = ait->second + glen - 1; // last base of the upstream flank (INS)
                 } else {
-                    pos = ait->second;            // first base of first event node
+                    pos = ait->second;            // first base of the first event node
                 }
-                const auto nit = graph.nodes.find(e.anchor_node);
+                const auto nit = graph.nodes.find(anchor);
                 if (nit != graph.nodes.end() && !nit->second.sequence.empty()) {
-                    const std::size_t bi = (e.anchor_after && glen > 0) ? glen - 1 : 0;
+                    const std::size_t bi = (anchor_after && glen > 0) ? glen - 1 : 0;
                     ref_base = upper_base(nit->second.sequence[bi]);
                 }
             }
@@ -1633,20 +1628,9 @@ void call_variants(
             rec.bubble_id = bubble.id;
             rec.id = id;
             rec.line = row.str();
-            if (options.write_variant_paths) {
-                for (const std::string& s : mr.carriers) {
-                    const auto sit = sample_to_allele.find(s);
-                    std::string walk;
-                    if (sit != sample_to_allele.end()) {
-                        walk = carrier_subwalk(alleles[sit->second].steps, pos, end);
-                    }
-                    rec.prov_lines.push_back(
-                        id + '\t' + std::to_string(bubble.id) + '\t' + svt + '\t' + s + "\t1\t" + walk);
-                }
-            }
             out_records.push_back(std::move(rec));
 
-            if (options.write_variant_paths) {
+            if (options.write_variant_nodes) {
                 std::string nodes;
                 for (std::size_t k = 0; k < var_nodes.size(); ++k) { if (k) nodes += ','; nodes += var_nodes[k]; }
                 variant_nodes_rows.push_back(
@@ -1715,18 +1699,11 @@ void call_variants(
         }
     }
 
-    if (options.write_variant_paths) {
-        std::ofstream prov_out(options.out_prefix + ".variant_paths.tsv");
-        if (!prov_out) {
-            throw std::runtime_error("Failed to write variant paths TSV: " + options.out_prefix + ".variant_paths.tsv");
-        }
-        prov_out << "variant_id\tbubble_id\tsvtype\tsample\tgt\tsub_walk\n";
-        for (const OutRecord& rec : out_records) {
-            for (const std::string& pl : rec.prov_lines) prov_out << pl << '\n';
-        }
-
-        // variant_nodes.tsv: per-variant node set, the bridge for `describe --variant-nodes`
-        // (restrict k-mer features to nodes participating in called variation).
+    if (options.write_variant_nodes) {
+        // variant_nodes.tsv: per-variant node set, the bridge for `describe --variant-nodes` (restrict
+        // k-mer features to nodes participating in called variation) and the `benchmark` round-trip
+        // (which nodes a call explains). Ordered START->END; the caller does not emit per-haplotype walks
+        // -- `benchmark` reconstructs those from the graph + this node set.
         std::ofstream vn_out(options.out_prefix + ".variant_nodes.tsv");
         if (!vn_out) {
             throw std::runtime_error("Failed to write variant nodes TSV: " + options.out_prefix + ".variant_nodes.tsv");

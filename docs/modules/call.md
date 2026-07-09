@@ -45,7 +45,7 @@ Call on the `panphorte` graph (the `bubble` → `panphorte` → `call` path) sho
 | `--classify-ins` | refine `INS` subtype `NOVEL`/`DUP` via minimap2 | off |
 | `--multiallelic-loci` | collapse a bounded locus into one multiallelic record; `--multiallelic-max-bp` (5000) bounds it | off |
 | `--gtf <path>` | gene annotation (needs a PanSN (Pangenome Sequence Naming) `--reference-path`); see [below](#gene-annotation---gtf) | — |
-| `--bubble-id <N>` / `--no-per-bubble-vcf` / `--no-variant-paths` / `-q, --quiet` | scope and output toggles | — |
+| `--bubble-id <N>` / `--no-per-bubble-vcf` / `--no-variant-nodes` / `-q, --quiet` | scope and output toggles | — |
 
 
 ## Outputs
@@ -54,8 +54,7 @@ Call on the `panphorte` graph (the `bubble` → `panphorte` → `call` path) sho
 |------|----------|
 | `<prefix>.region.vcf` | all records, coordinate-sorted, unique IDs (`bgzip`+`tabix`-able) |
 | `<prefix>.bubble_<id>.vcf` | per-bubble VCF (unless `--no-per-bubble-vcf`) |
-| `<prefix>.variant_paths.tsv` | per (variant, carrier) sub-walk provenance (unless `--no-variant-paths`) |
-| `<prefix>.variant_nodes.tsv` | per-variant node set — the `describe --variant-nodes` handoff |
+| `<prefix>.variant_nodes.tsv` | per-variant node set — the `describe --variant-nodes` handoff and the `benchmark` input (unless `--no-variant-nodes`) |
 | `<prefix>.node_genes.tsv`, `<prefix>.dup_gene_cn.tsv` | with `--gtf` (see below) |
 
 VCF 4.2; samples = haplotypes. `FORMAT`: `GT` (`1` carrier / `0` ref-like / `.` doesn't traverse), `CN` (per-sample copy number on `DUP`), `CNBP` (`DUP` only: the actual linear bp this haplotype gains `+` / loses `−` across the module vs the reference: `Σ node_length × traversal_multiplicity` from the bubble `source→sink`, minus the reference's). Key `INFO`:

@@ -75,7 +75,7 @@ make_plot <- function(sub, ncol, ylab) {
 }
 
 # Split by label case: per-gene split rows are the upper-case gene names; everything else is a locus total.
-paralogs <- c("C4A", "C4B", "CYP2D6", "CYP2D7", "GSTM1")
+paralogs <- c("C4A", "C4B", "CYP2D6", "CYP2D7", "GSTM1", "GSTM2", "GSTM4", "GSTM5")
 loci <- d[!(d$gene %in% paralogs), ]
 genes <- d[d$gene %in% paralogs, ]
 
@@ -88,11 +88,11 @@ if (nrow(loci) > 0) {
   cat("(no locus-total rows; skipping .loci.png)\n")
 }
 
-# Plot 2: the resolved per-gene splits (C4A/C4B, CYP2D6/CYP2D7, GSTM1) as a 3-wide grid
-# (5 panels -> 2 rows x 3 cols, which reads better than 3 rows x 2).
+# Plot 2: the resolved per-gene splits (C4A/C4B, CYP2D6/CYP2D7, GSTM1/2/4/5) as a 4-wide grid
+# (8 panels -> 2 rows x 4 cols).
 if (nrow(genes) > 0) {
-  p_genes <- make_plot(genes, ncol = 3, ylab = "panvar per-gene copy number (resolved)")
-  ggsave(paste0(out_prefix, ".genes.png"), p_genes, width = wnum(w_arg, 11), height = wnum(h_arg, 7), dpi = dpi)
+  p_genes <- make_plot(genes, ncol = 4, ylab = "panvar per-gene copy number (resolved)")
+  ggsave(paste0(out_prefix, ".genes.png"), p_genes, width = wnum(w_arg, 14), height = wnum(h_arg, 7), dpi = dpi)
   cat("Wrote:", paste0(out_prefix, ".genes.png"), "\n")
 } else {
   cat("(no CYP2D6/CYP2D7 per-gene rows; skipping .genes.png)\n")

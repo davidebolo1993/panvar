@@ -53,7 +53,7 @@ void print_call_help() {
         << "                                   per-gene DUP copy-number table; needs a PanSN reference path\n"
         << "      --bubble-id <N>              Restrict to one bubble ID (repeatable)\n"
         << "      --no-per-bubble-vcf          Only write the concatenated region VCF\n"
-        << "      --no-variant-paths           Skip the variant_paths.tsv sidecar\n"
+        << "      --no-variant-nodes           Skip the variant_nodes.tsv sidecar\n"
         << "      --threads <N>                Worker threads for the per-bubble loop (0 = auto)\n"
         << "  -q, --quiet                      Disable progress logs\n"
         << "  -h, --help                       Show this help\n";
@@ -184,8 +184,8 @@ int run_call_command(const std::vector<std::string>& args) {
             options.write_per_bubble_vcf = false;
             continue;
         }
-        if (arg == "--no-variant-paths") {
-            options.write_variant_paths = false;
+        if (arg == "--no-variant-nodes") {
+            options.write_variant_nodes = false;
             continue;
         }
         if (arg == "--threads") {
@@ -249,10 +249,9 @@ int run_call_command(const std::vector<std::string>& args) {
     if (options.write_per_bubble_vcf) {
         outputs.push_back(options.out_prefix + ".bubble_<id>.vcf");
     }
-    if (options.write_variant_paths) {
-        outputs.push_back(options.out_prefix + ".variant_paths.tsv");
+    if (options.write_variant_nodes) {
+        outputs.push_back(options.out_prefix + ".variant_nodes.tsv");
     }
-    outputs.push_back(options.out_prefix + ".variant_nodes.tsv");
     if (!options.gtf_path.empty()) {
         outputs.push_back(options.out_prefix + ".node_genes.tsv");
         outputs.push_back(options.out_prefix + ".dup_gene_cn.tsv");

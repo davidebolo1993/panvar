@@ -20,3 +20,4 @@ Documentation for the `panvar` CLI, organized into three subfolders plus a share
 4. [modules/describe.md](modules/describe.md) — per-bubble variant, k-mer and node-edge features.
 5. [modules/associate.md](modules/associate.md) — GWAS on the describe genotypes.
 - [modules/inspect.md](modules/inspect.md) — clustering, path FASTA, and node/edge matrices for a called bubble.
+- [modules/benchmark.md](modules/benchmark.md) — round-trip QV / reconstruction identity of the caller's own output.
