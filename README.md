@@ -1,7 +1,6 @@
 # panvar
 
-`panvar` is a modular C++17 toolkit for pangenome-graph SV calling and association testing. It runs an end-to-end pipeline — snarl finding, tandem-repeat normalization, graph-native structural-variant calling, feature description, and association testing: `bubble → panphorte → call → describe → associate`, with the `inspect` and `benchmark` utilities
-available at any step.
+`panvar` is a modular C++17 toolkit for pangenome-graph SV calling and association testing. It runs an end-to-end pipeline — snarl finding, tandem-repeat normalization, graph-native structural-variant calling, feature description, and association testing: `bubble → panphorte → call → describe → associate`, with the `inspect` utility available at any step and `benchmark` for assessing the quality of the calls.
 
 ## Install
 
@@ -14,7 +13,7 @@ cmake --build build -j
 
 #### Requirements
 
-A C++17 compiler, CMake ≥ 3.16, `make`, and zlib. Three libraries ship as git submodules (hence the `git submodule update --init --recursive` step — nothing extra to install): `minimap2`, statically linked for INS-subtype realignment; `Eigen`, the header-only linear-algebra library used by the `associate` LMM; and `edlib`, the bit-parallel edit-distance library behind the banded fit alignment. A fast smoke test runs with `ctest --test-dir build --output-on-failure`.
+A C++17 compiler, CMake ≥ 3.16, `make`, and zlib. Three libraries ship as git submodules (hence the `git submodule update --init --recursive` step — nothing extra to install): `minimap2`, statically linked for INS-subtype realignment; `Eigen`, the header-only linear-algebra library used for linear mixed models; and `edlib`, the bit-parallel edit-distance library behind the banded fit alignment. A fast smoke test runs with `ctest --test-dir build --output-on-failure`.
 
 ## Docker
 

@@ -118,7 +118,7 @@ validate_cn() {  # <region> <compare args...>
     || echo "  (validation could not run)"
 }
 
-REGIONS=("$@"); [[ ${#REGIONS[@]} -eq 0 ]] && REGIONS=(lpa c4 gstm1 cyp2d6 acot synthetic)
+REGIONS=("$@"); [[ ${#REGIONS[@]} -eq 0 ]] && REGIONS=(lpa c4 gstm1 cyp2d6 acot ankrd36c synthetic)
 mkdir -p "$REPO/results"; rm -f "$CN_TABLE"
 
 for region in "${REGIONS[@]}"; do
@@ -196,6 +196,12 @@ for region in "${REGIONS[@]}"; do
             --dump-tsv "$CN_TABLE" || echo "  (per-gene $g compare skipped)"
         done
       fi
+      ;;
+    ankrd36c)
+      # chr2 ANKRD36 segmental-dup region: a sub-genic VNTR (RU ~5.6 kb, REF_CN 11, 7-15 copies) plus
+      # DEL/INS. No per-gene CN truth (ADRA2B/ANKRD36C/ASTL/GPAT2/DUSP2 are all single-copy), so this is
+      # an SV/VNTR example -- it exercises the pipeline + benchmark, not CN validation. On the panphorte graph.
+      run_region ankrd36c "$DATA/ankrd36c.gfa.gz" "--min-similarity 0.70" panphorte "--cn"
       ;;
     synthetic)
       echo "############ synthetic ############"

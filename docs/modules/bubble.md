@@ -26,6 +26,7 @@ Algorithm and worked trace: [algorithms/bubble.md](../algorithms/bubble.md).
 | `-o, --out-prefix <p>` | output prefix | `bubble_calls` |
 | `-s, --superbubbles` | emit only acyclic [superbubbles](../algorithms/bubble.md#terms) instead of all snarls | off (all snarls) |
 | `--min-variant-bp <N>` | keep a bubble only if some path's internal span ≥ N (`0` = off) | `50` |
+| `--max-variant-bp <N>` | largest variant to keep: drop a bubble if any path's internal span > N (`0` = off). | `0` (off) |
 | `--min-path-support <N>` | keep only bubbles crossed by ≥ N paths | `0` (off) |
 | `--merge-nearby-bp <N>` | merge consecutive bubbles ≤ N bp apart (after filters) | `0` (off) |
 | `--no-flip` | sort but don't reorient nodes to the reference strand | off |

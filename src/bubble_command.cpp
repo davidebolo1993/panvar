@@ -48,6 +48,8 @@ void print_bubble_help() {
         << "                                    Requires a PanSN reference path; skipped otherwise.\n"
         << "      --snarl-debug-tsv <path>     Optional diagnostics TSV for snarl candidates\n"
         << "      --min-variant-bp <N>         Keep bubbles with at least one path carrying >= N bp\n"
+        << "      --max-variant-bp <N>         Largest variant to keep: drop bubbles whose longest path\n"
+        << "                                   exceeds N bp (0 = no cap; tames hypervariable tangles)\n"
         << "                                    inside the bubble (default: 50, 0=disable)\n"
         << "      --min-path-support <N>       Require at least N supporting P/W paths (default: 0)\n"
         << "      --merge-nearby-bp <N>        Merge nearby bubbles only after base filters\n"
@@ -141,6 +143,10 @@ int run_bubble_command(const std::vector<std::string>& args) {
         }
         if (arg == "--min-variant-bp") {
             options.min_variant_bp = cli::parse_size_arg(arg, require_value(arg));
+            continue;
+        }
+        if (arg == "--max-variant-bp") {
+            options.max_variant_bp = cli::parse_size_arg(arg, require_value(arg));
             continue;
         }
         if (arg == "--min-path-support") {

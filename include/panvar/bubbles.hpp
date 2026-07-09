@@ -46,6 +46,10 @@ struct BubbleCallOptions {
     // Keep bubbles only if at least one supporting path has inside length >= this threshold
     // (unless inversion_signal is detected). Set to 0 to disable size filtering.
     std::size_t min_variant_bp = 50;
+    // Drop bubbles whose longest supporting path exceeds this (0 = no cap): the largest variant to
+    // keep. Bounds the per-bubble walk cost so panphorte/call stay tractable on hypervariable regions
+    // (deeply-nested giant snarls); trades away SVs bigger than the cap.
+    std::size_t max_variant_bp = 0;
     std::size_t min_path_support = 0;
     // Optional merge of nearby bubbles on graph distance (bp) between sink/source boundaries.
     // 0 disables merging.

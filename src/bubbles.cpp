@@ -878,6 +878,15 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
             bubbles.end());
     }
 
+    if (options.max_variant_bp > 0) {
+        // Drop bubbles whose longest supporting path exceeds the cap: bounds the per-bubble walk cost so
+        // panphorte/call stay tractable on hypervariable regions. Trades away SVs larger than the cap.
+        bubbles.erase(
+            std::remove_if(bubbles.begin(), bubbles.end(),
+                           [&](const Bubble& b) { return b.max_inside_bp > options.max_variant_bp; }),
+            bubbles.end());
+    }
+
     if (options.merge_nearby_bp > 0 && bubbles.size() > 1) {
         bubbles = merge_nearby_bubbles(graph, bubbles, options.merge_nearby_bp);
         compute_bubble_metrics(bubbles, "Rescoring merged");
