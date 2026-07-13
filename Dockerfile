@@ -23,7 +23,8 @@ ARG MAMBA_DOCKERFILE_ACTIVATE=1
 USER $MAMBA_USER
 
 # Companion tools only: vg (snarls), odgi (inspect graph sort/flip), bcftools (work with the called VCFs),
-# and R for the plotting scripts. minimap2 is NOT installed (panvar links the minimap2 API statically).
+# and R for the plotting scripts (ggplot2/ggrepel) plus the interactive node-coverage viewer
+# (shiny/plotly/data.table/DT). minimap2 is NOT installed (panvar links the minimap2 API statically).
 RUN micromamba install --yes --name base --channel conda-forge --channel bioconda \
     vg \
     odgi \
@@ -31,6 +32,10 @@ RUN micromamba install --yes --name base --channel conda-forge --channel biocond
     r-base \
     r-ggplot2 \
     r-ggrepel \
+    r-data.table \
+    r-shiny \
+    r-plotly \
+    r-dt \
     && micromamba clean --all --yes
 
 USER root
