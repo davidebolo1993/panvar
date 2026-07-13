@@ -137,6 +137,24 @@ Rscript scripts/plot_vcf_map.R \
 
 Rows are haplotypes, columns are called variants grouped by bubble. The KIV-2 column is the wide blue band shaded by `FORMAT:CN` — dark = high copy number. DEL are red, INS green/purple, INV orange. The KIV-2 blue gradient is the copy-number spectrum the whole pipeline was after.
 
+For a per-node, interactive view of the same calls, build the viewer bundle and launch the Shiny + plotly app (`scripts/build_variant_node_data.R` + `scripts/variant_node_heatmap_app.R`; needs `shiny`, `plotly`, `data.table`, `DT`):
+
+```bash
+Rscript scripts/build_variant_node_data.R \
+  --gfa "$OUT/panphorte/panphorte.normalized.sorted.gfa" \
+  --variant-nodes "$OUT/call/call.variant_nodes.tsv" \
+  --vcf "$OUT/call/call.region.vcf" \
+  --bubbles "$OUT/panphorte/panphorte.bubbles.csv" \
+  --node-genes "$OUT/call/call.node_genes.tsv" \
+  --out "$OUT/plots/lpa_variant_nodes.rds"
+
+VN_RDS="$OUT/plots/lpa_variant_nodes.rds" Rscript scripts/variant_node_heatmap_app.R
+```
+
+The app serves at `http://127.0.0.1:<port>` (printed on launch). It opens on the representative haplotypes across the whole locus: each row is a haplotype, each column a variant node (width ∝ node length) coloured by traversal count — white = untraversed, grey = ×1, red-gradient = ×2+ — so the KIV-2 `DUP` shows as the deep-red copy-number band. Hover a node for its gene/coverage/genotype; pick a bubble to zoom, or click a `variant_id` to pull up its carriers.
+
+![LPA node-coverage viewer](img/lpa_node_coverage.png)
+
 ---
 
 ## 6. `describe` — genotype features for association

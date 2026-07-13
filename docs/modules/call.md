@@ -94,6 +94,26 @@ Flags:
 - `--reference-path <name>` — optionally pin a haplotype (substring match) as the top (or leftmost, with `--flip`) row.
 - `--width` / `--height` / `--dpi` — figure size (inches) and PNG resolution (default 300).
 
+### Interactive node-coverage viewer
+
+For a per-node view — how each haplotype actually traverses the graph under every call — `scripts/variant_node_heatmap_app.R` is a Shiny + plotly app. The top panel is a coverage heatmap (rows = haplotypes, columns = variant-affected nodes ordered by genomic position, width ∝ node length): white = not traversed, grey = ×1, red-gradient = ×2+ (so a `DUP` reads as a copy-number gradient). The bottom panel marks each `variant_id`'s node set. Hovering a node shows its gene, coverage, and — on a variant node — that haplotype's `GT` (+ `CN`/`CNBP` for `DUP`). It opens on a representative subset (the reference plus one carrier per variant / per distinct `DUP` CN); pick a bubble to zoom, clear the box to show all haplotypes, or click a `variant_id` to select its carriers.
+
+First assemble the bundle with `scripts/build_variant_node_data.R` (needs `data.table`), then launch the app (`shiny`, `plotly`, `data.table`, `DT`):
+
+```bash
+Rscript scripts/build_variant_node_data.R \
+  --gfa <panphorte.normalized.sorted.gfa> \
+  --variant-nodes <prefix>.variant_nodes.tsv \
+  --vcf <prefix>.region.vcf \
+  --bubbles <panphorte-prefix>.bubbles.csv \
+  --node-genes <prefix>.node_genes.tsv \
+  --out variant_nodes.rds
+
+VN_RDS=variant_nodes.rds Rscript scripts/variant_node_heatmap_app.R
+```
+
+`--node-genes` is optional (drops the gene hover if omitted). The `--gfa` is the graph `call` ran on and `--bubbles` its panphorte `bubbles.csv`, so node order and bubble spans match the VCF.
+
 
 ## Gene annotation (`--gtf`)
 
