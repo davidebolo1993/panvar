@@ -582,6 +582,14 @@ void call_variants(
     const ParsedReferencePath ref_meta = parse_reference_path_label(ref_name);
     const std::vector<std::size_t> ref_prefix = path_prefix_bp(*ref_path, graph.nodes);
 
+    // Last reference coordinate: no record's END may exceed it (the reference is finite). Guards
+    // against a copy-number event whose bp estimate runs past the region -- a low-complexity tangle
+    // can make the peak/coverage DUP's excess-bp sum balloon past the graph.
+    std::size_t ref_total_bp = 0;
+    for (const auto& st : ref_path->steps) ref_total_bp += node_len(graph, st.node_id);
+    const std::size_t ref_end_1based =
+        ref_meta.region_start_1based + (ref_total_bp > 0 ? ref_total_bp - 1 : 0);
+
     // Optional GTF annotation: project reference-coordinate genes onto reference nodes via the PanSN
     // chrom+start. node_genes maps a ref node id -> gene indices. Built once, const in the parallel
     // loop; skipped when --gtf is unset or the reference name isn't PanSN.
@@ -1466,6 +1474,7 @@ void call_variants(
                         static_cast<long long>(node_len(graph, e.nodes.empty() ? std::string() : e.nodes.front()));
                 end = pos + node_len(graph, e.nodes.empty() ? std::string() : e.nodes.front());
             }
+            if (end > ref_end_1based) end = ref_end_1based;  // END is a reference coordinate; never past the graph
 
             // Ordered, deduplicated event node set: reference nodes by genomic position,
             // haplotype-only nodes kept in representative-walk order after them. This gives
