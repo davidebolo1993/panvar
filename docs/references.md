@@ -23,6 +23,12 @@ GitHub: [GenoGra/Panphorte](https://github.com/GenoGra/Panphorte) — the origin
 
 - Coggi M, Basile L, Branchini B, Amodeo G, Di Donato GW, Santambrogio MD. **On the optimization of copy number variations representation in pangenome graphs.** *Front. Bioinform.* 2026;6:1811916. <https://doi.org/10.3389/fbinf.2026.1811916> — the original panphorte tandem-repeat normalization.
 
+## `refine`
+
+GitHub: [yangao07/abPOA](https://github.com/yangao07/abPOA) — SIMD partial-order alignment (affine gaps), statically vendored (with its nested [SIMDe](https://github.com/simd-everywhere/simde)) as the residual-segment MSA engine behind `refine`.
+
+- Gao Y, Liu Y, Ma Y, Liu B, Wang Y, Xing Y. **abPOA: an SIMD-based C library for fast partial order alignment using adaptive band.** *Bioinformatics* 2021;37(15):2209–2211. <https://doi.org/10.1093/bioinformatics/btaa963>
+
 ## `call`
 
 GitHub: [lh3/minimap2](https://github.com/lh3/minimap2) — used for INS subtype realignment and, in the per-gene copy-number resolver, the one-time reference alignment of a near-identical paralog pair's coding sequences (to locate their divergent columns for the per-site split). Per-haplotype copy number is read by k-mer dosage, without alignment.

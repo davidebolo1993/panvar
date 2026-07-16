@@ -109,7 +109,24 @@ Rscript scripts/plot_node_coverage_heatmap.R \
 
 ---
 
-## 5. `call` — type the variants and read copy number
+## 5. `refine` — remove graph-builder artifacts (optional)
+
+`call` diffs node-walks, so when the graph builder splits one true event across adjacent snarls it reports the split as separate records. `refine` re-aligns the actual per-haplotype interior sequences with POA (abPOA), collapsing such artifacts, and emits panphorte's output family so its graph is a drop-in for `call`. It is opt-in, sequence-lossless, and `DUP`-safe: folded self-loop REP nodes (like LPA's KIV-2 unit) are held fixed and only the residual flanks around them are re-aligned; a bubble carrying an unfolded copy-number revisit is skipped.
+
+```bash
+./build/panvar refine \
+  -i "$OUT/panphorte/panphorte.normalized.sorted.gfa" \
+  --bubble-prefix-in "$OUT/panphorte/panphorte" \
+  --reference-path "$REF" \
+  -o "$OUT/refine/refine" \
+  --gtf tests/real_data/Homo_sapiens.GRCh38.116.gtf.gz
+```
+
+On LPA the KIV-2 tangle (bubble 7) is left untouched — it carries an unfolded revisit, so the DUP copy-number signal is preserved intact — while smaller bubbles are cleaned (e.g. a balanced +439/−439 bp INS+DEL pair, the same displaced sequence the builder split in two, collapses to nothing). To type the refined graph, point `call`/`describe`/`inspect` at the refine prefix instead of the panphorte one (`-i "$OUT/refine/refine.normalized.sorted.gfa" --bubble-prefix-in "$OUT/refine/refine"`). The rest of this walkthrough stays on the panphorte output, since the LPA copy-number story is unaffected.
+
+---
+
+## 6. `call` — type the variants and read copy number
 
 Diffs every haplotype against the reference and emits a VCF. On LPA: 7 DEL, 13 INS, 3 DUP. The headline record is the KIV-2 DUP on bubble 7: `REF_CN=6`, `RU_LEN=5547`, with a per-sample `CN` spanning 1–32 copies (and `CNBP` giving the actual bp each haplotype gains/loses).
 
@@ -157,7 +174,7 @@ The app serves at `http://127.0.0.1:<port>` (printed on launch). It opens on the
 
 ---
 
-## 6. `describe` — genotype features for association
+## 7. `describe` — genotype features for association
 
 Turns the called bubbles into per-haplotype dosage features (k-mer, node/edge graph, and per-variant), exported as BIMBAM matrices — the input to `associate`. Restricting to the called variant nodes keeps only features that carry signal.
 
@@ -170,16 +187,16 @@ Turns the called bubbles into per-haplotype dosage features (k-mer, node/edge gr
 ```
 ---
 
-## 7. `associate` — the GWAS
+## 8. `associate` — the GWAS
 
 Association (`phenotype ~ genotype`, multiple-testing correction, conditional independence) is its own worked example on this exact LPA output: see [GWAS example](gwas/example.md). In short, testing the KIV-2 features against a Lp(a) phenotype recovers the KIV-2 copy-number signal as the region's top hit, and structure correction keeps the genomic-inflation λ ≈ 1.
 
 
 ---
 
-## 8. `benchmark` — round-trip QV of the calls
+## 9. `benchmark` — round-trip reconstruction of the calls
 
-How faithfully do the calls reconstruct the haplotypes? For each called bubble and each haplotype, `benchmark` rebuilds the haplotype from the reference walk with*only the called events applied (which nodes each call explains comes from `variant_nodes.tsv`), aligns that to the haplotype's true graph walk, and scores a cosigt-style `QV = -10·log10(max(0.5, δ)/S)`. Uncalled variation (SNPs, sub-50 bp indels) is exactly what keeps it short of perfect. 
+How faithfully do the calls reconstruct the haplotypes? For each called bubble and each haplotype, `benchmark` rebuilds the haplotype from the reference walk with only the called events applied (which nodes each call explains comes from `variant_nodes.tsv`), aligns that to the haplotype's true graph walk, and reports the reconstruction identity `= 1 − Σδ/ΣS`. Uncalled variation (SNPs, sub-50 bp indels) is exactly what keeps it short of perfect. (A comparability `QV = -10·log10(max(0.5, δ)/S)` is emitted alongside but is no longer the headline.)
 
 ```bash
 ./build/panvar benchmark \
@@ -190,11 +207,11 @@ How faithfully do the calls reconstruct the haplotypes? For each called bubble a
   -o "$OUT/call/benchmark"
 ```
 
-Because a perfect reconstruction of a short region can't reach a high absolute QV, the length-fair headline is per-haplotype reconstruction identity (`1 − Σδ/ΣS`). `scripts/plot_benchmark_qv.R --category dist` draws it per locus, on a "nines" axis:
+The per-gene headline is per-haplotype reconstruction identity (`1 − Σδ/ΣS`) — length-fair, unlike an absolute QV that a short region can never push high. `scripts/plot_benchmark.R` draws the per-gene anatomy: the left panel stacks Reconstructed (identity) + Residual to 100% of the aligned sequence, and the right panel splits that residual only into Not-callable (sub-threshold) vs Mis-called (≥ threshold) — so a tiny residual stays legible:
 
-![Round-trip reconstruction identity](img/benchmark_qv_dist.png)
+![Round-trip reconstruction anatomy](img/benchmark_qv.png)
 
-Every haplotype across every locus reconstructs at >99.9% identity. On LPA, the copy number lands exactly (the DUP module scores δ=0), so the residual is small sub-threshold variation — e.g. a ~32 bp insertion at one bubble that sits just under `--min-sv-bp=50`. CYP2D6 is near-perfect; GSTM1 sits lowest (its paralog stack is dense with small paralogous sequence variants) but is still >99.9%. This confirms the calls round-trip the haplotypes.
+Every haplotype across every locus reconstructs at >99.9% identity (left panel ~all green), and the residual is essentially all Not-callable (right panel blue) — no callable-size misses. On LPA, the copy number lands exactly (the DUP module scores δ=0); its residual is small sub-threshold variation, e.g. a ~32 bp insertion at one bubble that sits just under `--min-sv-bp=50`. GSTM1 sits lowest (its paralog stack is dense with small paralogous sequence variants) but is still >99.9%. This confirms the calls round-trip the haplotypes. (Match `benchmark --min-sv-bp` to the `call` run, or 20–50 bp variation that was correctly not called would show up as Mis-called.)
 
 ---
 

@@ -7,3 +7,6 @@
 [submodule "external/edlib"]
 	path = external/edlib
 	url = https://github.com/Martinsos/edlib.git
+[submodule "external/abpoa"]
+	path = external/abpoa
+	url = https://github.com/yangao07/abPOA.git

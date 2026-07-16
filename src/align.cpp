@@ -58,11 +58,16 @@ FitAlignResult fit_align(const std::string& query, const std::string& target, st
 
 // Global align both sequences end-to-end; TASK_PATH so alignmentLength (the number of
 // alignment columns, S) is populated alongside editDistance (delta).
-NwAlign nw_edit_distance(const std::string& a, const std::string& b) {
+NwAlign nw_edit_distance(const std::string& a, const std::string& b, std::size_t min_event_bp) {
     NwAlign out;
+    auto bucket = [&](std::size_t block) {
+        if (min_event_bp == 0 || block == 0) return;
+        if (block < min_event_bp) out.sub_threshold_bp += block;
+        else out.over_threshold_bp += block;
+    };
     if (a.empty() && b.empty()) return out;
-    if (a.empty()) { out.edits = b.size(); out.aln_len = b.size(); return out; }
-    if (b.empty()) { out.edits = a.size(); out.aln_len = a.size(); return out; }
+    if (a.empty()) { out.edits = b.size(); out.aln_len = b.size(); bucket(b.size()); return out; }
+    if (b.empty()) { out.edits = a.size(); out.aln_len = a.size(); bucket(a.size()); return out; }
 
     const EdlibAlignConfig cfg = edlibNewAlignConfig(-1, EDLIB_MODE_NW, EDLIB_TASK_PATH, nullptr, 0);
     EdlibAlignResult res = edlibAlign(a.data(), static_cast<int>(a.size()),
@@ -72,10 +77,20 @@ NwAlign nw_edit_distance(const std::string& a, const std::string& b) {
         edlibFreeAlignResult(res);
         out.edits = std::max(a.size(), b.size());
         out.aln_len = std::max(a.size(), b.size());
+        bucket(out.edits);
         return out;
     }
     out.edits = static_cast<std::size_t>(res.editDistance);
     out.aln_len = static_cast<std::size_t>(res.alignmentLength);
+    // Split the residual by contiguous non-match block length (each I/D/X op is one edit).
+    if (min_event_bp > 0 && res.alignment != nullptr) {
+        std::size_t run = 0;
+        for (int k = 0; k < res.alignmentLength; ++k) {
+            if (res.alignment[k] == EDLIB_EDOP_MATCH) { bucket(run); run = 0; }
+            else ++run;
+        }
+        bucket(run);
+    }
     edlibFreeAlignResult(res);
     return out;
 }

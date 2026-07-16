@@ -53,6 +53,9 @@ void print_benchmark_help() {
         << "                                   haplotype diverging from reference at an uncalled bubble\n"
         << "                                   then lands in a low band -- a missed call. Default scores\n"
         << "                                   only bubbles that carry >=1 call.\n"
+        << "      --min-sv-bp <N>              Threshold for the residual split (match the call run;\n"
+        << "                                   default 50): residual blocks < N bp are sub-threshold\n"
+        << "                                   variation, >= N bp are callable-size misses.\n"
         << "      --threads <N>                Worker threads over haplotypes (0 = auto)\n"
         << "  -q, --quiet                      Disable progress logs\n"
         << "  -h, --help                       Show this help\n";
@@ -228,6 +231,8 @@ struct BubbleObs {
     bool carrier = false;
     std::size_t delta = 0;
     std::size_t aln_len = 0;
+    std::size_t sub_bp = 0;    // residual in blocks < min-sv-bp (variation that couldn't be called)
+    std::size_t over_bp = 0;   // residual in blocks >= min-sv-bp (a callable-size event missed/mis-called)
 };
 
 struct HapResult {
@@ -235,6 +240,8 @@ struct HapResult {
     bool scored = false;
     std::size_t sum_delta = 0;
     std::size_t sum_aln = 0;
+    std::size_t sum_sub = 0;
+    std::size_t sum_over = 0;
     std::vector<BubbleObs> obs;
 };
 
@@ -245,6 +252,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
 
     std::string gfa_path, bubble_prefix_in, bubbles_csv_in, variant_nodes_in, reference_path, out_prefix;
     std::size_t threads = 0;
+    std::size_t min_sv_bp = 50;   // threshold for the residual sub/over split (should match the call run)
     bool quiet = false;
     bool all_bubbles = false;
 
@@ -262,6 +270,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
         else if (arg == "-r" || arg == "--reference-path") reference_path = require_value(arg);
         else if (arg == "-o" || arg == "--out-prefix") out_prefix = require_value(arg);
         else if (arg == "--all-bubbles") all_bubbles = true;
+        else if (arg == "--min-sv-bp") min_sv_bp = cli::parse_size_arg(arg, require_value(arg));
         else if (arg == "--threads") threads = cli::parse_size_arg(arg, require_value(arg));
         else if (arg == "-q" || arg == "--quiet") quiet = true;
         else throw std::runtime_error("Unknown option for benchmark: " + arg);
@@ -329,21 +338,24 @@ int run_benchmark_command(const std::vector<std::string>& args) {
             bool applied = false;
             const std::vector<PathStep> recon_steps = reconstruct(rit->second, *steps, called, applied);
             const std::string recon = spell_path_steps_sequence(graph, recon_steps);
-            const NwAlign nw = nw_edit_distance(recon, truth);
+            const NwAlign nw = nw_edit_distance(recon, truth, min_sv_bp);
             hr.scored = true;
             hr.sum_delta += nw.edits;
             hr.sum_aln += nw.aln_len;
-            hr.obs.push_back({b.id, applied, nw.edits, nw.aln_len});
+            hr.sum_sub += nw.sub_threshold_bp;
+            hr.sum_over += nw.over_threshold_bp;
+            hr.obs.push_back({b.id, applied, nw.edits, nw.aln_len, nw.sub_threshold_bp, nw.over_threshold_bp});
         }
     });
 
     std::map<std::string, std::size_t> band_count;
     std::map<std::string, std::size_t> quintile_count;
     std::size_t scored_haps = 0;
+    std::size_t tot_sub = 0, tot_over = 0;
     {
         std::ofstream by_hap(out_prefix + ".qv_by_haplotype.tsv");
         if (!by_hap) throw std::runtime_error("Failed to write " + out_prefix + ".qv_by_haplotype.tsv");
-        by_hap << "sample\tn_bubbles\tsum_delta\tsum_aln_len\tqv\tband\tqv_max\tqv_ratio\tquintile\tidentity\n";
+        by_hap << "sample\tn_bubbles\tsum_delta\tsum_aln_len\tqv\tband\tqv_max\tqv_ratio\tquintile\tidentity\tsub_threshold_bp\tover_threshold_bp\n";
         for (const HapResult& hr : results) {
             if (!hr.scored) continue;
             const double qv = qv_from(hr.sum_delta, hr.sum_aln);
@@ -356,10 +368,13 @@ int run_benchmark_command(const std::vector<std::string>& args) {
             const std::string quintile = qv_ratio_quintile(ratio);
             by_hap << hr.sample << '\t' << hr.obs.size() << '\t' << hr.sum_delta << '\t'
                    << hr.sum_aln << '\t' << qv << '\t' << band << '\t' << qmax << '\t'
-                   << ratio << '\t' << quintile << '\t' << identity << '\n';
+                   << ratio << '\t' << quintile << '\t' << identity << '\t'
+                   << hr.sum_sub << '\t' << hr.sum_over << '\n';
             ++band_count[band];
             ++quintile_count[quintile];
             ++scored_haps;
+            tot_sub += hr.sum_sub;
+            tot_over += hr.sum_over;
         }
     }
 
@@ -367,7 +382,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
     {
         std::ofstream qv_out(out_prefix + ".qv.tsv");
         if (!qv_out) throw std::runtime_error("Failed to write " + out_prefix + ".qv.tsv");
-        qv_out << "sample\tbubble_id\tsvtypes\tis_carrier\tdelta\taln_len\tqv\n";
+        qv_out << "sample\tbubble_id\tsvtypes\tis_carrier\tdelta\taln_len\tqv\tsub_threshold_bp\tover_threshold_bp\n";
         for (const HapResult& hr : results) {
             if (!hr.scored) continue;
             for (const BubbleObs& o : hr.obs) {
@@ -378,7 +393,8 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                 const double qv = qv_from(o.delta, o.aln_len);
                 const std::string band = qv_band(qv);
                 qv_out << hr.sample << '\t' << o.bubble_id << '\t' << (svt.empty() ? "." : svt) << '\t'
-                       << (o.carrier ? 1 : 0) << '\t' << o.delta << '\t' << o.aln_len << '\t' << qv << '\n';
+                       << (o.carrier ? 1 : 0) << '\t' << o.delta << '\t' << o.aln_len << '\t' << qv << '\t'
+                       << o.sub_bp << '\t' << o.over_bp << '\n';
                 if (sit != cv.svtypes.end())
                     for (const std::string& s : sit->second) ++class_bands[s][band];
             }
@@ -401,6 +417,15 @@ int run_benchmark_command(const std::vector<std::string>& args) {
             const std::size_t n = band_count.count(band) ? band_count[band] : 0;
             const double pct = scored_haps ? 100.0 * static_cast<double>(n) / static_cast<double>(scored_haps) : 0.0;
             sum << "haplotype\tALL\t" << band << '\t' << n << '\t' << pct << '\n';
+        }
+        // Residual split: of all the sequence we could not reconstruct, how much is sub-threshold
+        // variation (couldn't be called) vs callable-size events missed/mis-called.
+        {
+            const std::size_t tot = tot_sub + tot_over;
+            const double sub_pct = tot ? 100.0 * static_cast<double>(tot_sub) / static_cast<double>(tot) : 0.0;
+            const double over_pct = tot ? 100.0 * static_cast<double>(tot_over) / static_cast<double>(tot) : 0.0;
+            sum << "residual\t<" << min_sv_bp << "bp\tsub_threshold\t" << tot_sub << '\t' << sub_pct << '\n';
+            sum << "residual\t>=" << min_sv_bp << "bp\tover_threshold\t" << tot_over << '\t' << over_pct << '\n';
         }
         for (const auto& [svclass, bands] : class_bands) {
             std::size_t total = 0;

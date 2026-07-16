@@ -26,11 +26,17 @@ FitAlignResult fit_align(const std::string& query, const std::string& target, st
 struct NwAlign {
     std::size_t edits = 0;    // global edit distance (delta)
     std::size_t aln_len = 0;  // total alignment length in columns (S)
+    // Residual split by contiguous non-match block size (populated only when min_event_bp > 0):
+    // a block shorter than the call threshold is variation that could not have been called;
+    // a block >= the threshold is a callable-size event missed or mis-represented.
+    std::size_t sub_threshold_bp = 0;
+    std::size_t over_threshold_bp = 0;
 };
 
 // Global (Needleman-Wunsch) edit distance with the alignment length, via edlib
 // EDLIB_MODE_NW + EDLIB_TASK_PATH. Used by benchmark's round-trip QV:
-// QV = -10*log10(max(0.5, edits) / aln_len).
-NwAlign nw_edit_distance(const std::string& a, const std::string& b);
+// QV = -10*log10(max(0.5, edits) / aln_len). When min_event_bp > 0 the edit path is walked and the
+// residual (edits) is split into sub-threshold vs >= threshold contiguous blocks.
+NwAlign nw_edit_distance(const std::string& a, const std::string& b, std::size_t min_event_bp = 0);
 
 } // namespace panvar

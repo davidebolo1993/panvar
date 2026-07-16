@@ -4,16 +4,17 @@ CLI: `panvar benchmark`
 
 ## What it does
 
-Scores the caller's own output with a round-trip QV. For each called bubble and each haplotype that traverses it:
+Scores the caller's own output with a round-trip reconstruction. For each called bubble and each haplotype that traverses it:
 - reconstructs the haplotype on the passed graph by taking the reference walk and substituting only the divergent blocks the calls explain — node-align the haplotype's walk against the reference walk and, between shared anchors, keep the haplotype's block when its nodes are in `variant_nodes.tsv`, else revert to reference. Uncalled variation (SNPs, sub-threshold indels) stays at reference. This is coordinate-free, so bubble orientation never matters;
-- aligns the reconstruction to the haplotype's true walk over the bubble (edlib global/NW);
-- scores `QV = -10·log10(max(0.5, δ)/S)`, where `δ` is the edit distance and `S` the alignment length.
+- aligns the reconstruction to the haplotype's true walk over the bubble (edlib global/NW) to get the edit distance `δ` and alignment length `S`.
 
-Per-haplotype QV is the length-weighted combine over the bubbles it traverses (`Σδ / ΣS`, then the formula). `δ` stays above zero wherever a haplotype carries variation we did not call (so an accurate call set still scores high but finite); `δ` reaches zero only when the called events fully reconstruct the bubble. No VCF is needed — `variant_nodes.tsv` says which nodes each call explains, and the haplotype walks come from the graph.
+**Reconstruction identity `= 1 − Σδ/ΣS`** (length-weighted over the bubbles a haplotype traverses). `δ` stays above zero wherever a haplotype carries variation `panvar` did not call, so identity is `1.0` only when the called events fully reconstruct every bubble, and drops in linear proportion to the uncalled sequence. Report it per haplotype and aggregated per gene.
 
 Algorithm and worked trace: [algorithms/benchmark.md](../algorithms/benchmark.md).
 
-**Length-fair headline (quintiles).** The `max(0.5, δ)` floor makes the achievable ceiling depend on region length: a perfect reconstruction of total length `S` maxes out at `QV_max = 10·log10(2S)`, so a haplotype spanning only small bubbles can never reach the high cosigt bands however good its calls are. So we also report `qv_ratio = QV / QV_max` — length-fair, `1.0` for a perfect reconstruction of *any* size — and bin it into quintiles (`0.0–0.2` … `0.8–1.0`, top is best). An accurate call set piles into the top quintile regardless of locus size; a haplotype drops only in proportion to the uncalled sequence it carries *relative to its region*. Because QV is logarithmic, `qv_ratio` is sensitive: a handful of uncalled SNPs over tens of kb still moves it down a quintile. The fixed cosigt bands (`<17`, `17–23`, `23–33`, `>33`) are kept alongside for external comparability.
+**Residual anatomy:** The reconstruction-vs-truth alignment path is walked and the residual `δ` is split by contiguous non-match block size against `--min-sv-bp`: a block shorter than the threshold is variation that could not have been called (sub-threshold SNPs/indels), a block `≥` the threshold is a callable-size event missed or mis-represented. This separates a real caller problem from a metric artifact — e.g. a locus whose only variation is a small indel scores a low raw identity over its tiny denominator, but the split shows it as 100% sub-threshold, not a miss. Aggregated per gene, `Reconstructed (= identity) + Not-callable (sub-threshold) + Mis-called (≥ threshold)` sum to 100% of the aligned sequence. Results can be plotted via `scripts/plot_benchmark.R` — two side-by-side plots: left stacks Reconstructed + Residual as % of the aligned sequence; right splits that residual into Not-callable vs Mis-called, also as % of aligned sequence but with the y-axis auto-scaled to the largest residual.
+
+A logarithmic `QV = -10·log10(max(0.5, δ)/S)` with its ratio `qv_ratio = QV / QV_max` (`QV_max = 10·log10(2S)`) binned into quintiles is also emitted.
 
 ## Required inputs
 
@@ -27,7 +28,8 @@ Algorithm and worked trace: [algorithms/benchmark.md](../algorithms/benchmark.md
 
 | flag | what it does | default |
 |------|--------------|---------|
-| `--all-bubbles` | score every bubble in the CSV, not just called ones — a haplotype diverging from reference at an *uncalled* bubble then surfaces as a low-QV miss (turns the metric into a recall/sensitivity view) | off (called bubbles only) |
+| `--all-bubbles` | score every bubble in the CSV, not just called ones — a haplotype diverging from reference at an *uncalled* bubble then surfaces as an identity drop / over-threshold miss (turns the metric into a recall/sensitivity view) | off (called bubbles only) |
+| `--min-sv-bp <N>` | threshold for the residual split — match the `call` run. Residual blocks `< N` bp are sub-threshold (uncallable) variation, `≥ N` bp are callable-size misses | `50` |
 | `--threads <N>` | worker threads over haplotypes | `0` (auto) |
 | `-q, --quiet` | disable progress logs | — |
 
@@ -35,11 +37,6 @@ Algorithm and worked trace: [algorithms/benchmark.md](../algorithms/benchmark.md
 
 | file | contents |
 |------|----------|
-| `<prefix>.qv.tsv` | per (haplotype, bubble): `svtypes`, `is_carrier` (a called block was applied), `δ`, `aln_len`, `qv` |
-| `<prefix>.qv_by_haplotype.tsv` | per-haplotype length-weighted `qv`, cosigt `band`, `qv_max`, `qv_ratio`, `quintile` |
-| `<prefix>.qv_summary.tsv` | `% haplotypes` per `qv_ratio` quintile and per cosigt band (`scope` = `quintile`/`haplotype`), plus `% observations` per band per SV class (`scope` = `svclass`) |
-
-## Notes
-
-- Read the `qv_ratio` quintile distribution as the length-fair headline and the per-bubble `qv.tsv` as a diagnostic (a perfectly reconstructed but short bubble scores a modest *per-bubble* QV because of the `max(0.5, δ)` floor, even though it is a perfect reconstruction).
-- Sensitivity: rerun `call --min-sv-bp <huge>` to drop records and re-benchmark with `--all-bubbles` — the dropped events are then scored against reference and QV collapses, confirming the metric tracks missed calls.
+| `<prefix>.qv.tsv` | per (haplotype, bubble): `svtypes`, `is_carrier` (a called block was applied), `δ`, `aln_len`, the residual split `sub_threshold_bp` / `over_threshold_bp`, and `qv` (comparability) |
+| `<prefix>.qv_by_haplotype.tsv` | per-haplotype `identity` and the residual split `sub_threshold_bp` / `over_threshold_bp` (the headline columns `plot_benchmark.R` reads), plus the comparability columns `qv`, cosigt `band`, `qv_max`, `qv_ratio`, `quintile` |
+| `<prefix>.qv_summary.tsv` | the `residual` scope splitting total un-reconstructed bp into `sub_threshold` (`< min-sv-bp`) vs `over_threshold` (`≥ min-sv-bp`); plus, for comparability, `% haplotypes` per `qv_ratio` quintile / cosigt band (`scope` = `quintile`/`haplotype`) and `% observations` per band per SV class (`scope` = `svclass`) |

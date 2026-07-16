@@ -66,6 +66,19 @@ fi
 NORM_GFA="$PANPHORTE_PREFIX.normalized.sorted.gfa"
 test -s "$NORM_GFA"
 
+# 4b) refine: POA-realign bubble interiors to remove pggb alignment artifacts (DUP-safe). Emits its
+#     own sorted GFA + bubbles + Bandage colours, so its output is a drop-in for call.
+REFINE_PREFIX="$OUT_DIR/refine"
+"$PANVAR_BIN" refine -i "$NORM_GFA" --bubble-prefix-in "$PANPHORTE_PREFIX" \
+  --reference-path "$REF_PATH" -o "$REFINE_PREFIX" --quiet
+REFINE_GFA="$REFINE_PREFIX.normalized.sorted.gfa"
+test -s "$REFINE_GFA"
+
+# 4c) call on the refined graph must succeed (proves the refine output is call-ready)
+REFINE_CALL_PREFIX="$OUT_DIR/refine_call"
+"$PANVAR_BIN" call -i "$REFINE_GFA" --bubble-prefix-in "$REFINE_PREFIX" \
+  --reference-path "$REF_PATH" -o "$REFINE_CALL_PREFIX" --cn --quiet
+
 # 5) call on the panphorte sorted output
 "$PANVAR_BIN" call -i "$NORM_GFA" --bubble-prefix-in "$PANPHORTE_PREFIX" \
   --reference-path "$REF_PATH" -o "$CALL_PREFIX" --cn --quiet
@@ -93,6 +106,11 @@ if [[ -n "${FIRST_BUBBLE_ID:-}" ]]; then
 fi
 test -s "$PANPHORTE_PREFIX.normalized.sorted.gfa"   # reference given -> sorted graph (no plain .normalized.gfa)
 test -s "$PANPHORTE_PREFIX.panphorte.report.tsv"
+# refine emitted panphorte's output family and its graph is call-ready
+test -s "$REFINE_PREFIX.normalized.sorted.gfa"
+test -s "$REFINE_PREFIX.bubbles.csv"
+test -s "$REFINE_PREFIX.bandage_nodes.csv"
+test -s "$REFINE_CALL_PREFIX.region.vcf"
 test -s "$CALL_PREFIX.region.vcf"
 test -s "$CALL_PREFIX.variant_nodes.tsv"   # the describe --variant-nodes and benchmark handoff
 test -s "$BENCH_PREFIX.qv.tsv"

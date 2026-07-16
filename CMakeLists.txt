@@ -46,6 +46,26 @@ add_library(edlib STATIC ${EDLIB_DIR}/src/edlib.cpp)
 target_include_directories(edlib PUBLIC $<BUILD_INTERFACE:${EDLIB_DIR}/include>)
 set_target_properties(edlib PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+# abPOA (submodule + nested SIMDe, MIT) -- partial-order alignment behind `refine`'s residual MSA.
+# Built as a static library via its own Makefile (like minimap2); its Makefile auto-detects arm64
+# (uname -m) and selects the apple-m1/SIMDe SIMD path.
+set(ABPOA_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external/abpoa)
+set(ABPOA_LIB ${ABPOA_DIR}/lib/libabpoa.a)
+if(NOT EXISTS ${ABPOA_DIR}/include/abpoa.h OR NOT EXISTS ${ABPOA_DIR}/include/simde/simde/x86/sse2.h)
+    message(FATAL_ERROR
+        "Missing abPOA sources in external/abpoa (or its nested SIMDe). "
+        "Run: git submodule update --init --recursive")
+endif()
+find_program(ABPOA_MAKE NAMES make gmake REQUIRED)
+add_custom_target(abpoa_build
+    COMMAND ${ABPOA_MAKE} -C ${ABPOA_DIR} lib/libabpoa.a
+    BYPRODUCTS ${ABPOA_LIB}
+    COMMENT "Building abPOA static library"
+)
+add_library(abpoa STATIC IMPORTED GLOBAL)
+set_target_properties(abpoa PROPERTIES IMPORTED_LOCATION ${ABPOA_LIB})
+add_dependencies(abpoa abpoa_build)
+
 # Eigen (header-only) for the `associate` LMM eigendecomposition / linear algebra.
 set(EIGEN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external/eigen)
 if(NOT EXISTS ${EIGEN_DIR}/Eigen/Dense)
@@ -72,6 +92,8 @@ add_library(panvarlib
     src/variant_call.cpp
     src/describe.cpp
     src/panphorte.cpp
+    src/poa.cpp
+    src/refine.cpp
     src/output.cpp
 )
 
@@ -81,6 +103,7 @@ target_include_directories(panvarlib
         $<INSTALL_INTERFACE:include>
     PRIVATE
         ${MINIMAP2_DIR}
+        ${ABPOA_DIR}/include
 )
 
 target_compile_options(panvarlib
@@ -93,7 +116,7 @@ target_compile_options(panvarlib
 # PRIVATE: edlib is an implementation detail of align.cpp, not part of panvarlib's
 # public interface. For a static lib CMake still propagates the symbols to the final
 # executable link, while keeping edlib out of the installed export set.
-target_link_libraries(panvarlib PRIVATE edlib)
+target_link_libraries(panvarlib PRIVATE edlib abpoa ZLIB::ZLIB)
 
 add_executable(panvar
     src/main.cpp
@@ -104,6 +127,7 @@ add_executable(panvar
     src/benchmark_command.cpp
     src/describe_command.cpp
     src/panphorte_command.cpp
+    src/refine_command.cpp
     src/associate_command.cpp
 )
 target_include_directories(panvar PRIVATE ${EIGEN_DIR})

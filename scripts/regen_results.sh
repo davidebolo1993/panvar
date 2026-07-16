@@ -13,6 +13,9 @@ RS="${RSCRIPT:-Rscript}"
 DATA="$REPO/tests/real_data"
 OUT="$REPO/results/real_data"
 THREADS="${THREADS:-0}"
+# refine (POA-realign bubble interiors to remove pggb artifacts) runs in-pipeline by default; the
+# calls come from the refined graph. Set REFINE=0 to fall back to calling on the panphorte graph.
+REFINE="${REFINE:-1}"
 # optional GTF for gene annotation; skipped if absent
 GTF="${GTF:-$DATA/Homo_sapiens.GRCh38.116.gtf.gz}"
 GTFOPT=(); [[ -f "$GTF" ]] && GTFOPT=(--gtf "$GTF")
@@ -28,7 +31,7 @@ run_region() {
   local region="$1" gfa="$2" pan_extra="$3" call_graph="$4" call_extra="$5" finer_clusters="${6:-0}"
   local d="$OUT/$region"
   echo "############ $region ############"
-  mkdir -p "$d"/{bubble,panphorte,call,describe,inspect,plots}
+  mkdir -p "$d"/{bubble,panphorte,refine,call,describe,inspect,plots}
   local ref; ref="$(ref_of "$gfa")"
   echo "[$region] reference: $ref ; call graph: $call_graph"
 
@@ -40,10 +43,18 @@ run_region() {
   "$BIN" panphorte -i "$sgfa" --bubble-prefix-in "$d/bubble/bubble" -o "$d/panphorte/panphorte" \
     --reference-path "$ref" --threads "$THREADS" "${GTFOPT[@]}" --quiet $pan_extra || return 1
   local pgfa="$d/panphorte/panphorte.normalized.sorted.gfa"
+  local ppfx="$d/panphorte/panphorte"
+  # 2b) refine (default on; REFINE=0 to skip): POA-realign bubble interiors to remove pggb alignment
+  #     artifacts. DUP-safe (folded REP nodes held fixed); emits its own sorted GFA + bubbles the rest consume.
+  if [[ "$REFINE" == "1" && "$call_graph" == "panphorte" ]]; then
+    "$BIN" refine -i "$pgfa" --bubble-prefix-in "$ppfx" --reference-path "$ref" \
+      -o "$d/refine/refine" "${GTFOPT[@]}" --quiet || return 1
+    pgfa="$d/refine/refine.normalized.sorted.gfa"; ppfx="$d/refine/refine"
+  fi
   # Pick the graph + bubble prefix `call`/`describe`/`inspect` read, per topology.
   local cgfa cpfx
   if [[ "$call_graph" == "bubble" ]]; then cgfa="$sgfa"; cpfx="$d/bubble/bubble";
-  else cgfa="$pgfa"; cpfx="$d/panphorte/panphorte"; fi
+  else cgfa="$pgfa"; cpfx="$ppfx"; fi
   # 3) call
   "$BIN" call -i "$cgfa" --bubble-prefix-in "$cpfx" --reference-path "$ref" \
     -o "$d/call/call" --threads "$THREADS" "${GTFOPT[@]}" --quiet $call_extra || return 1
@@ -221,17 +232,15 @@ elif [[ -s "$CN_TABLE" ]]; then
   echo "  (R not found; skipping cn_correlation plot; table at $CN_TABLE)"
 fi
 
-# Round-trip QV summary: combine each locus's per-haplotype benchmark, then a cosigt-style stacked bar.
+# Round-trip QV summary: combine each locus's per-haplotype benchmark, then the reconstruction-anatomy plot.
 QV_TABLE="$REPO/results/benchmark_qv.tsv"
-printf 'locus\tsample\tsum_delta\tsum_aln_len\tqv\tband\tqv_ratio\tquintile\tidentity\n' > "$QV_TABLE"
+printf 'locus\tsample\tsum_delta\tsum_aln_len\tqv\tidentity\tsub_threshold_bp\tover_threshold_bp\n' > "$QV_TABLE"
 for region in "${REGIONS[@]}"; do
   bh="$OUT/$region/call/benchmark.qv_by_haplotype.tsv"
-  [[ -s "$bh" ]] && awk -F'\t' -v L="$region" 'NR>1{print L"\t"$1"\t"$3"\t"$4"\t"$5"\t"$6"\t"$8"\t"$9"\t"$10}' "$bh" >> "$QV_TABLE"
+  [[ -s "$bh" ]] && awk -F'\t' -v L="$region" 'NR>1{print L"\t"$1"\t"$3"\t"$4"\t"$5"\t"$10"\t"$11"\t"$12}' "$bh" >> "$QV_TABLE"
 done
 if [[ $(wc -l < "$QV_TABLE") -gt 1 ]] && have_r; then
-  for cat in dist quintile band identity; do
-    "$RS" "$HERE/plot_benchmark_qv.R" --table "$QV_TABLE" --out "$REPO/results/benchmark_qv" --category "$cat" \
-      || echo "  (benchmark_qv $cat plot skipped)"
-  done
+  "$RS" "$HERE/plot_benchmark.R" --table "$QV_TABLE" --out "$REPO/results/benchmark_qv" --per-row 12 \
+    || echo "  (benchmark plot skipped)"
 fi
 echo "ALL DONE -> $REPO/results"
