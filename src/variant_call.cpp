@@ -589,6 +589,10 @@ void call_variants(
     for (const auto& st : ref_path->steps) ref_total_bp += node_len(graph, st.node_id);
     const std::size_t ref_end_1based =
         ref_meta.region_start_1based + (ref_total_bp > 0 ? ref_total_bp - 1 : 0);
+    // A peak/coverage DUP spanning more than this many bp is a tangle artifact, not a real duplication.
+    const std::size_t max_dup_bp = options.max_dup_region_frac > 0.0
+        ? static_cast<std::size_t>(options.max_dup_region_frac * static_cast<double>(ref_total_bp))
+        : 0;
 
     // Optional GTF annotation: project reference-coordinate genes onto reference nodes via the PanSN
     // chrom+start. node_genes maps a ref node id -> gene indices. Built once, const in the parallel
@@ -633,6 +637,18 @@ void call_variants(
     for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) name_to_pi.emplace(graph.paths[pi].name, pi);
 
     const std::unordered_set<std::string> selfloops = self_loop_nodes(graph);
+
+    // Distinct-neighbour degree per node, for the low-complexity tangle guard. A hub reached from all
+    // over the graph has high degree; a repeat/paralog unit sits in a chain (degree ~2-6). One pass.
+    std::unordered_map<std::string, std::size_t> node_degree;
+    if (options.tangle_min_hubs > 0) {
+        for (const auto& kv : graph.nodes) {
+            std::unordered_set<std::string> nb;
+            for (const Neighbor& n : kv.second.start) nb.insert(n.node_id);
+            for (const Neighbor& n : kv.second.end) nb.insert(n.node_id);
+            node_degree[kv.first] = nb.size();
+        }
+    }
 
     cli::ensure_parent_dir_for_file(options.out_prefix + ".region.vcf");
 
@@ -847,6 +863,20 @@ void call_variants(
         bool has_rep_selfloop = false;
         for (const std::string& cn : cn_nodes)
             if (node_len(graph, cn) >= options.min_sv_bp) { has_rep_selfloop = true; break; }
+        // Low-complexity tangle: a bubble whose interior holds many high-degree hub nodes (reached from
+        // all over the graph) is a low-complexity region, not a copy-number module -- its node
+        // multiplicity is meaningless as copy number. Suppress the coverage/peak DUP routes there. A
+        // real paralog cluster is chain-like (low degree) and has ~0 hubs, so it is unaffected.
+        bool is_tangle = false;
+        if (options.tangle_min_hubs > 0) {
+            std::size_t hubs = 0;
+            for (const std::string& id : bubble.inside) {
+                const auto it = node_degree.find(id);
+                if (it != node_degree.end() && it->second >= options.tangle_hub_degree &&
+                    ++hubs >= options.tangle_min_hubs) { is_tangle = true; break; }
+            }
+            if (is_tangle) ++summary.tangle_bubbles;
+        }
         bool coverage_fired = false;
         double cn_unit_bp = 0.0;   // one-copy bp of the coverage module (set when coverage fires)
         if (options.cn && !has_rep_selfloop) {
@@ -1194,6 +1224,23 @@ void call_variants(
                 }
                 merged = std::move(kept);
             }
+        }
+
+        // Drop copy-number DUPs that are low-complexity-tangle or physically implausible (span > a
+        // large fraction of the reference). Runs AFTER the folded-INS de-dup above, so the matching INS
+        // stays dropped -- we remove only the bogus DUP record, without resurfacing its content. Genuine
+        // self-loop REP DUPs (cn_peak=false, e.g. KIV-2) are never touched.
+        if (is_tangle || max_dup_bp > 0) {
+            std::vector<MergedRecord> kept;
+            for (MergedRecord& mr : merged) {
+                const bool cn_dup = (mr.seed.type == EvType::Dup && mr.seed.cn_peak);
+                if (cn_dup && (is_tangle || (max_dup_bp > 0 && mr.seed.size_bp > max_dup_bp))) {
+                    ++summary.oversized_dups;
+                    continue;
+                }
+                kept.push_back(std::move(mr));
+            }
+            merged = std::move(kept);
         }
 
         // ---- INS subtype refinement on the representative only (bounded minimap2 calls).
@@ -1678,6 +1725,8 @@ void call_variants(
         summary.inv += bo.sum.inv;
         summary.dup += bo.sum.dup;
         summary.multi += bo.sum.multi;
+        summary.tangle_bubbles += bo.sum.tangle_bubbles;
+        summary.oversized_dups += bo.sum.oversized_dups;
         for (OutRecord& r : bo.records) out_records.push_back(std::move(r));
         for (std::string& s : bo.variant_nodes) variant_nodes_rows.push_back(std::move(s));
         for (DupGeneTarget& t : bo.dup_targets) dup_targets.push_back(std::move(t));

@@ -31,6 +31,18 @@ struct VariantCallOptions {
     std::string minimap_preset = "asm20";
     std::size_t minimap_best_n = 8;
     double ins_dup_min_identity = 0.90;  // identity for an INS to be subtyped DUP
+    // Low-complexity tangle guard: a bubble whose interior is a densely-interconnected tangle (many
+    // high-degree hub nodes, reached from all over the graph) is a low-complexity region, not a
+    // copy-number module. Its node multiplicity is meaningless as copy number, so the coverage/peak
+    // DUP routes are suppressed there. A real paralog cluster -- even a large one -- is chain-like
+    // (low-degree nodes) and has ~0 hubs, so it is unaffected.
+    std::size_t tangle_hub_degree = 20;  // an interior node with >= this many distinct neighbours is a "hub"
+    std::size_t tangle_min_hubs = 10;    // a bubble with >= this many hubs is a low-complexity tangle (0=off)
+    // Physical implausibility guard for the peak/coverage DUP routes: a copy-number event whose size
+    // spans more than this fraction of the whole reference isn't a coherent duplication -- it is a
+    // tangle summing diffuse revisits (real peak/coverage DUPs span a few % of the locus). Suppressed.
+    // The self-loop REP route (genuine folded tandems, e.g. KIV-2) is not gated by this. 0 = off.
+    double max_dup_region_frac = 0.80;
     std::string gtf_path;                // optional reference-coordinate GTF: annotate variants with the
                                          // genes they touch (INFO GENES), write <prefix>.node_genes.tsv,
                                          // and a per-gene DUP copy-number table; needs a PanSN reference
@@ -52,6 +64,8 @@ struct VariantCallSummary {
     std::size_t inv = 0;
     std::size_t dup = 0;
     std::size_t multi = 0;  // multiallelic-locus records (--multiallelic-loci)
+    std::size_t tangle_bubbles = 0;   // bubbles flagged low-complexity tangles (CN routes suppressed)
+    std::size_t oversized_dups = 0;   // peak DUPs suppressed for spanning too much of the reference
 };
 
 void call_variants(

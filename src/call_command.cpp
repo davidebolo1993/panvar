@@ -43,6 +43,12 @@ void print_call_help() {
         << "      --minimap-preset <name>      minimap2 preset for INS refinement: asm5|asm10|asm20 (default: asm20)\n"
         << "      --minimap-best-n <N>         minimap2 best_n chains (default: 8)\n"
         << "      --ins-dup-min-identity <X>   Identity for an INS to be subtyped DUP (default: 0.90)\n"
+        << "      --tangle-min-hubs <N>        Suppress DUP/CN calling in a low-complexity tangle: a bubble\n"
+        << "                                   with >= N high-degree hub interior nodes (default: 10, 0=off)\n"
+        << "      --tangle-hub-degree <N>      Distinct-neighbour degree for an interior node to count as a\n"
+        << "                                   tangle hub (default: 20)\n"
+        << "      --max-dup-region-frac <F>    Suppress a peak DUP spanning more than this fraction of the\n"
+        << "                                   reference (a tangle artifact, not a real dup; default: 0.8, 0=off)\n"
         << "      --cn                         Copy-number calling (locus-agnostic): enables all routes and\n"
         << "                                   resolves them by topology (self-loop REP > coverage > peak),\n"
         << "                                   emitting the TOTAL copy number of the folded module. With --gtf\n"
@@ -153,6 +159,18 @@ int run_call_command(const std::vector<std::string>& args) {
             options.cn = true;
             continue;
         }
+        if (arg == "--tangle-hub-degree") {
+            options.tangle_hub_degree = cli::parse_size_arg(arg, require_value(arg));
+            continue;
+        }
+        if (arg == "--tangle-min-hubs") {    // 0 disables the low-complexity tangle guard
+            options.tangle_min_hubs = cli::parse_size_arg(arg, require_value(arg));
+            continue;
+        }
+        if (arg == "--max-dup-region-frac") {  // suppress a peak DUP spanning > this fraction of the reference
+            options.max_dup_region_frac = std::stod(require_value(arg));
+            continue;
+        }
         if (arg == "--gtf") {
             options.gtf_path = require_value(arg);
             continue;
@@ -243,6 +261,13 @@ int run_call_command(const std::vector<std::string>& args) {
              " bubbles (DEL " + std::to_string(summary.del) + ", INS " + std::to_string(summary.ins) +
              ", INV " + std::to_string(summary.inv) + ", DUP " + std::to_string(summary.dup) +
              ", MULTI " + std::to_string(summary.multi) + ")");
+    if (summary.oversized_dups > 0) {
+        log.info("suppressed " + std::to_string(summary.oversized_dups) +
+                 " copy-number DUP call(s) as low-complexity-tangle or oversized (> max-dup-region-frac)" +
+                 (summary.tangle_bubbles > 0
+                      ? "; " + std::to_string(summary.tangle_bubbles) + " bubble(s) flagged tangle"
+                      : ""));
+    }
 
     std::vector<std::string> outputs;
     outputs.push_back(options.out_prefix + ".region.vcf");
