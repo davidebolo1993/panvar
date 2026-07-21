@@ -24,7 +24,11 @@ Approximate mode (`< 1.0`) does single-block, lossy collapse via an in-process b
 - Find copies per path by aligning the unit (and its reverse complement) into the path's spelled sequence: k-mer anchors propose starts, a banded fit alignment decides each copy, its extent, and orientation. Edit budget `(1 − f)·|unit|` (uncapped): a copy folds while its edits (mismatches + indels) stay within it, so a copy with a large internal indel still aligns when `f` is low. Copies need not be adjacent; sequence between them is kept as literal nodes.
 - Collapse copies to one `REP` node traversed once per copy (self-loop when adjacent, edges through flanking literals otherwise). Lossy: within-copy SNVs/indels are discarded. Per-copy orientation is preserved (`REP +,−,+`). Single copies of the seeded unit fold too.
 
-A limitation worth considering is that the unit must occur as `≥ 2` adjacent identical copies in `≥ 1` haplotype to be seeded. A duplication with no adjacent identical pair anywhere (e.g. paralogs separated by other sequence) is left intact.
+Both routes above measure the period in node steps: the unit is a run of consecutive steps that repeats. That works when the graph splits nodes at repeat-unit boundaries, which is what a builder producing one node per distinct observed segment does. It fails when the boundaries fall elsewhere — a graph built by progressive alignment splits an array wherever chaining happened to break it, so a four-copy array may be spread over an arbitrary number of nodes with no step period at all, even though the base-level period is unambiguous.
+
+For a bubble where the node-step detector finds nothing anywhere, the unit is instead seeded at base level from the spelled sequence: candidate lags are proposed by k-mer occurrence and each is accepted or rejected by comparing adjacent copies at that lag. Once a unit is seeded, the approximate route above takes over unchanged.
+
+A limitation worth considering is that the unit must occur as `≥ 2` adjacent identical copies in `≥ 1` haplotype to be seeded by the node-step route. A duplication with no adjacent identical pair anywhere (e.g. paralogs separated by other sequence) is left intact unless the base-level fallback seeds it.
 
 ## Worked trace
 

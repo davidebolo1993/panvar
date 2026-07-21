@@ -66,6 +66,40 @@ add_library(abpoa STATIC IMPORTED GLOBAL)
 set_target_properties(abpoa PROPERTIES IMPORTED_LOCATION ${ABPOA_LIB})
 add_dependencies(abpoa abpoa_build)
 
+# minigraph (submodule, MIT) -- progressive graph generation (mg_ggen) + graph mapping (mg_map) behind
+# `rebuild`. Its Makefile builds only the executable, so we build the objects and archive them ourselves.
+#
+# minimap2 vendored the same lh3 chaining/util code, so the two libraries export ~24 identical symbols
+# (mg_lchain_dp, gfa_aux_*, seq_nt4_table, ksort/krmq instantiations) and cannot simply be linked side by
+# side. Fix: partial-link (ld -r) all of minigraph's objects EXCEPT main.o into a single relocatable
+# object, keeping only the handful of entry points `rebuild` calls global and localizing everything else.
+# minigraph's internal calls then bind to its own copies, and nothing collides with minimap2.
+set(MINIGRAPH_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external/minigraph)
+set(MINIGRAPH_LIB ${MINIGRAPH_DIR}/libminigraph.a)
+set(MINIGRAPH_MERGED ${MINIGRAPH_DIR}/minigraph_merged.o)
+if(NOT EXISTS ${MINIGRAPH_DIR}/minigraph.h OR NOT EXISTS ${MINIGRAPH_DIR}/Makefile)
+    message(FATAL_ERROR
+        "Missing minigraph sources in external/minigraph. "
+        "Run: git submodule update --init --recursive")
+endif()
+find_program(MINIGRAPH_MAKE NAMES make gmake REQUIRED)
+if(APPLE)
+    set(MINIGRAPH_EXPORTS ${CMAKE_CURRENT_SOURCE_DIR}/cmake/minigraph_exports_macho.txt)
+else()
+    set(MINIGRAPH_EXPORTS ${CMAKE_CURRENT_SOURCE_DIR}/cmake/minigraph_exports_elf.txt)
+endif()
+add_custom_target(minigraph_build
+    COMMAND ${MINIGRAPH_MAKE} -C ${MINIGRAPH_DIR} minigraph
+    COMMAND ${CMAKE_COMMAND} -E rm -f ${MINIGRAPH_LIB} ${MINIGRAPH_MERGED}
+    COMMAND /usr/bin/env bash ${CMAKE_CURRENT_SOURCE_DIR}/cmake/build_minigraph_lib.sh
+            ${MINIGRAPH_DIR} ${MINIGRAPH_EXPORTS}
+    BYPRODUCTS ${MINIGRAPH_LIB} ${MINIGRAPH_MERGED}
+    COMMENT "Building minigraph static library (symbols localized against minimap2)"
+)
+add_library(minigraph STATIC IMPORTED GLOBAL)
+set_target_properties(minigraph PROPERTIES IMPORTED_LOCATION ${MINIGRAPH_LIB})
+add_dependencies(minigraph minigraph_build)
+
 # Eigen (header-only) for the `associate` LMM eigendecomposition / linear algebra.
 set(EIGEN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external/eigen)
 if(NOT EXISTS ${EIGEN_DIR}/Eigen/Dense)
@@ -94,6 +128,7 @@ add_library(panvarlib
     src/panphorte.cpp
     src/poa.cpp
     src/refine.cpp
+    src/rebuild.cpp
     src/output.cpp
 )
 
@@ -106,6 +141,10 @@ target_include_directories(panvarlib
         ${ABPOA_DIR}/include
 )
 
+# SYSTEM: minigraph's headers use C99 flexible array members, which our -Wpedantic flags in C++.
+# The vendored source is not ours to fix, so exempt it the way the other vendored targets are.
+target_include_directories(panvarlib SYSTEM PRIVATE ${MINIGRAPH_DIR})
+
 target_compile_options(panvarlib
     PRIVATE
         -Wall
@@ -116,7 +155,7 @@ target_compile_options(panvarlib
 # PRIVATE: edlib is an implementation detail of align.cpp, not part of panvarlib's
 # public interface. For a static lib CMake still propagates the symbols to the final
 # executable link, while keeping edlib out of the installed export set.
-target_link_libraries(panvarlib PRIVATE edlib abpoa ZLIB::ZLIB)
+target_link_libraries(panvarlib PRIVATE edlib abpoa minigraph ZLIB::ZLIB)
 
 add_executable(panvar
     src/main.cpp
@@ -128,6 +167,7 @@ add_executable(panvar
     src/describe_command.cpp
     src/panphorte_command.cpp
     src/refine_command.cpp
+    src/rebuild_command.cpp
     src/associate_command.cpp
 )
 target_include_directories(panvar PRIVATE ${EIGEN_DIR})

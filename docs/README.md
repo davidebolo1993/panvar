@@ -12,8 +12,9 @@ Documentation for the `panvar` CLI, organized into three subfolders plus a share
 
 ## Pipeline
 
-`bubble → panphorte → [refine] → call → describe → associate`, plus the `inspect` and `benchmark` utilities.
+`[rebuild] → bubble → panphorte → [refine] → call → describe → associate`, plus the `inspect` and `benchmark` utilities.
 
+0. [modules/rebuild.md](modules/rebuild.md) — (opt-in, gated) re-induce a locus graph too fragmented to decompose, before bubble finding.
 1. [modules/bubble.md](modules/bubble.md) — bubble-site extraction from a GFA.
 2. [modules/panphorte.md](modules/panphorte.md) — normalize tandem-repeat bubbles into a copy-number-explicit GFA.
 3. [modules/refine.md](modules/refine.md) — (opt-in) POA-realign bubble interiors to remove graph-builder alignment artifacts.

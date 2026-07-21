@@ -1484,11 +1484,16 @@ void call_variants(
                 const bool reverse_bubble = (ps >= 0 && pk >= 0 && pk < ps);
                 anchor_after = !reverse_bubble;
             } else {
-                // DUP: genomically upstream of the bubble's source/sink boundary.
+                // DUP: genomically upstream of the bubble's source/sink boundary. The duplicated content
+                // starts immediately AFTER that flank ends, so POS is the flank's LAST base -- the same
+                // convention INS uses above. Taking its first base instead is only invisible when flanks
+                // are short: on a pggb graph the flank is fragmented to a few bp, but on a minigraph-style
+                // graph it is a single multi-kb backbone node and POS lands kb upstream (measured: an
+                // 11 kb error against a 10 956 bp flank).
                 const long long ps = rpos(bubble.source), pk = rpos(bubble.sink);
                 if (pk >= 0 && (ps < 0 || pk < ps)) anchor = bubble.sink;
                 else anchor = bubble.source;
-                anchor_after = false;
+                anchor_after = true;
             }
             std::size_t pos = 1;
             std::string ref_base = "N";

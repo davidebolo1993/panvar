@@ -359,8 +359,7 @@ struct PathArray {
 };
 
 // Approximate (similarity-based) collapse: pick one representative repeat unit per bubble, find
-// near-identical copies by banded alignment of the unit against each path (so a divergent copy with a
-// big internal indel, e.g. the C4 long/short HERV, is bridged at low --min-similarity), then collapse
+// near-identical copies by banded alignment of the unit against each path, then collapse
 // them lossily to one REP node. Detection is per-path/multithreaded; the graph mutation is serial.
 
 constexpr std::size_t kAnchorSeeds = 8;     // seeds spread across the unit for anchoring
@@ -467,6 +466,72 @@ std::size_t nearest_step_off(const std::vector<std::size_t>& prefix, std::size_t
     return (bp - prefix[lo] <= prefix[hi] - bp) ? lo : hi;
 }
 
+// Base-level tandem seeding: the smallest lag p (>= min_unit_bp) at which the spelled interval is
+// self-similar. This is the fallback for graphs whose node boundaries do NOT coincide with repeat-unit
+// boundaries: `detect_tandems` above measures its period in node STEPS, so a minigraph-style DAG that
+// splits a 4x900 bp array into 9 arbitrary nodes shows no token period even though the base-level one is
+// unambiguous. pggb splits at repeat boundaries, so on those graphs the token detector always wins and
+// this never runs.
+//
+// Cost is bounded and independent of unit size: a few 2-bit k-mer scans (O(len)) propose candidate lags,
+// each accepted/rejected by a SAMPLED identity check (kSamples positions), never a full O(len^2) scan.
+std::string seed_unit_by_period(const std::string& s, std::size_t min_unit_bp, double min_identity) {
+    constexpr std::size_t k = 16;
+    constexpr std::size_t kProbes = 16;        // seed offsets spread ACROSS the interval: the array is
+                                               // usually interior (the interval carries the source/sink
+                                               // flanks, often kb of backbone), and probing only the
+                                               // start would seed inside the flank and find nothing
+    constexpr std::size_t kMaxCandidates = 8;  // candidate lags examined per offset
+    constexpr std::size_t kSamples = 2048;     // sampled identity keeps each candidate ~O(1)
+    if (min_unit_bp == 0 || s.size() < 2 * min_unit_bp || s.size() < 2 * k) {
+        return {};
+    }
+    const std::size_t stride = std::max<std::size_t>(k, s.size() / kProbes);
+    for (std::size_t off = 0, tried_off = 0; tried_off < kProbes && off + k <= s.size();
+         off += stride, ++tried_off) {
+        const std::vector<std::size_t> occ = find_kmer_starts(s, s.substr(off, k));
+        std::size_t tried = 0;
+        for (const std::size_t j : occ) {
+            if (j <= off) {
+                continue;
+            }
+            const std::size_t p = j - off;
+            if (p < min_unit_bp) {
+                continue;
+            }
+            if (off + 2 * p > s.size()) {
+                break; // need two full copies to call it a tandem
+            }
+            if (++tried > kMaxCandidates) {
+                break;
+            }
+            // Verify LOCALLY, on adjacent copy pairs walking right from the seed. Measuring identity
+            // across the whole interval would drown the signal: the interval carries the source/sink
+            // flanks (often kb of non-periodic backbone), so a real array's lag scores near-random there.
+            const std::size_t sample_step = std::max<std::size_t>(1, p / kSamples);
+            std::size_t copies = 1;
+            for (std::size_t a = off; a + 2 * p <= s.size(); a += p) {
+                std::size_t seen = 0;
+                std::size_t hit = 0;
+                for (std::size_t i = 0; i < p; i += sample_step) {
+                    ++seen;
+                    if (s[a + i] == s[a + p + i]) {
+                        ++hit;
+                    }
+                }
+                if (seen == 0 || static_cast<double>(hit) / static_cast<double>(seen) < min_identity) {
+                    break;
+                }
+                ++copies;
+            }
+            if (copies >= 2) {
+                return s.substr(off, p); // a rotation of the unit; any rotation folds equivalently
+            }
+        }
+    }
+    return {};
+}
+
 // Seed the repeat unit from the exact tandem detector: a unit must come from a clean adjacent
 // identical pair, so we get the true period (the whole ~32 kb C4 module, not a recurring sub-segment).
 // Per-path scan is parallel; the tally merge is serial in path order and the winner is the
@@ -499,6 +564,30 @@ std::string pick_reference_unit(
     std::unordered_map<std::string, std::size_t> tally;
     for (const auto& v : per_path) {
         for (const auto& [seq, w] : v) tally[seq] += w;
+    }
+    // Fallback: no node-step period anywhere in this bubble. Retry at base level, where a unit whose
+    // boundaries straddle node boundaries is still visible. Gated on the token detector coming up empty,
+    // so graphs that split at repeat boundaries (pggb: LPA, C4, GSTM1) never reach this and are unchanged.
+    if (tally.empty()) {
+        std::vector<std::vector<Cand>> per_path_bp(graph.paths.size());
+        run_parallel(graph.paths.size(), options.threads, [&](std::size_t pi) {
+            const auto interval = find_best_bubble_path_interval(path_indexes[pi], bubble);
+            if (!interval.has_value()) return;
+            const std::size_t left = interval->left;
+            const std::size_t n = interval->right - left + 1;
+            const std::vector<PathStep> nat(
+                graph.paths[pi].steps.begin() + static_cast<std::ptrdiff_t>(left),
+                graph.paths[pi].steps.begin() + static_cast<std::ptrdiff_t>(left + n));
+            const std::string snat = spell_path_steps_sequence(graph, nat);
+            const std::string unit =
+                seed_unit_by_period(snat, options.min_unit_bp, options.min_similarity);
+            if (!unit.empty()) {
+                per_path_bp[pi].emplace_back(unit, snat.size() / unit.size());
+            }
+        });
+        for (const auto& v : per_path_bp) {
+            for (const auto& [seq, w] : v) tally[seq] += w;
+        }
     }
     std::string best;
     std::size_t best_n = 0;

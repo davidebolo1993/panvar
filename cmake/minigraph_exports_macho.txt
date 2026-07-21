@@ -1,0 +1,15 @@
+# Symbols kept global when minigraph is partial-linked into one object (Mach-O: leading underscore).
+# Everything else is localized so it cannot collide with minimap2, which vendored the same lh3
+# chaining/util code (mg_lchain_dp, gfa_aux_*, seq_nt4_table, ksort/krmq instantiations).
+_mg_ggen
+_mg_index
+_mg_idx_destroy
+_mg_map
+_mg_opt_set
+_mg_gchain_free
+_mg_tbuf_init
+_mg_tbuf_destroy
+_mg_verbose
+_gfa_read
+_gfa_destroy
+_gfa_init

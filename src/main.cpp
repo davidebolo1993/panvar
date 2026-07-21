@@ -11,6 +11,7 @@
 #include "panvar/describe_command.hpp"
 #include "panvar/inspect.hpp"
 #include "panvar/panphorte_command.hpp"
+#include "panvar/rebuild_command.hpp"
 #include "panvar/refine_command.hpp"
 
 int main(int argc, char** argv) {
@@ -53,6 +54,9 @@ int main(int argc, char** argv) {
         }
         if (subcommand == "refine") {
             return panvar::run_refine_command(args);
+        }
+        if (subcommand == "rebuild") {
+            return panvar::run_rebuild_command(args);
         }
         if (subcommand == "associate") {
             return panvar::run_associate_command(args);

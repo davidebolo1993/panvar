@@ -10,6 +10,8 @@ Normalizes contiguous, tandem repeat (TR) bubbles into a compact, copy-number-ex
 
 Collapse is exact by default (byte-identical copies) and can be made approximate to fold divergent copies. Only genuine population TR are folded, not rare duplications.
 
+Detection normally measures the repeat period in node steps, which requires the graph to split nodes at repeat-unit boundaries. When a bubble yields no step period — as happens on graphs whose node boundaries were set by alignment rather than by the repeat — the unit is seeded from the spelled sequence instead, so an array split across arbitrary node boundaries is still folded.
+
 Algorithm and worked trace: [algorithms/panphorte.md](../algorithms/panphorte.md).
 
 ## Required inputs

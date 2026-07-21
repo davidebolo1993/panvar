@@ -29,6 +29,13 @@ GitHub: [yangao07/abPOA](https://github.com/yangao07/abPOA) — SIMD partial-ord
 
 - Gao Y, Liu Y, Ma Y, Liu B, Wang Y, Xing Y. **abPOA: an SIMD-based C library for fast partial order alignment using adaptive band.** *Bioinformatics* 2021;37(15):2209–2211. <https://doi.org/10.1093/bioinformatics/btaa963>
 
+## `rebuild`
+
+GitHub: [lh3/minigraph](https://github.com/lh3/minigraph) — progressive graph generation and graph mapping, statically vendored as the construction engine behind `rebuild`.
+
+- Li H, Feng X, Chu C. **The design and construction of reference pangenome graphs with minigraph.** *Genome Biol.* 22, 265 (2021). <https://doi.org/10.1186/s13059-021-02168-z> — the incremental graph-generation model `rebuild` drives.
+- Hickey G, Monlong J, Ebler J, et al. **Pangenome graph construction from genome alignments with Minigraph-Cactus.** *Nat. Biotechnol.* 42, 663–673 (2024). <https://doi.org/10.1038/s41587-023-01793-w> — the base-level refinement step `rebuild` deliberately does not perform, and the reason its output is structural rather than base-exact.
+
 ## `call`
 
 GitHub: [lh3/minimap2](https://github.com/lh3/minimap2) — used for INS subtype realignment and, in the per-gene copy-number resolver, the one-time reference alignment of a near-identical paralog pair's coding sequences (to locate their divergent columns for the per-site split). Per-haplotype copy number is read by k-mer dosage, without alignment.

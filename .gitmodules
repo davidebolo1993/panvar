@@ -10,3 +10,6 @@
 [submodule "external/abpoa"]
 	path = external/abpoa
 	url = https://github.com/yangao07/abPOA.git
+[submodule "external/minigraph"]
+	path = external/minigraph
+	url = https://github.com/lh3/minigraph.git

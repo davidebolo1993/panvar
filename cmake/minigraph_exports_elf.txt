@@ -1,0 +1,12 @@
+mg_ggen
+mg_index
+mg_idx_destroy
+mg_map
+mg_opt_set
+mg_gchain_free
+mg_tbuf_init
+mg_tbuf_destroy
+mg_verbose
+gfa_read
+gfa_destroy
+gfa_init
