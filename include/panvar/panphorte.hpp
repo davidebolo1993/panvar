@@ -12,12 +12,9 @@ struct PanphorteOptions {
     std::string out_prefix;         // writes <prefix>.normalized.gfa + <prefix>.panphorte.report.tsv
     std::size_t min_unit_bp = 50;   // minimum repeat-unit span to normalize
     std::size_t min_copies = 2;     // minimum tandem copies to normalize
-    // Minimum fraction of bubble-traversing haplotypes that must carry a >=min_copies tandem array
-    // for the bubble to be normalized. This distinguishes a genuine population VNTR (folded; e.g.
-    // LPA KIV-2, carried by ~all haplotypes) from a RARE private duplication of a gene/segmental
-    // module (left untouched; e.g. a CYP2D6x2 in a handful of haplotypes, or the C4/RCCX module
-    // carried by a minority) -- those are gene-level events resolved later by `call`, and folding
-    // them here would collapse paralogs/genes. Default 0.5 (a true VNTR is carried by a majority).
+    // Minimum fraction of bubble-traversing haplotypes carrying a >=min_copies array for the bubble to
+    // be normalized. Separates a population VNTR (folded) from a rare private duplication of a gene or
+    // segmental module (left for `call`, since folding would collapse paralogs). Default 0.5.
     double min_array_prevalence = 0.5;
     double max_interruption_frac = 0.25; // tolerance for interrupting bases within an array
     // Minimum identity to treat a block as a copy of the repeat unit. 1.0 = exact

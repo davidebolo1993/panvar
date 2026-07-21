@@ -466,15 +466,11 @@ std::size_t nearest_step_off(const std::vector<std::size_t>& prefix, std::size_t
     return (bp - prefix[lo] <= prefix[hi] - bp) ? lo : hi;
 }
 
-// Base-level tandem seeding: the smallest lag p (>= min_unit_bp) at which the spelled interval is
-// self-similar. This is the fallback for graphs whose node boundaries do NOT coincide with repeat-unit
-// boundaries: `detect_tandems` above measures its period in node STEPS, so a minigraph-style DAG that
-// splits a 4x900 bp array into 9 arbitrary nodes shows no token period even though the base-level one is
-// unambiguous. pggb splits at repeat boundaries, so on those graphs the token detector always wins and
-// this never runs.
-//
-// Cost is bounded and independent of unit size: a few 2-bit k-mer scans (O(len)) propose candidate lags,
-// each accepted/rejected by a SAMPLED identity check (kSamples positions), never a full O(len^2) scan.
+// Base-level tandem seeding: the smallest lag (>= min_unit_bp) at which the spelled interval is
+// self-similar. Fallback for graphs whose node boundaries do not follow repeat-unit boundaries, where
+// `detect_tandems` -- which measures its period in node STEPS -- sees no period at all. Cost is bounded
+// and independent of unit size: 2-bit k-mer scans propose candidate lags, each settled by a sampled
+// identity check rather than a full O(len^2) scan.
 std::string seed_unit_by_period(const std::string& s, std::size_t min_unit_bp, double min_identity) {
     constexpr std::size_t k = 16;
     constexpr std::size_t kProbes = 16;        // seed offsets spread ACROSS the interval: the array is
@@ -567,7 +563,7 @@ std::string pick_reference_unit(
     }
     // Fallback: no node-step period anywhere in this bubble. Retry at base level, where a unit whose
     // boundaries straddle node boundaries is still visible. Gated on the token detector coming up empty,
-    // so graphs that split at repeat boundaries (pggb: LPA, C4, GSTM1) never reach this and are unchanged.
+    // so graphs that split at repeat boundaries never reach this and are unchanged.
     if (tally.empty()) {
         std::vector<std::vector<Cand>> per_path_bp(graph.paths.size());
         run_parallel(graph.paths.size(), options.threads, [&](std::size_t pi) {

@@ -137,13 +137,12 @@ target_include_directories(panvarlib
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
     PRIVATE
-        ${MINIMAP2_DIR}
         ${ABPOA_DIR}/include
 )
 
-# SYSTEM: minigraph's headers use C99 flexible array members, which our -Wpedantic flags in C++.
-# The vendored source is not ours to fix, so exempt it the way the other vendored targets are.
-target_include_directories(panvarlib SYSTEM PRIVATE ${MINIGRAPH_DIR})
+# SYSTEM: minimap2's and minigraph's headers use C99 flexible array members, which our -Wpedantic flags
+# in C++. The vendored sources are not ours to fix, so exempt them as the other vendored targets are.
+target_include_directories(panvarlib SYSTEM PRIVATE ${MINIMAP2_DIR} ${MINIGRAPH_DIR})
 
 target_compile_options(panvarlib
     PRIVATE

@@ -1,15 +1,9 @@
 #pragma once
 
-// Reference-guided node ORDERING for a GFA, done internally so the pipeline does not
-// depend on `odgi sort`/`odgi flip`. Operates on the editable GfaModel (so both `bubble`
-// and `panphorte` can reuse it) and restores the invariant the rest of panvar relies on:
-// numeric node id == reference order. Three steps:
-//   1. flip   - reverse-complement nodes the reference path traverses in reverse so the
-//               reference reads all-forward (optional; a no-op when already forward).
-//   2. sort   - reference-guided topological order (reference backbone in path order, each
-//               bubble's interior contiguous right after its source).
-//   3. renumber - assign ids 1..N in sorted order (rewriting S/L/P/W).
-// Idempotent on a graph that is already sorted+flipped along the reference.
+// Reference-guided node ordering for a GFA, internal so the pipeline does not depend on odgi. Restores
+// the invariant the rest of panvar relies on -- numeric node id == reference order -- in three steps:
+// flip nodes the reference traverses in reverse, sort into reference-guided topological order (each
+// bubble's interior contiguous after its source), renumber 1..N. Idempotent on an already-sorted graph.
 
 #include "panvar/gfa_io.hpp"
 

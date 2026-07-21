@@ -41,7 +41,7 @@ struct VariantCallOptions {
     // Physical implausibility guard for the peak/coverage DUP routes: a copy-number event whose size
     // spans more than this fraction of the whole reference isn't a coherent duplication -- it is a
     // tangle summing diffuse revisits (real peak/coverage DUPs span a few % of the locus). Suppressed.
-    // The self-loop REP route (genuine folded tandems, e.g. KIV-2) is not gated by this. 0 = off.
+    // The self-loop REP route (genuine folded tandems) is not gated by this. 0 = off.
     double max_dup_region_frac = 0.80;
     std::string gtf_path;                // optional reference-coordinate GTF: annotate variants with the
                                          // genes they touch (INFO GENES), write <prefix>.node_genes.tsv,

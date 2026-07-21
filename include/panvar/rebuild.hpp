@@ -5,13 +5,11 @@
 
 namespace panvar {
 
-// `rebuild`: re-induce a pathological (fragmented low-complexity) locus graph BEFORE bubble
-// decomposition. A cheap degree gate (Criteria A) decides whether a graph is pathological; if so the
-// locus is rebuilt by progressive graph generation, driving minigraph's own engine (mg_ggen) as a
-// library. What is ours is the two ends: the haplotype ORDER fed to it (Criteria B, k-mer richness --
-// the seed becomes the coordinate backbone, so richest-first matters) and the emitted GFA, which carries
-// per-haplotype P lines recovered in memory via mg_map and preserves link orientation so inversion
-// bubbles survive. Healthy graphs pass through untouched -- the gate is why this is not just minigraph.
+// `rebuild`: re-induce a fragmented low-complexity locus graph before bubble decomposition. A degree
+// gate decides whether the graph is pathological; if so the locus is rebuilt by progressive graph
+// generation, driving minigraph as a library. Ours are the two ends: the haplotype order fed to it
+// (k-mer richness, since the seed becomes the backbone) and the emitted GFA, which carries per-haplotype
+// P lines and preserves link orientation. Healthy graphs pass through untouched.
 struct RebuildOptions {
     std::string gfa_path;            // input GFA (the pggb graph for the locus)
     std::string out_path;            // output GFA

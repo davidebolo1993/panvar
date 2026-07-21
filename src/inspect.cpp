@@ -169,7 +169,7 @@ double weighted_jaccard_tokens(const TokenWeights& a, const TokenWeights& b) {
 // Jaccard estimates identity; walks within --cluster-similarity are unioned (disjoint-set), clusters
 // = connected components. The sketch is multiplicity-aware (a shingle's occurrence index folds into
 // the hash) so it approximates the multiset Jaccard - needed to separate tandem-repeat haplotypes
-// (LPA KIV-2) sharing a unit at different copy numbers. MinHash: Broder 1997; Mash: Ondov et al. 2016.
+// sharing a unit at different copy numbers. MinHash: Broder 1997; Mash: Ondov et al. 2016.
 std::uint64_t splitmix64(std::uint64_t x) {
     x += 0x9e3779b97f4a7c15ULL;
     x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;

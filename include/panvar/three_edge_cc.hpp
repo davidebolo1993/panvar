@@ -1,11 +1,9 @@
 #pragma once
 
-// Vendored from vg (src/algorithms/three_edge_connected_components.cpp), the dense
-// "merges" entry point only. Independent implementation of Norouzi & Tsin (2014),
-// "A simple 3-edge connected component algorithm revisited". Self-contained: it reports,
-// via `same_component`, pairs of nodes that belong to the same 3-edge-connected component
-// (a spanning set per component); feed those into a union-find to recover the components.
-// We use this to build the cactus graph for internal snarl finding (see snarls.cpp).
+// Vendored from vg (three_edge_connected_components.cpp), the dense "merges" entry point only.
+// Independent implementation of Norouzi & Tsin (2014). Reports via `same_component` a spanning set of
+// same-component node pairs; feed those to a union-find to recover the components. Used to build the
+// cactus graph for internal snarl finding.
 
 #include <cstddef>
 #include <functional>

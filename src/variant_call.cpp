@@ -855,11 +855,10 @@ void call_variants(
             return sid >= options.merge_seq_identity;
         };
 
-        // bp-coverage CN for a pggb-collapsed paralog cluster: the reference revisits the module >=2x,
-        // so copy number is node multiplicity, not a tandem block. CN = full-walk bp / unit, unit =
-        // ref_full_bp / ref_fold. Uses the WIDEST source..sink span (the minimal-span walk used
-        // elsewhere collapses the repeats). Yields to a genuine REP self-loop (unit >= min_sv_bp, exact
-        // count); an incidental tiny self-loop doesn't -- routes stay disjoint (self-loop > coverage > peak).
+        // bp-coverage CN for a collapsed paralog cluster: the reference revisits the module >=2x, so CN
+        // is node multiplicity, not a tandem block. CN = full-walk bp / unit (unit = ref_full_bp /
+        // ref_fold), over the WIDEST source..sink span since the minimal one collapses the repeats.
+        // Yields to a genuine REP self-loop; routes stay disjoint (self-loop > coverage > peak).
         bool has_rep_selfloop = false;
         for (const std::string& cn : cn_nodes)
             if (node_len(graph, cn) >= options.min_sv_bp) { has_rep_selfloop = true; break; }
@@ -1000,11 +999,10 @@ void call_variants(
             }
         }
 
-        // Peak-multiplicity DUP: for a folded cluster panphorte couldn't collapse (no self-loop node,
-        // e.g. GSTM1), copy number is the per-haplotype peak node traversal count. Firing on the peak
-        // (not any node exceeding the reference) rejects cluster background -- scattered per-node
-        // excesses are paralog presence/absence, the peak is gene dosage. Gated on the absence of a REP
-        // self-loop >= min_sv_bp so the routes stay disjoint by topology.
+        // Peak-multiplicity DUP: where panphorte could not fold the cluster (no self-loop node), CN is
+        // the per-haplotype peak node traversal count. Using the peak rather than any node above the
+        // reference rejects cluster background: scattered per-node excesses are paralog presence/absence,
+        // the peak is dosage. Gated on the absence of a REP self-loop so routes stay disjoint.
         if (options.cn && !has_rep_selfloop && !coverage_fired) {
             std::size_t ref_peak = 0;
             for (const std::string& id : bubble.inside) {
@@ -1058,11 +1056,10 @@ void call_variants(
             }
         }
 
-        // DEL/INS/INV per allele, kept down to the rescue floor for the re-scan, then merged. Emitted
-        // even when coverage fired -- the coverage DUP is a dosage, not sequence-resolved indels inside
-        // the bubble, so suppressing them would drop real calls. The per-allele walk-diff (O(m*n)
-        // segment DP) dominates on big folded bubbles; it's pure and writes only its own slot, so run
-        // it across cores (the merge below consumes in allele order, independent of thread count).
+        // DEL/INS/INV per allele, kept down to the rescue floor, then merged. Emitted even when coverage
+        // fired: a coverage DUP is dosage, not the sequence-resolved indels inside the bubble. The
+        // per-allele walk-diff dominates on big folded bubbles and writes only its own slot, so it runs
+        // across cores; the merge below consumes in allele order, independent of thread count.
         std::vector<std::vector<Event>> allele_events(alleles.size());
         run_parallel(alleles.size(), options.threads, [&](std::size_t ai) {
             if (build_walk_signature(alleles[ai].steps) == ref_sig) return;
@@ -1097,11 +1094,10 @@ void call_variants(
                     if (e.size_bp >= rescue_floor) cands.push_back({ai, &e});
 
             DisjointSet dsu(cands.size());
-            // Position-sorted windowed sweep keeps edge-building near-linear: events_match
-            // can only fire within |dpos| <= merge_distance_bp + min(size) <= merge_distance_bp
-            // + size_i, so once an earlier (smaller-pos) event is past that bound we stop.
-            // Zero-coordinate events (rare; anchor missing from the reference) match on
-            // node/sequence only, so they are never position-pruned.
+            // Position-sorted windowed sweep keeps edge-building near-linear: events_match can only
+            // fire within |dpos| <= merge_distance_bp + size_i, so we stop once past that bound.
+            // Zero-coordinate events (anchor missing from the reference) match on node/sequence only
+            // and are never position-pruned.
             std::vector<std::size_t> ord(cands.size());
             std::iota(ord.begin(), ord.end(), std::size_t{0});
             std::sort(ord.begin(), ord.end(), [&](std::size_t a, std::size_t b) {
@@ -1166,12 +1162,10 @@ void call_variants(
             }
         }
 
-        // Graph-level force-call: re-read every non-member haplotype's own walk-diff at each locus and
-        // add it as a carrier if it supports the record's (fixed) representative, even below the size
-        // threshold. Monotone, so one pass reaches the fixpoint. (A node-set containment test was
-        // rejected: on folded loci the inserted nodes are shared across nearly all walks, so it
-        // force-called everyone.) Parallel over records; the other hot path on big CNV bubbles
-        // (events_match -> fit_align), run records x alleles.
+        // Force-call: re-read every non-member haplotype's walk-diff and add it as a carrier if it
+        // supports the record's fixed representative, even below the size threshold. Monotone, so one
+        // pass suffices. A node-set containment test was rejected: on folded loci the inserted nodes are
+        // shared across nearly all walks, so it force-called everyone.
         run_parallel(merged.size(), options.threads, [&](std::size_t ri) {
             MergedRecord& mr = merged[ri];
             if (mr.seed.type == EvType::Dup) return;
@@ -1229,7 +1223,7 @@ void call_variants(
         // Drop copy-number DUPs that are low-complexity-tangle or physically implausible (span > a
         // large fraction of the reference). Runs AFTER the folded-INS de-dup above, so the matching INS
         // stays dropped -- we remove only the bogus DUP record, without resurfacing its content. Genuine
-        // self-loop REP DUPs (cn_peak=false, e.g. KIV-2) are never touched.
+        // self-loop REP DUPs (cn_peak=false) are never touched.
         if (is_tangle || max_dup_bp > 0) {
             std::vector<MergedRecord> kept;
             for (MergedRecord& mr : merged) {
@@ -1295,10 +1289,9 @@ void call_variants(
         }
 
         // ---- enforce the EVENTID contract: a link_id must denote a genuine co-located DEL+INS pair.
-        // A substitution arm can vanish (a sub-threshold micro-arm that never became a record) or a link_id
-        // can smear onto a large merged cluster. Strip any link_id lacking BOTH a DEL and an INS among
-        // survivors, so EVENTID is never orphaned. A now-orphaned arm kept only by the substitution
-        // unit-rule (its size_bp < min_sv_bp) is dropped, not surfaced as a bare INS/DEL.
+        // An arm can vanish, or a link_id can smear onto a merged cluster, so strip any link_id lacking
+        // both a DEL and an INS among survivors. An arm orphaned that way is dropped rather than
+        // surfaced as a bare INS/DEL.
         {
             std::unordered_map<std::string, std::pair<bool, bool>> link_arms;  // link -> (has_del, has_ins)
             for (const MergedRecord& mr : merged) {
@@ -1350,7 +1343,7 @@ void call_variants(
         // Genes overlapping this bubble's reference span (for the per-gene DUP table, resolved by
         // realignment in a post-pass). The GENES INFO field is graph-based (collapsed nodes tag
         // multiple genes); the per-gene COPY NUMBER is resolved later by competitive realignment,
-        // which separates collapsed paralogs (CYP2D6 vs 2D7) the graph cannot.
+        // which separates collapsed paralogs the graph cannot.
         std::vector<int> bubble_gene_idx;
         if (!node_genes.empty()) {
             std::unordered_set<int> seen;
@@ -1484,12 +1477,9 @@ void call_variants(
                 const bool reverse_bubble = (ps >= 0 && pk >= 0 && pk < ps);
                 anchor_after = !reverse_bubble;
             } else {
-                // DUP: genomically upstream of the bubble's source/sink boundary. The duplicated content
-                // starts immediately AFTER that flank ends, so POS is the flank's LAST base -- the same
-                // convention INS uses above. Taking its first base instead is only invisible when flanks
-                // are short: on a pggb graph the flank is fragmented to a few bp, but on a minigraph-style
-                // graph it is a single multi-kb backbone node and POS lands kb upstream (measured: an
-                // 11 kb error against a 10 956 bp flank).
+                // DUP: anchor on the genomically upstream flank, POS = its LAST base (as INS does), since
+                // the duplicated content starts where that flank ends. Using the first base only looks
+                // right when flanks are short; against a multi-kb flank node POS lands kb upstream.
                 const long long ps = rpos(bubble.source), pk = rpos(bubble.sink);
                 if (pk >= 0 && (ps < 0 || pk < ps)) anchor = bubble.sink;
                 else anchor = bubble.source;
@@ -1551,12 +1541,9 @@ void call_variants(
             const std::string start_node = ev_nodes.empty() ? e.start_node : ev_nodes.front();
             const std::string end_node = ev_nodes.empty() ? e.end_node : ev_nodes.back();
 
-            // The describe handoff (variant_nodes.tsv) needs every node any carrier traverses for this
-            // event, so each carrier's own allele sequence is sketched (not just the representative's).
-            // Use the union of all merged member events' nodes together with the representative ev_nodes,
-            // so the VCF EVENT_NODES is always a subset of variant_nodes -- a coverage DUP folds the whole
-            // module's inside nodes into member_nodes, and its POS anchor would otherwise be missing when
-            // that anchor is a bubble boundary node. A self-loop DUP has empty member_nodes -> ev_nodes.
+            // variant_nodes.tsv must cover every node any carrier traverses, so take the union of the
+            // merged members' nodes and the representative's. This keeps VCF EVENT_NODES a subset of
+            // variant_nodes; otherwise a coverage DUP anchored on a bubble boundary loses its POS node.
             std::vector<std::string> var_nodes;
             if (mr.member_nodes.empty()) {
                 var_nodes = ev_nodes;
@@ -1779,11 +1766,10 @@ void call_variants(
         for (const std::string& r : variant_nodes_rows) vn_out << r << '\n';
     }
 
-    // GTF sidecars: node->genes map and the per-gene DUP CN table. Per-gene CN by private-k-mer dosage:
-    // each gene's discriminative reference (merged CDS, or gene span if none) gives canonical k-mers
-    // unique vs its paralogs, and a haplotype's per-copy count of those is the gene's CN -- no
-    // per-haplotype alignment. Separates collapsed paralogs (CYP2D6 vs 2D7) graph multiplicity can't.
-    // Evidence (hits / private-set size / dosage) per row.
+    // GTF sidecars: node->genes map and per-gene DUP CN. CN comes from private-k-mer dosage -- each
+    // gene's discriminative reference (merged CDS, else gene span) yields k-mers unique against its
+    // paralogs, and a haplotype's per-copy count of those is its CN. Separates collapsed paralogs that
+    // graph multiplicity cannot, without per-haplotype alignment.
     if (!genes.empty()) {
         write_node_genes_tsv(options.out_prefix + ".node_genes.tsv", node_genes, genes);
 

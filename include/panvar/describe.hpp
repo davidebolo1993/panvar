@@ -54,12 +54,10 @@ struct DescribeOptions {
     // SAMPLE-level BIMBAM (<out_dir>/bimbam_{kmers,graph}.samples.bimbam.gz) whose per-sample value
     // is the summed dosage over that sample's assigned haplotype paths (diploid CN = CN_A + CN_B).
     std::string samples_path;
-    // call region VCF. When set, describe ALSO emits a VARIANT-level BIMBAM (one dosage row per SV
-    // call, not per k-mer/node/edge): <out_dir>/bimbam_variant.bimbam.gz + feature_annot.variant.tsv.gz
-    // (+ the per-sample version under --samples). This is the statistically honest GWAS unit -- the
-    // testable features within one variant are correlated, so testing the variant itself makes
-    // n_tests an honest multiple-testing denominator. Dosage = CN (DUP) / allele indicator
-    // (multiallelic ALT) / GT 0|1 (DEL/INS/INV); a haplotype not traversing the bubble (GT=.) is NA.
+    // call region VCF. When set, describe also emits a variant-level BIMBAM (one dosage row per SV call
+    // rather than per k-mer/node/edge). This is the honest GWAS unit: features within one variant are
+    // correlated, so testing the variant keeps n_tests an honest multiple-testing denominator. Dosage =
+    // CN (DUP) / allele indicator (multiallelic) / GT 0|1 otherwise; untraversed bubble (GT=.) is NA.
     std::string variant_vcf_path;
     // Rescale each feature's BIMBAM dosage to the 0..2 range (per-feature min-max). Off by default
     // (panvar keeps the raw counts, e.g. copy number). Use it for tools that ASSUME a 0..2 diploid

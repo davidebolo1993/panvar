@@ -809,12 +809,11 @@ int run_associate_command(const std::vector<std::string>& args) {
         if (!blocks.empty()) meff = blocks.size();
     }
 
-    // Variant-tier forward-stepwise conditional/joint (COJO): r^2-clumping can't establish independence
-    // (a weak tag of a very strong locus stays significant below --ld-r2). Add the variant with the
-    // smallest conditional p until none clears --cojo-p (default 0.05/Meff), then report each conditioned
-    // on the selected set minus itself -- shadows collapse, true signals survive (cond_role=signal).
-    // Variant tier only; linear/logistic (LMM needs the rotation). Conditioning dosages go in as extra
-    // covariates with the genotype at column 1, so FitResult is its conditional Wald.
+    // Variant-tier forward-stepwise conditional/joint (COJO), since r^2-clumping cannot establish
+    // independence: a weak tag of a strong locus stays significant below --ld-r2. Add the smallest
+    // conditional p until none clears --cojo-p, then report each conditioned on the rest, so shadows
+    // collapse and true signals survive. Conditioning dosages enter as covariates with the genotype at
+    // column 1, so FitResult is its conditional Wald. Linear/logistic only; LMM needs the rotation.
     std::vector<double> p_cond(rows.size(), kNaN);
     // cond_role: variant tier -> "signal" (COJO-selected) / "shadow"; feature tier -> "lead" /
     // "collinear" (same-event redundancy, not scored) / "conditioned"; "." when not computed.
