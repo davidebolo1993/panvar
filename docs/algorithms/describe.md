@@ -2,12 +2,7 @@
 
 Mechanism for the `describe` module. For usage/flags see [modules/describe.md](../modules/describe.md); References in [references.md](../references.md#describe).
 
-## Terms
-
-- **k-mer** — a length-k DNA substring; canonicalised to `min(forward, reverse-complement)` of its 2-bit code (`A=0,C=1,G=2,T=3`), so a k-mer and its reverse complement count as one feature.
-- **closed syncmer** — a sampling rule that keeps a k-mer only when its smallest internal s-mer sits at either end; it samples sequence space evenly and degrades gracefully under substitutions (one base change disturbs only the overlapping syncmers).
-- **node/edge dosage** — how many times a path traverses a graph node/an oriented step-to-step edge (`from±>to±`); a graph-local, coordinate-keyed feature complementary to k-mers.
-- **variant dosage** — one genotype per structural-variant (SV) call read straight from `call`'s VCF (Variant Call Format): copy number for a `DUP`, allele presence otherwise.
+`describe` turns a called locus into GWAS-ready genotype features across three substrates: k-mers and node/edge dosages spelled from the graph, and one dosage per structural-variant call read back from `call`'s VCF. Each substrate is defined where it is built below; all three carry copy number as a true multiplicity, so a copy-number locus is a first-class dosage rather than a presence flag.
 
 ## Graph features
 

@@ -2,31 +2,32 @@
 
 Mechanism for the `refine` module. For usage/flags see [modules/refine.md](../modules/refine.md); References in [references.md](../references.md#refine).
 
-## Terms
-
-- **region** — one or more bubbles fused into a single `source…sink` span and refined as a unit. Bubbles fuse when they share a boundary node; a region is refined only if the fused set reduces to exactly two outer anchor nodes (a clean linear chain).
-- **residual segment** — a maximal run of non-`REP` interior steps between or around the `REP` blocks; the only part POA re-aligns.
-- **`REP` node** — panphorte's folded tandem unit, an interior node carrying an L self-edge (see [panphorte](panphorte.md)). Held fixed during refine.
+`refine` POA-realigns the interior of bubbles on the panphorte normalized graph to remove graph-builder alignment artifacts (a spurious insertion-plus-deletion pair where one clean indel belongs), without touching copy number. It works on a region: one or more bubbles fused into a single `source→sink` span and refined as a unit. A `REP` node — panphorte's folded tandem unit, an interior node carrying an L self-edge — is held fixed throughout, and only the residual segments (the maximal runs of non-`REP` interior steps between and around the `REP` blocks) are re-aligned.
 
 ## How it works
 
-Operate on the panphorte normalized graph. Precompute the set of `REP` nodes (nodes with an L self-edge).
+### 1. Form regions
 
-Form regions by fusing bubbles that share a boundary node. `panphorte` emits the bubble decomposition without merging nearby bubbles, but directly-adjacent snarls in a chain already share their boundary node — the sink of one is the source of the next. `refine` fuses exactly those. For a fused set, the two endpoints that appear once across the pooled `source`/`sink` are the outer anchors `a`, `b`; every other node is interior (the shared boundary nodes become interior, so POA spans across the original bubble boundaries). A set that does not reduce to exactly two anchors is not a clean linear chain and is skipped. This endpoint-based fusion is independent of `bubble --merge-nearby-bp`, which merges by graph distance.
+Working on the panphorte graph, the set of `REP` nodes (those with an L self-edge) is precomputed, then bubbles that share a boundary node are fused into regions. `panphorte` emits its bubbles without merging nearby ones, but directly-adjacent snarls in a chain already share a boundary node — the sink of one is the source of the next — and `refine` fuses exactly those. For a fused set, the two endpoints that appear once across the pooled `source`/`sink` are the outer anchors `a`, `b`; every other node becomes interior (the shared boundaries included, so POA spans across the original bubble boundaries). A set that does not reduce to exactly two anchors is not a clean linear chain and is skipped. This endpoint-based fusion is independent of `bubble --merge-nearby-bp`, which merges by graph distance.
 
-For each region, take the oriented steps between `a` and `b` for every path (the reference must traverse the region), and act by copy-number content:
+### 2. Classify by copy-number content
 
-- No DUP — the interior has no `REP` node and no path revisits a non-`REP` interior node. Re-align the whole interior between `a` and `b`.
-- Folded DUP — the interior has a `REP` node. Hold it fixed: split each path's interior at every `REP` block into residual segments and verbatim `REP×n` runs, re-align only the residual segments, and copy the `REP` runs through unchanged (per-haplotype copy count and orientation preserved). All traversing paths must share the same ordered `REP` skeleton, otherwise the region is skipped.
-- Unfolded DUP — the reference or any haplotype revisits a non-`REP` interior node two or more times. Skip the whole region: POA would linearize the copies and destroy the copy-number signal `call` reconstructs from the revisits. This is the case panphorte's prevalence gate leaves unfolded (a private duplication, or a paralog cluster collapsed onto shared nodes).
+For each region, the oriented steps between `a` and `b` are taken for every path (the reference must traverse the region), and the region is handled by its copy-number content:
 
-Re-align and splice (the no-DUP and folded-DUP cases). For each residual-segment position, collapse the per-haplotype sequences to their exact distinct set and run abPOA over them (one sequence, or none, is handled trivially). Skip the region if a segment's median length exceeds `--max-poa-bp` or its distinct-walk count exceeds `--max-walks`. Compact the resulting column MSA into a minimal sub-graph: a run of columns that all and only the same haplotypes traverse becomes one node, with fresh non-colliding ids. This maps each distinct residual sequence to a rebuilt node path.
+- No DUP — the interior has no `REP` node and no path revisits a non-`REP` interior node. The whole interior between `a` and `b` is re-aligned.
+- Folded DUP — the interior has a `REP` node, held fixed: each path's interior is split at every `REP` block into residual segments and verbatim `REP×n` runs; only the residual segments are re-aligned, and the `REP` runs are copied through unchanged (per-haplotype copy count and orientation preserved). All traversing paths must share the same ordered `REP` skeleton, or the region is skipped.
+- Unfolded DUP — the reference or any haplotype revisits a non-`REP` interior node two or more times. The whole region is skipped: POA would linearize the copies and destroy the copy-number signal `call` reconstructs from the revisits. This is what panphorte's prevalence gate leaves unfolded (a private duplication, or a paralog cluster collapsed onto shared nodes).
 
-Reassemble each haplotype's interior as `residual-path, REP-block, residual-path, …` (the `REP` blocks verbatim) and splice it between the anchors: drop the old interior nodes, keep the `REP` nodes and their self-loops, add the rebuilt nodes, rewrite each traversing path's `a…b` sub-walk, and add any path adjacency the graph now lacks as a `0M` link. Because every rebuilt node spells exactly the bases of its MSA columns and `REP` runs are copied verbatim, each haplotype's spelled sequence over the region is unchanged: the rebuild is sequence-lossless, only the node structure changes.
+### 3. Re-align and splice
 
-Finally, re-sort and flip along the reference and re-snarl with the cactus finder (the same step panphorte runs), then write `<prefix>.normalized.sorted.gfa`, `<prefix>.bubbles.csv`, `<prefix>.bandage_nodes.csv` (and `<prefix>.bandage_genes.csv` with `--gtf`). Running `call` on this graph re-derives the now-clean records; a folded DUP is byte-identical because its `REP` node, self-loop and per-haplotype multiplicity never changed.
+For the no-DUP and folded-DUP cases, each residual-segment position has its per-haplotype sequences collapsed to their exact distinct set and run through abPOA (one sequence, or none, is trivial). The region is skipped if a segment's median length exceeds `--max-poa-bp` or its distinct-walk count exceeds `--max-walks`. The resulting column MSA is compacted into a minimal sub-graph — a run of columns that all and only the same haplotypes traverse becomes one node, with fresh non-colliding ids — mapping each distinct residual sequence to a rebuilt node path.
 
-The rebuild is coordinate-free — it works on step tokens and node-set membership — so a reverse-oriented region needs no special treatment: each haplotype's residual is spelled and reassembled in its own path direction, so its sequence is preserved regardless.
+Each haplotype's interior is then reassembled as `residual-path, REP-block, residual-path, …` (the `REP` blocks verbatim) and spliced between the anchors: the old interior nodes are dropped, the `REP` nodes and self-loops kept, the rebuilt nodes added, each traversing path's `a…b` sub-walk rewritten, and any now-missing path adjacency added as a `0M` link. Because every rebuilt node spells exactly the bases of its MSA columns and `REP` runs are copied verbatim, each haplotype's spelled sequence over the region is unchanged: the rebuild is sequence-lossless, only the node structure changes.
+
+### 4. Re-sort and re-snarl
+
+Finally the graph is re-sorted and flipped along the reference and re-snarled with the cactus finder (the same step panphorte runs), then written as `<prefix>.normalized.sorted.gfa`, `<prefix>.bubbles.csv`, `<prefix>.bandage_nodes.csv` (and `<prefix>.bandage_genes.csv` with `--gtf`). Running `call` on this graph re-derives the now-clean records; a folded DUP is byte-identical because its `REP` node, self-loop and per-haplotype multiplicity never changed.
+
 
 ## Worked trace
 

@@ -7,7 +7,7 @@ CLI: `panvar describe`
 Converts the called bubbles into per-haplotype genotype features for association, on three substrates that share the same graph coordinates and are each exported as a BIMBAM mean-genotype dosage matrix — the canonical input to [`associate`](associate.md) and tools like [GEMMA](https://github.com/genetics-statistics/GEMMA):
 
 - **variant** — one dosage per structural-variant (SV) call from `call`'s VCF (Variant Call Format) (`--variant-vcf`): copy number for a `DUP`, presence for `DEL`/`INS`/`INV`
-- **k-mers** — canonical k-mers per path, [closed-syncmer](../algorithms/describe.md#terms) sampled by default, each carrying its node provenance;
+- **k-mers** — canonical k-mers per path, [closed-syncmer](../algorithms/describe.md) sampled by default, each carrying its node provenance;
 - **graph** — per-node and per-oriented-edge traversal counts, a graph-local dosage;
 
 The k-mer and graph substrates are built from the graph and emitted by default; the variant substrate is emitted when its VCF is supplied. Any one can be produced on its own (`--only-kmers`/`--only-graph`/`--only-variant`). The k-mer and graph substrates pass through a discriminative filter that drops features which do not vary across haplotypes — those present in all (or all but `--min-paths`) paths, unless their copy number varies — so only informative markers reach the matrix; the variant substrate emits every call and leaves frequency filtering to `associate`.
@@ -21,7 +21,7 @@ Algorithm and worked trace: [algorithms/describe.md](../algorithms/describe.md).
 
 `describe` must run on the same graph and bubble prefix as `call` so feature node ids line up with the VCF: the `panphorte` `.normalized.sorted.gfa` or the `bubble` `.sorted.gfa`.
 
-- `-i, --gfa <path>`; 
+- `-i, --gfa <path>` — the call substrate from `panphorte`/`refine`/`bubble` (node ids should match the CSV to `-b`);
 - one of `-b, --bubble-prefix-in <prefix>` or `-c, --bubbles-csv <path>`.
 - `--variant-nodes <call.variant_nodes.tsv>` to restrict features to `call`'s variant scope (recommended; this is what keeps `describe` and the VCF in lockstep).
 

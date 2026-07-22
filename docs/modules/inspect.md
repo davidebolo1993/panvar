@@ -16,7 +16,7 @@ Algorithm and worked trace: [algorithms/inspect.md](../algorithms/inspect.md).
 
 ## Required inputs
 
-- `-i, --gfa <graph.gfa>` — the sorted GFA from `bubble`/`panphorte` (node ids should match the CSV to `-b`).
+- `-i, --gfa <graph.gfa>` — the sorted GFA from `bubble`/`panphorte`/`refine` (node ids should match the CSV to `-b`).
 - one of `-b, --bubble-prefix-in <prefix>` (auto-uses `<prefix>.bubbles.csv`) or `-c, --bubbles-csv <path>`.
 
 ## Key options

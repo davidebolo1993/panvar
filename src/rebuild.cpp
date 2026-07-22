@@ -245,23 +245,27 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
     mg_opt_set(nullptr, &ipt, &opt, &gpt);
     if (mg_opt_set("ggs", &ipt, &opt, &gpt) < 0) throw std::runtime_error("rebuild: mg_opt_set(ggs) failed");
     gpt.min_var_len = static_cast<int>(options.min_var);
-    // Let minigraph print its own per-sample progress during the long generation phase; silence it when
-    // the caller asked for quiet.
-    mg_verbose = options.quiet ? 1 : 3;
+    // Keep minigraph itself quiet (its per-sample logs are one block per haplotype, far too noisy at
+    // cohort scale) and print our own throttled counter instead. mg_ggen augments one file per call
+    // internally, so driving that loop here costs nothing extra and lets us report progress.
+    mg_verbose = 1;
 
     GfaHandle handle(gfa_read(fasta_paths.front().c_str()));
     if (handle.get() == nullptr) {
         throw std::runtime_error("rebuild: minigraph could not seed from " + fasta_paths.front());
     }
-    std::vector<const char*> rest;
-    rest.reserve(fasta_paths.size() - 1);
-    for (std::size_t i = 1; i < fasta_paths.size(); ++i) rest.push_back(fasta_paths[i].c_str());
-    step("generating graph over " + std::to_string(fasta_paths.size()) +
-         " haplotypes in richness order (minigraph; the long step)");
-    if (!rest.empty() &&
-        mg_ggen(handle.get(), static_cast<int32_t>(rest.size()), rest.data(), &ipt, &opt, &gpt,
-                n_threads) != 0) {
-        throw std::runtime_error("rebuild: mg_ggen failed");
+    const std::size_t total = fasta_paths.size();
+    step("generating graph: seed + " + std::to_string(total - 1) +
+         " haplotypes in richness order (minigraph)");
+    for (std::size_t i = 1; i < fasta_paths.size(); ++i) {
+        const char* f = fasta_paths[i].c_str();
+        if (mg_ggen(handle.get(), 1, &f, &ipt, &opt, &gpt, n_threads) != 0) {
+            throw std::runtime_error("rebuild: mg_ggen failed on " + fasta_paths[i]);
+        }
+        if (i % 50 == 0 || i + 1 == total) {
+            step("  added " + std::to_string(i + 1) + "/" + std::to_string(total) + " haplotypes; " +
+                 std::to_string(handle.get()->n_seg) + " segments so far");
+        }
     }
     gfa_t* out = handle.get();
     step("generated " + std::to_string(out->n_seg) + " segments, " + std::to_string(out->n_arc) +

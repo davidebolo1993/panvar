@@ -2,27 +2,26 @@
 
 Mechanism for the `benchmark` module. For usage/flags see [modules/benchmark.md](../modules/benchmark.md); References in [references.md](../references.md).
 
-## Terms
+`benchmark` measures how much of each haplotype the caller's own output reconstructs. For a bubble it takes the reference `source → sink` walk and applies only the called divergences — where a haplotype diverges from the reference and that divergence is one of our calls, the haplotype's nodes are spliced in; everything else stays reference — then aligns that reconstruction against the haplotype's true sequence. The identity, `1 − δ/S` (edit distance `δ` over alignment length `S`), is the headline: the fraction of aligned sequence the calls reproduce. Only bubbles carrying at least one call are scored (or every bubble with `--all-bubbles`); a bubble the reference does not traverse is dropped, having no baseline.
 
-- **reconstruction** — the reference walk over a bubble with only the called divergences applied: where the haplotype diverges from reference and that divergence is a call, the haplotype's nodes are spliced in; everything else stays reference.
-- **anchor** — a `source→sink` step (node id and orientation) shared by the reference and the haplotype walk, used to pin the two walks together (a longest common subsequence over the step tokens).
-- **divergent block** — a maximal stretch between two anchors where reference and haplotype differ (a reference-only run for a deletion, a haplotype-only run for an insertion, or both for a substitution/inversion).
-- **called block** — a divergent block whose reference-side or haplotype-side nodes appear in the bubble's `variant_nodes.tsv` set — i.e. a divergence one of our calls explains.
-- **δ / S** — edit distance and alignment length from the global (Needleman–Wunsch) alignment of the reconstruction against the true haplotype sequence.
-- **identity** — `1 − δ/S`, the headline metric: the fraction of aligned sequence the calls reconstruct.
-- **QV** (comparability) — `-10·log10(max(0.5, δ)/S)`; **QV_max** — `10·log10(2S)`, the ceiling for a perfect (`δ≤0.5`) reconstruction of length `S`; **qv_ratio** — `QV/QV_max` ∈ (0,1].
+## How it works
 
-## Algorithm
+For each scored bubble, for each haplotype that traverses it:
 
-Score only bubbles that carry ≥1 call (or every bubble in the CSV with `--all-bubbles`). For each such bubble, get the reference `source→sink` walk; a bubble the reference does not traverse is dropped (no baseline). Then for each haplotype that traverses the bubble:
+### 1. Spell the truth
 
-1. Spell the truth: the haplotype's own canonical `source→sink` walk, orientation-aware. This is the sequence we are trying to reproduce;
-2. Node-align the haplotype walk against the reference walk on shared step tokens (LCS). Between consecutive anchors, emit the haplotype's block if it is a called block (any of its nodes ∈ the bubble's `variant_nodes` set), otherwise revert to the reference's block. Uncalled divergence (SNPs, sub-threshold indels) therefore stays at reference. Spell the result — again orientation-aware;
-3. Align reconstruction vs truth → `δ`, `S`, contributing to identity (`1 − δ/S`). Walking the edit path also splits `δ` by contiguous non-match block size against `--min-sv-bp` into `sub_threshold_bp` (blocks `< N`, uncallable variation) and `over_threshold_bp` (blocks `≥ N`, callable-size misses). A comparability `QV = -10·log10(max(0.5, δ)/S)` is emitted alongside.
+The haplotype's own canonical `source → sink` walk, orientation-aware — the sequence we are trying to reproduce.
+
+### 2. Reconstruct from the calls
+
+Node-align the haplotype walk against the reference walk on shared step tokens — the anchors, a longest common subsequence over the `(node id, orientation)` tokens. Between two consecutive anchors lies a divergent block, a maximal stretch where the two walks differ. Emit the haplotype's side of the block if it is a called block (any of its nodes are in the bubble's `variant_nodes.tsv` set — a divergence one of our calls explains), otherwise revert to the reference's side, so uncalled divergence (SNPs, sub-threshold indels) stays at reference.
+
+### 3. Align and split the residual
+
+Align the reconstruction against the truth with a global (Needleman–Wunsch) alignment, giving `δ` and `S` and contributing to identity `1 − δ/S`. Walking the edit path splits `δ` by contiguous non-match block size against `--min-sv-bp`: `sub_threshold_bp` (blocks below N, uncallable variation) and `over_threshold_bp` (blocks at or above N, callable-size misses). A comparability `QV = -10·log10(max(0.5, δ)/S)` is emitted alongside, with a ceiling `QV_max = 10·log10(2S)` for a perfect reconstruction and `qv_ratio = QV/QV_max` in (0, 1].
 
 Aggregate per haplotype length-weighted (`Σδ`, `ΣS` over its bubbles) to give identity `= 1 − Σδ/ΣS` and the summed residual split (plus the comparability `QV`/`qv_ratio`/`quintile`). Per gene, `identity + Σsub/ΣS + Σover/ΣS = 1` — the anatomy `scripts/plot_benchmark.R` renders (left: reconstructed + residual; right: the residual's not-callable vs mis-called split).
 
-The reconstruction is entirely coordinate-free — it works on step tokens and node-set membership — so a reverse-oriented bubble (see [call's coordinate handling](call.md)) needs no special treatment.
 
 ## Worked trace
 

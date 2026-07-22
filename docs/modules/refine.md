@@ -4,7 +4,7 @@ CLI: `panvar refine`
 
 ## What it does
 
-`refine` fixes graph artifacts (e.g. spurious `INS` + `DEL` events) at the graph level. It runs after `panphorte`, on the normalized graph, and for each selected bubble re-aligns the actual per-haplotype interior sequences with POA (abPOA, affine-gap partial-order alignment) — collapsing artifacts into a single clean event. While this is safe in bubbles with no duplication signal:
+`refine` fixes graph artifacts (e.g. spurious `INS` + `DEL` events) at the graph level. It runs after `panphorte`, on the normalized graph, and for each selected bubble re-aligns the actual per-haplotype interior sequences with POA ([abPOA](https://github.com/yangao07/abPOA), affine-gap partial-order alignment) — collapsing artifacts into a single clean event. While this is safe in bubbles with no duplication signal:
 
 - in a bubble that carries an unfolded copy-number signal - the reference or any haplotype revisits a non-REP interior node ≥2× (e.g. a paralog collapse or a private duplication `panphorte` left unfolded) — `refine` does noting - i.e. the bubble is skipped entirely, because POA would linearize those copies and destroy the CN signal `call` reconstructs from them;
 - in a bubble with a folded tandem (a `REP` node from `panphorte`), `refine` splits each haplotype's interior at every REP block, copies the `REP×n` run (per-haplotype copy count and orientation is preserved), and POA-aligns only the residual flanks around it.
@@ -27,8 +27,8 @@ Algorithm and worked trace: [algorithms/refine.md](../algorithms/refine.md).
 |------|--------------|---------|
 | `--gtf <path>` | reference-coordinate GTF; also write `<prefix>.bandage_genes.csv` | — |
 | `--bubble-id <id[,id...]>` | refine only these bubble ids (targeted mode) instead of auto over the whole locus | auto (all) |
-| `--max-poa-bp <N>` | primary cost guard: skip a residual segment whose median interior exceeds this (abPOA cost ∝ length²) | `5000` |
-| `--max-walks <N>` | skip a residual segment with more than this many distinct walks (catches pathological bubbles) | `500` |
+| `--max-poa-bp <N>` | skip a residual segment whose median interior exceeds this | `5000` |
+| `--max-walks <N>` | skip a residual segment with more than this many distinct walks | `500` |
 | `--min-bubbles <N>` | only rebuild regions fusing ≥ N bubbles (`2` = cross-bubble over-splits only, leaves single clean bubbles untouched) | `1` |
 | `--no-flip` | do not reorient nodes to the reference forward strand | — |
 | `-q, --quiet` | disable progress logs | — |

@@ -66,3 +66,4 @@ panvar re-implements the [GenoGra/Panphorte](https://github.com/GenoGra/Panphort
 | aligner | external | in-process banded aligner (edlib, approximate mode) |
 | threading | — | per-haplotype parallel seed scan and copy detection (`--threads`) |
 | modes | single collapse | explicit exact (sequence-preserving) vs approximate (lossy) via `--min-similarity` |
+\

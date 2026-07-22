@@ -1,6 +1,7 @@
 #include "panvar/refine.hpp"
 
 #include "panvar/bubbles.hpp"
+#include "panvar/cli_utils.hpp"
 #include "panvar/gfa.hpp"
 #include "panvar/gfa_io.hpp"
 #include "panvar/graph_sort.hpp"
@@ -413,12 +414,13 @@ RefineSummary refine_graph(const RefineOptions& options) {
     ++next_id;
 
     std::vector<RegionEdit> edits;
+    cli::ProgressBar progress(options.quiet ? "" : "Refining regions", comps.size());
     for (const auto& comp : comps) {
         std::string note;
         auto edit = process_region(comp, model, path_order, ref_idx, self_loop, options, next_id, note);
-        if (!options.quiet) std::fprintf(stderr, "  %s%s\n", edit ? "" : "- ", note.c_str());
         if (edit) { edits.push_back(std::move(*edit)); ++summary.regions_rebuilt; }
         else ++summary.regions_skipped;
+        progress.tick();
     }
 
     // splice every rebuilt interior back into the model

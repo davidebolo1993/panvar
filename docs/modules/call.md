@@ -12,7 +12,7 @@ Types structural variants on the pangenome graph into a multi-sample VCF (Varian
 
 Algorithm and worked trace: [algorithms/call.md](../algorithms/call.md).
 
-Call on the `panphorte` graph (the `bubble` → `panphorte` → `call` path) should be the first choice. `panphorte` folds genuine tandem repeats into `REP` self-loops — which a tandem needs for an exact count — and leaves paralog clusters and rare duplications untouched. Calling on the `bubble` graph should also work for a non-tandem paralog cluster and give identical results. 
+The recommended path is `bubble → panphorte → [refine] → call`, so `call` runs on the `panphorte` graph, or on the `refine` graph when the opt-in `refine` step is used. `panphorte` folds genuine tandem repeats into `REP` self-loops — which a tandem needs for an exact count — and leaves paralog clusters and rare duplications untouched; `refine` then POA-realigns the bubble interiors to remove graph-builder artifacts while holding those `REP` self-loops fixed, so it is copy-number-safe and the substrate `call` sees is the same folding with cleaner interiors. Calling directly on the `bubble` graph also works for a non-tandem paralog cluster and gives identical results there, since `panphorte` leaves such clusters untouched, but it misses the tandem folding.
 
 #### Event types
 
@@ -25,7 +25,7 @@ Call on the `panphorte` graph (the `bubble` → `panphorte` → `call` path) sho
 
 ## Required inputs
 
-- `-i, --gfa <graph.gfa>` — the call substrate from `panphorte`/`bubble` (in any case, node ids should match the CSV to `-b`)
+- `-i, --gfa <graph.gfa>` — the call substrate from `panphorte`/`refine`/`bubble` (in any case, node ids should match the CSV to `-b`)
 - one of `-b, --bubble-prefix-in <prefix>` or `-c, --bubbles-csv <path>`
 - `-r, --reference-path <name>` — the diff baseline (full name or unique case-insensitive substring).
 - `-o, --out-prefix <prefix>`.
@@ -67,7 +67,7 @@ VCF 4.2; samples = haplotypes. `FORMAT`: `GT` (`1` carrier / `0` ref-like / `.` 
 | `NMERGED`, `SVLEN_RANGE`, `MERGE_JACCARD`/`MERGE_SEQID`/`MERGE_SIZE_RATIO` | merge count, size span, merge evidence (≥2-event records only) |
 | `EVENTID` | links a co-located `DEL`+`INS` substitution |
 | `INS_SUBTYPE` | `NOVEL`/`DUP` (`--classify-ins`) |
-| `REF_CN` / `RU_LEN` | `DUP` only: reference copy number / one-copy repeat-unit length (the *folded* unit; for the real per-haplotype linear size see `FORMAT:CNBP`) |
+| `REF_CN` / `RU_LEN` | `DUP` only: reference copy number / one-copy repeat-unit length (the folded unit; for the real per-haplotype linear size see `FORMAT:CNBP`) |
 | `GENES` | `--gtf`: gene(s) overlapped (whole folded module for a `DUP`) |
 | `NALLELES` | `--multiallelic-loci`: number of alleles |
 | `INSSEQ`/`DELSEQ`/`INVSEQ` | event sequence (omitted when very long) |
@@ -102,7 +102,7 @@ First assemble the bundle with `scripts/build_variant_node_data.R` (needs `data.
 
 ```bash
 Rscript scripts/build_variant_node_data.R \
-  --gfa <panphorte.normalized.sorted.gfa> \
+  --gfa <call-graph.normalized.sorted.gfa> \   # the panphorte or refine graph call ran on
   --variant-nodes <prefix>.variant_nodes.tsv \
   --vcf <prefix>.region.vcf \
   --bubbles <panphorte-prefix>.bubbles.csv \

@@ -2,23 +2,35 @@
 
 Mechanism for the `call` module. For usage/flags see [modules/call.md](../modules/call.md); References in [references.md](../references.md#call).
 
-## Terms
+`call` types each haplotype's differences from the reference within a bubble into a multi-sample VCF, and with `--cn` reads copy number off the walk as a `DUP`. It pins the two walks together at their anchors — node tokens occurring exactly once in both the reference and the haplotype walk, so each must mark the same position, chained in the order they appear — and aligns only the gap blocks between consecutive anchors, the maximal stretches where the walks differ. Each gap block becomes one typed event: a `DEL`, `INS`, `INV`, or a substitution (a co-located `DEL` and `INS` sharing one `EVENTID`).
 
-- **anchor** — a node token that occurs exactly once in *both* the reference and the haplotype walk, so it must correspond to the same position in each. The anchors the two walks share are chained in the order they appear (a monotonic subsequence), pinning the walks together at those points. 
-- **gap block** — a maximal stretch between two anchors where reference and haplotype differ; each becomes one typed event (`DEL` / `INS` / `INV` / `substitution`).
-- **full walk** — the widest `source→sink` span with every repeated traversal counted (a node visited twice contributes its length twice); contrast the minimal-span walk that visits each distinct node once.
-- **peak multiplicity** — the visit count of a haplotype's single busiest node in the bubble.
-
-## Algorithm
+## How it works
 
 For each bubble:
 
-1. Group identical `source→sink` walks into distinct alleles; call once per allele (genotypes expand by membership);
-2.  Fold a node's consecutive self-repeats (a `REP` self-loop) into one alignment token, so extra copies surface as copy number, not a spurious `INS`/ `DEL`;
-3. Split both walks at their shared anchors and align only the segments between them. Each gap block becomes one typed event: a `DEL` where only the reference has nodes, an `INS` where only the haplotype does, an `INV` where the haplotype's run is the reverse-complement node-walk of the reference's, or a substitution — a co-located `DEL` and `INS` that share one `EVENTID`.
-4. Merge consecutive same-type events whose gap is ≤ `--merge-distance-bp`, measured in either reference space or the haplotype's own sequence space.
-5. Merge across haplotypes into one record per site, by transitive single-linkage (connected components), seeding from the events down to `--rescue-min-bp`. Two events link when they are the same type, sit within a position window, and either their node sets overlap or their sequences align. The window is `--merge-distance-bp` widened by the smaller event's size, so one large indel whose breakpoint wanders by kilobases across haplotypes still reads as one site; the node/sequence gate below keeps that fuzziness from over-merging genuinely distinct events. The overlap test is a length-weighted node-set Jaccard ≥ `--merge-jaccard`; if that misses, the fallback is sequence identity ≥ `--merge-seq-identity` (length-gated by `--merge-size-ratio`). The largest member represents the record and `MERGE_*` records the evidence. Copy-number (`DUP`) records do not use this path — they merge separately on a shared `REP` self-loop node.
-6. Re-test every non-carrier against its own diff, adding it as a carrier when it matches (sub-threshold events get `GT=1` instead of `0`); one pass (representative is fixed). Keep records whose representative reaches `--min-sv-bp` and carrier count reaches `--min-haplotypes`.
+### 1. Group alleles
+
+Identical `source → sink` walks are grouped into distinct alleles and called once per allele; genotypes expand by membership.
+
+### 2. Fold copy-number loops
+
+A node's consecutive self-repeats (a `REP` self-loop) fold to one alignment token, so extra copies surface as copy number rather than a spurious `INS`/`DEL`.
+
+### 3. Diff at anchors into typed events
+
+Both walks are split at their shared anchors and only the gap block between consecutive anchors is aligned. Each becomes one typed event: a `DEL` where only the reference has nodes, an `INS` where only the haplotype does, an `INV` where the haplotype's run is the reverse-complement node-walk of the reference's, or a substitution — a co-located `DEL` and `INS` that share one `EVENTID`.
+
+### 4. Coalesce within a haplotype
+
+Consecutive same-type events whose gap is within `--merge-distance-bp` are joined into one, measured in either reference space or the haplotype's own sequence space.
+
+### 5. Merge across haplotypes
+
+Events merge into one record per site by transitive single-linkage (connected components), seeding from the events down to `--rescue-min-bp`. Two events link when they are the same type, sit within a position window, and either their node sets overlap or their sequences align. The window is `--merge-distance-bp` widened by the smaller event's size, so one large indel whose breakpoint wanders by kilobases across haplotypes still reads as one site; the node/sequence gate below keeps that fuzziness from over-merging genuinely distinct events. The overlap test is a length-weighted node-set Jaccard ≥ `--merge-jaccard`; if that misses, the fallback is sequence identity ≥ `--merge-seq-identity` (length-gated by `--merge-size-ratio`). The largest member represents the record and `MERGE_*` records the evidence. Copy-number (`DUP`) records do not use this path — they merge separately on a shared `REP` self-loop node.
+
+### 6. Force-call and filter
+
+Every non-carrier is re-tested against its own diff and added as a carrier when it matches (sub-threshold events get `GT=1` instead of `0`), in one pass since the representative is fixed. A record is kept only if its representative reaches `--min-sv-bp` and its carrier count reaches `--min-haplotypes`.
 
 #### Merge keys — Jaccard vs sequence identity
 
