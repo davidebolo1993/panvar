@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -108,7 +109,7 @@ void copy_file(const std::string& from, const std::string& to) {
 // disk. Named by rank so the progressive order stays visible when debugging a run.
 class FastaScratch {
 public:
-    explicit FastaScratch(const std::string& out_path) : dir_(out_path + ".rebuild.tmp") {
+    explicit FastaScratch(const std::string& dir) : dir_(dir) {
         std::string cmd = "mkdir -p '" + dir_ + "'";
         if (std::system(cmd.c_str()) != 0) throw std::runtime_error("rebuild: cannot create " + dir_);
     }
@@ -154,6 +155,15 @@ private:
 
 RebuildSummary rebuild_graph(const RebuildOptions& options) {
     RebuildSummary sum;
+    const auto t0 = std::chrono::steady_clock::now();
+    auto secs = [&] {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    };
+    auto step = [&](const std::string& msg) {
+        if (!options.quiet) std::cerr << "[rebuild " << static_cast<long>(secs()) << "s] " << msg << std::endl;
+    };
+
+    step("reading " + options.gfa_path);
     ParseGfaOptions po;
     po.include_paths = true;
     po.include_sequences = true;
@@ -162,6 +172,7 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
     sum.raw_nodes = g.nodes.size();
     sum.haplotypes = g.paths.size();
     degree_stats(g, options.hub_degree, sum.raw_hubs, sum.raw_maxdeg);
+    step("ordering " + std::to_string(sum.haplotypes) + " haplotypes by k-mer richness");
 
     // ---- Criteria B: order haplotypes by k-mer richness ----
     // Lexicographic, diversity first: (distinct k-mers, total k-mers) descending. Abundance only
@@ -187,7 +198,8 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
     // ---- Criteria A: the pathology gate ----
     sum.pathological = sum.raw_hubs >= options.min_hubs;
     if (!options.quiet) {
-        std::cerr << "[rebuild] gate(A): " << sum.raw_nodes << " nodes, " << sum.haplotypes
+        std::cerr << "[rebuild " << static_cast<long>(secs()) << "s] gate: " << sum.raw_nodes
+                  << " nodes, " << sum.haplotypes
                   << " haps; #deg>=" << options.hub_degree << "=" << sum.raw_hubs
                   << " maxdeg=" << sum.raw_maxdeg << " density=" << static_cast<long>(sum.raw_density)
                   << "/kb -> " << (sum.pathological ? "PATHOLOGICAL" : "healthy")
@@ -209,7 +221,17 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
     // ---- progressive graph generation, in richness order ----
     // minigraph reads the first file as the seed graph and augments it with each subsequent one in turn,
     // so passing our richness order drives the progressive build directly.
-    FastaScratch scratch(options.out_path);
+    // Scratch FASTAs live beside --out by default, or under --tmp-dir in a dedicated subfolder (named
+    // from the output basename) so cleanup removes only what we created, never the whole --tmp-dir.
+    std::string scratch_dir = options.out_path + ".rebuild.tmp";
+    if (!options.tmp_dir.empty()) {
+        std::string base = options.out_path;
+        const auto slash = base.find_last_of('/');
+        if (slash != std::string::npos) base = base.substr(slash + 1);
+        scratch_dir = options.tmp_dir + "/" + base + ".rebuild.tmp";
+    }
+    step("writing haplotype FASTAs to " + scratch_dir);
+    FastaScratch scratch(scratch_dir);
     std::vector<std::string> fasta_paths;
     fasta_paths.reserve(idx.size());
     for (std::size_t rank = 0; rank < idx.size(); ++rank) {
@@ -223,7 +245,9 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
     mg_opt_set(nullptr, &ipt, &opt, &gpt);
     if (mg_opt_set("ggs", &ipt, &opt, &gpt) < 0) throw std::runtime_error("rebuild: mg_opt_set(ggs) failed");
     gpt.min_var_len = static_cast<int>(options.min_var);
-    if (options.quiet) mg_verbose = 1;
+    // Let minigraph print its own per-sample progress during the long generation phase; silence it when
+    // the caller asked for quiet.
+    mg_verbose = options.quiet ? 1 : 3;
 
     GfaHandle handle(gfa_read(fasta_paths.front().c_str()));
     if (handle.get() == nullptr) {
@@ -232,16 +256,16 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
     std::vector<const char*> rest;
     rest.reserve(fasta_paths.size() - 1);
     for (std::size_t i = 1; i < fasta_paths.size(); ++i) rest.push_back(fasta_paths[i].c_str());
+    step("generating graph over " + std::to_string(fasta_paths.size()) +
+         " haplotypes in richness order (minigraph; the long step)");
     if (!rest.empty() &&
         mg_ggen(handle.get(), static_cast<int32_t>(rest.size()), rest.data(), &ipt, &opt, &gpt,
                 n_threads) != 0) {
         throw std::runtime_error("rebuild: mg_ggen failed");
     }
     gfa_t* out = handle.get();
-    if (!options.quiet) {
-        std::cerr << "[rebuild] generated: " << out->n_seg << " segments, " << out->n_arc
-                  << " arcs (min-var " << options.min_var << ")\n";
-    }
+    step("generated " + std::to_string(out->n_seg) + " segments, " + std::to_string(out->n_arc) +
+         " arcs (min-var " + std::to_string(options.min_var) + ")");
 
     // ---- path recovery: map every haplotype back to the graph, in memory (no GAF round-trip) ----
     // Each mg_llchain_t.v is an ORIENTED vertex (seg<<1|strand), which is what lets inversion
@@ -255,6 +279,7 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
     }
     mg_idx_t* gi = mg_index(out, &ipt_map, n_threads, &opt_map);
     if (gi == nullptr) throw std::runtime_error("rebuild: mg_index failed");
+    step("recovering " + std::to_string(g.paths.size()) + " haplotype walks");
 
     // Parallel like minigraph's own kt_for: index and options shared read-only, one mg_tbuf_t per
     // worker (what makes mg_map re-entrant). Results go to distinct indices, so output is
@@ -360,10 +385,10 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
                   << sum.haplotypes << " haplotypes could not be mapped back and have no P line\n";
     }
     if (!options.quiet) {
-        std::cerr << "[rebuild] emitted: " << sum.out_nodes << " nodes, " << sum.out_edges
-                  << " edges; maxdeg=" << sum.out_maxdeg << " #hub=" << sum.out_hubs << "; paths "
-                  << sum.paths_recovered << '/' << sum.haplotypes << ", mean query cover "
-                  << sum.mean_query_cover << '\n';
+        std::cerr << "[rebuild " << static_cast<long>(secs()) << "s] emitted " << sum.out_nodes
+                  << " nodes, " << sum.out_edges << " edges; maxdeg=" << sum.out_maxdeg << " #hub="
+                  << sum.out_hubs << "; paths " << sum.paths_recovered << '/' << sum.haplotypes
+                  << ", mean query cover " << sum.mean_query_cover << std::endl;
     }
     return sum;
 }

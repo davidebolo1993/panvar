@@ -2,20 +2,29 @@
 
 Mechanism for the `inspect` utility's `--cluster` mode. For usage/flags see [modules/inspect.md](../modules/inspect.md); References in [references.md](../references.md#inspect).
 
-## Terms
+`--cluster` groups the haplotypes crossing a bubble by how similarly they traverse it, so structurally identical alleles collapse to one representative for plotting. A walk is a path's `source → sink` traversal of the bubble, written as a sequence of `<node_id><strand>` steps; two walks are compared by how much their windowed content overlaps.
 
-- **walk** — a path's `source → sink` traversal of a bubble, as a sequence of `<node_id><strand>` steps.
-- **shingle** — a window of k consecutive steps.
-- **MinHash sketch** — a small, fixed-size summary (bottom-k smallest hashes of the shingles)
+## How it works
 
+### 1. Collapse identical walks
 
-## Algorithm Overview
+Walks that spell the same step sequence fold to one representative up front, so only distinct walks are sketched and compared.
 
-1. Identical walks collapse to one representative.
-2. Each distinct walk gets a multiplicity-aware MinHash sketch over its shingles: the k-th occurrence of a shingle is salted to a distinct element, so the sketch tracks the multiset (copy number), not just the set.
-3. Two walks' similarity is the sketch-estimated identity `= 2J/(1+J)` from shingle Jaccard `J`. A threshold graph connects every pair ≥ `--cluster-similarity`; clusters are its connected components (transitive, order-independent).
-4. Very short walks that can't be shingled fall back to an exact bp-weighted Jaccard over `<node_id><strand>` tokens (`sum(min)/sum(max)`).
-5. Representative = the member minimizing max-then-mean intra-cluster distance (most-supported walk breaks ties).
+### 2. Sketch each walk
+
+Each distinct walk is broken into shingles — windows of k consecutive steps — and summarized by a MinHash sketch, the bottom-k smallest hashes of those shingles. The sketch is multiplicity-aware: the k-th occurrence of a shingle is salted to a distinct element, so it tracks the multiset (copy number), not just the set of shingles.
+
+### 3. Score similarity
+
+Two walks' similarity is the sketch-estimated identity `2J / (1 + J)`, where `J` is the shingle Jaccard. Very short walks that cannot be shingled fall back to an exact bp-weighted Jaccard over `<node_id><strand>` tokens (`sum(min) / sum(max)`).
+
+### 4. Cluster
+
+A threshold graph connects every pair at or above `--cluster-similarity`; clusters are its connected components, so membership is transitive and order-independent.
+
+### 5. Pick a representative
+
+Each cluster's representative is the member minimizing max-then-mean intra-cluster distance, with the most-supported walk breaking ties.
 
 
 ## Worked trace

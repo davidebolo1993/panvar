@@ -2,33 +2,35 @@
 
 Mechanism for the `panphorte` module. For usage/flags see [modules/panphorte.md](../modules/panphorte.md); References in [references.md](../references.md#panphorte).
 
-## Terms
-
-- **unit/period** — the tandem repeat (TR) segment an array is built from.
-- **interruption** — non-unit steps interspersed in an array, tolerated up to `--max-interruption-frac` and kept as nested literal steps.
-- **`REP` node** — the single self-looping node an array collapses to; a haplotype's copy number (`CN`) is the number of self-loop traversals.
+panphorte finds tandem-repeat bubbles and rewrites each as one repeat unit looped a copy-number of times, so downstream `call` reads copy number off a loop count rather than as a stack of insertions. The unit (its period) is the segment the array is built from; the collapsed form is a `REP` node carrying a self-loop, and a haplotype's copy number (`CN`) is the number of times its path traverses that self-loop. An interruption — a non-unit step interspersed in an array — is tolerated up to `--max-interruption-frac` and kept as a literal step between copies.
 
 ## How it works
 
-Detection runs on the node-walk, tokenizing each step by the sequence it spells (orientation-aware), so identical copies match even when they are distinct node ids. For each bubble, for each crossing path:
+### 1. Detect tandem arrays
 
-1. tokenize the `source→sink` walk by spelled-sequence hash;
-2. find non-overlapping tandem arrays: establish the unit period from a clean adjacent identical pair, then extend bidirectionally collecting further copies, tolerating short interruptions (kept as nested literal steps). Accept a run when the TR unit length  `≥ --min-unit-bp`, the number of copies `≥ --min-copies`, and interruptions stay within `--max-interruption-frac`;
-3. apply a cohort-prevalence gate: fold the bubble only if a `≥ --min-copies` array is carried by `≥ --min-array-prevalence` of the bubble-traversing haplotypes. This separates a genuine population TR (carried by a large fraction of the cohort) from a rare/private duplication (carried by only a few haplotypes). Default `0.5` (a real TR is carried by a majority);
-4. collapse each array to one `REP` node (deduplicated by canonical unit sequence) with a self-loop; reroute the path through it `copies` times.
+Detection runs on the node-walk, tokenizing each `source → sink` step by the sequence it spells (orientation-aware), so identical copies match even when they are distinct node ids. For each crossing path, the unit period is established from a clean adjacent identical pair, then extended in both directions, collecting further copies and bridging short interruptions. A run is accepted when the unit length is at least `--min-unit-bp`, the copy count is at least `--min-copies`, and interruptions stay within `--max-interruption-frac` of the array span.
 
-Exact (`--min-similarity 1.0`, default) is sequence-preserving — every path spells exactly the same sequence through the normalized graph (enforced internally), but misses divergent repeats (copies differing by SNVs/indels). 
-Approximate mode (`< 1.0`) does single-block, lossy collapse via an in-process banded aligner ([edlib](https://github.com/Martinsos/edlib), bit-parallel edit distance):
+### 2. Gate on cohort prevalence
 
-- Seed one representative unit per bubble from the exact detector (must come from a clean adjacent identical pair somewhere in the cohort, so the true period is recovered; most-supported unit wins).
-- Find copies per path by aligning the unit (and its reverse complement) into the path's spelled sequence: k-mer anchors propose starts, a banded fit alignment decides each copy, its extent, and orientation. Edit budget `(1 − f)·|unit|` (uncapped): a copy folds while its edits (mismatches + indels) stay within it, so a copy with a large internal indel still aligns when `f` is low. Copies need not be adjacent; sequence between them is kept as literal nodes.
-- Collapse copies to one `REP` node traversed once per copy (self-loop when adjacent, edges through flanking literals otherwise). Lossy: within-copy SNVs/indels are discarded. Per-copy orientation is preserved (`REP +,−,+`). Single copies of the seeded unit fold too.
+A bubble folds only if a `≥ --min-copies` array is carried by at least `--min-array-prevalence` of the haplotypes that traverse it. This separates a genuine population tandem repeat (carried by a large fraction of the cohort) from a rare or private duplication (carried by only a few haplotypes, and left for `call`). The default `0.5` asks for a majority.
 
-Both routes above measure the period in node steps: the unit is a run of consecutive steps that repeats. That works when the graph splits nodes at repeat-unit boundaries, which is what a builder producing one node per distinct observed segment does. It fails when the boundaries fall elsewhere — a graph built by progressive alignment splits an array wherever chaining happened to break it, so a four-copy array may be spread over an arbitrary number of nodes with no step period at all, even though the base-level period is unambiguous.
+### 3. Collapse to a REP node
 
-For a bubble where the node-step detector finds nothing anywhere, the unit is instead seeded at base level from the spelled sequence: candidate lags are proposed by k-mer occurrence and each is accepted or rejected by comparing adjacent copies at that lag. Once a unit is seeded, the approximate route above takes over unchanged.
+Each accepted array collapses to one `REP` node — deduplicated by canonical unit sequence — carrying a self-loop, and every crossing path is rerouted through it once per copy, interruptions kept as literal steps. `call --cn` then reads copy number straight off the self-loop count.
 
-A limitation worth considering is that the unit must occur as `≥ 2` adjacent identical copies in `≥ 1` haplotype to be seeded by the node-step route. A duplication with no adjacent identical pair anywhere (e.g. paralogs separated by other sequence) is left intact unless the base-level fallback seeds it.
+## Exact and approximate collapse
+
+Exact collapse (`--min-similarity 1.0`, the default) is sequence-preserving: every path spells exactly the same sequence through the normalized graph (enforced internally). It only folds byte-identical copies, so it misses repeats whose copies differ by SNVs or indels.
+
+Approximate collapse (`< 1.0`) folds divergent copies, lossily, via an in-process banded aligner ([edlib](https://github.com/Martinsos/edlib), bit-parallel edit distance):
+
+- Seed one representative unit per bubble from the exact detector — it must come from a clean adjacent identical pair somewhere in the cohort, so the true period is recovered, and the most-supported unit wins.
+- Find copies per path by aligning the unit (and its reverse complement) into the path's spelled sequence: k-mer anchors propose starts, and a banded fit alignment decides each copy's extent and orientation. The edit budget is `(1 − f)·|unit|`, uncapped, so a copy with a large internal indel still folds when `f` is low. Copies need not be adjacent; sequence between them is kept as literal nodes.
+- Collapse the copies to one `REP` node traversed once per copy — a self-loop when adjacent, edges through the flanking literals otherwise. Within-copy SNVs and indels are discarded; per-copy orientation is preserved (`REP +,−,+`). A single copy of the seeded unit folds too.
+
+## Seeding when node boundaries do not follow the repeat
+
+Both routes above measure the period in node steps: the unit is a run of consecutive steps that repeats. That works when the graph splits nodes at repeat-unit boundaries, which is what a builder producing one node per distinct observed segment does. It fails when the boundaries fall elsewhere — a graph built by progressive alignment splits an array wherever chaining happened to break it, so a four-copy array may be spread over an arbitrary number of nodes with no step period at all, even though the base-level period is unambiguous. For a bubble where the node-step detector finds nothing anywhere, the unit is instead seeded at base level from the spelled sequence: candidate lags are proposed by k-mer occurrence, and each is accepted or rejected by comparing adjacent copies at that lag. Once a unit is seeded, the approximate route takes over unchanged. A unit must occur as at least two adjacent identical copies in at least one haplotype to be seeded by the node-step route. A duplication with no adjacent identical pair anywhere (paralogs separated by other sequence, say) is left intact unless the base-level fallback seeds it.
 
 ## Worked trace
 

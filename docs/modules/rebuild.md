@@ -29,6 +29,7 @@ Algorithm and worked trace: [algorithms/rebuild.md](../algorithms/rebuild.md).
 | `--force` | rebuild even when the gate says healthy; for testing and for small inputs the gate is not calibrated on | off |
 | `--kmer <N>` | k for the k-mer richness metric that orders haplotypes: distinct k-mers first, total k-mers breaking ties | `21` |
 | `--min-var <N>` | minimum variant length augmented into the graph; smaller differences are left at the backbone allele | `50` |
+| `--tmp-dir <path>` | parent directory for the per-haplotype FASTA scratch; a dedicated subfolder is created under it and removed on exit | beside `--out` |
 | `-t, --threads <N>` | worker threads (`0` = auto) | `0` |
 | `-q, --quiet` | disable progress/logs | off |
 

@@ -25,7 +25,7 @@ Algorithm and worked trace: [algorithms/inspect.md](../algorithms/inspect.md).
 |------|--------------|---------|
 | `-o, --out-prefix <p>` | output prefix | — |
 | `--bubble-id <N>` | restrict to one bubble | all bubbles |
-| `--cluster` | group crossing paths by `source → sink` [walk](../algorithms/inspect.md#terms) (`<prefix>.bubble_<N>.clusters.tsv`) | off |
+| `--cluster` | group crossing paths by how similarly they traverse the bubble (`source → sink` walk; `<prefix>.bubble_<N>.clusters.tsv`) | off |
 | `--cluster-similarity <f>` | walk-similarity threshold for `--cluster` | `0.90` |
 | `--fasta-out` / `--table-out` / `--edge-table-out <path>` | override the FASTA/node-count/edge-count paths (single `--bubble-id` only) | derived |
 

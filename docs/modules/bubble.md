@@ -5,14 +5,13 @@ CLI: `panvar bubble`
 ## What it does
 
 Turns a pangenome graph (GFA — Graphical Fragment Assembly — from [pggb](https://github.com/pangenome/pggb)) into bubble sites for the downstream modules. It:
-- sorts/flips the graph along the reference
-- finds [snarls](../algorithms/bubble.md#terms) internally (a vendored cactus/3-edge-connected decomposition matching [vg](https://github.com/vgteam/vg) `snarls`)
--  infers each bubble's internal nodes from path intervals
--  scores path support and internal span
--   applies size/support filters
--   writes the sorted GFA, a bubble CSV and [Bandage](https://github.com/asl/BandageNG)-ready visualization files.
+- sorts/flips the graph along the reference;
+- finds snarls internally — a snarl being a boundary-node pair whose removal isolates an interior subgraph (a vendored cactus/3-edge-connected decomposition matching [vg](https://github.com/vgteam/vg) `snarls`);
+- infers each bubble's internal nodes from path intervals, and scores path support and internal span;
+- applies size/support filters;
+- writes the sorted GFA, a bubble CSV and [Bandage](https://github.com/asl/BandageNG)-ready visualization files.
 
-Algorithm and worked trace: [algorithms/bubble.md](../algorithms/bubble.md).
+A snarl can contain cycles and inversions, which is where much pangenome variation sits, so snarls are the default; `--superbubbles` restricts to the acyclic subset. Algorithm and worked trace: [algorithms/bubble.md](../algorithms/bubble.md).
 
 ## Required inputs
 
@@ -24,7 +23,7 @@ Algorithm and worked trace: [algorithms/bubble.md](../algorithms/bubble.md).
 | flag | what it does | default |
 |------|--------------|---------|
 | `-o, --out-prefix <p>` | output prefix | `bubble_calls` |
-| `-s, --superbubbles` | emit only acyclic [superbubbles](../algorithms/bubble.md#terms) instead of all snarls | off (all snarls) |
+| `-s, --superbubbles` | emit only acyclic superbubbles (single-source/single-sink, no cycle or inversion) instead of all snarls | off (all snarls) |
 | `--min-variant-bp <N>` | keep a bubble only if some path's internal span ≥ N (`0` = off) | `50` |
 | `--max-variant-bp <N>` | largest variant to keep: drop a bubble if any path's internal span > N (`0` = off). | `0` (off) |
 | `--min-path-support <N>` | keep only bubbles crossed by ≥ N paths | `0` (off) |
