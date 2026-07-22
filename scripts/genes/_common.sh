@@ -5,6 +5,13 @@
 
 set -uo pipefail
 
+# Sourced by the per-gene drivers; running it directly does nothing useful.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  echo "_common.sh is a sourced library for scripts/genes/<gene>.sh, not a standalone script." >&2
+  exit 1
+fi
+
+
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BIN="${PANVAR_BIN:-$REPO/build/panvar}"
 PY="${PYTHON:-python3}"

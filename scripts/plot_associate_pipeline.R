@@ -1,21 +1,38 @@
 #!/usr/bin/env Rscript
-# Pipeline Manhattan for `panvar associate`: one facet per processing stage, colouring which features
-# survive each stage, so the funnel TEST -> FILTER MAF -> [CLUMP] -> CORRECT -> CONDITION is explicit.
-# The variant tier has a CLUMP stage (genotype-r^2 LD-clumping); the graph/k-mer feature tiers do not.
-# See docs/gwas/example.md and docs/algorithms/associate.md.
-#   plot_associate_pipeline.R --assoc <real.assoc.tsv> --unfiltered <minmaf0.assoc.tsv> \
-#       --summary <real.summary.tsv> --min-maf <X> --out <prefix> [--title T]
-# --assoc       : the real run (correct Meff/clump/COJO; post-MAF features)        [required]
-# --unfiltered  : a `--min-maf 0` run of the SAME data (to show TEST + FILTER MAF) [optional]
+# Staged Manhattan for `panvar associate`: one facet per stage of the funnel TEST -> FILTER MAF ->
+# [CLUMP] -> CORRECT -> CONDITION. See docs/gwas.md and docs/algorithms/associate.md; --help for usage.
 suppressWarnings(suppressMessages(library(ggplot2)))
 
 args <- commandArgs(trailingOnly = TRUE)
+usage <- function(status = 0) {
+  cat(paste(c(
+    "plot_associate_pipeline.R - staged Manhattan showing which features survive each association stage",
+    "  (TEST -> FILTER MAF -> [CLUMP] -> CORRECT -> CONDITION), one facet per stage.",
+    "",
+    "Usage:",
+    "  Rscript plot_associate_pipeline.R --assoc <real.assoc.tsv> --out <prefix> [options]",
+    "",
+    "Required:",
+    "  --assoc <path>       the real run (correct Meff/clump/COJO; post-MAF features)",
+    "  --out <prefix>       output prefix; writes <prefix>.pipeline.{png,pdf}",
+    "",
+    "Optional:",
+    "  --unfiltered <path>  a --min-maf 0 run of the same data (adds the TEST + FILTER MAF stages)",
+    "  --summary <path>     .summary.tsv (correction thresholds)",
+    "  --min-maf <X>        MAF cut to draw for the FILTER stage (default 0.01)",
+    "  --title <s>          plot title",
+    "  --width / --height   figure size in inches (default 9 x 11.5)",
+    "  --dpi <n>            PNG resolution (default 150)",
+    "  -h, --help           show this help"), collapse = "\n"), "\n")
+  quit(status = status)
+}
+if (length(args) == 0 || any(args %in% c("-h", "--help"))) usage(0)
 get <- function(f, d = NULL) { i <- match(f, args); if (is.na(i) || i == length(args)) return(d); args[i + 1] }
 assoc <- get("--assoc"); unfilt <- get("--unfiltered"); summ <- get("--summary")
 out <- get("--out"); title <- get("--title", "panvar associate")
 min_maf <- as.numeric(get("--min-maf", "0.01"))
 W <- as.numeric(get("--width", "9")); H <- as.numeric(get("--height", "11.5")); dpi <- as.numeric(get("--dpi", "150"))
-if (is.null(assoc) || is.null(out)) stop("usage: plot_associate_pipeline.R --assoc <a> --out <p> [--unfiltered u --summary s --min-maf X --title T]")
+if (is.null(assoc) || is.null(out)) usage(1)
 
 B <- read.delim(assoc, sep = "\t", header = TRUE, check.names = FALSE)
 B <- B[is.finite(B$p), ]

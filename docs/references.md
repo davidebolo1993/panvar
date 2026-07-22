@@ -5,9 +5,19 @@ Tools `panvar` builds on (GitHub) and the papers behind the ideas in each module
 ## General on pangenome graphs
 
 - [pangenome/pggb](https://github.com/pangenome/pggb) — the pangenome graph builder whose `*.smooth.final.gfa` is the usual input to `bubble`.
+- [ekg/seqwish](https://github.com/ekg/seqwish) — the graph inducer inside pggb; its transitive closure over all-pairs alignments is what `rebuild` re-induces around when a locus comes out tangled.
 - [pangenome/odgi](https://github.com/pangenome/odgi) — graph sort / visualization; `panvar`'s internal reference sort mirrors the odgi-style ordering used downstream.
 - [vgteam/vg](https://github.com/vgteam/vg) — `vg snarls` is the reference behaviour `bubble`'s internal snarl finder reproduces.
 - [pangenome/PanSN-spec](https://github.com/pangenome/PanSN-spec) — the `sample#hap#contig:start-end` path naming `--gtf` annotation relies on.
+
+
+## `rebuild`
+
+GitHub: [lh3/minigraph](https://github.com/lh3/minigraph) — progressive graph generation and graph mapping, statically vendored as the construction engine behind `rebuild`.
+
+- Li H, Feng X, Chu C. **The design and construction of reference pangenome graphs with minigraph.** *Genome Biol.* 22, 265 (2021). <https://doi.org/10.1186/s13059-021-02168-z> — the incremental graph-generation model `rebuild` drives.
+- Hickey G, Monlong J, Ebler J, et al. **Pangenome graph construction from genome alignments with Minigraph-Cactus.** *Nat. Biotechnol.* 42, 663–673 (2024). <https://doi.org/10.1038/s41587-023-01793-w> — the base-level refinement step `rebuild` deliberately does not perform, and the reason its output is structural rather than base-exact.
+
 
 ## `bubble`
 
@@ -29,12 +39,6 @@ GitHub: [yangao07/abPOA](https://github.com/yangao07/abPOA) — SIMD partial-ord
 
 - Gao Y, Liu Y, Ma Y, Liu B, Wang Y, Xing Y. **abPOA: an SIMD-based C library for fast partial order alignment using adaptive band.** *Bioinformatics* 2021;37(15):2209–2211. <https://doi.org/10.1093/bioinformatics/btaa963>
 
-## `rebuild`
-
-GitHub: [lh3/minigraph](https://github.com/lh3/minigraph) — progressive graph generation and graph mapping, statically vendored as the construction engine behind `rebuild`.
-
-- Li H, Feng X, Chu C. **The design and construction of reference pangenome graphs with minigraph.** *Genome Biol.* 22, 265 (2021). <https://doi.org/10.1186/s13059-021-02168-z> — the incremental graph-generation model `rebuild` drives.
-- Hickey G, Monlong J, Ebler J, et al. **Pangenome graph construction from genome alignments with Minigraph-Cactus.** *Nat. Biotechnol.* 42, 663–673 (2024). <https://doi.org/10.1038/s41587-023-01793-w> — the base-level refinement step `rebuild` deliberately does not perform, and the reason its output is structural rather than base-exact.
 
 ## `call`
 

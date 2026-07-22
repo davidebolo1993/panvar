@@ -1,6 +1,6 @@
 # LPA GWAS example inputs (simulated)
 
-Ready-to-use phenotype and cohort tables for the [GWAS example](../../../docs/gwas/example.md), so the real
+Ready-to-use phenotype and cohort tables for the [GWAS example](../../../docs/gwas.md), so the real
 `panvar` pipeline can be exercised end-to-end without first generating a cohort.
 
 **These are simulated**, not a real study. A structured cohort of ~6,000 diploid individuals — the scale of

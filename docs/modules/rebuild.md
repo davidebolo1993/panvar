@@ -4,14 +4,12 @@ CLI: `panvar rebuild`
 
 ## What it does
 
-Re-induces a locus graph before bubble decomposition, for the minority of graphs whose construction left them too fragmented to decompose sanely. It:
-- runs a cheap degree gate over the input GFA (Graphical Fragment Assembly) to decide whether the graph is pathological, and passes healthy graphs through untouched
-- if pathological, rebuilds the locus by progressive graph generation: haplotypes are added most-complete-first, each aligned to the graph built so far and augmented with the parts that do not match
-- recovers a walk for every haplotype and writes a plain GFA with integer node ids, orientation-preserving links and one `P` line per haplotype, ready for `bubble`
+Re-induces a locus graph (GFA — Graphical Fragment Assembly — from [pggb](https://github.com/pangenome/pggb)) before bubble decomposition, for the minority of graphs whose construction left them too fragmented to decompose sanely. It:
+- runs a cheap degree gate over the input GFA to decide whether the graph is pathological, and passes healthy graphs through untouched;
+- if pathological, rebuilds the locus by progressive graph generation: haplotypes are added most-complete-first, each aligned to the graph built so far and augmented with the parts that do not match;
+- recovers a walk for every haplotype and writes a plain GFA ready for `bubble`.
 
-Some graph builders resolve a low-complexity locus by transitive closure over all pairwise alignments, which merges near-identical repeat copies into a small number of very high-degree nodes. The resulting tangle has no clean nesting, so snarl finding returns one large undecomposable site instead of a set of variant sites. Rebuilding the locus from the haplotype sequences removes the tangle, because progressive alignment chains colinearly through the graph rather than closing over every pairwise match.
-
-Graph generation is delegated to [minigraph](https://github.com/lh3/minigraph), linked as a library. What this module owns is the gate that decides when to intervene, the haplotype order that generation consumes, and the emitted GFA.
+pggb induces its graph with [seqwish](https://github.com/ekg/seqwish), whose transitive closure over all-pairs alignments can collapse sequences that recur across the locus — repeat copies, or the same short segment reused in different places — onto shared, very high-degree nodes, complicating downstream variant calling. Rebuilding avoids this because progressive re-alignment never closes over every pairwise match: it threads each haplotype colinearly, so recurring sequence branches locally instead of merging globally. In `rebuild`, graph generation is delegated to [minigraph](https://github.com/lh3/minigraph), while the module decides when to intervene, the haplotype order that generation consumes, and the emitted GFA.
 
 Algorithm and worked trace: [algorithms/rebuild.md](../algorithms/rebuild.md).
 
@@ -38,12 +36,9 @@ Algorithm and worked trace: [algorithms/rebuild.md](../algorithms/rebuild.md).
 
 | file | contents |
 |------|----------|
-| `<out.gfa>` | the rebuilt graph: `S` lines with consecutive integer ids, `L` lines carrying orientation, one `P` line per recovered haplotype |
+| `<out.gfa>` | the rebuilt graph: `S` lines, `L` lines carrying orientation, one `P` line per recovered haplotype |
 
 
 ## Notes
 
-The rebuilt graph is structural, not base-exact. Differences shorter than `--min-var` are not augmented, so a haplotype's `P` line spells the backbone allele at those positions rather than its own sequence. Expect per-haplotype identity below `1.0`, with the shortfall concentrated in substitutions and short indels; lowering `--min-var` does not remove it, because the underlying generator does not augment single-base differences at any practical setting.
-
-This matters for anything that assumes a path spells its haplotype exactly, including k-mer features from `describe` and round-trip identity from `benchmark`. It does not affect structural-variant calling, which is what the module exists to make possible. Because the gate confines rebuilding to graphs that could not be decomposed at all, the loss applies only where the alternative was no usable decomposition.
-
+The rebuilt graph is structural, not base-exact. Differences shorter than `--min-var` are not augmented, so a haplotype's `P` line spells the backbone allele at those positions rather than its own sequence. Expect per-haplotype identity below `1.0`, with the shortfall concentrated in substitutions and short indels; lowering `--min-var` does not fully remove it, because the underlying generator does not augment single-base differences at any practical setting. This matters for anything that assumes a path spells its haplotype exactly. 

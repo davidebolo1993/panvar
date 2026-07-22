@@ -56,7 +56,7 @@ def convert(path):
 
 
 def main(argv):
-    if len(argv) < 2:
+    if len(argv) < 2 or argv[1] in ("-h", "--help"):
         sys.exit(__doc__)
     for path in argv[1:]:
         n = convert(path)

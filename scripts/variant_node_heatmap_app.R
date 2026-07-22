@@ -6,6 +6,20 @@
 # per-walk coverage: white = not traversed, grey = x1, red = x2+ (so a DUP reads as a copy-number gradient).
 # Bottom (toggle): one row per VCF variant_id, red at its union nodes. Hover shows node/gene/coverage and,
 # on a variant node, that haplotype's GT (+ CN/CNBP for DUPs).
+if (any(commandArgs(trailingOnly = TRUE) %in% c("-h", "--help"))) {
+  cat(paste(c(
+    "variant_node_heatmap_app.R - interactive node-coverage + variant-track viewer (Shiny + plotly).",
+    "",
+    "Usage:",
+    "  VN_RDS=<bundle.rds> Rscript variant_node_heatmap_app.R",
+    "",
+    "  VN_RDS   path to a bundle from build_variant_node_data.R (required, passed as an env var)",
+    "",
+    "Top panel: one row per haplotype, X = variant regions, node colour = per-walk coverage",
+    "  (white none, grey x1, red x2+). Bottom panel (toggle): one row per VCF variant at its nodes."),
+    collapse = "\n"), "\n")
+  quit(status = 0)
+}
 suppressWarnings(suppressMessages({library(shiny); library(plotly); library(data.table)}))
 
 load_bundle <- function() {

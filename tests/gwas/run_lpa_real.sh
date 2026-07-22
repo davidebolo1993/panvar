@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # LPA association demo on the real graph: bubble -> panphorte -> call -> describe --samples -> associate.
 # Produces (1) a region scan that recovers KIV-2 as the top hit, and (2) a structure-correction demo on a
-# synthetic genome-wide panel (naive lambda>>1 -> ~1 with PCs/LMM). See docs/gwas/example.md. Needs a
+# synthetic genome-wide panel (naive lambda>>1 -> ~1 with PCs/LMM). See docs/gwas.md. Needs a
 # numpy-capable python.
 #   run_lpa_real.sh <panvar_bin> <out_dir> [python] [Rscript] [--big]
 # Env: N (cohort size; --big sets 6000, the Moli-sani WGS scale), SIM (null markers, default 3000),

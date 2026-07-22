@@ -4,10 +4,16 @@
 # copy number). Called on the panphorte graph (universal substrate; panphorte leaves this cluster
 # untouched at min-similarity 0.97, so it equals the bubble graph).
 #   scripts/genes/cyp2d6.sh
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  echo "CYP2D6 driver: paralog cluster; module CN + CYP2D6/2D7 per-gene split."
+  echo "Usage: [PANVAR_BIN=..] [PYTHON=..] [RSCRIPT=..] [THREADS=..] scripts/genes/cyp2d6.sh"
+  echo "Writes results/real_data/cyp2d6/. See scripts/genes/_common.sh for the env vars."
+  exit 0
+fi
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; source "$HERE/_common.sh"
 region=cyp2d6; d="$OUT/$region"
 
-run_gene_data "$region" "$DATA/cyp2d6.gfa.gz" 0.97 panphorte "--cn" 0.97 || exit 1
+run_gene_data "$region" "$DATA/cyp2d6.gfa.gz" 0.95 panphorte "--cn" 0.97 || exit 1
 
 # ---- copy-number validation vs ground truth (optional; uncomment) -------------------------------
 # "$PY" "$REPO/scripts/compare_copy_number.py" --vcf "$d/call/call.region.vcf" --label cyp2d6 \

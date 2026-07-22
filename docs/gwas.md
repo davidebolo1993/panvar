@@ -1,6 +1,6 @@
 # Pangenome association with panvar — the LPA/KIV-2 example
 
-The association half of the pipeline, on `panvar`'s LPA output. The variant calling and feature description that produce the genotype matrices are covered in the [walkthrough](../walkthrough.md); this page picks up at `associate` — testing a simulated plasma Lp(a) (lipoprotein(a)) phenotype against the KIV-2 copy number, and reading the multiple-testing corrections. The KIV-2 copy number is inversely associated with Lp(a) (more copies means lower Lp(a)), and the whole signal is in the count, so it is the ideal copy-number test. The phenotype is simulated, so this demonstrates recovering a planted signal under realistic population structure, not a real Lp(a) study (protected). Methods are cited in [references.md](../references.md#associate).
+The association half of the pipeline, on `panvar`'s LPA output. The variant calling and feature description that produce the genotype matrices are covered in the [walkthrough](walkthrough.md); this page picks up at `associate` — testing a simulated plasma Lp(a) (lipoprotein(a)) phenotype against the KIV-2 copy number, and reading the multiple-testing corrections. The KIV-2 copy number is inversely associated with Lp(a) (more copies means lower Lp(a)), and the whole signal is in the count, so it is the ideal copy-number test. The phenotype is simulated, so this demonstrates recovering a planted signal under realistic population structure, not a real Lp(a) study (protected). Methods are cited in [references.md](references.md#associate).
 
 ## The example cohort (simulated)
 
@@ -15,7 +15,7 @@ The tables are committed under `tests/gwas/lpa/` so the association is runnable 
 | `pheno.binary.tsv` | high-risk case/control (0/1) + the same covariates |
 | `pheno.quant.nopc.tsv` | quantitative phenotype without the PCs (the naive, uncorrected analysis) |
 
-The genotype matrices tested below live under `results/real_data/lpa/gwas/desc/`: the per-substrate BIMBAM dosage matrices (`bimbam_variant.*`, `bimbam_graph.*`, `bimbam_kmers.*`) from a `describe` run configured for association — passed the `cosigt` `--samples` table and the `--variant-vcf`, so each sample's two haplotypes are summed into one diploid dosage row (`bimbam_*.samples.bimbam.gz`). The driver `tests/gwas/run_lpa_real.sh` builds them. This is a GWAS-specific `describe`, distinct from the plain per-haplotype `describe` (`results/real_data/lpa/describe/`) in the [walkthrough](../walkthrough.md) — the association needs the diploid per-sample and variant-level matrices that the walkthrough run does not emit.
+The genotype matrices tested below live under `results/real_data/lpa/gwas/desc/`: the per-substrate BIMBAM dosage matrices (`bimbam_variant.*`, `bimbam_graph.*`, `bimbam_kmers.*`) from a `describe` run configured for association — passed the `cosigt` `--samples` table and the `--variant-vcf`, so each sample's two haplotypes are summed into one diploid dosage row (`bimbam_*.samples.bimbam.gz`). The driver `tests/gwas/run_lpa_real.sh` builds them. This is a GWAS-specific `describe`, distinct from the plain per-haplotype `describe` (`results/real_data/lpa/describe/`) in the [walkthrough](walkthrough.md) — the association needs the diploid per-sample and variant-level matrices that the walkthrough run does not emit.
 
 ## Associate the variant unit — the honest test
 
@@ -142,7 +142,7 @@ The statistics match. The only wrinkle is the copy-number marker: GEMMA's allele
 
 ## See also
 
-- [associate](../modules/associate.md) — the engine, units, corrections, and output columns.
-- [describe](../modules/describe.md) — the three BIMBAM substrates and `--samples`/`--variant-vcf`.
-- [walkthrough](../walkthrough.md) — the calling and feature-description steps that produce the genotype matrices.
-- [references.md](../references.md#associate) — methods (EMMAX/GEMMA, Benjamini–Hochberg) and the LPA/Lp(a) literature.
+- [associate](modules/associate.md) — the engine, units, corrections, and output columns.
+- [describe](modules/describe.md) — the three BIMBAM substrates and `--samples`/`--variant-vcf`.
+- [walkthrough](walkthrough.md) — the calling and feature-description steps that produce the genotype matrices.
+- [references.md](references.md#associate) — methods (EMMAX/GEMMA, Benjamini–Hochberg) and the LPA/Lp(a) literature.

@@ -1,15 +1,34 @@
 #!/usr/bin/env Rscript
-# Manhattan (before/after correction) + QQ for `panvar associate` output. See docs/gwas/example.md.
-#   Rscript plot_associate.R --assoc out.assoc.tsv [--summary out.summary.tsv] --out prefix [--title T]
+# Manhattan + QQ for `panvar associate` output. See docs/gwas.md; run with --help for usage.
 suppressWarnings(suppressMessages(library(ggplot2)))
 
 args <- commandArgs(trailingOnly = TRUE)
+usage <- function(status = 0) {
+  cat(paste(c(
+    "plot_associate.R - Manhattan (before/after correction) + QQ for `panvar associate` output.",
+    "",
+    "Usage:",
+    "  Rscript plot_associate.R --assoc <assoc.tsv> --out <prefix> [options]",
+    "",
+    "Required:",
+    "  --assoc <path>     panvar associate .assoc.tsv",
+    "  --out <prefix>     output prefix; writes <prefix>.manhattan.{png,pdf} and <prefix>.qq.{png,pdf}",
+    "",
+    "Optional:",
+    "  --summary <path>   .summary.tsv (adds correction thresholds to the Manhattan)",
+    "  --title <s>        plot title (default 'panvar associate')",
+    "  --width / --height figure size in inches (default 10 x 7)",
+    "  --dpi <n>          PNG resolution (default 150)",
+    "  -h, --help         show this help"), collapse = "\n"), "\n")
+  quit(status = status)
+}
+if (length(args) == 0 || any(args %in% c("-h", "--help"))) usage(0)
 get <- function(flag, default = NULL) {
   i <- match(flag, args); if (is.na(i) || i == length(args)) return(default); args[i + 1]
 }
 assoc <- get("--assoc"); out <- get("--out"); summary_path <- get("--summary"); title <- get("--title", "panvar associate")
 man_w <- as.numeric(get("--width", "10")); man_h <- as.numeric(get("--height", "7")); dpi <- as.numeric(get("--dpi", "150"))
-if (is.null(assoc) || is.null(out)) stop("usage: plot_associate.R --assoc <assoc.tsv> --out <prefix> [--summary s] [--title T] [--width W --height H --dpi D]")
+if (is.null(assoc) || is.null(out)) usage(1)
 
 d <- read.delim(assoc, sep = "\t", header = TRUE, check.names = FALSE)
 d <- d[is.finite(d$p), ]

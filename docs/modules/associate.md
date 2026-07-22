@@ -107,4 +107,4 @@ Script flags (need `Rscript` + `ggplot2`; `ggrepel` optional, for the gene label
 
 ## Example
 
-See the [GWAS example](../gwas/example.md) for a runnable association run on this locus, and the [LPA walkthrough](../walkthrough.md) for the full pipeline.
+See the [GWAS example](../gwas.md) for a runnable association run on this locus, and the [LPA walkthrough](../walkthrough.md) for the full pipeline.

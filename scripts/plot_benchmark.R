@@ -13,6 +13,35 @@
 suppressWarnings(suppressMessages({library(ggplot2); library(grid)}))
 
 args <- commandArgs(trailingOnly = TRUE)
+usage <- function(status = 0) {
+  cat(paste(c(
+    "plot_benchmark.R - round-trip reconstruction anatomy, one bar per locus.",
+    "  LEFT  (Reconstruction): stacked bar = Reconstructed (identity) + Residual, as % of the",
+    "        aligned haplotype sequence.",
+    "  RIGHT (Residual composition): that residual split into Not-callable (< threshold) and",
+    "        Mis-called (>= threshold), y-axis auto-scaled so the usually tiny shortfall is legible.",
+    "  Loci are ordered worst-first by mis-called bp.",
+    "",
+    "Usage:",
+    "  Rscript plot_benchmark.R --table <combined.tsv> --out <prefix> [options]",
+    "",
+    "Required:",
+    "  --table <path>           per-haplotype benchmark rows; needs the columns locus, sum_aln_len,",
+    "                           sum_delta, sub_threshold_bp, over_threshold_bp (from `panvar benchmark`)",
+    "",
+    "Optional:",
+    "  --out <prefix>           output prefix; writes <prefix>.png (default benchmark)",
+    "  --per-row <N>            loci per row; both plots wrap the same way (default 30)",
+    "  --top <N>                keep only the N worst loci (default 0 = all)",
+    "  --left-ymin <y>          zoom the left y-axis, e.g. 90, since bars sit near 100% (default 0)",
+    "  --dpi <n>                PNG resolution (default 150)",
+    "  -h, --help               show this help",
+    "",
+    "Note: `benchmark` reads the post-filter variant_nodes.tsv, so calls dropped by a `call` filter",
+    "such as --min-maf are counted as Mis-called rather than as filtered."), collapse = "\n"), "\n")
+  quit(status = status)
+}
+if (length(args) == 0 || any(args %in% c("-h", "--help"))) usage(0)
 get <- function(f, d = NULL) {
   i <- match(f, args)
   if (is.na(i) || i == length(args)) return(d)
@@ -25,7 +54,7 @@ tp <- get("--table"); out <- get("--out", "benchmark")
 per_row <- as.integer(numarg("--per-row", "30")); if (per_row < 1) per_row <- 30L
 top <- as.integer(numarg("--top", "0"))
 left_ymin <- numarg("--left-ymin", "0"); dpi <- numarg("--dpi", "150")
-if (is.null(tp)) stop("need --table <tsv> (benchmark per-haplotype rows with the residual-split columns)")
+if (is.null(tp)) usage(1)
 
 d <- read.delim(tp, check.names = FALSE, stringsAsFactors = FALSE)
 need <- c("locus", "sum_aln_len", "sum_delta", "sub_threshold_bp", "over_threshold_bp")

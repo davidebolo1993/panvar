@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Validate `panvar associate` against GEMMA on the same BIMBAM panel + phenotype: linear (vs GEMMA -lm 4)
-# and mixed (vs -lmm 4 -k). Reports Pearson r of beta and -log10 p. See docs/gwas/example.md. Skips if no
+# and mixed (vs -lmm 4 -k). Reports Pearson r of beta and -log10 p. See docs/gwas.md. Skips if no
 # GEMMA. BIMBAM is GEMMA's native format, so genotypes load unchanged.
 #   validate_gemma.sh <panvar_bin> <out_dir> [python] [gemma_bin] [copies.tsv]
 set -uo pipefail

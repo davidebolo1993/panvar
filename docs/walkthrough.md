@@ -1,6 +1,6 @@
 # Walkthrough — the LPA locus, end to end
 
-A single worked run of the whole pipeline on one real locus: LPA (the `LPA` gene's KIV-2 VNTR — a variable-number tandem repeat whose copy number is a known cardiovascular risk factor). It shows the usage of all the modules in `panvar` with the exception of `associate`, which is covered by the dedicated [GWAS example](gwas/example.md); here it is only pointed at.
+A single worked run of the whole pipeline on one real locus: LPA (the `LPA` gene's KIV-2 VNTR — a variable-number tandem repeat whose copy number is a known cardiovascular risk factor). It shows the usage of all the modules in `panvar` with the exception of `associate`, which is covered by the dedicated [GWAS example](gwas.md); here it is only pointed at.
 
 Every command runs against the committed test graph `tests/real_data/lpa.gfa.gz` and writes under `results/real_data/lpa/`. The whole run is reproduced by `scripts/regen_results.sh lpa`. The reference path is `GRCh38#0#chr6:160509252-160734894`.
 
@@ -189,7 +189,7 @@ Turns the called bubbles into per-haplotype dosage features (k-mer, node/edge gr
 
 ## 8. `associate` — the GWAS
 
-Association (`phenotype ~ genotype`, multiple-testing correction, conditional independence) is its own worked example on this exact LPA output: see [GWAS example](gwas/example.md). In short, testing the KIV-2 features against a Lp(a) phenotype recovers the KIV-2 copy-number signal as the region's top hit, and structure correction keeps the genomic-inflation λ ≈ 1.
+Association (`phenotype ~ genotype`, multiple-testing correction, conditional independence) is its own worked example on this exact LPA output: see [GWAS example](gwas.md). In short, testing the KIV-2 features against a Lp(a) phenotype recovers the KIV-2 copy-number signal as the region's top hit, and structure correction keeps the genomic-inflation λ ≈ 1.
 
 
 ---
@@ -228,10 +228,10 @@ Rscript scripts/plot_cn_correlation.R \
 
 Total copy number per locus (called vs ground truth):
 
-![Locus total-CN correlation](img/cn_correlation_loci.png)
+![Locus total-CN correlation](img/cn_correlation.loci.png)
 
 Per-gene split for the paralog clusters:
 
-![Per-gene CN correlation](img/cn_correlation_genes.png)
+![Per-gene CN correlation](img/cn_correlation.genes.png)
 
 Every point on the diagonal is an exactly-correct call. Locus totals are exact (LPA 465/465, C4 131/131, GSTM1 159/159, ACOT 467/467); the per-gene splits land C4A/C4B at 96.2%, CYP2D6 99.2%, CYP2D7 100%, the whole GSTM cluster (GSTM1, GSTM2, GSTM4, GSTM5) at 466/466 each, and ACOT1/ACOT2 at 99.6% (100% within ±1) — the off-diagonal C4/CYP/ACOT handful are gene-conversion mosaics and unannotated pseudogene/hybrid modules. Stable single-copy genes outside the folded module (GSTM3, ACOT4, ACOT6) have nothing to resolve, so they are not split out.

@@ -1,9 +1,30 @@
 #!/usr/bin/env bash
 # Regenerate everything under results/ (gitignored): the full pipeline per region + copy-number
-# validation vs the committed ground truth, plus the synthetic smoke. Needs Rscript for plots and a
-# numpy/scipy python for the LPA GWAS (set RSCRIPT / PYTHON, e.g. conda base).
-#   scripts/regen_results.sh [region ...]      # default: all regions + synthetic
+# validation vs the committed ground truth, plus the synthetic smoke.
 set -uo pipefail
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  cat <<'EOF'
+regen_results.sh - regenerate everything under results/ (gitignored).
+
+Usage:
+  scripts/regen_results.sh [region ...]
+
+  region ...   subset to run (default: lpa c4 gstm1 cyp2d6 acot ankrd36c synthetic)
+
+For each region: bubble -> panphorte -> refine -> call -> describe -> benchmark, plus copy-number
+validation against the committed ground truth, plus the cn-correlation and benchmark-QV plots.
+
+Environment:
+  PANVAR_BIN   panvar binary        (default build/panvar)
+  PYTHON       python for the plots + LPA GWAS; needs numpy/scipy (default python3)
+  RSCRIPT      Rscript for the plots (default Rscript)
+  THREADS      worker threads       (default 0 = auto)
+  REFINE       1 = call on the refined graph, 0 = on the panphorte graph (default 1)
+  GTF          gene GTF for annotation (default tests/real_data/Homo_sapiens.GRCh38.116.gtf.gz)
+EOF
+  exit 0
+fi
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
@@ -26,7 +47,6 @@ ref_of() {  # pick a reference path: prefer GRCh38, then CHM13, else the first p
 }
 
 # run_region <region> <gfa.gz> <panphorte_extra> <call_graph: bubble|panphorte> <call_extra>
-# Which graph `call` reads depends on topology; see docs/algorithms/call.md (CN-topology table).
 run_region() {
   local region="$1" gfa="$2" pan_extra="$3" call_graph="$4" call_extra="$5" finer_clusters="${6:-0}"
   local d="$OUT/$region"
@@ -61,7 +81,7 @@ run_region() {
   # 4) describe (variant-restricted markers)
   "$BIN" describe -i "$cgfa" --bubble-prefix-in "$cpfx" --out-dir "$d/describe" \
     --variant-nodes "$d/call/call.variant_nodes.tsv" --no-wide-matrix --threads "$THREADS" --quiet || return 1
-  # 4b) benchmark: round-trip QV of the calls (cosigt-style bands), if variant nodes were written
+  # 4b) benchmark: round-trip QV of the calls - if variant nodes were written
   if [[ -s "$d/call/call.variant_nodes.tsv" ]]; then
     "$BIN" benchmark -i "$cgfa" --bubble-prefix-in "$cpfx" --reference-path "$ref" \
       --variant-nodes "$d/call/call.variant_nodes.tsv" -o "$d/call/benchmark" \
@@ -135,20 +155,14 @@ mkdir -p "$REPO/results"; rm -f "$CN_TABLE"
 for region in "${REGIONS[@]}"; do
   case "$region" in
     lpa)
-      # Tandem repeat (KIV-2): panphorte folds the variable tandem; call counts on the REP node.
-      run_region lpa "$DATA/lpa.gfa.gz" "--min-similarity 0.70" panphorte "--cn" 1
+      run_region lpa "$DATA/lpa.gfa.gz" "--min-similarity 0.95" panphorte "--cn" 1
       validate_cn lpa --mode repeats --truth "$DATA/lpa.repeats.tsv" --name-col hapl --count-col copies
       # LPA GWAS demo (needs python numpy/scipy); reuses the dedicated driver
       bash "$HERE/../tests/gwas/run_lpa_real.sh" "$BIN" "$OUT/lpa/gwas" "$PY" "$RS" || echo "  (gwas demo skipped)"
       ;;
     c4)
-      # PGGB-collapsed paralog cluster (each RCCX module = one C4 gene). Total CN from folded-node
-      # coverage -> 131/131 exact against the C4A+C4B gene count. Called on the panphorte graph (the
-      # universal substrate; panphorte leaves this cluster untouched, so it equals the bubble graph).
-      run_region c4 "$DATA/c4.gfa.gz" "--min-similarity 0.70" panphorte "--cn"
+      run_region c4 "$DATA/c4.gfa.gz" "--min-similarity 0.95" panphorte "--cn"
       validate_cn c4 --mode gene-count --truth "$DATA/c4.bed" --genes C4A,C4B
-      # Resolved per-gene split (C4A/C4B from the k-mer per-site resolver, --gtf) vs per-gene truth,
-      # absolute (offset 0). C4A/C4B are near-identical, so the split rides the per-site consensus.
       if [[ -s "$OUT/c4/call/call.dup_gene_cn.tsv" ]]; then
         for g in C4A C4B; do
           echo "---- c4 $g per-gene split vs ground truth ----"
@@ -159,9 +173,7 @@ for region in "${REGIONS[@]}"; do
       fi
       ;;
     gstm1)
-      # PGGB-collapsed paralog cluster (GSTM1/2/5, reference folds 3x): total-module coverage,
-      # validated against the GSTM1 count after the paralog baseline. Called on the panphorte graph.
-      run_region gstm1 "$DATA/gstm1.gfa.gz" "--min-similarity 0.70" panphorte "--cn"
+      run_region gstm1 "$DATA/gstm1.gfa.gz" "--min-similarity 0.95" panphorte "--cn"
       validate_cn gstm1 --mode direct --truth "$DATA/gstm1.bed"
       # Per-gene split (--gtf) vs the full pangene truth (gstm.bed, per-molecule gene counts), absolute
       # (offset 0). We resolve GSTM1/2/4/5; GSTM3 is stable single-copy outside the module, so not scored.
@@ -175,14 +187,8 @@ for region in "${REGIONS[@]}"; do
       fi
       ;;
     cyp2d6)
-      # PGGB-collapsed paralog cluster (CYP2D6/2D7/2D8P). Folded-node coverage = total module copies;
-      # validated against the collapsed D6+D7 truth. The few residual misses carry an extra
-      # (unannotated) CYP2D8P / 2D7-hybrid module that the gene BED does not count -- real biology.
-      # Called on the panphorte graph (leaves this cluster untouched, so it equals the bubble graph).
-      run_region cyp2d6 "$DATA/cyp2d6.gfa.gz" "" panphorte "--cn"
+      run_region cyp2d6 "$DATA/cyp2d6.gfa.gz" "--min-similarity 0.95" panphorte "--cn"
       validate_cn cyp2d6 --mode gene-count --truth "$DATA/cyp2d6.bed" --genes CYP2D6,CYP2D7
-      # Resolved per-gene split (divergent paralogs, --gtf private-k-mer dosage) vs per-gene truth: CYP2D6
-      # and CYP2D7 separately, absolute (offset 0). Adds CYP2D6/CYP2D7 facets to the concordance plot.
       if [[ -s "$OUT/cyp2d6/call/call.dup_gene_cn.tsv" ]]; then
         for g in CYP2D6 CYP2D7; do
           echo "---- cyp2d6 $g per-gene split vs ground truth ----"
@@ -193,11 +199,7 @@ for region in "${REGIONS[@]}"; do
       fi
       ;;
     acot)
-      # chr14 ACOT paralog cluster: panphorte folds ACOT1/ACOT2 into one ~14.5 kb RU. Total module CN vs
-      # the ACOT1+ACOT2 gene count is exact, and the private-k-mer split (--gtf) resolves the two variable
-      # paralogs -- ACOT1 (a common presence/null, 0-3 copies) and ACOT2 (mostly single). ACOT4/ACOT6 are
-      # stable single-copy outside the folded module (like GSTM3), so they are not resolved.
-      run_region acot "$DATA/acot.gfa.gz" "--min-similarity 0.70" panphorte "--cn"
+      run_region acot "$DATA/acot.gfa.gz" "--min-similarity 0.95" panphorte "--cn"
       validate_cn acot --mode gene-count --truth "$DATA/acot.bed" --genes ACOT1,ACOT2
       if [[ -s "$OUT/acot/call/call.dup_gene_cn.tsv" ]]; then
         for g in ACOT1 ACOT2; do
@@ -209,10 +211,7 @@ for region in "${REGIONS[@]}"; do
       fi
       ;;
     ankrd36c)
-      # chr2 ANKRD36 segmental-dup region: a sub-genic VNTR (RU ~5.6 kb, REF_CN 11, 7-15 copies) plus
-      # DEL/INS. No per-gene CN truth (ADRA2B/ANKRD36C/ASTL/GPAT2/DUSP2 are all single-copy), so this is
-      # an SV/VNTR example -- it exercises the pipeline + benchmark, not CN validation. On the panphorte graph.
-      run_region ankrd36c "$DATA/ankrd36c.gfa.gz" "--min-similarity 0.70" panphorte "--cn"
+      run_region ankrd36c "$DATA/ankrd36c.gfa.gz" "--min-similarity 0.95" panphorte "--cn"
       ;;
     synthetic)
       echo "############ synthetic ############"

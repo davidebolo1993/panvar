@@ -1,13 +1,28 @@
 #!/usr/bin/env Rscript
-# Copy-number concordance (called vs ground-truth BED), one facet per gene, from
-# compare_copy_number.py --dump-tsv (cols: gene sample truth_cn called_cn baseline_offset is_reference).
-#   Rscript plot_cn_correlation.R --table cn_table.tsv --out results/cn_correlation
-# Writes <out>.loci.png (lower-case locus totals, 2x2) and <out>.genes.png (upper-case per-gene splits: C4A/C4B, CYP2D6/CYP2D7).
+# Copy-number concordance (called vs ground-truth), one facet per gene. See --help for usage.
 suppressWarnings(suppressMessages({
   library(ggplot2)
 }))
 
 args <- commandArgs(trailingOnly = TRUE)
+usage <- function(status = 0) {
+  cat(paste(c(
+    "plot_cn_correlation.R - called vs ground-truth copy-number concordance, one facet per gene.",
+    "",
+    "Usage:",
+    "  Rscript plot_cn_correlation.R --table <cn_table.tsv> --out <prefix> [options]",
+    "",
+    "Required:",
+    "  --table <path>     compare_copy_number.py --dump-tsv output",
+    "                     (gene sample truth_cn called_cn baseline_offset is_reference)",
+    "",
+    "Optional:",
+    "  --out <prefix>     output prefix (default cn_correlation); writes <prefix>.loci.{png,pdf}",
+    "                     (locus totals) and <prefix>.genes.{png,pdf} (per-gene paralog splits)",
+    "  -h, --help         show this help"), collapse = "\n"), "\n")
+  quit(status = status)
+}
+if (length(args) == 0 || any(args %in% c("-h", "--help"))) usage(0)
 get <- function(flag, default = NULL) {
   i <- match(flag, args)
   if (is.na(i) || i == length(args)) return(default)
@@ -15,7 +30,7 @@ get <- function(flag, default = NULL) {
 }
 table_path <- get("--table")
 out_prefix <- get("--out", "cn_correlation")
-if (is.null(table_path)) stop("need --table <tsv>")
+if (is.null(table_path)) usage(1)
 # --dpi applies to both plots; --width/--height override the per-plot defaults when given.
 dpi <- as.numeric(get("--dpi", "150"))
 w_arg <- get("--width"); h_arg <- get("--height")

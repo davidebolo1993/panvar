@@ -11,7 +11,7 @@ Converts the called bubbles into per-haplotype genotype features for association
 - **graph** — per-node and per-oriented-edge traversal counts, a graph-local dosage;
 
 The k-mer and graph substrates are built from the graph and emitted by default; the variant substrate is emitted when its VCF is supplied. Any one can be produced on its own (`--only-kmers`/`--only-graph`/`--only-variant`). The k-mer and graph substrates pass through a discriminative filter that drops features which do not vary across haplotypes — those present in all (or all but `--min-paths`) paths, unless their copy number varies — so only informative markers reach the matrix; the variant substrate emits every call and leaves frequency filtering to `associate`.
-Pass a [cosigt](https://github.com/davidebolo1993/cosigt) table (`sample <tab> hap1 <tab> hap2 …`) to `--samples <cosigt.tsv>` and `describe` also writes a per-sample BIMBAM for each substrate (`bimbam_{kmers,graph,variant}.samples.bimbam.gz`) whose value sums the dosage over the sample's haplotypes (diploid `CN` = `CN_A` + `CN_B`). See [gwas/example.md](../gwas/example.md).
+Pass a [cosigt](https://github.com/davidebolo1993/cosigt) table (`sample <tab> hap1 <tab> hap2 …`) to `--samples <cosigt.tsv>` and `describe` also writes a per-sample BIMBAM for each substrate (`bimbam_{kmers,graph,variant}.samples.bimbam.gz`) whose value sums the dosage over the sample's haplotypes (diploid `CN` = `CN_A` + `CN_B`). See [GWAS example](../gwas.md).
 
 Algorithm and worked trace: [algorithms/describe.md](../algorithms/describe.md).
 
@@ -75,7 +75,7 @@ The BIMBAM matrices themselves hold `feature_id`, two allele-label columns `A`,`
 
 ## Association
 
-The BIMBAM exports feed [`panvar associate`](associate.md) directly (it tests the dosage, so copy-number loci are first-class). A significant marker traces back through its `nodes`/`bubbles` to `call`'s `variant_nodes.tsv` and from there to the variant `call` typed — and, with `call --gtf` plus `associate --node-genes`, on to the gene it sits in. A worked end-to-end run with the concepts in context is in [gwas/example.md](../gwas/example.md).
+The BIMBAM exports feed [`panvar associate`](associate.md) directly (it tests the dosage, so copy-number loci are first-class). A significant marker traces back through its `nodes`/`bubbles` to `call`'s `variant_nodes.tsv` and from there to the variant `call` typed — and, with `call --gtf` plus `associate --node-genes`, on to the gene it sits in. A worked end-to-end run with the concepts in context is in [GWAS example](../gwas.md).
 
 ## Example
 

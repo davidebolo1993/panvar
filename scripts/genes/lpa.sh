@@ -4,10 +4,16 @@
 # Runs the data pipeline then the GWAS (cohort sim -> describe --samples -> associate, region scan +
 # structure demo). Needs a numpy-capable python.
 #   PYTHON=~/miniconda3/bin/python scripts/genes/lpa.sh        # env: N (cohort size), SIM (null markers)
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  echo "LPA (KIV-2 VNTR) driver: data pipeline + the GWAS demo (cohort sim -> describe --samples -> associate)."
+  echo "Usage: [PANVAR_BIN=..] [PYTHON=..] [RSCRIPT=..] [THREADS=..] scripts/genes/lpa.sh"
+  echo "Writes results/real_data/lpa/. See scripts/genes/_common.sh for the env vars."
+  exit 0
+fi
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; source "$HERE/_common.sh"
 region=lpa; d="$OUT/$region"
 
-run_gene_data "$region" "$DATA/lpa.gfa.gz" 0.97 panphorte "--cn" 0.95 || exit 1
+run_gene_data "$region" "$DATA/lpa.gfa.gz" 0.95 panphorte "--cn" 0.95 || exit 1
 
 # ---- copy-number validation vs ground truth (optional; uncomment) -------------------------------
 # "$PY" "$REPO/scripts/compare_copy_number.py" --vcf "$d/call/call.region.vcf" --label lpa \

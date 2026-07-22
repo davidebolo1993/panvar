@@ -32,7 +32,7 @@ docker run --rm -v "$PWD":/work -w /work panvar:latest panvar --help
 - **Modules:** [rebuild](docs/modules/rebuild.md) · [bubble](docs/modules/bubble.md) · [panphorte](docs/modules/panphorte.md) · [refine](docs/modules/refine.md) · [call](docs/modules/call.md) · [describe](docs/modules/describe.md) · [associate](docs/modules/associate.md) · [inspect](docs/modules/inspect.md) · [benchmark](docs/modules/benchmark.md)
 - **Algorithms:** [rebuild](docs/algorithms/rebuild.md) · [bubble](docs/algorithms/bubble.md) · [panphorte](docs/algorithms/panphorte.md) · [refine](docs/algorithms/refine.md) · [call](docs/algorithms/call.md) · [describe](docs/algorithms/describe.md) · [associate](docs/algorithms/associate.md) · [inspect](docs/algorithms/inspect.md) · [benchmark](docs/algorithms/benchmark.md)
 - [docs/walkthrough.md](docs/walkthrough.md) — the full pipeline on the LPA locus, step by step with plots
-- [docs/gwas/example.md](docs/gwas/example.md) - an example association testing (LPA KIV-2 repeat ~ Lp(a))
+- [docs/gwas.md](docs/gwas.md) - an example association testing (LPA KIV-2 repeat ~ Lp(a))
 - [docs/references.md](docs/references.md) — tools and papers per module
 
 ## License

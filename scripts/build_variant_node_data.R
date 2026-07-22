@@ -1,21 +1,34 @@
 #!/usr/bin/env Rscript
-# Assemble the data bundle for the interactive node-coverage + variant-track viewer
-# (scripts/variant_node_heatmap_app.R). Outputs an .rds with:
-#   nodes     : node_id, length, gpos (reference genomic coordinate; inserted nodes projected to their
-#               insertion locus), order (rank of gpos = genome order), gene, bubble_id
-#   coverage  : haplotype, node_id, count   (per-walk traversal multiplicity; count>=1 only)
-#   variants  : variant_id, bubble_id, svtype, pos, gene, nodes (union set from variant_nodes.tsv)
-#   genotypes : variant_id, haplotype, gt, cn, cnbp
-#   bubbles   : bubble_id, lo, hi   (gpos-order span of the bubble's nodes)
-#   haplotypes: character; reference: the calling reference path name
-#   Rscript build_variant_node_data.R --gfa <call.gfa> --variant-nodes <vn.tsv> --vcf <region.vcf> \
-#       --bubbles <panphorte.bubbles.csv> [--node-genes <ng.tsv>] --out <bundle.rds>
+# Assemble the .rds bundle (nodes, coverage, variants, genotypes, bubbles) for
+# variant_node_heatmap_app.R. See --help for usage.
 suppressWarnings(suppressMessages(library(data.table)))
 args <- commandArgs(trailingOnly = TRUE)
+usage <- function(status = 0) {
+  cat(paste(c(
+    "build_variant_node_data.R - assemble the .rds data bundle for variant_node_heatmap_app.R",
+    "  (nodes, per-haplotype coverage, variants, genotypes, bubbles).",
+    "",
+    "Usage:",
+    "  Rscript build_variant_node_data.R --gfa <call.gfa> --variant-nodes <vn.tsv> \\",
+    "      --vcf <region.vcf> --bubbles <panphorte.bubbles.csv> [--node-genes <ng.tsv>] --out <bundle.rds>",
+    "",
+    "Required:",
+    "  --gfa <path>            the graph call was run on",
+    "  --variant-nodes <path>  call's variant_nodes.tsv",
+    "  --vcf <path>            call's region VCF",
+    "",
+    "Optional:",
+    "  --bubbles <path>        panphorte bubbles CSV (adds bubble spans)",
+    "  --node-genes <path>     call's node_genes.tsv (adds the gene track)",
+    "  --out <path>            output .rds (default variant_node_data.rds)",
+    "  -h, --help              show this help"), collapse = "\n"), "\n")
+  quit(status = status)
+}
+if (length(args) == 0 || any(args %in% c("-h", "--help"))) usage(0)
 get <- function(f, d = NULL) { i <- match(f, args); if (is.na(i) || i == length(args)) d else args[i + 1] }
 gfa <- get("--gfa"); vnp <- get("--variant-nodes"); vcfp <- get("--vcf")
 bcsv <- get("--bubbles"); ngp <- get("--node-genes"); outp <- get("--out", "variant_node_data.rds")
-stopifnot(!is.null(gfa), !is.null(vnp), !is.null(vcfp))
+if (is.null(gfa) || is.null(vnp) || is.null(vcfp)) usage(1)
 
 # --- GFA: node lengths (S) + ordered per-path node sequences (P) ---
 L <- readLines(gfa)
