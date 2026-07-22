@@ -2,9 +2,9 @@
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <ctime>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -22,6 +22,21 @@
 
 namespace panvar {
 namespace {
+
+// Wall-clock HH:MM:SS, matching cli::RunLog's line prefix so rebuild's progress lines read the same as
+// its RunLog summary lines and as every other module.
+std::string hms() {
+    const std::time_t t = std::time(nullptr);
+    std::tm tm{};
+#if defined(_WIN32)
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+    char buf[16];
+    std::strftime(buf, sizeof(buf), "%H:%M:%S", &tm);
+    return std::string(buf);
+}
 
 char comp(char c) {
     switch (c) {
@@ -116,7 +131,7 @@ public:
     ~FastaScratch() {
         const std::string cmd = "rm -rf '" + dir_ + "'";
         if (std::system(cmd.c_str()) != 0) {
-            std::cerr << "[rebuild] warning: could not remove scratch dir " << dir_ << '\n';
+            std::cerr << "[rebuild " << hms() << "] warning: could not remove scratch dir " << dir_ << '\n';
         }
     }
     FastaScratch(const FastaScratch&) = delete;
@@ -155,12 +170,8 @@ private:
 
 RebuildSummary rebuild_graph(const RebuildOptions& options) {
     RebuildSummary sum;
-    const auto t0 = std::chrono::steady_clock::now();
-    auto secs = [&] {
-        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    };
     auto step = [&](const std::string& msg) {
-        if (!options.quiet) std::cerr << "[rebuild " << static_cast<long>(secs()) << "s] " << msg << std::endl;
+        if (!options.quiet) std::cerr << "[rebuild " << hms() << "] " << msg << std::endl;
     };
 
     step("reading " + options.gfa_path);
@@ -198,7 +209,7 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
     // ---- Criteria A: the pathology gate ----
     sum.pathological = sum.raw_hubs >= options.min_hubs;
     if (!options.quiet) {
-        std::cerr << "[rebuild " << static_cast<long>(secs()) << "s] gate: " << sum.raw_nodes
+        std::cerr << "[rebuild " << hms() << "] gate: " << sum.raw_nodes
                   << " nodes, " << sum.haplotypes
                   << " haps; #deg>=" << options.hub_degree << "=" << sum.raw_hubs
                   << " maxdeg=" << sum.raw_maxdeg << " density=" << static_cast<long>(sum.raw_density)
@@ -206,7 +217,7 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
                   << "; seed=" << sum.seed << '\n';
     }
     if (!sum.pathological && !options.force) {
-        if (!options.quiet) std::cerr << "[rebuild] healthy -> pass through unchanged\n";
+        step("healthy -> pass through unchanged");
         if (!options.out_path.empty()) copy_file(options.gfa_path, options.out_path);
         sum.out_nodes = sum.raw_nodes;
         return sum;
@@ -385,11 +396,11 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
         }
     }
     if (sum.paths_recovered < sum.haplotypes) {
-        std::cerr << "[rebuild] warning: " << (sum.haplotypes - sum.paths_recovered) << " of "
-                  << sum.haplotypes << " haplotypes could not be mapped back and have no P line\n";
+        std::cerr << "[rebuild " << hms() << "] warning: " << (sum.haplotypes - sum.paths_recovered)
+                  << " of " << sum.haplotypes << " haplotypes could not be mapped back and have no P line\n";
     }
     if (!options.quiet) {
-        std::cerr << "[rebuild " << static_cast<long>(secs()) << "s] emitted " << sum.out_nodes
+        std::cerr << "[rebuild " << hms() << "] emitted " << sum.out_nodes
                   << " nodes, " << sum.out_edges << " edges; maxdeg=" << sum.out_maxdeg << " #hub="
                   << sum.out_hubs << "; paths " << sum.paths_recovered << '/' << sum.haplotypes
                   << ", mean query cover " << sum.mean_query_cover << std::endl;

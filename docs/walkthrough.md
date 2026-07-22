@@ -235,3 +235,19 @@ Per-gene split for the paralog clusters:
 ![Per-gene CN correlation](img/cn_correlation.genes.png)
 
 Every point on the diagonal is an exactly-correct call. Locus totals are exact (LPA 465/465, C4 131/131, GSTM1 159/159, ACOT 467/467); the per-gene splits land C4A/C4B at 96.2%, CYP2D6 99.2%, CYP2D7 100%, the whole GSTM cluster (GSTM1, GSTM2, GSTM4, GSTM5) at 466/466 each, and ACOT1/ACOT2 at 99.6% (100% within ±1) — the off-diagonal C4/CYP/ACOT handful are gene-conversion mosaics and unannotated pseudogene/hybrid modules. Stable single-copy genes outside the folded module (GSTM3, ACOT4, ACOT6) have nothing to resolve, so they are not split out.
+
+---
+
+## `rebuild` — re-inducing a tangled locus
+
+The loci above all decompose cleanly, but a minority of graphs come out of construction too tangled to work with. Where the graph inducer closes over all-pairs alignments, sequence that recurs across a low-complexity locus collapses onto a few very high-degree hub nodes, and snarl finding then returns one large undecomposable site instead of a set of variant sites. The opt-in, gated `rebuild` step re-induces such a locus from its haplotype sequences before `bubble`, and leaves healthy graphs untouched, so it is not part of the LPA run above.
+
+MYOM2 (chr8) is one such locus. As originally built, its interior is a dense hub — hundreds of near-identical paths knotted onto shared nodes — with the rest of the graph strung off it:
+
+![MYOM2 as originally built: a low-complexity hub tangle](img/myom2.original.png)
+
+After `rebuild`, the same haplotypes re-induce into a graph that reads as a backbone with discrete bubbles at the variant sites, no hub, and the copy-number arrays showing as small loops along the path:
+
+![MYOM2 after rebuild: a decomposable backbone with discrete bubbles](img/myom2.rebuild.png)
+
+On this locus `rebuild` takes ~80,000 nodes with a 1,035-degree hub down to ~490 nodes with no hub, so `bubble` finds a few dozen clean variant sites instead of one giant snarl and `call` stops mis-firing hundreds of spurious duplications. See [modules/rebuild.md](modules/rebuild.md) and [algorithms/rebuild.md](algorithms/rebuild.md) for the gate, the haplotype ordering, and how minigraph drives the re-induction.

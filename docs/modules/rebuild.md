@@ -42,4 +42,8 @@ Algorithm and worked trace: [algorithms/rebuild.md](../algorithms/rebuild.md).
 
 ## Notes
 
-The rebuilt graph is structural, not base-exact. Differences shorter than `--min-var` are not augmented, so a haplotype's `P` line spells the backbone allele at those positions rather than its own sequence. Expect per-haplotype identity below `1.0`, with the shortfall concentrated in substitutions and short indels; lowering `--min-var` does not fully remove it, because the underlying generator does not augment single-base differences at any practical setting. This matters for anything that assumes a path spells its haplotype exactly. 
+The rebuilt graph is structural, not base-exact. Differences shorter than `--min-var` are not augmented, so a haplotype's `P` line spells the backbone allele at those positions rather than its own sequence. Expect per-haplotype identity below `1.0`, with the shortfall concentrated in substitutions and short indels; lowering `--min-var` does not fully remove it, because the underlying generator does not augment single-base differences at any practical setting. This matters for anything that assumes a path spells its haplotype exactly.
+
+## Example
+
+`rebuild` runs before `bubble` and only on graphs the gate flags, so it is not part of the main LPA run. The [rebuild section of the walkthrough](../walkthrough.md#rebuild--re-inducing-a-tangled-locus) shows it on MYOM2 (chr8) instead — a tangled locus before and after re-induction. 
