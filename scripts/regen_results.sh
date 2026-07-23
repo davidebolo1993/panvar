@@ -51,7 +51,7 @@ run_region() {
   local region="$1" gfa="$2" pan_extra="$3" call_graph="$4" call_extra="$5" finer_clusters="${6:-0}"
   local d="$OUT/$region"
   echo "############ $region ############"
-  mkdir -p "$d"/{bubble,panphorte,refine,call,describe,inspect,plots}
+  mkdir -p "$d"/{bubble,panphorte,refine,call,describe,inspect,benchmark,plots}
   local ref; ref="$(ref_of "$gfa")"
   echo "[$region] reference: $ref ; call graph: $call_graph"
 
@@ -84,7 +84,7 @@ run_region() {
   # 4b) benchmark: round-trip QV of the calls - if variant nodes were written
   if [[ -s "$d/call/call.variant_nodes.tsv" ]]; then
     "$BIN" benchmark -i "$cgfa" --bubble-prefix-in "$cpfx" --reference-path "$ref" \
-      --variant-nodes "$d/call/call.variant_nodes.tsv" -o "$d/call/benchmark" \
+      --variant-nodes "$d/call/call.variant_nodes.tsv" -o "$d/benchmark/benchmark" \
       --threads "$THREADS" --quiet || echo "  (benchmark skipped)"
   fi
   # 5) inspect the largest-DUP bubble (the CN module) on the call graph, with walk clustering
@@ -158,7 +158,12 @@ for region in "${REGIONS[@]}"; do
       run_region lpa "$DATA/lpa.gfa.gz" "--min-similarity 0.95" panphorte "--cn" 1
       validate_cn lpa --mode repeats --truth "$DATA/lpa.repeats.tsv" --name-col hapl --count-col copies
       # LPA GWAS demo (needs python numpy/scipy); reuses the dedicated driver
-      bash "$HERE/../tests/gwas/run_lpa_real.sh" "$BIN" "$OUT/lpa/gwas" "$PY" "$RS" || echo "  (gwas demo skipped)"
+      # reuse the lpa stages already built above (no rebuild into gwas/): call ran on the refined graph
+      lgfa="$OUT/lpa/refine/refine.normalized.sorted.gfa"; lpfx="$OUT/lpa/refine/refine"
+      [[ -s "$lgfa" ]] || { lgfa="$OUT/lpa/panphorte/panphorte.normalized.sorted.gfa"; lpfx="$OUT/lpa/panphorte/panphorte"; }
+      REUSE_GRAPH="$lgfa" REUSE_BUBBLE_PREFIX="$lpfx" REUSE_CALL_PREFIX="$OUT/lpa/call/call" \
+        REUSE_COPIES="$OUT/lpa/panphorte/panphorte.panphorte.copies.tsv" \
+        bash "$HERE/../tests/gwas/run_lpa_real.sh" "$BIN" "$OUT/lpa/gwas" "$PY" "$RS" || echo "  (gwas demo skipped)"
       ;;
     c4)
       run_region c4 "$DATA/c4.gfa.gz" "--min-similarity 0.95" panphorte "--cn"
@@ -235,7 +240,7 @@ fi
 QV_TABLE="$REPO/results/benchmark_qv.tsv"
 printf 'locus\tsample\tsum_delta\tsum_aln_len\tqv\tidentity\tsub_threshold_bp\tover_threshold_bp\n' > "$QV_TABLE"
 for region in "${REGIONS[@]}"; do
-  bh="$OUT/$region/call/benchmark.qv_by_haplotype.tsv"
+  bh="$OUT/$region/benchmark/benchmark.qv_by_haplotype.tsv"
   [[ -s "$bh" ]] && awk -F'\t' -v L="$region" 'NR>1{print L"\t"$1"\t"$3"\t"$4"\t"$5"\t"$10"\t"$11"\t"$12}' "$bh" >> "$QV_TABLE"
 done
 if [[ $(wc -l < "$QV_TABLE") -gt 1 ]] && have_r; then

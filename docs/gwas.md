@@ -15,16 +15,16 @@ The tables are committed under `tests/gwas/lpa/` so the association is runnable 
 | `pheno.binary.tsv` | high-risk case/control (0/1) + the same covariates |
 | `pheno.quant.nopc.tsv` | quantitative phenotype without the PCs (the naive, uncorrected analysis) |
 
-The genotype matrices tested below live under `results/real_data/lpa/gwas/desc/`: the per-substrate BIMBAM dosage matrices (`bimbam_variant.*`, `bimbam_graph.*`, `bimbam_kmers.*`) from a `describe` run configured for association — passed the `cosigt` `--samples` table and the `--variant-vcf`, so each sample's two haplotypes are summed into one diploid dosage row (`bimbam_*.samples.bimbam.gz`). The driver `tests/gwas/run_lpa_real.sh` builds them. This is a GWAS-specific `describe`, distinct from the plain per-haplotype `describe` (`results/real_data/lpa/describe/`) in the [walkthrough](walkthrough.md) — the association needs the diploid per-sample and variant-level matrices that the walkthrough run does not emit.
+The genotype matrices tested below live under `results/real_data/lpa/gwas/desc/`: the per-substrate BIMBAM dosage matrices, each in its own folder `desc/<level>/<substrate>/` (`level` = `haplotype` or `sample`; `substrate` = `variant`/`graph`/`kmers`), from a `describe` run configured for association — passed the `cosigt` `--samples` table and the `--variant-vcf`, so the `sample/` level sums each sample's two haplotypes into one diploid dosage row. The driver `tests/gwas/run_lpa_real.sh` builds them. This is a GWAS-specific `describe`, distinct from the plain per-haplotype `describe` (`results/real_data/lpa/describe/`) in the [walkthrough](walkthrough.md) — the association needs the diploid per-sample and variant-level matrices that the walkthrough run does not emit.
 
 ## Associate the variant unit — the honest test
 
 ```bash
 panvar associate \
-  --genotypes results/real_data/lpa/gwas/desc/bimbam_variant.samples.bimbam.gz \
-  --samples   results/real_data/lpa/gwas/desc/bimbam_variant.samples.samples.txt.gz \
-  --feature-annot results/real_data/lpa/gwas/desc/feature_annot.variant.tsv.gz \
-  --phenotype tests/gwas/lpa/pheno.quant.tsv -o results/real_data/lpa/gwas/assoc_variant_quant
+  --genotypes results/real_data/lpa/gwas/desc/sample/variant/bimbam_variant.bimbam.gz \
+  --samples   results/real_data/lpa/gwas/desc/sample/variant/samples.txt.gz \
+  --feature-annot results/real_data/lpa/gwas/desc/sample/variant/feature_annot.variant.tsv.gz \
+  --phenotype tests/gwas/lpa/pheno.quant.tsv -o results/real_data/lpa/gwas/associate/assoc_variant_quant
 ```
 
 `--unit` auto-detects `variant` from the sidecar, so the test count is the number of structural-variant (SV) calls — the honest denominator. The KIV-2 duplication `bubble7_DUP_4789` is the top hit by a wide margin (its dosage is the full copy-number gradient in a single test), `is_lead=1` for its linkage-disequilibrium (LD) clump, `low_af=0` (a `DUP` carried by almost everyone is still informative), and it survives both `q_bh` and the effective-tests (`Meff`) Bonferroni threshold.
@@ -37,13 +37,13 @@ With one test per SV call the scan is sparse, and KIV-2 stands clear of the LD-c
 
 ```bash
 panvar associate \
-  --genotypes results/real_data/lpa/gwas/desc/bimbam_graph.samples.bimbam.gz \
-  --samples results/real_data/lpa/gwas/desc/bimbam.samples.samples.txt.gz \
-  --feature-annot results/real_data/lpa/gwas/desc/feature_annot.samples.tsv.gz \
+  --genotypes results/real_data/lpa/gwas/desc/sample/graph/bimbam_graph.bimbam.gz \
+  --samples results/real_data/lpa/gwas/desc/sample/graph/samples.txt.gz \
+  --feature-annot results/real_data/lpa/gwas/desc/sample/graph/feature_annot.graph.tsv.gz \
   --node-genes results/real_data/lpa/call/call.node_genes.tsv \
   --phenotype tests/gwas/lpa/pheno.quant.tsv \
   --min-maf 0.02 \
-  -o results/real_data/lpa/gwas/assoc_graph_quant
+  -o results/real_data/lpa/gwas/associate/assoc_graph_quant
 ```
 
 Run the same on `bimbam_kmers.*` for the k-mer substrate. These keep every node/edge/k-mer test, so they fine-map within the locus, but their raw count over-states the number of independent tests; `associate` corrects with `Meff`, the number of distinct bubbles (reported as `meff`, with a per-marker `p_bonf_meff`).

@@ -1321,6 +1321,16 @@ struct BimbamRow {
     std::unordered_map<std::string, double> carriers; // path -> dosage
 };
 
+// Per-substrate output directory: <out>/{haplotype|sample}/{kmers|graph|variant}/, created on demand.
+// Each holds a self-contained associate input -- the BIMBAM matrix, its feature_annot, and the column
+// order (samples.txt.gz) -- so the substrates and the aggregated-vs-per-haplotype split never co-mingle.
+std::filesystem::path substrate_dir(const std::filesystem::path& out_dir, const char* agg,
+                                    const char* sub) {
+    const std::filesystem::path d = out_dir / agg / sub;
+    std::filesystem::create_directories(d);
+    return d;
+}
+
 void write_bimbam_rows(
     const std::string& bimbam_path,
     GzipWriter& annot,
@@ -1643,14 +1653,15 @@ void emit_variant_substrate(const DescribeOptions& options, DescribeSummary& sum
     };
     const std::string annot_header = "feature_id\tlayer\tencoding\tbubbles\tnodes\tsvtype\tgene\tAF\tAN\n";
 
-    // Haplotype-level BIMBAM + sidecar + column order.
+    // Haplotype-level BIMBAM + sidecar + column order, in haplotype/variant/.
     {
-        GzipWriter sout((out_dir / "bimbam_variant.samples.txt.gz").string());
+        const std::filesystem::path dir = substrate_dir(out_dir, "haplotype", "variant");
+        GzipWriter sout((dir / "samples.txt.gz").string());
         for (const std::string& s : hap_order) { sout.write(s); sout.write("\n"); }
         sout.close();
-        GzipWriter annot((out_dir / "feature_annot.variant.tsv.gz").string());
+        GzipWriter annot((dir / "feature_annot.variant.tsv.gz").string());
         annot.write(annot_header);
-        GzipWriter geno((out_dir / "bimbam_variant.bimbam.gz").string());
+        GzipWriter geno((dir / "bimbam_variant.bimbam.gz").string());
         for (const VariantBimbam& v : rows) {
             write_annot(annot, v);
             double lo = std::numeric_limits<double>::infinity(), hi = -lo;
@@ -1671,15 +1682,20 @@ void emit_variant_substrate(const DescribeOptions& options, DescribeSummary& sum
     }
 
     // Sample-level (diploid) BIMBAM: sum a sample's haplotype dosages; NA only if no haplotype traverses.
+    // In sample/variant/, self-contained (matrix + feature_annot + column order).
     if (!options.samples_path.empty()) {
         const auto cosigt = read_cosigt_table(options.samples_path);
         const auto& path_to_samples = cosigt.first;
         const auto& sample_order = cosigt.second;
-        GzipWriter sout((out_dir / "bimbam_variant.samples.samples.txt.gz").string());
+        const std::filesystem::path dir = substrate_dir(out_dir, "sample", "variant");
+        GzipWriter sout((dir / "samples.txt.gz").string());
         for (const std::string& s : sample_order) { sout.write(s); sout.write("\n"); }
         sout.close();
-        GzipWriter geno((out_dir / "bimbam_variant.samples.bimbam.gz").string());
+        GzipWriter annot((dir / "feature_annot.variant.tsv.gz").string());
+        annot.write(annot_header);
+        GzipWriter geno((dir / "bimbam_variant.bimbam.gz").string());
         for (const VariantBimbam& v : rows) {
+            write_annot(annot, v);
             std::unordered_map<std::string, double> samp;
             std::unordered_set<std::string> covered;
             for (const auto& [hap, d] : v.dose) {
@@ -1699,8 +1715,8 @@ void emit_variant_substrate(const DescribeOptions& options, DescribeSummary& sum
             g += '\n';
             geno.write(g);
         }
-        geno.close();
-        summary.files_written += 2;
+        geno.close(); annot.close();
+        summary.files_written += 3;
     }
 
     if (!options.quiet)
@@ -1917,19 +1933,23 @@ void describe_kmers_from_graph(
             << (result.graph_matrix_written ? "1" : "0") << '\n';
     }
 
-    // Pooled BIMBAM mean-genotype dosage (canonical genotype export) + shared feature_annot + sample order.
+    // Pooled BIMBAM mean-genotype dosage, per substrate under haplotype/{kmers,graph}/: each folder gets
+    // its own matrix, feature_annot, and column order (samples.txt.gz).
     if (want_bimbam) {
         std::vector<std::string> sample_order;
         sample_order.reserve(graph.paths.size());
         for (const auto& p : graph.paths) sample_order.push_back(p.name);
-        {
-            GzipWriter sout((out_dir / "bimbam.samples.txt.gz").string());
+        const char* pool_header = "feature_id\tlayer\tencoding\tbubbles\tnodes\n";
+        auto write_samples = [&](const std::filesystem::path& dir) {
+            GzipWriter sout((dir / "samples.txt.gz").string());
             for (const std::string& s : sample_order) { sout.write(s); sout.write("\n"); }
             sout.close();
-        }
-        GzipWriter annot((out_dir / "feature_annot.tsv.gz").string());
-        annot.write("feature_id\tlayer\tencoding\tbubbles\tnodes\n");
+        };
         if (options.emit_kmers) {
+            const std::filesystem::path dir = substrate_dir(out_dir, "haplotype", "kmers");
+            write_samples(dir);
+            GzipWriter annot((dir / "feature_annot.kmers.tsv.gz").string());
+            annot.write(pool_header);
             std::vector<BimbamRow> rows;
             rows.reserve(kmer_pool.size());
             for (const auto& [code, carriers] : kmer_pool) {
@@ -1943,11 +1963,16 @@ void describe_kmers_from_graph(
                 for (const auto& [path, c] : carriers) r.carriers[path] = static_cast<double>(c);
                 rows.push_back(std::move(r));
             }
-            write_bimbam_rows((out_dir / "bimbam_kmers.bimbam.gz").string(), annot, "kmer",
+            write_bimbam_rows((dir / "bimbam_kmers.bimbam.gz").string(), annot, "kmer",
                               rows, sample_order, bubble_traversers, options.scale_dosage);
-            summary.files_written += 1;
+            annot.close();
+            summary.files_written += 3;
         }
         if (options.emit_graph) {
+            const std::filesystem::path dir = substrate_dir(out_dir, "haplotype", "graph");
+            write_samples(dir);
+            GzipWriter annot((dir / "feature_annot.graph.tsv.gz").string());
+            annot.write(pool_header);
             std::vector<BimbamRow> rows;
             rows.reserve(graph_pool.size());
             for (const auto& [feature, carriers] : graph_pool) {
@@ -1959,12 +1984,11 @@ void describe_kmers_from_graph(
                 for (const auto& [path, c] : carriers) r.carriers[path] = static_cast<double>(c);
                 rows.push_back(std::move(r));
             }
-            write_bimbam_rows((out_dir / "bimbam_graph.bimbam.gz").string(), annot, "graph",
+            write_bimbam_rows((dir / "bimbam_graph.bimbam.gz").string(), annot, "graph",
                               rows, sample_order, bubble_traversers, options.scale_dosage);
-            summary.files_written += 1;
+            annot.close();
+            summary.files_written += 3;
         }
-        annot.close();
-        summary.files_written += 2;  // feature_annot + bimbam.samples
     }
 
     // --samples (cosigt): aggregate any per-haplotype pool into per-SAMPLE dosage by summing over
@@ -2001,14 +2025,17 @@ void describe_kmers_from_graph(
                     for (const std::string& s : it->second) dst.insert(s);
                 }
             }
-            {
-                GzipWriter sout((out_dir / "bimbam.samples.samples.txt.gz").string());
+            const char* pool_header = "feature_id\tlayer\tencoding\tbubbles\tnodes\n";
+            auto write_samples_s = [&](const std::filesystem::path& dir) {
+                GzipWriter sout((dir / "samples.txt.gz").string());
                 for (const std::string& s : sample_order_s) { sout.write(s); sout.write("\n"); }
                 sout.close();
-            }
-            GzipWriter annot((out_dir / "feature_annot.samples.tsv.gz").string());
-            annot.write("feature_id\tlayer\tencoding\tbubbles\tnodes\n");
+            };
             if (options.emit_kmers) {
+                const std::filesystem::path dir = substrate_dir(out_dir, "sample", "kmers");
+                write_samples_s(dir);
+                GzipWriter annot((dir / "feature_annot.kmers.tsv.gz").string());
+                annot.write(pool_header);
                 KmerPool sample_pool;
                 for (const auto& [code, carriers] : kmer_pool) {
                     auto& out = sample_pool[code];
@@ -2029,11 +2056,16 @@ void describe_kmers_from_graph(
                     for (const auto& [s, c] : carriers) r.carriers[s] = static_cast<double>(c);
                     rows.push_back(std::move(r));
                 }
-                write_bimbam_rows((out_dir / "bimbam_kmers.samples.bimbam.gz").string(), annot, "kmer",
+                write_bimbam_rows((dir / "bimbam_kmers.bimbam.gz").string(), annot, "kmer",
                                   rows, sample_order_s, bubble_traversers_s, options.scale_dosage);
-                summary.files_written += 1;
+                annot.close();
+                summary.files_written += 3;
             }
             if (options.emit_graph) {
+                const std::filesystem::path dir = substrate_dir(out_dir, "sample", "graph");
+                write_samples_s(dir);
+                GzipWriter annot((dir / "feature_annot.graph.tsv.gz").string());
+                annot.write(pool_header);
                 std::vector<BimbamRow> rows; rows.reserve(graph_sample_pool.size());
                 for (const auto& [feature, carriers] : graph_sample_pool) {
                     BimbamRow r; r.id = feature; r.nodes = feature;
@@ -2042,15 +2074,14 @@ void describe_kmers_from_graph(
                     for (const auto& [s, c] : carriers) r.carriers[s] = static_cast<double>(c);
                     rows.push_back(std::move(r));
                 }
-                write_bimbam_rows((out_dir / "bimbam_graph.samples.bimbam.gz").string(), annot, "graph",
+                write_bimbam_rows((dir / "bimbam_graph.bimbam.gz").string(), annot, "graph",
                                   rows, sample_order_s, bubble_traversers_s, options.scale_dosage);
-                summary.files_written += 1;
+                annot.close();
+                summary.files_written += 3;
             }
-            annot.close();
-            summary.files_written += 2;
             if (!options.quiet) {
                 std::cerr << "[describe] sample-level BIMBAM: " << sample_order_s.size()
-                          << " samples -> " << out_dir.string() << "/bimbam_*.samples.bimbam.gz\n";
+                          << " samples -> " << (out_dir / "sample").string() << "/{kmers,graph}/\n";
             }
         }
     }

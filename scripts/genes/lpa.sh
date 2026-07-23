@@ -32,25 +32,30 @@ NGOPT=(); [ -f "$d/call/call.node_genes.tsv" ] && NGOPT=(--node-genes "$d/call/c
   --no-wide-matrix --variant-nodes "$d/call/call.variant_nodes.tsv" \
   --variant-vcf "$d/call/call.region.vcf" --samples "$real/samples.tsv" --quiet || exit 1
 
-DESC="$gw/desc"; SAMP="$DESC/bimbam.samples.samples.txt.gz"; ANNOT="$DESC/feature_annot.samples.tsv.gz"
+DESC="$gw/desc"   # per-substrate sample-level inputs live under $DESC/sample/<substrate>/
+ASSOC="$gw/associate"; mkdir -p "$ASSOC"   # all association outputs live here
 echo "[lpa] region scan (associate, PC-adjusted): feature substrates + the variant unit"
-for sub in graph kmers; do for mode in quant binary; do
-  "$BIN" associate --genotypes "$DESC/bimbam_${sub}.samples.bimbam.gz" --samples "$SAMP" \
-    --feature-annot "$ANNOT" ${NGOPT[@]+"${NGOPT[@]}"} --phenotype "$real/pheno.${mode}.tsv" --min-maf 0.02 \
-    -o "$gw/assoc_${sub}_${mode}"
-done; done
+for sub in graph kmers; do
+  SD="$DESC/sample/$sub"
+  for mode in quant binary; do
+    "$BIN" associate --genotypes "$SD/bimbam_${sub}.bimbam.gz" --samples "$SD/samples.txt.gz" \
+      --feature-annot "$SD/feature_annot.${sub}.tsv.gz" ${NGOPT[@]+"${NGOPT[@]}"} \
+      --phenotype "$real/pheno.${mode}.tsv" --min-maf 0.02 -o "$ASSOC/assoc_${sub}_${mode}"
+  done
+done
+VD="$DESC/sample/variant"
 for mode in quant binary; do   # variant unit: one test per SV call (honest n_tests + LD-clumping)
-  "$BIN" associate --genotypes "$DESC/bimbam_variant.samples.bimbam.gz" \
-    --samples "$DESC/bimbam_variant.samples.samples.txt.gz" --feature-annot "$DESC/feature_annot.variant.tsv.gz" \
-    ${NGOPT[@]+"${NGOPT[@]}"} --phenotype "$real/pheno.${mode}.tsv" -o "$gw/assoc_variant_${mode}"
+  "$BIN" associate --genotypes "$VD/bimbam_variant.bimbam.gz" \
+    --samples "$VD/samples.txt.gz" --feature-annot "$VD/feature_annot.variant.tsv.gz" \
+    ${NGOPT[@]+"${NGOPT[@]}"} --phenotype "$real/pheno.${mode}.tsv" -o "$ASSOC/assoc_variant_${mode}"
 done
 echo "[lpa] structure-correction demo (naive / PC / LMM) on the synthetic panel"
 SG="$real/geno.sim.bimbam.gz"; SS="$real/sim.samples.txt"; SA="$real/feature_annot.sim.tsv.gz"
 if [ -f "$SG" ]; then
-  "$BIN" associate --genotypes "$SG" --samples "$SS" --feature-annot "$SA" --phenotype "$real/pheno.quant.nopc.tsv" --min-maf 0.02 -o "$gw/sim_naive"
-  "$BIN" associate --genotypes "$SG" --samples "$SS" --feature-annot "$SA" --phenotype "$real/pheno.quant.tsv"      --min-maf 0.02 -o "$gw/sim_pc"
+  "$BIN" associate --genotypes "$SG" --samples "$SS" --feature-annot "$SA" --phenotype "$real/pheno.quant.nopc.tsv" --min-maf 0.02 -o "$ASSOC/sim_naive"
+  "$BIN" associate --genotypes "$SG" --samples "$SS" --feature-annot "$SA" --phenotype "$real/pheno.quant.tsv"      --min-maf 0.02 -o "$ASSOC/sim_pc"
   { [ "$N" -le "$LMM_MAX_N" ] && [ -f "$real/kinship.tsv" ]; } && "$BIN" associate --genotypes "$SG" --samples "$SS" --feature-annot "$SA" \
-    --phenotype "$real/pheno.quant.nopc.tsv" --model lmm --kinship "$real/kinship.tsv" --min-maf 0.02 -o "$gw/sim_lmm"
+    --phenotype "$real/pheno.quant.nopc.tsv" --model lmm --kinship "$real/kinship.tsv" --min-maf 0.02 -o "$ASSOC/sim_lmm"
 fi
 echo "[lpa] GWAS done -> $gw"
 
@@ -60,4 +65,4 @@ echo "[lpa] GWAS done -> $gw"
 # "$RS" "$REPO/scripts/plot_node_coverage_heatmap.R" --table "$ip.node_counts.tsv" --node-lengths "$ip.node_lengths.tsv" --cluster-by "$ip.clusters.tsv" --out "$d/lpa_node_heatmap"
 # "$RS" "$REPO/scripts/plot_edge_coverage_heatmap.R" --table "$ip.edge_counts.tsv" --cluster-by "$ip.clusters.tsv" --out "$d/lpa_edge_heatmap"
 # for s in assoc_graph_quant assoc_kmers_quant sim_naive sim_pc sim_lmm; do \
-#   "$RS" "$REPO/scripts/plot_associate.R" --assoc "$gw/$s.assoc.tsv" --summary "$gw/$s.summary.tsv" --out "$gw/$s" --title "lpa $s"; done
+#   "$RS" "$REPO/scripts/plot_associate.R" --assoc "$gw/associate/$s.assoc.tsv" --summary "$gw/associate/$s.summary.tsv" --out "$gw/associate/$s" --title "lpa $s"; done

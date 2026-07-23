@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# LPA association demo on the real graph: bubble -> panphorte -> call -> describe --samples -> associate.
+# LPA association demo on the real graph: (reuse or build) -> describe --samples -> associate.
 # Produces (1) a region scan that recovers KIV-2 as the top hit, and (2) a structure-correction demo on a
 # synthetic genome-wide panel (naive lambda>>1 -> ~1 with PCs/LMM). See docs/gwas.md. Needs a
 # numpy-capable python.
 #   run_lpa_real.sh <panvar_bin> <out_dir> [python] [Rscript] [--big]
 # Env: N (cohort size; --big sets 6000, the Moli-sani WGS scale), SIM (null markers, default 3000),
 #      LMM_MAX_N (LMM size cap).
+# Reuse env (regen sets these so the GWAS does not rebuild the pipeline; unset = self-contained build
+# under <out_dir>/prep): REUSE_GRAPH, REUSE_BUBBLE_PREFIX, REUSE_CALL_PREFIX, REUSE_COPIES.
 set -euo pipefail
 
 PANVAR_BIN="${1:?usage: run_lpa_real.sh <panvar_bin> <out_dir> [python] [Rscript] [--big]}"
@@ -20,36 +22,42 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 GFA="$REPO/tests/real_data/lpa.gfa.gz"
 REAL="$OUT_DIR/real"
-mkdir -p "$OUT_DIR" "$REAL"
+ASSOC="$OUT_DIR/associate"       # all association outputs (region scan + structure demo) live here
+mkdir -p "$OUT_DIR" "$REAL" "$ASSOC"
 REF="$(gzcat "$GFA" | awk -F'\t' '($1=="P"||$1=="W"){n=$2; if(g==""&&n~/[Gg][Rr][Cc]h38/)g=n; if(f=="")f=n} END{print (g!=""?g:f)}')"
 echo "reference path: $REF ; cohort N=$N ; sim null markers=$SIM"
 
-echo "== bubble -> panphorte (KIV-2 copies) =="
-"$PANVAR_BIN" bubble    -i "$GFA" -o "$OUT_DIR/bub" -r "$REF" --quiet >/dev/null
-SGFA="$OUT_DIR/bub.sorted.gfa"
-"$PANVAR_BIN" panphorte -i "$SGFA" --bubble-prefix-in "$OUT_DIR/bub" -o "$OUT_DIR/pan" \
-  --reference-path "$REF" --min-similarity 0.97 --quiet >/dev/null
-PGFA="$OUT_DIR/pan.normalized.sorted.gfa"
+# --- (reuse or build) the call substrate: graph, bubble prefix, call prefix, copies table -------------
+if [ -n "${REUSE_GRAPH:-}" ]; then
+  echo "== reusing pre-built pipeline (no rebuild): $REUSE_GRAPH =="
+  PGFA="$REUSE_GRAPH"; BPFX="${REUSE_BUBBLE_PREFIX:?need REUSE_BUBBLE_PREFIX}"
+  CALL="${REUSE_CALL_PREFIX:?need REUSE_CALL_PREFIX}"; COPIES="${REUSE_COPIES:?need REUSE_COPIES}"
+else
+  PREP="$OUT_DIR/prep"; mkdir -p "$PREP"
+  echo "== bubble -> panphorte (KIV-2 copies) =="
+  "$PANVAR_BIN" bubble    -i "$GFA" -o "$PREP/bub" -r "$REF" --quiet >/dev/null
+  "$PANVAR_BIN" panphorte -i "$PREP/bub.sorted.gfa" --bubble-prefix-in "$PREP/bub" -o "$PREP/pan" \
+    --reference-path "$REF" --min-similarity 0.97 --quiet >/dev/null
+  GTF="${GTF:-$REPO/tests/real_data/Homo_sapiens.GRCh38.116.gtf.gz}"
+  GTFOPT=(); [ -f "$GTF" ] && GTFOPT=(--gtf "$GTF")
+  "$PANVAR_BIN" call -i "$PREP/pan.normalized.sorted.gfa" --bubble-prefix-in "$PREP/pan" \
+    --reference-path "$REF" -o "$PREP/call" --cn ${GTFOPT[@]+"${GTFOPT[@]}"} --quiet >/dev/null
+  PGFA="$PREP/pan.normalized.sorted.gfa"; BPFX="$PREP/pan"; CALL="$PREP/call"
+  COPIES="$PREP/pan.panphorte.copies.tsv"
+fi
+NGOPT=(); [ -f "${CALL}.node_genes.tsv" ] && NGOPT=(--node-genes "${CALL}.node_genes.tsv")
 
 # structured cohort: cosigt samples.tsv + pheno.{quant,binary}{,.nopc}.tsv (subpops, PCs, NA) +
 # synthetic structure-demo panel; kinship GRM only when N is small enough for a dense matrix file.
 KOPT=(); [ "$N" -le "$LMM_MAX_N" ] && KOPT=(--kinship-out "$REAL/kinship.tsv")
-"$PY" "$HERE/make_lpa_phenotype.py" "$OUT_DIR/pan.panphorte.copies.tsv" "$REAL" \
-  --n "$N" --sim-markers "$SIM" ${KOPT[@]+"${KOPT[@]}"}
+"$PY" "$HERE/make_lpa_phenotype.py" "$COPIES" "$REAL" --n "$N" --sim-markers "$SIM" ${KOPT[@]+"${KOPT[@]}"}
 
-echo "== call -> describe --samples (per-sample BIMBAM dosage) =="
-GTF="${GTF:-$REPO/tests/real_data/Homo_sapiens.GRCh38.116.gtf.gz}"
-GTFOPT=(); [ -f "$GTF" ] && GTFOPT=(--gtf "$GTF")
-"$PANVAR_BIN" call -i "$PGFA" --bubble-prefix-in "$OUT_DIR/pan" --reference-path "$REF" \
-  -o "$OUT_DIR/call" --cn ${GTFOPT[@]+"${GTFOPT[@]}"} --quiet >/dev/null
-NGOPT=(); [ -f "$OUT_DIR/call.node_genes.tsv" ] && NGOPT=(--node-genes "$OUT_DIR/call.node_genes.tsv")
-"$PANVAR_BIN" describe -i "$PGFA" --bubble-prefix-in "$OUT_DIR/pan" --out-dir "$OUT_DIR/desc" \
-  --kmer-size 31 --no-wide-matrix --variant-nodes "$OUT_DIR/call.variant_nodes.tsv" \
-  --variant-vcf "$OUT_DIR/call.region.vcf" --samples "$REAL/samples.tsv" --quiet >/dev/null
+echo "== describe --samples (per-sample BIMBAM dosage) =="
+"$PANVAR_BIN" describe -i "$PGFA" --bubble-prefix-in "$BPFX" --out-dir "$OUT_DIR/desc" \
+  --kmer-size 31 --no-wide-matrix --variant-nodes "${CALL}.variant_nodes.tsv" \
+  --variant-vcf "${CALL}.region.vcf" --samples "$REAL/samples.tsv" --quiet >/dev/null
 
-DESC="$OUT_DIR/desc"
-SAMP="$DESC/bimbam.samples.samples.txt.gz"
-ANNOT="$DESC/feature_annot.samples.tsv.gz"
+DESC="$OUT_DIR/desc"   # per-substrate sample-level inputs live under $DESC/sample/<substrate>/
 plot() {  # plot <assoc_prefix> <title>
   "$RS" "$REPO/scripts/plot_associate.R" --assoc "$1.assoc.tsv" --summary "$1.summary.tsv" \
     --out "$1" --title "$2" >/dev/null 2>&1 || echo "  (plot skipped: ggplot2?)"
@@ -67,16 +75,17 @@ echo "== 1) REGION SCAN: associate on the real KIV-2 features (PC-adjusted) =="
 # graph = node/edge dosage (carries the KIV-2 self-loop REP node); kmer = k-mer multiplicity.
 # quant = log10 Lp(a) (linear); binary = high-risk case/control (logistic). pheno tables carry PCs.
 for sub in graph kmers; do
-  GENO="$DESC/bimbam_${sub}.samples.bimbam.gz"
+  SD="$DESC/sample/$sub"; GENO="$SD/bimbam_${sub}.bimbam.gz"
+  SAMP="$SD/samples.txt.gz"; ANNOT="$SD/feature_annot.${sub}.tsv.gz"
   for mode in quant binary; do
     echo "   -- associate ($sub / $mode) --"
     "$PANVAR_BIN" associate --genotypes "$GENO" --samples "$SAMP" --feature-annot "$ANNOT" \
-      ${NGOPT[@]+"${NGOPT[@]}"} --phenotype "$REAL/pheno.${mode}.tsv" --min-maf 0.02 -o "$OUT_DIR/assoc_${sub}_${mode}"
-    plot "$OUT_DIR/assoc_${sub}_${mode}" "LPA Lp(a) ($sub, $mode)"
+      ${NGOPT[@]+"${NGOPT[@]}"} --phenotype "$REAL/pheno.${mode}.tsv" --min-maf 0.02 -o "$ASSOC/assoc_${sub}_${mode}"
+    plot "$ASSOC/assoc_${sub}_${mode}" "LPA Lp(a) ($sub, $mode)"
     if [ "$mode" = quant ]; then  # extra unfiltered run + per-stage pipeline plot
       "$PANVAR_BIN" associate --genotypes "$GENO" --samples "$SAMP" --feature-annot "$ANNOT" \
-        ${NGOPT[@]+"${NGOPT[@]}"} --phenotype "$REAL/pheno.quant.tsv" --min-maf 0 -o "$OUT_DIR/assoc_${sub}_quant.unfiltered" >/dev/null
-      pipeline "$OUT_DIR/assoc_${sub}_quant" "$OUT_DIR/assoc_${sub}_quant.unfiltered" 0.02 "LPA Lp(a) ($sub)"
+        ${NGOPT[@]+"${NGOPT[@]}"} --phenotype "$REAL/pheno.quant.tsv" --min-maf 0 -o "$ASSOC/assoc_${sub}_quant.unfiltered" >/dev/null
+      pipeline "$ASSOC/assoc_${sub}_quant" "$ASSOC/assoc_${sub}_quant.unfiltered" 0.02 "LPA Lp(a) ($sub)"
     fi
   done
 done
@@ -84,18 +93,19 @@ done
 echo "== 1b) VARIANT-LEVEL scan: one test per SV call (honest unit + LD-clumping) =="
 # The statistically honest unit: tests the SV calls directly, so n_tests = #variants (not correlated
 # k-mers/nodes). --unit auto-detects 'variant' from the variant feature_annot.
+VD="$DESC/sample/variant"
 for mode in quant binary; do
   echo "   -- associate (variant / $mode) --"
-  "$PANVAR_BIN" associate --genotypes "$DESC/bimbam_variant.samples.bimbam.gz" \
-    --samples "$DESC/bimbam_variant.samples.samples.txt.gz" \
-    --feature-annot "$DESC/feature_annot.variant.tsv.gz" \
-    ${NGOPT[@]+"${NGOPT[@]}"} --phenotype "$REAL/pheno.${mode}.tsv" -o "$OUT_DIR/assoc_variant_${mode}"
-  plot "$OUT_DIR/assoc_variant_${mode}" "LPA Lp(a) (variant, $mode)"
+  "$PANVAR_BIN" associate --genotypes "$VD/bimbam_variant.bimbam.gz" \
+    --samples "$VD/samples.txt.gz" \
+    --feature-annot "$VD/feature_annot.variant.tsv.gz" \
+    ${NGOPT[@]+"${NGOPT[@]}"} --phenotype "$REAL/pheno.${mode}.tsv" -o "$ASSOC/assoc_variant_${mode}"
+  plot "$ASSOC/assoc_variant_${mode}" "LPA Lp(a) (variant, $mode)"
   if [ "$mode" = quant ]; then  # extra unfiltered run + per-stage pipeline plot (variant tier has CLUMP)
-    "$PANVAR_BIN" associate --genotypes "$DESC/bimbam_variant.samples.bimbam.gz" \
-      --samples "$DESC/bimbam_variant.samples.samples.txt.gz" --feature-annot "$DESC/feature_annot.variant.tsv.gz" \
-      ${NGOPT[@]+"${NGOPT[@]}"} --phenotype "$REAL/pheno.quant.tsv" --min-maf 0 -o "$OUT_DIR/assoc_variant_quant.unfiltered" >/dev/null
-    pipeline "$OUT_DIR/assoc_variant_quant" "$OUT_DIR/assoc_variant_quant.unfiltered" 0.01 "LPA Lp(a) (variants)"
+    "$PANVAR_BIN" associate --genotypes "$VD/bimbam_variant.bimbam.gz" \
+      --samples "$VD/samples.txt.gz" --feature-annot "$VD/feature_annot.variant.tsv.gz" \
+      ${NGOPT[@]+"${NGOPT[@]}"} --phenotype "$REAL/pheno.quant.tsv" --min-maf 0 -o "$ASSOC/assoc_variant_quant.unfiltered" >/dev/null
+    pipeline "$ASSOC/assoc_variant_quant" "$ASSOC/assoc_variant_quant.unfiltered" 0.01 "LPA Lp(a) (variants)"
   fi
 done
 
@@ -104,29 +114,32 @@ SGENO="$REAL/geno.sim.bimbam.gz"; SSAMP="$REAL/sim.samples.txt"; SANNOT="$REAL/f
 if [ -f "$SGENO" ]; then
   echo "   -- naive (Age+Sex, no PCs): expect inflated lambda --"
   "$PANVAR_BIN" associate --genotypes "$SGENO" --samples "$SSAMP" --feature-annot "$SANNOT" \
-    --phenotype "$REAL/pheno.quant.nopc.tsv" --min-maf 0.02 -o "$OUT_DIR/sim_naive"
-  plot "$OUT_DIR/sim_naive" "LPA structure demo (naive)"
+    --phenotype "$REAL/pheno.quant.nopc.tsv" --min-maf 0.02 -o "$ASSOC/sim_naive"
+  plot "$ASSOC/sim_naive" "LPA structure demo (naive)"
   echo "   -- + ancestry PC covariates: lambda back toward 1 --"
   "$PANVAR_BIN" associate --genotypes "$SGENO" --samples "$SSAMP" --feature-annot "$SANNOT" \
-    --phenotype "$REAL/pheno.quant.tsv" --min-maf 0.02 -o "$OUT_DIR/sim_pc"
-  plot "$OUT_DIR/sim_pc" "LPA structure demo (PC-adjusted)"
+    --phenotype "$REAL/pheno.quant.tsv" --min-maf 0.02 -o "$ASSOC/sim_pc"
+  plot "$ASSOC/sim_pc" "LPA structure demo (PC-adjusted)"
   if [ "$N" -le "$LMM_MAX_N" ] && [ -f "$REAL/kinship.tsv" ]; then
     echo "   -- LMM with the genome-wide-like panel GRM (--kinship): lambda ~ 1 --"
     "$PANVAR_BIN" associate --genotypes "$SGENO" --samples "$SSAMP" --feature-annot "$SANNOT" \
-      --phenotype "$REAL/pheno.quant.nopc.tsv" --model lmm --kinship "$REAL/kinship.tsv" --min-maf 0.02 -o "$OUT_DIR/sim_lmm"
-    plot "$OUT_DIR/sim_lmm" "LPA structure demo (LMM)"
+      --phenotype "$REAL/pheno.quant.nopc.tsv" --model lmm --kinship "$REAL/kinship.tsv" --min-maf 0.02 -o "$ASSOC/sim_lmm"
+    plot "$ASSOC/sim_lmm" "LPA structure demo (LMM)"
   else
     echo "   (LMM skipped: N=$N > LMM_MAX_N=$LMM_MAX_N or no kinship.tsv; use PC covariates at this scale)"
   fi
 fi
 
-echo "== sanity: region scan recovers KIV-2 (bubble 7, negative effect); structure correction lowers lambda =="
-"$PY" - "$OUT_DIR/assoc_graph_quant.assoc.tsv" "$OUT_DIR/sim_naive.summary.tsv" "$OUT_DIR/sim_pc.summary.tsv" <<'PY'
+# KIV-2 = the largest-DUP bubble (id is graph-dependent, so detect it rather than hardcode)
+KIV2_BUB="$(awk -F'\t' '/SVTYPE=DUP/{sv=$8;sub(/.*SVLEN=/,"",sv);sub(/;.*/,"",sv);if(sv<0)sv=-sv;
+  b=$8;sub(/.*BUBBLE_ID=/,"",b);sub(/;.*/,"",b); if(sv+0>m){m=sv+0;bb=b}} END{print bb}' "${CALL}.region.vcf")"
+echo "== sanity: region scan recovers KIV-2 (bubble $KIV2_BUB, negative effect); structure correction lowers lambda =="
+"$PY" - "$ASSOC/assoc_graph_quant.assoc.tsv" "$ASSOC/sim_naive.summary.tsv" "$ASSOC/sim_pc.summary.tsv" "$KIV2_BUB" <<'PY'
 import sys
 rows = [l.split("\t") for l in open(sys.argv[1]).read().splitlines()[1:]]
 top = rows[0]
 beta, p_bonf = float(top[6]), float(top[10])
-ok = ("7" in top[2].split(";")) and beta < 0 and p_bonf < 0.05
+ok = (sys.argv[4] in top[2].split(";")) and beta < 0 and p_bonf < 0.05
 print(f"  region top feature={top[0]} bubble={top[2]} beta={beta:.3f} p_bonf={p_bonf:.1e} -> {'PASS' if ok else 'CHECK'}")
 def lam(p):
     try:
@@ -136,4 +149,4 @@ def lam(p):
 ln, lp = lam(sys.argv[2]), lam(sys.argv[3])
 print(f"  structure-demo lambda: naive={ln:.2f} -> PC-adjusted={lp:.2f} -> {'PASS' if lp < ln else 'CHECK'}")
 PY
-echo "== DONE: $OUT_DIR (assoc_*, sim_{naive,pc,lmm}.{assoc.tsv,summary.tsv,manhattan.png,qq.png}) =="
+echo "== DONE: $ASSOC (assoc_*, sim_{naive,pc,lmm}.{assoc.tsv,summary.tsv,manhattan.png,qq.png}) =="

@@ -204,7 +204,7 @@ How faithfully do the calls reconstruct the haplotypes? For each called bubble a
   --bubble-prefix-in "$OUT/panphorte/panphorte" \
   --reference-path "$REF" \
   --variant-nodes "$OUT/call/call.variant_nodes.tsv" \
-  -o "$OUT/call/benchmark"
+  -o "$OUT/benchmark/benchmark"
 ```
 
 The per-gene headline is per-haplotype reconstruction identity (`1 − Σδ/ΣS`) — length-fair, unlike an absolute QV that a short region can never push high. `scripts/plot_benchmark.R` draws the per-gene anatomy: the left panel stacks Reconstructed (identity) + Residual to 100% of the aligned sequence, and the right panel splits that residual only into Not-callable (sub-threshold) vs Mis-called (≥ threshold) — so a tiny residual stays legible:

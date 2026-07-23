@@ -11,7 +11,7 @@ Converts the called bubbles into per-haplotype genotype features for association
 - **graph** — per-node and per-oriented-edge traversal counts, a graph-local dosage;
 
 The k-mer and graph substrates are built from the graph and emitted by default; the variant substrate is emitted when its VCF is supplied. Any one can be produced on its own (`--only-kmers`/`--only-graph`/`--only-variant`). The k-mer and graph substrates pass through a discriminative filter that drops features which do not vary across haplotypes — those present in all (or all but `--min-paths`) paths, unless their copy number varies — so only informative markers reach the matrix; the variant substrate emits every call and leaves frequency filtering to `associate`.
-Pass a [cosigt](https://github.com/davidebolo1993/cosigt) table (`sample <tab> hap1 <tab> hap2 …`) to `--samples <cosigt.tsv>` and `describe` also writes a per-sample BIMBAM for each substrate (`bimbam_{kmers,graph,variant}.samples.bimbam.gz`) whose value sums the dosage over the sample's haplotypes (diploid `CN` = `CN_A` + `CN_B`). See [GWAS example](../gwas.md).
+Pass a [cosigt](https://github.com/davidebolo1993/cosigt) table (`sample <tab> hap1 <tab> hap2 …`) to `--samples <cosigt.tsv>` and `describe` also writes a per-sample BIMBAM for each substrate (under `sample/<substrate>/`) whose value sums the dosage over the sample's haplotypes (diploid `CN` = `CN_A` + `CN_B`). See [GWAS example](../gwas.md).
 
 Algorithm and worked trace: [algorithms/describe.md](../algorithms/describe.md).
 
@@ -39,39 +39,44 @@ Algorithm and worked trace: [algorithms/describe.md](../algorithms/describe.md).
 | `--variant-vcf <vcf>` | also emit a VARIANT-level BIMBAM (one dosage row per SV call) from `call`'s region VCF — the honest GWAS unit for `associate --unit variant` | — |
 | `--only-kmers` / `--only-graph` / `--only-variant` | emit only one substrate (`--only-variant` needs `--variant-vcf` and no GFA — Graphical Fragment Assembly) | k-mer + graph |
 | `--scale-dosage` | rescale each feature's dosage to the `0..2` range (per-feature min-max) | off (raw counts) |
-| `--no-bimbam` | skip the BIMBAM dosage matrices + `feature_annot.tsv.gz` | off |
+| `--no-bimbam` | skip the BIMBAM dosage matrices + their `feature_annot` sidecars | off |
 | `--no-wide-matrix` | write only the feature map and the sparse JSONL (JSON Lines; skip the dense per-bubble matrix) | off |
 | `--max-wide-features <N>` / `--force-wide` | wide-matrix cap / override | `250000` |
 | `--threads <N>` / `--quiet` | workers / quiet | `0` / off |
 
 ## Outputs
 
+Each BIMBAM substrate is written to its own self-contained folder, `<out-dir>/<level>/<substrate>/`, where `<level>` is `haplotype` (per-haplotype, always) or `sample` (per-sample diploid, only with `--samples`) and `<substrate>` is `kmers`, `graph`, or `variant`. A folder holds three files: the matrix, its sidecar, and its column order. So an `associate` run points at one folder and takes all three from it.
+
+| file (in each `<level>/<substrate>/`) | contents |
+|------|----------|
+| `bimbam_<substrate>.bimbam.gz` | BIMBAM mean-genotype dosage (`id, A, B, dose…`; missing = `NA`); the `associate`/GEMMA input |
+| `feature_annot.<substrate>.tsv.gz` | `feature_id, layer, encoding, bubbles, nodes` sidecar for the BIMBAM rows (variant adds `svtype, gene, AF, AN`) |
+| `samples.txt.gz` | column order for that matrix — haplotype names under `haplotype/`, sample names under `sample/` |
+
+`kmers`/`graph` come from the graph; `variant` needs `--variant-vcf` and carries the variant-level dosage (`CN` for `DUP`, allele indicator for multiallelic, `GT` 0/1 otherwise). The `sample/` level appears only with `--samples`, summing each sample's haplotype dosages into a diploid genotype. Alongside the substrate folders, at the top of `<out-dir>`:
+
 | file | contents |
 |------|----------|
-| `bimbam_{kmers,graph}.bimbam.gz` | canonical BIMBAM mean-genotype dosage (`id, A, B, dose…`; missing = `NA`); the `associate`/GEMMA input |
-| `feature_annot.tsv.gz` | `feature_id, layer, encoding, bubbles, nodes` sidecar for the BIMBAM rows |
-| `bimbam.samples.txt.gz` | sample (column) order shared by both BIMBAM files |
-| `bimbam_{kmers,graph}.samples.bimbam.gz` + `bimbam.samples.samples.txt.gz` + `feature_annot.samples.tsv.gz` | with `--samples`: per-sample versions |
-| `bimbam_variant.bimbam.gz` + `bimbam_variant.samples.txt.gz` + `feature_annot.variant.tsv.gz` | with `--variant-vcf`: the variant-level dosage (`CN` for `DUP`, allele indicator for multiallelic, `GT` 0/1 otherwise), its column order, and a sidecar adding `svtype, gene, AF, AN`. With `--samples`, also the diploid `bimbam_variant.samples.bimbam.gz` (+ `.samples.samples.txt.gz`) |
 | `describe.index.tsv` | per-bubble kept/candidates/discarded for both substrates |
 | `describe.params.json` | the run's resolved parameters (k, feature mode, filter, wide-matrix flags) |
 | `bubble_<id>/graph_features.tsv.gz` | node and edge dosage map (`feature_type` = node/edge) |
 | `bubble_<id>/kmer_features.tsv.gz` + `kmer_counts.jsonl.gz` | k-mer map (with `nodes` provenance) + per-path sparse counts |
 | `bubble_<id>/{kmer,graph}_matrix.tsv.gz` | dense feature × path matrices — only without `--no-wide-matrix` (the gene drivers pass `--no-wide-matrix`, so these are normally absent; the feature maps + JSONL carry the same information) |
 
-By default dosages are raw counts (not rescaled to 0–2), so a haplotype carrying 50 copies shows 50; `NA` = a haplotype that doesn't traverse the feature's bubble (distinct from `0` = traverses but reference). `panvar associate` tests these raw counts directly. `--scale-dosage` maps each feature to the `0..2` range instead — a per-feature linear map, so it doesn't change `associate`'s linear-model result; it's there for external tools (e.g. GEMMA's minor-allele-frequency (MAF) model) that assume a diploid `0..2` dosage and would otherwise drop copy-number markers.
+By default dosages are raw counts (not rescaled to 0–2), so a haplotype carrying 50 copies shows 50; `NA` = a haplotype that doesn't traverse the feature's bubble (distinct from `0` = traverses but reference). `panvar associate` tests these raw counts directly. `--scale-dosage` maps each feature to the `0..2` range instead — a per-feature linear map, so it doesn't change `associate`'s linear-model result; it's there for external tools (e.g. GEMMA) that assume a diploid `0..2` dosage and would otherwise drop copy-number markers.
 
-`feature_annot.tsv.gz` (one row per BIMBAM feature, in row order) carries the provenance of each genotype:
+Each `feature_annot.<substrate>.tsv.gz` (one row per BIMBAM feature, in row order) carries the provenance of each genotype:
 
 | column | meaning |
 |--------|---------|
-| `feature_id` | the k-mer sequence (k-mer substrate) or the node id / oriented-edge key (graph substrate) |
+| `feature_id` | the k-mer sequence (k-mer substrate) or the node id/oriented-edge key (graph substrate) |
 | `layer` | `kmer` or `graph` |
 | `encoding` | how the feature is built (`syncmer`/`all` for k-mers; `node`/`edge` for graph dosage) |
 | `bubbles` | the bubble id(s) the feature belongs to |
 | `nodes` | the graph node(s) the feature localizes to — the traceback into `call`'s `variant_nodes.tsv` |
 
-The BIMBAM matrices themselves hold `feature_id`, two allele-label columns `A`,`B`, then one dosage column per haplotype (or per sample, with `--samples`) in `bimbam.samples.txt.gz` order. The per-bubble `*_features.tsv.gz` maps name each feature to its nodes/encoding, and `kmer_counts.jsonl.gz` holds the per-path sparse counts (`[feature_id, count]` tuples); the dense `*_matrix.tsv.gz` is the same data materialised as a feature × path table and is written only when the wide matrix is enabled (i.e. not under `--no-wide-matrix`).
+The BIMBAM matrices themselves hold `feature_id`, two allele-label columns `A`,`B`, then one dosage column per haplotype (or per sample, with `--samples`) in the folder's `samples.txt.gz` order. The per-bubble `*_features.tsv.gz` maps name each feature to its nodes/encoding, and `kmer_counts.jsonl.gz` holds the per-path sparse counts (`[feature_id, count]` tuples); the dense `*_matrix.tsv.gz` is the same data materialised as a feature × path table and is written only when the wide matrix is enabled (i.e. not under `--no-wide-matrix`).
 
 ## Association
 
