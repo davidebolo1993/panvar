@@ -18,6 +18,8 @@ struct RebuildOptions {
     std::size_t hub_degree = 50;     // Criteria A: a node with >= this many distinct neighbours is a hub
     std::size_t min_hubs = 10;       // Criteria A: >= this many hubs => pathological
     std::size_t min_var = 50;        // minigraph -L: minimum variant length to augment into the graph
+    std::size_t min_align_len = 0;   // minigraph -l: chains shorter than this augment nothing. 0 = auto,
+                                     // i.e. scaled to the locus (minigraph's default assumes chromosomes)
     std::string tmp_dir;             // parent for the per-haplotype FASTA scratch (empty = beside --out);
                                      // a dedicated subfolder is created under it and removed on exit
     std::size_t threads = 0;         // worker threads (0 = auto)

@@ -29,6 +29,7 @@ Algorithm and worked trace: [algorithms/rebuild.md](../algorithms/rebuild.md).
 | `--force` | rebuild even when the gate says healthy; for testing and for small inputs the gate is not calibrated on | off |
 | `--kmer <N>` | k for the k-mer richness metric that orders haplotypes: distinct k-mers first, total k-mers breaking ties | `21` |
 | `--min-var <N>` | minimum variant length augmented into the graph; smaller differences are left at the backbone allele | `50` |
+| `--min-align-len <N>` | minimum alignment length that may contribute events; `auto` scales it to half the seed haplotype | `auto` |
 | `--tmp-dir <path>` | parent directory for the per-haplotype FASTA scratch; a dedicated subfolder is created under it and removed on exit | beside `--out` |
 | `-t, --threads <N>` | worker threads (`0` = auto) | `0` |
 | `-q, --quiet` | disable progress/logs | off |
@@ -43,6 +44,10 @@ Algorithm and worked trace: [algorithms/rebuild.md](../algorithms/rebuild.md).
 ## Notes
 
 The rebuilt graph is structural, not base-exact. Differences shorter than `--min-var` are not augmented, so a haplotype's `P` line spells the backbone allele at those positions rather than its own sequence. Expect per-haplotype identity below `1.0`, with the shortfall concentrated in substitutions and short indels; lowering `--min-var` does not fully remove it, because the underlying generator does not augment single-base differences at any practical setting. This matters for anything that assumes a path spells its haplotype exactly.
+
+Lowering `--min-var` does recover a useful part of it. On a locus of a few tens of kb, moving from `50` to `10` roughly doubles the number of haplotypes that still spell a distinct sequence, at the cost of a denser graph; below `10` the curve flattens. The default stays at `50` because that is the scale the downstream calling is tuned for.
+
+The generator drops an alignment entirely when it is shorter than `--min-align-len`, before `--min-var` is ever consulted, and its native default assumes chromosome-scale input. On a locus graph that threshold can reject every alignment, in which case nothing is augmented and the result collapses to the seed alone. `auto` avoids this by scaling the threshold to the locus, and as a backstop a rebuild that recovers no variation at all is discarded and the input graph is passed through unchanged.
 
 ## Example
 

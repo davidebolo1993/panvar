@@ -27,7 +27,11 @@ void print_rebuild_help() {
         << "      --kmer <N>              k for the k-mer richness metric: haplotypes are ordered by\n"
         << "                              distinct k-mers, ties broken by total k-mers (default 21)\n"
         << "      --min-var <N>           Minimum variant length augmented into the graph, i.e.\n"
-        << "                              minigraph -L (default 50)\n"
+        << "                              minigraph -L (default 50). Lower values keep more of the\n"
+        << "                              small variation, at the cost of a denser graph\n"
+        << "      --min-align-len <N>     Minimum alignment length that may contribute events, i.e.\n"
+        << "                              minigraph -l (default auto: half the seed haplotype, since\n"
+        << "                              minigraph's own default assumes chromosome-scale input)\n"
         << "      --tmp-dir <path>        Parent dir for the per-haplotype FASTA scratch (default: beside\n"
         << "                              --out); a dedicated subfolder under it is created and removed\n"
         << "      --hub-degree <N>        Node degree that counts as a hub (default 50)\n"
@@ -58,6 +62,10 @@ int run_rebuild_command(const std::vector<std::string>& args) {
         else if (arg == "-o" || arg == "--out") opt.out_path = require_value(arg);
         else if (arg == "--kmer") opt.kmer = cli::parse_size_arg(arg, require_value(arg));
         else if (arg == "--min-var") opt.min_var = cli::parse_size_arg(arg, require_value(arg));
+        else if (arg == "--min-align-len") {
+            const std::string& v = require_value(arg);
+            opt.min_align_len = (v == "auto") ? 0 : cli::parse_size_arg(arg, v);
+        }
         else if (arg == "--tmp-dir") opt.tmp_dir = require_value(arg);
         else if (arg == "--hub-degree") opt.hub_degree = cli::parse_size_arg(arg, require_value(arg));
         else if (arg == "--min-hubs") opt.min_hubs = cli::parse_size_arg(arg, require_value(arg));

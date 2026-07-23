@@ -256,6 +256,26 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
     mg_opt_set(nullptr, &ipt, &opt, &gpt);
     if (mg_opt_set("ggs", &ipt, &opt, &gpt) < 0) throw std::runtime_error("rebuild: mg_opt_set(ggs) failed");
     gpt.min_var_len = static_cast<int>(options.min_var);
+    // minigraph's length gates assume chromosome-scale input: ggsimple drops a chain wholesale when
+    // its block length is under min_map_len (100 kb by default), before min_var_len is ever consulted.
+    // A locus graph of a few tens of kb therefore augments nothing and collapses to the bare seed, so
+    // scale both gates to the locus. Loci already above the defaults keep minigraph's own values.
+    const std::size_t seed_len = hseq[idx.front()].size();
+    if (options.min_align_len > 0) {
+        gpt.min_map_len = static_cast<int>(options.min_align_len);
+        if (static_cast<std::size_t>(gpt.min_depth_len) > options.min_align_len) {
+            gpt.min_depth_len = static_cast<int>(std::max<std::size_t>(500, options.min_align_len / 5));
+        }
+        step("min alignment length " + std::to_string(gpt.min_map_len) + " (requested), min depth length " +
+             std::to_string(gpt.min_depth_len));
+    } else if (seed_len < 2 * static_cast<std::size_t>(gpt.min_map_len)) {
+        gpt.min_map_len = static_cast<int>(std::max<std::size_t>(1000, seed_len / 2));
+        if (seed_len < 2 * static_cast<std::size_t>(gpt.min_depth_len)) {
+            gpt.min_depth_len = static_cast<int>(std::max<std::size_t>(500, seed_len / 10));
+        }
+        step("locus-scale input (" + std::to_string(seed_len) + " bp): min alignment length " +
+             std::to_string(gpt.min_map_len) + ", min depth length " + std::to_string(gpt.min_depth_len));
+    }
     // Keep minigraph itself quiet (its per-sample logs are one block per haplotype, far too noisy at
     // cohort scale) and print our own throttled counter instead. mg_ggen augments one file per call
     // internally, so driving that loop here costs nothing extra and lets us report progress.
@@ -281,6 +301,16 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
     gfa_t* out = handle.get();
     step("generated " + std::to_string(out->n_seg) + " segments, " + std::to_string(out->n_arc) +
          " arcs (min-var " + std::to_string(options.min_var) + ")");
+
+    // A graph with no arcs carries no variation at all: every haplotype would spell the seed, which is
+    // strictly worse than the input. Treat that as "not rebuildable" and keep the original graph.
+    if (out->n_arc == 0 || out->n_seg <= 1) {
+        step("degenerate rebuild (no variation recovered) -> pass through unchanged");
+        if (!options.out_path.empty()) copy_file(options.gfa_path, options.out_path);
+        sum.out_nodes = sum.raw_nodes;
+        sum.ran = false;
+        return sum;
+    }
 
     // ---- path recovery: map every haplotype back to the graph, in memory (no GAF round-trip) ----
     // Each mg_llchain_t.v is an ORIENTED vertex (seg<<1|strand), which is what lets inversion
