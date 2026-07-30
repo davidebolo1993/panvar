@@ -807,6 +807,31 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
                 for (const auto& [slot, n] : local) actual[slot] += n;
                 for (const auto& [slot, n] : elocal) eactual[slot] += n;
             });
+            // Diagnostic: when a marker is dropped for appearing in several blocks, are those blocks
+            // ADJACENT (which would mean the shared boundary node between consecutive blocks is the
+            // cause -- an artifact of how the chain is cut) or DISTANT (a genuine duplication
+            // elsewhere in the region)? The answer decides whether the filter is correct.
+            {
+                std::vector<std::uint32_t> first_blk(out_panel->node_codes.size(), 0xffffffffu);
+                std::vector<std::uint32_t> last_blk(out_panel->node_codes.size(), 0xffffffffu);
+                for (std::size_t bi = 0; bi < chain.size(); ++bi) {
+                    for (const auto& mset : out_panel->by_block[bi]) {
+                        for (const auto& [slot, mult] : mset.nodes) {
+                            (void)mult;
+                            if (first_blk[slot] == 0xffffffffu) first_blk[slot] = static_cast<std::uint32_t>(bi);
+                            last_blk[slot] = static_cast<std::uint32_t>(bi);
+                        }
+                    }
+                }
+                std::size_t adj = 0;
+                std::size_t distant = 0;
+                for (std::size_t sl = 0; sl < out_panel->node_codes.size(); ++sl) {
+                    if (blocks_with[sl] <= 1) continue;
+                    if (last_blk[sl] - first_blk[sl] <= 1) ++adj; else ++distant;
+                }
+                out_panel->dropped_adjacent_blocks = adj;
+                out_panel->dropped_distant_blocks = distant;
+            }
             std::size_t dropped = 0;
             for (std::size_t bi = 0; bi < chain.size(); ++bi) {
                 for (const auto& mset : out_panel->by_block[bi]) {

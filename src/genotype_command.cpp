@@ -360,6 +360,10 @@ int run_genotype_command(const std::vector<std::string>& args) {
                      std::to_string(read_panel.dropped_multi_block) + " appear in >1 block, " +
                      std::to_string(read_panel.dropped_over_expected) + " exceed what the blocks own, of " +
                      std::to_string(read_panel.informative_before_filter) + " informative)");
+            log.info("multi-block markers: " + std::to_string(read_panel.dropped_adjacent_blocks) +
+                     " span ADJACENT blocks only (shared boundary), " +
+                     std::to_string(read_panel.dropped_distant_blocks) +
+                     " span DISTANT blocks (duplication elsewhere in the region)");
             const ReadCounts rc = count_reads(read_paths, read_panel, options.threads);
             log.info("reads: " + std::to_string(rc.reads) + " (" + std::to_string(rc.bases / 1000) +
                      " kb); " + std::to_string(rc.syncmers) + " syncmers, " +

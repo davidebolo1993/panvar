@@ -34,6 +34,8 @@ struct ReadPanel {
     std::size_t dropped_multi_block = 0;       // ...because they appear in more than one block
     std::size_t dropped_over_expected = 0;     // ...because the panel shows more copies than blocks own
     std::size_t informative_before_filter = 0;
+    std::size_t dropped_adjacent_blocks = 0;   // multi-block markers confined to neighbouring blocks
+    std::size_t dropped_distant_blocks = 0;    // ...spread across non-adjacent blocks
 };
 
 struct ReadCounts {
