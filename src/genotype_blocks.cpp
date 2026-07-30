@@ -6,6 +6,7 @@
 #include "panvar/syncmer.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <fstream>
 #include <stdexcept>
 
@@ -60,6 +61,25 @@ std::vector<Block> build_block_chain(const std::vector<Bubble>& bubbles) {
         }
     }
 
+    // A bubble's source/sink are not guaranteed to be in reference order -- a bubble whose paths
+    // traverse the graph backwards is stored with them swapped (all of c4's and gstm1's are). Taking
+    // them at face value makes the neighbouring flank and backbone intervals span straight across the
+    // bubble's interior, so the same sequence lands in three blocks at once. Blocks then stop tiling
+    // (measured: c4 1.56x, gstm1 1.36x, ankrd36c 1.93x of the haplotype length), and since confinement
+    // drops any marker varying in more than one block, every bubble marker is destroyed by its own
+    // neighbours. The graph is reference-sorted, so numeric node order IS reference order.
+    auto node_pos = [](const std::string& n) {
+        char* end = nullptr;
+        const unsigned long long v = std::strtoull(n.c_str(), &end, 10);
+        return (end != nullptr && *end == '\0') ? v : 0ULL;
+    };
+    auto left_of = [&](const Bubble& b) {
+        return node_pos(b.source) <= node_pos(b.sink) ? b.source : b.sink;
+    };
+    auto right_of = [&](const Bubble& b) {
+        return node_pos(b.source) <= node_pos(b.sink) ? b.sink : b.source;
+    };
+
     // Leading flank: everything upstream of the first bubble. Skipping it leaves ~8.6% of each
     // haplotype (measured on cyp2d6) outside the chain, and reads landing there match no block --
     // which shows up as spurious "novel" adjacencies and would poison the off-panel detector.
@@ -67,7 +87,7 @@ std::vector<Block> build_block_chain(const std::vector<Bubble>& bubbles) {
         Block b;
         b.index = chain.size();
         b.kind = BlockKind::Flank;
-        b.sink = bubbles.front().source;     // empty source = from the start of the path
+        b.sink = left_of(bubbles.front());   // empty source = from the start of the path
         chain.push_back(b);
     }
     for (std::size_t i = 0; i < bubbles.size(); ++i) {
@@ -75,8 +95,8 @@ std::vector<Block> build_block_chain(const std::vector<Bubble>& bubbles) {
             Block b;
             b.index = chain.size();
             b.kind = BlockKind::Backbone;
-            b.source = bubbles[i - 1].sink;
-            b.sink = bubbles[i].source;
+            b.source = right_of(bubbles[i - 1]);
+            b.sink = left_of(bubbles[i]);
             if (b.source != b.sink) chain.push_back(b);   // adjacent bubbles share a boundary node
         }
         Block b;
@@ -91,7 +111,7 @@ std::vector<Block> build_block_chain(const std::vector<Bubble>& bubbles) {
         Block b;                              // trailing flank; empty sink = to the end of the path
         b.index = chain.size();
         b.kind = BlockKind::Flank;
-        b.source = bubbles.back().sink;
+        b.source = right_of(bubbles.back());
         chain.push_back(b);
     }
     return chain;

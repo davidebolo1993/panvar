@@ -682,6 +682,10 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
         // where a marker's count VARIES with the genotype: a block in which every allele carries it at
         // the same multiplicity contributes a constant offset to every candidate pair alike, which is
         // harmless, whereas a block where it varies is a second signal mixed into the same count.
+        // Which blocks each marker varies in, not merely how many. The list is what says where a
+        // bubble's markers escape to, and a bubble that loses all of them to one distant block is a
+        // different problem from one that loses them to many.
+        std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> vary_where;
         std::unordered_map<std::uint64_t, std::uint32_t> vary_blocks;
         std::unordered_map<std::uint64_t, std::uint32_t> evary_blocks;
         for (std::size_t bi = 0; bi < chain.size(); ++bi) {
@@ -717,7 +721,10 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
             }
             // Rule-independent: where does this marker's count depend on the genotype at all?
             for (const auto& [c, n] : seen) {
-                if (n < inv.size() || mult_of[c] == 0xffffffffu) ++vary_blocks[c];
+                if (n < inv.size() || mult_of[c] == 0xffffffffu) {
+                    ++vary_blocks[c];
+                    vary_where[c].push_back(static_cast<std::uint32_t>(bi));
+                }
             }
             for (const auto& [c, n] : eseen) {
                 if (n < inv.size() || emult[c] == 0xffffffffu) ++evary_blocks[c];
@@ -789,6 +796,27 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
             out_panel->vary_edges = evary_blocks.size();
             for (const auto& [c, n] : vary_blocks) { (void)c; if (n <= 1) ++out_panel->confined_vary_nodes; }
             for (const auto& [c, n] : evary_blocks) { (void)c; if (n <= 1) ++out_panel->confined_vary_edges; }
+            // Block-to-block overlap of informative markers, the shape of the confinement loss.
+            out_panel->block_overlap.assign(chain.size(), {});
+            {
+                std::vector<std::vector<std::uint32_t>> tally(chain.size(),
+                                                              std::vector<std::uint32_t>(chain.size(), 0));
+                for (const auto& [c, where] : vary_where) {
+                    (void)c;
+                    if (where.size() < 2) continue;
+                    for (const std::uint32_t x : where)
+                        for (const std::uint32_t y : where)
+                            if (x != y) ++tally[x][y];
+                }
+                for (std::size_t b = 0; b < chain.size(); ++b) {
+                    for (std::size_t o = 0; o < chain.size(); ++o) {
+                        if (tally[b][o] > 0) out_panel->block_overlap[b].emplace_back(o, tally[b][o]);
+                    }
+                    std::sort(out_panel->block_overlap[b].begin(), out_panel->block_overlap[b].end(),
+                              [](const auto& x, const auto& y) { return x.second > y.second; });
+                    if (out_panel->block_overlap[b].size() > 3) out_panel->block_overlap[b].resize(3);
+                }
+            }
             for (std::size_t sl = 0; sl < out_panel->node_codes.size(); ++sl) {
                 const auto it = vary_blocks.find(out_panel->node_codes[sl]);
                 blocks_with[sl] = it == vary_blocks.end() ? 0 : it->second;

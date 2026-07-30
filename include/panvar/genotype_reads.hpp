@@ -43,6 +43,8 @@ struct ReadPanel {
     std::size_t confined_vary_nodes = 0;       // ...and varies in exactly one block
     std::size_t vary_edges = 0;                // same, for 2-syncmer context
     std::size_t confined_vary_edges = 0;
+    // Per block, the up-to-3 other blocks its informative markers most often also occur in.
+    std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>> block_overlap;
 };
 
 struct ReadCounts {

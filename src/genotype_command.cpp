@@ -381,6 +381,17 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                     std::max<std::size_t>(1, read_panel.vary_edges)) +
                      "% (" + std::to_string(read_panel.confined_vary_edges) + "/" +
                      std::to_string(read_panel.vary_edges) + ")");
+            for (std::size_t b = 0; b < read_panel.block_overlap.size(); ++b) {
+                if (read_panel.block_overlap[b].empty()) continue;
+                std::string msg = "  block " + std::to_string(b) + " (" +
+                                  (chain[b].kind == BlockKind::Bubble ? "bubble" :
+                                   chain[b].kind == BlockKind::Flank ? "flank" : "backbone") +
+                                  ") shares markers with:";
+                for (const auto& [other, n] : read_panel.block_overlap[b]) {
+                    msg += " " + std::to_string(other) + "(" + std::to_string(n) + ")";
+                }
+                log.info(msg);
+            }
             log.info("multi-block markers: " + std::to_string(read_panel.dropped_adjacent_blocks) +
                      " span ADJACENT blocks only (shared boundary), " +
                      std::to_string(read_panel.dropped_distant_blocks) +
