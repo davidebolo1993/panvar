@@ -1,6 +1,7 @@
 #include "panvar/variant_call.hpp"
 
 #include "panvar/align.hpp"
+#include "panvar/bubble_alleles.hpp"
 #include "panvar/bubble_path.hpp"
 #include "panvar/bubbles.hpp"
 #include "panvar/cli_utils.hpp"
@@ -52,47 +53,6 @@ const char* ev_svtype(EvType t) {
 std::size_t node_len(const Graph& graph, const std::string& id) {
     const auto it = graph.nodes.find(id);
     return it == graph.nodes.end() ? 0 : it->second.sequence.size();
-}
-
-// Nodes carrying a self-loop edge (a panphorte REP, or any tandem-unit node):
-// these are copy-number loci even when a haplotype traverses them only once.
-std::unordered_set<std::string> self_loop_nodes(const Graph& graph) {
-    std::unordered_set<std::string> out;
-    for (const auto& [id, node] : graph.nodes) {
-        bool loop = false;
-        for (const Neighbor& nb : node.start) if (nb.node_id == id) { loop = true; break; }
-        if (!loop) for (const Neighbor& nb : node.end) if (nb.node_id == id) { loop = true; break; }
-        if (loop) out.insert(id);
-    }
-    return out;
-}
-
-// Steps of `path` across `bubble` (canonical source->sink). Falls back to an empty interior
-// ([source, sink]) for paths that cross with no inside node (a pure deletion / short side of an
-// insertion), which the inside-node-only interval finder would otherwise drop.
-std::optional<std::vector<PathStep>> bubble_steps(
-    const PathRecord& path, const BubblePathIndex& index, const Bubble& bubble) {
-    const auto iv = find_best_bubble_path_interval(index, bubble);
-    if (iv.has_value()) {
-        std::vector<PathStep> s = canonical_bubble_path_steps(path, bubble, *iv);
-        if (!s.empty()) return s;
-    }
-    const auto si = index.positions.find(bubble.source);
-    const auto ki = index.positions.find(bubble.sink);
-    if (si == index.positions.end() || ki == index.positions.end()) return std::nullopt;
-    const std::unordered_set<std::size_t> sink_pos(ki->second.begin(), ki->second.end());
-    for (const std::size_t p : si->second) {                 // forward: source then sink
-        if (sink_pos.count(p + 1)) return std::vector<PathStep>{ path.steps[p], path.steps[p + 1] };
-    }
-    const std::unordered_set<std::size_t> src_pos(si->second.begin(), si->second.end());
-    for (const std::size_t p : ki->second) {                 // reverse: sink then source -> flip
-        if (src_pos.count(p + 1)) {
-            return std::vector<PathStep>{
-                PathStep{ path.steps[p + 1].node_id, !path.steps[p + 1].reverse },
-                PathStep{ path.steps[p].node_id, !path.steps[p].reverse } };
-        }
-    }
-    return std::nullopt;
 }
 
 // One node-token position in a walk (oriented), for the DEL/INS/INV alignment.
@@ -763,43 +723,22 @@ void call_variants(
         if (!bubble_filter.empty() && bubble_filter.find(bubble.id) == bubble_filter.end()) return;
         ++summary.bubbles_seen;
 
-        // Reference walk through this bubble. path_indexes is parallel to graph.paths.
+        // Reference walk + distinct alleles (grouped by canonical-walk signature).
         std::size_t ref_idx = graph.paths.size();
         for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
             if (graph.paths[pi].name == ref_name) { ref_idx = pi; break; }
         }
-        std::optional<std::vector<PathStep>> ref_opt =
-            (ref_idx < graph.paths.size())
-                ? bubble_steps(graph.paths[ref_idx], path_indexes[ref_idx], bubble)
-                : std::optional<std::vector<PathStep>>{};
-        if (!ref_opt.has_value() || ref_opt->empty()) {
+        BubbleAlleleSet allele_set = enumerate_bubble_alleles(graph, path_indexes, bubble, ref_name);
+        if (!allele_set.has_reference) {
             return; // reference does not traverse this bubble; cannot type events
         }
         ++summary.bubbles_with_reference;
 
-        const std::vector<PathStep> ref_steps = std::move(*ref_opt);
-
-        // Distinct alleles: group paths by canonical-walk signature.
-        struct Allele { std::vector<PathStep> steps; std::vector<std::string> members; };
-        std::unordered_map<std::string, std::size_t> sig_to_allele;
-        std::vector<Allele> alleles;
-        std::unordered_set<std::string> traverses; // path names that cross the bubble
-        const std::string ref_sig = build_walk_signature(ref_steps);
-        for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
-            const auto steps_opt = bubble_steps(graph.paths[pi], path_indexes[pi], bubble);
-            if (!steps_opt.has_value() || steps_opt->empty()) continue;
-            const std::vector<PathStep>& steps = *steps_opt;
-            traverses.insert(graph.paths[pi].name);
-            const std::string sig = build_walk_signature(steps);
-            auto it = sig_to_allele.find(sig);
-            if (it == sig_to_allele.end()) {
-                sig_to_allele.emplace(sig, alleles.size());
-                Allele a; a.steps = steps; a.members.push_back(graph.paths[pi].name);
-                alleles.push_back(std::move(a));
-            } else {
-                alleles[it->second].members.push_back(graph.paths[pi].name);
-            }
-        }
+        const std::vector<PathStep> ref_steps = std::move(allele_set.reference_steps);
+        using Allele = BubbleAllele;
+        const std::vector<Allele>& alleles = allele_set.alleles;
+        const std::unordered_set<std::string>& traverses = allele_set.traversing;
+        const std::string& ref_sig = allele_set.reference_signature;
 
         // CN nodes: self-loop nodes in this bubble (a REP / tandem unit), handled as count-based DUP
         // events and excluded from the DEL/INS/INV alignment. Ordinary recurring nodes stay in it.

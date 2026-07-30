@@ -8,6 +8,7 @@
 #include <utility>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace panvar {
@@ -58,5 +59,10 @@ std::string spell_path_steps_sequence(
 std::uint64_t hash_step_token(const PathStep& step);
 std::vector<std::uint64_t> build_walk_tokens(const std::vector<PathStep>& steps);
 std::string build_walk_signature(const std::vector<PathStep>& steps);
+
+// Nodes carrying a self-loop edge (a panphorte REP, or any tandem-unit node): these are
+// copy-number loci even when a haplotype traverses them only once. Re-derive this from the graph
+// rather than trusting `Bubble::cyclic`, which `bubbles.csv` does not round-trip.
+std::unordered_set<std::string> self_loop_nodes(const Graph& graph);
 
 } // namespace panvar

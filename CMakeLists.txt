@@ -117,6 +117,12 @@ add_library(panvarlib
     src/three_edge_cc.cpp
     src/union_find.cpp
     src/integrated_snarls.cpp
+    src/bubble_alleles.cpp
+    src/syncmer.cpp
+    src/genotype.cpp
+    src/genotype_blocks.cpp
+    src/genotype_markers.cpp
+    src/genotype_reads.cpp
     src/bubble_path.cpp
     src/bubbles.cpp
     src/ref_path.cpp
@@ -162,6 +168,7 @@ add_executable(panvar
     src/bubble_command.cpp
     src/inspect.cpp
     src/call_command.cpp
+    src/genotype_command.cpp
     src/benchmark_command.cpp
     src/describe_command.cpp
     src/panphorte_command.cpp

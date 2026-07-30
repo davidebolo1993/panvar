@@ -122,4 +122,15 @@ std::string spell_path_steps_sequence(
     return seq;
 }
 
+std::unordered_set<std::string> self_loop_nodes(const Graph& graph) {
+    std::unordered_set<std::string> out;
+    for (const auto& [id, node] : graph.nodes) {
+        bool loop = false;
+        for (const Neighbor& nb : node.start) if (nb.node_id == id) { loop = true; break; }
+        if (!loop) for (const Neighbor& nb : node.end) if (nb.node_id == id) { loop = true; break; }
+        if (loop) out.insert(id);
+    }
+    return out;
+}
+
 } // namespace panvar

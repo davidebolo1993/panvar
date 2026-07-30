@@ -31,4 +31,34 @@ std::vector<PathStep> canonical_bubble_path_steps(
     const Bubble& bubble,
     const BubblePathInterval& interval);
 
+// Steps of `path` across `bubble` (canonical source->sink). Falls back to an empty interior
+// ([source, sink]) for paths that cross with no inside node (a pure deletion / short side of an
+// insertion), which the inside-node-only interval finder above would otherwise drop. Prefer this
+// over `canonical_bubble_path_steps` whenever every allele of a bubble must be represented.
+std::optional<std::vector<PathStep>> bubble_steps(
+    const PathRecord& path,
+    const BubblePathIndex& index,
+    const Bubble& bubble);
+
+// Steps of `path` from `from_node` to `to_node`, oriented from->to. Unlike `bubble_steps` this keys
+// on the two boundary nodes alone, so it works for a stretch with no declared interior — the
+// backbone between two consecutive bubbles, which carries the sub-threshold variation that
+// `--min-variant-bp` kept out of the bubble list. Picks the shortest spanning interval; returns
+// nullopt when the path does not traverse both boundaries in either orientation.
+std::optional<std::vector<PathStep>> interval_steps(
+    const PathRecord& path,
+    const BubblePathIndex& index,
+    const std::string& from_node,
+    const std::string& to_node);
+
+// Steps of `path` on one side of a single boundary node: the stretch before the first bubble or
+// after the last. Orientation is taken from how the path traverses the boundary itself, so a path
+// running through the graph backwards still yields a reference-oriented flank. `leading` selects the
+// reference-upstream side.
+std::optional<std::vector<PathStep>> flank_steps(
+    const PathRecord& path,
+    const BubblePathIndex& index,
+    const std::string& boundary_node,
+    bool leading);
+
 } // namespace panvar

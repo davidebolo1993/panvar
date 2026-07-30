@@ -93,34 +93,6 @@ const char* qv_ratio_quintile(double ratio) {
     return "0.8-1.0";
 }
 
-// Steps of `path` across `bubble` (canonical source->sink), mirroring call's bubble_steps: fall back
-// to a bare [source, sink] pair for haplotypes that cross with no inside node (the short side of a
-// deletion), which the inside-node interval finder would otherwise drop.
-std::optional<std::vector<PathStep>> bubble_steps(
-    const PathRecord& path, const BubblePathIndex& index, const Bubble& bubble) {
-    const auto iv = find_best_bubble_path_interval(index, bubble);
-    if (iv.has_value()) {
-        std::vector<PathStep> s = canonical_bubble_path_steps(path, bubble, *iv);
-        if (!s.empty()) return s;
-    }
-    const auto si = index.positions.find(bubble.source);
-    const auto ki = index.positions.find(bubble.sink);
-    if (si == index.positions.end() || ki == index.positions.end()) return std::nullopt;
-    const std::unordered_set<std::size_t> sink_pos(ki->second.begin(), ki->second.end());
-    for (const std::size_t p : si->second) {
-        if (sink_pos.count(p + 1)) return std::vector<PathStep>{ path.steps[p], path.steps[p + 1] };
-    }
-    const std::unordered_set<std::size_t> src_pos(si->second.begin(), si->second.end());
-    for (const std::size_t p : ki->second) {
-        if (src_pos.count(p + 1)) {
-            return std::vector<PathStep>{
-                PathStep{ path.steps[p + 1].node_id, !path.steps[p + 1].reverse },
-                PathStep{ path.steps[p].node_id, !path.steps[p].reverse } };
-        }
-    }
-    return std::nullopt;
-}
-
 const PathRecord* resolve_reference(const Graph& graph, const std::string& wanted) {
     for (const PathRecord& p : graph.paths) {
         if (p.name == wanted) return &p;

@@ -1,6 +1,7 @@
 #include "panvar/bubble_path.hpp"
 
 #include <algorithm>
+#include <unordered_set>
 
 namespace panvar {
 namespace {
@@ -132,6 +133,116 @@ std::vector<PathStep> canonical_bubble_path_steps(
         for (auto& step : out) {
             step.reverse = !step.reverse;
         }
+    }
+    return out;
+}
+
+// Steps of `path` across `bubble` (canonical source->sink). Falls back to an empty interior
+// ([source, sink]) for paths that cross with no inside node (a pure deletion / short side of an
+// insertion), which the inside-node-only interval finder would otherwise drop.
+std::optional<std::vector<PathStep>> bubble_steps(
+    const PathRecord& path, const BubblePathIndex& index, const Bubble& bubble) {
+    const auto iv = find_best_bubble_path_interval(index, bubble);
+    if (iv.has_value()) {
+        std::vector<PathStep> s = canonical_bubble_path_steps(path, bubble, *iv);
+        if (!s.empty()) return s;
+    }
+    const auto si = index.positions.find(bubble.source);
+    const auto ki = index.positions.find(bubble.sink);
+    if (si == index.positions.end() || ki == index.positions.end()) return std::nullopt;
+    const std::unordered_set<std::size_t> sink_pos(ki->second.begin(), ki->second.end());
+    for (const std::size_t p : si->second) {                 // forward: source then sink
+        if (sink_pos.count(p + 1)) return std::vector<PathStep>{ path.steps[p], path.steps[p + 1] };
+    }
+    const std::unordered_set<std::size_t> src_pos(si->second.begin(), si->second.end());
+    for (const std::size_t p : ki->second) {                 // reverse: sink then source -> flip
+        if (src_pos.count(p + 1)) {
+            return std::vector<PathStep>{
+                PathStep{ path.steps[p + 1].node_id, !path.steps[p + 1].reverse },
+                PathStep{ path.steps[p].node_id, !path.steps[p].reverse } };
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<std::vector<PathStep>> interval_steps(
+    const PathRecord& path,
+    const BubblePathIndex& index,
+    const std::string& from_node,
+    const std::string& to_node) {
+
+    const auto fi = index.positions.find(from_node);
+    const auto ti = index.positions.find(to_node);
+    if (fi == index.positions.end() || ti == index.positions.end()) return std::nullopt;
+
+    // Shortest interval spanning the two boundaries, in either direction.
+    bool found = false;
+    bool forward = true;
+    std::size_t best_left = 0;
+    std::size_t best_right = 0;
+    auto consider = [&](std::size_t l, std::size_t r, bool fwd) {
+        if (r <= l) return;
+        if (!found || (r - l) < (best_right - best_left)) {
+            found = true;
+            forward = fwd;
+            best_left = l;
+            best_right = r;
+        }
+    };
+    for (const std::size_t a : fi->second) {
+        for (const std::size_t b : ti->second) {
+            if (b > a) consider(a, b, true);
+        }
+    }
+    if (!found) {
+        for (const std::size_t b : ti->second) {
+            for (const std::size_t a : fi->second) {
+                if (a > b) consider(b, a, false);
+            }
+        }
+    }
+    if (!found) return std::nullopt;
+
+    std::vector<PathStep> out;
+    out.reserve(best_right - best_left + 1);
+    if (forward) {
+        for (std::size_t i = best_left; i <= best_right; ++i) out.push_back(path.steps[i]);
+    } else {
+        for (std::size_t i = best_right + 1; i > best_left; --i) {
+            const PathStep& s = path.steps[i - 1];
+            out.push_back(PathStep{s.node_id, !s.reverse});
+        }
+    }
+    return out;
+}
+
+std::optional<std::vector<PathStep>> flank_steps(
+    const PathRecord& path,
+    const BubblePathIndex& index,
+    const std::string& boundary_node,
+    bool leading) {
+
+    const auto it = index.positions.find(boundary_node);
+    if (it == index.positions.end() || it->second.empty()) return std::nullopt;
+
+    // A path may run through the graph in either direction; the boundary node's own orientation says
+    // which. When it is reversed, the reference-upstream flank sits AFTER the boundary in path order.
+    const std::size_t pos = leading ? it->second.front() : it->second.back();
+    const bool rev = path.steps[pos].reverse;
+    const bool take_prefix = leading != rev;
+
+    std::vector<PathStep> out;
+    if (take_prefix) {
+        if (pos == 0) return std::nullopt;
+        out.assign(path.steps.begin(), path.steps.begin() + static_cast<long>(pos));
+    } else {
+        if (pos + 1 >= path.steps.size()) return std::nullopt;
+        out.assign(path.steps.begin() + static_cast<long>(pos) + 1, path.steps.end());
+    }
+    if (out.empty()) return std::nullopt;
+    if (rev) {
+        std::reverse(out.begin(), out.end());
+        for (PathStep& st : out) st.reverse = !st.reverse;
     }
     return out;
 }
