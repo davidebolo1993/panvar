@@ -675,6 +675,15 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
             m.emplace(c, id);
             return id;
         };
+        // Confinement (below) must be judged on a property of the marker, not on which markers the
+        // selected rule happened to retain. Counting "blocks that retained it" lets a permissive rule
+        // inflate its own block counts and filter itself out, while a strict rule keeps markers that
+        // are just as contaminated but invisible to the count. The property that actually matters is
+        // where a marker's count VARIES with the genotype: a block in which every allele carries it at
+        // the same multiplicity contributes a constant offset to every candidate pair alike, which is
+        // harmless, whereas a block where it varies is a second signal mixed into the same count.
+        std::unordered_map<std::uint64_t, std::uint32_t> vary_blocks;
+        std::unordered_map<std::uint64_t, std::uint32_t> evary_blocks;
         for (std::size_t bi = 0; bi < chain.size(); ++bi) {
             const std::vector<AlleleInventory>& inv = kept_inv[bi];
             out_panel->by_block[bi].resize(inv.size());
@@ -705,6 +714,13 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
                     if (m == emult.end()) emult.emplace(c, mult);
                     else if (m->second != mult) m->second = 0xffffffffu;
                 }
+            }
+            // Rule-independent: where does this marker's count depend on the genotype at all?
+            for (const auto& [c, n] : seen) {
+                if (n < inv.size() || mult_of[c] == 0xffffffffu) ++vary_blocks[c];
+            }
+            for (const auto& [c, n] : eseen) {
+                if (n < inv.size() || emult[c] == 0xffffffffu) ++evary_blocks[c];
             }
             auto informative_node = [&](std::uint64_t c) {
                 if (options.rule == MarkerRule::PanGenie) {
@@ -769,21 +785,13 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
             // How many distinct blocks carry each marker, and its total multiplicity within them.
             std::vector<std::uint32_t> blocks_with(out_panel->node_codes.size(), 0);
             std::vector<std::uint32_t> eblocks_with(out_panel->edge_keys.size(), 0);
-            {
-                std::vector<std::uint32_t> last_seen(out_panel->node_codes.size(), 0xffffffffu);
-                std::vector<std::uint32_t> elast_seen(out_panel->edge_keys.size(), 0xffffffffu);
-                for (std::size_t bi = 0; bi < chain.size(); ++bi) {
-                    for (const auto& mset : out_panel->by_block[bi]) {
-                        for (const auto& [slot, mult] : mset.nodes) {
-                            (void)mult;
-                            if (last_seen[slot] != bi) { last_seen[slot] = static_cast<std::uint32_t>(bi); ++blocks_with[slot]; }
-                        }
-                        for (const auto& [slot, mult] : mset.edges) {
-                            (void)mult;
-                            if (elast_seen[slot] != bi) { elast_seen[slot] = static_cast<std::uint32_t>(bi); ++eblocks_with[slot]; }
-                        }
-                    }
-                }
+            for (std::size_t sl = 0; sl < out_panel->node_codes.size(); ++sl) {
+                const auto it = vary_blocks.find(out_panel->node_codes[sl]);
+                blocks_with[sl] = it == vary_blocks.end() ? 0 : it->second;
+            }
+            for (std::size_t sl = 0; sl < out_panel->edge_keys.size(); ++sl) {
+                const auto it = evary_blocks.find(out_panel->edge_keys[sl]);
+                eblocks_with[sl] = it == evary_blocks.end() ? 0 : it->second;
             }
             std::vector<std::uint64_t> actual(out_panel->node_codes.size(), 0);
             std::vector<std::uint64_t> eactual(out_panel->edge_keys.size(), 0);
