@@ -360,6 +360,15 @@ int run_genotype_command(const std::vector<std::string>& args) {
                      std::to_string(read_panel.dropped_multi_block) + " appear in >1 block, " +
                      std::to_string(read_panel.dropped_over_expected) + " exceed what the blocks own, of " +
                      std::to_string(read_panel.informative_before_filter) + " informative)");
+            log.info("confinement by context: 1-syncmer " +
+                     std::to_string(100 * read_panel.confined_vary_nodes /
+                                    std::max<std::size_t>(1, read_panel.vary_nodes)) +
+                     "% (" + std::to_string(read_panel.confined_vary_nodes) + "/" +
+                     std::to_string(read_panel.vary_nodes) + "), 2-syncmer " +
+                     std::to_string(100 * read_panel.confined_vary_edges /
+                                    std::max<std::size_t>(1, read_panel.vary_edges)) +
+                     "% (" + std::to_string(read_panel.confined_vary_edges) + "/" +
+                     std::to_string(read_panel.vary_edges) + ")");
             log.info("multi-block markers: " + std::to_string(read_panel.dropped_adjacent_blocks) +
                      " span ADJACENT blocks only (shared boundary), " +
                      std::to_string(read_panel.dropped_distant_blocks) +

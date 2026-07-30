@@ -36,6 +36,13 @@ struct ReadPanel {
     std::size_t informative_before_filter = 0;
     std::size_t dropped_adjacent_blocks = 0;   // multi-block markers confined to neighbouring blocks
     std::size_t dropped_distant_blocks = 0;    // ...spread across non-adjacent blocks
+    // Does longer context buy confinement? A single syncmer's count mixes every block it occurs in,
+    // but the observed PAIR (a -> b) may occur in only one of them. Comparing these two rates says
+    // whether read-level context can reach blocks where no single marker is usable.
+    std::size_t vary_nodes = 0;                // syncmers whose count varies with genotype somewhere
+    std::size_t confined_vary_nodes = 0;       // ...and varies in exactly one block
+    std::size_t vary_edges = 0;                // same, for 2-syncmer context
+    std::size_t confined_vary_edges = 0;
 };
 
 struct ReadCounts {

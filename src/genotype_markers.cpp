@@ -785,6 +785,10 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
             // How many distinct blocks carry each marker, and its total multiplicity within them.
             std::vector<std::uint32_t> blocks_with(out_panel->node_codes.size(), 0);
             std::vector<std::uint32_t> eblocks_with(out_panel->edge_keys.size(), 0);
+            out_panel->vary_nodes = vary_blocks.size();
+            out_panel->vary_edges = evary_blocks.size();
+            for (const auto& [c, n] : vary_blocks) { (void)c; if (n <= 1) ++out_panel->confined_vary_nodes; }
+            for (const auto& [c, n] : evary_blocks) { (void)c; if (n <= 1) ++out_panel->confined_vary_edges; }
             for (std::size_t sl = 0; sl < out_panel->node_codes.size(); ++sl) {
                 const auto it = vary_blocks.find(out_panel->node_codes[sl]);
                 blocks_with[sl] = it == vary_blocks.end() ? 0 : it->second;
