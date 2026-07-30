@@ -1,5 +1,6 @@
 #include "panvar/genotype_command.hpp"
 
+#include "panvar/align.hpp"
 #include "panvar/cli_utils.hpp"
 #include "panvar/genotype_blocks.hpp"
 #include "panvar/genotype_markers.hpp"
@@ -13,6 +14,9 @@
 #include "panvar/parallel.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <fstream>
 
 #include <iostream>
 #include <stdexcept>
@@ -401,6 +405,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
             GenotypeSummary gsum;
             std::vector<int> ta1;
             std::vector<int> ta2;
+            std::vector<std::string> ts1;   // true spelled sequence per block, even when unrepresentable
+            std::vector<std::string> ts2;
             if (!truth_haplotypes.empty()) {
                 const auto comma = truth_haplotypes.find(',');
                 if (comma == std::string::npos) {
@@ -414,7 +420,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 // resolved by spelling their own walk and matching it against the reduced panel's
                 // allele sequences. No match means the panel simply cannot represent that allele --
                 // the mosaic ceiling -- and the block is scored as unrepresentable rather than wrong.
-                auto resolve = [&](const std::string& name, std::vector<int>& out_alleles) {
+                auto resolve = [&](const std::string& name, std::vector<int>& out_alleles,
+                                   std::vector<std::string>& out_seq) {
                     const auto direct = [&](std::size_t bi) {
                         const auto it = blocks[bi].allele_of.find(name);
                         return it == blocks[bi].allele_of.end() ? -1 : static_cast<int>(it->second);
@@ -422,7 +429,13 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     const PathRecord* held = nullptr;
                     for (const PathRecord& p : held_out) if (p.name == name) held = &p;
                     if (held == nullptr) {
-                        for (std::size_t bi = 0; bi < chain.size(); ++bi) out_alleles[bi] = direct(bi);
+                        for (std::size_t bi = 0; bi < chain.size(); ++bi) {
+                            out_alleles[bi] = direct(bi);
+                            if (out_alleles[bi] >= 0 &&
+                                static_cast<std::size_t>(out_alleles[bi]) < blocks[bi].allele_seq.size()) {
+                                out_seq[bi] = blocks[bi].allele_seq[static_cast<std::size_t>(out_alleles[bi])];
+                            }
+                        }
                         return;
                     }
                     const BubblePathIndex idx = build_bubble_path_index(*held);
@@ -439,14 +452,19 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             st = interval_steps(*held, idx, chain[bi].source, chain[bi].sink);
                         }
                         if (!st.has_value() || st->empty()) continue;
-                        const std::string seq = spell_path_steps_sequence(graph, *st);
+                        std::string seq = spell_path_steps_sequence(graph, *st);
                         for (std::size_t ai = 0; ai < blocks[bi].allele_seq.size(); ++ai) {
                             if (blocks[bi].allele_seq[ai] == seq) { out_alleles[bi] = static_cast<int>(ai); break; }
                         }
+                        // Kept even when no allele matches: an unrepresentable block still has a true
+                        // sequence, and that is exactly the case the graded score exists to measure.
+                        out_seq[bi] = std::move(seq);
                     }
                 };
-                resolve(a, ta1);
-                resolve(b, ta2);
+                ts1.assign(chain.size(), std::string());
+                ts2.assign(chain.size(), std::string());
+                resolve(a, ta1, ts1);
+                resolve(b, ta2, ts2);
             }
             const std::vector<BlockCall> calls =
                 genotype_sample(chain, blocks, read_panel, rc, depth, hap_names, gopt, &gsum,
@@ -506,6 +524,101 @@ int run_genotype_command(const std::vector<std::string>& args) {
                          " blocks with the exact allele pair (" + std::to_string(partial) +
                          " one allele right, " + std::to_string(wrong) + " both wrong); bubble blocks " +
                          std::to_string(ok_bub) + "/" + std::to_string(scored_bub));
+
+                // Graded accuracy. Exact allele identity is the strict test, but it discards every
+                // block whose true allele the reduced panel cannot represent -- around 40% under
+                // leave-one-out -- and it scores a near miss exactly like a wild one. Aligning the
+                // called allele against the true sequence scores every block and says how wrong a
+                // call is, on the same edit-distance/QV scale benchmark already uses.
+                //
+                // Reported alongside is the best any panel allele could have achieved. Without it the
+                // metric flatters: at a block whose alleles are all but identical, any pick scores
+                // high, and the number would say more about the block than about the caller.
+                if (!blocks.empty() && !blocks[0].allele_seq.empty()) {
+                    const std::string acc_path = out_prefix + ".accuracy.tsv";
+                    std::ofstream acc(acc_path);
+                    acc << "block_index\tblock_kind\tbubble_id\tn_alleles\trepresentable\texact\t"
+                           "dbp\tbest_dbp\tidentity\tqv\ttrue_bp\tcalled_bp\n";
+                    auto len_of = [&](std::size_t bi, std::size_t ai) {
+                        return ai < blocks[bi].allele_seq.size() ? blocks[bi].allele_seq[ai].size() : 0;
+                    };
+                    double id_sum = 0.0, qv_sum = 0.0, id_sum_b = 0.0;
+                    std::size_t graded = 0, graded_b = 0;
+                    std::size_t dbp_sum = 0, best_sum = 0, dbp_sum_b = 0, best_sum_b = 0;
+                    // Per-block identity averages blocks of wildly different sizes equally; the
+                    // length-weighted figure is the one to compare across loci.
+                    std::size_t tot_edits = 0, tot_aln = 0;
+                    for (std::size_t bi = 0; bi < chain.size(); ++bi) {
+                        if (ts1[bi].empty() && ts2[bi].empty()) continue;
+                        const std::string* tv[2] = {&ts1[bi], &ts2[bi]};
+                        const std::size_t cv[2] = {calls[bi].allele1, calls[bi].allele2};
+                        // Pair called to true by closest length; the alternative pairing would score
+                        // the same haplotypes against each other's truth.
+                        const long d00 = std::labs(static_cast<long>(len_of(bi, cv[0])) - static_cast<long>(tv[0]->size())) +
+                                         std::labs(static_cast<long>(len_of(bi, cv[1])) - static_cast<long>(tv[1]->size()));
+                        const long d01 = std::labs(static_cast<long>(len_of(bi, cv[0])) - static_cast<long>(tv[1]->size())) +
+                                         std::labs(static_cast<long>(len_of(bi, cv[1])) - static_cast<long>(tv[0]->size()));
+                        const int swap = d01 < d00 ? 1 : 0;
+                        std::size_t dbp = 0, best = 0, tbp = 0, cbp = 0;
+                        double idsum = 0.0, qvsum = 0.0;
+                        for (int h = 0; h < 2; ++h) {
+                            const std::string& truth = *tv[h];
+                            const std::size_t ca = cv[h ^ swap];
+                            const std::string& called = ca < blocks[bi].allele_seq.size()
+                                                            ? blocks[bi].allele_seq[ca] : truth;
+                            tbp += truth.size();
+                            cbp += called.size();
+                            dbp += static_cast<std::size_t>(
+                                std::labs(static_cast<long>(called.size()) - static_cast<long>(truth.size())));
+                            std::size_t bd = SIZE_MAX;
+                            for (const std::string& s : blocks[bi].allele_seq) {
+                                bd = std::min(bd, static_cast<std::size_t>(std::labs(
+                                    static_cast<long>(s.size()) - static_cast<long>(truth.size()))));
+                            }
+                            best += bd == SIZE_MAX ? 0 : bd;
+                            const NwAlign nw = nw_edit_distance(called, truth);
+                            const double denom = static_cast<double>(std::max<std::size_t>(1, nw.aln_len));
+                            idsum += 1.0 - static_cast<double>(nw.edits) / denom;
+                            qvsum += -10.0 * std::log10(std::max(0.5, static_cast<double>(nw.edits)) / denom);
+                            tot_edits += nw.edits;
+                            tot_aln += nw.aln_len;
+                        }
+                        const bool is_bub = chain[bi].kind == BlockKind::Bubble;
+                        const bool repr = ta1[bi] >= 0 && ta2[bi] >= 0;
+                        const bool exact = repr &&
+                            std::min<std::size_t>(static_cast<std::size_t>(ta1[bi]), static_cast<std::size_t>(ta2[bi])) ==
+                                std::min(calls[bi].allele1, calls[bi].allele2) &&
+                            std::max<std::size_t>(static_cast<std::size_t>(ta1[bi]), static_cast<std::size_t>(ta2[bi])) ==
+                                std::max(calls[bi].allele1, calls[bi].allele2);
+                        acc << chain[bi].index << '\t'
+                            << (is_bub ? "bubble" : chain[bi].kind == BlockKind::Flank ? "flank" : "backbone") << '\t'
+                            << chain[bi].bubble_id << '\t' << blocks[bi].n_alleles << '\t'
+                            << (repr ? 1 : 0) << '\t' << (exact ? 1 : 0) << '\t'
+                            << dbp << '\t' << best << '\t' << (idsum / 2.0) << '\t' << (qvsum / 2.0) << '\t'
+                            << tbp << '\t' << cbp << '\n';
+                        id_sum += idsum / 2.0; qv_sum += qvsum / 2.0; ++graded;
+                        dbp_sum += dbp; best_sum += best;
+                        if (is_bub) { id_sum_b += idsum / 2.0; ++graded_b; dbp_sum_b += dbp; best_sum_b += best; }
+                    }
+                    if (graded > 0) {
+                        auto pct = [](double v) { return std::to_string(100.0 * v); };
+                        log.info("graded accuracy over " + std::to_string(graded) + " blocks (vs " +
+                                 std::to_string(scored) + " scored exactly): mean identity " +
+                                 pct(id_sum / static_cast<double>(graded)) + "%, mean QV " +
+                                 std::to_string(qv_sum / static_cast<double>(graded)) + ", total dbp " +
+                                 std::to_string(dbp_sum) + " (best any panel allele could do: " +
+                                 std::to_string(best_sum) + "); length-weighted identity " +
+                                 pct(1.0 - static_cast<double>(tot_edits) /
+                                               static_cast<double>(std::max<std::size_t>(1, tot_aln))) + "%");
+                        if (graded_b > 0) {
+                            log.info("graded accuracy, bubble blocks only (" + std::to_string(graded_b) +
+                                     "): mean identity " + pct(id_sum_b / static_cast<double>(graded_b)) +
+                                     "%, total dbp " + std::to_string(dbp_sum_b) + " (best: " +
+                                     std::to_string(best_sum_b) + ")");
+                        }
+                    }
+                    log.wrote({acc_path});
+                }
             }
         }
 
