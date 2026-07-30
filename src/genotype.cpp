@@ -224,7 +224,7 @@ std::vector<BlockCall> genotype_sample(
         const double s = std::accumulate(v.begin(), v.end(), 0.0);
         if (s > 0.0) for (double& x : v) x /= s;
     };
-    auto block_emissions = [&](std::size_t bi, std::vector<double>& e) {
+    auto compute_emissions = [&](std::size_t bi, std::vector<double>& e) {
         e.assign(nh * nh, 0.0);
         double best = -std::numeric_limits<double>::infinity();
         for (std::size_t i = 0; i < nh; ++i)
@@ -234,12 +234,24 @@ std::vector<BlockCall> genotype_sample(
             for (std::size_t j = 0; j < nh; ++j)
                 e[i * nh + j] = std::exp(emission_for(bi, i, j) - best);
     };
+    // Provenance re-runs the recursion once per block with that block's evidence removed. Neutralizing
+    // means a flat emission -- the block still exists and still costs a recombination step, it simply
+    // says nothing -- and the cache keeps the expensive part (the emissions) from being recomputed
+    // n_blocks times.
+    std::size_t neutral_block = std::numeric_limits<std::size_t>::max();
+    std::vector<std::vector<double>> e_cache;
+    auto block_emissions = [&](std::size_t bi, std::vector<double>& e) {
+        if (bi == neutral_block) { e.assign(nh * nh, 1.0); return; }
+        if (!e_cache.empty()) { e = e_cache[bi]; return; }
+        compute_emissions(bi, e);
+    };
 
     std::vector<double> e(nh * nh);
+    std::vector<double> beta(nh * nh), rowsum(nh), colsum(nh);
+    auto run_forward = [&]() {
     block_emissions(0, e);
     fwd[0] = e;
     normalize(fwd[0]);
-    std::vector<double> beta(nh * nh), rowsum(nh), colsum(nh);
     for (std::size_t bi = 1; bi < nb; ++bi) {
         const std::vector<double>& prev = fwd[bi - 1];
         std::fill(rowsum.begin(), rowsum.end(), 0.0);
@@ -257,7 +269,9 @@ std::vector<BlockCall> genotype_sample(
                 fwd[bi][i * nh + j] = e[i * nh + j] * ((1.0 - r) * beta[i * nh + j] + (r / nh) * colsum[j]);
         normalize(fwd[bi]);
     }
+    };
 
+    auto run_backward = [&]() {
     std::fill(bwd[nb - 1].begin(), bwd[nb - 1].end(), 1.0);
     normalize(bwd[nb - 1]);
     for (std::size_t bi = nb - 1; bi-- > 0;) {
@@ -278,6 +292,41 @@ std::vector<BlockCall> genotype_sample(
                 bwd[bi][i * nh + j] = (1.0 - r) * beta[i * nh + j] + (r / nh) * colsum[j];
         normalize(bwd[bi]);
     }
+    };
+
+    run_forward();
+    run_backward();
+
+    // Most probable allele pair per block, from whatever fwd/bwd currently hold. Used both for the
+    // reported call and, with a block neutralized, to see which blocks that call actually depended on.
+    auto map_allele_pairs = [&]() {
+        std::vector<std::pair<std::size_t, std::size_t>> out(nb, {0, 0});
+        std::unordered_map<std::uint64_t, double> ap;
+        for (std::size_t bi = 0; bi < nb; ++bi) {
+            ap.clear();
+            for (std::size_t i = 0; i < nh; ++i) {
+                for (std::size_t j = 0; j < nh; ++j) {
+                    const double p = fwd[bi][i * nh + j] * bwd[bi][i * nh + j];
+                    if (p <= 0.0) continue;
+                    const int a = allele_of[bi][i];
+                    const int b = allele_of[bi][j];
+                    if (a < 0 || b < 0) continue;
+                    const std::uint32_t lo = static_cast<std::uint32_t>(std::min(a, b));
+                    const std::uint32_t hi = static_cast<std::uint32_t>(std::max(a, b));
+                    ap[(static_cast<std::uint64_t>(lo) << 32) | hi] += p;
+                }
+            }
+            double bestp = -1.0;
+            for (const auto& [key, p] : ap) {
+                if (p > bestp) {
+                    bestp = p;
+                    out[bi] = {static_cast<std::size_t>(key >> 32),
+                               static_cast<std::size_t>(key & 0xffffffffu)};
+                }
+            }
+        }
+        return out;
+    };
 
     // ---- posteriors -> per-block allele pair ----
     double gq_sum = 0.0;
@@ -359,6 +408,76 @@ std::vector<BlockCall> genotype_sample(
         else { c.filter = has_markers ? "PASS" : "LINKED"; ++called; gq_sum += c.gq; }
     }
 
+    // ---- provenance: which blocks did each call actually depend on? ----
+    // Neutralize one block's evidence at a time and re-run the recursion; a block whose removal
+    // changes another block's call is what determined it. Model-exact rather than a heuristic, and
+    // it costs only the recursion (the emissions are cached), not the emissions themselves.
+    if (options.provenance) {
+        const std::vector<std::pair<std::size_t, std::size_t>> base = map_allele_pairs();
+        // Posterior mass on a FIXED allele pair per block, so the perturbed run is compared against
+        // the same hypothesis. Asking only whether the MAP flipped would report "nothing influenced
+        // this" whenever two blocks redundantly support the same call -- which is the common case, and
+        // exactly the case worth describing.
+        auto pair_posterior = [&](const std::vector<std::pair<std::size_t, std::size_t>>& target) {
+            std::vector<double> out(nb, 0.0);
+            for (std::size_t bi = 0; bi < nb; ++bi) {
+                double hit = 0.0;
+                double tot = 0.0;
+                for (std::size_t i = 0; i < nh; ++i) {
+                    for (std::size_t j = 0; j < nh; ++j) {
+                        const double p = fwd[bi][i * nh + j] * bwd[bi][i * nh + j];
+                        if (p <= 0.0) continue;
+                        const int a = allele_of[bi][i];
+                        const int b = allele_of[bi][j];
+                        if (a < 0 || b < 0) continue;
+                        tot += p;
+                        const std::size_t lo = static_cast<std::size_t>(std::min(a, b));
+                        const std::size_t hi = static_cast<std::size_t>(std::max(a, b));
+                        if (lo == target[bi].first && hi == target[bi].second) hit += p;
+                    }
+                }
+                out[bi] = tot > 0.0 ? hit / tot : 0.0;
+            }
+            return out;
+        };
+        const std::vector<double> base_post = pair_posterior(base);
+        e_cache.resize(nb);
+        for (std::size_t bi = 0; bi < nb; ++bi) compute_emissions(bi, e_cache[bi]);
+        std::vector<std::vector<std::pair<double, std::size_t>>> influence(nb);
+        for (std::size_t j = 0; j < nb; ++j) {
+            neutral_block = j;
+            run_forward();
+            run_backward();
+            const std::vector<double> alt = pair_posterior(base);
+            for (std::size_t b = 0; b < nb; ++b) {
+                const double drop = base_post[b] - alt[b];
+                if (drop > 0.01) influence[b].emplace_back(drop, j);
+            }
+        }
+        neutral_block = std::numeric_limits<std::size_t>::max();
+        e_cache.clear();
+        e_cache.shrink_to_fit();
+        for (std::size_t b = 0; b < nb; ++b) {
+            std::sort(influence[b].begin(), influence[b].end(),
+                      [](const auto& x, const auto& y) {
+                          return x.first != y.first ? x.first > y.first : x.second < y.second;
+                      });
+            for (const auto& [drop, j] : influence[b]) {
+                (void)drop;
+                if (calls[b].influencers.size() >= 5) break;
+                calls[b].influencers.push_back(j);
+            }
+            // Named for the block that contributes most, so the label answers "where did this call
+            // come from" rather than "what could have overturned it".
+            if (influence[b].empty()) calls[b].provenance = "none";
+            else {
+                const std::size_t top = influence[b].front().second;
+                calls[b].provenance = top == b ? "self"
+                                    : (top + 1 == b || b + 1 == top) ? "neighbours" : "distant";
+            }
+        }
+    }
+
     if (summary != nullptr) {
         summary->blocks = nb;
         summary->called = called;
@@ -385,8 +504,9 @@ void write_genotypes(
     const std::string gpath = out_prefix + ".genotypes.tsv";
     std::ofstream g(gpath);
     if (!g) throw std::runtime_error("genotype: cannot write " + gpath);
+    // provenance/influencers are appended after filter so existing column positions are unchanged.
     g << "block_index\tblock_kind\tbubble_id\tn_alleles\tn_markers\tallele1\tallele2\tgq"
-         "\texplained\ttruth1\ttruth2\ttruth_rank\tfilter\n";
+         "\texplained\ttruth1\ttruth2\ttruth_rank\tfilter\tprovenance\tinfluencers\n";
     for (std::size_t bi = 0; bi < calls.size(); ++bi) {
         const BlockCall& c = calls[bi];
         g << c.block_index << '\t'
@@ -395,7 +515,13 @@ void write_genotypes(
           << '\t' << c.bubble_id << '\t' << blocks[bi].n_alleles << '\t' << c.n_markers << '\t'
           << c.allele1 << '\t' << c.allele2 << '\t' << c.gq << '\t' << c.explained << '\t'
           << c.truth_allele1 << '\t' << c.truth_allele2 << '\t' << c.truth_emission_rank << '\t'
-          << c.filter << '\n';
+          << c.filter << '\t' << c.provenance << '\t';
+        for (std::size_t k = 0; k < c.influencers.size(); ++k) {
+            if (k) g << ',';
+            g << c.influencers[k];
+        }
+        if (c.influencers.empty()) g << '.';
+        g << '\n';
     }
 
     const std::string hpath = out_prefix + ".haplotypes.tsv";

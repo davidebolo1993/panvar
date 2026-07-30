@@ -21,6 +21,10 @@ struct GenotypeOptions {
     double min_gq = 20.0;
     double min_explained = 0.5;        // below this, the panel does not account for what was observed
     std::size_t max_alleles_per_block = 64;   // prune by detected-marker fraction before pairing
+    // Attribute each call to the blocks that determined it. Costs one extra forward-backward pass per
+    // block plus a cache of every block's emissions (n_blocks * n_haplotypes^2 doubles), so it is a
+    // diagnostic rather than something to leave on for a cohort.
+    bool provenance = false;
     std::size_t threads = 0;
 };
 
@@ -43,6 +47,12 @@ struct BlockCall {
     std::size_t hap2 = 0;
     double hap_posterior = 0.0;
     std::string filter = "PASS";
+    // Which blocks this call actually depended on, found by neutralizing each block in turn and
+    // seeing whose call changes. "self" means the block's own markers decide it; "neighbours" means
+    // the adjacent blocks carry it; "distant" means the evidence came from elsewhere in the chain.
+    // Empty and "none" unless GenotypeOptions::provenance is set.
+    std::vector<std::size_t> influencers;
+    std::string provenance = "none";
 };
 
 struct GenotypeSummary {

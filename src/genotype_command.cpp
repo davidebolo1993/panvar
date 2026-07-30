@@ -58,6 +58,12 @@ void print_genotype_help() {
         << "                              presence/absence only (PanGenie's actual rule)\n"
         << "      --fragment-len <N>      Library fragment length, used to discount correlated\n"
         << "                              markers when computing GQ (default 350; 0 disables)\n"
+        << "      --provenance            Attribute each call to the blocks that determined it, by\n"
+        << "                              neutralizing one block at a time and re-running the chain.\n"
+        << "                              Adds provenance (self/neighbours/distant/none) and the\n"
+        << "                              influencing block list to the genotypes table. Diagnostic:\n"
+        << "                              caches every block's emissions, so memory grows with\n"
+        << "                              n_blocks * n_haplotypes^2\n"
         << "      --max-alleles <N>       Candidate alleles kept per block before pairing (default\n"
         << "                              64). Rare alleles fall outside it and cannot be called\n"
         << "      --exclude-haplotypes <a,b> Drop these from the panel before genotyping. With\n"
@@ -117,6 +123,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
     std::string index_in;
     std::size_t max_alleles = 64;
     double fragment_len = 350.0;
+    bool provenance = false;
     double uneven_tolerance = 0.35;
     bool quiet = false;
     MarkerOptions options;
@@ -149,6 +156,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
         }
         else if (arg == "--max-alleles") max_alleles = cli::parse_size_arg(arg, require_value(arg));
         else if (arg == "--fragment-len") fragment_len = std::stod(require_value(arg));
+        else if (arg == "--provenance") provenance = true;
         else if (arg == "-k" || arg == "--kmer-size") options.kmer_size = cli::parse_size_arg(arg, require_value(arg));
         else if (arg == "--syncmer-s") options.syncmer_s = cli::parse_size_arg(arg, require_value(arg));
         else if (arg == "--min-markers") options.min_markers = cli::parse_size_arg(arg, require_value(arg));
@@ -402,6 +410,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
             gopt.threads = options.threads;
             gopt.max_alleles_per_block = max_alleles;
             gopt.fragment_len = fragment_len;
+            gopt.provenance = provenance;
             GenotypeSummary gsum;
             std::vector<int> ta1;
             std::vector<int> ta2;
@@ -538,7 +547,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     const std::string acc_path = out_prefix + ".accuracy.tsv";
                     std::ofstream acc(acc_path);
                     acc << "block_index\tblock_kind\tbubble_id\tn_alleles\trepresentable\texact\t"
-                           "dbp\tbest_dbp\tidentity\tqv\ttrue_bp\tcalled_bp\n";
+                           "dbp\tbest_dbp\tidentity\tqv\ttrue_bp\tcalled_bp\tfilter\n";
                     auto len_of = [&](std::size_t bi, std::size_t ai) {
                         return ai < blocks[bi].allele_seq.size() ? blocks[bi].allele_seq[ai].size() : 0;
                     };
@@ -548,24 +557,34 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     // Per-block identity averages blocks of wildly different sizes equally; the
                     // length-weighted figure is the one to compare across loci.
                     std::size_t tot_edits = 0, tot_aln = 0;
+                    std::size_t dbp_rep = 0, best_rep = 0, graded_rep = 0;
+                    std::size_t dbp_unrep = 0, graded_norep = 0;
                     for (std::size_t bi = 0; bi < chain.size(); ++bi) {
                         if (ts1[bi].empty() && ts2[bi].empty()) continue;
                         const std::string* tv[2] = {&ts1[bi], &ts2[bi]};
                         const std::size_t cv[2] = {calls[bi].allele1, calls[bi].allele2};
-                        // Pair called to true by closest length; the alternative pairing would score
-                        // the same haplotypes against each other's truth.
-                        const long d00 = std::labs(static_cast<long>(len_of(bi, cv[0])) - static_cast<long>(tv[0]->size())) +
-                                         std::labs(static_cast<long>(len_of(bi, cv[1])) - static_cast<long>(tv[1]->size()));
-                        const long d01 = std::labs(static_cast<long>(len_of(bi, cv[0])) - static_cast<long>(tv[1]->size())) +
-                                         std::labs(static_cast<long>(len_of(bi, cv[1])) - static_cast<long>(tv[0]->size()));
-                        const int swap = d01 < d00 ? 1 : 0;
+                        // Which called haplotype to compare against which true one is itself a choice,
+                        // and length is a poor way to make it -- two alleles of equal length can be
+                        // entirely different sequence. Align all four combinations and take the
+                        // assignment with the smaller total edit distance, the same NW kernel the rest
+                        // of the metric uses.
+                        auto seq_of = [&](std::size_t ai, const std::string& fallback) -> const std::string& {
+                            return ai < blocks[bi].allele_seq.size() ? blocks[bi].allele_seq[ai] : fallback;
+                        };
+                        NwAlign nwm[2][2];
+                        for (int c = 0; c < 2; ++c) {
+                            for (int t = 0; t < 2; ++t) {
+                                nwm[c][t] = nw_edit_distance(seq_of(cv[c], *tv[t]), *tv[t]);
+                            }
+                        }
+                        const int swap = (nwm[1][0].edits + nwm[0][1].edits) <
+                                         (nwm[0][0].edits + nwm[1][1].edits) ? 1 : 0;
                         std::size_t dbp = 0, best = 0, tbp = 0, cbp = 0;
                         double idsum = 0.0, qvsum = 0.0;
                         for (int h = 0; h < 2; ++h) {
                             const std::string& truth = *tv[h];
                             const std::size_t ca = cv[h ^ swap];
-                            const std::string& called = ca < blocks[bi].allele_seq.size()
-                                                            ? blocks[bi].allele_seq[ca] : truth;
+                            const std::string& called = seq_of(ca, truth);
                             tbp += truth.size();
                             cbp += called.size();
                             dbp += static_cast<std::size_t>(
@@ -576,7 +595,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                     static_cast<long>(s.size()) - static_cast<long>(truth.size()))));
                             }
                             best += bd == SIZE_MAX ? 0 : bd;
-                            const NwAlign nw = nw_edit_distance(called, truth);
+                            const NwAlign& nw = nwm[h ^ swap][h];
                             const double denom = static_cast<double>(std::max<std::size_t>(1, nw.aln_len));
                             idsum += 1.0 - static_cast<double>(nw.edits) / denom;
                             qvsum += -10.0 * std::log10(std::max(0.5, static_cast<double>(nw.edits)) / denom);
@@ -595,10 +614,15 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             << chain[bi].bubble_id << '\t' << blocks[bi].n_alleles << '\t'
                             << (repr ? 1 : 0) << '\t' << (exact ? 1 : 0) << '\t'
                             << dbp << '\t' << best << '\t' << (idsum / 2.0) << '\t' << (qvsum / 2.0) << '\t'
-                            << tbp << '\t' << cbp << '\n';
+                            << tbp << '\t' << cbp << '\t' << calls[bi].filter << '\n';
                         id_sum += idsum / 2.0; qv_sum += qvsum / 2.0; ++graded;
                         dbp_sum += dbp; best_sum += best;
                         if (is_bub) { id_sum_b += idsum / 2.0; ++graded_b; dbp_sum_b += dbp; best_sum_b += best; }
+                        // Scoring a block the caller declined to call measures the metric, not the
+                        // caller. Reported separately so a refused call cannot be counted as an error.
+                        const bool reported = calls[bi].filter == "PASS" || calls[bi].filter == "LINKED";
+                        if (reported) { dbp_rep += dbp; best_rep += best; ++graded_rep; }
+                        else { dbp_unrep += dbp; ++graded_norep; }
                     }
                     if (graded > 0) {
                         auto pct = [](double v) { return std::to_string(100.0 * v); };
@@ -610,6 +634,11 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                  std::to_string(best_sum) + "); length-weighted identity " +
                                  pct(1.0 - static_cast<double>(tot_edits) /
                                                static_cast<double>(std::max<std::size_t>(1, tot_aln))) + "%");
+                        log.info("graded accuracy, reported calls only (PASS/LINKED, " +
+                                 std::to_string(graded_rep) + " blocks): total dbp " +
+                                 std::to_string(dbp_rep) + " (best: " + std::to_string(best_rep) +
+                                 "); the " + std::to_string(graded_norep) +
+                                 " blocks the caller declined carry dbp " + std::to_string(dbp_unrep));
                         if (graded_b > 0) {
                             log.info("graded accuracy, bubble blocks only (" + std::to_string(graded_b) +
                                      "): mean identity " + pct(id_sum_b / static_cast<double>(graded_b)) +
