@@ -144,7 +144,8 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
     const std::vector<BlockAlleles>& blocks,
     const MarkerOptions& options,
     ReadPanel* out_panel = nullptr,
-    const Graph* graph_for_region_uniqueness = nullptr);
+    const Graph* graph_for_region_uniqueness = nullptr,
+    bool want_separation_stats = true);
 
 void write_block_marker_audit(
     const std::string& out_prefix,

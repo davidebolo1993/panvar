@@ -576,7 +576,8 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
     const std::vector<BlockAlleles>& blocks,
     const MarkerOptions& options,
     ReadPanel* out_panel,
-    const Graph* graph_for_region_uniqueness) {
+    const Graph* graph_for_region_uniqueness,
+    bool want_separation_stats) {
 
     const std::size_t k = options.kmer_size;
     const std::size_t s = options.syncmer_s != 0 ? options.syncmer_s : default_syncmer_s(k);
@@ -619,9 +620,16 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
             }
         }
 
+        // Pairwise separation is an audit statistic, not something the genotyper needs. It is the
+        // single most expensive part of building the panel, so genotyping skips it.
         std::vector<std::size_t> carried_n, carried_e, sep_n, sep_e;
-        compute_separation(inv, false, carried_n, sep_n, st.n_informative_nodes, options.max_dense_alleles, options.sep_top_k, options.sketch_size);
-        compute_separation(inv, true, carried_e, sep_e, st.n_informative_edges, options.max_dense_alleles, options.sep_top_k, options.sketch_size);
+        if (want_separation_stats) {
+            compute_separation(inv, false, carried_n, sep_n, st.n_informative_nodes, options.max_dense_alleles, options.sep_top_k, options.sketch_size);
+            compute_separation(inv, true, carried_e, sep_e, st.n_informative_edges, options.max_dense_alleles, options.sep_top_k, options.sketch_size);
+        } else {
+            sep_n.assign(B.allele_seq.size(), 0);
+            sep_e.assign(B.allele_seq.size(), 0);
+        }
 
         std::vector<std::size_t> sn = sep_n;
         std::vector<std::size_t> se = sep_e;

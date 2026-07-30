@@ -4,6 +4,7 @@
 #include "panvar/genotype_blocks.hpp"
 #include "panvar/genotype_markers.hpp"
 #include "panvar/genotype.hpp"
+#include "panvar/genotype_index.hpp"
 #include "panvar/graph_utils.hpp"
 #include "panvar/genotype_reads.hpp"
 #include "panvar/gfa.hpp"
@@ -39,6 +40,10 @@ void print_genotype_help() {
         << "  -r, --reference-path <name> Reference path name (required)\n"
         << "  -o, --out-prefix <path>     Output prefix (required)\n"
         << "      --audit                 Per-bubble marker feasibility audit\n"
+        << "      --build-index <path>    Build the panel index and write it here, then exit. The\n"
+        << "                              index depends only on the graph, so a cohort builds it once\n"
+        << "      --index <path>          Genotype using a prebuilt index instead of rebuilding the\n"
+        << "                              panel from the graph (much faster per sample)\n"
         << "  -R, --reads <path>          Short reads (FASTA/FASTQ, plain or gzipped); repeatable.\n"
         << "                              Projects them onto the block marker panel and reports\n"
         << "                              per-block depth. No genotypes are called yet.\n"
@@ -102,6 +107,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
     std::size_t min_anchors = 20;
     std::string truth_haplotypes;
     std::string exclude_haplotypes;
+    std::string index_out;
+    std::string index_in;
     std::size_t max_alleles = 64;
     double fragment_len = 350.0;
     double uneven_tolerance = 0.35;
@@ -126,6 +133,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--min-anchors") min_anchors = cli::parse_size_arg(arg, require_value(arg));
         else if (arg == "--truth-haplotypes") truth_haplotypes = require_value(arg);
         else if (arg == "--exclude-haplotypes") exclude_haplotypes = require_value(arg);
+        else if (arg == "--build-index") index_out = require_value(arg);
+        else if (arg == "--index") index_in = require_value(arg);
         else if (arg == "--marker-rule") {
             const std::string v = require_value(arg);
             if (v == "pangenie") options.rule = MarkerRule::PanGenie;
@@ -146,28 +155,70 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else throw std::runtime_error("Unknown option for genotype: " + arg);
     }
 
-    if (gfa_path.empty()) throw std::runtime_error("genotype requires -i/--gfa");
+    if (gfa_path.empty() && index_in.empty()) {
+        throw std::runtime_error("genotype requires -i/--gfa (or --index for a prebuilt panel)");
+    }
+    if (!index_in.empty() && read_paths.empty()) {
+        throw std::runtime_error("genotype: --index is for genotyping; pass -R/--reads too");
+    }
     if (out_prefix.empty()) throw std::runtime_error("genotype requires -o/--out-prefix");
-    if (reference_path.empty()) throw std::runtime_error("genotype requires -r/--reference-path");
+    if (reference_path.empty() && index_in.empty()) {
+        throw std::runtime_error("genotype requires -r/--reference-path");
+    }
     if (options.kmer_size == 0 || options.kmer_size > 31) {
         throw std::runtime_error("genotype: --kmer-size must be in [1, 31]");
     }
-    if (!audit && !audit_linkage && read_paths.empty()) {
-        throw std::runtime_error("genotype: pass --audit, --audit-linkage, or -R/--reads");
+    if (!audit && !audit_linkage && read_paths.empty() && index_out.empty()) {
+        throw std::runtime_error(
+            "genotype: pass --audit, --audit-linkage, --build-index, or -R/--reads");
     }
-    if (!read_paths.empty()) audit_linkage = true;   // reads are counted against the block chain
+    // Reads need the block chain and the marker panel, but not the linkage/novelty audits or the
+    // separation statistics -- those are diagnostics and were roughly half the runtime.
+    const bool need_blocks = audit_linkage || !read_paths.empty() || !index_out.empty();
+    const bool want_audit_stats = audit_linkage;
     if (!bubble_prefix_in.empty()) {
         if (!bubbles_csv_in.empty()) {
             throw std::runtime_error("genotype: use either --bubble-prefix-in or --bubbles-csv-in");
         }
         bubbles_csv_in = bubble_prefix_in + ".bubbles.csv";
     }
-    if (bubbles_csv_in.empty()) {
+    if (bubbles_csv_in.empty() && index_in.empty()) {
         throw std::runtime_error("genotype requires --bubble-prefix-in or --bubbles-csv-in");
     }
     cli::ensure_parent_dir_for_file(out_prefix);
 
     cli::RunLog log("genotype", quiet);
+
+    if (!index_in.empty()) {
+        // Everything the panel contributes was precomputed; only the reads are new.
+        const GenotypeIndex idx = read_genotype_index(index_in);
+        log.info("index " + index_in + ": " + std::to_string(idx.chain.size()) + " blocks, " +
+                 std::to_string(idx.haplotype_names.size()) + " haplotypes, " +
+                 std::to_string(idx.panel.node_codes.size()) + " markers");
+        const ReadCounts rc = count_reads(read_paths, idx.panel, options.threads);
+        log.info("reads: " + std::to_string(rc.reads) + " (" + std::to_string(rc.bases / 1000) +
+                 " kb); " + std::to_string(rc.syncmers) + " syncmers, " +
+                 std::to_string(100 * rc.matched_syncmers / std::max<std::uint64_t>(1, rc.syncmers)) +
+                 "% matched a panel marker");
+        const std::vector<BlockDepth> depth =
+            estimate_depth(idx.panel, rc, min_anchors, uneven_tolerance);
+        GenotypeOptions gopt;
+        gopt.threads = options.threads;
+        gopt.max_alleles_per_block = max_alleles;
+        gopt.fragment_len = fragment_len;
+        GenotypeSummary gsum;
+        const std::vector<BlockCall> calls = genotype_sample(idx.chain, idx.blocks, idx.panel, rc,
+                                                             depth, idx.haplotype_names, gopt, &gsum);
+        log.info("calls: " + std::to_string(gsum.called) + " PASS, " + std::to_string(gsum.no_calls) +
+                 " no-call, " + std::to_string(gsum.off_panel) + " off-panel; mean GQ " +
+                 std::to_string(gsum.mean_gq));
+        write_read_audit(out_prefix, idx.chain, idx.panel, rc, depth);
+        write_genotypes(out_prefix, idx.chain, idx.blocks, calls, idx.haplotype_names);
+        log.wrote({out_prefix + ".reads.depth.tsv", out_prefix + ".genotypes.tsv",
+                   out_prefix + ".haplotypes.tsv"});
+        log.done();
+        return 0;
+    }
     ParseGfaOptions parse_options;
     parse_options.include_paths = true;
     parse_options.include_sequences = true;
@@ -205,7 +256,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
              std::to_string(graph.paths.size()) + " paths); " + std::to_string(bubbles.size()) +
              " bubbles; reference " + reference_path);
 
-    if (audit_linkage) {
+    if (need_blocks) {
         const std::vector<Block> chain = build_block_chain(bubbles);
         std::vector<BubblePathIndex> path_indexes(panel_graph.paths.size());
         run_parallel(panel_graph.paths.size(), options.threads, [&](std::size_t i) {
@@ -224,6 +275,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
         log.info("block chain: " + std::to_string(chain.size()) + " blocks (" +
                  std::to_string(chain.size() - n_bb - n_fl) + " bubble, " + std::to_string(n_bb) +
                  " backbone, " + std::to_string(n_fl) + " flank)");
+        if (want_audit_stats) {
         const LinkageReport rep = measure_linkage(panel_graph, blocks);
         log.info("uniquely identified by the full chain: " + std::to_string(rep.uniquely_identified) +
                  "/" + std::to_string(rep.n_haplotypes) + " haplotypes");
@@ -247,12 +299,16 @@ int run_genotype_command(const std::vector<std::string>& args) {
                  "% of bubble alleles recoverable; " +
                  std::to_string(static_cast<long>(100.0 * rep2.singleton_mass + 0.5)) +
                  "% of (haplotype, bubble) cells hold a private allele");
+        write_linkage_audit(out_prefix, panel_graph, chain, blocks, rep2);
+        }
+
         ReadPanel read_panel;
         const std::vector<BlockMarkerStats> bstats =
             build_block_marker_panel(chain, blocks, options,
-                                     read_paths.empty() ? nullptr : &read_panel,
-                                     read_paths.empty() ? nullptr : &panel_graph);
-        {
+                                     (read_paths.empty() && index_out.empty()) ? nullptr : &read_panel,
+                                     (read_paths.empty() && index_out.empty()) ? nullptr : &panel_graph,
+                                     want_audit_stats);
+        if (want_audit_stats) {
             double tot = 0.0; std::size_t inf_n = 0, inf_e = 0, over = 0, maxmult = 0;
             double mass_n = 0.0, mass_e = 0.0; std::size_t hap_tot = 0;
             for (const BlockMarkerStats& b : bstats) {
@@ -273,6 +329,24 @@ int run_genotype_command(const std::vector<std::string>& args) {
                      std::to_string(maxmult) + "; marker scoring took " +
                      std::to_string(static_cast<long>(tot * 1000.0)) + " ms of CPU");
             write_block_marker_audit(out_prefix, bstats);
+        }
+
+        if (!index_out.empty()) {
+            GenotypeIndex idx;
+            idx.chain = chain;
+            idx.blocks = blocks;
+            for (BlockAlleles& b : idx.blocks) b.allele_seq.clear();   // not needed to genotype
+            idx.panel = read_panel;
+            idx.kmer_size = options.kmer_size;
+            idx.syncmer_s = read_panel.syncmer_s;
+            for (const PathRecord& p : panel_graph.paths) idx.haplotype_names.push_back(p.name);
+            write_genotype_index(index_out, idx);
+            log.info("index: " + std::to_string(idx.chain.size()) + " blocks, " +
+                     std::to_string(idx.haplotype_names.size()) + " haplotypes, " +
+                     std::to_string(idx.panel.node_codes.size()) + " markers");
+            log.wrote({index_out});
+            log.done();
+            return 0;
         }
 
         if (!read_paths.empty()) {
@@ -419,15 +493,16 @@ int run_genotype_command(const std::vector<std::string>& args) {
             }
         }
 
+        if (want_audit_stats) {
         const NoveltyReport nov = measure_novelty(chain, blocks, options.kmer_size, options.syncmer_s);
         log.info("private bubble alleles: " + std::to_string(nov.private_alleles) + "; syncmer content reused elsewhere in the block " +
                  std::to_string(static_cast<long>(100.0 * nov.mean_syncmer_reuse + 0.5)) + "%, adjacencies " +
                  std::to_string(static_cast<long>(100.0 * nov.mean_adjacency_reuse + 0.5)) + "%; " +
                  std::to_string(nov.fully_reusable) + " are pure rearrangements, " +
                  std::to_string(nov.with_novel_sequence) + " carry novel sequence");
-        write_linkage_audit(out_prefix, panel_graph, chain, blocks, rep2);
         log.wrote({out_prefix + ".audit.blocks.tsv", out_prefix + ".audit.linkage.tsv",
                    out_prefix + ".audit.blockmarkers.tsv"});
+        }
         if (!read_paths.empty()) {
             log.wrote({out_prefix + ".reads.depth.tsv", out_prefix + ".genotypes.tsv",
                        out_prefix + ".haplotypes.tsv"});

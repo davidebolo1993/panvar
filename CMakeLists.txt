@@ -121,6 +121,7 @@ add_library(panvarlib
     src/syncmer.cpp
     src/genotype.cpp
     src/genotype_blocks.cpp
+    src/genotype_index.cpp
     src/genotype_markers.cpp
     src/genotype_reads.cpp
     src/bubble_path.cpp
