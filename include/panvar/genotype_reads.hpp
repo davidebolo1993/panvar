@@ -22,6 +22,7 @@ struct AlleleMarkerSet {
 struct ReadPanel {
     std::size_t kmer_size = 31;
     std::size_t syncmer_s = 0;
+    bool all_kmers = false;
     std::vector<std::uint64_t> node_codes;                  // slot -> canonical syncmer code
     std::vector<std::uint64_t> edge_keys;                   // slot -> adjacency key
     std::vector<std::vector<AlleleMarkerSet>> by_block;     // [block][allele]

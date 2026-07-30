@@ -73,6 +73,8 @@ void print_genotype_help() {
         << "                              (default 0 = no cap). Capping discards the copy-number\n"
         << "                              signal a tandem array carries: at LPA's KIV-2 block a cap\n"
         << "                              of 3 cuts median allele separation from 261 to 48\n"
+        << "      --all-kmers             Use every k-mer instead of the ~17%% closed-syncmer sample\n"
+        << "                              (~6x more markers, ~6x the memory and time)\n"
         << "      --no-region-unique      Skip the region-uniqueness filter (diagnostic)\n"
         << "      --max-dense-alleles <N> Above N alleles in a block, score pairwise separation with\n"
         << "                              an O(n) sparse accumulator instead of the O(n^2) dense one\n"
@@ -148,6 +150,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--min-markers") options.min_markers = cli::parse_size_arg(arg, require_value(arg));
         else if (arg == "--max-multiplicity") options.max_multiplicity = cli::parse_size_arg(arg, require_value(arg));
         else if (arg == "--no-region-unique") options.require_region_unique = false;
+        else if (arg == "--all-kmers") options.all_kmers = true;
         else if (arg == "--max-dense-alleles") options.max_dense_alleles = cli::parse_size_arg(arg, require_value(arg));
         else if (arg == "--sep-top-k") options.sep_top_k = cli::parse_size_arg(arg, require_value(arg));
         else if (arg == "-t" || arg == "--threads") options.threads = cli::parse_size_arg(arg, require_value(arg));

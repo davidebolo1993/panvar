@@ -42,8 +42,10 @@ struct AlleleInventory {
     std::size_t syncmers_total = 0;
 };
 
-void collect_inventory(const std::string& seq, std::size_t k, std::size_t s, AlleleInventory& inv) {
-    const std::vector<KmerOccurrence> sy = collect_syncmers(seq, k, s);
+void collect_inventory(const std::string& seq, std::size_t k, std::size_t s, AlleleInventory& inv,
+                       bool all_kmers = false) {
+    const std::vector<KmerOccurrence> sy =
+        all_kmers ? collect_canonical_kmer_occurrences(seq, k) : collect_syncmers(seq, k, s);
     inv.bp = seq.size();
     inv.syncmers_total = sy.size();
     for (const KmerOccurrence& o : sy) ++inv.nodes[o.code];
@@ -601,7 +603,7 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
 
         std::vector<AlleleInventory> inv(B.allele_seq.size());
         for (std::size_t ai = 0; ai < B.allele_seq.size(); ++ai) {
-            collect_inventory(B.allele_seq[ai], k, s, inv[ai]);
+            collect_inventory(B.allele_seq[ai], k, s, inv[ai], options.all_kmers);
             for (const auto& [c, mult] : inv[ai].nodes) {
                 (void)c;
                 st.max_marker_multiplicity_seen = std::max<std::size_t>(st.max_marker_multiplicity_seen, mult);
@@ -659,6 +661,7 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
     if (out_panel != nullptr) {
         out_panel->kmer_size = k;
         out_panel->syncmer_s = s;
+        out_panel->all_kmers = options.all_kmers;
         out_panel->by_block.assign(chain.size(), {});
         out_panel->anchor_slots.assign(chain.size(), {});
         std::unordered_map<std::uint64_t, std::uint32_t> node_slot;
@@ -787,7 +790,8 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
             std::mutex mu;
             run_parallel(graph.paths.size(), options.threads, [&](std::size_t pi) {
                 const std::string seq = spell_path_steps_sequence(graph, graph.paths[pi].steps);
-                const std::vector<KmerOccurrence> sy = collect_syncmers(seq, k, s);
+                const std::vector<KmerOccurrence> sy = options.all_kmers
+                    ? collect_canonical_kmer_occurrences(seq, k) : collect_syncmers(seq, k, s);
                 std::unordered_map<std::uint32_t, std::uint32_t> local;
                 std::unordered_map<std::uint32_t, std::uint32_t> elocal;
                 for (const KmerOccurrence& o : sy) {

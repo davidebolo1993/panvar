@@ -92,7 +92,8 @@ ReadCounts count_reads(
                     for (const std::string& r : batch) {
                         ++local.reads;
                         local.bases += r.size();
-                        const std::vector<KmerOccurrence> sy = collect_syncmers(r, k, s);
+                        const std::vector<KmerOccurrence> sy = panel.all_kmers
+                            ? collect_canonical_kmer_occurrences(r, k) : collect_syncmers(r, k, s);
                         local.syncmers += sy.size();
                         for (const KmerOccurrence& o : sy) {
                             const auto it = node_slot.find(o.code);

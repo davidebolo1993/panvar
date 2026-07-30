@@ -31,6 +31,10 @@ struct MarkerOptions {
     MarkerRule rule = MarkerRule::Panvar;
     std::size_t kmer_size = 31;
     std::size_t syncmer_s = 0;              // 0 = auto (default_syncmer_s)
+    // Closed syncmers sample ~17% of positions. Using every k-mer gives ~6x more markers at ~6x the
+    // memory and time; whether that helps depends on whether a block is marker-poor because markers
+    // are sparse (density helps) or because they are ambiguous across blocks (density does not).
+    bool all_kmers = false;
     std::size_t min_markers = 10;           // per-allele "green" threshold
     std::size_t max_multiplicity = 0;       // 0 = no cap; multiplicity IS the copy-number signal
     bool require_region_unique = true;

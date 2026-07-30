@@ -344,15 +344,19 @@ std::vector<BlockCall> genotype_sample(
                                         static_cast<std::size_t>(yi - kept[bi].begin())];
         }
 
-        // Filter order matters. A block with no surviving markers carries no evidence either way, so
-        // it is a no-call rather than an off-panel signal -- `explained` is undefined there, and
-        // flagging it OFFPANEL would claim the sample has sequence the panel lacks on no data at all.
+        // A block with no markers of its own is NOT evidence-free: the forward-backward carries the
+        // haplotype assignment in from its neighbours, which is the whole point of chaining blocks.
+        // On ankrd36c only the two flank blocks retain markers after region uniqueness, yet all 23
+        // blocks are called correctly from linkage alone -- so treating "no local markers" as a
+        // no-call discarded 21 correct calls. Such blocks are marked LINKED and still face the same
+        // GQ gate, so the user can tell locally-supported calls from inherited ones.
+        // `explained` is undefined without local markers, so the off-panel test is skipped there
+        // rather than being read as "the panel explains none of this".
         const bool has_markers = c.n_markers > 0;
         const bool measurable = has_markers && obs_universe_of[bi] >= 1.0;
-        if (!has_markers) { c.filter = "NOMARKERS"; ++nocall; }
-        else if (measurable && c.explained < options.min_explained) { c.filter = "OFFPANEL"; ++offpanel; }
+        if (measurable && c.explained < options.min_explained) { c.filter = "OFFPANEL"; ++offpanel; }
         else if (c.gq < options.min_gq) { c.filter = "LOWGQ"; ++nocall; }
-        else { ++called; gq_sum += c.gq; }
+        else { c.filter = has_markers ? "PASS" : "LINKED"; ++called; gq_sum += c.gq; }
     }
 
     if (summary != nullptr) {
