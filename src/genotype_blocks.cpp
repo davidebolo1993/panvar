@@ -26,17 +26,30 @@ BlockAlleles group_by_sequence(
     out.n_walk_alleles = n_walk_alleles;
     std::unordered_map<std::string, std::size_t> seq_to_allele;
     for (std::size_t i = 0; i < hap_names.size(); ++i) {
-        if (seqs[i].empty()) continue;
-        auto it = seq_to_allele.find(seqs[i]);
         std::size_t ai;
-        if (it == seq_to_allele.end()) {
-            ai = out.allele_haplotypes.size();
-            seq_to_allele.emplace(seqs[i], ai);
-            out.allele_haplotypes.push_back(0);
-            out.allele_bp.push_back(seqs[i].size());
-            out.allele_seq.push_back(seqs[i]);
+        if (seqs[i].empty()) {
+            // Bypass: this haplotype does not walk the block at all. Give it a shared allele of its
+            // own rather than dropping it, so a haplotype whose deletion removed the block's own
+            // boundary nodes stays representable instead of resolving to "missing" at every block.
+            if (out.bypass_allele < 0) {
+                out.bypass_allele = static_cast<int>(out.allele_haplotypes.size());
+                out.allele_haplotypes.push_back(0);
+                out.allele_bp.push_back(0);
+                out.allele_seq.emplace_back();
+            }
+            ai = static_cast<std::size_t>(out.bypass_allele);
         } else {
-            ai = it->second;
+            auto it = seq_to_allele.find(seqs[i]);
+            if (it == seq_to_allele.end()) {
+                ai = out.allele_haplotypes.size();
+                seq_to_allele.emplace(seqs[i], ai);
+                out.allele_haplotypes.push_back(0);
+                out.allele_bp.push_back(seqs[i].size());
+                out.allele_seq.push_back(seqs[i]);
+            } else {
+                ai = it->second;
+            }
+            ++out.n_traversing;
         }
         ++out.allele_haplotypes[ai];
         out.allele_of.emplace(hap_names[i], ai);

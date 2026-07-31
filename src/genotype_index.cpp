@@ -7,7 +7,7 @@
 namespace panvar {
 namespace {
 
-constexpr char kMagic[8] = {'p', 'v', 'g', 't', 'i', 'd', 'x', '2'};
+constexpr char kMagic[8] = {'p', 'v', 'g', 't', 'i', 'd', 'x', '3'};
 
 template <typename T>
 void put(std::ostream& o, const T& v) {
@@ -71,6 +71,8 @@ void write_genotype_index(const std::string& path, const GenotypeIndex& index) {
         put<std::uint64_t>(o, b.block_index);
         put<std::uint64_t>(o, b.n_alleles);
         put<std::uint64_t>(o, b.n_walk_alleles);
+        put<std::int64_t>(o, b.bypass_allele);
+        put<std::uint64_t>(o, b.n_traversing);
         put_vec(o, b.allele_haplotypes);
         put_vec(o, b.allele_bp);
         put<std::uint64_t>(o, b.allele_of.size());
@@ -129,6 +131,9 @@ GenotypeIndex read_genotype_index(const std::string& path) {
         get(i, v); b.block_index = v;
         get(i, v); b.n_alleles = v;
         get(i, v); b.n_walk_alleles = v;
+        std::int64_t bp = -1;
+        get(i, bp); b.bypass_allele = static_cast<int>(bp);
+        get(i, v); b.n_traversing = v;
         get_vec(i, b.allele_haplotypes);
         get_vec(i, b.allele_bp);
         get(i, v);

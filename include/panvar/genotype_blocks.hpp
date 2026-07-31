@@ -37,6 +37,14 @@ struct BlockAlleles {
     std::vector<std::size_t> allele_bp;               // per allele: spelled length
     std::unordered_map<std::string, std::size_t> allele_of;  // haplotype name -> allele index
     std::vector<std::string> allele_seq;                     // representative sequence per allele
+    // A haplotype that does not traverse the block is not missing data -- it BYPASSES it, which is a
+    // well-defined state and usually a deletion spanning the site. Treating it as missing makes such a
+    // haplotype unrepresentable at every block whose boundaries the deletion removed, so it can never
+    // be called and never be scored. It gets an allele of its own instead: empty sequence, zero
+    // markers, and therefore an expected read count of zero, which is exactly what a deletion predicts.
+    // -1 when every haplotype traverses.
+    int bypass_allele = -1;
+    std::size_t n_traversing = 0;    // haplotypes that actually walk the block, excluding bypassers
 };
 
 // For alleles carried by exactly one haplotype -- the ones a panel-based model cannot supply -- how

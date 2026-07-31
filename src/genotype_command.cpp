@@ -494,7 +494,11 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         } else {
                             st = interval_interior_steps(*held, idx, chain[bi].source, chain[bi].sink);
                         }
-                        if (!st.has_value() || st->empty()) continue;
+                        if (!st.has_value() || st->empty()) {
+                            // Does not traverse: that is the bypass allele, not missing data.
+                            if (blocks[bi].bypass_allele >= 0) out_alleles[bi] = blocks[bi].bypass_allele;
+                            continue;
+                        }
                         std::string seq = spell_path_steps_sequence(graph, *st);
                         for (std::size_t ai = 0; ai < blocks[bi].allele_seq.size(); ++ai) {
                             if (blocks[bi].allele_seq[ai] == seq) { out_alleles[bi] = static_cast<int>(ai); break; }

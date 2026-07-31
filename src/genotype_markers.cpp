@@ -771,8 +771,13 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
                         slot_for(edge_slot, out_panel->edge_keys, c), mult);
                 }
             }
+            // A bypass allele spells nothing, so it carries no marker and would make "carried by every
+            // allele" unsatisfiable -- the block would lose all its depth anchors. Anchors are about
+            // coverage of the sequence that IS there, so measure them over the traversing alleles.
+            const std::size_t n_real =
+                inv.size() - (blocks[bi].bypass_allele >= 0 && inv.size() > 0 ? 1u : 0u);
             for (const auto& [c, n] : seen) {
-                if (n == inv.size() && mult_of[c] == 1) {
+                if (n == n_real && n_real > 0 && mult_of[c] == 1) {
                     out_panel->anchor_slots[bi].push_back(slot_for(node_slot, out_panel->node_codes, c));
                 }
             }
@@ -926,7 +931,9 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
                 // old bound degenerated to "seen more than once per haplotype on average". An anchor is
                 // carried by every allele of its block at multiplicity 1, so the panel should show it
                 // exactly once per traversing haplotype.
-                const std::uint64_t anchor_expected = blocks[bi].allele_of.size();
+                // Expect an anchor once per TRAVERSING haplotype; bypassers contribute no reads here.
+                const std::uint64_t anchor_expected =
+                    blocks[bi].n_traversing > 0 ? blocks[bi].n_traversing : blocks[bi].allele_of.size();
                 auto& anch = out_panel->anchor_slots[bi];
                 anch.erase(std::remove_if(anch.begin(), anch.end(),
                                           [&](std::uint32_t slot) {
