@@ -232,6 +232,17 @@ def main():
             out.append("".join(u))
         return out
 
+    # Near-twin mode: give the "b" copy a different allele at a few SNP sites, so holding out a
+    # sample leaves a haplotype that is CLOSE but not identical. The right answer is then no longer an
+    # exact allele match -- it is the most similar allele available -- which is the realistic case.
+    twin_snp = {}
+    if args.twin_divergence > 0:
+        trng = random.Random(args.seed * 31337)
+        for d in range(args.designs):
+            for p_ in trng.sample(snp_pos, min(args.twin_divergence, len(snp_pos))):
+                cur_b = designs[d]["snp"][p_]
+                twin_snp[(f"design{d}#b", p_)] = trng.choice([x for x in "ACGT" if x != cur_b])
+
     # ---- graph -----------------------------------------------------------------------------
     # Walk the backbone left to right emitting shared nodes, one bubble per SNP position, and the four
     # SV structures. Node ids are assigned in reference order, which is what the downstream sort assumes.
@@ -290,13 +301,14 @@ def main():
             push(here, nid)
         elif kind == "snp":
             p = payload
-            bases = sorted({designs[d]["snp"][p] for d in range(args.designs)} | {backbone[p]})
+            bases = sorted({designs[d]["snp"][p] for d in range(args.designs)} | {backbone[p]}
+                           | {v for (h, q), v in twin_snp.items() if q == p})
             ids = {b: add_node(b) for b in bases}
             ref_walk.append((ids[backbone[p]], "+"))
             for d in range(args.designs):
                 for h in (f"design{d}#a", f"design{d}#b"):
                     if h in here:
-                        push([h], ids[designs[d]["snp"][p]])
+                        push([h], ids[twin_snp.get((h, p), designs[d]["snp"][p])])
         else:
             if payload in ("DEL", "DEL2"):
                 p0 = DEL_POS if payload == "DEL" else DEL2_POS

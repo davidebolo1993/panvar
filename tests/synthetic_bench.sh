@@ -102,4 +102,17 @@ done
 echo
 echo "TOTAL leave-zero-out: blocks $lz_ok/$lz_tot, bubbles $lzb_ok/$lzb_tot"
 echo "TOTAL leave-one-out : blocks $lo_ok/$lo_tot, bubbles $lob_ok/$lob_tot"
-echo "(both should be 100% -- the twins guarantee the panel can represent the sample exactly)"
+echo "(with exact twins both should be 100% -- the panel can represent the sample exactly)"
+
+# With --twin-divergence the sample's allele may be absent from the panel, so exact match is the wrong
+# test: the right answer is the most similar allele available. The identity oracle answers that
+# directly -- rank 1 means we chose it.
+if [[ -s "$OUT/gt_lo.accuracy.tsv" ]]; then
+  awk -F'\t' 'NR>1 && $14 > 0 && $15 > 0 {
+      n += 2; if ($14 == 1) k++; if ($15 == 1) k++
+      if ($10 > 0) { gap += $10 - ($12 + $13) / 2; g++ }
+    } END {
+      if (n) printf "ORACLE (last pair): picked the most similar available allele in %d/%d haplotype-blocks (%.0f%%)\n", k, n, 100*k/n
+      if (g) printf "                    mean identity shortfall against the best available: %.6f\n", gap/g
+    }' "$OUT/gt_lo.accuracy.tsv"
+fi
