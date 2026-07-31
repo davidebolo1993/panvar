@@ -63,6 +63,12 @@ void print_genotype_help() {
         << "                              multiplicity inside them\n"
         << "      --fragment-len <N>      Library fragment length, used to discount correlated\n"
         << "                              markers when computing GQ (default 350; 0 disables)\n"
+        << "      --carrier-weight <b>    Down-weight markers by how many of the block's alleles\n"
+        << "                              carry them: weight = (n_alleles/carriers)^b, mean 1.\n"
+        << "                              At blocks with hundreds of alleles the set is swamped\n"
+        << "                              by markers shared across many of them, which\n"
+        << "                              discriminate little but outvote the specific ones.\n"
+        << "                              0 (default) disables\n"
         << "      --recomb-rate <x>       Li-Stephens switch scaling; 1.0 (default) is about one\n"
         << "                              expected haplotype switch across the locus. Raising it\n"
         << "                              makes blocks nearly independent, lowering it locks the\n"
@@ -134,6 +140,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
     std::size_t max_alleles = 64;
     double fragment_len = 350.0;
     double recomb_rate = 1.0;
+    double carrier_weight = 0.0;
     bool provenance = false;
     double uneven_tolerance = 0.35;
     bool quiet = false;
@@ -169,6 +176,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--max-alleles") max_alleles = cli::parse_size_arg(arg, require_value(arg));
         else if (arg == "--fragment-len") fragment_len = std::stod(require_value(arg));
         else if (arg == "--recomb-rate") recomb_rate = std::stod(require_value(arg));
+        else if (arg == "--carrier-weight") carrier_weight = std::stod(require_value(arg));
         else if (arg == "--provenance") provenance = true;
         else if (arg == "-k" || arg == "--kmer-size") options.kmer_size = cli::parse_size_arg(arg, require_value(arg));
         else if (arg == "--syncmer-s") options.syncmer_s = cli::parse_size_arg(arg, require_value(arg));
@@ -436,6 +444,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
             gopt.fragment_len = fragment_len;
             gopt.provenance = provenance;
             gopt.recomb_rate = recomb_rate;
+            gopt.carrier_weight = carrier_weight;
             GenotypeSummary gsum;
             std::vector<int> ta1;
             std::vector<int> ta2;
@@ -573,7 +582,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     std::ofstream acc(acc_path);
                     acc << "block_index\tblock_kind\tbubble_id\tn_alleles\trepresentable\texact\t"
                            "dbp\tbest_dbp\tidentity\tbest_identity\toracle_rank\tid_h1\tid_h2\trank_h1\trank_h2"
-                           "\tqv\ttrue_bp\tcalled_bp\tfilter\n";
+                           "\tcross_c1t2\tcross_c2t1\tqv\ttrue_bp\tcalled_bp\tfilter\n";
                     // Identity oracle: the most similar allele the panel could have offered. `best_dbp`
                     // only says some allele matched the truth's LENGTH, which among hundreds of alleles
                     // happens by coincidence -- it cannot distinguish "the panel had nothing better"
@@ -717,7 +726,15 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             << (repr ? 1 : 0) << '\t' << (exact ? 1 : 0) << '\t'
                             << dbp << '\t' << best << '\t' << (idsum / 2.0) << '\t' << best_id << '\t'
                             << oracle_rank << '\t' << id_h0 << '\t' << id_h1 << '\t'
-                            << rank_h0 << '\t' << rank_h1 << '\t' << (qvsum / 2.0) << '\t'
+                            << rank_h0 << '\t' << rank_h1 << '\t'
+                            // Both called alleles matching the SAME truth haplotype is the failure a
+                            // per-haplotype identity cannot show: distinct allele indices can still be
+                            // near-identical sequence, leaving the other haplotype unexplained.
+                            << (1.0 - static_cast<double>(nwm[0][1].edits) /
+                                    static_cast<double>(std::max<std::size_t>(1, nwm[0][1].aln_len))) << '\t'
+                            << (1.0 - static_cast<double>(nwm[1][0].edits) /
+                                    static_cast<double>(std::max<std::size_t>(1, nwm[1][0].aln_len))) << '\t'
+                            << (qvsum / 2.0) << '\t'
                             << tbp << '\t' << cbp << '\t' << calls[bi].filter << '\n';
                         id_sum += idsum / 2.0; qv_sum += qvsum / 2.0; ++graded;
                         dbp_sum += dbp; best_sum += best;

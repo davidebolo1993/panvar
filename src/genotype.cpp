@@ -120,6 +120,30 @@ std::vector<BlockCall> genotype_sample(
         }
         std::sort(universe.begin(), universe.end());
         universe.erase(std::unique(universe.begin(), universe.end()), universe.end());
+        // How many of this block's alleles carry each marker -- the basis of the specificity weight.
+        std::unordered_map<std::uint32_t, std::uint32_t> carriers;
+        for (const auto& mset : panel.by_block[bi]) {
+            for (const auto& [slot, mult] : mset.nodes) { (void)mult; ++carriers[slot]; }
+        }
+        std::unordered_map<std::uint32_t, double> wt;
+        if (options.carrier_weight > 0.0 && !universe.empty()) {
+            const double na = static_cast<double>(std::max<std::size_t>(1, panel.by_block[bi].size()));
+            double sum = 0.0;
+            for (const std::uint32_t slot : universe) {
+                const double c = static_cast<double>(std::max<std::uint32_t>(1, carriers[slot]));
+                const double w = std::pow(na / c, options.carrier_weight);
+                wt[slot] = w;
+                sum += w;
+            }
+            const double scale = static_cast<double>(universe.size()) / std::max(1e-12, sum);
+            for (auto& [slot, w] : wt) { (void)slot; w *= scale; }
+        }
+        auto weight_of = [&](std::uint32_t slot) {
+            if (wt.empty()) return 1.0;
+            const auto it = wt.find(slot);
+            return it == wt.end() ? 1.0 : it->second;
+        };
+
         double baseline = 0.0;
         double obs_universe = 0.0;
         for (const std::uint32_t slot : universe) {
@@ -156,7 +180,7 @@ std::vector<BlockCall> genotype_sample(
                 double obs_in = 0.0;
                 for (const auto& [slot, m] : tot) {
                     const double o = static_cast<double>(counts.node[slot]);
-                    ll += log_nb(o, lambda * m + mu, phi) - log_nb(o, mu, phi);
+                    ll += weight_of(slot) * (log_nb(o, lambda * m + mu, phi) - log_nb(o, mu, phi));
                     obs_in += o;
                 }
                 emis[bi][x * kn + y] = baseline + rho * ll;

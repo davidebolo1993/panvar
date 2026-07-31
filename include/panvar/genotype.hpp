@@ -21,6 +21,12 @@ struct GenotypeOptions {
     double min_gq = 20.0;
     double min_explained = 0.5;        // below this, the panel does not account for what was observed
     std::size_t max_alleles_per_block = 64;   // prune by detected-marker fraction before pairing
+    // Down-weight markers by how many of the block's alleles carry them. At a block with hundreds of
+    // alleles the marker set is swamped by markers shared across many of them: one carried by 200 of
+    // 450 discriminates almost nothing, yet thousands of such terms outvote the few allele-specific
+    // ones. Weight = (n_alleles / carriers)^beta, renormalized to mean 1 so the likelihood scale (and
+    // with it the ESS discount and GQ) stays comparable. 0 disables.
+    double carrier_weight = 0.0;
     // Attribute each call to the blocks that determined it. Costs one extra forward-backward pass per
     // block plus a cache of every block's emissions (n_blocks * n_haplotypes^2 doubles), so it is a
     // diagnostic rather than something to leave on for a cohort.
