@@ -739,7 +739,10 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
             for (const auto& [c, n] : eseen) {
                 if (n < inv.size() || emult[c] == 0xffffffffu) ++evary_blocks[c];
             }
+            const bool presence_only =
+                options.rule == MarkerRule::Mixed && chain[bi].kind != BlockKind::Bubble;
             auto informative_node = [&](std::uint64_t c) {
+                if (presence_only) return seen[c] < inv.size();   // presence varies; ignore counts
                 if (options.rule == MarkerRule::PanGenie) {
                     // unique to a single allele, and occurring exactly once within it
                     return seen[c] == 1 && mult_of[c] == 1;
@@ -756,8 +759,9 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
                 for (const auto& [c, mult] : inv[ai].nodes) {
                     if (!informative_node(c)) continue;
                     // PanGenie stores presence, not count: an allele either has the k-mer or not.
-                    const std::uint32_t stored = options.rule == MarkerRule::PanGenie
-                                                     ? std::min<std::uint32_t>(mult, 1) : mult;
+                    const std::uint32_t stored =
+                        (options.rule == MarkerRule::PanGenie || presence_only)
+                            ? std::min<std::uint32_t>(mult, 1) : mult;
                     out_panel->by_block[bi][ai].nodes.emplace_back(
                         slot_for(node_slot, out_panel->node_codes, c), stored);
                 }

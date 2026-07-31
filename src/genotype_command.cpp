@@ -58,7 +58,9 @@ void print_genotype_help() {
         << "      --marker-rule <r>       panvar (default) = keep markers whose multiplicity varies\n"
         << "                              across alleles; unique = carried by exactly one allele (any\n"
         << "                              copy number); pangenie = unique AND occurring once,\n"
-        << "                              presence/absence only (PanGenie's actual rule)\n"
+        << "                              presence/absence only (PanGenie's actual rule);\n"
+        << "                              mixed = presence/absence outside bubbles,\n"
+        << "                              multiplicity inside them\n"
         << "      --fragment-len <N>      Library fragment length, used to discount correlated\n"
         << "                              markers when computing GQ (default 350; 0 disables)\n"
         << "      --recomb-rate <x>       Li-Stephens switch scaling; 1.0 (default) is about one\n"
@@ -161,7 +163,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
             const std::string v = require_value(arg);
             if (v == "pangenie") options.rule = MarkerRule::PanGenie;
             else if (v == "unique") options.rule = MarkerRule::Unique;
-            else if (v != "panvar") throw std::runtime_error("genotype: --marker-rule must be panvar|unique|pangenie");
+            else if (v == "mixed") options.rule = MarkerRule::Mixed;
+            else if (v != "panvar") throw std::runtime_error("genotype: --marker-rule must be panvar|unique|pangenie|mixed");
         }
         else if (arg == "--max-alleles") max_alleles = cli::parse_size_arg(arg, require_value(arg));
         else if (arg == "--fragment-len") fragment_len = std::stod(require_value(arg));

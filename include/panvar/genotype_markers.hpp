@@ -25,7 +25,10 @@ namespace panvar {
 //   Panvar   - multiplicity varies across the block's alleles (permissive)
 //   Unique   - carried by exactly ONE allele, any multiplicity
 //   PanGenie - carried by exactly one allele AND occurring exactly once in it, presence/absence
-enum class MarkerRule { Panvar, Unique, PanGenie };
+//   Mixed    - presence/absence outside bubbles, multiplicity inside them. The blocks have different
+//              jobs: backbones and flanks exist to identify which haplotypes the sample is on, where
+//              presence is enough, while copy number is the signal a bubble is meant to carry.
+enum class MarkerRule { Panvar, Unique, PanGenie, Mixed };
 
 struct MarkerOptions {
     MarkerRule rule = MarkerRule::Panvar;
