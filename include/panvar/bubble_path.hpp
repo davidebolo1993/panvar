@@ -51,6 +51,18 @@ std::optional<std::vector<PathStep>> interval_steps(
     const std::string& from_node,
     const std::string& to_node);
 
+// The same interval with both boundary nodes removed. A bubble owns its source and sink -- they are
+// its anchors, and `bubble_steps` returns them -- so a backbone stretch that also included them would
+// put the same sequence in two blocks. That is not cosmetic: blocks are meant to TILE the haplotype,
+// and marker confinement drops anything varying in more than one block, so a shared boundary node
+// silently destroys the markers of both blocks that touch it. Returns nullopt when nothing lies
+// strictly between the boundaries.
+std::optional<std::vector<PathStep>> interval_interior_steps(
+    const PathRecord& path,
+    const BubblePathIndex& index,
+    const std::string& from_node,
+    const std::string& to_node);
+
 // Steps of `path` on one side of a single boundary node: the stretch before the first bubble or
 // after the last. Orientation is taken from how the path traverses the boundary itself, so a path
 // running through the graph backwards still yields a reference-oriented flank. `leading` selects the

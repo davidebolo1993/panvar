@@ -492,7 +492,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             const bool leading = chain[bi].source.empty();
                             st = flank_steps(*held, idx, leading ? chain[bi].sink : chain[bi].source, leading);
                         } else {
-                            st = interval_steps(*held, idx, chain[bi].source, chain[bi].sink);
+                            st = interval_interior_steps(*held, idx, chain[bi].source, chain[bi].sink);
                         }
                         if (!st.has_value() || st->empty()) continue;
                         std::string seq = spell_path_steps_sequence(graph, *st);

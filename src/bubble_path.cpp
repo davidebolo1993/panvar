@@ -216,6 +216,17 @@ std::optional<std::vector<PathStep>> interval_steps(
     return out;
 }
 
+std::optional<std::vector<PathStep>> interval_interior_steps(
+    const PathRecord& path,
+    const BubblePathIndex& index,
+    const std::string& from_node,
+    const std::string& to_node) {
+
+    auto full = interval_steps(path, index, from_node, to_node);
+    if (!full.has_value() || full->size() <= 2) return std::nullopt;
+    return std::vector<PathStep>(full->begin() + 1, full->end() - 1);
+}
+
 std::optional<std::vector<PathStep>> flank_steps(
     const PathRecord& path,
     const BubblePathIndex& index,

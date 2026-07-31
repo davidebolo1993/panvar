@@ -145,7 +145,7 @@ BlockAlleles enumerate_block_alleles(
             steps = flank_steps(graph.paths[pi], path_indexes[pi],
                                 leading ? block.sink : block.source, leading);
         } else {
-            steps = interval_steps(graph.paths[pi], path_indexes[pi], block.source, block.sink);
+            steps = interval_interior_steps(graph.paths[pi], path_indexes[pi], block.source, block.sink);
         }
         if (!steps.has_value() || steps->empty()) return;
         seqs[pi] = spell_path_steps_sequence(graph, *steps);
