@@ -687,6 +687,12 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
         // different problem from one that loses them to many.
         std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> vary_where;
         std::unordered_map<std::uint64_t, std::uint32_t> vary_blocks;
+        // Blocks a marker OCCURS in at all, varying or not. Anchors are constant-multiplicity by
+        // construction, so they never appear in vary_blocks and the vary-based confinement test can
+        // never fire for them -- an anchor sitting in duplicated sequence keeps the read counts
+        // contributed by every copy, and since a block may have only a few hundred anchors, a
+        // duplication-biased subset drags the depth median with it.
+        std::unordered_map<std::uint64_t, std::uint32_t> occ_blocks;
         std::unordered_map<std::uint64_t, std::uint32_t> evary_blocks;
         for (std::size_t bi = 0; bi < chain.size(); ++bi) {
             const std::vector<AlleleInventory>& inv = kept_inv[bi];
@@ -720,6 +726,10 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
                 }
             }
             // Rule-independent: where does this marker's count depend on the genotype at all?
+            for (const auto& [c, n] : seen) {
+                (void)n;
+                ++occ_blocks[c];
+            }
             for (const auto& [c, n] : seen) {
                 if (n < inv.size() || mult_of[c] == 0xffffffffu) {
                     ++vary_blocks[c];
@@ -907,11 +917,18 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
                         mset.edges.end());
                     dropped += ebefore - mset.edges.size();
                 }
+                // Anchors need the OCCURRENCE-based test, not the vary-based one, and an expectation
+                // of their own: they are absent from `by_block`, so `expected` is zero for them and the
+                // old bound degenerated to "seen more than once per haplotype on average". An anchor is
+                // carried by every allele of its block at multiplicity 1, so the panel should show it
+                // exactly once per traversing haplotype.
+                const std::uint64_t anchor_expected = blocks[bi].allele_of.size();
                 auto& anch = out_panel->anchor_slots[bi];
                 anch.erase(std::remove_if(anch.begin(), anch.end(),
                                           [&](std::uint32_t slot) {
-                                              return blocks_with[slot] > 1 ||
-                                                     actual[slot] > expected[slot] + graph.paths.size();
+                                              const auto it = occ_blocks.find(out_panel->node_codes[slot]);
+                                              const std::uint32_t nb = it == occ_blocks.end() ? 0 : it->second;
+                                              return nb > 1 || actual[slot] > anchor_expected;
                                           }),
                            anch.end());
             }
