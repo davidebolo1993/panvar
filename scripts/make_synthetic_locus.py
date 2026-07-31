@@ -60,6 +60,17 @@ def main():
     ap.add_argument("--designs", type=int, default=8)
     ap.add_argument("--snps", type=int, default=60,
                     help="SNP sites, shared positions with per-design alleles")
+    ap.add_argument("--dup-unit-bp", type=int, default=500,
+                    help="tandem repeat unit length. Raise it with --dup-max-cn for a VNTR-scale array "
+                         "like LPA's KIV-2 or ANKRD36C's, where copy number IS the variant and marker "
+                         "multiplicity is the only signal that can measure it.")
+    ap.add_argument("--dup-min-cn", type=int, default=1)
+    ap.add_argument("--dup-max-cn", type=int, default=3)
+    ap.add_argument("--paralog-ins", action="store_true",
+                    help="a second insertion site carrying the SAME payload as the first, in a "
+                         "different block, polymorphic independently. The payload's syncmers then "
+                         "occur in both sites and vary in both, so confinement strips them; junction "
+                         "syncmers differ, so the bubble is left partly rather than wholly stripped.")
     ap.add_argument("--paralog-del", action="store_true",
                     help="plant a SECOND deletion site whose sequence (and flanking context) is an "
                          "exact copy of the first, in a different block, polymorphic independently. "
@@ -90,16 +101,19 @@ def main():
     # default 50 kb these are the familiar 8000/18000/28000/38000.
     DEL_POS, DEL_LEN = int(args.backbone_bp * 0.16), 400
     INS_POS, INS_LEN = int(args.backbone_bp * 0.36), 600
-    DUP_POS, DUP_LEN = int(args.backbone_bp * 0.56), 500
+    DUP_POS, DUP_LEN = int(args.backbone_bp * 0.56), args.dup_unit_bp
     INV_POS, INV_LEN = int(args.backbone_bp * 0.76), 700
     ins_payload = random_seq(rng, INS_LEN)
     # The paralogue sits inside the backbone stretch between INS and DUP, i.e. a different block.
     DEL2_POS = int(args.backbone_bp * 0.46)
+    INS2_POS = int(args.backbone_bp * 0.66)
     PARA_FLANK = 400
     sv_spans = [(DEL_POS, DEL_POS + DEL_LEN), (INS_POS, INS_POS + INS_LEN),
                 (DUP_POS, DUP_POS + DUP_LEN), (INV_POS, INV_POS + INV_LEN)]
     if args.paralog_del:
         sv_spans.append((DEL2_POS, DEL2_POS + DEL_LEN))
+    if args.paralog_ins:
+        sv_spans.append((INS2_POS, INS2_POS + INS_LEN))
 
     def in_sv(p):
         return any(a - 50 <= p < b + 50 for a, b in sv_spans)
@@ -171,9 +185,10 @@ def main():
         designs.append({
             "DEL": (d % 2 == 1),
             "INS": (d // 2) % 2 == 1,
-            "DUP": [1, 2, 3, 2][d % 4],
+            "DUP": args.dup_min_cn + (d % max(1, args.dup_max_cn - args.dup_min_cn + 1)),
             "INV": (d // 4) % 2 == 1,
             "DEL2": (d // 8) % 2 == 1,      # independent of DEL, so the two sites are not correlated
+            "INS2": (d // 16) % 2 == 1,
             "snp": alt,
         })
 
@@ -216,6 +231,8 @@ def main():
                (DUP_POS, "sv", "DUP"), (INV_POS, "sv", "INV")]
     if args.paralog_del:
         events.append((DEL2_POS, "sv", "DEL2"))
+    if args.paralog_ins:
+        events.append((INS2_POS, "sv", "INS2"))
     events.sort()
     for pos, kind, payload in events:
         if pos > cur:
@@ -225,7 +242,8 @@ def main():
             cur = pos + 1
         else:
             segs.append(("sv", payload))
-            cur = pos + (DEL_LEN if payload in ("DEL", "DEL2") else INS_LEN if payload == "INS"
+            cur = pos + (DEL_LEN if payload in ("DEL", "DEL2")
+                         else INS_LEN if payload in ("INS", "INS2")
                          else DUP_LEN if payload == "DUP" else INV_LEN)
     if cur < len(backbone):
         segs.append(("shared", backbone[cur:]))
@@ -263,14 +281,17 @@ def main():
                 for d in range(args.designs):
                     if not designs[d][payload]:
                         push([f"design{d}#a", f"design{d}#b"], nid)
-            elif payload == "INS":
-                base = add_node(backbone[INS_POS:INS_POS + INS_LEN])
+            elif payload in ("INS", "INS2"):
+                p0 = INS_POS if payload == "INS" else INS2_POS
+                base = add_node(backbone[p0:p0 + INS_LEN])
+                # A distinct node carrying IDENTICAL sequence: two independent insertions of the same
+                # payload, which is what makes the payload's syncmers ambiguous between the two sites.
                 alt = add_node(ins_payload)
                 ref_walk.append((base, "+"))
                 for d in range(args.designs):
                     hs = [f"design{d}#a", f"design{d}#b"]
                     push(hs, base)
-                    if designs[d]["INS"]:
+                    if designs[d][payload]:
                         push(hs, alt)
             elif payload == "DUP":
                 # One node per copy index; a haplotype with N copies traverses the first N. Identical
@@ -351,7 +372,10 @@ def main():
     for d in range(args.designs):
         s = designs[d]
         print(f"  design{d}: DEL={int(s['DEL'])} INS={int(s['INS'])} DUP={s['DUP']} "
-              f"INV={int(s['INV'])}  {len(hap_seq[f'design{d}#a'])} bp")
+              f"INV={int(s['INV'])}"
+              + (f" DEL2={int(s['DEL2'])}" if args.paralog_del else "")
+              + (f" INS2={int(s['INS2'])}" if args.paralog_ins else "")
+              + f"  {len(hap_seq[f'design{d}#a'])} bp")
 
 
 if __name__ == "__main__":

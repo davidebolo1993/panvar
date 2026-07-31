@@ -155,14 +155,33 @@ std::vector<BlockDepth> estimate_depth(
         d.uneven = d.median > 0.0 && (d.mad / d.median) > uneven_tolerance;
     }
 
-    // Region-wide fallback for blocks with too few anchors of their own.
+    // Region-wide fallback for blocks with too few anchors of their own, and shrinkage toward it for
+    // the rest.
+    //
+    // A hard threshold is the wrong shape here: a block just over it gets its own noisy estimate at
+    // full weight, a block just under it gets the region estimate at full weight, and the two answers
+    // can differ by a third. That matters most exactly where it hurts most -- a tandem array has few
+    // invariant markers (its unit syncmers vary with copy number, so they are not anchors), so its
+    // depth rests on a handful of flanking anchors, and depth is the denominator that CONVERTS marker
+    // multiplicity into copy number. Measured on a synthetic VNTR: 21 anchors gave lambda 15.5 against
+    // a region-wide 11.5, and the 35% inflation came straight back out as a copy number 35% too low --
+    // 12 true copies called as 9.
+    //
+    // Shrink instead, with a pseudo-count: a block with thousands of anchors keeps its own estimate,
+    // one with a handful is pulled to the region. No cliff, and no tuning of where to put it.
     const double global_median = median_of(all_anchor_counts);
+    constexpr double kPseudoAnchors = 200.0;
     for (BlockDepth& d : out) {
-        if (!d.usable && global_median > 0.0) {
+        if (global_median <= 0.0) continue;
+        if (!d.usable) {
             d.median = global_median;
             d.lambda_hap = global_median / 2.0;
             d.usable = true;
+            continue;
         }
+        const double w = static_cast<double>(d.n_anchor);
+        d.median = (w * d.median + kPseudoAnchors * global_median) / (w + kPseudoAnchors);
+        d.lambda_hap = d.median / 2.0;
     }
     return out;
 }
