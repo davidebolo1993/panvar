@@ -47,9 +47,38 @@ BlockAlleles group_by_sequence(
 
 } // namespace
 
-std::vector<Block> build_block_chain(const std::vector<Bubble>& bubbles) {
+std::vector<Block> build_block_chain(const std::vector<Bubble>& bubbles_in) {
     std::vector<Block> chain;
-    if (bubbles.empty()) return chain;
+    if (bubbles_in.empty()) return chain;
+
+    // Drop bubbles contained in another before anything else. `bubble` may legitimately report both a
+    // container and its children -- `call` needs them, and its DUP detection is built on exactly that --
+    // but a CHAIN is a partition, and a contained bubble puts the same sequence in two blocks. Marker
+    // confinement then drops anything varying in more than one block, so both blocks are stripped bare.
+    // Measured on a synthetic locus with a deliberately planted container: the chain came to 2.29x the
+    // haplotype length and every one of the eight interior blocks lost all its markers. Keeping the
+    // leaves rather than the container preserves the finer decomposition, which is what a panel-based
+    // genotyper needs -- a container spanning tens of kb is near-singleton across the panel and cannot
+    // represent a held-out sample.
+    std::vector<Bubble> bubbles;
+    {
+        std::vector<std::unordered_set<std::string>> inside(bubbles_in.size());
+        for (std::size_t i = 0; i < bubbles_in.size(); ++i) {
+            inside[i].insert(bubbles_in[i].inside.begin(), bubbles_in[i].inside.end());
+        }
+        for (std::size_t i = 0; i < bubbles_in.size(); ++i) {
+            bool contains_another = false;
+            for (std::size_t j = 0; j < bubbles_in.size() && !contains_another; ++j) {
+                if (i == j || inside[j].empty() || inside[j].size() >= inside[i].size()) continue;
+                contains_another = true;
+                for (const std::string& n : inside[j]) {
+                    if (inside[i].count(n) == 0) { contains_another = false; break; }
+                }
+            }
+            if (!contains_another) bubbles.push_back(bubbles_in[i]);
+        }
+        if (bubbles.empty()) bubbles = bubbles_in;   // all mutually contained: keep what we were given
+    }
 
     // Reference order is bubble id order; assert rather than assume, since it only holds for a graph
     // that went through the reference sort.

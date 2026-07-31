@@ -60,6 +60,16 @@ def main():
     ap.add_argument("--designs", type=int, default=8)
     ap.add_argument("--snps", type=int, default=60,
                     help="SNP sites, shared positions with per-design alleles")
+    ap.add_argument("--nested-del", action="store_true",
+                    help="plant a large polymorphic deletion spanning ALL the inner SV sites. It "
+                         "creates a bubble that CONTAINS the others, which is ankrd36c's structure and "
+                         "the case the block chain assumes cannot happen.")
+    ap.add_argument("--twin-divergence", type=int, default=0,
+                    help="SNPs by which a design's second copy differs from its first. 0 (default) "
+                         "makes them exact twins, so leave-one-out has a perfectly representable "
+                         "answer. Raise it to test the realistic case: the sample's own haplotypes are "
+                         "gone and only a NEAR-identical one remains, where the right answer is no "
+                         "longer an exact allele match but the most similar allele available.")
     ap.add_argument("--dup-unit-bp", type=int, default=500,
                     help="tandem repeat unit length. Raise it with --dup-max-cn for a VNTR-scale array "
                          "like LPA's KIV-2 or ANKRD36C's, where copy number IS the variant and marker "
@@ -189,6 +199,7 @@ def main():
             "INV": (d // 4) % 2 == 1,
             "DEL2": (d // 8) % 2 == 1,      # independent of DEL, so the two sites are not correlated
             "INS2": (d // 16) % 2 == 1,
+            "NEST": (d % 5 == 4),          # a minority carry the container deletion
             "snp": alt,
         })
 
@@ -224,7 +235,9 @@ def main():
     # ---- graph -----------------------------------------------------------------------------
     # Walk the backbone left to right emitting shared nodes, one bubble per SNP position, and the four
     # SV structures. Node ids are assigned in reference order, which is what the downstream sort assumes.
-    segs = []          # ("shared", seq) | ("snp", pos) | ("sv", which)
+    NEST_A = DEL_POS - 1000
+    NEST_B = INV_POS + INV_LEN + 1000
+    segs = []          # (start_pos, kind, payload)
     cur = 0
     events = [(p, "snp", p) for p in snp_pos]
     events += [(DEL_POS, "sv", "DEL"), (INS_POS, "sv", "INS"),
@@ -236,17 +249,17 @@ def main():
     events.sort()
     for pos, kind, payload in events:
         if pos > cur:
-            segs.append(("shared", backbone[cur:pos]))
+            segs.append((cur, "shared", backbone[cur:pos]))
         if kind == "snp":
-            segs.append(("snp", pos))
+            segs.append((pos, "snp", pos))
             cur = pos + 1
         else:
-            segs.append(("sv", payload))
+            segs.append((pos, "sv", payload))
             cur = pos + (DEL_LEN if payload in ("DEL", "DEL2")
                          else INS_LEN if payload in ("INS", "INS2")
                          else DUP_LEN if payload == "DUP" else INV_LEN)
     if cur < len(backbone):
-        segs.append(("shared", backbone[cur:]))
+        segs.append((cur, "shared", backbone[cur:]))
 
     nodes = []                 # (id, seq)
     walks = {f"design{d}#{t}": [] for d in range(args.designs) for t in ("a", "b")}
@@ -261,18 +274,29 @@ def main():
             walks[h].append((nid, orient))
 
     all_haps = list(walks.keys())
-    for kind, payload in segs:
+    # Haplotypes carrying the nested deletion skip every segment inside its span, which is what makes
+    # the enclosing bubble contain the inner ones.
+    def carriers(exclude_nested):
+        if not (args.nested_del and exclude_nested):
+            return all_haps
+        return [h for h in all_haps if not designs[int(h.split("#")[0][6:])]["NEST"]]
+
+    for seg_pos, kind, payload in segs:
+        inside_nest = args.nested_del and NEST_A <= seg_pos < NEST_B
+        here = carriers(inside_nest)
         if kind == "shared":
             nid = add_node(payload)
             ref_walk.append((nid, "+"))
-            push(all_haps, nid)
+            push(here, nid)
         elif kind == "snp":
             p = payload
             bases = sorted({designs[d]["snp"][p] for d in range(args.designs)} | {backbone[p]})
             ids = {b: add_node(b) for b in bases}
             ref_walk.append((ids[backbone[p]], "+"))
             for d in range(args.designs):
-                push([f"design{d}#a", f"design{d}#b"], ids[designs[d]["snp"][p]])
+                for h in (f"design{d}#a", f"design{d}#b"):
+                    if h in here:
+                        push([h], ids[designs[d]["snp"][p]])
         else:
             if payload in ("DEL", "DEL2"):
                 p0 = DEL_POS if payload == "DEL" else DEL2_POS
@@ -280,7 +304,7 @@ def main():
                 ref_walk.append((nid, "+"))
                 for d in range(args.designs):
                     if not designs[d][payload]:
-                        push([f"design{d}#a", f"design{d}#b"], nid)
+                        push([h for h in (f"design{d}#a", f"design{d}#b") if h in here], nid)
             elif payload in ("INS", "INS2"):
                 p0 = INS_POS if payload == "INS" else INS2_POS
                 base = add_node(backbone[p0:p0 + INS_LEN])
@@ -289,7 +313,7 @@ def main():
                 alt = add_node(ins_payload)
                 ref_walk.append((base, "+"))
                 for d in range(args.designs):
-                    hs = [f"design{d}#a", f"design{d}#b"]
+                    hs = [h for h in (f"design{d}#a", f"design{d}#b") if h in here]
                     push(hs, base)
                     if designs[d][payload]:
                         push(hs, alt)
@@ -301,14 +325,14 @@ def main():
                 ids = [add_node(c) for c in copies]
                 ref_walk.append((ids[0], "+"))
                 for d in range(args.designs):
-                    hs = [f"design{d}#a", f"design{d}#b"]
+                    hs = [h for h in (f"design{d}#a", f"design{d}#b") if h in here]
                     for k in range(designs[d]["DUP"]):
                         push(hs, ids[k])
             else:  # INV -- the same node traversed in reverse, as a real graph represents it
                 nid = add_node(backbone[INV_POS:INV_POS + INV_LEN])
                 ref_walk.append((nid, "+"))
                 for d in range(args.designs):
-                    push([f"design{d}#a", f"design{d}#b"], nid,
+                    push([h for h in (f"design{d}#a", f"design{d}#b") if h in here], nid,
                          "-" if designs[d]["INV"] else "+")
 
     # ---- sequences, straight from the walks so graph and FASTA cannot disagree ---------------
