@@ -63,6 +63,13 @@ void print_genotype_help() {
         << "                              multiplicity inside them\n"
         << "      --fragment-len <N>      Library fragment length, used to discount correlated\n"
         << "                              markers when computing GQ (default 350; 0 disables)\n"
+        << "      --depth-model <m>       How per-haplotype depth is estimated: median (default,\n"
+        << "                              per-block anchor median/2 shrunk toward the region),\n"
+        << "                              quantile (one region-wide value from a high quantile of the\n"
+        << "                              block medians, so a deletion covering much of the locus\n"
+        << "                              cannot drag it), or bases (total read bases over reference\n"
+        << "                              length, independent of block structure)\n"
+        << "      --depth-quantile <q>    Quantile for --depth-model quantile (default 0.75)\n"
         << "      --carrier-weight <b>    Down-weight markers by how many of the block's alleles\n"
         << "                              carry them: weight = (n_alleles/carriers)^b, mean 1.\n"
         << "                              At blocks with hundreds of alleles the set is swamped\n"
@@ -141,6 +148,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
     double fragment_len = 350.0;
     double recomb_rate = 1.0;
     double carrier_weight = 0.0;
+    DepthModel depth_model = DepthModel::Median;
+    double depth_quantile = 0.75;
     bool provenance = false;
     double uneven_tolerance = 0.35;
     bool quiet = false;
@@ -176,6 +185,15 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--max-alleles") max_alleles = cli::parse_size_arg(arg, require_value(arg));
         else if (arg == "--fragment-len") fragment_len = std::stod(require_value(arg));
         else if (arg == "--recomb-rate") recomb_rate = std::stod(require_value(arg));
+        else if (arg == "--depth-model") {
+            const std::string v = require_value(arg);
+            if (v == "median") depth_model = DepthModel::Median;
+            else if (v == "quantile") depth_model = DepthModel::Quantile;
+            else if (v == "bases") depth_model = DepthModel::Bases;
+            else if (v == "joint") depth_model = DepthModel::Joint;
+            else throw std::runtime_error("genotype: --depth-model must be median|quantile|bases|joint");
+        }
+        else if (arg == "--depth-quantile") depth_quantile = std::stod(require_value(arg));
         else if (arg == "--carrier-weight") carrier_weight = std::stod(require_value(arg));
         else if (arg == "--provenance") provenance = true;
         else if (arg == "-k" || arg == "--kmer-size") options.kmer_size = cli::parse_size_arg(arg, require_value(arg));
@@ -237,7 +255,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
                  std::to_string(100 * rc.matched_syncmers / std::max<std::uint64_t>(1, rc.syncmers)) +
                  "% matched a panel marker");
         const std::vector<BlockDepth> depth =
-            estimate_depth(idx.panel, rc, min_anchors, uneven_tolerance);
+            estimate_depth(idx.panel, rc, min_anchors, uneven_tolerance, depth_model,
+                           depth_quantile, 0);
         GenotypeOptions gopt;
         gopt.threads = options.threads;
         gopt.max_alleles_per_block = max_alleles;
@@ -423,8 +442,23 @@ int run_genotype_command(const std::vector<std::string>& args) {
                      std::to_string(100 * rc.matched_syncmers / std::max<std::uint64_t>(1, rc.syncmers)) +
                      "% matched a panel marker; " + std::to_string(rc.novel_adjacencies) +
                      " novel adjacencies");
-            const std::vector<BlockDepth> depth =
-                estimate_depth(read_panel, rc, min_anchors, uneven_tolerance);
+            std::size_t region_bp_hint = 0;
+            for (const PathRecord& p : panel_graph.paths) {
+                if (p.name == reference_path) {
+                    region_bp_hint = spell_path_steps_sequence(panel_graph, p.steps).size();
+                    break;
+                }
+            }
+            std::vector<BlockDepth> depth =
+                estimate_depth(read_panel, rc, min_anchors, uneven_tolerance,
+                               // Joint refines a first pass, so its starting point matters: seeded
+                               // with Median it reproduces Median's own homozygous answer and never
+                               // escapes. Bases does not depend on the genotype at all, which is
+                               // exactly what a starting point needs.
+                               depth_model == DepthModel::Joint
+                                   ? (region_bp_hint > 0 ? DepthModel::Bases : DepthModel::Quantile)
+                                   : depth_model,
+                               depth_quantile, region_bp_hint);
             std::size_t uneven = 0;
             std::vector<double> lam;
             for (const BlockDepth& d : depth) { if (d.uneven) ++uneven; if (d.usable) lam.push_back(d.lambda_hap); }
@@ -513,9 +547,41 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 resolve(a, ta1, ts1);
                 resolve(b, ta2, ts2);
             }
-            const std::vector<BlockCall> calls =
+            std::vector<BlockCall> calls =
                 genotype_sample(chain, blocks, read_panel, rc, depth, hap_names, gopt, &gsum,
                                 ta1.empty() ? nullptr : &ta1, ta2.empty() ? nullptr : &ta2);
+
+            if (depth_model == DepthModel::Joint) {
+                // The anchors of a block record lambda times the number of the sample's haplotypes
+                // that traverse it, and that count is part of the genotype. Take it from the first
+                // pass: divide each block's anchor median by how many of its called alleles are not
+                // the bypass allele, then use the median of those as one region-wide lambda and call
+                // again. One refinement is enough -- the count only ever takes the values 0, 1 or 2.
+                std::vector<double> per_hap;
+                for (std::size_t bi = 0; bi < depth.size() && bi < calls.size(); ++bi) {
+                    if (depth[bi].anchor_median <= 0.0) continue;
+                    const int bp = bi < blocks.size() ? blocks[bi].bypass_allele : -1;
+                    int traversing = 0;
+                    if (static_cast<int>(calls[bi].allele1) != bp) ++traversing;
+                    if (static_cast<int>(calls[bi].allele2) != bp) ++traversing;
+                    if (traversing > 0) per_hap.push_back(depth[bi].anchor_median / traversing);
+                }
+                if (!per_hap.empty()) {
+                    std::sort(per_hap.begin(), per_hap.end());
+                    const double lambda = per_hap[per_hap.size() / 2];
+                    log.info("joint depth: lambda " + std::to_string(lambda) +
+                             " from " + std::to_string(per_hap.size()) +
+                             " blocks, using the first pass's traversal counts");
+                    for (BlockDepth& d : depth) {
+                        d.median = lambda * 2.0;
+                        d.lambda_hap = lambda;
+                        d.usable = true;
+                    }
+                    calls = genotype_sample(chain, blocks, read_panel, rc, depth, hap_names, gopt,
+                                            &gsum, ta1.empty() ? nullptr : &ta1,
+                                            ta2.empty() ? nullptr : &ta2);
+                }
+            }
             log.info("model: lambda " + std::to_string(gsum.lambda_hap) + ", overdispersion phi " +
                      std::to_string(gsum.overdispersion) + ", error background " +
                      std::to_string(gsum.error_background));

@@ -129,7 +129,10 @@ std::vector<BlockDepth> estimate_depth(
     const ReadPanel& panel,
     const ReadCounts& counts,
     std::size_t min_anchors,
-    double uneven_tolerance) {
+    double uneven_tolerance,
+    DepthModel model,
+    double depth_quantile,
+    std::size_t region_bp) {
 
     std::vector<BlockDepth> out(panel.anchor_slots.size());
     std::vector<double> all_anchor_counts;
@@ -146,6 +149,7 @@ std::vector<BlockDepth> estimate_depth(
         d.n_anchor = v.size();
         if (v.size() < min_anchors) continue;
         d.median = median_of(v);
+        d.anchor_median = d.median;
         std::vector<double> dev;
         dev.reserve(v.size());
         for (const double x : v) dev.push_back(std::fabs(x - d.median));
@@ -169,7 +173,42 @@ std::vector<BlockDepth> estimate_depth(
     //
     // Shrink instead, with a pseudo-count: a block with thousands of anchors keeps its own estimate,
     // one with a handful is pulled to the region. No cliff, and no tuning of where to put it.
-    const double global_median = median_of(all_anchor_counts);
+    double global_median = median_of(all_anchor_counts);
+
+    if (model == DepthModel::Quantile || model == DepthModel::Bases) {
+        double lambda = 0.0;
+        if (model == DepthModel::Quantile) {
+            std::vector<double> block_medians;
+            for (const BlockDepth& d : out) {
+                if (d.n_anchor >= min_anchors && d.median > 0.0) block_medians.push_back(d.median);
+            }
+            if (!block_medians.empty()) {
+                std::sort(block_medians.begin(), block_medians.end());
+                const std::size_t k = std::min(block_medians.size() - 1,
+                    static_cast<std::size_t>(depth_quantile * static_cast<double>(block_medians.size())));
+                lambda = block_medians[k] / 2.0;
+            } else if (global_median > 0.0) {
+                lambda = global_median / 2.0;
+            }
+        } else if (region_bp > 0 && counts.reads > 0) {
+            // Expected count of a syncmer present once per haplotype: per-haplotype base depth times
+            // the share of read positions a k-mer can start at.
+            const double read_len = static_cast<double>(counts.bases) / static_cast<double>(counts.reads);
+            const double per_hap_depth =
+                static_cast<double>(counts.bases) / (2.0 * static_cast<double>(region_bp));
+            const double k = static_cast<double>(panel.kmer_size);
+            lambda = per_hap_depth * std::max(0.0, (read_len - k + 1.0)) / std::max(1.0, read_len);
+        }
+        if (lambda > 0.0) {
+            for (BlockDepth& d : out) {
+                d.median = lambda * 2.0;
+                d.lambda_hap = lambda;
+                d.usable = true;
+            }
+            return out;
+        }
+    }
+
     constexpr double kPseudoAnchors = 200.0;
     for (BlockDepth& d : out) {
         if (global_median <= 0.0) continue;

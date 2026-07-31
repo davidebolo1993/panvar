@@ -68,6 +68,9 @@ ReadCounts count_reads(
 struct BlockDepth {
     std::size_t block_index = 0;
     std::size_t n_anchor = 0;
+    // The raw anchor-count median, never rewritten by a depth model. `median` below is the model's
+    // fitted value; this is the observation, which is what a second pass has to reason from.
+    double anchor_median = 0.0;
     double median = 0.0;        // anchor count median
     double mad = 0.0;
     double lambda_hap = 0.0;    // expected count for one haplotype copy (median / 2, diploid)
@@ -75,13 +78,36 @@ struct BlockDepth {
     bool uneven = false;        // MAD/median above the tolerance: coverage too ragged to trust
 };
 
+// How the per-haplotype depth lambda is estimated. All of them must answer the same question -- what
+// read count does ONE copy of a marker produce -- and they differ in what they assume about the sample.
+//
+//   Median   per-block anchor median / 2, shrunk toward the region. Assumes BOTH of the sample's
+//            haplotypes traverse every block. Where one bypasses (a deletion spanning the site) only
+//            one copy is present, the anchors read lambda rather than 2*lambda, and the estimate halves
+//            -- after which the model needs two copies to explain the data and calls homozygous.
+//   Quantile a single region-wide lambda from a high quantile of the per-block anchor medians, so a
+//            deletion covering most of the locus cannot drag it. Robust as long as some reasonable
+//            fraction of blocks is diploid; the quantile is where that assumption is stated.
+//   Bases    lambda from total read bases over the reference length, independent of block structure
+//            entirely. Biased when the sample's own length differs from the reference, which is exactly
+//            what a large indel does.
+//   Joint    two passes: call once with Median, then re-estimate lambda using how many of each
+//            block's CALLED alleles actually traverse it, and call again. This is the only one that
+//            can be right when a haplotype bypasses many blocks, because then "one haplotype at full
+//            depth" and "two at half depth" produce identical anchor counts and lambda is simply not
+//            identifiable from the anchors alone -- it needs the genotype, which needs lambda.
+enum class DepthModel { Median, Quantile, Bases, Joint };
+
 // Per-block depth from that block's own invariant markers, with a region-wide fallback for blocks
 // that have too few of their own.
 std::vector<BlockDepth> estimate_depth(
     const ReadPanel& panel,
     const ReadCounts& counts,
     std::size_t min_anchors,
-    double uneven_tolerance);
+    double uneven_tolerance,
+    DepthModel model = DepthModel::Median,
+    double depth_quantile = 0.75,
+    std::size_t region_bp = 0);
 
 void write_read_audit(
     const std::string& out_prefix,
