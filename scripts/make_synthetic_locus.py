@@ -60,6 +60,13 @@ def main():
     ap.add_argument("--designs", type=int, default=8)
     ap.add_argument("--snps", type=int, default=60,
                     help="SNP sites, shared positions with per-design alleles")
+    ap.add_argument("--paralog-del", action="store_true",
+                    help="plant a SECOND deletion site whose sequence (and flanking context) is an "
+                         "exact copy of the first, in a different block, polymorphic independently. "
+                         "Every syncmer of either site then occurs in both AND varies in both, so "
+                         "confinement must strip them all and both bubbles are left with no local "
+                         "evidence. That forces the call to come from linkage -- the C4A/C4B case, and "
+                         "the one mechanism the clean synthetic locus never exercises.")
     ap.add_argument("--segdups", type=int, default=0,
                     help="segmental duplication PAIRS to plant. Each copies a stretch of backbone to "
                          "another position in a DIFFERENT block, so its syncmers occur in two blocks "
@@ -86,8 +93,13 @@ def main():
     DUP_POS, DUP_LEN = int(args.backbone_bp * 0.56), 500
     INV_POS, INV_LEN = int(args.backbone_bp * 0.76), 700
     ins_payload = random_seq(rng, INS_LEN)
+    # The paralogue sits inside the backbone stretch between INS and DUP, i.e. a different block.
+    DEL2_POS = int(args.backbone_bp * 0.46)
+    PARA_FLANK = 400
     sv_spans = [(DEL_POS, DEL_POS + DEL_LEN), (INS_POS, INS_POS + INS_LEN),
                 (DUP_POS, DUP_POS + DUP_LEN), (INV_POS, INV_POS + INV_LEN)]
+    if args.paralog_del:
+        sv_spans.append((DEL2_POS, DEL2_POS + DEL_LEN))
 
     def in_sv(p):
         return any(a - 50 <= p < b + 50 for a, b in sv_spans)
@@ -122,6 +134,13 @@ def main():
             backbone = backbone[:b] + "".join(cp) + backbone[b + L:]
             segdup_pairs.append((a, b, L))
 
+    # Copy the first deletion site, with flanking context, onto the paralogue position. Both sites then
+    # spell the same sequence, so a syncmer from either occurs in both.
+    if args.paralog_del:
+        a0, a1 = DEL_POS - PARA_FLANK, DEL_POS + DEL_LEN + PARA_FLANK
+        b0 = DEL2_POS - PARA_FLANK
+        backbone = backbone[:b0] + backbone[a0:a1] + backbone[b0 + (a1 - a0):]
+
     # Read the tandem unit only now: the segdups above may have rewritten this stretch.
     dup_unit = backbone[DUP_POS:DUP_POS + DUP_LEN]
 
@@ -129,7 +148,13 @@ def main():
     # there are only backbone_bp/spacing slots, so rejection sampling stalls once the request approaches
     # that bound -- the acceptance probability goes to zero and the loop never finishes.
     SNP_SPACING = 100
-    slots = [q for q in range(200, args.backbone_bp - 200, SNP_SPACING) if not in_sv(q)]
+    def in_para(q):
+        if not args.paralog_del:
+            return False
+        return (DEL_POS - PARA_FLANK - 50 <= q < DEL_POS + DEL_LEN + PARA_FLANK + 50 or
+                DEL2_POS - PARA_FLANK - 50 <= q < DEL2_POS + DEL_LEN + PARA_FLANK + 50)
+    slots = [q for q in range(200, args.backbone_bp - 200, SNP_SPACING)
+             if not in_sv(q) and not in_para(q)]
     if args.snps > len(slots):
         raise SystemExit(f"--snps {args.snps} exceeds the {len(slots)} slots available at "
                          f"{SNP_SPACING} bp spacing in a {args.backbone_bp} bp backbone")
@@ -148,6 +173,7 @@ def main():
             "INS": (d // 2) % 2 == 1,
             "DUP": [1, 2, 3, 2][d % 4],
             "INV": (d // 4) % 2 == 1,
+            "DEL2": (d // 8) % 2 == 1,      # independent of DEL, so the two sites are not correlated
             "snp": alt,
         })
 
@@ -188,6 +214,8 @@ def main():
     events = [(p, "snp", p) for p in snp_pos]
     events += [(DEL_POS, "sv", "DEL"), (INS_POS, "sv", "INS"),
                (DUP_POS, "sv", "DUP"), (INV_POS, "sv", "INV")]
+    if args.paralog_del:
+        events.append((DEL2_POS, "sv", "DEL2"))
     events.sort()
     for pos, kind, payload in events:
         if pos > cur:
@@ -197,7 +225,7 @@ def main():
             cur = pos + 1
         else:
             segs.append(("sv", payload))
-            cur = pos + (DEL_LEN if payload == "DEL" else INS_LEN if payload == "INS"
+            cur = pos + (DEL_LEN if payload in ("DEL", "DEL2") else INS_LEN if payload == "INS"
                          else DUP_LEN if payload == "DUP" else INV_LEN)
     if cur < len(backbone):
         segs.append(("shared", backbone[cur:]))
@@ -228,11 +256,12 @@ def main():
             for d in range(args.designs):
                 push([f"design{d}#a", f"design{d}#b"], ids[designs[d]["snp"][p]])
         else:
-            if payload == "DEL":
-                nid = add_node(backbone[DEL_POS:DEL_POS + DEL_LEN])
+            if payload in ("DEL", "DEL2"):
+                p0 = DEL_POS if payload == "DEL" else DEL2_POS
+                nid = add_node(backbone[p0:p0 + DEL_LEN])
                 ref_walk.append((nid, "+"))
                 for d in range(args.designs):
-                    if not designs[d]["DEL"]:
+                    if not designs[d][payload]:
                         push([f"design{d}#a", f"design{d}#b"], nid)
             elif payload == "INS":
                 base = add_node(backbone[INS_POS:INS_POS + INS_LEN])
