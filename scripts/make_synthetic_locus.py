@@ -60,6 +60,15 @@ def main():
     ap.add_argument("--designs", type=int, default=8)
     ap.add_argument("--snps", type=int, default=60,
                     help="SNP sites, shared positions with per-design alleles")
+    ap.add_argument("--segdups", type=int, default=0,
+                    help="segmental duplication PAIRS to plant. Each copies a stretch of backbone to "
+                         "another position in a DIFFERENT block, so its syncmers occur in two blocks "
+                         "at once. That is what marker confinement strips, and what makes a real "
+                         "locus hard -- without it every marker is trivially block-unique.")
+    ap.add_argument("--segdup-len", type=int, default=4000)
+    ap.add_argument("--segdup-divergence", type=float, default=0.01,
+                    help="per-base divergence between the two copies. At 1%% a 31-mer survives in "
+                         "both with probability ~0.73, so most markers are shared.")
     ap.add_argument("--dup-divergence", type=float, default=0.0,
                     help="per-base divergence between tandem copies. 0 keeps copies identical, so "
                          "copy number shows up purely as marker multiplicity -- the clean case. Raise "
@@ -70,25 +79,61 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     backbone = random_seq(rng, args.backbone_bp)
 
-    DEL_POS, DEL_LEN = 8000, 400
-    INS_POS, INS_LEN = 18000, 600
-    DUP_POS, DUP_LEN = 28000, 500
-    INV_POS, INV_LEN = 38000, 700
+    # SV sites at fixed FRACTIONS of the backbone, so the block structure scales with it. At the
+    # default 50 kb these are the familiar 8000/18000/28000/38000.
+    DEL_POS, DEL_LEN = int(args.backbone_bp * 0.16), 400
+    INS_POS, INS_LEN = int(args.backbone_bp * 0.36), 600
+    DUP_POS, DUP_LEN = int(args.backbone_bp * 0.56), 500
+    INV_POS, INV_LEN = int(args.backbone_bp * 0.76), 700
     ins_payload = random_seq(rng, INS_LEN)
-    dup_unit = backbone[DUP_POS:DUP_POS + DUP_LEN]
-
     sv_spans = [(DEL_POS, DEL_POS + DEL_LEN), (INS_POS, INS_POS + INS_LEN),
                 (DUP_POS, DUP_POS + DUP_LEN), (INV_POS, INV_POS + INV_LEN)]
 
     def in_sv(p):
         return any(a - 50 <= p < b + 50 for a, b in sv_spans)
 
-    snp_pos = []
-    while len(snp_pos) < args.snps:
-        p = rng.randrange(200, args.backbone_bp - 200)
-        if not in_sv(p) and all(abs(p - q) > 100 for q in snp_pos):
-            snp_pos.append(p)
-    snp_pos.sort()
+
+    # Segmental duplications, planted before anything else so every haplotype inherits them. Each
+    # pair puts near-identical sequence in two different blocks of the chain.
+    segdup_pairs = []
+    if args.segdups > 0:
+        L = args.segdup_len
+        # Deliberately spanning different blocks: flank<->flank, then backbone<->backbone.
+        # One copy per block, chosen so the two copies land in DIFFERENT blocks of the chain -- that
+        # is the whole point. Block midpoints, in order: leading flank, the three backbones, trailing
+        # flank.
+        mids = [DEL_POS // 2,
+                (DEL_POS + DEL_LEN + INS_POS) // 2,
+                (INS_POS + INS_LEN + DUP_POS) // 2,
+                (DUP_POS + DUP_LEN + INV_POS) // 2,
+                (INV_POS + INV_LEN + args.backbone_bp) // 2]
+        starts = [max(200, m - L // 2) for m in mids]
+        candidates = [(starts[0], starts[4]), (starts[1], starts[3]), (starts[2], starts[4] + L)]
+        for k in range(min(args.segdups, len(candidates))):
+            a, b = candidates[k]
+            if any(a - 200 < e and s_ - 200 < a + L + 200 for s_, e in sv_spans) or \
+               any(b - 200 < e and s_ - 200 < b + L + 200 for s_, e in sv_spans):
+                continue
+            src = backbone[a:a + L]
+            cp = list(src)
+            for i in range(L):
+                if rng.random() < args.segdup_divergence:
+                    cp[i] = rng.choice([x for x in "ACGT" if x != cp[i]])
+            backbone = backbone[:b] + "".join(cp) + backbone[b + L:]
+            segdup_pairs.append((a, b, L))
+
+    # Read the tandem unit only now: the segdups above may have rewritten this stretch.
+    dup_unit = backbone[DUP_POS:DUP_POS + DUP_LEN]
+
+    # Draw from a pre-built grid of legal slots rather than rejection-sampling. With a minimum spacing
+    # there are only backbone_bp/spacing slots, so rejection sampling stalls once the request approaches
+    # that bound -- the acceptance probability goes to zero and the loop never finishes.
+    SNP_SPACING = 100
+    slots = [q for q in range(200, args.backbone_bp - 200, SNP_SPACING) if not in_sv(q)]
+    if args.snps > len(slots):
+        raise SystemExit(f"--snps {args.snps} exceeds the {len(slots)} slots available at "
+                         f"{SNP_SPACING} bp spacing in a {args.backbone_bp} bp backbone")
+    snp_pos = sorted(rng.sample(slots, args.snps))
 
     # Per design: state at each SV site, and an allele at each SNP position.
     designs = []
@@ -105,6 +150,22 @@ def main():
             "INV": (d // 4) % 2 == 1,
             "snp": alt,
         })
+
+    # Mirror each SNP inside a segdup copy onto its paralogue, with the SAME per-design allele. Without
+    # this the duplicated stretch is identical across every haplotype, so its syncmers are constant and
+    # become depth anchors rather than markers -- and confinement, which only sees markers, never fires.
+    # A real paralogue pair carries the same variation twice, and that is what makes a marker ambiguous.
+    snp_set = set(snp_pos)
+    for a, b, L in segdup_pairs:
+        for p_ in [q for q in snp_pos if a <= q < a + L]:
+            q_ = b + (p_ - a)
+            if in_sv(q_) or q_ in snp_set or q_ >= args.backbone_bp - 200:
+                continue
+            snp_pos.append(q_)
+            snp_set.add(q_)
+            for d in range(args.designs):
+                designs[d]["snp"][q_] = designs[d]["snp"][p_]
+    snp_pos.sort()
 
     def dup_copies(n):
         if args.dup_divergence <= 0.0:
@@ -251,6 +312,9 @@ def main():
         f.write(f"DUP\tDUP\t{DUP_POS}\t{DUP_LEN}\t3\n")
         f.write(f"INV\tINV\t{INV_POS}\t{INV_LEN}\t2\n")
 
+    if segdup_pairs:
+        print("  segdups: " + ", ".join(f"{a}<->{b} ({L}bp, {100*args.segdup_divergence:.1f}% div)"
+                                        for a, b, L in segdup_pairs))
     print(f"{len(all_haps)} haplotypes ({args.designs} designs x 2 twins), "
           f"{len(nodes)} nodes, {len(edges)} edges, {len(snp_pos)} SNP sites")
     print(f"  ref {len(ref_seq)} bp; DEL@{DEL_POS}/{DEL_LEN} INS@{INS_POS}/{INS_LEN} "
