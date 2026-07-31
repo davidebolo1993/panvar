@@ -61,6 +61,11 @@ void print_genotype_help() {
         << "                              presence/absence only (PanGenie's actual rule)\n"
         << "      --fragment-len <N>      Library fragment length, used to discount correlated\n"
         << "                              markers when computing GQ (default 350; 0 disables)\n"
+        << "      --recomb-rate <x>       Li-Stephens switch scaling; 1.0 (default) is about one\n"
+        << "                              expected haplotype switch across the locus. Raising it\n"
+        << "                              makes blocks nearly independent, lowering it locks the\n"
+        << "                              chain to one haplotype pair -- useful for telling\n"
+        << "                              emission error apart from linkage error\n"
         << "      --provenance            Attribute each call to the blocks that determined it, by\n"
         << "                              neutralizing one block at a time and re-running the chain.\n"
         << "                              Adds provenance (self/neighbours/distant/none) and the\n"
@@ -126,6 +131,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
     std::string index_in;
     std::size_t max_alleles = 64;
     double fragment_len = 350.0;
+    double recomb_rate = 1.0;
     bool provenance = false;
     double uneven_tolerance = 0.35;
     bool quiet = false;
@@ -159,6 +165,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
         }
         else if (arg == "--max-alleles") max_alleles = cli::parse_size_arg(arg, require_value(arg));
         else if (arg == "--fragment-len") fragment_len = std::stod(require_value(arg));
+        else if (arg == "--recomb-rate") recomb_rate = std::stod(require_value(arg));
         else if (arg == "--provenance") provenance = true;
         else if (arg == "-k" || arg == "--kmer-size") options.kmer_size = cli::parse_size_arg(arg, require_value(arg));
         else if (arg == "--syncmer-s") options.syncmer_s = cli::parse_size_arg(arg, require_value(arg));
@@ -425,6 +432,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
             gopt.max_alleles_per_block = max_alleles;
             gopt.fragment_len = fragment_len;
             gopt.provenance = provenance;
+            gopt.recomb_rate = recomb_rate;
             GenotypeSummary gsum;
             std::vector<int> ta1;
             std::vector<int> ta2;
