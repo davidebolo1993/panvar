@@ -12,6 +12,9 @@
 #include "panvar/output.hpp"
 
 #include "panvar/parallel.hpp"
+#include "panvar/syncmer.hpp"
+
+#include <unordered_set>
 
 #include <algorithm>
 #include <cmath>
@@ -558,7 +561,21 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     const std::string acc_path = out_prefix + ".accuracy.tsv";
                     std::ofstream acc(acc_path);
                     acc << "block_index\tblock_kind\tbubble_id\tn_alleles\trepresentable\texact\t"
-                           "dbp\tbest_dbp\tidentity\tqv\ttrue_bp\tcalled_bp\tfilter\n";
+                           "dbp\tbest_dbp\tidentity\tbest_identity\toracle_rank\tid_h1\tid_h2\trank_h1\trank_h2"
+                           "\tqv\ttrue_bp\tcalled_bp\tfilter\n";
+                    // Identity oracle: the most similar allele the panel could have offered. `best_dbp`
+                    // only says some allele matched the truth's LENGTH, which among hundreds of alleles
+                    // happens by coincidence -- it cannot distinguish "the panel had nothing better"
+                    // from "the panel had something better and we missed it". Shortlist by syncmer
+                    // Jaccard (cheap, over all alleles), then align the shortlist exactly.
+                    const std::size_t kk = read_panel.kmer_size;
+                    const std::size_t ss = read_panel.syncmer_s != 0 ? read_panel.syncmer_s
+                                                                     : default_syncmer_s(kk);
+                    auto sync_set = [&](const std::string& s) {
+                        std::unordered_set<std::uint64_t> out;
+                        for (const KmerOccurrence& o : collect_syncmers(s, kk, ss)) out.insert(o.code);
+                        return out;
+                    };
                     auto len_of = [&](std::size_t bi, std::size_t ai) {
                         return ai < blocks[bi].allele_seq.size() ? blocks[bi].allele_seq[ai].size() : 0;
                     };
@@ -613,6 +630,69 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             tot_edits += nw.edits;
                             tot_aln += nw.aln_len;
                         }
+                        // Best identity any panel allele could have reached, and where our pick ranked.
+                        double best_id = 0.0;
+                        long oracle_rank = -1;
+                        double id_h0 = 0.0, id_h1 = 0.0;
+                        long rank_h0 = -1, rank_h1 = -1;
+                        if (blocks[bi].allele_seq.size() <= 1024) {
+                            std::vector<std::unordered_set<std::uint64_t>> asets;
+                            asets.reserve(blocks[bi].allele_seq.size());
+                            for (const std::string& s : blocks[bi].allele_seq) asets.push_back(sync_set(s));
+                            double idsum_best = 0.0;
+                            long ranksum = 0;
+                            int nh_scored = 0;
+                            // Per haplotype, not averaged: a mean hides the common failure where one
+                            // haplotype is placed perfectly and the other is essentially arbitrary.
+                            double id_h[2] = {0.0, 0.0};
+                            long rank_h[2] = {-1, -1};
+                            for (int h = 0; h < 2; ++h) {
+                                const std::string& truth = *tv[h];
+                                if (truth.empty()) continue;
+                                const auto tset = sync_set(truth);
+                                std::vector<std::pair<double, std::size_t>> jac;
+                                jac.reserve(asets.size());
+                                for (std::size_t ai = 0; ai < asets.size(); ++ai) {
+                                    std::size_t inter = 0;
+                                    const auto& A = asets[ai];
+                                    const auto& S = A.size() <= tset.size() ? A : tset;
+                                    const auto& L = A.size() <= tset.size() ? tset : A;
+                                    for (const std::uint64_t c : S) if (L.count(c) != 0) ++inter;
+                                    const std::size_t uni = A.size() + tset.size() - inter;
+                                    jac.emplace_back(uni == 0 ? 1.0 : static_cast<double>(inter) /
+                                                                          static_cast<double>(uni), ai);
+                                }
+                                std::sort(jac.begin(), jac.end(),
+                                          [](const auto& x, const auto& y) {
+                                              return x.first != y.first ? x.first > y.first
+                                                                        : x.second < y.second;
+                                          });
+                                const std::size_t called_ai = cv[h ^ swap];
+                                for (std::size_t r = 0; r < jac.size(); ++r) {
+                                    if (jac[r].second == called_ai) {
+                                        ranksum += static_cast<long>(r) + 1;
+                                        rank_h[h] = static_cast<long>(r) + 1;
+                                        break;
+                                    }
+                                }
+                                double bid = 0.0;
+                                for (std::size_t r = 0; r < std::min<std::size_t>(16, jac.size()); ++r) {
+                                    const NwAlign n2 = nw_edit_distance(blocks[bi].allele_seq[jac[r].second], truth);
+                                    const double d2 = static_cast<double>(std::max<std::size_t>(1, n2.aln_len));
+                                    bid = std::max(bid, 1.0 - static_cast<double>(n2.edits) / d2);
+                                }
+                                idsum_best += bid;
+                                id_h[h] = 1.0 - static_cast<double>(nwm[h ^ swap][h].edits) /
+                                              static_cast<double>(std::max<std::size_t>(1, nwm[h ^ swap][h].aln_len));
+                                ++nh_scored;
+                            }
+                            if (nh_scored > 0) {
+                                best_id = idsum_best / nh_scored;
+                                oracle_rank = ranksum / nh_scored;
+                                id_h0 = id_h[0]; id_h1 = id_h[1];
+                                rank_h0 = rank_h[0]; rank_h1 = rank_h[1];
+                            }
+                        }
                         const bool is_bub = chain[bi].kind == BlockKind::Bubble;
                         const bool repr = ta1[bi] >= 0 && ta2[bi] >= 0;
                         const bool exact = repr &&
@@ -624,7 +704,9 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             << (is_bub ? "bubble" : chain[bi].kind == BlockKind::Flank ? "flank" : "backbone") << '\t'
                             << chain[bi].bubble_id << '\t' << blocks[bi].n_alleles << '\t'
                             << (repr ? 1 : 0) << '\t' << (exact ? 1 : 0) << '\t'
-                            << dbp << '\t' << best << '\t' << (idsum / 2.0) << '\t' << (qvsum / 2.0) << '\t'
+                            << dbp << '\t' << best << '\t' << (idsum / 2.0) << '\t' << best_id << '\t'
+                            << oracle_rank << '\t' << id_h0 << '\t' << id_h1 << '\t'
+                            << rank_h0 << '\t' << rank_h1 << '\t' << (qvsum / 2.0) << '\t'
                             << tbp << '\t' << cbp << '\t' << calls[bi].filter << '\n';
                         id_sum += idsum / 2.0; qv_sum += qvsum / 2.0; ++graded;
                         dbp_sum += dbp; best_sum += best;
