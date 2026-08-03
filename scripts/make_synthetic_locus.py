@@ -84,6 +84,14 @@ def main():
                     help="tandem repeat unit length. Raise it with --dup-max-cn for a VNTR-scale array "
                          "like LPA's KIV-2 or ANKRD36C's, where copy number IS the variant and marker "
                          "multiplicity is the only signal that can measure it.")
+    ap.add_argument("--dup-per-design-divergence", type=float, default=0.0,
+                    help="give EVERY design its own array copies, diverged from the base unit by this "
+                         "per-base rate. Without it all designs share one set of copy nodes and the "
+                         "array bubble has only as many alleles as there are distinct copy numbers -- "
+                         "heavily shared, so leave-one-out always leaves a carrier. With it each "
+                         "design's array is unique, reproducing what a real VNTR looks like: lpa's "
+                         "KIV-2 block carries 457 distinct alleles among 466 haplotypes, so removing a "
+                         "haplotype removes the only carrier of its allele.")
     ap.add_argument("--dup-min-cn", type=int, default=1)
     ap.add_argument("--dup-max-cn", type=int, default=3)
     ap.add_argument("--paralog-ins", action="store_true",
@@ -355,10 +363,25 @@ def main():
                 copies = dup_copies(maxcn)
                 ids = [add_node(c) for c in copies]
                 ref_walk.append((ids[0], "+"))
-                for d in range(args.designs):
-                    hs = [h for h in (f"design{d}#a", f"design{d}#b") if h in here]
-                    for k in range(designs[d]["DUP"]):
-                        push(hs, ids[k])
+                if args.dup_per_design_divergence > 0.0:
+                    # Each design walks its OWN copies, so every array allele is distinct.
+                    for d in range(args.designs):
+                        drng2 = random.Random(args.seed * 991 + d)
+                        own = []
+                        for _ in range(designs[d]["DUP"]):
+                            u = list(dup_unit)
+                            for t in range(len(u)):
+                                if drng2.random() < args.dup_per_design_divergence:
+                                    u[t] = drng2.choice([b for b in "ACGT" if b != u[t]])
+                            own.append(add_node("".join(u)))
+                        hs = [h for h in (f"design{d}#a", f"design{d}#b") if h in here]
+                        for nid2 in own:
+                            push(hs, nid2)
+                else:
+                    for d in range(args.designs):
+                        hs = [h for h in (f"design{d}#a", f"design{d}#b") if h in here]
+                        for k in range(designs[d]["DUP"]):
+                            push(hs, ids[k])
             else:  # INV -- the same node traversed in reverse, as a real graph represents it
                 nid = add_node(backbone[INV_POS:INV_POS + INV_LEN])
                 ref_walk.append((nid, "+"))
