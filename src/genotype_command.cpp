@@ -443,6 +443,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
                      " span ADJACENT blocks only (shared boundary), " +
                      std::to_string(read_panel.dropped_distant_blocks) +
                      " span DISTANT blocks (duplication elsewhere in the region)");
+            const ReadCounts rc_pre = dump_block >= 0 ? count_reads(read_paths, read_panel, options.threads)
+                                                     : ReadCounts{};
             // Per-allele diagnostic for one block: does marker multiplicity scale with allele length?
             // At a tandem array it must, or the emission has no copy-number signal to work with and no
             // amount of reweighting will recover one.
@@ -450,17 +452,23 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 const std::size_t bi = static_cast<std::size_t>(dump_block);
                 const std::string dpath = out_prefix + ".block" + std::to_string(bi) + ".tsv";
                 std::ofstream d(dpath);
-                d << "allele\tn_haplotypes\tbp\tn_markers\tsum_multiplicity\n";
+                // obs_sum lets the reader solve for the depth each allele implies. For a marker at
+                // multiplicity m in allele a, the reads carry lambda*(m_truth1 + m_truth2), so
+                // obs_sum/sum_multiplicity is about 2*lambda for an allele whose copy number matches
+                // the sample, lower for one that is too long and higher for one too short.
+                d << "allele\tn_haplotypes\tbp\tn_markers\tsum_multiplicity\tobs_sum\n";
                 for (std::size_t ai = 0; ai < read_panel.by_block[bi].size(); ++ai) {
                     std::uint64_t mult = 0;
+                    std::uint64_t obs = 0;
                     for (const auto& [slot, m] : read_panel.by_block[bi][ai].nodes) {
-                        (void)slot;
                         mult += m;
+                        obs += rc_pre.node[slot];
                     }
                     d << ai << '\t'
                       << (ai < blocks[bi].allele_haplotypes.size() ? blocks[bi].allele_haplotypes[ai] : 0)
                       << '\t' << (ai < blocks[bi].allele_bp.size() ? blocks[bi].allele_bp[ai] : 0)
-                      << '\t' << read_panel.by_block[bi][ai].nodes.size() << '\t' << mult << '\n';
+                      << '\t' << read_panel.by_block[bi][ai].nodes.size() << '\t' << mult
+                      << '\t' << obs << '\n';
                 }
                 log.wrote({dpath});
             }
