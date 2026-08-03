@@ -154,6 +154,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
     double carrier_weight = 0.0;
     DepthModel depth_model = DepthModel::Joint;
     double depth_quantile = 0.75;
+    long dump_block = -1;
     bool provenance = false;
     double uneven_tolerance = 0.35;
     bool quiet = false;
@@ -198,6 +199,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
             else throw std::runtime_error("genotype: --depth-model must be median|quantile|bases|joint");
         }
         else if (arg == "--depth-quantile") depth_quantile = std::stod(require_value(arg));
+        else if (arg == "--dump-block") dump_block = std::stol(require_value(arg));
         else if (arg == "--carrier-weight") carrier_weight = std::stod(require_value(arg));
         else if (arg == "--provenance") provenance = true;
         else if (arg == "-k" || arg == "--kmer-size") options.kmer_size = cli::parse_size_arg(arg, require_value(arg));
@@ -439,6 +441,28 @@ int run_genotype_command(const std::vector<std::string>& args) {
                      " span ADJACENT blocks only (shared boundary), " +
                      std::to_string(read_panel.dropped_distant_blocks) +
                      " span DISTANT blocks (duplication elsewhere in the region)");
+            // Per-allele diagnostic for one block: does marker multiplicity scale with allele length?
+            // At a tandem array it must, or the emission has no copy-number signal to work with and no
+            // amount of reweighting will recover one.
+            if (dump_block >= 0 && static_cast<std::size_t>(dump_block) < read_panel.by_block.size()) {
+                const std::size_t bi = static_cast<std::size_t>(dump_block);
+                const std::string dpath = out_prefix + ".block" + std::to_string(bi) + ".tsv";
+                std::ofstream d(dpath);
+                d << "allele\tn_haplotypes\tbp\tn_markers\tsum_multiplicity\n";
+                for (std::size_t ai = 0; ai < read_panel.by_block[bi].size(); ++ai) {
+                    std::uint64_t mult = 0;
+                    for (const auto& [slot, m] : read_panel.by_block[bi][ai].nodes) {
+                        (void)slot;
+                        mult += m;
+                    }
+                    d << ai << '\t'
+                      << (ai < blocks[bi].allele_haplotypes.size() ? blocks[bi].allele_haplotypes[ai] : 0)
+                      << '\t' << (ai < blocks[bi].allele_bp.size() ? blocks[bi].allele_bp[ai] : 0)
+                      << '\t' << read_panel.by_block[bi][ai].nodes.size() << '\t' << mult << '\n';
+                }
+                log.wrote({dpath});
+            }
+
             const ReadCounts rc = count_reads(read_paths, read_panel, options.threads);
             log.info("reads: " + std::to_string(rc.reads) + " (" + std::to_string(rc.bases / 1000) +
                      " kb); " + std::to_string(rc.syncmers) + " syncmers, " +
