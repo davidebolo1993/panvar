@@ -105,9 +105,46 @@ std::vector<BlockCall> genotype_sample(
             if (x.first != y.first) return x.first > y.first;
             return x.second < y.second;                 // total order: keep it reproducible
         });
+        // Half the budget by that score, half spread evenly over the LENGTH distribution.
+        //
+        // Detected-marker fraction cannot rank alleles that differ mainly in copy number: they share
+        // the repeat unit's syncmers, so nearly every allele scores alike and the top-K is decided by
+        // the index tie-break. Measured on lpa's KIV-2 block, 457 alleles: the allele nearest the
+        // truth in length was pruned before pairing. Stratifying by length guarantees the candidate
+        // set spans the range whatever the score does, which needs no knowledge of the locus -- a
+        // block whose alleles are all the same length simply gets its top-scoring alleles back, since
+        // the stratified picks collapse onto them.
         const std::size_t keep_n = std::min(na, std::max<std::size_t>(2, options.max_alleles_per_block));
         kept[bi].reserve(keep_n);
-        for (std::size_t i = 0; i < keep_n; ++i) kept[bi].push_back(score[i].second);
+        std::vector<char> taken(na, 0);
+        const std::size_t by_score = keep_n - keep_n / 2;
+        for (std::size_t i = 0; i < by_score && i < score.size(); ++i) {
+            kept[bi].push_back(score[i].second);
+            taken[score[i].second] = 1;
+        }
+        if (kept[bi].size() < keep_n) {
+            std::vector<std::uint32_t> by_len(na);
+            for (std::size_t i = 0; i < na; ++i) by_len[i] = static_cast<std::uint32_t>(i);
+            std::sort(by_len.begin(), by_len.end(), [&](std::uint32_t x, std::uint32_t y) {
+                const std::size_t bx = x < blocks[bi].allele_bp.size() ? blocks[bi].allele_bp[x] : 0;
+                const std::size_t by = y < blocks[bi].allele_bp.size() ? blocks[bi].allele_bp[y] : 0;
+                if (bx != by) return bx < by;
+                return x < y;                           // total order: keep it reproducible
+            });
+            const std::size_t want = keep_n - kept[bi].size();
+            for (std::size_t k = 0; k < want && kept[bi].size() < keep_n; ++k) {
+                // Evenly spaced ranks across the sorted-by-length list, then the next untaken allele.
+                std::size_t start = want > 1 ? (k * (na - 1)) / (want - 1) : na / 2;
+                for (std::size_t step = 0; step < na; ++step) {
+                    const std::size_t idx = (start + step) % na;
+                    if (!taken[by_len[idx]]) {
+                        kept[bi].push_back(by_len[idx]);
+                        taken[by_len[idx]] = 1;
+                        break;
+                    }
+                }
+            }
+        }
         std::sort(kept[bi].begin(), kept[bi].end());
 
         // Every candidate pair must be scored over the SAME marker set. Summing only over the markers
