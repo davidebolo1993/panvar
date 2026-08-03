@@ -82,6 +82,7 @@ std::vector<BlockCall> genotype_sample(
     std::vector<std::vector<double>> emis(nb);          // [block][x*kn + y], log scale
     std::vector<std::vector<std::uint32_t>> kept(nb);
     std::vector<std::vector<double>> explained(nb);
+    std::vector<std::vector<double>> detected(nb);
     std::vector<double> baseline_of(nb, 0.0);
     std::vector<double> obs_universe_of(nb, 0.0);
 
@@ -168,6 +169,7 @@ std::vector<BlockCall> genotype_sample(
         const std::size_t kn = kept[bi].size();
         emis[bi].assign(kn * kn, 0.0);
         explained[bi].assign(kn * kn, 0.0);
+        detected[bi].assign(kn * kn, 0.0);
         for (std::size_t x = 0; x < kn; ++x) {
             for (std::size_t y = 0; y < kn; ++y) {
                 // Expected count per marker is lambda * (copies in allele1 + copies in allele2), with
@@ -178,16 +180,19 @@ std::vector<BlockCall> genotype_sample(
                 for (const auto& [slot, mult] : panel.by_block[bi][kept[bi][y]].nodes) tot[slot] += mult;
                 double ll = 0.0;
                 double obs_in = 0.0;
+                double pred_in = 0.0;
                 for (const auto& [slot, m] : tot) {
                     const double o = static_cast<double>(counts.node[slot]);
                     ll += weight_of(slot) * (log_nb(o, lambda * m + mu, phi) - log_nb(o, mu, phi));
                     obs_in += o;
+                    pred_in += lambda * m + mu;
                 }
                 emis[bi][x * kn + y] = baseline + rho * ll;
                 // Share of the block's observed marker mass this pair accounts for. The denominator is
                 // the UNION of the block's markers -- summing per allele would count every shared
                 // marker once per carrier and make `explained` scale like 1/n_alleles.
                 explained[bi][x * kn + y] = obs_universe > 0.0 ? obs_in / obs_universe : 0.0;
+                detected[bi][x * kn + y] = pred_in > 0.0 ? std::min(1.0, obs_in / pred_in) : 1.0;
             }
         }
     }
@@ -413,8 +418,10 @@ std::vector<BlockCall> genotype_sample(
         const auto yi = std::find(kept[bi].begin(), kept[bi].end(), static_cast<std::uint32_t>(c.allele2));
         if (xi != kept[bi].end() && yi != kept[bi].end()) {
             const std::size_t kn = kept[bi].size();
-            c.explained = explained[bi][static_cast<std::size_t>(xi - kept[bi].begin()) * kn +
-                                        static_cast<std::size_t>(yi - kept[bi].begin())];
+            const std::size_t off = static_cast<std::size_t>(xi - kept[bi].begin()) * kn +
+                                    static_cast<std::size_t>(yi - kept[bi].begin());
+            c.explained = explained[bi][off];
+            c.detected = detected[bi][off];
         }
 
         // A block with no markers of its own is NOT evidence-free: the forward-backward carries the
@@ -428,6 +435,11 @@ std::vector<BlockCall> genotype_sample(
         const bool has_markers = c.n_markers > 0;
         const bool measurable = has_markers && obs_universe_of[bi] >= 1.0;
         if (measurable && c.explained < options.min_explained) { c.filter = "OFFPANEL"; ++offpanel; }
+        // The reads do not account for what the call predicts, so the block is under-covered and the
+        // likelihood has been minimising predicted counts rather than matching them. GQ cannot see
+        // this: it is a comparison between alternatives, and when every alternative fits badly the
+        // least-bad one still wins by a wide margin.
+        else if (has_markers && c.detected < options.min_detected) { c.filter = "LOWCOV"; ++nocall; }
         else if (c.gq < options.min_gq) { c.filter = "LOWGQ"; ++nocall; }
         else { c.filter = "PASS"; ++called; gq_sum += c.gq; }
         // Provenance is orthogonal to quality: a block with no markers of its own is not a worse call,
@@ -542,7 +554,7 @@ void write_genotypes(
     std::ofstream g(gpath);
     if (!g) throw std::runtime_error("genotype: cannot write " + gpath);
     g << "block_index\tblock_kind\tbubble_id\tsource\tsink\tn_alleles\tn_markers"
-         "\tallele1\tallele2\thaplotype1\thaplotype2\thap_posterior\tgq\texplained"
+         "\tallele1\tallele2\thaplotype1\thaplotype2\thap_posterior\tgq\texplained\tdetected"
          "\tevidence\tfilter\ttruth1\ttruth2\ttruth_rank\tinfluencers\n";
     for (std::size_t bi = 0; bi < calls.size(); ++bi) {
         const BlockCall& c = calls[bi];
@@ -556,7 +568,7 @@ void write_genotypes(
           << c.allele1 << '\t' << c.allele2 << '\t'
           << (c.hap1 < haplotype_names.size() ? haplotype_names[c.hap1] : ".") << '\t'
           << (c.hap2 < haplotype_names.size() ? haplotype_names[c.hap2] : ".") << '\t'
-          << c.hap_posterior << '\t' << c.gq << '\t' << c.explained << '\t'
+          << c.hap_posterior << '\t' << c.gq << '\t' << c.explained << '\t' << c.detected << '\t'
           << c.evidence << '\t' << c.filter << '\t'
           << c.truth_allele1 << '\t' << c.truth_allele2 << '\t' << c.truth_emission_rank << '\t';
         for (std::size_t k = 0; k < c.influencers.size(); ++k) {

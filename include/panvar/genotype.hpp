@@ -20,6 +20,7 @@ struct GenotypeOptions {
     double fragment_len = 350.0;
     double min_gq = 20.0;
     double min_explained = 0.5;        // below this, the panel does not account for what was observed
+    double min_detected = 0.5;         // below this, the reads do not account for what the call predicts
     std::size_t max_alleles_per_block = 64;   // prune by detected-marker fraction before pairing
     // Down-weight markers by how many of the block's alleles carry them. At a block with hundreds of
     // alleles the marker set is swamped by markers shared across many of them: one carried by 200 of
@@ -49,6 +50,13 @@ struct BlockCall {
     double gq = 0.0;
     std::size_t n_markers = 0;   // distinct panel markers surviving in this block
     double explained = 0.0;      // share of observed marker mass the called pair accounts for
+    // The complement, and the one that catches a coverage dropout. `explained` asks how much of what
+    // we SAW the call accounts for, so when almost nothing was seen every call explains all of it and
+    // the metric reads 1.0. `detected` asks how much of what the call PREDICTS actually turned up. A
+    // block whose reads are missing predicts counts that are not there, and the likelihood then picks
+    // whichever allele predicts least -- collapsing a copy-number call to its minimum, confidently,
+    // because every alternative fits even worse.
+    double detected = 0.0;
     std::size_t hap1 = 0;        // most probable panel haplotype pair at this block
     std::size_t hap2 = 0;
     double hap_posterior = 0.0;
