@@ -60,6 +60,12 @@ def main():
     ap.add_argument("--designs", type=int, default=8)
     ap.add_argument("--snps", type=int, default=60,
                     help="SNP sites, shared positions with per-design alleles")
+    ap.add_argument("--mosaics", type=int, default=0,
+                    help="emit N extra haplotypes that are NOT in the panel, each switching donor "
+                         "design at every SV site and every inter-SV stretch. They test the chain the "
+                         "hard way: the backbones that carry a marker-poor bubble are themselves from "
+                         "different donors, so nothing along the chain is stable and the model must "
+                         "switch almost everywhere. Truth is written per region.")
     ap.add_argument("--nested-del", action="store_true",
                     help="plant a large polymorphic deletion spanning ALL the inner SV sites. It "
                          "creates a bubble that CONTAINS the others, which is ankrd36c's structure and "
@@ -292,7 +298,13 @@ def main():
             return all_haps
         return [h for h in all_haps if not designs[int(h.split("#")[0][6:])]["NEST"]]
 
+    # Where each seg's steps land in each haplotype's walk, so a mosaic can be spliced out of walks
+    # that are already correct rather than rebuilt from scratch. A donor that bypasses a seg simply
+    # contributed no steps there, and the slice is empty -- which is the right answer.
+    seg_marks = {h: [] for h in walks}
     for seg_pos, kind, payload in segs:
+        for h in seg_marks:
+            seg_marks[h].append(len(walks[h]))
         inside_nest = args.nested_del and NEST_A <= seg_pos < NEST_B
         here = carriers(inside_nest)
         if kind == "shared":
@@ -347,6 +359,36 @@ def main():
                     push([h for h in (f"design{d}#a", f"design{d}#b") if h in here], nid,
                          "-" if designs[d]["INV"] else "+")
 
+    for h in seg_marks:
+        seg_marks[h].append(len(walks[h]))
+
+    # ---- mosaic haplotypes: a different donor design in every region of the chain ------------
+    # These are NOT in the panel. Each switches donor at every SV site and every stretch between two,
+    # so the backbones that carry a marker-poor bubble are themselves from different donors and nothing
+    # along the chain is stable. This is the hard case for a linkage-based model.
+    mosaic_walks = {}
+    mosaic_truth = []      # (name, region, kind, donor)
+    if args.mosaics > 0:
+        mrng = random.Random(args.seed * 4242)
+        for m in range(args.mosaics):
+            name = f"mosaic{m}"
+            walk = []
+            region = 0
+            donors = {}
+            for i, (seg_pos, kind, payload) in enumerate(segs):
+                if kind == "sv":
+                    region += 1
+                if region not in donors:
+                    donors[region] = mrng.randrange(args.designs)
+                src = f"design{donors[region]}#a"
+                walk.extend(walks[src][seg_marks[src][i]:seg_marks[src][i + 1]])
+                if kind == "sv":
+                    region += 1
+                    donors.setdefault(region, mrng.randrange(args.designs))
+            mosaic_walks[name] = walk
+            for r, d in sorted(donors.items()):
+                mosaic_truth.append((name, r, "sv" if r % 2 == 1 else "between", f"design{d}"))
+
     # ---- sequences, straight from the walks so graph and FASTA cannot disagree ---------------
     seq_of = {nid: s for nid, s in nodes}
 
@@ -355,6 +397,7 @@ def main():
 
     ref_seq = spell(ref_walk)
     hap_seq = {h: spell(w) for h, w in walks.items()}
+    mosaic_seq = {n: spell(w) for n, w in mosaic_walks.items()}
 
     write_fasta(os.path.join(args.out, "ref.fa"), "ref", ref_seq)
     with open(os.path.join(args.out, "haplotypes.fa"), "w") as allf:
@@ -366,7 +409,7 @@ def main():
 
     # ---- GFA -------------------------------------------------------------------------------
     edges = set()
-    for w in [ref_walk] + list(walks.values()):
+    for w in [ref_walk] + list(walks.values()) + list(mosaic_walks.values()):
         for i in range(1, len(w)):
             edges.add((w[i - 1][0], w[i - 1][1], w[i][0], w[i][1]))
     with open(os.path.join(args.out, "graph.gfa"), "w") as f:
@@ -378,6 +421,11 @@ def main():
         f.write("P\tref\t" + ",".join(f"{n}{o}" for n, o in ref_walk) + "\t*\n")
         for h in all_haps:
             f.write(f"P\t{h}\t" + ",".join(f"{n}{o}" for n, o in walks[h]) + "\t*\n")
+        # Mosaics go in as paths so their per-block truth can be resolved by spelling, exactly as for a
+        # panel haplotype. They must then be excluded from the panel when genotyping -- which is what
+        # leave-one-out already does -- or the test is trivial.
+        for n, w in mosaic_walks.items():
+            f.write(f"P\t{n}\t" + ",".join(f"{a}{o}" for a, o in w) + "\t*\n")
 
     # ---- truth -----------------------------------------------------------------------------
     with open(os.path.join(args.out, "truth.variants.tsv"), "w") as f:
@@ -391,6 +439,14 @@ def main():
             d = h.split("#")[0]
             twin = d + "#" + ("b" if h.endswith("a") else "a")
             f.write(f"{h}\t{d}\t{twin}\t{len(hap_seq[h])}\n")
+    for n, seq in mosaic_seq.items():
+        write_fasta(os.path.join(args.out, f"hap_{n}.fa"), n, seq)
+    if mosaic_truth:
+        with open(os.path.join(args.out, "truth.mosaics.tsv"), "w") as f:
+            f.write("mosaic\tregion\tregion_kind\tdonor\n")
+            for name, r, kind, d in mosaic_truth:
+                f.write(f"{name}\t{r}\t{kind}\t{d}\n")
+
     with open(os.path.join(args.out, "truth.bubbles.tsv"), "w") as f:
         f.write("site\ttype\tref_pos\tsize\tn_alleles_expected\n")
         f.write(f"DEL\tDEL\t{DEL_POS}\t{DEL_LEN}\t2\n")

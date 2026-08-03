@@ -107,6 +107,29 @@ echo "(with exact twins both should be 100% -- the panel can represent the sampl
 # With --twin-divergence the sample's allele may be absent from the panel, so exact match is the wrong
 # test: the right answer is the most similar allele available. The identity oracle answers that
 # directly -- rank 1 means we chose it.
+# A fully mosaic sample: a different donor in every region of the chain, so the backbones that carry a
+# marker-poor bubble are themselves from different donors and nothing along the chain is stable. This is
+# the case a linkage-based model should struggle with, so it is worth checking explicitly rather than
+# assuming. Both mosaics are held out, so the panel cannot contain either.
+if [[ -s "$OUT/hap_mosaic0.fa" && -s "$OUT/hap_mosaic1.fa" ]]; then
+  echo
+  echo "== fully mosaic sample (donor switches at every region; both held out) =="
+  rm -f "$OUT/m_1.fq" "$OUT/m_2.fq"
+  for h in mosaic0 mosaic1; do
+    L=$(awk 'NR>1{n+=length($0)} END{print n}' "$OUT/hap_$h.fa")
+    wgsim -N $(( DEPTH * L / 2 / 300 )) -1 150 -2 150 -d 350 -s 50 -e "$ERR" -r 0 -R 0 -X 0 \
+      -S "$SEED" "$OUT/hap_$h.fa" "$OUT/a_1.fq" "$OUT/a_2.fq" >/dev/null 2>&1
+    cat "$OUT/a_1.fq" >> "$OUT/m_1.fq"; cat "$OUT/a_2.fq" >> "$OUT/m_2.fq"
+  done
+  gzip -f "$OUT/m_1.fq" "$OUT/m_2.fq"
+  "$BIN" genotype -i "$OUT/bub.sorted.gfa" -b "$OUT/bub" -r ref -o "$OUT/gt_mo" \
+    -R "$OUT/m_1.fq.gz" -R "$OUT/m_2.fq.gz" --truth-haplotypes "mosaic0,mosaic1" \
+    --exclude-haplotypes "mosaic0,mosaic1" ${GENOTYPE_EXTRA:-} 2>&1 | grep -E "truth check" | sed 's/^/  /'
+  awk -F'\t' 'NR>1 && $2!="bubble"{n++; if ($10!=prev) sw++; prev=$10}
+              END{printf "  haplotype1 switched at %d of %d non-bubble blocks (a mosaic should switch often)\n", sw-1, n}' \
+    "$OUT/gt_mo.genotypes.tsv"
+fi
+
 if [[ -s "$OUT/gt_lo.accuracy.tsv" ]]; then
   awk -F'\t' 'NR>1 && $14 > 0 && $15 > 0 {
       n += 2; if ($14 == 1) k++; if ($15 == 1) k++
