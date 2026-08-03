@@ -155,6 +155,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
     DepthModel depth_model = DepthModel::Joint;
     double depth_quantile = 0.75;
     long dump_block = -1;
+    bool nearest_rank = false;
     bool provenance = false;
     double uneven_tolerance = 0.35;
     bool quiet = false;
@@ -200,6 +201,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
         }
         else if (arg == "--depth-quantile") depth_quantile = std::stod(require_value(arg));
         else if (arg == "--dump-block") dump_block = std::stol(require_value(arg));
+        else if (arg == "--nearest-emission-rank") nearest_rank = true;
         else if (arg == "--carrier-weight") carrier_weight = std::stod(require_value(arg));
         else if (arg == "--provenance") provenance = true;
         else if (arg == "-k" || arg == "--kmer-size") options.kmer_size = cli::parse_size_arg(arg, require_value(arg));
@@ -594,9 +596,33 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 resolve(a, ta1, ts1);
                 resolve(b, ta2, ts2);
             }
+            // Diagnostic: under leave-one-out the truth allele is often absent, so the emission-rank
+            // diagnostic (which asks where the target pair sits by emission alone, ignoring linkage) has
+            // nothing to aim at. Substitute the NEAREST AVAILABLE allele by length. If the nearest ranks
+            // first by emission but is not called, something after the emission overrode it; if it ranks
+            // poorly, the likelihood itself prefers a worse allele. Scoring is untouched -- the truth
+            // check reads ta1/ta2 directly, not what is handed to genotype_sample.
+            std::vector<int> pa1 = ta1;
+            std::vector<int> pa2 = ta2;
+            if (nearest_rank && !ta1.empty()) {
+                auto nearest = [&](std::size_t bi, const std::string& truth) {
+                    long best = -1;
+                    long bestd = -1;
+                    for (std::size_t ai = 0; ai < blocks[bi].allele_seq.size(); ++ai) {
+                        const long d = std::labs(static_cast<long>(blocks[bi].allele_seq[ai].size()) -
+                                                 static_cast<long>(truth.size()));
+                        if (best < 0 || d < bestd) { best = static_cast<long>(ai); bestd = d; }
+                    }
+                    return static_cast<int>(best);
+                };
+                for (std::size_t bi = 0; bi < chain.size(); ++bi) {
+                    if (bi < ts1.size() && !ts1[bi].empty() && pa1[bi] < 0) pa1[bi] = nearest(bi, ts1[bi]);
+                    if (bi < ts2.size() && !ts2[bi].empty() && pa2[bi] < 0) pa2[bi] = nearest(bi, ts2[bi]);
+                }
+            }
             std::vector<BlockCall> calls =
                 genotype_sample(chain, blocks, read_panel, rc, depth, hap_names, gopt, &gsum,
-                                ta1.empty() ? nullptr : &ta1, ta2.empty() ? nullptr : &ta2);
+                                pa1.empty() ? nullptr : &pa1, pa2.empty() ? nullptr : &pa2);
 
             if (run_joint) {
                 // The anchors of a block record lambda times the number of the sample's haplotypes
