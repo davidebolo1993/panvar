@@ -52,7 +52,11 @@ struct BlockCall {
     std::size_t hap1 = 0;        // most probable panel haplotype pair at this block
     std::size_t hap2 = 0;
     double hap_posterior = 0.0;
-    std::string filter = "PASS";
+    std::string filter = "PASS";     // quality only: PASS / LOWGQ / OFFPANEL / NOCALL
+    // Where the call came from, kept separate from quality. `local` = this block's own markers decided
+    // it; `linked` = it has none and the chain carried it. With --provenance this refines to
+    // self / neighbours / distant / none.
+    std::string evidence = "local";
     // Which blocks this call actually depended on, found by neutralizing each block in turn and
     // seeing whose call changes. "self" means the block's own markers decide it; "neighbours" means
     // the adjacent blocks carry it; "distant" means the evidence came from elsewhere in the chain.

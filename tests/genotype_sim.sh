@@ -75,9 +75,9 @@ for ((p=0; p<PAIRS; p++)); do
   wr=$(sed -E 's/.*\(([0-9]+) one allele right, ([0-9]+) both wrong\).*/\2/' <<<"$line")
   be=$(sed -E 's/.*bubble blocks ([0-9]+)\/([0-9]+).*/\1/' <<<"$line")
   bt=$(sed -E 's/.*bubble blocks ([0-9]+)\/([0-9]+).*/\2/' <<<"$line")
-  awk -F'\t' -v L="$LOCUS" -v D="$DEPTH" -v E="$ERR" -v LO="${LOO:-0}" -v P="$p" 'NR>1 && $10>=0 {
-      lo=($6<$7?$6:$7); hi=($6<$7?$7:$6); tl=($10<$11?$10:$11); th=($10<$11?$11:$10);
-      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n", L,D,E,LO,P,$2,$4,$5,$8,$9,(lo==tl&&hi==th)?1:0,$13
+  awk -F'\t' -v L="$LOCUS" -v D="$DEPTH" -v E="$ERR" -v LO="${LOO:-0}" -v P="$p" 'NR>1 && $17>=0 {
+      lo=($8<$9?$8:$9); hi=($8<$9?$9:$8); tl=($17<$18?$17:$18); th=($17<$18?$18:$17);
+      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n", L,D,E,LO,P,$2,$6,$7,$13,$14,(lo==tl&&hi==th)?1:0,$16
     }' "$OUT/gt.genotypes.tsv" >> "$CALLS" 2>/dev/null
   printf "  pair %d: %s/%s blocks exact, bubbles %s/%s%s\n" "$p" "$e" "$t" "$be" "$bt" "${unrep:+, $unrep unrepresentable}"
   exact=$((exact+e)); total=$((total+t)); partial=$((partial+pa)); wrong=$((wrong+wr))

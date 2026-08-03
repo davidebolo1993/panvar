@@ -273,8 +273,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                  std::to_string(gsum.mean_gq));
         write_read_audit(out_prefix, idx.chain, idx.panel, rc, depth);
         write_genotypes(out_prefix, idx.chain, idx.blocks, calls, idx.haplotype_names);
-        log.wrote({out_prefix + ".reads.depth.tsv", out_prefix + ".genotypes.tsv",
-                   out_prefix + ".haplotypes.tsv"});
+        log.wrote({out_prefix + ".reads.depth.tsv", out_prefix + ".genotypes.tsv"});
         log.done();
         return 0;
     }
@@ -866,8 +865,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                    out_prefix + ".audit.blockmarkers.tsv"});
         }
         if (!read_paths.empty()) {
-            log.wrote({out_prefix + ".reads.depth.tsv", out_prefix + ".genotypes.tsv",
-                       out_prefix + ".haplotypes.tsv"});
+            log.wrote({out_prefix + ".reads.depth.tsv", out_prefix + ".genotypes.tsv"});
         }
         if (!audit) { log.done(); return 0; }
     }

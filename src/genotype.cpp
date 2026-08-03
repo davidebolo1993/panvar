@@ -429,7 +429,10 @@ std::vector<BlockCall> genotype_sample(
         const bool measurable = has_markers && obs_universe_of[bi] >= 1.0;
         if (measurable && c.explained < options.min_explained) { c.filter = "OFFPANEL"; ++offpanel; }
         else if (c.gq < options.min_gq) { c.filter = "LOWGQ"; ++nocall; }
-        else { c.filter = has_markers ? "PASS" : "LINKED"; ++called; gq_sum += c.gq; }
+        else { c.filter = "PASS"; ++called; gq_sum += c.gq; }
+        // Provenance is orthogonal to quality: a block with no markers of its own is not a worse call,
+        // it is a differently sourced one, and a reader must be able to filter on each separately.
+        c.evidence = has_markers ? "local" : "linked";
     }
 
     // ---- provenance: which blocks did each call actually depend on? ----
@@ -499,6 +502,7 @@ std::vector<BlockCall> genotype_sample(
                 calls[b].provenance = top == b ? "self"
                                     : (top + 1 == b || b + 1 == top) ? "neighbours" : "distant";
             }
+            calls[b].evidence = calls[b].provenance;   // the finer answer, when we paid for it
         }
     }
 
@@ -525,41 +529,42 @@ void write_genotypes(
     const std::vector<BlockCall>& calls,
     const std::vector<std::string>& haplotype_names) {
 
+    // One row per block, in chain order, carrying everything needed to read a call without joining
+    // another file: where the block is (source -> sink), what was called, which panel haplotypes it
+    // came from, how confident, WHY, and whether it passed quality.
+    //
+    // `evidence` and `filter` answer different questions and used to be conflated in one column.
+    // `evidence` is provenance -- did this block's own syncmers decide it (`local`), or was it carried
+    // by the rest of the chain (`linked`)? With --provenance that refines to which blocks. `filter` is
+    // quality alone. A LINKED call is not lower quality, it is differently sourced, and a reader needs
+    // to be able to filter on each independently.
     const std::string gpath = out_prefix + ".genotypes.tsv";
     std::ofstream g(gpath);
     if (!g) throw std::runtime_error("genotype: cannot write " + gpath);
-    // provenance/influencers are appended after filter so existing column positions are unchanged.
-    g << "block_index\tblock_kind\tbubble_id\tn_alleles\tn_markers\tallele1\tallele2\tgq"
-         "\texplained\ttruth1\ttruth2\ttruth_rank\tfilter\tprovenance\tinfluencers\n";
+    g << "block_index\tblock_kind\tbubble_id\tsource\tsink\tn_alleles\tn_markers"
+         "\tallele1\tallele2\thaplotype1\thaplotype2\thap_posterior\tgq\texplained"
+         "\tevidence\tfilter\ttruth1\ttruth2\ttruth_rank\tinfluencers\n";
     for (std::size_t bi = 0; bi < calls.size(); ++bi) {
         const BlockCall& c = calls[bi];
         g << c.block_index << '\t'
           << (chain[bi].kind == BlockKind::Bubble ? "bubble"
               : chain[bi].kind == BlockKind::Flank ? "flank" : "backbone")
-          << '\t' << c.bubble_id << '\t' << blocks[bi].n_alleles << '\t' << c.n_markers << '\t'
-          << c.allele1 << '\t' << c.allele2 << '\t' << c.gq << '\t' << c.explained << '\t'
-          << c.truth_allele1 << '\t' << c.truth_allele2 << '\t' << c.truth_emission_rank << '\t'
-          << c.filter << '\t' << c.provenance << '\t';
+          << '\t' << c.bubble_id << '\t'
+          << (chain[bi].source.empty() ? "." : chain[bi].source) << '\t'
+          << (chain[bi].sink.empty() ? "." : chain[bi].sink) << '\t'
+          << blocks[bi].n_alleles << '\t' << c.n_markers << '\t'
+          << c.allele1 << '\t' << c.allele2 << '\t'
+          << (c.hap1 < haplotype_names.size() ? haplotype_names[c.hap1] : ".") << '\t'
+          << (c.hap2 < haplotype_names.size() ? haplotype_names[c.hap2] : ".") << '\t'
+          << c.hap_posterior << '\t' << c.gq << '\t' << c.explained << '\t'
+          << c.evidence << '\t' << c.filter << '\t'
+          << c.truth_allele1 << '\t' << c.truth_allele2 << '\t' << c.truth_emission_rank << '\t';
         for (std::size_t k = 0; k < c.influencers.size(); ++k) {
             if (k) g << ',';
             g << c.influencers[k];
         }
         if (c.influencers.empty()) g << '.';
         g << '\n';
-    }
-
-    const std::string hpath = out_prefix + ".haplotypes.tsv";
-    std::ofstream h(hpath);
-    if (!h) throw std::runtime_error("genotype: cannot write " + hpath);
-    h << "block_index\tblock_kind\thaplotype1\thaplotype2\tposterior\n";
-    for (std::size_t bi = 0; bi < calls.size(); ++bi) {
-        const BlockCall& c = calls[bi];
-        h << c.block_index << '\t'
-          << (chain[bi].kind == BlockKind::Bubble ? "bubble"
-              : chain[bi].kind == BlockKind::Flank ? "flank" : "backbone")
-          << '\t' << (c.hap1 < haplotype_names.size() ? haplotype_names[c.hap1] : "?") << '\t'
-          << (c.hap2 < haplotype_names.size() ? haplotype_names[c.hap2] : "?") << '\t'
-          << c.hap_posterior << '\n';
     }
 }
 
