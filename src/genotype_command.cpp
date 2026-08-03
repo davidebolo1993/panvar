@@ -543,6 +543,20 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 // resolved by spelling their own walk and matching it against the reduced panel's
                 // allele sequences. No match means the panel simply cannot represent that allele --
                 // the mosaic ceiling -- and the block is scored as unrepresentable rather than wrong.
+                // Alleles of the held-out haplotypes, enumerated exactly as the panel's were.
+                std::vector<BlockAlleles> held_blocks(chain.size());
+                if (!held_out.empty()) {
+                    Graph held_graph = graph;
+                    held_graph.paths = held_out;
+                    std::vector<BubblePathIndex> held_idx(held_graph.paths.size());
+                    for (std::size_t k = 0; k < held_graph.paths.size(); ++k) {
+                        held_idx[k] = build_bubble_path_index(held_graph.paths[k]);
+                    }
+                    for (std::size_t bi = 0; bi < chain.size(); ++bi) {
+                        held_blocks[bi] = enumerate_block_alleles(held_graph, held_idx, bubbles,
+                                                                 chain[bi], options.threads);
+                    }
+                }
                 auto resolve = [&](const std::string& name, std::vector<int>& out_alleles,
                                    std::vector<std::string>& out_seq) {
                     const auto direct = [&](std::size_t bi) {
@@ -561,42 +575,31 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         }
                         return;
                     }
-                    const BubblePathIndex idx = build_bubble_path_index(*held);
+                    // Resolve a held-out haplotype's truth by running the SAME allele enumeration
+                    // that built the panel, over a graph whose paths are the held-out ones. The two
+                    // used to be separate code paths -- the panel enumerated alleles while the truth
+                    // re-spelled the walk by hand -- and they drifted: on lpa the same haplotype at the
+                    // same block resolved to 252332 bp in the panel and 180244 bp when re-spelled, so
+                    // every leave-one-out score was measured against a truth the panel disagreed with.
+                    // One routine, used for both, is the only way to keep them from drifting again.
                     for (std::size_t bi = 0; bi < chain.size(); ++bi) {
-                        std::optional<std::vector<PathStep>> st;
-                        if (chain[bi].kind == BlockKind::Bubble) {
-                            for (const Bubble& bb : bubbles) {
-                                if (bb.id == chain[bi].bubble_id) {
-                                    st = bubble_steps(*held, idx, bb);
-                                    if (st.has_value() && !chain[bi].trim_node.empty() &&
-                                        st->size() > 1) {
-                                        if (st->front().node_id == chain[bi].trim_node) {
-                                            st->erase(st->begin());
-                                        } else if (st->back().node_id == chain[bi].trim_node) {
-                                            st->pop_back();
-                                        }
-                                    }
-                                    break;
-                                }
-                            }
-                        } else if (chain[bi].kind == BlockKind::Flank) {
-                            const bool leading = chain[bi].source.empty();
-                            st = flank_steps(*held, idx, leading ? chain[bi].sink : chain[bi].source, leading);
-                        } else {
-                            st = interval_interior_steps(*held, idx, chain[bi].source, chain[bi].sink);
-                        }
-                        if (!st.has_value() || st->empty()) {
-                            // Does not traverse: that is the bypass allele, not missing data.
+                        const auto it = held_blocks[bi].allele_of.find(name);
+                        if (it == held_blocks[bi].allele_of.end()) continue;
+                        const std::size_t hai = it->second;
+                        if (held_blocks[bi].bypass_allele >= 0 &&
+                            hai == static_cast<std::size_t>(held_blocks[bi].bypass_allele)) {
                             if (blocks[bi].bypass_allele >= 0) out_alleles[bi] = blocks[bi].bypass_allele;
                             continue;
                         }
-                        std::string seq = spell_path_steps_sequence(graph, *st);
+                        if (hai >= held_blocks[bi].allele_seq.size()) continue;
+                        const std::string& seq = held_blocks[bi].allele_seq[hai];
+                        if (seq.empty()) continue;
                         for (std::size_t ai = 0; ai < blocks[bi].allele_seq.size(); ++ai) {
                             if (blocks[bi].allele_seq[ai] == seq) { out_alleles[bi] = static_cast<int>(ai); break; }
                         }
                         // Kept even when no allele matches: an unrepresentable block still has a true
                         // sequence, and that is exactly the case the graded score exists to measure.
-                        out_seq[bi] = std::move(seq);
+                        out_seq[bi] = seq;
                     }
                 };
                 ts1.assign(chain.size(), std::string());
