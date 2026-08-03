@@ -63,8 +63,12 @@ void print_genotype_help() {
         << "                              multiplicity inside them\n"
         << "      --fragment-len <N>      Library fragment length, used to discount correlated\n"
         << "                              markers when computing GQ (default 350; 0 disables)\n"
-        << "      --depth-model <m>       How per-haplotype depth is estimated: median (default,\n"
-        << "                              per-block anchor median/2 shrunk toward the region),\n"
+        << "      --depth-model <m>       How per-haplotype depth is estimated: joint (default,\n"
+        << "                              a second pass that divides each block's anchors by how many\n"
+        << "                              of its called alleles traverse it -- the only estimator that\n"
+        << "                              is right when a haplotype's deletion removes whole blocks;\n"
+        << "                              skipped entirely when no block has a bypass allele),\n"
+        << "                              median (per-block anchor median/2 shrunk toward the region),\n"
         << "                              quantile (one region-wide value from a high quantile of the\n"
         << "                              block medians, so a deletion covering much of the locus\n"
         << "                              cannot drag it), or bases (total read bases over reference\n"
@@ -148,7 +152,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
     double fragment_len = 350.0;
     double recomb_rate = 1.0;
     double carrier_weight = 0.0;
-    DepthModel depth_model = DepthModel::Median;
+    DepthModel depth_model = DepthModel::Joint;
     double depth_quantile = 0.75;
     bool provenance = false;
     double uneven_tolerance = 0.35;
@@ -449,15 +453,24 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     break;
                 }
             }
+            // The joint refinement can only change anything when some haplotype bypasses a block --
+            // otherwise every block is traversed twice, the traversal count is a constant 2, and the
+            // second pass reproduces the first. Gate on that, so a panel without bypass alleles pays
+            // nothing for it.
+            bool panel_has_bypass = false;
+            for (const BlockAlleles& b : blocks) {
+                if (b.bypass_allele >= 0) { panel_has_bypass = true; break; }
+            }
+            const bool run_joint = depth_model == DepthModel::Joint && panel_has_bypass;
             std::vector<BlockDepth> depth =
                 estimate_depth(read_panel, rc, min_anchors, uneven_tolerance,
                                // Joint refines a first pass, so its starting point matters: seeded
                                // with Median it reproduces Median's own homozygous answer and never
                                // escapes. Bases does not depend on the genotype at all, which is
                                // exactly what a starting point needs.
-                               depth_model == DepthModel::Joint
-                                   ? (region_bp_hint > 0 ? DepthModel::Bases : DepthModel::Quantile)
-                                   : depth_model,
+                               run_joint ? (region_bp_hint > 0 ? DepthModel::Bases : DepthModel::Quantile)
+                                         : (depth_model == DepthModel::Joint ? DepthModel::Median
+                                                                             : depth_model),
                                depth_quantile, region_bp_hint);
             std::size_t uneven = 0;
             std::vector<double> lam;
@@ -551,7 +564,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 genotype_sample(chain, blocks, read_panel, rc, depth, hap_names, gopt, &gsum,
                                 ta1.empty() ? nullptr : &ta1, ta2.empty() ? nullptr : &ta2);
 
-            if (depth_model == DepthModel::Joint) {
+            if (run_joint) {
                 // The anchors of a block record lambda times the number of the sample's haplotypes
                 // that traverse it, and that count is part of the genotype. Take it from the first
                 // pass: divide each block's anchor median by how many of its called alleles are not
