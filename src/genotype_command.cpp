@@ -532,7 +532,18 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         std::optional<std::vector<PathStep>> st;
                         if (chain[bi].kind == BlockKind::Bubble) {
                             for (const Bubble& bb : bubbles) {
-                                if (bb.id == chain[bi].bubble_id) { st = bubble_steps(*held, idx, bb); break; }
+                                if (bb.id == chain[bi].bubble_id) {
+                                    st = bubble_steps(*held, idx, bb);
+                                    if (st.has_value() && !chain[bi].trim_node.empty() &&
+                                        st->size() > 1) {
+                                        if (st->front().node_id == chain[bi].trim_node) {
+                                            st->erase(st->begin());
+                                        } else if (st->back().node_id == chain[bi].trim_node) {
+                                            st->pop_back();
+                                        }
+                                    }
+                                    break;
+                                }
                             }
                         } else if (chain[bi].kind == BlockKind::Flank) {
                             const bool leading = chain[bi].source.empty();

@@ -25,6 +25,12 @@ struct Block {
     std::size_t bubble_id = 0;    // 0 for a backbone block
     std::string source;
     std::string sink;
+    // Two bubbles can abut, sharing a boundary node with no backbone between them. Both would then
+    // spell that node and the chain would count it twice -- the same defect that made backbones
+    // swallow their neighbours' boundaries. The later bubble gives it up. Named rather than
+    // front/back, because a reverse-oriented bubble carries its left endpoint at the END of the
+    // canonical source->sink steps.
+    std::string trim_node;
 };
 
 // Alleles of one block, grouped by the sequence they spell: two haplotypes taking different graph

@@ -132,14 +132,17 @@ std::vector<Block> build_block_chain(const std::vector<Bubble>& bubbles_in) {
         b.sink = left_of(bubbles.front());   // empty source = from the start of the path
         chain.push_back(b);
     }
+    std::string abut_node;
     for (std::size_t i = 0; i < bubbles.size(); ++i) {
+        abut_node.clear();
         if (i > 0) {
             Block b;
             b.index = chain.size();
             b.kind = BlockKind::Backbone;
             b.source = right_of(bubbles[i - 1]);
             b.sink = left_of(bubbles[i]);
-            if (b.source != b.sink) chain.push_back(b);   // adjacent bubbles share a boundary node
+            if (b.source != b.sink) chain.push_back(b);
+            else abut_node = b.source;   // no backbone between them: they share this boundary node
         }
         Block b;
         b.index = chain.size();
@@ -147,6 +150,7 @@ std::vector<Block> build_block_chain(const std::vector<Bubble>& bubbles_in) {
         b.bubble_id = bubbles[i].id;
         b.source = bubbles[i].source;
         b.sink = bubbles[i].sink;
+        b.trim_node = abut_node;
         chain.push_back(b);
     }
     {
@@ -182,6 +186,12 @@ BlockAlleles enumerate_block_alleles(
         std::optional<std::vector<PathStep>> steps;
         if (bubble != nullptr) {
             steps = bubble_steps(graph.paths[pi], path_indexes[pi], *bubble);
+            // Abutting bubbles share a boundary node; the later one gives it up so the chain tiles.
+            // It may sit at either end: a reverse-oriented bubble carries its left endpoint last.
+            if (steps.has_value() && !block.trim_node.empty() && steps->size() > 1) {
+                if (steps->front().node_id == block.trim_node) steps->erase(steps->begin());
+                else if (steps->back().node_id == block.trim_node) steps->pop_back();
+            }
         } else if (block.kind == BlockKind::Flank) {
             const bool leading = block.source.empty();
             steps = flank_steps(graph.paths[pi], path_indexes[pi],

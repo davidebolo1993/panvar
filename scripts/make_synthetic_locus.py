@@ -60,6 +60,10 @@ def main():
     ap.add_argument("--designs", type=int, default=8)
     ap.add_argument("--snps", type=int, default=60,
                     help="SNP sites, shared positions with per-design alleles")
+    ap.add_argument("--abut", action="store_true",
+                    help="place the DEL and INS sites back to back with no backbone between them, so "
+                         "two bubbles share a boundary node. build_block_chain drops the backbone when "
+                         "source == sink, a branch nothing else exercises.")
     ap.add_argument("--mosaics", type=int, default=0,
                     help="emit N extra haplotypes that are NOT in the panel, each switching donor "
                          "design at every SV site and every inter-SV stretch. They test the chain the "
@@ -116,7 +120,10 @@ def main():
     # SV sites at fixed FRACTIONS of the backbone, so the block structure scales with it. At the
     # default 50 kb these are the familiar 8000/18000/28000/38000.
     DEL_POS, DEL_LEN = int(args.backbone_bp * 0.16), 400
-    INS_POS, INS_LEN = int(args.backbone_bp * 0.36), 600
+    # --abut puts INS immediately after DEL, so the two bubbles share a boundary and no backbone lies
+    # between them.
+    INS_POS, INS_LEN = (int(args.backbone_bp * 0.16) + 400 if args.abut
+                        else int(args.backbone_bp * 0.36)), 600
     DUP_POS, DUP_LEN = int(args.backbone_bp * 0.56), args.dup_unit_bp
     INV_POS, INV_LEN = int(args.backbone_bp * 0.76), 700
     ins_payload = random_seq(rng, INS_LEN)
