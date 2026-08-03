@@ -675,6 +675,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     std::ofstream acc(acc_path);
                     acc << "block_index\tblock_kind\tbubble_id\tn_alleles\trepresentable\texact\t"
                            "dbp\tbest_dbp\tidentity\tbest_identity\toracle_rank\tid_h1\tid_h2\trank_h1\trank_h2"
+                           "\tlenrank_h1\tlenrank_h2"
                            "\tcross_c1t2\tcross_c2t1\tqv\ttrue_bp\tcalled_bp\tfilter\n";
                     // Identity oracle: the most similar allele the panel could have offered. `best_dbp`
                     // only says some allele matched the truth's LENGTH, which among hundreds of alleles
@@ -748,10 +749,17 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         long oracle_rank = -1;
                         double id_h0 = 0.0, id_h1 = 0.0;
                         long rank_h0 = -1, rank_h1 = -1;
+                        // Rank by LENGTH as well as by identity. At a tandem array the two disagree
+                        // sharply: alleles differing by several copies are still ~99% identical,
+                        // because identity is dominated by the shared repeat unit. An identity oracle
+                        // therefore reports success on a call whose copy number is badly wrong, which
+                        // is precisely the quantity a CNV caller exists to get right.
+                        long lenrank_h0 = -1, lenrank_h1 = -1;
                         if (blocks[bi].allele_seq.size() <= 1024) {
                             std::vector<std::unordered_set<std::uint64_t>> asets;
                             asets.reserve(blocks[bi].allele_seq.size());
                             for (const std::string& s : blocks[bi].allele_seq) asets.push_back(sync_set(s));
+                            long lrank_h[2] = {-1, -1};
                             double idsum_best = 0.0;
                             long ranksum = 0;
                             int nh_scored = 0;
@@ -780,6 +788,23 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                               return x.first != y.first ? x.first > y.first
                                                                         : x.second < y.second;
                                           });
+                                // Where the called allele ranks by |length - truth length|.
+                                {
+                                    std::vector<std::pair<long, std::size_t>> byd;
+                                    byd.reserve(blocks[bi].allele_seq.size());
+                                    for (std::size_t ai = 0; ai < blocks[bi].allele_seq.size(); ++ai) {
+                                        byd.emplace_back(std::labs(
+                                            static_cast<long>(blocks[bi].allele_seq[ai].size()) -
+                                            static_cast<long>(truth.size())), ai);
+                                    }
+                                    std::sort(byd.begin(), byd.end());
+                                    for (std::size_t r = 0; r < byd.size(); ++r) {
+                                        if (byd[r].second == cv[h ^ swap]) {
+                                            lrank_h[h] = static_cast<long>(r) + 1;
+                                            break;
+                                        }
+                                    }
+                                }
                                 const std::size_t called_ai = cv[h ^ swap];
                                 for (std::size_t r = 0; r < jac.size(); ++r) {
                                     if (jac[r].second == called_ai) {
@@ -804,6 +829,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                 oracle_rank = ranksum / nh_scored;
                                 id_h0 = id_h[0]; id_h1 = id_h[1];
                                 rank_h0 = rank_h[0]; rank_h1 = rank_h[1];
+                                lenrank_h0 = lrank_h[0]; lenrank_h1 = lrank_h[1];
                             }
                         }
                         const bool is_bub = chain[bi].kind == BlockKind::Bubble;
@@ -820,6 +846,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             << dbp << '\t' << best << '\t' << (idsum / 2.0) << '\t' << best_id << '\t'
                             << oracle_rank << '\t' << id_h0 << '\t' << id_h1 << '\t'
                             << rank_h0 << '\t' << rank_h1 << '\t'
+                            << lenrank_h0 << '\t' << lenrank_h1 << '\t'
                             // Both called alleles matching the SAME truth haplotype is the failure a
                             // per-haplotype identity cannot show: distinct allele indices can still be
                             // near-identical sequence, leaving the other haplotype unexplained.
