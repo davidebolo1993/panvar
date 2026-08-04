@@ -43,6 +43,19 @@ struct GenotypeOptions {
     // haplotype's nearest length independently of sequence -- and the model was already choosing the
     // most similar available allele for both. Kept so the negative result stays reproducible.
     double mass_weight = 0.0;
+    // Probability that a marker's count comes from sequence the candidate allele does not model rather
+    // than from the allele itself, mixed against a flat component (unmodelled sequence sits at an
+    // unknown copy number). Without it a marker the candidate lacks is predicted at the error
+    // background, so a real count there costs tens of log units and becomes an unbounded veto -- and
+    // under leave-one-out every candidate lacks some of the sample's sequence.
+    //
+    // OFF by default: the diagnosis is right and the remedy is not enough. It moves the most identical
+    // available pair from emission rank 29 to 9 as eps goes 0 to 0.05, monotonically, so the mechanism
+    // is real -- but it never flips the call, block-13 identities come out byte-identical at eps 0.01,
+    // and across 8 lpa pairs exact blocks fall 117/155 to 112/155. Capping the vetoes leaves a residual
+    // preference for the longer allele spread thinly over many markers, and pushing eps far enough to
+    // beat that discards real evidence. Kept so the measurement is reproducible.
+    double marker_outlier = 0.0;
     // Down-weight markers by how many of the block's alleles carry them. At a block with hundreds of
     // alleles the marker set is swamped by markers shared across many of them: one carried by 200 of
     // 450 discriminates almost nothing, yet thousands of such terms outvote the few allele-specific

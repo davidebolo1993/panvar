@@ -183,10 +183,46 @@ std::vector<BlockCall> genotype_sample(
             return it == wt.end() ? 1.0 : it->second;
         };
 
+        // A marker the candidate pair does not carry is predicted at the error background, so observing
+        // real counts there is nearly impossible and the marker becomes a veto. Under leave-one-out
+        // that is guaranteed to happen: the sample's own allele is gone, so EVERY candidate lacks some
+        // of the sample's sequence, and the one that lacks least wins whatever else it gets wrong.
+        //
+        // Measured at lpa's KIV-2 block, comparing the called pair against the most identical available
+        // pair: 57 markers carried by one and not the other, holding 797 of 451,000 observed counts,
+        // contributed +2704 log units, while the 951 markers both carry at differing copy number --
+        // holding 404,138 counts, 90% of the data -- contributed +453. A five-thousandth of the reads
+        // outvoted nine tenths of them, six to one. And the bias has a direction: a longer tandem array
+        // carries more distinct unit variants, so it is more likely to contain any given marker, which
+        // is why the call came out two repeat units too long.
+        //
+        // So every marker gets a mixture: mostly the allele's own prediction, and with probability
+        // `marker_outlier` a broad component standing for sequence the candidate does not model. That
+        // bounds what one marker can say without changing what many markers say together.
+        // The outlier component is FLAT, not another Poisson. Unmodelled sequence is present at an
+        // unknown copy number, so marginalising the count over that unknown gives a near-uniform
+        // density across the range a marker could reach -- about 1/(lambda * max copies). A Poisson at
+        // the block's mean count was tried first and is too narrow: it still charges ~20 log units for
+        // a marker the candidate lacks, which halved the problem instead of removing it (the identity
+        // oracle moved from emission rank 29 to 14 and the call did not change).
+        const double eps = std::min(0.5, std::max(0.0, options.marker_outlier));
+        double max_mult = 1.0;
+        for (const auto& mset : panel.by_block[bi]) {
+            for (const auto& [slot, m] : mset.nodes) { (void)slot; max_mult = std::max(max_mult, (double)m); }
+        }
+        const double broad_ll = -std::log(std::max(2.0, lambda * max_mult + 1.0));
+        auto mix = [&](double o, double mean) {
+            if (eps <= 0.0) return log_nb(o, mean, phi);
+            const double a = std::log1p(-eps) + log_nb(o, mean, phi);
+            const double b = std::log(eps) + broad_ll;
+            const double hi = std::max(a, b);
+            return hi + std::log(std::exp(a - hi) + std::exp(b - hi));
+        };
+
         double baseline = 0.0;
         double obs_universe = 0.0;
         for (const std::uint32_t slot : universe) {
-            baseline += log_nb(static_cast<double>(counts.node[slot]), mu, phi);
+            baseline += mix(static_cast<double>(counts.node[slot]), mu);
             obs_universe += counts.node[slot];
         }
         baseline_of[bi] = baseline;
@@ -282,8 +318,7 @@ std::vector<BlockCall> genotype_sample(
                 double ll = 0.0;
                 for (const auto& [slot, m] : tot) {
                     const double o = static_cast<double>(counts.node[slot]);
-                    ll += weight_of(slot) *
-                          (log_nb(o, scale * (lambda * m + mu), phi) - log_nb(o, mu, phi));
+                    ll += weight_of(slot) * (mix(o, scale * (lambda * m + mu)) - mix(o, mu));
                 }
                 double mass_ll = 0.0;
                 if (mass_sd > 0.0) {
@@ -709,7 +744,7 @@ void write_genotypes(
     g << "block_index\tblock_kind\tbubble_id\tsource\tsink\tn_alleles\tn_markers"
          "\tallele1\tallele2\thaplotype1\thaplotype2\thap_posterior\tgq\texplained\tdetected"
          "\tcalled_bp\tmass_bp\tmass_bp_sd"
-         "\tevidence\tfilter\ttruth1\ttruth2\ttruth_rank\tinfluencers\n";
+         "\tevidence\tfilter\ttruth1\ttruth2\ttruth_rank\ttruth_delta\tinfluencers\n";
     for (std::size_t bi = 0; bi < calls.size(); ++bi) {
         const BlockCall& c = calls[bi];
         g << c.block_index << '\t'
@@ -725,7 +760,8 @@ void write_genotypes(
           << c.hap_posterior << '\t' << c.gq << '\t' << c.explained << '\t' << c.detected << '\t'
           << c.called_bp << '\t' << c.mass_bp << '\t' << c.mass_bp_sd << '\t'
           << c.evidence << '\t' << c.filter << '\t'
-          << c.truth_allele1 << '\t' << c.truth_allele2 << '\t' << c.truth_emission_rank << '\t';
+          << c.truth_allele1 << '\t' << c.truth_allele2 << '\t' << c.truth_emission_rank << '\t'
+          << c.truth_emission_delta << '\t';
         for (std::size_t k = 0; k < c.influencers.size(); ++k) {
             if (k) g << ',';
             g << c.influencers[k];

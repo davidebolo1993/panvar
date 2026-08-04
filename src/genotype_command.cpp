@@ -16,6 +16,8 @@
 #include "panvar/syncmer.hpp"
 
 #include <unordered_set>
+#include <set>
+#include <cstdio>
 
 #include <algorithm>
 #include <cmath>
@@ -164,6 +166,9 @@ int run_genotype_command(const std::vector<std::string>& args) {
     bool depth_calibration = false;
     double mass_weight = 0.0;
     bool nearest_rank = false;
+    bool oracle_rank = false;
+    std::string explain_pair;
+    double marker_outlier = 0.0;
     bool model_pangenie = false;
     bool provenance = false;
     double uneven_tolerance = 0.35;
@@ -213,6 +218,9 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--depth-calibration") depth_calibration = true;
         else if (arg == "--mass-weight") mass_weight = std::stod(require_value(arg));
         else if (arg == "--nearest-emission-rank") nearest_rank = true;
+        else if (arg == "--oracle-emission-rank") oracle_rank = true;
+        else if (arg == "--explain-pair") explain_pair = require_value(arg);
+        else if (arg == "--marker-outlier") marker_outlier = std::stod(require_value(arg));
         else if (arg == "--model-pangenie") model_pangenie = true;
         else if (arg == "--carrier-weight") carrier_weight = std::stod(require_value(arg));
         else if (arg == "--provenance") provenance = true;
@@ -282,6 +290,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
         gopt.max_alleles_per_block = max_alleles;
         gopt.fragment_len = fragment_len;
         gopt.mass_weight = mass_weight;
+        gopt.marker_outlier = marker_outlier;
         GenotypeSummary gsum;
         const std::vector<BlockCall> calls = genotype_sample(idx.chain, idx.blocks, idx.panel, rc,
                                                              depth, idx.haplotype_names, gopt, &gsum);
@@ -486,6 +495,89 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 log.wrote({dpath});
             }
 
+            // Why does the emission prefer one candidate pair over another? The likelihood is a sum
+            // over thousands of markers, so a 100-unit gap can be one marker screaming or ten thousand
+            // whispering, and those call for opposite fixes. This splits the difference by multiplicity
+            // band and by whether the two pairs actually disagree about that marker.
+            if (!explain_pair.empty()) {
+                std::size_t ebi = 0, a1 = 0, a2 = 0, b1 = 0, b2 = 0;
+                if (std::sscanf(explain_pair.c_str(), "%zu:%zu,%zu:%zu,%zu", &ebi, &a1, &a2, &b1, &b2) != 5) {
+                    throw std::runtime_error("genotype: --explain-pair wants block:a1,a2:b1,b2");
+                }
+                const ReadCounts rce = count_reads(read_paths, read_panel, options.threads);
+                const std::vector<BlockDepth> de =
+                    estimate_depth(read_panel, rce, min_anchors, uneven_tolerance, DepthModel::Median,
+                                   depth_quantile, 0);
+                const double lam = ebi < de.size() ? de[ebi].lambda_hap : 0.0;
+                const double mub = 0.02 * lam;
+                auto profile = [&](std::size_t x, std::size_t y) {
+                    std::unordered_map<std::uint32_t, std::uint32_t> t;
+                    if (x < read_panel.by_block[ebi].size())
+                        for (const auto& [s, m] : read_panel.by_block[ebi][x].nodes) t[s] += m;
+                    if (y < read_panel.by_block[ebi].size())
+                        for (const auto& [s, m] : read_panel.by_block[ebi][y].nodes) t[s] += m;
+                    return t;
+                };
+                const auto A = profile(a1, a2);
+                const auto B = profile(b1, b2);
+                std::set<std::uint32_t> all;
+                for (const auto& [s, m] : A) { (void)m; all.insert(s); }
+                for (const auto& [s, m] : B) { (void)m; all.insert(s); }
+                // Poisson, matching the emission when phi degenerates (which it does here).
+                auto lp = [&](double o, double mean) {
+                    if (mean <= 0.0) mean = 1e-9;
+                    return -mean + o * std::log(mean) - std::lgamma(o + 1.0);
+                };
+                const char* bn[] = {"0", "1", "2", "3-5", "6-10", "11-30", ">30"};
+                double dsum[7] = {0}; std::size_t dn[7] = {0}; double dobs[7] = {0};
+                double dmA[7] = {0}, dmB[7] = {0};
+                for (const std::uint32_t s : all) {
+                    const auto ia = A.find(s); const auto ib = B.find(s);
+                    const double ma = ia == A.end() ? 0.0 : ia->second;
+                    const double mb = ib == B.end() ? 0.0 : ib->second;
+                    const double o = static_cast<double>(rce.node[s]);
+                    const double mx = std::max(ma, mb);
+                    const std::size_t k = mx == 0 ? 0 : mx == 1 ? 1 : mx == 2 ? 2 : mx <= 5 ? 3
+                                        : mx <= 10 ? 4 : mx <= 30 ? 5 : 6;
+                    dsum[k] += lp(o, lam * ma + mub) - lp(o, lam * mb + mub);
+                    dobs[k] += o; dmA[k] += ma; dmB[k] += mb; ++dn[k];
+                }
+                const std::string ep = out_prefix + ".explain.tsv";
+                std::ofstream e(ep);
+                e << "mult_band\tn_markers\tsum_obs\tsum_mult_A\tsum_mult_B\tlogL_A_minus_B\n";
+                double tot = 0.0;
+                for (std::size_t k = 0; k < 7; ++k) {
+                    if (dn[k] == 0) continue;
+                    e << bn[k] << '\t' << dn[k] << '\t' << dobs[k] << '\t' << dmA[k] << '\t' << dmB[k]
+                      << '\t' << dsum[k] << '\n';
+                    tot += dsum[k];
+                }
+                e << "all\t" << all.size() << "\t\t\t\t" << tot << '\n';
+                // The band table says WHICH markers vote; this says whether they vote because the two
+                // pairs disagree about copy number, or because one of them does not carry the marker at
+                // all. Those are very different failures: the first is a copy-number call, the second
+                // is the sample carrying sequence the candidate allele lacks -- which under
+                // leave-one-out is guaranteed for every candidate, since the true allele is gone.
+                struct Cls { std::size_t n = 0; double obs = 0, ll = 0; };
+                Cls only_a, only_b, both_differ, both_same;
+                for (const std::uint32_t s2 : all) {
+                    const auto ia = A.find(s2); const auto ib = B.find(s2);
+                    const double ma = ia == A.end() ? 0.0 : ia->second;
+                    const double mb = ib == B.end() ? 0.0 : ib->second;
+                    const double o = static_cast<double>(rce.node[s2]);
+                    const double d = lp(o, lam * ma + mub) - lp(o, lam * mb + mub);
+                    Cls& c2 = (ma > 0 && mb == 0) ? only_a : (mb > 0 && ma == 0) ? only_b
+                            : (ma != mb) ? both_differ : both_same;
+                    ++c2.n; c2.obs += o; c2.ll += d;
+                }
+                e << "#class\tn_markers\tsum_obs\tlogL_A_minus_B\n";
+                e << "#carried_by_A_only\t" << only_a.n << '\t' << only_a.obs << '\t' << only_a.ll << '\n';
+                e << "#carried_by_B_only\t" << only_b.n << '\t' << only_b.obs << '\t' << only_b.ll << '\n';
+                e << "#both_but_differing_copies\t" << both_differ.n << '\t' << both_differ.obs << '\t' << both_differ.ll << '\n';
+                e << "#both_same_copies\t" << both_same.n << '\t' << both_same.obs << '\t' << both_same.ll << '\n';
+                log.wrote({ep});
+            }
+
             const ReadCounts rc = count_reads(read_paths, read_panel, options.threads);
             log.info("reads: " + std::to_string(rc.reads) + " (" + std::to_string(rc.bases / 1000) +
                      " kb); " + std::to_string(rc.syncmers) + " syncmers, " +
@@ -539,6 +631,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
             gopt.recomb_rate = recomb_rate;
             gopt.carrier_weight = carrier_weight;
             gopt.mass_weight = mass_weight;
+            gopt.marker_outlier = marker_outlier;
             GenotypeSummary gsum;
             std::vector<int> ta1;
             std::vector<int> ta2;
@@ -635,8 +728,13 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     const std::string cpath = out_prefix + ".depth.calibration.tsv";
                     std::ofstream c(cpath);
                     if (!c) throw std::runtime_error("genotype: cannot write " + cpath);
+                    // fano = observed variance of the residual divided by the predicted mean. A
+                    // Poisson count gives 1. The emission uses a negative binomial whose dispersion is
+                    // fitted on the depth ANCHORS, which are single-copy by construction, so this is
+                    // the check that the fit still holds where the copy-number signal actually lives:
+                    // at markers carried twenty or thirty times over.
                     c << "block_index\tblock_kind\tmult_class\tn_markers\tsum_mult\tsum_obs"
-                         "\tlambda_implied\tlambda_used\tratio\n";
+                         "\tlambda_implied\tlambda_used\tratio\tmean_pred\tfano\n";
                     const char* names[] = {"1", "2", "3-5", "6-10", ">10", "all"};
                     for (std::size_t bi = 0; bi < chain.size() && bi < read_panel.by_block.size(); ++bi) {
                         if (bi >= ta1.size() || ta1[bi] < 0 || ta2[bi] < 0) continue;
@@ -647,14 +745,19 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         std::unordered_map<std::uint32_t, std::uint64_t> m;
                         for (const auto& [slot, k] : ba[i1].nodes) m[slot] += k;
                         for (const auto& [slot, k] : ba[i2].nodes) m[slot] += k;
-                        double sm[6] = {0}, so[6] = {0};
+                        double sm[6] = {0}, so[6] = {0}, sres[6] = {0}, spred[6] = {0};
                         std::size_t nm[6] = {0};
+                        const double lam_b = bi < depth.size() ? depth[bi].lambda_hap : 0.0;
                         for (const auto& [slot, mult] : m) {
                             const std::size_t cls = mult == 1 ? 0 : mult == 2 ? 1 : mult <= 5 ? 2
                                                   : mult <= 10 ? 3 : 4;
                             const double obs = static_cast<double>(rc.node[slot]);
+                            const double pred = lam_b * static_cast<double>(mult);
+                            const double res = (obs - pred) * (obs - pred);
                             sm[cls] += static_cast<double>(mult); so[cls] += obs; ++nm[cls];
                             sm[5] += static_cast<double>(mult); so[5] += obs;  ++nm[5];
+                            sres[cls] += res;   spred[cls] += pred;
+                            sres[5] += res;     spred[5] += pred;
                         }
                         for (std::size_t cl = 0; cl < 6; ++cl) {
                             if (nm[cl] == 0) continue;
@@ -666,7 +769,9 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                   : chain[bi].kind == BlockKind::Flank ? "flank" : "backbone")
                               << '\t' << names[cl] << '\t' << nm[cl] << '\t' << sm[cl] << '\t' << so[cl]
                               << '\t' << implied << '\t' << used << '\t'
-                              << (used > 0.0 ? implied / used : 0.0) << '\n';
+                              << (used > 0.0 ? implied / used : 0.0) << '\t'
+                              << spred[cl] / static_cast<double>(nm[cl]) << '\t'
+                              << (spred[cl] > 0.0 ? sres[cl] / spred[cl] : 0.0) << '\n';
                         }
                     }
                     log.wrote({cpath});
@@ -694,6 +799,58 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 for (std::size_t bi = 0; bi < chain.size(); ++bi) {
                     if (bi < ts1.size() && !ts1[bi].empty() && pa1[bi] < 0) pa1[bi] = nearest(bi, ts1[bi]);
                     if (bi < ts2.size() && !ts2[bi].empty() && pa2[bi] < 0) pa2[bi] = nearest(bi, ts2[bi]);
+                }
+            }
+            // Target the most IDENTICAL available allele per haplotype, and ask where the EMISSION
+            // ranks that pair. This is the gate on every "we picked the wrong allele" claim: the
+            // identity oracle chooses each haplotype's best independently, so the pair it names has
+            // never been scored as a pair, and a target that no likelihood could prefer is not a defect.
+            //
+            // Length was the previous target and it was the wrong one -- it ignores sequence entirely,
+            // and forcing the call to match it made identity worse. Identity is the meaningful oracle,
+            // but it needs the same check before it is trusted.
+            if (oracle_rank && !ta1.empty()) {
+                const std::size_t kk = read_panel.kmer_size;
+                const std::size_t ss = read_panel.syncmer_s != 0 ? read_panel.syncmer_s
+                                                                 : default_syncmer_s(kk);
+                auto sset = [&](const std::string& s) {
+                    std::unordered_set<std::uint64_t> out;
+                    for (const KmerOccurrence& o : collect_syncmers(s, kk, ss)) out.insert(o.code);
+                    return out;
+                };
+                // Jaccard over every allele to shortlist, exact alignment on the shortlist. Jaccard
+                // alone will not do: it is set-valued, so it ignores multiplicity, and inside a tandem
+                // array two alleles with the same unit repertoire and different copy numbers score
+                // alike -- blind to the one quantity the call has to get right.
+                auto most_identical = [&](std::size_t bi, const std::string& truth) {
+                    if (blocks[bi].allele_seq.empty() || blocks[bi].allele_seq.size() > 1024) return -1;
+                    const auto tset = sset(truth);
+                    std::vector<std::pair<double, std::size_t>> jac;
+                    for (std::size_t ai = 0; ai < blocks[bi].allele_seq.size(); ++ai) {
+                        const auto A = sset(blocks[bi].allele_seq[ai]);
+                        std::size_t inter = 0;
+                        for (const std::uint64_t c : (A.size() <= tset.size() ? A : tset)) {
+                            if ((A.size() <= tset.size() ? tset : A).count(c) != 0) ++inter;
+                        }
+                        const std::size_t uni = A.size() + tset.size() - inter;
+                        jac.emplace_back(uni == 0 ? 1.0 : static_cast<double>(inter) / static_cast<double>(uni), ai);
+                    }
+                    std::sort(jac.begin(), jac.end(), [](const auto& x, const auto& y) {
+                        return x.first != y.first ? x.first > y.first : x.second < y.second;
+                    });
+                    long best = -1;
+                    double bid = -1.0;
+                    for (std::size_t r = 0; r < std::min<std::size_t>(16, jac.size()); ++r) {
+                        const NwAlign n2 = nw_edit_distance(blocks[bi].allele_seq[jac[r].second], truth);
+                        const double id = 1.0 - static_cast<double>(n2.edits) /
+                                                static_cast<double>(std::max<std::size_t>(1, n2.aln_len));
+                        if (id > bid) { bid = id; best = static_cast<long>(jac[r].second); }
+                    }
+                    return static_cast<int>(best);
+                };
+                for (std::size_t bi = 0; bi < chain.size(); ++bi) {
+                    if (bi < ts1.size() && !ts1[bi].empty()) pa1[bi] = most_identical(bi, ts1[bi]);
+                    if (bi < ts2.size() && !ts2[bi].empty()) pa2[bi] = most_identical(bi, ts2[bi]);
                 }
             }
             std::vector<BlockCall> calls =
