@@ -364,16 +364,21 @@ def main():
                 ids = [add_node(c) for c in copies]
                 ref_walk.append((ids[0], "+"))
                 if args.dup_per_design_divergence > 0.0:
-                    # Each design walks its OWN copies, so every array allele is distinct.
+                    # Each design walks its OWN copies, so every array allele is distinct. The unit is
+                    # diverged ONCE per design and then repeated, so copies within a haplotype stay
+                    # identical and copy number still shows up as marker MULTIPLICITY -- which is what a
+                    # real tandem array looks like, the copies being a recent duplication of one unit.
+                    # Diverging each copy independently instead would make every copy's syncmers unique,
+                    # so multiplicity would never accumulate and copy number would be carried by marker
+                    # count alone. That is a different and much harder problem than the real one.
                     for d in range(args.designs):
                         drng2 = random.Random(args.seed * 991 + d)
-                        own = []
-                        for _ in range(designs[d]["DUP"]):
-                            u = list(dup_unit)
-                            for t in range(len(u)):
-                                if drng2.random() < args.dup_per_design_divergence:
-                                    u[t] = drng2.choice([b for b in "ACGT" if b != u[t]])
-                            own.append(add_node("".join(u)))
+                        u = list(dup_unit)
+                        for t in range(len(u)):
+                            if drng2.random() < args.dup_per_design_divergence:
+                                u[t] = drng2.choice([b for b in "ACGT" if b != u[t]])
+                        unit_d = "".join(u)
+                        own = [add_node(unit_d) for _ in range(designs[d]["DUP"])]
                         hs = [h for h in (f"design{d}#a", f"design{d}#b") if h in here]
                         for nid2 in own:
                             push(hs, nid2)

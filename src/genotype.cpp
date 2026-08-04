@@ -229,7 +229,12 @@ std::vector<BlockCall> genotype_sample(
                 // the UNION of the block's markers -- summing per allele would count every shared
                 // marker once per carrier and make `explained` scale like 1/n_alleles.
                 explained[bi][x * kn + y] = obs_universe > 0.0 ? obs_in / obs_universe : 0.0;
-                detected[bi][x * kn + y] = pred_in > 0.0 ? std::min(1.0, obs_in / pred_in) : 1.0;
+                // Raw ratio, NOT capped. Capping at 1 made this blind in one direction: a call that
+                // UNDER-states multiplicity predicts fewer counts than the reads carry, so obs/pred
+                // rises above 1 -- and the cap turned that into a clean 1.0. Measured on a synthetic
+                // tandem array, 7 of 8 samples under-called the total by 9-54 kb while reporting
+                // detected = 1.0. A fit ratio has to be two-sided to be a fit ratio.
+                detected[bi][x * kn + y] = pred_in > 0.0 ? obs_in / pred_in : 1.0;
             }
         }
     }
@@ -476,7 +481,13 @@ std::vector<BlockCall> genotype_sample(
         // likelihood has been minimising predicted counts rather than matching them. GQ cannot see
         // this: it is a comparison between alternatives, and when every alternative fits badly the
         // least-bad one still wins by a wide margin.
-        else if (has_markers && c.detected < options.min_detected) { c.filter = "LOWCOV"; ++nocall; }
+        // Either direction is a misfit: below the bound the reads do not account for what the call
+        // predicts (a coverage dropout), above its reciprocal the call does not account for what the
+        // reads carry (multiplicity under-stated, which is how a copy-number call collapses).
+        else if (has_markers && options.min_detected > 0.0 &&
+                 (c.detected < options.min_detected || c.detected > 1.0 / options.min_detected)) {
+            c.filter = "LOWCOV"; ++nocall;
+        }
         else if (c.gq < options.min_gq) { c.filter = "LOWGQ"; ++nocall; }
         else { c.filter = "PASS"; ++called; gq_sum += c.gq; }
         // Provenance is orthogonal to quality: a block with no markers of its own is not a worse call,

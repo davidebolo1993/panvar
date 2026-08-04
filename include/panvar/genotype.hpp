@@ -18,9 +18,15 @@ struct GenotypeOptions {
     // independent observations: roughly the block span divided by the fragment length, not the marker
     // count. 0 disables the correction.
     double fragment_len = 350.0;
-    double min_gq = 20.0;
+    // Measured, not guessed. Sweeping the threshold on lpa leave-one-out over 6 pairs, 88 exact and
+    // 26 wrong calls: GQ>=10 keeps 80% of exact calls at 90% precision, while GQ>=20 keeps only 65% at
+    // 89%. Precision plateaus from 10 upward, so every point above it costs recall and buys nothing.
+    double min_gq = 10.0;
     double min_explained = 0.5;        // below this, the panel does not account for what was observed
-    double min_detected = 0.5;         // below this, the reads do not account for what the call predicts
+    // Two-sided bound on obs/pred. Below it the reads do not account for what the call predicts (a
+    // dropout); above its reciprocal the call does not account for what the reads carry (multiplicity
+    // under-stated). 0 disables.
+    double min_detected = 0.5;
     std::size_t max_alleles_per_block = 64;   // prune by detected-marker fraction before pairing
     // Down-weight markers by how many of the block's alleles carry them. At a block with hundreds of
     // alleles the marker set is swamped by markers shared across many of them: one carried by 200 of
@@ -56,7 +62,7 @@ struct BlockCall {
     // block whose reads are missing predicts counts that are not there, and the likelihood then picks
     // whichever allele predicts least -- collapsing a copy-number call to its minimum, confidently,
     // because every alternative fits even worse.
-    double detected = 0.0;
+    double detected = 0.0;   // obs/pred over the called pair's markers; 1.0 is a perfect fit
     std::size_t hap1 = 0;        // most probable panel haplotype pair at this block
     std::size_t hap2 = 0;
     double hap_posterior = 0.0;
