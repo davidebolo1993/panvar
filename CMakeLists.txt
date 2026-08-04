@@ -124,6 +124,7 @@ add_library(panvarlib
     src/genotype_index.cpp
     src/genotype_markers.cpp
     src/genotype_reads.cpp
+    src/pangenie_model.cpp
     src/bubble_path.cpp
     src/bubbles.cpp
     src/ref_path.cpp

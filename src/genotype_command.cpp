@@ -10,6 +10,7 @@
 #include "panvar/genotype_reads.hpp"
 #include "panvar/gfa.hpp"
 #include "panvar/output.hpp"
+#include "panvar/pangenie_model.hpp"
 
 #include "panvar/parallel.hpp"
 #include "panvar/syncmer.hpp"
@@ -85,6 +86,11 @@ void print_genotype_help() {
         << "                              makes blocks nearly independent, lowering it locks the\n"
         << "                              chain to one haplotype pair -- useful for telling\n"
         << "                              emission error apart from linkage error\n"
+        << "      --model-pangenie        Genotype with a faithful port of PanGenie's model instead\n"
+        << "                              of panvar's: their unique-once presence/absence marker rule,\n"
+        << "                              their geometric+Poisson emission capped at copy number 2, and\n"
+        << "                              their distance-scaled Li-Stephens transition. Same panel and\n"
+        << "                              same read counts, so any difference is the model alone\n"
         << "      --provenance            Attribute each call to the blocks that determined it, by\n"
         << "                              neutralizing one block at a time and re-running the chain.\n"
         << "                              Adds provenance (self/neighbours/distant/none) and the\n"
@@ -156,6 +162,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
     double depth_quantile = 0.75;
     long dump_block = -1;
     bool nearest_rank = false;
+    bool model_pangenie = false;
     bool provenance = false;
     double uneven_tolerance = 0.35;
     bool quiet = false;
@@ -202,6 +209,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--depth-quantile") depth_quantile = std::stod(require_value(arg));
         else if (arg == "--dump-block") dump_block = std::stol(require_value(arg));
         else if (arg == "--nearest-emission-rank") nearest_rank = true;
+        else if (arg == "--model-pangenie") model_pangenie = true;
         else if (arg == "--carrier-weight") carrier_weight = std::stod(require_value(arg));
         else if (arg == "--provenance") provenance = true;
         else if (arg == "-k" || arg == "--kmer-size") options.kmer_size = cli::parse_size_arg(arg, require_value(arg));
@@ -634,6 +642,29 @@ int run_genotype_command(const std::vector<std::string>& args) {
             std::vector<BlockCall> calls =
                 genotype_sample(chain, blocks, read_panel, rc, depth, hap_names, gopt, &gsum,
                                 pa1.empty() ? nullptr : &pa1, pa2.empty() ? nullptr : &pa2);
+
+            if (model_pangenie) {
+                // Same panel, same counts, same depth -- only the model differs, which is the whole
+                // point: any difference is attributable to the emission, transition and marker rule
+                // rather than to inputs.
+                PanGenieOptions po;
+                po.threads = options.threads;
+                const std::vector<PanGenieCall> pg =
+                    genotype_pangenie(chain, blocks, read_panel, rc, depth, hap_names, po);
+                std::size_t undef = 0;
+                for (std::size_t bi = 0; bi < calls.size() && bi < pg.size(); ++bi) {
+                    calls[bi].allele1 = pg[bi].allele1;
+                    calls[bi].allele2 = pg[bi].allele2;
+                    calls[bi].gq = pg[bi].gq;
+                    calls[bi].n_markers = pg[bi].n_markers;
+                    calls[bi].evidence = pg[bi].undefined ? "none" : "local";
+                    calls[bi].filter = pg[bi].undefined ? "NOMARKERS"
+                                                        : (pg[bi].gq < gopt.min_gq ? "LOWGQ" : "PASS");
+                    if (pg[bi].undefined) ++undef;
+                }
+                log.info("pangenie model: " + std::to_string(calls.size()) + " blocks, " +
+                         std::to_string(undef) + " with no usable marker under their unique-once rule");
+            }
 
             if (run_joint) {
                 // The anchors of a block record lambda times the number of the sample's haplotypes
