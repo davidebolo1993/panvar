@@ -85,6 +85,7 @@ std::vector<BlockCall> genotype_sample(
     std::vector<std::vector<double>> detected(nb);
     std::vector<double> baseline_of(nb, 0.0);
     std::vector<double> obs_universe_of(nb, 0.0);
+    std::vector<double> universe_size(nb, 0.0);
 
     for (std::size_t bi = 0; bi < nb; ++bi) {
         const std::size_t na = panel.by_block[bi].size();
@@ -190,6 +191,7 @@ std::vector<BlockCall> genotype_sample(
         }
         baseline_of[bi] = baseline;
         obs_universe_of[bi] = obs_universe;
+        universe_size[bi] = static_cast<double>(universe.size());
 
         // Effective-sample-size discount. Adjacent syncmers sit a few bp apart, so ~25 of them share
         // one 150 bp read; treating each as independent overstates the evidence and yields
@@ -201,6 +203,41 @@ std::vector<BlockCall> genotype_sample(
             const double span = lens.empty() ? 0.0 : static_cast<double>(lens[lens.size() / 2]);
             rho = std::min(1.0, (span / options.fragment_len) / static_cast<double>(universe.size()));
             if (!(rho > 0.0)) rho = 1e-6;
+        }
+
+        // ---- total-mass term ----
+        //
+        // The per-marker product above is discounted by rho because adjacent syncmers share reads, so
+        // thousands of markers do not carry thousands of independent observations. That discount is
+        // right for COMPOSITION -- which markers are present, at what relative multiplicity -- but it
+        // is wrong for the TOTAL, and the two are different statistics with different effective sample
+        // sizes. One fragment contributes to many markers at once, so summing the block's counts adds
+        // fragments rather than markers: the total's relative error is 1/sqrt(number of fragments
+        // crossing the block), independent of how many markers it holds.
+        //
+        // Scored jointly under rho, the total is shrunk by the same factor as the composition and stops
+        // deciding anything. Measured at lpa's KIV-2 array: the pair whose total length is correct
+        // ranks 4270th of 457x457 by emission alone, while a pair one repeat unit short ranks first at
+        // GQ 99 -- the likelihood was trading a uniform 3.7% shortfall in predicted counts, which costs
+        // it almost nothing per marker, against unit-variant composition, which costs it a lot. The
+        // total is exactly the statistic that distinguishes them, so it gets its own weight.
+        //
+        // Worked in multiplicity rather than in bases: informative-marker density is not a property of
+        // sequence -- an allele with many confined markers and one with few can be the same length --
+        // so a bases-to-multiplicity conversion would be a second assumption. The emission already
+        // needs each pair's total multiplicity, so this costs nothing to compute.
+        double mass_target = 0.0;
+        double mass_sd = 0.0;
+        if (options.mass_weight > 0.0 && lambda > 0.0 && !universe.empty()) {
+            mass_target = std::max(0.0, obs_universe - static_cast<double>(universe.size()) * mu) / lambda;
+            std::vector<std::size_t> lens = blocks[bi].allele_bp;
+            std::sort(lens.begin(), lens.end());
+            const double span = lens.empty() ? 0.0 : static_cast<double>(lens[lens.size() / 2]);
+            // Fragments over both haplotypes of the block. lambda under-states the base depth (it is
+            // per-syncmer, so it already carries the (readlen-k+1)/readlen factor), which makes this
+            // an under-count and the resulting sd conservative.
+            const double frags = options.fragment_len > 0.0 ? 2.0 * lambda * span / options.fragment_len : 0.0;
+            mass_sd = frags > 1.0 && mass_target > 0.0 ? mass_target / std::sqrt(frags) : 0.0;
         }
 
         const std::size_t kn = kept[bi].size();
@@ -215,16 +252,45 @@ std::vector<BlockCall> genotype_sample(
                 std::unordered_map<std::uint32_t, std::uint32_t> tot;
                 for (const auto& [slot, mult] : panel.by_block[bi][kept[bi][x]].nodes) tot[slot] += mult;
                 for (const auto& [slot, mult] : panel.by_block[bi][kept[bi][y]].nodes) tot[slot] += mult;
-                double ll = 0.0;
                 double obs_in = 0.0;
                 double pred_in = 0.0;
+                double mult_in = 0.0;
+                for (const auto& [slot, m] : tot) {
+                    obs_in += static_cast<double>(counts.node[slot]);
+                    pred_in += lambda * m + mu;
+                    mult_in += m;
+                }
+                // Shape and scale are scored separately, because the reads measure them at very
+                // different precisions and folding both into one discounted product gets the second
+                // one wrong.
+                //
+                // `scale` profiles the pair's overall depth out of the per-marker term: every predicted
+                // mean is multiplied by the factor that makes the pair's total match the observed
+                // total, so what remains is the SHAPE of the count vector -- which markers, in what
+                // proportion -- and that is what the ESS discount is the right correction for.
+                // `mass_ll` then puts the scale back as its own term at its own precision: the block's
+                // total count gains one observation per fragment crossing it, not one per marker, so
+                // its relative error is 1/sqrt(fragments) and does not shrink with rho.
+                //
+                // Scored the old way -- scale buried inside the discounted product -- lpa's KIV-2 block
+                // preferred a pair two repeat units too long by 208 log units, because a uniform 4.4%
+                // excess in predicted counts costs almost nothing per marker after rho, while the
+                // unit-variant composition it buys is worth a great deal. The total, which says
+                // unambiguously that the pair is 4.4% too big, was being shrunk 22-fold alongside it.
+                const double scale = (options.mass_weight > 0.0 && pred_in > 0.0 && obs_in > 0.0)
+                                         ? obs_in / pred_in : 1.0;
+                double ll = 0.0;
                 for (const auto& [slot, m] : tot) {
                     const double o = static_cast<double>(counts.node[slot]);
-                    ll += weight_of(slot) * (log_nb(o, lambda * m + mu, phi) - log_nb(o, mu, phi));
-                    obs_in += o;
-                    pred_in += lambda * m + mu;
+                    ll += weight_of(slot) *
+                          (log_nb(o, scale * (lambda * m + mu), phi) - log_nb(o, mu, phi));
                 }
-                emis[bi][x * kn + y] = baseline + rho * ll;
+                double mass_ll = 0.0;
+                if (mass_sd > 0.0) {
+                    const double z = (mult_in - mass_target) / mass_sd;
+                    mass_ll = -0.5 * options.mass_weight * z * z;
+                }
+                emis[bi][x * kn + y] = baseline + rho * ll + mass_ll;
                 // Share of the block's observed marker mass this pair accounts for. The denominator is
                 // the UNION of the block's markers -- summing per allele would count every shared
                 // marker once per carrier and make `explained` scale like 1/n_alleles.
@@ -466,6 +532,45 @@ std::vector<BlockCall> genotype_sample(
             c.detected = detected[bi][off];
         }
 
+        // How much sequence the reads say is here, measured without reference to the panel's allele
+        // list. Every marker in the block is expected at lambda*(copies in hap1 + copies in hap2), so
+        // the observed mass over the whole marker universe, less the error background, divided by
+        // lambda, IS the total multiplicity the sample carries. The called pair's own
+        // multiplicity-per-base converts that to bases -- a ratio that is stable inside a tandem array,
+        // where every allele is the same unit repeated.
+        //
+        // This matters because an allele call is quantised to the lengths the panel happens to hold.
+        // When the sample's own array is not among them the call lands on the nearest whole array,
+        // which at lpa's KIV-2 is a whole repeat unit away; the mass estimate is continuous and does
+        // not have to round to a panel member.
+        {
+            const double bp1 = c.allele1 < blocks[bi].allele_bp.size()
+                                   ? static_cast<double>(blocks[bi].allele_bp[c.allele1]) : 0.0;
+            const double bp2 = c.allele2 < blocks[bi].allele_bp.size()
+                                   ? static_cast<double>(blocks[bi].allele_bp[c.allele2]) : 0.0;
+            c.called_bp = bp1 + bp2;
+            double m_called = 0.0;
+            if (c.allele1 < panel.by_block[bi].size()) {
+                for (const auto& [slot, m] : panel.by_block[bi][c.allele1].nodes) { (void)slot; m_called += m; }
+            }
+            if (c.allele2 < panel.by_block[bi].size()) {
+                for (const auto& [slot, m] : panel.by_block[bi][c.allele2].nodes) { (void)slot; m_called += m; }
+            }
+            const double lambda = bi < depth.size() ? depth[bi].lambda_hap : 0.0;
+            const double density = c.called_bp > 0.0 ? m_called / c.called_bp : 0.0;
+            if (lambda > 0.0 && density > 0.0) {
+                const double m_hat = std::max(0.0, obs_universe_of[bi] - universe_size[bi] * mu) / lambda;
+                c.mass_bp = m_hat / density;
+                // The mass is a sum over fragments, not over markers: one fragment contributes to many
+                // markers at once, so its relative error is set by how many fragments cross the block,
+                // not by how many markers it holds. That is also why the per-marker ESS discount must
+                // not be read as the precision of this number -- they measure different things.
+                const double frags = options.fragment_len > 0.0
+                                         ? 2.0 * lambda * c.called_bp / (2.0 * options.fragment_len) : 0.0;
+                c.mass_bp_sd = frags > 1.0 ? c.mass_bp / std::sqrt(frags) : 0.0;
+            }
+        }
+
         // A block with no markers of its own is NOT evidence-free: the forward-backward carries the
         // haplotype assignment in from its neighbours, which is the whole point of chaining blocks.
         // On ankrd36c only the two flank blocks retain markers after region uniqueness, yet all 23
@@ -603,6 +708,7 @@ void write_genotypes(
     if (!g) throw std::runtime_error("genotype: cannot write " + gpath);
     g << "block_index\tblock_kind\tbubble_id\tsource\tsink\tn_alleles\tn_markers"
          "\tallele1\tallele2\thaplotype1\thaplotype2\thap_posterior\tgq\texplained\tdetected"
+         "\tcalled_bp\tmass_bp\tmass_bp_sd"
          "\tevidence\tfilter\ttruth1\ttruth2\ttruth_rank\tinfluencers\n";
     for (std::size_t bi = 0; bi < calls.size(); ++bi) {
         const BlockCall& c = calls[bi];
@@ -617,6 +723,7 @@ void write_genotypes(
           << (c.hap1 < haplotype_names.size() ? haplotype_names[c.hap1] : ".") << '\t'
           << (c.hap2 < haplotype_names.size() ? haplotype_names[c.hap2] : ".") << '\t'
           << c.hap_posterior << '\t' << c.gq << '\t' << c.explained << '\t' << c.detected << '\t'
+          << c.called_bp << '\t' << c.mass_bp << '\t' << c.mass_bp_sd << '\t'
           << c.evidence << '\t' << c.filter << '\t'
           << c.truth_allele1 << '\t' << c.truth_allele2 << '\t' << c.truth_emission_rank << '\t';
         for (std::size_t k = 0; k < c.influencers.size(); ++k) {

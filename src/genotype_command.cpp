@@ -161,6 +161,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
     DepthModel depth_model = DepthModel::Joint;
     double depth_quantile = 0.75;
     long dump_block = -1;
+    bool depth_calibration = false;
+    double mass_weight = 0.0;
     bool nearest_rank = false;
     bool model_pangenie = false;
     bool provenance = false;
@@ -208,6 +210,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
         }
         else if (arg == "--depth-quantile") depth_quantile = std::stod(require_value(arg));
         else if (arg == "--dump-block") dump_block = std::stol(require_value(arg));
+        else if (arg == "--depth-calibration") depth_calibration = true;
+        else if (arg == "--mass-weight") mass_weight = std::stod(require_value(arg));
         else if (arg == "--nearest-emission-rank") nearest_rank = true;
         else if (arg == "--model-pangenie") model_pangenie = true;
         else if (arg == "--carrier-weight") carrier_weight = std::stod(require_value(arg));
@@ -277,6 +281,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
         gopt.threads = options.threads;
         gopt.max_alleles_per_block = max_alleles;
         gopt.fragment_len = fragment_len;
+        gopt.mass_weight = mass_weight;
         GenotypeSummary gsum;
         const std::vector<BlockCall> calls = genotype_sample(idx.chain, idx.blocks, idx.panel, rc,
                                                              depth, idx.haplotype_names, gopt, &gsum);
@@ -533,6 +538,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
             gopt.provenance = provenance;
             gopt.recomb_rate = recomb_rate;
             gopt.carrier_weight = carrier_weight;
+            gopt.mass_weight = mass_weight;
             GenotypeSummary gsum;
             std::vector<int> ta1;
             std::vector<int> ta2;
@@ -614,6 +620,57 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 ts2.assign(chain.size(), std::string());
                 resolve(a, ta1, ts1);
                 resolve(b, ta2, ts2);
+
+                // Depth calibration: with the truth known, every marker's expected count is
+                // lambda*(m_truth1 + m_truth2), so the reads measure lambda directly. Regressing the
+                // observed counts on the true multiplicity gives the depth the DATA implies, against
+                // the depth the model is using. The two must agree, and a copy-number call is exactly
+                // as wrong as they disagree: at an array of N copies a 1/N relative error in lambda
+                // moves the call by one whole repeat unit.
+                //
+                // Stratified by multiplicity because a constant offset and a wrong slope look the same
+                // in the aggregate but mean different things -- the first is a background term, the
+                // second is the depth itself.
+                if (depth_calibration) {
+                    const std::string cpath = out_prefix + ".depth.calibration.tsv";
+                    std::ofstream c(cpath);
+                    if (!c) throw std::runtime_error("genotype: cannot write " + cpath);
+                    c << "block_index\tblock_kind\tmult_class\tn_markers\tsum_mult\tsum_obs"
+                         "\tlambda_implied\tlambda_used\tratio\n";
+                    const char* names[] = {"1", "2", "3-5", "6-10", ">10", "all"};
+                    for (std::size_t bi = 0; bi < chain.size() && bi < read_panel.by_block.size(); ++bi) {
+                        if (bi >= ta1.size() || ta1[bi] < 0 || ta2[bi] < 0) continue;
+                        const auto& ba = read_panel.by_block[bi];
+                        const std::size_t i1 = static_cast<std::size_t>(ta1[bi]);
+                        const std::size_t i2 = static_cast<std::size_t>(ta2[bi]);
+                        if (i1 >= ba.size() || i2 >= ba.size()) continue;
+                        std::unordered_map<std::uint32_t, std::uint64_t> m;
+                        for (const auto& [slot, k] : ba[i1].nodes) m[slot] += k;
+                        for (const auto& [slot, k] : ba[i2].nodes) m[slot] += k;
+                        double sm[6] = {0}, so[6] = {0};
+                        std::size_t nm[6] = {0};
+                        for (const auto& [slot, mult] : m) {
+                            const std::size_t cls = mult == 1 ? 0 : mult == 2 ? 1 : mult <= 5 ? 2
+                                                  : mult <= 10 ? 3 : 4;
+                            const double obs = static_cast<double>(rc.node[slot]);
+                            sm[cls] += static_cast<double>(mult); so[cls] += obs; ++nm[cls];
+                            sm[5] += static_cast<double>(mult); so[5] += obs;  ++nm[5];
+                        }
+                        for (std::size_t cl = 0; cl < 6; ++cl) {
+                            if (nm[cl] == 0) continue;
+                            // Poisson ML for lambda in obs ~ Poisson(lambda*m): sum(obs)/sum(m).
+                            const double implied = so[cl] / std::max(1.0, sm[cl]);
+                            const double used = bi < depth.size() ? depth[bi].lambda_hap : 0.0;
+                            c << bi << '\t'
+                              << (chain[bi].kind == BlockKind::Bubble ? "bubble"
+                                  : chain[bi].kind == BlockKind::Flank ? "flank" : "backbone")
+                              << '\t' << names[cl] << '\t' << nm[cl] << '\t' << sm[cl] << '\t' << so[cl]
+                              << '\t' << implied << '\t' << used << '\t'
+                              << (used > 0.0 ? implied / used : 0.0) << '\n';
+                        }
+                    }
+                    log.wrote({cpath});
+                }
             }
             // Diagnostic: under leave-one-out the truth allele is often absent, so the emission-rank
             // diagnostic (which asks where the target pair sits by emission alone, ignoring linkage) has

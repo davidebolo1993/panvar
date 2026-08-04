@@ -28,6 +28,21 @@ struct GenotypeOptions {
     // under-stated). 0 disables.
     double min_detected = 0.5;
     std::size_t max_alleles_per_block = 64;   // prune by detected-marker fraction before pairing
+    // Score the block's TOTAL count as its own term, at its own effective sample size (fragments over
+    // the block, not markers), with each pair's overall scale profiled out of the per-marker product so
+    // the two do not double count.
+    //
+    // OFF by default, because it was measured and it does not help. The reasoning was that the ESS
+    // discount shrinks the total alongside the composition, so a pair 4.4% too long in total copy
+    // number could buy unit-variant composition cheaply -- and at lpa's KIV-2 block the reads do fix
+    // the total to about 1.2%, sharply enough to see that. But at its honest weight the term is worth
+    // ~7.5 log units against composition gaps of 200+, so it never overturns anything (output identical
+    // on 8 lpa pairs), and forced hard enough to win it makes the answer WORSE: identity to the truth
+    // 0.957 -> 0.914, the identity-oracle rank of the second haplotype 1 -> 160, and the locus 11/18 ->
+    // 2/18 blocks. The length target it was chasing is not jointly achievable -- it picks each
+    // haplotype's nearest length independently of sequence -- and the model was already choosing the
+    // most similar available allele for both. Kept so the negative result stays reproducible.
+    double mass_weight = 0.0;
     // Down-weight markers by how many of the block's alleles carry them. At a block with hundreds of
     // alleles the marker set is swamped by markers shared across many of them: one carried by 200 of
     // 450 discriminates almost nothing, yet thousands of such terms outvote the few allele-specific
@@ -63,6 +78,15 @@ struct BlockCall {
     // whichever allele predicts least -- collapsing a copy-number call to its minimum, confidently,
     // because every alternative fits even worse.
     double detected = 0.0;   // obs/pred over the called pair's markers; 1.0 is a perfect fit
+    // Total sequence this block's reads account for, across both haplotypes, measured WITHOUT going
+    // through the panel's allele list: the observed marker mass divided by the depth gives the
+    // multiplicity the sample carries, and the called pair's own multiplicity-per-base converts it to
+    // bases. It is the answer to "how much sequence is there", which at a tandem array is the question,
+    // and it is continuous where an allele call is quantised to whatever lengths the panel happens to
+    // hold. `mass_bp_sd` is its standard error, from the number of independent fragments over the span.
+    double mass_bp = 0.0;
+    double mass_bp_sd = 0.0;
+    double called_bp = 0.0;  // the called pair's own total, for comparison
     std::size_t hap1 = 0;        // most probable panel haplotype pair at this block
     std::size_t hap2 = 0;
     double hap_posterior = 0.0;
