@@ -84,6 +84,11 @@ def main():
                     help="tandem repeat unit length. Raise it with --dup-max-cn for a VNTR-scale array "
                          "like LPA's KIV-2 or ANKRD36C's, where copy number IS the variant and marker "
                          "multiplicity is the only signal that can measure it.")
+    ap.add_argument("--dup-fold-divergence", type=float, default=0.0,
+                    help="graph keeps ONE consensus repeat unit traversed N times while the emitted "
+                         "haplotypes carry copies diverging from it at this per-base rate, which is what "
+                         "panphorte normalization produces. Reads then come from real copies and the "
+                         "graph from a consensus, so k-mer and alignment evidence diverge sharply")
     ap.add_argument("--dup-node-per-copy", action="store_true",
                     help="emit one node per array copy instead of revisiting a single node. That is "
                          "the opposite of what a real pangenome graph does (lpa: 75%% of path steps "
@@ -450,8 +455,39 @@ def main():
     def spell(walk):
         return "".join(seq_of[n] if o == "+" else revcomp(seq_of[n]) for n, o in walk)
 
+    # --dup-fold-divergence reproduces what panphorte's normalization does to a tandem array, which is
+    # the ONE structure a real folded graph has that no other fixture here reproduces: the GRAPH holds a
+    # single consensus repeat unit traversed N times, while the SAMPLE's copies each differ from that
+    # consensus by a percent or two. Graph and haplotypes deliberately disagree, which nothing else in
+    # this generator does -- everywhere else they are emitted from the same edits precisely so they
+    # cannot.
+    #
+    # It matters because it separates two things that lpa conflates. A k-mer spanning a copy that
+    # diverges 2% from the consensus fails to match with probability 1 - 0.98^31, about 47%, so the
+    # marker path should collapse here. Coverage should not: an aligner is untroubled by 2%, and copy
+    # number is the consensus node's traversal count. If coverage works here and fails on lpa, the lpa
+    # failure is something else and this fixture localises it.
+    fold_rng = random.Random(args.seed * 7717)
+    def spell_sample(walk):
+        out = []
+        seen = {}
+        for n, o in walk:
+            base = seq_of[n]
+            if args.dup_fold_divergence > 0.0 and len(base) >= args.dup_unit_bp:
+                # Each traversal of the folded node is an independent copy in the sample, so successive
+                # visits diverge independently -- which is what makes them real copies rather than a
+                # repeat of one consensus.
+                seen[n] = seen.get(n, 0) + 1
+                u = list(base)
+                for t in range(len(u)):
+                    if fold_rng.random() < args.dup_fold_divergence:
+                        u[t] = fold_rng.choice([b for b in "ACGT" if b != u[t]])
+                base = "".join(u)
+            out.append(base if o == "+" else revcomp(base))
+        return "".join(out)
+
     ref_seq = spell(ref_walk)
-    hap_seq = {h: spell(w) for h, w in walks.items()}
+    hap_seq = {h: spell_sample(w) for h, w in walks.items()}
     mosaic_seq = {n: spell(w) for n, w in mosaic_walks.items()}
 
     write_fasta(os.path.join(args.out, "ref.fa"), "ref", ref_seq)

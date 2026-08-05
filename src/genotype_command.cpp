@@ -174,6 +174,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
     long cosine_block = -1;
     bool node_coverage = false;
     long coverage_block = -1;
+    std::string coverage_preset = "sr";
     std::string evidence = "syncmer";
     bool model_pangenie = false;
     bool provenance = false;
@@ -231,6 +232,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--cosine-block") cosine_block = std::stol(require_value(arg));
         else if (arg == "--node-coverage") node_coverage = true;
         else if (arg == "--coverage-block") coverage_block = std::stol(require_value(arg));
+        else if (arg == "--coverage-preset") coverage_preset = require_value(arg);
         else if (arg == "--evidence") {
             evidence = require_value(arg);
             if (evidence != "syncmer" && evidence != "coverage" && evidence != "auto" &&
@@ -742,6 +744,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                          "any k-mer), " + std::to_string(pcov.path_names.size()) + " panel paths");
                 CoverageOptions copt;
                 copt.threads = options.threads;
+                copt.preset = coverage_preset;
                 const SampleCoverage scov = inject_reads(panel_graph, nidx, pcov, read_paths, copt);
                 log.info("node coverage: " + std::to_string(scov.reads) + " reads, " +
                          std::to_string(100 * scov.aligned / std::max<std::uint64_t>(1, scov.reads)) +
