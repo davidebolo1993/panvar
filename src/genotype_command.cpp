@@ -169,6 +169,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
     bool oracle_rank = false;
     std::string explain_pair;
     double marker_outlier = 0.0;
+    long deconvolve = -1;
     bool model_pangenie = false;
     bool provenance = false;
     double uneven_tolerance = 0.35;
@@ -221,6 +222,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--oracle-emission-rank") oracle_rank = true;
         else if (arg == "--explain-pair") explain_pair = require_value(arg);
         else if (arg == "--marker-outlier") marker_outlier = std::stod(require_value(arg));
+        else if (arg == "--deconvolve") deconvolve = std::stol(require_value(arg));
         else if (arg == "--model-pangenie") model_pangenie = true;
         else if (arg == "--carrier-weight") carrier_weight = std::stod(require_value(arg));
         else if (arg == "--provenance") provenance = true;
@@ -510,72 +512,125 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                    depth_quantile, 0);
                 const double lam = ebi < de.size() ? de[ebi].lambda_hap : 0.0;
                 const double mub = 0.02 * lam;
-                auto profile = [&](std::size_t x, std::size_t y) {
-                    std::unordered_map<std::uint32_t, std::uint32_t> t;
-                    if (x < read_panel.by_block[ebi].size())
-                        for (const auto& [s, m] : read_panel.by_block[ebi][x].nodes) t[s] += m;
-                    if (y < read_panel.by_block[ebi].size())
-                        for (const auto& [s, m] : read_panel.by_block[ebi][y].nodes) t[s] += m;
-                    return t;
-                };
-                const auto A = profile(a1, a2);
-                const auto B = profile(b1, b2);
-                std::set<std::uint32_t> all;
-                for (const auto& [s, m] : A) { (void)m; all.insert(s); }
-                for (const auto& [s, m] : B) { (void)m; all.insert(s); }
-                // Poisson, matching the emission when phi degenerates (which it does here).
-                auto lp = [&](double o, double mean) {
-                    if (mean <= 0.0) mean = 1e-9;
-                    return -mean + o * std::log(mean) - std::lgamma(o + 1.0);
-                };
-                const char* bn[] = {"0", "1", "2", "3-5", "6-10", "11-30", ">30"};
-                double dsum[7] = {0}; std::size_t dn[7] = {0}; double dobs[7] = {0};
-                double dmA[7] = {0}, dmB[7] = {0};
-                for (const std::uint32_t s : all) {
-                    const auto ia = A.find(s); const auto ib = B.find(s);
-                    const double ma = ia == A.end() ? 0.0 : ia->second;
-                    const double mb = ib == B.end() ? 0.0 : ib->second;
-                    const double o = static_cast<double>(rce.node[s]);
-                    const double mx = std::max(ma, mb);
-                    const std::size_t k = mx == 0 ? 0 : mx == 1 ? 1 : mx == 2 ? 2 : mx <= 5 ? 3
-                                        : mx <= 10 ? 4 : mx <= 30 ? 5 : 6;
-                    dsum[k] += lp(o, lam * ma + mub) - lp(o, lam * mb + mub);
-                    dobs[k] += o; dmA[k] += ma; dmB[k] += mb; ++dn[k];
-                }
+                // Both marker units, because H4 asks exactly this: junction markers are the only
+                // local evidence of unit ORDER inside a tandem array, and an allele with extra copies
+                // creates junctions the sample may lack -- a penalty node counts cannot express. If
+                // adjacencies carry the same presence bias as nodes they will vote the same way, and
+                // that settles it without rebuilding the emission's edge path.
                 const std::string ep = out_prefix + ".explain.tsv";
                 std::ofstream e(ep);
-                e << "mult_band\tn_markers\tsum_obs\tsum_mult_A\tsum_mult_B\tlogL_A_minus_B\n";
-                double tot = 0.0;
-                for (std::size_t k = 0; k < 7; ++k) {
-                    if (dn[k] == 0) continue;
-                    e << bn[k] << '\t' << dn[k] << '\t' << dobs[k] << '\t' << dmA[k] << '\t' << dmB[k]
-                      << '\t' << dsum[k] << '\n';
-                    tot += dsum[k];
+                for (int unit = 0; unit < 2; ++unit) {
+                    const bool use_edges = unit == 1;
+                    auto profile = [&](std::size_t x, std::size_t y) {
+                        std::unordered_map<std::uint64_t, std::uint32_t> t;
+                        const auto& B0 = read_panel.by_block[ebi];
+                        if (x < B0.size()) for (const auto& [s2, m] : (use_edges ? B0[x].edges : B0[x].nodes)) t[s2] += m;
+                        if (y < B0.size()) for (const auto& [s2, m] : (use_edges ? B0[y].edges : B0[y].nodes)) t[s2] += m;
+                        return t;
+                    };
+                    const auto A = profile(a1, a2);
+                    const auto B = profile(b1, b2);
+                    std::set<std::uint64_t> all;
+                    for (const auto& [s2, m] : A) { (void)m; all.insert(s2); }
+                    for (const auto& [s2, m] : B) { (void)m; all.insert(s2); }
+                    auto lp = [&](double o, double mean) {
+                        if (mean <= 0.0) mean = 1e-9;
+                        return -mean + o * std::log(mean) - std::lgamma(o + 1.0);
+                    };
+                    auto obs_of = [&](std::uint64_t slot) {
+                        return static_cast<double>(use_edges ? rce.edge[slot] : rce.node[slot]);
+                    };
+                    struct Cls { std::size_t n = 0; double obs = 0, ll = 0; };
+                    Cls only_a, only_b, both_differ, both_same;
+                    for (const std::uint64_t s2 : all) {
+                        const auto ia = A.find(s2); const auto ib = B.find(s2);
+                        const double ma = ia == A.end() ? 0.0 : ia->second;
+                        const double mb = ib == B.end() ? 0.0 : ib->second;
+                        const double o = obs_of(s2);
+                        const double d = lp(o, lam * ma + mub) - lp(o, lam * mb + mub);
+                        Cls& c2 = (ma > 0 && mb == 0) ? only_a : (mb > 0 && ma == 0) ? only_b
+                                : (ma != mb) ? both_differ : both_same;
+                        ++c2.n; c2.obs += o; c2.ll += d;
+                    }
+                    const char* u = use_edges ? "edges" : "nodes";
+                    e << u << "\tcarried_by_A_only\t" << only_a.n << '\t' << only_a.obs << '\t' << only_a.ll << '\n';
+                    e << u << "\tcarried_by_B_only\t" << only_b.n << '\t' << only_b.obs << '\t' << only_b.ll << '\n';
+                    e << u << "\tboth_differing_copies\t" << both_differ.n << '\t' << both_differ.obs << '\t' << both_differ.ll << '\n';
+                    e << u << "\tboth_same_copies\t" << both_same.n << '\t' << both_same.obs << '\t' << both_same.ll << '\n';
+                    e << u << "\tTOTAL\t" << all.size() << '\t' << (only_a.obs+only_b.obs+both_differ.obs+both_same.obs)
+                      << '\t' << (only_a.ll+only_b.ll+both_differ.ll+both_same.ll) << '\n';
                 }
-                e << "all\t" << all.size() << "\t\t\t\t" << tot << '\n';
-                // The band table says WHICH markers vote; this says whether they vote because the two
-                // pairs disagree about copy number, or because one of them does not carry the marker at
-                // all. Those are very different failures: the first is a copy-number call, the second
-                // is the sample carrying sequence the candidate allele lacks -- which under
-                // leave-one-out is guaranteed for every candidate, since the true allele is gone.
-                struct Cls { std::size_t n = 0; double obs = 0, ll = 0; };
-                Cls only_a, only_b, both_differ, both_same;
-                for (const std::uint32_t s2 : all) {
-                    const auto ia = A.find(s2); const auto ib = B.find(s2);
-                    const double ma = ia == A.end() ? 0.0 : ia->second;
-                    const double mb = ib == B.end() ? 0.0 : ib->second;
-                    const double o = static_cast<double>(rce.node[s2]);
-                    const double d = lp(o, lam * ma + mub) - lp(o, lam * mb + mub);
-                    Cls& c2 = (ma > 0 && mb == 0) ? only_a : (mb > 0 && ma == 0) ? only_b
-                            : (ma != mb) ? both_differ : both_same;
-                    ++c2.n; c2.obs += o; c2.ll += d;
-                }
-                e << "#class\tn_markers\tsum_obs\tlogL_A_minus_B\n";
-                e << "#carried_by_A_only\t" << only_a.n << '\t' << only_a.obs << '\t' << only_a.ll << '\n';
-                e << "#carried_by_B_only\t" << only_b.n << '\t' << only_b.obs << '\t' << only_b.ll << '\n';
-                e << "#both_but_differing_copies\t" << both_differ.n << '\t' << both_differ.obs << '\t' << both_differ.ll << '\n';
-                e << "#both_same_copies\t" << both_same.n << '\t' << both_same.obs << '\t' << both_same.ll << '\n';
                 log.wrote({ep});
+            }
+
+            // H5, as a measurement before it is a feature. The defect found by --explain-pair is that
+            // scoring WHOLE panel alleles rewards whichever allele contains most of the sample's unit
+            // variants, regardless of how many copies that costs. The proposed cure is to stop choosing
+            // two alleles and instead infer how much of each is present -- a non-negative mixture whose
+            // weights sum to 2 (a diploid) rather than a 0/1/2 indicator.
+            //
+            // Panel alleles are used as the basis rather than decomposed unit variants, because that
+            // needs no repeat decomposition and answers the question that matters first: can ANY
+            // non-negative combination explain these counts better than the best pair, and does its
+            // implied length match the truth? If it cannot, unit-level decomposition will not either.
+            if (deconvolve >= 0) {
+                const std::size_t dbi = static_cast<std::size_t>(deconvolve);
+                const ReadCounts rcd = count_reads(read_paths, read_panel, options.threads);
+                const std::vector<BlockDepth> dd =
+                    estimate_depth(read_panel, rcd, min_anchors, uneven_tolerance, DepthModel::Median,
+                                   depth_quantile, 0);
+                const double lam = dbi < dd.size() ? dd[dbi].lambda_hap : 0.0;
+                const auto& BB = read_panel.by_block[dbi];
+                std::vector<std::uint32_t> uni;
+                for (const auto& ms : BB) for (const auto& [s2, m] : ms.nodes) { (void)m; uni.push_back(s2); }
+                std::sort(uni.begin(), uni.end());
+                uni.erase(std::unique(uni.begin(), uni.end()), uni.end());
+                std::unordered_map<std::uint32_t, std::size_t> row;
+                for (std::size_t i = 0; i < uni.size(); ++i) row[uni[i]] = i;
+                std::vector<double> obs(uni.size(), 0.0);
+                for (std::size_t i = 0; i < uni.size(); ++i) obs[i] = static_cast<double>(rcd.node[uni[i]]);
+                // Multiplicative update for non-negative least squares, renormalised to sum 2 each
+                // step. Cheap, monotone, and it needs no solver dependency.
+                std::vector<double> w(BB.size(), 2.0 / static_cast<double>(std::max<std::size_t>(1, BB.size())));
+                std::vector<double> pred(uni.size(), 0.0);
+                for (int it = 0; it < 300; ++it) {
+                    std::fill(pred.begin(), pred.end(), 0.0);
+                    for (std::size_t a = 0; a < BB.size(); ++a) {
+                        if (w[a] <= 0.0) continue;
+                        for (const auto& [s2, m] : BB[a].nodes) pred[row[s2]] += w[a] * lam * m;
+                    }
+                    std::vector<double> num(BB.size(), 0.0), den(BB.size(), 0.0);
+                    for (std::size_t a = 0; a < BB.size(); ++a) {
+                        for (const auto& [s2, m] : BB[a].nodes) {
+                            const std::size_t r = row[s2];
+                            num[a] += lam * m * obs[r];
+                            den[a] += lam * m * pred[r];
+                        }
+                    }
+                    double sum = 0.0;
+                    for (std::size_t a = 0; a < BB.size(); ++a) {
+                        if (den[a] > 0.0) w[a] *= num[a] / den[a];
+                        sum += w[a];
+                    }
+                    if (sum > 0.0) for (double& x : w) x *= 2.0 / sum;
+                }
+                double bp_mix = 0.0;
+                std::vector<std::pair<double, std::size_t>> top;
+                for (std::size_t a = 0; a < BB.size(); ++a) {
+                    bp_mix += w[a] * static_cast<double>(a < blocks[dbi].allele_bp.size() ? blocks[dbi].allele_bp[a] : 0);
+                    if (w[a] > 0.01) top.emplace_back(w[a], a);
+                }
+                std::sort(top.rbegin(), top.rend());
+                const std::string dp = out_prefix + ".deconv.tsv";
+                std::ofstream d2(dp);
+                d2 << "#block\t" << dbi << "\tn_alleles\t" << BB.size() << "\tlambda\t" << lam
+                   << "\timplied_bp\t" << bp_mix << "\tn_alleles_with_weight_over_0.01\t" << top.size() << '\n';
+                d2 << "allele\tweight\tallele_bp\n";
+                for (const auto& [ww, a] : top) {
+                    d2 << a << '\t' << ww << '\t'
+                       << (a < blocks[dbi].allele_bp.size() ? blocks[dbi].allele_bp[a] : 0) << '\n';
+                }
+                log.wrote({dp});
             }
 
             const ReadCounts rc = count_reads(read_paths, read_panel, options.threads);
