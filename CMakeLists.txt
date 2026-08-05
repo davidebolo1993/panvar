@@ -131,6 +131,7 @@ add_library(panvarlib
     src/gtf.cpp
     src/gene_cn_kmer.cpp
     src/minimap2_align.cpp
+    src/node_coverage.cpp
     src/variant_call.cpp
     src/describe.cpp
     src/panphorte.cpp

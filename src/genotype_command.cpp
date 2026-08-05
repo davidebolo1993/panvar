@@ -8,6 +8,7 @@
 #include "panvar/genotype_index.hpp"
 #include "panvar/graph_utils.hpp"
 #include "panvar/genotype_reads.hpp"
+#include "panvar/node_coverage.hpp"
 #include "panvar/gfa.hpp"
 #include "panvar/output.hpp"
 #include "panvar/pangenie_model.hpp"
@@ -171,6 +172,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
     double marker_outlier = 0.0;
     long deconvolve = -1;
     long cosine_block = -1;
+    bool node_coverage = false;
     bool model_pangenie = false;
     bool provenance = false;
     double uneven_tolerance = 0.35;
@@ -225,6 +227,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--marker-outlier") marker_outlier = std::stod(require_value(arg));
         else if (arg == "--deconvolve") deconvolve = std::stol(require_value(arg));
         else if (arg == "--cosine-block") cosine_block = std::stol(require_value(arg));
+        else if (arg == "--node-coverage") node_coverage = true;
         else if (arg == "--model-pangenie") model_pangenie = true;
         else if (arg == "--carrier-weight") carrier_weight = std::stod(require_value(arg));
         else if (arg == "--provenance") provenance = true;
@@ -712,6 +715,46 @@ int run_genotype_command(const std::vector<std::string>& args) {
                        << (bpv(all[r].second.first) + bpv(all[r].second.second)) << '\n';
                 }
                 log.wrote({cp});
+            }
+
+            // Gate A for the coverage evidence path: build the panel's per-node traversal vectors,
+            // project the reads onto nodes by alignment, and run the four invariants. Deliberately
+            // separate from the marker path so the two can be compared on the same sample rather than
+            // replacing each other before there is evidence to justify it.
+            if (node_coverage) {
+                const NodeIndex nidx = build_node_index(panel_graph);
+                const PanelCoverage pcov = build_panel_coverage(panel_graph, nidx);
+                std::size_t short_nodes = 0;
+                for (const std::uint32_t l : nidx.length) if (l < options.kmer_size) ++short_nodes;
+                log.info("node coverage: " + std::to_string(nidx.size()) + " nodes (" +
+                         std::to_string(100 * short_nodes / std::max<std::size_t>(1, nidx.size())) +
+                         "% shorter than k=" + std::to_string(options.kmer_size) + ", so unreachable by "
+                         "any k-mer), " + std::to_string(pcov.path_names.size()) + " panel paths");
+                CoverageOptions copt;
+                copt.threads = options.threads;
+                const SampleCoverage scov = inject_reads(panel_graph, nidx, pcov, read_paths, copt);
+                log.info("node coverage: " + std::to_string(scov.reads) + " reads, " +
+                         std::to_string(100 * scov.aligned / std::max<std::uint64_t>(1, scov.reads)) +
+                         "% placed, " + std::to_string(scov.placements) + " placements (" +
+                         std::to_string(scov.placements / std::max<std::uint64_t>(1, scov.aligned)) +
+                         " per placed read)");
+                std::vector<std::string> tnames;
+                if (!truth_haplotypes.empty()) {
+                    const auto comma = truth_haplotypes.find(',');
+                    if (comma != std::string::npos) {
+                        tnames.push_back(truth_haplotypes.substr(0, comma));
+                        tnames.push_back(truth_haplotypes.substr(comma + 1));
+                    }
+                }
+                const CoverageAudit ca = audit_coverage(panel_graph, nidx, pcov, scov, tnames, copt);
+                log.info("GATE A  probe " + std::to_string(ca.probe_exact) + "/" +
+                         std::to_string(ca.probe_total) + " intervals project onto exactly the right "
+                         "nodes | mass ratio " + std::to_string(ca.mass_ratio) +
+                         " (1.0 = no bases lost or double counted) | self correlation " +
+                         std::to_string(ca.self_pearson) + ", slope " + std::to_string(ca.self_slope) +
+                         " (slope = per-haplotype read depth)");
+                write_node_coverage(out_prefix, nidx, pcov, scov);
+                log.wrote({out_prefix + ".nodecov.sample.tsv", out_prefix + ".nodecov.panel.tsv"});
             }
 
             const ReadCounts rc = count_reads(read_paths, read_panel, options.threads);
