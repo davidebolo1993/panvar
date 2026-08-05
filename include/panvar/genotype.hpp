@@ -120,6 +120,10 @@ struct BlockCall {
     // Highest multiplicity any of this block's markers reaches in any allele. 1-2 is ordinary
     // variation; a large value means a tandem array, and there the two length figures above answer
     // different questions -- see `is_array`.
+    // Total sequence the ALIGNMENT coverage implies at this block, across both haplotypes. Independent
+    // of the markers and of which allele pair was called, so it is the arbiter when the two evidence
+    // paths disagree about how much sequence is present. 0 where coverage was not computed.
+    double cov_bp = 0.0;
     std::size_t max_copies = 1;
     // True when the block is a tandem array. It changes how the row should be read, which is why it is
     // a column rather than something the reader has to infer:
