@@ -915,6 +915,16 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
                 const auto ie = expected.find(static_cast<std::uint32_t>(sl));
                 out_panel->dbg_expected[sl] = ie == expected.end() ? 0 : ie->second;
             }
+            std::vector<std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>>> pre_filter;
+            if (options.restore_stripped_alleles) {
+                pre_filter.resize(chain.size());
+                for (std::size_t bi = 0; bi < chain.size(); ++bi) {
+                    pre_filter[bi].resize(out_panel->by_block[bi].size());
+                    for (std::size_t ai = 0; ai < out_panel->by_block[bi].size(); ++ai) {
+                        pre_filter[bi][ai] = out_panel->by_block[bi][ai].nodes;
+                    }
+                }
+            }
             for (std::size_t bi = 0; bi < chain.size(); ++bi) {
                 for (auto& mset : out_panel->by_block[bi]) {
                     const std::size_t before = mset.nodes.size();
@@ -938,6 +948,32 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
                                        }),
                         mset.edges.end());
                     dropped += ebefore - mset.edges.size();
+                }
+                // Confinement can strip an allele to nothing. When it does, the block loses the ability
+                // to decide genotypes by COMPOSITION and falls back on the absolute count level of
+                // whatever alleles still have markers -- the one scale-dependent decision this model
+                // makes, and the one measured to be unreliable (a true heterozygote reads 1.78 x lambda
+                // and a true homozygote 2.33 on the paralogous fixture, against 1.0 and 2.0).
+                //
+                // The trade this option offers: put the stripped allele's markers back, contamination
+                // and all, and let the RATIO between alleles carry the decision. A paralogue inflates
+                // both alleles' counts by a similar amount, so it corrupts absolute counts far more
+                // than it corrupts their ratio -- which is why every SNV caller decides zygosity from
+                // allele balance rather than from depth.
+                if (options.restore_stripped_alleles) {
+                    bool stripped = false;
+                    for (std::size_t ai = 0; ai < out_panel->by_block[bi].size(); ++ai) {
+                        if (blocks[bi].bypass_allele >= 0 &&
+                            ai == static_cast<std::size_t>(blocks[bi].bypass_allele)) continue;
+                        if (out_panel->by_block[bi][ai].nodes.empty() &&
+                            !pre_filter[bi][ai].empty()) { stripped = true; break; }
+                    }
+                    if (stripped) {
+                        for (std::size_t ai = 0; ai < out_panel->by_block[bi].size(); ++ai) {
+                            out_panel->by_block[bi][ai].nodes = pre_filter[bi][ai];
+                        }
+                        ++out_panel->blocks_restored;
+                    }
                 }
                 // Anchors need the OCCURRENCE-based test, not the vary-based one, and an expectation
                 // of their own: they are absent from `by_block`, so `expected` is zero for them and the

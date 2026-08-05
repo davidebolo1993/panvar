@@ -39,6 +39,7 @@ struct ReadPanel {
     std::vector<std::uint32_t> dbg_occ;
     std::vector<std::uint64_t> dbg_actual;
     std::vector<std::uint64_t> dbg_expected;
+    std::size_t blocks_restored = 0;          // blocks whose markers were put back for allele balance
     std::size_t region_filtered_markers = 0;   // dropped for occurring elsewhere in the region
     std::size_t dropped_multi_block = 0;       // ...because they appear in more than one block
     std::size_t dropped_over_expected = 0;     // ...because the panel shows more copies than blocks own

@@ -40,6 +40,9 @@ struct MarkerOptions {
     bool all_kmers = false;
     std::size_t min_markers = 10;           // per-allele "green" threshold
     std::size_t max_multiplicity = 0;       // 0 = no cap; multiplicity IS the copy-number signal
+    // Put a block's markers back when confinement has stripped some allele to nothing, so the block
+    // can still be decided by allele balance instead of by absolute depth.
+    bool restore_stripped_alleles = false;
     bool require_region_unique = true;
     // Pairwise allele separation uses a dense n^2 scratch matrix, which is the fastest form but costs
     // n_alleles^2 * 8 bytes per block (1.7 MB at today's largest block of 463 alleles, but 200 MB at

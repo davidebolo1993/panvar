@@ -170,6 +170,9 @@ int run_genotype_command(const std::vector<std::string>& args) {
     bool oracle_rank = false;
     std::string explain_pair;
     double marker_outlier = 0.0;
+    bool restore_stripped = false;
+    bool compositional = false;
+    double scale_weight = 1.0;
     long deconvolve = -1;
     long cosine_block = -1;
     bool node_coverage = false;
@@ -228,6 +231,9 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--oracle-emission-rank") oracle_rank = true;
         else if (arg == "--explain-pair") explain_pair = require_value(arg);
         else if (arg == "--marker-outlier") marker_outlier = std::stod(require_value(arg));
+        else if (arg == "--restore-stripped-alleles") restore_stripped = true;
+        else if (arg == "--compositional") compositional = true;
+        else if (arg == "--scale-weight") scale_weight = std::stod(require_value(arg));
         else if (arg == "--deconvolve") deconvolve = std::stol(require_value(arg));
         else if (arg == "--cosine-block") cosine_block = std::stol(require_value(arg));
         else if (arg == "--node-coverage") node_coverage = true;
@@ -415,6 +421,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
         }
 
         ReadPanel read_panel;
+        options.restore_stripped_alleles = restore_stripped;
         const std::vector<BlockMarkerStats> bstats =
             build_block_marker_panel(chain, blocks, options,
                                      (read_paths.empty() && index_out.empty()) ? nullptr : &read_panel,
@@ -903,6 +910,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
             gopt.carrier_weight = carrier_weight;
             gopt.mass_weight = mass_weight;
             gopt.marker_outlier = marker_outlier;
+            gopt.compositional = compositional;
+            gopt.scale_weight = scale_weight;
             GenotypeSummary gsum;
             std::vector<int> ta1;
             std::vector<int> ta2;

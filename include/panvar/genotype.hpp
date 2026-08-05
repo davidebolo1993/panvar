@@ -57,6 +57,20 @@ struct GenotypeOptions {
     // preference for the longer allele spread thinly over many markers, and pushing eps far enough to
     // beat that discards real evidence. Kept so the measurement is reproducible.
     double marker_outlier = 0.0;
+    // Score a block by the SHAPE of its count vector rather than its magnitude: model the observed
+    // counts as a multinomial draw whose proportions come from the candidate pair, instead of as
+    // independent Poissons around absolute predicted means.
+    //
+    // This is what "allele balance" means formally, and it is how SNV callers decide zygosity, because
+    // a ratio survives things absolute depth does not -- a contaminated marker set, a mis-estimated
+    // lambda, a locus with unusual coverage. It is also the only form in which a marker set that a
+    // paralogue has inflated can still be used at all.
+    bool compositional = false;
+    // Weight on the SCALE half of the compositional emission, relative to the shape half. The total's
+    // nominal precision is the number of fragments crossing the block, but that assumes counting noise
+    // is the only error -- and it is not: lambda carries about 7% uncertainty of its own, and markers
+    // a paralogue has inflated break the count scale while leaving the ratio usable. Swept, not assumed.
+    double scale_weight = 1.0;
     // Down-weight markers by how many of the block's alleles carry them. At a block with hundreds of
     // alleles the marker set is swamped by markers shared across many of them: one carried by 200 of
     // 450 discriminates almost nothing, yet thousands of such terms outvote the few allele-specific

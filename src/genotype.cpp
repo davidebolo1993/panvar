@@ -341,6 +341,29 @@ std::vector<BlockCall> genotype_sample(
             continue;
         }
 
+        // Independent observations behind the block's TOTAL count: fragments crossing it, not markers.
+        double scale_neff = 0.0;
+        if (options.fragment_len > 0.0) {
+            std::vector<std::size_t> lens2 = blocks[bi].allele_bp;
+            std::sort(lens2.begin(), lens2.end());
+            const double span2 = lens2.empty() ? 0.0 : static_cast<double>(lens2[lens2.size() / 2]);
+            scale_neff = 2.0 * lambda * span2 / options.fragment_len;
+        }
+        // Whether the block's TOTAL should be trusted is a property of the panel, not of the sample, so
+        // it is decided here rather than tuned.
+        //
+        // Shape can only separate two alleles when their marker PROPORTIONS differ. When an allele
+        // contributes nothing at all -- a bypass, i.e. a haplotype that deletes the block -- every
+        // genotype containing it has the same proportions as the homozygote and differs only in
+        // magnitude. There the total is the entire signal and must be used.
+        //
+        // Where all alleles do carry markers, shape is available and the total is the more fragile of
+        // the two: it is what a mis-estimated lambda corrupts, what a paralogue inflates, and what copy
+        // divergence from a folded consensus deflates. Measured on the ladder, a single global weight
+        // cannot serve both -- the folded-consensus fixture needs the total ignored (36/36 against
+        // 28/36) while the nested fixture needs it used (36/36 against 27/36).
+        const bool shape_blind = blocks[bi].bypass_allele >= 0;
+        if (!shape_blind) scale_neff = 0.0;
         double cov_target = 0.0, cov_sd = 0.0;
         if (coverage != nullptr && bi < coverage->target_bp.size() && coverage->target_bp[bi] > 0.0 &&
             bi < coverage->use_block.size() && coverage->use_block[bi] != 0) {
@@ -417,7 +440,45 @@ std::vector<BlockCall> genotype_sample(
                     const double z = (bp_pair - cov_target) / cov_sd;
                     cov_ll = -0.5 * z * z;
                 }
-                emis[bi][x * kn + y] = baseline + rho * ll + mass_ll + cov_ll;
+                if (options.compositional) {
+                    // Multinomial over the block's marker universe: log L = SUM o_j log p_j, with
+                    // p_j the pair's predicted share of the block's total predicted mass. The
+                    // multinomial coefficient depends only on the observations, so it is identical for
+                    // every candidate and cancels in the comparison.
+                    double pred_tot = 0.0;
+                    for (const std::uint32_t slot : universe) {
+                        const auto it = tot.find(slot);
+                        pred_tot += lambda * (it == tot.end() ? 0.0 : it->second) + mu;
+                    }
+                    double cll = 0.0;
+                    if (pred_tot > 0.0) {
+                        for (const std::uint32_t slot : universe) {
+                            const double o = static_cast<double>(counts.node[slot]);
+                            if (o <= 0.0) continue;
+                            const auto it = tot.find(slot);
+                            const double pj = (lambda * (it == tot.end() ? 0.0 : it->second) + mu) / pred_tot;
+                            cll += o * std::log(std::max(1e-300, pj));
+                        }
+                    }
+                    // A Poisson likelihood factorises exactly into a total and a composition:
+                    //   L(o; mean) = Poisson(SUM o; SUM mean) x Multinomial(o; mean / SUM mean)
+                    // and the two halves deserve different effective sample sizes. Composition is
+                    // spread over many correlated markers, so it takes the ESS discount. The total adds
+                    // one observation per fragment crossing the block, so it is far sharper and must
+                    // NOT be discounted alongside it -- and it is the only thing that separates a
+                    // deletion from a homozygote, where both alleles predict the same proportions and
+                    // only the magnitude differs.
+                    double sll = 0.0;
+                    if (scale_neff > 0.0 && pred_tot > 0.0 && obs_universe > 0.0) {
+                        const double c = std::max(1.0, obs_universe / scale_neff);
+                        const double oo = obs_universe / c;
+                        const double pp = pred_tot / c;
+                        sll = -pp + oo * std::log(std::max(1e-300, pp)) - std::lgamma(oo + 1.0);
+                    }
+                    emis[bi][x * kn + y] = rho * cll + options.scale_weight * sll;
+                } else {
+                    emis[bi][x * kn + y] = baseline + rho * ll + mass_ll + cov_ll;
+                }
                 // Share of the block's observed marker mass this pair accounts for. The denominator is
                 // the UNION of the block's markers -- summing per allele would count every shared
                 // marker once per carrier and make `explained` scale like 1/n_alleles.
