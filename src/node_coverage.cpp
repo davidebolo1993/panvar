@@ -352,6 +352,116 @@ CoverageAudit audit_coverage(
     return a;
 }
 
+
+std::vector<std::vector<std::uint32_t>> block_allele_node_vectors(
+    const Graph& graph,
+    const std::vector<BubblePathIndex>& path_indexes,
+    const std::vector<Bubble>& bubbles,
+    const Block& block,
+    const BlockAlleles& alleles,
+    const NodeIndex& index) {
+
+    const Bubble* bubble = nullptr;
+    if (block.kind == BlockKind::Bubble) {
+        for (const Bubble& b : bubbles) if (b.id == block.bubble_id) { bubble = &b; break; }
+    }
+    std::vector<std::vector<std::uint32_t>> out(alleles.allele_haplotypes.size());
+    std::vector<char> done(out.size(), 0);
+    for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
+        const auto it = alleles.allele_of.find(graph.paths[pi].name);
+        if (it == alleles.allele_of.end()) continue;
+        const std::size_t ai = it->second;
+        if (ai >= out.size() || done[ai]) continue;      // one representative per allele is enough:
+        done[ai] = 1;                                    // an allele is a set of identical walks
+        std::optional<std::vector<PathStep>> steps;
+        if (bubble != nullptr) {
+            steps = bubble_steps(graph.paths[pi], path_indexes[pi], *bubble);
+            if (steps.has_value() && !block.trim_node.empty() && steps->size() > 1) {
+                if (steps->front().node_id == block.trim_node) steps->erase(steps->begin());
+                else if (steps->back().node_id == block.trim_node) steps->pop_back();
+            }
+        } else if (block.kind == BlockKind::Flank) {
+            const bool leading = block.source.empty();
+            steps = flank_steps(graph.paths[pi], path_indexes[pi], leading ? block.sink : block.source, leading);
+        } else {
+            steps = interval_interior_steps(graph.paths[pi], path_indexes[pi], block.source, block.sink);
+        }
+        if (!steps.has_value()) continue;
+        std::vector<std::uint32_t> v(index.size(), 0);
+        for (const PathStep& st : *steps) {
+            const auto ni = index.of.find(st.node_id);
+            if (ni != index.of.end()) ++v[ni->second];
+        }
+        out[ai] = std::move(v);
+    }
+    for (auto& v : out) if (v.empty()) v.assign(index.size(), 0);   // the bypass allele traverses nothing
+    return out;
+}
+
+std::vector<CoverageScore> score_block_by_coverage(
+    const std::vector<std::vector<std::uint32_t>>& allele_vec,
+    const std::vector<std::size_t>& allele_bp,
+    const SampleCoverage& sample,
+    const NodeIndex& index,
+    double lambda,
+    double overdispersion) {
+
+    // Only the nodes some allele of this block traverses. Everything else is another block's business,
+    // and including it would add the same constant to every candidate while diluting the comparison.
+    std::vector<std::uint32_t> nodes;
+    for (const auto& v : allele_vec) {
+        for (std::size_t i = 0; i < v.size(); ++i) if (v[i] > 0) nodes.push_back(static_cast<std::uint32_t>(i));
+    }
+    std::sort(nodes.begin(), nodes.end());
+    nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
+
+    double obs_norm2 = 0.0, obs_sum = 0.0;
+    for (const std::uint32_t n : nodes) { obs_norm2 += sample.node[n] * sample.node[n]; obs_sum += sample.node[n]; }
+    const double obs_norm = std::sqrt(std::max(1e-12, obs_norm2));
+    const double obs_mean = nodes.empty() ? 0.0 : obs_sum / static_cast<double>(nodes.size());
+    const double mu = std::max(0.01, 0.02 * lambda);
+
+    auto lognb = [&](double x, double mean) {
+        if (mean <= 0.0) mean = 1e-9;
+        if (overdispersion <= 0.0) return -mean + x * std::log(mean) - std::lgamma(x + 1.0);
+        const double phi = overdispersion;
+        return std::lgamma(x + phi) - std::lgamma(phi) - std::lgamma(x + 1.0)
+             + phi * std::log(phi / (phi + mean)) + x * std::log(mean / (phi + mean));
+    };
+
+    std::vector<CoverageScore> out;
+    const std::size_t na = allele_vec.size();
+    out.reserve(na * (na + 1) / 2);
+    for (std::size_t a = 0; a < na; ++a) {
+        for (std::size_t b = a; b < na; ++b) {
+            CoverageScore s;
+            s.allele1 = a; s.allele2 = b;
+            s.bp = (a < allele_bp.size() ? allele_bp[a] : 0) + (b < allele_bp.size() ? allele_bp[b] : 0);
+            double ll = 0.0, dot = 0.0, pn2 = 0.0;
+            double pmean = 0.0;
+            for (const std::uint32_t n : nodes) pmean += allele_vec[a][n] + allele_vec[b][n];
+            pmean = nodes.empty() ? 0.0 : pmean / static_cast<double>(nodes.size());
+            double cdot = 0.0, cpx = 0.0, cpy = 0.0;
+            for (const std::uint32_t n : nodes) {
+                const double m = static_cast<double>(allele_vec[a][n] + allele_vec[b][n]);
+                const double o = sample.node[n];
+                ll += lognb(o, lambda * m + mu);
+                dot += m * o; pn2 += m * m;
+                // Pearson: the same score on centred vectors, which removes the component every
+                // candidate carries and is what compresses cosine at a repeat-heavy block.
+                cdot += (m - pmean) * (o - obs_mean);
+                cpx += (m - pmean) * (m - pmean);
+                cpy += (o - obs_mean) * (o - obs_mean);
+            }
+            s.loglik = ll;
+            s.cosine = (pn2 > 0.0) ? dot / (std::sqrt(pn2) * obs_norm) : 0.0;
+            s.pearson = (cpx > 0.0 && cpy > 0.0) ? cdot / std::sqrt(cpx * cpy) : 0.0;
+            out.push_back(s);
+        }
+    }
+    return out;
+}
+
 void write_node_coverage(
     const std::string& out_prefix,
     const NodeIndex& index,

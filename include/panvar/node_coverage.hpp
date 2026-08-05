@@ -18,6 +18,9 @@
 // node boundaries and reaches them.
 
 #include "panvar/gfa.hpp"
+#include "panvar/genotype_blocks.hpp"
+#include "panvar/bubble_path.hpp"
+#include "panvar/bubbles.hpp"
 
 #include <cstdint>
 #include <string>
@@ -115,6 +118,36 @@ CoverageAudit audit_coverage(
     const SampleCoverage& sample,
     const std::vector<std::string>& sample_paths,
     const CoverageOptions& options);
+
+// Per-allele node multiplicity inside one block, using the same step extraction the marker panel
+// uses, so an allele means the same thing on both evidence paths and the two are comparable.
+std::vector<std::vector<std::uint32_t>> block_allele_node_vectors(
+    const Graph& graph,
+    const std::vector<BubblePathIndex>& path_indexes,
+    const std::vector<Bubble>& bubbles,
+    const Block& block,
+    const BlockAlleles& alleles,
+    const NodeIndex& index);
+
+// Score every allele pair at one block by the coverage the reads put on its nodes. Negative binomial
+// on node coverage, the direct analogue of the marker emission -- the difference being what the
+// evidence is, not how it is weighed.
+struct CoverageScore {
+    std::size_t allele1 = 0;
+    std::size_t allele2 = 0;
+    double loglik = 0.0;
+    double cosine = 0.0;
+    double pearson = 0.0;
+    std::size_t bp = 0;
+};
+
+std::vector<CoverageScore> score_block_by_coverage(
+    const std::vector<std::vector<std::uint32_t>>& allele_vec,
+    const std::vector<std::size_t>& allele_bp,
+    const SampleCoverage& sample,
+    const NodeIndex& index,
+    double lambda,
+    double overdispersion);
 
 void write_node_coverage(
     const std::string& out_prefix,

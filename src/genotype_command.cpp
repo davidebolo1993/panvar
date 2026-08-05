@@ -173,6 +173,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
     long deconvolve = -1;
     long cosine_block = -1;
     bool node_coverage = false;
+    long coverage_block = -1;
     bool model_pangenie = false;
     bool provenance = false;
     double uneven_tolerance = 0.35;
@@ -228,6 +229,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--deconvolve") deconvolve = std::stol(require_value(arg));
         else if (arg == "--cosine-block") cosine_block = std::stol(require_value(arg));
         else if (arg == "--node-coverage") node_coverage = true;
+        else if (arg == "--coverage-block") coverage_block = std::stol(require_value(arg));
         else if (arg == "--model-pangenie") model_pangenie = true;
         else if (arg == "--carrier-weight") carrier_weight = std::stod(require_value(arg));
         else if (arg == "--provenance") provenance = true;
@@ -753,6 +755,67 @@ int run_genotype_command(const std::vector<std::string>& args) {
                          " (1.0 = no bases lost or double counted) | self correlation " +
                          std::to_string(ca.self_pearson) + ", slope " + std::to_string(ca.self_slope) +
                          " (slope = per-haplotype read depth)");
+                // Phase B at one block: score every allele pair on the coverage vectors by the
+                // three candidate scores at once, so likelihood, cosine and Pearson are compared on
+                // identical evidence rather than across runs.
+                if (coverage_block >= 0 && static_cast<std::size_t>(coverage_block) < chain.size()) {
+                    const std::size_t cb = static_cast<std::size_t>(coverage_block);
+                    const auto avec = block_allele_node_vectors(panel_graph, path_indexes, bubbles,
+                                                                chain[cb], blocks[cb], nidx);
+                    // Region-wide depth per haplotype copy: total coverage over the panel's typical
+                    // total traversal, halved for the diploid. Sample-independent apart from the reads
+                    // themselves, and it needs no anchors -- every node counts.
+                    // Depth from ANCHOR nodes: those every panel path traverses exactly once, so the
+                    // sample must carry two copies whatever its genotype and their coverage measures
+                    // depth alone. Dividing total coverage by the panel's median total traversal was
+                    // tried first and is biased -- it assumes the sample's total length equals the
+                    // panel median, and at a CNV locus that is exactly the quantity in question. It
+                    // read 16.14 where the true depth was 15.0, and a 7% depth error becomes a 7%
+                    // copy-number error: 17 kb on a 252 kb array.
+                    std::vector<double> anchor_cov;
+                    for (std::size_t n = 0; n < nidx.size(); ++n) {
+                        bool invariant = !pcov.by_path.empty();
+                        for (const auto& v : pcov.by_path) if (v[n] != 1) { invariant = false; break; }
+                        if (invariant) anchor_cov.push_back(scov.node[n]);
+                    }
+                    double lam = 1.0;
+                    if (anchor_cov.size() >= 20) {
+                        std::sort(anchor_cov.begin(), anchor_cov.end());
+                        lam = anchor_cov[anchor_cov.size() / 2] / 2.0;
+                    } else {
+                        std::vector<double> tot;
+                        for (const auto& v : pcov.by_path) {
+                            double t = 0.0;
+                            for (const std::uint32_t m : v) t += m;
+                            tot.push_back(t);
+                        }
+                        std::sort(tot.begin(), tot.end());
+                        double cov_sum = 0.0;
+                        for (const double c : scov.node) cov_sum += c;
+                        if (!tot.empty() && tot[tot.size() / 2] > 0.0) lam = cov_sum / (2.0 * tot[tot.size() / 2]);
+                    }
+                    log.info("coverage depth: lambda " + std::to_string(lam) + " from " +
+                             std::to_string(anchor_cov.size()) + " invariant nodes");
+                    auto sc = score_block_by_coverage(avec, blocks[cb].allele_bp, scov, nidx, lam, 0.0);
+                    const std::string cp = out_prefix + ".covscore.tsv";
+                    std::ofstream cf(cp);
+                    cf << "#block\t" << cb << "\tlambda\t" << lam << "\tn_alleles\t" << avec.size() << "\n";
+                    cf << "score\trank\tallele1\tallele2\ttotal_bp\tvalue\n";
+                    auto dump = [&](const char* nm, auto key) {
+                        auto v = sc;
+                        std::sort(v.begin(), v.end(), [&](const CoverageScore& x, const CoverageScore& y) {
+                            return key(x) > key(y);
+                        });
+                        for (std::size_t r = 0; r < std::min<std::size_t>(8, v.size()); ++r) {
+                            cf << nm << '\t' << (r + 1) << '\t' << v[r].allele1 << '\t' << v[r].allele2
+                               << '\t' << v[r].bp << '\t' << key(v[r]) << '\n';
+                        }
+                    };
+                    dump("loglik", [](const CoverageScore& x) { return x.loglik; });
+                    dump("cosine", [](const CoverageScore& x) { return x.cosine; });
+                    dump("pearson", [](const CoverageScore& x) { return x.pearson; });
+                    log.wrote({cp});
+                }
                 write_node_coverage(out_prefix, nidx, pcov, scov);
                 log.wrote({out_prefix + ".nodecov.sample.tsv", out_prefix + ".nodecov.panel.tsv"});
             }
