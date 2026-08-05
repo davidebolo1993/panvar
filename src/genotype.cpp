@@ -320,7 +320,24 @@ std::vector<BlockCall> genotype_sample(
                     detected[bi][x * kn2 + y] = pred_in > 0.0 ? obs_in / pred_in : 1.0;
                 }
             }
-            baseline_of[bi] = *std::min_element(emis[bi].begin(), emis[bi].end());
+            // The same effective-sample-size discount the marker emission gets, and for the same
+            // reason: one fragment covers many adjacent nodes, so a sum over thousands of nodes is not
+            // thousands of independent observations. Without it the coverage blocks are enormously
+            // more decisive than the marker blocks they are chained to -- a scale mismatch, not a
+            // difference in evidence -- and they drag the haplotype assignment across the whole locus.
+            // Measured on lpa leave-one-out before this: routing four blocks to coverage took the pairs
+            // from 15/13/18/11 exact blocks down to 12/11/15/7.
+            double rho_cov = 1.0;
+            if (options.fragment_len > 0.0 && !cnodes.empty()) {
+                std::vector<std::size_t> lens = blocks[bi].allele_bp;
+                std::sort(lens.begin(), lens.end());
+                const double span = lens.empty() ? 0.0 : static_cast<double>(lens[lens.size() / 2]);
+                rho_cov = std::min(1.0, (span / options.fragment_len) / static_cast<double>(cnodes.size()));
+                if (!(rho_cov > 0.0)) rho_cov = 1e-6;
+            }
+            const double base_cov = *std::min_element(emis[bi].begin(), emis[bi].end());
+            for (double& v : emis[bi]) v = base_cov + rho_cov * (v - base_cov);
+            baseline_of[bi] = base_cov;
             continue;
         }
 
