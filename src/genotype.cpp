@@ -86,6 +86,7 @@ std::vector<BlockCall> genotype_sample(
     std::vector<double> baseline_of(nb, 0.0);
     std::vector<double> obs_universe_of(nb, 0.0);
     std::vector<double> universe_size(nb, 0.0);
+    std::vector<std::size_t> max_copies_of(nb, 1);
 
     for (std::size_t bi = 0; bi < nb; ++bi) {
         const std::size_t na = panel.by_block[bi].size();
@@ -210,6 +211,7 @@ std::vector<BlockCall> genotype_sample(
         for (const auto& mset : panel.by_block[bi]) {
             for (const auto& [slot, m] : mset.nodes) { (void)slot; max_mult = std::max(max_mult, (double)m); }
         }
+        max_copies_of[bi] = static_cast<std::size_t>(max_mult);
         const double broad_ll = -std::log(std::max(2.0, lambda * max_mult + 1.0));
         auto mix = [&](double o, double mean) {
             if (eps <= 0.0) return log_nb(o, mean, phi);
@@ -591,6 +593,12 @@ std::vector<BlockCall> genotype_sample(
             if (c.allele2 < panel.by_block[bi].size()) {
                 for (const auto& [slot, m] : panel.by_block[bi][c.allele2].nodes) { (void)slot; m_called += m; }
             }
+            c.max_copies = max_copies_of[bi];
+            // Three copies of a marker is already past anything ordinary variation produces: a
+            // substitution or a small indel changes a marker's presence, not how many times it recurs.
+            // Recurrence at that level means the block contains a repeat, and it is the repeat that
+            // makes the allele call and the mass estimate answer different questions.
+            c.is_array = c.max_copies >= 3;
             const double lambda = bi < depth.size() ? depth[bi].lambda_hap : 0.0;
             const double density = c.called_bp > 0.0 ? m_called / c.called_bp : 0.0;
             if (lambda > 0.0 && density > 0.0) {
@@ -743,7 +751,7 @@ void write_genotypes(
     if (!g) throw std::runtime_error("genotype: cannot write " + gpath);
     g << "block_index\tblock_kind\tbubble_id\tsource\tsink\tn_alleles\tn_markers"
          "\tallele1\tallele2\thaplotype1\thaplotype2\thap_posterior\tgq\texplained\tdetected"
-         "\tcalled_bp\tmass_bp\tmass_bp_sd"
+         "\tcalled_bp\tmass_bp\tmass_bp_sd\tmax_copies\tblock_class"
          "\tevidence\tfilter\ttruth1\ttruth2\ttruth_rank\ttruth_delta\tinfluencers\n";
     for (std::size_t bi = 0; bi < calls.size(); ++bi) {
         const BlockCall& c = calls[bi];
@@ -759,6 +767,7 @@ void write_genotypes(
           << (c.hap2 < haplotype_names.size() ? haplotype_names[c.hap2] : ".") << '\t'
           << c.hap_posterior << '\t' << c.gq << '\t' << c.explained << '\t' << c.detected << '\t'
           << c.called_bp << '\t' << c.mass_bp << '\t' << c.mass_bp_sd << '\t'
+          << c.max_copies << '\t' << (c.is_array ? "array" : "simple") << '\t'
           << c.evidence << '\t' << c.filter << '\t'
           << c.truth_allele1 << '\t' << c.truth_allele2 << '\t' << c.truth_emission_rank << '\t'
           << c.truth_emission_delta << '\t';

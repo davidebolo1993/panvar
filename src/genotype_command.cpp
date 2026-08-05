@@ -299,6 +299,15 @@ int run_genotype_command(const std::vector<std::string>& args) {
         log.info("calls: " + std::to_string(gsum.called) + " PASS, " + std::to_string(gsum.no_calls) +
                  " no-call, " + std::to_string(gsum.off_panel) + " off-panel; mean GQ " +
                  std::to_string(gsum.mean_gq));
+        {
+            std::size_t n_arr = 0;
+            for (const BlockCall& c : calls) if (c.is_array) ++n_arr;
+            if (n_arr > 0) {
+                log.info(std::to_string(n_arr) + " block(s) are tandem arrays (block_class=array): "
+                         "there the called allele pair is the closest panel allele BY CONTENT, and "
+                         "copy number is mass_bp +- mass_bp_sd, not called_bp");
+            }
+        }
         write_read_audit(out_prefix, idx.chain, idx.panel, rc, depth);
         write_genotypes(out_prefix, idx.chain, idx.blocks, calls, idx.haplotype_names);
         log.wrote({out_prefix + ".reads.depth.tsv", out_prefix + ".genotypes.tsv"});
@@ -972,6 +981,20 @@ int run_genotype_command(const std::vector<std::string>& args) {
             log.info("calls: " + std::to_string(gsum.called) + " PASS, " + std::to_string(gsum.no_calls) +
                      " no-call, " + std::to_string(gsum.off_panel) + " off-panel; mean GQ " +
                      std::to_string(gsum.mean_gq));
+
+            // Say it in the log, not only in a column. At a tandem array the allele pair is the closest
+            // panel allele BY CONTENT and its length is not the copy-number answer -- mass_bp is -- and
+            // a reader who takes called_bp for the copy number gets it wrong by up to a whole repeat
+            // unit. That is easy to do silently, so it is stated wherever such a block is called.
+            {
+                std::size_t n_arr = 0;
+                for (const BlockCall& c : calls) if (c.is_array) ++n_arr;
+                if (n_arr > 0) {
+                    log.info(std::to_string(n_arr) + " block(s) are tandem arrays (block_class=array): "
+                             "there the called allele pair is the closest panel allele BY CONTENT, and "
+                             "copy number is mass_bp +- mass_bp_sd, not called_bp");
+                }
+            }
             write_genotypes(out_prefix, chain, blocks, calls, hap_names);
 
             if (!truth_haplotypes.empty()) {

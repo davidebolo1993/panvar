@@ -100,6 +100,21 @@ struct BlockCall {
     double mass_bp = 0.0;
     double mass_bp_sd = 0.0;
     double called_bp = 0.0;  // the called pair's own total, for comparison
+    // Highest multiplicity any of this block's markers reaches in any allele. 1-2 is ordinary
+    // variation; a large value means a tandem array, and there the two length figures above answer
+    // different questions -- see `is_array`.
+    std::size_t max_copies = 1;
+    // True when the block is a tandem array. It changes how the row should be read, which is why it is
+    // a column rather than something the reader has to infer:
+    //   allele1/allele2 and called_bp -- the closest panel alleles BY CONTENT. At an array the panel
+    //     rarely holds the sample's own arrangement, and the likelihood favours whichever allele
+    //     carries most of the sample's repeat-unit variants, which is not the one with the right
+    //     number of copies. Measured on lpa's KIV-2 block, called_bp misses by up to 11 kb.
+    //   mass_bp +- mass_bp_sd -- how much sequence the READS say is there, which is the copy number.
+    //     On the same block it lands within 1.2% (-19, -522, +1700 bases against truths of 252, 280
+    //     and 152 kb).
+    // Taking called_bp for the copy number at an array is the mistake this column exists to prevent.
+    bool is_array = false;
     std::size_t hap1 = 0;        // most probable panel haplotype pair at this block
     std::size_t hap2 = 0;
     double hap_posterior = 0.0;
