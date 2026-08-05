@@ -362,8 +362,22 @@ std::vector<BlockCall> genotype_sample(
         // divergence from a folded consensus deflates. Measured on the ladder, a single global weight
         // cannot serve both -- the folded-consensus fixture needs the total ignored (36/36 against
         // 28/36) while the nested fixture needs it used (36/36 against 27/36).
-        const bool shape_blind = blocks[bi].bypass_allele >= 0;
-        if (!shape_blind) scale_neff = 0.0;
+        // Use the block's TOTAL only where SHAPE cannot decide. That is precisely when some allele
+        // contributes nothing -- a bypass, a haplotype that deletes the block -- because then every
+        // genotype containing it has the same marker proportions as the homozygote and only magnitude
+        // separates them. Everywhere else shape is available, and the total is the more fragile half:
+        // it is what a mis-estimated lambda corrupts, what a paralogue inflates, and what divergence
+        // from a folded consensus deflates.
+        //
+        // A data-driven alternative was tried -- also use the total wherever alleles differ in
+        // magnitude, unless no candidate can account for the observed mass. On lpa it reproduced the
+        // baseline exactly, so it bought nothing there, and it cost the folded-consensus fixture
+        // (32/36 against 36/36). The simpler rule is kept.
+        //
+        // The cost to state: at a tandem array with no bypass allele, copy number IS the scale and this
+        // rule discards it, so `called_bp` at such a block is less accurate. `mass_bp` remains the
+        // copy-number answer there, which is what block_class=array already says.
+        if (blocks[bi].bypass_allele < 0) scale_neff = 0.0;
         double cov_target = 0.0, cov_sd = 0.0;
         if (coverage != nullptr && bi < coverage->target_bp.size() && coverage->target_bp[bi] > 0.0 &&
             bi < coverage->use_block.size() && coverage->use_block[bi] != 0) {
