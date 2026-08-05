@@ -39,6 +39,10 @@ struct ReadPanel {
     std::vector<std::uint32_t> dbg_occ;
     std::vector<std::uint64_t> dbg_actual;
     std::vector<std::uint64_t> dbg_expected;
+    // Per block: how many distinct fragment-length windows the surviving markers occupy. This, not the
+    // marker count, is how many independent observations the block really supplies -- markers inside one
+    // fragment are carried by the same reads and rise and fall together.
+    std::vector<double> marker_clumps;
     std::size_t blocks_restored = 0;          // blocks whose markers were put back for allele balance
     std::size_t region_filtered_markers = 0;   // dropped for occurring elsewhere in the region
     std::size_t dropped_multi_block = 0;       // ...because they appear in more than one block

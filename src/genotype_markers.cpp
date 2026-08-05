@@ -40,6 +40,10 @@ struct AlleleInventory {
     Counts edges;
     std::size_t bp = 0;
     std::size_t syncmers_total = 0;
+    // Where each marker sits along the allele. Two markers a few bases apart are carried by the same
+    // reads, so they are one observation, not two -- and a marker set clustered in a single fragment
+    // is one observation however many members it has.
+    std::unordered_map<std::uint64_t, std::size_t> first_pos;
 };
 
 void collect_inventory(const std::string& seq, std::size_t k, std::size_t s, AlleleInventory& inv,
@@ -48,7 +52,7 @@ void collect_inventory(const std::string& seq, std::size_t k, std::size_t s, All
         all_kmers ? collect_canonical_kmer_occurrences(seq, k) : collect_syncmers(seq, k, s);
     inv.bp = seq.size();
     inv.syncmers_total = sy.size();
-    for (const KmerOccurrence& o : sy) ++inv.nodes[o.code];
+    for (const KmerOccurrence& o : sy) { ++inv.nodes[o.code]; inv.first_pos.emplace(o.code, o.start); }
     for (std::size_t i = 1; i < sy.size(); ++i) {
         ++inv.edges[adjacency_key(sy[i - 1].code, sy[i].code, sy[i].start - sy[i - 1].start)];
     }
@@ -975,7 +979,28 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
                         ++out_panel->blocks_restored;
                     }
                 }
-                // Anchors need the OCCURRENCE-based test, not the vary-based one, and an expectation
+                // Independent observations per block: distinct fragment-length windows occupied by the
+            // surviving markers, taken over the union of alleles. A deletion junction contributes about
+            // 31 bases of novel sequence and therefore a handful of markers inside ONE fragment -- five
+            // markers that are one observation. Counting them as five is what let a paralogous block be
+            // called homozygous at GQ 20 on a coverage fluctuation that moved all five together.
+            out_panel->marker_clumps.assign(chain.size(), 0.0);
+            for (std::size_t bi = 0; bi < chain.size(); ++bi) {
+                std::unordered_set<long> bins;
+                const double frag = 350.0;
+                for (std::size_t ai = 0; ai < out_panel->by_block[bi].size() && ai < kept_inv[bi].size(); ++ai) {
+                    for (const auto& [slot_i, mult] : out_panel->by_block[bi][ai].nodes) {
+                        (void)mult;
+                        if (slot_i >= out_panel->node_codes.size()) continue;
+                        const auto ip = kept_inv[bi][ai].first_pos.find(out_panel->node_codes[slot_i]);
+                        if (ip != kept_inv[bi][ai].first_pos.end()) {
+                            bins.insert(static_cast<long>(ip->second / frag));
+                        }
+                    }
+                }
+                out_panel->marker_clumps[bi] = static_cast<double>(bins.size());
+            }
+            // Anchors need the OCCURRENCE-based test, not the vary-based one, and an expectation
                 // of their own: they are absent from `by_block`, so `expected` is zero for them and the
                 // old bound degenerated to "seen more than once per haplotype on average". An anchor is
                 // carried by every allele of its block at multiplicity 1, so the panel should show it

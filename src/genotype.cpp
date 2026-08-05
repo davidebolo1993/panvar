@@ -240,7 +240,14 @@ std::vector<BlockCall> genotype_sample(
             std::vector<std::size_t> lens = blocks[bi].allele_bp;
             std::sort(lens.begin(), lens.end());
             const double span = lens.empty() ? 0.0 : static_cast<double>(lens[lens.size() / 2]);
-            rho = std::min(1.0, (span / options.fragment_len) / static_cast<double>(universe.size()));
+            // Independent observations = the fragment-length WINDOWS the markers actually occupy, not
+            // the block's span. Using the span assumes the markers are spread across it; a deletion
+            // junction puts all of them inside a single fragment, where they share reads and move
+            // together, and treating five such markers as four independent votes is what turned a
+            // coverage fluctuation into a confident wrong homozygous call.
+            const double clumps = bi < panel.marker_clumps.size() && panel.marker_clumps[bi] > 0.0
+                ? panel.marker_clumps[bi] : span / options.fragment_len;
+            rho = std::min(1.0, clumps / static_cast<double>(universe.size()));
             if (!(rho > 0.0)) rho = 1e-6;
         }
 
