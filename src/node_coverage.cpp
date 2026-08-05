@@ -129,6 +129,16 @@ SampleCoverage inject_reads(
                                idx_opt.bucket_bits, static_cast<int>(seqs.size()), seqs.data(), names.data());
     if (idx == nullptr) throw std::runtime_error("coverage: could not index the panel paths");
     mm_mapopt_update(&map_opt, idx);
+    // Repeat-seed filtering has to be switched off, and this is the single setting that decides
+    // whether a tandem array is measurable at all. minimap2 discards minimizers that occur more often
+    // than mid_occ, which mm_mapopt_update derives from the index -- sensible for mapping to a genome,
+    // exactly wrong here. The panel holds hundreds of near-identical haplotypes and the array is a
+    // cycle, so a seed inside it occurs (paths x copies) times: at lpa about 11,000. Left at the
+    // default, 23% of reads failed to place and the array nodes came back at 2.59 times their
+    // traversal count where every other multiplicity band sat at 12-15.
+    map_opt.mid_occ = std::numeric_limits<int>::max();
+    map_opt.max_occ = std::numeric_limits<int>::max();
+    map_opt.mid_occ_frac = 0.0f;
 
     const std::size_t nthreads =
         std::max<std::size_t>(1, options.threads != 0 ? options.threads : std::thread::hardware_concurrency());

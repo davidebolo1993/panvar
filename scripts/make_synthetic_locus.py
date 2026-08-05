@@ -84,6 +84,11 @@ def main():
                     help="tandem repeat unit length. Raise it with --dup-max-cn for a VNTR-scale array "
                          "like LPA's KIV-2 or ANKRD36C's, where copy number IS the variant and marker "
                          "multiplicity is the only signal that can measure it.")
+    ap.add_argument("--dup-node-per-copy", action="store_true",
+                    help="emit one node per array copy instead of revisiting a single node. That is "
+                         "the opposite of what a real pangenome graph does (lpa: 75%% of path steps "
+                         "revisit a node, no >100bp sequence under two ids) and it makes the array "
+                         "easier, so it exists only to reproduce results measured before the fix")
     ap.add_argument("--dup-per-design-divergence", type=float, default=0.0,
                     help="give EVERY design its own array copies, diverged from the base unit by this "
                          "per-base rate. Without it all designs share one set of copy nodes and the "
@@ -357,11 +362,21 @@ def main():
                     if designs[d][payload]:
                         push(hs, alt)
             elif payload == "DUP":
-                # One node per copy index; a haplotype with N copies traverses the first N. Identical
-                # copies (default) make copy number show up purely as marker multiplicity.
+                # A real pangenome graph collapses identical sequence into ONE node and expresses
+                # repetition as revisiting it, so a haplotype with N copies traverses the same node N
+                # times and copy number is that node's traversal multiplicity. Measured on the lpa
+                # graph: 75% of path steps revisit a node already used, and no sequence over 100 bp is
+                # stored under two node ids.
+                #
+                # This generator used to emit one node per copy index instead, which is the opposite
+                # structure -- N distinct nodes each traversed once, 0% revisits. That made the array
+                # easier than the real thing in a way that matters: read placement is unambiguous when
+                # the copies are separate nodes, and per-node coverage then needs the opposite
+                # weighting. Any result measured on the old shape should be re-measured on this one.
+                # `--dup-node-per-copy` restores it for exactly that comparison.
                 maxcn = max(designs[d]["DUP"] for d in range(args.designs))
                 copies = dup_copies(maxcn)
-                ids = [add_node(c) for c in copies]
+                ids = [add_node(c) for c in copies] if args.dup_node_per_copy else [add_node(copies[0])]
                 ref_walk.append((ids[0], "+"))
                 if args.dup_per_design_divergence > 0.0:
                     # Each design walks its OWN copies, so every array allele is distinct. The unit is
@@ -378,7 +393,12 @@ def main():
                             if drng2.random() < args.dup_per_design_divergence:
                                 u[t] = drng2.choice([b for b in "ACGT" if b != u[t]])
                         unit_d = "".join(u)
-                        own = [add_node(unit_d) for _ in range(designs[d]["DUP"])]
+                        # One node per DESIGN (its own diverged unit), traversed as many times as
+                        # that design has copies -- distinct unit variants are distinct nodes, and
+                        # repetition of a variant is revisiting its node, which is what a real graph does.
+                        own = ([add_node(unit_d) for _ in range(designs[d]["DUP"])]
+                               if args.dup_node_per_copy
+                               else [add_node(unit_d)] * designs[d]["DUP"])
                         hs = [h for h in (f"design{d}#a", f"design{d}#b") if h in here]
                         for nid2 in own:
                             push(hs, nid2)
@@ -386,7 +406,7 @@ def main():
                     for d in range(args.designs):
                         hs = [h for h in (f"design{d}#a", f"design{d}#b") if h in here]
                         for k in range(designs[d]["DUP"]):
-                            push(hs, ids[k])
+                            push(hs, ids[k] if args.dup_node_per_copy else ids[0])
             else:  # INV -- the same node traversed in reverse, as a real graph represents it
                 nid = add_node(backbone[INV_POS:INV_POS + INV_LEN])
                 ref_walk.append((nid, "+"))
