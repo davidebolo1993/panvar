@@ -233,8 +233,9 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--coverage-block") coverage_block = std::stol(require_value(arg));
         else if (arg == "--evidence") {
             evidence = require_value(arg);
-            if (evidence != "syncmer" && evidence != "coverage" && evidence != "auto") {
-                throw std::runtime_error("genotype: --evidence must be syncmer|coverage|auto");
+            if (evidence != "syncmer" && evidence != "coverage" && evidence != "auto" &&
+                evidence != "combined") {
+                throw std::runtime_error("genotype: --evidence must be syncmer|coverage|auto|combined");
             }
         }
         else if (arg == "--model-pangenie") model_pangenie = true;
@@ -1123,6 +1124,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 cev.node = scov.node;
                 cev.block_allele_nodes.resize(chain.size());
                 cev.use_block.assign(chain.size(), 0);
+                cev.target_bp.assign(chain.size(), 0.0);
+                cev.target_sd.assign(chain.size(), 0.0);
                 std::size_t n_used = 0;
                 for (std::size_t bi = 0; bi < chain.size(); ++bi) {
                     auto av = block_allele_node_vectors(panel_graph, path_indexes, bubbles,
@@ -1132,9 +1135,41 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     // `auto` routes only the tandem arrays to coverage, on the argument that the marker
                     // path is validated everywhere else and a marker rule cannot express copy number.
                     // Whether routing beats using coverage everywhere is a measurement, not a belief.
-                    const bool want = evidence == "coverage" || (evidence == "auto" && mx >= 3);
+                    const bool is_array = mx >= 3;
+                    const bool want = evidence == "coverage" ||
+                                      ((evidence == "auto" || evidence == "combined") && is_array);
                     if (want) { cev.use_block[bi] = 1; ++n_used; }
+                    // How much sequence the coverage says is here, across both haplotypes: the observed
+                    // coverage over the block's nodes, divided by the depth, times each node's length.
+                    // Alignment-derived, so independent of the markers it will be used to constrain.
+                    if (want && cev.lambda > 0.0) {
+                        std::vector<char> seen(nidx.size(), 0);
+                        double bp = 0.0;
+                        for (const auto& v : av) {
+                            for (std::size_t n = 0; n < v.size(); ++n) {
+                                if (v[n] > 0 && !seen[n]) {
+                                    seen[n] = 1;
+                                    bp += (scov.node[n] / cev.lambda) * static_cast<double>(nidx.length[n]);
+                                }
+                            }
+                        }
+                        cev.target_bp[bi] = bp;
+                        // Gate A measured this estimator to about 1% on lpa; 2% is deliberately loose,
+                        // so the constraint rules out whole repeat units without arbitrating between
+                        // pairs that are both plausible -- that arbitration is the markers' job.
+                        cev.target_sd[bi] = 0.02 * bp;
+                    }
                     cev.block_allele_nodes[bi] = std::move(av);
+                }
+                // In combined mode the markers keep the emission and coverage contributes only the
+                // total-length constraint. The emission fires on the per-block allele vectors, so
+                // dropping those switches it off while use_block stays set and the target still
+                // applies.
+                if (evidence == "combined") {
+                    for (auto& v : cev.block_allele_nodes) v.clear();
+                    for (std::size_t bi = 0; bi < cev.use_block.size(); ++bi) {
+                        if (cev.target_bp[bi] <= 0.0) cev.use_block[bi] = 0;
+                    }
                 }
                 log.info("evidence " + evidence + ": coverage at " + std::to_string(n_used) + " of " +
                          std::to_string(chain.size()) + " blocks, lambda " + std::to_string(cev.lambda) +

@@ -79,6 +79,11 @@ struct CoverageEvidence {
     std::vector<double> node;            // the sample's per-node coverage
     double lambda = 0.0;                 // depth per haplotype copy, from invariant nodes
     std::vector<char> use_block;         // per block: 1 = score from coverage
+    // Total sequence across both haplotypes that the coverage implies at each block, and its standard
+    // error. Used by the combined mode, where the marker emission still CHOOSES the alleles and this
+    // only says how much sequence there should be between them.
+    std::vector<double> target_bp;
+    std::vector<double> target_sd;
 };
 
 struct BlockCall {

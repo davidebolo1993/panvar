@@ -341,6 +341,13 @@ std::vector<BlockCall> genotype_sample(
             continue;
         }
 
+        double cov_target = 0.0, cov_sd = 0.0;
+        if (coverage != nullptr && bi < coverage->target_bp.size() && coverage->target_bp[bi] > 0.0 &&
+            bi < coverage->use_block.size() && coverage->use_block[bi] != 0) {
+            cov_target = coverage->target_bp[bi];
+            cov_sd = coverage->target_sd[bi];
+        }
+
         const std::size_t kn = kept[bi].size();
         emis[bi].assign(kn * kn, 0.0);
         explained[bi].assign(kn * kn, 0.0);
@@ -390,7 +397,27 @@ std::vector<BlockCall> genotype_sample(
                     const double z = (mult_in - mass_target) / mass_sd;
                     mass_ll = -0.5 * options.mass_weight * z * z;
                 }
-                emis[bi][x * kn + y] = baseline + rho * ll + mass_ll;
+                // Coverage says how much sequence is here; the markers say which alleles it is. The
+                // two are good at different halves: at lpa's KIV-2 block the marker emission places one
+                // haplotype at identity 0.9999 and puts the entire error in the other, while the
+                // coverage emission gets the total to 30 bases and splits the error across both. So the
+                // markers keep the choice and coverage only constrains the sum.
+                //
+                // This is not the earlier mass term, which failed. That took its target from marker
+                // mass -- the same evidence it was correcting -- and enforced it hard enough to pick
+                // badly among pairs of the right length. This target is alignment-derived, independent,
+                // and accurate to about 1%, so it can be applied at its own precision.
+                double cov_ll = 0.0;
+                if (cov_target > 0.0 && cov_sd > 0.0) {
+                    const double bp_pair =
+                        static_cast<double>(kept[bi][x] < blocks[bi].allele_bp.size()
+                                                ? blocks[bi].allele_bp[kept[bi][x]] : 0) +
+                        static_cast<double>(kept[bi][y] < blocks[bi].allele_bp.size()
+                                                ? blocks[bi].allele_bp[kept[bi][y]] : 0);
+                    const double z = (bp_pair - cov_target) / cov_sd;
+                    cov_ll = -0.5 * z * z;
+                }
+                emis[bi][x * kn + y] = baseline + rho * ll + mass_ll + cov_ll;
                 // Share of the block's observed marker mass this pair accounts for. The denominator is
                 // the UNION of the block's markers -- summing per allele would count every shared
                 // marker once per carrier and make `explained` scale like 1/n_alleles.
