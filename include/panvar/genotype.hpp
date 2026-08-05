@@ -4,6 +4,7 @@
 #include "panvar/genotype_reads.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -67,6 +68,17 @@ struct GenotypeOptions {
     // diagnostic rather than something to leave on for a cohort.
     bool provenance = false;
     std::size_t threads = 0;
+};
+
+// Node coverage as an alternative emission for selected blocks. The marker path stays the default and
+// is untouched; this replaces only what the emission is computed FROM, so blocks, pruning, chaining,
+// filters and scoring are shared and any difference is attributable to the evidence.
+struct CoverageEvidence {
+    // [block][allele][node] traversal multiplicity, empty for blocks that keep the marker emission.
+    std::vector<std::vector<std::vector<std::uint32_t>>> block_allele_nodes;
+    std::vector<double> node;            // the sample's per-node coverage
+    double lambda = 0.0;                 // depth per haplotype copy, from invariant nodes
+    std::vector<char> use_block;         // per block: 1 = score from coverage
 };
 
 struct BlockCall {
@@ -156,7 +168,8 @@ std::vector<BlockCall> genotype_sample(
     const GenotypeOptions& options,
     GenotypeSummary* summary = nullptr,
     const std::vector<int>* truth_allele1 = nullptr,
-    const std::vector<int>* truth_allele2 = nullptr);
+    const std::vector<int>* truth_allele2 = nullptr,
+    const CoverageEvidence* coverage = nullptr);
 
 void write_genotypes(
     const std::string& out_prefix,

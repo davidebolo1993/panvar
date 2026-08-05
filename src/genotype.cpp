@@ -51,7 +51,8 @@ std::vector<BlockCall> genotype_sample(
     const GenotypeOptions& options,
     GenotypeSummary* summary,
     const std::vector<int>* truth_allele1,
-    const std::vector<int>* truth_allele2) {
+    const std::vector<int>* truth_allele2,
+    const CoverageEvidence* coverage) {
 
     const std::size_t nb = chain.size();
     const std::size_t nh = haplotype_names.size();
@@ -276,6 +277,51 @@ std::vector<BlockCall> genotype_sample(
             // an under-count and the resulting sd conservative.
             const double frags = options.fragment_len > 0.0 ? 2.0 * lambda * span / options.fragment_len : 0.0;
             mass_sd = frags > 1.0 && mass_target > 0.0 ? mass_target / std::sqrt(frags) : 0.0;
+        }
+
+        // Coverage emission for this block, if it was asked for. Same candidate set, same chain, same
+        // filters -- only the evidence changes, so a difference in the result is attributable.
+        const bool use_cov = coverage != nullptr && bi < coverage->use_block.size() &&
+                             coverage->use_block[bi] != 0 &&
+                             bi < coverage->block_allele_nodes.size() &&
+                             !coverage->block_allele_nodes[bi].empty();
+        if (use_cov) {
+            const auto& av = coverage->block_allele_nodes[bi];
+            const double lam = coverage->lambda > 0.0 ? coverage->lambda : 1.0;
+            const double cmu = std::max(0.01, 0.02 * lam);
+            // Only the nodes some allele here traverses. Anything else belongs to another block and
+            // would add the same constant to every candidate while diluting the comparison.
+            std::vector<std::uint32_t> cnodes;
+            for (const auto& v : av) {
+                for (std::size_t i = 0; i < v.size(); ++i) {
+                    if (v[i] > 0) cnodes.push_back(static_cast<std::uint32_t>(i));
+                }
+            }
+            std::sort(cnodes.begin(), cnodes.end());
+            cnodes.erase(std::unique(cnodes.begin(), cnodes.end()), cnodes.end());
+            const std::size_t kn2 = kept[bi].size();
+            emis[bi].assign(kn2 * kn2, 0.0);
+            explained[bi].assign(kn2 * kn2, 1.0);
+            detected[bi].assign(kn2 * kn2, 1.0);
+            for (std::size_t x = 0; x < kn2; ++x) {
+                for (std::size_t y = 0; y < kn2; ++y) {
+                    const std::size_t ax = kept[bi][x];
+                    const std::size_t ay = kept[bi][y];
+                    if (ax >= av.size() || ay >= av.size()) continue;
+                    double ll = 0.0, obs_in = 0.0, pred_in = 0.0;
+                    for (const std::uint32_t n : cnodes) {
+                        const double m = static_cast<double>(av[ax][n] + av[ay][n]);
+                        const double o = n < coverage->node.size() ? coverage->node[n] : 0.0;
+                        ll += log_nb(o, lam * m + cmu, phi);
+                        obs_in += o;
+                        pred_in += lam * m + cmu;
+                    }
+                    emis[bi][x * kn2 + y] = ll;
+                    detected[bi][x * kn2 + y] = pred_in > 0.0 ? obs_in / pred_in : 1.0;
+                }
+            }
+            baseline_of[bi] = *std::min_element(emis[bi].begin(), emis[bi].end());
+            continue;
         }
 
         const std::size_t kn = kept[bi].size();

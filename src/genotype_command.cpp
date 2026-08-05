@@ -174,6 +174,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
     long cosine_block = -1;
     bool node_coverage = false;
     long coverage_block = -1;
+    std::string evidence = "syncmer";
     bool model_pangenie = false;
     bool provenance = false;
     double uneven_tolerance = 0.35;
@@ -230,6 +231,12 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--cosine-block") cosine_block = std::stol(require_value(arg));
         else if (arg == "--node-coverage") node_coverage = true;
         else if (arg == "--coverage-block") coverage_block = std::stol(require_value(arg));
+        else if (arg == "--evidence") {
+            evidence = require_value(arg);
+            if (evidence != "syncmer" && evidence != "coverage" && evidence != "auto") {
+                throw std::runtime_error("genotype: --evidence must be syncmer|coverage|auto");
+            }
+        }
         else if (arg == "--model-pangenie") model_pangenie = true;
         else if (arg == "--carrier-weight") carrier_weight = std::stod(require_value(arg));
         else if (arg == "--provenance") provenance = true;
@@ -1095,9 +1102,48 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     if (bi < ts2.size() && !ts2[bi].empty()) pa2[bi] = most_identical(bi, ts2[bi]);
                 }
             }
+            // Coverage evidence, built once and handed to the same chain the marker path uses.
+            CoverageEvidence cev;
+            if (evidence != "syncmer") {
+                const NodeIndex nidx = build_node_index(panel_graph);
+                const PanelCoverage pcov = build_panel_coverage(panel_graph, nidx);
+                CoverageOptions copt;
+                copt.threads = options.threads;
+                const SampleCoverage scov = inject_reads(panel_graph, nidx, pcov, read_paths, copt);
+                // Depth from nodes every panel path traverses exactly once: the sample carries two
+                // copies of those whatever its genotype, so their coverage measures depth alone.
+                std::vector<double> anchor_cov;
+                for (std::size_t n = 0; n < nidx.size(); ++n) {
+                    bool inv = !pcov.by_path.empty();
+                    for (const auto& v : pcov.by_path) if (v[n] != 1) { inv = false; break; }
+                    if (inv) anchor_cov.push_back(scov.node[n]);
+                }
+                std::sort(anchor_cov.begin(), anchor_cov.end());
+                cev.lambda = anchor_cov.size() >= 20 ? anchor_cov[anchor_cov.size() / 2] / 2.0 : 0.0;
+                cev.node = scov.node;
+                cev.block_allele_nodes.resize(chain.size());
+                cev.use_block.assign(chain.size(), 0);
+                std::size_t n_used = 0;
+                for (std::size_t bi = 0; bi < chain.size(); ++bi) {
+                    auto av = block_allele_node_vectors(panel_graph, path_indexes, bubbles,
+                                                        chain[bi], blocks[bi], nidx);
+                    std::uint32_t mx = 0;
+                    for (const auto& v : av) for (const std::uint32_t m : v) mx = std::max(mx, m);
+                    // `auto` routes only the tandem arrays to coverage, on the argument that the marker
+                    // path is validated everywhere else and a marker rule cannot express copy number.
+                    // Whether routing beats using coverage everywhere is a measurement, not a belief.
+                    const bool want = evidence == "coverage" || (evidence == "auto" && mx >= 3);
+                    if (want) { cev.use_block[bi] = 1; ++n_used; }
+                    cev.block_allele_nodes[bi] = std::move(av);
+                }
+                log.info("evidence " + evidence + ": coverage at " + std::to_string(n_used) + " of " +
+                         std::to_string(chain.size()) + " blocks, lambda " + std::to_string(cev.lambda) +
+                         " from " + std::to_string(anchor_cov.size()) + " invariant nodes");
+            }
             std::vector<BlockCall> calls =
                 genotype_sample(chain, blocks, read_panel, rc, depth, hap_names, gopt, &gsum,
-                                pa1.empty() ? nullptr : &pa1, pa2.empty() ? nullptr : &pa2);
+                                pa1.empty() ? nullptr : &pa1, pa2.empty() ? nullptr : &pa2,
+                                evidence == "syncmer" ? nullptr : &cev);
 
             if (model_pangenie) {
                 // Same panel, same counts, same depth -- only the model differs, which is the whole
