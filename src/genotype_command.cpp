@@ -506,6 +506,24 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 // multiplicity m in allele a, the reads carry lambda*(m_truth1 + m_truth2), so
                 // obs_sum/sum_multiplicity is about 2*lambda for an allele whose copy number matches
                 // the sample, lower for one that is too long and higher for one too short.
+                // Per-marker confinement audit for this block: why is each surviving marker still
+                // here, and does its panel-wide occurrence match what the block accounts for?
+                {
+                    const std::string apath = out_prefix + ".block" + std::to_string(bi) + ".conf.tsv";
+                    std::ofstream cf(apath);
+                    cf << "allele\tslot\tmult\tvary_blocks\tocc_blocks\tactual\texpected\tobs\n";
+                    for (std::size_t ai = 0; ai < read_panel.by_block[bi].size(); ++ai) {
+                        for (const auto& [slot, m] : read_panel.by_block[bi][ai].nodes) {
+                            cf << ai << '\t' << slot << '\t' << m << '\t'
+                               << (slot < read_panel.dbg_vary.size() ? read_panel.dbg_vary[slot] : 0) << '\t'
+                               << (slot < read_panel.dbg_occ.size() ? read_panel.dbg_occ[slot] : 0) << '\t'
+                               << (slot < read_panel.dbg_actual.size() ? read_panel.dbg_actual[slot] : 0) << '\t'
+                               << (slot < read_panel.dbg_expected.size() ? read_panel.dbg_expected[slot] : 0) << '\t'
+                               << rc_pre.node[slot] << '\n';
+                        }
+                    }
+                    log.wrote({apath});
+                }
                 d << "allele\tn_haplotypes\tbp\tn_markers\tsum_multiplicity\tobs_sum\n";
                 for (std::size_t ai = 0; ai < read_panel.by_block[bi].size(); ++ai) {
                     std::uint64_t mult = 0;

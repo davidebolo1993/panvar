@@ -123,6 +123,17 @@ struct BlockCall {
     // Total sequence the ALIGNMENT coverage implies at this block, across both haplotypes. Independent
     // of the markers and of which allele pair was called, so it is the arbiter when the two evidence
     // paths disagree about how much sequence is present. 0 where coverage was not computed.
+    // How many of this block's alleles carry no informative marker at all. Such an allele is invisible
+    // to the emission: it predicts nothing, so a pair containing it is separated from a pair containing
+    // its neighbour only by the ABSOLUTE count level of the other allele's markers, never by
+    // composition. That makes the call rest entirely on the depth scale being right.
+    //
+    // Measured on the paralogous fixture, where one allele of a two-allele deletion bubble has zero
+    // markers: a true heterozygote reads 1.78 x lambda on the other allele's five markers and a true
+    // homozygote reads 2.33 x lambda, against predictions of 1.0 and 2.0. The two classes are half as
+    // far apart as the model believes and the heterozygote sits nearer the homozygous prediction, so it
+    // is called homozygous at GQ 20 and PASS.
+    std::size_t alleles_without_markers = 0;
     double cov_bp = 0.0;
     std::size_t max_copies = 1;
     // True when the block is a tandem array. It changes how the row should be read, which is why it is

@@ -902,6 +902,19 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
                     }
                 }
             }
+            // Snapshot before the erase, so a surviving marker can be interrogated afterwards.
+            out_panel->dbg_vary.assign(out_panel->node_codes.size(), 0);
+            out_panel->dbg_occ.assign(out_panel->node_codes.size(), 0);
+            out_panel->dbg_actual.assign(out_panel->node_codes.size(), 0);
+            out_panel->dbg_expected.assign(out_panel->node_codes.size(), 0);
+            for (std::size_t sl = 0; sl < out_panel->node_codes.size(); ++sl) {
+                out_panel->dbg_vary[sl] = blocks_with[sl];
+                const auto io = occ_blocks.find(out_panel->node_codes[sl]);
+                out_panel->dbg_occ[sl] = io == occ_blocks.end() ? 0 : io->second;
+                out_panel->dbg_actual[sl] = actual[sl];
+                const auto ie = expected.find(static_cast<std::uint32_t>(sl));
+                out_panel->dbg_expected[sl] = ie == expected.end() ? 0 : ie->second;
+            }
             for (std::size_t bi = 0; bi < chain.size(); ++bi) {
                 for (auto& mset : out_panel->by_block[bi]) {
                     const std::size_t before = mset.nodes.size();

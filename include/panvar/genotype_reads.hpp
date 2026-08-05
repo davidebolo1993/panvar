@@ -30,6 +30,15 @@ struct ReadPanel {
     // anything, which is exactly why they are the right depth reference: their observed count is a
     // clean read-out of coverage, uncontaminated by which allele the sample carries.
     std::vector<std::vector<std::uint32_t>> anchor_slots;   // [block] -> node slots
+    // Per-slot confinement audit, filled only when requested. `vary` is the number of blocks whose
+    // count depends on the genotype, `occ` the number of blocks the marker appears in at all, `actual`
+    // its panel-wide occurrence count from re-spelling every path, and `expected` what the blocks that
+    // retained it account for. A marker survives only when vary <= 1 and actual <= expected, so these
+    // four numbers say exactly why any given marker is still here.
+    std::vector<std::uint32_t> dbg_vary;
+    std::vector<std::uint32_t> dbg_occ;
+    std::vector<std::uint64_t> dbg_actual;
+    std::vector<std::uint64_t> dbg_expected;
     std::size_t region_filtered_markers = 0;   // dropped for occurring elsewhere in the region
     std::size_t dropped_multi_block = 0;       // ...because they appear in more than one block
     std::size_t dropped_over_expected = 0;     // ...because the panel shows more copies than blocks own

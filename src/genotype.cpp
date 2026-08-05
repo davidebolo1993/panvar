@@ -684,6 +684,7 @@ std::vector<BlockCall> genotype_sample(
                 for (const auto& [slot, m] : panel.by_block[bi][c.allele2].nodes) { (void)slot; m_called += m; }
             }
             c.max_copies = max_copies_of[bi];
+            for (const auto& ms : panel.by_block[bi]) if (ms.nodes.empty()) ++c.alleles_without_markers;
             if (coverage != nullptr && bi < coverage->target_bp.size()) c.cov_bp = coverage->target_bp[bi];
             // Three copies of a marker is already past anything ordinary variation produces: a
             // substitution or a small indel changes a marker's presence, not how many times it recurs.
@@ -842,7 +843,7 @@ void write_genotypes(
     if (!g) throw std::runtime_error("genotype: cannot write " + gpath);
     g << "block_index\tblock_kind\tbubble_id\tsource\tsink\tn_alleles\tn_markers"
          "\tallele1\tallele2\thaplotype1\thaplotype2\thap_posterior\tgq\texplained\tdetected"
-         "\tcalled_bp\tmass_bp\tmass_bp_sd\tcov_bp\tmax_copies\tblock_class"
+         "\tcalled_bp\tmass_bp\tmass_bp_sd\tcov_bp\tno_marker_alleles\tmax_copies\tblock_class"
          "\tevidence\tfilter\ttruth1\ttruth2\ttruth_rank\ttruth_delta\tinfluencers\n";
     for (std::size_t bi = 0; bi < calls.size(); ++bi) {
         const BlockCall& c = calls[bi];
@@ -858,7 +859,7 @@ void write_genotypes(
           << (c.hap2 < haplotype_names.size() ? haplotype_names[c.hap2] : ".") << '\t'
           << c.hap_posterior << '\t' << c.gq << '\t' << c.explained << '\t' << c.detected << '\t'
           << c.called_bp << '\t' << c.mass_bp << '\t' << c.mass_bp_sd << '\t'
-          << c.cov_bp << '\t' << c.max_copies << '\t' << (c.is_array ? "array" : "simple") << '\t'
+          << c.cov_bp << '\t' << c.alleles_without_markers << '\t' << c.max_copies << '\t' << (c.is_array ? "array" : "simple") << '\t'
           << c.evidence << '\t' << c.filter << '\t'
           << c.truth_allele1 << '\t' << c.truth_allele2 << '\t' << c.truth_emission_rank << '\t'
           << c.truth_emission_delta << '\t';
