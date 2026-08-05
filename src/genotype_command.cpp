@@ -170,6 +170,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
     std::string explain_pair;
     double marker_outlier = 0.0;
     long deconvolve = -1;
+    long cosine_block = -1;
     bool model_pangenie = false;
     bool provenance = false;
     double uneven_tolerance = 0.35;
@@ -223,6 +224,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--explain-pair") explain_pair = require_value(arg);
         else if (arg == "--marker-outlier") marker_outlier = std::stod(require_value(arg));
         else if (arg == "--deconvolve") deconvolve = std::stol(require_value(arg));
+        else if (arg == "--cosine-block") cosine_block = std::stol(require_value(arg));
         else if (arg == "--model-pangenie") model_pangenie = true;
         else if (arg == "--carrier-weight") carrier_weight = std::stod(require_value(arg));
         else if (arg == "--provenance") provenance = true;
@@ -640,6 +642,76 @@ int run_genotype_command(const std::vector<std::string>& args) {
                        << (a < blocks[dbi].allele_bp.size() ? blocks[dbi].allele_bp[a] : 0) << '\n';
                 }
                 log.wrote({dp});
+            }
+
+            // cosigt's score, on our vectors. cosigt compares the sample's per-node coverage against
+            // the summed coverage of every candidate haplotype pair by cosine similarity; here the same
+            // score runs over one block's marker counts, which is the cheapest way to find out whether
+            // the SCORE is what matters before deciding whether the alignment-derived COVERAGE is.
+            //
+            // The reason to expect a difference: our likelihood predicts a marker the candidate lacks
+            // at the error background, so real counts there cost tens of log units and veto the
+            // candidate outright. Cosine has no such term -- a marker the candidate lacks contributes
+            // nothing to the dot product and only enters the sample's magnitude -- so it should not
+            // carry the bias toward longer arrays that --explain-pair exposed.
+            if (cosine_block >= 0) {
+                const std::size_t cbi = static_cast<std::size_t>(cosine_block);
+                const ReadCounts rcc = count_reads(read_paths, read_panel, options.threads);
+                const auto& BB = read_panel.by_block[cbi];
+                const std::size_t na = BB.size();
+                std::vector<std::unordered_map<std::uint32_t, double>> vec(na);
+                std::vector<double> self_dot(na, 0.0), obs_dot(na, 0.0);
+                double obs_norm2 = 0.0;
+                std::unordered_map<std::uint32_t, double> obs;
+                for (const auto& ms : BB) {
+                    for (const auto& [s2, m] : ms.nodes) {
+                        if (obs.find(s2) == obs.end()) {
+                            const double o = static_cast<double>(rcc.node[s2]);
+                            obs[s2] = o;
+                            obs_norm2 += o * o;
+                        }
+                    }
+                }
+                for (std::size_t a = 0; a < na; ++a) {
+                    for (const auto& [s2, m] : BB[a].nodes) {
+                        const double v = static_cast<double>(m);
+                        vec[a][s2] = v;
+                        self_dot[a] += v * v;
+                        obs_dot[a] += v * obs[s2];
+                    }
+                }
+                const double obs_norm = std::sqrt(std::max(1e-12, obs_norm2));
+                auto cos_of = [&](std::size_t a, std::size_t b) {
+                    double cross = 0.0;
+                    const auto& S = vec[a].size() <= vec[b].size() ? vec[a] : vec[b];
+                    const auto& L = vec[a].size() <= vec[b].size() ? vec[b] : vec[a];
+                    for (const auto& [s2, v] : S) {
+                        const auto it = L.find(s2);
+                        if (it != L.end()) cross += v * it->second;
+                    }
+                    const double n2 = self_dot[a] + self_dot[b] + 2.0 * cross;
+                    if (n2 <= 0.0) return 0.0;
+                    return (obs_dot[a] + obs_dot[b]) / (std::sqrt(n2) * obs_norm);
+                };
+                std::vector<std::pair<double, std::pair<std::size_t, std::size_t>>> all;
+                all.reserve(na * (na + 1) / 2);
+                for (std::size_t a = 0; a < na; ++a) {
+                    for (std::size_t b = a; b < na; ++b) all.emplace_back(cos_of(a, b), std::make_pair(a, b));
+                }
+                std::sort(all.rbegin(), all.rend());
+                const std::string cp = out_prefix + ".cosine.tsv";
+                std::ofstream cf(cp);
+                cf << "rank\tallele1\tallele2\tcosine\tbp1\tbp2\ttotal_bp\n";
+                auto bpv = [&](std::size_t a) {
+                    return a < blocks[cbi].allele_bp.size() ? blocks[cbi].allele_bp[a] : 0;
+                };
+                for (std::size_t r = 0; r < std::min<std::size_t>(20, all.size()); ++r) {
+                    cf << (r + 1) << '\t' << all[r].second.first << '\t' << all[r].second.second << '\t'
+                       << all[r].first << '\t' << bpv(all[r].second.first) << '\t'
+                       << bpv(all[r].second.second) << '\t'
+                       << (bpv(all[r].second.first) + bpv(all[r].second.second)) << '\n';
+                }
+                log.wrote({cp});
             }
 
             const ReadCounts rc = count_reads(read_paths, read_panel, options.threads);
