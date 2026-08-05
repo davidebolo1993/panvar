@@ -684,7 +684,19 @@ std::vector<BlockCall> genotype_sample(
                 for (const auto& [slot, m] : panel.by_block[bi][c.allele2].nodes) { (void)slot; m_called += m; }
             }
             c.max_copies = max_copies_of[bi];
-            for (const auto& ms : panel.by_block[bi]) if (ms.nodes.empty()) ++c.alleles_without_markers;
+            // The BYPASS allele is excluded: a haplotype that does not traverse the block carries no
+            // sequence, so having no markers is the correct description of it rather than a failure of
+            // evidence, and the machinery for that case (predicted count zero, `detected`, mass) is
+            // already in place. What matters here is a real allele with real sequence that confinement
+            // has stripped to nothing -- then the model genuinely cannot see it.
+            for (std::size_t ai = 0; ai < panel.by_block[bi].size(); ++ai) {
+                if (blocks[bi].bypass_allele >= 0 &&
+                    ai == static_cast<std::size_t>(blocks[bi].bypass_allele)) continue;
+                if (panel.by_block[bi][ai].nodes.empty()) ++c.alleles_without_markers;
+            }
+            c.scale_only = c.alleles_without_markers > 0 && c.allele1 == c.allele2 &&
+                           c.allele1 < panel.by_block[bi].size() &&
+                           !panel.by_block[bi][c.allele1].nodes.empty();
             if (coverage != nullptr && bi < coverage->target_bp.size()) c.cov_bp = coverage->target_bp[bi];
             // Three copies of a marker is already past anything ordinary variation produces: a
             // substitution or a small indel changes a marker's presence, not how many times it recurs.
@@ -728,6 +740,12 @@ std::vector<BlockCall> genotype_sample(
                  (c.detected < options.min_detected || c.detected > 1.0 / options.min_detected)) {
             c.filter = "LOWCOV"; ++nocall;
         }
+        // A homozygous call at a block holding an invisible allele is decided by absolute depth alone,
+        // and measurement says that is not safe here: on the paralogous fixture the same five markers
+        // read 1.78 x lambda for a true heterozygote and 2.33 x lambda for a true homozygote, against
+        // predictions of 1.0 and 2.0 -- the classes are half as far apart as the model believes and the
+        // heterozygote falls nearer the homozygous prediction. Reported rather than guessed.
+        else if (c.scale_only) { c.filter = "SCALEONLY"; ++nocall; }
         else if (c.gq < options.min_gq) { c.filter = "LOWGQ"; ++nocall; }
         else { c.filter = "PASS"; ++called; gq_sum += c.gq; }
         // Provenance is orthogonal to quality: a block with no markers of its own is not a worse call,

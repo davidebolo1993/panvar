@@ -134,6 +134,12 @@ struct BlockCall {
     // far apart as the model believes and the heterozygote sits nearer the homozygous prediction, so it
     // is called homozygous at GQ 20 and PASS.
     std::size_t alleles_without_markers = 0;
+    // True when the call is homozygous at a block that also holds an allele with no markers. The
+    // competing heterozygous hypothesis -- one copy of the called allele and one of the invisible one --
+    // predicts exactly HALF the counts on exactly the same markers, so the two differ only by the
+    // absolute depth scale and never by which markers are present. Every other genotype decision this
+    // model makes rests on composition, which is scale-free; this one rests on lambda being right.
+    bool scale_only = false;
     double cov_bp = 0.0;
     std::size_t max_copies = 1;
     // True when the block is a tandem array. It changes how the row should be read, which is why it is
