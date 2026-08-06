@@ -172,6 +172,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
     double marker_outlier = 0.0;
     bool restore_stripped = false;
     bool compositional = false;
+    double robust_c = 0.0;
+    double mass_window = 0.0;
     double scale_weight = 1.0;
     long deconvolve = -1;
     long cosine_block = -1;
@@ -233,6 +235,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--marker-outlier") marker_outlier = std::stod(require_value(arg));
         else if (arg == "--restore-stripped-alleles") restore_stripped = true;
         else if (arg == "--compositional") compositional = true;
+        else if (arg == "--robust") robust_c = std::stod(require_value(arg));
+        else if (arg == "--mass-window") mass_window = std::stod(require_value(arg));
         else if (arg == "--scale-weight") scale_weight = std::stod(require_value(arg));
         else if (arg == "--deconvolve") deconvolve = std::stol(require_value(arg));
         else if (arg == "--cosine-block") cosine_block = std::stol(require_value(arg));
@@ -911,6 +915,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
             gopt.mass_weight = mass_weight;
             gopt.marker_outlier = marker_outlier;
             gopt.compositional = compositional;
+            gopt.robust_c = robust_c;
+            gopt.mass_window = mass_window;
             gopt.scale_weight = scale_weight;
             GenotypeSummary gsum;
             std::vector<int> ta1;

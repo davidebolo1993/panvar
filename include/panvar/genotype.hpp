@@ -65,6 +65,29 @@ struct GenotypeOptions {
     // a ratio survives things absolute depth does not -- a contaminated marker set, a mis-estimated
     // lambda, a locus with unusual coverage. It is also the only form in which a marker set that a
     // paralogue has inflated can still be used at all.
+    // Huber threshold on the standardised residual, in standard deviations. 0 disables.
+    //
+    // A Poisson or negative-binomial term has UNBOUNDED influence: a marker the candidate does not
+    // carry is predicted at the error background, so observing real counts there costs tens of log
+    // units, while a 5% error on a marker predicted at 500 costs about 0.6. Measured at lpa's KIV-2
+    // block, 57 markers holding 0.18% of the observed mass outvoted 951 markers holding 90% of it, six
+    // to one. Under leave-one-out every candidate lacks some of the sample's sequence, and a longer
+    // tandem array lacks less, so that asymmetry has a direction and it is the one that makes the call
+    // too long.
+    //
+    // A bounded loss is the standard answer to contaminated data: quadratic while the residual is
+    // small, linear beyond, so no single marker can dominate however badly it fits. The multinomial
+    // does NOT solve this -- o * log(p) with p near zero is just as unbounded.
+    // Hard window, in relative deviations, on a block's total marker multiplicity, applied only where
+    // block_class is array. Candidates outside it are not scored.
+    //
+    // A soft penalty was tried and cannot work: at its honest precision it is worth about 2 log units
+    // against a composition preference of 129. A window is not a trade, it is a statement that the
+    // total is known -- and it is: the marker-mass estimate recovers KIV-2 copy number exactly on 7 of
+    // 8 pairs, mean error 0.87%. An earlier window attempt used the ALIGNMENT-derived estimate, which
+    // is biased +2.63% and could not resolve one repeat unit; this uses the marker-derived one.
+    double mass_window = 0.0;
+    double robust_c = 0.0;
     bool compositional = false;
     // Weight on the SCALE half of the compositional emission, relative to the shape half. The total's
     // nominal precision is the number of fragments crossing the block, but that assumes counting noise

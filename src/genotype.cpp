@@ -7,6 +7,8 @@
 #include <numeric>
 #include <stdexcept>
 #include <unordered_map>
+#include <cstdio>
+#include <cstdlib>
 
 namespace panvar {
 namespace {
@@ -392,6 +394,12 @@ std::vector<BlockCall> genotype_sample(
             cov_sd = coverage->target_sd[bi];
         }
 
+        // Target total multiplicity implied by the observed marker mass, for the array window.
+        double win_target = 0.0;
+        if (options.mass_window > 0.0 && max_copies_of[bi] >= 3 && lambda > 0.0) {
+            win_target = std::max(0.0, obs_universe - static_cast<double>(universe.size()) * mu) / lambda;
+        }
+
         const std::size_t kn = kept[bi].size();
         emis[bi].assign(kn * kn, 0.0);
         explained[bi].assign(kn * kn, 0.0);
@@ -432,9 +440,35 @@ std::vector<BlockCall> genotype_sample(
                 const double scale = (options.mass_weight > 0.0 && pred_in > 0.0 && obs_in > 0.0)
                                          ? obs_in / pred_in : 1.0;
                 double ll = 0.0;
-                for (const auto& [slot, m] : tot) {
-                    const double o = static_cast<double>(counts.node[slot]);
-                    ll += weight_of(slot) * (mix(o, scale * (lambda * m + mu)) - mix(o, mu));
+                if (options.robust_c > 0.0) {
+                    // Huber on the Pearson residual, negated so larger is better and the scale stays
+                    // comparable with the likelihood path. Every marker of the block's universe is
+                    // scored, so a candidate is charged for markers it lacks -- but only up to the cap.
+                    const double c = options.robust_c;
+                    for (const std::uint32_t slot : universe) {
+                        const auto it = tot.find(slot);
+                        const double m = it == tot.end() ? 0.0 : static_cast<double>(it->second);
+                        const double pred = lambda * m + mu;
+                        const double o = static_cast<double>(counts.node[slot]);
+                        const double z = (o - pred) / std::sqrt(pred + 1.0);
+                        const double a = std::fabs(z);
+                        ll -= weight_of(slot) * (a <= c ? 0.5 * z * z : c * (a - 0.5 * c));
+                    }
+                } else {
+                    for (const auto& [slot, m] : tot) {
+                        const double o = static_cast<double>(counts.node[slot]);
+                        ll += weight_of(slot) * (mix(o, scale * (lambda * m + mu)) - mix(o, mu));
+                    }
+                }
+                // Outside the window the candidate is not scored: the reads say how much sequence is
+                // present, and a pair that contradicts that by more than the estimate's own precision
+                // is not a candidate whatever its composition.
+                if (win_target > 0.0 &&
+                    std::fabs(mult_in - win_target) > options.mass_window * win_target) {
+                    emis[bi][x * kn + y] = -1e18;
+                    explained[bi][x * kn + y] = 0.0;
+                    detected[bi][x * kn + y] = 1.0;
+                    continue;
                 }
                 double mass_ll = 0.0;
                 if (mass_sd > 0.0) {
@@ -498,7 +532,8 @@ std::vector<BlockCall> genotype_sample(
                     }
                     emis[bi][x * kn + y] = rho * cll + options.scale_weight * sll;
                 } else {
-                    emis[bi][x * kn + y] = baseline + rho * ll + mass_ll + cov_ll;
+                    emis[bi][x * kn + y] = (options.robust_c > 0.0 ? 0.0 : baseline)
+                                           + rho * ll + mass_ll + cov_ll;
                 }
                 // Share of the block's observed marker mass this pair accounts for. The denominator is
                 // the UNION of the block's markers -- summing per allele would count every shared
