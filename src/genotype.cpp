@@ -396,8 +396,13 @@ std::vector<BlockCall> genotype_sample(
 
         // Target total multiplicity implied by the observed marker mass, for the array window.
         double win_target = 0.0;
-        if (options.mass_window > 0.0 && max_copies_of[bi] >= 3 && lambda > 0.0) {
+        // Not where an allele contributes nothing: there the observed mass legitimately falls short of
+        // any full traversal, so a window built from it excludes the right answer. Same gate the scale
+        // term uses, and for the same reason.
+        if (options.mass_window > 0.0 && max_copies_of[bi] >= 3 && lambda > 0.0 &&
+            blocks[bi].bypass_allele < 0) {
             win_target = std::max(0.0, obs_universe - static_cast<double>(universe.size()) * mu) / lambda;
+
         }
 
         const std::size_t kn = kept[bi].size();

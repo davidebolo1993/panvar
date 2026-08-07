@@ -535,6 +535,19 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     }
                     log.wrote({apath});
                 }
+                // Allele sequences for the block, so an external experiment uses the SAME sequence the
+                // model does. Reconstructing a block interval by node-id range is not equivalent to the
+                // interval walk and silently produces different sequences.
+                {
+                    const std::string fp = out_prefix + ".block" + std::to_string(bi) + ".fa";
+                    std::ofstream ff(fp);
+                    for (std::size_t ai = 0; ai < blocks[bi].allele_seq.size(); ++ai) {
+                        if (blocks[bi].allele_seq[ai].empty()) continue;
+                        ff << '>' << ai << ' ' << blocks[bi].allele_seq[ai].size() << '\n'
+                           << blocks[bi].allele_seq[ai] << '\n';
+                    }
+                    log.wrote({fp});
+                }
                 d << "allele\tn_haplotypes\tbp\tn_markers\tsum_multiplicity\tobs_sum\n";
                 for (std::size_t ai = 0; ai < read_panel.by_block[bi].size(); ++ai) {
                     std::uint64_t mult = 0;

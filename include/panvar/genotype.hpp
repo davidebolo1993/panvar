@@ -78,8 +78,26 @@ struct GenotypeOptions {
     // A bounded loss is the standard answer to contaminated data: quadratic while the residual is
     // small, linear beyond, so no single marker can dominate however badly it fits. The multinomial
     // does NOT solve this -- o * log(p) with p near zero is just as unbounded.
-    // Hard window, in relative deviations, on a block's total marker multiplicity, applied only where
-    // block_class is array. Candidates outside it are not scored.
+    // Hard window, in relative deviations, on a block's total marker multiplicity, applied only at
+    // tandem arrays that have no bypass allele. Candidates outside it are not scored. 0 disables.
+    //
+    // OFF by default, and the reason is decisive: it breaks leave-zero-out. On cyp2d6, where the
+    // sample's own haplotypes ARE in the panel and an exact call must be reachable, it takes 76/76
+    // blocks down to 67/76. A constraint that prevents recovering a haplotype the panel contains is
+    // wrong whatever it buys elsewhere.
+    //
+    // What it does buy, and what it should be used FOR: the array's total length. On lpa block 13 it
+    // takes the mean absolute length error from 3470 bases to 15, every pair within 29. That belongs in
+    // the copy-number report, not in the genotype likelihood -- constrain the number you report, not
+    // the allele you call.
+    //
+    // Why the constraint is needed at all: a likelihood that maximises read explanation will
+    // always prefer a SUPERSET allele at an array. An allele containing the sample's array plus two
+    // extra units explains every read perfectly, and the extra copies cost only a modest
+    // over-prediction -- confirmed independently by mapping simulated 15 kb reads with minimap2, where
+    // 156 of them chose a 128,909 bp allele over the 117,821 bp one that is closest by edit distance.
+    // The emission is not wrong to prefer it; total length is simply information the emission does not
+    // have, and the window is where it enters.
     //
     // A soft penalty was tried and cannot work: at its honest precision it is worth about 2 log units
     // against a composition preference of 129. A window is not a trade, it is a statement that the
