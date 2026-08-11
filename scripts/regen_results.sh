@@ -84,8 +84,8 @@ run_region() {
   # 4b) benchmark: round-trip QV of the calls - if variant nodes were written
   if [[ -s "$d/call/call.variant_nodes.tsv" ]]; then
     "$BIN" benchmark -i "$cgfa" --bubble-prefix-in "$cpfx" --reference-path "$ref" \
-      --variant-nodes "$d/call/call.variant_nodes.tsv" -o "$d/benchmark/benchmark" \
-      --threads "$THREADS" --quiet || echo "  (benchmark skipped)"
+      --variant-nodes "$d/call/call.variant_nodes.tsv" --vcf "$d/call/call.region.vcf" \
+      -o "$d/benchmark/benchmark" --threads "$THREADS" --quiet || echo "  (benchmark skipped)"
   fi
   # 5) inspect the largest-DUP bubble (the CN module) on the call graph, with walk clustering
   local bub; bub="$(awk -F'\t' '/SVTYPE=DUP/{
