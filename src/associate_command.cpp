@@ -151,6 +151,93 @@ FitResult fit_linear(const std::vector<double>& X, const std::vector<double>& y,
     return r;
 }
 
+// IRLS for logistic regression on an arbitrary design. Returns the coefficients, the inverse
+// information matrix and the fitted probabilities, so callers can build either a Wald or a score test
+// from one fit.
+bool logistic_irls(const std::vector<double>& X, const std::vector<double>& y, std::size_t n, std::size_t p,
+                   std::vector<double>& beta, std::vector<double>& inv, std::vector<double>* mu_out) {
+    beta.assign(p, 0.0);
+    inv.clear();
+    for (int iter = 0; iter < 50; ++iter) {
+        std::vector<double> XtWX(p * p, 0.0), XtWz(p, 0.0);
+        for (std::size_t i = 0; i < n; ++i) {
+            double eta = 0.0;
+            for (std::size_t a = 0; a < p; ++a) eta += X[i * p + a] * beta[a];
+            const double mu = 1.0 / (1.0 + std::exp(-eta));
+            const double w = std::max(mu * (1.0 - mu), 1e-9);
+            const double z = eta + (y[i] - mu) / w;
+            for (std::size_t a = 0; a < p; ++a) {
+                const double xa = X[i * p + a];
+                XtWz[a] += xa * w * z;
+                for (std::size_t b = a; b < p; ++b) XtWX[a * p + b] += xa * w * X[i * p + b];
+            }
+        }
+        for (std::size_t a = 0; a < p; ++a) for (std::size_t b = 0; b < a; ++b) XtWX[a * p + b] = XtWX[b * p + a];
+        std::vector<double> nb;
+        if (!solve_and_invert(XtWX, XtWz, p, nb, inv)) return false;
+        double delta = 0.0;
+        for (std::size_t a = 0; a < p; ++a) { delta += std::fabs(nb[a] - beta[a]); beta[a] = nb[a]; }
+        if (delta < 1e-8) break;
+    }
+    if (mu_out != nullptr) {
+        mu_out->assign(n, 0.0);
+        for (std::size_t i = 0; i < n; ++i) {
+            double eta = 0.0;
+            for (std::size_t a = 0; a < p; ++a) eta += X[i * p + a] * beta[a];
+            (*mu_out)[i] = 1.0 / (1.0 + std::exp(-eta));
+        }
+    }
+    return true;
+}
+
+// Rao score test on the genotype column, evaluated under the NULL fit (covariates only, genotype
+// coefficient fixed at zero).
+//
+// Why not the Wald test here. Wald divides the estimate by its own standard error, and for a rare
+// variant in an unbalanced case/control study the fit approaches separation: |beta| grows, its standard
+// error grows faster, and the statistic collapses toward zero. Measured on the LPA cohort (492 cases,
+// 5213 controls) every feature below minor frequency 0.01 failed a uniformity check under permutation
+// -- lambda_GC 0.80, worst KS p 3e-12 -- while every feature above it passed. The score test never fits
+// the alternative, so it does not have a standard error to inflate, and it is the standard remedy.
+//
+// The genotype column is dropped from the design to form the null, which also means each feature gets
+// its own null fit -- correct rather than wasteful, since each has its own complete-case sample set.
+FitResult score_logistic(const std::vector<double>& X, const std::vector<double>& y,
+                         std::size_t n, std::size_t p) {
+    FitResult r;
+    if (p < 2 || n <= p + 1) return r;
+    const std::size_t p0 = p - 1;
+    std::vector<double> X0(n * p0);
+    std::vector<double> g(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        g[i] = X[i * p + 1];
+        X0[i * p0 + 0] = X[i * p + 0];                       // intercept
+        for (std::size_t a = 2; a < p; ++a) X0[i * p0 + (a - 1)] = X[i * p + a];
+    }
+    std::vector<double> b0, inv0, mu;
+    if (!logistic_irls(X0, y, n, p0, b0, inv0, &mu)) return r;
+    if (inv0.size() != p0 * p0) return r;
+
+    double U = 0.0, gWg = 0.0;
+    std::vector<double> gWX(p0, 0.0);
+    for (std::size_t i = 0; i < n; ++i) {
+        const double w = std::max(mu[i] * (1.0 - mu[i]), 1e-12);
+        U += g[i] * (y[i] - mu[i]);
+        gWg += g[i] * w * g[i];
+        for (std::size_t a = 0; a < p0; ++a) gWX[a] += g[i] * w * X0[i * p0 + a];
+    }
+    double proj = 0.0;
+    for (std::size_t a = 0; a < p0; ++a)
+        for (std::size_t b = 0; b < p0; ++b) proj += gWX[a] * inv0[a * p0 + b] * gWX[b];
+    const double V = gWg - proj;                             // variance of the score, covariate-adjusted
+    if (!(V > 0.0) || !std::isfinite(U)) return r;
+    const double chi2 = (U * U) / V;
+    r.z = (U >= 0.0 ? 1.0 : -1.0) * std::sqrt(chi2);
+    r.p = wald_p(r.z);                                       // chi2 on 1 df is the squared normal
+    r.ok = std::isfinite(r.p);
+    return r;
+}
+
 FitResult fit_logistic(const std::vector<double>& X, const std::vector<double>& y, std::size_t n, std::size_t p) {
     FitResult r;
     if (n <= p + 1) return r;
@@ -382,6 +469,11 @@ void print_help() {
         << "  --cojo-p <X>           variant tier: forward-stepwise conditional (COJO) entry p (default 0.05/Meff).\n"
         << "                         selects independent signals; adds p_conditional + cond_role columns.\n"
         << "  --model <m>            auto|linear|logistic|lmm (default auto: binary->logistic, else linear)\n"
+        << "                         logistic reports a Rao SCORE test: `z`/`p` come from it, while\n"
+        << "                         `log_or`/`se` stay the Wald maximum-likelihood effect size, so p is\n"
+        << "                         NOT recoverable from log_or/se. The Wald test collapses for a rare\n"
+        << "                         variant in an unbalanced study (near-separation inflates se); the\n"
+        << "                         score test never fits the alternative, so it does not.\n"
         << "                         lmm = linear mixed model (EMMAX); needs an external --kinship GRM.\n"
         << "  --kinship <path>       precomputed (genome-wide) n x n GRM (rows/cols in --samples order)\n"
         << "                         for --model lmm / --pca. panvar is local, so it does not build a GRM itself;\n"
@@ -720,6 +812,14 @@ int run_associate_command(const std::vector<std::string>& args) {
                 for (std::size_t j = 0; j < ncov_eff; ++j) X[i * p_dim + 2 + j] = zz[i][j];
             }
             fr = (model == "logistic") ? fit_logistic(X, yy, n, p_dim) : fit_linear(X, yy, n, p_dim);
+            if (model == "logistic") {
+                // Keep the Wald fit's beta/se as the effect size, but report the SCORE test's p. The two
+                // agree for common features and diverge exactly where the Wald one breaks -- a rare
+                // variant in an unbalanced case/control study, where near-separation inflates the
+                // standard error and collapses the statistic.
+                const FitResult sc = score_logistic(X, yy, n, p_dim);
+                if (sc.ok) { fr.z = sc.z; fr.p = sc.p; fr.ok = true; }
+            }
         }
         if (!fr.ok) { ++n_dropped_fit; continue; }
 
@@ -831,7 +931,7 @@ int run_associate_command(const std::vector<std::string>& args) {
                 for (std::size_t j = 0; j < ncov_eff; ++j) X[u * pc + col++] = Z[u][j];
                 for (std::size_t c : cond) X[u * pc + col++] = var_dose[c](static_cast<Eigen::Index>(u));
             }
-            const FitResult fc = (model == "logistic") ? fit_logistic(X, y, n_used, pc)
+            const FitResult fc = (model == "logistic") ? score_logistic(X, y, n_used, pc)
                                                        : fit_linear(X, y, n_used, pc);
             return fc.ok ? fc.p : kNaN;
         };
@@ -916,7 +1016,7 @@ int run_associate_command(const std::vector<std::string>& args) {
                     for (std::size_t j = 0; j < ncov_eff; ++j) X[u * pc + 2 + j] = Z[u][j];
                     X[u * pc + 2 + ncov_eff] = gl(static_cast<Eigen::Index>(u));
                 }
-                const FitResult fc = (model == "logistic") ? fit_logistic(X, y, n_used, pc)
+                const FitResult fc = (model == "logistic") ? score_logistic(X, y, n_used, pc)
                                                            : fit_linear(X, y, n_used, pc);
                 if (fc.ok) { p_cond[i] = fc.p; cond_role[i] = "conditioned"; }
             }

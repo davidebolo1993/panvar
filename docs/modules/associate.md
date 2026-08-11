@@ -105,3 +105,21 @@ Script flags (need `Rscript` + `ggplot2`; `ggrepel` optional, for the gene label
 ## Example
 
 See the [GWAS example](../gwas.md) for a runnable association run on this locus, and the [LPA walkthrough](../walkthrough.md) for the full pipeline.
+
+## Calibration
+
+A p-value means nothing unless it is uniform when nothing is going on. `tests/associate_null.sh` permutes the phenotype table's sample labels — severing every genotype-phenotype link while leaving the genotype matrix, the missingness pattern and the phenotype/covariate joint distribution untouched — and reports type-I error, `lambda_GC`, and a per-feature uniformity test. Per feature, p-values across permutations are independent, which is what makes the uniformity test valid; pooled across features within one permutation they are not, so the pooled intervals it prints are optimistic and labelled as such.
+
+Measured on the LPA cohort (6000 individuals; 492 cases / 5213 controls for the binary trait), 300 permutations:
+
+| model | lambda_GC | features rejecting uniformity |
+|-------|-----------|-------------------------------|
+| linear, default `--min-maf` | 1.088 | 2/13 (95% bound is 2) |
+| logistic, default `--min-maf` | 1.006 | 0/13 |
+| logistic, `--min-maf 0` | 1.010 | 0/20 |
+
+**Binary traits use a Rao score test.** The Wald test divides an estimate by its own standard error, and for a rare variant in an unbalanced case/control study the fit approaches separation: the coefficient grows, its standard error grows faster, and the statistic collapses. Measured here before the change, every feature below minor frequency 0.01 failed uniformity (`lambda_GC` 0.80, worst KS p 3e-12) while every feature above it passed — the default `--min-maf 0.01` was the only thing hiding it. The score test never fits the alternative, so it has no standard error to inflate.
+
+Consequence for reading the output: `z` and `p` are the score test, while `log_or` and `se` remain the Wald maximum-likelihood effect size, so **p is not recoverable from `log_or`/`se`**. This is the same arrangement SAIGE and REGENIE use.
+
+Residual limitation: at `p < 0.001` on very rare features the score test is still mildly anti-conservative (observed 0.0025 against a nominal 0.001). The saddlepoint approximation (SPA) is the standard remedy and is not implemented.
