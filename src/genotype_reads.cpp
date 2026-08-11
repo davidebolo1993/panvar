@@ -53,6 +53,9 @@ ReadCounts count_reads(
     edge_slot.reserve(panel.edge_keys.size() * 2);
     for (std::uint32_t i = 0; i < panel.node_codes.size(); ++i) node_slot.emplace(panel.node_codes[i], i);
     for (std::uint32_t i = 0; i < panel.edge_keys.size(); ++i) edge_slot.emplace(panel.edge_keys[i], i);
+    // Novelty is judged against every adjacency the panel carries, not the retained informative subset.
+    const std::unordered_set<std::uint64_t> panel_adjacencies(panel.all_edge_keys.begin(),
+                                                             panel.all_edge_keys.end());
 
     const std::size_t nthreads =
         std::max<std::size_t>(1, threads != 0 ? threads : std::thread::hardware_concurrency());
@@ -104,7 +107,8 @@ ReadCounts count_reads(
                                 adjacency_key(sy[i - 1].code, sy[i].code, sy[i].start - sy[i - 1].start);
                             const auto it = edge_slot.find(key);
                             if (it != edge_slot.end()) ++local.edge[it->second];
-                            else ++local.novel_adjacencies;
+                            if (!panel_adjacencies.empty() && !panel_adjacencies.count(key))
+                                ++local.novel_adjacencies;
                         }
                     }
                 }

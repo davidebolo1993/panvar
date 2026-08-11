@@ -770,6 +770,9 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
                         slot_for(node_slot, out_panel->node_codes, c), stored);
                 }
                 for (const auto& [c, mult] : inv[ai].edges) {
+                    // Recorded before the informativeness filter: an arrangement is novel only if NO
+                    // panel allele carries it, not merely if it was filtered out for being constant.
+                    out_panel->all_edge_keys.push_back(c);
                     if (!informative_edge(c)) continue;
                     out_panel->by_block[bi][ai].edges.emplace_back(
                         slot_for(edge_slot, out_panel->edge_keys, c), mult);
@@ -814,6 +817,10 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
             }
             // How many distinct blocks carry each marker, and its total multiplicity within them.
             std::vector<std::uint32_t> blocks_with(out_panel->node_codes.size(), 0);
+            std::sort(out_panel->all_edge_keys.begin(), out_panel->all_edge_keys.end());
+            out_panel->all_edge_keys.erase(
+                std::unique(out_panel->all_edge_keys.begin(), out_panel->all_edge_keys.end()),
+                out_panel->all_edge_keys.end());
             std::vector<std::uint32_t> eblocks_with(out_panel->edge_keys.size(), 0);
             out_panel->vary_nodes = vary_blocks.size();
             out_panel->vary_edges = evary_blocks.size();

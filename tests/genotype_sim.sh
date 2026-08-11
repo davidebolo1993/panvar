@@ -44,7 +44,10 @@ echo "locus $LOCUS: $N panel haplotypes; $PAIRS pairs at ${DEPTH}x, error $ERR"
 
 # Per-call records for the calibration plot: one row per scored block across every pair.
 CALLS="${CALLS:-$OUT/calls.tsv}"
-if [[ ! -s "$CALLS" ]]; then
+# Truncate unless the caller is deliberately accumulating across loci in one sweep (CALLS_APPEND=1).
+# Appending by default silently mixed rows from earlier runs into the calibration plot, so a figure
+# could be built from two different builds of the binary.
+if [[ "${CALLS_APPEND:-0}" == "0" || ! -s "$CALLS" ]]; then
   printf 'locus\tdepth\terror\tloo\tpair\tblock_kind\tn_alleles\tn_markers\tgq\texplained\tcorrect\tfilter\n' > "$CALLS"
 fi
 
@@ -98,3 +101,12 @@ for ((p=0; p<PAIRS; p++)); do
   bex=$((bex+be)); btot=$((btot+bt))
 done
 echo "TOTAL $LOCUS: $exact/$total blocks exact ($partial one-allele, $wrong both-wrong); bubbles $bex/$btot"
+# Accuracy over ALL scored blocks hides the filter doing its job: a call the model declined counts the
+# same as one it got wrong. Report the PASS subset and its call rate alongside.
+awk -F'\t' -v L="$LOCUS" 'NR>1 && $1==L {
+    n++; c+=$11;
+    if ($12=="PASS") { pn++; pc+=$11 }
+  } END {
+    if (n) printf "  all calls: %d/%d exact (%.1f%%); PASS only: %d/%d exact (%.1f%%), call rate %.1f%%\n",
+      c, n, 100*c/n, pc, pn, (pn?100*pc/pn:0), 100*pn/n
+  }' "$CALLS"

@@ -405,6 +405,44 @@ std::vector<BlockCall> genotype_sample(
 
         }
 
+        // The floor a PRUNED allele falls back to has to sit on the same scale as the alleles that
+        // survived pruning, or the chain compares a multinomial against a negative binomial and the
+        // pruned pair wins or loses for arithmetic reasons. In the default branch `ll` is a CORRECTION
+        // over `baseline`, so a candidate carrying nothing scores exactly `baseline` and the existing
+        // fallback is already right. The compositional and robust branches are absolute, so their floor
+        // has to be computed the same way they compute everything else: by scoring the null candidate,
+        // one that carries no marker at all. Pruning fires at every block above --max-alleles (64),
+        // which is exactly the large array blocks those two modes were built for.
+        if (options.compositional) {
+            const double pred_tot = static_cast<double>(universe.size()) * mu;
+            double cll = 0.0;
+            if (pred_tot > 0.0) {
+                for (const std::uint32_t slot : universe) {
+                    const double o = static_cast<double>(counts.node[slot]);
+                    if (o <= 0.0) continue;
+                    cll += o * std::log(std::max(1e-300, mu / pred_tot));
+                }
+            }
+            double sll = 0.0;
+            if (scale_neff > 0.0 && pred_tot > 0.0 && obs_universe > 0.0) {
+                const double c = std::max(1.0, obs_universe / scale_neff);
+                const double oo = obs_universe / c;
+                const double pp = pred_tot / c;
+                sll = -pp + oo * std::log(std::max(1e-300, pp)) - std::lgamma(oo + 1.0);
+            }
+            baseline_of[bi] = rho * cll + options.scale_weight * sll;
+        } else if (options.robust_c > 0.0) {
+            const double c = options.robust_c;
+            double ll = 0.0;
+            for (const std::uint32_t slot : universe) {
+                const double o = static_cast<double>(counts.node[slot]);
+                const double z = (o - mu) / std::sqrt(mu + 1.0);
+                const double a = std::fabs(z);
+                ll -= weight_of(slot) * (a <= c ? 0.5 * z * z : c * (a - 0.5 * c));
+            }
+            baseline_of[bi] = rho * ll;
+        }
+
         const std::size_t kn = kept[bi].size();
         emis[bi].assign(kn * kn, 0.0);
         explained[bi].assign(kn * kn, 0.0);

@@ -7,7 +7,9 @@
 namespace panvar {
 namespace {
 
-constexpr char kMagic[8] = {'p', 'v', 'g', 't', 'i', 'd', 'x', '3'};
+// Bumped to 4 when all_edge_keys joined the panel: an index written by an older build has no such
+// field, and reading one as if it did would desynchronise every vector after it.
+constexpr char kMagic[8] = {'p', 'v', 'g', 't', 'i', 'd', 'x', '4'};
 
 template <typename T>
 void put(std::ostream& o, const T& v) {
@@ -81,6 +83,7 @@ void write_genotype_index(const std::string& path, const GenotypeIndex& index) {
 
     put_vec(o, index.panel.node_codes);
     put_vec(o, index.panel.edge_keys);
+    put_vec(o, index.panel.all_edge_keys);
     put<std::uint64_t>(o, index.panel.by_block.size());
     for (const auto& per_allele : index.panel.by_block) {
         put<std::uint64_t>(o, per_allele.size());
@@ -147,6 +150,7 @@ GenotypeIndex read_genotype_index(const std::string& path) {
 
     get_vec(i, x.panel.node_codes);
     get_vec(i, x.panel.edge_keys);
+    get_vec(i, x.panel.all_edge_keys);
     get(i, n);
     x.panel.by_block.resize(n);
     for (auto& per_allele : x.panel.by_block) {

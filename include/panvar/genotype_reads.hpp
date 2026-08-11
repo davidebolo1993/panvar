@@ -25,6 +25,11 @@ struct ReadPanel {
     bool all_kmers = false;
     std::vector<std::uint64_t> node_codes;                  // slot -> canonical syncmer code
     std::vector<std::uint64_t> edge_keys;                   // slot -> adjacency key
+    // Every adjacency any panel allele carries, BEFORE confinement and the marker rules thin it down.
+    // `edge_keys` is only the retained informative subset, so judging a read's adjacencies against it
+    // counts constant and filtered panel adjacencies as novel -- which is most of them. Only this set
+    // can say whether an arrangement is genuinely off-panel.
+    std::vector<std::uint64_t> all_edge_keys;
     std::vector<std::vector<AlleleMarkerSet>> by_block;     // [block][allele]
     // Markers carried by every allele of a block at the same multiplicity. They cannot separate
     // anything, which is exactly why they are the right depth reference: their observed count is a
