@@ -1503,7 +1503,11 @@ void emit_variant_substrate(const DescribeOptions& options, DescribeSummary& sum
         }
         const bool is_dup = (svtype == "DUP");
         const bool is_multi = nalleles > 1;
-        const int n_rows = is_multi ? nalleles : 1;
+        // NALLELES counts REF plus the ALTs (variant_call.cpp writes alt_seqs.size() + 1, and the
+        // header says so), while a dosage row is emitted per ALT. Using it directly produced one extra
+        // row per multiallelic site, testing gt == NALLELES, which no sample can carry -- an all-zero
+        // column for an allele that does not exist.
+        const int n_rows = is_multi ? nalleles - 1 : 1;
         for (int a = 0; a < n_rows; ++a) {
             VariantBimbam v;
             v.id = is_multi ? (id + "_a" + std::to_string(a + 1)) : id;
