@@ -741,6 +741,11 @@ int run_associate_command(const std::vector<std::string>& args) {
     // Variant tier only: full-length mean-imputed dosage per retained row, for LD r^2 between variants.
     // Kept only in variant mode (few variants), so the k-mer substrate never holds a giant matrix.
     std::vector<Eigen::VectorXd> var_dose;
+    // Which entries of var_dose were OBSERVED rather than mean-imputed. LD r^2 is happy with the imputed
+    // vector, but a conditional model must not be: the marginal test uses complete cases, so a
+    // conditional test on imputed rows analyses a different sample and the two p-values stop being
+    // comparable -- which is precisely the comparison a COJO table invites a reader to make.
+    std::vector<std::vector<char>> var_obs;
     std::size_t n_geno_rows = 0, n_dropped_maf = 0, n_dropped_fit = 0;
     const std::size_t p_dim = 2 + ncov_eff;  // intercept + genotype + covariates(+PCs)
     const bool is_lmm = (model == "lmm");
@@ -846,8 +851,9 @@ int run_associate_command(const std::vector<std::string>& args) {
         // Retain a full-length mean-imputed dosage for variant-tier LD-clumping (cheap: few variants).
         if (variant_mode) {
             Eigen::VectorXd vd(n_used);
+            std::vector<char> obs(n_used, 1);
             if (is_lmm) {
-                vd = glmm;  // already full-length, mean-imputed
+                vd = glmm;  // already full-length, mean-imputed (the LMM rotation needs a fixed set)
             } else {
                 for (std::size_t u = 0; u < n_used; ++u) vd(static_cast<Eigen::Index>(u)) =
                     std::numeric_limits<double>::quiet_NaN();
@@ -860,9 +866,13 @@ int run_associate_command(const std::vector<std::string>& args) {
                 }
                 const double mean = nf ? sum / static_cast<double>(nf) : 0.0;
                 for (std::size_t u = 0; u < n_used; ++u)
-                    if (!std::isfinite(vd(static_cast<Eigen::Index>(u)))) vd(static_cast<Eigen::Index>(u)) = mean;
+                    if (!std::isfinite(vd(static_cast<Eigen::Index>(u)))) {
+                        vd(static_cast<Eigen::Index>(u)) = mean;
+                        obs[u] = 0;
+                    }
             }
             var_dose.push_back(std::move(vd));
+            var_obs.push_back(std::move(obs));
         }
     }
 
@@ -923,16 +933,31 @@ int run_associate_command(const std::vector<std::string>& args) {
         // conditional p of variant i given a set of conditioning dosage vectors (empty -> marginal-style).
         auto cond_p = [&](std::size_t i, const std::vector<std::size_t>& cond) -> double {
             const std::size_t pc = p_dim + cond.size();        // intercept, g_i, covariates, |cond|
-            std::vector<double> X(n_used * pc);
+            // Complete cases over the target and every conditioning variant, matching what the marginal
+            // test did. Under the LMM the rotation is over a fixed sample set, so everything is imputed
+            // there by construction and every row is marked observed.
+            std::vector<std::size_t> keep;
+            keep.reserve(n_used);
             for (std::size_t u = 0; u < n_used; ++u) {
-                std::size_t col = 0;
-                X[u * pc + col++] = 1.0;
-                X[u * pc + col++] = var_dose[i](static_cast<Eigen::Index>(u));   // target -> column 1
-                for (std::size_t j = 0; j < ncov_eff; ++j) X[u * pc + col++] = Z[u][j];
-                for (std::size_t c : cond) X[u * pc + col++] = var_dose[c](static_cast<Eigen::Index>(u));
+                if (!var_obs[i][u]) continue;
+                bool ok = true;
+                for (std::size_t c : cond) if (!var_obs[c][u]) { ok = false; break; }
+                if (ok) keep.push_back(u);
             }
-            const FitResult fc = (model == "logistic") ? score_logistic(X, y, n_used, pc)
-                                                       : fit_linear(X, y, n_used, pc);
+            const std::size_t nk = keep.size();
+            if (nk <= pc + 1) return kNaN;
+            std::vector<double> X(nk * pc), yk(nk);
+            for (std::size_t k = 0; k < nk; ++k) {
+                const std::size_t u = keep[k];
+                std::size_t col = 0;
+                yk[k] = y[u];
+                X[k * pc + col++] = 1.0;
+                X[k * pc + col++] = var_dose[i](static_cast<Eigen::Index>(u));   // target -> column 1
+                for (std::size_t j = 0; j < ncov_eff; ++j) X[k * pc + col++] = Z[u][j];
+                for (std::size_t c : cond) X[k * pc + col++] = var_dose[c](static_cast<Eigen::Index>(u));
+            }
+            const FitResult fc = (model == "logistic") ? score_logistic(X, yk, nk, pc)
+                                                       : fit_linear(X, yk, nk, pc);
             return fc.ok ? fc.p : kNaN;
         };
         const double entry = opt.cojo_p > 0.0 ? opt.cojo_p
@@ -965,7 +990,10 @@ int run_associate_command(const std::vector<std::string>& args) {
         // conditioning them on the top feature is degenerate -> flag features with r^2 > 0.95 vs the lead
         // ("collinear") instead of scoring them. Cross-bubble features get a real conditional p: a mere tag
         // of the lead's variant collapses. Two bounded streaming passes (no feature x sample matrix kept).
-        auto parse_full = [&](const std::vector<std::string>& f, Eigen::VectorXd& vd) -> bool {
+        // `obs` records which rows carried a real dosage, so the conditional fit below can use the same
+        // complete cases the marginal test used rather than mean-imputed stand-ins.
+        auto parse_full = [&](const std::vector<std::string>& f, Eigen::VectorXd& vd,
+                              std::vector<char>* obs = nullptr) -> bool {
             vd = Eigen::VectorXd::Constant(static_cast<Eigen::Index>(n_used), kNaN);
             double sum = 0.0; std::size_t nf = 0;
             for (std::size_t c = 0; c < geno_samples.size(); ++c) {
@@ -976,8 +1004,12 @@ int run_associate_command(const std::vector<std::string>& args) {
             }
             if (nf == 0) return false;
             const double mean = sum / static_cast<double>(nf);
+            if (obs != nullptr) obs->assign(n_used, 1);
             for (std::size_t u = 0; u < n_used; ++u)
-                if (!std::isfinite(vd(static_cast<Eigen::Index>(u)))) vd(static_cast<Eigen::Index>(u)) = mean;
+                if (!std::isfinite(vd(static_cast<Eigen::Index>(u)))) {
+                    vd(static_cast<Eigen::Index>(u)) = mean;
+                    if (obs != nullptr) (*obs)[u] = 0;
+                }
             return true;
         };
         std::size_t lead_idx = 0; double best_p = std::numeric_limits<double>::infinity();
@@ -988,12 +1020,13 @@ int run_associate_command(const std::vector<std::string>& args) {
         for (std::size_t i = 0; i < rows.size(); ++i) id_to_row[rows[i].id] = i;
         const std::size_t need_cols = 3 + geno_samples.size();
         Eigen::VectorXd gl;  // pass 1: capture the lead feature's dosage
+        std::vector<char> lead_obs;
         { GzLineReader g2(opt.genotypes); std::string line;
           while (g2.getline(line)) {
               if (line.empty()) continue;
               std::vector<std::string> f = split(line, ',');
               if (f.size() < need_cols) continue;
-              if (trim(f[0]) == lead_id) { parse_full(f, gl); break; }
+              if (trim(f[0]) == lead_id) { parse_full(f, gl, &lead_obs); break; }
           } }
         if (gl.size() == static_cast<Eigen::Index>(n_used)) {
             const std::size_t pc = p_dim + 1;  // intercept, g_i, covariates, g_lead
@@ -1007,17 +1040,26 @@ int run_associate_command(const std::vector<std::string>& args) {
                 const std::size_t i = it->second;
                 if (i == lead_idx) { cond_role[i] = "lead"; continue; }
                 Eigen::VectorXd vd;
-                if (!parse_full(f, vd)) continue;
+                std::vector<char> obs;
+                if (!parse_full(f, vd, &obs)) continue;
                 if (r2_vec(vd, gl) > 0.95) { cond_role[i] = "collinear"; continue; }  // same-event redundancy
-                std::vector<double> X(n_used * pc);
-                for (std::size_t u = 0; u < n_used; ++u) {
-                    X[u * pc + 0] = 1.0;
-                    X[u * pc + 1] = vd(static_cast<Eigen::Index>(u));
-                    for (std::size_t j = 0; j < ncov_eff; ++j) X[u * pc + 2 + j] = Z[u][j];
-                    X[u * pc + 2 + ncov_eff] = gl(static_cast<Eigen::Index>(u));
+                std::vector<std::size_t> keep;
+                keep.reserve(n_used);
+                for (std::size_t u = 0; u < n_used; ++u)
+                    if (obs[u] && (lead_obs.empty() || lead_obs[u])) keep.push_back(u);
+                const std::size_t nk = keep.size();
+                if (nk <= pc + 1) continue;
+                std::vector<double> X(nk * pc), yk(nk);
+                for (std::size_t k = 0; k < nk; ++k) {
+                    const std::size_t u = keep[k];
+                    yk[k] = y[u];
+                    X[k * pc + 0] = 1.0;
+                    X[k * pc + 1] = vd(static_cast<Eigen::Index>(u));
+                    for (std::size_t j = 0; j < ncov_eff; ++j) X[k * pc + 2 + j] = Z[u][j];
+                    X[k * pc + 2 + ncov_eff] = gl(static_cast<Eigen::Index>(u));
                 }
-                const FitResult fc = (model == "logistic") ? score_logistic(X, y, n_used, pc)
-                                                           : fit_linear(X, y, n_used, pc);
+                const FitResult fc = (model == "logistic") ? score_logistic(X, yk, nk, pc)
+                                                           : fit_linear(X, yk, nk, pc);
                 if (fc.ok) { p_cond[i] = fc.p; cond_role[i] = "conditioned"; }
             }
         }

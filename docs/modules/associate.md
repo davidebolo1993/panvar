@@ -4,7 +4,7 @@ CLI: `panvar associate`
 
 ## What it does
 
-Tests a phenotype against the genotypes from `describe` across a pangenome region. For each unit it fits `phenotype ~ genotype + covariates`, reports a Wald test on the genotype term, applies a minor-allele-frequency (MAF) filter on the cohort genotypes, and corrects for the number of independent tests in the region. Phenotype type is auto-detected (binary or quantitative). The testable unit is chosen by `--unit`. Variant mode tests one genotype per structural-variant (SV) call (the `describe --variant-vcf` export) — the statistically honest unit, since the k-mers, nodes and edges within one variant are correlated rather than independent; correlated nearby variants are then collapsed by linkage-disequilibrium (LD) clumping, so an LD shadow is not counted as a separate hit. Feature mode keeps the fine-grained k-mer/node/edge tests but corrects with an effective number of independent tests (`Meff`, the distinct bubbles), because the raw feature count over-states how many independent tests were run. Both report Benjamini–Hochberg (BH) false-discovery-rate (FDR) control alongside the `Meff`-Bonferroni benchmark and the genomic-inflation `λ`. 
+Tests a phenotype against the genotypes from `describe` across a pangenome region. For each unit it fits `phenotype ~ genotype + covariates`, reports a test on the genotype term (Wald for quantitative traits, a Rao score test for binary ones — see [Calibration](#calibration)), applies a minor-allele-frequency (MAF) filter on the cohort genotypes, and corrects for the number of independent tests in the region. Phenotype type is auto-detected (binary or quantitative). The testable unit is chosen by `--unit`. Variant mode tests one genotype per structural-variant (SV) call (the `describe --variant-vcf` export) — the statistically honest unit, since the k-mers, nodes and edges within one variant are correlated rather than independent; correlated nearby variants are then collapsed by linkage-disequilibrium (LD) clumping, so an LD shadow is not counted as a separate hit. Feature mode keeps the fine-grained k-mer/node/edge tests but corrects with an effective number of independent tests (`Meff`, the distinct bubbles), because the raw feature count over-states how many independent tests were run. Both report Benjamini–Hochberg (BH) false-discovery-rate (FDR) control alongside the `Meff`-Bonferroni benchmark and the genomic-inflation `λ`. 
 Beyond the threshold, `associate` also tests independence by conditioning: refitting each unit with the top signal(s) added as covariates, so a hit that merely tags a stronger nearby variant is exposed (its `p` collapses). The variant unit runs a forward-stepwise selection of jointly-independent signals (conditional-and-joint, COJO-style); the feature unit conditions on the single top feature with a within-bubble collinearity guard. 
 For a quantitative trait it can also add the top kinship principal components (PCs) as covariates (`--pca N`), or fit a linear mixed model (LMM, `--model lmm`) against a kinship matrix, to control population structure.
 
@@ -51,8 +51,8 @@ Algorithm and worked trace: [algorithms/associate.md](../algorithms/associate.md
 | `minor_freq` | minor (non-modal) genotype frequency on the cohort (the MAF-filter quantity) |
 | `beta` \| `log_or` | effect size on the genotype term — `beta` (linear) or `log_or` = log odds ratio (logistic) |
 | `se` | standard error of the effect |
-| `z` | Wald statistic, `effect / se` |
-| `p` | Wald p-value |
+| `z` | test statistic. Linear: the Wald statistic, `effect / se`. Logistic: the Rao score statistic, which is **not** `log_or / se` (see [Calibration](#calibration)) |
+| `p` | two-sided p-value for `z` — Wald for linear, score for logistic |
 | `p_bonf` | raw Bonferroni-adjusted p, `min(1, p · features_tested)` (over-conservative — kept for reference) |
 | `p_bonf_meff` | effective-tests Bonferroni, `min(1, p · Meff)` — the honest correction |
 | `q_bh` | Benjamini–Hochberg FDR q-value (the primary control) |
@@ -60,7 +60,7 @@ Algorithm and worked trace: [algorithms/associate.md](../algorithms/associate.md
 | `low_af` | (variant unit) `1` when the minority-genotype count < `--min-ac` (underpowered/unstable), else `0`; `.` otherwise |
 | `clump`, `is_lead` | (variant unit) LD-clump id and whether this is its lead variant (`1`); `.` in feature mode |
 | `gene` | gene name (variant `GENES`, or via `--node-genes`), else `.` |
-| `p_conditional` | conditional Wald p (variant: vs the COJO-selected set minus self; feature: vs the top lead); `NA` for a sole signal / the lead / a collinear feature |
+| `p_conditional` | conditional p (same test as `p`) (variant: vs the COJO-selected set minus self; feature: vs the top lead); `NA` for a sole signal / the lead / a collinear feature |
 | `cond_role` | variant: `signal` (independent) / `shadow`; feature: `lead` / `collinear` (same-event, r²>0.95, not scored) / `conditioned`; `.` otherwise |
 
 `<prefix>.summary.tsv` keys:
