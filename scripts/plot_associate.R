@@ -68,7 +68,8 @@ d$sig <- factor(d$sig, levels = c("ns", "FDR<0.05", "Bonferroni"))
 
 # panels: raw -log10 p (nominal + Bonferroni lines), BH -log10 q (q=0.05 line), and -- when the
 # conditional/COJO columns are present -- -log10(p_conditional). colour is the verdict, so noise peaks in
-# the top panel collapse in the lower ones; the conditioning anchor(s) stay tall while shadows fall away.
+# the top panel collapse in the lower ones; what remains tall in the third panel is what survives
+# conditioning on the selected signals, whether or not it is itself one of them.
 has_cond <- "p_conditional" %in% names(d) && any(is.finite(d$p_conditional))
 role <- if ("cond_role" %in% names(d)) as.character(d$cond_role) else rep(".", nrow(d))
 levels_sig <- c("ns", "FDR<0.05", "Bonferroni", "conditioning signal")
@@ -80,10 +81,19 @@ long <- rbind(
   data.frame(x = d$x, y = d$logq, sig = d$sig, panel = lv[2]))
 if (has_cond) {
   anchor <- role %in% c("signal", "lead")                       # the conditioning signal(s)
-  yc <- ifelse(anchor, d$logp, -log10(pmax(d$p_conditional, 1e-300)))
+  # Every point is drawn at its OWN p_conditional, anchors included. Drawing anchors at their raw p
+  # instead made the panel contradict its axis: a lead going p=3e-191 -> p_conditional=2e-38 was drawn
+  # at 191, so a signal that mostly dissolves under conditioning looked untouched. Anchors stay
+  # identifiable by colour, which is what the colour is for.
+  # A sole COJO signal has nothing to condition on, so associate leaves p_conditional NA. Conditioning
+  # on the empty set IS the marginal model, so that anchor is drawn at its own p -- dropping it would
+  # empty the panel of the very signal it is about. Anchors that DO have a conditional estimate (two or
+  # more signals) are drawn at it, which is the case that was being misreported.
+  pc <- ifelse(is.finite(d$p_conditional), d$p_conditional, ifelse(anchor, d$p, NA_real_))
+  yc <- -log10(pmax(pc, 1e-300))
   sc <- ifelse(anchor, "conditioning signal",
         ifelse(is.finite(d$p_conditional) & d$p_conditional < bonf, "Bonferroni", "ns"))
-  keep <- anchor | is.finite(d$p_conditional)                   # drop collinear / non-anchor NAs
+  keep <- is.finite(pc)                       # collinear features have no conditional estimate to show
   long <- rbind(long, data.frame(x = d$x[keep], y = yc[keep],
     sig = factor(sc[keep], levels = levels_sig), panel = lv[3]))
 }

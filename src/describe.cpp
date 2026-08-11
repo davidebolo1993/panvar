@@ -1460,8 +1460,14 @@ read_cosigt_table(const std::string& path) {
 // GT=. -> NA. Same format/NA semantics as the k-mer/graph BIMBAM, but the unit is the variant -- an
 // honest testing denominator (features within a variant are correlated).
 struct VariantBimbam {
+    // af/an are the VCF's own INFO fields, computed over the PANEL haplotypes. They describe the
+    // haplotype substrate and are wrong for the sample substrate, which covers a different population --
+    // so the sample writer recomputes them rather than copying these.
     std::string id, svtype, bubble, nodes, gene = ".", af = ".", an = ".";
     std::unordered_map<std::string, double> dose;  // haplotype -> dosage (present only; absent => NA)
+    // Whether the haplotype carries this row's ALT, taken from GT. Dosage cannot stand in for it: a DUP
+    // carries a copy NUMBER, so "dose > 0" is true of the reference too.
+    std::unordered_map<std::string, char> is_alt;
 };
 
 void emit_variant_substrate(const DescribeOptions& options, DescribeSummary& summary) {
@@ -1528,15 +1534,25 @@ void emit_variant_substrate(const DescribeOptions& options, DescribeSummary& sum
                 else
                     d = std::atof(gt.c_str());  // 0/1 presence
                 v.dose[hap_order[s]] = d;
+                const int gti = std::atoi(gt.c_str());
+                v.is_alt[hap_order[s]] = static_cast<char>((is_multi ? (gti == a + 1) : (gti >= 1)) ? 1 : 0);
             }
             rows.push_back(std::move(v));
         }
     }
 
-    auto write_annot = [&](GzipWriter& annot, const VariantBimbam& v) {
+    // af/an default to the VCF's panel-wide values; the sample writer passes its own, computed over the
+    // samples actually in the matrix. Emitting the panel's numbers next to sample dosages made every
+    // graph feature look like it came from a 466-haplotype study sitting beside SNPs from thousands.
+    auto write_annot = [&](GzipWriter& annot, const VariantBimbam& v,
+                           const std::string* af_override = nullptr,
+                           const std::string* an_override = nullptr) {
         std::string a = tsv_sanitize(v.id);
         a += "\tvariant\tdosage\t"; a += v.bubble; a += '\t'; a += v.nodes;
-        a += '\t'; a += v.svtype; a += '\t'; a += v.gene; a += '\t'; a += v.af; a += '\t'; a += v.an; a += '\n';
+        a += '\t'; a += v.svtype; a += '\t'; a += v.gene;
+        a += '\t'; a += (af_override ? *af_override : v.af);
+        a += '\t'; a += (an_override ? *an_override : v.an);
+        a += '\n';
         annot.write(a);
     };
     const std::string annot_header = "feature_id\tlayer\tencoding\tbubbles\tnodes\tsvtype\tgene\tAF\tAN\n";
@@ -1583,14 +1599,28 @@ void emit_variant_substrate(const DescribeOptions& options, DescribeSummary& sum
         annot.write(annot_header);
         GzipWriter geno((dir / "bimbam_variant.bimbam.gz").string());
         for (const VariantBimbam& v : rows) {
-            write_annot(annot, v);
             std::unordered_map<std::string, double> samp;
             std::unordered_set<std::string> covered;
+            // AN counts the (haplotype, sample) assignments that carry an observed genotype here -- one
+            // allele each -- and AC those whose GT is this row's ALT, the same definition the VCF uses,
+            // but over the samples this matrix actually contains.
+            std::size_t an_s = 0, ac_s = 0;
             for (const auto& [hap, d] : v.dose) {
                 const auto it = path_to_samples.find(hap);
                 if (it == path_to_samples.end()) continue;
-                for (const std::string& s : it->second) { samp[s] += d; covered.insert(s); }
+                const auto ai = v.is_alt.find(hap);
+                const bool alt = ai != v.is_alt.end() && ai->second != 0;
+                for (const std::string& s : it->second) {
+                    samp[s] += d;
+                    covered.insert(s);
+                    ++an_s;
+                    if (alt) ++ac_s;
+                }
             }
+            const std::string an_str = std::to_string(an_s);
+            const std::string af_str =
+                an_s ? format_dosage(static_cast<double>(ac_s) / static_cast<double>(an_s)) : std::string(".");
+            write_annot(annot, v, &af_str, &an_str);
             double lo = std::numeric_limits<double>::infinity(), hi = -lo;
             for (const std::string& s : covered) { lo = std::min(lo, samp[s]); hi = std::max(hi, samp[s]); }
             const bool do_scale = options.scale_dosage && hi > lo;
