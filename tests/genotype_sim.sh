@@ -55,18 +55,22 @@ for ((p=0; p<PAIRS; p++)); do
   [[ "$i" == "$j" ]] && j=$(( (j + 1) % N ))
   H1="${NAMES[$i]}"; H2="${NAMES[$j]}"
   rm -rf "$OUT/fa"; "$PY" "$REPO/scripts/spell_paths.py" -i "$G" -o "$OUT/fa" --paths "$H1,$H2" >/dev/null
-  rm -f "$OUT/r_1.fq" "$OUT/r_2.fq"
+  rm -f "$OUT/r_1.fq" "$OUT/r_2.fq"; hidx=0
   for f in "$OUT"/fa/*.fa; do
     L=$(awk 'NR>1{n+=length($0)} END{print n}' "$f")
     NR_=$(( DEPTH * L / 2 / 300 ))          # per haplotype: half the diploid depth
-    wgsim -N "$NR_" -1 150 -2 150 -d 350 -s 50 -e "$ERR" -r 0 -R 0 -X 0 -S $((SEED+p)) \
+    # A distinct seed per homolog. Sharing one across both makes their coverage fluctuations identical,
+    # which is the one thing a diploid simulation must not do -- it hides exactly the per-haplotype
+    # depth noise that decides het against hom.
+    hseed=$((SEED + p*97 + hidx)); hidx=$((hidx+1))
+    wgsim -N "$NR_" -1 150 -2 150 -d 350 -s 50 -e "$ERR" -r 0 -R 0 -X 0 -S "$hseed" \
       "$f" "$OUT/a_1.fq" "$OUT/a_2.fq" >/dev/null 2>&1
     cat "$OUT/a_1.fq" >> "$OUT/r_1.fq"; cat "$OUT/a_2.fq" >> "$OUT/r_2.fq"
   done
   gzip -f "$OUT/r_1.fq" "$OUT/r_2.fq"
   line=$("$BIN" genotype -i "$G" --bubble-prefix-in "$PFX" -r "$REF" -o "$OUT/gt" \
     -R "$OUT/r_1.fq.gz" -R "$OUT/r_2.fq.gz" --truth-haplotypes "$H1,$H2" \
-    ${LOO:+--exclude-haplotypes "$H1,$H2"} ${GENOTYPE_EXTRA:-} 2>&1 | grep -E "truth check|unrepresentable")
+    $( [ "${LOO:-0}" != "0" ] && printf -- "--exclude-haplotypes %s,%s" "$H1" "$H2" ) ${GENOTYPE_EXTRA:-} 2>&1 | grep -E "truth check|unrepresentable")
   unrep=$(sed -nE 's/.*unrepresentable blocks[^0-9]*([0-9]+)\/.*/\1/p' <<<"$line" | head -1)
   line=$(grep "truth check" <<<"$line")
   e=$(sed -E 's/.*check: ([0-9]+)\/([0-9]+).*/\1/' <<<"$line")
@@ -75,9 +79,19 @@ for ((p=0; p<PAIRS; p++)); do
   wr=$(sed -E 's/.*\(([0-9]+) one allele right, ([0-9]+) both wrong\).*/\2/' <<<"$line")
   be=$(sed -E 's/.*bubble blocks ([0-9]+)\/([0-9]+).*/\1/' <<<"$line")
   bt=$(sed -E 's/.*bubble blocks ([0-9]+)\/([0-9]+).*/\2/' <<<"$line")
-  awk -F'\t' -v L="$LOCUS" -v D="$DEPTH" -v E="$ERR" -v LO="${LOO:-0}" -v P="$p" 'NR>1 && $17>=0 {
-      lo=($8<$9?$8:$9); hi=($8<$9?$9:$8); tl=($17<$18?$17:$18); th=($17<$18?$18:$17);
-      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n", L,D,E,LO,P,$2,$6,$7,$13,$14,(lo==tl&&hi==th)?1:0,$16
+  # Columns are looked up BY NAME. Fixed indices silently drift the moment a column is added, and did:
+  # truth moved from 17-18 to 25-26 and filter from 16 to 24 as length estimates were inserted, so every
+  # calibration figure this script produced after that was scored against called_bp and mass_bp.
+  awk -F'\t' -v L="$LOCUS" -v D="$DEPTH" -v E="$ERR" -v LO="${LOO:-0}" -v P="$p" '
+    NR==1 { for (i=1;i<=NF;i++) c[$i]=i; next }
+    $(c["truth1"])>=0 {
+      lo=($(c["allele1"])<$(c["allele2"])?$(c["allele1"]):$(c["allele2"]));
+      hi=($(c["allele1"])<$(c["allele2"])?$(c["allele2"]):$(c["allele1"]));
+      tl=($(c["truth1"])<$(c["truth2"])?$(c["truth1"]):$(c["truth2"]));
+      th=($(c["truth1"])<$(c["truth2"])?$(c["truth2"]):$(c["truth1"]));
+      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n", L,D,E,LO,P,
+             $(c["block_kind"]),$(c["n_alleles"]),$(c["n_markers"]),$(c["gq"]),$(c["explained"]),
+             (lo==tl&&hi==th)?1:0,$(c["filter"])
     }' "$OUT/gt.genotypes.tsv" >> "$CALLS" 2>/dev/null
   printf "  pair %d: %s/%s blocks exact, bubbles %s/%s%s\n" "$p" "$e" "$t" "$be" "$bt" "${unrep:+, $unrep unrepresentable}"
   exact=$((exact+e)); total=$((total+t)); partial=$((partial+pa)); wrong=$((wrong+wr))

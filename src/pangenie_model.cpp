@@ -171,7 +171,22 @@ std::vector<PanGenieCall> genotype_pangenie(
         if (a1 < 0 || a2 < 0 || na == 0) return 1.0L;
         return emis[bi][static_cast<std::size_t>(a1) * na + static_cast<std::size_t>(a2)];
     };
-    auto pos_of = [&](std::size_t bi) { return bi; };   // block index stands in for variant position
+    // Base-pair position, not block index. PanGenie scales its transition by the distance between
+    // consecutive variants (transitionprobabilitycomputer.cpp:14), so standing the block index in for
+    // it made every interval one unit apart and removed the distance term the port exists to reproduce.
+    std::vector<double> block_bp(nb, 0.0);
+    {
+        double cum = 0.0;
+        for (std::size_t b = 0; b < nb; ++b) {
+            block_bp[b] = cum;
+            std::vector<std::size_t> lens = blocks[b].allele_bp;
+            if (!lens.empty()) {
+                std::sort(lens.begin(), lens.end());
+                cum += static_cast<double>(lens[lens.size() / 2]);
+            }
+        }
+    }
+    auto pos_of = [&](std::size_t bi) { return block_bp[bi]; };
 
     for (std::size_t bi = 0; bi < nb; ++bi) {
         std::vector<long double> hi(nh, 0.0L), hj(nh, 0.0L);

@@ -286,6 +286,23 @@ int run_genotype_command(const std::vector<std::string>& args) {
     // Reads need the block chain and the marker panel, but not the linkage/novelty audits or the
     // separation statistics -- those are diagnostics and were roughly half the runtime.
     const bool need_blocks = audit_linkage || !read_paths.empty() || !index_out.empty();
+    // Every option the model takes, in one place, so the indexed and direct paths cannot diverge.
+    auto make_genotype_options = [&]() {
+        GenotypeOptions g;
+        g.threads = options.threads;
+        g.max_alleles_per_block = max_alleles;
+        g.fragment_len = fragment_len;
+        g.provenance = provenance;
+        g.recomb_rate = recomb_rate;
+        g.carrier_weight = carrier_weight;
+        g.mass_weight = mass_weight;
+        g.marker_outlier = marker_outlier;
+        g.compositional = compositional;
+        g.scale_weight = scale_weight;
+        g.robust_c = robust_c;
+        g.mass_window = mass_window;
+        return g;
+    };
     const bool want_audit_stats = audit_linkage;
     if (!bubble_prefix_in.empty()) {
         if (!bubbles_csv_in.empty()) {
@@ -314,12 +331,11 @@ int run_genotype_command(const std::vector<std::string>& args) {
         const std::vector<BlockDepth> depth =
             estimate_depth(idx.panel, rc, min_anchors, uneven_tolerance, depth_model,
                            depth_quantile, 0);
-        GenotypeOptions gopt;
-        gopt.threads = options.threads;
-        gopt.max_alleles_per_block = max_alleles;
-        gopt.fragment_len = fragment_len;
-        gopt.mass_weight = mass_weight;
-        gopt.marker_outlier = marker_outlier;
+        // Same options as the direct path. Assembling them twice let the two drift: the indexed path
+        // silently ignored the recombination rate, carrier weight, provenance, compositional and robust
+        // scoring, the mass window and the scale weight, so --index and --bubble-prefix-in did not mean
+        // the same thing.
+        GenotypeOptions gopt = make_genotype_options();
         GenotypeSummary gsum;
         const std::vector<BlockCall> calls = genotype_sample(idx.chain, idx.blocks, idx.panel, rc,
                                                              depth, idx.haplotype_names, gopt, &gsum);
@@ -918,18 +934,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
             std::vector<std::string> hap_names;
             hap_names.reserve(panel_graph.paths.size());
             for (const PathRecord& p : panel_graph.paths) hap_names.push_back(p.name);
-            GenotypeOptions gopt;
-            gopt.threads = options.threads;
-            gopt.max_alleles_per_block = max_alleles;
-            gopt.fragment_len = fragment_len;
-            gopt.provenance = provenance;
-            gopt.recomb_rate = recomb_rate;
-            gopt.carrier_weight = carrier_weight;
-            gopt.mass_weight = mass_weight;
-            gopt.marker_outlier = marker_outlier;
-            gopt.compositional = compositional;
-            gopt.robust_c = robust_c;
-            gopt.mass_window = mass_window;
+            GenotypeOptions gopt = make_genotype_options();
             gopt.scale_weight = scale_weight;
             GenotypeSummary gsum;
             std::vector<int> ta1;
@@ -1278,9 +1283,15 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         d.lambda_hap = lambda;
                         d.usable = true;
                     }
+                    // Same arguments as the first pass. Dropping the coverage evidence here silently
+                    // reverted --evidence to the marker model whenever a bypass allele existed, which
+                    // is exactly the case the joint pass exists for -- so the flag appeared to have no
+                    // effect at precisely those loci. Passing ta instead of pa did the same to the
+                    // emission-rank diagnostics.
                     calls = genotype_sample(chain, blocks, read_panel, rc, depth, hap_names, gopt,
-                                            &gsum, ta1.empty() ? nullptr : &ta1,
-                                            ta2.empty() ? nullptr : &ta2);
+                                            &gsum, pa1.empty() ? nullptr : &pa1,
+                                            pa2.empty() ? nullptr : &pa2,
+                                            evidence == "syncmer" ? nullptr : &cev);
                 }
             }
             log.info("model: lambda " + std::to_string(gsum.lambda_hap) + ", overdispersion phi " +
