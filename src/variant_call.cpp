@@ -14,6 +14,7 @@
 #include "panvar/ref_path.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstddef>
 #include <cmath>
@@ -157,6 +158,11 @@ bool is_inversion(const std::vector<const Tok*>& ref_blk, const std::vector<cons
 // equal tokens; else gaps) and append the DEL/INS/INV events to `events`.
 // `preceding_ref_node` anchors an INS that opens the segment (the last matched ref
 // node before it). Bounded by kAlignCellCap; segments between shared anchors are small.
+// Segments abandoned because the node-token DP would exceed its cell cap. Each one is a divergent
+// block that produced NO variant records, so it is a false negative -- and one that used to vanish
+// unless PANVAR_CALL_DEBUG happened to be set. Counted here and reported at the end of the run.
+std::atomic<std::size_t> g_skipped_segments{0};
+
 void diff_segment(
     const Graph& graph,
     const std::vector<Tok>& R, std::size_t r0, std::size_t r1,
@@ -171,6 +177,7 @@ void diff_segment(
         if (std::getenv("PANVAR_CALL_DEBUG")) {
             std::cerr << "[diff] SKIP segment m=" << m << " n=" << n << " (cap " << kAlignCellCap << ")\n";
         }
+        ++g_skipped_segments;   // counted and reported, not silently dropped
         return; // unanchored divergent block too large to align; skip
     }
 
@@ -1658,6 +1665,7 @@ void call_variants(
         summary.multi += bo.sum.multi;
         summary.tangle_bubbles += bo.sum.tangle_bubbles;
         summary.oversized_dups += bo.sum.oversized_dups;
+        summary.skipped_large_segments = g_skipped_segments.load();
         for (OutRecord& r : bo.records) out_records.push_back(std::move(r));
         for (std::string& s : bo.variant_nodes) variant_nodes_rows.push_back(std::move(s));
         for (DupGeneTarget& t : bo.dup_targets) dup_targets.push_back(std::move(t));

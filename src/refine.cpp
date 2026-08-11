@@ -452,7 +452,24 @@ RefineSummary refine_graph(const RefineOptions& options) {
             st = std::move(next);
         }
     }
-    // drop removed nodes
+    // drop removed nodes -- but only those no path still walks.
+    //
+    // Only paths spanning BOTH anchors are rewritten above. A path that enters the interior without
+    // crossing both anchors keeps its original steps, so deleting an interior node it references leaves
+    // a path pointing at a node that no longer exists: a silently corrupt graph that every downstream
+    // module then reads. Count references after the rewrite and keep anything still in use.
+    if (!removed.empty()) {
+        std::unordered_set<std::string> still_used;
+        for (const auto& pth : model.paths) {
+            for (const auto& st : pth.steps) {
+                if (removed.count(st.node_id) != 0) still_used.insert(st.node_id);
+            }
+        }
+        if (!still_used.empty()) {
+            for (const auto& n : still_used) removed.erase(n);
+            summary.nodes_retained_referenced = still_used.size();
+        }
+    }
     if (!removed.empty()) {
         for (const auto& n : removed) { model.seq.erase(n); ++summary.nodes_removed; }
         model.node_order.erase(std::remove_if(model.node_order.begin(), model.node_order.end(),

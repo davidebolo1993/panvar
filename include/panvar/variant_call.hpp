@@ -59,6 +59,9 @@ struct VariantCallSummary {
     std::size_t bubbles_with_reference = 0;
     std::size_t bubbles_with_calls = 0;
     std::size_t records_written = 0;
+    // Divergent blocks abandoned because the node-token DP would exceed its cell cap. Each is a
+    // guaranteed false negative, so it belongs in the summary rather than behind a debug env var.
+    std::size_t skipped_large_segments = 0;
     std::size_t del = 0;
     std::size_t ins = 0;
     std::size_t inv = 0;

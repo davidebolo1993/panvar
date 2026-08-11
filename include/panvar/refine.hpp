@@ -29,6 +29,9 @@ struct RefineSummary {
     std::size_t regions_skipped = 0;
     std::size_t nodes_added = 0;
     std::size_t nodes_removed = 0;
+    // Interior nodes kept back from deletion because a path that does not span both anchors still
+    // walks them. Non-zero means the naive removal would have corrupted the graph.
+    std::size_t nodes_retained_referenced = 0;
     std::size_t bubbles_after = 0;
 };
 
