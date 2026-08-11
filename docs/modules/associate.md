@@ -106,6 +106,12 @@ Script flags (need `Rscript` + `ggplot2`; `ggrepel` optional, for the gene label
 
 See the [GWAS example](../gwas.md) for a runnable association run on this locus, and the [LPA walkthrough](../walkthrough.md) for the full pipeline.
 
+## Effective tests
+
+`Meff` is the denominator the Bonferroni threshold uses, so **every tested feature has to be in it**. In the variant tier a low-AF variant is barred from anchoring an LD clump — its `r^2` is unstable, so it must not claim shadows — but it is still tested, and it used to end up in no clump at all: its own threshold was then computed from a set it was not part of. Measured on the LPA cohort at `--min-ac 30`, 5 of 20 tested variants sat outside every clump and `Meff` read 12. Each such feature now gets a singleton clump: it counts, but it claims nothing (`Meff` 12 → 17). The same rule applies in the feature tier, where a feature with no bubble annotation belongs to no block.
+
+`Meff` is still an LD-clumping heuristic, not an eigenvalue decomposition; BH-FDR across all tests remains the primary control, and is what should be quoted.
+
 ## Calibration
 
 A p-value means nothing unless it is uniform when nothing is going on. `tests/associate_null.sh` permutes the phenotype table's sample labels — severing every genotype-phenotype link while leaving the genotype matrix, the missingness pattern and the phenotype/covariate joint distribution untouched — and reports type-I error, `lambda_GC`, and a per-feature uniformity test. Per feature, p-values across permutations are independent, which is what makes the uniformity test valid; pooled across features within one permutation they are not, so the pooled intervals it prints are optimistic and labelled as such.

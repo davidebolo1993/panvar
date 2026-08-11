@@ -911,12 +911,36 @@ int run_associate_command(const std::vector<std::string>& args) {
             }
             ++next_clump;
         }
+        // Every TESTED feature has to count toward the denominator it is corrected against. A low-AF
+        // variant is barred above from ANCHORING a clump -- its r^2 is unstable, so it must not claim
+        // shadows -- but it is still tested, and leaving it in no clump at all made Meff smaller than the
+        // number of tests: its own Bonferroni threshold was then computed from a set it was not in.
+        // Measured on the LPA cohort at --min-ac 30, 5 of 20 tested variants sat in no clump and Meff read
+        // 12. Give each remaining tested feature a singleton clump: it counts, but it claims nothing.
+        for (std::size_t oi = 0; oi < n_tests; ++oi) {
+            const std::size_t i = byp[oi];
+            if (rows[i].clump != -1 || !std::isfinite(rows[i].p)) continue;
+            rows[i].clump = next_clump++;
+            rows[i].is_lead = 1;
+        }
         meff = static_cast<std::size_t>(std::max(1, next_clump));
     } else if (n_tests > 0) {
+        // Same rule as the variant tier: a tested feature must count. A feature with no bubble
+        // annotation belongs to no block, and skipping it made Meff smaller than the number of tests
+        // whenever only SOME features were annotated. Each unannotated feature counts as its own block.
+        // With no annotation at all this reduces to meff = n_tests, which is where it started.
         std::unordered_set<std::string> blocks;
-        for (const Row& r : rows)
-            for (const std::string& b : split(r.bubbles, ';')) { const std::string t = trim(b); if (!t.empty() && t != ".") blocks.insert(t); }
-        if (!blocks.empty()) meff = blocks.size();
+        std::size_t unannotated = 0;
+        for (const Row& r : rows) {
+            bool any = false;
+            for (const std::string& b : split(r.bubbles, ';')) {
+                const std::string t = trim(b);
+                if (!t.empty() && t != ".") { blocks.insert(t); any = true; }
+            }
+            if (!any) ++unannotated;
+        }
+        if (!blocks.empty() || unannotated > 0)
+            meff = std::max<std::size_t>(1, blocks.size() + unannotated);
     }
 
     // Variant-tier forward-stepwise conditional/joint (COJO), since r^2-clumping cannot establish
