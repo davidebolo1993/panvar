@@ -112,6 +112,10 @@ See the [GWAS example](../gwas.md) for a runnable association run on this locus,
 
 `Meff` is still an LD-clumping heuristic, not an eigenvalue decomposition; BH-FDR across all tests remains the primary control, and is what should be quoted.
 
+## Reading `lambda_GC`
+
+`lambda_GC` is a **genome-wide** diagnostic: it reads the median chi-square on the assumption that most tests are null. `panvar` tests one locus, where a real signal and everything in linkage disequilibrium with it can be most of the tests — `lambda` then measures the signal, not inflation. On the LPA example it reads **43.8** across 12 tests, which says the KIV-2 effect is enormous, not that the analysis is inflated. The run summary now says which situation it is in, and only calls it an inflation estimate when there are at least 100 tests and fewer than a quarter of them are significant.
+
 ## Calibration
 
 A p-value means nothing unless it is uniform when nothing is going on. `tests/associate_null.sh` permutes the phenotype table's sample labels — severing every genotype-phenotype link while leaving the genotype matrix, the missingness pattern and the phenotype/covariate joint distribution untouched — and reports type-I error, `lambda_GC`, and a per-feature uniformity test. Per feature, p-values across permutations are independent, which is what makes the uniformity test valid; pooled across features within one permutation they are not, so the pooled intervals it prints are optimistic and labelled as such.

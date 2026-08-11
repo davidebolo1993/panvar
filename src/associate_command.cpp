@@ -1178,6 +1178,16 @@ int run_associate_command(const std::vector<std::string>& args) {
     std::vector<double> zs(n_tests);
     for (std::size_t i = 0; i < n_tests; ++i) zs[i] = rows[i].z;
     const double lambda_gc = genomic_lambda(zs);
+    // lambda_GC is a genome-wide diagnostic: it reads the MEDIAN chi-square, on the assumption that most
+    // tests are null. panvar tests one locus, where a real signal and everything in LD with it can be
+    // most of the tests -- lambda then measures the signal, not inflation. Reporting it unqualified
+    // invites the opposite reading, so say which situation this run is in.
+    const bool lambda_meaningful =
+        n_tests >= 100 && static_cast<double>(n_sig_fdr) < 0.25 * static_cast<double>(n_tests);
+    const std::string lambda_label = lambda_meaningful
+        ? std::string("genomic inflation lambda_GC")
+        : std::string("lambda_GC (NOT an inflation estimate here: too few tests, or too many are "
+                      "signal -- it reads the median chi-square assuming most tests are null)");
 
     // ---- write assoc.tsv (sorted by p) ----
     std::vector<std::size_t> order(n_tests);
@@ -1248,7 +1258,7 @@ int run_associate_command(const std::vector<std::string>& args) {
              std::to_string(n_tests) + ", Meff " + std::to_string(meff) + ", dropped " +
              std::to_string(n_dropped_maf) + " (MAF) + " + std::to_string(n_dropped_fit) + " (fit)");
     log.info("significant: Bonferroni(Meff=" + std::to_string(meff) + ") " + std::to_string(n_sig_meff) +
-             ", FDR<0.05 " + std::to_string(n_sig_fdr) + "; genomic inflation lambda_GC=" + fmt(lambda_gc) +
+             ", FDR<0.05 " + std::to_string(n_sig_fdr) + "; " + lambda_label + "=" + fmt(lambda_gc) +
              (variant_mode ? "; COJO signals " + std::to_string(cojo_n_signals) : ""));
     log.wrote({opt.out_prefix + ".assoc.tsv", opt.out_prefix + ".summary.tsv"});
     log.done();
