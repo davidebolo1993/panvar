@@ -671,6 +671,7 @@ void call_variants(
         std::string line;                       // full VCF row (with trailing newline)
     };
     std::vector<OutRecord> out_records;
+    std::vector<OutRecord> allele_records;
     std::vector<std::string> variant_nodes_rows;     // <prefix>.variant_nodes.tsv (describe handoff)
     std::vector<std::string> dup_gene_cn_rows;       // <prefix>.dup_gene_cn.tsv body (per-gene DUP CN)
 
@@ -691,6 +692,7 @@ void call_variants(
     struct BubbleOut {
         VariantCallSummary sum;
         std::vector<OutRecord> records;
+        std::vector<OutRecord> allele_records;
         std::vector<std::string> variant_nodes;
         std::vector<DupGeneTarget> dup_targets;   // DUPs needing per-gene CN (when --gtf is active)
     };
@@ -724,6 +726,7 @@ void call_variants(
         BubbleOut& bout = bouts[bubble_idx];
         VariantCallSummary& summary = bout.sum;
         std::vector<OutRecord>& out_records = bout.records;
+        std::vector<OutRecord>& allele_records = bout.allele_records;
         std::vector<std::string>& variant_nodes_rows = bout.variant_nodes;
         std::vector<DupGeneTarget>& dup_targets = bout.dup_targets;
         std::unordered_map<std::string, int> id_counts;
@@ -1303,6 +1306,103 @@ void call_variants(
             std::sort(bubble_gene_idx.begin(), bubble_gene_idx.end());
         }
 
+        // Lossless companion output (--allele-vcf): one record per bubble carrying EVERY distinct
+        // allele as explicit sequence, each haplotype's GT indexing its own allele. The merged records
+        // in the region VCF are an interpretation -- several of them can describe one walk, and a
+        // carrier is given the merged representative's length rather than its own -- so a consumer
+        // reconstructing a specific sample needs this instead. Written alongside, never in place of,
+        // the region VCF, and deliberately not gated on CN: the region VCF keeps REF_CN/CN semantics
+        // and this file keeps the sequence.
+        if (options.allele_vcf) {
+            // Anchor orientation-independently, as the merged path does: when the reference crosses
+            // this bubble sink->source the genomically-upstream flank is the SINK, and the allele
+            // sequences -- spelled canonically source->sink -- have to be reverse-complemented to sit
+            // in reference-forward coordinates alongside POS.
+            const auto a_ps = ref_node_pos.find(bubble.source);
+            const auto a_pk = ref_node_pos.find(bubble.sink);
+            const bool a_rev = a_ps != ref_node_pos.end() && a_pk != ref_node_pos.end() &&
+                               a_pk->second < a_ps->second;
+            const std::string& a_anchor_id = a_rev ? bubble.sink : bubble.source;
+            const auto asit = ref_node_pos.find(a_anchor_id);
+            const auto asnode = graph.nodes.find(a_anchor_id);
+            auto a_interior = [&](const std::vector<PathStep>& steps) -> std::string {
+                if (steps.size() < 2) return std::string();
+                std::vector<PathStep> inner(steps.begin() + 1, steps.end() - 1);
+                std::string seq = spell_path_steps_sequence(graph, inner);
+                return a_rev ? reverse_complement(seq) : seq;
+            };
+            if (asit == ref_node_pos.end() || asnode == graph.nodes.end() || asnode->second.sequence.empty()) {
+                ++summary.allele_skipped;
+            } else {
+                const std::size_t aslen = asnode->second.sequence.size();
+                const std::string a_anchor = upper_base(asnode->second.sequence[aslen - 1]);
+                const std::size_t a_pos = asit->second + (aslen > 0 ? aslen - 1 : 0);
+                const std::string a_ref = a_anchor + a_interior(ref_steps);
+                const std::size_t cap = options.allele_vcf_max_bp;
+                std::vector<std::string> a_alts;
+                std::unordered_map<std::string, int> a_idx_of;
+                a_idx_of.emplace(a_ref, 0);
+                std::vector<int> a_vcf_idx(alleles.size(), -1);
+                bool a_ok = !(cap && a_ref.size() > cap);
+                for (std::size_t ai = 0; a_ok && ai < alleles.size(); ++ai) {
+                    const std::string seq = a_anchor + a_interior(alleles[ai].steps);
+                    if (cap && seq.size() > cap) { a_ok = false; break; }
+                    auto it = a_idx_of.find(seq);
+                    if (it == a_idx_of.end()) {
+                        const int idx = 1 + static_cast<int>(a_alts.size());
+                        a_alts.push_back(seq);
+                        a_idx_of.emplace(seq, idx);
+                        a_vcf_idx[ai] = idx;
+                    } else {
+                        a_vcf_idx[ai] = it->second;
+                    }
+                }
+                if (!a_ok || a_alts.empty()) {
+                    ++summary.allele_skipped;
+                } else {
+                    std::vector<std::size_t> a_ac(a_alts.size(), 0);
+                    std::size_t a_an = 0;
+                    for (const std::string& s : sample_names) {
+                        if (!traverses.count(s)) continue;
+                        ++a_an;
+                        const auto ait = sample_to_allele.find(s);
+                        if (ait == sample_to_allele.end()) continue;
+                        const int vi = a_vcf_idx[ait->second];
+                        if (vi >= 1) ++a_ac[static_cast<std::size_t>(vi - 1)];
+                    }
+                    const std::size_t a_end = a_pos + a_ref.size() - 1;
+                    std::ostringstream info;
+                    info << "BUBBLE_ID=" << bubble.id << ";END=" << a_end
+                         << ";NALLELES=" << (a_alts.size() + 1) << ";AN=" << a_an << ";AC=";
+                    for (std::size_t k = 0; k < a_ac.size(); ++k) { if (k) info << ','; info << a_ac[k]; }
+                    info << ";SVLEN=";
+                    for (std::size_t k = 0; k < a_alts.size(); ++k) {
+                        if (k) info << ',';
+                        info << (static_cast<long long>(a_alts[k].size()) - static_cast<long long>(a_ref.size()));
+                    }
+                    std::ostringstream row;
+                    row << ref_meta.chrom << '\t' << a_pos << '\t'
+                        << ("bubble" + std::to_string(bubble.id) + "_ALLELES") << '\t' << a_ref << '\t';
+                    for (std::size_t k = 0; k < a_alts.size(); ++k) { if (k) row << ','; row << a_alts[k]; }
+                    row << "\t.\t.\t" << info.str() << "\tGT";
+                    for (const std::string& s : sample_names) {
+                        row << '\t';
+                        if (!traverses.count(s)) { row << '.'; continue; }
+                        const auto ait = sample_to_allele.find(s);
+                        row << (ait != sample_to_allele.end() && a_vcf_idx[ait->second] >= 0
+                                    ? std::to_string(a_vcf_idx[ait->second]) : ".");
+                    }
+                    row << '\n';
+                    OutRecord arec;
+                    arec.pos = a_pos; arec.end = a_end; arec.bubble_id = bubble.id;
+                    arec.id = "bubble" + std::to_string(bubble.id) + "_ALLELES";
+                    arec.line = row.str();
+                    allele_records.push_back(std::move(arec));
+                    ++summary.allele_records;
+                }
+            }
+        }
+
         // Optional multiallelic record (--multiallelic-loci): collapse a bounded locus (STR/VNTR) into
         // one record with explicit-sequence alleles (REF + ALTs), GT indexing each sample's allele.
         // Skipped when an allele exceeds --multiallelic-max-bp, or the bubble carries a CN record (would
@@ -1666,7 +1766,10 @@ void call_variants(
         summary.tangle_bubbles += bo.sum.tangle_bubbles;
         summary.oversized_dups += bo.sum.oversized_dups;
         summary.skipped_large_segments = g_skipped_segments.load();
+        summary.allele_records += bo.sum.allele_records;
+        summary.allele_skipped += bo.sum.allele_skipped;
         for (OutRecord& r : bo.records) out_records.push_back(std::move(r));
+        for (OutRecord& r : bo.allele_records) allele_records.push_back(std::move(r));
         for (std::string& s : bo.variant_nodes) variant_nodes_rows.push_back(std::move(s));
         for (DupGeneTarget& t : bo.dup_targets) dup_targets.push_back(std::move(t));
     }
@@ -1684,6 +1787,20 @@ void call_variants(
         throw std::runtime_error("Failed to write region VCF: " + options.out_prefix + ".region.vcf");
     }
     write_vcf_header(region_out);
+
+    if (options.allele_vcf) {
+        std::stable_sort(allele_records.begin(), allele_records.end(),
+                         [](const OutRecord& a, const OutRecord& b) {
+                             if (a.pos != b.pos) return a.pos < b.pos;
+                             if (a.end != b.end) return a.end < b.end;
+                             return a.id < b.id;
+                         });
+        const std::string path = options.out_prefix + ".alleles.vcf";
+        std::ofstream allele_out(path);
+        if (!allele_out) throw std::runtime_error("Failed to write allele VCF: " + path);
+        write_vcf_header(allele_out);
+        for (const OutRecord& rec : allele_records) allele_out << rec.line;
+    }
 
     std::map<std::size_t, std::ofstream> bubble_files;
     for (const OutRecord& rec : out_records) {

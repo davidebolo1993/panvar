@@ -122,3 +122,18 @@ A reference-coordinate GTF (Gene Transfer Format; Ensembl/GENCODE) projected ont
 ## Example
 
 See the [LPA walkthrough](../walkthrough.md) for this module in a full end-to-end run.
+
+## Lossless companion: the allele VCF
+
+`--allele-vcf` writes `<prefix>.alleles.vcf` alongside the region VCF: **one record per bubble, carrying every distinct allele as explicit sequence**, with each haplotype's `GT` indexing its own allele.
+
+The region VCF is an *interpretation* — events are typed, merged across haplotypes that carry the same site, and written symbolically. That is what makes it readable, and it is deliberately kept as the primary output. But it is lossy in three ways that matter to anyone reconstructing a specific sample: several records can describe one walk and do not compose additively when applied together; a merged record gives every carrier the representative's length rather than its own; and a symbolic `ALT` carries no sequence at all.
+
+The allele VCF has none of those properties, because it never interprets: it just spells what each haplotype actually traverses. Measured with `benchmark --vcf` on all six reference loci, it reconstructs **every haplotype at every called bubble exactly** — residual 0 bp, no haplotype worse than the do-nothing baseline — where the region VCF closes 16-96% of the same gap.
+
+The cost is size: 70-600x the region VCF (3 MB to 110 MB per locus at 466 haplotypes), since a bubble with hundreds of distinct kilobase-scale alleles spells each one out. Use `--allele-vcf-max-bp` to skip bubbles above a size, and prefer it bgzipped.
+
+| flag | what it does | default |
+|------|--------------|---------|
+| `--allele-vcf` | also write `<prefix>.alleles.vcf` | off |
+| `--allele-vcf-max-bp <N>` | skip a bubble there if any allele exceeds N bp | `0` (no limit) |

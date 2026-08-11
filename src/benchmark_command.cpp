@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -172,9 +173,13 @@ struct VcfRecord {
     long long svlen = 0;
     std::string svtype;
     std::string insseq;
+    std::string ref_allele;                 // REF column, when the record carries explicit sequence
+    std::vector<std::string> alts;          // ALT alleles, explicit sequence only (empty if symbolic)
     std::size_t ref_cn = 0;            // copy-number records: copies the reference carries
     std::size_t ru_len = 0;            // copy-number records: length of one repeat unit
-    std::vector<std::int8_t> gt;       // per sample: -1 missing, 0 reference, >=1 alt
+    // Wide enough for a bubble with hundreds of distinct alleles: the allele VCF indexes every one of
+    // them, so an 8-bit slot silently wraps past 127 and drops the edit.
+    std::vector<std::int32_t> gt;      // per sample: -1 missing, 0 reference, >=1 alt
     std::vector<long long> cn;         // per sample: copies this haplotype carries (-1 absent)
     std::vector<long long> cnbp;       // per sample: bp this haplotype gains/loses
 };
@@ -204,6 +209,12 @@ VcfData load_vcf(const std::string& path) {
         VcfRecord r;
         r.id = f[2];
         r.pos = static_cast<std::size_t>(std::stoull(f[1]));
+        // A record whose ALT is literal sequence is applied as a plain REF -> ALT substitution, which
+        // is what the allele VCF emits: one record per bubble, every distinct allele spelled out.
+        if (!f[4].empty() && f[4] != "." && f[4].find('<') == std::string::npos) {
+            r.ref_allele = f[3];
+            r.alts = split_on(f[4], ',');
+        }
         for (const std::string& kv : split_on(f[7], ';')) {
             const std::size_t eq = kv.find('=');
             if (eq == std::string::npos) continue;
@@ -229,7 +240,7 @@ VcfData load_vcf(const std::string& path) {
         for (std::size_t s = 0; s + 9 < f.size() && s < vd.samples.size(); ++s) {
             const std::vector<std::string> v = split_on(f[s + 9], ':');
             if (gt_i < v.size() && !v[gt_i].empty() && v[gt_i] != ".")
-                r.gt[s] = static_cast<std::int8_t>(std::stoi(v[gt_i]));
+                r.gt[s] = static_cast<std::int32_t>(std::stoi(v[gt_i]));
             if (cnbp_i < v.size() && !v[cnbp_i].empty() && v[cnbp_i] != ".")
                 r.cnbp[s] = std::stoll(v[cnbp_i]);
             if (cn_i < v.size() && !v[cn_i].empty() && v[cn_i] != ".")
@@ -248,6 +259,7 @@ struct GtStats {
     std::size_t unplaceable = 0;   // POS outside the bubble's reference span (a merged or shifted bubble)
     std::size_t clamped = 0;       // edit ran past the span end and was truncated
     std::size_t unhandled = 0;     // svtype with no reconstruction rule
+    std::size_t ref_mismatch = 0;  // record REF did not match the reference at POS (placement is wrong)
 };
 
 // Apply the edits `hap` is genotyped as carrying to the bubble's reference sequence. Nothing from the
@@ -276,7 +288,21 @@ std::string apply_genotype(const std::string& ref_bubble,
         const std::size_t at = g - bubble_start_0 + 1;        // first edited base, 0-based in `out`
         if (at > out.size()) { ++stats.unplaceable; continue; }
 
-        if (r->svtype == "DEL") {
+        if (!r->alts.empty()) {
+            // Explicit-sequence allele: replace the record's REF span with the allele the GT names.
+            // `at` is one past the anchor, and REF starts AT the anchor, so back up one base.
+            const std::size_t start = at - 1;
+            const std::int32_t gi = r->gt[hap];
+            if (gi < 1 || static_cast<std::size_t>(gi) > r->alts.size()) { ++stats.unhandled; continue; }
+            std::size_t n = r->ref_allele.size();
+            if (start + n > out.size()) { n = out.size() - start; ++stats.clamped; }
+            // The record's REF must be the reference sequence at POS. If it is not, the record is
+            // being laid down in the wrong place and every score downstream is fiction.
+            if (out.compare(start, n, r->ref_allele, 0, n) != 0) ++stats.ref_mismatch;
+            out.erase(start, n);
+            out.insert(start, r->alts[static_cast<std::size_t>(gi) - 1]);
+            ++stats.applied;
+        } else if (r->svtype == "DEL") {
             std::size_t n = static_cast<std::size_t>(r->svlen < 0 ? -r->svlen : r->svlen);
             if (at + n > out.size()) { n = out.size() - at; ++stats.clamped; }
             out.erase(at, n);
@@ -708,6 +734,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                 tot_gt.unplaceable += hr.gt_stats.unplaceable;
                 tot_gt.clamped += hr.gt_stats.clamped;
                 tot_gt.unhandled += hr.gt_stats.unhandled;
+                tot_gt.ref_mismatch += hr.gt_stats.ref_mismatch;
             } else {
                 by_hap << "\t.\t.\t.\t.\t.\t.\t.\t.\t.";
             }
@@ -825,6 +852,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
             sum << "gt_records\tALL\tunplaceable\t" << tot_gt.unplaceable << "\t0\n";
             sum << "gt_records\tALL\tclamped\t" << tot_gt.clamped << "\t0\n";
             sum << "gt_records\tALL\tunhandled\t" << tot_gt.unhandled << "\t0\n";
+            sum << "gt_records\tALL\tref_mismatch\t" << tot_gt.ref_mismatch << "\t0\n";
         }
         for (const auto& [svclass, bands] : class_bands) {
             std::size_t total = 0;

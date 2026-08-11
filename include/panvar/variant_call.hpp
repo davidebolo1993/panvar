@@ -22,6 +22,10 @@ struct VariantCallOptions {
     bool multiallelic_loci = false;       // opt-in: collapse a bounded locus into ONE multiallelic record
                                          // (REF + ALT1,ALT2,... explicit seqs; GT indexes the allele)
     std::size_t multiallelic_max_bp = 5000; // skip multiallelic collapse if any allele seq exceeds this
+    // Lossless companion VCF: one record per bubble carrying every distinct allele as explicit
+    // sequence, each haplotype's GT indexing its own allele. Written alongside the region VCF.
+    bool allele_vcf = false;
+    std::size_t allele_vcf_max_bp = 0;    // skip a bubble whose alleles exceed this (0 = no limit)
     std::size_t rescue_min_bp = 0;       // floor for events kept for merge/rescue (0 -> min_sv_bp/2)
     bool classify_ins = false;           // minimap2 INS subtype refinement (NOVEL vs DUP)
     bool cn = false;                     // copy-number calling: enable all CN routes, resolved by topology
@@ -67,6 +71,8 @@ struct VariantCallSummary {
     std::size_t inv = 0;
     std::size_t dup = 0;
     std::size_t multi = 0;  // multiallelic-locus records (--multiallelic-loci)
+    std::size_t allele_records = 0;   // bubbles written to the allele VCF
+    std::size_t allele_skipped = 0;   // bubbles skipped there (over --allele-vcf-max-bp, or no anchor)
     std::size_t tangle_bubbles = 0;   // bubbles flagged low-complexity tangles (CN routes suppressed)
     std::size_t oversized_dups = 0;   // peak DUPs suppressed for spanning too much of the reference
 };

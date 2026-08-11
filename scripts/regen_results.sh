@@ -77,7 +77,7 @@ run_region() {
   else cgfa="$pgfa"; cpfx="$ppfx"; fi
   # 3) call
   "$BIN" call -i "$cgfa" --bubble-prefix-in "$cpfx" --reference-path "$ref" \
-    -o "$d/call/call" --threads "$THREADS" "${GTFOPT[@]}" --quiet $call_extra || return 1
+    -o "$d/call/call" --threads "$THREADS" "${GTFOPT[@]}" --allele-vcf --quiet $call_extra || return 1
   # 4) describe (variant-restricted markers)
   "$BIN" describe -i "$cgfa" --bubble-prefix-in "$cpfx" --out-dir "$d/describe" \
     --variant-nodes "$d/call/call.variant_nodes.tsv" --no-wide-matrix --threads "$THREADS" --quiet || return 1

@@ -11,6 +11,8 @@ Scores the caller's own output with a round-trip reconstruction, on two levels. 
 | `graph` | reference walk + **the haplotype's own steps** at blocks the calls explain | can the graph represent this haplotype, and did the caller flag the divergent blocks |
 | `genotype` | reference sequence + **only the edits this haplotype's `GT` names**, from the VCF alone | can a consumer reconstruct this sample from the VCF |
 
+`--vcf` accepts either VCF `call` produces. Give it `<prefix>.region.vcf` to score the merged, interpreted output; give it `<prefix>.alleles.vcf` (from `call --allele-vcf`) to score the lossless one. Records whose `ALT` is literal sequence are applied as a plain `REF` to `ALT` substitution; symbolic ones (`<DEL>`, `<INS>`, `<DUP>`) are reconstructed from `SVLEN` / `INSSEQ` / `CNBP`. Running both and comparing is the point: the difference is exactly what the merged representation costs.
+
 `graph` reads no genotype, so it cannot be wrong about *which* haplotype carries what. It is an upper bound on reconstruction, not a genotyping score — a locus can score near-perfect there while every genotype is on the wrong haplotype. `genotype` (enabled by `--vcf`) is the genotyping score: a missed carrier keeps reference and a spurious one edits sequence that was already correct, so both error directions cost bases.
 
 A third **baseline** reconstruction — plain reference, no edits applied — is always computed alongside `genotype`, and the headline is how much of the distance between that baseline and the `graph` bound the VCF actually closes:

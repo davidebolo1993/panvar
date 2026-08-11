@@ -36,6 +36,12 @@ void print_call_help() {
         << "                                   (default: 0 = use --merge-seq-identity)\n"
         << "      --min-haplotypes <N>         Drop records carried by fewer than N haplotypes (default: 1)\n"
         << "      --min-maf <X>                Drop records with AF (carriers/traversing-haps) below X (default: 0=off)\n"
+        << "      --allele-vcf                 Also write <prefix>.alleles.vcf: one record per bubble carrying\n"
+        << "                                   EVERY distinct allele as explicit sequence, each haplotype's GT\n"
+        << "                                   indexing its own. Lossless companion to the merged region VCF,\n"
+        << "                                   which describes one walk with several interpreted records\n"
+        << "      --allele-vcf-max-bp <N>      Skip a bubble in the allele VCF if any allele exceeds N bp\n"
+        << "                                   (0 = no limit, the default)\n"
         << "      --multiallelic-loci          Collapse a bounded locus into ONE multiallelic record (REF+ALT1,ALT2..)\n"
         << "      --multiallelic-max-bp <N>    Skip multiallelic collapse above this allele size (default: 5000)\n"
         << "      --rescue-min-bp <N>          Floor for sub-threshold events kept for rescue (default: min-sv-bp/2)\n"
@@ -137,6 +143,14 @@ int run_call_command(const std::vector<std::string>& args) {
         }
         if (arg == "--min-maf") {
             options.min_maf = cli::parse_unit_fraction_arg(arg, require_value(arg));
+            continue;
+        }
+        if (arg == "--allele-vcf") {
+            options.allele_vcf = true;
+            continue;
+        }
+        if (arg == "--allele-vcf-max-bp") {
+            options.allele_vcf_max_bp = cli::parse_size_arg(arg, require_value(arg));
             continue;
         }
         if (arg == "--multiallelic-loci") {
@@ -271,6 +285,9 @@ int run_call_command(const std::vector<std::string>& args) {
 
     std::vector<std::string> outputs;
     outputs.push_back(options.out_prefix + ".region.vcf");
+    if (options.allele_vcf) {
+        outputs.push_back(options.out_prefix + ".alleles.vcf");
+    }
     if (options.write_per_bubble_vcf) {
         outputs.push_back(options.out_prefix + ".bubble_<id>.vcf");
     }
