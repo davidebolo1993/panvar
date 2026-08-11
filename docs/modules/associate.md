@@ -124,8 +124,14 @@ Measured on the LPA cohort (6000 individuals; 492 cases / 5213 controls for the 
 | logistic, default `--min-maf` | 1.006 | 0/13 |
 | logistic, `--min-maf 0` | 1.010 | 0/20 |
 
+**Quantitative traits use a Student-t tail** on `n - p` degrees of freedom, not the normal one: the residual variance is estimated from the same data, so the statistic is t-distributed. The difference is invisible at GWAS sample sizes but not at small ones — at 3 degrees of freedom, `t = 1.96` is `p = 0.145`, where the normal would say `0.050`. The implementation is validated against R's `pt()` to a relative error below 4e-12 over df 3–5000.
+
 **Binary traits use a Rao score test.** The Wald test divides an estimate by its own standard error, and for a rare variant in an unbalanced case/control study the fit approaches separation: the coefficient grows, its standard error grows faster, and the statistic collapses. Measured here before the change, every feature below minor frequency 0.01 failed uniformity (`lambda_GC` 0.80, worst KS p 3e-12) while every feature above it passed — the default `--min-maf 0.01` was the only thing hiding it. The score test never fits the alternative, so it has no standard error to inflate.
 
 Consequence for reading the output: `z` and `p` are the score test, while `log_or` and `se` remain the Wald maximum-likelihood effect size, so **p is not recoverable from `log_or`/`se`**. This is the same arrangement SAIGE and REGENIE use.
+
+**A logistic fit that hits the iteration cap is dropped rather than reported.** Under separation IRLS is still diverging at iteration 50, so the last iterate records where the optimiser ran out of patience, not a maximum. Such features are counted in the `(fit)` term of the run summary.
+
+**The kinship matrix is validated before use** — row count and row width (a ragged matrix previously indexed past the end of a short row), finiteness, symmetry, and positive semi-definiteness. A matrix failing any of these is not a GRM, and the variance ratio the LMM derives from it would not mean anything.
 
 Residual limitation: at `p < 0.001` on very rare features the score test is still mildly anti-conservative (observed 0.0025 against a nominal 0.001). The saddlepoint approximation (SPA) is the standard remedy and is not implemented.

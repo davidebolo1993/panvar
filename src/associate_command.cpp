@@ -69,6 +69,52 @@ double wald_p(double z) {
     return p < 1e-300 ? 1e-300 : p;
 }
 
+// Regularized incomplete beta I_x(a,b), by the continued fraction of Numerical Recipes 6.4. Needed for
+// the Student-t tail below; the normal tail is not the right reference distribution for a linear model
+// whose residual variance was estimated from the same data.
+double betacf(double a, double b, double x) {
+    const int kMaxIt = 300;
+    const double kEps = 3e-14, kTiny = 1e-300;
+    const double qab = a + b, qap = a + 1.0, qam = a - 1.0;
+    double c = 1.0, d = 1.0 - qab * x / qap;
+    if (std::fabs(d) < kTiny) d = kTiny;
+    d = 1.0 / d;
+    double h = d;
+    for (int m = 1; m <= kMaxIt; ++m) {
+        const int m2 = 2 * m;
+        double aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+        d = 1.0 + aa * d; if (std::fabs(d) < kTiny) d = kTiny;
+        c = 1.0 + aa / c; if (std::fabs(c) < kTiny) c = kTiny;
+        d = 1.0 / d; h *= d * c;
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+        d = 1.0 + aa * d; if (std::fabs(d) < kTiny) d = kTiny;
+        c = 1.0 + aa / c; if (std::fabs(c) < kTiny) c = kTiny;
+        d = 1.0 / d;
+        const double del = d * c;
+        h *= del;
+        if (std::fabs(del - 1.0) < kEps) break;
+    }
+    return h;
+}
+
+double betai(double a, double b, double x) {
+    if (!(x > 0.0)) return 0.0;
+    if (!(x < 1.0)) return 1.0;
+    const double bt = std::exp(std::lgamma(a + b) - std::lgamma(a) - std::lgamma(b) +
+                               a * std::log(x) + b * std::log1p(-x));
+    return (x < (a + 1.0) / (a + b + 2.0)) ? bt * betacf(a, b, x) / a
+                                           : 1.0 - bt * betacf(b, a, 1.0 - x) / b;
+}
+
+// Two-sided Student-t tail on `df` degrees of freedom. Falls back to the normal when df is large enough
+// that the difference is below the printing precision anyway.
+double student_p(double t, double df) {
+    if (!std::isfinite(t) || !(df > 0.0)) return kNaN;
+    if (df > 1e6) return wald_p(t);
+    const double p = betai(0.5 * df, 0.5, df / (df + t * t));
+    return p < 1e-300 ? 1e-300 : (p > 1.0 ? 1.0 : p);
+}
+
 // Solve A x = b and also return A^{-1} (Gauss-Jordan, partial pivot). A is p x p (row-major),
 // small (p <= ~12). Returns false if singular.
 bool solve_and_invert(std::vector<double> A, const std::vector<double>& b,
@@ -158,6 +204,7 @@ bool logistic_irls(const std::vector<double>& X, const std::vector<double>& y, s
                    std::vector<double>& beta, std::vector<double>& inv, std::vector<double>* mu_out) {
     beta.assign(p, 0.0);
     inv.clear();
+    bool converged = false;
     for (int iter = 0; iter < 50; ++iter) {
         std::vector<double> XtWX(p * p, 0.0), XtWz(p, 0.0);
         for (std::size_t i = 0; i < n; ++i) {
@@ -177,8 +224,12 @@ bool logistic_irls(const std::vector<double>& X, const std::vector<double>& y, s
         if (!solve_and_invert(XtWX, XtWz, p, nb, inv)) return false;
         double delta = 0.0;
         for (std::size_t a = 0; a < p; ++a) { delta += std::fabs(nb[a] - beta[a]); beta[a] = nb[a]; }
-        if (delta < 1e-8) break;
+        if (delta < 1e-8) { converged = true; break; }
     }
+    // A run that hit the iteration cap has not found the maximum -- under separation it is still
+    // diverging. Reporting the last iterate as an estimate would be reporting where we ran out of
+    // patience, so the caller counts it as an unfittable feature instead.
+    if (!converged) return false;
     if (mu_out != nullptr) {
         mu_out->assign(n, 0.0);
         for (std::size_t i = 0; i < n; ++i) {
@@ -241,31 +292,10 @@ FitResult score_logistic(const std::vector<double>& X, const std::vector<double>
 FitResult fit_logistic(const std::vector<double>& X, const std::vector<double>& y, std::size_t n, std::size_t p) {
     FitResult r;
     if (n <= p + 1) return r;
-    std::vector<double> beta(p, 0.0), inv;
-    for (int iter = 0; iter < 50; ++iter) {
-        std::vector<double> XtWX(p * p, 0.0), XtWz(p, 0.0);
-        bool bad = false;
-        for (std::size_t i = 0; i < n; ++i) {
-            double eta = 0.0;
-            for (std::size_t a = 0; a < p; ++a) eta += X[i * p + a] * beta[a];
-            const double mu = 1.0 / (1.0 + std::exp(-eta));
-            const double w = std::max(mu * (1.0 - mu), 1e-9);
-            const double z = eta + (y[i] - mu) / w;
-            for (std::size_t a = 0; a < p; ++a) {
-                const double xa = X[i * p + a];
-                XtWz[a] += xa * w * z;
-                for (std::size_t b = a; b < p; ++b) XtWX[a * p + b] += xa * w * X[i * p + b];
-            }
-        }
-        for (std::size_t a = 0; a < p; ++a) for (std::size_t b = 0; b < a; ++b) XtWX[a * p + b] = XtWX[b * p + a];
-        std::vector<double> nb;
-        if (!solve_and_invert(XtWX, XtWz, p, nb, inv)) { bad = true; }
-        if (bad) return r;
-        double delta = 0.0;
-        for (std::size_t a = 0; a < p; ++a) { delta += std::fabs(nb[a] - beta[a]); beta[a] = nb[a]; }
-        if (delta < 1e-8) break;
-    }
-    const double var_b1 = inv.empty() ? kNaN : inv[1 * p + 1];
+    std::vector<double> beta, inv;
+    if (!logistic_irls(X, y, n, p, beta, inv, nullptr)) return r;   // includes non-convergence
+    if (inv.size() != p * p) return r;
+    const double var_b1 = inv[1 * p + 1];
     if (!(var_b1 > 0.0)) return r;
     r.beta = beta[1];
     r.se = std::sqrt(var_b1);
@@ -630,10 +660,58 @@ int run_associate_command(const std::vector<std::string>& args) {
             if (!row.empty()) M.push_back(std::move(row));
         }
         if (M.size() < geno_samples.size())
-            throw std::runtime_error("--kinship matrix has fewer rows than samples");
+            throw std::runtime_error("--kinship matrix has fewer rows than samples (" +
+                                     std::to_string(M.size()) + " < " +
+                                     std::to_string(geno_samples.size()) + ")");
+        // Row WIDTH was never checked, so a ragged matrix indexed past the end of a short row -- silent
+        // out-of-bounds rather than an error. Check every row this run will actually touch.
+        for (std::size_t c : used_cols)
+            if (M[c].size() < geno_samples.size())
+                throw std::runtime_error("--kinship row " + std::to_string(c + 1) + " has " +
+                                         std::to_string(M[c].size()) + " entries, expected at least " +
+                                         std::to_string(geno_samples.size()) + " (ragged matrix)");
         for (std::size_t a = 0; a < n_used; ++a)
             for (std::size_t b = 0; b < n_used; ++b)
                 K(a, b) = M[used_cols[a]][used_cols[b]];
+
+        // A GRM has to be finite and symmetric before anything downstream can mean what it claims: the
+        // eigendecomposition below assumes self-adjointness and will happily return nonsense otherwise.
+        double asym = 0.0, scale = 0.0;
+        for (std::size_t a = 0; a < n_used; ++a) {
+            for (std::size_t b = 0; b < n_used; ++b) {
+                if (!std::isfinite(K(static_cast<Eigen::Index>(a), static_cast<Eigen::Index>(b))))
+                    throw std::runtime_error("--kinship has a non-finite entry at row " +
+                                             std::to_string(a + 1) + ", column " + std::to_string(b + 1));
+                scale = std::max(scale, std::fabs(K(static_cast<Eigen::Index>(a), static_cast<Eigen::Index>(b))));
+                if (b > a)
+                    asym = std::max(asym, std::fabs(K(static_cast<Eigen::Index>(a), static_cast<Eigen::Index>(b)) -
+                                                    K(static_cast<Eigen::Index>(b), static_cast<Eigen::Index>(a))));
+            }
+        }
+        if (scale > 0.0 && asym > 1e-6 * scale)
+            throw std::runtime_error("--kinship is not symmetric (largest |K(i,j)-K(j,i)| = " +
+                                     std::to_string(asym) + " against a maximum |K| of " +
+                                     std::to_string(scale) + ")");
+        // Positive semi-definiteness: a negative eigenvalue means it is not a covariance, and the LMM
+        // variance ratio it feeds is then meaningless. Symmetrise the rounding first so the check tests
+        // the matrix rather than the last bit of the input's decimals.
+        for (std::size_t a = 0; a < n_used; ++a)
+            for (std::size_t b = a + 1; b < n_used; ++b) {
+                const double m = 0.5 * (K(static_cast<Eigen::Index>(a), static_cast<Eigen::Index>(b)) +
+                                        K(static_cast<Eigen::Index>(b), static_cast<Eigen::Index>(a)));
+                K(static_cast<Eigen::Index>(a), static_cast<Eigen::Index>(b)) = m;
+                K(static_cast<Eigen::Index>(b), static_cast<Eigen::Index>(a)) = m;
+            }
+        {
+            Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(K, Eigen::EigenvaluesOnly);
+            if (es.info() != Eigen::Success)
+                throw std::runtime_error("--kinship eigendecomposition failed; the matrix is not usable");
+            const double lo = es.eigenvalues().minCoeff(), hi = es.eigenvalues().maxCoeff();
+            if (hi > 0.0 && lo < -1e-6 * hi)
+                throw std::runtime_error("--kinship is not positive semi-definite (smallest eigenvalue " +
+                                         std::to_string(lo) + " against a largest of " + std::to_string(hi) +
+                                         "); it is not a valid GRM");
+        }
     }
 
     // PCA: append the top-N kinship eigenvectors as fixed covariates (cheap structure control).
