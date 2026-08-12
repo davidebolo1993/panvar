@@ -240,6 +240,19 @@ if(PANVAR_BUILD_TESTING)
             set_tests_properties(panvar_associate_stats PROPERTIES TIMEOUT 120)
         endif()
 
+        # bubble contract on hand-checkable graphs. CTest exercised the default internal cactus finder
+        # nowhere: synthetic_smoke.sh supplies checked-in external snarls, and real_smoke.sh makes its
+        # bubble assertions conditional on finding a first bubble -- and a header-only CSV is non-empty,
+        # so a total discovery regression would escape.
+        set(PANVAR_BUBBLE_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/bubble_stats.sh)
+        if(EXISTS ${PANVAR_BUBBLE_STATS})
+            add_test(
+                NAME panvar_bubble_stats
+                COMMAND /usr/bin/env bash ${PANVAR_BUBBLE_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/bubble_stats
+            )
+            set_tests_properties(panvar_bubble_stats PROPERTIES TIMEOUT 180)
+        endif()
+
         # rebuild contract: the input is never destroyed, a healthy graph survives, a malformed one is
         # refused rather than silently repaired, and nothing is left behind. CTest previously exercised
         # no rebuild at all.

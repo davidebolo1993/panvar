@@ -91,6 +91,14 @@ One filter is a gradient; the other is a step at the panel size. C4 has a bubble
 
 `--min-variant-bp` and `--max-variant-bp` measure the **interior span** between the boundaries — the summed length of the interior nodes a path traverses — not the size of the difference between alleles. A 1 bp substitution inside a 1 kb allele has a 1 kb span and passes `--min-variant-bp 50`. `--min-interior-bp` and `--max-interior-bp` are accepted as aliases that say so; the CSV columns `min_inside_bp` / `max_inside_bp` were always named correctly. Computing true allele-to-reference divergence is not implemented.
 
+## `--superbubbles` tests the graph, not the paths
+
+A superbubble is a snarl whose interior is a directed acyclic graph. Cyclicity used to be inferred entirely from what the stored paths happen to do — an interior self-loop, a path revisiting an interior node, a node used in both orientations. Those are real signals, but none of them looks at the graph: **an interior cycle that no stored path walks was reported as acyclic and survived `--superbubbles`**, which exists precisely to exclude it.
+
+The interior is now searched directly for a directed cycle, over oriented **handles** rather than node names — leaving a node forward departs its end, leaving it reversed departs its start, so collapsing to node names would call `A+ → B+ → A-` a cycle when it is an ordinary traversal of two distinct handles. The path-derived signals are kept as additional evidence.
+
+On C4 and LPA this changes nothing (3 and 7 superbubbles before and after): the path signals already caught everything cyclic there. It closes a hole those graphs happen not to exercise.
+
 ## An empty result is a result
 
 A graph with no snarl — a single node, a linear path — emits an empty bubble table and exits 0. It previously raised `no snarls — provide ...`, because an empty result from the internal finder was indistinguishable from no finder having been supplied.

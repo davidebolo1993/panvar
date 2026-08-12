@@ -633,6 +633,65 @@ void evaluate_direction_candidates(
     }
 }
 
+// Does the snarl's INTERIOR contain a directed cycle?
+//
+// Cyclicity was previously inferred from what the stored paths happen to do -- a self-loop, a path
+// revisiting an interior node, a node used in both orientations. All three are real signals, but none
+// of them looks at the graph: an interior cycle that no stored path traverses was reported as acyclic
+// and survived --superbubbles, which exists precisely to exclude it. A superbubble's interior must be a
+// DAG whether or not anybody walked it.
+//
+// The search is over oriented HANDLES, not node names. A bidirected node is two vertices: leaving it
+// forward departs its end, leaving it reversed departs its start, so `A.end` gives the successors of
+// (A,+) and `A.start` those of (A,-). Collapsing to node names would call `A+ -> B+ -> A-` a cycle when
+// it is a perfectly ordinary hairpin-free traversal of two distinct handles.
+bool interior_has_cycle(const Graph& graph, const std::vector<std::string>& inside) {
+    if (inside.size() < 2) return false;
+    std::unordered_map<std::string, std::size_t> index;
+    index.reserve(inside.size());
+    for (std::size_t i = 0; i < inside.size(); ++i) index.emplace(inside[i], i);
+
+    // vertex id = 2*node_index + orientation (0 = forward, 1 = reverse)
+    const std::size_t n = inside.size() * 2;
+    std::vector<std::vector<std::size_t>> adj(n);
+    for (std::size_t i = 0; i < inside.size(); ++i) {
+        const auto nit = graph.nodes.find(inside[i]);
+        if (nit == graph.nodes.end()) continue;
+        for (int orient = 0; orient < 2; ++orient) {
+            const std::vector<Neighbor>& out = orient ? nit->second.start : nit->second.end;
+            for (const Neighbor& nb : out) {
+                const auto jt = index.find(nb.node_id);
+                if (jt == index.end()) continue;              // leaves the interior: not an interior cycle
+                // side 0 = entering the neighbour's start = its forward handle
+                adj[i * 2 + static_cast<std::size_t>(orient)]
+                    .push_back(jt->second * 2 + (nb.side == 0 ? 0u : 1u));
+            }
+        }
+    }
+
+    // Iterative three-colour DFS; a grey successor is a back edge and therefore a cycle.
+    std::vector<char> colour(n, 0);   // 0 white, 1 grey, 2 black
+    std::vector<std::pair<std::size_t, std::size_t>> stack;   // (vertex, next successor to visit)
+    for (std::size_t start = 0; start < n; ++start) {
+        if (colour[start] != 0) continue;
+        stack.clear();
+        stack.emplace_back(start, 0);
+        colour[start] = 1;
+        while (!stack.empty()) {
+            auto& [v, next] = stack.back();
+            if (next < adj[v].size()) {
+                const std::size_t w = adj[v][next++];
+                if (colour[w] == 1) return true;              // back edge
+                if (colour[w] == 0) { colour[w] = 1; stack.emplace_back(w, 0); }
+            } else {
+                colour[v] = 2;
+                stack.pop_back();
+            }
+        }
+    }
+    return false;
+}
+
 std::optional<CandidateInterval> find_best_interval(const PathIndex& index, const Bubble& bubble) {
     const auto src_it = index.positions.find(bubble.source);
     const auto sink_it = index.positions.find(bubble.sink);
@@ -783,6 +842,10 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
             std::unordered_set<std::string> inside_nodes(bubble.inside.begin(), bubble.inside.end());
             std::unordered_map<std::string, unsigned char> orientation_mask;
             orientation_mask.reserve(bubble.inside.size() * 2);
+
+            // A directed cycle anywhere in the induced oriented interior, whether or not a stored path
+            // walks it. This is the structural test; the path-derived signals below are additional.
+            if (interior_has_cycle(graph, bubble.inside)) cyclic = true;
 
             // An interior node carrying a self-loop edge makes the snarl cyclic (tandem unit).
             for (const std::string& id : bubble.inside) {
