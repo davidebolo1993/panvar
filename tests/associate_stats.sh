@@ -51,7 +51,10 @@ st=$(col "$OUT/sep.assoc.tsv" effect_status sep); sp=$(col "$OUT/sep.assoc.tsv" 
 lo=$(col "$OUT/sep.assoc.tsv" log_or sep)
 [ "$st" = "separation" ]                  && ok "separated feature reports effect_status=separation" || bad "effect_status=$st, expected separation"
 [ -n "$sp" ] && [ "$sp" != "NA" ]         && ok "separated feature still has a score p ($sp)"        || bad "separated feature has no p"
-[ "$lo" = "NA" ]                          && ok "separated feature has no effect estimate"           || bad "log_or=$lo, expected NA under separation"
+# Firth's penalised likelihood gives a FINITE estimate where maximum likelihood diverges, so the
+# contract is a real effect size here, not NA.
+awk -v v="$lo" 'BEGIN{exit !(v+0 > 1 && v+0 < 50)}' \
+  && ok "separated feature has a finite Firth effect estimate ($lo)" || bad "log_or=$lo, expected a finite Firth estimate"
 mc=$(col "$OUT/sep.assoc.tsv" mac_case com); mo=$(col "$OUT/sep.assoc.tsv" mac_ctrl com)
 [ "$mc" != "." ] && [ "$mo" != "." ]      && ok "case/control carrier counts reported ($mc/$mo)"     || bad "mac_case/mac_ctrl not reported"
 

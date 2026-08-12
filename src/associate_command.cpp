@@ -157,6 +157,7 @@ bool solve_and_invert(std::vector<double> A, const std::vector<double>& b,
 
 struct FitResult {
     bool ok = false;
+    bool spa = false;      // p came from the saddlepoint rather than the normal tail
     double beta = kNaN;  // genotype coefficient (column 1)
     double se = kNaN;
     double z = kNaN;
@@ -244,6 +245,67 @@ bool logistic_irls(const std::vector<double>& X, const std::vector<double>& y, s
     return true;
 }
 
+// Firth-penalised logistic regression (Firth 1993; Heinze & Schemper 2002).
+//
+// Under separation the ordinary maximum likelihood estimate diverges -- there is no finite coefficient
+// that maximises the likelihood -- so an MLE fit returns nothing and the effect size is simply absent.
+// Firth adds Jeffreys' invariant prior, |I(beta)|^{1/2}, as a penalty. The penalised score is
+//
+//   U*_j = sum_i x_ij [ y_i - mu_i + h_i (0.5 - mu_i) ],    h = diag( W^{1/2} X (X'WX)^-1 X' W^{1/2} )
+//
+// which stays finite because the h_i(0.5 - mu_i) term pulls the fitted probabilities back off 0 and 1.
+// The estimate is also first-order unbiased, which ordinary ML is not at small counts.
+//
+// This is used ONLY for the reported effect size when ML fails. The p-value stays the score test's,
+// which needs no alternative fit at all.
+bool firth_logistic(const std::vector<double>& X, const std::vector<double>& y, std::size_t n,
+                    std::size_t p, std::vector<double>& beta, std::vector<double>& inv) {
+    beta.assign(p, 0.0);
+    inv.clear();
+    std::vector<double> mu(n), w(n);
+    for (int iter = 0; iter < 200; ++iter) {
+        std::vector<double> XtWX(p * p, 0.0);
+        for (std::size_t i = 0; i < n; ++i) {
+            double eta = 0.0;
+            for (std::size_t a = 0; a < p; ++a) eta += X[i * p + a] * beta[a];
+            mu[i] = 1.0 / (1.0 + std::exp(-eta));
+            w[i] = std::max(mu[i] * (1.0 - mu[i]), 1e-10);
+            for (std::size_t a = 0; a < p; ++a)
+                for (std::size_t b = a; b < p; ++b) XtWX[a * p + b] += X[i * p + a] * w[i] * X[i * p + b];
+        }
+        for (std::size_t a = 0; a < p; ++a) for (std::size_t b = 0; b < a; ++b) XtWX[a * p + b] = XtWX[b * p + a];
+        std::vector<double> unit(p, 0.0), sol;
+        if (!solve_and_invert(XtWX, unit, p, sol, inv)) return false;
+        if (inv.size() != p * p) return false;
+        // leverages h_i = w_i * x_i' (X'WX)^-1 x_i
+        std::vector<double> Ustar(p, 0.0);
+        for (std::size_t i = 0; i < n; ++i) {
+            double h = 0.0;
+            for (std::size_t a = 0; a < p; ++a) {
+                double t = 0.0;
+                for (std::size_t b = 0; b < p; ++b) t += inv[a * p + b] * X[i * p + b];
+                h += X[i * p + a] * t;
+            }
+            h *= w[i];
+            const double resid = (y[i] - mu[i]) + h * (0.5 - mu[i]);
+            for (std::size_t a = 0; a < p; ++a) Ustar[a] += X[i * p + a] * resid;
+        }
+        double step = 0.0;
+        for (std::size_t a = 0; a < p; ++a) {
+            double d = 0.0;
+            for (std::size_t b = 0; b < p; ++b) d += inv[a * p + b] * Ustar[b];
+            // Half-step when the move is large: the penalised likelihood is well behaved but a raw
+            // Newton step can still overshoot from a cold start.
+            if (d > 5.0) d = 5.0;
+            if (d < -5.0) d = -5.0;
+            beta[a] += d;
+            step += std::fabs(d);
+        }
+        if (step < 1e-10) return true;
+    }
+    return false;   // did not settle even with the penalty
+}
+
 // Rao score test on the genotype column, evaluated under the NULL fit (covariates only, genotype
 // coefficient fixed at zero).
 //
@@ -256,8 +318,130 @@ bool logistic_irls(const std::vector<double>& X, const std::vector<double>& y, s
 //
 // The genotype column is dropped from the design to form the null, which also means each feature gets
 // its own null fit -- correct rather than wasteful, since each has its own complete-case sample set.
+// ---- Saddlepoint approximation for the binary score statistic (Dey et al. fastSPA; SAIGE) --------
+//
+// The score S = sum_i Gt_i (y_i - mu_i) is a sum of INDEPENDENT bounded terms, so its cumulant
+// generating function is available in closed form -- no approximation needed:
+//
+//   K(t)   = sum_i [ log(1 - mu_i + mu_i e^{t Gt_i}) - t Gt_i mu_i ]
+//   K'(t)  = sum_i [ Gt_i mu_i e^{t Gt_i} / (1 - mu_i + mu_i e^{t Gt_i}) - Gt_i mu_i ]
+//   K''(t) = sum_i [ Gt_i^2 mu_i (1-mu_i) e^{t Gt_i} / (1 - mu_i + mu_i e^{t Gt_i})^2 ]
+//
+// The normal approximation matches only the first two cumulants, which is why it drifts in the far tail
+// exactly when the terms are skewed -- a rare variant under case/control imbalance. The saddlepoint
+// expands about the point where the tilted distribution is centred on the observed value, so it stays
+// accurate out where a regional Bonferroni threshold actually sits.
+struct SpaCgf {
+    const std::vector<double>* gt;
+    const std::vector<double>* mu;
+};
+
+double spa_K(double t, const SpaCgf& c) {
+    double k = 0.0;
+    for (std::size_t i = 0; i < c.gt->size(); ++i) {
+        const double g = (*c.gt)[i], m = (*c.mu)[i];
+        if (g == 0.0) continue;
+        const double e = std::exp(t * g);
+        k += std::log1p(m * (e - 1.0)) - t * g * m;
+    }
+    return k;
+}
+
+// First and second derivatives together: the saddlepoint solve needs both at every step.
+void spa_K12(double t, const SpaCgf& c, double& k1, double& k2) {
+    k1 = 0.0; k2 = 0.0;
+    for (std::size_t i = 0; i < c.gt->size(); ++i) {
+        const double g = (*c.gt)[i], m = (*c.mu)[i];
+        if (g == 0.0) continue;
+        const double e = std::exp(t * g);
+        const double d = 1.0 + m * (e - 1.0);               // 1 - mu + mu e^{tg}
+        const double q = m * e / d;                          // tilted mean of y_i
+        k1 += g * (q - m);
+        k2 += g * g * q * (1.0 - q);
+    }
+}
+
+// Solve K'(zeta) = s. K' is strictly increasing, so bracket then bisect with a Newton step where it is
+// safe -- robust matters more than fast here, and it runs once per tail per feature.
+bool spa_root(double s, const SpaCgf& c, double& zeta) {
+    double k1 = 0.0, k2 = 0.0;
+    spa_K12(0.0, c, k1, k2);
+    if (!(k2 > 0.0)) return false;
+    double lo = 0.0, hi = 0.0;
+    const double step = (s > k1) ? 1.0 : -1.0;
+    double t = 0.0;
+    for (int it = 0; it < 200; ++it) {
+        t += step * (0.05 + 0.5 * std::fabs(t));
+        spa_K12(t, c, k1, k2);
+        if (!std::isfinite(k1)) return false;
+        if ((step > 0.0 && k1 >= s) || (step < 0.0 && k1 <= s)) { lo = std::min(0.0, t); hi = std::max(0.0, t); break; }
+        if (it == 199) return false;
+    }
+    if (lo == hi) return false;
+    for (int it = 0; it < 200; ++it) {
+        const double mid = 0.5 * (lo + hi);
+        spa_K12(mid, c, k1, k2);
+        if (!std::isfinite(k1)) return false;
+        if (k1 < s) lo = mid; else hi = mid;
+        if (hi - lo < 1e-12 * std::max(1.0, std::fabs(mid))) break;
+    }
+    zeta = 0.5 * (lo + hi);
+    // A saddlepoint this far out means the search ran to the support boundary rather than a genuine
+    // interior root; the expansion is not valid there.
+    return std::isfinite(zeta) && std::fabs(zeta) < 50.0;
+}
+
+// The FAR tail at s, by Lugannani-Rice: P(S >= s) when the saddlepoint is positive, P(S <= s) when it
+// is negative. Each side is evaluated in the form that is numerically stable there -- the survival
+// function above the mean, the distribution function below it -- rather than one of them by subtraction.
+double spa_far_tail(double s, const SpaCgf& c) {
+    double zeta = 0.0;
+    if (!spa_root(s, c, zeta)) return kNaN;
+    if (std::fabs(zeta) < 1e-10) return 0.5;
+    double k1 = 0.0, k2 = 0.0;
+    spa_K12(zeta, c, k1, k2);
+    if (!(k2 > 0.0)) return kNaN;
+    const double arg = 2.0 * (zeta * s - spa_K(zeta, c));
+    if (!(arg > 0.0)) return kNaN;
+    const double w = (zeta > 0.0 ? 1.0 : -1.0) * std::sqrt(arg);
+    const double v = zeta * std::sqrt(k2);                  // shares the sign of zeta
+    if (!(std::fabs(w) > 1e-8) || !(std::fabs(v) > 1e-12)) return kNaN;
+    const double pdf = std::exp(-0.5 * w * w) / std::sqrt(2.0 * M_PI);
+    const double corr = pdf * (1.0 / w - 1.0 / v);
+    // Phi(w) via erfc keeps both tails accurate without cancellation.
+    const double t = (zeta > 0.0) ? (0.5 * std::erfc(w / std::sqrt(2.0)) - corr)   // P(S >= s)
+                                  : (0.5 * std::erfc(-w / std::sqrt(2.0)) + corr); // P(S <= s)
+    if (!std::isfinite(t)) return kNaN;
+    return std::min(1.0, std::max(0.0, t));
+}
+
+// Two-sided p for the observed score. The score's distribution is NOT symmetric under case/control
+// imbalance, so both tails are computed rather than one doubled.
+double spa_two_sided(double s, const std::vector<double>& gt, const std::vector<double>& mu) {
+    // S is a bounded sum, and at (or beyond) the edge of its support the saddlepoint is at infinity:
+    // K'(t) approaches the boundary asymptotically, so a root search finds a spurious "root" far out
+    // and Lugannani-Rice degenerates -- it returned 1 for a perfectly separating feature whose exact
+    // two-sided p is 2*0.5^12. Decline there and let the caller keep the normal tail.
+    double smax = 0.0, smin = 0.0;
+    for (std::size_t i = 0; i < gt.size(); ++i) {
+        const double a = gt[i] * (1.0 - mu[i]), b = gt[i] * (0.0 - mu[i]);
+        smax += std::max(a, b);
+        smin += std::min(a, b);
+    }
+    const double span = smax - smin;
+    if (!(span > 0.0)) return kNaN;
+    if (std::fabs(s) >= smax - 1e-8 * span || -std::fabs(s) <= smin + 1e-8 * span) return kNaN;
+    const SpaCgf c{&gt, &mu};
+    const double up = spa_far_tail(std::fabs(s), c);    // P(S >= |s|)
+    const double dn = spa_far_tail(-std::fabs(s), c);   // P(S <= -|s|)
+    if (!std::isfinite(up) || !std::isfinite(dn)) return kNaN;
+    const double p = up + dn;
+    if (!std::isfinite(p) || p <= 0.0) return kNaN;
+    return std::min(1.0, p);
+}
+
 FitResult score_logistic(const std::vector<double>& X, const std::vector<double>& y,
-                         std::size_t n, std::size_t p) {
+                         std::size_t n, std::size_t p, double spa_cutoff = 2.0) {
     FitResult r;
     if (p < 2 || n <= p + 1) return r;
     const std::size_t p0 = p - 1;
@@ -289,6 +473,26 @@ FitResult score_logistic(const std::vector<double>& X, const std::vector<double>
     r.z = (U >= 0.0 ? 1.0 : -1.0) * std::sqrt(chi2);
     r.p = wald_p(r.z);                                       // chi2 on 1 df is the squared normal
     r.ok = std::isfinite(r.p);
+
+    // Past the cutoff, replace the normal tail with the saddlepoint. Below it the two agree to well
+    // within printing precision and the normal is far cheaper, which is the same gate SAIGE uses.
+    if (spa_cutoff > 0.0 && std::fabs(r.z) > spa_cutoff) {
+        // Covariate-adjusted genotype: Gt = g - X0 (X0'W X0)^-1 X0'W g. The score is Gt'(y - mu), and
+        // its terms are independent, which is what makes the exact CGF above available.
+        std::vector<double> bproj(p0, 0.0);
+        for (std::size_t a = 0; a < p0; ++a)
+            for (std::size_t b = 0; b < p0; ++b) bproj[a] += inv0[a * p0 + b] * gWX[b];
+        std::vector<double> gt(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            double fit = 0.0;
+            for (std::size_t a = 0; a < p0; ++a) fit += X0[i * p0 + a] * bproj[a];
+            gt[i] = g[i] - fit;
+        }
+        double S = 0.0;
+        for (std::size_t i = 0; i < n; ++i) S += gt[i] * (y[i] - mu[i]);
+        const double ps = spa_two_sided(S, gt, mu);
+        if (std::isfinite(ps) && ps > 0.0) { r.p = std::max(ps, 1e-300); r.spa = true; }
+    }
     return r;
 }
 
@@ -370,13 +574,21 @@ double lmm_reml_obj(const LmmNull& m, double delta) {
     const Eigen::MatrixXd Xw = m.UtX.array().colwise() * w;   // row i scaled by w_i
     const Eigen::MatrixXd A = m.UtX.transpose() * Xw;         // q x q
     const Eigen::VectorXd b = Xw.transpose() * m.Uty;         // q
-    const Eigen::VectorXd beta = A.ldlt().solve(b);
+    // One CHECKED factorisation serves both the solve and the log-determinant. A raw determinant
+    // underflows to zero for a moderately sized q and then log() of it is meaningless; taking it from
+    // the factor's diagonal is exact and also tells us the design was singular in the first place.
+    const Eigen::LDLT<Eigen::MatrixXd> ldlt(A);
+    if (ldlt.info() != Eigen::Success || !ldlt.isPositive())
+        return std::numeric_limits<double>::infinity();
+    const Eigen::VectorXd beta = ldlt.solve(b);
     const Eigen::VectorXd resid = m.Uty - m.UtX * beta;
     const double rss = (resid.array().square() * w).sum();
     const double sigma2 = rss / static_cast<double>(n - q);
     if (!(sigma2 > 0.0)) return std::numeric_limits<double>::infinity();
     const double logdetV = (m.d.array() + delta).log().sum();
-    const double logdetA = std::log(std::max(A.determinant(), 1e-300));
+    const Eigen::ArrayXd dA = ldlt.vectorD().array();
+    if ((dA <= 0.0).any()) return std::numeric_limits<double>::infinity();
+    const double logdetA = dA.log().sum();
     return static_cast<double>(n - q) * std::log(sigma2) + logdetV + logdetA;
 }
 
@@ -413,17 +625,29 @@ FitResult lmm_test(const LmmNull& m, const Eigen::VectorXd& g) {
     const Eigen::MatrixXd Xw = X.array().colwise() * w;
     const Eigen::MatrixXd A = X.transpose() * Xw;            // (q+1) x (q+1)
     const Eigen::VectorXd b = Xw.transpose() * m.Uty;
-    const Eigen::MatrixXd Ainv = A.inverse();
-    const Eigen::VectorXd beta = Ainv * b;
+    // Checked LDLT rather than a raw inverse: a singular or near-singular design (a collinear
+    // covariate, a monomorphic genotype after rotation) silently produced garbage through .inverse(),
+    // where the factorisation reports it. Only the (q,q) entry of A^-1 is needed for the standard
+    // error, so it comes from solving against the last unit vector.
+    const Eigen::LDLT<Eigen::MatrixXd> ldlt(A);
+    if (ldlt.info() != Eigen::Success || !ldlt.isPositive()) return r;
+    const Eigen::ArrayXd dA = ldlt.vectorD().array();
+    if ((dA <= 0.0).any()) return r;
+    const Eigen::VectorXd beta = ldlt.solve(b);
+    Eigen::VectorXd e = Eigen::VectorXd::Zero(q + 1);
+    e(q) = 1.0;
+    const double Ainv_qq = ldlt.solve(e)(q);
     const Eigen::VectorXd resid = m.Uty - X * beta;
     const double rss = (resid.array().square() * w).sum();
     const double sigma2 = rss / static_cast<double>(n - (q + 1));
-    const double var_b = sigma2 * Ainv(q, q);
-    if (!(var_b > 0.0)) return r;
+    const double var_b = sigma2 * Ainv_qq;
+    if (!(var_b > 0.0) || !std::isfinite(var_b)) return r;
     r.beta = beta(q);
     r.se = std::sqrt(var_b);
     r.z = r.beta / r.se;
-    r.p = wald_p(r.z);
+    // Same reasoning as the ordinary linear model: sigma^2 comes from the same residuals, so the tail
+    // is Student-t on n - (q+1) degrees of freedom.
+    r.p = student_p(r.z, static_cast<double>(n - (q + 1)));
     r.ok = std::isfinite(r.p);
     return r;
 }
@@ -829,6 +1053,10 @@ int run_associate_command(const std::vector<std::string>& args) {
         // the score test's p remains valid -- the score test never fits the alternative. Reporting the
         // p without saying the effect size is missing for a REASON is what makes that confusing.
         std::string effect_status = "ok";
+        // Which tail produced `p`: "t" (Student-t, quantitative), "score" (Rao score, normal tail),
+        // "score_spa" (score with the saddlepoint), "lmm". Worth naming per feature because the score
+        // test only switches to the saddlepoint past a |z| cutoff, so a table mixes both.
+        std::string p_method = "t";
         // Binary traits: the minor-allele carrier count split by case/control. Total MAC hides what
         // actually governs asymptotic reliability -- 1 case / 19 controls is far weaker than 10 / 10 at
         // the same MAC, and it is the imbalanced one that drives a score statistic into its bad tail.
@@ -904,6 +1132,7 @@ int run_associate_command(const std::vector<std::string>& args) {
 
         FitResult fr;
         std::string row_effect_status = "ok";
+        std::string row_p_method = is_lmm ? "lmm" : "t";
         if (is_lmm) {
             fr = lmm_test(lmm, glmm);
         } else {
@@ -923,16 +1152,30 @@ int run_associate_command(const std::vector<std::string>& args) {
                 // standard error and collapses the statistic.
                 const FitResult sc = score_logistic(X, yy, n, p_dim);
                 if (sc.ok) {
-                    if (!fr.ok) { fr.beta = kNaN; fr.se = kNaN; separated = true; }
+                    if (!fr.ok) {
+                        // ML diverged. Recover a finite effect size with Firth's penalised likelihood
+                        // rather than reporting none; the p-value stays the score test's either way.
+                        std::vector<double> fb, finv;
+                        if (firth_logistic(X, yy, n, p_dim, fb, finv) && finv.size() == p_dim * p_dim &&
+                            finv[1 * p_dim + 1] > 0.0) {
+                            fr.beta = fb[1];
+                            fr.se = std::sqrt(finv[1 * p_dim + 1]);
+                        } else {
+                            fr.beta = kNaN; fr.se = kNaN;
+                        }
+                        separated = true;
+                    }
                     fr.z = sc.z; fr.p = sc.p; fr.ok = true;
                 }
                 if (separated) row_effect_status = "separation";
+                row_p_method = sc.spa ? "score_spa" : "score";
             }
         }
         if (!fr.ok) { ++n_dropped_fit; continue; }
 
         Row row;
         row.effect_status = row_effect_status;
+        row.p_method = row_p_method;
         row.id = id;
         std::string ann_gene;
         if (auto it = annot.find(id); it != annot.end()) {
@@ -1000,6 +1243,7 @@ int run_associate_command(const std::vector<std::string>& args) {
     // mode: Meff = number of distinct bubbles the features map to (the correlated block). Bonferroni then
     // uses Meff; BH-FDR stays the primary control. See docs/algorithms/associate.md.
     std::size_t meff = n_tests;
+    std::size_t meff_clump = 0, meff_eigen = 0;   // clumping heuristic vs the phenotype-blind estimate
     if (variant_mode && n_tests > 0) {
         std::vector<std::size_t> byp(n_tests);
         std::iota(byp.begin(), byp.end(), 0);
@@ -1035,7 +1279,43 @@ int run_associate_command(const std::vector<std::string>& args) {
             rows[i].clump = next_clump++;
             rows[i].is_lead = 1;
         }
-        meff = static_cast<std::size_t>(std::max(1, next_clump));
+        meff_clump = static_cast<std::size_t>(std::max(1, next_clump));
+        // Phenotype-blind effective tests (Li & Ji 2005): eigenvalues of the genotype CORRELATION
+        // matrix, Meff = sum_i [ I(lambda_i >= 1) + frac(lambda_i) ]. Clumping is seeded in p-value
+        // order, so the phenotype changes how many clumps there are -- a chain A-B-C with A,C
+        // uncorrelated gives one clump seeded at B and two seeded at A. This estimator never looks at
+        // the phenotype, so the regional threshold it implies cannot be circular.
+        if (n_tests >= 2) {
+            Eigen::MatrixXd C(n_tests, n_tests);
+            std::vector<double> mean(n_tests, 0.0), sd(n_tests, 0.0);
+            for (std::size_t i = 0; i < n_tests; ++i) {
+                const Eigen::VectorXd& v = var_dose[i];
+                mean[i] = v.mean();
+                sd[i] = std::sqrt((v.array() - mean[i]).square().sum() / std::max<double>(1.0, v.size() - 1));
+            }
+            bool usable = true;
+            for (std::size_t i = 0; i < n_tests && usable; ++i) if (!(sd[i] > 0.0)) usable = false;
+            if (usable) {
+                for (std::size_t i = 0; i < n_tests; ++i)
+                    for (std::size_t j = i; j < n_tests; ++j) {
+                        const double cij = ((var_dose[i].array() - mean[i]) *
+                                            (var_dose[j].array() - mean[j])).sum() /
+                                           (std::max<double>(1.0, var_dose[i].size() - 1) * sd[i] * sd[j]);
+                        C(static_cast<Eigen::Index>(i), static_cast<Eigen::Index>(j)) = cij;
+                        C(static_cast<Eigen::Index>(j), static_cast<Eigen::Index>(i)) = cij;
+                    }
+                Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(C, Eigen::EigenvaluesOnly);
+                if (es.info() == Eigen::Success) {
+                    double m = 0.0;
+                    for (Eigen::Index k = 0; k < es.eigenvalues().size(); ++k) {
+                        const double lam = std::max(0.0, es.eigenvalues()(k));
+                        m += (lam >= 1.0 ? 1.0 : 0.0) + (lam - std::floor(lam));
+                    }
+                    meff_eigen = std::min<std::size_t>(n_tests, std::max<std::size_t>(1, static_cast<std::size_t>(std::ceil(m))));
+                }
+            }
+        }
+        meff = meff_eigen > 0 ? meff_eigen : meff_clump;
     } else if (n_tests > 0) {
         // Same rule as the variant tier: a tested feature must count. A feature with no bubble
         // annotation belongs to no block, and skipping it made Meff smaller than the number of tests
@@ -1250,7 +1530,7 @@ int run_associate_command(const std::vector<std::string>& args) {
         // seeded in p-value order and therefore depends on the phenotype -- it is not a phenotype-blind
         // effective-test count and gives no formal family-wise guarantee. q_bh is the primary control.
         out << "feature_id\tlayer\tbubbles\tnodes\tn\tn_conditional\tminor_freq\t" << effect
-            << "\tse\tz\tp\teffect_status\tmac_case\tmac_ctrl\tp_bonf\tp_bonf_meff\tq_bh\taf\tan\tlow_af\tclump\tis_lead\tgene"
+            << "\tse\tz\tp\tp_method\teffect_status\tmac_case\tmac_ctrl\tp_bonf\tp_bonf_meff\tq_bh\taf\tan\tlow_af\tclump\tis_lead\tgene"
                "\tp_conditional\tcond_role\n";
         for (std::size_t k = 0; k < n_tests; ++k) {
             const std::size_t i = order[k];
@@ -1260,7 +1540,7 @@ int run_associate_command(const std::vector<std::string>& args) {
             out << r.id << '\t' << r.layer << '\t' << r.bubbles << '\t' << r.nodes << '\t'
                 << r.n << '\t' << (n_cond[i] ? std::to_string(n_cond[i]) : std::string("."))
                 << '\t' << fmt(r.minor_freq) << '\t' << fmt(r.beta) << '\t' << fmt(r.se)
-                << '\t' << fmt(r.z) << '\t' << fmt(r.p) << '\t' << r.effect_status
+                << '\t' << fmt(r.z) << '\t' << fmt(r.p) << '\t' << r.p_method << '\t' << r.effect_status
                 << '\t' << (r.mac_case < 0 ? std::string(".") : std::to_string(r.mac_case))
                 << '\t' << (r.mac_ctrl < 0 ? std::string(".") : std::to_string(r.mac_ctrl))
                 << '\t' << fmt(p_bonf) << '\t' << fmt(p_bonf_meff)
@@ -1282,6 +1562,11 @@ int run_associate_command(const std::vector<std::string>& args) {
             << "features_tested\t" << n_tests << '\n'
             << "unit\t" << (variant_mode ? "variant" : "feature") << '\n'
             << "meff\t" << meff << '\n'
+            << "meff_method\t" << (meff_eigen > 0 ? "eigenvalue (Li-Ji, phenotype-blind)"
+                                                   : (variant_mode ? "ld_clumping (heuristic)" : "bubbles"))
+               << '\n'
+            << "meff_eigen\t" << (meff_eigen > 0 ? std::to_string(meff_eigen) : std::string("NA")) << '\n'
+            << "meff_ld_clumping\t" << (meff_clump > 0 ? std::to_string(meff_clump) : std::string("NA")) << '\n'
             << (variant_mode ? "independent_variants\t" : "distinct_bubbles\t") << meff << '\n'
             << "dropped_min_maf\t" << n_dropped_maf << '\n'
             << "dropped_fit\t" << n_dropped_fit << '\n'
