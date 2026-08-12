@@ -85,9 +85,12 @@ std::vector<PathStep> parse_w_steps(const std::string& walk) {
     return steps;
 }
 
+// `*` on an L line means the overlap is UNKNOWN, not that it is zero. Reporting it as 0 lets a caller
+// that concatenates segments believe it verified something it did not, so it is distinguished here and
+// consumers decide: -1 = unknown.
 int parse_overlap(const std::string& field) {
     if (field == "*") {
-        return 0;
+        return -1;
     }
     if (!field.empty() && field.back() == 'M') {
         return std::stoi(field.substr(0, field.size() - 1));

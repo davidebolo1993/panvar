@@ -143,14 +143,21 @@ int run_rebuild_command(const std::vector<std::string>& args) {
         // Acceptance proves FIDELITY -- that every haplotype came back within the bounds. It does not
         // prove the graph got less tangled, which is the reason for rebuilding in the first place, so
         // report the before/after on the same per-handle measure and let the reader judge.
-        const bool better = s.out_hubs <= s.raw_hubs && s.out_maxdeg <= s.raw_maxdeg;
+        // At least one metric must strictly improve and none may worsen. `<=` alone called an entirely
+        // unchanged graph "untangled", which is the one thing the word must not mean.
+        const bool no_worse = s.out_hubs <= s.raw_hubs && s.out_maxdeg <= s.raw_maxdeg &&
+                              s.out_selfloops <= s.raw_selfloops;
+        const bool strictly_better = s.out_hubs < s.raw_hubs || s.out_maxdeg < s.raw_maxdeg ||
+                                     s.out_selfloops < s.raw_selfloops;
+        const bool better = no_worse && strictly_better;
         log.info(std::string("structure: hubs ") + std::to_string(s.raw_hubs) + " -> " +
                  std::to_string(s.out_hubs) + ", max handle degree " + std::to_string(s.raw_maxdeg) +
                  " -> " + std::to_string(s.out_maxdeg) + ", self-loops " +
                  std::to_string(s.raw_selfloops) + " -> " + std::to_string(s.out_selfloops) +
                  (better ? " (untangled)"
-                         : " (NOT untangled -- the rebuild preserved the haplotypes but did not "
-                           "simplify the graph)"));
+                         : (no_worse ? " (unchanged -- the rebuild preserved the haplotypes but did not "
+                                       "simplify the graph)"
+                                     : " (NOT untangled -- some structure measure got worse)")));
     } else {
         log.info("rejected: the rebuild would have been " + std::to_string(s.raw_nodes) + " -> " +
                  std::to_string(s.out_nodes) + " nodes, but " + s.reject_reason +

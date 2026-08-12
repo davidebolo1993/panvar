@@ -106,10 +106,12 @@ void validate_input(const Graph& g) {
         for (const std::vector<Neighbor>* side : {&kv.second.start, &kv.second.end})
             for (const Neighbor& n : *side)
                 if (n.overlap != 0)
-                    throw std::runtime_error("rebuild: link " + kv.first + " -- " + n.node_id +
-                                             " has a non-zero overlap (" + std::to_string(n.overlap) +
-                                             "M); rebuild spells paths by concatenation and does not "
-                                             "support overlaps");
+                    throw std::runtime_error(
+                        "rebuild: link " + kv.first + " -- " + n.node_id +
+                        (n.overlap < 0 ? std::string(" has an UNKNOWN overlap ('*')")
+                                       : " has a non-zero overlap (" + std::to_string(n.overlap) + "M)") +
+                        "; rebuild spells paths by concatenation, which is only correct when every "
+                        "overlap is a verified 0M");
     }
 }
 
@@ -314,6 +316,14 @@ private:
 std::string fmt2(double v) {
     char b[32];
     std::snprintf(b, sizeof(b), "%.4f", v);
+    return b;
+}
+
+// Enough digits to reproduce the decision. The four-decimal form printed a --min-recovered-identity of
+// 0.999999 as "1.0000", so the audit could not be used to check why a path was rejected.
+std::string fmt_exact(double v) {
+    char b[40];
+    std::snprintf(b, sizeof(b), "%.10g", v);
     return b;
 }
 
@@ -812,11 +822,17 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
                 }
                 // The global verdict belongs beside the per-path rows, or a reader has to reconstruct
                 // it from them and guess which bound applied.
-                a << "#verdict\t" << (sum.accepted ? "accepted" : "rejected") << '\n';
+                // What was DONE with the output, not just whether the contract held: --allow-loss emits
+                // the rebuilt graph, and recording that as "rejected" described the opposite of what is
+                // on disk.
+                a << "#verdict\t"
+                  << (sum.accepted ? "accepted"
+                                   : (options.allow_loss ? "accepted_with_override" : "rejected"))
+                  << '\n';
                 a << "#reason\t" << (sum.reject_reason.empty() ? std::string("-") : sum.reject_reason)
                   << '\n';
-                a << "#min_recovered_identity\t" << fmt2(options.min_recovered_identity) << '\n';
-                a << "#min_matched_cover\t" << fmt2(options.min_matched_cover) << '\n';
+                a << "#min_recovered_identity\t" << fmt_exact(options.min_recovered_identity) << '\n';
+                a << "#min_matched_cover\t" << fmt_exact(options.min_matched_cover) << '\n';
                 a << "#dangling_walks\t" << sum.dangling_steps << '\n';
                 a.flush();
                 if (!a) throw std::runtime_error("rebuild: failed writing audit " + audit_staged.string());
@@ -848,7 +864,8 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
         // measured per end made the before/after numbers describe different quantities, so any claim
         // that rebuilding reduced tangling was comparing two different rulers.
         std::vector<std::array<std::unordered_set<std::uint32_t>, 2>> hs(out->n_seg);
-        std::size_t edges = 0, loops = 0;
+        std::vector<char> has_loop(out->n_seg, 0);   // NODES with a self-loop, as the input side counts
+        std::size_t edges = 0;
         for (std::uint64_t k = 0; k < out->n_arc; ++k) {
             const gfa_arc_t& a = out->arc[k];
             if (a.del || a.comp) continue;
@@ -856,14 +873,14 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
             const std::uint32_t v = static_cast<std::uint32_t>(a.v_lv >> 32);   // oriented vertex
             const std::uint32_t w = a.w;
             const std::uint32_t vs = v >> 1, ws = w >> 1;
-            if (vs == ws) { ++loops; continue; }
+            if (vs == ws) { has_loop[vs] = 1; continue; }
             // v is left by its end when forward, by its start when reverse; w is entered at its start
             // when forward, at its end when reverse.
             hs[vs][(v & 1) ? 0 : 1].insert(ws);
             hs[ws][(w & 1) ? 1 : 0].insert(vs);
         }
         sum.out_edges = edges;
-        sum.out_selfloops = loops;
+        sum.out_selfloops = static_cast<std::size_t>(std::count(has_loop.begin(), has_loop.end(), 1));
         for (const auto& h : hs) {
             const std::size_t deg = std::max(h[0].size(), h[1].size());
             sum.out_maxdeg = std::max(sum.out_maxdeg, deg);

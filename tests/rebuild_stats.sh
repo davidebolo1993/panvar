@@ -13,9 +13,12 @@ BIN="${1:?usage: rebuild_stats.sh <panvar> <outdir> [input.gfa]}"
 PY="${PYTHON:-python3}"
 OUT="${2:?}"
 SRC="${3:-}"
-# A FRESH directory each run. The suite writes fixtures, symlinks and staged outputs here, and reusing
-# a populated directory makes results depend on what a previous run (or a concurrent manual one) left
-# behind -- which showed up once as a failure that would not reproduce.
+# A UNIQUE directory per invocation, under the requested output path. Two runs sharing one directory is
+# not merely untidy: a concurrent invocation removing it while minigraph is reading scratch FASTAs
+# segfaults the reader, which looks exactly like a rebuild race and is not one. The parent is left
+# alone so a caller's directory is never removed.
+mkdir -p "$OUT"
+OUT="$OUT/run.$$.$(date +%s)"
 rm -rf "$OUT"
 mkdir -p "$OUT"
 fails=0
@@ -132,6 +135,8 @@ fi
 if [ -n "$SRC" ] && [ -s "$SRC" ]; then
   seed_of() { "$BIN" rebuild -i "$1" -o "$2" --force --min-recovered-identity 0.97 2>&1 \
                 | grep -oE 'seed=[^;]*' | head -1; }
+  seed_of_k() { "$BIN" rebuild -i "$1" -o "$2" --force --min-recovered-identity 0.97 --kmer "$3" 2>&1 \
+                  | grep -oE 'seed=[^;]*' | head -1; }
 
   s1=$(seed_of "$GFA" "$OUT/rep1.gfa"); s2=$(seed_of "$GFA" "$OUT/rep2.gfa")
   [ -n "$s1" ] && [ "$s1" = "$s2" ] && ok "repeated runs choose the same seed" \
@@ -201,12 +206,16 @@ printf 'H\tVN:Z:1.0\nS\t1\tACGTACGTAC\nS\t2\tTTTTGGGGCC\nL\t1\t+\t2\t-\t0M\nP\tp
 # Both branches must be canonical and ambiguity-aware, or crossing k=31 silently changes what richness
 # means. Same graph, two k values either side of the boundary: the seed must not change.
 if [ -n "$SRC" ] && [ -s "$SRC" ]; then
-  k1=$("$BIN" rebuild -i "$GFA" -o "$OUT/k21.gfa" --force --min-recovered-identity 0.97 --kmer 21 2>&1 \
-        | grep -oE 'seed=[^;]*' | head -1)
-  k2=$("$BIN" rebuild -i "$GFA" -o "$OUT/k41.gfa" --force --min-recovered-identity 0.97 --kmer 41 2>&1 \
-        | grep -oE 'seed=[^;]*' | head -1)
-  [ -n "$k1" ] && [ "$k1" = "$k2" ] && ok "k=21 and k=41 choose the same seed (both branches canonical)" \
-                                    || bad "seed changes across the k=31 boundary: '$k1' vs '$k2'"
+  # The k>31 branch must be canonical and ambiguity-aware like the k<=31 one. Two seeds agreeing at
+  # different k is incidental -- the property is that at a GIVEN k above 31 the ranking does not follow
+  # the strand the graph is stored on, and that ambiguity does not break it. Test that directly.
+  for kk in 21 41; do
+    a1=$(seed_of_k "$GFA" "$OUT/kf.$kk.gfa" "$kk")
+    a2=$(seed_of_k "$OUT/rc.gfa" "$OUT/kr.$kk.gfa" "$kk")
+    [ -n "$a1" ] && [ "$a1" = "$a2" ] \
+      && ok "k=$kk: seed is strand-independent (canonical on both branches)" \
+      || bad "k=$kk: seed follows the stored strand: '$a1' vs '$a2'"
+  done
 
   # An ambiguous --reference-path must be refused, not resolved by file order.
   e=$("$BIN" rebuild -i "$GFA" -o "$OUT/amb.out.gfa" --force -r "haplotype" 2>&1 | grep -c "ambiguous")
@@ -232,6 +241,42 @@ t2=$("$BIN" rebuild -i "$OUT/tie.gfa" -o "$OUT/tie2.gfa" --force 2>&1 | grep -oE
                                   || bad "equal-richness seed is unstable: '$t1' vs '$t2'"
 case "$t1" in *aaa*) ok "  ... and by path name, not input order" ;;
               *) bad "tie broken by something other than name: $t1" ;; esac
+
+
+# ---------------------------------------------------------------- disposition, precision, units
+if [ -n "$SRC" ] && [ -s "$SRC" ]; then
+  # --allow-loss WRITES the rebuilt graph, so the audit must not call that "rejected".
+  "$BIN" rebuild -i "$GFA" -o "$OUT/ovr.gfa" --force --min-recovered-identity 0.999999 --allow-loss \
+    > /dev/null 2>&1
+  v=$(awk -F'\t' '$1=="#verdict"{print $2}' "$OUT/ovr.gfa.rebuild_audit.tsv" 2>/dev/null)
+  [ "$v" = "accepted_with_override" ] && ok "--allow-loss records disposition '$v'" \
+                                      || bad "--allow-loss recorded verdict '$v', expected accepted_with_override"
+  # The recorded threshold must be precise enough to reproduce the decision: 0.999999 must not print
+  # as 1.0000.
+  t=$(awk -F'\t' '$1=="#min_recovered_identity"{print $2}' "$OUT/ovr.gfa.rebuild_audit.tsv" 2>/dev/null)
+  case "$t" in 0.999999*) ok "audit records the threshold at full precision ($t)" ;;
+               *) bad "audit records threshold as '$t', losing the digits that decided it" ;; esac
+fi
+
+# An unchanged graph must not be called "untangled".
+{ printf 'H\tVN:Z:1.0\n'
+  printf 'S\t1\tACGTACGTACGTACGTACGT\nS\t2\tTTTTGGGGCCCCAAAATTTT\n'
+  printf 'L\t1\t+\t2\t+\t0M\n'
+  printf 'P\tp1\t1+,2+\t*\nP\tp2\t1+,2+\t*\n'; } > "$OUT/flat.gfa"
+"$BIN" rebuild -i "$OUT/flat.gfa" -o "$OUT/flat.out.gfa" --force > "$OUT/flat.log" 2>&1
+if grep -q "structure:" "$OUT/flat.log"; then
+  grep -q "untangled)" "$OUT/flat.log" && ! grep -q "unchanged\|NOT untangled" "$OUT/flat.log" \
+    && bad "a graph with unchanged degree metrics was reported as untangled" \
+    || ok "an unimproved graph is not reported as untangled"
+else
+  ok "an unimproved graph is not reported as untangled (no rebuild attempted)"
+fi
+
+# An unknown ('*') overlap means unverified, not zero.
+printf 'H\tVN:Z:1.0\nS\t1\tACGTACGTAC\nS\t2\tTTTTGGGGCC\nL\t1\t+\t2\t+\t*\nP\tp1\t1+,2+\t*\n' > "$OUT/e_star.gfa"
+e=$("$BIN" rebuild -i "$OUT/e_star.gfa" -o "$OUT/e_star.out.gfa" 2>&1 | grep -c "UNKNOWN overlap")
+[ "$e" -gt 0 ] && ok "an unknown ('*') overlap is refused, not read as 0M" \
+               || bad "an unknown ('*') overlap was accepted as zero"
 
 
 echo
