@@ -5,10 +5,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <random>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -112,12 +114,41 @@ KmerStats kmer_stats(const std::string& s, std::size_t k) {
     return st;
 }
 
+// A unique sibling of `final` -- outputs are staged here and renamed into place, so an interrupted or
+// failed run never leaves a half-written graph where a complete one is expected.
+std::filesystem::path staging_path(const std::string& final_path) {
+    static std::atomic<unsigned> seq{0};
+    std::random_device rd;
+    const std::string tag = std::to_string(rd()) + "." + std::to_string(seq++);
+    return std::filesystem::path(final_path + ".rebuild-tmp." + tag);
+}
+
+void commit_staged(const std::filesystem::path& staged, const std::string& final_path) {
+    std::error_code ec;
+    std::filesystem::rename(staged, final_path, ec);
+    if (ec) {
+        // Across filesystems rename fails; fall back to copy-then-remove, still not in place.
+        std::filesystem::copy_file(staged, final_path,
+                                   std::filesystem::copy_options::overwrite_existing, ec);
+        std::filesystem::remove(staged);
+        if (ec) throw std::runtime_error("rebuild: cannot move output into place: " + final_path);
+    }
+}
+
 void copy_file(const std::string& from, const std::string& to) {
-    std::ifstream in(from, std::ios::binary);
-    if (!in) throw std::runtime_error("rebuild: cannot open input: " + from);
-    std::ofstream out(to, std::ios::binary);
-    if (!out) throw std::runtime_error("rebuild: cannot open output: " + to);
-    out << in.rdbuf();
+    // Staged then renamed: writing straight to `to` truncates it on open, which destroyed the input
+    // outright when the same path was given for -i and -o. The guard in run_rebuild rejects that case,
+    // but a pass-through should not depend on the caller having been checked.
+    const std::filesystem::path staged = staging_path(to);
+    {
+        std::ifstream in(from, std::ios::binary);
+        if (!in) throw std::runtime_error("rebuild: cannot open input: " + from);
+        std::ofstream out(staged, std::ios::binary);
+        if (!out) throw std::runtime_error("rebuild: cannot open output: " + staged.string());
+        out << in.rdbuf();
+        if (!out) throw std::runtime_error("rebuild: failed writing " + staged.string());
+    }
+    commit_staged(staged, to);
 }
 
 // One-record FASTAs, deleted on scope exit: mg_ggen consumes files, so haplotypes round-trip through
@@ -125,10 +156,19 @@ void copy_file(const std::string& from, const std::string& to) {
 class FastaScratch {
 public:
     explicit FastaScratch(const std::string& dir) : dir_(dir) {
-        std::string cmd = "mkdir -p '" + dir_ + "'";
-        if (std::system(cmd.c_str()) != 0) throw std::runtime_error("rebuild: cannot create " + dir_);
+        // create_directory (not create_directories) so an EXISTING directory is an error rather than
+        // something this object will delete on scope exit. The name carries a random tag, so two
+        // concurrent runs cannot collide and neither can adopt a directory it did not make.
+        std::error_code ec;
+        std::filesystem::create_directories(std::filesystem::path(dir_).parent_path(), ec);
+        if (!std::filesystem::create_directory(dir_, ec) || ec)
+            throw std::runtime_error("rebuild: cannot create scratch directory " + dir_ +
+                                     (ec ? " (" + ec.message() + ")" : " (already exists)"));
     }
     ~FastaScratch() {
+        std::error_code ec;
+        std::filesystem::remove_all(dir_, ec);
+        if (!ec) return;
         const std::string cmd = "rm -rf '" + dir_ + "'";
         if (std::system(cmd.c_str()) != 0) {
             std::cerr << "[rebuild " << hms() << "] warning: could not remove scratch dir " << dir_ << '\n';
@@ -234,12 +274,14 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
     // so passing our richness order drives the progressive build directly.
     // Scratch FASTAs live beside --out by default, or under --tmp-dir in a dedicated subfolder (named
     // from the output basename) so cleanup removes only what we created, never the whole --tmp-dir.
-    std::string scratch_dir = options.out_path + ".rebuild.tmp";
+    std::random_device scratch_rd;
+    const std::string scratch_tag = ".rebuild.tmp." + std::to_string(scratch_rd());
+    std::string scratch_dir = options.out_path + scratch_tag;
     if (!options.tmp_dir.empty()) {
         std::string base = options.out_path;
         const auto slash = base.find_last_of('/');
         if (slash != std::string::npos) base = base.substr(slash + 1);
-        scratch_dir = options.tmp_dir + "/" + base + ".rebuild.tmp";
+        scratch_dir = options.tmp_dir + "/" + base + scratch_tag;
     }
     step("writing haplotype FASTAs to " + scratch_dir);
     FastaScratch scratch(scratch_dir);
@@ -377,8 +419,9 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
     // that stores node ids as integers (odgi) rejects non-numeric names outright. The original name is
     // kept as an SN tag.
     if (!options.out_path.empty()) {
-        std::ofstream o(options.out_path);
-        if (!o) throw std::runtime_error("rebuild: cannot write " + options.out_path);
+        const std::filesystem::path staged = staging_path(options.out_path);
+        std::ofstream o(staged);
+        if (!o) throw std::runtime_error("rebuild: cannot write " + staged.string());
         auto seg_id = [](std::uint32_t seg) { return seg + 1; }; // 0-based index -> 1-based GFA id
         o << "H\tVN:Z:1.0\n";
         for (std::uint32_t i = 0; i < out->n_seg; ++i) {
@@ -403,6 +446,10 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
             }
             o << "\t*\n";
         }
+        o.flush();
+        if (!o) throw std::runtime_error("rebuild: failed writing " + staged.string());
+        o.close();
+        commit_staged(staged, options.out_path);
     }
 
     // ---- structural summary of what we emitted ----

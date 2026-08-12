@@ -8,6 +8,8 @@
 #include "panvar/cli_utils.hpp"
 #include "panvar/rebuild.hpp"
 
+#include <filesystem>
+
 namespace panvar {
 namespace {
 
@@ -77,6 +79,22 @@ int run_rebuild_command(const std::vector<std::string>& args) {
 
     if (opt.gfa_path.empty()) throw std::runtime_error("Missing required input: --gfa <path>");
     if (opt.out_path.empty()) throw std::runtime_error("Missing required input: --out <path>");
+    // Writing to the input path truncated it on open, so the graph was destroyed before it could be
+    // read -- a healthy pass-through turned a 2 kB file into 0 bytes. Compare the resolved paths, and
+    // also `equivalent` so a symlink or a second mount point to the same file is caught.
+    {
+        std::error_code ec;
+        const std::filesystem::path in_p = std::filesystem::weakly_canonical(opt.gfa_path, ec);
+        const std::filesystem::path out_p = std::filesystem::weakly_canonical(opt.out_path, ec);
+        bool same = (!ec && !in_p.empty() && in_p == out_p);
+        if (!same && std::filesystem::exists(opt.out_path)) {
+            std::error_code eq;
+            same = std::filesystem::equivalent(opt.gfa_path, opt.out_path, eq) && !eq;
+        }
+        if (same)
+            throw std::runtime_error("rebuild: --out is the same file as --gfa (" + opt.out_path +
+                                     "); refusing to overwrite the input");
+    }
     cli::ensure_parent_dir_for_file(opt.out_path);
 
     cli::RunLog log("rebuild", opt.quiet);
