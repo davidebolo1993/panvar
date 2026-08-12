@@ -15,6 +15,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "panvar/align.hpp"
 #include "panvar/gfa.hpp"
 #include "panvar/parallel.hpp"
 
@@ -236,6 +237,12 @@ private:
 
 } // namespace
 
+std::string fmt2(double v) {
+    char b[32];
+    std::snprintf(b, sizeof(b), "%.4f", v);
+    return b;
+}
+
 RebuildSummary rebuild_graph(const RebuildOptions& options) {
     RebuildSummary sum;
     auto step = [&](const std::string& msg) {
@@ -429,7 +436,9 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
     // worker (what makes mg_map re-entrant). Results go to distinct indices, so output is
     // thread-order independent.
     std::vector<std::vector<std::uint32_t>> walks(g.paths.size());
-    std::vector<double> cover(g.paths.size(), 0.0);
+    std::vector<double> cover(g.paths.size(), 0.0);        // envelope (qe-qs)/len
+    std::vector<double> matched(g.paths.size(), 0.0);      // matching bases / len
+    std::vector<double> chain_id(g.paths.size(), 0.0);     // mlen / blen
     {
         std::atomic<std::size_t> next{0};
         std::vector<std::thread> pool;
@@ -451,7 +460,16 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
                         const mg_gchain_t& c = gc->gc[best];
                         walks[h].reserve(static_cast<std::size_t>(c.cnt));
                         for (int32_t j = 0; j < c.cnt; ++j) walks[h].push_back(gc->lc[c.off + j].v);
+                        // Three different questions, previously answered by one number:
+                        //   cover   -- where the alignment begins and ends (the outer envelope)
+                        //   matched -- how much of the query is genuinely aligned (envelope minus gaps)
+                        //   chain_id-- how well it matches where it does align
+                        // A chain spanning the whole query through a large internal gap scores high on
+                        // the first and low on the second, which is exactly the case the envelope hid.
                         cover[h] = static_cast<double>(c.qe - c.qs) / static_cast<double>(q.size());
+                        matched[h] = static_cast<double>(c.mlen) / static_cast<double>(q.size());
+                        chain_id[h] = c.blen > 0 ? static_cast<double>(c.mlen) / static_cast<double>(c.blen)
+                                                 : 0.0;
                     }
                     if (gc != nullptr) mg_gchain_free(gc);
                 }
@@ -461,13 +479,29 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
         for (std::thread& th : pool) th.join();
     }
     mg_idx_destroy(gi);
-    double cover_sum = 0.0;
+    double cover_sum = 0.0, matched_sum = 0.0, chainid_sum = 0.0;
+    double matched_min = 1.0;
+    std::size_t n_recovered = 0;
     for (std::size_t h = 0; h < walks.size(); ++h) {
-        if (!walks[h].empty()) ++sum.paths_recovered;
+        if (!walks[h].empty()) {
+            ++sum.paths_recovered;
+            ++n_recovered;
+            chainid_sum += chain_id[h];
+        }
         cover_sum += cover[h];
+        matched_sum += matched[h];
+        matched_min = std::min(matched_min, matched[h]);
     }
     sum.mean_query_cover =
         g.paths.empty() ? 0.0 : cover_sum / static_cast<double>(g.paths.size());
+    sum.mean_matched_cover =
+        g.paths.empty() ? 0.0 : matched_sum / static_cast<double>(g.paths.size());
+    sum.min_matched_cover = g.paths.empty() ? 0.0 : matched_min;
+    sum.mean_chain_identity = n_recovered ? chainid_sum / static_cast<double>(n_recovered) : 0.0;
+    step("recovered " + std::to_string(sum.paths_recovered) + "/" + std::to_string(g.paths.size()) +
+         " walks; envelope cover " + fmt2(sum.mean_query_cover) + ", matched cover " +
+         fmt2(sum.mean_matched_cover) + " (min " + fmt2(sum.min_matched_cover) + "), chain identity " +
+         fmt2(sum.mean_chain_identity));
 
     // ---- emit plain GFA: S + oriented L + one P per haplotype ----
     // Orientation MUST be carried through: flattening links to +/+ silently destroys every inversion
@@ -507,6 +541,47 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
         if (!o) throw std::runtime_error("rebuild: failed writing " + staged.string());
         o.close();
         commit_staged(staged, options.out_path);
+    }
+
+    // ---- recovered-walk identity: the end-to-end check ----
+    // Re-spell each recovered walk from the REBUILT graph and compare it with the haplotype the input
+    // spelled. Chain coverage and identity describe the alignment; this describes what a caller
+    // actually gets back, so it catches an error anywhere in mapping, chain choice or emission. It is
+    // also the quantity an acceptance threshold has to be stated in.
+    {
+        std::vector<std::string> seg_seq(out->n_seg);
+        for (std::uint32_t i = 0; i < out->n_seg; ++i)
+            seg_seq[i] = out->seg[i].seq ? out->seg[i].seq : std::string();
+        std::vector<double> wid(g.paths.size(), -1.0);
+        run_parallel(g.paths.size(), options.threads, [&](std::size_t h) {
+            if (walks[h].empty() || hseq[h].empty()) return;
+            std::string spelled;
+            for (const std::uint32_t v : walks[h]) {
+                const std::uint32_t seg = v >> 1;
+                if (seg >= seg_seq.size()) return;
+                const std::string& sq = seg_seq[seg];
+                spelled += (v & 1) ? reverse_complement(sq) : sq;
+            }
+            if (spelled.empty()) return;
+            const NwAlign nw = nw_edit_distance(spelled, hseq[h]);
+            wid[h] = nw.aln_len ? std::max(0.0, 1.0 - static_cast<double>(nw.edits) /
+                                                     static_cast<double>(nw.aln_len))
+                                : 0.0;
+        });
+        double wsum = 0.0, wmin = 1.0;
+        std::size_t wn = 0, wpoor = 0;
+        for (const double v : wid) {
+            if (v < 0.0) continue;
+            wsum += v; wmin = std::min(wmin, v); ++wn;
+            if (v < 0.99) ++wpoor;   // the count an acceptance threshold would act on
+        }
+        sum.walks_below_99 = wpoor;
+        sum.walk_identity_checked = wn;
+        sum.mean_walk_identity = wn ? wsum / static_cast<double>(wn) : 0.0;
+        sum.min_walk_identity = wn ? wmin : 0.0;
+        step("recovered-walk identity over " + std::to_string(wn) + " haplotypes: mean " +
+             fmt2(sum.mean_walk_identity) + ", worst " + fmt2(sum.min_walk_identity) + "; " +
+             std::to_string(wpoor) + " below 0.99");
     }
 
     // ---- structural summary of what we emitted ----

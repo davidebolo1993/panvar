@@ -51,4 +51,17 @@ The generator drops an alignment entirely when it is shorter than `--min-align-l
 
 ## Example
 
-`rebuild` runs before `bubble` and only on graphs the gate flags, so it is not part of the main LPA run. The [rebuild section of the walkthrough](../walkthrough.md#rebuild--re-inducing-a-tangled-locus) shows it on MYOM2 (chr8) instead — a tangled locus before and after re-induction. 
+`rebuild` runs before `bubble` and only on graphs the gate flags, so it is not part of the main LPA run. The [rebuild section of the walkthrough](../walkthrough.md#rebuild--re-inducing-a-tangled-locus) shows it on MYOM2 (chr8) instead — a tangled locus before and after re-induction.
+
+## What the coverage numbers mean
+
+Three different questions, which one number used to answer:
+
+| reported | definition | what it detects |
+|----------|------------|-----------------|
+| `envelope cover` | `(qe − qs) / haplotype length` | where the alignment begins and ends — the chain's outer span |
+| `matched cover` | matching bases / haplotype length | how much of the haplotype is **genuinely** aligned; an internal gap shows up here where the envelope hides it |
+| `chain identity` | matches / alignment-block length | how well it matches where it does align |
+| `recovered-walk identity` | edit identity of the walk re-spelled from the **rebuilt** graph against the original haplotype | what a caller actually gets back — an error anywhere in mapping, chain choice or emission |
+
+The distinction is not academic. On the C4 locus (131 haplotypes, forced rebuild) the envelope reads **0.9999** while matched cover is **0.9910** and the worst recovered walk is **0.9740** — so a `98–99%` acceptance threshold read off the envelope would pass a haplotype that comes back 97.4% correct. `recovered-walk identity` is the quantity such a threshold has to be stated in, and the run reports how many haplotypes fall below 0.99.
