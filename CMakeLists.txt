@@ -249,7 +249,9 @@ if(PANVAR_BUILD_TESTING)
                 NAME panvar_rebuild_stats
                 COMMAND /usr/bin/env bash ${PANVAR_REBUILD_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/rebuild_stats ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_data/c4.gfa.gz
             )
-            set_tests_properties(panvar_rebuild_stats PROPERTIES TIMEOUT 180)
+            # Real-data integration: several forced rebuilds of C4 (reproducibility across threads,
+            # k either side of 31, the reference-ambiguity and verdict cases). Minutes, not seconds.
+            set_tests_properties(panvar_rebuild_stats PROPERTIES TIMEOUT 900 LABELS "real")
         endif()
 
         # Real-data integration smoke: the whole bubble -> inspect -> describe -> panphorte

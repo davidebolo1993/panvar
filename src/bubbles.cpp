@@ -1,5 +1,7 @@
 #include "panvar/bubbles.hpp"
 
+#include "panvar/bubble_path.hpp"
+
 #include "panvar/cli_utils.hpp"
 
 #include <algorithm>
@@ -51,9 +53,13 @@ struct EndpointKeyHash {
 
 using CandidateMap = std::unordered_map<EndpointKey, BubbleCandidateIdx, EndpointKeyHash>;
 
-struct PathIndex {
-    std::unordered_map<std::string, std::vector<std::size_t>> positions;
-};
+// The bubble-path index and the walk extraction live in bubble_path.{hpp,cpp} and are what every other
+// module uses. bubbles.cpp used to carry a second, structurally identical index with its own interval
+// search, and the two had drifted: the local one required at least one declared interior node between
+// the boundaries, so a direct source->sink allele -- a pure deletion -- was invisible to bubble scoring
+// while `bubble_steps` handled it correctly everywhere else. Aliasing rather than duplicating removes
+// the class of divergence, not just this instance.
+using PathIndex = BubblePathIndex;
 
 PackedGraph pack_graph(const Graph& graph) {
     PackedGraph packed;
@@ -341,14 +347,7 @@ std::vector<Bubble> merge_nearby_bubbles(
 
 // ---- Path indexing + snarl JSONL import ----------------------------------------------
 
-PathIndex build_path_index(const PathRecord& path) {
-    PathIndex out;
-    out.positions.reserve(path.steps.size());
-    for (std::size_t i = 0; i < path.steps.size(); ++i) {
-        out.positions[path.steps[i].node_id].push_back(i);
-    }
-    return out;
-}
+PathIndex build_path_index(const PathRecord& path) { return build_bubble_path_index(path); }
 
 std::optional<std::string> extract_node_id_for_key(
     const std::string& line,
@@ -779,16 +778,17 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
             }
 
             for (std::size_t p_idx = 0; p_idx < path_indexes.size(); ++p_idx) {
-                const auto interval = find_best_interval(path_indexes[p_idx], bubble);
-                if (!interval.has_value()) {
+                // `bubble_steps` returns the canonical source->sink walk and, when a path crosses with no
+                // interior at all, falls back to the adjacent source/sink pair. That fallback is the
+                // pure-deletion allele, and it is why this must not reimplement the search: requiring an
+                // interior node made a deletion count as no support and reported min_inside_bp as the
+                // shortest INSERTION rather than 0.
+                const auto steps_opt = bubble_steps(graph.paths[p_idx], path_indexes[p_idx], bubble);
+                if (!steps_opt.has_value() || steps_opt->size() < 2) {
                     continue;
                 }
                 ++supported_paths;
-
-                const auto steps = canonical_steps_for_bubble(graph.paths[p_idx], bubble, *interval);
-                if (steps.size() < 2) {
-                    continue;
-                }
+                const std::vector<PathStep>& steps = *steps_opt;
 
                 std::size_t inside_bp = 0;
                 std::unordered_set<std::string> seen_this_path;

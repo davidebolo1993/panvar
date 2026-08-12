@@ -59,3 +59,11 @@ A snarl can contain cycles and inversions, which is where much pangenome variati
 ## Example
 
 See the [LPA walkthrough](../walkthrough.md) for this module in a full end-to-end run.
+
+## Path support counts pure-deletion alleles
+
+A bubble's supporting paths are found with the shared `bubble_steps()` walk extractor — the same one `call`, `describe` and `genotype` use. `bubbles.cpp` previously carried a second, structurally identical path index with its own interval search, and the two had drifted: the local one required at least one **declared interior node** between the boundaries, so a direct `source → sink` allele — a pure deletion, and usually the most interesting allele in the bubble — was invisible to bubble scoring while every other module handled it correctly.
+
+On the minimal case (paths `1,2,3` and `1,3`) that reported `path_support=1, min_inside_bp=4`; it now reports `path_support=2, min_inside_bp=0`, and the bubble survives `--min-path-support 2` instead of being dropped.
+
+**A consequence to be aware of:** with deletions counted, on a fully-typed panel nearly every haplotype supports nearly every bubble simply by crossing it. On C4 and LPA `path_support` is now uniformly 131 and 466 — the panel size. It is *traversal* support, not evidence that an alternate allele has multiple observations, and `--min-path-support` should be read that way. Distinct-allele and alternate-allele support are not yet reported separately.
