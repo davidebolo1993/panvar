@@ -1,6 +1,7 @@
 #include "panvar/rebuild.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <atomic>
 #include <cstdint>
@@ -78,6 +79,37 @@ void validate_input(const Graph& g) {
                 throw std::runtime_error("rebuild: node " + step.node_id + " on path " + p.name +
                                          " has no sequence (S line is '*'); rebuild needs real sequence");
         }
+        // Every consecutive pair of steps must be joined by an ORIENTED link that exists. A path
+        // describing a traversal the graph does not permit spells a sequence no walk could produce, and
+        // every later comparison would be against that.
+        for (std::size_t i = 1; i < p.steps.size(); ++i) {
+            const PathStep& a = p.steps[i - 1];
+            const PathStep& b = p.steps[i];
+            const auto ita = g.nodes.find(a.node_id);
+            if (ita == g.nodes.end()) continue;                       // already reported above
+            // Leave `a` by its end when forward, by its start when reverse; enter `b` at its start when
+            // forward, at its end when reverse.
+            const std::vector<Neighbor>& side = a.reverse ? ita->second.start : ita->second.end;
+            const int want = b.reverse ? 1 : 0;
+            bool linked = false;
+            for (const Neighbor& n : side)
+                if (n.node_id == b.node_id && n.side == want) { linked = true; break; }
+            if (!linked)
+                throw std::runtime_error("rebuild: path " + p.name + " steps from " + a.node_id +
+                                         (a.reverse ? "-" : "+") + " to " + b.node_id +
+                                         (b.reverse ? "-" : "+") + " but the graph has no such link");
+        }
+    }
+    // Spelling concatenates whole segments, so a non-zero overlap would double-count the overlapping
+    // bases in every length and identity figure downstream. Reject rather than quietly mis-measure.
+    for (const auto& kv : g.nodes) {
+        for (const std::vector<Neighbor>* side : {&kv.second.start, &kv.second.end})
+            for (const Neighbor& n : *side)
+                if (n.overlap != 0)
+                    throw std::runtime_error("rebuild: link " + kv.first + " -- " + n.node_id +
+                                             " has a non-zero overlap (" + std::to_string(n.overlap) +
+                                             "M); rebuild spells paths by concatenation and does not "
+                                             "support overlaps");
     }
 }
 
@@ -238,10 +270,11 @@ public:
     ~FastaScratch() {
         std::error_code ec;
         std::filesystem::remove_all(dir_, ec);
-        if (!ec) return;
-        const std::string cmd = "rm -rf '" + dir_ + "'";
-        if (std::system(cmd.c_str()) != 0) {
-            std::cerr << "[rebuild " << hms() << "] warning: could not remove scratch dir " << dir_ << '\n';
+        if (ec) {
+            // No shell fallback: `rm -rf` on a path this class did not necessarily create is a worse
+            // outcome than a leftover directory, and the path is interpolated into a command line.
+            std::cerr << "[rebuild " << hms() << "] warning: could not remove scratch dir " << dir_
+                      << " (" << ec.message() << ")\n";
         }
     }
     FastaScratch(const FastaScratch&) = delete;
@@ -688,12 +721,18 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
                     break;
                 }
             }
+            // An identity that could not be COMPUTED is not evidence of a good recovery; it is the
+            // absence of evidence. Treating id < 0 as passing let exactly the unverifiable cases through
+            // the one check meant to catch them.
             const double id = h < walk_id.size() ? walk_id[h] : -1.0;
-            if (matched[h] < options.min_matched_cover || (id >= 0.0 && id < options.min_recovered_identity)) {
+            if (matched[h] < options.min_matched_cover || id < 0.0 ||
+                id < options.min_recovered_identity) {
                 ++failing;
                 if (first_bad.empty())
-                    first_bad = g.paths[h].name + " (identity " + fmt2(id < 0 ? 0.0 : id) +
-                                ", matched cover " + fmt2(matched[h]) + ")";
+                    first_bad = g.paths[h].name +
+                                (id < 0.0 ? " (recovered-walk identity could not be computed)"
+                                          : " (identity " + fmt2(id) + ", matched cover " +
+                                                fmt2(matched[h]) + ")");
             }
         }
         sum.paths_failing = failing;
@@ -704,10 +743,22 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
         // Seeding stays richness-driven; this is about RECOVERY, not about which haplotype seeds.
         bool ref_ok = true;
         if (!options.reference_path.empty()) {
+            // Exact match wins; otherwise a UNIQUE substring match; an ambiguous one is refused rather
+            // than resolved by file order, which is not a property anybody intends to depend on.
             std::size_t ri = g.paths.size();
             for (std::size_t h = 0; h < g.paths.size(); ++h)
-                if (g.paths[h].name == options.reference_path ||
-                    g.paths[h].name.find(options.reference_path) != std::string::npos) { ri = h; break; }
+                if (g.paths[h].name == options.reference_path) { ri = h; break; }
+            if (ri == g.paths.size()) {
+                std::vector<std::size_t> hits;
+                for (std::size_t h = 0; h < g.paths.size(); ++h)
+                    if (g.paths[h].name.find(options.reference_path) != std::string::npos) hits.push_back(h);
+                if (hits.size() == 1) ri = hits.front();
+                else if (hits.size() > 1)
+                    throw std::runtime_error("rebuild: --reference-path '" + options.reference_path +
+                                             "' is ambiguous (" + std::to_string(hits.size()) +
+                                             " matches, e.g. " + g.paths[hits[0]].name + " and " +
+                                             g.paths[hits[1]].name + ")");
+            }
             if (ri == g.paths.size()) {
                 ref_ok = false;
                 sum.reject_reason = "reference path not found in the input: " + options.reference_path;
@@ -716,8 +767,8 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
                 sum.reject_reason = "reference path was not recovered: " + g.paths[ri].name;
             } else {
                 const double rid = ri < walk_id.size() ? walk_id[ri] : -1.0;
-                if (matched[ri] < options.min_matched_cover ||
-                    (rid >= 0.0 && rid < options.min_recovered_identity)) {
+                if (matched[ri] < options.min_matched_cover || rid < 0.0 ||
+                    rid < options.min_recovered_identity) {
                     ref_ok = false;
                     sum.reject_reason = "reference path recovered below the contract: " +
                                         g.paths[ri].name + " (identity " + fmt2(rid < 0 ? 0.0 : rid) +
@@ -742,8 +793,10 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
                                       : (options.out_path.empty() ? std::string()
                                                                   : options.out_path + ".rebuild_audit.tsv");
         if (!audit.empty()) {
-            std::ofstream a(audit);
-            if (a) {
+            const std::filesystem::path audit_staged = staging_path(audit);
+            std::ofstream a(audit_staged);
+            if (!a) throw std::runtime_error("rebuild: cannot write audit " + audit_staged.string());
+            {
                 a << "path\toriginal_bp\trecovered_steps\tenvelope_cover\tmatched_cover\tchain_identity"
                      "\twalk_identity\tstatus\n";
                 for (std::size_t h = 0; h < g.paths.size(); ++h) {
@@ -751,11 +804,24 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
                     std::string status = "ok";
                     if (walks[h].empty()) status = "not_recovered";
                     else if (matched[h] < options.min_matched_cover) status = "low_cover";
-                    else if (id >= 0.0 && id < options.min_recovered_identity) status = "low_identity";
+                    else if (id < 0.0) status = "identity_unavailable";
+                    else if (id < options.min_recovered_identity) status = "low_identity";
                     a << g.paths[h].name << '\t' << hseq[h].size() << '\t' << walks[h].size() << '\t'
                       << fmt2(cover[h]) << '\t' << fmt2(matched[h]) << '\t' << fmt2(chain_id[h]) << '\t'
                       << (id < 0.0 ? std::string("NA") : fmt2(id)) << '\t' << status << '\n';
                 }
+                // The global verdict belongs beside the per-path rows, or a reader has to reconstruct
+                // it from them and guess which bound applied.
+                a << "#verdict\t" << (sum.accepted ? "accepted" : "rejected") << '\n';
+                a << "#reason\t" << (sum.reject_reason.empty() ? std::string("-") : sum.reject_reason)
+                  << '\n';
+                a << "#min_recovered_identity\t" << fmt2(options.min_recovered_identity) << '\n';
+                a << "#min_matched_cover\t" << fmt2(options.min_matched_cover) << '\n';
+                a << "#dangling_walks\t" << sum.dangling_steps << '\n';
+                a.flush();
+                if (!a) throw std::runtime_error("rebuild: failed writing audit " + audit_staged.string());
+                a.close();
+                commit_staged(audit_staged, audit);
                 sum.audit_written = true;
             }
         }
@@ -778,21 +844,30 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
     // ---- structural summary of what we emitted ----
     sum.out_nodes = out->n_seg;
     {
-        std::vector<std::unordered_set<std::uint32_t>> nb(out->n_seg);
-        std::size_t edges = 0;
+        // Per HANDLE, exactly as the input gate measures it. Pooling both ends here while the input is
+        // measured per end made the before/after numbers describe different quantities, so any claim
+        // that rebuilding reduced tangling was comparing two different rulers.
+        std::vector<std::array<std::unordered_set<std::uint32_t>, 2>> hs(out->n_seg);
+        std::size_t edges = 0, loops = 0;
         for (std::uint64_t k = 0; k < out->n_arc; ++k) {
             const gfa_arc_t& a = out->arc[k];
             if (a.del || a.comp) continue;
             ++edges;
-            const std::uint32_t u = static_cast<std::uint32_t>(a.v_lv >> 33);
-            const std::uint32_t v = a.w >> 1;
-            nb[u].insert(v);
-            nb[v].insert(u);
+            const std::uint32_t v = static_cast<std::uint32_t>(a.v_lv >> 32);   // oriented vertex
+            const std::uint32_t w = a.w;
+            const std::uint32_t vs = v >> 1, ws = w >> 1;
+            if (vs == ws) { ++loops; continue; }
+            // v is left by its end when forward, by its start when reverse; w is entered at its start
+            // when forward, at its end when reverse.
+            hs[vs][(v & 1) ? 0 : 1].insert(ws);
+            hs[ws][(w & 1) ? 1 : 0].insert(vs);
         }
         sum.out_edges = edges;
-        for (const auto& s : nb) {
-            sum.out_maxdeg = std::max(sum.out_maxdeg, s.size());
-            if (s.size() >= options.hub_degree) ++sum.out_hubs;
+        sum.out_selfloops = loops;
+        for (const auto& h : hs) {
+            const std::size_t deg = std::max(h[0].size(), h[1].size());
+            sum.out_maxdeg = std::max(sum.out_maxdeg, deg);
+            if (deg >= options.hub_degree) ++sum.out_hubs;
         }
     }
     if (sum.paths_recovered < sum.haplotypes) {

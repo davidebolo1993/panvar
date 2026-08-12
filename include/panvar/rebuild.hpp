@@ -52,6 +52,7 @@ struct RebuildSummary {
     std::size_t out_edges = 0;
     std::size_t out_maxdeg = 0;
     std::size_t out_hubs = 0;        // #nodes with degree >= hub_degree in the rebuilt graph
+    std::size_t out_selfloops = 0;
     std::size_t paths_recovered = 0; // haplotypes whose walk mg_map resolved
     // (qe-qs)/len -- the chain's OUTER envelope. It says where the alignment starts and ends, not how
     // much of the query is actually aligned, so a chain with a large internal gap still reads high.

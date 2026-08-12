@@ -113,10 +113,11 @@ if [ -n "$SRC" ] && [ -s "$SRC" ]; then
   # The audit sidecar must have one row per path and name a status for each.
   aud="$OUT/strict.gfa.rebuild_audit.tsv"
   if [ -s "$aud" ]; then
-    rows=$(( $(wc -l < "$aud") - 1 ))
+    # data rows only: the trailing #verdict/#reason lines are metadata, not paths
+    rows=$(grep -vc '^#' "$aud"); rows=$(( rows - 1 ))
     [ "$rows" = "$in_paths" ] && ok "audit has one row per path ($rows)" \
                               || bad "audit has $rows rows for $in_paths paths"
-    bad_status=$(awk -F'\t' 'NR>1 && $8!="ok" && $8!="not_recovered" && $8!="low_cover" && $8!="low_identity"' "$aud" | wc -l | tr -d ' ')
+    bad_status=$(awk -F'\t' 'NR>1 && $0 !~ /^#/ && $8!="ok" && $8!="not_recovered" && $8!="low_cover" && $8!="low_identity" && $8!="identity_unavailable" && $8!="dangling_walk"' "$aud" | wc -l | tr -d ' ')
     [ "$bad_status" = "0" ] && ok "every audit row carries a known status" \
                             || bad "$bad_status audit rows have an unrecognised status"
   else
@@ -178,6 +179,59 @@ fi
 rc=$?
 [ "$rc" -eq 0 ] && [ -s "$OUT/amb.out.gfa" ] && ok "ambiguous bases (N) are handled without failure" \
                                              || bad "a graph containing N failed (exit $rc)"
+
+
+# ---------------------------------------------------------------- traversal and overlap validation
+# A path that steps between nodes with no link spells a sequence no walk could produce; a non-zero
+# overlap would double-count the overlapping bases in every length and identity figure downstream.
+printf 'H\tVN:Z:1.0\nS\t1\tACGTACGTAC\nS\t2\tTTTTGGGGCC\nS\t3\tGGGGCCCCAA\nL\t1\t+\t2\t+\t0M\nP\tp1\t1+,2+,3+\t*\n' > "$OUT/e_nolink.gfa"
+printf 'H\tVN:Z:1.0\nS\t1\tACGTACGTAC\nS\t2\tTTTTGGGGCC\nL\t1\t+\t2\t+\t5M\nP\tp1\t1+,2+\t*\n' > "$OUT/e_ovl.gfa"
+for c in "e_nolink:a step pair with no link" "e_ovl:a non-zero overlap"; do
+  f=${c%%:*}; what=${c##*:}
+  e=$("$BIN" rebuild -i "$OUT/$f.gfa" -o "$OUT/$f.out.gfa" 2>&1 | grep -c "Error")
+  [ "$e" -gt 0 ] && ok "refused: $what" || bad "$what was accepted"
+done
+# ...but a VALID reverse traversal must still pass.
+printf 'H\tVN:Z:1.0\nS\t1\tACGTACGTAC\nS\t2\tTTTTGGGGCC\nL\t1\t+\t2\t-\t0M\nP\tp1\t1+,2-\t*\nP\tp2\t1+,2-\t*\n' > "$OUT/rev.gfa"
+"$BIN" rebuild -i "$OUT/rev.gfa" -o "$OUT/rev.out.gfa" >/dev/null 2>&1
+[ -s "$OUT/rev.out.gfa" ] && ok "a valid reverse-orientation traversal is accepted" \
+                          || bad "a valid reverse traversal was rejected"
+
+# ---------------------------------------------------------------- k > 31 uses the same rules as k <= 31
+# Both branches must be canonical and ambiguity-aware, or crossing k=31 silently changes what richness
+# means. Same graph, two k values either side of the boundary: the seed must not change.
+if [ -n "$SRC" ] && [ -s "$SRC" ]; then
+  k1=$("$BIN" rebuild -i "$GFA" -o "$OUT/k21.gfa" --force --min-recovered-identity 0.97 --kmer 21 2>&1 \
+        | grep -oE 'seed=[^;]*' | head -1)
+  k2=$("$BIN" rebuild -i "$GFA" -o "$OUT/k41.gfa" --force --min-recovered-identity 0.97 --kmer 41 2>&1 \
+        | grep -oE 'seed=[^;]*' | head -1)
+  [ -n "$k1" ] && [ "$k1" = "$k2" ] && ok "k=21 and k=41 choose the same seed (both branches canonical)" \
+                                    || bad "seed changes across the k=31 boundary: '$k1' vs '$k2'"
+
+  # An ambiguous --reference-path must be refused, not resolved by file order.
+  e=$("$BIN" rebuild -i "$GFA" -o "$OUT/amb.out.gfa" --force -r "haplotype" 2>&1 | grep -c "ambiguous")
+  [ "$e" -gt 0 ] && ok "an ambiguous --reference-path is refused" \
+                 || bad "an ambiguous --reference-path was resolved silently"
+
+  # The audit must carry the global verdict beside the per-path rows.
+  "$BIN" rebuild -i "$GFA" -o "$OUT/verd.gfa" --force --min-recovered-identity 0.999999 >/dev/null 2>&1
+  grep -q "^#verdict" "$OUT/verd.gfa.rebuild_audit.tsv" 2>/dev/null \
+    && ok "audit records the global verdict and reason" || bad "audit has no verdict row"
+fi
+
+# ---------------------------------------------------------------- equal richness is ordered, not arbitrary
+# Two byte-identical haplotypes tie on every richness measure. The seed must be decided by name, not by
+# whatever std::sort happens to do.
+{ printf 'H\tVN:Z:1.0\n'
+  printf 'S\t1\tACGTACGTACGTACGTACGT\nS\t2\tTTTTGGGGCCCCAAAATTTT\nS\t3\tGGGGCCCCAAAATTTTGGGG\n'
+  printf 'L\t1\t+\t2\t+\t0M\nL\t2\t+\t3\t+\t0M\nL\t1\t+\t3\t+\t0M\n'
+  printf 'P\tzzz\t1+,2+,3+\t*\nP\taaa\t1+,2+,3+\t*\nP\tmmm\t1+,3+\t*\n'; } > "$OUT/tie.gfa"
+t1=$("$BIN" rebuild -i "$OUT/tie.gfa" -o "$OUT/tie1.gfa" --force 2>&1 | grep -oE 'seed=[^;]*' | head -1)
+t2=$("$BIN" rebuild -i "$OUT/tie.gfa" -o "$OUT/tie2.gfa" --force 2>&1 | grep -oE 'seed=[^;]*' | head -1)
+[ -n "$t1" ] && [ "$t1" = "$t2" ] && ok "equal richness is broken deterministically ($t1)" \
+                                  || bad "equal-richness seed is unstable: '$t1' vs '$t2'"
+case "$t1" in *aaa*) ok "  ... and by path name, not input order" ;;
+              *) bad "tie broken by something other than name: $t1" ;; esac
 
 
 echo

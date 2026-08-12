@@ -8,7 +8,7 @@ pggb induces its graph with seqwish, whose transitive closure over all-pairs ali
 
 ### 1. Gate
 
-One pass over the input GFA decides whether the graph needs rebuilding. For each node it counts the node's degree. An `L` line joins one end of a segment to one end of another, so a node has links off both of its ends; its degree is the number of distinct other nodes those links reach, pooled across both ends (a neighbour reached by two links, or off both ends, still counts once). A node whose degree is at least `--hub-degree` is a hub — the mark of seqwish having merged sequence that recurs across the locus onto one shared node. The graph is called pathological when
+One pass over the input GFA decides whether the graph needs rebuilding. An `L` line joins one end of a segment to one end of another, so a node has links off both of its ends, and degree is counted **per end**: the node's degree is the larger of its two handle degrees, not the two pooled. Pooling conflates two different shapes — 25 neighbours on each side is a clean two-sided branch, while 50 on one side is the tangle the gate exists to find, yet pooled both read 50. Self-loops are counted separately: that is how a tandem array appears after folding, and it is not pathology. The same per-end measure is applied to the rebuilt graph, so the before/after figures are comparable. A node whose degree is at least `--hub-degree` is a hub — the mark of seqwish having merged sequence that recurs across the locus onto one shared node. The graph is called pathological when
 
 ```text
 #nodes with degree >= --hub-degree   >=   --min-hubs

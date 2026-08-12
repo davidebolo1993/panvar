@@ -18,10 +18,21 @@ void print_rebuild_help() {
         << "Usage:\n"
         << "  panvar rebuild -i <graph.gfa> -o <out.gfa> [options]\n\n"
         << "Re-induce a pathological (fragmented low-complexity) locus graph BEFORE bubble decomposition.\n"
-        << "A cheap degree gate decides whether the graph is pathological (a cluster of high-degree hubs\n"
-        << "from seqwish over-merging); if so, the locus is rebuilt by progressive graph generation using\n"
-        << "minigraph's engine, with haplotypes added most-complete-first (k-mer richness). The emitted GFA\n"
-        << "carries per-haplotype P lines and preserves link orientation, so inversion bubbles survive.\n"
+        << "A cheap degree gate decides whether the graph is pathological (a cluster of hubs with a high\n"
+        << "single-END degree, from seqwish over-merging); if so, the locus is rebuilt by progressive graph\n"
+        << "generation using minigraph's engine, with haplotypes added most-complete-first by CANONICAL\n"
+        << "k-mer richness (so the order does not depend on which strand the graph is stored on), ties\n"
+        << "broken by path name. The emitted GFA carries per-haplotype P lines and preserves link\n"
+        << "orientation, so inversion bubbles survive.\n"
+        << "\n"
+        << "The result is ACCEPTED only if every haplotype comes back: each path recovered as a walk whose\n"
+        << "consecutive steps are joined by links that exist, with matched cover and recovered-walk\n"
+        << "identity above --min-matched-cover / --min-recovered-identity. minigraph augments variation\n"
+        << "above --min-var, so sub-threshold differences are collapsed by construction and a walk is\n"
+        << "never byte-identical -- the contract is fidelity within those bounds, not losslessness.\n"
+        << "Otherwise the rebuilt graph is discarded and the ORIGINAL written unchanged. Acceptance proves\n"
+        << "fidelity, NOT that the graph got less tangled; the run reports hubs and max handle degree\n"
+        << "before and after so that can be judged separately.\n"
         << "Healthy graphs pass through unchanged, so validated loci are never touched.\n\n"
         << "Options:\n"
         << "  -i, --gfa <path>            Input GFA (required)\n"
@@ -31,14 +42,26 @@ void print_rebuild_help() {
         << "      --min-var <N>           Minimum variant length augmented into the graph, i.e.\n"
         << "                              minigraph -L (default 50). Lower values keep more of the\n"
         << "                              small variation, at the cost of a denser graph\n"
-        << "      --min-align-len <N>     Minimum alignment length that may contribute events, i.e.\n"
-        << "                              minigraph -l (default auto: half the seed haplotype, since\n"
-        << "                              minigraph's own default assumes chromosome-scale input)\n"
+        << "      --min-align-len <N>     Minimum alignment length that may contribute events. 0 = auto:\n"
+        << "                              scaled from the MEDIAN haplotype length and capped at half the\n"
+        << "                              shortest, so no haplotype is gated out by a bar it could never\n"
+        << "                              clear. A larger value is honoured but warned about.\n"
         << "      --tmp-dir <path>        Parent dir for the per-haplotype FASTA scratch (default: beside\n"
         << "                              --out); a dedicated subfolder under it is created and removed\n"
         << "      --hub-degree <N>        Node degree that counts as a hub (default 50)\n"
         << "      --min-hubs <N>          >= this many hubs => pathological (default 10)\n"
         << "  -t, --threads <N>           Worker threads (0 = auto)\n"
+        << "  ---- acceptance contract (the rebuild is discarded and the ORIGINAL written if unmet) ----\n"
+        << "      --min-recovered-identity <X>  Per-path identity of the walk re-spelled from the REBUILT\n"
+        << "                              graph against the original haplotype (default 0.98)\n"
+        << "      --min-matched-cover <X> Per-path matching bases / haplotype length (default 0.95).\n"
+        << "                              Distinct from the chain's outer envelope, which hides internal gaps\n"
+        << "  -r, --reference-path <name>  This path must be recovered within the same bounds. Exact match\n"
+        << "                              wins, else a unique substring; an ambiguous name is refused.\n"
+        << "                              Seeding stays richness-driven -- this is about RECOVERY\n"
+        << "      --allow-loss            Accept a rebuild that fails the contract, recording what it violated\n"
+        << "      --audit <path>          Per-path audit TSV (default <out>.rebuild_audit.tsv): coverage,\n"
+        << "                              identity and a status per path, plus the global verdict\n"
         << "      --force                 Rebuild even if the gate says healthy (testing/small inputs)\n"
         << "  -q, --quiet                 Disable progress logs\n"
         << "  -h, --help                  Show this help\n";
@@ -117,6 +140,17 @@ int run_rebuild_command(const std::vector<std::string>& args) {
                  " nodes; seed=" + (s.seed.empty() ? "-" : s.seed) + "; " +
                  std::to_string(s.paths_recovered) + "/" + std::to_string(s.haplotypes) +
                  " paths recovered");
+        // Acceptance proves FIDELITY -- that every haplotype came back within the bounds. It does not
+        // prove the graph got less tangled, which is the reason for rebuilding in the first place, so
+        // report the before/after on the same per-handle measure and let the reader judge.
+        const bool better = s.out_hubs <= s.raw_hubs && s.out_maxdeg <= s.raw_maxdeg;
+        log.info(std::string("structure: hubs ") + std::to_string(s.raw_hubs) + " -> " +
+                 std::to_string(s.out_hubs) + ", max handle degree " + std::to_string(s.raw_maxdeg) +
+                 " -> " + std::to_string(s.out_maxdeg) + ", self-loops " +
+                 std::to_string(s.raw_selfloops) + " -> " + std::to_string(s.out_selfloops) +
+                 (better ? " (untangled)"
+                         : " (NOT untangled -- the rebuild preserved the haplotypes but did not "
+                           "simplify the graph)"));
     } else {
         log.info("rejected: the rebuild would have been " + std::to_string(s.raw_nodes) + " -> " +
                  std::to_string(s.out_nodes) + " nodes, but " + s.reject_reason +

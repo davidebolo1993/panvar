@@ -75,13 +75,17 @@ The distinction is not academic. On the C4 locus (131 haplotypes, forced rebuild
 - matched cover ≥ `--min-matched-cover` (default `0.95`) and recovered-walk identity ≥ `--min-recovered-identity` (default `0.98`);
 - if `-r/--reference-path` is given, that path must be present and meet the same bounds.
 
+A recovered-walk identity that could not be **computed** counts as a failure, not a pass. Absence of evidence is not evidence of a good recovery, and treating it as one would let exactly the unverifiable cases through the check meant to catch them.
+
 **If any of these fails, the rebuilt graph is discarded and the original is written unchanged**, with the reason stated. A graph that silently drops or truncates a haplotype is worse than no rebuild, because everything downstream would then agree with it. `--allow-loss` accepts anyway and records what was violated.
+
+**Acceptance proves fidelity, not untangling.** It says every haplotype came back within the bounds; it says nothing about whether the graph got simpler, which is the reason for rebuilding. The run therefore reports hubs, maximum handle degree and self-loops before and after — on the same per-end measure — and labels the outcome `untangled` or `NOT untangled`. A rebuild can be perfectly faithful and still not have helped.
 
 The reference clause is about **recovery, not seeding**. Which haplotype seeds the graph stays richness-driven — that is deliberate — but a reference that did not come back invalidates every reference-relative bubble and call downstream, so it is checked.
 
 ### Audit sidecar
 
-`<out>.rebuild_audit.tsv`, one row per path: `original_bp`, `recovered_steps`, `envelope_cover`, `matched_cover`, `chain_identity`, `walk_identity`, and a `status` of `ok` / `not_recovered` / `low_cover` / `low_identity`. The verdict can then be read rather than trusted — on C4 at the default bounds, 130 paths are `ok` and one is `low_identity` at 0.9740, which is the single haplotype that rejects the run.
+`<out>.rebuild_audit.tsv`, one row per path: `original_bp`, `recovered_steps`, `envelope_cover`, `matched_cover`, `chain_identity`, `walk_identity`, and a `status` of `ok` / `not_recovered` / `low_cover` / `low_identity` / `identity_unavailable`. Trailing `#`-prefixed rows carry the global verdict, the rejection reason and the bounds that applied, so the file explains itself without the log. It is staged and renamed like the graph, and a failure to write it is an error rather than a silent omission. The verdict can then be read rather than trusted — on C4 at the default bounds, 130 paths are `ok` and one is `low_identity` at 0.9740, which is the single haplotype that rejects the run.
 
 | flag | what it does | default |
 |------|--------------|---------|
