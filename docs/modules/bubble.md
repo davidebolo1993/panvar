@@ -91,6 +91,21 @@ One filter is a gradient; the other is a step at the panel size. C4 has a bubble
 
 `--min-variant-bp` and `--max-variant-bp` measure the **interior span** between the boundaries — the summed length of the interior nodes a path traverses — not the size of the difference between alleles. A 1 bp substitution inside a 1 kb allele has a 1 kb span and passes `--min-variant-bp 50`. `--min-interior-bp` and `--max-interior-bp` are accepted as aliases that say so; the CSV columns `min_inside_bp` / `max_inside_bp` were always named correctly. Computing true allele-to-reference divergence is not implemented.
 
+## Boundaries carry reference order
+
+A cactus snarl is an **unordered** pair of boundaries — nothing in the decomposition says which is left. But every consumer reads them as an interval in reference order: `call` anchors coordinates on the source, and merging joins one bubble's sink to the next bubble's source. `bubble` therefore orients each pair so `source` is the reference-left boundary, before ids are assigned, so `bubble_id` also increases along the reference. A bubble the reference does not traverse has no order to take and is left alone.
+
+This was not a rare edge case. Measured on the reference loci, the fraction of bubbles stored **reversed** against the reference was:
+
+| locus | reversed |
+|-------|----------|
+| C4 | 5/5 |
+| GSTM1 | 4/4 |
+| ACOT | 9/9 |
+| LPA | 0/9 |
+
+The bubble *set* is unchanged by orienting — same endpoints, same interiors — but what `call` makes of it is not. On C4 the same five bubbles yield 19 records instead of 15, and the reconstruction benchmark says the extra resolution is real rather than noise: the region VCF closes **9.2%** of the baseline-to-graph gap where it closed **2.5%** before, with residual falling from 1,376,483 to 1,282,382 bases. The events are re-partitioned, not merely multiplied — total allele count falls from 347 to 318 as a few coarse events become several finer ones.
+
 ## `--superbubbles` tests the graph, not the paths
 
 A superbubble is a snarl whose interior is a directed acyclic graph. Cyclicity used to be inferred entirely from what the stored paths happen to do — an interior self-loop, a path revisiting an interior node, a node used in both orientations. Those are real signals, but none of them looks at the graph: **an interior cycle that no stored path walks was reported as acyclic and survived `--superbubbles`**, which exists precisely to exclude it.

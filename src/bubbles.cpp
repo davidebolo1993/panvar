@@ -141,6 +141,42 @@ bool node_id_less(const std::string& a, const std::string& b) {
     return a < b;
 }
 
+// Orient every bubble so `source` is the reference-LEFT boundary and `sink` the reference-RIGHT one.
+//
+// The cactus decomposition names the two boundaries of a snarl, but nothing in it fixes which is which:
+// on a three-node graph whose reference is 1,2,3 it reports source=3, sink=1. That is not wrong as a
+// snarl -- the pair is unordered -- but every consumer downstream reads them as an interval in
+// reference order: `call` derives POS from the source, merging joins one bubble's sink to the next
+// bubble's source, and a coordinate written from a reversed pair lands at the wrong end.
+//
+// A bubble the reference does not traverse has no reference order to take, and is left alone.
+void orient_bubbles_to_reference(const Graph& graph, const std::string& reference_path,
+                                 std::vector<Bubble>& bubbles) {
+    if (reference_path.empty() || bubbles.empty()) return;
+    std::size_t ref_idx = graph.paths.size();
+    for (std::size_t i = 0; i < graph.paths.size(); ++i)
+        if (graph.paths[i].name == reference_path) { ref_idx = i; break; }
+    if (ref_idx == graph.paths.size()) {
+        std::size_t hits = 0, last = 0;
+        for (std::size_t i = 0; i < graph.paths.size(); ++i)
+            if (graph.paths[i].name.find(reference_path) != std::string::npos) { ++hits; last = i; }
+        if (hits != 1) return;                      // ambiguous or absent: no order to impose
+        ref_idx = last;
+    }
+    // First occurrence of each node on the reference walk. A boundary the reference visits more than
+    // once has no single coordinate; the first is the one `call` already anchors on.
+    std::unordered_map<std::string, std::size_t> first_pos;
+    const PathRecord& ref = graph.paths[ref_idx];
+    for (std::size_t i = 0; i < ref.steps.size(); ++i)
+        first_pos.emplace(ref.steps[i].node_id, i);
+    for (Bubble& b : bubbles) {
+        const auto s_it = first_pos.find(b.source);
+        const auto k_it = first_pos.find(b.sink);
+        if (s_it == first_pos.end() || k_it == first_pos.end()) continue;
+        if (k_it->second < s_it->second) std::swap(b.source, b.sink);
+    }
+}
+
 bool bubble_endpoint_less(const Bubble& a, const Bubble& b) {
     if (a.source != b.source) {
         return node_id_less(a.source, b.source);
@@ -1020,6 +1056,9 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
         (void)before;
     }
 
+    // Boundaries carry reference order before ids are assigned, so bubble_id increases along the
+    // reference and every downstream coordinate is derived from the left boundary.
+    orient_bubbles_to_reference(graph, options.reference_path, bubbles);
     std::sort(bubbles.begin(), bubbles.end(), bubble_endpoint_less);
     assign_ids(bubbles);
 

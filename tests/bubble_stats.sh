@@ -50,6 +50,14 @@ rows() { tail -n +2 "$1" 2>/dev/null | wc -l | tr -d ' '; }
 [ "$(cel "$OUT/del.bubbles.csv" alt_allele_support_max)" = "1" ] && ok "alt_allele_support_max = 1" \
   || bad "alt_allele_support_max=$(cel "$OUT/del.bubbles.csv" alt_allele_support_max), expected 1"
 
+# ---------------------------------------------------------------- boundaries carry reference order
+# The cactus pair is unordered, but every consumer reads source/sink as an interval in reference order:
+# `call` anchors coordinates on the source and merging joins one sink to the next source. On the
+# deletion graph the reference is 1,2,3, so the bubble must be reported source=1, sink=3.
+[ "$(cel "$OUT/del.bubbles.csv" source)" = "1" ] && [ "$(cel "$OUT/del.bubbles.csv" sink)" = "3" ] \
+  && ok "boundaries are in reference order (source=1, sink=3)" \
+  || bad "source=$(cel "$OUT/del.bubbles.csv" source) sink=$(cel "$OUT/del.bubbles.csv" sink), expected 1 and 3"
+
 # ---------------------------------------------------------------- --superbubbles tests the GRAPH
 # Interior nodes 2 and 3 are joined both ways, so the interior contains a directed cycle -- but no
 # stored path walks it, so every path-derived signal (self-loop, revisit, both-orientation use) says
