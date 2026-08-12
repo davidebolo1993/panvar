@@ -95,10 +95,32 @@ sp=$(col "$OUT/spa.assoc.tsv" p rare); sm=$(col "$OUT/spa.assoc.tsv" p_method ra
 [ "$sm" = "score_spa" ] && ok "saddlepoint used past the |z| cutoff (p_method=$sm)" \
                         || bad "p_method=$sm, expected score_spa"
 # must be materially closer to the exact tail than the normal approximation is
-awk -v p="$sp" 'BEGIN{ex=0.00182437858954; no=0.000385746755682;
-  exit !( (p>0) && ((p>ex?p/ex:ex/p) < (ex/no)) )}' \
-  && ok "SPA p ($sp) is closer to the exact tail 0.001824 than the normal 0.000386 would be" \
-  || bad "SPA p $sp is no better than the normal tail against exact 0.00182437858954"
+# Pinned against an independent Lugannani-Rice implementation in R on the same quantities, so this
+# catches a numerical regression rather than only a gross one. (Exact 0.00182437858954; the normal
+# would give 0.000386, so here the saddlepoint is much the better of the two.)
+close "$sp" 0.00132055 1e-4 && ok "SPA p matches the reference implementation ($sp)" \
+                            || bad "SPA p $sp != 0.00132055"
+
+# ---- asymmetric support: the two tails are in different regimes and must be evaluated separately.
+# Covariate-dependent mu makes smax (6.0749) and -smin (6.1295) differ, so a rule that treats "at or
+# beyond the boundary" as one case gets this wrong. Both thresholds here are INTERIOR, so both tails are
+# saddlepoint. R reference on the same gt/mu: upper 0.000116838 + lower 2.77864e-07 = 0.000117116.
+# Note the exact tail is 0.000184813 and the NORMAL would give 0.000139 -- at n=16 the saddlepoint
+# expansion is not yet accurate and is the further of the two. That is a property of SPA at tiny n, not
+# a defect here, which is why this asserts the implementation rather than any superiority claim.
+{ printf 'asym, A, B, 2, 0, 0, 0, 2, 0, 0, 1, 2, 0, 0, 0, 2, 0, 0, 0\n'; } > "$OUT/asym.bimbam"
+: > "$OUT/asym.samples"; for i in $(seq 1 16); do echo "s$i" >> "$OUT/asym.samples"; done
+{ printf 'sample\tphenotype\tcv\n'
+  ys=(1 0 0 0 1 0 0 0 1 0 0 0 1 0 0 0); cs=(3 1 4 1 5 9 2 6 5 3 5 8 9 7 9 3)
+  for i in $(seq 1 16); do printf 's%d\t%s\t%s\n' "$i" "${ys[$((i-1))]}" "${cs[$((i-1))]}"; done; } > "$OUT/asym.pheno"
+gzip -cf "$OUT/asym.bimbam" > "$OUT/asym.bimbam.gz"; gzip -cf "$OUT/asym.samples" > "$OUT/asym.samples.gz"
+"$BIN" associate --genotypes "$OUT/asym.bimbam.gz" --samples "$OUT/asym.samples.gz" \
+  --phenotype "$OUT/asym.pheno" --min-maf 0 -o "$OUT/asym" --quiet >/dev/null 2>&1
+ap=$(col "$OUT/asym.assoc.tsv" p asym); am=$(col "$OUT/asym.assoc.tsv" p_method asym)
+[ "$am" = "score_spa" ] && ok "asymmetric support, both tails interior -> saddlepoint ($am)" \
+                        || bad "p_method=$am on asymmetric support, expected score_spa"
+close "$ap" 0.000117116 1e-4 && ok "asymmetric two-sided p matches the reference ($ap)" \
+                             || bad "asymmetric p $ap != 0.000117116"
 
 # At the support boundary the saddlepoint is at infinity, but the probability is a single Bernoulli
 # configuration and is exact: 2 * 0.5^12 = 0.00048828125 for the separation fixture above.

@@ -444,11 +444,13 @@ double spa_far_tail(double s, const SpaCgf& c) {
 // Two-sided p for the observed score. The score's distribution is NOT symmetric under case/control
 // imbalance, so both tails are computed rather than one doubled.
 double spa_two_sided(double s, const std::vector<double>& gt, const std::vector<double>& mu,
-                     bool* exact_out = nullptr) {
-    // S is a bounded sum, and at (or beyond) the edge of its support the saddlepoint is at infinity:
-    // K'(t) approaches the boundary asymptotically, so a root search finds a spurious "root" far out
-    // and Lugannani-Rice degenerates -- it returned 1 for a perfectly separating feature whose exact
-    // two-sided p is 2*0.5^12. Decline there and let the caller keep the normal tail.
+                     const std::vector<double>* y = nullptr, bool* exact_out = nullptr) {
+    // S is a bounded sum. The two tails are evaluated INDEPENDENTLY, because for an asymmetric score
+    // distribution they are in different regimes: a threshold can be outside the support on one side
+    // (probability exactly zero), sitting on the boundary atom on the other, or interior on both.
+    // Treating "at or beyond the boundary" as one case conflated all three -- it charged the boundary
+    // atom for a threshold that is strictly outside the support, where the probability is zero, and it
+    // skipped the opposite tail entirely when that tail was interior and non-negligible.
     double smax = 0.0, smin = 0.0;
     for (std::size_t i = 0; i < gt.size(); ++i) {
         const double a = gt[i] * (1.0 - mu[i]), b = gt[i] * (0.0 - mu[i]);
@@ -457,11 +459,9 @@ double spa_two_sided(double s, const std::vector<double>& gt, const std::vector<
     }
     const double span = smax - smin;
     if (!(span > 0.0)) return kNaN;
-    // At the boundary the saddlepoint is at infinity, but the probability there is a single Bernoulli
-    // configuration and can be written down exactly -- no approximation and no enumeration:
-    //   P(S = smax) = prod_{gt>0} mu_i * prod_{gt<0} (1 - mu_i)
-    // Computed in logs so it does not underflow. Falling back to the normal tail here would use the
-    // approximation precisely where it is least trustworthy.
+
+    // P(S = smax) = prod_{gt>0} mu_i * prod_{gt<0} (1 - mu_i): a single Bernoulli configuration, so it
+    // is exact. In logs, so it does not underflow.
     auto log_extreme = [&](bool upper) {
         double lg = 0.0;
         for (std::size_t i = 0; i < gt.size(); ++i) {
@@ -473,24 +473,55 @@ double spa_two_sided(double s, const std::vector<double>& gt, const std::vector<
         }
         return lg;
     };
-    const bool at_top = std::fabs(s) >= smax - 1e-8 * span;
-    const bool at_bot = -std::fabs(s) <= smin + 1e-8 * span;
-    if (at_top || at_bot) {
-        const double lu = at_top ? log_extreme(true) : -std::numeric_limits<double>::infinity();
-        const double ll = at_bot ? log_extreme(false) : -std::numeric_limits<double>::infinity();
-        double pex = 0.0;
-        if (std::isfinite(lu)) pex += std::exp(lu);
-        if (std::isfinite(ll)) pex += std::exp(ll);
-        // Only one side is at the boundary in the asymmetric case; the other is negligible beside it.
-        if (exact_out != nullptr) *exact_out = true;
-        return (pex > 0.0 && pex <= 1.0) ? pex : kNaN;
-    }
+    // Whether the OBSERVED outcome really is the extreme configuration, checked against y rather than
+    // inferred from a floating-point tolerance on the statistic. It applies only to the side the
+    // observation is actually ON -- s can be extremal at one end at most, and demanding it of the
+    // opposite tail rejected a legitimate boundary atom there. The opposite threshold reaching its own
+    // boundary is a numeric fact about the threshold, not a claim about what was observed.
+    auto observed_is_extreme = [&](bool upper) {
+        if (y == nullptr || y->size() != gt.size()) return true;
+        for (std::size_t i = 0; i < gt.size(); ++i) {
+            if (gt[i] == 0.0) continue;
+            const double want = (upper ? (gt[i] > 0.0) : (gt[i] < 0.0)) ? 1.0 : 0.0;
+            if (std::fabs((*y)[i] - want) > 1e-12) return false;
+        }
+        return true;
+    };
+
+    const double tol = 1e-8 * span;
     const SpaCgf c{&gt, &mu};
-    const double up = spa_far_tail(std::fabs(s), c);    // P(S >= |s|)
-    const double dn = spa_far_tail(-std::fabs(s), c);   // P(S <= -|s|)
+    bool up_exact = false, dn_exact = false;
+
+    // Upper tail P(S >= |s|)
+    double up = kNaN;
+    const double u = std::fabs(s);
+    if (u > smax + tol) { up = 0.0; up_exact = true; }                       // outside the support
+    else if (u >= smax - tol && (s < 0.0 || observed_is_extreme(true))) {
+        const double lu = log_extreme(true);
+        up = std::isfinite(lu) ? std::exp(lu) : kNaN;
+        up_exact = std::isfinite(up);
+    } else {
+        up = spa_far_tail(u, c);
+    }
+
+    // Lower tail P(S <= -|s|)
+    double dn = kNaN;
+    const double l = -std::fabs(s);
+    if (l < smin - tol) { dn = 0.0; dn_exact = true; }                       // outside the support
+    else if (l <= smin + tol && (s > 0.0 || observed_is_extreme(false))) {
+        const double ll = log_extreme(false);
+        dn = std::isfinite(ll) ? std::exp(ll) : kNaN;
+        dn_exact = std::isfinite(dn);
+    } else {
+        dn = spa_far_tail(l, c);
+    }
+
     if (!std::isfinite(up) || !std::isfinite(dn)) return kNaN;
     const double p = up + dn;
     if (!std::isfinite(p) || p <= 0.0) return kNaN;
+    // Only claim an exact p when BOTH tails were exact or provably zero; a mix is a hybrid and is
+    // reported as the saddlepoint, which is what it mostly is.
+    if (exact_out != nullptr) *exact_out = (up_exact && dn_exact);
     return std::min(1.0, p);
 }
 
@@ -545,7 +576,7 @@ FitResult score_logistic(const std::vector<double>& X, const std::vector<double>
         double S = 0.0;
         for (std::size_t i = 0; i < n; ++i) S += gt[i] * (y[i] - mu[i]);
         bool exact = false;
-        const double ps = spa_two_sided(S, gt, mu, &exact);
+        const double ps = spa_two_sided(S, gt, mu, &y, &exact);
         if (std::isfinite(ps) && ps > 0.0) {
             r.p = std::max(ps, 1e-300);
             r.spa = !exact;
