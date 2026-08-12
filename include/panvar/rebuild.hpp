@@ -24,6 +24,17 @@ struct RebuildOptions {
                                      // a dedicated subfolder is created under it and removed on exit
     std::size_t threads = 0;         // worker threads (0 = auto)
     bool force = false;              // rebuild even if the gate says healthy (testing / small inputs)
+    // ---- acceptance contract ----
+    // minigraph augments variation ABOVE --min-var, so sub-threshold differences (SNPs, short indels)
+    // are collapsed by construction and a recovered walk is never byte-identical to its haplotype.
+    // The contract is therefore structural plus a threshold, not losslessness: every path must come
+    // back, spelling what it spelled before to within these bounds, or the rebuild is rejected and the
+    // original graph is passed through unchanged.
+    double min_recovered_identity = 0.98;  // per-path recovered-walk identity
+    double min_matched_cover = 0.95;       // per-path matching bases / haplotype length
+    std::string reference_path;            // if set, must be recovered and meet the bounds; else reject
+    bool allow_loss = false;               // accept a rebuild that fails the contract (records why)
+    std::string audit_path;                // per-path audit TSV (empty = <out>.rebuild_audit.tsv)
     bool quiet = false;
 };
 
@@ -56,7 +67,13 @@ struct RebuildSummary {
     double mean_walk_identity = 0.0;
     double min_walk_identity = 0.0;
     std::size_t walk_identity_checked = 0;   // haplotypes the walk check ran on
-    std::size_t walks_below_99 = 0;          // recovered at under 99% identity -- what R1 will gate on
+    std::size_t walks_below_99 = 0;          // recovered at under 99% identity
+    // ---- acceptance ----
+    bool accepted = false;                   // did the rebuild satisfy the contract?
+    std::string reject_reason;               // why not, when it did not
+    std::size_t paths_failing = 0;           // paths below the identity/cover bounds
+    std::size_t dangling_steps = 0;          // consecutive P steps with no emitted L
+    bool audit_written = false;
 };
 
 RebuildSummary rebuild_graph(const RebuildOptions& options);

@@ -65,3 +65,28 @@ Three different questions, which one number used to answer:
 | `recovered-walk identity` | edit identity of the walk re-spelled from the **rebuilt** graph against the original haplotype | what a caller actually gets back — an error anywhere in mapping, chain choice or emission |
 
 The distinction is not academic. On the C4 locus (131 haplotypes, forced rebuild) the envelope reads **0.9999** while matched cover is **0.9910** and the worst recovered walk is **0.9740** — so a `98–99%` acceptance threshold read off the envelope would pass a haplotype that comes back 97.4% correct. `recovered-walk identity` is the quantity such a threshold has to be stated in, and the run reports how many haplotypes fall below 0.99.
+
+## The acceptance contract
+
+`rebuild` drives minigraph, which augments variation **above `--min-var`** — sub-threshold differences (SNPs, short indels) are collapsed by construction, so a recovered walk is never byte-identical to the haplotype it came from. Losslessness is therefore the wrong contract. What is checked instead is structural, plus a threshold:
+
+- every input path comes back as a walk;
+- every consecutive pair of steps on that walk is joined by a link that exists in the emitted graph;
+- matched cover ≥ `--min-matched-cover` (default `0.95`) and recovered-walk identity ≥ `--min-recovered-identity` (default `0.98`);
+- if `-r/--reference-path` is given, that path must be present and meet the same bounds.
+
+**If any of these fails, the rebuilt graph is discarded and the original is written unchanged**, with the reason stated. A graph that silently drops or truncates a haplotype is worse than no rebuild, because everything downstream would then agree with it. `--allow-loss` accepts anyway and records what was violated.
+
+The reference clause is about **recovery, not seeding**. Which haplotype seeds the graph stays richness-driven — that is deliberate — but a reference that did not come back invalidates every reference-relative bubble and call downstream, so it is checked.
+
+### Audit sidecar
+
+`<out>.rebuild_audit.tsv`, one row per path: `original_bp`, `recovered_steps`, `envelope_cover`, `matched_cover`, `chain_identity`, `walk_identity`, and a `status` of `ok` / `not_recovered` / `low_cover` / `low_identity`. The verdict can then be read rather than trusted — on C4 at the default bounds, 130 paths are `ok` and one is `low_identity` at 0.9740, which is the single haplotype that rejects the run.
+
+| flag | what it does | default |
+|------|--------------|---------|
+| `--min-recovered-identity <X>` | per-path recovered-walk identity bound | `0.98` |
+| `--min-matched-cover <X>` | per-path matching bases / haplotype length | `0.95` |
+| `-r, --reference-path <name>` | this path must be recovered within the bounds | none |
+| `--allow-loss` | accept a rebuild that fails the contract, recording why | off |
+| `--audit <path>` | where to write the sidecar | `<out>.rebuild_audit.tsv` |

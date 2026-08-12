@@ -247,7 +247,7 @@ if(PANVAR_BUILD_TESTING)
         if(EXISTS ${PANVAR_REBUILD_STATS})
             add_test(
                 NAME panvar_rebuild_stats
-                COMMAND /usr/bin/env bash ${PANVAR_REBUILD_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/rebuild_stats
+                COMMAND /usr/bin/env bash ${PANVAR_REBUILD_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/rebuild_stats ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_data/c4.gfa.gz
             )
             set_tests_properties(panvar_rebuild_stats PROPERTIES TIMEOUT 180)
         endif()

@@ -74,6 +74,52 @@ for c in "e_missing:missing node" "e_dup:duplicate path name" "e_nostar:node wit
   [ ! -s "$OUT/$f.out.gfa" ] && ok "  ... and wrote no output" || bad "$what left an output file behind"
 done
 
+# ---------------------------------------------------------------- the acceptance contract
+# minigraph augments variation above --min-var, so sub-threshold differences are collapsed by
+# construction and a recovered walk is never byte-identical. The contract is therefore structural plus
+# a threshold: every path back, every step pair backed by an edge, identity/cover above the bounds --
+# otherwise the rebuilt graph is discarded and the ORIGINAL is written.
+if [ -n "$SRC" ] && [ -s "$SRC" ]; then
+  in_nodes=$(grep -c '^S' "$GFA"); in_paths=$(grep -c '^P' "$GFA")
+
+  # An identity bound nothing can satisfy must reject and roll back.
+  "$BIN" rebuild -i "$GFA" -o "$OUT/strict.gfa" --force --min-recovered-identity 0.999999 \
+    > "$OUT/strict.log" 2>&1
+  grep -q "rejected" "$OUT/strict.log" && ok "an unsatisfiable contract is rejected" \
+                                       || bad "an unsatisfiable contract was accepted"
+  [ "$(grep -c '^S' "$OUT/strict.gfa")" = "$in_nodes" ] \
+    && ok "  ... and the ORIGINAL graph was written ($in_nodes nodes)" \
+    || bad "rollback did not restore the original graph"
+  [ "$(grep -c '^P' "$OUT/strict.gfa")" = "$in_paths" ] \
+    && ok "  ... with every path intact ($in_paths)" || bad "rollback lost paths"
+
+  # --allow-loss accepts the same run and says so.
+  "$BIN" rebuild -i "$GFA" -o "$OUT/loss.gfa" --force --min-recovered-identity 0.999999 \
+    --allow-loss > "$OUT/loss.log" 2>&1
+  grep -q "WARNING" "$OUT/loss.log" && ok "--allow-loss accepts but warns" \
+                                    || bad "--allow-loss did not warn"
+
+  # A reference that is not in the graph must reject, whatever else passes.
+  "$BIN" rebuild -i "$GFA" -o "$OUT/badref.gfa" --force -r "NOT_A_REAL_PATH_XYZ" \
+    > "$OUT/badref.log" 2>&1
+  grep -q "reference path not found" "$OUT/badref.log" \
+    && ok "a missing reference path is rejected" || bad "a missing reference path was accepted"
+
+  # The audit sidecar must have one row per path and name a status for each.
+  aud="$OUT/strict.gfa.rebuild_audit.tsv"
+  if [ -s "$aud" ]; then
+    rows=$(( $(wc -l < "$aud") - 1 ))
+    [ "$rows" = "$in_paths" ] && ok "audit has one row per path ($rows)" \
+                              || bad "audit has $rows rows for $in_paths paths"
+    bad_status=$(awk -F'\t' 'NR>1 && $8!="ok" && $8!="not_recovered" && $8!="low_cover" && $8!="low_identity"' "$aud" | wc -l | tr -d ' ')
+    [ "$bad_status" = "0" ] && ok "every audit row carries a known status" \
+                            || bad "$bad_status audit rows have an unrecognised status"
+  else
+    bad "no audit sidecar was written"
+  fi
+fi
+
+
 echo
 if [ "$fails" -eq 0 ]; then echo "rebuild_stats: all assertions passed"; exit 0; fi
 echo "rebuild_stats: $fails assertion(s) FAILED"; exit 1

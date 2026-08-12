@@ -73,6 +73,13 @@ int run_rebuild_command(const std::vector<std::string>& args) {
         else if (arg == "--min-hubs") opt.min_hubs = cli::parse_size_arg(arg, require_value(arg));
         else if (arg == "-t" || arg == "--threads") opt.threads = cli::parse_size_arg(arg, require_value(arg));
         else if (arg == "--force") opt.force = true;
+        else if (arg == "--min-recovered-identity")
+            opt.min_recovered_identity = cli::parse_unit_fraction_arg(arg, require_value(arg));
+        else if (arg == "--min-matched-cover")
+            opt.min_matched_cover = cli::parse_unit_fraction_arg(arg, require_value(arg));
+        else if (arg == "-r" || arg == "--reference-path") opt.reference_path = require_value(arg);
+        else if (arg == "--allow-loss") opt.allow_loss = true;
+        else if (arg == "--audit") opt.audit_path = require_value(arg);
         else if (arg == "-q" || arg == "--quiet") opt.quiet = true;
         else throw std::runtime_error("Unknown option: " + arg);
     }
@@ -99,9 +106,26 @@ int run_rebuild_command(const std::vector<std::string>& args) {
 
     cli::RunLog log("rebuild", opt.quiet);
     const RebuildSummary s = rebuild_graph(opt);
-    log.info((s.ran ? "rebuilt" : "passed through") + std::string(": ") + std::to_string(s.raw_nodes) +
-             " -> " + std::to_string(s.out_nodes) + " nodes; seed=" + (s.seed.empty() ? "-" : s.seed));
-    log.wrote({opt.out_path});
+    // Report what was actually WRITTEN. Saying "rebuilt: 4740 -> 31 nodes" after the contract rejected
+    // the rebuild and the original was passed through describes a file that does not exist.
+    if (!s.ran) {
+        log.info("passed through: " + std::to_string(s.raw_nodes) + " nodes (graph is not pathological)");
+    } else if (s.accepted || opt.allow_loss) {
+        log.info(std::string(s.accepted ? "rebuilt" : "rebuilt (contract not met, accepted with "
+                                                     "--allow-loss)") + ": " +
+                 std::to_string(s.raw_nodes) + " -> " + std::to_string(s.out_nodes) +
+                 " nodes; seed=" + (s.seed.empty() ? "-" : s.seed) + "; " +
+                 std::to_string(s.paths_recovered) + "/" + std::to_string(s.haplotypes) +
+                 " paths recovered");
+    } else {
+        log.info("rejected: the rebuild would have been " + std::to_string(s.raw_nodes) + " -> " +
+                 std::to_string(s.out_nodes) + " nodes, but " + s.reject_reason +
+                 "; the original graph was written unchanged");
+    }
+    std::vector<std::string> written{opt.out_path};
+    if (s.audit_written)
+        written.push_back(opt.audit_path.empty() ? opt.out_path + ".rebuild_audit.tsv" : opt.audit_path);
+    log.wrote(written);
     log.done();
     return 0;
 }

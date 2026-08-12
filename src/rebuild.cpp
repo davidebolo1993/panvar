@@ -509,6 +509,7 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
     // Segments are renamed to consecutive integers: minigraph names them "s1", "s2", ... and tooling
     // that stores node ids as integers (odgi) rejects non-numeric names outright. The original name is
     // kept as an SN tag.
+    std::filesystem::path staged_out;
     if (!options.out_path.empty()) {
         const std::filesystem::path staged = staging_path(options.out_path);
         std::ofstream o(staged);
@@ -540,9 +541,10 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
         o.flush();
         if (!o) throw std::runtime_error("rebuild: failed writing " + staged.string());
         o.close();
-        commit_staged(staged, options.out_path);
+        staged_out = staged;   // committed only if the acceptance contract below is satisfied
     }
 
+    std::vector<double> walk_id;
     // ---- recovered-walk identity: the end-to-end check ----
     // Re-spell each recovered walk from the REBUILT graph and compare it with the haplotype the input
     // spelled. Chain coverage and identity describe the alignment; this describes what a caller
@@ -552,7 +554,8 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
         std::vector<std::string> seg_seq(out->n_seg);
         for (std::uint32_t i = 0; i < out->n_seg; ++i)
             seg_seq[i] = out->seg[i].seq ? out->seg[i].seq : std::string();
-        std::vector<double> wid(g.paths.size(), -1.0);
+        walk_id.assign(g.paths.size(), -1.0);
+        std::vector<double>& wid = walk_id;
         run_parallel(g.paths.size(), options.threads, [&](std::size_t h) {
             if (walks[h].empty() || hseq[h].empty()) return;
             std::string spelled;
@@ -582,6 +585,134 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
         step("recovered-walk identity over " + std::to_string(wn) + " haplotypes: mean " +
              fmt2(sum.mean_walk_identity) + ", worst " + fmt2(sum.min_walk_identity) + "; " +
              std::to_string(wpoor) + " below 0.99");
+    }
+
+    // ---- acceptance contract, and the audit that explains its verdict ----
+    //
+    // minigraph augments variation ABOVE --min-var, so sub-threshold differences are collapsed by
+    // construction and a recovered walk is never byte-identical to its haplotype. The contract is
+    // therefore structural plus a threshold, not losslessness: every path must come back, its steps
+    // must be connected by edges that exist, and it must spell what it spelled before to within the
+    // declared bounds. Anything less and the rebuilt graph is discarded and the ORIGINAL passed
+    // through, because a graph that silently drops or truncates a haplotype is worse than no rebuild:
+    // everything downstream would agree with it.
+    {
+        // Every consecutive pair of steps on an emitted walk needs a link that actually exists, or the
+        // P line describes a traversal the graph does not permit.
+        // Both orientations of every link. A GFA stores each edge once and minigraph marks the dual as
+        // `comp`, which the emitter skips -- so a walk traversing an edge the other way round finds no
+        // arc and would be reported as dangling when the graph is perfectly well formed. For v -> w the
+        // dual is (w^1) -> (v^1).
+        std::unordered_set<std::uint64_t> arcs;
+        arcs.reserve(static_cast<std::size_t>(out->n_arc) * 4);
+        for (std::uint64_t k = 0; k < out->n_arc; ++k) {
+            const gfa_arc_t& a = out->arc[k];
+            if (a.del) continue;
+            const std::uint32_t v = static_cast<std::uint32_t>(a.v_lv >> 32);
+            arcs.insert((static_cast<std::uint64_t>(v) << 32) | a.w);
+            arcs.insert((static_cast<std::uint64_t>(a.w ^ 1) << 32) | (v ^ 1));
+        }
+        std::size_t missing_paths = 0, dangling = 0, failing = 0;
+        std::string first_bad;
+        for (std::size_t h = 0; h < g.paths.size(); ++h) {
+            if (walks[h].empty()) {
+                ++missing_paths;
+                if (first_bad.empty()) first_bad = g.paths[h].name + " (no walk recovered)";
+                continue;
+            }
+            for (std::size_t j = 1; j < walks[h].size(); ++j) {
+                const std::uint64_t key = (static_cast<std::uint64_t>(walks[h][j - 1]) << 32) | walks[h][j];
+                if (!arcs.count(key)) {
+                    ++dangling;
+                    if (first_bad.empty()) first_bad = g.paths[h].name + " (a step pair has no edge)";
+                    break;
+                }
+            }
+            const double id = h < walk_id.size() ? walk_id[h] : -1.0;
+            if (matched[h] < options.min_matched_cover || (id >= 0.0 && id < options.min_recovered_identity)) {
+                ++failing;
+                if (first_bad.empty())
+                    first_bad = g.paths[h].name + " (identity " + fmt2(id < 0 ? 0.0 : id) +
+                                ", matched cover " + fmt2(matched[h]) + ")";
+            }
+        }
+        sum.paths_failing = failing;
+        sum.dangling_steps = dangling;
+
+        // The reference, if named, is held to the same bounds and must be present: everything
+        // downstream is reference-relative, so a reference that did not come back invalidates the lot.
+        // Seeding stays richness-driven; this is about RECOVERY, not about which haplotype seeds.
+        bool ref_ok = true;
+        if (!options.reference_path.empty()) {
+            std::size_t ri = g.paths.size();
+            for (std::size_t h = 0; h < g.paths.size(); ++h)
+                if (g.paths[h].name == options.reference_path ||
+                    g.paths[h].name.find(options.reference_path) != std::string::npos) { ri = h; break; }
+            if (ri == g.paths.size()) {
+                ref_ok = false;
+                sum.reject_reason = "reference path not found in the input: " + options.reference_path;
+            } else if (walks[ri].empty()) {
+                ref_ok = false;
+                sum.reject_reason = "reference path was not recovered: " + g.paths[ri].name;
+            } else {
+                const double rid = ri < walk_id.size() ? walk_id[ri] : -1.0;
+                if (matched[ri] < options.min_matched_cover ||
+                    (rid >= 0.0 && rid < options.min_recovered_identity)) {
+                    ref_ok = false;
+                    sum.reject_reason = "reference path recovered below the contract: " +
+                                        g.paths[ri].name + " (identity " + fmt2(rid < 0 ? 0.0 : rid) +
+                                        ", matched cover " + fmt2(matched[ri]) + ")";
+                }
+            }
+        }
+
+        if (sum.reject_reason.empty()) {
+            if (missing_paths > 0)
+                sum.reject_reason = std::to_string(missing_paths) + " haplotype(s) not recovered, first: " + first_bad;
+            else if (dangling > 0)
+                sum.reject_reason = std::to_string(dangling) + " walk(s) contain a step pair with no edge, first: " + first_bad;
+            else if (failing > 0)
+                sum.reject_reason = std::to_string(failing) + " haplotype(s) below the contract, first: " + first_bad;
+        }
+        sum.accepted = ref_ok && sum.reject_reason.empty();
+
+        // ---- audit sidecar: one row per path, so the verdict can be read rather than trusted ----
+        const std::string audit = !options.audit_path.empty()
+                                      ? options.audit_path
+                                      : (options.out_path.empty() ? std::string()
+                                                                  : options.out_path + ".rebuild_audit.tsv");
+        if (!audit.empty()) {
+            std::ofstream a(audit);
+            if (a) {
+                a << "path\toriginal_bp\trecovered_steps\tenvelope_cover\tmatched_cover\tchain_identity"
+                     "\twalk_identity\tstatus\n";
+                for (std::size_t h = 0; h < g.paths.size(); ++h) {
+                    const double id = h < walk_id.size() ? walk_id[h] : -1.0;
+                    std::string status = "ok";
+                    if (walks[h].empty()) status = "not_recovered";
+                    else if (matched[h] < options.min_matched_cover) status = "low_cover";
+                    else if (id >= 0.0 && id < options.min_recovered_identity) status = "low_identity";
+                    a << g.paths[h].name << '\t' << hseq[h].size() << '\t' << walks[h].size() << '\t'
+                      << fmt2(cover[h]) << '\t' << fmt2(matched[h]) << '\t' << fmt2(chain_id[h]) << '\t'
+                      << (id < 0.0 ? std::string("NA") : fmt2(id)) << '\t' << status << '\n';
+                }
+                sum.audit_written = true;
+            }
+        }
+
+        if (!staged_out.empty()) {
+            if (sum.accepted || options.allow_loss) {
+                if (!sum.accepted)
+                    step("WARNING: accepting a rebuild that fails the contract (--allow-loss): " +
+                         sum.reject_reason);
+                commit_staged(staged_out, options.out_path);
+            } else {
+                std::error_code ec;
+                std::filesystem::remove(staged_out, ec);
+                step("REJECTED: " + sum.reject_reason + " -- passing the original graph through unchanged");
+                copy_file(options.gfa_path, options.out_path);
+            }
+        }
     }
 
     // ---- structural summary of what we emitted ----
