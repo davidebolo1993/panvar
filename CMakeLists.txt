@@ -228,6 +228,18 @@ if(PANVAR_BUILD_TESTING)
             )
         endif()
 
+        # Deterministic statistical assertions for `associate`: linear p against R's lm() (the normal
+        # tail would be 83 orders of magnitude out at 9 df), the logistic separation contract, case/
+        # control carrier counts, and GRM rejection. No RNG, no R at run time, ~1s.
+        set(PANVAR_ASSOC_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/associate_stats.sh)
+        if(EXISTS ${PANVAR_ASSOC_STATS})
+            add_test(
+                NAME panvar_associate_stats
+                COMMAND /usr/bin/env bash ${PANVAR_ASSOC_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/associate_stats
+            )
+            set_tests_properties(panvar_associate_stats PROPERTIES TIMEOUT 120)
+        endif()
+
         # Real-data integration smoke: the whole bubble -> inspect -> describe -> panphorte
         # -> call pipeline on a committed locus, asserting each stage's outputs. Registered on
         # C4 (the smallest graph, ~3s, no external tools) so the pipeline is exercised end-to-end

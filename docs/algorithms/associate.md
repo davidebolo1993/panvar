@@ -6,13 +6,13 @@ Mechanism for the `associate` module. For usage/flags see [modules/associate.md]
 
 ## How it works
 
-### 1. Fit and Wald-test each unit
+### 1. Fit and test each unit
 
-Per unit, `associate` fits `phenotype ~ genotype + covariates` and reports a Wald test on the genotype term:
+Per unit, `associate` fits `phenotype ~ genotype + covariates` and tests the genotype term. **Quantitative traits** get a Wald test with a **Student-t** tail on `n − p` degrees of freedom — `σ²` is estimated from the same residuals, so the statistic is t-distributed, and the normal tail is anti-conservative (at 9 df a `z` of 20.4 is `p = 7.6e-09` under t and `1.3e-92` under the normal). **Binary traits** get a covariate-adjusted **Rao score test** instead, because the Wald statistic collapses under near-separation; see [modules/associate.md](../modules/associate.md#calibration). For those, `z` and `p` come from the score test while `log_or` and `se` remain the maximum-likelihood effect size, so `p` is not recoverable from them.
 
 - linear (quantitative trait) — ordinary least squares (OLS); `β = (XᵀX)⁻¹Xᵀy`, `Var(β) = σ²·(XᵀX)⁻¹` with `σ² = RSS/(n−p)` (RSS is the residual sum of squares).
 - logistic (binary trait) — iteratively reweighted least squares (IRLS) Newton–Raphson; `β`, `Var(β) = (Xᵀ W X)⁻¹` at convergence.
-- Wald p — `z = β_genotype / se`, `p = erfc(|z|/√2)` (the upper tail computed directly via `erfc` to avoid the cancellation of `1 − Φ(|z|)` at large `|z|`), floored at `1e-300`.
+- p — `z = β_genotype / se`, and for a quantitative trait `p = 2·P(T_{n−p} > |z|)` via the regularized incomplete beta (validated against R's `pt()` to a relative error below 3.3e-12). The normal form `erfc(|z|/√2)` — the upper tail computed directly to avoid the cancellation of `1 − Φ(|z|)` at large `|z|` — is what the score test uses for its chi-square-on-1-df tail. Floored at `1e-300`.
 
 The unit is auto-detected from the `layer` column of `feature_annot` — `variant` when the majority of rows are variant-level, otherwise `feature` (override with `--unit`). Across all tested units the genomic-inflation factor `λ = median(z²)/0.4549` (the observed median z² over the null median of a χ²₁, `0.4549`) is reported in the summary: `λ ≈ 1` means the test is calibrated, `λ > 1` flags residual structure.
 
@@ -45,11 +45,11 @@ The summary reports `unit`, `meff`, both Bonferroni thresholds, and a unit-named
 
 ### 4. Establish independence — conditioning (phenotype-aware)
 
-Clumping and `Meff` fix the threshold; they do not establish that a hit is independent. A marginal test of a variant only weakly correlated with an extremely strong locus still comes out genome-wide significant — even when its r² is far below `--ld-r2`, so clumping never groups it. A conditional refit is the only honest way to separate a true signal from such a shadow, so `associate` runs one on every tier and reports `p_conditional` (a unit's Wald p after the lead signal(s) enter the model as covariates) plus `cond_role` (its status). This step is deliberately separate from the phenotype-blind `Meff`, so the threshold cannot become circular.
+Clumping and `Meff` fix the threshold; they do not establish that a hit is independent. A marginal test of a variant only weakly correlated with an extremely strong locus still comes out genome-wide significant — even when its r² is far below `--ld-r2`, so clumping never groups it. A conditional refit is the only honest way to separate a true signal from such a shadow, so `associate` runs one on every tier and reports `p_conditional` (a unit's p — same test as the marginal one — after the lead signal(s) enter the model as covariates, restricted to samples observed for the target and every conditioning feature, reported as `n_conditional`) plus `cond_role` (its status). This step is deliberately separate from the phenotype-blind `Meff`, so the threshold cannot become circular.
 
 Variant tier — forward-stepwise conditional-and-joint (COJO-style) analysis. Select a set of jointly-independent signals:
 
-1. compute each variant's p conditioned on the currently-selected set (its dosage(s) added as covariates; the genotype of interest stays the Wald target);
+1. compute each variant's p conditioned on the currently-selected set (its dosage(s) added as covariates; the genotype of interest stays the target of the same test used marginally);
 2. add the variant with the smallest conditional p if it clears the entry threshold `--cojo-p` (default `0.05/Meff`);
 3. repeat until nothing new clears the bar.
 
@@ -66,7 +66,7 @@ Full forward-stepwise across thousands of correlated features would be unstable,
 The two correction layers in order:
 
 ```text
-1. TEST       per feature/variant: phenotype ~ genotype + covariates(+PCs)  -> Wald -> marginal p
+1. TEST       per feature/variant: phenotype ~ genotype + covariates(+PCs)  -> Student-t (quantitative) / score (binary) -> marginal p
 2. MAF FILTER drop minor (non-modal) freq < --min-maf
 ── Layer A: multiple-testing BURDEN (phenotype-blind) ───────────────────────────────────
 3. Meff       variant: LD-clump by genotype r² > --ld-r2 (low-AF can't lead) -> Meff = #leads
@@ -95,7 +95,7 @@ s5       6   0.5
 
 1. Filter on minor frequency. Round the dosages to `{2,2,4,6,6}`; the modal value occurs twice of five, so the minor (non-modal) frequency is `1 − 2/5 = 0.60`. That clears `--min-maf`, so the feature is tested.
 2. Fit `y ≈ a + b·g` by ordinary least squares. With `ḡ = 4` and `ȳ = 1.04`, the sums of squares are `Sgg = Σ(g−ḡ)² = 16` and `Sgy = Σ(g−ḡ)(y−ȳ) = −3.20`, giving slope `b = Sgy/Sgg = −0.20` and intercept `a = ȳ − b·ḡ = 1.84`.
-3. Wald-test the slope. The fitted values `1.44, 1.44, 1.04, 0.64, 0.64` leave residuals `−0.14, 0.16, −0.04, 0.16, −0.14`, so `RSS = 0.092`, `σ² = RSS/(n−2) = 0.0307`, `Var(b) = σ²/Sgg = 0.00192` and `se = 0.0438`. Then `z = b/se = −4.57` and `p = erfc(|z|/√2) = erfc(3.23) ≈ 5e-6`. Covariates only widen `X` and change `Var(b_g) = σ²·[(XᵀX)⁻¹]_gg`; a binary trait swaps this OLS for the IRLS-reweighted logistic fit, and the Wald test is otherwise identical.
+3. Wald-test the slope. The fitted values `1.44, 1.44, 1.04, 0.64, 0.64` leave residuals `−0.14, 0.16, −0.04, 0.16, −0.14`, so `RSS = 0.092`, `σ² = RSS/(n−2) = 0.0307`, `Var(b) = σ²/Sgg = 0.00192` and `se = 0.0438`. Then `z = b/se = −4.57`, and on `n − p = 3` degrees of freedom `p = 2·P(T₃ > 4.57) ≈ 0.020` — the normal tail would say `5e-6`, which at this sample size is simply wrong. Covariates only widen `X` and change `Var(b_g) = σ²·[(XᵀX)⁻¹]_gg`; a binary trait swaps this OLS for the IRLS-reweighted logistic fit and reports a score test rather than a Wald one.
 
 Result for this feature:
 

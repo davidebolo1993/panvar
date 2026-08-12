@@ -192,7 +192,10 @@ FitResult fit_linear(const std::vector<double>& X, const std::vector<double>& y,
     r.beta = beta[1];
     r.se = std::sqrt(var_b1);
     r.z = r.beta / r.se;
-    r.p = wald_p(r.z);
+    // Student-t on n - p degrees of freedom, not the normal: sigma^2 is estimated from the same
+    // residuals, so the statistic is t-distributed. Immaterial at GWAS n, but panvar is a locus tool and
+    // a few dozen samples is a realistic cohort, where the normal tail is anti-conservative.
+    r.p = student_p(r.z, static_cast<double>(n - p));
     r.ok = std::isfinite(r.p);
     return r;
 }
@@ -707,7 +710,14 @@ int run_associate_command(const std::vector<std::string>& args) {
             if (es.info() != Eigen::Success)
                 throw std::runtime_error("--kinship eigendecomposition failed; the matrix is not usable");
             const double lo = es.eigenvalues().minCoeff(), hi = es.eigenvalues().maxCoeff();
-            if (hi > 0.0 && lo < -1e-6 * hi)
+            // Scale the tolerance by max(1, |hi|) rather than hi: gating on `hi > 0` let a negative
+            // DEFINITE matrix (-I has hi < 0) skip the check entirely.
+            const double tol = 1e-6 * std::max(1.0, std::fabs(hi));
+            for (std::size_t a = 0; a < n_used; ++a)
+                if (K(static_cast<Eigen::Index>(a), static_cast<Eigen::Index>(a)) < -tol)
+                    throw std::runtime_error("--kinship has a negative diagonal entry at " +
+                                             std::to_string(a + 1) + "; it is not a covariance matrix");
+            if (lo < -tol)
                 throw std::runtime_error("--kinship is not positive semi-definite (smallest eigenvalue " +
                                          std::to_string(lo) + " against a largest of " + std::to_string(hi) +
                                          "); it is not a valid GRM");
@@ -814,6 +824,15 @@ int run_associate_command(const std::vector<std::string>& args) {
         int is_lead = -1;         // 1/0 lead-of-clump (variant mode), -1 -> "."
         std::size_t n = 0;
         double minor_freq = kNaN, beta = kNaN, se = kNaN, z = kNaN, p = kNaN;
+        // Whether the effect estimate is usable. `ok` = the maximum-likelihood fit converged.
+        // `separation` = it did not (logistic, near-complete separation), so log_or/se are absent while
+        // the score test's p remains valid -- the score test never fits the alternative. Reporting the
+        // p without saying the effect size is missing for a REASON is what makes that confusing.
+        std::string effect_status = "ok";
+        // Binary traits: the minor-allele carrier count split by case/control. Total MAC hides what
+        // actually governs asymptotic reliability -- 1 case / 19 controls is far weaker than 10 / 10 at
+        // the same MAC, and it is the imbalanced one that drives a score statistic into its bad tail.
+        long mac_case = -1, mac_ctrl = -1;
     };
     std::vector<Row> rows;
     // Variant tier only: full-length mean-imputed dosage per retained row, for LD r^2 between variants.
@@ -884,6 +903,7 @@ int run_associate_command(const std::vector<std::string>& args) {
         if (minor_freq < opt.min_maf) { ++n_dropped_maf; continue; }
 
         FitResult fr;
+        std::string row_effect_status = "ok";
         if (is_lmm) {
             fr = lmm_test(lmm, glmm);
         } else {
@@ -896,17 +916,23 @@ int run_associate_command(const std::vector<std::string>& args) {
             }
             fr = (model == "logistic") ? fit_logistic(X, yy, n, p_dim) : fit_linear(X, yy, n, p_dim);
             if (model == "logistic") {
+                bool separated = false;
                 // Keep the Wald fit's beta/se as the effect size, but report the SCORE test's p. The two
                 // agree for common features and diverge exactly where the Wald one breaks -- a rare
                 // variant in an unbalanced case/control study, where near-separation inflates the
                 // standard error and collapses the statistic.
                 const FitResult sc = score_logistic(X, yy, n, p_dim);
-                if (sc.ok) { fr.z = sc.z; fr.p = sc.p; fr.ok = true; }
+                if (sc.ok) {
+                    if (!fr.ok) { fr.beta = kNaN; fr.se = kNaN; separated = true; }
+                    fr.z = sc.z; fr.p = sc.p; fr.ok = true;
+                }
+                if (separated) row_effect_status = "separation";
             }
         }
         if (!fr.ok) { ++n_dropped_fit; continue; }
 
         Row row;
+        row.effect_status = row_effect_status;
         row.id = id;
         std::string ann_gene;
         if (auto it = annot.find(id); it != annot.end()) {
@@ -922,6 +948,14 @@ int run_associate_command(const std::vector<std::string>& args) {
         // must not be flagged. This metric is uniform for binary (0/1) and copy-number genotypes.
         if (variant_mode)
             row.low_af = (minor_freq * static_cast<double>(n) < static_cast<double>(opt.min_ac)) ? 1 : 0;
+        if (binary && g.size() == yy.size() && !g.empty()) {
+            long long modal = 0; std::size_t best = 0;
+            for (const auto& kv : cat) if (kv.second > best) { best = kv.second; modal = kv.first; }
+            long ca = 0, co = 0;
+            for (std::size_t t = 0; t < g.size(); ++t)
+                if (std::llround(g[t]) != modal) { if (yy[t] > 0.5) ++ca; else ++co; }
+            row.mac_case = ca; row.mac_ctrl = co;
+        }
         row.n = n; row.minor_freq = minor_freq;
         row.beta = fr.beta; row.se = fr.se; row.z = fr.z; row.p = fr.p;
         rows.push_back(std::move(row));
@@ -1027,13 +1061,18 @@ int run_associate_command(const std::vector<std::string>& args) {
     // collapse and true signals survive. Conditioning dosages enter as covariates with the genotype at
     // column 1, so FitResult is its conditional Wald. Linear/logistic only; LMM needs the rotation.
     std::vector<double> p_cond(rows.size(), kNaN);
+    // Samples the CONDITIONAL model actually used. It is the intersection of the target's complete cases
+    // with every conditioning feature's, so it can be smaller than the marginal `n` -- and then p and
+    // p_conditional are computed on different samples and are not directly comparable. Reporting it is
+    // the minimum; a reader can see when the comparison is clean and when it is not.
+    std::vector<std::size_t> n_cond(rows.size(), 0);
     // cond_role: variant tier -> "signal" (COJO-selected) / "shadow"; feature tier -> "lead" /
     // "collinear" (same-event redundancy, not scored) / "conditioned"; "." when not computed.
     std::vector<std::string> cond_role(rows.size(), ".");
     std::size_t cojo_n_signals = 0;
     if (variant_mode && !is_lmm && rows.size() > 1) {
         // conditional p of variant i given a set of conditioning dosage vectors (empty -> marginal-style).
-        auto cond_p = [&](std::size_t i, const std::vector<std::size_t>& cond) -> double {
+        auto cond_p = [&](std::size_t i, const std::vector<std::size_t>& cond, std::size_t* out_n) -> double {
             const std::size_t pc = p_dim + cond.size();        // intercept, g_i, covariates, |cond|
             // Complete cases over the target and every conditioning variant, matching what the marginal
             // test did. Under the LMM the rotation is over a fixed sample set, so everything is imputed
@@ -1047,6 +1086,7 @@ int run_associate_command(const std::vector<std::string>& args) {
                 if (ok) keep.push_back(u);
             }
             const std::size_t nk = keep.size();
+            if (out_n != nullptr) *out_n = nk;
             if (nk <= pc + 1) return kNaN;
             std::vector<double> X(nk * pc), yk(nk);
             for (std::size_t k = 0; k < nk; ++k) {
@@ -1071,7 +1111,7 @@ int run_associate_command(const std::vector<std::string>& args) {
             std::size_t best = rows.size(); double best_p = std::numeric_limits<double>::infinity();
             for (std::size_t i = 0; i < rows.size(); ++i) {
                 if (in_sel[i] || !std::isfinite(rows[i].p)) continue;
-                const double pc_i = cond_p(i, selected);
+                const double pc_i = cond_p(i, selected, nullptr);
                 if (std::isfinite(pc_i) && pc_i < best_p) { best_p = pc_i; best = i; }
             }
             if (best == rows.size() || !(best_p < entry)) break;   // nothing new clears the bar
@@ -1084,7 +1124,7 @@ int run_associate_command(const std::vector<std::string>& args) {
             cond_role[i] = in_sel[i] ? "signal" : "shadow";
             std::vector<std::size_t> cond;
             for (std::size_t c : selected) if (c != i) cond.push_back(c);
-            if (!cond.empty()) p_cond[i] = cond_p(i, cond);   // empty cond (the sole signal) -> NA
+            if (!cond.empty()) p_cond[i] = cond_p(i, cond, &n_cond[i]);   // empty cond (sole signal) -> NA
         }
     } else if (!variant_mode && !is_lmm && rows.size() > 1) {
         // --- feature-tier single-lead conditional p with a within-bubble collinearity guard ---
@@ -1162,7 +1202,7 @@ int run_associate_command(const std::vector<std::string>& args) {
                 }
                 const FitResult fc = (model == "logistic") ? score_logistic(X, yk, nk, pc)
                                                            : fit_linear(X, yk, nk, pc);
-                if (fc.ok) { p_cond[i] = fc.p; cond_role[i] = "conditioned"; }
+                if (fc.ok) { p_cond[i] = fc.p; n_cond[i] = nk; cond_role[i] = "conditioned"; }
             }
         }
     }
@@ -1206,9 +1246,11 @@ int run_associate_command(const std::vector<std::string>& args) {
     {
         std::ofstream out(opt.out_prefix + ".assoc.tsv");
         if (!out) throw std::runtime_error("cannot write " + opt.out_prefix + ".assoc.tsv");
-        // p_bonf = raw 0.05/n_tests scaling; p_bonf_meff = the honest effective-tests scaling (Meff).
-        out << "feature_id\tlayer\tbubbles\tnodes\tn\tminor_freq\t" << effect
-            << "\tse\tz\tp\tp_bonf\tp_bonf_meff\tq_bh\taf\tan\tlow_af\tclump\tis_lead\tgene"
+        // p_bonf = raw 0.05/n_tests. p_bonf_meff scales by Meff, an LD-CLUMPING heuristic that is
+        // seeded in p-value order and therefore depends on the phenotype -- it is not a phenotype-blind
+        // effective-test count and gives no formal family-wise guarantee. q_bh is the primary control.
+        out << "feature_id\tlayer\tbubbles\tnodes\tn\tn_conditional\tminor_freq\t" << effect
+            << "\tse\tz\tp\teffect_status\tmac_case\tmac_ctrl\tp_bonf\tp_bonf_meff\tq_bh\taf\tan\tlow_af\tclump\tis_lead\tgene"
                "\tp_conditional\tcond_role\n";
         for (std::size_t k = 0; k < n_tests; ++k) {
             const std::size_t i = order[k];
@@ -1216,8 +1258,12 @@ int run_associate_command(const std::vector<std::string>& args) {
             const double p_bonf = std::isfinite(r.p) ? std::min(1.0, r.p * static_cast<double>(n_tests)) : kNaN;
             const double p_bonf_meff = std::isfinite(r.p) ? std::min(1.0, r.p * static_cast<double>(meff)) : kNaN;
             out << r.id << '\t' << r.layer << '\t' << r.bubbles << '\t' << r.nodes << '\t'
-                << r.n << '\t' << fmt(r.minor_freq) << '\t' << fmt(r.beta) << '\t' << fmt(r.se)
-                << '\t' << fmt(r.z) << '\t' << fmt(r.p) << '\t' << fmt(p_bonf) << '\t' << fmt(p_bonf_meff)
+                << r.n << '\t' << (n_cond[i] ? std::to_string(n_cond[i]) : std::string("."))
+                << '\t' << fmt(r.minor_freq) << '\t' << fmt(r.beta) << '\t' << fmt(r.se)
+                << '\t' << fmt(r.z) << '\t' << fmt(r.p) << '\t' << r.effect_status
+                << '\t' << (r.mac_case < 0 ? std::string(".") : std::to_string(r.mac_case))
+                << '\t' << (r.mac_ctrl < 0 ? std::string(".") : std::to_string(r.mac_ctrl))
+                << '\t' << fmt(p_bonf) << '\t' << fmt(p_bonf_meff)
                 << '\t' << fmt(qv[i]) << '\t' << r.af << '\t' << r.an << '\t' << flag(r.low_af)
                 << '\t' << flag(r.clump) << '\t' << flag(r.is_lead) << '\t' << r.gene
                 << '\t' << fmt(p_cond[i]) << '\t' << cond_role[i] << '\n';
@@ -1257,6 +1303,22 @@ int run_associate_command(const std::vector<std::string>& args) {
     log.info("unit " + std::string(variant_mode ? "variant" : "feature") + "; tested " +
              std::to_string(n_tests) + ", Meff " + std::to_string(meff) + ", dropped " +
              std::to_string(n_dropped_maf) + " (MAF) + " + std::to_string(n_dropped_fit) + " (fit)");
+    if (binary) {
+        // The score test is well calibrated in the body but still mildly anti-conservative in the far
+        // tail for very rare features (measured: 0.0025 against a nominal 0.001), and a regional
+        // Bonferroni threshold can sit right there. SPA is the standard remedy and is not implemented,
+        // so say so rather than let a rare binary hit be read as a calibrated discovery.
+        std::size_t n_rare = 0, n_imbal = 0;
+        for (const Row& r : rows) {
+            if (std::isfinite(r.minor_freq) && r.minor_freq < 0.01) ++n_rare;
+            if (r.mac_case >= 0 && r.mac_case < 10) ++n_imbal;
+        }
+        if (n_rare > 0 || n_imbal > 0)
+            log.info("WARNING: " + std::to_string(n_rare) + " features below 1% minor frequency and " +
+                     std::to_string(n_imbal) + " with fewer than 10 minor-allele carriers among cases. "
+                     "The score test is not saddlepoint-corrected (no SPA), so p-values for those in the "
+                     "far tail are approximate -- treat them as exploratory, not as calibrated discoveries");
+    }
     log.info("significant: Bonferroni(Meff=" + std::to_string(meff) + ") " + std::to_string(n_sig_meff) +
              ", FDR<0.05 " + std::to_string(n_sig_fdr) + "; " + lambda_label + "=" + fmt(lambda_gc) +
              (variant_mode ? "; COJO signals " + std::to_string(cojo_n_signals) : ""));

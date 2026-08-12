@@ -110,7 +110,7 @@ See the [GWAS example](../gwas.md) for a runnable association run on this locus,
 
 `Meff` is the denominator the Bonferroni threshold uses, so **every tested feature has to be in it**. In the variant tier a low-AF variant is barred from anchoring an LD clump — its `r^2` is unstable, so it must not claim shadows — but it is still tested, and it used to end up in no clump at all: its own threshold was then computed from a set it was not part of. Measured on the LPA cohort at `--min-ac 30`, 5 of 20 tested variants sat outside every clump and `Meff` read 12. Each such feature now gets a singleton clump: it counts, but it claims nothing (`Meff` 12 → 17). The same rule applies in the feature tier, where a feature with no bubble annotation belongs to no block.
 
-`Meff` is still an LD-clumping heuristic, not an eigenvalue decomposition; BH-FDR across all tests remains the primary control, and is what should be quoted.
+`Meff` is an LD-**clumping heuristic**, not an effective-test count. Clumps are seeded in p-value order, so the phenotype changes how many there are: in a correlation chain A—B—C with A and C uncorrelated, seeding at B gives one clump and seeding at A gives two. It is therefore not phenotype-blind and carries **no formal family-wise guarantee**. `p_bonf` (raw `0.05/n_tests`) and `q_bh` are the formal corrections and are what should be quoted; read `p_bonf_meff` as a regional guide. A phenotype-blind alternative would be a genotype-only eigenvalue `Meff` or a permutation/maxT threshold — neither is implemented. Feature-mode `Meff` (the number of distinct bubbles) is likewise a biological grouping, not a statistical one.
 
 ## Reading `lambda_GC`
 
@@ -134,7 +134,9 @@ Measured on the LPA cohort (6000 individuals; 492 cases / 5213 controls for the 
 
 Consequence for reading the output: `z` and `p` are the score test, while `log_or` and `se` remain the Wald maximum-likelihood effect size, so **p is not recoverable from `log_or`/`se`**. This is the same arrangement SAIGE and REGENIE use.
 
-**A logistic fit that hits the iteration cap is dropped rather than reported.** Under separation IRLS is still diverging at iteration 50, so the last iterate records where the optimiser ran out of patience, not a maximum. Such features are counted in the `(fit)` term of the run summary.
+**Separation contract.** Under near-complete separation the maximum-likelihood logistic fit diverges, so IRLS hitting the iteration cap returns failure rather than its last iterate. The score test does not fit the alternative and is unaffected, so the feature is **still reported** with a valid `p` — but with `log_or` and `se` absent and `effect_status=separation` saying why. A feature is only dropped (counted in the `(fit)` term of the run summary) when the score test also fails. There is never a silent fall back to a Wald p.
+
+**Rare binary features are exploratory.** The score test is well calibrated in the body of the distribution but still mildly anti-conservative in the far tail for very rare features, and a regional Bonferroni threshold can sit exactly there (`0.05/20 = 0.0025`, against a measured 0.0025 at a nominal 0.001). `associate` warns when features below 1% minor frequency, or with fewer than 10 minor-allele carriers among cases, are tested. `mac_case` and `mac_ctrl` are reported for binary traits because total MAC hides the split that governs reliability — 1 case / 19 controls is far weaker than 10 / 10. Keep `--min-maf 0.01` unless you accept that sub-threshold results are exploratory.
 
 **The kinship matrix is validated before use** — row count and row width (a ragged matrix previously indexed past the end of a short row), finiteness, symmetry, and positive semi-definiteness. A matrix failing any of these is not a GRM, and the variance ratio the LMM derives from it would not mean anything.
 
