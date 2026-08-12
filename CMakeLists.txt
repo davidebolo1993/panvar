@@ -240,6 +240,18 @@ if(PANVAR_BUILD_TESTING)
             set_tests_properties(panvar_associate_stats PROPERTIES TIMEOUT 120)
         endif()
 
+        # rebuild contract: the input is never destroyed, a healthy graph survives, a malformed one is
+        # refused rather than silently repaired, and nothing is left behind. CTest previously exercised
+        # no rebuild at all.
+        set(PANVAR_REBUILD_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/rebuild_stats.sh)
+        if(EXISTS ${PANVAR_REBUILD_STATS})
+            add_test(
+                NAME panvar_rebuild_stats
+                COMMAND /usr/bin/env bash ${PANVAR_REBUILD_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/rebuild_stats
+            )
+            set_tests_properties(panvar_rebuild_stats PROPERTIES TIMEOUT 180)
+        endif()
+
         # Real-data integration smoke: the whole bubble -> inspect -> describe -> panphorte
         # -> call pipeline on a committed locus, asserting each stage's outputs. Registered on
         # C4 (the smallest graph, ~3s, no external tools) so the pipeline is exercised end-to-end

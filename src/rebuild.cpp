@@ -54,11 +54,39 @@ std::string reverse_complement(const std::string& s) {
     return r;
 }
 
+// Everything downstream is a comparison against what the input paths spell, so a path that spells
+// something other than what the file says is worse than a hard error -- it is a silently wrong answer
+// that every later check then agrees with. Validate once, up front, and refuse rather than repair.
+void validate_input(const Graph& g) {
+    if (g.paths.empty()) throw std::runtime_error("rebuild: input GFA has no P/W paths to rebuild");
+    std::unordered_set<std::string> seen;
+    for (const PathRecord& p : g.paths) {
+        if (p.name.empty()) throw std::runtime_error("rebuild: input GFA has a path with no name");
+        if (!seen.insert(p.name).second)
+            throw std::runtime_error("rebuild: input GFA has a duplicate path name: " + p.name +
+                                     " (which of the two a result refers to would be undefined)");
+        if (p.steps.empty())
+            throw std::runtime_error("rebuild: path has no steps: " + p.name);
+        for (const PathStep& step : p.steps) {
+            const auto it = g.nodes.find(step.node_id);
+            if (it == g.nodes.end())
+                throw std::runtime_error("rebuild: path " + p.name + " references a node that is not in "
+                                         "the graph: " + step.node_id);
+            if (it->second.sequence.empty() || it->second.sequence == "*")
+                throw std::runtime_error("rebuild: node " + step.node_id + " on path " + p.name +
+                                         " has no sequence (S line is '*'); rebuild needs real sequence");
+        }
+    }
+}
+
 std::string spell(const Graph& g, const PathRecord& path) {
     std::string out;
     for (const PathStep& step : path.steps) {
         const auto it = g.nodes.find(step.node_id);
-        if (it == g.nodes.end()) continue;
+        // validate_input() has already refused a graph where this could miss; keeping the guard means a
+        // future caller cannot silently spell a short sequence.
+        if (it == g.nodes.end())
+            throw std::runtime_error("rebuild: path " + path.name + " references missing node " + step.node_id);
         out += step.reverse ? reverse_complement(it->second.sequence) : it->second.sequence;
     }
     return out;
@@ -219,6 +247,7 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
     po.include_paths = true;
     po.include_sequences = true;
     const Graph g = parse_gfa(options.gfa_path, po);
+    validate_input(g);
 
     sum.raw_nodes = g.nodes.size();
     sum.haplotypes = g.paths.size();
@@ -302,21 +331,49 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
     // its block length is under min_map_len (100 kb by default), before min_var_len is ever consulted.
     // A locus graph of a few tens of kb therefore augments nothing and collapses to the bare seed, so
     // scale both gates to the locus. Loci already above the defaults keep minigraph's own values.
+    // The gate is derived from the whole length DISTRIBUTION, not from the seed. The seed is the richest
+    // haplotype and can be far longer than the rest; a threshold scaled from it can exceed what a
+    // shorter haplotype could ever produce, so that haplotype clears no chain and is dropped without
+    // anything saying so. The median sets the scale and the SHORTEST haplotype caps it, so every
+    // haplotype can in principle contribute a chain covering half of itself.
+    std::vector<std::size_t> hlen;
+    hlen.reserve(hseq.size());
+    for (const std::string& h : hseq) if (!h.empty()) hlen.push_back(h.size());
+    if (hlen.empty()) throw std::runtime_error("rebuild: every haplotype spelled an empty sequence");
+    std::sort(hlen.begin(), hlen.end());
+    const std::size_t min_len = hlen.front();
+    const std::size_t med_len = hlen[hlen.size() / 2];
     const std::size_t seed_len = hseq[idx.front()].size();
+    // Never above half the shortest haplotype, whatever else says.
+    const int cap = static_cast<int>(std::max<std::size_t>(500, min_len / 2));
     if (options.min_align_len > 0) {
         gpt.min_map_len = static_cast<int>(options.min_align_len);
+        if (gpt.min_map_len > cap) {
+            step("warning: --min-align-len " + std::to_string(options.min_align_len) +
+                 " exceeds half the shortest haplotype (" + std::to_string(min_len) +
+                 " bp); haplotypes shorter than twice it cannot clear the gate");
+        }
         if (static_cast<std::size_t>(gpt.min_depth_len) > options.min_align_len) {
             gpt.min_depth_len = static_cast<int>(std::max<std::size_t>(500, options.min_align_len / 5));
         }
         step("min alignment length " + std::to_string(gpt.min_map_len) + " (requested), min depth length " +
              std::to_string(gpt.min_depth_len));
-    } else if (seed_len < 2 * static_cast<std::size_t>(gpt.min_map_len)) {
-        gpt.min_map_len = static_cast<int>(std::max<std::size_t>(1000, seed_len / 2));
-        if (seed_len < 2 * static_cast<std::size_t>(gpt.min_depth_len)) {
-            gpt.min_depth_len = static_cast<int>(std::max<std::size_t>(500, seed_len / 10));
+    } else {
+        const int base = (med_len < 2 * static_cast<std::size_t>(gpt.min_map_len))
+                             ? static_cast<int>(std::max<std::size_t>(1000, med_len / 2))
+                             : gpt.min_map_len;
+        const int chosen = std::min(base, cap);
+        if (chosen != gpt.min_map_len) {
+            gpt.min_map_len = chosen;
+            if (med_len < 2 * static_cast<std::size_t>(gpt.min_depth_len))
+                gpt.min_depth_len = static_cast<int>(std::max<std::size_t>(500, med_len / 10));
+            gpt.min_depth_len = std::min(gpt.min_depth_len, gpt.min_map_len);
+            step("haplotype lengths " + std::to_string(min_len) + "-" + std::to_string(hlen.back()) +
+                 " bp (median " + std::to_string(med_len) + ", seed " + std::to_string(seed_len) +
+                 "): min alignment length " + std::to_string(gpt.min_map_len) +
+                 (chosen == cap && cap < base ? " (capped by the shortest haplotype)" : "") +
+                 ", min depth length " + std::to_string(gpt.min_depth_len));
         }
-        step("locus-scale input (" + std::to_string(seed_len) + " bp): min alignment length " +
-             std::to_string(gpt.min_map_len) + ", min depth length " + std::to_string(gpt.min_depth_len));
     }
     // Keep minigraph itself quiet (its per-sample logs are one block per haplotype, far too noisy at
     // cohort scale) and print our own throttled counter instead. mg_ggen augments one file per call
