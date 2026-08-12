@@ -158,6 +158,7 @@ bool solve_and_invert(std::vector<double> A, const std::vector<double>& b,
 struct FitResult {
     bool ok = false;
     bool spa = false;      // p came from the saddlepoint rather than the normal tail
+    bool exact_tail = false;  // p is the exact boundary probability, not any approximation
     double beta = kNaN;  // genotype coefficient (column 1)
     double se = kNaN;
     double z = kNaN;
@@ -336,13 +337,40 @@ struct SpaCgf {
     const std::vector<double>* mu;
 };
 
+// log(a) + log(1 + e^{b-a}) without overflowing either branch.
+double log_add(double a, double b) {
+    if (!std::isfinite(a)) return b;
+    if (!std::isfinite(b)) return a;
+    const double m = std::max(a, b);
+    return m + std::log1p(std::exp(std::min(a, b) - m));
+}
+
+// log(1 - mu + mu e^x), computed as a log-sum-exp so a large saddlepoint cannot overflow exp(x) and
+// silently turn the whole SPA into a normal fallback.
+double log_mix(double mu, double x) {
+    if (!(mu > 0.0)) return 0.0;
+    if (!(mu < 1.0)) return x;
+    return log_add(std::log1p(-mu), std::log(mu) + x);
+}
+
+// The exponentially tilted mean of y_i, in the numerically stable logistic form
+//   mu e^x / (1 - mu + mu e^x) = 1 / (1 + ((1-mu)/mu) e^{-x})
+// which is bounded for either sign of x.
+double tilted_mean(double mu, double x) {
+    if (!(mu > 0.0)) return 0.0;
+    if (!(mu < 1.0)) return 1.0;
+    const double z = std::log1p(-mu) - std::log(mu) - x;   // log((1-mu)/mu) - x
+    if (z > 40.0) return 0.0;
+    if (z < -40.0) return 1.0;
+    return 1.0 / (1.0 + std::exp(z));
+}
+
 double spa_K(double t, const SpaCgf& c) {
     double k = 0.0;
     for (std::size_t i = 0; i < c.gt->size(); ++i) {
         const double g = (*c.gt)[i], m = (*c.mu)[i];
         if (g == 0.0) continue;
-        const double e = std::exp(t * g);
-        k += std::log1p(m * (e - 1.0)) - t * g * m;
+        k += log_mix(m, t * g) - t * g * m;
     }
     return k;
 }
@@ -353,9 +381,7 @@ void spa_K12(double t, const SpaCgf& c, double& k1, double& k2) {
     for (std::size_t i = 0; i < c.gt->size(); ++i) {
         const double g = (*c.gt)[i], m = (*c.mu)[i];
         if (g == 0.0) continue;
-        const double e = std::exp(t * g);
-        const double d = 1.0 + m * (e - 1.0);               // 1 - mu + mu e^{tg}
-        const double q = m * e / d;                          // tilted mean of y_i
+        const double q = tilted_mean(m, t * g);
         k1 += g * (q - m);
         k2 += g * g * q * (1.0 - q);
     }
@@ -417,7 +443,8 @@ double spa_far_tail(double s, const SpaCgf& c) {
 
 // Two-sided p for the observed score. The score's distribution is NOT symmetric under case/control
 // imbalance, so both tails are computed rather than one doubled.
-double spa_two_sided(double s, const std::vector<double>& gt, const std::vector<double>& mu) {
+double spa_two_sided(double s, const std::vector<double>& gt, const std::vector<double>& mu,
+                     bool* exact_out = nullptr) {
     // S is a bounded sum, and at (or beyond) the edge of its support the saddlepoint is at infinity:
     // K'(t) approaches the boundary asymptotically, so a root search finds a spurious "root" far out
     // and Lugannani-Rice degenerates -- it returned 1 for a perfectly separating feature whose exact
@@ -430,7 +457,34 @@ double spa_two_sided(double s, const std::vector<double>& gt, const std::vector<
     }
     const double span = smax - smin;
     if (!(span > 0.0)) return kNaN;
-    if (std::fabs(s) >= smax - 1e-8 * span || -std::fabs(s) <= smin + 1e-8 * span) return kNaN;
+    // At the boundary the saddlepoint is at infinity, but the probability there is a single Bernoulli
+    // configuration and can be written down exactly -- no approximation and no enumeration:
+    //   P(S = smax) = prod_{gt>0} mu_i * prod_{gt<0} (1 - mu_i)
+    // Computed in logs so it does not underflow. Falling back to the normal tail here would use the
+    // approximation precisely where it is least trustworthy.
+    auto log_extreme = [&](bool upper) {
+        double lg = 0.0;
+        for (std::size_t i = 0; i < gt.size(); ++i) {
+            if (gt[i] == 0.0) continue;
+            const bool want_one = upper ? (gt[i] > 0.0) : (gt[i] < 0.0);
+            const double q = want_one ? mu[i] : (1.0 - mu[i]);
+            if (!(q > 0.0)) return -std::numeric_limits<double>::infinity();
+            lg += std::log(q);
+        }
+        return lg;
+    };
+    const bool at_top = std::fabs(s) >= smax - 1e-8 * span;
+    const bool at_bot = -std::fabs(s) <= smin + 1e-8 * span;
+    if (at_top || at_bot) {
+        const double lu = at_top ? log_extreme(true) : -std::numeric_limits<double>::infinity();
+        const double ll = at_bot ? log_extreme(false) : -std::numeric_limits<double>::infinity();
+        double pex = 0.0;
+        if (std::isfinite(lu)) pex += std::exp(lu);
+        if (std::isfinite(ll)) pex += std::exp(ll);
+        // Only one side is at the boundary in the asymmetric case; the other is negligible beside it.
+        if (exact_out != nullptr) *exact_out = true;
+        return (pex > 0.0 && pex <= 1.0) ? pex : kNaN;
+    }
     const SpaCgf c{&gt, &mu};
     const double up = spa_far_tail(std::fabs(s), c);    // P(S >= |s|)
     const double dn = spa_far_tail(-std::fabs(s), c);   // P(S <= -|s|)
@@ -490,8 +544,13 @@ FitResult score_logistic(const std::vector<double>& X, const std::vector<double>
         }
         double S = 0.0;
         for (std::size_t i = 0; i < n; ++i) S += gt[i] * (y[i] - mu[i]);
-        const double ps = spa_two_sided(S, gt, mu);
-        if (std::isfinite(ps) && ps > 0.0) { r.p = std::max(ps, 1e-300); r.spa = true; }
+        bool exact = false;
+        const double ps = spa_two_sided(S, gt, mu, &exact);
+        if (std::isfinite(ps) && ps > 0.0) {
+            r.p = std::max(ps, 1e-300);
+            r.spa = !exact;
+            r.exact_tail = exact;
+        }
     }
     return r;
 }
@@ -784,6 +843,15 @@ int run_associate_command(const std::vector<std::string>& args) {
     }
     if (opt.genotypes.empty() || opt.samples.empty() || opt.phenotype.empty())
         throw std::runtime_error("associate requires --genotypes, --samples, --phenotype");
+    if (!(opt.min_maf >= 0.0 && opt.min_maf <= 1.0))
+        throw std::runtime_error("--min-maf must be between 0 and 1");
+    if (!(opt.ld_r2 >= 0.0 && opt.ld_r2 <= 1.0))
+        throw std::runtime_error("--ld-r2 must be between 0 and 1");
+    if (opt.min_ac < 0) throw std::runtime_error("--min-ac must be >= 0");
+    if (opt.pca < 0) throw std::runtime_error("--pca must be >= 0");
+    // <0 is the "unset" sentinel meaning 0.05/Meff; anything supplied must be a probability.
+    if (opt.cojo_p >= 0.0 && !(opt.cojo_p > 0.0 && opt.cojo_p <= 1.0))
+        throw std::runtime_error("--cojo-p must be in (0, 1]");
     if (opt.model != "auto" && opt.model != "linear" && opt.model != "logistic" && opt.model != "lmm")
         throw std::runtime_error("--model must be auto|linear|logistic|lmm");
     if (opt.unit != "auto" && opt.unit != "variant" && opt.unit != "feature")
@@ -802,6 +870,14 @@ int run_associate_command(const std::vector<std::string>& args) {
         while (r.getline(line)) { line = trim(line); if (!line.empty()) geno_samples.push_back(line); }
     }
     if (geno_samples.empty()) throw std::runtime_error("no samples in " + opt.samples);
+    {
+        // A repeated genotype column would silently reuse one individual's phenotype for two columns,
+        // inflating n and correlating rows that are not independent observations.
+        std::unordered_set<std::string> seen;
+        for (const std::string& sname : geno_samples)
+            if (!seen.insert(sname).second)
+                throw std::runtime_error("--samples has a duplicate sample id: " + sname);
+    }
 
     // ---- phenotype + covariates: sample -> (phenotype, covariates[]) ----
     std::vector<std::string> covar_names;
@@ -825,6 +901,10 @@ int run_associate_command(const std::vector<std::string>& args) {
             }
             const std::string s = trim(f[0]);
             if (s.empty()) continue;
+            // Without this a repeated row silently overwrites the earlier one, so which phenotype was
+            // analysed depends on file order -- a difference no output column would reveal.
+            if (pheno.find(s) != pheno.end())
+                throw std::runtime_error("--phenotype has a duplicate sample id: " + s);
             pheno[s] = (f.size() > 1) ? parse_num(f[1]) : kNaN;
             std::vector<double> cv(ncov, kNaN);
             for (std::size_t j = 0; j < ncov; ++j) if (j + 2 < f.size()) cv[j] = parse_num(f[j + 2]);
@@ -1054,8 +1134,9 @@ int run_associate_command(const std::vector<std::string>& args) {
         // p without saying the effect size is missing for a REASON is what makes that confusing.
         std::string effect_status = "ok";
         // Which tail produced `p`: "t" (Student-t, quantitative), "score" (Rao score, normal tail),
-        // "score_spa" (score with the saddlepoint), "lmm". Worth naming per feature because the score
-        // test only switches to the saddlepoint past a |z| cutoff, so a table mixes both.
+        // "score_spa" (score with the saddlepoint), "score_exact" (the score is at the edge of its
+        // support, where the probability is a single Bernoulli configuration and is written down
+        // exactly), "lmm". Worth naming per feature because one table mixes several.
         std::string p_method = "t";
         // Binary traits: the minor-allele carrier count split by case/control. Total MAC hides what
         // actually governs asymptotic reliability -- 1 case / 19 controls is far weaker than 10 / 10 at
@@ -1151,6 +1232,10 @@ int run_associate_command(const std::vector<std::string>& args) {
                 // variant in an unbalanced case/control study, where near-separation inflates the
                 // standard error and collapses the statistic.
                 const FitResult sc = score_logistic(X, yy, n, p_dim);
+                // The contract is that a logistic p is ALWAYS the score test's. If the score test fails
+                // there is no valid p to report: keeping the Wald one and labelling it `score` is the
+                // silent fallback the contract exists to forbid, so the feature is dropped instead.
+                if (!sc.ok) { fr.ok = false; }
                 if (sc.ok) {
                     if (!fr.ok) {
                         // ML diverged. Recover a finite effect size with Firth's penalised likelihood
@@ -1168,7 +1253,7 @@ int run_associate_command(const std::vector<std::string>& args) {
                     fr.z = sc.z; fr.p = sc.p; fr.ok = true;
                 }
                 if (separated) row_effect_status = "separation";
-                row_p_method = sc.spa ? "score_spa" : "score";
+                row_p_method = sc.exact_tail ? "score_exact" : (sc.spa ? "score_spa" : "score");
             }
         }
         if (!fr.ok) { ++n_dropped_fit; continue; }
@@ -1306,12 +1391,28 @@ int run_associate_command(const std::vector<std::string>& args) {
                     }
                 Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(C, Eigen::EigenvaluesOnly);
                 if (es.info() == Eigen::Success) {
+                    // Eigenvalues that are numerically zero must be treated as exactly zero: for k
+                    // identical features the spectrum is (k, 0, ..., 0) and Li-Ji gives exactly 1, but
+                    // the zeros arrive as +/-1e-16 whose fractional parts push the sum a hair above 1
+                    // and a bare ceil() then answers 2. The same epsilon is why the sum is rounded up
+                    // from just below rather than from the raw value.
+                    // Li-Ji sums an INTEGER part and a FRACTIONAL part, so it is acutely sensitive to
+                    // an eigenvalue that lands a few ulps below a whole number: for k identical
+                    // features the top eigenvalue comes back as 2.9999999999999996, whose floor is 2 and
+                    // whose fractional part is ~1, and the estimate reads 2 where the answer is 1. (R's
+                    // own eigen() reproduces this, so it is a property of the estimator's form rather
+                    // than of one implementation.) Snap near-integer eigenvalues before splitting them.
                     double m = 0.0;
+                    const double scale = std::max(1.0, es.eigenvalues().cwiseAbs().maxCoeff());
                     for (Eigen::Index k = 0; k < es.eigenvalues().size(); ++k) {
-                        const double lam = std::max(0.0, es.eigenvalues()(k));
+                        double lam = es.eigenvalues()(k);
+                        if (!(lam > 1e-8 * scale)) lam = 0.0;
+                        const double near = std::round(lam);
+                        if (std::fabs(lam - near) < 1e-6 * scale) lam = near;
                         m += (lam >= 1.0 ? 1.0 : 0.0) + (lam - std::floor(lam));
                     }
-                    meff_eigen = std::min<std::size_t>(n_tests, std::max<std::size_t>(1, static_cast<std::size_t>(std::ceil(m))));
+                    meff_eigen = std::min<std::size_t>(
+                        n_tests, std::max<std::size_t>(1, static_cast<std::size_t>(std::ceil(m - 1e-9))));
                 }
             }
         }
@@ -1601,8 +1702,10 @@ int run_associate_command(const std::vector<std::string>& args) {
         if (n_rare > 0 || n_imbal > 0)
             log.info("WARNING: " + std::to_string(n_rare) + " features below 1% minor frequency and " +
                      std::to_string(n_imbal) + " with fewer than 10 minor-allele carriers among cases. "
-                     "The score test is not saddlepoint-corrected (no SPA), so p-values for those in the "
-                     "far tail are approximate -- treat them as exploratory, not as calibrated discoveries");
+                     "The score test is saddlepoint-corrected, but measured type-I error in the far "
+                     "tail is still about 1.7x nominal at p<0.001 for such features, and panvar has no "
+                     "burden/SKAT rare-variant test -- treat these as exploratory, not as calibrated "
+                     "discoveries");
     }
     log.info("significant: Bonferroni(Meff=" + std::to_string(meff) + ") " + std::to_string(n_sig_meff) +
              ", FDR<0.05 " + std::to_string(n_sig_fdr) + "; " + lambda_label + "=" + fmt(lambda_gc) +

@@ -75,6 +75,99 @@ for k in k_ok k_neg k_ragged k_asym; do
   fi
 done
 
+# ------------------------------------------------- SPA and the exact support boundary
+# The score statistic S = sum_i Gt_i (y_i - mu_i) is a sum of independent Bernoulli terms, so its exact
+# null distribution can be convolved. These reference values come from that enumeration (R, 2^18 outcomes
+# folded by convolution), and they are why SPA exists: the normal tail is 4.7x anti-conservative here.
+#
+#   g <- c(1,1,1,1, rep(0,14)); y <- c(1,1,1, rep(0,15))
+#   -> exact two-sided p = 0.00182437858954, normal = 0.000385746755682, z = 3.5496
+{ printf 'rare, A, B'; for i in $(seq 1 18); do
+    if [ "$i" -le 4 ]; then printf ', 1'; else printf ', 0'; fi; done; printf '\n'; } > "$OUT/spa.bimbam"
+: > "$OUT/spa.samples"; for i in $(seq 1 18); do echo "s$i" >> "$OUT/spa.samples"; done
+{ printf 'sample\tphenotype\n'
+  for i in $(seq 1 3);  do printf 's%d\t1\n' "$i"; done
+  for i in $(seq 4 18); do printf 's%d\t0\n' "$i"; done; } > "$OUT/spa.pheno"
+gzip -cf "$OUT/spa.bimbam" > "$OUT/spa.bimbam.gz"; gzip -cf "$OUT/spa.samples" > "$OUT/spa.samples.gz"
+"$BIN" associate --genotypes "$OUT/spa.bimbam.gz" --samples "$OUT/spa.samples.gz" \
+  --phenotype "$OUT/spa.pheno" --min-maf 0 -o "$OUT/spa" --quiet >/dev/null 2>&1
+sp=$(col "$OUT/spa.assoc.tsv" p rare); sm=$(col "$OUT/spa.assoc.tsv" p_method rare)
+[ "$sm" = "score_spa" ] && ok "saddlepoint used past the |z| cutoff (p_method=$sm)" \
+                        || bad "p_method=$sm, expected score_spa"
+# must be materially closer to the exact tail than the normal approximation is
+awk -v p="$sp" 'BEGIN{ex=0.00182437858954; no=0.000385746755682;
+  exit !( (p>0) && ((p>ex?p/ex:ex/p) < (ex/no)) )}' \
+  && ok "SPA p ($sp) is closer to the exact tail 0.001824 than the normal 0.000386 would be" \
+  || bad "SPA p $sp is no better than the normal tail against exact 0.00182437858954"
+
+# At the support boundary the saddlepoint is at infinity, but the probability is a single Bernoulli
+# configuration and is exact: 2 * 0.5^12 = 0.00048828125 for the separation fixture above.
+bp=$(col "$OUT/sep.assoc.tsv" p sep); bm=$(col "$OUT/sep.assoc.tsv" p_method sep)
+[ "$bm" = "score_exact" ] && ok "support boundary uses the exact tail (p_method=$bm)" \
+                          || bad "p_method=$bm at the support boundary, expected score_exact"
+close "$bp" 0.00048828125 1e-6 && ok "boundary p is exact ($bp)" \
+                               || bad "boundary p $bp != 0.00048828125"
+
+# ------------------------------------------------- Firth against an independent reference
+# Firth by its definition in R (penalised score U* = X'(y - mu + h(0.5 - mu)), h the leverages):
+#   y <- g <- c(rep(0,6), rep(1,6))  ->  beta = 5.129898715, se = 2.241794153
+close "$lo" 5.129898715 1e-5 && ok "Firth beta matches the reference ($lo)" \
+                             || bad "Firth beta $lo != 5.129898715"
+fse=$(col "$OUT/sep.assoc.tsv" se sep)
+close "$fse" 2.241794153 1e-5 && ok "Firth se matches the reference ($fse)" \
+                              || bad "Firth se $fse != 2.241794153"
+
+# ------------------------------------------------- Li-Ji Meff on spectra with known answers
+# Four 0/1 patterns repeated 4x give exactly orthogonal centred columns, so the correlation matrix is
+# the identity (Meff = k); identical columns give an all-ones matrix (Meff = 1); two orthogonal blocks
+# of identical columns give eigenvalues (2,2,0,0) (Meff = 2).
+mk_meff() { # <name> <rows...>
+  local nm="$1"; shift
+  : > "$OUT/$nm.bimbam"; for r in "$@"; do echo "$r" >> "$OUT/$nm.bimbam"; done
+  gzip -cf "$OUT/$nm.bimbam" > "$OUT/$nm.bimbam.gz"
+  printf 'feature_id\tlayer\tencoding\tbubbles\tnodes\tsvtype\tgene\tAF\tAN\n' > "$OUT/$nm.annot.tsv"
+  awk -F', ' '{print $1"\tvariant\tdosage\t.\t.\t.\t.\t.\t."}' "$OUT/$nm.bimbam" >> "$OUT/$nm.annot.tsv"
+  gzip -cf "$OUT/$nm.annot.tsv" > "$OUT/$nm.annot.tsv.gz"
+}
+A="0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1"
+B="0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1"
+C="0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0"
+mk_meff indep  "a, A, B, $A" "b, A, B, $B" "c, A, B, $C"
+mk_meff same   "a, A, B, $A" "b, A, B, $A" "c, A, B, $A"
+mk_meff blocks "a1, A, B, $A" "a2, A, B, $A" "b1, A, B, $B" "b2, A, B, $B"
+: > "$OUT/m.samples"; for i in $(seq 1 16); do echo "s$i" >> "$OUT/m.samples"; done
+gzip -cf "$OUT/m.samples" > "$OUT/m.samples.gz"
+{ printf 'sample\tphenotype\n'
+  vs=(0.3 -1.2 0.7 1.9 -0.4 0.2 -1.7 0.9 1.1 -0.6 0.4 -0.2 1.4 -1.1 0.8 -0.9)
+  for i in $(seq 1 16); do printf 's%d\t%s\n' "$i" "${vs[$((i-1))]}"; done; } > "$OUT/m.pheno"
+for cfg in "indep:3" "same:1" "blocks:2"; do
+  nm=${cfg%%:*}; want=${cfg##*:}
+  "$BIN" associate --genotypes "$OUT/$nm.bimbam.gz" --samples "$OUT/m.samples.gz" \
+    --feature-annot "$OUT/$nm.annot.tsv.gz" --phenotype "$OUT/m.pheno" --min-maf 0 \
+    -o "$OUT/m.$nm" --quiet >/dev/null 2>&1
+  got=$(awk -F'\t' '$1=="meff_eigen"{print $2}' "$OUT/m.$nm.summary.tsv")
+  [ "$got" = "$want" ] && ok "Li-Ji Meff on '$nm' = $got (expected $want)" \
+                       || bad "Li-Ji Meff on '$nm' = $got, expected $want"
+done
+
+# ------------------------------------------------- input validation
+dup_s="$OUT/dup.samples"; gzcat "$OUT/lin.samples.gz" > "$dup_s"; echo "s1" >> "$dup_s"
+gzip -cf "$dup_s" > "$dup_s.gz"
+e=$("$BIN" associate --genotypes "$OUT/lin.bimbam.gz" --samples "$dup_s.gz" \
+     --phenotype "$OUT/lin.pheno" --min-maf 0 -o "$OUT/dv" --quiet 2>&1 | grep -c "duplicate sample id")
+[ "$e" -gt 0 ] && ok "duplicate genotype sample id rejected" || bad "duplicate genotype sample id accepted"
+{ head -2 "$OUT/lin.pheno"; sed -n '2p' "$OUT/lin.pheno"; } > "$OUT/dup.pheno"
+e=$("$BIN" associate --genotypes "$OUT/lin.bimbam.gz" --samples "$OUT/lin.samples.gz" \
+     --phenotype "$OUT/dup.pheno" --min-maf 0 -o "$OUT/dv" --quiet 2>&1 | grep -c "duplicate sample id")
+[ "$e" -gt 0 ] && ok "duplicate phenotype row rejected" || bad "duplicate phenotype row accepted"
+for opt in "--min-maf 2" "--ld-r2 -1" "--min-ac -5" "--cojo-p 0" "--cojo-p 1.5" "--pca -2"; do
+  set -- $opt
+  e=$("$BIN" associate --genotypes "$OUT/lin.bimbam.gz" --samples "$OUT/lin.samples.gz" \
+       --phenotype "$OUT/lin.pheno" "$1" "$2" -o "$OUT/dv" --quiet 2>&1 | grep -c "Error")
+  [ "$e" -gt 0 ] && ok "out-of-range option rejected ($opt)" || bad "$opt accepted"
+done
+
+
 echo
 if [ "$fails" -eq 0 ]; then echo "associate_stats: all assertions passed"; exit 0; fi
 echo "associate_stats: $fails assertion(s) FAILED"; exit 1

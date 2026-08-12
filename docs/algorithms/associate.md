@@ -27,7 +27,7 @@ A unit is dropped when its minor (non-modal) frequency — the fraction of the c
 | unit | substrates | how `Meff` is computed | LD-clumping? | conditioning | per-row columns |
 |------|-----------|------------------------|--------------|--------------|-----------------|
 | feature | k-mers and graph (nodes/edges) | `Meff` = number of distinct bubbles the tested features map to (the `bubbles` column, split on `;`, de-duplicated) | no | single-lead + collinearity guard | `p_conditional`, `cond_role` |
-| variant | SV calls (`describe --variant-vcf`) | `Meff` = number of LD-clump leads | yes (genotype r²) | forward-stepwise (COJO) | `clump`, `is_lead`, `low_af`, `p_conditional`, `cond_role` |
+| variant | SV calls (`describe --variant-vcf`) | `Meff` = Li–Ji eigenvalue estimate (phenotype-blind) | yes (genotype r²) | forward-stepwise (COJO) | `clump`, `is_lead`, `low_af`, `p_conditional`, `cond_role` |
 
 Feature unit — membership-based `Meff`. k-mer counts and node/edge dosages are correlated by construction: every feature carries the `bubbles` it came from, and all the features inside one bubble are reads of the same local variation. So no genotype correlations are needed — each bubble collapses to one effective test and `Meff` = the number of distinct bubbles. There is no clumping and no r² in feature mode; it is a cheap set-count over the `bubbles` column, so it needs no genotype matrix. Both the k-mer run and the graph run use exactly this rule.
 
@@ -95,12 +95,12 @@ s5       6   0.5
 
 1. Filter on minor frequency. Round the dosages to `{2,2,4,6,6}`; the modal value occurs twice of five, so the minor (non-modal) frequency is `1 − 2/5 = 0.60`. That clears `--min-maf`, so the feature is tested.
 2. Fit `y ≈ a + b·g` by ordinary least squares. With `ḡ = 4` and `ȳ = 1.04`, the sums of squares are `Sgg = Σ(g−ḡ)² = 16` and `Sgy = Σ(g−ḡ)(y−ȳ) = −3.20`, giving slope `b = Sgy/Sgg = −0.20` and intercept `a = ȳ − b·ḡ = 1.84`.
-3. Wald-test the slope. The fitted values `1.44, 1.44, 1.04, 0.64, 0.64` leave residuals `−0.14, 0.16, −0.04, 0.16, −0.14`, so `RSS = 0.092`, `σ² = RSS/(n−2) = 0.0307`, `Var(b) = σ²/Sgg = 0.00192` and `se = 0.0438`. Then `z = b/se = −4.57`, and on `n − p = 3` degrees of freedom `p = 2·P(T₃ > 4.57) ≈ 0.020` — the normal tail would say `5e-6`, which at this sample size is simply wrong. Covariates only widen `X` and change `Var(b_g) = σ²·[(XᵀX)⁻¹]_gg`; a binary trait swaps this OLS for the IRLS-reweighted logistic fit and reports a score test rather than a Wald one.
+3. Test the slope. The fitted values `1.44, 1.44, 1.04, 0.64, 0.64` leave residuals `−0.14, 0.16, −0.04, 0.16, −0.14`, so `RSS = 0.092`, `σ² = RSS/(n−2) = 0.0307`, `Var(b) = σ²/Sgg = 0.00192` and `se = 0.0438`. Then `z = b/se = −4.57`, and on `n − p = 3` degrees of freedom `p = 2·P(T₃ > 4.57) ≈ 0.020` — the normal tail would say `5e-6`, which at this sample size is simply wrong. Covariates only widen `X` and change `Var(b_g) = σ²·[(XᵀX)⁻¹]_gg`; a binary trait swaps this OLS for the IRLS-reweighted logistic fit and reports a score test rather than a Wald one.
 
 Result for this feature:
 
 ```text
-minor_freq=0.60  beta=−0.20  se=0.0438  z=−4.57  p≈5e-6
+minor_freq=0.60  beta=−0.20  se=0.0438  z=−4.57  p≈0.020  p_method=t
 ```
 
 ## Worked trace (region-wide correction)
