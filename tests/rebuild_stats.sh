@@ -10,6 +10,7 @@
 set -uo pipefail
 
 BIN="${1:?usage: rebuild_stats.sh <panvar> <outdir> [input.gfa]}"
+PY="${PYTHON:-python3}"
 OUT="${2:?}"
 SRC="${3:-}"
 mkdir -p "$OUT"
@@ -118,6 +119,61 @@ if [ -n "$SRC" ] && [ -s "$SRC" ]; then
     bad "no audit sidecar was written"
   fi
 fi
+
+
+# ---------------------------------------------------------------- reproducibility
+# A rebuild that depends on thread count or on which strand the input happens to be stored on is not
+# reproducible, and neither property is visible in a single run's output.
+if [ -n "$SRC" ] && [ -s "$SRC" ]; then
+  seed_of() { "$BIN" rebuild -i "$1" -o "$2" --force --min-recovered-identity 0.97 2>&1 \
+                | grep -oE 'seed=[^;]*' | head -1; }
+
+  s1=$(seed_of "$GFA" "$OUT/rep1.gfa"); s2=$(seed_of "$GFA" "$OUT/rep2.gfa")
+  [ -n "$s1" ] && [ "$s1" = "$s2" ] && ok "repeated runs choose the same seed" \
+                                    || bad "seed differs between runs: '$s1' vs '$s2'"
+
+  "$BIN" rebuild -i "$GFA" -o "$OUT/th1.gfa" --force --min-recovered-identity 0.97 -t 1 -q >/dev/null 2>&1
+  "$BIN" rebuild -i "$GFA" -o "$OUT/th8.gfa" --force --min-recovered-identity 0.97 -t 8 -q >/dev/null 2>&1
+  cmp -s "$OUT/th1.gfa" "$OUT/th8.gfa" && ok "output is identical with 1 and 8 threads" \
+                                       || bad "thread count changes the output"
+  cmp -s "$OUT/th1.gfa.rebuild_audit.tsv" "$OUT/th8.gfa.rebuild_audit.tsv" \
+    && ok "  ... and so is the audit" || bad "thread count changes the audit"
+
+  # Reverse-complement every segment and flip every step: the same graph, stored on the other strand.
+  # k-mer richness must be canonical, or the seed (and so the whole rebuild) follows the storage.
+  "$PY" - "$GFA" "$OUT/rc.gfa" <<'PYEOF'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+comp = str.maketrans('ACGTacgtNn', 'TGCAtgcaNn')
+def rc(s): return s.translate(comp)[::-1]
+flip = {'+': '-', '-': '+'}
+out = []
+for line in open(src):
+    f = line.rstrip('\n').split('\t')
+    if f[0] == 'S' and len(f) > 2:
+        f[2] = rc(f[2])
+    elif f[0] == 'P' and len(f) > 2:
+        f[2] = ','.join(t[:-1] + flip.get(t[-1], t[-1]) for t in f[2].split(','))
+    elif f[0] == 'L' and len(f) > 4:
+        f[2], f[4] = flip.get(f[2], f[2]), flip.get(f[4], f[4])
+    out.append('\t'.join(f))
+open(dst, 'w').write('\n'.join(out) + '\n')
+PYEOF
+  s3=$(seed_of "$OUT/rc.gfa" "$OUT/rc.out.gfa")
+  [ "$s1" = "$s3" ] && ok "seed is the same on the reverse-complemented graph (canonical k-mers)" \
+                    || bad "seed follows the strand the graph is stored on: '$s1' vs '$s3'"
+fi
+
+# ---------------------------------------------------------------- ambiguous bases
+# N must neither crash the k-mer roll nor be counted as sequence.
+{ printf 'H\tVN:Z:1.0\n'
+  printf 'S\t1\tACGTNNNNACGTACGTACGT\nS\t2\tTTTTGGGGCCCCAAAANNNN\nS\t3\tGGGGCCCCAAAATTTTGGGG\n'
+  printf 'L\t1\t+\t2\t+\t0M\nL\t2\t+\t3\t+\t0M\nL\t1\t+\t3\t+\t0M\n'
+  printf 'P\thapA\t1+,2+,3+\t*\nP\thapB\t1+,3+\t*\n'; } > "$OUT/amb.gfa"
+"$BIN" rebuild -i "$OUT/amb.gfa" -o "$OUT/amb.out.gfa" >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && [ -s "$OUT/amb.out.gfa" ] && ok "ambiguous bases (N) are handled without failure" \
+                                             || bad "a graph containing N failed (exit $rc)"
 
 
 echo

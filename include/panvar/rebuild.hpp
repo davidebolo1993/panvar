@@ -41,7 +41,8 @@ struct RebuildOptions {
 struct RebuildSummary {
     std::size_t raw_nodes = 0;
     std::size_t raw_hubs = 0;        // #nodes with degree >= hub_degree
-    std::size_t raw_maxdeg = 0;
+    std::size_t raw_maxdeg = 0;      // largest single-handle degree (not the two ends pooled)
+    std::size_t raw_selfloops = 0;   // nodes with a self-loop: a folded tandem array, not pathology
     double raw_density = 0.0;        // nodes per kb of the longest haplotype span
     bool pathological = false;
     bool ran = false;                // did we actually rebuild (pathological or forced)?

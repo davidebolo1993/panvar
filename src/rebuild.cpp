@@ -1,6 +1,7 @@
 #include "panvar/rebuild.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -93,15 +94,33 @@ std::string spell(const Graph& g, const PathRecord& path) {
     return out;
 }
 
-void degree_stats(const Graph& g, std::size_t hub_degree, std::size_t& hubs, std::size_t& maxdeg) {
+// Degree per HANDLE, not per node. A bidirected graph node has two ends, and pooling them conflates two
+// different shapes: a node with 25 neighbours on each side is a clean two-sided branch, while one with
+// 50 on a single side is the tangle the gate exists to find -- yet pooled they both read 50. The node's
+// degree is therefore the larger of its two handle degrees. Self-loops are counted separately: they are
+// how a tandem array appears after folding, and they are not pathology.
+void degree_stats(const Graph& g, std::size_t hub_degree, std::size_t& hubs, std::size_t& maxdeg,
+                  std::size_t* selfloops) {
     hubs = 0;
     maxdeg = 0;
+    std::size_t loops = 0;
     for (const auto& kv : g.nodes) {
-        const std::vector<std::string> nb = g.neighbors_of(kv.first);
-        const std::unordered_set<std::string> distinct(nb.begin(), nb.end());
-        if (distinct.size() > maxdeg) maxdeg = distinct.size();
-        if (distinct.size() >= hub_degree) ++hubs;
+        std::unordered_set<std::string> left, right;
+        bool loop = false;
+        for (const Neighbor& n : kv.second.start) {
+            if (n.node_id == kv.first) { loop = true; continue; }
+            left.insert(n.node_id);
+        }
+        for (const Neighbor& n : kv.second.end) {
+            if (n.node_id == kv.first) { loop = true; continue; }
+            right.insert(n.node_id);
+        }
+        if (loop) ++loops;
+        const std::size_t deg = std::max(left.size(), right.size());
+        if (deg > maxdeg) maxdeg = deg;
+        if (deg >= hub_degree) ++hubs;
     }
+    if (selfloops != nullptr) *selfloops = loops;
 }
 
 struct KmerStats {
@@ -111,21 +130,42 @@ struct KmerStats {
 
 // Rolling 2-bit encoding: substr-per-position costs tens of millions of allocations at cohort scale.
 // k <= 31 fits a uint64; above that fall back to substr.
+//
+// Three properties this has to have, and previously did not:
+//   CANONICAL   -- a k-mer and its reverse complement count as one. Without it a haplotype's richness
+//                  depends on which strand the GFA happens to store it on, so the seed -- and hence the
+//                  whole rebuild -- changes when an input is flipped.
+//   CONSISTENT  -- `total` counts only the windows `distinct` counts. It was s.size()-k+1, including
+//                  windows containing N, while `distinct` skipped them, so the redundancy figure
+//                  (total - distinct) was wrong by however much ambiguity a haplotype carried.
+//   UNIFORM     -- k > 31 behaves the same way. It kept every window verbatim, ambiguity and strand
+//                  included, so crossing k=31 silently changed what the ranking meant.
 KmerStats kmer_stats(const std::string& s, std::size_t k) {
     KmerStats st;
     if (k == 0 || s.size() < k) return st;
-    st.total = s.size() - k + 1;
     if (k > 31) {
         std::unordered_set<std::string> set;
         set.reserve(s.size());
-        for (std::size_t i = 0; i + k <= s.size(); ++i) set.insert(s.substr(i, k));
+        for (std::size_t i = 0; i + k <= s.size(); ++i) {
+            std::string up = s.substr(i, k);
+            bool ok = true;
+            for (char& c : up) {
+                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                if (c != 'A' && c != 'C' && c != 'G' && c != 'T') { ok = false; break; }
+            }
+            if (!ok) continue;                        // ambiguity: not a countable window
+            const std::string rc = reverse_complement(up);
+            set.insert(up < rc ? up : rc);            // canonical
+            ++st.total;
+        }
         st.distinct = set.size();
         return st;
     }
     std::unordered_set<std::uint64_t> set;
     set.reserve(s.size());
     const std::uint64_t mask = (k < 32) ? ((1ULL << (2 * k)) - 1) : ~0ULL;
-    std::uint64_t code = 0;
+    const unsigned shift = static_cast<unsigned>(2 * (k - 1));
+    std::uint64_t fwd = 0, rev = 0;
     std::size_t valid = 0;
     for (std::size_t i = 0; i < s.size(); ++i) {
         int b;
@@ -134,10 +174,11 @@ KmerStats kmer_stats(const std::string& s, std::size_t k) {
             case 'C': case 'c': b = 1; break;
             case 'G': case 'g': b = 2; break;
             case 'T': case 't': b = 3; break;
-            default: valid = 0; code = 0; continue; // ambiguity resets the roll
+            default: valid = 0; fwd = 0; rev = 0; continue;  // ambiguity resets the roll
         }
-        code = ((code << 2) | static_cast<std::uint64_t>(b)) & mask;
-        if (++valid >= k) set.insert(code);
+        fwd = ((fwd << 2) | static_cast<std::uint64_t>(b)) & mask;
+        rev = (rev >> 2) | (static_cast<std::uint64_t>(3 - b) << shift);
+        if (++valid >= k) { set.insert(std::min(fwd, rev)); ++st.total; }
     }
     st.distinct = set.size();
     return st;
@@ -258,7 +299,7 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
 
     sum.raw_nodes = g.nodes.size();
     sum.haplotypes = g.paths.size();
-    degree_stats(g, options.hub_degree, sum.raw_hubs, sum.raw_maxdeg);
+    degree_stats(g, options.hub_degree, sum.raw_hubs, sum.raw_maxdeg, &sum.raw_selfloops);
     step("ordering " + std::to_string(sum.haplotypes) + " haplotypes by k-mer richness");
 
     // ---- Criteria B: order haplotypes by k-mer richness ----
@@ -278,7 +319,15 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
         max_len = std::max(max_len, hseq[i].size());
         idx[i] = i;
     }
-    std::sort(idx.begin(), idx.end(), [&](std::size_t a, std::size_t b) { return score[a] > score[b]; });
+    // Richness descending, then path NAME, then original index. std::sort is not stable, so equal
+    // richness previously produced an implementation-defined order -- two runs on the same input could
+    // seed from different haplotypes and build different graphs. Ties are the norm in a panel of
+    // near-duplicate haplotypes, not an edge case.
+    std::sort(idx.begin(), idx.end(), [&](std::size_t a, std::size_t b) {
+        if (score[a] != score[b]) return score[a] > score[b];
+        if (g.paths[a].name != g.paths[b].name) return g.paths[a].name < g.paths[b].name;
+        return a < b;
+    });
     if (!idx.empty()) sum.seed = g.paths[idx.front()].name;
     sum.raw_density = static_cast<double>(sum.raw_nodes) / (static_cast<double>(max_len) / 1000.0);
 
@@ -452,11 +501,22 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
                     mg_gchains_t* gc = mg_map(gi, static_cast<int>(q.size()), q.c_str(), tbuf, &opt_map,
                                               g.paths[h].name.c_str());
                     if (gc != nullptr && gc->n_gc > 0) {
-                        // Longest chain wins: concatenating chains would stitch an incoherent walk.
+                        // One chain wins -- concatenating chains would stitch an incoherent walk -- but
+                        // "longest query SPAN" ranks by the outer envelope, so a chain reaching further
+                        // through a large internal gap beats one that genuinely aligns more. Rank by
+                        // matching bases, then identity within the aligned block, then mapping quality,
+                        // with a deterministic tie-break so the choice is reproducible.
+                        auto better = [](const mg_gchain_t& x, const mg_gchain_t& y) {
+                            if (x.mlen != y.mlen) return x.mlen > y.mlen;
+                            const double ix = x.blen > 0 ? static_cast<double>(x.mlen) / x.blen : 0.0;
+                            const double iy = y.blen > 0 ? static_cast<double>(y.mlen) / y.blen : 0.0;
+                            if (ix != iy) return ix > iy;
+                            if (x.mapq != y.mapq) return x.mapq > y.mapq;
+                            if (x.score != y.score) return x.score > y.score;
+                            return x.qs < y.qs;
+                        };
                         int best = 0;
-                        for (int i = 1; i < gc->n_gc; ++i) {
-                            if (gc->gc[i].qe - gc->gc[i].qs > gc->gc[best].qe - gc->gc[best].qs) best = i;
-                        }
+                        for (int i = 1; i < gc->n_gc; ++i) if (better(gc->gc[i], gc->gc[best])) best = i;
                         const mg_gchain_t& c = gc->gc[best];
                         walks[h].reserve(static_cast<std::size_t>(c.cnt));
                         for (int32_t j = 0; j < c.cnt; ++j) walks[h].push_back(gc->lc[c.off + j].v);

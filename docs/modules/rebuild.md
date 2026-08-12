@@ -90,3 +90,21 @@ The reference clause is about **recovery, not seeding**. Which haplotype seeds t
 | `-r, --reference-path <name>` | this path must be recovered within the bounds | none |
 | `--allow-loss` | accept a rebuild that fails the contract, recording why | off |
 | `--audit <path>` | where to write the sidecar | `<out>.rebuild_audit.tsv` |
+
+## Reproducibility
+
+Three properties a rebuild has to have, none of which is visible in a single run's output:
+
+- **Deterministic.** Haplotypes are ordered by richness, then by path **name**, then by original index. `std::sort` is not stable, so equal richness previously produced an implementation-defined order — and ties are the norm in a panel of near-duplicate haplotypes, not an edge case. Two runs could seed from different haplotypes and build different graphs.
+- **Thread-invariant.** One thread and eight produce byte-identical output, audit included.
+- **Strand-independent.** k-mer richness is counted over **canonical** k-mers (a k-mer and its reverse complement are one), so reverse-complementing the whole graph does not change the seed. Without that, richness followed whichever strand the GFA happened to store.
+
+k-mer counting also only counts windows free of ambiguity, and `total` counts exactly the windows `distinct` does — previously `total` included windows containing `N` while `distinct` skipped them, so the redundancy figure `total − distinct` was wrong by however much ambiguity a haplotype carried. `k > 31` now behaves identically to `k ≤ 31`; it used to keep every window verbatim, ambiguity and strand included.
+
+## Chain selection
+
+When a haplotype produces several graph chains, one has to win — concatenating them would stitch an incoherent walk. The choice is by **matching bases**, then identity within the aligned block, then mapping quality, with a deterministic tie-break. Ranking by longest query *span* let a chain that reaches further through a large internal gap beat one that genuinely aligns more.
+
+## The pathology gate
+
+Degree is measured **per handle**. A bidirected node has two ends, and pooling them conflates two different shapes: 25 neighbours on each side is a clean two-sided branch, while 50 on one side is the tangle the gate exists to find — pooled, both read 50. A node's degree is the larger of its two handle degrees, and self-loops (how a tandem array appears after folding, and not pathology) are counted separately. On the six reference loci this lowers `maxdeg` — c4 11 → 9, LPA 20 → 17, ANKRD36C 21 → 19 — without changing any verdict, since all sit far below the default threshold of 50.
