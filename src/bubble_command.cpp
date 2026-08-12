@@ -51,7 +51,13 @@ void print_bubble_help() {
         << "      --max-variant-bp <N>         Largest variant to keep: drop bubbles whose longest path\n"
         << "                                   exceeds N bp (0 = no cap; tames hypervariable tangles)\n"
         << "                                    inside the bubble (default: 50, 0=disable)\n"
-        << "      --min-path-support <N>       Require at least N supporting P/W paths (default: 0)\n"
+        << "      --min-path-support <N>       Require at least N supporting P/W paths (default: 0).\n"
+        << "                                   This is TRAVERSAL support -- on a fully-typed panel nearly\n"
+        << "                                   every haplotype crosses nearly every bubble, so it says\n"
+        << "                                   little about any particular allele\n"
+        << "      --min-alt-support <N>        Require the best-supported NON-REFERENCE allele to have at\n"
+        << "                                   least N supporting paths. This is what a support filter is\n"
+        << "                                   usually wanted for (default: 0)\n"
         << "      --merge-nearby-bp <N>        Merge nearby bubbles only after base filters\n"
         << "                                    (min-path/min-variant) when sink->source shortest-path\n"
         << "                                    distance is <= N bp (default: 0, disabled)\n"
@@ -153,6 +159,20 @@ int run_bubble_command(const std::vector<std::string>& args) {
             options.min_path_support = cli::parse_size_arg(arg, require_value(arg));
             continue;
         }
+        if (arg == "--min-alt-support") {
+            options.min_alt_support = cli::parse_size_arg(arg, require_value(arg));
+            continue;
+        }
+        // Aliases that say what the bp filters actually measure: the interior SPAN between the
+        // boundaries, not the size of the difference between alleles.
+        if (arg == "--min-interior-bp") {
+            options.min_variant_bp = cli::parse_size_arg(arg, require_value(arg));
+            continue;
+        }
+        if (arg == "--max-interior-bp") {
+            options.max_variant_bp = cli::parse_size_arg(arg, require_value(arg));
+            continue;
+        }
         if (arg == "--merge-nearby-bp") {
             options.merge_nearby_bp = cli::parse_size_arg(arg, require_value(arg));
             continue;
@@ -216,6 +236,7 @@ int run_bubble_command(const std::vector<std::string>& args) {
         // Find boundary pairs internally with the vg-faithful cactus finder. --superbubbles
         // then keeps only the acyclic snarls (= superbubbles), filtered in call_bubbles_report.
         options.snarl_pairs_override = find_top_level_snarls_cactus(snarl_input_from_model(model));
+    options.snarl_source_supplied = true;
         site_mode = options.superbubbles_only ? "superbubble (internal, cactus + acyclic)"
                                               : "snarl (internal, cactus)";
     } else {

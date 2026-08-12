@@ -723,14 +723,16 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
     // Snarl boundary pairs: pre-computed cactus pairs (the internal default, supplied by the
     // command after sorting) win; otherwise an external vg snarls JSONL.
     std::vector<std::pair<std::string, std::string>> snarl_pairs;
-    if (!options.snarl_pairs_override.empty()) {
+    if (options.snarl_source_supplied || !options.snarl_pairs_override.empty()) {
+        // An empty override from a supplied source is a valid answer -- a linear graph has no snarl --
+        // and must produce an empty table, not an error about a missing source.
         snarl_pairs = options.snarl_pairs_override;
     } else if (!options.snarls_input_path.empty()) {
         snarl_pairs = read_snarl_pairs_jsonl(options.snarls_input_path);
     } else {
         throw std::runtime_error(
-            "call_bubbles_report: no snarls — provide snarl_pairs_override (internal cactus finder) "
-            "or snarls_input_path (--snarls-in)");
+            "call_bubbles_report: no snarl source — provide snarl_pairs_override (internal cactus "
+            "finder) or snarls_input_path (--snarls-in)");
     }
     collect_candidates_for_pairs(graph, packed, snarl_pairs, path_indexes, dedup, debug_ptr);
 
@@ -751,6 +753,21 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
     // Per-bubble support: number of crossing paths, internal bp span (min/max), the count of
     // paths whose internal span reaches --min-variant-bp, and an inversion signal (an internal
     // node seen in both orientations across paths).
+    // Which path is the reference, so allele support can be split into reference and alternate. Exact
+    // name first, then a unique substring; anything ambiguous is left unresolved rather than guessed,
+    // in which case every allele is reported as an alternate.
+    std::size_t ref_idx = graph.paths.size();
+    if (!options.reference_path.empty()) {
+        for (std::size_t i = 0; i < graph.paths.size(); ++i)
+            if (graph.paths[i].name == options.reference_path) { ref_idx = i; break; }
+        if (ref_idx == graph.paths.size()) {
+            std::size_t hits = 0, last = 0;
+            for (std::size_t i = 0; i < graph.paths.size(); ++i)
+                if (graph.paths[i].name.find(options.reference_path) != std::string::npos) { ++hits; last = i; }
+            if (hits == 1) ref_idx = last;
+        }
+    }
+
     const auto compute_bubble_metrics = [&](std::vector<Bubble>& target, const char* progress_label) {
         // An empty label suppresses the bar (honors --quiet).
         cli::ProgressBar progress(options.quiet ? "" : progress_label, target.size());
@@ -777,6 +794,8 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
                 if (loop) { cyclic = true; break; }
             }
 
+            std::unordered_map<std::string, std::size_t> allele_counts;
+            std::string ref_signature;
             for (std::size_t p_idx = 0; p_idx < path_indexes.size(); ++p_idx) {
                 // `bubble_steps` returns the canonical source->sink walk and, when a path crosses with no
                 // interior at all, falls back to the adjacent source/sink pair. That fallback is the
@@ -789,6 +808,18 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
                 }
                 ++supported_paths;
                 const std::vector<PathStep>& steps = *steps_opt;
+                // The walk itself, so support can be reported per ALLELE rather than per traversal.
+                {
+                    std::string sig;
+                    sig.reserve(steps.size() * 8);
+                    for (const PathStep& st : steps) {
+                        sig += st.node_id;
+                        sig += st.reverse ? '-' : '+';
+                        sig += ',';
+                    }
+                    ++allele_counts[sig];
+                    if (p_idx == ref_idx) ref_signature = sig;
+                }
 
                 std::size_t inside_bp = 0;
                 std::unordered_set<std::string> seen_this_path;
@@ -821,6 +852,21 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
                 }
             }
 
+            // path_support counts TRAVERSALS. On a fully-typed panel nearly every haplotype crosses
+            // nearly every bubble, so it says little about any particular allele; these say what the
+            // traversals actually contain.
+            bubble.distinct_alleles = allele_counts.size();
+            bubble.ref_allele_support = 0;
+            std::size_t alt_max = 0, alt_min = 0;
+            bool any_alt = false;
+            for (const auto& [sig, n] : allele_counts) {
+                if (!ref_signature.empty() && sig == ref_signature) { bubble.ref_allele_support = n; continue; }
+                alt_max = std::max(alt_max, n);
+                alt_min = any_alt ? std::min(alt_min, n) : n;
+                any_alt = true;
+            }
+            bubble.alt_allele_support_max = alt_max;
+            bubble.alt_allele_support_min = any_alt ? alt_min : 0;
             bubble.path_support = supported_paths;
             bubble.min_inside_bp = has_inside_bp ? min_inside_bp : 0;
             bubble.max_inside_bp = has_inside_bp ? max_inside_bp : 0;
@@ -870,6 +916,13 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
         if (options.min_path_support > 0) {
             bs.erase(std::remove_if(bs.begin(), bs.end(),
                                     [&](const Bubble& b) { return b.path_support < options.min_path_support; }),
+                     bs.end());
+        }
+        if (options.min_alt_support > 0) {
+            bs.erase(std::remove_if(bs.begin(), bs.end(),
+                                    [&](const Bubble& b) {
+                                        return b.alt_allele_support_max < options.min_alt_support;
+                                    }),
                      bs.end());
         }
         if (options.min_variant_bp > 0) {

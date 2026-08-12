@@ -66,4 +66,31 @@ A bubble's supporting paths are found with the shared `bubble_steps()` walk extr
 
 On the minimal case (paths `1,2,3` and `1,3`) that reported `path_support=1, min_inside_bp=4`; it now reports `path_support=2, min_inside_bp=0`, and the bubble survives `--min-path-support 2` instead of being dropped.
 
-**A consequence to be aware of:** with deletions counted, on a fully-typed panel nearly every haplotype supports nearly every bubble simply by crossing it. On C4 and LPA `path_support` is now uniformly 131 and 466 — the panel size. It is *traversal* support, not evidence that an alternate allele has multiple observations, and `--min-path-support` should be read that way. Distinct-allele and alternate-allele support are not yet reported separately.
+**A consequence, and what is reported instead.** With deletions counted, on a fully-typed panel nearly every haplotype supports nearly every bubble simply by crossing it. On C4 and LPA `path_support` is uniformly 131 and 466 — the panel size. It is *traversal* support and says nothing about any particular allele, so the CSV also reports what those traversals contain:
+
+| column | meaning |
+|--------|---------|
+| `path_support` | paths that cross the bubble at all — traversal support |
+| `distinct_alleles` | distinct `source → sink` walks |
+| `ref_allele_support` | paths taking the reference's walk |
+| `alt_allele_support_max` | the best-supported non-reference walk |
+| `alt_allele_support_min` | the least-supported non-reference walk |
+
+`--min-alt-support <N>` filters on the fourth of these, which is what a support filter is usually wanted for. The difference is not subtle. On C4, where `path_support` is 131 for every bubble:
+
+```
+--min-alt-support   0 -> 5     --min-path-support 100 -> 5
+--min-alt-support   5 -> 4     --min-path-support 131 -> 5
+--min-alt-support  20 -> 2     --min-path-support 200 -> 0
+--min-alt-support  90 -> 0
+```
+
+One filter is a gradient; the other is a step at the panel size. C4 has a bubble with **127 distinct alleles across 131 paths** (`alt_allele_support_max = 2`, so no alternate is replicated) sitting beside one with `alt_allele_support_max = 80` — `--min-path-support` cannot tell them apart.
+
+## What the bp filters measure
+
+`--min-variant-bp` and `--max-variant-bp` measure the **interior span** between the boundaries — the summed length of the interior nodes a path traverses — not the size of the difference between alleles. A 1 bp substitution inside a 1 kb allele has a 1 kb span and passes `--min-variant-bp 50`. `--min-interior-bp` and `--max-interior-bp` are accepted as aliases that say so; the CSV columns `min_inside_bp` / `max_inside_bp` were always named correctly. Computing true allele-to-reference divergence is not implemented.
+
+## An empty result is a result
+
+A graph with no snarl — a single node, a linear path — emits an empty bubble table and exits 0. It previously raised `no snarls — provide ...`, because an empty result from the internal finder was indistinguishable from no finder having been supplied.

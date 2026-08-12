@@ -113,7 +113,13 @@ void write_bubbles_csv(
         throw std::runtime_error("Failed to write bubbles CSV: " + output_path);
     }
 
-    out << "bubble_id,source,sink,inside_node_count,total_node_count,path_support,min_inside_bp,max_inside_bp,inside_nodes\n";
+    // path_support is TRAVERSAL support -- how many paths cross the site at all, which on a fully-typed
+    // panel is close to the panel size for most bubbles. The allele columns say what those traversals
+    // contain, which is what "is this variant supported" actually means. min/max_inside_bp are interior
+    // SPAN, not the size of the difference between alleles.
+    out << "bubble_id,source,sink,inside_node_count,total_node_count,path_support,"
+           "distinct_alleles,ref_allele_support,alt_allele_support_max,alt_allele_support_min,"
+           "min_inside_bp,max_inside_bp,inside_nodes\n";
 
     for (const auto& bubble : bubbles) {
         const std::size_t total_nodes = bubble.inside.size() + 2;
@@ -126,6 +132,10 @@ void write_bubbles_csv(
             << bubble.inside.size() << ','
             << total_nodes << ','
             << bubble.path_support << ','
+            << bubble.distinct_alleles << ','
+            << bubble.ref_allele_support << ','
+            << bubble.alt_allele_support_max << ','
+            << bubble.alt_allele_support_min << ','
             << bubble.min_inside_bp << ','
             << bubble.max_inside_bp << ','
             << '"' << join_nodes(inside) << '"'

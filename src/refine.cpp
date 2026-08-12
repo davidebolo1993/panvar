@@ -514,6 +514,7 @@ RefineSummary refine_graph(const RefineOptions& options) {
     BubbleCallOptions bopts;
     bopts.reference_path = options.reference_path;
     bopts.snarl_pairs_override = find_top_level_snarls_cactus(snarl_input_from_model(model));
+    bopts.snarl_source_supplied = true;
     bopts.quiet = options.quiet;
     ParseGfaOptions parse_options;
     parse_options.include_paths = true;

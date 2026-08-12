@@ -15,7 +15,19 @@ struct Bubble {
     std::string source;
     std::string sink;
     std::vector<std::string> inside;
+    // TRAVERSAL support: paths that cross the bubble at all. On a fully-typed panel this is close to
+    // the panel size for most bubbles -- crossing a site is not evidence about any particular allele.
     std::size_t path_support = 0;
+    // What the traversals actually contain. `distinct_alleles` counts distinct source->sink walks;
+    // ref_allele_support is how many take the reference's walk; alt_allele_support_max/min are the
+    // best- and least-supported non-reference walks. These are the numbers that say whether an
+    // alternate allele has been seen more than once.
+    std::size_t distinct_alleles = 0;
+    std::size_t ref_allele_support = 0;
+    std::size_t alt_allele_support_max = 0;
+    std::size_t alt_allele_support_min = 0;
+    // Interior SPAN in bp, summed over the interior nodes a path traverses -- not the size of the
+    // difference between alleles. A 1 bp substitution inside a 1 kb allele has a 1 kb span.
     std::size_t min_inside_bp = 0;
     std::size_t max_inside_bp = 0;
     // Supporting paths with inside span >= --min-variant-bp (drives the size filter).
@@ -42,6 +54,11 @@ struct BubbleCallOptions {
     // (e.g. the cactus finder run on the sorted GfaModel), overriding both --snarls-in and
     // the order-based fallback finder.
     std::vector<std::pair<std::string, std::string>> snarl_pairs_override;
+    // Whether a snarl source was SUPPLIED, independent of whether it found anything. Without this an
+    // empty override is indistinguishable from no override, so a graph that genuinely contains no
+    // snarl (a single node, a linear path) errored with "no snarls -- provide ..." instead of
+    // reporting an empty table.
+    bool snarl_source_supplied = false;
     bool collect_snarl_debug = false;
     // Keep bubbles only if at least one supporting path has inside length >= this threshold
     // (unless inversion_signal is detected). Set to 0 to disable size filtering.
@@ -51,6 +68,10 @@ struct BubbleCallOptions {
     // (deeply-nested giant snarls); trades away SVs bigger than the cap.
     std::size_t max_variant_bp = 0;
     std::size_t min_path_support = 0;
+    // Minimum support for the best-supported NON-REFERENCE allele. Unlike min_path_support this asks
+    // whether an alternate has been observed more than once, which is what a support filter is usually
+    // wanted for.
+    std::size_t min_alt_support = 0;
     // Optional merge of nearby bubbles on graph distance (bp) between sink/source boundaries.
     // 0 disables merging.
     std::size_t merge_nearby_bp = 0;
