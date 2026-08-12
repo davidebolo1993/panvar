@@ -3,6 +3,7 @@
 #include "panvar/cli_utils.hpp"
 
 #include <algorithm>
+#include <iostream>
 #include <cstdint>
 #include <fstream>
 #include <functional>
@@ -857,39 +858,50 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
                          bubble.long_path_support, bubble.inversion_signal};
     }
 
-    // --superbubbles: keep only acyclic (single-entry/single-exit) snarls = superbubbles.
-    if (options.superbubbles_only) {
-        bubbles.erase(std::remove_if(bubbles.begin(), bubbles.end(),
-                                     [&](const Bubble& b) { return b.cyclic; }),
-                      bubbles.end());
-    }
+    // Every filter, applied to whatever the current bubble set is. Merging creates NEW bubbles whose
+    // metrics are not those of their parts -- two 1 bp bubbles 10 bp apart fuse into one spanning 12 bp
+    // -- so a set filtered before merging is not a filtered set afterwards. Measured: with
+    // `--max-variant-bp 1 --merge-nearby-bp 50` the emitted bubble had max_inside_bp 12.
+    auto apply_filters = [&](std::vector<Bubble>& bs) {
+        if (options.superbubbles_only) {
+            bs.erase(std::remove_if(bs.begin(), bs.end(), [&](const Bubble& b) { return b.cyclic; }),
+                     bs.end());
+        }
+        if (options.min_path_support > 0) {
+            bs.erase(std::remove_if(bs.begin(), bs.end(),
+                                    [&](const Bubble& b) { return b.path_support < options.min_path_support; }),
+                     bs.end());
+        }
+        if (options.min_variant_bp > 0) {
+            bs.erase(std::remove_if(bs.begin(), bs.end(),
+                                    [&](const Bubble& b) {
+                                        return b.long_path_support == 0 && !b.inversion_signal;
+                                    }),
+                     bs.end());
+        }
+        if (options.max_variant_bp > 0) {
+            // Bounds the per-bubble walk cost so panphorte/call stay tractable on hypervariable
+            // regions. Trades away SVs larger than the cap.
+            bs.erase(std::remove_if(bs.begin(), bs.end(),
+                                    [&](const Bubble& b) { return b.max_inside_bp > options.max_variant_bp; }),
+                     bs.end());
+        }
+    };
 
-    if (options.min_path_support > 0) {
-        bubbles.erase(
-            std::remove_if(bubbles.begin(), bubbles.end(),
-                           [&](const Bubble& b) { return b.path_support < options.min_path_support; }),
-            bubbles.end());
-    }
-
-    if (options.min_variant_bp > 0) {
-        bubbles.erase(
-            std::remove_if(bubbles.begin(), bubbles.end(),
-                           [&](const Bubble& b) { return b.long_path_support == 0 && !b.inversion_signal; }),
-            bubbles.end());
-    }
-
-    if (options.max_variant_bp > 0) {
-        // Drop bubbles whose longest supporting path exceeds the cap: bounds the per-bubble walk cost so
-        // panphorte/call stay tractable on hypervariable regions. Trades away SVs larger than the cap.
-        bubbles.erase(
-            std::remove_if(bubbles.begin(), bubbles.end(),
-                           [&](const Bubble& b) { return b.max_inside_bp > options.max_variant_bp; }),
-            bubbles.end());
-    }
+    apply_filters(bubbles);
 
     if (options.merge_nearby_bp > 0 && bubbles.size() > 1) {
+        const std::size_t before = bubbles.size();
         bubbles = merge_nearby_bubbles(graph, bubbles, options.merge_nearby_bp);
         compute_bubble_metrics(bubbles, "Rescoring merged");
+        const std::size_t merged = bubbles.size();
+        apply_filters(bubbles);   // a fused bubble has to clear the same bars its parts did
+        if (bubbles.size() != merged && !options.quiet) {
+            std::cerr << "[bubble] " << (merged - bubbles.size())
+                      << " merged bubble(s) dropped by re-applying the filters (a fusion can exceed "
+                         "a bound its parts satisfied)\n";
+        }
+        (void)before;
     }
 
     std::sort(bubbles.begin(), bubbles.end(), bubble_endpoint_less);

@@ -13,6 +13,10 @@ BIN="${1:?usage: rebuild_stats.sh <panvar> <outdir> [input.gfa]}"
 PY="${PYTHON:-python3}"
 OUT="${2:?}"
 SRC="${3:-}"
+# A FRESH directory each run. The suite writes fixtures, symlinks and staged outputs here, and reusing
+# a populated directory makes results depend on what a previous run (or a concurrent manual one) left
+# behind -- which showed up once as a failure that would not reproduce.
+rm -rf "$OUT"
 mkdir -p "$OUT"
 fails=0
 ok()  { printf "  ok   %s\n" "$1"; }
