@@ -117,7 +117,7 @@ void write_bubbles_csv(
     // panel is close to the panel size for most bubbles. The allele columns say what those traversals
     // contain, which is what "is this variant supported" actually means. min/max_inside_bp are interior
     // SPAN, not the size of the difference between alleles.
-    out << "bubble_id,source,sink,inside_node_count,total_node_count,path_support,"
+    out << "bubble_id,source,source_orient,sink,sink_orient,inside_node_count,total_node_count,path_support,"
            "distinct_alleles,ref_allele_support,alt_allele_support_max,alt_allele_support_min,"
            "min_inside_bp,max_inside_bp,inside_nodes\n";
 
@@ -128,7 +128,9 @@ void write_bubbles_csv(
 
         out << bubble.id << ','
             << bubble.source << ','
+            << (bubble.source_reverse ? '-' : '+') << ','
             << bubble.sink << ','
+            << (bubble.sink_reverse ? '-' : '+') << ','
             << bubble.inside.size() << ','
             << total_nodes << ','
             << bubble.path_support << ','
@@ -170,6 +172,8 @@ std::vector<Bubble> read_bubbles_csv(const std::string& input_path) {
     const std::size_t idx_path_support = required_column(index_by_name, "path_support");
     const std::size_t idx_min_bp = required_column(index_by_name, "min_inside_bp");
     const std::size_t idx_max_bp = required_column(index_by_name, "max_inside_bp");
+    const auto idx_src_orient = optional_column(index_by_name, "source_orient");
+    const auto idx_snk_orient = optional_column(index_by_name, "sink_orient");
     const auto idx_long_path = optional_column(index_by_name, "long_path_support");
     const auto idx_inversion = optional_column(index_by_name, "inversion_signal");
     const std::size_t idx_inside_nodes = required_column(index_by_name, "inside_nodes");
@@ -199,6 +203,12 @@ std::vector<Bubble> read_bubbles_csv(const std::string& input_path) {
         bubble.id = parse_size_field(require_field(idx_id, "bubble_id"), "bubble_id");
         bubble.source = require_field(idx_source, "source");
         bubble.sink = require_field(idx_sink, "sink");
+        // Absent in a CSV written before boundaries carried orientation; forward is the safe default
+        // because that is what an unoriented pair was always implicitly read as.
+        if (idx_src_orient.has_value() && *idx_src_orient < fields.size())
+            bubble.source_reverse = (fields[*idx_src_orient] == "-");
+        if (idx_snk_orient.has_value() && *idx_snk_orient < fields.size())
+            bubble.sink_reverse = (fields[*idx_snk_orient] == "-");
         bubble.path_support = parse_size_field(require_field(idx_path_support, "path_support"), "path_support");
         bubble.min_inside_bp = parse_size_field(require_field(idx_min_bp, "min_inside_bp"), "min_inside_bp");
         bubble.max_inside_bp = parse_size_field(require_field(idx_max_bp, "max_inside_bp"), "max_inside_bp");

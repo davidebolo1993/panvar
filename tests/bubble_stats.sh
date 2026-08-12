@@ -123,6 +123,47 @@ rc=$?
   && ok "  ... confirming --min-path-support 3 keeps it (traversal, not allele)" \
   || bad "--min-path-support 3 unexpectedly dropped it"
 
+# ---------------------------------------------------------------- merging is defined on the reference
+# Three bubbles along a reference: 1..4, then 4..7 SHARING boundary node 4 (gap 0), then 9..12 behind a
+# 30 bp spacer. --merge-nearby-bp 0 means merging off, so the smallest meaningful threshold is 1: it must
+# fuse the shared-boundary pair and nothing else. That is also the B11 assertion -- the old distance was
+# seeded with the whole length of the starting boundary node (10 bp here), so two bubbles sharing a
+# boundary had a nominal gap of 10 and a threshold of 1 could never join them.
+{ printf 'H\tVN:Z:1.0\n'
+  printf 'S\t1\tAAAAAAAAAA\nS\t2\tC\nS\t3\tG\nS\t4\tTTTTTTTTTT\nS\t5\tA\nS\t6\tT\nS\t7\tCCCCCCCCCC\n'
+  printf 'S\t8\tGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG\nS\t9\tAAAAAAAAAA\nS\t10\tA\nS\t11\tC\nS\t12\tTTTTTTTTTT\n'
+  printf 'L\t1\t+\t2\t+\t0M\nL\t1\t+\t3\t+\t0M\nL\t2\t+\t4\t+\t0M\nL\t3\t+\t4\t+\t0M\n'
+  printf 'L\t4\t+\t5\t+\t0M\nL\t4\t+\t6\t+\t0M\nL\t5\t+\t7\t+\t0M\nL\t6\t+\t7\t+\t0M\n'
+  printf 'L\t7\t+\t8\t+\t0M\nL\t8\t+\t9\t+\t0M\n'
+  printf 'L\t9\t+\t10\t+\t0M\nL\t9\t+\t11\t+\t0M\nL\t10\t+\t12\t+\t0M\nL\t11\t+\t12\t+\t0M\n'
+  printf 'P\tpA\t1+,2+,4+,5+,7+,8+,9+,10+,12+\t*\n'
+  printf 'P\tpB\t1+,3+,4+,6+,7+,8+,9+,11+,12+\t*\n'; } > "$OUT/mr.gfa"
+"$BIN" bubble -i "$OUT/mr.gfa" -r pA -o "$OUT/mr0" --min-variant-bp 0 -q >/dev/null 2>&1
+[ "$(rows "$OUT/mr0.bubbles.csv")" = "3" ] && ok "three bubbles found along the reference" \
+                                           || bad "expected 3 bubbles, got $(rows "$OUT/mr0.bubbles.csv")"
+"$BIN" bubble -i "$OUT/mr.gfa" -r pA -o "$OUT/mrA" --min-variant-bp 0 --merge-nearby-bp 1 -q >/dev/null 2>&1
+[ "$(rows "$OUT/mrA.bubbles.csv")" = "2" ] \
+  && ok "a threshold of 1 fuses the pair sharing a boundary (gap 0, not the boundary's length)" \
+  || bad "shared-boundary merge gave $(rows "$OUT/mrA.bubbles.csv") bubbles, expected 2"
+"$BIN" bubble -i "$OUT/mr.gfa" -r pA -o "$OUT/mrB" --min-variant-bp 0 --merge-nearby-bp 50 -q >/dev/null 2>&1
+[ "$(rows "$OUT/mrB.bubbles.csv")" = "1" ] \
+  && ok "--merge-nearby-bp 50 spans the 30 bp connector and fuses all three" \
+  || bad "50 bp merge gave $(rows "$OUT/mrB.bubbles.csv") bubbles, expected 1"
+# A 20 bp threshold must NOT cross a 30 bp connector: the distance is the sequence strictly between the
+# facing boundaries, so it cannot be shrunk by the length of a boundary node.
+"$BIN" bubble -i "$OUT/mr.gfa" -r pA -o "$OUT/mrC" --min-variant-bp 0 --merge-nearby-bp 20 -q >/dev/null 2>&1
+[ "$(rows "$OUT/mrC.bubbles.csv")" = "2" ] \
+  && ok "a 20 bp threshold does not cross a 30 bp connector" \
+  || bad "20 bp merge gave $(rows "$OUT/mrC.bubbles.csv") bubbles, expected 2"
+
+# Every fused bubble must contain only nodes inside its own reference span.
+"$BIN" bubble -i "$OUT/mr.gfa" -r pA -o "$OUT/mrD" --min-variant-bp 0 --merge-nearby-bp 50 -q >/dev/null 2>&1
+src=$(cel "$OUT/mrD.bubbles.csv" source); snk=$(cel "$OUT/mrD.bubbles.csv" sink)
+[ "$src" = "1" ] && [ "$snk" = "12" ] \
+  && ok "the fusion spans source=1 to sink=12, the outermost boundaries" \
+  || bad "fused bubble is $src..$snk, expected 1..12"
+
+
 echo
 if [ "$fails" -eq 0 ]; then echo "bubble_stats: all assertions passed"; exit 0; fi
 echo "bubble_stats: $fails assertion(s) FAILED"; exit 1

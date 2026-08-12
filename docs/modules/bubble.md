@@ -106,6 +106,20 @@ This was not a rare edge case. Measured on the reference loci, the fraction of b
 
 The bubble *set* is unchanged by orienting — same endpoints, same interiors — but what `call` makes of it is not. On C4 the same five bubbles yield 19 records instead of 15, and the reconstruction benchmark says the extra resolution is real rather than noise: the region VCF closes **9.2%** of the baseline-to-graph gap where it closed **2.5%** before, with residual falling from 1,376,483 to 1,282,382 bases. The events are re-partitioned, not merely multiplied — total allele count falls from 347 to 318 as a few coarse events become several finer ones.
 
+### Oriented boundary visits
+
+A snarl boundary is a **handle**, not a node: the same node can bound a snarl on either side, and merging has to know which sides face one another. `source_orient` and `sink_orient` record how the reference reads each boundary. In practice they are `+` throughout, because `bubble` sorts the graph reference-forward before discovery — on C4, LPA and ACOT the sorted reference walk contains **zero** reverse steps. They are there for graphs where that is not achievable, and so that a consumer never has to assume.
+
+## Merging is defined in reference coordinates
+
+Bubbles are ordered by reference coordinate, and the distance between two of them is the sequence **strictly between the facing boundaries** — after the left bubble's sink ends, before the right bubble's source begins. Two bubbles that abut or share a boundary have a gap of exactly 0.
+
+The previous version sorted by source node id and joined `current.sink` to `next.source` through an undirected shortest path. That assumed cactus order follows reference order, which it does not — and it seeded the distance with the whole length of the starting boundary node, so two bubbles sharing a boundary had a nominal gap of that node's length and would not merge under a smaller threshold.
+
+A fused bubble is **validated** before it is accepted: every interior node that appears on the reference must lie inside the new span, or the merge is refused and the two bubbles are kept apart. Nodes that are not on the reference (alternate alleles) legitimately sit inside and are not required to have a coordinate.
+
+Ordering matters more than it looks: boundaries are oriented **before** filtering and merging, not after. When orientation ran last, merging saw every bubble as reference-inverted and refused them all as unorderable — the operation silently did nothing on real data.
+
 ## `--superbubbles` tests the graph, not the paths
 
 A superbubble is a snarl whose interior is a directed acyclic graph. Cyclicity used to be inferred entirely from what the stored paths happen to do — an interior self-loop, a path revisiting an interior node, a node used in both orientations. Those are real signals, but none of them looks at the graph: **an interior cycle that no stored path walks was reported as acyclic and survived `--superbubbles`**, which exists precisely to exclude it.

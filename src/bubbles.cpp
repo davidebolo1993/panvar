@@ -5,6 +5,7 @@
 #include "panvar/cli_utils.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
 #include <cstdint>
 #include <fstream>
@@ -174,6 +175,12 @@ void orient_bubbles_to_reference(const Graph& graph, const std::string& referenc
         const auto k_it = first_pos.find(b.sink);
         if (s_it == first_pos.end() || k_it == first_pos.end()) continue;
         if (k_it->second < s_it->second) std::swap(b.source, b.sink);
+        // Each boundary is a HANDLE: record which way the reference reads it, so a consumer knows
+        // which side of the node faces into the bubble.
+        const auto so = first_pos.find(b.source);
+        const auto ko = first_pos.find(b.sink);
+        if (so != first_pos.end()) b.source_reverse = ref.steps[so->second].reverse;
+        if (ko != first_pos.end()) b.sink_reverse = ref.steps[ko->second].reverse;
     }
 }
 
@@ -317,67 +324,143 @@ std::optional<std::vector<std::string>> shortest_node_path_within_bp(
     return path_rev;
 }
 
+// Reference coordinates of a bubble's boundaries: the bp offset at which each boundary node starts on
+// the reference walk, and its length. Bubbles the reference does not span cannot be ordered against
+// each other and are never merged.
+struct RefSpan {
+    std::size_t src_start = 0;   // bp offset of the source node's first base
+    std::size_t snk_start = 0;   // bp offset of the sink node's first base
+    std::size_t snk_len = 0;
+    std::size_t src_len = 0;
+    bool ok = false;
+};
+
+std::unordered_map<std::string, std::pair<std::size_t, std::size_t>> reference_offsets(
+    const Graph& graph, const std::string& reference_path) {
+    std::unordered_map<std::string, std::pair<std::size_t, std::size_t>> out;   // node -> (bp start, len)
+    if (reference_path.empty()) return out;
+    std::size_t ref_idx = graph.paths.size();
+    for (std::size_t i = 0; i < graph.paths.size(); ++i)
+        if (graph.paths[i].name == reference_path) { ref_idx = i; break; }
+    if (ref_idx == graph.paths.size()) {
+        std::size_t hits = 0, last = 0;
+        for (std::size_t i = 0; i < graph.paths.size(); ++i)
+            if (graph.paths[i].name.find(reference_path) != std::string::npos) { ++hits; last = i; }
+        if (hits != 1) return out;
+        ref_idx = last;
+    }
+    std::size_t off = 0;
+    for (const PathStep& st : graph.paths[ref_idx].steps) {
+        const auto nit = graph.nodes.find(st.node_id);
+        const std::size_t len = nit == graph.nodes.end() ? 0 : nit->second.sequence.size();
+        out.emplace(st.node_id, std::make_pair(off, len));   // first occurrence wins
+        off += len;
+    }
+    return out;
+}
+
+// Merge bubbles that sit close together on the REFERENCE.
+//
+// The old version sorted by source node id and joined `current.sink` to `next.source` through an
+// undirected shortest path, which assumed cactus order follows reference order. It does not: on the
+// bundled synthetic graph the reference traverses 2..4 while cactus reports source=4, sink=2, and with
+// a large threshold the fused bubble ended up containing nodes before its own source and after its own
+// sink. It also seeded the distance with the whole length of the starting boundary node, so two
+// bubbles sharing a boundary had a nominal gap of zero yet failed to merge when that node was long.
+//
+// Ordering and distance now both come from reference coordinates. The gap between two bubbles is the
+// sequence strictly BETWEEN the facing boundaries -- after the left bubble's sink ends, before the
+// right bubble's source begins -- which is zero for bubbles that abut or share a boundary. A fused
+// bubble is validated: every interior node must lie inside the new span, or the merge is refused.
 std::vector<Bubble> merge_nearby_bubbles(
     const Graph& graph,
     const std::vector<Bubble>& input,
-    std::size_t max_bp) {
+    std::size_t max_bp,
+    const std::string& reference_path) {
 
     if (max_bp == 0 || input.size() < 2) {
         return input;
     }
+    const auto ref_off = reference_offsets(graph, reference_path);
+    if (ref_off.empty()) return input;   // no reference to order against: merging would be guesswork
 
-    std::vector<Bubble> bubbles = input;
-    std::sort(bubbles.begin(), bubbles.end(), bubble_endpoint_less);
+    auto span_of = [&](const Bubble& b) {
+        RefSpan r;
+        const auto s = ref_off.find(b.source);
+        const auto k = ref_off.find(b.sink);
+        if (s == ref_off.end() || k == ref_off.end()) return r;
+        r.src_start = s->second.first;  r.src_len = s->second.second;
+        r.snk_start = k->second.first;  r.snk_len = k->second.second;
+        r.ok = r.src_start <= r.snk_start;      // boundaries are reference-ordered by now
+        return r;
+    };
 
-    const NodeAdjacency adj = build_node_adjacency(graph);
+    // Reference order, and only bubbles the reference actually spans take part.
+    std::vector<Bubble> spanned, unspanned;
+    for (const Bubble& b : input) (span_of(b).ok ? spanned : unspanned).push_back(b);
+    if (std::getenv("PANVAR_MERGE_DEBUG"))
+        std::cerr << "[merge] spanned=" << spanned.size() << " unspanned=" << unspanned.size() << '\n';
+    std::sort(spanned.begin(), spanned.end(), [&](const Bubble& a, const Bubble& b) {
+        const RefSpan ra = span_of(a), rb = span_of(b);
+        if (ra.src_start != rb.src_start) return ra.src_start < rb.src_start;
+        return ra.snk_start < rb.snk_start;
+    });
 
     std::vector<Bubble> merged;
-    merged.reserve(bubbles.size());
-    Bubble current = bubbles.front();
-    for (std::size_t i = 1; i < bubbles.size(); ++i) {
-        const Bubble& next = bubbles[i];
-        const auto path_opt = shortest_node_path_within_bp(adj, current.sink, next.source, max_bp);
-        if (!path_opt.has_value()) {
-            merged.push_back(std::move(current));
-            current = next;
-            continue;
+    merged.reserve(spanned.size());
+    for (std::size_t i = 0; i < spanned.size(); ++i) {
+        if (merged.empty()) { merged.push_back(spanned[i]); continue; }
+        Bubble& cur = merged.back();
+        const RefSpan rc = span_of(cur), rn = span_of(spanned[i]);
+        const std::size_t cur_end = rc.snk_start + rc.snk_len;   // one past the left bubble's last base
+        // Strictly between the facing boundaries; overlapping or abutting bubbles have a gap of 0.
+        const std::size_t gap = rn.src_start > cur_end ? rn.src_start - cur_end : 0;
+        if (std::getenv("PANVAR_MERGE_DEBUG"))
+            std::cerr << "[merge] " << cur.source << ".." << cur.sink << " -> " << spanned[i].source
+                      << ".." << spanned[i].sink << " gap=" << gap << " max=" << max_bp << '\n';
+        if (gap > max_bp) { merged.push_back(spanned[i]); continue; }
+
+        Bubble fused = cur;
+        fused.sink = spanned[i].sink;
+        fused.sink_reverse = spanned[i].sink_reverse;
+        std::unordered_set<std::string> inside_set(cur.inside.begin(), cur.inside.end());
+        inside_set.insert(spanned[i].inside.begin(), spanned[i].inside.end());
+        inside_set.insert(cur.sink);                 // old boundaries become interior
+        inside_set.insert(spanned[i].source);
+        // Everything the reference itself carries across the connector.
+        for (const auto& [node, off_len] : ref_off)
+            if (off_len.first >= cur_end && off_len.first < rn.src_start) inside_set.insert(node);
+
+        const RefSpan rf = span_of(fused);
+        bool contained = rf.ok;
+        if (contained) {
+            const std::size_t lo = rf.src_start, hi = rf.snk_start + rf.snk_len;
+            for (const std::string& n : inside_set) {
+                if (n == fused.source || n == fused.sink) continue;
+                const auto it = ref_off.find(n);
+                if (it == ref_off.end()) continue;   // off-reference alleles legitimately sit inside
+                if (it->second.first < lo || it->second.first >= hi) { contained = false; break; }
+            }
+        }
+        if (!contained) {
+            if (std::getenv("PANVAR_MERGE_DEBUG"))
+                std::cerr << "[merge]   refused: fused span would not contain every interior node\n";
+            merged.push_back(spanned[i]); continue;
         }
 
-        std::unordered_set<std::string> inside_set;
-        inside_set.reserve((current.inside.size() + next.inside.size() + path_opt->size()) * 2);
-        for (const auto& n : current.inside) {
-            inside_set.insert(n);
-        }
-        for (const auto& n : next.inside) {
-            inside_set.insert(n);
-        }
-        // Old boundary nodes become internal when two nearby bubbles are fused.
-        inside_set.insert(current.sink);
-        inside_set.insert(next.source);
-        // Include any connector nodes on the shortest path between boundaries.
-        for (std::size_t pi = 1; pi + 1 < path_opt->size(); ++pi) {
-            inside_set.insert((*path_opt)[pi]);
-        }
-
-        Bubble fused = current;
-        fused.sink = next.sink;
-        fused.path_support = 0;
-        fused.min_inside_bp = 0;
-        fused.max_inside_bp = 0;
-        fused.long_path_support = 0;
-        fused.inversion_signal = false;
         fused.inside.clear();
         fused.inside.reserve(inside_set.size());
-        for (const auto& node_id : inside_set) {
-            if (node_id == fused.source || node_id == fused.sink) {
-                continue;
-            }
-            fused.inside.push_back(node_id);
-        }
+        for (const std::string& n : inside_set)
+            if (n != fused.source && n != fused.sink) fused.inside.push_back(n);
         std::sort(fused.inside.begin(), fused.inside.end());
-        current = std::move(fused);
+        fused.path_support = 0; fused.min_inside_bp = 0; fused.max_inside_bp = 0;
+        fused.long_path_support = 0; fused.inversion_signal = false;
+        fused.distinct_alleles = 0; fused.ref_allele_support = 0;
+        fused.alt_allele_support_max = 0; fused.alt_allele_support_min = 0;
+        cur = std::move(fused);
     }
-    merged.push_back(std::move(current));
+    for (Bubble& b : unspanned) merged.push_back(std::move(b));
+    std::sort(merged.begin(), merged.end(), bubble_endpoint_less);
     return merged;
 }
 
@@ -1003,6 +1086,12 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
                          bubble.long_path_support, bubble.inversion_signal};
     }
 
+    // Boundaries carry reference order BEFORE anything reads them as an interval. Merging in
+    // particular is defined in reference coordinates, so it has to run on oriented pairs; when this
+    // ran after the merge instead, every bubble looked reference-inverted (source after sink) and
+    // merging refused them all as unorderable.
+    orient_bubbles_to_reference(graph, options.reference_path, bubbles);
+
     // Every filter, applied to whatever the current bubble set is. Merging creates NEW bubbles whose
     // metrics are not those of their parts -- two 1 bp bubbles 10 bp apart fuse into one spanning 12 bp
     // -- so a set filtered before merging is not a filtered set afterwards. Measured: with
@@ -1044,7 +1133,7 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
 
     if (options.merge_nearby_bp > 0 && bubbles.size() > 1) {
         const std::size_t before = bubbles.size();
-        bubbles = merge_nearby_bubbles(graph, bubbles, options.merge_nearby_bp);
+        bubbles = merge_nearby_bubbles(graph, bubbles, options.merge_nearby_bp, options.reference_path);
         compute_bubble_metrics(bubbles, "Rescoring merged");
         const std::size_t merged = bubbles.size();
         apply_filters(bubbles);   // a fused bubble has to clear the same bars its parts did
@@ -1056,9 +1145,6 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
         (void)before;
     }
 
-    // Boundaries carry reference order before ids are assigned, so bubble_id increases along the
-    // reference and every downstream coordinate is derived from the left boundary.
-    orient_bubbles_to_reference(graph, options.reference_path, bubbles);
     std::sort(bubbles.begin(), bubbles.end(), bubble_endpoint_less);
     assign_ids(bubbles);
 

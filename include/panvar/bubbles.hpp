@@ -14,6 +14,12 @@ struct Bubble {
     std::size_t id = 0;
     std::string source;
     std::string sink;
+    // Orientation of each boundary as the REFERENCE traverses it. A snarl boundary is a handle, not a
+    // node: the same node can bound a snarl on either side, and merging has to know which sides face
+    // each other. Defaults to forward when the reference does not traverse the boundary, which is the
+    // only case where no orientation can be derived.
+    bool source_reverse = false;
+    bool sink_reverse = false;
     std::vector<std::string> inside;
     // TRAVERSAL support: paths that cross the bubble at all. On a fully-typed panel this is close to
     // the panel size for most bubbles -- crossing a site is not evidence about any particular allele.
@@ -83,6 +89,12 @@ struct SnarlDebugEntry {
     std::size_t candidate_id = 0;
     std::string source;
     std::string sink;
+    // Orientation of each boundary as the REFERENCE traverses it. A snarl boundary is a handle, not a
+    // node: the same node can bound a snarl on either side, and merging has to know which sides face
+    // each other. Defaults to forward when the reference does not traverse the boundary, which is the
+    // only case where no orientation can be derived.
+    bool source_reverse = false;
+    bool sink_reverse = false;
     std::size_t inside_node_count = 0;
     std::size_t n_paths = 0;
     std::size_t min_inside_bp = 0;
