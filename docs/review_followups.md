@@ -40,6 +40,37 @@ as history; Git already provides that history.
   still says SPA is not implemented even though it is; keep the warning about residual anti-conservatism,
   but make the source comment match the actual method.
 
+## Bubble
+
+### Bounded and legacy-mode limitations
+
+- **Remove or expose the 64-endpoint traversal cap.** The repeated-boundary interval search examines only
+  the first 64 later endpoint occurrences for each start. A focused 70-repeat path therefore reports an
+  interior span of 64 rather than 70. Replace the quadratic search with an exact bounded-time selection,
+  or at minimum make truncation explicit in diagnostics; high-copy tandem loci must not be silently
+  clipped.
+- **Expose graph-interior traversal truncation.** Graph-derived interior discovery abandons its handle
+  traversal after `2^20` visited handles and silently falls back to the path-derived interior. Report this
+  condition and either reject the candidate or label the result incomplete, so the stated graph-derived
+  interior contract does not quietly become panel-derived on a very large or leaky pair.
+- **Define the supported `--snarls-in` contract.** Without a resolvable reference, imported boundary pairs
+  are emitted with no reliable reference order and default handle orientations; reference-coordinate
+  merging is also skipped. Either require a reference (and resolve it by the same exact/case-insensitive
+  rules as internal mode), preserve and consume the oriented vg handles, or clearly restrict this path to
+  diagnostic use rather than downstream-ready Bubble output.
+
+### Transactional and documentation cleanup
+
+- **Reject colliding output destinations.** Input/output aliasing is checked, but two outputs may still
+  name the same file. For example, identical `--bubbles-csv` and `--bandage-csv` destinations succeed and
+  leave only the Bandage CSV. Preflight pairwise-distinct final paths before staging them.
+- **Strengthen the multi-file commit contract.** The output family is staged, but destinations are
+  installed sequentially and a later commit failure can leave a partially updated family. Add rollback
+  or a manifest/disposition protocol if these files need true family-level atomicity.
+- **Bring the public description up to the final contract.** Update the module summary and primary CSV
+  table for graph-derived interiors, boundary orientations and allele-support columns; document the
+  `--snarls-in` limitation chosen above, and include `--emit-snarls-jsonl` in the reported output list.
+
 ## Rebuild
 
 ### Deferred capability

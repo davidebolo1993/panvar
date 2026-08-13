@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstddef>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace panvar::cli {
@@ -70,5 +71,31 @@ double parse_similarity_arg(const std::string& name, const std::string& value);
 double parse_unit_fraction_arg(const std::string& name, const std::string& value);
 std::string join_with_comma(const std::vector<std::string>& values);
 void ensure_parent_dir_for_file(const std::string& path_text);
+
+// A unique sibling of `final_path`: outputs are written here and renamed into place, so an
+// interrupted or failed run never leaves a half-written file where a complete one is expected.
+std::string staging_path(const std::string& final_path, const std::string& module);
+
+// Rename a staged file into place, falling back to copy-then-remove across filesystems.
+void commit_staged(const std::string& staged, const std::string& final_path);
+
+// Every output of one command, staged together and committed only once the command has succeeded.
+// Anything still staged when the set is destroyed is removed, so a throw leaves no partial output.
+class StagedOutputs {
+public:
+    explicit StagedOutputs(std::string module);
+    ~StagedOutputs();
+    StagedOutputs(const StagedOutputs&) = delete;
+    StagedOutputs& operator=(const StagedOutputs&) = delete;
+
+    // Register a destination and return the path to write to instead.
+    std::string stage(const std::string& final_path);
+    // Move every staged file to its destination, in registration order.
+    void commit();
+
+private:
+    std::string module_;
+    std::vector<std::pair<std::string, std::string>> pending_;   // (staged, final)
+};
 
 } // namespace panvar::cli

@@ -174,6 +174,10 @@ std::vector<Bubble> read_bubbles_csv(const std::string& input_path) {
     const std::size_t idx_max_bp = required_column(index_by_name, "max_inside_bp");
     const auto idx_src_orient = optional_column(index_by_name, "source_orient");
     const auto idx_snk_orient = optional_column(index_by_name, "sink_orient");
+    const auto idx_distinct = optional_column(index_by_name, "distinct_alleles");
+    const auto idx_ref_sup = optional_column(index_by_name, "ref_allele_support");
+    const auto idx_alt_max = optional_column(index_by_name, "alt_allele_support_max");
+    const auto idx_alt_min = optional_column(index_by_name, "alt_allele_support_min");
     const auto idx_long_path = optional_column(index_by_name, "long_path_support");
     const auto idx_inversion = optional_column(index_by_name, "inversion_signal");
     const std::size_t idx_inside_nodes = required_column(index_by_name, "inside_nodes");
@@ -212,6 +216,18 @@ std::vector<Bubble> read_bubbles_csv(const std::string& input_path) {
         bubble.path_support = parse_size_field(require_field(idx_path_support, "path_support"), "path_support");
         bubble.min_inside_bp = parse_size_field(require_field(idx_min_bp, "min_inside_bp"), "min_inside_bp");
         bubble.max_inside_bp = parse_size_field(require_field(idx_max_bp, "max_inside_bp"), "max_inside_bp");
+        // Written since the allele-support work but never read back, so every consumer that goes
+        // through the CSV saw zeros and --min-alt-support could not be re-applied downstream.
+        const auto read_optional = [&](const std::optional<std::size_t>& idx, const char* name,
+                                       std::size_t& target) {
+            if (idx.has_value() && *idx < fields.size() && !fields[*idx].empty()) {
+                target = parse_size_field(fields[*idx], name);
+            }
+        };
+        read_optional(idx_distinct, "distinct_alleles", bubble.distinct_alleles);
+        read_optional(idx_ref_sup, "ref_allele_support", bubble.ref_allele_support);
+        read_optional(idx_alt_max, "alt_allele_support_max", bubble.alt_allele_support_max);
+        read_optional(idx_alt_min, "alt_allele_support_min", bubble.alt_allele_support_min);
         if (idx_long_path.has_value()) {
             bubble.long_path_support =
                 parse_size_field(require_field(*idx_long_path, "long_path_support"), "long_path_support");

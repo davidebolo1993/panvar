@@ -62,6 +62,25 @@ using CandidateMap = std::unordered_map<EndpointKey, BubbleCandidateIdx, Endpoin
 // the class of divergence, not just this instance.
 using PathIndex = BubblePathIndex;
 
+// Defined below, next to the rest of the interior machinery; declared here because merging needs to
+// recompute a fused bubble's interior with exactly the rule discovery used.
+std::unordered_set<std::uint32_t> interior_indices_for_pair(
+    const Graph& graph,
+    const PackedGraph& packed,
+    const std::vector<PathIndex>& path_indexes,
+    const std::string& source_id,
+    const std::string& sink_id,
+    std::uint32_t src_idx,
+    std::uint32_t sink_idx);
+bool reachable_interior(
+    const Graph& graph,
+    const PackedGraph& packed,
+    std::uint64_t start_handle,
+    std::uint32_t stop_idx,
+    std::uint32_t origin_idx,
+    bool backward,
+    std::unordered_set<std::uint32_t>& out);
+
 PackedGraph pack_graph(const Graph& graph) {
     PackedGraph packed;
     packed.node_ids.reserve(graph.nodes.size());
@@ -194,135 +213,8 @@ bool bubble_endpoint_less(const Bubble& a, const Bubble& b) {
     return a.inside.size() < b.inside.size();
 }
 
-// ---- Nearby-bubble merge (graph-distance based) --------------------------------------
 
-struct NodeAdjacency {
-    std::unordered_map<std::string, std::vector<std::string>> neighbors;
-    std::unordered_map<std::string, std::size_t> node_len_bp;
-};
 
-NodeAdjacency build_node_adjacency(const Graph& graph) {
-    NodeAdjacency out;
-    out.neighbors.reserve(graph.nodes.size() * 2);
-    out.node_len_bp.reserve(graph.nodes.size() * 2);
-
-    for (const auto& [node_id, node] : graph.nodes) {
-        out.node_len_bp[node_id] = std::max<std::size_t>(1, node.sequence.size());
-    }
-
-    auto add_neighbor = [&](const std::string& from, const std::string& to) {
-        out.neighbors[from].push_back(to);
-    };
-
-    for (const auto& [node_id, node] : graph.nodes) {
-        for (const auto& n : node.start) {
-            if (graph.nodes.find(n.node_id) == graph.nodes.end()) {
-                continue;
-            }
-            add_neighbor(node_id, n.node_id);
-            add_neighbor(n.node_id, node_id);
-        }
-        for (const auto& n : node.end) {
-            if (graph.nodes.find(n.node_id) == graph.nodes.end()) {
-                continue;
-            }
-            add_neighbor(node_id, n.node_id);
-            add_neighbor(n.node_id, node_id);
-        }
-    }
-
-    for (auto& [node_id, vec] : out.neighbors) {
-        (void)node_id;
-        std::sort(vec.begin(), vec.end());
-        vec.erase(std::unique(vec.begin(), vec.end()), vec.end());
-    }
-
-    return out;
-}
-
-std::optional<std::vector<std::string>> shortest_node_path_within_bp(
-    const NodeAdjacency& adj,
-    const std::string& from_node,
-    const std::string& to_node,
-    std::size_t max_bp) {
-
-    const auto it_from = adj.node_len_bp.find(from_node);
-    const auto it_to = adj.node_len_bp.find(to_node);
-    if (it_from == adj.node_len_bp.end() || it_to == adj.node_len_bp.end()) {
-        return std::nullopt;
-    }
-
-    const std::size_t start_cost = it_from->second;
-    if (start_cost > max_bp) {
-        return std::nullopt;
-    }
-
-    using HeapItem = std::pair<std::size_t, std::string>;
-    std::priority_queue<HeapItem, std::vector<HeapItem>, std::greater<HeapItem>> heap;
-    std::unordered_map<std::string, std::size_t> dist;
-    std::unordered_map<std::string, std::string> prev;
-    dist.reserve(adj.node_len_bp.size() / 2 + 16);
-    prev.reserve(adj.node_len_bp.size() / 2 + 16);
-
-    dist[from_node] = start_cost;
-    heap.push({start_cost, from_node});
-
-    while (!heap.empty()) {
-        auto [d, node] = heap.top();
-        heap.pop();
-        const auto dist_it = dist.find(node);
-        if (dist_it == dist.end() || d != dist_it->second) {
-            continue;
-        }
-        if (d > max_bp) {
-            continue;
-        }
-        if (node == to_node) {
-            break;
-        }
-
-        const auto neigh_it = adj.neighbors.find(node);
-        if (neigh_it == adj.neighbors.end()) {
-            continue;
-        }
-        for (const auto& nxt : neigh_it->second) {
-            const auto len_it = adj.node_len_bp.find(nxt);
-            if (len_it == adj.node_len_bp.end()) {
-                continue;
-            }
-            const std::size_t nd = d + len_it->second;
-            if (nd > max_bp) {
-                continue;
-            }
-            const auto old_it = dist.find(nxt);
-            if (old_it == dist.end() || nd < old_it->second) {
-                dist[nxt] = nd;
-                prev[nxt] = node;
-                heap.push({nd, nxt});
-            }
-        }
-    }
-
-    const auto to_dist_it = dist.find(to_node);
-    if (to_dist_it == dist.end() || to_dist_it->second > max_bp) {
-        return std::nullopt;
-    }
-
-    std::vector<std::string> path_rev;
-    path_rev.push_back(to_node);
-    while (!path_rev.empty() && path_rev.back() != from_node) {
-        const auto p_it = prev.find(path_rev.back());
-        if (p_it == prev.end()) {
-            return std::nullopt;
-        }
-        path_rev.push_back(p_it->second);
-    }
-    if (path_rev.empty() || path_rev.back() != from_node) {
-        return std::nullopt;
-    }
-    std::reverse(path_rev.begin(), path_rev.end());
-    return path_rev;
-}
 
 // Reference coordinates of a bubble's boundaries: the bp offset at which each boundary node starts on
 // the reference walk, and its length. Bubbles the reference does not span cannot be ordered against
@@ -374,6 +266,8 @@ std::unordered_map<std::string, std::pair<std::size_t, std::size_t>> reference_o
 // bubble is validated: every interior node must lie inside the new span, or the merge is refused.
 std::vector<Bubble> merge_nearby_bubbles(
     const Graph& graph,
+    const PackedGraph& packed,
+    const std::vector<PathIndex>& path_indexes,
     const std::vector<Bubble>& input,
     std::size_t max_bp,
     const std::string& reference_path) {
@@ -423,13 +317,27 @@ std::vector<Bubble> merge_nearby_bubbles(
         Bubble fused = cur;
         fused.sink = spanned[i].sink;
         fused.sink_reverse = spanned[i].sink_reverse;
+        // The fused interior is recomputed from the graph between the new outer boundaries, not
+        // assembled from the parts. Taking the union of the two interiors plus whatever the REFERENCE
+        // carries across the connector describes only the reference route between them: an alternate
+        // connector branch -- and any cycle riding on it, which is what --superbubbles must see -- is
+        // in neither part's interior and is not on the reference, so it went missing exactly when the
+        // fused bubble started to span it.
         std::unordered_set<std::string> inside_set(cur.inside.begin(), cur.inside.end());
         inside_set.insert(spanned[i].inside.begin(), spanned[i].inside.end());
         inside_set.insert(cur.sink);                 // old boundaries become interior
         inside_set.insert(spanned[i].source);
-        // Everything the reference itself carries across the connector.
-        for (const auto& [node, off_len] : ref_off)
-            if (off_len.first >= cur_end && off_len.first < rn.src_start) inside_set.insert(node);
+        {
+            const auto s_it = packed.node_idx_of.find(fused.source);
+            const auto k_it = packed.node_idx_of.find(fused.sink);
+            if (s_it != packed.node_idx_of.end() && k_it != packed.node_idx_of.end()) {
+                for (const std::uint32_t idx : interior_indices_for_pair(
+                         graph, packed, path_indexes, fused.source, fused.sink,
+                         s_it->second, k_it->second)) {
+                    inside_set.insert(packed.node_ids[idx]);
+                }
+            }
+        }
 
         const RefSpan rf = span_of(fused);
         bool contained = rf.ok;
@@ -597,6 +505,75 @@ std::vector<std::pair<std::string, std::string>> read_snarl_pairs_jsonl(const st
 // inside nodes seen on every path that crosses source->sink. Shared by the internal snarl
 // finder and the --snarls-in override.
 
+// The interior of one endpoint pair: everything the panel walks between the boundaries, unioned with
+// everything the GRAPH carries between them. One function, so discovery and merging cannot drift --
+// a fused bubble used to take the union of its parts' interiors plus the nodes the REFERENCE carries
+// across the connector, which omits any alternate connector branch and any cycle riding on one.
+std::unordered_set<std::uint32_t> interior_indices_for_pair(
+    const Graph& graph,
+    const PackedGraph& packed,
+    const std::vector<PathIndex>& path_indexes,
+    const std::string& source_id,
+    const std::string& sink_id,
+    std::uint32_t src_idx,
+    std::uint32_t sink_idx) {
+
+    std::unordered_set<std::uint32_t> inside_idx_set;
+    std::optional<EndpointOnlyInterval> best_iv;
+    std::size_t best_iv_path = 0;
+    for (std::size_t p_idx = 0; p_idx < path_indexes.size(); ++p_idx) {
+        const auto interval = find_best_endpoint_interval(path_indexes[p_idx], source_id, sink_id);
+        if (!interval.has_value()) {
+            continue;
+        }
+        if (!best_iv.has_value() || better_endpoint_interval(*interval, *best_iv)) {
+            best_iv = interval;
+            best_iv_path = p_idx;
+        }
+        const auto& steps = graph.paths[p_idx].steps;
+        for (std::size_t i = interval->left + 1; i < interval->right; ++i) {
+            const auto idx_it = packed.node_idx_of.find(steps[i].node_id);
+            if (idx_it == packed.node_idx_of.end()) {
+                continue;
+            }
+            if (idx_it->second == src_idx || idx_it->second == sink_idx) {
+                continue;
+            }
+            inside_idx_set.insert(idx_it->second);
+        }
+    }
+
+    // B5: add the branches the graph carries between these boundaries that no stored path takes.
+    // The walked interval supplies the orientation -- which side of each boundary faces inward --
+    // which the unordered cactus pair does not.
+    if (best_iv.has_value()) {
+        const auto& steps = graph.paths[best_iv_path].steps;
+        const PathStep& near = steps[best_iv->left];
+        const PathStep& far = steps[best_iv->right];
+        const auto near_it = packed.node_idx_of.find(near.node_id);
+        const auto far_it = packed.node_idx_of.find(far.node_id);
+        if (near_it != packed.node_idx_of.end() && far_it != packed.node_idx_of.end()) {
+            const std::uint64_t near_handle =
+                (static_cast<std::uint64_t>(near_it->second) << 1) | (near.reverse ? 1u : 0u);
+            const std::uint64_t far_handle =
+                (static_cast<std::uint64_t>(far_it->second) << 1) | (far.reverse ? 1u : 0u);
+            std::unordered_set<std::uint32_t> forward;
+            std::unordered_set<std::uint32_t> backward;
+            if (reachable_interior(graph, packed, near_handle, far_it->second, near_it->second,
+                                   false, forward) &&
+                reachable_interior(graph, packed, far_handle, near_it->second, far_it->second,
+                                   true, backward)) {
+                for (const std::uint32_t idx : forward) {
+                    if (backward.count(idx) == 0) continue;   // not on a boundary-to-boundary route
+                    if (idx == src_idx || idx == sink_idx) continue;
+                    inside_idx_set.insert(idx);
+                }
+            }
+        }
+    }
+    return inside_idx_set;
+}
+
 // B5. The interior of a snarl is a property of the GRAPH, not of the panel that happens to walk it.
 //
 // Collecting only the nodes some stored path visits between the boundaries understates the site
@@ -707,58 +684,8 @@ void collect_candidates_for_pairs(
             continue;
         }
 
-        std::unordered_set<std::uint32_t> inside_idx_set;
-        std::optional<EndpointOnlyInterval> best_iv;
-        std::size_t best_iv_path = 0;
-        for (std::size_t p_idx = 0; p_idx < path_indexes.size(); ++p_idx) {
-            const auto interval = find_best_endpoint_interval(path_indexes[p_idx], source_id, sink_id);
-            if (!interval.has_value()) {
-                continue;
-            }
-            if (!best_iv.has_value() || better_endpoint_interval(*interval, *best_iv)) {
-                best_iv = interval;
-                best_iv_path = p_idx;
-            }
-            const auto& steps = graph.paths[p_idx].steps;
-            for (std::size_t i = interval->left + 1; i < interval->right; ++i) {
-                const auto idx_it = packed.node_idx_of.find(steps[i].node_id);
-                if (idx_it == packed.node_idx_of.end()) {
-                    continue;
-                }
-                if (idx_it->second == src_idx_it->second || idx_it->second == sink_idx_it->second) {
-                    continue;
-                }
-                inside_idx_set.insert(idx_it->second);
-            }
-        }
-
-        // B5: add the branches the graph carries between these boundaries that no stored path takes.
-        // The walked interval supplies the orientation -- which side of each boundary faces inward --
-        // which the unordered cactus pair does not.
-        if (best_iv.has_value()) {
-            const auto& steps = graph.paths[best_iv_path].steps;
-            const PathStep& near = steps[best_iv->left];
-            const PathStep& far = steps[best_iv->right];
-            const auto near_it = packed.node_idx_of.find(near.node_id);
-            const auto far_it = packed.node_idx_of.find(far.node_id);
-            if (near_it != packed.node_idx_of.end() && far_it != packed.node_idx_of.end()) {
-                const std::uint64_t near_handle =
-                    (static_cast<std::uint64_t>(near_it->second) << 1) | (near.reverse ? 1u : 0u);
-                const std::uint64_t far_handle =
-                    (static_cast<std::uint64_t>(far_it->second) << 1) | (far.reverse ? 1u : 0u);
-                std::unordered_set<std::uint32_t> forward;
-                std::unordered_set<std::uint32_t> backward;
-                if (reachable_interior(graph, packed, near_handle, far_it->second, near_it->second,
-                                       false, forward) &&
-                    reachable_interior(graph, packed, far_handle, near_it->second, far_it->second,
-                                       true, backward)) {
-                    for (const std::uint32_t idx : forward) {
-                        if (backward.count(idx) == 0) continue;   // does not lie on a boundary-to-boundary route
-                        inside_idx_set.insert(idx);
-                    }
-                }
-            }
-        }
+        std::unordered_set<std::uint32_t> inside_idx_set = interior_indices_for_pair(
+            graph, packed, path_indexes, source_id, sink_id, src_idx_it->second, sink_idx_it->second);
 
         std::vector<std::uint32_t> inside;
         inside.reserve(inside_idx_set.size());
@@ -790,36 +717,7 @@ void collect_candidates_for_pairs(
 
 // ---- Per-bubble metrics on supporting path intervals ----------------------------------
 
-std::vector<std::size_t> collect_inside_positions(const PathIndex& path, const Bubble& bubble) {
-    std::vector<std::size_t> inside_positions;
-    inside_positions.reserve(bubble.inside.size());
-    for (const auto& node : bubble.inside) {
-        const auto it = path.positions.find(node);
-        if (it == path.positions.end()) {
-            continue;
-        }
-        inside_positions.insert(inside_positions.end(), it->second.begin(), it->second.end());
-    }
-    if (inside_positions.empty()) {
-        return inside_positions;
-    }
-    std::sort(inside_positions.begin(), inside_positions.end());
-    inside_positions.erase(std::unique(inside_positions.begin(), inside_positions.end()), inside_positions.end());
-    return inside_positions;
-}
 
-std::size_t count_inside_between(
-    const std::vector<std::size_t>& inside_positions,
-    std::size_t left,
-    std::size_t right) {
-
-    if (inside_positions.empty() || left >= right) {
-        return 0;
-    }
-    const auto begin_it = std::upper_bound(inside_positions.begin(), inside_positions.end(), left);
-    const auto end_it = std::lower_bound(inside_positions.begin(), inside_positions.end(), right);
-    return static_cast<std::size_t>(std::distance(begin_it, end_it));
-}
 
 struct CandidateInterval {
     std::size_t left = 0;
@@ -828,55 +726,7 @@ struct CandidateInterval {
     bool source_to_sink = true;
 };
 
-bool better_candidate(const CandidateInterval& a, const CandidateInterval& b) {
-    if (a.inside_count != b.inside_count) {
-        return a.inside_count > b.inside_count;
-    }
-    const std::size_t a_span = a.right - a.left;
-    const std::size_t b_span = b.right - b.left;
-    if (a_span != b_span) {
-        return a_span < b_span;
-    }
-    return a.left < b.left;
-}
 
-void evaluate_direction_candidates(
-    const std::vector<std::size_t>& start_positions,
-    const std::vector<std::size_t>& end_positions,
-    bool source_to_sink,
-    const std::vector<std::size_t>& inside_positions,
-    std::optional<CandidateInterval>& best) {
-
-    // Every later endpoint is considered, not just the nearest one. The selection rule is "the interval
-    // with the most interior steps wins", but taking only the first endpoint after each start made that
-    // unreachable: where a boundary recurs -- a tandem array, a duplication, any path revisiting a
-    // boundary -- the enclosing traversal ends at a LATER occurrence, and the nearest one closes a
-    // short interval that contains almost none of the snarl.
-    //
-    // Bounded: a boundary occurring many times gives quadratically many pairs, and only the widest few
-    // can ever win, so each start examines at most `kMaxEndsPerStart` endpoints beyond the first.
-    constexpr std::size_t kMaxEndsPerStart = 64;
-    for (const std::size_t start_pos : start_positions) {
-        const auto first = std::upper_bound(end_positions.begin(), end_positions.end(), start_pos);
-        std::size_t examined = 0;
-        for (auto it = first; it != end_positions.end() && examined < kMaxEndsPerStart; ++it, ++examined) {
-            const std::size_t end_pos = *it;
-            const std::size_t inside_count = count_inside_between(inside_positions, start_pos, end_pos);
-            if (inside_count == 0) {
-                continue;
-            }
-            CandidateInterval candidate;
-            candidate.left = start_pos;
-            candidate.right = end_pos;
-            candidate.inside_count = inside_count;
-            candidate.source_to_sink = source_to_sink;
-
-            if (!best.has_value() || better_candidate(candidate, *best)) {
-                best = candidate;
-            }
-        }
-    }
-}
 
 // Does the snarl's INTERIOR contain a directed cycle?
 //
@@ -937,55 +787,7 @@ bool interior_has_cycle(const Graph& graph, const std::vector<std::string>& insi
     return false;
 }
 
-std::optional<CandidateInterval> find_best_interval(const PathIndex& index, const Bubble& bubble) {
-    const auto src_it = index.positions.find(bubble.source);
-    const auto sink_it = index.positions.find(bubble.sink);
-    if (src_it == index.positions.end() || sink_it == index.positions.end()) {
-        return std::nullopt;
-    }
 
-    const auto inside_positions = collect_inside_positions(index, bubble);
-    if (inside_positions.empty()) {
-        return std::nullopt;
-    }
-
-    std::optional<CandidateInterval> best;
-    evaluate_direction_candidates(src_it->second, sink_it->second, true, inside_positions, best);
-    evaluate_direction_candidates(sink_it->second, src_it->second, false, inside_positions, best);
-    return best;
-}
-
-std::vector<PathStep> canonical_steps_for_bubble(
-    const PathRecord& path,
-    const Bubble& bubble,
-    const CandidateInterval& interval) {
-
-    if (interval.left >= path.steps.size() || interval.right >= path.steps.size() || interval.left > interval.right) {
-        return {};
-    }
-
-    std::vector<PathStep> out;
-    out.reserve(interval.right - interval.left + 1);
-
-    if (interval.source_to_sink) {
-        for (std::size_t i = interval.left; i <= interval.right; ++i) {
-            out.push_back(path.steps[i]);
-        }
-    } else {
-        for (std::size_t i = interval.right + 1; i > interval.left; --i) {
-            const PathStep& s = path.steps[i - 1];
-            out.push_back(PathStep{s.node_id, !s.reverse});
-        }
-        if (!out.empty() && (out.front().node_id != bubble.source || out.back().node_id != bubble.sink)) {
-            std::reverse(out.begin(), out.end());
-            for (auto& step : out) {
-                step.reverse = !step.reverse;
-            }
-        }
-    }
-
-    return out;
-}
 
 void assign_ids(std::vector<Bubble>& bubbles) {
     for (std::size_t i = 0; i < bubbles.size(); ++i) {
@@ -1259,7 +1061,8 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
 
     if (options.merge_nearby_bp > 0 && bubbles.size() > 1) {
         const std::size_t before = bubbles.size();
-        bubbles = merge_nearby_bubbles(graph, bubbles, options.merge_nearby_bp, options.reference_path);
+        bubbles = merge_nearby_bubbles(graph, packed, path_indexes, bubbles, options.merge_nearby_bp,
+                                       options.reference_path);
         compute_bubble_metrics(bubbles, "Rescoring merged");
         const std::size_t merged = bubbles.size();
         apply_filters(bubbles);   // a fused bubble has to clear the same bars its parts did

@@ -193,6 +193,77 @@ src=$(cel "$OUT/mrD.bubbles.csv" source); snk=$(cel "$OUT/mrD.bubbles.csv" sink)
   && ok "--superbubbles excludes a cycle carried on a branch no path walks" \
   || bad "cyclic unwalked branch survived --superbubbles: $(rows "$OUT/uwc1.bubbles.csv") bubbles"
 
+# ---- the reference name must be the RESOLVED one -------------------------------------------------
+# sort_graph_reference accepts an exact name, a unique case-insensitive match or a unique substring,
+# but everything downstream compares path names exactly. Keeping the user's spelling meant `-r FULL`
+# for a path named `full` sorted correctly and then matched nothing: boundaries came back unoriented
+# and reference allele support read 0, with no error anywhere.
+{ printf 'H\tVN:Z:1.0\n'
+  printf 'S\t1\tAAAAAAAAAA\nS\t2\tCCCCCCCCCC\nS\t3\tGGGGGGGGGG\n'
+  printf 'L\t1\t+\t2\t+\t0M\nL\t2\t+\t3\t+\t0M\nL\t1\t+\t3\t+\t0M\n'
+  printf 'P\tfull\t1+,2+,3+\t*\nP\tdel\t1+,3+\t*\n'; } > "$OUT/case.gfa"
+"$BIN" bubble -i "$OUT/case.gfa" -r FULL -o "$OUT/case" --min-variant-bp 0 -q >/dev/null 2>&1
+[ "$(cel "$OUT/case.bubbles.csv" source)" = "1" ] && [ "$(cel "$OUT/case.bubbles.csv" sink)" = "3" ] \
+  && ok "a case-insensitive reference alias still orients the boundaries" \
+  || bad "-r FULL gave $(cel "$OUT/case.bubbles.csv" source)..$(cel "$OUT/case.bubbles.csv" sink), expected 1..3"
+[ "$(cel "$OUT/case.bubbles.csv" ref_allele_support)" = "1" ] \
+  && ok "a case-insensitive reference alias still finds the reference allele" \
+  || bad "-r FULL gave ref_allele_support $(cel "$OUT/case.bubbles.csv" ref_allele_support), expected 1"
+
+# ---- the graph contract applies through BOTH doors ------------------------------------------------
+{ printf 'H\tVN:Z:1.0\n'
+  printf 'S\t1\tAAAAAAAAAA\nS\t2\tCCCCCCCCCC\nS\t3\tGGGGGGGGGG\n'
+  printf 'L\t1\t+\t2\t+\t0M\nL\t1\t+\t3\t+\t0M\n'
+  printf 'P\tfull\t1+,2+,3+\t*\nP\tdel\t1+,3+\t*\n'; } > "$OUT/bad.gfa"
+printf '{"start": {"node_id": "1"}, "end": {"node_id": "3"}}\n' > "$OUT/snarls.jsonl"
+rm -f "$OUT/ext".*
+"$BIN" bubble -i "$OUT/bad.gfa" --snarls-in "$OUT/snarls.jsonl" -o "$OUT/ext" --min-variant-bp 0 -q >/dev/null 2>&1
+[ "$?" -ne 0 ] && ok "--snarls-in refuses a path step with no link behind it" \
+               || bad "--snarls-in accepted a malformed graph"
+[ "$(ls "$OUT/ext".* 2>/dev/null | wc -l | tr -d ' ')" = "0" ] \
+  && ok "a refused --snarls-in run writes no output" \
+  || bad "--snarls-in left $(ls "$OUT/ext".* 2>/dev/null | wc -l | tr -d ' ') file(s) behind"
+
+# ---- nothing lands until the run succeeds ---------------------------------------------------------
+# The sorted GFA is written before discovery finishes, so a later failure used to leave a
+# complete-looking graph for the next command in a pipeline to consume.
+rm -f "$OUT/stage".*
+"$BIN" bubble -i "$OUT/bad.gfa" -r full -o "$OUT/stage" --min-variant-bp 0 -q >/dev/null 2>&1
+[ "$(ls "$OUT/stage".* 2>/dev/null | wc -l | tr -d ' ')" = "0" ] \
+  && ok "a failed run leaves no partial output, not even the sorted GFA" \
+  || bad "failed run left: $(ls "$OUT/stage".* 2>/dev/null | tr '\n' ' ')"
+
+# ---- an alternate connector belongs to a fused bubble ---------------------------------------------
+# Node 5 is a connector branch no path walks, so it is in neither part's interior and not on the
+# reference. Assembling a fusion from its parts plus the reference connector dropped it.
+{ printf 'H\tVN:Z:1.0\n'
+  for n in 1 2 3 4 5 6 7 8 9 10; do printf "S\t$n\tACGTACGTAC\n"; done
+  printf 'L\t1\t+\t2\t+\t0M\nL\t1\t+\t3\t+\t0M\nL\t2\t+\t4\t+\t0M\nL\t3\t+\t4\t+\t0M\n'
+  printf 'L\t4\t+\t6\t+\t0M\nL\t6\t+\t7\t+\t0M\nL\t4\t+\t5\t+\t0M\nL\t5\t+\t7\t+\t0M\n'
+  printf 'L\t7\t+\t8\t+\t0M\nL\t7\t+\t9\t+\t0M\nL\t8\t+\t10\t+\t0M\nL\t9\t+\t10\t+\t0M\n'
+  printf 'P\tpA\t1+,2+,4+,6+,7+,8+,10+\t*\nP\tpB\t1+,3+,4+,6+,7+,9+,10+\t*\n'; } > "$OUT/conn.gfa"
+"$BIN" bubble -i "$OUT/conn.gfa" -r pA -o "$OUT/conn" --min-variant-bp 0 --min-alt-support 1 \
+       --merge-nearby-bp 50 -q >/dev/null 2>&1
+case "$(cel "$OUT/conn.bubbles.csv" inside_nodes)" in
+  *5*) ok "a fused bubble contains the alternate connector branch, not just the reference route" ;;
+  *)   bad "fused interior $(cel "$OUT/conn.bubbles.csv" inside_nodes) omits the alternate connector 5" ;;
+esac
+
+# ---- a cycle through a boundary handle ------------------------------------------------------------
+# The acyclicity search is induced over the strict interior, so a cycle running through a BOUNDARY is
+# not in the graph it searches. It is caught anyway, because a boundary carrying a cycle stops being a
+# cut vertex and the decomposition promotes it into the interior of the enclosing snarl. Pinned here
+# so a change to the decomposition cannot quietly reopen the hole.
+{ printf 'H\tVN:Z:1.0\n'
+  for n in 1 2 3 4 5 6 7; do printf "S\t$n\tACGTACGTAC\n"; done
+  printf 'L\t1\t+\t2\t+\t0M\nL\t2\t+\t3\t+\t0M\nL\t3\t+\t4\t+\t0M\nL\t4\t+\t5\t+\t0M\nL\t5\t+\t6\t+\t0M\n'
+  printf 'L\t2\t+\t7\t+\t0M\nL\t7\t+\t4\t+\t0M\nL\t3\t+\t2\t+\t0M\n'
+  printf 'P\tpA\t1+,2+,3+,4+,5+,6+\t*\nP\tpB\t1+,2+,7+,4+,5+,6+\t*\n'; } > "$OUT/bcyc.gfa"
+"$BIN" bubble -i "$OUT/bcyc.gfa" -r pA -o "$OUT/bcyc" --min-variant-bp 0 --superbubbles -q >/dev/null 2>&1
+[ "$(rows "$OUT/bcyc.bubbles.csv")" = "0" ] \
+  && ok "--superbubbles excludes a cycle that runs through a boundary handle" \
+  || bad "boundary-handle cycle survived --superbubbles: $(rows "$OUT/bcyc.bubbles.csv") bubbles"
+
 echo
 if [ "$fails" -eq 0 ]; then echo "bubble_stats: all assertions passed"; exit 0; fi
 echo "bubble_stats: $fails assertion(s) FAILED"; exit 1

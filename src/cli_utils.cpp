@@ -1,6 +1,8 @@
 #include "panvar/cli_utils.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <random>
 #include <cctype>
 #include <cstdio>
 #include <ctime>
@@ -235,3 +237,49 @@ void ensure_parent_dir_for_file(const std::string& path_text) {
 }
 
 } // namespace panvar::cli
+
+namespace panvar {
+namespace cli {
+
+std::string staging_path(const std::string& final_path, const std::string& module) {
+    static std::atomic<unsigned> seq{0};
+    std::random_device rd;
+    const std::string tag = std::to_string(rd()) + "." + std::to_string(seq++);
+    return final_path + "." + module + "-tmp." + tag;
+}
+
+void commit_staged(const std::string& staged, const std::string& final_path) {
+    std::error_code ec;
+    std::filesystem::rename(staged, final_path, ec);
+    if (!ec) return;
+    // Across filesystems rename fails; fall back to copy-then-remove, still not in place.
+    std::filesystem::copy_file(staged, final_path,
+                               std::filesystem::copy_options::overwrite_existing, ec);
+    std::filesystem::remove(staged);
+    if (ec) throw std::runtime_error("cannot move output into place: " + final_path);
+}
+
+StagedOutputs::StagedOutputs(std::string module) : module_(std::move(module)) {}
+
+StagedOutputs::~StagedOutputs() {
+    std::error_code ec;
+    for (const auto& [staged, _final] : pending_) std::filesystem::remove(staged, ec);
+}
+
+std::string StagedOutputs::stage(const std::string& final_path) {
+    ensure_parent_dir_for_file(final_path);
+    const std::string staged = staging_path(final_path, module_);
+    pending_.emplace_back(staged, final_path);
+    return staged;
+}
+
+void StagedOutputs::commit() {
+    for (const auto& [staged, final_path] : pending_) {
+        if (!std::filesystem::exists(staged)) continue;   // an optional output nobody wrote
+        commit_staged(staged, final_path);
+    }
+    pending_.clear();
+}
+
+} // namespace cli
+} // namespace panvar

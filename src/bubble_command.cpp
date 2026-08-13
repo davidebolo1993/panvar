@@ -60,9 +60,11 @@ void print_bubble_help() {
         << "      --min-alt-support <N>        Require the best-supported NON-REFERENCE allele to have at\n"
         << "                                   least N supporting paths. This is what a support filter is\n"
         << "                                   usually wanted for (default: 0)\n"
-        << "      --merge-nearby-bp <N>        Merge nearby bubbles only after base filters\n"
-        << "                                    (min-path/min-variant) when sink->source shortest-path\n"
-        << "                                    distance is <= N bp (default: 0, disabled)\n"
+        << "      --merge-nearby-bp <N>        Merge nearby bubbles, after the base filters and again\n"
+        << "                                   after merging, when the reference sequence STRICTLY\n"
+        << "                                   BETWEEN the facing boundaries is <= N bp. Ordering and\n"
+        << "                                   distance are both in reference coordinates, so bubbles\n"
+        << "                                   that abut have a gap of 0 (default: 0, disabled)\n"
         << "  -q, --quiet                      Disable the progress bar\n"
         << "  -h, --help                       Show this help\n";
 }
@@ -190,37 +192,64 @@ int run_bubble_command(const std::vector<std::string>& args) {
         throw std::runtime_error("Missing required input: --gfa <path>");
     }
 
+    // Every output path is resolved here, BEFORE anything is opened, so the alias check below sees the
+    // defaults too -- the sorted GFA used to be named after the check had already run, which left the
+    // one output written before discovery unchecked.
     if (bubbles_csv_path.empty()) {
         bubbles_csv_path = out_prefix + ".bubbles.csv";
     }
     if (bandage_csv_path.empty()) {
         bandage_csv_path = out_prefix + ".bandage_nodes.csv";
     }
-
-    cli::ensure_parent_dir_for_file(bubbles_csv_path);
-    cli::ensure_parent_dir_for_file(bandage_csv_path);
-    if (!snarl_debug_tsv_path.empty()) {
-        cli::ensure_parent_dir_for_file(snarl_debug_tsv_path);
+    if (sorted_gfa_path.empty() && options.snarls_input_path.empty()) {
+        sorted_gfa_path = out_prefix + ".sorted.gfa";
+    }
+    std::string bandage_genes_path;
+    if (!gtf_path.empty()) {
+        bandage_genes_path = out_prefix + ".bandage_genes.csv";
     }
 
     ParseGfaOptions parse_options;
     parse_options.include_paths = true;
     parse_options.include_sequences = true;
 
-    // Refuse to write an output over the input. `bubble` writes the sorted GFA before discovery even
+    // Refuse to write any output over any input. `bubble` writes the sorted GFA before discovery even
     // begins, so an aliased path destroys the graph it is about to read.
     {
-        std::error_code ec;
-        const std::filesystem::path in_p = std::filesystem::weakly_canonical(gfa_path, ec);
-        for (const std::string* out : {&bubbles_csv_path, &bandage_csv_path, &sorted_gfa_path}) {
-            if (out->empty()) continue;
-            std::error_code e2;
-            const std::filesystem::path o = std::filesystem::weakly_canonical(*out, e2);
-            if (!ec && !e2 && !in_p.empty() && in_p == o)
-                throw std::runtime_error("bubble: output '" + *out +
-                                         "' is the same file as --gfa; refusing to overwrite the input");
+        const std::string* inputs[] = {&gfa_path, &options.snarls_input_path, &gtf_path};
+        const std::string* outs[] = {&bubbles_csv_path, &bandage_csv_path, &sorted_gfa_path,
+                                     &bandage_genes_path, &snarl_debug_tsv_path,
+                                     &emit_snarls_jsonl_path};
+        for (const std::string* in : inputs) {
+            if (in->empty()) continue;
+            std::error_code ec;
+            const std::filesystem::path in_p = std::filesystem::weakly_canonical(*in, ec);
+            if (ec || in_p.empty()) continue;
+            for (const std::string* out : outs) {
+                if (out->empty()) continue;
+                std::error_code e2;
+                const std::filesystem::path o = std::filesystem::weakly_canonical(*out, e2);
+                if (!e2 && in_p == o)
+                    throw std::runtime_error("bubble: output '" + *out + "' is the same file as input '" +
+                                             *in + "'; refusing to overwrite it");
+            }
         }
     }
+
+    // Nothing lands in its final location until the run has succeeded: a malformed input used to exit
+    // non-zero having already left a complete-looking .sorted.gfa behind, which the next command in a
+    // pipeline would happily consume.
+    cli::StagedOutputs staged("bubble");
+    const std::string bubbles_csv_staged = staged.stage(bubbles_csv_path);
+    const std::string bandage_csv_staged = staged.stage(bandage_csv_path);
+    const std::string sorted_gfa_staged =
+        sorted_gfa_path.empty() ? std::string() : staged.stage(sorted_gfa_path);
+    const std::string bandage_genes_staged =
+        bandage_genes_path.empty() ? std::string() : staged.stage(bandage_genes_path);
+    const std::string snarl_debug_staged =
+        snarl_debug_tsv_path.empty() ? std::string() : staged.stage(snarl_debug_tsv_path);
+    const std::string emit_snarls_staged =
+        emit_snarls_jsonl_path.empty() ? std::string() : staged.stage(emit_snarls_jsonl_path);
 
     std::string site_mode;
     std::string effective_gfa = gfa_path;
@@ -232,20 +261,21 @@ int run_bubble_command(const std::vector<std::string>& args) {
             throw std::runtime_error(
                 "Missing required input: --reference-path <name> (or pass --snarls-in to use vg)");
         }
-        if (sorted_gfa_path.empty()) {
-            sorted_gfa_path = out_prefix + ".sorted.gfa";
-        }
-        cli::ensure_parent_dir_for_file(sorted_gfa_path);
-
         GfaModel model = read_gfa_model(gfa_path);
         GraphSortOptions sort_opts;
         sort_opts.reference_path = options.reference_path;
         sort_opts.flip = !no_flip;
-        sort_graph_reference(model, sort_opts);
-        write_gfa_model(sorted_gfa_path, model);
+        // The sorter resolves an exact name, a unique case-insensitive match or a unique substring;
+        // everything downstream compares against the path name EXACTLY. Keeping the user's query here
+        // meant `-r FULL` for a path named `full` sorted correctly and then matched nothing: bubbles
+        // came back unoriented (source=3, sink=1 on a three-node graph), reference allele support read
+        // 0, and merging had no reference coordinates to order by -- all silently.
+        const GraphSortResult sort_result = sort_graph_reference(model, sort_opts);
+        options.reference_path = sort_result.resolved_reference;
+        write_gfa_model(sorted_gfa_staged, model);
         effective_gfa = sorted_gfa_path;
 
-        graph = parse_gfa(sorted_gfa_path, parse_options);
+        graph = parse_gfa(sorted_gfa_staged, parse_options);
         // Sequences are needed because the bp filters measure interior span; overlaps must be a
         // verified 0M for the same reason -- span is summed over whole segments.
         validate_graph_paths(graph, "bubble", true, true);
@@ -262,8 +292,19 @@ int run_bubble_command(const std::vector<std::string>& args) {
     } else {
         // Legacy override: external vg snarls on the graph as-is (no internal sort).
         graph = parse_gfa(gfa_path, parse_options);
+        // The same graph contract as internal mode. Skipping it here meant a malformed graph -- a path
+        // step with no link behind it -- was accepted through this door with exit 0 and an empty table,
+        // while the identical file was refused through the other one.
+        validate_graph_paths(graph, "bubble", true, true);
         if (graph.paths.empty()) {
             throw std::runtime_error("Input GFA has no P/W paths; snarl refinement requires path walks");
+        }
+        // Imported snarl boundaries are an unordered pair and this mode does not sort, so without a
+        // reference there is nothing to orient them by: source/sink do not mean reference-left/right,
+        // and every consumer that reads them as an interval is then reading a coin flip.
+        if (options.reference_path.empty()) {
+            std::cerr << "warning: --snarls-in without --reference-path: bubble boundaries are "
+                         "unordered, so source/sink do not mean reference-left/right\n";
         }
         site_mode = "snarl (JSONL import)";
     }
@@ -271,17 +312,15 @@ int run_bubble_command(const std::vector<std::string>& args) {
     const auto report = call_bubbles_report(graph, options);
     const auto& bubbles = report.bubbles;
 
-    write_bubbles_csv(bubbles_csv_path, bubbles);
-    write_bandage_node_colors_csv(bandage_csv_path, bubbles, report.non_snp_bubbles);
-    std::string bandage_genes_path;
-    if (!gtf_path.empty()) {
-        bandage_genes_path = out_prefix + ".bandage_genes.csv";
-        if (!emit_gene_annotation(graph, options.reference_path, gtf_path, bandage_genes_path)) {
+    write_bubbles_csv(bubbles_csv_staged, bubbles);
+    write_bandage_node_colors_csv(bandage_csv_staged, bubbles, report.non_snp_bubbles);
+    if (!bandage_genes_path.empty()) {
+        if (!emit_gene_annotation(graph, options.reference_path, gtf_path, bandage_genes_staged)) {
             bandage_genes_path.clear();
         }
     }
-    if (!snarl_debug_tsv_path.empty()) {
-        write_snarl_debug_tsv(snarl_debug_tsv_path, report.snarl_debug);
+    if (!snarl_debug_staged.empty()) {
+        write_snarl_debug_tsv(snarl_debug_staged, report.snarl_debug);
     }
     if (!emit_snarls_jsonl_path.empty()) {
         // Emit the internally found (cactus) snarl pairs. In --snarls-in (legacy) mode the
@@ -289,8 +328,7 @@ int run_bubble_command(const std::vector<std::string>& args) {
         if (options.snarl_pairs_override.empty()) {
             std::cerr << "note: --emit-snarls-jsonl is a no-op with --snarls-in (the input IS the snarls)\n";
         } else {
-            cli::ensure_parent_dir_for_file(emit_snarls_jsonl_path);
-            std::ofstream js(emit_snarls_jsonl_path);
+            std::ofstream js(emit_snarls_staged);
             for (const auto& [s, t] : options.snarl_pairs_override) {
                 js << "{\"start\": {\"node_id\": \"" << s << "\"}, \"end\": {\"node_id\": \"" << t
                    << "\"}}\n";
@@ -315,6 +353,10 @@ int run_bubble_command(const std::vector<std::string>& args) {
     log.info("found " + std::to_string(bubbles.size()) + " bubbles (" +
              std::to_string(long_path_positive_count) + " ≥ min-bp, " +
              std::to_string(inversion_signal_count) + " inversion-flagged)");
+
+    // Everything succeeded: move the staged files into place. Reported only after this, so the log
+    // never names a file that is not there.
+    staged.commit();
 
     std::vector<std::string> outputs;
     if (options.snarls_input_path.empty()) {
