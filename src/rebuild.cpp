@@ -19,6 +19,7 @@
 
 #include "panvar/align.hpp"
 #include "panvar/gfa.hpp"
+#include "panvar/graph_utils.hpp"
 #include "panvar/parallel.hpp"
 
 #include "gfa.h"
@@ -51,75 +52,14 @@ char comp(char c) {
     }
 }
 
-std::string reverse_complement(const std::string& s) {
-    std::string r(s.rbegin(), s.rend());
-    for (char& c : r) c = comp(c);
-    return r;
-}
+// reverse_complement lives in graph_utils; a second copy here was one more thing that could drift.
 
-// Everything downstream is a comparison against what the input paths spell, so a path that spells
-// something other than what the file says is worse than a hard error -- it is a silently wrong answer
-// that every later check then agrees with. Validate once, up front, and refuse rather than repair.
-void validate_input(const Graph& g) {
-    if (g.paths.empty()) throw std::runtime_error("rebuild: input GFA has no P/W paths to rebuild");
-    std::unordered_set<std::string> seen;
-    for (const PathRecord& p : g.paths) {
-        if (p.name.empty()) throw std::runtime_error("rebuild: input GFA has a path with no name");
-        if (!seen.insert(p.name).second)
-            throw std::runtime_error("rebuild: input GFA has a duplicate path name: " + p.name +
-                                     " (which of the two a result refers to would be undefined)");
-        if (p.steps.empty())
-            throw std::runtime_error("rebuild: path has no steps: " + p.name);
-        for (const PathStep& step : p.steps) {
-            const auto it = g.nodes.find(step.node_id);
-            if (it == g.nodes.end())
-                throw std::runtime_error("rebuild: path " + p.name + " references a node that is not in "
-                                         "the graph: " + step.node_id);
-            if (it->second.sequence.empty() || it->second.sequence == "*")
-                throw std::runtime_error("rebuild: node " + step.node_id + " on path " + p.name +
-                                         " has no sequence (S line is '*'); rebuild needs real sequence");
-        }
-        // Every consecutive pair of steps must be joined by an ORIENTED link that exists. A path
-        // describing a traversal the graph does not permit spells a sequence no walk could produce, and
-        // every later comparison would be against that.
-        for (std::size_t i = 1; i < p.steps.size(); ++i) {
-            const PathStep& a = p.steps[i - 1];
-            const PathStep& b = p.steps[i];
-            const auto ita = g.nodes.find(a.node_id);
-            if (ita == g.nodes.end()) continue;                       // already reported above
-            // Leave `a` by its end when forward, by its start when reverse; enter `b` at its start when
-            // forward, at its end when reverse.
-            const std::vector<Neighbor>& side = a.reverse ? ita->second.start : ita->second.end;
-            const int want = b.reverse ? 1 : 0;
-            bool linked = false;
-            for (const Neighbor& n : side)
-                if (n.node_id == b.node_id && n.side == want) { linked = true; break; }
-            if (!linked)
-                throw std::runtime_error("rebuild: path " + p.name + " steps from " + a.node_id +
-                                         (a.reverse ? "-" : "+") + " to " + b.node_id +
-                                         (b.reverse ? "-" : "+") + " but the graph has no such link");
-        }
-    }
-    // Spelling concatenates whole segments, so a non-zero overlap would double-count the overlapping
-    // bases in every length and identity figure downstream. Reject rather than quietly mis-measure.
-    for (const auto& kv : g.nodes) {
-        for (const std::vector<Neighbor>* side : {&kv.second.start, &kv.second.end})
-            for (const Neighbor& n : *side)
-                if (n.overlap != 0)
-                    throw std::runtime_error(
-                        "rebuild: link " + kv.first + " -- " + n.node_id +
-                        (n.overlap < 0 ? std::string(" has an UNKNOWN overlap ('*')")
-                                       : " has a non-zero overlap (" + std::to_string(n.overlap) + "M)") +
-                        "; rebuild spells paths by concatenation, which is only correct when every "
-                        "overlap is a verified 0M");
-    }
-}
 
 std::string spell(const Graph& g, const PathRecord& path) {
     std::string out;
     for (const PathStep& step : path.steps) {
         const auto it = g.nodes.find(step.node_id);
-        // validate_input() has already refused a graph where this could miss; keeping the guard means a
+        // validate_graph_paths() has already refused a graph where this could miss; the guard means a
         // future caller cannot silently spell a short sequence.
         if (it == g.nodes.end())
             throw std::runtime_error("rebuild: path " + path.name + " references missing node " + step.node_id);
@@ -338,7 +278,7 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
     po.include_paths = true;
     po.include_sequences = true;
     const Graph g = parse_gfa(options.gfa_path, po);
-    validate_input(g);
+    validate_graph_paths(g, "rebuild", true, true);
 
     sum.raw_nodes = g.nodes.size();
     sum.haplotypes = g.paths.size();

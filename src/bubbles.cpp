@@ -729,25 +729,33 @@ void evaluate_direction_candidates(
     const std::vector<std::size_t>& inside_positions,
     std::optional<CandidateInterval>& best) {
 
+    // Every later endpoint is considered, not just the nearest one. The selection rule is "the interval
+    // with the most interior steps wins", but taking only the first endpoint after each start made that
+    // unreachable: where a boundary recurs -- a tandem array, a duplication, any path revisiting a
+    // boundary -- the enclosing traversal ends at a LATER occurrence, and the nearest one closes a
+    // short interval that contains almost none of the snarl.
+    //
+    // Bounded: a boundary occurring many times gives quadratically many pairs, and only the widest few
+    // can ever win, so each start examines at most `kMaxEndsPerStart` endpoints beyond the first.
+    constexpr std::size_t kMaxEndsPerStart = 64;
     for (const std::size_t start_pos : start_positions) {
-        const auto end_it = std::upper_bound(end_positions.begin(), end_positions.end(), start_pos);
-        if (end_it == end_positions.end()) {
-            continue;
-        }
-        const std::size_t end_pos = *end_it;
-        const std::size_t inside_count = count_inside_between(inside_positions, start_pos, end_pos);
-        if (inside_count == 0) {
-            continue;
-        }
+        const auto first = std::upper_bound(end_positions.begin(), end_positions.end(), start_pos);
+        std::size_t examined = 0;
+        for (auto it = first; it != end_positions.end() && examined < kMaxEndsPerStart; ++it, ++examined) {
+            const std::size_t end_pos = *it;
+            const std::size_t inside_count = count_inside_between(inside_positions, start_pos, end_pos);
+            if (inside_count == 0) {
+                continue;
+            }
+            CandidateInterval candidate;
+            candidate.left = start_pos;
+            candidate.right = end_pos;
+            candidate.inside_count = inside_count;
+            candidate.source_to_sink = source_to_sink;
 
-        CandidateInterval candidate;
-        candidate.left = start_pos;
-        candidate.right = end_pos;
-        candidate.inside_count = inside_count;
-        candidate.source_to_sink = source_to_sink;
-
-        if (!best.has_value() || better_candidate(candidate, *best)) {
-            best = candidate;
+            if (!best.has_value() || better_candidate(candidate, *best)) {
+                best = candidate;
+            }
         }
     }
 }

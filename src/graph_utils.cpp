@@ -133,4 +133,61 @@ std::unordered_set<std::string> self_loop_nodes(const Graph& graph) {
     return out;
 }
 
+void validate_graph_paths(const Graph& graph, const std::string& module,
+                          bool require_sequences, bool require_zero_overlaps) {
+    if (graph.paths.empty()) throw std::runtime_error(module + ": input GFA has no P/W paths");
+    std::unordered_set<std::string> seen;
+    for (const PathRecord& p : graph.paths) {
+        if (p.name.empty()) throw std::runtime_error(module + ": input GFA has a path with no name");
+        if (!seen.insert(p.name).second)
+            throw std::runtime_error(module + ": input GFA has a duplicate path name: " + p.name +
+                                     " (which of the two a result refers to would be undefined)");
+        if (p.steps.empty()) throw std::runtime_error(module + ": path has no steps: " + p.name);
+        for (const PathStep& step : p.steps) {
+            const auto it = graph.nodes.find(step.node_id);
+            if (it == graph.nodes.end())
+                throw std::runtime_error(module + ": path " + p.name +
+                                         " references a node that is not in the graph: " + step.node_id);
+            if (require_sequences && (it->second.sequence.empty() || it->second.sequence == "*"))
+                throw std::runtime_error(module + ": node " + step.node_id + " on path " + p.name +
+                                         " has no sequence (S line is '*')");
+        }
+        // Every consecutive pair of steps must be joined by an ORIENTED link that exists. A path
+        // describing a traversal the graph does not permit spells a sequence no walk could produce,
+        // and every later comparison would be made against that.
+        for (std::size_t i = 1; i < p.steps.size(); ++i) {
+            const PathStep& a = p.steps[i - 1];
+            const PathStep& b = p.steps[i];
+            const auto ita = graph.nodes.find(a.node_id);
+            if (ita == graph.nodes.end()) continue;               // already reported above
+            // Leave `a` by its end when forward, by its start when reverse; enter `b` at its start
+            // when forward, at its end when reverse.
+            const std::vector<Neighbor>& side = a.reverse ? ita->second.start : ita->second.end;
+            const int want = b.reverse ? 1 : 0;
+            bool linked = false;
+            for (const Neighbor& n : side)
+                if (n.node_id == b.node_id && n.side == want) { linked = true; break; }
+            if (!linked)
+                throw std::runtime_error(module + ": path " + p.name + " steps from " + a.node_id +
+                                         (a.reverse ? "-" : "+") + " to " + b.node_id +
+                                         (b.reverse ? "-" : "+") + " but the graph has no such link");
+        }
+    }
+    if (!require_zero_overlaps) return;
+    // Spelling and span measurement concatenate whole segments, so a non-zero overlap double-counts
+    // the overlapping bases in every length and identity figure. '*' means UNKNOWN, not zero, so it
+    // cannot be assumed away either.
+    for (const auto& kv : graph.nodes) {
+        for (const std::vector<Neighbor>* side : {&kv.second.start, &kv.second.end})
+            for (const Neighbor& n : *side)
+                if (n.overlap != 0)
+                    throw std::runtime_error(
+                        module + ": link " + kv.first + " -- " + n.node_id +
+                        (n.overlap < 0 ? std::string(" has an UNKNOWN overlap ('*')")
+                                       : " has a non-zero overlap (" + std::to_string(n.overlap) + "M)") +
+                        "; this module measures by concatenation, which is only correct when every "
+                        "overlap is a verified 0M");
+    }
+}
+
 } // namespace panvar

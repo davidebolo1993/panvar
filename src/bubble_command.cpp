@@ -1,6 +1,8 @@
 #include "panvar/bubble_command.hpp"
 
 #include "panvar/bubbles.hpp"
+#include <filesystem>
+#include "panvar/graph_utils.hpp"
 #include "panvar/cli_utils.hpp"
 #include "panvar/gfa.hpp"
 #include "panvar/gfa_io.hpp"
@@ -205,6 +207,21 @@ int run_bubble_command(const std::vector<std::string>& args) {
     parse_options.include_paths = true;
     parse_options.include_sequences = true;
 
+    // Refuse to write an output over the input. `bubble` writes the sorted GFA before discovery even
+    // begins, so an aliased path destroys the graph it is about to read.
+    {
+        std::error_code ec;
+        const std::filesystem::path in_p = std::filesystem::weakly_canonical(gfa_path, ec);
+        for (const std::string* out : {&bubbles_csv_path, &bandage_csv_path, &sorted_gfa_path}) {
+            if (out->empty()) continue;
+            std::error_code e2;
+            const std::filesystem::path o = std::filesystem::weakly_canonical(*out, e2);
+            if (!ec && !e2 && !in_p.empty() && in_p == o)
+                throw std::runtime_error("bubble: output '" + *out +
+                                         "' is the same file as --gfa; refusing to overwrite the input");
+        }
+    }
+
     std::string site_mode;
     std::string effective_gfa = gfa_path;
     Graph graph;
@@ -229,6 +246,9 @@ int run_bubble_command(const std::vector<std::string>& args) {
         effective_gfa = sorted_gfa_path;
 
         graph = parse_gfa(sorted_gfa_path, parse_options);
+        // Sequences are needed because the bp filters measure interior span; overlaps must be a
+        // verified 0M for the same reason -- span is summed over whole segments.
+        validate_graph_paths(graph, "bubble", true, true);
         if (graph.paths.empty()) {
             throw std::runtime_error("Input GFA has no P/W paths; snarl finding requires path walks");
         }

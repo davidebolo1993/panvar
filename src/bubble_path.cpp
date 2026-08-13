@@ -56,21 +56,27 @@ void evaluate_direction(
     const std::vector<std::size_t>& inside_positions,
     std::optional<BubblePathInterval>& best) {
 
+    // Every later endpoint, not just the nearest. The rule is "the interval with the most interior
+    // steps wins", but taking only the first endpoint after each start made that unreachable: where a
+    // boundary recurs -- a tandem array, a duplication, any path revisiting a boundary -- the enclosing
+    // traversal ends at a LATER occurrence, and the nearest one closes a short interval containing
+    // almost none of the snarl. Bounded per start, since only the widest few can ever win.
+    constexpr std::size_t kMaxEndsPerStart = 64;
     for (const std::size_t start_pos : start_positions) {
-        const auto end_it = std::upper_bound(end_positions.begin(), end_positions.end(), start_pos);
-        if (end_it == end_positions.end()) {
-            continue;
-        }
-        BubblePathInterval candidate;
-        candidate.left = start_pos;
-        candidate.right = *end_it;
-        candidate.inside_count = count_inside_between(inside_positions, candidate.left, candidate.right);
-        candidate.source_to_sink = source_to_sink;
-        if (candidate.inside_count == 0) {
-            continue;
-        }
-        if (!best.has_value() || better_interval(candidate, *best)) {
-            best = candidate;
+        const auto first = std::upper_bound(end_positions.begin(), end_positions.end(), start_pos);
+        std::size_t examined = 0;
+        for (auto it = first; it != end_positions.end() && examined < kMaxEndsPerStart; ++it, ++examined) {
+            BubblePathInterval candidate;
+            candidate.left = start_pos;
+            candidate.right = *it;
+            candidate.inside_count = count_inside_between(inside_positions, candidate.left, candidate.right);
+            candidate.source_to_sink = source_to_sink;
+            if (candidate.inside_count == 0) {
+                continue;
+            }
+            if (!best.has_value() || better_interval(candidate, *best)) {
+                best = candidate;
+            }
         }
     }
 }
