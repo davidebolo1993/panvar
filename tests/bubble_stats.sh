@@ -164,6 +164,35 @@ src=$(cel "$OUT/mrD.bubbles.csv" source); snk=$(cel "$OUT/mrD.bubbles.csv" sink)
   || bad "fused bubble is $src..$snk, expected 1..12"
 
 
+# ---- B5: the interior is the graph's, not the panel's -------------------------------------------
+# Node 5 is a third allele between the same two boundaries that NEITHER stored path takes. Collecting
+# the interior from path intervals alone made it invisible: an allele nobody in the cohort carries is
+# still part of the site, and everything computed from `inside` inherited the omission.
+{ printf 'H\tVN:Z:1.0\n'
+  printf 'S\t1\tAAAAAAAAAA\nS\t2\tCCCCCCCCCC\nS\t3\tGGGGGGGGGG\nS\t4\tTTTTTTTTTT\nS\t5\tACGTACGTAC\n'
+  printf 'L\t1\t+\t2\t+\t0M\nL\t2\t+\t4\t+\t0M\nL\t1\t+\t3\t+\t0M\nL\t3\t+\t4\t+\t0M\n'
+  printf 'L\t1\t+\t5\t+\t0M\nL\t5\t+\t4\t+\t0M\n'
+  printf 'P\tpA\t1+,2+,4+\t*\nP\tpB\t1+,3+,4+\t*\n'; } > "$OUT/uw.gfa"
+"$BIN" bubble -i "$OUT/uw.gfa" -r pA -o "$OUT/uw" --min-variant-bp 0 -q >/dev/null 2>&1
+[ "$(cel "$OUT/uw.bubbles.csv" inside_node_count)" = "3" ] \
+  && ok "an allele no path walks is still part of the interior (3 inside, not 2)" \
+  || bad "unwalked branch: inside_node_count $(cel "$OUT/uw.bubbles.csv" inside_node_count), expected 3"
+
+# And the case B4 alone could not reach: the only directed cycle sits on that unwalked branch, so the
+# acyclicity search had nothing to find it in. --superbubbles must exclude the site.
+{ printf 'H\tVN:Z:1.0\n'
+  printf 'S\t1\tAAAAAAAAAA\nS\t2\tCCCCCCCCCC\nS\t3\tGGGGGGGGGG\nS\t4\tTTTTTTTTTT\nS\t5\tACGTACGTAC\nS\t6\tTGCATGCATG\n'
+  printf 'L\t1\t+\t2\t+\t0M\nL\t2\t+\t4\t+\t0M\nL\t1\t+\t3\t+\t0M\nL\t3\t+\t4\t+\t0M\n'
+  printf 'L\t1\t+\t5\t+\t0M\nL\t5\t+\t6\t+\t0M\nL\t6\t+\t5\t+\t0M\nL\t6\t+\t4\t+\t0M\n'
+  printf 'P\tpA\t1+,2+,4+\t*\nP\tpB\t1+,3+,4+\t*\n'; } > "$OUT/uwc.gfa"
+"$BIN" bubble -i "$OUT/uwc.gfa" -r pA -o "$OUT/uwc0" --min-variant-bp 0 -q >/dev/null 2>&1
+[ "$(rows "$OUT/uwc0.bubbles.csv")" = "1" ] && ok "the cyclic site is reported without --superbubbles" \
+                                            || bad "expected 1 bubble, got $(rows "$OUT/uwc0.bubbles.csv")"
+"$BIN" bubble -i "$OUT/uwc.gfa" -r pA -o "$OUT/uwc1" --min-variant-bp 0 --superbubbles -q >/dev/null 2>&1
+[ "$(rows "$OUT/uwc1.bubbles.csv")" = "0" ] \
+  && ok "--superbubbles excludes a cycle carried on a branch no path walks" \
+  || bad "cyclic unwalked branch survived --superbubbles: $(rows "$OUT/uwc1.bubbles.csv") bubbles"
+
 echo
 if [ "$fails" -eq 0 ]; then echo "bubble_stats: all assertions passed"; exit 0; fi
 echo "bubble_stats: $fails assertion(s) FAILED"; exit 1

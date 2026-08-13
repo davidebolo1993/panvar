@@ -524,23 +524,26 @@ void evaluate_endpoint_interval_direction(
     bool source_to_sink,
     std::optional<EndpointOnlyInterval>& best) {
 
+    // Every later endpoint, bounded, for the reason evaluate_direction_candidates gives: where a
+    // boundary recurs the enclosing traversal ends at a later occurrence, and the nearest one closes
+    // an interval holding almost none of the snarl.
+    constexpr std::size_t kMaxEndsPerStart = 64;
     for (const std::size_t start_pos : start_positions) {
-        const auto end_it = std::upper_bound(end_positions.begin(), end_positions.end(), start_pos);
-        if (end_it == end_positions.end()) {
-            continue;
-        }
-        const std::size_t end_pos = *end_it;
-        if (end_pos <= start_pos + 1) {
-            continue;
-        }
-
-        EndpointOnlyInterval candidate;
-        candidate.left = start_pos;
-        candidate.right = end_pos;
-        candidate.inside_steps = end_pos - start_pos - 1;
-        candidate.source_to_sink = source_to_sink;
-        if (!best.has_value() || better_endpoint_interval(candidate, *best)) {
-            best = candidate;
+        const auto first = std::upper_bound(end_positions.begin(), end_positions.end(), start_pos);
+        std::size_t examined = 0;
+        for (auto it = first; it != end_positions.end() && examined < kMaxEndsPerStart; ++it, ++examined) {
+            const std::size_t end_pos = *it;
+            if (end_pos <= start_pos + 1) {
+                continue;
+            }
+            EndpointOnlyInterval candidate;
+            candidate.left = start_pos;
+            candidate.right = end_pos;
+            candidate.inside_steps = end_pos - start_pos - 1;
+            candidate.source_to_sink = source_to_sink;
+            if (!best.has_value() || better_endpoint_interval(candidate, *best)) {
+                best = candidate;
+            }
         }
     }
 }
@@ -593,6 +596,87 @@ std::vector<std::pair<std::string, std::string>> read_snarl_pairs_jsonl(const st
 // Build bubble candidates from top-level (source,sink) pairs: for each pair, union the
 // inside nodes seen on every path that crosses source->sink. Shared by the internal snarl
 // finder and the --snarls-in override.
+
+// B5. The interior of a snarl is a property of the GRAPH, not of the panel that happens to walk it.
+//
+// Collecting only the nodes some stored path visits between the boundaries understates the site
+// wherever the graph carries a branch this panel does not use -- an allele nobody in the cohort
+// carries is still part of the variant. Everything computed from `inside` inherits that: the
+// interior-span filters, the --superbubbles acyclicity search (a cycle on an unwalked branch is
+// invisible), and the fused-span validation in merging.
+//
+// So the interior is derived here from the graph, in the standard snarl sense: the nodes reachable
+// from the near boundary's inner handle that also reach the far boundary, without leaving through a
+// boundary. The traversal is over oriented HANDLES for the reason interior_has_cycle gives -- leaving
+// a node forward departs its end, reversed departs its start.
+//
+// Two deliberate conservatisms. The result is UNIONED with the path-derived set rather than replacing
+// it, so a pair that is not really a snarl cannot lose nodes the panel proves are between its
+// boundaries; and the search is capped, because a leaky pair floods the whole component, in which case
+// the path-derived answer stands alone.
+constexpr std::size_t kMaxInteriorHandles = 1u << 20;
+
+// Successors of an encoded handle (node index * 2 + orientation; 0 forward, 1 reverse).
+// `backward` walks predecessors instead, using the bidirected identity
+// pred(n, o) == { reverse(h) : h in succ(n, 1 - o) }, which needs no reverse index.
+void handle_successors(
+    const Graph& graph,
+    const PackedGraph& packed,
+    std::uint64_t handle,
+    bool backward,
+    std::vector<std::uint64_t>& out) {
+
+    out.clear();
+    const std::uint32_t idx = static_cast<std::uint32_t>(handle >> 1);
+    const int orient = static_cast<int>(handle & 1u);
+    const int depart = backward ? (1 - orient) : orient;
+
+    const auto nit = graph.nodes.find(packed.node_ids[idx]);
+    if (nit == graph.nodes.end()) return;
+    const std::vector<Neighbor>& arcs = depart ? nit->second.start : nit->second.end;
+    for (const Neighbor& nb : arcs) {
+        const auto jt = packed.node_idx_of.find(nb.node_id);
+        if (jt == packed.node_idx_of.end()) continue;
+        // side 0 = entering the neighbour's start = arriving on its forward handle
+        std::uint64_t next = (static_cast<std::uint64_t>(jt->second) << 1) | (nb.side == 0 ? 0u : 1u);
+        if (backward) next ^= 1u;   // the predecessor is that handle reversed
+        out.push_back(next);
+    }
+}
+
+// Nodes reachable from `start_handle`, stopping at `stop_idx` and never passing back through
+// `origin_idx`. Returns false if the cap is hit, in which case `out` is meaningless.
+bool reachable_interior(
+    const Graph& graph,
+    const PackedGraph& packed,
+    std::uint64_t start_handle,
+    std::uint32_t stop_idx,
+    std::uint32_t origin_idx,
+    bool backward,
+    std::unordered_set<std::uint32_t>& out) {
+
+    out.clear();
+    std::unordered_set<std::uint64_t> seen;
+    std::vector<std::uint64_t> stack{start_handle};
+    std::vector<std::uint64_t> succ;
+    seen.insert(start_handle);
+
+    while (!stack.empty()) {
+        const std::uint64_t h = stack.back();
+        stack.pop_back();
+        handle_successors(graph, packed, h, backward, succ);
+        for (const std::uint64_t nh : succ) {
+            const std::uint32_t nidx = static_cast<std::uint32_t>(nh >> 1);
+            if (nidx == origin_idx) continue;   // would leave through the near boundary
+            if (nidx == stop_idx) continue;     // reached the far boundary; do not expand past it
+            out.insert(nidx);
+            if (seen.size() >= kMaxInteriorHandles) return false;
+            if (seen.insert(nh).second) stack.push_back(nh);
+        }
+    }
+    return true;
+}
+
 void collect_candidates_for_pairs(
     const Graph& graph,
     const PackedGraph& packed,
@@ -624,10 +708,16 @@ void collect_candidates_for_pairs(
         }
 
         std::unordered_set<std::uint32_t> inside_idx_set;
+        std::optional<EndpointOnlyInterval> best_iv;
+        std::size_t best_iv_path = 0;
         for (std::size_t p_idx = 0; p_idx < path_indexes.size(); ++p_idx) {
             const auto interval = find_best_endpoint_interval(path_indexes[p_idx], source_id, sink_id);
             if (!interval.has_value()) {
                 continue;
+            }
+            if (!best_iv.has_value() || better_endpoint_interval(*interval, *best_iv)) {
+                best_iv = interval;
+                best_iv_path = p_idx;
             }
             const auto& steps = graph.paths[p_idx].steps;
             for (std::size_t i = interval->left + 1; i < interval->right; ++i) {
@@ -639,6 +729,34 @@ void collect_candidates_for_pairs(
                     continue;
                 }
                 inside_idx_set.insert(idx_it->second);
+            }
+        }
+
+        // B5: add the branches the graph carries between these boundaries that no stored path takes.
+        // The walked interval supplies the orientation -- which side of each boundary faces inward --
+        // which the unordered cactus pair does not.
+        if (best_iv.has_value()) {
+            const auto& steps = graph.paths[best_iv_path].steps;
+            const PathStep& near = steps[best_iv->left];
+            const PathStep& far = steps[best_iv->right];
+            const auto near_it = packed.node_idx_of.find(near.node_id);
+            const auto far_it = packed.node_idx_of.find(far.node_id);
+            if (near_it != packed.node_idx_of.end() && far_it != packed.node_idx_of.end()) {
+                const std::uint64_t near_handle =
+                    (static_cast<std::uint64_t>(near_it->second) << 1) | (near.reverse ? 1u : 0u);
+                const std::uint64_t far_handle =
+                    (static_cast<std::uint64_t>(far_it->second) << 1) | (far.reverse ? 1u : 0u);
+                std::unordered_set<std::uint32_t> forward;
+                std::unordered_set<std::uint32_t> backward;
+                if (reachable_interior(graph, packed, near_handle, far_it->second, near_it->second,
+                                       false, forward) &&
+                    reachable_interior(graph, packed, far_handle, near_it->second, far_it->second,
+                                       true, backward)) {
+                    for (const std::uint32_t idx : forward) {
+                        if (backward.count(idx) == 0) continue;   // does not lie on a boundary-to-boundary route
+                        inside_idx_set.insert(idx);
+                    }
+                }
             }
         }
 
