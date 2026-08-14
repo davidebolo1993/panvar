@@ -679,31 +679,6 @@ int run_inspect_command(const std::vector<std::string>& args) {
         throw std::runtime_error("--fasta-out/--table-out/--edge-table-out require --bubble-id; use --out-prefix when inspecting all bubbles");
     }
 
-    // Explicit output paths are unconstrained, so two of them can name the same file -- in which case
-    // whichever is written last silently wins -- or name an input, destroying it before it is read.
-    {
-        const std::string* outs[] = {&fasta_out_path, &table_out_path, &edge_table_out_path};
-        const std::string* ins[] = {&gfa_path, &bubbles_csv_path};
-        const auto same = [](const std::string& a, const std::string& b) {
-            std::error_code e1, e2;
-            const auto pa = std::filesystem::weakly_canonical(a, e1);
-            const auto pb = std::filesystem::weakly_canonical(b, e2);
-            return !e1 && !e2 && !pa.empty() && pa == pb;
-        };
-        for (std::size_t i = 0; i < 3; ++i) {
-            if (outs[i]->empty()) continue;
-            for (std::size_t j = i + 1; j < 3; ++j) {
-                if (!outs[j]->empty() && same(*outs[i], *outs[j]))
-                    throw std::runtime_error("inspect: two outputs name the same file: " + *outs[i]);
-            }
-            for (const std::string* in : ins) {
-                if (!in->empty() && same(*outs[i], *in))
-                    throw std::runtime_error("inspect: output '" + *outs[i] +
-                                             "' is the same file as input '" + *in + "'");
-            }
-        }
-    }
-
     ParseGfaOptions parse_options;
     parse_options.include_paths = true;
     parse_options.include_sequences = true;
@@ -775,6 +750,46 @@ int run_inspect_command(const std::vector<std::string>& args) {
     std::vector<std::string> single_outputs;
     std::string single_info;
 
+    // Every output path this run will write, explicit and derived alike, resolved before anything is
+    // opened. Checking only the three explicit flags missed the larger half of the family: an explicit
+    // --table-out naming the derived <prefix>.bubble_N.node_lengths.tsv collided silently and one
+    // clobbered the other, which is exactly the case a preflight exists to catch.
+    {
+        std::vector<std::string> finals;
+        for (const Bubble* b : selected_bubbles) {
+            const std::string stem = out_prefix + ".bubble_" + std::to_string(b->id);
+            finals.push_back(fasta_out_path.empty() ? stem + ".paths.fa.gz" : fasta_out_path);
+            finals.push_back(table_out_path.empty() ? stem + ".node_counts.tsv" : table_out_path);
+            finals.push_back(edge_table_out_path.empty() ? stem + ".edge_counts.tsv"
+                                                         : edge_table_out_path);
+            finals.push_back(stem + ".node_lengths.tsv");
+            if (cluster) finals.push_back(stem + ".clusters.tsv");
+        }
+        const auto canon = [](const std::string& p) {
+            std::error_code ec;
+            const auto c = std::filesystem::weakly_canonical(p, ec);
+            return ec ? std::filesystem::path(p) : c;
+        };
+        std::unordered_map<std::string, std::string> seen;
+        for (const std::string& f : finals) {
+            const std::string key = canon(f).string();
+            const auto it = seen.find(key);
+            if (it != seen.end()) {
+                throw std::runtime_error("inspect: two outputs would be written to the same file: " +
+                                         (it->second == f ? f : it->second + " and " + f));
+            }
+            seen.emplace(key, f);
+        }
+        for (const std::string* in : {&gfa_path, &bubbles_csv_path}) {
+            if (in->empty()) continue;
+            const std::string key = canon(*in).string();
+            const auto it = seen.find(key);
+            if (it != seen.end())
+                throw std::runtime_error("inspect: output '" + it->second +
+                                         "' is the same file as input '" + *in + "'");
+        }
+    }
+
     cli::ProgressBar progress((single_bubble || quiet) ? "" : "Inspecting bubbles",
                               single_bubble ? 0 : selected_bubbles.size());
 
@@ -830,6 +845,11 @@ int run_inspect_command(const std::vector<std::string>& args) {
         result.edge_table_out_path = final_edges;
         result.node_lengths_out_path = final_lengths;
         result.clusters_out_path = final_clusters;
+        if (result.paths_written == 0) {
+            throw std::runtime_error(
+                "inspect: no path crosses bubble " + std::to_string(bubble.id) + " (" + bubble.source +
+                ".." + bubble.sink + "); the bubbles CSV does not describe this graph");
+        }
         total_paths_written += result.paths_written;
         progress.tick();
 

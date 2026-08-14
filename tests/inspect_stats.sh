@@ -142,32 +142,40 @@ before=$(wc -c < "$OUT/db.sorted.gfa" | tr -d ' ')
   || bad "the input GFA was overwritten by an output"
 
 # ---------------------------------------------------------------- long-walk clustering
-# Walks longer than the sketch (512 shingles) are truncated, and comparing two independently truncated
-# bottom-k sketches by intersection-over-union is biased low -- badly so when the walks differ in
-# length, which is exactly the tandem-array case. Two haplotypes carrying the same repeat unit at
-# different copy numbers must still land in one cluster at a permissive threshold.
+# The sketch holds 512 shingles, so only a walk with more than that is truncated -- and truncation is
+# the whole reason the estimator matters. An earlier version of this fixture had 60 shingles and
+# therefore tested nothing: both estimators are exact when nothing is dropped.
+#
+# A cyclic array: node 2 carries a self-loop, walked 3000 times by `long` and 500 by `short`, so the
+# shingle sets are 3000 and 500 with the smaller nested in the larger. True Jaccard is 500/3000 =
+# 0.1667, i.e. an identity of 2J/(1+J) = 0.286.
+#
+#   old estimator (intersection over union of two truncated sketches): J 0.0847, identity 0.156
+#   new estimator (bottom-k of the union):                             J 0.1580, identity 0.273
+#
+# The assertions below bracket the identity in [0.22, 0.30], which the old estimator's 0.156 cannot
+# satisfy -- so this fails if the biased form is ever restored.
 { printf 'H\tVN:Z:1.0\n'
-  printf 'S\t1\tACGTACGTAC\n'
-  for n in $(seq 2 61); do printf "S\t$n\tACGTACGTAC\n"; done
-  printf 'S\t62\tTTTTTTTTTT\n'
-  printf 'L\t1\t+\t2\t+\t0M\n'
-  for n in $(seq 2 60); do printf "L\t$n\t+\t$((n+1))\t+\t0M\n"; done
-  printf 'L\t61\t+\t62\t+\t0M\nL\t30\t+\t62\t+\t0M\n'
-  long=$(printf '1+'; for n in $(seq 2 61); do printf ",$n+"; done; printf ',62+')
-  short=$(printf '1+'; for n in $(seq 2 30); do printf ",$n+"; done; printf ',62+')
-  printf "P\tlong\t%s\t*\n" "$long"
-  printf "P\tshort\t%s\t*\n" "$short"; } > "$OUT/arr.gfa"
+  printf 'S\t1\tACGTACGTAC\nS\t2\tTTTTGGGGCC\nS\t3\tGGGGGGGGGG\n'
+  printf 'L\t1\t+\t2\t+\t0M\nL\t2\t+\t2\t+\t0M\nL\t2\t+\t3\t+\t0M\n'
+  units=""; for i in $(seq 1 3000); do units="$units,2+"; done
+  printf 'P\tlong\t1+%s,3+\t*\n' "$units"
+  units=""; for i in $(seq 1 500); do units="$units,2+"; done
+  printf 'P\tshort\t1+%s,3+\t*\n' "$units"; } > "$OUT/arr.gfa"
 "$BIN" bubble -i "$OUT/arr.gfa" -r long -o "$OUT/ab" --min-variant-bp 0 -q >/dev/null 2>&1
+nclust() { awk 'NR>1{print $1}' "$1" 2>/dev/null | sort -u | wc -l | tr -d ' '; }
+
+"$BIN" inspect -i "$OUT/ab.sorted.gfa" -c "$OUT/ab.bubbles.csv" --cluster --cluster-similarity 0.22 \
+       -o "$OUT/a22" -q >/dev/null 2>&1
+[ "$(nclust "$OUT/a22.bubble_1.clusters.tsv")" = "1" ] \
+  && ok "truncated sketches at a 6x length ratio still cluster at 0.22 (needs the unbiased estimator)" \
+  || bad "expected 1 cluster at 0.22, got $(nclust "$OUT/a22.bubble_1.clusters.tsv"); the biased estimator reads 0.156 here"
+
 "$BIN" inspect -i "$OUT/ab.sorted.gfa" -c "$OUT/ab.bubbles.csv" --cluster --cluster-similarity 0.30 \
-       -o "$OUT/a" -q >/dev/null 2>&1
-if ls "$OUT/a".bubble_*.clusters.tsv >/dev/null 2>&1; then
-  nclust=$(cat "$OUT/a".bubble_*.clusters.tsv | awk 'NR>1{print $2}' | sort -u | wc -l | tr -d ' ')
-  [ "$nclust" = "1" ] \
-    && ok "two walks of the same unit at different lengths cluster together at 0.30" \
-    || bad "expected 1 cluster at a permissive threshold, got $nclust"
-else
-  bad "no clusters file was written"
-fi
+       -o "$OUT/a30" -q >/dev/null 2>&1
+[ "$(nclust "$OUT/a30.bubble_1.clusters.tsv")" = "2" ] \
+  && ok "and separate at 0.30, bracketing the estimate at the true 0.286" \
+  || bad "expected 2 clusters at 0.30, got $(nclust "$OUT/a30.bubble_1.clusters.tsv")"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "inspect_stats: all assertions passed"; exit 0; fi

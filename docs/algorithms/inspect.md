@@ -53,8 +53,12 @@ h4 : a x y b                  a different allele
    J = 4/6 = 0.667
    identity = 2·0.667/1.667 = 0.80
    ```
-4. Estimate that `J` cheaply with a bottom-k MinHash instead of enumerating every shingle. Hash each occurrence-salted shingle to one value — say `auv₁→12, uvu₁→27, vuv₁→41, uvb₁→55`, plus `W3`'s extra copies `uvu₂→08, vuv₂→33`. Both walks have ≤ k shingles here, so each sketch holds all of them: `sketch(W1) = {12, 27, 41, 55}` and `sketch(W3) = {08, 12, 27, 33, 41, 55}`. The estimator is the sketch overlap `|shared| / |union|` (all four `W1` hashes are also in `W3`), giving `4/6 = 0.667` — exactly the multiset Jaccard from step 3. (Exact here because nothing was truncated; when a walk has more than k shingles the same ratio is estimated from just the bottom-k smallest hashes.)
-5. Cluster by connected components at `--cluster-similarity 0.90`. No pair clears the threshold, so the three walks stay in their own clusters — the 2-copy and 3-copy alleles are kept apart rather than chained into one band.
+4. Estimate that `J` cheaply with a bottom-k MinHash instead of enumerating every shingle. Hash each occurrence-salted shingle to one value — say `auv₁→12, uvu₁→27, vuv₁→41, uvb₁→55`, plus `W3`'s extra copies `uvu₂→08, vuv₂→33`. Each sketch keeps the k smallest of its own walk; with k above 6 nothing is dropped here, so `sketch(W1) = {12, 27, 41, 55}` and `sketch(W3) = {08, 12, 27, 33, 41, 55}`.
+
+   The estimator takes the **k smallest values of the two sketches' union**, with `k = min(|sketch(W1)|, |sketch(W3)|) = 4`, and asks how many of those appear in both. The union sorts to `08, 12, 27, 33, 41, 55`; its bottom 4 are `08, 12, 27, 33`, of which `12` and `27` are in both — giving `2/4 = 0.5`. (This example is small enough that the estimator's sampling error is visible: the multiset Jaccard from step 3 is 0.667. At sketch sizes that matter, hundreds of values, the estimate converges on it.)
+
+   Comparing the two sketches directly as `|shared| / |union|` would be **biased**, and that is why the union is taken first. Each sketch holds the smallest hashes of *its own* shingle set, so when a walk has more than k shingles and is truncated, a shingle both walks carry can sit inside one sketch and below the other's cutoff. The two sketches then sample different regions of the hash space. The error grows with the length ratio, which is exactly the tandem-array case: on a 3000-shingle walk against a 500-shingle one with a true `J` of 0.167, the direct ratio reads **0.085** while the union form reads **0.158**.
+5. Cluster by connected components at `--cluster-similarity 0.90`, using the identity derived from the estimated `J`. No pair clears the threshold, so the three walks stay in their own clusters — the 2-copy and 3-copy alleles are kept apart rather than chained into one band.
 
 Resulting `clusters.tsv`:
 

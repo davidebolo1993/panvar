@@ -42,7 +42,7 @@ as history; Git already provides that history.
 
 ## Bubble
 
-### Bounded and legacy-mode limitations
+### Bounded traversal limitations
 
 - **Remove or expose the 64-endpoint traversal cap.** The repeated-boundary interval search examines only
   the first 64 later endpoint occurrences for each start. A focused 70-repeat path therefore reports an
@@ -53,11 +53,16 @@ as history; Git already provides that history.
   traversal after `2^20` visited handles and silently falls back to the path-derived interior. Report this
   condition and either reject the candidate or label the result incomplete, so the stated graph-derived
   interior contract does not quietly become panel-derived on a very large or leaky pair.
-- **Define the supported `--snarls-in` contract.** Without a resolvable reference, imported boundary pairs
-  are emitted with no reliable reference order and default handle orientations; reference-coordinate
-  merging is also skipped. Either require a reference (and resolve it by the same exact/case-insensitive
-  rules as internal mode), preserve and consume the oriented vg handles, or clearly restrict this path to
-  diagnostic use rather than downstream-ready Bubble output.
+
+### Legacy-mode contract
+
+- **Decide whether reference-free `--snarls-in` is diagnostic-only.** When a reference is supplied, the
+  external door now validates it and resolves the same exact/unique-case-insensitive alias as internal
+  mode. Without one, it still exits successfully after warning: imported pairs have no reliable reference
+  order, boundary orientations default, reference-coordinate merging is skipped, and no sorted graph is
+  emitted. Either require a reference for downstream-ready output, preserve and consume the oriented vg
+  handles, or state prominently that this form is diagnostic-only; the module page currently says a
+  reference is simply “not needed with `--snarls-in`”.
 
 ### Transactional and documentation cleanup
 
@@ -68,8 +73,9 @@ as history; Git already provides that history.
   installed sequentially and a later commit failure can leave a partially updated family. Add rollback
   or a manifest/disposition protocol if these files need true family-level atomicity.
 - **Bring the public description up to the final contract.** Update the module summary and primary CSV
-  table for graph-derived interiors, boundary orientations and allele-support columns; document the
-  `--snarls-in` limitation chosen above, and include `--emit-snarls-jsonl` in the reported output list.
+  table for graph-derived interiors, boundary orientations and allele-support columns; add
+  `--min-alt-support` to the key-option table; document the `--snarls-in` limitation chosen above; and
+  include `--emit-snarls-jsonl` in both the public output list and the command's `wrote:` summary.
 
 ## Rebuild
 
