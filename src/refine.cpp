@@ -34,11 +34,6 @@ namespace {
 
 using Steps = std::vector<PathStep>;
 
-std::string to_lower(std::string s) {
-    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return s;
-}
-
 std::string spell(const GfaModel& model, const Steps& steps) {
     std::string out;
     for (const auto& s : steps) {
@@ -302,14 +297,6 @@ Anchors region_anchors(const std::vector<Bubble>& comp) {
     interior.erase(out.b);
     out.interior = std::move(interior);
     return out;
-}
-
-double median_len(std::vector<std::size_t> v) {
-    if (v.empty()) return 0.0;
-    std::sort(v.begin(), v.end());
-    const std::size_t m = v.size() / 2;
-    return (v.size() % 2) ? static_cast<double>(v[m])
-                          : 0.5 * static_cast<double>(v[m - 1] + v[m]);
 }
 
 // Try to rebuild one region. Returns a RegionEdit (with note in *note) or nullopt if skipped.

@@ -44,16 +44,7 @@ std::string hms() {
     return std::string(buf);
 }
 
-char comp(char c) {
-    switch (c) {
-        case 'A': return 'T'; case 'T': return 'A'; case 'C': return 'G'; case 'G': return 'C';
-        case 'a': return 't'; case 't': return 'a'; case 'c': return 'g'; case 'g': return 'c';
-        default: return c;
-    }
-}
-
 // reverse_complement lives in graph_utils; a second copy here was one more thing that could drift.
-
 
 std::string spell(const Graph& g, const PathRecord& path) {
     std::string out;
