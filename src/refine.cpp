@@ -1,5 +1,8 @@
 #include "panvar/refine.hpp"
 
+#include <filesystem>
+#include <fstream>
+
 #include "panvar/bubbles.hpp"
 #include "panvar/cli_utils.hpp"
 #include "panvar/gfa.hpp"
@@ -320,13 +323,31 @@ std::optional<RegionEdit> process_region(const std::vector<Bubble>& comp, const 
             lens.push_back(s.size());
             distinct.insert(s);
         }
-        if (median_len(lens) > static_cast<double>(opt.max_poa_bp)) {
-            note = tag + ": skip (segment " + std::to_string(pos) + " median > max-poa-bp)";
+        // A cost guard has to bound the worst case. The median let a single very long outlier into
+        // abPOA no matter how large it was -- POA cost is driven by the longest sequence and by total
+        // bases, and the median is blind to both. Longest and total are checked; the median is kept
+        // only for the message, since it is what makes a skip readable.
+        const std::size_t longest = lens.empty() ? 0 : *std::max_element(lens.begin(), lens.end());
+        if (longest > opt.max_poa_bp) {
+            note = tag + ": skip (segment " + std::to_string(pos) + " longest " +
+                   std::to_string(longest) + " bp > max-poa-bp " + std::to_string(opt.max_poa_bp) + ")";
+            return std::nullopt;
+        }
+        std::size_t total_bp = 0;
+        for (const std::size_t l : lens) total_bp += l;
+        // The DP matrix is roughly longest x total across the input set; bounding their product keeps
+        // a segment of very many short sequences from costing as much as one long one.
+        if (longest > 0 && total_bp > 0 &&
+            static_cast<double>(longest) * static_cast<double>(total_bp) >
+                static_cast<double>(opt.max_poa_bp) * static_cast<double>(opt.max_poa_bp) *
+                    static_cast<double>(opt.max_walks)) {
+            note = tag + ": skip (segment " + std::to_string(pos) + " POA cost bound exceeded: longest " +
+                   std::to_string(longest) + " bp x " + std::to_string(total_bp) + " bp total)";
             return std::nullopt;
         }
         if (distinct.size() > opt.max_walks) {
             note = tag + ": skip (segment " + std::to_string(pos) + " too diverse, " +
-                   std::to_string(distinct.size()) + " walks)";
+                   std::to_string(distinct.size()) + " distinct sequences)";
             return std::nullopt;
         }
     }
@@ -375,19 +396,88 @@ std::optional<RegionEdit> process_region(const std::vector<Bubble>& comp, const 
 
 RefineSummary refine_graph(const RefineOptions& options) {
     RefineSummary summary;
+    // No output may name an input: the refined GFA is written before re-snarl, CSV, Bandage and GTF
+    // work, so an aliased path destroys a file still being read.
+    {
+        const std::string outs[] = {
+            options.out_prefix + ".normalized.sorted.gfa",
+            options.out_prefix + ".bubbles.csv",
+            options.out_prefix + ".bandage_nodes.csv",
+            options.out_prefix + ".bandage_genes.csv",
+            options.out_prefix + ".refine.report.tsv",
+        };
+        for (const std::string& in : {options.gfa_path, options.bubbles_csv_in}) {
+            if (in.empty()) continue;
+            std::error_code ec;
+            const auto ip = std::filesystem::weakly_canonical(in, ec);
+            if (ec || ip.empty()) continue;
+            for (const std::string& o : outs) {
+                std::error_code e2;
+                const auto op = std::filesystem::weakly_canonical(o, e2);
+                if (!e2 && ip == op)
+                    throw std::runtime_error("refine: output '" + o + "' is the same file as input '" +
+                                             in + "'");
+            }
+        }
+    }
+
     GfaModel model = read_gfa_model(options.gfa_path);
     std::vector<Bubble> bubbles = read_bubbles_csv(options.bubbles_csv_in);
+    std::string resolved_reference;
+
+    // The same graph contract every other module applies. refine REWRITES the graph, so accepting a
+    // malformed one means emitting a repaired-looking graph that was never validated. The Graph view is
+    // also what resolves the reference, so the rule is shared rather than reimplemented here.
+    {
+        ParseGfaOptions popts;
+        popts.include_paths = true;
+        popts.include_sequences = true;
+        const Graph gview = parse_gfa(options.gfa_path, popts);
+        validate_graph_paths(gview, "refine", true, true);
+        if (gview.paths.empty())
+            throw std::runtime_error("refine: input GFA has no P/W paths");
+        resolved_reference = resolve_reference_path_name(gview, options.reference_path, "refine");
+
+        // The CSV and the graph are separate inputs with nothing tying them together.
+        std::vector<std::string> missing;
+        std::unordered_set<std::size_t> seen_ids;
+        for (const Bubble& b : bubbles) {
+            if (!seen_ids.insert(b.id).second)
+                throw std::runtime_error("refine: duplicate bubble id in the CSV: " +
+                                         std::to_string(b.id));
+            const auto check = [&](const std::string& n) {
+                if (gview.nodes.find(n) == gview.nodes.end() && missing.size() < 8)
+                    missing.push_back("bubble " + std::to_string(b.id) + " node " + n);
+            };
+            check(b.source);
+            check(b.sink);
+            for (const std::string& n : b.inside) check(n);
+        }
+        if (!missing.empty())
+            throw std::runtime_error(
+                "refine: the bubbles CSV describes nodes the GFA does not contain (" +
+                cli::join_with_comma(missing) + "); the CSV and the graph are not the same graph");
+    }
+
     const std::unordered_set<std::string> self_loop = self_loop_nodes(model);
 
-    // resolve reference path (name or case-insensitive substring) -> index
-    const std::string ref_q = to_lower(options.reference_path);
+    // The resolved name, matched exactly. Selecting the first case-insensitive SUBSTRING gave no
+    // priority to an exact match and never rejected ambiguity, so `-r hap1` could silently pick
+    // `hap10` if it came first in the file.
     std::size_t ref_idx = model.paths.size();
     for (std::size_t i = 0; i < model.paths.size(); ++i) {
-        if (to_lower(path_display_name(model.paths[i])).find(ref_q) != std::string::npos) { ref_idx = i; break; }
+        if (path_display_name(model.paths[i]) == resolved_reference) { ref_idx = i; break; }
     }
     if (ref_idx == model.paths.size()) {
-        throw std::runtime_error("refine: no path matching --reference-path '" + options.reference_path + "'");
+        throw std::runtime_error("refine: resolved reference '" + resolved_reference +
+                                 "' is not a path of the model");
     }
+
+    // Every input path's spelled sequence, kept so the rewrite can be PROVEN lossless rather than
+    // assumed to be. refine re-aligns interiors and rebuilds nodes; "sequence-preserving" was an
+    // algorithmic argument with nothing checking it.
+    std::unordered_map<std::string, std::string> spelled_before;
+    for (const GfaPath& p : model.paths) spelled_before[path_display_name(p)] = spell(model, p.steps);
 
     // path indices to consider per region: reference first, then all others
     std::vector<std::size_t> path_order;
@@ -401,8 +491,25 @@ RefineSummary refine_graph(const RefineOptions& options) {
     } else {
         std::unordered_set<std::string> want(options.only_bubble_ids.begin(), options.only_bubble_ids.end());
         std::vector<Bubble> picked;
-        for (const auto& b : bubbles) if (want.count(std::to_string(b.id))) picked.push_back(b);
-        if (!picked.empty()) comps.push_back(picked);
+        std::unordered_set<std::string> found;
+        for (const auto& b : bubbles) {
+            const std::string id = std::to_string(b.id);
+            if (want.count(id)) { picked.push_back(b); found.insert(id); }
+        }
+        // A --bubble-id naming nothing used to rebuild zero regions and still write a full, unchanged
+        // output family with exit 0 -- indistinguishable from "nothing needed refining".
+        std::vector<std::string> absent;
+        for (const std::string& w : want) if (!found.count(w)) absent.push_back(w);
+        if (!absent.empty()) {
+            std::sort(absent.begin(), absent.end());
+            throw std::runtime_error("refine: --bubble-id not present in the bubbles CSV: " +
+                                     cli::join_with_comma(absent));
+        }
+        // Selected ids go through the SAME component grouping as auto mode. Forcing them into one
+        // region assumed they were adjacent: two disjoint bubbles became a single region spanning
+        // disconnected anchors, which then failed as one unit -- `--bubble-id 1,2` reported "rebuilt 0,
+        // skipped 1" where auto mode rebuilt both.
+        comps = components(picked);
     }
 
     long long next_id = 0;
@@ -413,11 +520,32 @@ RefineSummary refine_graph(const RefineOptions& options) {
     }
     ++next_id;
 
+    // Component order was whatever the container produced, which makes the run's node numbering (and
+    // so its output bytes) depend on hash iteration order. Sorted by first anchor, so two runs of the
+    // same input agree byte for byte.
+    std::sort(comps.begin(), comps.end(), [](const std::vector<Bubble>& a, const std::vector<Bubble>& b) {
+        if (a.empty() || b.empty()) return b.empty() < a.empty();
+        if (a.front().source != b.front().source) return a.front().source < b.front().source;
+        return a.front().sink < b.front().sink;
+    });
+
+    // The reasons a region was skipped were composed and thrown away, so "skipped 3" was the whole
+    // story a user got.
+    std::ofstream rep(options.out_prefix + ".refine.report.tsv");
+    if (!rep) throw std::runtime_error("refine: cannot write " + options.out_prefix + ".refine.report.tsv");
+    rep << "region\tn_bubbles\tsource\tsink\tdecision\treason\n";
+
     std::vector<RegionEdit> edits;
     cli::ProgressBar progress(options.quiet ? "" : "Refining regions", comps.size());
+    std::size_t region_no = 0;
     for (const auto& comp : comps) {
         std::string note;
         auto edit = process_region(comp, model, path_order, ref_idx, self_loop, options, next_id, note);
+        ++region_no;
+        rep << region_no << '\t' << comp.size() << '\t'
+            << (comp.empty() ? std::string("-") : comp.front().source) << '\t'
+            << (comp.empty() ? std::string("-") : comp.back().sink) << '\t'
+            << (edit ? "rebuilt" : "skipped") << '\t' << (note.empty() ? "-" : note) << '\n';
         if (edit) { edits.push_back(std::move(*edit)); ++summary.regions_rebuilt; }
         else ++summary.regions_skipped;
         progress.tick();
@@ -502,17 +630,62 @@ RefineSummary refine_graph(const RefineOptions& options) {
     }
     model.edges = std::move(kept);
 
+    // ACCEPTANCE: every path must still spell exactly what it spelled on the way in. refine re-aligns
+    // interiors and rebuilds nodes, and losslessness was an argument about the algorithm with nothing
+    // testing it. Checked before anything is written, so a violation cannot reach disk.
+    {
+        std::vector<std::string> broken;
+        for (const GfaPath& p : model.paths) {
+            const std::string name = path_display_name(p);
+            const auto it = spelled_before.find(name);
+            if (it == spelled_before.end()) { broken.push_back(name + " (path appeared)"); continue; }
+            const std::string now = spell(model, p.steps);
+            if (now != it->second && broken.size() < 8) {
+                broken.push_back(name + " (" + std::to_string(it->second.size()) + " bp -> " +
+                                 std::to_string(now.size()) + " bp)");
+            }
+        }
+        if (model.paths.size() != spelled_before.size())
+            broken.push_back("path count " + std::to_string(spelled_before.size()) + " -> " +
+                             std::to_string(model.paths.size()));
+        if (!broken.empty())
+            throw std::runtime_error("refine: the rewrite changed a haplotype's sequence, which it must "
+                                     "never do: " + cli::join_with_comma(broken));
+
+        // Every consecutive step pair must be joined by a link that exists, in the orientation walked.
+        std::unordered_set<std::string> have;
+        for (const GfaEdge& e : model.edges) {
+            have.insert(e.from + e.from_orient + "\t" + e.to + e.to_orient);
+            have.insert(e.to + static_cast<char>(e.to_orient == '+' ? '-' : '+') + "\t" + e.from +
+                        static_cast<char>(e.from_orient == '+' ? '-' : '+'));
+        }
+        for (const GfaPath& p : model.paths) {
+            for (std::size_t k = 1; k < p.steps.size(); ++k) {
+                const std::string key = p.steps[k - 1].node_id +
+                                        (p.steps[k - 1].reverse ? '-' : '+') + "\t" +
+                                        p.steps[k].node_id + (p.steps[k].reverse ? '-' : '+');
+                if (have.find(key) == have.end())
+                    throw std::runtime_error("refine: path " + path_display_name(p) +
+                                             " steps across a link the rebuilt graph does not have: " +
+                                             key);
+            }
+        }
+    }
+
     // re-sort, re-snarl and write the output family, the same way panphorte does
     GraphSortOptions sort_opts;
-    sort_opts.reference_path = options.reference_path;
+    sort_opts.reference_path = resolved_reference;
     sort_opts.flip = !options.no_flip;
-    sort_graph_reference(model, sort_opts);
+    const GraphSortResult sort_result = sort_graph_reference(model, sort_opts);
 
     const std::string sorted_gfa = options.out_prefix + ".normalized.sorted.gfa";
     write_gfa_model(sorted_gfa, model);
 
     BubbleCallOptions bopts;
-    bopts.reference_path = options.reference_path;
+    bopts.reference_path = sort_result.resolved_reference;
+    // The re-snarl silently used BubbleCallOptions' own 50 bp default, so an input built with a
+    // different threshold could lose bubbles that refinement never touched.
+    bopts.min_variant_bp = options.resnarl_min_variant_bp;
     bopts.snarl_pairs_override = find_top_level_snarls_cactus(snarl_input_from_model(model));
     bopts.snarl_source_supplied = true;
     bopts.quiet = options.quiet;
@@ -525,8 +698,10 @@ RefineSummary refine_graph(const RefineOptions& options) {
     write_bandage_node_colors_csv(options.out_prefix + ".bandage_nodes.csv", report.bubbles,
                                   report.non_snp_bubbles);
     if (!options.gtf_path.empty()) {
-        emit_gene_annotation(sorted_graph, options.reference_path, options.gtf_path,
-                             options.out_prefix + ".bandage_genes.csv");
+        if (emit_gene_annotation(sorted_graph, sort_result.resolved_reference, options.gtf_path,
+                                 options.out_prefix + ".bandage_genes.csv")) {
+            summary.wrote_gene_annotation = true;   // it was omitted from the reported output list
+        }
     }
     summary.bubbles_after = report.bubbles.size();
     return summary;

@@ -277,6 +277,17 @@ if(PANVAR_BUILD_TESTING)
             set_tests_properties(panvar_panphorte_stats PROPERTIES TIMEOUT 300)
         endif()
 
+        # refine contract. real_smoke.sh only checks that refine's files exist and that `call` runs
+        # afterwards, which passes whether or not the rewrite was correct.
+        set(PANVAR_REFINE_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/refine_stats.sh)
+        if(EXISTS ${PANVAR_REFINE_STATS})
+            add_test(
+                NAME panvar_refine_stats
+                COMMAND /usr/bin/env bash ${PANVAR_REFINE_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/refine_stats
+            )
+            set_tests_properties(panvar_refine_stats PROPERTIES TIMEOUT 300)
+        endif()
+
         # rebuild contract: the input is never destroyed, a healthy graph survives, a malformed one is
         # refused rather than silently repaired, and nothing is left behind. CTest previously exercised
         # no rebuild at all.

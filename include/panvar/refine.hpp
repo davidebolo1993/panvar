@@ -20,11 +20,15 @@ struct RefineOptions {
     std::size_t max_walks = 500;             // skip a residual segment with more distinct walks than this
     std::size_t min_bubbles = 1;             // only rebuild regions fusing >= this many bubbles
     std::vector<std::string> only_bubble_ids; // targeted mode: rebuild only these bubble ids (empty = auto)
+    // Interior-span filter for the re-snarled call-ready CSV. Was BubbleCallOptions' own default,
+    // applied silently to an input that may have been produced with a different one.
+    std::size_t resnarl_min_variant_bp = 50;
     bool no_flip = false;
     bool quiet = false;
 };
 
 struct RefineSummary {
+    bool wrote_gene_annotation = false;  // <prefix>.bandage_genes.csv, when --gtf projected genes
     std::size_t regions_rebuilt = 0;
     std::size_t regions_skipped = 0;
     std::size_t nodes_added = 0;

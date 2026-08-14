@@ -31,7 +31,9 @@ void print_refine_help() {
         << "  -o, --out-prefix <prefix>     Output prefix (required)\n"
         << "      --gtf <path>              Reference GTF; also write <prefix>.bandage_genes.csv\n"
         << "      --bubble-id <id[,id...]>  Refine only these bubble ids (default: auto over the whole locus)\n"
-        << "      --max-poa-bp <N>          Skip a residual segment whose median interior exceeds this (default 5000)\n"
+        << "      --max-poa-bp <N>          Skip a residual segment whose LONGEST sequence exceeds this, and\n"
+        << "                                bound total POA cost with it (default 5000)\n"
+        << "      --resnarl-min-variant-bp <N>  Interior-span filter for the re-snarled CSV (default 50)\n"
         << "      --max-walks <N>           Skip a residual segment with more than N distinct walks (default 500)\n"
         << "      --min-bubbles <N>         Only rebuild regions fusing >= N bubbles (default 1)\n"
         << "      --no-flip                 Do not reorient nodes to the reference forward strand\n"
@@ -97,8 +99,13 @@ int run_refine_command(const std::vector<std::string>& args) {
     log.info("rebuilt " + std::to_string(s.regions_rebuilt) + " region(s), skipped " +
              std::to_string(s.regions_skipped) + " (+" + std::to_string(s.nodes_added) + " nodes, -" +
              std::to_string(s.nodes_removed) + "); " + std::to_string(s.bubbles_after) + " bubbles after");
-    log.wrote({opt.out_prefix + ".normalized.sorted.gfa", opt.out_prefix + ".bubbles.csv",
-               opt.out_prefix + ".bandage_nodes.csv"});
+    std::vector<std::string> outs{opt.out_prefix + ".normalized.sorted.gfa",
+                                  opt.out_prefix + ".bubbles.csv",
+                                  opt.out_prefix + ".bandage_nodes.csv",
+                                  opt.out_prefix + ".refine.report.tsv"};
+    // The gene annotation was produced and never reported, so a --gtf run understated what it wrote.
+    if (s.wrote_gene_annotation) outs.push_back(opt.out_prefix + ".bandage_genes.csv");
+    log.wrote(outs);
     log.done();
     return 0;
 }
