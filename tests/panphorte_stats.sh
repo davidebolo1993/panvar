@@ -422,6 +422,108 @@ else
   bad "the reuse fixture produced no normalized graph"
 fi
 
+# ---------------------------------------------------------------- the same case, reverse-traversed
+# A GFA stores each link once, in whichever direction it happens to store it, and a+ -> b+ IS b- -> a-.
+# Here the carriers walk the site backwards, so every arc they use is recorded under the dual of the
+# stored L. Keyed on the stored direction alone the pruner found none of them and the entire replaced
+# branch stayed walkable -- measured: 0 links removed and 1+>2+, 2+>2+, 2+>4+ all still present.
+{ printf 'H\tVN:Z:1.0\n'
+  printf "S\t1\t%s\nS\t2\t%s\nS\t3\tTTT%sGGG\nS\t4\t%s\nS\t5\t%s\nS\t6\t%s\n" \
+         "$BB1" "$UNIT" "$UNIT" "$BB2" "$BB1" "$BB2"
+  for e in "1 2" "2 2" "2 4" "1 3" "3 4" "5 2" "2 6"; do
+    set -- $e; printf "L\t%s\t+\t%s\t+\t0M\n" "$1" "$2"
+  done
+  printf 'P\trevA\t4-,2-,2-,1-\t*\nP\trevB\t4-,2-,2-,1-\t*\nP\trevC\t4-,3-,1-\t*\n'
+  printf 'P\tkeep\t5+,2+,6+\t*\n'; } > "$OUT/rev.gfa"
+"$BIN" panphorte -i "$OUT/rev.gfa" -c "$OUT/reuse.bubbles.csv" -o "$OUT/revp" \
+       --min-similarity 0.90 --min-array-prevalence 0.5 -q >/dev/null 2>&1
+if [ -s "$OUT/revp.normalized.gfa" ]; then
+  grep -q '^S	2	' "$OUT/revp.normalized.gfa" \
+    && ok "reverse: a replaced node still walked elsewhere is kept" \
+    || bad "reverse: a node another path still walks was removed"
+  rstale=0
+  for l in '1	+	2	+' '2	+	2	+' '2	+	4	+'; do
+    grep -q "^L	$l" "$OUT/revp.normalized.gfa" && rstale=$((rstale + 1))
+  done
+  [ "$rstale" = "0" ] \
+    && ok "reverse: an arc stored one way and walked the other is still recognised as obsolete" \
+    || bad "reverse: $rstale stale link(s) survived because the key was not canonical"
+  rlive=0
+  for l in '5	+	2	+' '2	+	6	+'; do
+    grep -q "^L	$l" "$OUT/revp.normalized.gfa" && rlive=$((rlive + 1))
+  done
+  [ "$rlive" = "2" ] \
+    && ok "reverse: the arcs a final path still walks are kept" \
+    || bad "reverse: pruning removed a link a path still traverses ($rlive of 2 kept)"
+else
+  bad "the reverse-traversal fixture produced no normalized graph"
+fi
+
+# Same canonical key, second consequence: ensure() adds an L only when the arc is absent in EITHER
+# direction. Keyed on the stored direction it re-added every adjacency the graph already held as a
+# dual, so a run that folded NOTHING still doubled the link set -- C4 6532 -> 12374, CYP2D6 8171 ->
+# 15606. No link may appear twice, once in each direction.
+dupe_arcs() {  # links present in both directions, counted once per pair
+  awk -F'\t' '$1=="L"{
+    fo=($3=="+")?"-":"+"; to=($5=="+")?"-":"+"
+    a=$2 $3 ">" $4 $5; b=$4 to ">" $2 fo
+    k=(a<b)?a:b; n[k]++
+  } END {d=0; for (x in n) if (n[x] > 1) d++; print d}' "$1"
+}
+[ "$(dupe_arcs "$OUT/revp.normalized.gfa")" = "0" ] \
+  && ok "no arc is emitted twice, once in each direction" \
+  || bad "$(dupe_arcs "$OUT/revp.normalized.gfa") arc(s) emitted in both directions"
+
+# ---------------------------------------------------------------- the replaced route must not survive
+# A link kept because another path needs it is not on its own a defect: at a real array it is the normal
+# case (2009 of them at LPA, where no replaced route survives). What matters is whether the surviving
+# nodes and links still spell the OLD allele end to end -- then the site is represented twice, folded and
+# unfolded, and the re-snarl reports two alleles for one haplotype. Here `stubX` keeps 1+>2+ alive and
+# `stubY` keeps 2+>2+ and 2+>4+, neither crossing the site, so cleanA's original route is fully intact
+# after its rewrite.
+{ printf 'H\tVN:Z:1.0\n'
+  printf "S\t1\t%s\nS\t2\t%s\nS\t3\tTTT%sGGG\nS\t4\t%s\nS\t7\t%s\nS\t8\t%s\n" \
+         "$BB1" "$UNIT" "$UNIT" "$BB2" "$(head -c 300 /dev/zero | tr '\0' 'T')" \
+         "$(head -c 300 /dev/zero | tr '\0' 'C')"
+  for e in "1 2" "2 2" "2 4" "1 3" "3 4" "2 7" "8 2"; do
+    set -- $e; printf "L\t%s\t+\t%s\t+\t0M\n" "$1" "$2"
+  done
+  printf 'P\tcleanA\t1+,2+,2+,4+\t*\nP\tcleanB\t1+,2+,2+,4+\t*\nP\tflank\t1+,3+,4+\t*\n'
+  printf 'P\tstubX\t1+,2+,7+\t*\nP\tstubY\t8+,2+,2+,4+\t*\n'; } > "$OUT/twin.gfa"
+"$BIN" panphorte -i "$OUT/twin.gfa" -c "$OUT/reuse.bubbles.csv" -o "$OUT/twinp" \
+       --min-similarity 0.90 -q > "$OUT/twin.log" 2>&1
+twin_rc=$?
+[ "$twin_rc" != "0" ] && grep -q "ORIGINAL route" "$OUT/twin.log" \
+  && ok "a rewrite whose replaced route stays walkable is refused, naming the paths" \
+  || bad "a site folded twice was accepted (exit $twin_rc): $(head -c 120 "$OUT/twin.log")"
+"$BIN" panphorte -i "$OUT/twin.gfa" -c "$OUT/reuse.bubbles.csv" -o "$OUT/twino" \
+       --min-similarity 0.90 --allow-surviving-replaced-route -q >/dev/null 2>&1
+[ -s "$OUT/twino.normalized.gfa" ] \
+  && ok "--allow-surviving-replaced-route accepts it" \
+  || bad "the override did not produce a graph"
+# The other side of the same rule: the reuse fixture keeps node 2 and one of its arcs alive, so the
+# obsolete-and-live count is non-zero, but the entry and exit arcs go and the old route is broken. It
+# must run, not be refused -- refusing on the arc count alone would block LPA.
+[ -s "$OUT/reusep.normalized.gfa" ] \
+  && ok "a shared link whose route no longer reconnects does not refuse the run" \
+  || bad "the reuse fixture was refused although its replaced route is broken"
+
+# ---------------------------------------------------------------- overlap refusal respects --bubble-id
+# Only the SELECTED sites can overlap: refusing on a pair the run was never going to touch blocked the
+# one safe way to work at a locus whose CSV carries an overlap, which is to name one member of it.
+for want in 1 2; do
+  "$BIN" panphorte -i "$OUT/e2e.gfa" -c "$OUT/nested.bubbles.csv" -o "$OUT/sel$want" \
+         --min-similarity 0.90 --bubble-id "$want" -q > "$OUT/sel$want.log" 2>&1
+  [ "$?" = "0" ] \
+    && ok "selecting overlapping bubble $want on its own runs" \
+    || bad "--bubble-id $want was refused although nothing it selects overlaps: $(head -1 "$OUT/sel$want.log")"
+done
+"$BIN" panphorte -i "$OUT/e2e.gfa" -c "$OUT/nested.bubbles.csv" -o "$OUT/selboth" \
+       --min-similarity 0.90 --bubble-id 1 --bubble-id 2 -q > "$OUT/selboth.log" 2>&1
+[ "$?" != "0" ] && grep -q "both claim interior node" "$OUT/selboth.log" \
+  && ok "selecting both members of an overlapping pair is still refused" \
+  || bad "--bubble-id 1 --bubble-id 2 was accepted"
+
 # ---------------------------------------------------------------- two copies inside one node
 # Two copies of a 16 bp unit sit in a single 96 bp node, separated by 64 bp. There is no step boundary
 # between them, so mapping each copy to its own containing step range declined the second -- at an
@@ -454,29 +556,6 @@ n=$(awk '$1=="P" && $2=="sep"{print $3}' "$OUT/tiop.normalized.gfa" | tr ',' '\n
   && ok "sep is anchor, REP, fragment, REP, anchor (5 steps)" \
   || bad "sep has $n steps, expected 5"
 
-# ---------------------------------------------------------------- nothing is declined any more
-# This fixture used to be the decline case: two copies inside one node, the second with no step to start
-# at. With blocks and fragments both fold, so the assertion is now the positive one -- the site
-# normalizes, nothing is declined, and the sequence survives. Kept because it is the shape that used to
-# break, and a regression would show up here first.
-U16="ACGTTGCAACGTTGCA"
-G64="TTTTTTTTGGGGCCCCTTTTTTTTGGGGCCCCTTTTTTTTGGGGCCCCTTTTTTTTGGGGCCCC"
-{ printf 'H\tVN:Z:1.0\n'
-  printf "S\t1\t%s\nS\t2\t%s\nS\t3\t%s%s%s\nS\t4\t%s\n" "$BB1" "$U16" "$U16" "$G64" "$U16" "$BB2"
-  printf 'L\t1\t+\t2\t+\t0M\nL\t2\t+\t2\t+\t0M\nL\t2\t+\t4\t+\t0M\n'
-  printf 'L\t1\t+\t3\t+\t0M\nL\t3\t+\t4\t+\t0M\n'
-  printf 'P\tcleanA\t1+,2+,2+,4+\t*\nP\tcleanB\t1+,2+,2+,4+\t*\nP\tboth\t1+,3+,4+\t*\n'; } \
-  > "$OUT/two_in_one.gfa"
-"$BIN" bubble -i "$OUT/two_in_one.gfa" -r cleanA -o "$OUT/tiob" --min-variant-bp 0 -q >/dev/null 2>&1
-"$BIN" panphorte -i "$OUT/tiob.sorted.gfa" -c "$OUT/tiob.bubbles.csv" -o "$OUT/tiop" \
-       --min-similarity 0.90 --min-unit-bp 16 --min-array-prevalence 0.5 -q >/dev/null 2>&1
-tio_before=$(spell "$OUT/tiob.sorted.gfa" both)
-[ "$(spell "$OUT/tiop.normalized.gfa" both)" = "$tio_before" ] \
-  && ok "the haplotype with two copies in one node keeps its sequence" \
-  || bad "the two-copies-in-one-node haplotype lost bases"
-[ "$(rep "$OUT/tiop.panphorte.report.tsv" status)" != "partial_boundary" ] \
-  && ok "no site is refused for a boundary now that every copy is bounded by its step range" \
-  || bad "the site was refused although both copies are foldable"
 
 # ---------------------------------------------------------------- REP provenance is emitted
 [ -s "$OUT/cnp.panphorte.rep_provenance.tsv" ] \
@@ -499,30 +578,36 @@ grep -q "^L	$prov_out	+	$prov_out	+" "$OUT/e2ep.normalized.sorted.gfa" \
   && ok "the created id and the delivered id are both reported, and here they differ" \
   || bad "created_rep_node and output_rep_node are equal; the sort renumbering was not applied"
 
-# ---------------------------------------------------------------- a declined copy beside folded ones
-# The opposite case, and the common one at a real array: a haplotype has several copies and only one is
-# unfoldable. It still reaches the site through the REP node, so its copy number is undercounted by
-# that copy rather than zeroed -- refusing the whole site here would throw away the fold for every
-# haplotype to prevent an error of one copy in several. Measured at LPA KIV-2: 466 of 466 haplotypes
-# fold at least one copy (median 20), so the false-zero condition never arises there.
-# `mixed` reaches the motif twice: once on node 2, which is exactly one unit and folds, and once inside
-# node 3, whose copy is flanked by 3 bp on each side and cannot be folded without splitting the node.
+# ---------------------------------------------------------------- copies on unequal node boundaries
+# `mixed` reaches the motif twice: once on a node that is exactly one unit, and once inside a node whose
+# copy is flanked by 3 bp on each side. Both fold, so its copy number is 2 -- the assertion that matters.
+# The old check here asked only whether the site was refused, which is now structurally unreachable, and
+# the fixture did not even seed (status=no_seed), so it passed whatever the fold did. `alt` bypasses the
+# array so that the first unit node is interior rather than the site's own source anchor; without it the
+# bubble starts AT that node and each haplotype has a single copy inside, which is what stopped it
+# seeding.
 { printf 'H\tVN:Z:1.0\n'
-  printf "S\t1\t%s\nS\t2\t%s\nS\t5\t%s\nS\t3\tTTT%sGGG\nS\t4\t%s\n" \
-         "$BB1" "$UNIT" "$UNIT" "$UNIT" "$BB2"
-  for e in "1 2" "2 5" "5 4" "2 3" "3 4"; do
+  printf "S\t1\t%s\nS\t2\t%s\nS\t5\t%s\nS\t3\tTTT%sGGG\nS\t4\t%s\nS\t6\t%s\n" \
+         "$BB1" "$UNIT" "$UNIT" "$UNIT" "$BB2" "$(head -c 200 /dev/zero | tr '\0' 'C')"
+  for e in "1 2" "2 5" "5 4" "2 3" "3 4" "1 6" "6 4"; do
     set -- $e; printf "L\t%s\t+\t%s\t+\t0M\n" "$1" "$2"
   done
-  printf 'P\tcleanA\t1+,2+,5+,4+\t*\nP\tcleanB\t1+,2+,5+,4+\t*\nP\tmixed\t1+,2+,3+,4+\t*\n'; } \
-  > "$OUT/mix.gfa"
+  printf 'P\tcleanA\t1+,2+,5+,4+\t*\nP\tcleanB\t1+,2+,5+,4+\t*\nP\tmixed\t1+,2+,3+,4+\t*\n'
+  printf 'P\talt\t1+,6+,4+\t*\n'; } > "$OUT/mix.gfa"
 "$BIN" bubble -i "$OUT/mix.gfa" -r cleanA -o "$OUT/mixb" --min-variant-bp 0 -q >/dev/null 2>&1
+mix_before=$(spell "$OUT/mixb.sorted.gfa" mixed)
 "$BIN" panphorte -i "$OUT/mixb.sorted.gfa" -c "$OUT/mixb.bubbles.csv" -o "$OUT/mixp" \
        --min-similarity 0.90 --min-array-prevalence 0.5 > "$OUT/mixp.log" 2>&1
-if [ "$(rep "$OUT/mixp.panphorte.report.tsv" status)" = "partial_boundary" ]; then
-  bad "a site was refused although every haplotype still folds at least one copy"
-else
-  ok "a declined copy beside folded ones does not refuse the site"
-fi
+[ "$(rep "$OUT/mixp.panphorte.report.tsv" status)" = "normalized" ] \
+  && ok "the mixed-boundary site seeds and folds" \
+  || bad "the mixed-boundary site reports $(rep "$OUT/mixp.panphorte.report.tsv" status)"
+mix_copies=$(awk -F'\t' '$1=="mixed"{print $4}' "$OUT/mixp.panphorte.copies.tsv" 2>/dev/null)
+[ "$mix_copies" = "2" ] \
+  && ok "a copy on a node boundary and a copy inside a node both fold (CN 2)" \
+  || bad "mixed folds '$mix_copies' copies, expected 2"
+[ "$(spell "$OUT/mixp.normalized.gfa" mixed)" = "$mix_before" ] \
+  && ok "and the 3 bp flanking each in-node copy survive" \
+  || bad "mixed lost bases when its two unequal copies were folded"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "panphorte_stats: all assertions passed"; exit 0; fi

@@ -42,6 +42,19 @@ as history; Git already provides that history.
 
 ## Bubble
 
+### Retained-site disjointness
+
+- **Resolve overlapping retained snarls before assigning final bubble IDs.** On ANKRD36C, `bubble`
+  emits one snarl whose interior contains the interiors of all ten other retained snarls; Panphorte then
+  sees the same 5,616 bp repeat array at two scales and correctly refuses the CSV rather than rewriting
+  overlapping spans. Apply a deterministic conflict-resolution pass after filtering/merging. The chosen
+  project policy is to retain the enclosing/larger snarl and drop the overlapping smaller snarls; report
+  the dropped candidates and their conflict so the loss of finer site resolution is visible. Add a
+  synthetic nested-snarl fixture plus an ANKRD36C regression asserting pairwise-disjoint emitted
+  interiors and successful Panphorte preflight. Because the larger site can combine otherwise distinct
+  subevents, also compare its downstream `call` records with the current smaller-site calls before
+  treating this policy as biologically neutral.
+
 ### Bounded traversal limitations
 
 - **Remove or expose the 64-endpoint traversal cap.** The repeated-boundary interval search examines only
