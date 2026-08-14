@@ -253,6 +253,19 @@ if(PANVAR_BUILD_TESTING)
             set_tests_properties(panvar_bubble_stats PROPERTIES TIMEOUT 180)
         endif()
 
+        # inspect contract. real_smoke.sh only checks that inspect's files exist and that the gzip is
+        # readable, which passes whether or not the contents are right -- it would not have caught a
+        # whole allele missing from the FASTA, a duplicate path name, or a bubbles CSV from a different
+        # graph running to completion.
+        set(PANVAR_INSPECT_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/inspect_stats.sh)
+        if(EXISTS ${PANVAR_INSPECT_STATS})
+            add_test(
+                NAME panvar_inspect_stats
+                COMMAND /usr/bin/env bash ${PANVAR_INSPECT_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/inspect_stats
+            )
+            set_tests_properties(panvar_inspect_stats PROPERTIES TIMEOUT 180)
+        endif()
+
         # rebuild contract: the input is never destroyed, a healthy graph survives, a malformed one is
         # refused rather than silently repaired, and nothing is left behind. CTest previously exercised
         # no rebuild at all.

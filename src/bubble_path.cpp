@@ -147,22 +147,37 @@ std::vector<PathStep> canonical_bubble_path_steps(
 // ([source, sink]) for paths that cross with no inside node (a pure deletion / short side of an
 // insertion), which the inside-node-only interval finder would otherwise drop.
 std::optional<std::vector<PathStep>> bubble_steps(
-    const PathRecord& path, const BubblePathIndex& index, const Bubble& bubble) {
+    const PathRecord& path, const BubblePathIndex& index, const Bubble& bubble,
+    BubblePathInterval* used_interval) {
     const auto iv = find_best_bubble_path_interval(index, bubble);
     if (iv.has_value()) {
         std::vector<PathStep> s = canonical_bubble_path_steps(path, bubble, *iv);
-        if (!s.empty()) return s;
+        if (!s.empty()) {
+            if (used_interval != nullptr) *used_interval = *iv;
+            return s;
+        }
     }
     const auto si = index.positions.find(bubble.source);
     const auto ki = index.positions.find(bubble.sink);
     if (si == index.positions.end() || ki == index.positions.end()) return std::nullopt;
+    const auto record = [&](std::size_t l, std::size_t r, bool s2s) {
+        if (used_interval == nullptr) return;
+        used_interval->left = l;
+        used_interval->right = r;
+        used_interval->inside_count = 0;
+        used_interval->source_to_sink = s2s;
+    };
     const std::unordered_set<std::size_t> sink_pos(ki->second.begin(), ki->second.end());
     for (const std::size_t p : si->second) {                 // forward: source then sink
-        if (sink_pos.count(p + 1)) return std::vector<PathStep>{ path.steps[p], path.steps[p + 1] };
+        if (sink_pos.count(p + 1)) {
+            record(p, p + 1, true);
+            return std::vector<PathStep>{ path.steps[p], path.steps[p + 1] };
+        }
     }
     const std::unordered_set<std::size_t> src_pos(si->second.begin(), si->second.end());
     for (const std::size_t p : ki->second) {                 // reverse: sink then source -> flip
         if (src_pos.count(p + 1)) {
+            record(p, p + 1, false);
             return std::vector<PathStep>{
                 PathStep{ path.steps[p + 1].node_id, !path.steps[p + 1].reverse },
                 PathStep{ path.steps[p].node_id, !path.steps[p].reverse } };

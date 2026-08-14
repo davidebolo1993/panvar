@@ -220,26 +220,42 @@ std::vector<std::uint64_t> build_walk_minhash_sketch(
     return sketch;
 }
 
+// Bottom-k Jaccard over the UNION of the two sketches.
+//
+// The obvious form -- intersection over union of the two stored sketches -- is biased whenever either
+// sketch is truncated, which here means a walk longer than kWalkSketchSize + shingle - 1 steps. Each
+// sketch then holds the smallest hashes of its OWN shingle set, so a shingle both walks share can sit
+// inside one sketch and below the other's cutoff, and the two sketches sample different regions of the
+// hash space. The bias grows with the size difference, which is exactly the tandem-array case: two
+// walks of the same repeat unit at different copy numbers.
+//
+// The standard unbiased estimator takes the k smallest distinct values of the union, k = min(|a|,|b|),
+// and asks how many of those are in both. Every value considered is at or below both sketches' cutoffs,
+// so membership is decidable from the sketches alone.
 double sketch_jaccard(const std::vector<std::uint64_t>& a, const std::vector<std::uint64_t>& b) {
     if (a.empty() || b.empty()) {
         return 0.0;
     }
+    const std::size_t k = std::min(a.size(), b.size());
     std::size_t i = 0;
     std::size_t j = 0;
-    std::size_t inter = 0;
-    while (i < a.size() && j < b.size()) {
-        if (a[i] == b[j]) {
-            ++inter;
+    std::size_t taken = 0;
+    std::size_t both = 0;
+    while (taken < k && (i < a.size() || j < b.size())) {
+        const bool take_a = (j >= b.size()) || (i < a.size() && a[i] < b[j]);
+        const bool take_b = (i >= a.size()) || (j < b.size() && b[j] < a[i]);
+        if (take_a) {
+            ++i;
+        } else if (take_b) {
+            ++j;
+        } else {                      // equal: present in both
             ++i;
             ++j;
-        } else if (a[i] < b[j]) {
-            ++i;
-        } else {
-            ++j;
+            ++both;
         }
+        ++taken;
     }
-    const std::size_t uni = a.size() + b.size() - inter;
-    return uni == 0 ? 0.0 : static_cast<double>(inter) / static_cast<double>(uni);
+    return taken == 0 ? 0.0 : static_cast<double>(both) / static_cast<double>(taken);
 }
 
 // identity ~= 2J / (1 + J) from k-mer/shingle Jaccard.
@@ -394,16 +410,18 @@ InspectBubbleResult write_inspect_outputs_for_bubble(
     std::vector<UniqueWalk> uniques;
     try {
         for (const auto& path : graph.paths) {
+            // bubble_steps, not the inside-node-only interval finder: a haplotype that crosses the
+            // bubble with NO interior node -- a pure deletion, or the short side of an insertion -- has
+            // no interval and was dropped, so inspect emitted one allele where `bubble` reported two.
+            // It is a real allele and it is often the interesting one.
             const BubblePathIndex index = build_bubble_path_index(path);
-            const auto interval = find_best_bubble_path_interval(index, bubble);
-            if (!interval.has_value()) {
+            BubblePathInterval used{};
+            const auto steps_opt = bubble_steps(path, index, bubble, &used);
+            if (!steps_opt.has_value() || steps_opt->empty()) {
                 continue;
             }
-
-            const std::vector<PathStep> steps = canonical_bubble_path_steps(path, bubble, *interval);
-            if (steps.empty()) {
-                continue;
-            }
+            const std::vector<PathStep>& steps = *steps_opt;
+            const BubblePathInterval* interval = &used;
 
             const std::string sequence = spell_path_steps_sequence(graph, steps);
             InspectPathRow row;
@@ -661,10 +679,40 @@ int run_inspect_command(const std::vector<std::string>& args) {
         throw std::runtime_error("--fasta-out/--table-out/--edge-table-out require --bubble-id; use --out-prefix when inspecting all bubbles");
     }
 
+    // Explicit output paths are unconstrained, so two of them can name the same file -- in which case
+    // whichever is written last silently wins -- or name an input, destroying it before it is read.
+    {
+        const std::string* outs[] = {&fasta_out_path, &table_out_path, &edge_table_out_path};
+        const std::string* ins[] = {&gfa_path, &bubbles_csv_path};
+        const auto same = [](const std::string& a, const std::string& b) {
+            std::error_code e1, e2;
+            const auto pa = std::filesystem::weakly_canonical(a, e1);
+            const auto pb = std::filesystem::weakly_canonical(b, e2);
+            return !e1 && !e2 && !pa.empty() && pa == pb;
+        };
+        for (std::size_t i = 0; i < 3; ++i) {
+            if (outs[i]->empty()) continue;
+            for (std::size_t j = i + 1; j < 3; ++j) {
+                if (!outs[j]->empty() && same(*outs[i], *outs[j]))
+                    throw std::runtime_error("inspect: two outputs name the same file: " + *outs[i]);
+            }
+            for (const std::string* in : ins) {
+                if (!in->empty() && same(*outs[i], *in))
+                    throw std::runtime_error("inspect: output '" + *outs[i] +
+                                             "' is the same file as input '" + *in + "'");
+            }
+        }
+    }
+
     ParseGfaOptions parse_options;
     parse_options.include_paths = true;
     parse_options.include_sequences = true;
     const Graph graph = parse_gfa(gfa_path, parse_options);
+    // The same contract every other module applies. Without it a duplicate path name produced two
+    // rows labelled identically -- nothing downstream could tell which haplotype was which -- and a
+    // non-zero overlap silently inflated every path_length_bp, because inspect spells by
+    // concatenating whole nodes and an overlap means those nodes share bases.
+    validate_graph_paths(graph, "inspect", true, true);
     if (graph.paths.empty()) {
         throw std::runtime_error("Input GFA has no P/W paths; inspect requires paths");
     }
@@ -691,6 +739,30 @@ int run_inspect_command(const std::vector<std::string>& args) {
         selected_bubbles.push_back(&(*bubble_it));
     }
 
+    // The bubbles CSV and the GFA are separate inputs and nothing ties them together, so a CSV from
+    // another graph -- or from the same graph before a rewrite renumbered it -- used to run to
+    // completion: node lengths came back as 0, the count matrix had a column per phantom node and no
+    // rows, and the run exited 0. Every selected bubble must name nodes this graph actually has.
+    {
+        std::vector<std::string> missing;
+        for (const Bubble* b : selected_bubbles) {
+            const auto check = [&](const std::string& n) {
+                if (graph.nodes.find(n) == graph.nodes.end() && missing.size() < 8) {
+                    missing.push_back("bubble " + std::to_string(b->id) + " node " + n);
+                }
+            };
+            check(b->source);
+            check(b->sink);
+            for (const std::string& n : b->inside) check(n);
+        }
+        if (!missing.empty()) {
+            throw std::runtime_error(
+                "inspect: the bubbles CSV describes nodes the GFA does not contain (" +
+                cli::join_with_comma(missing) +
+                "); the CSV and the graph are not the same graph");
+        }
+    }
+
     // Verbose per-bubble block is useful for a single bubble; for an all-bubbles run
     // it just floods stdout, so we show a progress bar on stderr instead.
     const bool single_bubble = bubble_id != 0;
@@ -705,6 +777,11 @@ int run_inspect_command(const std::vector<std::string>& args) {
 
     cli::ProgressBar progress((single_bubble || quiet) ? "" : "Inspecting bubbles",
                               single_bubble ? 0 : selected_bubbles.size());
+
+    // An all-bubbles run writes five files per bubble. Failing at bubble 400 of 500 used to leave 399
+    // complete-looking bubbles on disk beside a non-zero exit, which is the shape of result a later
+    // command consumes without noticing.
+    cli::StagedOutputs staged("inspect");
 
     for (const Bubble* bubble_ptr : selected_bubbles) {
         const Bubble& bubble = *bubble_ptr;
@@ -729,13 +806,30 @@ int run_inspect_command(const std::vector<std::string>& args) {
         emit.cluster = cluster;
         emit.cluster_similarity = cluster_similarity;
 
-        const InspectBubbleResult result = write_inspect_outputs_for_bubble(
+        // The writer receives staged paths; everything reported below is the final destination.
+        const std::string final_fasta = bubble_fasta_out_path;
+        const std::string final_table = bubble_table_out_path;
+        const std::string final_edges = bubble_edge_table_out_path;
+        const std::string final_lengths = emit.node_lengths_out_path;
+        const std::string final_clusters = emit.clusters_out_path;
+        bubble_fasta_out_path = staged.stage(final_fasta);
+        bubble_table_out_path = staged.stage(final_table);
+        bubble_edge_table_out_path = staged.stage(final_edges);
+        emit.node_lengths_out_path = staged.stage(final_lengths);
+        emit.clusters_out_path = staged.stage(final_clusters);
+
+        InspectBubbleResult result = write_inspect_outputs_for_bubble(
             graph,
             bubble,
             bubble_fasta_out_path,
             bubble_table_out_path,
             bubble_edge_table_out_path,
             emit);
+        result.fasta_out_path = final_fasta;
+        result.table_out_path = final_table;
+        result.edge_table_out_path = final_edges;
+        result.node_lengths_out_path = final_lengths;
+        result.clusters_out_path = final_clusters;
         total_paths_written += result.paths_written;
         progress.tick();
 
@@ -753,6 +847,7 @@ int run_inspect_command(const std::vector<std::string>& args) {
         }
     }
     progress.done();
+    staged.commit();
 
     if (single_bubble) {
         log.info(single_info);

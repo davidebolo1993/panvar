@@ -35,10 +35,14 @@ std::vector<PathStep> canonical_bubble_path_steps(
 // ([source, sink]) for paths that cross with no inside node (a pure deletion / short side of an
 // insertion), which the inside-node-only interval finder above would otherwise drop. Prefer this
 // over `canonical_bubble_path_steps` whenever every allele of a bubble must be represented.
+// `used_interval`, when non-null, receives the interval the steps came from -- including for the
+// empty-interior fallback, where `inside_count` is 0. Callers that report the interval as metadata
+// need it for every allele, not only the ones with an inside node.
 std::optional<std::vector<PathStep>> bubble_steps(
     const PathRecord& path,
     const BubblePathIndex& index,
-    const Bubble& bubble);
+    const Bubble& bubble,
+    BubblePathInterval* used_interval = nullptr);
 
 // Steps of `path` from `from_node` to `to_node`, oriented from->to. Unlike `bubble_steps` this keys
 // on the two boundary nodes alone, so it works for a stretch with no declared interior — the
