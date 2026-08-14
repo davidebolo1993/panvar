@@ -917,13 +917,18 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
             const bool seeded = ref_unit.size() >= options.min_unit_bp;
             double approx_prevalence = 0.0;
             if (ref_unit.size() >= options.min_unit_bp) {
-                // off_lo/off_hi are the step range CONTAINING the copy; pre/suf are the bases inside
-                // that range which fall outside the copy and must survive verbatim.
+                // One replaced step range holding one or more copies. Several copies can share a range
+                // -- two copies inside a single node have no step boundary between them -- so the range
+                // is emitted as fragment, REP, fragment, REP, ... fragment: `frag` always holds one
+                // more entry than there are copies, and the outer two are the bases before the first
+                // copy and after the last.
                 struct Mapped {
-                    std::size_t off_lo, off_hi;
-                    bool rev;
-                    double id;
-                    std::string pre, suf;
+                    std::size_t off_lo = 0, off_hi = 0;
+                    std::vector<bool> rev;
+                    std::vector<double> id;
+                    std::vector<std::string> frag;
+                    std::size_t last_bp_hi = 0;   // end of the most recent copy, in interval bp
+                    std::size_t n_copies() const { return rev.size(); }
                 };
                 struct Res { bool has = false; std::size_t left = 0; std::vector<Mapped> copies; };
                 std::vector<Res> results(graph.paths.size());
@@ -985,23 +990,44 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                         while (hi < prefix.size() && prefix[hi] < bp) ++hi;
                         return hi < prefix.size() ? hi : prefix.size() - 1;
                     };
+                    // Copies are grouped into BLOCKS by the step range that contains them. Two copies
+                    // inside one node share a range, and mapping each copy to a range independently
+                    // declined the second one (its floor collided with the first one's ceiling) --
+                    // which at an array is a whole repeat unit missing from the copy number.
                     std::vector<Mapped> copies;
-                    std::size_t prev_hi = 0;
                     std::size_t declined = 0;
                     for (const ApproxCopy& c : bp_copies) {
-                        std::size_t lo = floor_off(c.bp_lo);
+                        const std::size_t lo = floor_off(c.bp_lo);
                         const std::size_t hi = ceil_off(c.bp_hi);
-                        if (lo < prev_hi) lo = prev_hi;       // keep monotonic / non-overlapping
                         if (hi <= lo) { ++declined; continue; }
+                        if (!copies.empty() && lo < copies.back().off_hi) {
+                            // Shares the open block: extend it and record the gap since the last copy.
+                            Mapped& blk = copies.back();
+                            if (hi > blk.off_hi) blk.off_hi = hi;
+                            const std::size_t gap_lo = blk.last_bp_hi;
+                            const std::size_t gap_hi = std::max(c.bp_lo, gap_lo);
+                            blk.frag.push_back(snat.substr(gap_lo, gap_hi - gap_lo));
+                            blk.rev.push_back(c.rev);
+                            blk.id.push_back(c.identity);
+                            blk.last_bp_hi = std::max(c.bp_hi, gap_hi);
+                            continue;
+                        }
+                        Mapped blk;
+                        blk.off_lo = lo;
+                        blk.off_hi = hi;
                         const std::size_t range_lo = prefix[lo];
-                        const std::size_t range_hi = prefix[hi];
                         const std::size_t copy_lo = std::max(c.bp_lo, range_lo);
-                        const std::size_t copy_hi = std::min(c.bp_hi, range_hi);
-                        std::string pre, suf;
-                        if (copy_lo > range_lo) pre = snat.substr(range_lo, copy_lo - range_lo);
-                        if (range_hi > copy_hi) suf = snat.substr(copy_hi, range_hi - copy_hi);
-                        copies.push_back({lo, hi, c.rev, c.identity, std::move(pre), std::move(suf)});
-                        prev_hi = hi;
+                        blk.frag.push_back(snat.substr(range_lo, copy_lo - range_lo));
+                        blk.rev.push_back(c.rev);
+                        blk.id.push_back(c.identity);
+                        blk.last_bp_hi = std::min(c.bp_hi, prefix[hi]);
+                        copies.push_back(std::move(blk));
+                    }
+                    // Close each block with the bases between its last copy and the end of its range.
+                    for (Mapped& blk : copies) {
+                        const std::size_t range_hi = prefix[blk.off_hi];
+                        const std::size_t tail_lo = std::min(blk.last_bp_hi, range_hi);
+                        blk.frag.push_back(snat.substr(tail_lo, range_hi - tail_lo));
                     }
                     if (declined > 0) {
                         std::lock_guard<std::mutex> lk(detail_mtx);
@@ -1022,8 +1048,17 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                     std::size_t path_interruptions = 0;
                     std::size_t best_group = 0;
                     {
+                        // Group sizes count COPIES, not blocks: a block sharing one node can hold
+                        // several, and they are adjacent within it by construction.
                         std::size_t gstart = 0;
                         std::size_t ginterrupt = 0;
+                        std::size_t group_copies = 0;
+                        const auto blk_copies = [&](std::size_t a, std::size_t b) {
+                            std::size_t n = 0;
+                            for (std::size_t q = a; q < b; ++q) n += copies[q].n_copies();
+                            return n;
+                        };
+                        (void)group_copies;
                         for (std::size_t k = 0; k < copies.size(); ++k) {
                             if (k > 0) {
                                 const std::size_t gap =
@@ -1034,7 +1069,7 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                                     ? static_cast<double>(ginterrupt + gap) / static_cast<double>(span)
                                     : 0.0;
                                 if (frac > options.max_interruption_frac) {
-                                    best_group = std::max(best_group, k - gstart);
+                                    best_group = std::max(best_group, blk_copies(gstart, k));
                                     path_interruptions += ginterrupt;
                                     gstart = k;
                                     ginterrupt = 0;
@@ -1043,7 +1078,7 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                                 ginterrupt += gap;
                             }
                         }
-                        best_group = std::max(best_group, copies.size() - gstart);
+                        best_group = std::max(best_group, blk_copies(gstart, copies.size()));
                         path_interruptions += ginterrupt;
                     }
                     {
@@ -1087,7 +1122,9 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                 std::size_t max_copies_path = 0;
                 for (const Res& r : results) {
                     if (!r.has) continue;
-                    max_copies_path = std::max(max_copies_path, r.copies.size());
+                    std::size_t nc = 0;
+                    for (const auto& blk : r.copies) nc += blk.n_copies();
+                    max_copies_path = std::max(max_copies_path, nc);
                 }
                 const std::size_t traversing = n_traverse.load();
                 const double prevalence =
@@ -1166,32 +1203,33 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                         for (std::size_t off = prev_hi; off < m.off_lo; ++off) {
                             pa.replacement.push_back(graph.paths[pi].steps[left + off]);
                         }
-                        // Bases inside the replaced range but outside the copy, kept verbatim as their
-                        // own nodes so the haplotype still spells them. Per-occurrence fragments rather
-                        // than a global node split: splitting would force a rewrite of every other path
-                        // through that node, while a fragment is local to this one.
-                        if (!m.pre.empty()) {
-                            pa.replacement.push_back(PathStep{add_new_node(model, m.pre), false});
+                        // fragment, REP, fragment, REP, ... fragment. The fragments carry every base
+                        // in the replaced range that is not inside a copy, verbatim, as
+                        // per-occurrence nodes: nothing outside an accepted copy is lost, and copies
+                        // that share a node are all folded rather than the second one declined.
+                        for (std::size_t ci = 0; ci < m.n_copies(); ++ci) {
+                            if (!m.frag[ci].empty()) {
+                                pa.replacement.push_back(PathStep{add_new_node(model, m.frag[ci]), false});
+                                ++summary.nodes_added;
+                            }
+                            pa.replacement.push_back(PathStep{rep_id, m.rev[ci]});
+                        }
+                        if (!m.frag.back().empty()) {
+                            pa.replacement.push_back(PathStep{add_new_node(model, m.frag.back()), false});
                             ++summary.nodes_added;
                         }
-                        pa.replacement.push_back(PathStep{rep_id, m.rev});
-                        if (!m.suf.empty()) {
-                            pa.replacement.push_back(PathStep{add_new_node(model, m.suf), false});
-                            ++summary.nodes_added;
+                        for (std::size_t ci = 0; ci < m.n_copies(); ++ci) {
+                            orients += (m.rev[ci] ? '-' : '+');
+                            id_sum += m.id[ci];
                         }
-                        for (std::size_t off = m.off_lo; off < m.off_hi; ++off) {
-                            removal_candidates.insert(graph.paths[pi].steps[left + off].node_id);
-                            collapsed_nodes.insert(graph.paths[pi].steps[left + off].node_id);
-                        }
-                        orients += (m.rev ? '-' : '+');
-                        id_sum += m.id;
                         prev_hi = m.off_hi;
                     }
                     pa.length = (left + prev_hi) - pa.start;
                     per_path_arrays[pi].push_back(std::move(pa));
                     ++paths_norm;
 
-                    const std::size_t occ = copies.size();
+                    std::size_t occ = 0;
+                    for (const Mapped& m : copies) occ += m.n_copies();
                     if (min_copies_seen == 0 || occ < min_copies_seen) min_copies_seen = occ;
                     if (occ > max_copies_seen) max_copies_seen = occ;
                     if (unit_bp_report == 0) unit_bp_report = ref_unit.size();

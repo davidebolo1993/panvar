@@ -316,6 +316,38 @@ else
   bad "the end-to-end fixture produced no call-ready CSV"
 fi
 
+# ---------------------------------------------------------------- two copies inside one node
+# Two copies of a 16 bp unit sit in a single 96 bp node, separated by 64 bp. There is no step boundary
+# between them, so mapping each copy to its own containing step range declined the second -- at an
+# array that is a whole repeat unit missing from the copy number. Copies sharing a range are emitted as
+# one block: fragment, REP, fragment, REP, fragment.
+U16="ACGTTGCAACGTTGCA"
+G64="TTTTTTTTGGGGCCCCTTTTTTTTGGGGCCCCTTTTTTTTGGGGCCCCTTTTTTTTGGGGCCCC"
+{ printf 'H\tVN:Z:1.0\n'
+  printf "S\t1\t%s\nS\t2\t%s\nS\t3\t%s%s%s\nS\t4\t%s\n" "$BB1" "$U16" "$U16" "$G64" "$U16" "$BB2"
+  printf 'L\t1\t+\t2\t+\t0M\nL\t2\t+\t2\t+\t0M\nL\t2\t+\t4\t+\t0M\n'
+  printf 'L\t1\t+\t3\t+\t0M\nL\t3\t+\t4\t+\t0M\n'
+  printf 'P\tclean\t1+,2+,2+,4+\t*\nP\tsep\t1+,3+,4+\t*\n'; } > "$OUT/tio.gfa"
+"$BIN" bubble -i "$OUT/tio.gfa" -r clean -o "$OUT/tiob" --min-variant-bp 0 -q >/dev/null 2>&1
+sep_before=$(spell "$OUT/tiob.sorted.gfa" sep)
+"$BIN" panphorte -i "$OUT/tiob.sorted.gfa" -c "$OUT/tiob.bubbles.csv" -o "$OUT/tiop" \
+       --min-similarity 0.90 --min-unit-bp 16 --max-interruption-frac 0.9 --min-array-prevalence 0.5 \
+       -q >/dev/null 2>&1
+[ "$(rep "$OUT/tiop.panphorte.report.tsv" copies_declined_partial_boundary)" = "0" ] \
+  && ok "two copies sharing one node are both folded, neither declined" \
+  || bad "$(rep "$OUT/tiop.panphorte.report.tsv" copies_declined_partial_boundary) copies declined for sharing a node"
+[ "$(rep "$OUT/tiop.panphorte.report.tsv" max_copies)" = "2" ] \
+  && ok "the haplotype's copy number is 2, not 1" \
+  || bad "max_copies is $(rep "$OUT/tiop.panphorte.report.tsv" max_copies), expected 2"
+[ "$(spell "$OUT/tiop.normalized.gfa" sep)" = "$sep_before" ] \
+  && ok "the 64 bp between the two copies survives as a fragment, byte for byte" \
+  || bad "the intervening sequence was lost when both copies were folded"
+# sep must traverse the REP twice with the gap fragment between: REP, frag, REP.
+n=$(awk '$1=="P" && $2=="sep"{print $3}' "$OUT/tiop.normalized.gfa" | tr ',' '\n' | wc -l | tr -d ' ')
+[ "$n" = "5" ] \
+  && ok "sep is anchor, REP, fragment, REP, anchor (5 steps)" \
+  || bad "sep has $n steps, expected 5"
+
 # ---------------------------------------------------------------- the false-zero guard still exists
 # Fragments remove the ordinary decline, but a copy that cannot be bounded by ANY step boundary -- two
 # copies inside one node, so the second has no step to start at -- is still declined. The guard fires
