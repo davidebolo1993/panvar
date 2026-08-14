@@ -33,7 +33,6 @@ The CSV must describe the graph handed in and its sites must be disjoint: a node
 | `--min-array-prevalence <f>` | min fraction of bubble-traversing haplotypes that must carry a ≥`min-copies` array for the bubble to fold; separates a true population TR from a rare/private duplication | `0.5` |
 | `--max-interruption-frac <f>` | max fraction of an array's bp that may be interruptions | `0.25` |
 | `--bubble-id <N>` | restrict to these sites (repeatable); overlap and disjointness are then judged among the selected ones only | all |
-| `--allow-surviving-replaced-route` | accept a run in which a rewritten path's original route is still walkable, so its site is represented twice — folded, and as the branch it replaced | off (refused) |
 | `--threads <N>` | workers for the approximate seed scan/`CN` detection (`0` = auto) | `0` |
 | `--gtf <path>` | after re-sorting, project genes ( `<prefix>.bandage_genes.csv`, needs a PanSN (Pangenome Sequence Naming) `--reference-path`); separate from `bubble --gtf` because collapse, if applicable, renumbers nodes | — |
 | `-q, --quiet` | disable progress/logs | off |

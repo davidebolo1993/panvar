@@ -476,9 +476,10 @@ dupe_arcs() {  # links present in both directions, counted once per pair
 
 # ---------------------------------------------------------------- the replaced route must not survive
 # A link kept because another path needs it is not on its own a defect: at a real array it is the normal
-# case (2009 of them at LPA, where no replaced route survives). What matters is whether the surviving
-# nodes and links still spell the OLD allele end to end -- then the site is represented twice, folded and
-# unfolded, and the re-snarl reports two alleles for one haplotype. Here `stubX` keeps 1+>2+ alive and
+# case -- LPA keeps 2009, because an arc inside the repeat unit is crossed once per copy and folding
+# replaces all but the crossing that falls outside the folded span. What matters is whether the
+# surviving nodes and links still spell the OLD allele end to end -- then the site is represented twice,
+# folded and unfolded, and the re-snarl reports two alleles for one haplotype. Here `stubX` keeps 1+>2+ alive and
 # `stubY` keeps 2+>2+ and 2+>4+, neither crossing the site, so cleanA's original route is fully intact
 # after its rewrite.
 { printf 'H\tVN:Z:1.0\n'
@@ -496,11 +497,9 @@ twin_rc=$?
 [ "$twin_rc" != "0" ] && grep -q "ORIGINAL route" "$OUT/twin.log" \
   && ok "a rewrite whose replaced route stays walkable is refused, naming the paths" \
   || bad "a site folded twice was accepted (exit $twin_rc): $(head -c 120 "$OUT/twin.log")"
-"$BIN" panphorte -i "$OUT/twin.gfa" -c "$OUT/reuse.bubbles.csv" -o "$OUT/twino" \
-       --min-similarity 0.90 --allow-surviving-replaced-route -q >/dev/null 2>&1
-[ -s "$OUT/twino.normalized.gfa" ] \
-  && ok "--allow-surviving-replaced-route accepts it" \
-  || bad "the override did not produce a graph"
+[ -z "$(ls "$OUT"/twinp.* 2>/dev/null)" ] \
+  && ok "and it writes nothing -- there is no override for it" \
+  || bad "the refused run left output behind"
 # The other side of the same rule: the reuse fixture keeps node 2 and one of its arcs alive, so the
 # obsolete-and-live count is non-zero, but the entry and exit arcs go and the old route is broken. It
 # must run, not be refused -- refusing on the arc count alone would block LPA.

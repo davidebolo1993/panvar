@@ -21,10 +21,6 @@ struct PanphorteOptions {
     // Setting this true restores per-copy refusal: more sites fold, at the cost of that false CN on the
     // affected haplotypes. Off by default, and it warns with the counts.
     bool allow_partial_boundary = false;
-    // Accept a run in which a rewritten path's ORIGINAL route is still walkable in the normalized
-    // graph, so the site is represented twice: once folded and once as the branch it replaced. Refused
-    // by default. Does not occur on any of the six reference loci.
-    bool allow_surviving_replaced_route = false;
     std::size_t min_copies = 2;     // minimum tandem copies to normalize
     // Minimum fraction of bubble-traversing haplotypes carrying a >=min_copies array for the bubble to
     // be normalized. Separates a population VNTR (folded) from a rare private duplication of a gene or
@@ -62,12 +58,8 @@ struct PanphorteSummary {
     // Oriented links that only the pre-rewrite paths traversed, dropped so the replaced branch does not
     // survive beside the normalized one.
     std::size_t edges_removed = 0;
-    // Links a replaced span used that some final path still walks elsewhere. A GFA link is global, so
-    // these cannot be dropped without breaking that path. On its own this is not a defect -- 2009 of
-    // them at LPA, where no replaced route survives -- so it is reported, not refused.
-    std::size_t edges_obsolete_still_live = 0;
-    // Rewritten paths whose original route is still walkable end to end. That IS the defect the line
-    // above only hints at, and it is what the run refuses on.
+    // Rewritten paths whose original route is still walkable end to end, so their site would be
+    // represented twice. A hard error; this exists so the count can be stated. Always 0 in practice.
     std::size_t routes_surviving = 0;
     // Set when --reference-path triggers the internal sort + re-snarl.
     bool sorted = false;

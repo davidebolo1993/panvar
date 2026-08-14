@@ -1599,7 +1599,6 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
             to_remove.insert(id);
         }
     }
-    std::vector<std::string> shared_obsolete;   // a few examples, for the error message
     {
         std::vector<std::string> kept_order;
         kept_order.reserve(model.node_order.size());
@@ -1621,23 +1620,18 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
             // An arc only a pre-rewrite path used, between two nodes that both survive for other
             // reasons. Removing the nodes is not enough on its own: the link is what keeps the old
             // route walkable, and the re-snarl reads links, not paths.
+            // A link is dropped only when NO final path walks it. One a rewritten span used that some
+            // path still walks stays: a GFA link is global and deleting it would break that path. At an
+            // array that is ordinary rather than exceptional -- LPA keeps 2009 of them, because an arc
+            // inside the repeat unit is crossed once per copy and folding replaces all but the one
+            // crossing that falls outside the folded span. Whether that matters is not a property of
+            // any single link, so it is not judged here; the acceptance check below asks the question
+            // that does matter.
             const std::string k = EdgeSet::key(e.from, e.from_orient, e.to, e.to_orient);
-            const auto ob = obsolete_edge_keys.find(k);
-            if (ob != obsolete_edge_keys.end()) {
-                if (traversed_edges.find(k) == traversed_edges.end()) {
-                    ++summary.edges_removed;
-                    continue;
-                }
-                // Obsolete HERE and still walked SOMEWHERE. A GFA link is global, so it cannot be
-                // deleted without breaking the path that still needs it, and keeping it may leave the
-                // replaced route reachable at the normalized site -- the very thing the removal exists
-                // to prevent. Separating the two would need the reused context cloned before the
-                // rewrite, so the run refuses instead of shipping a graph it cannot vouch for.
-                ++summary.edges_obsolete_still_live;
-                if (shared_obsolete.size() < 4)
-                    shared_obsolete.push_back(std::string(1, e.from_orient) + e.from + " -> " +
-                                              std::string(1, e.to_orient) + e.to + " (bubble " +
-                                              std::to_string(ob->second) + ")");
+            if (obsolete_edge_keys.find(k) != obsolete_edge_keys.end() &&
+                traversed_edges.find(k) == traversed_edges.end()) {
+                ++summary.edges_removed;
+                continue;
             }
             kept_edges.push_back(e);
         }
@@ -1673,23 +1667,19 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                 if (survivors.size() < 4) survivors.push_back(graph.paths[i].name);
             }
         }
-        if (summary.routes_surviving > 0 && !options.allow_surviving_replaced_route) {
+        // No override. This is an internal invariant, not a choice about how to fold: a graph carrying
+        // the same site both folded and unfolded is wrong for every consumer, and the answer is to fix
+        // whatever produced it, not to accept it. Nothing in the six reference loci reaches it.
+        if (summary.routes_surviving > 0) {
             throw std::runtime_error(
                 "panphorte: " + std::to_string(summary.routes_surviving) +
                 " rewritten path(s) can still be walked along their ORIGINAL route in the normalized "
                 "graph (" + cli::join_with_comma(survivors) +
                 "), so the site is represented twice -- once folded and once as the branch it replaced, "
                 "which the re-snarl will pick up as a second allele. This happens when every node and "
-                "link of the replaced span is also used somewhere else, and separating the two needs "
-                "the reused context cloned before the rewrite, which is not implemented. Rerun with "
-                "--allow-surviving-replaced-route to accept it");
+                "link of the replaced span is also used somewhere else, and separating the two would "
+                "need the reused context cloned before the rewrite, which is not implemented");
         }
-    }
-    if (summary.edges_obsolete_still_live > 0 && !options.quiet) {
-        std::cerr << "[panphorte] " << summary.edges_obsolete_still_live
-                  << " replaced link(s) kept because another path still walks them (e.g. "
-                  << cli::join_with_comma(shared_obsolete)
-                  << "); no rewritten path's original route survives, so none of them is folded twice\n";
     }
 
     // old REP id -> the id it is delivered under. Empty means the ids did not move.

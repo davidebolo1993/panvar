@@ -30,11 +30,6 @@ void print_panphorte_help() {
         << "                                   input; the guard and this override remain for the case\n"
         << "                                   where a haplotype would otherwise reach the site\n"
         << "                                   literally and be read CN 0 while carrying copies\n"
-        << "      --allow-surviving-replaced-route\n"
-        << "                                   Accept a run in which a rewritten path's ORIGINAL route\n"
-        << "                                   is still walkable, so its site is represented twice --\n"
-        << "                                   once folded, once as the branch it replaced. Refused by\n"
-        << "                                   default; does not occur on the reference loci\n"
         << "      --resnarl-min-variant-bp <N> Interior-span filter for the re-snarled call-ready CSV\n"
         << "                                   under --reference-path (default: 50, 0 = keep all)\n"
         << "      --min-copies <N>             Minimum tandem copies to normalize (default: 2)\n"
@@ -110,10 +105,6 @@ int run_panphorte_command(const std::vector<std::string>& args) {
         }
         if (arg == "--allow-partial-boundary") {
             options.allow_partial_boundary = true;
-            continue;
-        }
-        if (arg == "--allow-surviving-replaced-route") {
-            options.allow_surviving_replaced_route = true;
             continue;
         }
         if (arg == "--resnarl-min-variant-bp") {
