@@ -29,7 +29,7 @@ echo "== build a structured cohort + synthetic panel (n=$N, sim=$SIM) =="
 "$PY" "$HERE/make_lpa_phenotype.py" "$COPIES" "$OUT" --n "$N" --sim-markers "$SIM" --kinship-out "$OUT/kinship.tsv"
 
 GENO_GZ="$OUT/geno.sim.bimbam.gz"; GENO="$OUT/geno.sim.bimbam"
-gzcat "$GENO_GZ" > "$GENO"                                   # GEMMA wants a plain BIMBAM
+gunzip -c "$GENO_GZ" > "$GENO"                                   # GEMMA wants a plain BIMBAM
 SAMP="$OUT/sim.samples.txt"; ANNOT="$OUT/feature_annot.sim.tsv.gz"
 
 # GEMMA phenotype (one value/line, sample order, NA kept) + covariates (intercept + Age Sex PC1-3, no NA).

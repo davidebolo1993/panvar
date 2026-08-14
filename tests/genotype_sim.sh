@@ -33,7 +33,7 @@ PFX="$REPO/results/real_data/$LOCUS/bubble/bubble"
 [[ -s "$G" ]] || { echo "no bubble-stage graph for $LOCUS ($G); run scripts/regen_results.sh first"; exit 1; }
 mkdir -p "$OUT"
 
-REF="$(gzcat "$REPO/tests/real_data/$LOCUS.gfa.gz" 2>/dev/null | awk -F'\t' \
+REF="$(gunzip -c "$REPO/tests/real_data/$LOCUS.gfa.gz" 2>/dev/null | awk -F'\t' \
   '($1=="P"||$1=="W"){n=$2; if(n~/[Gg][Rr][Cc]h38/){print n;exit} if(!f)f=n} END{if(f&&!d)print f}' | head -1)"
 
 # bash 3.2 (macOS default) has no mapfile

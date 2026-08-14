@@ -24,7 +24,7 @@ GTFOPT=(); [[ -f "$GTF" ]] && GTFOPT=(--gtf "$GTF")
 
 # pick a reference path: prefer GRCh38, then the first path in the GFA
 ref_of() {
-  gzcat "$1" 2>/dev/null | awk -F'\t' '($1=="P"||$1=="W"){n=$2;
+  gunzip -c "$1" 2>/dev/null | awk -F'\t' '($1=="P"||$1=="W"){n=$2;
     if(n~/[Gg][Rr][Cc]h38/){print n;exit} if(!first)first=n} END{if(first)print first}' | head -1
 }
 

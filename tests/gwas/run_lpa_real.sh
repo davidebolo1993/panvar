@@ -24,7 +24,7 @@ GFA="$REPO/tests/real_data/lpa.gfa.gz"
 REAL="$OUT_DIR/real"
 ASSOC="$OUT_DIR/associate"       # all association outputs (region scan + structure demo) live here
 mkdir -p "$OUT_DIR" "$REAL" "$ASSOC"
-REF="$(gzcat "$GFA" | awk -F'\t' '($1=="P"||$1=="W"){n=$2; if(g==""&&n~/[Gg][Rr][Cc]h38/)g=n; if(f=="")f=n} END{print (g!=""?g:f)}')"
+REF="$(gunzip -c "$GFA" | awk -F'\t' '($1=="P"||$1=="W"){n=$2; if(g==""&&n~/[Gg][Rr][Cc]h38/)g=n; if(f=="")f=n} END{print (g!=""?g:f)}')"
 echo "reference path: $REF ; cohort N=$N ; sim null markers=$SIM"
 
 # --- (reuse or build) the call substrate: graph, bubble prefix, call prefix, copies table -------------

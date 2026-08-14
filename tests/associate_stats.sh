@@ -173,7 +173,7 @@ for cfg in "indep:3" "same:1" "blocks:2"; do
 done
 
 # ------------------------------------------------- input validation
-dup_s="$OUT/dup.samples"; gzcat "$OUT/lin.samples.gz" > "$dup_s"; echo "s1" >> "$dup_s"
+dup_s="$OUT/dup.samples"; gunzip -c "$OUT/lin.samples.gz" > "$dup_s"; echo "s1" >> "$dup_s"
 gzip -cf "$dup_s" > "$dup_s.gz"
 e=$("$BIN" associate --genotypes "$OUT/lin.bimbam.gz" --samples "$dup_s.gz" \
      --phenotype "$OUT/lin.pheno" --min-maf 0 -o "$OUT/dv" --quiet 2>&1 | grep -c "duplicate sample id")

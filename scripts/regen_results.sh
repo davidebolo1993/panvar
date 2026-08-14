@@ -43,7 +43,7 @@ GTFOPT=(); [[ -f "$GTF" ]] && GTFOPT=(--gtf "$GTF")
 
 have_r() { command -v "$RS" >/dev/null 2>&1; }
 ref_of() {  # pick a reference path: prefer GRCh38, then CHM13, else the first path
-  gzcat "$1" 2>/dev/null | awk -F'\t' '($1=="P"||$1=="W"){n=$2; if(n~/[Gg][Rr][Cc]h38/){print n;exit} if(!first)first=n} END{if(first&&!done)print first}' | head -1
+  gunzip -c "$1" 2>/dev/null | awk -F'\t' '($1=="P"||$1=="W"){n=$2; if(n~/[Gg][Rr][Cc]h38/){print n;exit} if(!first)first=n} END{if(first&&!done)print first}' | head -1
 }
 
 # run_region <region> <gfa.gz> <panphorte_extra> <call_graph: bubble|panphorte> <call_extra>
