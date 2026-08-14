@@ -916,7 +916,14 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
             std::size_t approx_partial_paths = 0;      // haplotypes carrying at least one such copy
             double approx_prevalence = 0.0;
             if (ref_unit.size() >= options.min_unit_bp) {
-                struct Mapped { std::size_t off_lo, off_hi; bool rev; double id; };
+                // off_lo/off_hi are the step range CONTAINING the copy; pre/suf are the bases inside
+                // that range which fall outside the copy and must survive verbatim.
+                struct Mapped {
+                    std::size_t off_lo, off_hi;
+                    bool rev;
+                    double id;
+                    std::string pre, suf;
+                };
                 struct Res { bool has = false; std::size_t left = 0; std::vector<Mapped> copies; };
                 std::vector<Res> results(graph.paths.size());
 
@@ -956,28 +963,43 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                         prefix[off + 1] = prefix[off] + (it != node_tok.end() ? it->second.len : 0);
                     }
                     const auto bp_copies = detect_copies_native(snat, ref_unit, options.min_similarity);
-                    // A copy boundary must fall EXACTLY on a node boundary. Rounding to the nearest one
-                    // and replacing whole steps deleted every base between the node edge and the copy
-                    // edge -- sequence outside the copy, which this mode is not licensed to discard.
-                    // Until nodes can be split at aligned boundaries, such a copy is declined rather
-                    // than approximated: an option that emits a graph must not lose bases quietly.
-                    const auto exact_off = [&](std::size_t bp) -> std::optional<std::size_t> {
-                        const auto it = std::lower_bound(prefix.begin(), prefix.end(), bp);
-                        if (it == prefix.end() || *it != bp) return std::nullopt;
-                        return static_cast<std::size_t>(it - prefix.begin());
+                    // A copy boundary rarely lands on a node boundary. Rounding to the nearest one
+                    // and replacing whole steps DELETED the bases between the node edge and the copy
+                    // edge -- sequence outside the copy, which approximate mode may not discard (it may
+                    // drop differences WITHIN a copy; that is a different claim).
+                    //
+                    // Declining those copies instead was worse: a declined copy at a tandem array is a
+                    // whole repeat unit missing from the copy number, and the bases at stake are a
+                    // handful. So the containing step range is taken -- floor for the start, ceiling
+                    // for the end -- and the bases inside it that fall outside the copy are kept as
+                    // literal fragments, emitted around the REP step at rewrite time. Nothing is lost
+                    // and nothing is undercounted.
+                    const auto floor_off = [&](std::size_t bp) {
+                        std::size_t lo = 0;
+                        while (lo + 1 < prefix.size() && prefix[lo + 1] <= bp) ++lo;
+                        return lo;
+                    };
+                    const auto ceil_off = [&](std::size_t bp) {
+                        std::size_t hi = 0;
+                        while (hi < prefix.size() && prefix[hi] < bp) ++hi;
+                        return hi < prefix.size() ? hi : prefix.size() - 1;
                     };
                     std::vector<Mapped> copies;
                     std::size_t prev_hi = 0;
                     std::size_t declined = 0;
                     for (const ApproxCopy& c : bp_copies) {
-                        const auto lo_opt = exact_off(c.bp_lo);
-                        const auto hi_opt = exact_off(c.bp_hi);
-                        if (!lo_opt.has_value() || !hi_opt.has_value()) { ++declined; continue; }
-                        std::size_t lo = *lo_opt;
-                        const std::size_t hi = *hi_opt;
+                        std::size_t lo = floor_off(c.bp_lo);
+                        const std::size_t hi = ceil_off(c.bp_hi);
                         if (lo < prev_hi) lo = prev_hi;       // keep monotonic / non-overlapping
-                        if (hi <= lo) continue;
-                        copies.push_back({lo, hi, c.rev, c.identity});
+                        if (hi <= lo) { ++declined; continue; }
+                        const std::size_t range_lo = prefix[lo];
+                        const std::size_t range_hi = prefix[hi];
+                        const std::size_t copy_lo = std::max(c.bp_lo, range_lo);
+                        const std::size_t copy_hi = std::min(c.bp_hi, range_hi);
+                        std::string pre, suf;
+                        if (copy_lo > range_lo) pre = snat.substr(range_lo, copy_lo - range_lo);
+                        if (range_hi > copy_hi) suf = snat.substr(copy_hi, range_hi - copy_hi);
+                        copies.push_back({lo, hi, c.rev, c.identity, std::move(pre), std::move(suf)});
                         prev_hi = hi;
                     }
                     if (declined > 0) {
@@ -1143,7 +1165,19 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                         for (std::size_t off = prev_hi; off < m.off_lo; ++off) {
                             pa.replacement.push_back(graph.paths[pi].steps[left + off]);
                         }
+                        // Bases inside the replaced range but outside the copy, kept verbatim as their
+                        // own nodes so the haplotype still spells them. Per-occurrence fragments rather
+                        // than a global node split: splitting would force a rewrite of every other path
+                        // through that node, while a fragment is local to this one.
+                        if (!m.pre.empty()) {
+                            pa.replacement.push_back(PathStep{add_new_node(model, m.pre), false});
+                            ++summary.nodes_added;
+                        }
                         pa.replacement.push_back(PathStep{rep_id, m.rev});
+                        if (!m.suf.empty()) {
+                            pa.replacement.push_back(PathStep{add_new_node(model, m.suf), false});
+                            ++summary.nodes_added;
+                        }
                         for (std::size_t off = m.off_lo; off < m.off_hi; ++off) {
                             removal_candidates.insert(graph.paths[pi].steps[left + off].node_id);
                             collapsed_nodes.insert(graph.paths[pi].steps[left + off].node_id);

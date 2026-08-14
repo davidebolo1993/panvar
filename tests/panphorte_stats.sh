@@ -272,19 +272,21 @@ before_flank=$(spell "$OUT/flankb.sorted.gfa" flank)
   || bad "the flanking haplotype lost $(( ${#before_flank} - $(spell "$OUT/flankp.normalized.gfa" flank | wc -c) )) bases"
 # Site-wide, not per copy: folding the rest would leave the site half REP and half literal, and `call`
 # counts REP occurrences -- so the refused haplotype would be reported CN 0 while carrying one copy.
-# The flank haplotype's ONLY copy is unfoldable, so it would reach the site literally while its
-# neighbours use the REP -- that is the false-zero condition, and the site is refused.
-[ "$(rep "$OUT/flankp.panphorte.report.tsv" normalized)" = "no" ] \
-  && ok "a site is refused when a haplotype would be left with no foldable copy" \
-  || bad "the site normalized around a haplotype left entirely literal"
-[ "$(rep "$OUT/flankp.panphorte.report.tsv" status)" = "partial_boundary" ] \
-  && ok "the refusal is reported as partial_boundary" \
-  || bad "status is $(rep "$OUT/flankp.panphorte.report.tsv" status), expected partial_boundary"
+# The copy sits inside a 70 bp node with 3 bp of flank on each side. It folds: the flanks are kept as
+# their own fragment nodes around the REP step, so the haplotype spells exactly what it did before AND
+# reaches the site through the REP node, so its copy number is right. Neither declining the copy (an
+# undercount of a whole repeat unit) nor rounding it away (deleting the flanks) is necessary.
+[ "$(rep "$OUT/flankp.panphorte.report.tsv" normalized)" = "yes" ] \
+  && ok "a copy with flanking bases in its node still folds" \
+  || bad "the copy was not folded, so its haplotype is undercounted by a whole unit"
+[ "$(rep "$OUT/flankp.panphorte.report.tsv" copies_declined_partial_boundary)" = "0" ] \
+  && ok "no copy is declined for a mid-node boundary" \
+  || bad "$(rep "$OUT/flankp.panphorte.report.tsv" copies_declined_partial_boundary) copies declined"
 for h in cleanA cleanB flank; do
   [ "$(spell "$OUT/flankb.sorted.gfa" $h)" = "$(spell "$OUT/flankp.normalized.gfa" $h)" ] \
-    || bad "$h changed sequence at a refused site"
+    || bad "$h lost or gained bases when its copy was folded"
 done
-ok "every haplotype at a refused site keeps its sequence"
+ok "the flanking bases survive as fragments, byte for byte"
 
 # ---------------------------------------------------------------- a refused site is never called CN 0
 # The point of site-wide refusal: a half-REP, half-literal site makes `call` report CN 0 for a
@@ -314,16 +316,26 @@ else
   bad "the end-to-end fixture produced no call-ready CSV"
 fi
 
-# ---------------------------------------------------------------- the refusal is survivable, loudly
-"$BIN" panphorte -i "$OUT/e2eb.sorted.gfa" -c "$OUT/e2eb.bubbles.csv" -o "$OUT/e2eo" \
-       --min-similarity 0.90 --min-array-prevalence 0.5 --allow-partial-boundary \
-       > "$OUT/e2eo.log" 2>&1
-[ "$(rep "$OUT/e2eo.panphorte.report.tsv" normalized)" = "yes" ] \
-  && ok "--allow-partial-boundary folds the site instead of refusing it" \
-  || bad "--allow-partial-boundary did not restore folding"
-grep -q "CN 0" "$OUT/e2eo.log" \
-  && ok "and warns that the affected haplotypes will be called CN 0" \
-  || bad "--allow-partial-boundary folded without warning about the CN consequence"
+# ---------------------------------------------------------------- the false-zero guard still exists
+# Fragments remove the ordinary decline, but a copy that cannot be bounded by ANY step boundary -- two
+# copies inside one node, so the second has no step to start at -- is still declined. The guard fires
+# only if that leaves a haplotype with no foldable copy at all, which is the case that would make
+# `call` read CN 0 while the haplotype carries copies.
+U16="ACGTTGCAACGTTGCA"
+G64="TTTTTTTTGGGGCCCCTTTTTTTTGGGGCCCCTTTTTTTTGGGGCCCCTTTTTTTTGGGGCCCC"
+{ printf 'H\tVN:Z:1.0\n'
+  printf "S\t1\t%s\nS\t2\t%s\nS\t3\t%s%s%s\nS\t4\t%s\n" "$BB1" "$U16" "$U16" "$G64" "$U16" "$BB2"
+  printf 'L\t1\t+\t2\t+\t0M\nL\t2\t+\t2\t+\t0M\nL\t2\t+\t4\t+\t0M\n'
+  printf 'L\t1\t+\t3\t+\t0M\nL\t3\t+\t4\t+\t0M\n'
+  printf 'P\tcleanA\t1+,2+,2+,4+\t*\nP\tcleanB\t1+,2+,2+,4+\t*\nP\tboth\t1+,3+,4+\t*\n'; } \
+  > "$OUT/two_in_one.gfa"
+"$BIN" bubble -i "$OUT/two_in_one.gfa" -r cleanA -o "$OUT/tiob" --min-variant-bp 0 -q >/dev/null 2>&1
+"$BIN" panphorte -i "$OUT/tiob.sorted.gfa" -c "$OUT/tiob.bubbles.csv" -o "$OUT/tiop" \
+       --min-similarity 0.90 --min-unit-bp 16 --min-array-prevalence 0.5 -q >/dev/null 2>&1
+tio_before=$(spell "$OUT/tiob.sorted.gfa" both)
+[ "$(spell "$OUT/tiop.normalized.gfa" both)" = "$tio_before" ] \
+  && ok "a haplotype whose copies cannot be bounded keeps its sequence" \
+  || bad "the unrepresentable haplotype lost bases"
 
 # ---------------------------------------------------------------- REP provenance is emitted
 [ -s "$OUT/cnp.panphorte.rep_provenance.tsv" ] \
