@@ -264,6 +264,54 @@ esac
   && ok "--superbubbles excludes a cycle that runs through a boundary handle" \
   || bad "boundary-handle cycle survived --superbubbles: $(rows "$OUT/bcyc.bubbles.csv") bubbles"
 
+# ---- a graph-only allele when every path takes the deletion -------------------------------------
+# Node 2 is an allele the graph carries and no stored path walks, and every path crosses the site
+# directly source->sink. The endpoint finder rejected adjacent boundaries, so no interval survived --
+# and that interval is what tells the graph-derived search which side of each boundary faces inward.
+# With nothing to seed it, the site produced no bubble at all rather than a bubble with one interior
+# node.
+{ printf 'H\tVN:Z:1.0\n'
+  printf 'S\t1\tAAAAAAAAAA\nS\t2\tCCCCCCCCCC\nS\t3\tGGGGGGGGGG\n'
+  printf 'L\t1\t+\t2\t+\t0M\nL\t2\t+\t3\t+\t0M\nL\t1\t+\t3\t+\t0M\n'
+  printf 'P\tpA\t1+,3+\t*\nP\tpB\t1+,3+\t*\n'; } > "$OUT/gonly.gfa"
+"$BIN" bubble -i "$OUT/gonly.gfa" -r pA -o "$OUT/gonly" --min-variant-bp 0 -q >/dev/null 2>&1
+[ "$(rows "$OUT/gonly.bubbles.csv")" = "1" ] \
+  && ok "a graph-only allele is found when every path takes the direct route" \
+  || bad "expected 1 bubble for the graph-only allele, got $(rows "$OUT/gonly.bubbles.csv")"
+[ "$(cel "$OUT/gonly.bubbles.csv" inside_node_count)" = "1" ] \
+  && ok "the graph-only allele is the interior of that bubble" \
+  || bad "graph-only bubble has inside_node_count $(cel "$OUT/gonly.bubbles.csv" inside_node_count), expected 1"
+[ "$(cel "$OUT/gonly.bubbles.csv" source)" = "1" ] && [ "$(cel "$OUT/gonly.bubbles.csv" sink)" = "3" ] \
+  && ok "the adjacent interval still establishes reference order" \
+  || bad "graph-only bubble is $(cel "$OUT/gonly.bubbles.csv" source)..$(cel "$OUT/gonly.bubbles.csv" sink), expected 1..3"
+
+# ---- --snarls-in resolves the reference the same way the internal door does ----------------------
+# External mode kept the user's spelling, so `-r FULL` for a path named `full` matched nothing: an
+# imported reversed pair stayed reversed and reference allele support read 0, with no error.
+printf '{"start": {"node_id": "3"}, "end": {"node_id": "1"}}\n' > "$OUT/revsnarl.jsonl"
+"$BIN" bubble -i "$OUT/case.gfa" --snarls-in "$OUT/revsnarl.jsonl" -r FULL -o "$OUT/snx" \
+       --min-variant-bp 0 -q >/dev/null 2>&1
+[ "$(cel "$OUT/snx.bubbles.csv" source)" = "1" ] && [ "$(cel "$OUT/snx.bubbles.csv" sink)" = "3" ] \
+  && ok "--snarls-in orients an imported reversed pair from a case-insensitive alias" \
+  || bad "--snarls-in -r FULL gave $(cel "$OUT/snx.bubbles.csv" source)..$(cel "$OUT/snx.bubbles.csv" sink), expected 1..3"
+[ "$(cel "$OUT/snx.bubbles.csv" ref_allele_support)" = "1" ] \
+  && ok "--snarls-in finds the reference allele through an alias" \
+  || bad "--snarls-in -r FULL gave ref_allele_support $(cel "$OUT/snx.bubbles.csv" ref_allele_support), expected 1"
+
+# An ambiguous reference must be an error rather than resolved by file order.
+{ printf 'H\tVN:Z:1.0\n'
+  printf 'S\t1\tAAAAAAAAAA\nS\t2\tCCCCCCCCCC\nS\t3\tGGGGGGGGGG\n'
+  printf 'L\t1\t+\t2\t+\t0M\nL\t2\t+\t3\t+\t0M\nL\t1\t+\t3\t+\t0M\n'
+  printf 'P\tsampleA\t1+,2+,3+\t*\nP\tsampleB\t1+,3+\t*\n'; } > "$OUT/amb.gfa"
+"$BIN" bubble -i "$OUT/amb.gfa" --snarls-in "$OUT/revsnarl.jsonl" -r sample -o "$OUT/amb" \
+       --min-variant-bp 0 -q >/dev/null 2>&1
+[ "$?" -ne 0 ] && ok "--snarls-in refuses an ambiguous reference" \
+               || bad "--snarls-in resolved an ambiguous reference by file order"
+"$BIN" bubble -i "$OUT/amb.gfa" --snarls-in "$OUT/revsnarl.jsonl" -r nope -o "$OUT/amb2" \
+       --min-variant-bp 0 -q >/dev/null 2>&1
+[ "$?" -ne 0 ] && ok "--snarls-in refuses a reference that is not there" \
+               || bad "--snarls-in accepted a reference that does not exist"
+
 echo
 if [ "$fails" -eq 0 ]; then echo "bubble_stats: all assertions passed"; exit 0; fi
 echo "bubble_stats: $fails assertion(s) FAILED"; exit 1

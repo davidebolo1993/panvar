@@ -299,6 +299,11 @@ int run_bubble_command(const std::vector<std::string>& args) {
         if (graph.paths.empty()) {
             throw std::runtime_error("Input GFA has no P/W paths; snarl refinement requires path walks");
         }
+        // The same resolution the internal door does. Without it this mode kept the user's spelling,
+        // so `-r FULL` for a path named `full` matched nothing: an imported reversed pair stayed
+        // reversed and reference allele support read 0, silently.
+        options.reference_path =
+            resolve_reference_path_name(graph, options.reference_path, "bubble");
         // Imported snarl boundaries are an unordered pair and this mode does not sort, so without a
         // reference there is nothing to orient them by: source/sink do not mean reference-left/right,
         // and every consumer that reads them as an interval is then reading a coin flip.

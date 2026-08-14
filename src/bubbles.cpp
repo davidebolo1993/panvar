@@ -432,18 +432,23 @@ void evaluate_endpoint_interval_direction(
     bool source_to_sink,
     std::optional<EndpointOnlyInterval>& best) {
 
-    // Every later endpoint, bounded, for the reason evaluate_direction_candidates gives: where a
-    // boundary recurs the enclosing traversal ends at a later occurrence, and the nearest one closes
-    // an interval holding almost none of the snarl.
+    // Every later endpoint, bounded: where a boundary recurs the enclosing traversal ends at a later
+    // occurrence, and the nearest one closes an interval holding almost none of the snarl. Only the
+    // widest few can ever win, so each start examines at most kMaxEndsPerStart endpoints.
+    //
+    // An ADJACENT pair (end_pos == start_pos + 1) is a real crossing with an empty interior, and it was
+    // rejected here. That looks harmless -- it contributes no interior nodes -- but this interval is
+    // also what tells the graph-derived search which SIDE of each boundary faces inward. With every
+    // stored path taking the direct source->sink route, no interval survived, the graph search was
+    // never seeded, and an alternate allele that exists in the graph produced no bubble at all.
+    // better_endpoint_interval ranks on interior steps first, so an empty interval wins only when
+    // there is nothing else.
     constexpr std::size_t kMaxEndsPerStart = 64;
     for (const std::size_t start_pos : start_positions) {
         const auto first = std::upper_bound(end_positions.begin(), end_positions.end(), start_pos);
         std::size_t examined = 0;
         for (auto it = first; it != end_positions.end() && examined < kMaxEndsPerStart; ++it, ++examined) {
             const std::size_t end_pos = *it;
-            if (end_pos <= start_pos + 1) {
-                continue;
-            }
             EndpointOnlyInterval candidate;
             candidate.left = start_pos;
             candidate.right = end_pos;

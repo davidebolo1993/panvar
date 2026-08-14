@@ -74,6 +74,15 @@ std::unordered_set<std::string> self_loop_nodes(const Graph& graph);
 //
 // `module` prefixes the message. `require_sequences` is for callers that spell or measure bp;
 // `require_zero_overlaps` for callers that concatenate.
+// Resolve a reference path QUERY to an exact path name: exact match, else a unique case-insensitive
+// substring match. Ambiguity and absence are errors, never resolved by file order.
+//
+// Every consumer compares path names exactly, so a module that accepts a loose query and then passes
+// the QUERY on has silently resolved nothing: boundaries come back unoriented, reference allele support
+// reads 0, and nothing says so. Resolve once, at the edge, and pass the resolved name inward.
+std::string resolve_reference_path_name(const Graph& graph, const std::string& query,
+                                        const std::string& module);
+
 void validate_graph_paths(const Graph& graph, const std::string& module,
                           bool require_sequences, bool require_zero_overlaps);
 

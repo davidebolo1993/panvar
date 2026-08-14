@@ -1,5 +1,7 @@
 #include "panvar/graph_utils.hpp"
 
+#include <cctype>
+
 #include <algorithm>
 #include <cstdint>
 #include <stdexcept>
@@ -131,6 +133,31 @@ std::unordered_set<std::string> self_loop_nodes(const Graph& graph) {
         if (loop) out.insert(id);
     }
     return out;
+}
+
+std::string resolve_reference_path_name(const Graph& graph, const std::string& query,
+                                        const std::string& module) {
+    if (query.empty()) return query;
+    for (const PathRecord& p : graph.paths) {
+        if (p.name == query) return p.name;
+    }
+    const auto lower = [](std::string t) {
+        std::transform(t.begin(), t.end(), t.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return t;
+    };
+    const std::string q = lower(query);
+    std::vector<std::string> hits;
+    for (const PathRecord& p : graph.paths) {
+        if (lower(p.name).find(q) != std::string::npos) hits.push_back(p.name);
+    }
+    if (hits.size() == 1) return hits[0];
+    if (hits.empty()) {
+        throw std::runtime_error(module + ": reference path not found: " + query);
+    }
+    std::string msg = module + ": reference path ambiguous: " + query + " matches:";
+    for (const std::string& h : hits) msg += "\n  " + h;
+    throw std::runtime_error(msg);
 }
 
 void validate_graph_paths(const Graph& graph, const std::string& module,
