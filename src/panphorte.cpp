@@ -8,6 +8,7 @@
 #include "panvar/gfa_io.hpp"
 #include "panvar/graph_sort.hpp"
 #include "panvar/graph_utils.hpp"
+#include "panvar/gtf.hpp"
 #include "panvar/integrated_snarls.hpp"
 #include "panvar/output.hpp"
 #include "panvar/parallel.hpp"
@@ -788,6 +789,26 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                 "panphorte: the bubbles CSV describes nodes the GFA does not contain (" +
                 cli::join_with_comma(missing) + "); the CSV and the graph are not the same graph");
     }
+    // Sites are meant to be disjoint. Two that share interior nodes describe the same sequence twice,
+    // and folding both rewrites one span inside another -- the same array folded at two scales, which
+    // the acceptance check later catches as overlapping edits, but only after every haplotype has been
+    // aligned. Caught here instead, naming the pair, since the input is what has to be fixed.
+    {
+        std::unordered_map<std::string, std::size_t> owner;
+        for (const Bubble& b : bubbles) {
+            for (const std::string& n : b.inside) {
+                const auto it = owner.find(n);
+                if (it != owner.end()) {
+                    throw std::runtime_error(
+                        "panphorte: bubbles " + std::to_string(it->second) + " and " +
+                        std::to_string(b.id) + " both claim interior node " + n +
+                        "; overlapping sites describe the same sequence twice and folding both would "
+                        "rewrite one span inside the other");
+                }
+                owner.emplace(n, b.id);
+            }
+        }
+    }
     std::unordered_set<std::size_t> bubble_filter(options.bubble_ids.begin(), options.bubble_ids.end());
 
     const std::unordered_map<std::string, NodeTok> node_tok = build_node_tokens(graph);
@@ -809,11 +830,18 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
     // What each REP node stands for. Two phase-rotated units at one site cannot share an unsplit node
     // while exact spelling is preserved, so they become separate REP nodes -- and without this table a
     // consumer counting REP occurrences sees two independent DUPs instead of one site's copy number.
-    // The ids here are the ones panphorte created; under --reference-path the sort renumbers them, so
-    // a consumer must map through the sorted graph.
-    std::ofstream prov(staged.stage(options.out_prefix + ".panphorte.rep_provenance.tsv"));
-    if (!prov) throw std::runtime_error("panphorte: cannot write the REP provenance table");
-    prov << "rep_node\tinput_bubble_id\tcanonical_motif\tphase_unit\tunit_bp\tcopy_quantum\n";
+    //
+    // Buffered rather than streamed, because the id a REP is created with is not the id it is delivered
+    // under: --reference-path renumbers the graph, so a table written during the loop named nodes that
+    // do not exist in the GFA beside it and could not be joined to anything. Both ids are emitted --
+    // created_rep_node for the input-side numbering, output_rep_node for the delivered graph.
+    struct ProvRecord {
+        std::string created_node;
+        std::size_t bubble_id = 0;
+        std::string canonical_motif;
+        std::string phase_unit;
+    };
+    std::vector<ProvRecord> provenance;
 
     std::ofstream copies_out;
     if (approximate) {
@@ -837,7 +865,25 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
     // one.
     std::unordered_map<std::string, std::string> rep_by_unit; // "<bubble>\t<canonical unit>" -> node
     std::unordered_set<std::string> removal_candidates;
+    // Oriented links a path traversed across a span this run replaced. A replaced node that survives
+    // because some other site still uses it would otherwise keep its old arcs, so the branch the
+    // rewrite was supposed to normalize away stays reachable in the delivered graph.
+    std::unordered_set<std::string> obsolete_edge_keys;
     std::vector<std::vector<PathArray>> per_path_arrays(graph.paths.size());
+
+    // Every consecutive pair the ORIGINAL path walks across [lo, hi), plus the arcs into and out of the
+    // span: those are the ones the replacement is meant to supersede.
+    const auto record_replaced_span = [&](const PathRecord& p, std::size_t lo, std::size_t hi) {
+        if (p.steps.empty()) return;
+        const std::size_t first = lo == 0 ? 1 : lo;
+        const std::size_t last = std::min(hi + 1, p.steps.size());
+        for (std::size_t k = first; k < last; ++k) {
+            obsolete_edge_keys.insert(EdgeSet::key(p.steps[k - 1].node_id,
+                                                   orient_char(p.steps[k - 1].reverse),
+                                                   p.steps[k].node_id,
+                                                   orient_char(p.steps[k].reverse)));
+        }
+    };
 
     PanphorteSummary summary;
     std::ofstream report(staged.stage(options.out_prefix + ".panphorte.report.tsv"));
@@ -1187,8 +1233,8 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                             rep_id = add_new_node(model, ref_unit);
                             rep_by_unit.emplace(rep_key, rep_id);
                             ++summary.nodes_added;
-                            prov << rep_id << '\t' << bubble.id << '\t' << canonical_motif_key(ref_unit)
-                                 << '\t' << ref_unit << '\t' << ref_unit.size() << '\t' << 1 << '\n';
+                            provenance.push_back(
+                                ProvRecord{rep_id, bubble.id, canonical_motif_key(ref_unit), ref_unit});
                         } else {
                             rep_id = rit->second;
                         }
@@ -1211,13 +1257,27 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                             if (!m.frag[ci].empty()) {
                                 pa.replacement.push_back(PathStep{add_new_node(model, m.frag[ci]), false});
                                 ++summary.nodes_added;
+                                ++summary.fragment_nodes_added;
                             }
                             pa.replacement.push_back(PathStep{rep_id, m.rev[ci]});
                         }
                         if (!m.frag.back().empty()) {
                             pa.replacement.push_back(PathStep{add_new_node(model, m.frag.back()), false});
                             ++summary.nodes_added;
+                            ++summary.fragment_nodes_added;
                         }
+                        // The steps this block replaces are gone from the path. Marking them (and the
+                        // arcs across them) makes them candidates for removal; whether they actually
+                        // go is decided globally, since another site may still use them. Without this
+                        // the approximate branch left every replaced node and link in the graph beside
+                        // its own normalized route -- a dead branch the re-snarl then picked up -- and
+                        // reported nodes_collapsed=0 while doing it.
+                        for (std::size_t off = m.off_lo; off < m.off_hi; ++off) {
+                            const std::string& nid = graph.paths[pi].steps[left + off].node_id;
+                            removal_candidates.insert(nid);
+                            collapsed_nodes.insert(nid);
+                        }
+                        record_replaced_span(graph.paths[pi], left + m.off_lo, left + m.off_hi);
                         for (std::size_t ci = 0; ci < m.n_copies(); ++ci) {
                             orients += (m.rev[ci] ? '-' : '+');
                             id_sum += m.id[ci];
@@ -1348,8 +1408,8 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                     rep_id = add_new_node(model, canonical);
                     rep_by_unit.emplace(rep_key, rep_id);
                     ++summary.nodes_added;
-                    prov << rep_id << '\t' << bubble.id << '\t' << canonical_motif_key(unit) << '\t'
-                         << canonical << '\t' << canonical.size() << '\t' << 1 << '\n';
+                    provenance.push_back(
+                        ProvRecord{rep_id, bubble.id, canonical_motif_key(unit), canonical});
                 } else {
                     rep_id = rit->second;
                 }
@@ -1371,6 +1431,7 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                         removal_candidates.insert(graph.paths[pi].steps[s].node_id);
                         collapsed_nodes.insert(graph.paths[pi].steps[s].node_id);
                     }
+                    record_replaced_span(graph.paths[pi], r.first, r.second);
                 }
                 if (min_copies_seen == 0 || arr.copies < min_copies_seen) min_copies_seen = arr.copies;
                 if (arr.copies > max_copies_seen) max_copies_seen = arr.copies;
@@ -1501,9 +1562,20 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
 
     // Remove collapsed nodes no longer referenced by any path; drop their edges.
     std::unordered_set<std::string> referenced;
+    // The arcs the FINAL paths walk. An oriented link is one arc read from either end, so a step pair
+    // b-,a- traverses the stored a+>b+; missing the dual would delete live links.
+    std::unordered_set<std::string> traversed_edges;
     for (const GfaPath& p : model.paths) {
         for (const PathStep& s : p.steps) {
             referenced.insert(s.node_id);
+        }
+        for (std::size_t k = 1; k < p.steps.size(); ++k) {
+            const PathStep& a = p.steps[k - 1];
+            const PathStep& b = p.steps[k];
+            traversed_edges.insert(
+                EdgeSet::key(a.node_id, orient_char(a.reverse), b.node_id, orient_char(b.reverse)));
+            traversed_edges.insert(
+                EdgeSet::key(b.node_id, orient_char(!b.reverse), a.node_id, orient_char(!a.reverse)));
         }
     }
     std::unordered_set<std::string> to_remove;
@@ -1512,7 +1584,7 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
             to_remove.insert(id);
         }
     }
-    if (!to_remove.empty()) {
+    {
         std::vector<std::string> kept_order;
         kept_order.reserve(model.node_order.size());
         for (const std::string& id : model.node_order) {
@@ -1527,12 +1599,28 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
         std::vector<GfaEdge> kept_edges;
         kept_edges.reserve(model.edges.size());
         for (const GfaEdge& e : model.edges) {
-            if (to_remove.find(e.from) == to_remove.end() && to_remove.find(e.to) == to_remove.end()) {
-                kept_edges.push_back(e);
+            if (to_remove.find(e.from) != to_remove.end() || to_remove.find(e.to) != to_remove.end()) {
+                continue;
             }
+            // An arc only a pre-rewrite path used, between two nodes that both survive for other
+            // reasons. Removing the nodes is not enough on its own: the link is what keeps the old
+            // route walkable, and the re-snarl reads links, not paths.
+            const std::string k = EdgeSet::key(e.from, e.from_orient, e.to, e.to_orient);
+            const std::string dual = EdgeSet::key(e.to, e.to_orient == '+' ? '-' : '+', e.from,
+                                                  e.from_orient == '+' ? '-' : '+');
+            if (obsolete_edge_keys.find(k) != obsolete_edge_keys.end() &&
+                traversed_edges.find(k) == traversed_edges.end() &&
+                traversed_edges.find(dual) == traversed_edges.end()) {
+                ++summary.edges_removed;
+                continue;
+            }
+            kept_edges.push_back(e);
         }
         model.edges = std::move(kept_edges);
     }
+
+    // old REP id -> the id it is delivered under. Empty means the ids did not move.
+    std::unordered_map<std::string, std::string> rep_id_remap;
 
     // When a reference is given we make the output call-ready with no external tools: internally
     // sort+flip along the reference (placing the appended REP nodes into reference order) and
@@ -1550,6 +1638,7 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
         // bubbles came back reversed with ref_allele_support 0.
         const GraphSortResult sort_result = sort_graph_reference(model, sort_opts);
         const std::string resolved_reference = sort_result.resolved_reference;
+        rep_id_remap = sort_result.id_remap;
 
         const std::string sorted_gfa = staged.stage(options.out_prefix + ".normalized.sorted.gfa");
         write_gfa_model(sorted_gfa, model);
@@ -1597,13 +1686,44 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
         write_bandage_node_colors_csv(staged.stage(options.out_prefix + ".bandage_nodes.csv"),
                                       report.bubbles, report.non_snp_bubbles);
 
+        // Gene annotation belongs inside the transaction. Run by the caller after this function
+        // returned, a malformed GTF failed with the whole normalized family already on disk -- so the
+        // one output family the staging exists to keep whole was not whole.
+        if (!options.gtf_path.empty()) {
+            summary.genes_written = emit_gene_annotation(
+                sorted_graph, resolved_reference, options.gtf_path,
+                staged.stage(options.out_prefix + ".bandage_genes.csv"));
+        }
+
         summary.sorted = true;
         summary.resnarled_bubbles = report.bubbles.size();
     }
 
-    // Everything succeeded: move the family into place.
-    report.flush();
-    if (copies_out.is_open()) copies_out.flush();
+    // The REP ids, mapped through the sort so they name nodes in the graph delivered beside this file.
+    {
+        std::ofstream prov(staged.stage(options.out_prefix + ".panphorte.rep_provenance.tsv"));
+        if (!prov) throw std::runtime_error("panphorte: cannot write the REP provenance table");
+        prov << "created_rep_node\toutput_rep_node\tinput_bubble_id\tcanonical_motif\tphase_unit\t"
+                "unit_bp\tcopy_quantum\n";
+        for (const ProvRecord& r : provenance) {
+            const auto it = rep_id_remap.find(r.created_node);
+            const std::string out_id = it == rep_id_remap.end() ? r.created_node : it->second;
+            prov << r.created_node << '\t' << out_id << '\t' << r.bubble_id << '\t'
+                 << r.canonical_motif << '\t' << r.phase_unit << '\t' << r.phase_unit.size() << '\t'
+                 << 1 << '\n';
+        }
+        prov.close();
+        if (!prov) throw std::runtime_error("panphorte: failed to write the REP provenance table");
+    }
+
+    // Everything succeeded: move the family into place. Closed and checked, not just flushed -- a
+    // failure that surfaces on close would otherwise be committed as a complete file.
+    report.close();
+    if (!report) throw std::runtime_error("panphorte: failed to write the report table");
+    if (copies_out.is_open()) {
+        copies_out.close();
+        if (!copies_out) throw std::runtime_error("panphorte: failed to write the copies table");
+    }
     staged.commit();
 
     if (summary_out != nullptr) {

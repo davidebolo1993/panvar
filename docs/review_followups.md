@@ -114,6 +114,33 @@ as history; Git already provides that history.
   output that was not installed. Either commit the graph first and clearly mark audit failure, or add a
   small manifest/transaction protocol that makes the pair's final disposition unambiguous.
 
+## Refine
+
+### Biological validation debt
+
+- **Add the defining before/after `call` fixture.** The structural contracts are now well covered, but
+  there is still no end-to-end example in which a reproducible graph-builder artifact calls as a split
+  `INS`+`DEL` before refinement and as the intended clean event afterwards. Build this on a realistic
+  pggb-style artifact and assert the exact records on both sides; that is the test that demonstrates the
+  module's biological purpose rather than only its losslessness and graph validity.
+- **Measure the stricter POA guards on every real locus.** `--max-poa-bp` now uses the longest allele and
+  `--max-poa-work` independently bounds total distinct-sequence work, which is the honest resource
+  contract. Record how many regions each guard skips on the six reference loci so safer accounting is
+  not mistaken for unchanged refinement coverage.
+
+### Documentation and portability cleanup
+
+- **Repair the module page's options/output tables.** `docs/modules/refine.md` currently has output rows
+  spliced into the `--max-poa-bp` option row, leaving both sections malformed. Also tighten the oriented
+  traversal sentence in the algorithm page and document the final `--max-poa-work` and partial-path
+  decision/report semantics in one coherent table.
+- **Close and check staged streams before committing.** The report stream is flushed but remains open
+  when `StagedOutputs::commit()` renames the family. This works on Unix but is not portable to platforms
+  that refuse renaming open files, and `flush()` alone does not turn a late write failure into an error.
+- **Declare `PANVAR_SLOW_TESTS` as a CMake option.** It currently works as an undeclared cache variable.
+  Add an `option(...)` with help text and a default, and make clear that the default build must be
+  reconfigured before the rebuild test can be selected explicitly.
+
 ## Inspect
 
 ### Clustering accuracy and scale

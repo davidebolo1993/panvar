@@ -37,6 +37,10 @@ struct PanphorteOptions {
     // <prefix>.bubbles.csv so `call` can run with no external tools.
     std::string reference_path;
     bool no_flip = false;
+    // Reference-coordinate GTF projected onto the sorted normalized graph. Handled here rather than by
+    // the caller so the gene annotation is part of the same staged transaction as everything else: run
+    // afterwards it could fail with the normalized family already on disk.
+    std::string gtf_path;
     bool quiet = false;
 };
 
@@ -46,10 +50,18 @@ struct PanphorteSummary {
     std::size_t paths_rewritten = 0;
     std::size_t nodes_removed = 0;
     std::size_t nodes_added = 0;
+    // Of nodes_added, the per-occurrence fragments emitted around an accepted copy (the bases inside
+    // the replaced step range that fall outside the copy). One array with thousands of copies can add
+    // thousands of these, so the growth they account for is reported on its own.
+    std::size_t fragment_nodes_added = 0;
     std::size_t edges_added = 0;
+    // Oriented links that only the pre-rewrite paths traversed, dropped so the replaced branch does not
+    // survive beside the normalized one.
+    std::size_t edges_removed = 0;
     // Set when --reference-path triggers the internal sort + re-snarl.
     bool sorted = false;
     std::size_t resnarled_bubbles = 0;
+    bool genes_written = false;
 };
 
 void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summary_out = nullptr);

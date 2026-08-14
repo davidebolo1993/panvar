@@ -23,6 +23,13 @@ bad() { printf "  FAIL %s\n" "$1"; fails=$((fails + 1)); }
 # value of <column> in the first data row of the report
 rep() { awk -F'\t' -v w="$2" 'NR==1{for(i=1;i<=NF;i++)c[$i]=i;next} NR==2{print $(c[w])}' "$1"; }
 pline() { awk -v p="$2" '$1=="P" && $2==p {print $3}' "$1"; }
+# value of a FORMAT key for one sample in the first data record of a VCF. CN is a FORMAT field, so
+# grepping for the literal "CN=0" can never find a zero-copy sample and the assertion passes vacuously.
+fmt() { awk -F'\t' -v s="$2" -v k="$3" '
+  /^#CHROM/ {for (i = 10; i <= NF; i++) if ($i == s) col = i; next}
+  /^#/ {next}
+  col && !done {split($9, f, ":"); for (i in f) if (f[i] == k) j = i;
+                split($col, v, ":"); print v[j]; done = 1}' "$1"; }
 
 UNIT="ACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCA"   # 64 bp
 BB1="$(head -c 2000 /dev/zero | tr '\0' 'A')"
@@ -253,10 +260,10 @@ G64="TTTTTTTTGGGGCCCCTTTTTTTTGGGGCCCCTTTTTTTTGGGGCCCCTTTTTTTTGGGGCCCC"
   || bad "interruptions_bp is $(rep "$OUT/g9.panphorte.report.tsv" interruptions_bp), expected 64"
 
 # ---------------------------------------------------------------- approximate mode: partial boundaries
-# A copy whose boundary falls inside a node cannot be folded without splitting that node, and rounding
-# to the nearest boundary DELETES the bases between the node edge and the copy edge -- sequence outside
-# the copy. Until splitting exists the copy is declined, so the haplotype keeps its original nodes and
-# spells exactly what it spelled before.
+# A copy boundary rarely lands on a node edge, and rounding to the nearest one DELETES the bases between
+# the node edge and the copy edge -- sequence outside the copy. The copy is folded anyway: the whole
+# containing step range is replaced and those outside bases come back as fragment nodes around the REP
+# step, so the haplotype spells exactly what it spelled before AND its copy is counted.
 { printf 'H\tVN:Z:1.0\n'
   printf "S\t1\t%s\nS\t2\t%s\nS\t3\tTTT%sGGG\nS\t4\t%s\n" "$BB1" "$UNIT" "$UNIT" "$BB2"
   printf 'L\t1\t+\t2\t+\t0M\nL\t2\t+\t2\t+\t0M\nL\t2\t+\t4\t+\t0M\n'
@@ -268,14 +275,10 @@ before_flank=$(spell "$OUT/flankb.sorted.gfa" flank)
 "$BIN" panphorte -i "$OUT/flankb.sorted.gfa" -c "$OUT/flankb.bubbles.csv" -o "$OUT/flankp" \
        --min-similarity 0.90 --min-array-prevalence 0.5 -q >/dev/null 2>&1
 [ "$(spell "$OUT/flankp.normalized.gfa" flank)" = "$before_flank" ] \
-  && ok "a copy with a mid-node boundary is declined, not truncated to the node edge" \
+  && ok "a copy with a mid-node boundary is not truncated to the node edge" \
   || bad "the flanking haplotype lost $(( ${#before_flank} - $(spell "$OUT/flankp.normalized.gfa" flank | wc -c) )) bases"
-# Site-wide, not per copy: folding the rest would leave the site half REP and half literal, and `call`
-# counts REP occurrences -- so the refused haplotype would be reported CN 0 while carrying one copy.
-# The copy sits inside a 70 bp node with 3 bp of flank on each side. It folds: the flanks are kept as
-# their own fragment nodes around the REP step, so the haplotype spells exactly what it did before AND
-# reaches the site through the REP node, so its copy number is right. Neither declining the copy (an
-# undercount of a whole repeat unit) nor rounding it away (deleting the flanks) is necessary.
+# The copy sits inside a 70 bp node with 3 bp of flank on each side. Neither declining it (an undercount
+# of a whole repeat unit) nor rounding it away (deleting the flanks) is necessary.
 [ "$(rep "$OUT/flankp.panphorte.report.tsv" normalized)" = "yes" ] \
   && ok "a copy with flanking bases in its node still folds" \
   || bad "the copy was not folded, so its haplotype is undercounted by a whole unit"
@@ -288,9 +291,12 @@ for h in cleanA cleanB flank; do
 done
 ok "the flanking bases survive as fragments, byte for byte"
 
-# ---------------------------------------------------------------- a refused site is never called CN 0
-# The point of site-wide refusal: a half-REP, half-literal site makes `call` report CN 0 for a
-# haplotype that carries a copy. End to end, through call --cn, no such record may appear.
+# ---------------------------------------------------------------- no carrier is ever called CN 0
+# The condition the whole boundary policy exists to prevent: a half-REP, half-literal site makes `call`
+# read CN 0 for a haplotype that carries a copy, because copy number is counted from REP occurrences.
+# `flank` carries exactly one copy, inside a node with 3 bp on each side, so its CN must be 1.
+# Also the topology check: the nodes the rewrite replaced must be GONE from the delivered graph, not
+# left beside the normalized route as a dead branch for the re-snarl to pick up.
 { printf 'H\tVN:Z:1.0\n'
   printf "S\t1\t%s\nS\t2\t%s\nS\t5\t%s\nS\t3\tTTT%sGGG\nS\t4\t%s\n" \
          "$BB1" "$UNIT" "$UNIT" "$UNIT" "$BB2"
@@ -306,14 +312,114 @@ if [ -s "$OUT/e2ep.bubbles.csv" ]; then
   "$BIN" call -i "$OUT/e2ep.normalized.sorted.gfa" -b "$OUT/e2ep" -r cleanA -o "$OUT/e2ec" --cn \
          -q >/dev/null 2>&1
   if [ -f "$OUT/e2ec.region.vcf" ]; then
-    [ "$(grep -c 'CN=0' "$OUT/e2ec.region.vcf")" = "0" ] \
-      && ok "a site refused for a partial boundary yields no CN=0 call" \
-      || bad "call reports CN=0 for a haplotype that carries a copy: $(grep -m1 'CN=0' "$OUT/e2ec.region.vcf" | cut -c1-80)"
+    e2e_cn=$(fmt "$OUT/e2ec.region.vcf" flank CN)
+    [ -n "$e2e_cn" ] && [ "$e2e_cn" -ge 1 ] \
+      && ok "a haplotype carrying one copy is called CN $e2e_cn, not 0" \
+      || bad "call reports CN '$e2e_cn' for a haplotype that carries a copy"
   else
-    bad "call produced no region VCF for the refused site"
+    bad "call produced no region VCF"
   fi
 else
   bad "the end-to-end fixture produced no call-ready CSV"
+fi
+
+# Every node the delivered paths walk must exist, every adjacency must have a link, and no segment may
+# be left that no path visits: the approximate rewrite used to mark nothing for removal, so the replaced
+# nodes and their links survived beside the REP route and the re-snarl swallowed them back in.
+awk -v out="$OUT" '
+  $1 == "S" {seg[$2] = 1}
+  $1 == "L" {link[$2 "" $3 ">" $4 "" $5] = 1}
+  $1 == "P" {n = split($3, st, ","); for (i = 1; i <= n; i++) {
+               node = substr(st[i], 1, length(st[i]) - 1); o = substr(st[i], length(st[i]))
+               used[node] = 1
+               if (!(node in seg)) absent++
+               if (i > 1) {
+                 fo = (po == "+") ? "-" : "+"; ro = (o == "+") ? "-" : "+"
+                 if (!((pn "" po ">" node "" o) in link) && !((node "" ro ">" pn "" fo) in link)) dangling++
+               }
+               pn = node; po = o }}
+  END {for (s in seg) if (!(s in used)) orphan++
+       printf "%d %d %d\n", absent + 0, dangling + 0, orphan + 0}' \
+  "$OUT/e2ep.normalized.sorted.gfa" > "$OUT/e2e.topo"
+read -r e2e_absent e2e_dangling e2e_orphan < "$OUT/e2e.topo"
+[ "$e2e_absent" = "0" ] && [ "$e2e_dangling" = "0" ] \
+  && ok "the normalized graph has no absent node and no dangling adjacency" \
+  || bad "normalized graph: $e2e_absent absent nodes, $e2e_dangling adjacencies with no link"
+[ "$e2e_orphan" = "0" ] \
+  && ok "no replaced node survives in the delivered graph" \
+  || bad "$e2e_orphan replaced node(s) left behind, so the old branch survives beside the REP route"
+[ "$(rep "$OUT/e2ep.panphorte.report.tsv" nodes_collapsed)" != "0" ] \
+  && ok "nodes_collapsed counts the nodes the rewrite replaced" \
+  || bad "nodes_collapsed is 0 although the rewrite replaced nodes"
+# The re-snarled site must be exactly the normalized route -- fragment, REP, fragment -- with no extra
+# interior node standing for the branch the rewrite was supposed to remove.
+e2e_inside=$(awk -F',' 'NR==2{print $6}' "$OUT/e2ep.bubbles.csv")
+[ "$e2e_inside" = "3" ] \
+  && ok "the re-snarled bubble holds only the normalized route (3 interior nodes)" \
+  || bad "the re-snarled bubble has $e2e_inside interior nodes, so a dead branch was picked up"
+
+# ---------------------------------------------------------------- overlapping sites are refused
+# Two bubbles claiming the same interior describe one piece of sequence twice, and folding both rewrites
+# one span inside the other -- the same array folded at two scales. The acceptance check catches it, but
+# only after every haplotype has been aligned, so the input is rejected up front instead. This is not
+# hypothetical: `bubble` emits such a pair at ANKRD36C, where a site enclosing all ten others normalized
+# with the same 5616 bp unit as the site inside it.
+{ printf 'bubble_id,source,source_orient,sink,sink_orient,inside_node_count,total_node_count,'
+  printf 'path_support,distinct_alleles,ref_allele_support,alt_allele_support_max,'
+  printf 'alt_allele_support_min,min_inside_bp,max_inside_bp,inside_nodes\n'
+  printf '1,1,+,4,+,2,4,3,2,2,1,1,64,70,"2;5"\n'
+  printf '2,1,+,4,+,2,4,3,2,2,1,1,64,70,"5;3"\n'; } > "$OUT/nested.bubbles.csv"
+"$BIN" panphorte -i "$OUT/e2e.gfa" -c "$OUT/nested.bubbles.csv" -o "$OUT/nestedp" \
+       --min-similarity 0.90 -q > "$OUT/nested.log" 2>&1
+nested_rc=$?
+[ "$nested_rc" != "0" ] && grep -q "both claim interior node" "$OUT/nested.log" \
+  && ok "two bubbles claiming the same interior node are refused, naming both" \
+  || bad "overlapping sites were accepted (exit $nested_rc): $(head -1 "$OUT/nested.log")"
+[ -z "$(ls "$OUT"/nestedp.* 2>/dev/null)" ] \
+  && ok "the refused run writes nothing" \
+  || bad "the refused run left output behind"
+
+# ---------------------------------------------------------------- a replaced node that survives
+# A node the rewrite replaced HERE may still be walked somewhere else, so it stays -- but its arcs at
+# this site do not. Removing the node is not enough on its own: the link is what keeps the old route
+# walkable, and the re-snarl reads links, not paths. `flank2` walks node 2 downstream of the bubble, so
+# 2 survives while 1+>2+, 2+>2+ and 2+>4+ must all go.
+{ printf 'H\tVN:Z:1.0\n'
+  printf "S\t1\t%s\nS\t2\t%s\nS\t3\tTTT%sGGG\nS\t4\t%s\nS\t5\t%s\nS\t6\t%s\n" \
+         "$BB1" "$UNIT" "$UNIT" "$BB2" "$BB1" "$BB2"
+  for e in "1 2" "2 2" "2 4" "1 3" "3 4" "4 5" "5 2" "2 6" "5 6"; do
+    set -- $e; printf "L\t%s\t+\t%s\t+\t0M\n" "$1" "$2"
+  done
+  printf 'P\tcleanA\t1+,2+,2+,4+,5+,6+\t*\nP\tcleanB\t1+,2+,2+,4+,5+,6+\t*\n'
+  printf 'P\tflank2\t1+,3+,4+,5+,2+,6+\t*\n'; } > "$OUT/reuse.gfa"
+# Hand-written CSV: run through `bubble` the reused node drags the whole graph into one snarl, and the
+# point here is a site whose replaced node is walked OUTSIDE it.
+{ printf 'bubble_id,source,source_orient,sink,sink_orient,inside_node_count,total_node_count,'
+  printf 'path_support,distinct_alleles,ref_allele_support,alt_allele_support_max,'
+  printf 'alt_allele_support_min,min_inside_bp,max_inside_bp,inside_nodes\n'
+  printf '1,1,+,4,+,2,4,3,2,2,1,1,64,70,"2;3"\n'; } > "$OUT/reuse.bubbles.csv"
+"$BIN" panphorte -i "$OUT/reuse.gfa" -c "$OUT/reuse.bubbles.csv" -o "$OUT/reusep" \
+       --min-similarity 0.90 --min-array-prevalence 0.5 -q >/dev/null 2>&1
+if [ -s "$OUT/reusep.normalized.gfa" ]; then
+  grep -q '^S	2	' "$OUT/reusep.normalized.gfa" \
+    && ok "a replaced node still walked elsewhere is kept" \
+    || bad "a node another path still walks was removed"
+  stale=0
+  for l in '1	+	2	+' '2	+	2	+' '2	+	4	+'; do
+    grep -q "^L	$l" "$OUT/reusep.normalized.gfa" && stale=$((stale + 1))
+  done
+  [ "$stale" = "0" ] \
+    && ok "the arcs only the pre-rewrite paths walked are pruned" \
+    || bad "$stale stale link(s) keep the replaced branch walkable"
+  live=0
+  for l in '5	+	2	+' '2	+	6	+'; do
+    grep -q "^L	$l" "$OUT/reusep.normalized.gfa" && live=$((live + 1))
+  done
+  [ "$live" = "2" ] \
+    && ok "the arcs a final path still walks are kept" \
+    || bad "pruning removed a link a path still traverses ($live of 2 kept)"
+else
+  bad "the reuse fixture produced no normalized graph"
 fi
 
 # ---------------------------------------------------------------- two copies inside one node
@@ -348,11 +454,11 @@ n=$(awk '$1=="P" && $2=="sep"{print $3}' "$OUT/tiop.normalized.gfa" | tr ',' '\n
   && ok "sep is anchor, REP, fragment, REP, anchor (5 steps)" \
   || bad "sep has $n steps, expected 5"
 
-# ---------------------------------------------------------------- the false-zero guard still exists
-# Fragments remove the ordinary decline, but a copy that cannot be bounded by ANY step boundary -- two
-# copies inside one node, so the second has no step to start at -- is still declined. The guard fires
-# only if that leaves a haplotype with no foldable copy at all, which is the case that would make
-# `call` read CN 0 while the haplotype carries copies.
+# ---------------------------------------------------------------- nothing is declined any more
+# This fixture used to be the decline case: two copies inside one node, the second with no step to start
+# at. With blocks and fragments both fold, so the assertion is now the positive one -- the site
+# normalizes, nothing is declined, and the sequence survives. Kept because it is the shape that used to
+# break, and a regression would show up here first.
 U16="ACGTTGCAACGTTGCA"
 G64="TTTTTTTTGGGGCCCCTTTTTTTTGGGGCCCCTTTTTTTTGGGGCCCCTTTTTTTTGGGGCCCC"
 { printf 'H\tVN:Z:1.0\n'
@@ -366,8 +472,11 @@ G64="TTTTTTTTGGGGCCCCTTTTTTTTGGGGCCCCTTTTTTTTGGGGCCCCTTTTTTTTGGGGCCCC"
        --min-similarity 0.90 --min-unit-bp 16 --min-array-prevalence 0.5 -q >/dev/null 2>&1
 tio_before=$(spell "$OUT/tiob.sorted.gfa" both)
 [ "$(spell "$OUT/tiop.normalized.gfa" both)" = "$tio_before" ] \
-  && ok "a haplotype whose copies cannot be bounded keeps its sequence" \
-  || bad "the unrepresentable haplotype lost bases"
+  && ok "the haplotype with two copies in one node keeps its sequence" \
+  || bad "the two-copies-in-one-node haplotype lost bases"
+[ "$(rep "$OUT/tiop.panphorte.report.tsv" status)" != "partial_boundary" ] \
+  && ok "no site is refused for a boundary now that every copy is bounded by its step range" \
+  || bad "the site was refused although both copies are foldable"
 
 # ---------------------------------------------------------------- REP provenance is emitted
 [ -s "$OUT/cnp.panphorte.rep_provenance.tsv" ] \
@@ -376,6 +485,19 @@ tio_before=$(spell "$OUT/tiob.sorted.gfa" both)
 head -1 "$OUT/cnp.panphorte.rep_provenance.tsv" | grep -q "canonical_motif" \
   && ok "provenance names the site motif each REP stands for" \
   || bad "provenance header lacks canonical_motif"
+# The join key has to name a node in the graph delivered BESIDE it. --reference-path renumbers, so the
+# id a REP was created with is not the id it ships under, and the table named nodes that do not exist.
+prov_out=$(awk -F'\t' 'NR==2{print $2}' "$OUT/e2ep.panphorte.rep_provenance.tsv")
+prov_in=$(awk -F'\t' 'NR==2{print $1}' "$OUT/e2ep.panphorte.rep_provenance.tsv")
+[ -n "$prov_out" ] && grep -q "^S	$prov_out	" "$OUT/e2ep.normalized.sorted.gfa" \
+  && ok "output_rep_node names a node in the delivered graph" \
+  || bad "provenance output_rep_node '$prov_out' is not a segment of the sorted graph"
+grep -q "^L	$prov_out	+	$prov_out	+" "$OUT/e2ep.normalized.sorted.gfa" \
+  && ok "the delivered REP node carries the self-loop copy number is counted from" \
+  || bad "node $prov_out has no self-loop, so it is not the REP"
+[ "$prov_in" != "$prov_out" ] \
+  && ok "the created id and the delivered id are both reported, and here they differ" \
+  || bad "created_rep_node and output_rep_node are equal; the sort renumbering was not applied"
 
 # ---------------------------------------------------------------- a declined copy beside folded ones
 # The opposite case, and the common one at a real array: a haplotype has several copies and only one is

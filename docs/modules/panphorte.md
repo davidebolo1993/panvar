@@ -19,6 +19,8 @@ Algorithm and worked trace: [algorithms/panphorte.md](../algorithms/panphorte.md
 - `-i, --gfa <graph.gfa>` — the sorted GFA from `bubble`.
 - one of `-b, --bubble-prefix-in <bubble-prefix>` (auto-uses `<prefix>.bubbles.csv`) or `-c, --bubbles-csv <path>`.
 
+The CSV must describe the graph handed in and its sites must be disjoint: a node named by no segment, a duplicate bubble id, or two bubbles claiming the same interior node is refused before any work starts. Overlapping sites are not a formality — they describe one piece of sequence twice, so folding both rewrites one span inside the other and the same array is folded at two scales. `bubble` currently emits such a pair at ANKRD36C, where a site enclosing all ten others folds with the same 5616 bp unit as the site inside it.
+
 ## Key options
 
 | flag | what it does | default |
@@ -55,7 +57,7 @@ Algorithm and worked trace: [algorithms/panphorte.md](../algorithms/panphorte.md
 | `unit_bp` | length of the detected repeat unit (bp) |
 | `paths_normalized` | how many paths were rewritten |
 | `min_copies`, `max_copies` | smallest / largest copy count seen across haplotypes |
-| `nodes_collapsed` | number of original nodes folded into the unit |
+| `nodes_collapsed` | distinct original nodes the rewrite replaced at this bubble. A node still walked at another site survives the run, so this counts what was replaced here, not what was deleted from the graph |
 
 `<prefix>.panphorte.copies.tsv` columns:
 
@@ -81,4 +83,4 @@ With `--reference-path`, the normalized graph is sorted and re-snarled so the ou
 
 `<prefix>.panphorte.report.tsv` carries, per bubble: `normalized`, `unit_bp`, `paths_normalized`, `min_copies`, `max_copies`, `interruptions_bp`, `nodes_collapsed`, and the diagnostics `n_traversing`, `n_motif_carriers`, `prevalence`, `n_motifs`, `copies_declined_partial_boundary`, `paths_with_partial_boundary` and `status` (`normalized`, `below_prevalence`, `no_tandem_detected`, `no_seed`, `partial_boundary`). `normalized` is `yes`/`no`.
 
-`<prefix>.panphorte.rep_provenance.tsv` maps each REP node to the site and motif it stands for (`rep_node`, `input_bubble_id`, `canonical_motif`, `phase_unit`, `unit_bp`, `copy_quantum`). Two phase-rotated units at one site cannot share an unsplit REP node while exact spelling is preserved, so they become separate nodes; without this table a consumer counting REP occurrences sees two independent DUPs instead of one site's copy number. The ids are the ones panphorte created — under `--reference-path` the sort renumbers them, so a consumer must map through the sorted graph. `call` does not yet aggregate by site. `<prefix>.panphorte.copies.tsv` names its graph columns `input_bubble_id`, `input_from_node` and `input_to_node`: they describe the graph handed in, and sorting renumbers nodes and reassigns bubble ids.
+`<prefix>.panphorte.rep_provenance.tsv` maps each REP node to the site and motif it stands for (`created_rep_node`, `output_rep_node`, `input_bubble_id`, `canonical_motif`, `phase_unit`, `unit_bp`, `copy_quantum`). Two phase-rotated units at one site cannot share an unsplit REP node while exact spelling is preserved, so they become separate nodes; without this table a consumer counting REP occurrences sees two independent DUPs instead of one site's copy number. Join on `output_rep_node`: it names the node in the graph delivered beside this file, since `--reference-path` renumbers and the id a REP was created with is not the id it ships under. `created_rep_node` is the input-side id, kept so the two numberings can be reconciled. `call` does not yet aggregate by site. `<prefix>.panphorte.copies.tsv` names its graph columns `input_bubble_id`, `input_from_node` and `input_to_node`: they describe the graph handed in, and sorting renumbers nodes and reassigns bubble ids.
