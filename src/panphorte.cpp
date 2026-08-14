@@ -924,6 +924,7 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                 std::atomic<std::size_t> n_traverse{0};   // haplotypes that traverse this bubble
                 std::size_t partial_boundary_declined = 0;  // copies refused for a mid-node boundary
                 std::size_t partial_boundary_paths = 0;     // haplotypes carrying at least one
+                std::size_t zero_after_decline = 0;         // haplotypes left with NO foldable copy
                 std::size_t approx_interruptions_bp = 0;    // real interrupting bases within arrays
                 std::size_t group_carriers = 0;             // paths with an array reaching min_copies
                 std::mutex detail_mtx;
@@ -983,6 +984,13 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                         std::lock_guard<std::mutex> lk(detail_mtx);
                         partial_boundary_declined += declined;
                         ++partial_boundary_paths;
+                        // The condition that actually breaks `call`: this haplotype carries the motif
+                        // but ends with NOTHING foldable, so it reaches the site literally while its
+                        // neighbours reach it through the REP node -- and REP occurrences are what copy
+                        // number is counted from, so it reads 0 while carrying copies. A haplotype that
+                        // folds some copies and declines others is merely undercounted by those copies,
+                        // which is a different and much smaller harm.
+                        if (copies.empty()) ++zero_after_decline;
                     }
                     // Copies are grouped into tandem ARRAYS by the gap between them, and
                     // --max-interruption-frac decides where a group ends. The option was applied when
@@ -1066,8 +1074,13 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                 // still spells it literally. `call` counts REP occurrences, so that haplotype is
                 // reported CN=0 with the literal node as an insertion, when it carries one copy. The
                 // sequence was safe and the CALL was not, so the whole bubble is left alone.
-                const bool partial_boundary =
-                    partial_boundary_declined > 0 && !options.allow_partial_boundary;
+                // Refuse the site only where the mixed representation would produce a FALSE ZERO, not
+                // wherever any boundary happens to fall mid-node. Blanket refusal cost the principal
+                // case for nothing: at a real tandem array every haplotype still folds most of its
+                // copies (measured at KIV-2: 466 of 466 haplotypes fold at least one, median 20), so
+                // refusing the whole site to prevent an undercount of one copy in twenty threw away
+                // the fold for all 466.
+                const bool partial_boundary = zero_after_decline > 0 && !options.allow_partial_boundary;
                 const bool array_confirmed = !partial_boundary &&
                                              max_copies_path >= options.min_copies &&
                                              prevalence >= options.min_array_prevalence;
@@ -1075,18 +1088,26 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                 approx_carriers = group_carriers;
                 approx_partial_boundary = partial_boundary_declined;
                 approx_partial_paths = partial_boundary_paths;
-                if (partial_boundary_declined > 0 && options.allow_partial_boundary && !options.quiet) {
+                if (partial_boundary_declined > 0 && zero_after_decline == 0 && !options.quiet) {
+                    std::cerr << "[bubble " << bubble.id << "] " << partial_boundary_declined
+                              << " copy/copies declined (boundary inside a node) across "
+                              << partial_boundary_paths
+                              << " haplotype(s); each still folds other copies, so copy number is "
+                                 "undercounted by those copies rather than zeroed\n";
+                }
+                if (zero_after_decline > 0 && options.allow_partial_boundary && !options.quiet) {
                     std::cerr << "[bubble " << bubble.id << "] --allow-partial-boundary: folding with "
-                              << partial_boundary_declined << " copy/copies declined across "
-                              << partial_boundary_paths << " haplotype(s). Those haplotypes keep the "
-                                 "motif literally while the rest reach it through the REP node, so "
-                                 "`call` will report them CN 0 despite carrying copies\n";
+                              << zero_after_decline << " haplotype(s) left with no foldable copy. They "
+                                 "keep the motif literally while the rest reach it through the REP "
+                                 "node, so `call` will report them CN 0 despite carrying copies\n";
                 }
                 if (partial_boundary && !options.quiet) {
-                    std::cerr << "[bubble " << bubble.id << "] not normalized: " << partial_boundary_declined
-                              << " copy/copies have a boundary inside a node. Folding the rest would "
-                                 "leave this site half REP and half literal, and `call` counts REP "
-                                 "occurrences -- so a haplotype carrying one copy would be called CN 0\n";
+                    std::cerr << "[bubble " << bubble.id << "] not normalized: " << zero_after_decline
+                              << " haplotype(s) carry the motif but have NO copy that can be folded "
+                                 "(every boundary falls inside a node). Folding the rest would leave "
+                                 "them literal while their neighbours use the REP node, and `call` "
+                                 "counts REP occurrences -- so they would read CN 0 while carrying "
+                                 "copies. --allow-partial-boundary folds anyway\n";
                 }
                 // The report's interruptions column was never fed by the approximate branch, so it
                 // read 0 whatever the arrays actually contained.

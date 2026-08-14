@@ -272,9 +272,11 @@ before_flank=$(spell "$OUT/flankb.sorted.gfa" flank)
   || bad "the flanking haplotype lost $(( ${#before_flank} - $(spell "$OUT/flankp.normalized.gfa" flank | wc -c) )) bases"
 # Site-wide, not per copy: folding the rest would leave the site half REP and half literal, and `call`
 # counts REP occurrences -- so the refused haplotype would be reported CN 0 while carrying one copy.
+# The flank haplotype's ONLY copy is unfoldable, so it would reach the site literally while its
+# neighbours use the REP -- that is the false-zero condition, and the site is refused.
 [ "$(rep "$OUT/flankp.panphorte.report.tsv" normalized)" = "no" ] \
-  && ok "one in-node boundary refuses the whole site, not just that copy" \
-  || bad "the site normalized around a declined copy, leaving a mixed REP/literal representation"
+  && ok "a site is refused when a haplotype would be left with no foldable copy" \
+  || bad "the site normalized around a haplotype left entirely literal"
 [ "$(rep "$OUT/flankp.panphorte.report.tsv" status)" = "partial_boundary" ] \
   && ok "the refusal is reported as partial_boundary" \
   || bad "status is $(rep "$OUT/flankp.panphorte.report.tsv" status), expected partial_boundary"
@@ -330,6 +332,31 @@ grep -q "CN 0" "$OUT/e2eo.log" \
 head -1 "$OUT/cnp.panphorte.rep_provenance.tsv" | grep -q "canonical_motif" \
   && ok "provenance names the site motif each REP stands for" \
   || bad "provenance header lacks canonical_motif"
+
+# ---------------------------------------------------------------- a declined copy beside folded ones
+# The opposite case, and the common one at a real array: a haplotype has several copies and only one is
+# unfoldable. It still reaches the site through the REP node, so its copy number is undercounted by
+# that copy rather than zeroed -- refusing the whole site here would throw away the fold for every
+# haplotype to prevent an error of one copy in several. Measured at LPA KIV-2: 466 of 466 haplotypes
+# fold at least one copy (median 20), so the false-zero condition never arises there.
+# `mixed` reaches the motif twice: once on node 2, which is exactly one unit and folds, and once inside
+# node 3, whose copy is flanked by 3 bp on each side and cannot be folded without splitting the node.
+{ printf 'H\tVN:Z:1.0\n'
+  printf "S\t1\t%s\nS\t2\t%s\nS\t5\t%s\nS\t3\tTTT%sGGG\nS\t4\t%s\n" \
+         "$BB1" "$UNIT" "$UNIT" "$UNIT" "$BB2"
+  for e in "1 2" "2 5" "5 4" "2 3" "3 4"; do
+    set -- $e; printf "L\t%s\t+\t%s\t+\t0M\n" "$1" "$2"
+  done
+  printf 'P\tcleanA\t1+,2+,5+,4+\t*\nP\tcleanB\t1+,2+,5+,4+\t*\nP\tmixed\t1+,2+,3+,4+\t*\n'; } \
+  > "$OUT/mix.gfa"
+"$BIN" bubble -i "$OUT/mix.gfa" -r cleanA -o "$OUT/mixb" --min-variant-bp 0 -q >/dev/null 2>&1
+"$BIN" panphorte -i "$OUT/mixb.sorted.gfa" -c "$OUT/mixb.bubbles.csv" -o "$OUT/mixp" \
+       --min-similarity 0.90 --min-array-prevalence 0.5 > "$OUT/mixp.log" 2>&1
+if [ "$(rep "$OUT/mixp.panphorte.report.tsv" status)" = "partial_boundary" ]; then
+  bad "a site was refused although every haplotype still folds at least one copy"
+else
+  ok "a declined copy beside folded ones does not refuse the site"
+fi
 
 echo
 if [ "$fails" -eq 0 ]; then echo "panphorte_stats: all assertions passed"; exit 0; fi
