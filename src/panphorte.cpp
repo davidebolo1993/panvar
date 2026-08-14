@@ -878,15 +878,28 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
 
                 std::atomic<std::size_t> detect_done{0};
                 std::atomic<std::size_t> n_traverse{0};   // haplotypes that traverse this bubble
+                std::size_t partial_boundary_declined = 0;  // copies refused for a mid-node boundary
+                std::size_t approx_interruptions_bp = 0;    // real interrupting bases within arrays
+                std::size_t group_carriers = 0;             // paths with an array reaching min_copies
                 std::mutex detail_mtx;
                 const std::size_t n_paths = graph.paths.size();
 
                 auto detect_one = [&](std::size_t pi) {
-                    const auto interval = find_best_bubble_path_interval(path_indexes[pi], bubble);
-                    if (!interval.has_value()) return;
+                    // bubble_steps, not the inside-node-only interval finder: a haplotype crossing the
+                    // site with no interior carries ZERO copies and is still a haplotype at this site.
+                    // The exact branch was fixed for this; the approximate branch kept the old finder,
+                    // so one array carrier among nine direct alleles still read prevalence 1/1.
+                    BubblePathInterval used{};
+                    const auto steps_opt = bubble_steps(graph.paths[pi], path_indexes[pi], bubble, &used);
+                    if (!steps_opt.has_value()) return;
                     n_traverse.fetch_add(1);
-                    const std::size_t left = interval->left;
-                    const std::size_t n = interval->right - left + 1;
+                    if (used.inside_count == 0) return;      // crosses with no copies
+                    // Search the INTERIOR only. Including the source and sink steps let the anchors --
+                    // which are backbone, not bubble content -- contribute copies, and a long periodic
+                    // backbone is exactly where that goes wrong.
+                    const std::size_t left = used.left + 1;
+                    if (used.right <= left) return;
+                    const std::size_t n = used.right - left;
                     const std::vector<PathStep> nat(
                         graph.paths[pi].steps.begin() + static_cast<std::ptrdiff_t>(left),
                         graph.paths[pi].steps.begin() + static_cast<std::ptrdiff_t>(left + n));
@@ -897,15 +910,69 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                         prefix[off + 1] = prefix[off] + (it != node_tok.end() ? it->second.len : 0);
                     }
                     const auto bp_copies = detect_copies_native(snat, ref_unit, options.min_similarity);
+                    // A copy boundary must fall EXACTLY on a node boundary. Rounding to the nearest one
+                    // and replacing whole steps deleted every base between the node edge and the copy
+                    // edge -- sequence outside the copy, which this mode is not licensed to discard.
+                    // Until nodes can be split at aligned boundaries, such a copy is declined rather
+                    // than approximated: an option that emits a graph must not lose bases quietly.
+                    const auto exact_off = [&](std::size_t bp) -> std::optional<std::size_t> {
+                        const auto it = std::lower_bound(prefix.begin(), prefix.end(), bp);
+                        if (it == prefix.end() || *it != bp) return std::nullopt;
+                        return static_cast<std::size_t>(it - prefix.begin());
+                    };
                     std::vector<Mapped> copies;
                     std::size_t prev_hi = 0;
+                    std::size_t declined = 0;
                     for (const ApproxCopy& c : bp_copies) {
-                        std::size_t lo = nearest_step_off(prefix, c.bp_lo);
-                        std::size_t hi = nearest_step_off(prefix, c.bp_hi);
+                        const auto lo_opt = exact_off(c.bp_lo);
+                        const auto hi_opt = exact_off(c.bp_hi);
+                        if (!lo_opt.has_value() || !hi_opt.has_value()) { ++declined; continue; }
+                        std::size_t lo = *lo_opt;
+                        const std::size_t hi = *hi_opt;
                         if (lo < prev_hi) lo = prev_hi;       // keep monotonic / non-overlapping
                         if (hi <= lo) continue;
                         copies.push_back({lo, hi, c.rev, c.identity});
                         prev_hi = hi;
+                    }
+                    if (declined > 0) {
+                        std::lock_guard<std::mutex> lk(detail_mtx);
+                        partial_boundary_declined += declined;
+                    }
+                    // Copies are grouped into tandem ARRAYS by the gap between them, and
+                    // --max-interruption-frac decides where a group ends. The option was applied when
+                    // seeding and nowhere afterwards, so two copies with a 64 bp gap between them were
+                    // accepted as one array at every setting and interruptions_bp reported 0.
+                    std::size_t path_interruptions = 0;
+                    std::size_t best_group = 0;
+                    {
+                        std::size_t gstart = 0;
+                        std::size_t ginterrupt = 0;
+                        for (std::size_t k = 0; k < copies.size(); ++k) {
+                            if (k > 0) {
+                                const std::size_t gap =
+                                    prefix[copies[k].off_lo] - prefix[copies[k - 1].off_hi];
+                                const std::size_t span =
+                                    prefix[copies[k].off_hi] - prefix[copies[gstart].off_lo];
+                                const double frac = span > 0
+                                    ? static_cast<double>(ginterrupt + gap) / static_cast<double>(span)
+                                    : 0.0;
+                                if (frac > options.max_interruption_frac) {
+                                    best_group = std::max(best_group, k - gstart);
+                                    path_interruptions += ginterrupt;
+                                    gstart = k;
+                                    ginterrupt = 0;
+                                    continue;
+                                }
+                                ginterrupt += gap;
+                            }
+                        }
+                        best_group = std::max(best_group, copies.size() - gstart);
+                        path_interruptions += ginterrupt;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lk(detail_mtx);
+                        approx_interruptions_bp += path_interruptions;
+                        if (best_group >= options.min_copies) ++group_carriers;
                     }
                     // Record any path with >=1 detected copy. The bubble-level min_copies gate is
                     // applied below: once an array is confirmed (some path reaches min_copies), even
@@ -939,6 +1006,9 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                 // haplotypes to carry one -- so a rare private duplication (a CYP2D6x2 in a few
                 // haplotypes) isn't folded, collapsing genes `call` resolves downstream.
                 std::size_t max_copies_path = 0, haps_with_array = 0;
+                // Carriers are counted by GROUP, not by total copy count: two copies separated by more
+                // than --max-interruption-frac are two arrays of one, not one array of two.
+                (void)haps_with_array;
                 for (const Res& r : results) {
                     if (!r.has) continue;
                     max_copies_path = std::max(max_copies_path, r.copies.size());
@@ -946,11 +1016,14 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                 }
                 const std::size_t traversing = n_traverse.load();
                 const double prevalence =
-                    traversing > 0 ? static_cast<double>(haps_with_array) / static_cast<double>(traversing) : 0.0;
+                    traversing > 0 ? static_cast<double>(group_carriers) / static_cast<double>(traversing) : 0.0;
                 const bool array_confirmed = max_copies_path >= options.min_copies &&
                                              prevalence >= options.min_array_prevalence;
                 approx_traversing = traversing;
-                approx_carriers = haps_with_array;
+                approx_carriers = group_carriers;
+                // The report's interruptions column was never fed by the approximate branch, so it
+                // read 0 whatever the arrays actually contained.
+                interruptions_bp = approx_interruptions_bp;
                 approx_prevalence = prevalence;
 
                 // Serial: one REP node per bubble; build PathArrays + copies.tsv rows.
@@ -1280,22 +1353,20 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
         const Graph sorted_graph = parse_gfa(sorted_gfa, parse_options);
         const BubbleCallReport report = call_bubbles_report(sorted_graph, bopts);
         write_bubbles_csv(options.out_prefix + ".bubbles.csv", report.bubbles);
-        // A bubble handed to panphorte that no longer appears after re-snarling is information the
-        // caller needs: it was either absorbed into a neighbour by normalization or dropped by the
-        // interior-span filter above.
+        // Bubble ids are REASSIGNED by the re-snarl, so comparing input ids against output ids says
+        // nothing: id 3 afterwards is not id 3 before. Only the count is comparable without remapping
+        // anchors through the sort, so only the count is reported.
         if (!options.quiet) {
-            std::unordered_set<std::size_t> kept;
-            for (const Bubble& nb : report.bubbles) kept.insert(nb.id);
-            std::size_t lost = 0;
-            for (const Bubble& ib : bubbles) {
-                if (!bubble_filter.empty() && bubble_filter.find(ib.id) == bubble_filter.end()) continue;
-                if (kept.find(ib.id) == kept.end()) ++lost;
-            }
-            if (lost > 0) {
-                std::cerr << "[panphorte] " << lost << " of " << bubbles.size()
-                          << " input bubble id(s) are absent from the re-snarled CSV (normalization "
-                             "merges sites, and --resnarl-min-variant-bp "
-                          << options.resnarl_min_variant_bp << " filters them)\n";
+            const std::size_t before = bubble_filter.empty()
+                ? bubbles.size()
+                : std::count_if(bubbles.begin(), bubbles.end(), [&](const Bubble& b) {
+                      return bubble_filter.find(b.id) != bubble_filter.end();
+                  });
+            if (report.bubbles.size() != before) {
+                std::cerr << "[panphorte] bubble count " << before << " -> " << report.bubbles.size()
+                          << " after re-snarling (normalization merges sites, and "
+                             "--resnarl-min-variant-bp " << options.resnarl_min_variant_bp
+                          << " filters them); ids are reassigned, so they do not correspond\n";
             }
         }
         write_bandage_node_colors_csv(options.out_prefix + ".bandage_nodes.csv",

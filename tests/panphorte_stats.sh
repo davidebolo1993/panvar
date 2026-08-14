@@ -120,8 +120,14 @@ reps=$(pline "$OUT/twop.normalized.gfa" pA | tr ',' '\n' | tr -d '+-' | sort | u
   && ok "two sites with an identical repeat unit get distinct REP nodes" \
   || bad "the two sites share a REP node, joining separate loci through one node"
 
-# ---------------------------------------------------------------- rotation and strand resolve to one motif
-# The same repeat written starting one base later, and on the other strand, is the same motif.
+# ---------------------------------------------------------------- rotation resolves to one motif
+# The same repeat written starting one base later is the same MOTIF, and prevalence is asked of it
+# once rather than of two half-supported candidates. It does NOT follow that both phases share one REP
+# node: two phase-rotated linear sequences cannot both be spelled by one unsplit node while exact
+# spelling is preserved, so each phase gets its own REP. Downstream copy number therefore still needs a
+# REP -> (site, motif, phase) mapping to know they are the same site; that mapping is not implemented,
+# and this test asserts the motif count only. (Strand equivalence is a separate claim and is not
+# tested here -- this fixture is a rotation, not a reverse-oriented traversal.)
 ROT="CGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAA"
 { printf 'H\tVN:Z:1.0\n'
   printf "S\t1\t%s\nS\t2\t%s\nS\t3\t%s\nS\t4\t%s\n" "$BB1" "$UNIT" "$ROT" "$BB2"
@@ -131,7 +137,7 @@ ROT="CGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAACGTTGCAA"
 "$BIN" bubble -i "$OUT/rot.gfa" -r fwd -o "$OUT/rotb" --min-variant-bp 0 -q >/dev/null 2>&1
 "$BIN" panphorte -i "$OUT/rotb.sorted.gfa" -c "$OUT/rotb.bubbles.csv" -o "$OUT/rotp" -q >/dev/null 2>&1
 [ "$(rep "$OUT/rotp.panphorte.report.tsv" n_motifs)" = "1" ] \
-  && ok "a rotated unit resolves to the same motif" \
+  && ok "a rotated unit is counted as one motif, not two half-supported candidates" \
   || bad "n_motifs is $(rep "$OUT/rotp.panphorte.report.tsv" n_motifs), expected 1 for a rotation"
 
 # ---------------------------------------------------------------- exact sequence preservation
@@ -203,6 +209,70 @@ fi
 cmp -s "$OUT/t1.normalized.gfa" "$OUT/t8.normalized.gfa" \
   && ok "approximate output is byte-identical at 1 and 8 threads" \
   || bad "approximate output differs between 1 and 8 threads"
+
+# ---------------------------------------------------------------- approximate mode: direct alleles
+# The approximate branch kept the inside-node-only interval finder after the exact branch was fixed,
+# so one array carrier among nine direct alleles still read prevalence 1/1 and folded through a 50%
+# gate.
+"$BIN" panphorte -i "$OUT/prevb.sorted.gfa" -c "$OUT/prevb.bubbles.csv" -o "$OUT/apx" \
+       --min-similarity 0.90 -q >/dev/null 2>&1
+[ "$(rep "$OUT/apx.panphorte.report.tsv" n_traversing)" = "10" ] \
+  && ok "approximate mode counts direct source->sink crossings in the denominator" \
+  || bad "approximate n_traversing is $(rep "$OUT/apx.panphorte.report.tsv" n_traversing), expected 10"
+[ "$(rep "$OUT/apx.panphorte.report.tsv" normalized)" = "no" ] \
+  && ok "approximate mode refuses prevalence 1/10 at the default gate" \
+  || bad "approximate mode folded a site carried by one haplotype in ten"
+
+# ---------------------------------------------------------------- approximate mode: interruptions
+# Two copies of a 16 bp unit separated by a 64 bp gap: the gap is 64/96 = 0.667 of the span, so the
+# pair is one array only when --max-interruption-frac allows that much. The option was applied when
+# seeding the unit and nowhere afterwards, so the pair was accepted at every setting and
+# interruptions_bp always read 0.
+U16="ACGTTGCAACGTTGCA"
+G64="TTTTTTTTGGGGCCCCTTTTTTTTGGGGCCCCTTTTTTTTGGGGCCCCTTTTTTTTGGGGCCCC"
+{ printf 'H\tVN:Z:1.0\n'
+  printf "S\t1\t%s\nS\t2\t%s\nS\t3\t%s\nS\t4\t%s\n" "$BB1" "$U16" "$G64" "$BB2"
+  printf 'L\t1\t+\t2\t+\t0M\nL\t2\t+\t2\t+\t0M\nL\t2\t+\t4\t+\t0M\n'
+  printf 'L\t2\t+\t3\t+\t0M\nL\t3\t+\t2\t+\t0M\n'
+  printf 'P\tclean\t1+,2+,2+,4+\t*\nP\tsep\t1+,2+,3+,2+,4+\t*\n'; } > "$OUT/gap.gfa"
+"$BIN" bubble -i "$OUT/gap.gfa" -r clean -o "$OUT/gapb" --min-variant-bp 0 -q >/dev/null 2>&1
+"$BIN" panphorte -i "$OUT/gapb.sorted.gfa" -c "$OUT/gapb.bubbles.csv" -o "$OUT/g0" \
+       --min-similarity 0.90 --min-unit-bp 16 --max-interruption-frac 0 --min-array-prevalence 0.5 \
+       -q >/dev/null 2>&1
+"$BIN" panphorte -i "$OUT/gapb.sorted.gfa" -c "$OUT/gapb.bubbles.csv" -o "$OUT/g9" \
+       --min-similarity 0.90 --min-unit-bp 16 --max-interruption-frac 0.9 --min-array-prevalence 0.5 \
+       -q >/dev/null 2>&1
+[ "$(rep "$OUT/g0.panphorte.report.tsv" n_motif_carriers)" = "1" ] \
+  && ok "at --max-interruption-frac 0 a 0.667 gap splits the pair into two arrays of one" \
+  || bad "frac 0 gave $(rep "$OUT/g0.panphorte.report.tsv" n_motif_carriers) carriers, expected 1"
+[ "$(rep "$OUT/g9.panphorte.report.tsv" n_motif_carriers)" = "2" ] \
+  && ok "at --max-interruption-frac 0.9 the same gap is tolerated and the pair is one array" \
+  || bad "frac 0.9 gave $(rep "$OUT/g9.panphorte.report.tsv" n_motif_carriers) carriers, expected 2"
+[ "$(rep "$OUT/g9.panphorte.report.tsv" interruptions_bp)" = "64" ] \
+  && ok "the interrupting bases accepted into an array are reported (64 bp)" \
+  || bad "interruptions_bp is $(rep "$OUT/g9.panphorte.report.tsv" interruptions_bp), expected 64"
+
+# ---------------------------------------------------------------- approximate mode: partial boundaries
+# A copy whose boundary falls inside a node cannot be folded without splitting that node, and rounding
+# to the nearest boundary DELETES the bases between the node edge and the copy edge -- sequence outside
+# the copy. Until splitting exists the copy is declined, so the haplotype keeps its original nodes and
+# spells exactly what it spelled before.
+{ printf 'H\tVN:Z:1.0\n'
+  printf "S\t1\t%s\nS\t2\t%s\nS\t3\tTTT%sGGG\nS\t4\t%s\n" "$BB1" "$UNIT" "$UNIT" "$BB2"
+  printf 'L\t1\t+\t2\t+\t0M\nL\t2\t+\t2\t+\t0M\nL\t2\t+\t4\t+\t0M\n'
+  printf 'L\t1\t+\t3\t+\t0M\nL\t3\t+\t4\t+\t0M\n'
+  printf 'P\tcleanA\t1+,2+,2+,4+\t*\nP\tcleanB\t1+,2+,2+,4+\t*\nP\tflank\t1+,3+,4+\t*\n'; } \
+  > "$OUT/flank.gfa"
+"$BIN" bubble -i "$OUT/flank.gfa" -r cleanA -o "$OUT/flankb" --min-variant-bp 0 -q >/dev/null 2>&1
+before_flank=$(spell "$OUT/flankb.sorted.gfa" flank)
+"$BIN" panphorte -i "$OUT/flankb.sorted.gfa" -c "$OUT/flankb.bubbles.csv" -o "$OUT/flankp" \
+       --min-similarity 0.90 --min-array-prevalence 0.5 -q >/dev/null 2>&1
+[ "$(spell "$OUT/flankp.normalized.gfa" flank)" = "$before_flank" ] \
+  && ok "a copy with a mid-node boundary is declined, not truncated to the node edge" \
+  || bad "the flanking haplotype lost $(( ${#before_flank} - $(spell "$OUT/flankp.normalized.gfa" flank | wc -c) )) bases"
+[ "$(rep "$OUT/flankp.panphorte.report.tsv" normalized)" = "yes" ] \
+  && ok "the clean carriers still fold while the partial-boundary copy is declined" \
+  || bad "declining one copy suppressed the whole site"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "panphorte_stats: all assertions passed"; exit 0; fi

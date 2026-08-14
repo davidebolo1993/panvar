@@ -72,3 +72,11 @@ Algorithm and worked trace: [algorithms/panphorte.md](../algorithms/panphorte.md
 ## Example
 
 See the [LPA walkthrough](../walkthrough.md) for this module in a full end-to-end run.
+
+## Re-snarling under `--reference-path`
+
+With `--reference-path`, the normalized graph is sorted and re-snarled so the output is call-ready. That re-snarl applies its own interior-span filter, `--resnarl-min-variant-bp` (default 50). It is a separate decision from the one that produced the input bubbles: a CSV built with a different threshold can otherwise lose bubbles that normalization never touched. Bubble ids are reassigned by the re-snarl, so an id in the output does not correspond to the same id in the input; the run reports the count change rather than pretending the ids match.
+
+## Report columns
+
+`<prefix>.panphorte.report.tsv` carries, per bubble: `normalized`, `unit_bp`, `paths_normalized`, `min_copies`, `max_copies`, `interruptions_bp`, `nodes_collapsed`, and the diagnostics `n_traversing`, `n_motif_carriers`, `prevalence`, `n_motifs` and `status` (`normalized`, `below_prevalence`, `no_tandem_detected`, `no_seed`). `<prefix>.panphorte.copies.tsv` names its graph columns `input_bubble_id`, `input_from_node` and `input_to_node`: they describe the graph handed in, and sorting renumbers nodes and reassigns bubble ids.
