@@ -11,6 +11,10 @@ struct PanphorteOptions {
     std::string bubbles_csv_in;     // module-1 bubbles CSV
     std::string out_prefix;         // writes <prefix>.normalized.gfa + <prefix>.panphorte.report.tsv
     std::size_t min_unit_bp = 50;   // minimum repeat-unit span to normalize
+    // Interior-span filter applied when the normalized graph is re-snarled under --reference-path.
+    // This used to be BubbleCallOptions' own default, applied silently to a CSV that may have been
+    // produced with a different one.
+    std::size_t resnarl_min_variant_bp = 50;
     std::size_t min_copies = 2;     // minimum tandem copies to normalize
     // Minimum fraction of bubble-traversing haplotypes carrying a >=min_copies array for the bubble to
     // be normalized. Separates a population VNTR (folded) from a rare private duplication of a gene or

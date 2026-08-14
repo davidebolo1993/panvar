@@ -113,3 +113,37 @@ as history; Git already provides that history.
   is committed before the graph. A graph commit failure can therefore leave an audit describing an
   output that was not installed. Either commit the graph first and clearly mark audit failure, or add a
   small manifest/transaction protocol that makes the pair's final disposition unambiguous.
+
+## Inspect
+
+### Clustering accuracy and scale
+
+- **Use exact Jaccard when neither walk sketch is truncated.** The union-bottom-k estimator fixes the
+  old length-ratio bias, but it deliberately subsamples even when both complete shingle multisets fit in
+  the 512-element sketches. The worked example therefore estimates `J=0.5` where the exact value already
+  available in memory is `0.667`; near a clustering threshold this can split or join a pair needlessly.
+  Retain the exact shingle cardinality/truncation state and use exact multiset Jaccard for complete pairs,
+  reserving the estimator for pairs where at least one sketch was actually truncated.
+- **Bound or accelerate all-pairs clustering.** With `U` distinct walks, Inspect stores a `U x U` double
+  distance matrix and compares every pair. This is reasonable for the reviewed panels but can become the
+  dominant memory and runtime cost on a large cohort with many distinct haplotypes. Add a documented
+  guard/diagnostic or an LSH/banding candidate stage before claiming cohort-scale clustering.
+- **Make the representative independent of GFA path order.** Identical walks retain the first path name
+  encountered, and that name becomes `representative_path`; reordering otherwise identical `P`/`W`
+  records can therefore change the clusters TSV. Choose the representative by a stable rule such as the
+  lexicographically smallest member after the structural medoid has been selected.
+
+### Validation and transactional cleanup
+
+- **Check more than one surviving crossing when matching the CSV to the graph.** Rejecting absent nodes
+  and zero crossing paths closes the dangerous cases, but a stale graph with the same node IDs and only
+  some of the original paths still succeeds. Compare the number of emitted crossings with the CSV's
+  `path_support` (and, where the transformation promises to preserve it, the allele-support summary), or
+  report an explicit mismatch warning.
+- **Pin the two final second-pass branches directly.** The derived-output collision preflight and the
+  present-nodes-but-no-crossing rejection are implemented and work, but `inspect_stats.sh` has no focused
+  assertions for either case. Add them so the exact regressions fixed by the final pass cannot return.
+- **Finish and commit the output family defensively.** Check every TSV stream after its final write/close;
+  an open succeeding does not prove that later writes reached storage. Inspect also shares the sequential
+  `StagedOutputs::commit()` limitation recorded for Bubble, so a late rename/copy failure can install only
+  part of the per-bubble family unless the shared helper gains rollback or a manifest protocol.

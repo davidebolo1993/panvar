@@ -95,6 +95,88 @@ struct TandemArray {
 // comparing units by spelled-sequence tokens so identical-sequence copies match
 // even as distinct node ids. Tolerates short interruptions between copies (kept
 // as literal nested steps), e.g. CGG (A) CGG CGG CGG.
+
+// The identity of a repeat unit, independent of where the array happens to be cut, which strand it is
+// stored on, and whether the caller handed us one copy or three.
+//
+// Prevalence used to ask "does this haplotype contain SOME tandem", which is a different question from
+// "do these haplotypes share a repeat". One bubble carrying a poly-C array on one haplotype and a
+// poly-T array on another satisfied the first and was folded into two unrelated REP nodes; only the
+// second question distinguishes a population VNTR from two coincidental arrays.
+std::string canonical_motif_key(const std::string& unit) {
+    if (unit.empty()) return unit;
+    // Primitive root: if the unit is itself w repeated, the motif is w.
+    std::string prim = unit;
+    for (std::size_t p = 1; p <= unit.size() / 2; ++p) {
+        if (unit.size() % p != 0) continue;
+        bool ok = true;
+        for (std::size_t i = p; i < unit.size() && ok; ++i) ok = (unit[i] == unit[i - p]);
+        if (ok) { prim = unit.substr(0, p); break; }
+    }
+    // Least rotation, on both strands.
+    const auto least_rotation = [](const std::string& t) {
+        std::string best = t;
+        const std::string dbl = t + t;
+        for (std::size_t i = 1; i < t.size(); ++i) {
+            const std::string rot = dbl.substr(i, t.size());
+            if (rot < best) best = rot;
+        }
+        return best;
+    };
+    const std::string f = least_rotation(prim);
+    const std::string r = least_rotation(reverse_complement(prim));
+    return f <= r ? f : r;
+}
+
+
+// Copies of a KNOWN motif that sit exactly on node boundaries, including a lone copy.
+//
+// detect_tandems finds a PERIOD, which needs at least two copies to exist -- so a haplotype carrying
+// one copy has no array and, in exact mode, was left on the original nodes while its neighbours folded.
+// Once the site is confirmed the motif is known, so its copies can be matched directly instead of
+// rediscovered. A copy spanning several nodes is not matched here; that is the multi-node case
+// detect_tandems already covers whenever two or more copies are present.
+std::vector<TandemArray> find_motif_copies_by_node(
+    const Graph& graph,
+    const PathRecord& path,
+    std::size_t left,
+    std::size_t right,
+    const std::string& motif_key,
+    std::size_t min_unit_bp) {
+
+    std::vector<TandemArray> out;
+    std::size_t run_start = 0, run_len = 0;
+    std::string run_unit;
+    const auto flush = [&]() {
+        if (run_len == 0) return;
+        TandemArray a;
+        a.start = run_start;
+        a.length = run_len;
+        a.copies = run_len;
+        a.unit_seq = run_unit;
+        a.elements.assign(run_len, ArrayElement{true, {}});
+        a.copy_ranges.emplace_back(run_start, run_start + run_len);
+        out.push_back(std::move(a));
+        run_len = 0;
+    };
+    if (right <= left || right >= path.steps.size()) return out;
+    for (std::size_t i = left + 1; i < right; ++i) {
+        const PathStep& st = path.steps[i];
+        const auto nit = graph.nodes.find(st.node_id);
+        if (nit == graph.nodes.end()) { flush(); continue; }
+        std::string spelled = nit->second.sequence;
+        if (st.reverse) spelled = reverse_complement(spelled);
+        if (spelled.size() >= min_unit_bp && canonical_motif_key(spelled) == motif_key) {
+            if (run_len == 0) { run_start = i; run_unit = spelled; }
+            ++run_len;
+        } else {
+            flush();
+        }
+    }
+    flush();
+    return out;
+}
+
 std::vector<TandemArray> detect_tandems(
     const Graph& graph,
     const std::unordered_map<std::string, NodeTok>& node_tok,
@@ -616,6 +698,10 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
     parse_opts.include_paths = true;
     parse_opts.include_sequences = true;
     const Graph graph = parse_gfa(options.gfa_path, parse_opts);
+    // The same contract every other module applies. panphorte REWRITES the graph, so accepting a
+    // malformed one means emitting a repaired-looking graph that was never validated: a path step with
+    // no link behind it was silently given the edge it lacked.
+    validate_graph_paths(graph, "panphorte", true, true);
 
     GfaModel model = read_gfa_model(options.gfa_path);
     if (model.paths.size() != graph.paths.size()) {
@@ -643,11 +729,21 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
         if (!copies_out) {
             throw std::runtime_error("Failed to write panphorte copies TSV");
         }
-        copies_out << "path_name\tsample\tbubble_id\tcopies\tunit_bp\torientations\t"
-                   << "mean_identity\tregion_bp\tfrom_node\tto_node\n";
+        // These ids describe the INPUT graph. Under --reference-path the normalized graph is sorted,
+        // which renumbers nodes and reassigns bubble ids -- so the same numbers still exist afterwards
+        // and refer to different sequence. Naming them input_* is the difference between a join key and
+        // a trap.
+        copies_out << "path_name\tsample\tinput_bubble_id\tcopies\tunit_bp\torientations\t"
+                   << "mean_identity\tregion_bp\tinput_from_node\tinput_to_node\n";
     }
 
-    std::unordered_map<std::string, std::string> rep_by_unit; // canonical unit seq -> REP node id
+    // REP nodes are SITE-LOCAL: the key is (bubble id, canonical unit), not the unit alone. Keyed by
+    // sequence only, two distinct loci that happen to carry the same repeat unit were folded onto the
+    // SAME node -- which joins them in the graph, so a walk can leave one locus and arrive in the
+    // other. That corrupts sorting, snarl decomposition and any copy number read from node
+    // multiplicity, and identical repeat units at different loci are the normal case, not a corner
+    // one.
+    std::unordered_map<std::string, std::string> rep_by_unit; // "<bubble>\t<canonical unit>" -> node
     std::unordered_set<std::string> removal_candidates;
     std::vector<std::vector<PathArray>> per_path_arrays(graph.paths.size());
 
@@ -656,8 +752,12 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
     if (!report) {
         throw std::runtime_error("Failed to write panphorte report: " + options.out_prefix + ".panphorte.report.tsv");
     }
+    // Enough to explain a decision without re-running: how many haplotypes were at the site, how many
+    // carried the winning motif, what that fraction was, and the reason the bubble was or was not
+    // folded. "normalized=no" on its own gives a reader nothing to act on.
     report << "bubble_id\tnormalized\tunit_bp\tpaths_normalized\tmin_copies\tmax_copies\t"
-           << "interruptions_bp\tnodes_collapsed\n";
+           << "interruptions_bp\tnodes_collapsed\tn_traversing\tn_motif_carriers\tprevalence\t"
+           << "n_motifs\tstatus\n";
 
     std::size_t total_bubbles = 0;
     for (const Bubble& b : bubbles) {
@@ -706,6 +806,9 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                           << "; aligning across " << graph.paths.size() << " haplotypes\n"
                           << std::flush;
             }
+            // Hoisted so the report can state them whether or not the inner block runs.
+            std::size_t approx_traversing = 0, approx_carriers = 0;
+            double approx_prevalence = 0.0;
             if (ref_unit.size() >= options.min_unit_bp) {
                 struct Mapped { std::size_t off_lo, off_hi; bool rev; double id; };
                 struct Res { bool has = false; std::size_t left = 0; std::vector<Mapped> copies; };
@@ -784,6 +887,9 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                     traversing > 0 ? static_cast<double>(haps_with_array) / static_cast<double>(traversing) : 0.0;
                 const bool array_confirmed = max_copies_path >= options.min_copies &&
                                              prevalence >= options.min_array_prevalence;
+                approx_traversing = traversing;
+                approx_carriers = haps_with_array;
+                approx_prevalence = prevalence;
 
                 // Serial: one REP node per bubble; build PathArrays + copies.tsv rows.
                 std::string rep_id;
@@ -792,10 +898,11 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                     const std::size_t left = results[pi].left;
                     const std::vector<Mapped>& copies = results[pi].copies;
                     if (rep_id.empty()) {
-                        const auto rit = rep_by_unit.find(ref_unit);
+                        const std::string rep_key = std::to_string(bubble.id) + "\t" + ref_unit;
+                        const auto rit = rep_by_unit.find(rep_key);
                         if (rit == rep_by_unit.end()) {
                             rep_id = add_new_node(model, ref_unit);
-                            rep_by_unit.emplace(ref_unit, rep_id);
+                            rep_by_unit.emplace(rep_key, rep_id);
                             ++summary.nodes_added;
                         } else {
                             rep_id = rit->second;
@@ -847,7 +954,12 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
             report << bubble.id << '\t' << (norm_ok ? "yes" : "no") << '\t'
                    << unit_bp_report << '\t' << paths_norm << '\t'
                    << min_copies_seen << '\t' << max_copies_seen << '\t'
-                   << interruptions_bp << '\t' << collapsed_nodes.size() << '\n';
+                   << interruptions_bp << '\t' << collapsed_nodes.size() << '\t'
+                   << approx_traversing << '\t' << approx_carriers << '\t' << approx_prevalence
+                   << '\t' << (ref_unit.empty() ? 0 : 1) << '\t'
+                   << (norm_ok ? "normalized"
+                       : ref_unit.size() < options.min_unit_bp ? "no_seed" : "below_prevalence")
+                   << '\n';
             progress.tick();
             continue; // bubble fully handled in approximate mode
         }
@@ -858,33 +970,78 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
         // duplication of a gene/segmental module (e.g. a CYP2D6x2 in a handful of haplotypes) from
         // being collapsed in exact mode too, so the gate behaves identically at every similarity.
         std::vector<std::vector<TandemArray>> path_arrays(graph.paths.size());
-        std::size_t n_traverse = 0, haps_with_array = 0;
+        std::size_t n_traverse = 0;
+        // Carriers of each candidate motif, and the motif's own copy-number range, so prevalence can be
+        // asked per motif rather than of "any tandem at all".
+        std::unordered_map<std::string, std::size_t> carriers_by_motif;
         for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
-            const auto interval = find_best_bubble_path_interval(path_indexes[pi], bubble);
-            if (!interval.has_value()) continue;
+            // bubble_steps, not the inside-node-only interval finder: a haplotype crossing the site
+            // with no interior node carries ZERO copies, and it is still a haplotype at this site.
+            // Counting only paths with an interior made the denominator the set of carriers, so one
+            // array carrier among nine deletion alleles read as prevalence 1/1 instead of 1/10 and was
+            // folded straight through a 50% gate.
+            BubblePathInterval used{};
+            const auto steps_opt = bubble_steps(graph.paths[pi], path_indexes[pi], bubble, &used);
+            if (!steps_opt.has_value()) continue;
             ++n_traverse;
+            if (used.inside_count == 0) continue;             // crosses with 0 copies
             auto arrays = detect_tandems(
-                graph, node_tok, graph.paths[pi], interval->left, interval->right,
+                graph, node_tok, graph.paths[pi], used.left, used.right,
                 options.min_unit_bp, options.min_copies, options.max_interruption_frac);
-            if (!arrays.empty()) { ++haps_with_array; path_arrays[pi] = std::move(arrays); }
+            if (arrays.empty()) continue;
+            std::unordered_set<std::string> motifs_here;
+            for (const TandemArray& a : arrays) motifs_here.insert(canonical_motif_key(a.unit_seq));
+            for (const std::string& m : motifs_here) ++carriers_by_motif[m];
+            path_arrays[pi] = std::move(arrays);
         }
-        const double prevalence =
-            n_traverse > 0 ? static_cast<double>(haps_with_array) / static_cast<double>(n_traverse) : 0.0;
-        const bool array_confirmed = prevalence >= options.min_array_prevalence;
+        // Prevalence is asked of each MOTIF on its own. Two unrelated repeats in one bubble are two
+        // separate questions -- neither lends its support to the other -- and a motif that clears the
+        // gate is folded into its own site-local REP.
+        std::unordered_set<std::string> confirmed_motifs;
+        double prevalence = 0.0;
+        for (const auto& [m, c] : carriers_by_motif) {
+            const double p = n_traverse > 0 ? static_cast<double>(c) / static_cast<double>(n_traverse) : 0.0;
+            if (p >= options.min_array_prevalence) confirmed_motifs.insert(m);
+            if (p > prevalence) prevalence = p;
+        }
+        const bool array_confirmed = !confirmed_motifs.empty();
+        // Once the site is confirmed, every haplotype carrying at least ONE copy of the chosen motif
+        // folds, not only those reaching --min-copies. --min-copies confirms the SITE; it is not a
+        // per-haplotype threshold. Leaving one-copy haplotypes on the original nodes contradicted the
+        // documented contract and left them outside the REP node, so a copy number read from REP
+        // multiplicity called them 0 when they carry 1.
+        if (array_confirmed) {
+            for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
+                if (!path_arrays[pi].empty()) continue;       // already has >= min_copies
+                BubblePathInterval used{};
+                const auto steps_opt = bubble_steps(graph.paths[pi], path_indexes[pi], bubble, &used);
+                if (!steps_opt.has_value() || used.inside_count == 0) continue;
+                for (const std::string& m : confirmed_motifs) {
+                    auto singles = find_motif_copies_by_node(
+                        graph, graph.paths[pi], used.left, used.right, m, options.min_unit_bp);
+                    for (TandemArray& a : singles) path_arrays[pi].push_back(std::move(a));
+                }
+            }
+        }
         for (std::size_t pi = 0; array_confirmed && pi < graph.paths.size(); ++pi) {
             if (path_arrays[pi].empty()) continue;
             for (const TandemArray& arr : path_arrays[pi]) {
+                // Only the site's motif is folded. Without this a second, unrelated array in the same
+                // bubble got its own REP node on the strength of the first one's prevalence.
+                if (confirmed_motifs.find(canonical_motif_key(arr.unit_seq)) == confirmed_motifs.end())
+                    continue;
                 const std::string& unit = arr.unit_seq;
                 const std::string rc = reverse_complement(unit);
                 const bool forward = unit <= rc;
                 const std::string canonical = forward ? unit : rc;
                 const bool rev = !forward;
 
-                auto rit = rep_by_unit.find(canonical);
+                const std::string rep_key = std::to_string(bubble.id) + "\t" + canonical;
+                auto rit = rep_by_unit.find(rep_key);
                 std::string rep_id;
                 if (rit == rep_by_unit.end()) {
                     rep_id = add_new_node(model, canonical);
-                    rep_by_unit.emplace(canonical, rep_id);
+                    rep_by_unit.emplace(rep_key, rep_id);
                     ++summary.nodes_added;
                 } else {
                     rep_id = rit->second;
@@ -920,10 +1077,18 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
         if (normalized) {
             ++summary.bubbles_normalized;
         }
+        std::size_t top_carriers = 0;
+        for (const auto& [_m, c] : carriers_by_motif) top_carriers = std::max(top_carriers, c);
+        const char* status = normalized ? "normalized"
+                             : carriers_by_motif.empty() ? "no_tandem_detected"
+                             : confirmed_motifs.empty() ? "below_prevalence"
+                                                        : "no_copies_rewritten";
         report << bubble.id << '\t' << (normalized ? "yes" : "no") << '\t'
                << unit_bp_report << '\t' << paths_norm << '\t'
                << min_copies_seen << '\t' << max_copies_seen << '\t'
-               << interruptions_bp << '\t' << collapsed_nodes.size() << '\n';
+               << interruptions_bp << '\t' << collapsed_nodes.size() << '\t'
+               << n_traverse << '\t' << top_carriers << '\t' << prevalence << '\t'
+               << carriers_by_motif.size() << '\t' << status << '\n';
         progress.tick();
     }
     progress.done();
@@ -1026,13 +1191,23 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
         GraphSortOptions sort_opts;
         sort_opts.reference_path = options.reference_path;
         sort_opts.flip = !options.no_flip;
-        sort_graph_reference(model, sort_opts);
+        // The sorter resolves an exact name, a unique case-insensitive match or a unique substring, and
+        // everything after this compares path names EXACTLY. Discarding the resolved name meant
+        // `-r FULL` for a path named `full` sorted correctly and then oriented nothing: the re-snarled
+        // bubbles came back reversed with ref_allele_support 0.
+        const GraphSortResult sort_result = sort_graph_reference(model, sort_opts);
+        const std::string resolved_reference = sort_result.resolved_reference;
 
         const std::string sorted_gfa = options.out_prefix + ".normalized.sorted.gfa";
         write_gfa_model(sorted_gfa, model);
 
         BubbleCallOptions bopts;
-        bopts.reference_path = options.reference_path;
+        bopts.reference_path = resolved_reference;
+        // The re-snarl used BubbleCallOptions' own default (50 bp), silently re-filtering a CSV whose
+        // bubbles may have been produced under a different threshold -- so a small bubble handed to
+        // panphorte could disappear from the call-ready CSV with nothing said. The threshold is an
+        // option now, and any input bubble missing afterwards is reported.
+        bopts.min_variant_bp = options.resnarl_min_variant_bp;
         bopts.snarl_pairs_override = find_top_level_snarls_cactus(snarl_input_from_model(model));
     bopts.snarl_source_supplied = true;
         bopts.quiet = options.quiet;
@@ -1043,6 +1218,24 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
         const Graph sorted_graph = parse_gfa(sorted_gfa, parse_options);
         const BubbleCallReport report = call_bubbles_report(sorted_graph, bopts);
         write_bubbles_csv(options.out_prefix + ".bubbles.csv", report.bubbles);
+        // A bubble handed to panphorte that no longer appears after re-snarling is information the
+        // caller needs: it was either absorbed into a neighbour by normalization or dropped by the
+        // interior-span filter above.
+        if (!options.quiet) {
+            std::unordered_set<std::size_t> kept;
+            for (const Bubble& nb : report.bubbles) kept.insert(nb.id);
+            std::size_t lost = 0;
+            for (const Bubble& ib : bubbles) {
+                if (!bubble_filter.empty() && bubble_filter.find(ib.id) == bubble_filter.end()) continue;
+                if (kept.find(ib.id) == kept.end()) ++lost;
+            }
+            if (lost > 0) {
+                std::cerr << "[panphorte] " << lost << " of " << bubbles.size()
+                          << " input bubble id(s) are absent from the re-snarled CSV (normalization "
+                             "merges sites, and --resnarl-min-variant-bp "
+                          << options.resnarl_min_variant_bp << " filters them)\n";
+            }
+        }
         write_bandage_node_colors_csv(options.out_prefix + ".bandage_nodes.csv",
                                       report.bubbles, report.non_snp_bubbles);
 

@@ -26,6 +26,8 @@ void print_panphorte_help() {
         << "  -o, --out-prefix <prefix>        Output prefix for the normalized GFA + report (required)\n"
         << "      --bubble-id <N>              Restrict to one bubble ID (repeatable)\n"
         << "      --min-unit-bp <N>            Minimum repeat-unit span to normalize (default: 50)\n"
+        << "      --resnarl-min-variant-bp <N> Interior-span filter for the re-snarled call-ready CSV\n"
+        << "                                   under --reference-path (default: 50, 0 = keep all)\n"
         << "      --min-copies <N>             Minimum tandem copies to normalize (default: 2)\n"
         << "      --min-array-prevalence <f>   Min fraction of traversing haplotypes carrying a >=min-copies\n"
         << "                                   array for a bubble to be folded -- separates true population\n"
@@ -95,6 +97,10 @@ int run_panphorte_command(const std::vector<std::string>& args) {
                 throw std::runtime_error("--bubble-id must be > 0");
             }
             options.bubble_ids.push_back(id);
+            continue;
+        }
+        if (arg == "--resnarl-min-variant-bp") {
+            options.resnarl_min_variant_bp = cli::parse_size_arg(arg, require_value(arg));
             continue;
         }
         if (arg == "--min-unit-bp") {
