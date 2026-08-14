@@ -15,6 +15,12 @@ struct PanphorteOptions {
     // This used to be BubbleCallOptions' own default, applied silently to a CSV that may have been
     // produced with a different one.
     std::size_t resnarl_min_variant_bp = 50;
+    // A copy whose boundary falls inside a node cannot be folded without splitting that node. Declining
+    // only that copy leaves the site half REP and half literal, and `call` counts REP occurrences -- so
+    // a haplotype carrying one copy is reported CN 0. The site is therefore refused as a whole.
+    // Setting this true restores per-copy refusal: more sites fold, at the cost of that false CN on the
+    // affected haplotypes. Off by default, and it warns with the counts.
+    bool allow_partial_boundary = false;
     std::size_t min_copies = 2;     // minimum tandem copies to normalize
     // Minimum fraction of bubble-traversing haplotypes carrying a >=min_copies array for the bubble to
     // be normalized. Separates a population VNTR (folded) from a rare private duplication of a gene or

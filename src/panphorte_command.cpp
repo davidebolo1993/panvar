@@ -5,6 +5,8 @@
 #include "panvar/gtf.hpp"
 #include "panvar/panphorte.hpp"
 
+#include <filesystem>
+
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -26,6 +28,10 @@ void print_panphorte_help() {
         << "  -o, --out-prefix <prefix>        Output prefix for the normalized GFA + report (required)\n"
         << "      --bubble-id <N>              Restrict to one bubble ID (repeatable)\n"
         << "      --min-unit-bp <N>            Minimum repeat-unit span to normalize (default: 50)\n"
+        << "      --allow-partial-boundary     Fold a site even when some copy boundaries fall inside\n"
+        << "                                   a node. Those haplotypes keep the motif literally while\n"
+        << "                                   the rest use the REP, so `call` reports them CN 0 --\n"
+        << "                                   off by default, and it warns with the counts\n"
         << "      --resnarl-min-variant-bp <N> Interior-span filter for the re-snarled call-ready CSV\n"
         << "                                   under --reference-path (default: 50, 0 = keep all)\n"
         << "      --min-copies <N>             Minimum tandem copies to normalize (default: 2)\n"
@@ -97,6 +103,10 @@ int run_panphorte_command(const std::vector<std::string>& args) {
                 throw std::runtime_error("--bubble-id must be > 0");
             }
             options.bubble_ids.push_back(id);
+            continue;
+        }
+        if (arg == "--allow-partial-boundary") {
+            options.allow_partial_boundary = true;
             continue;
         }
         if (arg == "--resnarl-min-variant-bp") {
@@ -171,6 +181,16 @@ int run_panphorte_command(const std::vector<std::string>& args) {
 
     cli::RunLog log("panphorte", options.quiet);
     log.info("input " + options.gfa_path);
+
+    // The gene annotation is written next to the other outputs, so it can name the --gtf input.
+    if (!gtf_path.empty()) {
+        std::error_code e1, e2;
+        const auto gp = std::filesystem::weakly_canonical(gtf_path, e1);
+        const auto op = std::filesystem::weakly_canonical(options.out_prefix + ".bandage_genes.csv", e2);
+        if (!e1 && !e2 && !gp.empty() && gp == op)
+            throw std::runtime_error("panphorte: output '" + options.out_prefix +
+                                     ".bandage_genes.csv' is the same file as input '" + gtf_path + "'");
+    }
 
     PanphorteSummary summary;
     panphorte_normalize(options, &summary);

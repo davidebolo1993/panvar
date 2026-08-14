@@ -270,9 +270,66 @@ before_flank=$(spell "$OUT/flankb.sorted.gfa" flank)
 [ "$(spell "$OUT/flankp.normalized.gfa" flank)" = "$before_flank" ] \
   && ok "a copy with a mid-node boundary is declined, not truncated to the node edge" \
   || bad "the flanking haplotype lost $(( ${#before_flank} - $(spell "$OUT/flankp.normalized.gfa" flank | wc -c) )) bases"
-[ "$(rep "$OUT/flankp.panphorte.report.tsv" normalized)" = "yes" ] \
-  && ok "the clean carriers still fold while the partial-boundary copy is declined" \
-  || bad "declining one copy suppressed the whole site"
+# Site-wide, not per copy: folding the rest would leave the site half REP and half literal, and `call`
+# counts REP occurrences -- so the refused haplotype would be reported CN 0 while carrying one copy.
+[ "$(rep "$OUT/flankp.panphorte.report.tsv" normalized)" = "no" ] \
+  && ok "one in-node boundary refuses the whole site, not just that copy" \
+  || bad "the site normalized around a declined copy, leaving a mixed REP/literal representation"
+[ "$(rep "$OUT/flankp.panphorte.report.tsv" status)" = "partial_boundary" ] \
+  && ok "the refusal is reported as partial_boundary" \
+  || bad "status is $(rep "$OUT/flankp.panphorte.report.tsv" status), expected partial_boundary"
+for h in cleanA cleanB flank; do
+  [ "$(spell "$OUT/flankb.sorted.gfa" $h)" = "$(spell "$OUT/flankp.normalized.gfa" $h)" ] \
+    || bad "$h changed sequence at a refused site"
+done
+ok "every haplotype at a refused site keeps its sequence"
+
+# ---------------------------------------------------------------- a refused site is never called CN 0
+# The point of site-wide refusal: a half-REP, half-literal site makes `call` report CN 0 for a
+# haplotype that carries a copy. End to end, through call --cn, no such record may appear.
+{ printf 'H\tVN:Z:1.0\n'
+  printf "S\t1\t%s\nS\t2\t%s\nS\t5\t%s\nS\t3\tTTT%sGGG\nS\t4\t%s\n" \
+         "$BB1" "$UNIT" "$UNIT" "$UNIT" "$BB2"
+  for e in "1 2" "2 5" "5 4" "1 3" "3 4"; do
+    set -- $e; printf "L\t%s\t+\t%s\t+\t0M\n" "$1" "$2"
+  done
+  printf 'P\tcleanA\t1+,2+,5+,4+\t*\nP\tcleanB\t1+,2+,5+,4+\t*\nP\tflank\t1+,3+,4+\t*\n'; } > "$OUT/e2e.gfa"
+"$BIN" bubble -i "$OUT/e2e.gfa" -r cleanA -o "$OUT/e2eb" --min-variant-bp 0 -q >/dev/null 2>&1
+"$BIN" panphorte -i "$OUT/e2eb.sorted.gfa" -c "$OUT/e2eb.bubbles.csv" -o "$OUT/e2ep" \
+       --min-similarity 0.90 --min-array-prevalence 0.5 -r cleanA --resnarl-min-variant-bp 0 \
+       -q >/dev/null 2>&1
+if [ -s "$OUT/e2ep.bubbles.csv" ]; then
+  "$BIN" call -i "$OUT/e2ep.normalized.sorted.gfa" -b "$OUT/e2ep" -r cleanA -o "$OUT/e2ec" --cn \
+         -q >/dev/null 2>&1
+  if [ -f "$OUT/e2ec.region.vcf" ]; then
+    [ "$(grep -c 'CN=0' "$OUT/e2ec.region.vcf")" = "0" ] \
+      && ok "a site refused for a partial boundary yields no CN=0 call" \
+      || bad "call reports CN=0 for a haplotype that carries a copy: $(grep -m1 'CN=0' "$OUT/e2ec.region.vcf" | cut -c1-80)"
+  else
+    bad "call produced no region VCF for the refused site"
+  fi
+else
+  bad "the end-to-end fixture produced no call-ready CSV"
+fi
+
+# ---------------------------------------------------------------- the refusal is survivable, loudly
+"$BIN" panphorte -i "$OUT/e2eb.sorted.gfa" -c "$OUT/e2eb.bubbles.csv" -o "$OUT/e2eo" \
+       --min-similarity 0.90 --min-array-prevalence 0.5 --allow-partial-boundary \
+       > "$OUT/e2eo.log" 2>&1
+[ "$(rep "$OUT/e2eo.panphorte.report.tsv" normalized)" = "yes" ] \
+  && ok "--allow-partial-boundary folds the site instead of refusing it" \
+  || bad "--allow-partial-boundary did not restore folding"
+grep -q "CN 0" "$OUT/e2eo.log" \
+  && ok "and warns that the affected haplotypes will be called CN 0" \
+  || bad "--allow-partial-boundary folded without warning about the CN consequence"
+
+# ---------------------------------------------------------------- REP provenance is emitted
+[ -s "$OUT/cnp.panphorte.rep_provenance.tsv" ] \
+  && ok "a REP provenance table is written" \
+  || bad "no rep_provenance.tsv was written"
+head -1 "$OUT/cnp.panphorte.rep_provenance.tsv" | grep -q "canonical_motif" \
+  && ok "provenance names the site motif each REP stands for" \
+  || bad "provenance header lacks canonical_motif"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "panphorte_stats: all assertions passed"; exit 0; fi
