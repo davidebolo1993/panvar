@@ -708,7 +708,57 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
         throw std::runtime_error("Internal: path count mismatch between Graph and GfaModel");
     }
 
+    // No output may name an input: panphorte reads the graph and the CSV throughout the run, and the
+    // report and copies files used to be opened long before detection, sorting, re-snarl or GTF work
+    // could fail.
+    {
+        const std::string outs[] = {
+            options.out_prefix + ".panphorte.report.tsv",
+            options.out_prefix + ".panphorte.copies.tsv",
+            options.out_prefix + ".normalized.gfa",
+            options.out_prefix + ".normalized.sorted.gfa",
+            options.out_prefix + ".bubbles.csv",
+            options.out_prefix + ".bandage_nodes.csv",
+        };
+        for (const std::string& in : {options.gfa_path, options.bubbles_csv_in}) {
+            if (in.empty()) continue;
+            std::error_code ec;
+            const auto ip = std::filesystem::weakly_canonical(in, ec);
+            if (ec || ip.empty()) continue;
+            for (const std::string& o : outs) {
+                std::error_code e2;
+                const auto op = std::filesystem::weakly_canonical(o, e2);
+                if (!e2 && ip == op)
+                    throw std::runtime_error("panphorte: output '" + o + "' is the same file as input '" +
+                                             in + "'");
+            }
+        }
+    }
+
     const std::vector<Bubble> bubbles = read_bubbles_csv(options.bubbles_csv_in);
+    // The CSV and the graph are separate inputs with nothing tying them together, so a CSV built from
+    // a different graph -- or from this one before a rewrite renumbered it -- would otherwise run to
+    // completion against nodes that do not exist.
+    {
+        std::vector<std::string> missing;
+        std::unordered_set<std::size_t> seen_ids;
+        for (const Bubble& b : bubbles) {
+            if (!seen_ids.insert(b.id).second)
+                throw std::runtime_error("panphorte: duplicate bubble id in the CSV: " +
+                                         std::to_string(b.id));
+            const auto check = [&](const std::string& n) {
+                if (graph.nodes.find(n) == graph.nodes.end() && missing.size() < 8)
+                    missing.push_back("bubble " + std::to_string(b.id) + " node " + n);
+            };
+            check(b.source);
+            check(b.sink);
+            for (const std::string& n : b.inside) check(n);
+        }
+        if (!missing.empty())
+            throw std::runtime_error(
+                "panphorte: the bubbles CSV describes nodes the GFA does not contain (" +
+                cli::join_with_comma(missing) + "); the CSV and the graph are not the same graph");
+    }
     std::unordered_set<std::size_t> bubble_filter(options.bubble_ids.begin(), options.bubble_ids.end());
 
     const std::unordered_map<std::string, NodeTok> node_tok = build_node_tokens(graph);
@@ -758,6 +808,18 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
     report << "bubble_id\tnormalized\tunit_bp\tpaths_normalized\tmin_copies\tmax_copies\t"
            << "interruptions_bp\tnodes_collapsed\tn_traversing\tn_motif_carriers\tprevalence\t"
            << "n_motifs\tstatus\n";
+
+    // A --bubble-id that names nothing used to run to completion over an empty selection.
+    if (!bubble_filter.empty()) {
+        std::unordered_set<std::size_t> present;
+        for (const Bubble& b : bubbles) present.insert(b.id);
+        std::vector<std::string> absent;
+        for (const std::size_t want : bubble_filter)
+            if (present.find(want) == present.end()) absent.push_back(std::to_string(want));
+        if (!absent.empty())
+            throw std::runtime_error("panphorte: --bubble-id not present in the bubbles CSV: " +
+                                     cli::join_with_comma(absent));
+    }
 
     std::size_t total_bubbles = 0;
     for (const Bubble& b : bubbles) {

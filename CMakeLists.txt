@@ -266,6 +266,17 @@ if(PANVAR_BUILD_TESTING)
             set_tests_properties(panvar_inspect_stats PROPERTIES TIMEOUT 180)
         endif()
 
+        # panphorte contract. The registered C4 smoke test passes with five normalized=no rows, so it
+        # never exercises folding at all.
+        set(PANVAR_PANPHORTE_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/panphorte_stats.sh)
+        if(EXISTS ${PANVAR_PANPHORTE_STATS})
+            add_test(
+                NAME panvar_panphorte_stats
+                COMMAND /usr/bin/env bash ${PANVAR_PANPHORTE_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/panphorte_stats
+            )
+            set_tests_properties(panvar_panphorte_stats PROPERTIES TIMEOUT 300)
+        endif()
+
         # rebuild contract: the input is never destroyed, a healthy graph survives, a malformed one is
         # refused rather than silently repaired, and nothing is left behind. CTest previously exercised
         # no rebuild at all.
