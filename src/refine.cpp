@@ -39,14 +39,6 @@ std::string to_lower(std::string s) {
     return s;
 }
 
-std::string path_display_name(const GfaPath& p) {
-    if (p.type == 'P') return p.name;
-    std::string n = p.sample;
-    if (!p.hap.empty()) n += "#" + p.hap;
-    if (!p.seqid.empty()) n += "#" + p.seqid;
-    return n;
-}
-
 std::string spell(const GfaModel& model, const Steps& steps) {
     std::string out;
     for (const auto& s : steps) {
@@ -71,19 +63,69 @@ struct Interior {
     Steps steps;
     std::size_t lo = 0;
     std::size_t hi = 0;
+    bool reversed = false;   // the path crosses sink->source; steps above are canonicalized
 };
-std::optional<Interior> interior_between(const Steps& steps, const std::string& a, const std::string& b) {
-    std::size_t ia = steps.size(), ib = steps.size();
+// The interior a path carries between two anchors.
+//
+// Taking the FIRST occurrence of each anchor independently is wrong wherever an anchor repeats: the two
+// first occurrences need not bound the same traversal, and on a reverse crossing they come back in the
+// opposite order, so the interior was read backwards. Every valid (a, b) pair is enumerated instead and
+// scored by how much of the region's declared interior it contains; a reverse crossing is canonicalized
+// by reversing the steps and toggling their orientation, while `lo`/`hi` keep the ORIGINAL indices and
+// `reversed` records the direction so the edit can be spliced back where it came from.
+//
+// If two different pairs are equally good the traversal is genuinely ambiguous, and choosing one
+// arbitrarily would rewrite a copy the caller did not mean. That is refused.
+std::optional<Interior> interior_between(const Steps& steps, const std::string& a, const std::string& b,
+                                         const std::unordered_set<std::string>& region_interior,
+                                         bool* ambiguous) {
+    if (ambiguous != nullptr) *ambiguous = false;
+    std::vector<std::size_t> at_a, at_b;
     for (std::size_t i = 0; i < steps.size(); ++i) {
-        if (ia == steps.size() && steps[i].node_id == a) ia = i;
-        if (ib == steps.size() && steps[i].node_id == b) ib = i;
+        if (steps[i].node_id == a) at_a.push_back(i);
+        if (steps[i].node_id == b) at_b.push_back(i);
     }
-    if (ia == steps.size() || ib == steps.size()) return std::nullopt;
-    const std::size_t lo = std::min(ia, ib), hi = std::max(ia, ib);
+    if (at_a.empty() || at_b.empty()) return std::nullopt;
+
+    struct Cand { std::size_t lo, hi, score, span; bool reversed; };
+    std::vector<Cand> cands;
+    const auto consider = [&](std::size_t lo, std::size_t hi, bool reversed) {
+        if (hi <= lo) return;
+        std::size_t score = 0;
+        for (std::size_t k = lo + 1; k < hi; ++k) {
+            if (region_interior.empty() || region_interior.count(steps[k].node_id) != 0) ++score;
+        }
+        cands.push_back({lo, hi, score, hi - lo, reversed});
+    };
+    for (const std::size_t ia : at_a)
+        for (const std::size_t ib : at_b) {
+            if (ib > ia) consider(ia, ib, false);        // a ... b: forward
+            else if (ia > ib) consider(ib, ia, true);    // b ... a: the path crosses in reverse
+        }
+    if (cands.empty()) return std::nullopt;
+
+    // Most declared interior wins; among equals the tightest span, which is the enclosing traversal
+    // rather than one spanning several copies.
+    std::sort(cands.begin(), cands.end(), [](const Cand& x, const Cand& y) {
+        if (x.score != y.score) return x.score > y.score;
+        return x.span < y.span;
+    });
+    if (cands.size() > 1 && cands[0].score == cands[1].score && cands[0].span == cands[1].span) {
+        if (ambiguous != nullptr) *ambiguous = true;
+        return std::nullopt;
+    }
+
+    const Cand& best = cands.front();
     Interior out;
-    out.lo = lo;
-    out.hi = hi;
-    out.steps.assign(steps.begin() + static_cast<long>(lo) + 1, steps.begin() + static_cast<long>(hi));
+    out.lo = best.lo;
+    out.hi = best.hi;
+    out.reversed = best.reversed;
+    out.steps.assign(steps.begin() + static_cast<long>(best.lo) + 1,
+                     steps.begin() + static_cast<long>(best.hi));
+    if (best.reversed) {
+        std::reverse(out.steps.begin(), out.steps.end());
+        for (PathStep& st : out.steps) st.reverse = !st.reverse;
+    }
     return out;
 }
 
@@ -287,8 +329,38 @@ std::optional<RegionEdit> process_region(const std::vector<Bubble>& comp, const 
 
     // gather each traversing path's interior; skip on any unfolded (non-REP) revisit >=2x
     std::unordered_map<std::size_t, Interior> per_path;
+    // A path that touches this region's interior without spanning both anchors is a PARTIAL traversal.
+    // It cannot be rewritten, so its old nodes are retained -- and retaining them retains the old EDGES
+    // between them, leaving the pre-refinement topology beside the refined one where a walk can still
+    // take it. Sequence losslessness cannot see that: every path still spells the same bases. Skipping
+    // the region is the conservative default; --partial-path-policy retain is experimental.
+    std::size_t partial_paths = 0;
+    {
+        std::unordered_set<std::string> interior_set(anch.interior.begin(), anch.interior.end());
+        for (std::size_t idx = 0; idx < model.paths.size(); ++idx) {
+            if (interior_between(model.paths[idx].steps, anch.a, anch.b, interior_set, nullptr))
+                continue;   // spans both anchors
+            for (const PathStep& st : model.paths[idx].steps) {
+                if (interior_set.count(st.node_id) != 0) { ++partial_paths; break; }
+            }
+        }
+    }
+    if (partial_paths > 0 && opt.partial_path_policy_skip) {
+        note = tag + ": skip (" + std::to_string(partial_paths) +
+               " path(s) traverse the interior without spanning both anchors; "
+               "--partial-path-policy retain to rebuild anyway)";
+        return std::nullopt;
+    }
+
+    const std::unordered_set<std::string> region_interior(anch.interior.begin(), anch.interior.end());
     for (std::size_t idx : ref_and_paths) {
-        auto got = interior_between(model.paths[idx].steps, anch.a, anch.b);
+        bool ambiguous = false;
+        auto got = interior_between(model.paths[idx].steps, anch.a, anch.b, region_interior, &ambiguous);
+        if (ambiguous) {
+            note = tag + ": skip (ambiguous_anchor_traversal: path " + gfa_path_name(model.paths[idx]) +
+                   " has two equally good traversals between the anchors)";
+            return std::nullopt;
+        }
         if (!got) continue;
         std::unordered_map<std::string, int> c;
         for (const auto& s : got->steps) ++c[s.node_id];
@@ -316,38 +388,45 @@ std::optional<RegionEdit> process_region(const std::vector<Bubble>& comp, const 
 
     // size / diversity guards per residual segment position
     for (std::size_t pos = 0; pos < nseg; ++pos) {
-        std::vector<std::size_t> lens;
+        // abPOA is handed the DISTINCT sequences, so every guard is measured over those. Summing bases
+        // across all carriers instead made the decision depend on cohort composition: duplicating an
+        // identical haplotype could turn "rebuilt" into "skipped" without changing a single byte of
+        // POA input.
         std::set<std::string> distinct;
-        for (const auto& kv : split) {
-            std::string s = spell(model, kv.second.segments[pos]);
-            lens.push_back(s.size());
-            distinct.insert(s);
+        for (const auto& kv : split) distinct.insert(spell(model, kv.second.segments[pos]));
+        const std::size_t carriers = split.size();
+
+        std::size_t longest = 0, distinct_total = 0;
+        for (const std::string& d : distinct) {
+            longest = std::max(longest, d.size());
+            distinct_total += d.size();
         }
-        // A cost guard has to bound the worst case. The median let a single very long outlier into
-        // abPOA no matter how large it was -- POA cost is driven by the longest sequence and by total
-        // bases, and the median is blind to both. Longest and total are checked; the median is kept
-        // only for the message, since it is what makes a skip readable.
-        const std::size_t longest = lens.empty() ? 0 : *std::max_element(lens.begin(), lens.end());
+        const std::string sizes = "carriers " + std::to_string(carriers) + ", distinct " +
+                                  std::to_string(distinct.size()) + ", longest " +
+                                  std::to_string(longest) + " bp, distinct total " +
+                                  std::to_string(distinct_total) + " bp";
+
+        // The median let a single very long outlier into abPOA no matter how large it was; POA cost is
+        // driven by the longest sequence, and the median is blind to it.
         if (longest > opt.max_poa_bp) {
             note = tag + ": skip (segment " + std::to_string(pos) + " longest " +
-                   std::to_string(longest) + " bp > max-poa-bp " + std::to_string(opt.max_poa_bp) + ")";
+                   std::to_string(longest) + " bp > max-poa-bp " + std::to_string(opt.max_poa_bp) +
+                   "; " + sizes + ")";
             return std::nullopt;
         }
-        std::size_t total_bp = 0;
-        for (const std::size_t l : lens) total_bp += l;
-        // The DP matrix is roughly longest x total across the input set; bounding their product keeps
-        // a segment of very many short sequences from costing as much as one long one.
-        if (longest > 0 && total_bp > 0 &&
-            static_cast<double>(longest) * static_cast<double>(total_bp) >
-                static_cast<double>(opt.max_poa_bp) * static_cast<double>(opt.max_poa_bp) *
-                    static_cast<double>(opt.max_walks)) {
-            note = tag + ": skip (segment " + std::to_string(pos) + " POA cost bound exceeded: longest " +
-                   std::to_string(longest) + " bp x " + std::to_string(total_bp) + " bp total)";
+        // Estimated work, bounded independently. With longest <= max_poa_bp and distinct <= max_walks
+        // a product test against max_poa_bp^2 * max_walks is mathematically redundant, so it is a real
+        // separate budget or it is nothing.
+        if (opt.max_poa_work > 0 &&
+            static_cast<double>(longest) * static_cast<double>(distinct_total) >
+                static_cast<double>(opt.max_poa_work)) {
+            note = tag + ": skip (segment " + std::to_string(pos) + " estimated POA work " +
+                   std::to_string(static_cast<unsigned long long>(longest) * distinct_total) +
+                   " cells > max-poa-work " + std::to_string(opt.max_poa_work) + "; " + sizes + ")";
             return std::nullopt;
         }
         if (distinct.size() > opt.max_walks) {
-            note = tag + ": skip (segment " + std::to_string(pos) + " too diverse, " +
-                   std::to_string(distinct.size()) + " distinct sequences)";
+            note = tag + ": skip (segment " + std::to_string(pos) + " too diverse; " + sizes + ")";
             return std::nullopt;
         }
     }
@@ -382,11 +461,19 @@ std::optional<RegionEdit> process_region(const std::vector<Bubble>& comp, const 
                 for (const auto& st : sp.rep_blocks[pos]) rebuilt.push_back(st);  // REP run verbatim
             }
         }
+        // The interior was canonicalized to reference direction for alignment; a path that crosses the
+        // region in reverse must get it back in ITS direction, or the splice writes a
+        // reverse-complemented interior into a forward walk. Same length, different sequence -- which
+        // is precisely what the losslessness check exists to catch, and did.
+        if (kv.second.reversed) {
+            std::reverse(rebuilt.begin(), rebuilt.end());
+            for (PathStep& st : rebuilt) st.reverse = !st.reverse;
+        }
         edit.per_path[idx] = std::make_tuple(kv.second.lo, kv.second.hi, std::move(rebuilt));
     }
 
     for (const auto& n : anch.interior) if (!rep_set.count(n)) edit.interior_rm.insert(n);
-    note = tag + ": REBUILT [" + (rep_set.empty() ? "plain" : "rep-residual") + "] " +
+    note = tag + ": partial_paths=" + std::to_string(partial_paths) + " REBUILT [" + (rep_set.empty() ? "plain" : "rep-residual") + "] " +
            std::to_string(ref_skel.size()) + " REP block(s), " + std::to_string(nseg) + " residual seg(s) -> +" +
            std::to_string(edit.added.size()) + " nodes";
     return edit;
@@ -406,7 +493,7 @@ RefineSummary refine_graph(const RefineOptions& options) {
             options.out_prefix + ".bandage_genes.csv",
             options.out_prefix + ".refine.report.tsv",
         };
-        for (const std::string& in : {options.gfa_path, options.bubbles_csv_in}) {
+        for (const std::string& in : {options.gfa_path, options.bubbles_csv_in, options.gtf_path}) {
             if (in.empty()) continue;
             std::error_code ec;
             const auto ip = std::filesystem::weakly_canonical(in, ec);
@@ -466,7 +553,7 @@ RefineSummary refine_graph(const RefineOptions& options) {
     // `hap10` if it came first in the file.
     std::size_t ref_idx = model.paths.size();
     for (std::size_t i = 0; i < model.paths.size(); ++i) {
-        if (path_display_name(model.paths[i]) == resolved_reference) { ref_idx = i; break; }
+        if (gfa_path_name(model.paths[i]) == resolved_reference) { ref_idx = i; break; }
     }
     if (ref_idx == model.paths.size()) {
         throw std::runtime_error("refine: resolved reference '" + resolved_reference +
@@ -476,8 +563,11 @@ RefineSummary refine_graph(const RefineOptions& options) {
     // Every input path's spelled sequence, kept so the rewrite can be PROVEN lossless rather than
     // assumed to be. refine re-aligns interiors and rebuilds nodes; "sequence-preserving" was an
     // algorithmic argument with nothing checking it.
-    std::unordered_map<std::string, std::string> spelled_before;
-    for (const GfaPath& p : model.paths) spelled_before[path_display_name(p)] = spell(model, p.steps);
+    // Indexed by path position, not keyed by name: a name-keyed map silently tolerates a naming rule
+    // that does not round-trip, which is exactly the bug this replaced.
+    std::vector<std::string> spelled_before;
+    spelled_before.reserve(model.paths.size());
+    for (const GfaPath& p : model.paths) spelled_before.push_back(spell(model, p.steps));
 
     // path indices to consider per region: reference first, then all others
     std::vector<std::size_t> path_order;
@@ -531,7 +621,12 @@ RefineSummary refine_graph(const RefineOptions& options) {
 
     // The reasons a region was skipped were composed and thrown away, so "skipped 3" was the whole
     // story a user got.
-    std::ofstream rep(options.out_prefix + ".refine.report.tsv");
+    // Nothing lands in its final location until the whole run has succeeded. The report used to be
+    // opened before the losslessness check, so "a failed acceptance writes nothing" was false, and a
+    // later re-snarl or GTF failure left a usable-looking subset of the family.
+    cli::StagedOutputs staged("refine");
+    const std::string report_path = staged.stage(options.out_prefix + ".refine.report.tsv");
+    std::ofstream rep(report_path);
     if (!rep) throw std::runtime_error("refine: cannot write " + options.out_prefix + ".refine.report.tsv");
     rep << "region\tn_bubbles\tsource\tsink\tdecision\treason\n";
 
@@ -635,19 +730,19 @@ RefineSummary refine_graph(const RefineOptions& options) {
     // testing it. Checked before anything is written, so a violation cannot reach disk.
     {
         std::vector<std::string> broken;
-        for (const GfaPath& p : model.paths) {
-            const std::string name = path_display_name(p);
-            const auto it = spelled_before.find(name);
-            if (it == spelled_before.end()) { broken.push_back(name + " (path appeared)"); continue; }
-            const std::string now = spell(model, p.steps);
-            if (now != it->second && broken.size() < 8) {
-                broken.push_back(name + " (" + std::to_string(it->second.size()) + " bp -> " +
-                                 std::to_string(now.size()) + " bp)");
-            }
-        }
-        if (model.paths.size() != spelled_before.size())
+        if (model.paths.size() != spelled_before.size()) {
             broken.push_back("path count " + std::to_string(spelled_before.size()) + " -> " +
                              std::to_string(model.paths.size()));
+        } else {
+            for (std::size_t i = 0; i < model.paths.size(); ++i) {
+                const std::string now = spell(model, model.paths[i].steps);
+                if (now != spelled_before[i] && broken.size() < 8) {
+                    broken.push_back(gfa_path_name(model.paths[i]) + " (" +
+                                     std::to_string(spelled_before[i].size()) + " bp -> " +
+                                     std::to_string(now.size()) + " bp)");
+                }
+            }
+        }
         if (!broken.empty())
             throw std::runtime_error("refine: the rewrite changed a haplotype's sequence, which it must "
                                      "never do: " + cli::join_with_comma(broken));
@@ -665,7 +760,7 @@ RefineSummary refine_graph(const RefineOptions& options) {
                                         (p.steps[k - 1].reverse ? '-' : '+') + "\t" +
                                         p.steps[k].node_id + (p.steps[k].reverse ? '-' : '+');
                 if (have.find(key) == have.end())
-                    throw std::runtime_error("refine: path " + path_display_name(p) +
+                    throw std::runtime_error("refine: path " + gfa_path_name(p) +
                                              " steps across a link the rebuilt graph does not have: " +
                                              key);
             }
@@ -678,7 +773,8 @@ RefineSummary refine_graph(const RefineOptions& options) {
     sort_opts.flip = !options.no_flip;
     const GraphSortResult sort_result = sort_graph_reference(model, sort_opts);
 
-    const std::string sorted_gfa = options.out_prefix + ".normalized.sorted.gfa";
+    rep.flush();
+    const std::string sorted_gfa = staged.stage(options.out_prefix + ".normalized.sorted.gfa");
     write_gfa_model(sorted_gfa, model);
 
     BubbleCallOptions bopts;
@@ -694,16 +790,18 @@ RefineSummary refine_graph(const RefineOptions& options) {
     parse_options.include_sequences = true;
     const Graph sorted_graph = parse_gfa(sorted_gfa, parse_options);
     const BubbleCallReport report = call_bubbles_report(sorted_graph, bopts);
-    write_bubbles_csv(options.out_prefix + ".bubbles.csv", report.bubbles);
-    write_bandage_node_colors_csv(options.out_prefix + ".bandage_nodes.csv", report.bubbles,
-                                  report.non_snp_bubbles);
+    write_bubbles_csv(staged.stage(options.out_prefix + ".bubbles.csv"), report.bubbles);
+    write_bandage_node_colors_csv(staged.stage(options.out_prefix + ".bandage_nodes.csv"),
+                                  report.bubbles, report.non_snp_bubbles);
     if (!options.gtf_path.empty()) {
         if (emit_gene_annotation(sorted_graph, sort_result.resolved_reference, options.gtf_path,
-                                 options.out_prefix + ".bandage_genes.csv")) {
+                                 staged.stage(options.out_prefix + ".bandage_genes.csv"))) {
             summary.wrote_gene_annotation = true;   // it was omitted from the reported output list
         }
     }
     summary.bubbles_after = report.bubbles.size();
+    // Everything succeeded: move the family into place.
+    staged.commit();
     return summary;
 }
 

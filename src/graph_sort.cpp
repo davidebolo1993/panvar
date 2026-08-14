@@ -17,7 +17,6 @@
 #include <vector>
 
 namespace panvar {
-namespace {
 
 std::string gfa_path_name(const GfaPath& p) {
     if (p.type == 'W') {
@@ -25,6 +24,8 @@ std::string gfa_path_name(const GfaPath& p) {
     }
     return p.name;
 }
+
+namespace {
 
 std::string to_lower(std::string s) {
     for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));

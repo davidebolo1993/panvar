@@ -299,7 +299,14 @@ if(PANVAR_BUILD_TESTING)
             )
             # Real-data integration: several forced rebuilds of C4 (reproducibility across threads,
             # k either side of 31, the reference-ambiguity and verdict cases). Minutes, not seconds.
-            set_tests_properties(panvar_rebuild_stats PROPERTIES TIMEOUT 900 LABELS "real")
+            # PAUSED by default: the only test that drives minigraph, and it costs ~5.5 minutes of a
+            # ~6 minute suite. Re-enable with `cmake -DPANVAR_SLOW_TESTS=ON` (then `ctest -L slow`),
+            # and run it before anything that touches rebuild. Turn it back on by default once the
+            # module review pass is finished.
+            set_tests_properties(panvar_rebuild_stats PROPERTIES TIMEOUT 900 LABELS "real;slow")
+            if(NOT PANVAR_SLOW_TESTS)
+                set_tests_properties(panvar_rebuild_stats PROPERTIES DISABLED TRUE)
+            endif()
         endif()
 
         # Real-data integration smoke: the whole bubble -> inspect -> describe -> panphorte

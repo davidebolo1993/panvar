@@ -158,6 +158,141 @@ grep -q "longest" "$OUT/guard.refine.report.tsv" \
   && ok "the report carries one row per region" \
   || bad "the report has $(tail -n +2 "$OUT/auto.refine.report.tsv" | wc -l | tr -d ' ') rows, expected 2"
 
+# ---------------------------------------------------------------- a folded REP is held fixed
+# panphorte's self-loop REP node carries copy number. refine re-aligns the residual flanks around it
+# and must leave the REP run itself verbatim: same node, same count, same orientation.
+UNIT=$(blk 64)
+{ printf 'H\tVN:Z:1.0\n'
+  printf "S\t1\t%s\nS\t2\t%s\nS\t3\t%s\nS\t4\t%s\nS\t5\t%s\n" "$BB1" "$UNIT" "$(blk 40)" "$(blk 38)" "$BB2"
+  for e in "1 2" "2 2" "2 3" "2 4" "3 5" "4 5"; do
+    set -- $e; printf "L\t%s\t+\t%s\t+\t0M\n" "$1" "$2"
+  done
+  printf 'P\tref\t1+,2+,2+,2+,3+,5+\t*\n'
+  printf 'P\talt\t1+,2+,2+,2+,4+,5+\t*\n'
+  printf 'P\tthird\t1+,2+,2+,4+,5+\t*\n'; } > "$OUT/rep.gfa"
+"$BIN" bubble -i "$OUT/rep.gfa" -r ref -o "$OUT/repb" --min-variant-bp 0 -q >/dev/null 2>&1
+before_ref=$(spell "$OUT/repb.sorted.gfa" ref)
+"$BIN" refine -i "$OUT/repb.sorted.gfa" --bubbles-csv-in "$OUT/repb.bubbles.csv" -r ref \
+       -o "$OUT/repr" -q >/dev/null 2>&1
+if [ -s "$OUT/repr.normalized.sorted.gfa" ]; then
+  [ "$(spell "$OUT/repr.normalized.sorted.gfa" ref)" = "$before_ref" ] \
+    && ok "a folded REP region preserves the reference's spelled sequence" \
+    || bad "the REP region changed the reference's sequence"
+  selfloop=$(awk '$1=="L" && $2==$4 {print $2}' "$OUT/repr.normalized.sorted.gfa" | head -1)
+  [ -n "$selfloop" ] \
+    && ok "the self-loop REP node survives refinement" \
+    || bad "the self-loop edge was lost, so copy number is no longer recoverable"
+  n=$(awk -v r="$selfloop" '$1=="P" && $2=="ref"{n=split($3,a,","); c=0
+        for(i=1;i<=n;i++){s=a[i]; if(substr(s,1,length(s)-1)==r) c++} print c}' \
+        "$OUT/repr.normalized.sorted.gfa")
+  [ "$n" = "3" ] \
+    && ok "the REP run keeps its copy count (3x)" \
+    || bad "the REP is traversed ${n}x after refinement, expected 3"
+else
+  bad "the REP fixture produced no output"
+fi
+
+# ---------------------------------------------------------------- an unfolded non-REP revisit is skipped
+# A plain interior node visited twice is an unfolded copy-number signal. POA would linearize it and
+# destroy what `call` reconstructs, so the region must be skipped rather than rebuilt.
+# Node 2 is revisited via 3 and carries NO self-loop, so panphorte never folded it: it is an unfolded
+# copy-number signal, not a REP. (A self-loop would make it a REP and a different guard would fire.)
+{ printf 'H\tVN:Z:1.0\n'
+  printf "S\t1\t%s\nS\t2\t%s\nS\t3\t%s\nS\t4\t%s\nS\t5\t%s\n" \
+         "$BB1" "$(blk 120)" "$(blk 30)" "$BB2" "$(blk 118)"
+  for e in "1 2" "2 3" "3 2" "2 4" "1 5" "5 4"; do
+    set -- $e; printf "L\t%s\t+\t%s\t+\t0M\n" "$1" "$2"
+  done
+  printf 'P\tref\t1+,2+,3+,2+,4+\t*\nP\talt\t1+,5+,4+\t*\n'; } > "$OUT/unf.gfa"
+"$BIN" bubble -i "$OUT/unf.gfa" -r ref -o "$OUT/unfb" --min-variant-bp 0 -q >/dev/null 2>&1
+"$BIN" refine -i "$OUT/unfb.sorted.gfa" --bubbles-csv-in "$OUT/unfb.bubbles.csv" -r ref \
+       -o "$OUT/unfr" > "$OUT/unfr.log" 2>&1
+grep -q "unfolded dup" "$OUT/unfr.refine.report.tsv" 2>/dev/null \
+  && ok "an unfolded non-REP revisit is skipped, with the reason recorded" \
+  || bad "the unfolded duplication was not skipped: $(tail -1 "$OUT/unfr.refine.report.tsv" 2>/dev/null)"
+
+# ---------------------------------------------------------------- partial traversal
+# A path entering the interior without spanning both anchors cannot be rewritten. Retaining its nodes
+# also retains the old edges, so refined and unrefined topology coexist -- skip is the default.
+{ printf 'H\tVN:Z:1.0\n'
+  printf "S\t1\t%s\nS\t2\t%s\nS\t3\t%s\nS\t4\t%s\nS\t5\t%s\n" \
+         "$BB1" "$(blk 120)" "$(blk 118)" "$BB2" "$(blk 90)"
+  for e in "1 2" "1 3" "2 4" "3 4" "5 2"; do set -- $e; printf "L\t%s\t+\t%s\t+\t0M\n" "$1" "$2"; done
+  printf 'P\tref\t1+,2+,4+\t*\nP\talt\t1+,3+,4+\t*\nP\tpartial\t5+,2+,4+\t*\n'; } > "$OUT/part.gfa"
+"$BIN" bubble -i "$OUT/part.gfa" -r ref -o "$OUT/partb" --min-variant-bp 0 -q >/dev/null 2>&1
+"$BIN" refine -i "$OUT/partb.sorted.gfa" --bubbles-csv-in "$OUT/partb.bubbles.csv" -r ref \
+       -o "$OUT/ps" > "$OUT/ps.log" 2>&1
+[ "$(rebuilt "$OUT/ps.log")" = "0 1" ] \
+  && ok "a region with a partial traverser is skipped by default" \
+  || bad "partial traversal gave '$(rebuilt "$OUT/ps.log")', expected '0 1'"
+"$BIN" refine -i "$OUT/partb.sorted.gfa" --bubbles-csv-in "$OUT/partb.bubbles.csv" -r ref \
+       -o "$OUT/pr" --partial-path-policy retain > "$OUT/pr.log" 2>&1
+[ "$(rebuilt "$OUT/pr.log")" = "1 0" ] \
+  && ok "--partial-path-policy retain rebuilds it instead" \
+  || bad "retain gave '$(rebuilt "$OUT/pr.log")', expected '1 0'"
+
+# ---------------------------------------------------------------- W-line graphs
+# parse_gfa names a W path sample#hap#seqid:start-end. refine kept a private naming rule that dropped
+# the :start-end suffix, so the resolved reference matched no path and every W graph failed.
+W="$(cd "$(dirname "$0")" && pwd)/synthetic_data/syn_w.gfa"
+if [ -f "$W" ]; then
+  wref=$(awk '$1=="W"{print $2"#"$3"#"$4":"$5"-"$6; exit}' "$W")
+  "$BIN" bubble -i "$W" -r "$wref" -o "$OUT/wb" --min-variant-bp 0 -q >/dev/null 2>&1
+  "$BIN" refine -i "$OUT/wb.sorted.gfa" --bubbles-csv-in "$OUT/wb.bubbles.csv" -r "$wref" \
+         -o "$OUT/wr" -q >/dev/null 2>&1
+  [ "$?" -eq 0 ] && ok "a W-line graph resolves its reference and refines" \
+                 || bad "refine failed on a W-line graph"
+else
+  ok "W-line fixture not present, skipped"
+fi
+
+# ---------------------------------------------------------------- duplicate carriers must not decide
+# abPOA is handed DISTINCT sequences, so adding an identical haplotype changes no POA input. Summing
+# bases across carriers made cohort composition decide whether a region was rebuilt.
+{ printf 'H\tVN:Z:1.0\n'
+  printf "S\t1\t%s\nS\t2\t%s\nS\t3\t%s\nS\t4\t%s\n" "$BB1" "$(blk 120)" "$(blk 118)" "$BB2"
+  for e in "1 2" "1 3" "2 4" "3 4"; do set -- $e; printf "L\t%s\t+\t%s\t+\t0M\n" "$1" "$2"; done
+  printf 'P\tref\t1+,2+,4+\t*\nP\talt\t1+,3+,4+\t*\n'; } > "$OUT/dup1.gfa"
+{ cat "$OUT/dup1.gfa"
+  for i in 1 2 3 4 5 6 7 8; do printf "P\tcopy%s\t1+,3+,4+\t*\n" "$i"; done; } > "$OUT/dup2.gfa"
+for g in dup1 dup2; do
+  "$BIN" bubble -i "$OUT/$g.gfa" -r ref -o "$OUT/${g}b" --min-variant-bp 0 -q >/dev/null 2>&1
+  "$BIN" refine -i "$OUT/${g}b.sorted.gfa" --bubbles-csv-in "$OUT/${g}b.bubbles.csv" -r ref \
+         -o "$OUT/${g}r" --max-poa-work 200000 > "$OUT/${g}r.log" 2>&1
+done
+[ "$(rebuilt "$OUT/dup1r.log")" = "$(rebuilt "$OUT/dup2r.log")" ] \
+  && ok "replicating identical carriers does not change the POA decision" \
+  || bad "decision changed with duplicate carriers: '$(rebuilt "$OUT/dup1r.log")' vs '$(rebuilt "$OUT/dup2r.log")'"
+
+# ---------------------------------------------------------------- shuffled bubble rows
+# Component order must come from the graph, not from CSV row order.
+head -1 "$OUT/disb.bubbles.csv" > "$OUT/shuf.csv"
+tail -n +2 "$OUT/disb.bubbles.csv" | tail -r >> "$OUT/shuf.csv" 2>/dev/null || \
+  { tail -n +2 "$OUT/disb.bubbles.csv" | tac >> "$OUT/shuf.csv"; }
+"$BIN" refine -i "$OUT/disb.sorted.gfa" --bubbles-csv-in "$OUT/shuf.csv" -r ref -o "$OUT/sh" \
+       -q >/dev/null 2>&1
+cmp -s "$OUT/d1.normalized.sorted.gfa" "$OUT/sh.normalized.sorted.gfa" \
+  && ok "reordering the bubbles CSV gives byte-identical output" \
+  || bad "output depends on the order of rows in the bubbles CSV"
+
+# ---------------------------------------------------------------- the re-snarl threshold is usable
+"$BIN" refine -i "$OUT/disb.sorted.gfa" --bubbles-csv-in "$OUT/disb.bubbles.csv" -r ref \
+       -o "$OUT/rs" --resnarl-min-variant-bp 0 -q >/dev/null 2>&1
+[ "$?" -eq 0 ] && [ -s "$OUT/rs.bubbles.csv" ] \
+  && ok "--resnarl-min-variant-bp is accepted and produces a CSV" \
+  || bad "--resnarl-min-variant-bp is advertised but not parsed"
+
+# ---------------------------------------------------------------- an output may not name the GTF
+printf '#gtf\n' > "$OUT/genes.gtf"
+"$BIN" refine -i "$OUT/disb.sorted.gfa" --bubbles-csv-in "$OUT/disb.bubbles.csv" -r ref \
+       -o "$OUT/genes" --gtf "$OUT/genes.gtf" -q >/dev/null 2>&1
+# <prefix>.bandage_genes.csv vs --gtf genes.gtf do not collide; the direct collision is the check below
+cp "$OUT/disb.bubbles.csv" "$OUT/alias.bandage_genes.csv"
+"$BIN" refine -i "$OUT/disb.sorted.gfa" --bubbles-csv-in "$OUT/disb.bubbles.csv" -r ref \
+       -o "$OUT/alias" --gtf "$OUT/alias.bandage_genes.csv" -q >/dev/null 2>&1
+[ "$?" -ne 0 ] && ok "an output that would overwrite the --gtf input is refused" \
+               || bad "the --gtf input was left open to being overwritten"
+
 echo
 if [ "$fails" -eq 0 ]; then echo "refine_stats: all assertions passed"; exit 0; fi
 echo "refine_stats: $fails assertion(s) FAILED"; exit 1

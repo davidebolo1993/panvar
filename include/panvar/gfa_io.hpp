@@ -23,6 +23,11 @@ struct GfaEdge {
     std::string overlap = "0M"; // raw overlap field (e.g. "0M" or "*")
 };
 
+// The one canonical name for a path, matching what parse_gfa() records in Graph::paths: a W line is
+// sample#hap#seqid:start-end, a P line is its name. Modules kept private copies of this rule and one of
+// them dropped the :start-end suffix, so a W-line graph resolved a reference that then matched no path.
+std::string gfa_path_name(const struct GfaPath& p);
+
 struct GfaPath {
     char type = 'P';                 // 'P' or 'W'
     std::vector<PathStep> steps;     // oriented node walk

@@ -33,8 +33,15 @@ void print_refine_help() {
         << "      --bubble-id <id[,id...]>  Refine only these bubble ids (default: auto over the whole locus)\n"
         << "      --max-poa-bp <N>          Skip a residual segment whose LONGEST sequence exceeds this, and\n"
         << "                                bound total POA cost with it (default 5000)\n"
+        << "      --max-poa-work <N>        Estimated abPOA budget in DP cells: longest x total bases\n"
+        << "                                over the DISTINCT sequences (default 0 = no bound)\n"
         << "      --resnarl-min-variant-bp <N>  Interior-span filter for the re-snarled CSV (default 50)\n"
-        << "      --max-walks <N>           Skip a residual segment with more than N distinct walks (default 500)\n"
+        << "      --partial-path-policy <p>  skip|retain a region some paths only partly traverse.\n"
+        << "                                Retaining keeps their old nodes AND the old edges between\n"
+        << "                                them, so refined and unrefined topology coexist; skip is\n"
+        << "                                the default and retain is experimental\n"
+        << "      --max-walks <N>           Skip a residual segment with more than N DISTINCT sequences (not\n"
+        << "                                walks; identical carriers collapse before POA) (default 500)\n"
         << "      --min-bubbles <N>         Only rebuild regions fusing >= N bubbles (default 1)\n"
         << "      --no-flip                 Do not reorient nodes to the reference forward strand\n"
         << "  -q, --quiet                   Disable progress logs\n"
@@ -76,6 +83,15 @@ int run_refine_command(const std::vector<std::string>& args) {
         else if (arg == "--gtf") opt.gtf_path = require_value(arg);
         else if (arg == "--bubble-id") opt.only_bubble_ids = split_csv(require_value(arg));
         else if (arg == "--max-poa-bp") opt.max_poa_bp = cli::parse_size_arg(arg, require_value(arg));
+        else if (arg == "--max-poa-work") opt.max_poa_work = cli::parse_size_arg(arg, require_value(arg));
+        else if (arg == "--resnarl-min-variant-bp")
+            opt.resnarl_min_variant_bp = cli::parse_size_arg(arg, require_value(arg));
+        else if (arg == "--partial-path-policy") {
+            const std::string v = require_value(arg);
+            if (v == "skip") opt.partial_path_policy_skip = true;
+            else if (v == "retain") opt.partial_path_policy_skip = false;
+            else throw std::runtime_error("refine: --partial-path-policy must be skip or retain");
+        }
         else if (arg == "--max-walks") opt.max_walks = cli::parse_size_arg(arg, require_value(arg));
         else if (arg == "--min-bubbles") opt.min_bubbles = cli::parse_size_arg(arg, require_value(arg));
         else if (arg == "--no-flip") opt.no_flip = true;
