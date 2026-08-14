@@ -914,6 +914,7 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
             std::size_t approx_traversing = 0, approx_carriers = 0;
             std::size_t approx_partial_boundary = 0;   // copies refused for an in-node boundary
             std::size_t approx_partial_paths = 0;      // haplotypes carrying at least one such copy
+            const bool seeded = ref_unit.size() >= options.min_unit_bp;
             double approx_prevalence = 0.0;
             if (ref_unit.size() >= options.min_unit_bp) {
                 // off_lo/off_hi are the step range CONTAINING the copy; pre/suf are the bases inside
@@ -1214,8 +1215,13 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                    << unit_bp_report << '\t' << paths_norm << '\t'
                    << min_copies_seen << '\t' << max_copies_seen << '\t'
                    << interruptions_bp << '\t' << collapsed_nodes.size() << '\t'
-                   << approx_traversing << '\t' << approx_carriers << '\t' << approx_prevalence
-                   << '\t' << (ref_unit.empty() ? 0 : 1) << '\t' << approx_partial_boundary << '\t'
+                   // Without a seed nothing was counted, so these are unknown rather than zero. A
+                   // bubble reported "traversing=0" that 466 haplotypes cross is a misleading number,
+                   // and I introduced it with these columns.
+                   << (seeded ? std::to_string(approx_traversing) : ".") << '\t'
+                   << (seeded ? std::to_string(approx_carriers) : ".") << '\t'
+                   << (seeded ? std::to_string(approx_prevalence) : ".") << '\t'
+                   << (ref_unit.empty() ? 0 : 1) << '\t' << approx_partial_boundary << '\t'
                    << approx_partial_paths << '\t'
                    << (norm_ok ? "normalized"
                        : approx_partial_boundary > 0 ? "partial_boundary"
