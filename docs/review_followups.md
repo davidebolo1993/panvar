@@ -187,3 +187,39 @@ as history; Git already provides that history.
   an open succeeding does not prove that later writes reached storage. Inspect also shares the sequential
   `StagedOutputs::commit()` limitation recorded for Bubble, so a late rename/copy failure can install only
   part of the per-bubble family unless the shared helper gains rollback or a manifest protocol.
+
+## Panphorte
+
+### Deferred capability and sensitivity
+
+- **Recover safely when reused topology preserves a replaced route.** The per-edit acceptance check now
+  rejects a normalization when the original local route remains walkable because all of its nodes and
+  links are still needed elsewhere. That is the correct safe result. If this occurs often on real loci,
+  clone the reused context before rewriting so the normalized site can be separated without breaking the
+  paths that still need the original topology; until then, retain the hard refusal.
+- **Make exact folding invariant to graph node segmentation.** Default exact mode still seeds tandem
+  structure from repeated node-step runs. Two byte-identical copies split into different node boundaries
+  can therefore be missed even though folding them would be lossless; only approximate mode reaches the
+  base-level period fallback. Add an exact base-sequence fallback that proves byte identity before
+  rewriting, with fixtures whose identical copies have deliberately different step partitions.
+- **Reduce or quantify approximate-mode seed false negatives.** Copy alignment is attempted only after
+  finding an exact shared 16-mer. A copy above `--min-similarity` can remain invisible when distributed
+  substitutions disrupt every 16-mer. Consider multiple shorter/spaced seeds, minimizer candidates, or a
+  bounded seedless fallback, and calibrate sensitivity and runtime before changing the default detector.
+
+### Validation and cleanup debt
+
+- **Register a real folding regression.** The default real-data smoke test uses C4, where its Panphorte
+  rows do not normalize anything. Add an opt-in LPA regression that pins the KIV-2 site, all 466 paths,
+  sequence/topology acceptance, delivered REP provenance, and representative copy numbers. Once Bubble
+  emits a disjoint ANKRD36C set, add that locus as the nested-site regression as well.
+- **Reconcile the partial-boundary guard with its reachable behavior.** Fragment emission currently makes
+  `copies_declined_partial_boundary`, `paths_with_partial_boundary`, `partial_boundary`, and
+  `--allow-partial-boundary` structurally unreachable on the reviewed detector paths. Either add a valid
+  fixture proving the defensive branch can occur, or remove the dead option/status columns and update the
+  stale header comments. Also rename the surviving-route diagnostic from “rewritten path(s)” to
+  “replaced span(s)”, since the counter is now per edit.
+- **Strengthen family-level commit semantics.** Panphorte closes and checks its staged streams, but the
+  shared `StagedOutputs::commit()` still installs outputs sequentially. A late rename/copy failure can
+  leave only part of the normalized GFA, report, provenance, bubbles, Bandage and optional GTF family;
+  address this through the shared rollback or manifest protocol rather than module-specific handling.
