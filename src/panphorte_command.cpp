@@ -183,7 +183,10 @@ int run_panphorte_command(const std::vector<std::string>& args) {
     // Gene annotation on the collapsed graph: node ids differ from the bubble graph, so this Bandage
     // CSV is distinct from the one bubble emits. Needs a PanSN --reference-path. Projected inside
     // panphorte_normalize so it shares the staged transaction rather than landing after it.
-    options.gtf_path = options.reference_path.empty() ? std::string() : gtf_path;
+    // Passed through whether or not it will be used. Clearing it when there is no reference also cleared
+    // it from the input/output alias preflight, so a GTF named as an output would have been read and
+    // then overwritten by the commit -- the ignoring is about annotation, not about it being an input.
+    options.gtf_path = gtf_path;
     if (!gtf_path.empty() && options.reference_path.empty()) {
         // Projecting genes needs reference coordinates, so without --reference-path there is nothing to
         // project onto. It was skipped in silence, which reads as "the GTF had no genes here".

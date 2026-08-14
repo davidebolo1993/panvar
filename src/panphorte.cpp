@@ -475,6 +475,7 @@ struct EdgeSet {
 struct PathArray {
     std::size_t start = 0;
     std::size_t length = 0;
+    std::size_t bubble_id = 0;   // the site that produced this edit, for the acceptance check
     std::vector<PathStep> replacement;
 };
 
@@ -1258,6 +1259,7 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                     }
 
                     PathArray pa;
+                    pa.bubble_id = bubble.id;
                     pa.start = left + copies.front().off_lo;
                     std::size_t prev_hi = copies.front().off_lo;
                     std::string orients;
@@ -1432,6 +1434,7 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                 }
 
                 PathArray pa;
+                pa.bubble_id = bubble.id;
                 pa.start = arr.start;
                 pa.length = arr.length;
                 for (const ArrayElement& el : arr.elements) {
@@ -1641,8 +1644,13 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
     // rewrite still walkable AFTER it? A link that survives because another path needs it is not on its
     // own a defect -- at a real array that is the normal case, 2009 such links at LPA -- and refusing on
     // the count would block the locus for nothing. What matters is whether the arcs and nodes that
-    // survive still spell the old allele end to end, and that is checked directly. LPA: 0 of 466
-    // original walks remain walkable, so nothing there is left half normalized.
+    // survive still spell the old allele end to end.
+    //
+    // Asked PER EDIT, not per path. A haplotype normalized at two sites has two independent old routes,
+    // and testing the whole original walk conflates them: the first site's route being properly gone
+    // makes the walk unwalkable and hides the second site's route surviving intact. Each replaced span
+    // is therefore checked on its own -- the arc into it, its interior, and the arc out of it, which
+    // together are what make the old branch a detour a walk can actually take.
     {
         std::unordered_set<std::string> live_nodes(model.node_order.begin(), model.node_order.end());
         std::unordered_set<std::string> live_edges;
@@ -1651,20 +1659,32 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
             live_edges.insert(EdgeSet::key(e.from, e.from_orient, e.to, e.to_orient));
         std::vector<std::string> survivors;
         for (std::size_t i = 0; i < model.paths.size(); ++i) {
-            if (per_path_arrays[i].empty()) continue;      // not rewritten: its route SHOULD survive
             const std::vector<PathStep>& was = graph.paths[i].steps;
-            bool walkable = true;
-            for (std::size_t k = 0; walkable && k < was.size(); ++k) {
-                if (live_nodes.find(was[k].node_id) == live_nodes.end()) walkable = false;
-                else if (k > 0 &&
-                         live_edges.find(EdgeSet::key(was[k - 1].node_id,
-                                                      orient_char(was[k - 1].reverse), was[k].node_id,
-                                                      orient_char(was[k].reverse))) == live_edges.end())
-                    walkable = false;
-            }
-            if (walkable) {
-                ++summary.routes_surviving;
-                if (survivors.size() < 4) survivors.push_back(graph.paths[i].name);
+            const auto step_live = [&](std::size_t k) {
+                return live_nodes.find(was[k].node_id) != live_nodes.end();
+            };
+            const auto arc_live = [&](std::size_t k) {   // the arc from step k-1 to step k
+                return live_edges.find(EdgeSet::key(was[k - 1].node_id, orient_char(was[k - 1].reverse),
+                                                    was[k].node_id, orient_char(was[k].reverse))) !=
+                       live_edges.end();
+            };
+            for (const PathArray& a : per_path_arrays[i]) {
+                const std::size_t lo = a.start, hi = a.start + a.length;   // [lo, hi) was replaced
+                bool walkable = true;
+                for (std::size_t k = lo; walkable && k < hi; ++k) {
+                    if (!step_live(k)) walkable = false;
+                    else if (k > lo && !arc_live(k)) walkable = false;
+                }
+                // The anchors: without an arc in and an arc out the old interior is stranded, not a
+                // route anything can walk.
+                if (walkable && lo > 0 && !(step_live(lo - 1) && arc_live(lo))) walkable = false;
+                if (walkable && hi < was.size() && !(step_live(hi) && arc_live(hi))) walkable = false;
+                if (walkable) {
+                    ++summary.routes_surviving;
+                    if (survivors.size() < 4)
+                        survivors.push_back(graph.paths[i].name + " (bubble " +
+                                            std::to_string(a.bubble_id) + ")");
+                }
             }
         }
         // No override. This is an internal invariant, not a choice about how to fold: a graph carrying

@@ -507,6 +507,37 @@ twin_rc=$?
   && ok "a shared link whose route no longer reconnects does not refuse the run" \
   || bad "the reuse fixture was refused although its replaced route is broken"
 
+# ...and the check has to be asked PER EDIT. A haplotype normalized at two sites has two independent old
+# routes; testing the whole original walk conflates them, so the first site's route being properly gone
+# makes the walk unwalkable and hides the second site's route surviving intact. Here site A's nodes are
+# removed outright while `stubX` and `stubY` keep every node and arc of site B alive, so main, main2 and
+# flankA are each broken at A and intact at B. Measured: the whole-walk form accepts this fixture and
+# writes a graph; the per-edit form rejects all three.
+UB="TTGGCCAATTGGCCAATTGGCCAATTGGCCAATTGGCCAATTGGCCAATTGGCCAATTGGCCAA"
+MID="$(head -c 2000 /dev/zero | tr '\0' 'T')"
+S8="$(head -c 300 /dev/zero | tr '\0' 'C')"
+S9="$(head -c 300 /dev/zero | tr '\0' 'A')"
+{ printf 'H\tVN:Z:1.0\n'
+  printf "S\t1\t%s\nS\t2\t%s\nS\t3\tTTT%sGGG\nS\t4\t%s\nS\t5\t%s\nS\t7\t%s\nS\t6\t%s\nS\t8\t%s\nS\t9\t%s\n" \
+         "$BB1" "$UNIT" "$UNIT" "$MID" "$UB" "$S9" "$BB2" "$S8" "$S9"
+  for e in "1 2" "2 2" "2 4" "1 3" "3 4" "4 5" "5 5" "5 6" "4 7" "7 6" "5 8" "9 5"; do
+    set -- $e; printf "L\t%s\t+\t%s\t+\t0M\n" "$1" "$2"
+  done
+  printf 'P\tmain\t1+,2+,2+,4+,5+,5+,6+\t*\nP\tmain2\t1+,2+,2+,4+,5+,5+,6+\t*\n'
+  printf 'P\tflankA\t1+,3+,4+,5+,5+,6+\t*\nP\tflankB\t1+,2+,2+,4+,7+,6+\t*\n'
+  printf 'P\tstubX\t4+,5+,8+\t*\nP\tstubY\t9+,5+,5+,6+\t*\n'; } > "$OUT/twosite.gfa"
+{ printf 'bubble_id,source,source_orient,sink,sink_orient,inside_node_count,total_node_count,'
+  printf 'path_support,distinct_alleles,ref_allele_support,alt_allele_support_max,'
+  printf 'alt_allele_support_min,min_inside_bp,max_inside_bp,inside_nodes\n'
+  printf '1,1,+,4,+,2,4,4,2,2,1,1,64,300,"2;3"\n'
+  printf '2,4,+,6,+,2,4,4,2,2,1,1,64,300,"5;7"\n'; } > "$OUT/twosite.bubbles.csv"
+"$BIN" panphorte -i "$OUT/twosite.gfa" -c "$OUT/twosite.bubbles.csv" -o "$OUT/twositep" \
+       --min-similarity 0.90 -q > "$OUT/twosite.log" 2>&1
+ts_rc=$?
+[ "$ts_rc" != "0" ] && grep -q "bubble 2" "$OUT/twosite.log" \
+  && ok "a surviving route at the second of two sites is not masked by the first being removed" \
+  || bad "the second site's surviving route was missed (exit $ts_rc): $(head -c 140 "$OUT/twosite.log")"
+
 # ---------------------------------------------------------------- overlap refusal respects --bubble-id
 # Only the SELECTED sites can overlap: refusing on a pair the run was never going to touch blocked the
 # one safe way to work at a locus whose CSV carries an overlap, which is to name one member of it.
@@ -576,6 +607,45 @@ grep -q "^L	$prov_out	+	$prov_out	+" "$OUT/e2ep.normalized.sorted.gfa" \
 [ "$prov_in" != "$prov_out" ] \
   && ok "the created id and the delivered id are both reported, and here they differ" \
   || bad "created_rep_node and output_rep_node are equal; the sort renumbering was not applied"
+
+# Sorting can FLIP a REP, and then the sequence panphorte built the node with is not the sequence the
+# delivered node spells. Here the reference walks the array on the minus strand, so --flip reverses it.
+{ printf 'H\tVN:Z:1.0\n'
+  printf "S\t1\t%s\nS\t2\t%s\nS\t3\tTTT%sGGG\nS\t4\t%s\n" "$BB1" "$UNIT" "$UNIT" "$BB2"
+  for e in "1 2" "2 2" "2 4" "1 3" "3 4"; do
+    set -- $e; printf "L\t%s\t+\t%s\t+\t0M\n" "$1" "$2"
+  done
+  printf 'P\trefrev\t4-,2-,2-,1-\t*\nP\tcarrier\t1+,2+,2+,4+\t*\nP\tflank\t1+,3+,4+\t*\n'; } \
+  > "$OUT/flip.gfa"
+"$BIN" panphorte -i "$OUT/flip.gfa" -c "$OUT/reuse.bubbles.csv" -o "$OUT/flipp" \
+       --min-similarity 0.90 -r refrev -q >/dev/null 2>&1
+fl_out=$(awk -F'\t' 'NR==2{print $2}' "$OUT/flipp.panphorte.rep_provenance.tsv" 2>/dev/null)
+fl_made=$(awk -F'\t' 'NR==2{print $5}' "$OUT/flipp.panphorte.rep_provenance.tsv" 2>/dev/null)
+fl_deliv=$(awk -F'\t' 'NR==2{print $6}' "$OUT/flipp.panphorte.rep_provenance.tsv" 2>/dev/null)
+fl_seq=$(awk -v n="$fl_out" '$1=="S" && $2==n {print $3}' "$OUT/flipp.normalized.sorted.gfa")
+[ -n "$fl_seq" ] && [ "$fl_deliv" = "$fl_seq" ] \
+  && ok "output_phase_unit is the sequence the delivered REP actually spells" \
+  || bad "output_phase_unit does not match segment $fl_out in the sorted graph"
+[ -n "$fl_made" ] && [ "$fl_made" != "$fl_deliv" ] \
+  && ok "and it differs from created_phase_unit when the sort flips the REP" \
+  || bad "the REP was not flipped, so this fixture proves nothing"
+
+# ---------------------------------------------------------------- the GTF is an input like any other
+# Checked only against the gene CSV, a GTF naming some other output was read and then overwritten by the
+# commit. And clearing it when there is no --reference-path removed it from the preflight too, so the
+# gap was widest exactly where the annotation is skipped.
+"$BIN" panphorte -i "$OUT/e2e.gfa" -c "$OUT/e2eb.bubbles.csv" -o "$OUT/gawith" \
+       --gtf "$OUT/gawith.panphorte.report.tsv" -r cleanA -q > "$OUT/gawith.log" 2>&1
+ga_rc=$?
+[ "$ga_rc" != "0" ] && grep -q "same file as input" "$OUT/gawith.log" \
+  && ok "a GTF that names an output is refused (with --reference-path)" \
+  || bad "GTF aliasing an output was accepted with --reference-path (exit $ga_rc)"
+"$BIN" panphorte -i "$OUT/e2e.gfa" -c "$OUT/e2eb.bubbles.csv" -o "$OUT/gawithout" \
+       --gtf "$OUT/gawithout.panphorte.report.tsv" -q > "$OUT/gawithout.log" 2>&1
+ga_rc=$?
+[ "$ga_rc" != "0" ] && grep -q "same file as input" "$OUT/gawithout.log" \
+  && ok "a GTF that names an output is refused with no --reference-path, where it is not even used" \
+  || bad "GTF aliasing an output was accepted without --reference-path (exit $ga_rc)"
 
 # ---------------------------------------------------------------- copies on unequal node boundaries
 # `mixed` reaches the motif twice: once on a node that is exactly one unit, and once inside a node whose
