@@ -11,6 +11,15 @@ Coordinates stay in the reference PATH's own frame throughout: the FASTA handed 
 spelled reference path, so svim-asm's positions and the bubble spans computed here are already the same
 frame and nothing has to be projected.
 
+Its own uncertainty is reported rather than absorbed, because this script is as capable of manufacturing
+a disagreement as of finding one: calls no bubble could claim, calls equidistant between two spans, how
+many calls were summed into each comparison, and comparisons whose net cancels a gain against a loss.
+A number here is only worth acting on once those read zero.
+
+The ceiling, stated because it is easy to overclaim: both sides start from the same graph haplotypes.
+Agreement shows CNBP corresponds to an assembly-level SV length, not that the graph is biologically
+right. That would need the original assemblies, which are not in the repository.
+
   compare_svim_asm.py --gfa bubble.sorted.gfa --bubbles bubble.bubbles.csv --vcf call.region.vcf \
                       --reference <path name> --out-dir out [--samples N] [--threads N]
 """
@@ -169,22 +178,50 @@ def main():
     for r in rows:
         per_bubble.setdefault(info_of(r[7]).get("BUBBLE_ID"), []).append(r)
 
-    # every haplotype that has a CNBP on some DUP record
-    wanted = set()
+    # every haplotype that has a CNBP on some DUP record, with the CN it was called at
+    cn_of = {}
     for r in dup_rows:
         keys = r[8].split(":")
-        if "CNBP" not in keys:
+        if "CNBP" not in keys or "CN" not in keys:
             continue
-        bi = keys.index("CNBP")
+        bi, ci = keys.index("CNBP"), keys.index("CN")
         for i in range(9, len(hdr)):
             v = r[i].split(":")
-            if len(v) > bi and v[bi] not in (".", ""):
-                wanted.add(hdr[i])
-    wanted.discard(args.reference)
-    wanted = sorted(wanted)
+            if len(v) > bi and v[bi] not in (".", "") and v[ci].lstrip("-").isdigit():
+                cn_of.setdefault(hdr[i], {})[info_of(r[7]).get("BUBBLE_ID")] = int(v[ci])
+    cn_of.pop(args.reference, None)
+    wanted = sorted(cn_of)
+
+    # Stratified, not uniform. A random draw from a cohort where two thirds sit at one CN can easily
+    # contain no gain, no zero and no reference-like haplotype at all -- and those are the classes worth
+    # checking. The extremes and one representative of each behaviour are taken first, random fill after.
     if args.samples and len(wanted) > args.samples:
-        random.Random(args.seed).shuffle(wanted)
-        wanted = sorted(wanted[:args.samples])
+        ref_cn = {}
+        for r in dup_rows:
+            inf = info_of(r[7])
+            try:
+                ref_cn[inf.get("BUBBLE_ID")] = int(inf.get("REF_CN", "0"))
+            except ValueError:
+                ref_cn[inf.get("BUBBLE_ID")] = 0
+        must = []
+        for bid in sorted({b for m in cn_of.values() for b in m}):
+            here = {h: m[bid] for h, m in cn_of.items() if bid in m}
+            if not here:
+                continue
+            rc = ref_cn.get(bid, 0)
+            lo = min(here, key=lambda h: here[h])
+            hi = max(here, key=lambda h: here[h])
+            zero = next((h for h in sorted(here) if here[h] == 0), None)
+            like = next((h for h in sorted(here) if here[h] == rc), None)
+            loss = next((h for h in sorted(here) if here[h] < rc), None)
+            gain = next((h for h in sorted(here) if here[h] > rc), None)
+            must += [h for h in (lo, hi, zero, like, loss, gain) if h]
+        must = sorted(dict.fromkeys(must))[:args.samples]
+        rest = [h for h in wanted if h not in set(must)]
+        random.Random(args.seed).shuffle(rest)
+        wanted = sorted(must + rest[:max(0, args.samples - len(must))])
+        print(f"stratified selection: {len(must)} required (per-bubble min/max CN, zero, "
+              f"reference-like, a loss and a gain) + {len(wanted) - len(must)} random")
 
     os.makedirs(args.out_dir, exist_ok=True)
     ref_fa = os.path.join(args.out_dir, "reference.fa")
@@ -193,6 +230,8 @@ def main():
     run([os.path.join(env_bin, "samtools"), "faidx", ref_fa])
 
     records = []
+    unmatched = []     # svim-asm calls no bubble span could claim
+    ambiguous = []     # calls equidistant from two spans, attributed by an arbitrary tie-break
     for n, hap in enumerate(wanted, 1):
         if hap not in paths:
             continue
@@ -220,13 +259,18 @@ def main():
         # and looked like a 4 kb disagreement.
         attributed = {}
         for p, l in events:
-            best, best_d = None, None
-            for bid, (lo, hi) in span.items():
-                d = 0 if lo <= p <= hi else min(abs(p - lo), abs(p - hi))
-                if best_d is None or d < best_d:
-                    best, best_d = bid, d
-            if best is not None and best_d <= args.margin:
-                attributed.setdefault(best, []).append(l)
+            ranked = sorted(((0 if lo <= p <= hi else min(abs(p - lo), abs(p - hi)), bid)
+                             for bid, (lo, hi) in span.items()))
+            if not ranked or ranked[0][0] > args.margin:
+                unmatched.append((hap, p, l, ranked[0][0] if ranked else -1))
+                continue
+            best_d, best = ranked[0]
+            # A call equidistant from two spans, or inside neither and near both, is attributed by an
+            # arbitrary tie-break. Counting those rather than hiding them is the difference between a
+            # disagreement that means something and one that is an artefact of this script.
+            if len(ranked) > 1 and ranked[1][0] == best_d:
+                ambiguous.append((hap, p, l, best, ranked[1][1], best_d))
+            attributed.setdefault(best, []).append((p, l))
 
         for r in dup_rows:
             bid = info_of(r[7]).get("BUBBLE_ID")
@@ -240,10 +284,18 @@ def main():
             v = r[col].split(":")
             if len(v) <= bi or v[bi] in (".", ""):
                 continue
-            svim_bp = sum(attributed.get(bid, []))
+            calls = attributed.get(bid, [])
+            svim_bp = sum(l for _p, l in calls)
+            # Signed summation can hide a deletion and an insertion cancelling, so the events are kept
+            # alongside the total: a net of zero from one 0 bp call and a net of zero from +5k/-5k are
+            # very different findings.
             records.append({
                 "bubble": bid, "variant": r[2], "hap": hap,
                 "cn": v[ci], "cnbp": int(v[bi]), "svim_bp": svim_bp,
+                "n_svim_calls": len(calls),
+                "svim_gain": sum(l for _p, l in calls if l > 0),
+                "svim_loss": sum(l for _p, l in calls if l < 0),
+                "svim_detail": ";".join(f"{p}:{l:+d}" for p, l in sorted(calls)) or ".",
                 "n_records_in_bubble": len(per_bubble.get(bid, [])),
                 "class": "pure_module" if len(per_bubble.get(bid, [])) == 1 else "compound_site",
             })
@@ -253,12 +305,13 @@ def main():
 
     out_tsv = os.path.join(args.out_dir, "svim_asm_comparison.tsv")
     with open(out_tsv, "w") as fh:
-        fh.write("bubble_id\tvariant_id\thaplotype\tcn\tcnbp\tsvim_asm_bp\tdiff_bp\t"
-                 "records_in_bubble\tclass\n")
+        fh.write("bubble_id\tvariant_id\thaplotype\tcn\tcnbp\tsvim_asm_bp\tdiff_bp\tn_svim_calls\t"
+                 "svim_gain_bp\tsvim_loss_bp\trecords_in_bubble\tclass\tsvim_calls\n")
         for r in records:
             fh.write(f"{r['bubble']}\t{r['variant']}\t{r['hap']}\t{r['cn']}\t{r['cnbp']}\t"
-                     f"{r['svim_bp']}\t{r['svim_bp'] - r['cnbp']}\t{r['n_records_in_bubble']}\t"
-                     f"{r['class']}\n")
+                     f"{r['svim_bp']}\t{r['svim_bp'] - r['cnbp']}\t{r['n_svim_calls']}\t"
+                     f"{r['svim_gain']}\t{r['svim_loss']}\t{r['n_records_in_bubble']}\t"
+                     f"{r['class']}\t{r['svim_detail']}\n")
 
     def report(label, subset):
         subset = [r for r in subset if r["cnbp"] != 0 or r["svim_bp"] != 0]
@@ -280,6 +333,23 @@ def main():
         print(line)
 
     print(f"\nwrote {out_tsv}  ({len(records)} comparisons over {len(wanted)} haplotypes)")
+    n_calls = sum(r["n_svim_calls"] for r in records)
+    print(f"svim-asm calls summed into a comparison: {n_calls}"
+          f"   attributed to no bubble: {len(unmatched)}"
+          f"   equidistant between two: {len(ambiguous)}")
+    if unmatched:
+        u = sorted(unmatched, key=lambda x: -abs(x[2]))[:4]
+        print("  largest unattributed: " +
+              ", ".join(f"{l:+d} bp at {p} ({d} bp from the nearest span)" for _h, p, l, d in u))
+    if ambiguous:
+        a = ambiguous[:3]
+        print("  ambiguous: " +
+              ", ".join(f"{l:+d} bp at {p} -> bubble {b1} or {b2}, both {d} bp away"
+                        for _h, p, l, b1, b2, d in a))
+    cancel = [r for r in records if r["svim_gain"] > 0 and r["svim_loss"] < 0]
+    if cancel:
+        print(f"  {len(cancel)} comparison(s) sum a gain and a loss together; the net can hide both "
+              f"(see svim_calls in the TSV)")
     report("all", records)
     for cls in ("pure_module", "compound_site"):
         report(cls, [r for r in records if r["class"] == cls])
