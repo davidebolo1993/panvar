@@ -148,6 +148,7 @@ struct Event {
     double fold_residual = -1.0;      // MODULE_BP: spread of folded bp around ref_fold (-1 = n/a)
     double max_support = -1.0;        // MODULE_BP: share of folded bp at ref_fold, the anchor's support
     double step_bp = 0.0;             // MODULE_BP: bp one copy adds, from the panel's cluster spacing
+    bool dosage_spacing = false;      // MODULE_BP: CN came from the spacing model, not hbp/unit
     double round_residual = -1.0;     // MODULE_BP: mean distance from a whole number of units
 };
 
@@ -693,6 +694,7 @@ void call_variants(
         out << "##INFO=<ID=CN_MODULE_REF_BP,Number=1,Type=Integer,Description=\"Reference bp across the whole bubble interior. Against CN_SHARED_BP this is the shared-versus-total question: RU_LEN describes the shared part only, and their ratio is how far (CN-REF_CN)*RU_LEN understates a carrier's real gain or loss\">\n";
         out << "##INFO=<ID=CN_REF_MULTIPLICITY_HETEROGENEITY,Number=1,Type=Float,Description=\"MODULE_BP only: length-weighted spread of the folded set's reference multiplicities around CN_REF_FOLD. 0 means one coherent unit repeated CN_REF_FOLD times. A diagnostic of graph structure, not a correctness test -- see docs/algorithms/call.md\">\n";
         out << "##INFO=<ID=CN_REF_MAX_SUPPORT,Number=1,Type=Float,Description=\"MODULE_BP only: share of multiplicity-weighted folded bp that actually sits at CN_REF_FOLD, the multiplicity REF_CN was taken from. Low values mean the anchor is supported by a small part of the module\">\n";
+        out << "##INFO=<ID=CN_DOSAGE_MODEL,Number=1,Type=String,Description=\"MODULE_BP only: REFERENCE_RATIO (CN = hbp/CN_UNIT_BP, the default) or PANEL_SPACING (CN = REF_CN + (hbp-CN_SHARED_BP)/CN_STEP_BP, --cn-unit-spacing). Determines what FORMAT:CNR_RAW means\">\n";
         out << "##INFO=<ID=CN_STEP_BP,Number=1,Type=Integer,Description=\"MODULE_BP only: bp one copy adds, estimated from the spacing between the panel's own copy-state clusters. Independent of CN_UNIT_BP, which comes from ref_bp/ref_fold\">\n";
         out << "##INFO=<ID=CN_STEP_RATIO,Number=1,Type=Float,Description=\"CN_STEP_BP / CN_UNIT_BP. 1.0 means hbp is proportional to copy number, which is what the MODULE_BP integer assumes. Measured at 1.45 on both reference paralog modules, i.e. the dosage is AFFINE and its error grows about 0.45 per copy either side of the reference copy number -- see --cn-unit-spacing and docs/algorithms/call.md\">\n";
         out << "##INFO=<ID=REF_CN_SOURCE,Number=1,Type=String,Description=\"How REF_CN was anchored: REP_TRAVERSAL (exact self-loop count) or MAX_NODE_MULTIPLICITY (a heuristic -- one short node visited N times can set it, so absolute CN on that route is heuristic even where relative dosage is sound)\">\n";
@@ -719,7 +721,7 @@ void call_variants(
         out << "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"1=carrier, 0=reference-like, .=bubble not traversed\">\n";
         out << "##FORMAT=<ID=CN,Number=1,Type=Integer,Description=\"Copy number of the repeat unit (DUP records)\">\n";
         out << "##FORMAT=<ID=CNBP,Number=1,Type=Integer,Description=\"Actual linear bp gained(+)/lost(-) by this haplotype across the copy-number module vs the reference, from the spelled walk length (sum of node length x traversal multiplicity over the bubble source->sink, minus the reference's). Recovers the linear SV size that the folded one-copy RU_LEN does not convey; DUP records only.\">\n";
-        out << "##FORMAT=<ID=CNR_RAW,Number=1,Type=Float,Description=\"CN_METHOD=MODULE_BP only: this haplotype's raw dosage hbp/CN_UNIT_BP, before rounding to CN\">\n";
+        out << "##FORMAT=<ID=CNR_RAW,Number=1,Type=Float,Description=\"CN_METHOD=MODULE_BP only: this haplotype's raw dosage before rounding to CN. Which quantity that is depends on INFO/CN_DOSAGE_MODEL: hbp/CN_UNIT_BP under REFERENCE_RATIO, or REF_CN+(hbp-CN_SHARED_BP)/CN_STEP_BP under PANEL_SPACING\">\n";
         out << "##FORMAT=<ID=CNR_MARGIN,Number=1,Type=Float,Description=\"CN_METHOD=MODULE_BP only: 0.5 minus this haplotype's distance from a whole number of units. Near 0.5 the integer CN is unambiguous; near 0 the rounding was a coin flip and CN should be read with that in mind\">\n";
         out << "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT";
         for (const std::string& s : sample_names) out << '\t' << s;
@@ -1008,6 +1010,7 @@ void call_variants(
                 mr.seed.ru_len = static_cast<std::size_t>(unit);
                 mr.seed.cn_method = CnMethod::ModuleBp;
                 mr.seed.step_bp = step_bp;
+                mr.seed.dosage_spacing = (options.cn_unit_spacing && step_bp > 0.0);
                 mr.seed.shared_fold_bp = ref_bp;
                 mr.seed.ref_fold = ref_fold;
                 mr.seed.fold_residual = fold_residual;
@@ -1023,7 +1026,11 @@ void call_variants(
                         ? static_cast<double>(ref_copies) +
                           (static_cast<double>(hbp) - static_cast<double>(ref_bp)) / step_bp
                         : static_cast<double>(hbp) / unit;
-                    const std::size_t copies = static_cast<std::size_t>(std::llround(exact));
+                    // Spacing mode can put a haplotype BELOW zero copies when its walk is shorter
+                    // than the reference's by more than REF_CN steps. llround then yields a negative
+                    // long, and the cast to size_t wraps it to something astronomical.
+                    const long long rounded = std::llround(exact);
+                    const std::size_t copies = rounded > 0 ? static_cast<std::size_t>(rounded) : 0;
                     // How far each haplotype sits from a whole number of units. A calibrated unit should
                     // divide real walks nearly exactly; persistent halves mean the unit is wrong, and
                     // rounding then manufactures a confident integer out of a bad fit.
@@ -1478,8 +1485,15 @@ void call_variants(
             }
             merged = std::move(kept);
         }
-        if (merged.empty()) return;
-        ++summary.bubbles_with_calls;
+        // The allele VCF is the LOSSLESS record of what the graph holds, so it must not be gated on
+        // the interpreted caller having found something. It was: a bubble whose events were all
+        // filtered -- by --min-sv-bp, by support, or by the tangle/oversize suppression that can remove
+        // a MODULE_BP record after its duplicated-content INS was already dropped as redundant with it
+        // -- returned here and produced no allele record either, so the one output that could still
+        // describe the site described nothing. The interpreted work below stays skipped; only the
+        // allele record now survives an empty call set.
+        const bool no_interpreted_calls = merged.empty();
+        if (!no_interpreted_calls) ++summary.bubbles_with_calls;
 
         // Map each sample to its allele (for per-carrier sub-walk provenance).
         std::unordered_map<std::string, std::size_t> sample_to_allele;
@@ -1600,6 +1614,8 @@ void call_variants(
                 }
             }
         }
+
+        if (no_interpreted_calls) return;   // allele record written above; nothing to interpret
 
         // Optional multiallelic record (--multiallelic-loci): collapse a bounded locus (STR/VNTR) into
         // one record with explicit-sequence alleles (REF + ALTs), GT indexing each sample's allele.
@@ -1900,6 +1916,10 @@ void call_variants(
             if (e.max_support >= 0.0) {
                 std::ostringstream r; r.setf(std::ios::fixed); r.precision(4);
                 r << e.max_support; info << ";CN_REF_MAX_SUPPORT=" << r.str();
+            }
+            if (e.cn_method == CnMethod::ModuleBp) {
+                info << ";CN_DOSAGE_MODEL="
+                     << (e.dosage_spacing ? "PANEL_SPACING" : "REFERENCE_RATIO");
             }
             if (e.step_bp > 0.0) {
                 info << ";CN_STEP_BP=" << static_cast<long long>(e.step_bp + 0.5);
