@@ -612,6 +612,30 @@ void call_variants(
         ? static_cast<std::size_t>(options.max_dup_region_frac * static_cast<double>(ref_total_bp))
         : 0;
 
+    // Reference base at a 1-based genomic coordinate, by binary search over the reference walk's
+    // cumulative bp. Deliberately coordinate-driven rather than node-driven: anchoring a DEL/INV on
+    // the base BEFORE the event needs that base, and the node holding it is only reachable by walk
+    // position -- but every node->position map here records a node's FIRST occurrence, which is the
+    // wrong occurrence whenever the reference revisits it. Arithmetic on the coordinate has no such
+    // ambiguity. Returns an empty string when the coordinate is outside the region.
+    auto ref_base_at = [&](std::size_t genomic_1based) -> std::string {
+        if (genomic_1based < ref_meta.region_start_1based) return std::string();
+        const std::size_t off = genomic_1based - ref_meta.region_start_1based;
+        if (ref_prefix.empty() || off >= ref_prefix.back()) return std::string();
+        const std::size_t k =
+            static_cast<std::size_t>(std::upper_bound(ref_prefix.begin(), ref_prefix.end(), off) -
+                                     ref_prefix.begin()) - 1;
+        if (k >= ref_path->steps.size()) return std::string();
+        const PathStep& st = ref_path->steps[k];
+        const auto nit = graph.nodes.find(st.node_id);
+        if (nit == graph.nodes.end() || nit->second.sequence.empty()) return std::string();
+        const std::string& s = nit->second.sequence;
+        const std::size_t idx = off - ref_prefix[k];
+        if (idx >= s.size()) return std::string();
+        if (!st.reverse) return upper_base(s[idx]);
+        return upper_base(reverse_complement(std::string(1, s[s.size() - 1 - idx]))[0]);
+    };
+
     // Optional GTF annotation: project reference-coordinate genes onto reference nodes via the PanSN
     // chrom+start. node_genes maps a ref node id -> gene indices. Built once, const in the parallel
     // loop; skipped when --gtf is unset or the reference name isn't PanSN.
@@ -675,7 +699,7 @@ void call_variants(
         out << "##source=panvar call\n";
         out << "##reference=" << ref_name << "\n";
         out << "##contig=<ID=" << ref_meta.chrom << ">\n";
-        out << "##INFO=<ID=END,Number=1,Type=Integer,Description=\"End position of the variant\">\n";
+        out << "##INFO=<ID=END,Number=1,Type=Integer,Description=\"Last reference base the variant spans, inclusive. POS is the base BEFORE the event (symbolic convention), so the event occupies POS+1..END and END-POS is its reference span: |SVLEN| for DEL/INV, 0 for INS (which spans no reference), and the module's own reference span for a CN_SCOPE=COLLAPSED_MODULE DUP -- there it equals INFO/CN_MODULE_REF_BP, the interval FORMAT:CNBP is measured over\">\n";
         out << "##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"Structural variant type\">\n";
         out << "##INFO=<ID=SVLEN,Number=1,Type=Integer,Description=\"Length difference ALT-REF. Absent on CN_SCOPE=COLLAPSED_MODULE records: their carriers both gain and lose copies, so no single record-level size exists -- read FORMAT:CNBP for the per-sample size\">\n";
         out << "##INFO=<ID=SVLEN_RANGE,Number=2,Type=Integer,Description=\"Min,max event size among merged members (when they differ)\">\n";
@@ -1723,6 +1747,11 @@ void call_variants(
             };
             std::string anchor = e.anchor_node;
             bool anchor_after = e.anchor_after;
+            // A symbolic DEL/INV is anchored on the base PRECEDING the event, so REF carries one real
+            // base and ALT is the symbol. Computed as a coordinate (first affected base minus one)
+            // rather than by stepping back a node: the preceding node is only identifiable by walk
+            // position, and every node->position map here holds first occurrences.
+            long long del_inv_pos = -1;
             if (e.type == EvType::Del || e.type == EvType::Inv) {
                 // First (genomically-lowest) reference node of the event.
                 long long best = -1;
@@ -1731,6 +1760,7 @@ void call_variants(
                     if (p >= 0 && (best < 0 || p < best)) { best = p; anchor = n; }
                 }
                 anchor_after = false;
+                if (best > static_cast<long long>(ref_meta.region_start_1based)) del_inv_pos = best - 1;
             } else if (e.type == EvType::Ins) {
                 // anchor_node is the walk-order flank of the insertion. In a forward bubble it is the
                 // genomically-upstream flank (POS = its last base); in a reverse-oriented bubble it is
@@ -1761,6 +1791,16 @@ void call_variants(
                 if (nit != graph.nodes.end() && !nit->second.sequence.empty()) {
                     const std::size_t bi = (anchor_after && glen > 0) ? glen - 1 : 0;
                     ref_base = upper_base(nit->second.sequence[bi]);
+                }
+            }
+            // Step POS back onto the preceding base. Done after the node lookup above so the REF base
+            // comes from the coordinate rather than from the event's own first node. An event starting
+            // at the very first reference base has no preceding base and keeps its original anchor.
+            if (del_inv_pos > 0) {
+                const std::string b = ref_base_at(static_cast<std::size_t>(del_inv_pos));
+                if (!b.empty()) {
+                    pos = static_cast<std::size_t>(del_inv_pos);
+                    ref_base = b;
                 }
             }
             std::size_t end = pos;
@@ -1796,7 +1836,13 @@ void call_variants(
                     const bool sink_is_far = sit->second >= bit->second;
                     const std::size_t far_start = sink_is_far ? sit->second : bit->second;
                     const std::string& far = sink_is_far ? bubble.sink : bubble.source;
-                    end = far_start + node_len(graph, far);
+                    // END closes the interval FORMAT:CNBP is measured over, and that sum runs over the
+                    // bubble's INTERIOR only -- both boundary nodes are excluded. POS is already the
+                    // last base of the near boundary, so the interior is POS+1 .. far_start-1 and END
+                    // is the base before the far boundary starts. Including the far boundary node (or,
+                    // as before, the far boundary plus one) described an interval no other field means.
+                    (void)far;
+                    end = far_start > 0 ? far_start - 1 : 0;
                 }
             }
             if (end > ref_end_1based) end = ref_end_1based;  // END is a reference coordinate; never past the graph

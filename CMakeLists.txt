@@ -266,6 +266,18 @@ if(PANVAR_BUILD_TESTING)
             set_tests_properties(panvar_inspect_stats PROPERTIES TIMEOUT 180)
         endif()
 
+        # call coordinate contract. real_smoke.sh checks that call runs and that its files exist, and
+        # asserts nothing about where a record lands -- so an off-by-one in POS/END on every DEL and
+        # INV in the primary output passed the whole suite.
+        set(PANVAR_CALL_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/call_stats.sh)
+        if(EXISTS ${PANVAR_CALL_STATS})
+            add_test(
+                NAME panvar_call_stats
+                COMMAND /usr/bin/env bash ${PANVAR_CALL_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/call_stats
+            )
+            set_tests_properties(panvar_call_stats PROPERTIES TIMEOUT 180)
+        endif()
+
         # panphorte contract. The registered C4 smoke test passes with five normalized=no rows, so it
         # never exercises folding at all.
         set(PANVAR_PANPHORTE_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/panphorte_stats.sh)

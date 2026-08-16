@@ -42,6 +42,21 @@ The two link tests in step 5 fail on opposite kinds of event, which is why both 
 
 So lower `--merge-jaccard` to merge events that share a backbone, and lower `--merge-seq-identity` / `--merge-size-ratio` to merge similar content threaded through different nodes.
 
+### 7. Place the record
+
+`POS` is the base **before** the event, not its first affected base — the symbolic convention, so `REF` carries one real reference base and `ALT` is the symbol. The event then occupies `POS+1 … END`, and `END` is the last reference base it spans, inclusive:
+
+| record | `POS` | `END` | `END − POS` |
+|---|---|---|---|
+| `DEL` / `INV` | base before the event | last deleted/inverted base | `\|SVLEN\|` |
+| `INS` | base before the insertion | `POS` | 0 — an insertion spans no reference |
+| `DUP`, `CN_SCOPE=REPEAT_UNIT` | last base of the upstream flank | last base of the first copy | `RU_LEN` |
+| `DUP`, `CN_SCOPE=COLLAPSED_MODULE` | last base of the near boundary | base before the far boundary | `CN_MODULE_REF_BP` |
+
+The two `DUP` rows differ because the routes count different things. A `REP` unit is one node, so its span is that node's length; a collapsed module's span is the bubble **interior**, which is what `FORMAT:CNBP` sums over — both boundary nodes are excluded from that sum, so `END` stops where the far boundary begins. That identity (`END − POS = CN_MODULE_REF_BP`) holds on every module record across the reference loci and is the cheapest check that a module record is placed correctly.
+
+A `DEL` or `INV` whose first affected base is the region's first base has no preceding base to anchor on and keeps its original anchor.
+
 ## Worked trace (non-`DUP` events)
 
 Reference interior `R = A B C D E F` — single-letter node tokens (a `REP` self-loop, if present, is dropped from this walk and typed separately as a `DUP`, so extra copies are never mistyped as an insertion). Six haplotypes cross the bubble:
