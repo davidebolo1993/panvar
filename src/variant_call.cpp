@@ -145,6 +145,8 @@ struct Event {
     std::size_t shared_fold_bp = 0;   // reference bp in the folded (revisited) node set
     std::size_t ref_fold = 0;         // how many times the reference revisits that set
     std::size_t module_ref_bp = 0;    // reference bp across the whole bubble interior
+    double fold_residual = -1.0;      // MODULE_BP: folded bp not at the modal multiplicity (-1 = n/a)
+    double round_residual = -1.0;     // MODULE_BP: mean distance from a whole number of units
 };
 
 // Spell a token run in place (one reservation, no per-node temporaries): hot path under the
@@ -684,6 +686,8 @@ void call_variants(
         out << "##INFO=<ID=CN_SHARED_BP,Number=1,Type=Integer,Description=\"Reference bp in the folded (revisited) node set the MODULE_BP unit was calibrated from\">\n";
         out << "##INFO=<ID=CN_REF_FOLD,Number=1,Type=Integer,Description=\"How many times the reference revisits that folded set; the MODULE_BP unit is CN_SHARED_BP/CN_REF_FOLD\">\n";
         out << "##INFO=<ID=CN_MODULE_REF_BP,Number=1,Type=Integer,Description=\"Reference bp across the whole bubble interior. Against CN_SHARED_BP this is the shared-versus-total question: RU_LEN describes the shared part only, and their ratio is how far (CN-REF_CN)*RU_LEN understates a carrier's real gain or loss\">\n";
+        out << "##INFO=<ID=CN_FOLD_RESIDUAL,Number=1,Type=Float,Description=\"MODULE_BP only: fraction of folded bp whose reference multiplicity is NOT the modal one, length-weighted. 0 means the folded set is one coherent unit repeated CN_REF_FOLD times; a high value means the module is heterogeneous -- some sequence shared by fewer paralogs than others -- so CN_UNIT_BP is a calibration constant rather than a real copy. NOT an error signal: the two loci where it is highest (GSTM1 0.83, CYP2D6 0.85) are the two whose CN is exact against pangene truth\">\n";
+        out << "##INFO=<ID=CN_ROUND_RESIDUAL,Number=1,Type=Float,Description=\"MODULE_BP only: mean distance from a whole number of units across traversing haplotypes, 0..0.5. Large values mean the calibrated unit does not divide real walks cleanly and the reported integer CN was produced by rounding a poor fit\">\n";
         if (!genes.empty())
             out << "##INFO=<ID=GENES,Number=.,Type=String,Description=\"Gene(s) overlapping the variant (from --gtf)\">\n";
         out << "##INFO=<ID=NMERGED,Number=1,Type=Integer,Description=\"Haplotype carriers merged into this record\">\n";
@@ -896,6 +900,8 @@ void call_variants(
             std::unordered_set<std::string> folded_set;
             std::size_t ref_fold = 0;
             std::size_t ref_bp = 0;
+            double fold_residual = 0.0;   // folded bp not at the modal multiplicity, 0 = one coherent unit
+            double round_residual = 0.0;  // mean |hbp/unit - nearest integer| over traversers, 0..0.5
             if (ref_idx < graph.paths.size()) {
                 const auto ref_span = span_of(ref_idx);
                 const std::vector<PathStep>& steps = graph.paths[ref_idx].steps;
@@ -906,6 +912,21 @@ void call_variants(
                     if (kv.second >= 2) folded_set.insert(kv.first);
                     ref_fold = std::max(ref_fold, kv.second);
                 }
+                // How coherent is "the folded set is ref_fold copies of one unit"? Taking the MAX
+                // multiplicity as the fold count assumes every folded node is revisited the same number
+                // of times. If they sit at 2 and 3, dividing total folded bp by 3 yields a unit that is
+                // not one copy of anything -- and CN is that unit's divisor, so the dosage inherits the
+                // incoherence. Measured length-weighted, since one long node at the wrong multiplicity
+                // matters more than many short ones.
+                std::size_t fit_bp = 0, off_bp = 0;
+                for (const std::string& id : folded_set) {
+                    const std::size_t m = cnt.count(id) ? cnt.at(id) : 0;
+                    const std::size_t len = node_len(graph, id);
+                    if (m == ref_fold) fit_bp += len * m;
+                    else off_bp += len * (m > ref_fold ? m - ref_fold : ref_fold - m);
+                }
+                fold_residual = (fit_bp + off_bp) > 0
+                    ? static_cast<double>(off_bp) / static_cast<double>(fit_bp + off_bp) : 0.0;
                 for (std::size_t i = ref_span.first; i <= ref_span.second && i < steps.size(); ++i)
                     if (folded_set.count(steps[i].node_id)) ref_bp += node_len(graph, steps[i].node_id);
             }
@@ -924,6 +945,7 @@ void call_variants(
                 static_cast<double>(ref_bp) / static_cast<double>(ref_fold) >= static_cast<double>(options.min_sv_bp)) {
                 const double unit = static_cast<double>(ref_bp) / static_cast<double>(ref_fold);
                 const std::size_t ref_copies = ref_fold;
+                std::size_t round_n = 0;
                 MergedRecord mr;
                 mr.seed.type = EvType::Dup;
                 mr.seed.nodes.push_back(bubble.source);
@@ -935,6 +957,7 @@ void call_variants(
                 mr.seed.cn_method = CnMethod::ModuleBp;
                 mr.seed.shared_fold_bp = ref_bp;
                 mr.seed.ref_fold = ref_fold;
+                mr.seed.fold_residual = fold_residual;
                 for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
                     if (!traverses.count(graph.paths[pi].name)) continue;
                     // A traverser with no folded bp carries ZERO copies -- a complete loss of the
@@ -942,8 +965,13 @@ void call_variants(
                     // sample out of sample_cn, and the writer then filled the gap with REF_CN, so the
                     // haplotype that lost the whole module read exactly like one that lost nothing.
                     const std::size_t hbp = full_walk_bp(pi);
-                    const std::size_t copies =
-                        static_cast<std::size_t>(std::llround(static_cast<double>(hbp) / unit));
+                    const double exact = static_cast<double>(hbp) / unit;
+                    const std::size_t copies = static_cast<std::size_t>(std::llround(exact));
+                    // How far each haplotype sits from a whole number of units. A calibrated unit should
+                    // divide real walks nearly exactly; persistent halves mean the unit is wrong, and
+                    // rounding then manufactures a confident integer out of a bad fit.
+                    round_residual += std::fabs(exact - static_cast<double>(copies));
+                    ++round_n;
                     // CN is reported for every traversing haplotype (absolute module count); GT marks a
                     // CARRIER only when the count differs from the reference's (a gain or a loss), so AC/AF
                     // stay meaningful instead of flagging every haplotype.
@@ -951,6 +979,27 @@ void call_variants(
                     if (copies != ref_copies) mr.carriers.push_back(graph.paths[pi].name);
                     if (copies > mr.seed.alt_cn) mr.seed.alt_cn = copies;
                 }
+                mr.seed.round_residual = round_n > 0 ? round_residual / static_cast<double>(round_n) : 0.0;
+                // Opt-in strictness. Declining here is only right when a bad fit means a wrong answer,
+                // and on the reference loci it does not: the module routes are validated against
+                // pangene truth where the fit is worst. So the gate exists, is auditable, and is off.
+                if (options.max_cn_model_residual > 0.0 &&
+                    mr.seed.round_residual > options.max_cn_model_residual) {
+                    ++summary.declined_cn_model;
+                    // Declining means NO copy-number call here, not a different one. Leaving
+                    // coverage_fired false let the peak route answer instead, and it answers something
+                    // else entirely -- at GSTM1 the MODULE_BP record covers 309 carriers and the peak
+                    // record that replaced it covered 2. A refused measurement must not be silently
+                    // substituted by a weaker one; the sequence-resolved events and the allele VCF are
+                    // what remain.
+                    coverage_fired = true;
+                    if (!options.quiet) {
+                        std::cerr << "[call] bubble " << bubble.id << ": module CN declined, integer fit "
+                                  << "residual " << mr.seed.round_residual << " over "
+                                  << options.max_cn_model_residual
+                                  << " (sequence-resolved events and the allele VCF are unaffected)\n";
+                    }
+                } else
                 if (!mr.carriers.empty()) {  // a CN-invariant module is not a variant record
                     // describe handoff: a coverage DUP's CN signal lives in the folded module's inside
                     // nodes (their per-walk multiplicity), not the bubble source. Carry them in
@@ -1781,6 +1830,14 @@ void call_variants(
             }
             if (e.shared_fold_bp > 0) info << ";CN_SHARED_BP=" << e.shared_fold_bp;
             if (e.ref_fold > 0) info << ";CN_REF_FOLD=" << e.ref_fold;
+            if (e.fold_residual >= 0.0) {
+                std::ostringstream r; r.setf(std::ios::fixed); r.precision(4);
+                r << e.fold_residual; info << ";CN_FOLD_RESIDUAL=" << r.str();
+            }
+            if (e.round_residual >= 0.0) {
+                std::ostringstream r; r.setf(std::ios::fixed); r.precision(4);
+                r << e.round_residual; info << ";CN_ROUND_RESIDUAL=" << r.str();
+            }
             if (!genes.empty()) {
                 // Genes the variant touches: its reference event nodes; for a DUP (and as a
                 // fallback) the whole bubble's reference span (the folded module).

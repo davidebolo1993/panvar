@@ -47,6 +47,12 @@ struct VariantCallOptions {
     // tangle summing diffuse revisits (real peak/coverage DUPs span a few % of the locus). Suppressed.
     // The self-loop REP route (genuine folded tandems) is not gated by this. 0 = off.
     double max_dup_region_frac = 0.80;
+    // Refuse a MODULE_BP copy-number call whose integer model fits badly: CN_ROUND_RESIDUAL above this
+    // means the calibrated unit does not divide real walks cleanly and the reported integer came from
+    // rounding a poor fit. 0 disables. Default OFF, on evidence: the fit is worst exactly where CN is
+    // exact against pangene truth (GSTM1 fold residual 0.83, CN 466/466), because the unit is a
+    // calibration constant for a heterogeneous paralog module and never claimed to be one real copy.
+    double max_cn_model_residual = 0.0;
     std::string gtf_path;                // optional reference-coordinate GTF: annotate variants with the
                                          // genes they touch (INFO GENES), write <prefix>.node_genes.tsv,
                                          // and a per-gene DUP copy-number table; needs a PanSN reference
@@ -74,7 +80,9 @@ struct VariantCallSummary {
     std::size_t allele_records = 0;   // bubbles written to the allele VCF
     std::size_t allele_skipped = 0;   // bubbles skipped there (over --allele-vcf-max-bp, or no anchor)
     std::size_t tangle_bubbles = 0;   // bubbles flagged low-complexity tangles (CN routes suppressed)
-    std::size_t oversized_dups = 0;   // peak DUPs suppressed for spanning too much of the reference
+    std::size_t oversized_dups = 0;   // peak/coverage DUPs suppressed for spanning too much reference
+    // MODULE_BP calls refused by --max-cn-model-residual (0 unless that gate is enabled).
+    std::size_t declined_cn_model = 0;
 };
 
 void call_variants(

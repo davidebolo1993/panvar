@@ -53,6 +53,12 @@ void print_call_help() {
         << "                                   with >= N high-degree hub interior nodes (default: 10, 0=off)\n"
         << "      --tangle-hub-degree <N>      Distinct-neighbour degree for an interior node to count as a\n"
         << "                                   tangle hub (default: 20)\n"
+        << "      --max-cn-model-residual <F>  Refuse a MODULE_BP copy-number call whose integer fit is\n"
+        << "                                   worse than this (CN_ROUND_RESIDUAL, 0..0.5); the bubble then\n"
+        << "                                   gets no CN call at all, not a fallback one. 0 = off, the\n"
+        << "                                   default: on the reference loci the fit is worst exactly\n"
+        << "                                   where CN is exact against truth, so declining would discard\n"
+        << "                                   correct calls\n"
         << "      --max-dup-region-frac <F>    Suppress a peak DUP spanning more than this fraction of the\n"
         << "                                   reference (a tangle artifact, not a real dup; default: 0.8, 0=off)\n"
         << "      --cn                         Copy-number calling (locus-agnostic): enables all routes and\n"
@@ -183,6 +189,10 @@ int run_call_command(const std::vector<std::string>& args) {
         }
         if (arg == "--max-dup-region-frac") {  // suppress a peak DUP spanning > this fraction of the reference
             options.max_dup_region_frac = std::stod(require_value(arg));
+            continue;
+        }
+        if (arg == "--max-cn-model-residual") {
+            options.max_cn_model_residual = cli::parse_unit_fraction_arg(arg, require_value(arg));
             continue;
         }
         if (arg == "--gtf") {
