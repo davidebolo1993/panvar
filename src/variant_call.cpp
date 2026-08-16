@@ -936,8 +936,11 @@ void call_variants(
                 mr.seed.ref_fold = ref_fold;
                 for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
                     if (!traverses.count(graph.paths[pi].name)) continue;
+                    // A traverser with no folded bp carries ZERO copies -- a complete loss of the
+                    // module, which is the largest event this record can describe. Skipping it left the
+                    // sample out of sample_cn, and the writer then filled the gap with REF_CN, so the
+                    // haplotype that lost the whole module read exactly like one that lost nothing.
                     const std::size_t hbp = full_walk_bp(pi);
-                    if (hbp == 0) continue;
                     const std::size_t copies =
                         static_cast<std::size_t>(std::llround(static_cast<double>(hbp) / unit));
                     // CN is reported for every traversing haplotype (absolute module count); GT marks a
@@ -962,20 +965,32 @@ void call_variants(
         // ---- DUP/CN events: count self-loop traversals per allele vs reference. Merge
         // on shared REP node; per-sample CN. Independent of the walk-diff alignment.
         // Skipped when bp-coverage fired (it is the authority for that bubble's copy number).
-        for (std::size_t ai = 0; !coverage_fired && ai < alleles.size(); ++ai) {
-            std::unordered_map<std::string, std::size_t> alt_count;
-            for (const PathStep& s : alleles[ai].steps) ++alt_count[s.node_id];
-            for (const std::string& cn : cn_nodes) {
-                // Only a genuine REP unit (self-loop >= min_sv_bp) anchors a self-loop DUP; an incidental
-                // tiny self-loop would emit a spurious REF_CN=0 DUP, so skip it.
-                if (node_len(graph, cn) < options.min_sv_bp) continue;
-                const std::size_t rc = ref_count.count(cn) ? ref_count.at(cn) : 0;
-                const std::size_t ac = alt_count.count(cn) ? alt_count.at(cn) : 0;
+        // Node-outer, allele-inner: every allele's traversal count of a REP node is a copy number for
+        // that node, including the alleles that match the reference. Allele-outer skipped those before
+        // the record existed, so a reference-like traverser ended up with no CN at all -- which the
+        // writer turned into REF_CN by accident rather than by measurement, and which left the per-gene
+        // sidecar with nothing to split for hundreds of LPA and ANKRD36C haplotypes.
+        for (const std::string& cn : cn_nodes) {
+            if (coverage_fired) break;
+            // Only a genuine REP unit (self-loop >= min_sv_bp) anchors a self-loop DUP; an incidental
+            // tiny self-loop would emit a spurious REF_CN=0 DUP, so skip it.
+            if (node_len(graph, cn) < options.min_sv_bp) continue;
+            const std::size_t rc = ref_count.count(cn) ? ref_count.at(cn) : 0;
+            const std::size_t unit = node_len(graph, cn);
+            std::vector<std::size_t> ac_of(alleles.size(), 0);
+            for (std::size_t ai = 0; ai < alleles.size(); ++ai) {
+                std::unordered_map<std::string, std::size_t> alt_count;
+                for (const PathStep& s : alleles[ai].steps) ++alt_count[s.node_id];
+                ac_of[ai] = alt_count.count(cn) ? alt_count.at(cn) : 0;
+            }
+            // The record exists if ANY allele differs from the reference by a callable amount; the
+            // qualifying test is unchanged, only where it sits.
+            MergedRecord* grp = nullptr;
+            for (std::size_t ai = 0; ai < alleles.size(); ++ai) {
+                const std::size_t ac = ac_of[ai];
                 if (rc == ac) continue;
-                const std::size_t unit = node_len(graph, cn);
                 const std::size_t delta = rc > ac ? rc - ac : ac - rc;
                 if (unit * delta < options.min_sv_bp) continue;
-                MergedRecord* grp = nullptr;
                 for (MergedRecord& mr : merged) {
                     if (mr.seed.type == EvType::Dup && mr.seed.nodes.front() == cn) { grp = &mr; break; }
                 }
@@ -992,9 +1007,20 @@ void call_variants(
                     merged.push_back(std::move(mr));
                     grp = &merged.back();
                 }
+            }
+            if (grp == nullptr) continue;
+            // Now fill EVERY allele, reference-like ones included. Carriers stay the differing ones, so
+            // AC/AF are unchanged; what changes is that a traverser always has a measured CN.
+            for (std::size_t ai = 0; ai < alleles.size(); ++ai) {
+                const std::size_t ac = ac_of[ai];
+                const std::size_t delta = rc > ac ? rc - ac : ac - rc;
+                // Carrier keeps exactly the rule that produced this record -- a callable difference --
+                // so AC/AF are untouched. Completeness is about sample_cn, not about who counts as a
+                // carrier: a sub-threshold difference is a real CN and not a called SV.
+                const bool carrier = (ac != rc) && (unit * delta >= options.min_sv_bp);
                 for (const std::string& m : alleles[ai].members) {
-                    grp->carriers.push_back(m);
                     grp->sample_cn[m] = ac;
+                    if (carrier) grp->carriers.push_back(m);
                 }
             }
         }
@@ -1010,6 +1036,8 @@ void call_variants(
                 if (it != ref_count.end() && it->second > ref_peak) ref_peak = it->second;
             }
             MergedRecord* peak_grp = nullptr;
+            std::vector<std::size_t> peak_of(alleles.size(), 0);   // every allele's peak, qualifying or not
+            std::vector<char> qualified(alleles.size(), 0);         // ...and whether it cleared the rule
             for (std::size_t ai = 0; ai < alleles.size(); ++ai) {
                 std::unordered_map<std::string, std::size_t> alt_count;
                 for (const PathStep& s : alleles[ai].steps) ++alt_count[s.node_id];
@@ -1026,8 +1054,10 @@ void call_variants(
                     const std::size_t rc_id = ref_count.count(id) ? ref_count.at(id) : 0;
                     if (c > rc_id) excess_bp += node_len(graph, id) * (c - rc_id);
                 }
+                peak_of[ai] = ac_peak;
                 if (ac_peak < 2 || ac_peak <= ref_peak) continue;
                 if (excess_bp < options.min_sv_bp) continue;
+                qualified[ai] = 1;
                 if (peak_grp == nullptr) {
                     MergedRecord mr;
                     mr.seed.type = EvType::Dup;
@@ -1049,9 +1079,16 @@ void call_variants(
                     peak_grp->seed.size_bp = excess_bp;
                     peak_grp->seed.ru_len = excess_bp / (ac_peak - ref_peak);
                 }
-                for (const std::string& m : alleles[ai].members) {
-                    peak_grp->carriers.push_back(m);
-                    peak_grp->sample_cn[m] = ac_peak;
+            }
+            // Fill every allele, not only the duplicating ones: a traverser at reference multiplicity
+            // has a measured CN of ref_peak, and leaving it absent made the writer invent one.
+            if (peak_grp != nullptr) {
+                for (std::size_t ai = 0; ai < alleles.size(); ++ai) {
+                    for (const std::string& m : alleles[ai].members) {
+                        peak_grp->sample_cn[m] = peak_of[ai];
+                        // Carrier keeps the original rule, excess_bp test included, so AC/AF do not move.
+                        if (qualified[ai]) peak_grp->carriers.push_back(m);
+                    }
                 }
             }
         }
@@ -1781,8 +1818,18 @@ void call_variants(
                 const bool carrier = carrier_set.count(s) != 0;
                 row << (carrier ? "1" : "0") << ':';
                 if (is_dup) {
+                    // A traverser without a measured CN is a bug in whichever route produced this
+                    // record, not a reference-like sample. Filling the gap with REF_CN made a complete
+                    // module loss indistinguishable from carrying the reference count, and hid any
+                    // failure to compute a CN at all.
                     const auto cit = mr.sample_cn.find(s);
-                    row << (cit != mr.sample_cn.end() ? std::to_string(cit->second) : std::to_string(e.ref_cn));
+                    if (cit == mr.sample_cn.end()) {
+                        throw std::runtime_error(
+                            "panvar call: no copy number for " + s + " at " + id +
+                            ", which traverses the site (" + cn_method_name(e.cn_method) +
+                            " route); a traversing haplotype must always have a measured CN");
+                    }
+                    row << cit->second;
                     row << ':' << sample_cnbp(s);
                 } else {
                     row << '.';

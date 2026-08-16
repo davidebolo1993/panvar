@@ -179,7 +179,16 @@ for region in "${REGIONS[@]}"; do
       ;;
     gstm1)
       run_region gstm1 "$DATA/gstm1.gfa.gz" "--min-similarity 0.95" panphorte "--cn"
-      validate_cn gstm1 --mode direct --truth "$DATA/gstm1.bed"
+      # TWO claims, and they need two comparisons. The region VCF's DUP carries the TOTAL copy number of
+      # the collapsed module -- the paralogs together -- so it is scored against the summed gene count,
+      # as c4/cyp2d6/acot already are. Scoring it against GSTM1 alone (the old --mode direct check) read
+      # 0% and looked like a failure, when it was only asking the module for one gene's dosage. The
+      # per-gene split below is what answers that, from the sidecar.
+      validate_cn gstm1 --mode gene-count --truth "$DATA/gstm.bed" --genes GSTM1,GSTM2,GSTM4,GSTM5
+      # Kept as a record of the distinction: GSTM1 alone against the module CN, which it is not.
+      echo "---- gstm1 GSTM1-only vs the module CN (expected to disagree; see the per-gene split) ----"
+      "$PY" "$HERE/compare_copy_number.py" --mode direct --truth "$DATA/gstm1.bed" \
+        --vcf "$OUT/gstm1/call/call.region.vcf" --label gstm1_gene_only || true
       # Per-gene split (--gtf) vs the full pangene truth (gstm.bed, per-molecule gene counts), absolute
       # (offset 0). We resolve GSTM1/2/4/5; GSTM3 is stable single-copy outside the module, so not scored.
       if [[ -s "$OUT/gstm1/call/call.dup_gene_cn.tsv" ]]; then
