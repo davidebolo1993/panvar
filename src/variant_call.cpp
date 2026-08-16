@@ -147,6 +147,7 @@ struct Event {
     std::size_t module_ref_bp = 0;    // reference bp across the whole bubble interior
     double fold_residual = -1.0;      // MODULE_BP: spread of folded bp around ref_fold (-1 = n/a)
     double max_support = -1.0;        // MODULE_BP: share of folded bp at ref_fold, the anchor's support
+    double step_bp = 0.0;             // MODULE_BP: bp one copy adds, from the panel's cluster spacing
     double round_residual = -1.0;     // MODULE_BP: mean distance from a whole number of units
 };
 
@@ -692,6 +693,8 @@ void call_variants(
         out << "##INFO=<ID=CN_MODULE_REF_BP,Number=1,Type=Integer,Description=\"Reference bp across the whole bubble interior. Against CN_SHARED_BP this is the shared-versus-total question: RU_LEN describes the shared part only, and their ratio is how far (CN-REF_CN)*RU_LEN understates a carrier's real gain or loss\">\n";
         out << "##INFO=<ID=CN_REF_MULTIPLICITY_HETEROGENEITY,Number=1,Type=Float,Description=\"MODULE_BP only: length-weighted spread of the folded set's reference multiplicities around CN_REF_FOLD. 0 means one coherent unit repeated CN_REF_FOLD times. A diagnostic of graph structure, not a correctness test -- see docs/algorithms/call.md\">\n";
         out << "##INFO=<ID=CN_REF_MAX_SUPPORT,Number=1,Type=Float,Description=\"MODULE_BP only: share of multiplicity-weighted folded bp that actually sits at CN_REF_FOLD, the multiplicity REF_CN was taken from. Low values mean the anchor is supported by a small part of the module\">\n";
+        out << "##INFO=<ID=CN_STEP_BP,Number=1,Type=Integer,Description=\"MODULE_BP only: bp one copy adds, estimated from the spacing between the panel's own copy-state clusters. Independent of CN_UNIT_BP, which comes from ref_bp/ref_fold\">\n";
+        out << "##INFO=<ID=CN_STEP_RATIO,Number=1,Type=Float,Description=\"CN_STEP_BP / CN_UNIT_BP. 1.0 means hbp is proportional to copy number, which is what the MODULE_BP integer assumes. Measured at 1.45 on both reference paralog modules, i.e. the dosage is AFFINE and its error grows about 0.45 per copy either side of the reference copy number -- see --cn-unit-spacing and docs/algorithms/call.md\">\n";
         out << "##INFO=<ID=REF_CN_SOURCE,Number=1,Type=String,Description=\"How REF_CN was anchored: REP_TRAVERSAL (exact self-loop count) or MAX_NODE_MULTIPLICITY (a heuristic -- one short node visited N times can set it, so absolute CN on that route is heuristic even where relative dosage is sound)\">\n";
         out << "##INFO=<ID=CN_CONFIDENCE,Number=1,Type=String,Description=\"HEURISTIC on CN_METHOD=PEAK, which infers dosage from the highest interior-node traversal multiplicity and is not validated against external copy-number truth\">\n";
         out << "##INFO=<ID=CN_ROUND_RESIDUAL,Number=1,Type=Float,Description=\"MODULE_BP only: MEAN distance from a whole number of units across traversers, 0..0.5. A record-level mean dilutes one ambiguous sample among many exact ones; FORMAT:CNR_MARGIN is the per-sample form and is the one to act on\">\n";
@@ -965,6 +968,35 @@ void call_variants(
                 static_cast<double>(ref_bp) / static_cast<double>(ref_fold) >= static_cast<double>(options.min_sv_bp)) {
                 const double unit = static_cast<double>(ref_bp) / static_cast<double>(ref_fold);
                 const std::size_t ref_copies = ref_fold;
+                // The unit from ref_bp/ref_fold assumes hbp is PROPORTIONAL to copy number. Measured
+                // against pangene truth it is not: each real copy adds ~1.45 of those units, so the
+                // dosage is affine and the error grows ~0.45 per copy either side of the reference.
+                // The panel itself carries the missing constant -- haplotypes cluster by copy state,
+                // and the gap between adjacent clusters IS one copy. Estimated here and reported; the
+                // integer CN still comes from the division route unless --cn-unit spacing is given,
+                // because switching the default would move a result validated at 466/466.
+                std::vector<std::size_t> all_hbp;
+                for (std::size_t pi = 0; pi < graph.paths.size(); ++pi)
+                    if (traverses.count(graph.paths[pi].name)) all_hbp.push_back(full_walk_bp(pi));
+                double step_bp = 0.0;
+                if (all_hbp.size() >= 4) {
+                    std::sort(all_hbp.begin(), all_hbp.end());
+                    std::vector<std::vector<std::size_t>> cl{{all_hbp.front()}};
+                    for (std::size_t k = 1; k < all_hbp.size(); ++k) {
+                        if (static_cast<double>(all_hbp[k] - cl.back().back()) > 0.15 * unit)
+                            cl.emplace_back();
+                        cl.back().push_back(all_hbp[k]);
+                    }
+                    std::vector<double> centres;
+                    for (const auto& c : cl)
+                        if (c.size() >= 2) centres.push_back(static_cast<double>(c[c.size() / 2]));
+                    std::vector<double> gaps;
+                    for (std::size_t k = 1; k < centres.size(); ++k) gaps.push_back(centres[k] - centres[k - 1]);
+                    if (!gaps.empty()) {
+                        std::sort(gaps.begin(), gaps.end());
+                        step_bp = gaps[gaps.size() / 2];
+                    }
+                }
                 std::size_t round_n = 0;
                 MergedRecord mr;
                 mr.seed.type = EvType::Dup;
@@ -975,6 +1007,7 @@ void call_variants(
                 mr.seed.size_bp = static_cast<std::size_t>(unit);
                 mr.seed.ru_len = static_cast<std::size_t>(unit);
                 mr.seed.cn_method = CnMethod::ModuleBp;
+                mr.seed.step_bp = step_bp;
                 mr.seed.shared_fold_bp = ref_bp;
                 mr.seed.ref_fold = ref_fold;
                 mr.seed.fold_residual = fold_residual;
@@ -986,7 +1019,10 @@ void call_variants(
                     // sample out of sample_cn, and the writer then filled the gap with REF_CN, so the
                     // haplotype that lost the whole module read exactly like one that lost nothing.
                     const std::size_t hbp = full_walk_bp(pi);
-                    const double exact = static_cast<double>(hbp) / unit;
+                    const double exact = (options.cn_unit_spacing && step_bp > 0.0)
+                        ? static_cast<double>(ref_copies) +
+                          (static_cast<double>(hbp) - static_cast<double>(ref_bp)) / step_bp
+                        : static_cast<double>(hbp) / unit;
                     const std::size_t copies = static_cast<std::size_t>(std::llround(exact));
                     // How far each haplotype sits from a whole number of units. A calibrated unit should
                     // divide real walks nearly exactly; persistent halves mean the unit is wrong, and
@@ -1864,6 +1900,12 @@ void call_variants(
             if (e.max_support >= 0.0) {
                 std::ostringstream r; r.setf(std::ios::fixed); r.precision(4);
                 r << e.max_support; info << ";CN_REF_MAX_SUPPORT=" << r.str();
+            }
+            if (e.step_bp > 0.0) {
+                info << ";CN_STEP_BP=" << static_cast<long long>(e.step_bp + 0.5);
+                std::ostringstream r; r.setf(std::ios::fixed); r.precision(3);
+                r << (e.ru_len > 0 ? e.step_bp / static_cast<double>(e.ru_len) : 0.0);
+                info << ";CN_STEP_RATIO=" << r.str();
             }
             // REF_CN is not measured the same way on every route, and absolute CN is only as good as
             // its anchor. Say which one produced it rather than leaving a bare integer.

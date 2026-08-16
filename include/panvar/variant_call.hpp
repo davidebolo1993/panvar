@@ -53,6 +53,11 @@ struct VariantCallOptions {
     // exact against pangene truth (GSTM1 fold residual 0.83, CN 466/466), because the unit is a
     // calibration constant for a heterogeneous paralog module and never claimed to be one real copy.
     double max_cn_model_residual = 0.0;
+    // Take the MODULE_BP copy-number step from the panel's cluster spacing rather than from
+    // ref_bp/ref_fold. Measured against pangene truth the spacing model is far better in the bulk
+    // (GSTM median dosage error 0.4550 -> 0.0029) but it makes CN depend on cohort composition, and it
+    // costs one of GSTM's 466 exact calls, so it is opt-in until that outlier is understood.
+    bool cn_unit_spacing = false;
     std::string gtf_path;                // optional reference-coordinate GTF: annotate variants with the
                                          // genes they touch (INFO GENES), write <prefix>.node_genes.tsv,
                                          // and a per-gene DUP copy-number table; needs a PanSN reference

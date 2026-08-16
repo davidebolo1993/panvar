@@ -53,6 +53,10 @@ void print_call_help() {
         << "                                   with >= N high-degree hub interior nodes (default: 10, 0=off)\n"
         << "      --tangle-hub-degree <N>      Distinct-neighbour degree for an interior node to count as a\n"
         << "                                   tangle hub (default: 20)\n"
+        << "      --cn-unit-spacing            Take the MODULE_BP copy-number step from the panel's own\n"
+        << "                                   cluster spacing rather than ref_bp/ref_fold. Far more\n"
+        << "                                   accurate in the bulk (GSTM median dosage error 0.455 ->\n"
+        << "                                   0.003) but makes CN depend on cohort composition; opt-in\n"
         << "      --max-cn-model-residual <F>  Refuse a MODULE_BP copy-number call whose integer fit is\n"
         << "                                   worse than this (CN_ROUND_RESIDUAL, 0..0.5); the bubble then\n"
         << "                                   gets no CN call at all, not a fallback one. 0 = off, the\n"
@@ -189,6 +193,10 @@ int run_call_command(const std::vector<std::string>& args) {
         }
         if (arg == "--max-dup-region-frac") {  // suppress a peak DUP spanning > this fraction of the reference
             options.max_dup_region_frac = std::stod(require_value(arg));
+            continue;
+        }
+        if (arg == "--cn-unit-spacing") {   // take the MODULE_BP copy step from the panel, not ref_bp/ref_fold
+            options.cn_unit_spacing = true;
             continue;
         }
         if (arg == "--max-cn-model-residual") {
