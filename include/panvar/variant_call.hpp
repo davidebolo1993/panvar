@@ -83,6 +83,7 @@ struct VariantCallSummary {
     std::size_t oversized_dups = 0;   // peak/coverage DUPs suppressed for spanning too much reference
     // MODULE_BP calls refused by --max-cn-model-residual (0 unless that gate is enabled).
     std::size_t declined_cn_model = 0;
+    std::size_t declined_cn_model_bubbles = 0;  // bubbles left with no CN record by that refusal
 };
 
 void call_variants(

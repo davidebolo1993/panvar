@@ -145,7 +145,8 @@ struct Event {
     std::size_t shared_fold_bp = 0;   // reference bp in the folded (revisited) node set
     std::size_t ref_fold = 0;         // how many times the reference revisits that set
     std::size_t module_ref_bp = 0;    // reference bp across the whole bubble interior
-    double fold_residual = -1.0;      // MODULE_BP: folded bp not at the modal multiplicity (-1 = n/a)
+    double fold_residual = -1.0;      // MODULE_BP: spread of folded bp around ref_fold (-1 = n/a)
+    double max_support = -1.0;        // MODULE_BP: share of folded bp at ref_fold, the anchor's support
     double round_residual = -1.0;     // MODULE_BP: mean distance from a whole number of units
 };
 
@@ -532,6 +533,9 @@ struct MergedRecord {
     std::set<std::string> member_nodes;                     // union of every merged member event's
                                                             // nodes (describe handoff; ordered set)
     std::unordered_map<std::string, std::size_t> sample_cn; // DUP per-sample copy number
+    // MODULE_BP: the raw hbp/unit before rounding. A record-level mean residual hides which samples are
+    // ambiguous; this keeps the question per sample, where the answer is actionable.
+    std::unordered_map<std::string, double> sample_dosage;
     std::size_t min_size_bp = 0;                            // smallest merged member size (SVLEN_RANGE)
     std::size_t max_size_bp = 0;                            // largest merged member size
     double merge_max_jaccard = -1.0;                        // strongest node-set Jaccard that merged a member (-1 = none)
@@ -686,8 +690,11 @@ void call_variants(
         out << "##INFO=<ID=CN_SHARED_BP,Number=1,Type=Integer,Description=\"Reference bp in the folded (revisited) node set the MODULE_BP unit was calibrated from\">\n";
         out << "##INFO=<ID=CN_REF_FOLD,Number=1,Type=Integer,Description=\"How many times the reference revisits that folded set; the MODULE_BP unit is CN_SHARED_BP/CN_REF_FOLD\">\n";
         out << "##INFO=<ID=CN_MODULE_REF_BP,Number=1,Type=Integer,Description=\"Reference bp across the whole bubble interior. Against CN_SHARED_BP this is the shared-versus-total question: RU_LEN describes the shared part only, and their ratio is how far (CN-REF_CN)*RU_LEN understates a carrier's real gain or loss\">\n";
-        out << "##INFO=<ID=CN_FOLD_RESIDUAL,Number=1,Type=Float,Description=\"MODULE_BP only: fraction of folded bp whose reference multiplicity is NOT the modal one, length-weighted. 0 means the folded set is one coherent unit repeated CN_REF_FOLD times; a high value means the module is heterogeneous -- some sequence shared by fewer paralogs than others -- so CN_UNIT_BP is a calibration constant rather than a real copy. NOT an error signal: the two loci where it is highest (GSTM1 0.83, CYP2D6 0.85) are the two whose CN is exact against pangene truth\">\n";
-        out << "##INFO=<ID=CN_ROUND_RESIDUAL,Number=1,Type=Float,Description=\"MODULE_BP only: mean distance from a whole number of units across traversing haplotypes, 0..0.5. Large values mean the calibrated unit does not divide real walks cleanly and the reported integer CN was produced by rounding a poor fit\">\n";
+        out << "##INFO=<ID=CN_REF_MULTIPLICITY_HETEROGENEITY,Number=1,Type=Float,Description=\"MODULE_BP only: length-weighted spread of the folded set's reference multiplicities around CN_REF_FOLD. 0 means one coherent unit repeated CN_REF_FOLD times. A diagnostic of graph structure, not a correctness test -- see docs/algorithms/call.md\">\n";
+        out << "##INFO=<ID=CN_REF_MAX_SUPPORT,Number=1,Type=Float,Description=\"MODULE_BP only: share of multiplicity-weighted folded bp that actually sits at CN_REF_FOLD, the multiplicity REF_CN was taken from. Low values mean the anchor is supported by a small part of the module\">\n";
+        out << "##INFO=<ID=REF_CN_SOURCE,Number=1,Type=String,Description=\"How REF_CN was anchored: REP_TRAVERSAL (exact self-loop count) or MAX_NODE_MULTIPLICITY (a heuristic -- one short node visited N times can set it, so absolute CN on that route is heuristic even where relative dosage is sound)\">\n";
+        out << "##INFO=<ID=CN_CONFIDENCE,Number=1,Type=String,Description=\"HEURISTIC on CN_METHOD=PEAK, which infers dosage from the highest interior-node traversal multiplicity and is not validated against external copy-number truth\">\n";
+        out << "##INFO=<ID=CN_ROUND_RESIDUAL,Number=1,Type=Float,Description=\"MODULE_BP only: MEAN distance from a whole number of units across traversers, 0..0.5. A record-level mean dilutes one ambiguous sample among many exact ones; FORMAT:CNR_MARGIN is the per-sample form and is the one to act on\">\n";
         if (!genes.empty())
             out << "##INFO=<ID=GENES,Number=.,Type=String,Description=\"Gene(s) overlapping the variant (from --gtf)\">\n";
         out << "##INFO=<ID=NMERGED,Number=1,Type=Integer,Description=\"Haplotype carriers merged into this record\">\n";
@@ -709,6 +716,8 @@ void call_variants(
         out << "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"1=carrier, 0=reference-like, .=bubble not traversed\">\n";
         out << "##FORMAT=<ID=CN,Number=1,Type=Integer,Description=\"Copy number of the repeat unit (DUP records)\">\n";
         out << "##FORMAT=<ID=CNBP,Number=1,Type=Integer,Description=\"Actual linear bp gained(+)/lost(-) by this haplotype across the copy-number module vs the reference, from the spelled walk length (sum of node length x traversal multiplicity over the bubble source->sink, minus the reference's). Recovers the linear SV size that the folded one-copy RU_LEN does not convey; DUP records only.\">\n";
+        out << "##FORMAT=<ID=CNR_RAW,Number=1,Type=Float,Description=\"CN_METHOD=MODULE_BP only: this haplotype's raw dosage hbp/CN_UNIT_BP, before rounding to CN\">\n";
+        out << "##FORMAT=<ID=CNR_MARGIN,Number=1,Type=Float,Description=\"CN_METHOD=MODULE_BP only: 0.5 minus this haplotype's distance from a whole number of units. Near 0.5 the integer CN is unambiguous; near 0 the rounding was a coin flip and CN should be read with that in mind\">\n";
         out << "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT";
         for (const std::string& s : sample_names) out << '\t' << s;
         out << '\n';
@@ -878,7 +887,11 @@ void call_variants(
             }
             if (is_tangle) ++summary.tangle_bubbles;
         }
-        bool coverage_fired = false;
+        // Three distinct states. Overloading one flag is what let a DECLINED module CN suppress
+        // --multiallelic-loci: "do not try a weaker route" and "a CN record exists" are not the same
+        // claim, and the writer needs the second.
+        bool cn_route_consumed = false;   // a module route ran; weaker routes must not answer
+        bool module_cn_declined = false;  // ...and it refused, so no CN record was emitted
         double cn_unit_bp = 0.0;   // one-copy bp of the coverage module (set when coverage fires)
         if (options.cn && !has_rep_selfloop) {
             const std::unordered_set<std::string> inside_set(bubble.inside.begin(), bubble.inside.end());
@@ -900,7 +913,8 @@ void call_variants(
             std::unordered_set<std::string> folded_set;
             std::size_t ref_fold = 0;
             std::size_t ref_bp = 0;
-            double fold_residual = 0.0;   // folded bp not at the modal multiplicity, 0 = one coherent unit
+            double fold_residual = 0.0;   // spread of folded bp around ref_fold (the MAXIMUM, not the mode)
+            double max_support = 0.0;     // share of folded bp actually at ref_fold
             double round_residual = 0.0;  // mean |hbp/unit - nearest integer| over traversers, 0..0.5
             if (ref_idx < graph.paths.size()) {
                 const auto ref_span = span_of(ref_idx);
@@ -918,15 +932,21 @@ void call_variants(
                 // not one copy of anything -- and CN is that unit's divisor, so the dosage inherits the
                 // incoherence. Measured length-weighted, since one long node at the wrong multiplicity
                 // matters more than many short ones.
-                std::size_t fit_bp = 0, off_bp = 0;
+                std::size_t fit_bp = 0, off_bp = 0, all_bp = 0;
                 for (const std::string& id : folded_set) {
                     const std::size_t m = cnt.count(id) ? cnt.at(id) : 0;
                     const std::size_t len = node_len(graph, id);
+                    all_bp += len * m;
                     if (m == ref_fold) fit_bp += len * m;
                     else off_bp += len * (m > ref_fold ? m - ref_fold : ref_fold - m);
                 }
+                // Two numbers, because one alone misleads. The heterogeneity ratio mixes observed bp for
+                // matching nodes with distance-to-ref_fold for the rest, so it is a spread measure and
+                // not "the fraction of bp at the wrong multiplicity". max_support is the plain question:
+                // how much of the folded signal actually sits at the multiplicity REF_CN was taken from.
                 fold_residual = (fit_bp + off_bp) > 0
                     ? static_cast<double>(off_bp) / static_cast<double>(fit_bp + off_bp) : 0.0;
+                max_support = all_bp > 0 ? static_cast<double>(fit_bp) / static_cast<double>(all_bp) : 0.0;
                 for (std::size_t i = ref_span.first; i <= ref_span.second && i < steps.size(); ++i)
                     if (folded_set.count(steps[i].node_id)) ref_bp += node_len(graph, steps[i].node_id);
             }
@@ -958,6 +978,7 @@ void call_variants(
                 mr.seed.shared_fold_bp = ref_bp;
                 mr.seed.ref_fold = ref_fold;
                 mr.seed.fold_residual = fold_residual;
+                mr.seed.max_support = max_support;
                 for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
                     if (!traverses.count(graph.paths[pi].name)) continue;
                     // A traverser with no folded bp carries ZERO copies -- a complete loss of the
@@ -976,6 +997,7 @@ void call_variants(
                     // CARRIER only when the count differs from the reference's (a gain or a loss), so AC/AF
                     // stay meaningful instead of flagging every haplotype.
                     mr.sample_cn[graph.paths[pi].name] = copies;
+                    mr.sample_dosage[graph.paths[pi].name] = exact;
                     if (copies != ref_copies) mr.carriers.push_back(graph.paths[pi].name);
                     if (copies > mr.seed.alt_cn) mr.seed.alt_cn = copies;
                 }
@@ -987,12 +1009,13 @@ void call_variants(
                     mr.seed.round_residual > options.max_cn_model_residual) {
                     ++summary.declined_cn_model;
                     // Declining means NO copy-number call here, not a different one. Leaving
-                    // coverage_fired false let the peak route answer instead, and it answers something
+                    // leaving the route unconsumed let the peak route answer instead, and it answers something
                     // else entirely -- at GSTM1 the MODULE_BP record covers 309 carriers and the peak
                     // record that replaced it covered 2. A refused measurement must not be silently
                     // substituted by a weaker one; the sequence-resolved events and the allele VCF are
                     // what remain.
-                    coverage_fired = true;
+                    cn_route_consumed = true;
+                    module_cn_declined = true;
                     if (!options.quiet) {
                         std::cerr << "[call] bubble " << bubble.id << ": module CN declined, integer fit "
                                   << "residual " << mr.seed.round_residual << " over "
@@ -1005,7 +1028,7 @@ void call_variants(
                     // nodes (their per-walk multiplicity), not the bubble source. Carry them in
                     // variant_nodes.tsv or `describe --variant-nodes` masks to the source and drops it.
                     mr.member_nodes.insert(bubble.inside.begin(), bubble.inside.end());
-                    coverage_fired = true;
+                    cn_route_consumed = true;
                     cn_unit_bp = unit;   // one-copy size, used to drop CN-loss DELs below
                     merged.push_back(std::move(mr));
                 }
@@ -1021,7 +1044,7 @@ void call_variants(
         // writer turned into REF_CN by accident rather than by measurement, and which left the per-gene
         // sidecar with nothing to split for hundreds of LPA and ANKRD36C haplotypes.
         for (const std::string& cn : cn_nodes) {
-            if (coverage_fired) break;
+            if (cn_route_consumed) break;
             // Only a genuine REP unit (self-loop >= min_sv_bp) anchors a self-loop DUP; an incidental
             // tiny self-loop would emit a spurious REF_CN=0 DUP, so skip it.
             if (node_len(graph, cn) < options.min_sv_bp) continue;
@@ -1079,7 +1102,7 @@ void call_variants(
         // the per-haplotype peak node traversal count. Using the peak rather than any node above the
         // reference rejects cluster background: scattered per-node excesses are paralog presence/absence,
         // the peak is dosage. Gated on the absence of a REP self-loop so routes stay disjoint.
-        if (options.cn && !has_rep_selfloop && !coverage_fired) {
+        if (options.cn && !has_rep_selfloop && !cn_route_consumed) {
             std::size_t ref_peak = 0;
             for (const std::string& id : bubble.inside) {
                 const auto it = ref_count.find(id);
@@ -1407,7 +1430,8 @@ void call_variants(
         // copies, already reported by the coverage DUP -- emitting both double-counts). Keep novel
         // INS/INV, small local DELs, and substitution arms. Runs after the EVENTID contract pass so an
         // orphaned DEL reads as a lone CN-loss DEL.
-        if (coverage_fired && cn_unit_bp > 0.0) {
+        if (module_cn_declined) ++summary.declined_cn_model_bubbles;
+        if (cn_route_consumed && cn_unit_bp > 0.0) {
             std::vector<MergedRecord> kept;
             kept.reserve(merged.size());
             for (MergedRecord& mr : merged) {
@@ -1545,7 +1569,9 @@ void call_variants(
         // one record with explicit-sequence alleles (REF + ALTs), GT indexing each sample's allele.
         // Skipped when an allele exceeds --multiallelic-max-bp, or the bubble carries a CN record (would
         // discard REF_CN/CN) -- so it applies to pure DEL/INS/INV bubbles only. Opt-in.
-        bool bubble_has_cn = coverage_fired;
+        // A DECLINED module CN emitted no record, so it must not suppress the multiallelic form --
+        // that was the flag meaning two things at once.
+        bool bubble_has_cn = false;
         for (const MergedRecord& mr : merged)
             if (mr.seed.type == EvType::Dup) { bubble_has_cn = true; break; }
         if (options.multiallelic_loci && !bubble_has_cn) {
@@ -1832,8 +1858,20 @@ void call_variants(
             if (e.ref_fold > 0) info << ";CN_REF_FOLD=" << e.ref_fold;
             if (e.fold_residual >= 0.0) {
                 std::ostringstream r; r.setf(std::ios::fixed); r.precision(4);
-                r << e.fold_residual; info << ";CN_FOLD_RESIDUAL=" << r.str();
+                r << e.fold_residual;
+                info << ";CN_REF_MULTIPLICITY_HETEROGENEITY=" << r.str();
             }
+            if (e.max_support >= 0.0) {
+                std::ostringstream r; r.setf(std::ios::fixed); r.precision(4);
+                r << e.max_support; info << ";CN_REF_MAX_SUPPORT=" << r.str();
+            }
+            // REF_CN is not measured the same way on every route, and absolute CN is only as good as
+            // its anchor. Say which one produced it rather than leaving a bare integer.
+            if (e.type == EvType::Dup && e.cn_method != CnMethod::None) {
+                info << ";REF_CN_SOURCE="
+                     << (e.cn_method == CnMethod::Rep ? "REP_TRAVERSAL" : "MAX_NODE_MULTIPLICITY");
+            }
+            if (e.cn_method == CnMethod::Peak) info << ";CN_CONFIDENCE=HEURISTIC";
             if (e.round_residual >= 0.0) {
                 std::ostringstream r; r.setf(std::ios::fixed); r.precision(4);
                 r << e.round_residual; info << ";CN_ROUND_RESIDUAL=" << r.str();
@@ -1894,10 +1932,15 @@ void call_variants(
 
             std::ostringstream row;
             row << ref_meta.chrom << '\t' << pos << '\t' << id << '\t' << ref_base
-                << "\t<" << svt << ">\t.\t.\t" << info.str() << (is_dup ? "\tGT:CN:CNBP" : "\tGT:CN");
+                << "\t<" << svt << ">\t.\t.\t" << info.str()
+                << (is_dup ? (mr.sample_dosage.empty() ? "\tGT:CN:CNBP" : "\tGT:CN:CNBP:CNR_RAW:CNR_MARGIN")
+                           : "\tGT:CN");
             for (const std::string& s : sample_names) {
                 row << '\t';
-                if (!traverses.count(s)) { row << (is_dup ? ".:.:." : ".:."); continue; }
+                if (!traverses.count(s)) {
+                    row << (is_dup ? (mr.sample_dosage.empty() ? ".:.:." : ".:.:.:.:.") : ".:.");
+                    continue;
+                }
                 const bool carrier = carrier_set.count(s) != 0;
                 row << (carrier ? "1" : "0") << ':';
                 if (is_dup) {
@@ -1914,6 +1957,20 @@ void call_variants(
                     }
                     row << cit->second;
                     row << ':' << sample_cnbp(s);
+                    // Per sample, because that is where the ambiguity lives: how far this haplotype sat
+                    // from a whole number of units, and how much room it had before the rounding would
+                    // have gone the other way.
+                    if (!mr.sample_dosage.empty()) {
+                        const auto dit = mr.sample_dosage.find(s);
+                        if (dit == mr.sample_dosage.end()) { row << ":.:."; }
+                        else {
+                            const double resid = std::fabs(dit->second - std::round(dit->second));
+                            std::ostringstream d; d.setf(std::ios::fixed); d.precision(3);
+                            d << dit->second; row << ':' << d.str();
+                            std::ostringstream m; m.setf(std::ios::fixed); m.precision(3);
+                            m << (0.5 - resid); row << ':' << m.str();
+                        }
+                    }
                 } else {
                     row << '.';
                 }
