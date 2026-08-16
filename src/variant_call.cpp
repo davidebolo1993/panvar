@@ -85,6 +85,40 @@ std::vector<Tok> collapse_walk(
 }
 
 // A typed event derived from one haplotype walk vs the reference walk.
+// How a DUP record's CN was obtained. Three genuinely different measurements, and a consumer cannot
+// interpret CN, RU_LEN or SVLEN without knowing which one it is looking at:
+//   Rep       a panphorte REP self-loop -- an exact traversal count of a literal repeat unit
+//   ModuleBp  folded-node bp divided by a reference-calibrated unit; the module may hold several
+//             paralogs, so its "unit" is the SHARED per-copy content, not a whole copy
+//   Peak      the highest interior-node traversal multiplicity, used where nothing folded
+enum class CnMethod { None, Rep, ModuleBp, Peak };
+
+const char* cn_method_name(CnMethod m) {
+    switch (m) {
+        case CnMethod::Rep: return "REP";
+        case CnMethod::ModuleBp: return "MODULE_BP";
+        case CnMethod::Peak: return "PEAK";
+        default: return "";
+    }
+}
+
+// Both of these count copies of a collapsed module rather than of a literal repeat unit, and every
+// rule that is about "a module DUP rather than a REP DUP" must cover both. The single boolean these
+// two shared before the split hid that distinction, and every use of it meant this predicate.
+bool is_module_cn(CnMethod m) { return m == CnMethod::ModuleBp || m == CnMethod::Peak; }
+
+// What the copy is a copy OF. REPEAT_UNIT means CN counts a literal repeat unit; COLLAPSED_MODULE
+// means it counts copies of a module that may contain several distinct paralogs, so per-copy content
+// is not one uniform sequence and (CN - REF_CN) x RU_LEN is not the haplotype's event size.
+const char* cn_scope_name(CnMethod m) {
+    switch (m) {
+        case CnMethod::Rep: return "REPEAT_UNIT";
+        case CnMethod::ModuleBp:
+        case CnMethod::Peak: return "COLLAPSED_MODULE";
+        default: return "";
+    }
+}
+
 struct Event {
     EvType type = EvType::Del;
     std::vector<std::string> nodes;   // variant node set (length-weighted Jaccard key)
@@ -100,8 +134,17 @@ struct Event {
     bool anchor_after = false;        // true: POS = last base of anchor (INS); false: first base
     std::size_t size_bp = 0;          // |event| for min_sv filtering / SVLEN magnitude
     std::size_t ref_pos = 0;          // reference genomic position of the anchor (merge window)
-    bool cn_peak = false;             // DUP from peak multiplicity (size_bp is the duplicated bp)
+    // Which of the three CN routes produced this record. A boolean could only say "peak or not", so
+    // the coverage and peak routes were indistinguishable in the output and in the code that reads it
+    // -- and they answer different questions: one counts copies of a literal repeat unit, the other
+    // counts copies of a collapsed paralog module whose per-copy content is not one uniform sequence.
+    CnMethod cn_method = CnMethod::None;
     std::size_t ru_len = 0;           // DUP only: repeat-unit length in bp (RU_LEN; one copy)
+    // Instrumentation for the module routes, so the unit they calibrate against is inspectable rather
+    // than inferred. Zero when the route did not set them.
+    std::size_t shared_fold_bp = 0;   // reference bp in the folded (revisited) node set
+    std::size_t ref_fold = 0;         // how many times the reference revisits that set
+    std::size_t module_ref_bp = 0;    // reference bp across the whole bubble interior
 };
 
 // Spell a token run in place (one reservation, no per-node temporaries): hot path under the
@@ -635,6 +678,11 @@ void call_variants(
         out << "##INFO=<ID=INS_SUBTYPE,Number=1,Type=String,Description=\"INS subtype: NOVEL or DUP (minimap2 refined)\">\n";
         out << "##INFO=<ID=REF_CN,Number=1,Type=Integer,Description=\"Reference copy number of the repeat unit (DUP)\">\n";
         out << "##INFO=<ID=RU_LEN,Number=1,Type=Integer,Description=\"Repeat-unit length in bp, one copy (DUP)\">\n";
+        out << "##INFO=<ID=CN_METHOD,Number=1,Type=String,Description=\"How CN was measured: REP (traversal count of a panphorte REP self-loop, exact), MODULE_BP (folded-node bp over a reference-calibrated unit), PEAK (highest interior-node traversal multiplicity)\">\n";
+        out << "##INFO=<ID=CN_SCOPE,Number=1,Type=String,Description=\"What one copy is a copy of: REPEAT_UNIT (a literal repeat unit, so (CN-REF_CN)*RU_LEN is the haplotype's event size) or COLLAPSED_MODULE (a module that may hold several distinct paralogs, so RU_LEN is the SHARED per-copy content and per-haplotype size must be read from FORMAT:CNBP)\">\n";
+        out << "##INFO=<ID=CN_SHARED_BP,Number=1,Type=Integer,Description=\"Reference bp in the folded (revisited) node set the MODULE_BP unit was calibrated from\">\n";
+        out << "##INFO=<ID=CN_REF_FOLD,Number=1,Type=Integer,Description=\"How many times the reference revisits that folded set; the MODULE_BP unit is CN_SHARED_BP/CN_REF_FOLD\">\n";
+        out << "##INFO=<ID=CN_MODULE_REF_BP,Number=1,Type=Integer,Description=\"Reference bp across the whole bubble interior. Against CN_SHARED_BP this is the shared-versus-total question: RU_LEN describes the shared part only, and their ratio is how far (CN-REF_CN)*RU_LEN understates a carrier's real gain or loss\">\n";
         if (!genes.empty())
             out << "##INFO=<ID=GENES,Number=.,Type=String,Description=\"Gene(s) overlapping the variant (from --gtf)\">\n";
         out << "##INFO=<ID=NMERGED,Number=1,Type=Integer,Description=\"Haplotype carriers merged into this record\">\n";
@@ -883,7 +931,9 @@ void call_variants(
                 mr.seed.anchor_node = bubble.source;
                 mr.seed.size_bp = static_cast<std::size_t>(unit);
                 mr.seed.ru_len = static_cast<std::size_t>(unit);
-                mr.seed.cn_peak = true;
+                mr.seed.cn_method = CnMethod::ModuleBp;
+                mr.seed.shared_fold_bp = ref_bp;
+                mr.seed.ref_fold = ref_fold;
                 for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
                     if (!traverses.count(graph.paths[pi].name)) continue;
                     const std::size_t hbp = full_walk_bp(pi);
@@ -938,6 +988,7 @@ void call_variants(
                     mr.seed.anchor_node = bubble.source;
                     mr.seed.size_bp = unit * delta;
                     mr.seed.ru_len = unit;
+                    mr.seed.cn_method = CnMethod::Rep;
                     merged.push_back(std::move(mr));
                     grp = &merged.back();
                 }
@@ -986,7 +1037,7 @@ void call_variants(
                     mr.seed.anchor_node = bubble.source;
                     mr.seed.size_bp = excess_bp;
                     mr.seed.ru_len = excess_bp / (ac_peak - ref_peak);  // per-copy duplicated content
-                    mr.seed.cn_peak = true;
+                    mr.seed.cn_method = CnMethod::Peak;
                     // describe handoff: a peak DUP's CN signal lives in the folded module's inside nodes
                     // (their per-walk multiplicity), not the peak node. Carry them in variant_nodes.tsv
                     // or `describe --variant-nodes` masks to one invariant node and drops the feature.
@@ -1136,14 +1187,14 @@ void call_variants(
             }
         });
 
-        // De-dup a folded duplication against its peak DUP: both see the extra copy (the DUP as a
+        // De-dup a folded duplication against its module DUP: both see the extra copy (the DUP as a
         // count, the walk-diff as a duplicated-content INS). Keyed by the same carriers + comparable
         // bp (the copy may use off-reference paralog nodes). Drop the matching INS; keep genuine novel
         // insertions (more carriers, or a very different size).
         if (options.cn) {
             std::vector<std::pair<std::unordered_set<std::string>, std::size_t>> peak_dups;
             for (const MergedRecord& mr : merged) {
-                if (mr.seed.type == EvType::Dup && mr.seed.cn_peak) {
+                if (mr.seed.type == EvType::Dup && is_module_cn(mr.seed.cn_method)) {
                     peak_dups.emplace_back(
                         std::unordered_set<std::string>(mr.carriers.begin(), mr.carriers.end()),
                         mr.seed.size_bp);
@@ -1172,11 +1223,11 @@ void call_variants(
         // Drop copy-number DUPs that are low-complexity-tangle or physically implausible (span > a
         // large fraction of the reference). Runs AFTER the folded-INS de-dup above, so the matching INS
         // stays dropped -- we remove only the bogus DUP record, without resurfacing its content. Genuine
-        // self-loop REP DUPs (cn_peak=false) are never touched.
+        // self-loop REP DUPs are never touched.
         if (is_tangle || max_dup_bp > 0) {
             std::vector<MergedRecord> kept;
             for (MergedRecord& mr : merged) {
-                const bool cn_dup = (mr.seed.type == EvType::Dup && mr.seed.cn_peak);
+                const bool cn_dup = (mr.seed.type == EvType::Dup && is_module_cn(mr.seed.cn_method));
                 if (cn_dup && (is_tangle || (max_dup_bp > 0 && mr.seed.size_bp > max_dup_bp))) {
                     ++summary.oversized_dups;
                     continue;
@@ -1553,7 +1604,12 @@ void call_variants(
             if (e.type == EvType::Del) { svlen = -static_cast<long long>(e.size_bp); end = pos + e.size_bp; }
             else if (e.type == EvType::Ins) { svlen = static_cast<long long>(e.size_bp); end = pos; }
             else if (e.type == EvType::Inv) { svlen = static_cast<long long>(e.size_bp); end = pos + e.size_bp; }
-            else if (e.cn_peak) { // peak-multiplicity DUP: size_bp is the duplicated content bp
+            // Both module routes carry their size in size_bp: MODULE_BP the calibrated one-copy unit,
+            // PEAK the duplicated content. Only the REP route can derive it from a node length, because
+            // only there is the node the literal repeat unit -- at a module the anchor is the bubble
+            // source, which is whatever short node happens to bound the site. The flag these two shared
+            // before the split was load-bearing exactly here.
+            else if (is_module_cn(e.cn_method)) {
                 svlen = static_cast<long long>(e.size_bp);
                 end = pos + e.size_bp;
             }
@@ -1653,6 +1709,15 @@ void call_variants(
             if (!e.link_id.empty()) info << ";EVENTID=bubble" << bubble.id << "_" << e.link_id;
             if (e.type == EvType::Dup) info << ";REF_CN=" << e.ref_cn;
             if (e.type == EvType::Dup && e.ru_len > 0) info << ";RU_LEN=" << e.ru_len;
+            // Which measurement produced CN, and what a copy is a copy OF. Without these a consumer
+            // cannot tell an exact repeat-unit traversal count from a paralog module's dosage, and
+            // reads RU_LEN as a per-copy size in both cases -- which it only is for the first.
+            if (e.type == EvType::Dup && e.cn_method != CnMethod::None) {
+                info << ";CN_METHOD=" << cn_method_name(e.cn_method)
+                     << ";CN_SCOPE=" << cn_scope_name(e.cn_method);
+            }
+            if (e.shared_fold_bp > 0) info << ";CN_SHARED_BP=" << e.shared_fold_bp;
+            if (e.ref_fold > 0) info << ";CN_REF_FOLD=" << e.ref_fold;
             if (!genes.empty()) {
                 // Genes the variant touches: its reference event nodes; for a DUP (and as a
                 // fallback) the whole bubble's reference span (the folded module).
@@ -1697,6 +1762,11 @@ void call_variants(
                 return bp;
             };
             const long long cnbp_ref_bp = (is_dup && ref_idx < graph.paths.size()) ? cnbp_walk_bp(ref_idx) : 0;
+            // The reference's TOTAL bp across this bubble, beside CN_SHARED_BP (its folded subset). At a
+            // collapsed paralog module the two differ by the paralog-private content that travels with
+            // each copy but that the reference does not revisit -- which is exactly why RU_LEN, derived
+            // from the shared part, understates what a carrier gains or loses.
+            if (is_dup && cnbp_ref_bp > 0) info << ";CN_MODULE_REF_BP=" << cnbp_ref_bp;
             auto sample_cnbp = [&](const std::string& s) -> long long {
                 const auto pit = name_to_pi.find(s);
                 return pit == name_to_pi.end() ? 0 : cnbp_walk_bp(pit->second) - cnbp_ref_bp;
