@@ -63,8 +63,10 @@ def summarize_region(path, out):
                 if bi is not None and len(v) > bi and v[bi] != ".":
                     cnbp.setdefault(c, []).append(int(v[bi]))
         # POS is the anchor; keying on it rather than the record id keeps this stable across re-snarls
-        out.append(f"  DUP at {r[1]}  REF_CN={inf.get('REF_CN','-')} RU_LEN={inf.get('RU_LEN','-')} "
-                   f"SVLEN={inf.get('SVLEN','-')} AC={inf.get('AC','-')} AN={inf.get('AN','-')}")
+        # RU_LEN belongs to CN_METHOD=REP; a collapsed module reports CN_UNIT_BP and no SVLEN
+        unit = inf.get("RU_LEN") or inf.get("CN_UNIT_BP") or "-"
+        out.append(f"  DUP at {r[1]}  {inf.get('CN_METHOD','-'):<9} REF_CN={inf.get('REF_CN','-')} "
+                   f"unit={unit} SVLEN={inf.get('SVLEN','-')} AC={inf.get('AC','-')} AN={inf.get('AN','-')}")
         out.append("    CN " + " ".join(f"{c}:{n}" for c, n in sorted(cn.items())))
         if cnbp:
             med = {c: sorted(v)[len(v) // 2] for c, v in cnbp.items()}

@@ -669,7 +669,7 @@ void call_variants(
         out << "##contig=<ID=" << ref_meta.chrom << ">\n";
         out << "##INFO=<ID=END,Number=1,Type=Integer,Description=\"End position of the variant\">\n";
         out << "##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"Structural variant type\">\n";
-        out << "##INFO=<ID=SVLEN,Number=1,Type=Integer,Description=\"Length difference ALT-REF\">\n";
+        out << "##INFO=<ID=SVLEN,Number=1,Type=Integer,Description=\"Length difference ALT-REF. Absent on CN_SCOPE=COLLAPSED_MODULE records: their carriers both gain and lose copies, so no single record-level size exists -- read FORMAT:CNBP for the per-sample size\">\n";
         out << "##INFO=<ID=SVLEN_RANGE,Number=2,Type=Integer,Description=\"Min,max event size among merged members (when they differ)\">\n";
         out << "##INFO=<ID=BUBBLE_ID,Number=1,Type=Integer,Description=\"panvar bubble identifier\">\n";
         out << "##INFO=<ID=START_NODE,Number=1,Type=String,Description=\"First graph node of the event\">\n";
@@ -677,7 +677,8 @@ void call_variants(
         out << "##INFO=<ID=EVENT_NODES,Number=.,Type=String,Description=\"Variant node set\">\n";
         out << "##INFO=<ID=INS_SUBTYPE,Number=1,Type=String,Description=\"INS subtype: NOVEL or DUP (minimap2 refined)\">\n";
         out << "##INFO=<ID=REF_CN,Number=1,Type=Integer,Description=\"Reference copy number of the repeat unit (DUP)\">\n";
-        out << "##INFO=<ID=RU_LEN,Number=1,Type=Integer,Description=\"Repeat-unit length in bp, one copy (DUP)\">\n";
+        out << "##INFO=<ID=RU_LEN,Number=1,Type=Integer,Description=\"Repeat-unit length in bp, one copy. Emitted only for CN_METHOD=REP, where the unit is a literal repeat and (CN-REF_CN)*RU_LEN is the haplotype size\">\n";
+        out << "##INFO=<ID=CN_UNIT_BP,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE_BP only: the reference-calibrated unit CN was divided by (CN_SHARED_BP/CN_REF_FOLD). This is the SHARED per-copy content, not a whole copy, so it is not a per-haplotype event size -- read FORMAT:CNBP for that\">\n";
         out << "##INFO=<ID=CN_METHOD,Number=1,Type=String,Description=\"How CN was measured: REP (traversal count of a panphorte REP self-loop, exact), MODULE_BP (folded-node bp over a reference-calibrated unit), PEAK (highest interior-node traversal multiplicity)\">\n";
         out << "##INFO=<ID=CN_SCOPE,Number=1,Type=String,Description=\"What one copy is a copy of: REPEAT_UNIT (a literal repeat unit, so (CN-REF_CN)*RU_LEN is the haplotype's event size) or COLLAPSED_MODULE (a module that may hold several distinct paralogs, so RU_LEN is the SHARED per-copy content and per-haplotype size must be read from FORMAT:CNBP)\">\n";
         out << "##INFO=<ID=CN_SHARED_BP,Number=1,Type=Integer,Description=\"Reference bp in the folded (revisited) node set the MODULE_BP unit was calibrated from\">\n";
@@ -1655,6 +1656,22 @@ void call_variants(
                         static_cast<long long>(node_len(graph, e.nodes.empty() ? std::string() : e.nodes.front()));
                 end = pos + node_len(graph, e.nodes.empty() ? std::string() : e.nodes.front());
             }
+            // A COLLAPSED_MODULE record describes the whole site, and its "unit" is only the shared part
+            // of one copy, so pos + unit named a reference interval that corresponds to nothing. END is
+            // the module's own reference span -- the interval FORMAT:CNBP is measured over.
+            if (is_module_cn(e.cn_method)) {
+                const auto sit = ref_node_pos.find(bubble.sink);
+                const auto bit = ref_node_pos.find(bubble.source);
+                if (sit != ref_node_pos.end() && bit != ref_node_pos.end()) {
+                    // build_ref_node_pos already returns 1-based genomic starts, so the span end is the
+                    // far boundary's own start plus its length -- adding the region offset again put END
+                    // past the locus and it silently clamped to the last base.
+                    const bool sink_is_far = sit->second >= bit->second;
+                    const std::size_t far_start = sink_is_far ? sit->second : bit->second;
+                    const std::string& far = sink_is_far ? bubble.sink : bubble.source;
+                    end = far_start + node_len(graph, far);
+                }
+            }
             if (end > ref_end_1based) end = ref_end_1based;  // END is a reference coordinate; never past the graph
 
             // Ordered, deduplicated event node set: reference nodes by genomic position,
@@ -1711,7 +1728,11 @@ void call_variants(
             const std::string id = seen_n == 1 ? base_id : base_id + "_" + std::to_string(seen_n);
 
             std::ostringstream info;
-            info << "END=" << end << ";SVTYPE=" << svt << ";SVLEN=" << svlen;
+            info << "END=" << end << ";SVTYPE=" << svt;
+            // At a collapsed module the carriers both gain and lose -- GSTM1 spans CN 1..4 around
+            // REF_CN=3 -- so a single record-level size is not merely imprecise, it does not exist.
+            // Reporting the shared unit there understated every carrier by the shared-to-total ratio.
+            if (!is_module_cn(e.cn_method)) info << ";SVLEN=" << svlen;
             if (e.type != EvType::Dup && mr.min_size_bp != mr.max_size_bp) {
                 const long long sign = svlen < 0 ? -1 : 1;
                 const long long a = sign * static_cast<long long>(mr.min_size_bp);
@@ -1745,7 +1766,12 @@ void call_variants(
             for (std::size_t k = 0; k < ev_nodes.size(); ++k) { if (k) info << ','; info << ev_nodes[k]; }
             if (!e.link_id.empty()) info << ";EVENTID=bubble" << bubble.id << "_" << e.link_id;
             if (e.type == EvType::Dup) info << ";REF_CN=" << e.ref_cn;
-            if (e.type == EvType::Dup && e.ru_len > 0) info << ";RU_LEN=" << e.ru_len;
+            if (e.type == EvType::Dup && e.ru_len > 0) {
+                if (e.cn_method == CnMethod::Rep) info << ";RU_LEN=" << e.ru_len;
+                else if (e.cn_method == CnMethod::ModuleBp) info << ";CN_UNIT_BP=" << e.ru_len;
+                // PEAK claims no unit at all: its "unit" is excess content divided by a copy delta,
+                // which is an average over whatever the duplication happened to include.
+            }
             // Which measurement produced CN, and what a copy is a copy OF. Without these a consumer
             // cannot tell an exact repeat-unit traversal count from a paralog module's dosage, and
             // reads RU_LEN as a per-copy size in both cases -- which it only is for the first.

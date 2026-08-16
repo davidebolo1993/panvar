@@ -106,7 +106,11 @@ def per_gene_called_cn(dup_gene_cn_path, gene):
 
 
 def biggest_dup_cn(vcf_path):
-    """Per-sample CN of the largest DUP record (the gene's copy-number module)."""
+    """Per-sample CN of the largest DUP record (the gene's copy-number module).
+
+    Size is |SVLEN| where a record has one, else its reference span END-POS -- a CN_SCOPE=
+    COLLAPSED_MODULE record deliberately omits SVLEN.
+    """
     samples, best = [], None
     with open(vcf_path) as fh:
         for line in fh:
@@ -118,9 +122,17 @@ def biggest_dup_cn(vcf_path):
             f = line.rstrip("\n").split("\t")
             if "SVTYPE=DUP" not in f[7]:
                 continue
-            svlen = abs(int(next(x for x in f[7].split(";") if x.startswith("SVLEN="))[6:]))
-            if best is None or svlen > best[0]:
-                best = (svlen, f)
+            # "Largest" used to mean |SVLEN|, but a collapsed-module DUP no longer carries one: its
+            # carriers both gain and lose, so no single record-level size exists. Its reference span
+            # (END-POS) is the right notion of size for picking the module record, and it is what the
+            # per-sample CN is measured over anyway.
+            inf = dict(kv.split("=", 1) for kv in f[7].split(";") if "=" in kv)
+            if "SVLEN" in inf:
+                size = abs(int(inf["SVLEN"]))
+            else:
+                size = abs(int(inf.get("END", f[1])) - int(f[1]))
+            if best is None or size > best[0]:
+                best = (size, f)
     cn = {}
     if best is not None:
         for s, g in zip(samples, best[1][9:]):

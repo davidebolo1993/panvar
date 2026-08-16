@@ -98,8 +98,16 @@ hapY      : L REP REP REP REP R      loops REP ×4
 3. Emit one `DUP` at the bubble with `REF_CN = 3` and a per-sample `CN` from the loop count. `GT = 1` marks only the carriers whose `CN` differs from `REF_CN`, so `AC`/`AF` stay meaningful.
 
 ```text
-SVTYPE=DUP  REF_CN=3  RU_LEN=<unit bp>     hapX CN=2   hapY CN=4   (reference-like samples CN=3)
+SVTYPE=DUP  REF_CN=3  CN_METHOD=REP  RU_LEN=<unit bp>   hapX CN=2  hapY CN=4  (reference-like CN=3)
 ```
+
+### Why a collapsed module carries no SVLEN
+
+The `MODULE_BP` and `PEAK` routes count copies of a module that may hold several distinct paralogs, so a "copy" is not one uniform sequence. Two consequences, both visible in the record:
+
+`RU_LEN` is not emitted there. The unit those routes calibrate against is the **shared** per-copy content — the sequence the reference revisits — and not the paralog-private sequence that travels with each copy. It is reported as `CN_UNIT_BP` so it cannot be read as a per-copy size. At GSTM1 `CN_SHARED_BP=22830` over `CN_REF_FOLD=3` gives 7610, while `CN_MODULE_REF_BP=58249` puts the total per-copy content near 19.4 kb: `(CN − REF_CN) × 7610` understates every carrier by about 2.4×. The ratio is not a constant to correct for — across the reference loci it runs from ×1.01 to ×36.75.
+
+`SVLEN` is not emitted there either. At GSTM1 the carriers span −32030, −18396 and +18504 bp around `REF_CN=3`; no single record-level size describes them, so the field is absent rather than misleading and **`FORMAT:CNBP` is the per-sample size**. `END` is the module's reference span, the interval CNBP is measured over. Confirmed externally: svim-asm on the assemblies agrees with CNBP to a median of 6 bp at GSTM1 and 2 bp at LPA KIV-2.
 
 This is the only reading that fires without `--cn` too: the self-loop route is always on, so a `REP` tandem is a `DUP` regardless of the flag.
 

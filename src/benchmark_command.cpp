@@ -225,7 +225,11 @@ VcfData load_vcf(const std::string& path) {
             else if (k == "SVTYPE") r.svtype = v;
             else if (k == "INSSEQ") r.insseq = v;
             else if (k == "REF_CN") r.ref_cn = static_cast<std::size_t>(std::stoull(v));
-            else if (k == "RU_LEN") r.ru_len = static_cast<std::size_t>(std::stoull(v));
+            // RU_LEN only appears on CN_METHOD=REP now; a MODULE_BP record reports the same
+            // quantity as CN_UNIT_BP, renamed because it is the SHARED per-copy content rather
+            // than a literal repeat unit. --dup-model cn wants whichever the record carries.
+            else if (k == "RU_LEN" || k == "CN_UNIT_BP")
+                r.ru_len = static_cast<std::size_t>(std::stoull(v));
         }
         const std::vector<std::string> fmt = split_on(f[8], ':');
         std::size_t gt_i = fmt.size(), cnbp_i = fmt.size(), cn_i = fmt.size();

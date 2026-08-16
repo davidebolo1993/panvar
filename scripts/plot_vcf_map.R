@@ -98,8 +98,12 @@ for (ln in recs) {
   cn <- suppressWarnings(as.integer(sub("^[^:]*:([^:]*).*$", "\\1", f[-(1:9)])))
   # --scale size: |SVLEN|, or RU_LEN for a DUP so high-copy DUPs aren't drawn huge by their CN
   svlen <- suppressWarnings(abs(as.numeric(info_get(info, "SVLEN"))))
+  # RU_LEN is emitted only for CN_METHOD=REP; a collapsed-module DUP carries CN_UNIT_BP instead and
+  # no SVLEN at all, so fall through to the module's own reference span rather than dropping the cell.
   ru <- suppressWarnings(as.numeric(info_get(info, "RU_LEN")))
-  size_bp <- if (svt == "DUP" && !is.na(ru)) ru else svlen
+  if (is.na(ru)) ru <- suppressWarnings(as.numeric(info_get(info, "CN_UNIT_BP")))
+  span <- suppressWarnings(as.numeric(info_get(info, "END")) - as.numeric(f[2]))
+  size_bp <- if (svt == "DUP" && !is.na(ru)) ru else if (svt == "DUP" && !is.na(span)) span else svlen
   V[[length(V) + 1]] <- list(id = f[3], svt = svt, sub = info_get(info, "INS_SUBTYPE"),
                              bubble = if (is.na(bid)) 0L else bid,
                              ref_cn = suppressWarnings(as.integer(info_get(info, "REF_CN"))),

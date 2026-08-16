@@ -67,7 +67,11 @@ VCF 4.2; samples = haplotypes. `FORMAT`: `GT` (`1` carrier / `0` ref-like / `.` 
 | `NMERGED`, `SVLEN_RANGE`, `MERGE_JACCARD`/`MERGE_SEQID`/`MERGE_SIZE_RATIO` | merge count, size span, merge evidence (≥2-event records only) |
 | `EVENTID` | links a co-located `DEL`+`INS` substitution |
 | `INS_SUBTYPE` | `NOVEL`/`DUP` (`--classify-ins`) |
-| `REF_CN` / `RU_LEN` | `DUP` only: reference copy number / one-copy repeat-unit length (the folded unit; for the real per-haplotype linear size see `FORMAT:CNBP`) |
+| `REF_CN` | `DUP` only: reference copy number |
+| `CN_METHOD` / `CN_SCOPE` | `DUP` only: which of the three CN routes measured this — `REP` (exact traversal count of a panphorte self-loop), `MODULE_BP` (folded-node bp over a reference-calibrated unit), `PEAK` (highest interior-node multiplicity) — and whether a copy is a copy of a `REPEAT_UNIT` or of a `COLLAPSED_MODULE` |
+| `RU_LEN` | `CN_METHOD=REP` only: the literal repeat unit, where `(CN − REF_CN) × RU_LEN` is the haplotype's size |
+| `CN_UNIT_BP` | `CN_METHOD=MODULE_BP` only: the calibrated unit CN was divided by. This is the **shared** per-copy content, not a whole copy — see below |
+| `CN_SHARED_BP` / `CN_REF_FOLD` / `CN_MODULE_REF_BP` | the calibration inputs (`CN_UNIT_BP = CN_SHARED_BP / CN_REF_FOLD`) and the reference's total bp across the module |
 | `GENES` | `--gtf`: gene(s) overlapped (whole folded module for a `DUP`) |
 | `NALLELES` | `--multiallelic-loci`: number of alleles |
 | `INSSEQ`/`DELSEQ`/`INVSEQ` | event sequence (omitted when very long) |
