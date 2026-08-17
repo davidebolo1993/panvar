@@ -164,6 +164,7 @@ struct Event {
     double round_residual = -1.0;     // MODULE_BP: mean distance from a whole number of units
     double round_ambiguous_frac = -1.0; // MODULE_BP: share of traversers rounding near a coin flip
     std::size_t cn_clamped_zero = 0;  // MODULE_BP: traversers whose modelled dosage was below zero
+    std::size_t module_span_ambiguous = 0;  // traversers whose module span had a repeated boundary
     // What the spacing estimate actually rests on. A step is "one copy" only if the clusters it was
     // measured between are ADJACENT copy states, and that is an assumption the estimator cannot verify
     // from within -- these let a reader see how thin the evidence is instead of taking the number.
@@ -818,6 +819,7 @@ void call_variants(
         out << "##INFO=<ID=CN_CONFIDENCE,Number=1,Type=String,Description=\"HEURISTIC on CN_METHOD=PEAK, which infers dosage from the highest interior-node traversal multiplicity and is not validated against external copy-number truth\">\n";
         out << "##INFO=<ID=CN_ROUND_RESIDUAL,Number=1,Type=Float,Description=\"MODULE_BP only: MEAN distance from a whole number of units across traversers, 0..0.5. Reported for continuity, but the per-sample residuals are BIMODAL at a paralog module -- most near 0 or near 0.5 -- so this mean describes no sample and moves with their ratio. Read CN_ROUND_AMBIGUOUS_FRAC for the record-level summary and FORMAT:CNR_MARGIN per sample\">\n";
         out << "##INFO=<ID=IMPRECISE,Number=0,Type=Flag,Description=\"The record describes an event CLUSTER rather than one exact event: coalescing joined several pieces that have reference sequence retained between them, so the affected interval POS+1..END is wider than the |SVLEN| bases actually removed. On a PRECISE record END-POS equals |SVLEN| exactly; this flag marks the records where it cannot, instead of silently reporting one of the two numbers\">\n";
+        out << "##INFO=<ID=CN_SPAN_AMBIGUOUS,Number=1,Type=Integer,Description=\"Path measurements taken over a module span whose source or sink boundary occurs MORE THAN ONCE in that path. The span is then first-source..last-sink, which is a choice: it can enclose two separate visits and the content between them rather than one module. Every quantity measured over the span -- CN, CNBP, CN_MODULE_REF_BP -- inherits that choice on those paths. Absent when every boundary is visited once\">\n";
         out << "##INFO=<ID=CN_CLAMPED_ZERO,Number=1,Type=Integer,Description=\"MODULE_BP only: traversing haplotypes whose modelled dosage came out BELOW zero copies and whose reported CN was therefore floored at 0. Only the spacing model can produce this, when a walk is shorter than the reference's by more than REF_CN steps. Their CN is a boundary value rather than a measurement; FORMAT:CNR_RAW still carries the unclamped dosage. Absent when none occurred\">\n";
         out << "##INFO=<ID=CN_ROUND_AMBIGUOUS_FRAC,Number=1,Type=Float,Description=\"MODULE_BP only: share of traversing haplotypes whose dosage sat more than 0.4 units from a whole number, i.e. whose integer CN came from a near coin-flip rounding. This is what --max-cn-model-residual gates on. A high value does NOT by itself mean the CN is wrong: the reference locus with the worst value is exact against pangene truth on every haplotype, because the unit is a calibration constant for a heterogeneous module rather than one real copy\">\n";
         if (!genes.empty())
@@ -976,6 +978,31 @@ void call_variants(
         std::vector<MergedRecord> merged;
         const std::unordered_map<std::string, std::size_t> ref_node_pos = build_ref_node_pos(bubble);
 
+        // The module's oriented step span in one path, shared by every consumer that measures the
+        // module: the folded-set construction, reference and haplotype module bp, CNBP and
+        // CN_MODULE_REF_BP. Two copies of this arithmetic existed and could drift; that is the same
+        // duplication that let bubble's reference-name rule be fixed in one place and not the other.
+        //
+        // Deliberately the WIDEST span (first source .. last sink), not the tight allele interval:
+        // a module's copies are exactly what lies between the outermost boundaries. `ambiguous`
+        // reports when a boundary occurs more than once, because the span is then a CHOICE and can
+        // sweep in content between two unrelated visits rather than one module.
+        auto module_span = [&](std::size_t pi, bool* ambiguous = nullptr)
+            -> std::pair<std::size_t, std::size_t> {
+            if (ambiguous != nullptr) *ambiguous = false;
+            const auto& idx = path_indexes[pi].positions;
+            const auto sit = idx.find(bubble.source);
+            const auto kit = idx.find(bubble.sink);
+            if (sit == idx.end() || kit == idx.end()) return {1, 0};   // empty (lo > hi)
+            if (ambiguous != nullptr && (sit->second.size() > 1 || kit->second.size() > 1))
+                *ambiguous = true;
+            const std::size_t s0 = sit->second.front(), s1 = sit->second.back();
+            const std::size_t k0 = kit->second.front(), k1 = kit->second.back();
+            const std::size_t lo = (s0 <= k1) ? s0 : k0;
+            const std::size_t hi = (s0 <= k1) ? k1 : s1;
+            return {lo, hi};
+        };
+
         const std::size_t rescue_floor =
             options.rescue_min_bp != 0 ? options.rescue_min_bp : std::max<std::size_t>(1, options.min_sv_bp / 2);
 
@@ -1053,18 +1080,13 @@ void call_variants(
         double cn_unit_bp = 0.0;   // one-copy bp of the coverage module (set when coverage fires)
         if (options.cn && !has_rep_selfloop) {
             const std::unordered_set<std::string> inside_set(bubble.inside.begin(), bubble.inside.end());
-            // Widest oriented source..sink span of a path over this bubble (all repeats included):
-            // forward = first source .. last sink; reversed crossing = first sink .. last source.
-            auto span_of = [&](std::size_t pi) -> std::pair<std::size_t, std::size_t> {
-                const auto& idx = path_indexes[pi].positions;
-                const auto sit = idx.find(bubble.source);
-                const auto kit = idx.find(bubble.sink);
-                if (sit == idx.end() || kit == idx.end()) return {1, 0};  // empty (lo>hi)
-                const std::size_t s0 = sit->second.front(), s1 = sit->second.back();
-                const std::size_t k0 = kit->second.front(), k1 = kit->second.back();
-                const std::size_t lo = (s0 <= k1) ? s0 : k0;
-                const std::size_t hi = (s0 <= k1) ? k1 : s1;
-                return {lo, hi};
+            // The shared module resolver, so the CN routes and CNBP measure the SAME interval.
+            std::size_t span_ambiguous = 0;
+            auto span_of = [&](std::size_t pi) {
+                bool amb = false;
+                const auto sp = module_span(pi, &amb);
+                if (amb) ++span_ambiguous;
+                return sp;
             };
             // Folded set = inside nodes the reference revisits (>=2x): the repeat unit. Measuring CN
             // only over these keeps unique-content edits (interstitial / single-visit nodes) out of it.
@@ -1276,6 +1298,7 @@ void call_variants(
                 mr.seed.round_ambiguous_frac =
                     round_n > 0 ? static_cast<double>(round_ambiguous) / static_cast<double>(round_n) : 0.0;
                 mr.seed.cn_clamped_zero = cn_clamped_zero;
+                mr.seed.module_span_ambiguous = span_ambiguous;
                 // Gate on the SHARE of samples whose rounding was a coin flip, not on the mean residual.
                 // The mean is a bad summary of a bimodal distribution -- at GSTM1 the median sample sits
                 // at 0.045 and the 90th percentile at 0.496, so the mean of 0.197 describes no sample --
@@ -2282,6 +2305,8 @@ void call_variants(
             }
             if (e.cn_method == CnMethod::Peak) info << ";CN_CONFIDENCE=HEURISTIC";
             if (imprecise) info << ";IMPRECISE";
+            if (e.module_span_ambiguous > 0)
+                info << ";CN_SPAN_AMBIGUOUS=" << e.module_span_ambiguous;
             if (e.cn_clamped_zero > 0) info << ";CN_CLAMPED_ZERO=" << e.cn_clamped_zero;
             if (e.round_ambiguous_frac >= 0.0) {
                 std::ostringstream r; r.setf(std::ios::fixed); r.precision(4);
@@ -2320,17 +2345,11 @@ void call_variants(
             const bool is_dup = (e.type == EvType::Dup);
             const std::unordered_set<std::string> cnbp_inside(bubble.inside.begin(), bubble.inside.end());
             auto cnbp_walk_bp = [&](std::size_t pi) -> long long {
-                const auto& idx = path_indexes[pi].positions;
-                const auto s_it = idx.find(bubble.source);
-                const auto k_it = idx.find(bubble.sink);
-                if (s_it == idx.end() || k_it == idx.end()) return 0;
-                const std::size_t s0 = s_it->second.front(), s1 = s_it->second.back();
-                const std::size_t k0 = k_it->second.front(), k1 = k_it->second.back();
-                const std::size_t lo = (s0 <= k1) ? s0 : k0;
-                const std::size_t hi = (s0 <= k1) ? k1 : s1;
+                const auto sp = module_span(pi);
+                if (sp.first > sp.second) return 0;
                 const std::vector<PathStep>& steps = graph.paths[pi].steps;
                 long long bp = 0;
-                for (std::size_t i = lo; i <= hi && i < steps.size(); ++i)
+                for (std::size_t i = sp.first; i <= sp.second && i < steps.size(); ++i)
                     if (cnbp_inside.count(steps[i].node_id)) bp += static_cast<long long>(node_len(graph, steps[i].node_id));
                 return bp;
             };

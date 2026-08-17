@@ -158,6 +158,14 @@ Two records rest on a single gap (`gaps=1`), where the median is one difference 
 
 Where the panel supports no estimate at all, `--cn-unit-spacing` **fails** rather than quietly computing the reference-ratio model under a flag set to avoid it.
 
+#### One module span, and when it is a choice
+
+Everything that measures the module — the folded-set construction, reference and haplotype module bp, `FORMAT:CNBP`, `CN_MODULE_REF_BP`, and the record's `POS`/`END` — takes its interval from one resolver. It deliberately selects the **widest** oriented span (first source to last sink) rather than the tight interval used for ordinary allele diffing, because a module's copies are exactly what lies between the outermost boundaries.
+
+That span is well defined only while each boundary is visited once. When a boundary recurs, first-source-to-last-sink is a *choice*: it can enclose two separate visits and everything between them rather than one module, and every quantity measured over it inherits that. `CN_SPAN_AMBIGUOUS` counts the paths where this applies.
+
+It does not fire on any of the six reference loci, and the reason is structural rather than luck: a node the reference revisits cannot be a cut vertex, so the cactus decomposition promotes it into the enclosing snarl's interior and it never becomes a boundary. The counter is reachable through `--snarls-in` or a hand-written bubbles CSV, where boundaries carry no such guarantee — which is exactly the door that needs the warning.
+
 #### The integer fit is not a correctness signal
 
 `CN_ROUND_AMBIGUOUS_FRAC` is the share of haplotypes whose dosage sat more than 0.4 units from a whole number, so the integer came from near a coin flip. It replaces the mean residual as what `--max-cn-model-residual` gates on, because the per-sample residuals are bimodal and the mean describes neither mode — at c4 the mean is 0.13 while **no** sample is ambiguous, and at GSTM1 the mean is 0.30 while **two thirds** are.
