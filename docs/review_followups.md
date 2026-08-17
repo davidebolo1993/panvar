@@ -100,6 +100,37 @@ as history; Git already provides that history.
   `--min-alt-support` to the key-option table; document the `--snarls-in` limitation chosen above; and
   include `--emit-snarls-jsonl` in both the public output list and the command's `wrote:` summary.
 
+## Call
+
+### Missing cross-module capability
+
+- **Consume Panphorte's REP provenance to aggregate phase-rotated REP nodes.** When one tandem array is
+  folded at several rotations, Panphorte emits a REP node per phase and `call` counts each separately,
+  so a site's total copy number is split across records. The aggregation should join on
+  `output_rep_node` (not `created_rep_node`, which is pre-sort), determine the current bubble from node
+  membership rather than trusting `input_bubble_id` (re-snarling reassigns ids), group by current site
+  **plus** `canonical_motif` (never motif alone, or the same motif at two sites would merge), and sum
+  `traversal_count × copy_quantum` across the phase nodes for every traverser including reference-like
+  and zero-copy samples. Emit the grouped node set so the aggregation is auditable.
+
+  **This fixes no current call.** Across all six reference loci the provenance table holds one row
+  (LPA) and no site carries more than one REP node, so there is nothing to aggregate; any test would be
+  synthetic. Recorded as a capability gap rather than a correctness defect, and worth building when a
+  locus actually produces phase-rotated REPs. Tests to write with it: two rotations at one site
+  aggregate; the same motif at two sites does not; missing or duplicate provenance rows fail loudly;
+  `copy_quantum` affects the dosage; and CNBP plus the allele VCF are unchanged by aggregation.
+
+### Accepted limitations
+
+- **`PEAK` has no external truth validation, and cannot get one from the current data.** Every live
+  `PEAK` record describes an 11–92 bp micro-module while the available truth counts whole gene copies,
+  so the comparison is definitionally invalid — it produces numbers that look like accuracy and are
+  not. The route is tested on a synthetic fixture with a known micro-module copy number and keeps
+  `CN_CONFIDENCE=HEURISTIC`.
+- **Rare binary far-tail and merged-record content.** A merged record still hands every carrier the
+  representative's sequence; `MERGE_DIAMETER` now measures how far that reaches (0.0000 on a
+  132-member LPA record) but does not fix it. Per-carrier sequence needs the allele VCF.
+
 ## Rebuild
 
 ### Deferred capability
