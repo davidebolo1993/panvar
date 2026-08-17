@@ -371,6 +371,49 @@ rvend=$(awk -F'\t' '$0!~/^#/ && $8~/SVTYPE=DEL/{n=split($8,a,";");
   && ok "a reverse-oriented bubble gives the same coordinates as the forward one ($rvpos/$rvend)" \
   || bad "reverse-oriented coordinates: expected 100/220, got ${rvpos:-?}/${rvend:-?}"
 
+# ---------------------------------------------------------------------------------------------
+# The PEAK copy-number route, which had no test of any kind. It cannot be checked against the
+# pangene truth the other routes use: every PEAK record on the reference loci describes an 11-92 bp
+# micro-module, and gene-level truth counts GENE copies, so the two measure different things. A
+# fixture with a known micro-module copy number is the only way to test it.
+#
+# The reference visits u once; hapdup visits it three times, NON-consecutively so the REP self-loop
+# route does not claim it first. u is 60 bp, so a carrier gains 120 bp and clears --min-sv-bp.
+# ---------------------------------------------------------------------------------------------
+PF1=$(gblk 300 41); PU=$(gblk 60 43); PX=$(gblk 200 47); PF2=$(gblk 300 53)
+{ printf 'H\tVN:Z:1.0\n'
+  printf "S\tpf1\t%s\nS\tpu\t%s\nS\tpx\t%s\nS\tpf2\t%s\n" "$PF1" "$PU" "$PX" "$PF2"
+  for e in "pf1 pu" "pu px" "px pu" "px pf2" "pu pf2"; do
+    set -- $e; printf "L\t%s\t+\t%s\t+\t0M\n" "$1" "$2"
+  done
+  printf 'P\tpkref#0#chr8:1-860\tpf1+,pu+,px+,pf2+\t*\n'
+  printf 'P\tpkflat#1#chr8\tpf1+,pu+,px+,pf2+\t*\n'
+  printf 'P\tpkdup#1#chr8\tpf1+,pu+,px+,pu+,px+,pu+,pf2+\t*\n'
+  printf 'P\tpkdup2#1#chr8\tpf1+,pu+,px+,pu+,px+,pu+,pf2+\t*\n'; } > "$OUT/peak.gfa"
+"$BIN" bubble -i "$OUT/peak.gfa" -r 'pkref#0#chr8:1-860' -o "$OUT/pkb" -q >/dev/null 2>&1
+"$BIN" call -i "$OUT/pkb.sorted.gfa" -c "$OUT/pkb.bubbles.csv" -r 'pkref#0#chr8:1-860' \
+      -o "$OUT/pkc" --cn -q >/dev/null 2>&1
+PKV="$OUT/pkc.region.vcf"
+pk_method=$(awk -F'\t' '$0!~/^#/ && $8~/SVTYPE=DUP/{n=split($8,a,";");
+              for(i=1;i<=n;i++){split(a[i],kv,"="); if(kv[1]=="CN_METHOD"){print kv[2]; exit}}}' "$PKV")
+[ "$pk_method" = "PEAK" ] \
+  && ok "a non-consecutive micro-module duplication is called by the PEAK route" \
+  || bad "expected CN_METHOD=PEAK, got '${pk_method:-<no DUP record>}'"
+# the duplicating haplotype must read 3 copies, the flat one 1 -- a positive AND a negative
+pk_cn() { awk -F'\t' -v s="$1" '/^#CHROM/{for(i=10;i<=NF;i++) if($i ~ s) c=i}
+          $0!~/^#/ && $8~/SVTYPE=DUP/{split($9,k,":"); for(j in k) if(k[j]=="CN") ci=j
+            split($c,v,":"); print v[ci]; exit}' "$PKV"; }
+[ "$(pk_cn pkdup)" = "3" ] \
+  && ok "PEAK reports 3 copies for the haplotype that visits the unit three times" \
+  || bad "PEAK CN for the duplicating haplotype: expected 3, got '$(pk_cn pkdup)'"
+[ "$(pk_cn pkflat)" = "1" ] \
+  && ok "PEAK reports 1 copy for the haplotype that does not duplicate" \
+  || bad "PEAK CN for the non-duplicating haplotype: expected 1, got '$(pk_cn pkflat)'"
+# it must still be labelled heuristic: nothing here validates it against external truth
+grep -q "CN_CONFIDENCE=HEURISTIC" "$PKV" \
+  && ok "the PEAK record still declares itself heuristic" \
+  || bad "a PEAK record lost its CN_CONFIDENCE=HEURISTIC label"
+
 printf "\n"
 if [ "$fails" -eq 0 ]; then printf "call_stats: all assertions passed\n"; exit 0; fi
 printf "call_stats: %d assertion(s) failed\n" "$fails"; exit 1

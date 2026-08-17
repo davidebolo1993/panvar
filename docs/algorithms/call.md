@@ -209,6 +209,30 @@ hapC : 10,000 bp
 SVTYPE=DUP  REF_CN=2      hapA CN=3   hapB CN=1   hapC CN=2
 ```
 
+#### Why PEAK cannot be checked against the gene truth
+
+`PEAK` carries `CN_CONFIDENCE=HEURISTIC` and, unlike the other two routes, has no validation against
+pangene copy number. That is not an oversight waiting to be filled: the two measure different things.
+Every `PEAK` record on the reference loci describes a **micro-module** —
+
+| record | `CN_MODULE_REF_BP` | annotated gene |
+|---|---|---|
+| cyp2d6 bubble8 | 11 | TCF20 |
+| ankrd36c bubble9 | 63 | ANKRD36C |
+| cyp2d6 bubble2 | 76 | — |
+| lpa bubble8 | 92 | LPA |
+
+— while the truth counts whole gene copies. Comparing them produces numbers that look like accuracy and
+are not: the ANKRD36C record agrees with ANKRD36C gene copy number on 26.8% of haplotypes, which
+measures the 63 bp module against a gene rather than measuring the route. (The size floor is not
+bypassed, incidentally: `--min-sv-bp` gates the bp a carrier *gains*, so an 11 bp unit traversed six
+extra times legitimately clears 50.)
+
+The route is instead tested on a fixture where the micro-module copy number is known by construction —
+a 60 bp unit the reference visits once and a haplotype visits three times, non-consecutively so the
+`REP` route does not claim it first. `call_stats.sh` asserts the route fires, that the duplicating
+haplotype reads 3 and the flat one reads 1, and that the record still declares itself heuristic.
+
 #### A single-copy-reference duplication (peak multiplicity)
 
 The reference here visits each inside node once — it does not fold — so there is no reference fold for coverage to calibrate against. This reading covers a haplotype that folds an extra copy back onto those nodes (a duplication where the reference is the single/short allele):
