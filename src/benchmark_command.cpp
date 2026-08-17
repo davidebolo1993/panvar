@@ -1443,14 +1443,17 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                 if (gt_closed_n) sum << 100.0 * gt_closed_sum / static_cast<double>(gt_closed_n) << '\n';
                 else sum << "NA\n";
                 sum << "gt_gap\tALL\tgap_closed_undefined\t" << gt_closed_na << "\t0\n";
-                // The same question against the other denominator: of the distance between the plain
-                // reference and the truth, what fraction do the calls remove. gap_closed measures
-                // against the ACHIEVABLE bound (the graph), this against ALL of it -- so a locus whose
-                // graph cannot hold the haplotype scores low here and high there, and the pair says
-                // which of the two is the limit. Undefined when there is no variation to recover.
-                // Every comparative figure below is over the COMMON SET (see cs_* above), so the
-                // levels are ratios of the same observations. The all-panel graph/called totals stay
-                // available as `called_recon` and `gt_gap`, but they do not enter these.
+                sum << "gt_gap\tALL\tworse_than_baseline\t" << gt_worse_than_ref << '\t'
+                    << (gt_scored_haps ? 100.0 * static_cast<double>(gt_worse_than_ref) /
+                                             static_cast<double>(gt_scored_haps) : 0.0) << '\n';
+                // `variation_recovered` asks the same question against the other denominator: of the
+                // distance between the plain reference and the truth, what fraction does each level
+                // remove. gap_closed measures against the ACHIEVABLE bound (the graph), this against
+                // all of it, so the pair says which of representation or graph is the limit.
+                //
+                // Every figure below is over the COMMON SET (see cs_* above), so the levels are ratios
+                // of the same observations. The all-panel totals stay available as `called_recon` and
+                // `gt_gap`, but they do not enter these.
                 const double base = static_cast<double>(cs_base);
                 auto vr = [&](const char* name, std::size_t d) {
                     sum << "variation_recovered\tALL\t" << name << "\t0\t";
