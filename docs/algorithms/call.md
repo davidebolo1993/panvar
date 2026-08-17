@@ -212,8 +212,20 @@ P      span     4800     (no CDS -> gene span)
 ```
 
 1. Build each gene's canonical k-mer set from its marker and keep the k-mers private to it (absent from every paralog in the cluster). These sets discriminate from the reference alone.
-2. Scan a haplotype's module sub-walk and count each gene's private k-mers. A gene present in `c` copies carries each private k-mer about `c` times, so `dosage = hits / private-set size ≈ c`, rounded to the copy number.
+2. Scan a haplotype's module sub-walk and count each gene's private k-mer **occurrences**. A gene present in `c` copies carries each private k-mer about `c` times, so `dosage = hits / occurrences-per-reference-copy ≈ c`, rounded to the copy number. The denominator counts occurrences rather than distinct k-mers, because a k-mer appearing twice inside one copy contributes two hits from that copy and a distinct count would read it as extra copies.
 3. Emit one row per gene with its evidence. Keeping a CDS-less gene `P` in the set matters even when its own copy number is not separately validated: its private k-mers absorb its locus, so one of its copies is not mis-counted as a coding paralog.
+
+`reliable` is decided per haplotype, not per gene pair. A pair that is separable somewhere in the panel is not necessarily separable in a given haplotype, and reporting `CN=0` from `hits=0` over an empty private set as a confident call was wrong; such a haplotype falls back to the module total instead.
+
+**Measured and rejected: screening private k-mers against the whole locus.** Privacy is judged against the sibling genes only, so a k-mer occurring elsewhere in the locus still counts as discriminative. Widening it — dropping any k-mer whose locus occurrences are not all inside the gene's own marker — is the obvious correction and it is worse against pangene truth:
+
+| variant | GSTM1/2/4/5 exact | CYP2D6 exact |
+|---|---|---|
+| sibling-only (shipped) | 466/466 each | 126/127 |
+| + locus screen | 466/466 each | 123/127 |
+| + locus screen, keeping CDS-junction k-mers | 464/466 | 122/127 |
+
+It removes about a third of the markers, and the dosage ratio loses more to the smaller denominator than it gains in specificity. The second row exists because a marker is a gene's *merged CDS*, so a k-mer spanning an exon-exon junction occurs nowhere in the genomic reference; keeping those rather than discarding them as absent made the result worse still, which rules out the obvious repair. Not retained in any form.
 
 ```text
 one haplotype:  A  hits=990/1200  dosage=0.83  -> CN=1

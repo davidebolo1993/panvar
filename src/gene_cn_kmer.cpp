@@ -40,6 +40,24 @@ void collect_canonical_kmers(const std::string& seq, std::size_t k,
     }
 }
 
+// As above, but keeping how MANY times each canonical k-mer occurs. Copy number is an occurrence
+// ratio, so a set loses exactly the multiplicity the estimate is made of.
+void count_canonical_kmers(const std::string& seq, std::size_t k,
+                           std::unordered_map<std::uint64_t, long>& out) {
+    if (k == 0 || k > 32 || seq.size() < k) return;
+    const std::uint64_t mask = (k == 32) ? ~0ULL : ((1ULL << (2 * k)) - 1);
+    const unsigned top_shift = static_cast<unsigned>(2 * (k - 1));
+    std::uint64_t fwd = 0, rev = 0;
+    std::size_t len = 0;
+    for (char c : seq) {
+        const int b = base_code(c);
+        if (b < 0) { len = 0; fwd = 0; rev = 0; continue; }
+        fwd = ((fwd << 2) | static_cast<std::uint64_t>(b)) & mask;
+        rev = (rev >> 2) | (static_cast<std::uint64_t>(3 - b) << top_shift);
+        if (++len >= k) ++out[std::min(fwd, rev)];
+    }
+}
+
 } // namespace
 
 std::vector<std::vector<GeneCnEvidence>> resolve_gene_cn_kmer(
@@ -52,20 +70,33 @@ std::vector<std::vector<GeneCnEvidence>> resolve_gene_cn_kmer(
         hap_seqs.size(), std::vector<GeneCnEvidence>(n_genes));
     if (n_genes == 0 || k == 0 || k > 31) return out;
 
-    // 1) canonical k-mer set per gene.
-    std::vector<std::unordered_set<std::uint64_t>> gene_kmers(n_genes);
+    // 1) canonical k-mer COUNTS per gene. Counts, not a set: a k-mer occurring twice inside one copy
+    //    of a gene contributes two hits from that one copy, so the denominator below has to know.
+    std::vector<std::unordered_map<std::uint64_t, long>> gene_counts(n_genes);
     for (std::size_t g = 0; g < n_genes; ++g)
-        collect_canonical_kmers(gene_markers[g], k, gene_kmers[g]);
+        count_canonical_kmers(gene_markers[g], k, gene_counts[g]);
 
-    // 2) private k-mers: unique to one gene vs all others. Map private k-mer -> owning gene.
+    // 2) private k-mers: unique to one gene against its siblings. Map private k-mer -> owning gene.
+    //
+    // Screening these against the WHOLE locus reference as well -- dropping any k-mer that also occurs
+    // outside the gene's own marker -- was built and measured, and it is WORSE. Against pangene truth
+    // it cost CYP2D6 3 of 127 exact calls (126 -> 123) and, once CDS-junction k-mers were kept rather
+    // than dropped as absent, GSTM1 2 of 466 as well. It removes about a third of the markers, and the
+    // dosage ratio loses more to the smaller denominator than it gains in specificity. Not retained,
+    // switched off or otherwise; see docs/algorithms/call.md.
     std::unordered_map<std::uint64_t, int> owner;
     std::vector<long> priv_size(n_genes, 0);
     for (std::size_t g = 0; g < n_genes; ++g) {
-        for (std::uint64_t km : gene_kmers[g]) {
+        for (const auto& [km, in_gene] : gene_counts[g]) {
             bool shared = false;
             for (std::size_t o = 0; o < n_genes && !shared; ++o)
-                if (o != g && gene_kmers[o].count(km)) shared = true;
-            if (!shared) { owner[km] = static_cast<int>(g); ++priv_size[g]; }
+                if (o != g && gene_counts[o].count(km)) shared = true;
+            if (shared) continue;
+            owner[km] = static_cast<int>(g);
+            // The denominator is OCCURRENCES per reference copy, so that hits/denominator is the
+            // number of copies. Counting distinct k-mers instead made a k-mer repeated within one
+            // copy read as extra copies of the gene.
+            priv_size[g] += in_gene;
         }
     }
 
@@ -282,13 +313,17 @@ std::vector<std::vector<GeneCnEvidence>> resolve_gene_cn(
         if (pev.empty() || pev[0].sites == 0) continue;   // per-site failed -> keep pooled dosage
         for (std::size_t hp = 0; hp < hap_seqs.size(); ++hp) {
             GeneCnEvidence& ea = ev[hp][ia];
+            // Separability is per HAPLOTYPE, not per pair. `sites` above says the pair could be
+            // separated somewhere in the panel; it does not say this haplotype carried any of those
+            // sites. Marking it separable anyway published cn=0 from hits=0 over priv=0 as a
+            // confident call, when the honest outcome is to fall back to the module total.
             ea.cn = pev[hp].cn_a; ea.hits = pev[hp].hits_a; ea.priv_kmers = pev[hp].priv_a;
             ea.dosage = ea.priv_kmers > 0 ? static_cast<double>(ea.hits) / static_cast<double>(ea.priv_kmers) : 0.0;
-            ea.separable = true;
+            ea.separable = ea.priv_kmers > 0;
             GeneCnEvidence& eb = ev[hp][ib];
             eb.cn = pev[hp].cn_b; eb.hits = pev[hp].hits_b; eb.priv_kmers = pev[hp].priv_b;
             eb.dosage = eb.priv_kmers > 0 ? static_cast<double>(eb.hits) / static_cast<double>(eb.priv_kmers) : 0.0;
-            eb.separable = true;
+            eb.separable = eb.priv_kmers > 0;
         }
     }
     return ev;
