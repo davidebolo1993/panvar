@@ -414,6 +414,69 @@ grep -q "CN_CONFIDENCE=HEURISTIC" "$PKV" \
   && ok "the PEAK record still declares itself heuristic" \
   || bad "a PEAK record lost its CN_CONFIDENCE=HEURISTIC label"
 
+# ---------------------------------------------------------------------------------------------
+# Within-haplotype coalescing must also judge nearness at the OCCURRENCE, not at a node's first
+# visit. Reference f1 R f2 R f3 visits R twice; one haplotype inserts after the FIRST R and again
+# after the SECOND. By first occurrence both anchors resolve to the same base, so the gap reads 0
+# and they coalesce into a single insertion carrying both sequences at the earlier position.
+#
+# Also the DEL-cluster contract, which had no focused test: two deletions with reference retained
+# between them coalesce into one record that is IMPRECISE, whose END spans the whole affected
+# interval while SVLEN stays the net deleted bases.
+# ---------------------------------------------------------------------------------------------
+CF1=$(blk 100 2); CR=$(blk 50 6); CF2=$(blk 60 10); CF3=$(blk 100 14)
+CI1=$(gblk 70 61); CI2=$(gblk 80 67)
+CD1=$(blk 60 18); CK=$(blk 40 22); CD2=$(blk 60 26)
+{ printf 'H\tVN:Z:1.0\n'
+  printf "S\tc1\t%s\nS\tcR\t%s\nS\tc2\t%s\nS\tc3\t%s\nS\ti1\t%s\nS\ti2\t%s\n" \
+         "$CF1" "$CR" "$CF2" "$CF3" "$CI1" "$CI2"
+  printf "S\td1\t%s\nS\tck\t%s\nS\td2\t%s\n" "$CD1" "$CK" "$CD2"
+  for e in "c1 cR" "cR c2" "c2 cR" "cR c3" "cR i1" "i1 c2" "cR i2" "i2 c3" \
+           "c3 d1" "d1 ck" "ck d2" "d2 c1x" "c3 ck" "ck c1x" "c3 c1x"; do
+    set -- $e; printf "L\t%s\t+\t%s\t+\t0M\n" "$1" "$2"
+  done
+  printf "S\tc1x\t%s\n" "$(blk 100 30)"
+  printf 'P\tcref#0#chr9:1-570\tc1+,cR+,c2+,cR+,c3+,d1+,ck+,d2+,c1x+\t*\n'
+  printf 'P\tchapref#1#chr9\tc1+,cR+,c2+,cR+,c3+,d1+,ck+,d2+,c1x+\t*\n'
+  printf 'P\tchapins#1#chr9\tc1+,cR+,i1+,c2+,cR+,i2+,c3+,d1+,ck+,d2+,c1x+\t*\n'
+  printf 'P\tchapdel#1#chr9\tc1+,cR+,c2+,cR+,c3+,ck+,c1x+\t*\n'
+  # a haplotype that removes the whole span, so c3..c1x is ONE snarl containing d1, ck and d2 --
+  # otherwise ck is a cut vertex, the two deletions land in different bubbles, and within-haplotype
+  # coalescing (which is per bubble) never gets to see them
+  printf 'P\tchapwipe#1#chr9\tc1+,cR+,c2+,cR+,c3+,c1x+\t*\n'; } > "$OUT/coal.gfa"
+"$BIN" bubble -i "$OUT/coal.gfa" -r 'cref#0#chr9:1-570' -o "$OUT/cob" -q >/dev/null 2>&1
+"$BIN" call -i "$OUT/cob.sorted.gfa" -c "$OUT/cob.bubbles.csv" -r 'cref#0#chr9:1-570' \
+      -o "$OUT/coc" -q >/dev/null 2>&1
+CVCF="$OUT/coc.region.vcf"
+if [ ! -s "$CVCF" ]; then
+  bad "the coalescing fixture produced no region VCF"
+else
+  n_ins=$(awk -F'\t' '$0!~/^#/ && $8~/SVTYPE=INS/' "$CVCF" | wc -l | tr -d ' ')
+  [ "$n_ins" = "2" ] \
+    && ok "two insertions at distinct occurrences stay two records (not coalesced into one)" \
+    || bad "expected 2 INS records at distinct anchors, got $n_ins"
+  # the DEL cluster: coalesced across retained sequence, so IMPRECISE with END wider than |SVLEN|
+  # the cluster is the DEL carried by the haplotype that kept `ck`: net 120 bp over a 160 bp span
+  dsv=$(awk -F'\t' '$0!~/^#/ && $8~/SVLEN=-120/{n=split($8,a,";");
+          for(i=1;i<=n;i++){split(a[i],kv,"="); if(kv[1]=="SVLEN"){print -kv[2]; exit}}}' "$CVCF")
+  dspan=$(awk -F'\t' '$0!~/^#/ && $8~/SVLEN=-120/{n=split($8,a,";");
+            for(i=1;i<=n;i++){split(a[i],kv,"="); if(kv[1]=="END"){print kv[2]-$2; exit}}}' "$CVCF")
+  dimp=$(awk -F'\t' '$0!~/^#/ && $8~/SVLEN=-120/ && $8~/IMPRECISE/{print "yes"; exit}' "$CVCF")
+  if [ -z "$dsv" ]; then
+    bad "the fixture produced no DEL record to test the cluster contract on"
+  else
+    [ "$dsv" = "120" ] \
+      && ok "a coalesced DEL cluster reports the NET deleted bases as SVLEN (120)" \
+      || bad "DEL cluster SVLEN: expected 120 (two 60 bp deletions), got $dsv"
+    [ "$dspan" -gt "$dsv" ] \
+      && ok "its END spans the whole affected interval ($dspan > $dsv), including retained sequence" \
+      || bad "DEL cluster END-POS=$dspan should exceed |SVLEN|=$dsv"
+    [ "$dimp" = "yes" ] \
+      && ok "and it is flagged IMPRECISE, so END-POS == |SVLEN| still holds everywhere else" \
+      || bad "a DEL cluster whose span exceeds |SVLEN| was not flagged IMPRECISE"
+  fi
+fi
+
 printf "\n"
 if [ "$fails" -eq 0 ]; then printf "call_stats: all assertions passed\n"; exit 0; fi
 printf "call_stats: %d assertion(s) failed\n" "$fails"; exit 1

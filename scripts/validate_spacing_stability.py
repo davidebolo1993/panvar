@@ -97,6 +97,10 @@ def main():
     ap.add_argument("--fraction", type=float, default=0.7)
     ap.add_argument("--workdir", default=None)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--alternate-reference",
+                    help="path name to re-run as the reference. Without it the switch experiment is "
+                         "skipped rather than guessed at: which path is a meaningful alternative "
+                         "reference is a question about the data, not something to pick by file order")
     args = ap.parse_args()
 
     work = args.workdir or os.path.join(os.path.dirname(args.gfa) or ".", "spacing_stability")
@@ -164,24 +168,47 @@ def main():
         print(line)
 
     print("\n### reference switch")
-    alt = None
-    for p in others:
-        if module_records(full_vcf):
-            alt = p
-            break
+    alt = args.alternate_reference
     if alt is None:
-        print("  no alternative reference available")
+        print("  skipped: pass --alternate-reference NAME to run it")
         return
+    if alt not in paths:
+        sys.exit(f"validate_spacing_stability: --alternate-reference '{alt}' is not a path in the GFA")
     vcf, err = call_once(args.panvar, args.gfa, args.bubbles, alt, os.path.join(work, "altref"))
     if vcf is None:
         print(f"  switching the reference to {alt} makes spacing unsupported: {err}")
         return
     alt_rec = module_records(vcf)
     print(f"  reference {args.reference}  ->  {alt}")
-    print(f"  MODULE_BP records {len(base)} -> {len(alt_rec)}"
-          f"   (record ids are reference-relative, so a direct per-record match is not expected)")
-    for rid, (step, support, _cn) in sorted(alt_rec.items()):
-        print(f"    {rid:24s} CN_STEP_BP={step}  support={support}")
+    # Record IDs embed the bubble, and re-anchoring on another reference can renumber them, so match
+    # on BUBBLE_ID rather than on the id string. Comparing per-sample CN is the point: the calibration
+    # constants are expected to move with the reference; whether the integer ANSWER moves is the
+    # question, and printing the constants alone does not answer it.
+    def by_bubble(recs, vcf_path):
+        out = {}
+        for line in open(vcf_path):
+            if line.startswith("#"):
+                continue
+            f = line.rstrip("\n").split("\t")
+            inf = dict(kv.split("=", 1) for kv in f[7].split(";") if "=" in kv)
+            if f[2] in recs and "BUBBLE_ID" in inf:
+                out[inf["BUBBLE_ID"]] = (f[2], recs[f[2]])
+        return out
+    a = by_bubble(base, full_vcf)
+    b = by_bubble(alt_rec, vcf)
+    shared = sorted(set(a) & set(b))
+    if not shared:
+        print(f"  no bubble id is a MODULE_BP record under both references "
+              f"({len(a)} vs {len(b)}); nothing comparable")
+        return
+    for bid in shared:
+        rid_a, (step_a, sup_a, cn_a) = a[bid]
+        rid_b, (step_b, sup_b, cn_b) = b[bid]
+        common = set(cn_a) & set(cn_b)
+        diff = sum(1 for s in common if cn_a[s] != cn_b[s])
+        print(f"  bubble {bid}: step {step_a} -> {step_b}   support {sup_a} -> {sup_b}")
+        print(f"    per-sample CN differs on {diff}/{len(common)} haplotypes present under both"
+              f"  ({rid_a} vs {rid_b})")
 
 
 main()

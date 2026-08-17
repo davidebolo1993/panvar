@@ -20,7 +20,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -464,7 +466,8 @@ void coalesce_events(
     std::vector<Event>& events,
     const std::unordered_map<std::string, std::size_t>& ref_node_pos,
     const std::unordered_map<std::string, std::size_t>& hap_node_pos,
-    std::size_t merge_distance_bp) {
+    std::size_t merge_distance_bp,
+    const std::function<bool(std::size_t, std::size_t, long long&, long long&)>& tok_bp) {
 
     if (events.size() < 2) return;
     auto pos_in = [](const std::unordered_map<std::string, std::size_t>& m,
@@ -474,6 +477,15 @@ void coalesce_events(
     };
     // Reference bp interval [lo, hi) that an event occupies on the reference.
     auto ref_span = [&](const Event& e, long long& lo, long long& hi) {
+        // Occurrence-aware where the walk positions are known. Deciding nearness from a node's FIRST
+        // occurrence lets two events at distant visits to a repeated node look adjacent and coalesce
+        // -- before the cross-haplotype merge, which is now occurrence-aware, ever sees them.
+        const std::size_t t0 = e.type == EvType::Ins ? e.ref_tok_anchor : e.ref_tok_first;
+        const std::size_t t1 = e.type == EvType::Ins ? e.ref_tok_anchor : e.ref_tok_last;
+        if (t0 != SIZE_MAX && t1 != SIZE_MAX && tok_bp != nullptr) {
+            long long a = -1, b = -1;
+            if (tok_bp(t0, t1, a, b)) { lo = a; hi = b; return; }
+        }
         if (e.type == EvType::Ins) {
             const long long p = pos_in(ref_node_pos, e.anchor_node);
             const long long end = (p < 0) ? p : p + static_cast<long long>(node_len(graph, e.anchor_node));
@@ -514,7 +526,14 @@ void coalesce_events(
         hap_span(e, hlo, hhi);
         // Merge when the same-type predecessor is near EITHER in reference space OR in this
         // haplotype's own sequence space.
-        if (e.type != EvType::Dup && !out.empty() && out.back().type == e.type &&
+        // Two insertions at DIFFERENT reference anchors are two insertions. Concatenating their
+        // sequences and keeping only the first anchor reported them as one exact insertion at the
+        // earlier position, which is wrong wherever the anchors are distinct occurrences.
+        const bool ins_anchor_ok =
+            e.type != EvType::Ins || out.empty() ||
+            out.back().ref_tok_anchor == SIZE_MAX || e.ref_tok_anchor == SIZE_MAX ||
+            out.back().ref_tok_anchor == e.ref_tok_anchor;
+        if (e.type != EvType::Dup && !out.empty() && out.back().type == e.type && ins_anchor_ok &&
             (gap_ok(prev_hi, lo) || gap_ok(prev_hhi, hlo))) {
             Event& prev = out.back();
             for (const std::string& nd : e.nodes) prev.nodes.push_back(nd);
@@ -1006,6 +1025,29 @@ void call_variants(
         const std::size_t rescue_floor =
             options.rescue_min_bp != 0 ? options.rescue_min_bp : std::max<std::size_t>(1, options.min_sv_bp / 2);
 
+        // Traversing paths whose module span rests on a REPEATED boundary. Counted once per path
+        // here rather than incremented inside the span resolver: that resolver is called twice for
+        // every path (spacing estimation, then dosage), so an in-resolver counter reported roughly
+        // double. Computed at bubble scope so REP and PEAK records carry it too, not only MODULE_BP.
+        std::size_t module_ambiguous_paths = 0;
+        for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
+            if (!traverses.count(graph.paths[pi].name)) continue;
+            bool amb = false;
+            (void)module_span(pi, &amb);
+            if (amb) ++module_ambiguous_paths;
+        }
+
+        // The reference's module span as genomic coordinates, from the SAME resolver the folded bp
+        // and CNBP are measured over. Record coordinates were taken from a node->first-occurrence map
+        // instead, so with a repeated boundary the record described one interval and its CN another.
+        auto module_ref_bounds = [&](bool* ambiguous) -> std::pair<std::size_t, std::size_t> {
+            if (ref_idx >= graph.paths.size()) return {0, 0};
+            const auto sp = module_span(ref_idx, ambiguous);
+            if (sp.first > sp.second || sp.second + 1 >= ref_prefix.size()) return {0, 0};
+            return {ref_meta.region_start_1based + ref_prefix[sp.first],
+                    ref_meta.region_start_1based + ref_prefix[sp.second + 1] - 1};
+        };
+
         auto ev_ref_pos = [&](const Event& e) -> long long {
             // Occurrence-aware first: this position seeds the merge window and the sort order, so
             // taking a node's FIRST occurrence lets two events at two visits to the same node look
@@ -1081,13 +1123,7 @@ void call_variants(
         if (options.cn && !has_rep_selfloop) {
             const std::unordered_set<std::string> inside_set(bubble.inside.begin(), bubble.inside.end());
             // The shared module resolver, so the CN routes and CNBP measure the SAME interval.
-            std::size_t span_ambiguous = 0;
-            auto span_of = [&](std::size_t pi) {
-                bool amb = false;
-                const auto sp = module_span(pi, &amb);
-                if (amb) ++span_ambiguous;
-                return sp;
-            };
+            auto span_of = [&](std::size_t pi) { return module_span(pi); };
             // Folded set = inside nodes the reference revisits (>=2x): the repeat unit. Measuring CN
             // only over these keeps unique-content edits (interstitial / single-visit nodes) out of it.
             std::unordered_set<std::string> folded_set;
@@ -1298,7 +1334,7 @@ void call_variants(
                 mr.seed.round_ambiguous_frac =
                     round_n > 0 ? static_cast<double>(round_ambiguous) / static_cast<double>(round_n) : 0.0;
                 mr.seed.cn_clamped_zero = cn_clamped_zero;
-                mr.seed.module_span_ambiguous = span_ambiguous;
+                mr.seed.module_span_ambiguous = module_ambiguous_paths;
                 // Gate on the SHARE of samples whose rounding was a coin flip, not on the mean residual.
                 // The mean is a bad summary of a bimodal distribution -- at GSTM1 the median sample sits
                 // at 0.045 and the 90th percentile at 0.496, so the mean of 0.197 describes no sample --
@@ -1375,6 +1411,7 @@ void call_variants(
                 if (grp == nullptr) {
                     MergedRecord mr;
                     mr.seed.type = EvType::Dup;
+                    mr.seed.module_span_ambiguous = module_ambiguous_paths;
                     mr.seed.nodes.push_back(cn);
                     mr.seed.start_node = cn; mr.seed.end_node = cn;
                     mr.seed.ref_cn = rc; mr.seed.alt_cn = ac;
@@ -1439,6 +1476,7 @@ void call_variants(
                 if (peak_grp == nullptr) {
                     MergedRecord mr;
                     mr.seed.type = EvType::Dup;
+                    mr.seed.module_span_ambiguous = module_ambiguous_paths;
                     mr.seed.nodes.push_back(peak_node);
                     mr.seed.start_node = peak_node; mr.seed.end_node = peak_node;
                     mr.seed.ref_cn = ref_peak; mr.seed.alt_cn = ac_peak;
@@ -1490,7 +1528,15 @@ void call_variants(
                     off += node_len(graph, s.node_id);
                 }
             }
-            coalesce_events(graph, events, ref_node_pos, hap_node_pos, options.merge_distance_bp);
+            // The token->genomic resolver, so nearness is judged at the occurrence the events sit at.
+            coalesce_events(graph, events, ref_node_pos, hap_node_pos, options.merge_distance_bp,
+                            [&](std::size_t t0, std::size_t t1, long long& lo, long long& hi) {
+                                const auto sp = tok_span(t0, t1);
+                                if (sp.first == 0) return false;
+                                lo = static_cast<long long>(sp.first);
+                                hi = static_cast<long long>(sp.second) + 1;   // half-open, as before
+                                return true;
+                            });
             for (Event& e : events) {
                 const long long p = ev_ref_pos(e);
                 e.ref_pos = p < 0 ? 0 : static_cast<std::size_t>(p);
@@ -2137,22 +2183,26 @@ void call_variants(
             // of one copy, so pos + unit named a reference interval that corresponds to nothing. END is
             // the module's own reference span -- the interval FORMAT:CNBP is measured over.
             if (is_module_cn(e.cn_method)) {
-                const auto sit = ref_node_pos.find(bubble.sink);
-                const auto bit = ref_node_pos.find(bubble.source);
-                if (sit != ref_node_pos.end() && bit != ref_node_pos.end()) {
-                    // build_ref_node_pos already returns 1-based genomic starts, so the span end is the
-                    // far boundary's own start plus its length -- adding the region offset again put END
-                    // past the locus and it silently clamped to the last base.
-                    const bool sink_is_far = sit->second >= bit->second;
-                    const std::size_t far_start = sink_is_far ? sit->second : bit->second;
-                    const std::string& far = sink_is_far ? bubble.sink : bubble.source;
-                    // END closes the interval FORMAT:CNBP is measured over, and that sum runs over the
-                    // bubble's INTERIOR only -- both boundary nodes are excluded. POS is already the
-                    // last base of the near boundary, so the interior is POS+1 .. far_start-1 and END
-                    // is the base before the far boundary starts. Including the far boundary node (or,
-                    // as before, the far boundary plus one) described an interval no other field means.
-                    (void)far;
-                    end = far_start > 0 ? far_start - 1 : 0;
+                // POS/END from the resolver that measures the module, so the record's interval and the
+                // interval its CN/CNBP were taken over are the same one. The boundaries span
+                // [lo, hi]; the module CONTENT is the interior, so POS is the last base of the near
+                // boundary and END the base before the far one starts.
+                bool amb = false;
+                const auto mb = module_ref_bounds(&amb);
+                if (mb.first > 0 && mb.second > mb.first) {
+                    const std::size_t near_len = node_len(graph, bubble.source);
+                    const std::size_t far_len = node_len(graph, bubble.sink);
+                    // which boundary the span opens on depends on the reference's direction over it
+                    const std::size_t open_len =
+                        rpos(bubble.source) <= rpos(bubble.sink) ? near_len : far_len;
+                    const std::size_t close_len =
+                        rpos(bubble.source) <= rpos(bubble.sink) ? far_len : near_len;
+                    if (mb.first + open_len <= mb.second && mb.second >= close_len) {
+                        pos = mb.first + (open_len > 0 ? open_len - 1 : 0);
+                        end = mb.second - (close_len > 0 ? close_len - 1 : 0) - 1;
+                        const std::string b = ref_base_at(pos);
+                        if (!b.empty()) ref_base = b;
+                    }
                 }
             }
             if (end > ref_end_1based) end = ref_end_1based;  // END is a reference coordinate; never past the graph

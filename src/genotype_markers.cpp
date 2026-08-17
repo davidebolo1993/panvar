@@ -5,6 +5,7 @@
 #include "panvar/syncmer.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <fstream>
 #include <stdexcept>

@@ -406,6 +406,10 @@ std::vector<CoverageScore> score_block_by_coverage(
     double lambda,
     double overdispersion) {
 
+    // The block's allele vectors are already in node-index space, so the index itself is not needed
+    // here. Kept in the signature because every other scorer takes it and callers pass it positionally.
+    (void)index;
+
     // Only the nodes some allele of this block traverses. Everything else is another block's business,
     // and including it would add the same constant to every candidate while diluting the comparison.
     std::vector<std::uint32_t> nodes;
