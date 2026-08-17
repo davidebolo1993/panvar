@@ -220,6 +220,70 @@ nolo_alleles=$(grep -v "^#" "$OUT/nolo.alleles.vcf" 2>/dev/null | wc -l | tr -d 
   && ok "the allele VCF survives a region VCF with no interpreted calls ($nolo_alleles records)" \
   || bad "allele-VCF independence: region=$nolo_region alleles=$nolo_alleles (want region 0, alleles > 0)"
 
+# ---------------------------------------------------------------------------------------------
+# Per-gene copy number: a haplotype with no evidence must not be published as a confident zero.
+#
+# A self-loop REP node carrying two near-identical genes fires the REP DUP route, and --gtf then
+# splits it per gene. hapD deletes the module entirely, so it has no hits at any divergent site and
+# no basis for a split. It used to be reported CN=0 reliable=1 -- indistinguishable from a measured
+# absence -- because separability was decided from the pair's marker sets, which exist for every
+# haplotype, rather than from whether THIS haplotype resolved.
+# ---------------------------------------------------------------------------------------------
+# Deterministic pseudo-random sequence. The repeating-motif helper above will not do here: a gene
+# built from one 40-mer has only ~40 distinct k-mers, so the private sets are degenerate and the
+# per-site split cannot resolve for anyone. Same seed always gives the same sequence.
+gblk() { awk -v n="$1" -v seed="${2:-1}" 'BEGIN{
+           b="ACGT"; x=seed*1103515245+12345;
+           for(i=0;i<n;i++){ x=(x*1103515245+12345)%2147483648; if(x<0)x=-x;
+                             printf "%s", substr(b, (int(x/65536)%4)+1, 1) } }'; }
+
+GFL=$(gblk 400 5); GLINK=$(gblk 200 13); GFR=$(gblk 400 19)
+GA=$(gblk 1200 2)
+# gene B: gene A with five substituted bases, so the pair is near-identical (routed to per-site)
+# but still has divergent sites to split on
+GB="$GA"
+for p in 100 300 500 700 900; do
+  c="${GB:$p:1}"; case "$c" in A) n=C;; C) n=G;; G) n=T;; *) n=A;; esac
+  GB="${GB:0:$p}$n${GB:$((p+1))}"
+done
+GREP="$GA$GLINK$GB"
+gstart=$((${#GFL} + 1))
+ga1=$((gstart + ${#GA} - 1))
+gb0=$((gstart + ${#GA} + ${#GLINK}))
+gb1=$((gb0 + ${#GB} - 1))
+gtotal=$((${#GFL} + 2 * ${#GREP} + ${#GFR}))
+
+{ printf 'H\tVN:Z:1.0\n'
+  printf "S\tf1\t%s\nS\trep\t%s\nS\tf2\t%s\n" "$GFL" "$GREP" "$GFR"
+  printf 'L\tf1\t+\trep\t+\t0M\nL\trep\t+\trep\t+\t0M\nL\trep\t+\tf2\t+\t0M\nL\tf1\t+\tf2\t+\t0M\n'
+  printf 'P\tgref#0#chr9:1-%d\tf1+,rep+,rep+,f2+\t*\n' "$gtotal"
+  printf 'P\tghapA#1#chr9\tf1+,rep+,rep+,f2+\t*\n'
+  printf 'P\tghapB#1#chr9\tf1+,rep+,rep+,rep+,f2+\t*\n'
+  printf 'P\tghapD#1#chr9\tf1+,f2+\t*\n'; } > "$OUT/gene.gfa"
+{ printf 'chr9\ttest\tgene\t%d\t%d\t.\t+\t.\tgene_id "GENEA"; gene_name "GENEA";\n' "$gstart" "$ga1"
+  printf 'chr9\ttest\tCDS\t%d\t%d\t.\t+\t0\tgene_id "GENEA"; gene_name "GENEA";\n' "$gstart" "$ga1"
+  printf 'chr9\ttest\tgene\t%d\t%d\t.\t+\t.\tgene_id "GENEB"; gene_name "GENEB";\n' "$gb0" "$gb1"
+  printf 'chr9\ttest\tCDS\t%d\t%d\t.\t+\t0\tgene_id "GENEB"; gene_name "GENEB";\n' "$gb0" "$gb1"; } > "$OUT/gene.gtf"
+
+"$BIN" bubble -i "$OUT/gene.gfa" -r 'gref#0#chr9' -o "$OUT/gb" -q >/dev/null 2>&1
+"$BIN" call -i "$OUT/gb.sorted.gfa" -c "$OUT/gb.bubbles.csv" -r 'gref#0#chr9' -o "$OUT/gc" \
+      --cn --gtf "$OUT/gene.gtf" -q >/dev/null 2>&1
+GTSV="$OUT/gc.dup_gene_cn.tsv"
+if [ ! -s "$GTSV" ]; then
+  bad "the two-gene REP fixture produced no dup_gene_cn table"
+else
+  # a haplotype that DOES carry the module resolves and is reliable
+  carrier_rel=$(awk -F'\t' '$3 ~ /ghapB/ && $4=="GENEA" {print $6; exit}' "$GTSV")
+  [ "$carrier_rel" = "1" ] && ok "a haplotype carrying the module reports a reliable per-gene split" \
+    || bad "carrier per-gene split: expected reliable=1, got ${carrier_rel:-<missing>}"
+  # the haplotype that lost the module must NOT be reported as a confident zero
+  lost_rel=$(awk -F'\t' '$3 ~ /ghapD/ && $4=="GENEA" {print $6; exit}' "$GTSV")
+  lost_dos=$(awk -F'\t' '$3 ~ /ghapD/ && $4=="GENEA" {print $7; exit}' "$GTSV")
+  [ "$lost_rel" = "0" ] \
+    && ok "a haplotype with no per-site evidence falls back (reliable=0), not a confident zero" \
+    || bad "module-loss haplotype: expected reliable=0, got ${lost_rel:-<missing>} (dosage ${lost_dos:-?})"
+fi
+
 printf "\n"
 if [ "$fails" -eq 0 ]; then printf "call_stats: all assertions passed\n"; exit 0; fi
 printf "call_stats: %d assertion(s) failed\n" "$fails"; exit 1

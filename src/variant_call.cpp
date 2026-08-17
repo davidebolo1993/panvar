@@ -559,6 +559,12 @@ struct MergedRecord {
     std::size_t max_size_bp = 0;                            // largest merged member size
     double merge_max_jaccard = -1.0;                        // strongest node-set Jaccard that merged a member (-1 = none)
     double merge_max_seqid = -1.0;                          // strongest sequence identity that merged a member (-1 = none)
+    // Weakest pairwise node Jaccard inside the merged component (-1 = single member). Single-linkage
+    // can chain A-B-C where A and C would never merge directly, and the strongest-edge fields above
+    // cannot show that; this can. `exact` is false when the component was too large to compare all
+    // pairs and the figure is an upper bound taken against the representative.
+    double merge_diameter = -1.0;
+    bool merge_diameter_exact = true;
 };
 
 std::string upper_base(char c) {
@@ -782,6 +788,8 @@ void call_variants(
         if (!genes.empty())
             out << "##INFO=<ID=GENES,Number=.,Type=String,Description=\"Gene(s) overlapping the variant (from --gtf)\">\n";
         out << "##INFO=<ID=NMERGED,Number=1,Type=Integer,Description=\"Haplotype carriers merged into this record\">\n";
+        out << "##INFO=<ID=MERGE_DIAMETER,Number=1,Type=Float,Description=\"Weakest pairwise node Jaccard between any two events merged into this record. Merging is transitive single-linkage, so a record can span members that would never have merged directly (A-B-C with A and C dissimilar); MERGE_JACCARD reports the strongest edge and cannot show that, this reports the worst. Near 0 means the record's members share almost no nodes and the chain reached a long way. Absent on unmerged records\">\n";
+        out << "##INFO=<ID=MERGE_DIAMETER_EXACT,Number=0,Type=Flag,Description=\"MERGE_DIAMETER compared every pair. Absent means the component exceeded the all-pairs bound and the value is an upper bound measured against the representative only\">\n";
         out << "##INFO=<ID=MERGE_JACCARD,Number=1,Type=Float,Description=\"Strongest node-set Jaccard that merged a member into this record (cross-haplotype merge evidence)\">\n";
         out << "##INFO=<ID=MERGE_SEQID,Number=1,Type=Float,Description=\"Strongest sequence identity that merged a member into this record, when the Jaccard gate did not decide it\">\n";
         out << "##INFO=<ID=MERGE_SIZE_RATIO,Number=1,Type=Float,Description=\"Smallest/largest member size among merged members (min,max also in SVLEN_RANGE)\">\n";
@@ -1459,8 +1467,36 @@ void call_variants(
                 std::size_t best = comp.front();
                 for (std::size_t k : comp)
                     if (cands[k].e->size_bp > cands[best].e->size_bp) best = k;
+                // Single-linkage merges A with C whenever some B links to both, so the record can span
+                // members that would never have merged directly. MERGE_JACCARD reports the STRONGEST
+                // edge, which says nothing about that. The diameter -- the WEAKEST pairwise similarity
+                // in the component -- is what shows how far the chain reached. Bounded, because this is
+                // quadratic and a component can hold hundreds of members.
+                double diameter = -1.0;
+                bool diameter_exact = true;
+                if (comp.size() >= 2) {
+                    constexpr std::size_t kDiameterMaxMembers = 128;
+                    if (comp.size() <= kDiameterMaxMembers) {
+                        diameter = 1.0;
+                        for (std::size_t x = 0; x < comp.size(); ++x)
+                            for (std::size_t y = x + 1; y < comp.size(); ++y)
+                                diameter = std::min(diameter, weighted_jaccard(
+                                    graph, cands[comp[x]].e->nodes, cands[comp[y]].e->nodes));
+                    } else {
+                        // Against the representative only: an upper bound on the true diameter, and
+                        // labelled as such rather than passed off as the real thing.
+                        diameter = 1.0;
+                        diameter_exact = false;
+                        for (std::size_t k : comp)
+                            if (k != best)
+                                diameter = std::min(diameter, weighted_jaccard(
+                                    graph, cands[best].e->nodes, cands[k].e->nodes));
+                    }
+                }
                 MergedRecord mr;
                 mr.seed = *cands[best].e;                 // largest member represents the record
+                mr.merge_diameter = diameter;
+                mr.merge_diameter_exact = diameter_exact;
                 mr.min_size_bp = mr.seed.size_bp;
                 mr.max_size_bp = mr.seed.size_bp;
                 std::string link = mr.seed.link_id;
@@ -2059,6 +2095,12 @@ void call_variants(
                                   static_cast<double>(mr.min_size_bp) / static_cast<double>(mr.max_size_bp));
                     info << ";MERGE_SIZE_RATIO=" << buf;
                 }
+            }
+            if (mr.merge_diameter >= 0.0) {
+                std::ostringstream d; d.setf(std::ios::fixed); d.precision(4);
+                d << mr.merge_diameter;
+                info << ";MERGE_DIAMETER=" << d.str();
+                if (mr.merge_diameter_exact) info << ";MERGE_DIAMETER_EXACT";
             }
             // Cross-haplotype merge evidence (only set when ≥2 events were actually merged).
             if (e.type != EvType::Dup && mr.merge_max_jaccard >= 0.0) {

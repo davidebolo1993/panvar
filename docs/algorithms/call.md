@@ -42,6 +42,21 @@ The two link tests in step 5 fail on opposite kinds of event, which is why both 
 
 So lower `--merge-jaccard` to merge events that share a backbone, and lower `--merge-seq-identity` / `--merge-size-ratio` to merge similar content threaded through different nodes.
 
+#### What single-linkage can hide, and how to see it
+
+Merging is transitive: A and C join whenever some B links to both, even when A and C would never have merged directly. That is deliberate — greedy first-fit fragments a real event across haplotypes — but it means a record can span members far more different than any threshold allows. `MERGE_JACCARD` reports the **strongest** edge and cannot show this. `MERGE_DIAMETER` reports the **weakest** pairwise node Jaccard in the component, which can:
+
+| record | `NMERGED` | `MERGE_JACCARD` | `MERGE_DIAMETER` |
+|---|---|---|---|
+| lpa bubble8_INS | 132 | 1.0000 | **0.0000** |
+| gstm1 bubble7_INS | 363 | 1.0000 | 0.4937 |
+| ankrd36c bubble11_INS | 11 | 1.0000 | 0.3333 |
+| cyp2d6 bubble5_INS | 59 | 1.0000 | 0.9016 |
+
+The first row is the case to know about: 132 events merged into one record whose strongest edge is perfect and two of whose members **share no nodes at all**. The second is the record that hands 363 carriers an 80 bp representative when their true divergence averages 57 bp — the diameter says those members are genuinely heterogeneous, not a tight cluster.
+
+All-pairs comparison is quadratic, so above 128 members the value is measured against the representative only and `MERGE_DIAMETER_EXACT` is absent, marking it an upper bound.
+
 ### 7. Place the record
 
 `POS` is the base **before** the event, not its first affected base — the symbolic convention, so `REF` carries one real reference base and `ALT` is the symbol. The event then occupies `POS+1 … END`, and `END` is the last reference base it spans, inclusive:
