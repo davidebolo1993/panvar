@@ -136,11 +136,22 @@ KIV2_BUB="$(awk -F'\t' '/SVTYPE=DUP/{sv=$8;sub(/.*SVLEN=/,"",sv);sub(/;.*/,"",sv
 echo "== sanity: region scan recovers KIV-2 (bubble $KIV2_BUB, negative effect); structure correction lowers lambda =="
 "$PY" - "$ASSOC/assoc_graph_quant.assoc.tsv" "$ASSOC/sim_naive.summary.tsv" "$ASSOC/sim_pc.summary.tsv" "$KIV2_BUB" <<'PY'
 import sys
-rows = [l.split("\t") for l in open(sys.argv[1]).read().splitlines()[1:]]
-top = rows[0]
-beta, p_bonf = float(top[6]), float(top[10])
-ok = (sys.argv[4] in top[2].split(";")) and beta < 0 and p_bonf < 0.05
-print(f"  region top feature={top[0]} bubble={top[2]} beta={beta:.3f} p_bonf={p_bonf:.1e} -> {'PASS' if ok else 'CHECK'}")
+lines = open(sys.argv[1]).read().splitlines()
+# BY NAME. These were positional, and `associate` has since inserted n_conditional at index 5 and
+# added p_method/effect_status/mac_case/mac_ctrl -- so top[6] had become minor_freq and top[10] p.
+# The check was asking whether a FREQUENCY is negative, which it never is, so it could not pass: it
+# printed CHECK on a result that was in fact correct (bubble 7, beta -0.019, p_bonf 3e-08).
+hdr = lines[0].split("\t")
+ci = {c: i for i, c in enumerate(hdr)}
+for need in ("feature_id", "bubbles", "beta", "p_bonf"):
+    if need not in ci:
+        sys.exit(f"{sys.argv[1]}: no '{need}' column; header is {hdr}")
+top = lines[1].split("\t")
+beta, p_bonf = float(top[ci["beta"]]), float(top[ci["p_bonf"]])
+bubbles = top[ci["bubbles"]]
+ok = (sys.argv[4] in bubbles.split(";")) and beta < 0 and p_bonf < 0.05
+print(f"  region top feature={top[ci['feature_id']]} bubble={bubbles} beta={beta:.4f} "
+      f"p_bonf={p_bonf:.1e} -> {'PASS' if ok else 'CHECK'}")
 def lam(p):
     try:
         d = dict(l.split("\t") for l in open(p).read().splitlines()[1:]); return float(d["lambda_gc"])
