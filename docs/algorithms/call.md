@@ -166,6 +166,20 @@ That span is well defined only while each boundary is visited once. When a bound
 
 It does not fire on any of the six reference loci, and the reason is structural rather than luck: a node the reference revisits cannot be a cut vertex, so the cactus decomposition promotes it into the enclosing snarl's interior and it never becomes a boundary. The counter is reachable through `--snarls-in` or a hand-written bubbles CSV, where boundaries carry no such guarantee — which is exactly the door that needs the warning.
 
+#### Is the step a property of the locus or of the cohort?
+
+The obvious objection to taking the step from the panel is that it makes the answer depend on who is in the panel. `scripts/validate_spacing_stability.py` tests that from outside the caller, by rewriting the panel rather than instrumenting the estimator: it resamples 70% of the non-reference haplotypes ten times, and separately re-runs with a different path as the reference.
+
+| locus | step across 10 subsamples | CN changes | reference switch (GRCh38 → CHM13) |
+|---|---|---|---|
+| acot bubble5 | 475..475 (0.0%) | 0 / 1308 | — |
+| acot bubble7 | 14477..14481 (0.0%) | 0 / 1308 | step 14476 → 14480, CN 0/467 differ |
+| gstm1 bubble6 | 11067..11068 (0.0%) | 0 / 1956 | step 11068 → **711**, CN **1/466** differ |
+
+Cohort dependence is not the problem it looked like: the step does not move under resampling, and no copy number changes. Four to six of every ten replicates **refuse** spacing mode outright, which is the refusal conditions above doing their job on a thinner panel rather than the estimator guessing.
+
+The reference switch is the interesting one. At GSTM1 the calibration constants change completely — `CN_UNIT_BP` 7610 → 710, the step 11068 → 711 — because the two references revisit different node sets (`CN_REF_FOLD` 3 over 22830 bp against 2 over 1420 bp), so they are calibrating against different modules. The copy number nonetheless agrees on 465 of 466 haplotypes. **The calibration constants are reference-dependent; the integer copy number is very nearly not.** That is the reassuring version of the result, and it is worth stating in that order rather than reporting only the second half.
+
 #### The integer fit is not a correctness signal
 
 `CN_ROUND_AMBIGUOUS_FRAC` is the share of haplotypes whose dosage sat more than 0.4 units from a whole number, so the integer came from near a coin flip. It replaces the mean residual as what `--max-cn-model-residual` gates on, because the per-sample residuals are bimodal and the mean describes neither mode — at c4 the mean is 0.13 while **no** sample is ambiguous, and at GSTM1 the mean is 0.30 while **two thirds** are.
