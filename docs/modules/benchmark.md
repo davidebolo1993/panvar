@@ -31,7 +31,7 @@ Event size is a property of the two walks. It does not move with the alignment, 
 
 `graph ≥ called ≥ carrier` are **nested ceilings**: each substitutes a subset of the previous level's blocks, and all three implant the haplotype's own true sequence, so the ordering is guaranteed. **`genotype` is not bounded by them.** It applies every record the haplotype carries rather than only attributed eligible blocks, so it can beat `carrier` in places — which is exactly why the last two loss terms are signed. Treat it as a fourth measurement, not the bottom of a chain.
 
-What the steps separate: `called` and `carrier` implant the **same true blocks** and differ only in whether the haplotype was genotyped as a carrier; `carrier` and `genotype` cover the **same records on the same haplotypes** and differ only in whether the block comes from the walk or from the VCF's encoding.
+What the steps separate: `called` and `carrier` implant the **same true blocks** and differ only in whether the haplotype was genotyped as a carrier — that step is a clean isolation. The `carrier`-to-`genotype` step is not symmetric: `carrier` substitutes only blocks that are attributed *and* eligible, while `genotype` applies **every** record the haplotype's `GT` names, including ones covering no eligible truth block. So that step mixes two things, and they are reported separately — `representation` where the haplotype has an eligible truth event, `false_positive_damage` where it does not.
 
 That is emitted as a `loss_bp` partition of the genotype residual — five consecutive steps from truth down to the reconstruction, which **sum exactly** to it (`sum_check`, asserted, because an attribution built on arithmetic that has stopped closing is worthless):
 

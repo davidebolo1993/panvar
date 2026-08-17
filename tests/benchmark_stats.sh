@@ -403,6 +403,24 @@ if [ -s "$OUT/av.alleles.vcf" ]; then
   refused "a VCF whose record ids match neither contract is refused" "$OUT/MM" \
     "$BIN" benchmark -i "$OUT/ab.sorted.gfa" -c "$OUT/ab.bubbles.csv" -r "$REF" \
        --variant-nodes "$OUT/ac.variant_nodes.tsv" --vcf "$OUT/renamed.vcf" -o "$OUT/MM" -q
+  # An EXTRA VCF record is as wrong as a missing one: the genotype level would apply its edits while
+  # no truth attribution accounts for them, so the run would score a superset of the call set.
+  { grep '^#' "$OUT/ac.region.vcf"
+    grep -v '^#' "$OUT/ac.region.vcf"
+    grep -v '^#' "$OUT/ac.region.vcf" | head -1 | awk -F'\t' 'BEGIN{OFS="\t"}{$3=$3"_EXTRA"; print}'; } > "$OUT/extra.vcf"
+  refused "a VCF record with no variant_nodes row is refused" "$OUT/EX" \
+    "$BIN" benchmark -i "$OUT/ab.sorted.gfa" -c "$OUT/ab.bubbles.csv" -r "$REF" \
+       --variant-nodes "$OUT/ac.variant_nodes.tsv" --vcf "$OUT/extra.vcf" -o "$OUT/EX" -q
+
+  # An allele VCF carries exactly one record per bubble; the GT indexes that bubble's allele list, so
+  # a second record at the same bubble makes which allele a GT names depend on file order.
+  { grep '^#' "$OUT/av.alleles.vcf"
+    grep -v '^#' "$OUT/av.alleles.vcf"
+    grep -v '^#' "$OUT/av.alleles.vcf" | head -1 | awk -F'\t' 'BEGIN{OFS="\t"}{$3=$3"_DUP2"; print}'; } > "$OUT/twoallele.vcf"
+  refused "two allele records at one bubble are refused" "$OUT/TA" \
+    "$BIN" benchmark -i "$OUT/ab.sorted.gfa" -c "$OUT/ab.bubbles.csv" -r "$REF" \
+       --variant-nodes "$OUT/av.variant_nodes.tsv" --vcf "$OUT/twoallele.vcf" -o "$OUT/TA" -q
+
   # A matching id must also agree on the site.
   awk -F'\t' 'BEGIN{OFS="\t"} /^#/{print;next} {sub(/BUBBLE_ID=[0-9]*/,"BUBBLE_ID=99",$8); print}' \
     "$OUT/ac.region.vcf" > "$OUT/wrongbub.vcf"

@@ -961,12 +961,41 @@ int run_benchmark_command(const std::vector<std::string>& args) {
         for (const VcfRecord& r : vcf.records) if (r.allele_style) ++allele_rows;
         if (total_recs != 0 && joined_recs == 0 && allele_rows == vcf.records.size() && !vcf.records.empty()) {
             allele_mode = true;
+            // "One record per bubble" is the allele VCF's whole contract: the reconstruction takes the
+            // haplotype's GT as an index into that bubble's allele list, so a second record at the same
+            // bubble would silently make which allele a GT names depend on file order.
+            std::unordered_set<std::size_t> seen_bubbles;
+            for (const VcfRecord& r : vcf.records)
+                if (!seen_bubbles.insert(r.bubble_id).second)
+                    throw std::runtime_error(vcf_in + ": two allele records at bubble " +
+                                             std::to_string(r.bubble_id) + " ('" + r.id +
+                                             "'); an allele VCF carries exactly one record per bubble");
         } else if (joined_recs != total_recs) {
             throw std::runtime_error(
                 vcf_in + ": " + std::to_string(joined_recs) + " of " + std::to_string(total_recs) +
                 " records in " + variant_nodes_in + " have a VCF row with the same ID. A region VCF must "
                 "match all of them and an allele VCF none; a partial match means the two files are from "
                 "different runs");
+        }
+        // The join must be exact in BOTH directions. Checking only that every call has a VCF row lets a
+        // stale or superset VCF through, and its extra records are applied as edits by the genotype
+        // level while contributing to no truth attribution -- a silent superset of the run being scored.
+        if (!allele_mode) {
+            std::unordered_set<std::string> called_ids;
+            for (const auto& [bid, recs] : cv.records)
+                for (const CalledRecord& rec : recs) called_ids.insert(rec.variant_id);
+            std::size_t extra = 0;
+            std::string first_extra;
+            for (const VcfRecord& r : vcf.records)
+                if (r.id != "." && !called_ids.count(r.id)) {
+                    if (!extra) first_extra = r.id;
+                    ++extra;
+                }
+            if (extra)
+                throw std::runtime_error(vcf_in + " has " + std::to_string(extra) + " record(s) with no row "
+                                         "in " + variant_nodes_in + " (first: '" + first_extra +
+                                         "'). The two must describe the same call set exactly, or the "
+                                         "genotype level applies edits nothing else accounts for");
         }
     }
 
