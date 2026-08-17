@@ -312,6 +312,53 @@ printf '{"start": {"node_id": "3"}, "end": {"node_id": "1"}}\n' > "$OUT/revsnarl
 [ "$?" -ne 0 ] && ok "--snarls-in refuses a reference that is not there" \
                || bad "--snarls-in accepted a reference that does not exist"
 
+# ---------------------------------------------------------------------------------------------
+# Emitted sites must be pairwise disjoint. Two retained sites claiming the same interior node
+# describe the same sequence twice, and panphorte refuses to fold both -- so an overlap does not
+# degrade a locus, it stops it running at all (ANKRD36C failed exactly there).
+#
+# A nested pair: an outer site 1..6 and an inner site 2..5 whose interiors both contain node 3.
+# Only one may survive, and it must be the SMALLER one: measured at ANKRD36C, keeping the smaller
+# sites closes 89.54% of the reconstruction gap against the enclosing site's 3.98%.
+# ---------------------------------------------------------------------------------------------
+nb() { local n=$1 c=$2 out=""; while [ ${#out} -lt "$n" ]; do out="$out$c"; done; printf '%s' "${out:0:$n}"; }
+{ printf 'H\tVN:Z:1.0\n'
+  printf "S\t1\t%s\nS\t2\t%s\nS\t3\t%s\nS\t3b\t%s\nS\t4\t%s\nS\t5\t%s\nS\t6\t%s\n" \
+         "$(nb 200 A)" "$(nb 100 C)" "$(nb 120 G)" "$(nb 120 T)" "$(nb 100 A)" "$(nb 100 G)" "$(nb 200 T)"
+  for e in "1 2" "2 3" "2 3b" "3 4" "3b 4" "4 5" "5 6" "2 4" "1 5"; do
+    set -- $e; printf "L\t%s\t+\t%s\t+\t0M\n" "$1" "$2"
+  done
+  printf 'P\tnref#0#chrN:1-940\t1+,2+,3+,4+,5+,6+\t*\n'
+  printf 'P\tnhapA#1#chrN\t1+,2+,3b+,4+,5+,6+\t*\n'
+  printf 'P\tnhapB#1#chrN\t1+,2+,4+,5+,6+\t*\n'
+  printf 'P\tnhapC#1#chrN\t1+,5+,6+\t*\n'; } > "$OUT/nest.gfa"
+# The internal finder emits TOP-LEVEL snarls only, so it cannot produce a nested overlapping pair --
+# a fixture fed through that door yields one site and would assert nothing. --snarls-in can: it takes
+# the pairs it is given. Supplying an outer 1..6 and an inner 2..5, whose interiors both contain 3,
+# is the reproducer, and it is also the door a user can actually hit.
+printf '{"start": {"node_id": "1"}, "end": {"node_id": "6"}}\n{"start": {"node_id": "2"}, "end": {"node_id": "5"}}\n' \
+  > "$OUT/overlap.jsonl"
+"$BIN" bubble -i "$OUT/nest.gfa" --snarls-in "$OUT/overlap.jsonl" -r 'nref#0#chrN:1-940' \
+       -o "$OUT/nest" --min-variant-bp 0 -q >/dev/null 2>&1
+if [ ! -s "$OUT/nest.bubbles.csv" ]; then
+  bad "the overlapping-snarl fixture produced no bubbles CSV"
+else
+  nsites=$(tail -n +2 "$OUT/nest.bubbles.csv" | wc -l | tr -d ' ')
+  clashes=$(tail -n +2 "$OUT/nest.bubbles.csv" | awk -F'"' '{print $2}' |
+            tr ';' '\n' | grep -v '^$' | sort | uniq -d | wc -l | tr -d ' ')
+  [ "$clashes" = "0" ] \
+    && ok "two overlapping imported snarls are resolved to a disjoint set ($nsites site(s))" \
+    || bad "$clashes interior node(s) claimed by more than one emitted site"
+  # the SMALLER site is the one kept: it reconstructs far better than the enclosing one
+  kept_inside=$(tail -n +2 "$OUT/nest.bubbles.csv" | head -1 | awk -F'"' '{print $2}')
+  case "$kept_inside" in
+    *3*) [ "${#kept_inside}" -lt 7 ] \
+           && ok "the smaller of two overlapping sites is the one retained ($kept_inside)" \
+           || bad "the enclosing site was retained ($kept_inside); smaller reconstructs 89.54% vs 3.98%" ;;
+    *) bad "unexpected retained interior '$kept_inside'" ;;
+  esac
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then echo "bubble_stats: all assertions passed"; exit 0; fi
 echo "bubble_stats: $fails assertion(s) FAILED"; exit 1
