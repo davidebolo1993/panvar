@@ -26,10 +26,13 @@ BubblePathIndex build_bubble_path_index(const PathRecord& path);
 std::optional<BubblePathInterval> find_best_bubble_path_interval(
     const BubblePathIndex& index,
     const Bubble& bubble);
+// `out_step_indices`, when given, receives the index in `path.steps` each returned step came from.
+// This is the only safe way to know which OCCURRENCE of a repeated node a walk position refers to.
 std::vector<PathStep> canonical_bubble_path_steps(
     const PathRecord& path,
     const Bubble& bubble,
-    const BubblePathInterval& interval);
+    const BubblePathInterval& interval,
+    std::vector<std::size_t>* out_step_indices = nullptr);
 
 // Steps of `path` across `bubble` (canonical source->sink). Falls back to an empty interior
 // ([source, sink]) for paths that cross with no inside node (a pure deletion / short side of an
@@ -42,7 +45,8 @@ std::optional<std::vector<PathStep>> bubble_steps(
     const PathRecord& path,
     const BubblePathIndex& index,
     const Bubble& bubble,
-    BubblePathInterval* used_interval = nullptr);
+    BubblePathInterval* used_interval = nullptr,
+    std::vector<std::size_t>* used_step_indices = nullptr);
 
 // Steps of `path` from `from_node` to `to_node`, oriented from->to. Unlike `bubble_steps` this keys
 // on the two boundary nodes alone, so it works for a stretch with no declared interior — the

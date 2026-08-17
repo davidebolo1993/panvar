@@ -26,6 +26,10 @@ struct BubbleAlleleSet {
     std::vector<BubbleAllele> alleles;
     std::unordered_set<std::string> traversing;   // path names that cross the bubble at all
     std::vector<PathStep> reference_steps;        // empty when the reference does not cross
+    // For each entry of reference_steps, the index it came from in the reference path's own step
+    // vector. Coordinates must be taken from THESE, not from a node->position map: such a map records
+    // a node's first occurrence, which is the wrong occurrence wherever the reference revisits it.
+    std::vector<std::size_t> reference_step_indices;
     std::string reference_signature;
     bool has_reference = false;
 };

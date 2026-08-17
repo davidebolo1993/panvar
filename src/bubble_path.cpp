@@ -115,31 +115,44 @@ std::optional<BubblePathInterval> find_best_bubble_path_interval(
 std::vector<PathStep> canonical_bubble_path_steps(
     const PathRecord& path,
     const Bubble& bubble,
-    const BubblePathInterval& interval) {
+    const BubblePathInterval& interval,
+    std::vector<std::size_t>* out_step_indices) {
 
     if (interval.left >= path.steps.size() || interval.right >= path.steps.size() || interval.left > interval.right) {
+        if (out_step_indices != nullptr) out_step_indices->clear();
         return {};
     }
 
+    // The index each returned step came from in `path.steps`, carried alongside rather than derived by
+    // the caller: the reverse branch below may flip the walk a second time, so `left + j` and
+    // `right - j` are both wrong in one of the four combinations. A caller that needs to know WHICH
+    // occurrence of a repeated node it is looking at cannot reconstruct this safely from outside.
     std::vector<PathStep> out;
+    std::vector<std::size_t> idx;
     out.reserve(interval.right - interval.left + 1);
+    idx.reserve(interval.right - interval.left + 1);
     if (interval.source_to_sink) {
         for (std::size_t i = interval.left; i <= interval.right; ++i) {
             out.push_back(path.steps[i]);
+            idx.push_back(i);
         }
+        if (out_step_indices != nullptr) *out_step_indices = std::move(idx);
         return out;
     }
 
     for (std::size_t i = interval.right + 1; i > interval.left; --i) {
         const PathStep& step = path.steps[i - 1];
         out.push_back(PathStep{step.node_id, !step.reverse});
+        idx.push_back(i - 1);
     }
     if (!out.empty() && (out.front().node_id != bubble.source || out.back().node_id != bubble.sink)) {
         std::reverse(out.begin(), out.end());
+        std::reverse(idx.begin(), idx.end());
         for (auto& step : out) {
             step.reverse = !step.reverse;
         }
     }
+    if (out_step_indices != nullptr) *out_step_indices = std::move(idx);
     return out;
 }
 
@@ -148,10 +161,10 @@ std::vector<PathStep> canonical_bubble_path_steps(
 // insertion), which the inside-node-only interval finder would otherwise drop.
 std::optional<std::vector<PathStep>> bubble_steps(
     const PathRecord& path, const BubblePathIndex& index, const Bubble& bubble,
-    BubblePathInterval* used_interval) {
+    BubblePathInterval* used_interval, std::vector<std::size_t>* used_step_indices) {
     const auto iv = find_best_bubble_path_interval(index, bubble);
     if (iv.has_value()) {
-        std::vector<PathStep> s = canonical_bubble_path_steps(path, bubble, *iv);
+        std::vector<PathStep> s = canonical_bubble_path_steps(path, bubble, *iv, used_step_indices);
         if (!s.empty()) {
             if (used_interval != nullptr) *used_interval = *iv;
             return s;
@@ -161,6 +174,8 @@ std::optional<std::vector<PathStep>> bubble_steps(
     const auto ki = index.positions.find(bubble.sink);
     if (si == index.positions.end() || ki == index.positions.end()) return std::nullopt;
     const auto record = [&](std::size_t l, std::size_t r, bool s2s) {
+        if (used_step_indices != nullptr) *used_step_indices = s2s ? std::vector<std::size_t>{l, r}
+                                                                   : std::vector<std::size_t>{r, l};
         if (used_interval == nullptr) return;
         used_interval->left = l;
         used_interval->right = r;

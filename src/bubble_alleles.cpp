@@ -21,9 +21,12 @@ BubbleAlleleSet enumerate_bubble_alleles(
         if (graph.paths[pi].name == reference_path_name) { ref_idx = pi; break; }
     }
     if (ref_idx < graph.paths.size()) {
-        auto ref_opt = bubble_steps(graph.paths[ref_idx], path_indexes[ref_idx], bubble);
+        std::vector<std::size_t> ref_idxs;
+        auto ref_opt = bubble_steps(graph.paths[ref_idx], path_indexes[ref_idx], bubble,
+                                    nullptr, &ref_idxs);
         if (ref_opt.has_value() && !ref_opt->empty()) {
             out.reference_steps = std::move(*ref_opt);
+            out.reference_step_indices = std::move(ref_idxs);
             out.reference_signature = build_walk_signature(out.reference_steps);
             out.has_reference = true;
         }

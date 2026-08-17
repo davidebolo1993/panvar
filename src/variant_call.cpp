@@ -61,6 +61,10 @@ struct Tok {
     std::uint64_t token = 0;
     std::string node_id;
     bool reverse = false;
+    // Index of this token in the walk it was collapsed from. For the reference walk that resolves,
+    // via the allele set's step indices, to a position in the reference path -- and therefore to the
+    // OCCURRENCE the event actually sits at, which a node id alone cannot identify.
+    std::size_t src_idx = 0;
 };
 
 // Token walk for the DEL/INS/INV alignment. Copy-number nodes (REP self-loops)
@@ -71,14 +75,16 @@ std::vector<Tok> collapse_walk(
     const std::unordered_set<std::string>& cn_nodes) {
 
     std::vector<Tok> out;
-    for (const PathStep& s : steps) {
+    for (std::size_t i = 0; i < steps.size(); ++i) {
+        const PathStep& s = steps[i];
         if (cn_nodes.count(s.node_id) != 0) {
-            continue;
+            continue;   // dropped, so the token index is NOT the step index: carry it explicitly
         }
         Tok t;
         t.token = hash_step_token(s);
         t.node_id = s.node_id;
         t.reverse = s.reverse;
+        t.src_idx = i;
         out.push_back(std::move(t));
     }
     return out;
@@ -130,6 +136,12 @@ struct Event {
     std::string ins_subtype;          // INS only: "", "NOVEL", "DUP"
     std::string link_id;              // shared id for a co-located DEL+INS substitution (EVENTID)
     // Reference anchoring for VCF coordinates.
+    // Positions in the bubble's REFERENCE walk that this event occupies (SIZE_MAX = none). These
+    // identify the occurrence, which anchor_node alone cannot: a reference that revisits a node gives
+    // the same name to two different places, and every node->position map records only the first.
+    std::size_t ref_tok_first = SIZE_MAX;   // first affected reference token (DEL/INV)
+    std::size_t ref_tok_last = SIZE_MAX;    // last affected reference token (DEL/INV)
+    std::size_t ref_tok_anchor = SIZE_MAX;  // last MATCHED reference token before the event (INS)
     std::string anchor_node;          // ref node POS is taken from (the walk-order flank)
     bool anchor_after = false;        // true: POS = last base of anchor (INS); false: first base
     std::size_t size_bp = 0;          // |event| for min_sv filtering / SVLEN magnitude
@@ -289,6 +301,7 @@ void diff_segment(
     // Emit events from maximal gap blocks -> DEL / INS / INV. Track the last matched
     // ref node as the anchor for an INS that follows it.
     std::string last_ref_node = preceding_ref_node;
+    std::size_t last_ref_tok = SIZE_MAX;
     auto flush_block = [&](std::vector<const Tok*>& ref_blk, std::vector<const Tok*>& hap_blk) {
         if (ref_blk.empty() && hap_blk.empty()) return;
         if (!ref_blk.empty() && !hap_blk.empty() && is_inversion(ref_blk, hap_blk)) {
@@ -300,6 +313,8 @@ void diff_segment(
             e.seq = spell_toks(graph, ref_blk);
             e.size_bp = toks_bp(graph, ref_blk);
             e.anchor_node = ref_blk.front()->node_id;
+            e.ref_tok_first = ref_blk.front()->src_idx;
+            e.ref_tok_last = ref_blk.back()->src_idx;
             events.push_back(std::move(e));
         } else {
             // A gap-block with both ref and hap content is a substitution: emit DEL+INS
@@ -316,6 +331,8 @@ void diff_segment(
                 e.seq = spell_toks(graph, ref_blk);
                 e.size_bp = toks_bp(graph, ref_blk);
                 e.anchor_node = ref_blk.front()->node_id;
+                e.ref_tok_first = ref_blk.front()->src_idx;
+                e.ref_tok_last = ref_blk.back()->src_idx;
                 e.link_id = link;
                 events.push_back(std::move(e));
             }
@@ -328,6 +345,7 @@ void diff_segment(
                 e.seq = spell_toks(graph, hap_blk);
                 e.size_bp = toks_bp(graph, hap_blk);
                 e.anchor_node = last_ref_node;
+                e.ref_tok_anchor = last_ref_tok;
                 e.anchor_after = true;
                 e.link_id = link;
                 events.push_back(std::move(e));
@@ -343,6 +361,7 @@ void diff_segment(
         if (c.ri >= 0 && c.hi >= 0) {
             flush_block(ref_blk, hap_blk);
             last_ref_node = R[static_cast<std::size_t>(c.ri)].node_id;
+            last_ref_tok = R[static_cast<std::size_t>(c.ri)].src_idx;
         } else if (c.ri >= 0) {
             ref_blk.push_back(&R[static_cast<std::size_t>(c.ri)]);
         } else {
@@ -783,6 +802,7 @@ void call_variants(
         out << "##INFO=<ID=REF_CN_SOURCE,Number=1,Type=String,Description=\"How REF_CN was anchored: REP_TRAVERSAL (exact self-loop count) or MAX_NODE_MULTIPLICITY (a heuristic -- one short node visited N times can set it, so absolute CN on that route is heuristic even where relative dosage is sound)\">\n";
         out << "##INFO=<ID=CN_CONFIDENCE,Number=1,Type=String,Description=\"HEURISTIC on CN_METHOD=PEAK, which infers dosage from the highest interior-node traversal multiplicity and is not validated against external copy-number truth\">\n";
         out << "##INFO=<ID=CN_ROUND_RESIDUAL,Number=1,Type=Float,Description=\"MODULE_BP only: MEAN distance from a whole number of units across traversers, 0..0.5. Reported for continuity, but the per-sample residuals are BIMODAL at a paralog module -- most near 0 or near 0.5 -- so this mean describes no sample and moves with their ratio. Read CN_ROUND_AMBIGUOUS_FRAC for the record-level summary and FORMAT:CNR_MARGIN per sample\">\n";
+        out << "##INFO=<ID=REF_SPAN_BP,Number=1,Type=Integer,Description=\"DEL/INV only, and only when it disagrees with |SVLEN|: the genomic extent of the reference walk positions this event occupies. END is POS+|SVLEN| by convention, so a REF_SPAN_BP that differs means the event's summed node lengths and its span over the reference are not the same quantity. Unexplained on the three reference-locus records where it fires; treat those coordinates as approximate\">\n";
         out << "##INFO=<ID=CN_CLAMPED_ZERO,Number=1,Type=Integer,Description=\"MODULE_BP only: traversing haplotypes whose modelled dosage came out BELOW zero copies and whose reported CN was therefore floored at 0. Only the spacing model can produce this, when a walk is shorter than the reference's by more than REF_CN steps. Their CN is a boundary value rather than a measurement; FORMAT:CNR_RAW still carries the unclamped dosage. Absent when none occurred\">\n";
         out << "##INFO=<ID=CN_ROUND_AMBIGUOUS_FRAC,Number=1,Type=Float,Description=\"MODULE_BP only: share of traversing haplotypes whose dosage sat more than 0.4 units from a whole number, i.e. whose integer CN came from a near coin-flip rounding. This is what --max-cn-model-residual gates on. A high value does NOT by itself mean the CN is wrong: the reference locus with the worst value is exact against pangene truth on every haplotype, because the unit is a calibration constant for a heterogeneous module rather than one real copy\">\n";
         if (!genes.empty())
@@ -900,6 +920,27 @@ void call_variants(
         ++summary.bubbles_with_reference;
 
         const std::vector<PathStep> ref_steps = std::move(allele_set.reference_steps);
+        // Which step of the reference PATH each entry of ref_steps came from. This is what makes a
+        // walk position identify an occurrence rather than just a node name.
+        const std::vector<std::size_t> ref_step_idx = std::move(allele_set.reference_step_indices);
+        // Genomic extent [first base, last base] of a run of reference-walk tokens, by full-path step
+        // index rather than by node name. Returns {0,0} when unavailable. Takes min/max over the run
+        // because a reverse-oriented bubble walks the reference in DECREASING coordinate, so the
+        // walk-order first token is the genomically LAST one.
+        auto tok_span = [&](std::size_t lo_tok, std::size_t hi_tok)
+            -> std::pair<std::size_t, std::size_t> {
+            if (ref_step_idx.empty() || lo_tok == SIZE_MAX || hi_tok == SIZE_MAX) return {0, 0};
+            if (lo_tok >= ref_step_idx.size() || hi_tok >= ref_step_idx.size()) return {0, 0};
+            if (lo_tok > hi_tok) std::swap(lo_tok, hi_tok);
+            std::size_t lo_full = SIZE_MAX, hi_full = 0;
+            for (std::size_t j = lo_tok; j <= hi_tok; ++j) {
+                lo_full = std::min(lo_full, ref_step_idx[j]);
+                hi_full = std::max(hi_full, ref_step_idx[j]);
+            }
+            if (lo_full == SIZE_MAX || hi_full + 1 >= ref_prefix.size()) return {0, 0};
+            return {ref_meta.region_start_1based + ref_prefix[lo_full],
+                    ref_meta.region_start_1based + ref_prefix[hi_full + 1] - 1};
+        };
         using Allele = BubbleAllele;
         const std::vector<Allele>& alleles = allele_set.alleles;
         const std::unordered_set<std::string>& traverses = allele_set.traversing;
@@ -1930,15 +1971,31 @@ void call_variants(
             // rather than by stepping back a node: the preceding node is only identifiable by walk
             // position, and every node->position map here holds first occurrences.
             long long del_inv_pos = -1;
+            long long del_inv_end = -1;
             if (e.type == EvType::Del || e.type == EvType::Inv) {
-                // First (genomically-lowest) reference node of the event.
-                long long best = -1;
-                for (const std::string& n : e.nodes) {
-                    const long long p = rpos(n);
-                    if (p >= 0 && (best < 0 || p < best)) { best = p; anchor = n; }
+                // Preferred: the walk positions this event actually occupies, which name the
+                // OCCURRENCE. The node-name fallback below takes each node's FIRST occurrence, so a
+                // reference that revisits an event node anchors the record at the wrong copy -- on a
+                // fixture where the reference visits the deleted node twice, 150 bp upstream of the
+                // deletion, inside sequence the haplotype still carries.
+                const auto span = tok_span(e.ref_tok_first, e.ref_tok_last);
+                if (span.first > 0) {
+                    anchor_after = false;
+                    del_inv_end = static_cast<long long>(span.second);
+                    if (span.first > ref_meta.region_start_1based)
+                        del_inv_pos = static_cast<long long>(span.first) - 1;
+                    // keep `anchor` pointing at a node of the event for START_NODE/REF fallback
+                    anchor = e.nodes.empty() ? anchor : e.nodes.front();
+                } else {
+                    // First (genomically-lowest) reference node of the event.
+                    long long best = -1;
+                    for (const std::string& n : e.nodes) {
+                        const long long p = rpos(n);
+                        if (p >= 0 && (best < 0 || p < best)) { best = p; anchor = n; }
+                    }
+                    anchor_after = false;
+                    if (best > static_cast<long long>(ref_meta.region_start_1based)) del_inv_pos = best - 1;
                 }
-                anchor_after = false;
-                if (best > static_cast<long long>(ref_meta.region_start_1based)) del_inv_pos = best - 1;
             } else if (e.type == EvType::Ins) {
                 // anchor_node is the walk-order flank of the insertion. In a forward bubble it is the
                 // genomically-upstream flank (POS = its last base); in a reverse-oriented bubble it is
@@ -2001,6 +2058,12 @@ void call_variants(
                         static_cast<long long>(node_len(graph, e.nodes.empty() ? std::string() : e.nodes.front()));
                 end = pos + node_len(graph, e.nodes.empty() ? std::string() : e.nodes.front());
             }
+            // END deliberately stays POS + |SVLEN| rather than the walk span POS came from. On three
+            // of the six records this fix moves, the span is SHORTER than the event's own size_bp (85
+            // vs 58 at LPA bubble 8, 142 vs 53 at ANKRD36C bubble 2) with no node repeated inside the
+            // event to explain it. Until that is understood, redefining END would trade a known
+            // invariant -- END-POS == |SVLEN|, which consumers rely on -- for an unexplained number.
+            // REF_SPAN_BP reports the span beside it so the disagreement is visible.
             // A COLLAPSED_MODULE record describes the whole site, and its "unit" is only the shared part
             // of one copy, so pos + unit named a reference interval that corresponds to nothing. END is
             // the module's own reference span -- the interval FORMAT:CNBP is measured over.
@@ -2172,6 +2235,15 @@ void call_variants(
                      << (e.cn_method == CnMethod::Rep ? "REP_TRAVERSAL" : "MAX_NODE_MULTIPLICITY");
             }
             if (e.cn_method == CnMethod::Peak) info << ";CN_CONFIDENCE=HEURISTIC";
+            // The genomic extent of the reference walk positions this event occupies, when it does
+            // NOT agree with |SVLEN|. Emitted only on disagreement, because agreement is the norm and
+            // the disagreement is the thing worth looking at: it means the event's summed node
+            // lengths and its span over the reference are describing different quantities.
+            if (del_inv_end > 0 && (e.type == EvType::Del || e.type == EvType::Inv)) {
+                const long long span_bp = del_inv_end - static_cast<long long>(pos);
+                if (span_bp > 0 && span_bp != (svlen < 0 ? -svlen : svlen))
+                    info << ";REF_SPAN_BP=" << span_bp;
+            }
             if (e.cn_clamped_zero > 0) info << ";CN_CLAMPED_ZERO=" << e.cn_clamped_zero;
             if (e.round_ambiguous_frac >= 0.0) {
                 std::ostringstream r; r.setf(std::ios::fixed); r.precision(4);

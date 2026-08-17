@@ -284,6 +284,50 @@ else
     || bad "module-loss haplotype: expected reliable=0, got ${lost_rel:-<missing>} (dosage ${lost_dos:-?})"
 fi
 
+# ---------------------------------------------------------------------------------------------
+# A reference that REVISITS an event node. Every node->position map in `call` records a node's FIRST
+# occurrence, so an event sitting at a later copy was anchored at the earlier one -- in sequence the
+# haplotype still carries.
+#
+#   f1 100 bp    1..100
+#   R   50 bp  101..150     first occurrence of R, nowhere near the event
+#   f2 100 bp  151..250
+#   A   70 bp  251..320  \  the deletion covers 251..370: A and the SECOND R
+#   R   50 bp  321..370  /
+#   f3 100 bp  371..470
+#
+# Anchored on the preceding base: POS 250, END 370, SVLEN -120. Taking R's first occurrence instead
+# put the record at POS 100 / END 220, 150 bp upstream.
+# ---------------------------------------------------------------------------------------------
+RF1=$(blk 100 0); RR=$(blk 50 7); RF2=$(blk 100 13); RA=$(blk 70 21); RF3=$(blk 100 29)
+RREF_NAME='rref#0#chr1:1-470'
+{ printf 'H\tVN:Z:1.0\n'
+  printf "S\tf1\t%s\nS\tR\t%s\nS\tf2\t%s\nS\tA\t%s\nS\tf3\t%s\n" "$RF1" "$RR" "$RF2" "$RA" "$RF3"
+  for e in "f1 R" "R f2" "f2 A" "A R" "R f3" "f2 f3"; do
+    set -- $e; printf "L\t%s\t+\t%s\t+\t0M\n" "$1" "$2"
+  done
+  printf 'P\t%s\tf1+,R+,f2+,A+,R+,f3+\t*\n' "$RREF_NAME"
+  printf 'P\trhapref#1#chr1\tf1+,R+,f2+,A+,R+,f3+\t*\n'
+  printf 'P\trhapdel#1#chr1\tf1+,R+,f2+,f3+\t*\n'
+  printf 'P\trhapdel2#1#chr1\tf1+,R+,f2+,f3+\t*\n'; } > "$OUT/rep.gfa"
+
+"$BIN" bubble -i "$OUT/rep.gfa" -r "$RREF_NAME" -o "$OUT/rb" -q >/dev/null 2>&1
+"$BIN" call -i "$OUT/rb.sorted.gfa" -c "$OUT/rb.bubbles.csv" -r "$RREF_NAME" -o "$OUT/rc" -q >/dev/null 2>&1
+RVCF="$OUT/rc.region.vcf"
+if [ ! -s "$RVCF" ]; then
+  bad "the repeated-anchor fixture produced no region VCF"
+else
+  rpos=$(awk -F'\t' '$0!~/^#/ && $8~/SVTYPE=DEL/{print $2; exit}' "$RVCF")
+  rend=$(awk -F'\t' '$0!~/^#/ && $8~/SVTYPE=DEL/{n=split($8,a,";");
+           for(i=1;i<=n;i++){split(a[i],kv,"="); if(kv[1]=="END"){print kv[2]; exit}}}' "$RVCF")
+  [ "$rpos" = "250" ] \
+    && ok "a deletion at the SECOND visit to a node anchors there, not at the first (POS 250)" \
+    || bad "repeated-anchor POS: expected 250, got ${rpos:-<missing>} (100 = anchored at the first visit)"
+  [ "$rend" = "370" ] \
+    && ok "its END follows the same occurrence (370)" \
+    || bad "repeated-anchor END: expected 370, got ${rend:-<missing>}"
+fi
+
 printf "\n"
 if [ "$fails" -eq 0 ]; then printf "call_stats: all assertions passed\n"; exit 0; fi
 printf "call_stats: %d assertion(s) failed\n" "$fails"; exit 1
