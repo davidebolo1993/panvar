@@ -150,6 +150,16 @@ struct Event {
     double step_bp = 0.0;             // MODULE_BP: bp one copy adds, from the panel's cluster spacing
     bool dosage_spacing = false;      // MODULE_BP: CN came from the spacing model, not hbp/unit
     double round_residual = -1.0;     // MODULE_BP: mean distance from a whole number of units
+    double round_ambiguous_frac = -1.0; // MODULE_BP: share of traversers rounding near a coin flip
+    // What the spacing estimate actually rests on. A step is "one copy" only if the clusters it was
+    // measured between are ADJACENT copy states, and that is an assumption the estimator cannot verify
+    // from within -- these let a reader see how thin the evidence is instead of taking the number.
+    std::size_t step_clusters = 0;    // clusters the panel's walk lengths fell into
+    std::size_t step_gaps = 0;        // gaps the median was taken over (clusters kept, minus one)
+    std::size_t step_dropped = 0;     // haplotypes in singleton clusters, which are discarded
+    double step_max_offint = -1.0;    // worst |gap/step - nearest integer|; large means the clusters
+                                      // are not evenly spaced, so they are not one copy apart
+    double step_max_multiple = 0.0;   // largest gap/step; >= 2 means a copy state is missing
 };
 
 // Spell a token run in place (one reservation, no per-node temporaries): hot path under the
@@ -760,9 +770,13 @@ void call_variants(
         out << "##INFO=<ID=CN_DOSAGE_MODEL,Number=1,Type=String,Description=\"MODULE_BP only: REFERENCE_RATIO (CN = hbp/CN_UNIT_BP, the default) or PANEL_SPACING (CN = REF_CN + (hbp-CN_SHARED_BP)/CN_STEP_BP, --cn-unit-spacing). Determines what FORMAT:CNR_RAW means\">\n";
         out << "##INFO=<ID=CN_STEP_BP,Number=1,Type=Integer,Description=\"MODULE_BP only: bp one copy adds, estimated from the spacing between the panel's own copy-state clusters. Independent of CN_UNIT_BP, which comes from ref_bp/ref_fold\">\n";
         out << "##INFO=<ID=CN_STEP_RATIO,Number=1,Type=Float,Description=\"CN_STEP_BP / CN_UNIT_BP. 1.0 means hbp is proportional to copy number, which is what the MODULE_BP integer assumes. Measured at 1.45 on both reference paralog modules, i.e. the dosage is AFFINE and its error grows about 0.45 per copy either side of the reference copy number -- see --cn-unit-spacing and docs/algorithms/call.md\">\n";
+        out << "##INFO=<ID=CN_STEP_SUPPORT,Number=3,Type=Integer,Description=\"What CN_STEP_BP rests on: clusters,gaps,dropped. clusters = copy-state clusters the panel's walk lengths fell into; gaps = differences the median was taken over (one fewer than the populated clusters); dropped = haplotypes in singleton clusters, which are discarded. gaps=1 means the step is a single difference between two clusters, with nothing to cross-check it\">\n";
+        out << "##INFO=<ID=CN_STEP_OFFINT,Number=1,Type=Float,Description=\"Worst distance from a whole number of copies among the gaps CN_STEP_BP was taken over (0 = every gap is an exact multiple of the step). Large values mean the clusters are not evenly spaced, so treating a gap as one copy is unsupported\">\n";
+        out << "##INFO=<ID=CN_STEP_MAX_MULTIPLE,Number=1,Type=Float,Description=\"Largest gap as a multiple of CN_STEP_BP. At or above 2 a copy state is missing from the panel between two observed clusters; the estimator assumes adjacency and cannot detect this on its own\">\n";
         out << "##INFO=<ID=REF_CN_SOURCE,Number=1,Type=String,Description=\"How REF_CN was anchored: REP_TRAVERSAL (exact self-loop count) or MAX_NODE_MULTIPLICITY (a heuristic -- one short node visited N times can set it, so absolute CN on that route is heuristic even where relative dosage is sound)\">\n";
         out << "##INFO=<ID=CN_CONFIDENCE,Number=1,Type=String,Description=\"HEURISTIC on CN_METHOD=PEAK, which infers dosage from the highest interior-node traversal multiplicity and is not validated against external copy-number truth\">\n";
-        out << "##INFO=<ID=CN_ROUND_RESIDUAL,Number=1,Type=Float,Description=\"MODULE_BP only: MEAN distance from a whole number of units across traversers, 0..0.5. A record-level mean dilutes one ambiguous sample among many exact ones; FORMAT:CNR_MARGIN is the per-sample form and is the one to act on\">\n";
+        out << "##INFO=<ID=CN_ROUND_RESIDUAL,Number=1,Type=Float,Description=\"MODULE_BP only: MEAN distance from a whole number of units across traversers, 0..0.5. Reported for continuity, but the per-sample residuals are BIMODAL at a paralog module -- most near 0 or near 0.5 -- so this mean describes no sample and moves with their ratio. Read CN_ROUND_AMBIGUOUS_FRAC for the record-level summary and FORMAT:CNR_MARGIN per sample\">\n";
+        out << "##INFO=<ID=CN_ROUND_AMBIGUOUS_FRAC,Number=1,Type=Float,Description=\"MODULE_BP only: share of traversing haplotypes whose dosage sat more than 0.4 units from a whole number, i.e. whose integer CN came from a near coin-flip rounding. This is what --max-cn-model-residual gates on. A high value does NOT by itself mean the CN is wrong: the reference locus with the worst value is exact against pangene truth on every haplotype, because the unit is a calibration constant for a heterogeneous module rather than one real copy\">\n";
         if (!genes.empty())
             out << "##INFO=<ID=GENES,Number=.,Type=String,Description=\"Gene(s) overlapping the variant (from --gtf)\">\n";
         out << "##INFO=<ID=NMERGED,Number=1,Type=Integer,Description=\"Haplotype carriers merged into this record\">\n";
@@ -984,6 +998,7 @@ void call_variants(
             double fold_residual = 0.0;   // spread of folded bp around ref_fold (the MAXIMUM, not the mode)
             double max_support = 0.0;     // share of folded bp actually at ref_fold
             double round_residual = 0.0;  // mean |hbp/unit - nearest integer| over traversers, 0..0.5
+            std::size_t round_ambiguous = 0;  // traversers whose rounding was near a coin flip (>0.4)
             if (ref_idx < graph.paths.size()) {
                 const auto ref_span = span_of(ref_idx);
                 const std::vector<PathStep>& steps = graph.paths[ref_idx].steps;
@@ -1044,6 +1059,8 @@ void call_variants(
                 for (std::size_t pi = 0; pi < graph.paths.size(); ++pi)
                     if (traverses.count(graph.paths[pi].name)) all_hbp.push_back(full_walk_bp(pi));
                 double step_bp = 0.0;
+                std::size_t step_clusters = 0, step_gaps = 0, step_dropped = 0;
+                double step_max_offint = -1.0, step_max_multiple = 0.0;
                 if (all_hbp.size() >= 4) {
                     std::sort(all_hbp.begin(), all_hbp.end());
                     std::vector<std::vector<std::size_t>> cl{{all_hbp.front()}};
@@ -1052,14 +1069,31 @@ void call_variants(
                             cl.emplace_back();
                         cl.back().push_back(all_hbp[k]);
                     }
+                    step_clusters = cl.size();
                     std::vector<double> centres;
-                    for (const auto& c : cl)
+                    for (const auto& c : cl) {
+                        // A cluster of one is dropped: a lone walk length is as likely to be a
+                        // mis-folded outlier as a real copy state, and it would drag a centre. The
+                        // cost is that a genuinely rare copy state contributes nothing, which is
+                        // reported rather than hidden.
                         if (c.size() >= 2) centres.push_back(static_cast<double>(c[c.size() / 2]));
+                        else step_dropped += c.size();
+                    }
                     std::vector<double> gaps;
                     for (std::size_t k = 1; k < centres.size(); ++k) gaps.push_back(centres[k] - centres[k - 1]);
                     if (!gaps.empty()) {
-                        std::sort(gaps.begin(), gaps.end());
-                        step_bp = gaps[gaps.size() / 2];
+                        std::vector<double> sorted_gaps = gaps;
+                        std::sort(sorted_gaps.begin(), sorted_gaps.end());
+                        step_bp = sorted_gaps[sorted_gaps.size() / 2];
+                        step_gaps = gaps.size();
+                        // Each gap should be a whole number of copies of the chosen step. A gap at 2x
+                        // says a copy state is absent from the panel and the estimator cannot see it;
+                        // a gap that is not near ANY integer says the clusters are not copy states.
+                        for (const double g : gaps) {
+                            const double r = step_bp > 0.0 ? g / step_bp : 0.0;
+                            step_max_multiple = std::max(step_max_multiple, r);
+                            step_max_offint = std::max(step_max_offint, std::fabs(r - std::round(r)));
+                        }
                     }
                 }
                 std::size_t round_n = 0;
@@ -1074,6 +1108,23 @@ void call_variants(
                 mr.seed.cn_method = CnMethod::ModuleBp;
                 mr.seed.step_bp = step_bp;
                 mr.seed.dosage_spacing = (options.cn_unit_spacing && step_bp > 0.0);
+                mr.seed.step_clusters = step_clusters;
+                mr.seed.step_gaps = step_gaps;
+                mr.seed.step_dropped = step_dropped;
+                mr.seed.step_max_offint = step_max_offint;
+                mr.seed.step_max_multiple = step_max_multiple;
+                // --cn-unit-spacing asked for a specific model. If the panel cannot supply it, the
+                // honest outcome is to say so, not to quietly compute the biased ratio model under a
+                // flag the user set to avoid exactly that. CN_DOSAGE_MODEL would have recorded the
+                // substitution, but only for a reader who thought to check it.
+                if (options.cn_unit_spacing && step_bp <= 0.0) {
+                    throw std::runtime_error(
+                        "call: --cn-unit-spacing was given but bubble " + std::to_string(bubble.id) +
+                        " has no estimable copy-state spacing (" + std::to_string(all_hbp.size()) +
+                        " traversing haplotype(s) fell into " + std::to_string(step_clusters) +
+                        " cluster(s), leaving no gap between two populated ones). Rerun without the "
+                        "flag to use the reference-ratio model, which is biased but always defined");
+                }
                 mr.seed.shared_fold_bp = ref_bp;
                 mr.seed.ref_fold = ref_fold;
                 mr.seed.fold_residual = fold_residual;
@@ -1097,8 +1148,14 @@ void call_variants(
                     // How far each haplotype sits from a whole number of units. A calibrated unit should
                     // divide real walks nearly exactly; persistent halves mean the unit is wrong, and
                     // rounding then manufactures a confident integer out of a bad fit.
-                    round_residual += std::fabs(exact - static_cast<double>(copies));
+                    const double resid = std::fabs(exact - static_cast<double>(copies));
+                    round_residual += resid;
                     ++round_n;
+                    // Count the samples whose rounding was close to a coin flip. The mean above cannot
+                    // stand in for this: at a paralog module the per-sample residuals are BIMODAL --
+                    // most sit near 0 or near 0.5 and almost none in between -- so the mean describes
+                    // neither population and moves with their ratio rather than with either one.
+                    if (resid > 0.4) ++round_ambiguous;
                     // CN is reported for every traversing haplotype (absolute module count); GT marks a
                     // CARRIER only when the count differs from the reference's (a gain or a loss), so AC/AF
                     // stay meaningful instead of flagging every haplotype.
@@ -1108,11 +1165,20 @@ void call_variants(
                     if (copies > mr.seed.alt_cn) mr.seed.alt_cn = copies;
                 }
                 mr.seed.round_residual = round_n > 0 ? round_residual / static_cast<double>(round_n) : 0.0;
-                // Opt-in strictness. Declining here is only right when a bad fit means a wrong answer,
-                // and on the reference loci it does not: the module routes are validated against
-                // pangene truth where the fit is worst. So the gate exists, is auditable, and is off.
+                mr.seed.round_ambiguous_frac =
+                    round_n > 0 ? static_cast<double>(round_ambiguous) / static_cast<double>(round_n) : 0.0;
+                // Gate on the SHARE of samples whose rounding was a coin flip, not on the mean residual.
+                // The mean is a bad summary of a bimodal distribution -- at GSTM1 the median sample sits
+                // at 0.045 and the 90th percentile at 0.496, so the mean of 0.197 describes no sample --
+                // and it was also the statistic this record's own header warned against acting on.
+                //
+                // Opt-in strictness, and still OFF by default, because a bad fit does not mean a wrong
+                // answer here: GSTM1 has the worst fit of any reference locus (over half its samples
+                // ambiguous) and its CN is exact against pangene truth on all 466. The unit is a
+                // calibration constant for a heterogeneous paralog module, not one real copy, so
+                // landing near a half-integer is what it does when it is working.
                 if (options.max_cn_model_residual > 0.0 &&
-                    mr.seed.round_residual > options.max_cn_model_residual) {
+                    mr.seed.round_ambiguous_frac > options.max_cn_model_residual) {
                     ++summary.declined_cn_model;
                     // Declining means NO copy-number call here, not a different one. Leaving
                     // leaving the route unconsumed let the peak route answer instead, and it answers something
@@ -1123,9 +1189,10 @@ void call_variants(
                     cn_route_consumed = true;
                     module_cn_declined = true;
                     if (!options.quiet) {
-                        std::cerr << "[call] bubble " << bubble.id << ": module CN declined, integer fit "
-                                  << "residual " << mr.seed.round_residual << " over "
-                                  << options.max_cn_model_residual
+                        std::cerr << "[call] bubble " << bubble.id << ": module CN declined, "
+                                  << mr.seed.round_ambiguous_frac * 100.0
+                                  << "% of traversers round ambiguously, over "
+                                  << options.max_cn_model_residual * 100.0 << "%"
                                   << " (sequence-resolved events and the allele VCF are unaffected)\n";
                     }
                 } else
@@ -2011,6 +2078,14 @@ void call_variants(
                 std::ostringstream r; r.setf(std::ios::fixed); r.precision(3);
                 r << (e.ru_len > 0 ? e.step_bp / static_cast<double>(e.ru_len) : 0.0);
                 info << ";CN_STEP_RATIO=" << r.str();
+                info << ";CN_STEP_SUPPORT=" << e.step_clusters << ',' << e.step_gaps << ','
+                     << e.step_dropped;
+                if (e.step_max_offint >= 0.0) {
+                    std::ostringstream o; o.setf(std::ios::fixed); o.precision(3);
+                    o << e.step_max_offint; info << ";CN_STEP_OFFINT=" << o.str();
+                    std::ostringstream m; m.setf(std::ios::fixed); m.precision(2);
+                    m << e.step_max_multiple; info << ";CN_STEP_MAX_MULTIPLE=" << m.str();
+                }
             }
             // REF_CN is not measured the same way on every route, and absolute CN is only as good as
             // its anchor. Say which one produced it rather than leaving a bare integer.
@@ -2019,6 +2094,10 @@ void call_variants(
                      << (e.cn_method == CnMethod::Rep ? "REP_TRAVERSAL" : "MAX_NODE_MULTIPLICITY");
             }
             if (e.cn_method == CnMethod::Peak) info << ";CN_CONFIDENCE=HEURISTIC";
+            if (e.round_ambiguous_frac >= 0.0) {
+                std::ostringstream r; r.setf(std::ios::fixed); r.precision(4);
+                r << e.round_ambiguous_frac; info << ";CN_ROUND_AMBIGUOUS_FRAC=" << r.str();
+            }
             if (e.round_residual >= 0.0) {
                 std::ostringstream r; r.setf(std::ios::fixed); r.precision(4);
                 r << e.round_residual; info << ";CN_ROUND_RESIDUAL=" << r.str();

@@ -122,6 +122,33 @@ The `MODULE_BP` and `PEAK` routes count copies of a module that may hold several
 
 `RU_LEN` is not emitted there. The unit those routes calibrate against is the **shared** per-copy content — the sequence the reference revisits — and not the paralog-private sequence that travels with each copy. It is reported as `CN_UNIT_BP` so it cannot be read as a per-copy size. At GSTM1 `CN_SHARED_BP=22830` over `CN_REF_FOLD=3` gives 7610, while `CN_MODULE_REF_BP=58249` puts the total per-copy content near 19.4 kb: `(CN − REF_CN) × 7610` understates every carrier by about 2.4×. The ratio is not a constant to correct for — across the reference loci it runs from ×1.01 to ×36.75.
 
+#### What the panel-spacing model rests on
+
+`--cn-unit-spacing` takes the per-copy step from the gaps between the panel's own copy-state clusters instead of from `ref_bp/ref_fold`. That is the right shape — the reference-derived unit is affine, not proportional, at about 1.45 units per real copy — but a gap is one copy only if the two clusters are **adjacent** copy states, and nothing inside the estimator can confirm that. `CN_STEP_SUPPORT=clusters,gaps,dropped` and `CN_STEP_MAX_MULTIPLE` expose how thin the evidence is. Measured on the reference loci:
+
+| locus | step / unit | clusters, gaps, dropped | max gap multiple |
+|---|---|---|---|
+| acot bubble5 | 1.000 | 3, 2, 0 | 1.00 |
+| acot bubble7 | 0.999 | 4, 3, 0 | 1.00 |
+| gstm1 bubble6 | 1.454 | 4, 2, 1 | 1.00 |
+| cyp2d6 bubble5 | 1.453 | 4, 2, 1 | 1.00 |
+| ankrd36c bubble7 | 1.104 | 4, **1**, 2 | 1.00 |
+| ankrd36c bubble8 | 1.000 | 3, **1**, 1 | 1.00 |
+| **c4 bubble6** | **0.197** | 7, 6, 0 | **4.07** |
+| lpa bubble5 | — | estimator declines | — |
+
+Three things to read off it. At acot the step equals the reference unit, so the dosage there really is proportional and both models agree. The affine 1.45 appears only at the two paralog modules. And **c4 is where the assumption fails**: one gap is four times the chosen step, so copy states are missing between observed clusters, and the resulting step is a fifth of the reference unit. C4's copy number is exact on all 131 haplotypes under the reference-ratio model, which is why the spacing model is opt-in rather than the default.
+
+Two records rest on a single gap (`gaps=1`), where the median is one difference with nothing to cross-check it. Singleton clusters are dropped — a lone walk length is as likely to be a mis-folded outlier as a real copy state — and `dropped` counts the haplotypes lost that way.
+
+Where the panel supports no estimate at all, `--cn-unit-spacing` **fails** rather than quietly computing the reference-ratio model under a flag set to avoid it.
+
+#### The integer fit is not a correctness signal
+
+`CN_ROUND_AMBIGUOUS_FRAC` is the share of haplotypes whose dosage sat more than 0.4 units from a whole number, so the integer came from near a coin flip. It replaces the mean residual as what `--max-cn-model-residual` gates on, because the per-sample residuals are bimodal and the mean describes neither mode — at c4 the mean is 0.13 while **no** sample is ambiguous, and at GSTM1 the mean is 0.30 while **two thirds** are.
+
+The gate is off by default, and the reason is GSTM1: it has the worst fit of any reference locus and its copy number is exact against pangene truth on all 466 haplotypes. The unit is a calibration constant for a heterogeneous paralog module, not one real copy, so sitting near a half-integer is what it does when it is working. Declining on a bad fit would discard correct calls.
+
 `SVLEN` is not emitted there either. At GSTM1 the carriers span −32030, −18396 and +18504 bp around `REF_CN=3`; no single record-level size describes them, so the field is absent rather than misleading and **`FORMAT:CNBP` is the per-sample size**. `END` is the module's reference span, the interval CNBP is measured over. Confirmed externally: svim-asm on the assemblies agrees with CNBP to a median of 6 bp at GSTM1 and 2 bp at LPA KIV-2.
 
 This is the only reading that fires without `--cn` too: the self-loop route is always on, so a `REP` tandem is a `DUP` regardless of the flag.
