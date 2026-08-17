@@ -344,6 +344,33 @@ else
     || bad "expected 2 records at distinct occurrences, got $nrec"
 fi
 
+# The same repeated-node graph on the REVERSE strand, discovered with --no-flip so the bubble really
+# is reverse-oriented (source_orient/sink_orient '-') rather than normalised to forward. The walk is
+# then traversed in decreasing coordinate, so an index derived as `left + j` would be wrong; the
+# coordinates must come out identical to the forward case.
+{ printf 'H\tVN:Z:1.0\n'
+  printf "S\tf1\t%s\nS\tR\t%s\nS\tf2\t%s\nS\tA\t%s\nS\tf3\t%s\n" "$RF1" "$RR" "$RF2" "$RA" "$RF3"
+  for e in "f3 R" "R A" "A f2" "f2 R" "R f1" "f3 f2"; do
+    set -- $e; printf "L\t%s\t-\t%s\t-\t0M\n" "$1" "$2"
+  done
+  printf 'P\trvref#0#chr1:1-470\tf3-,R-,A-,f2-,R-,f1-\t*\n'
+  printf 'P\trvhapref#1#chr1\tf3-,R-,A-,f2-,R-,f1-\t*\n'
+  printf 'P\trvhapdel#1#chr1\tf3-,f2-,R-,f1-\t*\n'
+  printf 'P\trvhapdel2#1#chr1\tf3-,f2-,R-,f1-\t*\n'; } > "$OUT/rev.gfa"
+"$BIN" bubble -i "$OUT/rev.gfa" -r 'rvref#0#chr1:1-470' -o "$OUT/rvb" --no-flip -q >/dev/null 2>&1
+rvorient=$(tail -1 "$OUT/rvb.bubbles.csv" 2>/dev/null | cut -d, -f3)
+[ "$rvorient" = "-" ] \
+  && ok "--no-flip yields a genuinely reverse-oriented bubble to test against" \
+  || bad "expected a reverse-oriented bubble (source_orient '-'), got '${rvorient:-<none>}'"
+"$BIN" call -i "$OUT/rvb.sorted.gfa" -c "$OUT/rvb.bubbles.csv" -r 'rvref#0#chr1:1-470' \
+      -o "$OUT/rvc" -q >/dev/null 2>&1
+rvpos=$(awk -F'\t' '$0!~/^#/ && $8~/SVTYPE=DEL/{print $2; exit}' "$OUT/rvc.region.vcf")
+rvend=$(awk -F'\t' '$0!~/^#/ && $8~/SVTYPE=DEL/{n=split($8,a,";");
+          for(i=1;i<=n;i++){split(a[i],kv,"="); if(kv[1]=="END"){print kv[2]; exit}}}' "$OUT/rvc.region.vcf")
+{ [ "$rvpos" = "100" ] && [ "$rvend" = "220" ]; } \
+  && ok "a reverse-oriented bubble gives the same coordinates as the forward one ($rvpos/$rvend)" \
+  || bad "reverse-oriented coordinates: expected 100/220, got ${rvpos:-?}/${rvend:-?}"
+
 printf "\n"
 if [ "$fails" -eq 0 ]; then printf "call_stats: all assertions passed\n"; exit 0; fi
 printf "call_stats: %d assertion(s) failed\n" "$fails"; exit 1
