@@ -245,6 +245,7 @@ void diff_segment(
     const std::vector<Tok>& R, std::size_t r0, std::size_t r1,
     const std::vector<Tok>& H, std::size_t h0, std::size_t h1,
     const std::string& preceding_ref_node,
+    std::size_t preceding_ref_tok,
     std::vector<Event>& events) {
 
     const std::size_t m = r1 - r0;
@@ -301,7 +302,10 @@ void diff_segment(
     // Emit events from maximal gap blocks -> DEL / INS / INV. Track the last matched
     // ref node as the anchor for an INS that follows it.
     std::string last_ref_node = preceding_ref_node;
-    std::size_t last_ref_tok = SIZE_MAX;
+    // The anchor for an INS that OPENS this segment is the shared anchor the previous segment ended
+    // on, so its token index has to arrive with it. Starting at SIZE_MAX left every such insertion
+    // without an occurrence-aware anchor -- which is most of them, since segments are cut at anchors.
+    std::size_t last_ref_tok = preceding_ref_tok;
     auto flush_block = [&](std::vector<const Tok*>& ref_blk, std::vector<const Tok*>& hap_blk) {
         if (ref_blk.empty() && hap_blk.empty()) return;
         if (!ref_blk.empty() && !hap_blk.empty() && is_inversion(ref_blk, hap_blk)) {
@@ -436,12 +440,14 @@ std::vector<Event> diff_walks(
     // anchor itself is a match (resets the INS anchor to that ref node).
     std::size_t r_prev = 0, h_prev = 0;
     std::string preceding_ref = bubble_source;
+    std::size_t preceding_ref_tok = SIZE_MAX;   // no token precedes the first segment
     for (std::size_t a = 0; a <= chain_ref.size(); ++a) {
         const std::size_t r_end = (a < chain_ref.size()) ? chain_ref[a] : m;
         const std::size_t h_end = (a < chain_hap.size()) ? chain_hap[a] : n;
-        diff_segment(graph, R, r_prev, r_end, H, h_prev, h_end, preceding_ref, events);
+        diff_segment(graph, R, r_prev, r_end, H, h_prev, h_end, preceding_ref, preceding_ref_tok, events);
         if (a < chain_ref.size()) {
             preceding_ref = R[r_end].node_id; // the anchor node
+            preceding_ref_tok = R[r_end].src_idx;
             r_prev = r_end + 1;
             h_prev = h_end + 1;
         }
@@ -514,6 +520,15 @@ void coalesce_events(
             prev.end_node = e.end_node;
             if (!e.seq.empty()) prev.seq += e.seq;
             prev.size_bp += e.size_bp;
+            // The reference walk span has to grow with the content. Extending size_bp while leaving
+            // the span at the first block made the record claim more deleted bases than the interval
+            // it pointed at contained -- 85 bp of sequence over a 58 bp span at LPA bubble 8.
+            if (e.ref_tok_first != SIZE_MAX)
+                prev.ref_tok_first = prev.ref_tok_first == SIZE_MAX
+                    ? e.ref_tok_first : std::min(prev.ref_tok_first, e.ref_tok_first);
+            if (e.ref_tok_last != SIZE_MAX)
+                prev.ref_tok_last = prev.ref_tok_last == SIZE_MAX
+                    ? e.ref_tok_last : std::max(prev.ref_tok_last, e.ref_tok_last);
             if (hi >= 0) prev_hi = std::max(prev_hi, hi);
             if (hhi >= 0) prev_hhi = std::max(prev_hhi, hhi);
         } else {
@@ -790,7 +805,7 @@ void call_variants(
         out << "##INFO=<ID=CN_SCOPE,Number=1,Type=String,Description=\"What one copy is a copy of: REPEAT_UNIT (a literal repeat unit, so (CN-REF_CN)*RU_LEN is the haplotype's event size) or COLLAPSED_MODULE (a module that may hold several distinct paralogs, so RU_LEN is NOT emitted -- the shared per-copy content is reported as CN_UNIT_BP, and per-haplotype size must be read from FORMAT:CNBP)\">\n";
         out << "##INFO=<ID=CN_SHARED_BP,Number=1,Type=Integer,Description=\"Reference bp in the folded (revisited) node set the MODULE_BP unit was calibrated from\">\n";
         out << "##INFO=<ID=CN_REF_FOLD,Number=1,Type=Integer,Description=\"How many times the reference revisits that folded set; the MODULE_BP unit is CN_SHARED_BP/CN_REF_FOLD\">\n";
-        out << "##INFO=<ID=CN_MODULE_REF_BP,Number=1,Type=Integer,Description=\"Reference bp across the whole bubble interior. Against CN_SHARED_BP this is the shared-versus-total question: RU_LEN describes the shared part only, and their ratio is how far (CN-REF_CN)*RU_LEN understates a carrier's real gain or loss\">\n";
+        out << "##INFO=<ID=CN_MODULE_REF_BP,Number=1,Type=Integer,Description=\"Reference bp across the whole bubble interior. Against CN_SHARED_BP this is the shared-versus-total question: CN_UNIT_BP describes the shared part only, and their ratio is how far (CN-REF_CN)*CN_UNIT_BP understates a carrier's real gain or loss\">\n";
         out << "##INFO=<ID=CN_REF_MULTIPLICITY_HETEROGENEITY,Number=1,Type=Float,Description=\"MODULE_BP only: length-weighted spread of the folded set's reference multiplicities around CN_REF_FOLD. 0 means one coherent unit repeated CN_REF_FOLD times. A diagnostic of graph structure, not a correctness test -- see docs/algorithms/call.md\">\n";
         out << "##INFO=<ID=CN_REF_MAX_SUPPORT,Number=1,Type=Float,Description=\"MODULE_BP only: share of multiplicity-weighted folded bp that actually sits at CN_REF_FOLD, the multiplicity REF_CN was taken from. Low values mean the anchor is supported by a small part of the module\">\n";
         out << "##INFO=<ID=CN_DOSAGE_MODEL,Number=1,Type=String,Description=\"MODULE_BP only: REFERENCE_RATIO (CN = hbp/CN_UNIT_BP, the default) or PANEL_SPACING (CN = REF_CN + (hbp-CN_SHARED_BP)/CN_STEP_BP, --cn-unit-spacing). Determines what FORMAT:CNR_RAW means\">\n";
@@ -802,7 +817,7 @@ void call_variants(
         out << "##INFO=<ID=REF_CN_SOURCE,Number=1,Type=String,Description=\"How REF_CN was anchored: REP_TRAVERSAL (exact self-loop count) or MAX_NODE_MULTIPLICITY (a heuristic -- one short node visited N times can set it, so absolute CN on that route is heuristic even where relative dosage is sound)\">\n";
         out << "##INFO=<ID=CN_CONFIDENCE,Number=1,Type=String,Description=\"HEURISTIC on CN_METHOD=PEAK, which infers dosage from the highest interior-node traversal multiplicity and is not validated against external copy-number truth\">\n";
         out << "##INFO=<ID=CN_ROUND_RESIDUAL,Number=1,Type=Float,Description=\"MODULE_BP only: MEAN distance from a whole number of units across traversers, 0..0.5. Reported for continuity, but the per-sample residuals are BIMODAL at a paralog module -- most near 0 or near 0.5 -- so this mean describes no sample and moves with their ratio. Read CN_ROUND_AMBIGUOUS_FRAC for the record-level summary and FORMAT:CNR_MARGIN per sample\">\n";
-        out << "##INFO=<ID=REF_SPAN_BP,Number=1,Type=Integer,Description=\"DEL/INV only, and only when it disagrees with |SVLEN|: the genomic extent of the reference walk positions this event occupies. END is POS+|SVLEN| by convention, so a REF_SPAN_BP that differs means the event's summed node lengths and its span over the reference are not the same quantity. Unexplained on the three reference-locus records where it fires; treat those coordinates as approximate\">\n";
+        out << "##INFO=<ID=IMPRECISE,Number=0,Type=Flag,Description=\"The record describes an event CLUSTER rather than one exact event: coalescing joined several pieces that have reference sequence retained between them, so the affected interval POS+1..END is wider than the |SVLEN| bases actually removed. On a PRECISE record END-POS equals |SVLEN| exactly; this flag marks the records where it cannot, instead of silently reporting one of the two numbers\">\n";
         out << "##INFO=<ID=CN_CLAMPED_ZERO,Number=1,Type=Integer,Description=\"MODULE_BP only: traversing haplotypes whose modelled dosage came out BELOW zero copies and whose reported CN was therefore floored at 0. Only the spacing model can produce this, when a walk is shorter than the reference's by more than REF_CN steps. Their CN is a boundary value rather than a measurement; FORMAT:CNR_RAW still carries the unclamped dosage. Absent when none occurred\">\n";
         out << "##INFO=<ID=CN_ROUND_AMBIGUOUS_FRAC,Number=1,Type=Float,Description=\"MODULE_BP only: share of traversing haplotypes whose dosage sat more than 0.4 units from a whole number, i.e. whose integer CN came from a near coin-flip rounding. This is what --max-cn-model-residual gates on. A high value does NOT by itself mean the CN is wrong: the reference locus with the worst value is exact against pangene truth on every haplotype, because the unit is a calibration constant for a heterogeneous module rather than one real copy\">\n";
         if (!genes.empty())
@@ -965,6 +980,15 @@ void call_variants(
             options.rescue_min_bp != 0 ? options.rescue_min_bp : std::max<std::size_t>(1, options.min_sv_bp / 2);
 
         auto ev_ref_pos = [&](const Event& e) -> long long {
+            // Occurrence-aware first: this position seeds the merge window and the sort order, so
+            // taking a node's FIRST occurrence lets two events at two visits to the same node look
+            // co-located and merge into one record.
+            const std::size_t tok = e.ref_tok_first != SIZE_MAX ? e.ref_tok_first : e.ref_tok_anchor;
+            if (tok != SIZE_MAX) {
+                const auto span = tok_span(tok, e.ref_tok_last != SIZE_MAX ? e.ref_tok_last : tok);
+                if (span.first > 0)
+                    return static_cast<long long>(e.anchor_after ? span.second : span.first);
+            }
             const auto it = ref_node_pos.find(e.anchor_node);
             if (it == ref_node_pos.end()) return -1;
             const std::size_t glen = node_len(graph, e.anchor_node);
@@ -1972,6 +1996,7 @@ void call_variants(
             // position, and every node->position map here holds first occurrences.
             long long del_inv_pos = -1;
             long long del_inv_end = -1;
+            long long ins_pos = -1;
             if (e.type == EvType::Del || e.type == EvType::Inv) {
                 // Preferred: the walk positions this event actually occupies, which name the
                 // OCCURRENCE. The node-name fallback below takes each node's FIRST occurrence, so a
@@ -2003,6 +2028,12 @@ void call_variants(
                 const long long ps = rpos(bubble.source), pk = rpos(bubble.sink);
                 const bool reverse_bubble = (ps >= 0 && pk >= 0 && pk < ps);
                 anchor_after = !reverse_bubble;
+                // Prefer the flank's OWN occurrence over its first one. Without this an insertion
+                // after the second visit to a repeated node is placed at the first visit, exactly as
+                // DEL was: the node name is the same in both places.
+                const auto flank = tok_span(e.ref_tok_anchor, e.ref_tok_anchor);
+                if (flank.first > 0) ins_pos = static_cast<long long>(
+                    reverse_bubble ? flank.first : flank.second);
             } else {
                 // DUP: anchor on the genomically upstream flank, POS = its LAST base (as INS does), since
                 // the duplicated content starts where that flank ends. Using the first base only looks
@@ -2038,6 +2069,13 @@ void call_variants(
                     ref_base = b;
                 }
             }
+            if (ins_pos > 0) {
+                const std::string b = ref_base_at(static_cast<std::size_t>(ins_pos));
+                if (!b.empty()) {
+                    pos = static_cast<std::size_t>(ins_pos);
+                    ref_base = b;
+                }
+            }
             std::size_t end = pos;
             long long svlen = 0;
             const char* svt = ev_svtype(e.type);
@@ -2058,12 +2096,20 @@ void call_variants(
                         static_cast<long long>(node_len(graph, e.nodes.empty() ? std::string() : e.nodes.front()));
                 end = pos + node_len(graph, e.nodes.empty() ? std::string() : e.nodes.front());
             }
-            // END deliberately stays POS + |SVLEN| rather than the walk span POS came from. On three
-            // of the six records this fix moves, the span is SHORTER than the event's own size_bp (85
-            // vs 58 at LPA bubble 8, 142 vs 53 at ANKRD36C bubble 2) with no node repeated inside the
-            // event to explain it. Until that is understood, redefining END would trade a known
-            // invariant -- END-POS == |SVLEN|, which consumers rely on -- for an unexplained number.
-            // REF_SPAN_BP reports the span beside it so the disagreement is visible.
+            // A coalesced record can describe a deletion in SEVERAL pieces with reference retained
+            // between them. That is not one exact deletion: the affected interval is wider than the
+            // bases removed. Such a record is marked IMPRECISE and END describes the whole affected
+            // span, while SVLEN stays the net deleted bases. END-POS == |SVLEN| therefore holds for
+            // every PRECISE record and the flag announces the records where it cannot.
+            bool imprecise = false;
+            if (del_inv_end > 0 && (e.type == EvType::Del || e.type == EvType::Inv)) {
+                const long long span_bp = del_inv_end - static_cast<long long>(pos);
+                const long long mag = svlen < 0 ? -svlen : svlen;
+                if (span_bp > mag) {
+                    end = static_cast<std::size_t>(del_inv_end);
+                    imprecise = true;
+                }
+            }
             // A COLLAPSED_MODULE record describes the whole site, and its "unit" is only the shared part
             // of one copy, so pos + unit named a reference interval that corresponds to nothing. END is
             // the module's own reference span -- the interval FORMAT:CNBP is measured over.
@@ -2235,15 +2281,7 @@ void call_variants(
                      << (e.cn_method == CnMethod::Rep ? "REP_TRAVERSAL" : "MAX_NODE_MULTIPLICITY");
             }
             if (e.cn_method == CnMethod::Peak) info << ";CN_CONFIDENCE=HEURISTIC";
-            // The genomic extent of the reference walk positions this event occupies, when it does
-            // NOT agree with |SVLEN|. Emitted only on disagreement, because agreement is the norm and
-            // the disagreement is the thing worth looking at: it means the event's summed node
-            // lengths and its span over the reference are describing different quantities.
-            if (del_inv_end > 0 && (e.type == EvType::Del || e.type == EvType::Inv)) {
-                const long long span_bp = del_inv_end - static_cast<long long>(pos);
-                if (span_bp > 0 && span_bp != (svlen < 0 ? -svlen : svlen))
-                    info << ";REF_SPAN_BP=" << span_bp;
-            }
+            if (imprecise) info << ";IMPRECISE";
             if (e.cn_clamped_zero > 0) info << ";CN_CLAMPED_ZERO=" << e.cn_clamped_zero;
             if (e.round_ambiguous_frac >= 0.0) {
                 std::ostringstream r; r.setf(std::ios::fixed); r.precision(4);

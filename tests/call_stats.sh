@@ -300,16 +300,21 @@ fi
 # put the record at POS 100 / END 220, 150 bp upstream.
 # ---------------------------------------------------------------------------------------------
 RF1=$(blk 100 0); RR=$(blk 50 7); RF2=$(blk 100 13); RA=$(blk 70 21); RF3=$(blk 100 29)
+RI=$(gblk 90 4)
 RREF_NAME='rref#0#chr1:1-470'
 { printf 'H\tVN:Z:1.0\n'
-  printf "S\tf1\t%s\nS\tR\t%s\nS\tf2\t%s\nS\tA\t%s\nS\tf3\t%s\n" "$RF1" "$RR" "$RF2" "$RA" "$RF3"
-  for e in "f1 R" "R f2" "f2 A" "A R" "R f3" "f2 f3"; do
+  printf "S\tf1\t%s\nS\tR\t%s\nS\tf2\t%s\nS\tA\t%s\nS\tf3\t%s\nS\tI\t%s\n" \
+         "$RF1" "$RR" "$RF2" "$RA" "$RF3" "$RI"
+  for e in "f1 R" "R f2" "f2 A" "A R" "R f3" "f2 f3" "R I" "I f3"; do
     set -- $e; printf "L\t%s\t+\t%s\t+\t0M\n" "$1" "$2"
   done
   printf 'P\t%s\tf1+,R+,f2+,A+,R+,f3+\t*\n' "$RREF_NAME"
   printf 'P\trhapref#1#chr1\tf1+,R+,f2+,A+,R+,f3+\t*\n'
   printf 'P\trhapdel#1#chr1\tf1+,R+,f2+,f3+\t*\n'
-  printf 'P\trhapdel2#1#chr1\tf1+,R+,f2+,f3+\t*\n'; } > "$OUT/rep.gfa"
+  printf 'P\trhapdel2#1#chr1\tf1+,R+,f2+,f3+\t*\n'
+  # an insertion after the SECOND visit to R, i.e. anchored at 370, not at R's first visit (150)
+  printf 'P\trhapins#1#chr1\tf1+,R+,f2+,A+,R+,I+,f3+\t*\n'
+  printf 'P\trhapins2#1#chr1\tf1+,R+,f2+,A+,R+,I+,f3+\t*\n'; } > "$OUT/rep.gfa"
 
 "$BIN" bubble -i "$OUT/rep.gfa" -r "$RREF_NAME" -o "$OUT/rb" -q >/dev/null 2>&1
 "$BIN" call -i "$OUT/rb.sorted.gfa" -c "$OUT/rb.bubbles.csv" -r "$RREF_NAME" -o "$OUT/rc" -q >/dev/null 2>&1
@@ -326,6 +331,17 @@ else
   [ "$rend" = "370" ] \
     && ok "its END follows the same occurrence (370)" \
     || bad "repeated-anchor END: expected 370, got ${rend:-<missing>}"
+  # The insertion sits after the SECOND visit to R, so it anchors on that visit's last base (370).
+  # Anchoring on R's first visit would put it at 150, inside sequence the haplotype also carries.
+  ipos=$(awk -F'\t' '$0!~/^#/ && $8~/SVTYPE=INS/{print $2; exit}' "$RVCF")
+  [ "$ipos" = "370" ] \
+    && ok "an insertion after the SECOND visit anchors there too (POS 370)" \
+    || bad "repeated-anchor INS POS: expected 370, got ${ipos:-<missing>} (150 = R's first visit)"
+  # The DEL and the INS sit at different occurrences and must not have been merged into one record.
+  nrec=$(awk -F'\t' '$0!~/^#/' "$RVCF" | wc -l | tr -d ' ')
+  [ "$nrec" = "2" ] \
+    && ok "events at different occurrences stay separate records ($nrec)" \
+    || bad "expected 2 records at distinct occurrences, got $nrec"
 fi
 
 printf "\n"
