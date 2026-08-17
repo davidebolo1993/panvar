@@ -127,9 +127,61 @@ as history; Git already provides that history.
   so the comparison is definitionally invalid — it produces numbers that look like accuracy and are
   not. The route is tested on a synthetic fixture with a known micro-module copy number and keeps
   `CN_CONFIDENCE=HEURISTIC`.
-- **Rare binary far-tail and merged-record content.** A merged record still hands every carrier the
+- **Repeated module boundaries remain an explicit span choice.** `CN`, `CNBP`,
+  `CN_MODULE_REF_BP`, and the record's `POS`/`END` now use one occurrence-aware resolver. When a source
+  or sink recurs, it deliberately selects the widest first-source-to-last-sink span and reports the
+  number of affected traversers in `CN_SPAN_AMBIGUOUS`; that span can include content between separate
+  visits and should not be read as uniquely resolved. Add a focused forward/reverse fixture that pins
+  the warning count and proves all five quantities describe the same chosen span. The ordinary
+  repeated-event fixtures exercise occurrence-aware calls, but currently do not produce a CN record
+  with a repeated boundary.
+- **Merged-record representative sequence.** A merged record still hands every carrier the
   representative's sequence; `MERGE_DIAMETER` now measures how far that reaches (0.0000 on a
   132-member LPA record) but does not fix it. Per-carrier sequence needs the allele VCF.
+
+## Benchmark
+
+### Corrected measurements — what the old numbers meant
+
+- **Every QV figure recorded for this project before the ledger is the `graph` column**, which is an
+  optimistic upper bound: a block is substituted when it shares a node with ANY call at the bubble, and
+  no genotype is read at all. It is kept, unchanged and relabelled. The `called` reconstruction beside
+  it is the strict form.
+- **`over_threshold_bp` read 0 at all six reference loci and could not do otherwise.** The residual was
+  split by contiguous alignment-run length, and edlib's co-optimal edit path distributes a gap over
+  chance matches: a clean 60 bp deletion of non-repetitive sequence returns as fourteen runs of 1–10
+  bases. Any claim resting on that split, and on the carrier truth flag built from it, is withdrawn.
+- **"Recall is 100% everywhere; FN = 0 at all six loci" is withdrawn.** It followed from the truth flag
+  almost never firing. On the walk-derived ledger, ACOT has 145 genotyping false negatives and CYP2D6
+  has 3. One ACOT case is a 56,889 bp divergent block at bubble 7 whose haplotype is genotyped `0` at
+  every one of the nine records there.
+- **Carrier precision was understated, substantially.** ANKRD36C 3.9% → 69.2%, CYP2D6 55.7% → 100%,
+  LPA 77.4% → 94.7%, ACOT 76.1% → 98.6%.
+- **Discovery recall is complete on the new measure**: 0 missed above-threshold truth events at all six
+  loci. Where the loss lives is representation — `variation_recovered` is 95.4–99.9% for the retained
+  calls applied exactly, against 39.2–96.9% for the same calls read back out of the region VCF. CYP2D6
+  is the extreme (95.4% against 39.2%) and is the sharpest available measurement of what merging costs.
+
+### Accepted limitations
+
+- **`called` means a record's node lies in the block, not that the record reproduces it.** That is
+  stronger than the previous bubble-wide node union but still weaker than comparing the record's
+  reconstructed effect against the block's sequence. Closing it needs a per-record effect comparison.
+- **No `filtered_other` class.** A size-eligible truth event removed by `--min-haplotypes`, an AF
+  filter, a tangle guard or a resource limit is indistinguishable from one never found. Separating them
+  needs a decision audit emitted by `call` — every raw truth-side event with its decision and reason —
+  which is a `call` capability, not benchmark's.
+- **No `false_or_misrepresented_call` class.** An emitted call with no compatible truth event shows up
+  only as a carrier-table FP, at bubble rather than record granularity.
+- **DUP reconstruction is heuristic and labelled so.** Both `--dup-model` branches tile an inferred
+  reference span, so the length is right and the sequence only approximately; the count is reported as
+  `gt_records/heuristic`.
+- **The threshold sweep is not automated.** `--min-sv-bp` reclassifies the ledger and gates the `called`
+  reconstruction, but does not re-run discovery. A real experiment runs `call` at each threshold and
+  `benchmark` on that run's output at the same threshold, over a fixed bubble set, and reports where
+  monotonicity fails — those failures are where merging and rescue interact.
+- **The allele VCF is a serialization ceiling.** It reaches 0 residual because it spells every allele
+  out, which demonstrates lossless serialization, not call sensitivity.
 
 ## Rebuild
 

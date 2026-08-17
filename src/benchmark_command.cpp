@@ -18,13 +18,16 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -37,40 +40,51 @@ void print_benchmark_help() {
         << "Usage:\n"
         << "  panvar benchmark -i <graph.gfa> (-b <prefix> | -c <bubbles.csv>) \\\n"
         << "                   --variant-nodes <call.variant_nodes.tsv> -r <name> -o <prefix> [options]\n\n"
-        << "Two round-trip scores of the caller's own output, over the same bubbles, the same truth and\n"
-        << "the same QV scale, differing only in what the reconstruction is allowed to use.\n\n"
-        << "  graph     Reference walk with the haplotype's OWN steps substituted at blocks the calls\n"
-        << "            explain (nodes in variant_nodes.tsv), uncalled variation left at reference. It\n"
-        << "            asks whether the graph can represent this haplotype and whether the caller\n"
-        << "            flagged the divergent blocks. No genotype is read, so it cannot be wrong about\n"
-        << "            WHICH haplotype carries what -- it is an upper bound, not a genotyping score.\n"
+        << "Round-trip scores of the caller's own output, over the same bubbles, the same truth and the\n"
+        << "same QV scale, differing only in what the reconstruction is allowed to use.\n\n"
+        << "  graph     Reference walk with the haplotype's OWN steps substituted at every block that\n"
+        << "            shares a node with ANY call at that bubble. Deliberately optimistic: sharing a\n"
+        << "            node with some call is not the same as matching one, so a called block can\n"
+        << "            authorise copying a neighbouring uncalled allele. Read it as a discovery upper\n"
+        << "            bound -- can the graph hold this haplotype, and did the caller flag the\n"
+        << "            divergent blocks -- never as a genotyping score. No genotype is read.\n"
+        << "  called    The same substitution restricted to blocks that map to a specific emitted call\n"
+        << "            AND reach --min-sv-bp. Nothing else of the haplotype's own walk is copied, so\n"
+        << "            this is 'the reference with exactly what we called implanted into it'.\n"
         << "  genotype  (--vcf) Reference sequence with only the edits this haplotype's GT names,\n"
         << "            applied from the VCF alone. A missed carrier keeps reference and a spurious one\n"
         << "            edits sequence that was already correct, so both error directions cost bases.\n"
         << "            This is what a consumer reconstructing a sample from the VCF actually gets.\n\n"
-        << "Both align the reconstruction to the haplotype's true walk (edlib NW) and score\n"
+        << "All are aligned to the haplotype's true walk (edlib NW) and scored\n"
         << "QV = -10*log10(max(0.5, delta)/S), combined per haplotype length-weighted (sum delta / sum S)\n"
-        << "and binned into the cosigt bands (<17, 17-23, 23-33, >33). Uncalled variation keeps delta > 0.\n"
-        << "A large graph-minus-genotype gap is a genotyping loss; both low is a calling or graph loss.\n\n"
+        << "and binned into the cosigt bands (<17, 17-23, 23-33, >33). The do-nothing baseline (plain\n"
+        << "reference) is scored alongside and is the denominator of gap_closed.\n\n"
+        << "Separately, a TRUTH EVENT LEDGER classifies what was there to be found, before any call is\n"
+        << "consulted: each maximal divergent block between the reference walk and the haplotype's walk\n"
+        << "is one event, sized in bp, and classified called / missed / below_threshold. Event size is\n"
+        << "a property of the two walks, so it does not move with the alignment.\n\n"
         << "Options:\n"
         << "  -i, --gfa <path>                 Passed graph the calls were made on (required)\n"
         << "  -b, --bubble-prefix-in <prefix>  panphorte output prefix (auto-uses <prefix>.bubbles.csv)\n"
         << "  -c, --bubbles-csv-in <path>      panphorte bubbles CSV (required if no prefix)\n"
         << "      --variant-nodes <path>       call's <prefix>.variant_nodes.tsv (required)\n"
         << "      --vcf <path>                 call's <prefix>.region.vcf. Adds the genotype-aware\n"
-        << "                                   reconstruction above; without it only `graph` is scored\n"
+        << "                                   reconstruction above; without it only the graph and\n"
+        << "                                   called reconstructions are scored\n"
         << "  -r, --reference-path <name>      Reference path name/substring, the diff baseline (required)\n"
         << "  -o, --out-prefix <prefix>        Output prefix for the QV tables (required)\n"
-        << "      --all-bubbles                Score every bubble in the CSV, not just called ones. A\n"
-        << "                                   haplotype diverging from reference at an uncalled bubble\n"
-        << "                                   then lands in a low band -- a missed call. Default scores\n"
-        << "                                   only bubbles that carry >=1 call.\n"
+        << "      --called-bubbles-only        Score only bubbles carrying >=1 call. Ascertainment-biased\n"
+        << "                                   by construction -- a bubble with real variation and no call\n"
+        << "                                   is exactly the miss the ledger exists to count, and this\n"
+        << "                                   drops it. Default scores every reference-traversed bubble.\n"
         << "      --dup-model <cn|cnbp>        How a copy-number record is reconstructed: lay down CN\n"
         << "                                   copies of RU_LEN in place of REF_CN (cn), or apply\n"
-        << "                                   the per-sample CNBP bp delta (cnbp, default)\n"
-        << "      --min-sv-bp <N>              Threshold for the residual split (match the call run;\n"
-        << "                                   default 50): residual blocks < N bp are sub-threshold\n"
-        << "                                   variation, >= N bp are callable-size misses.\n"
+        << "                                   the per-sample CNBP bp delta (cnbp, default). Both tile an\n"
+        << "                                   inferred reference span, so DUP reconstruction is a\n"
+        << "                                   heuristic on length, not the inserted sequence.\n"
+        << "      --min-sv-bp <N>              Event-size threshold for the truth ledger; set it to the\n"
+        << "                                   value `call` ran with (default 50)\n"
+        << "      --no-truth-events            Do not write the per-event ledger table\n"
         << "      --threads <N>                Worker threads over haplotypes (0 = auto)\n"
         << "  -q, --quiet                      Disable progress logs\n"
         << "  -h, --help                       Show this help\n";
@@ -108,26 +122,20 @@ const char* qv_ratio_quintile(double ratio) {
     return "0.8-1.0";
 }
 
-const PathRecord* resolve_reference(const Graph& graph, const std::string& wanted) {
-    for (const PathRecord& p : graph.paths) {
-        if (p.name == wanted) return &p;
-    }
-    auto lower = [](std::string s) { for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c))); return s; };
-    const std::string needle = lower(wanted);
-    std::vector<const PathRecord*> hits;
-    for (const PathRecord& p : graph.paths) {
-        if (lower(p.name).find(needle) != std::string::npos) hits.push_back(&p);
-    }
-    if (hits.size() == 1) return hits.front();
-    if (hits.empty()) throw std::runtime_error("Reference path not found in GFA: " + wanted);
-    throw std::runtime_error("Reference path '" + wanted + "' is ambiguous (" +
-                             std::to_string(hits.size()) + " matches)");
-}
+// One emitted call, kept whole. Folding a bubble's calls into a single node set cannot distinguish
+// "this truth event matched THAT record" from "this truth event touches something some record also
+// touches", and the second is not evidence that anything was called correctly.
+struct CalledRecord {
+    std::string variant_id;
+    std::string svtype;
+    std::unordered_set<std::string> nodes;
+};
 
 struct CalledVariants {
-    std::unordered_set<std::size_t> bubble_ids;                                 // bubbles with >=1 call
-    std::unordered_map<std::size_t, std::unordered_set<std::string>> nodes;     // bubble_id -> called nodes
-    std::map<std::size_t, std::set<std::string>> svtypes;                       // bubble_id -> svtypes
+    std::unordered_set<std::size_t> bubble_ids;                                // bubbles with >=1 call
+    std::unordered_map<std::size_t, std::vector<CalledRecord>> records;        // bubble_id -> records
+    std::unordered_map<std::size_t, std::unordered_set<std::string>> nodes;    // bubble_id -> union
+    std::map<std::size_t, std::set<std::string>> svtypes;                      // bubble_id -> svtypes
 };
 
 CalledVariants load_variant_nodes(const std::string& path) {
@@ -147,11 +155,23 @@ CalledVariants load_variant_nodes(const std::string& path) {
         const std::size_t bid = static_cast<std::size_t>(std::stoull(f[1]));
         cv.bubble_ids.insert(bid);
         cv.svtypes[bid].insert(f[2]);
-        auto& ns = cv.nodes[bid];
+        CalledRecord rec;
+        rec.variant_id = f[0];
+        rec.svtype = f[2];
+        auto& un = cv.nodes[bid];
         std::string tok;
-        for (char c : f[3]) { if (c == ',') { if (!tok.empty()) ns.insert(tok); tok.clear(); } else tok += c; }
-        if (!tok.empty()) ns.insert(tok);
+        for (char c : f[3]) {
+            if (c == ',') { if (!tok.empty()) { rec.nodes.insert(tok); un.insert(tok); } tok.clear(); }
+            else tok += c;
+        }
+        if (!tok.empty()) { rec.nodes.insert(tok); un.insert(tok); }
+        cv.records[bid].push_back(std::move(rec));
     }
+    // Deterministic record order, so which record a truth event is attributed to cannot depend on the
+    // order rows happen to sit in the file.
+    for (auto& [bid, recs] : cv.records)
+        std::sort(recs.begin(), recs.end(),
+                  [](const CalledRecord& a, const CalledRecord& b) { return a.variant_id < b.variant_id; });
     return cv;
 }
 
@@ -168,6 +188,7 @@ std::vector<std::string> split_on(const std::string& s, char sep) {
 struct VcfRecord {
     std::string id;
     std::size_t bubble_id = 0;
+    bool has_bubble_id = false;
     std::size_t pos = 0;               // 1-based, genomic
     std::size_t end = 0;
     long long svlen = 0;
@@ -187,6 +208,7 @@ struct VcfRecord {
 struct VcfData {
     std::vector<std::string> samples;
     std::vector<VcfRecord> records;
+    std::size_t no_bubble_id = 0;      // records carrying no BUBBLE_ID: they cannot be placed
 };
 
 VcfData load_vcf(const std::string& path) {
@@ -201,6 +223,13 @@ VcfData load_vcf(const std::string& path) {
         if (line[0] == '#') {
             const std::vector<std::string> h = split_on(line, '\t');
             for (std::size_t i = 9; i < h.size(); ++i) vd.samples.push_back(h[i]);
+            // A repeated sample column makes "which haplotype is this" depend on column order, and the
+            // join below would silently keep only one of them.
+            std::unordered_set<std::string> seen;
+            for (const std::string& s : vd.samples)
+                if (!seen.insert(s).second)
+                    throw std::runtime_error("VCF has a duplicate sample column '" + s +
+                                             "', so which haplotype a genotype belongs to is undefined: " + path);
             saw_header = true;
             continue;
         }
@@ -219,7 +248,7 @@ VcfData load_vcf(const std::string& path) {
             const std::size_t eq = kv.find('=');
             if (eq == std::string::npos) continue;
             const std::string k = kv.substr(0, eq), v = kv.substr(eq + 1);
-            if (k == "BUBBLE_ID") r.bubble_id = static_cast<std::size_t>(std::stoull(v));
+            if (k == "BUBBLE_ID") { r.bubble_id = static_cast<std::size_t>(std::stoull(v)); r.has_bubble_id = true; }
             else if (k == "END") r.end = static_cast<std::size_t>(std::stoull(v));
             else if (k == "SVLEN") r.svlen = std::stoll(v);
             else if (k == "SVTYPE") r.svtype = v;
@@ -231,6 +260,7 @@ VcfData load_vcf(const std::string& path) {
             else if (k == "RU_LEN" || k == "CN_UNIT_BP")
                 r.ru_len = static_cast<std::size_t>(std::stoull(v));
         }
+        if (!r.has_bubble_id) ++vd.no_bubble_id;
         const std::vector<std::string> fmt = split_on(f[8], ':');
         std::size_t gt_i = fmt.size(), cnbp_i = fmt.size(), cn_i = fmt.size();
         for (std::size_t i = 0; i < fmt.size(); ++i) {
@@ -264,6 +294,7 @@ struct GtStats {
     std::size_t clamped = 0;       // edit ran past the span end and was truncated
     std::size_t unhandled = 0;     // svtype with no reconstruction rule
     std::size_t ref_mismatch = 0;  // record REF did not match the reference at POS (placement is wrong)
+    std::size_t heuristic = 0;     // laid down by tiling an inferred span (DUP): length, not sequence
 };
 
 // Apply the edits `hap` is genotyped as carrying to the bubble's reference sequence. Nothing from the
@@ -315,10 +346,23 @@ std::string apply_genotype(const std::string& ref_bubble,
             if (r->insseq.empty()) { ++stats.unhandled; continue; }
             out.insert(at, r->insseq);
             ++stats.applied;
+        } else if (r->svtype == "INV") {
+            // Symbolic inversion: the span POS+1..END comes back reverse-complemented. Unlike DUP this
+            // is exact -- an inversion carries no new sequence, so the reference supplies all of it.
+            std::size_t n = r->end > r->pos ? r->end - r->pos
+                                            : static_cast<std::size_t>(r->svlen < 0 ? -r->svlen : r->svlen);
+            if (n == 0) { ++stats.unhandled; continue; }
+            if (at + n > out.size()) { n = out.size() - at; ++stats.clamped; }
+            if (n == 0) { ++stats.unhandled; continue; }
+            const std::string seg = out.substr(at, n);
+            out.replace(at, n, reverse_complement(seg));
+            ++stats.applied;
         } else if (r->svtype == "DUP") {
             // A copy-number record. The reference carries REF_CN copies of a RU_LEN unit here and this
             // haplotype carries CN of them, so lay down CN copies in place of REF_CN -- the array's
-            // LENGTH is what this record is about, and it is what drives the score.
+            // LENGTH is what this record is about, and it is what drives the score. Both branches tile
+            // an inferred reference span, so what is reconstructed is the right LENGTH of approximately
+            // right sequence: counted as `heuristic`, never as exact.
             const std::size_t avail = out.size() - at;
             const long long cn = hap < r->cn.size() ? r->cn[hap] : -1;
             if (cn_model && cn >= 0 && r->ru_len > 0 && r->ref_cn > 0) {
@@ -334,6 +378,7 @@ std::string apply_genotype(const std::string& ref_bubble,
                 while (add.size() < want) add += unit.substr(0, std::min(unit.size(), want - add.size()));
                 out.insert(at, add);
                 ++stats.applied;
+                ++stats.heuristic;
                 continue;
             }
             // No CN or no unit length: fall back to the record's own bp delta over the annotated span.
@@ -353,6 +398,7 @@ std::string apply_genotype(const std::string& ref_bubble,
                 out.insert(at, add);
             }
             ++stats.applied;
+            ++stats.heuristic;
         } else {
             ++stats.unhandled;
         }
@@ -360,48 +406,108 @@ std::string apply_genotype(const std::string& ref_bubble,
     return out;
 }
 
-// Reconstruct a haplotype's walk over a bubble as "reference, with only the called divergences applied".
-// Node-align H against the reference walk on shared step tokens (LCS); between consecutive anchors take
-// H's block when it is a called event (any node of the ref- or hap-side block is in `called`), otherwise
-// revert to the reference block. Coordinate-free, so bubble orientation is irrelevant. `applied` reports
-// whether at least one called block was substituted (this haplotype carries a call at the bubble).
-std::vector<PathStep> reconstruct(const std::vector<PathStep>& ref_steps,
-                                  const std::vector<PathStep>& hap_steps,
-                                  const std::unordered_set<std::string>& called,
-                                  bool& applied) {
-    applied = false;
+// ---- One decomposition of the two walks, shared by the ledger and by both reconstructions ----
+//
+// LCS anchors on step tokens: the maximal runs of steps between consecutive shared anchors are the
+// places the two walks disagree. Coordinate-free, so bubble orientation is irrelevant.
+std::vector<std::pair<std::size_t, std::size_t>> walk_anchors(const std::vector<PathStep>& ref_steps,
+                                                              const std::vector<PathStep>& hap_steps,
+                                                              bool& coarse) {
+    coarse = false;
     const std::vector<std::uint64_t> rt = build_walk_tokens(ref_steps);
     const std::vector<std::uint64_t> ht = build_walk_tokens(hap_steps);
     const std::size_t n = rt.size(), m = ht.size();
-
-    // LCS anchors on step tokens. Guard the O(nm) table on pathological walks (a huge DUP): fall back
-    // to treating the whole bubble as one block.
     std::vector<std::pair<std::size_t, std::size_t>> anchors;
-    if (n != 0 && m != 0 && static_cast<std::uint64_t>(n) * m <= 8000000ULL) {
-        std::vector<std::vector<std::uint32_t>> dp(n + 1, std::vector<std::uint32_t>(m + 1, 0));
-        for (std::size_t i = 0; i < n; ++i)
-            for (std::size_t j = 0; j < m; ++j)
-                dp[i + 1][j + 1] = (rt[i] == ht[j]) ? dp[i][j] + 1
-                                                    : std::max(dp[i][j + 1], dp[i + 1][j]);
-        std::size_t i = n, j = m;
-        while (i > 0 && j > 0) {
-            if (rt[i - 1] == ht[j - 1]) { anchors.emplace_back(i - 1, j - 1); --i; --j; }
-            else if (dp[i - 1][j] >= dp[i][j - 1]) --i;
-            else --j;
-        }
-        std::reverse(anchors.begin(), anchors.end());
+    // Guard the O(nm) table on pathological walks (a huge DUP). Falling back means the whole bubble
+    // becomes ONE block, which is a coarser decomposition, not a wrong one -- but it has to be counted,
+    // because a single block cannot separate a called event from an uncalled one beside it.
+    if (n == 0 || m == 0 || static_cast<std::uint64_t>(n) * m > 8000000ULL) {
+        if (n != 0 && m != 0) coarse = true;
+        return anchors;
     }
+    std::vector<std::vector<std::uint32_t>> dp(n + 1, std::vector<std::uint32_t>(m + 1, 0));
+    for (std::size_t i = 0; i < n; ++i)
+        for (std::size_t j = 0; j < m; ++j)
+            dp[i + 1][j + 1] = (rt[i] == ht[j]) ? dp[i][j] + 1 : std::max(dp[i][j + 1], dp[i + 1][j]);
+    std::size_t i = n, j = m;
+    while (i > 0 && j > 0) {
+        if (rt[i - 1] == ht[j - 1]) { anchors.emplace_back(i - 1, j - 1); --i; --j; }
+        else if (dp[i - 1][j] >= dp[i][j - 1]) --i;
+        else --j;
+    }
+    std::reverse(anchors.begin(), anchors.end());
+    return anchors;
+}
 
-    auto block_called = [&](std::size_t ri0, std::size_t ri1, std::size_t hi0, std::size_t hi1) {
-        for (std::size_t k = ri0; k < ri1; ++k) if (called.count(ref_steps[k].node_id)) return true;
-        for (std::size_t k = hi0; k < hi1; ++k) if (called.count(hap_steps[k].node_id)) return true;
-        return false;
+// One maximal divergent block: the reference takes ref_steps[ri0,ri1) where the haplotype takes
+// hap_steps[hi0,hi1). This is the unit `call` works in -- a difference between two walks -- so it is
+// the unit a truth ledger has to be built on. Its SIZE is a property of the two walks and of nothing
+// else: it does not move with the alignment, the threshold or the calls.
+struct TruthBlock {
+    std::size_t ri0 = 0, ri1 = 0, hi0 = 0, hi1 = 0;
+    std::size_t ref_bp = 0, hap_bp = 0;
+    std::size_t size_bp = 0;   // max(ref_bp, hap_bp): call gates a linked DEL/INS pair on the larger arm
+    int rec = -1;              // index into the bubble's records; -1 when no emitted call covers it
+};
+
+std::vector<TruthBlock> divergent_blocks(const Graph& graph,
+                                         const std::vector<PathStep>& ref_steps,
+                                         const std::vector<PathStep>& hap_steps,
+                                         const std::vector<std::pair<std::size_t, std::size_t>>& anchors,
+                                         const std::vector<CalledRecord>& recs) {
+    auto node_bp = [&](const std::vector<PathStep>& steps, std::size_t lo, std::size_t hi) {
+        std::size_t bp = 0;
+        for (std::size_t k = lo; k < hi; ++k) {
+            const auto it = graph.nodes.find(steps[k].node_id);
+            if (it != graph.nodes.end()) bp += it->second.sequence.size();
+        }
+        return bp;
     };
+    std::vector<TruthBlock> out;
+    auto add = [&](std::size_t ri0, std::size_t ri1, std::size_t hi0, std::size_t hi1) {
+        if (ri1 == ri0 && hi1 == hi0) return;
+        TruthBlock b;
+        b.ri0 = ri0; b.ri1 = ri1; b.hi0 = hi0; b.hi1 = hi1;
+        b.ref_bp = node_bp(ref_steps, ri0, ri1);
+        b.hap_bp = node_bp(hap_steps, hi0, hi1);
+        b.size_bp = std::max(b.ref_bp, b.hap_bp);
+        // Attribute to the FIRST record (by variant id) whose nodes this block actually contains. A
+        // block that merely sits in the same bubble as a record is not attributed to it.
+        for (std::size_t ri = 0; ri < recs.size() && b.rec < 0; ++ri) {
+            for (std::size_t k = ri0; k < ri1 && b.rec < 0; ++k)
+                if (recs[ri].nodes.count(ref_steps[k].node_id)) b.rec = static_cast<int>(ri);
+            for (std::size_t k = hi0; k < hi1 && b.rec < 0; ++k)
+                if (recs[ri].nodes.count(hap_steps[k].node_id)) b.rec = static_cast<int>(ri);
+        }
+        out.push_back(b);
+    };
+    std::size_t pi = 0, pj = 0;
+    for (const auto& a : anchors) {
+        add(pi, a.first, pj, a.second);
+        pi = a.first + 1;
+        pj = a.second + 1;
+    }
+    add(pi, ref_steps.size(), pj, hap_steps.size());
+    return out;
+}
 
+// Walk the reference, substituting the haplotype's own steps at every block `take` accepts. `applied`
+// reports whether anything was substituted.
+std::vector<PathStep> reconstruct(const std::vector<PathStep>& ref_steps,
+                                  const std::vector<PathStep>& hap_steps,
+                                  const std::vector<std::pair<std::size_t, std::size_t>>& anchors,
+                                  const std::vector<TruthBlock>& blocks,
+                                  const std::function<bool(const TruthBlock&)>& take,
+                                  bool& applied) {
+    applied = false;
+    std::unordered_map<std::size_t, const TruthBlock*> by_ri0;
+    for (const TruthBlock& b : blocks) by_ri0[b.ri0 * 1000003ULL + b.hi0] = &b;
     std::vector<PathStep> out;
     std::size_t pi = 0, pj = 0;
     auto emit_block = [&](std::size_t ri1, std::size_t hi1) {
-        if (block_called(pi, ri1, pj, hi1)) {
+        const auto it = by_ri0.find(pi * 1000003ULL + pj);
+        const bool substitute = it != by_ri0.end() && take(*it->second);
+        if (substitute) {
             for (std::size_t k = pj; k < hi1; ++k) out.push_back(hap_steps[k]);
             if (ri1 != pi || hi1 != pj) applied = true;
         } else {
@@ -414,17 +520,28 @@ std::vector<PathStep> reconstruct(const std::vector<PathStep>& ref_steps,
         pi = a.first + 1;
         pj = a.second + 1;
     }
-    emit_block(n, m);
+    emit_block(ref_steps.size(), hap_steps.size());
     return out;
 }
+
+// The truth ledger for one (haplotype, bubble): what was there to be found, and what became of it.
+struct Ledger {
+    std::size_t events = 0;
+    std::size_t called = 0, missed = 0, below = 0;
+    std::size_t called_bp = 0, missed_bp = 0, below_bp = 0;
+};
 
 struct BubbleObs {
     std::size_t bubble_id = 0;
     bool carrier = false;
     std::size_t delta = 0;
     std::size_t aln_len = 0;
-    std::size_t sub_bp = 0;    // residual in blocks < min-sv-bp (variation that couldn't be called)
-    std::size_t over_bp = 0;   // residual in blocks >= min-sv-bp (a callable-size event missed/mis-called)
+    std::size_t run_lt_bp = 0;   // residual in alignment runs < min-sv-bp
+    std::size_t run_ge_bp = 0;   // residual in alignment runs >= min-sv-bp
+    Ledger led;
+    // The called-only reconstruction: the reference with exactly the retained calls implanted.
+    std::size_t called_delta = 0;
+    std::size_t called_aln_len = 0;
     // Genotype-aware reconstruction over the same bubble against the same truth, plus the do-nothing
     // baseline (plain reference) it has to beat. A VCF that closes none of the gap between the baseline
     // and the graph bound is worth nothing here, and one that scores WORSE than the baseline is applying
@@ -435,23 +552,39 @@ struct BubbleObs {
     std::size_t ref_delta = 0;
     std::size_t ref_aln_len = 0;
     bool gt_called_carrier = false;   // the VCF genotypes this haplotype as carrying an alt here
-    bool gt_true_carrier = false;     // its walk really does diverge from the reference walk here
+    bool gt_true_carrier = false;     // its walk really does diverge, by at least min-sv-bp
+};
+
+struct EventRow {
+    std::string sample;
+    std::size_t bubble_id = 0;
+    std::size_t ref_bp = 0, hap_bp = 0, size_bp = 0;
+    const char* klass = "";
+    std::string variant_id;
+    std::string svtype;
 };
 
 struct HapResult {
     std::string sample;
     bool scored = false;
+    bool joined = false;
     std::size_t sum_delta = 0;
     std::size_t sum_aln = 0;
-    std::size_t sum_sub = 0;
-    std::size_t sum_over = 0;
+    std::size_t sum_run_lt = 0;
+    std::size_t sum_run_ge = 0;
+    std::size_t called_sum_delta = 0;
+    std::size_t called_sum_aln = 0;
+    Ledger led;
     bool gt_scored = false;
     std::size_t gt_sum_delta = 0;
     std::size_t gt_sum_aln = 0;
     std::size_t ref_sum_delta = 0;
     std::size_t ref_sum_aln = 0;
+    std::size_t coarse_blocks = 0;     // bubbles whose walks were too big to decompose
+    std::size_t skipped_bubbles = 0;   // bubbles this haplotype does not traverse
     GtStats gt_stats;
     std::vector<BubbleObs> obs;
+    std::vector<EventRow> events;
 };
 
 } // namespace
@@ -461,9 +594,12 @@ int run_benchmark_command(const std::vector<std::string>& args) {
 
     std::string gfa_path, bubble_prefix_in, bubbles_csv_in, variant_nodes_in, vcf_in, reference_path, out_prefix;
     std::size_t threads = 0;
-    std::size_t min_sv_bp = 50;   // threshold for the residual sub/over split (should match the call run)
+    std::size_t min_sv_bp = 50;   // event-size threshold for the truth ledger (match the call run)
     bool quiet = false;
-    bool all_bubbles = false;
+    // Every reference-traversed bubble is scored. Restricting to called bubbles cannot measure a miss:
+    // the bubble a caller said nothing about is precisely the one a miss lives in.
+    bool called_only = false;
+    bool write_events = true;
     // How a copy-number record is laid down. `cnbp` -- the per-sample bp delta -- is the default
     // because it is measured: on acot it closes 95.7% of the gap against 51.5% for `cn`, since
     // CN x RU_LEN understates the true bp change by roughly half at a cyclic array.
@@ -489,7 +625,10 @@ int run_benchmark_command(const std::vector<std::string>& args) {
         }
         else if (arg == "-r" || arg == "--reference-path") reference_path = require_value(arg);
         else if (arg == "-o" || arg == "--out-prefix") out_prefix = require_value(arg);
-        else if (arg == "--all-bubbles") all_bubbles = true;
+        else if (arg == "--called-bubbles-only") called_only = true;
+        // Retained: scoring every bubble is now the default, so this asks for what it already gets.
+        else if (arg == "--all-bubbles") called_only = false;
+        else if (arg == "--no-truth-events") write_events = false;
         else if (arg == "--min-sv-bp") min_sv_bp = cli::parse_size_arg(arg, require_value(arg));
         else if (arg == "--threads") threads = cli::parse_size_arg(arg, require_value(arg));
         else if (arg == "-q" || arg == "--quiet") quiet = true;
@@ -509,6 +648,29 @@ int run_benchmark_command(const std::vector<std::string>& args) {
     if (variant_nodes_in.empty()) throw std::runtime_error("benchmark requires --variant-nodes <path>");
     if (reference_path.empty()) throw std::runtime_error("--reference-path is required for module 'benchmark'");
     if (out_prefix.empty()) throw std::runtime_error("benchmark requires -o/--out-prefix <prefix>");
+    if (min_sv_bp == 0) throw std::runtime_error("--min-sv-bp must be at least 1");
+
+    // Every destination is resolved and checked against every input BEFORE anything is opened, then
+    // written to a staged sibling and renamed in only once the run has succeeded.
+    std::vector<std::string> finals = {out_prefix + ".qv.tsv",
+                                       out_prefix + ".qv_by_haplotype.tsv",
+                                       out_prefix + ".qv_summary.tsv"};
+    if (write_events) finals.push_back(out_prefix + ".truth_events.tsv");
+    {
+        const std::vector<std::string> inputs = {gfa_path, bubbles_csv_in, variant_nodes_in, vcf_in};
+        std::unordered_set<std::string> seen_out;
+        for (const std::string& f : finals) {
+            if (!seen_out.insert(f).second)
+                throw std::runtime_error("benchmark: two outputs would be written to the same file: " + f);
+            for (const std::string& in : inputs) {
+                if (in.empty()) continue;
+                std::error_code ec;
+                if (f == in || std::filesystem::equivalent(f, in, ec))
+                    throw std::runtime_error("benchmark: output '" + f + "' is also an input; refusing to "
+                                             "overwrite what the run reads");
+            }
+        }
+    }
 
     ParseGfaOptions parse_options;
     parse_options.include_paths = true;
@@ -516,28 +678,66 @@ int run_benchmark_command(const std::vector<std::string>& args) {
     const Graph graph = parse_gfa(gfa_path, parse_options);
     if (graph.paths.empty())
         throw std::runtime_error("Input GFA has no P/W paths; benchmarking requires paths");
+    // benchmark spells every walk by concatenating whole segments and measures bp from them, so a step
+    // naming a missing node, a step pair with no link, a duplicate path name and a non-zero overlap all
+    // corrupt the numbers rather than failing.
+    validate_graph_paths(graph, "benchmark", true, true);
+    const std::string ref_name = resolve_reference_path_name(graph, reference_path, "benchmark");
 
     cli::RunLog log("benchmark", quiet);
     log.info("input " + gfa_path + " (" + std::to_string(graph.nodes.size()) + " nodes, " +
-             std::to_string(graph.paths.size()) + " paths); reference " + reference_path);
+             std::to_string(graph.paths.size()) + " paths); reference " + ref_name);
 
     const std::vector<Bubble> all_bubbles_csv = read_bubbles_csv(bubbles_csv_in);
+    {
+        std::unordered_set<std::size_t> ids;
+        for (const Bubble& b : all_bubbles_csv) {
+            if (!ids.insert(b.id).second)
+                throw std::runtime_error("bubbles CSV has a duplicate bubble id " + std::to_string(b.id) +
+                                         ": which site a call or a score refers to would be undefined");
+            auto need = [&](const std::string& n) {
+                if (!graph.nodes.count(n))
+                    throw std::runtime_error("bubble " + std::to_string(b.id) + " names node '" + n +
+                                             "', which is not in " + gfa_path +
+                                             " -- the CSV and the graph do not describe the same data");
+            };
+            need(b.source);
+            need(b.sink);
+            for (const std::string& n : b.inside) need(n);
+        }
+    }
     const CalledVariants cv = load_variant_nodes(variant_nodes_in);
-    const PathRecord* ref_path = resolve_reference(graph, reference_path);
+    {
+        std::size_t unknown = 0;
+        std::unordered_set<std::size_t> csv_ids;
+        for (const Bubble& b : all_bubbles_csv) csv_ids.insert(b.id);
+        for (const std::size_t bid : cv.bubble_ids) if (!csv_ids.count(bid)) ++unknown;
+        if (unknown && unknown == cv.bubble_ids.size())
+            throw std::runtime_error("no bubble id in " + variant_nodes_in + " appears in " + bubbles_csv_in +
+                                     "; these outputs are from different runs");
+        if (unknown)
+            log.info("warning: " + std::to_string(unknown) + "/" + std::to_string(cv.bubble_ids.size()) +
+                     " called bubbles are not in the bubbles CSV and cannot be scored");
+    }
+    const PathRecord* ref_path = nullptr;
+    for (const PathRecord& p : graph.paths) if (p.name == ref_name) ref_path = &p;
 
     std::vector<Bubble> bubbles;
-    for (const Bubble& b : all_bubbles_csv) if (all_bubbles || cv.bubble_ids.count(b.id)) bubbles.push_back(b);
-    log.info("scoring " + std::to_string(bubbles.size()) + (all_bubbles ? " bubbles (all) across " : " called bubbles across ") +
-             std::to_string(graph.paths.size()) + " haplotypes");
+    for (const Bubble& b : all_bubbles_csv) if (!called_only || cv.bubble_ids.count(b.id)) bubbles.push_back(b);
 
     // Reference walk per scored bubble (the reconstruction backbone). A bubble the reference doesn't
-    // traverse has no baseline, so it is dropped from scoring.
+    // traverse has no baseline, so it is dropped from scoring -- counted, never silent.
     const BubblePathIndex ref_index = build_bubble_path_index(*ref_path);
     std::unordered_map<std::size_t, std::vector<PathStep>> ref_steps;
     for (const Bubble& b : bubbles) {
         const auto s = bubble_steps(*ref_path, ref_index, b);
         if (s) ref_steps[b.id] = *s;
     }
+    const std::size_t no_ref_bubbles = bubbles.size() - ref_steps.size();
+    log.info("scoring " + std::to_string(ref_steps.size()) + " of " + std::to_string(bubbles.size()) +
+             (called_only ? " called bubbles" : " bubbles") + " across " +
+             std::to_string(graph.paths.size()) + " haplotypes (" + std::to_string(no_ref_bubbles) +
+             " not traversed by the reference), event threshold " + std::to_string(min_sv_bp) + " bp");
 
     // Genotype-aware scoring, when a VCF is supplied. VCF POS lives in the reference path's own forward
     // coordinates, so each bubble's reference span is taken as a substring there and the reconstruction
@@ -550,16 +750,18 @@ int run_benchmark_command(const std::vector<std::string>& args) {
     std::unordered_map<std::size_t, bool> ref_flip;
     std::string ref_seq;
     std::size_t region_start = 1;
+    std::size_t joined = 0, unjoined_samples = 0;
     if (do_gt) {
         vcf = load_vcf(vcf_in);
         for (const VcfRecord& r : vcf.records) recs_by_bubble[r.bubble_id].push_back(&r);
         std::unordered_map<std::string, std::size_t> sample_of;
         for (std::size_t i = 0; i < vcf.samples.size(); ++i) sample_of[vcf.samples[i]] = i;
-        std::size_t joined = 0;
+        std::unordered_set<std::size_t> used;
         for (std::size_t i = 0; i < graph.paths.size(); ++i) {
             const auto it = sample_of.find(graph.paths[i].name);
-            if (it != sample_of.end()) { hap_vcf[i] = static_cast<int>(it->second); ++joined; }
+            if (it != sample_of.end()) { hap_vcf[i] = static_cast<int>(it->second); used.insert(it->second); ++joined; }
         }
+        unjoined_samples = vcf.samples.size() - used.size();
         if (joined == 0)
             throw std::runtime_error("No VCF sample column matches a graph path name, so no haplotype "
                                      "can be genotype-scored: " + vcf_in);
@@ -604,41 +806,114 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                  " records, " + std::to_string(joined) + "/" + std::to_string(graph.paths.size()) +
                  " haplotypes joined to VCF samples, " + std::to_string(ref_span.size()) +
                  "/" + std::to_string(bubbles.size()) + " bubbles placed on the reference");
+        // A partial join is a selected subset, and a QV computed over a subset is not the QV of the run.
+        if (joined != graph.paths.size() || unjoined_samples)
+            log.info("warning: the genotype score covers " + std::to_string(joined) + " of " +
+                     std::to_string(graph.paths.size()) + " graph haplotypes; " +
+                     std::to_string(graph.paths.size() - joined) + " path(s) have no VCF column and " +
+                     std::to_string(unjoined_samples) + " VCF sample(s) have no path. It is a SUBSET score");
+        if (vcf.no_bubble_id)
+            log.info("warning: " + std::to_string(vcf.no_bubble_id) + " VCF record(s) carry no BUBBLE_ID "
+                     "and are all attributed to bubble 0");
     }
 
     std::vector<HapResult> results(graph.paths.size());
-    static const std::unordered_set<std::string> kEmpty;
+    static const std::vector<CalledRecord> kNoCalled;
     run_parallel(graph.paths.size(), threads, [&](std::size_t pi) {
         const PathRecord& path = graph.paths[pi];
         HapResult& hr = results[pi];
         hr.sample = path.name;
+        hr.joined = do_gt && hap_vcf[pi] >= 0;
         if (&path == ref_path) return;
         const BubblePathIndex idx = build_bubble_path_index(path);
         for (const Bubble& b : bubbles) {
             const auto rit = ref_steps.find(b.id);
             if (rit == ref_steps.end()) continue;                // reference doesn't traverse -> no baseline
             const auto steps = bubble_steps(path, idx, b);
-            if (!steps) continue;                                // haplotype doesn't traverse -> skip
+            if (!steps) { ++hr.skipped_bubbles; continue; }      // haplotype doesn't traverse
             const std::string truth = spell_path_steps_sequence(graph, *steps);
-            const auto nit = cv.nodes.find(b.id);
-            const std::unordered_set<std::string>& called = nit != cv.nodes.end() ? nit->second : kEmpty;
-            bool applied = false;
-            const std::vector<PathStep> recon_steps = reconstruct(rit->second, *steps, called, applied);
-            const std::string recon = spell_path_steps_sequence(graph, recon_steps);
-            const NwAlign nw = nw_edit_distance(recon, truth, min_sv_bp);
-            hr.scored = true;
-            hr.sum_delta += nw.edits;
-            hr.sum_aln += nw.aln_len;
-            hr.sum_sub += nw.sub_threshold_bp;
-            hr.sum_over += nw.over_threshold_bp;
+            const auto crit = cv.records.find(b.id);
+            const std::vector<CalledRecord>& recs = crit != cv.records.end() ? crit->second : kNoCalled;
+
+            // ONE decomposition, three consumers: the ledger, the optimistic graph reconstruction and
+            // the strict called-only one. They cannot disagree about what a block is.
+            bool coarse = false;
+            const auto anchors = walk_anchors(rit->second, *steps, coarse);
+            if (coarse) ++hr.coarse_blocks;
+            const std::vector<TruthBlock> blocks =
+                divergent_blocks(graph, rit->second, *steps, anchors, recs);
 
             BubbleObs o;
             o.bubble_id = b.id;
+            for (const TruthBlock& blk : blocks) {
+                if (blk.size_bp == 0) continue;                  // identical content, nothing to find
+                ++o.led.events;
+                const char* klass;
+                if (blk.size_bp < min_sv_bp) { ++o.led.below; o.led.below_bp += blk.size_bp; klass = "below_threshold"; }
+                else if (blk.rec >= 0)       { ++o.led.called; o.led.called_bp += blk.size_bp; klass = "called"; }
+                else                          { ++o.led.missed; o.led.missed_bp += blk.size_bp; klass = "missed"; }
+                if (write_events) {
+                    EventRow er;
+                    er.sample = path.name;
+                    er.bubble_id = b.id;
+                    er.ref_bp = blk.ref_bp;
+                    er.hap_bp = blk.hap_bp;
+                    er.size_bp = blk.size_bp;
+                    er.klass = klass;
+                    er.variant_id = blk.rec >= 0 ? recs[static_cast<std::size_t>(blk.rec)].variant_id : ".";
+                    er.svtype = blk.rec >= 0 ? recs[static_cast<std::size_t>(blk.rec)].svtype : ".";
+                    hr.events.push_back(std::move(er));
+                }
+            }
+
+            // Optimistic: substitute wherever the block shares a node with ANY call at this bubble.
+            const auto nit = cv.nodes.find(b.id);
+            static const std::unordered_set<std::string> kEmptyNodes;
+            const std::unordered_set<std::string>& union_nodes =
+                nit != cv.nodes.end() ? nit->second : kEmptyNodes;
+            bool applied = false;
+            const std::vector<PathStep> recon_steps =
+                reconstruct(rit->second, *steps, anchors, blocks,
+                            [&](const TruthBlock& blk) {
+                                for (std::size_t k = blk.ri0; k < blk.ri1; ++k)
+                                    if (union_nodes.count(rit->second[k].node_id)) return true;
+                                for (std::size_t k = blk.hi0; k < blk.hi1; ++k)
+                                    if (union_nodes.count((*steps)[k].node_id)) return true;
+                                return false;
+                            }, applied);
+            const std::string recon = spell_path_steps_sequence(graph, recon_steps);
+            const NwAlign nw = nw_edit_distance(recon, truth, min_sv_bp);
+
+            // Strict: substitute only blocks that map to a specific emitted call AND reach the threshold.
+            bool c_applied = false;
+            const std::vector<PathStep> called_steps =
+                reconstruct(rit->second, *steps, anchors, blocks,
+                            [&](const TruthBlock& blk) { return blk.rec >= 0 && blk.size_bp >= min_sv_bp; },
+                            c_applied);
+            const NwAlign cnw = nw_edit_distance(spell_path_steps_sequence(graph, called_steps), truth);
+
+            hr.scored = true;
+            hr.sum_delta += nw.edits;
+            hr.sum_aln += nw.aln_len;
+            hr.sum_run_lt += nw.sub_threshold_bp;
+            hr.sum_run_ge += nw.over_threshold_bp;
+            hr.called_sum_delta += cnw.edits;
+            hr.called_sum_aln += cnw.aln_len;
+            hr.led.events += o.led.events;
+            hr.led.called += o.led.called;   hr.led.called_bp += o.led.called_bp;
+            hr.led.missed += o.led.missed;   hr.led.missed_bp += o.led.missed_bp;
+            hr.led.below  += o.led.below;    hr.led.below_bp  += o.led.below_bp;
+
             o.carrier = applied;
             o.delta = nw.edits;
             o.aln_len = nw.aln_len;
-            o.sub_bp = nw.sub_threshold_bp;
-            o.over_bp = nw.over_threshold_bp;
+            o.run_lt_bp = nw.sub_threshold_bp;
+            o.run_ge_bp = nw.over_threshold_bp;
+            o.called_delta = cnw.edits;
+            o.called_aln_len = cnw.aln_len;
+            // Truth for the carrier call comes from the WALKS, not from an alignment: this haplotype
+            // carries something callable here iff one of its divergent blocks reaches the threshold.
+            o.gt_true_carrier = o.led.called > 0 || o.led.missed > 0;
 
             const auto span = do_gt && hap_vcf[pi] >= 0 ? ref_span.find(b.id) : ref_span.end();
             if (span != ref_span.end()) {
@@ -655,8 +930,8 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                     gt_recon = reverse_complement(gt_recon);
                     ref_recon = reverse_complement(ref_recon);
                 }
-                const NwAlign gnw = nw_edit_distance(gt_recon, truth, min_sv_bp);
-                const NwAlign rnw = nw_edit_distance(ref_recon, truth, min_sv_bp);
+                const NwAlign gnw = nw_edit_distance(gt_recon, truth);
+                const NwAlign rnw = nw_edit_distance(ref_recon, truth);
                 hr.gt_scored = true;
                 hr.gt_sum_delta += gnw.edits;
                 hr.gt_sum_aln += gnw.aln_len;
@@ -669,29 +944,42 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                 o.ref_aln_len = rnw.aln_len;
                 for (const VcfRecord* r : brecs)
                     if (hv < r->gt.size() && r->gt[hv] >= 1) { o.gt_called_carrier = true; break; }
-                // Truth for the carrier call: is there a callable-SIZE difference between this haplotype
-                // and the reference here. Plain walk inequality would count a single SNP as a missed
-                // carrier, which is not something the caller ever set out to emit.
-                o.gt_true_carrier = rnw.over_threshold_bp > 0;
             }
-            hr.obs.push_back(o);
+            hr.obs.push_back(std::move(o));
         }
     });
+
+    cli::StagedOutputs staged("benchmark");
+    std::vector<std::string> staged_paths;
+    for (const std::string& f : finals) staged_paths.push_back(staged.stage(f));
+    auto staged_for = [&](const std::string& f) {
+        for (std::size_t i = 0; i < finals.size(); ++i) if (finals[i] == f) return staged_paths[i];
+        throw std::runtime_error("benchmark: unstaged output " + f);
+    };
 
     std::map<std::string, std::size_t> band_count;
     std::map<std::string, std::size_t> quintile_count;
     std::map<std::string, std::size_t> gt_band_count;
     std::map<std::string, std::size_t> gt_quintile_count;
+    std::map<std::string, std::size_t> called_quintile_count;
     std::size_t scored_haps = 0, gt_scored_haps = 0;
     double gt_closed_sum = 0.0;
+    std::size_t gt_closed_n = 0, gt_closed_na = 0;
     std::size_t gt_worse_than_ref = 0;
     std::size_t gt_tot_ref_delta = 0, gt_tot_gt_delta = 0, gt_tot_graph_delta = 0;
-    std::size_t tot_sub = 0, tot_over = 0;
+    std::size_t tot_run_lt = 0, tot_run_ge = 0;
+    std::size_t tot_called_delta = 0;
+    std::size_t tot_coarse = 0, tot_skipped = 0;
+    Ledger tot_led;
     GtStats tot_gt;
     {
-        std::ofstream by_hap(out_prefix + ".qv_by_haplotype.tsv");
+        std::ofstream by_hap(staged_for(out_prefix + ".qv_by_haplotype.tsv"));
         if (!by_hap) throw std::runtime_error("Failed to write " + out_prefix + ".qv_by_haplotype.tsv");
-        by_hap << "sample\tn_bubbles\tsum_delta\tsum_aln_len\tqv\tband\tqv_max\tqv_ratio\tquintile\tidentity\tsub_threshold_bp\tover_threshold_bp"
+        by_hap << "sample\tn_bubbles\tsum_delta\tsum_aln_len\tqv\tband\tqv_max\tqv_ratio\tquintile\tidentity"
+                  "\tresid_run_lt_bp\tresid_run_ge_bp"
+                  "\ttruth_events\ttruth_called\ttruth_missed\ttruth_below"
+                  "\ttruth_called_bp\ttruth_missed_bp\ttruth_below_bp"
+                  "\tcalled_sum_delta\tcalled_qv\tcalled_quintile"
                   "\tgt_sum_delta\tgt_sum_aln_len\tgt_qv\tgt_band\tgt_quintile\tgt_identity"
                   "\tref_sum_delta\tref_qv\tgap_closed\n";
         for (const HapResult& hr : results) {
@@ -704,10 +992,17 @@ int run_benchmark_command(const std::vector<std::string>& args) {
             const double identity = hr.sum_aln ? std::max(0.0, 1.0 - static_cast<double>(hr.sum_delta) / static_cast<double>(hr.sum_aln)) : 1.0;
             const std::string band = qv_band(qv);
             const std::string quintile = qv_ratio_quintile(ratio);
+            const double cqv = qv_from(hr.called_sum_delta, hr.called_sum_aln);
+            const double cmax = qv_max_from(hr.called_sum_aln);
+            const std::string cquint = qv_ratio_quintile(std::min(1.0, std::max(0.0, cmax > 0.0 ? cqv / cmax : 1.0)));
             by_hap << hr.sample << '\t' << hr.obs.size() << '\t' << hr.sum_delta << '\t'
                    << hr.sum_aln << '\t' << qv << '\t' << band << '\t' << qmax << '\t'
                    << ratio << '\t' << quintile << '\t' << identity << '\t'
-                   << hr.sum_sub << '\t' << hr.sum_over;
+                   << hr.sum_run_lt << '\t' << hr.sum_run_ge << '\t'
+                   << hr.led.events << '\t' << hr.led.called << '\t' << hr.led.missed << '\t'
+                   << hr.led.below << '\t' << hr.led.called_bp << '\t' << hr.led.missed_bp << '\t'
+                   << hr.led.below_bp << '\t'
+                   << hr.called_sum_delta << '\t' << cqv << '\t' << cquint;
             if (hr.gt_scored) {
                 const double gqv = qv_from(hr.gt_sum_delta, hr.gt_sum_aln);
                 const double gmax = qv_max_from(hr.gt_sum_aln);
@@ -717,16 +1012,20 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                 const std::string gquint = qv_ratio_quintile(gratio);
                 // How much of the distance between doing nothing and the graph bound the VCF closes.
                 // 1 = everything the graph could offer, 0 = no better than plain reference, < 0 = the
-                // genotypes put edits where they do not belong.
+                // genotypes put edits where they do not belong. When the baseline already equals the
+                // graph bound there is no distance to close and the ratio is UNDEFINED -- reporting it
+                // as 1.0 called a total miss a perfect score, since baseline == genotype == graph then
+                // reads "closed everything".
                 const double denom = static_cast<double>(hr.ref_sum_delta) - static_cast<double>(hr.sum_delta);
-                const double closed = std::fabs(denom) > 1e-9
+                const bool has_gap = std::fabs(denom) > 1e-9;
+                const double closed = has_gap
                     ? (static_cast<double>(hr.ref_sum_delta) - static_cast<double>(hr.gt_sum_delta)) / denom
-                    : 1.0;
+                    : 0.0;
                 by_hap << '\t' << hr.gt_sum_delta << '\t' << hr.gt_sum_aln << '\t' << gqv << '\t'
                        << gband << '\t' << gquint << '\t' << gident << '\t'
-                       << hr.ref_sum_delta << '\t' << qv_from(hr.ref_sum_delta, hr.ref_sum_aln) << '\t'
-                       << closed;
-                gt_closed_sum += closed;
+                       << hr.ref_sum_delta << '\t' << qv_from(hr.ref_sum_delta, hr.ref_sum_aln) << '\t';
+                if (has_gap) by_hap << closed; else by_hap << "NA";
+                if (has_gap) { gt_closed_sum += closed; ++gt_closed_n; } else ++gt_closed_na;
                 if (hr.gt_sum_delta > hr.ref_sum_delta) ++gt_worse_than_ref;
                 gt_tot_ref_delta += hr.ref_sum_delta;
                 gt_tot_gt_delta += hr.gt_sum_delta;
@@ -739,26 +1038,51 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                 tot_gt.clamped += hr.gt_stats.clamped;
                 tot_gt.unhandled += hr.gt_stats.unhandled;
                 tot_gt.ref_mismatch += hr.gt_stats.ref_mismatch;
+                tot_gt.heuristic += hr.gt_stats.heuristic;
             } else {
                 by_hap << "\t.\t.\t.\t.\t.\t.\t.\t.\t.";
             }
             by_hap << '\n';
             ++band_count[band];
             ++quintile_count[quintile];
+            ++called_quintile_count[cquint];
             ++scored_haps;
-            tot_sub += hr.sum_sub;
-            tot_over += hr.sum_over;
+            tot_run_lt += hr.sum_run_lt;
+            tot_run_ge += hr.sum_run_ge;
+            tot_called_delta += hr.called_sum_delta;
+            tot_coarse += hr.coarse_blocks;
+            tot_skipped += hr.skipped_bubbles;
+            tot_led.events += hr.led.events;
+            tot_led.called += hr.led.called;   tot_led.called_bp += hr.led.called_bp;
+            tot_led.missed += hr.led.missed;   tot_led.missed_bp += hr.led.missed_bp;
+            tot_led.below  += hr.led.below;    tot_led.below_bp  += hr.led.below_bp;
         }
     }
 
+    if (write_events) {
+        std::ofstream ev(staged_for(out_prefix + ".truth_events.tsv"));
+        if (!ev) throw std::runtime_error("Failed to write " + out_prefix + ".truth_events.tsv");
+        ev << "sample\tbubble_id\tref_bp\thap_bp\tsize_bp\tclass\tvariant_id\tsvtype\n";
+        for (const HapResult& hr : results)
+            for (const EventRow& e : hr.events)
+                ev << e.sample << '\t' << e.bubble_id << '\t' << e.ref_bp << '\t' << e.hap_bp << '\t'
+                   << e.size_bp << '\t' << e.klass << '\t' << e.variant_id << '\t' << e.svtype << '\n';
+    }
+
     std::map<std::string, std::map<std::string, std::size_t>> class_bands;
-    // Carrier confusion, per svtype: the genotype call (does the VCF say this haplotype carries an alt
-    // at this bubble) against the truth (does its walk really diverge from the reference walk).
-    std::map<std::string, std::array<std::size_t, 4>> carrier;   // svtype -> {TP, FP, FN, TN}
+    // Carrier confusion at the (haplotype, bubble) level: the genotype call (does the VCF say this
+    // haplotype carries an alt here) against the truth (does its walk diverge by at least the
+    // threshold). Reported for ALL only -- a bubble judgement has no single svtype, and fanning it out
+    // over every svtype the bubble contains reported one observation as several.
+    std::array<std::size_t, 4> carrier{{0, 0, 0, 0}};   // {TP, FP, FN, TN}
+    // The event ledger by svtype IS a partition: each event maps to at most one record.
+    std::map<std::string, std::array<std::size_t, 3>> ledger_by_type;  // svtype -> {called, missed, below}
     {
-        std::ofstream qv_out(out_prefix + ".qv.tsv");
+        std::ofstream qv_out(staged_for(out_prefix + ".qv.tsv"));
         if (!qv_out) throw std::runtime_error("Failed to write " + out_prefix + ".qv.tsv");
-        qv_out << "sample\tbubble_id\tsvtypes\tis_carrier\tdelta\taln_len\tqv\tsub_threshold_bp\tover_threshold_bp"
+        qv_out << "sample\tbubble_id\tsvtypes\tis_carrier\tdelta\taln_len\tqv\tresid_run_lt_bp\tresid_run_ge_bp"
+                  "\ttruth_events\ttruth_called\ttruth_missed\ttruth_below\ttruth_missed_bp"
+                  "\tcalled_delta\tcalled_qv"
                   "\tgt_delta\tgt_aln_len\tgt_qv\tref_delta\tgt_called_carrier\tgt_true_carrier\n";
         for (const HapResult& hr : results) {
             if (!hr.scored) continue;
@@ -771,22 +1095,28 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                 const std::string band = qv_band(qv);
                 qv_out << hr.sample << '\t' << o.bubble_id << '\t' << (svt.empty() ? "." : svt) << '\t'
                        << (o.carrier ? 1 : 0) << '\t' << o.delta << '\t' << o.aln_len << '\t' << qv << '\t'
-                       << o.sub_bp << '\t' << o.over_bp;
+                       << o.run_lt_bp << '\t' << o.run_ge_bp << '\t'
+                       << o.led.events << '\t' << o.led.called << '\t' << o.led.missed << '\t'
+                       << o.led.below << '\t' << o.led.missed_bp << '\t'
+                       << o.called_delta << '\t' << qv_from(o.called_delta, o.called_aln_len);
                 if (o.gt_scored) {
                     qv_out << '\t' << o.gt_delta << '\t' << o.gt_aln_len << '\t'
                            << qv_from(o.gt_delta, o.gt_aln_len) << '\t' << o.ref_delta << '\t'
                            << (o.gt_called_carrier ? 1 : 0) << '\t' << (o.gt_true_carrier ? 1 : 0);
-                    const std::size_t cell = o.gt_called_carrier ? (o.gt_true_carrier ? 0 : 1)
-                                                                 : (o.gt_true_carrier ? 2 : 3);
-                    if (sit != cv.svtypes.end())
-                        for (const std::string& s : sit->second) ++carrier[s][cell];
-                    ++carrier["ALL"][cell];
+                    ++carrier[o.gt_called_carrier ? (o.gt_true_carrier ? 0 : 1)
+                                                  : (o.gt_true_carrier ? 2 : 3)];
                 } else {
-                    qv_out << "\t.\t.\t.\t.\t.\t.";
+                    qv_out << "\t.\t.\t.\t.\t.\t" << (o.gt_true_carrier ? 1 : 0);
                 }
                 qv_out << '\n';
                 if (sit != cv.svtypes.end())
                     for (const std::string& s : sit->second) ++class_bands[s][band];
+            }
+            for (const EventRow& e : hr.events) {
+                auto& c = ledger_by_type[e.svtype];
+                if (std::string(e.klass) == "called") ++c[0];
+                else if (std::string(e.klass) == "missed") ++c[1];
+                else ++c[2];
             }
         }
     }
@@ -794,7 +1124,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
     static const char* kBands[] = {"<17", "17-23", "23-33", ">33"};
     static const char* kQuintiles[] = {"0.0-0.2", "0.2-0.4", "0.4-0.6", "0.6-0.8", "0.8-1.0"};
     {
-        std::ofstream sum(out_prefix + ".qv_summary.tsv");
+        std::ofstream sum(staged_for(out_prefix + ".qv_summary.tsv"));
         if (!sum) throw std::runtime_error("Failed to write " + out_prefix + ".qv_summary.tsv");
         sum << "scope\tkey\tband\tn\tpct\n";
         // Length-fair headline: % of haplotypes per qv/qv_max quintile (Q5 = 0.8-1.0 is best).
@@ -808,15 +1138,51 @@ int run_benchmark_command(const std::vector<std::string>& args) {
             const double pct = scored_haps ? 100.0 * static_cast<double>(n) / static_cast<double>(scored_haps) : 0.0;
             sum << "haplotype\tALL\t" << band << '\t' << n << '\t' << pct << '\n';
         }
-        // Residual split: of all the sequence we could not reconstruct, how much is sub-threshold
-        // variation (couldn't be called) vs callable-size events missed/mis-called.
-        {
-            const std::size_t tot = tot_sub + tot_over;
-            const double sub_pct = tot ? 100.0 * static_cast<double>(tot_sub) / static_cast<double>(tot) : 0.0;
-            const double over_pct = tot ? 100.0 * static_cast<double>(tot_over) / static_cast<double>(tot) : 0.0;
-            sum << "residual\t<" << min_sv_bp << "bp\tsub_threshold\t" << tot_sub << '\t' << sub_pct << '\n';
-            sum << "residual\t>=" << min_sv_bp << "bp\tover_threshold\t" << tot_over << '\t' << over_pct << '\n';
+        for (const char* q : kQuintiles) {
+            const std::size_t n = called_quintile_count.count(q) ? called_quintile_count[q] : 0;
+            const double pct = scored_haps ? 100.0 * static_cast<double>(n) / static_cast<double>(scored_haps) : 0.0;
+            sum << "called_quintile\tALL\t" << q << '\t' << n << '\t' << pct << '\n';
         }
+        // The truth ledger. Every divergent block between the reference walk and a haplotype's walk is
+        // one event, sized from the walks; `called` means it contains a node of a specific emitted
+        // record, which is weaker than "that record reproduces it" and is labelled accordingly.
+        {
+            const std::size_t tot = tot_led.events ? tot_led.events : 1;
+            sum << "truth_event\tALL\tevents\t" << tot_led.events << "\t100\n";
+            sum << "truth_event\tALL\tcalled\t" << tot_led.called << '\t'
+                << 100.0 * static_cast<double>(tot_led.called) / static_cast<double>(tot) << '\n';
+            sum << "truth_event\tALL\tmissed\t" << tot_led.missed << '\t'
+                << 100.0 * static_cast<double>(tot_led.missed) / static_cast<double>(tot) << '\n';
+            sum << "truth_event\tALL\tbelow_threshold\t" << tot_led.below << '\t'
+                << 100.0 * static_cast<double>(tot_led.below) / static_cast<double>(tot) << '\n';
+            sum << "truth_bp\tALL\tcalled_bp\t" << tot_led.called_bp << "\t0\n";
+            sum << "truth_bp\tALL\tmissed_bp\t" << tot_led.missed_bp << "\t0\n";
+            sum << "truth_bp\tALL\tbelow_threshold_bp\t" << tot_led.below_bp << "\t0\n";
+            for (const auto& [svt, c] : ledger_by_type) {
+                sum << "truth_event\t" << svt << "\tcalled\t" << c[0] << "\t0\n";
+                sum << "truth_event\t" << svt << "\tmissed\t" << c[1] << "\t0\n";
+                sum << "truth_event\t" << svt << "\tbelow_threshold\t" << c[2] << "\t0\n";
+            }
+        }
+        // Residual by contiguous ALIGNMENT RUN length. This is a property of the edit path edlib
+        // returns, not of any event: a clean 60 bp deletion of non-repetitive sequence comes back as a
+        // dozen short runs, because co-optimal paths distribute the gap across chance matches. Kept as
+        // a description of the residual's shape; the called/missed question is the ledger's.
+        {
+            const std::size_t tot = tot_run_lt + tot_run_ge;
+            const double lt_pct = tot ? 100.0 * static_cast<double>(tot_run_lt) / static_cast<double>(tot) : 0.0;
+            const double ge_pct = tot ? 100.0 * static_cast<double>(tot_run_ge) / static_cast<double>(tot) : 0.0;
+            sum << "residual_run\t<" << min_sv_bp << "bp\tshort_runs\t" << tot_run_lt << '\t' << lt_pct << '\n';
+            sum << "residual_run\t>=" << min_sv_bp << "bp\tlong_runs\t" << tot_run_ge << '\t' << ge_pct << '\n';
+        }
+        // What was left out of the denominators, so no rate is read as if it covered everything.
+        sum << "excluded\tALL\tbubbles_no_reference_walk\t" << no_ref_bubbles << "\t0\n";
+        sum << "excluded\tALL\thaplotype_bubbles_not_traversed\t" << tot_skipped << "\t0\n";
+        sum << "excluded\tALL\tbubbles_decomposed_coarsely\t" << tot_coarse << "\t0\n";
+        sum << "excluded\tALL\thaplotypes_without_vcf_column\t"
+            << (do_gt ? graph.paths.size() - joined : 0) << "\t0\n";
+        sum << "excluded\tALL\tvcf_samples_without_path\t" << unjoined_samples << "\t0\n";
+        sum << "called_recon\tALL\tdelta\t" << tot_called_delta << "\t0\n";
         // Genotype-aware reconstruction, reported on the same scale so the two are read side by side.
         if (gt_scored_haps) {
             for (const char* q : kQuintiles) {
@@ -829,25 +1195,44 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                 const double pct = 100.0 * static_cast<double>(n) / static_cast<double>(gt_scored_haps);
                 sum << "gt_haplotype\tALL\t" << band << '\t' << n << '\t' << pct << '\n';
             }
-            for (const auto& [svclass, c] : carrier) {
-                const std::size_t tp = c[0], fp = c[1], fn = c[2], tn = c[3];
+            {
+                const std::size_t tp = carrier[0], fp = carrier[1], fn = carrier[2], tn = carrier[3];
                 const double prec = (tp + fp) ? 100.0 * static_cast<double>(tp) / static_cast<double>(tp + fp) : 0.0;
                 const double rec = (tp + fn) ? 100.0 * static_cast<double>(tp) / static_cast<double>(tp + fn) : 0.0;
-                sum << "gt_carrier\t" << svclass << "\tTP\t" << tp << '\t' << prec << '\n';
-                sum << "gt_carrier\t" << svclass << "\tFP\t" << fp << '\t' << prec << '\n';
-                sum << "gt_carrier\t" << svclass << "\tFN\t" << fn << '\t' << rec << '\n';
-                sum << "gt_carrier\t" << svclass << "\tTN\t" << tn << '\t' << rec << '\n';
+                sum << "gt_carrier\tALL\tTP\t" << tp << '\t' << prec << '\n';
+                sum << "gt_carrier\tALL\tFP\t" << fp << '\t' << prec << '\n';
+                sum << "gt_carrier\tALL\tFN\t" << fn << '\t' << rec << '\n';
+                sum << "gt_carrier\tALL\tTN\t" << tn << '\t' << rec << '\n';
             }
             {
                 const double denom = static_cast<double>(gt_tot_ref_delta) - static_cast<double>(gt_tot_graph_delta);
-                const double closed = std::fabs(denom) > 1e-9
-                    ? (static_cast<double>(gt_tot_ref_delta) - static_cast<double>(gt_tot_gt_delta)) / denom : 1.0;
+                const bool has_gap = std::fabs(denom) > 1e-9;
+                const double closed = has_gap
+                    ? (static_cast<double>(gt_tot_ref_delta) - static_cast<double>(gt_tot_gt_delta)) / denom : 0.0;
                 sum << "gt_gap\tALL\tbaseline_delta\t" << gt_tot_ref_delta << "\t0\n";
                 sum << "gt_gap\tALL\tgenotype_delta\t" << gt_tot_gt_delta << "\t0\n";
                 sum << "gt_gap\tALL\tgraph_delta\t" << gt_tot_graph_delta << "\t0\n";
-                sum << "gt_gap\tALL\tgap_closed_pooled\t0\t" << 100.0 * closed << "\n";
-                sum << "gt_gap\tALL\tgap_closed_mean\t0\t"
-                    << (gt_scored_haps ? 100.0 * gt_closed_sum / static_cast<double>(gt_scored_haps) : 0.0) << "\n";
+                sum << "gt_gap\tALL\tgap_closed_pooled\t0\t";
+                if (has_gap) sum << 100.0 * closed << '\n'; else sum << "NA\n";
+                sum << "gt_gap\tALL\tgap_closed_mean\t" << gt_closed_n << '\t';
+                if (gt_closed_n) sum << 100.0 * gt_closed_sum / static_cast<double>(gt_closed_n) << '\n';
+                else sum << "NA\n";
+                sum << "gt_gap\tALL\tgap_closed_undefined\t" << gt_closed_na << "\t0\n";
+                // The same question against the other denominator: of the distance between the plain
+                // reference and the truth, what fraction do the calls remove. gap_closed measures
+                // against the ACHIEVABLE bound (the graph), this against ALL of it -- so a locus whose
+                // graph cannot hold the haplotype scores low here and high there, and the pair says
+                // which of the two is the limit. Undefined when there is no variation to recover.
+                const double base = static_cast<double>(gt_tot_ref_delta);
+                sum << "variation_recovered\tALL\tgenotype\t0\t";
+                if (base > 0.0) sum << 100.0 * (base - static_cast<double>(gt_tot_gt_delta)) / base << '\n';
+                else sum << "NA\n";
+                sum << "variation_recovered\tALL\tcalled\t0\t";
+                if (base > 0.0) sum << 100.0 * (base - static_cast<double>(tot_called_delta)) / base << '\n';
+                else sum << "NA\n";
+                sum << "variation_recovered\tALL\tgraph\t0\t";
+                if (base > 0.0) sum << 100.0 * (base - static_cast<double>(gt_tot_graph_delta)) / base << '\n';
+                else sum << "NA\n";
                 sum << "gt_gap\tALL\tworse_than_baseline\t" << gt_worse_than_ref << "\t"
                     << (gt_scored_haps ? 100.0 * static_cast<double>(gt_worse_than_ref) / static_cast<double>(gt_scored_haps) : 0.0) << "\n";
             }
@@ -857,6 +1242,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
             sum << "gt_records\tALL\tclamped\t" << tot_gt.clamped << "\t0\n";
             sum << "gt_records\tALL\tunhandled\t" << tot_gt.unhandled << "\t0\n";
             sum << "gt_records\tALL\tref_mismatch\t" << tot_gt.ref_mismatch << "\t0\n";
+            sum << "gt_records\tALL\theuristic\t" << tot_gt.heuristic << "\t0\n";
         }
         for (const auto& [svclass, bands] : class_bands) {
             std::size_t total = 0;
@@ -869,6 +1255,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
             }
         }
     }
+    staged.commit();
 
     auto quintile_recap = [&](const std::map<std::string, std::size_t>& counts, std::size_t denom) {
         std::string s;
@@ -882,34 +1269,52 @@ int run_benchmark_command(const std::vector<std::string>& args) {
         }
         return s;
     };
-    log.info("graph (self-consistency) " + std::to_string(scored_haps) + " haplotypes, qv/qv_max quintiles:" +
+    log.info("graph (optimistic upper bound) " + std::to_string(scored_haps) + " haplotypes, qv/qv_max quintiles:" +
              quintile_recap(quintile_count, scored_haps));
+    log.info("called (retained calls only) " + std::to_string(scored_haps) + " haplotypes, qv/qv_max quintiles:" +
+             quintile_recap(called_quintile_count, scored_haps));
+    {
+        char lb[256];
+        std::snprintf(lb, sizeof(lb),
+                      "truth events at >=%zu bp: %zu called, %zu MISSED (%zu bp); %zu below threshold",
+                      min_sv_bp, tot_led.called, tot_led.missed, tot_led.missed_bp, tot_led.below);
+        log.info(lb);
+    }
+    if (tot_coarse)
+        log.info("note: " + std::to_string(tot_coarse) + " haplotype-bubble pair(s) were too large to "
+                 "decompose and were treated as a single event");
     if (gt_scored_haps) {
         log.info("genotype (from VCF) " + std::to_string(gt_scored_haps) + " haplotypes, qv/qv_max quintiles:" +
                  quintile_recap(gt_quintile_count, gt_scored_haps));
         {
             const double denom = static_cast<double>(gt_tot_ref_delta) - static_cast<double>(gt_tot_graph_delta);
-            const double closed = std::fabs(denom) > 1e-9
-                ? (static_cast<double>(gt_tot_ref_delta) - static_cast<double>(gt_tot_gt_delta)) / denom : 1.0;
-            char gb[224];
-            std::snprintf(gb, sizeof(gb),
-                          "residual bases: baseline(no edits)=%zu genotype=%zu graph=%zu -> gap closed %.1f%%"
-                          " (%zu haplotypes worse than baseline)",
-                          gt_tot_ref_delta, gt_tot_gt_delta, gt_tot_graph_delta, 100.0 * closed, gt_worse_than_ref);
+            const bool has_gap = std::fabs(denom) > 1e-9;
+            const double closed = has_gap
+                ? (static_cast<double>(gt_tot_ref_delta) - static_cast<double>(gt_tot_gt_delta)) / denom : 0.0;
+            char gb[288];
+            if (has_gap)
+                std::snprintf(gb, sizeof(gb),
+                              "residual bases: baseline(no edits)=%zu genotype=%zu graph=%zu -> gap closed %.1f%%"
+                              " (%zu haplotypes worse than baseline)",
+                              gt_tot_ref_delta, gt_tot_gt_delta, gt_tot_graph_delta, 100.0 * closed, gt_worse_than_ref);
+            else
+                std::snprintf(gb, sizeof(gb),
+                              "residual bases: baseline(no edits)=%zu genotype=%zu graph=%zu -> gap closed UNDEFINED"
+                              " (the graph bound equals the baseline, so there is no gap to close)",
+                              gt_tot_ref_delta, gt_tot_gt_delta, gt_tot_graph_delta);
             log.info(gb);
         }
-        const auto& c = carrier["ALL"];
-        const double prec = (c[0] + c[1]) ? 100.0 * static_cast<double>(c[0]) / static_cast<double>(c[0] + c[1]) : 0.0;
-        const double rec = (c[0] + c[2]) ? 100.0 * static_cast<double>(c[0]) / static_cast<double>(c[0] + c[2]) : 0.0;
+        const double prec = (carrier[0] + carrier[1]) ? 100.0 * static_cast<double>(carrier[0]) / static_cast<double>(carrier[0] + carrier[1]) : 0.0;
+        const double rec = (carrier[0] + carrier[2]) ? 100.0 * static_cast<double>(carrier[0]) / static_cast<double>(carrier[0] + carrier[2]) : 0.0;
         char buf[192];
         std::snprintf(buf, sizeof(buf),
                       "carrier calls: TP=%zu FP=%zu FN=%zu TN=%zu (precision %.1f%%, recall %.1f%%)",
-                      c[0], c[1], c[2], c[3], prec, rec);
+                      carrier[0], carrier[1], carrier[2], carrier[3], prec, rec);
         log.info(buf);
     } else if (do_gt) {
         log.info("genotype scoring produced no scored haplotype (no bubble placed on the reference)");
     }
-    log.wrote({out_prefix + ".qv.tsv", out_prefix + ".qv_by_haplotype.tsv", out_prefix + ".qv_summary.tsv"});
+    log.wrote(finals);
     log.done();
     return 0;
 }

@@ -247,10 +247,20 @@ fi
 
 # Round-trip QV summary: combine each locus's per-haplotype benchmark, then the reconstruction-anatomy plot.
 QV_TABLE="$REPO/results/benchmark_qv.tsv"
-printf 'locus\tsample\tsum_delta\tsum_aln_len\tqv\tidentity\tsub_threshold_bp\tover_threshold_bp\n' > "$QV_TABLE"
+# Columns are looked up BY NAME. They have moved once already -- the truth-event ledger was inserted
+# ahead of the residual columns -- and a positional read of a table that gained a column silently
+# aggregates the wrong quantity rather than failing.
+QV_COLS='sample sum_delta sum_aln_len qv identity truth_missed_bp truth_below_bp called_sum_delta'
+printf 'locus\t%s\n' "$(printf '%s\n' $QV_COLS | paste -sd$'\t' -)" > "$QV_TABLE"
 for region in "${REGIONS[@]}"; do
   bh="$OUT/$region/benchmark/benchmark.qv_by_haplotype.tsv"
-  [[ -s "$bh" ]] && awk -F'\t' -v L="$region" 'NR>1{print L"\t"$1"\t"$3"\t"$4"\t"$5"\t"$10"\t"$11"\t"$12}' "$bh" >> "$QV_TABLE"
+  [[ -s "$bh" ]] || continue
+  awk -F'\t' -v L="$region" -v WANT="$QV_COLS" '
+    NR==1 { for (i = 1; i <= NF; i++) at[$i] = i
+            n = split(WANT, w, " ")
+            for (k = 1; k <= n; k++) if (!(w[k] in at)) { print "regen_results: benchmark table has no column " w[k] > "/dev/stderr"; exit 1 }
+            next }
+    { line = L; for (k = 1; k <= n; k++) line = line "\t" $at[w[k]]; print line }' "$bh" >> "$QV_TABLE"
 done
 if [[ $(wc -l < "$QV_TABLE") -gt 1 ]] && have_r; then
   "$RS" "$HERE/plot_benchmark.R" --table "$QV_TABLE" --out "$REPO/results/benchmark_qv" --per-row 12 \

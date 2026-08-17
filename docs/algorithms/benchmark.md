@@ -2,82 +2,98 @@
 
 Mechanism for the `benchmark` module. For usage/flags see [modules/benchmark.md](../modules/benchmark.md); References in [references.md](../references.md).
 
-`benchmark` measures how much of each haplotype the caller's own output reconstructs, at two levels that share every other ingredient — same bubbles, same truth, same alignment, same QV scale — and differ only in what the reconstruction may draw on. The `graph` level below is the original one; the `genotype` level is described in its own section at the end.
+`benchmark` answers two separable questions about the caller's own output: **what was there to be found** (the truth event ledger) and **how much of the sequence comes back** (three reconstructions plus a do-nothing baseline). Everything is derived from one decomposition of the two walks, so the ledger and the reconstructions cannot disagree about what a divergent block is.
 
-For a bubble it takes the reference `source → sink` walk and applies only the called divergences — where a haplotype diverges from the reference and that divergence is one of our calls, the haplotype's nodes are spliced in; everything else stays reference — then aligns that reconstruction against the haplotype's true sequence. The identity, `1 − δ/S` (edit distance `δ` over alignment length `S`), is the headline: the fraction of aligned sequence the calls reproduce. Only bubbles carrying at least one call are scored (or every bubble with `--all-bubbles`); a bubble the reference does not traverse is dropped, having no baseline.
+Every reference-traversed bubble is scored by default. A bubble the reference does not traverse has no baseline and is dropped — counted in the `excluded` scope, never silently.
 
-## How it works
+## One decomposition
 
 For each scored bubble, for each haplotype that traverses it:
 
-### 1. Spell the truth
+**Spell the truth.** The haplotype's own canonical `source → sink` walk, orientation-aware.
 
-The haplotype's own canonical `source → sink` walk, orientation-aware — the sequence we are trying to reproduce.
+**Node-align.** Longest common subsequence over `(node id, orientation)` step tokens between the reference walk and the haplotype's walk. The matched positions are anchors; each maximal stretch between consecutive anchors where the two walks differ is one **divergent block**, holding `ref_steps[ri0,ri1)` against `hap_steps[hi0,hi1)`. On walks too large for the `O(nm)` table the whole bubble becomes one block — a coarser decomposition, not a wrong one, and counted as `bubbles_decomposed_coarsely`.
 
-### 2. Reconstruct from the calls
+**Size it, and attribute it.** `ref_bp` and `hap_bp` sum the node lengths on each side; the event size is `max(ref_bp, hap_bp)`, which is how `call` gates a linked DEL/INS replacement — on the larger arm. The block is attributed to the first record (by variant id, so the choice cannot depend on file order) whose node set it actually contains. A block that merely sits in the same bubble as a record is not attributed to it.
 
-Node-align the haplotype walk against the reference walk on shared step tokens — the anchors, a longest common subsequence over the `(node id, orientation)` tokens. Between two consecutive anchors lies a divergent block, a maximal stretch where the two walks differ. Emit the haplotype's side of the block if it is a called block (any of its nodes are in the bubble's `variant_nodes.tsv` set — a divergence one of our calls explains), otherwise revert to the reference's side, so uncalled divergence (SNPs, sub-threshold indels) stays at reference.
+**Event size is a property of the two walks alone.** It does not move with the alignment, the threshold, the calls or the reconstruction, which is what makes it usable as truth.
 
-### 3. Align and split the residual
+## The truth ledger
 
-Align the reconstruction against the truth with a global (Needleman–Wunsch) alignment, giving `δ` and `S` and contributing to identity `1 − δ/S`. Walking the edit path splits `δ` by contiguous non-match block size against `--min-sv-bp`: `sub_threshold_bp` (blocks below N, uncallable variation) and `over_threshold_bp` (blocks at or above N, callable-size misses). A comparability `QV = -10·log10(max(0.5, δ)/S)` is emitted alongside, with a ceiling `QV_max = 10·log10(2S)` for a perfect reconstruction and `qv_ratio = QV/QV_max` in (0, 1].
+Each block with a non-zero size is one truth event:
 
-Aggregate per haplotype length-weighted (`Σδ`, `ΣS` over its bubbles) to give identity `= 1 − Σδ/ΣS` and the summed residual split (plus the comparability `QV`/`qv_ratio`/`quintile`). Per gene, `identity + Σsub/ΣS + Σover/ΣS = 1` — the anatomy `scripts/plot_benchmark.R` renders (left: reconstructed + residual; right: the residual's not-callable vs mis-called split).
+| class | condition |
+|-------|-----------|
+| `below_threshold` | `size_bp < --min-sv-bp` |
+| `called` | `size_bp ≥ --min-sv-bp` and a specific record's node is in the block |
+| `missed` | `size_bp ≥ --min-sv-bp` and no record covers it |
 
+`called` says a record covering this block was **emitted**. It does not say this haplotype was genotyped as carrying it — that is the carrier table, and the two genuinely differ: at ACOT bubble 7, 145 haplotypes have an above-threshold event attributed to a record and are genotyped `0` at every record of the bubble.
+
+### Why not classify from the alignment
+
+The residual used to be split by contiguous non-match run length in the reconstruction-vs-truth alignment: runs shorter than `--min-sv-bp` were called "variation that could not have been called", runs at or above it "callable-size events missed". That measures the edit path, not the event.
+
+A clean 60 bp deletion of ordinary non-repetitive sequence, aligned globally by edlib, comes back as **fourteen runs of 1–10 bases** — the co-optimal edit path distributes the gap over chance matches, and every distribution costs the same 60 edits. Consequently `over_threshold_bp` read **0 at all six reference loci**: the bucket meant to hold missed callable-size events was structurally empty, and so was the carrier truth flag built on it. The columns survive as `resid_run_lt_bp` / `resid_run_ge_bp`, describing the residual's shape and nothing more.
+
+## Three reconstructions
+
+Each walks the reference and substitutes the haplotype's own steps at the blocks its rule accepts.
+
+| level | substitutes a block when |
+|-------|--------------------------|
+| `graph` | any of its nodes is in the **union** of called nodes at that bubble |
+| `called` | it is attributed to a **specific** record and `size_bp ≥ --min-sv-bp` |
+| `genotype` | not block-based at all — see below |
+
+`graph` is the optimistic upper bound and is what every QV figure previously quoted for this project measured. Sharing a node with some call is not matching one, so a called deletion containing a shared reference node can authorise copying a different, uncalled allele; and no genotype is read, so a call placed on entirely the wrong haplotypes still scores perfectly. `called` is the strict version: the reference with exactly the retained calls implanted and nothing else.
+
+Each reconstruction is globally aligned (Needleman–Wunsch, edlib) to the truth, giving `δ` and `S`. Identity is `1 − Σδ/ΣS` length-weighted over a haplotype's bubbles; `QV = -10·log10(max(0.5, δ)/S)` with ceiling `QV_max = 10·log10(2S)` and `qv_ratio = QV/QV_max` are emitted for comparability.
 
 ## Worked trace
 
-A locus with two bubbles, each 5 nodes of 10 bp; the reference spells nodes `1,2,3,4,5` then `6,7,8,9,10`. Take one haplotype H:
+Two bubbles, each 5 nodes of 10 bp; the reference spells `1,2,3,4,5` then `6,7,8,9,10`. Haplotype H:
 
-| bubble | reference walk | H's true walk |  call at this bubble |
-|--------|----------------|---------------|-------------------------|
+| bubble | reference walk | H's true walk | call at this bubble |
+|--------|----------------|---------------|---------------------|
 | A | `1,2,3,4,5` | `1,3,4,5` (node 2 deleted) | DEL of node 2 (node 2 ∈ `variant_nodes`) |
-| B | `6,7,8,9,10` | `6,7,8′,9,10` (node 8′is a SNP) | none (8′ ∉ `variant_nodes`) |
+| B | `6,7,8,9,10` | `6,7,8′,9,10` (8′ is a SNP) | none (8′ ∉ `variant_nodes`) |
 
-**Bubble A** — anchors `1,3,4,5`. The one divergent block is between anchors `1` and `3`: reference side `[2]`, haplotype side `[]`. Node 2 is in `variant_nodes`, so it is a called block and is dropped. Reconstruction `1,3,4,5` = truth `1,3,4,5`. δ=0, S=40.
+**Bubble A** — anchors `1,3,4,5`. One divergent block between anchors `1` and `3`: reference side `[2]` (10 bp), haplotype side `[]` (0 bp). Size `max(10,0) = 10`. At `--min-sv-bp 50` that is `below_threshold`; at `--min-sv-bp 5` it is `called`, since node 2 is a record's node. Both reconstructions that accept it drop node 2, giving `1,3,4,5` = truth. δ=0, S=40.
 
-**Bubble B** — anchors `6,7,9,10`. The divergent block between anchors `7` and `9`: reference side `[8]`, haplotype side `[8′]`. Neither node is in `variant_nodes` (we did not call the SNP), so it is not a called block. Keep the reference side `[8]`. Reconstruction `6,7,8,9,10` (reference) vs truth `6,7,8′,9,10`: they differ only at node 8/8′, therefore δ=1, S=50. 
+**Bubble B** — anchors `6,7,9,10`. Block between `7` and `9`: reference `[8]`, haplotype `[8′]`, both 10 bp, size 10, attributed to no record. `below_threshold` at 50 bp, `missed` at 5 bp. Neither reconstruction substitutes it, so the reconstruction is the reference `6,7,8,9,10` against truth `6,7,8′,9,10`: δ=1 (one substituted base — the nodes differ by a SNP), S=50.
 
-Then aggregate: `Σδ = 1`, `ΣS = 90`. identity `= 1 − 1/90 = 0.989` — H reconstructs at ~98.9%, the one uncalled SNP all that separates it from perfect. That 1 bp is a SNP below `--min-sv-bp`, so it is `sub_threshold` with zero `over_threshold`: the anatomy reads 98.9% Reconstructed / 1.1% Not-callable / 0% Mis-called. (Comparability: `QV = -10·log10(1/90) = 19.5`, `QV_max = 10·log10(180) = 22.6`, `qv_ratio = 0.87` — the raw QV looks middling only because the region is short.)
+Aggregate: `Σδ = 1`, `ΣS = 90`, identity `= 1 − 1/90 = 0.989`. The ledger says: at 50 bp, two below-threshold events and nothing missed; at 5 bp, one called and one missed. The identity is the same number in both cases — which is the point of keeping the two apart.
 
 ## The `genotype` level
 
-`graph` splices in **the haplotype's own steps** wherever a call explains the divergence. That is deliberate — it isolates "can the graph hold this haplotype, and did the caller find the divergent blocks" from any question of who carries what. But it also means no genotype is ever read, so the level is structurally incapable of being wrong about assignment: a call placed on entirely the wrong haplotypes still scores perfectly. It is an upper bound.
+With `--vcf`, a reconstruction that uses **only what the VCF says about this haplotype**, in sequence space, which is what a downstream consumer actually has.
 
-With `--vcf`, a second reconstruction uses **only what the VCF says about this haplotype**, in sequence space, which is what a downstream consumer actually has.
+**Join samples to haplotypes.** Each VCF sample column is one haplotype path, matched by exact name; genotypes are haploid and nothing is phased or imputed. Duplicate sample columns are refused — which haplotype a genotype belongs to would otherwise depend on column order. A partial join is accepted and reported prominently, with both directions counted, because a QV over a subset is not the QV of the run.
 
-### 1. Join samples to haplotypes
+**Place each bubble on the reference.** VCF `POS` lives in the reference path's own forward coordinates, so the bubble's reference span is taken as a substring there rather than from its canonical walk. A bubble the reference crosses `sink → source` has its reconstruction reverse-complemented before scoring, so it meets the canonical truth in the same orientation.
 
-Each VCF sample column is one haplotype path, matched to the graph by exact name, so genotypes are haploid and nothing is phased or imputed.
+**Apply the genotyped edits, right to left** — descending `POS`, so earlier edits do not shift later coordinates. `POS` is the anchor base and the event occupies `POS+1` onwards.
 
-### 2. Place each bubble on the reference
+| type | reconstruction | exact? |
+|------|----------------|--------|
+| explicit `ALT` | replace the record's `REF` span with the allele the `GT` names | yes |
+| `DEL` | erase `\|SVLEN\|` bases after the anchor | yes |
+| `INS` | insert `INSSEQ` after the anchor | yes |
+| `INV` | reverse-complement `POS+1..END` in place | yes — an inversion carries no new sequence, so the reference supplies all of it |
+| `DUP` | tile an inferred reference span to the per-sample `CNBP` delta, or lay down `CN` copies of `RU_LEN` in place of `REF_CN` under `--dup-model cn` | **no** — counted `heuristic`. `CNBP` supplies the length change, not the inserted sequence, so what is reconstructed is the right length of approximately right sequence |
 
-VCF `POS` lives in the reference path's own forward coordinates, so the bubble's reference span is taken as a substring there rather than from its canonical `source → sink` walk. A bubble the reference crosses `sink → source` has its reconstruction reverse-complemented before scoring, so it meets the canonical truth in the same orientation.
+Records that cannot be laid down are counted rather than dropped — `unplaceable` (`POS` outside the bubble's span), `clamped` (the edit ran past the span end), `unhandled` (no rule, or no usable payload), `ref_mismatch` (the record's `REF` is not the reference sequence at `POS`, so the placement is wrong and every score downstream would be fiction) — and reported in `gt_records`.
 
-### 3. Apply the genotyped edits, right to left
-
-For each record at the bubble with `GT ≥ 1`, applied in descending `POS` so earlier edits do not shift later coordinates. `POS` is the anchor base and the event occupies `POS+1` onwards:
-
-| type | reconstruction |
-|------|----------------|
-| `DEL` | erase `\|SVLEN\|` bases after the anchor |
-| `INS` | insert `INSSEQ` after the anchor |
-| `DUP` | a copy-number record: adjust the span by the sample's own `CNBP`, repeating the span when it grows |
-
-Records that cannot be laid down are counted rather than silently dropped — `unplaceable` (`POS` outside the bubble's reference span), `clamped` (the edit ran past the span end), `unhandled` (no rule for the type, or the record carries no usable payload) — and reported in `gt_records`, so a genotype QV is never read without knowing what produced it.
-
-### 4. Score against the same truth, and against doing nothing
-
-The result is aligned to the haplotype's true walk exactly as in step 3 of the `graph` level. A third reconstruction — the plain reference span with no edits — is scored alongside as the **baseline**, giving
+**Score against the same truth, and against doing nothing.** The plain reference span with no edits is scored alongside as the **baseline**:
 
 ```
-gap_closed = (baseline_delta - genotype_delta) / (baseline_delta - graph_delta)
+gap_closed          = (baseline_delta - genotype_delta) / (baseline_delta - graph_delta)
+variation_recovered = (baseline_delta - <level>_delta)  /  baseline_delta
 ```
 
-the fraction of the available distance the VCF actually closes, with `worse_than_baseline` counting haplotypes the genotypes actively harm.
+`gap_closed` measures against the achievable bound, `variation_recovered` against all the variation there was; reported for all three levels, the pair says whether representation or the graph is the limit. **`gap_closed` is `NA` when `baseline_delta == graph_delta`.** Those are equal exactly when nothing was called at the bubble, so the old convention of returning `1.0` on a zero denominator reported a total miss as having closed 100% of the gap.
 
-The baseline is also the correctness check on the whole projection: a haplotype genotyped as carrying nothing at a bubble applies no edits, so its genotype reconstruction must be **byte-identical** to the baseline. Any coordinate, orientation or span error breaks that equality, and it is asserted on real data rather than assumed.
+The baseline is also the correctness check on the whole projection: a haplotype genotyped as carrying nothing applies no edits, so its genotype reconstruction must be byte-identical to the baseline. Any coordinate, orientation or span error breaks that equality, and it is asserted on real data rather than assumed.
 
-### 5. Carrier confusion
-
-Separately from sequence, each (haplotype, bubble) contributes to a TP/FP/FN/TN table: called carrier is `GT ≥ 1` on any record at the bubble; true carrier is whether the baseline-versus-truth alignment leaves a residual block of at least `--min-sv-bp`. The size threshold matters — plain walk inequality would score a single uncalled SNP as a missed carrier, which is not something the caller set out to emit — and it also means precision and recall here move with `--min-sv-bp` and should be read against it.
+**Carrier confusion.** Each (haplotype, bubble) contributes to a TP/FP/FN/TN table: called carrier is `GT ≥ 1` on any record at the bubble; true carrier is whether the ledger holds an event of at least `--min-sv-bp` there. Truth therefore comes from the walks, not from an alignment. Reported for `ALL` only — a bubble-level judgement has no single SV type, and fanning it out over every type in the bubble counted one observation several times; the per-type partition is the ledger, where each event maps to at most one record.
