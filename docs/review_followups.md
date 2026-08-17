@@ -44,16 +44,26 @@ as history; Git already provides that history.
 
 ### Retained-site disjointness
 
-- **Resolve overlapping retained snarls before assigning final bubble IDs.** On ANKRD36C, `bubble`
-  emits one snarl whose interior contains the interiors of all ten other retained snarls; Panphorte then
-  sees the same 5,616 bp repeat array at two scales and correctly refuses the CSV rather than rewriting
-  overlapping spans. Apply a deterministic conflict-resolution pass after filtering/merging. The chosen
-  project policy is to retain the enclosing/larger snarl and drop the overlapping smaller snarls; report
-  the dropped candidates and their conflict so the loss of finer site resolution is visible. Add a
-  synthetic nested-snarl fixture plus an ANKRD36C regression asserting pairwise-disjoint emitted
-  interiors and successful Panphorte preflight. Because the larger site can combine otherwise distinct
-  subevents, also compare its downstream `call` records with the current smaller-site calls before
-  treating this policy as biologically neutral.
+- **DONE, with the policy reversed on measurement.** `bubble` now runs a deterministic conflict pass
+  before assigning IDs, so the emitted interiors are pairwise disjoint and Panphorte's preflight passes.
+  ANKRD36C previously failed the pipeline outright at `panphorte: bubbles 1 and 2 both claim interior
+  node 7467`.
+
+  The recorded policy was to retain the enclosing snarl and drop the smaller ones. The comparison this
+  entry asked for was run, and it does not support that:
+
+  | retained | sites | `call` records | reconstruction gap closed | worse than baseline |
+  |---|---|---|---|---|
+  | enclosing | 1 | 21 | 3.98% | 279 |
+  | **smaller** | **10** | **21** | **89.54%** | **245** |
+
+  Same record count either way; one large site simply describes a haplotype far worse than ten
+  well-localised ones. The allele VCF is lossless under both (0 bp residual), so this affects only the
+  interpreted output. `smaller` is now the behaviour. Only ANKRD36C is affected — the other five loci
+  emit no overlapping sites and are byte-identical.
+
+  Still owed: a synthetic nested-snarl fixture, and an ANKRD36C regression asserting pairwise-disjoint
+  interiors plus a successful Panphorte preflight.
 
 ### Bounded traversal limitations
 

@@ -1079,6 +1079,47 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
         (void)before;
     }
 
+    // Overlapping retained sites: two bubbles claiming the same interior node describe the same
+    // sequence twice. Downstream that is not a nuisance but a hard stop -- panphorte refuses to fold
+    // both, because rewriting one span inside the other would corrupt the enclosing one, so a locus
+    // with an overlap cannot be processed at all (ANKRD36C fails there today).
+    //
+    // Project policy is to keep the ENCLOSING site and drop the smaller ones it contains, so the
+    // conflict resolves toward more sequence rather than less. Reported, because dropping a site
+    // loses finer resolution and that should be visible rather than silent.
+    if (bubbles.size() > 1) {
+        std::sort(bubbles.begin(), bubbles.end(), [](const Bubble& a, const Bubble& b) {
+            if (a.inside.size() != b.inside.size()) return a.inside.size() < b.inside.size();  // EXPERIMENT: prefer smaller
+            return bubble_endpoint_less(a, b);   // deterministic among equals
+        });
+        std::unordered_set<std::string> claimed;
+        std::vector<Bubble> kept;
+        std::size_t dropped = 0;
+        for (Bubble& b : bubbles) {
+            const std::string* clash = nullptr;
+            for (const std::string& n : b.inside) {
+                if (claimed.count(n)) { clash = &n; break; }
+            }
+            if (clash != nullptr) {
+                ++dropped;
+                if (!options.quiet) {
+                    std::cerr << "[bubble] dropped site " << b.source << ".." << b.sink << " ("
+                              << b.inside.size() << " interior node(s)): its interior node " << *clash
+                              << " is already claimed by a smaller retained site\n";
+                }
+                continue;
+            }
+            for (const std::string& n : b.inside) claimed.insert(n);
+            kept.push_back(std::move(b));
+        }
+        if (dropped > 0 && !options.quiet) {
+            std::cerr << "[bubble] " << dropped << " overlapping site(s) dropped so the emitted set is "
+                         "pairwise disjoint; the smaller sites are retained, which keeps the finer "
+                         "resolution an enclosing site would have combined\n";
+        }
+        bubbles = std::move(kept);
+    }
+
     std::sort(bubbles.begin(), bubbles.end(), bubble_endpoint_less);
     assign_ids(bubbles);
 
