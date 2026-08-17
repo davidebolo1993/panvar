@@ -161,13 +161,24 @@ as history; Git already provides that history.
   That is a discovery *ceiling*, not a proof of correct discovery — `called` means a record shares at
   least one node with the block, not that it covers or represents it. The firm half of the result is
   the negative: had a record been absent entirely, the event would have shown as `missed`.
-- **Where the loss lives is representation.** `variation_recovered` is 95.4–99.9% when the haplotype's
-  true block is substituted at every record-attributed above-threshold event, against 39.2–96.9% when
-  the same records are read back out of the region VCF. CYP2D6 is the extreme (95.4% against 39.2%).
-  The first figure is a ceiling on those records, not sequence they reconstruct.
+- **Where the loss lives is representation.** The genotype residual is partitioned exactly, over one
+  common observation set, into five consecutive steps. Across the six loci: `discovery_or_attribution`
+  is **0 bp everywhere** (the retained calls restore exactly as much as a perfect in-scope caller
+  would), `carrier_missed` is 0 at four loci and at most 15.6 kb, `false_positive_damage` is small and
+  sometimes negative, and `representation` runs 43 kb to 8.57 Mb. Out-of-scope sub-threshold variation
+  is 13–78 kb and is reported separately, since `call` was never asked to emit it.
+
+  Three accounting faults were found in the first version of that partition and are fixed: comparative
+  totals were taken over different populations (a partial VCF join put `carrier` ABOVE `called` and
+  produced a loss of minus 20 bp); false-positive carrier damage was charged to representation; and
+  below-threshold variation was charged to discovery. Each has a fixture.
 
 ### Accepted limitations
 
+- **The reconstruction substitutes the whole divergent block, not the record's own interval.** A
+  single overlapping node authorises the entire maximal block between shared anchors, so `called` and
+  `carrier` do not prove the record delimits that sequence. Restricting the substitution to the
+  record's `START_NODE`..`END_NODE` span would tighten both.
 - **`called` means a record's node lies in the block, not that the record covers or reproduces it.**
   That is stronger than the previous bubble-wide node union but still weaker than comparing the
   record's reconstructed effect against the block's sequence. The `called` reconstruction inherits the
@@ -178,8 +189,10 @@ as history; Git already provides that history.
   filter, a tangle guard or a resource limit is indistinguishable from one never found. Separating them
   needs a decision audit emitted by `call` — every raw truth-side event with its decision and reason —
   which is a `call` capability, not benchmark's.
-- **No `false_or_misrepresented_call` class.** An emitted call with no compatible truth event shows up
-  only as a carrier-table FP, at bubble rather than record granularity.
+- **`false_positive_damage` is bubble-grained.** An emitted call with no compatible truth event is
+  attributed per (haplotype, bubble): if the haplotype has any eligible truth event at that bubble the
+  observation counts as representation, even when a second record there is spurious. Record-level
+  attribution needs a per-record effect comparison, the same thing the `called` limitation above needs.
 - **DUP reconstruction is heuristic and labelled so.** Both `--dup-model` branches tile an inferred
   reference span, so the length is right and the sequence only approximately; the count is reported as
   `gt_records/heuristic`. **Measured cost at CYP2D6: genotype `variation_recovered` is 86.1% without

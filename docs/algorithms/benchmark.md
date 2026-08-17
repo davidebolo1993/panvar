@@ -53,7 +53,15 @@ Each walks the reference and substitutes the haplotype's own steps at the blocks
 
 `carrier` adds the one thing `called` ignores: whether the VCF says this haplotype carries anything there. `variant_nodes.tsv` has no haplotype column — one row per record, holding the union of nodes over every merged event and every carrier — so carrier status is only knowable from the VCF, joined by record id (`call` writes the same id in both files). The block is substituted when **any** overlapping record has `GT ≥ 1`: one divergent region can be described by several records and different carriers take different ones, so testing only the primary attribution would be testing which record sorted first, not whether the haplotype was called.
 
-The four form a chain of upper bounds, `graph ≥ called ≥ carrier ≥ genotype`. `carrier` substitutes a subset of the blocks `called` does, and the same true blocks, so it cannot exceed it — `scripts/validate_benchmark_threshold.py` asserts that. Consecutive differences isolate one failure each, emitted as the `loss_bp` partition: `discovery_or_attribution`, `carrier_assignment` (the only pair that differs in *which haplotypes*), `representation` (the only pair that differs in *where the sequence comes from*).
+A fifth reconstruction, the **in-scope floor**, substitutes every block reaching `--min-sv-bp` regardless of any call. Its residual is purely sub-threshold variation, so it is the point the others are measured from: without it, sequence `call` was never asked to emit is charged to the caller as a discovery failure. On the standard fixture — two callable 60 bp events, one deliberate 20 bp one, zero missed — `discovery_or_attribution` read 20 bp until the floor was introduced.
+
+The five form a chain, `truth → in-scope floor → called → carrier → genotype`, and the consecutive differences are the `loss_bp` partition. They **sum exactly** to the genotype residual, which the run asserts (`sum_check`): an attribution whose arithmetic has stopped closing is worthless, and the check caught two of my own errors.
+
+Two rules make the partition mean what it says:
+
+**One population.** Every comparative total is over the common set — the `(haplotype, bubble)` observations *all* levels could score. `graph`/`called` cover every graph haplotype, `carrier` only VCF-joined ones, `genotype` only those whose bubble also placed. Totalling each over its own population reported `carrier` **above** `called` and a negative loss when one haplotype was left out of the VCF.
+
+**A false positive is not a representation failure.** Where the haplotype has no eligible truth event and the VCF still edits it, `carrier` has no true block to substitute and leaves the reference alone while `genotype` applies the erroneous edit. That difference is `false_positive_damage`, split out per observation from `representation`. The two are signed, because `genotype` applies every record the haplotype carries while `carrier` only substitutes attributed eligible blocks — so a record can improve a region `carrier` left alone.
 
 Each reconstruction is globally aligned (Needleman–Wunsch, edlib) to the truth, giving `δ` and `S`. Identity is `1 − Σδ/ΣS` length-weighted over a haplotype's bubbles; `QV = -10·log10(max(0.5, δ)/S)` with ceiling `QV_max = 10·log10(2S)` and `qv_ratio = QV/QV_max` are emitted for comparability.
 

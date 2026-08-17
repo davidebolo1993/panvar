@@ -29,15 +29,23 @@ Event size is a property of the two walks. It does not move with the alignment, 
 
 `graph` is deliberately optimistic and is not a genotyping score: sharing a node with some call is not the same as matching one, so a called block can authorise copying a neighbouring uncalled allele, and no genotype is read at all. `called` narrows that to per-record attribution and the size threshold, but it still splices in the haplotype's **true** block rather than the record's `REF`/`ALT` effect — so it too is a ceiling, just a much tighter one. Only `genotype` reconstructs what the records actually say.
 
-Read them as a chain of upper bounds, `graph ≥ called ≥ carrier ≥ genotype`, which separates three distinct failures. `called` and `carrier` implant the **same true blocks** and differ only in whether the haplotype was genotyped as a carrier, so the step between them isolates assignment; `carrier` and `genotype` cover the **same records on the same haplotypes** and differ only in whether the block comes from the walk or from the VCF's `REF`/`ALT`/`INSSEQ`/`CN`, so the step between them isolates encoding. That is emitted directly as a `loss_bp` partition rather than left as three ratios to subtract:
+Read them as a chain of upper bounds, `graph ≥ called ≥ carrier ≥ genotype`, which separates the failures. `called` and `carrier` implant the **same true blocks** and differ only in whether the haplotype was genotyped as a carrier; `carrier` and `genotype` cover the **same records on the same haplotypes** and differ only in whether the block comes from the walk or from the VCF's encoding.
+
+That is emitted as a `loss_bp` partition of the genotype residual — five consecutive steps from truth down to the reconstruction, which **sum exactly** to it (`sum_check`, asserted, because an attribution built on arithmetic that has stopped closing is worthless):
 
 | term | bases lost to |
 |------|---------------|
-| `discovery_or_attribution` | variation not found, or found but attributed to no record |
-| `carrier_assignment` | records assigned to the wrong haplotypes, and genotyping false negatives |
-| `representation` | right records, right carriers — what the VCF's encoding of them fails to reproduce |
+| `out_of_scope` | truth events **below** `--min-sv-bp`. `call` was never asked to emit these, so they are not a caller failure |
+| `discovery_or_attribution` | eligible truth events no retained record covers |
+| `carrier_missed` | covered by a record, but this haplotype is not genotyped as carrying it — a false negative |
+| `representation` | right record, right carrier: what the VCF's encoding of it fails to reproduce |
+| `false_positive_damage` | the VCF edits a haplotype that has no eligible truth event there |
 
-Measured on the six reference loci, this is lopsided: discovery costs 13–78 kb, assignment costs 0 bp at four loci and at most 15.6 kb, and representation costs 44 kb to 8.56 Mb. The caller finds the variation and puts it on the right haplotypes; the VCF's encoding of it is where the sequence is lost.
+**Every comparative figure is computed over the common set** — the `(haplotype, bubble)` observations *all* levels could score, reported as `common_set/observations`. `graph` and `called` cover every graph haplotype, `carrier` only those joined to a VCF column, and `genotype` only those whose bubble could also be placed; totalling each over its own population and subtracting compares different denominators. With one haplotype left out of the VCF that produced `carrier_walk` 100% sitting *above* `called` 83.3%, and a carrier loss of **minus** 20 bp.
+
+The last two terms are **signed**. `carrier` only substitutes blocks that are eligible *and* attributed, while `genotype` applies every record the haplotype carries, so a record can improve a region `carrier` left alone. A negative term means the VCF beat the walk-based ceiling there; clamping it to zero broke the partition on four of six loci.
+
+Measured on the six reference loci, this is lopsided: out-of-scope 13–78 kb, discovery **0 bp everywhere**, missed carriers 0 at four loci and at most 15.6 kb, false-positive damage small (and negative at C4), and representation 43 kb to 2.7 Mb. The caller finds the eligible variation and puts it on the right haplotypes; the VCF's encoding of it is where the sequence is lost.
 
 A carrier at a block is judged against **every** record overlapping it, not only the one the ledger attributes it to. One divergent region can be described by several records and different carriers take different ones, so asking about the single attributed record would really be asking whether the haplotype carries whichever record sorted first.
 

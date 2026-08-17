@@ -53,6 +53,12 @@ def summary(path):
     return out
 
 
+def summary_ok(s):
+    """The loss partition carries its own arithmetic check; a MISMATCH means the five terms stopped
+    summing to the genotype residual and no attribution below is trustworthy."""
+    return s.get(("loss_bp", "ALL", "sum_check"), (0, ""))[1]
+
+
 def num(v, default=0.0):
     try:
         return float(v)
@@ -134,7 +140,10 @@ def main():
             "vc": num(s.get(("variation_recovered", "ALL", "called"), (0, "nan"))[1], float("nan")),
             "vw": num(s.get(("variation_recovered", "ALL", "carrier_walk"), (0, "nan"))[1], float("nan")),
             "l_disc": int(num(s.get(("loss_bp", "ALL", "discovery_or_attribution"), (0, 0))[0])),
-            "l_asgn": int(num(s.get(("loss_bp", "ALL", "carrier_assignment"), (0, 0))[0])),
+            "l_oos": int(num(s.get(("loss_bp", "ALL", "out_of_scope"), (0, 0))[0])),
+            "l_miss": int(num(s.get(("loss_bp", "ALL", "carrier_missed"), (0, 0))[0])),
+            "l_fp": int(num(s.get(("loss_bp", "ALL", "false_positive_damage"), (0, 0))[0])),
+            "l_sum": summary_ok(s),
             "l_repr": int(num(s.get(("loss_bp", "ALL", "representation"), (0, 0))[0])),
             "av_delta": int(num(av.get(("gt_gap", "ALL", "genotype_delta"), (0, 0))[0])),
             "fp_path": pfx + ".bm.truth_events.tsv",
@@ -142,11 +151,11 @@ def main():
 
     print(f"{'T':>5} {'events':>7} {'called':>7} {'missed':>7} {'FN':>5} {'worse':>6} "
           f"{'%called':>8} {'%carrier':>9} {'%genotype':>10} | "
-          f"{'discovery':>10} {'assignment':>11} {'representation':>14}")
+          f"{'oos':>8} {'discovery':>10} {'missed':>8} {'repr':>12} {'fp':>8}")
     for r in rows:
         print(f"{r['t']:>5} {r['events']:>7} {r['called']:>7} {r['missed']:>7} {r['fn']:>5} {r['worse']:>6} "
               f"{r['vc']:>7.2f}% {r['vw']:>8.2f}% {r['vr']:>9.2f}% | "
-              f"{r['l_disc']:>10} {r['l_asgn']:>11} {r['l_repr']:>14}")
+              f"{r['l_oos']:>8} {r['l_disc']:>10} {r['l_miss']:>8} {r['l_repr']:>12} {r['l_fp']:>8}")
 
     fails = []
     notes = []
@@ -163,6 +172,9 @@ def main():
         if r["vw"] == r["vw"] and r["vc"] == r["vc"] and r["vw"] > r["vc"] + 0.01:
             fails.append(f"T={r['t']}: carrier_walk ({r['vw']:.2f}%) exceeds called ({r['vc']:.2f}%); "
                          f"it substitutes a SUBSET of the same true blocks and cannot beat it")
+        if r["l_sum"] != "exact":
+            fails.append(f"T={r['t']}: the loss partition does not sum to the genotype residual "
+                         f"({r['l_sum']}); no attribution from this run is trustworthy")
         if r["av_delta"] != 0:
             fails.append(f"T={r['t']}: the allele VCF left {r['av_delta']} bp unreconstructed; it is "
                          f"the serialization ceiling and must be exact")

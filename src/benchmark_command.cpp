@@ -658,6 +658,10 @@ struct BubbleObs {
     bool carrier_scored = false;
     std::size_t carrier_delta = 0;
     std::size_t carrier_aln_len = 0;
+    // Every block at or above the threshold restored, regardless of any call. What remains is purely
+    // variation the caller was never asked to emit, so it is the floor the other levels are measured
+    // from -- without it, sub-threshold sequence is charged to the caller as a discovery failure.
+    std::size_t scope_delta = 0;
     // Genotype-aware reconstruction over the same bubble against the same truth, plus the do-nothing
     // baseline (plain reference) it has to beat. A VCF that closes none of the gap between the baseline
     // and the graph bound is worth nothing here, and one that scores WORSE than the baseline is applying
@@ -1010,6 +1014,13 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                             c_applied);
             const NwAlign cnw = nw_edit_distance(spell_path_steps_sequence(graph, called_steps), truth);
 
+            bool s_applied = false;
+            const std::vector<PathStep> scope_steps =
+                reconstruct(rit->second, *steps, anchors, blocks,
+                            [&](const TruthBlock& blk) { return blk.size_bp >= min_sv_bp; }, s_applied);
+            o.scope_delta =
+                nw_edit_distance(spell_path_steps_sequence(graph, scope_steps), truth).edits;
+
             // carrier_walk: the same substitution, additionally requiring that THIS haplotype's GT
             // names the record. It uses the haplotype's true graph steps, exactly as `called` does, so
             // the only difference between them is whether the carrier was correctly identified. Needs
@@ -1242,6 +1253,21 @@ int run_benchmark_command(const std::vector<std::string>& args) {
     // threshold). Reported for ALL only -- a bubble judgement has no single svtype, and fanning it out
     // over every svtype the bubble contains reported one observation as several.
     std::array<std::size_t, 4> carrier{{0, 0, 0, 0}};   // {TP, FP, FN, TN}
+    // THE COMMON SET. Every comparative number is accumulated only over (haplotype, bubble)
+    // observations that ALL levels could score -- i.e. those the genotype level reached. `called` and
+    // `graph` cover every graph haplotype, `carrier` only those joined to a VCF column, `genotype`
+    // only those whose bubble could also be placed on the reference. Totalling them over their own
+    // populations and then subtracting compares different denominators: with one haplotype left out
+    // of the VCF the fixture reported carrier_walk 100% ABOVE called 83.3%, and a carrier-assignment
+    // loss of MINUS 20 bp.
+    std::size_t cs_obs = 0, cs_base = 0, cs_graph = 0, cs_called = 0, cs_carrier = 0,
+                cs_scope = 0, cs_gt = 0;
+    // SIGNED. The genotype level applies every record the haplotype carries, while carrier_walk only
+    // substitutes blocks that are eligible AND attributed, so a record can improve a region
+    // carrier_walk left alone and the step comes out negative there. Clamping those to zero silently
+    // broke the partition on four of six loci; a negative term is a real finding (the VCF beat the
+    // walk-based ceiling locally) and is shown rather than hidden.
+    long long cs_repr = 0, cs_fp = 0;
     // The event ledger by svtype IS a partition: each event maps to at most one record.
     std::map<std::string, std::array<std::size_t, 3>> ledger_by_type;  // svtype -> {called, missed, below}
     {
@@ -1277,6 +1303,23 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                            << (o.gt_called_carrier ? 1 : 0) << '\t' << (o.gt_true_carrier ? 1 : 0);
                     ++carrier[o.gt_called_carrier ? (o.gt_true_carrier ? 0 : 1)
                                                   : (o.gt_true_carrier ? 2 : 3)];
+                    ++cs_obs;
+                    cs_base += o.ref_delta;
+                    cs_graph += o.delta;
+                    cs_called += o.called_delta;
+                    cs_carrier += o.carrier_scored ? o.carrier_delta : o.called_delta;
+                    cs_scope += o.scope_delta;
+                    cs_gt += o.gt_delta;
+                    // The step from carrier to genotype is not one thing. Where this haplotype has an
+                    // eligible truth block, it is the encoding of a correctly assigned record. Where it
+                    // has none and the VCF still edits it, the damage is the false-positive assignment
+                    // itself -- carrier_walk has no true block to substitute, so it leaves the
+                    // reference alone while the genotype level applies the erroneous edit.
+                    const long long step = static_cast<long long>(o.gt_delta) -
+                                           static_cast<long long>(o.carrier_scored ? o.carrier_delta
+                                                                                   : o.called_delta);
+                    if (o.gt_called_carrier && !o.gt_true_carrier) cs_fp += step;
+                    else cs_repr += step;
                 } else {
                     qv_out << "\t.\t.\t.\t.\t.\t" << (o.gt_true_carrier ? 1 : 0);
                 }
@@ -1405,40 +1448,39 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                 // against the ACHIEVABLE bound (the graph), this against ALL of it -- so a locus whose
                 // graph cannot hold the haplotype scores low here and high there, and the pair says
                 // which of the two is the limit. Undefined when there is no variation to recover.
-                const double base = static_cast<double>(gt_tot_ref_delta);
-                sum << "variation_recovered\tALL\tgenotype\t0\t";
-                if (base > 0.0) sum << 100.0 * (base - static_cast<double>(gt_tot_gt_delta)) / base << '\n';
-                else sum << "NA\n";
-                sum << "variation_recovered\tALL\tcalled\t0\t";
-                if (base > 0.0) sum << 100.0 * (base - static_cast<double>(tot_called_delta)) / base << '\n';
-                else sum << "NA\n";
-                sum << "variation_recovered\tALL\tgraph\t0\t";
-                if (base > 0.0) sum << 100.0 * (base - static_cast<double>(gt_tot_graph_delta)) / base << '\n';
-                else sum << "NA\n";
-                sum << "variation_recovered\tALL\tcarrier_walk\t0\t";
-                if (base > 0.0 && carrier_scored_haps)
-                    sum << 100.0 * (base - static_cast<double>(tot_carrier_delta)) / base << '\n';
-                else sum << "NA\n";
-                // Where the reconstructed bases are lost, as a partition rather than as three ratios a
-                // reader has to subtract. Each term is bases, on the same scale as baseline_delta.
-                //   discovery      the reference is not improved even by implanting every retained
-                //                  call's own block -- the variation was not found or not attributed
-                //   assignment     `called` and `carrier_walk` implant the SAME true blocks, so their
-                //                  difference is entirely which haplotypes the calls were given to
-                //   representation the carriers are right and the blocks are right, so what remains is
-                //                  what the VCF's encoding of those calls fails to reproduce
-                if (carrier_scored_haps) {
-                    const long long disc = static_cast<long long>(tot_called_delta);
-                    const long long asgn = static_cast<long long>(tot_carrier_delta) -
-                                           static_cast<long long>(tot_called_delta);
-                    const long long repr = static_cast<long long>(gt_tot_gt_delta) -
-                                           static_cast<long long>(tot_carrier_delta);
+                // Every comparative figure below is over the COMMON SET (see cs_* above), so the
+                // levels are ratios of the same observations. The all-panel graph/called totals stay
+                // available as `called_recon` and `gt_gap`, but they do not enter these.
+                const double base = static_cast<double>(cs_base);
+                auto vr = [&](const char* name, std::size_t d) {
+                    sum << "variation_recovered\tALL\t" << name << "\t0\t";
+                    if (cs_obs && base > 0.0) sum << 100.0 * (base - static_cast<double>(d)) / base << '\n';
+                    else sum << "NA\n";
+                };
+                vr("graph", cs_graph);
+                vr("called", cs_called);
+                vr("carrier_walk", cs_carrier);
+                vr("genotype", cs_gt);
+                vr("in_scope_floor", cs_scope);
+                sum << "common_set\tALL\tobservations\t" << cs_obs << "\t0\n";
+                sum << "common_set\tALL\tbaseline_delta\t" << cs_base << "\t0\n";
+                sum << "common_set\tALL\tgenotype_delta\t" << cs_gt << "\t0\n";
+                // An exact partition of the genotype residual over the common set. The five terms sum
+                // to cs_gt by construction, each being one consecutive step of
+                //   truth -> in-scope floor -> called -> carrier -> genotype.
+                if (cs_obs) {
+                    const long long oos  = static_cast<long long>(cs_scope);
+                    const long long disc = static_cast<long long>(cs_called) - static_cast<long long>(cs_scope);
+                    const long long miss = static_cast<long long>(cs_carrier) - static_cast<long long>(cs_called);
+                    sum << "loss_bp\tALL\tout_of_scope\t" << oos << "\t0\n";
                     sum << "loss_bp\tALL\tdiscovery_or_attribution\t" << disc << "\t0\n";
-                    sum << "loss_bp\tALL\tcarrier_assignment\t" << asgn << "\t0\n";
-                    sum << "loss_bp\tALL\trepresentation\t" << repr << "\t0\n";
+                    sum << "loss_bp\tALL\tcarrier_missed\t" << miss << "\t0\n";
+                    sum << "loss_bp\tALL\trepresentation\t" << cs_repr << "\t0\n";
+                    sum << "loss_bp\tALL\tfalse_positive_damage\t" << cs_fp << "\t0\n";
+                    const long long tot = oos + disc + miss + cs_repr + cs_fp;
+                    sum << "loss_bp\tALL\tsum_check\t" << tot << '\t'
+                        << (tot == static_cast<long long>(cs_gt) ? "exact" : "MISMATCH") << '\n';
                 }
-                sum << "gt_gap\tALL\tworse_than_baseline\t" << gt_worse_than_ref << "\t"
-                    << (gt_scored_haps ? 100.0 * static_cast<double>(gt_worse_than_ref) / static_cast<double>(gt_scored_haps) : 0.0) << "\n";
             }
             // What the genotype QV was actually computed from, so it is never read without that context.
             sum << "gt_records\tALL\tapplied\t" << tot_gt.applied << "\t0\n";

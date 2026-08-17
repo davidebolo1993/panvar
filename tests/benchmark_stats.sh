@@ -107,9 +107,20 @@ ordered=$(awk -v g="$vg" -v c="$vc" -v w="$vw" -v t="$vt" \
 check "graph >= called >= carrier >= genotype ($vg/$vc/$vw/$vt)" "$ordered" "yes"
 
 # On this fixture every carrier is genotyped correctly, so carrier_walk must EQUAL called and the
-# assignment term of the loss decomposition must be exactly zero.
+# missed-carrier term of the loss decomposition must be exactly zero.
 check "with correct genotypes, carrier_walk equals called" "$(awk -v a="$vc" -v b="$vw" 'BEGIN{print (a==b)?"eq":"ne"}')" "eq"
-check "and carrier-assignment loss is zero" "$(sumcol loss_bp "$AS" carrier_assignment)" "0"
+check "and missed-carrier loss is zero" "$(sumcol loss_bp "$AS" carrier_missed)" "0"
+
+# --- The partition is exact by construction: five consecutive steps from truth to the genotype
+# reconstruction. If it stops summing, every attribution built on it is meaningless, so it carries
+# its own arithmetic check.
+check "the loss partition sums to the genotype residual" "$(pctcol loss_bp "$AS" sum_check)" "exact"
+
+# --- The 20 bp deletion is BELOW the threshold: `call` was never asked to emit it, so it must not be
+# charged to discovery. It was, until the in-scope floor was added -- this fixture has zero missed
+# events and still reported 20 bp of "discovery_or_attribution".
+check "below-threshold variation is out of scope, not a discovery failure" \
+      "$(sumcol loss_bp "$AS" out_of_scope)/$(sumcol loss_bp "$AS" discovery_or_attribution)" "20/0"
 
 # --- and the negative control, without which the two levels could be identical for a trivial reason.
 # Strip every carrier: rewrite each sample's GT subfield to 0, leaving records, nodes and coordinates
@@ -128,11 +139,52 @@ check "stripping carriers leaves the called level untouched (discovery is unchan
 ncw=$(pctcol variation_recovered "$NS" carrier_walk)
 check "but carrier_walk collapses to the baseline" \
       "$(awk -v w="$ncw" 'BEGIN{print (w+0==0)?"zero":"nonzero: " w}')" "zero"
-check "and the whole loss moves into the carrier-assignment term" \
-      "$(awk -v a="$(sumcol loss_bp "$NS" carrier_assignment)" 'BEGIN{print (a+0>0)?"positive":"zero"}')" "positive"
+check "and the whole loss moves into the missed-carrier term" \
+      "$(awk -v a="$(sumcol loss_bp "$NS" carrier_missed)" 'BEGIN{print (a+0>0)?"positive":"zero"}')" "positive"
 check "with every true carrier now a false negative" \
       "$(awk -v tp="$(sumcol gt_carrier "$NS" TP)" -v fn="$(sumcol gt_carrier "$NS" FN)" \
           'BEGIN{print tp"/"fn}')" "0/2"
+
+# ---------------------------------------------------------------------------------------------
+# The three accounting faults the loss partition had when it was first written. Each is a case where
+# the arithmetic was defensible in isolation and wrong as an attribution.
+# ---------------------------------------------------------------------------------------------
+
+# (i) A FALSE POSITIVE is not a representation failure. Genotype a genuine non-carrier as carrying the
+# 60 bp deletion: carrier_walk has no true block to substitute so it leaves the reference alone, while
+# the genotype level applies the erroneous edit. That difference used to be charged to representation.
+awk -F'\t' 'BEGIN{OFS="\t"} /^#CHROM/{for(i=10;i<=NF;i++) if($i ~ /^hapsmall/) c=i; print; next}
+  /^#/{print;next}
+  {if($3 ~ /bubble1/ && c){n=split($c,p,":"); p[1]="1"; s=p[1]; for(j=2;j<=n;j++) s=s":"p[j]; $c=s} print}' \
+  "$OUT/ac.region.vcf" > "$OUT/fp.vcf"
+"$BIN" benchmark -i "$OUT/ab.sorted.gfa" -c "$OUT/ab.bubbles.csv" -r "$REF" \
+   --variant-nodes "$OUT/ac.variant_nodes.tsv" --vcf "$OUT/fp.vcf" -o "$OUT/FP" \
+   --no-truth-events -q >/dev/null 2>&1
+FS_="$OUT/FP.qv_summary.tsv"
+check "a false-positive carrier is counted as one" "$(sumcol gt_carrier "$FS_" FP)" "1"
+check "its damage is charged to false_positive_damage, not representation" \
+      "$(sumcol loss_bp "$FS_" false_positive_damage)/$(sumcol loss_bp "$FS_" representation)" "60/0"
+check "and the partition still sums exactly" "$(pctcol loss_bp "$FS_" sum_check)" "exact"
+
+# (ii) A PARTIAL JOIN must not compare levels over different populations. Drop one sample column: the
+# levels used to be totalled over their own denominators, which reported carrier_walk 100% ABOVE
+# called 83.3% and a missed-carrier loss of MINUS 20 bp.
+ncol=$(grep -v '^#' "$OUT/ac.region.vcf" | head -1 | awk -F'\t' '{print NF}')
+cut -f1-$((ncol-1)) "$OUT/ac.region.vcf" > "$OUT/partial.vcf"
+"$BIN" benchmark -i "$OUT/ab.sorted.gfa" -c "$OUT/ab.bubbles.csv" -r "$REF" \
+   --variant-nodes "$OUT/ac.variant_nodes.tsv" --vcf "$OUT/partial.vcf" -o "$OUT/PJ" \
+   --no-truth-events -q >/dev/null 2>&1
+PS_="$OUT/PJ.qv_summary.tsv"
+pc=$(pctcol variation_recovered "$PS_" called); pw=$(pctcol variation_recovered "$PS_" carrier_walk)
+check "under a partial join, carrier_walk still cannot exceed called" \
+      "$(awk -v c="$pc" -v w="$pw" 'BEGIN{print (w<=c+1e-9)?"ok":"carrier "w" > called "c}')" "ok"
+neg=0
+for t in out_of_scope discovery_or_attribution carrier_missed representation false_positive_damage; do
+  v=$(sumcol loss_bp "$PS_" "$t"); [ "$(awk -v x="$v" 'BEGIN{print (x+0<0)?1:0}')" = "1" ] && neg=1
+done
+check "and no loss term is negative" "$neg" "0"
+check "the common set is reported so the denominator is visible" \
+      "$(awk -v n="$(sumcol common_set "$PS_" observations)" 'BEGIN{print (n+0>0)?"reported":"absent"}')" "reported"
 
 # ---------------------------------------------------------------------------------------------
 # Fixture B: ONE bubble, one 60 bp deletion, and `call` run at a threshold that refuses to emit it.
