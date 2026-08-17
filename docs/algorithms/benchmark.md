@@ -2,7 +2,7 @@
 
 Mechanism for the `benchmark` module. For usage/flags see [modules/benchmark.md](../modules/benchmark.md); References in [references.md](../references.md).
 
-`benchmark` answers two separable questions about the caller's own output: **what was there to be found** (the truth event ledger) and **how much of the sequence comes back** (three reconstructions plus a do-nothing baseline). Everything is derived from one decomposition of the two walks, so the ledger and the reconstructions cannot disagree about what a divergent block is.
+`benchmark` answers two separable questions about the caller's own output: **what was there to be found** (the truth event ledger) and **how much of the sequence comes back** (four reconstructions plus a do-nothing baseline). Everything is derived from one decomposition of the two walks, so the ledger and the reconstructions cannot disagree about what a divergent block is.
 
 Every reference-traversed bubble is scored by default. A bubble the reference does not traverse has no baseline and is dropped — counted in the `excluded` scope, never silently.
 
@@ -44,11 +44,16 @@ Each walks the reference and substitutes the haplotype's own steps at the blocks
 |-------|--------------------------|
 | `graph` | any of its nodes is in the **union** of called nodes at that bubble |
 | `called` | it is attributed to a **specific** record and `size_bp ≥ --min-sv-bp` |
+| `carrier` | as `called`, and this haplotype's `GT` names **some** record overlapping the block |
 | `genotype` | not block-based at all — see below |
 
 `graph` is the optimistic upper bound and is what every QV figure previously quoted for this project measured. Sharing a node with some call is not matching one, so a called deletion containing a shared reference node can authorise copying a different, uncalled allele; and no genotype is read, so a call placed on entirely the wrong haplotypes still scores perfectly.
 
-`called` narrows that to per-record attribution plus the size threshold, but **both substitute the haplotype's true block, not the record's `REF`/`ALT` effect**. `called` is therefore the ceiling the retained records would reach if each reproduced its block exactly — not what they do reproduce. The three form a chain of upper bounds, `graph ≥ called ≥ genotype`, and only `genotype` reconstructs what the records actually say.
+`called` narrows that to per-record attribution plus the size threshold, but **both substitute the haplotype's true block, not the record's `REF`/`ALT` effect**. `called` is therefore the ceiling the retained records would reach if each reproduced its block exactly — not what they do reproduce.
+
+`carrier` adds the one thing `called` ignores: whether the VCF says this haplotype carries anything there. `variant_nodes.tsv` has no haplotype column — one row per record, holding the union of nodes over every merged event and every carrier — so carrier status is only knowable from the VCF, joined by record id (`call` writes the same id in both files). The block is substituted when **any** overlapping record has `GT ≥ 1`: one divergent region can be described by several records and different carriers take different ones, so testing only the primary attribution would be testing which record sorted first, not whether the haplotype was called.
+
+The four form a chain of upper bounds, `graph ≥ called ≥ carrier ≥ genotype`. `carrier` substitutes a subset of the blocks `called` does, and the same true blocks, so it cannot exceed it — `scripts/validate_benchmark_threshold.py` asserts that. Consecutive differences isolate one failure each, emitted as the `loss_bp` partition: `discovery_or_attribution`, `carrier_assignment` (the only pair that differs in *which haplotypes*), `representation` (the only pair that differs in *where the sequence comes from*).
 
 Each reconstruction is globally aligned (Needleman–Wunsch, edlib) to the truth, giving `δ` and `S`. Identity is `1 − Σδ/ΣS` length-weighted over a haplotype's bubbles; `QV = -10·log10(max(0.5, δ)/S)` with ceiling `QV_max = 10·log10(2S)` and `qv_ratio = QV/QV_max` are emitted for comparability.
 
@@ -94,7 +99,7 @@ gap_closed          = (baseline_delta - genotype_delta) / (baseline_delta - grap
 variation_recovered = (baseline_delta - <level>_delta)  /  baseline_delta
 ```
 
-`gap_closed` measures against the achievable bound, `variation_recovered` against all the variation there was; reported for all three levels, the pair says whether representation or the graph is the limit. **`gap_closed` is `NA` when `baseline_delta == graph_delta`.** Those are equal exactly when nothing was called at the bubble, so the old convention of returning `1.0` on a zero denominator reported a total miss as having closed 100% of the gap.
+`gap_closed` measures against the achievable bound, `variation_recovered` against all the variation there was; reported for every level, the pair says whether representation or the graph is the limit. **`gap_closed` is `NA` when `baseline_delta == graph_delta`.** Those are equal exactly when nothing was called at the bubble, so the old convention of returning `1.0` on a zero denominator reported a total miss as having closed 100% of the gap.
 
 The baseline is also the correctness check on the whole projection: a haplotype genotyped as carrying nothing applies no edits, so its genotype reconstruction must be byte-identical to the baseline. Any coordinate, orientation or span error breaks that equality, and it is asserted on real data rather than assumed.
 

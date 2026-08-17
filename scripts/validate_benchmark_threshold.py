@@ -131,15 +131,22 @@ def main():
             "unpl": int(num(s.get(("gt_records", "ALL", "unplaceable"), (0, 0))[0])),
             "clamp": int(num(s.get(("gt_records", "ALL", "clamped"), (0, 0))[0])),
             "vr": num(s.get(("variation_recovered", "ALL", "genotype"), (0, "nan"))[1], float("nan")),
+            "vc": num(s.get(("variation_recovered", "ALL", "called"), (0, "nan"))[1], float("nan")),
+            "vw": num(s.get(("variation_recovered", "ALL", "carrier_walk"), (0, "nan"))[1], float("nan")),
+            "l_disc": int(num(s.get(("loss_bp", "ALL", "discovery_or_attribution"), (0, 0))[0])),
+            "l_asgn": int(num(s.get(("loss_bp", "ALL", "carrier_assignment"), (0, 0))[0])),
+            "l_repr": int(num(s.get(("loss_bp", "ALL", "representation"), (0, 0))[0])),
             "av_delta": int(num(av.get(("gt_gap", "ALL", "genotype_delta"), (0, 0))[0])),
             "fp_path": pfx + ".bm.truth_events.tsv",
         })
 
-    print(f"{'T':>5} {'events':>8} {'called':>8} {'missed':>7} {'below':>8} "
-          f"{'TP':>6} {'FP':>6} {'FN':>5} {'worse':>6} {'var_rec':>8} {'allele':>7}")
+    print(f"{'T':>5} {'events':>7} {'called':>7} {'missed':>7} {'FN':>5} {'worse':>6} "
+          f"{'%called':>8} {'%carrier':>9} {'%genotype':>10} | "
+          f"{'discovery':>10} {'assignment':>11} {'representation':>14}")
     for r in rows:
-        print(f"{r['t']:>5} {r['events']:>8} {r['called']:>8} {r['missed']:>7} {r['below']:>8} "
-              f"{r['tp']:>6} {r['fp']:>6} {r['fn']:>5} {r['worse']:>6} {r['vr']:>7.2f}% {r['av_delta']:>7}")
+        print(f"{r['t']:>5} {r['events']:>7} {r['called']:>7} {r['missed']:>7} {r['fn']:>5} {r['worse']:>6} "
+              f"{r['vc']:>7.2f}% {r['vw']:>8.2f}% {r['vr']:>9.2f}% | "
+              f"{r['l_disc']:>10} {r['l_asgn']:>11} {r['l_repr']:>14}")
 
     fails = []
     notes = []
@@ -153,6 +160,9 @@ def main():
             fails.append(f"T={r['t']}: total truth events {r['events']} != {rows[0]['events']}")
         if r["called"] + r["missed"] + r["below"] != r["events"]:
             fails.append(f"T={r['t']}: called+missed+below != events (the classes must partition)")
+        if r["vw"] == r["vw"] and r["vc"] == r["vc"] and r["vw"] > r["vc"] + 0.01:
+            fails.append(f"T={r['t']}: carrier_walk ({r['vw']:.2f}%) exceeds called ({r['vc']:.2f}%); "
+                         f"it substitutes a SUBSET of the same true blocks and cannot beat it")
         if r["av_delta"] != 0:
             fails.append(f"T={r['t']}: the allele VCF left {r['av_delta']} bp unreconstructed; it is "
                          f"the serialization ceiling and must be exact")

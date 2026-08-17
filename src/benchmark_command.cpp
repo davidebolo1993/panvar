@@ -48,6 +48,10 @@ void print_benchmark_help() {
         << "            authorise copying a neighbouring uncalled allele. Read it as a discovery upper\n"
         << "            bound -- can the graph hold this haplotype, and did the caller flag the\n"
         << "            divergent blocks -- never as a genotyping score. No genotype is read.\n"
+        << "  carrier   `called` plus the requirement that THIS haplotype's GT names the record. It\n"
+        << "            implants the same true blocks, so `called` minus `carrier` is entirely loss to\n"
+        << "            wrong carrier assignment, and `carrier` minus `genotype` is what the VCF's\n"
+        << "            encoding of those same calls costs. Needs --vcf.\n"
         << "  called    The same substitution restricted to blocks a SPECIFIC record is attributed to\n"
         << "            AND that reach --min-sv-bp; nothing else of the haplotype's walk is copied. It\n"
         << "            still substitutes the haplotype's TRUE block, not the record's REF/ALT effect,\n"
@@ -543,7 +547,12 @@ struct TruthBlock {
     std::size_t ri0 = 0, ri1 = 0, hi0 = 0, hi1 = 0;
     std::size_t ref_bp = 0, hap_bp = 0;
     std::size_t size_bp = 0;   // max(ref_bp, hap_bp): call gates a linked DEL/INS pair on the larger arm
-    int rec = -1;              // index into the bubble's records; -1 when no emitted call covers it
+    int rec = -1;              // PRIMARY attribution: lowest variant id overlapping the block, so the
+                               // ledger stays a partition (one event, one svtype). -1 when none.
+    std::vector<int> recs_all; // EVERY overlapping record. A bubble can carry many records over one
+                               // divergent region and different carriers take different ones, so asking
+                               // whether a haplotype carries "the" record would really be asking whether
+                               // it carries whichever one the primary attribution happened to pick.
 };
 
 std::vector<TruthBlock> divergent_blocks(const Graph& graph,
@@ -567,13 +576,18 @@ std::vector<TruthBlock> divergent_blocks(const Graph& graph,
         b.ref_bp = node_bp(ref_steps, ri0, ri1);
         b.hap_bp = node_bp(hap_steps, hi0, hi1);
         b.size_bp = std::max(b.ref_bp, b.hap_bp);
-        // Attribute to the FIRST record (by variant id) whose nodes this block actually contains. A
-        // block that merely sits in the same bubble as a record is not attributed to it.
-        for (std::size_t ri = 0; ri < recs.size() && b.rec < 0; ++ri) {
-            for (std::size_t k = ri0; k < ri1 && b.rec < 0; ++k)
-                if (recs[ri].nodes.count(ref_steps[k].node_id)) b.rec = static_cast<int>(ri);
-            for (std::size_t k = hi0; k < hi1 && b.rec < 0; ++k)
-                if (recs[ri].nodes.count(hap_steps[k].node_id)) b.rec = static_cast<int>(ri);
+        // Attribute to every record whose nodes this block actually contains; the first (records are
+        // sorted by variant id) is the primary one. A block that merely sits in the same bubble as a
+        // record is not attributed to it.
+        for (std::size_t ri = 0; ri < recs.size(); ++ri) {
+            bool hit = false;
+            for (std::size_t k = ri0; k < ri1 && !hit; ++k)
+                if (recs[ri].nodes.count(ref_steps[k].node_id)) hit = true;
+            for (std::size_t k = hi0; k < hi1 && !hit; ++k)
+                if (recs[ri].nodes.count(hap_steps[k].node_id)) hit = true;
+            if (!hit) continue;
+            if (b.rec < 0) b.rec = static_cast<int>(ri);
+            b.recs_all.push_back(static_cast<int>(ri));
         }
         out.push_back(b);
     };
@@ -638,6 +652,12 @@ struct BubbleObs {
     // The called-only reconstruction: the reference with exactly the retained calls implanted.
     std::size_t called_delta = 0;
     std::size_t called_aln_len = 0;
+    // The same, but only where THIS haplotype's GT names the record as one it carries. The bridge
+    // between discovery and representation: `called` minus this is carrier-assignment loss, this minus
+    // `genotype` is what the VCF's encoding of those same calls costs.
+    bool carrier_scored = false;
+    std::size_t carrier_delta = 0;
+    std::size_t carrier_aln_len = 0;
     // Genotype-aware reconstruction over the same bubble against the same truth, plus the do-nothing
     // baseline (plain reference) it has to beat. A VCF that closes none of the gap between the baseline
     // and the graph bound is worth nothing here, and one that scores WORSE than the baseline is applying
@@ -670,6 +690,10 @@ struct HapResult {
     std::size_t sum_run_ge = 0;
     std::size_t called_sum_delta = 0;
     std::size_t called_sum_aln = 0;
+    bool carrier_scored = false;
+    std::size_t carrier_sum_delta = 0;
+    std::size_t carrier_sum_aln = 0;
+    std::size_t gt_absent_records = 0;   // a called record with no VCF row to read a GT from
     Ledger led;
     bool gt_scored = false;
     std::size_t gt_sum_delta = 0;
@@ -900,6 +924,14 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                      std::to_string(unjoined_samples) + " VCF sample(s) have no path. It is a SUBSET score");
     }
 
+    // variant_nodes.tsv carries no haplotype column -- one row per RECORD, holding the union of nodes
+    // over every merged event and every carrier -- so which haplotype carries a record is only knowable
+    // from the VCF. Join by record id, which `call` writes identically in both files.
+    std::unordered_map<std::string, const VcfRecord*> vcf_by_id;
+    if (do_gt)
+        for (const VcfRecord& r : vcf.records)
+            if (r.id != ".") vcf_by_id.emplace(r.id, &r);
+
     std::vector<HapResult> results(graph.paths.size());
     static const std::vector<CalledRecord> kNoCalled;
     run_parallel(graph.paths.size(), threads, [&](std::size_t pi) {
@@ -978,6 +1010,38 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                             c_applied);
             const NwAlign cnw = nw_edit_distance(spell_path_steps_sequence(graph, called_steps), truth);
 
+            // carrier_walk: the same substitution, additionally requiring that THIS haplotype's GT
+            // names the record. It uses the haplotype's true graph steps, exactly as `called` does, so
+            // the only difference between them is whether the carrier was correctly identified. Needs
+            // a VCF and a joined column; without one there is no GT to read and the level is absent
+            // rather than assumed.
+            const int hv_i = do_gt ? hap_vcf[pi] : -1;
+            if (hv_i >= 0) {
+                const std::size_t hv = static_cast<std::size_t>(hv_i);
+                bool w_applied = false;
+                const std::vector<PathStep> carrier_steps =
+                    reconstruct(rit->second, *steps, anchors, blocks,
+                                [&](const TruthBlock& blk) {
+                                    if (blk.rec < 0 || blk.size_bp < min_sv_bp) return false;
+                                    for (const int ri : blk.recs_all) {
+                                        const auto vit = vcf_by_id.find(
+                                            recs[static_cast<std::size_t>(ri)].variant_id);
+                                        if (vit == vcf_by_id.end()) { ++hr.gt_absent_records; continue; }
+                                        if (hv < vit->second->gt.size() && vit->second->gt[hv] >= 1)
+                                            return true;
+                                    }
+                                    return false;
+                                }, w_applied);
+                const NwAlign wnw =
+                    nw_edit_distance(spell_path_steps_sequence(graph, carrier_steps), truth);
+                hr.carrier_scored = true;
+                hr.carrier_sum_delta += wnw.edits;
+                hr.carrier_sum_aln += wnw.aln_len;
+                o.carrier_scored = true;
+                o.carrier_delta = wnw.edits;
+                o.carrier_aln_len = wnw.aln_len;
+            }
+
             hr.scored = true;
             hr.sum_delta += nw.edits;
             hr.sum_aln += nw.aln_len;
@@ -1055,6 +1119,9 @@ int run_benchmark_command(const std::vector<std::string>& args) {
     std::size_t gt_tot_ref_delta = 0, gt_tot_gt_delta = 0, gt_tot_graph_delta = 0;
     std::size_t tot_run_lt = 0, tot_run_ge = 0;
     std::size_t tot_called_delta = 0;
+    std::size_t tot_carrier_delta = 0, tot_carrier_aln = 0, carrier_scored_haps = 0;
+    std::size_t tot_gt_absent = 0;
+    std::map<std::string, std::size_t> carrier_quintile_count;
     std::size_t tot_coarse = 0, tot_skipped = 0;
     Ledger tot_led;
     GtStats tot_gt;
@@ -1066,6 +1133,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                   "\ttruth_events\ttruth_called\ttruth_missed\ttruth_below"
                   "\ttruth_called_bp\ttruth_missed_bp\ttruth_below_bp"
                   "\tcalled_sum_delta\tcalled_qv\tcalled_quintile"
+                  "\tcarrier_sum_delta\tcarrier_qv"
                   "\tgt_sum_delta\tgt_sum_aln_len\tgt_qv\tgt_band\tgt_quintile\tgt_identity"
                   "\tref_sum_delta\tref_qv\tgap_closed\n";
         for (const HapResult& hr : results) {
@@ -1088,7 +1156,20 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                    << hr.led.events << '\t' << hr.led.called << '\t' << hr.led.missed << '\t'
                    << hr.led.below << '\t' << hr.led.called_bp << '\t' << hr.led.missed_bp << '\t'
                    << hr.led.below_bp << '\t'
-                   << hr.called_sum_delta << '\t' << cqv << '\t' << cquint;
+                   << hr.called_sum_delta << '\t' << cqv << '\t' << cquint << '\t';
+            if (hr.carrier_scored) {
+                const double wqv = qv_from(hr.carrier_sum_delta, hr.carrier_sum_aln);
+                const double wmax = qv_max_from(hr.carrier_sum_aln);
+                by_hap << hr.carrier_sum_delta << '\t' << wqv;
+                ++carrier_quintile_count[qv_ratio_quintile(
+                    std::min(1.0, std::max(0.0, wmax > 0.0 ? wqv / wmax : 1.0)))];
+                tot_carrier_delta += hr.carrier_sum_delta;
+                tot_carrier_aln += hr.carrier_sum_aln;
+                ++carrier_scored_haps;
+                tot_gt_absent += hr.gt_absent_records;
+            } else {
+                by_hap << ".\t.";
+            }
             if (hr.gt_scored) {
                 const double gqv = qv_from(hr.gt_sum_delta, hr.gt_sum_aln);
                 const double gmax = qv_max_from(hr.gt_sum_aln);
@@ -1168,7 +1249,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
         if (!qv_out) throw std::runtime_error("Failed to write " + out_prefix + ".qv.tsv");
         qv_out << "sample\tbubble_id\tsvtypes\tis_carrier\tdelta\taln_len\tqv\tresid_run_lt_bp\tresid_run_ge_bp"
                   "\ttruth_events\ttruth_called\ttruth_missed\ttruth_below\ttruth_missed_bp"
-                  "\tcalled_delta\tcalled_qv"
+                  "\tcalled_delta\tcalled_qv\tcarrier_delta\tcarrier_qv"
                   "\tgt_delta\tgt_aln_len\tgt_qv\tref_delta\tgt_called_carrier\tgt_true_carrier\n";
         for (const HapResult& hr : results) {
             if (!hr.scored) continue;
@@ -1185,6 +1266,11 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                        << o.led.events << '\t' << o.led.called << '\t' << o.led.missed << '\t'
                        << o.led.below << '\t' << o.led.missed_bp << '\t'
                        << o.called_delta << '\t' << qv_from(o.called_delta, o.called_aln_len);
+                if (o.carrier_scored)
+                    qv_out << '\t' << o.carrier_delta << '\t'
+                           << qv_from(o.carrier_delta, o.carrier_aln_len);
+                else
+                    qv_out << "\t.\t.";
                 if (o.gt_scored) {
                     qv_out << '\t' << o.gt_delta << '\t' << o.gt_aln_len << '\t'
                            << qv_from(o.gt_delta, o.gt_aln_len) << '\t' << o.ref_delta << '\t'
@@ -1269,6 +1355,16 @@ int run_benchmark_command(const std::vector<std::string>& args) {
             << (do_gt ? graph.paths.size() - joined : 0) << "\t0\n";
         sum << "excluded\tALL\tvcf_samples_without_path\t" << unjoined_samples << "\t0\n";
         sum << "called_recon\tALL\tdelta\t" << tot_called_delta << "\t0\n";
+        if (carrier_scored_haps) {
+            for (const char* q : kQuintiles) {
+                const std::size_t n = carrier_quintile_count.count(q) ? carrier_quintile_count[q] : 0;
+                const double pct = 100.0 * static_cast<double>(n) / static_cast<double>(carrier_scored_haps);
+                sum << "carrier_quintile\tALL\t" << q << '\t' << n << '\t' << pct << '\n';
+            }
+            sum << "carrier_recon\tALL\tdelta\t" << tot_carrier_delta << "\t0\n";
+            sum << "carrier_recon\tALL\thaplotypes\t" << carrier_scored_haps << "\t0\n";
+            sum << "carrier_recon\tALL\tcalled_records_absent_from_vcf\t" << tot_gt_absent << "\t0\n";
+        }
         // Genotype-aware reconstruction, reported on the same scale so the two are read side by side.
         if (gt_scored_haps) {
             for (const char* q : kQuintiles) {
@@ -1319,6 +1415,28 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                 sum << "variation_recovered\tALL\tgraph\t0\t";
                 if (base > 0.0) sum << 100.0 * (base - static_cast<double>(gt_tot_graph_delta)) / base << '\n';
                 else sum << "NA\n";
+                sum << "variation_recovered\tALL\tcarrier_walk\t0\t";
+                if (base > 0.0 && carrier_scored_haps)
+                    sum << 100.0 * (base - static_cast<double>(tot_carrier_delta)) / base << '\n';
+                else sum << "NA\n";
+                // Where the reconstructed bases are lost, as a partition rather than as three ratios a
+                // reader has to subtract. Each term is bases, on the same scale as baseline_delta.
+                //   discovery      the reference is not improved even by implanting every retained
+                //                  call's own block -- the variation was not found or not attributed
+                //   assignment     `called` and `carrier_walk` implant the SAME true blocks, so their
+                //                  difference is entirely which haplotypes the calls were given to
+                //   representation the carriers are right and the blocks are right, so what remains is
+                //                  what the VCF's encoding of those calls fails to reproduce
+                if (carrier_scored_haps) {
+                    const long long disc = static_cast<long long>(tot_called_delta);
+                    const long long asgn = static_cast<long long>(tot_carrier_delta) -
+                                           static_cast<long long>(tot_called_delta);
+                    const long long repr = static_cast<long long>(gt_tot_gt_delta) -
+                                           static_cast<long long>(tot_carrier_delta);
+                    sum << "loss_bp\tALL\tdiscovery_or_attribution\t" << disc << "\t0\n";
+                    sum << "loss_bp\tALL\tcarrier_assignment\t" << asgn << "\t0\n";
+                    sum << "loss_bp\tALL\trepresentation\t" << repr << "\t0\n";
+                }
                 sum << "gt_gap\tALL\tworse_than_baseline\t" << gt_worse_than_ref << "\t"
                     << (gt_scored_haps ? 100.0 * static_cast<double>(gt_worse_than_ref) / static_cast<double>(gt_scored_haps) : 0.0) << "\n";
             }
@@ -1359,6 +1477,10 @@ int run_benchmark_command(const std::vector<std::string>& args) {
              quintile_recap(quintile_count, scored_haps));
     log.info("called (retained calls only) " + std::to_string(scored_haps) + " haplotypes, qv/qv_max quintiles:" +
              quintile_recap(called_quintile_count, scored_haps));
+    if (carrier_scored_haps)
+        log.info("carrier_walk (retained calls this haplotype is genotyped as carrying) " +
+                 std::to_string(carrier_scored_haps) + " haplotypes, qv/qv_max quintiles:" +
+                 quintile_recap(carrier_quintile_count, carrier_scored_haps));
     {
         char lb[256];
         std::snprintf(lb, sizeof(lb),

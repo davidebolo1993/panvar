@@ -250,7 +250,7 @@ QV_TABLE="$REPO/results/benchmark_qv.tsv"
 # Columns are looked up BY NAME. They have moved once already -- the truth-event ledger was inserted
 # ahead of the residual columns -- and a positional read of a table that gained a column silently
 # aggregates the wrong quantity rather than failing.
-QV_COLS='sample sum_delta sum_aln_len qv identity truth_missed_bp truth_below_bp called_sum_delta'
+QV_COLS='sample sum_delta sum_aln_len qv identity truth_missed_bp truth_below_bp called_sum_delta carrier_sum_delta'
 printf 'locus\t%s\n' "$(printf '%s\n' $QV_COLS | paste -sd$'\t' -)" > "$QV_TABLE"
 for region in "${REGIONS[@]}"; do
   bh="$OUT/$region/benchmark/benchmark.qv_by_haplotype.tsv"

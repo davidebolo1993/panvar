@@ -91,8 +91,48 @@ check "fixture A: two above-threshold events are called" "$tc" "2"
 check "fixture A: one below-threshold event" "$tb" "1"
 
 # --- Carrier truth comes from the walks: every deletion carrier is a true carrier of its own bubble.
-tcar=$(awk -F'\t' 'NR>1 && $22==1' "$AQ" | wc -l | tr -d ' ')
+tcol=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++) if($i=="gt_true_carrier") print i}' "$AQ")
+tcar=$(awk -F'\t' -v c="$tcol" 'NR>1 && $c==1' "$AQ" | wc -l | tr -d ' ')
 check "true carriers = the two callable-size deletion haplotypes only" "$tcar" "2"
+
+# --- The four reconstructions are a chain of upper bounds. `carrier` substitutes a SUBSET of the
+# blocks `called` does (the same true blocks, minus those this haplotype is not genotyped as
+# carrying), so it can never beat it, and `graph` can never be beaten by either.
+vg=$(pctcol variation_recovered "$AS" graph)
+vc=$(pctcol variation_recovered "$AS" called)
+vw=$(pctcol variation_recovered "$AS" carrier_walk)
+vt=$(pctcol variation_recovered "$AS" genotype)
+ordered=$(awk -v g="$vg" -v c="$vc" -v w="$vw" -v t="$vt" \
+  'BEGIN{print (g>=c-1e-9 && c>=w-1e-9 && w>=t-1e-9) ? "yes" : "no"}')
+check "graph >= called >= carrier >= genotype ($vg/$vc/$vw/$vt)" "$ordered" "yes"
+
+# On this fixture every carrier is genotyped correctly, so carrier_walk must EQUAL called and the
+# assignment term of the loss decomposition must be exactly zero.
+check "with correct genotypes, carrier_walk equals called" "$(awk -v a="$vc" -v b="$vw" 'BEGIN{print (a==b)?"eq":"ne"}')" "eq"
+check "and carrier-assignment loss is zero" "$(sumcol loss_bp "$AS" carrier_assignment)" "0"
+
+# --- and the negative control, without which the two levels could be identical for a trivial reason.
+# Strip every carrier: rewrite each sample's GT subfield to 0, leaving records, nodes and coordinates
+# untouched. Discovery is unchanged, so `called` must not move; every carrier is now missing, so
+# `carrier_walk` must fall to the do-nothing baseline and the assignment term must absorb the whole
+# difference. This is what proves carrier_walk measures ASSIGNMENT and nothing else.
+awk -F'\t' 'BEGIN{OFS="\t"} /^#/{print;next}
+  {for(i=10;i<=NF;i++){n=split($i,p,":"); p[1]="0"; s=p[1]; for(j=2;j<=n;j++) s=s":"p[j]; $i=s} print}' \
+  "$OUT/ac.region.vcf" > "$OUT/nocarrier.vcf"
+"$BIN" benchmark -i "$OUT/ab.sorted.gfa" -c "$OUT/ab.bubbles.csv" -r "$REF" \
+   --variant-nodes "$OUT/ac.variant_nodes.tsv" --vcf "$OUT/nocarrier.vcf" -o "$OUT/NC" \
+   --no-truth-events -q >/dev/null 2>&1
+NS="$OUT/NC.qv_summary.tsv"
+check "stripping carriers leaves the called level untouched (discovery is unchanged)" \
+      "$(pctcol variation_recovered "$NS" called)" "$vc"
+ncw=$(pctcol variation_recovered "$NS" carrier_walk)
+check "but carrier_walk collapses to the baseline" \
+      "$(awk -v w="$ncw" 'BEGIN{print (w+0==0)?"zero":"nonzero: " w}')" "zero"
+check "and the whole loss moves into the carrier-assignment term" \
+      "$(awk -v a="$(sumcol loss_bp "$NS" carrier_assignment)" 'BEGIN{print (a+0>0)?"positive":"zero"}')" "positive"
+check "with every true carrier now a false negative" \
+      "$(awk -v tp="$(sumcol gt_carrier "$NS" TP)" -v fn="$(sumcol gt_carrier "$NS" FN)" \
+          'BEGIN{print tp"/"fn}')" "0/2"
 
 # ---------------------------------------------------------------------------------------------
 # Fixture B: ONE bubble, one 60 bp deletion, and `call` run at a threshold that refuses to emit it.
