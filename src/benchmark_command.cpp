@@ -48,9 +48,11 @@ void print_benchmark_help() {
         << "            authorise copying a neighbouring uncalled allele. Read it as a discovery upper\n"
         << "            bound -- can the graph hold this haplotype, and did the caller flag the\n"
         << "            divergent blocks -- never as a genotyping score. No genotype is read.\n"
-        << "  called    The same substitution restricted to blocks that map to a specific emitted call\n"
-        << "            AND reach --min-sv-bp. Nothing else of the haplotype's own walk is copied, so\n"
-        << "            this is 'the reference with exactly what we called implanted into it'.\n"
+        << "  called    The same substitution restricted to blocks a SPECIFIC record is attributed to\n"
+        << "            AND that reach --min-sv-bp; nothing else of the haplotype's walk is copied. It\n"
+        << "            still substitutes the haplotype's TRUE block, not the record's REF/ALT effect,\n"
+        << "            so it is the ceiling those records would reach if each reproduced its block\n"
+        << "            exactly -- not what they do reproduce. That is `genotype`.\n"
         << "  genotype  (--vcf) Reference sequence with only the edits this haplotype's GT names,\n"
         << "            applied from the VCF alone. A missed carrier keeps reference and a spurious one\n"
         << "            edits sequence that was already correct, so both error directions cost bases.\n"
@@ -138,35 +140,95 @@ struct CalledVariants {
     std::map<std::size_t, std::set<std::string>> svtypes;                      // bubble_id -> svtypes
 };
 
-CalledVariants load_variant_nodes(const std::string& path) {
+// `bubble_members` is every node each bubble owns (interior plus both boundaries). A call's nodes are
+// the whole basis on which a truth event is attributed to it, so a node that is not in the graph, or
+// belongs to a different site, silently turns a called event into a missed one -- the input error and
+// the caller failure produce the identical output. Nothing here is skipped or repaired: an input that
+// cannot be trusted is refused.
+CalledVariants load_variant_nodes(
+        const std::string& path,
+        const std::unordered_map<std::size_t, std::unordered_set<std::string>>& bubble_members) {
     std::ifstream in(path);
     if (!in) throw std::runtime_error("Failed to open variant nodes: " + path);
-    CalledVariants cv;
-    std::string line;
-    bool header = true;
-    while (std::getline(in, line)) {
-        if (line.empty()) continue;
-        if (header) { header = false; continue; }  // variant_id  bubble_id  svtype  node_ids
+    auto split_tab = [](const std::string& s) {
         std::vector<std::string> f;
         std::string cur;
-        for (char c : line) { if (c == '\t') { f.push_back(cur); cur.clear(); } else cur += c; }
+        for (char c : s) { if (c == '\t') { f.push_back(cur); cur.clear(); } else cur += c; }
         f.push_back(cur);
-        if (f.size() < 4) continue;
-        const std::size_t bid = static_cast<std::size_t>(std::stoull(f[1]));
-        cv.bubble_ids.insert(bid);
-        cv.svtypes[bid].insert(f[2]);
+        return f;
+    };
+    CalledVariants cv;
+    std::string line;
+    std::size_t ncol = 0, lineno = 0;
+    std::unordered_set<std::string> seen_ids;
+    static const char* kHead[] = {"variant_id", "bubble_id", "svtype", "node_ids"};
+    while (std::getline(in, line)) {
+        ++lineno;
+        if (line.empty()) continue;
+        const std::vector<std::string> f = split_tab(line);
+        if (ncol == 0) {
+            // A missing header is not cosmetic: the first data row would be eaten as one, dropping a
+            // real call and reporting its event as missed.
+            if (f.size() < 4)
+                throw std::runtime_error(path + ": expected a header with at least 4 tab-separated "
+                                         "columns, found " + std::to_string(f.size()));
+            for (int i = 0; i < 4; ++i)
+                if (f[static_cast<std::size_t>(i)] != kHead[i])
+                    throw std::runtime_error(path + ": column " + std::to_string(i + 1) + " of the header is '" +
+                                             f[static_cast<std::size_t>(i)] + "', expected '" + kHead[i] +
+                                             "'. This is not a variant_nodes.tsv written by `call`");
+            ncol = f.size();
+            continue;
+        }
+        if (f.size() != ncol)
+            throw std::runtime_error(path + ":" + std::to_string(lineno) + ": has " +
+                                     std::to_string(f.size()) + " fields, the header has " +
+                                     std::to_string(ncol));
+        if (f[0].empty())
+            throw std::runtime_error(path + ":" + std::to_string(lineno) + ": empty variant_id");
+        if (!seen_ids.insert(f[0]).second)
+            throw std::runtime_error(path + ":" + std::to_string(lineno) + ": duplicate variant_id '" +
+                                     f[0] + "'; which record a truth event is attributed to would be undefined");
+        std::size_t bid = 0;
+        try {
+            std::size_t used = 0;
+            bid = static_cast<std::size_t>(std::stoull(f[1], &used));
+            if (used != f[1].size()) throw std::invalid_argument("trailing");
+        } catch (const std::exception&) {
+            throw std::runtime_error(path + ":" + std::to_string(lineno) + ": bubble_id '" + f[1] +
+                                     "' is not a number");
+        }
+        const auto mit = bubble_members.find(bid);
+        if (mit == bubble_members.end())
+            throw std::runtime_error(path + ":" + std::to_string(lineno) + ": bubble id " +
+                                     std::to_string(bid) + " is not in the bubbles CSV; these outputs "
+                                     "are from different runs");
         CalledRecord rec;
         rec.variant_id = f[0];
         rec.svtype = f[2];
         auto& un = cv.nodes[bid];
         std::string tok;
-        for (char c : f[3]) {
-            if (c == ',') { if (!tok.empty()) { rec.nodes.insert(tok); un.insert(tok); } tok.clear(); }
-            else tok += c;
-        }
-        if (!tok.empty()) { rec.nodes.insert(tok); un.insert(tok); }
+        auto take = [&]() {
+            if (tok.empty()) return;
+            if (!mit->second.count(tok))
+                throw std::runtime_error(path + ":" + std::to_string(lineno) + ": record '" + f[0] +
+                                         "' names node '" + tok + "', which bubble " + std::to_string(bid) +
+                                         " does not contain. A stale node turns a called event into a "
+                                         "missed one with nothing to show for it");
+            rec.nodes.insert(tok);
+            un.insert(tok);
+            tok.clear();
+        };
+        for (char c : f[3]) { if (c == ',') take(); else tok += c; }
+        take();
+        if (rec.nodes.empty())
+            throw std::runtime_error(path + ":" + std::to_string(lineno) + ": record '" + f[0] +
+                                     "' names no nodes");
+        cv.bubble_ids.insert(bid);
+        cv.svtypes[bid].insert(f[2]);
         cv.records[bid].push_back(std::move(rec));
     }
+    if (ncol == 0) throw std::runtime_error(path + ": file is empty");
     // Deterministic record order, so which record a truth event is attributed to cannot depend on the
     // order rows happen to sit in the file.
     for (auto& [bid, recs] : cv.records)
@@ -208,7 +270,6 @@ struct VcfRecord {
 struct VcfData {
     std::vector<std::string> samples;
     std::vector<VcfRecord> records;
-    std::size_t no_bubble_id = 0;      // records carrying no BUBBLE_ID: they cannot be placed
 };
 
 VcfData load_vcf(const std::string& path) {
@@ -217,6 +278,8 @@ VcfData load_vcf(const std::string& path) {
     VcfData vd;
     std::string line;
     bool saw_header = false;
+    std::size_t lineno = 0;
+    std::unordered_set<std::string> seen_ids;
     while (std::getline(in, line)) {
         if (line.empty()) continue;
         if (line.rfind("##", 0) == 0) continue;
@@ -233,10 +296,22 @@ VcfData load_vcf(const std::string& path) {
             saw_header = true;
             continue;
         }
+        ++lineno;
         const std::vector<std::string> f = split_on(line, '\t');
-        if (f.size() < 10) continue;                       // no sample columns: nothing to genotype
+        if (!saw_header)
+            throw std::runtime_error(path + ": a data line appears before the #CHROM header");
+        // A short or long line means the columns are not where they are read from, so every genotype
+        // after it belongs to the wrong haplotype.
+        if (f.size() != 9 + vd.samples.size())
+            throw std::runtime_error(path + ":" + std::to_string(lineno) + ": has " +
+                                     std::to_string(f.size()) + " fields, the #CHROM header declares " +
+                                     std::to_string(9 + vd.samples.size()) + " (9 fixed + " +
+                                     std::to_string(vd.samples.size()) + " samples)");
         VcfRecord r;
         r.id = f[2];
+        if (r.id != "." && !seen_ids.insert(r.id).second)
+            throw std::runtime_error(path + ":" + std::to_string(lineno) + ": duplicate record ID '" +
+                                     r.id + "'");
         r.pos = static_cast<std::size_t>(std::stoull(f[1]));
         // A record whose ALT is literal sequence is applied as a plain REF -> ALT substitution, which
         // is what the allele VCF emits: one record per bubble, every distinct allele spelled out.
@@ -260,7 +335,11 @@ VcfData load_vcf(const std::string& path) {
             else if (k == "RU_LEN" || k == "CN_UNIT_BP")
                 r.ru_len = static_cast<std::size_t>(std::stoull(v));
         }
-        if (!r.has_bubble_id) ++vd.no_bubble_id;
+        // Without BUBBLE_ID a record cannot be placed, and every such record would silently pile up
+        // against bubble 0.
+        if (!r.has_bubble_id)
+            throw std::runtime_error(path + ":" + std::to_string(lineno) + ": record '" + r.id +
+                                     "' carries no BUBBLE_ID, so it cannot be attached to a site");
         const std::vector<std::string> fmt = split_on(f[8], ':');
         std::size_t gt_i = fmt.size(), cnbp_i = fmt.size(), cn_i = fmt.size();
         for (std::size_t i = 0; i < fmt.size(); ++i) {
@@ -271,10 +350,27 @@ VcfData load_vcf(const std::string& path) {
         r.gt.assign(vd.samples.size(), -1);
         r.cn.assign(vd.samples.size(), -1);
         r.cnbp.assign(vd.samples.size(), 0);
-        for (std::size_t s = 0; s + 9 < f.size() && s < vd.samples.size(); ++s) {
+        for (std::size_t s = 0; s < vd.samples.size(); ++s) {
             const std::vector<std::string> v = split_on(f[s + 9], ':');
-            if (gt_i < v.size() && !v[gt_i].empty() && v[gt_i] != ".")
-                r.gt[s] = static_cast<std::int32_t>(std::stoi(v[gt_i]));
+            if (gt_i < v.size() && !v[gt_i].empty() && v[gt_i] != ".") {
+                // Every sample column IS one haplotype, so a genotype is one allele index. A diploid
+                // field would be read by stoi as its first allele -- "0/1" as 0 -- so a heterozygous
+                // carrier would silently score as reference.
+                const std::string& g = v[gt_i];
+                if (g.find('/') != std::string::npos || g.find('|') != std::string::npos)
+                    throw std::runtime_error(path + ":" + std::to_string(lineno) + ": sample '" +
+                                             vd.samples[s] + "' has the diploid genotype '" + g +
+                                             "'. benchmark joins one VCF column to one haplotype path, "
+                                             "so genotypes must be haploid allele indices");
+                std::size_t used = 0;
+                int gi = 0;
+                try { gi = std::stoi(g, &used); } catch (const std::exception&) { used = 0; }
+                if (used != g.size() || gi < 0)
+                    throw std::runtime_error(path + ":" + std::to_string(lineno) + ": sample '" +
+                                             vd.samples[s] + "' has the genotype '" + g +
+                                             "', which is not an allele index");
+                r.gt[s] = static_cast<std::int32_t>(gi);
+            }
             if (cnbp_i < v.size() && !v[cnbp_i].empty() && v[cnbp_i] != ".")
                 r.cnbp[s] = std::stoll(v[cnbp_i]);
             if (cn_i < v.size() && !v[cn_i].empty() && v[cn_i] != ".")
@@ -689,36 +785,26 @@ int run_benchmark_command(const std::vector<std::string>& args) {
              std::to_string(graph.paths.size()) + " paths); reference " + ref_name);
 
     const std::vector<Bubble> all_bubbles_csv = read_bubbles_csv(bubbles_csv_in);
+    std::unordered_map<std::size_t, std::unordered_set<std::string>> bubble_members;
     {
-        std::unordered_set<std::size_t> ids;
         for (const Bubble& b : all_bubbles_csv) {
-            if (!ids.insert(b.id).second)
-                throw std::runtime_error("bubbles CSV has a duplicate bubble id " + std::to_string(b.id) +
-                                         ": which site a call or a score refers to would be undefined");
             auto need = [&](const std::string& n) {
                 if (!graph.nodes.count(n))
                     throw std::runtime_error("bubble " + std::to_string(b.id) + " names node '" + n +
                                              "', which is not in " + gfa_path +
                                              " -- the CSV and the graph do not describe the same data");
+                return n;
             };
-            need(b.source);
-            need(b.sink);
-            for (const std::string& n : b.inside) need(n);
+            std::unordered_set<std::string> members;
+            members.insert(need(b.source));
+            members.insert(need(b.sink));
+            for (const std::string& n : b.inside) members.insert(need(n));
+            if (!bubble_members.emplace(b.id, std::move(members)).second)
+                throw std::runtime_error("bubbles CSV has a duplicate bubble id " + std::to_string(b.id) +
+                                         ": which site a call or a score refers to would be undefined");
         }
     }
-    const CalledVariants cv = load_variant_nodes(variant_nodes_in);
-    {
-        std::size_t unknown = 0;
-        std::unordered_set<std::size_t> csv_ids;
-        for (const Bubble& b : all_bubbles_csv) csv_ids.insert(b.id);
-        for (const std::size_t bid : cv.bubble_ids) if (!csv_ids.count(bid)) ++unknown;
-        if (unknown && unknown == cv.bubble_ids.size())
-            throw std::runtime_error("no bubble id in " + variant_nodes_in + " appears in " + bubbles_csv_in +
-                                     "; these outputs are from different runs");
-        if (unknown)
-            log.info("warning: " + std::to_string(unknown) + "/" + std::to_string(cv.bubble_ids.size()) +
-                     " called bubbles are not in the bubbles CSV and cannot be scored");
-    }
+    const CalledVariants cv = load_variant_nodes(variant_nodes_in, bubble_members);
     const PathRecord* ref_path = nullptr;
     for (const PathRecord& p : graph.paths) if (p.name == ref_name) ref_path = &p;
 
@@ -812,9 +898,6 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                      std::to_string(graph.paths.size()) + " graph haplotypes; " +
                      std::to_string(graph.paths.size() - joined) + " path(s) have no VCF column and " +
                      std::to_string(unjoined_samples) + " VCF sample(s) have no path. It is a SUBSET score");
-        if (vcf.no_bubble_id)
-            log.info("warning: " + std::to_string(vcf.no_bubble_id) + " VCF record(s) carry no BUBBLE_ID "
-                     "and are all attributed to bubble 0");
     }
 
     std::vector<HapResult> results(graph.paths.size());
@@ -850,6 +933,9 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                 ++o.led.events;
                 const char* klass;
                 if (blk.size_bp < min_sv_bp) { ++o.led.below; o.led.below_bp += blk.size_bp; klass = "below_threshold"; }
+                // `called` = a specific record shares at least one node with this block. That is
+                // attribution, not coverage: it does not establish that the record spans the block or
+                // represents it correctly.
                 else if (blk.rec >= 0)       { ++o.led.called; o.led.called_bp += blk.size_bp; klass = "called"; }
                 else                          { ++o.led.missed; o.led.missed_bp += blk.size_bp; klass = "missed"; }
                 if (write_events) {

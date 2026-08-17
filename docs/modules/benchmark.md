@@ -10,21 +10,25 @@ Answers two different questions about the caller's own output, and keeps them ap
 
 | class | definition |
 |-------|------------|
-| `called` | size `≥ --min-sv-bp` and the block contains a node of a specific emitted record |
+| `called` | size `≥ --min-sv-bp` and a specific emitted record shares at least one node with the block |
 | `missed` | size `≥ --min-sv-bp` and no emitted record covers it |
 | `below_threshold` | size `< --min-sv-bp` — variation the caller never set out to emit |
 
-Event size is a property of the two walks. It does not move with the alignment, with the calls, or with anything else the run does, which is what makes it usable as truth. `called` is a statement about **discovery** — a record covering this block exists — not about whether this haplotype was genotyped as carrying it. That second question is the carrier table below.
+Event size is a property of the two walks. It does not move with the alignment, with the calls, or with anything else the run does, which is what makes it usable as truth.
+
+`called` is **attribution, not coverage**: a record shares at least one node with the block. It does not establish that the record spans the block, nor that it represents it correctly. So `missed` is a firm negative — nothing the caller emitted touches this event at all — while `called` is an upper bound on discovery. It is also silent on whether *this haplotype* was genotyped as carrying it; that is the carrier table below.
 
 **How much of the sequence comes back** — three reconstructions over the same bubbles, against the same truth, on the same QV scale, differing only in what each is allowed to use.
 
 | level | reconstruction built from | answers |
 |-------|---------------------------|---------|
 | `graph` | reference walk + the haplotype's own steps at every block sharing a node with **any** call at that bubble | optimistic upper bound: can the graph hold this haplotype, and did the caller flag the divergent blocks |
-| `called` | the same substitution restricted to blocks that map to a **specific** record and reach `--min-sv-bp` | the reference with exactly the retained calls implanted, and nothing else |
+| `called` | the same substitution restricted to blocks a **specific** record is attributed to and that reach `--min-sv-bp` | the ceiling the retained records would reach if each reproduced its block exactly |
 | `genotype` | reference sequence + only the edits this haplotype's `GT` names, from the VCF alone (`--vcf`) | what a consumer reconstructing this sample from the VCF actually gets |
 
-`graph` is deliberately optimistic and is not a genotyping score: sharing a node with some call is not the same as matching one, so a called block can authorise copying a neighbouring uncalled allele, and no genotype is read at all. `called` is the honest version of the same idea. The gap between `called` and `genotype` is what the VCF's *representation* costs, separated from what discovery costs.
+`graph` is deliberately optimistic and is not a genotyping score: sharing a node with some call is not the same as matching one, so a called block can authorise copying a neighbouring uncalled allele, and no genotype is read at all. `called` narrows that to per-record attribution and the size threshold, but it still splices in the haplotype's **true** block rather than the record's `REF`/`ALT` effect — so it too is a ceiling, just a much tighter one. Only `genotype` reconstructs what the records actually say.
+
+Read the three as a chain of upper bounds: `graph ≥ called ≥ genotype`. A large `graph`-to-`called` gap means calls are being credited for blocks they only touch; a large `called`-to-`genotype` gap means the events were found and attributed but the VCF's representation of them does not reproduce the sequence.
 
 A fourth **baseline** — plain reference, no edits — is always computed alongside, and is the denominator of the headline:
 
@@ -49,7 +53,9 @@ Per (haplotype, bubble): does the VCF genotype this haplotype as carrying an alt
 
 ### On `--min-sv-bp`
 
-It sets the event-size threshold for the ledger and for the `called` reconstruction. It does **not** re-run discovery, so lowering it here does not find anything new — it reclassifies. A real threshold experiment runs `call` at each threshold and `benchmark` on that run's output at the same threshold, over a fixed bubble set.
+It sets the event-size threshold for the ledger and for the `called` reconstruction. It does **not** re-run discovery, so lowering it here does not find anything new — it reclassifies. A real threshold experiment runs `call` at each threshold and `benchmark` on that run's output at the same threshold, over a fixed bubble set: `scripts/validate_benchmark_threshold.py` does exactly that and checks the invariants that must hold (the truth events themselves cannot move, the classes must partition, `below_threshold` cannot rise as the threshold falls, the allele VCF must stay exact).
+
+Pass it the same `--call-extra` the pipeline uses, or it measures a different caller. Measured at C4 and CYP2D6 with `--cn`: every newly eligible event is attributed to a record at every step, but genotype reconstruction is **not** monotone — at C4 it falls 67.4% → 41.7% between thresholds 50 and 10, with the count of haplotypes made worse than plain reference rising 7 → 43. More records mean more merged and overlapping records describing one walk, and independent records do not compose. The script reports those separately from the hard invariants rather than failing on them, because they are call-side interactions and are the point of running the sweep.
 
 Algorithm and worked trace: [algorithms/benchmark.md](../algorithms/benchmark.md).
 
@@ -57,11 +63,11 @@ Algorithm and worked trace: [algorithms/benchmark.md](../algorithms/benchmark.md
 
 - `-i, --gfa <graph.gfa>` — the same passed graph the calls were made on. Validated: every path step must name a node the graph has, consecutive steps must be joined by a link, path names must be unique and link overlaps must be zero, because every walk is spelled by concatenating whole segments.
 - one of `-b, --bubble-prefix-in <prefix>` or `-c, --bubbles-csv-in <path>`. Bubble ids must be unique and every node named must exist in the graph.
-- `--variant-nodes <path>` — `call`'s `<prefix>.variant_nodes.tsv`. If none of its bubble ids appear in the CSV the two are from different runs and the run is refused.
+- `--variant-nodes <path>` — `call`'s `<prefix>.variant_nodes.tsv`. Strictly validated, because a call's node set is the whole basis on which a truth event is attributed to it: a stale node produces exactly the output a genuine caller miss produces. The header must be `call`'s, every row must have the header's field count, `variant_id` must be non-empty and unique, and **every node must belong to the bubble the row names**. Any bubble id absent from the CSV is refused, not just the case where all of them are.
 - `-r, --reference-path <name>` — the diff baseline, resolved through the shared resolver (exact name, else a unique case-insensitive substring; ambiguity is an error, never settled by file order).
 - `-o, --out-prefix <prefix>`.
 
-Optional: `--vcf <path>` — either VCF `call` produces. `<prefix>.region.vcf` scores the merged, interpreted output; `<prefix>.alleles.vcf` (from `call --allele-vcf`) scores the lossless one, which is a serialization ceiling rather than a call-sensitivity score. Sample columns are joined to graph paths by exact name; each column is one haplotype, so genotypes are haploid and nothing has to be phased. Duplicate sample columns are refused. A partial join is accepted and **prominently reported**, because a QV over a subset is not the QV of the run.
+Optional: `--vcf <path>` — either VCF `call` produces. `<prefix>.region.vcf` scores the merged, interpreted output; `<prefix>.alleles.vcf` (from `call --allele-vcf`) scores the lossless one, which is a serialization ceiling rather than a call-sensitivity score. Sample columns are joined to graph paths by exact name; each column is one haplotype, so genotypes are haploid and nothing has to be phased. Also validated: unique record IDs, a `BUBBLE_ID` on every record (without it a record cannot be placed and would silently pile up against bubble 0), a field count matching the `#CHROM` header, and haploid `GT`. Duplicate sample columns are refused. A diploid `GT` is refused rather than parsed — one column is one haplotype, and `0/1` read as an integer becomes `0`, silently scoring a heterozygous carrier as reference. A partial join is accepted and **prominently reported**, because a QV over a subset is not the QV of the run.
 
 All outputs are staged and committed only on success, and no output may name an input.
 

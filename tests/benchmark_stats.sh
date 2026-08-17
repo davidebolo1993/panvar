@@ -205,11 +205,65 @@ refused "a VCF with a duplicate sample column is refused" "$OUT/E3" \
   "$BIN" benchmark -i "$OUT/ab.sorted.gfa" -c "$OUT/ab.bubbles.csv" -r "$REF" \
      --variant-nodes "$OUT/ac.variant_nodes.tsv" --vcf "$OUT/dup.vcf" -o "$OUT/E3" -q
 
-# variant nodes from a different run entirely
+# --- variant_nodes.tsv contracts. Each of these previously ran to completion with exit 0, and the
+# first two SILENTLY RECLASSIFIED a called event as missed -- the same output a genuine caller miss
+# produces, which is what makes them worth pinning individually.
 awk -F'\t' 'BEGIN{OFS="\t"} NR==1{print;next} {$2=$2+900000; print}' "$OUT/ac.variant_nodes.tsv" > "$OUT/other.tsv"
-refused "variant nodes whose bubble ids are all absent from the CSV are refused" "$OUT/E4" \
+refused "variant nodes whose bubble ids are absent from the CSV are refused" "$OUT/E4" \
   "$BIN" benchmark -i "$OUT/ab.sorted.gfa" -c "$OUT/ab.bubbles.csv" -r "$REF" \
      --variant-nodes "$OUT/other.tsv" -o "$OUT/E4" -q
+
+# ONE stale node, real bubble id kept: turned called=1 into missed=1 with exit 0.
+awk -F'\t' 'BEGIN{OFS="\t"} NR>1{$4="NOSUCHNODE"} {print}' "$OUT/ac.variant_nodes.tsv" > "$OUT/stalenode.tsv"
+refused "a variant_nodes node the bubble does not contain is refused" "$OUT/E4a" \
+  "$BIN" benchmark -i "$OUT/ab.sorted.gfa" -c "$OUT/ab.bubbles.csv" -r "$REF" \
+     --variant-nodes "$OUT/stalenode.tsv" -o "$OUT/E4a" -q
+
+# A node that EXISTS in the graph but belongs to another bubble: graph membership alone would pass it.
+foreign=$(awk -F'\t' -v B="$(awk -F'\t' 'NR==2{print $2}' "$OUT/ac.variant_nodes.tsv")" \
+  'NR>1 && $2!=B {print $4; exit}' "$OUT/ac.variant_nodes.tsv")
+if [ -n "$foreign" ]; then
+  awk -F'\t' -v N="$foreign" 'BEGIN{OFS="\t"} NR==2{$4=N} {print}' "$OUT/ac.variant_nodes.tsv" > "$OUT/foreign.tsv"
+  refused "a node from a DIFFERENT bubble is refused, not just one absent from the graph" "$OUT/E4b" \
+    "$BIN" benchmark -i "$OUT/ab.sorted.gfa" -c "$OUT/ab.bubbles.csv" -r "$REF" \
+       --variant-nodes "$OUT/foreign.tsv" -o "$OUT/E4b" -q
+else
+  bad "fixture A did not yield two bubbles with distinct called nodes"
+fi
+
+# No header: the first data row is eaten as one, dropping a real call.
+tail -n +2 "$OUT/ac.variant_nodes.tsv" > "$OUT/nohdr.tsv"
+refused "a variant_nodes file with no header is refused" "$OUT/E4c" \
+  "$BIN" benchmark -i "$OUT/ab.sorted.gfa" -c "$OUT/ab.bubbles.csv" -r "$REF" \
+     --variant-nodes "$OUT/nohdr.tsv" -o "$OUT/E4c" -q
+
+# A short row used to be skipped silently.
+{ head -1 "$OUT/ac.variant_nodes.tsv"; printf 'truncated\t1\n'; tail -n +2 "$OUT/ac.variant_nodes.tsv"; } > "$OUT/short.tsv"
+refused "a malformed variant_nodes row is refused, not skipped" "$OUT/E4d" \
+  "$BIN" benchmark -i "$OUT/ab.sorted.gfa" -c "$OUT/ab.bubbles.csv" -r "$REF" \
+     --variant-nodes "$OUT/short.tsv" -o "$OUT/E4d" -q
+
+{ cat "$OUT/ac.variant_nodes.tsv"; tail -1 "$OUT/ac.variant_nodes.tsv"; } > "$OUT/dupid.tsv"
+refused "a duplicate variant_id is refused" "$OUT/E4e" \
+  "$BIN" benchmark -i "$OUT/ab.sorted.gfa" -c "$OUT/ab.bubbles.csv" -r "$REF" \
+     --variant-nodes "$OUT/dupid.tsv" -o "$OUT/E4e" -q
+
+# --- VCF contracts. A diploid GT is the dangerous one: stoi("0/1") is 0, so a heterozygous carrier
+# scored as reference with nothing said.
+sed 's/\t0:/\t0\/1:/g' "$OUT/ac.region.vcf" > "$OUT/dip.vcf"
+refused "a diploid GT is refused, not read as its first allele" "$OUT/E4f" \
+  "$BIN" benchmark -i "$OUT/ab.sorted.gfa" -c "$OUT/ab.bubbles.csv" -r "$REF" \
+     --variant-nodes "$OUT/ac.variant_nodes.tsv" --vcf "$OUT/dip.vcf" -o "$OUT/E4f" -q
+
+sed 's/BUBBLE_ID=[0-9]*;//' "$OUT/ac.region.vcf" > "$OUT/nobid.vcf"
+refused "a VCF record with no BUBBLE_ID is refused" "$OUT/E4g" \
+  "$BIN" benchmark -i "$OUT/ab.sorted.gfa" -c "$OUT/ab.bubbles.csv" -r "$REF" \
+     --variant-nodes "$OUT/ac.variant_nodes.tsv" --vcf "$OUT/nobid.vcf" -o "$OUT/E4g" -q
+
+awk -F'\t' 'BEGIN{OFS="\t"} !/^#/ && NR>0 {NF=NF-1} {print}' "$OUT/ac.region.vcf" > "$OUT/shortvcf.vcf"
+refused "a VCF data line with the wrong field count is refused" "$OUT/E4h" \
+  "$BIN" benchmark -i "$OUT/ab.sorted.gfa" -c "$OUT/ab.bubbles.csv" -r "$REF" \
+     --variant-nodes "$OUT/ac.variant_nodes.tsv" --vcf "$OUT/shortvcf.vcf" -o "$OUT/E4h" -q
 
 # an ambiguous reference query, resolved through the SHARED resolver rather than a private copy
 refused "an ambiguous --reference-path is refused, not resolved by file order" "$OUT/E5" \

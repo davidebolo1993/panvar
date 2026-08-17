@@ -157,16 +157,23 @@ as history; Git already provides that history.
   every one of the nine records there.
 - **Carrier precision was understated, substantially.** ANKRD36C 3.9% → 69.2%, CYP2D6 55.7% → 100%,
   LPA 77.4% → 94.7%, ACOT 76.1% → 98.6%.
-- **Discovery recall is complete on the new measure**: 0 missed above-threshold truth events at all six
-  loci. Where the loss lives is representation — `variation_recovered` is 95.4–99.9% for the retained
-  calls applied exactly, against 39.2–96.9% for the same calls read back out of the region VCF. CYP2D6
-  is the extreme (95.4% against 39.2%) and is the sharpest available measurement of what merging costs.
+- **No above-threshold truth event is left untouched by some record** at any of the six loci: 0 `missed`.
+  That is a discovery *ceiling*, not a proof of correct discovery — `called` means a record shares at
+  least one node with the block, not that it covers or represents it. The firm half of the result is
+  the negative: had a record been absent entirely, the event would have shown as `missed`.
+- **Where the loss lives is representation.** `variation_recovered` is 95.4–99.9% when the haplotype's
+  true block is substituted at every record-attributed above-threshold event, against 39.2–96.9% when
+  the same records are read back out of the region VCF. CYP2D6 is the extreme (95.4% against 39.2%).
+  The first figure is a ceiling on those records, not sequence they reconstruct.
 
 ### Accepted limitations
 
-- **`called` means a record's node lies in the block, not that the record reproduces it.** That is
-  stronger than the previous bubble-wide node union but still weaker than comparing the record's
-  reconstructed effect against the block's sequence. Closing it needs a per-record effect comparison.
+- **`called` means a record's node lies in the block, not that the record covers or reproduces it.**
+  That is stronger than the previous bubble-wide node union but still weaker than comparing the
+  record's reconstructed effect against the block's sequence. The `called` reconstruction inherits the
+  same limit: it splices in the haplotype's TRUE block, so it measures what the retained records would
+  achieve if each reproduced its block exactly. Closing it needs a per-record effect comparison — apply
+  the record's own REF/ALT (or CNBP) within the block and align that against the block's true sequence.
 - **No `filtered_other` class.** A size-eligible truth event removed by `--min-haplotypes`, an AF
   filter, a tangle guard or a resource limit is indistinguishable from one never found. Separating them
   needs a decision audit emitted by `call` — every raw truth-side event with its decision and reason —
@@ -175,7 +182,10 @@ as history; Git already provides that history.
   only as a carrier-table FP, at bubble rather than record granularity.
 - **DUP reconstruction is heuristic and labelled so.** Both `--dup-model` branches tile an inferred
   reference span, so the length is right and the sequence only approximately; the count is reported as
-  `gt_records/heuristic`.
+  `gt_records/heuristic`. **Measured cost at CYP2D6: genotype `variation_recovered` is 86.1% without
+  `--cn` and 39.3% with it, at the same threshold on the same graph and bubbles.** The copy-number
+  records are therefore where that locus's reconstruction loss lives, not the DEL/INS ones. Reconstruct
+  a DUP from its allele sequence rather than by tiling, or accept and state the ceiling.
 - **The threshold sweep is not automated.** `--min-sv-bp` reclassifies the ledger and gates the `called`
   reconstruction, but does not re-run discovery. A real experiment runs `call` at each threshold and
   `benchmark` on that run's output at the same threshold, over a fixed bubble set, and reports where

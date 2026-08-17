@@ -28,7 +28,7 @@ Each block with a non-zero size is one truth event:
 | `called` | `size_bp ≥ --min-sv-bp` and a specific record's node is in the block |
 | `missed` | `size_bp ≥ --min-sv-bp` and no record covers it |
 
-`called` says a record covering this block was **emitted**. It does not say this haplotype was genotyped as carrying it — that is the carrier table, and the two genuinely differ: at ACOT bubble 7, 145 haplotypes have an above-threshold event attributed to a record and are genotyped `0` at every record of the bubble.
+`called` says a specific emitted record **shares at least one node** with this block. It does not say the record spans the block, represents it correctly, or that this haplotype was genotyped as carrying it. So the two negatives differ in strength: `missed` is firm — nothing emitted touches the event — while `called` is an upper bound on discovery. And it is not a genotyping statement: at ACOT bubble 7, 145 haplotypes have an above-threshold event attributed to a record and are genotyped `0` at every record of the bubble.
 
 ### Why not classify from the alignment
 
@@ -46,7 +46,9 @@ Each walks the reference and substitutes the haplotype's own steps at the blocks
 | `called` | it is attributed to a **specific** record and `size_bp ≥ --min-sv-bp` |
 | `genotype` | not block-based at all — see below |
 
-`graph` is the optimistic upper bound and is what every QV figure previously quoted for this project measured. Sharing a node with some call is not matching one, so a called deletion containing a shared reference node can authorise copying a different, uncalled allele; and no genotype is read, so a call placed on entirely the wrong haplotypes still scores perfectly. `called` is the strict version: the reference with exactly the retained calls implanted and nothing else.
+`graph` is the optimistic upper bound and is what every QV figure previously quoted for this project measured. Sharing a node with some call is not matching one, so a called deletion containing a shared reference node can authorise copying a different, uncalled allele; and no genotype is read, so a call placed on entirely the wrong haplotypes still scores perfectly.
+
+`called` narrows that to per-record attribution plus the size threshold, but **both substitute the haplotype's true block, not the record's `REF`/`ALT` effect**. `called` is therefore the ceiling the retained records would reach if each reproduced its block exactly — not what they do reproduce. The three form a chain of upper bounds, `graph ≥ called ≥ genotype`, and only `genotype` reconstructs what the records actually say.
 
 Each reconstruction is globally aligned (Needleman–Wunsch, edlib) to the truth, giving `δ` and `S`. Identity is `1 − Σδ/ΣS` length-weighted over a haplotype's bubbles; `QV = -10·log10(max(0.5, δ)/S)` with ceiling `QV_max = 10·log10(2S)` and `qv_ratio = QV/QV_max` are emitted for comparability.
 
