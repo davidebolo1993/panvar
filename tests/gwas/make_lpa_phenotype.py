@@ -78,13 +78,22 @@ def main(argv):
     os.makedirs(a.out_dir, exist_ok=True)
 
     # parse copies.tsv -> per-haplotype CN for the KIV-2 bubble (the one with the largest unit_bp)
+    # panphorte renamed this column to input_bubble_id, to say plainly that it is the id the site had
+    # BEFORE folding: re-snarling the normalized graph reassigns ids, so it is not the bubble id the
+    # downstream VCF uses. That is fine here -- this only needs a consistent key to group a haplotype's
+    # copy rows by site -- but it must not be joined against a call record's BUBBLE_ID.
     rows = []
     with open(a.copies_tsv) as fh:
         hdr = fh.readline().rstrip("\n").split("\t")
         ci = {c: i for i, c in enumerate(hdr)}
+        bid_col = next((c for c in ("input_bubble_id", "bubble_id") if c in ci), None)
+        missing = [c for c in ("path_name", "copies", "unit_bp") if c not in ci]
+        if bid_col is None or missing:
+            sys.exit(f"{a.copies_tsv}: missing column(s) "
+                     f"{missing + ([] if bid_col else ['input_bubble_id'])}; header is {hdr}")
         for line in fh:
             f = line.rstrip("\n").split("\t")
-            rows.append((f[ci["path_name"]], int(f[ci["bubble_id"]]), int(f[ci["copies"]]),
+            rows.append((f[ci["path_name"]], int(f[ci[bid_col]]), int(f[ci["copies"]]),
                          int(f[ci["unit_bp"]])))
     if not rows:
         sys.exit("no rows in copies.tsv (run panphorte first)")
