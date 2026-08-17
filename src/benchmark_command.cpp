@@ -255,6 +255,7 @@ struct VcfRecord {
     std::string id;
     std::size_t bubble_id = 0;
     bool has_bubble_id = false;
+    bool allele_style = false;    // one row per BUBBLE spelling every allele, not one row per call
     std::size_t pos = 0;               // 1-based, genomic
     std::size_t end = 0;
     long long svlen = 0;
@@ -313,6 +314,8 @@ VcfData load_vcf(const std::string& path) {
                                      std::to_string(vd.samples.size()) + " samples)");
         VcfRecord r;
         r.id = f[2];
+        if (r.id.size() > 8 && r.id.compare(r.id.size() - 8, 8, "_ALLELES") == 0)
+            r.allele_style = true;
         if (r.id != "." && !seen_ids.insert(r.id).second)
             throw std::runtime_error(path + ":" + std::to_string(lineno) + ": duplicate record ID '" +
                                      r.id + "'");
@@ -338,6 +341,7 @@ VcfData load_vcf(const std::string& path) {
             // than a literal repeat unit. --dup-model cn wants whichever the record carries.
             else if (k == "RU_LEN" || k == "CN_UNIT_BP")
                 r.ru_len = static_cast<std::size_t>(std::stoull(v));
+            else if (k == "NALLELES") r.allele_style = true;
         }
         // Without BUBBLE_ID a record cannot be placed, and every such record would silently pile up
         // against bubble 0.
@@ -930,11 +934,41 @@ int run_benchmark_command(const std::vector<std::string>& args) {
 
     // variant_nodes.tsv carries no haplotype column -- one row per RECORD, holding the union of nodes
     // over every merged event and every carrier -- so which haplotype carries a record is only knowable
-    // from the VCF. Join by record id, which `call` writes identically in both files.
+    // from the VCF. That join is by record id, and it only exists for the REGION VCF: `call --allele-vcf`
+    // writes one row per BUBBLE (`bubbleN_ALLELES`) spelling every allele, which shares no id with a
+    // per-call row. Assuming the join silently produced carrier_walk 0% and a 1.4 Mb "missed carrier"
+    // loss on C4 while the genotype level correctly read 0 bp residual, so the mode is now decided
+    // explicitly and refuses anything in between.
     std::unordered_map<std::string, const VcfRecord*> vcf_by_id;
-    if (do_gt)
+    bool allele_mode = false;
+    if (do_gt) {
         for (const VcfRecord& r : vcf.records)
             if (r.id != ".") vcf_by_id.emplace(r.id, &r);
+        std::size_t joined_recs = 0, total_recs = 0;
+        for (const auto& [bid, recs] : cv.records)
+            for (const CalledRecord& rec : recs) {
+                ++total_recs;
+                const auto vit = vcf_by_id.find(rec.variant_id);
+                if (vit == vcf_by_id.end()) continue;
+                // A matching id must also agree on the site, or the two files describe different runs.
+                if (vit->second->has_bubble_id && vit->second->bubble_id != bid)
+                    throw std::runtime_error("record '" + rec.variant_id + "' is at bubble " +
+                                             std::to_string(bid) + " in " + variant_nodes_in + " but at bubble " +
+                                             std::to_string(vit->second->bubble_id) + " in " + vcf_in);
+                ++joined_recs;
+            }
+        std::size_t allele_rows = 0;
+        for (const VcfRecord& r : vcf.records) if (r.allele_style) ++allele_rows;
+        if (total_recs != 0 && joined_recs == 0 && allele_rows == vcf.records.size() && !vcf.records.empty()) {
+            allele_mode = true;
+        } else if (joined_recs != total_recs) {
+            throw std::runtime_error(
+                vcf_in + ": " + std::to_string(joined_recs) + " of " + std::to_string(total_recs) +
+                " records in " + variant_nodes_in + " have a VCF row with the same ID. A region VCF must "
+                "match all of them and an allele VCF none; a partial match means the two files are from "
+                "different runs");
+        }
+    }
 
     std::vector<HapResult> results(graph.paths.size());
     static const std::vector<CalledRecord> kNoCalled;
@@ -1026,7 +1060,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
             // the only difference between them is whether the carrier was correctly identified. Needs
             // a VCF and a joined column; without one there is no GT to read and the level is absent
             // rather than assumed.
-            const int hv_i = do_gt ? hap_vcf[pi] : -1;
+            const int hv_i = (do_gt && !allele_mode) ? hap_vcf[pi] : -1;
             if (hv_i >= 0) {
                 const std::size_t hv = static_cast<std::size_t>(hv_i);
                 bool w_applied = false;
@@ -1462,7 +1496,8 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                 };
                 vr("graph", cs_graph);
                 vr("called", cs_called);
-                vr("carrier_walk", cs_carrier);
+                if (carrier_scored_haps) vr("carrier_walk", cs_carrier);
+                else sum << "variation_recovered\tALL\tcarrier_walk\t0\tNA\n";
                 vr("genotype", cs_gt);
                 vr("in_scope_floor", cs_scope);
                 sum << "common_set\tALL\tobservations\t" << cs_obs << "\t0\n";
@@ -1471,7 +1506,15 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                 // An exact partition of the genotype residual over the common set. The five terms sum
                 // to cs_gt by construction, each being one consecutive step of
                 //   truth -> in-scope floor -> called -> carrier -> genotype.
-                if (cs_obs) {
+                sum << "vcf_mode\tALL\t" << (allele_mode ? "allele" : "region") << "\t0\t0\n";
+                // The partition's middle terms are per-call attributions. An allele VCF has no per-call
+                // rows, so they are absent rather than zero -- reporting them anyway turned a perfect
+                // 0 bp reconstruction into a 1.4 Mb missed-carrier loss and a negative representation.
+                if (cs_obs && allele_mode) {
+                    sum << "loss_bp\tALL\tnot_applicable\t0\t0\n";
+                    sum << "loss_bp\tALL\tout_of_scope\t" << cs_scope << "\t0\n";
+                    sum << "loss_bp\tALL\tserialization_residual\t" << cs_gt << "\t0\n";
+                } else if (cs_obs) {
                     const long long oos  = static_cast<long long>(cs_scope);
                     const long long disc = static_cast<long long>(cs_called) - static_cast<long long>(cs_scope);
                     const long long miss = static_cast<long long>(cs_carrier) - static_cast<long long>(cs_called);

@@ -95,16 +95,18 @@ tcol=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++) if($i=="gt_true_carrier") print i}' 
 tcar=$(awk -F'\t' -v c="$tcol" 'NR>1 && $c==1' "$AQ" | wc -l | tr -d ' ')
 check "true carriers = the two callable-size deletion haplotypes only" "$tcar" "2"
 
-# --- The four reconstructions are a chain of upper bounds. `carrier` substitutes a SUBSET of the
-# blocks `called` does (the same true blocks, minus those this haplotype is not genotyped as
-# carrying), so it can never beat it, and `graph` can never be beaten by either.
+# --- graph >= called >= carrier are NESTED CEILINGS: each substitutes a subset of the previous
+# level's blocks and all three implant the haplotype's own true sequence, so the ordering is
+# guaranteed. `genotype` is deliberately NOT asserted against them -- it applies every record the
+# haplotype carries rather than only attributed eligible blocks, so it can beat `carrier` in places,
+# which is why the last two loss terms are signed. Asserting a chain that includes it would pin a
+# claim the code does not make.
 vg=$(pctcol variation_recovered "$AS" graph)
 vc=$(pctcol variation_recovered "$AS" called)
 vw=$(pctcol variation_recovered "$AS" carrier_walk)
 vt=$(pctcol variation_recovered "$AS" genotype)
-ordered=$(awk -v g="$vg" -v c="$vc" -v w="$vw" -v t="$vt" \
-  'BEGIN{print (g>=c-1e-9 && c>=w-1e-9 && w>=t-1e-9) ? "yes" : "no"}')
-check "graph >= called >= carrier >= genotype ($vg/$vc/$vw/$vt)" "$ordered" "yes"
+ordered=$(awk -v g="$vg" -v c="$vc" -v w="$vw" 'BEGIN{print (g>=c-1e-9 && c>=w-1e-9) ? "yes" : "no"}')
+check "graph >= called >= carrier, the nested ceilings ($vg/$vc/$vw; genotype $vt)" "$ordered" "yes"
 
 # On this fixture every carrier is genotyped correctly, so carrier_walk must EQUAL called and the
 # missed-carrier term of the loss decomposition must be exactly zero.
@@ -384,8 +386,32 @@ check "output is byte-identical at 1 and 8 threads" "$same" "1"
 if [ -s "$OUT/av.alleles.vcf" ]; then
   "$BIN" benchmark -i "$OUT/ab.sorted.gfa" -c "$OUT/ab.bubbles.csv" -r "$REF" \
      --variant-nodes "$OUT/av.variant_nodes.tsv" --vcf "$OUT/av.alleles.vcf" -o "$OUT/AV" -q >/dev/null 2>&1
-  check "the allele VCF reconstructs every haplotype exactly" \
-        "$(sumcol gt_gap "$OUT/AV.qv_summary.tsv" genotype_delta)" "0"
+  VS="$OUT/AV.qv_summary.tsv"
+  check "the allele VCF reconstructs every haplotype exactly" "$(sumcol gt_gap "$VS" genotype_delta)" "0"
+  # The allele VCF is one row per BUBBLE (bubbleN_ALLELES); variant_nodes.tsv is one row per CALL.
+  # They share no id, so the per-call carrier join does not exist here. Reporting it anyway turned a
+  # perfect 0 bp reconstruction into carrier_walk 0%, 1.4 Mb of "missed carrier" and a NEGATIVE
+  # representation on C4 -- numbers that summed correctly and meant nothing.
+  check "the allele VCF is detected as such" "$(awk -F'\t' '$1=="vcf_mode"{print $3}' "$VS")" "allele"
+  check "carrier_walk is NA, not 0" "$(pctcol variation_recovered "$VS" carrier_walk)" "NA"
+  check "the per-call loss terms are marked not applicable" \
+        "$(awk -F'\t' '$1=="loss_bp"{print $3}' "$VS" | tr '\n' ',')" "not_applicable,out_of_scope,serialization_residual,"
+  check "and the serialization residual is zero, which is the real result" \
+        "$(sumcol loss_bp "$VS" serialization_residual)" "0"
+  # A VCF that neither joins completely nor looks like an allele VCF is two different runs.
+  sed 's/\tbubble\([0-9]*\)_/\tXX\1_/' "$OUT/ac.region.vcf" > "$OUT/renamed.vcf"
+  refused "a VCF whose record ids match neither contract is refused" "$OUT/MM" \
+    "$BIN" benchmark -i "$OUT/ab.sorted.gfa" -c "$OUT/ab.bubbles.csv" -r "$REF" \
+       --variant-nodes "$OUT/ac.variant_nodes.tsv" --vcf "$OUT/renamed.vcf" -o "$OUT/MM" -q
+  # A matching id must also agree on the site.
+  awk -F'\t' 'BEGIN{OFS="\t"} /^#/{print;next} {sub(/BUBBLE_ID=[0-9]*/,"BUBBLE_ID=99",$8); print}' \
+    "$OUT/ac.region.vcf" > "$OUT/wrongbub.vcf"
+  refused "a record at a different bubble in the two files is refused" "$OUT/WB" \
+    "$BIN" benchmark -i "$OUT/ab.sorted.gfa" -c "$OUT/ab.bubbles.csv" -r "$REF" \
+       --variant-nodes "$OUT/ac.variant_nodes.tsv" --vcf "$OUT/wrongbub.vcf" -o "$OUT/WB" -q
+  # and the region VCF must still report the full partition
+  check "a region VCF still reports the per-call partition" \
+        "$(awk -F'\t' '$1=="vcf_mode"{print $3}' "$AS")" "region"
 else
   bad "call --allele-vcf wrote no alleles VCF"
 fi

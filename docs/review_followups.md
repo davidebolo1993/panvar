@@ -175,6 +175,18 @@ as history; Git already provides that history.
 
 ### Accepted limitations
 
+- **The allele VCF has no per-call attribution, and none is attempted.** `call --allele-vcf` writes one
+  row per BUBBLE (`bubbleN_ALLELES`) spelling every allele; `variant_nodes.tsv` is one row per CALL.
+  They share no id, so the `carrier` level and the per-call `loss_bp` terms do not exist in that mode
+  and are reported `NA` / `not_applicable`. A bubble/allele-level attribution model would restore them
+  — substitute a block when the haplotype's GT at that bubble names a non-reference allele — but it
+  answers a coarser question than the region-VCF version, and giving the same column two meanings
+  depending on the input file is the kind of silent semantic drift this campaign keeps paying for.
+  Build it as separately named columns if it is wanted.
+- **`genotype` is not bounded by `carrier`.** `graph ≥ called ≥ carrier` are nested ceilings; the
+  genotype level applies every record a haplotype carries rather than only attributed eligible blocks,
+  so it can beat the walk-based ceiling locally. The last two `loss_bp` terms are signed for this
+  reason, and the sweep asserts only the nested part.
 - **The reconstruction substitutes the whole divergent block, not the record's own interval.** A
   single overlapping node authorises the entire maximal block between shared anchors, so `called` and
   `carrier` do not prove the record delimits that sequence. Restricting the substitution to the
