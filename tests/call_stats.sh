@@ -113,6 +113,70 @@ ip=$(field INV 2); ie=$(info INV END)
 [ "$(info INS INSSEQ)" = "$NI" ] && ok "INSSEQ is exactly nI, the inserted node" \
                                  || bad "INSSEQ does not equal nI"
 
+# ---------------------------------------------------------------------------------------------
+# Input contracts. Each of these previously exited 0 and wrote a header-only VCF, which is
+# indistinguishable from a locus with no variation -- the failure mode that makes a silent contract
+# breach worse than a crash.
+# ---------------------------------------------------------------------------------------------
+
+# refuses <label> <expected-substring> <args...> -- must exit non-zero, say why, and write nothing
+refuses() {
+  local label="$1" want="$2"; shift 2
+  local pfx="$OUT/refuse.$((++refuse_n))"
+  local out rc
+  out=$("$@" -o "$pfx" 2>&1); rc=$?
+  if [ "$rc" -eq 0 ]; then bad "$label: expected a non-zero exit, got 0"; return; fi
+  case "$out" in *"$want"*) ;; *) bad "$label: message did not mention '$want' (got: $(printf '%s' "$out" | head -1))"; return;; esac
+  if [ -e "$pfx.region.vcf" ]; then bad "$label: refused but still wrote a region VCF"; return; fi
+  ok "$label"
+}
+refuse_n=0
+
+refuses "--bubble-id naming no such bubble is refused" "not in" \
+  "$BIN" call -i "$OUT/cb.sorted.gfa" -c "$OUT/cb.bubbles.csv" -r "$REF_NAME" --bubble-id 999 -q
+
+# a bubbles CSV whose nodes are not in this graph
+sed 's/^\([0-9]*\),\([0-9]*\),/\1,77\2,/' "$OUT/cb.bubbles.csv" > "$OUT/alien.csv"
+refuses "a bubbles CSV from another graph is refused" "does not belong to this GFA" \
+  "$BIN" call -i "$OUT/cb.sorted.gfa" -c "$OUT/alien.csv" -r "$REF_NAME" -q
+
+{ head -1 "$OUT/cb.bubbles.csv"; sed -n '2p' "$OUT/cb.bubbles.csv"; sed -n '2p' "$OUT/cb.bubbles.csv"; } > "$OUT/dup.csv"
+refuses "a duplicate bubble id is refused" "duplicate bubble id" \
+  "$BIN" call -i "$OUT/cb.sorted.gfa" -c "$OUT/dup.csv" -r "$REF_NAME" -q
+
+# a graph whose path steps name a node with no S line: spell() would skip it and silently shorten
+# every sequence derived from that walk, so the run must not start
+awk -F'\t' '!($1=="S" && $2=="3")' "$OUT/cb.sorted.gfa" > "$OUT/missing_node.gfa"
+refuses "a graph missing a referenced node is refused" "not in the graph" \
+  "$BIN" call -i "$OUT/missing_node.gfa" -c "$OUT/cb.bubbles.csv" -r "$REF_NAME" -q
+
+# an output that would overwrite an input
+cp "$OUT/cb.sorted.gfa" "$OUT/alias.region.vcf"
+out=$("$BIN" call -i "$OUT/alias.region.vcf" -c "$OUT/cb.bubbles.csv" -r "$REF_NAME" -o "$OUT/alias" -q 2>&1)
+case "$out" in
+  *"is also an input"*) [ -s "$OUT/alias.region.vcf" ] \
+      && ok "an output that aliases an input is refused, input intact" \
+      || bad "refused the alias but the input was destroyed anyway" ;;
+  *) bad "an output aliasing an input was not refused (got: $(printf '%s' "$out" | head -1))" ;;
+esac
+
+# Stale per-bubble files. A --bubble-id run must not leave the previous full run's per-bubble VCFs
+# lying beside it, where nothing distinguishes them from output this run produced.
+"$BIN" call -i "$OUT/cb.sorted.gfa" -c "$OUT/cb.bubbles.csv" -r "$REF_NAME" -o "$OUT/stale" -q >/dev/null 2>&1
+before=$(ls "$OUT"/stale.bubble_*.vcf 2>/dev/null | wc -l | tr -d ' ')
+"$BIN" call -i "$OUT/cb.sorted.gfa" -c "$OUT/cb.bubbles.csv" -r "$REF_NAME" -o "$OUT/stale" --bubble-id 1 -q >/dev/null 2>&1
+after=$(ls "$OUT"/stale.bubble_*.vcf 2>/dev/null | wc -l | tr -d ' ')
+[ "$before" = "3" ] && [ "$after" = "1" ] \
+  && ok "a narrowed rerun clears the previous run's per-bubble VCFs ($before -> $after)" \
+  || bad "stale per-bubble VCFs: expected 3 -> 1, got $before -> $after"
+
+# Number=A: AC and SVLEN are emitted as one value per ALT on a multiallelic record, so Number=1 was
+# a lie any spec-compliant reader would trip over.
+for k in AC AF SVLEN; do
+  got=$(grep -o "##INFO=<ID=$k,Number=[^,]*" "$VCF" | head -1 | sed 's/.*Number=//')
+  [ "$got" = "A" ] && ok "INFO/$k is declared Number=A" || bad "INFO/$k: expected Number=A, got ${got:-<missing>}"
+done
+
 printf "\n"
 if [ "$fails" -eq 0 ]; then printf "call_stats: all assertions passed\n"; exit 0; fi
 printf "call_stats: %d assertion(s) failed\n" "$fails"; exit 1

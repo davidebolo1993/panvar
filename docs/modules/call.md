@@ -30,6 +30,22 @@ The recommended path is `bubble → panphorte → [refine] → call`, so `call` 
 - `-r, --reference-path <name>` — the diff baseline (full name or unique case-insensitive substring).
 - `-o, --out-prefix <prefix>`.
 
+### Input contract
+
+Checked before anything is read, and refused with the offender named rather than worked around. Each of these used to exit 0 and write a header-only VCF, which is indistinguishable from a locus with no variation:
+
+| refused | why it cannot be tolerated |
+|---|---|
+| a path step naming a node with no `S` line | spelling skips it, so every sequence, coordinate and `SVLEN` from that walk is silently short |
+| a duplicate path name | which haplotype a genotype column refers to would be undefined |
+| a non-zero `L` overlap, or `*` | `call` spells by concatenating whole nodes, so an overlap is double-counted |
+| a bubbles CSV naming nodes absent from the graph | the CSV belongs to a different graph; every bubble would be skipped |
+| a duplicate `bubble_id` | the same site would be called twice |
+| `--bubble-id` naming an id not in the CSV | a typo, not an empty result |
+| an output path that is also an input | the run would overwrite the data it is reading |
+
+Outputs are staged and renamed in only once the whole run succeeds, so a failure part-way through no longer leaves a complete-looking region VCF beside a non-zero exit. A narrowed rerun (`--bubble-id`) also clears per-bubble VCFs left by an earlier wider run at the same prefix, which would otherwise be indistinguishable from current output.
+
 ## Key options
 
 | flag | what it does | default |

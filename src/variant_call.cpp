@@ -209,6 +209,12 @@ bool is_inversion(const std::vector<const Tok*>& ref_blk, const std::vector<cons
 // Segments abandoned because the node-token DP would exceed its cell cap. Each one is a divergent
 // block that produced NO variant records, so it is a false negative -- and one that used to vanish
 // unless PANVAR_CALL_DEBUG happened to be set. Counted here and reported at the end of the run.
+//
+// Process-global because diff_segment runs under the per-bubble parallelism and threading a counter
+// through it would touch every frame between. call_variants resets it on entry, so the figure is
+// per-run rather than cumulative -- without that, a second call in one process reports the first
+// call's skips as its own. That reset assumes call_variants is not run concurrently with itself in
+// one process, which is true of every command path here.
 std::atomic<std::size_t> g_skipped_segments{0};
 
 void diff_segment(
@@ -564,38 +570,71 @@ void call_variants(
         throw std::runtime_error("call requires -o/--out-prefix");
     }
 
-    // Locate the reference path by full name or case-insensitive substring (e.g. "grch38"). Exact
-    // name wins; otherwise the substring must match exactly one path, else error (missing / ambiguous).
+    // Per-run, not cumulative: see the declaration.
+    g_skipped_segments.store(0);
+
+    // Refuse a graph this caller cannot describe truthfully, before any of it is read. `spell()` skips
+    // a step whose node is absent, so an incomplete graph does not fail -- it produces shorter
+    // sequences, and every coordinate, SVLEN and allele derived from them is confidently wrong. Call
+    // spells by concatenating whole nodes, so a non-zero overlap would be double-counted the same way.
+    validate_graph_paths(graph, "call", /*require_sequences=*/true, /*require_zero_overlaps=*/true);
+
+    // Exact name wins, else a unique case-insensitive substring. Shared with bubble and inspect rather
+    // than reimplemented: this rule previously lived in two places and only one of them was fixed.
+    const std::string ref_name = resolve_reference_path_name(graph, options.reference_path, "call");
     const PathRecord* ref_path = nullptr;
     for (const PathRecord& p : graph.paths) {
-        if (p.name == options.reference_path) { ref_path = &p; break; }
+        if (p.name == ref_name) { ref_path = &p; break; }
     }
-    if (ref_path == nullptr) {
-        auto lower = [](std::string s) {
-            std::transform(s.begin(), s.end(), s.begin(),
-                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-            return s;
-        };
-        const std::string needle = lower(options.reference_path);
-        std::vector<const PathRecord*> hits;
-        for (const PathRecord& p : graph.paths) {
-            if (lower(p.name).find(needle) != std::string::npos) hits.push_back(&p);
+    if (ref_path == nullptr) throw std::runtime_error("call: reference path not found: " + ref_name);
+
+    const std::vector<Bubble> bubbles = read_bubbles_csv(options.bubbles_csv_in);
+    if (bubbles.empty()) {
+        throw std::runtime_error("call: bubbles CSV has no rows: " + options.bubbles_csv_in);
+    }
+    // The CSV and the graph must be the same pair. A CSV from another graph names nodes that do not
+    // exist here; every such bubble is then skipped and the run still exits 0 with a header-only VCF,
+    // which is indistinguishable from a locus with no variation.
+    {
+        std::unordered_set<std::size_t> seen_ids;
+        for (const Bubble& b : bubbles) {
+            if (!seen_ids.insert(b.id).second) {
+                throw std::runtime_error(
+                    "call: bubbles CSV has a duplicate bubble id: " + std::to_string(b.id) +
+                    " (each id must name one site; the same bubble would otherwise be called twice)");
+            }
+            for (const std::string& n : {b.source, b.sink}) {
+                if (graph.nodes.find(n) == graph.nodes.end()) {
+                    throw std::runtime_error(
+                        "call: bubble " + std::to_string(b.id) + " boundary node '" + n +
+                        "' is not in the graph -- the bubbles CSV does not belong to this GFA");
+                }
+            }
+            for (const std::string& n : b.inside) {
+                if (graph.nodes.find(n) == graph.nodes.end()) {
+                    throw std::runtime_error(
+                        "call: bubble " + std::to_string(b.id) + " interior node '" + n +
+                        "' is not in the graph -- the bubbles CSV does not belong to this GFA");
+                }
+            }
         }
-        if (hits.size() == 1) {
-            ref_path = hits.front();
-        } else if (hits.empty()) {
-            throw std::runtime_error("Reference path not found in GFA: " + options.reference_path);
-        } else {
-            std::string msg = "Reference path '" + options.reference_path + "' is ambiguous; matches " +
-                              std::to_string(hits.size()) + " paths:";
-            for (const PathRecord* p : hits) msg += "\n  " + p->name;
+    }
+    std::unordered_set<std::size_t> bubble_filter(options.bubble_ids.begin(), options.bubble_ids.end());
+    // A requested id that does not exist is a typo, not an empty result: without this the run reports
+    // success over zero bubbles and writes a header-only VCF.
+    if (!bubble_filter.empty()) {
+        std::unordered_set<std::size_t> have;
+        for (const Bubble& b : bubbles) have.insert(b.id);
+        std::vector<std::size_t> missing;
+        for (const std::size_t want : bubble_filter) if (!have.count(want)) missing.push_back(want);
+        if (!missing.empty()) {
+            std::sort(missing.begin(), missing.end());
+            std::string msg = "call: --bubble-id names " + std::to_string(missing.size()) +
+                              " id(s) not in " + options.bubbles_csv_in + ":";
+            for (const std::size_t m : missing) msg += " " + std::to_string(m);
             throw std::runtime_error(msg);
         }
     }
-    const std::string& ref_name = ref_path->name;
-
-    const std::vector<Bubble> bubbles = read_bubbles_csv(options.bubbles_csv_in);
-    std::unordered_set<std::size_t> bubble_filter(options.bubble_ids.begin(), options.bubble_ids.end());
 
     const ParsedReferencePath ref_meta = parse_reference_path_label(ref_name);
     const std::vector<std::size_t> ref_prefix = path_prefix_bp(*ref_path, graph.nodes);
@@ -701,7 +740,7 @@ void call_variants(
         out << "##contig=<ID=" << ref_meta.chrom << ">\n";
         out << "##INFO=<ID=END,Number=1,Type=Integer,Description=\"Last reference base the variant spans, inclusive. POS is the base BEFORE the event (symbolic convention), so the event occupies POS+1..END and END-POS is its reference span: |SVLEN| for DEL/INV, 0 for INS (which spans no reference), and the module's own reference span for a CN_SCOPE=COLLAPSED_MODULE DUP -- there it equals INFO/CN_MODULE_REF_BP, the interval FORMAT:CNBP is measured over\">\n";
         out << "##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"Structural variant type\">\n";
-        out << "##INFO=<ID=SVLEN,Number=1,Type=Integer,Description=\"Length difference ALT-REF. Absent on CN_SCOPE=COLLAPSED_MODULE records: their carriers both gain and lose copies, so no single record-level size exists -- read FORMAT:CNBP for the per-sample size\">\n";
+        out << "##INFO=<ID=SVLEN,Number=A,Type=Integer,Description=\"Length difference ALT-REF. Absent on CN_SCOPE=COLLAPSED_MODULE records: their carriers both gain and lose copies, so no single record-level size exists -- read FORMAT:CNBP for the per-sample size\">\n";
         out << "##INFO=<ID=SVLEN_RANGE,Number=2,Type=Integer,Description=\"Min,max event size among merged members (when they differ)\">\n";
         out << "##INFO=<ID=BUBBLE_ID,Number=1,Type=Integer,Description=\"panvar bubble identifier\">\n";
         out << "##INFO=<ID=START_NODE,Number=1,Type=String,Description=\"First graph node of the event\">\n";
@@ -731,8 +770,8 @@ void call_variants(
         out << "##INFO=<ID=MERGE_SEQID,Number=1,Type=Float,Description=\"Strongest sequence identity that merged a member into this record, when the Jaccard gate did not decide it\">\n";
         out << "##INFO=<ID=MERGE_SIZE_RATIO,Number=1,Type=Float,Description=\"Smallest/largest member size among merged members (min,max also in SVLEN_RANGE)\">\n";
         out << "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Allele number = haplotypes traversing the bubble\">\n";
-        out << "##INFO=<ID=AC,Number=1,Type=Integer,Description=\"Allele count = carrier haplotypes\">\n";
-        out << "##INFO=<ID=AF,Number=1,Type=Float,Description=\"Allele frequency = AC/AN (over traversing haplotypes)\">\n";
+        out << "##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count = carrier haplotypes\">\n";
+        out << "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Allele frequency = AC/AN (over traversing haplotypes)\">\n";
         out << "##INFO=<ID=NALLELES,Number=1,Type=Integer,Description=\"Number of alleles (REF+ALTs) at a multiallelic locus\">\n";
         out << "##INFO=<ID=EVENTID,Number=1,Type=String,Description=\"Shared id linking a co-located DEL+INS substitution\">\n";
         out << "##INFO=<ID=INSSEQ,Number=1,Type=String,Description=\"Inserted sequence\">\n";
@@ -2147,7 +2186,63 @@ void call_variants(
                          return a.id < b.id;
                      });
 
-    std::ofstream region_out(options.out_prefix + ".region.vcf");
+    // Every destination is resolved and checked BEFORE anything is opened, then written to a staged
+    // sibling and renamed in only once the whole run has succeeded. Previously a failure part-way
+    // through left a complete-looking region VCF beside a non-zero exit, and a run could overwrite its
+    // own input because nothing compared the two.
+    cli::StagedOutputs staged("call");
+    std::vector<std::string> finals;
+    finals.push_back(options.out_prefix + ".region.vcf");
+    if (options.allele_vcf) finals.push_back(options.out_prefix + ".alleles.vcf");
+    if (options.write_variant_nodes) finals.push_back(options.out_prefix + ".variant_nodes.tsv");
+    std::set<std::size_t> bubble_ids_out;
+    if (options.write_per_bubble_vcf) {
+        for (const OutRecord& rec : out_records) bubble_ids_out.insert(rec.bubble_id);
+        for (const std::size_t bid : bubble_ids_out)
+            finals.push_back(options.out_prefix + ".bubble_" + std::to_string(bid) + ".vcf");
+    }
+    {
+        const std::vector<std::string> inputs = {options.gfa_path, options.bubbles_csv_in,
+                                                 options.gtf_path};
+        std::unordered_set<std::string> seen_out;
+        for (const std::string& f : finals) {
+            if (!seen_out.insert(f).second)
+                throw std::runtime_error("call: two outputs would be written to the same file: " + f);
+            for (const std::string& in : inputs) {
+                if (in.empty()) continue;
+                std::error_code ec;
+                if (f == in || std::filesystem::equivalent(f, in, ec))
+                    throw std::runtime_error("call: output '" + f + "' is also an input; refusing to "
+                                             "overwrite the data being read");
+            }
+        }
+    }
+    // A previous run's per-bubble files are indistinguishable from this run's. Left in place, a
+    // --bubble-id run appears to have called every bubble the earlier full run did.
+    if (options.write_per_bubble_vcf) {
+        std::error_code ec;
+        const std::filesystem::path pfx(options.out_prefix);
+        const std::filesystem::path dir = pfx.has_parent_path() ? pfx.parent_path() : std::filesystem::path(".");
+        const std::string base = pfx.filename().string() + ".bubble_";
+        std::size_t removed = 0;
+        for (const auto& de : std::filesystem::directory_iterator(dir, ec)) {
+            if (ec) break;
+            const std::string name = de.path().filename().string();
+            if (name.rfind(base, 0) != 0 || de.path().extension() != ".vcf") continue;
+            const std::string mid = name.substr(base.size(), name.size() - base.size() - 4);
+            if (mid.empty() || mid.find_first_not_of("0123456789") != std::string::npos) continue;
+            if (bubble_ids_out.count(static_cast<std::size_t>(std::stoull(mid)))) continue;
+            std::filesystem::remove(de.path(), ec);
+            if (!ec) ++removed;
+        }
+        if (removed > 0 && !options.quiet) {
+            std::cerr << "[call] removed " << removed
+                      << " stale per-bubble VCF(s) from an earlier run at this prefix\n";
+        }
+    }
+
+    const std::string region_path = staged.stage(options.out_prefix + ".region.vcf");
+    std::ofstream region_out(region_path);
     if (!region_out) {
         throw std::runtime_error("Failed to write region VCF: " + options.out_prefix + ".region.vcf");
     }
@@ -2161,10 +2256,12 @@ void call_variants(
                              return a.id < b.id;
                          });
         const std::string path = options.out_prefix + ".alleles.vcf";
-        std::ofstream allele_out(path);
+        std::ofstream allele_out(staged.stage(path));
         if (!allele_out) throw std::runtime_error("Failed to write allele VCF: " + path);
         write_vcf_header(allele_out);
         for (const OutRecord& rec : allele_records) allele_out << rec.line;
+        allele_out.close();
+        if (!allele_out) throw std::runtime_error("Failed to finalize allele VCF: " + path);
     }
 
     std::map<std::size_t, std::ofstream> bubble_files;
@@ -2174,12 +2271,20 @@ void call_variants(
             auto& f = bubble_files[rec.bubble_id];
             if (!f.is_open()) {
                 const std::string path = options.out_prefix + ".bubble_" + std::to_string(rec.bubble_id) + ".vcf";
-                f.open(path);
+                f.open(staged.stage(path));
                 if (!f) throw std::runtime_error("Failed to write bubble VCF: " + path);
                 write_vcf_header(f);
             }
             f << rec.line;
         }
+    }
+    region_out.close();
+    if (!region_out) {
+        throw std::runtime_error("Failed to finalize region VCF: " + options.out_prefix + ".region.vcf");
+    }
+    for (auto& [bid, f] : bubble_files) {
+        f.close();
+        if (!f) throw std::runtime_error("Failed to finalize bubble VCF for bubble " + std::to_string(bid));
     }
 
     if (options.write_variant_nodes) {
@@ -2187,13 +2292,17 @@ void call_variants(
         // k-mer features to nodes participating in called variation) and the `benchmark` round-trip
         // (which nodes a call explains). Ordered START->END; the caller does not emit per-haplotype walks
         // -- `benchmark` reconstructs those from the graph + this node set.
-        std::ofstream vn_out(options.out_prefix + ".variant_nodes.tsv");
+        const std::string vn_path = options.out_prefix + ".variant_nodes.tsv";
+        std::ofstream vn_out(staged.stage(vn_path));
         if (!vn_out) {
-            throw std::runtime_error("Failed to write variant nodes TSV: " + options.out_prefix + ".variant_nodes.tsv");
+            throw std::runtime_error("Failed to write variant nodes TSV: " + vn_path);
         }
         vn_out << "variant_id\tbubble_id\tsvtype\tnode_ids\n";
         for (const std::string& r : variant_nodes_rows) vn_out << r << '\n';
+        vn_out.close();
+        if (!vn_out) throw std::runtime_error("Failed to finalize variant nodes TSV: " + vn_path);
     }
+    staged.commit();
 
     // GTF sidecars: node->genes map and per-gene DUP CN. CN comes from private-k-mer dosage -- each
     // gene's discriminative reference (merged CDS, else gene span) yields k-mers unique against its

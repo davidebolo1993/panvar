@@ -252,6 +252,7 @@ int run_call_command(const std::vector<std::string>& args) {
     if (gfa_path.empty()) {
         throw std::runtime_error("Missing required input: --gfa <path>");
     }
+    options.gfa_path = gfa_path;
     if (!bubble_prefix_in.empty()) {
         const std::string derived = bubble_prefix_in + ".bubbles.csv";
         if (options.bubbles_csv_in.empty()) {

@@ -9,6 +9,7 @@
 namespace panvar {
 
 struct VariantCallOptions {
+    std::string gfa_path;                // the graph's own path, so an output cannot alias an input
     std::string bubbles_csv_in;          // module-1 bubbles CSV
     std::string reference_path;          // required: graph path used as the diff baseline
     std::string out_prefix;              // writes <prefix>.bubble_<id>.vcf + <prefix>.region.vcf
