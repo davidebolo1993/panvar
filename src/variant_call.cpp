@@ -151,6 +151,7 @@ struct Event {
     bool dosage_spacing = false;      // MODULE_BP: CN came from the spacing model, not hbp/unit
     double round_residual = -1.0;     // MODULE_BP: mean distance from a whole number of units
     double round_ambiguous_frac = -1.0; // MODULE_BP: share of traversers rounding near a coin flip
+    std::size_t cn_clamped_zero = 0;  // MODULE_BP: traversers whose modelled dosage was below zero
     // What the spacing estimate actually rests on. A step is "one copy" only if the clusters it was
     // measured between are ADJACENT copy states, and that is an assumption the estimator cannot verify
     // from within -- these let a reader see how thin the evidence is instead of taking the number.
@@ -761,7 +762,7 @@ void call_variants(
         out << "##INFO=<ID=RU_LEN,Number=1,Type=Integer,Description=\"Repeat-unit length in bp, one copy. Emitted only for CN_METHOD=REP, where the unit is a literal repeat and (CN-REF_CN)*RU_LEN is the haplotype size\">\n";
         out << "##INFO=<ID=CN_UNIT_BP,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE_BP only: the reference-calibrated unit CN was divided by (CN_SHARED_BP/CN_REF_FOLD). This is the SHARED per-copy content, not a whole copy, so it is not a per-haplotype event size -- read FORMAT:CNBP for that\">\n";
         out << "##INFO=<ID=CN_METHOD,Number=1,Type=String,Description=\"How CN was measured: REP (traversal count of a panphorte REP self-loop, exact), MODULE_BP (folded-node bp over a reference-calibrated unit), PEAK (highest interior-node traversal multiplicity)\">\n";
-        out << "##INFO=<ID=CN_SCOPE,Number=1,Type=String,Description=\"What one copy is a copy of: REPEAT_UNIT (a literal repeat unit, so (CN-REF_CN)*RU_LEN is the haplotype's event size) or COLLAPSED_MODULE (a module that may hold several distinct paralogs, so RU_LEN is the SHARED per-copy content and per-haplotype size must be read from FORMAT:CNBP)\">\n";
+        out << "##INFO=<ID=CN_SCOPE,Number=1,Type=String,Description=\"What one copy is a copy of: REPEAT_UNIT (a literal repeat unit, so (CN-REF_CN)*RU_LEN is the haplotype's event size) or COLLAPSED_MODULE (a module that may hold several distinct paralogs, so RU_LEN is NOT emitted -- the shared per-copy content is reported as CN_UNIT_BP, and per-haplotype size must be read from FORMAT:CNBP)\">\n";
         out << "##INFO=<ID=CN_SHARED_BP,Number=1,Type=Integer,Description=\"Reference bp in the folded (revisited) node set the MODULE_BP unit was calibrated from\">\n";
         out << "##INFO=<ID=CN_REF_FOLD,Number=1,Type=Integer,Description=\"How many times the reference revisits that folded set; the MODULE_BP unit is CN_SHARED_BP/CN_REF_FOLD\">\n";
         out << "##INFO=<ID=CN_MODULE_REF_BP,Number=1,Type=Integer,Description=\"Reference bp across the whole bubble interior. Against CN_SHARED_BP this is the shared-versus-total question: RU_LEN describes the shared part only, and their ratio is how far (CN-REF_CN)*RU_LEN understates a carrier's real gain or loss\">\n";
@@ -776,6 +777,7 @@ void call_variants(
         out << "##INFO=<ID=REF_CN_SOURCE,Number=1,Type=String,Description=\"How REF_CN was anchored: REP_TRAVERSAL (exact self-loop count) or MAX_NODE_MULTIPLICITY (a heuristic -- one short node visited N times can set it, so absolute CN on that route is heuristic even where relative dosage is sound)\">\n";
         out << "##INFO=<ID=CN_CONFIDENCE,Number=1,Type=String,Description=\"HEURISTIC on CN_METHOD=PEAK, which infers dosage from the highest interior-node traversal multiplicity and is not validated against external copy-number truth\">\n";
         out << "##INFO=<ID=CN_ROUND_RESIDUAL,Number=1,Type=Float,Description=\"MODULE_BP only: MEAN distance from a whole number of units across traversers, 0..0.5. Reported for continuity, but the per-sample residuals are BIMODAL at a paralog module -- most near 0 or near 0.5 -- so this mean describes no sample and moves with their ratio. Read CN_ROUND_AMBIGUOUS_FRAC for the record-level summary and FORMAT:CNR_MARGIN per sample\">\n";
+        out << "##INFO=<ID=CN_CLAMPED_ZERO,Number=1,Type=Integer,Description=\"MODULE_BP only: traversing haplotypes whose modelled dosage came out BELOW zero copies and whose reported CN was therefore floored at 0. Only the spacing model can produce this, when a walk is shorter than the reference's by more than REF_CN steps. Their CN is a boundary value rather than a measurement; FORMAT:CNR_RAW still carries the unclamped dosage. Absent when none occurred\">\n";
         out << "##INFO=<ID=CN_ROUND_AMBIGUOUS_FRAC,Number=1,Type=Float,Description=\"MODULE_BP only: share of traversing haplotypes whose dosage sat more than 0.4 units from a whole number, i.e. whose integer CN came from a near coin-flip rounding. This is what --max-cn-model-residual gates on. A high value does NOT by itself mean the CN is wrong: the reference locus with the worst value is exact against pangene truth on every haplotype, because the unit is a calibration constant for a heterogeneous module rather than one real copy\">\n";
         if (!genes.empty())
             out << "##INFO=<ID=GENES,Number=.,Type=String,Description=\"Gene(s) overlapping the variant (from --gtf)\">\n";
@@ -799,6 +801,7 @@ void call_variants(
         out << "##FORMAT=<ID=CN,Number=1,Type=Integer,Description=\"Copy number of the repeat unit (DUP records)\">\n";
         out << "##FORMAT=<ID=CNBP,Number=1,Type=Integer,Description=\"Actual linear bp gained(+)/lost(-) by this haplotype across the copy-number module vs the reference, from the spelled walk length (sum of node length x traversal multiplicity over the bubble source->sink, minus the reference's). Recovers the linear SV size that the folded one-copy RU_LEN does not convey; DUP records only.\">\n";
         out << "##FORMAT=<ID=CNR_RAW,Number=1,Type=Float,Description=\"CN_METHOD=MODULE_BP only: this haplotype's raw dosage before rounding to CN. Which quantity that is depends on INFO/CN_DOSAGE_MODEL: hbp/CN_UNIT_BP under REFERENCE_RATIO, or REF_CN+(hbp-CN_SHARED_BP)/CN_STEP_BP under PANEL_SPACING\">\n";
+        out << "##FORMAT=<ID=CNRESID,Number=1,Type=Integer,Description=\"CN_METHOD=REP only: CNBP - (CN-REF_CN)*RU_LEN, the bp this haplotype gained or lost that its repeat-copy change does NOT explain. 0 means the whole size difference is copy number; a large value means other sequence changed in the same bubble. Emitted only for a literal repeat unit, where RU_LEN is a real per-copy length -- on a collapsed module RU_LEN is a calibration constant and the difference would measure that, not biology\">\n";
         out << "##FORMAT=<ID=CNR_MARGIN,Number=1,Type=Float,Description=\"CN_METHOD=MODULE_BP only: 0.5 minus this haplotype's distance from a whole number of units. Near 0.5 the integer CN is unambiguous; near 0 the rounding was a coin flip and CN should be read with that in mind\">\n";
         out << "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT";
         for (const std::string& s : sample_names) out << '\t' << s;
@@ -999,6 +1002,7 @@ void call_variants(
             double max_support = 0.0;     // share of folded bp actually at ref_fold
             double round_residual = 0.0;  // mean |hbp/unit - nearest integer| over traversers, 0..0.5
             std::size_t round_ambiguous = 0;  // traversers whose rounding was near a coin flip (>0.4)
+            std::size_t cn_clamped_zero = 0;  // traversers whose modelled dosage came out below zero
             if (ref_idx < graph.paths.size()) {
                 const auto ref_span = span_of(ref_idx);
                 const std::vector<PathStep>& steps = graph.paths[ref_idx].steps;
@@ -1117,13 +1121,38 @@ void call_variants(
                 // honest outcome is to say so, not to quietly compute the biased ratio model under a
                 // flag the user set to avoid exactly that. CN_DOSAGE_MODEL would have recorded the
                 // substitution, but only for a reader who thought to check it.
-                if (options.cn_unit_spacing && step_bp <= 0.0) {
-                    throw std::runtime_error(
-                        "call: --cn-unit-spacing was given but bubble " + std::to_string(bubble.id) +
-                        " has no estimable copy-state spacing (" + std::to_string(all_hbp.size()) +
-                        " traversing haplotype(s) fell into " + std::to_string(step_clusters) +
-                        " cluster(s), leaving no gap between two populated ones). Rerun without the "
-                        "flag to use the reference-ratio model, which is biased but always defined");
+                if (options.cn_unit_spacing) {
+                    // Reporting that a model is unsupported while still using it is not enough. The
+                    // step is only a copy when the clusters it was measured between are adjacent copy
+                    // states and evenly spaced, so each of those is a precondition, not a caveat.
+                    std::string why;
+                    if (step_bp <= 0.0) {
+                        why = std::to_string(all_hbp.size()) + " traversing haplotype(s) fell into " +
+                              std::to_string(step_clusters) +
+                              " cluster(s), leaving no gap between two populated ones";
+                    } else if (step_gaps < 2) {
+                        why = "the step rests on a single gap between two clusters, with nothing to "
+                              "cross-check that they are one copy apart";
+                    } else if (step_max_multiple >= 1.5) {
+                        std::ostringstream m; m.setf(std::ios::fixed); m.precision(2);
+                        m << step_max_multiple;
+                        why = "the widest gap is " + m.str() +
+                              "x the chosen step, so at least one copy state is missing from the "
+                              "panel between two observed clusters";
+                    } else if (step_max_offint > 0.15) {
+                        std::ostringstream o; o.setf(std::ios::fixed); o.precision(3);
+                        o << step_max_offint;
+                        why = "a gap sits " + o.str() +
+                              " of a step from any whole number of copies, so the clusters are not "
+                              "evenly spaced and are not copy states";
+                    }
+                    if (!why.empty()) {
+                        throw std::runtime_error(
+                            "call: --cn-unit-spacing was given but bubble " + std::to_string(bubble.id) +
+                            " cannot support it: " + why +
+                            ". Rerun without the flag to use the reference-ratio model, which is "
+                            "biased but always defined");
+                    }
                 }
                 mr.seed.shared_fold_bp = ref_bp;
                 mr.seed.ref_fold = ref_fold;
@@ -1145,10 +1174,16 @@ void call_variants(
                     // long, and the cast to size_t wraps it to something astronomical.
                     const long long rounded = std::llround(exact);
                     const std::size_t copies = rounded > 0 ? static_cast<std::size_t>(rounded) : 0;
+                    if (rounded < 0) ++cn_clamped_zero;
                     // How far each haplotype sits from a whole number of units. A calibrated unit should
                     // divide real walks nearly exactly; persistent halves mean the unit is wrong, and
                     // rounding then manufactures a confident integer out of a bad fit.
-                    const double resid = std::fabs(exact - static_cast<double>(copies));
+                    //
+                    // Measured against the model's own rounded value, NOT the zero-clamped CN. Using
+                    // the clamped one made a negative dosage report a residual above 0.5 and a
+                    // CNR_MARGIN below 0, both of which their headers rule out. The clamp is a
+                    // reporting floor and belongs in CN_CLAMPED_ZERO, not in the fit statistic.
+                    const double resid = std::fabs(exact - static_cast<double>(rounded));
                     round_residual += resid;
                     ++round_n;
                     // Count the samples whose rounding was close to a coin flip. The mean above cannot
@@ -1167,6 +1202,7 @@ void call_variants(
                 mr.seed.round_residual = round_n > 0 ? round_residual / static_cast<double>(round_n) : 0.0;
                 mr.seed.round_ambiguous_frac =
                     round_n > 0 ? static_cast<double>(round_ambiguous) / static_cast<double>(round_n) : 0.0;
+                mr.seed.cn_clamped_zero = cn_clamped_zero;
                 // Gate on the SHARE of samples whose rounding was a coin flip, not on the mean residual.
                 // The mean is a bad summary of a bimodal distribution -- at GSTM1 the median sample sits
                 // at 0.045 and the 90th percentile at 0.496, so the mean of 0.197 describes no sample --
@@ -2094,6 +2130,7 @@ void call_variants(
                      << (e.cn_method == CnMethod::Rep ? "REP_TRAVERSAL" : "MAX_NODE_MULTIPLICITY");
             }
             if (e.cn_method == CnMethod::Peak) info << ";CN_CONFIDENCE=HEURISTIC";
+            if (e.cn_clamped_zero > 0) info << ";CN_CLAMPED_ZERO=" << e.cn_clamped_zero;
             if (e.round_ambiguous_frac >= 0.0) {
                 std::ostringstream r; r.setf(std::ios::fixed); r.precision(4);
                 r << e.round_ambiguous_frac; info << ";CN_ROUND_AMBIGUOUS_FRAC=" << r.str();
@@ -2159,7 +2196,9 @@ void call_variants(
             std::ostringstream row;
             row << ref_meta.chrom << '\t' << pos << '\t' << id << '\t' << ref_base
                 << "\t<" << svt << ">\t.\t.\t" << info.str()
-                << (is_dup ? (mr.sample_dosage.empty() ? "\tGT:CN:CNBP" : "\tGT:CN:CNBP:CNR_RAW:CNR_MARGIN")
+                << (is_dup ? (e.cn_method == CnMethod::Rep && e.ru_len > 0
+                                  ? "\tGT:CN:CNBP:CNRESID"
+                                  : mr.sample_dosage.empty() ? "\tGT:CN:CNBP" : "\tGT:CN:CNBP:CNR_RAW:CNR_MARGIN")
                            : "\tGT:CN");
             for (const std::string& s : sample_names) {
                 row << '\t';
@@ -2182,7 +2221,20 @@ void call_variants(
                             " route); a traversing haplotype must always have a measured CN");
                     }
                     row << cit->second;
-                    row << ':' << sample_cnbp(s);
+                    const long long this_cnbp = sample_cnbp(s);
+                    row << ':' << this_cnbp;
+                    // CNRESID (REP only): what the repeat-copy change does NOT account for. A literal
+                    // REP unit has a real per-copy length, so (CN-REF_CN)*RU_LEN is a genuine
+                    // prediction of this haplotype's bp change and the remainder is other sequence
+                    // change in the same bubble. Deliberately absent on a collapsed module, where
+                    // RU_LEN is a calibration constant rather than one copy and the difference would
+                    // measure the calibration rather than the biology.
+                    if (e.cn_method == CnMethod::Rep && e.ru_len > 0) {
+                        const long long predicted =
+                            (static_cast<long long>(cit->second) - static_cast<long long>(e.ref_cn)) *
+                            static_cast<long long>(e.ru_len);
+                        row << ':' << (this_cnbp - predicted);
+                    }
                     // Per sample, because that is where the ambiguity lives: how far this haplotype sat
                     // from a whole number of units, and how much room it had before the rounding would
                     // have gone the other way.
@@ -2280,6 +2332,15 @@ void call_variants(
         for (const std::size_t bid : bubble_ids_out)
             finals.push_back(options.out_prefix + ".bubble_" + std::to_string(bid) + ".vcf");
     }
+    // The GTF sidecars belong to the same transaction as the VCFs. Committing the VCF family first and
+    // then writing them directly meant a sidecar failure left the VCFs already installed, and it kept
+    // them out of the collision check below -- so an input GTF named <prefix>.node_genes.tsv could be
+    // overwritten by the run reading it.
+    const bool gtf_active = !options.gtf_path.empty() && !genes.empty();
+    if (gtf_active) {
+        finals.push_back(options.out_prefix + ".node_genes.tsv");
+        finals.push_back(options.out_prefix + ".dup_gene_cn.tsv");
+    }
     {
         const std::vector<std::string> inputs = {options.gfa_path, options.bubbles_csv_in,
                                                  options.gtf_path};
@@ -2296,27 +2357,26 @@ void call_variants(
             }
         }
     }
-    // A previous run's per-bubble files are indistinguishable from this run's. Left in place, a
-    // --bubble-id run appears to have called every bubble the earlier full run did.
-    if (options.write_per_bubble_vcf) {
+    // Per-bubble VCFs an earlier run left at this prefix and this run will not rewrite. Collected now
+    // but REMOVED only after the transaction commits: deleting first meant a later failure destroyed
+    // part of a previous successful result and put nothing in its place. Not gated on
+    // --write-per-bubble-vcf either -- a rerun with --no-per-bubble-vcf leaves the old files looking
+    // like current output, which is the same defect in a different shape.
+    std::vector<std::filesystem::path> obsolete_bubble_vcfs;
+    {
         std::error_code ec;
         const std::filesystem::path pfx(options.out_prefix);
         const std::filesystem::path dir = pfx.has_parent_path() ? pfx.parent_path() : std::filesystem::path(".");
         const std::string base = pfx.filename().string() + ".bubble_";
-        std::size_t removed = 0;
         for (const auto& de : std::filesystem::directory_iterator(dir, ec)) {
             if (ec) break;
             const std::string name = de.path().filename().string();
             if (name.rfind(base, 0) != 0 || de.path().extension() != ".vcf") continue;
             const std::string mid = name.substr(base.size(), name.size() - base.size() - 4);
             if (mid.empty() || mid.find_first_not_of("0123456789") != std::string::npos) continue;
-            if (bubble_ids_out.count(static_cast<std::size_t>(std::stoull(mid)))) continue;
-            std::filesystem::remove(de.path(), ec);
-            if (!ec) ++removed;
-        }
-        if (removed > 0 && !options.quiet) {
-            std::cerr << "[call] removed " << removed
-                      << " stale per-bubble VCF(s) from an earlier run at this prefix\n";
+            if (options.write_per_bubble_vcf &&
+                bubble_ids_out.count(static_cast<std::size_t>(std::stoull(mid)))) continue;
+            obsolete_bubble_vcfs.push_back(de.path());
         }
     }
 
@@ -2381,14 +2441,13 @@ void call_variants(
         vn_out.close();
         if (!vn_out) throw std::runtime_error("Failed to finalize variant nodes TSV: " + vn_path);
     }
-    staged.commit();
 
     // GTF sidecars: node->genes map and per-gene DUP CN. CN comes from private-k-mer dosage -- each
     // gene's discriminative reference (merged CDS, else gene span) yields k-mers unique against its
     // paralogs, and a haplotype's per-copy count of those is its CN. Separates collapsed paralogs that
     // graph multiplicity cannot, without per-haplotype alignment.
     if (!genes.empty()) {
-        write_node_genes_tsv(options.out_prefix + ".node_genes.tsv", node_genes, genes);
+        write_node_genes_tsv(staged.stage(options.out_prefix + ".node_genes.tsv"), node_genes, genes);
 
         if (!dup_targets.empty()) {
             // Per-gene resolution (spelling every haplotype + building k-mer sets) is only meaningful when
@@ -2483,12 +2542,35 @@ void call_variants(
             }
         }
 
-        std::ofstream dg_out(options.out_prefix + ".dup_gene_cn.tsv");
+        const std::string dg_path = options.out_prefix + ".dup_gene_cn.tsv";
+        std::ofstream dg_out(staged.stage(dg_path));
         if (!dg_out) {
-            throw std::runtime_error("Failed to write per-gene DUP CN TSV: " + options.out_prefix + ".dup_gene_cn.tsv");
+            throw std::runtime_error("Failed to write per-gene DUP CN TSV: " + dg_path);
         }
         dg_out << "bubble_id\tvariant_id\tsample\tgenes\tcn\treliable\tdosage\thits\tpriv_kmers\n";
         for (const std::string& r : dup_gene_cn_rows) dg_out << r << '\n';
+        dg_out.close();
+        if (!dg_out) throw std::runtime_error("Failed to finalize per-gene DUP CN TSV: " + dg_path);
+    }
+
+    // One commit for the whole family -- VCFs, variant nodes and the GTF sidecars together.
+    staged.commit();
+    // Only now are the superseded files safe to drop: until the new outputs are installed, removing
+    // them would leave a failed run having destroyed the previous good result.
+    if (!obsolete_bubble_vcfs.empty()) {
+        std::size_t removed = 0;
+        for (const std::filesystem::path& p : obsolete_bubble_vcfs) {
+            std::error_code ec;
+            if (std::filesystem::remove(p, ec) && !ec) ++removed;
+            else if (ec) {
+                std::cerr << "warning: could not remove stale per-bubble VCF " << p.string()
+                          << ": " << ec.message() << " (it does not belong to this run)\n";
+            }
+        }
+        if (removed > 0 && !options.quiet) {
+            std::cerr << "[call] removed " << removed
+                      << " stale per-bubble VCF(s) from an earlier run at this prefix\n";
+        }
     }
 
     if (summary_out) *summary_out = summary;

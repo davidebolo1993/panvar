@@ -102,6 +102,21 @@ def main():
     # truth on the MODULE's scale
     data = [(C + off, x, cn) for C, x, cn in pairs]
 
+    # An auto offset is taken from the CALLED CN, so it absorbs any constant error in REF_CN. What
+    # remains is a test of relative dosage, not of the absolute anchor. Report the unshifted numbers
+    # alongside so the two questions stay separate; --offset N makes the shift a stated assumption.
+    if args.offset == "auto":
+        exact0 = sum(1 for C, _x, cn in pairs if cn == C)
+        print(f"### {args.label}   OFFSET IS AUTO ({off:+d}), taken from the called CN itself")
+        print(f"  Against UNSHIFTED truth: integer agreement {exact0}/{len(pairs)} "
+              f"({100.0*exact0/len(pairs):.1f}%)")
+        if off != 0:
+            print(f"  The {off:+d} shift below is therefore NOT validated -- it is assumed. Everything "
+                  f"after this line tests relative dosage only.")
+            print(f"  Re-run with --offset 0, or with a biologically justified constant, to test the "
+                  f"absolute REF_CN anchor.")
+        print()
+
     exact = sum(1 for C, _x, cn in data if cn == C)
     raw_err = [x - C for C, x, _cn in data]
     slope = (sum(x * C for C, x, _ in data) / sum(C * C for C, _x, _ in data)) if data else float("nan")

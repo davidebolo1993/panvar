@@ -35,7 +35,10 @@ void print_call_help() {
         << "                                   same-locus events of different sizes, e.g. STR alleles\n"
         << "                                   (default: 0 = use --merge-seq-identity)\n"
         << "      --min-haplotypes <N>         Drop records carried by fewer than N haplotypes (default: 1)\n"
-        << "      --min-maf <X>                Drop records with AF (carriers/traversing-haps) below X (default: 0=off)\n"
+        << "      --min-alt-af <X>             Drop records whose ALT carrier frequency (carriers over\n"
+        << "                                   traversing haplotypes) is below X. Not a minor-allele\n"
+        << "                                   frequency: a DUP's reference-like state is not an allele\n"
+        << "                                   here (default: 0=off; --min-maf is an accepted alias)\n"
         << "      --allele-vcf                 Also write <prefix>.alleles.vcf: one record per bubble carrying\n"
         << "                                   EVERY distinct allele as explicit sequence, each haplotype's GT\n"
         << "                                   indexing its own. Lossless companion to the merged region VCF,\n"
@@ -151,7 +154,7 @@ int run_call_command(const std::vector<std::string>& args) {
             options.min_haplotypes = cli::parse_size_arg(arg, require_value(arg));
             continue;
         }
-        if (arg == "--min-maf") {
+        if (arg == "--min-alt-af" || arg == "--min-maf") {   // --min-maf is the historical spelling
             options.min_maf = cli::parse_unit_fraction_arg(arg, require_value(arg));
             continue;
         }
@@ -192,7 +195,9 @@ int run_call_command(const std::vector<std::string>& args) {
             continue;
         }
         if (arg == "--max-dup-region-frac") {  // suppress a peak DUP spanning > this fraction of the reference
-            options.max_dup_region_frac = std::stod(require_value(arg));
+            // A fraction of the reference, so 0..1. Raw std::stod accepted 2, and "nan" -- which then
+            // compared false against everything and silently disabled the guard.
+            options.max_dup_region_frac = cli::parse_unit_fraction_arg(arg, require_value(arg));
             continue;
         }
         if (arg == "--cn-unit-spacing") {   // take the MODULE_BP copy step from the panel, not ref_bp/ref_fold
@@ -208,7 +213,13 @@ int run_call_command(const std::vector<std::string>& args) {
             continue;
         }
         if (arg == "--minimap-preset") {
+            // Only the three the help advertises; anything else reaches minimap2 as an unknown preset.
             options.minimap_preset = require_value(arg);
+            if (options.minimap_preset != "asm5" && options.minimap_preset != "asm10" &&
+                options.minimap_preset != "asm20") {
+                throw std::runtime_error("--minimap-preset must be asm5, asm10 or asm20 (got '" +
+                                         options.minimap_preset + "')");
+            }
             continue;
         }
         if (arg == "--minimap-best-n") {
@@ -300,6 +311,19 @@ int run_call_command(const std::vector<std::string>& args) {
                  (summary.tangle_bubbles > 0
                       ? "; " + std::to_string(summary.tangle_bubbles) + " bubble(s) flagged tangle"
                       : ""));
+    }
+    // Both of these are guaranteed losses, and a quiet run previously left no record of either: the
+    // counters reached the summary struct and nothing printed them, so a missing CN call or an
+    // unaligned divergent block had no durable reason anywhere in the output.
+    if (summary.skipped_large_segments > 0) {
+        log.info("skipped " + std::to_string(summary.skipped_large_segments) +
+                 " divergent block(s) too large to align; each is a false negative, not a quiet pass");
+    }
+    if (summary.declined_cn_model > 0) {
+        log.info("declined " + std::to_string(summary.declined_cn_model) +
+                 " module copy-number call(s) over --max-cn-model-residual, leaving " +
+                 std::to_string(summary.declined_cn_model_bubbles) +
+                 " bubble(s) with no CN record (sequence-resolved events are unaffected)");
     }
 
     std::vector<std::string> outputs;

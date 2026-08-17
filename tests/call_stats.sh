@@ -177,6 +177,49 @@ for k in AC AF SVLEN; do
   [ "$got" = "A" ] && ok "INFO/$k is declared Number=A" || bad "INFO/$k: expected Number=A, got ${got:-<missing>}"
 done
 
+# Option contracts. A fraction that is not a fraction used to be accepted: nan then compared false
+# against everything and silently disabled the guard it was meant to set.
+for bad in nan 2 -0.5; do
+  refuses "--max-dup-region-frac $bad is refused" "must be in [0,1]" \
+    "$BIN" call -i "$OUT/cb.sorted.gfa" -c "$OUT/cb.bubbles.csv" -r "$REF_NAME" --max-dup-region-frac "$bad" -q
+done
+refuses "--minimap-preset must be one of the advertised three" "must be asm5" \
+  "$BIN" call -i "$OUT/cb.sorted.gfa" -c "$OUT/cb.bubbles.csv" -r "$REF_NAME" --minimap-preset bogus -q
+
+# --min-alt-af is the honest name; --min-maf stays accepted so existing pipelines do not break.
+"$BIN" call -i "$OUT/cb.sorted.gfa" -c "$OUT/cb.bubbles.csv" -r "$REF_NAME" -o "$OUT/af1" --min-alt-af 0.1 -q >/dev/null 2>&1
+"$BIN" call -i "$OUT/cb.sorted.gfa" -c "$OUT/cb.bubbles.csv" -r "$REF_NAME" -o "$OUT/af2" --min-maf 0.1 -q >/dev/null 2>&1
+if [ -s "$OUT/af1.region.vcf" ] && cmp -s "$OUT/af1.region.vcf" "$OUT/af2.region.vcf"; then
+  ok "--min-alt-af and its --min-maf alias agree"
+else bad "--min-alt-af and --min-maf disagree (or one failed)"; fi
+
+# A rerun with --no-per-bubble-vcf must not leave the previous run's per-bubble files looking current.
+"$BIN" call -i "$OUT/cb.sorted.gfa" -c "$OUT/cb.bubbles.csv" -r "$REF_NAME" -o "$OUT/npb" -q >/dev/null 2>&1
+npb_before=$(ls "$OUT"/npb.bubble_*.vcf 2>/dev/null | wc -l | tr -d ' ')
+"$BIN" call -i "$OUT/cb.sorted.gfa" -c "$OUT/cb.bubbles.csv" -r "$REF_NAME" -o "$OUT/npb" --no-per-bubble-vcf -q >/dev/null 2>&1
+npb_after=$(ls "$OUT"/npb.bubble_*.vcf 2>/dev/null | wc -l | tr -d ' ')
+[ "$npb_before" = "3" ] && [ "$npb_after" = "0" ] \
+  && ok "--no-per-bubble-vcf clears the previous run's per-bubble VCFs ($npb_before -> $npb_after)" \
+  || bad "--no-per-bubble-vcf stale files: expected 3 -> 0, got $npb_before -> $npb_after"
+
+# Output must not depend on thread count. The per-bubble loop is parallel and writes into per-bubble
+# slots, so a shared-state regression would show up as a reordering rather than a crash.
+"$BIN" call -i "$OUT/cb.sorted.gfa" -c "$OUT/cb.bubbles.csv" -r "$REF_NAME" -o "$OUT/t1" --threads 1 --allele-vcf -q >/dev/null 2>&1
+"$BIN" call -i "$OUT/cb.sorted.gfa" -c "$OUT/cb.bubbles.csv" -r "$REF_NAME" -o "$OUT/t8" --threads 8 --allele-vcf -q >/dev/null 2>&1
+if cmp -s "$OUT/t1.region.vcf" "$OUT/t8.region.vcf" && cmp -s "$OUT/t1.alleles.vcf" "$OUT/t8.alleles.vcf"; then
+  ok "1 thread and 8 threads give byte-identical region and allele VCFs"
+else bad "output differs between 1 and 8 threads"; fi
+
+# The allele VCF is the lossless record and must not depend on anything being interpretable. Raising
+# --min-sv-bp above every event empties the region VCF; the allele VCF must still describe the site.
+"$BIN" call -i "$OUT/cb.sorted.gfa" -c "$OUT/cb.bubbles.csv" -r "$REF_NAME" -o "$OUT/nolo" \
+      --min-sv-bp 100000 --allele-vcf -q >/dev/null 2>&1
+nolo_region=$(grep -v "^#" "$OUT/nolo.region.vcf" 2>/dev/null | wc -l | tr -d " ")
+nolo_alleles=$(grep -v "^#" "$OUT/nolo.alleles.vcf" 2>/dev/null | wc -l | tr -d " ")
+[ "$nolo_region" = "0" ] && [ "$nolo_alleles" -gt 0 ] \
+  && ok "the allele VCF survives a region VCF with no interpreted calls ($nolo_alleles records)" \
+  || bad "allele-VCF independence: region=$nolo_region alleles=$nolo_alleles (want region 0, alleles > 0)"
+
 printf "\n"
 if [ "$fails" -eq 0 ]; then printf "call_stats: all assertions passed\n"; exit 0; fi
 printf "call_stats: %d assertion(s) failed\n" "$fails"; exit 1

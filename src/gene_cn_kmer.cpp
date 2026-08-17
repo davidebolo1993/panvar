@@ -163,6 +163,12 @@ struct PairSiteEvidence {
     long sites = 0;
     int cn_a = 0, cn_b = 0;
     long hits_a = 0, hits_b = 0, priv_a = 0, priv_b = 0;
+    // Did THIS haplotype produce a usable split? `sites` and `priv_*` describe the marker sets, which
+    // exist for every haplotype once the pair has divergent sites at all, so neither can answer it.
+    // Without this the pair's global separability was read as per-haplotype evidence and a haplotype
+    // with no usable site published cn_a=cn_b=0 as a confident call.
+    long usable_sites = 0;
+    bool resolved = false;
 };
 
 // Per-site consensus split of a near-identical gene pair (a, b). Aligns b (query) to a (target) ONCE to
@@ -239,9 +245,10 @@ std::vector<PairSiteEvidence> resolve_pair_cn_persite(
             if (asz > 0 && bsz > 0) {
                 const double na = static_cast<double>(ah[si]) / static_cast<double>(asz);
                 const double nb = static_cast<double>(bh[si]) / static_cast<double>(bsz);
-                if (na + nb >= 0.5) fr.push_back(na / (na + nb));
+                if (na + nb >= 0.5) { fr.push_back(na / (na + nb)); ++e.usable_sites; }
             }
         }
+        e.resolved = !fr.empty();
         if (!fr.empty()) {
             std::sort(fr.begin(), fr.end());
             const double med = (fr.size() % 2) ? fr[fr.size() / 2]
@@ -313,17 +320,26 @@ std::vector<std::vector<GeneCnEvidence>> resolve_gene_cn(
         if (pev.empty() || pev[0].sites == 0) continue;   // per-site failed -> keep pooled dosage
         for (std::size_t hp = 0; hp < hap_seqs.size(); ++hp) {
             GeneCnEvidence& ea = ev[hp][ia];
-            // Separability is per HAPLOTYPE, not per pair. `sites` above says the pair could be
-            // separated somewhere in the panel; it does not say this haplotype carried any of those
-            // sites. Marking it separable anyway published cn=0 from hits=0 over priv=0 as a
-            // confident call, when the honest outcome is to fall back to the module total.
+            // Separability is per HAPLOTYPE, not per pair. `sites` says the pair could be separated
+            // somewhere in the panel and `priv_*` are marker-set sizes that exist for every haplotype
+            // regardless, so neither answers whether THIS haplotype had evidence. Only `resolved`
+            // does. Testing priv_kmers instead was true whenever the pair had sites at all, so a
+            // haplotype with no usable site still published cn=0 as a confident call -- and the check
+            // could never fire, which is what made it look like the case did not arise.
+            if (!pev[hp].resolved) {
+                // Leave the pooled estimate in place and mark it unreliable; the caller then reports
+                // the module total for this haplotype rather than a split it has no basis for.
+                ea.separable = false;
+                ev[hp][ib].separable = false;
+                continue;
+            }
             ea.cn = pev[hp].cn_a; ea.hits = pev[hp].hits_a; ea.priv_kmers = pev[hp].priv_a;
             ea.dosage = ea.priv_kmers > 0 ? static_cast<double>(ea.hits) / static_cast<double>(ea.priv_kmers) : 0.0;
-            ea.separable = ea.priv_kmers > 0;
+            ea.separable = true;
             GeneCnEvidence& eb = ev[hp][ib];
             eb.cn = pev[hp].cn_b; eb.hits = pev[hp].hits_b; eb.priv_kmers = pev[hp].priv_b;
             eb.dosage = eb.priv_kmers > 0 ? static_cast<double>(eb.hits) / static_cast<double>(eb.priv_kmers) : 0.0;
-            eb.separable = eb.priv_kmers > 0;
+            eb.separable = true;
         }
     }
     return ev;
