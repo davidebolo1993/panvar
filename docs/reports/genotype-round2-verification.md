@@ -554,79 +554,144 @@ The generator flags were verified against the tool rather than guessed. An earli
 experiment used `--nested`, `--segdup` and `--vntr`, none of which exist; it would have run the same
 default locus eight times under eight labels and reported no difference anywhere.
 
-### 8.6 Robustness is not needed on this data, and the measurement says which
+### 8.6 Robustness: one hypothesis removed, the question not settled
 
-The review recommended a corrected Huber or negative binomial estimator rather than a plain mean. That
-was the right instinct and the measurement declines it for this fixture. Assuming the anchor counts are
-plain Poisson at the observed mean, with no contamination whatever:
+An earlier revision of this section claimed robustness was not needed. **That was overstated and is
+withdrawn.** Matching three summary statistics does not establish that 19,330 counts follow a
+homogeneous Poisson distribution; marker-specific efficiency, GC, repeated markers and mixtures can all
+preserve mean, median and trimmed mean simultaneously.
 
-| statistic | predicted by Poisson(23.2505) | observed |
+The check also used the wrong trimming definition. It compared against a Poisson expectation computed
+by retaining complete integer states between the 10th and 90th percentiles, which holds 85.4 percent of
+the mass rather than 80 percent. The implemented estimator drops exactly 10 percent of observations
+from each end. Simulating that estimator directly:
+
+| statistic | Poisson(23.2505) target | observed |
 |---|---|---|
 | median | 23 | 23.0000 |
-| 10 percent trimmed mean | 23.2018 | 23.1396 |
+| 10 percent trimmed mean, as implemented | 23.1503 | 23.1396 |
 | mean | 23.2505 | 23.250491 |
 
-**The median's downward bias is entirely explained by the discreteness and skew of the count
-distribution itself, not by outliers.** There is no contaminating tail to be robust against, so a
-downweighting estimator would reintroduce precisely the class of bias the trimmed mean already
-demonstrated, for no gain. The small residual, an observed trimmed mean 0.06 below the Poisson
-prediction, is in the opposite direction from a heavy right tail and argues against downweighting more
-strongly still.
+The corrected gap on the trimmed mean is 0.011 rather than the 0.062 previously reported, so the data
+is closer to Poisson than the flawed check suggested. The error made the data look less Poisson than it
+is, which happens to be the conservative direction, but the method was wrong either way.
 
-The recommendation therefore inverts: the plain arithmetic mean is correct here, and **robustness must
-be justified by a measured departure from Poisson on real reads rather than assumed.** That is a cheap
-and concrete gate: dump the anchor count distribution from a real library and test it. Simulated
-coverage is clean by construction; a real library carrying mappability and GC structure may well show a
-tail, and at that point the case for a robust estimator is made rather than presumed.
+What this does support, narrowly: the median's downward bias is fully accounted for by the discreteness
+and skew of the count distribution, so **a gross contaminating tail is not what drives the median-mean
+gap**. That removes one hypothesis. It does not establish the distribution.
 
-### 8.7 The variance objection, reframed
+What would settle it, none of it yet done: variance-to-mean ratio and fitted negative binomial
+dispersion, observed against Poisson tail frequencies, zero frequency, quantile residuals, the same
+summaries stratified by block, GC, uniqueness and marker clump, and held-out predictive deviance for
+Poisson against negative binomial. All of this needs per-anchor counts exported, which they currently
+are not.
 
-Section 8.3 recorded that the mean adds 70 percent to the variance of `mass_bp`, which read as a cost.
-Measuring where that variance comes from changes its interpretation:
+**A separate correction that changes what "build a robust estimator" would even mean.** A negative
+binomial with one common mean has essentially the same point estimate as the arithmetic mean; the
+negative binomial changes the variance model, not the location estimate. So negative binomial is not
+the robustness lever. Robustness would require marker-specific efficiency q_k, calibrated weighting, or
+a Fisher-corrected robust score. The earlier conclusion "do not build the negative binomial estimator"
+was right, but for the wrong reason: it is not that robustness is unnecessary, it is that a negative
+binomial would not have provided it.
+
+### 8.7 The variance objection, reframed with two corrections
+
+Section 8.3 recorded that the mean increases the spread of `mass_bp`, which read as a cost. Two
+corrections to how that was stated, then what it means.
+
+**It is a 70 percent increase in standard deviation, not in variance.** Standard deviation goes 1,695
+to 2,878; variance goes up about 188 percent, a factor of 2.88. The earlier wording conflated the two.
+
+**Calling it "genuine between-draw depth variation" was wrong.** All five simulations share the same
+nominal depth parameter, so nothing about the underlying depth changed. The variability is
+cluster-correlated sampling of overlapping markers in the realized coverage. It must still be
+propagated, but it is sampling variability, not a moving parameter.
 
     region lambda across 5 draws:   sd 0.0532
     independent-Poisson prediction: sd 0.0173
-    ratio 3.07, variance inflation 9.4-fold
+    ratio 3.07, variance inflation 9.4-fold, 95 percent CI 3.4 to 77.6-fold
 
-**The anchors covary**, at 9.4-fold, less than the markers' 19.96-fold but substantial. So the added
-variance is not estimator noise; it is genuine between-draw depth variation that the median was
-suppressing by rounding it onto the lattice. The median was not more precise, it was less informative.
+**The 9.4-fold figure is not a calibrated factor.** It comes from five draws, and its interval spans an
+order of magnitude in each direction. It is evidence that the anchors covary, which matters, and it is
+not a number a posterior can carry as though it were known. An earlier revision said a depth posterior
+must carry the 9.4-fold inflation "exactly"; that is withdrawn.
 
-The practical consequence is symmetric with the mass result: a depth posterior must carry the 9.4-fold
-inflation exactly as a mass posterior must carry the 19.96-fold one, and neither can be derived from
-independent per-observation counting.
+The direction of the conclusion survives: the added spread is not estimator noise, and neither the
+depth nor the mass uncertainty can be derived from independent per-observation counting. The magnitude
+needs far more draws.
 
-### 8.8 Not started
+### 8.8 What this does not do
 
-The `min_anchors` cliff, which should become continuous shrinkage over every non-empty block with only
-n=0 as a pure fallback, and the arbitrary 200 pseudo-anchors replaced by a precision estimated from
-within-block and between-block variability. A second real locus for the default decision. Tests: commit
-`9ac2318` added none and there is still no registered `genotype_stats.sh`; the needed assertions are a
-below-threshold block reporting NA with REGION_FALLBACK, a shrunk block whose raw and fitted values
-differ by the expected coefficient, the audit carrying the final joint depth rather than the first-pass
-value, direct and indexed runs honouring the same estimator, and continuous behaviour across 19, 20 and
-21 anchors. Items 3 through 7 of section 7.6 are untouched, as are both oracles.
+The estimator change improves the depth denominator and moves two allele calls on lpa. Bubble accuracy
+is unchanged at 7/10, and cyp2d6 is identical in both arms. This is a calibration repair. It is not
+evidence that the model chooses the nearest available haplotype, and it does nothing for mosaics. The
+certified nearest-pair oracle and the ideal-multiplicity oracle remain the decisive next experiments.
+
+A reporting defect of exactly the class this pass exists to remove was found in the pass itself: the
+region summary logged its selected anchor centre as though it were the lambda in force, which is false
+under the Bases, Quantile and Joint models where the fitted depth comes from elsewhere. It now prints
+`selected_anchor_center` and does not name it lambda.
+
+### 8.9 The min_anchors cliff, removed
+
+`estimate_depth` skipped any block below `--min-anchors` before computing a local estimate, so the
+shrinkage pass had nothing to shrink and those blocks took the region value whole. That contradicted
+the code's own stated rationale, which is that a hard threshold is the wrong shape and shrinkage
+replaces it. At lpa it discarded 61 anchors across six bubble blocks.
+
+Every block with any anchors now produces a local estimate and is shrunk by its own weight; only a
+block with none is a pure fallback. `--min-anchors` now flags thin local evidence rather than gating
+it.
+
+    depth provenance: 4 REGION_FALLBACK, 21 SHRUNK        (was 10 and 15)
+
+    block 11  bubble 6   n=17  local=27  fitted=23.3134  shrink=0.922
+    block 13  bubble 7   n=13  local=23  fitted=23.0000  shrink=0.939
+    block 15  bubble 8   n=1   local=15  fitted=22.9602  shrink=0.995
+    block 17  bubble 9   n=13  local=19  fitted=22.7559  shrink=0.939
+    block 19  bubble 10  n=12  local=28  fitted=23.2830  shrink=0.943
+    block 21  bubble 11  n=5   local=21  fitted=22.9512  shrink=0.976
+
+The local values are genuinely varied, 15 to 28, and the shrinkage does its job: block 15's single
+anchor reading 15 is pulled to 22.96 rather than trusted. `mass_bp` moves by 1 bp, the truth check is
+unchanged at 15/20 and 7/10, and graded accuracy is identical to six decimals. A consistency fix with
+essentially no behaviour change.
+
+### 8.10 Not started
+
+A negative binomial or robust weighted estimator, now understood to require marker-specific efficiency
+rather than a change of likelihood family. Per-anchor count export, without which none of the
+distributional checks in 8.6 can be run. Tests: there is still no registered `genotype_stats.sh`, and
+neither depth commit added one. The needed assertions are a zero-anchor block reporting NA with
+REGION_FALLBACK, a shrunk block whose raw and fitted values differ by the expected coefficient, the
+audit carrying the final joint depth rather than the first-pass value, direct and indexed runs
+honouring the same estimator, and continuous behaviour across 19, 20 and 21 anchors. Items 3 through 7
+of section 7.6 are untouched, as are both oracles.
 
 The `--explain-pair` and `--deconvolve` diagnostic paths request the historical median explicitly; that
 needs to be either deliberate and labelled, or changed.
 
-### 8.9 Open questions
+### 8.11 Agreed plan before the default moves
 
-**The default.** Evidence for the mean now: Fisher consistent for the expected count; agreement with
-independently derived theory to 0.07 percent; no regression across eight ladder cases; its added
-variance is real depth variation rather than noise; and the count distribution shows nothing to be
-robust against. Evidence still wanted: a second real locus, because the allele call moved on 2 of 5
-draws at one block. Is that the right bar before changing a default that affects every locus?
+Retain `--depth-estimator mean` as the leading experimental mode, default unchanged. Then: 50 to 100
+seeds on the fixed lpa pair; lower depths and higher error rates so the saturated ladder becomes
+discriminative; per-anchor counts and fragment or clump membership exported; uncertainty estimated by
+fragment-level bootstrap rather than from five draws; several real loci, then at least one real
+sequencing library with an external single-copy depth control. The default does not move until a
+registered genotype regression test exists and the real-library distribution checks have been run.
 
-**The cliff and the pseudo-count.** Is 200 defensible at all, or should the shrinkage precision be
-estimated from observed variability? A block with 13 anchors currently contributes nothing where it
-should contribute roughly 6 percent.
+### 8.12 Open questions
 
-**Certified oracle, a correctness point not yet acted on.** Minimum summed edit distance over the two
-assignments is not equivalent to maximum mean identity when the two alignment lengths differ. The 2A
-caching shortcut remains valid, but the pair assignment must optimise whichever identity definition is
-actually reported.
+**The cliff's replacement constant.** 200 pseudo-anchors is arbitrary. Should the shrinkage precision
+be estimated from within-block and between-block variability instead, and is there enough data per
+locus to do that?
 
-**Depth on real data.** The simulation-theory control that validated the mean here exists only because
-depth and error rate are known by construction. What plays that role on a real library, before
-per-marker efficiency has been learned from a cohort?
+**Certified oracle, still unacted.** Minimum summed edit distance over the two assignments is not
+equivalent to maximum mean identity when the alignment lengths differ. The 2A caching shortcut remains
+valid; the assignment must optimise whichever identity definition is reported.
+
+**Depth on real data.** The simulation-theory control that validated the mean exists only because depth
+and error rate are known by construction. What plays that role on a real library, before per-marker
+efficiency has been learned from a cohort? The suggestion of unique single-copy flanking markers
+normalized by cohort behaviour, with mean q_k constrained to 1, is the current best answer and is
+untested here.

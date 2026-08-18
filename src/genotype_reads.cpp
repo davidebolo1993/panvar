@@ -183,7 +183,13 @@ std::vector<BlockDepth> estimate_depth(
             all_anchor_counts.push_back(static_cast<double>(counts.node[slot]));
         }
         d.n_anchor = v.size();
-        if (v.size() < min_anchors) continue;
+        // Every block with ANY anchors gets a local estimate. The old `v.size() < min_anchors`
+        // skip contradicted the shrinkage below: that pass exists precisely so a block with a handful
+        // of anchors is pulled toward the region rather than falling off a cliff, but a block that
+        // never computed a local value has nothing to pull. At lpa that discarded 61 anchors across
+        // six bubble blocks. `min_anchors` now flags weak local evidence instead of gating it.
+        if (v.empty()) continue;
+        d.low_anchor = v.size() < min_anchors;
         // `anchor_median` stays the median whatever the estimator, so the raw audit column means the
         // same statistic across runs and remains comparable when the estimator changes. `median` is
         // the model's local centre and follows the estimator.
@@ -268,7 +274,7 @@ std::vector<BlockDepth> estimate_depth(
     constexpr double kPseudoAnchors = 200.0;
     for (BlockDepth& d : out) {
         if (global_median <= 0.0) continue;
-        if (!d.usable) {
+        if (!d.local_available || !d.usable) {
             d.median = global_median;
             d.lambda_hap = global_median / 2.0;
             d.usable = true;
@@ -318,7 +324,8 @@ void write_read_audit(
     // is how a block that inherited the region's depth came to look like a precise local measurement,
     // MAD 0 and all, at exactly the blocks where depth IS the answer.
     f << "block_index\tblock_kind\tbubble_id\tn_alleles\tn_anchor\traw_anchor_median\traw_anchor_mad"
-         "\tlocal_center\tfitted_median\tlambda_hap\tdepth_source\tregion_shrink_weight\tusable\tuneven\n";
+         "\tlocal_center\tfitted_median\tlambda_hap\tdepth_source\tregion_shrink_weight"
+         "\tlow_anchor\tusable\tuneven\n";
     for (std::size_t bi = 0; bi < chain.size() && bi < depth.size(); ++bi) {
         const BlockDepth& d = depth[bi];
         f << chain[bi].index << '\t' << (chain[bi].kind == BlockKind::Bubble ? "bubble" : chain[bi].kind == BlockKind::Flank ? "flank" : "backbone")
@@ -327,7 +334,7 @@ void write_read_audit(
           << na(d.anchor_median, d.local_available) << '\t' << na(d.mad, d.local_available) << '\t'
           << na(d.local_center, d.local_available) << '\t' << d.median << '\t' << d.lambda_hap << '\t'
           << depth_source_name(d.source) << '\t' << d.region_shrink_weight << '\t'
-          << (d.usable ? 1 : 0) << '\t' << (d.uneven ? 1 : 0) << '\n';
+          << (d.low_anchor ? 1 : 0) << '\t' << (d.usable ? 1 : 0) << '\t' << (d.uneven ? 1 : 0) << '\n';
     }
     (void)counts;
 }

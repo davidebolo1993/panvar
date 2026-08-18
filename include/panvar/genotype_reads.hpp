@@ -98,6 +98,9 @@ struct BlockDepth {
     // Whether this block produced any local estimate at all. Zero is a legitimate observed count, so
     // it cannot double as "not computed"; every consumer must test this rather than compare against 0.
     bool local_available = false;
+    // Fewer than `min_anchors` of its own. The estimate is still used and still shrunk toward
+    // the region by its own weight; this only says the local evidence is thin.
+    bool low_anchor = false;
     // Raw observations from this block's OWN anchors, never rewritten by a depth model.
     // `anchor_median` is always the median whatever `DepthEstimator` is in force, so the audit column
     // means one statistic across runs; `local_center` is the local estimate under the selected

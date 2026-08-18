@@ -38,8 +38,7 @@ namespace {
 // number the block exists to produce.
 void log_depth_provenance(cli::RunLog& log,
                           const std::vector<Block>& chain,
-                          const std::vector<BlockDepth>& depth,
-                          std::size_t min_anchors) {
+                          const std::vector<BlockDepth>& depth) {
     std::map<std::string, std::size_t> by_source;
     std::vector<std::size_t> fallback_bubbles;
     for (std::size_t bi = 0; bi < depth.size(); ++bi) {
@@ -62,9 +61,9 @@ void log_depth_provenance(cli::RunLog& log,
             ids += std::to_string(fallback_bubbles[i]);
         }
         if (fallback_bubbles.size() > 12) ids += ",...";
-        log.info("  " + std::to_string(fallback_bubbles.size()) + " bubble block(s) have fewer than " +
-                 std::to_string(min_anchors) + " anchors of their own and take the region's depth "
-                 "entirely (bubble " + ids + "); at a tandem array that is the copy-number denominator");
+        log.info("  " + std::to_string(fallback_bubbles.size()) + " bubble block(s) have NO anchors of "
+                 "their own and take the region's depth entirely (bubble " + ids + "); at a tandem "
+                 "array that is the copy-number denominator");
     }
 }
 
@@ -95,7 +94,10 @@ void print_genotype_help() {
         << "  -R, --reads <path>          Short reads (FASTA/FASTQ, plain or gzipped); repeatable.\n"
         << "                              Projects them onto the block marker panel and reports\n"
         << "                              per-block depth. No genotypes are called yet.\n"
-        << "      --min-anchors <N>       Minimum invariant markers for per-block depth (default 20)\n"
+        << "      --min-anchors <N>       Below this many invariant markers a block is flagged\n"
+        << "                              low_anchor (default 20). It no longer gates the local\n"
+        << "                              estimate: every block with any anchors contributes,\n"
+        << "                              shrunk toward the region by its own weight\n"
         << "      --marker-rule <r>       panvar (default) = keep markers whose multiplicity varies\n"
         << "                              across alleles; unique = carried by exactly one allele (any\n"
         << "                              copy number); pangenie = unique AND occurring once,\n"
@@ -385,9 +387,9 @@ int run_genotype_command(const std::vector<std::string>& args) {
                            depth_quantile, 0, depth_estimator, &idx_region_stats);
         log.info("region anchors: " + std::to_string(idx_region_stats.n_anchor) + "; median " +
                  std::to_string(idx_region_stats.median) + ", mean " + std::to_string(idx_region_stats.mean) +
-                 ", trimmed " + std::to_string(idx_region_stats.trimmed_mean) + "; using " +
-                 std::to_string(idx_region_stats.used));
-        log_depth_provenance(log, idx.chain, depth, min_anchors);
+                 ", trimmed " + std::to_string(idx_region_stats.trimmed_mean) +
+                 "; selected_anchor_center " + std::to_string(idx_region_stats.used));
+        log_depth_provenance(log, idx.chain, depth);
         // Same options as the direct path. Assembling them twice let the two drift: the indexed path
         // silently ignored the recombination rate, carrier weight, provenance, compositional and robust
         // scoring, the mass window and the scale weight, so --index and --bubble-prefix-in did not mean
@@ -989,12 +991,15 @@ int run_genotype_command(const std::vector<std::string>& args) {
                      " flagged UNEVEN");
             // All three side by side, because the choice is not neutral and the median cannot express
             // a value between half-integers however many anchors are pooled.
+            // Deliberately NOT reported as lambda. Under Bases, Quantile or the final Joint pass the
+            // fitted depth comes from elsewhere entirely, so printing this as the lambda in force
+            // would misstate what the model used -- the same defect the raw-versus-fitted split above
+            // exists to prevent, one level up.
             log.info("region anchors: " + std::to_string(region_stats.n_anchor) + "; median " +
                      std::to_string(region_stats.median) + ", mean " + std::to_string(region_stats.mean) +
-                     ", trimmed " + std::to_string(region_stats.trimmed_mean) + "; using " +
-                     std::to_string(region_stats.used) + " (lambda " +
-                     std::to_string(region_stats.used / 2.0) + ")");
-            log_depth_provenance(log, chain, depth, min_anchors);
+                     ", trimmed " + std::to_string(region_stats.trimmed_mean) +
+                     "; selected_anchor_center " + std::to_string(region_stats.used));
+            log_depth_provenance(log, chain, depth);
             // The audit is written AFTER the joint pass below, not here: joint replaces every block's
             // fitted depth, so an audit written at this point would describe a state the emission
             // never used. `raw_anchor_*` are untouched by any model, so nothing is lost by waiting.
@@ -1366,7 +1371,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                             &gsum, pa1.empty() ? nullptr : &pa1,
                                             pa2.empty() ? nullptr : &pa2,
                                             evidence == "syncmer" ? nullptr : &cev);
-                    log_depth_provenance(log, chain, depth, min_anchors);
+                    log_depth_provenance(log, chain, depth);
                 }
             }
             // Deferred from the first-pass logging so it describes the depth the emission actually
