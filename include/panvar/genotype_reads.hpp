@@ -84,15 +84,28 @@ ReadCounts count_reads(
     const ReadPanel& panel,
     std::size_t threads);
 
+// Where a block's fitted depth came from. Inheriting the region's depth is the right thing to do for a
+// block with too few anchors of its own, and the wrong thing to hide: at a tandem array the fitted
+// value IS the denominator that converts marker multiplicity into copy number, so an inherited one
+// carries none of that block's own evidence while looking exactly like a measurement.
+enum class DepthSource { None, Local, Shrunk, RegionFallback, Quantile, Bases, Joint };
+
+const char* depth_source_name(DepthSource source);
+
 struct BlockDepth {
     std::size_t block_index = 0;
     std::size_t n_anchor = 0;
-    // The raw anchor-count median, never rewritten by a depth model. `median` below is the model's
-    // fitted value; this is the observation, which is what a second pass has to reason from.
+    // Raw observations from this block's OWN anchors, never rewritten by a depth model. Both stay 0
+    // when the block has fewer than `min_anchors`, which is how a caller distinguishes "no local
+    // evidence" from "measured zero" -- the joint second pass depends on exactly that distinction.
     double anchor_median = 0.0;
-    double median = 0.0;        // anchor count median
     double mad = 0.0;
+    // The depth model's fitted value and the per-haplotype rate taken from it. These are what the
+    // emission uses, and they may owe anything from none to all of their value to the region.
+    double median = 0.0;
     double lambda_hap = 0.0;    // expected count for one haplotype copy (median / 2, diploid)
+    DepthSource source = DepthSource::None;
+    double region_weight = 0.0; // share of `median` contributed by the region rather than this block
     bool usable = false;
     bool uneven = false;        // MAD/median above the tolerance: coverage too ragged to trust
 };

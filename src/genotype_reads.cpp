@@ -161,6 +161,9 @@ std::vector<BlockDepth> estimate_depth(
         d.lambda_hap = d.median / 2.0;      // diploid: an invariant marker is carried by both copies
         d.usable = d.lambda_hap > 0.0;
         d.uneven = d.median > 0.0 && (d.mad / d.median) > uneven_tolerance;
+        // Provisional: the shrinkage pass below rewrites this for every block it touches. It survives
+        // only when there is no region estimate to shrink toward at all.
+        if (d.usable) { d.source = DepthSource::Local; d.region_weight = 0.0; }
     }
 
     // Region-wide fallback for blocks with too few anchors of their own, and shrinkage toward it for
@@ -204,10 +207,14 @@ std::vector<BlockDepth> estimate_depth(
             lambda = per_hap_depth * std::max(0.0, (read_len - k + 1.0)) / std::max(1.0, read_len);
         }
         if (lambda > 0.0) {
+            const DepthSource src =
+                model == DepthModel::Quantile ? DepthSource::Quantile : DepthSource::Bases;
             for (BlockDepth& d : out) {
                 d.median = lambda * 2.0;
                 d.lambda_hap = lambda;
                 d.usable = true;
+                d.source = src;
+                d.region_weight = 1.0;      // one region-wide value, no block contributes to its own
             }
             return out;
         }
@@ -220,13 +227,30 @@ std::vector<BlockDepth> estimate_depth(
             d.median = global_median;
             d.lambda_hap = global_median / 2.0;
             d.usable = true;
+            d.source = DepthSource::RegionFallback;
+            d.region_weight = 1.0;
             continue;
         }
         const double w = static_cast<double>(d.n_anchor);
         d.median = (w * d.median + kPseudoAnchors * global_median) / (w + kPseudoAnchors);
         d.lambda_hap = d.median / 2.0;
+        d.source = DepthSource::Shrunk;
+        d.region_weight = kPseudoAnchors / (w + kPseudoAnchors);
     }
     return out;
+}
+
+const char* depth_source_name(DepthSource source) {
+    switch (source) {
+        case DepthSource::Local:          return "LOCAL";
+        case DepthSource::Shrunk:         return "SHRUNK";
+        case DepthSource::RegionFallback: return "REGION_FALLBACK";
+        case DepthSource::Quantile:       return "QUANTILE";
+        case DepthSource::Bases:          return "BASES";
+        case DepthSource::Joint:          return "JOINT";
+        case DepthSource::None:           break;
+    }
+    return "NONE";
 }
 
 void write_read_audit(
@@ -239,14 +263,19 @@ void write_read_audit(
     const std::string path = out_prefix + ".reads.depth.tsv";
     std::ofstream f(path);
     if (!f) throw std::runtime_error("genotype: cannot write " + path);
-    f << "block_index\tblock_kind\tbubble_id\tn_alleles\tn_anchor\tanchor_median\tanchor_mad"
-         "\tlambda_hap\tusable\tuneven\n";
+    // `raw_anchor_*` are this block's OWN observations and are 0 when it had too few anchors to make
+    // any; `fitted_median` is what the model settled on. Writing the fitted value under the raw name
+    // is how a block that inherited the region's depth came to look like a precise local measurement,
+    // MAD 0 and all, at exactly the blocks where depth IS the answer.
+    f << "block_index\tblock_kind\tbubble_id\tn_alleles\tn_anchor\traw_anchor_median\traw_anchor_mad"
+         "\tfitted_median\tlambda_hap\tdepth_source\tregion_weight\tusable\tuneven\n";
     for (std::size_t bi = 0; bi < chain.size() && bi < depth.size(); ++bi) {
         const BlockDepth& d = depth[bi];
         f << chain[bi].index << '\t' << (chain[bi].kind == BlockKind::Bubble ? "bubble" : chain[bi].kind == BlockKind::Flank ? "flank" : "backbone")
           << '\t' << chain[bi].bubble_id << '\t'
           << (bi < panel.by_block.size() ? panel.by_block[bi].size() : 0) << '\t' << d.n_anchor << '\t'
-          << d.median << '\t' << d.mad << '\t' << d.lambda_hap << '\t' << (d.usable ? 1 : 0) << '\t'
+          << d.anchor_median << '\t' << d.mad << '\t' << d.median << '\t' << d.lambda_hap << '\t'
+          << depth_source_name(d.source) << '\t' << d.region_weight << '\t' << (d.usable ? 1 : 0) << '\t'
           << (d.uneven ? 1 : 0) << '\n';
     }
     (void)counts;

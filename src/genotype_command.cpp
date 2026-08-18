@@ -17,6 +17,7 @@
 #include "panvar/syncmer.hpp"
 
 #include <unordered_set>
+#include <map>
 #include <set>
 #include <cstdio>
 
@@ -30,6 +31,42 @@
 
 namespace panvar {
 namespace {
+
+// Depth provenance, said out loud. A block that inherited the region's depth reads identically to one
+// that measured its own, and at block_class=array that value is the denominator converting marker
+// multiplicity into copy number -- so an inherited one carries none of that block's evidence into the
+// number the block exists to produce.
+void log_depth_provenance(cli::RunLog& log,
+                          const std::vector<Block>& chain,
+                          const std::vector<BlockDepth>& depth,
+                          std::size_t min_anchors) {
+    std::map<std::string, std::size_t> by_source;
+    std::vector<std::size_t> fallback_bubbles;
+    for (std::size_t bi = 0; bi < depth.size(); ++bi) {
+        ++by_source[depth_source_name(depth[bi].source)];
+        if (depth[bi].source == DepthSource::RegionFallback && bi < chain.size() &&
+            chain[bi].kind == BlockKind::Bubble) {
+            fallback_bubbles.push_back(chain[bi].bubble_id);
+        }
+    }
+    std::string summary;
+    for (const auto& [name, n] : by_source) {
+        if (!summary.empty()) summary += ", ";
+        summary += std::to_string(n) + " " + name;
+    }
+    log.info("depth provenance: " + summary);
+    if (!fallback_bubbles.empty()) {
+        std::string ids;
+        for (std::size_t i = 0; i < fallback_bubbles.size() && i < 12; ++i) {
+            if (!ids.empty()) ids += ",";
+            ids += std::to_string(fallback_bubbles[i]);
+        }
+        if (fallback_bubbles.size() > 12) ids += ",...";
+        log.info("  " + std::to_string(fallback_bubbles.size()) + " bubble block(s) have fewer than " +
+                 std::to_string(min_anchors) + " anchors of their own and take the region's depth "
+                 "entirely (bubble " + ids + "); at a tandem array that is the copy-number denominator");
+    }
+}
 
 void print_genotype_help() {
     std::cout
@@ -331,6 +368,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
         const std::vector<BlockDepth> depth =
             estimate_depth(idx.panel, rc, min_anchors, uneven_tolerance, depth_model,
                            depth_quantile, 0);
+        log_depth_provenance(log, idx.chain, depth, min_anchors);
         // Same options as the direct path. Assembling them twice let the two drift: the indexed path
         // silently ignored the recombination rate, carrier weight, provenance, compositional and robust
         // scoring, the mass window and the scale weight, so --index and --bubble-prefix-in did not mean
@@ -929,7 +967,10 @@ int run_genotype_command(const std::vector<std::string>& args) {
                      std::to_string(lam.empty() ? 0.0 : lam[lam.size() / 2]) + " over " +
                      std::to_string(lam.size()) + " usable blocks; " + std::to_string(uneven) +
                      " flagged UNEVEN");
-            write_read_audit(out_prefix, chain, read_panel, rc, depth);
+            log_depth_provenance(log, chain, depth, min_anchors);
+            // The audit is written AFTER the joint pass below, not here: joint replaces every block's
+            // fitted depth, so an audit written at this point would describe a state the emission
+            // never used. `raw_anchor_*` are untouched by any model, so nothing is lost by waiting.
 
             std::vector<std::string> hap_names;
             hap_names.reserve(panel_graph.paths.size());
@@ -1282,6 +1323,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         d.median = lambda * 2.0;
                         d.lambda_hap = lambda;
                         d.usable = true;
+                        d.source = DepthSource::Joint;
+                        d.region_weight = 1.0;  // one region-wide value; raw_anchor_* stay untouched
                     }
                     // Same arguments as the first pass. Dropping the coverage evidence here silently
                     // reverted --evidence to the marker model whenever a bypass allele existed, which
@@ -1292,8 +1335,12 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                             &gsum, pa1.empty() ? nullptr : &pa1,
                                             pa2.empty() ? nullptr : &pa2,
                                             evidence == "syncmer" ? nullptr : &cev);
+                    log_depth_provenance(log, chain, depth, min_anchors);
                 }
             }
+            // Deferred from the first-pass logging so it describes the depth the emission actually
+            // used, joint refinement included.
+            write_read_audit(out_prefix, chain, read_panel, rc, depth);
             log.info("model: lambda " + std::to_string(gsum.lambda_hap) + ", overdispersion phi " +
                      std::to_string(gsum.overdispersion) + ", error background " +
                      std::to_string(gsum.error_background));
