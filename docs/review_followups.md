@@ -218,6 +218,43 @@ as history; Git already provides that history.
 - **The allele VCF is a serialization ceiling.** It reaches 0 residual because it spells every allele
   out, which demonstrates lossless serialization, not call sensitivity.
 
+## Describe
+
+### Corrected measurements
+
+- **A pure deletion produced no features at all.** All three step-building sites required an interior
+  bubble node, so a path taking the direct source→sink edge was not counted as a traverser; the node
+  that discriminates the deletion was then dropped as non-discriminative *because only its carriers had
+  been observed*. Real effect, like-for-like: cyp2d6 +245 path observations (+38%), lpa +496 (+13%),
+  c4 +26, and c4's 1340 "NA" cells were dropped traversals rather than missing data. Any dosage matrix
+  built before this is missing its deletion carriers.
+- **Both association gates re-run and pass.** The LPA KIV-2 signal is unmoved (bubble 7, beta −0.0193,
+  p_bonf 6.1e-06) on a 13% larger substrate, and a matched null (same flags, only the code differing)
+  gives type-I 0.05052→0.05082 at 0.05 and 0.00081→0.00081 at 0.001, lambda 0.9094→0.9116, with the
+  worst per-feature KS p and the maxT threshold bit-identical.
+- **The ~23% per-feature non-uniformity in that null is pre-existing**, present identically before and
+  after, and belongs to `associate`'s recorded limits rather than to this pass.
+
+### Accepted limitations
+
+- **`--variant-flank-bp` has two granularities on purpose.** Bases for k-mers, whole nodes for graph
+  dosage, because a node dosage is a property of the whole node. It therefore admits more nodes than
+  bases. Splitting it into two flags would be clearer; one flag with a documented asymmetry was chosen
+  over adding CLI surface.
+- **Node and edge features share one id namespace.** They are told apart by the sidecar's `encoding`
+  column, not by prefixed ids. A collision needs a node literally named like an oriented-edge key,
+  while renaming feature ids would break every downstream join against `call`'s `variant_nodes.tsv`.
+- **Pooling is locus-wide and stays that way.** Measured for the double-counting hazard: c4 has exactly
+  one node claimed by two bubbles, cyp2d6 none, and zero emitted features localise to a shared node at
+  either locus. The features spanning several bubbles (9 at c4, 31 at cyp2d6) are one k-mer sequence at
+  genuinely different nodes. Revisit only if a locus produces features on a shared boundary.
+- **Pooled carrier maps are held in memory across all bubbles.** `--max-wide-features` bounds the dense
+  matrices, not this. Streaming bubble-qualified rows or an external sort/merge is the fix if a panel
+  ever exceeds memory; no current locus does.
+- **The missingness rules are latent at the reference loci.** Requiring every contributing bubble and
+  every assigned haplotype to be observable is correct, but graph features never span more than one
+  bubble at these loci and no incomplete observation occurs, so nothing measured today changes.
+
 ## Rebuild
 
 ### Deferred capability
