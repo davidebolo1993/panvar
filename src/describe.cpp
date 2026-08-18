@@ -1239,7 +1239,15 @@ struct BimbamRow {
     std::string nodes;                                // provenance ("." for k-mers; the id itself for graph)
     std::vector<std::size_t> bubbles;                 // bubble(s) the feature was discriminative in
     std::unordered_map<std::string, double> carriers; // path -> dosage
+    std::string encoding;                             // syncmer/all, or node/edge
 };
+
+// Pooled rows come out of unordered_map iteration, whose order is not defined across builds or
+// standard libraries. Sort by feature id so the matrix and its sidecar are reproducible.
+inline void sort_rows(std::vector<BimbamRow>& rows) {
+    std::sort(rows.begin(), rows.end(),
+              [](const BimbamRow& a, const BimbamRow& b) { return a.id < b.id; });
+}
 
 // Per-substrate output directory: <out>/{haplotype|sample}/{kmers|graph|variant}/, created on demand.
 // Each holds a self-contained associate input -- the BIMBAM matrix, its feature_annot, and the column
@@ -1265,7 +1273,11 @@ void write_bimbam_rows(
         // annotation sidecar: feature_id, layer, encoding, bubbles, nodes
         std::string a = tsv_sanitize(row.id);
         a += '\t'; a += layer;
-        a += "\tcount\t";
+        // The real subtype -- syncmer/all for k-mers, node/edge for graph dosage -- which is what the
+        // module docs promise. Every row used to read "count", so a node feature and an edge feature
+        // were indistinguishable in the sidecar even though they share one id namespace.
+        a += '\t'; a += row.encoding.empty() ? std::string("count") : row.encoding;
+        a += '\t';
         for (std::size_t i = 0; i < row.bubbles.size(); ++i) { if (i) a += ';'; a += std::to_string(row.bubbles[i]); }
         a += '\t'; a += row.nodes; a += '\n';
         annot.write(a);
@@ -1430,7 +1442,12 @@ BubbleDescribeResult describe_one_bubble(
         }
         write_graph_feature_map(
             result.graph_feature_map_path, node_features, edge_features, node_stats, edge_stats, paths.size());
-        if (options.write_wide_matrix) {
+        // The same cap the k-mer matrix obeys. It guarded only that one, so --max-wide-features
+        // bounded half the dense output and a node+edge matrix could grow without limit.
+        const bool graph_wide_allowed =
+            options.max_wide_features == 0 ||
+            node_features.size() + edge_features.size() <= options.max_wide_features;
+        if (options.write_wide_matrix && (options.force_wide_matrix || graph_wide_allowed)) {
             write_graph_matrix(
                 result.graph_matrix_path, graph, bubble, path_indexes, paths, node_features, edge_features,
                 variant_nodes, options.variant_flank_bp);
@@ -2005,6 +2022,7 @@ void describe_kmers_from_graph(
             for (const auto& [code, carriers] : kmer_pool) {
                 BimbamRow r;
                 r.id = decode_kmer(code, options.kmer_size);
+                r.encoding = options.feature_mode == DescribeFeatureMode::Syncmer ? "syncmer" : "all";
                 const auto nit = feature_nodes_k.find(code);  // aggregated node provenance (across bubbles)
                 r.nodes = (nit != feature_nodes_k.end() && !nit->second.empty())
                     ? join_nodes(std::vector<std::string>(nit->second.begin(), nit->second.end())) : ".";
@@ -2013,6 +2031,7 @@ void describe_kmers_from_graph(
                 for (const auto& [path, c] : carriers) r.carriers[path] = static_cast<double>(c);
                 rows.push_back(std::move(r));
             }
+            sort_rows(rows);
             write_bimbam_rows((dir / "bimbam_kmers.bimbam.gz").string(), annot, "kmer",
                               rows, sample_order, bubble_traversers, options.scale_dosage);
             annot.close();
@@ -2029,11 +2048,13 @@ void describe_kmers_from_graph(
                 BimbamRow r;
                 r.id = feature;
                 r.nodes = feature;  // node/edge id is its own provenance
+                    r.encoding = feature.find('>') != std::string::npos ? "edge" : "node";
                 const auto fb = feature_bubbles_g.find(feature);
                 if (fb != feature_bubbles_g.end()) r.bubbles = fb->second;
                 for (const auto& [path, c] : carriers) r.carriers[path] = static_cast<double>(c);
                 rows.push_back(std::move(r));
             }
+            sort_rows(rows);
             write_bimbam_rows((dir / "bimbam_graph.bimbam.gz").string(), annot, "graph",
                               rows, sample_order, bubble_traversers, options.scale_dosage);
             annot.close();
@@ -2105,6 +2126,9 @@ void describe_kmers_from_graph(
                 std::vector<BimbamRow> rows; rows.reserve(sample_pool.size());
                 for (const auto& [code, carriers] : sample_pool) {
                     BimbamRow r; r.id = decode_kmer(code, options.kmer_size);
+                    r.encoding = options.feature_mode == DescribeFeatureMode::Syncmer ? "syncmer" : "all";
+                r.encoding = options.feature_mode == DescribeFeatureMode::Syncmer ? "syncmer" : "all";
+                    r.encoding = options.feature_mode == DescribeFeatureMode::Syncmer ? "syncmer" : "all";
                     const auto nit = feature_nodes_k.find(code);
                     r.nodes = (nit != feature_nodes_k.end() && !nit->second.empty())
                         ? join_nodes(std::vector<std::string>(nit->second.begin(), nit->second.end())) : ".";
@@ -2113,6 +2137,7 @@ void describe_kmers_from_graph(
                     for (const auto& [s, c] : carriers) r.carriers[s] = static_cast<double>(c);
                     rows.push_back(std::move(r));
                 }
+                sort_rows(rows);
                 write_bimbam_rows((dir / "bimbam_kmers.bimbam.gz").string(), annot, "kmer",
                                   rows, sample_order_s, bubble_traversers_s, options.scale_dosage);
                 annot.close();
@@ -2126,11 +2151,13 @@ void describe_kmers_from_graph(
                 std::vector<BimbamRow> rows; rows.reserve(graph_sample_pool.size());
                 for (const auto& [feature, carriers] : graph_sample_pool) {
                     BimbamRow r; r.id = feature; r.nodes = feature;
+                    r.encoding = feature.find('>') != std::string::npos ? "edge" : "node";
                     const auto fb = feature_bubbles_g.find(feature);
                     if (fb != feature_bubbles_g.end()) r.bubbles = fb->second;
                     for (const auto& [s, c] : carriers) r.carriers[s] = static_cast<double>(c);
                     rows.push_back(std::move(r));
                 }
+                sort_rows(rows);
                 write_bimbam_rows((dir / "bimbam_graph.bimbam.gz").string(), annot, "graph",
                                   rows, sample_order_s, bubble_traversers_s, options.scale_dosage);
                 annot.close();
