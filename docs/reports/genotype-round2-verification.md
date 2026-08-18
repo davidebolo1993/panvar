@@ -531,46 +531,102 @@ class of error this project keeps making.
 4. **Zero was doing double duty for "not computed".** Zero is a legitimate anchor count; a
    `local_available` flag now drives an explicit NA in the audit.
 
-### 8.5 In flight
+### 8.5 Synthetic ladder: no regression, and a weak test
 
-Synthetic ladder A/B, median against mean, across clean, nested-del, abutting, paralogous, segdup,
-near-twin, folded-consensus and per-design VNTR. The paralogous case is the one that matters most: with
-one allele stripped of markers it can separate heterozygous from homozygous only by the absolute count
-level, which is precisely what the depth estimator sets, so a regression should appear there first.
+Median against mean, 4 pairs, seed 11, 30x. Every case identical in both arms.
 
-Generator flags for this were verified against the tool rather than guessed. An earlier draft used
-`--nested`, `--segdup` and `--vntr`, none of which exist; it would have run the same default locus
-eight times under eight labels and reported no difference anywhere.
+| case | leave-zero-out | leave-one-out |
+|---|---|---|
+| clean, nested-del, paralogous, segdup, folded, per-design-vntr | 36/36 blocks, 16/16 bubbles | 36/36, 16/16 |
+| abutting | 32/32, 16/16 | 32/32, 16/16 |
+| near-twin | 36/36, 16/16 | 14/16, 14/16 (panel ceiling) |
 
-### 8.6 Not started
+The paralogous case is the one with the most at stake, because with one allele stripped of markers it
+can separate heterozygous from homozygous only by the absolute count level, which is exactly what the
+depth estimator sets. It does not move.
 
-The `min_anchors` cliff, which should become a continuous shrinkage over every non-empty block with
-only n=0 as a pure fallback, and with the arbitrary 200 pseudo-anchors replaced by a precision
-estimated from within-block and between-block variability. A negative binomial or Huber estimator
-consistent for the expected count. Tests: commit `9ac2318` added none and there is still no registered
-`genotype_stats.sh`; the needed assertions are a below-threshold block reporting NA with
-REGION_FALLBACK, a shrunk block whose raw and fitted values differ by the expected coefficient, the
-audit carrying the final joint depth rather than the first-pass value, direct and indexed runs honouring
-the same estimator, and continuous behaviour across 19, 20 and 21 anchors. Items 3 through 7 of section
-7.6 are untouched, as are both oracles.
+**Stated as a limitation rather than a result:** nearly every case sits at 36/36 under both arms, so
+the ladder is saturated. It can detect a regression and cannot detect a gain, and passing it is
+necessary but weak evidence. A version at lower depth, where depth estimation is noisier and the
+lattice is relatively coarser, would have discriminating power that this one does not.
+
+The generator flags were verified against the tool rather than guessed. An earlier draft of this
+experiment used `--nested`, `--segdup` and `--vntr`, none of which exist; it would have run the same
+default locus eight times under eight labels and reported no difference anywhere.
+
+### 8.6 Robustness is not needed on this data, and the measurement says which
+
+The review recommended a corrected Huber or negative binomial estimator rather than a plain mean. That
+was the right instinct and the measurement declines it for this fixture. Assuming the anchor counts are
+plain Poisson at the observed mean, with no contamination whatever:
+
+| statistic | predicted by Poisson(23.2505) | observed |
+|---|---|---|
+| median | 23 | 23.0000 |
+| 10 percent trimmed mean | 23.2018 | 23.1396 |
+| mean | 23.2505 | 23.250491 |
+
+**The median's downward bias is entirely explained by the discreteness and skew of the count
+distribution itself, not by outliers.** There is no contaminating tail to be robust against, so a
+downweighting estimator would reintroduce precisely the class of bias the trimmed mean already
+demonstrated, for no gain. The small residual, an observed trimmed mean 0.06 below the Poisson
+prediction, is in the opposite direction from a heavy right tail and argues against downweighting more
+strongly still.
+
+The recommendation therefore inverts: the plain arithmetic mean is correct here, and **robustness must
+be justified by a measured departure from Poisson on real reads rather than assumed.** That is a cheap
+and concrete gate: dump the anchor count distribution from a real library and test it. Simulated
+coverage is clean by construction; a real library carrying mappability and GC structure may well show a
+tail, and at that point the case for a robust estimator is made rather than presumed.
+
+### 8.7 The variance objection, reframed
+
+Section 8.3 recorded that the mean adds 70 percent to the variance of `mass_bp`, which read as a cost.
+Measuring where that variance comes from changes its interpretation:
+
+    region lambda across 5 draws:   sd 0.0532
+    independent-Poisson prediction: sd 0.0173
+    ratio 3.07, variance inflation 9.4-fold
+
+**The anchors covary**, at 9.4-fold, less than the markers' 19.96-fold but substantial. So the added
+variance is not estimator noise; it is genuine between-draw depth variation that the median was
+suppressing by rounding it onto the lattice. The median was not more precise, it was less informative.
+
+The practical consequence is symmetric with the mass result: a depth posterior must carry the 9.4-fold
+inflation exactly as a mass posterior must carry the 19.96-fold one, and neither can be derived from
+independent per-observation counting.
+
+### 8.8 Not started
+
+The `min_anchors` cliff, which should become continuous shrinkage over every non-empty block with only
+n=0 as a pure fallback, and the arbitrary 200 pseudo-anchors replaced by a precision estimated from
+within-block and between-block variability. A second real locus for the default decision. Tests: commit
+`9ac2318` added none and there is still no registered `genotype_stats.sh`; the needed assertions are a
+below-threshold block reporting NA with REGION_FALLBACK, a shrunk block whose raw and fitted values
+differ by the expected coefficient, the audit carrying the final joint depth rather than the first-pass
+value, direct and indexed runs honouring the same estimator, and continuous behaviour across 19, 20 and
+21 anchors. Items 3 through 7 of section 7.6 are untouched, as are both oracles.
 
 The `--explain-pair` and `--deconvolve` diagnostic paths request the historical median explicitly; that
 needs to be either deliberate and labelled, or changed.
 
-### 8.7 Open questions
+### 8.9 Open questions
 
-**Estimator.** Does a negative binomial or Huber estimator targeted at the expected count keep the bias
-correction while recovering the variance the plain mean gives up? The five-draw variance increase is
-the specific thing to beat.
+**The default.** Evidence for the mean now: Fisher consistent for the expected count; agreement with
+independently derived theory to 0.07 percent; no regression across eight ladder cases; its added
+variance is real depth variation rather than noise; and the count distribution shows nothing to be
+robust against. Evidence still wanted: a second real locus, because the allele call moved on 2 of 5
+draws at one block. Is that the right bar before changing a default that affects every locus?
 
 **The cliff and the pseudo-count.** Is 200 defensible at all, or should the shrinkage precision be
-estimated? A block with 13 anchors currently contributes nothing where it should contribute about 6
-percent.
-
-**Scale of the default decision.** The ladder plus one more real locus is what we plan to require
-before flipping. Is that enough, given the call moves on 2 of 5 draws at a single block?
+estimated from observed variability? A block with 13 anchors currently contributes nothing where it
+should contribute roughly 6 percent.
 
 **Certified oracle, a correctness point not yet acted on.** Minimum summed edit distance over the two
-assignments is not equivalent to maximum mean identity when the two alignment lengths differ. The
-caching shortcut is still valid, but the pair assignment must optimise whichever identity definition is
+assignments is not equivalent to maximum mean identity when the two alignment lengths differ. The 2A
+caching shortcut remains valid, but the pair assignment must optimise whichever identity definition is
 actually reported.
+
+**Depth on real data.** The simulation-theory control that validated the mean here exists only because
+depth and error rate are known by construction. What plays that role on a real library, before
+per-marker efficiency has been learned from a cohort?
