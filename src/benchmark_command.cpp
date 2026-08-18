@@ -9,6 +9,7 @@
 #include "panvar/output.hpp"
 #include "panvar/parallel.hpp"
 #include "panvar/ref_path.hpp"
+#include "panvar/variant_nodes.hpp"
 
 #include <algorithm>
 #include <array>
@@ -126,119 +127,6 @@ const char* qv_ratio_quintile(double ratio) {
     if (ratio < 0.6) return "0.4-0.6";
     if (ratio < 0.8) return "0.6-0.8";
     return "0.8-1.0";
-}
-
-// One emitted call, kept whole. Folding a bubble's calls into a single node set cannot distinguish
-// "this truth event matched THAT record" from "this truth event touches something some record also
-// touches", and the second is not evidence that anything was called correctly.
-struct CalledRecord {
-    std::string variant_id;
-    std::string svtype;
-    std::unordered_set<std::string> nodes;
-};
-
-struct CalledVariants {
-    std::unordered_set<std::size_t> bubble_ids;                                // bubbles with >=1 call
-    std::unordered_map<std::size_t, std::vector<CalledRecord>> records;        // bubble_id -> records
-    std::unordered_map<std::size_t, std::unordered_set<std::string>> nodes;    // bubble_id -> union
-    std::map<std::size_t, std::set<std::string>> svtypes;                      // bubble_id -> svtypes
-};
-
-// `bubble_members` is every node each bubble owns (interior plus both boundaries). A call's nodes are
-// the whole basis on which a truth event is attributed to it, so a node that is not in the graph, or
-// belongs to a different site, silently turns a called event into a missed one -- the input error and
-// the caller failure produce the identical output. Nothing here is skipped or repaired: an input that
-// cannot be trusted is refused.
-CalledVariants load_variant_nodes(
-        const std::string& path,
-        const std::unordered_map<std::size_t, std::unordered_set<std::string>>& bubble_members) {
-    std::ifstream in(path);
-    if (!in) throw std::runtime_error("Failed to open variant nodes: " + path);
-    auto split_tab = [](const std::string& s) {
-        std::vector<std::string> f;
-        std::string cur;
-        for (char c : s) { if (c == '\t') { f.push_back(cur); cur.clear(); } else cur += c; }
-        f.push_back(cur);
-        return f;
-    };
-    CalledVariants cv;
-    std::string line;
-    std::size_t ncol = 0, lineno = 0;
-    std::unordered_set<std::string> seen_ids;
-    static const char* kHead[] = {"variant_id", "bubble_id", "svtype", "node_ids"};
-    while (std::getline(in, line)) {
-        ++lineno;
-        if (line.empty()) continue;
-        const std::vector<std::string> f = split_tab(line);
-        if (ncol == 0) {
-            // A missing header is not cosmetic: the first data row would be eaten as one, dropping a
-            // real call and reporting its event as missed.
-            if (f.size() < 4)
-                throw std::runtime_error(path + ": expected a header with at least 4 tab-separated "
-                                         "columns, found " + std::to_string(f.size()));
-            for (int i = 0; i < 4; ++i)
-                if (f[static_cast<std::size_t>(i)] != kHead[i])
-                    throw std::runtime_error(path + ": column " + std::to_string(i + 1) + " of the header is '" +
-                                             f[static_cast<std::size_t>(i)] + "', expected '" + kHead[i] +
-                                             "'. This is not a variant_nodes.tsv written by `call`");
-            ncol = f.size();
-            continue;
-        }
-        if (f.size() != ncol)
-            throw std::runtime_error(path + ":" + std::to_string(lineno) + ": has " +
-                                     std::to_string(f.size()) + " fields, the header has " +
-                                     std::to_string(ncol));
-        if (f[0].empty())
-            throw std::runtime_error(path + ":" + std::to_string(lineno) + ": empty variant_id");
-        if (!seen_ids.insert(f[0]).second)
-            throw std::runtime_error(path + ":" + std::to_string(lineno) + ": duplicate variant_id '" +
-                                     f[0] + "'; which record a truth event is attributed to would be undefined");
-        std::size_t bid = 0;
-        try {
-            std::size_t used = 0;
-            bid = static_cast<std::size_t>(std::stoull(f[1], &used));
-            if (used != f[1].size()) throw std::invalid_argument("trailing");
-        } catch (const std::exception&) {
-            throw std::runtime_error(path + ":" + std::to_string(lineno) + ": bubble_id '" + f[1] +
-                                     "' is not a number");
-        }
-        const auto mit = bubble_members.find(bid);
-        if (mit == bubble_members.end())
-            throw std::runtime_error(path + ":" + std::to_string(lineno) + ": bubble id " +
-                                     std::to_string(bid) + " is not in the bubbles CSV; these outputs "
-                                     "are from different runs");
-        CalledRecord rec;
-        rec.variant_id = f[0];
-        rec.svtype = f[2];
-        auto& un = cv.nodes[bid];
-        std::string tok;
-        auto take = [&]() {
-            if (tok.empty()) return;
-            if (!mit->second.count(tok))
-                throw std::runtime_error(path + ":" + std::to_string(lineno) + ": record '" + f[0] +
-                                         "' names node '" + tok + "', which bubble " + std::to_string(bid) +
-                                         " does not contain. A stale node turns a called event into a "
-                                         "missed one with nothing to show for it");
-            rec.nodes.insert(tok);
-            un.insert(tok);
-            tok.clear();
-        };
-        for (char c : f[3]) { if (c == ',') take(); else tok += c; }
-        take();
-        if (rec.nodes.empty())
-            throw std::runtime_error(path + ":" + std::to_string(lineno) + ": record '" + f[0] +
-                                     "' names no nodes");
-        cv.bubble_ids.insert(bid);
-        cv.svtypes[bid].insert(f[2]);
-        cv.records[bid].push_back(std::move(rec));
-    }
-    if (ncol == 0) throw std::runtime_error(path + ": file is empty");
-    // Deterministic record order, so which record a truth event is attributed to cannot depend on the
-    // order rows happen to sit in the file.
-    for (auto& [bid, recs] : cv.records)
-        std::sort(recs.begin(), recs.end(),
-                  [](const CalledRecord& a, const CalledRecord& b) { return a.variant_id < b.variant_id; });
-    return cv;
 }
 
 std::vector<std::string> split_on(const std::string& s, char sep) {
@@ -817,26 +705,26 @@ int run_benchmark_command(const std::vector<std::string>& args) {
              std::to_string(graph.paths.size()) + " paths); reference " + ref_name);
 
     const std::vector<Bubble> all_bubbles_csv = read_bubbles_csv(bubbles_csv_in);
-    std::unordered_map<std::size_t, std::unordered_set<std::string>> bubble_members;
     {
+        std::unordered_set<std::size_t> seen;
         for (const Bubble& b : all_bubbles_csv) {
             auto need = [&](const std::string& n) {
                 if (!graph.nodes.count(n))
                     throw std::runtime_error("bubble " + std::to_string(b.id) + " names node '" + n +
                                              "', which is not in " + gfa_path +
                                              " -- the CSV and the graph do not describe the same data");
-                return n;
             };
-            std::unordered_set<std::string> members;
-            members.insert(need(b.source));
-            members.insert(need(b.sink));
-            for (const std::string& n : b.inside) members.insert(need(n));
-            if (!bubble_members.emplace(b.id, std::move(members)).second)
+            need(b.source);
+            need(b.sink);
+            for (const std::string& n : b.inside) need(n);
+            if (!seen.insert(b.id).second)
                 throw std::runtime_error("bubbles CSV has a duplicate bubble id " + std::to_string(b.id) +
                                          ": which site a call or a score refers to would be undefined");
         }
     }
-    const CalledVariants cv = load_variant_nodes(variant_nodes_in, bubble_members);
+    const std::unordered_map<std::size_t, std::unordered_set<std::string>> bubble_members =
+        bubble_member_nodes(all_bubbles_csv);
+    const VariantNodes cv = load_variant_nodes(variant_nodes_in, bubble_members, "benchmark");
     const PathRecord* ref_path = nullptr;
     for (const PathRecord& p : graph.paths) if (p.name == ref_name) ref_path = &p;
 

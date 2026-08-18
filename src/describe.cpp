@@ -3,6 +3,7 @@
 #include "panvar/syncmer.hpp"
 
 #include "panvar/bubble_path.hpp"
+#include "panvar/variant_nodes.hpp"
 #include "panvar/cli_utils.hpp"
 #include "panvar/gfa.hpp"
 #include "panvar/graph_utils.hpp"
@@ -516,11 +517,17 @@ std::vector<PathStep> canonical_steps_for_bubble_path(
     const PathRecord& path,
     const BubblePathIndex& index) {
 
-    const auto interval = find_best_bubble_path_interval(index, bubble);
-    if (!interval.has_value()) {
+    // bubble_steps, not find_best_bubble_path_interval: the interval finder requires an interior
+    // node, so a path taking the direct source->sink edge -- a pure deletion, the short side of an
+    // insertion -- produced no steps and was not counted as a traverser at all. On a three-path
+    // fixture where three haplotypes delete the interior, the bubble reported 4 paths instead of 7,
+    // and the node that discriminates them was then discarded as non-discriminative because only its
+    // carriers had been observed: a plain deletion yielded ZERO features.
+    const auto steps = bubble_steps(path, index, bubble);
+    if (!steps) {
         return {};
     }
-    return canonical_bubble_path_steps(path, bubble, *interval);
+    return *steps;
 }
 
 // Count node/edge dosage over a path's bubble walk. When `keep` is non-null (variant-restricted mode)
@@ -778,11 +785,11 @@ std::string path_sequence_for_bubble(
     if (complete_out != nullptr) {
         *complete_out = false;
     }
-    const auto interval = find_best_bubble_path_interval(index, bubble);
-    if (!interval.has_value()) {
+    const auto steps_opt = bubble_steps(path, index, bubble);
+    if (!steps_opt) {
         return {};
     }
-    const auto steps = canonical_bubble_path_steps(path, bubble, *interval);
+    const std::vector<PathStep>& steps = *steps_opt;
     if (steps.empty()) {
         return {};
     }
@@ -824,11 +831,11 @@ BubblePathSequence path_sequence_with_segments_for_bubble(
     std::size_t flank_bp = 0) {
 
     BubblePathSequence out;
-    const auto interval = find_best_bubble_path_interval(index, bubble);
-    if (!interval.has_value()) {
+    const auto steps_opt = bubble_steps(path, index, bubble);
+    if (!steps_opt) {
         return out;
     }
-    const auto steps = canonical_bubble_path_steps(path, bubble, *interval);
+    const std::vector<PathStep>& steps = *steps_opt;
     if (steps.empty()) {
         return out;
     }
@@ -1239,15 +1246,26 @@ void write_bimbam_rows(
         std::vector<double> vals(sample_order.size(), std::numeric_limits<double>::quiet_NaN());
         double lo = std::numeric_limits<double>::infinity(), hi = -std::numeric_limits<double>::infinity();
         for (std::size_t i = 0; i < sample_order.size(); ++i) {
-            const auto cit = row.carriers.find(sample_order[i]);
-            if (cit != row.carriers.end()) {
-                vals[i] = cit->second;
-            } else {
-                for (std::size_t b : row.bubbles) {
-                    const auto bt = bubble_traversers.find(b);
-                    if (bt != bubble_traversers.end() && bt->second.count(sample_order[i])) { vals[i] = 0.0; break; }
+            // A pooled feature's dosage is summed over EVERY bubble that contributes it, so it is a
+            // complete observation only when the path is observable at all of them. Requiring just one
+            // (`break` on the first hit) reported a partial sum as if it were whole, and turned a
+            // haplotype that traverses one contributing bubble but not another into a confident low
+            // dosage instead of a missing one -- a downward bias, on the substrate `associate` tests.
+            bool all_observed = !row.bubbles.empty();
+            for (std::size_t b : row.bubbles) {
+                const auto bt = bubble_traversers.find(b);
+                if (bt == bubble_traversers.end() || !bt->second.count(sample_order[i])) {
+                    all_observed = false;
+                    break;
                 }
             }
+            const auto cit = row.carriers.find(sample_order[i]);
+            if (row.bubbles.empty()) {
+                // No bubble provenance to check against; fall back to presence.
+                if (cit != row.carriers.end()) vals[i] = cit->second;
+            } else if (all_observed) {
+                vals[i] = cit != row.carriers.end() ? cit->second : 0.0;
+            }   // else: NA -- the observation is incomplete, which is not the same as zero
             if (std::isfinite(vals[i])) { lo = std::min(lo, vals[i]); hi = std::max(hi, vals[i]); }
         }
         // BIMBAM mean-genotype line: id, allele1, allele2, dosages... (--scale-dosage maps to 0..2)
@@ -1479,6 +1497,9 @@ void emit_variant_substrate(const DescribeOptions& options, DescribeSummary& sum
     std::vector<std::string> hap_order;     // VCF sample columns (haplotype paths) = BIMBAM column order
     std::vector<VariantBimbam> rows;
     std::string line;
+    bool saw_header = false;
+    std::size_t lineno = 0;
+    std::unordered_set<std::string> seen_ids;
     while (std::getline(vin, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty()) continue;
@@ -1486,18 +1507,49 @@ void emit_variant_substrate(const DescribeOptions& options, DescribeSummary& sum
             if (line.rfind("#CHROM", 0) == 0) {
                 std::vector<std::string> f = split_on(line, '\t');
                 for (std::size_t i = 9; i < f.size(); ++i) hap_order.push_back(f[i]);
+                // A repeated column makes which haplotype a dosage belongs to depend on column order,
+                // and the join below would keep only one of them.
+                std::unordered_set<std::string> seen_h;
+                for (const std::string& h : hap_order)
+                    if (!seen_h.insert(h).second)
+                        throw std::runtime_error("describe --variant-vcf: duplicate sample column '" + h +
+                                                 "' in " + options.variant_vcf_path);
+                saw_header = true;
             }
             continue;
         }
+        ++lineno;
+        if (!saw_header)
+            throw std::runtime_error("describe --variant-vcf: a data line appears before the #CHROM "
+                                     "header in " + options.variant_vcf_path);
         std::vector<std::string> f = split_on(line, '\t');
-        if (f.size() < 10) continue;
+        // A short or long line means the columns are not where they are read from, so every dosage
+        // after it belongs to the wrong haplotype. Skipping it silently dropped the whole record.
+        if (f.size() != 9 + hap_order.size())
+            throw std::runtime_error("describe --variant-vcf: " + options.variant_vcf_path + " line " +
+                                     std::to_string(lineno) + " has " + std::to_string(f.size()) +
+                                     " fields, the #CHROM header declares " +
+                                     std::to_string(9 + hap_order.size()));
         const std::string& id = f[2];
+        if (id != "." && !seen_ids.insert(id).second)
+            throw std::runtime_error("describe --variant-vcf: duplicate record ID '" + id + "' in " +
+                                     options.variant_vcf_path);
         const std::string& info = f[7];
         const std::string svtype = info_value(info, "SVTYPE");
         const std::string bubble = info_value(info, "BUBBLE_ID");
+        // Without it the feature cannot be traced back to a site, which is the whole point of the
+        // `bubbles` provenance column a significant hit is followed through.
+        if (bubble.empty())
+            throw std::runtime_error("describe --variant-vcf: record '" + id + "' carries no BUBBLE_ID");
         const std::string nodes = info_value(info, "EVENT_NODES");
         const std::string gene = info_value(info, "GENES");
+        // AF is Number=A -- one value per ALT -- and a multiallelic record emits one dosage row per
+        // ALT, so each row takes its OWN element. Copying the whole comma-separated list into every
+        // row labelled each allele with the frequencies of all of them. Unreachable with current
+        // `call` output (only the allele VCF carries NALLELES, and it writes no AF), so this changes
+        // nothing measured today; it is wrong the moment either of those two facts changes.
         const std::string af = info_value(info, "AF");
+        const std::vector<std::string> af_parts = split_on(af, ',');
         const std::string an = info_value(info, "AN");
         const std::string nalleles_s = info_value(info, "NALLELES");
         const int nalleles = nalleles_s.empty() ? 1 : std::max(1, std::atoi(nalleles_s.c_str()));
@@ -1520,21 +1572,54 @@ void emit_variant_substrate(const DescribeOptions& options, DescribeSummary& sum
             v.svtype = svtype.empty() ? "." : svtype;
             v.bubble = bubble; v.nodes = nodes.empty() ? "." : nodes;
             v.gene = gene.empty() ? "." : gene;
-            v.af = af.empty() ? "." : af; v.an = an.empty() ? "." : an;
+            if (af.empty()) v.af = ".";
+            else if (!is_multi) v.af = af;
+            else v.af = (static_cast<std::size_t>(a) < af_parts.size()) ? af_parts[static_cast<std::size_t>(a)] : ".";
+            v.an = an.empty() ? "." : an;   // AN is scalar: the allele number is a property of the site
             for (std::size_t s = 0; s < hap_order.size() && 9 + s < f.size(); ++s) {
                 const std::vector<std::string> sub = split_on(f[9 + s], ':');
                 const std::string gt = (gt_i >= 0 && gt_i < static_cast<int>(sub.size()))
                                            ? sub[gt_i] : (sub.empty() ? std::string(".") : sub[0]);
                 if (gt == "." || gt.empty()) continue;  // bubble not traversed -> NA (absent)
+                // Each column IS one haplotype, so a genotype is one allele index. atoi would read the
+                // diploid "0/1" as 0 and score a heterozygous carrier as reference, and would turn any
+                // malformed field into a confident zero.
+                if (gt.find('/') != std::string::npos || gt.find('|') != std::string::npos)
+                    throw std::runtime_error("describe --variant-vcf: sample '" + hap_order[s] +
+                                             "' has the diploid genotype '" + gt + "' at record '" + id +
+                                             "'; one VCF column is one haplotype, so GT must be haploid");
+                int gti = 0;
+                {
+                    std::size_t used = 0;
+                    try { gti = std::stoi(gt, &used); } catch (const std::exception&) { used = 0; }
+                    if (used != gt.size() || gti < 0)
+                        throw std::runtime_error("describe --variant-vcf: sample '" + hap_order[s] +
+                                                 "' has the genotype '" + gt + "' at record '" + id +
+                                                 "', which is not an allele index");
+                }
                 double d;
-                if (is_dup && cn_i >= 0 && cn_i < static_cast<int>(sub.size()) && sub[cn_i] != ".")
-                    d = std::atof(sub[cn_i].c_str());
-                else if (is_multi)
-                    d = (std::atoi(gt.c_str()) == a + 1) ? 1.0 : 0.0;
-                else
-                    d = std::atof(gt.c_str());  // 0/1 presence
+                if (is_dup) {
+                    // `call` writes CN on every traversing DUP record. Falling back to the GT made a
+                    // copy-number feature silently become a 0/1 presence indicator -- a different
+                    // quantity, tested as if it were dosage.
+                    if (cn_i < 0 || cn_i >= static_cast<int>(sub.size()) || sub[cn_i] == ".")
+                        throw std::runtime_error("describe --variant-vcf: DUP record '" + id +
+                                                 "' has no usable CN for sample '" + hap_order[s] +
+                                                 "'; a copy-number feature cannot fall back to GT presence");
+                    std::size_t cused = 0;
+                    double cn = 0.0;
+                    try { cn = std::stod(sub[cn_i], &cused); } catch (const std::exception&) { cused = 0; }
+                    if (cused != sub[cn_i].size() || !std::isfinite(cn) || cn < 0.0)
+                        throw std::runtime_error("describe --variant-vcf: DUP record '" + id +
+                                                 "' has CN '" + sub[cn_i] + "' for sample '" + hap_order[s] +
+                                                 "', which is not a finite non-negative number");
+                    d = cn;
+                } else if (is_multi) {
+                    d = (gti == a + 1) ? 1.0 : 0.0;
+                } else {
+                    d = static_cast<double>(gti);  // 0/1 presence
+                }
                 v.dose[hap_order[s]] = d;
-                const int gti = std::atoi(gt.c_str());
                 v.is_alt[hap_order[s]] = static_cast<char>((is_multi ? (gti == a + 1) : (gti >= 1)) ? 1 : 0);
             }
             rows.push_back(std::move(v));
@@ -1664,8 +1749,9 @@ void describe_kmers_from_graph(
         }
     }
 
-    std::filesystem::create_directories(options.out_dir);
-
+    // Validate FIRST. The output directory used to be created before any input was read, so a run
+    // that was going to be refused still left a directory behind -- and, with the stale-output problem
+    // below, one that could hold a previous run's files looking current.
     ParseGfaOptions parse_options;
     parse_options.include_paths = true;
     parse_options.include_sequences = true;
@@ -1673,8 +1759,37 @@ void describe_kmers_from_graph(
     if (graph.paths.empty()) {
         throw std::runtime_error("Input GFA has no P/W paths; describe requires paths");
     }
+    // describe spells every walk by concatenating whole segments and counts k-mers over them, so a
+    // step naming a missing node, a step pair with no link, a duplicate path name (two BIMBAM columns
+    // carrying the same label) and a non-zero overlap all corrupt the dosages rather than failing.
+    validate_graph_paths(graph, "describe", true, true);
 
     const std::vector<Bubble> all_bubbles = read_bubbles_csv(options.bubbles_csv_in);
+    if (all_bubbles.empty())
+        throw std::runtime_error("describe: " + options.bubbles_csv_in + " lists no bubbles");
+    {
+        std::unordered_set<std::size_t> seen;
+        for (const Bubble& b : all_bubbles) {
+            if (!seen.insert(b.id).second)
+                throw std::runtime_error("describe: bubbles CSV has a duplicate bubble id " +
+                                         std::to_string(b.id) + "; which site a feature belongs to "
+                                         "would be undefined");
+            auto need = [&](const std::string& n) {
+                if (!graph.nodes.count(n))
+                    throw std::runtime_error("describe: bubble " + std::to_string(b.id) + " names node '" +
+                                             n + "', which is not in " + options.gfa_path +
+                                             " -- the CSV and the graph do not describe the same data");
+            };
+            need(b.source);
+            need(b.sink);
+            for (const std::string& n : b.inside) need(n);
+        }
+        for (const std::size_t want : options.bubble_ids)
+            if (!seen.count(want))
+                throw std::runtime_error("describe: --bubble-id " + std::to_string(want) +
+                                         " is not in " + options.bubbles_csv_in);
+    }
+    std::filesystem::create_directories(options.out_dir);
     std::unordered_set<std::size_t> bubble_filter;
     bubble_filter.reserve(options.bubble_ids.size() * 2 + 1);
     for (const std::size_t id : options.bubble_ids) {
@@ -1687,28 +1802,16 @@ void describe_kmers_from_graph(
     std::unordered_map<std::size_t, std::unordered_set<std::string>> variant_nodes_by_bubble;
     const bool variant_mode = !options.variant_nodes_path.empty();
     if (variant_mode) {
-        std::ifstream vn(options.variant_nodes_path);
-        if (!vn) {
-            throw std::runtime_error("Failed to open --variant-nodes file: " + options.variant_nodes_path);
-        }
-        std::string line;
-        bool header = true;
-        while (std::getline(vn, line)) {
-            if (header) { header = false; continue; }  // skip "variant_id\tbubble_id\tsvtype\tnode_ids"
-            if (line.empty()) continue;
-            std::vector<std::string> f;
-            std::size_t start = 0;
-            for (std::size_t p = 0; p <= line.size(); ++p) {
-                if (p == line.size() || line[p] == '\t') { f.push_back(line.substr(start, p - start)); start = p + 1; }
-            }
-            if (f.size() < 4) continue;
-            const std::size_t bid = static_cast<std::size_t>(std::strtoull(f[1].c_str(), nullptr, 10));
+        // The shared strict reader (src/variant_nodes.cpp), not a local copy. This set decides which
+        // bubbles are processed AND which nodes contribute features, so a row dropped for being short,
+        // a headerless file whose first row is eaten, or a node belonging to another bubble silently
+        // removes real features from the association substrate -- indistinguishable from the caller
+        // never having emitted them.
+        const VariantNodes vn = load_variant_nodes(options.variant_nodes_path,
+                                                   bubble_member_nodes(all_bubbles), "describe");
+        for (const auto& [bid, recs] : vn.records) {
             auto& set = variant_nodes_by_bubble[bid];
-            std::size_t s = 0;
-            const std::string& nodes = f[3];
-            for (std::size_t p = 0; p <= nodes.size(); ++p) {
-                if (p == nodes.size() || nodes[p] == ',') { if (p > s) set.insert(nodes.substr(s, p - s)); s = p + 1; }
-            }
+            for (const CalledRecord& rec : recs) set.insert(rec.nodes.begin(), rec.nodes.end());
         }
     }
 
@@ -1934,13 +2037,20 @@ void describe_kmers_from_graph(
         // Sample-level BIMBAM (diploid, summed dosage) -- the realistic per-sample genotype input to
         // `panvar associate`. Coverage (for NA) is lifted from per-haplotype traversers to samples.
         if (want_bimbam) {
+            // A sample's dosage is the SUM over its assigned haplotypes, so it is complete only when
+            // every one of them traverses. Lifting coverage as "any haplotype traversed" reported a
+            // half-observed diploid genotype as a whole one at half its true dosage.
+            std::unordered_map<std::string, std::vector<std::string>> sample_to_paths;
+            for (const auto& [hap, samples] : path_to_samples)
+                for (const std::string& sm : samples) sample_to_paths[sm].push_back(hap);
             std::unordered_map<std::size_t, std::unordered_set<std::string>> bubble_traversers_s;
             for (const auto& [b, paths] : bubble_traversers) {
                 auto& dst = bubble_traversers_s[b];
-                for (const std::string& path : paths) {
-                    const auto it = path_to_samples.find(path);
-                    if (it == path_to_samples.end()) continue;
-                    for (const std::string& s : it->second) dst.insert(s);
+                for (const auto& [sm, haps] : sample_to_paths) {
+                    bool all = !haps.empty();
+                    for (const std::string& h : haps)
+                        if (!paths.count(h)) { all = false; break; }
+                    if (all) dst.insert(sm);
                 }
             }
             const char* pool_header = "feature_id\tlayer\tencoding\tbubbles\tnodes\n";

@@ -113,6 +113,7 @@ add_library(panvarlib
     src/gfa_io.cpp
     src/align.cpp
     src/graph_utils.cpp
+    src/variant_nodes.cpp
     src/graph_sort.cpp
     src/three_edge_cc.cpp
     src/union_find.cpp
