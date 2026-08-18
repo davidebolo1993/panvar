@@ -53,7 +53,11 @@ Built from the same canonical walks as the k-mers:
 - node dosage: a descriptive traversal count: count > 1 can be a tandem (`…A,A…`) or a node revisited elsewhere (`…A,B,A…`); for short nodes it carries no `CN` meaning. Treat as presence/abundance.
 - edge dosage: count of each oriented `from±>to±` transition; adjacency-aware, so it is the a better tandem signal compared to node dosage. An inversion appears as distinct (orientation-flipped) edge features.
 
-The discriminative filter drops constant features (e.g. source/sink nodes). Node dosages match `inspect`'s `node_counts.tsv` totals by construction. Under `--variant-nodes` both substrates are confined to the variant nodes (and the `--variant-flank-bp`): a k-mer is masked unless it lies on a variant node, a node feature is counted only if it is a variant node, and an edge only if both endpoints are.
+The discriminative filter drops constant features (e.g. source/sink nodes). Node dosages match `inspect`'s `node_counts.tsv` totals by construction. Under `--variant-nodes` both substrates are confined to the variant nodes, widened by `--variant-flank-bp`: a k-mer is masked unless it lies on a variant node or within the flank, a node feature is counted only if it is a variant node or the flank reaches it, and an edge only if both endpoints are.
+
+**The flank has two granularities, deliberately.** For k-mers it admits exactly N *bases* at the node end facing the variant node, the rest being masked to `N` so the scanner resets; for node and edge dosage it admits the *whole* node, because a node dosage is a property of the whole node and there is no partial-node count to give. So the same flag selects more nodes than bases. Keeping a neighbour entire for the k-mers as well is what made `--variant-flank-bp 30` admit a 100 kb node and every k-mer in it.
+
+**A traversal does not require an interior node.** A path taking the direct source→sink edge — a pure deletion, or the short side of an insertion — is a traverser of the bubble and receives a dosage of `0` at the nodes it skips, not `NA`. Requiring an interior node meant such a path was not observed at all, and the node that discriminates the deletion was then discarded as non-discriminative because only its carriers had been seen: the site produced no features whatever.
 
 ## Variant features
 
@@ -63,7 +67,7 @@ The k-mer and graph substrates are spelled from the graph itself. The third subs
 - a multiallelic record (`NALLELES > 1`) expands into one row per ALT allele (`<id>_a1`, `<id>_a2`, …), each an indicator of whether the haplotype carries that allele;
 - a `DEL`/`INS`/`INV` uses the `0/1` genotype directly, a presence dosage.
 
-A haplotype whose genotype is `.` did not traverse the bubble and becomes `NA`, exactly as in the other substrates. Reading one VCF record over four haplotypes (`h4` misses the two graph-collapsed bubbles):
+A haplotype whose genotype is `.` did not traverse the bubble and becomes `NA`, exactly as in the other substrates. `NA` means unobserved, and is kept distinct from `0` throughout: a pooled feature is finite only when every bubble contributing it is observable on that path, and a diploid sample only when every assigned haplotype traverses — a partial sum reported as a whole one would bias dosage downward. A `DUP` must carry a usable `CN`; falling back to `GT` presence would substitute a 0/1 indicator for a copy-number dosage. Reading one VCF record over four haplotypes (`h4` misses the two graph-collapsed bubbles):
 
 ```text
 VCF record (FORMAT)          h1      h2      h3      h4      →  BIMBAM row(s)
