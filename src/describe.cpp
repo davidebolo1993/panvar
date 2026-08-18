@@ -504,9 +504,21 @@ std::string edge_key(const PathStep& from, const PathStep& to) {
     return oriented_node_token(from) + ">" + oriented_node_token(to);
 }
 
-// Forward decl (defined below): per-step keep mask for --variant-nodes (+flank). Used by the graph
-// dosage counters here so they honour the variant-restricted scope, same as the k-mer substrate.
-std::vector<char> variant_keep_mask(
+// How much of one step's sequence the --variant-nodes scope keeps. A variant node is kept whole; a
+// neighbour is kept only for the FLANK BASES nearest the variant node, at whichever end faces it.
+// Keeping the neighbour entirely made `--variant-flank-bp 30` admit a 100 kb node and every k-mer in
+// it, so the flag's number bore no relation to how much sequence it let in.
+struct KeepSpan {
+    bool full = false;        // a variant node: all of it
+    std::size_t prefix = 0;   // bases kept at this node's START (a variant node follows it downstream)
+    std::size_t suffix = 0;   // bases kept at this node's END   (a variant node precedes it upstream)
+    bool any() const { return full || prefix != 0 || suffix != 0; }
+};
+
+// Forward decl (defined below): per-step keep spec for --variant-nodes (+flank). The graph dosage
+// counters consume it NODE-granularly (a node is counted or not), which is the honest granularity for
+// a per-node dosage; the k-mer substrate consumes the base offsets.
+std::vector<KeepSpan> variant_keep_mask(
     const Graph& graph,
     const std::vector<PathStep>& steps,
     const std::unordered_set<std::string>& variant_nodes,
@@ -534,14 +546,18 @@ std::vector<PathStep> canonical_steps_for_bubble_path(
 // a node is counted only on kept steps, and an edge only when BOTH of its endpoints are kept, so the
 // graph substrate honours --variant-nodes (+flank) exactly like the k-mer substrate.
 GraphDosage count_graph_dosage(const std::vector<PathStep>& steps,
-                               const std::vector<char>* keep = nullptr) {
+                               const std::vector<KeepSpan>* keep = nullptr) {
     GraphDosage dosage;
+    // NODE-granular by design: a node dosage is a property of the whole node, so a node the flank
+    // only partly reaches is either counted or not. The k-mer substrate is the one that honours the
+    // flank to the base. `--variant-flank-bp` therefore selects MORE nodes here than bases there, and
+    // the module docs say so rather than implying a single granularity.
     for (std::size_t i = 0; i < steps.size(); ++i) {
-        if (keep != nullptr && !(*keep)[i]) continue;
+        if (keep != nullptr && !(*keep)[i].any()) continue;
         ++dosage.node_counts[steps[i].node_id];
     }
     for (std::size_t i = 0; i + 1 < steps.size(); ++i) {
-        if (keep != nullptr && (!(*keep)[i] || !(*keep)[i + 1])) continue;
+        if (keep != nullptr && (!(*keep)[i].any() || !(*keep)[i + 1].any())) continue;
         ++dosage.edge_counts[edge_key(steps[i], steps[i + 1])];
     }
     return dosage;
@@ -593,9 +609,9 @@ void accumulate_graph_stats(
         if (steps.empty()) {
             continue;
         }
-        const std::vector<char> keep =
+        const std::vector<KeepSpan> keep =
             variant_nodes != nullptr ? variant_keep_mask(graph, steps, *variant_nodes, flank_bp)
-                                     : std::vector<char>();
+                                     : std::vector<KeepSpan>();
         const GraphDosage dosage = count_graph_dosage(steps, variant_nodes != nullptr ? &keep : nullptr);
         update_graph_stats(dosage.node_counts, node_stats);
         update_graph_stats(dosage.edge_counts, edge_stats);
@@ -679,9 +695,9 @@ void write_graph_matrix(
         if (steps.empty()) {
             continue;
         }
-        const std::vector<char> keep =
+        const std::vector<KeepSpan> keep =
             variant_nodes != nullptr ? variant_keep_mask(graph, steps, *variant_nodes, flank_bp)
-                                     : std::vector<char>();
+                                     : std::vector<KeepSpan>();
         const GraphDosage dosage = count_graph_dosage(steps, variant_nodes != nullptr ? &keep : nullptr);
 
         std::string line;
@@ -726,35 +742,37 @@ std::string join_nodes(const std::vector<std::string>& nodes) {
     return out;
 }
 
-// Per-step keep mask for `--variant-nodes`. Keep a step (emit its real sequence) when it is a variant
-// node, or -- with flank_bp > 0 -- within flank_bp along the path of one, so k-mers spanning into the
-// flanking sequence survive. flank_bp == 0 is the strict variant-only mask. Path-specific, so per path.
-std::vector<char> variant_keep_mask(
+// Per-step keep spec for `--variant-nodes`. A variant node is kept whole; with flank_bp > 0 a
+// neighbour keeps only the flank_bp bases nearest the variant node, at the end facing it.
+// flank_bp == 0 is the strict variant-only mask. Path-specific, so computed per path.
+std::vector<KeepSpan> variant_keep_mask(
     const Graph& graph,
     const std::vector<PathStep>& steps,
     const std::unordered_set<std::string>& variant_nodes,
     std::size_t flank_bp) {
 
     const std::size_t n = steps.size();
-    std::vector<char> is_var(n, 0), keep(n, 0);
+    std::vector<char> is_var(n, 0);
+    std::vector<KeepSpan> keep(n);
     std::vector<std::size_t> len(n, 0);
     for (std::size_t i = 0; i < n; ++i) {
         const auto it = graph.nodes.find(steps[i].node_id);
         len[i] = (it == graph.nodes.end()) ? 0 : it->second.sequence.size();
         is_var[i] = variant_nodes.count(steps[i].node_id) ? 1 : 0;
-        keep[i] = is_var[i];
+        keep[i].full = is_var[i] != 0;
     }
     if (flank_bp == 0) {
         return keep;
     }
-    // Forward sweep: `gap` is the bp from the right edge of the last variant node to the left edge
-    // of the current node; keep while still within flank_bp. Backward sweep mirrors it for the left
-    // flank. SIZE_MAX marks "no variant node seen yet" so leading/trailing runs are not kept.
+    // Forward sweep: `gap` is the bp from the right edge of the last variant node to the left edge of
+    // the current node. The bases of a downstream node nearest that variant are its LEADING ones, so
+    // only `flank_bp - gap` of them are kept -- not the whole node. Backward sweep mirrors it onto
+    // trailing bases. SIZE_MAX marks "no variant node seen yet" so leading/trailing runs are not kept.
     std::size_t gap = std::numeric_limits<std::size_t>::max();
     for (std::size_t i = 0; i < n; ++i) {
         if (is_var[i]) { gap = 0; continue; }
         if (gap != std::numeric_limits<std::size_t>::max()) {
-            if (gap < flank_bp) keep[i] = 1;
+            if (gap < flank_bp) keep[i].prefix = std::min(len[i], flank_bp - gap);
             gap += len[i];
         }
     }
@@ -762,11 +780,27 @@ std::vector<char> variant_keep_mask(
     for (std::size_t i = n; i-- > 0;) {
         if (is_var[i]) { gap = 0; continue; }
         if (gap != std::numeric_limits<std::size_t>::max()) {
-            if (gap < flank_bp) keep[i] = 1;
+            if (gap < flank_bp) keep[i].suffix = std::min(len[i], flank_bp - gap);
             gap += len[i];
         }
     }
     return keep;
+}
+
+// The kept sequence of one step, with everything else replaced by 'N' of the same length. The k-mer
+// scanner resets its window on any non-ACGT base, so this confines k-mer generation to the kept bases
+// without disturbing segment offsets or node provenance.
+std::string masked_step_sequence(const std::string& node_seq, bool reverse, const KeepSpan& k) {
+    const std::string oriented = reverse ? reverse_complement(node_seq) : node_seq;
+    if (k.full) return oriented;
+    if (!k.any()) return std::string(oriented.size(), 'N');
+    std::string out(oriented.size(), 'N');
+    // prefix/suffix are measured on the PATH's reading direction, which is what `oriented` is in.
+    const std::size_t pre = std::min(k.prefix, oriented.size());
+    for (std::size_t i = 0; i < pre; ++i) out[i] = oriented[i];
+    const std::size_t suf = std::min(k.suffix, oriented.size());
+    for (std::size_t i = 0; i < suf; ++i) out[oriented.size() - 1 - i] = oriented[oriented.size() - 1 - i];
+    return out;
 }
 
 // When `variant_nodes` is non-null, bases spelled from nodes outside the keep mask are replaced
@@ -801,7 +835,7 @@ std::string path_sequence_for_bubble(
         }
         return complete ? sequence : std::string{};
     }
-    const std::vector<char> keep = variant_keep_mask(graph, steps, *variant_nodes, flank_bp);
+    const std::vector<KeepSpan> keep = variant_keep_mask(graph, steps, *variant_nodes, flank_bp);
     std::string sequence;
     for (std::size_t si = 0; si < steps.size(); ++si) {
         const PathStep& step = steps[si];
@@ -809,12 +843,7 @@ std::string path_sequence_for_bubble(
         if (node_it == graph.nodes.end() || node_it->second.sequence.empty()) {
             return {};
         }
-        const auto& node_seq = node_it->second.sequence;
-        if (keep[si]) {
-            sequence += step.reverse ? reverse_complement(node_seq) : node_seq;
-        } else {
-            sequence.append(node_seq.size(), 'N');
-        }
+        sequence += masked_step_sequence(node_it->second.sequence, step.reverse, keep[si]);
     }
     if (complete_out != nullptr) {
         *complete_out = true;
@@ -849,17 +878,17 @@ BubblePathSequence path_sequence_with_segments_for_bubble(
         total_len += node_it->second.sequence.size();
     }
 
-    const std::vector<char> keep =
+    const std::vector<KeepSpan> keep =
         variant_nodes != nullptr ? variant_keep_mask(graph, steps, *variant_nodes, flank_bp)
-                                 : std::vector<char>{};
+                                 : std::vector<KeepSpan>{};
     out.sequence.reserve(total_len);
     out.segments.reserve(steps.size());
     for (std::size_t si = 0; si < steps.size(); ++si) {
         const PathStep& step = steps[si];
         const auto& node_seq = graph.nodes.at(step.node_id).sequence;
         const std::size_t start = out.sequence.size();
-        if (variant_nodes != nullptr && !keep[si]) {
-            out.sequence.append(node_seq.size(), 'N');     // masked: no k-mers from non-kept nodes
+        if (variant_nodes != nullptr) {
+            out.sequence += masked_step_sequence(node_seq, step.reverse, keep[si]);
         } else if (step.reverse) {
             out.sequence += reverse_complement(node_seq);
         } else {
@@ -1179,9 +1208,9 @@ void accumulate_graph_counts(
         if (steps.empty()) {
             continue;
         }
-        const std::vector<char> keep =
+        const std::vector<KeepSpan> keep =
             variant_nodes != nullptr ? variant_keep_mask(graph, steps, *variant_nodes, flank_bp)
-                                     : std::vector<char>();
+                                     : std::vector<KeepSpan>();
         const GraphDosage dosage = count_graph_dosage(steps, variant_nodes != nullptr ? &keep : nullptr);
         for (const auto& [key, c] : dosage.node_counts) {
             if (c > 0 && keep_nodes.count(key) != 0) pool[key][meta.path_name] += c;
