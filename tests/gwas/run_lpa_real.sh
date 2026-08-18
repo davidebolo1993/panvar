@@ -59,16 +59,21 @@ echo "== describe --samples (per-sample BIMBAM dosage) =="
 
 DESC="$OUT_DIR/desc"   # per-substrate sample-level inputs live under $DESC/sample/<substrate>/
 plot() {  # plot <assoc_prefix> <title>
-  "$RS" "$REPO/scripts/plot_associate.R" --assoc "$1.assoc.tsv" --summary "$1.summary.tsv" \
-    --out "$1" --title "$2" >/dev/null 2>&1 || echo "  (plot skipped: ggplot2?)"
+  # Report what actually failed. This used to guess "(plot skipped: ggplot2?)", which sent me looking
+  # for a missing R package that was installed -- the real cause was $RS not being on PATH.
+  local err
+  err="$("$RS" "$REPO/scripts/plot_associate.R" --assoc "$1.assoc.tsv" --summary "$1.summary.tsv" \
+    --out "$1" --title "$2" 2>&1 >/dev/null)" \
+    || echo "  (plot skipped: ${err:-$RS failed with no message}$([ -x "$(command -v "$RS")" ] || echo " -- '$RS' is not executable; set RSCRIPT=/path/to/Rscript)")"
 }
 # pipeline <real_prefix> <unfiltered_prefix> <min_maf> <title>: faceted per-stage Manhattan
 # (TEST -> FILTER MAF -> [CLUMP] -> CORRECT -> CONDITION). Needs an extra --min-maf 0 run for the
 # TEST/FILTER stages (so the MAF-dropped features are visible).
 pipeline() {
-  "$RS" "$REPO/scripts/plot_associate_pipeline.R" --assoc "$1.assoc.tsv" --unfiltered "$2.assoc.tsv" \
-    --summary "$1.summary.tsv" --min-maf "$3" --out "$1" --title "$4" >/dev/null 2>&1 \
-    || echo "  (pipeline plot skipped: ggplot2?)"
+  local err
+  err="$("$RS" "$REPO/scripts/plot_associate_pipeline.R" --assoc "$1.assoc.tsv" --unfiltered "$2.assoc.tsv" \
+    --summary "$1.summary.tsv" --min-maf "$3" --out "$1" --title "$4" 2>&1 >/dev/null)" \
+    || echo "  (pipeline plot skipped: ${err:-$RS failed with no message}$([ -x "$(command -v "$RS")" ] || echo " -- '$RS' is not executable; set RSCRIPT=/path/to/Rscript)")"
 }
 
 echo "== 1) REGION SCAN: associate on the real KIV-2 features (PC-adjusted) =="
