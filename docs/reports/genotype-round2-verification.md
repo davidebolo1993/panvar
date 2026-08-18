@@ -616,9 +616,11 @@ order of magnitude in each direction. It is evidence that the anchors covary, wh
 not a number a posterior can carry as though it were known. An earlier revision said a depth posterior
 must carry the 9.4-fold inflation "exactly"; that is withdrawn.
 
-The direction of the conclusion survives: the added spread is not estimator noise, and neither the
-depth nor the mass uncertainty can be derived from independent per-observation counting. The magnitude
-needs far more draws.
+The direction of the conclusion survives, with the wording corrected once more: the added spread is
+cluster-correlated estimator sampling error under a fixed lambda. It is not independent Poisson noise,
+but it is still uncertainty in the estimator rather than something outside it. What holds is that
+neither the depth nor the mass uncertainty can be derived from independent per-observation counting.
+The magnitude needs far more draws.
 
 ### 8.8 What this does not do
 
@@ -669,9 +671,15 @@ confinement audit. On lpa that is 19,330 rows, and it makes section 8.6's checks
     beyond +/-3 sd           1.43-fold
     randomized quantile residuals vs uniform: KS D 0.0087, p 0.104
 
-The pooled distribution is close to Poisson, and a Kolmogorov-Smirnov test failing to reject at 19,330
-observations is a strong statement rather than a weak one. **Outlier robustness is therefore not the
-priority**, which supports the narrow version of the earlier claim and not the broad one.
+The pooled distribution looks Poisson-like. **The Kolmogorov-Smirnov p-value is not a valid acceptance
+test here and should not be read as one**: it assumes independent observations while these anchors
+covary through shared fragments, which this same report measures at roughly 9-fold; the Poisson mean
+was estimated from the data being tested; and the randomized residuals add a further source of
+randomness. Read the whole block as descriptive evidence that outlier robustness is not the immediate
+problem in this clean simulation, not as a formal acceptance of homogeneous Poisson sampling.
+
+The three zeros are all in block 0, a flank, which is itself evidence of spatial heterogeneity that a
+homogeneous model does not predict.
 
 The stratified views show the structure the summaries hid, which is what the review predicted:
 
@@ -683,30 +691,59 @@ The stratified views show the structure the summaries hid, which is what the rev
 | 0.419 to 0.484 | 3,590 | 23.298 |
 | 0.484 to 0.839 | 5,344 | 23.504 |
 
-**A monotonic GC trend of about 3.4 percent in the mean count**, invisible in every pooled statistic.
-The magnitude is what matters: 3.4 percent of lambda is 0.40, while the all-correct lambda window
-measured in section 8.2 spans 11.60 to 11.65, a width of 0.43 percent. **The GC effect is roughly eight
-times the width of the window lambda has to land in.**
+There is a positive GC-associated trend, and an earlier revision of this section called it monotonic
+and treated it as an established effect. **Both were overstated.** The quintiles are not monotonic --
+23.267 falls to 23.216 in the middle -- and re-binning on equal-count quintiles gives a different shape
+again, peaking in the fourth rather than the fifth. The association is real but weak:
 
-So if the array block's markers are GC-atypical relative to the anchors, the lambda estimated from
-anchors is biased for that block by potentially more than one repeat unit on its own. Marker-specific
-efficiency is not a refinement here; it is plausibly the dominant remaining bias source, which
-independently reproduces danbing-tk's result that per-marker bias correction is the largest single
-effect in their method.
+    pooled Pearson r(count, gc)   0.0399     r-squared 0.0016
+    within-block centred r        0.0410
+    excluding both flanks r       0.0387
+
+So it is not an artifact of differing coverage between blocks or of the flanks, and it explains about
+0.16 percent of the variance. Per-block slopes are mixed: of eleven blocks with at least 200 anchors,
+two are negative and one substantially so at -6.759.
+
+The arithmetic linking it to lambda is correct as far as it goes -- the extreme-bin difference is about
+3.4 percent of the mean, which is 0.40 in lambda against an all-correct window 0.43 percent wide, so
+roughly eight-fold wider. But an extreme-bin difference from one seed with binning-sensitive quintiles
+is not a stable estimate of an effect size, and that comparison should not be quoted as though it were.
+
+**And a mechanism qualification that matters more than the statistics.** These reads come from wgsim,
+which samples fragments approximately uniformly and does not model library GC selection. There is
+therefore no GC-bias mechanism in this data for the trend to be. GC is more likely acting as a proxy
+for position, sequence context, syncmer ascertainment or a realized local coverage fluctuation. The
+right phrase is GC-associated marker efficiency, not a GC effect, and certainly not a GC-dependent one.
+
+The comparison with danbing-tk is directionally consistent and should be stated no more strongly than
+that: this independently motivates the same class of correction. It does not reproduce their result,
+because panvar has not shown that correcting the association improves copy-number or genotype accuracy.
+
+**The honest conclusion is that marker-specific efficiency is now the highest-priority hypothesis to
+test, not that it is the dominant remaining bias source.**
 
 By block, the variance-to-mean ratio runs 0.826 to 1.418, with both flanks near 1.4 and interior
 backbones below 1.16. Flanks are the locus edges where coverage falls away, so the region estimate
 probably should not weight them equally; they currently contribute 1,841 of 19,330 anchors.
 
-**A scope limit of this dump, which the result itself exposes.** It covers anchors only, so it cannot
-compare anchor GC against the array block's marker GC, which is the decisive test for whether the trend
-actually biases the array. That needs all markers, not only the invariant ones, and is the next change.
+**Two defects in the dump itself.** It covers anchors only, so it cannot compare anchor GC against the
+array block's marker GC, which is the decisive test for whether the trend biases the array at all. And
+its confinement columns are useless as written: `expected` is 0 for all 19,330 rows because
+`dbg_expected` is populated from the informative-marker expectation map while anchors are filtered
+against a separate anchor expectation, and `actual` is uniformly 464, which is just the panel size
+after exclusions and is the definition of an anchor rather than a fact about any particular one.
+
+Extending the dump to informative markers is not sufficient on its own either. Without per-allele
+multiplicity it would compare array markers carrying twenty copies against single-copy anchors and
+confound efficiency with dosage. The extended dump needs, at minimum: anchor against informative,
+block and within-block position, clump membership, per-allele multiplicity and carrier count, the
+simulated truth multiplicity where truth is supplied, and the observed count normalized by that
+multiplicity.
 
 ### 8.11 Not started
 
 A negative binomial or robust weighted estimator, now understood to require marker-specific efficiency
-rather than a change of likelihood family. Per-anchor count export, without which none of the
-distributional checks in 8.6 can be run. Tests: there is still no registered `genotype_stats.sh`, and
+rather than a change of likelihood family. Tests: there is still no registered `genotype_stats.sh`, and
 neither depth commit added one. The needed assertions are a zero-anchor block reporting NA with
 REGION_FALLBACK, a shrunk block whose raw and fitted values differ by the expected coefficient, the
 audit carrying the final joint depth rather than the first-pass value, direct and indexed runs
@@ -754,61 +791,91 @@ untested here.
 | `7d9bd65` | the `min_anchors` cliff removed, so every block with anchors contributes and is shrunk by its own weight; the region summary stops naming its anchor centre lambda |
 | `6c01d4c` | `--dump-anchors`, and the distributional checks it makes possible |
 
-Default behaviour is unchanged throughout. `--depth-estimator` still defaults to `median`, so every one
-of these is either a reporting fix or an opt-in alternative.
+**No default option changed. One intended default-path consistency fix can change output slightly:**
+commit `7d9bd65` alters the default median path for every block with 1 to 19 anchors, whose anchors now
+contribute through shrinkage instead of being discarded. On lpa that moves `mass_bp` by 1 bp. An
+earlier revision of this section said default behaviour was unchanged throughout, which contradicted a
+measurement recorded two sections earlier in the same document.
 
-### 9.2 The finding that reorders the remaining work
+### 9.2 What the depth thread found, stated at its actual strength
 
-The thread began as a depth-estimator question and did not end as one.
+The median-to-mean correction moves lambda by about 1.1 percent, which took the proof-of-concept's band
+selection from 3 of 5 draws to 5 of 5, and cut the bias in `mass_bp` by 81 percent across five draws
+for a 25 percent RMSE improvement. That part is measured and holds.
 
-The median-to-mean correction moves lambda by about 1.1 percent, and that was enough to take the
-proof-of-concept's band selection from 3 of 5 draws to 5 of 5. But the anchor dump shows a monotonic
-GC-dependent efficiency of about 3.4 percent across the marker set, three times larger, and **eight
-times the width of the 0.43 percent lambda window the array has to land in.** Unlike the median's bias,
-which is a constant, the GC effect varies with which markers a block happens to use.
+The anchor dump then showed a positive GC-associated trend in the counts. An earlier revision of this
+section promoted that into the claim that marker efficiency is the dominant remaining bias source.
+**That is withdrawn.** What the data supports:
 
-So marker-specific efficiency moves from something scheduled after the solver to plausibly the dominant
-remaining bias source. That is the same conclusion danbing-tk reached from the other direction, where
-per-marker bias correction is the single largest reported effect, and it was reached here from our own
-data rather than adopted from theirs.
+- a weak association, pooled r 0.0399, r-squared 0.0016;
+- surviving within-block centring and flank exclusion, so not a between-block artifact;
+- not monotonic across quintiles, and sensitive to how the quintiles are cut;
+- mixed per-block slopes, two of eleven negative, one at -6.759;
+- from a single wgsim draw, in which no library GC-selection mechanism exists at all, so GC is likely
+  standing in for position, context, syncmer ascertainment or a local coverage fluctuation.
+
+The extreme-bin difference is about eight times the width of the lambda window, and that arithmetic is
+right, but an extreme-bin difference from one seed is not a stable effect size and should not be
+quoted as one.
+
+**The supportable statement is that marker-specific efficiency is now the highest-priority hypothesis
+to test.** It independently motivates the same class of correction that danbing-tk applies; it does not
+reproduce their result, because nothing here yet shows that correcting the association improves
+copy-number or genotype accuracy.
+
+Recording plainly that section 9.4 below is a lesson this section had already broken when it was
+written: an anchor-only, single-seed association was used to support a claim about the dominant bias in
+genotyping. It is enough to reorder the next experiment. It is not enough to establish the conclusion.
 
 ### 9.3 What is blocking
 
-**The decisive test is not runnable yet, and the dump written to enable it is why.** `--dump-anchors`
-covers anchors only. Whether the GC trend actually biases the array depends on how the array block's
-marker GC compares with the anchors', and that needs all markers rather than only the invariant ones.
-Small change, and it settles whether the finding in 9.2 bites in practice or is merely present.
+**The decisive test is not runnable, and the dump written to enable it is why.** `--dump-anchors`
+covers invariant depth anchors only, so it cannot compare them against the informative array markers.
+It also has a real defect: its `expected` column is 0 on every row, because it is populated from the
+informative-marker expectation map while anchors are filtered against a separate anchor expectation,
+and its `actual` column is uniformly 464, which restates the panel size rather than saying anything
+about a given marker.
+
+Extending it to informative markers is necessary and not sufficient. Without per-allele multiplicity,
+array markers carrying twenty copies would be compared against single-copy anchors and efficiency would
+be confounded with dosage.
 
 **There is still no registered genotype test.** Four commits in, `genotype_stats.sh` does not exist
 while every other module has one. The depth code now branches over local against shrunk against
-fallback, three estimators, NA handling, and direct against indexed, which makes it the largest
-untested surface in the module. By the agreement in section 8.12 this also blocks the default change.
+fallback, three estimators, NA handling, and direct against indexed, making it the largest untested
+surface in the module, and by the agreement in section 8.12 this blocks the default change.
 
 ### 9.4 A pattern in this pass worth recording
 
-Three claims made in this thread were corrected, two in review and one by our own measurement: that
-depth was not the problem, that a posterior could not rescue the band selection, and the Poisson
-trimming comparison. The common shape is that each conclusion was drawn from a check narrower than the
-claim it was used to support -- one lambda held fixed, one choice of posterior width, one wrong
-definition of trimming.
+Four claims made in this thread were corrected: that depth was not the problem, that a posterior could
+not rescue band selection, the Poisson trimming comparison, and the strength of the GC finding. The
+common shape is that each conclusion was drawn from a check narrower than the claim it supported -- one
+lambda held fixed, one choice of posterior width, one wrong definition of trimming, one seed and one
+marker class.
 
-The distributional checks in section 8.10 are the first in this thread with the power to discriminate,
-and they immediately found structure that four agreeing summary statistics had missed. That is an
-argument for running the discriminating test before stating the conclusion, not after being asked.
+The stratified descriptive analysis in section 8.10 is what exposed structure that four agreeing
+summary statistics had missed. An earlier revision credited that to the distributional tests having
+power to discriminate, which overstates it: the Kolmogorov-Smirnov calibration is invalid under marker
+dependence, so it was the stratification and not the formal test that did the work.
 
 ### 9.5 Recommended order
 
-1. **Extend the dump to all markers** and compare the array block's marker GC against the anchors'.
-   Small, and it decides whether 9.2 changes anything in practice.
-2. **Write and register `genotype_stats.sh`**, covering a zero-anchor block reporting NA with
-   REGION_FALLBACK, a shrunk block whose raw and fitted values differ by the expected coefficient, the
-   audit carrying the final joint depth rather than the first-pass value, direct and indexed runs
-   honouring the same estimator, and continuous behaviour across 19, 20 and 21 anchors.
-3. **50 to 100 seeds on the fixed lpa pair**, plus lower depths and higher error rates so the ladder
-   stops being saturated.
-4. Then the marker-efficiency work proper, and only after that a decision on the default.
+1. **Write and register `genotype_stats.sh`**, either first or in the same commit as the dump
+   extension. Assertions: a zero-anchor block reporting NA with REGION_FALLBACK; a shrunk block whose
+   raw and fitted values differ by the expected coefficient; the audit carrying the final joint depth
+   rather than the first-pass value; direct and indexed runs honouring the same estimator; continuous
+   behaviour across 19, 20 and 21 anchors.
+2. **Fix the anchor `expected` field and extend the dump** to informative markers, with truth
+   multiplicity, position and clump membership, so efficiency can be separated from dosage.
+3. **Repeat the GC slope over 50 to 100 seeds**, fitted within block and position rather than pooled,
+   to establish whether the association reproduces at all.
+4. **Lower-depth and higher-error ladders**, so the saturated synthetic ladder becomes discriminative.
+5. **Fit a cross-validated efficiency model**, of the form
+   `y_k ~ NB(lambda * q(GC_k, position, clump) * m_k + b_k, phi)`, and test whether it improves
+   held-out mass and copy-number accuracy and calibration.
+6. Only then reconsider the default.
 
-The certified nearest-pair oracle and the ideal-multiplicity oracle remain where they were, ahead of
-any solver work, and neither has been started. Nothing in this pass constitutes progress on choosing
-the nearest available haplotype; bubble accuracy on lpa is unchanged at 7 of 10 and cyp2d6 is identical
-under both estimators.
+The certified nearest-pair oracle and the ideal-multiplicity oracle remain ahead of any solver work and
+neither has been started. Nothing in this pass constitutes progress on choosing the nearest available
+haplotype: bubble accuracy on lpa is unchanged at 7 of 10, and cyp2d6 is identical under both
+estimators.
