@@ -197,5 +197,90 @@ check "params.json records which substrates were emitted" \
 check "and the variant restriction, flank and thread count" \
       "$(~/miniconda3/bin/python -c "import json;d=json.load(open('$TX/describe.params.json'));print(sum(k in d for k in ('variant_nodes','variant_flank_bp','threads','samples','scale_dosage','input_sizes_bytes')))")" "6"
 
+
+# ---------------------------------------------------------------------------------------------
+# --variant-nodes must not lose the deletion. A DEL's EVENT_NODES are exactly the nodes the ALT
+# haplotype does NOT have, so on that haplotype the mask finds no seed: the bypass edge source->sink
+# was never counted and no junction k-mer was emitted. The deletion survived only as the ABSENCE of
+# reference features, which is not a positive genotyping signal.
+# ---------------------------------------------------------------------------------------------
+dbid=$(tail -n +2 "$OUT/ab.bubbles.csv" | head -1 | cut -d, -f1)
+dins=$(tail -n +2 "$OUT/ab.bubbles.csv" | head -1 | sed 's/.*"\(.*\)".*/\1/' | tr ';' ',')
+dsrc=$(tail -n +2 "$OUT/ab.bubbles.csv" | head -1 | cut -d, -f2)
+dsnk=$(tail -n +2 "$OUT/ab.bubbles.csv" | head -1 | cut -d, -f4)
+printf 'variant_id\tbubble_id\tsvtype\tnode_ids\nd1\t%s\tDEL\t%s\n' "$dbid" "$dins" > "$OUT/vndel.tsv"
+"$BIN" describe -i "$OUT/ab.sorted.gfa" --bubble-prefix-in "$OUT/ab" --out-dir "$OUT/VD" \
+   --variant-nodes "$OUT/vndel.tsv" --variant-flank-bp 30 --no-wide-matrix -q >/dev/null 2>&1
+VDB="$OUT/VD/haplotype/graph/bimbam_graph.bimbam.gz"
+check "the ALT-specific bypass edge survives --variant-nodes" \
+      "$(gunzip -c "$VDB" | cut -d, -f1 | grep -c "^${dsrc}+>${dsnk}+$")" "1"
+check "and the deletion still yields junction k-mers" \
+      "$(awk -v a="$(gunzip -c "$OUT/VD/haplotype/kmers/bimbam_kmers.bimbam.gz" | wc -l)" 'BEGIN{print (a+0>0)?"yes":"no"}')" "yes"
+
+# ---------------------------------------------------------------------------------------------
+# Sample level: a diploid genotype is complete or it is NA. The variant substrate marked a sample
+# covered as soon as ANY assigned haplotype had a dosage and summed whatever was there, so a
+# half-observed sample was reported at half its true value -- and entered AC/AN.
+# ---------------------------------------------------------------------------------------------
+"$BIN" call -i "$OUT/ab.sorted.gfa" -c "$OUT/ab.bubbles.csv" -r "$REF" -o "$OUT/ac" -q >/dev/null 2>&1
+printf 'sample\thap1\thap2\nS1\tfull1#1#chr1\tdel1#1#chr1\nS2\tfull2#1#chr1\ttrunc#1#chr1\n' > "$OUT/sam.tsv"
+"$BIN" describe -i "$OUT/ab.sorted.gfa" --bubble-prefix-in "$OUT/ab" --out-dir "$OUT/SV" \
+   --variant-vcf "$OUT/ac.region.vcf" --samples "$OUT/sam.tsv" --no-wide-matrix -q >/dev/null 2>&1
+SVB="$OUT/SV/sample/variant/bimbam_variant.bimbam.gz"
+if [ -s "$SVB" ]; then
+  s2col=$(gunzip -c "$OUT/SV/sample/variant/samples.txt.gz" | grep -n '^S2$' | cut -d: -f1)
+  # S2's second haplotype does not traverse bubble 2, so at a bubble-2 record S2 must be NA.
+  na2=$(gunzip -c "$SVB" | awk -F', ' -v c="$s2col" 'NR>0 && $(c+3)=="NA"{n++} END{print n+0}')
+  check "a half-observed diploid sample is NA somewhere, not a halved dosage" \
+        "$(awk -v n="$na2" 'BEGIN{print (n+0>0)?"yes":"no"}')" "yes"
+else
+  bad "no sample-level variant BIMBAM was written"
+fi
+
+# --samples must not accept a haplotype that matches nothing: it contributes silently nothing, which
+# looks exactly like a sample with no signal.
+printf 'sample\thap1\thap2\nS1\tfull1#1#chr1\tGHOST#9#chr1\n' > "$OUT/ghost.tsv"
+refused "an unknown haplotype name in --samples is refused" "$OUT/E8" \
+  "$BIN" describe -i "$OUT/ab.sorted.gfa" --bubble-prefix-in "$OUT/ab" --out-dir "$OUT/E8" \
+     --samples "$OUT/ghost.tsv" -q
+
+# --no-bimbam must mean no BIMBAM anywhere, not just the pooled graph/k-mer ones.
+refused "--no-bimbam with --variant-vcf is refused" "$OUT/E9" \
+  "$BIN" describe -i "$OUT/ab.sorted.gfa" --bubble-prefix-in "$OUT/ab" --out-dir "$OUT/E9" \
+     --no-bimbam --variant-vcf "$OUT/ac.region.vcf" -q
+refused "--no-bimbam with --samples is refused" "$OUT/E10" \
+  "$BIN" describe -i "$OUT/ab.sorted.gfa" --bubble-prefix-in "$OUT/ab" --out-dir "$OUT/E10" \
+     --no-bimbam --samples "$OUT/sam.tsv" -q
+
+# --variant-vcf parser: each of these was silently interpretable.
+mkvcf() { grep -v '^##' "$OUT/ac.region.vcf" > /dev/null 2>&1; }
+awk -F'\t' 'BEGIN{OFS="\t"} /^#/{print;next} {$9="CN"; print}' "$OUT/ac.region.vcf" > "$OUT/nogt.vcf"
+refused "a FORMAT with no GT is refused, not read from the first field" "$OUT/E11" \
+  "$BIN" describe -i "$OUT/ab.sorted.gfa" --bubble-prefix-in "$OUT/ab" --out-dir "$OUT/E11" \
+     --variant-vcf "$OUT/nogt.vcf" --only-variant -q
+awk -F'\t' 'BEGIN{OFS="\t"} /^#/{print;next} {for(i=10;i<=NF;i++){n=split($i,p,":"); p[1]="7"; s=p[1]; for(j=2;j<=n;j++) s=s":"p[j]; $i=s} print}' \
+  "$OUT/ac.region.vcf" > "$OUT/badidx.vcf"
+refused "an allele index the record does not have is refused" "$OUT/E12" \
+  "$BIN" describe -i "$OUT/ab.sorted.gfa" --bubble-prefix-in "$OUT/ab" --out-dir "$OUT/E12" \
+     --variant-vcf "$OUT/badidx.vcf" --only-variant -q
+awk -F'\t' 'BEGIN{OFS="\t"} /^#/{print;next} {$8=$8";NALLELES=abc"; print}' "$OUT/ac.region.vcf" > "$OUT/badnall.vcf"
+refused "a malformed NALLELES is refused, not atoi'd to a number" "$OUT/E13" \
+  "$BIN" describe -i "$OUT/ab.sorted.gfa" --bubble-prefix-in "$OUT/ab" --out-dir "$OUT/E13" \
+     --variant-vcf "$OUT/badnall.vcf" --only-variant -q
+: > "$OUT/empty.vcf"
+refused "a headerless/empty variant VCF is refused, not a successful empty run" "$OUT/E14" \
+  "$BIN" describe -i "$OUT/ab.sorted.gfa" --bubble-prefix-in "$OUT/ab" --out-dir "$OUT/E14" \
+     --variant-vcf "$OUT/empty.vcf" --only-variant -q
+
+# Output ownership is exact: only bubble_<digits> is generated, so a user's bubble_notes must survive.
+TXO="$OUT/own"
+"$BIN" describe -i "$OUT/ab.sorted.gfa" --bubble-prefix-in "$OUT/ab" --out-dir "$TXO" --no-wide-matrix -q >/dev/null 2>&1
+mkdir -p "$TXO/bubble_notes"; touch "$TXO/bubble_notes/mine.txt" "$TXO/bubble_readme.md"
+"$BIN" describe -i "$OUT/ab.sorted.gfa" --bubble-prefix-in "$OUT/ab" --out-dir "$TXO" --only-graph --no-wide-matrix -q >/dev/null 2>&1
+check "a user's bubble_notes/ is not treated as generated output" \
+      "$([ -f "$TXO/bubble_notes/mine.txt" ] && echo kept || echo DELETED)" "kept"
+check "nor is bubble_readme.md" "$([ -f "$TXO/bubble_readme.md" ] && echo kept || echo DELETED)" "kept"
+check "while the generated bubble_1 is still installed" "$([ -d "$TXO/bubble_1" ] && echo yes || echo no)" "yes"
+
 printf "%d assertion(s) failed\n" "$fails"
 [ "$fails" -eq 0 ]

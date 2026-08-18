@@ -511,9 +511,10 @@ std::string edge_key(const PathStep& from, const PathStep& to) {
 // it, so the flag's number bore no relation to how much sequence it let in.
 struct KeepSpan {
     bool full = false;        // a variant node: all of it
+    bool boundary = false;    // the bubble's source or sink: kept on EVERY traversing allele
     std::size_t prefix = 0;   // bases kept at this node's START (a variant node follows it downstream)
     std::size_t suffix = 0;   // bases kept at this node's END   (a variant node precedes it upstream)
-    bool any() const { return full || prefix != 0 || suffix != 0; }
+    bool any() const { return full || boundary || prefix != 0 || suffix != 0; }
 };
 
 // Forward decl (defined below): per-step keep spec for --variant-nodes (+flank). The graph dosage
@@ -524,6 +525,11 @@ std::vector<KeepSpan> variant_keep_mask(
     const std::vector<PathStep>& steps,
     const std::unordered_set<std::string>& variant_nodes,
     std::size_t flank_bp);
+
+// Mark the bubble's own source and sink kept on every traversing allele (see the definition for why a
+// DEL is otherwise invisible in --variant-nodes mode).
+void keep_bubble_boundaries(const Graph& graph, const std::vector<PathStep>& steps,
+                            std::size_t flank_bp, std::vector<KeepSpan>& keep);
 
 std::vector<PathStep> canonical_steps_for_bubble_path(
     const Bubble& bubble,
@@ -546,6 +552,17 @@ std::vector<PathStep> canonical_steps_for_bubble_path(
 // Count node/edge dosage over a path's bubble walk. When `keep` is non-null (variant-restricted mode)
 // a node is counted only on kept steps, and an edge only when BOTH of its endpoints are kept, so the
 // graph substrate honours --variant-nodes (+flank) exactly like the k-mer substrate.
+// Node ids and oriented-edge keys live in ONE string-keyed pool, so a node literally named like an
+// edge key would be summed together with that edge and no annotation could separate them afterwards.
+// The `encoding` column labels them, which is not the same as preventing the collision -- so the
+// collision itself is refused, cheaply and exactly, where the keys are made.
+void reject_node_edge_key_collision(const std::string& node_id) {
+    if (node_id.find('>') != std::string::npos)
+        throw std::runtime_error("describe: node id '" + node_id + "' contains '>', which is the "
+                                 "oriented-edge key separator; node and edge features share one "
+                                 "namespace and would be pooled together");
+}
+
 GraphDosage count_graph_dosage(const std::vector<PathStep>& steps,
                                const std::vector<KeepSpan>* keep = nullptr) {
     GraphDosage dosage;
@@ -555,6 +572,7 @@ GraphDosage count_graph_dosage(const std::vector<PathStep>& steps,
     // the module docs say so rather than implying a single granularity.
     for (std::size_t i = 0; i < steps.size(); ++i) {
         if (keep != nullptr && !(*keep)[i].any()) continue;
+        reject_node_edge_key_collision(steps[i].node_id);
         ++dosage.node_counts[steps[i].node_id];
     }
     for (std::size_t i = 0; i + 1 < steps.size(); ++i) {
@@ -610,9 +628,10 @@ void accumulate_graph_stats(
         if (steps.empty()) {
             continue;
         }
-        const std::vector<KeepSpan> keep =
+        std::vector<KeepSpan> keep =
             variant_nodes != nullptr ? variant_keep_mask(graph, steps, *variant_nodes, flank_bp)
                                      : std::vector<KeepSpan>();
+        if (variant_nodes != nullptr) keep_bubble_boundaries(graph, steps, flank_bp, keep);
         const GraphDosage dosage = count_graph_dosage(steps, variant_nodes != nullptr ? &keep : nullptr);
         update_graph_stats(dosage.node_counts, node_stats);
         update_graph_stats(dosage.edge_counts, edge_stats);
@@ -696,9 +715,10 @@ void write_graph_matrix(
         if (steps.empty()) {
             continue;
         }
-        const std::vector<KeepSpan> keep =
+        std::vector<KeepSpan> keep =
             variant_nodes != nullptr ? variant_keep_mask(graph, steps, *variant_nodes, flank_bp)
                                      : std::vector<KeepSpan>();
+        if (variant_nodes != nullptr) keep_bubble_boundaries(graph, steps, flank_bp, keep);
         const GraphDosage dosage = count_graph_dosage(steps, variant_nodes != nullptr ? &keep : nullptr);
 
         std::string line;
@@ -788,6 +808,32 @@ std::vector<KeepSpan> variant_keep_mask(
     return keep;
 }
 
+// The bubble's own boundaries, kept on EVERY traversing allele of a selected bubble.
+//
+// Without this, --variant-nodes loses the deletion entirely. A DEL's EVENT_NODES are precisely the
+// nodes the ALT haplotype does NOT have, so on that haplotype the mask finds no seed, keeps nothing,
+// and the bypass edge source->sink is never counted because neither endpoint is kept -- nor are the
+// junction k-mers that span it. The deletion is then represented only by the ABSENCE of reference
+// features, which is not a positive genotyping signal and is exactly what flank-based genotyping needs.
+//
+// The steps are the canonical source->sink walk, so the first and last are the boundaries. They are
+// marked kept (which restores the ALT-specific edge) and given the flank bases facing inward (which
+// restores the junction k-mers). Boundary NODE features are constant across traversers and the
+// discriminative filter drops them, so this adds the alt-specific signal without adding noise.
+void keep_bubble_boundaries(const Graph& graph, const std::vector<PathStep>& steps,
+                            std::size_t flank_bp, std::vector<KeepSpan>& keep) {
+    if (steps.empty() || keep.size() != steps.size()) return;
+    auto node_len = [&](std::size_t i) {
+        const auto it = graph.nodes.find(steps[i].node_id);
+        return it == graph.nodes.end() ? std::size_t{0} : it->second.sequence.size();
+    };
+    const std::size_t last = steps.size() - 1;
+    keep[0].boundary = true;
+    keep[0].suffix = std::max(keep[0].suffix, std::min(node_len(0), flank_bp));
+    keep[last].boundary = true;
+    keep[last].prefix = std::max(keep[last].prefix, std::min(node_len(last), flank_bp));
+}
+
 // The kept sequence of one step, with everything else replaced by 'N' of the same length. The k-mer
 // scanner resets its window on any non-ACGT base, so this confines k-mer generation to the kept bases
 // without disturbing segment offsets or node provenance.
@@ -836,7 +882,8 @@ std::string path_sequence_for_bubble(
         }
         return complete ? sequence : std::string{};
     }
-    const std::vector<KeepSpan> keep = variant_keep_mask(graph, steps, *variant_nodes, flank_bp);
+    std::vector<KeepSpan> keep = variant_keep_mask(graph, steps, *variant_nodes, flank_bp);
+    keep_bubble_boundaries(graph, steps, flank_bp, keep);
     std::string sequence;
     for (std::size_t si = 0; si < steps.size(); ++si) {
         const PathStep& step = steps[si];
@@ -879,9 +926,10 @@ BubblePathSequence path_sequence_with_segments_for_bubble(
         total_len += node_it->second.sequence.size();
     }
 
-    const std::vector<KeepSpan> keep =
+    std::vector<KeepSpan> keep =
         variant_nodes != nullptr ? variant_keep_mask(graph, steps, *variant_nodes, flank_bp)
                                  : std::vector<KeepSpan>{};
+    if (variant_nodes != nullptr) keep_bubble_boundaries(graph, steps, flank_bp, keep);
     out.sequence.reserve(total_len);
     out.segments.reserve(steps.size());
     for (std::size_t si = 0; si < steps.size(); ++si) {
@@ -1247,9 +1295,10 @@ void accumulate_graph_counts(
         if (steps.empty()) {
             continue;
         }
-        const std::vector<KeepSpan> keep =
+        std::vector<KeepSpan> keep =
             variant_nodes != nullptr ? variant_keep_mask(graph, steps, *variant_nodes, flank_bp)
                                      : std::vector<KeepSpan>();
+        if (variant_nodes != nullptr) keep_bubble_boundaries(graph, steps, flank_bp, keep);
         const GraphDosage dosage = count_graph_dosage(steps, variant_nodes != nullptr ? &keep : nullptr);
         for (const auto& [key, c] : dosage.node_counts) {
             if (c > 0 && keep_nodes.count(key) != 0) pool[key][meta.path_name] += c;
@@ -1530,12 +1579,15 @@ std::string info_value(const std::string& info, const std::string& key) {
 // Returns (haplotype-path -> samples carrying it, sample column order). Shared by the k-mer/graph
 // SAMPLE-level export and the variant-level export so the diploid summation is defined in one place.
 std::pair<std::unordered_map<std::string, std::vector<std::string>>, std::vector<std::string>>
-read_cosigt_table(const std::string& path) {
+read_cosigt_table(const std::string& path,
+                  const std::unordered_set<std::string>* known_haplotypes = nullptr,
+                  const char* known_label = "") {
     std::ifstream sin(path);
     if (!sin) throw std::runtime_error("Failed to open --samples file: " + path);
     std::unordered_map<std::string, std::vector<std::string>> path_to_samples;
     std::vector<std::string> sample_order;
     std::unordered_set<std::string> seen_samples;
+    std::unordered_map<std::string, std::size_t> ploidy;
     std::string line;
     bool first = true;
     while (std::getline(sin, line)) {
@@ -1556,10 +1608,34 @@ read_cosigt_table(const std::string& path) {
             throw std::runtime_error("describe --samples: duplicate sample id '" + sample + "' in " + path +
                                      "; which row's haplotypes a sample gets would depend on file order");
         sample_order.push_back(sample);
+        std::size_t assigned = 0;
         for (std::size_t fi = 1; fi < fields.size(); ++fi)
-            for (const std::string& hap : split_on(fields[fi], ','))
-                if (!hap.empty()) path_to_samples[hap].push_back(sample);
+            for (const std::string& hap : split_on(fields[fi], ',')) {
+                if (hap.empty()) continue;
+                // A name that matches nothing contributes silently nothing, which looks exactly like a
+                // sample with no signal. Reject it instead.
+                if (known_haplotypes != nullptr && !known_haplotypes->count(hap))
+                    throw std::runtime_error("describe --samples: sample '" + sample + "' names haplotype '" +
+                                             hap + "', which is not " + known_label);
+                path_to_samples[hap].push_back(sample);
+                ++assigned;
+            }
+        if (assigned == 0)
+            throw std::runtime_error("describe --samples: sample '" + sample + "' has no haplotype "
+                                     "assignment; a row with no haplotypes cannot be genotyped");
+        ploidy[sample] = assigned;
     }
+    // Ploidy is not assumed. The dosage is a SUM over a sample's assigned haplotypes and every one of
+    // them must be observed, so any fixed arity works -- but a table that is not uniformly diploid is
+    // worth saying out loud rather than silently averaging over.
+    std::size_t lo = 0, hi = 0;
+    for (const auto& [sm, n] : ploidy) {
+        if (lo == 0 || n < lo) lo = n;
+        if (n > hi) hi = n;
+    }
+    if (lo != hi)
+        std::cerr << "[describe] note: --samples has mixed ploidy (" << lo << ".." << hi
+                  << " haplotypes per sample); dosage is the sum over each sample's own assignments\n";
     return {std::move(path_to_samples), std::move(sample_order)};
 }
 
@@ -1642,7 +1718,14 @@ void emit_variant_substrate(const DescribeOptions& options, DescribeSummary& sum
         const std::vector<std::string> af_parts = split_on(af, ',');
         const std::string an = info_value(info, "AN");
         const std::string nalleles_s = info_value(info, "NALLELES");
-        const int nalleles = nalleles_s.empty() ? 1 : std::max(1, std::atoi(nalleles_s.c_str()));
+        int nalleles = 1;
+        if (!nalleles_s.empty()) {
+            std::size_t used = 0;
+            try { nalleles = std::stoi(nalleles_s, &used); } catch (const std::exception&) { used = 0; }
+            if (used != nalleles_s.size() || nalleles < 1)
+                throw std::runtime_error("describe --variant-vcf: record '" + id + "' has NALLELES='" +
+                                         nalleles_s + "', which is not a positive integer");
+        }
         const std::vector<std::string> fmt_keys = split_on(f[8], ':');
         int gt_i = -1, cn_i = -1;
         for (std::size_t i = 0; i < fmt_keys.size(); ++i) {
@@ -1659,6 +1742,9 @@ void emit_variant_substrate(const DescribeOptions& options, DescribeSummary& sum
         for (int a = 0; a < n_rows; ++a) {
             VariantBimbam v;
             v.id = is_multi ? (id + "_a" + std::to_string(a + 1)) : id;
+            if (is_multi && seen_ids.count(v.id))
+                throw std::runtime_error("describe --variant-vcf: generated per-ALT id '" + v.id +
+                                         "' collides with a record that already has that ID");
             v.svtype = svtype.empty() ? "." : svtype;
             v.bubble = bubble; v.nodes = nodes.empty() ? "." : nodes;
             v.gene = gene.empty() ? "." : gene;
@@ -1668,8 +1754,10 @@ void emit_variant_substrate(const DescribeOptions& options, DescribeSummary& sum
             v.an = an.empty() ? "." : an;   // AN is scalar: the allele number is a property of the site
             for (std::size_t s = 0; s < hap_order.size() && 9 + s < f.size(); ++s) {
                 const std::vector<std::string> sub = split_on(f[9 + s], ':');
-                const std::string gt = (gt_i >= 0 && gt_i < static_cast<int>(sub.size()))
-                                           ? sub[gt_i] : (sub.empty() ? std::string(".") : sub[0]);
+                if (gt_i < 0)
+                    throw std::runtime_error("describe --variant-vcf: record '" + id +
+                                             "' has no GT in FORMAT; the first field is not a genotype");
+                const std::string gt = gt_i < static_cast<int>(sub.size()) ? sub[gt_i] : std::string(".");
                 if (gt == "." || gt.empty()) continue;  // bubble not traversed -> NA (absent)
                 // Each column IS one haplotype, so a genotype is one allele index. atoi would read the
                 // diploid "0/1" as 0 and score a heterozygous carrier as reference, and would turn any
@@ -1687,6 +1775,12 @@ void emit_variant_substrate(const DescribeOptions& options, DescribeSummary& sum
                                                  "' has the genotype '" + gt + "' at record '" + id +
                                                  "', which is not an allele index");
                 }
+                const int max_allele = is_multi ? nalleles - 1 : 1;
+                if (gti > max_allele)
+                    throw std::runtime_error("describe --variant-vcf: record '" + id + "' gives sample '" +
+                                             hap_order[s] + "' allele index " + std::to_string(gti) +
+                                             ", but the record has only " + std::to_string(max_allele) +
+                                             " ALT allele(s)");
                 double d;
                 if (is_dup) {
                     // `call` writes CN on every traversing DUP record. Falling back to the GT made a
@@ -1715,6 +1809,13 @@ void emit_variant_substrate(const DescribeOptions& options, DescribeSummary& sum
             rows.push_back(std::move(v));
         }
     }
+
+    if (!saw_header)
+        throw std::runtime_error("describe --variant-vcf: " + options.variant_vcf_path +
+                                 " has no #CHROM header line");
+    if (rows.empty())
+        throw std::runtime_error("describe --variant-vcf: " + options.variant_vcf_path +
+                                 " yielded no variant rows");
 
     // af/an default to the VCF's panel-wide values; the sample writer passes its own, computed over the
     // samples actually in the matrix. Emitting the panel's numbers next to sample dosages made every
@@ -1760,12 +1861,18 @@ void emit_variant_substrate(const DescribeOptions& options, DescribeSummary& sum
         summary.files_written += 3;
     }
 
-    // Sample-level (diploid) BIMBAM: sum a sample's haplotype dosages; NA only if no haplotype traverses.
-    // In sample/variant/, self-contained (matrix + feature_annot + column order).
+    // Sample-level (diploid) BIMBAM: sum a sample's haplotype dosages, and ONLY when every assigned
+    // haplotype was observed. Marking a sample covered as soon as any one of them had a dosage --
+    // which is what this did -- reported a half-observed diploid genotype as a whole one at half its
+    // true value, and put the same partial sample into the recomputed AC/AN. The k-mer and graph
+    // substrates already require all; this one did not.
     if (!options.samples_path.empty()) {
         const auto cosigt = read_cosigt_table(options.samples_path);
         const auto& path_to_samples = cosigt.first;
         const auto& sample_order = cosigt.second;
+        std::unordered_map<std::string, std::vector<std::string>> sample_to_paths;
+        for (const auto& [hap, samples] : path_to_samples)
+            for (const std::string& sm : samples) sample_to_paths[sm].push_back(hap);
         const std::filesystem::path dir = substrate_dir(out_dir, "sample", "variant");
         GzipWriter sout((dir / "samples.txt.gz").string());
         for (const std::string& s : sample_order) { sout.write(s); sout.write("\n"); }
@@ -1780,16 +1887,17 @@ void emit_variant_substrate(const DescribeOptions& options, DescribeSummary& sum
             // allele each -- and AC those whose GT is this row's ALT, the same definition the VCF uses,
             // but over the samples this matrix actually contains.
             std::size_t an_s = 0, ac_s = 0;
-            for (const auto& [hap, d] : v.dose) {
-                const auto it = path_to_samples.find(hap);
-                if (it == path_to_samples.end()) continue;
-                const auto ai = v.is_alt.find(hap);
-                const bool alt = ai != v.is_alt.end() && ai->second != 0;
-                for (const std::string& s : it->second) {
-                    samp[s] += d;
-                    covered.insert(s);
+            for (const auto& [sm, haps] : sample_to_paths) {
+                bool all_observed = !haps.empty();
+                for (const std::string& h : haps)
+                    if (!v.dose.count(h)) { all_observed = false; break; }
+                if (!all_observed) continue;      // NA: an incomplete genotype is not a low one
+                covered.insert(sm);
+                for (const std::string& h : haps) {
+                    samp[sm] += v.dose.at(h);
+                    const auto ai = v.is_alt.find(h);
                     ++an_s;
-                    if (alt) ++ac_s;
+                    if (ai != v.is_alt.end() && ai->second != 0) ++ac_s;
                 }
             }
             const std::string an_str = std::to_string(an_s);
@@ -2006,18 +2114,24 @@ void describe_kmers_from_graph(
             summary.paths_written += result.paths;
             summary.features_written += result.features;
             summary.features_candidates += result.features_total;
-            summary.jsonl_files_written += 1;
-            summary.files_written += 2; // feature map + sparse JSONL
-            if (result.matrix_written) {
-                summary.matrix_files_written += 1;
-                summary.files_written += 1;
+            // Count only what this run actually wrote: these were added unconditionally, so
+            // --only-graph still counted the k-mer feature map and JSONL, and vice versa.
+            if (options.emit_kmers) {
+                summary.jsonl_files_written += 1;
+                summary.files_written += 2; // feature map + sparse JSONL
+                if (result.matrix_written) {
+                    summary.matrix_files_written += 1;
+                    summary.files_written += 1;
+                }
             }
             summary.node_edge_features_written += result.node_features + result.edge_features;
             summary.node_edge_candidates += result.node_features_total + result.edge_features_total;
-            summary.files_written += 1; // graph feature map
-            if (result.graph_matrix_written) {
-                summary.graph_matrix_files_written += 1;
-                summary.files_written += 1;
+            if (options.emit_graph) {
+                summary.files_written += 1; // graph feature map
+                if (result.graph_matrix_written) {
+                    summary.graph_matrix_files_written += 1;
+                    summary.files_written += 1;
+                }
             }
         }
 
@@ -2110,7 +2224,10 @@ void describe_kmers_from_graph(
     // the sample's assigned haplotype paths (a haplotype listed twice -> doubled, i.e. a homozygous
     // diploid genotype). Parsed once and reused for the k-mer and node/edge sample files.
     if (!options.samples_path.empty()) {
-        const auto cosigt = read_cosigt_table(options.samples_path);
+        std::unordered_set<std::string> graph_haps;
+        for (const auto& pr : graph.paths) graph_haps.insert(pr.name);
+        const auto cosigt = read_cosigt_table(options.samples_path, &graph_haps,
+                                              "a path in the input graph");
         const std::unordered_map<std::string, std::vector<std::string>>& path_to_samples = cosigt.first;
         const std::vector<std::string>& sample_order_s = cosigt.second;  // sample (column) order
 
@@ -2170,8 +2287,6 @@ void describe_kmers_from_graph(
                 std::vector<BimbamRow> rows; rows.reserve(sample_pool.size());
                 for (const auto& [code, carriers] : sample_pool) {
                     BimbamRow r; r.id = decode_kmer(code, options.kmer_size);
-                    r.encoding = options.feature_mode == DescribeFeatureMode::Syncmer ? "syncmer" : "all";
-                r.encoding = options.feature_mode == DescribeFeatureMode::Syncmer ? "syncmer" : "all";
                     r.encoding = options.feature_mode == DescribeFeatureMode::Syncmer ? "syncmer" : "all";
                     const auto nit = feature_nodes_k.find(code);
                     r.nodes = (nit != feature_nodes_k.end() && !nit->second.empty())

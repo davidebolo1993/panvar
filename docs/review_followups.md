@@ -241,9 +241,12 @@ as history; Git already provides that history.
   dosage, because a node dosage is a property of the whole node. It therefore admits more nodes than
   bases. Splitting it into two flags would be clearer; one flag with a documented asymmetry was chosen
   over adding CLI surface.
-- **Node and edge features share one id namespace.** They are told apart by the sidecar's `encoding`
-  column, not by prefixed ids. A collision needs a node literally named like an oriented-edge key,
-  while renaming feature ids would break every downstream join against `call`'s `variant_nodes.tsv`.
+- **Node and edge features share one id namespace, and a collision is REFUSED rather than annotated.**
+  An earlier note here claimed the sidecar's `encoding` column disambiguates them; it does not — both
+  keys go into one string-keyed pool, so a colliding pair would already have been summed into a single
+  entry before any annotation is written. A node id containing the oriented-edge separator `>` is now
+  an error. Renaming ids to `node:`/`edge:` remains rejected as it would break every downstream join
+  against `call`'s `variant_nodes.tsv`.
 - **Pooling is locus-wide and stays that way.** Measured for the double-counting hazard: c4 has exactly
   one node claimed by two bubbles, cyp2d6 none, and zero emitted features localise to a shared node at
   either locus. The features spanning several bubbles (9 at c4, 31 at cyp2d6) are one k-mer sequence at

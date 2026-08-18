@@ -11,6 +11,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace panvar {
@@ -52,7 +53,8 @@ void print_describe_help() {
         << "      --feature-mode <mode>        all|syncmer (default: syncmer)\n"
         << "      --syncmer-s <S>              Internal s-mer size for closed syncmer mode (default: auto)\n"
         << "      --min-paths <N>              Drop features with min(present,absent) paths <= N,\n"
-        << "                                   keeping copy-number features (default: 1; 0 keeps all)\n"
+        << "                                   keeping copy-number features (default: 1; 0 keeps every\n"
+        << "                                   DISCRIMINATIVE feature -- constant ones are always dropped)\n"
         << "      --max-wide-features <N>      Skip wide matrix above N features (default: 250000; 0=no cap)\n"
         << "      --force-wide                 Write wide matrix even above safety cap\n"
         << "      --no-wide-matrix             Write only feature map + sparse JSONL counts\n"
@@ -236,11 +238,15 @@ int run_describe_command(const std::vector<std::string>& args) {
     if (options.emit_variant && options.variant_vcf_path.empty() && !graph_substrates) {
         throw std::runtime_error("--only-variant requires --variant-vcf <call.region.vcf>");
     }
-    // The variant substrate IS a BIMBAM, so --no-bimbam --only-variant asked for nothing at all while
-    // still writing the variant matrix.
-    if (!options.bimbam && options.emit_variant && !options.variant_vcf_path.empty() && !graph_substrates)
-        throw std::runtime_error("--no-bimbam leaves --only-variant with nothing to write: the variant "
-                                 "substrate is a BIMBAM matrix");
+    // Every BIMBAM, not just the pooled graph/k-mer ones. The variant substrate IS a BIMBAM and the
+    // sample level is BIMBAM-only, so --no-bimbam with either of them asked for output it then
+    // suppressed -- or, for --variant-vcf, silently wrote the matrix anyway.
+    if (!options.bimbam && options.emit_variant && !options.variant_vcf_path.empty())
+        throw std::runtime_error("--no-bimbam and --variant-vcf conflict: the variant substrate is a "
+                                 "BIMBAM matrix, so there would be nothing to write");
+    if (!options.bimbam && !options.samples_path.empty())
+        throw std::runtime_error("--no-bimbam and --samples conflict: the sample level is emitted only "
+                                 "as a BIMBAM matrix");
     // A flank with no variant restriction to widen is a silently inert argument.
     if (options.variant_flank_bp != 0 && options.variant_nodes_path.empty() && flank_explicit)
         throw std::runtime_error("--variant-flank-bp only means anything with --variant-nodes, which "
@@ -313,36 +319,66 @@ int run_describe_command(const std::vector<std::string>& args) {
         }
     }
 
-    // Commit. Only describe-owned entries are removed from the destination -- the index, the params,
-    // the per-bubble directories and the two substrate levels -- so an output directory the user also
-    // keeps other files in is not cleared out from under them.
+    // Commit. Two properties the first version did not have:
+    //
+    //   * OWNERSHIP IS EXACT. Anything starting with "bubble_" was treated as ours, so a user's
+    //     `bubble_notes` file or directory would have been deleted. Only bubble_<digits> is generated.
+    //   * NEITHER RESULT IS LOST. Deleting the old family and then moving the new one in entry by entry
+    //     leaves neither complete if a move fails midway. The old entries are moved aside to a backup
+    //     first and restored if anything goes wrong.
+    auto is_owned = [](const std::string& n) {
+        if (n == "describe.index.tsv" || n == "describe.params.json") return true;
+        if (n == "haplotype" || n == "sample") return true;
+        if (n.rfind("bubble_", 0) != 0) return false;
+        const std::string suffix = n.substr(7);
+        return !suffix.empty() &&
+               suffix.find_first_not_of("0123456789") == std::string::npos;
+    };
     std::filesystem::create_directories(final_dir);
+    const std::filesystem::path backup_dir =
+        final_dir.parent_path() /
+        (final_dir.filename().string() + ".describe-backup." + std::to_string(::getpid()));
+    std::filesystem::remove_all(backup_dir, ec);
+    std::vector<std::pair<std::filesystem::path, std::filesystem::path>> moved;   // backup <- original
     std::size_t stale = 0;
-    if (std::filesystem::exists(final_dir)) {
+    auto restore = [&]() {
+        for (const auto& [bak, orig] : moved) {
+            std::error_code e;
+            std::filesystem::remove_all(orig, e);
+            std::filesystem::rename(bak, orig, e);
+        }
+        std::error_code e;
+        std::filesystem::remove_all(backup_dir, e);
+    };
+    try {
+        std::filesystem::create_directories(backup_dir);
         for (const auto& e : std::filesystem::directory_iterator(final_dir)) {
-            const std::string n = e.path().filename().string();
-            const bool owned = n == "describe.index.tsv" || n == "describe.params.json" ||
-                               n == "haplotype" || n == "sample" || n.rfind("bubble_", 0) == 0;
-            if (!owned) continue;
-            std::filesystem::remove_all(e.path(), ec);
-            if (ec) throw std::runtime_error("describe: cannot replace stale output " +
+            if (!is_owned(e.path().filename().string())) continue;
+            const std::filesystem::path bak = backup_dir / e.path().filename();
+            std::filesystem::rename(e.path(), bak, ec);
+            if (ec) throw std::runtime_error("describe: cannot set aside stale output " +
                                              e.path().string() + ": " + ec.message());
+            moved.emplace_back(bak, e.path());
             ++stale;
         }
-    }
-    for (const auto& e : std::filesystem::directory_iterator(stage_dir)) {
-        const std::filesystem::path dst = final_dir / e.path().filename();
-        std::filesystem::rename(e.path(), dst, ec);
-        if (ec) {   // across filesystems rename fails; fall back to copy
-            ec.clear();
-            std::filesystem::copy(e.path(), dst,
-                                  std::filesystem::copy_options::recursive |
-                                  std::filesystem::copy_options::overwrite_existing, ec);
-            if (ec) throw std::runtime_error("describe: cannot install output " + dst.string() +
-                                             ": " + ec.message());
+        for (const auto& e : std::filesystem::directory_iterator(stage_dir)) {
+            const std::filesystem::path dst = final_dir / e.path().filename();
+            std::filesystem::rename(e.path(), dst, ec);
+            if (ec) {   // across filesystems rename fails; fall back to copy
+                ec.clear();
+                std::filesystem::copy(e.path(), dst,
+                                      std::filesystem::copy_options::recursive |
+                                      std::filesystem::copy_options::overwrite_existing, ec);
+                if (ec) throw std::runtime_error("describe: cannot install output " + dst.string() +
+                                                 ": " + ec.message());
+            }
         }
+    } catch (...) {
+        restore();
+        throw;
     }
     guard.committed = true;
+    std::filesystem::remove_all(backup_dir, ec);
     std::filesystem::remove_all(stage_dir, ec);
     if (stale) log.info("replaced " + std::to_string(stale) + " stale describe output(s) from a previous run");
 
