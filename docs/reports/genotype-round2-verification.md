@@ -1,9 +1,9 @@
 # `genotype` round 2 — verification pass and first experiment
 
-Date: 2026-08-18. Status: item 1 of the agreed ordering is implemented (commit 9ac2318, a reporting
-change with no behaviour change); nothing in the emission, scorer or band logic has been touched.
-Sections 1 to 7 are the record of the verification pass and the first experiment. Section 8 is the
-live status and the open questions.
+Date: 2026-08-18. Status: four commits landed, all in depth estimation and reporting. Nothing in the
+emission, the scorer or the band logic has been touched, and no default has changed. Sections 1 to 7
+are the record of the verification pass and the first experiment; section 8 is the live detail;
+section 9 is the summary and the recommended order.
 
 Inputs to this report: an external defect review of `panvar genotype`, an accompanying redesign
 specification, and a proof-of-concept script (`experiments/multiplicity_genotyper_poc.py`) proposing a
@@ -740,3 +740,75 @@ and error rate are known by construction. What plays that role on a real library
 efficiency has been learned from a cohort? The suggestion of unique single-copy flanking markers
 normalized by cohort behaviour, with mean q_k constrained to 1, is the current best answer and is
 untested here.
+
+---
+
+## 9. Summary and recommended order
+
+### 9.1 What landed
+
+| commit | change |
+|---|---|
+| `9ac2318` | depth provenance: the audit stops reporting a region fallback as a local measurement, and is written after joint refinement rather than before |
+| `5812e48` | `--depth-estimator median\|mean\|trimmed`, with the estimator reaching the joint model and the indexed route rather than only the first pass |
+| `7d9bd65` | the `min_anchors` cliff removed, so every block with anchors contributes and is shrunk by its own weight; the region summary stops naming its anchor centre lambda |
+| `6c01d4c` | `--dump-anchors`, and the distributional checks it makes possible |
+
+Default behaviour is unchanged throughout. `--depth-estimator` still defaults to `median`, so every one
+of these is either a reporting fix or an opt-in alternative.
+
+### 9.2 The finding that reorders the remaining work
+
+The thread began as a depth-estimator question and did not end as one.
+
+The median-to-mean correction moves lambda by about 1.1 percent, and that was enough to take the
+proof-of-concept's band selection from 3 of 5 draws to 5 of 5. But the anchor dump shows a monotonic
+GC-dependent efficiency of about 3.4 percent across the marker set, three times larger, and **eight
+times the width of the 0.43 percent lambda window the array has to land in.** Unlike the median's bias,
+which is a constant, the GC effect varies with which markers a block happens to use.
+
+So marker-specific efficiency moves from something scheduled after the solver to plausibly the dominant
+remaining bias source. That is the same conclusion danbing-tk reached from the other direction, where
+per-marker bias correction is the single largest reported effect, and it was reached here from our own
+data rather than adopted from theirs.
+
+### 9.3 What is blocking
+
+**The decisive test is not runnable yet, and the dump written to enable it is why.** `--dump-anchors`
+covers anchors only. Whether the GC trend actually biases the array depends on how the array block's
+marker GC compares with the anchors', and that needs all markers rather than only the invariant ones.
+Small change, and it settles whether the finding in 9.2 bites in practice or is merely present.
+
+**There is still no registered genotype test.** Four commits in, `genotype_stats.sh` does not exist
+while every other module has one. The depth code now branches over local against shrunk against
+fallback, three estimators, NA handling, and direct against indexed, which makes it the largest
+untested surface in the module. By the agreement in section 8.12 this also blocks the default change.
+
+### 9.4 A pattern in this pass worth recording
+
+Three claims made in this thread were corrected, two in review and one by our own measurement: that
+depth was not the problem, that a posterior could not rescue the band selection, and the Poisson
+trimming comparison. The common shape is that each conclusion was drawn from a check narrower than the
+claim it was used to support -- one lambda held fixed, one choice of posterior width, one wrong
+definition of trimming.
+
+The distributional checks in section 8.10 are the first in this thread with the power to discriminate,
+and they immediately found structure that four agreeing summary statistics had missed. That is an
+argument for running the discriminating test before stating the conclusion, not after being asked.
+
+### 9.5 Recommended order
+
+1. **Extend the dump to all markers** and compare the array block's marker GC against the anchors'.
+   Small, and it decides whether 9.2 changes anything in practice.
+2. **Write and register `genotype_stats.sh`**, covering a zero-anchor block reporting NA with
+   REGION_FALLBACK, a shrunk block whose raw and fitted values differ by the expected coefficient, the
+   audit carrying the final joint depth rather than the first-pass value, direct and indexed runs
+   honouring the same estimator, and continuous behaviour across 19, 20 and 21 anchors.
+3. **50 to 100 seeds on the fixed lpa pair**, plus lower depths and higher error rates so the ladder
+   stops being saturated.
+4. Then the marker-efficiency work proper, and only after that a decision on the default.
+
+The certified nearest-pair oracle and the ideal-multiplicity oracle remain where they were, ahead of
+any solver work, and neither has been started. Nothing in this pass constitutes progress on choosing
+the nearest available haplotype; bubble accuracy on lpa is unchanged at 7 of 10 and cyp2d6 is identical
+under both estimators.
