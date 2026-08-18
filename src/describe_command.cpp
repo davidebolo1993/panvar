@@ -1,5 +1,9 @@
 #include "panvar/describe_command.hpp"
 
+#include <filesystem>
+#include <system_error>
+#include <unistd.h>
+
 #include "panvar/cli_utils.hpp"
 #include "panvar/describe.hpp"
 
@@ -87,6 +91,8 @@ int run_describe_command(const std::vector<std::string>& args) {
     DescribeOptions options;
     bool variant_flank_set = false;
 
+    std::string only_flag;
+    bool flank_explicit = false;
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& arg = args[i];
         auto require_value = [&](const std::string& flag) -> const std::string& {
@@ -158,6 +164,7 @@ int run_describe_command(const std::vector<std::string>& args) {
         }
         if (arg == "--variant-flank-bp") {
             options.variant_flank_bp = cli::parse_size_arg(arg, require_value(arg));
+            flank_explicit = true;
             variant_flank_set = true;
             continue;
         }
@@ -177,16 +184,17 @@ int run_describe_command(const std::vector<std::string>& args) {
             options.bimbam = false;
             continue;
         }
-        if (arg == "--only-kmers") {
-            options.emit_graph = false; options.emit_variant = false;
-            continue;
-        }
-        if (arg == "--only-graph") {
-            options.emit_kmers = false; options.emit_variant = false;
-            continue;
-        }
-        if (arg == "--only-variant") {
-            options.emit_kmers = false; options.emit_graph = false;
+        // One --only-* selects one substrate. Applying each as "clear the other two" made the flags
+        // order-dependent and let `--only-kmers --only-graph` disable every substrate, producing a
+        // successful run that emitted nothing.
+        if (arg == "--only-kmers" || arg == "--only-graph" || arg == "--only-variant") {
+            if (!only_flag.empty() && only_flag != arg)
+                throw std::runtime_error("describe: " + only_flag + " and " + arg +
+                                         " are mutually exclusive; pass exactly one --only-* flag");
+            only_flag = arg;
+            options.emit_kmers = (arg == "--only-kmers");
+            options.emit_graph = (arg == "--only-graph");
+            options.emit_variant = (arg == "--only-variant");
             continue;
         }
         if (arg == "--threads") {
@@ -228,6 +236,22 @@ int run_describe_command(const std::vector<std::string>& args) {
     if (options.emit_variant && options.variant_vcf_path.empty() && !graph_substrates) {
         throw std::runtime_error("--only-variant requires --variant-vcf <call.region.vcf>");
     }
+    // The variant substrate IS a BIMBAM, so --no-bimbam --only-variant asked for nothing at all while
+    // still writing the variant matrix.
+    if (!options.bimbam && options.emit_variant && !options.variant_vcf_path.empty() && !graph_substrates)
+        throw std::runtime_error("--no-bimbam leaves --only-variant with nothing to write: the variant "
+                                 "substrate is a BIMBAM matrix");
+    // A flank with no variant restriction to widen is a silently inert argument.
+    if (options.variant_flank_bp != 0 && options.variant_nodes_path.empty() && flank_explicit)
+        throw std::runtime_error("--variant-flank-bp only means anything with --variant-nodes, which "
+                                 "defines the scope it widens");
+    // Compressed VCF input is not supported; the parsers read plain text.
+    auto reject_gz = [](const std::string& path, const char* flag) {
+        if (path.size() > 3 && path.compare(path.size() - 3, 3, ".gz") == 0)
+            throw std::runtime_error(std::string(flag) + ": compressed VCF input is not supported; "
+                                     "decompress it first");
+    };
+    reject_gz(options.variant_vcf_path, "--variant-vcf");
     if (options.kmer_size == 0 || options.kmer_size > 31) {
         throw std::runtime_error("--kmer-size must be in [1,31]");
     }
@@ -257,13 +281,70 @@ int run_describe_command(const std::vector<std::string>& args) {
     log.info("input " + options.gfa_path + " (feature mode " + feature_mode_label(options.feature_mode) +
              ", k=" + std::to_string(options.kmer_size) + ")");
 
+    // Everything describe owns is built in a sibling staging directory and moved into place only once
+    // BOTH substrate passes have succeeded. Writing straight into the output directory meant a failure
+    // part-way left a mixed family, and -- worse -- a rerun with different --only-*, --bubble-id or
+    // --no-wide-matrix settings left the previous run's files sitting beside the new ones, looking
+    // current. The transaction lives here rather than inside either pass because the two share one
+    // directory: a per-pass commit would make the second treat the first's output as stale.
+    const std::filesystem::path final_dir(options.out_dir);
+    const std::filesystem::path stage_dir =
+        final_dir.parent_path() /
+        (final_dir.filename().string() + ".describe-staging." + std::to_string(::getpid()));
+    std::error_code ec;
+    std::filesystem::remove_all(stage_dir, ec);
+    struct StageGuard {
+        std::filesystem::path dir;
+        bool committed = false;
+        ~StageGuard() {
+            if (!committed) { std::error_code e; std::filesystem::remove_all(dir, e); }
+        }
+    } guard{stage_dir, false};
+
     DescribeSummary summary;
-    if (graph_substrates) {
-        describe_kmers_from_graph(options, &summary);
+    {
+        DescribeOptions staged = options;
+        staged.out_dir = stage_dir.string();
+        if (graph_substrates) {
+            describe_kmers_from_graph(staged, &summary);
+        }
+        if (staged.emit_variant && !staged.variant_vcf_path.empty()) {
+            describe_variant_from_vcf(staged, &summary);
+        }
     }
-    if (options.emit_variant && !options.variant_vcf_path.empty()) {
-        describe_variant_from_vcf(options, &summary);
+
+    // Commit. Only describe-owned entries are removed from the destination -- the index, the params,
+    // the per-bubble directories and the two substrate levels -- so an output directory the user also
+    // keeps other files in is not cleared out from under them.
+    std::filesystem::create_directories(final_dir);
+    std::size_t stale = 0;
+    if (std::filesystem::exists(final_dir)) {
+        for (const auto& e : std::filesystem::directory_iterator(final_dir)) {
+            const std::string n = e.path().filename().string();
+            const bool owned = n == "describe.index.tsv" || n == "describe.params.json" ||
+                               n == "haplotype" || n == "sample" || n.rfind("bubble_", 0) == 0;
+            if (!owned) continue;
+            std::filesystem::remove_all(e.path(), ec);
+            if (ec) throw std::runtime_error("describe: cannot replace stale output " +
+                                             e.path().string() + ": " + ec.message());
+            ++stale;
+        }
     }
+    for (const auto& e : std::filesystem::directory_iterator(stage_dir)) {
+        const std::filesystem::path dst = final_dir / e.path().filename();
+        std::filesystem::rename(e.path(), dst, ec);
+        if (ec) {   // across filesystems rename fails; fall back to copy
+            ec.clear();
+            std::filesystem::copy(e.path(), dst,
+                                  std::filesystem::copy_options::recursive |
+                                  std::filesystem::copy_options::overwrite_existing, ec);
+            if (ec) throw std::runtime_error("describe: cannot install output " + dst.string() +
+                                             ": " + ec.message());
+        }
+    }
+    guard.committed = true;
+    std::filesystem::remove_all(stage_dir, ec);
+    if (stale) log.info("replaced " + std::to_string(stale) + " stale describe output(s) from a previous run");
 
     log.info("processed " + std::to_string(summary.bubbles_processed) + " bubbles; kept " +
              std::to_string(summary.features_written) + "/" + std::to_string(summary.features_candidates) +

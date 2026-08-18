@@ -292,6 +292,18 @@ if(PANVAR_BUILD_TESTING)
             set_tests_properties(panvar_benchmark_stats PROPERTIES TIMEOUT 180)
         endif()
 
+        # describe contract. The C4 smoke test checks that describe produces output and asserts nothing
+        # about the dosages -- so a bug that made a plain deletion emit ZERO features passed it, with
+        # every file still present.
+        set(PANVAR_DESCRIBE_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/describe_stats.sh)
+        if(EXISTS ${PANVAR_DESCRIBE_STATS})
+            add_test(
+                NAME panvar_describe_stats
+                COMMAND /usr/bin/env bash ${PANVAR_DESCRIBE_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/describe_stats
+            )
+            set_tests_properties(panvar_describe_stats PROPERTIES TIMEOUT 300)
+        endif()
+
         # panphorte contract. The registered C4 smoke test passes with five normalized=no rows, so it
         # never exercises folding at all.
         set(PANVAR_PANPHORTE_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/panphorte_stats.sh)

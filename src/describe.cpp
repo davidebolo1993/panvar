@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <system_error>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -1121,6 +1122,23 @@ void write_wide_matrix(
     out.close();
 }
 
+std::uintmax_t file_size_or_zero(const std::string& path) {
+    if (path.empty()) return 0;
+    std::error_code ec;
+    const std::uintmax_t n = std::filesystem::file_size(path, ec);
+    return ec ? 0 : n;
+}
+
+std::string bubble_ids_label(const DescribeOptions& options) {
+    if (options.bubble_ids.empty()) return "all";
+    std::string out;
+    for (std::size_t i = 0; i < options.bubble_ids.size(); ++i) {
+        if (i) out += ',';
+        out += std::to_string(options.bubble_ids[i]);
+    }
+    return out;
+}
+
 void write_params_json(const DescribeOptions& options, const std::string& path) {
     std::ofstream out(path);
     if (!out) {
@@ -1142,7 +1160,28 @@ void write_params_json(const DescribeOptions& options, const std::string& path) 
         << "  \"sparse_jsonl_tuple\": \"[feature_id,count]\",\n"
         << "  \"max_wide_features\": " << options.max_wide_features << ",\n"
         << "  \"wide_matrix_requested\": " << (options.write_wide_matrix ? "true" : "false") << ",\n"
-        << "  \"force_wide_matrix\": " << (options.force_wide_matrix ? "true" : "false") << "\n"
+        << "  \"force_wide_matrix\": " << (options.force_wide_matrix ? "true" : "false") << ",\n"
+        // The rest of what the run actually resolved. Without these the file recorded k and the
+        // filter but not WHICH substrates were emitted, what restricted them, or from which inputs --
+        // so two runs that produced different matrices had indistinguishable provenance.
+        << "  \"emit_kmers\": " << (options.emit_kmers ? "true" : "false") << ",\n"
+        << "  \"emit_graph\": " << (options.emit_graph ? "true" : "false") << ",\n"
+        << "  \"emit_variant\": " << (options.emit_variant ? "true" : "false") << ",\n"
+        << "  \"bimbam\": " << (options.bimbam ? "true" : "false") << ",\n"
+        << "  \"scale_dosage\": " << (options.scale_dosage ? "true" : "false") << ",\n"
+        << "  \"variant_nodes\": \"" << json_escape(options.variant_nodes_path) << "\",\n"
+        << "  \"variant_flank_bp\": " << options.variant_flank_bp << ",\n"
+        << "  \"variant_flank_granularity\": \"bases for k-mers, whole nodes for graph dosage\",\n"
+        << "  \"variant_vcf\": \"" << json_escape(options.variant_vcf_path) << "\",\n"
+        << "  \"samples\": \"" << json_escape(options.samples_path) << "\",\n"
+        << "  \"bubble_ids\": \"" << json_escape(bubble_ids_label(options)) << "\",\n"
+        << "  \"threads\": " << options.threads << ",\n"
+        << "  \"input_sizes_bytes\": {"
+        << "\"gfa\": " << file_size_or_zero(options.gfa_path) << ", "
+        << "\"bubbles_csv\": " << file_size_or_zero(options.bubbles_csv_in) << ", "
+        << "\"variant_nodes\": " << file_size_or_zero(options.variant_nodes_path) << ", "
+        << "\"variant_vcf\": " << file_size_or_zero(options.variant_vcf_path) << ", "
+        << "\"samples\": " << file_size_or_zero(options.samples_path) << "}\n"
         << "}\n";
 }
 
@@ -1496,6 +1535,7 @@ read_cosigt_table(const std::string& path) {
     if (!sin) throw std::runtime_error("Failed to open --samples file: " + path);
     std::unordered_map<std::string, std::vector<std::string>> path_to_samples;
     std::vector<std::string> sample_order;
+    std::unordered_set<std::string> seen_samples;
     std::string line;
     bool first = true;
     while (std::getline(sin, line)) {
@@ -1510,7 +1550,11 @@ read_cosigt_table(const std::string& path) {
             if (h == "sample" || h == "sample.id" || h == "sample_id" || (!h.empty() && h[0] == '#')) continue;
         }
         const std::string& sample = fields[0];
-        if (sample.empty()) continue;
+        if (sample.empty())
+            throw std::runtime_error("describe --samples: " + path + " has a row with an empty sample id");
+        if (!seen_samples.insert(sample).second)
+            throw std::runtime_error("describe --samples: duplicate sample id '" + sample + "' in " + path +
+                                     "; which row's haplotypes a sample gets would depend on file order");
         sample_order.push_back(sample);
         for (std::size_t fi = 1; fi < fields.size(); ++fi)
             for (const std::string& hap : split_on(fields[fi], ','))
