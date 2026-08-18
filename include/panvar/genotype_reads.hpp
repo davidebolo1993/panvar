@@ -171,6 +171,19 @@ std::vector<BlockDepth> estimate_depth(
     DepthEstimator estimator = DepthEstimator::Median,
     DepthRegionStats* region_stats = nullptr);
 
+// Every anchor count, one row per (block, marker). The depth estimator reduces ~20,000 of these to a
+// single number, and nothing downstream can check that reduction without the raw counts: whether they
+// are Poisson, whether the variance-to-mean ratio is 1, whether the tail is heavier than a count model
+// predicts, and whether any of it is confounded with GC or with which block a marker sits in. Those
+// questions decide whether a robust estimator is needed at all, and they cannot be answered from
+// summary statistics.
+void write_anchor_dump(
+    const std::string& path,
+    const std::vector<Block>& chain,
+    const ReadPanel& panel,
+    const ReadCounts& counts,
+    const std::vector<BlockDepth>& depth);
+
 void write_read_audit(
     const std::string& out_prefix,
     const std::vector<Block>& chain,

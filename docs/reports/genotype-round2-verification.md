@@ -657,7 +657,52 @@ anchor reading 15 is pulled to 22.96 rather than trusted. `mass_bp` moves by 1 b
 unchanged at 15/20 and 7/10, and graded accuracy is identical to six decimals. A consistency fix with
 essentially no behaviour change.
 
-### 8.10 Not started
+### 8.10 The distributional checks, run
+
+`--dump-anchors` writes one row per (block, marker) with the count, the marker k-mer's GC and the
+confinement audit. On lpa that is 19,330 rows, and it makes section 8.6's checks answerable.
+
+    variance-to-mean ratio   1.0075        (1.0 under Poisson)
+    NB dispersion alpha      0.000322      (0 means Poisson adequate)
+    zero frequency           0.000155 observed against ~0 Poisson, i.e. 3 true zeros
+    beyond +/-2 sd           1.05-fold
+    beyond +/-3 sd           1.43-fold
+    randomized quantile residuals vs uniform: KS D 0.0087, p 0.104
+
+The pooled distribution is close to Poisson, and a Kolmogorov-Smirnov test failing to reject at 19,330
+observations is a strong statement rather than a weak one. **Outlier robustness is therefore not the
+priority**, which supports the narrow version of the earlier claim and not the broad one.
+
+The stratified views show the structure the summaries hid, which is what the review predicted:
+
+| GC quintile of the marker k-mer | n | mean count |
+|---|---|---|
+| 0.000 to 0.290 | 2,666 | 22.714 |
+| 0.290 to 0.355 | 3,351 | 23.267 |
+| 0.355 to 0.419 | 4,379 | 23.216 |
+| 0.419 to 0.484 | 3,590 | 23.298 |
+| 0.484 to 0.839 | 5,344 | 23.504 |
+
+**A monotonic GC trend of about 3.4 percent in the mean count**, invisible in every pooled statistic.
+The magnitude is what matters: 3.4 percent of lambda is 0.40, while the all-correct lambda window
+measured in section 8.2 spans 11.60 to 11.65, a width of 0.43 percent. **The GC effect is roughly eight
+times the width of the window lambda has to land in.**
+
+So if the array block's markers are GC-atypical relative to the anchors, the lambda estimated from
+anchors is biased for that block by potentially more than one repeat unit on its own. Marker-specific
+efficiency is not a refinement here; it is plausibly the dominant remaining bias source, which
+independently reproduces danbing-tk's result that per-marker bias correction is the largest single
+effect in their method.
+
+By block, the variance-to-mean ratio runs 0.826 to 1.418, with both flanks near 1.4 and interior
+backbones below 1.16. Flanks are the locus edges where coverage falls away, so the region estimate
+probably should not weight them equally; they currently contribute 1,841 of 19,330 anchors.
+
+**A scope limit of this dump, which the result itself exposes.** It covers anchors only, so it cannot
+compare anchor GC against the array block's marker GC, which is the decisive test for whether the trend
+actually biases the array. That needs all markers, not only the invariant ones, and is the next change.
+
+### 8.11 Not started
 
 A negative binomial or robust weighted estimator, now understood to require marker-specific efficiency
 rather than a change of likelihood family. Per-anchor count export, without which none of the
@@ -671,7 +716,7 @@ of section 7.6 are untouched, as are both oracles.
 The `--explain-pair` and `--deconvolve` diagnostic paths request the historical median explicitly; that
 needs to be either deliberate and labelled, or changed.
 
-### 8.11 Agreed plan before the default moves
+### 8.12 Agreed plan before the default moves
 
 Retain `--depth-estimator mean` as the leading experimental mode, default unchanged. Then: 50 to 100
 seeds on the fixed lpa pair; lower depths and higher error rates so the saturated ladder becomes
@@ -680,7 +725,7 @@ fragment-level bootstrap rather than from five draws; several real loci, then at
 sequencing library with an external single-copy depth control. The default does not move until a
 registered genotype regression test exists and the real-library distribution checks have been run.
 
-### 8.12 Open questions
+### 8.13 Open questions
 
 **The cliff's replacement constant.** 200 pseudo-anchors is arbitrary. Should the shrinkage precision
 be estimated from within-block and between-block variability instead, and is there enough data per

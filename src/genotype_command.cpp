@@ -117,6 +117,10 @@ void print_genotype_help() {
         << "                              cannot drag it), or bases (total read bases over reference\n"
         << "                              length, independent of block structure)\n"
         << "      --depth-quantile <q>    Quantile for --depth-model quantile (default 0.75)\n"
+        << "      --dump-anchors <path>   Write every anchor count, one row per (block, marker),\n"
+        << "                              with its k-mer GC and confinement audit. The depth\n"
+        << "                              estimator reduces ~20,000 of these to one number; this\n"
+        << "                              is what lets that reduction be checked\n"
         << "      --depth-estimator <e>   How anchor counts are reduced to one depth: median\n"
         << "                              (default, historical), mean, or trimmed (central 80%).\n"
         << "                              Anchor counts are small integers, so a median of them\n"
@@ -208,6 +212,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
     double carrier_weight = 0.0;
     DepthModel depth_model = DepthModel::Joint;
     DepthEstimator depth_estimator = DepthEstimator::Median;
+    std::string dump_anchors;
     double depth_quantile = 0.75;
     long dump_block = -1;
     bool depth_calibration = false;
@@ -272,6 +277,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
             else throw std::runtime_error("genotype: --depth-model must be median|quantile|bases|joint");
         }
         else if (arg == "--depth-quantile") depth_quantile = std::stod(require_value(arg));
+        else if (arg == "--dump-anchors") dump_anchors = require_value(arg);
         else if (arg == "--depth-estimator") {
             const std::string v = require_value(arg);
             if (v == "median") depth_estimator = DepthEstimator::Median;
@@ -411,6 +417,10 @@ int run_genotype_command(const std::vector<std::string>& args) {
             }
         }
         write_read_audit(out_prefix, idx.chain, idx.panel, rc, depth);
+        if (!dump_anchors.empty()) {
+            write_anchor_dump(dump_anchors, idx.chain, idx.panel, rc, depth);
+            log.wrote({dump_anchors});
+        }
         write_genotypes(out_prefix, idx.chain, idx.blocks, calls, idx.haplotype_names);
         log.wrote({out_prefix + ".reads.depth.tsv", out_prefix + ".genotypes.tsv"});
         log.done();
@@ -1377,6 +1387,10 @@ int run_genotype_command(const std::vector<std::string>& args) {
             // Deferred from the first-pass logging so it describes the depth the emission actually
             // used, joint refinement included.
             write_read_audit(out_prefix, chain, read_panel, rc, depth);
+            if (!dump_anchors.empty()) {
+                write_anchor_dump(dump_anchors, chain, read_panel, rc, depth);
+                log.wrote({dump_anchors});
+            }
             log.info("model: lambda " + std::to_string(gsum.lambda_hap) + ", overdispersion phi " +
                      std::to_string(gsum.overdispersion) + ", error background " +
                      std::to_string(gsum.error_background));

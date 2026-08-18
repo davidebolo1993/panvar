@@ -304,6 +304,44 @@ const char* depth_source_name(DepthSource source) {
     return "NONE";
 }
 
+void write_anchor_dump(
+    const std::string& path,
+    const std::vector<Block>& chain,
+    const ReadPanel& panel,
+    const ReadCounts& counts,
+    const std::vector<BlockDepth>& depth) {
+
+    std::ofstream f(path);
+    if (!f) throw std::runtime_error("genotype: cannot write " + path);
+    // `gc` is of the marker's own k-mer, so a GC-versus-count trend is visible without any external
+    // annotation. `vary`/`occ`/`actual`/`expected` are the confinement audit and are NA unless it ran.
+    f << "block_index\tblock_kind\tbubble_id\tn_anchor_in_block\tblock_fitted_median\tdepth_source"
+         "\tslot\tcount\tgc\tvary_blocks\tocc_blocks\tactual\texpected\n";
+    const bool have_dbg = panel.dbg_vary.size() == panel.node_codes.size();
+    for (std::size_t bi = 0; bi < panel.anchor_slots.size() && bi < chain.size(); ++bi) {
+        const char* kind = chain[bi].kind == BlockKind::Bubble ? "bubble"
+                         : chain[bi].kind == BlockKind::Flank  ? "flank" : "backbone";
+        const BlockDepth& d = bi < depth.size() ? depth[bi] : BlockDepth{};
+        for (const std::uint32_t slot : panel.anchor_slots[bi]) {
+            if (slot >= counts.node.size() || slot >= panel.node_codes.size()) continue;
+            const std::string kmer = decode_kmer(panel.node_codes[slot], panel.kmer_size);
+            std::size_t gc = 0;
+            for (const char c : kmer) if (c == 'G' || c == 'C' || c == 'g' || c == 'c') ++gc;
+            f << chain[bi].index << '\t' << kind << '\t' << chain[bi].bubble_id << '\t'
+              << d.n_anchor << '\t' << d.median << '\t' << depth_source_name(d.source) << '\t'
+              << slot << '\t' << counts.node[slot] << '\t'
+              << (kmer.empty() ? 0.0 : static_cast<double>(gc) / static_cast<double>(kmer.size())) << '\t';
+            if (have_dbg) {
+                f << panel.dbg_vary[slot] << '\t' << panel.dbg_occ[slot] << '\t'
+                  << panel.dbg_actual[slot] << '\t' << panel.dbg_expected[slot] << '\n';
+            } else {
+                f << "NA\tNA\tNA\tNA\n";
+            }
+        }
+    }
+    if (!f) throw std::runtime_error("genotype: write failed for " + path);
+}
+
 void write_read_audit(
     const std::string& out_prefix,
     const std::vector<Block>& chain,
