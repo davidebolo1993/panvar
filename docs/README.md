@@ -6,6 +6,7 @@ Documentation for the `panvar` CLI, organized into three subfolders plus a share
 |---------------|--------------|
 | **[modules/](modules/)** | one short usage page per module: what it does, inputs, key options, outputs. |
 | **[algorithms/](algorithms/)** | the matching worked traces for each module.|
+| **[reports/](reports/)** | dated write-ups of review passes and experiments, self-contained for an outside reader. |
 | **[walkthrough.md](walkthrough.md)** | the whole pipeline on one real locus (LPA), step by step with commands and plots. |
 | **[gwas.md](gwas.md)** | the association (GWAS) worked example on the LPA output: a simulated Lp(a) phenotype, multiple-testing corrections, structure control. |
 | **[references.md](references.md)** | tools and papers behind each module. |

@@ -7,6 +7,7 @@
 #include <cmath>
 #include <fstream>
 #include <mutex>
+#include <numeric>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -38,6 +39,35 @@ double median_of(std::vector<double> v) {
     if (v.empty()) return 0.0;
     std::sort(v.begin(), v.end());
     return v[v.size() / 2];
+}
+
+double mean_of(const std::vector<double>& v) {
+    if (v.empty()) return 0.0;
+    return std::accumulate(v.begin(), v.end(), 0.0) / static_cast<double>(v.size());
+}
+
+// Mean of the central (1 - 2*trim) fraction. Anchor counts have a right tail from markers that are
+// invariant across the panel but not unique in the genome, which is what a plain mean would follow and
+// a median would ignore entirely; trimming keeps the resolution of a mean without the tail.
+double trimmed_mean_of(std::vector<double> v, double trim) {
+    if (v.empty()) return 0.0;
+    std::sort(v.begin(), v.end());
+    const std::size_t drop = static_cast<std::size_t>(trim * static_cast<double>(v.size()));
+    if (2 * drop >= v.size()) return median_of(v);
+    return std::accumulate(v.begin() + static_cast<std::ptrdiff_t>(drop),
+                           v.end() - static_cast<std::ptrdiff_t>(drop), 0.0) /
+           static_cast<double>(v.size() - 2 * drop);
+}
+
+constexpr double kTrimFraction = 0.1;
+
+double central_value(const std::vector<double>& v, DepthEstimator estimator) {
+    switch (estimator) {
+        case DepthEstimator::Mean:        return mean_of(v);
+        case DepthEstimator::TrimmedMean: return trimmed_mean_of(v, kTrimFraction);
+        case DepthEstimator::Median:      break;
+    }
+    return median_of(v);
 }
 
 } // namespace
@@ -136,7 +166,9 @@ std::vector<BlockDepth> estimate_depth(
     double uneven_tolerance,
     DepthModel model,
     double depth_quantile,
-    std::size_t region_bp) {
+    std::size_t region_bp,
+    DepthEstimator estimator,
+    DepthRegionStats* region_stats) {
 
     std::vector<BlockDepth> out(panel.anchor_slots.size());
     std::vector<double> all_anchor_counts;
@@ -152,18 +184,24 @@ std::vector<BlockDepth> estimate_depth(
         }
         d.n_anchor = v.size();
         if (v.size() < min_anchors) continue;
-        d.median = median_of(v);
-        d.anchor_median = d.median;
+        // `anchor_median` stays the median whatever the estimator, so the raw audit column means the
+        // same statistic across runs and remains comparable when the estimator changes. `median` is
+        // the model's local centre and follows the estimator.
+        const double med = median_of(v);
+        d.anchor_median = med;
+        d.local_center = central_value(v, estimator);
+        d.median = d.local_center;
+        d.local_available = true;
         std::vector<double> dev;
         dev.reserve(v.size());
-        for (const double x : v) dev.push_back(std::fabs(x - d.median));
+        for (const double x : v) dev.push_back(std::fabs(x - med));
         d.mad = median_of(dev);
         d.lambda_hap = d.median / 2.0;      // diploid: an invariant marker is carried by both copies
         d.usable = d.lambda_hap > 0.0;
         d.uneven = d.median > 0.0 && (d.mad / d.median) > uneven_tolerance;
         // Provisional: the shrinkage pass below rewrites this for every block it touches. It survives
         // only when there is no region estimate to shrink toward at all.
-        if (d.usable) { d.source = DepthSource::Local; d.region_weight = 0.0; }
+        if (d.usable) { d.source = DepthSource::Local; d.region_shrink_weight = 0.0; }
     }
 
     // Region-wide fallback for blocks with too few anchors of their own, and shrinkage toward it for
@@ -180,7 +218,14 @@ std::vector<BlockDepth> estimate_depth(
     //
     // Shrink instead, with a pseudo-count: a block with thousands of anchors keeps its own estimate,
     // one with a handful is pulled to the region. No cliff, and no tuning of where to put it.
-    double global_median = median_of(all_anchor_counts);
+    double global_median = central_value(all_anchor_counts, estimator);
+    if (region_stats != nullptr) {
+        region_stats->n_anchor = all_anchor_counts.size();
+        region_stats->median = median_of(all_anchor_counts);
+        region_stats->mean = mean_of(all_anchor_counts);
+        region_stats->trimmed_mean = trimmed_mean_of(all_anchor_counts, kTrimFraction);
+        region_stats->used = global_median;
+    }
 
     if (model == DepthModel::Quantile || model == DepthModel::Bases) {
         double lambda = 0.0;
@@ -214,7 +259,7 @@ std::vector<BlockDepth> estimate_depth(
                 d.lambda_hap = lambda;
                 d.usable = true;
                 d.source = src;
-                d.region_weight = 1.0;      // one region-wide value, no block contributes to its own
+                d.region_shrink_weight = 1.0;   // one region-wide value, no block contributes its own
             }
             return out;
         }
@@ -228,14 +273,14 @@ std::vector<BlockDepth> estimate_depth(
             d.lambda_hap = global_median / 2.0;
             d.usable = true;
             d.source = DepthSource::RegionFallback;
-            d.region_weight = 1.0;
+            d.region_shrink_weight = 1.0;
             continue;
         }
         const double w = static_cast<double>(d.n_anchor);
         d.median = (w * d.median + kPseudoAnchors * global_median) / (w + kPseudoAnchors);
         d.lambda_hap = d.median / 2.0;
         d.source = DepthSource::Shrunk;
-        d.region_weight = kPseudoAnchors / (w + kPseudoAnchors);
+        d.region_shrink_weight = kPseudoAnchors / (w + kPseudoAnchors);
     }
     return out;
 }
@@ -263,20 +308,26 @@ void write_read_audit(
     const std::string path = out_prefix + ".reads.depth.tsv";
     std::ofstream f(path);
     if (!f) throw std::runtime_error("genotype: cannot write " + path);
+    // A statistic that was never computed is NA, not 0. Zero is a legitimate anchor count, and writing
+    // it for "no local estimate" is how an inherited depth came to look like a measured one.
+    auto na = [](double v, bool available) {
+        return available ? std::to_string(v) : std::string("NA");
+    };
     // `raw_anchor_*` are this block's OWN observations and are 0 when it had too few anchors to make
     // any; `fitted_median` is what the model settled on. Writing the fitted value under the raw name
     // is how a block that inherited the region's depth came to look like a precise local measurement,
     // MAD 0 and all, at exactly the blocks where depth IS the answer.
     f << "block_index\tblock_kind\tbubble_id\tn_alleles\tn_anchor\traw_anchor_median\traw_anchor_mad"
-         "\tfitted_median\tlambda_hap\tdepth_source\tregion_weight\tusable\tuneven\n";
+         "\tlocal_center\tfitted_median\tlambda_hap\tdepth_source\tregion_shrink_weight\tusable\tuneven\n";
     for (std::size_t bi = 0; bi < chain.size() && bi < depth.size(); ++bi) {
         const BlockDepth& d = depth[bi];
         f << chain[bi].index << '\t' << (chain[bi].kind == BlockKind::Bubble ? "bubble" : chain[bi].kind == BlockKind::Flank ? "flank" : "backbone")
           << '\t' << chain[bi].bubble_id << '\t'
           << (bi < panel.by_block.size() ? panel.by_block[bi].size() : 0) << '\t' << d.n_anchor << '\t'
-          << d.anchor_median << '\t' << d.mad << '\t' << d.median << '\t' << d.lambda_hap << '\t'
-          << depth_source_name(d.source) << '\t' << d.region_weight << '\t' << (d.usable ? 1 : 0) << '\t'
-          << (d.uneven ? 1 : 0) << '\n';
+          << na(d.anchor_median, d.local_available) << '\t' << na(d.mad, d.local_available) << '\t'
+          << na(d.local_center, d.local_available) << '\t' << d.median << '\t' << d.lambda_hap << '\t'
+          << depth_source_name(d.source) << '\t' << d.region_shrink_weight << '\t'
+          << (d.usable ? 1 : 0) << '\t' << (d.uneven ? 1 : 0) << '\n';
     }
     (void)counts;
 }

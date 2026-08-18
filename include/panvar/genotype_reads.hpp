@@ -95,17 +95,24 @@ const char* depth_source_name(DepthSource source);
 struct BlockDepth {
     std::size_t block_index = 0;
     std::size_t n_anchor = 0;
-    // Raw observations from this block's OWN anchors, never rewritten by a depth model. Both stay 0
-    // when the block has fewer than `min_anchors`, which is how a caller distinguishes "no local
-    // evidence" from "measured zero" -- the joint second pass depends on exactly that distinction.
+    // Whether this block produced any local estimate at all. Zero is a legitimate observed count, so
+    // it cannot double as "not computed"; every consumer must test this rather than compare against 0.
+    bool local_available = false;
+    // Raw observations from this block's OWN anchors, never rewritten by a depth model.
+    // `anchor_median` is always the median whatever `DepthEstimator` is in force, so the audit column
+    // means one statistic across runs; `local_center` is the local estimate under the selected
+    // estimator, which is what a second pass must reason from if the flag is to reach the model.
     double anchor_median = 0.0;
+    double local_center = 0.0;
     double mad = 0.0;
     // The depth model's fitted value and the per-haplotype rate taken from it. These are what the
     // emission uses, and they may owe anything from none to all of their value to the region.
     double median = 0.0;
     double lambda_hap = 0.0;    // expected count for one haplotype copy (median / 2, diploid)
     DepthSource source = DepthSource::None;
-    double region_weight = 0.0; // share of `median` contributed by the region rather than this block
+    // The shrinkage COEFFICIENT applied to the region estimate, tau/(n+tau) -- not the fraction of the
+    // fitted value the region ends up contributing, which depends on both estimates as well.
+    double region_shrink_weight = 0.0;
     bool usable = false;
     bool uneven = false;        // MAD/median above the tolerance: coverage too ragged to trust
 };
@@ -130,6 +137,24 @@ struct BlockDepth {
 //            identifiable from the anchors alone -- it needs the genotype, which needs lambda.
 enum class DepthModel { Median, Quantile, Bases, Joint };
 
+// How a set of anchor counts is reduced to one central value. Anchor counts are small integers, so a
+// median of them is an integer no matter how many are pooled -- pooling 20,000 anchors buys no
+// resolution at all, and the region estimate can only land on 11.0, 11.5, 12.0 and so on. At a tandem
+// array that value is the denominator converting marker multiplicity into copy number, and a half-copy
+// step in the denominator is a whole repeat unit in the answer. A mean escapes the lattice; a trimmed
+// mean escapes it without handing the estimate to the mismapping tail that makes the median attractive
+// in the first place.
+enum class DepthEstimator { Median, Mean, TrimmedMean };
+
+// The region-wide anchor summary, reported so the choice of estimator is visible rather than implied.
+struct DepthRegionStats {
+    std::size_t n_anchor = 0;
+    double median = 0.0;
+    double mean = 0.0;
+    double trimmed_mean = 0.0;  // central 80 percent
+    double used = 0.0;          // whichever the selected estimator produced
+};
+
 // Per-block depth from that block's own invariant markers, with a region-wide fallback for blocks
 // that have too few of their own.
 std::vector<BlockDepth> estimate_depth(
@@ -139,7 +164,9 @@ std::vector<BlockDepth> estimate_depth(
     double uneven_tolerance,
     DepthModel model = DepthModel::Median,
     double depth_quantile = 0.75,
-    std::size_t region_bp = 0);
+    std::size_t region_bp = 0,
+    DepthEstimator estimator = DepthEstimator::Median,
+    DepthRegionStats* region_stats = nullptr);
 
 void write_read_audit(
     const std::string& out_prefix,

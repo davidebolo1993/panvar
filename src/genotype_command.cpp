@@ -115,6 +115,12 @@ void print_genotype_help() {
         << "                              cannot drag it), or bases (total read bases over reference\n"
         << "                              length, independent of block structure)\n"
         << "      --depth-quantile <q>    Quantile for --depth-model quantile (default 0.75)\n"
+        << "      --depth-estimator <e>   How anchor counts are reduced to one depth: median\n"
+        << "                              (default, historical), mean, or trimmed (central 80%).\n"
+        << "                              Anchor counts are small integers, so a median of them\n"
+        << "                              is an integer however many are pooled -- the region\n"
+        << "                              depth can only land on 11.0, 11.5, 12.0 and so on. At a\n"
+        << "                              tandem array that is the copy-number denominator\n"
         << "      --carrier-weight <b>    Down-weight markers by how many of the block's alleles\n"
         << "                              carry them: weight = (n_alleles/carriers)^b, mean 1.\n"
         << "                              At blocks with hundreds of alleles the set is swamped\n"
@@ -199,6 +205,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
     double recomb_rate = 1.0;
     double carrier_weight = 0.0;
     DepthModel depth_model = DepthModel::Joint;
+    DepthEstimator depth_estimator = DepthEstimator::Median;
     double depth_quantile = 0.75;
     long dump_block = -1;
     bool depth_calibration = false;
@@ -263,6 +270,13 @@ int run_genotype_command(const std::vector<std::string>& args) {
             else throw std::runtime_error("genotype: --depth-model must be median|quantile|bases|joint");
         }
         else if (arg == "--depth-quantile") depth_quantile = std::stod(require_value(arg));
+        else if (arg == "--depth-estimator") {
+            const std::string v = require_value(arg);
+            if (v == "median") depth_estimator = DepthEstimator::Median;
+            else if (v == "mean") depth_estimator = DepthEstimator::Mean;
+            else if (v == "trimmed") depth_estimator = DepthEstimator::TrimmedMean;
+            else throw std::runtime_error("genotype: --depth-estimator must be median|mean|trimmed");
+        }
         else if (arg == "--dump-block") dump_block = std::stol(require_value(arg));
         else if (arg == "--depth-calibration") depth_calibration = true;
         else if (arg == "--mass-weight") mass_weight = std::stod(require_value(arg));
@@ -365,9 +379,14 @@ int run_genotype_command(const std::vector<std::string>& args) {
                  " kb); " + std::to_string(rc.syncmers) + " syncmers, " +
                  std::to_string(100 * rc.matched_syncmers / std::max<std::uint64_t>(1, rc.syncmers)) +
                  "% matched a panel marker");
+        DepthRegionStats idx_region_stats;
         const std::vector<BlockDepth> depth =
             estimate_depth(idx.panel, rc, min_anchors, uneven_tolerance, depth_model,
-                           depth_quantile, 0);
+                           depth_quantile, 0, depth_estimator, &idx_region_stats);
+        log.info("region anchors: " + std::to_string(idx_region_stats.n_anchor) + "; median " +
+                 std::to_string(idx_region_stats.median) + ", mean " + std::to_string(idx_region_stats.mean) +
+                 ", trimmed " + std::to_string(idx_region_stats.trimmed_mean) + "; using " +
+                 std::to_string(idx_region_stats.used));
         log_depth_provenance(log, idx.chain, depth, min_anchors);
         // Same options as the direct path. Assembling them twice let the two drift: the indexed path
         // silently ignored the recombination rate, carrier weight, provenance, compositional and robust
@@ -949,6 +968,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 if (b.bypass_allele >= 0) { panel_has_bypass = true; break; }
             }
             const bool run_joint = depth_model == DepthModel::Joint && panel_has_bypass;
+            DepthRegionStats region_stats;
             std::vector<BlockDepth> depth =
                 estimate_depth(read_panel, rc, min_anchors, uneven_tolerance,
                                // Joint refines a first pass, so its starting point matters: seeded
@@ -958,7 +978,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                run_joint ? (region_bp_hint > 0 ? DepthModel::Bases : DepthModel::Quantile)
                                          : (depth_model == DepthModel::Joint ? DepthModel::Median
                                                                              : depth_model),
-                               depth_quantile, region_bp_hint);
+                               depth_quantile, region_bp_hint, depth_estimator, &region_stats);
             std::size_t uneven = 0;
             std::vector<double> lam;
             for (const BlockDepth& d : depth) { if (d.uneven) ++uneven; if (d.usable) lam.push_back(d.lambda_hap); }
@@ -967,6 +987,13 @@ int run_genotype_command(const std::vector<std::string>& args) {
                      std::to_string(lam.empty() ? 0.0 : lam[lam.size() / 2]) + " over " +
                      std::to_string(lam.size()) + " usable blocks; " + std::to_string(uneven) +
                      " flagged UNEVEN");
+            // All three side by side, because the choice is not neutral and the median cannot express
+            // a value between half-integers however many anchors are pooled.
+            log.info("region anchors: " + std::to_string(region_stats.n_anchor) + "; median " +
+                     std::to_string(region_stats.median) + ", mean " + std::to_string(region_stats.mean) +
+                     ", trimmed " + std::to_string(region_stats.trimmed_mean) + "; using " +
+                     std::to_string(region_stats.used) + " (lambda " +
+                     std::to_string(region_stats.used / 2.0) + ")");
             log_depth_provenance(log, chain, depth, min_anchors);
             // The audit is written AFTER the joint pass below, not here: joint replaces every block's
             // fitted depth, so an audit written at this point would describe a state the emission
@@ -1306,12 +1333,16 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 // again. One refinement is enough -- the count only ever takes the values 0, 1 or 2.
                 std::vector<double> per_hap;
                 for (std::size_t bi = 0; bi < depth.size() && bi < calls.size(); ++bi) {
-                    if (depth[bi].anchor_median <= 0.0) continue;
+                    // `local_center`, not `anchor_median`: the latter is deliberately always the
+                    // median so the audit column is comparable across runs, so reading it here would
+                    // silently ignore --depth-estimator in the DEFAULT model. `local_available`
+                    // rather than a >0 test, because 0 is a legitimate anchor count.
+                    if (!depth[bi].local_available || depth[bi].local_center <= 0.0) continue;
                     const int bp = bi < blocks.size() ? blocks[bi].bypass_allele : -1;
                     int traversing = 0;
                     if (static_cast<int>(calls[bi].allele1) != bp) ++traversing;
                     if (static_cast<int>(calls[bi].allele2) != bp) ++traversing;
-                    if (traversing > 0) per_hap.push_back(depth[bi].anchor_median / traversing);
+                    if (traversing > 0) per_hap.push_back(depth[bi].local_center / traversing);
                 }
                 if (!per_hap.empty()) {
                     std::sort(per_hap.begin(), per_hap.end());
@@ -1324,7 +1355,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         d.lambda_hap = lambda;
                         d.usable = true;
                         d.source = DepthSource::Joint;
-                        d.region_weight = 1.0;  // one region-wide value; raw_anchor_* stay untouched
+                        d.region_shrink_weight = 1.0;   // region-wide; raw and local_* stay untouched
                     }
                     // Same arguments as the first pass. Dropping the coverage evidence here silently
                     // reverted --evidence to the marker model whenever a bypass allele existed, which

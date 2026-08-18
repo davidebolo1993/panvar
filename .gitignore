@@ -6,6 +6,7 @@ build/
 *.a
 *.so
 *.dylib
+__pycache__/
 *.claude/*
 *.claude
 
