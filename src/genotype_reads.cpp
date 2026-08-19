@@ -3,6 +3,7 @@
 #include "panvar/syncmer.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <fstream>
@@ -304,39 +305,113 @@ const char* depth_source_name(DepthSource source) {
     return "NONE";
 }
 
-void write_anchor_dump(
+void write_marker_dump(
     const std::string& path,
     const std::vector<Block>& chain,
     const ReadPanel& panel,
     const ReadCounts& counts,
-    const std::vector<BlockDepth>& depth) {
+    const std::vector<BlockDepth>& depth,
+    const std::vector<int>* truth1,
+    const std::vector<int>* truth2) {
 
     std::ofstream f(path);
     if (!f) throw std::runtime_error("genotype: cannot write " + path);
-    // `gc` is of the marker's own k-mer, so a GC-versus-count trend is visible without any external
-    // annotation. `vary`/`occ`/`actual`/`expected` are the confinement audit and are NA unless it ran.
-    f << "block_index\tblock_kind\tbubble_id\tn_anchor_in_block\tblock_fitted_median\tdepth_source"
-         "\tslot\tcount\tgc\tvary_blocks\tocc_blocks\tactual\texpected\n";
+    // `marker_class` separates the invariant depth anchors from the informative markers. Comparing the
+    // two without it confounds efficiency with dosage: an array marker carried twenty times and a
+    // single-copy anchor differ in expected count by twenty-fold before any efficiency effect.
+    // `truth_mult` is this sample's own expected copy number when truth is supplied, and
+    // `count_per_copy` divides it out, which is the quantity an efficiency model should see as flat.
+    f << "block_index\tblock_kind\tbubble_id\tmarker_class\tslot\tcount\tgc\tfirst_pos\tclump"
+         "\tn_alleles\tcarriers\tmult_min\tmult_max\tmult_mean\ttruth_mult\tcount_per_copy"
+         "\tvary_blocks\tocc_blocks\tactual\texpected\n";
     const bool have_dbg = panel.dbg_vary.size() == panel.node_codes.size();
-    for (std::size_t bi = 0; bi < panel.anchor_slots.size() && bi < chain.size(); ++bi) {
+    constexpr double kFrag = 350.0;
+
+    auto emit = [&](std::size_t bi, const char* kind, const char* cls, std::uint32_t slot,
+                    std::size_t n_alleles, std::size_t carriers, std::uint32_t mmin,
+                    std::uint32_t mmax, double mmean, double truth_mult) {
+        if (slot >= counts.node.size() || slot >= panel.node_codes.size()) return;
+        const std::string kmer = decode_kmer(panel.node_codes[slot], panel.kmer_size);
+        std::size_t gc = 0;
+        for (const char c : kmer) if (c == 'G' || c == 'C' || c == 'g' || c == 'c') ++gc;
+        const std::uint32_t pos =
+            slot < panel.node_first_pos.size() ? panel.node_first_pos[slot] : UINT32_MAX;
+        f << chain[bi].index << '\t' << kind << '\t' << chain[bi].bubble_id << '\t' << cls << '\t'
+          << slot << '\t' << counts.node[slot] << '\t'
+          << (kmer.empty() ? 0.0 : static_cast<double>(gc) / static_cast<double>(kmer.size())) << '\t';
+        if (pos == UINT32_MAX) f << "NA\tNA\t";
+        else f << pos << '\t' << static_cast<long>(pos / kFrag) << '\t';
+        f << n_alleles << '\t' << carriers << '\t' << mmin << '\t' << mmax << '\t' << mmean << '\t';
+        if (truth_mult < 0.0) f << "NA\tNA\t";
+        else f << truth_mult << '\t'
+               << (truth_mult > 0.0 ? static_cast<double>(counts.node[slot]) / truth_mult : 0.0) << '\t';
+        if (have_dbg) {
+            f << panel.dbg_vary[slot] << '\t' << panel.dbg_occ[slot] << '\t'
+              << panel.dbg_actual[slot] << '\t' << panel.dbg_expected[slot] << '\n';
+        } else {
+            f << "NA\tNA\tNA\tNA\n";
+        }
+    };
+
+    for (std::size_t bi = 0; bi < chain.size(); ++bi) {
         const char* kind = chain[bi].kind == BlockKind::Bubble ? "bubble"
                          : chain[bi].kind == BlockKind::Flank  ? "flank" : "backbone";
-        const BlockDepth& d = bi < depth.size() ? depth[bi] : BlockDepth{};
-        for (const std::uint32_t slot : panel.anchor_slots[bi]) {
-            if (slot >= counts.node.size() || slot >= panel.node_codes.size()) continue;
-            const std::string kmer = decode_kmer(panel.node_codes[slot], panel.kmer_size);
-            std::size_t gc = 0;
-            for (const char c : kmer) if (c == 'G' || c == 'C' || c == 'g' || c == 'c') ++gc;
-            f << chain[bi].index << '\t' << kind << '\t' << chain[bi].bubble_id << '\t'
-              << d.n_anchor << '\t' << d.median << '\t' << depth_source_name(d.source) << '\t'
-              << slot << '\t' << counts.node[slot] << '\t'
-              << (kmer.empty() ? 0.0 : static_cast<double>(gc) / static_cast<double>(kmer.size())) << '\t';
-            if (have_dbg) {
-                f << panel.dbg_vary[slot] << '\t' << panel.dbg_occ[slot] << '\t'
-                  << panel.dbg_actual[slot] << '\t' << panel.dbg_expected[slot] << '\n';
-            } else {
-                f << "NA\tNA\tNA\tNA\n";
+        const std::size_t na = bi < panel.by_block.size() ? panel.by_block[bi].size() : 0;
+
+        // Per-slot multiplicity across this block's alleles, and this sample's own copy number.
+        std::unordered_map<std::uint32_t, std::array<std::uint64_t, 3>> agg;  // carriers, sum, max
+        std::unordered_map<std::uint32_t, std::uint32_t> mmin;
+        std::unordered_map<std::uint32_t, double> tmult;
+        bool block_has_truth = false;
+        if (bi < panel.by_block.size()) {
+            for (std::size_t ai = 0; ai < panel.by_block[bi].size(); ++ai) {
+                for (const auto& [slot, mult] : panel.by_block[bi][ai].nodes) {
+                    auto& a = agg[slot];
+                    ++a[0]; a[1] += mult; a[2] = std::max<std::uint64_t>(a[2], mult);
+                    const auto it = mmin.find(slot);
+                    if (it == mmin.end() || mult < it->second) mmin[slot] = mult;
+                }
             }
+            // BOTH haplotypes or neither. Skipping the one whose truth allele is unrepresentable
+            // leaves a half-dosage figure that looks like a real copy number, and `count_per_copy`
+            // then reads 2*lambda instead of lambda -- which presented as a 26 percent efficiency
+            // gap between anchors and informative markers on lpa and was nothing of the kind.
+            bool both = truth1 != nullptr && truth2 != nullptr &&
+                        bi < truth1->size() && bi < truth2->size();
+            if (both) {
+                for (const std::vector<int>* tv : {truth1, truth2}) {
+                    const int ai = (*tv)[bi];
+                    if (ai < 0 || static_cast<std::size_t>(ai) >= panel.by_block[bi].size()) {
+                        both = false;
+                        break;
+                    }
+                }
+            }
+            if (both) {
+                for (const std::vector<int>* tv : {truth1, truth2}) {
+                    for (const auto& [slot, mult] : panel.by_block[bi][(*tv)[bi]].nodes) {
+                        tmult[slot] += mult;
+                    }
+                }
+            }
+            block_has_truth = both;
+        }
+        // Only blocks where BOTH truth alleles are representable can report a dosage at all.
+        const bool have_truth = block_has_truth;
+
+        if (bi < panel.anchor_slots.size()) {
+            for (const std::uint32_t slot : panel.anchor_slots[bi]) {
+                // An anchor is carried by every traversing allele at multiplicity 1 by definition, so
+                // in a diploid the sample expects two copies whatever its genotype.
+                emit(bi, kind, "anchor", slot, na, na, 1, 1, 1.0, have_truth ? 2.0 : -1.0);
+            }
+        }
+        for (const auto& [slot, a] : agg) {
+            const double mean = static_cast<double>(a[1]) / static_cast<double>(std::max<std::uint64_t>(1, a[0]));
+            const auto it = tmult.find(slot);
+            const double tm = !have_truth ? -1.0 : (it == tmult.end() ? 0.0 : it->second);
+            emit(bi, kind, "informative", slot, na, a[0], mmin[slot],
+                 static_cast<std::uint32_t>(a[2]), mean, tm);
         }
     }
     if (!f) throw std::runtime_error("genotype: write failed for " + path);

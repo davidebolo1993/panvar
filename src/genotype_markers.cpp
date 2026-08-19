@@ -669,6 +669,7 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
         out_panel->all_kmers = options.all_kmers;
         out_panel->by_block.assign(chain.size(), {});
         out_panel->anchor_slots.assign(chain.size(), {});
+        out_panel->node_first_pos.clear();
         std::unordered_map<std::uint64_t, std::uint32_t> node_slot;
         std::unordered_map<std::uint64_t, std::uint32_t> edge_slot;
         auto slot_for = [](std::unordered_map<std::uint64_t, std::uint32_t>& m,
@@ -786,7 +787,20 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
                 inv.size() - (blocks[bi].bypass_allele >= 0 && inv.size() > 0 ? 1u : 0u);
             for (const auto& [c, n] : seen) {
                 if (n == n_real && n_real > 0 && mult_of[c] == 1) {
-                    out_panel->anchor_slots[bi].push_back(slot_for(node_slot, out_panel->node_codes, c));
+                    const std::uint32_t sl = slot_for(node_slot, out_panel->node_codes, c);
+                    out_panel->anchor_slots[bi].push_back(sl);
+                    if (sl >= out_panel->node_first_pos.size()) {
+                        out_panel->node_first_pos.resize(sl + 1, UINT32_MAX);
+                    }
+                    if (out_panel->node_first_pos[sl] == UINT32_MAX) {
+                        for (const auto& iv : inv) {
+                            const auto ip = iv.first_pos.find(c);
+                            if (ip != iv.first_pos.end()) {
+                                out_panel->node_first_pos[sl] = static_cast<std::uint32_t>(ip->second);
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1003,6 +1017,12 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
                         const auto ip = kept_inv[bi][ai].first_pos.find(out_panel->node_codes[slot_i]);
                         if (ip != kept_inv[bi][ai].first_pos.end()) {
                             bins.insert(static_cast<long>(ip->second / frag));
+                            if (slot_i >= out_panel->node_first_pos.size()) {
+                                out_panel->node_first_pos.resize(slot_i + 1, UINT32_MAX);
+                            }
+                            if (out_panel->node_first_pos[slot_i] == UINT32_MAX) {
+                                out_panel->node_first_pos[slot_i] = static_cast<std::uint32_t>(ip->second);
+                            }
                         }
                     }
                 }
@@ -1024,6 +1044,13 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
                                               return nb > 1 || actual[slot] > anchor_expected;
                                           }),
                            anch.end());
+                // An anchor is absent from `by_block`, so the informative-marker expectation map has
+                // no entry for it and the audit reported `expected` as 0 on every anchor row -- which
+                // made the column useless exactly where it was being read. Record the anchor's own
+                // bound, which is what it was actually filtered against.
+                for (const std::uint32_t slot : anch) {
+                    if (slot < out_panel->dbg_expected.size()) out_panel->dbg_expected[slot] = anchor_expected;
+                }
             }
             out_panel->region_filtered_markers = dropped;
         }

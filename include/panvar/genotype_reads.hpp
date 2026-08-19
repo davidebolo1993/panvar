@@ -48,6 +48,11 @@ struct ReadPanel {
     // marker count, is how many independent observations the block really supplies -- markers inside one
     // fragment are carried by the same reads and rise and fall together.
     std::vector<double> marker_clumps;
+    // Per slot, a representative offset of the marker inside its block, or UINT32_MAX where none was
+    // recorded. Two things need it: clump membership is just this divided by the fragment length, and
+    // testing whether an apparent GC trend is really GC needs a positional covariate to regress it
+    // against. Without one, GC and position are indistinguishable.
+    std::vector<std::uint32_t> node_first_pos;
     std::size_t blocks_restored = 0;          // blocks whose markers were put back for allele balance
     std::size_t region_filtered_markers = 0;   // dropped for occurring elsewhere in the region
     std::size_t dropped_multi_block = 0;       // ...because they appear in more than one block
@@ -177,12 +182,17 @@ std::vector<BlockDepth> estimate_depth(
 // predicts, and whether any of it is confounded with GC or with which block a marker sits in. Those
 // questions decide whether a robust estimator is needed at all, and they cannot be answered from
 // summary statistics.
-void write_anchor_dump(
+// Optional truth alleles, so a marker's expected copy number in THIS sample is known and efficiency
+// can be separated from dosage. Without it an array marker carried twenty times is compared against a
+// single-copy anchor and the two effects are confounded.
+void write_marker_dump(
     const std::string& path,
     const std::vector<Block>& chain,
     const ReadPanel& panel,
     const ReadCounts& counts,
-    const std::vector<BlockDepth>& depth);
+    const std::vector<BlockDepth>& depth,
+    const std::vector<int>* truth1 = nullptr,
+    const std::vector<int>* truth2 = nullptr);
 
 void write_read_audit(
     const std::string& out_prefix,

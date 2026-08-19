@@ -740,7 +740,59 @@ block and within-block position, clump membership, per-allele multiplicity and c
 simulated truth multiplicity where truth is supplied, and the observed count normalized by that
 multiplicity.
 
-### 8.11 Not started
+### 8.11 The dump extended, a bug in it found, and the GC question answered
+
+`--dump-markers` replaces `--dump-anchors` (which remains as an alias) and covers every marker, not
+only the invariant ones, with `marker_class`, per-allele multiplicity and carrier count, the marker's
+offset and clump, and -- when `--truth-haplotypes` is supplied -- this sample's own copy number and the
+count divided by it. That last pair is what separates efficiency from dosage. The anchor `expected`
+field is fixed: it read 0 on every row because anchors are absent from `by_block`, and now carries the
+anchor's own bound, which equals `actual` when the contract holds.
+
+**A bug in the first version of this dump, found by diagnosing rather than reporting.** On lpa,
+informative markers appeared to read 26 percent higher per copy than anchors, with 2.5 times the
+spread. Stratifying by multiplicity showed it at once:
+
+    truth_mult == 1   n=2364   mean count_per_copy 20.829   (about 2*lambda)
+    truth_mult == 2   n=4922   mean count_per_copy 11.739   (about lambda)
+
+Where one truth haplotype's allele was unrepresentable the loop skipped it silently, so `truth_mult`
+was half the sample's actual dosage and `count_per_copy` doubled. It now requires both haplotypes or
+reports NA. After the fix, anchors read 11.684 and informative markers 11.670, agreeing to 0.1 percent.
+On the synthetic fixture the same quantity is exactly lambda for every marker of both classes, which is
+what the regression test now asserts.
+
+**The GC association, with dosage and position controlled.** The falsifiers were written down before
+the numbers: dosage confounding, position, and sign disagreement across blocks.
+
+    r(gc, raw count)                             +0.0349
+    r(gc, count_per_copy)                        +0.0318
+    r(gc, truth_mult)                            +0.0189
+    r(gc, count_per_copy) less position in block +0.0469
+    per-block sign agreement                     9 of 11 positive
+
+It survives all three, so it is not dosage confounding, not position alone, and not a sign accident.
+It is also very small: r-squared about 0.001.
+
+**Whether it bites at the array, which is the question that was not previously answerable.** The array
+block's markers are genuinely GC-atypical against the anchor pool that sets lambda:
+
+    all anchors        mean GC 0.3991
+    block 13 (KIV-2)   mean GC 0.4301     delta +0.0310, the largest of any substantial block
+    pooled anchor slope           +1.69 counts per unit GC
+    implied lambda bias at array  +0.0261
+    all-correct window half-width  0.025
+
+So the implied bias is about 1.04 times the half-width of the window lambda has to land in. **This
+replaces the earlier eight-fold figure**, which came from an extreme-bin difference and was not a
+stable effect size. The direction is consistent with the observed data: high-GC markers read high, the
+array's dosage is therefore overestimated, and all five span estimates were biased positive. The
+magnitude accounts for roughly a quarter of the observed 0.93 percent span bias.
+
+**Marker-specific efficiency is therefore a contributor at the array, not the explanation.** It is
+worth correcting and it will not on its own remove the residual.
+
+### 8.12 Not started
 
 A negative binomial or robust weighted estimator, now understood to require marker-specific efficiency
 rather than a change of likelihood family. Tests: there is still no registered `genotype_stats.sh`, and
@@ -753,7 +805,7 @@ of section 7.6 are untouched, as are both oracles.
 The `--explain-pair` and `--deconvolve` diagnostic paths request the historical median explicitly; that
 needs to be either deliberate and labelled, or changed.
 
-### 8.12 Agreed plan before the default moves
+### 8.13 Agreed plan before the default moves
 
 Retain `--depth-estimator mean` as the leading experimental mode, default unchanged. Then: 50 to 100
 seeds on the fixed lpa pair; lower depths and higher error rates so the saturated ladder becomes
@@ -762,7 +814,7 @@ fragment-level bootstrap rather than from five draws; several real loci, then at
 sequencing library with an external single-copy depth control. The default does not move until a
 registered genotype regression test exists and the real-library distribution checks have been run.
 
-### 8.13 Open questions
+### 8.14 Open questions
 
 **The cliff's replacement constant.** 200 pseudo-anchors is arbitrary. Should the shrinkage precision
 be estimated from within-block and between-block variability instead, and is there enough data per

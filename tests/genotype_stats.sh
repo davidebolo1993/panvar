@@ -172,19 +172,40 @@ else
   bad "--build-index wrote no index"
 fi
 
-# ------------------------------------------------------------------------ the anchor dump agrees
+# ---------------------------------------------------- the marker dump separates dosage from efficiency
 "$BIN" genotype -i "$OUT/g.gfa" -b "$OUT/bub" -r ref -o "$OUT/dump" -R "$OUT/reads.fa" \
-  --depth-model median --dump-anchors "$OUT/anchors.tsv" -q >/dev/null 2>&1
-if [ -s "$OUT/anchors.tsv" ]; then
-  rows=$(tail -n +2 "$OUT/anchors.tsv" | wc -l | tr -d ' ')
-  [ "$rows" = "$n" ] && ok "the anchor dump has one row per anchor ($n)" \
-                     || bad "anchor dump has $rows rows, expected $n"
-  # Every anchor is carried once by each of the two haplotypes fed R times, so every count is 2R.
-  odd=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)c[$i]=i;next} $(c["count"])!=16{k++} END{print k+0}' "$OUT/anchors.tsv")
+  --depth-model median --truth-haplotypes 'hapA1,hapB1' --dump-markers "$OUT/markers.tsv" -q >/dev/null 2>&1
+if [ -s "$OUT/markers.tsv" ]; then
+  na=$(awk -F'\t' 'NR>1 && $4=="anchor"' "$OUT/markers.tsv" | wc -l | tr -d ' ')
+  [ "$na" = "$n" ] && ok "the dump has one anchor row per anchor ($n)" \
+                   || bad "dump has $na anchor rows, expected $n"
+  ni=$(awk -F'\t' 'NR>1 && $4=="informative"' "$OUT/markers.tsv" | wc -l | tr -d ' ')
+  [ "$ni" -gt 0 ] && ok "the dump also covers informative markers ($ni), not anchors alone" \
+                  || bad "no informative marker rows: dosage cannot be separated from efficiency"
+  odd=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next} $4=="anchor" && $(h["count"])!=16{k++} END{print k+0}' "$OUT/markers.tsv")
   [ "$odd" = "0" ] && ok "every anchor count is exactly 2R=16, as the construction requires" \
                    || bad "$odd anchors deviate from 16 on exact-copy reads"
+  # An anchor's expected bound was reported as 0 on every row, because it is absent from by_block and
+  # the informative-marker expectation map has no entry for it. It is once per traversing haplotype.
+  ae=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next} $4=="anchor"{print $(h["expected"]); exit}' "$OUT/markers.tsv")
+  aa=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next} $4=="anchor"{print $(h["actual"]); exit}' "$OUT/markers.tsv")
+  { [ "$ae" != "0" ] && [ "$ae" = "$aa" ]; } \
+    && ok "an anchor's expected bound is its own ($ae), not 0, and matches actual" \
+    || bad "anchor expected=$ae actual=$aa; expected should be the anchor bound and equal actual here"
+  # The point of the whole dump: count divided by this sample's own copy number is the efficiency
+  # signal with dosage removed. On exact-copy reads it must be exactly lambda for EVERY marker,
+  # anchor and informative alike, or the normalization is wrong.
+  bad_cpc=$(awk -F'\t' -v r="$R" 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+            $(h["truth_mult"])!="NA" && $(h["truth_mult"])>0 && $(h["count_per_copy"])!=r{k++} END{print k+0}' "$OUT/markers.tsv")
+  [ "$bad_cpc" = "0" ] \
+    && ok "count_per_copy is exactly lambda=$R for every marker: dosage is fully divided out" \
+    || bad "$bad_cpc markers have count_per_copy != $R, so the dosage normalization is wrong"
+  # Position drives clump membership, and without it a GC trend cannot be told from a position trend.
+  npos=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next} $(h["first_pos"])!="NA"{k++} END{print k+0}' "$OUT/markers.tsv")
+  [ "$npos" -gt 0 ] && ok "markers carry a position and a clump ($npos rows)" \
+                    || bad "no marker has a position: GC and position stay confounded"
 else
-  bad "--dump-anchors wrote nothing"
+  bad "--dump-markers wrote nothing"
 fi
 
 echo
