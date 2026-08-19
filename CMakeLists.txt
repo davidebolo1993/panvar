@@ -270,6 +270,20 @@ if(PANVAR_BUILD_TESTING)
         # call coordinate contract. real_smoke.sh checks that call runs and that its files exist, and
         # asserts nothing about where a record lands -- so an off-by-one in POS/END on every DEL and
         # INV in the primary output passed the whole suite.
+        # genotype depth contract. CTest exercised `genotype` nowhere at all: every other module has a
+        # stats test and this one, the largest in the tree, had none, while the depth code branches over
+        # local against shrunk against region fallback, three estimators, NA against zero, and the direct
+        # against the indexed route. The fixture feeds exact copies of the sample's haplotypes so lambda
+        # is known by construction rather than recorded from a previous run.
+        set(PANVAR_GENOTYPE_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_stats.sh)
+        if(EXISTS ${PANVAR_GENOTYPE_STATS})
+            add_test(
+                NAME panvar_genotype_stats
+                COMMAND /usr/bin/env bash ${PANVAR_GENOTYPE_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/genotype_stats
+            )
+            set_tests_properties(panvar_genotype_stats PROPERTIES TIMEOUT 300)
+        endif()
+
         set(PANVAR_CALL_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/call_stats.sh)
         if(EXISTS ${PANVAR_CALL_STATS})
             add_test(
