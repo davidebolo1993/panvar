@@ -181,11 +181,23 @@ if [ -s "$OUT/idx.bin" ]; then
     grep -qi "index was built at" "$OUT/fl_bad.log" \
       && ok "an index refuses a --fragment-len it was not built at" \
       || bad "an index accepted a conflicting --fragment-len, mixing two clump definitions"
-    "$BIN" genotype --index "$OUT/idx.bin" -o "$OUT/fl_ok" -R "$OUT/skew.fa" \
-      --depth-model median -q >/dev/null 2>&1
-    [ -s "$OUT/fl_ok.genotypes.tsv" ] \
-      && ok "an index run without --fragment-len inherits the length it was built at" \
-      || bad "an index run without --fragment-len failed"
+    # Inheritance has to be checked at a NON-DEFAULT length, and at 0. The previous version of this
+    # assertion used an index built at the default 350 and only checked that a file appeared, so it
+    # could not detect either failure. 0 is the sharp case: it MEANS "disable clumping", and guarding
+    # inheritance on `> 0` sent such an index back to 350 -- GQ 33.03 against the direct route's 99.
+    for FL in 1400 0; do
+      "$BIN" genotype -i "$OUT/g.gfa" -b "$OUT/bub" -r ref -o "$OUT/ixb$FL" \
+        --build-index "$OUT/ix$FL.bin" --fragment-len "$FL" -q >/dev/null 2>&1
+      "$BIN" genotype -i "$OUT/g.gfa" -b "$OUT/bub" -r ref -o "$OUT/d$FL" -R "$OUT/skew.fa" \
+        --depth-model median --fragment-len "$FL" -q >/dev/null 2>&1
+      "$BIN" genotype --index "$OUT/ix$FL.bin" -o "$OUT/v$FL" -R "$OUT/skew.fa" \
+        --depth-model median -q >/dev/null 2>&1
+      if diff "$OUT/d$FL.genotypes.tsv" "$OUT/v$FL.genotypes.tsv" >/dev/null 2>&1; then
+        ok "an index built at --fragment-len $FL is inherited exactly (files identical)"
+      else
+        bad "index built at $FL, run without the flag, differs from direct $FL"
+      fi
+    done
   else
     bad "indexed or direct run produced no depth audit"
   fi

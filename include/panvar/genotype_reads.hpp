@@ -197,7 +197,12 @@ void write_marker_dump(
     const ReadCounts& counts,
     const std::vector<BlockDepth>& depth,
     const std::vector<std::string>* truth_seq1 = nullptr,
-    const std::vector<std::string>* truth_seq2 = nullptr);
+    const std::vector<std::string>* truth_seq2 = nullptr,
+    // The matching allele indices, needed only to tell a KNOWN bypass from an UNKNOWN traversal.
+    // An empty sequence alone cannot: it means both "this haplotype spells nothing here" and "no
+    // allele was found for it", and those are a dosage of zero and an absence of information.
+    const std::vector<int>* truth_allele1 = nullptr,
+    const std::vector<int>* truth_allele2 = nullptr);
 
 void write_read_audit(
     const std::string& out_prefix,

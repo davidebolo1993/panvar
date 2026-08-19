@@ -1,8 +1,18 @@
 # Pre-registration: does the GC association reproduce across read draws?
 
-Written and committed before any seed beyond the first is analysed. Four claims in this thread were
-corrected because the conclusion was drawn from a check chosen after seeing the data. Fixing the
-statistic, the model and the decision rule first removes that freedom.
+Four claims in this thread were corrected because the conclusion was drawn from a check chosen after
+seeing the data. Fixing the statistic, the model and the decision rule first removes that freedom.
+
+**Amendment, 2026-08-19, made before any confirmatory slope was fitted or inspected.** The first draft
+claimed this was written "before any seed beyond the first is analysed". That was false. Seeds 42, 508,
+974, 1440 and 1906 had already been analysed at length -- they are the five-seed tables in section 4.7
+and 8.3 of the verification report -- and they are exactly `k = 0..4` of this schedule. Those five are
+therefore **exploratory** and are excluded. The confirmatory set is `k = 5..54`, fifty seeds none of
+which has been looked at. The exploratory five may be reported separately and carry no weight in the
+decision rule.
+
+A second amendment in the same revision corrects the practical co-primary, whose formula did not match
+the model it was supposed to summarise. Details in the co-primary section.
 
 ## What is being tested
 
@@ -40,7 +50,8 @@ Pinned choices, so none of them can be selected afterwards:
   offset. A multiplicity-weighted refit is reported as secondary.
 - **Pooling**: one `beta` shared across blocks per seed. Per-block `beta_b` from separate fits is
   reported as secondary heterogeneity, not as the primary quantity.
-- **Seeds**: 50, `SEED = 42 + 466k`, which holds the genotype fixed and changes only the reads.
+- **Seeds**: `SEED = 42 + 466k` for `k = 5..54`, which holds the genotype fixed and changes only the
+  reads. `k = 0..4` are exploratory and excluded, see the amendment above.
 
 ## Evidence: the 50 seed-level values, and nothing below them
 
@@ -68,14 +79,41 @@ earlier draft said the efficiency line "closes" below 90 percent, which is both 
 proportion to the difference between 44 and 45 of 50.
 
 **Co-primary, practical.** A tiny slope reproducing in 50 of 50 seeds can be real and irrelevant. So
-alongside the slope, report the quantity that decides whether it matters:
+alongside the slope, report the quantity that decides whether it matters.
 
-    predicted lambda bias at block 13 = beta_mean * (weighted GC delta) / 2
+**Corrected formula.** The model has a log link with GC in the exponent, so the multiplicative effect
+of a GC difference is `exp(beta * delta_GC)` and the predicted change in the per-copy rate is
 
-against the all-correct window half-width of 0.025, where the weighted GC delta is the
-multiplicity-weighted GC of block 13's truth-carried markers minus the mean GC of the anchors. On the
-first seed those were 0.4366 and 0.3991. An effect is practically relevant only if this predicted bias
-is an appreciable fraction of 0.025.
+    predicted lambda bias = lambda_anchor * (exp(beta_mean * delta_GC) - 1)
+
+where `lambda_anchor` is the mean `count_per_copy` over anchors in the same seed, and `delta_GC` is the
+multiplicity-weighted GC of block 13's truth-carried markers minus the mean GC of the anchors.
+
+The first draft wrote `beta_mean * delta_GC / 2`. That is wrong twice over: it treats a log-link
+coefficient as if it were additive on the count scale, and the factor of two was carried across from
+the anchor relation `count = 2*lambda`, which has nothing to do with a regression coefficient. On the
+exploratory seed 42, with beta 0.0301025, delta_GC 0.0373547 and lambda_anchor 11.63235, the two give
+**0.000562 against 0.013088** -- a factor of 23, and the difference between 0.02 and 0.52 of the
+half-window. The wrong formula would have reported the effect as negligible.
+
+Reported as the **ratio** to the 0.025 half-width, with no binary practical verdict attached. Naming a
+threshold for "appreciable" after seeing a 23-fold formula error would be choosing the bar to suit the
+number.
+
+**Note from the exploratory seeds, recorded rather than acted on.** Fitting `k = 0..4` showed the
+pooled `beta` scattering around zero (+0.030, +0.012, -0.037, -0.024, +0.019) while the anchor-only
+slope was consistently positive and an order of magnitude larger (+0.41, +0.38, +0.29, +0.30, +0.35).
+The likely reason is mechanical: Poisson IRLS weights each observation by its mean, and an array marker
+at multiplicity 20 carries roughly ten times the weight of a single-copy anchor, so a single shared
+`beta` is dominated by high-multiplicity markers and is closer to an array-marker slope than to a
+global one.
+
+The primary is deliberately NOT changed on the strength of this. The anchor-only slope is already a
+pre-registered secondary and will be reported whatever the pooled figure does, and rewriting the
+primary after looking at data -- even exploratory data -- is the freedom this document exists to
+remove. It is recorded here so the reading of the confirmatory result is fixed in advance: if the two
+disagree in the same way, the anchor-only slope is the one that speaks to the depth denominator,
+because anchors are what set lambda.
 
 **Secondary, reported without a threshold.** The same slope on anchors alone, where multiplicity is 1
 by construction; the fraction of (block, seed) fits positive; and at block 13 the per-seed mean AND

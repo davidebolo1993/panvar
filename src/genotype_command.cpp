@@ -395,7 +395,11 @@ int run_genotype_command(const std::vector<std::string>& args) {
         // every other term uses the caller's. Inherit when unspecified, refuse when contradicted --
         // silently preferring either would reintroduce exactly the indexed-versus-direct drift v5
         // exists to remove.
-        if (idx.panel.fragment_len > 0.0) {
+        {
+            // No `> 0` guard: 0 is a MEANINGFUL value, it disables clumping. Skipping inheritance
+            // there sent an index built at 0 back to the 350 default and produced GQ 33.03 against
+            // the direct route's 99 on identical reads. Format v5 always writes the field, so it is
+            // always present and always authoritative.
             if (!fragment_len_set) {
                 fragment_len = idx.panel.fragment_len;
             } else if (std::abs(fragment_len - idx.panel.fragment_len) > 1e-9) {
@@ -1415,7 +1419,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
             write_read_audit(out_prefix, chain, read_panel, rc, depth);
             if (!dump_markers.empty()) {
                 write_marker_dump(dump_markers, chain, read_panel, rc, depth,
-                                  ts1.empty() ? nullptr : &ts1, ts2.empty() ? nullptr : &ts2);
+                                  ts1.empty() ? nullptr : &ts1, ts2.empty() ? nullptr : &ts2,
+                                  ta1.empty() ? nullptr : &ta1, ta2.empty() ? nullptr : &ta2);
                 log.wrote({dump_markers});
             }
             log.info("model: lambda " + std::to_string(gsum.lambda_hap) + ", overdispersion phi " +

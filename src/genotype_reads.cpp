@@ -312,7 +312,9 @@ void write_marker_dump(
     const ReadCounts& counts,
     const std::vector<BlockDepth>& depth,
     const std::vector<std::string>* truth_seq1,
-    const std::vector<std::string>* truth_seq2) {
+    const std::vector<std::string>* truth_seq2,
+    const std::vector<int>* truth_allele1,
+    const std::vector<int>* truth_allele2) {
 
     std::ofstream f(path);
     if (!f) throw std::runtime_error("genotype: cannot write " + path);
@@ -403,11 +405,18 @@ void write_marker_dump(
         // Truth is known for this block when sequences were supplied at all. A haplotype that does not
         // traverse contributes an empty string and therefore zero copies, which is a real dosage of 0
         // rather than an absence of information -- the distinction anchors depend on.
-        // Both haplotypes bypassing is a dosage of ZERO, which is known, not unknown. Calling it
-        // unknown discards the one case where a marker's absence is the informative observation.
-        const bool block_has_truth =
-            truth_seq1 != nullptr && truth_seq2 != nullptr &&
-            bi < truth_seq1->size() && bi < truth_seq2->size();
+        // Tri-state, because an empty truth sequence means two different things. A haplotype's
+        // dosage is KNOWN when it spells something, and known to be ZERO when it spells nothing but
+        // an allele was nonetheless found for it -- a genuine bypass, where the marker's absence is
+        // the informative observation. It is UNKNOWN when neither holds, and reporting 0 there would
+        // put an unmeasured block into the efficiency population.
+        auto hap_known = [&](const std::vector<std::string>* seqs, const std::vector<int>* alleles) {
+            if (seqs == nullptr || bi >= seqs->size()) return false;
+            if (!(*seqs)[bi].empty()) return true;
+            return alleles != nullptr && bi < alleles->size() && (*alleles)[bi] >= 0;
+        };
+        const bool block_has_truth = hap_known(truth_seq1, truth_allele1) &&
+                                     hap_known(truth_seq2, truth_allele2);
         if (block_has_truth) {
             dosage_from((*truth_seq1)[bi], tmult, tpos);
             dosage_from((*truth_seq2)[bi], tmult, tpos);

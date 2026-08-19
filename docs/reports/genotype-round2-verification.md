@@ -889,7 +889,41 @@ informative observation.
 differ by tens of kilobases, so a pooled raw offset correlates with copy number rather than with
 location. Occurrences are normalized within their own sequence to [0,1] before pooling.
 
-### 8.15 Not started
+### 8.15 The seed experiment, held twice before starting
+
+Three further defects, all found before any confirmatory data was fitted.
+
+**The practical co-primary formula did not match the model.** It read `beta * delta_GC / 2`, which
+treats a log-link coefficient as additive on the count scale and carries a factor of two across from
+the anchor relation `count = 2*lambda`, which has nothing to do with a regression coefficient. The
+correct form is `lambda_anchor * (exp(beta * delta_GC) - 1)`. On the exploratory seed those give
+**0.000562 against 0.013088**, a factor of 23, and the difference between 0.02 and 0.52 of the
+half-window. The wrong formula would have reported the effect as negligible.
+
+**The first five seeds were not confirmatory.** Seeds 42, 508, 974, 1440 and 1906 had already been
+analysed at length in sections 4.7 and 8.3, and they are exactly `k = 0..4` of the schedule, so the
+claim that the plan predated any analysed seed was false. They are exploratory now and excluded; the
+confirmatory set is `k = 5..54`.
+
+**`--fragment-len 0` reopened the index route.** Zero means "disable clumping", and inheritance was
+guarded on `> 0`, so an index built at 0 and run without the flag reverted to 350: GQ 33.03 against the
+direct route's 99, files differing. Inheritance is unconditional now and both non-default cases, 1400
+and 0, are asserted as whole-file parity. Until this, V1 and V8 were not actually closed.
+
+Also: the truth contract is tri-state rather than overloading an empty string, since a haplotype that
+spells nothing is a known dosage of zero only when an allele was found for it, and unknown otherwise.
+
+**Two implementation defects in the analysis itself**, found by running it on the exploratory seeds
+before touching the confirmatory ones. The IRLS convergence tolerance sat at 1e-10, below the numerical
+noise floor of the least-squares solve, so every fit was flagged non-convergent while being stable to
+eight decimals from iteration 10. And the pooled slope scatters around zero across the exploratory five
+while the anchor-only slope is consistently positive and an order of magnitude larger, which is
+mechanical: Poisson weights each observation by its mean, so a marker at multiplicity 20 carries about
+ten times the weight of a single-copy anchor and a single shared slope is dominated by array markers.
+That is recorded in the pre-registration and the primary is deliberately not changed on the strength of
+it.
+
+### 8.16 Not started
 
 A negative binomial or robust weighted estimator, now understood to require marker-specific efficiency
 rather than a change of likelihood family. Tests: there is still no registered `genotype_stats.sh`, and
@@ -902,7 +936,7 @@ of section 7.6 are untouched, as are both oracles.
 The `--explain-pair` and `--deconvolve` diagnostic paths request the historical median explicitly; that
 needs to be either deliberate and labelled, or changed.
 
-### 8.16 Agreed plan before the default moves
+### 8.17 Agreed plan before the default moves
 
 Retain `--depth-estimator mean` as the leading experimental mode, default unchanged. Then: 50 to 100
 seeds on the fixed lpa pair; lower depths and higher error rates so the saturated ladder becomes
@@ -911,7 +945,7 @@ fragment-level bootstrap rather than from five draws; several real loci, then at
 sequencing library with an external single-copy depth control. The default does not move until a
 registered genotype regression test exists and the real-library distribution checks have been run.
 
-### 8.17 Open questions
+### 8.18 Open questions
 
 **The cliff's replacement constant.** 200 pseudo-anchors is arbitrary. Should the shrinkage precision
 be estimated from within-block and between-block variability instead, and is there enough data per
@@ -943,7 +977,8 @@ untested here.
 | `d0e012c` | `--dump-markers` over every marker with dosage, position and clump; anchor `expected` fixed |
 | `3b7500f` | dosage from the truth sequences, so a held-out array is measurable at all; anchor and zero-dosage contracts fixed |
 | `ae0da53` | `--fragment-len` reaches marker clumping (V8); index v5 carries `marker_clumps`, `node_first_pos`, `all_kmers` and the construction fragment length (V1) |
-| `<this>` | GQ actually compared; index fragment-length inherited or refused; double-bypass and normalized truth positions |
+| `0c29557` | GQ actually compared; index fragment-length refused when contradicted; double-bypass and normalized truth positions |
+| `<this>` | co-primary formula corrected; exploratory seeds excluded; `--fragment-len 0` inheritance; truth tri-state; analysis committed |
 
 **No default option changed. One intended default-path consistency fix can change output slightly:**
 commit `7d9bd65` alters the default median path for every block with 1 to 19 anchors, whose anchors now
