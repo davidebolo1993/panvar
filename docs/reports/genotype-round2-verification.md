@@ -774,25 +774,62 @@ the numbers: dosage confounding, position, and sign disagreement across blocks.
 It survives all three, so it is not dosage confounding, not position alone, and not a sign accident.
 It is also very small: r-squared about 0.001.
 
-**Whether it bites at the array, which is the question that was not previously answerable.** The array
-block's markers are genuinely GC-atypical against the anchor pool that sets lambda:
+**Whether it bites at the array. Superseded, see 8.12** -- the figures below were computed over every
+candidate panel marker in block 13, because the held-out truth alleles were unrepresentable and the
+block therefore carried no truth dosage at all. The target of the whole analysis was excluded from it.
 
     all anchors        mean GC 0.3991
-    block 13 (KIV-2)   mean GC 0.4301     delta +0.0310, the largest of any substantial block
-    pooled anchor slope           +1.69 counts per unit GC
-    implied lambda bias at array  +0.0261
-    all-correct window half-width  0.025
+    block 13 (KIV-2)   mean GC 0.4301     delta +0.0310
+    implied lambda bias at array  +0.0261 against a window half-width of 0.025
 
-So the implied bias is about 1.04 times the half-width of the window lambda has to land in. **This
-replaces the earlier eight-fold figure**, which came from an extreme-bin difference and was not a
-stable effect size. The direction is consistent with the observed data: high-GC markers read high, the
-array's dosage is therefore overestimated, and all five span estimates were biased positive. The
-magnitude accounts for roughly a quarter of the observed 0.93 percent span bias.
+That was an extrapolation from the anchor slope and panel-wide marker composition, and the claim that
+it accounted for roughly a quarter of the span bias was not supported by it.
 
-**Marker-specific efficiency is therefore a contributor at the array, not the explanation.** It is
-worth correcting and it will not on its own remove the residual.
+### 8.12 Dosage from the truth SEQUENCES, and the array measured directly
 
-### 8.12 Not started
+Truth multiplicity was computed from panel allele indices, which do not exist for a held-out array
+allele. On lpa that left all 8,754 informative markers at block 13 -- and every marker at blocks 6, 11,
+18 and 20 -- with `truth_mult` NA. The conservative both-haplotypes rule was right and its consequence
+was that the block under study contributed nothing to the analysis about it.
+
+Dosage now comes from `ts1` and `ts2`, the spelled truth sequences, which are retained whether or not
+the allele is representable. Markers are counted straight out of the sequence against
+`panel.node_codes`. Block 13 now reports dosage for all 8,754 rows, of which 2,007 are carried, at a
+mean multiplicity of 20.34.
+
+Two related contract fixes: an anchor's dosage was hard-coded to 2, which is wrong wherever a truth
+haplotype takes a bypass -- on lpa 7 of 19,330 anchors have only one traversing haplotype -- and a
+marker with dosage 0 reported `count_per_copy` 0, which put background observations into the efficiency
+population. It is NA now.
+
+Note that `--depth-calibration` skips blocks where either truth allele index is negative, so that
+diagnostic has the same blind spot and has never covered the array either.
+
+**The array, measured rather than extrapolated:**
+
+| | value |
+|---|---|
+| anchors, mean count_per_copy | 11.628 |
+| block 13 carried markers, mean count_per_copy | 11.790 |
+| block 13 carried markers, MEDIAN count_per_copy | 11.632 |
+| multiplicity-weighted GC delta against anchors | +0.0375 |
+| GC-predicted lambda bias | +0.0316 |
+| lambda bias implied by the mean per-copy excess | +0.0808 |
+
+The mean per-copy rate at the array is 1.39 percent above the anchors, which implies a lambda bias of
++0.081 against a window half-width of 0.025, and GC predicts about 39 percent of it.
+
+**But the median excess is 0.03 percent, not 1.39.** The array's typical marker reads exactly what an
+anchor does; the mean is pulled by a right tail. So there is no uniform per-copy inflation to correct,
+and whether the tail biases lambda depends on which estimator consumes it -- a mean follows the tail, a
+median does not. That interacts directly with section 8.2, which recommended the mean on the grounds
+that anchors are clean Poisson with nothing to be robust against. Anchors are; array markers, on this
+evidence, are not. A single estimator may not be right for both populations.
+
+This is one seed and the tail is not characterized. It is the first direct measurement of the quantity
+that matters and it is not yet a conclusion.
+
+### 8.13 Not started
 
 A negative binomial or robust weighted estimator, now understood to require marker-specific efficiency
 rather than a change of likelihood family. Tests: there is still no registered `genotype_stats.sh`, and
@@ -805,7 +842,7 @@ of section 7.6 are untouched, as are both oracles.
 The `--explain-pair` and `--deconvolve` diagnostic paths request the historical median explicitly; that
 needs to be either deliberate and labelled, or changed.
 
-### 8.13 Agreed plan before the default moves
+### 8.14 Agreed plan before the default moves
 
 Retain `--depth-estimator mean` as the leading experimental mode, default unchanged. Then: 50 to 100
 seeds on the fixed lpa pair; lower depths and higher error rates so the saturated ladder becomes
@@ -814,7 +851,7 @@ fragment-level bootstrap rather than from five draws; several real loci, then at
 sequencing library with an external single-copy depth control. The default does not move until a
 registered genotype regression test exists and the real-library distribution checks have been run.
 
-### 8.14 Open questions
+### 8.15 Open questions
 
 **The cliff's replacement constant.** 200 pseudo-anchors is arbitrary. Should the shrinkage precision
 be estimated from within-block and between-block variability instead, and is there enough data per
@@ -842,6 +879,9 @@ untested here.
 | `5812e48` | `--depth-estimator median\|mean\|trimmed`, with the estimator reaching the joint model and the indexed route rather than only the first pass |
 | `7d9bd65` | the `min_anchors` cliff removed, so every block with anchors contributes and is shrunk by its own weight; the region summary stops naming its anchor centre lambda |
 | `6c01d4c` | `--dump-anchors`, and the distributional checks it makes possible |
+| `fdc8b3d` | `genotype_stats.sh`, the module's first registered test: 30 assertions, verified to fail against the pre-fix build |
+| `d0e012c` | `--dump-markers` over every marker with dosage, position and clump; anchor `expected` fixed |
+| pending | dosage from the truth sequences, so a held-out array is measurable at all |
 
 **No default option changed. One intended default-path consistency fix can change output slightly:**
 commit `7d9bd65` alters the default median path for every block with 1 to 19 anchors, whose anchors now
@@ -892,10 +932,9 @@ Extending it to informative markers is necessary and not sufficient. Without per
 array markers carrying twenty copies would be compared against single-copy anchors and efficiency would
 be confounded with dosage.
 
-**There is still no registered genotype test.** Four commits in, `genotype_stats.sh` does not exist
-while every other module has one. The depth code now branches over local against shrunk against
-fallback, three estimators, NA handling, and direct against indexed, making it the largest untested
-surface in the module, and by the agreement in section 8.12 this blocks the default change.
+**Resolved since this was written.** `genotype_stats.sh` is registered with 32 assertions and the dump
+covers every marker. What remains blocking the default is replication: one seed, one locus, and the
+tail at the array described in 8.12 is uncharacterized.
 
 ### 9.4 A pattern in this pass worth recording
 

@@ -1391,7 +1391,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
             write_read_audit(out_prefix, chain, read_panel, rc, depth);
             if (!dump_markers.empty()) {
                 write_marker_dump(dump_markers, chain, read_panel, rc, depth,
-                                  ta1.empty() ? nullptr : &ta1, ta2.empty() ? nullptr : &ta2);
+                                  ts1.empty() ? nullptr : &ts1, ts2.empty() ? nullptr : &ts2);
                 log.wrote({dump_markers});
             }
             log.info("model: lambda " + std::to_string(gsum.lambda_hap) + ", overdispersion phi " +

@@ -182,17 +182,19 @@ std::vector<BlockDepth> estimate_depth(
 // predicts, and whether any of it is confounded with GC or with which block a marker sits in. Those
 // questions decide whether a robust estimator is needed at all, and they cannot be answered from
 // summary statistics.
-// Optional truth alleles, so a marker's expected copy number in THIS sample is known and efficiency
-// can be separated from dosage. Without it an array marker carried twenty times is compared against a
-// single-copy anchor and the two effects are confounded.
+// Optional truth SEQUENCES per block, so a marker's expected copy number in this sample is known and
+// efficiency can be separated from dosage. Sequences rather than panel allele indices on purpose: at a
+// held-out array the truth allele is unrepresentable, so an index-based dosage is unavailable for
+// exactly the block the analysis is about, while the spelled sequence is retained regardless. An empty
+// string means that haplotype does not traverse the block and contributes zero copies.
 void write_marker_dump(
     const std::string& path,
     const std::vector<Block>& chain,
     const ReadPanel& panel,
     const ReadCounts& counts,
     const std::vector<BlockDepth>& depth,
-    const std::vector<int>* truth1 = nullptr,
-    const std::vector<int>* truth2 = nullptr);
+    const std::vector<std::string>* truth_seq1 = nullptr,
+    const std::vector<std::string>* truth_seq2 = nullptr);
 
 void write_read_audit(
     const std::string& out_prefix,

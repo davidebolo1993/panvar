@@ -311,8 +311,8 @@ void write_marker_dump(
     const ReadPanel& panel,
     const ReadCounts& counts,
     const std::vector<BlockDepth>& depth,
-    const std::vector<int>* truth1,
-    const std::vector<int>* truth2) {
+    const std::vector<std::string>* truth_seq1,
+    const std::vector<std::string>* truth_seq2) {
 
     std::ofstream f(path);
     if (!f) throw std::runtime_error("genotype: cannot write " + path);
@@ -326,10 +326,27 @@ void write_marker_dump(
          "\tvary_blocks\tocc_blocks\tactual\texpected\n";
     const bool have_dbg = panel.dbg_vary.size() == panel.node_codes.size();
     constexpr double kFrag = 350.0;
+    std::unordered_map<std::uint64_t, std::uint32_t> slot_of;
+    slot_of.reserve(panel.node_codes.size() * 2);
+    for (std::uint32_t i = 0; i < panel.node_codes.size(); ++i) slot_of.emplace(panel.node_codes[i], i);
+
+    // A truth haplotype's own copy number for every marker, read off the spelled sequence rather than
+    // off a panel allele index. This is the whole point: at a held-out array no panel allele matches,
+    // so an index-based dosage is missing at precisely the block being studied.
+    auto dosage_from = [&](const std::string& seq, std::unordered_map<std::uint32_t, double>& out) {
+        if (seq.empty()) return;
+        const std::vector<KmerOccurrence> occ =
+            panel.all_kmers ? collect_canonical_kmer_occurrences(seq, panel.kmer_size)
+                            : collect_syncmers(seq, panel.kmer_size, panel.syncmer_s);
+        for (const KmerOccurrence& o : occ) {
+            const auto it = slot_of.find(o.code);
+            if (it != slot_of.end()) out[it->second] += 1.0;
+        }
+    };
 
     auto emit = [&](std::size_t bi, const char* kind, const char* cls, std::uint32_t slot,
                     std::size_t n_alleles, std::size_t carriers, std::uint32_t mmin,
-                    std::uint32_t mmax, double mmean, double truth_mult) {
+                    std::uint32_t mmax, double mmean, double truth_mult, bool truth_known) {
         if (slot >= counts.node.size() || slot >= panel.node_codes.size()) return;
         const std::string kmer = decode_kmer(panel.node_codes[slot], panel.kmer_size);
         std::size_t gc = 0;
@@ -342,9 +359,11 @@ void write_marker_dump(
         if (pos == UINT32_MAX) f << "NA\tNA\t";
         else f << pos << '\t' << static_cast<long>(pos / kFrag) << '\t';
         f << n_alleles << '\t' << carriers << '\t' << mmin << '\t' << mmax << '\t' << mmean << '\t';
-        if (truth_mult < 0.0) f << "NA\tNA\t";
-        else f << truth_mult << '\t'
-               << (truth_mult > 0.0 ? static_cast<double>(counts.node[slot]) / truth_mult : 0.0) << '\t';
+        // A marker the sample carries zero times has a defined dosage and an UNDEFINED per-copy rate;
+        // reporting 0 there would put a background observation into the efficiency population.
+        if (!truth_known) f << "NA\tNA\t";
+        else if (truth_mult <= 0.0) f << truth_mult << "\tNA\t";
+        else f << truth_mult << '\t' << static_cast<double>(counts.node[slot]) / truth_mult << '\t';
         if (have_dbg) {
             f << panel.dbg_vary[slot] << '\t' << panel.dbg_occ[slot] << '\t'
               << panel.dbg_actual[slot] << '\t' << panel.dbg_expected[slot] << '\n';
@@ -362,7 +381,17 @@ void write_marker_dump(
         std::unordered_map<std::uint32_t, std::array<std::uint64_t, 3>> agg;  // carriers, sum, max
         std::unordered_map<std::uint32_t, std::uint32_t> mmin;
         std::unordered_map<std::uint32_t, double> tmult;
-        bool block_has_truth = false;
+        // Truth is known for this block when sequences were supplied at all. A haplotype that does not
+        // traverse contributes an empty string and therefore zero copies, which is a real dosage of 0
+        // rather than an absence of information -- the distinction anchors depend on.
+        const bool block_has_truth =
+            truth_seq1 != nullptr && truth_seq2 != nullptr &&
+            bi < truth_seq1->size() && bi < truth_seq2->size() &&
+            !((*truth_seq1)[bi].empty() && (*truth_seq2)[bi].empty());
+        if (block_has_truth) {
+            dosage_from((*truth_seq1)[bi], tmult);
+            dosage_from((*truth_seq2)[bi], tmult);
+        }
         if (bi < panel.by_block.size()) {
             for (std::size_t ai = 0; ai < panel.by_block[bi].size(); ++ai) {
                 for (const auto& [slot, mult] : panel.by_block[bi][ai].nodes) {
@@ -372,46 +401,26 @@ void write_marker_dump(
                     if (it == mmin.end() || mult < it->second) mmin[slot] = mult;
                 }
             }
-            // BOTH haplotypes or neither. Skipping the one whose truth allele is unrepresentable
-            // leaves a half-dosage figure that looks like a real copy number, and `count_per_copy`
-            // then reads 2*lambda instead of lambda -- which presented as a 26 percent efficiency
-            // gap between anchors and informative markers on lpa and was nothing of the kind.
-            bool both = truth1 != nullptr && truth2 != nullptr &&
-                        bi < truth1->size() && bi < truth2->size();
-            if (both) {
-                for (const std::vector<int>* tv : {truth1, truth2}) {
-                    const int ai = (*tv)[bi];
-                    if (ai < 0 || static_cast<std::size_t>(ai) >= panel.by_block[bi].size()) {
-                        both = false;
-                        break;
-                    }
-                }
-            }
-            if (both) {
-                for (const std::vector<int>* tv : {truth1, truth2}) {
-                    for (const auto& [slot, mult] : panel.by_block[bi][(*tv)[bi]].nodes) {
-                        tmult[slot] += mult;
-                    }
-                }
-            }
-            block_has_truth = both;
         }
-        // Only blocks where BOTH truth alleles are representable can report a dosage at all.
-        const bool have_truth = block_has_truth;
 
+        auto truth_mult_of = [&](std::uint32_t slot) {
+            const auto it = tmult.find(slot);
+            return it == tmult.end() ? 0.0 : it->second;
+        };
         if (bi < panel.anchor_slots.size()) {
             for (const std::uint32_t slot : panel.anchor_slots[bi]) {
-                // An anchor is carried by every traversing allele at multiplicity 1 by definition, so
-                // in a diploid the sample expects two copies whatever its genotype.
-                emit(bi, kind, "anchor", slot, na, na, 1, 1, 1.0, have_truth ? 2.0 : -1.0);
+                // An anchor is carried once by every TRAVERSING allele, so a diploid expects two copies
+                // only when both haplotypes traverse. Hard-coding 2 was wrong wherever a truth
+                // haplotype takes a bypass or deletion allele, which is the case a depth anchor is
+                // least able to absorb.
+                emit(bi, kind, "anchor", slot, na, na, 1, 1, 1.0,
+                     truth_mult_of(slot), block_has_truth);
             }
         }
         for (const auto& [slot, a] : agg) {
             const double mean = static_cast<double>(a[1]) / static_cast<double>(std::max<std::uint64_t>(1, a[0]));
-            const auto it = tmult.find(slot);
-            const double tm = !have_truth ? -1.0 : (it == tmult.end() ? 0.0 : it->second);
             emit(bi, kind, "informative", slot, na, a[0], mmin[slot],
-                 static_cast<std::uint32_t>(a[2]), mean, tm);
+                 static_cast<std::uint32_t>(a[2]), mean, truth_mult_of(slot), block_has_truth);
         }
     }
     if (!f) throw std::runtime_error("genotype: write failed for " + path);

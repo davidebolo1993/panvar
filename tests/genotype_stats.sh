@@ -200,6 +200,21 @@ if [ -s "$OUT/markers.tsv" ]; then
   [ "$bad_cpc" = "0" ] \
     && ok "count_per_copy is exactly lambda=$R for every marker: dosage is fully divided out" \
     || bad "$bad_cpc markers have count_per_copy != $R, so the dosage normalization is wrong"
+  # Dosage is summed PER TRUTH HAPLOTYPE from the spelled sequences, so a marker only one of them
+  # carries must read 1, not 2 and not NA. hapA1 carries allele A1 and hapB1 carries A2, so both
+  # single-haplotype cases exist in this fixture by construction.
+  n1=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next} $(h["truth_mult"])=="1"{k++} END{print k+0}' "$OUT/markers.tsv")
+  [ "$n1" -gt 0 ] \
+    && ok "markers carried by ONE truth haplotype report dosage 1 ($n1 of them)" \
+    || bad "no marker has truth_mult=1, so per-haplotype dosage is not being summed"
+  # A marker the sample carries zero times has a defined dosage and an UNDEFINED per-copy rate.
+  # Reporting 0 would put a background observation into the efficiency population.
+  z=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next} $(h["truth_mult"])=="0"{k++} END{print k+0}' "$OUT/markers.tsv")
+  zbad=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+         $(h["truth_mult"])=="0" && $(h["count_per_copy"])!="NA"{k++} END{print k+0}' "$OUT/markers.tsv")
+  { [ "$z" -gt 0 ] && [ "$zbad" = "0" ]; } \
+    && ok "zero-dosage markers ($z) report count_per_copy NA, not 0" \
+    || bad "$zbad of $z zero-dosage markers report a numeric count_per_copy"
   # Position drives clump membership, and without it a GC trend cannot be told from a position trend.
   npos=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next} $(h["first_pos"])!="NA"{k++} END{print k+0}' "$OUT/markers.tsv")
   [ "$npos" -gt 0 ] && ok "markers carry a position and a clump ($npos rows)" \
