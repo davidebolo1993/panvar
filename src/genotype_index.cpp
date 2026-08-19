@@ -7,9 +7,12 @@
 namespace panvar {
 namespace {
 
-// Bumped to 4 when all_edge_keys joined the panel: an index written by an older build has no such
-// field, and reading one as if it did would desynchronise every vector after it.
-constexpr char kMagic[8] = {'p', 'v', 'g', 't', 'i', 'd', 'x', '4'};
+// Bumped to 5 when marker_clumps, node_first_pos, all_kmers and fragment_len joined the serialized
+// panel. An index written by an older build has no such fields, and reading one as if it did would
+// desynchronise every vector after it. marker_clumps in particular is not cosmetic: absent, the
+// emission falls back to span/fragment_len for its effective sample size, so an indexed run silently
+// used a different -- and worse -- ESS discount than the direct one.
+constexpr char kMagic[8] = {'p', 'v', 'g', 't', 'i', 'd', 'x', '5'};
 
 template <typename T>
 void put(std::ostream& o, const T& v) {
@@ -94,6 +97,10 @@ void write_genotype_index(const std::string& path, const GenotypeIndex& index) {
     }
     put<std::uint64_t>(o, index.panel.anchor_slots.size());
     for (const auto& v : index.panel.anchor_slots) put_vec(o, v);
+    put_vec(o, index.panel.marker_clumps);
+    put_vec(o, index.panel.node_first_pos);
+    put<std::uint8_t>(o, index.panel.all_kmers ? 1 : 0);
+    put<double>(o, index.panel.fragment_len);
     if (!o) throw std::runtime_error("genotype index: write failed for " + path);
 }
 
@@ -165,6 +172,11 @@ GenotypeIndex read_genotype_index(const std::string& path) {
     get(i, n);
     x.panel.anchor_slots.resize(n);
     for (auto& v : x.panel.anchor_slots) get_vec(i, v);
+    get_vec(i, x.panel.marker_clumps);
+    get_vec(i, x.panel.node_first_pos);
+    std::uint8_t ak = 0;
+    get(i, ak); x.panel.all_kmers = ak != 0;
+    get(i, x.panel.fragment_len);
 
     x.panel.kmer_size = x.kmer_size;
     x.panel.syncmer_s = x.syncmer_s;

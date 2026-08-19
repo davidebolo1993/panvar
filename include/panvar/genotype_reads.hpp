@@ -53,6 +53,9 @@ struct ReadPanel {
     // testing whether an apparent GC trend is really GC needs a positional covariate to regress it
     // against. Without one, GC and position are indistinguishable.
     std::vector<std::uint32_t> node_first_pos;
+    // The fragment length the clumps above were computed at, so a consumer can reproduce the binning
+    // and an index cannot silently be used at a different one.
+    double fragment_len = 350.0;
     std::size_t blocks_restored = 0;          // blocks whose markers were put back for allele balance
     std::size_t region_filtered_markers = 0;   // dropped for occurring elsewhere in the region
     std::size_t dropped_multi_block = 0;       // ...because they appear in more than one block

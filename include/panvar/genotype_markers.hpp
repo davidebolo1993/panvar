@@ -57,6 +57,11 @@ struct MarkerOptions {
     // differ(a,b) >= |carried[a]-carried[b]|, is applied alongside to recover cheap certain misses.
     std::size_t sep_top_k = 0;
     std::size_t sketch_size = 64;
+    // The library fragment length, used to decide which markers are close enough to be carried by the
+    // same molecule. This was hard-coded at 350 while --fragment-len reached only the emission, so a
+    // run with a different library silently kept the default clumping -- and the clump count IS the
+    // effective sample size the emission divides by.
+    double fragment_len = 350.0;
     std::size_t threads = 0;
 };
 

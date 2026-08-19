@@ -829,7 +829,42 @@ evidence, are not. A single estimator may not be right for both populations.
 This is one seed and the tail is not characterized. It is the first direct measurement of the quantity
 that matters and it is not yet a conclusion.
 
-### 8.13 Not started
+### 8.13 Contract work cleared before the seed run
+
+**The clump window is no longer hard-coded** (verified defect V8). `--fragment-len` reached only the
+emission while marker clumping used a literal 350, and the clump count IS the effective sample size the
+emission divides by, so a run with a different library silently kept the default. `MarkerOptions` now
+carries it and `ReadPanel` records what it was computed at. Verified reaching the model rather than
+assumed: quadrupling the fragment length takes the distinct clump count from 3 to 1 on the fixture.
+
+Worth recording how that fix nearly failed. The assignment was first placed at the declaration of
+`MarkerOptions`, which is BEFORE the argument parse loop, so it copied the default and the flag would
+have gone nowhere -- the identical failure this module has now hit four times. It is after parsing, and
+`--fragment-len` is range-checked.
+
+**The index serializes what inference depends on** (verified defect V1, the highest-severity item in
+the original review). `marker_clumps`, `node_first_pos`, `all_kmers` and `fragment_len` join the format
+at version 5. Absent `marker_clumps`, an indexed run fell through to `span / fragment_len` for its
+effective sample size and produced a different GQ from the same reads and the same calls, which is
+exactly the symptom that was measured. Direct and indexed genotype rows now agree byte for byte
+including GQ, and the test asserts that rather than only lambda.
+
+**Truth-derived positions.** `node_first_pos` is one occurrence from one allele, which for a repeat
+marker carried twenty times is one of twenty places it sits. `truth_pos_mean` and `truth_pos_span` are
+computed from the truth sequence itself, so every occurrence is seen and the covariate is the sample's
+own.
+
+**The position control in section 8.10 was overstated by a small amount.** Rows in blocks too small to
+residualize were left unadjusted and still included, mixing adjusted and unadjusted data. Dropping them
+gives about +0.044 rather than +0.0469. The adjustment also removes only a block-specific linear trend,
+so it does not exclude nonlinear spatial coverage.
+
+The seed-level statistic is pre-registered in `SEED_STATISTIC.md` before any seed beyond the first is
+analysed: a block-adjusted, spline-position-adjusted slope of `count_per_copy` on GC, with the decision
+rule and the failure reading fixed in advance, and reproducibility judged from the distribution of the
+per-seed slope rather than from marker-level p-values.
+
+### 8.14 Not started
 
 A negative binomial or robust weighted estimator, now understood to require marker-specific efficiency
 rather than a change of likelihood family. Tests: there is still no registered `genotype_stats.sh`, and
@@ -842,7 +877,7 @@ of section 7.6 are untouched, as are both oracles.
 The `--explain-pair` and `--deconvolve` diagnostic paths request the historical median explicitly; that
 needs to be either deliberate and labelled, or changed.
 
-### 8.14 Agreed plan before the default moves
+### 8.15 Agreed plan before the default moves
 
 Retain `--depth-estimator mean` as the leading experimental mode, default unchanged. Then: 50 to 100
 seeds on the fixed lpa pair; lower depths and higher error rates so the saturated ladder becomes
@@ -851,7 +886,7 @@ fragment-level bootstrap rather than from five draws; several real loci, then at
 sequencing library with an external single-copy depth control. The default does not move until a
 registered genotype regression test exists and the real-library distribution checks have been run.
 
-### 8.15 Open questions
+### 8.16 Open questions
 
 **The cliff's replacement constant.** 200 pseudo-anchors is arbitrary. Should the shrinkage precision
 be estimated from within-block and between-block variability instead, and is there enough data per

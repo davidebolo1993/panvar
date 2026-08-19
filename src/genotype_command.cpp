@@ -340,6 +340,14 @@ int run_genotype_command(const std::vector<std::string>& args) {
     if (options.kmer_size == 0 || options.kmer_size > 31) {
         throw std::runtime_error("genotype: --kmer-size must be in [1, 31]");
     }
+    // AFTER the parse loop, not before it. Assigned at declaration this reads the default and the flag
+    // never reaches the marker builder -- the exact failure this module has hit repeatedly.
+    if (fragment_len < 0.0) {
+        throw std::runtime_error("genotype: --fragment-len must be >= 0");
+    }
+    {
+        options.fragment_len = fragment_len;
+    }
     if (!audit && !audit_linkage && read_paths.empty() && index_out.empty()) {
         throw std::runtime_error(
             "genotype: pass --audit, --audit-linkage, --build-index, or -R/--reads");

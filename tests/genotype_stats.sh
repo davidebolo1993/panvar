@@ -165,6 +165,14 @@ if [ -s "$OUT/idx.bin" ]; then
     [ "$(dep "$OUT/viaidx.reads.depth.tsv" 1 lambda_hap)" = "$(dep "$OUT/direct.reads.depth.tsv" 1 lambda_hap)" ] \
       && ok "the indexed route honours --depth-estimator identically to the direct one" \
       || bad "indexed lambda $(dep "$OUT/viaidx.reads.depth.tsv" 1 lambda_hap) != direct $(dep "$OUT/direct.reads.depth.tsv" 1 lambda_hap)"
+    # marker_clumps was not serialized, so an indexed run fell back to span/fragment_len for its
+    # effective sample size and produced a different GQ from the same reads and the same calls. That is
+    # the symptom the index defect actually presented as, so GQ is what has to match.
+    if diff <(cut -f1-12 "$OUT/direct.genotypes.tsv") <(cut -f1-12 "$OUT/viaidx.genotypes.tsv") >/dev/null 2>&1; then
+      ok "indexed and direct genotypes agree row for row, GQ included"
+    else
+      bad "indexed and direct genotype rows differ (marker_clumps or another panel field is not serialized)"
+    fi
   else
     bad "indexed or direct run produced no depth audit"
   fi

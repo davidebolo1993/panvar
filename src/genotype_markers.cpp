@@ -1006,10 +1006,11 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
             // 31 bases of novel sequence and therefore a handful of markers inside ONE fragment -- five
             // markers that are one observation. Counting them as five is what let a paralogous block be
             // called homozygous at GQ 20 on a coverage fluctuation that moved all five together.
+            out_panel->fragment_len = options.fragment_len;
             out_panel->marker_clumps.assign(chain.size(), 0.0);
             for (std::size_t bi = 0; bi < chain.size(); ++bi) {
                 std::unordered_set<long> bins;
-                const double frag = 350.0;
+                const double frag = options.fragment_len > 0.0 ? options.fragment_len : 350.0;
                 for (std::size_t ai = 0; ai < out_panel->by_block[bi].size() && ai < kept_inv[bi].size(); ++ai) {
                     for (const auto& [slot_i, mult] : out_panel->by_block[bi][ai].nodes) {
                         (void)mult;
