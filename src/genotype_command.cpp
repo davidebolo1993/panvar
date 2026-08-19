@@ -209,6 +209,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
     std::string index_in;
     std::size_t max_alleles = 64;
     double fragment_len = 350.0;
+    bool fragment_len_set = false;
     double recomb_rate = 1.0;
     double carrier_weight = 0.0;
     DepthModel depth_model = DepthModel::Joint;
@@ -267,7 +268,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
             else if (v != "panvar") throw std::runtime_error("genotype: --marker-rule must be panvar|unique|pangenie|mixed");
         }
         else if (arg == "--max-alleles") max_alleles = cli::parse_size_arg(arg, require_value(arg));
-        else if (arg == "--fragment-len") fragment_len = std::stod(require_value(arg));
+        else if (arg == "--fragment-len") { fragment_len = std::stod(require_value(arg)); fragment_len_set = true; }
         else if (arg == "--recomb-rate") recomb_rate = std::stod(require_value(arg));
         else if (arg == "--depth-model") {
             const std::string v = require_value(arg);
@@ -389,6 +390,21 @@ int run_genotype_command(const std::vector<std::string>& args) {
     if (!index_in.empty()) {
         // Everything the panel contributes was precomputed; only the reads are new.
         const GenotypeIndex idx = read_genotype_index(index_in);
+        // The index's clumps were computed at ONE fragment length. Building the emission from a
+        // different runtime value mixes the two: the clump count reflects the index's length while
+        // every other term uses the caller's. Inherit when unspecified, refuse when contradicted --
+        // silently preferring either would reintroduce exactly the indexed-versus-direct drift v5
+        // exists to remove.
+        if (idx.panel.fragment_len > 0.0) {
+            if (!fragment_len_set) {
+                fragment_len = idx.panel.fragment_len;
+            } else if (std::abs(fragment_len - idx.panel.fragment_len) > 1e-9) {
+                throw std::runtime_error(
+                    "genotype: --fragment-len " + std::to_string(fragment_len) +
+                    " but the index was built at " + std::to_string(idx.panel.fragment_len) +
+                    "; rebuild the index or drop the flag");
+            }
+        }
         log.info("index " + index_in + ": " + std::to_string(idx.chain.size()) + " blocks, " +
                  std::to_string(idx.haplotype_names.size()) + " haplotypes, " +
                  std::to_string(idx.panel.node_codes.size()) + " markers");

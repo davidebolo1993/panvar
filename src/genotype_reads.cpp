@@ -338,7 +338,7 @@ void write_marker_dump(
     // a repeat marker carried twenty times is one of twenty places it sits -- useless as a positional
     // covariate at exactly the blocks the analysis is about. Taken from the truth sequence, every
     // occurrence is seen, so the mean and span are the sample's own.
-    struct TruthPos { double n = 0, sum = 0; std::size_t lo = SIZE_MAX, hi = 0; };
+    struct TruthPos { double n = 0, sum = 0, lo = 1e30, hi = -1e30; };
     auto dosage_from = [&](const std::string& seq, std::unordered_map<std::uint32_t, double>& out,
                            std::unordered_map<std::uint32_t, TruthPos>& pos_out) {
         if (seq.empty()) return;
@@ -350,8 +350,12 @@ void write_marker_dump(
             if (it == slot_of.end()) continue;
             out[it->second] += 1.0;
             TruthPos& tp = pos_out[it->second];
-            tp.n += 1.0; tp.sum += static_cast<double>(o.start);
-            tp.lo = std::min(tp.lo, o.start); tp.hi = std::max(tp.hi, o.start);
+            // Normalized within its own sequence. The two haplotypes can differ in length by tens of
+            // kilobases at an array, so pooling raw offsets would make position mean different things
+            // for each and would correlate with copy number rather than with location.
+            const double u = static_cast<double>(o.start) / static_cast<double>(std::max<std::size_t>(1, seq.size()));
+            tp.n += 1.0; tp.sum += u;
+            tp.lo = std::min(tp.lo, u); tp.hi = std::max(tp.hi, u);
         }
     };
 
@@ -399,10 +403,11 @@ void write_marker_dump(
         // Truth is known for this block when sequences were supplied at all. A haplotype that does not
         // traverse contributes an empty string and therefore zero copies, which is a real dosage of 0
         // rather than an absence of information -- the distinction anchors depend on.
+        // Both haplotypes bypassing is a dosage of ZERO, which is known, not unknown. Calling it
+        // unknown discards the one case where a marker's absence is the informative observation.
         const bool block_has_truth =
             truth_seq1 != nullptr && truth_seq2 != nullptr &&
-            bi < truth_seq1->size() && bi < truth_seq2->size() &&
-            !((*truth_seq1)[bi].empty() && (*truth_seq2)[bi].empty());
+            bi < truth_seq1->size() && bi < truth_seq2->size();
         if (block_has_truth) {
             dosage_from((*truth_seq1)[bi], tmult, tpos);
             dosage_from((*truth_seq2)[bi], tmult, tpos);

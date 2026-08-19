@@ -1,9 +1,11 @@
 # `genotype` round 2 — verification pass and first experiment
 
-Date: 2026-08-18. Status: four commits landed, all in depth estimation and reporting. Nothing in the
-emission, the scorer or the band logic has been touched, and no default has changed. Sections 1 to 7
-are the record of the verification pass and the first experiment; section 8 is the live detail;
-section 9 is the summary and the recommended order.
+Date: 2026-08-19. Status: seven commits landed, in depth estimation, reporting, the marker dump and the
+module's first registered test. Nothing in the emission, the scorer or the band logic has been touched
+and no default has changed. Verified defects V1 (index omissions) and V8 (hard-coded clump window) are
+closed. Sections 1 to 7 are the record of the verification pass and the first experiment; section 8 is
+the live detail; section 9 is the summary and the recommended order. The seed run is pre-registered in
+`genotype-seed-preregistration.md` and has not been started.
 
 Inputs to this report: an external defect review of `panvar genotype`, an accompanying redesign
 specification, and a proof-of-concept script (`experiments/multiplicity_genotyper_poc.py`) proposing a
@@ -864,7 +866,30 @@ analysed: a block-adjusted, spline-position-adjusted slope of `count_per_copy` o
 rule and the failure reading fixed in advance, and reproducibility judged from the distribution of the
 per-seed slope rather than from marker-level p-values.
 
-### 8.14 Not started
+### 8.14 Contract corrections found in the previous round's own work
+
+Four defects in the fixes themselves, all raised in review.
+
+**The GQ parity assertion did not compare GQ.** It cut columns 1 to 12 while GQ is column 13, so it
+compared `hap_posterior` under a message claiming GQ was included. The whole file is compared now, and
+it is byte-identical between routes.
+
+**An indexed run could still mix fragment lengths.** The index records the length its clumps were built
+at, but the emission was assembled from the runtime value, so an index built at 1400 and run at the
+default took its clumps from one and every other term from the other. `--fragment-len` is now inherited
+from the index when unspecified and refused when it contradicts, both asserted.
+
+**The 350-versus-1400 clump check was run by hand**, not registered. It is an assertion now.
+
+**A double bypass was treated as unknown dosage.** When neither truth haplotype traverses a block, the
+dosage is a known zero, and calling it unknown discards the one case where a marker's absence is the
+informative observation.
+
+**Truth positions pooled raw coordinates from two sequences of different lengths.** At an array those
+differ by tens of kilobases, so a pooled raw offset correlates with copy number rather than with
+location. Occurrences are normalized within their own sequence to [0,1] before pooling.
+
+### 8.15 Not started
 
 A negative binomial or robust weighted estimator, now understood to require marker-specific efficiency
 rather than a change of likelihood family. Tests: there is still no registered `genotype_stats.sh`, and
@@ -877,7 +902,7 @@ of section 7.6 are untouched, as are both oracles.
 The `--explain-pair` and `--deconvolve` diagnostic paths request the historical median explicitly; that
 needs to be either deliberate and labelled, or changed.
 
-### 8.15 Agreed plan before the default moves
+### 8.16 Agreed plan before the default moves
 
 Retain `--depth-estimator mean` as the leading experimental mode, default unchanged. Then: 50 to 100
 seeds on the fixed lpa pair; lower depths and higher error rates so the saturated ladder becomes
@@ -886,7 +911,7 @@ fragment-level bootstrap rather than from five draws; several real loci, then at
 sequencing library with an external single-copy depth control. The default does not move until a
 registered genotype regression test exists and the real-library distribution checks have been run.
 
-### 8.16 Open questions
+### 8.17 Open questions
 
 **The cliff's replacement constant.** 200 pseudo-anchors is arbitrary. Should the shrinkage precision
 be estimated from within-block and between-block variability instead, and is there enough data per
@@ -916,7 +941,9 @@ untested here.
 | `6c01d4c` | `--dump-anchors`, and the distributional checks it makes possible |
 | `fdc8b3d` | `genotype_stats.sh`, the module's first registered test: 30 assertions, verified to fail against the pre-fix build |
 | `d0e012c` | `--dump-markers` over every marker with dosage, position and clump; anchor `expected` fixed |
-| pending | dosage from the truth sequences, so a held-out array is measurable at all |
+| `3b7500f` | dosage from the truth sequences, so a held-out array is measurable at all; anchor and zero-dosage contracts fixed |
+| `ae0da53` | `--fragment-len` reaches marker clumping (V8); index v5 carries `marker_clumps`, `node_first_pos`, `all_kmers` and the construction fragment length (V1) |
+| `<this>` | GQ actually compared; index fragment-length inherited or refused; double-bypass and normalized truth positions |
 
 **No default option changed. One intended default-path consistency fix can change output slightly:**
 commit `7d9bd65` alters the default median path for every block with 1 to 19 anchors, whose anchors now
@@ -967,9 +994,10 @@ Extending it to informative markers is necessary and not sufficient. Without per
 array markers carrying twenty copies would be compared against single-copy anchors and efficiency would
 be confounded with dosage.
 
-**Resolved since this was written.** `genotype_stats.sh` is registered with 32 assertions and the dump
-covers every marker. What remains blocking the default is replication: one seed, one locus, and the
-tail at the array described in 8.12 is uncharacterized.
+**Resolved.** `genotype_stats.sh` is registered with 37 assertions, verified to fail against the
+pre-fix build, and the dump covers every marker with dosage, position and clump. V1 and V8 are closed.
+What blocks the default now is replication, not machinery: one seed, one locus, and the tail at the
+array described in 8.12 is uncharacterized. The seed run is pre-registered and not yet started.
 
 ### 9.4 A pattern in this pass worth recording
 
@@ -986,19 +1014,14 @@ dependence, so it was the stratification and not the formal test that did the wo
 
 ### 9.5 Recommended order
 
-1. **Write and register `genotype_stats.sh`**, either first or in the same commit as the dump
-   extension. Assertions: a zero-anchor block reporting NA with REGION_FALLBACK; a shrunk block whose
-   raw and fitted values differ by the expected coefficient; the audit carrying the final joint depth
-   rather than the first-pass value; direct and indexed runs honouring the same estimator; continuous
-   behaviour across 19, 20 and 21 anchors.
-2. **Fix the anchor `expected` field and extend the dump** to informative markers, with truth
-   multiplicity, position and clump membership, so efficiency can be separated from dosage.
-3. **Repeat the GC slope over 50 to 100 seeds**, fitted within block and position rather than pooled,
-   to establish whether the association reproduces at all.
+1. ~~Write and register `genotype_stats.sh`~~ **done**, `fdc8b3d`, now 37 assertions.
+2. ~~Fix the anchor `expected` field and extend the dump~~ **done**, `d0e012c` and `3b7500f`.
+3. **Run the pre-registered seed experiment.** Ready to start; the model, inclusion rule, spline,
+   weighting, pooling, decision rule and practical co-primary are fixed in
+   `genotype-seed-preregistration.md`.
 4. **Lower-depth and higher-error ladders**, so the saturated synthetic ladder becomes discriminative.
-5. **Fit a cross-validated efficiency model**, of the form
-   `y_k ~ NB(lambda * q(GC_k, position, clump) * m_k + b_k, phi)`, and test whether it improves
-   held-out mass and copy-number accuracy and calibration.
+5. **Fit a cross-validated efficiency model** and test whether it improves held-out mass and
+   copy-number accuracy and calibration.
 6. Only then reconsider the default.
 
 The certified nearest-pair oracle and the ideal-multiplicity oracle remain ahead of any solver work and

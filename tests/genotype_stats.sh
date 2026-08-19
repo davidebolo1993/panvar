@@ -167,18 +167,44 @@ if [ -s "$OUT/idx.bin" ]; then
       || bad "indexed lambda $(dep "$OUT/viaidx.reads.depth.tsv" 1 lambda_hap) != direct $(dep "$OUT/direct.reads.depth.tsv" 1 lambda_hap)"
     # marker_clumps was not serialized, so an indexed run fell back to span/fragment_len for its
     # effective sample size and produced a different GQ from the same reads and the same calls. That is
-    # the symptom the index defect actually presented as, so GQ is what has to match.
-    if diff <(cut -f1-12 "$OUT/direct.genotypes.tsv") <(cut -f1-12 "$OUT/viaidx.genotypes.tsv") >/dev/null 2>&1; then
-      ok "indexed and direct genotypes agree row for row, GQ included"
+    # the symptom the index defect actually presented as, so GQ is what has to match. Compare the WHOLE
+    # file: a first version of this cut columns 1-12 and claimed to include GQ, which is column 13.
+    if diff "$OUT/direct.genotypes.tsv" "$OUT/viaidx.genotypes.tsv" >/dev/null 2>&1; then
+      ok "indexed and direct genotype files are byte-identical, GQ included"
     else
-      bad "indexed and direct genotype rows differ (marker_clumps or another panel field is not serialized)"
+      bad "indexed and direct genotype files differ (a panel field is not serialized)"
     fi
+    # An index carries the fragment length its clumps were built at. Running at a different one would
+    # mix the two: clumps from the index, every other emission term from the caller.
+    "$BIN" genotype --index "$OUT/idx.bin" -o "$OUT/fl_bad" -R "$OUT/skew.fa" \
+      --depth-model median --fragment-len 1400 -q >"$OUT/fl_bad.log" 2>&1
+    grep -qi "index was built at" "$OUT/fl_bad.log" \
+      && ok "an index refuses a --fragment-len it was not built at" \
+      || bad "an index accepted a conflicting --fragment-len, mixing two clump definitions"
+    "$BIN" genotype --index "$OUT/idx.bin" -o "$OUT/fl_ok" -R "$OUT/skew.fa" \
+      --depth-model median -q >/dev/null 2>&1
+    [ -s "$OUT/fl_ok.genotypes.tsv" ] \
+      && ok "an index run without --fragment-len inherits the length it was built at" \
+      || bad "an index run without --fragment-len failed"
   else
     bad "indexed or direct run produced no depth audit"
   fi
 else
   bad "--build-index wrote no index"
 fi
+
+# ------------------------------------------------ --fragment-len reaches the clumping, not just the GQ
+# The clump count IS the effective sample size the emission divides by, and it was computed at a
+# hard-coded 350 while the flag reached only the emission. A longer fragment must merge clumps.
+for FL in 350 1400; do
+  "$BIN" genotype -i "$OUT/g.gfa" -b "$OUT/bub" -r ref -o "$OUT/fl$FL" -R "$OUT/reads.fa" \
+    --depth-model median --fragment-len "$FL" --dump-markers "$OUT/fl$FL.tsv" -q >/dev/null 2>&1
+done
+c350=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}{c[$(h["clump"])]=1} END{print length(c)}' "$OUT/fl350.tsv")
+c1400=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}{c[$(h["clump"])]=1} END{print length(c)}' "$OUT/fl1400.tsv")
+[ "$c350" -gt "$c1400" ] \
+  && ok "--fragment-len reaches marker clumping (350 -> $c350 clumps, 1400 -> $c1400)" \
+  || bad "clump count did not fall with a longer fragment ($c350 vs $c1400): the flag is not reaching it"
 
 # ---------------------------------------------------- the marker dump separates dosage from efficiency
 "$BIN" genotype -i "$OUT/g.gfa" -b "$OUT/bub" -r ref -o "$OUT/dump" -R "$OUT/reads.fa" \
