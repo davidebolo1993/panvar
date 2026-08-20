@@ -1080,12 +1080,18 @@ pair under a header that said otherwise; it accumulates now.
 ### 8.18 Not started
 
 A negative binomial or robust weighted estimator, now understood to require marker-specific efficiency
-rather than a change of likelihood family. Tests: there is still no registered `genotype_stats.sh`, and
-neither depth commit added one. The needed assertions are a zero-anchor block reporting NA with
-REGION_FALLBACK, a shrunk block whose raw and fitted values differ by the expected coefficient, the
-audit carrying the final joint depth rather than the first-pass value, direct and indexed runs
-honouring the same estimator, and continuous behaviour across 19, 20 and 21 anchors. Items 3 through 7
-of section 7.6 are untouched, as are both oracles.
+rather than a change of likelihood family, and deprioritised because the 50-seed experiment found no
+efficiency signal to correct. `genotype_stats.sh` is registered as of `fdc8b3d` and carries 39
+assertions covering the zero-anchor NA contract, the shrinkage coefficient, the audit reflecting the
+final joint depth, direct-versus-indexed parity including GQ and both non-default fragment lengths, the
+dosage contracts, and the cliff removal. **Both oracles remain unstarted and are the next work.**
+
+A methodological item raised in review and not yet done: the "one block is noise" rule used for the
+depth ladder was declared in advance but never justified empirically. The two estimator arms see
+identical reads, so the comparison is PAIRED and a one-block difference may be real rather than draw
+noise. Establishing that needs the low-depth ladder repeated over several seeds with the paired
+differences analysed, which would also give the HOLD verdict a proper interval instead of a rule of
+thumb.
 
 The `--explain-pair` and `--deconvolve` diagnostic paths request the historical median explicitly; that
 needs to be either deliberate and labelled, or changed.
