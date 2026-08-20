@@ -1006,7 +1006,56 @@ control remains untouched by this experiment.
 The fifty per-seed values are committed as `experiments/genotype_seed_slopes.tsv` rather than existing
 only as console output.
 
-### 8.17 Not started
+### 8.17 The depth ladder: the fixture was trivial, and the estimator is neutral
+
+Run against a criterion fixed in the script before any result existed -- flip, hold, or revert -- with
+noise defined in advance as a one-block difference on one case at one depth.
+
+**First finding, and it is about the harness rather than the estimator.** At 30x, 10x and 5x, with
+exact twins retained, every case scored 36/36 blocks and 16/16 bubbles under both estimators. Read
+counts confirmed depth reached the simulator (5,035 / 1,677 / 838 reads), so the ladder genuinely
+scores perfectly at 2.5x per haplotype. The reason is defect V15: the generator emits each design twice
+as an EXACT twin, so holding out a sample leaves an identical haplotype in the panel and leave-one-out
+has a perfectly representable answer that barely needs coverage to find.
+
+**The ladder was never saturated by generous depth. It was saturated because the task is trivial**, and
+no reduction in depth can make a trivial task discriminate. Every ladder figure in this project's
+history was measured in that regime, including the 36/36 results quoted as validation for the
+paralogous, segdup and folded-consensus fixes. Those remain valid as evidence that the fixes break
+nothing. They were never evidence that the model performs well off-panel, and the earlier observation
+that routing "never loses and never gains" reads differently once it is clear the ladder could express
+neither.
+
+**With `--twin-divergence 40`, leave-one-out becomes an off-panel test and behaves like one.**
+Leave-zero-out stays 36/36 everywhere, correctly, since the answer is still in the panel.
+
+| case | 30x | 10x | 5x |
+|---|---|---|---|
+| clean | 14/16 | 14/16 | 11/16 |
+| paralogous | 13/16 | 11/16 | 11/16 |
+| segdup | 15/16 | 14/16 | 12 to 13/16 |
+| folded | 12/16 | 11 to 12/16 | 11/16 |
+| per-design-vntr | 16/16 | 14/16 | 13/16 |
+
+**Second finding: the estimator is neutral even where it should matter most.** 28 of 30 cells are
+identical. The two that differ are one block each and in opposite directions -- folded at 10x has
+median 12 against mean 11, segdup at 5x has median 12 against mean 13 -- so both fall under the noise
+definition fixed in advance, and neither reproduces across depths or cases.
+
+The lattice argument predicted this was where the mean should help: one median step is about 4 percent
+of lambda at 30x and roughly 25 percent at 5x. It does not.
+
+**Verdict: HOLD. The default stays `median`.** The case for the mean now rests entirely on theory --
+Fisher consistency for the expected count, the impossibility of a median of integers expressing a value
+between half-integers, and agreement with an independently derived simulation value to 0.07 percent.
+That is a real argument and it is not what this sweep was run to provide. Three empirical tests have
+now been neutral: the 30x ladder, cyp2d6, and this.
+
+**Recommendation carried forward:** `--twin-divergence` should become the harness default rather than
+an option a caller can omit, since with it omitted the principal off-panel test is not off-panel. That
+is the V15 fix and it changes what every future ladder number means.
+
+### 8.18 Not started
 
 A negative binomial or robust weighted estimator, now understood to require marker-specific efficiency
 rather than a change of likelihood family. Tests: there is still no registered `genotype_stats.sh`, and
@@ -1019,7 +1068,7 @@ of section 7.6 are untouched, as are both oracles.
 The `--explain-pair` and `--deconvolve` diagnostic paths request the historical median explicitly; that
 needs to be either deliberate and labelled, or changed.
 
-### 8.18 Agreed plan before the default moves
+### 8.19 Agreed plan before the default moves
 
 Retain `--depth-estimator mean` as the leading experimental mode, default unchanged. Then: 50 to 100
 seeds on the fixed lpa pair; lower depths and higher error rates so the saturated ladder becomes
@@ -1028,7 +1077,7 @@ fragment-level bootstrap rather than from five draws; several real loci, then at
 sequencing library with an external single-copy depth control. The default does not move until a
 registered genotype regression test exists and the real-library distribution checks have been run.
 
-### 8.19 Open questions
+### 8.20 Open questions
 
 **The cliff's replacement constant.** 200 pseudo-anchors is arbitrary. Should the shrinkage precision
 be estimated from within-block and between-block variability instead, and is there enough data per
@@ -1137,7 +1186,9 @@ dependence, so it was the stratification and not the formal test that did the wo
 2. ~~Fix the anchor `expected` field and extend the dump~~ **done**, `d0e012c` and `3b7500f`.
 3. ~~Run the pre-registered seed experiment~~ **done**; negative, see section 8.16. The GC line is
    closed for simulated data.
-4. **Lower-depth and higher-error ladders**, so the saturated synthetic ladder becomes discriminative.
+4. ~~Lower-depth ladders~~ **done**, section 8.17: the ladder was trivial rather than saturated, and
+   with diverged twins it discriminates while the estimator remains neutral. Higher error rates
+   untested.
 5. **Fit a cross-validated efficiency model** and test whether it improves held-out mass and
    copy-number accuracy and calibration.
 6. Only then reconsider the default.
