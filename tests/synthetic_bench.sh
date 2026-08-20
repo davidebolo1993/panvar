@@ -81,7 +81,7 @@ fi
 
 echo
 echo "== genotype: leave-zero-out then leave-one-out =="
-printf '%-22s %-28s %-28s\n' "sample" "leave-zero-out" "leave-one-out (twins kept)"
+printf '%-22s %-28s %-28s\n' "sample" "leave-zero-out" "leave-one-out (off-panel)"
 NAMES=()
 while IFS= read -r l; do NAMES+=("$l"); done < <(awk -F'\t' 'NR>1{print $1}' "$OUT/truth.haplotypes.tsv")
 N=${#NAMES[@]}
@@ -93,10 +93,16 @@ for ((p=0; p<PAIRS; p++)); do
   H1="${NAMES[$i]}"; H2="${NAMES[$j]}"
   F1="$OUT/hap_${H1/\#/_}.fa"; F2="$OUT/hap_${H2/\#/_}.fa"
   rm -f "$OUT/r_1.fq" "$OUT/r_2.fq"
+  hidx=0
   for f in "$F1" "$F2"; do
     L=$(awk 'NR>1{n+=length($0)} END{print n}' "$f")
+    # A distinct seed per homologue. Sharing one makes their coverage fluctuations identical, which is
+    # the one thing a diploid simulation must not do: it removes exactly the per-haplotype depth noise
+    # that decides heterozygous from homozygous. genotype_sim.sh was fixed for this long ago; this
+    # harness was not (defect V14), so every absolute ladder figure predates the fix.
+    hseed=$((SEED + p*97 + hidx)); hidx=$((hidx+1))
     wgsim -N $(( DEPTH * L / 2 / 300 )) -1 150 -2 150 -d 350 -s 50 -e "$ERR" -r 0 -R 0 -X 0 \
-      -S $((SEED + p)) "$f" "$OUT/a_1.fq" "$OUT/a_2.fq" >/dev/null 2>&1
+      -S "$hseed" "$f" "$OUT/a_1.fq" "$OUT/a_2.fq" >/dev/null 2>&1
     cat "$OUT/a_1.fq" >> "$OUT/r_1.fq"; cat "$OUT/a_2.fq" >> "$OUT/r_2.fq"
   done
   gzip -f "$OUT/r_1.fq" "$OUT/r_2.fq"
@@ -110,6 +116,11 @@ for ((p=0; p<PAIRS; p++)); do
 
   LZ=$(parse "$(run "" "$OUT/gt_lz")")
   LO=$(parse "$(run "--exclude-haplotypes $H1,$H2" "$OUT/gt_lo")")
+  # Accumulate before the next pair overwrites it; the summary below reads every pair, not the last.
+  if [[ -s "$OUT/gt_lo.accuracy.tsv" ]]; then
+    [[ -s "$OUT/gt_lo.accuracy.all.tsv" ]] || head -1 "$OUT/gt_lo.accuracy.tsv" > "$OUT/gt_lo.accuracy.all.tsv"
+    tail -n +2 "$OUT/gt_lo.accuracy.tsv" >> "$OUT/gt_lo.accuracy.all.tsv"
+  fi
   read -r a b c d <<<"$LZ"; read -r e f g h <<<"$LO"
   lz_ok=$((lz_ok+a)); lz_tot=$((lz_tot+b)); lzb_ok=$((lzb_ok+c)); lzb_tot=$((lzb_tot+d))
   lo_ok=$((lo_ok+e)); lo_tot=$((lo_tot+f)); lob_ok=$((lob_ok+g)); lob_tot=$((lob_tot+h))
@@ -121,7 +132,11 @@ echo
 echo "TOTAL leave-zero-out: blocks $lz_ok/$lz_tot, bubbles $lzb_ok/$lzb_tot"
 echo "TOTAL leave-one-out : blocks $lo_ok/$lo_tot, bubbles $lob_ok/$lob_tot"
 echo "(leave-zero-out should be 100%: the sample's haplotypes are in the panel, so anything short is a"
-echo " bug. leave-one-out should NOT be: with diverged twins it is a genuine off-panel measurement.)"
+echo " bug. leave-one-out is NOT guaranteed to be: with diverged twins it is an off-panel measurement,"
+echo " and a better genotyper may legitimately reach 100% there.)"
+echo "(--twin-divergence perturbs SNP sites only, so twins still SHARE every structural bubble allele."
+echo " The exact score therefore measures known bubble alleles on an unseen background; the ORACLE line"
+echo " below is the nearest-available-allele measurement over every block.)"
 
 # With --twin-divergence the sample's allele may be absent from the panel, so exact match is the wrong
 # test: the right answer is the most similar allele available. The identity oracle answers that
@@ -149,12 +164,19 @@ if [[ -s "$OUT/hap_mosaic0.fa" && -s "$OUT/hap_mosaic1.fa" ]]; then
     "$OUT/gt_mo.genotypes.tsv"
 fi
 
-if [[ -s "$OUT/gt_lo.accuracy.tsv" ]]; then
-  awk -F'\t' 'NR>1 && $14 > 0 && $15 > 0 {
+# Every held-out pair, not the last one. `gt_lo.accuracy.tsv` is rewritten at the same prefix on each
+# iteration, so reading it after the loop reported ONE pair under a header that said otherwise.
+#
+# The two numbers answer different questions and both matter. The exact-allele score above counts only
+# blocks whose truth allele is in the panel, so it measures genotyping of representable alleles. This
+# one asks whether, over EVERY block, the call is the most similar allele available -- which is the
+# behaviour the real-data problem is about, and which can be much worse than the exact score suggests.
+if [[ -s "$OUT/gt_lo.accuracy.all.tsv" ]]; then
+  awk -F'\t' -v PAIRS="$PAIRS" 'FNR>1 && $14 > 0 && $15 > 0 {
       n += 2; if ($14 == 1) k++; if ($15 == 1) k++
       if ($10 > 0) { gap += $10 - ($12 + $13) / 2; g++ }
     } END {
-      if (n) printf "ORACLE (last pair): picked the most similar available allele in %d/%d haplotype-blocks (%.0f%%)\n", k, n, 100*k/n
-      if (g) printf "                    mean identity shortfall against the best available: %.6f\n", gap/g
-    }' "$OUT/gt_lo.accuracy.tsv"
+      if (n) printf "ORACLE (all %d pairs): picked the most similar available allele in %d/%d haplotype-blocks (%.0f%%)\n", PAIRS, k, n, 100*k/n
+      if (g) printf "                       mean identity shortfall against the best available: %.6f\n", gap/g
+    }' "$OUT/gt_lo.accuracy.all.tsv"
 fi

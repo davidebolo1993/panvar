@@ -997,7 +997,8 @@ lattice argument that a median of integers cannot express a value between half-i
 depended on GC.
 
 **What is closed, stated at its actual scope.** Marker-specific efficiency is **not supported as an
-explanation for the array residual in this 30x lpa wgsim fixture**. That is narrower than "closed for
+explanation for the array residual in this one fixture: lpa, one genotype pair, 30x, one error rate,
+and a simulator with no GC-selection mechanism to detect**. That is narrower than "closed for
 simulated data" and much narrower than closed: one locus, one genotype pair, one depth, one error rate,
 and a simulator with no GC-selection mechanism to detect. A real library, a different depth, or a
 different locus could all reopen it, and the real-library check with an external single-copy depth
@@ -1051,9 +1052,30 @@ between half-integers, and agreement with an independently derived simulation va
 That is a real argument and it is not what this sweep was run to provide. Three empirical tests have
 now been neutral: the 30x ladder, cyp2d6, and this.
 
-**Recommendation carried forward:** `--twin-divergence` should become the harness default rather than
-an option a caller can omit, since with it omitted the principal off-panel test is not off-panel. That
-is the V15 fix and it changes what every future ladder number means.
+**Done in `8d15ef3`:** `--twin-divergence` is the harness default at 40 SNPs, with `TWIN_DIVERGENCE=0`
+retained as the exact-representation regression mode so figures measured under the old default remain
+reproducible by asking for them.
+
+**But the divergence is narrower than it sounds, and the ladder numbers above must be read
+accordingly.** `--twin-divergence` perturbs SNP sites only. Every SV site pushes both `#a` and `#b`
+onto the same node, so **twins still share every structural bubble allele**. Holding out a haplotype
+therefore removes an identical whole haplotype while leaving the bubble alleles in the panel, and the
+exact-allele check skips any block whose truth allele is absent. The 11 to 16 of 16 figures measure
+genotyping of KNOWN bubble alleles on an unseen haplotype background. That is a real and useful test.
+It is not nearest-haplotype accuracy, and the earlier description of it as "a genuine off-panel test"
+was too strong.
+
+Measured on the same run, the two endpoints diverge: bubbles score 14/16 exact, 88 percent, while the
+call is the most similar AVAILABLE allele in only 55 of 72 haplotype-blocks, 76 percent, with a mean
+identity shortfall of 0.004663. The exact score overstates the behaviour the real-data problem is
+about.
+
+Two harness defects were fixed alongside. Both homologues shared one wgsim seed (defect V14), making
+their coverage fluctuations identical and removing exactly the per-haplotype depth noise that decides
+heterozygous from homozygous; `genotype_sim.sh` was fixed for this long ago and this harness was not,
+so every absolute ladder figure in this report predates the fix. And the oracle summary read
+`gt_lo.accuracy.tsv` after the pair loop, where each pair had overwritten the last, so it reported ONE
+pair under a header that said otherwise; it accumulates now.
 
 ### 8.18 Not started
 
@@ -1185,7 +1207,7 @@ dependence, so it was the stratification and not the formal test that did the wo
 1. ~~Write and register `genotype_stats.sh`~~ **done**, `fdc8b3d`, now 37 assertions.
 2. ~~Fix the anchor `expected` field and extend the dump~~ **done**, `d0e012c` and `3b7500f`.
 3. ~~Run the pre-registered seed experiment~~ **done**; negative, see section 8.16. The GC line is
-   closed for simulated data.
+   not supported in this fixture; see the scope statement in section 8.16.
 4. ~~Lower-depth ladders~~ **done**, section 8.17: the ladder was trivial rather than saturated, and
    with diverged twins it discriminates while the estimator remains neutral. Higher error rates
    untested.
