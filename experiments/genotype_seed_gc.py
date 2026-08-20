@@ -114,12 +114,18 @@ def fit_seed(path):
     beta_w = poisson_irls(Xw, y * np.sqrt(m), off)[0][0]
 
     # Secondary: anchors alone, where multiplicity is 1 by construction.
+    # Anchors alone, where multiplicity is 1 by construction. The row set must be restricted to the
+    # blocks that are actually modelled: a row in a block with no intercept and no spline has its whole
+    # count level pushed onto the shared GC coefficient. 336 such rows of 19,330 -- 1.7 percent -- moved
+    # this estimate from +0.037 to +0.461, a factor of twelve, and made it look like a large effect
+    # reproducing in every seed.
     anc = cls == "anchor"
     ablocks = [b for b in np.unique(blk[anc]) if (blk[anc] == b).sum() >= MIN_PER_BLOCK]
     beta_a = np.nan
     if ablocks:
-        Xa, _ = design(blk[anc], gc[anc], u[anc], ablocks)
-        beta_a = poisson_irls(Xa, y[anc], off[anc])[0][0]
+        sel = anc & np.isin(blk, ablocks)
+        Xa, _ = design(blk[sel], gc[sel], u[sel], ablocks)
+        beta_a = poisson_irls(Xa, y[sel], off[sel])[0][0]
 
     # Secondary: per-block slopes, fitted separately.
     per_block = {}

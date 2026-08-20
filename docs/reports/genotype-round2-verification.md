@@ -923,7 +923,58 @@ ten times the weight of a single-copy anchor and a single shared slope is domina
 That is recorded in the pre-registration and the primary is deliberately not changed on the strength of
 it.
 
-### 8.16 Not started
+### 8.16 CONFIRMATORY RESULT: the GC association does not reproduce
+
+50 seeds, `k = 5..54`, analysed exactly as pre-registered. The exploratory five are excluded.
+
+    PRIMARY   mean beta -0.00641   95% t [-0.01450, +0.00167]   positive in 16 of 50
+              -> no reproducible positive effect demonstrated in this wgsim experiment
+
+    CO-PRIMARY  predicted lambda bias -0.00278, ratio 0.11 of the 0.025 half-width
+
+    SECONDARY   anchor-only beta   +0.00282
+                weighted refit     -0.00442
+                per-block fits     356 of 750 positive (47.5 percent, a coin flip)
+                block 13 excess    mean +0.20 percent, median +0.15 percent
+
+Every estimator agrees at zero: pooled, multiplicity-weighted, anchors alone, and per block. The
+pre-registered decision rule required the interval to exclude zero and at least 45 of 50 seeds
+positive. Neither holds, and the slope is positive in under a third of draws.
+
+One seed, k=46, hit the iteration cap at full rank. Its slope sits at z = +0.04 of the distribution and
+excluding it changes nothing: mean -0.00644, 16 of 49 positive, interval still spanning zero.
+
+**Two earlier findings of this report are withdrawn as single-draw artifacts.**
+
+Section 8.10's GC-associated marker efficiency does not reproduce. It was one read draw, and across 50
+the slope is centred slightly below zero.
+
+Section 8.12's array per-copy excess does not reproduce. On seed 42 the array read 1.39 percent above
+the anchors per copy; across 50 seeds it reads **0.20 percent**, and the median excess is 0.15 percent
+rather than the 0.03 percent that seed suggested. The mean-versus-median gap that seemed to indicate a
+right tail was itself a property of that draw. The consequence drawn from it -- that a mean-based
+lambda would follow an array tail a median-based one would not -- has no support and is withdrawn.
+
+**A bug in the analysis, found before the result was reported rather than after.** The anchor-only
+secondary first read +0.327, positive in 50 of 50 seeds, which contradicted every per-block fit
+including the array's own -0.017. Pooling with block intercepts cannot exceed its constituents, so the
+estimate was wrong rather than interesting: 336 anchor rows of 19,330 belonged to blocks below the
+200-anchor threshold and therefore had no intercept and no spline, so their entire count level was
+absorbed by the shared GC coefficient. Restricting to modelled blocks, as the primary already did,
+moves it from +0.4605 to +0.0367 on that seed and to +0.00282 across the 50. **1.7 percent of the rows
+were driving the coefficient by a factor of twelve.**
+
+That also disposes of the note added to the pre-registration from the exploratory seeds, which
+attributed the anchor-versus-pooled gap to Poisson weighting by the mean. The mechanism was wrong; the
+gap was the orphaned rows.
+
+**What survives.** The depth-estimator work rests on evidence independent of any of this: agreement
+with simulation theory to 0.07 percent, the ladder null across eight cases, the cyp2d6 null, and the
+lattice argument that a median of integers cannot express a value between half-integers. None of it
+depended on GC. What is closed is the marker-efficiency line as a candidate explanation for the array
+residual, at least in simulated data where no GC-selection mechanism exists.
+
+### 8.17 Not started
 
 A negative binomial or robust weighted estimator, now understood to require marker-specific efficiency
 rather than a change of likelihood family. Tests: there is still no registered `genotype_stats.sh`, and
@@ -936,7 +987,7 @@ of section 7.6 are untouched, as are both oracles.
 The `--explain-pair` and `--deconvolve` diagnostic paths request the historical median explicitly; that
 needs to be either deliberate and labelled, or changed.
 
-### 8.17 Agreed plan before the default moves
+### 8.18 Agreed plan before the default moves
 
 Retain `--depth-estimator mean` as the leading experimental mode, default unchanged. Then: 50 to 100
 seeds on the fixed lpa pair; lower depths and higher error rates so the saturated ladder becomes
@@ -945,7 +996,7 @@ fragment-level bootstrap rather than from five draws; several real loci, then at
 sequencing library with an external single-copy depth control. The default does not move until a
 registered genotype regression test exists and the real-library distribution checks have been run.
 
-### 8.18 Open questions
+### 8.19 Open questions
 
 **The cliff's replacement constant.** 200 pseudo-anchors is arbitrary. Should the shrinkage precision
 be estimated from within-block and between-block variability instead, and is there enough data per
@@ -1007,10 +1058,11 @@ The extreme-bin difference is about eight times the width of the lambda window, 
 right, but an extreme-bin difference from one seed is not a stable effect size and should not be
 quoted as one.
 
-**The supportable statement is that marker-specific efficiency is now the highest-priority hypothesis
-to test.** It independently motivates the same class of correction that danbing-tk applies; it does not
-reproduce their result, because nothing here yet shows that correcting the association improves
-copy-number or genotype accuracy.
+**Tested and not reproduced.** The pre-registered 50-seed experiment in section 8.16 returns a mean
+slope of -0.00641, positive in 16 of 50 draws, with anchors, weighted and per-block estimators all at
+zero. The association was a property of one read draw. Marker-specific efficiency is not the
+explanation for the array residual in this fixture, and the array per-copy excess reported in 8.12 does
+not reproduce either.
 
 Recording plainly that section 9.4 below is a lesson this section had already broken when it was
 written: an anchor-only, single-seed association was used to support a claim about the dominant bias in
@@ -1051,9 +1103,8 @@ dependence, so it was the stratification and not the formal test that did the wo
 
 1. ~~Write and register `genotype_stats.sh`~~ **done**, `fdc8b3d`, now 37 assertions.
 2. ~~Fix the anchor `expected` field and extend the dump~~ **done**, `d0e012c` and `3b7500f`.
-3. **Run the pre-registered seed experiment.** Ready to start; the model, inclusion rule, spline,
-   weighting, pooling, decision rule and practical co-primary are fixed in
-   `genotype-seed-preregistration.md`.
+3. ~~Run the pre-registered seed experiment~~ **done**; negative, see section 8.16. The GC line is
+   closed for simulated data.
 4. **Lower-depth and higher-error ladders**, so the saturated synthetic ladder becomes discriminative.
 5. **Fit a cross-validated efficiency model** and test whether it improves held-out mass and
    copy-number accuracy and calibration.
