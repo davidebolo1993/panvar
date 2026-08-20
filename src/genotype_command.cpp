@@ -221,6 +221,9 @@ int run_genotype_command(const std::vector<std::string>& args) {
     double mass_weight = 0.0;
     bool nearest_rank = false;
     bool oracle_rank = false;
+    bool certified_oracle = false;
+    std::size_t certified_oracle_max = 1024;
+    long certified_oracle_block = -1;
     std::string explain_pair;
     double marker_outlier = 0.0;
     bool restore_stripped = false;
@@ -293,6 +296,11 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--mass-weight") mass_weight = std::stod(require_value(arg));
         else if (arg == "--nearest-emission-rank") nearest_rank = true;
         else if (arg == "--oracle-emission-rank") oracle_rank = true;
+        else if (arg == "--certified-oracle") certified_oracle = true;
+        else if (arg == "--certified-oracle-block")
+            certified_oracle_block = std::stol(require_value(arg));
+        else if (arg == "--certified-oracle-max-alleles")
+            certified_oracle_max = static_cast<std::size_t>(std::stoul(require_value(arg)));
         else if (arg == "--explain-pair") explain_pair = require_value(arg);
         else if (arg == "--marker-outlier") marker_outlier = std::stod(require_value(arg));
         else if (arg == "--restore-stripped-alleles") restore_stripped = true;
@@ -1502,6 +1510,119 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 // Reported alongside is the best any panel allele could have achieved. Without it the
                 // metric flatters: at a block whose alleles are all but identical, any pick scores
                 // high, and the number would say more about the block than about the caller.
+                // ---- certified nearest-pair oracle -------------------------------------------
+                // The existing oracle shortlists by syncmer-set Jaccard and aligns only the top 16, so
+                // it certifies nothing: Jaccard is order- and multiplicity-blind, which is exactly
+                // wrong at a tandem array. This one is exact and costs 2A alignments rather than
+                // A(A+1)/2 pairs -- cache each allele against each truth haplotype, then every pair is
+                // read from the cache. At 457 alleles that is 914 alignments instead of 104,653.
+                //
+                // Three criteria, because they do not agree. Minimum summed edit distance is not the
+                // same ordering as maximum mean identity when the two alignments differ in length, and
+                // neither is the same as minimum length error. Whichever is reported must be the one
+                // optimised, so all three are.
+                //
+                // Per-haplotype residuals, not their sum: a summed length error of ~0 is equally
+                // consistent with both haplotypes right and with one too long by exactly what the
+                // other is too short. That distinction is the whole question of representability.
+                if (certified_oracle && !blocks.empty() && !blocks[0].allele_seq.empty()) {
+                    const std::string op = out_prefix + ".oracle.tsv";
+                    std::ofstream orc(op);
+                    if (!orc) throw std::runtime_error("genotype: cannot write " + op);
+                    orc << "block_index\tblock_kind\tbubble_id\tn_alleles\tcriterion"
+                           "\tbest_a\tbest_b\tbest_h1_id\tbest_h2_id\tbest_h1_lenerr\tbest_h2_lenerr"
+                           "\tbest_total_edits\tbest_mean_id\tn_tied"
+                           "\tcalled_a\tcalled_b\tcalled_rank\tcalled_h1_id\tcalled_h2_id"
+                           "\tcalled_h1_lenerr\tcalled_h2_lenerr\tcalled_mean_id\n";
+                    for (std::size_t bi = 0; bi < chain.size() && bi < blocks.size(); ++bi) {
+                        if (bi >= ts1.size() || (ts1[bi].empty() && ts2[bi].empty())) continue;
+                        if (certified_oracle_block >= 0 &&
+                            static_cast<long>(chain[bi].index) != certified_oracle_block) continue;
+                        const std::size_t A = blocks[bi].allele_seq.size();
+                        if (A == 0 || A > certified_oracle_max) continue;
+                        // Progress, because 2A exact alignments of whole block sequences is minutes to
+                        // hours and the output stream buffers -- an empty file says nothing about how
+                        // far it has got, which is how the first run became unobservable.
+                        log.info("certified oracle: block " + std::to_string(chain[bi].index) + ", " +
+                                 std::to_string(A) + " alleles, " + std::to_string(2 * A) + " alignments");
+                        const std::string* tv[2] = {&ts1[bi], &ts2[bi]};
+
+                        // 2A alignments, the entire cost of the exercise.
+                        std::vector<std::array<NwAlign, 2>> al(A);
+                        std::vector<std::array<long, 2>> dl(A);
+                        for (std::size_t a = 0; a < A; ++a) {
+                            for (int h = 0; h < 2; ++h) {
+                                al[a][static_cast<std::size_t>(h)] =
+                                    nw_edit_distance(blocks[bi].allele_seq[a], *tv[h]);
+                                dl[a][static_cast<std::size_t>(h)] =
+                                    static_cast<long>(blocks[bi].allele_seq[a].size()) -
+                                    static_cast<long>(tv[h]->size());
+                            }
+                        }
+                        auto ident = [&](std::size_t a, int h) {
+                            const NwAlign& n = al[a][static_cast<std::size_t>(h)];
+                            return 1.0 - static_cast<double>(n.edits) /
+                                             static_cast<double>(std::max<std::size_t>(1, n.aln_len));
+                        };
+                        // For a pair, take the better of the two haplotype assignments UNDER THE
+                        // CRITERION BEING SCORED, not under a single fixed one.
+                        struct PairScore { double v; int swap; };
+                        auto score = [&](std::size_t a, std::size_t b, int crit) -> PairScore {
+                            const double d0 = static_cast<double>(al[a][0].edits + al[b][1].edits);
+                            const double d1 = static_cast<double>(al[a][1].edits + al[b][0].edits);
+                            const double i0 = (ident(a, 0) + ident(b, 1)) / 2.0;
+                            const double i1 = (ident(a, 1) + ident(b, 0)) / 2.0;
+                            const double l0 = static_cast<double>(std::labs(dl[a][0]) + std::labs(dl[b][1]));
+                            const double l1 = static_cast<double>(std::labs(dl[a][1]) + std::labs(dl[b][0]));
+                            if (crit == 0) return d0 <= d1 ? PairScore{d0, 0} : PairScore{d1, 1};
+                            if (crit == 1) return i0 >= i1 ? PairScore{-i0, 0} : PairScore{-i1, 1};
+                            return l0 <= l1 ? PairScore{l0, 0} : PairScore{l1, 1};
+                        };
+                        const char* names[3] = {"edit_distance", "mean_identity", "length_error"};
+                        const std::size_t ca = calls[bi].allele1, cb = calls[bi].allele2;
+                        for (int crit = 0; crit < 3; ++crit) {
+                            double best = std::numeric_limits<double>::infinity();
+                            std::size_t ba = 0, bb = 0;
+                            int bswap = 0;
+                            std::size_t tied = 0;
+                            const double cval = (ca < A && cb < A) ? score(ca, cb, crit).v
+                                                                   : std::numeric_limits<double>::infinity();
+                            std::size_t rank = 1;
+                            for (std::size_t a = 0; a < A; ++a) {
+                                for (std::size_t b = a; b < A; ++b) {
+                                    const PairScore s = score(a, b, crit);
+                                    if (s.v < best - 1e-12) { best = s.v; ba = a; bb = b; bswap = s.swap; tied = 1; }
+                                    else if (s.v <= best + 1e-12) ++tied;
+                                    if (s.v < cval - 1e-12) ++rank;
+                                }
+                            }
+                            const std::size_t b1 = bswap ? bb : ba, b2 = bswap ? ba : bb;
+                            const PairScore cs = (ca < A && cb < A) ? score(ca, cb, crit) : PairScore{0, 0};
+                            const std::size_t c1 = cs.swap ? cb : ca, c2 = cs.swap ? ca : cb;
+                            orc << chain[bi].index << '\t'
+                                << (chain[bi].kind == BlockKind::Bubble ? "bubble"
+                                    : chain[bi].kind == BlockKind::Flank ? "flank" : "backbone") << '\t'
+                                << chain[bi].bubble_id << '\t' << A << '\t' << names[crit] << '\t'
+                                << ba << '\t' << bb << '\t'
+                                << ident(b1, 0) << '\t' << ident(b2, 1) << '\t'
+                                << dl[b1][0] << '\t' << dl[b2][1] << '\t'
+                                << (al[b1][0].edits + al[b2][1].edits) << '\t'
+                                << ((ident(b1, 0) + ident(b2, 1)) / 2.0) << '\t' << tied << '\t';
+                            if (ca < A && cb < A) {
+                                orc << ca << '\t' << cb << '\t' << rank << '\t'
+                                    << ident(c1, 0) << '\t' << ident(c2, 1) << '\t'
+                                    << dl[c1][0] << '\t' << dl[c2][1] << '\t'
+                                    << ((ident(c1, 0) + ident(c2, 1)) / 2.0) << '\n';
+                            } else {
+                                orc << ca << '\t' << cb << "\tNA\tNA\tNA\tNA\tNA\tNA\n";
+                            }
+                        }
+                        orc.flush();
+                    }
+                    if (!orc) throw std::runtime_error("genotype: write failed for " + op);
+                    log.wrote({op});
+                }
+
                 if (!blocks.empty() && !blocks[0].allele_seq.empty()) {
                     const std::string acc_path = out_prefix + ".accuracy.tsv";
                     std::ofstream acc(acc_path);

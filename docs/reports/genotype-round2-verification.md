@@ -1096,7 +1096,53 @@ thumb.
 The `--explain-pair` and `--deconvolve` diagnostic paths request the historical median explicitly; that
 needs to be either deliberate and labelled, or changed.
 
-### 8.19 Agreed plan before the default moves
+### 8.19 CERTIFIED NEAREST-PAIR ORACLE: the panel is adequate and the emission is not
+
+Exact, not shortlisted: every allele aligned against each truth haplotype, 914 alignments rather than
+104,653 pairs, then every pair scored from the cache under three criteria separately. lpa block 13,
+KIV-2, 457 alleles, truth 263,385 bp. 437 seconds.
+
+| | pair | identity h1 / h2 | length error h1 / h2 | tied |
+|---|---|---|---|---|
+| best by edit distance | (42, 178) | 0.99928 / 0.99436 | -1 / +44 | 1 |
+| best by mean identity | (42, 178) | 0.99928 / 0.99436 | -1 / +44 | 1 |
+| best by length error | (42, 411) | 0.99928 / 0.99064 | -1 / +17 | 1 |
+| **called** | **(53, 91)** | **0.82743 / 0.82288** | **+22,165 / -27,736** | rank **57,958** of 104,653 |
+
+**The panel can represent this sample almost exactly.** Two existing alleles reproduce the two truth
+haplotypes at 99.93 and 99.44 percent identity with length errors of 1 and 44 bases, and the optimum is
+UNIQUE -- one pair, not a tie. Representation is not the failure at KIV-2.
+
+**The emission ranks that pair 57,958th of 104,653.** Worse than the median of the pair space. This is a
+discrimination failure, not a representation failure, and it is far larger than any previous framing of
+it suggested.
+
+**Per-haplotype residuals change the size of the problem, and vindicate the correction that prompted
+them.** The called pair's length errors are +22,165 and -27,736 bases. They sum to -5,571, which is the
+figure this project has quoted for years as "one repeat unit out" -- and that sum conceals one
+haplotype 22 kb too long and the other 28 kb too short, errors four to five times larger and in
+opposite directions. A summed length metric was hiding most of the damage, exactly as warned when the
+earlier (0,392) claim was challenged for proving matching diploid mass rather than representability.
+
+**What this settles.** Of the decision table's rows, row 1 -- truth not representable by two panel
+alleles -- is answered: it is representable, uniquely and to within 44 bases. So a graph-flow model
+that synthesises novel paths would be enlarging a hypothesis space that already contains the answer,
+and on the earlier candidate-budget measurement enlarging it makes discrimination worse rather than
+better. Flow synthesis is not the fix for KIV-2.
+
+What remains open is which of the later rows applies, and the ideal-multiplicity oracle is what
+separates them: if the certified pair also loses under noiseless expected marker multiplicities, the
+feature map or likelihood is non-identifying; if it wins there and loses on reads, the failure is in
+sampling, depth, background or correlated evidence.
+
+**A caveat on the criteria.** All three agree here and each has a unique optimum, so this block does not
+exercise the disagreement between them. The synthetic fixture does: with three equal-length alleles,
+edit distance and identity both recover the true pair uniquely while length error selects the same
+allele twice and reports 6 tied. Minimum summed edit distance, maximum mean identity and minimum length
+error are different orderings, and the oracle optimises each under its own criterion rather than
+ranking one by another.
+
+### 8.20 Agreed plan before the default moves
 
 Retain `--depth-estimator mean` as the leading experimental mode, default unchanged. Then: 50 to 100
 seeds on the fixed lpa pair; lower depths and higher error rates so the saturated ladder becomes
@@ -1105,7 +1151,7 @@ fragment-level bootstrap rather than from five draws; several real loci, then at
 sequencing library with an external single-copy depth control. The default does not move until a
 registered genotype regression test exists and the real-library distribution checks have been run.
 
-### 8.20 Open questions
+### 8.21 Open questions
 
 **The cliff's replacement constant.** 200 pseudo-anchors is arbitrary. Should the shrinkage precision
 be estimated from within-block and between-block variability instead, and is there enough data per
