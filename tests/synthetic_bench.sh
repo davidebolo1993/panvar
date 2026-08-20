@@ -2,13 +2,25 @@
 # synthetic_bench.sh - end-to-end validation on a locus whose answers are known by construction.
 #
 # Real loci cannot validate this pipeline: their truth is whatever the graph encodes, so a wrong call
-# and an unrepresentable one look identical. Here every variant is planted, and every design is emitted
-# twice as an exact twin -- so holding out a sample's two haplotypes leaves its twins in the panel and
-# the expected leave-one-out accuracy is 100%. Anything short of that is a bug in panvar.
+# and an unrepresentable one look identical. Here every variant is planted.
+#
+# TWIN_DIVERGENCE defaults to 40 SNPs, NOT to 0. With exact twins, holding out a sample's two
+# haplotypes leaves an identical haplotype in the panel, so leave-one-out has a perfectly representable
+# answer and is not an off-panel test at all. Measured: with exact twins every case scores 36/36 blocks
+# and 16/16 bubbles at 30x, 10x AND 5x -- 2.5x per haplotype -- because picking an identical panel
+# haplotype barely needs coverage. The ladder was not saturated by generous depth; the task was
+# trivial, and no reduction in depth could make it discriminate.
+#
+# So leave-ZERO-out is the implementation check and should be 100%: the sample's own haplotypes are in
+# the panel and anything short of exact is a bug. Leave-ONE-out is the off-panel measurement and should
+# NOT be 100%; with 40 SNPs of divergence it runs 11-16 of 16 bubbles and degrades with depth, which is
+# the behaviour a real off-panel test has. Set TWIN_DIVERGENCE=0 to reproduce figures measured under
+# the old default, and read them knowing what they were.
 #
 #   synthetic_bench.sh [out_dir] [n_pairs] [depth] [error]
 #
-# Env: PANVAR_BIN (default build/panvar), PYTHON, SEED, GEN_EXTRA (flags for make_synthetic_locus.py),
+# Env: TWIN_DIVERGENCE (default 40; 0 restores exact twins and makes leave-one-out trivial),
+#      PANVAR_BIN (default build/panvar), PYTHON, SEED, GEN_EXTRA (flags for make_synthetic_locus.py),
 #      GENOTYPE_EXTRA (flags for `panvar genotype`), KEEP=1 to reuse an existing locus.
 set -uo pipefail
 
@@ -24,7 +36,13 @@ SEED="${SEED:-7}"
 
 mkdir -p "$OUT"
 if [[ "${KEEP:-0}" != "1" || ! -s "$OUT/graph.gfa" ]]; then
-  $PY "$REPO/scripts/make_synthetic_locus.py" -o "$OUT" --seed "$SEED" ${GEN_EXTRA:-} || exit 1
+  # Applied unless the caller already pinned it, so an explicit GEN_EXTRA still wins.
+  TWIN_FLAG=""
+  case " ${GEN_EXTRA:-} " in
+    *" --twin-divergence "*) ;;
+    *) TWIN_FLAG="--twin-divergence ${TWIN_DIVERGENCE:-40}" ;;
+  esac
+  $PY "$REPO/scripts/make_synthetic_locus.py" -o "$OUT" --seed "$SEED" $TWIN_FLAG ${GEN_EXTRA:-} || exit 1
 fi
 
 echo
@@ -102,7 +120,8 @@ done
 echo
 echo "TOTAL leave-zero-out: blocks $lz_ok/$lz_tot, bubbles $lzb_ok/$lzb_tot"
 echo "TOTAL leave-one-out : blocks $lo_ok/$lo_tot, bubbles $lob_ok/$lob_tot"
-echo "(with exact twins both should be 100% -- the panel can represent the sample exactly)"
+echo "(leave-zero-out should be 100%: the sample's haplotypes are in the panel, so anything short is a"
+echo " bug. leave-one-out should NOT be: with diverged twins it is a genuine off-panel measurement.)"
 
 # With --twin-divergence the sample's allele may be absent from the panel, so exact match is the wrong
 # test: the right answer is the most similar allele available. The identity oracle answers that
