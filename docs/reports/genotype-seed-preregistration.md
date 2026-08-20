@@ -100,7 +100,13 @@ Reported as the **ratio** to the 0.025 half-width, with no binary practical verd
 threshold for "appreciable" after seeing a 23-fold formula error would be choosing the bar to suit the
 number.
 
-**Note from the exploratory seeds, recorded rather than acted on.** Fitting `k = 0..4` showed the
+**Note from the exploratory seeds, SUPERSEDED.** The observation below rested on a defect: the
+anchor-only fit included rows from blocks that had no intercept and no spline, so 1.7 percent of the
+rows drove that coefficient by a factor of twelve. Corrected, the anchor slope is +0.0028 and the gap
+it describes does not exist, so the Poisson-weighting mechanism proposed here is not the explanation
+for anything. Retained only so the reasoning that was fixed in advance stays legible.
+
+**Original note, recorded rather than acted on.** Fitting `k = 0..4` showed the
 pooled `beta` scattering around zero (+0.030, +0.012, -0.037, -0.024, +0.019) while the anchor-only
 slope was consistently positive and an order of magnitude larger (+0.41, +0.38, +0.29, +0.30, +0.35).
 The likely reason is mechanical: Poisson IRLS weights each observation by its mean, and an array marker

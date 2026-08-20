@@ -932,17 +932,25 @@ it.
 
     CO-PRIMARY  predicted lambda bias -0.00278, ratio 0.11 of the 0.025 half-width
 
-    SECONDARY   anchor-only beta   +0.00282
-                weighted refit     -0.00442
-                per-block fits     356 of 750 positive (47.5 percent, a coin flip)
-                block 13 excess    mean +0.20 percent, median +0.15 percent
+    SECONDARY, with intervals
+      weighted refit         -0.01680   95% CI [-0.02880, -0.00479]   19 of 50
+      anchor-only            +0.00282   95% CI [-0.00850, +0.01413]   27 of 50
+      per-block fits         356 of 750 positive, 47.5 percent, a coin flip
+      block 13 mean excess   +0.203 percent  95% CI [-0.359, +0.765]  25 of 50
+      block 13 median excess +0.158 percent  95% CI [-0.244, +0.560]  25 of 50
+      mean minus median      +0.045 percent  95% CI [-0.261, +0.351]  21 of 50
 
-Every estimator agrees at zero: pooled, multiplicity-weighted, anchors alone, and per block. The
-pre-registered decision rule required the interval to exclude zero and at least 45 of 50 seeds
-positive. Neither holds, and the slope is positive in under a third of draws.
+The pre-registered rule required the interval to exclude zero and at least 45 of 50 seeds positive.
+Neither holds, and the slope is positive in under a third of draws.
 
-One seed, k=46, hit the iteration cap at full rank. Its slope sits at z = +0.04 of the distribution and
-excluding it changes nothing: mean -0.00644, 16 of 49 positive, interval still spanning zero.
+**Correction to a first statement of this result.** It said every estimator agrees at zero. That is
+false: the multiplicity-weighted refit is **significantly negative**, with an interval excluding zero.
+It does not rescue the positive-GC hypothesis -- the sign is opposite -- and the primary is untouched,
+but the summary was wrong and the weighted figure it quoted, -0.00442, came from a defective
+implementation described below. The accurate statement is that the pooled, anchor-only and per-block
+estimators are consistent with zero while the weighted one is negative.
+
+All 50 seeds converge at full rank.
 
 **Two earlier findings of this report are withdrawn as single-draw artifacts.**
 
@@ -950,13 +958,28 @@ Section 8.10's GC-associated marker efficiency does not reproduce. It was one re
 the slope is centred slightly below zero.
 
 Section 8.12's array per-copy excess does not reproduce. On seed 42 the array read 1.39 percent above
-the anchors per copy; across 50 seeds it reads **0.20 percent**, and the median excess is 0.15 percent
-rather than the 0.03 percent that seed suggested. The mean-versus-median gap that seemed to indicate a
-right tail was itself a property of that draw. The consequence drawn from it -- that a mean-based
-lambda would follow an array tail a median-based one would not -- has no support and is withdrawn.
+the anchors per copy; across 50 seeds it reads **0.203 percent with a 95 percent interval of -0.359 to
++0.767**, positive in 25 draws of 50, which is exactly a coin flip. The median excess behaves the same
+way. The mean-minus-median gap that seemed to indicate a right tail is +0.045 percent with an interval
+spanning zero, so the tail does not reproduce either, and the consequence drawn from it -- that a
+mean-based lambda would follow an array tail a median-based one would not -- has no support and is
+withdrawn.
 
-**A bug in the analysis, found before the result was reported rather than after.** The anchor-only
-secondary first read +0.327, positive in 50 of 50 seeds, which contradicted every per-block fit
+**Two bugs in the analysis.** The first was found before the result was reported; the second after,
+in review, which is worth recording as the less good outcome.
+
+The multiplicity-weighted refit scaled the design and the response by `sqrt(m)`. That is not a weighted
+Poisson GLM -- it fits a different model. Observation weights belong in the IRLS weight as `mu * w`
+with X, y and the offset untouched. Corrected, the estimate moves from -0.00442 to **-0.01680** with an
+interval excluding zero, which is what makes the "every estimator agrees at zero" sentence above wrong.
+
+Separately, the IRLS formed the normal equations `X'WX`, squaring the condition number. That spurious
+ill-conditioning was enough to stall one seed of fifty at the iteration cap. Solving the weighted least
+squares directly on `sqrt(W) X` converges it in five iterations and moves its coefficient by 3e-11, so
+no reported number depended on it -- but the earlier "k=46 failed to converge" note was an artifact of
+the solver, not of the data.
+
+The anchor-only secondary first read +0.327, positive in 50 of 50 seeds, which contradicted every per-block fit
 including the array's own -0.017. Pooling with block intercepts cannot exceed its constituents, so the
 estimate was wrong rather than interesting: 336 anchor rows of 19,330 belonged to blocks below the
 200-anchor threshold and therefore had no intercept and no spline, so their entire count level was
@@ -971,8 +994,17 @@ gap was the orphaned rows.
 **What survives.** The depth-estimator work rests on evidence independent of any of this: agreement
 with simulation theory to 0.07 percent, the ladder null across eight cases, the cyp2d6 null, and the
 lattice argument that a median of integers cannot express a value between half-integers. None of it
-depended on GC. What is closed is the marker-efficiency line as a candidate explanation for the array
-residual, at least in simulated data where no GC-selection mechanism exists.
+depended on GC.
+
+**What is closed, stated at its actual scope.** Marker-specific efficiency is **not supported as an
+explanation for the array residual in this 30x lpa wgsim fixture**. That is narrower than "closed for
+simulated data" and much narrower than closed: one locus, one genotype pair, one depth, one error rate,
+and a simulator with no GC-selection mechanism to detect. A real library, a different depth, or a
+different locus could all reopen it, and the real-library check with an external single-copy depth
+control remains untouched by this experiment.
+
+The fifty per-seed values are committed as `experiments/genotype_seed_slopes.tsv` rather than existing
+only as console output.
 
 ### 8.17 Not started
 

@@ -47,24 +47,31 @@ def ns_basis(x, knots):
     return np.column_stack([x] + [d(j) - dK1 for j in range(K - 2)])
 
 
-def poisson_irls(X, y, offset, iters=100, tol=1e-8):
-    """Returns (coefficients, converged, rank). Rank is reported so a rank-deficient design cannot
-    quietly produce a coefficient that is one of many equally good answers.
+def poisson_irls(X, y, offset, iters=100, tol=1e-8, case_weights=None):
+    """Poisson GLM by IRLS. Returns (coefficients, converged, rank).
 
-    The tolerance is 1e-8, not 1e-10. At 1e-10 the criterion sits BELOW the numerical noise floor of
-    the least-squares solve -- the coefficient is stable to eight decimals from iteration 10 while
-    successive steps still differ by about 1e-11 -- so every fit was flagged as non-convergent while
-    being perfectly converged."""
+    `case_weights` are OBSERVATION weights and enter the IRLS weight as `mu * w`, leaving X, y and the
+    offset untouched. Scaling the design and the response by sqrt(w) instead -- which an earlier
+    version did -- is not a weighted GLM at all; it fits a different model.
+
+    Solves the weighted least squares directly on `sqrt(W) X` rather than forming the normal equations
+    `X'WX`, which squares the condition number. On this design that spurious ill-conditioning was
+    enough to stall one seed of fifty at the iteration cap; solving directly it converges in five, and
+    the coefficient moves by 3e-11.
+
+    The tolerance is 1e-8. At 1e-10 the criterion sits below the numerical noise floor of the solve, so
+    every fit was flagged non-convergent while being stable to eight decimals from iteration 10.
+    """
     beta = np.zeros(X.shape[1])
     eta = np.log(np.maximum(y, 0.5)) - offset
+    cw = np.ones_like(y) if case_weights is None else np.asarray(case_weights, float)
     converged = False
     rank = 0
     for _ in range(iters):
         mu = np.exp(np.clip(eta + offset, -30, 30))
         z = eta + (y - mu) / np.maximum(mu, 1e-9)
-        W = np.maximum(mu, 1e-9)
-        XtW = X.T * W
-        new, _res, rank, _sv = np.linalg.lstsq(XtW @ X, XtW @ z, rcond=None)
+        s = np.sqrt(np.maximum(mu * cw, 1e-12))
+        new, _res, rank, _sv = np.linalg.lstsq(X * s.reshape(-1, 1), z * s, rcond=None)
         if np.max(np.abs(new - beta)) < tol:
             beta, converged = new, True
             break
@@ -109,9 +116,9 @@ def fit_seed(path):
     X, _ = design(blk, gc, u, blocks)
     beta, conv, rank = poisson_irls(X, y, off)
 
-    # Secondary: multiplicity-weighted refit, same design.
-    Xw = X * np.sqrt(m).reshape(-1, 1)
-    beta_w = poisson_irls(Xw, y * np.sqrt(m), off)[0][0]
+    # Secondary: multiplicity-weighted refit. Same design, same response, same offset -- multiplicity
+    # enters as an observation weight and nothing else.
+    beta_w = poisson_irls(X, y, off, case_weights=m)[0][0]
 
     # Secondary: anchors alone, where multiplicity is 1 by construction.
     # Anchors alone, where multiplicity is 1 by construction. The row set must be restricted to the
@@ -155,6 +162,12 @@ def main():
             files.append((k, p))
     if not files:
         sys.exit(f"no {'exploratory' if want_expl else 'confirmatory'} seed dumps in {d}")
+    if not want_expl:
+        missing = sorted(set(CONFIRMATORY) - {k for k, _ in files})
+        if missing:
+            sys.exit(f"confirmatory set incomplete: missing k={missing}. The decision rule is defined "
+                     f"over exactly k={CONFIRMATORY.start}..{CONFIRMATORY.stop - 1}; a partial set "
+                     f"would let the answer depend on which seeds happened to finish.")
 
     res = [(k, fit_seed(p)) for k, p in files]
     label = "EXPLORATORY (excluded from the decision rule)" if want_expl else "CONFIRMATORY"
@@ -203,6 +216,17 @@ def main():
     print(f"  anchor-only  mean beta   {np.nanmean([r['beta_anchor'] for _, r in res]):+.5f}")
     allb = [(kb, v) for _, r in res for kb, v in r["per_block"].items()]
     print(f"  per-block fits positive  {sum(1 for _, v in allb if v > 0)} of {len(allb)}")
+
+    # The 50 slopes are the evidence, so they belong in a file rather than only in a console line.
+    out = d / ("seed_slopes_exploratory.tsv" if want_expl else "seed_slopes.tsv")
+    with out.open("w") as f:
+        f.write("k\tbeta\tbeta_weighted\tbeta_anchor\tgc_delta\tanchor_lambda"
+                "\tarray_mean_cpc\tarray_median_cpc\tconverged\trank\tncol\tn\n")
+        for k, r in res:
+            f.write(f"{k}\t{r['beta']:.8f}\t{r['beta_w']:.8f}\t{r['beta_anchor']:.8f}\t"
+                    f"{r['gc_delta']:.8f}\t{r['anc_mean']:.6f}\t{r['arr_mean']:.6f}\t"
+                    f"{r['arr_median']:.6f}\t{int(r['converged'])}\t{r['rank']}\t{r['ncol']}\t{r['n']}\n")
+    print(f"\nper-seed values written to {out}")
 
 
 if __name__ == "__main__":
