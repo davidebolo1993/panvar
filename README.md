@@ -26,6 +26,17 @@ docker build -t panvar:latest .
 docker run --rm -v "$PWD":/work -w /work panvar:latest panvar --help
 ```
 
+## Scope and limitations
+
+Worth knowing before reading any number this project reports:
+
+- **`benchmark` reports four levels and they are not interchangeable.** `graph`, `called` and `carrier` are ceilings — they implant the haplotype's true block — while only `genotype` reconstructs the emitted VCF. Every QV figure quoted before the module review pass was the `graph` column.
+- **The region VCF is the interpreted output; the allele VCF is the lossless one.** `call --allele-vcf` reconstructs its haplotypes with 0 bp residual on all six reference loci. The region VCF merges records for readability and reconstructs 39–97% of the reference-to-truth distance depending on locus; a merged record hands every carrier the representative's sequence, and a `DUP` is reconstructed by tiling an inferred span.
+- **`associate` implements common single-variant association.** Firth and SPA make a rare single-variant test better behaved; there is no burden, collapsing or SKAT-style aggregation, rare binary p-values in the far tail remain about 1.7× nominal, and the LMM is experimental and not numerically validated against a pinned reference.
+- **`genotype` (short-read sample genotyping) is not built by default.** It is the one module that has not completed a review pass. `cmake -DPANVAR_ENABLE_EXPERIMENTAL_GENOTYPE=ON` builds it for development.
+
+The complete list, tagged by whether it blocks a release, is [docs/review_followups.md](docs/review_followups.md); numbers this project reported and later corrected are in [docs/reports/module-review-summary.md](docs/reports/module-review-summary.md).
+
 ## Documentation
 
 - [docs/README.md](docs/README.md) — documentation index

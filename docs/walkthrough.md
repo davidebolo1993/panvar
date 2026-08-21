@@ -64,7 +64,7 @@ Rows are (representative) haplotypes, columns are the repeat-unit nodes. A haplo
 
 ## 3. `panphorte` — fold the tandem into a countable unit
 
-The KIV-2 array is spelled out copy-by-copy in the graph, which would mis-type as a pile of insertions. `panphorte` collapses each detected tandem array onto one repeat-unit (`REP`) node with a self-loop, so copy number becomes the loop-traversal count. On LPA bubble 7 it folds a 5,547 bp unit carried by all 466 haplotypes, collapsing 3,484 nodes, with copies ranging 1–32.
+The KIV-2 array is spelled out copy-by-copy in the graph, which would mis-type as a pile of insertions. `panphorte` collapses each detected tandem array onto one repeat-unit (`REP`) node with a self-loop, so copy number becomes the loop-traversal count. On LPA bubble 7 it folds a 5,547 bp unit carried by all 466 haplotypes, collapsing 3,485 nodes, with copies ranging 1–32.
 
 ```bash
 ./build/panvar panphorte \
@@ -128,7 +128,7 @@ On LPA the KIV-2 tangle (bubble 7) is left untouched — it carries an unfolded 
 
 ## 6. `call` — type the variants and read copy number
 
-Diffs every haplotype against the reference and emits a VCF. On LPA: 7 DEL, 13 INS, 3 DUP. The headline record is the KIV-2 DUP on bubble 7: `REF_CN=6`, `RU_LEN=5547`, with a per-sample `CN` spanning 1–32 copies (and `CNBP` giving the actual bp each haplotype gains/loses).
+Diffs every haplotype against the reference and emits a VCF. On LPA: 5 DEL, 9 INS, 3 DUP. The headline record is the KIV-2 DUP on bubble 7: `REF_CN=6`, `RU_LEN=5547`, with a per-sample `CN` spanning 1–32 copies (and `CNBP` giving the actual bp each haplotype gains/loses).
 
 ```bash
 ./build/panvar call \
@@ -211,7 +211,22 @@ The per-gene headline is per-haplotype reconstruction identity (`1 − Σδ/ΣS`
 
 ![Round-trip reconstruction anatomy](img/benchmark_qv.png)
 
-Every haplotype across every locus reconstructs at >99.9% identity (left panel ~all green), and the residual is essentially all Not-callable (right panel blue) — no callable-size misses. On LPA, the copy number lands exactly (the DUP module scores δ=0); its residual is small sub-threshold variation, e.g. a ~32 bp insertion at one bubble that sits just under `--min-sv-bp=50`. GSTM1 sits lowest (its paralog stack is dense with small paralogous sequence variants) but is still >99.9%. This confirms the calls round-trip the haplotypes. (Match `benchmark --min-sv-bp` to the `call` run, or 20–50 bp variation that was correctly not called would show up as Mis-called.)
+`benchmark` reports **four levels**, and they answer four different questions. Quoting one without saying which it is has caused more confusion in this project than any other single thing, so they are always named:
+
+| level | what it reconstructs | what it bounds |
+|---|---|---|
+| `graph` | the graph/call-node ceiling | could the graph hold this haplotype at all |
+| `called` | the true block is spliced in wherever a record was attributed to it | what the retained records would achieve if each reproduced its block exactly |
+| `carrier` | the same, after GT assignment | the ceiling once genotypes are applied |
+| `genotype` | the reference plus **only the edits this haplotype's GT names** | what a consumer of the VCF actually gets |
+
+Only `genotype` reconstructs the emitted VCF. The first three implant the true block and are therefore ceilings, not results — **every QV figure this project quoted before the review pass was the `graph` column.**
+
+Measured on the current tree (`results/reconstruction.tsv`), `genotype` from the **region VCF** ranges from about 39% of the reference-to-truth distance closed at CYP2D6 to about 97% at ACOT. That spread is real and is where the interpreted output's remaining loss lives: a merged record hands every carrier the representative's sequence, and a DUP is reconstructed by tiling an inferred span, which at CYP2D6 costs the difference between 86.1% without `--cn` and 39.3% with it.
+
+The **allele VCF** (`call --allele-vcf`) closes **100.0%, 0 bp residual, on all six loci**. That demonstrates the representation is lossless — it spells every allele out — and is a serialization ceiling rather than a statement about call sensitivity. Both numbers are regenerated together by `scripts/regen_results.sh`; neither replaces the other.
+
+(Match `benchmark --min-sv-bp` to the `call` run, or 20–50 bp variation that was correctly not called is charged as a miss.)
 
 ---
 
