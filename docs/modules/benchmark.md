@@ -18,12 +18,12 @@ How much of the sequence comes back. Four reconstructions over the same bubbles 
 
 | level | reconstruction built from | answers |
 |-------|---------------------------|---------|
-| `graph` | reference walk plus the haplotype's own steps at every block sharing a node with any call | can the graph hold this haplotype, and did the caller flag the divergent blocks |
+| `graph` | reference walk plus the haplotype's own steps at every block sharing a node with any call | optimistic node-discovery ceiling: how far the union of called nodes reaches |
 | `called` | the same, restricted to blocks a specific record is attributed to and that reach `--min-sv-bp` | what the retained records would reach if each reproduced its block exactly |
 | `carrier` | `called`, plus the requirement that this haplotype's genotype names a record overlapping the block | the same ceiling once genotypes are applied |
 | `genotype` | the reference plus only the edits this haplotype's genotype names | what a consumer reconstructing this sample from the VCF actually gets |
 
-The first three implant the haplotype's own true sequence and are therefore ceilings, not results. Only `genotype` reconstructs what the records say.
+The first three implant the haplotype's own true sequence and are therefore ceilings, not VCF reconstructions. Only `genotype` reconstructs what the records say; this label belongs to the benchmark and is unrelated to the read-level `genotype` module.
 
 The genotype residual is then partitioned into five terms that sum to it exactly, so the shortfall can be attributed rather than just measured:
 
@@ -48,15 +48,15 @@ Algorithm and worked trace: [algorithms/benchmark.md](../algorithms/benchmark.md
 
 ## Required inputs
 
-- `-i, --gfa <graph.gfa>` — the same passed graph the calls were made on. Validated: every path step must name a node the graph has, consecutive steps must be joined by a link, path names must be unique and link overlaps must be zero, because every walk is spelled by concatenating whole segments.
-- one of `-b, --bubble-prefix-in <prefix>` or `-c, --bubbles-csv-in <path>`. Bubble ids must be unique and every node named must exist in the graph.
-- `--variant-nodes <path>` — `call`'s `<prefix>.variant_nodes.tsv`. Strictly validated, because a call's node set is the whole basis on which a truth event is attributed to it: a stale node produces exactly the output a genuine caller miss produces. The header must be `call`'s, every row must have the header's field count, `variant_id` must be non-empty and unique, and every node must belong to the bubble the row names. Any bubble id absent from the CSV is refused, not just the case where all of them are.
+- `-i, --gfa <graph.gfa>` — the same graph used by `call`; paths, links, overlaps and names are validated before spelling.
+- one of `-b, --bubble-prefix-in <prefix>` or `-c, --bubbles-csv-in <path>`; bubble ids and graph nodes are cross-checked.
+- `--variant-nodes <path>` — `call`'s matching `<prefix>.variant_nodes.tsv`. Its schema, variant ids, bubble ids and node membership are validated because these node sets define truth-event attribution.
 - `-r, --reference-path <name>` — the diff baseline, resolved through the shared resolver (exact name, else a unique case-insensitive substring; ambiguity is an error, never settled by file order).
 - `-o, --out-prefix <prefix>`.
 
-Optional: `--vcf <path>` — either VCF `call` produces. The two are different contracts and the mode is detected explicitly, reported as `vcf_mode`. A region VCF has one row per call and its IDs must match `variant_nodes.tsv` completely, agreeing on `BUBBLE_ID`; anything less is two different runs and is refused. An allele VCF has one row per bubble (`bubbleN_ALLELES`) and shares no ID with a per-call row, so the `carrier` level and the per-call `loss_bp` terms do not exist there and are reported `NA` / `not_applicable` rather than as zeros — reporting them anyway turned a perfect 0 bp reconstruction into a 1.4 Mb missed-carrier loss with negative representation. In allele mode the meaningful outputs are the genotype reconstruction and `loss_bp/serialization_residual`.
+Optional: `--vcf <path>` accepts either VCF from `call`; `vcf_mode` reports which contract was detected. Region-VCF ids must match `variant_nodes.tsv` completely and agree on `BUBBLE_ID`. An allele VCF instead has one `bubbleN_ALLELES` record per bubble, so per-call carrier and loss-attribution terms are not applicable; allele mode measures explicit-allele serialization.
 
- `<prefix>.region.vcf` scores the merged, interpreted output; `<prefix>.alleles.vcf` (from `call --allele-vcf`) scores the lossless one, which is a serialization ceiling rather than a call-sensitivity score. Sample columns are joined to graph paths by exact name; each column is one haplotype, so genotypes are haploid and nothing has to be phased. Also validated: unique record IDs, a `BUBBLE_ID` on every record (without it a record cannot be placed and would silently pile up against bubble 0), a field count matching the `#CHROM` header, and haploid `GT`. Duplicate sample columns are refused. A diploid `GT` is refused rather than parsed — one column is one haplotype, and `0/1` read as an integer becomes `0`, silently scoring a heterozygous carrier as reference. A partial join is accepted and prominently reported, because a QV over a subset is not the QV of the run.
+`<prefix>.region.vcf` scores the merged, interpreted output; `<prefix>.alleles.vcf` (from `call --allele-vcf`) scores the explicit per-bubble alleles. Sample columns join graph paths by exact name and must contain haploid `GT`; record ids, `BUBBLE_ID`, row widths and duplicate names are validated. A partial sample/path join is accepted but reported because its quality values describe only the joined subset.
 
 All outputs are staged and committed only on success, and no output may name an input.
 
@@ -69,7 +69,6 @@ All outputs are staged and committed only on success, and no output may name an 
 | `--min-sv-bp <N>` | event-size threshold for the ledger and the `called` reconstruction; set it to what `call` ran with | `50` |
 | `--dup-model <cn\|cnbp>` | lay down `CN` copies of `RU_LEN` in place of `REF_CN`, or apply the per-sample `CNBP` delta. Both tile an inferred reference span, so a DUP is reconstructed at the right length out of approximately right sequence and is counted `heuristic` | `cnbp` |
 | `--no-truth-events` | skip the per-event ledger table | off |
-| `--vcf` (again) | also enables the `carrier` level and the `loss_bp` partition, both of which need genotypes | — |
 | `--threads <N>` | worker threads over haplotypes | `0` (auto) |
 | `-q, --quiet` | disable progress logs | — |
 

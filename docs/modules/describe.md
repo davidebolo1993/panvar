@@ -25,7 +25,7 @@ Algorithm and worked trace: [algorithms/describe.md](../algorithms/describe.md).
 
 - `-i, --gfa <path>` — the call substrate from `panphorte`/`refine`/`bubble` (node ids should match the CSV to `-b`);
 - one of `-b, --bubble-prefix-in <prefix>` or `-c, --bubbles-csv <path>`.
-- `--variant-nodes <call.variant_nodes.tsv>` to restrict features to `call`'s variant scope (recommended; this is what keeps `describe` and the VCF in lockstep).
+- `--variant-nodes <call.variant_nodes.tsv>` is optional and restricts the k-mer and graph substrates to the nodes represented by `call`.
 
 ## Key options
 
@@ -33,9 +33,9 @@ Algorithm and worked trace: [algorithms/describe.md](../algorithms/describe.md).
 |------|--------------|---------|
 | `-o, --out-dir <dir>` | output directory | `describe_out` |
 | `-k, --kmer-size <K>` | k-mer size, 1–31 | `31` |
-| `--feature-mode <all\|syncmer>` | keep all canonical k-mers vs sampled [closed syncmers](../algorithms/describe.md#k-mer-encoding--syncmer-selection) | `syncmer` |
-| `--min-paths <N>` | discriminative-filter cut: drop features with `min(present,absent) ≤ N` (copy-number features always kept; `0` keeps all) | `1` |
-| `--variant-nodes <tsv>` | restrict both substrates to `call`'s variant nodes (the genotyping scope; [masking detail](../algorithms/describe.md#node--edge-dosage-complementary-substrate)) | — |
+| `--feature-mode <all\|syncmer>` | keep all canonical k-mers or sampled [closed syncmers](../algorithms/describe.md#2-spell-k-mer-features-from-the-walk) | `syncmer` |
+| `--min-paths <N>` | drop constant features and otherwise require `min(present,absent) > N`; copy-number-varying features are always kept | `1` |
+| `--variant-nodes <tsv>` | restrict graph-derived substrates to `call`'s variant nodes; see [the masking rules](../algorithms/describe.md#5-take-node-and-edge-dosage-from-the-same-walks) | — |
 | `--variant-flank-bp <N>` | with `--variant-nodes`, widen the scope by N bp. Base-granular for k-mers — exactly N bases at the node end facing the variant — and node-granular for graph dosage, since a node dosage is a property of the whole node. It therefore selects more nodes than bases; that asymmetry is deliberate. Requires `--variant-nodes` | `k-1` |
 | `--samples <cosigt.tsv>` | also write per-sample BIMBAM (diploid summed dosage) | — |
 | `--variant-vcf <vcf>` | also emit a VARIANT-level BIMBAM — one row per VCF record, or per ALT for a multiallelic one — from `call`'s region VCF (uncompressed; `.vcf.gz` is refused). A row is not necessarily one independent biological event: a paired DEL+INS representation, or correlated CN and sequence records, produce several rows for one event. It is a coarser and more interpretable unit than a k-mer, not an independent one; correlation is `associate`'s and `Meff`'s problem | — |
@@ -48,7 +48,7 @@ Algorithm and worked trace: [algorithms/describe.md](../algorithms/describe.md).
 
 ## Outputs
 
-Each BIMBAM substrate is written to its own self-contained folder, `<out-dir>/<level>/<substrate>/`, where `<level>` is `haplotype` (per-haplotype, always) or `sample` (per-sample diploid, only with `--samples`) and `<substrate>` is `kmers`, `graph`, or `variant`. A folder holds three files: the matrix, its sidecar, and its column order. So an `associate` run points at one folder and takes all three from it.
+When BIMBAM output is enabled, each substrate is written to its own self-contained folder, `<out-dir>/<level>/<substrate>/`, where `<level>` is `haplotype` or `sample` (diploid, only with `--samples`) and `<substrate>` is `kmers`, `graph`, or `variant`. A folder holds the matrix, its sidecar and its column order.
 
 | file (in each `<level>/<substrate>/`) | contents |
 |------|----------|
@@ -64,18 +64,18 @@ Each BIMBAM substrate is written to its own self-contained folder, `<out-dir>/<l
 | `describe.params.json` | the run's resolved parameters (k, feature mode, filter, wide-matrix flags) |
 | `bubble_<id>/graph_features.tsv.gz` | node and edge dosage map (`feature_type` = node/edge) |
 | `bubble_<id>/kmer_features.tsv.gz` + `kmer_counts.jsonl.gz` | k-mer map (with `nodes` provenance) + per-path sparse counts |
-| `bubble_<id>/{kmer,graph}_matrix.tsv.gz` | dense feature × path matrices — only without `--no-wide-matrix` (the gene drivers pass `--no-wide-matrix`, so these are normally absent; the feature maps + JSONL carry the same information) |
+| `bubble_<id>/{kmer,graph}_matrix.tsv.gz` | dense feature × path matrices — only without `--no-wide-matrix`; the feature maps and sparse JSONL carry the same information |
 
 By default dosages are raw counts (not rescaled to 0–2), so a haplotype carrying 50 copies shows 50; `NA` = a haplotype that doesn't traverse the feature's bubble (distinct from `0` = traverses but reference). A path taking the direct source-to-sink edge, that is a pure deletion, is a traverser and reads `0`, not `NA`.
 
-Missingness is all-or-nothing on purpose: a pooled feature is finite only when every bubble contributing it is observable on that path, and a diploid sample only when every assigned haplotype traverses. Taking "any" instead reported a partial sum as though it were whole, biasing dosage downward on the substrate `associate` tests. `panvar associate` tests these raw counts directly. `--scale-dosage` maps each feature to the `0..2` range instead — a per-feature linear map, so it doesn't change `associate`'s linear-model result; it's there for external tools (e.g. GEMMA) that assume a diploid `0..2` dosage and would otherwise drop copy-number markers.
+Missingness is all-or-nothing: a pooled feature is finite only when every contributing bubble is observable on that path, and a sample only when every assigned haplotype traverses. This prevents a partial sum from being reported as a complete low dosage. `panvar associate` tests raw counts directly. `--scale-dosage` instead maps each feature to `0..2`, a per-feature linear transformation provided for external tools that assume diploid dosage.
 
 Each `feature_annot.<substrate>.tsv.gz` (one row per BIMBAM feature, in row order) carries the provenance of each genotype:
 
 | column | meaning |
 |--------|---------|
-| `feature_id` | the k-mer sequence (k-mer substrate) or the node id/oriented-edge key (graph substrate). Node and edge ids share one namespace; `encoding` is what distinguishes them |
-| `layer` | `kmer` or `graph` |
+| `feature_id` | k-mer sequence, node id/oriented-edge key, or variant id, depending on substrate. Node and edge ids share one namespace; `encoding` distinguishes them |
+| `layer` | `kmer`, `graph`, or `variant` |
 | `encoding` | how the feature is built: `syncmer`/`all` for k-mers, `node`/`edge` for graph dosage, `dosage` for variant rows |
 | `bubbles` | the bubble id(s) the feature belongs to |
 | `nodes` | the graph node(s) the feature localizes to — the traceback into `call`'s `variant_nodes.tsv` |

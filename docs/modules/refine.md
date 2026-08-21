@@ -4,9 +4,9 @@ CLI: `panvar refine`
 
 ## What it does
 
-`refine` fixes graph artifacts (e.g. spurious `INS` + `DEL` events) at the graph level. It runs after `panphorte`, on the normalized graph, and for each selected bubble re-aligns the actual per-haplotype interior sequences with POA ([abPOA](https://github.com/yangao07/abPOA), affine-gap partial-order alignment) — collapsing artifacts into a single clean event. While this is safe in bubbles with no duplication signal:
+`refine` is intended to reduce graph-alignment artifacts such as split `INS` + `DEL` representations. It runs after `panphorte` and re-aligns selected per-haplotype interiors with POA ([abPOA](https://github.com/yangao07/abPOA), affine-gap partial-order alignment). Its treatment depends on copy-number topology:
 
-- in a bubble that carries an unfolded copy-number signal - the reference or any haplotype revisits a non-REP interior node ≥2× (e.g. a paralog collapse or a private duplication `panphorte` left unfolded) — `refine` does nothing - i.e. the bubble is skipped entirely, because POA would linearize those copies and destroy the CN signal `call` reconstructs from them;
+- in a bubble that carries an unfolded copy-number signal — the reference or any haplotype revisits a non-REP interior node at least twice — the bubble is skipped, because POA would linearize the copies and destroy the CN signal `call` reconstructs from them;
 - in a bubble with a folded tandem (a `REP` node from `panphorte`), `refine` splits each haplotype's interior at every REP block, copies the `REP×n` run (per-haplotype copy count and orientation is preserved), and POA-aligns only the residual flanks around it.
   
 The exact distinct-walk collapse means abPOA aligns only the handful of distinct interior sequences, so the binding cost is mainly interior length, not haplotype count.

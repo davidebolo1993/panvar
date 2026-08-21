@@ -9,13 +9,13 @@ Re-induces a locus graph (GFA — Graphical Fragment Assembly) before bubble dec
 - if pathological, rebuilds the locus by progressive graph generation: haplotypes are added most-complete-first, each aligned to the graph built so far and augmented with the parts that do not match;
 - recovers a walk for every haplotype, checks each against the original sequence, and writes a plain GFA ready for `bubble`.
 
-Graphs induced by transitive closure over all-pairs alignments can collapse sequence that recurs across a locus — repeat copies, or a short segment reused in different places — onto shared, very high-degree nodes, which makes downstream variant calling hard. Progressive re-alignment never closes over every pairwise match: it threads each haplotype colinearly, so recurring sequence branches locally instead of merging globally. Graph generation is delegated to [minigraph](https://github.com/lh3/minigraph); this module decides when to intervene, in what order haplotypes are added, whether the result is acceptable, and what is emitted.
+Graphs induced by transitive closure over all-pairs alignments can collapse sequence that recurs across a locus — repeat copies, or a short segment reused in different places — onto shared, very high-degree nodes, which makes downstream variant calling hard. Progressive re-alignment instead threads each haplotype colinearly, tending to keep recurrence in local branches rather than merging it globally. Graph generation is delegated to [minigraph](https://github.com/lh3/minigraph); this module decides when to intervene, in what order haplotypes are added, whether the result is acceptable, and what is emitted.
 
 Algorithm and worked trace: [algorithms/rebuild.md](../algorithms/rebuild.md).
 
 ## Required inputs
 
-- `-i, --gfa <graph.gfa>` — the locus graph, with one `P` line per haplotype
+- `-i, --gfa <graph.gfa>` — the locus graph, with one `P` or `W` walk per haplotype; accepted rebuilds are emitted with `P` lines
 - `-o, --out <path>` — output GFA
 
 ## Key options

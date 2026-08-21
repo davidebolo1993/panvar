@@ -2,7 +2,7 @@
 
 Mechanism for the `bubble` module. For usage/flags see [modules/bubble.md](../modules/bubble.md); references in [references.md](../references.md#bubble).
 
-`bubble` turns a graph into the variant sites the rest of the pipeline works on. A site is a snarl: a pair of boundary nodes whose removal separates an interior subgraph from the rest, defined on the bidirected graph so it can contain cycles and inversions. Pangenome variation often lives in exactly those cyclic sites, so snarls are the default unit rather than superbubbles — the acyclic special case, a single-source, single-sink subgraph with no cycle or inversion. `--superbubbles` restricts the output to that acyclic subset. The snarls come from a vendored cactus / 3-edge-connected-component decomposition that mirrors [vg](https://github.com/vgteam/vg) `snarls`, so the top-level sites should match vg's.
+`bubble` turns a graph into the variant sites the rest of the pipeline works on. A site is a snarl: a pair of boundary nodes whose removal separates an interior subgraph from the rest, defined on the bidirected graph so it can contain cycles and inversions. Pangenome variation often lives in exactly those cyclic sites, so snarls are the default unit rather than superbubbles — the acyclic special case, a single-source, single-sink subgraph with no cycle or inversion. `--superbubbles` restricts the output to that acyclic subset. The sites come from a vendored cactus / 3-edge-connected-component decomposition compatible with the representation used by [vg](https://github.com/vgteam/vg) `snarls`.
 
 ## How it works
 

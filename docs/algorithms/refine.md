@@ -2,7 +2,7 @@
 
 Mechanism for the `refine` module. For usage/flags see [modules/refine.md](../modules/refine.md); References in [references.md](../references.md#refine).
 
-`refine` POA-realigns the interior of bubbles on the panphorte normalized graph to remove graph-builder alignment artifacts (a spurious insertion-plus-deletion pair where one clean indel belongs), without touching copy number. It works on a region: one or more bubbles fused into a single `source→sink` span and refined as a unit. A `REP` node — panphorte's folded tandem unit, an interior node carrying an L self-edge — is held fixed throughout, and only the residual segments (the maximal runs of non-`REP` interior steps between and around the `REP` blocks) are re-aligned.
+`refine` POA-realigns bubble interiors on the panphorte-normalized graph to reduce graph-builder alignment artifacts, such as a split insertion-plus-deletion representation. It works on a region: one or more bubbles fused into a single `source→sink` span and refined as a unit. A `REP` node — panphorte's folded tandem unit, an interior node carrying an L self-edge — is held fixed throughout, and only the residual segments between and around `REP` blocks are re-aligned.
 
 ## How it works
 
@@ -36,7 +36,7 @@ The link check is not redundant with the sequence one. A rewrite can leave every
 
 ### 5. Re-sort, re-snarl and emit
 
-Finally the graph is re-sorted and flipped along the reference and re-snarled with the cactus finder, applying `--resnarl-min-variant-bp` as its own interior-span filter rather than inheriting whatever produced the input sites. Bubble ids are reassigned by that decomposition. The outputs are written as `<prefix>.normalized.sorted.gfa`, `<prefix>.bubbles.csv`, `<prefix>.bandage_nodes.csv` (and `<prefix>.bandage_genes.csv` with `--gtf`). Running `call` on this graph re-derives the now-clean records; a folded DUP is byte-identical because its `REP` node, self-loop and per-haplotype multiplicity never changed.
+Finally the graph is re-sorted and flipped along the reference and re-snarled with the cactus finder, applying `--resnarl-min-variant-bp` as its own interior-span filter rather than inheriting whatever produced the input sites. Bubble ids are reassigned by that decomposition. The outputs are written as `<prefix>.normalized.sorted.gfa`, `<prefix>.bubbles.csv`, `<prefix>.bandage_nodes.csv` (and `<prefix>.bandage_genes.csv` with `--gtf`). Running `call` on this graph re-derives events from the refined topology; folded DUP counts are preserved because their `REP` nodes, self-loops and per-haplotype multiplicities never changed.
 
 
 ## Worked trace

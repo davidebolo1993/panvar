@@ -2,7 +2,7 @@
 
 Mechanism for the `inspect` utility's `--cluster` mode. For usage/flags see [modules/inspect.md](../modules/inspect.md); references in [references.md](../references.md#inspect).
 
-`--cluster` groups the haplotypes crossing a bubble by how similarly they traverse it, so structurally identical alleles collapse to one representative and a dense site becomes readable. A walk is a haplotype's traversal of the bubble written as a sequence of oriented node steps, and two walks are compared by how much of their windowed content they share.
+`--cluster` groups haplotypes crossing a bubble by how similarly they traverse it and selects one representative per connected group. Identical walks are collapsed before comparison; additional walks can cluster when their similarity reaches the chosen threshold. A walk is a sequence of oriented node steps, compared through shared windowed content.
 
 ## How it works
 

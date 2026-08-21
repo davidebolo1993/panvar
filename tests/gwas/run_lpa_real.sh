@@ -126,7 +126,7 @@ if [ -f "$SGENO" ]; then
     --phenotype "$REAL/pheno.quant.tsv" --min-maf 0.02 -o "$ASSOC/sim_pc"
   plot "$ASSOC/sim_pc" "LPA structure demo (PC-adjusted)"
   if [ "$N" -le "$LMM_MAX_N" ] && [ -f "$REAL/kinship.tsv" ]; then
-    echo "   -- LMM with the genome-wide-like panel GRM (--kinship): lambda ~ 1 --"
+    echo "   -- LMM with the panel GRM (--kinship); compare its lambda_gc against sim_pc --"
     "$PANVAR_BIN" associate --genotypes "$SGENO" --samples "$SSAMP" --feature-annot "$SANNOT" \
       --phenotype "$REAL/pheno.quant.nopc.tsv" --model lmm --kinship "$REAL/kinship.tsv" --min-maf 0.02 -o "$ASSOC/sim_lmm"
     plot "$ASSOC/sim_lmm" "LPA structure demo (LMM)"

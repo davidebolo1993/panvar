@@ -52,7 +52,7 @@ A snarl can contain cycles and inversions, which is where much pangenome variati
 | column | meaning |
 |--------|---------|
 | `bubble_id` | unique id for the bubble site; increases along the reference |
-| `source`, `sink` | the two boundary node ids, ordered so `source` is the one the reference reaches first |
+| `source`, `sink` | the boundary node ids, ordered along the reference when it traverses the site; otherwise the finder order is retained |
 | `source_orient`, `sink_orient` | the strand on which the reference reads each boundary (`+` forward, `-` reverse) |
 | `inside_node_count` | number of interior nodes (strictly between the boundaries) |
 | `total_node_count` | interior nodes plus the two boundary nodes |

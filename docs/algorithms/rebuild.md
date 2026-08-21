@@ -2,7 +2,7 @@
 
 Mechanism for the `rebuild` module. For usage/flags see [modules/rebuild.md](../modules/rebuild.md); references in [references.md](../references.md#rebuild).
 
-A graph induced by transitive closure over all-pairs alignments collapses sequence that recurs across a locus — repeat copies, or the same short segment reused elsewhere — onto shared nodes. Where that recurrence is dense the shared nodes reach very high degree, which makes downstream variant calling hard, particularly for duplications. Progressive graph construction does not have this failure mode: each haplotype is threaded colinearly through the graph built so far, so recurring sequence either follows an existing path or branches locally. The locus is therefore reconstructible from the same haplotype sequences into a graph that does decompose. The cost is that progressive generation only represents variation above a size threshold.
+A graph induced by transitive closure over all-pairs alignments can collapse sequence that recurs across a locus — repeat copies, or the same short segment reused elsewhere — onto shared nodes. Where that recurrence is dense the shared nodes reach very high degree, which makes downstream variant calling hard, particularly for duplications. Progressive graph construction instead threads each haplotype colinearly through the graph built so far, so recurring sequence tends to follow an existing path or branch locally. This can produce a graph that decomposes more cleanly, at the cost of representing only variation above a size threshold.
 
 ## How it works
 
@@ -20,7 +20,7 @@ Maximum degree and node density are logged alongside but do not decide anything.
 
 ### 2. Order
 
-Progressive construction is order-sensitive. The first haplotype added becomes the coordinate backbone every later one is aligned against, so haplotypes are added most-complete-first, where completeness means k-mer richness: the number of distinct k-mers first, the total number breaking ties.
+Progressive construction is order-sensitive. The first haplotype added becomes the coordinate backbone every later one is aligned against, so haplotypes are added richness-first: the number of distinct k-mers decides first and the total number breaks ties.
 
 Diversity deciding first is the point. A haplotype carrying many copies of one unit is not rewarded for the copies, only for the distinct sequence it contributes; abundance separates only haplotypes that carry the same distinct content. Combining the two into a single weighted score would let abundance outrank diversity and seed the graph with a haplotype carrying less distinct sequence.
 
@@ -34,7 +34,7 @@ Two length thresholds apply in sequence, and the first is the one that bites. An
 
 The generated graph carries no path information, so each haplotype is mapped back to it and its walk read out. Mapping returns one or more chains, each a run of graph vertices covering a contiguous stretch of the haplotype in order. A haplotype that maps cleanly gives one chain spanning it end to end; it splits only where a stretch — divergent, rearranged, or missing as an assembly gap — leaves no single graph path to thread it onto.
 
-Separate chains need not be joined by a link, so concatenating them would assert an edge that does not exist and produce a walk nobody can traverse. The chain covering the most of the haplotype is therefore taken as its walk, and the rest is dropped. Each step is an oriented vertex, so a haplotype traversing a segment on the reverse strand is recorded as doing so, which is what lets an inversion survive into the emitted graph as an inversion bubble.
+Separate chains need not be joined by a link, so concatenating them would assert an edge that does not exist and produce a walk nobody can traverse. The chain with the most matching bases is therefore selected; identity and mapping quality break ties deterministically, and the rest is dropped. Each step is an oriented vertex, so a haplotype traversing a segment on the reverse strand is recorded as doing so, which is what lets an inversion survive into the emitted graph as an inversion bubble.
 
 ### 5. Check and accept
 

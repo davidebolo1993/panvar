@@ -30,13 +30,11 @@ Each block with a non-zero size is one truth event:
 | `called` | `size_bp ≥ --min-sv-bp` and a specific record's node is in the block |
 | `missed` | `size_bp ≥ --min-sv-bp` and no record covers it |
 
-`called` says a specific emitted record shares at least one node with this block. It does not say the record spans the block, represents it correctly, or that this haplotype was genotyped as carrying it. So the two negatives differ in strength: `missed` is firm — nothing emitted touches the event — while `called` is an upper bound on discovery. And it is not a genotyping statement: at ACOT bubble 7, 145 haplotypes have an above-threshold event attributed to a record and are genotyped `0` at every record of the bubble.
+`called` says a specific emitted record shares at least one node with this block. It does not say the record spans the block, represents it correctly, or that this haplotype was genotyped as carrying it. The two negatives therefore differ in strength: `missed` is firm — nothing emitted touches the event — while `called` is an upper bound on discovery, not a genotyping statement.
 
 #### Why not classify from the alignment
 
-The residual used to be split by contiguous non-match run length in the reconstruction-vs-truth alignment: runs shorter than `--min-sv-bp` were called "variation that could not have been called", runs at or above it "callable-size events missed". That measures the edit path, not the event.
-
-A clean 60 bp deletion of ordinary non-repetitive sequence, aligned globally by edlib, comes back as fourteen runs of 1–10 bases — the co-optimal edit path distributes the gap over chance matches, and every distribution costs the same 60 edits. Consequently `resid_run_ge_bp` read 0 at all six reference loci: the bucket meant to hold missed callable-size events was structurally empty, and so was the carrier truth flag built on it. The columns survive as `resid_run_lt_bp` / `resid_run_ge_bp`, describing the residual's shape and nothing more.
+Contiguous mismatch-run lengths from a sequence alignment cannot define event size: co-optimal alignments can distribute one deletion over several short runs through chance matches. The ledger therefore sizes events from the two graph walks. `resid_run_lt_bp` and `resid_run_ge_bp` remain descriptive summaries of residual shape only.
 
 ### 3. Reconstruct at each level
 
@@ -49,19 +47,19 @@ Each walks the reference and substitutes the haplotype's own steps at the blocks
 | `carrier` | as `called`, and this haplotype's `GT` names some record overlapping the block |
 | `genotype` | not block-based at all — see below |
 
-`graph` is the optimistic upper bound and is what every QV figure previously quoted for this project measured. Sharing a node with some call is not matching one, so a called deletion containing a shared reference node can authorise copying a different, uncalled allele; and no genotype is read, so a call placed on entirely the wrong haplotypes still scores perfectly.
+`graph` is an optimistic node-discovery ceiling. Sharing a node with some call is not matching one, so a called deletion containing a shared reference node can authorise copying a different allele; no genotype is read, so a call placed on the wrong haplotypes can still score perfectly.
 
 `called` narrows that to per-record attribution plus the size threshold, but both substitute the haplotype's true block, not the record's `REF`/`ALT` effect. `called` is therefore the ceiling the retained records would reach if each reproduced its block exactly — not what they do reproduce.
 
 `carrier` adds the one thing `called` ignores: whether the VCF says this haplotype carries anything there. `variant_nodes.tsv` has no haplotype column — one row per record, holding the union of nodes over every merged event and every carrier — so carrier status is only knowable from the VCF, joined by record id.
 
-That join exists only for the region VCF, and the mode is decided explicitly (reported as `vcf_mode`). A region VCF's record ids must equal the `variant_nodes` id set exactly, in both directions, and agree on `BUBBLE_ID`: a missing row would read as an uncalled carrier, and an extra one would have its edits applied by the genotype level with no truth attribution accounting for them. An allele VCF has one row per bubble (`bubbleN_ALLELES`, and exactly one per bubble, since the `GT` indexes that bubble's allele list) and shares no id with a per-call row — so `carrier` and the per-call `loss_bp` terms do not exist there and are reported `NA` / `not_applicable`. Assuming the join held regardless produced `carrier_walk` 0% and a 1.4 Mb missed-carrier loss on C4, beside a genotype level correctly reading 0 bp residual — arithmetic that summed exactly and meant nothing. Anything matching neither contract is refused.
+That join exists only for the region VCF, and the mode is reported as `vcf_mode`. Region record ids must equal the `variant_nodes` id set and agree on `BUBBLE_ID`. An allele VCF instead has one `bubbleN_ALLELES` record per bubble and no per-call id, so `carrier` and the per-call `loss_bp` terms are reported `NA` / `not_applicable`. Anything matching neither contract is refused.
 
 Within region mode, the block is substituted when any overlapping record has `GT ≥ 1`: one divergent region can be described by several records and different carriers take different ones, so testing only the primary attribution would be testing which record sorted first, not whether the haplotype was called.
 
-A fifth reconstruction, the in-scope floor, substitutes every block reaching `--min-sv-bp` regardless of any call. Its residual is purely sub-threshold variation, so it is the point the others are measured from: without it, sequence `call` was never asked to emit is charged to the caller as a discovery failure. On the standard fixture — two callable 60 bp events, one deliberate 20 bp one, zero missed — `discovery_or_attribution` read 20 bp until the floor was introduced.
+A fifth reconstruction, the in-scope floor, substitutes every block reaching `--min-sv-bp` regardless of any call. Its residual is purely sub-threshold variation, so it separates out-of-scope sequence from discovery failure.
 
-The consecutive differences along `truth → in-scope floor → called → carrier → genotype` are the `loss_bp` partition, and they sum exactly to the genotype residual, which the run asserts (`sum_check`): an attribution whose arithmetic has stopped closing is worthless, and the check caught two of my own errors.
+The consecutive differences along `truth → in-scope floor → called → carrier → genotype` are the `loss_bp` partition, and the run asserts that they sum exactly to the genotype residual (`sum_check`).
 
 This is a partition, not a descending chain. Only `in-scope floor ≥ called ≥ carrier` are nested ceilings — each substitutes a subset of the previous level's blocks, all implanting true sequence. `genotype` sits outside that nesting because it applies every record the haplotype carries rather than only attributed eligible blocks, so it can beat `carrier` locally; the last two terms are signed for exactly that reason.
 
@@ -94,7 +92,7 @@ Apply the genotyped edits, right to left — descending `POS`, so earlier edits 
 | `INV` | reverse-complement `POS+1..END` in place | yes — an inversion carries no new sequence, so the reference supplies all of it |
 | `DUP` | tile an inferred reference span to the per-sample `CNBP` delta, or lay down `CN` copies of `RU_LEN` in place of `REF_CN` under `--dup-model cn` | no — counted `heuristic`. `CNBP` supplies the length change, not the inserted sequence, so what is reconstructed is the right length of approximately right sequence |
 
-Records that cannot be laid down are counted rather than dropped — `unplaceable` (`POS` outside the bubble's span), `clamped` (the edit ran past the span end), `unhandled` (no rule, or no usable payload), `ref_mismatch` (the record's `REF` is not the reference sequence at `POS`, so the placement is wrong and every score downstream would be fiction) — and reported in `gt_records`.
+Records that cannot be laid down are counted rather than dropped — `unplaceable` (`POS` outside the bubble's span), `clamped` (the edit ran past the span end), `unhandled` (no rule or usable payload), and `ref_mismatch` (the record's `REF` does not match the reference at `POS`) — and reported in `gt_records`.
 
 Score against the same truth, and against doing nothing. The plain reference span with no edits is scored alongside as the baseline:
 
@@ -103,7 +101,7 @@ gap_closed          = (baseline_delta - genotype_delta) / (baseline_delta - grap
 variation_recovered = (baseline_delta - <level>_delta)  /  baseline_delta
 ```
 
-`gap_closed` measures against the achievable bound, `variation_recovered` against all the variation there was; reported for every level, the pair says whether representation or the graph is the limit. `gap_closed` is `NA` when `baseline_delta == graph_delta`. Those are equal exactly when nothing was called at the bubble, so the old convention of returning `1.0` on a zero denominator reported a total miss as having closed 100% of the gap.
+`gap_closed` measures against the achievable bound, while `variation_recovered` measures against all variation. `gap_closed` is `NA` when `baseline_delta == graph_delta`, because its denominator is then zero.
 
 The baseline is also the correctness check on the whole projection: a haplotype genotyped as carrying nothing applies no edits, so its genotype reconstruction must be byte-identical to the baseline. Any coordinate, orientation or span error breaks that equality, and it is asserted on real data rather than assumed.
 
@@ -119,20 +117,19 @@ A do-nothing baseline, the plain reference with no edits, is the denominator of 
 
 ## Worked trace
 
-The steps below follow the five above, one for one. Two bubbles, each five nodes of 10 bp; the reference spells `1,2,3,4,5` then `6,7,8,9,10`. Haplotype H:
+The steps below follow the five above, one for one. The first bubble contains a 60 bp node; the second contains a 20 bp replacement whose two sequences differ by one base. Haplotype H:
 
 | bubble | reference walk | H's true walk | call at this bubble |
 |--------|----------------|---------------|---------------------|
-| A | `1,2,3,4,5` | `1,3,4,5`, node 2 deleted | a deletion of node 2, whose node is in the call's node set |
-| B | `6,7,8,9,10` | `6,7,8',9,10`, a substitution | none, since node 8' is in no call's node set |
+| A | `1,2,3,4,5` | `1,3,4,5`, 60 bp node 2 deleted | a deletion of node 2, whose node is in the call's node set |
+| B | `6,7,8,9,10` | `6,7,8',9,10`, a 20 bp substitution | none, since node 8' is in no call's node set |
 
 1. Decompose each haplotype against the reference. At bubble A the shared anchors are `1,3,4,5`, leaving one divergent block between anchors `1` and `3`: the reference side holds node 2 and the haplotype side nothing. At bubble B the anchors are `6,7,9,10`, leaving a block between `7` and `9` holding one node on each side.
 
-2. Classify the truth events. Both blocks are 10 bp, under a 50 bp threshold, so both are below threshold: the caller was never asked to emit either. The ledger records two below-threshold events and nothing missed, which is the firm statement here — nothing eligible went unfound.
+2. Classify the truth events. Under a 50 bp threshold, bubble A is a `called` 60 bp truth event and bubble B is a 20 bp `below_threshold` event. Nothing eligible was missed.
 
-3. Reconstruct at each level. Bubble A's block shares a node with a call, so the graph level substitutes the haplotype's true steps there; the called and carrier levels do not, because the block is under the size threshold. Bubble B's block shares a node with nothing, so no level substitutes it and its 10 bp stays as reference at every level.
+3. Reconstruct at each level. Bubble A's block shares a node with an attributed record and reaches the threshold, so graph, called and carrier substitute its true steps. Bubble B's block is below threshold and shares a node with no record, so every ceiling leaves the reference sequence there.
 
 4. Reconstruct from the VCF alone. The genotype level applies only the edits H's genotype names. The deletion at bubble A is emitted and carried, so it is applied; nothing is emitted at bubble B, so that substitution is left as reference.
 
-5. Partition the residual and compare against a baseline. The residual that remains is one base at the substitution H carries and no record describes. It falls under variation below the size threshold rather than under discovery, since no eligible event was missed. Aggregating, the total difference is 1 against 90 aligned bases, an identity of 0.989.
-
+5. Partition the residual and compare against a baseline. The only remaining mismatch is the one changed base in the 20 bp substitution. It belongs to `out_of_scope`, not discovery, because the truth event itself is below the reporting threshold.

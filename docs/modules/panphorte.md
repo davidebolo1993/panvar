@@ -36,7 +36,7 @@ The CSV must describe the graph handed in, and the sites it selects must be pair
 | `--max-interruption-frac <f>` | fraction of an array's bases that may be interruptions between copies | `0.25` |
 | `--resnarl-min-variant-bp <N>` | interior-span filter applied when re-snarling under `--reference-path` | `50` |
 | `--bubble-id <N>` | restrict to these sites (repeatable) | all |
-| `--allow-partial-boundary` | fold a site even when a copy cannot be bounded by any step range | off |
+| `--allow-partial-boundary` | override the safety refusal if a copy cannot be bounded by a step range; normally unnecessary because fragment nodes preserve partial-node flanks | off |
 | `--no-flip` | with `--reference-path`, skip reorienting to the reference strand | off |
 | `--threads <N>` | workers for approximate detection (`0` = auto) | `0` |
 | `--gtf <path>` | after re-sorting, project genes onto reference nodes; separate from `bubble --gtf` because collapsing renumbers nodes | — |
@@ -81,6 +81,7 @@ The CSV must describe the graph handed in, and the sites it selects must be pair
 - Exact folding seeds from runs of repeated node steps, so two byte-identical copies split at different node boundaries can be missed even though folding them would be lossless.
 - Approximate detection looks for copies sharing an exact short seed, so a copy above `--min-similarity` whose substitutions are spread evenly can go undetected.
 - Where one site carries two phase-rotated units, each becomes its own repeat-unit node. A consumer counting those nodes sees two independent duplications rather than one site's copy number unless it groups them on `canonical_motif` using the provenance table.
+- `--allow-partial-boundary` is a safeguard override for an unobserved edge case, not a normal operating mode; using it can create a mixed folded/literal representation that downstream CN cannot interpret safely.
 
 ## Example
 

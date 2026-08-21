@@ -10,7 +10,7 @@ A sanity-check utility for one called bubble (or all of them) before going downs
 - an edge-count matrix (adjacencies)
 - node lengths
 
-With `--cluster` it also groups structurally identical haplotypes (used for representative-only plots).
+With `--cluster` it also groups sufficiently similar walks and selects a representative for each group.
 
 Algorithm and worked trace: [algorithms/inspect.md](../algorithms/inspect.md).
 

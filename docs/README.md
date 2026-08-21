@@ -18,9 +18,9 @@ Documentation for the `panvar` CLI.
 2. [modules/bubble.md](modules/bubble.md) — bubble-site extraction from a GFA.
 3. [modules/panphorte.md](modules/panphorte.md) — normalize tandem-repeat bubbles into a copy-number-explicit GFA.
 4. [modules/refine.md](modules/refine.md) — (opt-in) POA-realign bubble interiors to remove graph-builder alignment artifacts.
-5. [modules/call.md](modules/call.md) — graph-native SV calling (DEL/INS/INV/DUP) into a multi-sample VCF.
+5. [modules/call.md](modules/call.md) — graph-native SV calling (DEL/INS/INV/DUP), with an interpreted region VCF and an optional explicit-allele VCF.
 6. [modules/describe.md](modules/describe.md) — per-bubble variant, k-mer and node/edge features.
 7. [modules/associate.md](modules/associate.md) — association testing on the `describe` features.
 
 - [modules/inspect.md](modules/inspect.md) — clustering, path FASTA, and node/edge matrices for a called bubble.
-- [modules/benchmark.md](modules/benchmark.md) — round-trip reconstruction identity of the caller's own output.
+- [modules/benchmark.md](modules/benchmark.md) — truth-event discovery, carrier assignment, and sequence reconstruction from caller output.

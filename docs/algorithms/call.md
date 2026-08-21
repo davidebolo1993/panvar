@@ -2,7 +2,7 @@
 
 Mechanism for the `call` module. For usage/flags see [modules/call.md](../modules/call.md); references in [references.md](../references.md#call).
 
-`call` types structural variants by comparing walks rather than sequences. Within a bubble, each haplotype's route from one boundary to the other is a sequence of nodes, and so is the reference's; the difference between the two routes is the variant. Working in node space means an event is defined by which nodes a haplotype does or does not visit, which is exact and cheap, and it lets a tandem array be typed by how many times a node is traversed instead of as a pile of insertions.
+`call` types structural variants by comparing walks rather than aligning their spelled sequences. Within a bubble, each haplotype's route from one boundary to the other is a sequence of nodes, and so is the reference's; the difference between the two routes defines the graph event. This is deterministic and cheap on a fixed graph, and it lets a tandem array be typed by how many times a node is traversed instead of as a pile of insertions. Its biological resolution still depends on how the graph was built, which is why `refine` can improve fragmented event representations without changing the spelled haplotypes.
 
 ## How it works
 
@@ -42,12 +42,12 @@ Once a record's representative is fixed, every haplotype that was not already a 
 
 | record | `POS` | `END` | `END − POS` |
 |---|---|---|---|
-| `DEL` / `INV` | base before the event | last affected base | `SVLEN` in absolute value |
+| precise `DEL` / `INV` | base before the event | last affected base | `SVLEN` in absolute value |
 | `INS` | base before the insertion | `POS` | 0, since an insertion spans no reference |
 | `DUP`, `CN_SCOPE=REPEAT_UNIT` | last base of the upstream flank | last base of the first copy | `RU_LEN` |
 | `DUP`, `CN_SCOPE=COLLAPSED_MODULE` | last base of the near boundary | base before the far boundary | `CN_MODULE_REF_BP` |
 
-The two duplication rows differ because the routes count different things. A repeat unit is one node, so its span is that node's length; a collapsed module's span is the bubble interior, which is what `FORMAT:CNBP` sums over, and both boundaries are excluded from that sum.
+The two duplication rows differ because the routes count different things. A repeat unit is one node, so its span is that node's length; a collapsed module's span is the bubble interior, which is what `FORMAT:CNBP` sums over, and both boundaries are excluded from that sum. A coalesced `DEL` or `INV` can retain reference sequence between its pieces; it is marked `IMPRECISE`, and then `END − POS` describes the enclosing interval rather than `|SVLEN|`.
 
 The identity in the last row holds while every boundary is visited once, and `CN_SPAN_AMBIGUOUS` marks the records where it does not. `POS` and `END` come from the widest span, first source occurrence to last sink; `CN_MODULE_REF_BP` and `CNBP` sum node length by traversal count over the module's nodes. Where a boundary recurs, the span encloses the boundary visits lying between the outermost ones and the node sum does not, so the two differ by exactly that sequence. Treat the identity as a placement check on unflagged records, and a flagged one as a deliberate span choice rather than a uniquely resolved interval.
 
@@ -96,11 +96,11 @@ Copy number is read off the walk rather than inferred from coverage, by one of t
 
 `REP` applies where the array has been folded to a self-loop. The copy number is the number of traversals, which is exact, and `RU_LEN` is a real per-copy length, so `(CN − REF_CN) × RU_LEN` gives the haplotype's size change.
 
-`MODULE_BP` applies where several paralogous copies were collapsed onto shared nodes rather than folded into a unit. There is no single repeat unit to count, so the bases a haplotype carries across the module are divided by a unit calibrated from the reference. `CN_UNIT_BP` is that calibration constant and describes only the content the copies share, so it understates a carrier's real gain or loss; `FORMAT:CNBP` is the per-haplotype size. `--cn-unit-spacing` takes the step from the spacing of the panel's own values instead of from the reference, and `--max-cn-model-residual` refuses the call when the values do not fall near a consistent ladder.
+`MODULE_BP` applies where several paralogous copies were collapsed onto shared nodes rather than folded into a unit. There is no single repeat unit to count, so the bases a haplotype carries across the module are divided by a unit calibrated from the reference. `CN_UNIT_BP` is that calibration constant and describes only the content the copies share, so it can understate a carrier's real gain or loss; `FORMAT:CNBP` is the per-haplotype size. `--cn-unit-spacing` instead estimates a step from the panel's copy-state clusters. `--max-cn-model-residual` can refuse the record when too many traversers lie more than 0.4 units from an integer; it is off by default because a heterogeneous module can have an exact validated integer CN despite a large rounding diagnostic.
 
 `PEAK` applies where neither of the above does: copy number is taken from the highest multiplicity any interior node reaches. One short node visited several times can set it, so absolute copy number on this route is a heuristic and the records say so with `CN_CONFIDENCE=HEURISTIC`.
 
-Without `--cn`, only the self-loop route runs, since it needs no inference. A folded extra copy then surfaces as an ordinary insertion, flagged `INS_SUBTYPE=DUP` under `--classify-ins`, and a lost copy as a deletion, neither carrying a per-sample copy number.
+The `REP` route is always active because a self-loop traversal count is explicit in the graph. `--cn` additionally enables the inferred `MODULE_BP` and `PEAK` routes. Without it, non-`REP` repeated structures remain sequence-resolved `DEL`/`INS`/`INV` events and receive no inferred module copy number.
 
 ## Gene annotation
 
