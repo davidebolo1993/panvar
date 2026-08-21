@@ -46,14 +46,14 @@ The surviving bubbles are written to `<prefix>.bubbles.csv` (consumed by `inspec
 
 ## Worked trace
 
-Input graph, one bubble (`+` = forward strand):
+The steps below follow the six above, one for one. Input graph, one bubble (`+` = forward strand):
 
 ```text
 S  1  T                       flank
-S  2  GG                      source boundary
-S  3  AC                      interior allele "ref"  (2 bp)
-S  4  ATG                     interior allele "alt"  (3 bp)
-S  5  CC                      sink boundary
+S  2  GG                      first boundary
+S  3  ATG                     interior allele, 3 bp, carried by hA
+S  4  AC                      interior allele, 2 bp, carried by the reference and hB
+S  5  CC                      second boundary
 S  6  A                       flank
 L  1  +  2  +  0M
 L  2  +  3  +  0M
@@ -63,22 +63,24 @@ L  4  +  5  +  0M
 L  5  +  6  +  0M
 L  1  +  6  +  0M             bypass edge: hC skips the locus entirely
 L  2  +  5  +  0M             deletion of the interior: hD
-P  ref  1+,2+,3+,5+,6+  *
-P  hA   1+,2+,4+,5+,6+  *
-P  hB   1+,2+,3+,5+,6+  *
+P  ref  1+,2+,4+,5+,6+  *
+P  hA   1+,2+,3+,5+,6+  *
+P  hB   1+,2+,4+,5+,6+  *
 P  hC   1+,6+           *     reaches neither boundary
 P  hD   1+,2+,5+,6+     *     crosses the site carrying nothing
 ```
 
-1. Find snarls. The cactus finder returns the boundary pair `{2, 5}`: removing nodes 2 and 5 isolates `{3, 4}`.
+1. Sort and flip. Node ids already follow the reference and every node reads forward, so the sorted graph is identical to the input and `<prefix>.sorted.gfa` is a copy of it. On a graph that is not already in this frame the ids are reassigned here, and the ids in every output below are the new ones.
 
-2. Order the boundaries. The reference reaches 2 before 5, so the pair is stored `source = 2`, `sink = 5`, both read forward.
+2. Find snarls. The cactus finder returns the boundary pair `{2, 5}`: removing nodes 2 and 5 isolates `{3, 4}`. There is no smaller snarl nested inside it.
 
-3. Determine the interior and score it. Per path, take the crossing and collect what lies between the boundaries: `ref → {3}`, `hA → {4}`, `hB → {3}`, `hD → {}`. `hC` reaches neither boundary and does not cross. So `path_support = 4`, and the three walks taken are `{3}` (by ref and hB), `{4}` (hA) and the empty one (hD), giving `distinct_alleles = 3`, `ref_allele_support = 2`, and both alternate-support figures 1. Interior span runs from 0, hD's deletion, to 3, the `ATG` allele.
+3. Order the boundaries along the reference. The reference reaches 2 before 5, so the pair is stored `source = 2`, `sink = 5`. The reference reads both forward, so `source_orient` and `sink_orient` are `+`.
 
-4. Filter and emit. With the size floor low enough to admit a 3 bp interior the site is kept and one row is written. A `--min-variant-bp` above 3 drops it, since no crossing carries more than that between the boundaries. A `--min-alt-support` above 1 also drops it, since neither non-reference walk here is carried by more than one path.
+4. Determine the interior and score it. The interior from the graph is `{3, 4}`, everything lying between the two boundaries; the crossing paths add nothing beyond it. Per path, what lies between the boundaries is `ref → {4}`, `hA → {3}`, `hB → {4}`, `hD → {}`; `hC` reaches neither boundary and does not cross. So `path_support` is 4, and the walks taken are `{4}` by the reference and hB, `{3}` by hA, and the empty one by hD: `distinct_alleles` 3, `ref_allele_support` 2, and both alternate figures 1. Interior span runs from `min_inside_bp` 0, hD's deletion, to `max_inside_bp` 3, the `ATG` allele.
 
-Resulting `bubbles.csv` row:
+5. Filter and merge. With the size floor low enough to admit a 3 bp interior the site is kept. Raising `--min-variant-bp` above 3 drops it, since no crossing carries more than that between the boundaries; raising `--min-alt-support` above 1 also drops it, since neither non-reference walk is carried by more than one path. There is only one site, so merging has nothing to join. The interior contains no cycle, so `--superbubbles` keeps it too.
+
+6. Emit. One row is written to `<prefix>.bubbles.csv`, alongside the sorted GFA and the Bandage files:
 
 ```text
 bubble_id  source  sink  inside_node_count  path_support  distinct_alleles  ref_allele_support  alt_allele_support_max  min_inside_bp  max_inside_bp  inside_nodes
