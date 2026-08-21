@@ -61,13 +61,22 @@ if (is.null(tp)) usage(1)
 
 d <- read.delim(tp, check.names = FALSE, stringsAsFactors = FALSE)
 need <- c("locus", "sum_aln_len", "sum_delta", "truth_missed_bp", "truth_below_bp")
+# The genotype level is optional so an older table still plots, but without it the left panel shows
+# only the graph CEILING -- which reads ~100% everywhere and is not what a consumer of the VCF gets.
+has_gt <- all(c("gt_sum_delta", "gt_sum_aln_len") %in% names(d))
 miss <- setdiff(need, names(d))
 if (length(miss)) stop("table missing columns: ", paste(miss, collapse = ", "),
                        "  (re-run `panvar benchmark` to add the truth-event ledger columns)")
 
-a <- aggregate(cbind(sum_aln_len, sum_delta, truth_missed_bp, truth_below_bp) ~ locus, d, sum)
+agg_cols <- c("sum_aln_len", "sum_delta", "truth_missed_bp", "truth_below_bp")
+if (has_gt) agg_cols <- c(agg_cols, "gt_sum_delta", "gt_sum_aln_len")
+a <- aggregate(d[agg_cols], by = list(locus = d$locus), FUN = sum)
 a <- a[a$sum_aln_len > 0, ]
-a$recon <- 100 * (a$sum_aln_len - a$sum_delta) / a$sum_aln_len   # identity, % of aligned
+a$recon <- 100 * (a$sum_aln_len - a$sum_delta) / a$sum_aln_len   # GRAPH ceiling, % of aligned
+if (has_gt) {
+  a$gtrecon <- 100 * (a$gt_sum_aln_len - a$gt_sum_delta) / a$gt_sum_aln_len   # what the VCF gives
+  a$gtresid <- 100 - a$gtrecon
+}
 a$resid <- 100 * a$sum_delta / a$sum_aln_len                     # residual,  % of aligned
 a$ncall <- 100 * a$truth_below_bp / a$sum_aln_len               # ledger, absolute % of aligned
 a$mis   <- 100 * a$truth_missed_bp / a$sum_aln_len
@@ -97,16 +106,35 @@ panel <- function(df, cols, ymin, ymax, title) {
           strip.background = element_blank(), strip.text = element_blank(),
           panel.grid.major.x = element_blank(), axis.text.x = element_text(angle = 60, hjust = 1, size = 7))
 }
-p_left  <- panel(left,  c("Reconstructed" = "#3a9679", "Residual" = "#dcdcdc"), left_ymin, 100, "Reconstruction")
+# The panels NAME their level. The left one is the graph ceiling: it implants the haplotype's own true
+# block wherever a call shares a node with it, so it reads near 100% at every locus and is not what a
+# consumer of the VCF gets. Publishing it under the bare word "Reconstruction" is how "every haplotype
+# reconstructs above 99.9%" ended up in the walkthrough describing a number nobody could reproduce
+# from the emitted records.
+p_left  <- panel(left,  c("Reconstructed" = "#3a9679", "Residual" = "#dcdcdc"), left_ymin, 100,
+                 "Graph ceiling (implants the true block)")
 p_right <- panel(right, c("Below threshold" = "#74add1", "Missed" = "#d73027"), 0,
                  max(c(a$ncall, a$mis, a$resid)) * 1.05, "Variation found")
+if (has_gt) {
+  gt <- mkdf(c("Reconstructed" = "gtrecon", "Residual" = "gtresid"))
+  gt$locus <- factor(gt$locus, levels = lv)
+  gt$component <- factor(gt$component, levels = c("Reconstructed", "Residual"))
+  p_gt <- panel(gt, c("Reconstructed" = "#2c7fb8", "Residual" = "#dcdcdc"),
+                max(0, min(a$gtrecon) - 5), 100, "From the VCF alone (what a consumer gets)")
+}
 
-w <- max(9, min(22, 2 * (0.30 * per_row + 1.2)))
+ncol <- if (has_gt) 3 else 2
+w <- max(9, min(30, ncol * (0.30 * per_row + 1.2)))
 h <- 1.2 + 2.3 * nr
 png(paste0(out, ".png"), width = w, height = h, units = "in", res = dpi)
 grid.newpage()
-pushViewport(viewport(layout = grid.layout(1, 2)))
+pushViewport(viewport(layout = grid.layout(1, ncol)))
 print(p_left,  vp = viewport(layout.pos.row = 1, layout.pos.col = 1))
-print(p_right, vp = viewport(layout.pos.row = 1, layout.pos.col = 2))
+if (has_gt) {
+  print(p_gt,  vp = viewport(layout.pos.row = 1, layout.pos.col = 2))
+  print(p_right, vp = viewport(layout.pos.row = 1, layout.pos.col = 3))
+} else {
+  print(p_right, vp = viewport(layout.pos.row = 1, layout.pos.col = 2))
+}
 invisible(dev.off())
 cat(sprintf("wrote %s.png  (%d genes, %d row(s), %d per row; left y %g-100)\n", out, nrow(a), nr, per_row, left_ymin))

@@ -207,9 +207,15 @@ How faithfully do the calls reconstruct the haplotypes? For each called bubble a
   -o "$OUT/benchmark/benchmark"
 ```
 
-The per-gene headline is per-haplotype reconstruction identity (`1 − Σδ/ΣS`) — length-fair, unlike an absolute QV that a short region can never push high. `scripts/plot_benchmark.R` draws the per-gene anatomy: the left panel stacks Reconstructed (identity) + Residual to 100% of the aligned sequence, and the right panel splits that residual only into Not-callable (sub-threshold) vs Mis-called (≥ threshold) — so a tiny residual stays legible:
+The per-gene headline is per-haplotype reconstruction **identity** (`1 − Σδ/ΣS`) — length-fair, unlike an absolute QV that a short region can never push high. `scripts/plot_benchmark.R` draws three panels, and the first two are the same measurement at two different levels:
+
+- **Graph ceiling** — near 100% at every locus, because it implants the haplotype's own true block wherever a call shares a node with it. This is a bound on the graph and the discovery, not a genotyping result.
+- **From the VCF alone** — the reference plus only the edits this haplotype's `GT` names. 85.3% at LPA to 99.7% at ANKRD36C.
+- **Variation found** — the residual split into Below threshold (sub-threshold, correctly not called) vs Missed (≥ threshold and not called). Missed is zero everywhere.
 
 ![Round-trip reconstruction anatomy](img/benchmark_qv.png)
+
+Note that panel two is **identity**, a per-base fraction, while `results/reconstruction.tsv` reports **gap closed**, the fraction of the reference-to-truth *distance* the VCF removes. They are different questions and they read differently — LPA is 85.3% identity and 75.5% gap closed — so neither number should be quoted without its name.
 
 `benchmark` reports **four levels**, and they answer four different questions. Quoting one without saying which it is has caused more confusion in this project than any other single thing, so they are always named:
 
