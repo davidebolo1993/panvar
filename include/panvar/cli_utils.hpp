@@ -81,6 +81,13 @@ void commit_staged(const std::string& staged, const std::string& final_path);
 
 // Every output of one command, staged together and committed only once the command has succeeded.
 // Anything still staged when the set is destroyed is removed, so a throw leaves no partial output.
+// Refuse, before anything is opened, two outputs that name one file or any output that names an
+// input. Empty entries are ignored, so a caller can pass optional destinations unconditionally.
+// Comparison is by weakly_canonical path, so a symlink or a second mount point is caught too.
+void reject_output_collisions(const std::string& module,
+                              const std::vector<std::string>& outputs,
+                              const std::vector<std::string>& inputs);
+
 class StagedOutputs {
 public:
     explicit StagedOutputs(std::string module);

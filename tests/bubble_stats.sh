@@ -391,6 +391,20 @@ r70_min=$(cel "$OUT/repeat70.bubbles.csv" min_inside_bp)
 [ "$r70_min" = "20" ] && ok "the one-copy haplotype still sets min_inside_bp (20)" \
                       || bad "min_inside_bp=$r70_min, expected 20"
 
+# ------------------------------------------- two outputs may not name one file
+# Input/output aliasing was refused; output/output collision was not, so the run succeeded and left
+# whichever file happened to be installed last. Both rules now live in cli_utils so this and `inspect`
+# cannot drift apart the way the reference-alias rule once did.
+"$BIN" bubble -i "$OUT/del.gfa" -r full -o "$OUT/coll" --min-variant-bp 0 \
+       --bubbles-csv "$OUT/both.csv" --bandage-csv "$OUT/both.csv" -q >/dev/null 2>&1
+[ "$?" -ne 0 ] && [ ! -f "$OUT/both.csv" ] \
+  && ok "two outputs naming one file are refused, and nothing is written" \
+  || bad "colliding --bubbles-csv/--bandage-csv were accepted"
+"$BIN" bubble -i "$OUT/del.gfa" -r full -o "$OUT/coll2" --min-variant-bp 0 \
+       --bubbles-csv "$OUT/del.gfa" -q >/dev/null 2>&1
+[ "$?" -ne 0 ] && ok "an output naming the input graph is refused" \
+              || bad "an output aliasing the input was accepted"
+
 # ------------------------------------------- a failed commit leaves the previous family untouched
 # StagedOutputs is shared by every module, so this asserts a cross-module contract through the module
 # that happens to write the smallest multi-file family. Outputs were staged but installed one after

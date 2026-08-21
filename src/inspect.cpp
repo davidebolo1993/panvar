@@ -766,29 +766,7 @@ int run_inspect_command(const std::vector<std::string>& args) {
             finals.push_back(stem + ".node_lengths.tsv");
             if (cluster) finals.push_back(stem + ".clusters.tsv");
         }
-        const auto canon = [](const std::string& p) {
-            std::error_code ec;
-            const auto c = std::filesystem::weakly_canonical(p, ec);
-            return ec ? std::filesystem::path(p) : c;
-        };
-        std::unordered_map<std::string, std::string> seen;
-        for (const std::string& f : finals) {
-            const std::string key = canon(f).string();
-            const auto it = seen.find(key);
-            if (it != seen.end()) {
-                throw std::runtime_error("inspect: two outputs would be written to the same file: " +
-                                         (it->second == f ? f : it->second + " and " + f));
-            }
-            seen.emplace(key, f);
-        }
-        for (const std::string* in : {&gfa_path, &bubbles_csv_path}) {
-            if (in->empty()) continue;
-            const std::string key = canon(*in).string();
-            const auto it = seen.find(key);
-            if (it != seen.end())
-                throw std::runtime_error("inspect: output '" + it->second +
-                                         "' is the same file as input '" + *in + "'");
-        }
+        cli::reject_output_collisions("inspect", finals, {gfa_path, bubbles_csv_path});
     }
 
     cli::ProgressBar progress((single_bubble || quiet) ? "" : "Inspecting bubbles",

@@ -9,6 +9,8 @@
 #include <ctime>
 #include <exception>
 #include <filesystem>
+#include <map>
+#include <vector>
 #include <iostream>
 #include <stdexcept>
 #include <utility>
@@ -261,6 +263,34 @@ void commit_staged(const std::string& staged, const std::string& final_path) {
                                std::filesystem::copy_options::overwrite_existing, ec);
     std::filesystem::remove(staged);
     if (ec) throw std::runtime_error("cannot move output into place: " + final_path);
+}
+
+void reject_output_collisions(const std::string& module,
+                              const std::vector<std::string>& outputs,
+                              const std::vector<std::string>& inputs) {
+    const auto canon = [](const std::string& p) {
+        std::error_code ec;
+        const auto c = std::filesystem::weakly_canonical(p, ec);
+        return (ec || c.empty()) ? std::filesystem::path(p).string() : c.string();
+    };
+    std::map<std::string, std::string> seen;   // canonical -> the spelling the user gave
+    for (const std::string& out : outputs) {
+        if (out.empty()) continue;
+        const auto [it, fresh] = seen.emplace(canon(out), out);
+        if (!fresh) {
+            throw std::runtime_error(module + ": two outputs would be written to the same file: " +
+                                     (it->second == out ? out : it->second + " and " + out));
+        }
+    }
+    for (const std::string& in : inputs) {
+        if (in.empty()) continue;
+        const auto it = seen.find(canon(in));
+        if (it != seen.end()) {
+            throw std::runtime_error(module + ": output '" + it->second +
+                                     "' is the same file as input '" + in +
+                                     "'; refusing to overwrite it");
+        }
+    }
 }
 
 StagedOutputs::StagedOutputs(std::string module) : module_(std::move(module)) {}

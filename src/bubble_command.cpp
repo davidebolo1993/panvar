@@ -40,8 +40,11 @@ void print_bubble_help() {
         << "      --no-flip                    Do not reorient nodes to the reference forward strand\n"
         << "      --sorted-gfa-out <path>      Internally-sorted GFA output (default: <prefix>.sorted.gfa)\n"
         << "      --emit-snarls-jsonl <path>   Also write the internal snarls as a vg-style JSONL\n"
-        << "      --snarls-in <path>           Override: snarl JSONL from 'vg snarls -A integrated | vg view -R -j' (skips\n"
-        << "                                    internal sort + finding)\n"
+        << "      --snarls-in <path>           Override: snarl JSONL from 'vg snarls -A integrated | vg view -R -j'\n"
+        << "                                   (skips internal sort + finding). WITHOUT --reference-path this\n"
+        << "                                   mode is DIAGNOSTIC-ONLY: imported boundaries are unordered, so\n"
+        << "                                   source/sink do not mean reference-left/right, merging is skipped\n"
+        << "                                   and no sorted graph is written\n"
         << "  -o, --out-prefix <prefix>        Output prefix (default: bubble_calls)\n"
         << "      --bubbles-csv <path>         Explicit bubbles CSV output path\n"
         << "      --bandage-csv <path>         Explicit Bandage color CSV output path\n"
@@ -49,10 +52,14 @@ void print_bubble_help() {
         << "                                    nodes and write <prefix>.bandage_genes.csv (Bandage).\n"
         << "                                    Requires a PanSN reference path; skipped otherwise.\n"
         << "      --snarl-debug-tsv <path>     Optional diagnostics TSV for snarl candidates\n"
-        << "      --min-variant-bp <N>         Keep bubbles with at least one path carrying >= N bp\n"
-        << "      --max-variant-bp <N>         Largest variant to keep: drop bubbles whose longest path\n"
-        << "                                   exceeds N bp (0 = no cap; tames hypervariable tangles)\n"
-        << "                                    inside the bubble (default: 50, 0=disable)\n"
+        << "      --min-variant-bp <N>         Keep bubbles where some path carries >= N bp INSIDE the\n"
+        << "                                   bubble (default: 50, 0 = disable). This is interior SPAN,\n"
+        << "                                   not divergence from the reference: a 1 bp substitution\n"
+        << "                                   inside a 1 kb allele has a 1 kb span and passes at 50.\n"
+        << "                                   --min-interior-bp is the same option, named honestly\n"
+        << "      --max-variant-bp <N>         Drop bubbles whose longest interior span exceeds N bp\n"
+        << "                                   (0 = no cap; tames hypervariable tangles).\n"
+        << "                                   --max-interior-bp is the same option\n"
         << "      --min-path-support <N>       Require at least N supporting P/W paths (default: 0).\n"
         << "                                   This is TRAVERSAL support -- on a fully-typed panel nearly\n"
         << "                                   every haplotype crosses nearly every bubble, so it says\n"
@@ -213,28 +220,15 @@ int run_bubble_command(const std::vector<std::string>& args) {
     parse_options.include_paths = true;
     parse_options.include_sequences = true;
 
-    // Refuse to write any output over any input. `bubble` writes the sorted GFA before discovery even
-    // begins, so an aliased path destroys the graph it is about to read.
-    {
-        const std::string* inputs[] = {&gfa_path, &options.snarls_input_path, &gtf_path};
-        const std::string* outs[] = {&bubbles_csv_path, &bandage_csv_path, &sorted_gfa_path,
-                                     &bandage_genes_path, &snarl_debug_tsv_path,
-                                     &emit_snarls_jsonl_path};
-        for (const std::string* in : inputs) {
-            if (in->empty()) continue;
-            std::error_code ec;
-            const std::filesystem::path in_p = std::filesystem::weakly_canonical(*in, ec);
-            if (ec || in_p.empty()) continue;
-            for (const std::string* out : outs) {
-                if (out->empty()) continue;
-                std::error_code e2;
-                const std::filesystem::path o = std::filesystem::weakly_canonical(*out, e2);
-                if (!e2 && in_p == o)
-                    throw std::runtime_error("bubble: output '" + *out + "' is the same file as input '" +
-                                             *in + "'; refusing to overwrite it");
-            }
-        }
-    }
+    // Refuse to write any output over any input -- `bubble` writes the sorted GFA before discovery even
+    // begins, so an aliased path destroys the graph it is about to read -- and refuse two outputs that
+    // name one file, which used to succeed and leave whichever was written last. Both rules live in
+    // cli_utils so this and `inspect` cannot drift apart the way the reference-alias rule once did.
+    cli::reject_output_collisions(
+        "bubble",
+        {bubbles_csv_path, bandage_csv_path, sorted_gfa_path, bandage_genes_path,
+         snarl_debug_tsv_path, emit_snarls_jsonl_path},
+        {gfa_path, options.snarls_input_path, gtf_path});
 
     // Nothing lands in its final location until the run has succeeded: a malformed input used to exit
     // non-zero having already left a complete-looking .sorted.gfa behind, which the next command in a
@@ -308,8 +302,14 @@ int run_bubble_command(const std::vector<std::string>& args) {
         // reference there is nothing to orient them by: source/sink do not mean reference-left/right,
         // and every consumer that reads them as an interval is then reading a coin flip.
         if (options.reference_path.empty()) {
-            std::cerr << "warning: --snarls-in without --reference-path: bubble boundaries are "
-                         "unordered, so source/sink do not mean reference-left/right\n";
+            std::cerr << "warning: --snarls-in without --reference-path produces DIAGNOSTIC-ONLY "
+                         "output, not input for the rest of the pipeline. Imported boundaries are an "
+                         "unordered pair and this mode does not sort, so source/sink do not mean "
+                         "reference-left/right, boundary orientations are defaults rather than "
+                         "measurements, reference-coordinate merging is skipped, and no sorted graph "
+                         "is written. `call` anchors coordinates on the source, so a downstream run "
+                         "would place records by a coin flip. Supply --reference-path for output any "
+                         "later module should consume.\n";
         }
         site_mode = "snarl (JSONL import)";
     }

@@ -5,6 +5,7 @@
 #include "panvar/cli_utils.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <iostream>
 #include <cstdint>
@@ -61,6 +62,12 @@ using CandidateMap = std::unordered_map<EndpointKey, BubbleCandidateIdx, Endpoin
 // while `bubble_steps` handled it correctly everywhere else. Aliasing rather than duplicating removes
 // the class of divergence, not just this instance.
 using PathIndex = BubblePathIndex;
+
+// How many endpoint pairs fell back from the graph-derived interior to the path-derived one because
+// the handle traversal hit its cap. The fallback is a silent downgrade of a stated contract -- the
+// interior stops being "what the graph carries between the boundaries" and becomes "what this panel
+// happened to walk" -- so the run must say when it happened. Atomic because discovery is threaded.
+std::atomic<std::size_t> g_interior_traversal_truncated{0};
 
 // Defined below, next to the rest of the interior machinery; declared here because merging needs to
 // recompute a fused bubble's interior with exactly the rule discovery used.
@@ -577,6 +584,8 @@ std::unordered_set<std::uint32_t> interior_indices_for_pair(
                     if (idx == src_idx || idx == sink_idx) continue;
                     inside_idx_set.insert(idx);
                 }
+            } else {
+                g_interior_traversal_truncated.fetch_add(1, std::memory_order_relaxed);
             }
         }
     }
@@ -1067,6 +1076,17 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
     };
 
     apply_filters(bubbles);
+
+    // Always reported, quiet or not: the interior of every affected site is panel-derived rather than
+    // graph-derived, so an allele nobody in this panel carries is missing from it, and everything
+    // computed from `inside` -- the span filters, the --superbubbles acyclicity search, the emitted
+    // interior -- silently inherits that. A user cannot tell from the output that it happened.
+    if (const std::size_t truncated = g_interior_traversal_truncated.exchange(0); truncated > 0) {
+        std::cerr << "[bubble] WARNING: the graph-derived interior search hit its "
+                  << kMaxInteriorHandles << "-handle cap on " << truncated
+                  << " endpoint pair(s); their interiors are PANEL-derived, so a branch no stored path"
+                     " walks is not counted as part of those sites\n";
+    }
 
     if (options.merge_nearby_bp > 0 && bubbles.size() > 1) {
         const std::size_t before = bubbles.size();
