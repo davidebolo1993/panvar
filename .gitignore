@@ -26,6 +26,10 @@ tests/real_data/*.gtf.gz
 chiara_test/*
 
 
-# Genotype experiment run output (the scripts are tracked; their results are not).
-experiments/*.tsv
-!experiments/genotype_seed_slopes.tsv
+# Local-only working material. None of this belongs in the published repository:
+#   experiments/  genotype proof-of-concepts for the module that is not released
+#   docs/reports/ dated review write-ups, kept for the authors rather than for users
+#   docs/review_followups.md  the release ledger -- internal working state, not documentation
+experiments/
+docs/reports/
+docs/review_followups.md
