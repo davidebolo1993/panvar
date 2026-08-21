@@ -1665,7 +1665,8 @@ void emit_variant_substrate(const DescribeOptions& options, DescribeSummary& sum
     std::string line;
     bool saw_header = false;
     std::size_t lineno = 0;
-    std::unordered_set<std::string> seen_ids;
+    std::unordered_set<std::string> seen_ids;     // record IDs as they appear in the VCF
+    std::unordered_set<std::string> emitted_ids;  // feature ids actually written, generated included
     while (std::getline(vin, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty()) continue;
@@ -1725,7 +1726,23 @@ void emit_variant_substrate(const DescribeOptions& options, DescribeSummary& sum
             if (used != nalleles_s.size() || nalleles < 1)
                 throw std::runtime_error("describe --variant-vcf: record '" + id + "' has NALLELES='" +
                                          nalleles_s + "', which is not a positive integer");
+            // NALLELES drives how many dosage rows this record emits and which GT indices they test,
+            // so a value that disagrees with the ALT column silently produces rows for alleles that do
+            // not exist, or omits ones that do. It counts REF plus the ALTs.
+            const std::size_t n_alt = (f[4] == "." || f[4].empty()) ? 0 : split_on(f[4], ',').size();
+            if (static_cast<std::size_t>(nalleles) != n_alt + 1)
+                throw std::runtime_error("describe --variant-vcf: record '" + id + "' declares NALLELES=" +
+                                         nalleles_s + " but its ALT column carries " +
+                                         std::to_string(n_alt) + " allele(s); the two must agree "
+                                         "(NALLELES counts REF plus the ALTs)");
         }
+        // Number=A fields carry one value per ALT. AF is read per row below; a list of the wrong
+        // length would label an allele with another allele's frequency.
+        if (!af.empty() && af != "." && af_parts.size() > 1 &&
+            af_parts.size() != static_cast<std::size_t>(nalleles > 1 ? nalleles - 1 : 1))
+            throw std::runtime_error("describe --variant-vcf: record '" + id + "' has AF with " +
+                                     std::to_string(af_parts.size()) + " value(s), which is not one "
+                                     "per ALT (Number=A)");
         const std::vector<std::string> fmt_keys = split_on(f[8], ':');
         int gt_i = -1, cn_i = -1;
         for (std::size_t i = 0; i < fmt_keys.size(); ++i) {
@@ -1742,9 +1759,15 @@ void emit_variant_substrate(const DescribeOptions& options, DescribeSummary& sum
         for (int a = 0; a < n_rows; ++a) {
             VariantBimbam v;
             v.id = is_multi ? (id + "_a" + std::to_string(a + 1)) : id;
-            if (is_multi && seen_ids.count(v.id))
-                throw std::runtime_error("describe --variant-vcf: generated per-ALT id '" + v.id +
-                                         "' collides with a record that already has that ID");
+            // Every EMITTED feature id, generated or not, goes in one namespace. Checking a generated
+            // id only against the record ids read SO FAR left the other direction open: a real record
+            // later in the file named `X_a1` collided with a generated `X_a1` from an earlier
+            // multiallelic `X`, and the two dosage rows then shared a key in every downstream join.
+            // Order-independent because both kinds are inserted here.
+            if (!emitted_ids.insert(v.id).second)
+                throw std::runtime_error("describe --variant-vcf: feature id '" + v.id +
+                                         "' is emitted twice; per-ALT ids and record IDs share one "
+                                         "namespace and must be unique across both");
             v.svtype = svtype.empty() ? "." : svtype;
             v.bubble = bubble; v.nodes = nodes.empty() ? "." : nodes;
             v.gene = gene.empty() ? "." : gene;
@@ -1867,7 +1890,13 @@ void emit_variant_substrate(const DescribeOptions& options, DescribeSummary& sum
     // true value, and put the same partial sample into the recomputed AC/AN. The k-mer and graph
     // substrates already require all; this one did not.
     if (!options.samples_path.empty()) {
-        const auto cosigt = read_cosigt_table(options.samples_path);
+        // Validated against the VCF's own haplotype columns, exactly as the graph substrate validates
+        // against graph path names. Without it an unknown haplotype survived this mode and produced a
+        // silently incomplete sample genotype -- a diploid missing one homologue, reported as covered
+        // at half its dosage -- where every other substrate would have refused the input outright.
+        std::unordered_set<std::string> vcf_haps(hap_order.begin(), hap_order.end());
+        const auto cosigt = read_cosigt_table(options.samples_path, &vcf_haps,
+                                              "a haplotype column in --variant-vcf");
         const auto& path_to_samples = cosigt.first;
         const auto& sample_order = cosigt.second;
         std::unordered_map<std::string, std::vector<std::string>> sample_to_paths;

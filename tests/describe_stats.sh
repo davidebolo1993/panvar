@@ -282,5 +282,48 @@ check "a user's bubble_notes/ is not treated as generated output" \
 check "nor is bubble_readme.md" "$([ -f "$TXO/bubble_readme.md" ] && echo kept || echo DELETED)" "kept"
 check "while the generated bubble_1 is still installed" "$([ -d "$TXO/bubble_1" ] && echo yes || echo no)" "yes"
 
+# ---------------------------------------------------------------- variant-substrate input contracts
+# A minimal --variant-vcf: two haplotype columns, one biallelic record. `describe` needs BUBBLE_ID in
+# INFO and GT first in FORMAT; everything else here exists to be made wrong one field at a time.
+vcf_head() {
+  printf '##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\thapA\thapB\n'
+}
+# panvar exits 2 on a refusal, so assert the CLASS of outcome rather than a specific code
+verdict() { [ "$1" -eq 0 ] && echo accepted || echo refused; }
+VV="$OUT/variant"; mkdir -p "$VV"
+{ vcf_head; printf 'chr1\t100\trec1\tA\tG\t.\tPASS\tSVTYPE=SNV;BUBBLE_ID=1\tGT\t1\t0\n'; } > "$VV/ok.vcf"
+"$BIN" describe --only-variant --variant-vcf "$VV/ok.vcf" --out-dir "$VV/ok_out" -q >/dev/null 2>&1
+check "a well-formed --variant-vcf is accepted" "$(verdict $?)" "accepted"
+
+# --samples names a haplotype the VCF does not have. The graph substrate validates every assignment
+# against graph path names; this mode called the same reader without the VCF's column set, so an
+# unknown name survived and produced a diploid missing one homologue, reported covered at half dosage.
+printf 'sample\thap1\thap2\nS1\thapA\thapZZZ\n' > "$VV/bad_samples.tsv"
+"$BIN" describe --only-variant --variant-vcf "$VV/ok.vcf" --samples "$VV/bad_samples.tsv" \
+       --out-dir "$VV/bad_out" -q >/dev/null 2>&1
+check "--samples naming a haplotype absent from the VCF is refused" "$(verdict $?)" "refused"
+printf 'sample\thap1\thap2\nS1\thapA\thapB\n' > "$VV/good_samples.tsv"
+"$BIN" describe --only-variant --variant-vcf "$VV/ok.vcf" --samples "$VV/good_samples.tsv" \
+       --out-dir "$VV/good_out" -q >/dev/null 2>&1
+check "--samples naming only real haplotype columns is accepted" "$(verdict $?)" "accepted"
+
+# NALLELES counts REF plus the ALTs and decides how many dosage rows are emitted and which GT indices
+# they test, so a value disagreeing with the ALT column invents or omits alleles.
+{ vcf_head; printf 'chr1\t100\trec1\tA\tG,T\t.\tPASS\tBUBBLE_ID=1;NALLELES=4\tGT\t1\t2\n'; } > "$VV/nall.vcf"
+"$BIN" describe --only-variant --variant-vcf "$VV/nall.vcf" --out-dir "$VV/nall_out" -q >/dev/null 2>&1
+check "NALLELES disagreeing with the ALT cardinality is refused" "$(verdict $?)" "refused"
+{ vcf_head; printf 'chr1\t100\trec1\tA\tG,T\t.\tPASS\tBUBBLE_ID=1;NALLELES=3\tGT\t1\t2\n'; } > "$VV/nall_ok.vcf"
+"$BIN" describe --only-variant --variant-vcf "$VV/nall_ok.vcf" --out-dir "$VV/nall_ok_out" -q >/dev/null 2>&1
+check "NALLELES agreeing with the ALT cardinality is accepted" "$(verdict $?)" "accepted"
+
+# A generated per-ALT id was checked only against record IDs read SO FAR, so the other direction was
+# open: a real record LATER in the file named rec1_a1 collided with the generated rec1_a1 above it,
+# and the two dosage rows then shared a key in every downstream join.
+{ vcf_head
+  printf 'chr1\t100\trec1\tA\tG,T\t.\tPASS\tBUBBLE_ID=1;NALLELES=3\tGT\t1\t2\n'
+  printf 'chr1\t200\trec1_a1\tC\tA\t.\tPASS\tBUBBLE_ID=2\tGT\t1\t0\n'; } > "$VV/collide.vcf"
+"$BIN" describe --only-variant --variant-vcf "$VV/collide.vcf" --out-dir "$VV/coll_out" -q >/dev/null 2>&1
+check "a later record colliding with an earlier generated per-ALT id is refused" "$(verdict $?)" "refused"
+
 printf "%d assertion(s) failed\n" "$fails"
 [ "$fails" -eq 0 ]
