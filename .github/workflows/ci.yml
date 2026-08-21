@@ -55,9 +55,15 @@ jobs:
             echo "genotype is listed in the default build's help; it must be excluded" >&2
             exit 1
           fi
-          # It must refuse by NAME rather than as an unknown subcommand.
-          ./build/panvar genotype 2>&1 | grep -q "not built in this release" \
-            || { echo "genotype did not refuse with the expected message" >&2; exit 1; }
+          # It must refuse by NAME rather than as an unknown subcommand. `panvar genotype` exits
+          # non-zero by design and this shell runs with pipefail, so piping it into grep would fail
+          # the step on panvar's exit code even when grep matches. Capture first, then match.
+          refusal=$(./build/panvar genotype 2>&1 || true)
+          case "$refusal" in
+            *"not built in this release"*) ;;
+            *) echo "genotype did not refuse as expected; got: $refusal" >&2; exit 1 ;;
+          esac
+          echo "genotype is absent from help and refused by name"
 
       - name: No tracked script may hardcode a developer's interpreter path
         shell: bash
