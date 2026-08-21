@@ -1,6 +1,6 @@
 # `panvar` documentation
 
-Documentation for the `panvar` CLI, organized into two subfolders plus a shared bibliography.
+Documentation for the `panvar` CLI.
 
 | folder / file | what's in it |
 |---------------|--------------|

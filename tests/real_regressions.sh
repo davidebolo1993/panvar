@@ -136,12 +136,33 @@ if [ ! -f "$G" ]; then
 else
   R=$(ref_of "$G")
   gunzip -c "$G" > "$OUT/c4.gfa"
-  "$BIN" rebuild -i "$OUT/c4.gfa" -o "$OUT/c4_rebuilt.gfa" --min-recovered-identity 0.97 \
+  # --force, because this graph passes the pathology gate. Without it rebuild copies the input
+  # through unchanged and the round trip below would prove only that bubble can read its own input.
+  "$BIN" rebuild -i "$OUT/c4.gfa" -o "$OUT/c4_rebuilt.gfa" --force --min-recovered-identity 0.97 \
      --quiet >/dev/null 2>&1
+  AUD="$OUT/c4_rebuilt.gfa.rebuild_audit.tsv"
   if [ ! -s "$OUT/c4_rebuilt.gfa" ]; then
-    bad "rebuild produced no output on C4"
+    bad "rebuild produced no output"
   else
-    ok "rebuild emitted an accepted graph on C4"
+    # The audit is what proves a rebuild actually happened and was accepted, rather than the input
+    # being passed through: a pass-through writes no audit at all.
+    if [ ! -s "$AUD" ]; then
+      bad "no rebuild audit was written, so the graph was passed through rather than rebuilt"
+    else
+      verdict=$(awk -F'\t' '$1=="#verdict"{print $2}' "$AUD")
+      nrows=$(awk -F'\t' '$0!~/^#/ && NR>1' "$AUD" | wc -l | tr -d ' ')
+      nok=$(awk -F'\t' '$0!~/^#/ && NR>1 && $NF=="ok"' "$AUD" | wc -l | tr -d ' ')
+      [ "$verdict" = "accepted" ] && ok "the rebuild is accepted by its own contract" \
+                                  || bad "rebuild verdict is '${verdict:-none}', expected accepted"
+      [ "$nrows" -gt 0 ] && [ "$nok" = "$nrows" ] \
+        && ok "and every one of the $nrows haplotypes is recovered within bounds" \
+        || bad "$nok of $nrows haplotypes recovered ok"
+    fi
+    # ...and the emitted graph must genuinely differ from the input, or nothing was rebuilt.
+    in_nodes=$(grep -c "^S" "$OUT/c4.gfa"); out_nodes=$(grep -c "^S" "$OUT/c4_rebuilt.gfa")
+    [ "$in_nodes" != "$out_nodes" ] \
+      && ok "the emitted graph differs from the input ($in_nodes -> $out_nodes nodes)" \
+      || bad "the emitted graph has the same node count as the input; it was passed through"
     "$BIN" bubble -i "$OUT/c4_rebuilt.gfa" -r "$R" -o "$OUT/c4_rb_bub" --quiet >/dev/null 2>&1
     rc=$?
     [ "$rc" -eq 0 ] && [ -s "$OUT/c4_rb_bub.bubbles.csv" ] \

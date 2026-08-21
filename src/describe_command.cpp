@@ -424,16 +424,21 @@ int run_describe_command(const std::vector<std::string>& args) {
                 throw std::runtime_error("PANVAR_TEST_FAIL_COMMIT_AT: injected failure installing " +
                                          dst.string());
             }
-            std::filesystem::rename(e.path(), dst, ec);
-            if (ec) {   // across filesystems rename fails; fall back to copy
-                ec.clear();
-                std::filesystem::copy(e.path(), dst,
-                                      std::filesystem::copy_options::recursive |
-                                      std::filesystem::copy_options::overwrite_existing, ec);
-                if (ec) throw std::runtime_error("describe: cannot install output " + dst.string() +
-                                                 ": " + ec.message());
-            }
+            // Registered BEFORE the move, so a failure cannot leave a destination this run created
+            // outside the rollback's reach. remove_all on a path that was never created is a no-op.
             installed.push_back(dst);
+            std::filesystem::rename(e.path(), dst, ec);
+            if (ec) {
+                // No recursive-copy fallback. The staging directory is created as a SIBLING of the
+                // output directory, so a cross-filesystem rename cannot arise; a failure here means
+                // something else went wrong. Copying a directory tree instead is not atomic, and a
+                // copy that dies part-way leaves a half-populated destination that looks like real
+                // output -- the one state this transaction exists to prevent.
+                throw std::runtime_error("describe: cannot install output " + dst.string() + ": " +
+                                         ec.message() +
+                                         " (staging is a sibling of the output directory, so this is "
+                                         "not a cross-filesystem move)");
+            }
         }
     } catch (...) {
         restore();
