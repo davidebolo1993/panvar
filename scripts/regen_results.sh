@@ -22,6 +22,9 @@ Environment:
   THREADS      worker threads       (default 0 = auto)
   REFINE       1 = call on the refined graph, 0 = on the panphorte graph (default 1)
   GTF          gene GTF for annotation (default tests/real_data/Homo_sapiens.GRCh38.116.gtf.gz)
+  STRICT       1 = release mode (default): every required stage must succeed, the GTF and R must be
+               present, and a locus is published only after all of its stages pass. 0 = exploratory:
+               failures are reported and the run continues, which is what "skipped" used to mean.
 EOF
   exit 0
 fi
@@ -40,8 +43,47 @@ REFINE="${REFINE:-1}"
 # optional GTF for gene annotation; skipped if absent
 GTF="${GTF:-$DATA/Homo_sapiens.GRCh38.116.gtf.gz}"
 GTFOPT=(); [[ -f "$GTF" ]] && GTFOPT=(--gtf "$GTF")
+STRICT="${STRICT:-1}"
 
 have_r() { command -v "$RS" >/dev/null 2>&1; }
+
+# In strict mode a failure is a failure. The previous script turned several into the word "skipped"
+# and could still print ALL DONE, so a published tree could be missing whole stages while reading as a
+# complete run -- and the stale files below made that indistinguishable from success.
+FAILURES=0
+die_or_warn() {   # die_or_warn <message>
+  if [[ "$STRICT" == "1" ]]; then echo "regen_results: FAILED: $1" >&2; exit 1; fi
+  echo "  ($1 -- continuing, STRICT=0)"; FAILURES=$((FAILURES + 1))
+}
+
+if [[ "$STRICT" == "1" ]]; then
+  [[ -f "$GTF" ]] || { echo "regen_results: STRICT needs the GTF at $GTF (set GTF= or STRICT=0)" >&2; exit 1; }
+  have_r || { echo "regen_results: STRICT needs Rscript ($RS) for the plots (set RSCRIPT= or STRICT=0)" >&2; exit 1; }
+  command -v "$PY" >/dev/null 2>&1 || { echo "regen_results: STRICT needs python ($PY)" >&2; exit 1; }
+  [[ -x "$BIN" ]] || { echo "regen_results: STRICT needs the panvar binary at $BIN" >&2; exit 1; }
+fi
+
+# What produced this tree. Without it a results directory cannot be tied to a commit or a binary, and
+# an A/B against it is only as trustworthy as someone's memory of how it was made.
+write_manifest() {
+  local mf="$REPO/results/MANIFEST.txt"
+  {
+    echo "generated    $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    echo "commit       $(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
+    echo "worktree     $(git -C "$REPO" diff --quiet 2>/dev/null && echo clean || echo DIRTY)"
+    echo "binary       $BIN"
+    echo "binary_sha   $( (shasum -a 256 "$BIN" 2>/dev/null || sha256sum "$BIN" 2>/dev/null) | awk '{print $1}')"
+    echo "version      $("$BIN" --help 2>&1 | head -1)"
+    echo "regions      ${REGIONS[*]}"
+    echo "threads      $THREADS"
+    echo "refine       $REFINE"
+    echo "strict       $STRICT"
+    echo "gtf          $GTF"
+    echo "python       $PY ($("$PY" --version 2>&1))"
+    echo "rscript      $RS ($("$RS" --version 2>&1 | head -1))"
+  } > "$mf"
+  echo "wrote $mf"
+}
 ref_of() {  # pick a reference path: prefer GRCh38, then CHM13, else the first path
   gunzip -c "$1" 2>/dev/null | awk -F'\t' '($1=="P"||$1=="W"){n=$2; if(n~/[Gg][Rr][Cc]h38/){print n;exit} if(!first)first=n} END{if(first&&!done)print first}' | head -1
 }
@@ -51,6 +93,12 @@ run_region() {
   local region="$1" gfa="$2" pan_extra="$3" call_graph="$4" call_extra="$5" finer_clusters="${6:-0}"
   local d="$OUT/$region"
   echo "############ $region ############"
+  # Start from an EMPTY locus directory. Reusing it let output from an older run survive alongside the
+  # new one with nothing marking which was which -- measured: ANKRD36C kept an inspect.bubble_11 family
+  # from a run whose bubble numbering no longer exists, and C4 kept a bubble_4 family from July. An A/B
+  # against such a tree silently compares the current build with a months-old one.
+  [[ -n "$region" && "$d" == "$OUT/"* ]] || { echo "refusing to clear '$d'" >&2; return 1; }
+  rm -rf "$d"
   mkdir -p "$d"/{bubble,panphorte,refine,call,describe,inspect,benchmark,plots}
   local ref; ref="$(ref_of "$gfa")"
   echo "[$region] reference: $ref ; call graph: $call_graph"
@@ -85,7 +133,16 @@ run_region() {
   if [[ -s "$d/call/call.variant_nodes.tsv" ]]; then
     "$BIN" benchmark -i "$cgfa" --bubble-prefix-in "$cpfx" --reference-path "$ref" \
       --variant-nodes "$d/call/call.variant_nodes.tsv" --vcf "$d/call/call.region.vcf" \
-      -o "$d/benchmark/benchmark" --threads "$THREADS" --quiet || echo "  (benchmark skipped)"
+      -o "$d/benchmark/benchmark" --threads "$THREADS" --quiet || return 1
+    # The SAME benchmark against the allele VCF. These answer different questions and the project
+    # quotes both, so regenerating only the first left the headline claim -- the allele VCF is a
+    # lossless serialization, 0 bp residual -- resting on numbers nothing in the tree reproduced.
+    # The region VCF measures the interpreted output; this measures the representation.
+    if [[ -s "$d/call/call.alleles.vcf" ]]; then
+      "$BIN" benchmark -i "$cgfa" --bubble-prefix-in "$cpfx" --reference-path "$ref" \
+        --variant-nodes "$d/call/call.variant_nodes.tsv" --vcf "$d/call/call.alleles.vcf" \
+        -o "$d/benchmark/allele" --threads "$THREADS" --quiet || return 1
+    fi
   fi
   # 5) inspect the largest-DUP bubble (the CN module) on the call graph, with walk clustering
   local bub; bub="$(awk -F'\t' '/SVTYPE=DUP/{
@@ -235,7 +292,26 @@ for region in "${REGIONS[@]}"; do
       ;;
     *) echo "unknown region: $region" ;;
   esac
+  [[ $? -eq 0 ]] || die_or_warn "region $region did not complete"
 done
+
+# A locus-level reconstruction summary, so the walkthrough and the module pages can be checked against
+# a file rather than against a recollection. Two levels, never one: `genotype` from the region VCF is
+# what a consumer of the interpreted output actually reconstructs, and `allele` is the serialization
+# ceiling, which reaches 0 residual because it spells every allele out.
+RECON="$REPO/results/reconstruction.tsv"
+printf 'locus\tvcf\tbaseline_bp\tgraph_bp\tcalled_bp\tcarrier_bp\tgenotype_bp\trecovered_pct\n' > "$RECON"
+for region in "${REGIONS[@]}"; do
+  for kind in benchmark allele; do
+    f="$OUT/$region/benchmark/$kind.qv.tsv"
+    [[ -s "$f" ]] || continue
+    awk -F'\t' -v L="$region" -v K="$([[ $kind == benchmark ]] && echo region || echo allele)" '
+      NR==1 { for (i=1;i<=NF;i++) c[$i]=i; next }
+      { r+=$(c["ref_delta"]); g+=$(c["delta"]); cl+=$(c["called_delta"]); ca+=$(c["carrier_delta"]); gt+=$(c["gt_delta"]) }
+      END { printf "%s\t%s\t%d\t%d\t%d\t%d\t%d\t%.4f\n", L, K, r, g, cl, ca, gt, (r>0 ? 100*(1-gt/r) : 0) }' "$f" >> "$RECON"
+  done
+done
+echo "wrote $RECON"
 
 # Copy-number concordance plot (called-vs-truth, faceted by gene) from the combined table.
 if [[ -s "$CN_TABLE" ]] && have_r; then
@@ -265,5 +341,10 @@ done
 if [[ $(wc -l < "$QV_TABLE") -gt 1 ]] && have_r; then
   "$RS" "$HERE/plot_benchmark.R" --table "$QV_TABLE" --out "$REPO/results/benchmark_qv" --per-row 12 \
     || echo "  (benchmark plot skipped)"
+fi
+write_manifest
+if [[ "$FAILURES" -gt 0 ]]; then
+  echo "regen_results: completed with $FAILURES failed stage(s) (STRICT=0). This tree is NOT release-grade." >&2
+  exit 1
 fi
 echo "ALL DONE -> $REPO/results"

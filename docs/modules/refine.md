@@ -27,8 +27,21 @@ Algorithm and worked trace: [algorithms/refine.md](../algorithms/refine.md).
 |------|--------------|---------|
 | `--gtf <path>` | reference-coordinate GTF; also write `<prefix>.bandage_genes.csv` | — |
 | `--bubble-id <id[,id...]>` | refine only these bubble ids (targeted mode) instead of auto over the whole locus | auto (all) |
-| `--max-poa-bp <N>` | skip a residual segment whose longest residual sequence, measured over the DISTINCT sequences abPOA receives rather than over every carrier.normalized.sorted.gfa` | the refined, reference-sorted/flipped graph |
+| `--max-poa-bp <N>` | skip a residual segment whose longest sequence exceeds N bp, measured over the DISTINCT sequences abPOA receives rather than over every carrier | `5000` |
+| `--max-poa-work <N>` | estimated abPOA budget in DP cells (longest × total bases) over those distinct sequences; bounds total work independently of the length bound | `0` (no bound) |
+| `--max-walks <N>` | skip a residual segment carrying more than N distinct sequences (identical carriers collapse first, so this counts sequences, not walks) | `500` |
+| `--min-bubbles <N>` | only rebuild regions fusing at least N bubbles | `1` |
+| `--resnarl-min-variant-bp <N>` | interior-span filter applied to the re-snarled bubbles CSV | `50` |
+| `--partial-path-policy <p>` | `skip` or `retain` a region only some paths fully traverse. Retaining keeps their old nodes AND the old edges between them, so refined and unrefined topology coexist; `retain` is experimental | `skip` |
+| `--no-flip` | do not reorient nodes to the reference forward strand | off |
+
+## Outputs
+
+| file | what it is |
+|------|------------|
+| `<prefix>.normalized.sorted.gfa` | the refined, reference-sorted/flipped graph |
 | `<prefix>.bubbles.csv` | bubble decomposition on the refined graph (the sorted/flipped bubbles) |
+| `<prefix>.refine.report.tsv` | one row per region: the decision taken and why (see below) |
 | `<prefix>.bandage_nodes.csv` | Bandage node colouring |
 | `<prefix>.bandage_genes.csv` | Bandage gene track (only with `--gtf` and a PanSN reference) |
 
