@@ -15,6 +15,11 @@ option(PANVAR_BUILD_TESTING "Build tests" ON)
 option(PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE
        "Build the experimental genotype module (not release-reviewed)" OFF)
 
+# The rebuild suite is the only test that drives minigraph and costs about 5.5 minutes of a 6 minute
+# run, so it is registered but disabled by default. It worked as an undeclared cache variable, which
+# meant it did not appear in ccmake/cmake-gui and a fresh build tree had to be reconfigured to find it.
+option(PANVAR_SLOW_TESTS "Enable the slow test label (the ~6 minute rebuild suite)" OFF)
+
 # Every source below is reachable only from `genotype`: node_coverage and pangenie_model are its two
 # alternative evidence paths, not shared utilities.
 set(PANVAR_GENOTYPE_LIB_SOURCES

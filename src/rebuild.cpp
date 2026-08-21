@@ -733,8 +733,9 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
                                       ? options.audit_path
                                       : (options.out_path.empty() ? std::string()
                                                                   : options.out_path + ".rebuild_audit.tsv");
+        std::filesystem::path audit_staged;   // hoisted: installed after the graph, below
         if (!audit.empty()) {
-            const std::filesystem::path audit_staged = staging_path(audit);
+            audit_staged = staging_path(audit);
             std::ofstream a(audit_staged);
             if (!a) throw std::runtime_error("rebuild: cannot write audit " + audit_staged.string());
             {
@@ -747,9 +748,14 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
                     else if (matched[h] < options.min_matched_cover) status = "low_cover";
                     else if (id < 0.0) status = "identity_unavailable";
                     else if (id < options.min_recovered_identity) status = "low_identity";
+                    // fmt_exact, not fmt2, for the same reason the thresholds use it: a decision is
+                    // `matched[h] < min_matched_cover`, and two values that both print as 0.9900 can
+                    // fall on opposite sides of it. Rounding the compared value while printing the
+                    // threshold exactly leaves an audit that cannot reproduce its own verdict.
                     a << g.paths[h].name << '\t' << hseq[h].size() << '\t' << walks[h].size() << '\t'
-                      << fmt2(cover[h]) << '\t' << fmt2(matched[h]) << '\t' << fmt2(chain_id[h]) << '\t'
-                      << (id < 0.0 ? std::string("NA") : fmt2(id)) << '\t' << status << '\n';
+                      << fmt_exact(cover[h]) << '\t' << fmt_exact(matched[h]) << '\t'
+                      << fmt_exact(chain_id[h]) << '\t'
+                      << (id < 0.0 ? std::string("NA") : fmt_exact(id)) << '\t' << status << '\n';
                 }
                 // The global verdict belongs beside the per-path rows, or a reader has to reconstruct
                 // it from them and guess which bound applied.
@@ -768,8 +774,11 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
                 a.flush();
                 if (!a) throw std::runtime_error("rebuild: failed writing audit " + audit_staged.string());
                 a.close();
-                commit_staged(audit_staged, audit);
-                sum.audit_written = true;
+                if (!a) throw std::runtime_error("rebuild: failed closing audit " + audit_staged.string());
+                // NOT installed here. The audit describes what was done with the graph, so installing
+                // it first meant a graph commit that then failed left an audit on disk asserting a
+                // disposition for an output nobody wrote. The graph goes first below and the audit
+                // follows it.
             }
         }
 
@@ -784,6 +793,18 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
                 std::filesystem::remove(staged_out, ec);
                 step("REJECTED: " + sum.reject_reason + " -- passing the original graph through unchanged");
                 copy_file(options.gfa_path, options.out_path);
+            }
+        }
+
+        // The graph is in place, so the audit now describes something that exists. A failure here is
+        // reported rather than thrown: the graph is already installed and correct, and losing the
+        // report of it is not a reason to leave the caller believing the rebuild did not happen.
+        if (!audit_staged.empty() && std::filesystem::exists(audit_staged)) {
+            try {
+                commit_staged(audit_staged, audit);
+                sum.audit_written = true;
+            } catch (const std::exception& e) {
+                step(std::string("WARNING: the graph was written but its audit was not: ") + e.what());
             }
         }
     }

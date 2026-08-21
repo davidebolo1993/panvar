@@ -760,7 +760,13 @@ RefineSummary refine_graph(const RefineOptions& options) {
     sort_opts.flip = !options.no_flip;
     const GraphSortResult sort_result = sort_graph_reference(model, sort_opts);
 
-    rep.flush();
+    // Closed, then checked. flush() alone leaves the stream open across the commit below -- which
+    // works on Unix and is not portable to a platform that refuses to rename an open file -- and it
+    // does not turn a write that failed on the way to storage into an error, so a truncated report
+    // could be committed as part of a successful family.
+    rep.close();
+    if (!rep) throw std::runtime_error("refine: failed writing " + options.out_prefix +
+                                       ".refine.report.tsv");
     const std::string sorted_gfa = staged.stage(options.out_prefix + ".normalized.sorted.gfa");
     write_gfa_model(sorted_gfa, model);
 
