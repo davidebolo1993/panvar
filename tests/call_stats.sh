@@ -477,6 +477,56 @@ else
   fi
 fi
 
+
+# ---------------------------------------------------------------- repeated module boundary
+# CN, CNBP, CN_MODULE_REF_BP, POS and END share one occurrence-aware resolver, which deliberately
+# selects the WIDEST span (first source to last sink) when a boundary recurs. No reference locus
+# produces a CN record with a repeated boundary, so nothing exercised that choice.
+#
+# The reference here visits S and K TWICE, with a full module between each pair. Nothing is
+# self-adjacent, so the REP route cannot fire and the collapsed-module route is used.
+{ printf 'H\tVN:Z:1.0\n'
+  printf 'S\tF\t%s\nS\tS\t%s\nS\tP\t%s\nS\tQ\t%s\nS\tK\t%s\nS\tG\t%s\n' \
+    "$(gblk 150 21)" "$(gblk 50 22)" "$(gblk 150 23)" "$(gblk 150 24)" "$(gblk 50 25)" "$(gblk 150 26)"
+  for e in "F S" "S P" "P Q" "Q K" "K S" "K G" "Q P" "P K"; do
+    set -- $e; printf 'L\t%s\t+\t%s\t+\t0M\n' "$1" "$2"; done
+  printf 'P\tgrch38#0#chr1:1-3000\tF+,S+,P+,Q+,K+,S+,P+,Q+,K+,G+\t*\n'
+  printf 'P\th1#1#chr1\tF+,S+,P+,Q+,P+,Q+,K+,S+,P+,Q+,K+,G+\t*\n'
+  printf 'P\th2#1#chr1\tF+,S+,P+,K+,S+,P+,Q+,K+,G+\t*\n'; } > "$OUT/modrep.gfa"
+printf 'bubble_id,source,source_orient,sink,sink_orient,inside_node_count,total_node_count,path_support,distinct_alleles,ref_allele_support,alt_allele_support_max,alt_allele_support_min,min_inside_bp,max_inside_bp,inside_nodes\n1,S,+,K,+,2,4,3,3,1,1,1,150,450,"P;Q"\n' > "$OUT/modrep.bubbles.csv"
+"$BIN" call -i "$OUT/modrep.gfa" -c "$OUT/modrep.bubbles.csv" \
+   --reference-path "grch38#0#chr1:1-3000" -o "$OUT/modrep" --cn --min-sv-bp 20 -q >/dev/null 2>&1
+MRV="$OUT/modrep.region.vcf"
+inf() { awk -F'\t' -v k="$1" '$0!~/^#/ && $8~/SVTYPE=DUP/{n=split($8,a,";");
+          for(i=1;i<=n;i++){split(a[i],kv,"="); if(kv[1]==k){print kv[2]; exit}}}' "$MRV"; }
+fmtv() { awk -F'\t' -v s="$1" -v k="$2" '$0~/^#CHROM/{for(i=10;i<=NF;i++) if($i==s) col=i}
+          $0!~/^#/ && $8~/SVTYPE=DUP/{split($9,f,":"); for(j in f) if(f[j]==k) ki=j
+            split($col,v,":"); print v[ki]; exit}' "$MRV"; }
+[ "$(inf CN_METHOD)" = "MODULE_BP" ] \
+  && ok "a repeated module boundary still routes to MODULE_BP" \
+  || bad "CN_METHOD=$(inf CN_METHOD), expected MODULE_BP"
+[ "$(inf CN_SPAN_AMBIGUOUS)" = "3" ] \
+  && ok "CN_SPAN_AMBIGUOUS counts every traverser with a repeated boundary (3)" \
+  || bad "CN_SPAN_AMBIGUOUS=$(inf CN_SPAN_AMBIGUOUS), expected 3"
+[ "$(inf CN_MODULE_REF_BP)" = "600" ] \
+  && ok "CN_MODULE_REF_BP sums the module nodes over both visits (600)" \
+  || bad "CN_MODULE_REF_BP=$(inf CN_MODULE_REF_BP), expected 600"
+[ "$(fmtv h1#1#chr1 CNBP)" = "300" ] && [ "$(fmtv h2#1#chr1 CNBP)" = "-150" ] \
+  && ok "CNBP is measured over the same node set (+300 / -150)" \
+  || bad "CNBP h1=$(fmtv h1#1#chr1 CNBP) h2=$(fmtv h2#1#chr1 CNBP), expected 300 / -150"
+# POS/END are the widest SPAN, which with a repeated boundary encloses the intervening K and S. So
+# END-POS EXCEEDS CN_MODULE_REF_BP by exactly that intervening sequence. The identity
+# END-POS == CN_MODULE_REF_BP holds only when every boundary is visited once, and CN_SPAN_AMBIGUOUS
+# is precisely the flag that says it does not.
+mr_pos=$(awk -F'\t' '$0!~/^#/ && $8~/SVTYPE=DUP/{print $2; exit}' "$MRV")
+mr_span=$(( $(inf END) - mr_pos ))
+[ "$mr_span" = "700" ] \
+  && ok "END-POS is the widest span (700), not the node sum" \
+  || bad "END-POS=$mr_span, expected 700"
+[ "$(( mr_span - $(inf CN_MODULE_REF_BP) ))" = "100" ] \
+  && ok "and the excess is exactly the boundary visits between the outermost ones (K+S=100)" \
+  || bad "span excess $(( mr_span - $(inf CN_MODULE_REF_BP) )), expected 100"
+
 printf "\n"
 if [ "$fails" -eq 0 ]; then printf "call_stats: all assertions passed\n"; exit 0; fi
 printf "call_stats: %d assertion(s) failed\n" "$fails"; exit 1

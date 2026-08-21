@@ -310,6 +310,23 @@ if(PANVAR_BUILD_TESTING)
             set_tests_properties(panvar_genotype_stats PROPERTIES TIMEOUT 300)
         endif()
 
+        # Opt-in regressions against the committed real loci. Several contracts are only reachable
+        # on real data: ANKRD36C is the only locus that ever produced overlapping sites, LPA KIV-2 is
+        # the folding case with 466 haplotypes, whether the POA guards SKIP anything is a property of
+        # real sequence, and an accepted rebuilt GFA has to be re-readable by the next module. About
+        # 2.5 minutes, so it carries the slow label with the rebuild suite.
+        set(PANVAR_REAL_REGRESSIONS ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_regressions.sh)
+        if(EXISTS ${PANVAR_REAL_REGRESSIONS})
+            add_test(
+                NAME panvar_real_regressions
+                COMMAND /usr/bin/env bash ${PANVAR_REAL_REGRESSIONS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/real_regressions
+            )
+            set_tests_properties(panvar_real_regressions PROPERTIES TIMEOUT 900 LABELS "real;slow")
+            if(NOT PANVAR_SLOW_TESTS)
+                set_tests_properties(panvar_real_regressions PROPERTIES DISABLED TRUE)
+            endif()
+        endif()
+
         set(PANVAR_CALL_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/call_stats.sh)
         if(EXISTS ${PANVAR_CALL_STATS})
             add_test(

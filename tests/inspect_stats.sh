@@ -225,6 +225,29 @@ rep2=$(awk -F'\t' 'NR>1 && $2==2{print $3}' "$OUT/repord2_i.bubble_1.clusters.ts
   && ok "the representative is order-independent and lexicographically smallest (aaa)" \
   || bad "representative depends on P-record order: '$rep1' vs '$rep2' (expected aaa both ways)"
 
+# ------------------------------------------- the two second-pass branches, pinned directly
+# Both were implemented in the second review pass and neither had a focused assertion, so a
+# regression in either would have shown up only as a wrong result somewhere downstream.
+
+# 1. A DERIVED output collides with an explicit one. The preflight has to run AFTER bubble selection,
+#    because the derived names contain the bubble ids; before that it saw only the explicit flags and
+#    an explicit --table-out naming <prefix>.bubble_N.node_lengths.tsv silently clobbered one of them.
+"$BIN" inspect -i "$OUT/ab.sorted.gfa" -c "$OUT/ab.bubbles.csv" --bubble-id 1 \
+       --table-out "$OUT/coll.bubble_1.node_lengths.tsv" -o "$OUT/coll" -q >/dev/null 2>&1
+[ "$?" -ne 0 ] && ok "an explicit output colliding with a DERIVED one is refused" \
+               || bad "an explicit --table-out naming a derived output was accepted"
+
+# 2. The bubbles CSV names nodes that DO exist in the graph, but no path crosses the pair. That used
+#    to produce a header-only count table and exit 0, which reads as "this site has no variation"
+#    rather than "this CSV does not describe this graph".
+hdr=$(head -1 "$OUT/ab.bubbles.csv")
+{ echo "$hdr"
+  awk -F, -v h="$hdr" 'NR==2{n=split(h,c,","); for(i=1;i<=n;i++){ if(c[i]=="source") s=i; if(c[i]=="sink") k=i }
+        $s=$k; print }' OFS=, "$OUT/ab.bubbles.csv"; } > "$OUT/nocross.csv"
+"$BIN" inspect -i "$OUT/ab.sorted.gfa" -c "$OUT/nocross.csv" -o "$OUT/nocross" -q >/dev/null 2>&1
+[ "$?" -ne 0 ] && ok "a selected bubble no path crosses is refused, not reported as empty" \
+               || bad "a bubble with present nodes and no crossing path exited 0"
+
 echo
 if [ "$fails" -eq 0 ]; then echo "inspect_stats: all assertions passed"; exit 0; fi
 echo "inspect_stats: $fails assertion(s) FAILED"; exit 1

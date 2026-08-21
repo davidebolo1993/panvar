@@ -70,6 +70,8 @@ All-pairs comparison is quadratic, so above 128 members the value is measured ag
 
 The two `DUP` rows differ because the routes count different things. A `REP` unit is one node, so its span is that node's length; a collapsed module's span is the bubble **interior**, which is what `FORMAT:CNBP` sums over — both boundary nodes are excluded from that sum, so `END` stops where the far boundary begins. That identity (`END − POS = CN_MODULE_REF_BP`) holds on every module record across the reference loci and is the cheapest check that a module record is placed correctly.
 
+**It holds only while every boundary is visited once, and `CN_SPAN_AMBIGUOUS` is exactly the flag that says it does not.** `POS`/`END` come from the widest oriented span (first source to last sink); `CN_MODULE_REF_BP` and `CNBP` sum node length × multiplicity over the module nodes. When a boundary recurs those two disagree by precisely the boundary visits lying between the outermost occurrences, which the span encloses and the node sum does not. The registered fixture is a reference visiting both boundaries twice: `END − POS` is 700 where `CN_MODULE_REF_BP` is 600, and the 100 bp difference is the intervening sink and source. Read the identity as a placement check on records with `CN_SPAN_AMBIGUOUS` absent, and read the flagged ones as a deliberate span choice rather than a uniquely resolved interval.
+
 A `DEL` or `INV` whose first affected base is the region's first base has no preceding base to anchor on and keeps its original anchor.
 
 ## Worked trace (non-`DUP` events)

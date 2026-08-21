@@ -1410,7 +1410,31 @@ int run_associate_command(const std::vector<std::string>& args) {
         // order, so the phenotype changes how many clumps there are -- a chain A-B-C with A,C
         // uncorrelated gives one clump seeded at B and two seeded at A. This estimator never looks at
         // the phenotype, so the regional threshold it implies cannot be circular.
-        if (n_tests >= 2) {
+        // Both halves of this tier are unbounded in n_tests: LD clumping above compares every pair,
+        // and Li-Ji below MATERIALIZES an n_tests x n_tests correlation matrix and takes a full
+        // symmetric eigendecomposition -- quadratic memory to hold it, cubic time to solve it. That is
+        // fine for a region (LPA tests tens of variants) and is not a genome-wide estimator, so the
+        // limit is enforced rather than discovered by a machine running out of memory.
+        //
+        // Exceeding it is NOT an error: Meff is a refinement of the correction, so the run falls back
+        // to the clumping estimate and, failing that, to raw Bonferroni over n_tests -- both
+        // conservative. `meff_method` in the summary records which one was used.
+        constexpr std::size_t kMeffEigenMax = 20000;   // ~3.2 GB for the matrix alone
+        constexpr std::size_t kMeffEigenWarn = 5000;
+        if (n_tests > kMeffEigenMax) {
+            std::cerr << "[associate] WARNING: " << n_tests << " tested variants exceeds the "
+                      << kMeffEigenMax << "-variant limit for the phenotype-blind (Li-Ji) Meff, which "
+                         "needs an n x n correlation matrix and a full eigendecomposition. Falling "
+                         "back to "
+                      << (meff_clump > 0 ? "LD-clumping Meff" : "raw Bonferroni over n_tests")
+                      << "; meff_method in the summary records this.\n";
+        } else if (n_tests >= 2) {
+            if (n_tests > kMeffEigenWarn && !opt.quiet) {
+                std::cerr << "[associate] Meff: forming a " << n_tests << " x " << n_tests
+                          << " correlation matrix ("
+                          << (n_tests * n_tests * sizeof(double)) / (1024ULL * 1024ULL)
+                          << " MB) and eigendecomposing it; this tier is region-scale.\n";
+            }
             Eigen::MatrixXd C(n_tests, n_tests);
             std::vector<double> mean(n_tests, 0.0), sd(n_tests, 0.0);
             for (std::size_t i = 0; i < n_tests; ++i) {

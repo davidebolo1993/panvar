@@ -78,6 +78,29 @@ check "bubble 1 counts all 8 paths, not just the 5 that keep the interior" \
 check "and it yields features instead of nothing" \
       "$(awk -F'\t' 'NR==2{print ($13>0 && $16>0) ? "yes" : "no"}' "$AI")" "yes"
 
+# ...and the features are the RIGHT ones. "Non-empty" was the whole assertion here, which a matrix of
+# flank k-mers every haplotype carries would also satisfy. The signal a deletion contributes is the
+# junction it creates: syncmers spanning the direct source->sink join, carried by every bypass
+# haplotype and by no path that keeps the interior. Counting them is also the honest way to report
+# what a real deletion gives, since a repetitive junction cannot be guaranteed sequence-unique.
+KB="$OUT/A/haplotype/kmers/bimbam_kmers.bimbam.gz"
+KS="$OUT/A/haplotype/kmers/samples.txt.gz"
+alt_exclusive=$(gunzip -c "$KB" | awk -F', *' -v samples="$(gunzip -c "$KS" | tr '\n' ' ')" '
+  BEGIN { n = split(samples, s, " ") }
+  {
+    del_all = 1; other_any = 0
+    for (i = 1; i <= n; i++) {
+      v = $(i + 3)
+      carries = (v != "NA" && v != "" && v + 0 > 0)
+      if (s[i] ~ /^del/) { if (!carries) del_all = 0 }
+      else if (carries)  { other_any = 1 }
+    }
+    if (del_all && !other_any) c++
+  }
+  END { print c + 0 }')
+[ "${alt_exclusive:-0}" -ge 2 ]   && ok "the deletion contributes ALT-exclusive junction markers ($alt_exclusive of them)"   || bad "expected >=2 ALT-exclusive junction syncmers, found ${alt_exclusive:-0}"
+
+
 # --- zero vs missing, in both directions, on hand-checkable cells.
 cdel=$(colof "$GS" 'del1#1#chr1'); cfull=$(colof "$GS" 'full1#1#chr1'); ctr=$(colof "$GS" 'trunc#1#chr1')
 b1node=$(awk -F',' 'NR==2{gsub(/"/,"",$NF); split($NF,x,";"); print x[1]}' "$OUT/ab.bubbles.csv")
