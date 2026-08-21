@@ -90,7 +90,9 @@ public:
 
     // Register a destination and return the path to write to instead.
     std::string stage(const std::string& final_path);
-    // Move every staged file to its destination, in registration order.
+    // Move every staged file to its destination, in registration order, as ONE transaction: a
+    // failure part-way through removes what this run installed and restores whatever it displaced,
+    // so a caller never leaves a half-updated output family behind. Throws on failure.
     void commit();
 
 private:

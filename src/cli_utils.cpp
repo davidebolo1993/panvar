@@ -5,6 +5,7 @@
 #include <random>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <exception>
 #include <filesystem>
@@ -277,9 +278,74 @@ std::string StagedOutputs::stage(const std::string& final_path) {
 }
 
 void StagedOutputs::commit() {
-    for (const auto& [staged, final_path] : pending_) {
-        if (!std::filesystem::exists(staged)) continue;   // an optional output nobody wrote
-        commit_staged(staged, final_path);
+    // Installing sequentially made every module's output family non-atomic: a rename that failed on
+    // the fourth of six files left three new outputs beside three stale ones, with a non-zero exit
+    // and nothing saying which was which. Each module page promises the opposite -- a refusal leaves
+    // the previous complete output intact -- so the guarantee belongs here, once, rather than in
+    // eight partial re-implementations.
+    //
+    // Any destination that already exists is moved aside first, so a failure can put it back. On
+    // success the reserves are dropped; on failure this run's installs are removed and the reserves
+    // restored, in reverse order.
+    struct Installed {
+        std::string final_path;
+        std::string reserve;      // empty when the destination did not exist before this run
+    };
+    std::vector<Installed> installed;
+
+    // Fault injection, test-only: fail just before installing the Nth (1-based) staged file. The
+    // rollback branch is otherwise unreachable from a test -- every natural way to make a rename fail
+    // here either fails earlier, at staging, or is silently handled by the set-aside above -- and an
+    // untested rollback is worth about as much as no rollback.
+    std::size_t fail_at = 0;
+    if (const char* env = std::getenv("PANVAR_TEST_FAIL_COMMIT_AT")) {
+        fail_at = static_cast<std::size_t>(std::strtoull(env, nullptr, 10));
+    }
+    std::size_t installs = 0;
+
+    try {
+        for (const auto& [staged, final_path] : pending_) {
+            if (!std::filesystem::exists(staged)) continue;   // an optional output nobody wrote
+            if (fail_at != 0 && ++installs == fail_at) {
+                throw std::runtime_error("PANVAR_TEST_FAIL_COMMIT_AT: injected failure installing "
+                                         + final_path);
+            }
+            std::string reserve;
+            if (std::filesystem::exists(final_path)) {
+                reserve = staging_path(final_path, module_ + "-prev");
+                std::error_code ec;
+                std::filesystem::rename(final_path, reserve, ec);
+                if (ec) {
+                    throw std::runtime_error("cannot set aside the previous output before replacing it: "
+                                             + final_path);
+                }
+            }
+            commit_staged(staged, final_path);
+            installed.push_back({final_path, reserve});
+        }
+    } catch (...) {
+        // A restore that itself fails is the one outcome the caller cannot recover from, so it is
+        // named rather than swallowed: the previous output is gone and its reserve copy is the only
+        // remaining version.
+        std::vector<std::string> unrestored;
+        for (auto it = installed.rbegin(); it != installed.rend(); ++it) {
+            std::error_code ec;
+            std::filesystem::remove(it->final_path, ec);
+            if (it->reserve.empty()) continue;
+            std::filesystem::rename(it->reserve, it->final_path, ec);
+            if (ec) unrestored.push_back(it->final_path + " (kept as " + it->reserve + ")");
+        }
+        if (!unrestored.empty()) {
+            std::string msg = "output commit failed AND the previous output could not be restored for:";
+            for (const auto& u : unrestored) msg += "\n  " + u;
+            std::throw_with_nested(std::runtime_error(msg));
+        }
+        throw;   // pending_ is left intact so the destructor still clears the staged files
+    }
+
+    std::error_code ec;
+    for (const auto& entry : installed) {
+        if (!entry.reserve.empty()) std::filesystem::remove(entry.reserve, ec);
     }
     pending_.clear();
 }

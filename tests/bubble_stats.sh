@@ -391,6 +391,37 @@ r70_min=$(cel "$OUT/repeat70.bubbles.csv" min_inside_bp)
 [ "$r70_min" = "20" ] && ok "the one-copy haplotype still sets min_inside_bp (20)" \
                       || bad "min_inside_bp=$r70_min, expected 20"
 
+# ------------------------------------------- a failed commit leaves the previous family untouched
+# StagedOutputs is shared by every module, so this asserts a cross-module contract through the module
+# that happens to write the smallest multi-file family. Outputs were staged but installed one after
+# another, so a failure on the fourth of six left three new files beside three stale ones -- with a
+# non-zero exit and nothing saying which was which.
+#
+# The failure is injected, because it cannot be reached otherwise: the natural ways to make a rename
+# fail here either fail earlier, at staging, or are absorbed by the set-aside that protects the
+# previous file. Run one writes a family from the deletion graph; run two writes a DIFFERENT graph to
+# the same prefix and fails installing the second file, so a partial install would be plainly visible.
+"$BIN" bubble -i "$OUT/del.gfa" -r full -o "$OUT/txn" --min-variant-bp 0 -q >/dev/null 2>&1
+txn_csv_before=$(cksum < "$OUT/txn.bubbles.csv"); txn_gfa_before=$(cksum < "$OUT/txn.sorted.gfa")
+"$BIN" bubble -i "$OUT/cyc.gfa" -r pA -o "$OUT/other" --min-variant-bp 0 -q >/dev/null 2>&1
+if [ "$(cksum < "$OUT/other.bubbles.csv")" = "$txn_csv_before" ]; then
+  bad "the rollback fixture is not discriminating: both graphs write the same bubbles.csv"
+else
+  PANVAR_TEST_FAIL_COMMIT_AT=2 "$BIN" bubble -i "$OUT/cyc.gfa" -r pA -o "$OUT/txn" \
+      --min-variant-bp 0 -q >/dev/null 2>&1
+  [ "$?" -ne 0 ] && ok "an injected commit failure exits non-zero" \
+                 || bad "an injected commit failure exited 0"
+  [ "$(cksum < "$OUT/txn.bubbles.csv")" = "$txn_csv_before" ] \
+    && ok "the previous bubbles.csv survives a failed commit unchanged" \
+    || bad "bubbles.csv was replaced by a run that did not complete"
+  [ "$(cksum < "$OUT/txn.sorted.gfa")" = "$txn_gfa_before" ] \
+    && ok "the previous sorted.gfa survives a failed commit unchanged" \
+    || bad "sorted.gfa was replaced by a run that did not complete"
+  residue=$(ls "$OUT" | grep -c -- '-tmp\.\|-prev\.')
+  [ "$residue" = "0" ] && ok "a failed commit leaves no staging or set-aside residue" \
+                       || bad "$residue staging/set-aside file(s) left behind"
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then echo "bubble_stats: all assertions passed"; exit 0; fi
 echo "bubble_stats: $fails assertion(s) FAILED"; exit 1
