@@ -26,13 +26,6 @@ docker build -t panvar:latest .
 docker run --rm -v "$PWD":/work -w /work panvar:latest panvar --help
 ```
 
-## Scope and limitations
-
-- **`call` writes two VCFs and they answer different questions.** The region VCF is the interpreted output: records are merged for readability, so a merged record gives every carrier the representative's sequence and a `DUP` is reconstructed by tiling an inferred span. The allele VCF (`--allele-vcf`) spells every bubble allele out and is lossless.
-- **`benchmark` reports four reconstruction levels and they are not interchangeable.** Three of them implant the haplotype's own true sequence and are therefore ceilings; only the genotype level reconstructs what the VCF actually says. Each page states which level it quotes.
-- **`associate` implements common single-variant association.** Firth and saddlepoint corrections make a rare single-variant test better behaved, but there is no burden, collapsing or SKAT-style aggregation, and the linear mixed model is experimental.
-- Per-module limitations are stated on each module page.
-
 ## Documentation
 
 - [docs/README.md](docs/README.md) — documentation index
