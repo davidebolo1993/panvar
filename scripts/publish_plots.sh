@@ -50,7 +50,11 @@ for entry in "${MAP[@]}"; do
     missing=$((missing + 1)); continue
   fi
   if [[ "$CHECK" == "1" ]]; then
-    if [[ ! -f "$dst" ]] || [[ "$src" -nt "$dst" ]] || ! cmp -s "$src" "$dst"; then
+    # Content only. An earlier version also failed when the source was NEWER, which made every check
+    # after a regeneration report all eleven figures stale even though each was byte-identical --
+    # a gate that always fires teaches people to ignore it. Verified reproducible: two runs of the
+    # plot scripts on the same table produce byte-identical PNGs.
+    if [[ ! -f "$dst" ]] || ! cmp -s "$src" "$dst"; then
       echo "STALE: docs/img/${entry##*|} does not match results/${entry%%|*}"
       stale=$((stale + 1))
     fi

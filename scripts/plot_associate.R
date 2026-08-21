@@ -1,4 +1,11 @@
 #!/usr/bin/env Rscript
+
+# Deterministic figures: geom_jitter and ggrepel both draw from R's RNG, so two runs on the SAME table
+# produced byte-different PNGs and any staleness check comparing docs/img against results/ reported
+# every figure as changed. Seeded here rather than in a wrapper, so the property holds however the
+# script is invoked.
+set.seed(1)
+
 # Manhattan + QQ for `panvar associate` output. See docs/gwas.md; run with --help for usage.
 suppressWarnings(suppressMessages(library(ggplot2)))
 

@@ -2,6 +2,13 @@
 # Copy-number concordance (called vs ground-truth), one facet per gene. See --help for usage.
 suppressWarnings(suppressMessages({
   library(ggplot2)
+
+# Deterministic figures: geom_jitter and ggrepel both draw from R's RNG, so two runs on the SAME table
+# produced byte-different PNGs and any staleness check comparing docs/img against results/ reported
+# every figure as changed. Seeded here rather than in a wrapper, so the property holds however the
+# script is invoked.
+set.seed(1)
+
 }))
 
 args <- commandArgs(trailingOnly = TRUE)
