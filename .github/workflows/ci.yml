@@ -59,6 +59,17 @@ jobs:
           ./build/panvar genotype 2>&1 | grep -q "not built in this release" \
             || { echo "genotype did not refuse with the expected message" >&2; exit 1; }
 
+      - name: No tracked script may hardcode a developer's interpreter path
+        shell: bash
+        run: |
+          # A registered test that shells out to /home/<someone>/miniconda3/bin/python passes on one
+          # machine and fails everywhere else, for a reason unrelated to what it tests.
+          if git ls-files 'tests/*.sh' 'scripts/*' | xargs grep -nE '(~|\$HOME|/home/[a-z]+|/Users/[a-z.]+)/[a-zA-Z0-9_.-]*(conda|env)[a-zA-Z0-9_.-]*/bin/' 2>/dev/null; then
+            echo "hardcoded interpreter path above; use PATH or an overridable variable" >&2
+            exit 1
+          fi
+          echo "no hardcoded interpreter paths"
+
       - name: Install, then run the installed binary from elsewhere
         shell: bash
         run: |

@@ -3,7 +3,7 @@
 # self-loop; --cn covers any bubble that did not fold via the peak route.
 # Runs the data pipeline then the GWAS (cohort sim -> describe --samples -> associate, region scan +
 # structure demo). Needs a numpy-capable python.
-#   PYTHON=~/miniconda3/bin/python scripts/genes/lpa.sh        # env: N (cohort size), SIM (null markers)
+#   PYTHON=python3 scripts/genes/lpa.sh        # env: N (cohort size), SIM (null markers)
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   echo "LPA (KIV-2 VNTR) driver: data pipeline + the GWAS demo (cohort sim -> describe --samples -> associate)."
   echo "Usage: [PANVAR_BIN=..] [PYTHON=..] [RSCRIPT=..] [THREADS=..] scripts/genes/lpa.sh"

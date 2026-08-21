@@ -217,8 +217,12 @@ check "and leaves no staging directory behind" "$(ls -d "$TX".describe-staging.*
 # ---------------------------------------------------------------------------------------------
 check "params.json records which substrates were emitted" \
       "$(grep -c '"emit_kmers"\|"emit_graph"\|"emit_variant"' "$TX/describe.params.json")" "3"
+# Counted with grep, like the line above. This used to shell out to an interpreter at a hardcoded
+# path, which exists on one developer machine and on no CI runner -- the test then failed for a
+# reason that had nothing to do with describe. A registered test must not need anything outside the
+# build.
 check "and the variant restriction, flank and thread count" \
-      "$(~/miniconda3/bin/python -c "import json;d=json.load(open('$TX/describe.params.json'));print(sum(k in d for k in ('variant_nodes','variant_flank_bp','threads','samples','scale_dosage','input_sizes_bytes')))")" "6"
+      "$(grep -c '"variant_nodes"\|"variant_flank_bp"\|"threads"\|"samples"\|"scale_dosage"\|"input_sizes_bytes"' "$TX/describe.params.json")" "6"
 
 
 # ---------------------------------------------------------------------------------------------

@@ -134,7 +134,7 @@ def main():
                     help="how many carrier haplotypes to compare (0 = all)")
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--threads", type=int, default=4)
-    ap.add_argument("--bin-dir", default=os.path.expanduser("~/miniconda3/envs/svimasm/bin"),
+    ap.add_argument("--bin-dir", default="",
                     help="directory holding minimap2, samtools and svim-asm")
     ap.add_argument("--margin", type=int, default=2000,
                     help="bp of slack when attributing an svim-asm call to a bubble span; breakpoints "
@@ -145,10 +145,15 @@ def main():
     ap.add_argument("--keep", action="store_true", help="keep per-haplotype BAM/VCF working files")
     args = ap.parse_args()
 
+    # --bin-dir pins a directory holding the three external tools; empty means look on PATH, which is
+    # what a machine other than the author's will have.
     env_bin = args.bin_dir
     for tool in ("minimap2", "samtools", "svim-asm"):
-        if not os.path.exists(os.path.join(env_bin, tool)):
-            sys.exit(f"compare_svim_asm: {tool} not found in {env_bin}")
+        if env_bin:
+            if not os.path.exists(os.path.join(env_bin, tool)):
+                sys.exit(f"compare_svim_asm: {tool} not found in {env_bin}")
+        elif shutil.which(tool) is None:
+            sys.exit(f"compare_svim_asm: {tool} not found on PATH (or pass --bin-dir)")
 
     seq, paths = load_gfa(args.gfa)
     if args.reference not in paths:
