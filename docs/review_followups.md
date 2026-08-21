@@ -232,9 +232,12 @@ Audit precision, graph-first/audit-second disposition, checked Refine streams, a
 
 ### Validation and interface debt
 
-- **[TEST] Add opt-in real folding regressions.** LPA should pin the KIV-2 site, 466 path spellings,
-  topology acceptance, REP provenance, and representative CNs. ANKRD36C should pin the nested-site
-  preflight once paired with Bubble's real disjointness test.
+- **[TEST] PARTLY DONE.** `real_regressions.sh` pins the LPA KIV-2 site — 5,547 bp unit, all 466
+  haplotypes normalized, copies 1-32, 3,485 nodes collapsed, a REP provenance row, and a per-haplotype
+  copies table — and the ANKRD36C nested-site preflight alongside Bubble's disjointness assertion.
+  **Still owed: the 466 path SPELLINGS.** The current test proves the fold happened and was recorded;
+  it does not prove every haplotype still spells what it spelled before, which is the actual
+  losslessness claim.
 - **[TEST] Resolve the unreachable partial-boundary interface.** Either construct a valid detector path
   that reaches `copies_declined_partial_boundary`/`--allow-partial-boundary`, or remove the dead option,
   status columns, and stale comments. Rename the surviving-route diagnostic from “rewritten paths” to
