@@ -4,99 +4,84 @@ CLI: `panvar panphorte`
 
 ## What it does
 
-Normalizes contiguous, tandem repeat (TR) bubbles into a compact, copy-number-explicit form. It:
-- collapses each detected tandem array to a single repeat-unit (`REP`) node carrying a self-loop, so a haplotype's copy number (`CN`) is recorded as the number of self-loop traversals rather than as a spurious insertion
-- writes a new GFA (Graphical Fragment Assembly) — plus a report and `CN`-provenance table — for `inspect` and `call`
+Normalizes contiguous tandem-repeat bubbles into a compact, copy-number-explicit form. It:
+- detects, per bubble, whether the haplotypes carry a tandem array and what its repeat unit is;
+- collapses each detected array to a single repeat-unit node carrying a self-loop, so a haplotype's copy number is the number of self-loop traversals rather than a spurious insertion;
+- optionally re-sorts and re-snarls the result along the reference, so the output is ready for `call`;
+- writes the normalized GFA (Graphical Fragment Assembly), a per-bubble report, and the tables that let a consumer trace a copy number back to the site it came from.
 
-Collapse is exact by default (byte-identical copies) and can be made approximate to fold divergent copies. Only genuine population TR are folded, not rare duplications.
+Collapse is exact by default, folding only byte-identical copies, and can be made approximate to fold divergent ones. Only arrays carried by a substantial share of the panel are folded, so a rare private duplication is left for `call` to type as an ordinary event.
 
-Detection normally measures the repeat period in node steps, which requires the graph to split nodes at repeat-unit boundaries. When a bubble yields no step period — as happens on graphs whose node boundaries were set by alignment rather than by the repeat — the unit is seeded from the spelled sequence instead, so an array split across arbitrary node boundaries is still folded.
+Detection normally measures the repeat period in node steps, which needs the graph to split nodes at unit boundaries. Where a bubble yields no step period, because node boundaries were set by alignment rather than by the repeat, the unit is seeded from the spelled sequence instead.
 
 Algorithm and worked trace: [algorithms/panphorte.md](../algorithms/panphorte.md).
 
 ## Required inputs
 
-- `-i, --gfa <graph.gfa>` — the sorted GFA from `bubble`.
-- one of `-b, --bubble-prefix-in <bubble-prefix>` (auto-uses `<prefix>.bubbles.csv`) or `-c, --bubbles-csv <path>`.
+- `-i, --gfa <graph.gfa>` — the sorted GFA from `bubble`
+- one of `-b, --bubble-prefix-in <prefix>` (auto-uses `<prefix>.bubbles.csv`) or `-c, --bubbles-csv <path>`
 
-The CSV must describe the graph handed in and its sites must be disjoint: a node named by no segment, a duplicate bubble id, or two bubbles claiming the same interior node is refused before any work starts. Overlapping sites are not a formality — they describe one piece of sequence twice, so folding both rewrites one span inside the other and the same array is folded at two scales. `bubble` no longer emits such a pair: it runs a deterministic conflict pass before assigning ids, so the sites it emits are pairwise disjoint. ANKRD36C used to fail here, with a site enclosing all ten others folding the same 5616 bp unit as the site inside it; `bubble` now keeps the ten smaller sites, which reconstruct the haplotypes far better than the one enclosing site did. The check remains because the CSV can come from anywhere, and it applies to the *selected* sites, so `--bubble-id` is still the way to work with a hand-made overlapping set.
+The CSV must describe the graph handed in, and the sites it selects must be pairwise disjoint. A node named by no segment, a duplicate bubble id, or two sites claiming the same interior node is refused before any work starts: overlapping sites describe one piece of sequence twice, so folding both would rewrite one span inside the other and fold the same array at two scales. Disjointness is judged among the selected sites, so `--bubble-id` is the way to work with a set that overlaps.
 
 ## Key options
 
 | flag | what it does | default |
 |------|--------------|---------|
 | `-o, --out-prefix <p>` | output prefix | — |
-| `-r, --reference-path <name>` | sort and re-snarl the normalized graph along this reference | — |
-| `--min-similarity <f>` | identity to treat a block as a copy of the unit; `1.0` = exact (sequence-preserving), `< 1.0` = approximate/lossy collapse of divergent copies | `1.0` |
+| `-r, --reference-path <name>` | sort and re-snarl the normalized graph along this reference, producing call-ready output | — |
+| `--min-similarity <f>` | identity at which a block counts as a copy of the unit; `1.0` is exact and sequence-preserving, below that the collapse of divergent copies is lossy | `1.0` |
 | `--min-unit-bp <N>` | minimum repeat-unit span to normalize | `50` |
-| `--min-copies <N>` | tandem copies needed (in some haplotype) to treat a bubble as an array; once an array, every haplotype with ≥1 copy folds | `2` |
-| `--min-array-prevalence <f>` | min fraction of bubble-traversing haplotypes that must carry a ≥`min-copies` array for the bubble to fold; separates a true population TR from a rare/private duplication | `0.5` |
-| `--max-interruption-frac <f>` | max fraction of an array's bp that may be interruptions | `0.25` |
-| `--bubble-id <N>` | restrict to these sites (repeatable); overlap and disjointness are then judged among the selected ones only | all |
-| `--threads <N>` | workers for the approximate seed scan/`CN` detection (`0` = auto) | `0` |
-| `--gtf <path>` | after re-sorting, project genes ( `<prefix>.bandage_genes.csv`, needs a PanSN (Pangenome Sequence Naming) `--reference-path`); separate from `bubble --gtf` because collapse, if applicable, renumbers nodes | — |
-| `-q, --quiet` | disable progress/logs | off |
+| `--min-copies <N>` | tandem copies some haplotype must carry for a bubble to count as an array; once it does, every haplotype with at least one copy folds | `2` |
+| `--min-array-prevalence <f>` | fraction of the bubble's haplotypes that must carry an array before it is folded, which is what separates a population repeat from a private duplication | `0.5` |
+| `--max-interruption-frac <f>` | fraction of an array's bases that may be interruptions between copies | `0.25` |
+| `--resnarl-min-variant-bp <N>` | interior-span filter applied when re-snarling under `--reference-path` | `50` |
+| `--bubble-id <N>` | restrict to these sites (repeatable) | all |
+| `--allow-partial-boundary` | fold a site even when a copy cannot be bounded by any step range | off |
+| `--no-flip` | with `--reference-path`, skip reorienting to the reference strand | off |
+| `--threads <N>` | workers for approximate detection (`0` = auto) | `0` |
+| `--gtf <path>` | after re-sorting, project genes onto reference nodes; separate from `bubble --gtf` because collapsing renumbers nodes | — |
+| `-q, --quiet` | disable progress logs | off |
 
 ## Outputs
 
 | file | contents |
 |------|----------|
 | `<prefix>.normalized.sorted.gfa` | sorted, call-ready normalized graph (with `--reference-path`) |
-| `<prefix>.normalized.gfa` | unsorted normalized graph (without `--reference-path`; must be re-sorted before `call`) |
-| `<prefix>.bubbles.csv` | re-snarled bubbles (with `--reference-path`) |
-| `<prefix>.panphorte.report.tsv` | one row per bubble (columns below) |
-| `<prefix>.panphorte.copies.tsv` | (approximate mode) one row per (haplotype, array) — the `CN` provenance for `call` (columns below) |
-| `<prefix>.panphorte.rep_provenance.tsv` | one row per REP node: the site and motif it stands for (columns below) |
+| `<prefix>.normalized.gfa` | unsorted normalized graph (without `--reference-path`; re-sort before `call`) |
+| `<prefix>.bubbles.csv` | bubbles re-snarled on the normalized graph (with `--reference-path`) |
+| `<prefix>.panphorte.report.tsv` | one row per bubble |
+| `<prefix>.panphorte.copies.tsv` | one row per haplotype and array, in approximate mode |
+| `<prefix>.panphorte.rep_provenance.tsv` | one row per repeat-unit node created |
 | `<prefix>.bandage_nodes.csv` | Bandage node colors |
-| `<prefix>.bandage_genes.csv` | Bandage gene track (with `--gtf` and PanSN `--reference-path`) |
 
-`<prefix>.panphorte.report.tsv` columns:
-
-| column | meaning |
-|--------|---------|
-| `bubble_id` | the bubble considered |
-| `normalized` | whether it was folded into a `REP` self-loop (`1`/`0`) |
-| `unit_bp` | length of the detected repeat unit (bp) |
-| `paths_normalized` | how many paths were rewritten |
-| `min_copies`, `max_copies` | smallest / largest copy count seen across haplotypes |
-| `nodes_collapsed` | distinct original nodes the rewrite replaced at this bubble. A node still walked at another site survives the run, so this counts what was replaced here, not what was deleted from the graph |
-
-`<prefix>.panphorte.copies.tsv` columns:
+`panphorte.report.tsv` columns:
 
 | column | meaning |
 |--------|---------|
-| `path_name`, `sample` | the haplotype path and its sample |
-| `input_bubble_id` | the array's bubble, numbered as in the CSV handed in |
-| `copies` | detected tandem copy count for this haplotype |
-| `unit_bp`, `region_bp` | repeat-unit length and total array span (bp) |
-| `orientations` | strand(s) the copies were found on |
-| `mean_identity` | mean identity of the copies to the unit (approximate collapse) |
-| `input_from_node`, `input_to_node` | graph span of the array, in the input graph's numbering |
+| `bubble_id` | the site, as numbered in the input CSV |
+| `normalized` | `yes` if the site was folded |
+| `unit_bp` | length of the repeat unit found |
+| `paths_normalized` | how many haplotypes were rewritten onto the folded unit |
+| `min_copies`, `max_copies` | fewest and most copies any haplotype carries |
+| `interruptions_bp` | bases lying between copies rather than in them |
+| `nodes_collapsed` | how many nodes the fold removed |
+| `n_traversing` | haplotypes crossing the site at all |
+| `n_motif_carriers` | haplotypes carrying the detected unit |
+| `prevalence` | `n_motif_carriers` over `n_traversing`, the quantity `--min-array-prevalence` gates on |
+| `n_motifs` | distinct units detected at the site |
+| `copies_declined_partial_boundary`, `paths_with_partial_boundary` | copies, and haplotypes, refused because a copy could not be bounded |
+| `status` | `normalized`, or why not: `below_prevalence`, `no_tandem_detected`, `no_seed`, `partial_boundary` |
 
-The three `input_` columns describe the graph handed in. Under `--reference-path` the output is sorted, which renumbers nodes and reassigns bubble ids, so the same numbers still exist afterwards and refer to different sequence.
+`panphorte.copies.tsv` gives, per haplotype and array, its `copies`, `unit_bp`, `mean_identity`, the `orientations` of its copies, the `region_bp` they span and the input site they came from. `panphorte.rep_provenance.tsv` maps each created repeat-unit node to the site and `canonical_motif` it stands for, and gives the `copy_quantum` each traversal represents.
 
-`<prefix>.panphorte.rep_provenance.tsv` columns:
+## Limitations
 
-| column | meaning |
-|--------|---------|
-| `created_rep_node` | the id panphorte created the REP under, in the input graph's numbering |
-| `output_rep_node` | the id it is delivered under — the join key against the GFA beside this file |
-| `input_bubble_id` | the site it stands for, numbered as in the CSV handed in |
-| `canonical_motif` | the primitive motif, least rotation, min over both strands — the same whichever way the node ends up oriented, so it is the key for grouping phase-rotated units at one site |
-| `created_phase_unit` | the sequence panphorte built the node with |
-| `output_phase_unit` | the sequence the delivered node actually spells; sorting may flip a REP, so this is not always the same string |
-| `unit_bp`, `copy_quantum` | unit length, and how many copies one REP step stands for (always 1) |
+- Below `--min-similarity 1.0` the collapse is lossy: divergent copies are folded onto one consensus unit, so a haplotype no longer spells its own sequence at that site.
+- Bubble ids are reassigned when the graph is re-snarled under `--reference-path`, so an id in the output does not refer to the same site as that id in the input. The run reports the count change rather than implying the ids correspond.
+- Exact folding seeds from runs of repeated node steps, so two byte-identical copies split at different node boundaries can be missed even though folding them would be lossless.
+- Approximate detection looks for copies sharing an exact short seed, so a copy above `--min-similarity` whose substitutions are spread evenly can go undetected.
+- Where one site carries two phase-rotated units, each becomes its own repeat-unit node. A consumer counting those nodes sees two independent duplications rather than one site's copy number unless it groups them on `canonical_motif` using the provenance table.
 
 ## Example
 
-See the [LPA walkthrough](../walkthrough.md) for this module in a full end-to-end run.
-
-## Re-snarling under `--reference-path`
-
-With `--reference-path`, the normalized graph is sorted and re-snarled so the output is call-ready. That re-snarl applies its own interior-span filter, `--resnarl-min-variant-bp` (default 50). It is a separate decision from the one that produced the input bubbles: a CSV built with a different threshold can otherwise lose bubbles that normalization never touched. Bubble ids are reassigned by the re-snarl, so an id in the output does not correspond to the same id in the input; the run reports the count change rather than pretending the ids match.
-
-## Report columns
-
-`<prefix>.panphorte.report.tsv` carries, per bubble: `normalized`, `unit_bp`, `paths_normalized`, `min_copies`, `max_copies`, `interruptions_bp`, `nodes_collapsed`, and the diagnostics `n_traversing`, `n_motif_carriers`, `prevalence`, `n_motifs`, `copies_declined_partial_boundary`, `paths_with_partial_boundary` and `status` (`normalized`, `below_prevalence`, `no_tandem_detected`, `no_seed`, `partial_boundary`). `normalized` is `yes`/`no`.
-
-Two phase-rotated units at one site cannot share an unsplit REP node while exact spelling is preserved, so they become separate nodes; without the provenance table a consumer counting REP occurrences sees two independent DUPs instead of one site's copy number. Group them on `canonical_motif` and join to the graph on `output_rep_node`. `call` does not yet aggregate by site.
+See the [walkthrough](../walkthrough.md) for this module in a full end-to-end run.

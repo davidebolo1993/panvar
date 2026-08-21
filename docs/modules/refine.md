@@ -45,32 +45,31 @@ Algorithm and worked trace: [algorithms/refine.md](../algorithms/refine.md).
 | `<prefix>.bandage_nodes.csv` | Bandage node colouring |
 | `<prefix>.bandage_genes.csv` | Bandage gene track (only with `--gtf` and a PanSN reference) |
 
+## Limitations
+
+- A region carrying an unfolded copy-number signal is skipped entirely, because re-aligning it would linearize the copies and remove the signal `call` reconstructs from them. Refinement therefore does not reach the sites where duplications are typed.
+- A region only some haplotypes traverse fully is skipped by default. Rewriting the rest while retaining those haplotypes' nodes would also retain the edges between them, so refined and unrefined topology would coexist at the same site — which the losslessness check cannot detect, since every haplotype still spells the same bases. `--partial-path-policy retain` rebuilds anyway and is experimental.
+- The resource guards decide per region, so a locus can be partly refined. The report names which guard fired and the sizes behind it, so a skip can be acted on without re-running.
+- Bubble ids are reassigned when the refined graph is re-snarled, so an id in the output does not refer to the same site as that id in the input.
+
+## Guards and the decision report
+
+`--max-poa-bp` bounds the longest residual sequence in a segment and `--max-poa-work` bounds the estimated alignment cost, longest against total bases. Both are measured over the distinct sequences the aligner is handed, so adding an identical haplotype cannot change a decision without changing the alignment input; `--max-walks` counts those distinct sequences too.
+
+`--resnarl-min-variant-bp` sets the interior-span filter used when the refined graph is decomposed again, which otherwise reapplies the default to an input built with a different one.
+
+`<prefix>.refine.report.tsv` records one row per region:
+
+| column | meaning |
+|--------|---------|
+| `region` | the region's number in this run |
+| `n_bubbles` | how many input bubbles were fused into it |
+| `source`, `sink` | its outer anchor nodes |
+| `decision` | `rebuilt` or `skipped` |
+| `reason` | which guard fired, and the sizes behind it |
+
+Losslessness is checked rather than assumed: every haplotype's spelled sequence is compared against its input, and every consecutive step pair must be joined by a link that exists in the orientation walked, both before anything is written. The output family is staged and committed only once that passes.
+
 ## Example
 
-See the [LPA walkthrough](../walkthrough.md) for this module in a full end-to-end run.
-
-## Guards, policy and the decision report
-
-`--max-poa-bp` bounds the LONGEST residual sequence in a segment; `--max-poa-work` optionally bounds the
-estimated DP-cell budget (longest x total bases). Both are measured over the DISTINCT sequences abPOA is
-handed, so replicating an identical haplotype cannot change a decision without changing the POA input.
-`--max-walks` counts those distinct sequences, not walks.
-
-A region that some paths traverse only partly cannot have those paths rewritten. Retaining their nodes
-also retains the old edges between them, so pre-refinement topology survives beside the refined one --
-which sequence losslessness cannot detect, because every path still spells the same bases.
-`--partial-path-policy` defaults to `skip`; `retain` rebuilds anyway and is experimental. Measured on C4
-and LPA the two policies are identical (3 rebuilt / 2 skipped, and 7 / 5), because no region at either
-locus has a partial traverser.
-
-`--resnarl-min-variant-bp` sets the interior-span filter for the re-snarled call-ready CSV, which
-otherwise silently reapplies `bubble`'s own 50 bp default to an input built with a different one.
-
-`<prefix>.refine.report.tsv` records one row per region: region number, bubble count, anchors, decision
-and reason. Reasons name the guard that fired and the sizes behind it (carriers, distinct sequences,
-longest, distinct total bp), so a skip can be acted on without re-running.
-
-Losslessness is an acceptance criterion, not an assumption: every path's spelled sequence is compared
-against its input, and every consecutive step pair must be joined by a link that exists in the
-orientation walked, both before anything is written. The whole output family is staged and committed
-only once that passes.
+See the [walkthrough](../walkthrough.md) for this module in a full end-to-end run.
