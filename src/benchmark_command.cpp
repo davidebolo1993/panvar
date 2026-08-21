@@ -49,19 +49,22 @@ void print_benchmark_help() {
         << "            authorise copying a neighbouring uncalled allele. Read it as a discovery upper\n"
         << "            bound -- can the graph hold this haplotype, and did the caller flag the\n"
         << "            divergent blocks -- never as a genotyping score. No genotype is read.\n"
-        << "  carrier   `called` plus the requirement that THIS haplotype's GT names the record. It\n"
-        << "            implants the same true blocks, so `called` minus `carrier` is entirely loss to\n"
-        << "            wrong carrier assignment, and `carrier` minus `genotype` is what the VCF's\n"
-        << "            encoding of those same calls costs. Needs --vcf.\n"
-        << "  called    The same substitution restricted to blocks a SPECIFIC record is attributed to\n"
-        << "            AND that reach --min-sv-bp; nothing else of the haplotype's walk is copied. It\n"
-        << "            still substitutes the haplotype's TRUE block, not the record's REF/ALT effect,\n"
-        << "            so it is the ceiling those records would reach if each reproduced its block\n"
-        << "            exactly -- not what they do reproduce. That is `genotype`.\n"
-        << "  genotype  (--vcf) Reference sequence with only the edits this haplotype's GT names,\n"
-        << "            applied from the VCF alone. A missed carrier keeps reference and a spurious one\n"
-        << "            edits sequence that was already correct, so both error directions cost bases.\n"
-        << "            This is what a consumer reconstructing a sample from the VCF actually gets.\n\n"
+        << "  carrier    `called` plus the requirement that THIS haplotype's GT names the record. It\n"
+        << "             implants the same true blocks, so `called` minus `carrier` is entirely loss to\n"
+        << "             wrong carrier assignment, and `carrier` minus `region_vcf` is what the VCF's\n"
+        << "             encoding of those same calls costs. Needs --vcf.\n"
+        << "  called     The same substitution restricted to blocks a SPECIFIC record is attributed to\n"
+        << "             AND that reach --min-sv-bp; nothing else of the haplotype's walk is copied. It\n"
+        << "             still substitutes the haplotype's TRUE block, not the record's REF/ALT effect,\n"
+        << "             so it is the ceiling those records would reach if each reproduced its block\n"
+        << "             exactly -- not what they do reproduce. That is `region_vcf`.\n"
+        << "  region_vcf (--vcf) Reference sequence with only the edits this haplotype's GT names,\n"
+        << "             applied from the VCF alone. A missed carrier keeps reference and a spurious one\n"
+        << "             edits sequence that was already correct, so both error directions cost bases.\n"
+        << "             This is what a consumer reconstructing a sample from the VCF actually gets.\n"
+        << "             It measures the FIDELITY OF THE COMPACT REPRESENTATION, not read-level\n"
+        << "             genotyping: no reads are involved at any level here. Pass call's --allele-vcf\n"
+        << "             instead to score the lossless per-bubble alleles.\n\n"
         << "All are aligned to the haplotype's true walk (edlib NW) and scored\n"
         << "QV = -10*log10(max(0.5, delta)/S), combined per haplotype length-weighted (sum delta / sum S)\n"
         << "and binned into the cosigt bands (<17, 17-23, 23-33, >33). The do-nothing baseline (plain\n"
@@ -75,7 +78,7 @@ void print_benchmark_help() {
         << "  -b, --bubble-prefix-in <prefix>  panphorte output prefix (auto-uses <prefix>.bubbles.csv)\n"
         << "  -c, --bubbles-csv-in <path>      panphorte bubbles CSV (required if no prefix)\n"
         << "      --variant-nodes <path>       call's <prefix>.variant_nodes.tsv (required)\n"
-        << "      --vcf <path>                 call's <prefix>.region.vcf. Adds the genotype-aware\n"
+        << "      --vcf <path>                 call's <prefix>.region.vcf (or --allele-vcf). Adds the\n"
         << "                                   reconstruction above; without it only the graph and\n"
         << "                                   called reconstructions are scored\n"
         << "  -r, --reference-path <name>      Reference path name/substring, the diff baseline (required)\n"
@@ -769,7 +772,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
         unjoined_samples = vcf.samples.size() - used.size();
         if (joined == 0)
             throw std::runtime_error("No VCF sample column matches a graph path name, so no haplotype "
-                                     "can be genotype-scored: " + vcf_in);
+                                     "can be region-VCF scored: " + vcf_in);
         region_start = parse_reference_path_label(ref_path->name).region_start_1based;
 
         std::vector<std::size_t> prefix(ref_path->steps.size() + 1, 0);
@@ -807,13 +810,13 @@ int run_benchmark_command(const std::vector<std::string>& args) {
             ref_span[b.id] = { prefix[lo], prefix[hi + 1] - prefix[lo] };
             ref_flip[b.id] = flip;
         }
-        log.info("genotype scoring from " + vcf_in + ": " + std::to_string(vcf.records.size()) +
+        log.info("region-VCF scoring from " + vcf_in + ": " + std::to_string(vcf.records.size()) +
                  " records, " + std::to_string(joined) + "/" + std::to_string(graph.paths.size()) +
                  " haplotypes joined to VCF samples, " + std::to_string(ref_span.size()) +
                  "/" + std::to_string(bubbles.size()) + " bubbles placed on the reference");
         // A partial join is a selected subset, and a QV computed over a subset is not the QV of the run.
         if (joined != graph.paths.size() || unjoined_samples)
-            log.info("warning: the genotype score covers " + std::to_string(joined) + " of " +
+            log.info("warning: the region-VCF score covers " + std::to_string(joined) + " of " +
                      std::to_string(graph.paths.size()) + " graph haplotypes; " +
                      std::to_string(graph.paths.size() - joined) + " path(s) have no VCF column and " +
                      std::to_string(unjoined_samples) + " VCF sample(s) have no path. It is a SUBSET score");
@@ -882,7 +885,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                 throw std::runtime_error(vcf_in + " has " + std::to_string(extra) + " record(s) with no row "
                                          "in " + variant_nodes_in + " (first: '" + first_extra +
                                          "'). The two must describe the same call set exactly, or the "
-                                         "genotype level applies edits nothing else accounts for");
+                                         "region_vcf level applies edits nothing else accounts for");
         }
     }
 
@@ -1390,7 +1393,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                 const double closed = has_gap
                     ? (static_cast<double>(gt_tot_ref_delta) - static_cast<double>(gt_tot_gt_delta)) / denom : 0.0;
                 sum << "gt_gap\tALL\tbaseline_delta\t" << gt_tot_ref_delta << "\t0\n";
-                sum << "gt_gap\tALL\tgenotype_delta\t" << gt_tot_gt_delta << "\t0\n";
+                sum << "gt_gap\tALL\tregion_vcf_delta\t" << gt_tot_gt_delta << "\t0\n";
                 sum << "gt_gap\tALL\tgraph_delta\t" << gt_tot_graph_delta << "\t0\n";
                 sum << "gt_gap\tALL\tgap_closed_pooled\t0\t";
                 if (has_gap) sum << 100.0 * closed << '\n'; else sum << "NA\n";
@@ -1419,11 +1422,11 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                 vr("called", cs_called);
                 if (carrier_scored_haps) vr("carrier_walk", cs_carrier);
                 else sum << "variation_recovered\tALL\tcarrier_walk\t0\tNA\n";
-                vr("genotype", cs_gt);
+                vr("region_vcf", cs_gt);
                 vr("in_scope_floor", cs_scope);
                 sum << "common_set\tALL\tobservations\t" << cs_obs << "\t0\n";
                 sum << "common_set\tALL\tbaseline_delta\t" << cs_base << "\t0\n";
-                sum << "common_set\tALL\tgenotype_delta\t" << cs_gt << "\t0\n";
+                sum << "common_set\tALL\tregion_vcf_delta\t" << cs_gt << "\t0\n";
                 // An exact partition of the genotype residual over the common set. The five terms sum
                 // to cs_gt by construction, each being one consecutive step of
                 //   truth -> in-scope floor -> called -> carrier -> genotype.
@@ -1501,7 +1504,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
         log.info("note: " + std::to_string(tot_coarse) + " haplotype-bubble pair(s) were too large to "
                  "decompose and were treated as a single event");
     if (gt_scored_haps) {
-        log.info("genotype (from VCF) " + std::to_string(gt_scored_haps) + " haplotypes, qv/qv_max quintiles:" +
+        log.info("region_vcf (from the VCF alone) " + std::to_string(gt_scored_haps) + " haplotypes, qv/qv_max quintiles:" +
                  quintile_recap(gt_quintile_count, gt_scored_haps));
         {
             const double denom = static_cast<double>(gt_tot_ref_delta) - static_cast<double>(gt_tot_graph_delta);
@@ -1511,12 +1514,12 @@ int run_benchmark_command(const std::vector<std::string>& args) {
             char gb[288];
             if (has_gap)
                 std::snprintf(gb, sizeof(gb),
-                              "residual bases: baseline(no edits)=%zu genotype=%zu graph=%zu -> gap closed %.1f%%"
+                              "residual bases: baseline(no edits)=%zu region_vcf=%zu graph=%zu -> gap closed %.1f%%"
                               " (%zu haplotypes worse than baseline)",
                               gt_tot_ref_delta, gt_tot_gt_delta, gt_tot_graph_delta, 100.0 * closed, gt_worse_than_ref);
             else
                 std::snprintf(gb, sizeof(gb),
-                              "residual bases: baseline(no edits)=%zu genotype=%zu graph=%zu -> gap closed UNDEFINED"
+                              "residual bases: baseline(no edits)=%zu region_vcf=%zu graph=%zu -> gap closed UNDEFINED"
                               " (the graph bound equals the baseline, so there is no gap to close)",
                               gt_tot_ref_delta, gt_tot_gt_delta, gt_tot_graph_delta);
             log.info(gb);
@@ -1529,7 +1532,7 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                       carrier[0], carrier[1], carrier[2], carrier[3], prec, rec);
         log.info(buf);
     } else if (do_gt) {
-        log.info("genotype scoring produced no scored haplotype (no bubble placed on the reference)");
+        log.info("region-VCF scoring produced no scored haplotype (no bubble placed on the reference)");
     }
     log.wrote(finals);
     log.done();

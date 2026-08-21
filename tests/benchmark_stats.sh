@@ -104,7 +104,7 @@ check "true carriers = the two callable-size deletion haplotypes only" "$tcar" "
 vg=$(pctcol variation_recovered "$AS" graph)
 vc=$(pctcol variation_recovered "$AS" called)
 vw=$(pctcol variation_recovered "$AS" carrier_walk)
-vt=$(pctcol variation_recovered "$AS" genotype)
+vt=$(pctcol variation_recovered "$AS" region_vcf)
 ordered=$(awk -v g="$vg" -v c="$vc" -v w="$vw" 'BEGIN{print (g>=c-1e-9 && c>=w-1e-9) ? "yes" : "no"}')
 check "graph >= called >= carrier, the nested ceilings ($vg/$vc/$vw; genotype $vt)" "$ordered" "yes"
 
@@ -257,7 +257,7 @@ CS="$OUT/C.qv_summary.tsv"
 check "the INV is applied, not left unhandled" "$(sumcol gt_records "$CS" unhandled)" "0"
 check "and it is applied exactly (no heuristic tiling)" "$(sumcol gt_records "$CS" heuristic)" "0"
 # Reconstructing an inversion from the reference is exact, so the VCF must reach the graph bound.
-check "an inverted haplotype reconstructs perfectly from the VCF" "$(sumcol gt_gap "$CS" genotype_delta)" "0"
+check "an inverted haplotype reconstructs perfectly from the VCF" "$(sumcol gt_gap "$CS" region_vcf_delta)" "0"
 
 # ---------------------------------------------------------------------------------------------
 # Input contracts. Each must be REFUSED, and must leave no output behind.
@@ -387,7 +387,7 @@ if [ -s "$OUT/av.alleles.vcf" ]; then
   "$BIN" benchmark -i "$OUT/ab.sorted.gfa" -c "$OUT/ab.bubbles.csv" -r "$REF" \
      --variant-nodes "$OUT/av.variant_nodes.tsv" --vcf "$OUT/av.alleles.vcf" -o "$OUT/AV" -q >/dev/null 2>&1
   VS="$OUT/AV.qv_summary.tsv"
-  check "the allele VCF reconstructs every haplotype exactly" "$(sumcol gt_gap "$VS" genotype_delta)" "0"
+  check "the allele VCF reconstructs every haplotype exactly" "$(sumcol gt_gap "$VS" region_vcf_delta)" "0"
   # The allele VCF is one row per BUBBLE (bubbleN_ALLELES); variant_nodes.tsv is one row per CALL.
   # They share no id, so the per-call carrier join does not exist here. Reporting it anyway turned a
   # perfect 0 bp reconstruction into carrier_walk 0%, 1.4 Mb of "missed carrier" and a NEGATIVE

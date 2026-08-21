@@ -21,11 +21,11 @@ How much of the sequence comes back. Four reconstructions over the same bubbles 
 | `graph` | reference walk plus the haplotype's own steps at every block sharing a node with any call | optimistic node-discovery ceiling: how far the union of called nodes reaches |
 | `called` | the same, restricted to blocks a specific record is attributed to and that reach `--min-sv-bp` | what the retained records would reach if each reproduced its block exactly |
 | `carrier` | `called`, plus the requirement that this haplotype's genotype names a record overlapping the block | the same ceiling once genotypes are applied |
-| `genotype` | the reference plus only the edits this haplotype's genotype names | what a consumer reconstructing this sample from the VCF actually gets |
+| `region_vcf` | the reference plus only the edits this haplotype's genotype names | what a consumer reconstructing this sample from the VCF actually gets |
 
-The first three implant the haplotype's own true sequence and are therefore ceilings, not VCF reconstructions. Only `genotype` reconstructs what the records say; this label belongs to the benchmark and is unrelated to the read-level `genotype` module.
+The first three implant the haplotype's own true sequence and are therefore ceilings, not VCF reconstructions. Only `region_vcf` reconstructs what the records themselves say. No level uses reads: this measures the fidelity of the compact representation, not genotyping accuracy.
 
-The genotype residual is then partitioned into five terms that sum to it exactly, so the shortfall can be attributed rather than just measured:
+The region-VCF residual is then partitioned into five terms that sum to it exactly, so the shortfall can be attributed rather than just measured:
 
 | term | bases lost to |
 |------|---------------|
@@ -38,7 +38,7 @@ The genotype residual is then partitioned into five terms that sum to it exactly
 A do-nothing baseline, the plain reference with no edits, is computed alongside and is the denominator of the headline figures:
 
 ```
-gap_closed          = (baseline_delta - genotype_delta) / (baseline_delta - graph_delta)
+gap_closed          = (baseline_delta - region_vcf_delta) / (baseline_delta - graph_delta)
 variation_recovered = (baseline_delta - <level>_delta)  /  baseline_delta
 ```
 
@@ -64,7 +64,7 @@ All outputs are staged and committed only on success, and no output may name an 
 
 | flag | what it does | default |
 |------|--------------|---------|
-| `--vcf <path>` | add the genotype level and the baseline it is measured against | off |
+| `--vcf <path>` | add the `region_vcf` level and the baseline it is measured against; accepts the region VCF or the allele VCF | off |
 | `--called-bubbles-only` | score only bubbles carrying `≥ 1` call. Ascertainment-biased by construction: the bubble the caller said nothing about is exactly where a miss lives | off — every reference-traversed bubble is scored |
 | `--min-sv-bp <N>` | event-size threshold for the ledger and the `called` reconstruction; set it to what `call` ran with | `50` |
 | `--dup-model <cn\|cnbp>` | lay down `CN` copies of `RU_LEN` in place of `REF_CN`, or apply the per-sample `CNBP` delta. Both tile an inferred reference span, so a DUP is reconstructed at the right length out of approximately right sequence and is counted `heuristic` | `cnbp` |
@@ -87,7 +87,7 @@ Results can be plotted via `scripts/plot_benchmark.R`.
 
 ## Limitations
 
-- The first three levels implant the haplotype's own true block, so they bound what the graph and the retained records could achieve rather than measuring what the VCF says. `genotype` is not bounded by them, since it applies every record the haplotype carries rather than only attributed eligible blocks, which is why the last two partition terms are signed.
+- The first three levels implant the haplotype's own true block, so they bound what the graph and the retained records could achieve rather than measuring what the VCF says. `region_vcf` is not bounded by them, since it applies every record the haplotype carries rather than only attributed eligible blocks, which is why the last two partition terms are signed.
 - `called` means a record shares a node with the block, not that it covers or reproduces it. It is an upper bound on discovery; `missed` is the firm negative.
 - Duplication reconstruction is heuristic: the inferred reference span is tiled, so the length is right and the sequence only approximately.
 - Allele-VCF mode has one record per bubble while the node sidecar has one per call, so they share no identifier. The `carrier` level and the per-call loss terms are reported as not applicable in that mode rather than as zero.

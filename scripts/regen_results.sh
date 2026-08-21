@@ -296,11 +296,11 @@ for region in "${REGIONS[@]}"; do
 done
 
 # A locus-level reconstruction summary, so the walkthrough and the module pages can be checked against
-# a file rather than against a recollection. Two levels, never one: `genotype` from the region VCF is
-# what a consumer of the interpreted output actually reconstructs, and `allele` is the serialization
-# ceiling, which reaches 0 residual because it spells every allele out.
+# a file rather than against a recollection. Two levels, never one: `region_vcf` is what a consumer of
+# the compact interpreted output actually reconstructs, and `allele` is the serialization ceiling,
+# which reaches 0 residual because it spells every allele out. Neither involves reads.
 RECON="$REPO/results/reconstruction.tsv"
-printf 'locus\tvcf\tbaseline_bp\tgraph_bp\tcalled_bp\tcarrier_bp\tgenotype_bp\trecovered_pct\n' > "$RECON"
+printf 'locus\tvcf\tbaseline_bp\tgraph_bp\tcalled_bp\tcarrier_bp\tregion_vcf_bp\trecovered_pct\n' > "$RECON"
 for region in "${REGIONS[@]}"; do
   for kind in benchmark allele; do
     f="$OUT/$region/benchmark/$kind.qv.tsv"
@@ -338,7 +338,7 @@ for region in "${REGIONS[@]}"; do
             next }
     { line = L; for (k = 1; k <= n; k++) line = line "\t" $at[w[k]]; print line }' "$bh" >> "$QV_TABLE"
 done
-# The loss partition, per locus: five consecutive terms that sum EXACTLY to the genotype residual.
+# The loss partition, per locus: five consecutive terms that sum EXACTLY to the region-VCF residual.
 # It lives in each locus's qv_summary.tsv rather than the per-haplotype table, so it is collected here
 # for the plot. It is the only view that says WHY reconstruction falls short rather than by how much.
 LOSS_TABLE="$REPO/results/benchmark_loss.tsv"

@@ -45,7 +45,7 @@ Each walks the reference and substitutes the haplotype's own steps at the blocks
 | `graph` | any of its nodes is in the union of called nodes at that bubble |
 | `called` | it is attributed to a specific record and `size_bp ≥ --min-sv-bp` |
 | `carrier` | as `called`, and this haplotype's `GT` names some record overlapping the block |
-| `genotype` | not block-based at all — see below |
+| `region_vcf` | not block-based at all — see below |
 
 `graph` is an optimistic node-discovery ceiling. Sharing a node with some call is not matching one, so a called deletion containing a shared reference node can authorise copying a different allele; no genotype is read, so a call placed on the wrong haplotypes can still score perfectly.
 
@@ -59,22 +59,22 @@ Within region mode, the block is substituted when any overlapping record has `GT
 
 A fifth reconstruction, the in-scope floor, substitutes every block reaching `--min-sv-bp` regardless of any call. Its residual is purely sub-threshold variation, so it separates out-of-scope sequence from discovery failure.
 
-The consecutive differences along `truth → in-scope floor → called → carrier → genotype` are the `loss_bp` partition, and the run asserts that they sum exactly to the genotype residual (`sum_check`).
+The consecutive differences along `truth → in-scope floor → called → carrier → region_vcf` are the `loss_bp` partition, and the run asserts that they sum exactly to the region-VCF residual (`sum_check`).
 
-This is a partition, not a descending chain. Only `in-scope floor ≥ called ≥ carrier` are nested ceilings — each substitutes a subset of the previous level's blocks, all implanting true sequence. `genotype` sits outside that nesting because it applies every record the haplotype carries rather than only attributed eligible blocks, so it can beat `carrier` locally; the last two terms are signed for exactly that reason.
+This is a partition, not a descending chain. Only `in-scope floor ≥ called ≥ carrier` are nested ceilings — each substitutes a subset of the previous level's blocks, all implanting true sequence. `region_vcf` sits outside that nesting because it applies every record the haplotype carries rather than only attributed eligible blocks, so it can beat `carrier` locally; the last two terms are signed for exactly that reason.
 
 Two rules make the partition mean what it says:
 
-One population. Every comparative total is over the common set — the `(haplotype, bubble)` observations all levels could score. `graph`/`called` cover every graph haplotype, `carrier` only VCF-joined ones, `genotype` only those whose bubble also placed. Totalling each over its own population reported `carrier` above `called` and a negative loss when one haplotype was left out of the VCF.
+One population. Every comparative total is over the common set — the `(haplotype, bubble)` observations all levels could score. `graph`/`called` cover every graph haplotype, `carrier` only VCF-joined ones, `region_vcf` only those whose bubble also placed. Totalling each over its own population reported `carrier` above `called` and a negative loss when one haplotype was left out of the VCF.
 
-A false positive is not a representation failure. Where the haplotype has no eligible truth event and the VCF still edits it, `carrier` has no true block to substitute and leaves the reference alone while `genotype` applies the erroneous edit. That difference is `false_positive_damage`, split out per observation from `representation`. The two are signed, because `genotype` applies every record the haplotype carries while `carrier` only substitutes attributed eligible blocks — so a record can improve a region `carrier` left alone.
+A false positive is not a representation failure. Where the haplotype has no eligible truth event and the VCF still edits it, `carrier` has no true block to substitute and leaves the reference alone while `region_vcf` applies the erroneous edit. That difference is `false_positive_damage`, split out per observation from `representation`. The two are signed, because `region_vcf` applies every record the haplotype carries while `carrier` only substitutes attributed eligible blocks — so a record can improve a region `carrier` left alone.
 
 Each reconstruction is globally aligned (Needleman–Wunsch, edlib) to the truth, giving `δ` and `S`. Identity is `1 − Σδ/ΣS` length-weighted over a haplotype's bubbles; `QV = -10·log10(max(0.5, δ)/S)` with ceiling `QV_max = 10·log10(2S)` and `qv_ratio = QV/QV_max` are emitted for comparability.
 
 
 ### 4. Reconstruct from the VCF alone
 
-#### The `genotype` level
+#### The `region_vcf` level
 
 With `--vcf`, a reconstruction that uses only what the VCF says about this haplotype, in sequence space, which is what a downstream consumer actually has.
 
@@ -97,7 +97,7 @@ Records that cannot be laid down are counted rather than dropped — `unplaceabl
 Score against the same truth, and against doing nothing. The plain reference span with no edits is scored alongside as the baseline:
 
 ```
-gap_closed          = (baseline_delta - genotype_delta) / (baseline_delta - graph_delta)
+gap_closed          = (baseline_delta - region_vcf_delta) / (baseline_delta - graph_delta)
 variation_recovered = (baseline_delta - <level>_delta)  /  baseline_delta
 ```
 
