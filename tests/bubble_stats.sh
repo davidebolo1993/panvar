@@ -359,6 +359,38 @@ else
   esac
 fi
 
+# ------------------------------------------- a repeated boundary is not clipped at 64 occurrences
+# The interval search used to enumerate the endpoints following each start, bounded at 64 to keep the
+# pairwise scan affordable. A path revisiting a boundary more often than that had its interval closed
+# early and SILENTLY: the ledger's "a focused 70-repeat path reports an interior span of 64 rather
+# than 70". The graph-derived interior masks it in `inside_node_count` -- every unit variant is still
+# reachable between the boundaries -- so the observable is the walked span, `max_inside_bp`.
+#
+# 70 copies of a 20 bp unit variant between two boundaries that each recur 70 times. The array walk's
+# interior is 70 x 20 = 1400 bp; the capped search reported 64 x 20 = 1280.
+{ printf 'H\tVN:Z:1.0\nS\t1\t%s\nS\t2\t%s\nS\t3\t%s\nS\t4\t%s\n' \
+    "$(printf 'A%.0s' $(seq 60))" "$(printf 'C%.0s' $(seq 20))" \
+    "$(printf 'G%.0s' $(seq 20))" "$(printf 'T%.0s' $(seq 60))"
+  for i in $(seq 1 70); do printf 'S\t%d\tACGTACGTACGTACGTACGT\n' $((100 + i)); done
+  printf 'L\t1\t+\t2\t+\t0M\nL\t3\t+\t4\t+\t0M\nL\t3\t+\t2\t+\t0M\n'
+  for i in $(seq 1 70); do printf 'L\t2\t+\t%d\t+\t0M\nL\t%d\t+\t3\t+\t0M\n' $((100 + i)) $((100 + i)); done
+  printf 'P\tarray\t1+'; for i in $(seq 1 70); do printf ',2+,%d+,3+' $((100 + i)); done; printf ',4+\t*\n'
+  printf 'P\tsingle\t1+,2+,101+,3+,4+\t*\n'; } > "$OUT/repeat70.gfa"
+printf '{"start": {"node_id": "2"}, "end": {"node_id": "3"}}\n' > "$OUT/repeat70.jsonl"
+"$BIN" bubble -i "$OUT/repeat70.gfa" -r array --snarls-in "$OUT/repeat70.jsonl" \
+       -o "$OUT/repeat70" --min-variant-bp 0 -q >/dev/null 2>&1
+r70_max=$(cel "$OUT/repeat70.bubbles.csv" max_inside_bp)
+[ "$r70_max" = "1400" ] \
+  && ok "a 70-fold repeated boundary keeps its full interior (max_inside_bp 1400)" \
+  || bad "max_inside_bp=$r70_max, expected 1400 (64-endpoint clipping reports 1280)"
+r70_in=$(cel "$OUT/repeat70.bubbles.csv" inside_node_count)
+[ "$r70_in" = "70" ] && ok "all 70 unit variants are interior nodes" \
+                     || bad "inside_node_count=$r70_in, expected 70"
+# the single-copy haplotype still supplies the shortest interior, so the site is not merely widened
+r70_min=$(cel "$OUT/repeat70.bubbles.csv" min_inside_bp)
+[ "$r70_min" = "20" ] && ok "the one-copy haplotype still sets min_inside_bp (20)" \
+                      || bad "min_inside_bp=$r70_min, expected 20"
+
 echo
 if [ "$fails" -eq 0 ]; then echo "bubble_stats: all assertions passed"; exit 0; fi
 echo "bubble_stats: $fails assertion(s) FAILED"; exit 1

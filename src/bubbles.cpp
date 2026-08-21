@@ -432,32 +432,36 @@ void evaluate_endpoint_interval_direction(
     bool source_to_sink,
     std::optional<EndpointOnlyInterval>& best) {
 
-    // Every later endpoint, bounded: where a boundary recurs the enclosing traversal ends at a later
-    // occurrence, and the nearest one closes an interval holding almost none of the snarl. Only the
-    // widest few can ever win, so each start examines at most kMaxEndsPerStart endpoints.
+    // Where a boundary recurs, the enclosing traversal ends at a LATER occurrence and the nearest one
+    // closes an interval holding almost none of the snarl. This used to enumerate the endpoints after
+    // each start, bounded at 64 to keep it affordable, which silently clipped any path revisiting a
+    // boundary more often than that.
+    //
+    // The enumeration was never needed. This interval is ranked on `inside_steps`, which here is just
+    // `right - left - 1` -- the span, not a count of interior nodes -- so "most interior steps" and
+    // "widest" are the same requirement, and better_endpoint_interval's shortest-span tie-break is
+    // unreachable because equal inside_steps means equal span. The widest pair is the earliest start
+    // with the latest end, and it is unique: any other pair has a strictly smaller span.
     //
     // An ADJACENT pair (end_pos == start_pos + 1) is a real crossing with an empty interior, and it was
-    // rejected here. That looks harmless -- it contributes no interior nodes -- but this interval is
-    // also what tells the graph-derived search which SIDE of each boundary faces inward. With every
+    // once rejected here. That looks harmless -- it contributes no interior nodes -- but this interval
+    // is also what tells the graph-derived search which SIDE of each boundary faces inward. With every
     // stored path taking the direct source->sink route, no interval survived, the graph search was
-    // never seeded, and an alternate allele that exists in the graph produced no bubble at all.
-    // better_endpoint_interval ranks on interior steps first, so an empty interval wins only when
-    // there is nothing else.
-    constexpr std::size_t kMaxEndsPerStart = 64;
-    for (const std::size_t start_pos : start_positions) {
-        const auto first = std::upper_bound(end_positions.begin(), end_positions.end(), start_pos);
-        std::size_t examined = 0;
-        for (auto it = first; it != end_positions.end() && examined < kMaxEndsPerStart; ++it, ++examined) {
-            const std::size_t end_pos = *it;
-            EndpointOnlyInterval candidate;
-            candidate.left = start_pos;
-            candidate.right = end_pos;
-            candidate.inside_steps = end_pos - start_pos - 1;
-            candidate.source_to_sink = source_to_sink;
-            if (!best.has_value() || better_endpoint_interval(candidate, *best)) {
-                best = candidate;
-            }
-        }
+    // never seeded, and an alternate allele that exists in the graph produced no bubble at all. It is
+    // admitted here (right > left), and it wins only when there is nothing wider.
+    if (start_positions.empty() || end_positions.empty()) {
+        return;
+    }
+    EndpointOnlyInterval candidate;
+    candidate.left = start_positions.front();
+    candidate.right = end_positions.back();
+    if (candidate.right <= candidate.left) {
+        return;
+    }
+    candidate.inside_steps = candidate.right - candidate.left - 1;
+    candidate.source_to_sink = source_to_sink;
+    if (!best.has_value() || better_endpoint_interval(candidate, *best)) {
+        best = candidate;
     }
 }
 

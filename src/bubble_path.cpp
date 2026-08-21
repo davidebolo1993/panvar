@@ -56,28 +56,46 @@ void evaluate_direction(
     const std::vector<std::size_t>& inside_positions,
     std::optional<BubblePathInterval>& best) {
 
-    // Every later endpoint, not just the nearest. The rule is "the interval with the most interior
-    // steps wins", but taking only the first endpoint after each start made that unreachable: where a
-    // boundary recurs -- a tandem array, a duplication, any path revisiting a boundary -- the enclosing
-    // traversal ends at a LATER occurrence, and the nearest one closes a short interval containing
-    // almost none of the snarl. Bounded per start, since only the widest few can ever win.
-    constexpr std::size_t kMaxEndsPerStart = 64;
-    for (const std::size_t start_pos : start_positions) {
-        const auto first = std::upper_bound(end_positions.begin(), end_positions.end(), start_pos);
-        std::size_t examined = 0;
-        for (auto it = first; it != end_positions.end() && examined < kMaxEndsPerStart; ++it, ++examined) {
-            BubblePathInterval candidate;
-            candidate.left = start_pos;
-            candidate.right = *it;
-            candidate.inside_count = count_inside_between(inside_positions, candidate.left, candidate.right);
-            candidate.source_to_sink = source_to_sink;
-            if (candidate.inside_count == 0) {
-                continue;
-            }
-            if (!best.has_value() || better_interval(candidate, *best)) {
-                best = candidate;
-            }
-        }
+    // The rule is "the interval with the most interior steps wins, shortest span then leftmost to
+    // break a tie". Enumerating start/end pairs to find that is quadratic, and the bound that made it
+    // affordable -- the first 64 endpoints after each start -- silently clipped the answer wherever a
+    // boundary recurs more than that: a tandem array, a duplication, any path revisiting a boundary
+    // enough times. A focused 70-repeat path reported an interior of 64.
+    //
+    // No enumeration is needed. The interior count is monotone under containment, so the WIDEST
+    // interval attains the maximum, and every interval attaining it must contain all of those
+    // interior steps. The shortest one is therefore the tightest window around them: the last start
+    // before the first interior step, and the first end after the last. Exact, and two binary
+    // searches rather than a bounded scan.
+    if (start_positions.empty() || end_positions.empty()) {
+        return;
+    }
+    const std::size_t widest_left = start_positions.front();
+    const std::size_t widest_right = end_positions.back();
+    if (widest_right <= widest_left) {
+        return;
+    }
+    const std::size_t inside_count = count_inside_between(inside_positions, widest_left, widest_right);
+    if (inside_count == 0) {
+        return;
+    }
+
+    // inside_count > 0 makes every dereference below valid: there is at least one interior position
+    // strictly inside the widest interval, so each bound is bracketed by an endpoint on its own side.
+    const std::size_t first_inside =
+        *std::upper_bound(inside_positions.begin(), inside_positions.end(), widest_left);
+    const std::size_t last_inside =
+        *(std::lower_bound(inside_positions.begin(), inside_positions.end(), widest_right) - 1);
+
+    BubblePathInterval candidate;
+    candidate.left =
+        *(std::lower_bound(start_positions.begin(), start_positions.end(), first_inside) - 1);
+    candidate.right =
+        *std::upper_bound(end_positions.begin(), end_positions.end(), last_inside);
+    candidate.inside_count = inside_count;
+    candidate.source_to_sink = source_to_sink;
+    if (!best.has_value() || better_interval(candidate, *best)) {
+        best = candidate;
     }
 }
 
