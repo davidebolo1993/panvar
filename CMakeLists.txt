@@ -8,6 +8,30 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(PANVAR_BUILD_TESTING "Build tests" ON)
 
+# `genotype` is the one module that has not completed its review pass. It is excluded from the default
+# build entirely -- sources, dispatch, help and tests -- so a released binary cannot be asked to do
+# something the project is not prepared to stand behind. Development continues with
+# -DPANVAR_ENABLE_EXPERIMENTAL_GENOTYPE=ON, which restores all four.
+option(PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE
+       "Build the experimental genotype module (not release-reviewed)" OFF)
+
+# Every source below is reachable only from `genotype`: node_coverage and pangenie_model are its two
+# alternative evidence paths, not shared utilities.
+set(PANVAR_GENOTYPE_LIB_SOURCES
+    src/genotype.cpp
+    src/genotype_blocks.cpp
+    src/genotype_index.cpp
+    src/genotype_markers.cpp
+    src/genotype_reads.cpp
+    src/pangenie_model.cpp
+    src/node_coverage.cpp
+)
+set(PANVAR_GENOTYPE_CLI_SOURCES src/genotype_command.cpp)
+if(NOT PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE)
+    set(PANVAR_GENOTYPE_LIB_SOURCES "")
+    set(PANVAR_GENOTYPE_CLI_SOURCES "")
+endif()
+
 find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
 
@@ -120,19 +144,13 @@ add_library(panvarlib
     src/integrated_snarls.cpp
     src/bubble_alleles.cpp
     src/syncmer.cpp
-    src/genotype.cpp
-    src/genotype_blocks.cpp
-    src/genotype_index.cpp
-    src/genotype_markers.cpp
-    src/genotype_reads.cpp
-    src/pangenie_model.cpp
+    ${PANVAR_GENOTYPE_LIB_SOURCES}
     src/bubble_path.cpp
     src/bubbles.cpp
     src/ref_path.cpp
     src/gtf.cpp
     src/gene_cn_kmer.cpp
     src/minimap2_align.cpp
-    src/node_coverage.cpp
     src/variant_call.cpp
     src/describe.cpp
     src/panphorte.cpp
@@ -172,7 +190,7 @@ add_executable(panvar
     src/bubble_command.cpp
     src/inspect.cpp
     src/call_command.cpp
-    src/genotype_command.cpp
+    ${PANVAR_GENOTYPE_CLI_SOURCES}
     src/benchmark_command.cpp
     src/describe_command.cpp
     src/panphorte_command.cpp
@@ -181,6 +199,10 @@ add_executable(panvar
     src/associate_command.cpp
 )
 target_include_directories(panvar PRIVATE ${EIGEN_DIR})
+if(PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE)
+    target_compile_definitions(panvar PRIVATE PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE)
+    target_compile_definitions(panvarlib PUBLIC PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE)
+endif()
 target_link_libraries(panvar PRIVATE panvarlib minimap2 Threads::Threads ZLIB::ZLIB)
 if(NOT WIN32)
     target_link_libraries(panvar PRIVATE m)
@@ -276,7 +298,7 @@ if(PANVAR_BUILD_TESTING)
         # against the indexed route. The fixture feeds exact copies of the sample's haplotypes so lambda
         # is known by construction rather than recorded from a previous run.
         set(PANVAR_GENOTYPE_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_stats.sh)
-        if(EXISTS ${PANVAR_GENOTYPE_STATS})
+        if(EXISTS ${PANVAR_GENOTYPE_STATS} AND PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE)
             add_test(
                 NAME panvar_genotype_stats
                 COMMAND /usr/bin/env bash ${PANVAR_GENOTYPE_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/genotype_stats

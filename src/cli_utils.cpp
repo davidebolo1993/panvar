@@ -157,7 +157,10 @@ void print_general_help() {
         << "  panphorte  Module 2: normalize tandem-repeat bubbles into a compact GFA\n"
         << "  refine     Module 2b: POA-realign bubble interiors to remove pggb alignment artifacts\n"
         << "  call       Module 3: graph-native structural variant calling\n"
-        << "  genotype   Module 3b: per-bubble genotyping of a short-read sample\n"
+#ifdef PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE
+        << "  genotype   Module 3b: per-bubble genotyping of a short-read sample"
+           " (EXPERIMENTAL, not release-reviewed)\n"
+#endif
         << "  describe   Module 4: per-bubble k-mer feature description\n"
         << "  associate  Module 5: GWAS on describe genotypes vs a phenotype/covariate table\n"
         << "  inspect    Utility: inspect path walks through one or all called bubbles\n"
