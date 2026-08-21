@@ -248,6 +248,25 @@ hdr=$(head -1 "$OUT/ab.bubbles.csv")
 [ "$?" -ne 0 ] && ok "a selected bubble no path crosses is refused, not reported as empty" \
                || bad "a bubble with present nodes and no crossing path exited 0"
 
+# ------------------------------------------- a stale panel is reported, not silently rescored
+# Requiring at least one crossing catches a CSV from a DIFFERENT graph. It does not catch a stale one:
+# same node ids, some paths missing, so crossings still happen -- just fewer. The CSV records how many
+# `bubble` saw, so the two are compared and a mismatch is named.
+{ printf 'H\tVN:Z:1.0\nS\t1\tAAAAAAAAAA\nS\t2\tCCCCCCCCCC\nS\t3\tGGGGGGGGGG\n'
+  printf 'L\t1\t+\t2\t+\t0M\nL\t2\t+\t3\t+\t0M\nL\t1\t+\t3\t+\t0M\n'
+  printf 'P\tfull\t1+,2+,3+\t*\nP\tdel\t1+,3+\t*\nP\tthird\t1+,2+,3+\t*\n'; } > "$OUT/three.gfa"
+"$BIN" bubble -i "$OUT/three.gfa" -r full -o "$OUT/b3" --min-variant-bp 0 -q >/dev/null 2>&1
+{ printf 'H\tVN:Z:1.0\nS\t1\tAAAAAAAAAA\nS\t2\tCCCCCCCCCC\nS\t3\tGGGGGGGGGG\n'
+  printf 'L\t1\t+\t2\t+\t0M\nL\t2\t+\t3\t+\t0M\nL\t1\t+\t3\t+\t0M\n'
+  printf 'P\tfull\t1+,2+,3+\t*\nP\tdel\t1+,3+\t*\n'; } > "$OUT/two.gfa"
+warn=$("$BIN" inspect -i "$OUT/two.gfa" -c "$OUT/b3.bubbles.csv" -o "$OUT/stale" 2>&1 | grep -c "path_support=3")
+[ "$warn" -ge 1 ] && ok "a stale panel (2 crossings against path_support=3) is reported" \
+                  || bad "no warning when the graph carries fewer paths than the CSV records"
+# ...and a matching panel must stay quiet, or the warning is noise.
+quiet=$("$BIN" inspect -i "$OUT/b3.sorted.gfa" -c "$OUT/b3.bubbles.csv" -o "$OUT/fresh" 2>&1 | grep -c "path_support=")
+[ "$quiet" = "0" ] && ok "and a matching panel produces no such warning" \
+                   || bad "the stale-panel warning fires on a matching panel"
+
 echo
 if [ "$fails" -eq 0 ]; then echo "inspect_stats: all assertions passed"; exit 0; fi
 echo "inspect_stats: $fails assertion(s) FAILED"; exit 1

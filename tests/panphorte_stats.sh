@@ -678,6 +678,39 @@ mix_copies=$(awk -F'\t' '$1=="mixed"{print $4}' "$OUT/mixp.panphorte.copies.tsv"
   && ok "and the 3 bp flanking each in-node copy survive" \
   || bad "mixed lost bases when its two unequal copies were folded"
 
+# ---------------------------------------------------------------- family commit is a transaction
+# Panphorte writes a six-file family (normalized GFA, report, provenance, copies, bubbles, Bandage).
+# The shared StagedOutputs commit is what makes that atomic; the only injected-rollback fixture ran
+# through `bubble`, so this module's own family was never exercised.
+"$BIN" panphorte -i "$OUT/prevb.sorted.gfa" -c "$OUT/prevb.bubbles.csv" -o "$OUT/txnp" -q >/dev/null 2>&1
+if [ ! -s "$OUT/txnp.normalized.gfa" ]; then
+  bad "the panphorte rollback fixture produced no family to protect"
+else
+  tp_n=$(ls "$OUT" | grep -c '^txnp\.')
+  tp_gfa=$(cksum < "$OUT/txnp.normalized.gfa")
+  tp_rep=$(cksum < "$OUT/txnp.panphorte.report.tsv")
+  PANVAR_TEST_FAIL_COMMIT_AT=3 "$BIN" panphorte -i "$OUT/prevb.sorted.gfa" \
+      -c "$OUT/prevb.bubbles.csv" -o "$OUT/txnp" -q >/dev/null 2>&1
+  [ "$?" -ne 0 ] && ok "an injected failure in the panphorte family exits non-zero" \
+                 || bad "an injected failure in the panphorte family exited 0"
+  [ "$(ls "$OUT" | grep -c '^txnp\.')" = "$tp_n" ] \
+    && ok "every file of the previous panphorte family is still present ($tp_n)" \
+    || bad "the panphorte family lost a file: $(ls "$OUT" | grep '^txnp\.' | tr '\n' ' ')"
+  [ "$(cksum < "$OUT/txnp.normalized.gfa")" = "$tp_gfa" ] \
+    && [ "$(cksum < "$OUT/txnp.panphorte.report.tsv")" = "$tp_rep" ] \
+    && ok "and the graph and report are byte-unchanged" \
+    || bad "a panphorte output was replaced by a run that did not complete"
+  # The set-aside window, which the bubble fixture reaches but this family had never exercised.
+  PANVAR_TEST_FAIL_COMMIT_AFTER_SETASIDE=3 "$BIN" panphorte -i "$OUT/prevb.sorted.gfa" \
+      -c "$OUT/prevb.bubbles.csv" -o "$OUT/txnp" -q >/dev/null 2>&1
+  [ "$(cksum < "$OUT/txnp.normalized.gfa" 2>/dev/null)" = "$tp_gfa" ] \
+    && ok "and also when the failure lands between set-aside and install" \
+    || bad "the set-aside window lost a panphorte output"
+  [ "$(ls "$OUT" | grep -c -- '-tmp\.\|-prev\.')" = "0" ] \
+    && ok "panphorte leaves no staging or reserve residue" \
+    || bad "panphorte left staging/reserve residue"
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then echo "panphorte_stats: all assertions passed"; exit 0; fi
 echo "panphorte_stats: $fails assertion(s) FAILED"; exit 1

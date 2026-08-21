@@ -620,6 +620,12 @@ InspectBubbleResult write_inspect_outputs_for_bubble(
         const std::size_t len = it == graph.nodes.end() ? 0 : it->second.sequence.size();
         node_lengths_out << tsv_sanitize(node_id) << '\t' << len << '\n';
     }
+    // Closed and CHECKED, not left to the destructor. Destruction closes the file but has nowhere to
+    // report a write that failed on its way to storage, so a truncated table would be committed as
+    // part of a successful family. The same applies to every stream below.
+    node_lengths_out.close();
+    if (!node_lengths_out)
+        throw std::runtime_error("Failed writing node lengths TSV: " + emit.node_lengths_out_path);
 
     if (emit.cluster) {
         const std::vector<ClusterOut> clusters =
@@ -640,9 +646,19 @@ InspectBubbleResult write_inspect_outputs_for_bubble(
             }
             clusters_out << '\n';
         }
+        clusters_out.close();
+        if (!clusters_out)
+            throw std::runtime_error("Failed writing clusters TSV: " + emit.clusters_out_path);
         result.clusters_written = clusters.size();
         result.clusters_out_path = emit.clusters_out_path;
     }
+
+    // table_out and edge_out are still open here; both are checked before returning so a late write
+    // failure on either becomes an error rather than a short file inside a committed family.
+    table_out.close();
+    if (!table_out) throw std::runtime_error("Failed writing node counts TSV: " + table_out_path);
+    edge_out.close();
+    if (!edge_out) throw std::runtime_error("Failed writing edge counts TSV: " + edge_table_out_path);
 
     return result;
 }
@@ -895,6 +911,19 @@ int run_inspect_command(const std::vector<std::string>& args) {
             throw std::runtime_error(
                 "inspect: no path crosses bubble " + std::to_string(bubble.id) + " (" + bubble.source +
                 ".." + bubble.sink + "); the bubbles CSV does not describe this graph");
+        }
+        // Requiring at least one crossing closes the dangerous case -- a CSV from a different graph --
+        // but not the quiet one: a STALE graph with the same node ids and only some of the original
+        // paths still produces crossings, just fewer of them. The CSV records how many `bubble` saw,
+        // so the two can simply be compared. A mismatch is not an error (a legitimate path-dropping
+        // transform produces one), but it must not pass unremarked, because every count downstream is
+        // then taken over a different panel than the one the CSV describes.
+        if (bubble.path_support > 0 && result.paths_written != bubble.path_support) {
+            std::cerr << "[inspect] WARNING: bubble " << bubble.id << " is crossed by "
+                      << result.paths_written << " path(s), but the bubbles CSV records path_support="
+                      << bubble.path_support
+                      << ". The graph and the CSV describe different panels; counts here are over the "
+                         "graph's paths.\n";
         }
         total_paths_written += result.paths_written;
         progress.tick();
