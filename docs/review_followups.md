@@ -1,323 +1,289 @@
 # Deferred module review follow-ups
 
-This is the project-level ledger for issues deliberately left until every module has completed its
-review pass. It is not a live scratchpad: add or revise a module only when its pass is considered closed
-and the project owner explicitly asks to **record** it.
+This is the release ledger after the non-genotype review pass. Completed work is removed rather than
+kept as history; corrected historical claims belong in
+[`reports/module-review-summary.md`](reports/module-review-summary.md).
 
-Every entry is tagged with what it blocks:
+Tags have deliberately different meanings:
 
-- **[RELEASE]** — must be closed before a release. Nothing carrying this tag should be outstanding when
-  a version is tagged.
-- **[LIMIT]** — an accepted limitation. Not work: it is a claim the documentation must keep making, and
-  it belongs in the public pages as well as here.
-- **[LATER]** — a capability or hardening item deliberately deferred. Safe to ship without.
+- **[RELEASE]** — close this, or explicitly narrow the release contract, before tagging a release.
+- **[LIMIT]** — accepted behaviour. It is safe to ship only while the public documentation says it.
+- **[TEST]** — behaviour is implemented and exercised on the reviewed loci, but the focused regression
+  named here is still missing.
+- **[LATER]** — capability or hardening work that is safe to defer.
 
-Completed work is removed rather than kept as history; Git provides that, and the numbers this project
-reported and later corrected are collected in `reports/module-review-summary.md`.
+`genotype` is excluded from the default build and this ledger. Its open work is in
+[`reports/genotype-round2-verification.md`](reports/genotype-round2-verification.md); development builds
+restore it with `-DPANVAR_ENABLE_EXPERIMENTAL_GENOTYPE=ON`.
 
-As of 2026-08-21 no **[RELEASE]** item is outstanding. `genotype` is excluded from the default build
-(`-DPANVAR_ENABLE_EXPERIMENTAL_GENOTYPE=ON` restores it) and is not covered by this ledger; its open
-work is in `reports/genotype-round2-verification.md`.
+## Release-wide items
+
+### Output transaction correctness
+
+- **[RELEASE] Repair the shared rollback state machine.** `cli::StagedOutputs::commit()` moves an old
+  destination to a reserve, calls `commit_staged()`, and only then appends that destination to
+  `installed`. If installation fails after the set-aside, the current reserve is absent from
+  `installed`, so rollback never restores it. The existing fault injection fails *before* the
+  set-aside and therefore cannot expose this path. Register the current destination and reserve as
+  soon as the set-aside succeeds, track whether the new file was installed, and inject a failure after
+  set-aside/before installation. Assert that old files are restored, new-only files are absent, and no
+  `*-prev`/`*-tmp` files remain.
+
+  `commit_staged()` also falls back from a sibling rename to copying directly over the final path and
+  then removes the staged file even if the copy reported an error. That fallback is not atomic and can
+  damage the destination it is supposed to protect. Because staging files are siblings of their
+  destinations, either refuse an unexpected cross-filesystem rename or copy to another sibling and
+  atomically rename that complete copy.
+
+- **[RELEASE] Give `associate` the same output contract as the other commands.** It writes
+  `.assoc.tsv` and `.summary.tsv` directly, has no output/input collision preflight, and does not
+  explicitly close/check either stream. A late failure can leave a mixed family, and an output can
+  alias a genotype, phenotype, covariate, annotation, or kinship input. Use `StagedOutputs`,
+  `reject_output_collisions`, and checked close before the shared commit; cover replacement and failure
+  rollback in `associate_stats.sh`.
+
+- **[RELEASE] Finish Describe's independent directory transaction.** Its restore loop restores old
+  owned entries but does not remove a newly installed entry that had no predecessor if a later install
+  fails; restore errors are ignored. Track every installed destination, remove this run's new entries
+  in reverse order, restore every reserve, and report any reserve that could not be restored. Add fault
+  injection. Also reject an input whose canonical path is an owned output such as
+  `bubble_<digits>` inside `--out-dir`, or the commit can consume it and then replace it.
+
+### Packaging and platform contract
+
+- **[RELEASE] Decide whether the install is CLI-only or a supported C++ package.** The installed CLI
+  was smoke-tested successfully. The exported library package is not consumable as shipped:
+  `panvarTargets.cmake` refers to non-exported `abpoa` and `minigraph` targets and to `ZLIB::ZLIB`
+  without a package config that discovers dependencies. Experimental genotype headers are also
+  installed in the default build although their implementations are omitted. The small, honest release
+  fix is to install only the executable. If a C++ API is intended, add `panvarConfig.cmake`, dependency
+  discovery/export, an intentional public-header set, and a clean external consumer compile/link test.
+
+- **[RELEASE] Run a clean Linux/ELF build and test job, or state that this release is macOS-only.** The
+  clean AppleClang release build and all 10 enabled tests pass; an AddressSanitizer/UndefinedBehaviorSanitizer
+  build also passes those tests. Linux remains important because minigraph uses a separate ELF symbol
+  localization path. CI should configure from an empty tree, build with genotype off, run the default
+  suite, run the slow rebuild test at least in a scheduled/release job, install, and execute the
+  installed binary.
+
+### Small release cleanup
+
+- **[LATER] Remove the clean-build warning in benchmark.** `tot_carrier_aln` is accumulated but never
+  read (`src/benchmark_command.cpp`); either report the denominator it was intended to preserve or
+  delete it. This is not a behavioural defect.
 
 ## Associate
 
-### Missing capability
+### Accepted statistical and scale limits
 
-- **[LATER] Rare-variant aggregate association.** The implemented scope is common, single-feature association.
-  Add and calibrate gene/bubble-level burden, collapsing, and SKAT-style tests. Firth and SPA improve a
-  rare feature tested on its own; they do not provide rare-variant aggregation.
+- **[LIMIT] Rare binary far-tail calibration.** Even with SPA, measured type-I error for the rarest
+  features is about 1.7 times nominal at `p < 0.001`. Treat those single-feature results as
+  exploratory.
+- **[LIMIT] Rare binary mid-distribution distortion.** The covariate-preserving parametric null remains
+  non-uniform in the middle for the rarest features even though error near 0.05 and 0.01 is close to
+  nominal. Future calibration must retain this null rather than relying only on permutation.
+- **[LIMIT] Feature-tier `Meff` is biological, not statistical.** Counting bubbles is a grouping, not a
+  formal effective-number-of-tests estimate. Raw Bonferroni and BH are the defensible corrections at
+  this tier.
+- **[LIMIT] Variant-tier LD/Meff is region-scale.** LD clumping computes all feature pairs and the Li-Ji
+  estimator materializes an `n_tests × n_tests` correlation matrix followed by a full symmetric
+  eigendecomposition: quadratic memory/work to form it and cubic eigensolve time, with no cap. Add a
+  projected-memory/work guard and an auditable fallback (raw Bonferroni or block/clump Meff) before
+  describing this as cohort/genome-scale.
 
-### Known statistical limits
+### Deferred capability and validation
 
-- **[LIMIT] Rare binary far-tail calibration.** Even after SPA, the measured type-I error is about 1.7 times
-  nominal at `p < 0.001` for the rarest features. These results remain exploratory. Revisit with an exact
-  or better-calibrated small-count method when rare-variant support is designed.
-- **[LIMIT] Rare binary mid-distribution distortion.** Under the covariate-preserving parametric null, the rarest
-  features have a non-uniform middle of the p-value distribution even though error at 0.05 and 0.01 is
-  near nominal. Preserve this case in future calibration work rather than relying only on phenotype
-  permutation.
-- **[LIMIT] Feature-tier `Meff` is biological, not statistical.** Counting distinct bubbles is a useful grouping,
-  but not a formal effective-number-of-tests estimator. Raw Bonferroni and BH remain the defensible
-  corrections unless a phenotype-blind genotype-correlation estimator is implemented for this tier.
-
-### Validation and cleanup debt
-
-- **[LATER] Make the GEMMA comparison assert absolute agreement.** `tests/gwas/validate_gemma.sh` currently
-  reports correlations of beta and `-log10(p)` and can skip successfully when GEMMA or inputs are absent.
-  Add per-feature absolute/relative tolerances for beta, standard error, and p-value for both linear and
-  LMM models, with a pinned runnable environment or committed reference output. Correlation alone can
-  hide a systematic p-value difference; until this exists, do not describe the LMM as independently
-  validated to numerical tolerances.
+- **[LATER] Add rare-variant aggregate tests.** Burden, collapsing, and SKAT-style gene/bubble tests are
+  not implemented. Firth and SPA improve a rare feature tested alone; they are not rare-variant
+  aggregation.
+- **[LATER] Validate LMM numerics against GEMMA with absolute tolerances.** The current comparison uses
+  correlations and can skip when dependencies are absent. Pin a runnable reference and assert
+  beta/SE/p-value absolute or relative agreement. Until then, do not claim independent numerical
+  validation of the LMM.
 
 ## Bubble
 
-### Accepted limitations
+### Accepted limits
 
-- **[LIMIT] The bp filters measure interior SPAN, not divergence from the reference.** A 1 bp
-  substitution inside a 1 kb allele has a 1 kb span and passes `--min-variant-bp 50`.
-  `--min-interior-bp` / `--max-interior-bp` are the same options under honest names. True
-  allele-to-reference divergence is not implemented.
-- **[LIMIT] `--snarls-in` without `--reference-path` is diagnostic-only.** Imported boundaries are an
-  unordered pair and this mode does not sort, so source/sink do not mean reference-left/right, boundary
-  orientations are defaults, reference-coordinate merging is skipped and no sorted graph is written.
-  `call` anchors coordinates on the source, so consuming that output downstream places records by a coin
-  flip. Stated in the help and in the runtime warning. Consuming the oriented vg handles instead would
-  remove the limitation.
-- **[LIMIT] Only top-level snarls are considered.** Descending into the children of an oversized site was
-  built and measured: nothing gained at C4, five bubbles of 2564 at ACOT, and LPA did not finish in ten
-  minutes. Declined and reverted.
+- **[LIMIT] Size filters measure interior span, not allele/reference divergence.** A 1 bp substitution
+  inside a 1 kb allele has a 1 kb span and can pass a 50 bp threshold.
+- **[LIMIT] `--snarls-in` without `--reference-path` is diagnostic-only.** Imported boundaries are
+  unordered, orientations are defaults, reference-coordinate merging is skipped, and no sorted graph
+  is written. It must not feed coordinate-bearing `call` output.
+- **[LIMIT] Only top-level snarls are retained.** Descending into children was measured and reverted:
+  it did not help C4, exploded ACOT, and did not finish at LPA. Keeping the larger snarl is acceptable,
+  provided downstream consumers continue to require disjoint selected interiors.
 
-### Validation and test debt
+### Validation debt
 
-- **[LATER] Add the real-locus disjointness regression.** The synthetic nested-snarl fixture is in
-  `bubble_stats.sh`. An ANKRD36C regression asserting pairwise-disjoint interiors and a successful
-  Panphorte preflight is still owed.
+- **[TEST] Add the real ANKRD36C disjointness regression.** The synthetic nested-snarl test is good, but
+  an opt-in real fixture should assert pairwise-disjoint interiors and successful Panphorte preflight.
 
 ## Call
 
-### Missing cross-module capability
+### Accepted limits
 
-- **[LATER] Consume Panphorte's REP provenance to aggregate phase-rotated REP nodes.** When one tandem array is
-  folded at several rotations, Panphorte emits a REP node per phase and `call` counts each separately,
-  so a site's total copy number is split across records. The aggregation should join on
-  `output_rep_node` (not `created_rep_node`, which is pre-sort), determine the current bubble from node
-  membership rather than trusting `input_bubble_id` (re-snarling reassigns ids), group by current site
-  **plus** `canonical_motif` (never motif alone, or the same motif at two sites would merge), and sum
-  `traversal_count × copy_quantum` across the phase nodes for every traverser including reference-like
-  and zero-copy samples. Emit the grouped node set so the aggregation is auditable.
+- **[LIMIT] `PEAK` remains a heuristic micro-module CN route.** Current truth counts whole genes and
+  cannot validate the 11–92 bp modules on which PEAK fires. Keep `CN_CONFIDENCE=HEURISTIC`; the
+  synthetic known-copy fixture is its present evidence.
+- **[LIMIT] Repeated module boundaries require a policy choice.** CN, CNBP,
+  `CN_MODULE_REF_BP`, POS, and END share the occurrence-aware resolver, which deliberately chooses the
+  widest first-source-to-last-sink span and reports `CN_SPAN_AMBIGUOUS`. That may include sequence
+  between separate visits and is not a uniquely resolved biological interval.
+- **[LIMIT] A merged record uses one representative sequence for every carrier.** `MERGE_DIAMETER`
+  exposes the spread but does not provide per-carrier sequence; use the allele VCF when exact carrier
+  alleles matter.
 
-  **This fixes no current call.** Across all six reference loci the provenance table holds one row
-  (LPA) and no site carries more than one REP node, so there is nothing to aggregate; any test would be
-  synthetic. Recorded as a capability gap rather than a correctness defect, and worth building when a
-  locus actually produces phase-rotated REPs. Tests to write with it: two rotations at one site
-  aggregate; the same motif at two sites does not; missing or duplicate provenance rows fail loudly;
-  `copy_quantum` affects the dosage; and CNBP plus the allele VCF are unchanged by aggregation.
+### Deferred capability and validation
 
-### Accepted limitations
-
-- **[LIMIT] `PEAK` has no external truth validation, and cannot get one from the current data.** Every live
-  `PEAK` record describes an 11–92 bp micro-module while the available truth counts whole gene copies,
-  so the comparison is definitionally invalid — it produces numbers that look like accuracy and are
-  not. The route is tested on a synthetic fixture with a known micro-module copy number and keeps
-  `CN_CONFIDENCE=HEURISTIC`.
-- **[LIMIT] Repeated module boundaries remain an explicit span choice.** `CN`, `CNBP`,
-  `CN_MODULE_REF_BP`, and the record's `POS`/`END` now use one occurrence-aware resolver. When a source
-  or sink recurs, it deliberately selects the widest first-source-to-last-sink span and reports the
-  number of affected traversers in `CN_SPAN_AMBIGUOUS`; that span can include content between separate
-  visits and should not be read as uniquely resolved. Add a focused forward/reverse fixture that pins
-  the warning count and proves all five quantities describe the same chosen span. The ordinary
-  repeated-event fixtures exercise occurrence-aware calls, but currently do not produce a CN record
-  with a repeated boundary.
-- **[LIMIT] Merged-record representative sequence.** A merged record still hands every carrier the
-  representative's sequence; `MERGE_DIAMETER` now measures how far that reaches (0.0000 on a
-  132-member LPA record) but does not fix it. Per-carrier sequence needs the allele VCF.
+- **[LATER] Aggregate phase-rotated Panphorte REP nodes.** Join provenance on `output_rep_node`, map it
+  to the current re-snarled site, group by current site plus `canonical_motif`, and sum
+  `traversal_count × copy_quantum`. Test two phases at one site, the same motif at two sites, malformed
+  provenance, zero/reference-like traversers, and invariance of CNBP/allele serialization. No reviewed
+  locus currently has more than one REP node at a site, so this is a capability gap rather than a
+  current miscall.
+- **[TEST] Add a repeated-boundary MODULE_BP/CNBP fixture.** Exercise forward and reverse traversal,
+  pin `CN_SPAN_AMBIGUOUS`, and prove CN, CNBP, `CN_MODULE_REF_BP`, POS, and END all describe the same
+  chosen occurrence span. Existing repeated-node event tests do not create a CN record with a repeated
+  source/sink.
 
 ## Benchmark
 
-### Accepted limitations
+### Accepted interpretation limits
 
-- **[LIMIT] The allele VCF has no per-call attribution, and none is attempted.** `call --allele-vcf` writes one
-  row per BUBBLE (`bubbleN_ALLELES`) spelling every allele; `variant_nodes.tsv` is one row per CALL.
-  They share no id, so the `carrier` level and the per-call `loss_bp` terms do not exist in that mode
-  and are reported `NA` / `not_applicable`. A bubble/allele-level attribution model would restore them
-  — substitute a block when the haplotype's GT at that bubble names a non-reference allele — but it
-  answers a coarser question than the region-VCF version, and giving the same column two meanings
-  depending on the input file is the kind of silent semantic drift this campaign keeps paying for.
-  Build it as separately named columns if it is wanted.
-- **[LIMIT] `genotype` is not bounded by `carrier`.** `graph ≥ called ≥ carrier` are nested ceilings; the
-  genotype level applies every record a haplotype carries rather than only attributed eligible blocks,
-  so it can beat the walk-based ceiling locally. The last two `loss_bp` terms are signed for this
-  reason, and the sweep asserts only the nested part.
-- **[LIMIT] The reconstruction substitutes the whole divergent block, not the record's own interval.** A
-  single overlapping node authorises the entire maximal block between shared anchors, so `called` and
-  `carrier` do not prove the record delimits that sequence. Restricting the substitution to the
-  record's `START_NODE`..`END_NODE` span would tighten both.
-- **[LIMIT] `called` means a record's node lies in the block, not that the record covers or reproduces it.**
-  That is stronger than the previous bubble-wide node union but still weaker than comparing the
-  record's reconstructed effect against the block's sequence. The `called` reconstruction inherits the
-  same limit: it splices in the haplotype's TRUE block, so it measures what the retained records would
-  achieve if each reproduced its block exactly. Closing it needs a per-record effect comparison — apply
-  the record's own REF/ALT (or CNBP) within the block and align that against the block's true sequence.
-- **[LIMIT] No `filtered_other` class.** A size-eligible truth event removed by `--min-haplotypes`, an AF
-  filter, a tangle guard or a resource limit is indistinguishable from one never found. Separating them
-  needs a decision audit emitted by `call` — every raw truth-side event with its decision and reason —
-  which is a `call` capability, not benchmark's.
-- **[LIMIT] `false_positive_damage` is bubble-grained.** An emitted call with no compatible truth event is
-  attributed per (haplotype, bubble): if the haplotype has any eligible truth event at that bubble the
-  observation counts as representation, even when a second record there is spurious. Record-level
-  attribution needs a per-record effect comparison, the same thing the `called` limitation above needs.
-- **[LIMIT] DUP reconstruction is heuristic and labelled so.** Both `--dup-model` branches tile an inferred
-  reference span, so the length is right and the sequence only approximately; the count is reported as
-  `gt_records/heuristic`. **Measured cost at CYP2D6: genotype `variation_recovered` is 86.1% without
-  `--cn` and 39.3% with it, at the same threshold on the same graph and bubbles.** The copy-number
-  records are therefore where that locus's reconstruction loss lives, not the DEL/INS ones. Reconstruct
-  a DUP from its allele sequence rather than by tiling, or accept and state the ceiling.
-- **[LIMIT] The allele VCF is a serialization ceiling.** It reaches 0 residual because it spells every allele
-  out, which demonstrates lossless serialization, not call sensitivity.
+- **[LIMIT] The allele VCF result is a serialization ceiling.** Its 0 bp residual at all six loci proves
+  that every bubble allele can be serialized and re-implanted, not that region-level discovery or
+  genotyping is perfect.
+- **[LIMIT] Allele-VCF mode has no per-call attribution.** It has one row per bubble while
+  `variant_nodes.tsv` has one row per call; `carrier` and per-call loss terms therefore remain
+  `NA/not_applicable`, not zero.
+- **[LIMIT] `graph ≥ called ≥ carrier` are nested truth-assisted ceilings; `genotype` is not bounded by
+  `carrier`.** Genotype applies every record assigned to a haplotype and can locally outperform or
+  damage the truth-block ceiling.
+- **[LIMIT] `called`/`carrier` substitute the haplotype's whole true divergent block.** A call-node
+  overlap authorizes the block; it does not prove that the record delimits or reproduces it. A stricter
+  score must apply each record's own REF/ALT/CNBP effect inside its actual interval and align that to
+  truth.
+- **[LIMIT] No `filtered_other` truth class exists.** An eligible event removed by AF/support/tangle or
+  resource policy is indistinguishable from one never discovered until `call` emits a decision audit.
+- **[LIMIT] False-positive damage is attributed at haplotype/bubble level.** A second spurious record in
+  a bubble containing one valid truth event is not isolated without per-record effect matching.
+- **[LIMIT] DUP genotype reconstruction is heuristic.** It tiles an inferred reference span. The
+  measured CYP2D6 result (86.1% without CN versus 39.3% with CN) shows this is a material representation
+  limit, not cosmetic reporting.
+
+The threshold sweep is now the correct experiment: it reruns both `call` and `benchmark`, holds truth
+events fixed, and verifies that lowering the threshold cannot increase `below_threshold`. Do not claim
+that genotype reconstruction itself is monotone; at C4 additional overlapping/merged records make it
+worse at lower thresholds, and the validator reports that as a call interaction.
 
 ## Describe
 
-### Accepted limitations
+### Accepted limits
 
-- **[LIMIT] `--variant-flank-bp` has two granularities on purpose.** Bases for k-mers, whole nodes for graph
-  dosage, because a node dosage is a property of the whole node. It therefore admits more nodes than
-  bases. Splitting it into two flags would be clearer; one flag with a documented asymmetry was chosen
-  over adding CLI surface.
-- **[LIMIT] Node and edge features share one id namespace, and a collision is REFUSED rather than annotated.**
-  An earlier note here claimed the sidecar's `encoding` column disambiguates them; it does not — both
-  keys go into one string-keyed pool, so a colliding pair would already have been summed into a single
-  entry before any annotation is written. A node id containing the oriented-edge separator `>` is now
-  an error. Renaming ids to `node:`/`edge:` remains rejected as it would break every downstream join
-  against `call`'s `variant_nodes.tsv`.
-- **[LIMIT] Pooling is locus-wide and stays that way.** Measured for the double-counting hazard: c4 has exactly
-  one node claimed by two bubbles, cyp2d6 none, and zero emitted features localise to a shared node at
-  either locus. The features spanning several bubbles (9 at c4, 31 at cyp2d6) are one k-mer sequence at
-  genuinely different nodes. Revisit only if a locus produces features on a shared boundary.
-- **[LIMIT] Pooled carrier maps are held in memory across all bubbles.** `--max-wide-features` bounds the dense
-  matrices, not this. Streaming bubble-qualified rows or an external sort/merge is the fix if a panel
-  ever exceeds memory; no current locus does.
-- **[LIMIT] The missingness rules are latent at the reference loci.** Requiring every contributing bubble and
-  every assigned haplotype to be observable is correct, but graph features never span more than one
-  bubble at these loci and no incomplete observation occurs, so nothing measured today changes.
+- **[LIMIT] `--variant-flank-bp` has base granularity for k-mers and whole-node granularity for graph
+  dosage.** The asymmetry is intentional but must remain explicit.
+- **[LIMIT] Node and edge features share one ID namespace.** A node ID containing the edge separator is
+  refused; it is not repaired or annotated after collision.
+- **[LIMIT] Pooling is locus-wide.** It has not produced a shared-boundary emitted feature on C4 or
+  CYP2D6, but revisit if a larger locus does.
+- **[LIMIT] Pooled carrier maps remain resident across all bubbles.** The wide-matrix cap does not bound
+  this memory. Stream qualified rows or external-sort them if larger panels approach memory limits.
+- **[LIMIT] Multi-bubble missingness is not exercised by current real loci.** The rule is implemented,
+  but present features do not span several bubbles with incomplete observations.
 
-### Minor validation and contract debt
+### Validation debt
 
-- **[LATER] Audit deletion-positive marker availability, not merely non-empty output.** With the default
-  `k-1` flank, a direct source→sink deletion now retains both boundary flanks and the bypass edge. The
-  synthetic regression produces two canonical 31 bp syncmers carried by all three deletion
-  haplotypes and by none of the reference/full/truncated paths, so the intended positive signal is
-  present. The test currently asserts only that the k-mer matrix is non-empty; strengthen it to pin
-  that ALT-exclusive carrier pattern, and report the number of ALT-exclusive junction markers per
-  real deletion. Repetitive junctions cannot be guaranteed sequence-unique, and an explicit
-  `--variant-flank-bp 0` deliberately removes the sequence junction markers (the bypass-edge feature
-  remains).
-- **[LATER] Exercise commit rollback and input/output aliasing.** The backup protocol restores entries that
-  existed before the run, but a newly installed entry with no predecessor can remain if a later
-  install fails, and restore errors are currently ignored. Record every installed destination and
-  remove it before restoring; inject a commit failure in a test. Add a path-alias preflight so an input
-  placed under an owned output name such as `bubble_<id>` cannot be consumed and then deleted during
-  commit.
+- **[TEST] Strengthen the deletion-positive-marker fixture.** It currently proves only that the k-mer
+  matrix is non-empty. Pin the observed ALT-exclusive junction syncmers: carried by every bypass
+  deletion haplotype and by no reference/full/truncated path. Also report ALT-exclusive junction-marker
+  counts for real deletions; repetitive junctions cannot be guaranteed unique.
 
 ## Rebuild
 
-### Deferred capability
+### Accepted/deferred behaviour
 
-- **[LATER] R3: patch unmapped sequence into private nodes.** Rebuild currently rejects and rolls back a result
-  that cannot recover every haplotype within the fidelity contract. That is safe. Measure rejection rates
-  on real loci first; implement private-node patching only if losses occur often enough that it would
-  rescue useful rebuilds without creating misleading graph structure.
+- **[LATER] Patch unrecovered sequence into private nodes only if measurements justify it.** Current
+  behaviour rejects and rolls back any unverifiable/lossy recovery, which is safe. Implement R3 only if
+  real rejection rates show useful graphs are being lost.
+- **[LATER] Decide whether faithful-but-not-untangled should remain accepted.** Fidelity is the acceptance
+  gate and structural improvement is reported separately. Promote non-improvement to a rollback policy
+  only if it occurs materially on real inputs.
 
-### Validation and test debt
+### Validation debt
 
-- **[LATER] Preserve decision precision in the audit.** `fmt_exact()` uses ten significant digits, while per-path
-  cover and identity values still use four decimals. Use `max_digits10` (or an explicitly justified
-  precision) for both thresholds and the values compared with them so a decision can be reproduced from
-  the audit alone.
-- **[LATER] Add direct unit fixtures for hard-to-reach branches.** Extract/test the chain comparator, the
-  `identity_unavailable` rejection, and per-handle degree at the hub threshold. The current integration
-  suite exercises the surrounding workflow but does not pin these branches independently.
-- **[LATER] Make the remaining integration fixtures exercise their claims.** The unchanged-structure fixture
-  currently permits the degenerate early-return path, so it need not reach the `unchanged` label. Add a
-  non-degenerate faithful rebuild with unchanged metrics. Also add an ambiguity-containing `k > 31`
-  fixture; C4 proves strand canonicalization at `k=41` but contains no ambiguous bases.
-- **[LATER] Round-trip the accepted output through downstream consumers.** Parse an accepted rebuilt GFA again
-  and run at least bubble detection on it in a focused fixture, so in-memory validation and emitted-file
-  semantics cannot drift apart.
+- **[TEST] Unit-test hard-to-reach decisions.** Extract/pin the chain comparator,
+  `identity_unavailable`, and per-handle degree exactly at the hub threshold.
+- **[TEST] Make integration fixtures non-degenerate.** Require a rebuild that really runs and reports
+  unchanged metrics, and add an ambiguity-containing `k > 31` seed fixture. Current N handling and
+  `k=41` strand canonicalization are tested separately.
+- **[TEST] Round-trip an accepted rebuilt file through downstream parsing and bubble detection.** This
+  is the remaining check that emitted GFA semantics cannot drift from in-memory acceptance.
 
-### Policy and transactional hardening
-
-- **[LATER] Decide whether “faithful but not untangled” should be accepted in production.** The current contract
-  deliberately validates fidelity and only reports structural improvement. If real data shows accepted
-  rebuilds that do not improve hubs/handle degree, consider making non-improvement a rollback condition
-  rather than a warning.
-- **[LATER] Treat graph plus audit as one logical transaction.** Each file is staged individually, but the audit
-  is committed before the graph. A graph commit failure can therefore leave an audit describing an
-  output that was not installed. Either commit the graph first and clearly mark audit failure, or add a
-  small manifest/transaction protocol that makes the pair's final disposition unambiguous.
+Audit precision, graph-first/audit-second disposition, checked Refine streams, and declaration of
+`PANVAR_SLOW_TESTS` are closed and intentionally absent from this list.
 
 ## Refine
 
 ### Biological validation debt
 
-- **[LATER] Add the defining before/after `call` fixture.** The structural contracts are now well covered, but
-  there is still no end-to-end example in which a reproducible graph-builder artifact calls as a split
-  `INS`+`DEL` before refinement and as the intended clean event afterwards. Build this on a realistic
-  pggb-style artifact and assert the exact records on both sides; that is the test that demonstrates the
-  module's biological purpose rather than only its losslessness and graph validity.
-- **[LATER] Measure the stricter POA guards on every real locus.** `--max-poa-bp` now uses the longest allele and
-  `--max-poa-work` independently bounds total distinct-sequence work, which is the honest resource
-  contract. Record how many regions each guard skips on the six reference loci so safer accounting is
-  not mistaken for unchanged refinement coverage.
-
-### Documentation and portability cleanup
-
-- **[LATER] Tighten the oriented traversal sentence in the algorithm page.** The module page's
-  options/output tables were malformed -- output rows spliced into the `--max-poa-bp` row -- and are
-  repaired; `--max-poa-work`, `--max-walks`, `--min-bubbles` and the partial-path policy are now in one
-  coherent table with their defaults.
-- **[LATER] Close and check staged streams before committing.** The report stream is flushed but remains open
-  when `StagedOutputs::commit()` renames the family. This works on Unix but is not portable to platforms
-  that refuse renaming open files, and `flush()` alone does not turn a late write failure into an error.
-- **[LATER] Declare `PANVAR_SLOW_TESTS` as a CMake option.** It currently works as an undeclared cache variable.
-  Add an `option(...)` with help text and a default, and make clear that the default build must be
-  reconfigured before the rebuild test can be selected explicitly.
+- **[TEST] Add the defining before/after-call fixture.** Construct a reproducible pggb-style artifact
+  that calls as split INS+DEL before refinement and as the intended clean event afterwards; assert both
+  exact record sets and unchanged haplotype spellings.
+- **[TEST] Measure POA guard coverage on all six loci.** Record regions skipped separately by
+  `--max-poa-bp`, `--max-poa-work`, and `--max-walks`, so safer accounting is not mistaken for unchanged
+  biological coverage.
 
 ## Inspect
 
-### Clustering accuracy and scale
+### Accepted scale limit
 
-- **[LIMIT] Clustering is all-pairs over a dense `U x U` matrix, and is not cohort-scale.** A guard is in
-  place: a warning with the projected memory above 2,000 distinct walks, a refusal above 25,000. Neither
-  fires on the reviewed panels, where the maximum is 119. **[LATER]** an LSH/banding candidate stage is
-  what would actually raise the ceiling.
+- **[LIMIT] Clustering is dense all-pairs.** It warns above 2,000 distinct walks and refuses above
+  25,000; the reviewed maximum is 119. LSH/banding candidates are the route to cohort-scale clustering.
 
-### Validation and transactional cleanup
+### Validation and hardening debt
 
-- **[LATER] Check more than one surviving crossing when matching the CSV to the graph.** Rejecting absent nodes
-  and zero crossing paths closes the dangerous cases, but a stale graph with the same node IDs and only
-  some of the original paths still succeeds. Compare the number of emitted crossings with the CSV's
-  `path_support` (and, where the transformation promises to preserve it, the allele-support summary), or
-  report an explicit mismatch warning.
-- **[LATER] Pin the two final second-pass branches directly.** The derived-output collision preflight and the
-  present-nodes-but-no-crossing rejection are implemented and work, but `inspect_stats.sh` has no focused
-  assertions for either case. Add them so the exact regressions fixed by the final pass cannot return.
-- **[LATER] Check every TSV stream after its final write/close**; an open succeeding does not prove that
-  later writes reached storage. (The family-level commit itself is now transactional: `StagedOutputs`
-  sets aside any existing destination, and a failure part-way removes this run's installs and restores
-  what it displaced.)
+- **[LATER] Compare surviving graph support with the CSV.** Present nodes and at least one crossing are
+  required, but a stale graph with the same IDs and only some original paths can still pass. Compare or
+  warn on emitted crossings versus CSV `path_support`.
+- **[TEST] Pin derived-output collision and present-nodes/no-crossing directly.** Both branches exist but
+  lack focused assertions in `inspect_stats.sh`.
+- **[LATER] Explicitly close and check every TSV stream.** The writer's local streams are destroyed before
+  family commit, but destructor close cannot report a late disk error.
 
 ## Panphorte
 
-### Deferred capability and sensitivity
+### Accepted/deferred behaviour
 
-- **[LATER] Recover safely when reused topology preserves a replaced route.** The per-edit acceptance check now
-  rejects a normalization when the original local route remains walkable because all of its nodes and
-  links are still needed elsewhere. That is the correct safe result. If this occurs often on real loci,
-  clone the reused context before rewriting so the normalized site can be separated without breaking the
-  paths that still need the original topology; until then, retain the hard refusal.
-- **[LATER] Make exact folding invariant to graph node segmentation.** Default exact mode still seeds tandem
-  structure from repeated node-step runs. Two byte-identical copies split into different node boundaries
-  can therefore be missed even though folding them would be lossless; only approximate mode reaches the
-  base-level period fallback. Add an exact base-sequence fallback that proves byte identity before
-  rewriting, with fixtures whose identical copies have deliberately different step partitions.
-- **[LATER] Reduce or quantify approximate-mode seed false negatives.** Copy alignment is attempted only after
-  finding an exact shared 16-mer. A copy above `--min-similarity` can remain invisible when distributed
-  substitutions disrupt every 16-mer. Consider multiple shorter/spaced seeds, minimizer candidates, or a
-  bounded seedless fallback, and calibrate sensitivity and runtime before changing the default detector.
+- **[LATER] Clone reused context only if hard refusals become common.** A normalization is safely refused
+  when another site needs topology whose old local route would otherwise survive. Cloning is the
+  recovery, but no reviewed locus currently justifies its complexity.
+- **[LATER] Make exact folding invariant to node segmentation.** Exact mode still seeds repeated
+  node-step runs. Byte-identical copies split at different node boundaries can be missed; an exact
+  base-sequence fallback must prove spelling identity before rewriting.
+- **[LATER] Quantify approximate seed false negatives.** Approximate candidates require an exact shared
+  16-mer. Calibrate shorter/spaced/minimizer seeds or a bounded seedless fallback before changing the
+  default detector.
 
-### Validation and cleanup debt
+### Validation and interface debt
 
-- **[LATER] Register a real folding regression.** The default real-data smoke test uses C4, where its Panphorte
-  rows do not normalize anything. Add an opt-in LPA regression that pins the KIV-2 site, all 466 paths,
-  sequence/topology acceptance, delivered REP provenance, and representative copy numbers. Once Bubble
-  emits a disjoint ANKRD36C set, add that locus as the nested-site regression as well.
-- **[LATER] Reconcile the partial-boundary guard with its reachable behavior.** Fragment emission currently makes
-  `copies_declined_partial_boundary`, `paths_with_partial_boundary`, `partial_boundary`, and
-  `--allow-partial-boundary` structurally unreachable on the reviewed detector paths. Either add a valid
-  fixture proving the defensive branch can occur, or remove the dead option/status columns and update the
-  stale header comments. Also rename the surviving-route diagnostic from “rewritten path(s)” to
-  “replaced span(s)”, since the counter is now per edit.
-- **[LATER] Panphorte's own streams are closed and checked**, and the shared `StagedOutputs::commit()`
-  is now a transaction, so a late failure no longer leaves part of the normalized GFA, report,
-  provenance, bubbles, Bandage and GTF family installed. What remains is a fixture proving it for this
-  module's family specifically; the injected-failure fixture lives in `bubble_stats.sh`.
+- **[TEST] Add opt-in real folding regressions.** LPA should pin the KIV-2 site, 466 path spellings,
+  topology acceptance, REP provenance, and representative CNs. ANKRD36C should pin the nested-site
+  preflight once paired with Bubble's real disjointness test.
+- **[TEST] Resolve the unreachable partial-boundary interface.** Either construct a valid detector path
+  that reaches `copies_declined_partial_boundary`/`--allow-partial-boundary`, or remove the dead option,
+  status columns, and stale comments. Rename the surviving-route diagnostic from “rewritten paths” to
+  “replaced spans” if it still counts edits.
+- **[TEST] Add a Panphorte-family rollback fixture after the shared transaction repair.** The present
+  injected rollback test runs through Bubble only.
+
+## Verification snapshot (2026-08-21)
+
+- Fresh macOS AppleClang release configure/build with genotype disabled: pass.
+- Default tests from that fresh tree: 10/10 enabled pass; slow rebuild test disabled by policy.
+- macOS AddressSanitizer + UndefinedBehaviorSanitizer build: 10/10 enabled tests pass. Vendored C
+  libraries are not fully instrumented by that CMake flag.
+- Installed CLI smoke (`panvar --help` outside the build tree): pass.
+- Slow rebuild suite: reported passing in the closing pass, but not rerun in this audit.
+- Linux/ELF and installed C++ consumer: not validated; the latter is currently structurally incomplete
+  as described above.

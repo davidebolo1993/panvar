@@ -228,20 +228,19 @@ target_compile_options(panvar
 
 include(GNUInstallDirs)
 
-install(TARGETS panvar panvarlib edlib
-    EXPORT panvarTargets
-    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-)
-
-install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-
-install(EXPORT panvarTargets
-    FILE panvarTargets.cmake
-    NAMESPACE panvar::
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/panvar
-)
+# panvar ships as a COMMAND-LINE TOOL. Only the executable is installed.
+#
+# The previous rules exported panvarlib, its headers and a panvarTargets.cmake, which looked like a
+# supported C++ package and was not one: the exported target referred to `abpoa` and `minigraph`,
+# which are IMPORTED targets that were never exported, and to `ZLIB::ZLIB` with no package config to
+# rediscover it, so `find_package(panvar)` could not configure in a consumer project. The default
+# build also installed the experimental genotype headers whose implementations it deliberately omits.
+#
+# Advertising a package contract nobody can satisfy is worse than not advertising one. If a C++ API is
+# wanted later it needs a panvarConfig.cmake, dependency discovery and export for every vendored
+# dependency, a deliberate public-header set rather than all of include/, and an external consumer
+# that compiles and links against the installed tree in CI -- none of which is release work.
+install(TARGETS panvar RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 if(PANVAR_BUILD_TESTING)
     include(CTest)

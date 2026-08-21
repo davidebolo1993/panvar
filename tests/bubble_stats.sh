@@ -436,6 +436,40 @@ else
                        || bad "$residue staging/set-aside file(s) left behind"
 fi
 
+# The window between moving the old file aside and installing the new one. Registering the entry only
+# AFTER a successful install left that window unowned: rollback skipped the destination entirely, so
+# the previous output stayed in a `*-prev` file under a name nobody would look for and the destination
+# was simply gone. Measured against the previous ordering: b.bandage_nodes.csv disappeared and one
+# orphan remained.
+TX2="$OUT/tx2"; mkdir -p "$TX2"
+"$BIN" bubble -i "$OUT/del.gfa" -r full -o "$TX2/b" --min-variant-bp 0 -q >/dev/null 2>&1
+tx2_csv=$(cksum < "$TX2/b.bubbles.csv"); tx2_gfa=$(cksum < "$TX2/b.sorted.gfa")
+tx2_n=$(ls "$TX2" | wc -l | tr -d ' ')
+PANVAR_TEST_FAIL_COMMIT_AFTER_SETASIDE=2 "$BIN" bubble -i "$OUT/cyc.gfa" -r pA -o "$TX2/b" \
+    --min-variant-bp 0 -q >/dev/null 2>&1
+[ "$?" -ne 0 ] && ok "a failure between set-aside and install exits non-zero" \
+               || bad "a failure between set-aside and install exited 0"
+[ "$(ls "$TX2" | wc -l | tr -d ' ')" = "$tx2_n" ] \
+  && ok "every previous output is still present after that failure" \
+  || bad "the family lost a file: $(ls "$TX2" | tr '\n' ' ')"
+[ "$(cksum < "$TX2/b.bubbles.csv" 2>/dev/null)" = "$tx2_csv" ] \
+  && [ "$(cksum < "$TX2/b.sorted.gfa" 2>/dev/null)" = "$tx2_gfa" ] \
+  && ok "and each is byte-unchanged, restored from its reserve" \
+  || bad "a restored file does not match what was there before"
+tx2_res=$(ls "$TX2" | grep -c -- '-tmp\.\|-prev\.')
+[ "$tx2_res" = "0" ] && ok "no set-aside reserve is orphaned" \
+                     || bad "$tx2_res orphaned reserve(s); the previous ordering left exactly this"
+
+# An output this run CREATED, where none existed, must also be removed on rollback -- otherwise a
+# failed run leaves half a new family behind.
+TX3="$OUT/tx3"; mkdir -p "$TX3"
+PANVAR_TEST_FAIL_COMMIT_AT=3 "$BIN" bubble -i "$OUT/del.gfa" -r full -o "$TX3/fresh" \
+    --min-variant-bp 0 -q >/dev/null 2>&1
+tx3_left=$(ls "$TX3" 2>/dev/null | wc -l | tr -d ' ')
+[ "$tx3_left" = "0" ] && ok "a failed FIRST run leaves no partial new family" \
+                      || bad "$tx3_left file(s) left by a run that never completed: $(ls "$TX3" | tr '\n' ' ')"
+
+
 echo
 if [ "$fails" -eq 0 ]; then echo "bubble_stats: all assertions passed"; exit 0; fi
 echo "bubble_stats: $fails assertion(s) FAILED"; exit 1

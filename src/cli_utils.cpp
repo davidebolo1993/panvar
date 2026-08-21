@@ -258,11 +258,37 @@ void commit_staged(const std::string& staged, const std::string& final_path) {
     std::error_code ec;
     std::filesystem::rename(staged, final_path, ec);
     if (!ec) return;
-    // Across filesystems rename fails; fall back to copy-then-remove, still not in place.
-    std::filesystem::copy_file(staged, final_path,
-                               std::filesystem::copy_options::overwrite_existing, ec);
-    std::filesystem::remove(staged);
-    if (ec) throw std::runtime_error("cannot move output into place: " + final_path);
+
+    // The old fallback copied STRAIGHT ONTO the destination and then removed the staged file whether
+    // or not the copy reported an error. That is the one thing this function exists to prevent: a
+    // copy interrupted half-way leaves a truncated file where a complete one used to be, and the
+    // caller's rollback has nothing to restore from because the reserve is a different file entirely.
+    //
+    // A staged file is always a sibling of its destination, so a failed rename here is not the
+    // ordinary cross-filesystem case -- it means something unexpected. Copy to a SECOND sibling and
+    // rename that complete copy into place, so the destination is only ever replaced atomically. If
+    // any step fails the destination is untouched and the staged file is left for the caller's
+    // cleanup.
+    const std::string bridge = staging_path(final_path, "commit");
+    std::error_code copy_ec;
+    std::filesystem::copy_file(staged, bridge, std::filesystem::copy_options::overwrite_existing,
+                               copy_ec);
+    if (copy_ec) {
+        std::error_code rm;
+        std::filesystem::remove(bridge, rm);
+        throw std::runtime_error("cannot move output into place: " + final_path + " (" + ec.message() +
+                                 "; the copy fallback also failed: " + copy_ec.message() + ")");
+    }
+    std::error_code ren_ec;
+    std::filesystem::rename(bridge, final_path, ren_ec);
+    if (ren_ec) {
+        std::error_code rm;
+        std::filesystem::remove(bridge, rm);
+        throw std::runtime_error("cannot move output into place: " + final_path + " (" +
+                                 ren_ec.message() + ")");
+    }
+    std::error_code rm;
+    std::filesystem::remove(staged, rm);
 }
 
 void reject_output_collisions(const std::string& module,
@@ -317,26 +343,40 @@ void StagedOutputs::commit() {
     // Any destination that already exists is moved aside first, so a failure can put it back. On
     // success the reserves are dropped; on failure this run's installs are removed and the reserves
     // restored, in reverse order.
+    // The entry is recorded as soon as the SET-ASIDE succeeds, not after the install. Recording it
+    // afterwards left a window with no owner: if installation failed between moving the old file to
+    // its reserve and putting the new one in place, that destination was absent from `installed`, so
+    // rollback skipped it -- the old output stayed in a `*-prev` file under a name nobody would look
+    // for, and the destination was simply gone. `new_installed` distinguishes "this reserve needs
+    // restoring" from "a file of ours is sitting there and must be removed first".
     struct Installed {
         std::string final_path;
-        std::string reserve;      // empty when the destination did not exist before this run
+        std::string reserve;            // empty when the destination did not exist before this run
+        bool new_installed = false;     // our file actually reached final_path
     };
     std::vector<Installed> installed;
 
-    // Fault injection, test-only: fail just before installing the Nth (1-based) staged file. The
-    // rollback branch is otherwise unreachable from a test -- every natural way to make a rename fail
-    // here either fails earlier, at staging, or is silently handled by the set-aside above -- and an
-    // untested rollback is worth about as much as no rollback.
+    // Fault injection, test-only, at two distinct points. The rollback branch is otherwise
+    // unreachable from a test -- every natural way to make a rename fail here either fails earlier,
+    // at staging, or is absorbed by the set-aside -- and an untested rollback is worth about as much
+    // as no rollback. AT fails BEFORE the Nth set-aside; AFTER_SETASIDE fails between the Nth
+    // set-aside and its install, which is the window described above and the one the previous
+    // fixture could not reach.
     std::size_t fail_at = 0;
+    std::size_t fail_after_setaside = 0;
     if (const char* env = std::getenv("PANVAR_TEST_FAIL_COMMIT_AT")) {
         fail_at = static_cast<std::size_t>(std::strtoull(env, nullptr, 10));
+    }
+    if (const char* env = std::getenv("PANVAR_TEST_FAIL_COMMIT_AFTER_SETASIDE")) {
+        fail_after_setaside = static_cast<std::size_t>(std::strtoull(env, nullptr, 10));
     }
     std::size_t installs = 0;
 
     try {
         for (const auto& [staged, final_path] : pending_) {
             if (!std::filesystem::exists(staged)) continue;   // an optional output nobody wrote
-            if (fail_at != 0 && ++installs == fail_at) {
+            ++installs;
+            if (fail_at != 0 && installs == fail_at) {
                 throw std::runtime_error("PANVAR_TEST_FAIL_COMMIT_AT: injected failure installing "
                                          + final_path);
             }
@@ -350,8 +390,13 @@ void StagedOutputs::commit() {
                                              + final_path);
                 }
             }
+            installed.push_back({final_path, reserve, false});
+            if (fail_after_setaside != 0 && installs == fail_after_setaside) {
+                throw std::runtime_error("PANVAR_TEST_FAIL_COMMIT_AFTER_SETASIDE: injected failure "
+                                         "between set-aside and install for " + final_path);
+            }
             commit_staged(staged, final_path);
-            installed.push_back({final_path, reserve});
+            installed.back().new_installed = true;
         }
     } catch (...) {
         // A restore that itself fails is the one outcome the caller cannot recover from, so it is
@@ -360,10 +405,14 @@ void StagedOutputs::commit() {
         std::vector<std::string> unrestored;
         for (auto it = installed.rbegin(); it != installed.rend(); ++it) {
             std::error_code ec;
-            std::filesystem::remove(it->final_path, ec);
+            // Remove OUR file first, whether or not there was a predecessor: an output this run
+            // created where none existed has to go too, or a failed run leaves half a new family
+            // behind. Only then can a reserve be renamed back over the name.
+            if (it->new_installed) std::filesystem::remove(it->final_path, ec);
             if (it->reserve.empty()) continue;
-            std::filesystem::rename(it->reserve, it->final_path, ec);
-            if (ec) unrestored.push_back(it->final_path + " (kept as " + it->reserve + ")");
+            std::error_code ren;
+            std::filesystem::rename(it->reserve, it->final_path, ren);
+            if (ren) unrestored.push_back(it->final_path + " (kept as " + it->reserve + ")");
         }
         if (!unrestored.empty()) {
             std::string msg = "output commit failed AND the previous output could not be restored for:";

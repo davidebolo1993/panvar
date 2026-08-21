@@ -325,5 +325,36 @@ check "NALLELES agreeing with the ALT cardinality is accepted" "$(verdict $?)" "
 "$BIN" describe --only-variant --variant-vcf "$VV/collide.vcf" --out-dir "$VV/coll_out" -q >/dev/null 2>&1
 check "a later record colliding with an earlier generated per-ALT id is refused" "$(verdict $?)" "refused"
 
+# ---------------------------------------------------------------- directory transaction
+# describe commits its own output DIRECTORY rather than a file family, so it has its own transaction.
+# The restore loop put old entries back but never removed entries this run created where none existed,
+# so a failed run published half a new family; restore errors were also ignored.
+TXD="$OUT/txd"
+"$BIN" describe -i "$OUT/ab.sorted.gfa" --bubble-prefix-in "$OUT/ab" --out-dir "$TXD/out" \
+   --no-wide-matrix -q >/dev/null 2>&1
+txd_before=$(ls "$TXD/out" | sort | tr '\n' ',')
+PANVAR_TEST_FAIL_COMMIT_AT=2 "$BIN" describe -i "$OUT/ab.sorted.gfa" --bubble-prefix-in "$OUT/ab" \
+   --out-dir "$TXD/out" --no-wide-matrix -q >/dev/null 2>&1
+check "an injected commit failure exits non-zero" "$(verdict $?)" "refused"
+check "the previous describe directory is restored entry for entry" \
+      "$(ls "$TXD/out" | sort | tr '\n' ',')" "$txd_before"
+check "no describe backup directory is left behind" \
+      "$(ls "$TXD" | grep -c describe-backup)" "0"
+
+# A run that fails with NO previous output must leave nothing installed.
+PANVAR_TEST_FAIL_COMMIT_AT=2 "$BIN" describe -i "$OUT/ab.sorted.gfa" --bubble-prefix-in "$OUT/ab" \
+   --out-dir "$TXD/fresh" --no-wide-matrix -q >/dev/null 2>&1
+check "a failed FIRST run installs no partial describe family" \
+      "$(ls "$TXD/fresh" 2>/dev/null | wc -l | tr -d ' ')" "0"
+
+# An input placed under an owned output name would be consumed and then replaced by the commit.
+mkdir -p "$OUT/alias_dir/bubble_1"
+cp "$OUT/ab.bubbles.csv" "$OUT/alias_dir/bubble_1/b.csv"
+"$BIN" describe -i "$OUT/ab.sorted.gfa" --bubbles-csv-in "$OUT/alias_dir/bubble_1/b.csv" \
+   --out-dir "$OUT/alias_dir" --no-wide-matrix -q >/dev/null 2>&1
+check "an input under an owned output name is refused" "$(verdict $?)" "refused"
+check "and that input still exists" \
+      "$([ -s "$OUT/alias_dir/bubble_1/b.csv" ] && echo yes || echo no)" "yes"
+
 printf "%d assertion(s) failed\n" "$fails"
 [ "$fails" -eq 0 ]

@@ -3,8 +3,17 @@ name: ci
 on:
   push:
   pull_request:
+  # The slow rebuild suite costs about eight minutes and drives minigraph, so it runs on a schedule
+  # and on demand rather than on every push.
+  schedule:
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
 
 jobs:
+  # The release contract: a clean tree, genotype off, the default suite, and an INSTALLED binary that
+  # runs outside the build directory. Linux matters beyond "another compiler" -- minigraph's symbols
+  # are localized against minimap2 through a separate ELF path (cmake/minigraph_exports_elf.txt), so
+  # the Mach-O result says nothing about it.
   build-and-test:
     strategy:
       fail-fast: false
@@ -30,11 +39,65 @@ jobs:
         run: |
           brew install cmake zlib || true
 
-      - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Configure (clean tree, genotype off)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PWD/_install"
 
       - name: Build
         run: cmake --build build -j
 
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+      - name: The default build must not contain genotype
+        shell: bash
+        run: |
+          if ./build/panvar --help | grep -qE '^  genotype '; then
+            echo "genotype is listed in the default build's help; it must be excluded" >&2
+            exit 1
+          fi
+          # It must refuse by NAME rather than as an unknown subcommand.
+          ./build/panvar genotype 2>&1 | grep -q "not built in this release" \
+            || { echo "genotype did not refuse with the expected message" >&2; exit 1; }
+
+      - name: Install, then run the installed binary from elsewhere
+        shell: bash
+        run: |
+          cmake --install build
+          echo "installed files:"; find _install -type f | sort
+          cd /
+          "$GITHUB_WORKSPACE/_install/bin/panvar" --help > /dev/null
+          "$GITHUB_WORKSPACE/_install/bin/panvar" bubble --help > /dev/null
+
+  # Genotype is excluded from the release but must keep compiling and passing its own test, or it
+  # rots silently behind the flag.
+  experimental-genotype:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential cmake zlib1g-dev
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPANVAR_ENABLE_EXPERIMENTAL_GENOTYPE=ON
+      - run: cmake --build build -j
+      - run: ctest --test-dir build --output-on-failure
+
+  # The rebuild suite is the only test that drives minigraph end to end, and the only one that would
+  # catch an ELF symbol-localization regression at runtime rather than at link time.
+  slow-rebuild:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential cmake zlib1g-dev
+      - if: runner.os == 'macOS'
+        run: brew install cmake zlib || true
+      - run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPANVAR_SLOW_TESTS=ON
+      - run: cmake --build build -j
+      - run: ctest --test-dir build --output-on-failure

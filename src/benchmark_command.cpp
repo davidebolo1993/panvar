@@ -1356,6 +1356,11 @@ int run_benchmark_command(const std::vector<std::string>& args) {
                 sum << "carrier_quintile\tALL\t" << q << '\t' << n << '\t' << pct << '\n';
             }
             sum << "carrier_recon\tALL\tdelta\t" << tot_carrier_delta << "\t0\n";
+            // The denominator that turns the delta above into an identity. It was being accumulated
+            // and never reported, so the summary carried a numerator a reader could not normalize
+            // without going back to the per-haplotype table -- and the compiler flagged it as an
+            // unused variable, which is what the accumulation had in fact become.
+            sum << "carrier_recon\tALL\taln_len\t" << tot_carrier_aln << "\t0\n";
             sum << "carrier_recon\tALL\thaplotypes\t" << carrier_scored_haps << "\t0\n";
             sum << "carrier_recon\tALL\tcalled_records_absent_from_vcf\t" << tot_gt_absent << "\t0\n";
         }

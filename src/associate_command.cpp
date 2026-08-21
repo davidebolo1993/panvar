@@ -1651,6 +1651,19 @@ int run_associate_command(const std::vector<std::string>& args) {
                       "signal -- it reads the median chi-square assuming most tests are null)");
 
     // ---- write assoc.tsv (sorted by p) ----
+    // The output contract every other command already has. These two files were written straight to
+    // their destinations: a failure between them left a new assoc.tsv beside a stale summary.tsv, and
+    // nothing stopped `-o` from naming a genotype, phenotype, covariate, annotation or kinship input,
+    // which would have destroyed the input mid-run.
+    const std::string assoc_final = opt.out_prefix + ".assoc.tsv";
+    const std::string summary_final = opt.out_prefix + ".summary.tsv";
+    cli::reject_output_collisions("associate", {assoc_final, summary_final},
+                                  {opt.genotypes, opt.samples, opt.feature_annot, opt.node_genes,
+                                   opt.phenotype, opt.kinship});
+    cli::StagedOutputs staged("associate");
+    const std::string assoc_staged = staged.stage(assoc_final);
+    const std::string summary_staged = staged.stage(summary_final);
+
     std::vector<std::size_t> order(n_tests);
     std::iota(order.begin(), order.end(), 0);
     std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
@@ -1665,8 +1678,8 @@ int run_associate_command(const std::vector<std::string>& args) {
     const std::string effect = (model == "logistic") ? "log_or" : "beta";
     auto flag = [](int v) { return v < 0 ? std::string(".") : std::to_string(v); };
     {
-        std::ofstream out(opt.out_prefix + ".assoc.tsv");
-        if (!out) throw std::runtime_error("cannot write " + opt.out_prefix + ".assoc.tsv");
+        std::ofstream out(assoc_staged);
+        if (!out) throw std::runtime_error("cannot write " + assoc_final);
         // p_bonf = raw 0.05/n_tests. p_bonf_meff scales by Meff, an LD-CLUMPING heuristic that is
         // seeded in p-value order and therefore depends on the phenotype -- it is not a phenotype-blind
         // effective-test count and gives no formal family-wise guarantee. q_bh is the primary control.
@@ -1689,10 +1702,16 @@ int run_associate_command(const std::vector<std::string>& args) {
                 << '\t' << flag(r.clump) << '\t' << flag(r.is_lead) << '\t' << r.gene
                 << '\t' << fmt(p_cond[i]) << '\t' << cond_role[i] << '\n';
         }
+        // Closed and checked, not left to the destructor: an ofstream that fails on its way to
+        // storage reports nothing when it is destroyed, so a truncated table would have committed
+        // as part of a successful family.
+        out.close();
+        if (!out) throw std::runtime_error("failed writing " + assoc_final);
     }
     // ---- summary (also the per-plot threshold lines) ----
     {
-        std::ofstream out(opt.out_prefix + ".summary.tsv");
+        std::ofstream out(summary_staged);
+        if (!out) throw std::runtime_error("cannot write " + summary_final);
         out << "key\tvalue\n"
             << "model\t" << model << '\n'
             << "phenotype_type\t" << (binary ? "binary" : "quantitative") << '\n'
@@ -1720,7 +1739,13 @@ int run_associate_command(const std::vector<std::string>& args) {
             << "lambda_gc\t" << fmt(lambda_gc) << '\n';
         if (variant_mode) out << "cojo_independent_signals\t" << cojo_n_signals << '\n';
         if (model == "lmm") out << "lmm_delta\t" << fmt(lmm.delta) << '\n';
+        out.close();
+        if (!out) throw std::runtime_error("failed writing " + summary_final);
     }
+
+    // Both files are complete on disk. Install them as one transaction, so a failure here restores
+    // whatever was there before rather than leaving a new table beside a stale summary.
+    staged.commit();
 
     cli::RunLog log("associate", opt.quiet);
     log.info("model " + model + " (" + (binary ? "binary" : "quantitative") + "), " +
@@ -1752,7 +1777,7 @@ int run_associate_command(const std::vector<std::string>& args) {
     log.info("significant: Bonferroni(Meff=" + std::to_string(meff) + ") " + std::to_string(n_sig_meff) +
              ", FDR<0.05 " + std::to_string(n_sig_fdr) + "; " + lambda_label + "=" + fmt(lambda_gc) +
              (variant_mode ? "; COJO signals " + std::to_string(cojo_n_signals) : ""));
-    log.wrote({opt.out_prefix + ".assoc.tsv", opt.out_prefix + ".summary.tsv"});
+    log.wrote({assoc_final, summary_final});
     log.done();
     return 0;
 }

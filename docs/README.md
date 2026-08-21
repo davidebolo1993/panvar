@@ -10,7 +10,7 @@ Documentation for the `panvar` CLI, organized into three subfolders plus a share
 | **[walkthrough.md](walkthrough.md)** | the whole pipeline on one real locus (LPA), step by step with commands and plots. |
 | **[gwas.md](gwas.md)** | the association (GWAS) worked example on the LPA output: a simulated Lp(a) phenotype, multiple-testing corrections, structure control. |
 | **[glossary.md](glossary.md)** | terms that mean something specific here: the four reconstruction levels, the copy-number fields per route, the two VCFs, and the thresholds. |
-| **[review_followups.md](review_followups.md)** | the ledger of unfinished work, tagged `[RELEASE]` / `[LIMIT]` / `[LATER]`. |
+| **[review_followups.md](review_followups.md)** | the release ledger, tagged `[RELEASE]` / `[LIMIT]` / `[TEST]` / `[LATER]`. |
 | **[references.md](references.md)** | tools and papers behind each module. |
 
 ## Pipeline

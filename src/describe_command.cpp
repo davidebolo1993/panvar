@@ -335,21 +335,78 @@ int run_describe_command(const std::vector<std::string>& args) {
                suffix.find_first_not_of("0123456789") == std::string::npos;
     };
     std::filesystem::create_directories(final_dir);
+
+    // An INPUT sitting under an owned output name would be consumed and then replaced by the commit
+    // below. `reject_output_collisions` compares files; the owned set here is a set of directory
+    // ENTRIES, some of them directories, so the containment test is done directly.
+    {
+        const auto canon = [](const std::string& p) {
+            std::error_code e;
+            const auto c = std::filesystem::weakly_canonical(p, e);
+            return (e || c.empty()) ? std::filesystem::path(p) : c;
+        };
+        const std::filesystem::path canon_out = canon(final_dir.string());
+        for (const std::string* in : {&options.gfa_path, &options.bubbles_csv_in,
+                                      &options.variant_nodes_path, &options.samples_path,
+                                      &options.variant_vcf_path}) {
+            if (in->empty()) continue;
+            std::filesystem::path c = canon(*in);
+            for (std::filesystem::path up = c; !up.empty() && up != up.parent_path();
+                 up = up.parent_path()) {
+                if (up.parent_path() != canon_out) continue;
+                if (!is_owned(up.filename().string())) break;
+                throw std::runtime_error(
+                    "describe: input '" + *in + "' lives under an output this run owns (" +
+                    up.filename().string() + " in --out-dir); the commit would consume it and then "
+                    "replace it");
+            }
+        }
+    }
+
     const std::filesystem::path backup_dir =
         final_dir.parent_path() /
         (final_dir.filename().string() + ".describe-backup." + std::to_string(::getpid()));
     std::filesystem::remove_all(backup_dir, ec);
     std::vector<std::pair<std::filesystem::path, std::filesystem::path>> moved;   // backup <- original
+    // Every destination this run installed, in order. Restoring only `moved` left an entry that had
+    // NO predecessor sitting in the output directory after a rollback, so a failed run published half
+    // a new family -- exactly the state the transaction exists to prevent.
+    std::vector<std::filesystem::path> installed;
     std::size_t stale = 0;
     auto restore = [&]() {
+        std::vector<std::string> unrestored;
+        for (auto it = installed.rbegin(); it != installed.rend(); ++it) {
+            std::error_code e;
+            std::filesystem::remove_all(*it, e);
+            if (e) unrestored.push_back("could not remove " + it->string() + ": " + e.message());
+        }
         for (const auto& [bak, orig] : moved) {
             std::error_code e;
             std::filesystem::remove_all(orig, e);
             std::filesystem::rename(bak, orig, e);
+            // A restore that itself fails is the one outcome the caller cannot recover from: the
+            // previous output is gone and the backup is the only remaining copy. Naming it is the
+            // difference between a recoverable situation and a silent one.
+            if (e) unrestored.push_back("could not restore " + orig.string() + " (kept as " +
+                                        bak.string() + "): " + e.message());
+        }
+        if (!unrestored.empty()) {
+            std::string msg = "describe: rollback did not complete:";
+            for (const auto& u : unrestored) msg += "\n  " + u;
+            throw std::runtime_error(msg);
         }
         std::error_code e;
         std::filesystem::remove_all(backup_dir, e);
     };
+
+    // Fault injection, test-only, mirroring the shared StagedOutputs contract: fail before installing
+    // the Nth entry. Without it the rollback path is unreachable from a test.
+    std::size_t fail_at = 0;
+    if (const char* env = std::getenv("PANVAR_TEST_FAIL_COMMIT_AT")) {
+        fail_at = static_cast<std::size_t>(std::strtoull(env, nullptr, 10));
+    }
+    std::size_t n_installed = 0;
+
     try {
         std::filesystem::create_directories(backup_dir);
         for (const auto& e : std::filesystem::directory_iterator(final_dir)) {
@@ -363,6 +420,10 @@ int run_describe_command(const std::vector<std::string>& args) {
         }
         for (const auto& e : std::filesystem::directory_iterator(stage_dir)) {
             const std::filesystem::path dst = final_dir / e.path().filename();
+            if (fail_at != 0 && ++n_installed == fail_at) {
+                throw std::runtime_error("PANVAR_TEST_FAIL_COMMIT_AT: injected failure installing " +
+                                         dst.string());
+            }
             std::filesystem::rename(e.path(), dst, ec);
             if (ec) {   // across filesystems rename fails; fall back to copy
                 ec.clear();
@@ -372,6 +433,7 @@ int run_describe_command(const std::vector<std::string>& args) {
                 if (ec) throw std::runtime_error("describe: cannot install output " + dst.string() +
                                                  ": " + ec.message());
             }
+            installed.push_back(dst);
         }
     } catch (...) {
         restore();

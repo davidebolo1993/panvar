@@ -190,6 +190,41 @@ for opt in "--min-maf 2" "--ld-r2 -1" "--min-ac -5" "--cojo-p 0" "--cojo-p 1.5" 
 done
 
 
+# ---------------------------------------------------------------- output contract
+# associate wrote its two files straight to their destinations: a failure between them left a new
+# assoc.tsv beside a stale summary.tsv, and nothing stopped -o from naming an input.
+run_assoc() { "$BIN" associate --genotypes "$OUT/lin.bimbam.gz" --samples "$OUT/lin.samples.gz" \
+                --phenotype "$OUT/lin.pheno" --min-maf 0 "$@" --quiet >/dev/null 2>&1; }
+
+# -o naming the phenotype input must be refused BEFORE the input is touched. The phenotype IS the
+# file the run would write, so without the preflight the input is consumed and then replaced.
+cp "$OUT/lin.pheno" "$OUT/alias.assoc.tsv"
+alias_before=$(cksum < "$OUT/alias.assoc.tsv")
+"$BIN" associate --genotypes "$OUT/lin.bimbam.gz" --samples "$OUT/lin.samples.gz" \
+  --phenotype "$OUT/alias.assoc.tsv" --min-maf 0 -o "$OUT/alias" --quiet >/dev/null 2>&1
+[ "$?" -ne 0 ] && [ "$(cksum < "$OUT/alias.assoc.tsv")" = "$alias_before" ] \
+  && ok "an output aliasing the phenotype input is refused, and the input survives" \
+  || bad "associate overwrote, or accepted, an output aliasing its own input"
+
+# The family replaces atomically: a failure part-way leaves the previous pair untouched.
+run_assoc -o "$OUT/txn"
+a_before=$(cksum < "$OUT/txn.assoc.tsv"); s_before=$(cksum < "$OUT/txn.summary.tsv")
+PANVAR_TEST_FAIL_COMMIT_AT=2 run_assoc -o "$OUT/txn" --model linear
+[ "$?" -ne 0 ] && ok "an injected commit failure exits non-zero" \
+               || bad "an injected commit failure exited 0"
+[ "$(cksum < "$OUT/txn.assoc.tsv")" = "$a_before" ] \
+  && [ "$(cksum < "$OUT/txn.summary.tsv")" = "$s_before" ] \
+  && ok "both previous associate outputs survive a failed commit unchanged" \
+  || bad "a failed commit replaced part of the associate family"
+PANVAR_TEST_FAIL_COMMIT_AFTER_SETASIDE=2 run_assoc -o "$OUT/txn" --model linear
+[ "$(cksum < "$OUT/txn.assoc.tsv" 2>/dev/null)" = "$a_before" ] \
+  && [ "$(cksum < "$OUT/txn.summary.tsv" 2>/dev/null)" = "$s_before" ] \
+  && ok "and also when the failure lands between set-aside and install" \
+  || bad "the set-aside window lost an associate output"
+res=$(ls "$OUT" | grep -c -- '-tmp\.\|-prev\.')
+[ "$res" = "0" ] && ok "associate leaves no staging or reserve residue" \
+                 || bad "$res residue file(s) left by associate"
+
 echo
 if [ "$fails" -eq 0 ]; then echo "associate_stats: all assertions passed"; exit 0; fi
 echo "associate_stats: $fails assertion(s) FAILED"; exit 1
