@@ -18,6 +18,17 @@ Per unit, `associate` fits `phenotype ~ genotype + covariates` and tests the gen
 - logistic (binary trait) — iteratively reweighted least squares (IRLS) Newton–Raphson; `β`, `Var(β) = (Xᵀ W X)⁻¹` at convergence.
 - p — `z = β_genotype / se`, and for a quantitative trait `p = 2·P(T_{n−p} > |z|)` via the regularized incomplete beta (validated against R's `pt()` to a relative error below 3.3e-12). The normal form `erfc(|z|/√2)` — the upper tail computed directly to avoid the cancellation of `1 − Φ(|z|)` at large `|z|` — is what the score test uses for its chi-square-on-1-df tail. Floored at `1e-300`.
 
+Which test is used, and why it is not always the obvious one:
+
+- Quantitative traits use a Student-t tail on `n − p` degrees of freedom rather than the normal one. The residual variance is estimated from the same data, so the statistic is t-distributed; the difference is invisible at large sample sizes and substantial at small ones, where the normal tail is anticonservative by a wide margin.
+- Binary traits use a Rao score test rather than a Wald test. A Wald statistic divides an estimate by its own standard error, and for a rare variant in an unbalanced case/control study the fit approaches separation: the coefficient grows and its standard error grows faster, so the statistic collapses toward zero exactly where the evidence is strongest. The score test never fits the alternative, so it has no standard error to inflate.
+- Past `|z| > 2` the binary score is saddlepoint-corrected. The normal approximation matches only the first two cumulants, so it drifts in the far tail precisely when the terms are skewed, which is the rare-variant-under-imbalance case. The score is a sum of independent bounded terms, so its cumulant generating function is available exactly and the saddlepoint expansion is built from it. That does not make the result exact: the expansion is still an approximation, and at very small sample sizes it is not guaranteed to beat the normal.
+- At the edge of the score's support, where a feature separates the outcome perfectly, the saddlepoint is at infinity and the expansion does not apply. Falling back to the normal tail there would use an approximation exactly where it is least trustworthy, so the probability is instead written down exactly: the boundary is a single configuration whose probability is a product over the samples, computed in logs. The two tails are evaluated independently, since an asymmetric score distribution can put them in different regimes, and the result is labelled exact only when both are.
+
+Under separation the maximum-likelihood fit diverges, so an iteration limit is treated as failure rather than returning the last iterate. The score test is unaffected and still yields a valid p, and the effect size comes from Firth's penalised likelihood, which is finite where maximum likelihood is not. A feature is dropped only when the score test itself fails; there is never a silent fall back to a Wald p.
+
+Consequence for reading a row: `z` and `p` come from the score test while `log_or` and `se` are a Wald-style effect size, so `p` cannot be recovered from them.
+
 The unit is auto-detected from the `layer` column of `feature_annot` — `variant` when the majority of rows are variant-level, otherwise `feature` (override with `--unit`). Across all tested units the genomic-inflation factor `λ = median(z²)/0.4549` (the observed median z² over the null median of a χ²₁, `0.4549`) is reported in the summary: `λ ≈ 1` means the test is calibrated, `λ > 1` flags residual structure.
 
 ### 3. Correct the testing burden — `Meff` (phenotype-blind)
@@ -120,6 +131,8 @@ BH q (sorted, q_i = p_i·m/rank, monotone) = [2e-5, 0.004, 0.04, 0.40]
 5. Adjust the p-values and establish independence. BH recovers one more than Bonferroni — the expected conservative-vs-FDR trade-off. But when the four features tag the same underlying variation, the raw `n_tests = 4` over-counts and the region-wide Bonferroni is too conservative; `Meff` (step 3) replaces that 4 with the effective test count — the number of distinct bubbles for a feature run, or the number of LD-clump leads for a variant run — and `p_bonf_meff` rescales accordingly.
 
 ## LMM (EMMAX) — the fast mixed model
+
+The kinship matrix is validated before any of this runs: row count and row width, finiteness, symmetry, and positive semi-definiteness. A matrix failing any of them is not a covariance, and the variance ratio derived from it would not mean anything.
 
 For `--model lmm`, relatedness is a random effect with covariance `σ²_g·K` (the kinship `K`). The fixed-effect rotation is done once (EMMAX), then each feature is a cheap generalized least squares (GLS):
 

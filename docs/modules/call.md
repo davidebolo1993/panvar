@@ -30,21 +30,7 @@ The recommended path is `bubble → panphorte → [refine] → call`, so `call` 
 - `-r, --reference-path <name>` — the diff baseline (full name or unique case-insensitive substring).
 - `-o, --out-prefix <prefix>`.
 
-### Input contract
-
-Checked before anything is read, and refused with the offender named rather than worked around. Each of these used to exit 0 and write a header-only VCF, which is indistinguishable from a locus with no variation:
-
-| refused | why it cannot be tolerated |
-|---|---|
-| a path step naming a node with no `S` line | spelling skips it, so every sequence, coordinate and `SVLEN` from that walk is silently short |
-| a duplicate path name | which haplotype a genotype column refers to would be undefined |
-| a non-zero `L` overlap, or `*` | `call` spells by concatenating whole nodes, so an overlap is double-counted |
-| a bubbles CSV naming nodes absent from the graph | the CSV belongs to a different graph; every bubble would be skipped |
-| a duplicate `bubble_id` | the same site would be called twice |
-| `--bubble-id` naming an id not in the CSV | a typo, not an empty result |
-| an output path that is also an input | the run would overwrite the data it is reading |
-
-Outputs are staged and renamed in only once the whole run succeeds, so a failure part-way through no longer leaves a complete-looking region VCF beside a non-zero exit. A narrowed rerun (`--bubble-id`) also clears per-bubble VCFs left by an earlier wider run at the same prefix, which would otherwise be indistinguishable from current output.
+The graph and the bubbles CSV must describe each other, and both are checked before anything is read. A path step naming a node with no segment, a duplicate path name, a non-zero or unspecified link overlap, a bubbles CSV naming nodes the graph lacks, a duplicate bubble id, a `--bubble-id` that is not in the CSV, or an output path that is also an input: each is refused with the offender named. Every one of them would otherwise produce a plausible-looking VCF rather than an error.
 
 ## Key options
 
@@ -68,7 +54,8 @@ Outputs are staged and renamed in only once the whole run succeeds, so a failure
 
 | file | contents |
 |------|----------|
-| `<prefix>.region.vcf` | all records, coordinate-sorted, unique IDs (`bgzip`+`tabix`-able) |
+| `<prefix>.region.vcf` | all records, coordinate-sorted, unique IDs (`bgzip`+`tabix`-able). This is the interpreted output: records are merged so a reader can see what varies |
+| `<prefix>.alleles.vcf` | with `--allele-vcf`: one record per bubble whose ALT column spells every distinct allele at that site, each haplotype's `GT` indexing its own. Nothing is merged and no sequence is summarized, so reconstructing a haplotype from it reproduces the input exactly |
 | `<prefix>.bubble_<id>.vcf` | per-bubble VCF (unless `--no-per-bubble-vcf`) |
 | `<prefix>.variant_nodes.tsv` | per-variant node set — the `describe --variant-nodes` handoff and the `benchmark` input (unless `--no-variant-nodes`) |
 | `<prefix>.node_genes.tsv`, `<prefix>.dup_gene_cn.tsv` | with `--gtf` (see below) |
@@ -101,17 +88,9 @@ VCF 4.2; samples = haplotypes. `FORMAT`: `GT` (`1` carrier / `0` ref-like / `.` 
 - Where a module boundary is visited more than once, the span used is the widest one, from the first source occurrence to the last sink. It can enclose sequence lying between separate visits, and those records carry `CN_SPAN_AMBIGUOUS`.
 - The event sequence is omitted from very large records, so a consumer of `INSSEQ`/`DELSEQ`/`INVSEQ` alone cannot reconstruct those; the allele VCF carries them.
 
-## Lossless companion: the allele VCF
-
-The region VCF is the interpreted output: records are merged so a reader can see what varies. `--allele-vcf` additionally writes `<prefix>.alleles.vcf`, one record per bubble whose ALT column carries every distinct allele at that site spelled out, with each haplotype's `GT` indexing its own. Nothing is merged and no sequence is summarized, so reconstructing a haplotype from it reproduces the input exactly. Use the region VCF to interpret a locus and the allele VCF when the exact sequence a given haplotype carries matters.
-
-## Plotting
-
-`scripts/plot_vcf_map.R` draws an oncoprint-style map of the region VCF, rows being haplotypes and columns variants grouped by bubble, with duplications shaded by copy number. `scripts/build_variant_node_data.R` and `scripts/variant_node_heatmap_app.R` build and serve an interactive per-node coverage view of the same calls. Each script documents its own options under `--help`.
-
-## Gene annotation
-
 With `--gtf` and a PanSN (Pangenome Sequence Naming) reference path, genes overlapping each record are named in `INFO/GENES`, `<prefix>.node_genes.tsv` maps every node to the genes covering it, and for a duplication whose paralogs are separable `<prefix>.dup_gene_cn.tsv` splits the module's copy number per gene.
+
+`scripts/plot_vcf_map.R` renders the region VCF as an oncoprint-style map, and `scripts/build_variant_node_data.R` with `scripts/variant_node_heatmap_app.R` serve an interactive per-node view of the same calls. Each documents its own options under `--help`.
 
 ## Example
 

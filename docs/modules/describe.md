@@ -82,8 +82,6 @@ Each `feature_annot.<substrate>.tsv.gz` (one row per BIMBAM feature, in row orde
 
 The BIMBAM matrices themselves hold `feature_id`, two allele-label columns `A`,`B`, then one dosage column per haplotype (or per sample, with `--samples`) in the folder's `samples.txt.gz` order. The per-bubble `*_features.tsv.gz` maps name each feature to its nodes/encoding, and `kmer_counts.jsonl.gz` holds the per-path sparse counts (`[feature_id, count]` tuples); the dense `*_matrix.tsv.gz` is the same data materialised as a feature × path table and is written only when the wide matrix is enabled (i.e. not under `--no-wide-matrix`).
 
-## Association
-
 The BIMBAM exports feed [`panvar associate`](associate.md) directly (it tests the dosage, so copy-number loci are first-class). A significant marker traces back through its `nodes`/`bubbles` to `call`'s `variant_nodes.tsv` and from there to the variant `call` typed — and, with `call --gtf` plus `associate --node-genes`, on to the gene it sits in. A worked end-to-end run with the concepts in context is in [GWAS example](../gwas.md).
 
 ## Limitations

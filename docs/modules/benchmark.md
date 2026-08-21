@@ -6,77 +6,43 @@ CLI: `panvar benchmark`
 
 Answers two different questions about the caller's own output, and keeps them apart.
 
-What was there to be found, and what became of it — the truth event ledger. Independently of any call, the haplotype's walk over a bubble is node-aligned to the reference walk, and each maximal divergent block between shared anchors is one truth event, sized `max(ref_bp, hap_bp)` from the walks. Every event is then classified:
+What was there to be found, and what became of it. Independently of any call, each haplotype's walk over a bubble is compared with the reference's, and every divergent block becomes a truth event classified by size and by whether a record covers it:
 
 | class | definition |
 |-------|------------|
-| `called` | size `≥ --min-sv-bp` and a specific emitted record shares at least one node with the block |
-| `missed` | size `≥ --min-sv-bp` and no emitted record covers it |
-| `below_threshold` | size `< --min-sv-bp` — variation the caller never set out to emit |
+| `called` | at least `--min-sv-bp` and some emitted record shares a node with the block |
+| `missed` | at least `--min-sv-bp` and no emitted record covers it |
+| `below_threshold` | under `--min-sv-bp` — variation the caller never set out to emit |
 
-Event size is a property of the two walks. It does not move with the alignment, with the calls, or with anything else the run does, which is what makes it usable as truth.
-
-`called` is attribution, not coverage: a record shares at least one node with the block. It does not establish that the record spans the block, nor that it represents it correctly. So `missed` is a firm negative — nothing the caller emitted touches this event at all — while `called` is an upper bound on discovery. It is also silent on whether this haplotype was genotyped as carrying it; that is the carrier table below.
-
-How much of the sequence comes back — four reconstructions over the same bubbles, against the same truth, on the same QV scale, differing only in what each is allowed to use.
+How much of the sequence comes back. Four reconstructions over the same bubbles against the same truth, differing only in what each is allowed to use:
 
 | level | reconstruction built from | answers |
 |-------|---------------------------|---------|
-| `graph` | reference walk + the haplotype's own steps at every block sharing a node with any call at that bubble | optimistic upper bound: can the graph hold this haplotype, and did the caller flag the divergent blocks |
-| `called` | the same substitution restricted to blocks a specific record is attributed to and that reach `--min-sv-bp` | the ceiling the retained records would reach if each reproduced its block exactly |
-| `carrier` | `called` plus the requirement that this haplotype's `GT` names one of the records overlapping the block (`--vcf`) | the same ceiling, after carrier assignment is taken into account |
-| `genotype` | reference sequence + only the edits this haplotype's `GT` names, from the VCF alone (`--vcf`) | what a consumer reconstructing this sample from the VCF actually gets |
+| `graph` | reference walk plus the haplotype's own steps at every block sharing a node with any call | can the graph hold this haplotype, and did the caller flag the divergent blocks |
+| `called` | the same, restricted to blocks a specific record is attributed to and that reach `--min-sv-bp` | what the retained records would reach if each reproduced its block exactly |
+| `carrier` | `called`, plus the requirement that this haplotype's genotype names a record overlapping the block | the same ceiling once genotypes are applied |
+| `genotype` | the reference plus only the edits this haplotype's genotype names | what a consumer reconstructing this sample from the VCF actually gets |
 
-`graph` is deliberately optimistic and is not a genotyping score: sharing a node with some call is not the same as matching one, so a called block can authorise copying a neighbouring uncalled allele, and no genotype is read at all. `called` narrows that to per-record attribution and the size threshold, but it still splices in the haplotype's true block rather than the record's `REF`/`ALT` effect — so it too is a ceiling, just a much tighter one. Only `genotype` reconstructs what the records actually say.
+The first three implant the haplotype's own true sequence and are therefore ceilings, not results. Only `genotype` reconstructs what the records say.
 
-`graph ≥ called ≥ carrier` are nested ceilings: each substitutes a subset of the previous level's blocks, and all three implant the haplotype's own true sequence, so the ordering is guaranteed. `genotype` is not bounded by them. It applies every record the haplotype carries rather than only attributed eligible blocks, so it can beat `carrier` in places — which is exactly why the last two loss terms are signed. Treat it as a fourth measurement, not the bottom of a chain.
-
-What the steps separate: `called` and `carrier` implant the same true blocks and differ only in whether the haplotype was genotyped as a carrier — that step is a clean isolation. The `carrier`-to-`genotype` step is not symmetric: `carrier` substitutes only blocks that are attributed and eligible, while `genotype` applies every record the haplotype's `GT` names, including ones covering no eligible truth block. So that step mixes two things, and they are reported separately — `representation` where the haplotype has an eligible truth event, `false_positive_damage` where it does not.
-
-That is emitted as a `loss_bp` partition of the genotype residual — five consecutive steps from truth down to the reconstruction, which sum exactly to it (`sum_check`, asserted, because an attribution built on arithmetic that has stopped closing is worthless):
+The genotype residual is then partitioned into five terms that sum to it exactly, so the shortfall can be attributed rather than just measured:
 
 | term | bases lost to |
 |------|---------------|
-| `out_of_scope` | truth events below `--min-sv-bp`. `call` was never asked to emit these, so they are not a caller failure |
+| `out_of_scope` | truth events below the size threshold, which the caller was never asked to emit |
 | `discovery_or_attribution` | eligible truth events no retained record covers |
-| `carrier_missed` | covered by a record, but this haplotype is not genotyped as carrying it — a false negative |
-| `representation` | right record, right carrier: what the VCF's encoding of it fails to reproduce |
-| `false_positive_damage` | the VCF edits a haplotype that has no eligible truth event there |
+| `carrier_missed` | covered by a record, but this haplotype is not genotyped as carrying it |
+| `representation` | right record, right carrier, but the encoding does not reproduce the sequence |
+| `false_positive_damage` | an edit applied where the haplotype has no eligible truth event |
 
-Every comparative figure is computed over the common set — the `(haplotype, bubble)` observations all levels could score, reported as `common_set/observations`. `graph` and `called` cover every graph haplotype, `carrier` only those joined to a VCF column, and `genotype` only those whose bubble could also be placed; totalling each over its own population and subtracting compares different denominators. With one haplotype left out of the VCF that produced `carrier_walk` 100% sitting above `called` 83.3%, and a carrier loss of minus 20 bp.
-
-The last two terms are signed. `carrier` only substitutes blocks that are eligible and attributed, while `genotype` applies every record the haplotype carries, so a record can improve a region `carrier` left alone. A negative term means the VCF beat the walk-based ceiling there; clamping it to zero broke the partition on four of six loci.
-
-Across the reviewed loci this is lopsided: discovery is zero everywhere and representation dominates. The caller finds the eligible variation and puts it on the right haplotypes; the loss is in how the VCF encodes it.
-
-A carrier at a block is judged against every record overlapping it, not only the one the ledger attributes it to. One divergent region can be described by several records and different carriers take different ones, so asking about the single attributed record would really be asking whether the haplotype carries whichever record sorted first.
-
-A do-nothing baseline — plain reference, no edits — is always computed alongside, and is the denominator of the headline:
+A do-nothing baseline, the plain reference with no edits, is computed alongside and is the denominator of the headline figures:
 
 ```
 gap_closed          = (baseline_delta - genotype_delta) / (baseline_delta - graph_delta)
 variation_recovered = (baseline_delta - <level>_delta)  /  baseline_delta
 ```
 
-`gap_closed` measures against the achievable bound; `variation_recovered` against all of the variation there was. Reported for every level, the pair says which of representation or graph is the limit. When `baseline_delta == graph_delta` there is no distance to close and `gap_closed` is `NA`, not `1.0` — the two are equal precisely when a bubble was missed entirely, so reporting `1.0` scored a total miss as a perfect result.
-
-The baseline also makes the metric self-checking: a haplotype genotyped as carrying nothing must score byte-identically to it, so a coordinate or orientation error in the projection shows up immediately instead of hiding inside a plausible QV.
-
-### Carrier calls
-
-Per (haplotype, bubble): does the VCF genotype this haplotype as carrying an alt, against whether its walk really diverges by at least `--min-sv-bp`. Truth comes from the ledger, so it is a property of the walks. Reported for `ALL` only — a bubble-level judgement has no single SV type, and fanning it out over every type present in the bubble reported one observation several times. The per-type partition is the ledger, where each event maps to at most one record.
-
-`FN` here means the record exists but this haplotype's `GT` is `0` at every record of the bubble: a genotyping miss, distinct from a `missed` event, which is a discovery miss.
-
-### On the residual split
-
-`resid_run_lt_bp` / `resid_run_ge_bp` divide the residual by contiguous alignment-run length. This is a property of the edit path edlib returns, not of any event. A clean 60 bp deletion of ordinary non-repetitive sequence comes back as fourteen runs of 1–10 bases, because co-optimal paths distribute the gap over chance matches; every real locus therefore reported `over_threshold_bp = 0`. The columns are kept as a description of the residual's shape. The called/missed question belongs to the ledger.
-
-### On `--min-sv-bp`
-
-It sets the event-size threshold for the ledger and for the `called` reconstruction. It does not re-run discovery, so lowering it here does not find anything new — it reclassifies. A real threshold experiment runs `call` at each threshold and `benchmark` on that run's output at the same threshold, over a fixed bubble set: `scripts/validate_benchmark_threshold.py` does exactly that and checks the invariants that must hold (the truth events themselves cannot move, the classes must partition, `below_threshold` cannot rise as the threshold falls, the allele VCF must stay exact).
-
-Pass the sweep the same calling options the pipeline uses, or it measures a different caller. Lowering the threshold cannot reduce the count of sub-threshold truth events, and that is asserted; genotype reconstruction is not monotone, because more records mean more merged and overlapping records describing one walk, and independent records do not compose. The script reports the second separately from the hard invariants, since it is a call-side interaction and is the point of running the sweep.
+`gap_closed` measures against the achievable bound, `variation_recovered` against all the variation there was. The baseline also makes the metric self-checking: a haplotype genotyped as carrying nothing must reconstruct byte-identically to it.
 
 Algorithm and worked trace: [algorithms/benchmark.md](../algorithms/benchmark.md).
 
@@ -119,3 +85,17 @@ All outputs are staged and committed only on success, and no output may name an 
 Nothing is dropped silently: every haplotype-bubble pair excluded from a denominator is counted in the `excluded` scope, so no rate is read as though it covered everything.
 
 Results can be plotted via `scripts/plot_benchmark.R`.
+
+## Limitations
+
+- The first three levels implant the haplotype's own true block, so they bound what the graph and the retained records could achieve rather than measuring what the VCF says. `genotype` is not bounded by them, since it applies every record the haplotype carries rather than only attributed eligible blocks, which is why the last two partition terms are signed.
+- `called` means a record shares a node with the block, not that it covers or reproduces it. It is an upper bound on discovery; `missed` is the firm negative.
+- Duplication reconstruction is heuristic: the inferred reference span is tiled, so the length is right and the sequence only approximately.
+- Allele-VCF mode has one record per bubble while the node sidecar has one per call, so they share no identifier. The `carrier` level and the per-call loss terms are reported as not applicable in that mode rather than as zero.
+- There is no class for an eligible event removed by a frequency, support or resource policy: it is indistinguishable from one never discovered until the caller emits a decision audit.
+- False-positive damage is attributed per haplotype and bubble, so a second spurious record in a bubble that also holds a valid truth event is not isolated.
+- `--min-sv-bp` reclassifies the ledger and gates the `called` reconstruction but does not re-run discovery, so lowering it here finds nothing new. Use the threshold sweep, which re-runs both.
+
+## Example
+
+See the [walkthrough](../walkthrough.md) for this module in a full end-to-end run.
