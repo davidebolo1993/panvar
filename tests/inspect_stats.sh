@@ -177,6 +177,54 @@ nclust() { awk 'NR>1{print $1}' "$1" 2>/dev/null | sort -u | wc -l | tr -d ' '; 
   && ok "and separate at 0.30, bracketing the estimate at the true 0.286" \
   || bad "expected 2 clusters at 0.30, got $(nclust "$OUT/a30.bubble_1.clusters.tsv")"
 
+# ------------------------------------------- COMPLETE sketches are compared exactly, not estimated
+# The bottom-k estimator subsamples even when both sketches already hold every shingle the walks have,
+# so it answers with sampling error where the exact value is sitting in memory. This is the worked
+# example from docs/algorithms/inspect.md: two and three copies of a 3-node unit between the same
+# boundaries. W1 has 6 shingles, W3 has 9, they share 6, so the multiset Jaccard is 6/9 = 0.667 and
+# the identity is 2(0.667)/1.667 = 0.80. The estimator reads 0.5 and therefore 0.667.
+#
+# 0.79 and 0.85 bracket the exact identity, so the pair must cluster at the first and separate at the
+# second. With the estimator both readings are "separate", which is what makes this discriminating.
+{ printf 'H\tVN:Z:1.0\n'
+  printf 'S\tF\tAAAAAAAAAAAAAAAAAAAA\nS\tA\tCCCCCCCCCC\nS\tB\tGGGGGGGGGG\nS\tC\tTTTTTTTTTT\n'
+  printf 'S\tG\tAAAAAAAAAAAAAAAAAAAA\n'
+  printf 'L\tF\t+\tA\t+\t0M\nL\tA\t+\tB\t+\t0M\nL\tB\t+\tC\t+\t0M\nL\tC\t+\tA\t+\t0M\nL\tC\t+\tG\t+\t0M\n'
+  printf 'P\th1\tF+,A+,B+,C+,A+,B+,C+,G+\t*\n'
+  printf 'P\th3\tF+,A+,B+,C+,A+,B+,C+,A+,B+,C+,G+\t*\n'; } > "$OUT/exact.gfa"
+"$BIN" bubble -i "$OUT/exact.gfa" -r h1 -o "$OUT/ex" --min-variant-bp 0 -q >/dev/null 2>&1
+"$BIN" inspect -i "$OUT/ex.sorted.gfa" -c "$OUT/ex.bubbles.csv" --cluster --cluster-similarity 0.79 \
+       -o "$OUT/ex79" -q >/dev/null 2>&1
+[ "$(nclust "$OUT/ex79.bubble_1.clusters.tsv")" = "1" ] \
+  && ok "two complete sketches cluster at 0.79, so the exact 0.80 identity was used" \
+  || bad "expected 1 cluster at 0.79, got $(nclust "$OUT/ex79.bubble_1.clusters.tsv"); the estimator reads 0.667 here"
+"$BIN" inspect -i "$OUT/ex.sorted.gfa" -c "$OUT/ex.bubbles.csv" --cluster --cluster-similarity 0.85 \
+       -o "$OUT/ex85" -q >/dev/null 2>&1
+[ "$(nclust "$OUT/ex85.bubble_1.clusters.tsv")" = "2" ] \
+  && ok "and separate at 0.85, bracketing the exact identity rather than an estimate of it" \
+  || bad "expected 2 clusters at 0.85, got $(nclust "$OUT/ex85.bubble_1.clusters.tsv")"
+
+# ------------------------------------------- the representative does not follow GFA record order
+# Identical walks are pooled in encounter order and the first member became `representative_path`, so
+# reordering otherwise identical P records changed the reported representative and, through it, the
+# sort key of the whole TSV. The rule is now the lexicographically smallest member of the medoid walk.
+{ printf 'H\tVN:Z:1.0\nS\t1\tACGTACGTAC\nS\t2\tTTTT\nS\t3\tGGGGCCCCAA\n'
+  printf 'L\t1\t+\t2\t+\t0M\nL\t2\t+\t3\t+\t0M\nL\t1\t+\t3\t+\t0M\n'
+  printf 'P\tzzz\t1+,2+,3+\t*\nP\taaa\t1+,2+,3+\t*\nP\tref\t1+,3+\t*\n'; } > "$OUT/repord.gfa"
+{ printf 'H\tVN:Z:1.0\nS\t1\tACGTACGTAC\nS\t2\tTTTT\nS\t3\tGGGGCCCCAA\n'
+  printf 'L\t1\t+\t2\t+\t0M\nL\t2\t+\t3\t+\t0M\nL\t1\t+\t3\t+\t0M\n'
+  printf 'P\taaa\t1+,2+,3+\t*\nP\tzzz\t1+,2+,3+\t*\nP\tref\t1+,3+\t*\n'; } > "$OUT/repord2.gfa"
+for g in repord repord2; do
+  "$BIN" bubble -i "$OUT/$g.gfa" -r ref -o "$OUT/$g" --min-variant-bp 0 -q >/dev/null 2>&1
+  "$BIN" inspect -i "$OUT/$g.sorted.gfa" -c "$OUT/$g.bubbles.csv" --cluster --cluster-similarity 0.90 \
+         -o "$OUT/${g}_i" -q >/dev/null 2>&1
+done
+rep1=$(awk -F'\t' 'NR>1 && $2==2{print $3}' "$OUT/repord_i.bubble_1.clusters.tsv")
+rep2=$(awk -F'\t' 'NR>1 && $2==2{print $3}' "$OUT/repord2_i.bubble_1.clusters.tsv")
+[ -n "$rep1" ] && [ "$rep1" = "$rep2" ] && [ "$rep1" = "aaa" ] \
+  && ok "the representative is order-independent and lexicographically smallest (aaa)" \
+  || bad "representative depends on P-record order: '$rep1' vs '$rep2' (expected aaa both ways)"
+
 echo
 if [ "$fails" -eq 0 ]; then echo "inspect_stats: all assertions passed"; exit 0; fi
 echo "inspect_stats: $fails assertion(s) FAILED"; exit 1

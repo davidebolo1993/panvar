@@ -183,13 +183,21 @@ std::uint64_t splitmix64(std::uint64_t x) {
 constexpr std::size_t kWalkSketchShingle = 3;
 constexpr std::size_t kWalkSketchSize = 512;
 
+// `out_complete`, when given, reports whether the sketch holds EVERY shingle occurrence rather than
+// the bottom k of them. A complete sketch is the walk's full shingle multiset, so two complete
+// sketches can be compared exactly instead of estimated.
 std::vector<std::uint64_t> build_walk_minhash_sketch(
     const std::vector<std::uint64_t>& tokens,
     std::size_t shingle_size,
-    std::size_t sketch_size) {
+    std::size_t sketch_size,
+    bool* out_complete = nullptr) {
 
+    if (out_complete != nullptr) *out_complete = false;
     if (shingle_size == 0 || sketch_size == 0 || tokens.size() < shingle_size) {
         return {};
+    }
+    if (out_complete != nullptr) {
+        *out_complete = (tokens.size() - shingle_size + 1) <= sketch_size;
     }
     std::priority_queue<std::uint64_t> top_hashes;  // max-heap -> keep the bottom k
     // Per-shingle occurrence counter: the n-th occurrence of a shingle is salted with n,
@@ -259,6 +267,28 @@ double sketch_jaccard(const std::vector<std::uint64_t>& a, const std::vector<std
     return taken == 0 ? 0.0 : static_cast<double>(both) / static_cast<double>(taken);
 }
 
+// Exact multiset Jaccard of two COMPLETE sketches.
+//
+// The bottom-k estimator above deliberately subsamples: it looks at k = min(|a|,|b|) values even when
+// both sketches already hold every shingle the walks have. On the worked example that estimates
+// J = 0.5 where the exact value sitting in memory is 0.667, and near a clustering threshold that
+// difference splits or joins a pair for no reason. When neither sketch was truncated there is nothing
+// to estimate -- the sketches ARE the multisets -- so intersection over union is computed directly.
+double exact_multiset_jaccard(const std::vector<std::uint64_t>& a,
+                              const std::vector<std::uint64_t>& b) {
+    if (a.empty() || b.empty()) {
+        return 0.0;
+    }
+    std::size_t i = 0, j = 0, both = 0;
+    while (i < a.size() && j < b.size()) {
+        if (a[i] < b[j]) ++i;
+        else if (b[j] < a[i]) ++j;
+        else { ++both; ++i; ++j; }
+    }
+    const std::size_t uni = a.size() + b.size() - both;
+    return uni == 0 ? 0.0 : static_cast<double>(both) / static_cast<double>(uni);
+}
+
 // identity ~= 2J / (1 + J) from k-mer/shingle Jaccard.
 double estimate_identity_from_jaccard(double jaccard) {
     if (jaccard <= 0.0) {
@@ -274,6 +304,7 @@ struct UniqueWalk {
     std::string signature;
     TokenWeights weights;
     std::vector<std::uint64_t> sketch;  // walk MinHash sketch (for CC clustering)
+    bool sketch_complete = false;       // sketch holds every shingle, so it can be compared exactly
     std::vector<std::string> members;   // path names, in encounter order
 };
 
@@ -294,14 +325,44 @@ std::vector<ClusterOut> cluster_unique_walks_cc(
     if (n == 0) {
         return {};
     }
+    // This is an all-pairs O(U^2) comparison over a dense U x U matrix of doubles. That is fine for
+    // the reviewed panels (hundreds of distinct walks) and becomes the dominant cost on a large
+    // cohort. No LSH or banding candidate stage exists, so the limit is stated rather than hidden.
+    constexpr std::size_t kWarnUniqueWalks = 2000;
+    constexpr std::size_t kMaxUniqueWalks = 25000;      // ~5 GB of matrix alone
+    if (n > kMaxUniqueWalks) {
+        throw std::runtime_error(
+            "inspect: " + std::to_string(n) + " distinct walks exceeds the clustering limit of " +
+            std::to_string(kMaxUniqueWalks) + ". Clustering compares every pair over a dense " +
+            "matrix, so this run would need about " +
+            std::to_string((n * n * sizeof(double)) / (1024ULL * 1024ULL * 1024ULL)) +
+            " GB. Restrict to one bubble with --bubble-id, or drop --cluster.");
+    }
+    if (n > kWarnUniqueWalks) {
+        std::cerr << "[inspect] WARNING: clustering " << n << " distinct walks compares every pair "
+                  << "over a dense matrix (about "
+                  << (n * n * sizeof(double)) / (1024ULL * 1024ULL) << " MB and "
+                  << (n * (n - 1) / 2) << " comparisons). This implementation is not cohort-scale.\n";
+    }
+
     std::vector<std::vector<double>> dist(n, std::vector<double>(n, 0.0));
     for (std::size_t i = 0; i < n; ++i) {
         for (std::size_t j = i + 1; j < n; ++j) {
-            // Walks too short to shingle have empty sketches; fall back to the exact
-            // bp-weighted Jaccard so short bubbles still cluster instead of all-singleton.
-            const double id = (uniques[i].sketch.empty() || uniques[j].sketch.empty())
-                ? weighted_jaccard_tokens(uniques[i].weights, uniques[j].weights)
-                : estimate_identity_from_jaccard(sketch_jaccard(uniques[i].sketch, uniques[j].sketch));
+            // Three cases, in order of how much is actually known. Walks too short to shingle have
+            // empty sketches and fall back to the exact bp-weighted Jaccard, so short bubbles still
+            // cluster instead of coming out all-singleton. Two COMPLETE sketches are the full shingle
+            // multisets, so they are compared exactly rather than estimated. Only when at least one
+            // was truncated is the bottom-k estimator needed.
+            double id;
+            if (uniques[i].sketch.empty() || uniques[j].sketch.empty()) {
+                id = weighted_jaccard_tokens(uniques[i].weights, uniques[j].weights);
+            } else if (uniques[i].sketch_complete && uniques[j].sketch_complete) {
+                id = estimate_identity_from_jaccard(
+                    exact_multiset_jaccard(uniques[i].sketch, uniques[j].sketch));
+            } else {
+                id = estimate_identity_from_jaccard(
+                    sketch_jaccard(uniques[i].sketch, uniques[j].sketch));
+            }
             dist[i][j] = dist[j][i] = 1.0 - id;
         }
     }
@@ -364,7 +425,12 @@ std::vector<ClusterOut> cluster_unique_walks_cc(
                 co.members.push_back(name);
             }
         }
-        co.representative = uniques[rep].members.front();
+        // The lexicographically smallest member of the medoid walk, not the first one encountered:
+        // identical walks are pooled in GFA record order, so `members.front()` made the reported
+        // representative -- and therefore the sort key of the whole clusters TSV -- depend on how the
+        // P/W records happened to be ordered in the file.
+        co.representative = *std::min_element(uniques[rep].members.begin(),
+                                              uniques[rep].members.end());
         std::sort(co.members.begin(), co.members.end());
         out.push_back(std::move(co));
     }
@@ -472,7 +538,8 @@ InspectBubbleResult write_inspect_outputs_for_bubble(
                     for (const auto& step : steps) {
                         tokens.push_back(hash_step_token(step));
                     }
-                    uw.sketch = build_walk_minhash_sketch(tokens, kWalkSketchShingle, kWalkSketchSize);
+                    uw.sketch = build_walk_minhash_sketch(tokens, kWalkSketchShingle, kWalkSketchSize,
+                                                          &uw.sketch_complete);
                     uw.members.push_back(row.name);
                     uniques.push_back(std::move(uw));
                 } else {

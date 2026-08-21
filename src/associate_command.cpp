@@ -1071,6 +1071,15 @@ int run_associate_command(const std::vector<std::string>& args) {
     // LMM null: eigendecompose K once, rotate phenotype + covariates, estimate the variance ratio.
     LmmNull lmm;
     if (model == "lmm") {
+        // Not quiet-suppressed: the existing GEMMA comparison checks the CORRELATION of beta and
+        // -log10(p), which can look excellent while every p-value is off by a systematic factor. No
+        // absolute per-feature tolerance on beta, standard error or p has ever been asserted against
+        // a pinned reference, so the numbers below are not independently validated and must not be
+        // described as if they were.
+        std::cerr << "[associate] WARNING: the LMM is EXPERIMENTAL and numerically unvalidated. Its "
+                     "only external check is a correlation against GEMMA, which cannot detect a "
+                     "systematic difference in beta, SE or p. Use the linear/logistic models for "
+                     "results that need to be defensible.\n";
         if (!opt.quiet) std::cerr << "[associate] LMM: eigendecomposing kinship (" << n_used << " samples)...\n";
         Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(K);
         if (es.info() != Eigen::Success) throw std::runtime_error("kinship eigendecomposition failed");
@@ -1722,9 +1731,11 @@ int run_associate_command(const std::vector<std::string>& args) {
              std::to_string(n_dropped_maf) + " (MAF) + " + std::to_string(n_dropped_fit) + " (fit)");
     if (binary) {
         // The score test is well calibrated in the body but still mildly anti-conservative in the far
-        // tail for very rare features (measured: 0.0025 against a nominal 0.001), and a regional
-        // Bonferroni threshold can sit right there. SPA is the standard remedy and is not implemented,
-        // so say so rather than let a rare binary hit be read as a calibrated discovery.
+        // tail for very rare features, and a regional Bonferroni threshold can sit right there. SPA
+        // IS implemented and is applied past |z| > 2; it moved the measured type-I error at p<0.001
+        // from 0.0025 to 0.0017 against a nominal 0.001, so roughly 1.7x rather than 2.5x. It does
+        // not remove the anti-conservatism and it is not rare-variant aggregation, so the warning
+        // stands -- what changed is that the remedy is no longer missing, only insufficient.
         std::size_t n_rare = 0, n_imbal = 0;
         for (const Row& r : rows) {
             if (std::isfinite(r.minor_freq) && r.minor_freq < 0.01) ++n_rare;
