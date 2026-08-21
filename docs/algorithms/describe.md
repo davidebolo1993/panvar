@@ -4,11 +4,13 @@ Mechanism for the `describe` module. For usage/flags see [modules/describe.md](.
 
 `describe` turns a called locus into GWAS-ready genotype features across three substrates: k-mers and node/edge dosages spelled from the graph, and one dosage per structural-variant call read back from `call`'s VCF. Each substrate is defined where it is built below; all three carry copy number as a true multiplicity, so a copy-number locus is a first-class dosage rather than a presence flag.
 
-## Graph features
+## How it works
 
-### K-mers 
+### 1. Take each haplotype's canonical walk
 
-#### Enconding and selection
+Every substrate starts from the same thing: each haplotype's walk across a bubble, canonicalized to run from one boundary to the other so two haplotypes crossing on opposite strands are comparable. A haplotype taking the direct route between the boundaries, carrying nothing between them, is a traverser like any other and is counted as one.
+
+### 2. Spell k-mer features from the walk
 
 Each k-mer is packed into a 2-bit integer (`A=0, C=1, G=2, T=3`) and canonicalised — replaced by whichever of the k-mer and its reverse complement has the smaller code — so a sequence and its reverse strand count as one feature. At `k=4`, for instance, each base is a 2-bit digit (`A=00, C=01, G=10, T=11`) concatenated left-to-right into one integer, first base most-significant: `GACT` = `10 00 01 11` in binary = `2·4³ + 0·4² + 1·4 + 3` = 135, and its reverse complement `AGTC` = `00 10 11 01` = `0·4³ + 2·4² + 3·4 + 1` = 45, so the canonical form is `AGTC` (the smaller code). The BIMBAM matrix names features compactly (`K1, K2, …`), and the feature map keeps the resolution back to the DNA string and its node provenance.
 
@@ -23,7 +25,7 @@ CACG    CA AC CG             AC @ 1         DROP (middle)
 
 so `GACACG` contributes the single syncmer `ACAC`; passing `--feature-mode all` instead keeps every canonical k-mer (`GACA, ACAC, CACG`). The default `k=31` suits assembled haplotypes.
 
-#### Counting and filtering
+### 3. Count and filter to the discriminative features
 
 Each retained feature is then counted per haplotype, and because the count is a true multiplicity rather than a presence flag, a copy-number expansion is recorded faithfully (three copies of a k-mer show as 3, not 1). A feature is kept by a two-part rule (`--min-paths N`, default 1):
 
@@ -42,11 +44,11 @@ K4        1,1,1,1,0          4/1              1=1 no        DROP (all-but-one)
 
 `--min-paths 0` disables rule 2 (keeps every non-constant feature). The same filter applies to node/edge dosage features.
 
-#### Provenance
+### 4. Record where each feature came from
 
 Because k-mers are spelled from the bubble's node sequences, each kept k-mer records the set of graph nodes its occurrences touch (in the feature map). So a significant marker maps back to a node/edge in the bubble — and to the variant `call` makes there. The pooled cohort survivors are written as BIMBAM mean-genotype dosage (`bimbam_{kmers,graph}.bimbam.gz`).
 
-## Node and edge dosage
+### 5. Take node and edge dosage from the same walks
 
 Built from the same canonical walks as the k-mers:
 
@@ -59,7 +61,7 @@ The flank has two granularities, deliberately. For k-mers it admits exactly N ba
 
 A traversal does not require an interior node. A path taking the direct source→sink edge — a pure deletion, or the short side of an insertion — is a traverser of the bubble and receives a dosage of `0` at the nodes it skips, not `NA`. Requiring an interior node meant such a path was not observed at all, and the node that discriminates the deletion was then discarded as non-discriminative because only its carriers had been seen: the site produced no features whatever.
 
-## Variant features
+### 6. Read the variant substrate from the call output
 
 The k-mer and graph substrates are spelled from the graph itself. The third substrate (`--variant-vcf`) is different: it reads `call`'s region VCF back and emits one genotype row per SV call, so the feature that gets tested is the variant `call` already typed rather than a fragment of it. Its samples (VCF columns) are the haplotype paths, and each record contributes one BIMBAM row whose dosage is read off `FORMAT`:
 
@@ -80,3 +82,25 @@ multi V3   GT (2 alleles)  1       2       0       .         →  V3_a1   1,  0,
 The `DUP` keeps a reference-like sample's actual copy number (`h2` shows `2`, not `0`), so a loss and a gain are both testable dosages rather than a folded presence flag.
 
 Unlike the k-mer/graph substrates, the variant layer runs no discriminative filter — it emits every call and leaves frequency pruning to `associate`. The point of the layer is the multiple-testing denominator: the many k-mers and nodes inside one event are correlated, so testing them all inflates the count of independent tests; one dosage per variant is the statistically honest GWAS unit. The sidecar `feature_annot.variant.tsv.gz` (in the `variant/` folder) carries each row's `svtype`, `gene`, `AF`, and `AN` for the traceback, and `--samples` sums a sample's haplotype dosages into the diploid `sample/variant/bimbam_variant.bimbam.gz`.
+
+## Worked trace
+
+The steps below follow the six above, one for one. One bubble, boundaries `a` and `b`, with an interior node `v` that three haplotypes carry and three delete outright:
+
+```text
+ref  : a v b
+h1-h3: a v b        carry the interior
+h4-h6: a   b        take the direct route, deleting it
+```
+
+1. Take each haplotype's canonical walk. All seven cross the bubble, including the three that carry nothing between the boundaries. Counting only the carriers would leave the feature that distinguishes them observed on one side only.
+
+2. Spell k-mer features from the walk. Each walk is spelled and scanned, so the carriers yield k-mers spanning `v` and its junctions with the flanks, while the deleting haplotypes yield k-mers spanning the junction the deletion creates, which the carriers do not have.
+
+3. Count and filter to the discriminative features. A k-mer carried by all seven is constant and is dropped; the ones spanning `v` and the ones spanning the deletion junction each split the panel three against three and are kept.
+
+4. Record where each feature came from. Each kept k-mer records the nodes its occurrences touch and the bubble it belongs to, so a significant marker can be traced back to a site and, through the call output, to a variant.
+
+5. Take node and edge dosage from the same walks. Node `v` reads 1 for the carriers and 0 for the others; the edge from `a` straight to `b` reads 1 for the deleting haplotypes and 0 for the carriers. A haplotype not reaching the bubble at all would read as missing rather than zero.
+
+6. Read the variant substrate from the call output. With a VCF supplied, the deletion at this bubble also appears as one dosage row taken from each haplotype's genotype, which is the same split expressed at the level of the call rather than of the graph.

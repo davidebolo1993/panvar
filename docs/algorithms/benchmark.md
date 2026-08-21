@@ -6,7 +6,9 @@ Mechanism for the `benchmark` module. For usage/flags see [modules/benchmark.md]
 
 Every reference-traversed bubble is scored by default. A bubble the reference does not traverse has no baseline and is dropped — counted in the `excluded` scope, never silently.
 
-## One decomposition
+## How it works
+
+### 1. Decompose each haplotype against the reference
 
 For each scored bubble, for each haplotype that traverses it:
 
@@ -18,7 +20,7 @@ Size it, and attribute it. `ref_bp` and `hap_bp` sum the node lengths on each si
 
 Event size is a property of the two walks alone. It does not move with the alignment, the threshold, the calls or the reconstruction, which is what makes it usable as truth.
 
-## The truth ledger
+### 2. Classify the truth events
 
 Each block with a non-zero size is one truth event:
 
@@ -30,13 +32,13 @@ Each block with a non-zero size is one truth event:
 
 `called` says a specific emitted record shares at least one node with this block. It does not say the record spans the block, represents it correctly, or that this haplotype was genotyped as carrying it. So the two negatives differ in strength: `missed` is firm — nothing emitted touches the event — while `called` is an upper bound on discovery. And it is not a genotyping statement: at ACOT bubble 7, 145 haplotypes have an above-threshold event attributed to a record and are genotyped `0` at every record of the bubble.
 
-### Why not classify from the alignment
+#### Why not classify from the alignment
 
 The residual used to be split by contiguous non-match run length in the reconstruction-vs-truth alignment: runs shorter than `--min-sv-bp` were called "variation that could not have been called", runs at or above it "callable-size events missed". That measures the edit path, not the event.
 
 A clean 60 bp deletion of ordinary non-repetitive sequence, aligned globally by edlib, comes back as fourteen runs of 1–10 bases — the co-optimal edit path distributes the gap over chance matches, and every distribution costs the same 60 edits. Consequently `resid_run_ge_bp` read 0 at all six reference loci: the bucket meant to hold missed callable-size events was structurally empty, and so was the carrier truth flag built on it. The columns survive as `resid_run_lt_bp` / `resid_run_ge_bp`, describing the residual's shape and nothing more.
 
-## Three reconstructions
+### 3. Reconstruct at each level
 
 Each walks the reference and substitutes the haplotype's own steps at the blocks its rule accepts.
 
@@ -71,22 +73,10 @@ A false positive is not a representation failure. Where the haplotype has no eli
 
 Each reconstruction is globally aligned (Needleman–Wunsch, edlib) to the truth, giving `δ` and `S`. Identity is `1 − Σδ/ΣS` length-weighted over a haplotype's bubbles; `QV = -10·log10(max(0.5, δ)/S)` with ceiling `QV_max = 10·log10(2S)` and `qv_ratio = QV/QV_max` are emitted for comparability.
 
-## Worked trace
 
-Two bubbles, each 5 nodes of 10 bp; the reference spells `1,2,3,4,5` then `6,7,8,9,10`. Haplotype H:
+### 4. Reconstruct from the VCF alone
 
-| bubble | reference walk | H's true walk | call at this bubble |
-|--------|----------------|---------------|---------------------|
-| A | `1,2,3,4,5` | `1,3,4,5` (node 2 deleted) | DEL of node 2 (node 2 ∈ `variant_nodes`) |
-| B | `6,7,8,9,10` | `6,7,8′,9,10` (8′ is a SNP) | none (8′ ∉ `variant_nodes`) |
-
-Bubble A — anchors `1,3,4,5`. One divergent block between anchors `1` and `3`: reference side `[2]` (10 bp), haplotype side `[]` (0 bp). Size `max(10,0) = 10`. At `--min-sv-bp 50` that is `below_threshold`; at `--min-sv-bp 5` it is `called`, since node 2 is a record's node. Both reconstructions that accept it drop node 2, giving `1,3,4,5` = truth. δ=0, S=40.
-
-Bubble B — anchors `6,7,9,10`. Block between `7` and `9`: reference `[8]`, haplotype `[8′]`, both 10 bp, size 10, attributed to no record. `below_threshold` at 50 bp, `missed` at 5 bp. Neither reconstruction substitutes it, so the reconstruction is the reference `6,7,8,9,10` against truth `6,7,8′,9,10`: δ=1 (one substituted base — the nodes differ by a SNP), S=50.
-
-Aggregate: `Σδ = 1`, `ΣS = 90`, identity `= 1 − 1/90 = 0.989`. The ledger says: at 50 bp, two below-threshold events and nothing missed; at 5 bp, one called and one missed. The identity is the same number in both cases — which is the point of keeping the two apart.
-
-## The `genotype` level
+#### The `genotype` level
 
 With `--vcf`, a reconstruction that uses only what the VCF says about this haplotype, in sequence space, which is what a downstream consumer actually has.
 
@@ -118,3 +108,31 @@ variation_recovered = (baseline_delta - <level>_delta)  /  baseline_delta
 The baseline is also the correctness check on the whole projection: a haplotype genotyped as carrying nothing applies no edits, so its genotype reconstruction must be byte-identical to the baseline. Any coordinate, orientation or span error breaks that equality, and it is asserted on real data rather than assumed.
 
 Carrier confusion. Each (haplotype, bubble) contributes to a TP/FP/FN/TN table: called carrier is `GT ≥ 1` on any record at the bubble; true carrier is whether the ledger holds an event of at least `--min-sv-bp` there. Truth therefore comes from the walks, not from an alignment. Reported for `ALL` only — a bubble-level judgement has no single SV type, and fanning it out over every type in the bubble counted one observation several times; the per-type partition is the ledger, where each event maps to at most one record.
+
+### 5. Partition the residual and compare against a baseline
+
+The genotype residual is split into five consecutive terms that sum to it exactly: variation below the size threshold, eligible events no record covers, events covered but not genotyped onto this haplotype, sequence a record covers and carries but does not reproduce, and edits applied where there is no eligible truth event. The last two are signed, since the genotype level applies every record the haplotype carries rather than only attributed eligible blocks and can therefore beat the block-based ceiling locally.
+
+Every comparative figure is taken over the common set, the haplotype-and-bubble observations all levels could score, so two totals are never compared over different populations.
+
+A do-nothing baseline, the plain reference with no edits, is the denominator of `gap_closed` and `variation_recovered`. It is also the metric's own correctness check: a haplotype genotyped as carrying nothing must reconstruct byte-identically to it, so a coordinate or orientation error shows up immediately rather than hiding inside a plausible score.
+
+## Worked trace
+
+The steps below follow the five above, one for one. Two bubbles, each five nodes of 10 bp; the reference spells `1,2,3,4,5` then `6,7,8,9,10`. Haplotype H:
+
+| bubble | reference walk | H's true walk | call at this bubble |
+|--------|----------------|---------------|---------------------|
+| A | `1,2,3,4,5` | `1,3,4,5`, node 2 deleted | a deletion of node 2, whose node is in the call's node set |
+| B | `6,7,8,9,10` | `6,7,8',9,10`, a substitution | none, since node 8' is in no call's node set |
+
+1. Decompose each haplotype against the reference. At bubble A the shared anchors are `1,3,4,5`, leaving one divergent block between anchors `1` and `3`: the reference side holds node 2 and the haplotype side nothing. At bubble B the anchors are `6,7,9,10`, leaving a block between `7` and `9` holding one node on each side.
+
+2. Classify the truth events. Both blocks are 10 bp, under a 50 bp threshold, so both are below threshold: the caller was never asked to emit either. The ledger records two below-threshold events and nothing missed, which is the firm statement here — nothing eligible went unfound.
+
+3. Reconstruct at each level. Bubble A's block shares a node with a call, so the graph level substitutes the haplotype's true steps there; the called and carrier levels do not, because the block is under the size threshold. Bubble B's block shares a node with nothing, so no level substitutes it and its 10 bp stays as reference at every level.
+
+4. Reconstruct from the VCF alone. The genotype level applies only the edits H's genotype names. The deletion at bubble A is emitted and carried, so it is applied; nothing is emitted at bubble B, so that substitution is left as reference.
+
+5. Partition the residual and compare against a baseline. The residual that remains is one base at the substitution H carries and no record describes. It falls under variation below the size threshold rather than under discovery, since no eligible event was missed. Aggregating, the total difference is 1 against 90 aligned bases, an identity of 0.989.
+
