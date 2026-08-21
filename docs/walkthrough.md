@@ -211,7 +211,10 @@ The per-gene headline is per-haplotype reconstruction **identity** (`1 − Σδ/
 
 - **Graph ceiling** — near 100% at every locus, because it implants the haplotype's own true block wherever a call shares a node with it. This is a bound on the graph and the discovery, not a genotyping result.
 - **From the VCF alone** — the reference plus only the edits this haplotype's `GT` names. 85.3% at LPA to 99.7% at ANKRD36C.
+- **Where the loss lives** — the residual partitioned into five terms that sum to it exactly. Reading left to right they are one question per step: *did we even try* (sub-threshold, never asked for), *did we find it*, *did we put it on the right haplotype*, *did we describe it correctly*, *did we add something that is not there*. The last is signed, because a spurious edit occasionally helps.
 - **Variation found** — the residual split into Below threshold (sub-threshold, correctly not called) vs Missed (≥ threshold and not called). Missed is zero everywhere.
+
+The third panel is the one worth reading first. **`Not found` is 0.00% at all six loci** — the caller finds every eligible truth event and puts it on the right haplotypes — and essentially the whole residual is `Wrongly represented`, from 2.3% of the baseline distance at ACOT to 56.0% at CYP2D6. The loss is in how the region VCF *encodes* what it found, not in discovery or genotyping. That is also why the allele VCF, which spells each allele out instead of describing it, closes the gap completely.
 
 ![Round-trip reconstruction anatomy](img/benchmark_qv.png)
 

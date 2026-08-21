@@ -18,59 +18,22 @@ restore it with `-DPANVAR_ENABLE_EXPERIMENTAL_GENOTYPE=ON`.
 
 ## Release-wide items
 
-### Output transaction correctness
+All five release items from the 2026-08-21 audit are closed. Recorded here only so the next reader
+knows what was checked rather than assumed:
 
-- **[RELEASE] Repair the shared rollback state machine.** `cli::StagedOutputs::commit()` moves an old
-  destination to a reserve, calls `commit_staged()`, and only then appends that destination to
-  `installed`. If installation fails after the set-aside, the current reserve is absent from
-  `installed`, so rollback never restores it. The existing fault injection fails *before* the
-  set-aside and therefore cannot expose this path. Register the current destination and reserve as
-  soon as the set-aside succeeds, track whether the new file was installed, and inject a failure after
-  set-aside/before installation. Assert that old files are restored, new-only files are absent, and no
-  `*-prev`/`*-tmp` files remain.
-
-  `commit_staged()` also falls back from a sibling rename to copying directly over the final path and
-  then removes the staged file even if the copy reported an error. That fallback is not atomic and can
-  damage the destination it is supposed to protect. Because staging files are siblings of their
-  destinations, either refuse an unexpected cross-filesystem rename or copy to another sibling and
-  atomically rename that complete copy.
-
-- **[RELEASE] Give `associate` the same output contract as the other commands.** It writes
-  `.assoc.tsv` and `.summary.tsv` directly, has no output/input collision preflight, and does not
-  explicitly close/check either stream. A late failure can leave a mixed family, and an output can
-  alias a genotype, phenotype, covariate, annotation, or kinship input. Use `StagedOutputs`,
-  `reject_output_collisions`, and checked close before the shared commit; cover replacement and failure
-  rollback in `associate_stats.sh`.
-
-- **[RELEASE] Finish Describe's independent directory transaction.** Its restore loop restores old
-  owned entries but does not remove a newly installed entry that had no predecessor if a later install
-  fails; restore errors are ignored. Track every installed destination, remove this run's new entries
-  in reverse order, restore every reserve, and report any reserve that could not be restored. Add fault
-  injection. Also reject an input whose canonical path is an owned output such as
-  `bubble_<digits>` inside `--out-dir`, or the commit can consume it and then replace it.
-
-### Packaging and platform contract
-
-- **[RELEASE] Decide whether the install is CLI-only or a supported C++ package.** The installed CLI
-  was smoke-tested successfully. The exported library package is not consumable as shipped:
-  `panvarTargets.cmake` refers to non-exported `abpoa` and `minigraph` targets and to `ZLIB::ZLIB`
-  without a package config that discovers dependencies. Experimental genotype headers are also
-  installed in the default build although their implementations are omitted. The small, honest release
-  fix is to install only the executable. If a C++ API is intended, add `panvarConfig.cmake`, dependency
-  discovery/export, an intentional public-header set, and a clean external consumer compile/link test.
-
-- **[RELEASE] Run a clean Linux/ELF build and test job, or state that this release is macOS-only.** The
-  clean AppleClang release build and all 10 enabled tests pass; an AddressSanitizer/UndefinedBehaviorSanitizer
-  build also passes those tests. Linux remains important because minigraph uses a separate ELF symbol
-  localization path. CI should configure from an empty tree, build with genotype off, run the default
-  suite, run the slow rebuild test at least in a scheduled/release job, install, and execute the
-  installed binary.
-
-### Small release cleanup
-
-- **[LATER] Remove the clean-build warning in benchmark.** `tot_carrier_aln` is accumulated but never
-  read (`src/benchmark_command.cpp`); either report the denominator it was intended to preserve or
-  delete it. This is not a behavioural defect.
+- Shared rollback registers a destination as soon as the SET-ASIDE succeeds, so the window between
+  moving the old file aside and installing the new one is owned. `commit_staged()` no longer copies
+  onto the destination; it copies to a second sibling and renames that complete copy into place.
+  `PANVAR_TEST_FAIL_COMMIT_AFTER_SETASIDE` reaches the window that the previous fixture could not.
+- `associate` uses `reject_output_collisions`, `StagedOutputs` and checked closes.
+- Describe's directory transaction removes this run's new entries on rollback and reports a reserve it
+  could not restore; an input under an owned output name is refused.
+- The install is CLI-only (`bin/panvar`). No C++ package is advertised.
+- CI configures from an empty tree on Linux and macOS, asserts genotype is absent from the default
+  build, installs and runs the installed binary; a second job builds with genotype ON; the slow suite
+  runs on a schedule and on demand.
+- Benchmark's clean-build warning is gone: `tot_carrier_aln` was the denominator that turns
+  `carrier_recon delta` into an identity, and is now reported as `carrier_recon aln_len`.
 
 ## Associate
 
@@ -87,9 +50,10 @@ restore it with `-DPANVAR_ENABLE_EXPERIMENTAL_GENOTYPE=ON`.
   this tier.
 - **[LIMIT] Variant-tier LD/Meff is region-scale.** LD clumping computes all feature pairs and the Li-Ji
   estimator materializes an `n_tests × n_tests` correlation matrix followed by a full symmetric
-  eigendecomposition: quadratic memory/work to form it and cubic eigensolve time, with no cap. Add a
-  projected-memory/work guard and an auditable fallback (raw Bonferroni or block/clump Meff) before
-  describing this as cohort/genome-scale.
+  eigendecomposition: quadratic memory to form it and cubic time to solve it. A guard is now in place —
+  a matrix-size note above 5,000 tested variants and, above 20,000, a fall back to LD-clumping Meff or
+  raw Bonferroni with `meff_method` recording which was used. Exceeding the cap is not an error because
+  Meff only refines the correction. This is still not a genome-scale estimator.
 
 ### Deferred capability and validation
 
@@ -116,8 +80,8 @@ restore it with `-DPANVAR_ENABLE_EXPERIMENTAL_GENOTYPE=ON`.
 
 ### Validation debt
 
-- **[TEST] Add the real ANKRD36C disjointness regression.** The synthetic nested-snarl test is good, but
-  an opt-in real fixture should assert pairwise-disjoint interiors and successful Panphorte preflight.
+- **[TEST] DONE** — `tests/real_regressions.sh` asserts pairwise-disjoint ANKRD36C interiors across 10
+  sites and a successful Panphorte preflight on that set. Opt-in under `PANVAR_SLOW_TESTS`.
 
 ## Call
 
@@ -142,10 +106,13 @@ restore it with `-DPANVAR_ENABLE_EXPERIMENTAL_GENOTYPE=ON`.
   provenance, zero/reference-like traversers, and invariance of CNBP/allele serialization. No reviewed
   locus currently has more than one REP node at a site, so this is a capability gap rather than a
   current miscall.
-- **[TEST] Add a repeated-boundary MODULE_BP/CNBP fixture.** Exercise forward and reverse traversal,
-  pin `CN_SPAN_AMBIGUOUS`, and prove CN, CNBP, `CN_MODULE_REF_BP`, POS, and END all describe the same
-  chosen occurrence span. Existing repeated-node event tests do not create a CN record with a repeated
-  source/sink.
+- **[TEST] DONE, and it corrected a documented invariant.** `call_stats.sh` now builds a reference
+  visiting both module boundaries twice. `END − POS = CN_MODULE_REF_BP` was stated as the placement
+  check for module records; it holds only while every boundary is visited once. POS/END are the widest
+  span, CN_MODULE_REF_BP and CNBP sum node length × multiplicity over the module nodes, and with a
+  repeated boundary the two differ by exactly the boundary visits between the outermost occurrences —
+  measured 700 against 600. `CN_SPAN_AMBIGUOUS` is the flag that says the identity does not apply.
+  `docs/algorithms/call.md` is corrected.
 
 ## Benchmark
 
@@ -194,10 +161,9 @@ worse at lower thresholds, and the validator reports that as a call interaction.
 
 ### Validation debt
 
-- **[TEST] Strengthen the deletion-positive-marker fixture.** It currently proves only that the k-mer
-  matrix is non-empty. Pin the observed ALT-exclusive junction syncmers: carried by every bypass
-  deletion haplotype and by no reference/full/truncated path. Also report ALT-exclusive junction-marker
-  counts for real deletions; repetitive junctions cannot be guaranteed unique.
+- **[TEST] DONE** — the fixture pins the ALT-exclusive junction syncmers (carried by all three bypass
+  haplotypes, by no path keeping the interior) and reports how many there are: three here. Counting
+  rather than thresholding, because a repetitive junction cannot be guaranteed unique.
 
 ## Rebuild
 
@@ -217,8 +183,8 @@ worse at lower thresholds, and the validator reports that as a call interaction.
 - **[TEST] Make integration fixtures non-degenerate.** Require a rebuild that really runs and reports
   unchanged metrics, and add an ambiguity-containing `k > 31` seed fixture. Current N handling and
   `k=41` strand canonicalization are tested separately.
-- **[TEST] Round-trip an accepted rebuilt file through downstream parsing and bubble detection.** This
-  is the remaining check that emitted GFA semantics cannot drift from in-memory acceptance.
+- **[TEST] DONE** — `real_regressions.sh` rebuilds C4, re-reads the accepted GFA with `bubble`, and
+  asserts it decomposes with pairwise-disjoint interiors.
 
 Audit precision, graph-first/audit-second disposition, checked Refine streams, and declaration of
 `PANVAR_SLOW_TESTS` are closed and intentionally absent from this list.
@@ -230,9 +196,10 @@ Audit precision, graph-first/audit-second disposition, checked Refine streams, a
 - **[TEST] Add the defining before/after-call fixture.** Construct a reproducible pggb-style artifact
   that calls as split INS+DEL before refinement and as the intended clean event afterwards; assert both
   exact record sets and unchanged haplotype spellings.
-- **[TEST] Measure POA guard coverage on all six loci.** Record regions skipped separately by
-  `--max-poa-bp`, `--max-poa-work`, and `--max-walks`, so safer accounting is not mistaken for unchanged
-  biological coverage.
+- **[TEST] DONE, reported rather than thresholded** — `real_regressions.sh` prints refine's decisions
+  per locus (lpa 7 rebuilt/5 skipped, c4 3/2, gstm1 8/1, cyp2d6 5/4, acot 7/2, ankrd36c 5/5) and fails
+  only if no locus rebuilds anything. The per-guard breakdown is still owed; today the report gives the
+  decision, not which bound produced it.
 
 ## Inspect
 
@@ -243,13 +210,11 @@ Audit precision, graph-first/audit-second disposition, checked Refine streams, a
 
 ### Validation and hardening debt
 
-- **[LATER] Compare surviving graph support with the CSV.** Present nodes and at least one crossing are
-  required, but a stale graph with the same IDs and only some original paths can still pass. Compare or
-  warn on emitted crossings versus CSV `path_support`.
-- **[TEST] Pin derived-output collision and present-nodes/no-crossing directly.** Both branches exist but
-  lack focused assertions in `inspect_stats.sh`.
-- **[LATER] Explicitly close and check every TSV stream.** The writer's local streams are destroyed before
-  family commit, but destructor close cannot report a late disk error.
+- **[LATER] DONE** — emitted crossings are compared against the CSV's `path_support` and a mismatch is
+  named. Not an error, since a legitimate path-dropping transform produces one.
+- **[TEST] DONE** — both are pinned, plus a stale-panel case: a graph carrying fewer paths than the CSV
+  records now warns (2 crossings against `path_support=3`) and a matching panel stays silent.
+- **[LATER] DONE** — all four inspect TSV streams are closed and checked before the family commit.
 
 ## Panphorte
 
@@ -274,8 +239,8 @@ Audit precision, graph-first/audit-second disposition, checked Refine streams, a
   that reaches `copies_declined_partial_boundary`/`--allow-partial-boundary`, or remove the dead option,
   status columns, and stale comments. Rename the surviving-route diagnostic from “rewritten paths” to
   “replaced spans” if it still counts edits.
-- **[TEST] Add a Panphorte-family rollback fixture after the shared transaction repair.** The present
-  injected rollback test runs through Bubble only.
+- **[TEST] DONE** — `panphorte_stats.sh` pins both failure windows on the panphorte family, with the
+  graph and report byte-checked and no residue.
 
 ## Verification snapshot (2026-08-21)
 

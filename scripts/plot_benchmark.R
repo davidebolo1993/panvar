@@ -28,6 +28,8 @@ usage <- function(status = 0) {
     "  Rscript plot_benchmark.R --table <combined.tsv> --out <prefix> [options]",
     "",
     "Required:",
+    "  --loss <path>            optional per-locus loss partition (results/benchmark_loss.tsv);",
+    "                           adds the 'Where the loss lives' panel",
     "  --table <path>           per-haplotype benchmark rows; needs the columns locus, sum_aln_len,",
     "                           sum_delta, truth_missed_bp, truth_below_bp (from `panvar benchmark`)",
     "",
@@ -54,6 +56,7 @@ get <- function(f, d = NULL) {
 }
 numarg <- function(f, d) { v <- suppressWarnings(as.numeric(get(f, d))); if (is.na(v)) as.numeric(d) else v }
 tp <- get("--table"); out <- get("--out", "benchmark")
+lp <- get("--loss", "")
 per_row <- as.integer(numarg("--per-row", "30")); if (per_row < 1) per_row <- 30L
 top <- as.integer(numarg("--top", "0"))
 left_ymin <- numarg("--left-ymin", "0"); dpi <- numarg("--dpi", "150")
@@ -94,11 +97,14 @@ right <- mkdf(c("Below threshold" = "ncall", "Missed" = "mis"))
 left$locus  <- factor(left$locus,  levels = lv); left$component  <- factor(left$component,  levels = c("Reconstructed", "Residual"))
 right$locus <- factor(right$locus, levels = lv); right$component <- factor(right$component, levels = c("Below threshold", "Missed"))
 
-panel <- function(df, cols, ymin, ymax, title) {
+panel <- function(df, cols, ymin, ymax, title, legend_rows = 1) {
   ggplot(df, aes(locus, value, fill = component)) +
     geom_col(width = 0.85, position = position_stack(reverse = TRUE)) +
     facet_wrap(~row, ncol = 1, scales = "free_x") +
-    scale_fill_manual(values = cols, name = NULL) +
+    # A five-term legend does not fit on one row beside three other panels, and the entry that gets
+    # clipped is the last one -- which here is the SIGNED term, the one most in need of its label.
+    scale_fill_manual(values = cols, name = NULL,
+                      guide = guide_legend(nrow = legend_rows, byrow = TRUE)) +
     coord_cartesian(ylim = c(ymin, ymax)) +
     labs(x = "gene", y = "% of aligned sequence", title = title) +
     theme_bw(base_size = 10) +
@@ -123,18 +129,53 @@ if (has_gt) {
                 max(0, min(a$gtrecon) - 5), 100, "From the VCF alone (what a consumer gets)")
 }
 
+# The loss partition: five consecutive terms that sum EXACTLY to the genotype residual, so the panel
+# answers WHY reconstruction falls short rather than by how much. Read left to right it is one
+# question per step -- did we even try (out_of_scope, below the size threshold and never asked for),
+# did we find it (discovery), did we put it on the right haplotype (carrier_missed), did we describe
+# it correctly (representation), did we add something that is not there (false_positive_damage).
+# The last term is SIGNED: an edit applied where there is no eligible truth event occasionally helps.
+has_loss <- FALSE
+if (nzchar(lp) && file.exists(lp)) {
+  L <- read.delim(lp, check.names = FALSE, stringsAsFactors = FALSE)
+  L <- L[L$locus %in% a$locus & L$baseline_bp > 0, , drop = FALSE]
+  if (nrow(L) > 0) {
+    has_loss <- TRUE
+    terms <- c("Not attempted (sub-threshold)" = "out_of_scope",
+               "Not found"                      = "discovery_or_attribution",
+               "Wrong haplotype"                = "carrier_missed",
+               "Wrongly represented"            = "representation",
+               "Spurious edits"                 = "false_positive_damage")
+    loss <- do.call(rbind, lapply(names(terms), function(cn)
+      data.frame(locus = L$locus,
+                 row = a$row[match(L$locus, a$locus)],
+                 component = cn,
+                 value = 100 * L[[terms[[cn]]]] / L$baseline_bp,
+                 stringsAsFactors = FALSE)))
+    loss$locus <- factor(loss$locus, levels = lv)
+    loss$component <- factor(loss$component, levels = names(terms))
+    p_loss <- panel(loss,
+                    c("Not attempted (sub-threshold)" = "#bdbdbd",
+                      "Not found"                     = "#d73027",
+                      "Wrong haplotype"               = "#fc8d59",
+                      "Wrongly represented"           = "#4575b4",
+                      "Spurious edits"                = "#984ea3"),
+                    min(0, min(loss$value)), max(loss$value) * 1.1,
+                    "Where the loss lives (% of baseline)", legend_rows = 3)
+  }
+}
+
 ncol <- if (has_gt) 3 else 2
+if (has_loss) ncol <- ncol + 1
 w <- max(9, min(30, ncol * (0.30 * per_row + 1.2)))
 h <- 1.2 + 2.3 * nr
 png(paste0(out, ".png"), width = w, height = h, units = "in", res = dpi)
 grid.newpage()
 pushViewport(viewport(layout = grid.layout(1, ncol)))
-print(p_left,  vp = viewport(layout.pos.row = 1, layout.pos.col = 1))
-if (has_gt) {
-  print(p_gt,  vp = viewport(layout.pos.row = 1, layout.pos.col = 2))
-  print(p_right, vp = viewport(layout.pos.row = 1, layout.pos.col = 3))
-} else {
-  print(p_right, vp = viewport(layout.pos.row = 1, layout.pos.col = 2))
-}
+col <- 1
+print(p_left, vp = viewport(layout.pos.row = 1, layout.pos.col = col)); col <- col + 1
+if (has_gt)   { print(p_gt,   vp = viewport(layout.pos.row = 1, layout.pos.col = col)); col <- col + 1 }
+if (has_loss) { print(p_loss, vp = viewport(layout.pos.row = 1, layout.pos.col = col)); col <- col + 1 }
+print(p_right, vp = viewport(layout.pos.row = 1, layout.pos.col = col))
 invisible(dev.off())
 cat(sprintf("wrote %s.png  (%d genes, %d row(s), %d per row; left y %g-100)\n", out, nrow(a), nr, per_row, left_ymin))

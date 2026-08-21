@@ -338,9 +338,29 @@ for region in "${REGIONS[@]}"; do
             next }
     { line = L; for (k = 1; k <= n; k++) line = line "\t" $at[w[k]]; print line }' "$bh" >> "$QV_TABLE"
 done
+# The loss partition, per locus: five consecutive terms that sum EXACTLY to the genotype residual.
+# It lives in each locus's qv_summary.tsv rather than the per-haplotype table, so it is collected here
+# for the plot. It is the only view that says WHY reconstruction falls short rather than by how much.
+LOSS_TABLE="$REPO/results/benchmark_loss.tsv"
+printf 'locus\tbaseline_bp\tout_of_scope\tdiscovery_or_attribution\tcarrier_missed\trepresentation\tfalse_positive_damage\n' > "$LOSS_TABLE"
+for region in "${REGIONS[@]}"; do
+  qs="$OUT/$region/benchmark/benchmark.qv_summary.tsv"
+  [[ -s "$qs" ]] || continue
+  awk -F'\t' -v L="$region" '
+    $1=="gt_gap"  && $3=="baseline_delta"           { base=$4 }
+    $1=="loss_bp" && $3=="out_of_scope"             { a=$4 }
+    $1=="loss_bp" && $3=="discovery_or_attribution" { b=$4 }
+    $1=="loss_bp" && $3=="carrier_missed"           { c=$4 }
+    $1=="loss_bp" && $3=="representation"           { d=$4 }
+    $1=="loss_bp" && $3=="false_positive_damage"    { e=$4 }
+    END { if (base != "") printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", L, base, a+0, b+0, c+0, d+0, e+0 }' \
+    "$qs" >> "$LOSS_TABLE"
+done
+echo "wrote $LOSS_TABLE"
+
 if [[ $(wc -l < "$QV_TABLE") -gt 1 ]] && have_r; then
-  "$RS" "$HERE/plot_benchmark.R" --table "$QV_TABLE" --out "$REPO/results/benchmark_qv" --per-row 12 \
-    || echo "  (benchmark plot skipped)"
+  "$RS" "$HERE/plot_benchmark.R" --table "$QV_TABLE" --loss "$LOSS_TABLE" \
+    --out "$REPO/results/benchmark_qv" --per-row 12 || die_or_warn "benchmark plot"
 fi
 write_manifest
 if [[ "$FAILURES" -gt 0 ]]; then
