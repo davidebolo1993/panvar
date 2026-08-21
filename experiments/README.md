@@ -1,3 +1,15 @@
+# Genotype experiments — NOT part of the release
+
+Everything here belongs to `genotype`, the one module excluded from the default build
+(`-DPANVAR_ENABLE_EXPERIMENTAL_GENOTYPE=ON` restores it). These scripts neither change nor import the
+production modules. They are kept in the tree because their results are cited in
+`docs/reports/genotype-round2-verification.md` and re-deriving them is expensive; they are not
+maintained to the standard the shipped modules are held to, and nothing in the pipeline runs them.
+
+Untracked `.tsv` output alongside these scripts is run output, not input.
+
+---
+
 # Multiplicity-aware genotyper proof-of-concept
 
 This experiment is deliberately outside `src/` and `tests/`: it neither changes nor imports the
