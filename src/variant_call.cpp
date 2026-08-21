@@ -93,8 +93,8 @@ std::vector<Tok> collapse_walk(
 }
 
 // A typed event derived from one haplotype walk vs the reference walk.
-// How a DUP record's CN was obtained. Three genuinely different measurements, and a consumer cannot
-// interpret CN, RU_LEN or SVLEN without knowing which one it is looking at:
+// How a DUP record's CN was obtained. Three different measurements, and CN, RU_LEN and SVLEN cannot be
+// interpreted without knowing which:
 //   Rep       a panphorte REP self-loop -- an exact traversal count of a literal repeat unit
 //   ModuleBp  folded-node bp divided by a reference-calibrated unit; the module may hold several
 //             paralogs, so its "unit" is the SHARED per-copy content, not a whole copy
@@ -228,21 +228,16 @@ bool is_inversion(const std::vector<const Tok*>& ref_blk, const std::vector<cons
     return true;
 }
 
-// Align one sub-range R[r0,r1) vs H[h0,h1) with the node-token DP (diagonal only on
-// equal tokens; else gaps) and append the DEL/INS/INV events to `events`.
-// `preceding_ref_node` anchors an INS that opens the segment (the last matched ref
-// node before it). Bounded by kAlignCellCap; segments between shared anchors are small.
-// Segments abandoned because the node-token DP would exceed its cell cap. Each one is a divergent
-// block that produced NO variant records, so it is a false negative -- and one that used to vanish
-// unless PANVAR_CALL_DEBUG happened to be set. Counted here and reported at the end of the run.
-//
-// Process-global because diff_segment runs under the per-bubble parallelism and threading a counter
-// through it would touch every frame between. call_variants resets it on entry, so the figure is
-// per-run rather than cumulative -- without that, a second call in one process reports the first
-// call's skips as its own. That reset assumes call_variants is not run concurrently with itself in
-// one process, which is true of every command path here.
+// Segments abandoned because the node-token DP would exceed its cell cap. Each is a divergent block
+// that produced no variant records, so it is a false negative and has to be reported rather than
+// dropped silently. Process-global because diff_segment runs under the per-bubble parallelism;
+// call_variants resets it on entry, so the count is per-run rather than cumulative.
 std::atomic<std::size_t> g_skipped_segments{0};
 
+// Align one sub-range R[r0,r1) vs H[h0,h1) with the node-token DP (diagonal only on equal tokens; else
+// gaps) and append the DEL/INS/INV events to `events`. `preceding_ref_node` anchors an INS that opens
+// the segment (the last matched ref node before it). Bounded by kAlignCellCap; segments between shared
+// anchors are small.
 void diff_segment(
     const Graph& graph,
     const std::vector<Tok>& R, std::size_t r0, std::size_t r1,
@@ -540,9 +535,8 @@ void coalesce_events(
             prev.end_node = e.end_node;
             if (!e.seq.empty()) prev.seq += e.seq;
             prev.size_bp += e.size_bp;
-            // The reference walk span has to grow with the content. Extending size_bp while leaving
-            // the span at the first block made the record claim more deleted bases than the interval
-            // it pointed at contained -- 85 bp of sequence over a 58 bp span at LPA bubble 8.
+            // The reference walk span has to grow with the content, or the record claims more deleted
+            // bases than the interval it points at contains.
             if (e.ref_tok_first != SIZE_MAX)
                 prev.ref_tok_first = prev.ref_tok_first == SIZE_MAX
                     ? e.ref_tok_first : std::min(prev.ref_tok_first, e.ref_tok_first);
@@ -819,10 +813,10 @@ void call_variants(
         out << "##INFO=<ID=EVENT_NODES,Number=.,Type=String,Description=\"Variant node set\">\n";
         out << "##INFO=<ID=INS_SUBTYPE,Number=1,Type=String,Description=\"INS subtype: NOVEL or DUP (minimap2 refined)\">\n";
         out << "##INFO=<ID=REF_CN,Number=1,Type=Integer,Description=\"Reference copy number of the repeat unit (DUP)\">\n";
-        out << "##INFO=<ID=RU_LEN,Number=1,Type=Integer,Description=\"Repeat-unit length in bp, one copy. Emitted only for CN_METHOD=REP, where the unit is a literal repeat and (CN-REF_CN)*RU_LEN is the haplotype size\">\n";
+        out << "##INFO=<ID=RU_LEN,Number=1,Type=Integer,Description=\"Repeat-unit length in bp, one represented copy. Emitted only for CN_METHOD=REP; (CN-REF_CN)*RU_LEN is the repeat-copy component of the haplotype size, while FORMAT/CNBP is the full module-walk change and CNRESID is their difference\">\n";
         out << "##INFO=<ID=CN_UNIT_BP,Number=1,Type=Integer,Description=\"CN_METHOD=MODULE_BP only: the reference-calibrated unit CN was divided by (CN_SHARED_BP/CN_REF_FOLD). This is the SHARED per-copy content, not a whole copy, so it is not a per-haplotype event size -- read FORMAT:CNBP for that\">\n";
         out << "##INFO=<ID=CN_METHOD,Number=1,Type=String,Description=\"How CN was measured: REP (traversal count of a panphorte REP self-loop, exact), MODULE_BP (folded-node bp over a reference-calibrated unit), PEAK (highest interior-node traversal multiplicity)\">\n";
-        out << "##INFO=<ID=CN_SCOPE,Number=1,Type=String,Description=\"What one copy is a copy of: REPEAT_UNIT (a literal repeat unit, so (CN-REF_CN)*RU_LEN is the haplotype's event size) or COLLAPSED_MODULE (a module that may hold several distinct paralogs, so RU_LEN is NOT emitted -- the shared per-copy content is reported as CN_UNIT_BP, and per-haplotype size must be read from FORMAT:CNBP)\">\n";
+        out << "##INFO=<ID=CN_SCOPE,Number=1,Type=String,Description=\"What one copy is a copy of: REPEAT_UNIT (one traversal of a represented repeat unit; full per-haplotype module size is FORMAT/CNBP) or COLLAPSED_MODULE (a module that may hold several distinct paralogs; RU_LEN is not emitted, shared per-copy content is CN_UNIT_BP, and per-haplotype size is FORMAT/CNBP)\">\n";
         out << "##INFO=<ID=CN_SHARED_BP,Number=1,Type=Integer,Description=\"Reference bp in the folded (revisited) node set the MODULE_BP unit was calibrated from\">\n";
         out << "##INFO=<ID=CN_REF_FOLD,Number=1,Type=Integer,Description=\"How many times the reference revisits that folded set; the MODULE_BP unit is CN_SHARED_BP/CN_REF_FOLD\">\n";
         out << "##INFO=<ID=CN_MODULE_REF_BP,Number=1,Type=Integer,Description=\"Reference bp across the whole bubble interior. Against CN_SHARED_BP this is the shared-versus-total question: CN_UNIT_BP describes the shared part only, and their ratio is how far (CN-REF_CN)*CN_UNIT_BP understates a carrier's real gain or loss\">\n";
@@ -998,14 +992,13 @@ void call_variants(
         const std::unordered_map<std::string, std::size_t> ref_node_pos = build_ref_node_pos(bubble);
 
         // The module's oriented step span in one path, shared by every consumer that measures the
-        // module: the folded-set construction, reference and haplotype module bp, CNBP and
-        // CN_MODULE_REF_BP. Two copies of this arithmetic existed and could drift; that is the same
-        // duplication that let bubble's reference-name rule be fixed in one place and not the other.
+        // module (folded-set construction, reference and haplotype module bp, CNBP, CN_MODULE_REF_BP)
+        // so the arithmetic cannot drift between them.
         //
-        // Deliberately the WIDEST span (first source .. last sink), not the tight allele interval:
-        // a module's copies are exactly what lies between the outermost boundaries. `ambiguous`
-        // reports when a boundary occurs more than once, because the span is then a CHOICE and can
-        // sweep in content between two unrelated visits rather than one module.
+        // Deliberately the WIDEST span (first source .. last sink), not the tight allele interval: a
+        // module's copies are what lies between the outermost boundaries. `ambiguous` reports a
+        // boundary occurring more than once, since the span is then a choice and can sweep in content
+        // between two unrelated visits rather than one module.
         auto module_span = [&](std::size_t pi, bool* ambiguous = nullptr)
             -> std::pair<std::size_t, std::size_t> {
             if (ambiguous != nullptr) *ambiguous = false;
@@ -1183,13 +1176,12 @@ void call_variants(
                 static_cast<double>(ref_bp) / static_cast<double>(ref_fold) >= static_cast<double>(options.min_sv_bp)) {
                 const double unit = static_cast<double>(ref_bp) / static_cast<double>(ref_fold);
                 const std::size_t ref_copies = ref_fold;
-                // The unit from ref_bp/ref_fold assumes hbp is PROPORTIONAL to copy number. Measured
-                // against pangene truth it is not: each real copy adds ~1.45 of those units, so the
-                // dosage is affine and the error grows ~0.45 per copy either side of the reference.
-                // The panel itself carries the missing constant -- haplotypes cluster by copy state,
-                // and the gap between adjacent clusters IS one copy. Estimated here and reported; the
-                // integer CN still comes from the division route unless --cn-unit spacing is given,
-                // because switching the default would move a result validated at 466/466.
+                // The unit from ref_bp/ref_fold assumes module bp is PROPORTIONAL to copy number.
+                // Against truth it is not -- the dosage is affine, so the error grows with distance
+                // from the reference copy state. The panel carries the missing constant: haplotypes
+                // cluster by copy state and the gap between adjacent clusters is one copy. Estimated
+                // and reported here, but the integer CN still comes from the division route unless
+                // --cn-unit-spacing is given, since changing the default would move a validated result.
                 std::vector<std::size_t> all_hbp;
                 for (std::size_t pi = 0; pi < graph.paths.size(); ++pi)
                     if (traverses.count(graph.paths[pi].name)) all_hbp.push_back(full_walk_bp(pi));
@@ -1306,14 +1298,13 @@ void call_variants(
                     const long long rounded = std::llround(exact);
                     const std::size_t copies = rounded > 0 ? static_cast<std::size_t>(rounded) : 0;
                     if (rounded < 0) ++cn_clamped_zero;
-                    // How far each haplotype sits from a whole number of units. A calibrated unit should
-                    // divide real walks nearly exactly; persistent halves mean the unit is wrong, and
-                    // rounding then manufactures a confident integer out of a bad fit.
+                    // How far each haplotype sits from a whole number of units. A calibrated unit
+                    // should divide real walks nearly exactly; persistent halves mean the unit is
+                    // wrong and rounding then manufactures a confident integer out of a bad fit.
                     //
-                    // Measured against the model's own rounded value, NOT the zero-clamped CN. Using
-                    // the clamped one made a negative dosage report a residual above 0.5 and a
-                    // CNR_MARGIN below 0, both of which their headers rule out. The clamp is a
-                    // reporting floor and belongs in CN_CLAMPED_ZERO, not in the fit statistic.
+                    // Measured against the model's own rounded value, NOT the zero-clamped CN: the
+                    // clamp is a reporting floor and belongs in CN_CLAMPED_ZERO, not in a fit
+                    // statistic, where it can push the residual and CNR_MARGIN outside their range.
                     const double resid = std::fabs(exact - static_cast<double>(rounded));
                     round_residual += resid;
                     ++round_n;
@@ -1335,25 +1326,21 @@ void call_variants(
                     round_n > 0 ? static_cast<double>(round_ambiguous) / static_cast<double>(round_n) : 0.0;
                 mr.seed.cn_clamped_zero = cn_clamped_zero;
                 mr.seed.module_span_ambiguous = module_ambiguous_paths;
-                // Gate on the SHARE of samples whose rounding was a coin flip, not on the mean residual.
-                // The mean is a bad summary of a bimodal distribution -- at GSTM1 the median sample sits
-                // at 0.045 and the 90th percentile at 0.496, so the mean of 0.197 describes no sample --
-                // and it was also the statistic this record's own header warned against acting on.
+                // Gate on the SHARE of samples whose rounding was a coin flip, not on the mean
+                // residual: the residuals are bimodal, so a mean describes no actual sample.
                 //
-                // Opt-in strictness, and still OFF by default, because a bad fit does not mean a wrong
-                // answer here: GSTM1 has the worst fit of any reference locus (over half its samples
-                // ambiguous) and its CN is exact against pangene truth on all 466. The unit is a
-                // calibration constant for a heterogeneous paralog module, not one real copy, so
-                // landing near a half-integer is what it does when it is working.
+                // Off by default, because a bad fit does not imply a wrong answer. The unit is a
+                // calibration constant for a heterogeneous paralog module rather than one real copy,
+                // so landing near a half-integer is what it does when it is working -- the loci with
+                // the worst fit here are also exact against truth.
                 if (options.max_cn_model_residual > 0.0 &&
                     mr.seed.round_ambiguous_frac > options.max_cn_model_residual) {
                     ++summary.declined_cn_model;
-                    // Declining means NO copy-number call here, not a different one. Leaving
-                    // leaving the route unconsumed let the peak route answer instead, and it answers something
-                    // else entirely -- at GSTM1 the MODULE_BP record covers 309 carriers and the peak
-                    // record that replaced it covered 2. A refused measurement must not be silently
-                    // substituted by a weaker one; the sequence-resolved events and the allele VCF are
-                    // what remain.
+                    // Declining means NO copy-number call here, not a different one. Leaving the route
+                    // unconsumed lets the peak route answer instead, and it answers a different
+                    // question over a far smaller set of carriers. A refused measurement must not be
+                    // silently substituted by a weaker one; the sequence-resolved events and the
+                    // allele VCF are what remain.
                     cn_route_consumed = true;
                     module_cn_declined = true;
                     if (!options.quiet) {
@@ -1376,14 +1363,14 @@ void call_variants(
             }
         }
 
-        // ---- DUP/CN events: count self-loop traversals per allele vs reference. Merge
-        // on shared REP node; per-sample CN. Independent of the walk-diff alignment.
-        // Skipped when bp-coverage fired (it is the authority for that bubble's copy number).
-        // Node-outer, allele-inner: every allele's traversal count of a REP node is a copy number for
-        // that node, including the alleles that match the reference. Allele-outer skipped those before
-        // the record existed, so a reference-like traverser ended up with no CN at all -- which the
-        // writer turned into REF_CN by accident rather than by measurement, and which left the per-gene
-        // sidecar with nothing to split for hundreds of LPA and ANKRD36C haplotypes.
+        // ---- DUP/CN events: count self-loop traversals per allele vs reference. Merge on shared REP
+        // node; per-sample CN. Independent of the walk-diff alignment, and skipped when bp-coverage
+        // fired (that route is the authority for the bubble's copy number).
+        //
+        // Node-outer, allele-inner, so that every allele's traversal count of a REP node becomes a copy
+        // number -- including alleles matching the reference. Iterating alleles first drops those, and
+        // a reference-like traverser then gets REF_CN by default rather than by measurement, leaving
+        // the per-gene sidecar with nothing to split.
         for (const std::string& cn : cn_nodes) {
             if (cn_route_consumed) break;
             // Only a genuine REP unit (self-loop >= min_sv_bp) anchors a self-loop DUP; an incidental
@@ -1821,13 +1808,11 @@ void call_variants(
             }
             merged = std::move(kept);
         }
-        // The allele VCF is the LOSSLESS record of what the graph holds, so it must not be gated on
-        // the interpreted caller having found something. It was: a bubble whose events were all
-        // filtered -- by --min-sv-bp, by support, or by the tangle/oversize suppression that can remove
-        // a MODULE_BP record after its duplicated-content INS was already dropped as redundant with it
-        // -- returned here and produced no allele record either, so the one output that could still
-        // describe the site described nothing. The interpreted work below stays skipped; only the
-        // allele record now survives an empty call set.
+        // The allele VCF is the LOSSLESS record of what the graph holds, so it must not be gated on the
+        // interpreted caller having found something. A bubble whose events were all filtered -- by
+        // --min-sv-bp, by support, or by tangle/oversize suppression -- would otherwise produce no
+        // allele record either, leaving the one output that could still describe the site empty. The
+        // interpreted work below stays skipped; only the allele record survives an empty call set.
         const bool no_interpreted_calls = merged.empty();
         if (!no_interpreted_calls) ++summary.bubbles_with_calls;
 
@@ -1854,13 +1839,12 @@ void call_variants(
             std::sort(bubble_gene_idx.begin(), bubble_gene_idx.end());
         }
 
-        // Lossless companion output (--allele-vcf): one record per bubble carrying EVERY distinct
-        // allele as explicit sequence, each haplotype's GT indexing its own allele. The merged records
-        // in the region VCF are an interpretation -- several of them can describe one walk, and a
-        // carrier is given the merged representative's length rather than its own -- so a consumer
-        // reconstructing a specific sample needs this instead. Written alongside, never in place of,
-        // the region VCF, and deliberately not gated on CN: the region VCF keeps REF_CN/CN semantics
-        // and this file keeps the sequence.
+        // Lossless companion output (--allele-vcf): one record per bubble carrying every distinct
+        // allele as explicit sequence, each haplotype's GT indexing its own. The region VCF's merged
+        // records are an interpretation -- several can describe one walk, and a carrier is given the
+        // merged representative's length rather than its own -- so reconstructing a specific sample
+        // needs this file. Written alongside, never in place of, the region VCF, which keeps the
+        // REF_CN/CN semantics while this keeps the sequence.
         if (options.allele_vcf) {
             // Anchor orientation-independently, as the merged path does: when the reference crosses
             // this bubble sink->source the genomically-upstream flank is the SINK, and the allele
@@ -2262,9 +2246,9 @@ void call_variants(
 
             std::ostringstream info;
             info << "END=" << end << ";SVTYPE=" << svt;
-            // At a collapsed module the carriers both gain and lose -- GSTM1 spans CN 1..4 around
-            // REF_CN=3 -- so a single record-level size is not merely imprecise, it does not exist.
-            // Reporting the shared unit there understated every carrier by the shared-to-total ratio.
+            // At a collapsed module carriers both gain and lose copies around REF_CN, so a single
+            // record-level size is not merely imprecise -- it does not exist. Per-carrier CNBP carries
+            // it instead.
             if (!is_module_cn(e.cn_method)) info << ";SVLEN=" << svlen;
             if (e.type != EvType::Dup && mr.min_size_bp != mr.max_size_bp) {
                 const long long sign = svlen < 0 ? -1 : 1;

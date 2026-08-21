@@ -65,15 +65,6 @@ std::string build_walk_signature(const std::vector<PathStep>& steps);
 // rather than trusting `Bubble::cyclic`, which `bubbles.csv` does not round-trip.
 std::unordered_set<std::string> self_loop_nodes(const Graph& graph);
 
-// One authoritative check that a graph is safe to reason about, shared by every module that reads
-// paths. Each condition, left unchecked, produces a silently WRONG answer rather than a failure:
-// a step naming a missing node spells a shorter sequence than the file describes; a step pair with no
-// link describes a traversal the graph does not permit; duplicate path names make "which path" depend
-// on file order; a non-zero or unknown link overlap double-counts bases in every span and identity
-// figure, because spelling concatenates whole segments.
-//
-// `module` prefixes the message. `require_sequences` is for callers that spell or measure bp;
-// `require_zero_overlaps` for callers that concatenate.
 // Resolve a reference path QUERY to an exact path name: exact match, else a unique case-insensitive
 // substring match. Ambiguity and absence are errors, never resolved by file order.
 //
@@ -83,6 +74,15 @@ std::unordered_set<std::string> self_loop_nodes(const Graph& graph);
 std::string resolve_reference_path_name(const Graph& graph, const std::string& query,
                                         const std::string& module);
 
+// One authoritative check that a graph is safe to reason about, shared by every module that reads
+// paths. Each condition, left unchecked, gives a silently WRONG answer rather than a failure: a step
+// naming a missing node spells a shorter sequence than the file describes; a step pair with no link
+// describes a traversal the graph does not permit; duplicate path names make "which path" depend on
+// file order; a non-zero or unknown overlap double-counts bases in every span and identity figure,
+// since spelling concatenates whole segments.
+//
+// `module` prefixes the message. `require_sequences` is for callers that spell or measure bp;
+// `require_zero_overlaps` for callers that concatenate.
 void validate_graph_paths(const Graph& graph, const std::string& module,
                           bool require_sequences, bool require_zero_overlaps);
 

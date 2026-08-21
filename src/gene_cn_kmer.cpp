@@ -78,12 +78,9 @@ std::vector<std::vector<GeneCnEvidence>> resolve_gene_cn_kmer(
 
     // 2) private k-mers: unique to one gene against its siblings. Map private k-mer -> owning gene.
     //
-    // Screening these against the WHOLE locus reference as well -- dropping any k-mer that also occurs
-    // outside the gene's own marker -- was built and measured, and it is WORSE. Against pangene truth
-    // it cost CYP2D6 3 of 127 exact calls (126 -> 123) and, once CDS-junction k-mers were kept rather
-    // than dropped as absent, GSTM1 2 of 466 as well. It removes about a third of the markers, and the
-    // dosage ratio loses more to the smaller denominator than it gains in specificity. Not retained,
-    // switched off or otherwise; see docs/algorithms/call.md.
+    // Uniqueness is against the sibling genes only, not against the whole locus reference. Widening it
+    // removes about a third of the markers, and the dosage ratio loses more to the smaller denominator
+    // than it gains in specificity, so it is not offered as an option. See docs/algorithms/call.md.
     std::unordered_map<std::uint64_t, int> owner;
     std::vector<long> priv_size(n_genes, 0);
     for (std::size_t g = 0; g < n_genes; ++g) {

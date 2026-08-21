@@ -104,12 +104,11 @@ std::vector<Block> build_block_chain(const std::vector<Bubble>& bubbles_in) {
     }
 
     // A bubble's source/sink are not guaranteed to be in reference order -- a bubble whose paths
-    // traverse the graph backwards is stored with them swapped (all of c4's and gstm1's are). Taking
-    // them at face value makes the neighbouring flank and backbone intervals span straight across the
-    // bubble's interior, so the same sequence lands in three blocks at once. Blocks then stop tiling
-    // (measured: c4 1.56x, gstm1 1.36x, ankrd36c 1.93x of the haplotype length), and since confinement
-    // drops any marker varying in more than one block, every bubble marker is destroyed by its own
-    // neighbours. The graph is reference-sorted, so numeric node order IS reference order.
+    // traverse the graph backwards is stored with them swapped. Taking them at face value makes the
+    // neighbouring flank and backbone intervals span straight across the bubble's interior, so the
+    // same sequence lands in three blocks at once. Blocks then stop tiling -- they can cover well over
+    // the haplotype length -- and since confinement drops any marker varying in more than one block,
+    // every bubble marker is destroyed by its own neighbours. The graph is reference-sorted, so numeric node order IS reference order.
     auto node_pos = [](const std::string& n) {
         char* end = nullptr;
         const unsigned long long v = std::strtoull(n.c_str(), &end, 10);
@@ -122,8 +121,8 @@ std::vector<Block> build_block_chain(const std::vector<Bubble>& bubbles_in) {
         return node_pos(b.source) <= node_pos(b.sink) ? b.sink : b.source;
     };
 
-    // Leading flank: everything upstream of the first bubble. Skipping it leaves ~8.6% of each
-    // haplotype (measured on cyp2d6) outside the chain, and reads landing there match no block --
+    // Leading flank: everything upstream of the first bubble. Skipping it leaves several percent of
+    // each haplotype outside the chain, and reads landing there match no block --
     // which shows up as spurious "novel" adjacencies and would poison the off-panel detector.
     {
         Block b;

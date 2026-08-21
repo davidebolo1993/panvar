@@ -62,12 +62,12 @@ struct Interior {
 };
 // The interior a path carries between two anchors.
 //
-// Taking the FIRST occurrence of each anchor independently is wrong wherever an anchor repeats: the two
-// first occurrences need not bound the same traversal, and on a reverse crossing they come back in the
-// opposite order, so the interior was read backwards. Every valid (a, b) pair is enumerated instead and
-// scored by how much of the region's declared interior it contains; a reverse crossing is canonicalized
-// by reversing the steps and toggling their orientation, while `lo`/`hi` keep the ORIGINAL indices and
-// `reversed` records the direction so the edit can be spliced back where it came from.
+// Taking the FIRST occurrence of each anchor independently is wrong wherever an anchor repeats: two
+// first occurrences need not bound the same traversal, and on a reverse crossing they arrive in the
+// opposite order, so the interior reads backwards. Every valid (a, b) pair is enumerated instead and
+// scored by how much of the region's declared interior it contains. A reverse crossing is canonicalized
+// by reversing the steps and toggling orientation, while `lo`/`hi` keep the ORIGINAL indices and
+// `reversed` records the direction, so the edit can be spliced back where it came from.
 //
 // If two different pairs are equally good the traversal is genuinely ambiguous, and choosing one
 // arbitrarily would rewrite a copy the caller did not mean. That is refused.

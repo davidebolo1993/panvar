@@ -807,8 +807,8 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
 
         // Region uniqueness. A syncmer occurring in more than one place accumulates read counts from
         // all of them, so its observed count no longer reflects the block it is being used to
-        // genotype -- measured on cyp2d6, "private" markers of an absent allele carried counts of
-        // 38-294 against a depth of 24, and the model duly preferred that absent allele.
+        // genotype. Left unscreened, the "private" markers of an ABSENT allele can carry counts many
+        // times the depth, and the model duly prefers that absent allele.
         //
         // The comparison used for bubbles (panel-wide count vs what the bubble accounts for) does NOT
         // work here: blocks tile the haplotype, so the accounted-for total equals the panel-wide total

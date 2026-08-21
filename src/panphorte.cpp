@@ -99,12 +99,10 @@ struct TandemArray {
 // as literal nested steps), e.g. CGG (A) CGG CGG CGG.
 
 // The identity of a repeat unit, independent of where the array happens to be cut, which strand it is
-// stored on, and whether the caller handed us one copy or three.
-//
-// Prevalence used to ask "does this haplotype contain SOME tandem", which is a different question from
-// "do these haplotypes share a repeat". One bubble carrying a poly-C array on one haplotype and a
-// poly-T array on another satisfied the first and was folded into two unrelated REP nodes; only the
-// second question distinguishes a population VNTR from two coincidental arrays.
+// stored on, and whether the caller handed us one copy or three. Prevalence has to be counted per
+// unit, not per haplotype: "does this haplotype contain SOME tandem" is a different question from "do
+// these haplotypes share a repeat", and only the second distinguishes a population VNTR from two
+// coincidental, unrelated arrays at one site.
 std::string canonical_motif_key(const std::string& unit) {
     if (unit.empty()) return unit;
     // Primitive root: if the unit is itself w repeated, the motif is w.
@@ -131,21 +129,11 @@ std::string canonical_motif_key(const std::string& unit) {
 }
 
 
-// Copies of a KNOWN motif that sit exactly on node boundaries, including a lone copy.
-//
-// detect_tandems finds a PERIOD, which needs at least two copies to exist -- so a haplotype carrying
-// one copy has no array and, in exact mode, was left on the original nodes while its neighbours folded.
-// Once the site is confirmed the motif is known, so its copies can be matched directly instead of
-// rediscovered. A copy spanning several nodes is not matched here; that is the multi-node case
-// detect_tandems already covers whenever two or more copies are present.
-// Copies of a KNOWN motif that sit exactly on node boundaries, including a lone copy and a copy split
-// across several nodes.
-//
-// detect_tandems finds a PERIOD, which needs two copies to exist, so a haplotype carrying one copy has
-// no array. Matching only a single node then left a copy split across nodes literal while its
-// neighbours folded -- and a mixed representation is what makes `call` report CN 0 for a haplotype that
-// carries one copy. The unit is already known once the site is confirmed, so this is a direct match
-// rather than a rediscovery: spans of whole consecutive steps whose spelling IS the motif.
+// Copies of a KNOWN motif lying on whole node boundaries, including a lone copy and one split across
+// several nodes. detect_tandems finds a period, which needs two copies to exist, so a single-copy
+// haplotype has no array of its own; leaving it literal while its neighbours fold is what makes `call`
+// report CN 0 for a haplotype that does carry a copy. The motif is already known here, so this matches
+// spans of whole consecutive steps against it rather than rediscovering a period.
 std::vector<TandemArray> find_motif_copies_by_node(
     const Graph& graph,
     const PathRecord& path,
@@ -814,13 +802,13 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                                      cli::join_with_comma(absent));
     }
     // Sites are meant to be disjoint. Two that share interior nodes describe the same sequence twice,
-    // and folding both rewrites one span inside another -- the same array folded at two scales, which
-    // the acceptance check later catches as overlapping edits, but only after every haplotype has been
-    // aligned. Caught here instead, naming the pair, since the input is what has to be fixed.
+    // and folding both rewrites one span inside another. The acceptance check catches that later as
+    // overlapping edits, but only after every haplotype has been aligned, so it is caught here instead
+    // and the pair is named -- the input is what has to be fixed.
     //
     // Only among the SELECTED bubbles: what is not folded cannot overlap anything, and refusing on a
-    // pair the run was never going to touch blocks the one safe way to work at a locus whose CSV
-    // carries an overlap -- naming one member of it.
+    // pair the run was never going to touch would block the one safe way to work at a locus whose CSV
+    // carries an overlap, namely selecting one member of it.
     {
         std::unordered_map<std::string, std::size_t> owner;
         for (const Bubble& b : bubbles) {
@@ -860,9 +848,9 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
     // consumer counting REP occurrences sees two independent DUPs instead of one site's copy number.
     //
     // Buffered rather than streamed, because the id a REP is created with is not the id it is delivered
-    // under: --reference-path renumbers the graph, so a table written during the loop named nodes that
-    // do not exist in the GFA beside it and could not be joined to anything. Both ids are emitted --
-    // created_rep_node for the input-side numbering, output_rep_node for the delivered graph.
+    // under: --reference-path renumbers the graph, so a table written during the loop would name nodes
+    // absent from the GFA beside it. Both ids are emitted -- created_rep_node for the input-side
+    // numbering, output_rep_node for the delivered graph.
     struct ProvRecord {
         std::string created_node;
         std::size_t bubble_id = 0;
@@ -1034,17 +1022,15 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                         prefix[off + 1] = prefix[off] + (it != node_tok.end() ? it->second.len : 0);
                     }
                     const auto bp_copies = detect_copies_native(snat, ref_unit, options.min_similarity);
-                    // A copy boundary rarely lands on a node boundary. Rounding to the nearest one
-                    // and replacing whole steps DELETED the bases between the node edge and the copy
-                    // edge -- sequence outside the copy, which approximate mode may not discard (it may
-                    // drop differences WITHIN a copy; that is a different claim).
+                    // A copy boundary rarely lands on a node boundary. Rounding to the nearest one and
+                    // replacing whole steps would delete the bases between the node edge and the copy
+                    // edge -- sequence OUTSIDE the copy, which approximate mode is not licensed to
+                    // discard. Declining the copy instead is worse still: that drops a whole repeat
+                    // unit from the copy number over a handful of bases.
                     //
-                    // Declining those copies instead was worse: a declined copy at a tandem array is a
-                    // whole repeat unit missing from the copy number, and the bases at stake are a
-                    // handful. So the containing step range is taken -- floor for the start, ceiling
-                    // for the end -- and the bases inside it that fall outside the copy are kept as
-                    // literal fragments, emitted around the REP step at rewrite time. Nothing is lost
-                    // and nothing is undercounted.
+                    // So the containing step range is taken -- floor for the start, ceiling for the end
+                    // -- and the bases inside it that fall outside the copy are kept as literal
+                    // fragments, emitted around the REP step at rewrite time.
                     const auto floor_off = [&](std::size_t bp) {
                         std::size_t lo = 0;
                         while (lo + 1 < prefix.size() && prefix[lo + 1] <= bp) ++lo;
@@ -1194,17 +1180,11 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
                 const std::size_t traversing = n_traverse.load();
                 const double prevalence =
                     traversing > 0 ? static_cast<double>(group_carriers) / static_cast<double>(traversing) : 0.0;
-                // SITE-WIDE refusal, not per copy. Declining one copy while folding the rest leaves a
-                // mixed representation: some haplotypes reach the motif through the REP node and one
-                // still spells it literally. `call` counts REP occurrences, so that haplotype is
-                // reported CN=0 with the literal node as an insertion, when it carries one copy. The
-                // sequence was safe and the CALL was not, so the whole bubble is left alone.
-                // Refuse the site only where the mixed representation would produce a FALSE ZERO, not
-                // wherever any boundary happens to fall mid-node. Blanket refusal cost the principal
-                // case for nothing: at a real tandem array every haplotype still folds most of its
-                // copies (measured at KIV-2: 466 of 466 haplotypes fold at least one, median 20), so
-                // refusing the whole site to prevent an undercount of one copy in twenty threw away
-                // the fold for all 466.
+                // Refuse the whole site, but only where the mixed representation would produce a FALSE
+                // ZERO. `call` counts REP occurrences, so a haplotype left spelling the motif literally
+                // while its neighbours fold reads as CN=0 plus an insertion. Refusing wherever any
+                // boundary merely falls mid-node is far too blunt: at a real array every haplotype
+                // still folds most of its copies, so that discards the fold for the whole panel.
                 const bool partial_boundary = zero_after_decline > 0 && !options.allow_partial_boundary;
                 const bool array_confirmed = !partial_boundary &&
                                              max_copies_path >= options.min_copies &&
@@ -1621,16 +1601,12 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
             if (to_remove.find(e.from) != to_remove.end() || to_remove.find(e.to) != to_remove.end()) {
                 continue;
             }
-            // An arc only a pre-rewrite path used, between two nodes that both survive for other
-            // reasons. Removing the nodes is not enough on its own: the link is what keeps the old
-            // route walkable, and the re-snarl reads links, not paths.
-            // A link is dropped only when NO final path walks it. One a rewritten span used that some
-            // path still walks stays: a GFA link is global and deleting it would break that path. At an
-            // array that is ordinary rather than exceptional -- LPA keeps 2009 of them, because an arc
-            // inside the repeat unit is crossed once per copy and folding replaces all but the one
-            // crossing that falls outside the folded span. Whether that matters is not a property of
-            // any single link, so it is not judged here; the acceptance check below asks the question
-            // that does matter.
+            // Removing the nodes is not enough: the link is what keeps an old route walkable, and the
+            // re-snarl reads links rather than paths. But a link is dropped only when NO final path
+            // walks it -- a GFA link is global, so deleting one another path still uses would break
+            // that path. Inside a repeat unit that case is the norm, not the exception, since an arc is
+            // crossed once per copy. Whether the leftover route matters is left to the acceptance check
+            // below, which asks it per rewritten span.
             const std::string k = EdgeSet::key(e.from, e.from_orient, e.to, e.to_orient);
             if (obsolete_edge_keys.find(k) != obsolete_edge_keys.end() &&
                 traversed_edges.find(k) == traversed_edges.end()) {
@@ -1641,17 +1617,16 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
         }
         model.edges = std::move(kept_edges);
     }
-    // ACCEPTANCE, at the level the question is actually asked: is the route a path used BEFORE the
-    // rewrite still walkable AFTER it? A link that survives because another path needs it is not on its
-    // own a defect -- at a real array that is the normal case, 2009 such links at LPA -- and refusing on
-    // the count would block the locus for nothing. What matters is whether the arcs and nodes that
-    // survive still spell the old allele end to end.
+    // ACCEPTANCE, at the level the question is actually asked: is a route a path used BEFORE the
+    // rewrite still walkable AFTER it? An individual surviving link is not evidence either way -- at a
+    // real array most of them survive because other paths need them -- so what matters is whether the
+    // arcs and nodes that survive still spell the old allele end to end.
     //
     // Asked PER EDIT, not per path. A haplotype normalized at two sites has two independent old routes,
     // and testing the whole original walk conflates them: the first site's route being properly gone
     // makes the walk unwalkable and hides the second site's route surviving intact. Each replaced span
-    // is therefore checked on its own -- the arc into it, its interior, and the arc out of it, which
-    // together are what make the old branch a detour a walk can actually take.
+    // is checked on its own -- the arc in, the interior, the arc out -- which together are what would
+    // make the old branch a detour a walk can still take.
     {
         std::unordered_set<std::string> live_nodes(model.node_order.begin(), model.node_order.end());
         std::unordered_set<std::string> live_edges;

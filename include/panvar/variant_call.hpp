@@ -50,14 +50,12 @@ struct VariantCallOptions {
     double max_dup_region_frac = 0.80;
     // Refuse a MODULE_BP copy-number call whose integer model fits badly: CN_ROUND_RESIDUAL above this
     // means the calibrated unit does not divide real walks cleanly and the reported integer came from
-    // rounding a poor fit. 0 disables. Default OFF, on evidence: the fit is worst exactly where CN is
-    // exact against pangene truth (GSTM1 fold residual 0.83, CN 466/466), because the unit is a
-    // calibration constant for a heterogeneous paralog module and never claimed to be one real copy.
+    // rounding a poor fit. 0 disables, and that is the default: the unit is a calibration constant for
+    // a heterogeneous paralog module, never one real copy, so a poor fit does not imply a wrong CN.
     double max_cn_model_residual = 0.0;
     // Take the MODULE_BP copy-number step from the panel's cluster spacing rather than from
-    // ref_bp/ref_fold. Measured against pangene truth the spacing model is far better in the bulk
-    // (GSTM median dosage error 0.4550 -> 0.0029) but it makes CN depend on cohort composition, and it
-    // costs one of GSTM's 466 exact calls, so it is opt-in until that outlier is understood.
+    // ref_bp/ref_fold. Much closer in the bulk, but it makes CN depend on cohort composition, so it is
+    // opt-in.
     bool cn_unit_spacing = false;
     std::string gtf_path;                // optional reference-coordinate GTF: annotate variants with the
                                          // genes they touch (INFO GENES), write <prefix>.node_genes.tsv,

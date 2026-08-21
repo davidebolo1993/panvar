@@ -248,17 +248,16 @@ bool logistic_irls(const std::vector<double>& X, const std::vector<double>& y, s
 
 // Firth-penalised logistic regression (Firth 1993; Heinze & Schemper 2002).
 //
-// Under separation the ordinary maximum likelihood estimate diverges -- there is no finite coefficient
-// that maximises the likelihood -- so an MLE fit returns nothing and the effect size is simply absent.
-// Firth adds Jeffreys' invariant prior, |I(beta)|^{1/2}, as a penalty. The penalised score is
+// Under separation the ordinary maximum likelihood estimate diverges, so an MLE fit returns nothing and
+// the effect size is simply absent. Firth adds Jeffreys' invariant prior, |I(beta)|^{1/2}, as a
+// penalty, giving the penalised score
 //
 //   U*_j = sum_i x_ij [ y_i - mu_i + h_i (0.5 - mu_i) ],    h = diag( W^{1/2} X (X'WX)^-1 X' W^{1/2} )
 //
-// which stays finite because the h_i(0.5 - mu_i) term pulls the fitted probabilities back off 0 and 1.
-// The estimate is also first-order unbiased, which ordinary ML is not at small counts.
+// which stays finite because h_i(0.5 - mu_i) pulls the fitted probabilities back off 0 and 1, and is
+// first-order unbiased where ordinary ML is not.
 //
-// This is used ONLY for the reported effect size when ML fails. The p-value stays the score test's,
-// which needs no alternative fit at all.
+// Used ONLY for the reported effect size when ML fails; the p-value stays the score test's.
 bool firth_logistic(const std::vector<double>& X, const std::vector<double>& y, std::size_t n,
                     std::size_t p, std::vector<double>& beta, std::vector<double>& inv) {
     beta.assign(p, 0.0);
@@ -312,13 +311,13 @@ bool firth_logistic(const std::vector<double>& X, const std::vector<double>& y, 
 //
 // Why not the Wald test here. Wald divides the estimate by its own standard error, and for a rare
 // variant in an unbalanced case/control study the fit approaches separation: |beta| grows, its standard
-// error grows faster, and the statistic collapses toward zero. Measured on the LPA cohort (492 cases,
-// 5213 controls) every feature below minor frequency 0.01 failed a uniformity check under permutation
-// -- lambda_GC 0.80, worst KS p 3e-12 -- while every feature above it passed. The score test never fits
-// the alternative, so it does not have a standard error to inflate, and it is the standard remedy.
+// error grows faster, and the statistic collapses toward zero. Under permutation that shows up as rare
+// features failing a uniformity check while common ones pass. The score test never fits the
+// alternative, so it has no standard error to inflate, and it is the standard remedy.
 //
 // The genotype column is dropped from the design to form the null, which also means each feature gets
 // its own null fit -- correct rather than wasteful, since each has its own complete-case sample set.
+
 // ---- Saddlepoint approximation for the binary score statistic (Dey et al. fastSPA; SAIGE) --------
 //
 // The score S = sum_i Gt_i (y_i - mu_i) is a sum of INDEPENDENT bounded terms, so its cumulant
@@ -798,7 +797,7 @@ void print_help() {
         << "                        --phenotype <table.tsv> -o <prefix> [options]\n\n"
         << "GWAS on a BIMBAM dosage matrix (from `describe`) vs a phenotype/covariate table.\n\n"
         << "Required:\n"
-        << "  --genotypes <path>     BIMBAM mean-genotype dosage (describe bimbam_{kmers,graph}.bimbam.gz)\n"
+        << "  --genotypes <path>     BIMBAM dosage from describe (kmers, graph or variant substrate)\n"
         << "  --samples <path>       sample (column) order, one per line (describe bimbam.samples.txt.gz)\n"
         << "  --phenotype <path>     TSV: sample <tab> phenotype [<tab> covariate1 ...]; header required.\n"
         << "                         Phenotype/covariate cells may be NA (NA-phenotype samples are dropped).\n"
@@ -808,11 +807,12 @@ void print_help() {
         << "  --node-genes <path>    call node_genes.tsv (call --gtf): adds a `gene` column by node\n"
         << "  --min-maf <X>          drop features whose minor (non-modal) genotype frequency < X (default 0.01)\n"
         << "  --unit <u>             multiple-testing unit: auto|variant|feature (default auto). variant = one\n"
-        << "                         test per SV call (from describe --variant-vcf): honest n_tests + LD-clumping.\n"
-        << "                         feature = k-mer/node/edge tests with an effective-tests (Meff) Bonferroni.\n"
+        << "                         test per SV call (from describe --variant-vcf), with Li-Ji Meff when\n"
+        << "                         feasible and LD clumps reported as lead/shadow labels.\n"
+        << "                         feature = k-mer/node/edge tests; bubble-count Meff is heuristic.\n"
         << "                         auto = variant when the feature_annot layer is `variant`, else feature.\n"
         << "  --ld-r2 <X>            variant tier: r^2 above which a variant is an LD shadow of a lead (default 0.8)\n"
-        << "  --min-ac <N>           variant tier: flag low_af when the minor-allele count < N (default 3)\n"
+        << "  --min-ac <N>           variant tier: flag low_af when the minority-genotype count < N (default 3)\n"
         << "  --cojo-p <X>           variant tier: forward-stepwise conditional (COJO) entry p (default 0.05/Meff).\n"
         << "                         selects independent signals; adds p_conditional + cond_role columns.\n"
         << "  --model <m>            auto|linear|logistic|lmm (default auto: binary->logistic, else linear)\n"
@@ -1120,9 +1120,9 @@ int run_associate_command(const std::vector<std::string>& args) {
     }
 
     // ---- multiple-testing unit: variant (one test per SV call) vs feature (k-mer/node/edge) ----
-    // Variant mode tests the SV calls directly, so the tests are weakly correlated and n_tests is an
-    // honest Bonferroni denominator (refined by LD-clumping). Feature mode keeps the fine-grained tests
-    // but corrects with an effective-tests count Meff (the features within one variant are correlated).
+    // Variant mode tests one row per retained SV record. Records may still be linked or correlated;
+    // Li-Ji supplies the primary regional Meff when feasible. Feature mode keeps the fine-grained tests
+    // and uses annotated bubbles as a heuristic grouping.
     bool variant_mode;
     if (opt.unit == "variant") variant_mode = true;
     else if (opt.unit == "feature") variant_mode = false;
@@ -1364,11 +1364,10 @@ int run_associate_command(const std::vector<std::string>& args) {
     for (std::size_t i = 0; i < n_tests; ++i) pv[i] = rows[i].p;
     const std::vector<double> qv = bh_qvalues(pv);
 
-    // Effective number of independent tests (Meff). Raw n_tests over-counts because many tests are
-    // correlated -- features within one variant, or variants in LD. Variant mode: greedy LD-clumping
-    // (a lead variant, lowest p, claims neighbours with genotype r^2 > --ld-r2; Meff = #leads). Feature
-    // mode: Meff = number of distinct bubbles the features map to (the correlated block). Bonferroni then
-    // uses Meff; BH-FDR stays the primary control. See docs/algorithms/associate.md.
+    // Effective number of independent tests (Meff). Variant mode uses the phenotype-blind Li-Ji
+    // eigenvalue estimate when feasible; LD clumping remains a fallback and supplies lead/shadow labels.
+    // Feature mode uses the number of annotated bubbles, a biological grouping rather than a calibrated
+    // statistical effective-test estimate. See docs/algorithms/associate.md.
     std::size_t meff = n_tests;
     std::size_t meff_clump = 0, meff_eigen = 0;   // clumping heuristic vs the phenotype-blind estimate
     if (variant_mode && n_tests > 0) {
@@ -1396,10 +1395,9 @@ int run_associate_command(const std::vector<std::string>& args) {
         }
         // Every TESTED feature has to count toward the denominator it is corrected against. A low-AF
         // variant is barred above from ANCHORING a clump -- its r^2 is unstable, so it must not claim
-        // shadows -- but it is still tested, and leaving it in no clump at all made Meff smaller than the
-        // number of tests: its own Bonferroni threshold was then computed from a set it was not in.
-        // Measured on the LPA cohort at --min-ac 30, 5 of 20 tested variants sat in no clump and Meff read
-        // 12. Give each remaining tested feature a singleton clump: it counts, but it claims nothing.
+        // shadows -- but it is still tested, and leaving it in no clump made Meff smaller than the
+        // number of tests, so its own threshold came from a set it was not in. Each remaining tested
+        // feature gets a singleton clump: it counts, but it claims nothing.
         for (std::size_t oi = 0; oi < n_tests; ++oi) {
             const std::size_t i = byp[oi];
             if (rows[i].clump != -1 || !std::isfinite(rows[i].p)) continue;
@@ -1414,9 +1412,9 @@ int run_associate_command(const std::vector<std::string>& args) {
         // the phenotype, so the regional threshold it implies cannot be circular.
         // Both halves of this tier are unbounded in n_tests: LD clumping above compares every pair,
         // and Li-Ji below MATERIALIZES an n_tests x n_tests correlation matrix and takes a full
-        // symmetric eigendecomposition -- quadratic memory to hold it, cubic time to solve it. That is
-        // fine for a region (LPA tests tens of variants) and is not a genome-wide estimator, so the
-        // limit is enforced rather than discovered by a machine running out of memory.
+        // symmetric eigendecomposition -- quadratic memory, cubic time. That is fine at region scale,
+        // which is what this is for, so the limit is enforced rather than discovered by a machine
+        // running out of memory.
         //
         // Exceeding it is NOT an error: Meff is a refinement of the correction, so the run falls back
         // to the clumping estimate and, failing that, to raw Bonferroni over n_tests -- both
@@ -1457,17 +1455,13 @@ int run_associate_command(const std::vector<std::string>& args) {
                     }
                 Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(C, Eigen::EigenvaluesOnly);
                 if (es.info() == Eigen::Success) {
-                    // Eigenvalues that are numerically zero must be treated as exactly zero: for k
-                    // identical features the spectrum is (k, 0, ..., 0) and Li-Ji gives exactly 1, but
-                    // the zeros arrive as +/-1e-16 whose fractional parts push the sum a hair above 1
-                    // and a bare ceil() then answers 2. The same epsilon is why the sum is rounded up
-                    // from just below rather than from the raw value.
-                    // Li-Ji sums an INTEGER part and a FRACTIONAL part, so it is acutely sensitive to
-                    // an eigenvalue that lands a few ulps below a whole number: for k identical
-                    // features the top eigenvalue comes back as 2.9999999999999996, whose floor is 2 and
-                    // whose fractional part is ~1, and the estimate reads 2 where the answer is 1. (R's
-                    // own eigen() reproduces this, so it is a property of the estimator's form rather
-                    // than of one implementation.) Snap near-integer eigenvalues before splitting them.
+                    // Li-Ji sums an INTEGER and a FRACTIONAL part, so it is acutely sensitive to an
+                    // eigenvalue landing a few ulps off a whole number. For k identical features the
+                    // spectrum is (k, 0, ..., 0) and the answer is 1, but the top value arrives as
+                    // k - 1e-16 (floor k-1, fraction ~1) and the zeros as +/-1e-16, either of which
+                    // makes the estimate read one too high. R's eigen() reproduces this, so it is a
+                    // property of the estimator's form rather than of one implementation. Hence: snap
+                    // numeric zeros to zero, snap near-integers, and round the sum up from just below.
                     double m = 0.0;
                     const double scale = std::max(1.0, es.eigenvalues().cwiseAbs().maxCoeff());
                     for (Eigen::Index k = 0; k < es.eigenvalues().size(); ++k) {
@@ -1706,9 +1700,8 @@ int run_associate_command(const std::vector<std::string>& args) {
     {
         std::ofstream out(assoc_staged);
         if (!out) throw std::runtime_error("cannot write " + assoc_final);
-        // p_bonf = raw 0.05/n_tests. p_bonf_meff scales by Meff, an LD-CLUMPING heuristic that is
-        // seeded in p-value order and therefore depends on the phenotype -- it is not a phenotype-blind
-        // effective-test count and gives no formal family-wise guarantee. q_bh is the primary control.
+        // p_bonf = raw 0.05/n_tests. p_bonf_meff scales by the selected Meff estimate and has no
+        // general family-wise guarantee. q_bh reports the standard BH adjustment.
         out << "feature_id\tlayer\tbubbles\tnodes\tn\tn_conditional\tminor_freq\t" << effect
             << "\tse\tz\tp\tp_method\teffect_status\tmac_case\tmac_ctrl\tp_bonf\tp_bonf_meff\tq_bh\taf\tan\tlow_af\tclump\tis_lead\tgene"
                "\tp_conditional\tcond_role\n";

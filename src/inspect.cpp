@@ -232,15 +232,14 @@ std::vector<std::uint64_t> build_walk_minhash_sketch(
 // Bottom-k Jaccard over the UNION of the two sketches.
 //
 // The obvious form -- intersection over union of the two stored sketches -- is biased whenever either
-// sketch is truncated, which here means a walk longer than kWalkSketchSize + shingle - 1 steps. Each
-// sketch then holds the smallest hashes of its OWN shingle set, so a shingle both walks share can sit
-// inside one sketch and below the other's cutoff, and the two sketches sample different regions of the
-// hash space. The bias grows with the size difference, which is exactly the tandem-array case: two
-// walks of the same repeat unit at different copy numbers.
+// sketch is truncated, i.e. a walk longer than kWalkSketchSize + shingle - 1 steps. Each sketch then
+// holds the smallest hashes of its OWN shingle set, so a shared shingle can sit inside one sketch and
+// below the other's cutoff. The bias grows with the size difference, which is exactly the tandem-array
+// case: two walks of the same repeat unit at different copy numbers.
 //
 // The standard unbiased estimator takes the k smallest distinct values of the union, k = min(|a|,|b|),
-// and asks how many of those are in both. Every value considered is at or below both sketches' cutoffs,
-// so membership is decidable from the sketches alone.
+// and asks how many are in both. Every value considered is at or below both cutoffs, so membership is
+// decidable from the sketches alone.
 double sketch_jaccard(const std::vector<std::uint64_t>& a, const std::vector<std::uint64_t>& b) {
     if (a.empty() || b.empty()) {
         return 0.0;

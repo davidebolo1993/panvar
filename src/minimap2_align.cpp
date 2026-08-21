@@ -188,9 +188,9 @@ std::vector<Minimap2Hit> minimap2_hits(
         static_cast<std::size_t>(std::numeric_limits<int>::max()),
         std::max<std::size_t>(static_cast<std::size_t>(1), best_n)));
     map_opt.best_n = std::max(map_opt.best_n, want);
-    // Keep moderately low-scoring secondaries so a short paralog copy (e.g. C4 lacking the ~6.4 kb
-    // a partial copy still surfaces as its own hit, without admitting so many weak paralog
-    // hits that they steal loci in the competition (that degrades CYP2D7/GSTM separation).
+    // Keep moderately low-scoring secondaries, so a partial or truncated paralog copy still surfaces as
+    // its own hit -- without admitting so many weak hits that they steal loci in the competition and
+    // blur the separation between neighbouring paralogs.
     map_opt.pri_ratio = 0.5f;
 
     const char* seq_ptrs[1] = {target_seq.c_str()};

@@ -68,7 +68,7 @@ void print_describe_help() {
         << "                                   sample-level bimbam_{kmers,graph}.samples.bimbam.gz (summed dosage)\n"
         << "      --variant-vcf <vcf>          call region VCF; also emit the VARIANT-level BIMBAM\n"
         << "                                   (bimbam_variant.* + feature_annot.variant.tsv.gz): one\n"
-        << "                                   dosage row per SV call -- the honest GWAS unit for associate\n"
+        << "                                   dosage row per SV call -- the coarsest associate substrate\n"
         << "      --no-bimbam                  Do not write the pooled BIMBAM dosage + feature_annot.tsv.gz\n"
         << "      --only-kmers                 Emit only the k-mer substrate\n"
         << "      --only-graph                 Emit only the node/edge graph substrate\n"

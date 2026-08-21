@@ -96,15 +96,13 @@ struct KmerStats {
 // Rolling 2-bit encoding: substr-per-position costs tens of millions of allocations at cohort scale.
 // k <= 31 fits a uint64; above that fall back to substr.
 //
-// Three properties this has to have, and previously did not:
-//   CANONICAL   -- a k-mer and its reverse complement count as one. Without it a haplotype's richness
-//                  depends on which strand the GFA happens to store it on, so the seed -- and hence the
-//                  whole rebuild -- changes when an input is flipped.
-//   CONSISTENT  -- `total` counts only the windows `distinct` counts. It was s.size()-k+1, including
-//                  windows containing N, while `distinct` skipped them, so the redundancy figure
-//                  (total - distinct) was wrong by however much ambiguity a haplotype carried.
-//   UNIFORM     -- k > 31 behaves the same way. It kept every window verbatim, ambiguity and strand
-//                  included, so crossing k=31 silently changed what the ranking meant.
+// Three properties the richness metric has to have:
+//   CANONICAL   -- a k-mer and its reverse complement count as one, or a haplotype's richness depends
+//                  on which strand the GFA stores it on, and the seed changes when an input is flipped.
+//   CONSISTENT  -- `total` counts only the windows `distinct` counts, so the redundancy figure
+//                  (total - distinct) does not shift with how much ambiguity a haplotype carries.
+//   UNIFORM     -- k > 31 behaves the same way, so crossing that boundary does not silently change
+//                  what the ranking means.
 KmerStats kmer_stats(const std::string& s, std::size_t k) {
     KmerStats st;
     if (k == 0 || s.size() < k) return st;
@@ -357,15 +355,16 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
     mg_opt_set(nullptr, &ipt, &opt, &gpt);
     if (mg_opt_set("ggs", &ipt, &opt, &gpt) < 0) throw std::runtime_error("rebuild: mg_opt_set(ggs) failed");
     gpt.min_var_len = static_cast<int>(options.min_var);
-    // minigraph's length gates assume chromosome-scale input: ggsimple drops a chain wholesale when
-    // its block length is under min_map_len (100 kb by default), before min_var_len is ever consulted.
-    // A locus graph of a few tens of kb therefore augments nothing and collapses to the bare seed, so
-    // scale both gates to the locus. Loci already above the defaults keep minigraph's own values.
-    // The gate is derived from the whole length DISTRIBUTION, not from the seed. The seed is the richest
-    // haplotype and can be far longer than the rest; a threshold scaled from it can exceed what a
-    // shorter haplotype could ever produce, so that haplotype clears no chain and is dropped without
-    // anything saying so. The median sets the scale and the SHORTEST haplotype caps it, so every
-    // haplotype can in principle contribute a chain covering half of itself.
+    // minigraph's length gates assume chromosome-scale input: ggsimple drops a chain wholesale when its
+    // block length is under min_map_len (100 kb by default), before min_var_len is ever consulted. A
+    // locus graph of a few tens of kb therefore augments nothing and collapses to the bare seed, so
+    // both gates are scaled to the locus. Loci already above the defaults keep minigraph's own values.
+    //
+    // Scaled from the whole length DISTRIBUTION, not from the seed: the seed is the richest haplotype
+    // and can be far longer than the rest, so a threshold taken from it can exceed what a shorter
+    // haplotype could ever produce, dropping that haplotype with nothing saying so. The median sets the
+    // scale and the SHORTEST haplotype caps it, so every haplotype can in principle contribute a chain
+    // covering half of itself.
     std::vector<std::size_t> hlen;
     hlen.reserve(hseq.size());
     for (const std::string& h : hseq) if (!h.empty()) hlen.push_back(h.size());

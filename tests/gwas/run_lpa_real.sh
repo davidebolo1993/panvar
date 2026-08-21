@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # LPA association demo on the real graph: (reuse or build) -> describe --samples -> associate.
 # Produces (1) a region scan that recovers KIV-2 as the top hit, and (2) a structure-correction demo on a
-# synthetic genome-wide panel (naive lambda>>1 -> ~1 with PCs/LMM). See docs/gwas.md. Needs a
+# synthetic structure panel (naive lambda>>1 -> ~1 with the supplied PCs; the LMM is a negative
+# control here because this fixture's GRM does not capture the simulated structure). See docs/gwas.md. Needs a
 # numpy-capable python.
 #   run_lpa_real.sh <panvar_bin> <out_dir> [python] [Rscript] [--big]
 # Env: N (cohort size; --big sets 6000, the Moli-sani WGS scale), SIM (null markers, default 3000),
@@ -95,9 +96,9 @@ for sub in graph kmers; do
   done
 done
 
-echo "== 1b) VARIANT-LEVEL scan: one test per SV call (honest unit + LD-clumping) =="
-# The statistically honest unit: tests the SV calls directly, so n_tests = #variants (not correlated
-# k-mers/nodes). --unit auto-detects 'variant' from the variant feature_annot.
+echo "== 1b) VARIANT-LEVEL scan: one test per SV call (Li-Ji Meff + LD labels) =="
+# This coarser unit tests the SV calls directly, so n_tests = #variant records rather than the larger
+# set of correlated k-mers/nodes. Records can still be correlated or encode linked parts of one event.
 VD="$DESC/sample/variant"
 for mode in quant binary; do
   echo "   -- associate (variant / $mode) --"
@@ -114,7 +115,7 @@ for mode in quant binary; do
   fi
 done
 
-echo "== 2) STRUCTURE-CORRECTION demo on the synthetic genome-wide-like panel =="
+echo "== 2) STRUCTURE-CORRECTION demo on a synthetic panel with many null markers =="
 SGENO="$REAL/geno.sim.bimbam.gz"; SSAMP="$REAL/sim.samples.txt"; SANNOT="$REAL/feature_annot.sim.tsv.gz"
 if [ -f "$SGENO" ]; then
   echo "   -- naive (Age+Sex, no PCs): expect inflated lambda --"

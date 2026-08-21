@@ -2,7 +2,7 @@
 
 A single worked run of the whole pipeline on one real locus: LPA, whose KIV-2 tandem array varies in copy number between haplotypes. It shows every module except `associate`, which has its own [GWAS example](gwas.md).
 
-Every command runs against the committed test graph `tests/real_data/lpa.gfa.gz` and writes under `results/real_data/lpa/`. The whole run, and every figure on this page, is reproduced by `scripts/regen_results.sh lpa`.
+Every command runs against the committed test graph `tests/real_data/lpa.gfa.gz` and writes under `results/real_data/lpa/`. The numerical results and generated plots are reproduced by `scripts/regen_results.sh lpa`; the Bandage and interactive-viewer screenshots are illustrative views of those committed outputs.
 
 ```bash
 GFA=tests/real_data/lpa.gfa.gz
@@ -38,29 +38,17 @@ A linear reference backbone with the array ballooning into a dense tangle of par
 
 ## 2. `inspect` — cluster the haplotypes at a site
 
-Pulls every haplotype's walk through one site and groups them by how similarly they traverse it, which turns 466 walks into a handful of representative alleles.
+`inspect` is read-only and can be run at any stage. Before normalization, it exposes the 459 distinct array walks reported above and can cluster paths for closer inspection.
 
 ```bash
 ./build/panvar inspect \
-  -i "$OUT/refine/refine.normalized.sorted.gfa" \
-  --bubble-prefix-in "$OUT/refine/refine" --bubble-id 6 \
+  -i "$OUT/bubble/bubble.sorted.gfa" \
+  --bubble-prefix-in "$OUT/bubble/bubble" --bubble-id 7 \
   --cluster --cluster-similarity 0.97 \
-  -o "$OUT/inspect/inspect"
+  -o "$OUT/inspect/inspect_before"
 ```
 
-On the array this returns 7 clusters over all 466 paths. Plot the node-count matrix as a heatmap:
-
-```bash
-Rscript scripts/plot_node_coverage_heatmap.R \
-  --table "$OUT/inspect/inspect.bubble_6.node_counts.tsv" \
-  --node-lengths "$OUT/inspect/inspect.bubble_6.node_lengths.tsv" \
-  --cluster-by "$OUT/inspect/inspect.bubble_6.clusters.tsv" \
-  --out "$OUT/plots/lpa_node_heatmap"
-```
-
-![Per-node traversal counts across haplotypes](img/lpa_inspect_node_heatmap.png)
-
-Rows are representative haplotypes, columns the repeat-unit nodes. A haplotype with more copies traverses the unit nodes more often, so its row runs warmer across the repeat block: the heatmap is a direct picture of the copy-number ladder.
+The matrix is large because every physical copy is still spelled out. The compact, countable view appears after `panphorte`.
 
 ---
 
@@ -78,7 +66,7 @@ The array is spelled out copy by copy in the graph, which would type as a pile o
   --gtf tests/real_data/Homo_sapiens.GRCh38.116.gtf.gz
 ```
 
-At site 7 it folds a 5,547 bp unit carried by all 466 haplotypes, collapsing 3,485 nodes, with copy numbers spanning 1 to 32. The other 11 sites are reported `no_seed` or `below_prevalence` and are left alone — the prevalence gate is what keeps a private duplication out of the fold.
+At site 7 it folds a 5,547 bp unit, rewriting all 466 traversing paths and collapsing 3,485 nodes, with copy counts spanning 1 to 32. Of those paths, 465 meet the array-carrier definition used for the prevalence calculation; the remaining path carries one copy. The other 11 sites are reported `no_seed` or `below_prevalence` and are left alone — the prevalence gate is what keeps a private duplication out of the fold.
 
 ![The normalized graph in Bandage](img/lpa_panphorte_bandage.png)
 
@@ -94,10 +82,21 @@ The same cluster view on the normalized graph confirms the fold kept the per-hap
 ./build/panvar inspect \
   -i "$OUT/panphorte/panphorte.normalized.sorted.gfa" \
   --bubble-prefix-in "$OUT/panphorte/panphorte" --bubble-id 7 \
+  --cluster --cluster-similarity 0.97 \
   -o "$OUT/inspect/inspect_panphorte"
 ```
 
+```bash
+Rscript scripts/plot_node_coverage_heatmap.R \
+  --table "$OUT/inspect/inspect_panphorte.bubble_7.node_counts.tsv" \
+  --node-lengths "$OUT/inspect/inspect_panphorte.bubble_7.node_lengths.tsv" \
+  --cluster-by "$OUT/inspect/inspect_panphorte.bubble_7.clusters.tsv" \
+  --out "$OUT/plots/lpa_node_heatmap_panphorte"
+```
+
 ![The same site after folding](img/lpa_inspect_node_heatmap_panphorte.png)
+
+Rows are representative haplotypes and columns are nodes. More copies mean more traversals of the repeat-unit node, so the copy-number ladder remains visible after folding.
 
 ---
 
@@ -135,13 +134,13 @@ Diffs every haplotype's walk against the reference's and types each difference.
 
 On this locus: 5 deletions, 9 insertions and 3 duplications over 466 haplotype columns.
 
-The headline record is the array, `bubble6_DUP_5100`, on site 6 of the refined graph. It carries `REF_CN=6` and `RU_LEN=5547` with per-haplotype `CN` spanning 1 to 32 and 464 carriers, and `FORMAT:CNBP` giving the actual bases each haplotype gains or loses. Its `CN_METHOD` is `REP`: the array is a folded self-loop, so the copy number is a traversal count rather than an inference.
+The headline record is the array, `bubble6_DUP_5100`, on site 6 of the refined graph. It carries `REF_CN=6` and `RU_LEN=5547` with per-haplotype `CN` spanning 1 to 32 and 464 non-reference carriers. `FORMAT:CNBP` is the signed difference in module-walk bases relative to the reference; `CNRESID` records any difference from the ideal `(CN-REF_CN)×RU_LEN`. Its `CN_METHOD` is `REP`: the reported CN is the exact number of traversals of the folded unit in this graph. Because this run allowed 95% sequence similarity during folding, biological copy-number validity is established separately below rather than assumed from the topology.
 
 The other two duplications happen to exercise the other two routes, which is worth knowing because they carry different guarantees:
 
 | record | `CN_METHOD` | what a copy means |
 |---|---|---|
-| `bubble6_DUP_5100` | `REP` | traversals of a folded repeat unit — exact |
+| `bubble6_DUP_5100` | `REP` | exact traversal count of the represented repeat unit |
 | `bubble5_DUP_3916` | `MODULE_BP` | bases across a collapsed module, divided by a reference-calibrated unit |
 | `bubble8_DUP_7468` | `PEAK` | the highest multiplicity any interior node reaches — heuristic, and labelled `CN_CONFIDENCE=HEURISTIC` |
 
@@ -212,12 +211,12 @@ Four levels are reported and they are not interchangeable. The first three impla
 
 ![Reconstruction anatomy across the reference loci](img/benchmark_qv.png)
 
-- Graph ceiling: near 100% at every locus, because it substitutes the true block wherever a call shares a node with it.
+- Graph ceiling: near 100% at every locus, because it substitutes the true block wherever a call overlaps the truth event's node space. This is a discovery/representation ceiling, not the region VCF reconstruction.
 - From the VCF alone: 85.3% identity at this locus, 99.7% at the least varied of the six.
 - Where the loss lives: the residual partitioned into five terms that sum to it exactly.
 - Variation found: the residual split into sub-threshold and missed. Missed is zero everywhere.
 
-The third panel is the one to read first. `Not found` is 0.00% at all six loci — the caller finds every eligible truth event and puts it on the right haplotypes — and essentially the whole residual is `Wrongly represented`, from 2.3% of the baseline distance at the least affected locus to 56.0% at the most. The loss is in how the region VCF encodes what it found, not in discovery or genotyping.
+The third panel is the one to read first. `Not found` is 0.00% at all six loci: every above-threshold truth event overlaps at least one emitted call. That is a discovery statement, not a guarantee that every carrier genotype is correct. Carrier false negatives remain at ACOT and CYP2D6, while most residual bases come from how the compact region VCF represents overlapping or merged calls.
 
 That is also why the allele VCF closes the gap completely. `call --allele-vcf` spells every allele out instead of describing it, and reconstructing from it gives 0 bp residual on all six loci. Both figures live in `results/reconstruction.tsv`; neither replaces the other.
 
@@ -227,15 +226,15 @@ Two metrics are reported and they answer different questions. Identity is a per-
 
 ## Not just one locus
 
-`scripts/regen_results.sh` runs the same pipeline on six loci and checks copy number against per-haplotype ground truth.
+`scripts/regen_results.sh` runs the same pipeline on six loci and compares copy number with committed assembly-derived truth tables. These checks are independent of the GWAS phenotype simulation, but they are validation on the six supplied loci rather than a universal accuracy guarantee.
 
 ![Called copy number against truth, by locus](img/cn_correlation.loci.png)
 
-At this locus every one of the 465 haplotypes with a truth value is called exactly right. Where a duplication's paralogs are divergent enough to carry private k-mers, the module's total is also split per gene:
+At LPA every one of the 465 haplotypes with a truth value is called exactly right. This validates the 95%-similarity fold on this dataset; the same conclusion should not be inferred for a new locus without suitable truth. Where paralogs carry usable private k-mers, the module total can also be split per gene:
 
 ![Called copy number against truth, by gene](img/cn_correlation.genes.png)
 
-Points off the diagonal are gene-conversion mosaics and unannotated hybrid modules. Genes that sit outside the folded module are single-copy and have nothing to resolve, so they are not split out.
+Points off the diagonal are disagreements between the private-marker estimate and the annotation-derived truth. Gene-conversion mosaics, hybrid modules, ambiguous markers and annotation differences can all contribute. Genes outside the represented module are not split out.
 
 ---
 

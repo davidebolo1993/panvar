@@ -56,17 +56,15 @@ void evaluate_direction(
     const std::vector<std::size_t>& inside_positions,
     std::optional<BubblePathInterval>& best) {
 
-    // The rule is "the interval with the most interior steps wins, shortest span then leftmost to
-    // break a tie". Enumerating start/end pairs to find that is quadratic, and the bound that made it
-    // affordable -- the first 64 endpoints after each start -- silently clipped the answer wherever a
-    // boundary recurs more than that: a tandem array, a duplication, any path revisiting a boundary
-    // enough times. A focused 70-repeat path reported an interior of 64.
+    // The rule is "the interval with the most interior steps wins, shortest span then leftmost to break
+    // a tie". Enumerating start/end pairs to find that is quadratic, and any bound that makes it
+    // affordable silently clips the answer wherever a boundary recurs often -- a tandem array, a
+    // duplication, any path revisiting a boundary enough times.
     //
-    // No enumeration is needed. The interior count is monotone under containment, so the WIDEST
-    // interval attains the maximum, and every interval attaining it must contain all of those
-    // interior steps. The shortest one is therefore the tightest window around them: the last start
-    // before the first interior step, and the first end after the last. Exact, and two binary
-    // searches rather than a bounded scan.
+    // No enumeration is needed. The interior count is monotone under containment, so the WIDEST interval
+    // attains the maximum and every interval attaining it contains all of those interior steps. The
+    // shortest such interval is the tightest window around them: the last start before the first
+    // interior step, the first end after the last. Exact, in two binary searches.
     if (start_positions.empty() || end_positions.empty()) {
         return;
     }

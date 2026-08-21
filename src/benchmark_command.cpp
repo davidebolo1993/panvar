@@ -616,9 +616,8 @@ int run_benchmark_command(const std::vector<std::string>& args) {
     // the bubble a caller said nothing about is precisely the one a miss lives in.
     bool called_only = false;
     bool write_events = true;
-    // How a copy-number record is laid down. `cnbp` -- the per-sample bp delta -- is the default
-    // because it is measured: on acot it closes 95.7% of the gap against 51.5% for `cn`, since
-    // CN x RU_LEN understates the true bp change by roughly half at a cyclic array.
+    // How a copy-number record is laid down. `cnbp` -- the per-sample bp delta -- is the default: it is
+    // the measured quantity, where CN x RU_LEN understates the true bp change at a cyclic array.
     bool dup_cn_model = false;
 
     for (std::size_t i = 0; i < args.size(); ++i) {

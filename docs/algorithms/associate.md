@@ -86,14 +86,14 @@ The two correction layers in order:
 ── Layer A: multiple-testing BURDEN (phenotype-blind) ───────────────────────────────────
 3. Meff       variant: phenotype-blind Li–Ji eigen estimate; LD-clump count is a fallback
               feature: annotated bubble groups + unannotated singleton blocks
-4. p_adj      p_bonf = p·n_tests | p_bonf_meff = p·Meff | q_bh = BH-FDR (primary)
+4. p_adj      p_bonf = p·n_tests | p_bonf_meff = p·Meff | q_bh = BH-FDR summary
 ── Layer B: INDEPENDENCE (phenotype-aware) ──────────────────────────────────────────────
 5. CONDITION  variant: forward-stepwise COJO (entry --cojo-p, default 0.05/Meff) -> signal/shadow
               feature: condition on top lead; r²>0.95 vs lead -> collinear, else conditioned
               -> p_conditional, cond_role  (cojo_independent_signals in summary)
 ```
 
-`scripts/plot_associate.R` draws three Manhattan panels — raw `-log10(p)`, BH `-log10(q)`, and (when the columns are present) `-log10(p_conditional)`, where shadows collapse below the line and only the conditioning signal(s) stay tall.
+`scripts/plot_associate.R` draws three Manhattan panels — raw `-log10(p)`, BH `-log10(q)`, and (when the columns are present) `-log10(p_conditional)`. The last panel shows which rows meet the configured conditional entry rule and which are labelled shadows or collinear.
 
 ## Worked trace
 

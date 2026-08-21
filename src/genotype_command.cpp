@@ -1110,10 +1110,9 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     // Resolve a held-out haplotype's truth by running the SAME allele enumeration
                     // that built the panel, over a graph whose paths are the held-out ones. The two
                     // used to be separate code paths -- the panel enumerated alleles while the truth
-                    // re-spelled the walk by hand -- and they drifted: on lpa the same haplotype at the
-                    // same block resolved to 252332 bp in the panel and 180244 bp when re-spelled, so
-                    // every leave-one-out score was measured against a truth the panel disagreed with.
-                    // One routine, used for both, is the only way to keep them from drifting again.
+                    // re-spelled the walk by hand -- and they drifted, so leave-one-out scores were
+                    // measured against a truth the panel itself disagreed with. One routine used for
+                    // both is the only way to keep that from happening again.
                     for (std::size_t bi = 0; bi < chain.size(); ++bi) {
                         const auto it = held_blocks[bi].allele_of.find(name);
                         if (it == held_blocks[bi].allele_of.end()) continue;
@@ -1329,7 +1328,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             }
                         }
                         cev.target_bp[bi] = bp;
-                        // Gate A measured this estimator to about 1% on lpa; 2% is deliberately loose,
+                        // The estimator is good to about 1%; 2% is deliberately loose,
                         // so the constraint rules out whole repeat units without arbitrating between
                         // pairs that are both plausible -- that arbitration is the markers' job.
                         cev.target_sd[bi] = 0.02 * bp;
@@ -1510,6 +1509,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 // Reported alongside is the best any panel allele could have achieved. Without it the
                 // metric flatters: at a block whose alleles are all but identical, any pick scores
                 // high, and the number would say more about the block than about the caller.
+
                 // ---- certified nearest-pair oracle -------------------------------------------
                 // The existing oracle shortlists by syncmer-set Jaccard and aligns only the top 16, so
                 // it certifies nothing: Jaccard is order- and multiplicity-blind, which is exactly

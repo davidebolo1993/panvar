@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Build a structured diploid cohort + literature-based Lp(a) phenotype on the REAL LPA graph.
+"""Build a structured diploid positive-control cohort on the real LPA graph.
 
 Reads panphorte's <prefix>.panphorte.copies.tsv (KIV-2 copies per real haplotype path), partitions the
-real haplotypes into a few Southern-European-like SUBPOPULATIONS, and samples diploid individuals by
+real haplotypes into a few simulated SUBPOPULATIONS, and samples diploid individuals by
 drawing a subpopulation and then two haplotypes from it. This injects realistic POPULATION STRUCTURE:
 subpopulations differ both in KIV-2 allele frequency and in a baseline Lp(a) offset that is NOT caused by
 KIV-2 (an ancestry/environment confounder). A naive GWAS that ignores ancestry is therefore inflated
-(genomic inflation lambda > 1); adding the ancestry PCs as covariates (or an LMM with a kinship matrix)
-brings it back to ~1. That before/after is the point of the example.
+(genomic inflation lambda > 1); the supplied ancestry covariates are designed to remove it. The LMM
+run is a separate negative control here because its locus-panel relationship matrix does not capture
+the simulated structure. That contrast is the point of the example.
 
 Phenotype (synthetic values, literature-plausible shape and effect direction):
 
@@ -26,7 +27,8 @@ Outputs in <out_dir>:
   pheno.quant.nopc.tsv    same but WITHOUT the PCs (the naive/uncorrected analysis)
   pheno.binary.nopc.tsv
   phenotypes.tsv          legacy truth table (kiv2 dosage, raw Lp(a), subpop) for sanity checks
-  kinship.tsv             n x n GRM from haplotype sharing (only if --kinship-out and n is small enough)
+  kinship.tsv             n x n locus-panel relationship matrix from haplotype sharing
+                          (only if --kinship-out and n is small enough; not a genome-wide GRM)
 
 Usage:
   make_lpa_phenotype.py <copies.tsv> <out_dir> [--n N] [--seed S] [--subpops K] [--kinship-out PATH]
@@ -59,10 +61,11 @@ def parse_args(argv):
     p.add_argument("--n", type=int, default=None, help="number of diploid individuals (default 200)")
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--subpops", type=int, default=3, help="number of subpopulations (default 3)")
-    p.add_argument("--kinship-out", default=None, help="write an n x n GRM here (skipped if n is large)")
-    p.add_argument("--kinship-max-n", type=int, default=3000, help="skip GRM file above this n")
+    p.add_argument("--kinship-out", default=None,
+                   help="write an n x n LPA-panel relationship matrix here (not a genome-wide GRM)")
+    p.add_argument("--kinship-max-n", type=int, default=3000, help="skip the relationship matrix above this n")
     p.add_argument("--sim-markers", type=int, default=0,
-                   help="also emit a synthetic genome-wide-like marker panel (causal KIV-2 + N "
+                   help="also emit a synthetic many-null marker panel (causal KIV-2 + N "
                         "subpop-stratified null SNPs) for the structure-correction demo (needs numpy)")
     p.add_argument("--strat-sd", type=float, default=0.15,
                    help="per-subpop allele-frequency sd for the stratified null markers (default 0.15)")
@@ -186,7 +189,8 @@ def main(argv):
     write_pheno(os.path.join(a.out_dir, "pheno.quant.nopc.tsv"), "log10lpa", qfmt, False)
     write_pheno(os.path.join(a.out_dir, "pheno.binary.nopc.tsv"), "case", bfmt, False)
 
-    # optional kinship GRM from genome-wide haplotype sharing; skipped for large n or no numpy
+    # optional locus-panel relationship matrix from LPA haplotype sharing; this is a test input for
+    # the LMM path, not the external genome-wide GRM a real association study should supply
     if a.kinship_out:
         if a.n > a.kinship_max_n:
             print(f"  (skipping kinship: n={a.n} > --kinship-max-n={a.kinship_max_n}; "
@@ -212,9 +216,10 @@ def main(argv):
                         f.write("\t".join(f"{x:.6g}" for x in Kmat[i]) + "\n")
                 print(f"  wrote kinship GRM {a.kinship_out} ({a.n}x{a.n})")
 
-    # optional synthetic genome-wide panel for the structure-correction demo: real KIV-2 dosage +
+    # optional many-null synthetic panel for the structure-correction demo: real KIV-2 dosage +
     # subpop-stratified null SNPs. The nulls are spuriously associated under a naive scan (inflated
-    # lambda) but corrected by PCs/LMM, while KIV-2 survives. See docs/gwas/example.md.
+    # lambda) but corrected by the supplied PCs, while KIV-2 survives. The LMM run is retained as a
+    # negative control for the locus-panel relationship matrix. See docs/gwas.md.
     if a.sim_markers > 0:
         try:
             import gzip

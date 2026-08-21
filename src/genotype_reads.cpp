@@ -187,8 +187,8 @@ std::vector<BlockDepth> estimate_depth(
         // Every block with ANY anchors gets a local estimate. The old `v.size() < min_anchors`
         // skip contradicted the shrinkage below: that pass exists precisely so a block with a handful
         // of anchors is pulled toward the region rather than falling off a cliff, but a block that
-        // never computed a local value has nothing to pull. At lpa that discarded 61 anchors across
-        // six bubble blocks. `min_anchors` now flags weak local evidence instead of gating it.
+        // never computed a local value has nothing to pull, so the skip discarded usable anchors at
+        // exactly the blocks that needed them. `min_anchors` flags weak local evidence, not gates it.
         if (v.empty()) continue;
         d.low_anchor = v.size() < min_anchors;
         // `anchor_median` stays the median whatever the estimator, so the raw audit column means the

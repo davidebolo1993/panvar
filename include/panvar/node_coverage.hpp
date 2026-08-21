@@ -9,10 +9,10 @@
 // candidate -- and under leave-one-out every candidate lacks some of the sample's sequence, while a
 // longer array carries more distinct unit variants and so lacks less. Nodes do not have that problem:
 // the graph holds an array as a cycle, so alleles differ in how many TIMES they cross a node rather
-// than in which nodes they contain. At lpa's KIV-2 block the haplotypes use 2319-2347 of 3791 nodes
-// (a 1% spread) while their step counts vary threefold.
+// than in which nodes they contain: across a large array the haplotypes use nearly the same node set
+// (a spread of about 1%) while their step counts vary several-fold.
 //
-// Why alignment rather than syncmers here. The median node in that graph is 1 bp and 86% of nodes are
+// Why alignment rather than syncmers here. The median node in such a graph is 1 bp and most nodes are
 // shorter than k=31, so no k-mer can be assigned to them at all -- and those short nodes are exactly
 // the SNP and indel bubbles that separate haplotypes. An alignment carries base-level coverage across
 // node boundaries and reaches them.

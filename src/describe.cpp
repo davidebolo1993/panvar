@@ -810,16 +810,15 @@ std::vector<KeepSpan> variant_keep_mask(
 
 // The bubble's own boundaries, kept on EVERY traversing allele of a selected bubble.
 //
-// Without this, --variant-nodes loses the deletion entirely. A DEL's EVENT_NODES are precisely the
-// nodes the ALT haplotype does NOT have, so on that haplotype the mask finds no seed, keeps nothing,
-// and the bypass edge source->sink is never counted because neither endpoint is kept -- nor are the
-// junction k-mers that span it. The deletion is then represented only by the ABSENCE of reference
-// features, which is not a positive genotyping signal and is exactly what flank-based genotyping needs.
+// Without this, --variant-nodes loses a deletion entirely. A DEL's EVENT_NODES are the nodes the ALT
+// haplotype does NOT have, so the mask keeps nothing there and neither the bypass edge source->sink nor
+// the junction k-mers spanning it are counted. The deletion is then represented only by the ABSENCE of
+// reference features, which is not a positive genotyping signal.
 //
-// The steps are the canonical source->sink walk, so the first and last are the boundaries. They are
-// marked kept (which restores the ALT-specific edge) and given the flank bases facing inward (which
-// restores the junction k-mers). Boundary NODE features are constant across traversers and the
-// discriminative filter drops them, so this adds the alt-specific signal without adding noise.
+// Steps are the canonical source->sink walk, so the first and last are the boundaries: marking them
+// kept restores the ALT-specific edge, and the inward-facing flank restores the junction k-mers.
+// Boundary NODE features are constant across traversers, so the discriminative filter drops them and
+// this adds signal without noise.
 void keep_bubble_boundaries(const Graph& graph, const std::vector<PathStep>& steps,
                             std::size_t flank_bp, std::vector<KeepSpan>& keep) {
     if (steps.empty() || keep.size() != steps.size()) return;

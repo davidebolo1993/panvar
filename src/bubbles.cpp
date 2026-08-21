@@ -170,11 +170,11 @@ bool node_id_less(const std::string& a, const std::string& b) {
 
 // Orient every bubble so `source` is the reference-LEFT boundary and `sink` the reference-RIGHT one.
 //
-// The cactus decomposition names the two boundaries of a snarl, but nothing in it fixes which is which:
-// on a three-node graph whose reference is 1,2,3 it reports source=3, sink=1. That is not wrong as a
-// snarl -- the pair is unordered -- but every consumer downstream reads them as an interval in
-// reference order: `call` derives POS from the source, merging joins one bubble's sink to the next
-// bubble's source, and a coordinate written from a reversed pair lands at the wrong end.
+// The cactus decomposition names the two boundaries of a snarl, but nothing in it fixes which is which
+// -- the pair is unordered, so it can report the reference-right boundary as the source. Every consumer
+// downstream reads them as an interval in reference order: `call` derives POS from the source, merging
+// joins one bubble's sink to the next bubble's source, and a coordinate written from a reversed pair
+// lands at the wrong end.
 //
 // A bubble the reference does not traverse has no reference order to take, and is left alone.
 void orient_bubbles_to_reference(const Graph& graph, const std::string& reference_path,
@@ -260,17 +260,12 @@ std::unordered_map<std::string, std::pair<std::size_t, std::size_t>> reference_o
 
 // Merge bubbles that sit close together on the REFERENCE.
 //
-// The old version sorted by source node id and joined `current.sink` to `next.source` through an
-// undirected shortest path, which assumed cactus order follows reference order. It does not: on the
-// bundled synthetic graph the reference traverses 2..4 while cactus reports source=4, sink=2, and with
-// a large threshold the fused bubble ended up containing nodes before its own source and after its own
-// sink. It also seeded the distance with the whole length of the starting boundary node, so two
-// bubbles sharing a boundary had a nominal gap of zero yet failed to merge when that node was long.
-//
-// Ordering and distance now both come from reference coordinates. The gap between two bubbles is the
-// sequence strictly BETWEEN the facing boundaries -- after the left bubble's sink ends, before the
-// right bubble's source begins -- which is zero for bubbles that abut or share a boundary. A fused
-// bubble is validated: every interior node must lie inside the new span, or the merge is refused.
+// Ordering and distance both come from reference coordinates, not from node ids: cactus order does not
+// follow reference order, so ordering by source id can fuse a bubble with one that is not its
+// neighbour. The gap is the sequence strictly BETWEEN the facing boundaries -- after the left bubble's
+// sink ends, before the right bubble's source begins -- which is zero for bubbles that abut or share a
+// boundary, and excludes the boundary nodes' own lengths. A fused bubble is validated: every interior
+// node must lie inside the new span, or the merge is refused.
 std::vector<Bubble> merge_nearby_bubbles(
     const Graph& graph,
     const PackedGraph& packed,
@@ -439,23 +434,17 @@ void evaluate_endpoint_interval_direction(
     bool source_to_sink,
     std::optional<EndpointOnlyInterval>& best) {
 
-    // Where a boundary recurs, the enclosing traversal ends at a LATER occurrence and the nearest one
-    // closes an interval holding almost none of the snarl. This used to enumerate the endpoints after
-    // each start, bounded at 64 to keep it affordable, which silently clipped any path revisiting a
-    // boundary more often than that.
+    // Where a boundary recurs, the enclosing traversal ends at a LATER occurrence, and the nearest one
+    // closes an interval holding almost none of the snarl. No enumeration is needed to find it: the
+    // interval is ranked on `inside_steps`, which here is `right - left - 1` -- a span, not a count of
+    // interior nodes -- so widest and most-interior-steps are the same requirement, and the widest pair
+    // (earliest start, latest end) is unique.
     //
-    // The enumeration was never needed. This interval is ranked on `inside_steps`, which here is just
-    // `right - left - 1` -- the span, not a count of interior nodes -- so "most interior steps" and
-    // "widest" are the same requirement, and better_endpoint_interval's shortest-span tie-break is
-    // unreachable because equal inside_steps means equal span. The widest pair is the earliest start
-    // with the latest end, and it is unique: any other pair has a strictly smaller span.
-    //
-    // An ADJACENT pair (end_pos == start_pos + 1) is a real crossing with an empty interior, and it was
-    // once rejected here. That looks harmless -- it contributes no interior nodes -- but this interval
-    // is also what tells the graph-derived search which SIDE of each boundary faces inward. With every
-    // stored path taking the direct source->sink route, no interval survived, the graph search was
-    // never seeded, and an alternate allele that exists in the graph produced no bubble at all. It is
-    // admitted here (right > left), and it wins only when there is nothing wider.
+    // An ADJACENT pair (end_pos == start_pos + 1) is a real crossing with an empty interior, and it is
+    // admitted. It contributes no interior nodes, but it is also what tells the graph-derived search
+    // which SIDE of each boundary faces inward: reject it and a site where every stored path takes the
+    // direct source->sink route seeds no search and produces no bubble at all. It wins only when there
+    // is nothing wider.
     if (start_positions.empty() || end_positions.empty()) {
         return;
     }
@@ -592,22 +581,20 @@ std::unordered_set<std::uint32_t> interior_indices_for_pair(
     return inside_idx_set;
 }
 
-// B5. The interior of a snarl is a property of the GRAPH, not of the panel that happens to walk it.
+// The interior of a snarl is a property of the GRAPH, not of the panel that happens to walk it.
 //
 // Collecting only the nodes some stored path visits between the boundaries understates the site
 // wherever the graph carries a branch this panel does not use -- an allele nobody in the cohort
 // carries is still part of the variant. Everything computed from `inside` inherits that: the
-// interior-span filters, the --superbubbles acyclicity search (a cycle on an unwalked branch is
-// invisible), and the fused-span validation in merging.
+// interior-span filters, the --superbubbles acyclicity search, and merging's fused-span validation.
 //
-// So the interior is derived here from the graph, in the standard snarl sense: the nodes reachable
-// from the near boundary's inner handle that also reach the far boundary, without leaving through a
-// boundary. The traversal is over oriented HANDLES for the reason interior_has_cycle gives -- leaving
-// a node forward departs its end, reversed departs its start.
+// So the interior is also derived from the graph, in the standard snarl sense: nodes reachable from
+// the near boundary's inner handle that also reach the far boundary without leaving through a
+// boundary, traversed over oriented handles for the reason interior_has_cycle gives.
 //
-// Two deliberate conservatisms. The result is UNIONED with the path-derived set rather than replacing
-// it, so a pair that is not really a snarl cannot lose nodes the panel proves are between its
-// boundaries; and the search is capped, because a leaky pair floods the whole component, in which case
+// Two deliberate conservatisms: the result is UNIONED with the path-derived set rather than replacing
+// it, so a pair that is not really a snarl cannot lose nodes the panel proves lie between its
+// boundaries; and the search is capped, since a leaky pair floods the whole component, in which case
 // the path-derived answer stands alone.
 constexpr std::size_t kMaxInteriorHandles = 1u << 20;
 
@@ -748,16 +735,15 @@ struct CandidateInterval {
 
 // Does the snarl's INTERIOR contain a directed cycle?
 //
-// Cyclicity was previously inferred from what the stored paths happen to do -- a self-loop, a path
-// revisiting an interior node, a node used in both orientations. All three are real signals, but none
-// of them looks at the graph: an interior cycle that no stored path traverses was reported as acyclic
-// and survived --superbubbles, which exists precisely to exclude it. A superbubble's interior must be a
-// DAG whether or not anybody walked it.
+// Asked of the graph, not of the paths. Self-loops, path revisits and both-orientation use are all real
+// signals of cyclicity, but none of them sees a cycle no stored path happens to traverse -- and
+// --superbubbles exists precisely to exclude those. A superbubble's interior must be a DAG whether or
+// not anybody walked it.
 //
 // The search is over oriented HANDLES, not node names. A bidirected node is two vertices: leaving it
-// forward departs its end, leaving it reversed departs its start, so `A.end` gives the successors of
-// (A,+) and `A.start` those of (A,-). Collapsing to node names would call `A+ -> B+ -> A-` a cycle when
-// it is a perfectly ordinary hairpin-free traversal of two distinct handles.
+// forward departs its end, reversed departs its start, so `A.end` gives the successors of (A,+) and
+// `A.start` those of (A,-). Collapsing to node names would call `A+ -> B+ -> A-` a cycle when it is an
+// ordinary traversal of two distinct handles.
 bool interior_has_cycle(const Graph& graph, const std::vector<std::string>& inside) {
     if (inside.size() < 2) return false;
     std::unordered_map<std::string, std::size_t> index;
@@ -1104,13 +1090,12 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
     }
 
     // Overlapping retained sites: two bubbles claiming the same interior node describe the same
-    // sequence twice. Downstream that is not a nuisance but a hard stop -- panphorte refuses to fold
-    // both, because rewriting one span inside the other would corrupt the enclosing one, so a locus
-    // with an overlap cannot be processed at all (ANKRD36C fails there today).
+    // sequence twice. Downstream that is a hard stop rather than a nuisance -- panphorte refuses to
+    // fold both, since rewriting one span inside the other would corrupt the enclosing one.
     //
-    // Project policy is to keep the ENCLOSING site and drop the smaller ones it contains, so the
-    // conflict resolves toward more sequence rather than less. Reported, because dropping a site
-    // loses finer resolution and that should be visible rather than silent.
+    // Policy is to keep the ENCLOSING site and drop the smaller ones it contains, so the conflict
+    // resolves toward more sequence rather than less. Reported, because dropping a site loses finer
+    // resolution and that should be visible rather than silent.
     if (bubbles.size() > 1) {
         std::sort(bubbles.begin(), bubbles.end(), [](const Bubble& a, const Bubble& b) {
             if (a.inside.size() != b.inside.size()) return a.inside.size() < b.inside.size();  // EXPERIMENT: prefer smaller

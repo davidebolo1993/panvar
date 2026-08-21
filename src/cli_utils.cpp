@@ -259,16 +259,13 @@ void commit_staged(const std::string& staged, const std::string& final_path) {
     std::filesystem::rename(staged, final_path, ec);
     if (!ec) return;
 
-    // The old fallback copied STRAIGHT ONTO the destination and then removed the staged file whether
-    // or not the copy reported an error. That is the one thing this function exists to prevent: a
-    // copy interrupted half-way leaves a truncated file where a complete one used to be, and the
-    // caller's rollback has nothing to restore from because the reserve is a different file entirely.
+    // Never copy straight onto the destination: a copy interrupted half-way leaves a truncated file
+    // where a complete one used to be, which is the one thing this function exists to prevent.
     //
-    // A staged file is always a sibling of its destination, so a failed rename here is not the
-    // ordinary cross-filesystem case -- it means something unexpected. Copy to a SECOND sibling and
-    // rename that complete copy into place, so the destination is only ever replaced atomically. If
-    // any step fails the destination is untouched and the staged file is left for the caller's
-    // cleanup.
+    // A staged file is always a sibling of its destination, so a failed rename here is not the ordinary
+    // cross-filesystem case -- it means something unexpected. Copy to a SECOND sibling and rename that
+    // complete copy into place, so the destination is only ever replaced atomically. If any step fails
+    // the destination is untouched and the staged file is left for the caller's cleanup.
     const std::string bridge = staging_path(final_path, "commit");
     std::error_code copy_ec;
     std::filesystem::copy_file(staged, bridge, std::filesystem::copy_options::overwrite_existing,
@@ -334,21 +331,18 @@ std::string StagedOutputs::stage(const std::string& final_path) {
 }
 
 void StagedOutputs::commit() {
-    // Installing sequentially made every module's output family non-atomic: a rename that failed on
-    // the fourth of six files left three new outputs beside three stale ones, with a non-zero exit
-    // and nothing saying which was which. Each module page promises the opposite -- a refusal leaves
-    // the previous complete output intact -- so the guarantee belongs here, once, rather than in
-    // eight partial re-implementations.
+    // A module's whole output family installs together or not at all: every module page promises that a
+    // refusal leaves the previous complete output intact, so the guarantee lives here once rather than
+    // in a partial re-implementation per module.
     //
     // Any destination that already exists is moved aside first, so a failure can put it back. On
     // success the reserves are dropped; on failure this run's installs are removed and the reserves
     // restored, in reverse order.
-    // The entry is recorded as soon as the SET-ASIDE succeeds, not after the install. Recording it
-    // afterwards left a window with no owner: if installation failed between moving the old file to
-    // its reserve and putting the new one in place, that destination was absent from `installed`, so
-    // rollback skipped it -- the old output stayed in a `*-prev` file under a name nobody would look
-    // for, and the destination was simply gone. `new_installed` distinguishes "this reserve needs
-    // restoring" from "a file of ours is sitting there and must be removed first".
+    //
+    // The entry is recorded as soon as the SET-ASIDE succeeds, not after the install -- otherwise a
+    // failure between the two leaves that destination unowned, so rollback skips it and the old output
+    // stays parked under a name nobody would look for. `new_installed` distinguishes "this reserve
+    // needs restoring" from "a file of ours is sitting there and must be removed first".
     struct Installed {
         std::string final_path;
         std::string reserve;            // empty when the destination did not exist before this run

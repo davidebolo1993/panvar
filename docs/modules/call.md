@@ -8,7 +8,7 @@ Types structural variants on the pangenome graph into a multi-sample VCF (Varian
 - diffs every haplotype's `source → sink` walk against a reference walk and types each difference (`DEL`/`INS`/`INV`/`DUP`, see the [table](#event-types) below)
 - reduces fragmentation by coalescing events within a haplotype and clustering equivalent events across haplotypes
 - recovers sub-threshold carriers by force-calling them against the merged record
-- reads exact tandem-repeat copy number directly from self-loop traversal counts, and optionally infers copy number for other repeated modules (`--cn`)
+- reads the exact traversal count of a represented tandem-repeat self-loop, and optionally infers copy number for other repeated modules (`--cn`)
 
 Algorithm and worked trace: [algorithms/call.md](../algorithms/call.md).
 
@@ -74,7 +74,7 @@ VCF 4.2; samples are haplotypes. Core `FORMAT` fields are `GT` (`1` carrier / `0
 | `INS_SUBTYPE` | `NOVEL`/`DUP` (`--classify-ins`) |
 | `REF_CN` | `DUP` only: reference copy number |
 | `CN_METHOD` / `CN_SCOPE` | `DUP` only: which of the three CN routes measured this — `REP` (exact traversal count of a panphorte self-loop), `MODULE_BP` (folded-node bp over a reference-calibrated unit), `PEAK` (highest interior-node multiplicity) — and whether a copy is a copy of a `REPEAT_UNIT` or of a `COLLAPSED_MODULE` |
-| `RU_LEN` | `CN_METHOD=REP` only: the literal repeat unit, where `(CN − REF_CN) × RU_LEN` is the haplotype's size |
+| `RU_LEN` | `CN_METHOD=REP` only: the represented repeat-unit length; `(CN − REF_CN) × RU_LEN` is the repeat-copy component of the size, while `CNBP` is the full module-walk change and `CNRESID` is their difference |
 | `CN_UNIT_BP` | `CN_METHOD=MODULE_BP` only: the calibrated unit CN was divided by. This is the shared per-copy content, not a whole copy, so it understates a carrier's true gain or loss |
 | `CN_SHARED_BP` / `CN_REF_FOLD` / `CN_MODULE_REF_BP` | the calibration inputs (`CN_UNIT_BP = CN_SHARED_BP / CN_REF_FOLD`) and the reference's total bp across the module |
 | `CN_DOSAGE_MODEL`, `CN_ROUND_AMBIGUOUS_FRAC`, `CN_STEP_*` | `MODULE_BP` model and diagnostics; the VCF header defines each field and records whether panel spacing was used |

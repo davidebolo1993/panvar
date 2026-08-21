@@ -114,8 +114,8 @@ std::vector<BlockCall> genotype_sample(
         //
         // Detected-marker fraction cannot rank alleles that differ mainly in copy number: they share
         // the repeat unit's syncmers, so nearly every allele scores alike and the top-K is decided by
-        // the index tie-break. Measured on lpa's KIV-2 block, 457 alleles: the allele nearest the
-        // truth in length was pruned before pairing. Stratifying by length guarantees the candidate
+        // the index tie-break, so the allele nearest the truth in length can be pruned before
+        // pairing. Stratifying by length guarantees the candidate
         // set spans the range whatever the score does, which needs no knowledge of the locus -- a
         // block whose alleles are all the same length simply gets its top-scoring alleles back, since
         // the stratified picks collapse onto them.
@@ -187,28 +187,22 @@ std::vector<BlockCall> genotype_sample(
             return it == wt.end() ? 1.0 : it->second;
         };
 
-        // A marker the candidate pair does not carry is predicted at the error background, so observing
-        // real counts there is nearly impossible and the marker becomes a veto. Under leave-one-out
-        // that is guaranteed to happen: the sample's own allele is gone, so EVERY candidate lacks some
-        // of the sample's sequence, and the one that lacks least wins whatever else it gets wrong.
-        //
-        // Measured at lpa's KIV-2 block, comparing the called pair against the most identical available
-        // pair: 57 markers carried by one and not the other, holding 797 of 451,000 observed counts,
-        // contributed +2704 log units, while the 951 markers both carry at differing copy number --
-        // holding 404,138 counts, 90% of the data -- contributed +453. A five-thousandth of the reads
-        // outvoted nine tenths of them, six to one. And the bias has a direction: a longer tandem array
-        // carries more distinct unit variants, so it is more likely to contain any given marker, which
-        // is why the call came out two repeat units too long.
+        // A marker the candidate pair does not carry is predicted at the error background, so real
+        // counts there are nearly impossible and the marker becomes a veto. Under leave-one-out that is
+        // guaranteed: the sample's own allele is gone, so EVERY candidate lacks some of its sequence,
+        // and the one that lacks least wins whatever else it gets wrong. The bias has a direction --
+        // a longer tandem array carries more distinct unit variants, so it is likelier to contain any
+        // given marker -- which is why such calls come out too long.
         //
         // So every marker gets a mixture: mostly the allele's own prediction, and with probability
         // `marker_outlier` a broad component standing for sequence the candidate does not model. That
         // bounds what one marker can say without changing what many markers say together.
+        //
         // The outlier component is FLAT, not another Poisson. Unmodelled sequence is present at an
         // unknown copy number, so marginalising the count over that unknown gives a near-uniform
-        // density across the range a marker could reach -- about 1/(lambda * max copies). A Poisson at
-        // the block's mean count was tried first and is too narrow: it still charges ~20 log units for
-        // a marker the candidate lacks, which halved the problem instead of removing it (the identity
-        // oracle moved from emission rank 29 to 14 and the call did not change).
+        // density across the range a marker could reach, about 1/(lambda * max copies). A Poisson at the
+        // block's mean is too narrow: it still charges tens of log units for an absent marker, which
+        // halves the problem rather than removing it.
         const double eps = std::min(0.5, std::max(0.0, options.marker_outlier));
         double max_mult = 1.0;
         for (const auto& mset : panel.by_block[bi]) {
@@ -264,10 +258,10 @@ std::vector<BlockCall> genotype_sample(
         // crossing the block), independent of how many markers it holds.
         //
         // Scored jointly under rho, the total is shrunk by the same factor as the composition and stops
-        // deciding anything. Measured at lpa's KIV-2 array: the pair whose total length is correct
-        // ranks 4270th of 457x457 by emission alone, while a pair one repeat unit short ranks first at
-        // GQ 99 -- the likelihood was trading a uniform 3.7% shortfall in predicted counts, which costs
-        // it almost nothing per marker, against unit-variant composition, which costs it a lot. The
+        // deciding anything. At a large array that is decisive: the pair with the correct total length
+        // can rank thousands of places below one a repeat unit short, because the likelihood trades a
+        // uniform shortfall in predicted counts -- almost free per marker -- against unit-variant
+        // composition, which is not. The
         // total is exactly the statistic that distinguishes them, so it gets its own weight.
         //
         // Worked in multiplicity rather than in bases: informative-marker density is not a property of
@@ -334,8 +328,8 @@ std::vector<BlockCall> genotype_sample(
             // thousands of independent observations. Without it the coverage blocks are enormously
             // more decisive than the marker blocks they are chained to -- a scale mismatch, not a
             // difference in evidence -- and they drag the haplotype assignment across the whole locus.
-            // Measured on lpa leave-one-out before this: routing four blocks to coverage took the pairs
-            // from 15/13/18/11 exact blocks down to 12/11/15/7.
+            // Left unscaled, routing even a few blocks to coverage measurably degrades the rest of the
+            // chain.
             double rho_cov = 1.0;
             if (options.fragment_len > 0.0 && !cnodes.empty()) {
                 std::vector<std::size_t> lens = blocks[bi].allele_bp;
@@ -358,34 +352,22 @@ std::vector<BlockCall> genotype_sample(
             const double span2 = lens2.empty() ? 0.0 : static_cast<double>(lens2[lens2.size() / 2]);
             scale_neff = 2.0 * lambda * span2 / options.fragment_len;
         }
-        // Whether the block's TOTAL should be trusted is a property of the panel, not of the sample, so
-        // it is decided here rather than tuned.
+        // Use the block's TOTAL only where SHAPE cannot decide, and decide that from the PANEL rather
+        // than from the sample, so the rule cannot be tuned by the data it judges.
         //
-        // Shape can only separate two alleles when their marker PROPORTIONS differ. When an allele
-        // contributes nothing at all -- a bypass, i.e. a haplotype that deletes the block -- every
-        // genotype containing it has the same proportions as the homozygote and differs only in
-        // magnitude. There the total is the entire signal and must be used.
+        // Shape can only separate alleles whose marker PROPORTIONS differ. When an allele contributes
+        // nothing -- a bypass, a haplotype that deletes the block -- every genotype containing it has
+        // the same proportions as the homozygote and only magnitude separates them, so there the total
+        // is the entire signal. Everywhere else shape is available and the total is the more fragile
+        // half: it is what a mis-estimated lambda corrupts, what a paralogue inflates, and what
+        // divergence from a folded consensus deflates.
         //
-        // Where all alleles do carry markers, shape is available and the total is the more fragile of
-        // the two: it is what a mis-estimated lambda corrupts, what a paralogue inflates, and what copy
-        // divergence from a folded consensus deflates. Measured on the ladder, a single global weight
-        // cannot serve both -- the folded-consensus fixture needs the total ignored (36/36 against
-        // 28/36) while the nested fixture needs it used (36/36 against 27/36).
-        // Use the block's TOTAL only where SHAPE cannot decide. That is precisely when some allele
-        // contributes nothing -- a bypass, a haplotype that deletes the block -- because then every
-        // genotype containing it has the same marker proportions as the homozygote and only magnitude
-        // separates them. Everywhere else shape is available, and the total is the more fragile half:
-        // it is what a mis-estimated lambda corrupts, what a paralogue inflates, and what divergence
-        // from a folded consensus deflates.
-        //
-        // A data-driven alternative was tried -- also use the total wherever alleles differ in
-        // magnitude, unless no candidate can account for the observed mass. On lpa it reproduced the
-        // baseline exactly, so it bought nothing there, and it cost the folded-consensus fixture
-        // (32/36 against 36/36). The simpler rule is kept.
+        // A data-driven alternative -- also use the total wherever alleles differ in magnitude -- was
+        // measured and bought nothing while costing the folded-consensus case. The simpler rule stands.
         //
         // The cost to state: at a tandem array with no bypass allele, copy number IS the scale and this
-        // rule discards it, so `called_bp` at such a block is less accurate. `mass_bp` remains the
-        // copy-number answer there, which is what block_class=array already says.
+        // rule discards it, so `called_bp` there is less accurate. `mass_bp` remains the copy-number
+        // answer at such a block, which is what block_class=array already says.
         if (blocks[bi].bypass_allele < 0) scale_neff = 0.0;
         double cov_target = 0.0, cov_sd = 0.0;
         if (coverage != nullptr && bi < coverage->target_bp.size() && coverage->target_bp[bi] > 0.0 &&
@@ -475,10 +457,10 @@ std::vector<BlockCall> genotype_sample(
                 // total count gains one observation per fragment crossing it, not one per marker, so
                 // its relative error is 1/sqrt(fragments) and does not shrink with rho.
                 //
-                // Scored the old way -- scale buried inside the discounted product -- lpa's KIV-2 block
-                // preferred a pair two repeat units too long by 208 log units, because a uniform 4.4%
-                // excess in predicted counts costs almost nothing per marker after rho, while the
-                // unit-variant composition it buys is worth a great deal. The total, which says
+                // With the scale buried inside the discounted product, a large array prefers a pair
+                // several repeat units too long: a uniform excess in predicted counts costs almost
+                // nothing per marker after rho, while the unit-variant composition it buys is worth a
+                // great deal. The total, which says
                 // unambiguously that the pair is 4.4% too big, was being shrunk 22-fold alongside it.
                 const double scale = (options.mass_weight > 0.0 && pred_in > 0.0 && obs_in > 0.0)
                                          ? obs_in / pred_in : 1.0;
@@ -519,10 +501,10 @@ std::vector<BlockCall> genotype_sample(
                     mass_ll = -0.5 * options.mass_weight * z * z;
                 }
                 // Coverage says how much sequence is here; the markers say which alleles it is. The
-                // two are good at different halves: at lpa's KIV-2 block the marker emission places one
-                // haplotype at identity 0.9999 and puts the entire error in the other, while the
-                // coverage emission gets the total to 30 bases and splits the error across both. So the
-                // markers keep the choice and coverage only constrains the sum.
+                // two are good at different halves: the marker emission places one haplotype almost exactly
+                // and puts the whole error in the other, while the coverage emission gets the TOTAL
+                // nearly right and splits the error across both. So the markers keep the choice and
+                // coverage only constrains the sum.
                 //
                 // This is not the earlier mass term, which failed. That took its target from marker
                 // mass -- the same evidence it was correcting -- and enforced it hard enough to pick
@@ -828,8 +810,8 @@ std::vector<BlockCall> genotype_sample(
         //
         // This matters because an allele call is quantised to the lengths the panel happens to hold.
         // When the sample's own array is not among them the call lands on the nearest whole array,
-        // which at lpa's KIV-2 is a whole repeat unit away; the mass estimate is continuous and does
-        // not have to round to a panel member.
+        // which at a tandem array can be a whole repeat unit away; the mass estimate is continuous
+        // and does not have to round to a panel member.
         {
             const double bp1 = c.allele1 < blocks[bi].allele_bp.size()
                                    ? static_cast<double>(blocks[bi].allele_bp[c.allele1]) : 0.0;
@@ -880,9 +862,9 @@ std::vector<BlockCall> genotype_sample(
 
         // A block with no markers of its own is NOT evidence-free: the forward-backward carries the
         // haplotype assignment in from its neighbours, which is the whole point of chaining blocks.
-        // On ankrd36c only the two flank blocks retain markers after region uniqueness, yet all 23
-        // blocks are called correctly from linkage alone -- so treating "no local markers" as a
-        // no-call discarded 21 correct calls. Such blocks are marked LINKED and still face the same
+        // At a locus where region uniqueness leaves only the flanks with markers, the interior blocks
+        // are still called correctly from linkage alone, so treating "no local markers" as a no-call
+        // throws away correct calls. Such blocks are marked LINKED and still face the same
         // GQ gate, so the user can tell locally-supported calls from inherited ones.
         // `explained` is undefined without local markers, so the off-panel test is skipped there
         // rather than being read as "the panel explains none of this".

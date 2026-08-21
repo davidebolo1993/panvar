@@ -7,10 +7,9 @@
 // so which haplotype carries what is only knowable from the VCF.
 //
 // It is read strictly, because a call's node set is the whole basis on which anything downstream is
-// attributed to that call. A stale node, a dropped row or a mis-parsed bubble id does not fail --
+// attributed to that call. A stale node, a dropped row or a mis-parsed bubble id would not fail --
 // it produces exactly the output a genuine caller miss produces, and the two are indistinguishable
-// afterwards. `benchmark` reclassified a called truth event as missed and exited 0; `describe`
-// silently omits the features of any row it drops. Nothing here is skipped or repaired.
+// afterwards. So nothing here is skipped or repaired.
 
 #include <cstddef>
 #include <map>

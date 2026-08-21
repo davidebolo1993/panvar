@@ -133,9 +133,9 @@ SampleCoverage inject_reads(
     // whether a tandem array is measurable at all. minimap2 discards minimizers that occur more often
     // than mid_occ, which mm_mapopt_update derives from the index -- sensible for mapping to a genome,
     // exactly wrong here. The panel holds hundreds of near-identical haplotypes and the array is a
-    // cycle, so a seed inside it occurs (paths x copies) times: at lpa about 11,000. Left at the
-    // default, 23% of reads failed to place and the array nodes came back at 2.59 times their
-    // traversal count where every other multiplicity band sat at 12-15.
+    // cycle, so a seed inside it occurs (paths x copies) times -- easily tens of thousands. Left at
+    // the default, a large share of reads fail to place and the array nodes come back at a small
+    // fraction of the coverage every other multiplicity band shows.
     map_opt.mid_occ = std::numeric_limits<int>::max();
     map_opt.max_occ = std::numeric_limits<int>::max();
     map_opt.mid_occ_frac = 0.0f;

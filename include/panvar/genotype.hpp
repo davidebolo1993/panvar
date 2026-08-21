@@ -19,9 +19,8 @@ struct GenotypeOptions {
     // independent observations: roughly the block span divided by the fragment length, not the marker
     // count. 0 disables the correction.
     double fragment_len = 350.0;
-    // Measured, not guessed. Sweeping the threshold on lpa leave-one-out over 6 pairs, 88 exact and
-    // 26 wrong calls: GQ>=10 keeps 80% of exact calls at 90% precision, while GQ>=20 keeps only 65% at
-    // 89%. Precision plateaus from 10 upward, so every point above it costs recall and buys nothing.
+    // Measured, not guessed: sweeping the threshold, precision plateaus from about 10 upward, so
+    // every point above it costs recall and buys nothing.
     double min_gq = 10.0;
     double min_explained = 0.5;        // below this, the panel does not account for what was observed
     // Two-sided bound on obs/pred. Below it the reads do not account for what the call predicts (a
@@ -33,16 +32,10 @@ struct GenotypeOptions {
     // the block, not markers), with each pair's overall scale profiled out of the per-marker product so
     // the two do not double count.
     //
-    // OFF by default, because it was measured and it does not help. The reasoning was that the ESS
-    // discount shrinks the total alongside the composition, so a pair 4.4% too long in total copy
-    // number could buy unit-variant composition cheaply -- and at lpa's KIV-2 block the reads do fix
-    // the total to about 1.2%, sharply enough to see that. But at its honest weight the term is worth
-    // ~7.5 log units against composition gaps of 200+, so it never overturns anything (output identical
-    // on 8 lpa pairs), and forced hard enough to win it makes the answer WORSE: identity to the truth
-    // 0.957 -> 0.914, the identity-oracle rank of the second haplotype 1 -> 160, and the locus 11/18 ->
-    // 2/18 blocks. The length target it was chasing is not jointly achievable -- it picks each
-    // haplotype's nearest length independently of sequence -- and the model was already choosing the
-    // most similar available allele for both. Kept so the negative result stays reproducible.
+    // OFF by default: measured, and it does not help. At its honest weight the term is far too small to
+    // overturn a composition preference, and forced hard enough to win it makes identity to the truth
+    // worse -- it chases each haplotype's nearest LENGTH independently of sequence, which is not
+    // jointly achievable. Kept so the negative result stays reproducible.
     double mass_weight = 0.0;
     // Probability that a marker's count comes from sequence the candidate allele does not model rather
     // than from the allele itself, mixed against a flat component (unmodelled sequence sits at an
@@ -51,61 +44,45 @@ struct GenotypeOptions {
     // under leave-one-out every candidate lacks some of the sample's sequence.
     //
     // OFF by default: the diagnosis is right and the remedy is not enough. It moves the most identical
-    // available pair from emission rank 29 to 9 as eps goes 0 to 0.05, monotonically, so the mechanism
-    // is real -- but it never flips the call, block-13 identities come out byte-identical at eps 0.01,
-    // and across 8 lpa pairs exact blocks fall 117/155 to 112/155. Capping the vetoes leaves a residual
-    // preference for the longer allele spread thinly over many markers, and pushing eps far enough to
-    // beat that discards real evidence. Kept so the measurement is reproducible.
+    // available pair up the emission ranking, monotonically in eps, so the mechanism is real -- but it
+    // never flips a call, and pushing eps far enough to beat the residual preference for the longer
+    // allele discards real evidence. Kept so the measurement is reproducible.
     double marker_outlier = 0.0;
+    // Hard window, in relative deviations, on a block's total marker multiplicity, applied only at
+    // tandem arrays that have no bypass allele. Candidates outside it are not scored. 0 disables.
+    //
+    // Why a constraint is wanted at all: a likelihood maximising read explanation always prefers a
+    // SUPERSET allele at an array, since an allele containing the sample's array plus extra units
+    // explains every read and the extra copies cost only a modest over-prediction. The emission is not
+    // wrong to prefer it -- total length is information the emission does not have.
+    //
+    // OFF by default, for a decisive reason: it breaks leave-zero-out, refusing haplotypes the panel
+    // demonstrably contains. What it does buy is the array's TOTAL LENGTH, to within a fraction of a
+    // repeat unit -- so constrain the number you report, in the copy-number output, not the allele you
+    // call. A soft penalty instead of a window cannot work: at its honest precision it is worth a
+    // couple of log units against composition preferences two orders of magnitude larger.
+    double mass_window = 0.0;
+    // Huber threshold on the standardised residual, in standard deviations. 0 disables.
+    //
+    // A Poisson or negative-binomial term has UNBOUNDED influence: a marker the candidate does not
+    // carry is predicted at the error background, so real counts there cost tens of log units, while a
+    // few percent error on a well-predicted marker costs almost nothing. A handful of absent markers
+    // can therefore outvote a thousand carrying nearly all the observed mass. Under leave-one-out every
+    // candidate lacks some of the sample's sequence and a longer array lacks less, so that asymmetry
+    // has a direction -- toward calling too long.
+    //
+    // A bounded loss is the standard answer to contaminated data: quadratic while the residual is
+    // small, linear beyond. The multinomial does NOT solve this -- o * log(p) with p near zero is just
+    // as unbounded.
+    double robust_c = 0.0;
     // Score a block by the SHAPE of its count vector rather than its magnitude: model the observed
     // counts as a multinomial draw whose proportions come from the candidate pair, instead of as
     // independent Poissons around absolute predicted means.
     //
     // This is what "allele balance" means formally, and it is how SNV callers decide zygosity, because
-    // a ratio survives things absolute depth does not -- a contaminated marker set, a mis-estimated
-    // lambda, a locus with unusual coverage. It is also the only form in which a marker set that a
-    // paralogue has inflated can still be used at all.
-    // Huber threshold on the standardised residual, in standard deviations. 0 disables.
-    //
-    // A Poisson or negative-binomial term has UNBOUNDED influence: a marker the candidate does not
-    // carry is predicted at the error background, so observing real counts there costs tens of log
-    // units, while a 5% error on a marker predicted at 500 costs about 0.6. Measured at lpa's KIV-2
-    // block, 57 markers holding 0.18% of the observed mass outvoted 951 markers holding 90% of it, six
-    // to one. Under leave-one-out every candidate lacks some of the sample's sequence, and a longer
-    // tandem array lacks less, so that asymmetry has a direction and it is the one that makes the call
-    // too long.
-    //
-    // A bounded loss is the standard answer to contaminated data: quadratic while the residual is
-    // small, linear beyond, so no single marker can dominate however badly it fits. The multinomial
-    // does NOT solve this -- o * log(p) with p near zero is just as unbounded.
-    // Hard window, in relative deviations, on a block's total marker multiplicity, applied only at
-    // tandem arrays that have no bypass allele. Candidates outside it are not scored. 0 disables.
-    //
-    // OFF by default, and the reason is decisive: it breaks leave-zero-out. On cyp2d6, where the
-    // sample's own haplotypes ARE in the panel and an exact call must be reachable, it takes 76/76
-    // blocks down to 67/76. A constraint that prevents recovering a haplotype the panel contains is
-    // wrong whatever it buys elsewhere.
-    //
-    // What it does buy, and what it should be used FOR: the array's total length. On lpa block 13 it
-    // takes the mean absolute length error from 3470 bases to 15, every pair within 29. That belongs in
-    // the copy-number report, not in the genotype likelihood -- constrain the number you report, not
-    // the allele you call.
-    //
-    // Why the constraint is needed at all: a likelihood that maximises read explanation will
-    // always prefer a SUPERSET allele at an array. An allele containing the sample's array plus two
-    // extra units explains every read perfectly, and the extra copies cost only a modest
-    // over-prediction -- confirmed independently by mapping simulated 15 kb reads with minimap2, where
-    // 156 of them chose a 128,909 bp allele over the 117,821 bp one that is closest by edit distance.
-    // The emission is not wrong to prefer it; total length is simply information the emission does not
-    // have, and the window is where it enters.
-    //
-    // A soft penalty was tried and cannot work: at its honest precision it is worth about 2 log units
-    // against a composition preference of 129. A window is not a trade, it is a statement that the
-    // total is known -- and it is: the marker-mass estimate recovers KIV-2 copy number exactly on 7 of
-    // 8 pairs, mean error 0.87%. An earlier window attempt used the ALIGNMENT-derived estimate, which
-    // is biased +2.63% and could not resolve one repeat unit; this uses the marker-derived one.
-    double mass_window = 0.0;
-    double robust_c = 0.0;
+    // a ratio survives what absolute depth does not -- a contaminated marker set, a mis-estimated
+    // lambda, unusual coverage. It is also the only form in which a marker set a paralogue has inflated
+    // remains usable at all.
     bool compositional = false;
     // Weight on the SCALE half of the compositional emission, relative to the shape half. The total's
     // nominal precision is the number of fragments crossing the block, but that assumes counting noise
@@ -202,10 +179,9 @@ struct BlockCall {
     //   allele1/allele2 and called_bp -- the closest panel alleles BY CONTENT. At an array the panel
     //     rarely holds the sample's own arrangement, and the likelihood favours whichever allele
     //     carries most of the sample's repeat-unit variants, which is not the one with the right
-    //     number of copies. Measured on lpa's KIV-2 block, called_bp misses by up to 11 kb.
-    //   mass_bp +- mass_bp_sd -- how much sequence the READS say is there, which is the copy number.
-    //     On the same block it lands within 1.2% (-19, -522, +1700 bases against truths of 252, 280
-    //     and 152 kb).
+    //     number of copies, so at a large array called_bp can miss by several repeat units.
+    //   mass_bp +- mass_bp_sd -- how much sequence the READS say is there, which is the copy number,
+    //     and which lands within a couple of percent where called_bp does not.
     // Taking called_bp for the copy number at an array is the mistake this column exists to prevent.
     bool is_array = false;
     std::size_t hap1 = 0;        // most probable panel haplotype pair at this block
