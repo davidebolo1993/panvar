@@ -1,4 +1,5 @@
 #include "panvar/three_edge_cc.hpp"
+#include <functional>
 
 // Vendored, near-verbatim, from vg src/algorithms/three_edge_connected_components.cpp
 // (three_edge_connected_component_merges_dense). Debug output removed; namespace changed.

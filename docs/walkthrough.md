@@ -1,8 +1,8 @@
-# Walkthrough — the LPA locus, end to end
+# Walkthrough — one locus, end to end
 
-A single worked run of the whole pipeline on one real locus: LPA (the `LPA` gene's KIV-2 VNTR — a variable-number tandem repeat whose copy number is a known cardiovascular risk factor). It shows the usage of all the modules in `panvar` with the exception of `associate`, which is covered by the dedicated [GWAS example](gwas.md); here it is only pointed at.
+A single worked run of the whole pipeline on one real locus: LPA, whose KIV-2 tandem array varies in copy number between haplotypes. It shows every module except `associate`, which has its own [GWAS example](gwas.md).
 
-Every command runs against the committed test graph `tests/real_data/lpa.gfa.gz` and writes under `results/real_data/lpa/`. The whole run is reproduced by `scripts/regen_results.sh lpa`. The reference path is `GRCh38#0#chr6:160509252-160734894`.
+Every command runs against the committed test graph `tests/real_data/lpa.gfa.gz` and writes under `results/real_data/lpa/`. The numerical results and generated plots are reproduced by `scripts/regen_results.sh lpa`; the Bandage and interactive-viewer screenshots are illustrative views of those committed outputs.
 
 ```bash
 GFA=tests/real_data/lpa.gfa.gz
@@ -10,61 +10,51 @@ REF="GRCh38#0#chr6:160509252-160734894"
 OUT=results/real_data/lpa
 ```
 
+A note on bubble ids before starting. `panphorte` and `refine` both re-decompose the graph after rewriting it, and each decomposition numbers the sites it finds. An id therefore identifies a site within one stage, not across stages: the array below is bubble 7 as `bubble` finds it and bubble 6 by the time `call` runs. Each step here says which stage its numbers come from.
+
 ---
 
 ## 1. `bubble` — find the variant sites
 
-Sorts/flips the graph along the reference and decomposes it into bubbles (snarl sites where haplotypes diverge). On LPA this yields 12 bubbles; the KIV-2 tandem is bubble 7, spanning ~12–184 kb across the 466 haplotypes (its size is the copy-number variation).
+Sorts and flips the graph along the reference, then decomposes it into snarls: boundary-node pairs whose removal isolates an interior subgraph. On this locus that yields 12 sites across 466 haplotypes.
 
 ```bash
 ./build/panvar bubble \
--i "$GFA" \
--o "$OUT/bubble/bubble" \
--r "$REF" \
---gtf tests/real_data/Homo_sapiens.GRCh38.116.gtf.gz
+  -i "$GFA" \
+  -o "$OUT/bubble/bubble" \
+  -r "$REF" \
+  --gtf tests/real_data/Homo_sapiens.GRCh38.116.gtf.gz
 ```
 
-Bandage plot, from `$OUT/bubble/bubble.sorted.gfa` + `bubble.bandage_nodes.csv`):
+The tandem array is site 7 at this stage. Its interior span runs from 12,270 bp to 184,333 bp across the panel, and it carries 459 distinct alleles among 466 haplotypes — the size range is the copy-number variation, and the allele count is what makes it hard.
 
-![LPA bubble graph in Bandage](img/lpa_bubble_bandage.png)
+Bandage view of `$OUT/bubble/bubble.sorted.gfa` coloured by `bubble.bandage_nodes.csv`:
 
-The linear reference backbone with the KIV-2 site ballooning into a dense tangle of parallel node paths — one strand per copy-number allele. That tangle is bubble 7.
+![The locus graph in Bandage](img/lpa_bubble_bandage.png)
+
+A linear reference backbone with the array ballooning into a dense tangle of parallel paths, one strand per copy-number allele.
 
 ---
 
-## 2. `inspect` — cluster the haplotypes at the site
+## 2. `inspect` — cluster the haplotypes at a site
 
-A sanity check on one bubble: it pulls every haplotype's `source → sink` walk through bubble 7 and clusters them by walk similarity.
+`inspect` is read-only and can be run at any stage. Before normalization, it exposes the 459 distinct array walks reported above and can cluster paths for closer inspection.
 
 ```bash
 ./build/panvar inspect \
   -i "$OUT/bubble/bubble.sorted.gfa" \
   --bubble-prefix-in "$OUT/bubble/bubble" --bubble-id 7 \
-  --cluster \
-  --cluster-similarity 0.95 \
-  -o "$OUT/inspect/inspect"
+  --cluster --cluster-similarity 0.97 \
+  -o "$OUT/inspect/inspect_before"
 ```
 
-Then, run `scripts/plot_node_coverage_heatmap.R`:
-
-```bash
-Rscript scripts/plot_node_coverage_heatmap.R \
-  --table "$OUT/inspect/inspect.bubble_7.node_counts.tsv" \
-  --node-lengths "$OUT/inspect/inspect.bubble_7.node_lengths.tsv" \
-  --cluster-by "$OUT/inspect/inspect.bubble_7.clusters.tsv" \
-  --clusters "$OUT/inspect/inspect.bubble_7.clusters.tsv" \
-  --out "$OUT/plots/lpa_node_heatmap"
-```
-
-![LPA bubble graph in Bandage](img/lpa_inspect_node_heatmap.png)
-
-Rows are (representative) haplotypes, columns are the repeat-unit nodes. A haplotype with more KIV-2 copies traverses the unit nodes more times, so its row is warmer across the repeat block — the heatmap is a direct picture of the copy-number ladder. Drop `--clusters` to show all the haplotypes.
+The matrix is large because every physical copy is still spelled out. The compact, countable view appears after `panphorte`.
 
 ---
 
 ## 3. `panphorte` — fold the tandem into a countable unit
 
-The KIV-2 array is spelled out copy-by-copy in the graph, which would mis-type as a pile of insertions. `panphorte` collapses each detected tandem array onto one repeat-unit (`REP`) node with a self-loop, so copy number becomes the loop-traversal count. On LPA bubble 7 it folds a 5,547 bp unit carried by all 466 haplotypes, collapsing 3,484 nodes, with copies ranging 1–32.
+The array is spelled out copy by copy in the graph, which would type as a pile of insertions. `panphorte` collapses it onto one repeat-unit node with a self-loop, so copy number becomes the number of traversals.
 
 ```bash
 ./build/panvar panphorte \
@@ -72,46 +62,47 @@ The KIV-2 array is spelled out copy-by-copy in the graph, which would mis-type a
   --bubble-prefix-in "$OUT/bubble/bubble" \
   -o "$OUT/panphorte/panphorte" \
   --reference-path "$REF" \
-  --min-similarity 0.90 \
+  --min-similarity 0.95 \
   --gtf tests/real_data/Homo_sapiens.GRCh38.116.gtf.gz
 ```
 
-![LPA panphorte-normalized graph in Bandage](img/lpa_panphorte_bandage.png)
+At site 7 it folds a 5,547 bp unit, rewriting all 466 traversing paths and collapsing 3,485 nodes, with copy counts spanning 1 to 32. Of those paths, 465 meet the array-carrier definition used for the prevalence calculation; the remaining path carries one copy. The other 11 sites are reported `no_seed` or `below_prevalence` and are left alone — the prevalence gate is what keeps a private duplication out of the fold.
 
-The KIV-2 tangle has collapsed to a single node with a self-loop back onto itself — the whole array is now one countable unit. Contrast with the step-1 Bandage view of the same site.
+![The normalized graph in Bandage](img/lpa_panphorte_bandage.png)
+
+The tangle has become a single node with a self-loop onto itself. Compare with the step-1 view of the same site.
 
 ---
 
 ## 4. `inspect` again — on the folded graph
 
-The same cluster view, now on the `panphorte` output, confirms the fold preserved the per-haplotype signal: the copy-number ladder is still there, just read off self-loop traversals instead of a long node run.
+The same cluster view on the normalized graph confirms the fold kept the per-haplotype signal: the ladder is still there, now read off self-loop traversals instead of a long node run.
 
 ```bash
 ./build/panvar inspect \
   -i "$OUT/panphorte/panphorte.normalized.sorted.gfa" \
   --bubble-prefix-in "$OUT/panphorte/panphorte" --bubble-id 7 \
+  --cluster --cluster-similarity 0.97 \
   -o "$OUT/inspect/inspect_panphorte"
 ```
-
-Then, run `scripts/plot_node_coverage_heatmap.R`. Let's use the clusters coming from the previous `inspect` run to have a clear visual comparison with the previous heatmap:
 
 ```bash
 Rscript scripts/plot_node_coverage_heatmap.R \
   --table "$OUT/inspect/inspect_panphorte.bubble_7.node_counts.tsv" \
   --node-lengths "$OUT/inspect/inspect_panphorte.bubble_7.node_lengths.tsv" \
-  --cluster-by "$OUT/inspect/inspect.bubble_7.clusters.tsv" \
-  --clusters "$OUT/inspect/inspect.bubble_7.clusters.tsv" \
+  --cluster-by "$OUT/inspect/inspect_panphorte.bubble_7.clusters.tsv" \
   --out "$OUT/plots/lpa_node_heatmap_panphorte"
 ```
 
+![The same site after folding](img/lpa_inspect_node_heatmap_panphorte.png)
 
-![LPA inspect on the panphorte graph](img/lpa_inspect_node_heatmap_panphorte.png)
+Rows are representative haplotypes and columns are nodes. More copies mean more traversals of the repeat-unit node, so the copy-number ladder remains visible after folding.
 
 ---
 
-## 5. `refine` — remove graph-builder artifacts (optional)
+## 5. `refine` — remove graph-builder artifacts
 
-`call` diffs node-walks, so when the graph builder splits one true event across adjacent snarls it reports the split as separate records. `refine` re-aligns the actual per-haplotype interior sequences with POA (abPOA), collapsing such artifacts, and emits panphorte's output family so its graph is a drop-in for `call`. It is opt-in, sequence-lossless, and `DUP`-safe: folded self-loop REP nodes (like LPA's KIV-2 unit) are held fixed and only the residual flanks around them are re-aligned; a bubble carrying an unfolded copy-number revisit is skipped.
+Where the graph builder split one true event across adjacent snarls, `call` would report the split as separate records. `refine` re-aligns the actual per-haplotype interior sequences and collapses such artifacts, holding folded repeat-unit nodes fixed so copy number is untouched.
 
 ```bash
 ./build/panvar refine \
@@ -122,24 +113,38 @@ Rscript scripts/plot_node_coverage_heatmap.R \
   --gtf tests/real_data/Homo_sapiens.GRCh38.116.gtf.gz
 ```
 
-On LPA the KIV-2 tangle (bubble 7) is left untouched — it carries an unfolded revisit, so the DUP copy-number signal is preserved intact — while smaller bubbles are cleaned (e.g. a balanced +439/−439 bp INS+DEL pair, the same displaced sequence the builder split in two, collapses to nothing). To type the refined graph, point `call`/`describe`/`inspect` at the refine prefix instead of the panphorte one (`-i "$OUT/refine/refine.normalized.sorted.gfa" --bubble-prefix-in "$OUT/refine/refine"`). The rest of this walkthrough stays on the panphorte output, since the LPA copy-number story is unaffected.
+Here 7 regions are rebuilt and 5 skipped, and the re-decomposition leaves 11 sites where there were 12. The array's region is among those skipped, by design: it carries the copy-number signal, and re-aligning it would linearize the copies. Losslessness is checked rather than assumed, so every haplotype still spells exactly what it spelled on the way in.
+
+From here on, `call` and `describe` read the refine prefix.
 
 ---
 
 ## 6. `call` — type the variants and read copy number
 
-Diffs every haplotype against the reference and emits a VCF. On LPA: 7 DEL, 13 INS, 3 DUP. The headline record is the KIV-2 DUP on bubble 7: `REF_CN=6`, `RU_LEN=5547`, with a per-sample `CN` spanning 1–32 copies (and `CNBP` giving the actual bp each haplotype gains/loses).
+Diffs every haplotype's walk against the reference's and types each difference.
 
 ```bash
 ./build/panvar call \
-  -i "$OUT/panphorte/panphorte.normalized.sorted.gfa" \
-  --bubble-prefix-in "$OUT/panphorte/panphorte" --reference-path "$REF" \
+  -i "$OUT/refine/refine.normalized.sorted.gfa" \
+  --bubble-prefix-in "$OUT/refine/refine" --reference-path "$REF" \
   -o "$OUT/call/call" \
-  --cn \
+  --cn --allele-vcf \
   --gtf tests/real_data/Homo_sapiens.GRCh38.116.gtf.gz
 ```
 
-`scripts/plot_vcf_map.R` plot the oncoprint-style variant map), subsetting to 50 haplotypes:
+On this locus: 5 deletions, 9 insertions and 3 duplications over 466 haplotype columns.
+
+The headline record is the array, `bubble6_DUP_5100`, on site 6 of the refined graph. It carries `REF_CN=6` and `RU_LEN=5547` with per-haplotype `CN` spanning 1 to 32 and 464 non-reference carriers. `FORMAT:CNBP` is the signed difference in module-walk bases relative to the reference; `CNRESID` records any difference from the ideal `(CN-REF_CN)×RU_LEN`. Its `CN_METHOD` is `REP`: the reported CN is the exact number of traversals of the folded unit in this graph. Because this run allowed 95% sequence similarity during folding, biological copy-number validity is established separately below rather than assumed from the topology.
+
+The other two duplications happen to exercise the other two routes, which is worth knowing because they carry different guarantees:
+
+| record | `CN_METHOD` | what a copy means |
+|---|---|---|
+| `bubble6_DUP_5100` | `REP` | exact traversal count of the represented repeat unit |
+| `bubble5_DUP_3916` | `MODULE_BP` | bases across a collapsed module, divided by a reference-calibrated unit |
+| `bubble8_DUP_7468` | `PEAK` | the highest multiplicity any interior node reaches — heuristic, and labelled `CN_CONFIDENCE=HEURISTIC` |
+
+Draw the calls as an oncoprint-style map:
 
 ```bash
 Rscript scripts/plot_vcf_map.R \
@@ -149,105 +154,101 @@ Rscript scripts/plot_vcf_map.R \
   --max-paths 50
 ```
 
-![LPA call variant map](img/lpa_vcf_map.png)
+![The called variants across haplotypes](img/lpa_vcf_map.png)
 
+Rows are haplotypes, columns are calls grouped by site. The array is the wide band shaded by copy number; deletions, insertions and inversions take their own colours. That gradient is the copy-number spectrum the pipeline exists to recover.
 
-Rows are haplotypes, columns are called variants grouped by bubble. The KIV-2 column is the wide blue band shaded by `FORMAT:CN` — dark = high copy number. DEL are red, INS green/purple, INV orange. The KIV-2 blue gradient is the copy-number spectrum the whole pipeline was after.
-
-For a per-node, interactive view of the same calls, build the viewer bundle and launch the Shiny + plotly app (`scripts/build_variant_node_data.R` + `scripts/variant_node_heatmap_app.R`; needs `shiny`, `plotly`, `data.table`, `DT`):
+For a per-node view of how each haplotype traverses the graph under every call, build the viewer bundle and launch the app:
 
 ```bash
 Rscript scripts/build_variant_node_data.R \
-  --gfa "$OUT/panphorte/panphorte.normalized.sorted.gfa" \
-  --variant-nodes "$OUT/call/call.variant_nodes.tsv" \
+  --gfa "$OUT/refine/refine.normalized.sorted.gfa" \
   --vcf "$OUT/call/call.region.vcf" \
-  --bubbles "$OUT/panphorte/panphorte.bubbles.csv" \
-  --node-genes "$OUT/call/call.node_genes.tsv" \
+  --variant-nodes "$OUT/call/call.variant_nodes.tsv" \
   --out "$OUT/plots/lpa_variant_nodes.rds"
 
 VN_RDS="$OUT/plots/lpa_variant_nodes.rds" Rscript scripts/variant_node_heatmap_app.R
 ```
 
-The app serves at `http://127.0.0.1:<port>` (printed on launch). It opens on the representative haplotypes across the whole locus: each row is a haplotype, each column a variant node (width ∝ node length) coloured by traversal count — white = untraversed, grey = ×1, red-gradient = ×2+ — so the KIV-2 `DUP` shows as the deep-red copy-number band. Hover a node for its gene/coverage/genotype; pick a bubble to zoom, or click a `variant_id` to pull up its carriers.
-
-![LPA node-coverage viewer](img/lpa_node_coverage.png)
+![The interactive node-coverage viewer](img/lpa_node_coverage.png)
 
 ---
 
-## 7. `describe` — genotype features for association
+## 7. `describe` — features for association
 
-Turns the called bubbles into per-haplotype dosage features (k-mer, node/edge graph, and per-variant), exported as BIMBAM matrices — the input to `associate`. Restricting to the called variant nodes keeps only features that carry signal.
+Turns the called sites into per-haplotype feature matrices on three substrates: k-mers and node/edge dosages spelled from the graph, and variant-level dosages read from the VCF.
 
 ```bash
 ./build/panvar describe \
-  -i "$OUT/panphorte/panphorte.normalized.sorted.gfa" \
-  --bubble-prefix-in "$OUT/panphorte/panphorte" \
+  -i "$OUT/refine/refine.normalized.sorted.gfa" \
+  --bubble-prefix-in "$OUT/refine/refine" \
   --out-dir "$OUT/describe" \
-  --variant-nodes "$OUT/call/call.variant_nodes.tsv"
+  --variant-nodes "$OUT/call/call.variant_nodes.tsv" \
+  --no-wide-matrix
 ```
----
 
-## 8. `associate` — the GWAS
+A copy-number locus is first-class here: the variant substrate carries the duplication's `CN` as its dosage rather than a presence flag, so the association tests the copy number itself. Pass `--samples` with a sample-to-haplotype table to get diploid per-sample matrices as well.
 
-Association (`phenotype ~ genotype`, multiple-testing correction, conditional independence) is its own worked example on this exact LPA output: see [GWAS example](gwas.md). In short, testing the KIV-2 features against a Lp(a) phenotype recovers the KIV-2 copy-number signal as the region's top hit, and structure correction keeps the genomic-inflation λ ≈ 1.
-
+The association step is covered in the [GWAS example](gwas.md).
 
 ---
 
-## 9. `benchmark` — round-trip reconstruction of the calls
+## 8. `benchmark` — how much of the sequence comes back
 
-How faithfully do the calls reconstruct the haplotypes? For each called bubble and each haplotype, `benchmark` rebuilds the haplotype from the reference walk with only the called events applied (which nodes each call explains comes from `variant_nodes.tsv`), aligns that to the haplotype's true graph walk, and reports the reconstruction identity `= 1 − Σδ/ΣS`. Uncalled variation (SNPs, sub-50 bp indels) is exactly what keeps it short of perfect. (A comparability `QV = -10·log10(max(0.5, δ)/S)` is emitted alongside but is no longer the headline.)
+Reconstructs each haplotype from the caller's own output and compares it against the truth walk.
 
 ```bash
 ./build/panvar benchmark \
-  -i "$OUT/panphorte/panphorte.normalized.sorted.gfa" \
-  --bubble-prefix-in "$OUT/panphorte/panphorte" \
+  -i "$OUT/refine/refine.normalized.sorted.gfa" \
+  --bubble-prefix-in "$OUT/refine/refine" \
   --reference-path "$REF" \
   --variant-nodes "$OUT/call/call.variant_nodes.tsv" \
+  --vcf "$OUT/call/call.region.vcf" \
   -o "$OUT/benchmark/benchmark"
 ```
 
-The per-gene headline is per-haplotype reconstruction identity (`1 − Σδ/ΣS`) — length-fair, unlike an absolute QV that a short region can never push high. `scripts/plot_benchmark.R` draws the per-gene anatomy: the left panel stacks Reconstructed (identity) + Residual to 100% of the aligned sequence, and the right panel splits that residual only into Not-callable (sub-threshold) vs Mis-called (≥ threshold) — so a tiny residual stays legible:
+Four levels are reported and they are not interchangeable. The first three implant the haplotype's own true block and therefore bound what the graph and the retained records could achieve; only the fourth reconstructs what the VCF actually says.
 
-![Round-trip reconstruction anatomy](img/benchmark_qv.png)
+![Reconstruction anatomy across the reference loci](img/benchmark_qv.png)
 
-Every haplotype across every locus reconstructs at >99.9% identity (left panel ~all green), and the residual is essentially all Not-callable (right panel blue) — no callable-size misses. On LPA, the copy number lands exactly (the DUP module scores δ=0); its residual is small sub-threshold variation, e.g. a ~32 bp insertion at one bubble that sits just under `--min-sv-bp=50`. GSTM1 sits lowest (its paralog stack is dense with small paralogous sequence variants) but is still >99.9%. This confirms the calls round-trip the haplotypes. (Match `benchmark --min-sv-bp` to the `call` run, or 20–50 bp variation that was correctly not called would show up as Mis-called.)
+- Graph ceiling: near 100% at every locus, because it substitutes the true block wherever a call overlaps the truth event's node space. This is a discovery/representation ceiling, not the region VCF reconstruction.
+- From the VCF alone: 85.3% identity at this locus, 99.7% at the least varied of the six.
+- Where the loss lives: the residual partitioned into five terms that sum to it exactly.
+- Variation found: the residual split into sub-threshold and missed. Missed is zero everywhere.
+
+The third panel is the one to read first. `Not found` is 0.00% at all six loci: every above-threshold truth event overlaps at least one emitted call. That is a discovery statement, not a guarantee that every carrier genotype is correct. Carrier false negatives remain at ACOT and CYP2D6, while most residual bases come from how the compact region VCF represents overlapping or merged calls.
+
+That is also why the allele VCF closes the gap completely. `call --allele-vcf` spells every allele out instead of describing it, and reconstructing from it gives 0 bp residual on all six loci. Both figures live in `results/reconstruction.tsv`; neither replaces the other.
+
+Two metrics are reported and they answer different questions. Identity is a per-base fraction; gap closed is the fraction of the reference-to-truth distance the VCF removes. At this locus they read 85.3% and 75.5% for the same run, so neither should be quoted without its name.
 
 ---
 
-## Not just LPA — the other duplicated loci
+## Not just one locus
 
-The same pipeline is validated on C4 (C4A/C4B), GSTM1 (GSTM1/2/5), CYP2D6 (CYP2D6/2D7/2D8P), and ACOT (ACOT1/ACOT2 on chr14). `scripts/regen_results.sh` runs all of them and checks copy number against the pangene ground truth:
+`scripts/regen_results.sh` runs the same pipeline on six loci and compares copy number with committed assembly-derived truth tables. These checks are independent of the GWAS phenotype simulation, but they are validation on the six supplied loci rather than a universal accuracy guarantee.
 
-```bash
-scripts/regen_results.sh              # all loci + validation + plots
-Rscript scripts/plot_cn_correlation.R \
-  --table results/cn_table.tsv \
-  --out results/cn_correlation        # the two panels below
-```
+![Called copy number against truth, by locus](img/cn_correlation.loci.png)
 
-Total copy number per locus (called vs ground truth):
+At LPA every one of the 465 haplotypes with a truth value is called exactly right. This validates the 95%-similarity fold on this dataset; the same conclusion should not be inferred for a new locus without suitable truth. Where paralogs carry usable private k-mers, the module total can also be split per gene:
 
-![Locus total-CN correlation](img/cn_correlation.loci.png)
+![Called copy number against truth, by gene](img/cn_correlation.genes.png)
 
-Per-gene split for the paralog clusters:
-
-![Per-gene CN correlation](img/cn_correlation.genes.png)
-
-Every point on the diagonal is an exactly-correct call. Locus totals are exact (LPA 465/465, C4 131/131, GSTM1 159/159, ACOT 467/467); the per-gene splits land C4A/C4B at 96.2%, CYP2D6 99.2%, CYP2D7 100%, the whole GSTM cluster (GSTM1, GSTM2, GSTM4, GSTM5) at 466/466 each, and ACOT1/ACOT2 at 99.6% (100% within ±1) — the off-diagonal C4/CYP/ACOT handful are gene-conversion mosaics and unannotated pseudogene/hybrid modules. Stable single-copy genes outside the folded module (GSTM3, ACOT4, ACOT6) have nothing to resolve, so they are not split out.
+Points off the diagonal are disagreements between the private-marker estimate and the annotation-derived truth. Gene-conversion mosaics, hybrid modules, ambiguous markers and annotation differences can all contribute. Genes outside the represented module are not split out.
 
 ---
 
 ## `rebuild` — re-inducing a tangled locus
 
-The loci above all decompose cleanly, but a minority of graphs come out of construction too tangled to work with. Where the graph inducer closes over all-pairs alignments, sequence that recurs across a low-complexity locus collapses onto a few very high-degree hub nodes, and snarl finding then returns one large undecomposable site instead of a set of variant sites. The opt-in, gated `rebuild` step re-induces such a locus from its haplotype sequences before `bubble`, and leaves healthy graphs untouched, so it is not part of the LPA run above.
+A minority of graphs are too fragmented to decompose sanely: transitive closure over all-pairs alignments can collapse sequence that recurs across a locus onto shared, very high-degree nodes. `rebuild` re-induces such a locus by progressive graph generation before `bubble` sees it.
 
-MYOM2 (chr8) is one such locus. As originally built, its interior is a dense hub — hundreds of near-identical paths knotted onto shared nodes — with the rest of the graph strung off it:
+```bash
+./build/panvar rebuild -i tangled.gfa -o rebuilt.gfa
+```
 
-![MYOM2 as originally built: a low-complexity hub tangle](img/myom2.original.png)
+It gates first and passes healthy graphs through untouched, so it is not part of the run above. On a locus that does trip the gate:
 
-After `rebuild`, the same haplotypes re-induce into a graph that reads as a backbone with discrete bubbles at the variant sites, no hub, and the copy-number arrays showing as small loops along the path:
+![A tangled locus before re-induction](img/myom2.original.png)
+![The same locus after re-induction](img/myom2.rebuild.png)
 
-![MYOM2 after rebuild: a decomposable backbone with discrete bubbles](img/myom2.rebuild.png)
-
-On this locus `rebuild` takes ~80,000 nodes with a 1,035-degree hub down to ~490 nodes with no hub, so `bubble` finds a few dozen clean variant sites instead of one giant snarl and `call` stops mis-firing hundreds of spurious duplications. See [modules/rebuild.md](modules/rebuild.md) and [algorithms/rebuild.md](algorithms/rebuild.md) for the gate, the haplotype ordering, and how minigraph drives the re-induction.
+The rebuild is accepted only if every haplotype comes back within the identity and coverage bounds; otherwise the original graph is written unchanged and the audit says which haplotype failed and why.

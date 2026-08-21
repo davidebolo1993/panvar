@@ -1,5 +1,7 @@
 #include "panvar/graph_utils.hpp"
 
+#include <cctype>
+
 #include <algorithm>
 #include <cstdint>
 #include <stdexcept>
@@ -120,6 +122,99 @@ std::string spell_path_steps_sequence(
         seq += step.reverse ? reverse_complement(node_seq) : node_seq;
     }
     return seq;
+}
+
+std::unordered_set<std::string> self_loop_nodes(const Graph& graph) {
+    std::unordered_set<std::string> out;
+    for (const auto& [id, node] : graph.nodes) {
+        bool loop = false;
+        for (const Neighbor& nb : node.start) if (nb.node_id == id) { loop = true; break; }
+        if (!loop) for (const Neighbor& nb : node.end) if (nb.node_id == id) { loop = true; break; }
+        if (loop) out.insert(id);
+    }
+    return out;
+}
+
+std::string resolve_reference_path_name(const Graph& graph, const std::string& query,
+                                        const std::string& module) {
+    if (query.empty()) return query;
+    for (const PathRecord& p : graph.paths) {
+        if (p.name == query) return p.name;
+    }
+    const auto lower = [](std::string t) {
+        std::transform(t.begin(), t.end(), t.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return t;
+    };
+    const std::string q = lower(query);
+    std::vector<std::string> hits;
+    for (const PathRecord& p : graph.paths) {
+        if (lower(p.name).find(q) != std::string::npos) hits.push_back(p.name);
+    }
+    if (hits.size() == 1) return hits[0];
+    if (hits.empty()) {
+        throw std::runtime_error(module + ": reference path not found: " + query);
+    }
+    std::string msg = module + ": reference path ambiguous: " + query + " matches:";
+    for (const std::string& h : hits) msg += "\n  " + h;
+    throw std::runtime_error(msg);
+}
+
+void validate_graph_paths(const Graph& graph, const std::string& module,
+                          bool require_sequences, bool require_zero_overlaps) {
+    if (graph.paths.empty()) throw std::runtime_error(module + ": input GFA has no P/W paths");
+    std::unordered_set<std::string> seen;
+    for (const PathRecord& p : graph.paths) {
+        if (p.name.empty()) throw std::runtime_error(module + ": input GFA has a path with no name");
+        if (!seen.insert(p.name).second)
+            throw std::runtime_error(module + ": input GFA has a duplicate path name: " + p.name +
+                                     " (which of the two a result refers to would be undefined)");
+        if (p.steps.empty()) throw std::runtime_error(module + ": path has no steps: " + p.name);
+        for (const PathStep& step : p.steps) {
+            const auto it = graph.nodes.find(step.node_id);
+            if (it == graph.nodes.end())
+                throw std::runtime_error(module + ": path " + p.name +
+                                         " references a node that is not in the graph: " + step.node_id);
+            if (require_sequences && (it->second.sequence.empty() || it->second.sequence == "*"))
+                throw std::runtime_error(module + ": node " + step.node_id + " on path " + p.name +
+                                         " has no sequence (S line is '*')");
+        }
+        // Every consecutive pair of steps must be joined by an ORIENTED link that exists. A path
+        // describing a traversal the graph does not permit spells a sequence no walk could produce,
+        // and every later comparison would be made against that.
+        for (std::size_t i = 1; i < p.steps.size(); ++i) {
+            const PathStep& a = p.steps[i - 1];
+            const PathStep& b = p.steps[i];
+            const auto ita = graph.nodes.find(a.node_id);
+            if (ita == graph.nodes.end()) continue;               // already reported above
+            // Leave `a` by its end when forward, by its start when reverse; enter `b` at its start
+            // when forward, at its end when reverse.
+            const std::vector<Neighbor>& side = a.reverse ? ita->second.start : ita->second.end;
+            const int want = b.reverse ? 1 : 0;
+            bool linked = false;
+            for (const Neighbor& n : side)
+                if (n.node_id == b.node_id && n.side == want) { linked = true; break; }
+            if (!linked)
+                throw std::runtime_error(module + ": path " + p.name + " steps from " + a.node_id +
+                                         (a.reverse ? "-" : "+") + " to " + b.node_id +
+                                         (b.reverse ? "-" : "+") + " but the graph has no such link");
+        }
+    }
+    if (!require_zero_overlaps) return;
+    // Spelling and span measurement concatenate whole segments, so a non-zero overlap double-counts
+    // the overlapping bases in every length and identity figure. '*' means UNKNOWN, not zero, so it
+    // cannot be assumed away either.
+    for (const auto& kv : graph.nodes) {
+        for (const std::vector<Neighbor>* side : {&kv.second.start, &kv.second.end})
+            for (const Neighbor& n : *side)
+                if (n.overlap != 0)
+                    throw std::runtime_error(
+                        module + ": link " + kv.first + " -- " + n.node_id +
+                        (n.overlap < 0 ? std::string(" has an UNKNOWN overlap ('*')")
+                                       : " has a non-zero overlap (" + std::to_string(n.overlap) + "M)") +
+                        "; this module measures by concatenation, which is only correct when every "
+                        "overlap is a verified 0M");
+    }
 }
 
 } // namespace panvar

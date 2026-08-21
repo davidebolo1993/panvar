@@ -8,6 +8,7 @@
 #include <utility>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace panvar {
@@ -58,5 +59,31 @@ std::string spell_path_steps_sequence(
 std::uint64_t hash_step_token(const PathStep& step);
 std::vector<std::uint64_t> build_walk_tokens(const std::vector<PathStep>& steps);
 std::string build_walk_signature(const std::vector<PathStep>& steps);
+
+// Nodes carrying a self-loop edge (a panphorte REP, or any tandem-unit node): these are
+// copy-number loci even when a haplotype traverses them only once. Re-derive this from the graph
+// rather than trusting `Bubble::cyclic`, which `bubbles.csv` does not round-trip.
+std::unordered_set<std::string> self_loop_nodes(const Graph& graph);
+
+// Resolve a reference path QUERY to an exact path name: exact match, else a unique case-insensitive
+// substring match. Ambiguity and absence are errors, never resolved by file order.
+//
+// Every consumer compares path names exactly, so a module that accepts a loose query and then passes
+// the QUERY on has silently resolved nothing: boundaries come back unoriented, reference allele support
+// reads 0, and nothing says so. Resolve once, at the edge, and pass the resolved name inward.
+std::string resolve_reference_path_name(const Graph& graph, const std::string& query,
+                                        const std::string& module);
+
+// One authoritative check that a graph is safe to reason about, shared by every module that reads
+// paths. Each condition, left unchecked, gives a silently WRONG answer rather than a failure: a step
+// naming a missing node spells a shorter sequence than the file describes; a step pair with no link
+// describes a traversal the graph does not permit; duplicate path names make "which path" depend on
+// file order; a non-zero or unknown overlap double-counts bases in every span and identity figure,
+// since spelling concatenates whole segments.
+//
+// `module` prefixes the message. `require_sequences` is for callers that spell or measure bp;
+// `require_zero_overlaps` for callers that concatenate.
+void validate_graph_paths(const Graph& graph, const std::string& module,
+                          bool require_sequences, bool require_zero_overlaps);
 
 } // namespace panvar

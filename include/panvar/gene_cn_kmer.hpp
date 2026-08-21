@@ -18,9 +18,12 @@ struct GeneCnEvidence {
 };
 
 // Pooled private-k-mer dosage for a folded paralog cluster. `gene_markers[g]` is gene g's discriminative
-// reference (merged CDS, else gene span). Builds each gene's private canonical k-mer set (unique against
-// the others), then counts occurrences per haplotype -> dosage -> rounded CN. A gene with no private
-// k-mers is not separable and the caller reports the module total. Evidence indexed [haplotype][gene].
+// reference (merged CDS, else gene span). Builds each gene's private canonical k-mer set, then counts
+// occurrences per haplotype -> dosage -> rounded CN. A gene with no private k-mers is not separable and
+// the caller reports the module total. Evidence indexed [haplotype][gene].
+//
+// Privacy is judged against the sibling genes only. Screening against the whole locus as well was
+// measured and is worse -- see the note in the implementation.
 std::vector<std::vector<GeneCnEvidence>> resolve_gene_cn_kmer(
     const std::vector<std::string>& gene_markers,
     const std::vector<std::string>& hap_seqs,

@@ -8,6 +8,9 @@
 #include "panvar/bubble_command.hpp"
 #include "panvar/call_command.hpp"
 #include "panvar/cli_utils.hpp"
+#ifdef PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE
+#include "panvar/genotype_command.hpp"
+#endif
 #include "panvar/describe_command.hpp"
 #include "panvar/inspect.hpp"
 #include "panvar/panphorte_command.hpp"
@@ -42,6 +45,19 @@ int main(int argc, char** argv) {
         }
         if (subcommand == "call") {
             return panvar::run_call_command(args);
+        }
+        if (subcommand == "genotype") {
+#ifdef PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE
+            return panvar::run_genotype_command(args);
+#else
+            // Named explicitly rather than falling through to "Unknown subcommand": the module exists
+            // in the tree and in the history, so a user who has heard of it deserves to be told it was
+            // withheld and why, not that it never existed.
+            throw std::runtime_error(
+                "genotype is not built in this release. It is the one module that has not completed "
+                "its review pass, so it is excluded rather than shipped unreviewed. To build it for "
+                "development: cmake -DPANVAR_ENABLE_EXPERIMENTAL_GENOTYPE=ON");
+#endif
         }
         if (subcommand == "benchmark") {
             return panvar::run_benchmark_command(args);

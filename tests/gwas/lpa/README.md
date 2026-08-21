@@ -8,6 +8,8 @@ the Moli-sani whole-genome cohort genotyped with cosigt — is drawn from the LP
 (`tests/real_data/lpa.gfa.gz`); the Lp(a) phenotype is generated with an inverse KIV-2 copy-number effect plus
 a subpopulation confounder, age/sex, and noise (see `make_lpa_phenotype.py`, `--seed 42`). The point is to
 demonstrate the method and its corrections, not to report a finding.
+Because the simulated phenotype uses the same Panphorte counts later exported as association dosage,
+this is a positive control for the pipeline and not an independent copy-number validation.
 
 | file | contents |
 |------|----------|

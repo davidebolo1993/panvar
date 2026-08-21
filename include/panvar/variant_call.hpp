@@ -9,6 +9,7 @@
 namespace panvar {
 
 struct VariantCallOptions {
+    std::string gfa_path;                // the graph's own path, so an output cannot alias an input
     std::string bubbles_csv_in;          // module-1 bubbles CSV
     std::string reference_path;          // required: graph path used as the diff baseline
     std::string out_prefix;              // writes <prefix>.bubble_<id>.vcf + <prefix>.region.vcf
@@ -22,6 +23,10 @@ struct VariantCallOptions {
     bool multiallelic_loci = false;       // opt-in: collapse a bounded locus into ONE multiallelic record
                                          // (REF + ALT1,ALT2,... explicit seqs; GT indexes the allele)
     std::size_t multiallelic_max_bp = 5000; // skip multiallelic collapse if any allele seq exceeds this
+    // Lossless companion VCF: one record per bubble carrying every distinct allele as explicit
+    // sequence, each haplotype's GT indexing its own allele. Written alongside the region VCF.
+    bool allele_vcf = false;
+    std::size_t allele_vcf_max_bp = 0;    // skip a bubble whose alleles exceed this (0 = no limit)
     std::size_t rescue_min_bp = 0;       // floor for events kept for merge/rescue (0 -> min_sv_bp/2)
     bool classify_ins = false;           // minimap2 INS subtype refinement (NOVEL vs DUP)
     bool cn = false;                     // copy-number calling: enable all CN routes, resolved by topology
@@ -43,6 +48,15 @@ struct VariantCallOptions {
     // tangle summing diffuse revisits (real peak/coverage DUPs span a few % of the locus). Suppressed.
     // The self-loop REP route (genuine folded tandems) is not gated by this. 0 = off.
     double max_dup_region_frac = 0.80;
+    // Refuse a MODULE_BP copy-number call whose integer model fits badly: CN_ROUND_RESIDUAL above this
+    // means the calibrated unit does not divide real walks cleanly and the reported integer came from
+    // rounding a poor fit. 0 disables, and that is the default: the unit is a calibration constant for
+    // a heterogeneous paralog module, never one real copy, so a poor fit does not imply a wrong CN.
+    double max_cn_model_residual = 0.0;
+    // Take the MODULE_BP copy-number step from the panel's cluster spacing rather than from
+    // ref_bp/ref_fold. Much closer in the bulk, but it makes CN depend on cohort composition, so it is
+    // opt-in.
+    bool cn_unit_spacing = false;
     std::string gtf_path;                // optional reference-coordinate GTF: annotate variants with the
                                          // genes they touch (INFO GENES), write <prefix>.node_genes.tsv,
                                          // and a per-gene DUP copy-number table; needs a PanSN reference
@@ -59,13 +73,21 @@ struct VariantCallSummary {
     std::size_t bubbles_with_reference = 0;
     std::size_t bubbles_with_calls = 0;
     std::size_t records_written = 0;
+    // Divergent blocks abandoned because the node-token DP would exceed its cell cap. Each is a
+    // guaranteed false negative, so it belongs in the summary rather than behind a debug env var.
+    std::size_t skipped_large_segments = 0;
     std::size_t del = 0;
     std::size_t ins = 0;
     std::size_t inv = 0;
     std::size_t dup = 0;
     std::size_t multi = 0;  // multiallelic-locus records (--multiallelic-loci)
+    std::size_t allele_records = 0;   // bubbles written to the allele VCF
+    std::size_t allele_skipped = 0;   // bubbles skipped there (over --allele-vcf-max-bp, or no anchor)
     std::size_t tangle_bubbles = 0;   // bubbles flagged low-complexity tangles (CN routes suppressed)
-    std::size_t oversized_dups = 0;   // peak DUPs suppressed for spanning too much of the reference
+    std::size_t oversized_dups = 0;   // peak/coverage DUPs suppressed for spanning too much reference
+    // MODULE_BP calls refused by --max-cn-model-residual (0 unless that gate is enabled).
+    std::size_t declined_cn_model = 0;
+    std::size_t declined_cn_model_bubbles = 0;  // bubbles left with no CN record by that refusal
 };
 
 void call_variants(

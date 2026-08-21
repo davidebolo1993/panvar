@@ -1,148 +1,127 @@
-# Pangenome association with panvar — the LPA/KIV-2 example
+# Association with panvar — a worked example
 
-The association half of the pipeline, on `panvar`'s LPA output. The variant calling and feature description that produce the genotype matrices are covered in the [walkthrough](walkthrough.md); this page picks up at `associate` — testing a simulated plasma Lp(a) (lipoprotein(a)) phenotype against the KIV-2 copy number, and reading the multiple-testing corrections. The KIV-2 copy number is inversely associated with Lp(a) (more copies means lower Lp(a)), and the whole signal is in the count, so it is the ideal copy-number test. The phenotype is simulated, so this demonstrates recovering a planted signal under realistic population structure, not a real Lp(a) study (protected). Methods are cited in [references.md](references.md#associate).
+The association half of the pipeline, run on the output of the [walkthrough](walkthrough.md). Variant calling and feature description produce the genotype matrices; this page tests them.
 
-## The example cohort (simulated)
+## The cohort
 
-`tests/gwas/make_lpa_phenotype.py` reads each real haplotype's KIV-2 copy number (from `panphorte`), splits the haplotypes into 3 subpopulations with different KIV-2 frequencies and a baseline Lp(a) offset (an ancestry confounder), then draws ~6,000 diploid individuals — the scale of the Moli-sani whole-genome cohort genotyped with cosigt, so the demo mirrors a real run. Each individual's Lp(a) is log-normal with the inverse KIV-2 effect, an age and sex term, the subpopulation offset, and noise; ~5% of phenotypes are set to `NA`. Ten ancestry components `PC1..PC10` (principal components, PCs) are emitted as covariate columns — only the first two carry the subpopulation signal, a realistic scree. The phenotype is simulated (we model the known KIV-2/Lp(a) effect); it is not a real Moli-sani measurement.
+`tests/gwas/make_lpa_phenotype.py` reads the KIV-2 counts written by `panphorte`, splits the real haplotypes into simulated subpopulations with different array frequencies, pairs them into diploid samples, and simulates a quantitative phenotype driven by diploid copy number plus a subpopulation offset. Age, sex and ten simulated ancestry covariates are included in the phenotype table.
 
-The tables are committed under `tests/gwas/lpa/` so the association is runnable directly:
+This is an end-to-end positive control for feature export and association: the causal dosage is deliberately known and should be recovered. It is not an independent validation of KIV-2 copy number, because the phenotype and tested REP dosage ultimately come from the same normalized graph. The independent check used in this repository is the comparison with the committed assembly-derived repeat counts in the [walkthrough](walkthrough.md).
 
-| file | what it is |
-|------|-----------|
-| `samples.tsv` | the cosigt cohort: `sample <tab> haplotype_1 <tab> haplotype_2` |
-| `pheno.quant.tsv` | quantitative phenotype (log10 Lp(a)) + `Age, Sex, PC1..PC10` |
-| `pheno.binary.tsv` | high-risk case/control (0/1) + the same covariates |
-| `pheno.quant.nopc.tsv` | quantitative phenotype without the PCs (the naive, uncorrected analysis) |
+Two cohorts exist, and the numbers on this page come from the second:
 
-The genotype matrices tested below live under `results/real_data/lpa/gwas/desc/`: the per-substrate BIMBAM dosage matrices, each in its own folder `desc/<level>/<substrate>/` (`level` = `haplotype` or `sample`; `substrate` = `variant`/`graph`/`kmers`), from a `describe` run configured for association — passed the `cosigt` `--samples` table and the `--variant-vcf`, so the `sample/` level sums each sample's two haplotypes into one diploid dosage row. The driver `tests/gwas/run_lpa_real.sh` builds them. This is a GWAS-specific `describe`, distinct from the plain per-haplotype `describe` (`results/real_data/lpa/describe/`) in the [walkthrough](walkthrough.md) — the association needs the diploid per-sample and variant-level matrices that the walkthrough run does not emit.
+- `tests/gwas/lpa/` is committed and runnable directly: a 6,000-sample cosigt table with quantitative and binary phenotypes, each with and without ancestry principal components.
+- `scripts/regen_results.sh lpa` generates a smaller cohort under `results/real_data/lpa/gwas/real/` and runs everything below on it. That run produced every figure here: 300 samples, of which 285 have complete phenotype and covariate data and are used.
 
-## Associate the variant unit — the honest test
+The genotype matrices live under `results/real_data/lpa/gwas/desc/`, one folder per substrate, at both haplotype and diploid-sample level.
+
+## Test the variant unit
 
 ```bash
 panvar associate \
   --genotypes results/real_data/lpa/gwas/desc/sample/variant/bimbam_variant.bimbam.gz \
   --samples   results/real_data/lpa/gwas/desc/sample/variant/samples.txt.gz \
   --feature-annot results/real_data/lpa/gwas/desc/sample/variant/feature_annot.variant.tsv.gz \
-  --phenotype tests/gwas/lpa/pheno.quant.tsv -o results/real_data/lpa/gwas/associate/assoc_variant_quant
+  --phenotype results/real_data/lpa/gwas/real/pheno.quant.tsv \
+  -o results/real_data/lpa/gwas/associate/assoc_variant_quant
 ```
 
-`--unit` auto-detects `variant` from the sidecar, so the test count is the number of structural-variant (SV) calls — the honest denominator. The KIV-2 duplication `bubble7_DUP_4789` is the top hit by a wide margin (its dosage is the full copy-number gradient in a single test), `is_lead=1` for its linkage-disequilibrium (LD) clump, `low_af=0` (a `DUP` carried by almost everyone is still informative), and it survives both `q_bh` and the effective-tests (`Meff`) Bonferroni threshold.
+The unit is auto-detected as `variant` from the sidecar, so the test count is the number of VCF records rather than the number of graph or k-mer markers. Here 12 records are tested after the non-modal-genotype frequency filter drops 5. A record is a convenient testing unit, but linked DEL/INS records and records in LD need not be independent biological events.
 
-With one test per SV call the scan is sparse, and KIV-2 stands clear of the LD-clumped `Meff`-Bonferroni line:
+The array's duplication, `bubble6_DUP_5100`, comes out at `p = 2.9e-09`. Because the variant substrate carries the duplication's copy number as its dosage rather than a presence flag, that test is on the copy number itself.
 
-![LPA region scan — variant substrate, quantitative](img/assoc_variant_quant.manhattan.png)
+![Region scan, variant substrate](img/assoc_variant_quant.manhattan.png)
 
-## Associate the feature substrates — fine-mapping and effective tests
+## Test the graph and k-mer substrates
 
 ```bash
 panvar associate \
   --genotypes results/real_data/lpa/gwas/desc/sample/graph/bimbam_graph.bimbam.gz \
-  --samples results/real_data/lpa/gwas/desc/sample/graph/samples.txt.gz \
+  --samples   results/real_data/lpa/gwas/desc/sample/graph/samples.txt.gz \
   --feature-annot results/real_data/lpa/gwas/desc/sample/graph/feature_annot.graph.tsv.gz \
-  --node-genes results/real_data/lpa/call/call.node_genes.tsv \
-  --phenotype tests/gwas/lpa/pheno.quant.tsv \
-  --min-maf 0.02 \
+  --phenotype results/real_data/lpa/gwas/real/pheno.quant.tsv \
   -o results/real_data/lpa/gwas/associate/assoc_graph_quant
 ```
 
-Run the same on `bimbam_kmers.*` for the k-mer substrate. These keep every node/edge/k-mer test, so they fine-map within the locus, but their raw count over-states the number of independent tests; `associate` corrects with `Meff`, the number of distinct bubbles (reported as `meff`, with a per-marker `p_bonf_meff`).
+These substrates keep every node, edge and k-mer test, so they localize the association signal within the represented locus at the cost of many correlated tests. They do not by themselves establish which correlated feature is causal.
 
-The region scan recovers KIV-2 cleanly — the peak is the repeat node and its self-loop edge, far above the `Meff`-Bonferroni line, with the expected negative effect (more copies, lower Lp(a)):
+![Region scan, graph substrate](img/assoc_graph_quant.manhattan.png)
 
-![LPA region scan — KIV-2 recovered (graph substrate, quantitative)](img/assoc_graph_quant.manhattan.png)
+The graph scan's top feature is node `5100` — the repeat-unit node itself, and the same node the variant-level record is anchored on, at the same p-value. The two substrates are describing one thing at different granularities.
 
-The k-mer substrate tells the same story at finer grain — many more correlated tests (the repeat-unit k-mers), all peaking on KIV-2, with `Meff` again collapsing them to the distinct bubbles before the Bonferroni line:
+![Region scan, k-mer substrate](img/assoc_kmers_quant.manhattan.png)
 
-![LPA region scan — KIV-2 recovered (k-mer substrate, quantitative)](img/assoc_kmers_quant.manhattan.png)
+The k-mer substrate tells the same story more finely, its strongest marker reaching `p = 7.7e-10`, with the repeat-unit k-mers all peaking together.
 
-## Why these nodes, variants and k-mers light up
+Across the three, on the same cohort:
 
-All three substrates converge on the same place because they are three views of one fact — the KIV-2 copy number:
+| substrate | tested | `Meff` | method | `p_bonf_meff < 0.05` | `q_bh < 0.05` |
+|---|---|---|---|---|---|
+| variant | 12 | 10 | Li–Ji eigenvalue | 1 | 5 |
+| graph | 2,115 | 9 | distinct bubbles | 184 | 977 |
+| k-mers | 1,990 | 9 | distinct bubbles | 942 | 1,178 |
 
-- the variant record `bubble7_DUP_4789` carries the copy number explicitly in its dosage;
-- in the graph substrate the top features are the repeat node `4789` and its self-loop edge `4789+>4789+`, because a haplotype with more copies traverses them more times — the most direct graph read of copy number;
-- in the k-mer substrate the repeat-unit k-mers occur once per copy, so their counts track the same dosage.
-
-With `--node-genes`, every one of these is labelled `LPA` in the `gene` column, and the `bubbles`/`nodes` columns trace each back through `call`'s `variant_nodes.tsv` to the KIV-2 `DUP`.
+The variant substrate is the coarsest denominator: one test per retained VCF record. The graph and k-mer substrates are useful for locating signal, but their large numbers of correlated hits must not be counted as independent discoveries.
 
 ## Reading the corrections
 
-`associate` reports several columns precisely so a "hit" can be judged rather than taken on faith:
+- `p_bonf` is the raw Bonferroni adjustment over all tested features. Provided the individual p-values are valid, it controls family-wise error without requiring independent features, although correlation can make it conservative.
+- `p_bonf_meff` replaces the raw test count with `Meff`. In the variant unit, `Meff` is the phenotype-blind Li–Ji eigenvalue estimate of the genotype correlation matrix when the matrix is small enough; LD clumping is the fallback and also supplies lead/shadow labels. Here Li–Ji gives 10 and clumping gives 9. Phenotype blindness avoids circular use of the outcome, but an effective-test estimate is still an approximation and does not provide the general guarantee of raw Bonferroni. In feature units, `Meff` is the number of distinct bubbles, a biological grouping rather than a statistically calibrated count.
+- `q_bh` is the Benjamini–Hochberg adjustment. Its usual false-discovery-rate guarantee requires the corresponding assumptions on valid p-values and their dependence; the column should not be read as a universal guarantee for arbitrary correlated local features.
+- `p_conditional` and `cond_role` ask whether a feature adds signal after the selected features. At the default entry threshold (`0.05/Meff = 0.005` here), the array duplication is the only selected signal. Two linked records have conditional p-values near the cutoff (0.00586), so “one selected signal” is more accurate than saying every other association disappears.
 
-- **`q_bh`** — the Benjamini–Hochberg false-discovery-rate (FDR) q-value, the primary control: the expected fraction of false positives among the calls you accept. Use `q_bh < 0.05`.
-- **`p_bonf_meff`** — the conservative benchmark: `p` scaled by the effective number of independent tests (`Meff`), not the inflated raw count. The summary also gives `bonferroni_threshold_meff`.
-- **`clump`/`is_lead`** — (variant unit) group LD-correlated variants: a lead and its shadows share a `clump`, and only leads count toward `Meff`. So a run of neighbouring `DEL`s in LD with KIV-2 is reported once, not as several independent findings.
-- **`low_af`** — flags variants with too few minority observations to give a stable p, a power caveat rather than a significance call. Such a variant also cannot anchor a clump.
-- **`p_conditional`/`cond_role`** — test *independence*, which clumping alone cannot: clumping uses genotype r², but a variant only weakly correlated with KIV-2 (r² far below `--ld-r2`) can still be marginally significant just by tagging such a strong locus. Conditioning refits with the top signal(s) as covariates. In the variant unit a forward-stepwise conditional-and-joint (COJO) pass selects the jointly-independent signals (`cond_role=signal`) and exposes the rest as `shadow` whose `p_conditional` collapses; the summary's `cojo_independent_signals` counts the signals. In the feature unit, cross-bubble features get a conditional p while features collinear with the lead (same copy-number event) are flagged `cond_role=collinear` rather than scored. Here a nearby `PLG` insertion is marginally significant (`p ≈ 8e-9`) yet `p_conditional ≈ 0.3` — a KIV-2 shadow, not an independent Lp(a) signal — and `cojo_independent_signals = 1`.
+## The pipeline, stage by stage
 
-The summary's `unit`, `meff`, `significant_bonferroni_meff` and `cojo_independent_signals` make the chosen unit, effective test count, and number of independent signals explicit. The Manhattan plot adds a third after-conditioning panel where the shadows fall below the line and only the conditioning signal stays up.
+`scripts/plot_associate_pipeline.R` draws one facet per stage, recolouring the same markers by what survives each, so the funnel from every test down to the independent signal is visible in one figure.
 
-## The association pipeline, stage by stage
+1. `TEST` — every marker is tested and shown at its raw p-value.
+2. `FILTER MAF` — markers below `--min-maf` are greyed out.
+3. `CLUMP` — variant unit only: variants are grouped by genotype correlation into leads and shadows.
+4. `CORRECT` — both thresholds are drawn, and each marker is coloured by the strictest it passes.
+5. `CONDITION` — conditional p-values after the forward-stepwise stage; `signal` means the feature met the configured entry rule, while `shadow` did not.
 
-`scripts/plot_associate_pipeline.R` draws one Manhattan facet per processing stage, re-colouring the same markers by what survives each stage, so the funnel from "everything tested" down to "the independent signal" is explicit. It needs the normal run plus a `--min-maf 0` run of the same data (so the minor-allele-frequency-dropped markers are visible in the first two stages).
+![Association pipeline, variant tier](img/assoc_variant_quant.pipeline.png)
 
-The stages, and what each does:
+![Association pipeline, graph tier](img/assoc_graph_quant.pipeline.png)
 
-1. **TEST** — every marker is tested (`phenotype ~ dosage + covariates`); raw `-log10(p)`.
-2. **FILTER MAF** — markers below `--min-maf` are dropped (greyed), the rest kept.
-3. **CLUMP** — (variant tier only) variants are grouped by genotype r² > `--ld-r2` into leads and LD shadows; the number of leads is `Meff`. The feature tiers skip this — their `Meff` is the number of distinct bubbles, so there is no clumping facet for k-mers/nodes.
-4. **CORRECT** — the two thresholds are drawn together: Bonferroni·`Meff` (orange) and BH-FDR (blue); each marker is coloured by the strictest it passes.
-5. **CONDITION** — conditional `-log10(p_conditional)` after COJO: the shadows collapse below the line and only the independent signal(s) (magenta) stay up.
+![Association pipeline, k-mer tier](img/assoc_kmers_quant.pipeline.png)
 
-Variant tier — the honest unit; the CLUMP stage is present, and a single COJO signal (KIV-2/`LPA`) survives conditioning while neighbours like `PLG` collapse:
+The feature tiers have no `CLUMP` facet, since clumping applies to the variant unit only.
 
-![LPA association pipeline — variant tier](img/assoc_variant_quant.pipeline.png)
+## Reading `lambda_gc` at one locus
 
-Graph nodes/edges — no CLUMP stage (`Meff` = distinct bubbles); conditioning on the top KIV-2 feature collapses the rest of the region:
+`lambda_gc` reads the median chi-square on the assumption that most tests are null. That holds genome-wide and fails at a single locus, where a real signal and everything in linkage disequilibrium with it can be most of the tests. It reads 5.85 on the variant scan above and 10.13 on the graph scan — those measure the effect, not inflation. The run summary says which situation it is in and only calls it an inflation estimate when there are enough tests and few enough of them significant.
 
-![LPA association pipeline — graph tier](img/assoc_graph_quant.pipeline.png)
+## Structure correction, on a panel where it can be judged
 
-k-mers — identical machinery to the graph tier (no CLUMP), on per-path k-mer counts:
-
-![LPA association pipeline — k-mer tier](img/assoc_kmers_quant.pipeline.png)
-
-## A word on λ in a single region
-
-The genomic-inflation factor `λ` (`lambda_gc`) assumes that most tests are null. That holds genome-wide, but a single pangenome locus is the opposite: almost every marker tags the one causal variant, so `λ` is large by construction and is not a structure diagnostic here. (With only a handful of variant-unit tests it is unstable for the additional reason of small n.) λ becomes meaningful in the structure demo below, which adds genuinely null markers.
-
-## Structure correction on a genome-wide-like panel
-
-To show what PCs and the linear mixed model (LMM) buy you, the driver also builds a synthetic genome-wide-like panel — the real KIV-2 dosage plus many subpopulation-stratified null markers — where λ is interpretable. The subpopulation confounder inflates a naive scan and buries the causal signal; modelling structure restores calibration and surfaces KIV-2:
-
-| analysis | covariates | λ | KIV-2 |
-|----------|-----------|---|-------|
-| naive | Age, Sex | ≫ 1 (inflated) | buried among nulls |
-| + ancestry PCs | Age, Sex, PC1..PC10 | → ≈ 1 | rises to the top |
-| LMM, external genomic relationship matrix (GRM) | Age, Sex (+ random effect) | ≈ 1 | top |
+To demonstrate structure confounding, the driver also builds 3,000 simulated null markers alongside the real copy-number dosage. Their allele frequencies and the phenotype offset both vary by the same simulated subpopulation. This is a calibration fixture with many nulls, not a substitute for a real genome-wide validation.
 
 ```bash
-# naive (no PCs) -> inflated lambda; then add the PC covariate columns
-panvar associate --genotypes <panel.bimbam.gz> --samples <…> --feature-annot <…> \
-  --phenotype tests/gwas/lpa/pheno.quant.nopc.tsv -o sim_naive
-panvar associate --genotypes <panel.bimbam.gz> --samples <…> --feature-annot <…> \
-  --phenotype tests/gwas/lpa/pheno.quant.tsv     -o sim_pc
-# LMM needs an EXTERNAL genome-wide GRM; panvar does not build one
-panvar associate --genotypes <panel.bimbam.gz> --samples <…> --feature-annot <…> \
-  --phenotype tests/gwas/lpa/pheno.quant.nopc.tsv --model lmm --kinship <grm.tsv> -o sim_lmm
+# no ancestry covariates
+panvar associate --genotypes <panel.bimbam.gz> --samples <...> --feature-annot <...> \
+  --phenotype <pheno.quant.nopc.tsv> --min-maf 0.02 -o sim_naive
+# the same phenotype, with the principal components as covariates
+panvar associate --genotypes <panel.bimbam.gz> --samples <...> --feature-annot <...> \
+  --phenotype <pheno.quant.tsv>      --min-maf 0.02 -o sim_pc
+# a linear mixed model instead, with an external relationship matrix
+panvar associate --genotypes <panel.bimbam.gz> --samples <...> --feature-annot <...> \
+  --phenotype <pheno.quant.nopc.tsv> --model lmm --kinship <grm.tsv> --min-maf 0.02 -o sim_lmm
 ```
 
-This panel is a control to demonstrate the correction; the result on the actual pangenome is the region scan above. Compare `lambda_gc` across `sim_naive`/`sim_pc`/`sim_lmm` to see inflation collapse toward 1. At the ~6k scale shown here the driver runs the PC path (`sim_naive` → `sim_pc`) and skips the LMM demo, since the dense GRM is only materialised for smaller cohorts (`N ≤ 4000`); to reproduce `sim_lmm`, run at a capped `N` or supply your own external `--kinship` GRM.
+| analysis | `lambda_gc` | significant at `p_bonf_meff` |
+|---|---|---|
+| no ancestry covariates | 2.22 | 122 |
+| with principal components | 1.02 | 1 |
+| linear mixed model | 2.22 | 122 |
 
-## Validation against GEMMA
+The supplied simulated ancestry covariates do the work in this fixture: inflation collapses toward nominal and the 122 apparent hits reduce to the one planted signal.
 
-`panvar associate` is a from-scratch engine, so `tests/gwas/validate_gemma.sh` checks it against GEMMA on the same BIMBAM panel and phenotype (BIMBAM is GEMMA's native format, so the genotypes load unchanged):
+The mixed model does not correct this fixture. The generated relationship matrix is based on sharing among the LPA panel haplotypes, not genome-wide markers, and the fitted variance ratio is around 1.3e5: the random effect is effectively negligible, so the result matches the uncorrected model. This is a negative control for this particular GRM, not evidence against mixed models generally. Treat the implementation as experimental: its external comparison currently checks correlation only, which could miss systematic differences in effect size, standard error or p-value.
 
-| comparison | r(β) | r(−log10 p) |
-|------------|------|-------------|
-| linear (`--model linear` vs GEMMA `-lm`) | ≈ 1.000 | ≈ 1.000 |
-| mixed (`--model lmm --kinship` vs GEMMA `-lmm`) | ≈ 0.9997 | ≈ 0.9997 |
-
-The statistics match. The only wrinkle is the copy-number marker: GEMMA's allele-frequency model assumes a diploid 0–2 dosage, so a raw KIV-2 count (well above 2) reads as "allele frequency ≫ 1" and GEMMA mis-handles it. This is not a failure to validate — GEMMA just needs the dosage in its expected range, which `panvar` provides: regenerate the BIMBAM with `describe --scale-dosage` and each feature is rescaled to 0–2 (a per-feature linear map, so the linear-model p-values are unchanged). On that scaled BIMBAM GEMMA tests KIV-2 too and recovers the same β and significance `panvar` reports. So the two agree across the board — and on the copy-number marker as well, once the dosage is scaled to GEMMA's range. (`panvar` itself makes no 0–2 assumption and tests the raw copy number directly).
+In short, this page demonstrates that a planted KIV-2 dosage effect survives the export and association pipeline and that the supplied covariates remove the confounding designed into this simulation. It does not establish CN accuracy, real-cohort calibration, causal fine-mapping, or independent validation of the LMM.
 
 ## See also
 
-- [associate](modules/associate.md) — the engine, units, corrections, and output columns.
-- [describe](modules/describe.md) — the three BIMBAM substrates and `--samples`/`--variant-vcf`.
-- [walkthrough](walkthrough.md) — the calling and feature-description steps that produce the genotype matrices.
-- [references.md](references.md#associate) — methods (EMMAX/GEMMA, Benjamini–Hochberg) and the LPA/Lp(a) literature.
+- [associate](modules/associate.md) — units, options, output columns and limitations.
+- [algorithms/associate.md](algorithms/associate.md) — which test is used where, and why.
+- [walkthrough](walkthrough.md) — the calling and feature-description steps that produce these matrices.

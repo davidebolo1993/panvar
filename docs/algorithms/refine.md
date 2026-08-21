@@ -2,7 +2,7 @@
 
 Mechanism for the `refine` module. For usage/flags see [modules/refine.md](../modules/refine.md); References in [references.md](../references.md#refine).
 
-`refine` POA-realigns the interior of bubbles on the panphorte normalized graph to remove graph-builder alignment artifacts (a spurious insertion-plus-deletion pair where one clean indel belongs), without touching copy number. It works on a region: one or more bubbles fused into a single `source→sink` span and refined as a unit. A `REP` node — panphorte's folded tandem unit, an interior node carrying an L self-edge — is held fixed throughout, and only the residual segments (the maximal runs of non-`REP` interior steps between and around the `REP` blocks) are re-aligned.
+`refine` POA-realigns bubble interiors on the panphorte-normalized graph to reduce graph-builder alignment artifacts, such as a split insertion-plus-deletion representation. It works on a region: one or more bubbles fused into a single `source→sink` span and refined as a unit. A `REP` node — panphorte's folded tandem unit, an interior node carrying an L self-edge — is held fixed throughout, and only the residual segments between and around `REP` blocks are re-aligned.
 
 ## How it works
 
@@ -20,28 +20,40 @@ For each region, the oriented steps between `a` and `b` are taken for every path
 
 ### 3. Re-align and splice
 
-For the no-DUP and folded-DUP cases, each residual-segment position has its per-haplotype sequences collapsed to their exact distinct set and run through abPOA (one sequence, or none, is trivial). The region is skipped if a segment's median length exceeds `--max-poa-bp` or its distinct-walk count exceeds `--max-walks`. The resulting column MSA is compacted into a minimal sub-graph — a run of columns that all and only the same haplotypes traverse becomes one node, with fresh non-colliding ids — mapping each distinct residual sequence to a rebuilt node path.
+For the no-DUP and folded-DUP cases, each residual-segment position has its per-haplotype sequences collapsed to their exact distinct set and run through the aligner; one sequence, or none, is trivial.
+
+Three guards bound the cost, and all three are measured over that distinct set rather than over every carrier, so adding an identical haplotype cannot change a decision without changing what the aligner is actually handed. `--max-poa-bp` skips a segment whose longest sequence exceeds it, `--max-walks` skips one carrying more distinct sequences than it allows, and `--max-poa-work` bounds the estimated alignment cost, the longest sequence against the total bases. A guard firing skips the region, and the reason is recorded rather than silently dropped.
+
+The resulting column alignment is compacted into a minimal sub-graph: a run of columns that all and only the same haplotypes traverse becomes one node, with fresh non-colliding ids, mapping each distinct residual sequence to a rebuilt node path.
 
 Each haplotype's interior is then reassembled as `residual-path, REP-block, residual-path, …` (the `REP` blocks verbatim) and spliced between the anchors: the old interior nodes are dropped, the `REP` nodes and self-loops kept, the rebuilt nodes added, each traversing path's `a…b` sub-walk rewritten, and any now-missing path adjacency added as a `0M` link. Because every rebuilt node spells exactly the bases of its MSA columns and `REP` runs are copied verbatim, each haplotype's spelled sequence over the region is unchanged: the rebuild is sequence-lossless, only the node structure changes.
 
-### 4. Re-sort and re-snarl
+### 4. Check losslessness
 
-Finally the graph is re-sorted and flipped along the reference and re-snarled with the cactus finder (the same step panphorte runs), then written as `<prefix>.normalized.sorted.gfa`, `<prefix>.bubbles.csv`, `<prefix>.bandage_nodes.csv` (and `<prefix>.bandage_genes.csv` with `--gtf`). Running `call` on this graph re-derives the now-clean records; a folded DUP is byte-identical because its `REP` node, self-loop and per-haplotype multiplicity never changed.
+Losslessness is the module's central claim, so it is verified rather than argued. Every haplotype's spelled sequence is compared against what it spelled on the way in, and every consecutive step pair must be joined by a link that exists in the orientation walked. Both run before anything is written, so a violation cannot reach disk, and the output family is staged and committed only once they pass.
+
+The link check is not redundant with the sequence one. A rewrite can leave every haplotype spelling the same bases while walking an adjacency the graph no longer contains, which no sequence comparison can see.
+
+### 5. Re-sort, re-snarl and emit
+
+Finally the graph is re-sorted and flipped along the reference and re-snarled with the cactus finder, applying `--resnarl-min-variant-bp` as its own interior-span filter rather than inheriting whatever produced the input sites. Bubble ids are reassigned by that decomposition. The outputs are written as `<prefix>.normalized.sorted.gfa`, `<prefix>.bubbles.csv`, `<prefix>.bandage_nodes.csv` (and `<prefix>.bandage_genes.csv` with `--gtf`). Running `call` on this graph re-derives events from the refined topology; folded DUP counts are preserved because their `REP` nodes, self-loops and per-haplotype multiplicities never changed.
 
 
 ## Worked trace
 
-A region between anchors `S` and `E`. The reference interior is `X, R, Y` where `R` is a `REP` node (self-loop, 100 bp unit) and `X`, `Y` are residual flanks. Two haplotypes:
+The steps below follow the five above, one for one. A region between anchors `S` and `E`. The reference interior is `X, R, Y`, where `R` is a folded repeat-unit node carrying a self-loop and `X`, `Y` are residual flanks. Two haplotypes:
 
-| haplotype | interior walk | copies of R |
-|-----------|---------------|-------------|
+| haplotype | interior walk | copies of `R` |
+|-----------|---------------|---------------|
 | reference | `X, R, Y` | 1 |
-| H1 | `X, R, R, Y′` (one extra copy; `Y′` is `Y` with a spurious builder-split INS+DEL) | 2 |
+| H1 | `X, R, R, Y'` — one extra copy, and `Y'` is `Y` carrying a builder-split insertion and deletion | 2 |
 
-Split at `R`: the skeleton is `(R)` for both, so it is consistent. Residual segment 0 is `[X]` for both; segment 1 is `[Y]` (reference) and `[Y′]` (H1). The `REP` block is `[R]` (reference) and `[R, R]` (H1), copied verbatim.
+1. Form regions. The bubbles between `S` and `E` share boundary nodes, so they fuse into one region with `S` and `E` as its outer anchors.
 
-POA the residuals: segment 0 is `X` versus `X`, one node, no change. Segment 1 aligns `Y` against `Y′`; the builder's split insertion and deletion collapse to a single clean indel, or, if the net length is below `--min-sv-bp`, to sub-threshold variation.
+2. Classify by copy-number content. The interior holds a repeat-unit node with a self-loop, so this is the folded case: `R` is held fixed and only the residual flanks around it are re-aligned. Both haplotypes split at `R` into the same ordered skeleton, which is what the folded case requires. Residual segment 0 is `X` for both; segment 1 is `Y` for the reference and `Y'` for H1. The repeat block is `R` for the reference and `R, R` for H1.
 
-Reassemble: the reference interior becomes `x-nodes, R, y-nodes`; H1 becomes `x-nodes, R, R, y′-nodes`. The `R, R` run is untouched.
+3. Re-align and splice. Segment 0 aligns `X` against `X`: one sequence after collapsing to the distinct set, so nothing changes. Segment 1 aligns `Y` against `Y'`, and the builder's split insertion and deletion collapse into a single clean indel, or into sub-threshold variation if the net length is small. Neither segment approaches the guards. The interiors are reassembled as `x-nodes, R, y-nodes` and `x-nodes, R, R, y'-nodes`, with the repeat runs copied through untouched.
 
-Result: `call` on the refined graph emits one DUP at this region for H1 (`REF_CN=1`, `CN=2`), byte-identical to before because `R`, its self-loop and H1's two traversals are unchanged, and one clean indel (or nothing) for the `Y′` flank instead of the spurious INS+DEL pair. Benchmark identity for H1 is unchanged, since the same sequence is reconstructed from fewer, cleaner records.
+4. Check losslessness. Both haplotypes spell exactly what they spelled before — the rebuilt flank nodes carry the same bases, and the repeat run was never rewritten — and every consecutive step pair is joined by an existing link. The rewrite is accepted.
+
+5. Re-sort, re-snarl and emit. The graph is sorted along the reference and decomposed again, and the family is committed. Calling on it now yields one duplication for H1, unchanged because `R`, its self-loop and H1's two traversals were never touched, and one clean indel in place of the spurious insertion-and-deletion pair at the flank.

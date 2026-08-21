@@ -1,5 +1,9 @@
 #include "panvar/describe_command.hpp"
 
+#include <filesystem>
+#include <system_error>
+#include <unistd.h>
+
 #include "panvar/cli_utils.hpp"
 #include "panvar/describe.hpp"
 
@@ -7,6 +11,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace panvar {
@@ -48,7 +53,8 @@ void print_describe_help() {
         << "      --feature-mode <mode>        all|syncmer (default: syncmer)\n"
         << "      --syncmer-s <S>              Internal s-mer size for closed syncmer mode (default: auto)\n"
         << "      --min-paths <N>              Drop features with min(present,absent) paths <= N,\n"
-        << "                                   keeping copy-number features (default: 1; 0 keeps all)\n"
+        << "                                   keeping copy-number features (default: 1; 0 keeps every\n"
+        << "                                   DISCRIMINATIVE feature -- constant ones are always dropped)\n"
         << "      --max-wide-features <N>      Skip wide matrix above N features (default: 250000; 0=no cap)\n"
         << "      --force-wide                 Write wide matrix even above safety cap\n"
         << "      --no-wide-matrix             Write only feature map + sparse JSONL counts\n"
@@ -62,7 +68,7 @@ void print_describe_help() {
         << "                                   sample-level bimbam_{kmers,graph}.samples.bimbam.gz (summed dosage)\n"
         << "      --variant-vcf <vcf>          call region VCF; also emit the VARIANT-level BIMBAM\n"
         << "                                   (bimbam_variant.* + feature_annot.variant.tsv.gz): one\n"
-        << "                                   dosage row per SV call -- the honest GWAS unit for associate\n"
+        << "                                   dosage row per SV call -- the coarsest associate substrate\n"
         << "      --no-bimbam                  Do not write the pooled BIMBAM dosage + feature_annot.tsv.gz\n"
         << "      --only-kmers                 Emit only the k-mer substrate\n"
         << "      --only-graph                 Emit only the node/edge graph substrate\n"
@@ -87,6 +93,8 @@ int run_describe_command(const std::vector<std::string>& args) {
     DescribeOptions options;
     bool variant_flank_set = false;
 
+    std::string only_flag;
+    bool flank_explicit = false;
     for (std::size_t i = 0; i < args.size(); ++i) {
         const std::string& arg = args[i];
         auto require_value = [&](const std::string& flag) -> const std::string& {
@@ -158,6 +166,7 @@ int run_describe_command(const std::vector<std::string>& args) {
         }
         if (arg == "--variant-flank-bp") {
             options.variant_flank_bp = cli::parse_size_arg(arg, require_value(arg));
+            flank_explicit = true;
             variant_flank_set = true;
             continue;
         }
@@ -177,16 +186,17 @@ int run_describe_command(const std::vector<std::string>& args) {
             options.bimbam = false;
             continue;
         }
-        if (arg == "--only-kmers") {
-            options.emit_graph = false; options.emit_variant = false;
-            continue;
-        }
-        if (arg == "--only-graph") {
-            options.emit_kmers = false; options.emit_variant = false;
-            continue;
-        }
-        if (arg == "--only-variant") {
-            options.emit_kmers = false; options.emit_graph = false;
+        // One --only-* selects one substrate. Applying each as "clear the other two" made the flags
+        // order-dependent and let `--only-kmers --only-graph` disable every substrate, producing a
+        // successful run that emitted nothing.
+        if (arg == "--only-kmers" || arg == "--only-graph" || arg == "--only-variant") {
+            if (!only_flag.empty() && only_flag != arg)
+                throw std::runtime_error("describe: " + only_flag + " and " + arg +
+                                         " are mutually exclusive; pass exactly one --only-* flag");
+            only_flag = arg;
+            options.emit_kmers = (arg == "--only-kmers");
+            options.emit_graph = (arg == "--only-graph");
+            options.emit_variant = (arg == "--only-variant");
             continue;
         }
         if (arg == "--threads") {
@@ -228,6 +238,26 @@ int run_describe_command(const std::vector<std::string>& args) {
     if (options.emit_variant && options.variant_vcf_path.empty() && !graph_substrates) {
         throw std::runtime_error("--only-variant requires --variant-vcf <call.region.vcf>");
     }
+    // Every BIMBAM, not just the pooled graph/k-mer ones. The variant substrate IS a BIMBAM and the
+    // sample level is BIMBAM-only, so --no-bimbam with either of them asked for output it then
+    // suppressed -- or, for --variant-vcf, silently wrote the matrix anyway.
+    if (!options.bimbam && options.emit_variant && !options.variant_vcf_path.empty())
+        throw std::runtime_error("--no-bimbam and --variant-vcf conflict: the variant substrate is a "
+                                 "BIMBAM matrix, so there would be nothing to write");
+    if (!options.bimbam && !options.samples_path.empty())
+        throw std::runtime_error("--no-bimbam and --samples conflict: the sample level is emitted only "
+                                 "as a BIMBAM matrix");
+    // A flank with no variant restriction to widen is a silently inert argument.
+    if (options.variant_flank_bp != 0 && options.variant_nodes_path.empty() && flank_explicit)
+        throw std::runtime_error("--variant-flank-bp only means anything with --variant-nodes, which "
+                                 "defines the scope it widens");
+    // Compressed VCF input is not supported; the parsers read plain text.
+    auto reject_gz = [](const std::string& path, const char* flag) {
+        if (path.size() > 3 && path.compare(path.size() - 3, 3, ".gz") == 0)
+            throw std::runtime_error(std::string(flag) + ": compressed VCF input is not supported; "
+                                     "decompress it first");
+    };
+    reject_gz(options.variant_vcf_path, "--variant-vcf");
     if (options.kmer_size == 0 || options.kmer_size > 31) {
         throw std::runtime_error("--kmer-size must be in [1,31]");
     }
@@ -257,13 +287,167 @@ int run_describe_command(const std::vector<std::string>& args) {
     log.info("input " + options.gfa_path + " (feature mode " + feature_mode_label(options.feature_mode) +
              ", k=" + std::to_string(options.kmer_size) + ")");
 
+    // Everything describe owns is built in a sibling staging directory and moved into place only once
+    // BOTH substrate passes have succeeded. Writing straight into the output directory meant a failure
+    // part-way left a mixed family, and -- worse -- a rerun with different --only-*, --bubble-id or
+    // --no-wide-matrix settings left the previous run's files sitting beside the new ones, looking
+    // current. The transaction lives here rather than inside either pass because the two share one
+    // directory: a per-pass commit would make the second treat the first's output as stale.
+    const std::filesystem::path final_dir(options.out_dir);
+    const std::filesystem::path stage_dir =
+        final_dir.parent_path() /
+        (final_dir.filename().string() + ".describe-staging." + std::to_string(::getpid()));
+    std::error_code ec;
+    std::filesystem::remove_all(stage_dir, ec);
+    struct StageGuard {
+        std::filesystem::path dir;
+        bool committed = false;
+        ~StageGuard() {
+            if (!committed) { std::error_code e; std::filesystem::remove_all(dir, e); }
+        }
+    } guard{stage_dir, false};
+
     DescribeSummary summary;
-    if (graph_substrates) {
-        describe_kmers_from_graph(options, &summary);
+    {
+        DescribeOptions staged = options;
+        staged.out_dir = stage_dir.string();
+        if (graph_substrates) {
+            describe_kmers_from_graph(staged, &summary);
+        }
+        if (staged.emit_variant && !staged.variant_vcf_path.empty()) {
+            describe_variant_from_vcf(staged, &summary);
+        }
     }
-    if (options.emit_variant && !options.variant_vcf_path.empty()) {
-        describe_variant_from_vcf(options, &summary);
+
+    // Commit. Two properties the first version did not have:
+    //
+    //   * OWNERSHIP IS EXACT. Anything starting with "bubble_" was treated as ours, so a user's
+    //     `bubble_notes` file or directory would have been deleted. Only bubble_<digits> is generated.
+    //   * NEITHER RESULT IS LOST. Deleting the old family and then moving the new one in entry by entry
+    //     leaves neither complete if a move fails midway. The old entries are moved aside to a backup
+    //     first and restored if anything goes wrong.
+    auto is_owned = [](const std::string& n) {
+        if (n == "describe.index.tsv" || n == "describe.params.json") return true;
+        if (n == "haplotype" || n == "sample") return true;
+        if (n.rfind("bubble_", 0) != 0) return false;
+        const std::string suffix = n.substr(7);
+        return !suffix.empty() &&
+               suffix.find_first_not_of("0123456789") == std::string::npos;
+    };
+    std::filesystem::create_directories(final_dir);
+
+    // An INPUT sitting under an owned output name would be consumed and then replaced by the commit
+    // below. `reject_output_collisions` compares files; the owned set here is a set of directory
+    // ENTRIES, some of them directories, so the containment test is done directly.
+    {
+        const auto canon = [](const std::string& p) {
+            std::error_code e;
+            const auto c = std::filesystem::weakly_canonical(p, e);
+            return (e || c.empty()) ? std::filesystem::path(p) : c;
+        };
+        const std::filesystem::path canon_out = canon(final_dir.string());
+        for (const std::string* in : {&options.gfa_path, &options.bubbles_csv_in,
+                                      &options.variant_nodes_path, &options.samples_path,
+                                      &options.variant_vcf_path}) {
+            if (in->empty()) continue;
+            std::filesystem::path c = canon(*in);
+            for (std::filesystem::path up = c; !up.empty() && up != up.parent_path();
+                 up = up.parent_path()) {
+                if (up.parent_path() != canon_out) continue;
+                if (!is_owned(up.filename().string())) break;
+                throw std::runtime_error(
+                    "describe: input '" + *in + "' lives under an output this run owns (" +
+                    up.filename().string() + " in --out-dir); the commit would consume it and then "
+                    "replace it");
+            }
+        }
     }
+
+    const std::filesystem::path backup_dir =
+        final_dir.parent_path() /
+        (final_dir.filename().string() + ".describe-backup." + std::to_string(::getpid()));
+    std::filesystem::remove_all(backup_dir, ec);
+    std::vector<std::pair<std::filesystem::path, std::filesystem::path>> moved;   // backup <- original
+    // Every destination this run installed, in order. Restoring only `moved` left an entry that had
+    // NO predecessor sitting in the output directory after a rollback, so a failed run published half
+    // a new family -- exactly the state the transaction exists to prevent.
+    std::vector<std::filesystem::path> installed;
+    std::size_t stale = 0;
+    auto restore = [&]() {
+        std::vector<std::string> unrestored;
+        for (auto it = installed.rbegin(); it != installed.rend(); ++it) {
+            std::error_code e;
+            std::filesystem::remove_all(*it, e);
+            if (e) unrestored.push_back("could not remove " + it->string() + ": " + e.message());
+        }
+        for (const auto& [bak, orig] : moved) {
+            std::error_code e;
+            std::filesystem::remove_all(orig, e);
+            std::filesystem::rename(bak, orig, e);
+            // A restore that itself fails is the one outcome the caller cannot recover from: the
+            // previous output is gone and the backup is the only remaining copy. Naming it is the
+            // difference between a recoverable situation and a silent one.
+            if (e) unrestored.push_back("could not restore " + orig.string() + " (kept as " +
+                                        bak.string() + "): " + e.message());
+        }
+        if (!unrestored.empty()) {
+            std::string msg = "describe: rollback did not complete:";
+            for (const auto& u : unrestored) msg += "\n  " + u;
+            throw std::runtime_error(msg);
+        }
+        std::error_code e;
+        std::filesystem::remove_all(backup_dir, e);
+    };
+
+    // Fault injection, test-only, mirroring the shared StagedOutputs contract: fail before installing
+    // the Nth entry. Without it the rollback path is unreachable from a test.
+    std::size_t fail_at = 0;
+    if (const char* env = std::getenv("PANVAR_TEST_FAIL_COMMIT_AT")) {
+        fail_at = static_cast<std::size_t>(std::strtoull(env, nullptr, 10));
+    }
+    std::size_t n_installed = 0;
+
+    try {
+        std::filesystem::create_directories(backup_dir);
+        for (const auto& e : std::filesystem::directory_iterator(final_dir)) {
+            if (!is_owned(e.path().filename().string())) continue;
+            const std::filesystem::path bak = backup_dir / e.path().filename();
+            std::filesystem::rename(e.path(), bak, ec);
+            if (ec) throw std::runtime_error("describe: cannot set aside stale output " +
+                                             e.path().string() + ": " + ec.message());
+            moved.emplace_back(bak, e.path());
+            ++stale;
+        }
+        for (const auto& e : std::filesystem::directory_iterator(stage_dir)) {
+            const std::filesystem::path dst = final_dir / e.path().filename();
+            if (fail_at != 0 && ++n_installed == fail_at) {
+                throw std::runtime_error("PANVAR_TEST_FAIL_COMMIT_AT: injected failure installing " +
+                                         dst.string());
+            }
+            // Registered BEFORE the move, so a failure cannot leave a destination this run created
+            // outside the rollback's reach. remove_all on a path that was never created is a no-op.
+            installed.push_back(dst);
+            std::filesystem::rename(e.path(), dst, ec);
+            if (ec) {
+                // No recursive-copy fallback. The staging directory is created as a SIBLING of the
+                // output directory, so a cross-filesystem rename cannot arise; a failure here means
+                // something else went wrong. Copying a directory tree instead is not atomic, and a
+                // copy that dies part-way leaves a half-populated destination that looks like real
+                // output -- the one state this transaction exists to prevent.
+                throw std::runtime_error("describe: cannot install output " + dst.string() + ": " +
+                                         ec.message() +
+                                         " (staging is a sibling of the output directory, so this is "
+                                         "not a cross-filesystem move)");
+            }
+        }
+    } catch (...) {
+        restore();
+        throw;
+    }
+    guard.committed = true;
+    std::filesystem::remove_all(backup_dir, ec);
+    std::filesystem::remove_all(stage_dir, ec);
+    if (stale) log.info("replaced " + std::to_string(stale) + " stale describe output(s) from a previous run");
 
     log.info("processed " + std::to_string(summary.bubbles_processed) + " bubbles; kept " +
              std::to_string(summary.features_written) + "/" + std::to_string(summary.features_candidates) +

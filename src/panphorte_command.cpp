@@ -1,8 +1,6 @@
 #include "panvar/panphorte_command.hpp"
 
 #include "panvar/cli_utils.hpp"
-#include "panvar/gfa.hpp"
-#include "panvar/gtf.hpp"
 #include "panvar/panphorte.hpp"
 
 #include <iostream>
@@ -26,6 +24,14 @@ void print_panphorte_help() {
         << "  -o, --out-prefix <prefix>        Output prefix for the normalized GFA + report (required)\n"
         << "      --bubble-id <N>              Restrict to one bubble ID (repeatable)\n"
         << "      --min-unit-bp <N>            Minimum repeat-unit span to normalize (default: 50)\n"
+        << "      --allow-partial-boundary     Fold a site even when a copy cannot be bounded by any\n"
+        << "                                   step range at all. Since copies keep their flanks as\n"
+        << "                                   fragment nodes this no longer arises on any measured\n"
+        << "                                   input; the guard and this override remain for the case\n"
+        << "                                   where a haplotype would otherwise reach the site\n"
+        << "                                   literally and be read CN 0 while carrying copies\n"
+        << "      --resnarl-min-variant-bp <N> Interior-span filter for the re-snarled call-ready CSV\n"
+        << "                                   under --reference-path (default: 50, 0 = keep all)\n"
         << "      --min-copies <N>             Minimum tandem copies to normalize (default: 2)\n"
         << "      --min-array-prevalence <f>   Min fraction of traversing haplotypes carrying a >=min-copies\n"
         << "                                   array for a bubble to be folded -- separates true population\n"
@@ -97,6 +103,14 @@ int run_panphorte_command(const std::vector<std::string>& args) {
             options.bubble_ids.push_back(id);
             continue;
         }
+        if (arg == "--allow-partial-boundary") {
+            options.allow_partial_boundary = true;
+            continue;
+        }
+        if (arg == "--resnarl-min-variant-bp") {
+            options.resnarl_min_variant_bp = cli::parse_size_arg(arg, require_value(arg));
+            continue;
+        }
         if (arg == "--min-unit-bp") {
             options.min_unit_bp = cli::parse_size_arg(arg, require_value(arg));
             continue;
@@ -166,14 +180,30 @@ int run_panphorte_command(const std::vector<std::string>& args) {
     cli::RunLog log("panphorte", options.quiet);
     log.info("input " + options.gfa_path);
 
+    // Gene annotation on the collapsed graph: node ids differ from the bubble graph, so this Bandage
+    // CSV is distinct from the one bubble emits. Needs a PanSN --reference-path. Projected inside
+    // panphorte_normalize so it shares the staged transaction rather than landing after it.
+    // Passed through whether or not it will be used. Clearing it when there is no reference also cleared
+    // it from the input/output alias preflight, so a GTF named as an output would have been read and
+    // then overwritten by the commit -- the ignoring is about annotation, not about it being an input.
+    options.gtf_path = gtf_path;
+    if (!gtf_path.empty() && options.reference_path.empty()) {
+        // Projecting genes needs reference coordinates, so without --reference-path there is nothing to
+        // project onto. It was skipped in silence, which reads as "the GTF had no genes here".
+        log.info("--gtf needs --reference-path to place genes; no gene annotation will be written");
+    }
+
     PanphorteSummary summary;
     panphorte_normalize(options, &summary);
 
     log.info("normalized " + std::to_string(summary.bubbles_normalized) + "/" +
              std::to_string(summary.bubbles_seen) + " bubbles (" +
              std::to_string(summary.paths_rewritten) + " paths rewritten; +" +
-             std::to_string(summary.nodes_added) + " −" + std::to_string(summary.nodes_removed) +
-             " nodes, +" + std::to_string(summary.edges_added) + " edges)");
+             std::to_string(summary.nodes_added) + " (" +
+             std::to_string(summary.fragment_nodes_added) + " fragments) −" +
+             std::to_string(summary.nodes_removed) + " nodes, +" +
+             std::to_string(summary.edges_added) + " −" + std::to_string(summary.edges_removed) +
+             " edges)");
 
     std::vector<std::string> outputs;
     if (summary.sorted) {
@@ -182,20 +212,19 @@ int run_panphorte_command(const std::vector<std::string>& args) {
         outputs.push_back(options.out_prefix + ".normalized.sorted.gfa");
         outputs.push_back(options.out_prefix + ".bubbles.csv");
         outputs.push_back(options.out_prefix + ".bandage_nodes.csv");
-        // Gene annotation on the collapsed graph: node ids differ from the bubble graph, so this
-        // Bandage CSV is distinct from the one bubble emits. Needs a PanSN --reference-path.
-        if (!gtf_path.empty() && !options.reference_path.empty()) {
-            const std::string sorted_gfa = options.out_prefix + ".normalized.sorted.gfa";
-            const std::string genes_csv = options.out_prefix + ".bandage_genes.csv";
-            const Graph g = parse_gfa(sorted_gfa);
-            if (emit_gene_annotation(g, options.reference_path, gtf_path, genes_csv)) {
-                outputs.push_back(genes_csv);
-            }
+        if (summary.genes_written) {
+            outputs.push_back(options.out_prefix + ".bandage_genes.csv");
         }
     } else {
         outputs.push_back(options.out_prefix + ".normalized.gfa");
     }
     outputs.push_back(options.out_prefix + ".panphorte.report.tsv");
+    // Both were written on every run and neither was named. The provenance table in particular is the
+    // join key between a REP node and the site it stands for, so a consumer has to be told it exists.
+    outputs.push_back(options.out_prefix + ".panphorte.rep_provenance.tsv");
+    if (options.min_similarity < 1.0) {
+        outputs.push_back(options.out_prefix + ".panphorte.copies.tsv");
+    }
 
     log.wrote(outputs);
     log.done();

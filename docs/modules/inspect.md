@@ -10,7 +10,7 @@ A sanity-check utility for one called bubble (or all of them) before going downs
 - an edge-count matrix (adjacencies)
 - node lengths
 
-With `--cluster` it also groups structurally identical haplotypes (used for representative-only plots).
+With `--cluster` it also groups sufficiently similar walks and selects a representative for each group.
 
 Algorithm and worked trace: [algorithms/inspect.md](../algorithms/inspect.md).
 
@@ -29,7 +29,7 @@ Algorithm and worked trace: [algorithms/inspect.md](../algorithms/inspect.md).
 | `--cluster-similarity <f>` | walk-similarity threshold for `--cluster` | `0.90` |
 | `--fasta-out` / `--table-out` / `--edge-table-out <path>` | override the FASTA/node-count/edge-count paths (single `--bubble-id` only) | derived |
 
-## Outputs (per bubble)
+## Outputs
 
 | file | contents |
 |------|----------|
@@ -39,31 +39,15 @@ Algorithm and worked trace: [algorithms/inspect.md](../algorithms/inspect.md).
 | `<prefix>.bubble_<N>.node_lengths.tsv` | `node_id, length_bp` in node-column order (lets the heatmap scale x by length) |
 | `<prefix>.bubble_<N>.clusters.tsv` | (with `--cluster`) one row per cluster: `cluster_id` (group id), `n_paths` (paths in it), `representative_path` (the exemplar plotted), `members` (`;`-separated path names) |
 
-## Plotting
+`scripts/plot_node_coverage_heatmap.R` and `scripts/plot_edge_coverage_heatmap.R` render the count tables as heatmaps, optionally grouped by the cluster assignment. Each documents its own options under `--help`.
 
-Two R helpers (need `Rscript` + `ggplot2`) visualize the count tables:
+## Limitations
 
-```bash
-Rscript scripts/plot_node_coverage_heatmap.R \
-  --table <…>.node_counts.tsv \
-  --node-lengths <…>.node_lengths.tsv \
-  --out <…>.node_coverage
-Rscript scripts/plot_edge_coverage_heatmap.R \
-  --table <…>.edge_counts.tsv \
-  --out <…>.edge_coverage
-```
-
-Shared flags:
-
-- `--table <counts.tsv>` — the node- or edge-count matrix (required).
-- `--out <prefix>` — output prefix (required).
-- `--clusters` / `--cluster-by <clusters.tsv>` — plot only cluster representatives/group and order rows by cluster.
-- `--max-paths <N>` — keep at most N paths (by total coverage), to subset dense loci.
-- `--transform <raw|log1p>` — count transform.
-- `--width` / `--height` / `--dpi` — figure size (inches) and PNG resolution (default 300).
-
-Node heatmap only: `--node-lengths <node_lengths.tsv>` (scale x by node length), `--value <total|forward|reverse>` (which orientation count), `--length-transform <raw|sqrt|log1p>`, `--max-nodes <N>`. Edge heatmap only: `--max-edges <N>`.
+- Clustering compares every pair of distinct walks over a dense matrix, so it is region-scale rather than cohort-scale. It warns above two thousand distinct walks and refuses above twenty-five thousand.
+- Walk similarity is estimated from a sketch of the walk's node steps when a walk is long enough to exceed the sketch, and computed exactly when it is not. The estimate carries sampling error near a threshold.
+- Clusters are connected components at the similarity threshold, so membership is transitive: two walks below the threshold can land in one cluster through a chain of intermediates.
+- Sequences are spelled by concatenating whole nodes, so a graph whose links carry a non-zero overlap is refused rather than mis-measured.
 
 ## Example
 
-See the [LPA walkthrough](../walkthrough.md) for this module in a full end-to-end run.
+See the [walkthrough](../walkthrough.md) for this module in a full end-to-end run.

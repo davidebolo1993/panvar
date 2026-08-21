@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -182,13 +183,21 @@ std::uint64_t splitmix64(std::uint64_t x) {
 constexpr std::size_t kWalkSketchShingle = 3;
 constexpr std::size_t kWalkSketchSize = 512;
 
+// `out_complete`, when given, reports whether the sketch holds EVERY shingle occurrence rather than
+// the bottom k of them. A complete sketch is the walk's full shingle multiset, so two complete
+// sketches can be compared exactly instead of estimated.
 std::vector<std::uint64_t> build_walk_minhash_sketch(
     const std::vector<std::uint64_t>& tokens,
     std::size_t shingle_size,
-    std::size_t sketch_size) {
+    std::size_t sketch_size,
+    bool* out_complete = nullptr) {
 
+    if (out_complete != nullptr) *out_complete = false;
     if (shingle_size == 0 || sketch_size == 0 || tokens.size() < shingle_size) {
         return {};
+    }
+    if (out_complete != nullptr) {
+        *out_complete = (tokens.size() - shingle_size + 1) <= sketch_size;
     }
     std::priority_queue<std::uint64_t> top_hashes;  // max-heap -> keep the bottom k
     // Per-shingle occurrence counter: the n-th occurrence of a shingle is salted with n,
@@ -220,26 +229,63 @@ std::vector<std::uint64_t> build_walk_minhash_sketch(
     return sketch;
 }
 
+// Bottom-k Jaccard over the UNION of the two sketches.
+//
+// The obvious form -- intersection over union of the two stored sketches -- is biased whenever either
+// sketch is truncated, i.e. a walk longer than kWalkSketchSize + shingle - 1 steps. Each sketch then
+// holds the smallest hashes of its OWN shingle set, so a shared shingle can sit inside one sketch and
+// below the other's cutoff. The bias grows with the size difference, which is exactly the tandem-array
+// case: two walks of the same repeat unit at different copy numbers.
+//
+// The standard unbiased estimator takes the k smallest distinct values of the union, k = min(|a|,|b|),
+// and asks how many are in both. Every value considered is at or below both cutoffs, so membership is
+// decidable from the sketches alone.
 double sketch_jaccard(const std::vector<std::uint64_t>& a, const std::vector<std::uint64_t>& b) {
     if (a.empty() || b.empty()) {
         return 0.0;
     }
+    const std::size_t k = std::min(a.size(), b.size());
     std::size_t i = 0;
     std::size_t j = 0;
-    std::size_t inter = 0;
-    while (i < a.size() && j < b.size()) {
-        if (a[i] == b[j]) {
-            ++inter;
+    std::size_t taken = 0;
+    std::size_t both = 0;
+    while (taken < k && (i < a.size() || j < b.size())) {
+        const bool take_a = (j >= b.size()) || (i < a.size() && a[i] < b[j]);
+        const bool take_b = (i >= a.size()) || (j < b.size() && b[j] < a[i]);
+        if (take_a) {
+            ++i;
+        } else if (take_b) {
+            ++j;
+        } else {                      // equal: present in both
             ++i;
             ++j;
-        } else if (a[i] < b[j]) {
-            ++i;
-        } else {
-            ++j;
+            ++both;
         }
+        ++taken;
     }
-    const std::size_t uni = a.size() + b.size() - inter;
-    return uni == 0 ? 0.0 : static_cast<double>(inter) / static_cast<double>(uni);
+    return taken == 0 ? 0.0 : static_cast<double>(both) / static_cast<double>(taken);
+}
+
+// Exact multiset Jaccard of two COMPLETE sketches.
+//
+// The bottom-k estimator above deliberately subsamples: it looks at k = min(|a|,|b|) values even when
+// both sketches already hold every shingle the walks have. On the worked example that estimates
+// J = 0.5 where the exact value sitting in memory is 0.667, and near a clustering threshold that
+// difference splits or joins a pair for no reason. When neither sketch was truncated there is nothing
+// to estimate -- the sketches ARE the multisets -- so intersection over union is computed directly.
+double exact_multiset_jaccard(const std::vector<std::uint64_t>& a,
+                              const std::vector<std::uint64_t>& b) {
+    if (a.empty() || b.empty()) {
+        return 0.0;
+    }
+    std::size_t i = 0, j = 0, both = 0;
+    while (i < a.size() && j < b.size()) {
+        if (a[i] < b[j]) ++i;
+        else if (b[j] < a[i]) ++j;
+        else { ++both; ++i; ++j; }
+    }
+    const std::size_t uni = a.size() + b.size() - both;
+    return uni == 0 ? 0.0 : static_cast<double>(both) / static_cast<double>(uni);
 }
 
 // identity ~= 2J / (1 + J) from k-mer/shingle Jaccard.
@@ -257,6 +303,7 @@ struct UniqueWalk {
     std::string signature;
     TokenWeights weights;
     std::vector<std::uint64_t> sketch;  // walk MinHash sketch (for CC clustering)
+    bool sketch_complete = false;       // sketch holds every shingle, so it can be compared exactly
     std::vector<std::string> members;   // path names, in encounter order
 };
 
@@ -277,14 +324,44 @@ std::vector<ClusterOut> cluster_unique_walks_cc(
     if (n == 0) {
         return {};
     }
+    // This is an all-pairs O(U^2) comparison over a dense U x U matrix of doubles. That is fine for
+    // the reviewed panels (hundreds of distinct walks) and becomes the dominant cost on a large
+    // cohort. No LSH or banding candidate stage exists, so the limit is stated rather than hidden.
+    constexpr std::size_t kWarnUniqueWalks = 2000;
+    constexpr std::size_t kMaxUniqueWalks = 25000;      // ~5 GB of matrix alone
+    if (n > kMaxUniqueWalks) {
+        throw std::runtime_error(
+            "inspect: " + std::to_string(n) + " distinct walks exceeds the clustering limit of " +
+            std::to_string(kMaxUniqueWalks) + ". Clustering compares every pair over a dense " +
+            "matrix, so this run would need about " +
+            std::to_string((n * n * sizeof(double)) / (1024ULL * 1024ULL * 1024ULL)) +
+            " GB. Restrict to one bubble with --bubble-id, or drop --cluster.");
+    }
+    if (n > kWarnUniqueWalks) {
+        std::cerr << "[inspect] WARNING: clustering " << n << " distinct walks compares every pair "
+                  << "over a dense matrix (about "
+                  << (n * n * sizeof(double)) / (1024ULL * 1024ULL) << " MB and "
+                  << (n * (n - 1) / 2) << " comparisons). This implementation is not cohort-scale.\n";
+    }
+
     std::vector<std::vector<double>> dist(n, std::vector<double>(n, 0.0));
     for (std::size_t i = 0; i < n; ++i) {
         for (std::size_t j = i + 1; j < n; ++j) {
-            // Walks too short to shingle have empty sketches; fall back to the exact
-            // bp-weighted Jaccard so short bubbles still cluster instead of all-singleton.
-            const double id = (uniques[i].sketch.empty() || uniques[j].sketch.empty())
-                ? weighted_jaccard_tokens(uniques[i].weights, uniques[j].weights)
-                : estimate_identity_from_jaccard(sketch_jaccard(uniques[i].sketch, uniques[j].sketch));
+            // Three cases, in order of how much is actually known. Walks too short to shingle have
+            // empty sketches and fall back to the exact bp-weighted Jaccard, so short bubbles still
+            // cluster instead of coming out all-singleton. Two COMPLETE sketches are the full shingle
+            // multisets, so they are compared exactly rather than estimated. Only when at least one
+            // was truncated is the bottom-k estimator needed.
+            double id;
+            if (uniques[i].sketch.empty() || uniques[j].sketch.empty()) {
+                id = weighted_jaccard_tokens(uniques[i].weights, uniques[j].weights);
+            } else if (uniques[i].sketch_complete && uniques[j].sketch_complete) {
+                id = estimate_identity_from_jaccard(
+                    exact_multiset_jaccard(uniques[i].sketch, uniques[j].sketch));
+            } else {
+                id = estimate_identity_from_jaccard(
+                    sketch_jaccard(uniques[i].sketch, uniques[j].sketch));
+            }
             dist[i][j] = dist[j][i] = 1.0 - id;
         }
     }
@@ -347,7 +424,12 @@ std::vector<ClusterOut> cluster_unique_walks_cc(
                 co.members.push_back(name);
             }
         }
-        co.representative = uniques[rep].members.front();
+        // The lexicographically smallest member of the medoid walk, not the first one encountered:
+        // identical walks are pooled in GFA record order, so `members.front()` made the reported
+        // representative -- and therefore the sort key of the whole clusters TSV -- depend on how the
+        // P/W records happened to be ordered in the file.
+        co.representative = *std::min_element(uniques[rep].members.begin(),
+                                              uniques[rep].members.end());
         std::sort(co.members.begin(), co.members.end());
         out.push_back(std::move(co));
     }
@@ -394,16 +476,18 @@ InspectBubbleResult write_inspect_outputs_for_bubble(
     std::vector<UniqueWalk> uniques;
     try {
         for (const auto& path : graph.paths) {
+            // bubble_steps, not the inside-node-only interval finder: a haplotype that crosses the
+            // bubble with NO interior node -- a pure deletion, or the short side of an insertion -- has
+            // no interval and was dropped, so inspect emitted one allele where `bubble` reported two.
+            // It is a real allele and it is often the interesting one.
             const BubblePathIndex index = build_bubble_path_index(path);
-            const auto interval = find_best_bubble_path_interval(index, bubble);
-            if (!interval.has_value()) {
+            BubblePathInterval used{};
+            const auto steps_opt = bubble_steps(path, index, bubble, &used);
+            if (!steps_opt.has_value() || steps_opt->empty()) {
                 continue;
             }
-
-            const std::vector<PathStep> steps = canonical_bubble_path_steps(path, bubble, *interval);
-            if (steps.empty()) {
-                continue;
-            }
+            const std::vector<PathStep>& steps = *steps_opt;
+            const BubblePathInterval* interval = &used;
 
             const std::string sequence = spell_path_steps_sequence(graph, steps);
             InspectPathRow row;
@@ -453,7 +537,8 @@ InspectBubbleResult write_inspect_outputs_for_bubble(
                     for (const auto& step : steps) {
                         tokens.push_back(hash_step_token(step));
                     }
-                    uw.sketch = build_walk_minhash_sketch(tokens, kWalkSketchShingle, kWalkSketchSize);
+                    uw.sketch = build_walk_minhash_sketch(tokens, kWalkSketchShingle, kWalkSketchSize,
+                                                          &uw.sketch_complete);
                     uw.members.push_back(row.name);
                     uniques.push_back(std::move(uw));
                 } else {
@@ -534,6 +619,12 @@ InspectBubbleResult write_inspect_outputs_for_bubble(
         const std::size_t len = it == graph.nodes.end() ? 0 : it->second.sequence.size();
         node_lengths_out << tsv_sanitize(node_id) << '\t' << len << '\n';
     }
+    // Closed and CHECKED, not left to the destructor. Destruction closes the file but has nowhere to
+    // report a write that failed on its way to storage, so a truncated table would be committed as
+    // part of a successful family. The same applies to every stream below.
+    node_lengths_out.close();
+    if (!node_lengths_out)
+        throw std::runtime_error("Failed writing node lengths TSV: " + emit.node_lengths_out_path);
 
     if (emit.cluster) {
         const std::vector<ClusterOut> clusters =
@@ -554,9 +645,19 @@ InspectBubbleResult write_inspect_outputs_for_bubble(
             }
             clusters_out << '\n';
         }
+        clusters_out.close();
+        if (!clusters_out)
+            throw std::runtime_error("Failed writing clusters TSV: " + emit.clusters_out_path);
         result.clusters_written = clusters.size();
         result.clusters_out_path = emit.clusters_out_path;
     }
+
+    // table_out and edge_out are still open here; both are checked before returning so a late write
+    // failure on either becomes an error rather than a short file inside a committed family.
+    table_out.close();
+    if (!table_out) throw std::runtime_error("Failed writing node counts TSV: " + table_out_path);
+    edge_out.close();
+    if (!edge_out) throw std::runtime_error("Failed writing edge counts TSV: " + edge_table_out_path);
 
     return result;
 }
@@ -665,6 +766,11 @@ int run_inspect_command(const std::vector<std::string>& args) {
     parse_options.include_paths = true;
     parse_options.include_sequences = true;
     const Graph graph = parse_gfa(gfa_path, parse_options);
+    // The same contract every other module applies. Without it a duplicate path name produced two
+    // rows labelled identically -- nothing downstream could tell which haplotype was which -- and a
+    // non-zero overlap silently inflated every path_length_bp, because inspect spells by
+    // concatenating whole nodes and an overlap means those nodes share bases.
+    validate_graph_paths(graph, "inspect", true, true);
     if (graph.paths.empty()) {
         throw std::runtime_error("Input GFA has no P/W paths; inspect requires paths");
     }
@@ -691,6 +797,30 @@ int run_inspect_command(const std::vector<std::string>& args) {
         selected_bubbles.push_back(&(*bubble_it));
     }
 
+    // The bubbles CSV and the GFA are separate inputs and nothing ties them together, so a CSV from
+    // another graph -- or from the same graph before a rewrite renumbered it -- used to run to
+    // completion: node lengths came back as 0, the count matrix had a column per phantom node and no
+    // rows, and the run exited 0. Every selected bubble must name nodes this graph actually has.
+    {
+        std::vector<std::string> missing;
+        for (const Bubble* b : selected_bubbles) {
+            const auto check = [&](const std::string& n) {
+                if (graph.nodes.find(n) == graph.nodes.end() && missing.size() < 8) {
+                    missing.push_back("bubble " + std::to_string(b->id) + " node " + n);
+                }
+            };
+            check(b->source);
+            check(b->sink);
+            for (const std::string& n : b->inside) check(n);
+        }
+        if (!missing.empty()) {
+            throw std::runtime_error(
+                "inspect: the bubbles CSV describes nodes the GFA does not contain (" +
+                cli::join_with_comma(missing) +
+                "); the CSV and the graph are not the same graph");
+        }
+    }
+
     // Verbose per-bubble block is useful for a single bubble; for an all-bubbles run
     // it just floods stdout, so we show a progress bar on stderr instead.
     const bool single_bubble = bubble_id != 0;
@@ -703,8 +833,31 @@ int run_inspect_command(const std::vector<std::string>& args) {
     std::vector<std::string> single_outputs;
     std::string single_info;
 
+    // Every output path this run will write, explicit and derived alike, resolved before anything is
+    // opened. Checking only the three explicit flags missed the larger half of the family: an explicit
+    // --table-out naming the derived <prefix>.bubble_N.node_lengths.tsv collided silently and one
+    // clobbered the other, which is exactly the case a preflight exists to catch.
+    {
+        std::vector<std::string> finals;
+        for (const Bubble* b : selected_bubbles) {
+            const std::string stem = out_prefix + ".bubble_" + std::to_string(b->id);
+            finals.push_back(fasta_out_path.empty() ? stem + ".paths.fa.gz" : fasta_out_path);
+            finals.push_back(table_out_path.empty() ? stem + ".node_counts.tsv" : table_out_path);
+            finals.push_back(edge_table_out_path.empty() ? stem + ".edge_counts.tsv"
+                                                         : edge_table_out_path);
+            finals.push_back(stem + ".node_lengths.tsv");
+            if (cluster) finals.push_back(stem + ".clusters.tsv");
+        }
+        cli::reject_output_collisions("inspect", finals, {gfa_path, bubbles_csv_path});
+    }
+
     cli::ProgressBar progress((single_bubble || quiet) ? "" : "Inspecting bubbles",
                               single_bubble ? 0 : selected_bubbles.size());
+
+    // An all-bubbles run writes five files per bubble. Failing at bubble 400 of 500 used to leave 399
+    // complete-looking bubbles on disk beside a non-zero exit, which is the shape of result a later
+    // command consumes without noticing.
+    cli::StagedOutputs staged("inspect");
 
     for (const Bubble* bubble_ptr : selected_bubbles) {
         const Bubble& bubble = *bubble_ptr;
@@ -729,13 +882,48 @@ int run_inspect_command(const std::vector<std::string>& args) {
         emit.cluster = cluster;
         emit.cluster_similarity = cluster_similarity;
 
-        const InspectBubbleResult result = write_inspect_outputs_for_bubble(
+        // The writer receives staged paths; everything reported below is the final destination.
+        const std::string final_fasta = bubble_fasta_out_path;
+        const std::string final_table = bubble_table_out_path;
+        const std::string final_edges = bubble_edge_table_out_path;
+        const std::string final_lengths = emit.node_lengths_out_path;
+        const std::string final_clusters = emit.clusters_out_path;
+        bubble_fasta_out_path = staged.stage(final_fasta);
+        bubble_table_out_path = staged.stage(final_table);
+        bubble_edge_table_out_path = staged.stage(final_edges);
+        emit.node_lengths_out_path = staged.stage(final_lengths);
+        emit.clusters_out_path = staged.stage(final_clusters);
+
+        InspectBubbleResult result = write_inspect_outputs_for_bubble(
             graph,
             bubble,
             bubble_fasta_out_path,
             bubble_table_out_path,
             bubble_edge_table_out_path,
             emit);
+        result.fasta_out_path = final_fasta;
+        result.table_out_path = final_table;
+        result.edge_table_out_path = final_edges;
+        result.node_lengths_out_path = final_lengths;
+        result.clusters_out_path = final_clusters;
+        if (result.paths_written == 0) {
+            throw std::runtime_error(
+                "inspect: no path crosses bubble " + std::to_string(bubble.id) + " (" + bubble.source +
+                ".." + bubble.sink + "); the bubbles CSV does not describe this graph");
+        }
+        // Requiring at least one crossing closes the dangerous case -- a CSV from a different graph --
+        // but not the quiet one: a STALE graph with the same node ids and only some of the original
+        // paths still produces crossings, just fewer of them. The CSV records how many `bubble` saw,
+        // so the two can simply be compared. A mismatch is not an error (a legitimate path-dropping
+        // transform produces one), but it must not pass unremarked, because every count downstream is
+        // then taken over a different panel than the one the CSV describes.
+        if (bubble.path_support > 0 && result.paths_written != bubble.path_support) {
+            std::cerr << "[inspect] WARNING: bubble " << bubble.id << " is crossed by "
+                      << result.paths_written << " path(s), but the bubbles CSV records path_support="
+                      << bubble.path_support
+                      << ". The graph and the CSV describe different panels; counts here are over the "
+                         "graph's paths.\n";
+        }
         total_paths_written += result.paths_written;
         progress.tick();
 
@@ -753,6 +941,7 @@ int run_inspect_command(const std::vector<std::string>& args) {
         }
     }
     progress.done();
+    staged.commit();
 
     if (single_bubble) {
         log.info(single_info);

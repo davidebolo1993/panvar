@@ -35,7 +35,16 @@ void print_call_help() {
         << "                                   same-locus events of different sizes, e.g. STR alleles\n"
         << "                                   (default: 0 = use --merge-seq-identity)\n"
         << "      --min-haplotypes <N>         Drop records carried by fewer than N haplotypes (default: 1)\n"
-        << "      --min-maf <X>                Drop records with AF (carriers/traversing-haps) below X (default: 0=off)\n"
+        << "      --min-alt-af <X>             Drop records whose ALT carrier frequency (carriers over\n"
+        << "                                   traversing haplotypes) is below X. Not a minor-allele\n"
+        << "                                   frequency: a DUP's reference-like state is not an allele\n"
+        << "                                   here (default: 0=off; --min-maf is an accepted alias)\n"
+        << "      --allele-vcf                 Also write <prefix>.alleles.vcf: one record per bubble carrying\n"
+        << "                                   EVERY distinct allele as explicit sequence, each haplotype's GT\n"
+        << "                                   indexing its own. Lossless companion to the merged region VCF,\n"
+        << "                                   which describes one walk with several interpreted records\n"
+        << "      --allele-vcf-max-bp <N>      Skip a bubble in the allele VCF if any allele exceeds N bp\n"
+        << "                                   (0 = no limit, the default)\n"
         << "      --multiallelic-loci          Collapse a bounded locus into ONE multiallelic record (REF+ALT1,ALT2..)\n"
         << "      --multiallelic-max-bp <N>    Skip multiallelic collapse above this allele size (default: 5000)\n"
         << "      --rescue-min-bp <N>          Floor for sub-threshold events kept for rescue (default: min-sv-bp/2)\n"
@@ -47,12 +56,21 @@ void print_call_help() {
         << "                                   with >= N high-degree hub interior nodes (default: 10, 0=off)\n"
         << "      --tangle-hub-degree <N>      Distinct-neighbour degree for an interior node to count as a\n"
         << "                                   tangle hub (default: 20)\n"
+        << "      --cn-unit-spacing            Take the MODULE_BP copy-number step from the panel's own\n"
+        << "                                   cluster spacing rather than ref_bp/ref_fold. This makes\n"
+        << "                                   the calibration panel-dependent and is therefore opt-in\n"
+        << "      --max-cn-model-residual <F>  Refuse a MODULE_BP copy-number call when more than this\n"
+        << "                                   FRACTION of traversers round ambiguously\n"
+        << "                                   (CN_ROUND_AMBIGUOUS_FRAC, 0..1); the bubble then\n"
+        << "                                   gets no CN call at all, not a fallback one. 0 = off\n"
         << "      --max-dup-region-frac <F>    Suppress a peak DUP spanning more than this fraction of the\n"
         << "                                   reference (a tangle artifact, not a real dup; default: 0.8, 0=off)\n"
-        << "      --cn                         Copy-number calling (locus-agnostic): enables all routes and\n"
-        << "                                   resolves them by topology (self-loop REP > coverage > peak),\n"
-        << "                                   emitting the TOTAL copy number of the folded module. With --gtf\n"
-        << "                                   the total is reassigned to per-gene copy number. Sequence-resolved\n"
+        << "      --cn                         Enable inferred MODULE_BP and PEAK copy-number routes. REP\n"
+        << "                                   self-loop traversal counting is automatic when that topology\n"
+        << "                                   exists. Routes resolve as REP > MODULE_BP > PEAK and emit the\n"
+        << "                                   total copy number of the represented module. With --gtf, a\n"
+        << "                                   separate table estimates per-gene CN where paralogs are\n"
+        << "                                   separable. Sequence-resolved\n"
         << "                                   DEL/INS/INV are kept alongside the CN call.\n"
         << "      --gtf <path>                 Reference-coordinate GTF: annotate variants with the genes\n"
         << "                                   they touch (INFO GENES), write <prefix>.node_genes.tsv and a\n"
@@ -135,8 +153,16 @@ int run_call_command(const std::vector<std::string>& args) {
             options.min_haplotypes = cli::parse_size_arg(arg, require_value(arg));
             continue;
         }
-        if (arg == "--min-maf") {
+        if (arg == "--min-alt-af" || arg == "--min-maf") {   // --min-maf is the historical spelling
             options.min_maf = cli::parse_unit_fraction_arg(arg, require_value(arg));
+            continue;
+        }
+        if (arg == "--allele-vcf") {
+            options.allele_vcf = true;
+            continue;
+        }
+        if (arg == "--allele-vcf-max-bp") {
+            options.allele_vcf_max_bp = cli::parse_size_arg(arg, require_value(arg));
             continue;
         }
         if (arg == "--multiallelic-loci") {
@@ -168,7 +194,17 @@ int run_call_command(const std::vector<std::string>& args) {
             continue;
         }
         if (arg == "--max-dup-region-frac") {  // suppress a peak DUP spanning > this fraction of the reference
-            options.max_dup_region_frac = std::stod(require_value(arg));
+            // A fraction of the reference, so 0..1. Raw std::stod accepted 2, and "nan" -- which then
+            // compared false against everything and silently disabled the guard.
+            options.max_dup_region_frac = cli::parse_unit_fraction_arg(arg, require_value(arg));
+            continue;
+        }
+        if (arg == "--cn-unit-spacing") {   // take the MODULE_BP copy step from the panel, not ref_bp/ref_fold
+            options.cn_unit_spacing = true;
+            continue;
+        }
+        if (arg == "--max-cn-model-residual") {
+            options.max_cn_model_residual = cli::parse_unit_fraction_arg(arg, require_value(arg));
             continue;
         }
         if (arg == "--gtf") {
@@ -176,7 +212,13 @@ int run_call_command(const std::vector<std::string>& args) {
             continue;
         }
         if (arg == "--minimap-preset") {
+            // Only the three the help advertises; anything else reaches minimap2 as an unknown preset.
             options.minimap_preset = require_value(arg);
+            if (options.minimap_preset != "asm5" && options.minimap_preset != "asm10" &&
+                options.minimap_preset != "asm20") {
+                throw std::runtime_error("--minimap-preset must be asm5, asm10 or asm20 (got '" +
+                                         options.minimap_preset + "')");
+            }
             continue;
         }
         if (arg == "--minimap-best-n") {
@@ -220,6 +262,7 @@ int run_call_command(const std::vector<std::string>& args) {
     if (gfa_path.empty()) {
         throw std::runtime_error("Missing required input: --gfa <path>");
     }
+    options.gfa_path = gfa_path;
     if (!bubble_prefix_in.empty()) {
         const std::string derived = bubble_prefix_in + ".bubbles.csv";
         if (options.bubbles_csv_in.empty()) {
@@ -268,9 +311,25 @@ int run_call_command(const std::vector<std::string>& args) {
                       ? "; " + std::to_string(summary.tangle_bubbles) + " bubble(s) flagged tangle"
                       : ""));
     }
+    // Both of these are guaranteed losses, and a quiet run previously left no record of either: the
+    // counters reached the summary struct and nothing printed them, so a missing CN call or an
+    // unaligned divergent block had no durable reason anywhere in the output.
+    if (summary.skipped_large_segments > 0) {
+        log.info("skipped " + std::to_string(summary.skipped_large_segments) +
+                 " divergent block(s) too large to align; each is a false negative, not a quiet pass");
+    }
+    if (summary.declined_cn_model > 0) {
+        log.info("declined " + std::to_string(summary.declined_cn_model) +
+                 " module copy-number call(s) over --max-cn-model-residual, leaving " +
+                 std::to_string(summary.declined_cn_model_bubbles) +
+                 " bubble(s) with no CN record (sequence-resolved events are unaffected)");
+    }
 
     std::vector<std::string> outputs;
     outputs.push_back(options.out_prefix + ".region.vcf");
+    if (options.allele_vcf) {
+        outputs.push_back(options.out_prefix + ".alleles.vcf");
+    }
     if (options.write_per_bubble_vcf) {
         outputs.push_back(options.out_prefix + ".bubble_<id>.vcf");
     }

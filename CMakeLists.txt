@@ -8,6 +8,35 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(PANVAR_BUILD_TESTING "Build tests" ON)
 
+# `genotype` is the one module that has not completed its review pass. It is excluded from the default
+# build entirely -- sources, dispatch, help and tests -- so a released binary cannot be asked to do
+# something the project is not prepared to stand behind. Development continues with
+# -DPANVAR_ENABLE_EXPERIMENTAL_GENOTYPE=ON, which restores all four.
+option(PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE
+       "Build the experimental genotype module (not release-reviewed)" OFF)
+
+# The rebuild suite is the only test that drives minigraph and costs about 5.5 minutes of a 6 minute
+# run, so it is registered but disabled by default. It worked as an undeclared cache variable, which
+# meant it did not appear in ccmake/cmake-gui and a fresh build tree had to be reconfigured to find it.
+option(PANVAR_SLOW_TESTS "Enable the slow test label (the ~6 minute rebuild suite)" OFF)
+
+# Every source below is reachable only from `genotype`: node_coverage and pangenie_model are its two
+# alternative evidence paths, not shared utilities.
+set(PANVAR_GENOTYPE_LIB_SOURCES
+    src/genotype.cpp
+    src/genotype_blocks.cpp
+    src/genotype_index.cpp
+    src/genotype_markers.cpp
+    src/genotype_reads.cpp
+    src/pangenie_model.cpp
+    src/node_coverage.cpp
+)
+set(PANVAR_GENOTYPE_CLI_SOURCES src/genotype_command.cpp)
+if(NOT PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE)
+    set(PANVAR_GENOTYPE_LIB_SOURCES "")
+    set(PANVAR_GENOTYPE_CLI_SOURCES "")
+endif()
+
 find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
 
@@ -113,10 +142,14 @@ add_library(panvarlib
     src/gfa_io.cpp
     src/align.cpp
     src/graph_utils.cpp
+    src/variant_nodes.cpp
     src/graph_sort.cpp
     src/three_edge_cc.cpp
     src/union_find.cpp
     src/integrated_snarls.cpp
+    src/bubble_alleles.cpp
+    src/syncmer.cpp
+    ${PANVAR_GENOTYPE_LIB_SOURCES}
     src/bubble_path.cpp
     src/bubbles.cpp
     src/ref_path.cpp
@@ -162,6 +195,7 @@ add_executable(panvar
     src/bubble_command.cpp
     src/inspect.cpp
     src/call_command.cpp
+    ${PANVAR_GENOTYPE_CLI_SOURCES}
     src/benchmark_command.cpp
     src/describe_command.cpp
     src/panphorte_command.cpp
@@ -170,6 +204,10 @@ add_executable(panvar
     src/associate_command.cpp
 )
 target_include_directories(panvar PRIVATE ${EIGEN_DIR})
+if(PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE)
+    target_compile_definitions(panvar PRIVATE PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE)
+    target_compile_definitions(panvarlib PUBLIC PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE)
+endif()
 target_link_libraries(panvar PRIVATE panvarlib minimap2 Threads::Threads ZLIB::ZLIB)
 if(NOT WIN32)
     target_link_libraries(panvar PRIVATE m)
@@ -190,20 +228,19 @@ target_compile_options(panvar
 
 include(GNUInstallDirs)
 
-install(TARGETS panvar panvarlib edlib
-    EXPORT panvarTargets
-    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-)
-
-install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-
-install(EXPORT panvarTargets
-    FILE panvarTargets.cmake
-    NAMESPACE panvar::
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/panvar
-)
+# panvar ships as a COMMAND-LINE TOOL. Only the executable is installed.
+#
+# The previous rules exported panvarlib, its headers and a panvarTargets.cmake, which looked like a
+# supported C++ package and was not one: the exported target referred to `abpoa` and `minigraph`,
+# which are IMPORTED targets that were never exported, and to `ZLIB::ZLIB` with no package config to
+# rediscover it, so `find_package(panvar)` could not configure in a consumer project. The default
+# build also installed the experimental genotype headers whose implementations it deliberately omits.
+#
+# Advertising a package contract nobody can satisfy is worse than not advertising one. If a C++ API is
+# wanted later it needs a panvarConfig.cmake, dependency discovery and export for every vendored
+# dependency, a deliberate public-header set rather than all of include/, and an external consumer
+# that compiles and links against the installed tree in CI -- none of which is release work.
+install(TARGETS panvar RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
 if(PANVAR_BUILD_TESTING)
     include(CTest)
@@ -216,6 +253,155 @@ if(PANVAR_BUILD_TESTING)
                 NAME panvar_smoke_synthetic
                 COMMAND /usr/bin/env bash ${PANVAR_SYN_SMOKE} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_SOURCE_DIR}/tests/synthetic_data ${CMAKE_CURRENT_BINARY_DIR}/smoke_synthetic
             )
+        endif()
+
+        # Deterministic statistical assertions for `associate`: linear p against R's lm() (the normal
+        # tail would be 83 orders of magnitude out at 9 df), the logistic separation contract, case/
+        # control carrier counts, and GRM rejection. No RNG, no R at run time, ~1s.
+        set(PANVAR_ASSOC_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/associate_stats.sh)
+        if(EXISTS ${PANVAR_ASSOC_STATS})
+            add_test(
+                NAME panvar_associate_stats
+                COMMAND /usr/bin/env bash ${PANVAR_ASSOC_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/associate_stats
+            )
+            set_tests_properties(panvar_associate_stats PROPERTIES TIMEOUT 120)
+        endif()
+
+        # bubble contract on hand-checkable graphs. CTest exercised the default internal cactus finder
+        # nowhere: synthetic_smoke.sh supplies checked-in external snarls, and real_smoke.sh makes its
+        # bubble assertions conditional on finding a first bubble -- and a header-only CSV is non-empty,
+        # so a total discovery regression would escape.
+        set(PANVAR_BUBBLE_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/bubble_stats.sh)
+        if(EXISTS ${PANVAR_BUBBLE_STATS})
+            add_test(
+                NAME panvar_bubble_stats
+                COMMAND /usr/bin/env bash ${PANVAR_BUBBLE_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/bubble_stats
+            )
+            set_tests_properties(panvar_bubble_stats PROPERTIES TIMEOUT 180)
+        endif()
+
+        # inspect contract. real_smoke.sh only checks that inspect's files exist and that the gzip is
+        # readable, which passes whether or not the contents are right -- it would not have caught a
+        # whole allele missing from the FASTA, a duplicate path name, or a bubbles CSV from a different
+        # graph running to completion.
+        set(PANVAR_INSPECT_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/inspect_stats.sh)
+        if(EXISTS ${PANVAR_INSPECT_STATS})
+            add_test(
+                NAME panvar_inspect_stats
+                COMMAND /usr/bin/env bash ${PANVAR_INSPECT_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/inspect_stats
+            )
+            set_tests_properties(panvar_inspect_stats PROPERTIES TIMEOUT 180)
+        endif()
+
+        # call coordinate contract. real_smoke.sh checks that call runs and that its files exist, and
+        # asserts nothing about where a record lands -- so an off-by-one in POS/END on every DEL and
+        # INV in the primary output passed the whole suite.
+        # genotype depth contract. CTest exercised `genotype` nowhere at all: every other module has a
+        # stats test and this one, the largest in the tree, had none, while the depth code branches over
+        # local against shrunk against region fallback, three estimators, NA against zero, and the direct
+        # against the indexed route. The fixture feeds exact copies of the sample's haplotypes so lambda
+        # is known by construction rather than recorded from a previous run.
+        set(PANVAR_GENOTYPE_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_stats.sh)
+        if(EXISTS ${PANVAR_GENOTYPE_STATS} AND PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE)
+            add_test(
+                NAME panvar_genotype_stats
+                COMMAND /usr/bin/env bash ${PANVAR_GENOTYPE_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/genotype_stats
+            )
+            set_tests_properties(panvar_genotype_stats PROPERTIES TIMEOUT 300)
+        endif()
+
+        # Opt-in regressions against the committed real loci. Several contracts are only reachable
+        # on real data: ANKRD36C is the only locus that ever produced overlapping sites, LPA KIV-2 is
+        # the folding case with 466 haplotypes, whether the POA guards SKIP anything is a property of
+        # real sequence, and an accepted rebuilt GFA has to be re-readable by the next module. About
+        # 2.5 minutes, so it carries the slow label with the rebuild suite.
+        set(PANVAR_REAL_REGRESSIONS ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_regressions.sh)
+        if(EXISTS ${PANVAR_REAL_REGRESSIONS})
+            add_test(
+                NAME panvar_real_regressions
+                COMMAND /usr/bin/env bash ${PANVAR_REAL_REGRESSIONS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/real_regressions
+            )
+            set_tests_properties(panvar_real_regressions PROPERTIES TIMEOUT 900 LABELS "real;slow")
+            if(NOT PANVAR_SLOW_TESTS)
+                set_tests_properties(panvar_real_regressions PROPERTIES DISABLED TRUE)
+            endif()
+        endif()
+
+        set(PANVAR_CALL_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/call_stats.sh)
+        if(EXISTS ${PANVAR_CALL_STATS})
+            add_test(
+                NAME panvar_call_stats
+                COMMAND /usr/bin/env bash ${PANVAR_CALL_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/call_stats
+            )
+            set_tests_properties(panvar_call_stats PROPERTIES TIMEOUT 180)
+        endif()
+
+        # benchmark contract. real_smoke.sh checks that benchmark runs; it asserts nothing about what
+        # the numbers mean. Both headline claims were wrong -- the residual split classified by
+        # alignment-run length rather than event size, so a clean 60 bp deletion read as
+        # sub-threshold, and gap_closed reported 100% for a bubble that was missed entirely.
+        set(PANVAR_BENCHMARK_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/benchmark_stats.sh)
+        if(EXISTS ${PANVAR_BENCHMARK_STATS})
+            add_test(
+                NAME panvar_benchmark_stats
+                COMMAND /usr/bin/env bash ${PANVAR_BENCHMARK_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/benchmark_stats
+            )
+            set_tests_properties(panvar_benchmark_stats PROPERTIES TIMEOUT 180)
+        endif()
+
+        # describe contract. The C4 smoke test checks that describe produces output and asserts nothing
+        # about the dosages -- so a bug that made a plain deletion emit ZERO features passed it, with
+        # every file still present.
+        set(PANVAR_DESCRIBE_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/describe_stats.sh)
+        if(EXISTS ${PANVAR_DESCRIBE_STATS})
+            add_test(
+                NAME panvar_describe_stats
+                COMMAND /usr/bin/env bash ${PANVAR_DESCRIBE_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/describe_stats
+            )
+            set_tests_properties(panvar_describe_stats PROPERTIES TIMEOUT 300)
+        endif()
+
+        # panphorte contract. The registered C4 smoke test passes with five normalized=no rows, so it
+        # never exercises folding at all.
+        set(PANVAR_PANPHORTE_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/panphorte_stats.sh)
+        if(EXISTS ${PANVAR_PANPHORTE_STATS})
+            add_test(
+                NAME panvar_panphorte_stats
+                COMMAND /usr/bin/env bash ${PANVAR_PANPHORTE_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/panphorte_stats
+            )
+            set_tests_properties(panvar_panphorte_stats PROPERTIES TIMEOUT 300)
+        endif()
+
+        # refine contract. real_smoke.sh only checks that refine's files exist and that `call` runs
+        # afterwards, which passes whether or not the rewrite was correct.
+        set(PANVAR_REFINE_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/refine_stats.sh)
+        if(EXISTS ${PANVAR_REFINE_STATS})
+            add_test(
+                NAME panvar_refine_stats
+                COMMAND /usr/bin/env bash ${PANVAR_REFINE_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/refine_stats
+            )
+            set_tests_properties(panvar_refine_stats PROPERTIES TIMEOUT 300)
+        endif()
+
+        # rebuild contract: the input is never destroyed, a healthy graph survives, a malformed one is
+        # refused rather than silently repaired, and nothing is left behind. CTest previously exercised
+        # no rebuild at all.
+        set(PANVAR_REBUILD_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/rebuild_stats.sh)
+        if(EXISTS ${PANVAR_REBUILD_STATS})
+            add_test(
+                NAME panvar_rebuild_stats
+                COMMAND /usr/bin/env bash ${PANVAR_REBUILD_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/rebuild_stats ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_data/c4.gfa.gz
+            )
+            # Real-data integration: several forced rebuilds of C4 (reproducibility across threads,
+            # k either side of 31, the reference-ambiguity and verdict cases). Minutes, not seconds.
+            # PAUSED by default: the only test that drives minigraph, and it costs ~5.5 minutes of a
+            # ~6 minute suite. Re-enable with `cmake -DPANVAR_SLOW_TESTS=ON` (then `ctest -L slow`),
+            # and run it before anything that touches rebuild. Turn it back on by default once the
+            # module review pass is finished.
+            set_tests_properties(panvar_rebuild_stats PROPERTIES TIMEOUT 900 LABELS "real;slow")
+            if(NOT PANVAR_SLOW_TESTS)
+                set_tests_properties(panvar_rebuild_stats PROPERTIES DISABLED TRUE)
+            endif()
         endif()
 
         # Real-data integration smoke: the whole bubble -> inspect -> describe -> panphorte

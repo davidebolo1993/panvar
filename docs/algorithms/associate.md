@@ -6,52 +6,67 @@ Mechanism for the `associate` module. For usage/flags see [modules/associate.md]
 
 ## How it works
 
-### 1. Fit and Wald-test each unit
-
-Per unit, `associate` fits `phenotype ~ genotype + covariates` and reports a Wald test on the genotype term:
-
-- linear (quantitative trait) — ordinary least squares (OLS); `β = (XᵀX)⁻¹Xᵀy`, `Var(β) = σ²·(XᵀX)⁻¹` with `σ² = RSS/(n−p)` (RSS is the residual sum of squares).
-- logistic (binary trait) — iteratively reweighted least squares (IRLS) Newton–Raphson; `β`, `Var(β) = (Xᵀ W X)⁻¹` at convergence.
-- Wald p — `z = β_genotype / se`, `p = erfc(|z|/√2)` (the upper tail computed directly via `erfc` to avoid the cancellation of `1 − Φ(|z|)` at large `|z|`), floored at `1e-300`.
-
-The unit is auto-detected from the `layer` column of `feature_annot` — `variant` when the majority of rows are variant-level, otherwise `feature` (override with `--unit`). Across all tested units the genomic-inflation factor `λ = median(z²)/0.4549` (the observed median z² over the null median of a χ²₁, `0.4549`) is reported in the summary: `λ ≈ 1` means the test is calibrated, `λ > 1` flags residual structure.
-
-### 2. Filter on minor frequency
+### 1. Filter on minor frequency
 
 A unit is dropped when its minor (non-modal) frequency — the fraction of the cohort not carrying the most common rounded dosage — is below `--min-maf`. This is the minor-allele-frequency (MAF) quantity generalized to a multi-valued copy-number dosage, where a two-allele MAF is not defined: round each dosage, take the modal value's share `f`, and the minor frequency is `1 − f`.
 
+### 2. Fit and test each unit
+
+Per unit, `associate` fits `phenotype ~ genotype + covariates` and tests the genotype term. Quantitative traits get a Wald test with a Student-t tail on `n − p` degrees of freedom because the residual variance is estimated from the same data. Binary traits get a covariate-adjusted Rao score test because the Wald statistic can collapse under near-separation. The logistic effect is the maximum-likelihood estimate when that fit converges and Firth's penalised estimate under separation; in either case, `z` and `p` come from the score test and are not recoverable from `log_or / se`.
+
+- linear (quantitative trait) — ordinary least squares (OLS); `β = (XᵀX)⁻¹Xᵀy`, `Var(β) = σ²·(XᵀX)⁻¹` with `σ² = RSS/(n−p)` (RSS is the residual sum of squares).
+- logistic effect — iteratively reweighted least squares (IRLS), or Firth's penalised fit under separation.
+- p-value — quantitative traits use `t = β_genotype / se` with `n−p` degrees of freedom; binary traits use the Rao score statistic, with saddlepoint or exact-tail handling where applicable. Values are floored at `1e-300`.
+
+Which test is used, and why it is not always the obvious one:
+
+- Quantitative traits use a Student-t tail on `n − p` degrees of freedom rather than the normal one. The residual variance is estimated from the same data, so the statistic is t-distributed; the difference is invisible at large sample sizes and substantial at small ones, where the normal tail is anticonservative by a wide margin.
+- Binary traits use a Rao score test rather than a Wald test. A Wald statistic divides an estimate by its own standard error, and for a rare variant in an unbalanced case/control study the fit approaches separation: the coefficient grows and its standard error grows faster, so the statistic collapses toward zero exactly where the evidence is strongest. The score test never fits the alternative, so it has no standard error to inflate.
+- Past `|z| > 2` the binary score is saddlepoint-corrected. The normal approximation matches only the first two cumulants, so it drifts in the far tail precisely when the terms are skewed, which is the rare-variant-under-imbalance case. The score is a sum of independent bounded terms, so its cumulant generating function is available exactly and the saddlepoint expansion is built from it. That does not make the result exact: the expansion is still an approximation, and at very small sample sizes it is not guaranteed to beat the normal.
+- At the edge of the score's support, where a feature separates the outcome perfectly, the saddlepoint is at infinity and the expansion does not apply. Falling back to the normal tail there would use an approximation exactly where it is least trustworthy, so the probability is instead written down exactly: the boundary is a single configuration whose probability is a product over the samples, computed in logs. The two tails are evaluated independently, since an asymmetric score distribution can put them in different regimes, and the result is labelled exact only when both are.
+
+Under separation the maximum-likelihood fit diverges, so an iteration limit is treated as failure rather than returning the last iterate. The score test is unaffected and still yields a valid p, and the effect size comes from Firth's penalised likelihood, which is finite where maximum likelihood is not. A feature is dropped only when the score test itself fails; there is never a silent fall back to a Wald p.
+
+Consequence for reading a row: `z` and `p` come from the score test while `log_or` and `se` are a Wald-style effect size, so `p` cannot be recovered from them.
+
+The unit is auto-detected from the `layer` column of `feature_annot` — `variant` when the majority of rows are variant-level, otherwise `feature` (override with `--unit`). Across all tested units the summary reports `λ = median(z²)/0.4549`. It is meaningful as genomic inflation only when most tested units are null; in a single associated locus the signal itself can move it.
+
 ### 3. Correct the testing burden — `Meff` (phenotype-blind)
 
-`Meff` is the effective number of independent tests in the region, always ≤ the raw feature count; it replaces the raw `n_tests` in the Bonferroni benchmark. How it is derived depends on the unit — the two are corrected by different mechanisms:
+`Meff` is a regional estimate used in a secondary Bonferroni benchmark. How it is derived depends on the unit:
 
 | unit | substrates | how `Meff` is computed | LD-clumping? | conditioning | per-row columns |
 |------|-----------|------------------------|--------------|--------------|-----------------|
-| feature | k-mers and graph (nodes/edges) | `Meff` = number of distinct bubbles the tested features map to (the `bubbles` column, split on `;`, de-duplicated) | no | single-lead + collinearity guard | `p_conditional`, `cond_role` |
-| variant | SV calls (`describe --variant-vcf`) | `Meff` = number of LD-clump leads | yes (genotype r²) | forward-stepwise (COJO) | `clump`, `is_lead`, `low_af`, `p_conditional`, `cond_role` |
+| feature | k-mers and graph (nodes/edges) | distinct annotated bubbles plus one block per unannotated feature | no | single-lead + collinearity guard | `p_conditional`, `cond_role` |
+| variant | SV calls (`describe --variant-vcf`) | `Meff` = Li–Ji eigenvalue estimate (phenotype-blind) | yes (genotype r²) | forward-stepwise (COJO) | `clump`, `is_lead`, `low_af`, `p_conditional`, `cond_role` |
 
-Feature unit — membership-based `Meff`. k-mer counts and node/edge dosages are correlated by construction: every feature carries the `bubbles` it came from, and all the features inside one bubble are reads of the same local variation. So no genotype correlations are needed — each bubble collapses to one effective test and `Meff` = the number of distinct bubbles. There is no clumping and no r² in feature mode; it is a cheap set-count over the `bubbles` column, so it needs no genotype matrix. Both the k-mer run and the graph run use exactly this rule.
+Feature unit — membership-based `Meff`. Each annotated bubble counts once; a tested feature without bubble annotation counts as its own block. This is a biological grouping, not a statistically estimated effective-test count. There is no LD clumping in feature mode.
 
-Variant unit — genotype-r² LD-clumping. Distinct SV calls can still be in linkage disequilibrium (LD) across different bubbles, which bubble-membership cannot see, so here correlation is measured directly. Greedy clump: sort variants by p ascending; the best unassigned variant becomes a lead (`is_lead=1`, new `clump` id); every still-unassigned variant whose genotype r² (squared Pearson on mean-imputed dosage) with that lead exceeds `--ld-r2` (default 0.8) is marked its shadow (`is_lead=0`, same `clump`); repeat over the remaining variants. `Meff` is the number of leads. Only the variant tier retains the full dosage vectors needed for r², so clumping is intrinsically variant-only. `low_af` flags a variant whose observed minor-allele count (`minor_freq · n`) is below `--min-ac` (default 3); a low-AF variant has an unstable r² and a fragile asymptotic p, so it is barred from anchoring a clump (and thus cannot inflate `Meff`) — it can still be claimed as a shadow of a genuine lead.
+Variant unit — the primary estimate is Li–Ji's phenotype-blind function of the genotype-correlation eigenvalues. It requires a dense feature-correlation matrix and eigendecomposition, so it is region-scale and is capped at 20,000 tested variants. If it is unavailable, the run falls back to the LD-clump count, then to the raw test count.
 
-`Meff` only rescales the Bonferroni benchmark; Benjamini–Hochberg (BH) false-discovery-rate (FDR) control is unchanged and stays primary:
+Variant LD clumping is still performed for interpretation. Variants are sorted by p; the best unassigned non-low-AF variant becomes a lead, and unassigned variants with genotype r² above `--ld-r2` become its shadows. Low-AF variants cannot seed a clump but can be claimed by one; any tested variant left unassigned receives a singleton clump. Because the seeds are chosen by p, this clump count is phenotype-dependent and is not the primary `Meff`. The summary reports `meff_eigen`, `meff_ld_clumping` and `meff_method` separately.
+
+### 4. Adjust the p-values
+
+`Meff` only rescales a regional Bonferroni guide. Benjamini–Hochberg (BH) is computed from the raw p-values and does not use `Meff`:
 
 ```text
-p_bonf      = min(1, p · n_tests)   # raw, over-conservative (ignores correlation)
-p_bonf_meff = min(1, p · Meff)      # the honest effective-tests Bonferroni
-q_bh                                # Benjamini–Hochberg FDR — primary control, no Meff
+p_bonf      = min(1, p · n_tests)   # formal family-wise reference
+p_bonf_meff = min(1, p · Meff)      # regional heuristic
+q_bh                                # BH FDR summary; no Meff
 ```
 
-The summary reports `unit`, `meff`, both Bonferroni thresholds, and a unit-named alias for the effective count: `independent_variants` (variant) or `distinct_bubbles` (feature).
+The summary reports `unit`, `meff`, `meff_method`, both Bonferroni thresholds, and a unit-named alias for the selected estimate: `independent_variants` (variant) or `distinct_bubbles` (feature).
 
-### 4. Establish independence — conditioning (phenotype-aware)
+### 5. Establish independence — conditioning (phenotype-aware)
 
-Clumping and `Meff` fix the threshold; they do not establish that a hit is independent. A marginal test of a variant only weakly correlated with an extremely strong locus still comes out genome-wide significant — even when its r² is far below `--ld-r2`, so clumping never groups it. A conditional refit is the only honest way to separate a true signal from such a shadow, so `associate` runs one on every tier and reports `p_conditional` (a unit's Wald p after the lead signal(s) enter the model as covariates) plus `cond_role` (its status). This step is deliberately separate from the phenotype-blind `Meff`, so the threshold cannot become circular.
+Clumping and `Meff` do not establish that a hit is independent. A marginal test of a variant only weakly correlated with an extremely strong locus can remain significant even when its r² is below `--ld-r2`. `associate` therefore refits each tier conditionally and reports `p_conditional` (the target tested after the lead signal or signals enter as covariates, on their common complete cases) plus `n_conditional` and `cond_role`. This phenotype-aware step remains separate from the phenotype-blind `Meff`, so the selected threshold is not circular.
 
 Variant tier — forward-stepwise conditional-and-joint (COJO-style) analysis. Select a set of jointly-independent signals:
 
-1. compute each variant's p conditioned on the currently-selected set (its dosage(s) added as covariates; the genotype of interest stays the Wald target);
-2. add the variant with the smallest conditional p if it clears the entry threshold `--cojo-p` (default `0.05/Meff`);
-3. repeat until nothing new clears the bar.
+- compute each variant's p conditioned on the currently-selected set (its dosage(s) added as covariates; the genotype of interest stays the target of the same test used marginally);
+- add the variant with the smallest conditional p if it clears the entry threshold `--cojo-p` (default `0.05/Meff`);
+- repeat until nothing new clears the bar.
 
 Then every variant is reported conditioned on the selected set minus itself: a true signal stays significant and is tagged `cond_role=signal`; a shadow's `p_conditional` inflates (e.g. a neighbour that only tags the lead goes from genome-wide significant to ~null) and is tagged `cond_role=shadow`. The sole signal of a single-signal locus has an empty conditioning set, so its `p_conditional` is `NA`. The summary reports `cojo_independent_signals`. Linear/logistic only; linear-mixed-model (LMM) conditioning (which needs the rotation) is not done.
 
@@ -66,23 +81,23 @@ Full forward-stepwise across thousands of correlated features would be unstable,
 The two correction layers in order:
 
 ```text
-1. TEST       per feature/variant: phenotype ~ genotype + covariates(+PCs)  -> Wald -> marginal p
-2. MAF FILTER drop minor (non-modal) freq < --min-maf
+1. MAF FILTER drop minor (non-modal) freq < --min-maf
+2. TEST       per feature/variant: phenotype ~ genotype + covariates(+PCs)  -> Student-t (quantitative) / score (binary) -> marginal p
 ── Layer A: multiple-testing BURDEN (phenotype-blind) ───────────────────────────────────
-3. Meff       variant: LD-clump by genotype r² > --ld-r2 (low-AF can't lead) -> Meff = #leads
-              feature: Meff = #distinct bubbles  (no clumping, no r²)
-4. p_adj      p_bonf = p·n_tests | p_bonf_meff = p·Meff | q_bh = BH-FDR (primary)
+3. Meff       variant: phenotype-blind Li–Ji eigen estimate; LD-clump count is a fallback
+              feature: annotated bubble groups + unannotated singleton blocks
+4. p_adj      p_bonf = p·n_tests | p_bonf_meff = p·Meff | q_bh = BH-FDR summary
 ── Layer B: INDEPENDENCE (phenotype-aware) ──────────────────────────────────────────────
 5. CONDITION  variant: forward-stepwise COJO (entry --cojo-p, default 0.05/Meff) -> signal/shadow
               feature: condition on top lead; r²>0.95 vs lead -> collinear, else conditioned
               -> p_conditional, cond_role  (cojo_independent_signals in summary)
 ```
 
-`scripts/plot_associate.R` draws three Manhattan panels — raw `-log10(p)`, BH `-log10(q)`, and (when the columns are present) `-log10(p_conditional)`, where shadows collapse below the line and only the conditioning signal(s) stay tall.
+`scripts/plot_associate.R` draws three Manhattan panels — raw `-log10(p)`, BH `-log10(q)`, and (when the columns are present) `-log10(p_conditional)`. The last panel shows which rows meet the configured conditional entry rule and which are labelled shadows or collinear.
 
-## Worked trace (one feature)
+## Worked trace
 
-Five samples cross one feature; genotype dosage `g` (a copy number), phenotype `y = log10 Lp(a)`. Covariates are omitted so the arithmetic stays legible — they only add columns to `X`:
+Five samples cross one feature; genotype dosage `g` (a copy number), phenotype `y` on a log scale. Covariates are omitted so the arithmetic stays legible — they only add columns to `X`:
 
 ```text
 sample   g   y
@@ -94,18 +109,18 @@ s5       6   0.5
 ```
 
 1. Filter on minor frequency. Round the dosages to `{2,2,4,6,6}`; the modal value occurs twice of five, so the minor (non-modal) frequency is `1 − 2/5 = 0.60`. That clears `--min-maf`, so the feature is tested.
-2. Fit `y ≈ a + b·g` by ordinary least squares. With `ḡ = 4` and `ȳ = 1.04`, the sums of squares are `Sgg = Σ(g−ḡ)² = 16` and `Sgy = Σ(g−ḡ)(y−ȳ) = −3.20`, giving slope `b = Sgy/Sgg = −0.20` and intercept `a = ȳ − b·ḡ = 1.84`.
-3. Wald-test the slope. The fitted values `1.44, 1.44, 1.04, 0.64, 0.64` leave residuals `−0.14, 0.16, −0.04, 0.16, −0.14`, so `RSS = 0.092`, `σ² = RSS/(n−2) = 0.0307`, `Var(b) = σ²/Sgg = 0.00192` and `se = 0.0438`. Then `z = b/se = −4.57` and `p = erfc(|z|/√2) = erfc(3.23) ≈ 5e-6`. Covariates only widen `X` and change `Var(b_g) = σ²·[(XᵀX)⁻¹]_gg`; a binary trait swaps this OLS for the IRLS-reweighted logistic fit, and the Wald test is otherwise identical.
+2. Fit and test the unit. Fit `y ≈ a + b·g` by ordinary least squares. With `ḡ = 4` and `ȳ = 1.04`, the sums of squares are `Sgg = Σ(g−ḡ)² = 16` and `Sgy = Σ(g−ḡ)(y−ȳ) = −3.20`, giving slope `b = Sgy/Sgg = −0.20` and intercept `a = ȳ − b·ḡ = 1.84`.
+   The fitted values `1.44, 1.44, 1.04, 0.64, 0.64` leave residuals `−0.14, 0.16, −0.04, 0.16, −0.14`, so `RSS = 0.092`, `σ² = RSS/(n−2) = 0.0307`, `Var(b) = σ²/Sgg = 0.00192` and `se = 0.0438`. Then `t = b/se = −4.57`, and on `n − p = 3` degrees of freedom `p = 2·P(T₃ > 4.57) ≈ 0.020`. Covariates widen `X`; a binary trait instead reports the score test described above.
 
 Result for this feature:
 
 ```text
-minor_freq=0.60  beta=−0.20  se=0.0438  z=−4.57  p≈5e-6
+minor_freq=0.60  beta=−0.20  se=0.0438  z=−4.57  p≈0.020  p_method=t
 ```
 
-## Worked trace (region-wide correction)
+3. Estimate the testing burden. Across four tested features, suppose the provenance contains two distinct bubbles. Feature-mode `Meff` is then 2; in variant mode it would instead come from the genotype-correlation spectrum when available.
 
-One feature is not a region. Across, say, four tested features `p = [5e-6, 2e-3, 0.03, 0.40]`:
+4. Adjust the p-values. For `p = [5e-6, 2e-3, 0.03, 0.40]`:
 
 ```text
 Bonferroni threshold = 0.05/4 = 0.0125    significant: 5e-6, 2e-3            (2 features)
@@ -114,15 +129,19 @@ BH q (sorted, q_i = p_i·m/rank, monotone) = [2e-5, 0.004, 0.04, 0.40]
   FDR < 0.05                              significant: 5e-6, 2e-3, 0.03      (3 features)
 ```
 
-BH recovers one more than Bonferroni — the expected conservative-vs-FDR trade-off. But when the four features tag the same underlying variation, the raw `n_tests = 4` over-counts and the region-wide Bonferroni is too conservative; `Meff` (step 3) replaces that 4 with the effective test count — the number of distinct bubbles for a feature run, or the number of LD-clump leads for a variant run — and `p_bonf_meff` rescales accordingly.
+   With `Meff=2`, `p_bonf_meff = min(1, 2p)` is also reported as a regional guide.
+
+5. Establish independence. Feature mode conditions non-collinear rows on the top feature. Variant mode builds a forward-selected signal set, then conditions every row on that set minus itself. The resulting `p_conditional` and `cond_role` distinguish retained signals from correlated shadows.
 
 ## LMM (EMMAX) — the fast mixed model
 
+The kinship matrix is validated before any of this runs: row count and row width, finiteness, symmetry, and positive semi-definiteness. A matrix failing any of them is not a covariance, and the variance ratio derived from it would not mean anything.
+
 For `--model lmm`, relatedness is a random effect with covariance `σ²_g·K` (the kinship `K`). The fixed-effect rotation is done once (EMMAX), then each feature is a cheap generalized least squares (GLS):
 
-1. Eigendecompose `K = U diag(d) Uᵀ` (one symmetric eigendecomposition, via Eigen).
-2. Rotate the phenotype and covariates: `ỹ = Uᵀy`, `X̃ = UᵀX_cov`.
-3. Estimate the variance ratio `δ = σ²_e/σ²_g` once under the null by maximizing the restricted-maximum-likelihood (REML) profile likelihood over `δ` (1-D grid + golden-section), where row `i` has variance `(d_i + δ)`.
-4. Per feature, rotate the genotype `g̃ = Uᵀg`, append it to `X̃`, and solve a weighted least squares with weights `1/(d_i + δ)`; the Wald test on the genotype coefficient gives `β, se, z, p` exactly as above. `lmm_delta` in the summary is the fitted `δ`.
+- Eigendecompose `K = U diag(d) Uᵀ` (one symmetric eigendecomposition, via Eigen).
+- Rotate the phenotype and covariates: `ỹ = Uᵀy`, `X̃ = UᵀX_cov`.
+- Estimate the variance ratio `δ = σ²_e/σ²_g` once under the null by maximizing the restricted-maximum-likelihood (REML) profile likelihood over `δ` (1-D grid + golden-section), where row `i` has variance `(d_i + δ)`.
+- Per feature, rotate the genotype `g̃ = Uᵀg`, append it to `X̃`, and solve weighted least squares with weights `1/(d_i + δ)`; the genotype coefficient is tested with a Student-t tail on the residual degrees of freedom. `lmm_delta` in the summary is the fitted `δ`.
 
 This costs one `O(n³)` eigendecomposition plus `O(n·p²)` per feature — orders of magnitude cheaper than re-fitting a full mixed model per feature. `--pca N` is the lighter alternative: it adds the top-N eigenvectors of `K` (principal components, PCs) as fixed covariates to the generalized linear model (GLM), with no variance-component step. Both need an external genome-wide `K` (`--kinship`); panvar is local and does not build one from its own region genotypes.

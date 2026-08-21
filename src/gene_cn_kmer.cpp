@@ -40,6 +40,24 @@ void collect_canonical_kmers(const std::string& seq, std::size_t k,
     }
 }
 
+// As above, but keeping how MANY times each canonical k-mer occurs. Copy number is an occurrence
+// ratio, so a set loses exactly the multiplicity the estimate is made of.
+void count_canonical_kmers(const std::string& seq, std::size_t k,
+                           std::unordered_map<std::uint64_t, long>& out) {
+    if (k == 0 || k > 32 || seq.size() < k) return;
+    const std::uint64_t mask = (k == 32) ? ~0ULL : ((1ULL << (2 * k)) - 1);
+    const unsigned top_shift = static_cast<unsigned>(2 * (k - 1));
+    std::uint64_t fwd = 0, rev = 0;
+    std::size_t len = 0;
+    for (char c : seq) {
+        const int b = base_code(c);
+        if (b < 0) { len = 0; fwd = 0; rev = 0; continue; }
+        fwd = ((fwd << 2) | static_cast<std::uint64_t>(b)) & mask;
+        rev = (rev >> 2) | (static_cast<std::uint64_t>(3 - b) << top_shift);
+        if (++len >= k) ++out[std::min(fwd, rev)];
+    }
+}
+
 } // namespace
 
 std::vector<std::vector<GeneCnEvidence>> resolve_gene_cn_kmer(
@@ -52,20 +70,30 @@ std::vector<std::vector<GeneCnEvidence>> resolve_gene_cn_kmer(
         hap_seqs.size(), std::vector<GeneCnEvidence>(n_genes));
     if (n_genes == 0 || k == 0 || k > 31) return out;
 
-    // 1) canonical k-mer set per gene.
-    std::vector<std::unordered_set<std::uint64_t>> gene_kmers(n_genes);
+    // 1) canonical k-mer COUNTS per gene. Counts, not a set: a k-mer occurring twice inside one copy
+    //    of a gene contributes two hits from that one copy, so the denominator below has to know.
+    std::vector<std::unordered_map<std::uint64_t, long>> gene_counts(n_genes);
     for (std::size_t g = 0; g < n_genes; ++g)
-        collect_canonical_kmers(gene_markers[g], k, gene_kmers[g]);
+        count_canonical_kmers(gene_markers[g], k, gene_counts[g]);
 
-    // 2) private k-mers: unique to one gene vs all others. Map private k-mer -> owning gene.
+    // 2) private k-mers: unique to one gene against its siblings. Map private k-mer -> owning gene.
+    //
+    // Uniqueness is against the sibling genes only, not against the whole locus reference. Widening it
+    // removes about a third of the markers, and the dosage ratio loses more to the smaller denominator
+    // than it gains in specificity, so it is not offered as an option. See docs/algorithms/call.md.
     std::unordered_map<std::uint64_t, int> owner;
     std::vector<long> priv_size(n_genes, 0);
     for (std::size_t g = 0; g < n_genes; ++g) {
-        for (std::uint64_t km : gene_kmers[g]) {
+        for (const auto& [km, in_gene] : gene_counts[g]) {
             bool shared = false;
             for (std::size_t o = 0; o < n_genes && !shared; ++o)
-                if (o != g && gene_kmers[o].count(km)) shared = true;
-            if (!shared) { owner[km] = static_cast<int>(g); ++priv_size[g]; }
+                if (o != g && gene_counts[o].count(km)) shared = true;
+            if (shared) continue;
+            owner[km] = static_cast<int>(g);
+            // The denominator is OCCURRENCES per reference copy, so that hits/denominator is the
+            // number of copies. Counting distinct k-mers instead made a k-mer repeated within one
+            // copy read as extra copies of the gene.
+            priv_size[g] += in_gene;
         }
     }
 
@@ -132,6 +160,12 @@ struct PairSiteEvidence {
     long sites = 0;
     int cn_a = 0, cn_b = 0;
     long hits_a = 0, hits_b = 0, priv_a = 0, priv_b = 0;
+    // Did THIS haplotype produce a usable split? `sites` and `priv_*` describe the marker sets, which
+    // exist for every haplotype once the pair has divergent sites at all, so neither can answer it.
+    // Without this the pair's global separability was read as per-haplotype evidence and a haplotype
+    // with no usable site published cn_a=cn_b=0 as a confident call.
+    long usable_sites = 0;
+    bool resolved = false;
 };
 
 // Per-site consensus split of a near-identical gene pair (a, b). Aligns b (query) to a (target) ONCE to
@@ -208,9 +242,10 @@ std::vector<PairSiteEvidence> resolve_pair_cn_persite(
             if (asz > 0 && bsz > 0) {
                 const double na = static_cast<double>(ah[si]) / static_cast<double>(asz);
                 const double nb = static_cast<double>(bh[si]) / static_cast<double>(bsz);
-                if (na + nb >= 0.5) fr.push_back(na / (na + nb));
+                if (na + nb >= 0.5) { fr.push_back(na / (na + nb)); ++e.usable_sites; }
             }
         }
+        e.resolved = !fr.empty();
         if (!fr.empty()) {
             std::sort(fr.begin(), fr.end());
             const double med = (fr.size() % 2) ? fr[fr.size() / 2]
@@ -282,6 +317,19 @@ std::vector<std::vector<GeneCnEvidence>> resolve_gene_cn(
         if (pev.empty() || pev[0].sites == 0) continue;   // per-site failed -> keep pooled dosage
         for (std::size_t hp = 0; hp < hap_seqs.size(); ++hp) {
             GeneCnEvidence& ea = ev[hp][ia];
+            // Separability is per HAPLOTYPE, not per pair. `sites` says the pair could be separated
+            // somewhere in the panel and `priv_*` are marker-set sizes that exist for every haplotype
+            // regardless, so neither answers whether THIS haplotype had evidence. Only `resolved`
+            // does. Testing priv_kmers instead was true whenever the pair had sites at all, so a
+            // haplotype with no usable site still published cn=0 as a confident call -- and the check
+            // could never fire, which is what made it look like the case did not arise.
+            if (!pev[hp].resolved) {
+                // Leave the pooled estimate in place and mark it unreliable; the caller then reports
+                // the module total for this haplotype rather than a split it has no basis for.
+                ea.separable = false;
+                ev[hp][ib].separable = false;
+                continue;
+            }
             ea.cn = pev[hp].cn_a; ea.hits = pev[hp].hits_a; ea.priv_kmers = pev[hp].priv_a;
             ea.dosage = ea.priv_kmers > 0 ? static_cast<double>(ea.hits) / static_cast<double>(ea.priv_kmers) : 0.0;
             ea.separable = true;
