@@ -12,7 +12,7 @@ Types structural variants on the pangenome graph into a multi-sample VCF (Varian
 
 Algorithm and worked trace: [algorithms/call.md](../algorithms/call.md).
 
-The recommended path is `bubble → panphorte → [refine] → call`, so `call` runs on the `panphorte` graph, or on the `refine` graph when the opt-in `refine` step is used. `panphorte` folds genuine tandem repeats into `REP` self-loops — which a tandem needs for an exact count — and leaves paralog clusters and rare duplications untouched; `refine` then POA-realigns the bubble interiors to remove graph-builder artifacts while holding those `REP` self-loops fixed, so it is copy-number-safe and the substrate `call` sees is the same folding with cleaner interiors. Calling directly on the `bubble` graph also works for a non-tandem paralog cluster and gives identical results there, since `panphorte` leaves such clusters untouched, but it misses the tandem folding.
+The recommended path is `bubble → panphorte → [refine] → call`, so `call` runs on the `panphorte` graph, or on the `refine` graph when the opt-in `refine` step is used. `panphorte` folds genuine tandem repeats into repeat-unit self-loops, which a tandem needs for an exact count, and leaves paralog clusters and rare duplications untouched; `refine` then POA-realigns the bubble interiors to remove graph-builder artifacts while holding those self-loops fixed, so it is copy-number-safe and the substrate `call` sees is the same folding with cleaner interiors. Calling directly on the `bubble` graph also works for a non-tandem paralog cluster and gives identical results there, since `panphorte` leaves such clusters untouched, but it misses the tandem folding.
 
 #### Event types
 
@@ -56,7 +56,7 @@ Outputs are staged and renamed in only once the whole run succeeds, so a failure
 | `--merge-jaccard <X>` | node-set [Jaccard](../algorithms/call.md#merge-keys--jaccard-vs-sequence-identity) to merge events | `0.80` |
 | `--merge-seq-identity <X>` | event-sequence identity to merge | `0.80` |
 | `--merge-size-ratio <X>` | length-ratio floor for the sequence merge (lower to merge more differing lengths) | `0` (off) |
-| `--min-haplotypes <N>` / `--min-maf <X>` | drop records below N carriers / carrier frequency `AF=AC/AN` | `1` / `0` |
+| `--min-haplotypes <N>` / `--min-alt-af <X>` | drop records below N carriers, or below that carrier frequency | `1` / `0` |
 | `--cn` | emit the total copy number of the folded module; with `--gtf` it is reassigned to per-gene `CN` where the paralogs are separable. See [algorithms/call.md](../algorithms/call.md#copy-number) for the routes and [calling without `--cn`](../algorithms/call.md#copy-number) for what surfaces without it | off |
 | `--classify-ins` | refine `INS` subtype `NOVEL`/`DUP` via minimap2 | off |
 | `--multiallelic-loci` | collapse a bounded locus into one multiallelic record; `--multiallelic-max-bp` (5000) bounds it | off |
@@ -86,74 +86,33 @@ VCF 4.2; samples = haplotypes. `FORMAT`: `GT` (`1` carrier / `0` ref-like / `.` 
 | `REF_CN` | `DUP` only: reference copy number |
 | `CN_METHOD` / `CN_SCOPE` | `DUP` only: which of the three CN routes measured this — `REP` (exact traversal count of a panphorte self-loop), `MODULE_BP` (folded-node bp over a reference-calibrated unit), `PEAK` (highest interior-node multiplicity) — and whether a copy is a copy of a `REPEAT_UNIT` or of a `COLLAPSED_MODULE` |
 | `RU_LEN` | `CN_METHOD=REP` only: the literal repeat unit, where `(CN − REF_CN) × RU_LEN` is the haplotype's size |
-| `CN_UNIT_BP` | `CN_METHOD=MODULE_BP` only: the calibrated unit CN was divided by. This is the **shared** per-copy content, not a whole copy — see below |
+| `CN_UNIT_BP` | `CN_METHOD=MODULE_BP` only: the calibrated unit CN was divided by. This is the shared per-copy content, not a whole copy, so it understates a carrier's true gain or loss |
 | `CN_SHARED_BP` / `CN_REF_FOLD` / `CN_MODULE_REF_BP` | the calibration inputs (`CN_UNIT_BP = CN_SHARED_BP / CN_REF_FOLD`) and the reference's total bp across the module |
 | `GENES` | `--gtf`: gene(s) overlapped (whole folded module for a `DUP`) |
 | `NALLELES` | `--multiallelic-loci`: number of alleles |
 | `INSSEQ`/`DELSEQ`/`INVSEQ` | event sequence (omitted when very long) |
 
 
-## Plotting
+## Limitations
 
-`scripts/plot_vcf_map.R` draws the headline oncoprint-style map (rows = haplotypes, columns = variants grouped by bubble; `DEL` red, `INS`-`NOVEL` green, `INS`-`DUP` purple, `INV` orange, multiallelic yellow-amber, `DUP` shaded blue by `FORMAT:CN`). It needs only the region VCF (`Rscript` + `ggplot2`):
-
-```bash
-Rscript scripts/plot_vcf_map.R \
-  --vcf <prefix>.region.vcf \
-  --out <prefix>.vcf_map
-```
-
-Flags:
-
-- `--vcf <file>` — the `call` region VCF (required).
-- `--out <prefix>` — output prefix (required).
-- `--clusters` / `--cluster-by <tsv>` — plot only cluster representatives / group and order rows by cluster (mirrors the inspect heatmaps).
-- `--max-paths <N>` — cap the number of haplotype rows.
-- `--flip` — transpose (variants as rows).
-- `--scale` / `--scale-transform <raw|sqrt|log1p>` — size each cell by `|SVLEN|` (`RU_LEN` for a `DUP`), with an optional transform.
-- `--reference-path <name>` — optionally pin a haplotype (substring match) as the top (or leftmost, with `--flip`) row.
-- `--width` / `--height` / `--dpi` — figure size (inches) and PNG resolution (default 300).
-
-### Interactive node-coverage viewer
-
-For a per-node view — how each haplotype actually traverses the graph under every call — `scripts/variant_node_heatmap_app.R` is a Shiny + plotly app. The top panel is a coverage heatmap (rows = haplotypes, columns = variant-affected nodes ordered by genomic position, width ∝ node length): white = not traversed, grey = ×1, red-gradient = ×2+ (so a `DUP` reads as a copy-number gradient). The bottom panel marks each `variant_id`'s node set. Hovering a node shows its gene, coverage, and — on a variant node — that haplotype's `GT` (+ `CN`/`CNBP` for `DUP`). It opens on a representative subset (the reference plus one carrier per variant / per distinct `DUP` CN); pick a bubble to zoom, clear the box to show all haplotypes, or click a `variant_id` to select its carriers.
-
-First assemble the bundle with `scripts/build_variant_node_data.R` (needs `data.table`), then launch the app (`shiny`, `plotly`, `data.table`, `DT`):
-
-```bash
-Rscript scripts/build_variant_node_data.R \
-  --gfa <call-graph.normalized.sorted.gfa> \   # the panphorte or refine graph call ran on
-  --variant-nodes <prefix>.variant_nodes.tsv \
-  --vcf <prefix>.region.vcf \
-  --bubbles <panphorte-prefix>.bubbles.csv \
-  --node-genes <prefix>.node_genes.tsv \
-  --out variant_nodes.rds
-
-VN_RDS=variant_nodes.rds Rscript scripts/variant_node_heatmap_app.R
-```
-
-`--node-genes` is optional (drops the gene hover if omitted). The `--gfa` is the graph `call` ran on and `--bubbles` its panphorte `bubbles.csv`, so node order and bubble spans match the VCF.
-
-
-## Gene annotation (`--gtf`)
-
-A reference-coordinate GTF (Gene Transfer Format; Ensembl/GENCODE) projected onto the graph via a PanSN reference (`sample#hap#chrom:start-end`); else skipped with a warning. It adds: `INFO=GENES` per record; `<prefix>.node_genes.tsv` (`node_id → gene(s)`); and `<prefix>.dup_gene_cn.tsv` — the per-haplotype per-gene copy number split of a folded paralog cluster, resolved from the GTF alone by k-mer dosage. Each gene's coding sequence (its gene span if it has no CDS) supplies a set of k-mers private to it vs its paralogs; a haplotype's per-copy count of those k-mers is the gene's copy number. Near-identical paralog pairs — where a plain count blurs under gene conversion — are split instead by per-site consensus over their divergent coding columns. See [algorithms/call.md](../algorithms/call.md#gene-annotation---gtf).
-
-## Example
-
-See the [LPA walkthrough](../walkthrough.md) for this module in a full end-to-end run.
+- A merged record carries one representative sequence for every carrier. `SVLEN_RANGE` and `MERGE_DIAMETER` show how far that reaches, but the per-carrier allele is only in the allele VCF.
+- `CN_METHOD=PEAK` takes copy number from the highest interior-node multiplicity, which is a heuristic; those records carry `CN_CONFIDENCE=HEURISTIC`.
+- Under `CN_METHOD=MODULE_BP`, `CN_UNIT_BP` is a calibration constant rather than a repeat-unit length, so `(CN − REF_CN) × CN_UNIT_BP` understates a carrier. `FORMAT:CNBP` is the per-haplotype size on every route.
+- Where a module boundary is visited more than once, the span used is the widest one, from the first source occurrence to the last sink. It can enclose sequence lying between separate visits, and those records carry `CN_SPAN_AMBIGUOUS`.
+- The event sequence is omitted from very large records, so a consumer of `INSSEQ`/`DELSEQ`/`INVSEQ` alone cannot reconstruct those; the allele VCF carries them.
 
 ## Lossless companion: the allele VCF
 
-`--allele-vcf` writes `<prefix>.alleles.vcf` alongside the region VCF: **one record per bubble, carrying every distinct allele as explicit sequence**, with each haplotype's `GT` indexing its own allele.
+The region VCF is the interpreted output: records are merged so a reader can see what varies. `--allele-vcf` additionally writes `<prefix>.alleles.vcf`, one record per bubble whose ALT column carries every distinct allele at that site spelled out, with each haplotype's `GT` indexing its own. Nothing is merged and no sequence is summarized, so reconstructing a haplotype from it reproduces the input exactly. Use the region VCF to interpret a locus and the allele VCF when the exact sequence a given haplotype carries matters.
 
-The region VCF is an *interpretation* — events are typed, merged across haplotypes that carry the same site, and written symbolically. That is what makes it readable, and it is deliberately kept as the primary output. But it is lossy in three ways that matter to anyone reconstructing a specific sample: several records can describe one walk and do not compose additively when applied together; a merged record gives every carrier the representative's length rather than its own; and a symbolic `ALT` carries no sequence at all.
+## Plotting
 
-The allele VCF has none of those properties, because it never interprets: it just spells what each haplotype actually traverses. Measured with `benchmark --vcf` on all six reference loci, it reconstructs **every haplotype at every called bubble exactly** — residual 0 bp, no haplotype worse than the do-nothing baseline — where the region VCF closes 16-96% of the same gap.
+`scripts/plot_vcf_map.R` draws an oncoprint-style map of the region VCF, rows being haplotypes and columns variants grouped by bubble, with duplications shaded by copy number. `scripts/build_variant_node_data.R` and `scripts/variant_node_heatmap_app.R` build and serve an interactive per-node coverage view of the same calls. Each script documents its own options under `--help`.
 
-The cost is size: 70-600x the region VCF (3 MB to 110 MB per locus at 466 haplotypes), since a bubble with hundreds of distinct kilobase-scale alleles spells each one out. Use `--allele-vcf-max-bp` to skip bubbles above a size, and prefer it bgzipped.
+## Gene annotation
 
-| flag | what it does | default |
-|------|--------------|---------|
-| `--allele-vcf` | also write `<prefix>.alleles.vcf` | off |
-| `--allele-vcf-max-bp <N>` | skip a bubble there if any allele exceeds N bp | `0` (no limit) |
+With `--gtf` and a PanSN (Pangenome Sequence Naming) reference path, genes overlapping each record are named in `INFO/GENES`, `<prefix>.node_genes.tsv` maps every node to the genes covering it, and for a duplication whose paralogs are separable `<prefix>.dup_gene_cn.tsv` splits the module's copy number per gene.
+
+## Example
+
+See the [walkthrough](../walkthrough.md) for this module in a full end-to-end run.
