@@ -8,6 +8,8 @@
 #   genotype_sim.sh <locus> [n_pairs] [depth] [error]
 #
 # Env: LOO=1 for leave-one-out (the sample's own haplotypes dropped from the panel)
+# Env: PAIRING=self (default; both haplotypes of ONE donor, so LOO holds out a whole individual)
+#      or chimera (two haplotypes from unrelated donors -- a stress case, not a real genome)
 # Env: PANVAR_BIN (default build/panvar), PYTHON, OUT (default a scratch dir), SEED,
 #      GENOTYPE_EXTRA (extra flags passed through to `panvar genotype`)
 set -uo pipefail
@@ -51,12 +53,38 @@ if [[ "${CALLS_APPEND:-0}" == "0" || ! -s "$CALLS" ]]; then
   printf 'locus\tdepth\terror\tloo\tpair\tblock_kind\tn_alleles\tn_markers\tgq\texplained\tcorrect\tfilter\n' > "$CALLS"
 fi
 
-exact=0; partial=0; wrong=0; total=0; bex=0; btot=0
+# PAIRING=self (default) simulates a REAL INDIVIDUAL: both haplotypes of one panel donor, so under
+# LOO the whole individual is held out. PAIRING=chimera keeps the old behaviour, two haplotypes drawn
+# from unrelated donors.
+#
+# The default changed because a chimera is not a person. Its two haplotypes never co-occurred, so it
+# has no relatives in the panel in the way a real sample does, and measured on real reads one real
+# individual lost 6,877 bp where a chimera lost 49,966. Tuning against chimeras risks tuning against a
+# difficulty that does not occur. `chimera` is kept because it is a legitimate stress case.
+PAIRING="${PAIRING:-self}"
+DONORS=()
+if [[ "$PAIRING" == "self" ]]; then
+  while IFS= read -r line; do DONORS+=("$line"); done < <(
+    printf '%s\n' "${NAMES[@]}" | awk -F'#' '{c[$1]++; if(c[$1]==1) first[$1]=$0; else if(c[$1]==2) second[$1]=$0}
+      END{for(s in c) if(c[s]>=2) print first[s]"\t"second[s]}' | sort)
+  ND=${#DONORS[@]}
+  (( ND > 0 )) || { echo "PAIRING=self: no donor has two haplotypes in $G"; exit 1; }
+  echo "  pairing: self (one individual per pair); $ND donors with two haplotypes"
+else
+  echo "  pairing: chimera (two unrelated haplotypes per pair)"
+fi
+
+exact=0; partial=0; wrong=0; total=0; bex=0; btot=0; sumdbp=0; sumbdbp=0
 for ((p=0; p<PAIRS; p++)); do
-  i=$(( (SEED + p * 7919) % N ))
-  j=$(( (SEED + p * 104729 + 13) % N ))
-  [[ "$i" == "$j" ]] && j=$(( (j + 1) % N ))
-  H1="${NAMES[$i]}"; H2="${NAMES[$j]}"
+  if [[ "$PAIRING" == "self" ]]; then
+    d=$(( (SEED + p * 7919) % ND ))
+    H1="${DONORS[$d]%%$'\t'*}"; H2="${DONORS[$d]##*$'\t'}"
+  else
+    i=$(( (SEED + p * 7919) % N ))
+    j=$(( (SEED + p * 104729 + 13) % N ))
+    [[ "$i" == "$j" ]] && j=$(( (j + 1) % N ))
+    H1="${NAMES[$i]}"; H2="${NAMES[$j]}"
+  fi
   rm -rf "$OUT/fa"; "$PY" "$REPO/scripts/spell_paths.py" -i "$G" -o "$OUT/fa" --paths "$H1,$H2" >/dev/null
   rm -f "$OUT/r_1.fq" "$OUT/r_2.fq"; hidx=0
   for f in "$OUT"/fa/*.fa; do
@@ -73,8 +101,14 @@ for ((p=0; p<PAIRS; p++)); do
   gzip -f "$OUT/r_1.fq" "$OUT/r_2.fq"
   line=$("$BIN" genotype -i "$G" --bubble-prefix-in "$PFX" -r "$REF" -o "$OUT/gt" \
     -R "$OUT/r_1.fq.gz" -R "$OUT/r_2.fq.gz" --truth-haplotypes "$H1,$H2" \
-    $( [ "${LOO:-0}" != "0" ] && printf -- "--exclude-haplotypes %s,%s" "$H1" "$H2" ) ${GENOTYPE_EXTRA:-} 2>&1 | grep -E "truth check|unrepresentable")
+    $( [ "${LOO:-0}" != "0" ] && printf -- "--exclude-haplotypes %s,%s" "$H1" "$H2" ) ${GENOTYPE_EXTRA:-} 2>&1 | grep -E "truth check|unrepresentable|graded accuracy over")
   unrep=$(sed -nE 's/.*unrepresentable blocks[^0-9]*([0-9]+)\/.*/\1/p' <<<"$line" | head -1)
+  # Exact-allele counting is harsh and its denominator moves with how many blocks are representable,
+  # so carry the sequence-distance figures too: they are comparable across samples and across loci,
+  # and they are what the real-data cohort reports.
+  dbp=$(sed -nE 's/.*total dbp ([0-9]+) \(best any panel allele could do: ([0-9]+)\).*/\1/p' <<<"$line" | head -1)
+  bdbp=$(sed -nE 's/.*total dbp ([0-9]+) \(best any panel allele could do: ([0-9]+)\).*/\2/p' <<<"$line" | head -1)
+  lwi=$(sed -nE 's/.*length-weighted identity ([0-9.]+)%.*/\1/p' <<<"$line" | head -1)
   line=$(grep "truth check" <<<"$line")
   e=$(sed -E 's/.*check: ([0-9]+)\/([0-9]+).*/\1/' <<<"$line")
   t=$(sed -E 's/.*check: ([0-9]+)\/([0-9]+).*/\2/' <<<"$line")
@@ -96,11 +130,14 @@ for ((p=0; p<PAIRS; p++)); do
              $(c["block_kind"]),$(c["n_alleles"]),$(c["n_markers"]),$(c["gq"]),$(c["explained"]),
              (lo==tl&&hi==th)?1:0,$(c["filter"])
     }' "$OUT/gt.genotypes.tsv" >> "$CALLS" 2>/dev/null
-  printf "  pair %d: %s/%s blocks exact, bubbles %s/%s%s\n" "$p" "$e" "$t" "$be" "$bt" "${unrep:+, $unrep unrepresentable}"
+  printf "  pair %d: %s/%s blocks exact, bubbles %s/%s%s; dbp %s (best %s), lenwt %s%%\n" \
+    "$p" "$e" "$t" "$be" "$bt" "${unrep:+, $unrep unrepresentable}" "${dbp:-NA}" "${bdbp:-NA}" "${lwi:-NA}"
+  sumdbp=$((sumdbp + ${dbp:-0})); sumbdbp=$((sumbdbp + ${bdbp:-0}))
   exact=$((exact+e)); total=$((total+t)); partial=$((partial+pa)); wrong=$((wrong+wr))
   bex=$((bex+be)); btot=$((btot+bt))
 done
 echo "TOTAL $LOCUS: $exact/$total blocks exact ($partial one-allele, $wrong both-wrong); bubbles $bex/$btot"
+echo "TOTAL $LOCUS: sequence distance $sumdbp bp (best the panel could do: $sumbdbp bp)"
 # Accuracy over ALL scored blocks hides the filter doing its job: a call the model declined counts the
 # same as one it got wrong. Report the PASS subset and its call rate alongside.
 awk -F'\t' -v L="$LOCUS" 'NR>1 && $1==L {
