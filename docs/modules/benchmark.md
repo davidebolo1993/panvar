@@ -76,21 +76,57 @@ All outputs are staged and committed only on success, and no output may name an 
 
 | file | contents |
 |------|----------|
-| `<prefix>.truth_events.tsv` | one row per (haplotype, bubble, truth event): `ref_bp`, `hap_bp`, `size_bp`, `class`, and the `variant_id` / `svtype` it maps to. The ledger everything else aggregates |
-| `<prefix>.qv.tsv` | per (haplotype, bubble): `svtypes`, `is_carrier`, `δ`, `aln_len`, `qv`, the run split `resid_run_lt_bp` / `resid_run_ge_bp`, the ledger counts `truth_events` / `truth_called` / `truth_missed` / `truth_below` / `truth_missed_bp`, `called_delta` / `called_qv`, and `carrier_delta` / `carrier_qv`. With `--vcf`, also `gt_delta` / `gt_aln_len` / `gt_qv`, the baseline `ref_delta`, and `gt_called_carrier` / `gt_true_carrier` |
-| `<prefix>.qv_by_haplotype.tsv` | the same per haplotype: `identity`, the run split, the ledger, `called_sum_delta` / `called_qv` / `called_quintile`, `carrier_sum_delta` / `carrier_qv`, plus `qv`, cosigt `band`, `qv_max`, `qv_ratio`, `quintile`. With `--vcf`, the `gt_*` mirror plus `ref_sum_delta`, `ref_qv` and `gap_closed` (literal `NA` where undefined) |
-| `<prefix>.qv_summary.tsv` | `truth_event` / `truth_bp` (the ledger, `ALL` and per svtype), `quintile` / `haplotype` / `called_quintile` distributions, `residual_run`, `excluded` (bubbles with no reference walk, haplotype-bubble pairs not traversed, pairs decomposed coarsely, haplotypes with no VCF column, VCF samples with no path), `called_recon`. With `--vcf`: `gt_quintile` / `gt_haplotype`, `gt_gap` (pooled deltas, `gap_closed_pooled`, `gap_closed_mean`, `gap_closed_undefined`, `worse_than_baseline`), `variation_recovered` for every level, `carrier_quintile` / `carrier_recon` and the `loss_bp` partition, `gt_carrier` (TP/FP/FN/TN with precision and recall) and `gt_records` (`applied` / `unplaceable` / `clamped` / `unhandled` / `ref_mismatch` / `heuristic`) |
+| `<prefix>.truth_events.tsv` | one row per haplotype, bubble and truth event. The ledger everything else aggregates |
+| `<prefix>.qv.tsv` | one row per haplotype and bubble |
+| `<prefix>.qv_by_haplotype.tsv` | one row per haplotype, the same quantities summed over its bubbles |
+| `<prefix>.qv_summary.tsv` | run totals, as `scope` / `key` / `band` / `n` / `pct` rows |
 
-Nothing is dropped silently: every haplotype-bubble pair excluded from a denominator is counted in the `excluded` scope, so no rate is read as though it covered everything.
+`truth_events.tsv` columns:
 
-Results can be plotted via `scripts/plot_benchmark.R`, which consumes combined tables rather than this module's own output:
+| column | meaning |
+|--------|---------|
+| `ref_bp`, `hap_bp`, `size_bp` | the event's span on the reference walk, on the haplotype walk, and its size |
+| `class` | `called`, `missed` or `below_threshold` |
+| `variant_id`, `svtype` | the record it maps to, empty when nothing was emitted there |
 
-| the script wants | where it comes from |
-|------------------|---------------------|
-| `--table` | `scripts/regen_results.sh` concatenates every locus's `<prefix>.qv_by_haplotype.tsv` into `results/benchmark_qv.tsv`, prepending the `locus` column the script groups by. To plot one run on its own, pass its `<prefix>.qv_by_haplotype.tsv` with `--locus <name>` |
-| `--loss` | assembled by `scripts/regen_results.sh` into `results/benchmark_loss.tsv` from the `loss_bp` rows of each locus's `<prefix>.qv_summary.tsv`. `benchmark` writes no file with that name itself |
+`qv.tsv` and `qv_by_haplotype.tsv` columns, one family per reconstruction level:
 
-Without `--vcf` only the `graph` and `called` levels are scored, and every per-haplotype column from `carrier_sum_delta` onward is written as `.`. The run says so on stderr, and the plot falls back to the graph ceiling alone.
+| column family | level | present |
+|--------|-------|---------|
+| `delta`, `aln_len`, `qv`, `identity` | `graph` | always |
+| `called_delta`, `called_qv`, `called_quintile` | `called` | always |
+| `carrier_delta`, `carrier_qv` | `carrier` | `--vcf` only |
+| `gt_delta`, `gt_aln_len`, `gt_qv`, `gt_identity` | `region_vcf` | `--vcf` only |
+| `ref_delta`, `ref_qv` | do-nothing baseline | `--vcf` only |
+| `gap_closed` | fraction of the baseline-to-graph distance closed | `--vcf` only |
+
+Alongside these: `svtypes` and `is_carrier`; the residual run split `resid_run_lt_bp` / `resid_run_ge_bp`; the ledger counts `truth_events` / `truth_called` / `truth_missed` / `truth_below` / `truth_missed_bp`; and the cosigt bands `band`, `qv_max`, `qv_ratio`, `quintile`.
+
+`qv_summary.tsv` scopes:
+
+| scope | reports |
+|-------|---------|
+| `truth_event`, `truth_bp` | the ledger, for `ALL` and per svtype |
+| `quintile`, `haplotype`, `called_quintile` | distributions across haplotypes |
+| `residual_run` | residual split by run length |
+| `excluded` | every haplotype-bubble pair left out of a denominator, so no rate reads as though it covered everything |
+| `called_recon` | the `called` level's totals |
+| `variation_recovered` | one row per level: `graph`, `called`, `carrier_walk`, `region_vcf` |
+| `gt_gap` | pooled deltas, `gap_closed_pooled`, `gap_closed_mean`, `worse_than_baseline` |
+| `loss_bp` | the five-term partition summing to the region-VCF residual |
+| `gt_carrier` | carrier TP / FP / FN / TN |
+| `gt_records` | how each VCF record was applied: `applied`, `unplaceable`, `clamped`, `unhandled`, `ref_mismatch`, `heuristic` |
+
+The last five need `--vcf`. Without it only `graph` and `called` are scored, every per-haplotype column from `carrier_delta` onward is written as `.`, and the run says so on stderr.
+
+### Plotting
+
+`scripts/plot_benchmark.R` consumes combined tables, not this module's own output:
+
+| input | where it comes from |
+|-------|---------------------|
+| `--table` | `scripts/regen_results.sh` concatenates each locus's `qv_by_haplotype.tsv` into `results/benchmark_qv.tsv`, adding the `locus` column it groups by. To plot one run alone, pass its `qv_by_haplotype.tsv` with `--locus <name>` |
+| `--loss` | `scripts/regen_results.sh` also builds `results/benchmark_loss.tsv` from the `loss_bp` rows of each `qv_summary.tsv`. `benchmark` writes no file with that name itself |
 
 ## Limitations
 
