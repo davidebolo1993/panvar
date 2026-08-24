@@ -83,7 +83,14 @@ All outputs are staged and committed only on success, and no output may name an 
 
 Nothing is dropped silently: every haplotype-bubble pair excluded from a denominator is counted in the `excluded` scope, so no rate is read as though it covered everything.
 
-Results can be plotted via `scripts/plot_benchmark.R`.
+Results can be plotted via `scripts/plot_benchmark.R`, which consumes combined tables rather than this module's own output:
+
+| the script wants | where it comes from |
+|------------------|---------------------|
+| `--table` | `scripts/regen_results.sh` concatenates every locus's `<prefix>.qv_by_haplotype.tsv` into `results/benchmark_qv.tsv`, prepending the `locus` column the script groups by. To plot one run on its own, pass its `<prefix>.qv_by_haplotype.tsv` with `--locus <name>` |
+| `--loss` | assembled by `scripts/regen_results.sh` into `results/benchmark_loss.tsv` from the `loss_bp` rows of each locus's `<prefix>.qv_summary.tsv`. `benchmark` writes no file with that name itself |
+
+Without `--vcf` only the `graph` and `called` levels are scored, and every per-haplotype column from `carrier_sum_delta` onward is written as `.`. The run says so on stderr, and the plot falls back to the graph ceiling alone.
 
 ## Limitations
 

@@ -751,6 +751,17 @@ int run_benchmark_command(const std::vector<std::string>& args) {
     // coordinates, so each bubble's reference span is taken as a substring there and the reconstruction
     // is flipped back for bubbles the reference crosses sink->source.
     const bool do_gt = !vcf_in.empty();
+    // Without a VCF only the two truth-assisted levels can be scored, and every column from
+    // carrier_sum_delta onward is written as `.`. That is a silently PARTIAL result: a reader sees a
+    // populated table and no indication that half the analysis did not run, and the plotting script
+    // then fails on the empty columns. Say so once, prominently.
+    if (!do_gt) {
+        log.info("no --vcf: scoring the `graph` and `called` levels ONLY. The `carrier` and "
+                 "`region_vcf` levels, the loss partition (loss_bp) and variation_recovered are NOT "
+                 "computed, and their columns are written as `.`");
+        log.info("  pass call's <prefix>.region.vcf for the interpreted reconstruction, or its "
+                 "<prefix>.alleles.vcf (call --allele-vcf) for the lossless one");
+    }
     VcfData vcf;
     std::unordered_map<std::size_t, std::vector<const VcfRecord*>> recs_by_bubble;
     std::vector<int> hap_vcf(graph.paths.size(), -1);

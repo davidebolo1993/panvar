@@ -109,9 +109,15 @@ def main():
 
             # Link targets carry anchors like #rebuild--re-inducing-..., which look like flags.
             prose = re.sub(r"\]\([^)]*\)", "]()", text)
-            for f in sorted(set(re.findall(r"--[a-z0-9][a-z0-9-]+", prose))):
-                if flags and f not in flags:
-                    bad.append(f"flag not accepted by `{mod} --help`: {f}")
+            # A module page legitimately documents the flags of the helper SCRIPT that consumes its
+            # output, and those are not the module's own. Attribute a flag to the script when the
+            # line naming it also names a script; check only the rest against the module's --help.
+            for line in prose.splitlines():
+                owns = not re.search(r"[A-Za-z0-9_]+\.(R|py|sh)\b", line)
+                for f in sorted(set(re.findall(r"--[a-z0-9][a-z0-9-]+", line))):
+                    if owns and flags and f not in flags:
+                        bad.append(f"flag not accepted by `{mod} --help`: {f}")
+            bad = sorted(set(bad))
 
             for tok in sorted(set(re.findall(r"`([A-Za-z][A-Za-z0-9_]*)`", text))):
                 if "_" not in tok and not tok.isupper():

@@ -28,8 +28,12 @@ usage <- function(status = 0) {
     "  Rscript plot_benchmark.R --table <combined.tsv> --out <prefix> [options]",
     "",
     "Required:",
-    "  --loss <path>            optional per-locus loss partition (results/benchmark_loss.tsv);",
-    "                           adds the 'Where the loss lives' panel",
+    "  --loss <path>            optional per-locus loss partition; adds the 'Where the loss lives'",
+    "                           panel. NOT written by `panvar benchmark` -- it is assembled from each",
+    "                           locus's <prefix>.qv_summary.tsv (the loss_bp rows) by",
+    "                           scripts/regen_results.sh, as results/benchmark_loss.tsv",
+    "  --locus <name>           label a single run's <prefix>.qv_by_haplotype.tsv, which has no",
+    "                           `locus` column of its own",
     "  --table <path>           per-haplotype benchmark rows; needs the columns locus, sum_aln_len,",
     "                           sum_delta, truth_missed_bp, truth_below_bp (from `panvar benchmark`)",
     "",
@@ -63,13 +67,30 @@ left_ymin <- numarg("--left-ymin", "0"); dpi <- numarg("--dpi", "150")
 if (is.null(tp)) usage(1)
 
 d <- read.delim(tp, check.names = FALSE, stringsAsFactors = FALSE)
+# A single `panvar benchmark` run writes <prefix>.qv_by_haplotype.tsv with NO locus column -- that is
+# added by scripts/regen_results.sh when it concatenates loci into results/benchmark_qv.tsv. Accept a
+# single run directly by naming it, rather than telling the user to re-run benchmark, which can never
+# add the column.
+locus_name <- get("--locus", "")
+if (!("locus" %in% names(d)) && nzchar(locus_name)) d$locus <- locus_name
 need <- c("locus", "sum_aln_len", "sum_delta", "truth_missed_bp", "truth_below_bp")
-# The genotype level is optional so an older table still plots, but without it the left panel shows
+# The region-VCF level is optional so a table without it still plots, but the left panel then shows
 # only the graph CEILING -- which reads ~100% everywhere and is not what a consumer of the VCF gets.
-has_gt <- all(c("gt_sum_delta", "gt_sum_aln_len") %in% names(d))
+has_gt <- all(c("gt_sum_delta", "gt_sum_aln_len") %in% names(d)) &&
+          any(!is.na(suppressWarnings(as.numeric(d$gt_sum_delta))))
 miss <- setdiff(need, names(d))
-if (length(miss)) stop("table missing columns: ", paste(miss, collapse = ", "),
-                       "  (re-run `panvar benchmark` to add the truth-event ledger columns)")
+if (length(miss)) {
+  hint <- if (identical(miss, "locus"))
+    paste0("this looks like one run's <prefix>.qv_by_haplotype.tsv, which carries no `locus` column.",
+           " Pass --locus <name> to plot it on its own, or use results/benchmark_qv.tsv written by",
+           " scripts/regen_results.sh, which prepends it.")
+  else "expected the per-haplotype table written by `panvar benchmark`."
+  stop("table missing columns: ", paste(miss, collapse = ", "), "\n  ", hint)
+}
+if (!has_gt)
+  message("note: no region-VCF columns (gt_*) -- benchmark was run without --vcf, so only the graph",
+          " ceiling is shown. Re-run `panvar benchmark --vcf <call>.region.vcf` for the level a",
+          " consumer of the VCF actually gets.")
 
 agg_cols <- c("sum_aln_len", "sum_delta", "truth_missed_bp", "truth_below_bp")
 if (has_gt) agg_cols <- c(agg_cols, "gt_sum_delta", "gt_sum_aln_len")
