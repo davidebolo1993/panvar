@@ -815,8 +815,11 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 {
                     const std::string fp = out_prefix + ".block" + std::to_string(bi) + ".fa";
                     std::ofstream ff(fp);
+                    // An EMPTY allele is a real allele -- the bypass a deletion takes -- and skipping
+                    // it made the dump disagree with every other per-block output about how many
+                    // alleles the block has. A consumer counting FASTA records then silently drops
+                    // the one allele a deletion is about. Emitted with an empty sequence line.
                     for (std::size_t ai = 0; ai < blocks[bi].allele_seq.size(); ++ai) {
-                        if (blocks[bi].allele_seq[ai].empty()) continue;
                         ff << '>' << ai << ' ' << blocks[bi].allele_seq[ai].size() << '\n'
                            << blocks[bi].allele_seq[ai] << '\n';
                     }
