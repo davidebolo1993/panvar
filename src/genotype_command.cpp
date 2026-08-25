@@ -195,6 +195,10 @@ void print_genotype_help() {
         << "                              (<prefix>.blockN.ledger.tsv). Needs no reads: the ledger is\n"
         << "                              a property of the panel. One block, since the pre-filter set\n"
         << "                              is several times the retained one\n"
+        << "      --dump-haplotype-alleles <f>  Write which allele every panel haplotype carries at\n"
+        << "                              every block. The panel's basic fact, and the only way to\n"
+        << "                              recover TRANSITIONS between blocks: per-block dumps cannot\n"
+        << "                              say which allele pairs co-occur on one haplotype\n"
         << "      --edge-weight <F>       Weight on 2-syncmer adjacency evidence (default 0 = off).\n"
         << "                              Adjacencies come from the same reads as the nodes, so this\n"
         << "                              double-counts; measured worth 0.5-4% at 0.25-0.5, and 1.0\n"
@@ -246,6 +250,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
     double depth_quantile = 0.75;
     long dump_block = -1;
     long ledger_block = -1;
+    std::string alleles_out;
     bool depth_calibration = false;
     double mass_weight = 0.0;
     bool nearest_rank = false;
@@ -323,6 +328,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
         }
         else if (arg == "--dump-block") dump_block = std::stol(require_value(arg));
         else if (arg == "--ledger-block") ledger_block = std::stol(require_value(arg));
+        else if (arg == "--dump-haplotype-alleles") alleles_out = require_value(arg);
         else if (arg == "--depth-calibration") depth_calibration = true;
         else if (arg == "--mass-weight") mass_weight = std::stod(require_value(arg));
         else if (arg == "--nearest-emission-rank") nearest_rank = true;
@@ -393,14 +399,17 @@ int run_genotype_command(const std::vector<std::string>& args) {
     {
         options.fragment_len = fragment_len;
     }
-    if (!audit && !audit_linkage && read_paths.empty() && index_out.empty() && ledger_block < 0) {
+    if (!audit && !audit_linkage && read_paths.empty() && index_out.empty() && ledger_block < 0 &&
+        alleles_out.empty()) {
         throw std::runtime_error(
-            "genotype: pass --audit, --audit-linkage, --build-index, --ledger-block, or -R/--reads");
+            "genotype: pass --audit, --audit-linkage, --build-index, --ledger-block, "
+            "--dump-haplotype-alleles, or -R/--reads");
     }
     // Reads need the block chain and the marker panel, but not the linkage/novelty audits or the
     // separation statistics -- those are diagnostics and were roughly half the runtime.
     const bool need_blocks =
-        audit_linkage || !read_paths.empty() || !index_out.empty() || ledger_block >= 0;
+        audit_linkage || !read_paths.empty() || !index_out.empty() || ledger_block >= 0 ||
+        !alleles_out.empty();
     // Every option the model takes, in one place, so the indexed and direct paths cannot diverge.
     auto make_genotype_options = [&]() {
         GenotypeOptions g;
@@ -592,6 +601,34 @@ int run_genotype_command(const std::vector<std::string>& args) {
                  std::to_string(static_cast<long>(100.0 * rep2.singleton_mass + 0.5)) +
                  "% of (haplotype, bubble) cells hold a private allele");
         write_linkage_audit(out_prefix, panel_graph, chain, blocks, rep2);
+        }
+
+        // Haplotype x block allele assignment. Held internally by the linkage audit and never
+        // written out, though it is the panel's basic fact: which allele each haplotype carries at
+        // each block. Anything reasoning about TRANSITIONS between blocks -- boundary-spanning
+        // markers, mosaic structure, linkage -- needs the pairs (allele at bi, allele at bi+1),
+        // which cannot be recovered from per-block dumps.
+        if (!alleles_out.empty()) {
+            std::ofstream af(alleles_out);
+            if (!af) throw std::runtime_error("genotype: cannot write " + alleles_out);
+            af << "haplotype\tblock_index\tblock_kind\tallele\n";
+            std::size_t cells = 0;
+            for (const PathRecord& p : panel_graph.paths) {
+                for (std::size_t bi = 0; bi < blocks.size() && bi < chain.size(); ++bi) {
+                    const auto it = blocks[bi].allele_of.find(p.name);
+                    if (it == blocks[bi].allele_of.end()) continue;   // does not traverse this block
+                    af << p.name << '\t' << bi << '\t'
+                       << (chain[bi].kind == BlockKind::Bubble     ? "bubble"
+                           : chain[bi].kind == BlockKind::Flank    ? "flank"
+                                                                   : "backbone")
+                       << '\t' << it->second << '\n';
+                    ++cells;
+                }
+            }
+            log.info("haplotype-allele matrix: " + std::to_string(cells) + " cells over " +
+                     std::to_string(panel_graph.paths.size()) + " haplotypes and " +
+                     std::to_string(blocks.size()) + " blocks");
+            log.wrote({alleles_out});
         }
 
         // A block index nobody has is a typo, not a request for nothing. Silently writing no ledger
