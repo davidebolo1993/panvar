@@ -825,6 +825,19 @@ std::vector<BlockCall> genotype_sample(
                                     static_cast<std::size_t>(yi - kept[bi].begin());
             c.explained = explained[bi][off];
             c.detected = detected[bi][off];
+            // Emission-only standing of the pair we actually reported.
+            const double cv = emis[bi][off];
+            double best = -std::numeric_limits<double>::infinity();
+            int rank = 1;
+            for (std::size_t x = 0; x < kn; ++x) {
+                for (std::size_t y = x; y < kn; ++y) {
+                    const double v = emis[bi][x * kn + y];
+                    best = std::max(best, v);
+                    if (v > cv + 1e-9) ++rank;
+                }
+            }
+            c.called_emission_rank = rank;
+            c.called_emission_delta = cv - best;
         }
 
         // How much sequence the reads say is here, measured without reference to the panel's allele
@@ -1031,7 +1044,7 @@ void write_genotypes(
          "\tallele1\tallele2\thaplotype1\thaplotype2\thap_posterior\tgq\texplained\tdetected"
          "\tcalled_bp\tmass_bp\tmass_bp_sd\tcov_bp\tno_marker_alleles\tmax_copies\tblock_class"
          "\tevidence\tfilter\ttruth1\ttruth2\ttruth_rank\ttruth_delta\ttruth_ties"
-          "\tn_scored_alleles\tinfluencers\n";
+          "\tn_scored_alleles\tcalled_rank\tcalled_delta\tinfluencers\n";
     for (std::size_t bi = 0; bi < calls.size(); ++bi) {
         const BlockCall& c = calls[bi];
         g << c.block_index << '\t'
@@ -1050,7 +1063,8 @@ void write_genotypes(
           << c.evidence << '\t' << c.filter << '\t'
           << c.truth_allele1 << '\t' << c.truth_allele2 << '\t' << c.truth_emission_rank << '\t'
           << c.truth_emission_delta << '\t' << c.truth_emission_ties << '\t'
-          << c.n_scored_alleles << '\t';
+          << c.n_scored_alleles << '\t' << c.called_emission_rank << '\t'
+          << c.called_emission_delta << '\t';
         for (std::size_t k = 0; k < c.influencers.size(); ++k) {
             if (k) g << ',';
             g << c.influencers[k];

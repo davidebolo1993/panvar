@@ -143,6 +143,13 @@ struct BlockCall {
     // understates how tied a large block is -- badly, above the 64-allele default. Emitted so no
     // consumer has to infer min(n_alleles, budget), which is only correct at the default.
     int n_scored_alleles = -1;
+    // Where the CALLED pair sits by emission alone. Together with the truth's rank this measures the
+    // chain in both directions, which a one-sided count cannot: a delta of 0 means linkage kept the
+    // block-local optimum, a large negative delta means it overrode strong local evidence, and a
+    // block where the emission's own optimum is wrong while the call is right is linkage EARNING its
+    // place. Counting only the overrides would price linkage without its benefit.
+    int called_emission_rank = -1;
+    double called_emission_delta = 0.0;   // called pair's emission minus the best pair's
     std::size_t block_index = 0;
     bool is_bubble = true;
     std::size_t bubble_id = 0;
