@@ -189,10 +189,12 @@ void print_genotype_help() {
         << "                              for -- so it cannot attribute a loss to either one. It also\n"
         << "                              turns off the audit that counts them, which then reports\n"
         << "                              nothing rather than zero. Measured to break leave-zero-out\n"
-        << "      --ledger-block <N>      Write every candidate marker of block N with the reason it\n"
-        << "                              was kept or dropped, taken before the filter erases them\n"
-        << "                              (<prefix>.blockN.ledger.tsv). One block, since the\n"
-        << "                              pre-filter set is several times the retained one\n"
+        << "      --ledger-block <N>      Write every candidate marker of block N -- syncmer nodes and\n"
+        << "                              2-syncmer adjacencies alike -- with the reason it was kept\n"
+        << "                              or dropped, taken before the filter erases them\n"
+        << "                              (<prefix>.blockN.ledger.tsv). Needs no reads: the ledger is\n"
+        << "                              a property of the panel. One block, since the pre-filter set\n"
+        << "                              is several times the retained one\n"
         << "      --edge-weight <F>       Weight on 2-syncmer adjacency evidence (default 0 = off).\n"
         << "                              Adjacencies come from the same reads as the nodes, so this\n"
         << "                              double-counts; measured worth 0.5-4% at 0.25-0.5, and 1.0\n"
@@ -391,13 +393,14 @@ int run_genotype_command(const std::vector<std::string>& args) {
     {
         options.fragment_len = fragment_len;
     }
-    if (!audit && !audit_linkage && read_paths.empty() && index_out.empty()) {
+    if (!audit && !audit_linkage && read_paths.empty() && index_out.empty() && ledger_block < 0) {
         throw std::runtime_error(
-            "genotype: pass --audit, --audit-linkage, --build-index, or -R/--reads");
+            "genotype: pass --audit, --audit-linkage, --build-index, --ledger-block, or -R/--reads");
     }
     // Reads need the block chain and the marker panel, but not the linkage/novelty audits or the
     // separation statistics -- those are diagnostics and were roughly half the runtime.
-    const bool need_blocks = audit_linkage || !read_paths.empty() || !index_out.empty();
+    const bool need_blocks =
+        audit_linkage || !read_paths.empty() || !index_out.empty() || ledger_block >= 0;
     // Every option the model takes, in one place, so the indexed and direct paths cannot diverge.
     auto make_genotype_options = [&]() {
         GenotypeOptions g;
@@ -591,21 +594,43 @@ int run_genotype_command(const std::vector<std::string>& args) {
         write_linkage_audit(out_prefix, panel_graph, chain, blocks, rep2);
         }
 
+        // A block index nobody has is a typo, not a request for nothing. Silently writing no ledger
+        // and exiting 0 is how an experiment reports "the filters dropped nothing" when in fact it
+        // never looked.
+        // Every fate the ledger reports is a filter decision. With the filter off there are no
+        // decisions to report, and a ledger of "retained, retained, retained" would read as evidence
+        // the filter kept everything rather than that it never ran.
+        if (ledger_block >= 0 && !options.require_region_unique) {
+            throw std::runtime_error(
+                "genotype: --ledger-block cannot be combined with --no-region-unique; the ledger "
+                "reports why each marker was kept or dropped, and that flag removes the decision");
+        }
+        if (ledger_block >= 0 && static_cast<std::size_t>(ledger_block) >= chain.size()) {
+            throw std::runtime_error("genotype: --ledger-block " + std::to_string(ledger_block) +
+                                     " is out of range; the chain has " +
+                                     std::to_string(chain.size()) + " blocks (0.." +
+                                     std::to_string(chain.size() - 1) + ")");
+        }
         ReadPanel read_panel;
         options.restore_stripped_alleles = restore_stripped;
         options.ledger_block = static_cast<int>(ledger_block);
+        // The ledger is a property of the PANEL, so it must not require reads. Without this the only
+        // way to get one was to ask for an index as well, which is a 40 MB side effect of a question
+        // about markers.
+        const bool need_panel =
+            !read_paths.empty() || !index_out.empty() || ledger_block >= 0;
         const std::vector<BlockMarkerStats> bstats =
             build_block_marker_panel(chain, blocks, options,
-                                     (read_paths.empty() && index_out.empty()) ? nullptr : &read_panel,
-                                     (read_paths.empty() && index_out.empty()) ? nullptr : &panel_graph,
+                                     need_panel ? &read_panel : nullptr,
+                                     need_panel ? &panel_graph : nullptr,
                                      want_audit_stats);
         // Written before anything reads: the ledger is a property of the panel, not of a sample.
         if (!read_panel.ledger.empty()) {
             const std::string lp = out_prefix + ".block" + std::to_string(ledger_block) + ".ledger.tsv";
             std::ofstream lf(lp);
             if (!lf) throw std::runtime_error("genotype: cannot write " + lp);
-            lf << "allele\tslot\tmult\tvary_blocks\tactual\texpected\tfate\n";
-            std::size_t kept = 0, mb = 0, oe = 0, both = 0;
+            lf << "unit\tallele\tslot\tcode\tmult\tvary_blocks\tvary_where\tactual\texpected\tfate\n";
+            std::size_t kept = 0, mb = 0, oe = 0, both = 0, edges = 0;
             for (const MarkerLedgerRow& r : read_panel.ledger) {
                 const char* fate = r.fate == MarkerFate::Retained     ? "retained"
                                    : r.fate == MarkerFate::MultiBlock ? "multi_block"
@@ -617,11 +642,21 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     case MarkerFate::OverExpected: ++oe; break;
                     case MarkerFate::Both: ++both; break;
                 }
-                lf << r.allele << '\t' << r.slot << '\t' << r.mult << '\t' << r.vary_blocks << '\t'
-                   << r.actual << '\t' << r.expected << '\t' << fate << '\n';
+                if (r.unit == MarkerUnit::Edge) ++edges;
+                std::string where;
+                for (const std::uint32_t b : r.where) {
+                    if (!where.empty()) where += ',';
+                    where += std::to_string(b);
+                }
+                lf << (r.unit == MarkerUnit::Edge ? "edge" : "node") << '\t' << r.allele << '\t'
+                   << r.slot << '\t' << r.code << '\t' << r.mult << '\t' << r.vary_blocks << '\t'
+                   << (where.empty() ? "." : where) << '\t' << r.actual << '\t' << r.expected << '\t'
+                   << fate << '\n';
             }
             log.info("block " + std::to_string(ledger_block) + " marker ledger: " +
-                     std::to_string(read_panel.ledger.size()) + " candidate occurrences, " +
+                     std::to_string(read_panel.ledger.size()) + " candidate occurrences (" +
+                     std::to_string(read_panel.ledger.size() - edges) + " node, " +
+                     std::to_string(edges) + " edge), " +
                      std::to_string(kept) + " retained, " + std::to_string(mb) + " multi-block, " +
                      std::to_string(oe) + " over-expected, " + std::to_string(both) + " both");
             log.wrote({lp});

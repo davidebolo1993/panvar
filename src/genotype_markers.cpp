@@ -943,17 +943,41 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
             if (options.ledger_block >= 0 &&
                 static_cast<std::size_t>(options.ledger_block) < chain.size()) {
                 const std::size_t bi = static_cast<std::size_t>(options.ledger_block);
+                const auto row = [&](MarkerUnit unit, std::size_t ai, std::uint32_t slot,
+                                     std::uint32_t mult, std::uint64_t code, std::uint32_t nvary,
+                                     std::uint64_t act, std::uint64_t exp) {
+                    const bool multi = nvary > 1;
+                    const bool over = act > exp;
+                    MarkerLedgerRow r;
+                    r.unit = unit;
+                    r.allele = static_cast<std::uint32_t>(ai);
+                    r.slot = slot;
+                    r.code = code;
+                    r.mult = mult;
+                    r.vary_blocks = nvary;
+                    r.actual = act;
+                    r.expected = exp;
+                    r.fate = multi && over ? MarkerFate::Both
+                             : multi       ? MarkerFate::MultiBlock
+                             : over        ? MarkerFate::OverExpected
+                                           : MarkerFate::Retained;
+                    const auto it = vary_where.find(code);
+                    if (it != vary_where.end()) r.where = it->second;
+                    out_panel->ledger.push_back(std::move(r));
+                };
                 for (std::size_t ai = 0; ai < out_panel->by_block[bi].size(); ++ai) {
                     for (const auto& [slot, mult] : out_panel->by_block[bi][ai].nodes) {
-                        const bool multi = blocks_with[slot] > 1;
-                        const bool over = actual[slot] > expected[slot];
-                        out_panel->ledger.push_back(
-                            {static_cast<std::uint32_t>(ai), slot, mult, blocks_with[slot],
-                             actual[slot], expected[slot],
-                             multi && over ? MarkerFate::Both
-                                           : multi ? MarkerFate::MultiBlock
-                                                   : over ? MarkerFate::OverExpected
-                                                          : MarkerFate::Retained});
+                        row(MarkerUnit::Node, ai, slot, mult,
+                            slot < out_panel->node_codes.size() ? out_panel->node_codes[slot] : 0,
+                            blocks_with[slot], actual[slot], expected[slot]);
+                    }
+                    // Adjacencies go through the SAME two rules. Whether longer context escapes the
+                    // filters that remove single syncmers is the question to settle before building
+                    // anything on junction evidence, and it cannot be read off a node-only ledger.
+                    for (const auto& [slot, mult] : out_panel->by_block[bi][ai].edges) {
+                        row(MarkerUnit::Edge, ai, slot, mult,
+                            slot < out_panel->edge_keys.size() ? out_panel->edge_keys[slot] : 0,
+                            eblocks_with[slot], eactual[slot], eexpected[slot]);
                     }
                 }
             }

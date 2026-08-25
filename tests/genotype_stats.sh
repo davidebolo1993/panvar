@@ -308,9 +308,9 @@ if [ -s "$OUT/au0.audit.alleles.tsv" ] && [ -s "$OUT/auN.audit.alleles.tsv" ]; t
   # And the flag is not inert in the other direction: a cap of 1 must be able to remove something,
   # or the assertion above would pass on a build where the option never reached the audit at all.
   r1=$(col "$OUT/au1.audit.alleles.tsv" n_retained_nodes)
-  [ "$r1" -le "$r0" ] \
-    && ok "a cap of 1 retains no more than no cap ($r1 <= $r0): the option does reach the audit" \
-    || bad "a cap of 1 retained MORE markers ($r1) than no cap ($r0)"
+  [ "$r1" -lt "$r0" ] \
+    && ok "a cap of 1 retains strictly fewer than no cap ($r1 < $r0): the option reaches the audit" \
+    || bad "a cap of 1 retained $r1 against no cap's $r0; the flag is not reaching the audit"
 else
   bad "--audit wrote no allele table"
 fi
@@ -318,38 +318,125 @@ fi
 # ------------------------------------------- the ledger accounts for every candidate, kept or not
 # Inferring why a block is marker-poor from what survived is how one filter gets blamed for another
 # filter's losses. The ledger is taken before the erase, so retained + dropped must be the whole
-# candidate set and at least one row must record a drop in this deliberately-clashing fixture.
-# Which chain index holds the bubble is the block builder's business, not this test's, so ask for
-# each in turn and audit whichever one carries the candidates.
-LED=""
-for b in 0 1 2 3; do
-  "$BIN" genotype -i "$OUT/rep.gfa" -b "$OUT/repbub" -r ref -o "$OUT/led$b" -R "$OUT/reads.fa" \
-    --ledger-block "$b" -q >/dev/null 2>&1
-  if [ -s "$OUT/led$b.block$b.ledger.tsv" ]; then LED="$OUT/led$b.block$b.ledger.tsv"; break; fi
-done
-if [ -n "$LED" ]; then
-  tot=$(awk 'NR>1' "$LED" | wc -l | tr -d ' ')
-  kept=$(awk -F'\t' 'NR>1 && $7=="retained"' "$LED" | wc -l | tr -d ' ')
-  drop=$(awk -F'\t' 'NR>1 && $7!="retained"' "$LED" | wc -l | tr -d ' ')
-  [ "$tot" = "$((kept + drop))" ] \
-    && ok "every ledger row carries a fate: $kept retained + $drop dropped = $tot candidates" \
-    || bad "ledger fates do not partition its $tot rows"
-  # The two rules are independent and a marker can fail both; collapsing them is what made the
-  # 36 -> 10 loss at cyp2d6 block 5 look like one filter's doing.
-  badfate=$(awk -F'\t' 'NR>1 && $7!="retained" && $7!="multi_block" && $7!="over_expected" && $7!="both"' \
-            "$LED" | wc -l | tr -d ' ')
-  [ "$badfate" = "0" ] && ok "every fate is one of the four defined reasons" \
-                       || bad "$badfate ledger rows carry an unrecognized fate"
-  # A row's fate must follow from the two numbers printed beside it, or the ledger cannot be audited.
-  incons=$(awk -F'\t' 'NR>1{ m=($4>1); o=($5>$6);
-           want=(m&&o)?"both":(m?"multi_block":(o?"over_expected":"retained"));
-           if ($7!=want) k++} END{print k+0}' "$LED")
-  [ "$incons" = "0" ] \
-    && ok "each fate follows from the vary_blocks and actual/expected printed with it" \
-    || bad "$incons ledger rows have a fate their own columns do not imply"
+# candidate set.
+#
+# TWO fixtures, because one cannot exercise both outcomes. `rep.gfa` produces a block where every
+# candidate survives; the first version of this test used only that, asserted a partition over 82
+# retained and 0 dropped, and therefore never executed the drop branches at all -- the same vacuity
+# it was written to catch. `dup.gfa` repeats a bubble allele in a second bubble, so its candidates
+# are seen across the panel more often than the blocks account for and every one is dropped.
+A4=$(seq_of 120 6); T=$(seq_of 400 7)
+{ printf 'H\tVN:Z:1.0\n'
+  printf 'S\t1\t%s\n' "$L"; printf 'S\t2\t%s\n' "$A1"; printf 'S\t3\t%s\n' "$A2"
+  printf 'S\t5\t%s\n' "$B"; printf 'S\t6\t%s\n' "$A1"; printf 'S\t7\t%s\n' "$A4"
+  printf 'S\t8\t%s\n' "$T"
+  for a in 2 3; do printf 'L\t1\t+\t%s\t+\t0M\nL\t%s\t+\t5\t+\t0M\n' "$a" "$a"; done
+  for a in 6 7; do printf 'L\t5\t+\t%s\t+\t0M\nL\t%s\t+\t8\t+\t0M\n' "$a" "$a"; done
+  printf 'P\tref\t1+,2+,5+,6+,8+\t*\n'
+  for i in 1 2 3 4; do printf 'P\thapW%d\t1+,2+,5+,6+,8+\t*\n' "$i"; done
+  for i in 1 2 3 4; do printf 'P\thapX%d\t1+,3+,5+,7+,8+\t*\n' "$i"; done
+  for i in 1 2 3 4; do printf 'P\thapY%d\t1+,2+,5+,7+,8+\t*\n' "$i"; done
+} > "$OUT/dup.gfa"
+"$BIN" bubble -i "$OUT/dup.gfa" -r ref -o "$OUT/dupbub" --min-variant-bp 0 -q >/dev/null 2>&1
+
+# Which chain index carries a block's candidates is the block builder's business, not this test's.
+find_ledger() {   # <gfa> <bubprefix> <tag> -> echoes the path of the first non-empty ledger
+  for b in 0 1 2 3 4; do
+    "$BIN" genotype -i "$1" -b "$2" -r ref -o "$OUT/$3$b" --ledger-block "$b" -q >/dev/null 2>&1
+    if [ -s "$OUT/$3$b.block$b.ledger.tsv" ]; then echo "$OUT/$3$b.block$b.ledger.tsv"; return; fi
+  done
+}
+fates() { awk -F'\t' -v w="$2" 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+          $(h["fate"])~w{k++} END{print k+0}' "$1"; }
+
+LED=$(find_ledger "$OUT/rep.gfa" "$OUT/repbub" led)
+DROPLED=$(find_ledger "$OUT/dup.gfa" "$OUT/dupbub" dled)
+if [ -n "$LED" ] && [ -n "$DROPLED" ]; then
+  for f in "$LED" "$DROPLED"; do
+    tot=$(awk 'NR>1' "$f" | wc -l | tr -d ' ')
+    kept=$(fates "$f" '^retained$'); drop=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+                                            $(h["fate"])!="retained"{k++} END{print k+0}' "$f")
+    [ "$tot" = "$((kept + drop))" ] \
+      && ok "ledger partitions its rows: $kept retained + $drop dropped = $tot ($(basename "$f"))" \
+      || bad "ledger fates do not partition its $tot rows ($(basename "$f"))"
+    bf=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+         $(h["fate"])!="retained" && $(h["fate"])!="multi_block" &&
+         $(h["fate"])!="over_expected" && $(h["fate"])!="both"{k++} END{print k+0}' "$f")
+    [ "$bf" = "0" ] || bad "$bf rows carry an unrecognized fate ($(basename "$f"))"
+    # A row's fate must follow from the numbers printed beside it, or the ledger cannot be audited.
+    incons=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+             { m=($(h["vary_blocks"])>1); o=($(h["actual"])>$(h["expected"]));
+               want=(m&&o)?"both":(m?"multi_block":(o?"over_expected":"retained"));
+               if ($(h["fate"])!=want) k++} END{print k+0}' "$f")
+    [ "$incons" = "0" ] \
+      && ok "each fate follows from its own vary_blocks and actual/expected ($(basename "$f"))" \
+      || bad "$incons rows have a fate their columns do not imply ($(basename "$f"))"
+  done
+
+  # The point of the second fixture: the drop branches must actually execute somewhere.
+  nd=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next} $(h["fate"])!="retained"{k++} END{print k+0}' "$DROPLED")
+  [ "$nd" -gt 0 ] \
+    && ok "a dropped-marker fixture records $nd non-retained rows, so the drop branches run" \
+    || bad "no ledger row records a drop: the fate logic is never exercised"
+  nk=$(fates "$LED" '^retained$')
+  [ "$nk" -gt 0 ] && ok "and the other fixture records $nk retained rows, so both branches run" \
+                  || bad "no ledger row records a retained marker"
+
+  # Adjacencies pass through the same two rules, and a node-only ledger cannot say whether longer
+  # context escapes the filters that remove single syncmers.
+  ne=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next} $(h["unit"])=="edge"{k++} END{print k+0}' "$LED")
+  nn=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next} $(h["unit"])=="node"{k++} END{print k+0}' "$LED")
+  { [ "$ne" -gt 0 ] && [ "$nn" -gt 0 ]; } \
+    && ok "the ledger covers both marker units ($nn node, $ne edge)" \
+    || bad "ledger has $nn node and $ne edge rows; it must cover both"
+
+  # The ledger's fates must match what actually reached the panel the model scores against.
+  # "No dropped marker leaked into the panel" is NOT enough: at a block where everything is dropped
+  # the panel is empty and the check passes on nothing. Assert the EQUALITY instead -- the retained
+  # NODE rows must be exactly the markers the dump shows surviving -- which is non-vacuous whichever
+  # way the block went. (`conf.tsv` carries nodes only, so edges are excluded from the count.)
+  for pair in "$LED:rep:repbub" "$DROPLED:dup:dupbub"; do
+    f="${pair%%:*}"; rest="${pair#*:}"; gfa="${rest%%:*}"; bub="${rest#*:}"
+    BLK=$(basename "$f" | sed -E 's/.*\.block([0-9]+)\.ledger\.tsv/\1/')
+    "$BIN" genotype -i "$OUT/$gfa.gfa" -b "$OUT/$bub" -r ref -o "$OUT/c$gfa" -R "$OUT/reads.fa" \
+      --dump-block "$BLK" -q >/dev/null 2>&1
+    C="$OUT/c$gfa.block$BLK.conf.tsv"
+    if [ -s "$C" ]; then
+      want=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+             $(h["fate"])=="retained" && $(h["unit"])=="node"{k++} END{print k+0}' "$f")
+      got=$(awk 'NR>1' "$C" | wc -l | tr -d ' ')
+      [ "$want" = "$got" ] \
+        && ok "the ledger's retained nodes are exactly what survives into the panel ($want, $gfa)" \
+        || bad "ledger says $want nodes retained, the scored panel holds $got ($gfa)"
+      leaked=$(awk -F'\t' 'NR==FNR{if(FNR>1 && $10!="retained" && $1=="node") d[$3]=1; next}
+               FNR>1 && ($2 in d){k++} END{print k+0}' "$f" "$C")
+      [ "$leaked" = "0" ] || bad "$leaked markers the ledger calls dropped are in the panel ($gfa)"
+    else
+      bad "--dump-block wrote no conf table for $gfa"
+    fi
+  done
+
 else
-  bad "--ledger-block wrote nothing"
+  bad "--ledger-block wrote nothing for one of the two fixtures"
 fi
+
+# ----------------------------------------------------- the ledger refuses questions it cannot answer
+"$BIN" genotype -i "$OUT/rep.gfa" -b "$OUT/repbub" -r ref -o "$OUT/lb" \
+  --ledger-block 99 -q >"$OUT/lb_range.log" 2>&1
+grep -qi "out of range" "$OUT/lb_range.log" \
+  && ok "an out-of-range --ledger-block is rejected, not silently ignored" \
+  || bad "--ledger-block 99 did not report that the block does not exist"
+"$BIN" genotype -i "$OUT/rep.gfa" -b "$OUT/repbub" -r ref -o "$OUT/lb2" \
+  --ledger-block 1 --no-region-unique -q >"$OUT/lb_nru.log" 2>&1
+grep -qi "cannot be combined" "$OUT/lb_nru.log" \
+  && ok "--ledger-block refuses --no-region-unique, whose fates would all read retained" \
+  || bad "--ledger-block accepted --no-region-unique, reporting decisions no filter made"
+# The ledger is a property of the panel, so it must not require reads to produce one.
+"$BIN" genotype -i "$OUT/rep.gfa" -b "$OUT/repbub" -r ref -o "$OUT/lb3" \
+  --ledger-block 1 -q >/dev/null 2>&1
+ls "$OUT"/lb3.block*.ledger.tsv >/dev/null 2>&1 \
+  && ok "--ledger-block needs no reads: the ledger describes the panel, not a sample" \
+  || bad "--ledger-block produced nothing without reads, though it describes only the panel"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "genotype_stats: all assertions passed"; else echo "genotype_stats: $fails FAILED"; fi

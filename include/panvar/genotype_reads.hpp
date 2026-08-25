@@ -23,14 +23,24 @@ struct AlleleMarkerSet {
 // the tiling instead.
 enum class MarkerFate { Retained, MultiBlock, OverExpected, Both };
 
+// Node markers and adjacency markers pass through the SAME two rules, so a ledger covering only
+// nodes cannot say whether longer context escapes the filters that remove single syncmers -- which is
+// the first question to ask before building anything on adjacency evidence.
+enum class MarkerUnit { Node, Edge };
+
 struct MarkerLedgerRow {
+    MarkerUnit unit = MarkerUnit::Node;
     std::uint32_t allele = 0;
     std::uint32_t slot = 0;
+    std::uint64_t code = 0;             // the marker itself, so a row can be traced across runs
     std::uint32_t mult = 0;
     std::uint32_t vary_blocks = 0;
     std::uint64_t actual = 0;
     std::uint64_t expected = 0;
     MarkerFate fate = MarkerFate::Retained;
+    // WHICH blocks it varies in, not just how many: "shares a boundary with its neighbour" and
+    // "duplicated at the far end of the region" both read as vary_blocks=2 and need different fixes.
+    std::vector<std::uint32_t> where;
 };
 
 // Everything reads are counted against: the marker universe with dense slots, each allele's expected
