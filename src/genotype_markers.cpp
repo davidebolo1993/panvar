@@ -709,6 +709,10 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
         // duplication-biased subset drags the depth median with it.
         std::unordered_map<std::uint64_t, std::uint32_t> occ_blocks;
         std::unordered_map<std::uint64_t, std::uint32_t> evary_blocks;
+        // Adjacency keys live in their own hash space, so they need their own where-map. Looking an
+        // edge key up in the node map returns nothing at best, and at worst a node's blocks under a
+        // hash collision -- an audit that silently reports the wrong location.
+        std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> evary_where;
         for (std::size_t bi = 0; bi < chain.size(); ++bi) {
             const std::vector<AlleleInventory>& inv = kept_inv[bi];
             out_panel->by_block[bi].resize(inv.size());
@@ -752,7 +756,10 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
                 }
             }
             for (const auto& [c, n] : eseen) {
-                if (n < inv.size() || emult[c] == 0xffffffffu) ++evary_blocks[c];
+                if (n < inv.size() || emult[c] == 0xffffffffu) {
+                    ++evary_blocks[c];
+                    evary_where[c].push_back(static_cast<std::uint32_t>(bi));
+                }
             }
             const bool presence_only =
                 options.rule == MarkerRule::Mixed && chain[bi].kind != BlockKind::Bubble;
@@ -961,8 +968,9 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
                              : multi       ? MarkerFate::MultiBlock
                              : over        ? MarkerFate::OverExpected
                                            : MarkerFate::Retained;
-                    const auto it = vary_where.find(code);
-                    if (it != vary_where.end()) r.where = it->second;
+                    const auto& wmap = unit == MarkerUnit::Edge ? evary_where : vary_where;
+                    const auto it = wmap.find(code);
+                    if (it != wmap.end()) r.where = it->second;
                     out_panel->ledger.push_back(std::move(r));
                 };
                 for (std::size_t ai = 0; ai < out_panel->by_block[bi].size(); ++ai) {

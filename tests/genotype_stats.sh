@@ -373,6 +373,12 @@ if [ -n "$LED" ] && [ -n "$DROPLED" ]; then
       || bad "$incons rows have a fate their columns do not imply ($(basename "$f"))"
   done
 
+  # COVERAGE GAP, stated rather than papered over: these fixtures exercise `retained` and
+  # `over_expected` only. `multi_block` needs one variable sequence living in two SEPARATE chain
+  # blocks, and the block builder collapses these hand-written bubbles into a single block, so the
+  # multi_block and both branches are not reached here. They do occur on real panels (gstm1 block 3
+  # is 7 multi-block of 11; cyp2d6 block 5 is 16 both of 36). Anyone extending this file should aim
+  # at that gap first.
   # The point of the second fixture: the drop branches must actually execute somewhere.
   nd=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next} $(h["fate"])!="retained"{k++} END{print k+0}' "$DROPLED")
   [ "$nd" -gt 0 ] \
@@ -402,15 +408,17 @@ if [ -n "$LED" ] && [ -n "$DROPLED" ]; then
       --dump-block "$BLK" -q >/dev/null 2>&1
     C="$OUT/c$gfa.block$BLK.conf.tsv"
     if [ -s "$C" ]; then
-      want=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
-             $(h["fate"])=="retained" && $(h["unit"])=="node"{k++} END{print k+0}' "$f")
-      got=$(awk 'NR>1' "$C" | wc -l | tr -d ' ')
-      [ "$want" = "$got" ] \
-        && ok "the ledger's retained nodes are exactly what survives into the panel ($want, $gfa)" \
-        || bad "ledger says $want nodes retained, the scored panel holds $got ($gfa)"
-      leaked=$(awk -F'\t' 'NR==FNR{if(FNR>1 && $10!="retained" && $1=="node") d[$3]=1; next}
-               FNR>1 && ($2 in d){k++} END{print k+0}' "$f" "$C")
-      [ "$leaked" = "0" ] || bad "$leaked markers the ledger calls dropped are in the panel ($gfa)"
+      # Compare the SETS, not their sizes. Equal counts with different members would pass a count
+      # check while meaning the ledger describes a different panel than the one being scored.
+      awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+           $(h["fate"])=="retained" && $(h["unit"])=="node"{print $(h["slot"])}' "$f" \
+        | sort -u > "$OUT/$gfa.want.slots"
+      awk -F'\t' 'NR>1{print $2}' "$C" | sort -u > "$OUT/$gfa.got.slots"
+      if diff -q "$OUT/$gfa.want.slots" "$OUT/$gfa.got.slots" >/dev/null 2>&1; then
+        ok "the ledger's retained node SET is exactly the scored panel's ($(wc -l < "$OUT/$gfa.want.slots" | tr -d ' '), $gfa)"
+      else
+        bad "ledger's retained node set differs from the scored panel's ($gfa): $(diff "$OUT/$gfa.want.slots" "$OUT/$gfa.got.slots" | head -3 | tr '\n' ' ')"
+      fi
     else
       bad "--dump-block wrote no conf table for $gfa"
     fi
@@ -421,16 +429,22 @@ else
 fi
 
 # ----------------------------------------------------- the ledger refuses questions it cannot answer
+# A refusal must FAIL, not merely print. A message on stderr with exit 0 is a success as far as any
+# caller is concerned, and every one of these contracts exists to stop a silent no-op.
+refuses() {   # <logfile> <expected text> <description> -- run the command before calling
+  if [ "$1" -ne 0 ] && grep -qi "$3" "$2"; then ok "$4"
+  elif [ "$1" -eq 0 ]; then bad "$4 -- but it exited 0, so a caller sees success"
+  else bad "$4 -- exited nonzero with an unexpected message"
+  fi
+}
 "$BIN" genotype -i "$OUT/rep.gfa" -b "$OUT/repbub" -r ref -o "$OUT/lb" \
   --ledger-block 99 -q >"$OUT/lb_range.log" 2>&1
-grep -qi "out of range" "$OUT/lb_range.log" \
-  && ok "an out-of-range --ledger-block is rejected, not silently ignored" \
-  || bad "--ledger-block 99 did not report that the block does not exist"
+refuses $? "$OUT/lb_range.log" "out of range" \
+  "an out-of-range --ledger-block is rejected, not silently ignored"
 "$BIN" genotype -i "$OUT/rep.gfa" -b "$OUT/repbub" -r ref -o "$OUT/lb2" \
   --ledger-block 1 --no-region-unique -q >"$OUT/lb_nru.log" 2>&1
-grep -qi "cannot be combined" "$OUT/lb_nru.log" \
-  && ok "--ledger-block refuses --no-region-unique, whose fates would all read retained" \
-  || bad "--ledger-block accepted --no-region-unique, reporting decisions no filter made"
+refuses $? "$OUT/lb_nru.log" "cannot be combined" \
+  "--ledger-block refuses --no-region-unique, whose fates would all read retained"
 # The ledger is a property of the panel, so it must not require reads to produce one.
 "$BIN" genotype -i "$OUT/rep.gfa" -b "$OUT/repbub" -r ref -o "$OUT/lb3" \
   --ledger-block 1 -q >/dev/null 2>&1
