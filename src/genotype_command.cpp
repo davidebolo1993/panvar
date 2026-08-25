@@ -1713,7 +1713,14 @@ int run_genotype_command(const std::vector<std::string>& args) {
                            "\tbest_a\tbest_b\tbest_h1_id\tbest_h2_id\tbest_h1_lenerr\tbest_h2_lenerr"
                            "\tbest_total_edits\tbest_mean_id\tn_tied"
                            "\tcalled_a\tcalled_b\tcalled_rank\tcalled_h1_id\tcalled_h2_id"
-                           "\tcalled_h1_lenerr\tcalled_h2_lenerr\tcalled_mean_id\n";
+                           "\tcalled_h1_lenerr\tcalled_h2_lenerr\tcalled_mean_id"
+                           // The quantity to prioritise on: how many edits the call costs OVER the
+                           // best pair the reduced panel could have offered. Identity is a mean of
+                           // two per-haplotype RATES, each normalised by its own alignment length,
+                           // so scaling it by a block's bp only approximates this -- and the earlier
+                           // `best_identity` is a top-16 Jaccard shortlist, a lower bound. These are
+                           // exact and certified over all 2A alignments.
+                           "\tcalled_total_edits\texcess_total_edits\n";
                     for (std::size_t bi = 0; bi < chain.size() && bi < blocks.size(); ++bi) {
                         if (bi >= ts1.size() || (ts1[bi].empty() && ts2[bi].empty())) continue;
                         if (certified_oracle_block >= 0 &&
@@ -1792,9 +1799,21 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                 orc << ca << '\t' << cb << '\t' << rank << '\t'
                                     << ident(c1, 0) << '\t' << ident(c2, 1) << '\t'
                                     << dl[c1][0] << '\t' << dl[c2][1] << '\t'
-                                    << ((ident(c1, 0) + ident(c2, 1)) / 2.0) << '\n';
+                                    << ((ident(c1, 0) + ident(c2, 1)) / 2.0) << '\t';
+                                // Only the edit_distance row's `best` minimises EDITS, so only there
+                                // is (called - best) the certified edit excess. Writing a number on
+                                // the other two rows would invite a later script to aggregate all
+                                // three, or to read a length-optimal pair's edit count as the
+                                // certified optimum.
+                                if (crit == 0) {
+                                    const long ce = static_cast<long>(al[c1][0].edits + al[c2][1].edits);
+                                    const long be = static_cast<long>(al[b1][0].edits + al[b2][1].edits);
+                                    orc << ce << '\t' << (ce - be) << '\n';
+                                } else {
+                                    orc << "NA\tNA\n";
+                                }
                             } else {
-                                orc << ca << '\t' << cb << "\tNA\tNA\tNA\tNA\tNA\tNA\n";
+                                orc << ca << '\t' << cb << "\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\n";
                             }
                         }
                         orc.flush();

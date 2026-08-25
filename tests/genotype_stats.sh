@@ -428,6 +428,50 @@ else
   bad "--ledger-block wrote nothing for one of the two fixtures"
 fi
 
+# ----------------------------------- the certified oracle's edit columns, and which row owns them
+# excess_total_edits is (called - best) EDITS, and only the edit_distance row's `best` minimises
+# edits. On this fixture the length_error row's "best" pair sits 69 edits from truth while the
+# edit-optimal one sits at 0 -- so a number there would read as a certified optimum and be wrong by
+# the whole distance. The other rows must say NA.
+"$BIN" genotype -i "$OUT/g.gfa" -b "$OUT/bub" -r ref -o "$OUT/orc" -R "$OUT/reads.fa" \
+  --truth-haplotypes 'hapA1,hapB1' --certified-oracle -q >/dev/null 2>&1
+ORC="$OUT/orc.oracle.tsv"
+if [ -s "$ORC" ]; then
+  ocol() { awk -F'\t' -v c="$2" -v w="$3" 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+           $(h["criterion"])==c{print $(h[w]); exit}' "$1"; }
+  # One edit_distance row per scored block, so an aggregate cannot triple-count.
+  nb=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}{b[$(h["block_index"])]=1} END{print length(b)}' "$ORC")
+  ne=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next} $(h["criterion"])=="edit_distance"{k++} END{print k+0}' "$ORC")
+  [ "$nb" = "$ne" ] && ok "the oracle writes exactly one edit_distance row per scored block ($nb)" \
+                    || bad "$nb blocks but $ne edit_distance rows: an aggregate would miscount"
+  # The edit columns belong to that row alone.
+  na=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+       $(h["criterion"])!="edit_distance" && ($(h["called_total_edits"])!="NA" || $(h["excess_total_edits"])!="NA"){k++}
+       END{print k+0}' "$ORC")
+  [ "$na" = "0" ] \
+    && ok "only the edit_distance row carries edit columns; the others say NA" \
+    || bad "$na non-edit_distance rows carry an edit number that is not a certified optimum"
+  # Excess is a minimum over all pairs, so it can never be negative.
+  neg=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+        $(h["excess_total_edits"])!="NA" && $(h["excess_total_edits"])+0<0{k++} END{print k+0}' "$ORC")
+  [ "$neg" = "0" ] && ok "no certified excess is negative (it is a minimum over every pair)" \
+                   || bad "$neg rows report a negative certified excess"
+  # This fixture's truth pair IS in the panel and IS what was called, which pins all three at 0.
+  be=$(ocol "$ORC" edit_distance best_total_edits)
+  ce=$(ocol "$ORC" edit_distance called_total_edits)
+  xe=$(ocol "$ORC" edit_distance excess_total_edits)
+  { [ "$be" = "0" ] && [ "$ce" = "0" ] && [ "$xe" = "0" ]; } \
+    && ok "a representable truth called exactly gives best=called=excess=0 edits" \
+    || bad "truth is in the panel and was called, but best=$be called=$ce excess=$xe"
+  # And the criterion really does disagree, so the NA rule above is not guarding a non-issue.
+  le=$(ocol "$ORC" length_error best_total_edits)
+  [ -n "$le" ] && [ "$le" != "0" ] \
+    && ok "the length-optimal pair is $le edits from truth: criteria genuinely disagree" \
+    || bad "length_error picked the edit-optimal pair, so this fixture cannot test the NA rule"
+else
+  bad "--certified-oracle wrote no table"
+fi
+
 # ------------------------------------- the linkage constraint: what the chain may and may not do
 # Measured motivation: linkage moved off a UNIQUE block-local optimum 93 times over the cohort, 20
 # rescues against 73 overrides, separating cleanly by how far it moved. The constraint excludes
