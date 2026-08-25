@@ -133,6 +133,11 @@ struct BlockCall {
     int truth_allele2 = -1;
     int truth_emission_rank = -1;
     double truth_emission_delta = 0.0;   // log-likelihood gap to the best-emission pair
+    // How many pairs share the top emission value. Rank counts STRICTLY better pairs, so a block
+    // whose markers cannot separate anything gives every pair the same score and reports rank 1 --
+    // which reads as "the emission got it right" when the emission said nothing at all. Without this
+    // count, an identifiability failure and a linkage override are indistinguishable in the output.
+    int truth_emission_ties = -1;
     std::size_t block_index = 0;
     bool is_bubble = true;
     std::size_t bubble_id = 0;
