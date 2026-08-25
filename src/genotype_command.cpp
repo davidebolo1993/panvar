@@ -240,6 +240,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
     double marker_outlier = 0.0;
     bool restore_stripped = false;
     bool compositional = false;
+    double edge_weight = 0.0;
     double robust_c = 0.0;
     double mass_window = 0.0;
     double scale_weight = 1.0;
@@ -317,6 +318,11 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--marker-outlier") marker_outlier = std::stod(require_value(arg));
         else if (arg == "--restore-stripped-alleles") restore_stripped = true;
         else if (arg == "--compositional") compositional = true;
+        else if (arg == "--edge-weight") {
+            edge_weight = std::stod(require_value(arg));
+            if (!(edge_weight >= 0.0) || !std::isfinite(edge_weight))
+                throw std::runtime_error("--edge-weight must be a finite value >= 0");
+        }
         else if (arg == "--robust") robust_c = std::stod(require_value(arg));
         else if (arg == "--mass-window") mass_window = std::stod(require_value(arg));
         else if (arg == "--scale-weight") scale_weight = std::stod(require_value(arg));
@@ -388,6 +394,16 @@ int run_genotype_command(const std::vector<std::string>& args) {
         g.mass_weight = mass_weight;
         g.marker_outlier = marker_outlier;
         g.compositional = compositional;
+        // The compositional emission is a multinomial SHAPE score; the adjacency term is a negative
+        // binomial over absolute counts. Adding them is the incommensurable-scale error that already
+        // cost this module once, and the edge term currently reaches only the non-compositional
+        // branch, so combining them would silently do nothing. Refuse rather than mislead.
+        if (edge_weight > 0.0 && compositional)
+            throw std::runtime_error("--edge-weight cannot be combined with --compositional: the "
+                                     "compositional emission is a multinomial shape score and the "
+                                     "adjacency term is a negative binomial over counts, so the two "
+                                     "are not on the same scale");
+        g.edge_weight = edge_weight;
         g.scale_weight = scale_weight;
         g.robust_c = robust_c;
         g.mass_window = mass_window;
