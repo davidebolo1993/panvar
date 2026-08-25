@@ -629,6 +629,20 @@ std::vector<BlockCall> genotype_sample(
         }
     }
 
+    // ---- linkage constraint -------------------------------------------------------------------
+    // A floor per block, below which a state is unreachable by the chain. Computed from the
+    // UNCONSTRAINED emission and applied only inside emission_for, so every diagnostic above still
+    // describes the emission as scored -- otherwise a constrained run could not be compared with an
+    // unconstrained one.
+    std::vector<double> emis_floor(nb, -std::numeric_limits<double>::infinity());
+    if (std::isfinite(options.max_linkage_emission_loss)) {
+        for (std::size_t bi = 0; bi < nb; ++bi) {
+            if (emis[bi].empty()) continue;
+            const double best = *std::max_element(emis[bi].begin(), emis[bi].end());
+            emis_floor[bi] = best - options.max_linkage_emission_loss;
+        }
+    }
+
     // ---- diploid Li-Stephens forward-backward over haplotype pairs ----
     // Transitions factorize (each haplotype switches independently), so a step is O(n^2) via row and
     // column sums rather than O(n^4).
@@ -644,8 +658,11 @@ std::vector<BlockCall> genotype_sample(
         if (xi == kept[bi].end() || *xi != static_cast<std::uint32_t>(a)) return baseline_of[bi];
         if (yi == kept[bi].end() || *yi != static_cast<std::uint32_t>(b)) return baseline_of[bi];
         const std::size_t kn = kept[bi].size();
-        return emis[bi][static_cast<std::size_t>(xi - kept[bi].begin()) * kn +
-                        static_cast<std::size_t>(yi - kept[bi].begin())];
+        const double v = emis[bi][static_cast<std::size_t>(xi - kept[bi].begin()) * kn +
+                                  static_cast<std::size_t>(yi - kept[bi].begin())];
+        // Excluded states use the same -1e18 the mass window already uses, not -inf: the recursion
+        // multiplies these and a true -inf would poison sums that still have to normalize.
+        return v < emis_floor[bi] ? -1e18 : v;
     };
 
     const double r = std::min(0.5, options.recomb_rate / static_cast<double>(std::max<std::size_t>(1, nb)));

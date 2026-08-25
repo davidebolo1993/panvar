@@ -199,6 +199,16 @@ void print_genotype_help() {
         << "                              every block. The panel's basic fact, and the only way to\n"
         << "                              recover TRANSITIONS between blocks: per-block dumps cannot\n"
         << "                              say which allele pairs co-occur on one haplotype\n"
+        << "      --max-linkage-emission-loss <F|inf>\n"
+        << "                              How much block-local emission a state may give up and\n"
+        << "                              still be reachable by the chain. States losing more than F\n"
+        << "                              to the block optimum are excluded BEFORE forward-backward,\n"
+        << "                              so posterior and GQ are computed under the constraint.\n"
+        << "                              Default inf = unrestricted. 0 is NOT off: it admits states\n"
+        << "                              TIED with the optimum, so linkage can still resolve a tie.\n"
+        << "                              Measured over 6 loci x 20 donors, linkage moved off a\n"
+        << "                              unique local optimum 93 times: 20 rescues (median move\n"
+        << "                              0.15) against 73 overrides (median 1.57)\n"
         << "      --edge-weight <F>       Weight on 2-syncmer adjacency evidence (default 0 = off).\n"
         << "                              Adjacencies come from the same reads as the nodes, so this\n"
         << "                              double-counts; measured worth 0.5-4% at 0.25-0.5, and 1.0\n"
@@ -251,6 +261,9 @@ int run_genotype_command(const std::vector<std::string>& args) {
     long dump_block = -1;
     long ledger_block = -1;
     std::string alleles_out;
+    // Infinity = unrestricted, and it is the default so current output cannot move. NOT 0: tau of 0
+    // admits every state tied with the block optimum, which is a real and useful setting.
+    double max_linkage_loss = std::numeric_limits<double>::infinity();
     bool depth_calibration = false;
     double mass_weight = 0.0;
     bool nearest_rank = false;
@@ -329,6 +342,18 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--dump-block") dump_block = std::stol(require_value(arg));
         else if (arg == "--ledger-block") ledger_block = std::stol(require_value(arg));
         else if (arg == "--dump-haplotype-alleles") alleles_out = require_value(arg);
+        else if (arg == "--max-linkage-emission-loss") {
+            const std::string v = require_value(arg);
+            if (v == "inf" || v == "INF" || v == "infinity") {
+                max_linkage_loss = std::numeric_limits<double>::infinity();
+            } else {
+                max_linkage_loss = std::stod(v);
+                if (!(max_linkage_loss >= 0.0)) {
+                    throw std::runtime_error(arg + " must be >= 0 or 'inf'; a negative loss would "
+                                             "exclude the block optimum itself");
+                }
+            }
+        }
         else if (arg == "--depth-calibration") depth_calibration = true;
         else if (arg == "--mass-weight") mass_weight = std::stod(require_value(arg));
         else if (arg == "--nearest-emission-rank") nearest_rank = true;
@@ -415,6 +440,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
         GenotypeOptions g;
         g.threads = options.threads;
         g.max_alleles_per_block = max_alleles;
+        g.max_linkage_emission_loss = max_linkage_loss;
         g.fragment_len = fragment_len;
         g.provenance = provenance;
         g.recomb_rate = recomb_rate;

@@ -4,6 +4,7 @@
 #include "panvar/genotype_reads.hpp"
 
 #include <cstddef>
+#include <limits>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -12,6 +13,18 @@ namespace panvar {
 
 struct GenotypeOptions {
     double recomb_rate = 1.0;          // Li-Stephens switch scaling; 1.0 = one expected switch per locus
+    // How much block-local emission a state may give up and still be reachable by the chain. Any
+    // diploid state losing more than this to the block's best is excluded BEFORE forward-backward,
+    // so the posterior and GQ are computed under the constraint rather than patched after it.
+    //
+    // Measured motivation: over 6 loci x 20 donors, linkage moved off a UNIQUE local optimum 93
+    // times -- 20 of those rescued the call and 73 broke it, and the two separate cleanly by how far
+    // the chain moved (rescues median 0.15, overrides median 1.57).
+    //
+    // Infinity (the default) means unrestricted and reproduces the unconstrained chain exactly. Note
+    // 0 is NOT "off": it admits only states tied with the block optimum, which still lets linkage
+    // resolve a tie -- the case where it demonstrably earns its place.
+    double max_linkage_emission_loss = std::numeric_limits<double>::infinity();
     double error_background = 0.0;     // 0 = estimate from the observed marker counts
     double overdispersion = 0.0;       // negative-binomial phi; 0 = estimate from the depth anchors
     // Adjacent syncmers share reads, so treating markers as independent observations overstates

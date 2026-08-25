@@ -428,6 +428,64 @@ else
   bad "--ledger-block wrote nothing for one of the two fixtures"
 fi
 
+# ------------------------------------- the linkage constraint: what the chain may and may not do
+# Measured motivation: linkage moved off a UNIQUE block-local optimum 93 times over the cohort, 20
+# rescues against 73 overrides, separating cleanly by how far it moved. The constraint excludes
+# states losing more than tau BEFORE forward-backward, so posterior and GQ are recomputed under it.
+lk() {  # <tag> [flags...] -> md5 of the genotypes table
+  "$BIN" genotype -i "$OUT/g.gfa" -b "$OUT/bub" -r ref -o "$OUT/$1" -R "$OUT/reads.fa" \
+    --truth-haplotypes 'hapA1,hapB1' "${@:2}" -q >/dev/null 2>&1
+  md5 -q "$OUT/$1.genotypes.tsv" 2>/dev/null || md5sum "$OUT/$1.genotypes.tsv" | cut -d" " -f1
+}
+LK_ABSENT=$(lk lk_a)
+LK_INF=$(lk lk_i --max-linkage-emission-loss inf)
+[ "$LK_ABSENT" = "$LK_INF" ] \
+  && ok "the constraint is absent by default: no flag and explicit inf are byte-identical" \
+  || bad "default output moved: --max-linkage-emission-loss inf differs from omitting it"
+
+# The defining property, asserted exactly rather than by eyeball: with tau, no reported call may sit
+# more than tau below its block's emission optimum. called_delta measures precisely that.
+worst_delta() { awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+                { d=$(h["called_delta"]); if (d != "" && d < m) m = d } END{printf "%.6f", m+0}' "$1"; }
+for TAU in 0 0.25 2; do
+  lk "lk_t$TAU" --max-linkage-emission-loss "$TAU" >/dev/null
+  wd=$(worst_delta "$OUT/lk_t$TAU.genotypes.tsv")
+  # awk has no abs on a string compare; test -wd <= tau via awk to keep float semantics.
+  okk=$(awk -v w="$wd" -v t="$TAU" 'BEGIN{print (-w <= t + 1e-6) ? 1 : 0}')
+  [ "$okk" = "1" ] \
+    && ok "at tau=$TAU no call falls further than tau below its block optimum (worst $wd)" \
+    || bad "at tau=$TAU a call sits $wd below its block optimum, outside the constraint"
+done
+
+# tau=0 is NOT "off": it admits every state TIED with the optimum, so linkage can still resolve a
+# tie. At a block with no markers every pair ties, so tau=0 must change nothing there.
+"$BIN" genotype -i "$OUT/dup.gfa" -b "$OUT/dupbub" -r ref -o "$OUT/lk_tie0" -R "$OUT/reads.fa" \
+  --truth-haplotypes 'hapW1,hapX1' -q >/dev/null 2>&1
+"$BIN" genotype -i "$OUT/dup.gfa" -b "$OUT/dupbub" -r ref -o "$OUT/lk_tie1" -R "$OUT/reads.fa" \
+  --truth-haplotypes 'hapW1,hapX1' --max-linkage-emission-loss 0 -q >/dev/null 2>&1
+if diff -q "$OUT/lk_tie0.genotypes.tsv" "$OUT/lk_tie1.genotypes.tsv" >/dev/null 2>&1; then
+  ok "tau=0 leaves a fully-tied block untouched: tied states stay admissible, linkage still decides"
+else
+  bad "tau=0 changed a block whose states all tie, so it is excluding the optimum itself"
+fi
+
+# The constraint must reach the posterior, not just the argmax: GQ is recomputed under it.
+gqs() { awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}{s+=$(h["gq"])} END{printf "%.4f", s}' "$1"; }
+g_un=$(gqs "$OUT/lk_a.genotypes.tsv"); g_c=$(gqs "$OUT/lk_t0.genotypes.tsv")
+if [ "$LK_ABSENT" = "$(lk lk_t0b --max-linkage-emission-loss 0)" ]; then
+  ok "tau=0 reproduces the unconstrained run on this fixture (its optima are already unique)"
+else
+  [ "$g_un" != "$g_c" ] \
+    && ok "the constraint reaches the posterior: total GQ moves ($g_un -> $g_c), not just the call" \
+    || bad "the call changed under tau=0 but total GQ did not: GQ is inherited, not recomputed"
+fi
+
+# And it must not depend on how the work is divided.
+t1=$(lk lk_j1 --max-linkage-emission-loss 0.25 --threads 1)
+t8=$(lk lk_j8 --max-linkage-emission-loss 0.25 --threads 8)
+[ "$t1" = "$t8" ] && ok "the constrained run is thread-independent (1 vs 8)" \
+                  || bad "constrained output differs between 1 and 8 threads"
+
 # --------------------------------------- the emission's tie count, without which rank 1 is a lie
 # truth_rank counts only STRICTLY better pairs, so a block whose markers separate nothing reports
 # rank 1 for every pair -- and read as "the emission ranked truth first" that turns an evidence
