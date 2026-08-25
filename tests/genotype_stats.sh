@@ -428,6 +428,62 @@ else
   bad "--ledger-block wrote nothing for one of the two fixtures"
 fi
 
+# --------------------------------------- the emission's tie count, without which rank 1 is a lie
+# truth_rank counts only STRICTLY better pairs, so a block whose markers separate nothing reports
+# rank 1 for every pair -- and read as "the emission ranked truth first" that turns an evidence
+# failure into an apparent linkage failure. On the cohort it would have said 94% of leave-one-out
+# errors were the chain overriding a correct emission. truth_ties is what tells them apart.
+ties_of() { awk -F'\t' -v b="$2" 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+            $(h["block_index"])==b{print $(h["truth_ties"]); exit}' "$1"; }
+col_of()  { awk -F'\t' -v b="$2" -v w="$3" 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+            $(h["block_index"])==b{print $(h[w]); exit}' "$1"; }
+
+# (a) a block with NO retained markers: every pair scores alike, so all A(A+1)/2 of them tie.
+"$BIN" genotype -i "$OUT/dup.gfa" -b "$OUT/dupbub" -r ref -o "$OUT/tie0" -R "$OUT/reads.fa" \
+  --truth-haplotypes 'hapW1,hapX1' -q >/dev/null 2>&1
+if [ -s "$OUT/tie0.genotypes.tsv" ]; then
+  found=0
+  for b in 0 1 2 3 4; do
+    mk=$(col_of "$OUT/tie0.genotypes.tsv" "$b" n_markers)
+    na=$(col_of "$OUT/tie0.genotypes.tsv" "$b" n_alleles)
+    ti=$(ties_of "$OUT/tie0.genotypes.tsv" "$b")
+    [ -n "$mk" ] && [ "$mk" = "0" ] && [ -n "$na" ] && [ "$na" -gt 1 ] || continue
+    found=1
+    want=$(( na * (na + 1) / 2 ))
+    [ "$ti" = "$want" ] \
+      && ok "a block with no markers ties every pair ($ti = ${na}x$((na+1))/2), so rank 1 means nothing" \
+      || bad "block $b has 0 markers and $na alleles: expected $want ties, got $ti"
+    break
+  done
+  [ "$found" = "1" ] || bad "no zero-marker multi-allele block in the fixture to test ties against"
+else
+  bad "the tie fixture produced no genotypes"
+fi
+
+# (b) a block whose markers DO separate: exactly one pair at the top. Without this the assertion
+# above would pass on a build that reported A(A+1)/2 unconditionally.
+"$BIN" genotype -i "$OUT/g.gfa" -b "$OUT/bub" -r ref -o "$OUT/tie1" -R "$OUT/reads.fa" \
+  --truth-haplotypes 'hapA1,hapB1' --depth-model median -q >/dev/null 2>&1
+if [ -s "$OUT/tie1.genotypes.tsv" ]; then
+  uniq_seen=0
+  for b in 0 1 2 3; do
+    mk=$(col_of "$OUT/tie1.genotypes.tsv" "$b" n_markers)
+    ti=$(ties_of "$OUT/tie1.genotypes.tsv" "$b")
+    [ -n "$mk" ] && [ "$mk" -gt 0 ] && [ "$ti" = "1" ] && uniq_seen=1
+  done
+  [ "$uniq_seen" = "1" ] \
+    && ok "a block whose markers separate reports exactly one pair at the top" \
+    || bad "no well-supplied block reports a unique optimum: the tie count is not discriminating"
+  # Bounds hold everywhere: at least one pair is at the top, never more than there are pairs.
+  bad_b=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+          { t=$(h["truth_ties"]); a=$(h["n_alleles"]); if (t=="-1") next;
+            if (t < 1 || t > a*(a+1)/2) k++ } END{print k+0}' "$OUT/tie1.genotypes.tsv")
+  [ "$bad_b" = "0" ] && ok "every tie count lies in [1, A(A+1)/2]" \
+                     || bad "$bad_b blocks report a tie count outside [1, A(A+1)/2]"
+else
+  bad "the unique-optimum fixture produced no genotypes"
+fi
+
 # ------------------------------------------------ an EMPTY allele is an allele, and must be dumped
 # The bypass a deletion takes has no sequence. --dump-block skipped such alleles, so any consumer
 # counting FASTA records silently dropped the one allele a deletion is about -- which is how an
