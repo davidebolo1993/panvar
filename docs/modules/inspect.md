@@ -4,7 +4,7 @@ CLI: `panvar inspect`
 
 ## What it does
 
-A sanity-check utility for one called bubble (or all of them) before going downstream. Given a `bubble`/`panphorte` GFA (Graphical Fragment Assembly) and its bubble CSV, it writes, per bubble:
+A sanity-check utility for one called bubble (or all of them) before going downstream. Given a `bubble`/`panphorte`/`refine` GFA (Graphical Fragment Assembly) and its bubble CSV, it writes, per bubble:
 - a multi-FASTA of each crossing path's `source → sink` allele
 - a node-count matrix (how each path traverses the internal nodes, with orientation)
 - an edge-count matrix (adjacencies)

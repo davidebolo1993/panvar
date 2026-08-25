@@ -428,6 +428,44 @@ else
   bad "--ledger-block wrote nothing for one of the two fixtures"
 fi
 
+# ------------------------------------------------ an EMPTY allele is an allele, and must be dumped
+# The bypass a deletion takes has no sequence. --dump-block skipped such alleles, so any consumer
+# counting FASTA records silently dropped the one allele a deletion is about -- which is how an
+# identifiability experiment came to score a block as 13 alleles when the panel has 14.
+#
+# The invariant that broke is not "an empty record exists" but "the dump and the panel agree on how
+# many alleles the block has". That holds for every block, needs no special fixture, and fails
+# against the old code on any block containing a bypass.
+"$BIN" genotype -i "$OUT/rep.gfa" -b "$OUT/repbub" -r ref -o "$OUT/hm" \
+  --dump-haplotype-alleles "$OUT/hm.tsv" -q >/dev/null 2>&1
+if [ -s "$OUT/hm.tsv" ]; then
+  # How many blocks the PANEL says exist. Counting only blocks whose dump is non-empty is what let
+  # the old bug hide: it emptied two dumps entirely, and a loop that skips empty files then checks
+  # fewer blocks and still reports success.
+  nblocks=$(awk -F'\t' 'NR>1{b[$2]=1} END{print length(b)}' "$OUT/hm.tsv")
+  agreed=0; checked=0
+  for b in 0 1 2 3; do
+    "$BIN" genotype -i "$OUT/rep.gfa" -b "$OUT/repbub" -r ref -o "$OUT/fa$b" -R "$OUT/reads.fa" \
+      --dump-block "$b" -q >/dev/null 2>&1
+    F="$OUT/fa$b.block$b.fa"
+    npanel=$(awk -F'\t' -v bb="$b" 'NR>1 && $2==bb{a[$4]=1} END{print length(a)}' "$OUT/hm.tsv")
+    [ "$npanel" -gt 0 ] || continue
+    nrec=$([ -s "$F" ] && grep -c '^>' "$F" || echo 0)
+    checked=$((checked + 1))
+    [ "$nrec" = "$npanel" ] && agreed=$((agreed + 1)) \
+      || bad "block $b: --dump-block wrote $nrec alleles, the panel matrix has $npanel"
+    # Every record must also carry a sequence line, empty or not, or it cannot be re-read.
+    nhdr="$nrec"; nline=$([ -s "$F" ] && awk 'END{print NR}' "$F" || echo 0)
+    [ "$nline" = "$((nhdr * 2))" ] \
+      || bad "block $b: $nhdr headers but $nline lines; a record is missing its sequence line"
+  done
+  { [ "$checked" = "$nblocks" ] && [ "$agreed" = "$checked" ]; } \
+    && ok "--dump-block and the panel matrix agree on the allele count (all $nblocks blocks)" \
+    || bad "checked $checked of the panel's $nblocks blocks, $agreed agreed: a dump is short or missing"
+else
+  bad "--dump-haplotype-alleles wrote nothing"
+fi
+
 # ----------------------------------------------------- the ledger refuses questions it cannot answer
 # A refusal must FAIL, not merely print. A message on stderr with exit 0 is a success as far as any
 # caller is concerned, and every one of these contracts exists to stop a silent no-op.
