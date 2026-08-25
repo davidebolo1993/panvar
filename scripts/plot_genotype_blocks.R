@@ -59,7 +59,7 @@ only_loci <- getarg("--loci", NA)
 
 d <- read.delim(table_path, stringsAsFactors = FALSE, check.names = FALSE)
 need <- c("locus", "read_source", "regime", "block_index", "block_kind",
-          "sample", "identity", "best_identity")
+          "sample", "identity", "best_identity", "filter")
 missing <- setdiff(need, names(d))
 if (length(missing)) stop(paste("table lacks columns:", paste(missing, collapse = ", ")))
 
@@ -118,6 +118,12 @@ for (loc in sort(unique(d$locus))) {
   fl <- fl[is.finite(fl$floor), ]
   fl <- aggregate(floor ~ regime + blk, data = fl, FUN = mean)
 
+  # Which of this error the module already declines. A reader has to be able to tell "we call this
+  # wrong" from "we decline to call this", because only the first is a defect -- the second is the
+  # module correctly saying the block cannot be genotyped on the evidence it has.
+  sub$kept <- ifelse(sub$filter == "PASS", "reported (PASS)", "declined")
+  sub$kept <- factor(sub$kept, levels = c("reported (PASS)", "declined"))
+
   p <- ggplot(sub, aes(x = blk, y = err, fill = reads)) +
     # Violins collapse to a line when every sample is exact, which is the correct picture for a
     # solved block; the jittered points keep the sample count visible when that happens.
@@ -125,16 +131,19 @@ for (loc in sort(unique(d$locus))) {
                 scale = "width", alpha = 0.55, colour = NA, na.rm = TRUE) +
     geom_point(position = position_jitterdodge(jitter.width = 0.12, dodge.width = 0.8,
                                                seed = 42),
-               aes(colour = reads), size = 0.5, alpha = 0.5, na.rm = TRUE) +
+               aes(colour = reads, shape = kept, size = kept, alpha = kept), na.rm = TRUE) +
+    scale_shape_manual(values = c("reported (PASS)" = 16, "declined" = 1), name = NULL) +
+    scale_size_manual(values = c("reported (PASS)" = 0.75, "declined" = 0.9), guide = "none") +
+    scale_alpha_manual(values = c("reported (PASS)" = 0.75, "declined" = 0.45), guide = "none") +
     geom_point(data = fl, aes(x = blk, y = floor), inherit.aes = FALSE,
                shape = 18, size = 1.9, colour = "black", na.rm = TRUE) +
     facet_wrap(~ regime, ncol = 1, scales = "free_y") +
     scale_fill_manual(values = pal, name = "reads") +
     scale_colour_manual(values = pal, guide = "none") +
     labs(title = paste0(loc, " - per-block genotyping error"),
-         subtitle = paste0("normalized edit distance to truth (1 - identity); ",
-                           "black diamond = panel floor (1 - best_identity), unreachable once ",
-                           "the donor is held out"),
+         subtitle = paste0("normalized edit distance to truth (1 - identity). Filled = reported, ",
+                           "hollow = declined by the module. Black diamond = panel floor ",
+                           "(1 - best_identity), unreachable once the donor is held out."),
          x = "block (chain order, kind abbreviated)", y = "1 - identity") +
     theme_bw(base_size = 9) +
     theme(panel.grid.minor = element_blank(),
