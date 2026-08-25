@@ -557,8 +557,26 @@ std::vector<BlockCall> genotype_sample(
                     }
                     emis[bi][x * kn + y] = rho * cll + options.scale_weight * sll;
                 } else {
+                    // Adjacency term, same NB against the same depth, over the pair's summed edge
+                    // multiplicities. Discounted by the SAME rho as the nodes: the two are counted
+                    // from one set of reads, so they do not carry independent evidence and must not
+                    // be added at full weight -- measured strictly worse at low depth when they were.
+                    double ell = 0.0;
+                    if (options.edge_weight > 0.0) {
+                        std::unordered_map<std::uint32_t, std::uint32_t> etot;
+                        for (const auto& [slot, mult] : panel.by_block[bi][kept[bi][x]].edges)
+                            etot[slot] += mult;
+                        for (const auto& [slot, mult] : panel.by_block[bi][kept[bi][y]].edges)
+                            etot[slot] += mult;
+                        for (const auto& [slot, m] : etot) {
+                            const double o = slot < counts.edge.size()
+                                                 ? static_cast<double>(counts.edge[slot]) : 0.0;
+                            ell += log_nb(o, lambda * m + mu, phi) - log_nb(o, mu, phi);
+                        }
+                    }
                     emis[bi][x * kn + y] = (options.robust_c > 0.0 ? 0.0 : baseline)
-                                           + rho * ll + mass_ll + cov_ll;
+                                           + rho * ll + mass_ll + cov_ll
+                                           + options.edge_weight * rho * ell;
                 }
                 // Share of the block's observed marker mass this pair accounts for. The denominator is
                 // the UNION of the block's markers -- summing per allele would count every shared

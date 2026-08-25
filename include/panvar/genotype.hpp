@@ -84,6 +84,14 @@ struct GenotypeOptions {
     // lambda, unusual coverage. It is also the only form in which a marker set a paralogue has inflated
     // remains usable at all.
     bool compositional = false;
+    // Weight on a syncmer-ADJACENCY term alongside the per-node one. Adjacencies are computed for
+    // every allele and, until this existed, never read by the emission -- a whole evidence class was
+    // carried and discarded.
+    //
+    // It needs its own weight rather than entering at full strength: nodes and adjacencies come from
+    // the SAME reads, so summing both at weight 1 double counts, which was measured to be strictly
+    // worse at low depth. 0 disables, and that is the default until a stratified sweep says otherwise.
+    double edge_weight = 0.0;
     // Weight on the SCALE half of the compositional emission, relative to the shape half. The total's
     // nominal precision is the number of fragments crossing the block, but that assumes counting noise
     // is the only error -- and it is not: lambda carries about 7% uncertainty of its own, and markers
