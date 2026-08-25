@@ -408,12 +408,16 @@ MarkerPanel build_marker_panel(
             m.min_separating_edges = minsep_e[ai];
             if (m.n_haplotypes == 1) { ++w.report.singleton_alleles; singleton_haps += 1; }
 
+            // 0 means NO cap (the option's contract), not a cap of zero. Written without the guard
+            // this dropped every candidate at the default and left the region-uniqueness pass below
+            // nothing to filter, so its audit reported 0 losses whatever the panel did.
+            const bool capped = options.max_multiplicity != 0;
             for (const auto& [c, mult] : inv[ai].nodes) {
-                if (mult > options.max_multiplicity) continue;
+                if (capped && mult > options.max_multiplicity) continue;
                 w.cand_nodes[ai].emplace(c, mult);
             }
             for (const auto& [c, mult] : inv[ai].edges) {
-                if (mult > options.max_multiplicity) continue;
+                if (capped && mult > options.max_multiplicity) continue;
                 w.cand_edges[ai].emplace(c, mult);
             }
 
@@ -566,14 +570,19 @@ void write_marker_audit(const std::string& out_prefix, const MarkerPanel& panel)
     af << "bubble_id\tallele_id\tis_reference\tn_haplotypes\tallele_bp\tn_syncmers_total"
           "\tn_syncmers_distinct\tn_informative_nodes\tn_informative_edges\tn_carried_nodes"
           "\tn_carried_edges\tmin_separating_nodes\tmin_separating_edges\tn_nodes_lost_region"
-          "\tn_edges_lost_region\thardest_sibling\tnearest_sibling_jaccard\n";
+          "\tn_edges_lost_region\tn_retained_nodes\tn_retained_edges"
+          "\thardest_sibling\tnearest_sibling_jaccard\n";
     for (const AlleleMarkers& m : panel.markers) {
         af << m.bubble_id << '\t' << m.allele_id << '\t' << (m.is_reference ? 1 : 0) << '\t'
            << m.n_haplotypes << '\t' << m.allele_bp << '\t' << m.n_syncmers_total << '\t'
            << m.n_syncmers_distinct << '\t' << m.n_informative_nodes << '\t'
            << m.n_informative_edges << '\t' << m.n_carried_nodes << '\t' << m.n_carried_edges
            << '\t' << m.min_separating_nodes << '\t' << m.min_separating_edges << '\t'
-           << m.n_nodes_lost_region << '\t' << m.n_edges_lost_region << '\t' << m.hardest_sibling
+           << m.n_nodes_lost_region << '\t' << m.n_edges_lost_region << '\t'
+        // What the audit actually kept. Every other count here is taken from the raw inventory, so
+        // a defect that emptied the retained set left no trace in this table at all -- which is how
+        // a multiplicity cap of "0 = no cap", applied as a cap of zero, went unnoticed.
+           << m.node_codes.size() << '\t' << m.edge_keys.size() << '\t' << m.hardest_sibling
            << '\t' << m.nearest_sibling_jaccard << '\n';
     }
 }
@@ -925,6 +934,26 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
                         (void)mult;
                         if (blocks_with[slot] > 1) ++out_panel->dropped_multi_block;
                         else if (actual[slot] > expected[slot]) ++out_panel->dropped_over_expected;
+                    }
+                }
+            }
+            // Per-candidate ledger for one block, taken here because the erase below is destructive
+            // and the two predicates are independent: a marker can fail both, and counting only the
+            // survivors cannot tell which one cost the block its evidence.
+            if (options.ledger_block >= 0 &&
+                static_cast<std::size_t>(options.ledger_block) < chain.size()) {
+                const std::size_t bi = static_cast<std::size_t>(options.ledger_block);
+                for (std::size_t ai = 0; ai < out_panel->by_block[bi].size(); ++ai) {
+                    for (const auto& [slot, mult] : out_panel->by_block[bi][ai].nodes) {
+                        const bool multi = blocks_with[slot] > 1;
+                        const bool over = actual[slot] > expected[slot];
+                        out_panel->ledger.push_back(
+                            {static_cast<std::uint32_t>(ai), slot, mult, blocks_with[slot],
+                             actual[slot], expected[slot],
+                             multi && over ? MarkerFate::Both
+                                           : multi ? MarkerFate::MultiBlock
+                                                   : over ? MarkerFate::OverExpected
+                                                          : MarkerFate::Retained});
                     }
                 }
             }

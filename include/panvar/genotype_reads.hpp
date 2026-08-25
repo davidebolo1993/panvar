@@ -17,6 +17,22 @@ struct AlleleMarkerSet {
     std::vector<std::pair<std::uint32_t, std::uint32_t>> edges;
 };
 
+// Why a candidate marker did or did not survive region filtering. The two rules are independent and
+// a marker can fail both, so they are recorded separately: a marker shared with another block might
+// be recoverable with longer context, while one seen more often than the blocks account for points at
+// the tiling instead.
+enum class MarkerFate { Retained, MultiBlock, OverExpected, Both };
+
+struct MarkerLedgerRow {
+    std::uint32_t allele = 0;
+    std::uint32_t slot = 0;
+    std::uint32_t mult = 0;
+    std::uint32_t vary_blocks = 0;
+    std::uint64_t actual = 0;
+    std::uint64_t expected = 0;
+    MarkerFate fate = MarkerFate::Retained;
+};
+
 // Everything reads are counted against: the marker universe with dense slots, each allele's expected
 // multiplicities, and the invariant markers that serve as depth anchors.
 struct ReadPanel {
@@ -44,6 +60,9 @@ struct ReadPanel {
     std::vector<std::uint32_t> dbg_occ;
     std::vector<std::uint64_t> dbg_actual;
     std::vector<std::uint64_t> dbg_expected;
+    // Every candidate of the block named by --ledger-block, with the reason it survived or did not.
+    // Empty unless asked for.
+    std::vector<MarkerLedgerRow> ledger;
     // Per block: how many distinct fragment-length windows the surviving markers occupy. This, not the
     // marker count, is how many independent observations the block really supplies -- markers inside one
     // fragment are carried by the same reads and rise and fall together.

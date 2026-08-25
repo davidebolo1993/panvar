@@ -181,12 +181,26 @@ void print_genotype_help() {
         << "                              (default 0 = no cap). Capping discards the copy-number\n"
         << "                              signal a tandem array carries: at LPA's KIV-2 block a cap\n"
         << "                              of 3 cuts median allele separation from 261 to 48\n"
-        << "      --all-kmers             Use every k-mer instead of the ~17%% closed-syncmer sample\n"
+        << "      --all-kmers             Use every k-mer instead of the ~17% closed-syncmer sample\n"
         << "                              (~6x more markers, ~6x the memory and time)\n"
-        << "      --no-region-unique      Skip the region-uniqueness filter (diagnostic)\n"
+        << "      --no-region-unique      Skip region filtering entirely (diagnostic). This disables\n"
+        << "                              BOTH rules -- markers varying in more than one block, and\n"
+        << "                              markers the panel shows more often than the blocks account\n"
+        << "                              for -- so it cannot attribute a loss to either one. It also\n"
+        << "                              turns off the audit that counts them, which then reports\n"
+        << "                              nothing rather than zero. Measured to break leave-zero-out\n"
+        << "      --ledger-block <N>      Write every candidate marker of block N with the reason it\n"
+        << "                              was kept or dropped, taken before the filter erases them\n"
+        << "                              (<prefix>.blockN.ledger.tsv). One block, since the\n"
+        << "                              pre-filter set is several times the retained one\n"
+        << "      --edge-weight <F>       Weight on 2-syncmer adjacency evidence (default 0 = off).\n"
+        << "                              Adjacencies come from the same reads as the nodes, so this\n"
+        << "                              double-counts; measured worth 0.5-4% at 0.25-0.5, and 1.0\n"
+        << "                              helps one locus while hurting another. Cannot be combined\n"
+        << "                              with --compositional (different likelihood scales)\n"
         << "      --max-dense-alleles <N> Above N alleles in a block, score pairwise separation with\n"
         << "                              an O(n) sparse accumulator instead of the O(n^2) dense one\n"
-        << "                              (default 2048; identical results, ~40%% slower, but the\n"
+        << "                              (default 2048; identical results, ~40% slower, but the\n"
         << "                              dense matrix would need 200 MB/block at 5000 alleles)\n"
         << "      --sep-top-k <N>         Approximate: score each allele only against its N most\n"
         << "                              similar siblings (MinHash), for panels where even the\n"
@@ -229,6 +243,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
     std::string dump_markers;
     double depth_quantile = 0.75;
     long dump_block = -1;
+    long ledger_block = -1;
     bool depth_calibration = false;
     double mass_weight = 0.0;
     bool nearest_rank = false;
@@ -305,6 +320,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
             else throw std::runtime_error("genotype: --depth-estimator must be median|mean|trimmed");
         }
         else if (arg == "--dump-block") dump_block = std::stol(require_value(arg));
+        else if (arg == "--ledger-block") ledger_block = std::stol(require_value(arg));
         else if (arg == "--depth-calibration") depth_calibration = true;
         else if (arg == "--mass-weight") mass_weight = std::stod(require_value(arg));
         else if (arg == "--nearest-emission-rank") nearest_rank = true;
@@ -577,11 +593,39 @@ int run_genotype_command(const std::vector<std::string>& args) {
 
         ReadPanel read_panel;
         options.restore_stripped_alleles = restore_stripped;
+        options.ledger_block = static_cast<int>(ledger_block);
         const std::vector<BlockMarkerStats> bstats =
             build_block_marker_panel(chain, blocks, options,
                                      (read_paths.empty() && index_out.empty()) ? nullptr : &read_panel,
                                      (read_paths.empty() && index_out.empty()) ? nullptr : &panel_graph,
                                      want_audit_stats);
+        // Written before anything reads: the ledger is a property of the panel, not of a sample.
+        if (!read_panel.ledger.empty()) {
+            const std::string lp = out_prefix + ".block" + std::to_string(ledger_block) + ".ledger.tsv";
+            std::ofstream lf(lp);
+            if (!lf) throw std::runtime_error("genotype: cannot write " + lp);
+            lf << "allele\tslot\tmult\tvary_blocks\tactual\texpected\tfate\n";
+            std::size_t kept = 0, mb = 0, oe = 0, both = 0;
+            for (const MarkerLedgerRow& r : read_panel.ledger) {
+                const char* fate = r.fate == MarkerFate::Retained     ? "retained"
+                                   : r.fate == MarkerFate::MultiBlock ? "multi_block"
+                                   : r.fate == MarkerFate::OverExpected ? "over_expected"
+                                                                        : "both";
+                switch (r.fate) {
+                    case MarkerFate::Retained: ++kept; break;
+                    case MarkerFate::MultiBlock: ++mb; break;
+                    case MarkerFate::OverExpected: ++oe; break;
+                    case MarkerFate::Both: ++both; break;
+                }
+                lf << r.allele << '\t' << r.slot << '\t' << r.mult << '\t' << r.vary_blocks << '\t'
+                   << r.actual << '\t' << r.expected << '\t' << fate << '\n';
+            }
+            log.info("block " + std::to_string(ledger_block) + " marker ledger: " +
+                     std::to_string(read_panel.ledger.size()) + " candidate occurrences, " +
+                     std::to_string(kept) + " retained, " + std::to_string(mb) + " multi-block, " +
+                     std::to_string(oe) + " over-expected, " + std::to_string(both) + " both");
+            log.wrote({lp});
+        }
         if (want_audit_stats) {
             double tot = 0.0; std::size_t inf_n = 0, inf_e = 0, over = 0, maxmult = 0;
             double mass_n = 0.0, mass_e = 0.0; std::size_t hap_tot = 0;
@@ -631,15 +675,22 @@ int run_genotype_command(const std::vector<std::string>& args) {
                      std::to_string(read_panel.dropped_multi_block) + " appear in >1 block, " +
                      std::to_string(read_panel.dropped_over_expected) + " exceed what the blocks own, of " +
                      std::to_string(read_panel.informative_before_filter) + " informative)");
-            log.info("confinement by context: 1-syncmer " +
-                     std::to_string(100 * read_panel.confined_vary_nodes /
-                                    std::max<std::size_t>(1, read_panel.vary_nodes)) +
-                     "% (" + std::to_string(read_panel.confined_vary_nodes) + "/" +
-                     std::to_string(read_panel.vary_nodes) + "), 2-syncmer " +
-                     std::to_string(100 * read_panel.confined_vary_edges /
-                                    std::max<std::size_t>(1, read_panel.vary_edges)) +
-                     "% (" + std::to_string(read_panel.confined_vary_edges) + "/" +
-                     std::to_string(read_panel.vary_edges) + ")");
+            // --no-region-unique skips the pass that fills these, so they stay 0. Printed as a
+            // percentage that reads "0% confined" -- the opposite of the truth, and indistinguishable
+            // from a panel where nothing IS confined. Say "not measured" instead.
+            if (!options.require_region_unique) {
+                log.info("confinement by context: not measured (--no-region-unique skips the pass)");
+            } else {
+                log.info("confinement by context: 1-syncmer " +
+                         std::to_string(100 * read_panel.confined_vary_nodes /
+                                        std::max<std::size_t>(1, read_panel.vary_nodes)) +
+                         "% (" + std::to_string(read_panel.confined_vary_nodes) + "/" +
+                         std::to_string(read_panel.vary_nodes) + "), 2-syncmer " +
+                         std::to_string(100 * read_panel.confined_vary_edges /
+                                        std::max<std::size_t>(1, read_panel.vary_edges)) +
+                         "% (" + std::to_string(read_panel.confined_vary_edges) + "/" +
+                         std::to_string(read_panel.vary_edges) + ")");
+            }
             for (std::size_t b = 0; b < read_panel.block_overlap.size(); ++b) {
                 if (read_panel.block_overlap[b].empty()) continue;
                 std::string msg = "  block " + std::to_string(b) + " (" +

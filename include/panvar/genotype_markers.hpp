@@ -44,6 +44,11 @@ struct MarkerOptions {
     // can still be decided by allele balance instead of by absolute depth.
     bool restore_stripped_alleles = false;
     bool require_region_unique = true;
+    // Record every candidate of ONE block with the reason it was kept or dropped, before the erase.
+    // The surviving-marker dump cannot answer "why is this block marker-poor", and inferring the
+    // reason from what is left over is how a filter gets blamed for another filter's losses.
+    // -1 = off. Bounded to one block because the pre-filter set is several times the retained one.
+    int ledger_block = -1;
     // Pairwise allele separation uses a dense n^2 scratch matrix, which is the fastest form but costs
     // n_alleles^2 * 8 bytes per block (1.7 MB at today's largest block of 463 alleles, but 200 MB at
     // 5,000 and 800 MB at 10,000 -- times the worker count, so it OOMs rather than merely slowing).

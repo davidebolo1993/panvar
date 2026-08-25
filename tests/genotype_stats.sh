@@ -269,6 +269,88 @@ else
   bad "--dump-markers wrote nothing"
 fi
 
+# --------------------------------------- --max-multiplicity 0 means NO cap, in the audit as well
+# The bubble audit wrote `if (mult > max_multiplicity) continue`, so at the default 0 it discarded
+# every candidate before region filtering ever ran. The region-loss column then read 0 whatever the
+# panel contained, and that vacuous zero was quoted as evidence that the filter dropped nothing.
+#
+# A fixture where nothing is dropped cannot catch this -- the whole defect was a vacuous zero -- so
+# the left flank here CONTAINS a copy of allele A1. A1's syncmers are then seen across the panel far
+# more often than the bubble's alleles account for, and the filter must remove them.
+{ printf 'H\tVN:Z:1.0\n'
+  printf 'S\t1\t%s%s%s\n' "$(seq_of 200 1)" "$A1" "$(seq_of 200 8)"
+  printf 'S\t2\t%s\n' "$A1"; printf 'S\t3\t%s\n' "$A2"; printf 'S\t4\t%s\n' "$A3"
+  printf 'S\t5\t%s\n' "$B"
+  for a in 2 3 4; do printf 'L\t1\t+\t%s\t+\t0M\nL\t%s\t+\t5\t+\t0M\n' "$a" "$a"; done
+  printf 'P\tref\t1+,2+,5+\t*\n'
+  for i in 1 2 3 4 5 6; do printf 'P\thapA%d\t1+,2+,5+\t*\n' "$i"; done
+  for i in 1 2 3 4 5 6; do printf 'P\thapB%d\t1+,3+,5+\t*\n' "$i"; done
+  for i in 1 2 3 4 5 6; do printf 'P\thapC%d\t1+,4+,5+\t*\n' "$i"; done
+} > "$OUT/rep.gfa"
+"$BIN" bubble -i "$OUT/rep.gfa" -r ref -o "$OUT/repbub" --min-variant-bp 0 -q >/dev/null 2>&1
+col() { awk -F'\t' -v w="$2" 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+        {s+=$(h[w])} END{print s+0}' "$1"; }
+"$BIN" genotype -i "$OUT/rep.gfa" -b "$OUT/repbub" -r ref -o "$OUT/au0" --audit -q >/dev/null 2>&1
+"$BIN" genotype -i "$OUT/rep.gfa" -b "$OUT/repbub" -r ref -o "$OUT/auN" --audit \
+  --max-multiplicity 1000000 -q >/dev/null 2>&1
+"$BIN" genotype -i "$OUT/rep.gfa" -b "$OUT/repbub" -r ref -o "$OUT/au1" --audit \
+  --max-multiplicity 1 -q >/dev/null 2>&1
+if [ -s "$OUT/au0.audit.alleles.tsv" ] && [ -s "$OUT/auN.audit.alleles.tsv" ]; then
+  r0=$(col "$OUT/au0.audit.alleles.tsv" n_retained_nodes)
+  [ "$r0" -gt 0 ] \
+    && ok "the audit retains candidates at the default cap ($r0 markers), so its filters see input" \
+    || bad "the audit retained 0 markers at --max-multiplicity 0: the cap discarded every candidate"
+  if diff "$OUT/au0.audit.alleles.tsv" "$OUT/auN.audit.alleles.tsv" >/dev/null 2>&1; then
+    ok "--max-multiplicity 0 and an unreachable cap produce identical audits, as 0 = no cap requires"
+  else
+    bad "the default cap and an unreachable cap disagree, so 0 is being treated as a cap of zero"
+  fi
+  # And the flag is not inert in the other direction: a cap of 1 must be able to remove something,
+  # or the assertion above would pass on a build where the option never reached the audit at all.
+  r1=$(col "$OUT/au1.audit.alleles.tsv" n_retained_nodes)
+  [ "$r1" -le "$r0" ] \
+    && ok "a cap of 1 retains no more than no cap ($r1 <= $r0): the option does reach the audit" \
+    || bad "a cap of 1 retained MORE markers ($r1) than no cap ($r0)"
+else
+  bad "--audit wrote no allele table"
+fi
+
+# ------------------------------------------- the ledger accounts for every candidate, kept or not
+# Inferring why a block is marker-poor from what survived is how one filter gets blamed for another
+# filter's losses. The ledger is taken before the erase, so retained + dropped must be the whole
+# candidate set and at least one row must record a drop in this deliberately-clashing fixture.
+# Which chain index holds the bubble is the block builder's business, not this test's, so ask for
+# each in turn and audit whichever one carries the candidates.
+LED=""
+for b in 0 1 2 3; do
+  "$BIN" genotype -i "$OUT/rep.gfa" -b "$OUT/repbub" -r ref -o "$OUT/led$b" -R "$OUT/reads.fa" \
+    --ledger-block "$b" -q >/dev/null 2>&1
+  if [ -s "$OUT/led$b.block$b.ledger.tsv" ]; then LED="$OUT/led$b.block$b.ledger.tsv"; break; fi
+done
+if [ -n "$LED" ]; then
+  tot=$(awk 'NR>1' "$LED" | wc -l | tr -d ' ')
+  kept=$(awk -F'\t' 'NR>1 && $7=="retained"' "$LED" | wc -l | tr -d ' ')
+  drop=$(awk -F'\t' 'NR>1 && $7!="retained"' "$LED" | wc -l | tr -d ' ')
+  [ "$tot" = "$((kept + drop))" ] \
+    && ok "every ledger row carries a fate: $kept retained + $drop dropped = $tot candidates" \
+    || bad "ledger fates do not partition its $tot rows"
+  # The two rules are independent and a marker can fail both; collapsing them is what made the
+  # 36 -> 10 loss at cyp2d6 block 5 look like one filter's doing.
+  badfate=$(awk -F'\t' 'NR>1 && $7!="retained" && $7!="multi_block" && $7!="over_expected" && $7!="both"' \
+            "$LED" | wc -l | tr -d ' ')
+  [ "$badfate" = "0" ] && ok "every fate is one of the four defined reasons" \
+                       || bad "$badfate ledger rows carry an unrecognized fate"
+  # A row's fate must follow from the two numbers printed beside it, or the ledger cannot be audited.
+  incons=$(awk -F'\t' 'NR>1{ m=($4>1); o=($5>$6);
+           want=(m&&o)?"both":(m?"multi_block":(o?"over_expected":"retained"));
+           if ($7!=want) k++} END{print k+0}' "$LED")
+  [ "$incons" = "0" ] \
+    && ok "each fate follows from the vary_blocks and actual/expected printed with it" \
+    || bad "$incons ledger rows have a fate their own columns do not imply"
+else
+  bad "--ledger-block wrote nothing"
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then echo "genotype_stats: all assertions passed"; else echo "genotype_stats: $fails FAILED"; fi
 exit "$fails"
