@@ -138,6 +138,11 @@ struct BlockCall {
     // which reads as "the emission got it right" when the emission said nothing at all. Without this
     // count, an identifiability failure and a linkage override are indistinguishable in the output.
     int truth_emission_ties = -1;
+    // How many candidates the block actually SCORED, after pruning to --max-alleles. The tie count
+    // is over these, not over every allele in the block, so dividing it by the full allele count
+    // understates how tied a large block is -- badly, above the 64-allele default. Emitted so no
+    // consumer has to infer min(n_alleles, budget), which is only correct at the default.
+    int n_scored_alleles = -1;
     std::size_t block_index = 0;
     bool is_bubble = true;
     std::size_t bubble_id = 0;

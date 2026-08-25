@@ -625,6 +625,7 @@ std::vector<BlockCall> genotype_sample(
             calls[bi].truth_emission_rank = rank;
             calls[bi].truth_emission_delta = tv - best;
             calls[bi].truth_emission_ties = ties;
+            calls[bi].n_scored_alleles = static_cast<int>(kn);
         }
     }
 
@@ -1029,7 +1030,8 @@ void write_genotypes(
     g << "block_index\tblock_kind\tbubble_id\tsource\tsink\tn_alleles\tn_markers"
          "\tallele1\tallele2\thaplotype1\thaplotype2\thap_posterior\tgq\texplained\tdetected"
          "\tcalled_bp\tmass_bp\tmass_bp_sd\tcov_bp\tno_marker_alleles\tmax_copies\tblock_class"
-         "\tevidence\tfilter\ttruth1\ttruth2\ttruth_rank\ttruth_delta\ttruth_ties\tinfluencers\n";
+         "\tevidence\tfilter\ttruth1\ttruth2\ttruth_rank\ttruth_delta\ttruth_ties"
+          "\tn_scored_alleles\tinfluencers\n";
     for (std::size_t bi = 0; bi < calls.size(); ++bi) {
         const BlockCall& c = calls[bi];
         g << c.block_index << '\t'
@@ -1047,7 +1049,8 @@ void write_genotypes(
           << c.cov_bp << '\t' << c.alleles_without_markers << '\t' << c.max_copies << '\t' << (c.is_array ? "array" : "simple") << '\t'
           << c.evidence << '\t' << c.filter << '\t'
           << c.truth_allele1 << '\t' << c.truth_allele2 << '\t' << c.truth_emission_rank << '\t'
-          << c.truth_emission_delta << '\t' << c.truth_emission_ties << '\t';
+          << c.truth_emission_delta << '\t' << c.truth_emission_ties << '\t'
+          << c.n_scored_alleles << '\t';
         for (std::size_t k = 0; k < c.influencers.size(); ++k) {
             if (k) g << ',';
             g << c.influencers[k];
