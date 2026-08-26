@@ -499,11 +499,15 @@ c2=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}{print $(h["allele1"])","$
                   || bad "the calls changed under --probe-pair; the probe is affecting inference"
 probe_refuses() {
   "$BIN" genotype -i "$OUT/g.gfa" -b "$OUT/bub" -r ref -o "$OUT/px" -R "$OUT/reads.fa" \
-    --probe-pair "$1" -q >"$OUT/px.log" 2>&1
+    --probe-pair $1 -q >"$OUT/px.log" 2>&1
   if [ $? -ne 0 ] && grep -qi "$2" "$OUT/px.log"; then ok "--probe-pair rejects $3"
   else bad "--probe-pair accepted $3 (exit $?), which rank -2 would report as pruning"; fi
 }
 probe_refuses "1:0,99"    "allele out of range" "an allele index past the end"
+# The check must cover EVERY repetition. A valid first probe followed by a bad one used to sail
+# through and report rank -2, which reads as "pruned before scoring" -- a finding, not a typo.
+probe_refuses "1:0,1 --probe-pair 1:0,99" "allele out of range" "a bad SECOND probe after a good first"
+probe_refuses "1:0,1 --probe-pair 99:0,1" "out of range"        "a bad second probe's block"
 probe_refuses "99:0,1"    "out of range"        "a block index past the end"
 probe_refuses "1:0,1,2"   "exactly BLOCK"       "a third field"
 probe_refuses "1:x,1"     "whole number"        "a non-numeric allele"
@@ -562,6 +566,11 @@ nl_refuses() {
 # identically. This is the test that the halves partition the marker set: if the scopes overlapped, or
 # left a marker in neither, the identity breaks and nothing else here would have noticed.
 #
+# SCOPE: this holds for the DEFAULT emission, which is a sum of per-marker terms. A mass-profile term,
+# a data-dependent scale or any other non-additive component could break the identity while the
+# partition remains perfectly correct -- so this assertion is about the default path only, and a
+# future non-additive option must not be added to it without deriving what the identity becomes.
+#
 # The source pair must be one the sample does NOT carry. Where it does, observed counts already equal
 # the expected ones, every arm rewrites a value to itself, and all four agree for a reason that has
 # nothing to do with the code being right -- which is how a first version of this test passed while
@@ -598,6 +607,17 @@ else
   bad "--noiseless-scope arms produced no probe scores"
 fi
 nl_refuses "--noiseless-counts 1 --noiseless-scope sideways" "all|present|absent" "an unknown scope"
+# A scope with nothing to scope rewrites no marker, so the run is the baseline wearing an arm's name.
+nl_refuses "--noiseless-scope absent" "rewrites nothing" "a scope without --noiseless-counts"
+# The indexed route does not carry these diagnostics. Accepting them there would report a plain run
+# as an injected one, which is the same failure as an inert scope and harder to notice.
+idx_refuses() {
+  "$BIN" genotype --index "$OUT/idx.bin" -o "$OUT/ixr" -R "$OUT/skew.fa" $1 -q >"$OUT/ixr.log" 2>&1
+  if [ $? -ne 0 ] && grep -qi "indexed route" "$OUT/ixr.log"; then ok "--index rejects $2"
+  else bad "--index accepted $2 (exit $?) and would have ignored it silently"; fi
+}
+idx_refuses "--probe-pair 1:0,1"      "--probe-pair"
+idx_refuses "--noiseless-counts 1:0,1" "--noiseless-counts"
 
 # --------------------------------------------------------------- --probe-pair is repeatable
 # Several probes must all be reported, and adding one must not change what an earlier one said --

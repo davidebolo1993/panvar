@@ -586,6 +586,18 @@ int run_genotype_command(const std::vector<std::string>& args) {
         throw std::runtime_error("genotype: --oracle-called-only only means anything with "
                                  "--certified-oracle; on its own it reports nothing");
     }
+    // A diagnostic that quietly does nothing is worse than one that refuses: the run looks like an
+    // arm of the experiment and is actually the baseline, which is exactly how a null result gets
+    // manufactured. Both combinations below were silently inert.
+    if (noiseless_scope != "all" && noiseless_block < 0) {
+        throw std::runtime_error("genotype: --noiseless-scope selects which half of the markers "
+                                 "--noiseless-counts rewrites; on its own it rewrites nothing");
+    }
+    if (!index_in.empty() && (noiseless_block >= 0 || !probe_pairs.empty())) {
+        throw std::runtime_error("genotype: --probe-pair, --noiseless-counts and --noiseless-scope "
+                                 "are not implemented on the indexed route (--index) and would be "
+                                 "ignored; run the direct route with -i/--gfa");
+    }
     if (noiseless_block >= 0) {
         // It replaces counts, so there must be counts to replace: the panel, the depth model and phi
         // are all built from the reads and only the named block's node counts are overwritten.
@@ -1858,19 +1870,23 @@ int run_genotype_command(const std::vector<std::string>& args) {
             // Applied before the FIRST call, which always runs: the joint-depth refinement below
             // fires only under some depth conditions, so patching it there made the flag inert
             // exactly where the diagnosis was needed.
-            if (probe_block >= 0) {
-                if (static_cast<std::size_t>(probe_block) >= chain.size())
-                    throw std::runtime_error("--probe-pair block " + std::to_string(probe_block) +
+            // EVERY probe is range-checked, not only the first. rank -2 means "pruned before
+            // scoring", so an out-of-range index silently becomes a pruning finding -- which is the
+            // conclusion the flag exists to establish. Validating only the first left the later ones
+            // of a repeated probe able to forge exactly that.
+            for (const auto& pp : probe_pairs) {
+                if (pp[0] >= chain.size())
+                    throw std::runtime_error("--probe-pair block " + std::to_string(pp[0]) +
                                              " is out of range (chain has " +
                                              std::to_string(chain.size()) + " blocks)");
-                // An allele index past the end would report rank -2, which is the sentinel for
-                // "pruned before scoring" -- so a typo would read as a pruning finding.
-                const std::size_t na = blocks[static_cast<std::size_t>(probe_block)].allele_seq.size();
-                if (static_cast<std::size_t>(probe_a) >= na || static_cast<std::size_t>(probe_b) >= na)
+                const std::size_t na = blocks[pp[0]].allele_seq.size();
+                if (pp[1] >= na || pp[2] >= na)
                     throw std::runtime_error("--probe-pair allele out of range: block " +
-                                             std::to_string(probe_block) + " has " +
-                                             std::to_string(na) + " alleles, asked for (" +
-                                             std::to_string(probe_a) + "," + std::to_string(probe_b) + ")");
+                                             std::to_string(pp[0]) + " has " + std::to_string(na) +
+                                             " alleles, asked for (" + std::to_string(pp[1]) + "," +
+                                             std::to_string(pp[2]) + ")");
+            }
+            if (probe_block >= 0) {
                 if (pa1.size() < chain.size()) pa1.resize(chain.size(), -1);
                 if (pa2.size() < chain.size()) pa2.resize(chain.size(), -1);
                 pa1[static_cast<std::size_t>(probe_block)] = static_cast<int>(probe_a);
