@@ -199,6 +199,12 @@ void print_genotype_help() {
         << "                              every block. The panel's basic fact, and the only way to\n"
         << "                              recover TRANSITIONS between blocks: per-block dumps cannot\n"
         << "                              say which allele pairs co-occur on one haplotype\n"
+        << "      --probe-pair <BLK:A,B>  Report the emission rank, tie count and delta for allele\n"
+        << "                              pair (A,B) at block BLK instead of the truth's. The\n"
+        << "                              certified oracle names the best REACHABLE pair, which at an\n"
+        << "                              unrepresentable block is not the truth; this asks which\n"
+        << "                              stage lost it. truth_rank -2 means pruned before scoring.\n"
+        << "                              DIAGNOSTIC: the truth_* columns then describe the probe\n"
         << "      --max-linkage-emission-loss <F|inf>\n"
         << "                              How much block-local emission a state may give up and\n"
         << "                              still be reachable by the chain. States losing more than F\n"
@@ -264,6 +270,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
     // Infinity = unrestricted, and it is the default so current output cannot move. NOT 0: tau of 0
     // admits every state tied with the block optimum, which is a real and useful setting.
     double max_linkage_loss = std::numeric_limits<double>::infinity();
+    long probe_block = -1; long probe_a = -1, probe_b = -1;
     bool depth_calibration = false;
     double mass_weight = 0.0;
     bool nearest_rank = false;
@@ -342,6 +349,35 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--dump-block") dump_block = std::stol(require_value(arg));
         else if (arg == "--ledger-block") ledger_block = std::stol(require_value(arg));
         else if (arg == "--dump-haplotype-alleles") alleles_out = require_value(arg);
+        else if (arg == "--probe-pair") {
+            // BLOCK:A,B -- point the emission-rank diagnostics at a chosen allele pair instead of
+            // the truth's. The certified oracle names the best REACHABLE pair, which at an
+            // unrepresentable block is not the truth and so has no rank reported; this is how to
+            // ask which stage lost it. truth_rank == -2 already means "pruned before scoring".
+            const std::string v = require_value(arg);
+            const std::size_t c = v.find(':'), m = v.find(',');
+            if (c == std::string::npos || m == std::string::npos || m < c ||
+                v.find(':', c + 1) != std::string::npos || v.find(',', m + 1) != std::string::npos) {
+                throw std::runtime_error("--probe-pair wants exactly BLOCK:A,B (e.g. 13:271,304)");
+            }
+            const auto whole = [&](const std::string& t) {
+                if (t.empty()) throw std::runtime_error("--probe-pair has an empty field in '" + v + "'");
+                std::size_t used = 0;
+                long n = 0;
+                try {
+                    n = std::stol(t, &used);
+                } catch (const std::exception&) {
+                    throw std::runtime_error("--probe-pair: '" + t + "' is not a whole number");
+                }
+                if (used != t.size())
+                    throw std::runtime_error("--probe-pair: '" + t + "' is not a whole number");
+                if (n < 0) throw std::runtime_error("--probe-pair indices must be >= 0");
+                return n;
+            };
+            probe_block = whole(v.substr(0, c));
+            probe_a = whole(v.substr(c + 1, m - c - 1));
+            probe_b = whole(v.substr(m + 1));
+        }
         else if (arg == "--max-linkage-emission-loss") {
             const std::string v = require_value(arg);
             if (v == "inf" || v == "INF" || v == "infinity") {
@@ -1538,6 +1574,30 @@ int run_genotype_command(const std::vector<std::string>& args) {
                          std::to_string(chain.size()) + " blocks, lambda " + std::to_string(cev.lambda) +
                          " from " + std::to_string(anchor_cov.size()) + " invariant nodes");
             }
+            // Applied before the FIRST call, which always runs: the joint-depth refinement below
+            // fires only under some depth conditions, so patching it there made the flag inert
+            // exactly where the diagnosis was needed.
+            if (probe_block >= 0) {
+                if (static_cast<std::size_t>(probe_block) >= chain.size())
+                    throw std::runtime_error("--probe-pair block " + std::to_string(probe_block) +
+                                             " is out of range (chain has " +
+                                             std::to_string(chain.size()) + " blocks)");
+                // An allele index past the end would report rank -2, which is the sentinel for
+                // "pruned before scoring" -- so a typo would read as a pruning finding.
+                const std::size_t na = blocks[static_cast<std::size_t>(probe_block)].allele_seq.size();
+                if (static_cast<std::size_t>(probe_a) >= na || static_cast<std::size_t>(probe_b) >= na)
+                    throw std::runtime_error("--probe-pair allele out of range: block " +
+                                             std::to_string(probe_block) + " has " +
+                                             std::to_string(na) + " alleles, asked for (" +
+                                             std::to_string(probe_a) + "," + std::to_string(probe_b) + ")");
+                if (pa1.size() < chain.size()) pa1.resize(chain.size(), -1);
+                if (pa2.size() < chain.size()) pa2.resize(chain.size(), -1);
+                pa1[static_cast<std::size_t>(probe_block)] = static_cast<int>(probe_a);
+                pa2[static_cast<std::size_t>(probe_block)] = static_cast<int>(probe_b);
+                log.info("PROBE: block " + std::to_string(probe_block) + " truth columns now describe "
+                         "the pair (" + std::to_string(probe_a) + "," + std::to_string(probe_b) +
+                         "), NOT this sample's truth");
+            }
             std::vector<BlockCall> calls =
                 genotype_sample(chain, blocks, read_panel, rc, depth, hap_names, gopt, &gsum,
                                 pa1.empty() ? nullptr : &pa1, pa2.empty() ? nullptr : &pa2,
@@ -1639,7 +1699,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                              "copy number is mass_bp +- mass_bp_sd, not called_bp");
                 }
             }
-            write_genotypes(out_prefix, chain, blocks, calls, hap_names);
+            write_genotypes(out_prefix, chain, blocks, calls, hap_names, probe_block >= 0);
 
             if (!truth_haplotypes.empty()) {
                 const auto comma = truth_haplotypes.find(',');

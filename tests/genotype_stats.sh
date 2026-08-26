@@ -428,6 +428,37 @@ else
   bad "--ledger-block wrote nothing for one of the two fixtures"
 fi
 
+# ------------------------------------------------------ --probe-pair, and the sentinel it can forge
+# The emission-rank diagnostics report on the truth pair, but at an unrepresentable block the truth
+# is not in the panel and the pair worth asking about is the certified-optimal one. --probe-pair
+# points them at any pair. Its danger is that rank -2 means "pruned before scoring", so an
+# out-of-range allele index would read as a pruning finding -- the exact conclusion the flag exists
+# to establish. It must be rejected, not silently reported.
+"$BIN" genotype -i "$OUT/g.gfa" -b "$OUT/bub" -r ref -o "$OUT/pt" -R "$OUT/reads.fa" \
+  --truth-haplotypes 'hapA1,hapB1' -q >/dev/null 2>&1
+"$BIN" genotype -i "$OUT/g.gfa" -b "$OUT/bub" -r ref -o "$OUT/pp" -R "$OUT/reads.fa" \
+  --truth-haplotypes 'hapA1,hapB1' --probe-pair 1:0,2 -q >/dev/null 2>&1
+tgt() { awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}{print $(h["rank_target"]); exit}' "$1"; }
+{ [ "$(tgt "$OUT/pt.genotypes.tsv")" = "truth" ] && [ "$(tgt "$OUT/pp.genotypes.tsv")" = "probe" ]; } \
+  && ok "rank_target distinguishes a probe run from a scored one" \
+  || bad "rank_target does not mark probe rows: a diagnostic run could be read as a scored one"
+# A probe changes only the reported ranks, never the call itself.
+c1=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}{print $(h["allele1"])","$(h["allele2"])}' "$OUT/pt.genotypes.tsv" | tr '\n' ' ')
+c2=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}{print $(h["allele1"])","$(h["allele2"])}' "$OUT/pp.genotypes.tsv" | tr '\n' ' ')
+[ "$c1" = "$c2" ] && ok "a probe run reports the same calls: it observes, it does not steer" \
+                  || bad "the calls changed under --probe-pair; the probe is affecting inference"
+probe_refuses() {
+  "$BIN" genotype -i "$OUT/g.gfa" -b "$OUT/bub" -r ref -o "$OUT/px" -R "$OUT/reads.fa" \
+    --probe-pair "$1" -q >"$OUT/px.log" 2>&1
+  if [ $? -ne 0 ] && grep -qi "$2" "$OUT/px.log"; then ok "--probe-pair rejects $3"
+  else bad "--probe-pair accepted $3 (exit $?), which rank -2 would report as pruning"; fi
+}
+probe_refuses "1:0,99"    "allele out of range" "an allele index past the end"
+probe_refuses "99:0,1"    "out of range"        "a block index past the end"
+probe_refuses "1:0,1,2"   "exactly BLOCK"       "a third field"
+probe_refuses "1:x,1"     "whole number"        "a non-numeric allele"
+probe_refuses "1:0,1junk" "whole number"        "trailing junk"
+
 # ----------------------------------- the certified oracle's edit columns, and which row owns them
 # excess_total_edits is (called - best) EDITS, and only the edit_distance row's `best` minimises
 # edits. On this fixture the length_error row's "best" pair sits 69 edits from truth while the

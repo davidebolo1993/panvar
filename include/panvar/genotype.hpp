@@ -266,11 +266,14 @@ std::vector<BlockCall> genotype_sample(
     const std::vector<int>* truth_allele2 = nullptr,
     const CoverageEvidence* coverage = nullptr);
 
+// `probe_target` records whether the truth_* columns describe this sample's truth or a pair supplied
+// by --probe-pair, so a diagnostic run can never be mistaken for a scored one downstream.
 void write_genotypes(
     const std::string& out_prefix,
     const std::vector<Block>& chain,
     const std::vector<BlockAlleles>& blocks,
     const std::vector<BlockCall>& calls,
-    const std::vector<std::string>& haplotype_names);
+    const std::vector<std::string>& haplotype_names,
+    bool probe_target = false);
 
 } // namespace panvar

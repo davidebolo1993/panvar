@@ -1043,7 +1043,8 @@ void write_genotypes(
     const std::vector<Block>& chain,
     const std::vector<BlockAlleles>& blocks,
     const std::vector<BlockCall>& calls,
-    const std::vector<std::string>& haplotype_names) {
+    const std::vector<std::string>& haplotype_names,
+    bool probe_target) {
 
     // One row per block, in chain order, carrying everything needed to read a call without joining
     // another file: where the block is (source -> sink), what was called, which panel haplotypes it
@@ -1061,7 +1062,7 @@ void write_genotypes(
          "\tallele1\tallele2\thaplotype1\thaplotype2\thap_posterior\tgq\texplained\tdetected"
          "\tcalled_bp\tmass_bp\tmass_bp_sd\tcov_bp\tno_marker_alleles\tmax_copies\tblock_class"
          "\tevidence\tfilter\ttruth1\ttruth2\ttruth_rank\ttruth_delta\ttruth_ties"
-          "\tn_scored_alleles\tcalled_rank\tcalled_delta\tinfluencers\n";
+          "\tn_scored_alleles\tcalled_rank\tcalled_delta\trank_target\tinfluencers\n";
     for (std::size_t bi = 0; bi < calls.size(); ++bi) {
         const BlockCall& c = calls[bi];
         g << c.block_index << '\t'
@@ -1081,7 +1082,7 @@ void write_genotypes(
           << c.truth_allele1 << '\t' << c.truth_allele2 << '\t' << c.truth_emission_rank << '\t'
           << c.truth_emission_delta << '\t' << c.truth_emission_ties << '\t'
           << c.n_scored_alleles << '\t' << c.called_emission_rank << '\t'
-          << c.called_emission_delta << '\t';
+          << c.called_emission_delta << '\t' << (probe_target ? "probe" : "truth") << '\t';
         for (std::size_t k = 0; k < c.influencers.size(); ++k) {
             if (k) g << ',';
             g << c.influencers[k];
