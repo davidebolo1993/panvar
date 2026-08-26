@@ -1240,6 +1240,11 @@ int run_genotype_command(const std::vector<std::string>& args) {
             GenotypeSummary gsum;
             std::vector<int> ta1;
             std::vector<int> ta2;
+            // An EMPTY truth sequence is a real genotype -- the deletion/bypass allele -- so the
+            // empty string cannot double as "no truth here". Conflating them made the evaluation
+            // silently skip blocks where both haplotypes carry the deletion, which is exactly the
+            // case a deletion caller has to get right.
+            std::vector<char> tav1, tav2;   // does this haplotype traverse the block at all?
             std::vector<std::string> ts1;   // true spelled sequence per block, even when unrepresentable
             std::vector<std::string> ts2;
             if (!truth_haplotypes.empty()) {
@@ -1270,7 +1275,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     }
                 }
                 auto resolve = [&](const std::string& name, std::vector<int>& out_alleles,
-                                   std::vector<std::string>& out_seq) {
+                                   std::vector<std::string>& out_seq, std::vector<char>& out_avail) {
                     const auto direct = [&](std::size_t bi) {
                         const auto it = blocks[bi].allele_of.find(name);
                         return it == blocks[bi].allele_of.end() ? -1 : static_cast<int>(it->second);
@@ -1284,6 +1289,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                 static_cast<std::size_t>(out_alleles[bi]) < blocks[bi].allele_seq.size()) {
                                 out_seq[bi] = blocks[bi].allele_seq[static_cast<std::size_t>(out_alleles[bi])];
                             }
+                            if (out_alleles[bi] >= 0) out_avail[bi] = 1;
                         }
                         return;
                     }
@@ -1296,6 +1302,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     for (std::size_t bi = 0; bi < chain.size(); ++bi) {
                         const auto it = held_blocks[bi].allele_of.find(name);
                         if (it == held_blocks[bi].allele_of.end()) continue;
+                        out_avail[bi] = 1;   // it traverses the block; the sequence may still be empty
                         const std::size_t hai = it->second;
                         if (held_blocks[bi].bypass_allele >= 0 &&
                             hai == static_cast<std::size_t>(held_blocks[bi].bypass_allele)) {
@@ -1315,8 +1322,10 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 };
                 ts1.assign(chain.size(), std::string());
                 ts2.assign(chain.size(), std::string());
-                resolve(a, ta1, ts1);
-                resolve(b, ta2, ts2);
+                tav1.assign(chain.size(), 0);
+                tav2.assign(chain.size(), 0);
+                resolve(a, ta1, ts1, tav1);
+                resolve(b, ta2, ts2, tav2);
 
                 // Depth calibration: with the truth known, every marker's expected count is
                 // lambda*(m_truth1 + m_truth2), so the reads measure lambda directly. Regressing the
@@ -1722,7 +1731,9 @@ int run_genotype_command(const std::vector<std::string>& args) {
                            // exact and certified over all 2A alignments.
                            "\tcalled_total_edits\texcess_total_edits\n";
                     for (std::size_t bi = 0; bi < chain.size() && bi < blocks.size(); ++bi) {
-                        if (bi >= ts1.size() || (ts1[bi].empty() && ts2[bi].empty())) continue;
+                        // Skip only when NEITHER haplotype traverses the block. Both carrying the
+                        // deletion is a genotype, not a missing value.
+                        if (bi >= ts1.size() || (!tav1[bi] && !tav2[bi])) continue;
                         if (certified_oracle_block >= 0 &&
                             static_cast<long>(chain[bi].index) != certified_oracle_block) continue;
                         const std::size_t A = blocks[bi].allele_seq.size();
@@ -1854,7 +1865,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     std::size_t dbp_rep = 0, best_rep = 0, graded_rep = 0;
                     std::size_t dbp_unrep = 0, graded_norep = 0;
                     for (std::size_t bi = 0; bi < chain.size(); ++bi) {
-                        if (ts1[bi].empty() && ts2[bi].empty()) continue;
+                        if (!tav1[bi] && !tav2[bi]) continue;
                         const std::string* tv[2] = {&ts1[bi], &ts2[bi]};
                         const std::size_t cv[2] = {calls[bi].allele1, calls[bi].allele2};
                         // Which called haplotype to compare against which true one is itself a choice,

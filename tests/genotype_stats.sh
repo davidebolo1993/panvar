@@ -457,17 +457,35 @@ if [ -s "$ORC" ]; then
   [ "$neg" = "0" ] && ok "no certified excess is negative (it is a minimum over every pair)" \
                    || bad "$neg rows report a negative certified excess"
   # This fixture's truth pair IS in the panel and IS what was called, which pins all three at 0.
-  be=$(ocol "$ORC" edit_distance best_total_edits)
-  ce=$(ocol "$ORC" edit_distance called_total_edits)
-  xe=$(ocol "$ORC" edit_distance excess_total_edits)
-  { [ "$be" = "0" ] && [ "$ce" = "0" ] && [ "$xe" = "0" ]; } \
-    && ok "a representable truth called exactly gives best=called=excess=0 edits" \
-    || bad "truth is in the panel and was called, but best=$be called=$ce excess=$xe"
-  # And the criterion really does disagree, so the NA rule above is not guarding a non-issue.
-  le=$(ocol "$ORC" length_error best_total_edits)
-  [ -n "$le" ] && [ "$le" != "0" ] \
-    && ok "the length-optimal pair is $le edits from truth: criteria genuinely disagree" \
-    || bad "length_error picked the edit-optimal pair, so this fixture cannot test the NA rule"
+  # Every block here has a representable truth that was called exactly, so all three must be 0
+  # everywhere -- checked across blocks, not on whichever row happens to come first.
+  nz=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+       $(h["criterion"])=="edit_distance" &&
+       ($(h["best_total_edits"])+0!=0 || $(h["called_total_edits"])+0!=0 ||
+        $(h["excess_total_edits"])+0!=0){k++} END{print k+0}' "$ORC")
+  [ "$nz" = "0" ] \
+    && ok "a representable truth called exactly gives best=called=excess=0 edits, at every block" \
+    || bad "$nz blocks have a nonzero edit count though truth is in the panel and was called"
+  # And the criteria really do disagree SOMEWHERE, so the NA rule is not guarding a non-issue.
+  # Asked per block rather than off the first row: which block comes first is the chain builder's
+  # business, and an earlier version of this test silently started reading a block where the two
+  # criteria happen to agree.
+  dis=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+        { b=$(h["block_index"]); c=$(h["criterion"]); e=$(h["best_total_edits"])
+          if (c=="edit_distance") ed[b]=e; if (c=="length_error") le[b]=e }
+        END{ for (b in ed) if (le[b] != "" && le[b]+0 > ed[b]+0) { print b" "le[b]" "ed[b]; exit } }' "$ORC")
+  [ -n "$dis" ] \
+    && ok "a length-optimal pair is farther in edits than the edit-optimal one (block $dis): criteria disagree" \
+    || bad "no block where length_error and edit_distance disagree: the fixture cannot test the NA rule"
+  # An EMPTY truth sequence is a genotype (the deletion/bypass allele), not a missing value. The
+  # evaluation used the empty string as a missing-value sentinel and silently skipped such blocks,
+  # which is precisely the case a deletion caller has to get right. This fixture's flanks spell
+  # empty, so they must appear.
+  nblk=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}{b[$(h["block_index"])]=1} END{print length(b)}' "$ORC")
+  nchain=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}{b[$(h["block_index"])]=1} END{print length(b)}' "$OUT/orc.genotypes.tsv")
+  [ "$nblk" = "$nchain" ] \
+    && ok "the oracle scores every block in the chain ($nblk), empty-truth ones included" \
+    || bad "the oracle scored $nblk of $nchain blocks: an empty truth is being read as no truth"
 else
   bad "--certified-oracle wrote no table"
 fi
