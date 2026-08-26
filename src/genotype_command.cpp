@@ -329,6 +329,10 @@ int run_genotype_command(const std::vector<std::string>& args) {
     // worse" into a causal statement: if rewriting only the markers the source LACKS reproduces the
     // damage, the defect is in how absent markers are scored.
     std::string noiseless_scope = "all";       // all | present | absent
+    // Where to write the source pair's multiplicity vector for the injected block. It is the only
+    // quantity in the decomposition that cannot be recovered from --dump-block: under leave-one-out
+    // the truth is off-panel, so no allele column carries it.
+    std::string injection_out;
     // Every --probe-pair, in order. The first also redirects the truth_* columns, which is what the
     // single-probe form has always done; all of them appear in the probe table.
     std::vector<std::array<std::size_t, 3>> probe_pairs;
@@ -491,6 +495,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 noiseless_b = whole(v.substr(m + 1));
             }
         }
+        else if (arg == "--dump-injection") injection_out = require_value(arg);
         else if (arg == "--noiseless-scope") {
             noiseless_scope = require_value(arg);
             if (noiseless_scope != "all" && noiseless_scope != "present" && noiseless_scope != "absent")
@@ -589,6 +594,10 @@ int run_genotype_command(const std::vector<std::string>& args) {
     // A diagnostic that quietly does nothing is worse than one that refuses: the run looks like an
     // arm of the experiment and is actually the baseline, which is exactly how a null result gets
     // manufactured. Both combinations below were silently inert.
+    if (!injection_out.empty() && noiseless_block < 0) {
+        throw std::runtime_error("genotype: --dump-injection writes the vector --noiseless-counts "
+                                 "injects; without it there is nothing to write");
+    }
     if (noiseless_scope != "all" && noiseless_block < 0) {
         throw std::runtime_error("genotype: --noiseless-scope selects which half of the markers "
                                  "--noiseless-counts rewrites; on its own it rewrites nothing");
@@ -1831,6 +1840,22 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 // sharper than any real read pile-up, which scatters stray counts there. That is the
                 // asymmetry the `absent` scope exists to test, and it is worth being precise about:
                 // the treatment is "set to zero", not "set to mu", because counts are integers.
+                if (!injection_out.empty()) {
+                    std::ofstream jf(injection_out);
+                    if (!jf) throw std::runtime_error("genotype: cannot write " + injection_out);
+                    jf << "slot\tsource_mult\tobserved_count\n";
+                    std::vector<std::uint32_t> uni;
+                    for (const auto& mset : read_panel.by_block[nbi])
+                        for (const auto& [slot, m] : mset.nodes) { (void)m; uni.push_back(slot); }
+                    std::sort(uni.begin(), uni.end());
+                    uni.erase(std::unique(uni.begin(), uni.end()), uni.end());
+                    for (const std::uint32_t sl : uni) {
+                        const auto it = mult.find(sl);
+                        jf << sl << '\t' << (it == mult.end() ? 0u : it->second) << '\t'
+                           << rc.node[sl] << '\n';
+                    }
+                    log.wrote({injection_out});
+                }
                 std::size_t n_pres = 0, n_abs = 0;
                 double pres_before = 0.0, pres_after = 0.0, abs_before = 0.0, abs_after = 0.0;
                 for (const std::uint32_t s : universe) {
