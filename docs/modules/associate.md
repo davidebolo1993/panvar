@@ -6,9 +6,26 @@ CLI: `panvar associate`
 
 Tests a phenotype against `describe` dosages across a pangenome region. For each unit it fits `phenotype ~ genotype + covariates`, applies a cohort minor-frequency filter and reports a test on the genotype term: a Student-t Wald test for quantitative traits or a Rao score test for binary traits. Phenotype type is auto-detected.
 
-`--unit` chooses the testing unit. Variant mode tests the structural-variant rows exported by `describe --variant-vcf`; feature mode tests individual k-mer, node and edge dosages. Both report raw Bonferroni and Benjamini–Hochberg (BH) summaries. A regional effective-test estimate (`Meff`) is also reported: Li–Ji from the variant genotype-correlation matrix when feasible, or the number of annotated bubble groups in feature mode. This estimate is useful but heuristic.
+### What is a unit
 
-To distinguish independent signals from correlated shadows, variant mode performs forward-stepwise conditional analysis, while feature mode conditions on its top feature with a collinearity guard. Quantitative analyses can also use kinship principal components (`--pca`) or an experimental linear mixed model (`--model lmm`) with an external kinship matrix.
+`--unit` chooses what a single test is about. Everything else in this page follows from that choice.
+
+| unit | one row is | comes from | gets |
+|------|-----------|------------|------|
+| `variant` | a structural variant | `describe --variant-vcf` | LD clumping, forward-stepwise conditioning, `svtype` / `gene` / `AF` |
+| `feature` | one k-mer, node or edge dosage | `describe`'s k-mer or graph substrate | conditioning on the single top feature, with a collinearity guard |
+
+### Which number to read
+
+Three multiple-testing summaries are reported, and they are not interchangeable:
+
+| column | use it for | guarantee |
+|--------|-----------|-----------|
+| `q_bh` | the headline result | Benjamini–Hochberg FDR, under its usual dependence assumptions. Start here |
+| `p_bonf` | a family-wise claim | genuine, and over-conservative in a region where units are correlated |
+| `p_bonf_meff` | a regional guide only | none. `Meff` is a heuristic estimate of how many independent tests the region really holds |
+
+Conditional analysis then separates independent signals from correlated shadows: variant mode runs forward-stepwise selection, feature mode conditions on its top feature. Quantitative analyses can additionally use kinship principal components (`--pca`) or an experimental linear mixed model (`--model lmm`), both of which need an external kinship matrix.
 
 Algorithm and worked trace: [algorithms/associate.md](../algorithms/associate.md).
 
