@@ -210,12 +210,31 @@ std::vector<BlockCall> genotype_sample(
         }
         max_copies_of[bi] = static_cast<std::size_t>(max_mult);
         const double broad_ll = -std::log(std::max(2.0, lambda * max_mult + 1.0));
+        // log_nb(o, mean) = G(o) + H(o, mean), where
+        //   G(o) = lgamma(o+phi) - lgamma(phi) - lgamma(o+1)   depends ONLY on the observation
+        //   H(o, mean) = phi*log(phi/(phi+mean)) + o*log(mean/(phi+mean))
+        // Every emission term is a DIFFERENCE of two log_nb at the same o, so G cancels exactly.
+        // Computing it was six lgamma calls per marker-pair summing to zero, and lgamma dominated
+        // the inner loop: at 457 candidates one block is ~100M evaluations.
+        auto nb_h = [&](double o, double mean) {
+            if (mean <= 0.0) mean = 1e-9;
+            if (phi <= 0.0 || !std::isfinite(phi)) return -mean + o * std::log(mean);
+            return phi * std::log(phi / (phi + mean)) + o * std::log(mean / (phi + mean));
+        };
         auto mix = [&](double o, double mean) {
             if (eps <= 0.0) return log_nb(o, mean, phi);
             const double a = std::log1p(-eps) + log_nb(o, mean, phi);
             const double b = std::log(eps) + broad_ll;
             const double hi = std::max(a, b);
             return hi + std::log(std::exp(a - hi) + std::exp(b - hi));
+        };
+
+        // The difference of two mixed likelihoods at one observation. Without the outlier component
+        // the G terms cancel and only H is needed; with it the mixture is not a plain difference and
+        // the full form is used, which is the price of that option rather than of every run.
+        auto mix_diff = [&](double o, double mean_a, double mean_b) {
+            if (eps <= 0.0) return nb_h(o, mean_a) - nb_h(o, mean_b);
+            return mix(o, mean_a) - mix(o, mean_b);
         };
 
         double baseline = 0.0;
@@ -482,7 +501,7 @@ std::vector<BlockCall> genotype_sample(
                 } else {
                     for (const auto& [slot, m] : tot) {
                         const double o = static_cast<double>(counts.node[slot]);
-                        ll += weight_of(slot) * (mix(o, scale * (lambda * m + mu)) - mix(o, mu));
+                        ll += weight_of(slot) * mix_diff(o, scale * (lambda * m + mu), mu);
                     }
                 }
                 // Outside the window the candidate is not scored: the reads say how much sequence is
