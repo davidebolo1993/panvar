@@ -1,4 +1,8 @@
 build/
+# Any CMake build tree at the root, not only the one called "build". A review build named
+# build_genotype_review was swept into a commit by `git add -A` -- 448 generated files, 75 MB --
+# and one directory name was all that stood between the rule and the repository.
+/build*/
 .DS_Store
 
 *.o
