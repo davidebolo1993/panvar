@@ -161,6 +161,13 @@ struct BlockCall {
     // block-local optimum, a large negative delta means it overrode strong local evidence, and a
     // block where the emission's own optimum is wrong while the call is right is linkage EARNING its
     // place. Counting only the overrides would price linkage without its benefit.
+    // The block-local emission optimum, exported from the production run itself. Obtaining it from
+    // a separate tau=0 counterfactual would perturb every block and, under the joint-depth model,
+    // feed changed first-pass calls back into depth estimation -- so the reference would not be
+    // comparable with the run it is meant to explain.
+    int local_best_a = -1;
+    int local_best_b = -1;
+    int local_best_ties = -1;
     int called_emission_rank = -1;
     double called_emission_delta = 0.0;   // called pair's emission minus the best pair's
     std::size_t block_index = 0;

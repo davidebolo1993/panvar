@@ -20,10 +20,18 @@ OUT="$OUT/run.$$.$(date +%s)"
 rm -rf "$OUT"; mkdir -p "$OUT"
 fails=0
 ok()  { printf "  ok   %s\n" "$1"; }
+bad_early() { printf "  FAIL %s\n" "$1"; exit 1; }
 bad() { printf "  FAIL %s\n" "$1"; fails=$((fails + 1)); }
 # value of <column> for the row whose block_index is <blk>, in a depth audit
 dep() { awk -F'\t' -v b="$2" -v w="$3" 'NR==1{for(i=1;i<=NF;i++)c[$i]=i;next}
         $(c["block_index"])==b{print $(c[w]); exit}' "$1"; }
+
+# The whole file is meaningless against a binary without the module. The dev build silently
+# reverted to PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE=OFF once, and every run after that reported
+# success while exercising nothing -- a wrong fix nearly shipped on it. Fail loudly and first.
+if ! "$BIN" genotype --help >/dev/null 2>&1; then
+  bad_early "this binary has no genotype module (configure with -DPANVAR_ENABLE_EXPERIMENTAL_GENOTYPE=ON); every assertion below would be vacuous"
+fi
 
 # Deterministic pseudo-random ACGT without python: a seeded linear congruential generator. The
 # sequences must be fixed across runs or the syncmer set, and therefore every count, would move.
@@ -428,6 +436,28 @@ else
   bad "--ledger-block wrote nothing for one of the two fixtures"
 fi
 
+# local_best_* is the emission's own optimum, taken from the production run. A tau=0 counterfactual
+# would perturb every block and feed changed first-pass calls back through joint-depth estimation,
+# so the reference would not be comparable with the run it explains.
+"$BIN" genotype -i "$OUT/g.gfa" -b "$OUT/bub" -r ref -o "$OUT/lb" -R "$OUT/reads.fa" \
+  --truth-haplotypes 'hapA1,hapB1' -q >/dev/null 2>&1
+if [ -s "$OUT/lb.genotypes.tsv" ]; then
+  bad_lb=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+           # where the call IS the emission optimum (rank 1, unique), local_best must equal the call
+           $(h["called_emission_rank"])+0==1 && $(h["local_best_ties"])+0==1 &&
+           ($(h["local_best_a"])!=$(h["allele1"]) || $(h["local_best_b"])!=$(h["allele2"])){k++}
+           END{print k+0}' "$OUT/lb.genotypes.tsv")
+  [ "$bad_lb" = "0" ] \
+    && ok "local_best_* agrees with the call wherever the call is the unique emission optimum" \
+    || bad "$bad_lb rows claim emission rank 1 with a unique optimum, but local_best differs from the call"
+  neg=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+        $(h["local_best_ties"])!="-1" && $(h["local_best_ties"])+0 < 1{k++} END{print k+0}' "$OUT/lb.genotypes.tsv")
+  [ "$neg" = "0" ] && ok "every scored block reports at least one pair at the emission optimum" \
+                   || bad "$neg scored blocks report fewer than one optimal pair"
+else
+  bad "the local_best fixture produced no genotypes"
+fi
+
 # --oracle-called-only reports nothing on its own; saying so beats writing an empty table.
 "$BIN" genotype -i "$OUT/g.gfa" -b "$OUT/bub" -r ref -o "$OUT/oco" -R "$OUT/reads.fa" \
   --oracle-called-only -q >"$OUT/oco.log" 2>&1
@@ -559,7 +589,7 @@ LK_INF=$(lk lk_i --max-linkage-emission-loss inf)
 # The defining property, asserted exactly rather than by eyeball: with tau, no reported call may sit
 # more than tau below its block's emission optimum. called_delta measures precisely that.
 worst_delta() { awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
-                { d=$(h["called_delta"]); if (d != "" && d < m) m = d } END{printf "%.6f", m+0}' "$1"; }
+                { d=$(h["called_emission_delta"]); if (d != "" && d < m) m = d } END{printf "%.6f", m+0}' "$1"; }
 for TAU in 0 0.25 2; do
   lk "lk_t$TAU" --max-linkage-emission-loss "$TAU" >/dev/null
   wd=$(worst_delta "$OUT/lk_t$TAU.genotypes.tsv")
@@ -579,7 +609,7 @@ done
   --truth-haplotypes 'hapA1,hapB1' --max-alleles 2 --max-linkage-emission-loss 0 -q >/dev/null 2>&1
 if [ -s "$OUT/lk_cap.genotypes.tsv" ]; then
   unscored=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
-             $(h["n_alleles"])+0 > 2 && $(h["called_rank"])+0 < 1 {k++} END{print k+0}' "$OUT/lk_cap.genotypes.tsv")
+             $(h["n_alleles"])+0 > 2 && $(h["called_emission_rank"])+0 < 1 {k++} END{print k+0}' "$OUT/lk_cap.genotypes.tsv")
   over=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next} $(h["n_alleles"])+0 > 2{k++} END{print k+0}' "$OUT/lk_cap.genotypes.tsv")
   [ "$over" -gt 0 ] \
     && ok "the cap fixture actually prunes: $over block(s) have more alleles than --max-alleles 2" \

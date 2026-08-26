@@ -861,6 +861,17 @@ std::vector<BlockCall> genotype_sample(
             }
             c.called_emission_rank = rank;
             c.called_emission_delta = cv - best;
+            // Which pair the emission alone would have chosen, and how many share that value.
+            int ties = 0, ba = -1, bb = -1;
+            for (std::size_t x = 0; x < kn; ++x) {
+                for (std::size_t y = x; y < kn; ++y) {
+                    if (emis[bi][x * kn + y] > best - 1e-9) {
+                        ++ties;
+                        if (ba < 0) { ba = static_cast<int>(kept[bi][x]); bb = static_cast<int>(kept[bi][y]); }
+                    }
+                }
+            }
+            c.local_best_a = ba; c.local_best_b = bb; c.local_best_ties = ties;
         }
 
         // How much sequence the reads say is here, measured without reference to the panel's allele
@@ -1068,7 +1079,8 @@ void write_genotypes(
          "\tallele1\tallele2\thaplotype1\thaplotype2\thap_posterior\tgq\texplained\tdetected"
          "\tcalled_bp\tmass_bp\tmass_bp_sd\tcov_bp\tno_marker_alleles\tmax_copies\tblock_class"
          "\tevidence\tfilter\ttruth1\ttruth2\ttruth_rank\ttruth_delta\ttruth_ties"
-          "\tn_scored_alleles\tcalled_rank\tcalled_delta\trank_target\tinfluencers\n";
+          "\tn_scored_alleles\tcalled_emission_rank\tcalled_emission_delta"
+          "\tlocal_best_a\tlocal_best_b\tlocal_best_ties\trank_target\tinfluencers\n";
     for (std::size_t bi = 0; bi < calls.size(); ++bi) {
         const BlockCall& c = calls[bi];
         g << c.block_index << '\t'
@@ -1088,7 +1100,8 @@ void write_genotypes(
           << c.truth_allele1 << '\t' << c.truth_allele2 << '\t' << c.truth_emission_rank << '\t'
           << c.truth_emission_delta << '\t' << c.truth_emission_ties << '\t'
           << c.n_scored_alleles << '\t' << c.called_emission_rank << '\t'
-          << c.called_emission_delta << '\t' << (probe_target ? "probe" : "truth") << '\t';
+          << c.called_emission_delta << '\t' << c.local_best_a << '\t' << c.local_best_b
+          << '\t' << c.local_best_ties << '\t' << (probe_target ? "probe" : "truth") << '\t';
         for (std::size_t k = 0; k < c.influencers.size(); ++k) {
             if (k) g << ',';
             g << c.influencers[k];
