@@ -509,6 +509,64 @@ probe_refuses "1:0,1,2"   "exactly BLOCK"       "a third field"
 probe_refuses "1:x,1"     "whole number"        "a non-numeric allele"
 probe_refuses "1:0,1junk" "whole number"        "trailing junk"
 
+# ------------------------------------------------- --noiseless-counts, and the control it must pass
+# The flag rewrites one block's marker counts to lambda*(m1+m2)+mu -- the emission's OWN mean for a
+# stated pair. A negative binomial is maximised at mean == observation, so when the source pair is in
+# the panel the emission MUST rank it first and alone. That is not a property of this fixture, it is
+# what makes the likelihood a likelihood, and it is the control that makes the off-panel form of the
+# probe interpretable: if this fails, a bad rank on truth-sourced counts proves nothing.
+nl_run() {   # $1 = out tag, rest = flags
+  local tag="$1"; shift
+  "$BIN" genotype -i "$OUT/g.gfa" -b "$OUT/bub" -r ref -o "$OUT/$tag" -R "$OUT/reads.fa" \
+    --truth-haplotypes 'hapA1,hapB1' "$@" -q >"$OUT/$tag.log" 2>&1
+}
+nl_field() { awk -F'\t' -v b="$2" -v c="$3" 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+                                             $1==b{print $(h[c]); exit}' "$1"; }
+# Probe the pair the counts were built from. Any block with >= 2 alleles will do; block 1 has them.
+nl_run nlc --noiseless-counts 1:0,1 --probe-pair 1:0,1
+if [ -s "$OUT/nlc.genotypes.tsv" ]; then
+  r=$(nl_field "$OUT/nlc.genotypes.tsv" 1 truth_rank)
+  t=$(nl_field "$OUT/nlc.genotypes.tsv" 1 truth_ties)
+  { [ "$r" = "1" ] && [ "$t" = "1" ]; } \
+    && ok "noiseless on-panel control: the source pair is the unique emission optimum" \
+    || bad "noiseless control failed: source pair ranks $r with $t ties -- the emission is not maximised at its own mean"
+else
+  bad "--noiseless-counts 1:0,1 produced no genotypes (see $OUT/nlc.log)"
+fi
+# Absent, it must change nothing. A diagnostic that perturbs the default path is worse than none.
+nl_run nlb
+nl_run nlp --probe-pair 1:0,1
+if [ -s "$OUT/nlb.genotypes.tsv" ] && [ -s "$OUT/nlp.genotypes.tsv" ]; then
+  c1=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}{print $(h["allele1"])","$(h["allele2"])}' "$OUT/nlb.genotypes.tsv" | tr '\n' ' ')
+  c2=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}{print $(h["allele1"])","$(h["allele2"])}' "$OUT/nlp.genotypes.tsv" | tr '\n' ' ')
+  [ "$c1" = "$c2" ] && ok "omitting --noiseless-counts leaves the calls untouched" \
+                    || bad "calls differ with the flag absent: the probe is not inert by default"
+else
+  bad "the --noiseless-counts baseline runs produced no genotypes"
+fi
+# The refusals. Each one is a combination whose result would be uninterpretable rather than merely
+# wrong: noiseless node counts mixed with observed edges or observed coverage attribute nothing.
+nl_refuses() {
+  "$BIN" genotype -i "$OUT/g.gfa" -b "$OUT/bub" -r ref -o "$OUT/nx" -R "$OUT/reads.fa" \
+    --truth-haplotypes 'hapA1,hapB1' $1 -q >"$OUT/nx.log" 2>&1
+  if [ $? -ne 0 ] && grep -qi "$2" "$OUT/nx.log"; then ok "--noiseless-counts rejects $3"
+  else bad "--noiseless-counts accepted $3 (exit $?), which would silently mix evidence"; fi
+}
+nl_refuses "--noiseless-counts 1 --edge-weight 0.5" "adjacency"      "a nonzero edge weight"
+nl_refuses "--noiseless-counts 1 --evidence coverage" "coverage"     "alignment coverage evidence"
+nl_refuses "--noiseless-counts 99"                  "out of range"   "a block index past the end"
+nl_refuses "--noiseless-counts 1:0,99"              "allele out of range" "an allele index past the end"
+nl_refuses "--noiseless-counts 1:0,1,2"             "BLOCK"          "a third field"
+nl_refuses "--noiseless-counts x"                   "whole number"   "a non-numeric block"
+# Truth-sourced form without a truth to source from.
+"$BIN" genotype -i "$OUT/g.gfa" -b "$OUT/bub" -r ref -o "$OUT/nx2" -R "$OUT/reads.fa" \
+  --noiseless-counts 1 -q >"$OUT/nx2.log" 2>&1
+if [ $? -ne 0 ] && grep -qi "truth-haplotypes" "$OUT/nx2.log"; then
+  ok "--noiseless-counts <BLK> refuses without --truth-haplotypes"
+else
+  bad "--noiseless-counts <BLK> ran with no truth to take counts from (exit $?)"
+fi
+
 # ----------------------------------- the certified oracle's edit columns, and which row owns them
 # excess_total_edits is (called - best) EDITS, and only the edit_distance row's `best` minimises
 # edits. On this fixture the length_error row's "best" pair sits 69 edits from truth while the

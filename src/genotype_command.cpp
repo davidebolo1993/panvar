@@ -215,6 +215,21 @@ void print_genotype_help() {
         << "                              unrepresentable block is not the truth; this asks which\n"
         << "                              stage lost it. truth_rank -2 means pruned before scoring.\n"
         << "                              DIAGNOSTIC: the truth_* columns then describe the probe\n"
+        << "      --noiseless-counts <BLK|BLK:A,B>\n"
+        << "                              Replace block BLK's observed marker counts with the counts a\n"
+        << "                              pair would produce with NO read noise: lambda*(m1+m2)+mu at\n"
+        << "                              every marker, rounded. With BLK alone the source is this\n"
+        << "                              sample's truth haplotypes (needs --truth-haplotypes), which\n"
+        << "                              under leave-one-out is OFF-PANEL -- that is the point, it is\n"
+        << "                              what tests the emission's geometry on a projection. With\n"
+        << "                              BLK:A,B it is panel alleles A and B, an on-panel control the\n"
+        << "                              emission must rank first if it is a proper likelihood.\n"
+        << "                              Removes read sampling, sequencing error and count noise, so\n"
+        << "                              a wrong answer here is the model, not the reads. Rejected\n"
+        << "                              with --edge-weight or --evidence other than syncmer, since\n"
+        << "                              adjacency and coverage counts are NOT synthesized and mixing\n"
+        << "                              them with noiseless nodes would attribute nothing.\n"
+        << "                              DIAGNOSTIC: the run no longer describes these reads\n"
         << "      --max-linkage-emission-loss <F|inf>\n"
         << "                              How much block-local emission a state may give up and\n"
         << "                              still be reachable by the chain. States losing more than F\n"
@@ -282,6 +297,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
     // admits every state tied with the block optimum, which is a real and useful setting.
     double max_linkage_loss = std::numeric_limits<double>::infinity();
     long probe_block = -1; long probe_a = -1, probe_b = -1;
+    // --noiseless-counts. `noiseless_a/b` stay -1 when the source is the sample's own truth.
+    long noiseless_block = -1; long noiseless_a = -1, noiseless_b = -1;
     bool oracle_called_only = false;
     bool depth_calibration = false;
     double mass_weight = 0.0;
@@ -398,6 +415,43 @@ int run_genotype_command(const std::vector<std::string>& args) {
             probe_a = whole(v.substr(c + 1, m - c - 1));
             probe_b = whole(v.substr(m + 1));
         }
+        else if (arg == "--noiseless-counts") {
+            // BLOCK, or BLOCK:A,B -- replace this block's observed marker counts with the counts a
+            // stated allele pair would produce with no read noise, then run the ordinary pipeline.
+            // The point is to score the SAME emission on data it cannot blame: if it still prefers
+            // the wrong pair, no amount of read work can help.
+            const std::string v = require_value(arg);
+            const std::size_t c = v.find(':');
+            const auto whole = [&](const std::string& t) {
+                if (t.empty())
+                    throw std::runtime_error("--noiseless-counts has an empty field in '" + v + "'");
+                std::size_t used = 0;
+                long n = 0;
+                try {
+                    n = std::stol(t, &used);
+                } catch (const std::exception&) {
+                    throw std::runtime_error("--noiseless-counts: '" + t + "' is not a whole number");
+                }
+                if (used != t.size())
+                    throw std::runtime_error("--noiseless-counts: '" + t + "' is not a whole number");
+                if (n < 0) throw std::runtime_error("--noiseless-counts indices must be >= 0");
+                return n;
+            };
+            if (c == std::string::npos) {
+                noiseless_block = whole(v);          // source = this sample's truth haplotypes
+            } else {
+                const std::size_t m = v.find(',');
+                if (m == std::string::npos || m < c ||
+                    v.find(':', c + 1) != std::string::npos ||
+                    v.find(',', m + 1) != std::string::npos) {
+                    throw std::runtime_error("--noiseless-counts wants BLOCK or BLOCK:A,B "
+                                             "(e.g. 13, or 13:271,304)");
+                }
+                noiseless_block = whole(v.substr(0, c));
+                noiseless_a = whole(v.substr(c + 1, m - c - 1));
+                noiseless_b = whole(v.substr(m + 1));
+            }
+        }
         else if (arg == "--max-linkage-emission-loss") {
             const std::string v = require_value(arg);
             if (v == "inf" || v == "INF" || v == "infinity") {
@@ -487,6 +541,29 @@ int run_genotype_command(const std::vector<std::string>& args) {
     if (oracle_called_only && !certified_oracle) {
         throw std::runtime_error("genotype: --oracle-called-only only means anything with "
                                  "--certified-oracle; on its own it reports nothing");
+    }
+    if (noiseless_block >= 0) {
+        // It replaces counts, so there must be counts to replace: the panel, the depth model and phi
+        // are all built from the reads and only the named block's node counts are overwritten.
+        if (read_paths.empty()) {
+            throw std::runtime_error("genotype: --noiseless-counts replaces the counts at one block "
+                                     "and needs the rest of the run to be real; pass -R/--reads");
+        }
+        if (noiseless_a < 0 && truth_haplotypes.empty()) {
+            throw std::runtime_error("genotype: --noiseless-counts <BLK> takes its counts from this "
+                                     "sample's truth; pass --truth-haplotypes, or name a panel pair "
+                                     "with --noiseless-counts <BLK:A,B>");
+        }
+        if (edge_weight != 0.0) {
+            throw std::runtime_error("genotype: --noiseless-counts does not synthesize adjacency "
+                                     "counts, so with --edge-weight the emission would mix noiseless "
+                                     "nodes with observed edges and attribute nothing");
+        }
+        if (evidence != "syncmer") {
+            throw std::runtime_error("genotype: --noiseless-counts does not synthesize alignment "
+                                     "coverage, so with --evidence " + evidence + " the emission "
+                                     "would mix noiseless counts with observed coverage");
+        }
     }
     if (!audit && !audit_linkage && read_paths.empty() && index_out.empty() && ledger_block < 0 &&
         alleles_out.empty()) {
@@ -1241,7 +1318,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 log.wrote({out_prefix + ".nodecov.sample.tsv", out_prefix + ".nodecov.panel.tsv"});
             }
 
-            const ReadCounts rc = count_reads(read_paths, read_panel, options.threads);
+            ReadCounts rc = count_reads(read_paths, read_panel, options.threads);
             log.info("reads: " + std::to_string(rc.reads) + " (" + std::to_string(rc.bases / 1000) +
                      " kb); " + std::to_string(rc.syncmers) + " syncmers, " +
                      std::to_string(100 * rc.matched_syncmers / std::max<std::uint64_t>(1, rc.syncmers)) +
@@ -1602,6 +1679,114 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 log.info("evidence " + evidence + ": coverage at " + std::to_string(n_used) + " of " +
                          std::to_string(chain.size()) + " blocks, lambda " + std::to_string(cev.lambda) +
                          " from " + std::to_string(anchor_cov.size()) + " invariant nodes");
+            }
+            // ---- --noiseless-counts -----------------------------------------------------------
+            // Overwrite one block's observed marker counts with what a stated pair would produce at
+            // this sample's depth with no read noise. Everything else -- panel, depth model, pruning,
+            // emission, chain -- is the production path untouched, so a wrong call afterwards cannot
+            // be charged to read sampling, sequencing error or marker acquisition.
+            //
+            // The counts are written as lambda*(m1+m2)+mu, which is exactly the emission's own mean
+            // for that pair. A per-marker negative binomial is maximised at mean == observation, so a
+            // proper likelihood MUST rank the source pair first when it is in the panel. That is why
+            // the BLK:A,B form exists: it is a control the model cannot fail for an honest reason.
+            if (noiseless_block >= 0) {
+                const std::size_t nbi = static_cast<std::size_t>(noiseless_block);
+                if (nbi >= chain.size())
+                    throw std::runtime_error("--noiseless-counts block " +
+                                             std::to_string(noiseless_block) +
+                                             " is out of range (chain has " +
+                                             std::to_string(chain.size()) + " blocks)");
+                // lambda exactly as the emission reads it (genotype.cpp), so the injected counts and
+                // the means they are compared against come from one number, not two.
+                const double lambda = depth[nbi].usable ? depth[nbi].lambda_hap : 1.0;
+                double lam = 0.0;
+                std::size_t nlam = 0;
+                for (const BlockDepth& d : depth) { if (d.usable) { lam += d.lambda_hap; ++nlam; } }
+                lam = nlam ? lam / static_cast<double>(nlam) : 1.0;
+                const double mu = gopt.error_background > 0.0 ? gopt.error_background
+                                                              : std::max(0.01, 0.02 * lam);
+
+                // The two source sequences.
+                std::string src1, src2;
+                std::string src_desc;
+                if (noiseless_a >= 0) {
+                    const std::size_t na = blocks[nbi].allele_seq.size();
+                    if (static_cast<std::size_t>(noiseless_a) >= na ||
+                        static_cast<std::size_t>(noiseless_b) >= na)
+                        throw std::runtime_error("--noiseless-counts allele out of range: block " +
+                                                 std::to_string(noiseless_block) + " has " +
+                                                 std::to_string(na) + " alleles, asked for (" +
+                                                 std::to_string(noiseless_a) + "," +
+                                                 std::to_string(noiseless_b) + ")");
+                    src1 = blocks[nbi].allele_seq[static_cast<std::size_t>(noiseless_a)];
+                    src2 = blocks[nbi].allele_seq[static_cast<std::size_t>(noiseless_b)];
+                    src_desc = "panel pair (" + std::to_string(noiseless_a) + "," +
+                               std::to_string(noiseless_b) + ")";
+                } else {
+                    // The truth's own spelled sequence, which under leave-one-out is off-panel.
+                    // Traversal is what decides availability: an empty string is a legitimate
+                    // deletion allele and must not read as missing data.
+                    if (nbi >= tav1.size() || (!tav1[nbi] && !tav2[nbi]))
+                        throw std::runtime_error("--noiseless-counts <BLK>: neither truth haplotype "
+                                                 "traverses block " + std::to_string(noiseless_block));
+                    src1 = ts1[nbi];
+                    src2 = ts2[nbi];
+                    src_desc = "the truth haplotypes";
+                }
+
+                // Marker multiplicity of a sequence, extracted exactly as the panel extracted its
+                // alleles'. A code the panel never kept as a marker has no slot and is dropped, which
+                // is the same thing that happens to it in a real read.
+                std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> slot_of;
+                slot_of.reserve(read_panel.node_codes.size() * 2);
+                for (std::size_t s = 0; s < read_panel.node_codes.size(); ++s) {
+                    slot_of[read_panel.node_codes[s]].push_back(static_cast<std::uint32_t>(s));
+                }
+                std::unordered_map<std::uint32_t, std::uint32_t> mult;
+                const auto add = [&](const std::string& seq) {
+                    if (seq.empty()) return;
+                    const std::vector<KmerOccurrence> sy =
+                        read_panel.all_kmers
+                            ? collect_canonical_kmer_occurrences(seq, read_panel.kmer_size)
+                            : collect_syncmers(seq, read_panel.kmer_size, read_panel.syncmer_s);
+                    for (const KmerOccurrence& o : sy) {
+                        const auto it = slot_of.find(o.code);
+                        if (it == slot_of.end()) continue;
+                        for (const std::uint32_t s : it->second) ++mult[s];
+                    }
+                };
+                add(src1);
+                add(src2);
+
+                // Every marker of the block, not only the ones the source carries: a marker the pair
+                // lacks is predicted at mu, and writing mu there is what makes the source the
+                // per-marker maximum. Leaving the observed count would keep the veto the probe exists
+                // to remove.
+                std::vector<std::uint32_t> universe;
+                for (const auto& mset : read_panel.by_block[nbi]) {
+                    for (const auto& [slot, m] : mset.nodes) { (void)m; universe.push_back(slot); }
+                }
+                std::sort(universe.begin(), universe.end());
+                universe.erase(std::unique(universe.begin(), universe.end()), universe.end());
+                double before = 0.0, after = 0.0;
+                for (const std::uint32_t s : universe) {
+                    const auto it = mult.find(s);
+                    const double m = it == mult.end() ? 0.0 : static_cast<double>(it->second);
+                    before += rc.node[s];
+                    const double want = lambda * m + mu;
+                    // Counts are integers, so the injection is noiseless only up to rounding -- at
+                    // most half a count per marker, against a lambda of tens.
+                    rc.node[s] = static_cast<std::uint32_t>(std::max<long long>(0, std::llround(want)));
+                    after += rc.node[s];
+                }
+                log.info("NOISELESS: block " + std::to_string(noiseless_block) + ", " +
+                         std::to_string(universe.size()) + " markers rewritten from " + src_desc +
+                         " at lambda " + std::to_string(lambda) + ", mu " + std::to_string(mu) +
+                         "; total marker mass " + std::to_string(static_cast<long long>(before)) +
+                         " -> " + std::to_string(static_cast<long long>(after)));
+                log.info("NOISELESS: this run no longer describes the supplied reads at block " +
+                         std::to_string(noiseless_block));
             }
             // Applied before the FIRST call, which always runs: the joint-depth refinement below
             // fires only under some depth conditions, so patching it there made the flag inert
