@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
 
 #include <iostream>
 #include <stdexcept>
@@ -214,7 +215,18 @@ void print_genotype_help() {
         << "                              certified oracle names the best REACHABLE pair, which at an\n"
         << "                              unrepresentable block is not the truth; this asks which\n"
         << "                              stage lost it. truth_rank -2 means pruned before scoring.\n"
-        << "                              DIAGNOSTIC: the truth_* columns then describe the probe\n"
+        << "                              DIAGNOSTIC: the truth_* columns then describe the probe.\n"
+        << "                              REPEATABLE: every occurrence adds a row to\n"
+        << "                              <prefix>.probe_pairs.tsv (rank, ties, delta, raw score);\n"
+        << "                              the FIRST also redirects the truth_* columns as above, so\n"
+        << "                              adding a probe cannot change what an earlier one reported.\n"
+        << "                              Probing costs nothing -- the emission matrix already exists\n"
+        << "                              -- which is how a FIXED reference pair can be scored in\n"
+        << "                              every arm of an experiment. Needed because `delta` is\n"
+        << "                              measured against the block optimum and the optimum MOVES\n"
+        << "                              when the counts do: deltas from different runs are not on a\n"
+        << "                              common scale, but two pairs probed in the same run are,\n"
+        << "                              since the block baseline is common to both and cancels\n"
         << "      --noiseless-counts <BLK|BLK:A,B>\n"
         << "                              Replace block BLK's observed marker counts with the counts a\n"
         << "                              pair would produce with NO read noise: lambda*(m1+m2)+mu at\n"
@@ -234,6 +246,16 @@ void print_genotype_help() {
         << "                              adjacency and coverage counts are NOT synthesized and mixing\n"
         << "                              them with noiseless nodes would attribute nothing.\n"
         << "                              DIAGNOSTIC: the run no longer describes these reads\n"
+        << "      --noiseless-scope <all|present|absent>\n"
+        << "                              Which half of the block's markers --noiseless-counts\n"
+        << "                              rewrites: those the source pair carries, those it does not,\n"
+        << "                              or both (default all). The other half keeps its observed\n"
+        << "                              counts. Splitting it is what makes the diagnosis causal --\n"
+        << "                              if `absent` alone reproduces the damage, the defect is in\n"
+        << "                              how unsupported markers are scored. Note `absent` writes 0,\n"
+        << "                              not mu: counts are integers and mu is well under 1, so this\n"
+        << "                              is the SHARPEST possible absent reading, sharper than real\n"
+        << "                              reads which scatter stray counts there\n"
         << "      --max-linkage-emission-loss <F|inf>\n"
         << "                              How much block-local emission a state may give up and\n"
         << "                              still be reachable by the chain. States losing more than F\n"
@@ -303,6 +325,13 @@ int run_genotype_command(const std::vector<std::string>& args) {
     long probe_block = -1; long probe_a = -1, probe_b = -1;
     // --noiseless-counts. `noiseless_a/b` stay -1 when the source is the sample's own truth.
     long noiseless_block = -1; long noiseless_a = -1, noiseless_b = -1;
+    // Which half of the marker set the injection rewrites. Splitting it is what turns "noiseless is
+    // worse" into a causal statement: if rewriting only the markers the source LACKS reproduces the
+    // damage, the defect is in how absent markers are scored.
+    std::string noiseless_scope = "all";       // all | present | absent
+    // Every --probe-pair, in order. The first also redirects the truth_* columns, which is what the
+    // single-probe form has always done; all of them appear in the probe table.
+    std::vector<std::array<std::size_t, 3>> probe_pairs;
     bool oracle_called_only = false;
     bool depth_calibration = false;
     double mass_weight = 0.0;
@@ -415,9 +444,15 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 if (n < 0) throw std::runtime_error("--probe-pair indices must be >= 0");
                 return n;
             };
-            probe_block = whole(v.substr(0, c));
-            probe_a = whole(v.substr(c + 1, m - c - 1));
-            probe_b = whole(v.substr(m + 1));
+            const long pb = whole(v.substr(0, c));
+            const long pa = whole(v.substr(c + 1, m - c - 1));
+            const long pbb = whole(v.substr(m + 1));
+            // Repeatable. The first occurrence keeps the historical behaviour of pointing the truth_*
+            // columns at the pair; later ones only add rows to the probe table, so adding a second
+            // probe cannot silently change what the first one reported.
+            if (probe_block < 0) { probe_block = pb; probe_a = pa; probe_b = pbb; }
+            probe_pairs.push_back({static_cast<std::size_t>(pb), static_cast<std::size_t>(pa),
+                                   static_cast<std::size_t>(pbb)});
         }
         else if (arg == "--noiseless-counts") {
             // BLOCK, or BLOCK:A,B -- replace this block's observed marker counts with the counts a
@@ -455,6 +490,11 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 noiseless_a = whole(v.substr(c + 1, m - c - 1));
                 noiseless_b = whole(v.substr(m + 1));
             }
+        }
+        else if (arg == "--noiseless-scope") {
+            noiseless_scope = require_value(arg);
+            if (noiseless_scope != "all" && noiseless_scope != "present" && noiseless_scope != "absent")
+                throw std::runtime_error("genotype: --noiseless-scope must be all|present|absent");
         }
         else if (arg == "--max-linkage-emission-loss") {
             const std::string v = require_value(arg);
@@ -1773,22 +1813,45 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 }
                 std::sort(universe.begin(), universe.end());
                 universe.erase(std::unique(universe.begin(), universe.end()), universe.end());
-                double before = 0.0, after = 0.0;
+                // Split by whether the SOURCE carries the marker, so each half can be rewritten on
+                // its own. A marker the source lacks is predicted at mu, and mu is well under 1, so
+                // rounding sends it to exactly 0 -- the sharpest possible "absent" reading, and
+                // sharper than any real read pile-up, which scatters stray counts there. That is the
+                // asymmetry the `absent` scope exists to test, and it is worth being precise about:
+                // the treatment is "set to zero", not "set to mu", because counts are integers.
+                std::size_t n_pres = 0, n_abs = 0;
+                double pres_before = 0.0, pres_after = 0.0, abs_before = 0.0, abs_after = 0.0;
                 for (const std::uint32_t s : universe) {
                     const auto it = mult.find(s);
                     const double m = it == mult.end() ? 0.0 : static_cast<double>(it->second);
-                    before += rc.node[s];
-                    const double want = lambda * m + mu;
-                    // Counts are integers, so the injection is noiseless only up to rounding -- at
-                    // most half a count per marker, against a lambda of tens.
-                    rc.node[s] = static_cast<std::uint32_t>(std::max<long long>(0, std::llround(want)));
-                    after += rc.node[s];
+                    const bool present = m > 0.0;
+                    if (present) { ++n_pres; pres_before += rc.node[s]; }
+                    else         { ++n_abs;  abs_before  += rc.node[s]; }
+                    const bool rewrite = noiseless_scope == "all" ||
+                                         (noiseless_scope == "present" && present) ||
+                                         (noiseless_scope == "absent" && !present);
+                    if (rewrite) {
+                        const double want = lambda * m + mu;
+                        // Counts are integers, so the injection is noiseless only up to rounding --
+                        // at most half a count per marker, against a lambda of tens.
+                        rc.node[s] =
+                            static_cast<std::uint32_t>(std::max<long long>(0, std::llround(want)));
+                    }
+                    if (present) pres_after += rc.node[s];
+                    else         abs_after  += rc.node[s];
                 }
-                log.info("NOISELESS: block " + std::to_string(noiseless_block) + ", " +
-                         std::to_string(universe.size()) + " markers rewritten from " + src_desc +
-                         " at lambda " + std::to_string(lambda) + ", mu " + std::to_string(mu) +
-                         "; total marker mass " + std::to_string(static_cast<long long>(before)) +
-                         " -> " + std::to_string(static_cast<long long>(after)));
+                const auto mass = [](double v) {
+                    return std::to_string(static_cast<long long>(v));
+                };
+                log.info("NOISELESS: block " + std::to_string(noiseless_block) + ", scope " +
+                         noiseless_scope + ", source " + src_desc + ", lambda " +
+                         std::to_string(lambda) + ", mu " + std::to_string(mu));
+                log.info("NOISELESS:   markers the source carries: " + std::to_string(n_pres) +
+                         ", mass " + mass(pres_before) + " -> " + mass(pres_after));
+                log.info("NOISELESS:   markers it does not:        " + std::to_string(n_abs) +
+                         ", mass " + mass(abs_before) + " -> " + mass(abs_after) +
+                         (noiseless_scope == "all" || noiseless_scope == "absent"
+                              ? "  (rewritten to 0, not to mu: counts are integers and mu < 1)" : ""));
                 log.info("NOISELESS: this run no longer describes the supplied reads at block " +
                          std::to_string(noiseless_block));
             }
@@ -1816,10 +1879,12 @@ int run_genotype_command(const std::vector<std::string>& args) {
                          "the pair (" + std::to_string(probe_a) + "," + std::to_string(probe_b) +
                          "), NOT this sample's truth");
             }
+            gopt.probe_pairs = probe_pairs;
+            std::vector<ProbePairResult> probe_rows;
             std::vector<BlockCall> calls =
                 genotype_sample(chain, blocks, read_panel, rc, depth, hap_names, gopt, &gsum,
                                 pa1.empty() ? nullptr : &pa1, pa2.empty() ? nullptr : &pa2,
-                                evidence == "syncmer" ? nullptr : &cev);
+                                evidence == "syncmer" ? nullptr : &cev, &probe_rows);
 
             if (model_pangenie) {
                 // Same panel, same counts, same depth -- only the model differs, which is the whole
@@ -1881,10 +1946,13 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     // is exactly the case the joint pass exists for -- so the flag appeared to have no
                     // effect at precisely those loci. Passing ta instead of pa did the same to the
                     // emission-rank diagnostics.
+                    // The second pass supersedes the first, so the probe table must describe THIS
+                    // run and not hold both. Appending would silently double every row.
+                    probe_rows.clear();
                     calls = genotype_sample(chain, blocks, read_panel, rc, depth, hap_names, gopt,
                                             &gsum, pa1.empty() ? nullptr : &pa1,
                                             pa2.empty() ? nullptr : &pa2,
-                                            evidence == "syncmer" ? nullptr : &cev);
+                                            evidence == "syncmer" ? nullptr : &cev, &probe_rows);
                     log_depth_provenance(log, chain, depth);
                 }
             }
@@ -1918,6 +1986,31 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 }
             }
             write_genotypes(out_prefix, chain, blocks, calls, hap_names, probe_block >= 0);
+
+            // The probe table. One row per --probe-pair, in the order given. `score` is raw and only
+            // comparable within this run; `delta` is against this run's block optimum, which moves
+            // when the counts do -- so to compare arms of an experiment, probe a FIXED reference pair
+            // in every arm and take the difference of the two deltas, where the baseline cancels.
+            if (!probe_pairs.empty()) {
+                const std::string pp_path = out_prefix + ".probe_pairs.tsv";
+                std::ofstream pf(pp_path);
+                if (!pf) throw std::runtime_error("genotype: cannot write " + pp_path);
+                pf << "block_index\tallele1\tallele2\trank\tties\tn_scored\tdelta\tscore\n";
+                pf.setf(std::ios::fixed);
+                for (const ProbePairResult& r : probe_rows) {
+                    pf << r.block_index << '\t' << r.allele1 << '\t' << r.allele2 << '\t'
+                       << r.rank << '\t' << r.ties << '\t' << r.n_scored << '\t';
+                    // rank -2 means pruned before scoring: there is no emission, so a number in the
+                    // score columns would be read as one.
+                    if (r.rank == -2) pf << "NA\tNA\n";
+                    // Ten decimals, not six. These numbers exist to be SUBTRACTED across runs -- a
+                    // factorial design takes four of them -- and at scores in the thousands, six
+                    // decimals leaves rounding noise the size of the effect being measured.
+                    else pf << std::setprecision(10) << r.delta << '\t'
+                            << std::setprecision(10) << r.score << '\n';
+                }
+                log.wrote({pp_path});
+            }
 
             if (!truth_haplotypes.empty()) {
                 const auto comma = truth_haplotypes.find(',');

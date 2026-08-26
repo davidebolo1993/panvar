@@ -3,6 +3,7 @@
 #include "panvar/genotype_blocks.hpp"
 #include "panvar/genotype_reads.hpp"
 
+#include <array>
 #include <cstddef>
 #include <limits>
 #include <map>
@@ -46,6 +47,13 @@ struct GenotypeOptions {
     // other block too, so the neighbouring emissions the chain sees change as well and a difference
     // at the block under study cannot be attributed to it. Keyed by chain index.
     std::map<std::size_t, std::size_t> max_alleles_override;
+    // Allele pairs to report the emission's opinion of, beyond the truth's. Each becomes one row of
+    // the probe table. The emission matrix is already built, so a probe is a lookup and costs nothing
+    // per pair -- which is what makes it possible to score a FIXED reference pair in every arm of an
+    // experiment. That matters: `delta` is measured against the block optimum, and the optimum moves
+    // between arms, so deltas from different arms are not on a common scale. The difference between
+    // two pairs probed in the SAME arm is, because the block's baseline is common to both and cancels.
+    std::vector<std::array<std::size_t, 3>> probe_pairs;   // {block index, allele a, allele b}
     // Score the block's TOTAL count as its own term, at its own effective sample size (fragments over
     // the block, not markers), with each pair's overall scale profiled out of the per-marker product so
     // the two do not double count.
@@ -250,6 +258,25 @@ struct BlockCall {
     std::string provenance = "none";
 };
 
+// One row of the probe table: what the block's emission thinks of a named allele pair.
+struct ProbePairResult {
+    std::size_t block_index = 0;
+    std::size_t allele1 = 0;
+    std::size_t allele2 = 0;
+    // -2 means the pair was pruned before scoring and has no emission at all. That is a finding, not
+    // a missing value, and it must never be confused with rank 1.
+    int rank = -2;
+    int ties = 0;
+    int n_scored = 0;
+    // score - (the block's best scored pair). Zero means this pair IS the optimum.
+    double delta = 0.0;
+    // The raw emission value. Comparable only between pairs within ONE run: it carries the block's
+    // baseline over the full marker universe, which is computed from the observed counts and so
+    // shifts whenever the counts do. Differences across runs are meaningless; differences between
+    // two pairs of the same run are exactly the contrast the baseline cancels out of.
+    double score = 0.0;
+};
+
 struct GenotypeSummary {
     std::size_t blocks = 0;
     std::size_t called = 0;
@@ -276,7 +303,8 @@ std::vector<BlockCall> genotype_sample(
     GenotypeSummary* summary = nullptr,
     const std::vector<int>* truth_allele1 = nullptr,
     const std::vector<int>* truth_allele2 = nullptr,
-    const CoverageEvidence* coverage = nullptr);
+    const CoverageEvidence* coverage = nullptr,
+    std::vector<ProbePairResult>* probes = nullptr);
 
 // `probe_target` records whether the truth_* columns describe this sample's truth or a pair supplied
 // by --probe-pair, so a diagnostic run can never be mistaken for a scored one downstream.

@@ -54,7 +54,8 @@ std::vector<BlockCall> genotype_sample(
     GenotypeSummary* summary,
     const std::vector<int>* truth_allele1,
     const std::vector<int>* truth_allele2,
-    const CoverageEvidence* coverage) {
+    const CoverageEvidence* coverage,
+    std::vector<ProbePairResult>* probes) {
 
     const std::size_t nb = chain.size();
     const std::size_t nh = haplotype_names.size();
@@ -745,6 +746,51 @@ std::vector<BlockCall> genotype_sample(
                     detected[bi][x * kn + y] = detected[bi][sx * kn + sy];
                 }
             }
+        }
+    }
+
+    // The probe table: the emission's opinion of any pair the caller names. Uses the same triangle
+    // and the same tie tolerance as the truth ranking below, so a probe of the truth pair and the
+    // truth columns cannot disagree. `score` is the raw value, which is comparable only against other
+    // pairs of THIS run -- it carries the block baseline, and the baseline is built from the counts.
+    if (probes != nullptr && !options.probe_pairs.empty()) {
+        for (const auto& pp : options.probe_pairs) {
+            ProbePairResult r;
+            r.block_index = pp[0];
+            r.allele1 = pp[1];
+            r.allele2 = pp[2];
+            if (pp[0] >= nb || kept[pp[0]].empty()) { probes->push_back(r); continue; }
+            const std::size_t bi = pp[0];
+            const auto xi = std::find(kept[bi].begin(), kept[bi].end(),
+                                      static_cast<std::uint32_t>(pp[1]));
+            const auto yi = std::find(kept[bi].begin(), kept[bi].end(),
+                                      static_cast<std::uint32_t>(pp[2]));
+            r.n_scored = static_cast<int>(kept[bi].size());
+            // rank stays -2: the pair was pruned before scoring, which is a finding of its own.
+            if (xi == kept[bi].end() || yi == kept[bi].end()) { probes->push_back(r); continue; }
+            const std::size_t kn = kept[bi].size();
+            const double tv = emis[bi][static_cast<std::size_t>(xi - kept[bi].begin()) * kn +
+                                       static_cast<std::size_t>(yi - kept[bi].begin())];
+            double best = -std::numeric_limits<double>::infinity();
+            int rank = 1;
+            for (std::size_t x = 0; x < kn; ++x) {
+                for (std::size_t y = x; y < kn; ++y) {
+                    const double v = emis[bi][x * kn + y];
+                    best = std::max(best, v);
+                    if (v > tv + 1e-9) ++rank;
+                }
+            }
+            int ties = 0;
+            for (std::size_t x = 0; x < kn; ++x) {
+                for (std::size_t y = x; y < kn; ++y) {
+                    if (emis[bi][x * kn + y] > best - 1e-9) ++ties;
+                }
+            }
+            r.rank = rank;
+            r.ties = ties;
+            r.delta = tv - best;
+            r.score = tv;
+            probes->push_back(r);
         }
     }
 

@@ -552,6 +552,69 @@ nl_refuses() {
   if [ $? -ne 0 ] && grep -qi "$2" "$OUT/nx.log"; then ok "--noiseless-counts rejects $3"
   else bad "--noiseless-counts accepted $3 (exit $?), which would silently mix evidence"; fi
 }
+# ---------------------------------------------- --noiseless-scope, and the partition it has to obey
+# The scope splits the block's markers by whether the source pair carries them. Rewriting each half
+# alone must decompose EXACTLY, because the emission is a sum of per-marker terms and the two halves
+# are disjoint. Writing C(arm) for the score gap between two fixed pairs probed in that arm,
+#
+#   C(all) - C(present) - C(absent) + C(observed) == 0
+#
+# identically. This is the test that the halves partition the marker set: if the scopes overlapped, or
+# left a marker in neither, the identity breaks and nothing else here would have noticed.
+#
+# The source pair must be one the sample does NOT carry. Where it does, observed counts already equal
+# the expected ones, every arm rewrites a value to itself, and all four agree for a reason that has
+# nothing to do with the code being right -- which is how a first version of this test passed while
+# asserting nothing.
+pscore() {   # $1 = probe table, $2 = "a,b"
+  awk -F'\t' -v want="$2" 'NR>1 && $2","$3==want{print $8; exit}' "$1"
+}
+contrast() {   # score(1,2) - score(0,1) from one probe table; bash 3.2, so no associative arrays
+  # printf, not print: awk's default OFMT is %.6g, which rounds the contrast to six significant
+  # digits BEFORE the four of them are subtracted. That alone manufactured an interaction of 3.7e-5
+  # and read as a partition bug in the code, which was fine.
+  awk -F'\t' 'NR>1{s[$2","$3]=$8}
+               END{if (("1,2" in s) && ("0,1" in s)) printf "%.12f", s["1,2"]-s["0,1"]}' "$1"
+}
+C_all=""; C_present=""; C_absent=""
+for sc in all present absent; do
+  nl_run "nsc_$sc" --noiseless-counts 1:1,2 --noiseless-scope "$sc" --probe-pair 1:1,2 --probe-pair 1:0,1
+  v=$(contrast "$OUT/nsc_$sc.probe_pairs.tsv")
+  eval "C_$sc=\$v"
+done
+nl_run nsc_obs --probe-pair 1:1,2 --probe-pair 1:0,1
+C_obs=$(contrast "$OUT/nsc_obs.probe_pairs.tsv")
+if [ -n "$C_all" ] && [ -n "$C_present" ] && [ -n "$C_absent" ] && [ -n "$C_obs" ]; then
+  # First: the arms must actually differ, or the identity below holds trivially.
+  moved=$(awk -v p="$C_present" -v q="$C_absent" -v o="$C_obs" \
+          'BEGIN{print ((p-o)<-1e-6||(p-o)>1e-6) && ((q-o)<-1e-6||(q-o)>1e-6) ? 1 : 0}')
+  [ "$moved" = "1" ] && ok "--noiseless-scope present and absent each move the emission" \
+    || bad "a scope arm reproduced the observed contrast exactly; the split is inert and the identity below proves nothing"
+  I=$(awk -v A="$C_all" -v P="$C_present" -v B="$C_absent" -v O="$C_obs" 'BEGIN{printf "%.9f", A-P-B+O}')
+  okI=$(awk -v i="$I" 'BEGIN{print (i<1e-6 && i>-1e-6) ? 1 : 0}')
+  [ "$okI" = "1" ] && ok "present and absent partition the markers exactly (interaction $I)" \
+    || bad "scope interaction is $I, not 0: the two halves overlap or omit markers"
+else
+  bad "--noiseless-scope arms produced no probe scores"
+fi
+nl_refuses "--noiseless-counts 1 --noiseless-scope sideways" "all|present|absent" "an unknown scope"
+
+# --------------------------------------------------------------- --probe-pair is repeatable
+# Several probes must all be reported, and adding one must not change what an earlier one said --
+# otherwise a second probe silently rewrites the first's answer.
+nl_run pmulti --probe-pair 1:0,1 --probe-pair 1:1,2 --probe-pair 1:0,2
+n=$(awk 'NR>1' "$OUT/pmulti.probe_pairs.tsv" 2>/dev/null | wc -l | tr -d ' ')
+[ "$n" = "3" ] && ok "--probe-pair repeats: three probes, three rows" \
+               || bad "three --probe-pair gave $n rows"
+nl_run pone --probe-pair 1:0,1
+s1=$(pscore "$OUT/pone.probe_pairs.tsv" "0,1"); s2=$(pscore "$OUT/pmulti.probe_pairs.tsv" "0,1")
+[ -n "$s1" ] && [ "$s1" = "$s2" ] && ok "adding probes does not change an earlier probe's score" \
+                                  || bad "probe (0,1) scored $s1 alone and $s2 alongside others"
+# The first probe still owns the truth columns, as the single-probe form always did.
+[ "$(tgt "$OUT/pmulti.genotypes.tsv")" = "probe" ] \
+  && ok "with several probes the first still redirects the truth columns" \
+  || bad "rank_target is not 'probe' under repeated --probe-pair"
+
 nl_refuses "--noiseless-counts 1 --edge-weight 0.5" "adjacency"      "a nonzero edge weight"
 nl_refuses "--noiseless-counts 1 --evidence coverage" "coverage"     "alignment coverage evidence"
 nl_refuses "--noiseless-counts 99"                  "out of range"   "a block index past the end"
