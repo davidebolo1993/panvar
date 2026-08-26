@@ -119,7 +119,12 @@ std::vector<BlockCall> genotype_sample(
         // set spans the range whatever the score does, which needs no knowledge of the locus -- a
         // block whose alleles are all the same length simply gets its top-scoring alleles back, since
         // the stratified picks collapse onto them.
-        const std::size_t keep_n = std::min(na, std::max<std::size_t>(2, options.max_alleles_per_block));
+        std::size_t cap = options.max_alleles_per_block;
+        {
+            const auto ov = options.max_alleles_override.find(bi);
+            if (ov != options.max_alleles_override.end()) cap = ov->second;
+        }
+        const std::size_t keep_n = std::min(na, std::max<std::size_t>(2, cap));
         kept[bi].reserve(keep_n);
         std::vector<char> taken(na, 0);
         const std::size_t by_score = keep_n - keep_n / 2;
@@ -448,8 +453,11 @@ std::vector<BlockCall> genotype_sample(
         emis[bi].assign(kn * kn, 0.0);
         explained[bi].assign(kn * kn, 0.0);
         detected[bi].assign(kn * kn, 0.0);
+        // Only the upper triangle is computed. A diploid pair is unordered and the emission sums the
+        // two alleles' multiplicities, so emis[x][y] == emis[y][x] by construction; the lower half
+        // was recomputed from scratch. Mirrored below.
         for (std::size_t x = 0; x < kn; ++x) {
-            for (std::size_t y = 0; y < kn; ++y) {
+            for (std::size_t y = x; y < kn; ++y) {
                 // Expected count per marker is lambda * (copies in allele1 + copies in allele2), with
                 // integer multiplicity and no cap -- which is what lets a tandem array with 20 copies
                 // be modelled at all.
@@ -512,6 +520,11 @@ std::vector<BlockCall> genotype_sample(
                     emis[bi][x * kn + y] = -1e18;
                     explained[bi][x * kn + y] = 0.0;
                     detected[bi][x * kn + y] = 1.0;
+                    if (y != x) {
+                        emis[bi][y * kn + x] = -1e18;
+                        explained[bi][y * kn + x] = 0.0;
+                        detected[bi][y * kn + x] = 1.0;
+                    }
                     continue;
                 }
                 double mass_ll = 0.0;
@@ -607,6 +620,14 @@ std::vector<BlockCall> genotype_sample(
                 // tandem array, 7 of 8 samples under-called the total by 9-54 kb while reporting
                 // detected = 1.0. A fit ratio has to be two-sided to be a fit ratio.
                 detected[bi][x * kn + y] = pred_in > 0.0 ? obs_in / pred_in : 1.0;
+                // Mirror. Readers index emis/explained/detected as [x*kn+y] for arbitrary x,y --
+                // emission_for looks up (allele1, allele2) in whichever order the caller has them --
+                // so the lower triangle has to hold the same values, not be left at zero.
+                if (y != x) {
+                    emis[bi][y * kn + x] = emis[bi][x * kn + y];
+                    explained[bi][y * kn + x] = explained[bi][x * kn + y];
+                    detected[bi][y * kn + x] = detected[bi][x * kn + y];
+                }
             }
         }
     }

@@ -199,6 +199,11 @@ void print_genotype_help() {
         << "                              every block. The panel's basic fact, and the only way to\n"
         << "                              recover TRANSITIONS between blocks: per-block dumps cannot\n"
         << "                              say which allele pairs co-occur on one haplotype\n"
+        << "      --max-alleles-block <B:N>  Cap block B at N candidates, overriding --max-alleles\n"
+        << "                              there only. Raising the cap locus-wide to study one block\n"
+        << "                              expands every other block too, so the neighbouring\n"
+        << "                              emissions change and a difference at the block under study\n"
+        << "                              cannot be attributed to it. Repeatable\n"
         << "      --oracle-called-only    With --certified-oracle, align ONLY the called pair rather\n"
         << "                              than searching all 2A. Reports called_total_edits; best_*\n"
         << "                              and excess_total_edits are NA. Use when the certified best\n"
@@ -261,6 +266,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
     std::string index_out;
     std::string index_in;
     std::size_t max_alleles = 64;
+    std::map<std::size_t, std::size_t> max_alleles_override;
     double fragment_len = 350.0;
     bool fragment_len_set = false;
     double recomb_rate = 1.0;
@@ -332,6 +338,14 @@ int run_genotype_command(const std::vector<std::string>& args) {
             else if (v != "panvar") throw std::runtime_error("genotype: --marker-rule must be panvar|unique|pangenie|mixed");
         }
         else if (arg == "--max-alleles") max_alleles = cli::parse_size_arg(arg, require_value(arg));
+        else if (arg == "--max-alleles-block") {
+            const std::string v = require_value(arg);
+            const std::size_t c = v.find(':');
+            if (c == std::string::npos || v.find(':', c + 1) != std::string::npos)
+                throw std::runtime_error("--max-alleles-block wants exactly BLOCK:N (e.g. 13:512)");
+            max_alleles_override[cli::parse_size_arg(arg, v.substr(0, c))] =
+                cli::parse_size_arg(arg, v.substr(c + 1));
+        }
         else if (arg == "--fragment-len") { fragment_len = std::stod(require_value(arg)); fragment_len_set = true; }
         else if (arg == "--recomb-rate") recomb_rate = std::stod(require_value(arg));
         else if (arg == "--depth-model") {
@@ -490,6 +504,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
         GenotypeOptions g;
         g.threads = options.threads;
         g.max_alleles_per_block = max_alleles;
+        g.max_alleles_override = max_alleles_override;
         g.max_linkage_emission_loss = max_linkage_loss;
         g.fragment_len = fragment_len;
         g.provenance = provenance;

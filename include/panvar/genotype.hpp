@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <limits>
+#include <map>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -41,6 +42,10 @@ struct GenotypeOptions {
     // under-stated). 0 disables.
     double min_detected = 0.5;
     std::size_t max_alleles_per_block = 64;   // prune by detected-marker fraction before pairing
+    // Per-block override of the cap. Raising the cap locus-wide to study ONE block expands every
+    // other block too, so the neighbouring emissions the chain sees change as well and a difference
+    // at the block under study cannot be attributed to it. Keyed by chain index.
+    std::map<std::size_t, std::size_t> max_alleles_override;
     // Score the block's TOTAL count as its own term, at its own effective sample size (fragments over
     // the block, not markers), with each pair's overall scale profiled out of the per-marker product so
     // the two do not double count.
