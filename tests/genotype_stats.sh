@@ -614,14 +614,22 @@ if [ -s "$OUT/lk_cap.genotypes.tsv" ]; then
   [ "$over" -gt 0 ] \
     && ok "the cap fixture actually prunes: $over block(s) have more alleles than --max-alleles 2" \
     || bad "no block exceeds --max-alleles 2, so this cannot test the pruned-pair path"
-  # KNOWN GAP, stated so nobody reads this as a guard it is not. The assertion is right, but this
-  # fixture does not exercise it: verified by reintroducing the bug, which leaves it passing. Linkage
-  # here never prefers the pruned pair, so the background path is never the winner. Catching it needs
-  # a chain where a neighbouring block pulls the call onto a haplotype whose allele at THIS block was
-  # pruned. Until such a fixture exists the guard is the code review, not this line.
+  # HONEST SCOPE: this fixture still does not discriminate -- linkage here never prefers a pruned
+  # pair, so the assertion passes either way, as it did before. What changed is the code, not the
+  # test: at finite tau an unscored pair now returns -1e18 unconditionally, with no arithmetic that
+  # could let one through, where before it depended on a background constant landing below a floor.
+  # The discriminating check is the post-hoc audit of a real finite-tau arm (every call must have
+  # called_emission_rank >= 1); on a 3-allele fixture there is nothing to audit.
   [ "$unscored" = "0" ] \
-    && ok "at finite tau every call is a SCORED pair (called_rank >= 1)  [see KNOWN GAP above]" \
-    || bad "$unscored calls at pruned-capable blocks have no emission rank: the floor is not applied to the background fallback"
+    && ok "at finite tau every call is a SCORED pair (called_emission_rank >= 1)" \
+    || bad "$unscored calls at pruned-capable blocks have no emission rank: an unscored pair was reachable"
+  # local_best_* must be reported even where the CALLED pair was pruned -- the block's optimum
+  # exists regardless of what the chain picked, and that is exactly the diagnostic case.
+  nolb=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+         $(h["n_markers"])+0 > 0 && $(h["local_best_a"])+0 < 0 {k++} END{print k+0}' "$OUT/lk_cap.genotypes.tsv")
+  [ "$nolb" = "0" ] \
+    && ok "the emission optimum is reported at every scored block, pruned calls included" \
+    || bad "$nolb scored blocks report no local_best: it is nested inside the called-pair lookup"
 else
   bad "the capped constrained run produced no genotypes"
 fi

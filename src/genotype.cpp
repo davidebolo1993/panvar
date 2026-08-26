@@ -655,16 +655,24 @@ std::vector<BlockCall> genotype_sample(
         // -1e18 rather than -inf, matching the mass window: the recursion multiplies these and a
         // true -inf would poison sums that still have to normalize.
         const auto guard = [&](double v) { return v < emis_floor[bi] ? -1e18 : v; };
+        // At finite tau an UNSCORED pair is excluded outright. Its background likelihood is a
+        // constant, not an emission, so "within tau of the block optimum" is not a statement about
+        // it -- and if the constant happens to sit above the floor, linkage could reach a pair the
+        // emission never ranked while every scored pair was being held to tau.
+        const bool restrict_to_scored = std::isfinite(options.max_linkage_emission_loss);
         const int a = allele_of[bi][i];
         const int b = allele_of[bi][j];
-        if (a < 0 || b < 0 || kept[bi].empty()) return guard(baseline_of[bi]);
+        if (a < 0 || b < 0 || kept[bi].empty())
+            return restrict_to_scored ? -1e18 : guard(baseline_of[bi]);
         const auto xi = std::lower_bound(kept[bi].begin(), kept[bi].end(), static_cast<std::uint32_t>(a));
         const auto yi = std::lower_bound(kept[bi].begin(), kept[bi].end(), static_cast<std::uint32_t>(b));
         // A pruned allele falls back to the all-background likelihood rather than -inf. Zeroing it
         // would remove that haplotype from the forward recursion for the rest of the chain, so one
         // weak block could silently veto the correct haplotype everywhere.
-        if (xi == kept[bi].end() || *xi != static_cast<std::uint32_t>(a)) return guard(baseline_of[bi]);
-        if (yi == kept[bi].end() || *yi != static_cast<std::uint32_t>(b)) return guard(baseline_of[bi]);
+        if (xi == kept[bi].end() || *xi != static_cast<std::uint32_t>(a))
+            return restrict_to_scored ? -1e18 : guard(baseline_of[bi]);
+        if (yi == kept[bi].end() || *yi != static_cast<std::uint32_t>(b))
+            return restrict_to_scored ? -1e18 : guard(baseline_of[bi]);
         const std::size_t kn = kept[bi].size();
         const double v = emis[bi][static_cast<std::size_t>(xi - kept[bi].begin()) * kn +
                                   static_cast<std::size_t>(yi - kept[bi].begin())];
@@ -840,28 +848,14 @@ std::vector<BlockCall> genotype_sample(
         c.allele2 = static_cast<std::size_t>(best_key & 0xffffffffu);
         c.gq = (p1 <= 0.0) ? 0.0 : std::min(99.0, -10.0 * std::log10(std::max(1e-10, 1.0 - p1)));
 
-        const auto xi = std::find(kept[bi].begin(), kept[bi].end(), static_cast<std::uint32_t>(c.allele1));
-        const auto yi = std::find(kept[bi].begin(), kept[bi].end(), static_cast<std::uint32_t>(c.allele2));
-        if (xi != kept[bi].end() && yi != kept[bi].end()) {
+        // The block's emission optimum exists whether or not the CALLED pair survived pruning, so
+        // it is computed first and unconditionally. Nesting it inside the called-pair lookup left it
+        // unreported at exactly the blocks where the call is a pruned pair -- the diagnostic case.
+        if (!kept[bi].empty()) {
             const std::size_t kn = kept[bi].size();
-            const std::size_t off = static_cast<std::size_t>(xi - kept[bi].begin()) * kn +
-                                    static_cast<std::size_t>(yi - kept[bi].begin());
-            c.explained = explained[bi][off];
-            c.detected = detected[bi][off];
-            // Emission-only standing of the pair we actually reported.
-            const double cv = emis[bi][off];
             double best = -std::numeric_limits<double>::infinity();
-            int rank = 1;
-            for (std::size_t x = 0; x < kn; ++x) {
-                for (std::size_t y = x; y < kn; ++y) {
-                    const double v = emis[bi][x * kn + y];
-                    best = std::max(best, v);
-                    if (v > cv + 1e-9) ++rank;
-                }
-            }
-            c.called_emission_rank = rank;
-            c.called_emission_delta = cv - best;
-            // Which pair the emission alone would have chosen, and how many share that value.
+            for (std::size_t x = 0; x < kn; ++x)
+                for (std::size_t y = x; y < kn; ++y) best = std::max(best, emis[bi][x * kn + y]);
             int ties = 0, ba = -1, bb = -1;
             for (std::size_t x = 0; x < kn; ++x) {
                 for (std::size_t y = x; y < kn; ++y) {
@@ -872,6 +866,22 @@ std::vector<BlockCall> genotype_sample(
                 }
             }
             c.local_best_a = ba; c.local_best_b = bb; c.local_best_ties = ties;
+
+            const auto xi = std::find(kept[bi].begin(), kept[bi].end(), static_cast<std::uint32_t>(c.allele1));
+            const auto yi = std::find(kept[bi].begin(), kept[bi].end(), static_cast<std::uint32_t>(c.allele2));
+            if (xi != kept[bi].end() && yi != kept[bi].end()) {
+                const std::size_t off = static_cast<std::size_t>(xi - kept[bi].begin()) * kn +
+                                        static_cast<std::size_t>(yi - kept[bi].begin());
+                c.explained = explained[bi][off];
+                c.detected = detected[bi][off];
+                const double cv = emis[bi][off];
+                int rank = 1;
+                for (std::size_t x = 0; x < kn; ++x)
+                    for (std::size_t y = x; y < kn; ++y)
+                        if (emis[bi][x * kn + y] > cv + 1e-9) ++rank;
+                c.called_emission_rank = rank;
+                c.called_emission_delta = cv - best;
+            }
         }
 
         // How much sequence the reads say is here, measured without reference to the panel's allele
