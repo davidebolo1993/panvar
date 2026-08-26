@@ -453,6 +453,17 @@ std::vector<BlockCall> genotype_sample(
         emis[bi].assign(kn * kn, 0.0);
         explained[bi].assign(kn * kn, 0.0);
         detected[bi].assign(kn * kn, 0.0);
+        // Each candidate's sparse (slot, multiplicity) vector, sorted by slot ONCE so the pair loop
+        // can merge two of them with two pointers. The previous form built a fresh unordered_map for
+        // every pair -- a heap allocation, a hash per marker, and then iteration in hash order, which
+        // is the worst of the three for cache behaviour. At 457 candidates that is 104,653 maps.
+        std::vector<std::vector<std::pair<std::uint32_t, std::uint32_t>>> sorted_nodes(kn);
+        for (std::size_t x = 0; x < kn; ++x) {
+            sorted_nodes[x] = panel.by_block[bi][kept[bi][x]].nodes;
+            std::sort(sorted_nodes[x].begin(), sorted_nodes[x].end(),
+                      [](const auto& a, const auto& b) { return a.first < b.first; });
+        }
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> tot;   // reused; no per-pair allocation
         // Only the upper triangle is computed. A diploid pair is unordered and the emission sums the
         // two alleles' multiplicities, so emis[x][y] == emis[y][x] by construction; the lower half
         // was recomputed from scratch. Mirrored below.
@@ -461,9 +472,30 @@ std::vector<BlockCall> genotype_sample(
                 // Expected count per marker is lambda * (copies in allele1 + copies in allele2), with
                 // integer multiplicity and no cap -- which is what lets a tandem array with 20 copies
                 // be modelled at all.
-                std::unordered_map<std::uint32_t, std::uint32_t> tot;
-                for (const auto& [slot, mult] : panel.by_block[bi][kept[bi][x]].nodes) tot[slot] += mult;
-                for (const auto& [slot, mult] : panel.by_block[bi][kept[bi][y]].nodes) tot[slot] += mult;
+                const auto& NA = sorted_nodes[x];
+                const auto& NB = sorted_nodes[y];
+                tot.clear();
+                tot.reserve(NA.size() + NB.size());
+                {
+                    std::size_t ia = 0, ib = 0;
+                    while (ia < NA.size() && ib < NB.size()) {
+                        if (NA[ia].first < NB[ib].first) tot.push_back(NA[ia++]);
+                        else if (NB[ib].first < NA[ia].first) tot.push_back(NB[ib++]);
+                        else { tot.emplace_back(NA[ia].first, NA[ia].second + NB[ib].second); ++ia; ++ib; }
+                    }
+                    while (ia < NA.size()) tot.push_back(NA[ia++]);
+                    while (ib < NB.size()) tot.push_back(NB[ib++]);
+                }
+                // tot is sorted by slot, so the "does this pair carry slot s" questions below are a
+                // binary search rather than a hash lookup.
+                const auto tot_at = [&](std::uint32_t slot) -> double {
+                    const auto it = std::lower_bound(tot.begin(), tot.end(), slot,
+                        [](const std::pair<std::uint32_t, std::uint32_t>& e, std::uint32_t v) {
+                            return e.first < v;
+                        });
+                    return (it == tot.end() || it->first != slot) ? 0.0
+                                                                  : static_cast<double>(it->second);
+                };
                 double obs_in = 0.0;
                 double pred_in = 0.0;
                 double mult_in = 0.0;
@@ -498,8 +530,7 @@ std::vector<BlockCall> genotype_sample(
                     // scored, so a candidate is charged for markers it lacks -- but only up to the cap.
                     const double c = options.robust_c;
                     for (const std::uint32_t slot : universe) {
-                        const auto it = tot.find(slot);
-                        const double m = it == tot.end() ? 0.0 : static_cast<double>(it->second);
+                        const double m = tot_at(slot);
                         const double pred = lambda * m + mu;
                         const double o = static_cast<double>(counts.node[slot]);
                         const double z = (o - pred) / std::sqrt(pred + 1.0);
@@ -559,16 +590,14 @@ std::vector<BlockCall> genotype_sample(
                     // every candidate and cancels in the comparison.
                     double pred_tot = 0.0;
                     for (const std::uint32_t slot : universe) {
-                        const auto it = tot.find(slot);
-                        pred_tot += lambda * (it == tot.end() ? 0.0 : it->second) + mu;
+                        pred_tot += lambda * tot_at(slot) + mu;
                     }
                     double cll = 0.0;
                     if (pred_tot > 0.0) {
                         for (const std::uint32_t slot : universe) {
                             const double o = static_cast<double>(counts.node[slot]);
                             if (o <= 0.0) continue;
-                            const auto it = tot.find(slot);
-                            const double pj = (lambda * (it == tot.end() ? 0.0 : it->second) + mu) / pred_tot;
+                            const double pj = (lambda * tot_at(slot) + mu) / pred_tot;
                             cll += o * std::log(std::max(1e-300, pj));
                         }
                     }
@@ -865,7 +894,16 @@ std::vector<BlockCall> genotype_sample(
             for (std::size_t j = 0; j < nh; ++j) {
                 const double p = post[i * nh + j];
                 if (p <= 0.0) continue;
-                if (p > best_hp) { best_hp = p; c.hap1 = i; c.hap2 = j; }
+                // Strict >, so the FIRST pair at the maximum wins -- and a diploid haplotype pair
+                // is unordered, so which of two tied haplotypes is reported first was decided by
+                // iteration order. Any change to summation order could then swap the two labels
+                // while calling exactly the same genotype. Ordering the pair makes the report a
+                // function of the answer rather than of the traversal.
+                if (p > best_hp) {
+                    best_hp = p;
+                    c.hap1 = std::min(i, j);
+                    c.hap2 = std::max(i, j);
+                }
                 const int a = allele_of[bi][i];
                 const int b = allele_of[bi][j];
                 if (a < 0 || b < 0) continue;
