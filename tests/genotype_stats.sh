@@ -571,6 +571,34 @@ else
   bad "--certified-oracle wrote no table"
 fi
 
+# ------------------ the emission's exact speedups must be exact under EVERY scoring mode, not one
+# Candidates with identical marker vectors share an emission and are scored once. The key has to
+# cover everything the emission reads: node markers alone are not enough, because the adjacency term
+# reads the edge vector and the coverage-size term reads allele length. Keyed on nodes only, two
+# candidates differing solely in edges would have been given each other's score -- correct under the
+# default path and wrong under --edge-weight, which is exactly the kind of mode-dependent break a
+# default-only test cannot see.
+mode_md5() {
+  "$BIN" genotype -i "$OUT/g.gfa" -b "$OUT/bub" -r ref -o "$OUT/$1" -R "$OUT/reads.fa" \
+    --truth-haplotypes 'hapA1,hapB1' "${@:2}" -q >/dev/null 2>&1
+  md5 -q "$OUT/$1.genotypes.tsv" 2>/dev/null || md5sum "$OUT/$1.genotypes.tsv" | cut -d" " -f1
+}
+# Each mode must give the SAME answer at 1 and 8 threads, and must produce output at all: a mode
+# that silently errors would otherwise "pass" by comparing two empty files.
+for m in "default:" "edgew:--edge-weight 0.5" "nomass:--mass-weight 0"; do
+  tag="${m%%:*}"; flags="${m#*:}"
+  h1=$(mode_md5 "sp_${tag}_1" $flags --threads 1)
+  h8=$(mode_md5 "sp_${tag}_8" $flags --threads 8)
+  n=$(awk 'NR>1' "$OUT/sp_${tag}_1.genotypes.tsv" 2>/dev/null | wc -l | tr -d " ")
+  if [ "${n:-0}" -eq 0 ]; then
+    bad "scoring mode '$tag' produced no rows, so its byte-identity check would be vacuous"
+  elif [ "$h1" = "$h8" ]; then
+    ok "scoring mode '$tag' is thread-independent over $n blocks (dedup key covers what it reads)"
+  else
+    bad "scoring mode '$tag' differs between 1 and 8 threads"
+  fi
+done
+
 # ------------------------------------- the linkage constraint: what the chain may and may not do
 # Measured motivation: linkage moved off a UNIQUE block-local optimum 93 times over the cohort, 20
 # rescues against 73 overrides, separating cleanly by how far it moved. The constraint excludes

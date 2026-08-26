@@ -491,13 +491,34 @@ std::vector<BlockCall> genotype_sample(
         // emission -- the term depends on the vector and nothing else. At a tandem array many
         // alleles differ only in ways no retained marker sees, so this collapses a large share of
         // the pair space. Exact: representatives are scored, the rest copied.
+        // The key must cover EVERYTHING the emission reads, or two candidates that agree on node
+        // markers but differ elsewhere would share a score they do not share. Node markers are not
+        // enough: the adjacency term reads the edge vector, and the coverage-size term reads allele
+        // length. Both are folded in, so the collapse is exact under every scoring mode rather than
+        // only the default one.
+        struct DedupKey {
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> nodes, edges;
+            std::size_t bp = 0;
+            bool operator<(const DedupKey& o) const {
+                if (bp != o.bp) return bp < o.bp;
+                if (nodes != o.nodes) return nodes < o.nodes;
+                return edges < o.edges;
+            }
+        };
         std::vector<std::size_t> rep_of(kn);          // candidate -> its representative
-        std::vector<std::size_t> reps;                // distinct vectors, in first-seen order
+        std::vector<std::size_t> reps;                // distinct keys, in first-seen order
         {
-            std::map<std::vector<std::pair<std::uint32_t, std::uint32_t>>, std::size_t> seen;
+            std::map<DedupKey, std::size_t> seen;
             for (std::size_t x = 0; x < kn; ++x) {
-                const auto it = seen.find(sorted_nodes[x]);
-                if (it == seen.end()) { seen.emplace(sorted_nodes[x], x); rep_of[x] = x; reps.push_back(x); }
+                DedupKey k;
+                k.nodes = sorted_nodes[x];
+                k.edges = panel.by_block[bi][kept[bi][x]].edges;
+                std::sort(k.edges.begin(), k.edges.end(),
+                          [](const auto& a, const auto& b) { return a.first < b.first; });
+                k.bp = (kept[bi][x] < blocks[bi].allele_bp.size())
+                           ? blocks[bi].allele_bp[kept[bi][x]] : 0;
+                const auto it = seen.find(k);
+                if (it == seen.end()) { seen.emplace(std::move(k), x); rep_of[x] = x; reps.push_back(x); }
                 else { rep_of[x] = it->second; }
             }
         }
