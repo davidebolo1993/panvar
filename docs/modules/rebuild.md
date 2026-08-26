@@ -51,8 +51,8 @@ Audit columns:
 | `path` | the haplotype's name in the input graph |
 | `original_bp` | its length in the input |
 | `recovered_steps` | how many nodes its recovered walk visits |
-| `envelope_cover` | fraction of the haplotype between the first and last aligned base, which does not see internal gaps |
-| `matched_cover` | fraction of the haplotype covered by bases that actually match, which does |
+| `envelope_cover` | fraction of the haplotype lying between its first and last aligned base — blind to any gap in the middle |
+| `matched_cover` | fraction of the haplotype whose bases actually align and match — gaps in the middle do count against it |
 | `chain_identity` | identity within the aligned region |
 | `walk_identity` | identity of the walk re-spelled from the rebuilt graph against the original haplotype |
 | `status` | `ok`, or why this haplotype failed: `not_recovered`, `low_cover`, `low_identity`, `identity_unavailable` |

@@ -2,35 +2,43 @@
 
 Mechanism for the `benchmark` module. For usage/flags see [modules/benchmark.md](../modules/benchmark.md); References in [references.md](../references.md).
 
-`benchmark` answers two separable questions about the caller's own output: what was there to be found (the truth event ledger) and how much of the sequence comes back (four reconstructions plus a do-nothing baseline). Everything is derived from one decomposition of the two walks, so the ledger and the reconstructions cannot disagree about what a divergent block is.
+### The one idea
+
+Every number in this module comes from a single comparison: line up a haplotype's path through a bubble against the reference's path, and see where they part company. Each place they part company is a divergent stretch. That one decomposition feeds both the ledger and every reconstruction, so the two can never disagree about what counts as an event.
+
+From there the module answers two separable questions — what was there to be found (the truth event ledger) and how much of the sequence comes back (four reconstructions plus a do-nothing baseline).
 
 Every reference-traversed bubble is scored by default. A bubble the reference does not traverse has no baseline and is dropped — counted in the `excluded` scope, never silently.
 
 ## How it works
 
-### 1. Decompose each haplotype against the reference
+### 1. Find where each haplotype differs from the reference
 
 For each scored bubble, for each haplotype that traverses it:
 
-Spell the truth. The haplotype's own canonical `source → sink` walk, orientation-aware.
+Spell the truth. The haplotype's own `source → sink` walk, orientation-aware. This is what everything is scored against.
 
-Node-align. Longest common subsequence over `(node id, orientation)` step tokens between the reference walk and the haplotype's walk. The matched positions are anchors; each maximal stretch between consecutive anchors where the two walks differ is one divergent block, holding `ref_steps[ri0,ri1)` against `hap_steps[hi0,hi1)`. On walks too large for the `O(nm)` table the whole bubble becomes one block — a coarser decomposition, not a wrong one, and counted as `bubbles_decomposed_coarsely`.
+Line the two walks up. Both walks are sequences of steps, each step being a node together with the direction it is read in. A longest-common-subsequence match over those steps finds the steps the two walks share; those shared steps are anchors. Between two consecutive anchors, wherever the two walks are not identical, is one divergent stretch — a piece of the reference walk on one side and a piece of the haplotype walk on the other, either of which may be empty.
 
-Size it, and attribute it. `ref_bp` and `hap_bp` sum the node lengths on each side; the event size is `max(ref_bp, hap_bp)`, which is how `call` gates a linked DEL/INS replacement — on the larger arm. The block is attributed to the first record (by variant id, so the choice cannot depend on file order) whose node set it actually contains. A block that merely sits in the same bubble as a record is not attributed to it.
+> On walks too large for the quadratic alignment table, the whole bubble is treated as one stretch. That is a coarser decomposition, not a wrong one, and it is counted as `bubbles_decomposed_coarsely` rather than passed off as a fine one.
 
-Event size is a property of the two walks alone. It does not move with the alignment, the threshold, the calls or the reconstruction, which is what makes it usable as truth.
+Size it. Add up the node lengths on each side, and take the event's size to be the larger of the two. That matches how `call` gates a deletion-plus-insertion replacement: on the larger arm.
+
+Attribute it. A stretch belongs to a record when it actually contains one of that record's nodes. If several qualify, the lowest variant id wins, so the choice can never depend on file order. A record that merely sits in the same bubble is not attributed anything.
+
+The size of an event is a property of the two walks and nothing else. It does not move when the alignment, the threshold, the calls or the reconstruction change — which is exactly what makes it usable as truth.
 
 ### 2. Classify the truth events
 
-Each block with a non-zero size is one truth event:
+Each divergent stretch with a non-zero size is one truth event:
 
 | class | condition |
 |-------|-----------|
 | `below_threshold` | `size_bp < --min-sv-bp` |
-| `called` | `size_bp ≥ --min-sv-bp` and a specific record's node is in the block |
+| `called` | `size_bp ≥ --min-sv-bp` and a specific record's node is in the stretch |
 | `missed` | `size_bp ≥ --min-sv-bp` and no record covers it |
 
-`called` says a specific emitted record shares at least one node with this block. It does not say the record spans the block, represents it correctly, or that this haplotype was genotyped as carrying it. The two negatives therefore differ in strength: `missed` is firm — nothing emitted touches the event — while `called` is an upper bound on discovery, not a genotyping statement.
+`called` says a specific emitted record shares at least one node with this stretch. It does not say the record spans the stretch, represents it correctly, or that this haplotype was genotyped as carrying it. The two negatives therefore differ in strength: `missed` is firm — nothing emitted touches the event — while `called` is an upper bound on discovery, not a genotyping statement.
 
 #### Why not classify from the alignment
 
@@ -38,36 +46,38 @@ Contiguous mismatch-run lengths from a sequence alignment cannot define event si
 
 ### 3. Reconstruct at each level
 
-Each walks the reference and substitutes the haplotype's own steps at the blocks its rule accepts.
+Three of the four levels share one mechanism: walk the reference, and at some of the divergent stretches, paste in the haplotype's own true sequence. They differ in nothing but which stretches qualify.
 
-| level | substitutes a block when |
-|-------|--------------------------|
-| `graph` | any of its nodes is in the union of called nodes at that bubble |
-| `called` | it is attributed to a specific record and `size_bp ≥ --min-sv-bp` |
-| `carrier` | as `called`, and this haplotype's `GT` names some record overlapping the block |
-| `region_vcf` | not block-based at all — see below |
+| level | pastes a stretch when | what that makes it |
+|-------|-----------------------|--------------------|
+| `graph` | any of its nodes is one that some call at that bubble also touches | loosest — mere overlap with the union of called nodes |
+| `called` | it is attributed to a specific record, and reaches `--min-sv-bp` | the same idea made strict |
+| `carrier` | as `called`, and this haplotype's `GT` names an overlapping record | …with genotypes finally taken into account |
+| `region_vcf` | — does not work this way at all; see step 4 | the only level that reads the records' own sequence |
 
-`graph` is an optimistic node-discovery ceiling. Sharing a node with some call is not matching one, so a called deletion containing a shared reference node can authorise copying a different allele; no genotype is read, so a call placed on the wrong haplotypes can still score perfectly.
+Because all three paste in the truth, none of them tests whether a record encodes its event correctly. They measure where the caller pointed. A record can be flawlessly placed and describe nonsense, and all three still score it as recovered. That is deliberate: it separates finding an event from writing it down properly, and step 4 is where the second question gets asked.
 
-`called` narrows that to per-record attribution plus the size threshold, but both substitute the haplotype's true block, not the record's `REF`/`ALT` effect. `called` is therefore the ceiling the retained records would reach if each reproduced its block exactly — not what they do reproduce.
+The three are progressively stricter, and each strictness costs something specific:
 
-`carrier` adds the one thing `called` ignores: whether the VCF says this haplotype carries anything there. `variant_nodes.tsv` has no haplotype column — one row per record, holding the union of nodes over every merged event and every carrier — so carrier status is only knowable from the VCF, joined by record id.
+- `graph` does not read genotypes and does not require a match. Touching a node that a call also touches is not the same as agreeing with that call, so a correctly called deletion sharing one reference node can license pasting an entirely different, uncalled allele nearby. And because no `GT` is consulted, a call placed on completely the wrong samples still scores perfectly here. Read it as a discovery ceiling: could the graph hold this haplotype, and did the caller flag the right neighbourhood?
+- `called` requires the stretch itself to map to a record, and to clear the size threshold. Genotypes still play no part.
+- `carrier` adds the one thing `called` ignores: whether the VCF says this haplotype carries anything there. That information exists nowhere else — `variant_nodes.tsv` has one row per record holding the union of nodes over every merged event and every carrier, with no haplotype column — so carrier status is knowable only from the VCF, joined by record id.
 
 That join exists only for the region VCF, and the mode is reported as `vcf_mode`. Region record ids must equal the `variant_nodes` id set and agree on `BUBBLE_ID`. An allele VCF instead has one `bubbleN_ALLELES` record per bubble and no per-call id, so `carrier` and the per-call `loss_bp` terms are reported `NA` / `not_applicable`. Anything matching neither contract is refused.
 
-Within region mode, the block is substituted when any overlapping record has `GT ≥ 1`: one divergent region can be described by several records and different carriers take different ones, so testing only the primary attribution would be testing which record sorted first, not whether the haplotype was called.
+Within region mode, the stretch is pasted when any overlapping record has `GT ≥ 1`: one divergent region can be described by several records and different carriers take different ones, so testing only the primary attribution would be testing which record sorted first, not whether the haplotype was called.
 
-A fifth reconstruction, the in-scope floor, substitutes every block reaching `--min-sv-bp` regardless of any call. Its residual is purely sub-threshold variation, so it separates out-of-scope sequence from discovery failure.
+A fifth reconstruction, the in-scope floor, pastes every stretch reaching `--min-sv-bp` regardless of any call. Its residual is purely sub-threshold variation, so it separates out-of-scope sequence from discovery failure.
 
 The consecutive differences along `truth → in-scope floor → called → carrier → region_vcf` are the `loss_bp` partition, and the run asserts that they sum exactly to the region-VCF residual (`sum_check`).
 
-This is a partition, not a descending chain. Only `in-scope floor ≥ called ≥ carrier` are nested ceilings — each substitutes a subset of the previous level's blocks, all implanting true sequence. `region_vcf` sits outside that nesting because it applies every record the haplotype carries rather than only attributed eligible blocks, so it can beat `carrier` locally; the last two terms are signed for exactly that reason.
+This is a partition, not a descending chain. Only `in-scope floor ≥ called ≥ carrier` are nested ceilings — each substitutes a subset of the previous level's stretches, all implanting true sequence. `region_vcf` sits outside that nesting because it applies every record the haplotype carries rather than only attributed eligible stretches, so it can beat `carrier` locally; the last two terms are signed for exactly that reason.
 
 Two rules make the partition mean what it says:
 
 One population. Every comparative total is over the common set — the `(haplotype, bubble)` observations all levels could score. `graph`/`called` cover every graph haplotype, `carrier` only VCF-joined ones, `region_vcf` only those whose bubble also placed. Totalling each over its own population reported `carrier` above `called` and a negative loss when one haplotype was left out of the VCF.
 
-A false positive is not a representation failure. Where the haplotype has no eligible truth event and the VCF still edits it, `carrier` has no true block to substitute and leaves the reference alone while `region_vcf` applies the erroneous edit. That difference is `false_positive_damage`, split out per observation from `representation`. The two are signed, because `region_vcf` applies every record the haplotype carries while `carrier` only substitutes attributed eligible blocks — so a record can improve a region `carrier` left alone.
+A false positive is not a representation failure. Where the haplotype has no eligible truth event and the VCF still edits it, `carrier` has no true stretch to paste and leaves the reference alone while `region_vcf` applies the erroneous edit. That difference is `false_positive_damage`, split out per observation from `representation`. The two are signed, because `region_vcf` applies every record the haplotype carries while `carrier` only substitutes attributed eligible stretches — so a record can improve a region `carrier` left alone.
 
 Each reconstruction is globally aligned (Needleman–Wunsch, edlib) to the truth, giving `δ` and `S`. Identity is `1 − Σδ/ΣS` length-weighted over a haplotype's bubbles; `QV = -10·log10(max(0.5, δ)/S)` with ceiling `QV_max = 10·log10(2S)` and `qv_ratio = QV/QV_max` are emitted for comparability.
 
@@ -109,7 +119,7 @@ Carrier confusion. Each (haplotype, bubble) contributes to a TP/FP/FN/TN table: 
 
 ### 5. Partition the residual and compare against a baseline
 
-The genotype residual is split into five consecutive terms that sum to it exactly: variation below the size threshold, eligible events no record covers, events covered but not genotyped onto this haplotype, sequence a record covers and carries but does not reproduce, and edits applied where there is no eligible truth event. The last two are signed, since the genotype level applies every record the haplotype carries rather than only attributed eligible blocks and can therefore beat the block-based ceiling locally.
+The genotype residual is split into five consecutive terms that sum to it exactly: variation below the size threshold, eligible events no record covers, events covered but not genotyped onto this haplotype, sequence a record covers and carries but does not reproduce, and edits applied where there is no eligible truth event. The last two are signed, since the genotype level applies every record the haplotype carries rather than only attributed eligible stretches and can therefore beat the stretch-based ceiling locally.
 
 Every comparative figure is taken over the common set, the haplotype-and-bubble observations all levels could score, so two totals are never compared over different populations.
 
@@ -124,11 +134,11 @@ The steps below follow the five above, one for one. The first bubble contains a 
 | A | `1,2,3,4,5` | `1,3,4,5`, 60 bp node 2 deleted | a deletion of node 2, whose node is in the call's node set |
 | B | `6,7,8,9,10` | `6,7,8',9,10`, a 20 bp substitution | none, since node 8' is in no call's node set |
 
-1. Decompose each haplotype against the reference. At bubble A the shared anchors are `1,3,4,5`, leaving one divergent block between anchors `1` and `3`: the reference side holds node 2 and the haplotype side nothing. At bubble B the anchors are `6,7,9,10`, leaving a block between `7` and `9` holding one node on each side.
+1. Decompose each haplotype against the reference. At bubble A the shared anchors are `1,3,4,5`, leaving one divergent stretch between anchors `1` and `3`: the reference side holds node 2 and the haplotype side nothing. At bubble B the anchors are `6,7,9,10`, leaving a stretch between `7` and `9` holding one node on each side.
 
 2. Classify the truth events. Under a 50 bp threshold, bubble A is a `called` 60 bp truth event and bubble B is a 20 bp `below_threshold` event. Nothing eligible was missed.
 
-3. Reconstruct at each level. Bubble A's block shares a node with an attributed record and reaches the threshold, so graph, called and carrier substitute its true steps. Bubble B's block is below threshold and shares a node with no record, so every ceiling leaves the reference sequence there.
+3. Reconstruct at each level. Bubble A's stretch shares a node with an attributed record and reaches the threshold, so graph, called and carrier substitute its true steps. Bubble B's stretch is below threshold and shares a node with no record, so every ceiling leaves the reference sequence there.
 
 4. Reconstruct from the VCF alone. The genotype level applies only the edits H's genotype names. The deletion at bubble A is emitted and carried, so it is applied; nothing is emitted at bubble B, so that substitution is left as reference.
 

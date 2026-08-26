@@ -66,7 +66,7 @@ A snarl can contain cycles and inversions, which is where much pangenome variati
 
 ## Limitations
 
-- `--min-variant-bp` and `--max-variant-bp` measure the span between the boundaries, not how much an allele differs from the reference. A small edit inside a long allele is filtered by the length of the allele carrying it. `--min-interior-bp` and `--max-interior-bp` are aliases that name this directly.
+- `--min-variant-bp` and `--max-variant-bp` measure the span between the boundaries, not how much an allele differs from the reference. A small edit inside a long allele is filtered by the length of the allele carrying it.
 - `path_support` counts any path that crosses the site, including one carrying the reference allele, so on a densely typed panel it approaches the panel size. `--min-alt-support` filters on the alternate alleles instead.
 - Only top-level snarls are emitted. A large tangle is reported as one site rather than decomposed, so variants nested inside it do not appear separately.
 - `--snarls-in` without `--reference-path` is diagnostic-only: imported boundaries carry no reference order, coordinate merging is skipped and no sorted graph is written. Do not pass that output to `call`, which anchors coordinates on the source boundary.

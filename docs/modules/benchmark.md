@@ -6,24 +6,32 @@ CLI: `panvar benchmark`
 
 Answers two different questions about the caller's own output, and keeps them apart.
 
-What was there to be found, and what became of it. Independently of any call, each haplotype's walk over a bubble is compared with the reference's, and every divergent block becomes a truth event classified by size and by whether a record covers it:
+What was there to be found, and what became of it. Independently of any call, each haplotype's walk over a bubble is compared with the reference's, and every divergent stretch becomes a truth event classified by size and by whether a record covers it:
 
 | class | definition |
 |-------|------------|
-| `called` | at least `--min-sv-bp` and some emitted record shares a node with the block |
+| `called` | at least `--min-sv-bp` and some emitted record shares a node with the stretch |
 | `missed` | at least `--min-sv-bp` and no emitted record covers it |
 | `below_threshold` | under `--min-sv-bp` — variation the caller never set out to emit |
 
-How much of the sequence comes back. Four reconstructions over the same bubbles against the same truth, differing only in what each is allowed to use:
+How much of the sequence comes back. Four reconstructions of each haplotype, each scored against that haplotype's true sequence.
 
-| level | reconstruction built from | answers |
-|-------|---------------------------|---------|
-| `graph` | reference walk plus the haplotype's own steps at every block sharing a node with any call | optimistic node-discovery ceiling: how far the union of called nodes reaches |
-| `called` | the same, restricted to blocks a specific record is attributed to and that reach `--min-sv-bp` | what the retained records would reach if each reproduced its block exactly |
-| `carrier` | `called`, plus the requirement that this haplotype's genotype names a record overlapping the block | the same ceiling once genotypes are applied |
-| `region_vcf` | the reference plus only the edits this haplotype's genotype names | what a consumer reconstructing this sample from the VCF actually gets |
+Three of the four are built the same way: walk the reference, and wherever this haplotype genuinely diverges from it, paste in the haplotype's own true sequence. They differ in one thing only — which divergent stretches are allowed to be pasted:
 
-The first three implant the haplotype's own true sequence and are therefore ceilings, not VCF reconstructions. Only `region_vcf` reconstructs what the records themselves say. No level uses reads: this measures the fidelity of the compact representation, not genotyping accuracy.
+| level | pastes a divergent stretch when | so it answers |
+|-------|---------------------------------|---------------|
+| `graph` | it touches any node that any call at this bubble also touches | could the graph hold this haplotype at all, and did the caller flag the right neighbourhood? |
+| `called` | a specific record is attributed to that exact stretch, and it is at least `--min-sv-bp` | do the retained records point at the right places? |
+| `carrier` | as `called`, and this haplotype's `GT` names that record | and are the right samples genotyped as carrying them? |
+
+Because they paste in the truth, these three are ceilings rather than reconstructions of what the caller said. They measure where the caller pointed. They never test whether a record's REF or ALT reproduces the sequence: a record can be perfectly placed and encode nonsense, and all three still score it as recovered.
+
+The fourth is different in kind. `region_vcf` takes the reference and applies only the edits this haplotype's `GT` names, from the VCF alone — the record's own REF and ALT, with no truth anywhere. It is the only level that measures what a consumer actually gets.
+
+Two distinctions worth stating plainly, because the levels are easy to collapse:
+
+- `graph` does not ask whether a variant was called on this haplotype. It asks only whether the haplotype's divergent stretch overlaps a node that some call — any call, any sample — also touched. Sharing a node is not matching an allele, so one correctly called stretch can authorise pasting a neighbouring, entirely uncalled one. That is why it is the loosest bound.
+- `called` is the strict version of that same idea: the stretch itself must map to an emitted record, not merely brush against one. Genotypes still play no part; `carrier` is where they enter.
 
 The region-VCF residual is then partitioned into five terms that sum to it exactly, so the shortfall can be attributed rather than just measured:
 
@@ -57,8 +65,6 @@ Algorithm and worked trace: [algorithms/benchmark.md](../algorithms/benchmark.md
 Optional: `--vcf <path>` accepts either VCF from `call`; `vcf_mode` reports which contract was detected. Region-VCF ids must match `variant_nodes.tsv` completely and agree on `BUBBLE_ID`. An allele VCF instead has one `bubbleN_ALLELES` record per bubble, so per-call carrier and loss-attribution terms are not applicable; allele mode measures explicit-allele serialization.
 
 `<prefix>.region.vcf` scores the merged, interpreted output; `<prefix>.alleles.vcf` (from `call --allele-vcf`) scores the explicit per-bubble alleles. Sample columns join graph paths by exact name and must contain haploid `GT`; record ids, `BUBBLE_ID`, row widths and duplicate names are validated. A partial sample/path join is accepted but reported because its quality values describe only the joined subset.
-
-All outputs are staged and committed only on success, and no output may name an input.
 
 ## Key options
 
@@ -121,17 +127,26 @@ The last five need `--vcf`. Without it only `graph` and `called` are scored, eve
 
 ### Plotting
 
-`scripts/plot_benchmark.R` consumes combined tables, not this module's own output:
+`scripts/plot_benchmark.R` plots one run straight from the output above:
 
-| input | where it comes from |
-|-------|---------------------|
-| `--table` | `scripts/regen_results.sh` concatenates each locus's `qv_by_haplotype.tsv` into `results/benchmark_qv.tsv`, adding the `locus` column it groups by. To plot one run alone, pass its `qv_by_haplotype.tsv` with `--locus <name>` |
-| `--loss` | `scripts/regen_results.sh` also builds `results/benchmark_loss.tsv` from the `loss_bp` rows of each `qv_summary.tsv`. `benchmark` writes no file with that name itself |
+```
+Rscript scripts/plot_benchmark.R --table <prefix>.qv_by_haplotype.tsv --locus <name> --out <prefix>
+```
+
+The per-haplotype table already carries every column the figure needs except the run's own name,
+which a single run has no reason to record; `scripts/plot_benchmark.R --locus` supplies it. Concatenate
+several runs' tables, each labelled, to compare them in one figure.
+
+The second panel of `scripts/plot_benchmark.R`, selected with `--loss`, is a cross-run view: it wants
+one row per run holding that run's do-nothing baseline and one column per partition term. That is a
+pivot of the loss rows in `qv_summary.tsv`, not a file this module writes. Building it is aggregation
+work outside the module; `scripts/regen_results.sh` does it for this repository's own results and is
+worth reading as an example rather than treated as a dependency.
 
 ## Limitations
 
-- The first three levels implant the haplotype's own true block, so they bound what the graph and the retained records could achieve rather than measuring what the VCF says. `region_vcf` is not bounded by them, since it applies every record the haplotype carries rather than only attributed eligible blocks, which is why the last two partition terms are signed.
-- `called` means a record shares a node with the block, not that it covers or reproduces it. It is an upper bound on discovery; `missed` is the firm negative.
+- The first three levels paste in the haplotype's own true sequence, so they bound what the graph and the retained records could achieve rather than measuring what the VCF says. `region_vcf` is not bounded by them, since it applies every record the haplotype carries rather than only attributed eligible stretches, which is why the last two partition terms are signed.
+- `called` means a record shares a node with the stretch, not that it covers or reproduces it. It is an upper bound on discovery; `missed` is the firm negative.
 - Duplication reconstruction is heuristic: the inferred reference span is tiled, so the length is right and the sequence only approximately.
 - Allele-VCF mode has one record per bubble while the node sidecar has one per call, so they share no identifier. The `carrier` level and the per-call loss terms are reported as not applicable in that mode rather than as zero.
 - There is no class for an eligible event removed by a frequency, support or resource policy: it is indistinguishable from one never discovered until the caller emits a decision audit.

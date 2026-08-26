@@ -13,7 +13,6 @@ Converts the called bubbles into per-haplotype genotype features for association
 The k-mer and graph substrates are built from the graph and emitted by default; the variant substrate is emitted when its VCF is supplied. Any one can be produced on its own (`--only-kmers`/`--only-graph`/`--only-variant`). The k-mer and graph substrates pass through a discriminative filter that drops features which do not vary across haplotypes — those present in all (or all but `--min-paths`) paths, unless their copy number varies — so only informative markers reach the matrix; the variant substrate emits every call and leaves frequency filtering to `associate`.
 Pass a [cosigt](https://github.com/davidebolo1993/cosigt) table (`sample <tab> hap1 <tab> hap2 …`) to `--samples <cosigt.tsv>` and `describe` also writes a per-sample BIMBAM for each substrate (under `sample/<substrate>/`) whose value sums the dosage over the sample's haplotypes, so a diploid genotype is the sum of the two. See [GWAS example](../gwas.md).
 
-Outputs are transactional: everything `describe` owns is built in a sibling staging directory and moved into place only once every substrate pass has succeeded. A rerun with a different substrate selection, `--bubble-id` or `--no-wide-matrix` setting removes the previous run's now-stale families rather than leaving them beside the new ones looking current; unrelated files in the output directory are left alone.
 
 Algorithm and worked trace: [algorithms/describe.md](../algorithms/describe.md).
 
