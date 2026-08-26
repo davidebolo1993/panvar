@@ -242,6 +242,30 @@ std::vector<BlockCall> genotype_sample(
             return mix(o, mean_a) - mix(o, mean_b);
         };
 
+        // Likelihood table. Every marker term is mix_diff(obs[s], lambda*m + mu, mu) with m a small
+        // integer, so when `scale` is 1 the whole term depends only on (slot, m) and can be looked
+        // up. `scale` is 1 unless --mass-weight is set, where it is a per-pair quantity profiled out
+        // of the emission -- so the table is built only when it is safe and the exact path is kept
+        // for that option rather than every run paying for it.
+        const bool tabulate = !(options.mass_weight > 0.0);
+        const std::size_t tab_m = static_cast<std::size_t>(max_mult) * 2 + 1;   // a PAIR's multiplicity
+        std::vector<double> ltab;
+        std::unordered_map<std::uint32_t, std::uint32_t> tab_row;   // slot -> row in ltab
+        if (tabulate) {
+            tab_row.reserve(universe.size() * 2);
+            ltab.assign(universe.size() * (tab_m + 1), 0.0);
+            std::uint32_t r = 0;
+            for (const std::uint32_t slot : universe) {
+                tab_row.emplace(slot, r);
+                const double o = static_cast<double>(counts.node[slot]);
+                for (std::size_t m = 0; m <= tab_m; ++m) {
+                    ltab[static_cast<std::size_t>(r) * (tab_m + 1) + m] =
+                        mix_diff(o, lambda * static_cast<double>(m) + mu, mu);
+                }
+                ++r;
+            }
+        }
+
         double baseline = 0.0;
         double obs_universe = 0.0;
         for (const std::uint32_t slot : universe) {
@@ -463,12 +487,27 @@ std::vector<BlockCall> genotype_sample(
             std::sort(sorted_nodes[x].begin(), sorted_nodes[x].end(),
                       [](const auto& a, const auto& b) { return a.first < b.first; });
         }
+        // Candidates whose retained marker vectors are IDENTICAL have, by construction, the same
+        // emission -- the term depends on the vector and nothing else. At a tandem array many
+        // alleles differ only in ways no retained marker sees, so this collapses a large share of
+        // the pair space. Exact: representatives are scored, the rest copied.
+        std::vector<std::size_t> rep_of(kn);          // candidate -> its representative
+        std::vector<std::size_t> reps;                // distinct vectors, in first-seen order
+        {
+            std::map<std::vector<std::pair<std::uint32_t, std::uint32_t>>, std::size_t> seen;
+            for (std::size_t x = 0; x < kn; ++x) {
+                const auto it = seen.find(sorted_nodes[x]);
+                if (it == seen.end()) { seen.emplace(sorted_nodes[x], x); rep_of[x] = x; reps.push_back(x); }
+                else { rep_of[x] = it->second; }
+            }
+        }
         std::vector<std::pair<std::uint32_t, std::uint32_t>> tot;   // reused; no per-pair allocation
         // Only the upper triangle is computed. A diploid pair is unordered and the emission sums the
         // two alleles' multiplicities, so emis[x][y] == emis[y][x] by construction; the lower half
         // was recomputed from scratch. Mirrored below.
-        for (std::size_t x = 0; x < kn; ++x) {
-            for (std::size_t y = x; y < kn; ++y) {
+        for (const std::size_t x : reps) {
+            for (const std::size_t y : reps) {
+                if (y < x) continue;
                 // Expected count per marker is lambda * (copies in allele1 + copies in allele2), with
                 // integer multiplicity and no cap -- which is what lets a tandem array with 20 copies
                 // be modelled at all.
@@ -538,9 +577,23 @@ std::vector<BlockCall> genotype_sample(
                         ll -= weight_of(slot) * (a <= c ? 0.5 * z * z : c * (a - 0.5 * c));
                     }
                 } else {
-                    for (const auto& [slot, m] : tot) {
-                        const double o = static_cast<double>(counts.node[slot]);
-                        ll += weight_of(slot) * mix_diff(o, scale * (lambda * m + mu), mu);
+                    if (tabulate) {
+                        for (const auto& [slot, m] : tot) {
+                            const auto it = tab_row.find(slot);
+                            if (it != tab_row.end() && m <= tab_m) {
+                                ll += weight_of(slot) *
+                                      ltab[static_cast<std::size_t>(it->second) * (tab_m + 1) + m];
+                            } else {   // outside the tabulated range; exact fallback
+                                ll += weight_of(slot) *
+                                      mix_diff(static_cast<double>(counts.node[slot]),
+                                               lambda * m + mu, mu);
+                            }
+                        }
+                    } else {
+                        for (const auto& [slot, m] : tot) {
+                            const double o = static_cast<double>(counts.node[slot]);
+                            ll += weight_of(slot) * mix_diff(o, scale * (lambda * m + mu), mu);
+                        }
                     }
                 }
                 // Outside the window the candidate is not scored: the reads say how much sequence is
@@ -656,6 +709,19 @@ std::vector<BlockCall> genotype_sample(
                     emis[bi][y * kn + x] = emis[bi][x * kn + y];
                     explained[bi][y * kn + x] = explained[bi][x * kn + y];
                     detected[bi][y * kn + x] = detected[bi][x * kn + y];
+                }
+            }
+        }
+        // Copy each representative pair's values out to every candidate pair that shares its
+        // vectors. Done after the scoring loop so the source cells are all populated.
+        if (reps.size() != kn) {
+            for (std::size_t x = 0; x < kn; ++x) {
+                for (std::size_t y = 0; y < kn; ++y) {
+                    if (rep_of[x] == x && rep_of[y] == y) continue;   // already scored
+                    const std::size_t sx = rep_of[x], sy = rep_of[y];
+                    emis[bi][x * kn + y] = emis[bi][sx * kn + sy];
+                    explained[bi][x * kn + y] = explained[bi][sx * kn + sy];
+                    detected[bi][x * kn + y] = detected[bi][sx * kn + sy];
                 }
             }
         }
