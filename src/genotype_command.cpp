@@ -199,6 +199,11 @@ void print_genotype_help() {
         << "                              every block. The panel's basic fact, and the only way to\n"
         << "                              recover TRANSITIONS between blocks: per-block dumps cannot\n"
         << "                              say which allele pairs co-occur on one haplotype\n"
+        << "      --oracle-called-only    With --certified-oracle, align ONLY the called pair rather\n"
+        << "                              than searching all 2A. Reports called_total_edits; best_*\n"
+        << "                              and excess_total_edits are NA. Use when the certified best\n"
+        << "                              is already known from an earlier run -- the search is 914\n"
+        << "                              alignments of ~50 kb at an array, about half an hour a sample\n"
         << "      --probe-pair <BLK:A,B>  Report the emission rank, tie count and delta for allele\n"
         << "                              pair (A,B) at block BLK instead of the truth's. The\n"
         << "                              certified oracle names the best REACHABLE pair, which at an\n"
@@ -271,6 +276,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
     // admits every state tied with the block optimum, which is a real and useful setting.
     double max_linkage_loss = std::numeric_limits<double>::infinity();
     long probe_block = -1; long probe_a = -1, probe_b = -1;
+    bool oracle_called_only = false;
     bool depth_calibration = false;
     double mass_weight = 0.0;
     bool nearest_rank = false;
@@ -395,6 +401,10 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--nearest-emission-rank") nearest_rank = true;
         else if (arg == "--oracle-emission-rank") oracle_rank = true;
         else if (arg == "--certified-oracle") certified_oracle = true;
+        // The 2A search is the whole cost: 914 alignments of ~50 kb sequences at LPA's array is
+        // half an hour per sample. When the certified best is already known from an earlier run,
+        // only the CALLED pair needs aligning, which is 2.
+        else if (arg == "--oracle-called-only") oracle_called_only = true;
         else if (arg == "--certified-oracle-block")
             certified_oracle_block = std::stol(require_value(arg));
         else if (arg == "--certified-oracle-max-alleles")
@@ -1802,13 +1812,18 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         // hours and the output stream buffers -- an empty file says nothing about how
                         // far it has got, which is how the first run became unobservable.
                         log.info("certified oracle: block " + std::to_string(chain[bi].index) + ", " +
-                                 std::to_string(A) + " alleles, " + std::to_string(2 * A) + " alignments");
+                                 std::to_string(A) + " alleles, " +
+                                 std::to_string(oracle_called_only ? 4 : 2 * A) + " alignments" +
+                                 (oracle_called_only ? " (called pair only; best_* will be NA)" : ""));
                         const std::string* tv[2] = {&ts1[bi], &ts2[bi]};
 
-                        // 2A alignments, the entire cost of the exercise.
+                        // 2A alignments, the entire cost of the exercise -- unless only the called
+                        // pair is wanted, in which case it is 2.
+                        const std::size_t ca0 = calls[bi].allele1, cb0 = calls[bi].allele2;
                         std::vector<std::array<NwAlign, 2>> al(A);
                         std::vector<std::array<long, 2>> dl(A);
                         for (std::size_t a = 0; a < A; ++a) {
+                            if (oracle_called_only && a != ca0 && a != cb0) continue;
                             for (int h = 0; h < 2; ++h) {
                                 al[a][static_cast<std::size_t>(h)] =
                                     nw_edit_distance(blocks[bi].allele_seq[a], *tv[h]);
@@ -1838,6 +1853,27 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         };
                         const char* names[3] = {"edit_distance", "mean_identity", "length_error"};
                         const std::size_t ca = calls[bi].allele1, cb = calls[bi].allele2;
+                        if (oracle_called_only) {
+                            // Only the called pair was aligned; every other al[] entry is a
+                            // default-constructed zero, which the search below would happily report
+                            // as a perfect best pair. Emit the called edits and nothing else.
+                            const long ce = (ca < A && cb < A)
+                                ? static_cast<long>(al[ca][0].edits + al[cb][1].edits)
+                                : -1;
+                            const long ce_sw = (ca < A && cb < A)
+                                ? static_cast<long>(al[ca][1].edits + al[cb][0].edits)
+                                : -1;
+                            const long cbest = (ce < 0) ? -1 : std::min(ce, ce_sw);
+                            orc << chain[bi].index << '\t'
+                                << (chain[bi].kind == BlockKind::Bubble ? "bubble"
+                                    : chain[bi].kind == BlockKind::Flank ? "flank" : "backbone")
+                                << '\t' << chain[bi].bubble_id << '\t' << A << '\t'
+                                << "edit_distance\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\t"
+                                << ca << '\t' << cb << "\tNA\tNA\tNA\tNA\tNA\tNA\t";
+                            if (cbest >= 0) orc << cbest << "\tNA\n"; else orc << "NA\tNA\n";
+                            orc.flush();
+                            continue;
+                        }
                         for (int crit = 0; crit < 3; ++crit) {
                             double best = std::numeric_limits<double>::infinity();
                             std::size_t ba = 0, bb = 0;
