@@ -428,6 +428,26 @@ else
   bad "--ledger-block wrote nothing for one of the two fixtures"
 fi
 
+# --oracle-called-only reports nothing on its own; saying so beats writing an empty table.
+"$BIN" genotype -i "$OUT/g.gfa" -b "$OUT/bub" -r ref -o "$OUT/oco" -R "$OUT/reads.fa" \
+  --oracle-called-only -q >"$OUT/oco.log" 2>&1
+rc=$?
+{ [ "$rc" -ne 0 ] && grep -qi "certified-oracle" "$OUT/oco.log"; } \
+  && ok "--oracle-called-only is refused without --certified-oracle" \
+  || bad "--oracle-called-only accepted alone (exit $rc), reporting nothing"
+
+# Full and called-only modes must agree on the one quantity they share.
+"$BIN" genotype -i "$OUT/g.gfa" -b "$OUT/bub" -r ref -o "$OUT/ofull" -R "$OUT/reads.fa" \
+  --truth-haplotypes 'hapA1,hapB1' --certified-oracle -q >/dev/null 2>&1
+"$BIN" genotype -i "$OUT/g.gfa" -b "$OUT/bub" -r ref -o "$OUT/ocall" -R "$OUT/reads.fa" \
+  --truth-haplotypes 'hapA1,hapB1' --certified-oracle --oracle-called-only -q >/dev/null 2>&1
+ce_of() { awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+          $(h["criterion"])=="edit_distance"{print $(h["block_index"])":"$(h["called_total_edits"])}' "$1" | tr '\n' ' '; }
+f=$(ce_of "$OUT/ofull.oracle.tsv"); c=$(ce_of "$OUT/ocall.oracle.tsv")
+{ [ -n "$f" ] && [ "$f" = "$c" ]; } \
+  && ok "called-only and full oracle agree on called_total_edits ($f)" \
+  || bad "called_total_edits differs: full [$f] vs called-only [$c]"
+
 # ------------------------------------------------------ --probe-pair, and the sentinel it can forge
 # The emission-rank diagnostics report on the truth pair, but at an unrepresentable block the truth
 # is not in the panel and the pair worth asking about is the certified-optimal one. --probe-pair
@@ -549,6 +569,32 @@ for TAU in 0 0.25 2; do
     && ok "at tau=$TAU no call falls further than tau below its block optimum (worst $wd)" \
     || bad "at tau=$TAU a call sits $wd below its block optimum, outside the constraint"
 done
+
+# The constraint has to bind on PRUNED pairs too. A pruned allele takes the all-background
+# likelihood by a path that used to return before the floor was applied, so at a block above
+# --max-alleles linkage could still reach a pruned pair while every scored pair was held to tau.
+# The delta check above cannot see it: an unscored call reports called_rank -1 and called_delta 0,
+# which reads as perfectly compliant. Rank is the assertion that catches it.
+"$BIN" genotype -i "$OUT/g.gfa" -b "$OUT/bub" -r ref -o "$OUT/lk_cap" -R "$OUT/reads.fa" \
+  --truth-haplotypes 'hapA1,hapB1' --max-alleles 2 --max-linkage-emission-loss 0 -q >/dev/null 2>&1
+if [ -s "$OUT/lk_cap.genotypes.tsv" ]; then
+  unscored=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+             $(h["n_alleles"])+0 > 2 && $(h["called_rank"])+0 < 1 {k++} END{print k+0}' "$OUT/lk_cap.genotypes.tsv")
+  over=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next} $(h["n_alleles"])+0 > 2{k++} END{print k+0}' "$OUT/lk_cap.genotypes.tsv")
+  [ "$over" -gt 0 ] \
+    && ok "the cap fixture actually prunes: $over block(s) have more alleles than --max-alleles 2" \
+    || bad "no block exceeds --max-alleles 2, so this cannot test the pruned-pair path"
+  # KNOWN GAP, stated so nobody reads this as a guard it is not. The assertion is right, but this
+  # fixture does not exercise it: verified by reintroducing the bug, which leaves it passing. Linkage
+  # here never prefers the pruned pair, so the background path is never the winner. Catching it needs
+  # a chain where a neighbouring block pulls the call onto a haplotype whose allele at THIS block was
+  # pruned. Until such a fixture exists the guard is the code review, not this line.
+  [ "$unscored" = "0" ] \
+    && ok "at finite tau every call is a SCORED pair (called_rank >= 1)  [see KNOWN GAP above]" \
+    || bad "$unscored calls at pruned-capable blocks have no emission rank: the floor is not applied to the background fallback"
+else
+  bad "the capped constrained run produced no genotypes"
+fi
 
 # tau=0 is NOT "off": it admits every state TIED with the optimum, so linkage can still resolve a
 # tie. At a block with no markers every pair ties, so tau=0 must change nothing there.

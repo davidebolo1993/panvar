@@ -647,22 +647,28 @@ std::vector<BlockCall> genotype_sample(
     // Transitions factorize (each haplotype switches independently), so a step is O(n^2) via row and
     // column sums rather than O(n^4).
     auto emission_for = [&](std::size_t bi, std::size_t i, std::size_t j) -> double {
+        // EVERY exit goes through the floor, the background fallbacks included. A pruned pair takes
+        // the all-background likelihood, and if that is left unguarded the constraint has a hole
+        // exactly where the block is largest: at a block above the allele cap, linkage could still
+        // reach a pruned pair while every scored pair was being held to within tau. At tau = inf the
+        // floor is -inf and this is the identity, so default behaviour is untouched.
+        // -1e18 rather than -inf, matching the mass window: the recursion multiplies these and a
+        // true -inf would poison sums that still have to normalize.
+        const auto guard = [&](double v) { return v < emis_floor[bi] ? -1e18 : v; };
         const int a = allele_of[bi][i];
         const int b = allele_of[bi][j];
-        if (a < 0 || b < 0 || kept[bi].empty()) return baseline_of[bi];
+        if (a < 0 || b < 0 || kept[bi].empty()) return guard(baseline_of[bi]);
         const auto xi = std::lower_bound(kept[bi].begin(), kept[bi].end(), static_cast<std::uint32_t>(a));
         const auto yi = std::lower_bound(kept[bi].begin(), kept[bi].end(), static_cast<std::uint32_t>(b));
         // A pruned allele falls back to the all-background likelihood rather than -inf. Zeroing it
         // would remove that haplotype from the forward recursion for the rest of the chain, so one
         // weak block could silently veto the correct haplotype everywhere.
-        if (xi == kept[bi].end() || *xi != static_cast<std::uint32_t>(a)) return baseline_of[bi];
-        if (yi == kept[bi].end() || *yi != static_cast<std::uint32_t>(b)) return baseline_of[bi];
+        if (xi == kept[bi].end() || *xi != static_cast<std::uint32_t>(a)) return guard(baseline_of[bi]);
+        if (yi == kept[bi].end() || *yi != static_cast<std::uint32_t>(b)) return guard(baseline_of[bi]);
         const std::size_t kn = kept[bi].size();
         const double v = emis[bi][static_cast<std::size_t>(xi - kept[bi].begin()) * kn +
                                   static_cast<std::size_t>(yi - kept[bi].begin())];
-        // Excluded states use the same -1e18 the mass window already uses, not -inf: the recursion
-        // multiplies these and a true -inf would poison sums that still have to normalize.
-        return v < emis_floor[bi] ? -1e18 : v;
+        return guard(v);
     };
 
     const double r = std::min(0.5, options.recomb_rate / static_cast<double>(std::max<std::size_t>(1, nb)));

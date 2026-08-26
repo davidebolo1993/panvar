@@ -470,6 +470,10 @@ int run_genotype_command(const std::vector<std::string>& args) {
     {
         options.fragment_len = fragment_len;
     }
+    if (oracle_called_only && !certified_oracle) {
+        throw std::runtime_error("genotype: --oracle-called-only only means anything with "
+                                 "--certified-oracle; on its own it reports nothing");
+    }
     if (!audit && !audit_linkage && read_paths.empty() && index_out.empty() && ledger_block < 0 &&
         alleles_out.empty()) {
         throw std::runtime_error(
