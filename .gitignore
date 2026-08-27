@@ -39,10 +39,11 @@ chiara_test/*
 # outlive any working tree: without them a clone gets the result tables with nothing to say what they
 # mean or what was declared before the run. Track the prose, ignore everything else.
 experiments/*
-!experiments/*.md
+#!experiments/*.md
 docs/reports/
 docs/review_followups.md
 reports/
 
 
 build_genotype_review/
+
