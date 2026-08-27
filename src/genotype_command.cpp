@@ -337,6 +337,11 @@ int run_genotype_command(const std::vector<std::string>& args) {
     // single-probe form has always done; all of them appear in the probe table.
     std::vector<std::array<std::size_t, 3>> probe_pairs;
     bool oracle_called_only = false;
+    // Extra allele pairs to price against the truth, beyond the certified best and the called pair.
+    // The oracle's cost is the 2A alignment cache; once it exists, any pair is two lookups. Without
+    // this, asking "how far from truth is the pair this new score picked" means re-running the whole
+    // 914-alignment search.
+    std::vector<std::array<std::size_t, 2>> oracle_pairs;
     bool depth_calibration = false;
     double mass_weight = 0.0;
     bool nearest_rank = false;
@@ -522,6 +527,24 @@ int run_genotype_command(const std::vector<std::string>& args) {
         // half an hour per sample. When the certified best is already known from an earlier run,
         // only the CALLED pair needs aligning, which is 2.
         else if (arg == "--oracle-called-only") oracle_called_only = true;
+        else if (arg == "--oracle-pair") {
+            const std::string v = require_value(arg);
+            const std::size_t c = v.find(',');
+            if (c == std::string::npos || v.find(',', c + 1) != std::string::npos)
+                throw std::runtime_error("--oracle-pair wants exactly A,B (e.g. 271,304)");
+            const auto whole = [&](const std::string& t) {
+                if (t.empty()) throw std::runtime_error("--oracle-pair has an empty field in '" + v + "'");
+                std::size_t used = 0; long n = 0;
+                try { n = std::stol(t, &used); }
+                catch (const std::exception&) {
+                    throw std::runtime_error("--oracle-pair: '" + t + "' is not a whole number"); }
+                if (used != t.size())
+                    throw std::runtime_error("--oracle-pair: '" + t + "' is not a whole number");
+                if (n < 0) throw std::runtime_error("--oracle-pair indices must be >= 0");
+                return static_cast<std::size_t>(n);
+            };
+            oracle_pairs.push_back({whole(v.substr(0, c)), whole(v.substr(c + 1))});
+        }
         else if (arg == "--certified-oracle-block")
             certified_oracle_block = std::stol(require_value(arg));
         else if (arg == "--certified-oracle-max-alleles")
@@ -586,6 +609,10 @@ int run_genotype_command(const std::vector<std::string>& args) {
     }
     {
         options.fragment_len = fragment_len;
+    }
+    if (!oracle_pairs.empty() && !certified_oracle) {
+        throw std::runtime_error("genotype: --oracle-pair prices a pair using the certified oracle's "
+                                 "alignment cache; it does nothing without --certified-oracle");
     }
     if (oracle_called_only && !certified_oracle) {
         throw std::runtime_error("genotype: --oracle-called-only only means anything with "
@@ -2144,6 +2171,16 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     const std::string op = out_prefix + ".oracle.tsv";
                     std::ofstream orc(op);
                     if (!orc) throw std::runtime_error("genotype: cannot write " + op);
+                    // Opened once, like orc. Opening it inside the per-block loop meant every block
+                    // truncated the previous one's rows and the file described only the last block.
+                    const std::string pp = out_prefix + ".oracle_pairs.tsv";
+                    std::ofstream opf;
+                    if (!oracle_pairs.empty()) {
+                        opf.open(pp);
+                        if (!opf) throw std::runtime_error("genotype: cannot write " + pp);
+                        opf << "block_index\tallele1\tallele2\th1_id\th2_id\th1_lenerr"
+                               "\th2_lenerr\ttotal_edits\tmean_id\texcess_total_edits\n";
+                    }
                     orc << "block_index\tblock_kind\tbubble_id\tn_alleles\tcriterion"
                            "\tbest_a\tbest_b\tbest_h1_id\tbest_h2_id\tbest_h1_lenerr\tbest_h2_lenerr"
                            "\tbest_total_edits\tbest_mean_id\tn_tied"
@@ -2178,8 +2215,16 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         const std::size_t ca0 = calls[bi].allele1, cb0 = calls[bi].allele2;
                         std::vector<std::array<NwAlign, 2>> al(A);
                         std::vector<std::array<long, 2>> dl(A);
+                        // Under --oracle-called-only the cache is trimmed to the called pair; any
+                        // allele named by --oracle-pair must survive that trim or it would be priced
+                        // from an alignment that was never computed.
+                        std::vector<char> want_allele(A, 0);
+                        for (const auto& pr : oracle_pairs) {
+                            if (pr[0] < A) want_allele[pr[0]] = 1;
+                            if (pr[1] < A) want_allele[pr[1]] = 1;
+                        }
                         for (std::size_t a = 0; a < A; ++a) {
-                            if (oracle_called_only && a != ca0 && a != cb0) continue;
+                            if (oracle_called_only && a != ca0 && a != cb0 && !want_allele[a]) continue;
                             for (int h = 0; h < 2; ++h) {
                                 al[a][static_cast<std::size_t>(h)] =
                                     nw_edit_distance(blocks[bi].allele_seq[a], *tv[h]);
@@ -2280,9 +2325,47 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             }
                         }
                         orc.flush();
+                        // Named pairs, priced from the same cache and against the same truth. Written
+                        // to their own file rather than as extra rows of oracle.tsv, whose schema is
+                        // one row per criterion and is consumed by existing scripts.
+                        if (!oracle_pairs.empty()) {
+                            std::ofstream& of = opf;
+                            // best_* on the edit_distance criterion, recomputed here so the excess is
+                            // against the certified optimum and not against whatever ran last.
+                            std::size_t eb_a = 0, eb_b = 0; long eb = -1;
+                            for (std::size_t a = 0; a < A; ++a) {
+                                if (oracle_called_only && !want_allele[a] && a != ca0 && a != cb0) continue;
+                                for (std::size_t b = a; b < A; ++b) {
+                                    if (oracle_called_only && !want_allele[b] && b != ca0 && b != cb0) continue;
+                                    const long e0 = static_cast<long>(al[a][0].edits + al[b][1].edits);
+                                    const long e1 = static_cast<long>(al[a][1].edits + al[b][0].edits);
+                                    const long e = std::min(e0, e1);
+                                    if (eb < 0 || e < eb) { eb = e; eb_a = a; eb_b = b; }
+                                }
+                            }
+                            (void)eb_a; (void)eb_b;
+                            for (const auto& pr : oracle_pairs) {
+                                of << chain[bi].index << '\t' << pr[0] << '\t' << pr[1] << '\t';
+                                if (pr[0] >= A || pr[1] >= A) { of << "NA\tNA\tNA\tNA\tNA\tNA\tNA\n"; continue; }
+                                // The better of the two haplotype assignments, by edits, matching how
+                                // the oracle scores the called pair.
+                                const long e0 = static_cast<long>(al[pr[0]][0].edits + al[pr[1]][1].edits);
+                                const long e1 = static_cast<long>(al[pr[0]][1].edits + al[pr[1]][0].edits);
+                                const int sw = (e1 < e0) ? 1 : 0;
+                                const std::size_t x = sw ? pr[1] : pr[0], y = sw ? pr[0] : pr[1];
+                                const long tot = std::min(e0, e1);
+                                of << ident(x, 0) << '\t' << ident(y, 1) << '\t'
+                                   << dl[x][0] << '\t' << dl[y][1] << '\t' << tot << '\t'
+                                   << ((ident(x, 0) + ident(y, 1)) / 2.0) << '\t'
+                                   << (eb >= 0 ? std::to_string(tot - eb) : std::string("NA")) << '\n';
+                            }
+                            of.flush();
+                            if (!of) throw std::runtime_error("genotype: write failed for " + pp);
+                        }
                     }
                     if (!orc) throw std::runtime_error("genotype: write failed for " + op);
                     log.wrote({op});
+                    if (!oracle_pairs.empty()) log.wrote({pp});
                 }
 
                 if (!blocks.empty() && !blocks[0].allele_seq.empty()) {

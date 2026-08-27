@@ -650,6 +650,41 @@ else
   bad "--noiseless-counts <BLK> ran with no truth to take counts from (exit $?)"
 fi
 
+# ------------------------------------------- --oracle-pair prices from the same cache, or it lies
+# The oracle's cost is the 2A alignment cache; once built, any pair is two lookups. The danger is
+# that the lookup drifts from what the oracle itself reports -- a different haplotype assignment, a
+# different criterion -- and then a score's selected pair is priced on a scale the certified optimum
+# was never on. Pricing the CALLED pair must reproduce called_total_edits exactly.
+"$BIN" genotype -i "$OUT/g.gfa" -b "$OUT/bub" -r ref -o "$OUT/opr" -R "$OUT/reads.fa" \
+  --truth-haplotypes 'hapA1,hapB1' --certified-oracle --certified-oracle-block 1 \
+  --oracle-pair 0,1 --oracle-pair 1,2 -q >/dev/null 2>&1
+if [ -s "$OUT/opr.oracle_pairs.tsv" ]; then
+  cp=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next} $1==1 && $(h["criterion"])=="edit_distance"{
+        print $(h["called_a"])","$(h["called_b"]); exit}' "$OUT/opr.oracle.tsv")
+  ce=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next} $1==1 && $(h["criterion"])=="edit_distance"{
+        print $(h["called_total_edits"]); exit}' "$OUT/opr.oracle.tsv")
+  pe=$(awk -F'\t' -v p="$cp" 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
+        $1==1 && $(h["allele1"])","$(h["allele2"])==p{print $(h["total_edits"]); exit}' "$OUT/opr.oracle_pairs.tsv")
+  if [ -n "$pe" ] && [ "$pe" = "$ce" ]; then
+    ok "--oracle-pair prices the called pair at the oracle's own total_edits ($ce)"
+  else
+    bad "--oracle-pair says $pe for the called pair $cp, oracle.tsv says $ce"
+  fi
+  # Rows must cover every block asked for, not only the last one processed.
+  n=$(awk 'NR>1' "$OUT/opr.oracle_pairs.tsv" | wc -l | tr -d ' ')
+  [ "$n" = "2" ] && ok "--oracle-pair writes one row per named pair" \
+                 || bad "--oracle-pair wrote $n rows for two pairs (a per-block reopen truncates)"
+else
+  bad "--oracle-pair produced no table"
+fi
+"$BIN" genotype -i "$OUT/g.gfa" -b "$OUT/bub" -r ref -o "$OUT/opx" -R "$OUT/reads.fa" \
+  --truth-haplotypes 'hapA1,hapB1' --oracle-pair 0,1 -q >"$OUT/opx.log" 2>&1
+if [ $? -ne 0 ] && grep -qi "certified-oracle" "$OUT/opx.log"; then
+  ok "--oracle-pair refuses without --certified-oracle"
+else
+  bad "--oracle-pair ran with no alignment cache to price from"
+fi
+
 # ----------------------------------- the certified oracle's edit columns, and which row owns them
 # excess_total_edits is (called - best) EDITS, and only the edit_distance row's `best` minimises
 # edits. On this fixture the length_error row's "best" pair sits 69 edits from truth while the
