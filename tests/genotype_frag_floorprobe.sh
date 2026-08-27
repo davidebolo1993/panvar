@@ -28,7 +28,7 @@ ND=${#DONORS[@]}
 [[ ! -d "$OUT/panel_all" ]] && "$PY" "$REPO/scripts/spell_paths.py" -i "$G" -o "$OUT/panel_all" >/dev/null
 
 RES="$OUT/floorprobe.tsv"
-printf 'locus\tdonor\tfloor\tcalled\texcess\tfloor_hap1_shortlisted\tfloor_hap2_shortlisted\tfloor_pair_rank\tfloor_pair_delta\tverdict\n' > "$RES"
+printf 'locus\tdonor\tfloor\tcalled\texcess\tfloor_hap1_shortlisted\tfloor_hap2_shortlisted\tfloor_pair_rank\tfloor_pair_delta\ttruth_bp\tfloor_bp\tcalled_bp\tlen_err_total\tlen_err_per_hap\tnm\tunaligned\tverdict\n' > "$RES"
 
 for ((p=0; p<DONORS_N && p<ND; p++)); do
   d=$(( (SEED + p * 7919) % ND ))
@@ -60,8 +60,25 @@ for line in open(sys.argv[1]):
 for i,(k,v) in enumerate(s.items(),1):
     open(f"{sys.argv[2]}/called_{i}.fa","w").write(f">{k}\n{''.join(v)}\n")
 PYS
-  read -r _ CALLED _ _ _ _ _ < <("$PY" "$REPO/scripts/genotype_pair_sequence_distance.py" \
+  read -r _ CALLED NM UNAL _ _ _ _ < <("$PY" "$REPO/scripts/genotype_pair_sequence_distance.py" \
       "$T1" "$T2" "$OUT/called_1.fa" "$OUT/called_2.fa" c)
+  # Lengths, so a length/CN failure separates from a composition failure at the right length.
+  bp() { awk 'NR>1||/^[ACGTNacgtn]/{ if(substr($0,1,1)!=">") n+=length($0) } END{print n+0}' "$@"; }
+  TBP=$(( $(bp "$T1") + $(bp "$T2") ))
+  CBP=$(( $(bp "$OUT/called_1.fa") + $(bp "$OUT/called_2.fa") ))
+  rm -rf "$OUT/fl"; "$PY" "$REPO/scripts/spell_paths.py" -i "$G" -o "$OUT/fl" --paths "$B1,$B2" >/dev/null 2>&1
+  FBP=$(bp $(ls "$OUT"/fl/*.fa 2>/dev/null) 2>/dev/null); FBP=${FBP:-0}
+  LERR=$(( CBP > TBP ? CBP - TBP : TBP - CBP ))
+  # per-homologue length error under the better assignment: a correct TOTAL with the wrong split
+  # between homologues is an allocation failure, not a dosage one, and they need different fixes
+  LPH=$("$PY" - "$T1" "$T2" "$OUT/called_1.fa" "$OUT/called_2.fa" <<'PYS'
+import sys
+def n(p):
+    return sum(len(l.strip()) for l in open(p) if not l.startswith(">"))
+t1,t2,c1,c2=[n(x) for x in sys.argv[1:5]]
+print(min(abs(t1-c1)+abs(t2-c2), abs(t1-c2)+abs(t2-c1)))
+PYS
+)
   read -r _ _ SL1 RANK _ DELTA _ _ < <(tail -1 "$OUT/frag.hap_probes.tsv")
   # shortlist membership of each floor haplotype separately: "one of two" is a different failure
   s1=$(awk -F'\t' -v n="$B1" 'NR>1 && $1==n{print 1; exit}' "$OUT/frag.hap_scores.tsv"); s1=${s1:-0}
@@ -71,14 +88,20 @@ PYS
   elif [ "$s1$s2" != "11" ]; then V="candidates:one"
   elif [ "$RANK" = "1" ]; then V="not-selection"
   else V="likelihood"; fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$LOCUS" "$DONOR" "$FLOOR" "$CALLED" "$EX" "$s1" "$s2" "$RANK" "$DELTA" "$V" >> "$RES"
-  printf "  %-10s floor=%-7s called=%-7s excess=%-7s shortlisted=%s%s rank=%-5s %s\n" \
-    "$DONOR" "$FLOOR" "$CALLED" "$EX" "$s1" "$s2" "$RANK" "$V"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$LOCUS" "$DONOR" "$FLOOR" "$CALLED" "$EX" "$s1" "$s2" "$RANK" "$DELTA" \
+    "$TBP" "$FBP" "$CBP" "$LERR" "$LPH" "$NM" "$UNAL" "$V" >> "$RES"
+  printf "  %-10s floor=%-7s called=%-7s excess=%-8s len_err=%-8s per_hap=%-8s nm=%-7s unal=%-8s %s\n" \
+    "$DONOR" "$FLOOR" "$CALLED" "$EX" "$LERR" "$LPH" "$NM" "$UNAL" "$V"
 done
 echo
-awk -F'\t' 'NR>1{v[$10]++; if($5>100) big[$10]++} END{
-  print "verdict for donors missing the floor by >100 edits:"
+awk -F'\t' 'NR>1{v[$17]++; if($5>100) big[$17]++} END{
+  print "mechanism for donors missing the floor by >100 edits:"
   for(k in big) printf "  %-22s %d\n", k, big[k]
   print "all donors:"; for(k in v) printf "  %-22s %d\n", k, v[k]}' "$RES"
+echo
+awk -F'\t' 'NR>1 && $5>100 {
+    printf "  %-10s excess=%-8s of which unaligned=%-8s length_err=%-8s per_hap=%-8s -> %s\n",
+      $2,$5,$16,$13,$14, ($13>$5/2 ? "LENGTH/CN dominates" : ($16>$5/2 ? "missing sequence" : "composition"))
+  }' "$RES"
 echo "rows: $RES"

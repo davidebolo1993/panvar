@@ -1,5 +1,6 @@
 #include "panvar/genotype_fragments.hpp"
 
+#include "panvar/align.hpp"
 #include "panvar/graph_utils.hpp"
 #include "panvar/parallel.hpp"
 #include "panvar/syncmer.hpp"
@@ -934,6 +935,18 @@ HaplotypeResult genotype_haplotype_pairs(
     const double log_mix = std::log1p(-options.outlier_mix);
     const double log_out = std::log(options.outlier_mix);
 
+    // lambda, fitted once and outside every candidate: the observed fragment count over twice the
+    // panel's median haplotype length. Using any candidate's own length here would make the term
+    // self-fulfilling.
+    double lambda = options.haploid_depth;
+    if (options.total_depth && lambda <= 0.0) {
+        std::vector<std::size_t> lens;
+        for (std::size_t h = 0; h < nh; ++h) lens.push_back(haps[h].seq.size());
+        std::sort(lens.begin(), lens.end());
+        const double med = lens.empty() ? 0.0 : static_cast<double>(lens[lens.size() / 2]);
+        if (med > 0.0) lambda = static_cast<double>(fragments.size()) / (2.0 * med);
+    }
+
     std::vector<HaplotypePairScore> pairs;
     pairs.reserve(nh * (nh + 1) / 2);
     std::vector<std::pair<std::size_t, std::size_t>> pair_index;
@@ -951,7 +964,19 @@ HaplotypeResult genotype_haplotype_pairs(
             const double num = log_add(ll[fi * nh + a], ll[fi * nh + b]);
             total += log_add(log_mix + num - log_total_len, log_out + floors[fi]);
         }
-        pair_score[pi] = total + cov_ll[a] + cov_ll[b];
+        const double pair_bp = static_cast<double>(haps[a].seq.size() + haps[b].seq.size());
+        double dosage = 0.0;
+        if (options.truth_total_bp > 0.0) {
+            // Oracle arm: a sharp penalty on total-length error, standing in for perfect dosage
+            // knowledge. Not a model, a bound.
+            const double err = std::abs(pair_bp - options.truth_total_bp);
+            dosage = -err;
+        } else if (options.total_depth && lambda > 0.0) {
+            const double mean = lambda * pair_bp;
+            const double n = static_cast<double>(fragments.size());
+            dosage = n * std::log(mean) - mean - std::lgamma(n + 1.0);
+        }
+        pair_score[pi] = total + cov_ll[a] + cov_ll[b] + dosage;
     });
     for (std::size_t pi = 0; pi < pair_index.size(); ++pi) {
         pairs.push_back({pair_index[pi].first, pair_index[pi].second, pair_score[pi], 0.0});
@@ -1039,6 +1064,112 @@ HaplotypeResult genotype_haplotype_pairs(
 
     for (std::size_t i = 0; i < std::min(top_pairs_kept, pairs.size()); ++i) {
         out.top_pairs.push_back(pairs[i]);
+    }
+    return out;
+}
+
+MosaicFloors mosaic_floors(const std::vector<BlockAlleles>& blocks,
+                           const std::vector<std::string>& haplotype_names,
+                           const std::vector<std::string>& truth_block_seq,
+                           const std::vector<double>& switch_penalties,
+                           std::size_t threads) {
+    MosaicFloors out;
+    out.blocks = blocks.size();
+    const std::size_t nb = blocks.size();
+    const std::size_t nh = haplotype_names.size();
+
+    // cost[block][haplotype] = edit distance from that haplotype's allele here to the truth's own
+    // sequence here. Global alignment, not an alignment-derived approximation: these are block
+    // alleles, short enough that the exact distance is affordable and the right thing to use.
+    std::vector<std::vector<std::size_t>> cost(nb);
+    std::vector<char> scored(nb, 0);
+    run_parallel(nb, threads, [&](std::size_t bi) {
+        cost[bi].assign(nh, 0);
+        if (bi >= truth_block_seq.size()) return;
+        const std::string& truth = truth_block_seq[bi];
+        // Distinct alleles are aligned ONCE and reused across every haplotype carrying them; at a
+        // locus with 466 haplotypes over a handful of alleles per block that is the whole cost.
+        std::unordered_map<std::size_t, std::size_t> by_allele;
+        bool any = false;
+        for (std::size_t h = 0; h < nh; ++h) {
+            const auto it = blocks[bi].allele_of.find(haplotype_names[h]);
+            if (it == blocks[bi].allele_of.end() || it->second >= blocks[bi].allele_seq.size()) {
+                // The haplotype does not traverse: it spells nothing, so it costs the truth's whole
+                // length here. That is a real cost, not missing data.
+                cost[bi][h] = truth.size();
+                continue;
+            }
+            any = true;
+            const std::size_t ai = it->second;
+            const auto cached = by_allele.find(ai);
+            if (cached != by_allele.end()) { cost[bi][h] = cached->second; continue; }
+            const std::string& cand = blocks[bi].allele_seq[ai];
+            std::size_t d;
+            if (cand.empty() || truth.empty()) d = cand.size() + truth.size();
+            else d = nw_edit_distance(cand, truth).edits;
+            by_allele.emplace(ai, d);
+            cost[bi][h] = d;
+        }
+        scored[bi] = (any && !truth.empty()) ? 1 : 0;
+    });
+    for (std::size_t bi = 0; bi < nb; ++bi) if (scored[bi]) ++out.blocks_scored;
+
+    // complete: one haplotype for the whole locus
+    std::size_t best_total = std::numeric_limits<std::size_t>::max();
+    for (std::size_t h = 0; h < nh; ++h) {
+        std::size_t t = 0;
+        for (std::size_t bi = 0; bi < nb; ++bi) t += cost[bi][h];
+        best_total = std::min(best_total, t);
+    }
+    out.complete = best_total == std::numeric_limits<std::size_t>::max() ? 0 : best_total;
+
+    // free: the nearest allele at every block, independently
+    {
+        std::size_t total = 0, sw = 0;
+        long prev = -1;
+        for (std::size_t bi = 0; bi < nb; ++bi) {
+            std::size_t best = std::numeric_limits<std::size_t>::max();
+            long arg = -1;
+            for (std::size_t h = 0; h < nh; ++h) {
+                if (cost[bi][h] < best) { best = cost[bi][h]; arg = static_cast<long>(h); }
+            }
+            if (arg < 0) continue;
+            total += best;
+            if (prev >= 0 && arg != prev) ++sw;
+            prev = arg;
+        }
+        out.free_mosaic = total;
+        out.switches_free = sw;
+    }
+
+    // penalised: Viterbi over source haplotype, with a cost for switching. The min-plus structure
+    // lets each block be done in O(n) rather than O(n^2): staying costs dp[h], switching costs
+    // (best over all h) + penalty.
+    for (const double pen : switch_penalties) {
+        std::vector<double> dp(nh, 0.0);
+        std::vector<std::size_t> sw_count(nh, 0);
+        for (std::size_t bi = 0; bi < nb; ++bi) {
+            double best = std::numeric_limits<double>::infinity();
+            std::size_t best_h = 0;
+            for (std::size_t h = 0; h < nh; ++h) {
+                if (dp[h] < best) { best = dp[h]; best_h = h; }
+            }
+            std::vector<double> next(nh);
+            std::vector<std::size_t> next_sw(nh);
+            for (std::size_t h = 0; h < nh; ++h) {
+                const double stay = dp[h];
+                const double move = best + pen;
+                if (bi > 0 && move < stay) { next[h] = move + cost[bi][h]; next_sw[h] = sw_count[best_h] + 1; }
+                else { next[h] = stay + cost[bi][h]; next_sw[h] = sw_count[h]; }
+            }
+            dp.swap(next);
+            sw_count.swap(next_sw);
+        }
+        double best = std::numeric_limits<double>::infinity();
+        std::size_t best_h = 0;
+        for (std::size_t h = 0; h < nh; ++h) if (dp[h] < best) { best = dp[h]; best_h = h; }
+        out.penalised.emplace_back(pen, static_cast<std::size_t>(best + 0.5));
+        out.penalised_switches.push_back(sw_count[best_h]);
     }
     return out;
 }

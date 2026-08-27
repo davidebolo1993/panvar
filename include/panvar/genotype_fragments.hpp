@@ -217,6 +217,33 @@ struct HaplotypeScoreOptions : FragmentScoreOptions {
     // spelling artefact: concatenating a haplotype's own block alleles reproduces its sequence at 0
     // edits over 213 kb.
     bool project_map = true;
+    // TOTAL-DOSAGE CHANNEL, and deliberately not another coverage weight.
+    //
+    // Alignment identity cannot see copy number: reads from a sample's single copy align perfectly
+    // to a candidate carrying two near-identical copies. Measured, cyp2d6 HG04036 carries a
+    // haplotype 12,121 bp shorter than the panel median and the caller misses by 12,136 -- the
+    // absent sequence almost exactly.
+    //
+    // The per-haplotype window channel could not fix it, for two reasons, and only one was a tuning
+    // problem. The rate was fitted per haplotype, which normalises absolute depth away; and every
+    // fragment was counted on EVERY haplotype it placed on, so one real fragment made two candidate
+    // copies both look covered. No shared rate repairs the second -- the reads have already been
+    // duplicated.
+    //
+    // This asks a coarser question that needs neither: does the pair's TOTAL length explain how many
+    // fragments were seen at all?
+    //
+    //     N_fragments ~ Poisson( lambda * (L(h1) + L(h2)) )
+    //
+    // with lambda estimated ONCE, outside any candidate, from the observed fragment count over twice
+    // the panel's median haplotype length. Each fragment is counted once by construction, because
+    // the observation is a single scalar.
+    bool total_depth = false;
+    double haploid_depth = 0.0;      // fragments per bp per haplotype copy; 0 = estimate externally
+    // Diagnostic ONLY: score pairs on how close their total length is to the sample's true total,
+    // which no caller can know. It bounds what perfect dosage knowledge could buy, so a failure here
+    // means the tail is not a dosage problem at all.
+    double truth_total_bp = 0.0;
     // Sequence compatibility and copy number are different signals and a read alignment cannot carry
     // both. Measured, at cyp2d6 leave-ZERO-out: NA18939's haplotype 1 is 13.6 kb longer than the
     // panel's typical haplotype -- a duplication -- and the reads from the extra copy align perfectly
@@ -341,6 +368,42 @@ void spell_called_pair(
     const std::vector<int>& allele2,
     std::string& seq1,
     std::string& seq2);
+
+// ---------------------------------------------------------------------------------------------
+// FLOORS
+//
+// Three different questions about how well the PANEL could possibly do, which the single
+// "best complete pair" number conflates:
+//
+//   complete   one panel haplotype per homologue across the whole locus. What a non-mosaic caller
+//              can reach at best.
+//   free       the nearest panel allele at every block, chosen independently. A mathematical
+//              optimum: it may switch source haplotype at every boundary with no evidence for any
+//              of the switches, so it is a bound and not a target.
+//   penalised  the same, with a cost for changing source haplotype between blocks. Between the two,
+//              and the only one of the three whose switches are constrained at all.
+//
+// H_mosaic = complete - free is what a mosaic model could recover AT MOST. Small, and a factor graph
+// is not worth building; large, and the next question is whether the switches have spanning-fragment
+// evidence, which is a separate measurement again.
+struct MosaicFloors {
+    std::size_t blocks = 0;
+    std::size_t blocks_scored = 0;      // where the truth traverses and the panel offers an allele
+    std::size_t complete = 0;
+    std::size_t free_mosaic = 0;
+    std::size_t switches_free = 0;      // source-haplotype changes the free optimum uses
+    std::vector<std::pair<double, std::size_t>> penalised;   // (penalty per switch, total)
+    std::vector<std::size_t> penalised_switches;
+};
+
+// Per homologue, so the two can differ and be reported separately: one may be represented well and
+// the other not, and a summed figure hides that entirely.
+MosaicFloors mosaic_floors(
+    const std::vector<BlockAlleles>& blocks,
+    const std::vector<std::string>& haplotype_names,
+    const std::vector<std::string>& truth_block_seq,
+    const std::vector<double>& switch_penalties,
+    std::size_t threads);
 
 void write_fragment_results(
     const std::string& out_prefix,

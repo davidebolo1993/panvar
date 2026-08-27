@@ -1,5 +1,6 @@
 #include "panvar/genotype_frag_command.hpp"
 
+#include "panvar/align.hpp"
 #include "panvar/bubble_path.hpp"
 #include "panvar/bubbles.hpp"
 #include "panvar/cli_utils.hpp"
@@ -105,6 +106,22 @@ void print_help() {
         << "      --placement-topk <N>    Implied-start bins kept per mate per haplotype (default 2).\n"
         << "                              A sum over placements is only meaningful if the placements\n"
         << "                              are enumerated, so raise it with the flag above\n"
+        << "      --total-depth           Score the pair's TOTAL length against how many fragments\n"
+        << "                              were seen: N ~ Poisson(lambda * (L(h1)+L(h2))), with lambda\n"
+        << "                              fitted once from the observed count over twice the panel's\n"
+        << "                              median haplotype length -- outside any candidate, so the\n"
+        << "                              term cannot be self-fulfilling. Each fragment is counted\n"
+        << "                              once by construction, because the observation is a single\n"
+        << "                              scalar; that is the defect the per-haplotype window channel\n"
+        << "                              could not escape, where one fragment made every candidate\n"
+        << "                              copy it aligned to look covered\n"
+        << "      --haploid-depth <x>     Supply lambda (fragments per bp per haplotype copy) instead\n"
+        << "                              of estimating it; implies --total-depth\n"
+        << "      --truth-total-bp <N>    DIAGNOSTIC: rank pairs by how close their total length is to\n"
+        << "                              N, the sample's true diploid total, which no caller can\n"
+        << "                              know. Bounds what perfect dosage knowledge could buy -- if\n"
+        << "                              the tail does not close under this, it is not a dosage\n"
+        << "                              problem and no depth model will fix it\n"
         << "      --coverage-weight <w>   Weight on the depth channel in --haplotype-mode (default\n"
         << "                              1.0; 0 disables). Sequence compatibility and copy number are\n"
         << "                              different signals: reads from a duplicated segment align\n"
@@ -118,6 +135,25 @@ void print_help() {
         << "                              blocks. Real mechanism, not yet a safe default\n"
         << "      --coverage-window <N>   Window size for that channel (default 500)\n"
         << "      --blocks <a,b,c>        Score only these chain indices. Default: every bubble block\n"
+        << "      --exact-distance <a.fa> <b.fa>\n"
+        << "                              Global (Needleman-Wunsch) edit distance between two\n"
+        << "                              sequences, printed and nothing else. The panel floor is\n"
+        << "                              computed from minimap2, which reports alignments rather\n"
+        << "                              than a distance: split or overlapping records can double\n"
+        << "                              count edits, and anything it declines to align is charged\n"
+        << "                              as a whole unaligned base. Use this to check the floor\n"
+        << "                              exactly on the few nearest candidates -- it is affordable\n"
+        << "                              there and not over a whole panel\n"
+        << "      --mosaic-floor          Three floors instead of one, needing --truth-haplotypes\n"
+        << "                              and no reads: COMPLETE (one panel haplotype per homologue\n"
+        << "                              across the locus), FREE (the nearest panel allele at every\n"
+        << "                              block, chosen independently -- a bound, since it may switch\n"
+        << "                              source at every boundary with no evidence for any switch),\n"
+        << "                              and PENALISED (the same with a cost per switch). Their\n"
+        << "                              difference is the most a mosaic model could ever recover,\n"
+        << "                              which is the measurement that decides whether a factor\n"
+        << "                              graph is worth building at all\n"
+        << "      --switch-penalties <a,b,c>  Penalties to evaluate (default 0,10,100,1000)\n"
         << "      --spell-calls <gt.tsv>  Read a per-block call table (either caller's) and write the\n"
         << "                              two sequences it claims, to <out-prefix>.called.fa. Needed\n"
         << "                              because the two callers report in different shapes and\n"
@@ -198,6 +234,9 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     std::string gfa_path, bubble_prefix_in, bubbles_csv_in, out_prefix;
     std::vector<std::string> read_paths;
     std::string truth_haplotypes, exclude_haplotypes, blocks_arg, spell_calls;
+    bool mosaic_floor = false;
+    std::string switch_penalties_arg = "0,10,100,1000";
+    std::vector<std::string> exact_distance;
     bool all_blocks = false, quiet = false, hap_mode = false, length_normalize_set = false;
     std::size_t top_pairs = 20;
     HaplotypeScoreOptions hopt;
@@ -219,6 +258,10 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--blocks") blocks_arg = value(i, a);
         else if (a == "--all-blocks") all_blocks = true;
         else if (a == "--spell-calls") spell_calls = value(i, a);
+        else if (a == "--mosaic-floor") mosaic_floor = true;
+        else if (a == "--switch-penalties") switch_penalties_arg = value(i, a);
+        else if (a == "--exact-distance") { exact_distance.push_back(value(i, a));
+                                            exact_distance.push_back(value(i, a)); }
         else if (a == "--truth-haplotypes") truth_haplotypes = value(i, a);
         else if (a == "--exclude-haplotypes") exclude_haplotypes = value(i, a);
         else if (a == "--flank-bp") opt.flank_bp = cli::parse_size_arg(a, value(i, a));
@@ -247,6 +290,9 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--project-marginal") hopt.project_map = false;
         else if (a == "--marginalise-placements") hopt.marginalise_placements = true;
         else if (a == "--placement-topk") hopt.placement_topk = cli::parse_size_arg(a, value(i, a));
+        else if (a == "--total-depth") hopt.total_depth = true;
+        else if (a == "--haploid-depth") { hopt.haploid_depth = std::stod(value(i, a)); hopt.total_depth = true; }
+        else if (a == "--truth-total-bp") hopt.truth_total_bp = std::stod(value(i, a));
         else if (a == "--coverage-weight") hopt.coverage_weight = std::stod(value(i, a));
         else if (a == "--coverage-window") hopt.coverage_window = cli::parse_size_arg(a, value(i, a));
         else if (a == "--max-divergence") opt.max_divergence = std::stod(value(i, a));
@@ -260,10 +306,29 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else throw std::runtime_error("genotype-frag: unknown option " + a);
     }
 
+    if (!exact_distance.empty()) {
+        const auto slurp = [](const std::string& path) {
+            std::ifstream in(path);
+            if (!in) throw std::runtime_error("genotype-frag: cannot read " + path);
+            std::string line, seq;
+            while (std::getline(in, line)) {
+                if (!line.empty() && line[0] == '>') continue;
+                while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+                seq += line;
+            }
+            return seq;
+        };
+        const std::string a = slurp(exact_distance[0]);
+        const std::string b = slurp(exact_distance[1]);
+        if (a.empty() || b.empty()) { std::cout << (a.size() + b.size()) << '\n'; return 0; }
+        std::cout << nw_edit_distance(a, b).edits << '\n';
+        return 0;
+    }
+
     if (gfa_path.empty() || out_prefix.empty()) {
         throw std::runtime_error("genotype-frag requires --gfa and --out-prefix");
     }
-    if (read_paths.empty() && spell_calls.empty()) {
+    if (read_paths.empty() && spell_calls.empty() && !mosaic_floor) {
         throw std::runtime_error("genotype-frag requires at least one --reads");
     }
     if (!bubble_prefix_in.empty()) {
@@ -389,6 +454,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
 
     // ---- truth, resolved the same way `genotype` resolves it ---------------------------------
     std::vector<int> truth1, truth2;
+    std::vector<std::string> truth_seq1, truth_seq2;
     bool have_truth = false;
     if (!truth_haplotypes.empty()) {
         const std::vector<std::string> names = split_commas(truth_haplotypes);
@@ -408,15 +474,22 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                                                           chain[bi], opt.threads);
             }
         }
-        const auto resolve = [&](const std::string& name, std::vector<int>& out_alleles) {
+        const auto resolve = [&](const std::string& name, std::vector<int>& out_alleles,
+                                 std::vector<std::string>* out_seq = nullptr) {
             out_alleles.assign(chain.size(), -1);
+            if (out_seq != nullptr) out_seq->assign(chain.size(), std::string());
             const bool is_held =
                 std::any_of(held_out.begin(), held_out.end(),
                             [&](const PathRecord& p) { return p.name == name; });
             for (std::size_t bi = 0; bi < chain.size(); ++bi) {
                 if (!is_held) {
                     const auto it = blocks[bi].allele_of.find(name);
-                    if (it != blocks[bi].allele_of.end()) out_alleles[bi] = static_cast<int>(it->second);
+                    if (it != blocks[bi].allele_of.end()) {
+                        out_alleles[bi] = static_cast<int>(it->second);
+                        if (out_seq != nullptr && it->second < blocks[bi].allele_seq.size()) {
+                            (*out_seq)[bi] = blocks[bi].allele_seq[it->second];
+                        }
+                    }
                     continue;
                 }
                 const auto it = held_blocks[bi].allele_of.find(name);
@@ -429,6 +502,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                 }
                 if (hai >= held_blocks[bi].allele_seq.size()) continue;
                 const std::string& seq = held_blocks[bi].allele_seq[hai];
+                if (out_seq != nullptr) (*out_seq)[bi] = seq;
                 if (seq.empty()) continue;
                 for (std::size_t ai = 0; ai < blocks[bi].allele_seq.size(); ++ai) {
                     if (blocks[bi].allele_seq[ai] == seq) {
@@ -438,8 +512,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                 }
             }
         };
-        resolve(names[0], truth1);
-        resolve(names[1], truth2);
+        resolve(names[0], truth1, &truth_seq1);
+        resolve(names[1], truth2, &truth_seq2);
         have_truth = true;
         std::size_t representable = 0;
         for (std::size_t bi = 0; bi < chain.size(); ++bi) {
@@ -447,6 +521,48 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         }
         log.info("truth " + names[0] + " / " + names[1] + ": both alleles representable at " +
                  std::to_string(representable) + "/" + std::to_string(chain.size()) + " blocks");
+    }
+
+    if (mosaic_floor) {
+        if (!have_truth) throw std::runtime_error("genotype-frag: --mosaic-floor needs --truth-haplotypes");
+        std::vector<double> pens;
+        for (const std::string& t : split_commas(switch_penalties_arg)) pens.push_back(std::stod(t));
+        std::vector<std::string> names;
+        for (const PathRecord& p : panel_graph.paths) names.push_back(p.name);
+        const std::string fp = out_prefix + ".mosaic_floor.tsv";
+        std::ofstream mf(fp);
+        if (!mf) throw std::runtime_error("genotype-frag: cannot write " + fp);
+        mf << "homologue\tfloor\tswitch_penalty\tedits\tswitches\tblocks_scored\tblocks\n";
+        std::size_t tot_complete = 0, tot_free = 0;
+        std::vector<std::size_t> tot_pen(pens.size(), 0);
+        for (int side = 0; side < 2; ++side) {
+            const MosaicFloors r = mosaic_floors(blocks, names, side == 0 ? truth_seq1 : truth_seq2,
+                                                 pens, opt.threads);
+            const int hn = side + 1;
+            mf << hn << "\tcomplete\tNA\t" << r.complete << "\tNA\t" << r.blocks_scored << '\t'
+               << r.blocks << '\n';
+            mf << hn << "\tfree\t0\t" << r.free_mosaic << '\t' << r.switches_free << '\t'
+               << r.blocks_scored << '\t' << r.blocks << '\n';
+            for (std::size_t i = 0; i < r.penalised.size(); ++i) {
+                mf << hn << "\tpenalised\t" << r.penalised[i].first << '\t' << r.penalised[i].second
+                   << '\t' << r.penalised_switches[i] << '\t' << r.blocks_scored << '\t'
+                   << r.blocks << '\n';
+                tot_pen[i] += r.penalised[i].second;
+            }
+            tot_complete += r.complete;
+            tot_free += r.free_mosaic;
+        }
+        mf.flush();
+        if (!mf) throw std::runtime_error("genotype-frag: write failed for " + fp);
+        log.info("floors, both homologues: complete " + std::to_string(tot_complete) +
+                 ", free mosaic " + std::to_string(tot_free) + " (H_mosaic " +
+                 std::to_string(tot_complete > tot_free ? tot_complete - tot_free : 0) + ")");
+        for (std::size_t i = 0; i < pens.size(); ++i) {
+            log.info("  switch penalty " + std::to_string(pens[i]) + ": " + std::to_string(tot_pen[i]));
+        }
+        log.wrote({fp});
+        log.done();
+        return 0;
     }
 
     if (hap_mode) {
