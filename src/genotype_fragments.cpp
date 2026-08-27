@@ -751,7 +751,7 @@ HaplotypeResult genotype_haplotype_pairs(
             std::vector<Cand> keep;
             for (auto& [hi, v] : per_hap) {
                 std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-                for (std::size_t i = 0; i < std::min<std::size_t>(2, v.size()); ++i) {
+                for (std::size_t i = 0; i < std::min(options.placement_topk, v.size()); ++i) {
                     keep.push_back({hi, v[i].second.first, v[i].second.second});
                 }
             }
@@ -806,12 +806,18 @@ HaplotypeResult genotype_haplotype_pairs(
             const std::vector<Placed> a1 = place_all(c1, hi, F.r1, r1rc, band1);
             const std::vector<Placed> a2 = F.r2.empty() ? std::vector<Placed>{}
                                                         : place_all(c2, hi, F.r2, r2rc, band2);
-            double lp = kNegInf;
+            double lp = kNegInf;      // the accumulated likelihood: max, or the sum when marginalising
+            double best = kNegInf;    // always the best single placement, so the midpoint is a real one
             long mid = -1;
             const double miss1 = read_ll(band1, F.r1.size());
             const double miss2 = F.r2.empty() ? 0.0 : read_ll(band2, F.r2.size());
-            const auto consider = [&](double v, long m) { if (v > lp) { lp = v; mid = m; } };
+            const auto consider = [&](double v, long m) {
+                if (v > best) { best = v; mid = m; }
+                lp = options.marginalise_placements ? log_add(lp, v) : std::max(lp, v);
+            };
             if (!a1.empty() && !a2.empty()) {
+                // Both mates placed: the pair's placements are the COMBINATIONS, and the single-mate
+                // terms below would double count them, so they are skipped.
                 for (const Placed& x : a1) {
                     for (const Placed& y : a2) {
                         double v = read_ll(x.edits, F.r1.size()) + read_ll(y.edits, F.r2.size());
@@ -822,11 +828,12 @@ HaplotypeResult genotype_haplotype_pairs(
                         consider(v, (std::min(x.start, y.start) + std::max(x.end, y.end)) / 2);
                     }
                 }
+            } else {
+                for (const Placed& x : a1) consider(read_ll(x.edits, F.r1.size()) + miss2,
+                                                    (x.start + x.end) / 2);
+                for (const Placed& y : a2) consider(miss1 + read_ll(y.edits, F.r2.size()),
+                                                    (y.start + y.end) / 2);
             }
-            for (const Placed& x : a1) consider(read_ll(x.edits, F.r1.size()) + miss2,
-                                                (x.start + x.end) / 2);
-            for (const Placed& y : a2) consider(miss1 + read_ll(y.edits, F.r2.size()),
-                                                (y.start + y.end) / 2);
             if (lp == kNegInf) { ll[fi * nh + hi] = floors[fi]; continue; }
             midpoint[fi * nh + hi] = static_cast<std::int32_t>(mid);
             ll[fi * nh + hi] = lp;
@@ -965,6 +972,32 @@ HaplotypeResult genotype_haplotype_pairs(
         }
     }
 
+    for (const auto& [n1, n2] : options.probe_pairs) {
+        HaplotypeProbe pr;
+        pr.name1 = n1;
+        pr.name2 = n2;
+        const auto find = [&](const std::string& n) {
+            for (std::size_t i = 0; i < nh; ++i) if (out.shortlist[i] == n) return static_cast<long>(i);
+            return -1L;
+        };
+        const long i1 = find(n1);
+        const long i2 = find(n2);
+        if (i1 < 0 || i2 < 0) { out.probes.push_back(pr); continue; }
+        pr.in_shortlist = true;
+        pr.placed1 = out.haplotypes[static_cast<std::size_t>(i1)].placed;
+        pr.placed2 = out.haplotypes[static_cast<std::size_t>(i2)].placed;
+        const std::size_t a = std::min<std::size_t>(i1, i2);
+        const std::size_t b = std::max<std::size_t>(i1, i2);
+        for (std::size_t r = 0; r < pairs.size(); ++r) {
+            if (pairs[r].hap1 != a || pairs[r].hap2 != b) continue;
+            pr.rank = static_cast<int>(r) + 1;
+            pr.score = pairs[r].score;
+            pr.delta = pairs[r].score - pairs.front().score;
+            break;
+        }
+        out.probes.push_back(pr);
+    }
+
     for (std::size_t i = 0; i < std::min(top_pairs_kept, pairs.size()); ++i) {
         out.top_pairs.push_back(pairs[i]);
     }
@@ -1004,6 +1037,20 @@ void write_haplotype_results(const std::string& out_prefix,
     }
     hf.flush();
     if (!hf) throw std::runtime_error("genotype-frag: write failed for " + hp);
+
+    if (!result.probes.empty()) {
+        const std::string qp = out_prefix + ".hap_probes.tsv";
+        std::ofstream qf(qp);
+        if (!qf) throw std::runtime_error("genotype-frag: cannot write " + qp);
+        qf << "hap1\thap2\tin_shortlist\trank\tscore\tdelta\tplaced1\tplaced2\n";
+        for (const HaplotypeProbe& pr : result.probes) {
+            qf << pr.name1 << '\t' << pr.name2 << '\t' << (pr.in_shortlist ? 1 : 0) << '\t'
+               << pr.rank << '\t' << pr.score << '\t' << pr.delta << '\t' << pr.placed1 << '\t'
+               << pr.placed2 << '\n';
+        }
+        qf.flush();
+        if (!qf) throw std::runtime_error("genotype-frag: write failed for " + qp);
+    }
 
     const std::string pp = out_prefix + ".hap_pairs.tsv";
     std::ofstream pf(pp);

@@ -182,6 +182,27 @@ struct HaplotypeScoreOptions : FragmentScoreOptions {
     // larger shortlist pushed more codes past a shared cap.
     std::size_t max_anchor_occ = 8;
     std::size_t anchor_slack = 40;     // bases of window either side of an anchored read start
+    // Haplotype pairs to report the likelihood's opinion of, by name. Probing costs nothing: the
+    // pair scores already exist.
+    std::vector<std::pair<std::string, std::string>> probe_pairs;
+    // Sum a fragment's likelihood over EVERY placement it has on a haplotype instead of taking its
+    // best one:
+    //
+    //   P(f|h) = (1/N_h) * SUM over valid placements p of P(f|h,p)
+    //
+    // A fragment compatible with ten positions is evidence for a haplotype that offers ten, and the
+    // maximum represents that identically to a haplotype offering one. The measured reason to try it:
+    // at cyp2d6 the ceiling pair is shortlisted in 10 of 10 donors with 100% of fragments placing on
+    // it, and still loses by a median of 2,323 nats -- so neither candidate generation nor placement
+    // availability is the failure, and the geometry of the likelihood is what is left.
+    //
+    // The 1/N_h is not optional with this on. Summing placements without it rewards a repetitive
+    // haplotype for offering more places to land, which is the superset pathology in a new costume --
+    // so this implies length normalisation unless it is explicitly overridden.
+    bool marginalise_placements = false;
+    // Implied-start bins kept per mate per haplotype. 2 is what best-placement scoring used; a sum
+    // over placements is only meaningful if the placements are actually enumerated.
+    std::size_t placement_topk = 2;
     // Sequence compatibility and copy number are different signals and a read alignment cannot carry
     // both. Measured, at cyp2d6 leave-ZERO-out: NA18939's haplotype 1 is 13.6 kb longer than the
     // panel's typical haplotype -- a duplication -- and the reads from the extra copy align perfectly
@@ -246,6 +267,21 @@ struct HaplotypeScore {
     double containment = 0.0;       // the coarse shortlist score, reported not trusted
 };
 
+// What the likelihood thinks of a NAMED haplotype pair. Production has `--probe-pair` for the same
+// reason and the reasoning carries over: a score carries a baseline that shifts whenever the reads or
+// the shortlist do, so scores from different runs are not on a common scale, while two pairs probed
+// in the SAME run are. It also separates three failures a truncated top-N list cannot: the pair was
+// never shortlisted, the pair was shortlisted and scored badly, or the pair was scored and is close.
+struct HaplotypeProbe {
+    std::string name1, name2;
+    bool in_shortlist = false;
+    int rank = -2;              // -2 = not shortlisted, so never scored
+    double score = 0.0;
+    double delta = 0.0;         // score minus the best pair's
+    std::size_t placed1 = 0;    // fragments that landed on each, for telling a placement failure
+    std::size_t placed2 = 0;    // apart from a likelihood failure
+};
+
 struct HaplotypeResult {
     std::vector<std::string> shortlist;         // haplotype names actually scored
     std::vector<HaplotypeScore> haplotypes;
@@ -253,6 +289,7 @@ struct HaplotypeResult {
     std::size_t n_fragments = 0;
     std::size_t n_informative = 0;
     std::vector<BlockProjection> blocks;
+    std::vector<HaplotypeProbe> probes;
 };
 
 HaplotypeResult genotype_haplotype_pairs(

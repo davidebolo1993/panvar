@@ -71,6 +71,13 @@ void print_help() {
         << "                              a mosaic, so under leave-one-out this is bounded by the\n"
         << "                              panel's mosaic ceiling. Measuring that bound is the point\n"
         << "      --max-haplotypes <N>    Shortlist size in --haplotype-mode (default 48)\n"
+        << "      --probe-haplotypes <a,b>  Report the likelihood's opinion of this named haplotype\n"
+        << "                              pair: whether it was shortlisted at all, its rank, its\n"
+        << "                              score delta to the best pair, and how many fragments placed\n"
+        << "                              on each. Separates three failures a truncated top-N list\n"
+        << "                              cannot -- never shortlisted, shortlisted and scored badly,\n"
+        << "                              or scored and close. Repeatable; costs nothing, the pair\n"
+        << "                              scores already exist\n"
         << "      --max-anchor-occ <N>    Occurrences PER HAPLOTYPE above which a syncmer anchors\n"
         << "                              nothing (default 8): inside a tandem array it points\n"
         << "                              everywhere. Per haplotype, not across the shortlist -- a\n"
@@ -78,6 +85,17 @@ void print_help() {
         << "                              it did: at cyp2d6 NA18939 the same reads put the truth at\n"
         << "                              rank 2 with 48 haplotypes and rank 1 with 96\n"
         << "      --anchor-slack <N>      Window either side of an anchored read start (default 40)\n"
+        << "      --marginalise-placements  Sum a fragment's likelihood over EVERY placement it has\n"
+        << "                              on a haplotype instead of taking its best one. A fragment\n"
+        << "                              compatible with ten positions is evidence for a haplotype\n"
+        << "                              offering ten, and a maximum scores that identically to a\n"
+        << "                              haplotype offering one -- which is worst exactly where\n"
+        << "                              cyp2d6 is hardest. Implies --length-normalize, because a\n"
+        << "                              sum without the 1/N factor rewards a repetitive haplotype\n"
+        << "                              for offering more places to land\n"
+        << "      --placement-topk <N>    Implied-start bins kept per mate per haplotype (default 2).\n"
+        << "                              A sum over placements is only meaningful if the placements\n"
+        << "                              are enumerated, so raise it with the flag above\n"
         << "      --coverage-weight <w>   Weight on the depth channel in --haplotype-mode (default\n"
         << "                              1.0; 0 disables). Sequence compatibility and copy number are\n"
         << "                              different signals: reads from a duplicated segment align\n"
@@ -203,6 +221,15 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--max-haplotypes") hopt.max_haplotypes = cli::parse_size_arg(a, value(i, a));
         else if (a == "--max-anchor-occ") hopt.max_anchor_occ = cli::parse_size_arg(a, value(i, a));
         else if (a == "--anchor-slack") hopt.anchor_slack = cli::parse_size_arg(a, value(i, a));
+        else if (a == "--probe-haplotypes") {
+            const std::vector<std::string> two = split_commas(value(i, a));
+            if (two.size() != 2) {
+                throw std::runtime_error("genotype-frag: --probe-haplotypes needs exactly two names");
+            }
+            hopt.probe_pairs.emplace_back(two[0], two[1]);
+        }
+        else if (a == "--marginalise-placements") hopt.marginalise_placements = true;
+        else if (a == "--placement-topk") hopt.placement_topk = cli::parse_size_arg(a, value(i, a));
         else if (a == "--coverage-weight") hopt.coverage_weight = std::stod(value(i, a));
         else if (a == "--coverage-window") hopt.coverage_window = cli::parse_size_arg(a, value(i, a));
         else if (a == "--max-divergence") opt.max_divergence = std::stod(value(i, a));
@@ -350,7 +377,9 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     }
 
     if (hap_mode) {
-        if (!length_normalize_set) hopt.length_normalize = false;
+        // Summing over placements without dividing by the number of positions a haplotype offers
+        // rewards a repetitive haplotype for offering more places to land. The two go together.
+        if (!length_normalize_set) hopt.length_normalize = hopt.marginalise_placements;
         FragmentLoadStats hs;
         const std::vector<Fragment> frags = load_fragments(read_paths, &hs);
         log.info("reads: " + std::to_string(hs.reads) + " -> " + std::to_string(hs.fragments) +
