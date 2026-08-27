@@ -184,3 +184,96 @@ carrying j, + mu)` -> connected to every block in which that marker occurs. Each
 scored **once**, never once per block. The marker-to-block incidence graph decomposes into connected
 components: exact enumeration for small ones, beam or message passing for larger. At cyp2d6 block 5
 the component is just blocks 3 and 5.
+
+
+---
+
+# Closing the analyses: two of my explanations were wrong, and the third is supported
+
+## Retraction 1: the read-opportunity computation was circular
+
+`opportunity()` counted the **realised** wgsim fragments covering each occurrence, taken from the read
+names. That predicts observed counts using the observed reads, so the reported collapse of the
+residual to about -3% was near-tautological. **Withdrawn.** Positional read opportunity is not
+established as the explanation, and the flanking-context experiment designed to test it is not the
+priority it looked like.
+
+A production-compatible opportunity term would have to be geometry-derived -- expected fragment
+starts from position, sequence length, read length and insert distribution -- never from realised
+reads.
+
+## Retraction 2: per-donor lambda bias, refuted by multi-seed
+
+The per-marker ratio `observed / (lambda * multiplicity)` looked like a tight per-donor constant
+(median IQR 0.11) varying between donors (0.87 to 1.26), which suggested a systematic depth
+misestimate. Re-simulating the same haplotypes under three further read seeds refutes it:
+
+| donor | implied lambda across four seeds | sd |
+|---|---|---:|
+| HG03452 | 14.00, 9.00, 14.00, 14.00 | 2.17 |
+| NA20509 | 13.94, 12.77, 12.38, 9.00 | 1.84 |
+| HG00358 | 11.50, 12.00, 11.38, 13.33 | 0.78 |
+
+The implied lambda swings by more within one donor across seeds than it varies between donors. It is
+not a stable property of the donor, so it is not a depth bias.
+
+## What the residual actually is: four independent observations, not 23
+
+At block 5 the markers occupy almost no independent evidence:
+
+| | |
+|---|---|
+| markers with occurrences | 23 |
+| total occurrences over both haplotypes | 68 |
+| **distinct 350 bp fragment windows** | **4** |
+| occurrences per window | median 18, max 36 |
+| per-marker ratio sd | 0.243 |
+| Poisson sd for a single count of that size | 0.209 |
+
+The per-marker spread matches the noise of a **single** count. The markers are not averaging down --
+they sit inside four fragments and move together. Effective sample size is about 4, not 23, so a
++-25% swing in the pooled ratio between read realisations is exactly what should happen.
+
+That also explains why residual magnitude predicted failure (0/5 above +20%) without any of it being
+a fixable count-model defect: an unlucky realisation of four fragment windows inflates the residual
+AND breaks the call, because the same four windows carry the decision.
+
+**This is the clump/effective-sample-size problem, at a locus where it was not previously located.**
+The emission already discounts by `rho`; what this shows is how severe the discount should be here --
+the evidence behind block 5 is four observations, and treating it as 23 overstates certainty by
+roughly sqrt(23/4), about 2.4x.
+
+# Certified floor: the three excluded donors were misclassified
+
+They were dropped because the truth ALLELE INDEX is absent from the reduced panel. Measured against
+the certified nearest panel pair instead:
+
+| donor | E* certified | E called | excess | best identity | stratum |
+|---|---:|---:|---:|---:|---|
+| HG00171 | 2 | 60 | 58 | 0.9977 | near-representable |
+| NA19036 | 1 | 177 | 176 | 0.9987 | near-representable |
+| NA19317 | 2 | 119 | 117 | 0.9969 | near-representable |
+
+**All three are near-representable, not panel-limited.** The panel reconstructs them to within 1-2
+edits; the caller misses by 58-176. Excluding them understated the failure rate, and the exclusion
+criterion itself was wrong -- exactly what the release plan's three strata were written to prevent.
+Representability must be defined from certified sequence error, never from whether a label exists.
+
+# Denominator
+
+25 donors, not 24. The earlier figure predates the `params.log` fallback that recovered HG00096's
+model line. With the three near-representable donors added the scored set should be 28.
+
+# Where CYP2D6 stands
+
+**Established:** the block decomposition misses real marker occurrences, and whole-locus multiplicity
+fixes it -- median count error +47% to +3.8%, recovery 0/25 to 16/25 exact and 21/25 within a
+two-member class. The deficit that remains is concentrated (median 4 markers carry half) and sits
+entirely on markers shared with block 3.
+
+**Not established:** any count-model defect beyond that. Two candidate mechanisms were tested and both
+failed. The residual is consistent with sampling over four independent fragment windows.
+
+**Consequence for the design:** a locus-wide shared-marker factor remains the right architecture, and
+it does NOT need a positional coverage term. What it does need is an honest effective sample size --
+scoring 23 markers that occupy four fragments as four observations, not 23.
