@@ -1062,6 +1062,39 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
                         ++out_panel->blocks_restored;
                     }
                 }
+            // Anchors need the OCCURRENCE-based test, not the vary-based one, and an expectation
+                // of their own: they are absent from `by_block`, so `expected` is zero for them and the
+                // old bound degenerated to "seen more than once per haplotype on average". An anchor is
+                // carried by every allele of its block at multiplicity 1, so the panel should show it
+                // exactly once per traversing haplotype.
+                // Expect an anchor once per TRAVERSING haplotype; bypassers contribute no reads here.
+                const std::uint64_t anchor_expected =
+                    blocks[bi].n_traversing > 0 ? blocks[bi].n_traversing : blocks[bi].allele_of.size();
+                auto& anch = out_panel->anchor_slots[bi];
+                anch.erase(std::remove_if(anch.begin(), anch.end(),
+                                          [&](std::uint32_t slot) {
+                                              const auto it = occ_blocks.find(out_panel->node_codes[slot]);
+                                              const std::uint32_t nb = it == occ_blocks.end() ? 0 : it->second;
+                                              return nb > 1 || actual[slot] > anchor_expected;
+                                          }),
+                           anch.end());
+                // An anchor is absent from `by_block`, so the informative-marker expectation map has
+                // no entry for it and the audit reported `expected` as 0 on every anchor row -- which
+                // made the column useless exactly where it was being read. Record the anchor's own
+                // bound, which is what it was actually filtered against.
+                for (const std::uint32_t slot : anch) {
+                    if (slot < out_panel->dbg_expected.size()) out_panel->dbg_expected[slot] = anchor_expected;
+                }
+            }
+            out_panel->region_filtered_markers = dropped;
+        }
+
+        // Marker positions and fragment clumps are NOT part of region uniqueness, and used to sit
+        // inside its guard. With --no-region-unique they were skipped entirely: marker_clumps was
+        // never assigned, so rho silently fell back to span/fragment_len, and node_first_pos was
+        // filled only by the anchor path -- 3 of 36 markers at a restored block. Every consumer of
+        // clump structure was therefore blind exactly when the marker set was largest.
+
                 // Independent observations per block: distinct fragment-length windows occupied by the
             // surviving markers, taken over the union of alleles. A deletion junction contributes about
             // 31 bases of novel sequence and therefore a handful of markers inside ONE fragment -- five
@@ -1090,32 +1123,6 @@ std::vector<BlockMarkerStats> build_block_marker_panel(
                 }
                 out_panel->marker_clumps[bi] = static_cast<double>(bins.size());
             }
-            // Anchors need the OCCURRENCE-based test, not the vary-based one, and an expectation
-                // of their own: they are absent from `by_block`, so `expected` is zero for them and the
-                // old bound degenerated to "seen more than once per haplotype on average". An anchor is
-                // carried by every allele of its block at multiplicity 1, so the panel should show it
-                // exactly once per traversing haplotype.
-                // Expect an anchor once per TRAVERSING haplotype; bypassers contribute no reads here.
-                const std::uint64_t anchor_expected =
-                    blocks[bi].n_traversing > 0 ? blocks[bi].n_traversing : blocks[bi].allele_of.size();
-                auto& anch = out_panel->anchor_slots[bi];
-                anch.erase(std::remove_if(anch.begin(), anch.end(),
-                                          [&](std::uint32_t slot) {
-                                              const auto it = occ_blocks.find(out_panel->node_codes[slot]);
-                                              const std::uint32_t nb = it == occ_blocks.end() ? 0 : it->second;
-                                              return nb > 1 || actual[slot] > anchor_expected;
-                                          }),
-                           anch.end());
-                // An anchor is absent from `by_block`, so the informative-marker expectation map has
-                // no entry for it and the audit reported `expected` as 0 on every anchor row -- which
-                // made the column useless exactly where it was being read. Record the anchor's own
-                // bound, which is what it was actually filtered against.
-                for (const std::uint32_t slot : anch) {
-                    if (slot < out_panel->dbg_expected.size()) out_panel->dbg_expected[slot] = anchor_expected;
-                }
-            }
-            out_panel->region_filtered_markers = dropped;
-        }
     }
     return out;
 }

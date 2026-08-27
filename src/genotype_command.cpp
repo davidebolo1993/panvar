@@ -333,6 +333,11 @@ int run_genotype_command(const std::vector<std::string>& args) {
     // quantity in the decomposition that cannot be recovered from --dump-block: under leave-one-out
     // the truth is off-panel, so no allele column carries it.
     std::string injection_out;
+    // Whole-locus marker multiplicity for the truth haplotypes. --dump-injection and
+    // --noiseless-counts both measure the truth's marker content WITHIN one block; this counts every
+    // panel marker across the truth's ENTIRE walk, which is what says whether a block decomposition
+    // has missed places that generate a marker's counts.
+    std::string truth_markers_out;
     // Every --probe-pair, in order. The first also redirects the truth_* columns, which is what the
     // single-probe form has always done; all of them appear in the probe table.
     std::vector<std::array<std::size_t, 3>> probe_pairs;
@@ -501,6 +506,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
             }
         }
         else if (arg == "--dump-injection") injection_out = require_value(arg);
+        else if (arg == "--dump-truth-marker-counts") truth_markers_out = require_value(arg);
         else if (arg == "--noiseless-scope") {
             noiseless_scope = require_value(arg);
             if (noiseless_scope != "all" && noiseless_scope != "present" && noiseless_scope != "absent")
@@ -621,6 +627,10 @@ int run_genotype_command(const std::vector<std::string>& args) {
     // A diagnostic that quietly does nothing is worse than one that refuses: the run looks like an
     // arm of the experiment and is actually the baseline, which is exactly how a null result gets
     // manufactured. Both combinations below were silently inert.
+    if (!truth_markers_out.empty() && truth_haplotypes.empty()) {
+        throw std::runtime_error("genotype: --dump-truth-marker-counts counts panel markers across "
+                                 "the TRUTH haplotypes' walks; pass --truth-haplotypes");
+    }
     if (!injection_out.empty() && noiseless_block < 0) {
         throw std::runtime_error("genotype: --dump-injection writes the vector --noiseless-counts "
                                  "injects; without it there is nothing to write");
@@ -1488,6 +1498,65 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 }
                 const std::string a = truth_haplotypes.substr(0, comma);
                 const std::string b = truth_haplotypes.substr(comma + 1);
+
+                // Whole-locus marker multiplicity for the truth. Every other truth measurement here
+                // is scoped to one block, which is exactly what cannot answer "does the block
+                // decomposition account for everywhere this marker occurs". Spelled from the truth's
+                // own full walk and counted with the panel's own syncmer code, so the two cannot
+                // drift apart.
+                if (!truth_markers_out.empty()) {
+                    std::unordered_map<std::uint64_t, std::uint32_t> tot;
+                    // Where each occurrence sits, per haplotype. Counts alone cannot test whether
+                    // lambda * multiplicity is the right observation model: an occurrence near a
+                    // sequence end has fewer possible fragment starts than one in the middle, so
+                    // equal multiplicity does not mean equal expected coverage.
+                    std::unordered_map<std::uint64_t, std::vector<std::pair<int, std::size_t>>> pos;
+                    std::vector<std::size_t> hap_len;
+                    std::size_t nfound = 0;
+                    for (const std::string& nm : {a, b}) {
+                        const PathRecord* pr = nullptr;
+                        for (const PathRecord& p : graph.paths) if (p.name == nm) pr = &p;
+                        if (pr == nullptr) continue;
+                        ++nfound;
+                        const std::string seq = spell_path_steps_sequence(graph, pr->steps);
+                        const std::vector<KmerOccurrence> sy =
+                            read_panel.all_kmers
+                                ? collect_canonical_kmer_occurrences(seq, read_panel.kmer_size)
+                                : collect_syncmers(seq, read_panel.kmer_size, read_panel.syncmer_s);
+                        for (const KmerOccurrence& o : sy) {
+                            ++tot[o.code];
+                            pos[o.code].emplace_back(static_cast<int>(nfound - 1), o.start);
+                        }
+                        hap_len.push_back(seq.size());
+                    }
+                    if (nfound != 2) {
+                        throw std::runtime_error("genotype: --dump-truth-marker-counts could not find "
+                                                 "both truth haplotypes in the graph");
+                    }
+                    std::ofstream tf(truth_markers_out);
+                    if (!tf) throw std::runtime_error("genotype: cannot write " + truth_markers_out);
+                    tf << "slot\tcode\ttruth_multiplicity_whole_locus\toccurrences\n";
+                    for (std::size_t sl = 0; sl < read_panel.node_codes.size(); ++sl) {
+                        const auto it = tot.find(read_panel.node_codes[sl]);
+                        tf << sl << '\t' << read_panel.node_codes[sl] << '\t'
+                           << (it == tot.end() ? 0u : it->second) << '\t';
+                        const auto pit = pos.find(read_panel.node_codes[sl]);
+                        if (pit == pos.end()) { tf << ".\n"; continue; }
+                        bool first = true;
+                        for (const auto& [h, st] : pit->second) {
+                            if (!first) tf << ',';
+                            tf << h << ':' << st;
+                            first = false;
+                        }
+                        tf << '\n';
+                    }
+                    tf << "# haplotype_lengths";
+                    for (const std::size_t L : hap_len) tf << '\t' << L;
+                    tf << '\n';
+                    tf.flush();
+                    if (!tf) throw std::runtime_error("genotype: write failed for " + truth_markers_out);
+                    log.wrote({truth_markers_out});
+                }
                 ta1.assign(chain.size(), -1);
                 ta2.assign(chain.size(), -1);
                 // Under leave-one-out the truth haplotypes are not in the panel, so their allele is
