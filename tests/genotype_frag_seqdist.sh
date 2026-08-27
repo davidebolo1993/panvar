@@ -26,6 +26,13 @@ DONORS=(); while IFS= read -r l; do DONORS+=("$l"); done < <(
     END{for(s in c) if(c[s]>=2) print first[s]"\t"second[s]}' | sort)
 ND=${#DONORS[@]}
 
+# The panel is the same for every donor except which two are held out, so it is spelled ONCE and
+# filtered per donor. Spelling it per donor would dominate the runtime at the larger loci.
+PANELDIR="$OUT/panel_all"
+if [[ ! -d "$PANELDIR" ]]; then
+  "$PY" "$REPO/scripts/spell_paths.py" -i "$G" -o "$PANELDIR" >/dev/null
+fi
+
 RES="$OUT/seqdist.tsv"
 printf 'locus\tdonor\tarm\ttotal\tnm\tunaligned\ttotal1\ttotal2\taligned1\taligned2\n' > "$RES"
 echo "locus $LOCUS: $DONORS_N donors, leave-one-out; divergence from the donor's own haplotypes"
@@ -62,6 +69,13 @@ for ((p=0; p<DONORS_N && p<ND; p++)); do
     printf '%s\t%s\t' "$LOCUS" "$DONOR" >> "$RES"
     "$PY" "$REPO/scripts/genotype_pair_sequence_distance.py" "$T1" "$T2" "$A" "$B" "$1" >> "$RES"
   }
+  # E*_panel: the best ANY panel pair could reconstruct. Separates panel limitation from inference
+  # failure, which the exact-label ceiling could not.
+  cat $(ls "$PANELDIR"/*.fa | grep -v "$DONOR") > "$OUT/panel_loo.fa"
+  printf '%s\t%s\t' "$LOCUS" "$DONOR" >> "$RES"
+  "$PY" "$REPO/scripts/genotype_panel_floor.py" "$T1" "$T2" "$OUT/panel_loo.fa" panel_floor \
+    | awk -F'\t' '{printf "%s\t%s\t0\t0\t%s\t%s\t0\t0\n",$1,$2,$3,$4}' >> "$RES"
+
   emit ceiling "$C1" "$C2"
   emit prototype "$P1" "$P2"
 
@@ -96,7 +110,7 @@ import sys, collections
 rows=[l.rstrip('\n').split('\t') for l in open(sys.argv[1])][1:]
 by=collections.defaultdict(dict)
 for r in rows: by[r[1]][r[2]]=int(r[3])
-arms=[a for a in ('ceiling','prototype','production','prototype_blocks')
+arms=[a for a in ('panel_floor','ceiling','prototype','production','prototype_blocks')
       if any(a in v for v in by.values())]
 both=[d for d,v in by.items() if all(a in v for a in arms)]
 if not both: sys.exit("no paired donors")
@@ -108,6 +122,16 @@ for d in sorted(both):
     print(f"  {d:<10}" + "".join(f"{by[d][a]:>19d}" for a in arms))
 med={a: sorted(by[d][a] for d in both)[len(both)//2] for a in arms}
 print(f"  {'MEDIAN':<10}" + "".join(f"{med[a]:>19d}" for a in arms))
+if 'panel_floor' in arms:
+    print("\nEXCESS over the panel floor -- the part a better CALLER could still recover.")
+    print("(the floor itself is the part only a better PANEL could)")
+    print(f"\n  {'donor':<10}" + "".join(f"{a:>19}" for a in arms if a!='panel_floor'))
+    for d in sorted(both):
+        print(f"  {d:<10}" + "".join(f"{by[d][a]-by[d]['panel_floor']:>19d}"
+                                     for a in arms if a!='panel_floor'))
+    mex={a: sorted(by[d][a]-by[d]['panel_floor'] for d in both)[len(both)//2]
+         for a in arms if a!='panel_floor'}
+    print(f"  {'MEDIAN':<10}" + "".join(f"{mex[a]:>19d}" for a in arms if a!='panel_floor'))
 if 'production' in arms:
     w=sum(1 for d in both if by[d]['prototype_blocks'] < by[d]['production'])
     print(f"\n  prototype closer than PRODUCTION in sequence: {w}/{len(both)} donors")

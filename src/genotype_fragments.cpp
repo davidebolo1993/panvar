@@ -663,9 +663,38 @@ HaplotypeResult genotype_haplotype_pairs(
     }
     std::stable_sort(ranked.begin(), ranked.end(),
                      [](const auto& a, const auto& b) { return a.first > b.first; });
-    const std::size_t nh = std::min(options.max_haplotypes, ranked.size());
+
+    // Containment SATURATES. It asks what fraction of a haplotype's syncmers the reads contain, and
+    // a panel haplotype differing from the sample only in WHICH combination of otherwise-present
+    // alleles it carries scores 1.0 like every other -- the discriminating signal there is linkage,
+    // which a presence score cannot see. Two consequences, both measured in the registered fixture,
+    // where the correct pair was reachable only at full panel size:
+    //
+    //   * sequence-identical haplotypes each consume a slot, and a panel holds many;
+    //   * once scores tie, the cut is decided by path order, which is arbitrary.
+    //
+    // So: collapse identical sequences to one candidate, and never cut through a tie -- extend until
+    // the score strictly separates. This is the shortlist arm of the gstm1 donors whose answer never
+    // reaches scoring.
+    {
+        std::unordered_set<std::string> seen;
+        std::vector<std::pair<double, std::size_t>> unique_ranked;
+        unique_ranked.reserve(ranked.size());
+        for (const auto& r : ranked) {
+            const HaplotypeSeq h = spell_haplotype(blocks, haplotype_names[r.second]);
+            if (seen.insert(h.seq).second) unique_ranked.push_back(r);
+        }
+        ranked.swap(unique_ranked);
+    }
+    std::size_t nh = std::min(options.max_haplotypes, ranked.size());
+    while (nh > 0 && nh < ranked.size() &&
+           std::abs(ranked[nh].first - ranked[nh - 1].first) < 1e-12) {
+        ++nh;   // the cut fell inside a tie; taking one side of it would be arbitrary
+    }
     std::vector<HaplotypeSeq> haps(nh);
     out.haplotypes.resize(nh);
+    // Reported so a run can say whether the shortlist was a real selection or a tie it could not
+    // break. `nh` above the requested cap means it was extended through a tie.
     for (std::size_t i = 0; i < nh; ++i) {
         out.shortlist.push_back(haplotype_names[ranked[i].second]);
         haps[i] = spell_haplotype(blocks, haplotype_names[ranked[i].second]);

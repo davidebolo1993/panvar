@@ -311,6 +311,20 @@ if(PANVAR_BUILD_TESTING)
             set_tests_properties(panvar_genotype_stats PROPERTIES TIMEOUT 300)
         endif()
 
+        # genotype-frag contract. The fragment prototype shipped with no test at all, and three of
+        # the defects it has had -- a shortlist-wide anchor cap that made the answer depend on
+        # --max-haplotypes, an unbounded insert term, and a per-block projection that sorted the two
+        # alleles and so switched homologue mid-locus -- are each an assertion in it. The fixture
+        # makes every expected value derivable: reads are exact substrings of two known haplotypes.
+        set(PANVAR_GENOTYPE_FRAG_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_frag_stats.sh)
+        if(EXISTS ${PANVAR_GENOTYPE_FRAG_STATS} AND PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE)
+            add_test(
+                NAME panvar_genotype_frag_stats
+                COMMAND /usr/bin/env bash ${PANVAR_GENOTYPE_FRAG_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/genotype_frag_stats
+            )
+            set_tests_properties(panvar_genotype_frag_stats PROPERTIES TIMEOUT 300)
+        endif()
+
         # Opt-in regressions against the committed real loci. Several contracts are only reachable
         # on real data: ANKRD36C is the only locus that ever produced overlapping sites, LPA KIV-2 is
         # the folding case with 466 haplotypes, whether the POA guards SKIP anything is a property of
