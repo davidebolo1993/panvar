@@ -27,7 +27,7 @@ DONORS=(); while IFS= read -r l; do DONORS+=("$l"); done < <(
 ND=${#DONORS[@]}
 
 RES="$OUT/seqdist.tsv"
-printf 'locus\tdonor\tarm\ttotal_edits\ttotal_divergence\tedits1\tedits2\taligned1\taligned2\n' > "$RES"
+printf 'locus\tdonor\tarm\ttotal\tnm\tunaligned\ttotal1\ttotal2\taligned1\taligned2\n' > "$RES"
 echo "locus $LOCUS: $DONORS_N donors, leave-one-out; divergence from the donor's own haplotypes"
 
 for ((p=0; p<DONORS_N && p<ND; p++)); do
@@ -100,7 +100,9 @@ arms=[a for a in ('ceiling','prototype','production','prototype_blocks')
       if any(a in v for v in by.values())]
 both=[d for d,v in by.items() if all(a in v for a in arms)]
 if not both: sys.exit("no paired donors")
-print("total edits from the donor's own two haplotypes, lower is better")
+print("total distance from the donor's own two haplotypes (aligned NM + unaligned bp), lower is better")
+unal={}
+for r in rows: unal.setdefault(r[1],{})[r[2]]=int(r[5])
 print(f"\n  {'donor':<10}" + "".join(f"{a:>19}" for a in arms))
 for d in sorted(both):
     print(f"  {d:<10}" + "".join(f"{by[d][a]:>19d}" for a in arms))

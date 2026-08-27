@@ -11,9 +11,9 @@ This measures the other one. If the caller's pair is CLOSER IN SEQUENCE while ma
 the label metric is what needs fixing, not the model.
 
 Usage: genotype_pair_sequence_distance.py <truth1.fa> <truth2.fa> <cand1.fa> <cand2.fa> [label]
-Prints: label, total EDITS under the best assignment, total divergence, per-haplotype edits,
-per-haplotype aligned bp. Edits are the primary figure: they are integers and they are what the
-release goal is stated in.
+Prints: label, TOTAL distance under the best assignment, the aligned-NM part, the unaligned part,
+per-haplotype totals, per-haplotype aligned bp. The split is reported because a total that is mostly
+unaligned bases means something different from one that is mostly mismatches.
 """
 import subprocess
 import sys
@@ -23,28 +23,65 @@ import re
 MM2 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "external", "minimap2", "minimap2")
 
 
-def divergence(ref, qry):
-    """Aligned-base divergence between two haplotype FASTAs.
+def _uncovered(length, intervals):
+    """Bases of a sequence no alignment covers, from merged half-open intervals."""
+    covered = 0
+    last = -1
+    for a, b in sorted(intervals):
+        a = max(a, last)
+        if b > a:
+            covered += b - a
+            last = b
+    return max(0, length - covered)
 
-    From minimap2's NM:i: (an INTEGER edit count) over total aligned block length, not from de:f:.
-    de:f: is printed to four decimals, which at the divergences seen here (2e-4 to 6e-4) quantises
-    the answer to one or two steps and cannot separate two candidates that differ by a few dozen
-    edits over 213 kb. Returns (divergence, aligned_bp, edits); aligned_bp matters because a low
-    divergence over a small aligned fraction is not a good reconstruction and must not read as one.
+
+def distance(ref, qry):
+    """Edit distance between two haplotype FASTAs that PENALISES UNALIGNED SEQUENCE.
+
+        D = NM over aligned blocks + unaligned truth bp + unaligned called bp
+
+    Summing NM over minimap2's reported alignments alone is not safe: bases that never aligned are
+    simply absent from the total, so a candidate missing 10-20 kb can score BETTER than one that
+    represents the whole locus, purely because the missing part was never compared. Every base of
+    both sequences has to be accounted for, either as aligned (and then charged its edits) or as
+    unaligned (and then charged in full).
+
+    Returns (total, aligned_bp, nm, unaligned_truth, unaligned_called).
     """
     out = subprocess.run([MM2, "-cx", "asm20", "--secondary=no", ref, qry],
                          capture_output=True, text=True)
-    edits = den = 0
+    nm = blocks = 0
+    qlen = tlen = 0
+    qiv, tiv = [], []
     for line in out.stdout.splitlines():
         f = line.split("\t")
-        if len(f) < 11:
+        if len(f) < 12:
             continue
         m = re.search(r"NM:i:(\d+)", line)
         if m is None:
             continue
-        edits += int(m.group(1))
-        den += int(f[10])
-    return (edits / den if den else 1.0), den, edits
+        nm += int(m.group(1))
+        blocks += int(f[10])
+        qlen = int(f[1])
+        tlen = int(f[6])
+        qiv.append((int(f[2]), int(f[3])))
+        tiv.append((int(f[7]), int(f[8])))
+    if qlen == 0 or tlen == 0:
+        # Nothing aligned at all: charge both sequences in full rather than reporting 0 edits.
+        qn = _fasta_len(qry)
+        tn = _fasta_len(ref)
+        return qn + tn, 0, 0, tn, qn
+    uq = _uncovered(qlen, qiv)
+    ut = _uncovered(tlen, tiv)
+    return nm + uq + ut, blocks, nm, ut, uq
+
+
+def _fasta_len(path):
+    n = 0
+    for line in open(path):
+        if line[0] != ">":
+            n += len(line.strip())
+    return n
 
 
 def main():
@@ -52,12 +89,15 @@ def main():
     label = sys.argv[5] if len(sys.argv) > 5 else "pair"
     # Both assignments of the two candidates to the two truth haplotypes; the caller does not phase,
     # so scoring only one orientation would penalise a correct call for the order it was written in.
-    a = [divergence(t1, c1), divergence(t2, c2)]
-    b = [divergence(t1, c2), divergence(t2, c1)]
-    best = a if (a[0][2] + a[1][2]) <= (b[0][2] + b[1][2]) else b
-    total_edits = best[0][2] + best[1][2]
-    total_div = best[0][0] + best[1][0]
-    print(f"{label}\t{total_edits}\t{total_div:.6f}\t{best[0][2]}\t{best[1][2]}"
+    a = [distance(t1, c1), distance(t2, c2)]
+    b = [distance(t1, c2), distance(t2, c1)]
+    # Select the homologue assignment on the FULL distance, not on aligned edits. Selecting on
+    # aligned edits alone lets an assignment win by aligning less of the sequence.
+    best = a if (a[0][0] + a[1][0]) <= (b[0][0] + b[1][0]) else b
+    total = best[0][0] + best[1][0]
+    nm = best[0][2] + best[1][2]
+    unal = best[0][3] + best[0][4] + best[1][3] + best[1][4]
+    print(f"{label}\t{total}\t{nm}\t{unal}\t{best[0][0]}\t{best[1][0]}"
           f"\t{best[0][1]}\t{best[1][1]}")
 
 
