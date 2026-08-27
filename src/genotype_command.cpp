@@ -2273,6 +2273,29 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                 << ca << '\t' << cb << "\tNA\tNA\tNA\tNA\tNA\tNA\t";
                             if (cbest >= 0) orc << cbest << "\tNA\n"; else orc << "NA\tNA\n";
                             orc.flush();
+                            // The named pairs still have to be priced here. This branch returns
+                            // early, and the emit below it never ran under --oracle-called-only --
+                            // which is exactly the combination the pricing pass uses, so the table
+                            // came out with a header and no rows.
+                            if (!oracle_pairs.empty()) {
+                                for (const auto& pr : oracle_pairs) {
+                                    opf << chain[bi].index << '\t' << pr[0] << '\t' << pr[1] << '\t';
+                                    if (pr[0] >= A || pr[1] >= A) {
+                                        opf << "NA\tNA\tNA\tNA\tNA\tNA\tNA\n"; continue;
+                                    }
+                                    const long e0 = static_cast<long>(al[pr[0]][0].edits + al[pr[1]][1].edits);
+                                    const long e1 = static_cast<long>(al[pr[0]][1].edits + al[pr[1]][0].edits);
+                                    const int sw = (e1 < e0) ? 1 : 0;
+                                    const std::size_t x = sw ? pr[1] : pr[0], y = sw ? pr[0] : pr[1];
+                                    opf << ident(x, 0) << '\t' << ident(y, 1) << '\t'
+                                        << dl[x][0] << '\t' << dl[y][1] << '\t' << std::min(e0, e1)
+                                        << '\t' << ((ident(x, 0) + ident(y, 1)) / 2.0)
+                                        // The cache is trimmed here by construction, so the certified
+                                        // optimum is not visible and no excess can be honest.
+                                        << "\tNA\n";
+                                }
+                                opf.flush();
+                            }
                             continue;
                         }
                         for (int crit = 0; crit < 3; ++crit) {

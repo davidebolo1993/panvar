@@ -677,6 +677,24 @@ if [ -s "$OUT/opr.oracle_pairs.tsv" ]; then
 else
   bad "--oracle-pair produced no table"
 fi
+# --oracle-called-only returns early from the oracle block; the pairs emit sat after that return, so
+# the pricing pass -- which uses exactly that combination, because the full search is half an hour a
+# donor -- produced a header and no rows. Trimmed pricing must still write one row per named pair,
+# with excess NA because the certified optimum is not visible from a trimmed cache.
+"$BIN" genotype -i "$OUT/g.gfa" -b "$OUT/bub" -r ref -o "$OUT/opc" -R "$OUT/reads.fa" \
+  --truth-haplotypes 'hapA1,hapB1' --certified-oracle --certified-oracle-block 1 \
+  --oracle-called-only --oracle-pair 0,1 --oracle-pair 1,2 -q >/dev/null 2>&1
+n=$(awk 'NR>1' "$OUT/opc.oracle_pairs.tsv" 2>/dev/null | wc -l | tr -d ' ')
+[ "$n" = "2" ] && ok "--oracle-pair prices under --oracle-called-only ($n rows)" \
+               || bad "--oracle-called-only wrote $n priced rows for two pairs (early return skips the emit)"
+ex=$(awk -F'\t' 'NR==2{print $10}' "$OUT/opc.oracle_pairs.tsv" 2>/dev/null)
+[ "$ex" = "NA" ] && ok "trimmed pricing reports excess NA, not a minimum over a handful" \
+                 || bad "trimmed pricing reported excess $ex, which is not against the certified optimum"
+te=$(awk -F'\t' 'NR==2{print $8}' "$OUT/opc.oracle_pairs.tsv" 2>/dev/null)
+tf=$(awk -F'\t' -v p="0,1" 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next} $(h["allele1"])","$(h["allele2"])==p{print $(h["total_edits"]); exit}' "$OUT/opr.oracle_pairs.tsv" 2>/dev/null)
+[ -n "$te" ] && [ "$te" = "$tf" ] && ok "trimmed and full pricing agree on total_edits ($te)" \
+                                 || bad "trimmed says $te, full says $tf for the same pair"
+
 "$BIN" genotype -i "$OUT/g.gfa" -b "$OUT/bub" -r ref -o "$OUT/opx" -R "$OUT/reads.fa" \
   --truth-haplotypes 'hapA1,hapB1' --oracle-pair 0,1 -q >"$OUT/opx.log" 2>&1
 if [ $? -ne 0 ] && grep -qi "certified-oracle" "$OUT/opx.log"; then
