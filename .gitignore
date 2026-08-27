@@ -31,15 +31,16 @@ chiara_test/*
 
 
 # Local-only working material. None of this belongs in the published repository:
-#   experiments/  genotype proof-of-concepts for the module that is not released
+#   experiments/  proof-of-concepts and the research record for the module that is not released
+#   results/      regenerated output tables (scripts/regen_results.sh), ignored above
 #   docs/reports/ dated review write-ups, kept for the authors rather than for users
 #   docs/review_followups.md  the release ledger -- internal working state, not documentation
-# The experiment tree is 1.6 GB of generated output and 220 KB of documents. The documents are the
-# scientific record -- pre-registrations, gates, frozen definitions, negative results -- and they must
-# outlive any working tree: without them a clone gets the result tables with nothing to say what they
-# mean or what was declared before the run. Track the prose, ignore everything else.
-experiments/*
-#!experiments/*.md
+# An earlier rule tracked experiments/*.md, on the argument that the pre-registrations and negative
+# results are the scientific record and should outlive any working tree. They are, and they still do:
+# the record stays in git history and in the local tree. But a published repository is the wrong place
+# to ship it -- a clone of a released tool should get the tool, not the internal argument about a
+# module it cannot even build. Ignore the directory outright, with no exception to re-add it.
+experiments/
 docs/reports/
 docs/review_followups.md
 reports/
