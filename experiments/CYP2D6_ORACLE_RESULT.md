@@ -87,3 +87,100 @@ explains half the signal.
 5** under leave-one-out and cannot be scored on recovering it; they are separated here rather than
 counted as failures, and they are owed a certified-floor analysis of their own. HG00096's first run
 was made with `-q` and carried no model line; it is recovered from its non-quiet run.
+
+
+---
+
+# Check 1: whole-locus multiplicity. The block model was missing real marker sources.
+
+`--dump-truth-marker-counts` scans both truth haplotypes' complete walks and counts every panel
+marker with the panel's own syncmer code, so the two cannot drift. Background is then measured from
+sequence rather than reconstructed from block annotations.
+
+| background for block 5 | median count error | truth at rank 1 | median rank |
+|---|---:|---:|---:|
+| blocks 3 + 5 only | **+47%** | 0 / 25 | 22 |
+| **whole-locus minus block 5** | **+3.8%** | **16 / 25** | **1** |
+
+The surplus is structural: on the shared markers each truth haplotype carries the marker once more
+outside blocks 3 and 5, a consistent **+2 per marker**.
+
+Counting the pre-registered way -- top **equivalence class**, not exact pair:
+
+| | |
+|---|---|
+| rank 1 | 16 / 25 |
+| **rank <= 2** | **21 / 25** |
+| rank <= 5 | 21 / 25 |
+
+Five of the nine misses sit within **1.5 log units**, two of them essentially tied at 0.07 and 0.08.
+Only four miss by a real margin.
+
+## Residual MAGNITUDE predicts failure. Sign does not.
+
+| stratum | n | rank 1 | median \|err\| |
+|---|---:|---:|---:|
+| negative residual | 5 | 4/5 | 8.7% |
+| positive, < 10% | 11 | 9/11 | 2.6% |
+| positive, 10-20% | 4 | 3/4 | 16.4% |
+| **positive, >= 20%** | **5** | **0/5** | 23.5% |
+
+> **CORRECTION.** An earlier draft said "sign matters -- the negative cases don't break the genotype
+> the way the positive ones do", from a single donor at -19.2%. Withdrawn. Across five negative
+> donors the pattern does not hold: NA19347 succeeds at -19.2% while HG02554 fails at -12.4%. What is
+> supported is **magnitude**: every donor above +20% fails, and below it 16 of 20 succeed.
+
+> **A positive residual does not prove an additional sequence source.** Every exact occurrence in the
+> complete truth haplotypes is already counted, so the remainder could equally be sequencing-error
+> matches, depth underestimation, positional coverage (lambda x multiplicity assumes every occurrence
+> gets identical coverage, and occurrences near a boundary have fewer possible fragment starts),
+> canonicalisation collisions, or duplicated counting. An earlier draft called it "an unmodelled
+> source still contributing counts". That is one hypothesis of several and is not established.
+
+# Check 2: the deficit is concentrated, and entirely on shared markers
+
+For the truth pair against the pair the score chose, per marker delta log-likelihood, ranked by
+absolute value, over the nine failing donors:
+
+| | |
+|---|---|
+| markers carrying 50% of the deficit | median **4** |
+| markers carrying 90% | median **9** |
+| single worst marker's share | median 17% |
+| **deficit on markers shared with block 3** | **100%** |
+
+Not diffuse miscalibration: a handful of shared markers decide it. That is the tractable case, and it
+means a locus-wide shared-marker factor is aimed at the right objects.
+
+> **Known defect in this table.** The filter-fate breakdown came out 56% `both` / 44% unattributed,
+> because ledger slot indices come from a different panel build than the scored run. The fate column
+> is unreliable; the shared-vs-block-5-only split is computed from the data itself and is sound.
+> Keying on marker code rather than slot would fix it.
+
+# Precise conclusion
+
+**Whole-locus multiplicity explains most of the CYP2D6 failure and validates the architecture of a
+locus-wide shared-marker factor. The remaining observed-count residual must be attributed before that
+factor can be implemented safely.**
+
+# Still owed, before any production change
+
+1. Exact simulated-read accounting: trace every counted marker occurrence to its source read and
+   coordinate, and partition into expected-position occurrence, sequencing-error-created match,
+   canonical reverse-complement collision, count reused across slots, otherwise unexplained. Include
+   marker-specific read opportunity, since `lambda x multiplicity` assumes uniform coverage per
+   occurrence.
+2. Multi-seed repeat with haplotypes fixed, to separate persistent marker-specific residuals
+   (systematic model error) from residuals that change sign across seeds (sampling).
+3. Certified-floor analysis for the three donors with no representable truth: measure
+   `error(selected) - error(certified nearest)` and whether the top class contains a certified-optimal
+   pair, rather than asking whether an unavailable pair ranks first.
+4. The fate-attribution fix above.
+
+# The production construction this points at
+
+One unique marker -> one likelihood factor `y_j ~ NB(lambda * SUM multiplicity over every block state
+carrying j, + mu)` -> connected to every block in which that marker occurs. Each observed marker
+scored **once**, never once per block. The marker-to-block incidence graph decomposes into connected
+components: exact enumeration for small ones, beam or message passing for larger. At cyp2d6 block 5
+the component is just blocks 3 and 5.
