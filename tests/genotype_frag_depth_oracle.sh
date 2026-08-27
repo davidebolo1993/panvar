@@ -5,9 +5,21 @@
 #
 # Pre-registered, three arms, run before implementing a windowed read-assignment model:
 #
-#   A  alignment only                      the current default
-#   B  + total-fragment Poisson            lambda fitted ONCE outside any candidate
-#   C  + truth total length                DIAGNOSTIC ONLY: no caller can know this
+#   A   alignment only                     the current default
+#   B   + total-fragment Poisson, lambda auto-estimated   -- BROKEN, kept as the control
+#   B2  + the same, lambda supplied         the arm that actually tests scalar dosage
+#   C   + truth total length                DIAGNOSTIC ONLY: no caller can know this
+#
+# B IS A NULL ARM AND IS RETAINED TO SHOW WHY. It estimates lambda = N / (2 * L_panel_median) and then
+# scores N ~ Poisson(lambda * L_pair). Substituting, the score is maximised at L_pair = N / lambda =
+# 2 * L_panel_median exactly, and the observed N cancels: it is a prior pulling every sample toward
+# the panel's median length, not a depth calibration, and it CANNOT discover a length outlier.
+# Verified numerically -- it ranks twice the panel median above cyp2d6 HG04036's true total.
+#
+# B2 supplies lambda instead. These reads come from wgsim at 30x with 2 x 150 bp mates, so
+# lambda = 30 / (2 * 300) = 0.05 fragments per haplotype bp, known by construction rather than
+# estimated from the locus being genotyped. On real data it must come from invariant flanks or
+# genome-wide depth -- never from this locus's own fragment count over an assumed length.
 #
 # The question C answers is the one that decides whether to build the joint model at all: if even
 # PERFECT total-length knowledge does not close the catastrophic donors, their failure is not total
@@ -72,6 +84,7 @@ for ((p=0; p<DONORS_N && p<ND; p++)); do
   printf "  %-10s floor=%-7s " "$DONOR" "$FLOOR"
   arm A ""
   arm B "--total-depth"
+  arm B2 "--haploid-depth ${LAMBDA:-0.05}"
   arm C "--truth-total-bp $TBP"
   echo
 done
@@ -82,7 +95,7 @@ import sys, collections
 rows=[l.rstrip('\n').split('\t') for l in open(sys.argv[1])][1:]
 by=collections.defaultdict(dict)
 for r in rows: by[r[1]][r[2]]=int(r[5])
-arms=['A','B','C']
+arms=['A','B','B2','C']
 ds=[d for d,v in by.items() if all(a in v for a in arms)]
 print(f"{'donor':<10}" + "".join(f"{a:>12}" for a in arms))
 for d in sorted(ds, key=lambda x:-by[x]['A']):
