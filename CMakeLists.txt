@@ -28,10 +28,11 @@ set(PANVAR_GENOTYPE_LIB_SOURCES
     src/genotype_index.cpp
     src/genotype_markers.cpp
     src/genotype_reads.cpp
+    src/genotype_fragments.cpp
     src/pangenie_model.cpp
     src/node_coverage.cpp
 )
-set(PANVAR_GENOTYPE_CLI_SOURCES src/genotype_command.cpp)
+set(PANVAR_GENOTYPE_CLI_SOURCES src/genotype_command.cpp src/genotype_frag_command.cpp)
 if(NOT PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE)
     set(PANVAR_GENOTYPE_LIB_SOURCES "")
     set(PANVAR_GENOTYPE_CLI_SOURCES "")

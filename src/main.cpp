@@ -10,6 +10,7 @@
 #include "panvar/cli_utils.hpp"
 #ifdef PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE
 #include "panvar/genotype_command.hpp"
+#include "panvar/genotype_frag_command.hpp"
 #endif
 #include "panvar/describe_command.hpp"
 #include "panvar/inspect.hpp"
@@ -56,6 +57,16 @@ int main(int argc, char** argv) {
             throw std::runtime_error(
                 "genotype is not built in this release. It is the one module that has not completed "
                 "its review pass, so it is excluded rather than shipped unreviewed. To build it for "
+                "development: cmake -DPANVAR_ENABLE_EXPERIMENTAL_GENOTYPE=ON");
+#endif
+        }
+        if (subcommand == "genotype-frag") {
+#ifdef PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE
+            return panvar::run_genotype_frag_command(args);
+#else
+            throw std::runtime_error(
+                "genotype-frag is not built in this release. It is a prototype of the genotype "
+                "module's fragment-level evidence model, gated with it. To build it for "
                 "development: cmake -DPANVAR_ENABLE_EXPERIMENTAL_GENOTYPE=ON");
 #endif
         }
