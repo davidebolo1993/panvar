@@ -34,7 +34,12 @@ chiara_test/*
 #   experiments/  genotype proof-of-concepts for the module that is not released
 #   docs/reports/ dated review write-ups, kept for the authors rather than for users
 #   docs/review_followups.md  the release ledger -- internal working state, not documentation
-experiments/
+# The experiment tree is 1.6 GB of generated output and 220 KB of documents. The documents are the
+# scientific record -- pre-registrations, gates, frozen definitions, negative results -- and they must
+# outlive any working tree: without them a clone gets the result tables with nothing to say what they
+# mean or what was declared before the run. Track the prose, ignore everything else.
+experiments/*
+!experiments/*.md
 docs/reports/
 docs/review_followups.md
 reports/
