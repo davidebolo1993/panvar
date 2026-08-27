@@ -944,8 +944,8 @@ HaplotypeResult genotype_haplotype_pairs(
         P.kind = chain[bi].kind;
         P.bubble_id = chain[bi].bubble_id;
         P.n_alleles = blocks[bi].allele_seq.size();
-        // Marginal, not a read-out of the best pair: haplotype pairs that disagree elsewhere may
-        // agree here, and that agreement is evidence.
+        // The posterior mass on each allele pair is computed either way, because it is what the
+        // reported confidence means; only which one is CALLED depends on the projection.
         std::map<std::pair<int, int>, double> mass;
         for (const HaplotypePairScore& p : pairs) {
             if (p.posterior < 1e-12) continue;
@@ -954,20 +954,30 @@ HaplotypeResult genotype_haplotype_pairs(
             if (a > b) std::swap(a, b);
             mass[{a, b}] += p.posterior;
         }
-        double best = -1.0;
-        for (const auto& [key, m] : mass) {
-            if (m > best) { best = m; P.allele1 = key.first; P.allele2 = key.second; }
+        if (options.project_map && !pairs.empty()) {
+            // No sort: allele1 stays with the pair's FIRST haplotype at every block, so the two
+            // columns are two homologues rather than two sorted indices.
+            P.allele1 = haps[pairs.front().hap1].allele[bi];
+            P.allele2 = haps[pairs.front().hap2].allele[bi];
+            const auto it = mass.find({std::min(P.allele1, P.allele2), std::max(P.allele1, P.allele2)});
+            P.posterior = it == mass.end() ? 0.0 : it->second;
+        } else {
+            double best = -1.0;
+            for (const auto& [key, m] : mass) {
+                if (m > best) { best = m; P.allele1 = key.first; P.allele2 = key.second; }
+            }
+            P.posterior = best < 0.0 ? 0.0 : best;
         }
-        P.posterior = best < 0.0 ? 0.0 : best;
         if (truth_allele1 != nullptr && truth_allele2 != nullptr &&
             bi < truth_allele1->size() && bi < truth_allele2->size()) {
             P.truth_a = (*truth_allele1)[bi];
             P.truth_b = (*truth_allele2)[bi];
             if (P.truth_a >= 0 && P.truth_b >= 0) {
                 P.truth_representable = true;
-                const int ta = std::min(P.truth_a, P.truth_b);
-                const int tb = std::max(P.truth_a, P.truth_b);
-                P.exact = (ta == P.allele1 && tb == P.allele2);
+                // Compared UNORDERED. The call is phased and the truth columns are not, so requiring
+                // the same order would score a correct call wrong for the order it was written in.
+                P.exact = (std::min(P.truth_a, P.truth_b) == std::min(P.allele1, P.allele2) &&
+                           std::max(P.truth_a, P.truth_b) == std::max(P.allele1, P.allele2));
             }
         }
     }
@@ -1002,6 +1012,24 @@ HaplotypeResult genotype_haplotype_pairs(
         out.top_pairs.push_back(pairs[i]);
     }
     return out;
+}
+
+void spell_called_pair(const std::vector<BlockAlleles>& blocks,
+                       const std::vector<int>& allele1,
+                       const std::vector<int>& allele2,
+                       std::string& seq1,
+                       std::string& seq2) {
+    seq1.clear();
+    seq2.clear();
+    for (std::size_t bi = 0; bi < blocks.size(); ++bi) {
+        const auto take = [&](const std::vector<int>& a, std::string& into) {
+            if (bi >= a.size() || a[bi] < 0) return;
+            const std::size_t ai = static_cast<std::size_t>(a[bi]);
+            if (ai < blocks[bi].allele_seq.size()) into += blocks[bi].allele_seq[ai];
+        };
+        take(allele1, seq1);
+        take(allele2, seq2);
+    }
 }
 
 void write_haplotype_results(const std::string& out_prefix,

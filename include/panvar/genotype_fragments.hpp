@@ -203,6 +203,20 @@ struct HaplotypeScoreOptions : FragmentScoreOptions {
     // Implied-start bins kept per mate per haplotype. 2 is what best-placement scoring used; a sum
     // over placements is only meaningful if the placements are actually enumerated.
     std::size_t placement_topk = 2;
+    // How a haplotype-pair posterior becomes a per-block allele pair.
+    //
+    //   map      take the best pair's alleles. The answer is then a real pair some haplotype pair
+    //            actually realises.
+    //   marginal take, per block, the allele pair with the most posterior mass summed over pairs.
+    //
+    // `marginal` sounds strictly better -- pairs that disagree elsewhere may agree here, and that
+    // agreement is evidence. Measured at cyp2d6 under leave-one-out it is much worse: the MAP pair
+    // reconstructs the donor's own sequence to a median of 130 edits and the marginal projection of
+    // the SAME posterior to 385. Taking a per-block argmax of marginals assembles a combination no
+    // single pair realises, and a chimera of good pairs is not a good sequence. Verified not to be a
+    // spelling artefact: concatenating a haplotype's own block alleles reproduces its sequence at 0
+    // edits over 213 kb.
+    bool project_map = true;
     // Sequence compatibility and copy number are different signals and a read alignment cannot carry
     // both. Measured, at cyp2d6 leave-ZERO-out: NA18939's haplotype 1 is 13.6 kb longer than the
     // panel's typical haplotype -- a duplication -- and the reads from the extra copy align perfectly
@@ -243,6 +257,12 @@ struct BlockProjection {
     BlockKind kind = BlockKind::Bubble;
     std::size_t bubble_id = 0;
     std::size_t n_alleles = 0;
+    // PHASED: allele1 is always the first haplotype of the called pair and allele2 the second,
+    // across every block. Sorting them per block by index -- which both this and production's table
+    // used to do -- is invisible to an unordered allele-pair comparison and fatal to a sequence one:
+    // concatenating allele1 down the chain then switches homologue at every block and produces a
+    // chimera of the two. Measured at cyp2d6: the same called pair reconstructs the donor at 130
+    // edits phased and 385 unphased.
     int allele1 = -1;
     int allele2 = -1;
     double posterior = 0.0;
@@ -306,6 +326,21 @@ void write_haplotype_results(
     const std::string& out_prefix,
     const HaplotypeResult& result,
     bool have_truth);
+
+// Spell a per-block call table into the two sequences it claims the sample carries.
+//
+// Needed because the two callers report in different shapes and cannot otherwise be compared on the
+// objective that matters. Production emits a per-block allele pair -- a mosaic, not a haplotype pair
+// -- so it has no "called haplotype" to align. Concatenating its own called alleles along the chain
+// gives exactly the sequence its output asserts, and that can be aligned to the donor's truth like
+// anything else. `allele1`/`allele2` of -1 (a block with no call) contribute nothing, which is the
+// same convention a bypass allele already has.
+void spell_called_pair(
+    const std::vector<BlockAlleles>& blocks,
+    const std::vector<int>& allele1,
+    const std::vector<int>& allele2,
+    std::string& seq1,
+    std::string& seq2);
 
 void write_fragment_results(
     const std::string& out_prefix,

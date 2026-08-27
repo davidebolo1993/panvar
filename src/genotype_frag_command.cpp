@@ -10,6 +10,7 @@
 #include "panvar/parallel.hpp"
 
 #include <algorithm>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -85,6 +86,14 @@ void print_help() {
         << "                              it did: at cyp2d6 NA18939 the same reads put the truth at\n"
         << "                              rank 2 with 48 haplotypes and rank 1 with 96\n"
         << "      --anchor-slack <N>      Window either side of an anchored read start (default 40)\n"
+        << "      --project-marginal      Call each block from the allele pair with the most\n"
+        << "                              posterior mass summed over haplotype pairs, instead of from\n"
+        << "                              the best pair. It sounds stricter and measures worse: at\n"
+        << "                              cyp2d6 under leave-one-out the best pair reconstructs the\n"
+        << "                              donor to a median 130 edits and the marginal projection of\n"
+        << "                              the SAME posterior to 385, because a per-block argmax of\n"
+        << "                              marginals assembles a combination no single pair realises.\n"
+        << "                              Kept so that stays reproducible\n"
         << "      --marginalise-placements  Sum a fragment's likelihood over EVERY placement it has\n"
         << "                              on a haplotype instead of taking its best one. A fragment\n"
         << "                              compatible with ten positions is evidence for a haplotype\n"
@@ -109,6 +118,12 @@ void print_help() {
         << "                              blocks. Real mechanism, not yet a safe default\n"
         << "      --coverage-window <N>   Window size for that channel (default 500)\n"
         << "      --blocks <a,b,c>        Score only these chain indices. Default: every bubble block\n"
+        << "      --spell-calls <gt.tsv>  Read a per-block call table (either caller's) and write the\n"
+        << "                              two sequences it claims, to <out-prefix>.called.fa. Needed\n"
+        << "                              because the two callers report in different shapes and\n"
+        << "                              cannot otherwise be compared on the objective that matters:\n"
+        << "                              production emits a per-block allele pair, which is a mosaic\n"
+        << "                              and has no called haplotype to align. Needs no reads\n"
         << "      --all-blocks            Score backbone and flank blocks too. gstm1's worst blocks\n"
         << "                              are BACKBONE blocks carrying 16 and 21 alleles, so the\n"
         << "                              default view omits them\n"
@@ -182,7 +197,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
 
     std::string gfa_path, bubble_prefix_in, bubbles_csv_in, out_prefix;
     std::vector<std::string> read_paths;
-    std::string truth_haplotypes, exclude_haplotypes, blocks_arg;
+    std::string truth_haplotypes, exclude_haplotypes, blocks_arg, spell_calls;
     bool all_blocks = false, quiet = false, hap_mode = false, length_normalize_set = false;
     std::size_t top_pairs = 20;
     HaplotypeScoreOptions hopt;
@@ -203,6 +218,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "-R" || a == "--reads") read_paths.push_back(value(i, a));
         else if (a == "--blocks") blocks_arg = value(i, a);
         else if (a == "--all-blocks") all_blocks = true;
+        else if (a == "--spell-calls") spell_calls = value(i, a);
         else if (a == "--truth-haplotypes") truth_haplotypes = value(i, a);
         else if (a == "--exclude-haplotypes") exclude_haplotypes = value(i, a);
         else if (a == "--flank-bp") opt.flank_bp = cli::parse_size_arg(a, value(i, a));
@@ -228,6 +244,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             }
             hopt.probe_pairs.emplace_back(two[0], two[1]);
         }
+        else if (a == "--project-marginal") hopt.project_map = false;
         else if (a == "--marginalise-placements") hopt.marginalise_placements = true;
         else if (a == "--placement-topk") hopt.placement_topk = cli::parse_size_arg(a, value(i, a));
         else if (a == "--coverage-weight") hopt.coverage_weight = std::stod(value(i, a));
@@ -246,7 +263,9 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     if (gfa_path.empty() || out_prefix.empty()) {
         throw std::runtime_error("genotype-frag requires --gfa and --out-prefix");
     }
-    if (read_paths.empty()) throw std::runtime_error("genotype-frag requires at least one --reads");
+    if (read_paths.empty() && spell_calls.empty()) {
+        throw std::runtime_error("genotype-frag requires at least one --reads");
+    }
     if (!bubble_prefix_in.empty()) {
         if (!bubbles_csv_in.empty()) {
             throw std::runtime_error("genotype-frag: use either --bubble-prefix-in or --bubbles-csv-in");
@@ -313,6 +332,60 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
              std::to_string(graph.paths.size()) + " paths); " + std::to_string(bubbles.size()) +
              " bubbles; chain of " + std::to_string(chain.size()) + " blocks" +
              (held_out.empty() ? "" : "; " + std::to_string(held_out.size()) + " held out"));
+
+    if (!spell_calls.empty()) {
+        std::ifstream cf(spell_calls);
+        if (!cf) throw std::runtime_error("genotype-frag: cannot read " + spell_calls);
+        std::string line;
+        if (!std::getline(cf, line)) throw std::runtime_error("genotype-frag: empty " + spell_calls);
+        std::vector<std::string> header;
+        {
+            std::size_t start = 0;
+            for (std::size_t i = 0; i <= line.size(); ++i) {
+                if (i == line.size() || line[i] == '\t') {
+                    header.push_back(line.substr(start, i - start));
+                    start = i + 1;
+                }
+            }
+        }
+        const auto col = [&](const std::string& n) {
+            for (std::size_t i = 0; i < header.size(); ++i) if (header[i] == n) return static_cast<long>(i);
+            throw std::runtime_error("genotype-frag: --spell-calls table has no column '" + n + "'");
+        };
+        // Both callers' tables are accepted: production names the column block_index, the prototype
+        // names it block. Requiring one of them would make the comparison depend on which caller
+        // happened to write the file.
+        const long c_blk = std::find(header.begin(), header.end(), std::string("block_index")) != header.end()
+            ? col("block_index") : col("block");
+        const long c_a1 = col("allele1");
+        const long c_a2 = col("allele2");
+        std::vector<int> a1(chain.size(), -1), a2(chain.size(), -1);
+        while (std::getline(cf, line)) {
+            std::vector<std::string> f;
+            std::size_t start = 0;
+            for (std::size_t i = 0; i <= line.size(); ++i) {
+                if (i == line.size() || line[i] == '\t') { f.push_back(line.substr(start, i - start)); start = i + 1; }
+            }
+            if (f.size() <= static_cast<std::size_t>(std::max(c_blk, std::max(c_a1, c_a2)))) continue;
+            const long bi = std::stol(f[static_cast<std::size_t>(c_blk)]);
+            if (bi < 0 || static_cast<std::size_t>(bi) >= chain.size()) continue;
+            a1[static_cast<std::size_t>(bi)] = std::stoi(f[static_cast<std::size_t>(c_a1)]);
+            a2[static_cast<std::size_t>(bi)] = std::stoi(f[static_cast<std::size_t>(c_a2)]);
+        }
+        std::string s1, s2;
+        spell_called_pair(blocks, a1, a2, s1, s2);
+        const std::string fa = out_prefix + ".called.fa";
+        std::ofstream of(fa);
+        if (!of) throw std::runtime_error("genotype-frag: cannot write " + fa);
+        of << ">called_1\n" << s1 << "\n>called_2\n" << s2 << '\n';
+        of.flush();
+        if (!of) throw std::runtime_error("genotype-frag: write failed for " + fa);
+        log.info("spelled " + spell_calls + ": " + std::to_string(s1.size()) + " bp and " +
+                 std::to_string(s2.size()) + " bp");
+        log.wrote({fa});
+        log.done();
+        return 0;
+    }
 
     // ---- truth, resolved the same way `genotype` resolves it ---------------------------------
     std::vector<int> truth1, truth2;
