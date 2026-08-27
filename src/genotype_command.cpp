@@ -1843,7 +1843,15 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 if (!injection_out.empty()) {
                     std::ofstream jf(injection_out);
                     if (!jf) throw std::runtime_error("genotype: cannot write " + injection_out);
-                    jf << "slot\tsource_mult\tobserved_count\n";
+                    // first_pos and clump make the per-class decomposition answerable at the
+                    // right unit. Adjacent syncmers a few bp apart sit inside one fragment and rise
+                    // and fall together, so N markers disagreeing is not N independent pieces of
+                    // evidence -- it may be one sequence difference counted many times. The block's
+                    // rho discount already scales the total by clumps/markers, but it applies AFTER
+                    // correlated markers have each voted, so a class total in marker units cannot say
+                    // how many real differences are behind it.
+                    const double frag = read_panel.fragment_len > 0.0 ? read_panel.fragment_len : 350.0;
+                    jf << "slot\tsource_mult\tobserved_count\tfirst_pos\tclump\n";
                     std::vector<std::uint32_t> uni;
                     for (const auto& mset : read_panel.by_block[nbi])
                         for (const auto& [slot, m] : mset.nodes) { (void)m; uni.push_back(slot); }
@@ -1851,8 +1859,14 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     uni.erase(std::unique(uni.begin(), uni.end()), uni.end());
                     for (const std::uint32_t sl : uni) {
                         const auto it = mult.find(sl);
+                        const std::uint32_t fp = sl < read_panel.node_first_pos.size()
+                                                     ? read_panel.node_first_pos[sl] : UINT32_MAX;
                         jf << sl << '\t' << (it == mult.end() ? 0u : it->second) << '\t'
-                           << rc.node[sl] << '\n';
+                           << rc.node[sl] << '\t';
+                        // No recorded position means no clump can be assigned; NA, never 0, which
+                        // would silently pool every such marker into one enormous clump.
+                        if (fp == UINT32_MAX) jf << "NA\tNA\n";
+                        else jf << fp << '\t' << static_cast<long>(fp / frag) << '\n';
                     }
                     log.wrote({injection_out});
                 }
