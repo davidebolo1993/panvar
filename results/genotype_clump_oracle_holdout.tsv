@@ -2,8 +2,11 @@
 # eligibility_source	cohort/lpa.avail.tsv
 # eligibility_sha256	ac7e59c962365a8aa622c0b3f0fe6138e076a3fe962cf4a75f9c2ec9e00db81d
 # n_available	101
-# n_excluded_ever_inspected	35
+# n_excluded_ever_inspected_total	35
+# n_excluded_among_available	21
+# n_inspected_not_in_available	14
 # n_eligible	80
+# arithmetic	101 available - 21 inspected-and-available = 80 eligible
 # rule	sha256(salt + TAB + donor), ascending; first 30 = selection, rest = holdout
 donor	arm	hash_prefix
 NA19043	selection	07c00d032dea2148
