@@ -2332,6 +2332,15 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             std::ofstream& of = opf;
                             // best_* on the edit_distance criterion, recomputed here so the excess is
                             // against the certified optimum and not against whatever ran last.
+                            //
+                            // Under --oracle-called-only the cache holds only the called pair and the
+                            // alleles named here, so the minimum over it is NOT the certified optimum
+                            // over all A alleles -- it is a minimum over a handful. Reporting that
+                            // difference as excess would understate it, silently, by however much the
+                            // real optimum beats the named set. Excess is NA there; total_edits is
+                            // still exact, and the caller can subtract a best_total_edits obtained
+                            // from a full run.
+                            const bool excess_computable = !oracle_called_only;
                             std::size_t eb_a = 0, eb_b = 0; long eb = -1;
                             for (std::size_t a = 0; a < A; ++a) {
                                 if (oracle_called_only && !want_allele[a] && a != ca0 && a != cb0) continue;
@@ -2357,7 +2366,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                 of << ident(x, 0) << '\t' << ident(y, 1) << '\t'
                                    << dl[x][0] << '\t' << dl[y][1] << '\t' << tot << '\t'
                                    << ((ident(x, 0) + ident(y, 1)) / 2.0) << '\t'
-                                   << (eb >= 0 ? std::to_string(tot - eb) : std::string("NA")) << '\n';
+                                   << ((excess_computable && eb >= 0) ? std::to_string(tot - eb)
+                                                                      : std::string("NA")) << '\n';
                             }
                             of.flush();
                             if (!of) throw std::runtime_error("genotype: write failed for " + pp);
