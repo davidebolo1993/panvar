@@ -172,8 +172,16 @@ def load(p):
         except ValueError: pass
     return d
 ref, rz = load(sys.argv[1]), load(sys.argv[2])
-common=[k for k in ref if k in rz]
-if len(common) < 3: print("  .... too few pairs"); sys.exit(1)
+# EXACT key-set equality. Accepting "any common subset of at least three" would pass an accelerated
+# scorer that silently dropped most pairs -- including the truth -- which is precisely the failure
+# this suite already had once, when a duplicated `ref` sequence removed the truth pair from the
+# comparison and the remaining pairs agreed nicely.
+missing = sorted(set(ref) - set(rz))
+extra   = sorted(set(rz) - set(ref))
+if missing or extra:
+    print(f"  .... key sets differ: {len(missing)} missing {missing[:4]}, {len(extra)} extra {extra[:4]}")
+    sys.exit(1)
+common=sorted(ref)
 off=[rz[k]-ref[k] for k in common]
 c=statistics.median(off)
 resid=max(abs(o-c) for o in off)
@@ -266,6 +274,21 @@ sys.exit(0 if abs(rz_sep / ref_sep - 1.0) <= 0.10 else 1)
 PYEOF
   [ $? -eq 0 ] && ok "unbounded recruited placements reproduce the reference separation within +/-10%" \
                || bad "unbounded recruited placements do NOT match the reference -- the models still differ"
+
+  # ABSOLUTE equality, not merely equal differences. With every model difference removed the two
+  # scorers compute the same quantity, so they must agree to floating point -- and only an absolute
+  # check catches a term that shifts every candidate by the same amount. The 1/2-per-strand factor is
+  # exactly such a term: mutation-tested, deleting it passes every ranking-based and offset-based
+  # assertion in this suite and is caught only here.
+  "$PY" - "$R2" "$rzt" <<'PYEOF'
+import sys
+ref, fast = float(sys.argv[1]), float(sys.argv[2])
+print(f"  .... absolute agreement on two/two: reference {ref:.3f}, accelerated {fast:.3f}, "
+      f"difference {abs(ref-fast):.3f}")
+sys.exit(0 if abs(ref - fast) < 1.0 else 1)
+PYEOF
+  [ $? -eq 0 ] && ok "accelerated score equals the reference ABSOLUTELY, not just up to a constant" \
+               || bad "the two scorers differ by a constant -- some per-fragment term is not shared"
 else
   bad "rung zero did not score both pairs"
 fi

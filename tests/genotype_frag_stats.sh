@@ -319,27 +319,58 @@ emit_same_strand() { awk -v s="$1" -v tag="$2" -v step="$3" 'BEGIN{
       printf ">%s_%d/1\n%s\n>%s_%d/2\n%s\n", tag,i,substr(s,i,rl),tag,i,substr(s,i+ins-rl,rl) } }'; }
 emit_same_strand "$H1" ss 25 > "$OUT/ss_bad.fa"
 emit_pairs      "$H1" ss 25 > "$OUT/ss_good.fa"
-SG=$("$BIN" genotype-frag --reference-score "$OUT/truth1.fa" "$OUT/truth1.fa" -R "$OUT/ss_good.fa" \
-       --haploid-depth 0.05 --fragment-len 350 --fragment-sd 50 2>/dev/null)
-SB=$("$BIN" genotype-frag --reference-score "$OUT/truth1.fa" "$OUT/truth1.fa" -R "$OUT/ss_bad.fa" \
-       --haploid-depth 0.05 --fragment-len 350 --fragment-sd 50 2>/dev/null)
-awk -v a="$SG" -v b="$SB" 'BEGIN{ exit !(a > b + 1) }' \
-  && ok "same-strand mates earn less than a valid FR pair ($SG vs $SB)" \
-  || bad "same-strand mates score as well as FR pairs: $SG vs $SB"
+# Scored through the ACCELERATED path, because that is where the FR guard lives. Checking this with
+# --reference-score would pass even if the fast guard were deleted, which is the defect the fixture
+# exists for.
+fastscore() {   # <reads> -> the top pair's score under the accelerated scorer
+  "$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/fs" -R "$1" \
+    --haplotype-mode --rung-zero --hamming-emission --top-pairs 1 \
+    --haploid-depth 0.05 --fragment-len 350 --fragment-sd 50 -t 2 -q >/dev/null 2>&1
+  sed -n 2p "$OUT/fs.hap_pairs.tsv" | cut -f4
+}
+SG=$(fastscore "$OUT/ss_good.fa"); SB=$(fastscore "$OUT/ss_bad.fa")
+awk -v a="${SG:-0}" -v b="${SB:-0}" 'BEGIN{ exit !(a > b + 1) }' \
+  && ok "ACCELERATED: same-strand mates earn less than a valid FR pair ($SG vs $SB)" \
+  || bad "accelerated scorer credits same-strand mates like FR pairs: $SG vs $SB"
 
 # ------------------------------------------- strand prior: a haplotype and its revcomp score alike
 # The 1/2-per-strand factor and the both-orientations search must agree, and the scorer must be
 # strand-symmetric. Not cosmetic: real panel sequence contains haplotypes spelled reverse-complemented
 # by block concatenation, which is what made an earlier recall measurement read 48% instead of 100%.
-RCSEQ=$(printf '%s' "$H1" | tr 'ACGT' 'TGCA' | rev)
-printf '>rc\n%s\n' "$RCSEQ" > "$OUT/rc.fa"
-FS=$("$BIN" genotype-frag --reference-score "$OUT/truth1.fa" "$OUT/truth1.fa" -R "$OUT/ss_good.fa" \
-       --haploid-depth 0.05 --fragment-len 350 --fragment-sd 50 2>/dev/null)
-RS=$("$BIN" genotype-frag --reference-score "$OUT/rc.fa" "$OUT/rc.fa" -R "$OUT/ss_good.fa" \
-       --haploid-depth 0.05 --fragment-len 350 --fragment-sd 50 2>/dev/null)
-awk -v a="$FS" -v b="$RS" 'BEGIN{ d=a-b; if(d<0) d=-d; exit !(d < 0.000001) }' \
-  && ok "strand prior: a haplotype and its reverse complement score identically ($FS)" \
-  || bad "strand handling is asymmetric: $FS vs $RS"
+# Strand symmetry through the ACCELERATED path too: build a second graph whose node sequences are
+# reverse-complemented, so every path spells the reverse complement of its counterpart. The same reads
+# must score identically against it.
+rcof() { printf '%s' "$1" | tr 'ACGTacgt' 'TGCAtgca' | rev; }
+# The node ORDER reverses as well as each node's sequence: rc(A B C) is rc(C) rc(B) rc(A), not
+# rc(A) rc(B) rc(C). Reverse-complementing nodes in place spells a scrambled sequence, which is what
+# the first version of this fixture did -- and it looked exactly like an asymmetric scorer.
+{ printf 'H\tVN:Z:1.0\n'
+  printf 'S\t1\t%s\n' "$(rcof "$N")"
+  printf 'S\t2\t%s\n' "$(rcof "$Y1")"; printf 'S\t3\t%s\n' "$(rcof "$Y2")"
+  printf 'S\t4\t%s\n' "$(rcof "$M")"
+  printf 'S\t5\t%s\n' "$(rcof "$X1")"; printf 'S\t6\t%s\n' "$(rcof "$X2")"
+  printf 'S\t7\t%s\n' "$(rcof "$L")"
+  for a in 2 3; do printf 'L\t1\t+\t%s\t+\t0M\nL\t%s\t+\t4\t+\t0M\n' "$a" "$a"; done
+  for a in 5 6; do printf 'L\t4\t+\t%s\t+\t0M\nL\t%s\t+\t7\t+\t0M\n' "$a" "$a"; done
+  # rc(L X1 M Y1 N) = rc(N) rc(Y1) rc(M) rc(X1) rc(L) = 1,2,4,5,7
+  printf 'P\tref\t1+,2+,4+,5+,7+\t*\n'
+  for i in 1 2 3; do printf 'P\thapAB%d\t1+,2+,4+,5+,7+\t*\n' "$i"; done
+  for i in 1 2 3; do printf 'P\thapCD%d\t1+,3+,4+,6+,7+\t*\n' "$i"; done
+  for i in 1 2 3; do printf 'P\thapAD%d\t1+,3+,4+,5+,7+\t*\n' "$i"; done
+  for i in 1 2 3; do printf 'P\thapCB%d\t1+,2+,4+,6+,7+\t*\n' "$i"; done
+} > "$OUT/grc.gfa"
+"$BIN" bubble -i "$OUT/grc.gfa" -r ref -o "$OUT/rcbub" --min-variant-bp 0 -q >/dev/null 2>&1
+"$BIN" genotype-frag -i "$OUT/grc.gfa" -b "$OUT/rcbub" -o "$OUT/frc" -R "$OUT/reads.fa" \
+  --haplotype-mode --rung-zero --hamming-emission --top-pairs 1 \
+  --haploid-depth 0.05 --fragment-len 350 --fragment-sd 50 -t 2 -q >/dev/null 2>&1
+"$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/ffw" -R "$OUT/reads.fa" \
+  --haplotype-mode --rung-zero --hamming-emission --top-pairs 1 \
+  --haploid-depth 0.05 --fragment-len 350 --fragment-sd 50 -t 2 -q >/dev/null 2>&1
+FS=$(sed -n 2p "$OUT/ffw.hap_pairs.tsv" | cut -f4)
+RS=$(sed -n 2p "$OUT/frc.hap_pairs.tsv" | cut -f4)
+awk -v a="${FS:-0}" -v b="${RS:-1}" 'BEGIN{ d=a-b; if(d<0) d=-d; exit !(d < 0.5) }' \
+  && ok "ACCELERATED: a reverse-complemented panel scores identically ($FS vs $RS)" \
+  || bad "accelerated strand handling is asymmetric: $FS vs $RS"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "genotype-frag stats: all assertions passed"; else
