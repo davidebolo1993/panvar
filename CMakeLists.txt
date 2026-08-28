@@ -325,6 +325,19 @@ if(PANVAR_BUILD_TESTING)
             set_tests_properties(panvar_genotype_frag_stats PROPERTIES TIMEOUT 300)
         endif()
 
+        # The fragment model's exact reference scorer, against fixtures whose values are derivable
+        # rather than recorded -- the homozygous-doubling case is checked against
+        # -lambda*starts + n*log(2) analytically. It is the oracle the accelerated scorer must be
+        # proven equivalent to, so it is tested on its own before anything is compared with it.
+        set(PANVAR_GENOTYPE_FRAG_REFERENCE ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_frag_reference.sh)
+        if(EXISTS ${PANVAR_GENOTYPE_FRAG_REFERENCE} AND PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE)
+            add_test(
+                NAME panvar_genotype_frag_reference
+                COMMAND /usr/bin/env bash ${PANVAR_GENOTYPE_FRAG_REFERENCE} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/genotype_frag_reference
+            )
+            set_tests_properties(panvar_genotype_frag_reference PROPERTIES TIMEOUT 600)
+        endif()
+
         # Opt-in regressions against the committed real loci. Several contracts are only reachable
         # on real data: ANKRD36C is the only locus that ever produced overlapping sites, LPA KIV-2 is
         # the folding case with 466 haplotypes, whether the POA guards SKIP anything is a property of

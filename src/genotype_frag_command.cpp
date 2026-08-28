@@ -144,6 +144,16 @@ void print_help() {
         << "                              as a whole unaligned base. Use this to check the floor\n"
         << "                              exactly on the few nearest candidates -- it is affordable\n"
         << "                              there and not over a whole panel\n"
+        << "      --reference-score <a.fa> <b.fa>\n"
+        << "                              Score this haplotype pair against --reads with the EXACT\n"
+        << "                              reference implementation of the model contract: every\n"
+        << "                              fragment start on both haplotypes enumerated, the insert\n"
+        << "                              prior summed over, no syncmer index, no anchor cap and no\n"
+        << "                              --placement-topk. It is the oracle the fast path is tested\n"
+        << "                              against, not a caller -- it is O(fragments x length x insert\n"
+        << "                              range) and is meant for small synthetic haplotypes. Pass the\n"
+        << "                              same file twice for a homozygous pair; exposure and the\n"
+        << "                              placement set both double, as the contract requires\n"
         << "      --mosaic-floor          Three floors instead of one, needing --truth-haplotypes\n"
         << "                              and no reads: COMPLETE (one panel haplotype per homologue\n"
         << "                              across the locus), FREE (the nearest panel allele at every\n"
@@ -235,6 +245,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     std::vector<std::string> read_paths;
     std::string truth_haplotypes, exclude_haplotypes, blocks_arg, spell_calls;
     bool mosaic_floor = false;
+    std::vector<std::string> reference_pair;
     std::string switch_penalties_arg = "0,10,100,1000";
     std::vector<std::string> exact_distance;
     bool all_blocks = false, quiet = false, hap_mode = false, length_normalize_set = false;
@@ -259,6 +270,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--all-blocks") all_blocks = true;
         else if (a == "--spell-calls") spell_calls = value(i, a);
         else if (a == "--mosaic-floor") mosaic_floor = true;
+        else if (a == "--reference-score") { reference_pair.push_back(value(i, a));
+                                             reference_pair.push_back(value(i, a)); }
         else if (a == "--switch-penalties") switch_penalties_arg = value(i, a);
         else if (a == "--exact-distance") { exact_distance.push_back(value(i, a));
                                             exact_distance.push_back(value(i, a)); }
@@ -313,6 +326,33 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else throw std::runtime_error("genotype-frag: unknown option " + a);
     }
 
+    if (!reference_pair.empty()) {
+        if (read_paths.empty()) throw std::runtime_error("genotype-frag: --reference-score needs --reads");
+        const auto slurp_fa = [](const std::string& path) {
+            std::ifstream in(path);
+            if (!in) throw std::runtime_error("genotype-frag: cannot read " + path);
+            std::string line, seq;
+            while (std::getline(in, line)) {
+                if (!line.empty() && line[0] == '>') continue;
+                while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+                seq += line;
+            }
+            return seq;
+        };
+        FragmentLoadStats st;
+        const std::vector<Fragment> frags = load_fragments(read_paths, &st);
+        ReferenceParams rp;
+        rp.lambda = hopt.haploid_depth > 0.0 ? hopt.haploid_depth : 0.05;
+        rp.eta = hopt.outlier_mix;
+        rp.error_rate = hopt.error_rate;
+        rp.fragment_len = hopt.fragment_len;
+        rp.fragment_sd = hopt.fragment_sd;
+        rp.bg_divergence = hopt.bg_divergence;
+        const double v = reference_pair_loglik(slurp_fa(reference_pair[0]), slurp_fa(reference_pair[1]),
+                                               frags, rp);
+        std::printf("%.6f\n", v);
+        return 0;
+    }
     if (!exact_distance.empty()) {
         const auto slurp = [](const std::string& path) {
             std::ifstream in(path);

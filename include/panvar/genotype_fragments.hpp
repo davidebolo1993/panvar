@@ -549,6 +549,36 @@ MosaicFloors mosaic_floors(
     const std::vector<double>& switch_penalties,
     std::size_t threads);
 
+// ---------------------------------------------------------------------------------------------
+// EXACT REFERENCE SCORER
+//
+// The model of docs/reports/genotype-fragment-model-contract.md, implemented as directly and as
+// slowly as possible: every fragment start on both haplotypes is enumerated, the insert prior is
+// summed over, and there is no syncmer index, no anchor cap and no placement_topk anywhere in it.
+//
+// It exists to be an ORACLE, not a caller. It is O(fragments x haplotype length x insert range) and
+// is meant for small synthetic haplotypes where the answer can also be worked out by hand. The fast
+// path is accepted only if it reproduces this ranking and these likelihood differences within a
+// stated bound -- and the fast path is never adjusted to make them agree, because this defines the
+// model and the fast path only approximates it.
+struct ReferenceParams {
+    double lambda = 0.05;        // fragments per start position
+    double eta = 0.05;           // background weight
+    double error_rate = 0.01;
+    double fragment_len = 350.0;
+    double fragment_sd = 50.0;
+    double bg_divergence = 0.10; // the background's implied per-base disagreement
+    int insert_sigmas = 4;       // how far into the insert prior's tails to sum
+};
+
+// log L(a,b) under the contract. `hap_a` and `hap_b` are the two homologues; pass the same sequence
+// twice for a homozygous pair and the exposure and placement set both double, as they must.
+double reference_pair_loglik(
+    const std::string& hap_a,
+    const std::string& hap_b,
+    const std::vector<Fragment>& fragments,
+    const ReferenceParams& params);
+
 void write_fragment_results(
     const std::string& out_prefix,
     const std::vector<BlockFragmentResult>& results,

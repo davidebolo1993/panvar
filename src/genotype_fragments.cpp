@@ -1670,4 +1670,120 @@ void write_haplotype_results(const std::string& out_prefix,
     if (!pf) throw std::runtime_error("genotype-frag: write failed for " + pp);
 }
 
+// =================================================================================================
+// EXACT REFERENCE SCORER
+// =================================================================================================
+
+namespace {
+
+// Hamming emission. The reference deliberately does NOT align: a placement is a start position, and
+// the fragment either agrees with the sequence there or it does not. Indels inside a read would need
+// alignment and would make "the set of starts" ambiguous, which is exactly the ambiguity the contract
+// removes. Fixtures are built without them.
+double reference_emission(const std::string& read, const std::string& target, std::size_t offset,
+                          double log_eps, double log_1meps) {
+    if (offset + read.size() > target.size()) return kNegInf;
+    std::size_t mism = 0;
+    for (std::size_t i = 0; i < read.size(); ++i) {
+        if (read[i] != target[offset + i]) ++mism;
+    }
+    return static_cast<double>(mism) * log_eps +
+           static_cast<double>(read.size() - mism) * log_1meps;
+}
+
+// log Pr(insert length L) under the library prior, normalised over the range actually summed.
+double reference_insert_logprior(double L, double mean, double sd) {
+    const double z = (L - mean) / sd;
+    return -0.5 * z * z - std::log(sd) - 0.9189385332046727;
+}
+
+// log sum over every start on ONE haplotype of P(f | start), with the insert prior integrated.
+// One orientation of one fragment against one haplotype: `lead` maps forward at the start and
+// `trail` maps forward at start + L - |trail|.
+double reference_orientation(const std::string& lead, const std::string& trail,
+                             const std::string& hap, const ReferenceParams& p,
+                             double log_eps, double log_1meps) {
+    if (hap.empty() || lead.empty()) return kNegInf;
+    const Fragment tmp;
+    (void)tmp;
+    const long lo_ins = std::max<long>(static_cast<long>(lead.size() + trail.size()),
+                                       static_cast<long>(p.fragment_len - p.insert_sigmas * p.fragment_sd));
+    const long hi_ins = static_cast<long>(p.fragment_len + p.insert_sigmas * p.fragment_sd);
+    double acc = kNegInf;
+    const long n = static_cast<long>(hap.size());
+    for (long s = 0; s + static_cast<long>(lead.size()) <= n; ++s) {
+        const double e1 = reference_emission(lead, hap, static_cast<std::size_t>(s), log_eps, log_1meps);
+        if (e1 == kNegInf) continue;
+        if (trail.empty()) { acc = log_add(acc, e1); continue; }
+        for (long L = lo_ins; L <= hi_ins; ++L) {
+            const long m2 = s + L - static_cast<long>(trail.size());
+            if (m2 < 0 || m2 + static_cast<long>(trail.size()) > n) continue;
+            const double e2 = reference_emission(trail, hap, static_cast<std::size_t>(m2), log_eps, log_1meps);
+            if (e2 == kNegInf) continue;
+            acc = log_add(acc, e1 + e2 +
+                          reference_insert_logprior(static_cast<double>(L), p.fragment_len, p.fragment_sd));
+        }
+    }
+    return acc;
+}
+
+double reference_fragment_on_haplotype(const Fragment& f, const std::string& hap,
+                                       const ReferenceParams& p,
+                                       const std::string& r2rc,
+                                       double log_eps, double log_1meps) {
+    if (hap.empty() || f.r1.empty()) return kNegInf;
+    // BOTH STRANDS. A fragment arises from either strand at a start with probability 1/2 each, so a
+    // haplotype and its reverse complement must score identically -- which they do not if only the
+    // FR orientation is tried. Measured need: one of cyp2d6 HG04036's haplotypes is spelled
+    // reverse-complemented by block concatenation, so a scorer that assumes one strand is wrong on
+    // real panel sequence, not only on a contrived fixture.
+    const std::string r1rc = reverse_complement(f.r1);
+    const double fwd = reference_orientation(f.r1, r2rc, hap, p, log_eps, log_1meps);
+    const double rev = reference_orientation(f.r2, r1rc, hap, p, log_eps, log_1meps);
+    const double half = std::log(0.5);
+    return log_add(fwd == kNegInf ? kNegInf : half + fwd,
+                   rev == kNegInf ? kNegInf : half + rev);
+}
+
+} // namespace
+
+double reference_pair_loglik(const std::string& hap_a, const std::string& hap_b,
+                             const std::vector<Fragment>& fragments,
+                             const ReferenceParams& params) {
+    const double log_eps = std::log(params.error_rate);
+    const double log_1meps = std::log1p(-params.error_rate);
+
+    // Exposure is a count of START POSITIONS, over exactly the starts the placement sum below ranges
+    // over. Both homologues are counted, so a homozygous pair (the same sequence passed twice) gets
+    // double exposure and a doubled placement set, which is the whole of what homozygosity means here.
+    const auto starts_of = [&](const std::string& h) {
+        const long n = static_cast<long>(h.size());
+        const long need = static_cast<long>(params.fragment_len - params.insert_sigmas * params.fragment_sd);
+        return static_cast<double>(std::max<long>(0, n - std::max<long>(1, need) + 1));
+    };
+    const double exposure = starts_of(hap_a) + starts_of(hap_b);
+
+    double total = -params.lambda * exposure;
+    const double log_lam = std::log(params.lambda);
+    const double log_mix = std::log1p(-params.eta);
+    const double log_bg_w = std::log(params.eta);
+
+    for (const Fragment& f : fragments) {
+        const std::size_t len = f.bases();
+        if (len == 0) continue;
+        const std::string r2rc = f.r2.empty() ? std::string() : reverse_complement(f.r2);
+        // The fragment may have come from either homologue: one sum over the union of their starts.
+        double lse = reference_fragment_on_haplotype(f, hap_a, params, r2rc, log_eps, log_1meps);
+        lse = log_add(lse, reference_fragment_on_haplotype(f, hap_b, params, r2rc, log_eps, log_1meps));
+
+        const double bg = static_cast<double>(
+                              static_cast<std::size_t>(params.bg_divergence * static_cast<double>(len))) * log_eps +
+                          static_cast<double>(len - static_cast<std::size_t>(
+                              params.bg_divergence * static_cast<double>(len))) * log_1meps;
+        const double placed = (lse == kNegInf) ? kNegInf : log_mix + log_lam + lse;
+        total += log_add(placed, log_bg_w + bg);
+    }
+    return total;
+}
+
 } // namespace panvar
