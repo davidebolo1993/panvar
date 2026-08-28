@@ -275,11 +275,15 @@ PYEOF
   [ $? -eq 0 ] && ok "unbounded recruited placements reproduce the reference separation within +/-10%" \
                || bad "unbounded recruited placements do NOT match the reference -- the models still differ"
 
-  # ABSOLUTE equality, not merely equal differences. With every model difference removed the two
-  # scorers compute the same quantity, so they must agree to floating point -- and only an absolute
-  # check catches a term that shifts every candidate by the same amount. The 1/2-per-strand factor is
-  # exactly such a term: mutation-tested, deleting it passes every ranking-based and offset-based
-  # assertion in this suite and is caught only here.
+  # ABSOLUTE agreement within a PREDECLARED 1-nat tolerance -- not "floating-point equality". The
+  # observed residual is about 0.3 nats, which is orders of magnitude above numerical rounding and is
+  # presumably the remaining recruitment approximation; calling it floating point would hide the one
+  # quantity the ladder is about to measure.
+  #
+  # It has to be an absolute check, not a relative one: only an absolute comparison catches a term
+  # that shifts every candidate by the same amount. Mutation-tested -- deleting the 1/2-per-strand
+  # factor passes every ranking-based and offset-based assertion in this suite and is caught only
+  # here, shifting the score by 146*log(2) = 101.2 nats.
   "$PY" - "$R2" "$rzt" <<'PYEOF'
 import sys
 ref, fast = float(sys.argv[1]), float(sys.argv[2])
@@ -287,8 +291,8 @@ print(f"  .... absolute agreement on two/two: reference {ref:.3f}, accelerated {
       f"difference {abs(ref-fast):.3f}")
 sys.exit(0 if abs(ref - fast) < 1.0 else 1)
 PYEOF
-  [ $? -eq 0 ] && ok "accelerated score equals the reference ABSOLUTELY, not just up to a constant" \
-               || bad "the two scorers differ by a constant -- some per-fragment term is not shared"
+  [ $? -eq 0 ] && ok "accelerated score agrees with the reference absolutely, within the 1-nat tolerance" \
+               || bad "absolute disagreement beyond 1 nat -- some per-fragment term is not shared"
 else
   bad "rung zero did not score both pairs"
 fi

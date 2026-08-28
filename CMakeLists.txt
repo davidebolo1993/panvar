@@ -351,6 +351,19 @@ if(PANVAR_BUILD_TESTING)
             set_tests_properties(panvar_genotype_frag_differential PROPERTIES TIMEOUT 900)
         endif()
 
+        # The approximation ladder. Not an assertion suite -- it MEASURES what each acceleration
+        # costs, in retained placement probability mass and in score error against the winner's
+        # margin, and is registered so the numbers are reproducible rather than quoted from a
+        # notebook.
+        set(PANVAR_GENOTYPE_FRAG_LADDER ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_frag_ladder.sh)
+        if(EXISTS ${PANVAR_GENOTYPE_FRAG_LADDER} AND PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE)
+            add_test(
+                NAME panvar_genotype_frag_ladder
+                COMMAND /usr/bin/env bash ${PANVAR_GENOTYPE_FRAG_LADDER} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/genotype_frag_ladder
+            )
+            set_tests_properties(panvar_genotype_frag_ladder PROPERTIES TIMEOUT 900)
+        endif()
+
         # Opt-in regressions against the committed real loci. Several contracts are only reachable
         # on real data: ANKRD36C is the only locus that ever produced overlapping sites, LPA KIV-2 is
         # the folding case with 466 haplotypes, whether the POA guards SKIP anything is a property of

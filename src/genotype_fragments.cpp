@@ -1420,6 +1420,27 @@ HaplotypeResult genotype_haplotype_pairs(
                 std::max(out.convergence.max_iterations_used, conv_iters[pi]);
             out.convergence.total_moves_last_iteration += conv_moves[pi];
         }
+        if (!options.dump_fragment_mass.empty() && nrescore > 0) {
+            // The top pair's per-fragment placement mass, comparable term-for-term with the
+            // reference's. Written before the re-sort so it belongs to a named pair.
+            const std::size_t a = pairs[0].hap1, b = pairs[0].hap2;
+            const bool homoz = (a == b);
+            std::ofstream mf(options.dump_fragment_mass);
+            if (mf) {
+                mf << "# pair\t" << out.shortlist[a] << '\t' << out.shortlist[b] << '\n';
+                mf << "fragment\tlog_mass\n";
+                for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
+                    double lse = kNegInf;
+                    for (const auto& [mid, v] : placements[fi * nh + a]) { (void)mid; lse = log_add(lse, v); }
+                    if (!homoz) {
+                        for (const auto& [mid, v] : placements[fi * nh + b]) { (void)mid; lse = log_add(lse, v); }
+                    } else if (lse != kNegInf) {
+                        lse += std::log(2.0);
+                    }
+                    mf << fragments[fi].name << '\t' << lse << '\n';
+                }
+            }
+        }
         for (std::size_t pi = 0; pi < nrescore; ++pi) pairs[pi].score = joint[pi];
         std::stable_sort(pairs.begin(), pairs.begin() + static_cast<long>(nrescore),
                          [](const HaplotypePairScore& x, const HaplotypePairScore& y) {
@@ -1852,7 +1873,8 @@ double reference_fragment_on_haplotype(const Fragment& f, const std::string& hap
 
 double reference_pair_loglik(const std::string& hap_a, const std::string& hap_b,
                              const std::vector<Fragment>& fragments,
-                             const ReferenceParams& params) {
+                             const ReferenceParams& params,
+                             std::vector<double>* fragment_mass) {
     const double log_eps = std::log(params.error_rate);
     const double log_1meps = std::log1p(-params.error_rate);
 
@@ -1900,6 +1922,7 @@ double reference_pair_loglik(const std::string& hap_a, const std::string& hap_b,
                               static_cast<std::size_t>(params.bg_divergence * static_cast<double>(len))) * log_eps +
                           static_cast<double>(len - static_cast<std::size_t>(
                               params.bg_divergence * static_cast<double>(len))) * log_1meps;
+        if (fragment_mass != nullptr) fragment_mass->push_back(lse);
         const double placed = (lse == kNegInf) ? kNegInf : log_mix + log_lam + lse;
         total += log_add(placed, log_bg_w + bg);
     }

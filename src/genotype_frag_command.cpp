@@ -317,6 +317,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         }
         else if (a == "--placement-bin") hopt.placement_bin = cli::parse_size_arg(a, value(i, a));
         else if (a == "--hamming-emission") hopt.hamming_emission = true;
+        else if (a == "--dump-fragment-mass") hopt.dump_fragment_mass = value(i, a);
         else if (a == "--joint-reverse-order") hopt.joint_reverse_order = true;
         else if (a == "--equivalence-tolerance") hopt.equivalence_tolerance = std::stod(value(i, a));
         else if (a == "--joint-top-pairs") hopt.joint_top_pairs = cli::parse_size_arg(a, value(i, a));
@@ -360,8 +361,18 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         rp.fragment_len = hopt.fragment_len;
         rp.fragment_sd = hopt.fragment_sd;
         rp.bg_divergence = hopt.bg_divergence;
+        std::vector<double> mass;
         const double v = reference_pair_loglik(slurp_fa(reference_pair[0]), slurp_fa(reference_pair[1]),
-                                               frags, rp);
+                                               frags, rp,
+                                               hopt.dump_fragment_mass.empty() ? nullptr : &mass);
+        if (!hopt.dump_fragment_mass.empty()) {
+            std::ofstream mf(hopt.dump_fragment_mass);
+            if (!mf) throw std::runtime_error("genotype-frag: cannot write " + hopt.dump_fragment_mass);
+            mf << "# reference\n" << "fragment\tlog_mass\n";
+            for (std::size_t i = 0; i < mass.size() && i < frags.size(); ++i) {
+                mf << frags[i].name << '\t' << mass[i] << '\n';
+            }
+        }
         std::printf("%.6f\n", v);
         return 0;
     }

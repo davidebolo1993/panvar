@@ -261,6 +261,10 @@ struct HaplotypeScoreOptions : FragmentScoreOptions {
     // offset and so create placements the reference rejects, which is a model difference and not an
     // acceleration. This exists to remove it from the comparison.
     bool hamming_emission = false;
+    // Write each fragment's total placement log-mass for the top pair. The ladder needs retained
+    // placement PROBABILITY MASS, not a count of placements: dropping ten negligible placements and
+    // dropping one dominant one are the same number and completely different facts.
+    std::string dump_fragment_mass;
     // How a haplotype-pair posterior becomes a per-block allele pair.
     //
     //   map      take the best pair's alleles. The answer is then a real pair some haplotype pair
@@ -617,7 +621,10 @@ double reference_pair_loglik(
     const std::string& hap_a,
     const std::string& hap_b,
     const std::vector<Fragment>& fragments,
-    const ReferenceParams& params);
+    const ReferenceParams& params,
+    // Optional: per-fragment log SUM_p P(f|p) over both homologues, in fragment order. This is the
+    // exact placement mass the accelerated recruiter is trying to retain.
+    std::vector<double>* fragment_mass = nullptr);
 
 void write_fragment_results(
     const std::string& out_prefix,
