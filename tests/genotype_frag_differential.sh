@@ -439,6 +439,41 @@ PYEOF
 [ $? -eq 0 ] && ok "with errors present, every pair still agrees to within 1 nat of one constant" \
              || bad "with errors present the offset varies by pair -- the emission models differ"
 
+# ---- Cartesian product vs coordinate join: EXACT equality, in the registered suite.
+# The join reorders one sum. It is not a model change and not an approximation, so the criterion is
+# numerical equality on every diplotype, never "the same winner" -- a join that lost mass everywhere
+# by a constant would keep the winner and be wrong. This lives here, in the fast suite that runs on
+# every build, rather than only in the slow measurement grid: a regression in the default scoring
+# path should not need an opt-in benchmark to surface.
+for arm in cart join; do
+  extra=""; [ "$arm" = join ] && extra="--coordinate-join"
+  "$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/cj_$arm" -R "$OUT/reads.fa" \
+    --haplotype-mode --rung-zero --hamming-emission --mate-rescue --top-pairs 100 $extra $P -q \
+    >/dev/null 2>&1
+  awk -F'\t' 'NR>1{a=$2;b=$3; if(a>b){t=a;a=b;b=t} print a"/"b"\t"$4}' "$OUT/cj_$arm.hap_pairs.tsv" \
+    > "$OUT/cj_$arm.tsv"
+done
+"$PY" - "$OUT/cj_cart.tsv" "$OUT/cj_join.tsv" <<'PYEOF'
+import sys
+def load(p):
+    d = {}
+    for l in open(p):
+        f = l.rstrip("\n").split("\t")
+        if len(f) < 2: continue
+        try: d[f[0]] = float(f[1])
+        except ValueError: pass
+    return d
+a, b = load(sys.argv[1]), load(sys.argv[2])
+if not a or not b or set(a) != set(b):
+    print(f"  .... key sets differ: {len(a)} cartesian vs {len(b)} join")
+    sys.exit(1)
+dev = max(abs(a[k] - b[k]) for k in a)
+print(f"  .... cartesian vs coordinate join: max deviation {dev:.3e} over {len(a)} diplotypes")
+sys.exit(0 if dev < 1e-9 else 1)
+PYEOF
+[ $? -eq 0 ] && ok "the coordinate join is numerically identical to the Cartesian product" \
+             || bad "the coordinate join does not reproduce the Cartesian product exactly"
+
 printf "  .... reference separates them by %s nats; then the approximations, one knob at a time:\n" "$REFDIFF"
 for tk in 2 8 32; do
   "$BIN" genotype-frag -i "$OUT/r.gfa" -b "$OUT/rbub" -o "$OUT/rk$tk" -R "$OUT/rreads.fa" \

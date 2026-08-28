@@ -24,6 +24,8 @@ OUT="${2:?}"; COPIES="${3:-2,4,8}"; REPLENS="${4:-100}"; SEEDS="${5:-2}"
 mkdir -p "$OUT"; OUT="$OUT/run.$$"; rm -rf "$OUT"; mkdir -p "$OUT"
 PY="${PYTHON:-python3}"
 exp_init "frag-grid" "$BIN" "$OUT/provenance.txt"
+GRID_FAILS=0      # the grid was previously a pure measurement: every gate printed its verdict and
+                  # the script exited 0 regardless, so no failure in it could ever break a build
 EQ_TOL=1.0        # predeclared: the compressed optimum must be within this of the reference best
 MASS_BOUND=1e-3   # predeclared: omitted placement mass
 
@@ -138,16 +140,16 @@ PYEOF
   # ONE named pair throughout -- many/many -- for the dumps AND for the reported U-R. Dumping mass
   # for many/many while evaluating U-R at G's own optimum compares different pairs, and they differ in
   # exactly the cells that fail.
-  run_arm U --dump-fragment-mass "$W/U.mass" --dump-mass-pair many,many || continue
-  run_arm M --mate-rescue --dump-fragment-mass "$W/M.mass" --dump-mass-pair many,many || continue
-  run_arm G --multiplicity-aware --mass-tolerance "$MASS_BOUND" --dump-fragment-mass "$W/G.mass" --dump-mass-pair many,many || continue
+  run_arm U --dump-fragment-mass "$W/U.mass" --dump-mass-pair many,many || { GRID_FAILS=$((GRID_FAILS+1)); continue; }
+  run_arm M --mate-rescue --dump-fragment-mass "$W/M.mass" --dump-mass-pair many,many || { GRID_FAILS=$((GRID_FAILS+1)); continue; }
+  run_arm G --multiplicity-aware --mass-tolerance "$MASS_BOUND" --dump-fragment-mass "$W/G.mass" --dump-mass-pair many,many || { GRID_FAILS=$((GRID_FAILS+1)); continue; }
   # J is M with the mate combinations formed by coordinate join instead of by Cartesian product.
   # Same flags otherwise, so any difference is the join and nothing else.
-  run_arm J --mate-rescue --coordinate-join --dump-fragment-mass "$W/J.mass" --dump-mass-pair many,many || continue
+  run_arm J --mate-rescue --coordinate-join --dump-fragment-mass "$W/J.mass" --dump-mass-pair many,many || { GRID_FAILS=$((GRID_FAILS+1)); continue; }
   "$BIN" genotype-frag --reference-score "$W/many.fa" "$W/many.fa" -R "$W/reads.fa" $P \
     --dump-fragment-mass "$W/R.mass" >/dev/null 2>&1
   t1=$(date +%s)
-  "$PY" - "$W" "$CN" "$RL" "$SD" "$EQ_TOL" "$((t1-t0))" <<'PYEOF'
+  "$PY" - "$W" "$CN" "$RL" "$SD" "$EQ_TOL" "$((t1-t0))" <<'PYEOF' || GRID_FAILS=$((GRID_FAILS+1))
 import sys, os, re
 W, cn, rl, sd, tol, secs = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], float(sys.argv[5]), sys.argv[6]
 ref = {}
@@ -155,7 +157,7 @@ for l in open(os.path.join(W,"ref.tsv")):
     k,v = l.rstrip("\n").split("\t")
     try: ref[k] = float(v)
     except ValueError: pass
-if not ref: print(f"  {cn:<5} {rl:<7} {sd:<5} | reference produced nothing"); sys.exit()
+if not ref: print(f"  {cn:<5} {rl:<7} {sd:<5} | reference produced nothing"); sys.exit(1)
 best = max(ref.values())
 top_class = {k for k,v in ref.items() if best - v <= tol}
 def arm(tag):
@@ -167,7 +169,7 @@ def arm(tag):
     return "/".join(sorted((a, b))), float(rows[0][3])
 u, g = arm("U"), arm("G")
 if u is None or g is None:
-    print(f"  {cn:<5} {rl:<7} {sd:<5} | an arm produced nothing"); sys.exit()
+    print(f"  {cn:<5} {rl:<7} {sd:<5} | an arm produced nothing"); sys.exit(1)
 ukey, uval = u; gkey, gval = g
 # Compared at the SAME pair -- G's own optimum -- so the two errors are about scoring and not about
 # which pair each arm happened to rank first.
@@ -214,7 +216,7 @@ PYEOF
   # ---- join gate: J must equal M NUMERICALLY, on every diplotype, not merely pick the same winner.
   # The join reorders one sum; it is not a different model and not an approximation, so "same winner"
   # is far too weak a criterion -- it would pass a join that lost mass everywhere by a constant.
-  "$PY" - "$W" <<'PYEOF'
+  "$PY" - "$W" <<'PYEOF' || GRID_FAILS=$((GRID_FAILS+1))
 import os, re, sys, math
 W = sys.argv[1]
 def all_scores(tag):
@@ -228,7 +230,7 @@ def all_scores(tag):
 m, j = all_scores("M"), all_scores("J")
 if not m or not j or set(m) != set(j):
     print(f"        join: KEY SETS DIFFER ({len(m)} cartesian vs {len(j)} join) -- not comparable")
-    sys.exit()
+    sys.exit(1)
 dev = max(abs(m[k] - j[k]) for k in m)
 def logs(tag):
     return (open(os.path.join(W, tag + ".log")).read() +
@@ -247,15 +249,23 @@ def secs(txt):
     g = re.search(r"([\d.]+)\s+real", txt)
     return f"{float(g.group(1)):.2f}s" if g else "?"
 eqm = os.path.join(W, "M.equivalence.tsv"); eqj = os.path.join(W, "J.equivalence.tsv")
-same_cls = "unchanged"
-if os.path.exists(eqm) and os.path.exists(eqj):
-    same_cls = "unchanged" if open(eqm).read() == open(eqj).read() else "CHANGED"
+# A MISSING file is not evidence of agreement. Defaulting to "unchanged" when the comparison could
+# not be made reports the reassuring answer for the case where nothing was checked at all.
+if not (os.path.exists(eqm) and os.path.exists(eqj)):
+    print(f"        join: equivalence dumps missing ({os.path.basename(eqm)} / "
+          f"{os.path.basename(eqj)}) -- class comparison NOT MADE")
+    sys.exit(1)
+same_cls = "unchanged" if open(eqm).read() == open(eqj).read() else "CHANGED"
 verdict = "EQUAL" if dev < 1e-9 else ("close" if dev < 1e-6 else "DIFFER")
 print(f"        join: max|cartesian-join| = {dev:.3e} over {len(m)} diplotypes [{verdict}]; "
       f"equivalence class {same_cls}")
 print(f"        work: {cart} Cartesian hypothetical -> {probe} join probes; "
       f"rescue examined {rpos} positions -> {rpl} placements; "
       f"cartesian {secs(lm)}/{rss(lm)}, join {secs(lj)}/{rss(lj)}")
+# Both paths are the same sum in a different order, so anything above summation-order rounding is a
+# defect, and a changed equivalence class is a changed call. Printing DIFFER and exiting 0 made this
+# whole gate advisory.
+sys.exit(0 if (dev < 1e-9 and same_cls == "unchanged") else 1)
 PYEOF
 
   # Per-fragment decomposition of the deficit by seeding stratum. A fragment is the unit: one
@@ -264,7 +274,7 @@ PYEOF
   # so the per-fragment contribution deltas must sum EXACTLY to the whole-pair U - R. If they do not,
   # the strata are describing something other than the reported number and must not be read.
   RU=$(awk -F'\t' -v a=many -v b=many 'NR>1 && (($2==a&&$3==b)){print $4}' "$W/U.hap_pairs.tsv")
-  "$PY" - "$W/R.mass" "$W/U.mass" "${RU:-nan}" "$(awk -F'\t' '$1=="many/many"{print $2}' "$W/ref.tsv")" <<'PYEOF'
+  "$PY" - "$W/R.mass" "$W/U.mass" "${RU:-nan}" "$(awk -F'\t' '$1=="many/many"{print $2}' "$W/ref.tsv")" <<'PYEOF' || GRID_FAILS=$((GRID_FAILS+1))
 import sys, collections
 def load(p):
     d={}
@@ -279,7 +289,7 @@ try:
     R, U = load(sys.argv[1]), load(sys.argv[2])
     u_whole, r_whole = float(sys.argv[3]), float(sys.argv[4])
 except (OSError, ValueError):
-    print("        reconciliation inputs missing"); sys.exit()
+    print("        reconciliation inputs missing"); sys.exit(1)
 strata=collections.defaultdict(lambda: [0, 0.0])
 tot_delta = 0.0
 for k,(rv, _, rc, _rp, _rf) in R.items():
@@ -298,7 +308,7 @@ whole = u_whole - r_whole
 ok = abs(tot_delta - whole) < 1e-6
 print(f"        reconciliation: per-fragment deltas sum to {tot_delta:+.2f}, whole-pair U-R is "
       f"{whole:+.2f} -> {'MATCH' if ok else 'MISMATCH, strata not interpretable'}")
-if not ok: sys.exit()
+if not ok: sys.exit(1)
 # seed -> placement -> valid FR, so the stage the evidence disappears at is visible
 parts=[]
 for key in sorted(strata, key=lambda k: -abs(strata[k][1])):
@@ -316,3 +326,9 @@ echo "  the same exposure. max|G-U| is over EVERY diplotype with exact key-set e
 echo "  winner, so grouping cannot perturb another pair unnoticed."
 echo "  combos is the tractability number: it grows as (copies)^2 per fragment and is the work the"
 echo "  anchor cap and top-k were introduced to avoid."
+
+if [ "$GRID_FAILS" -ne 0 ]; then
+  printf "\n  grid: %d gate(s) FAILED -- join equality, reconciliation or an arm\n" "$GRID_FAILS"
+  exit 1
+fi
+printf "\n  grid: all gates passed\n"

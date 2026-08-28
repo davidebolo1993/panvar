@@ -528,6 +528,8 @@ struct PlacementCompleteness {
     std::uint64_t join_operations = 0;              // (forward start, insert length) probes
     std::uint64_t rescue_positions = 0;             // interval positions examined by mate rescue
     std::uint64_t rescue_placements = 0;            // of those, ones that passed the band
+    std::uint64_t join_chosen = 0;                  // fragment-haplotype decisions dispatched to
+    std::uint64_t cartesian_chosen = 0;             // each path by the adaptive rule
     std::uint64_t placements_before_grouping = 0;
     std::uint64_t groups_after_grouping = 0;
 };

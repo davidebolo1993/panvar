@@ -813,11 +813,13 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                 std::snprintf(jb, sizeof(jb),
                               "work: %llu Cartesian combinations hypothetical, %llu coordinate-join "
                               "probes actual, %llu rescue interval positions examined -> %llu "
-                              "rescued placements",
+                              "rescued placements; dispatch %llu join / %llu cartesian",
                               (unsigned long long)c.cartesian_combinations,
                               (unsigned long long)c.join_operations,
                               (unsigned long long)c.rescue_positions,
-                              (unsigned long long)c.rescue_placements);
+                              (unsigned long long)c.rescue_placements,
+                              (unsigned long long)c.join_chosen,
+                              (unsigned long long)c.cartesian_chosen);
                 log.info(jb);
             }
             if (hopt.joint_depth) {

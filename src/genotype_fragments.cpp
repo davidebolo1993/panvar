@@ -900,6 +900,7 @@ HaplotypeResult genotype_haplotype_pairs(
         struct Cand { std::uint32_t hap; bool fwd; long start; };
         std::uint64_t found_local = 0, kept_local = 0, anchor_hits_local = 0, combos_local = 0;
         std::uint64_t cart_local = 0, join_local = 0, rescue_pos_local = 0, rescue_placed_local = 0;
+        std::uint64_t join_pick_local = 0, cart_pick_local = 0;
         const auto gather = [&](const std::string& r, bool fwd,
                                 std::vector<Cand>& into) {
             for (const KmerOccurrence& o : collect_syncmers(r, k, s)) {
@@ -1047,34 +1048,62 @@ HaplotypeResult genotype_haplotype_pairs(
                 const std::size_t want_band = have1 ? band2 : band1;
                 std::vector<Placed>& into = have1 ? resc2 : resc1;
                 const long n = static_cast<long>(haps[hi].seq.size());
-                for (const Placed& p : have) {
-                    // FR: if the anchored mate is forward, the partner is reverse and DOWNSTREAM,
-                    // ending between start+lo and start+hi. If reverse, the partner is upstream.
-                    const std::string& q = p.fwd ? want_rev : want_fwd;
+                // Grouped by the ANCHORED mate's strand, because that fixes both the partner's
+                // orientation and which side of the anchor the interval lies on. Within a group the
+                // intervals are merged, so each position is examined ONCE however many anchored
+                // placements propose it.
+                //
+                // Merging is not only a saving. Scanning per anchored placement pushes the same
+                // (start, strand) state once per proposing placement, and overlapping intervals are
+                // the normal case in a tandem array -- copies sit closer together than the insert
+                // width, so their intervals overlap heavily. Those duplicates then reach the join,
+                // which sums their mass, and one physical placement is counted several times.
+                for (int g = 0; g < 2; ++g) {
+                    const bool anchored_fwd = (g == 0);
+                    const std::string& q = anchored_fwd ? want_rev : want_fwd;
                     if (q.empty()) continue;
-                    long lo_s, hi_s;
-                    if (p.fwd) {
-                        lo_s = p.start + ins_prior.lo - static_cast<long>(q.size());
-                        hi_s = p.start + ins_prior.hi - static_cast<long>(q.size());
-                    } else {
-                        lo_s = p.end - ins_prior.hi + 1;
-                        hi_s = p.end - ins_prior.lo + 1;
-                    }
-                    lo_s = std::max<long>(0, lo_s);
-                    hi_s = std::min<long>(hi_s, n - static_cast<long>(q.size()));
-                    if (hi_s >= lo_s) rescue_pos_local += static_cast<std::uint64_t>(hi_s - lo_s + 1);
-                    for (long st = lo_s; st <= hi_s; ++st) {
-                        std::size_t mism = 0;
-                        for (std::size_t bi2 = 0; bi2 < q.size() && mism <= want_band; ++bi2) {
-                            if (q[bi2] != haps[hi].seq[static_cast<std::size_t>(st) + bi2]) ++mism;
+                    std::vector<std::pair<long, long>> iv;
+                    for (const Placed& p : have) {
+                        if (p.fwd != anchored_fwd) continue;
+                        // FR: an anchored forward mate has its partner reverse and DOWNSTREAM; an
+                        // anchored reverse mate has it forward and upstream.
+                        long lo_s, hi_s;
+                        if (anchored_fwd) {
+                            lo_s = p.start + ins_prior.lo - static_cast<long>(q.size());
+                            hi_s = p.start + ins_prior.hi - static_cast<long>(q.size());
+                        } else {
+                            lo_s = p.end - ins_prior.hi + 1;
+                            hi_s = p.end - ins_prior.lo + 1;
                         }
-                        if (mism > want_band) continue;
-                        Placed r;
-                        r.ok = true; r.edits = mism; r.start = st;
-                        r.end = st + static_cast<long>(q.size()) - 1;
-                        r.fwd = !p.fwd;
-                        ++rescue_placed_local;
-                        into.push_back(r);
+                        lo_s = std::max<long>(0, lo_s);
+                        hi_s = std::min<long>(hi_s, n - static_cast<long>(q.size()));
+                        if (hi_s >= lo_s) iv.emplace_back(lo_s, hi_s);
+                    }
+                    if (iv.empty()) continue;
+                    std::sort(iv.begin(), iv.end());
+                    std::vector<std::pair<long, long>> merged;
+                    for (const auto& e : iv) {
+                        if (!merged.empty() && e.first <= merged.back().second + 1) {
+                            merged.back().second = std::max(merged.back().second, e.second);
+                        } else {
+                            merged.push_back(e);
+                        }
+                    }
+                    for (const auto& e : merged) {
+                        rescue_pos_local += static_cast<std::uint64_t>(e.second - e.first + 1);
+                        for (long st = e.first; st <= e.second; ++st) {
+                            std::size_t mism = 0;
+                            for (std::size_t bi2 = 0; bi2 < q.size() && mism <= want_band; ++bi2) {
+                                if (q[bi2] != haps[hi].seq[static_cast<std::size_t>(st) + bi2]) ++mism;
+                            }
+                            if (mism > want_band) continue;
+                            Placed r;
+                            r.ok = true; r.edits = mism; r.start = st;
+                            r.end = st + static_cast<long>(q.size()) - 1;
+                            r.fwd = !anchored_fwd;
+                            ++rescue_placed_local;
+                            into.push_back(r);
+                        }
                     }
                 }
                 if (!into.empty()) mates_seeded[fi * nh + hi] |= 32u;   // rescued
@@ -1088,15 +1117,31 @@ HaplotypeResult genotype_haplotype_pairs(
             }
 
             // ---- coordinate join -----------------------------------------------------------
-            // Forward placements keyed by start, reverse placements keyed by end. A fragment state
-            // is then (forward start s, insert length L) with the reverse end at s + L - 1, so the
-            // work is unique_starts x insert_support -- bounded by the library's insert width -- in
-            // place of |b1| x |b2|, which grows as the square of the repeat copy number. This is
-            // exact and not a pruning: ins_prior.log_at returns -inf outside [lo, hi], so every
-            // combination the product would form and the join skips carries exactly zero mass.
-            const bool do_join = options.coordinate_join && !b1.empty() && !b2.empty();
+            // Forward placements keyed by start, reverse placements keyed by end; a fragment state
+            // is (forward start s, reverse end e) with e - s + 1 inside the insert prior's support.
+            //
+            // COST, stated honestly: O(|F| + |R| + K), where K is the number of coordinate pairs
+            // that fall within the insert support. It is NOT bounded by the library's insert width.
+            // K is itself quadratic whenever many coordinates cluster inside one allowed interval --
+            // a short tandem repeat whose whole array fits inside one insert is exactly that case.
+            // On the array fixtures measured here K grew linearly in copy number, so the join saved
+            // one factor of copies, but that is a measurement on those fixtures and not a bound.
+            //
+            // It is exact rather than a pruning: ins_prior.log_at returns -inf outside [lo, hi], so
+            // every combination the product forms and the join skips carries exactly zero mass.
+            //
+            // ADAPTIVE DISPATCH. Both paths compute the same sum -- measured identical to 0.0 on
+            // every diplotype -- so which one runs is a cost decision and not a model parameter, and
+            // it can be made per fragment-haplotype from the actual coordinates rather than assumed
+            // from the copy number. The product wins on small inputs, where building two ordered
+            // maps costs more than the |b1| x |b2| combinations it avoids, and on clustered
+            // coordinates, where K approaches the product anyway. K is counted by the same
+            // two-pointer sweep run in counting mode, which is O(|F| + |R|) -- window sizes come
+            // from pointer arithmetic, so counting the pairs does not require visiting them.
+            const bool join_available = options.coordinate_join && !b1.empty() && !b2.empty();
+            bool do_join = false;
             CoordAgg jf1, jr1, jf2, jr2;
-            if (do_join) {
+            if (join_available) {
                 for (const Placed& x : b1) {
                     (x.fwd ? jf1 : jr1).add(x.fwd ? x.start : x.end, read_ll(x.edits, F.r1.size()));
                 }
@@ -1112,6 +1157,31 @@ HaplotypeResult genotype_haplotype_pairs(
                            rev.at.rbegin()->first >= fwd.at.begin()->first;
                 };
                 if (any_fr(jf1, jr2) || any_fr(jf2, jr1)) mates_seeded[fi * nh + hi] |= 16u;
+
+                const auto count_pairs = [&](const CoordAgg& FA, const CoordAgg& RA) -> std::uint64_t {
+                    if (FA.at.empty() || RA.at.empty()) return 0;
+                    std::vector<long> RC;
+                    RC.reserve(RA.at.size());
+                    for (const auto& e : RA.at) RC.push_back(e.first);
+                    std::size_t wlo = 0, whi = 0;
+                    std::uint64_t k = 0;
+                    for (const auto& fe : FA.at) {
+                        const long elo = fe.first + ins_prior.lo - 1;
+                        const long ehi = fe.first + ins_prior.hi - 1;
+                        while (wlo < RC.size() && RC[wlo] < elo) ++wlo;
+                        if (whi < wlo) whi = wlo;
+                        while (whi < RC.size() && RC[whi] <= ehi) ++whi;
+                        k += static_cast<std::uint64_t>(whi - wlo);
+                    }
+                    return k;
+                };
+                const std::uint64_t cart_cost =
+                    static_cast<std::uint64_t>(b1.size()) * b2.size();
+                const std::uint64_t k_pairs = count_pairs(jf1, jr2) + count_pairs(jf2, jr1);
+                const std::uint64_t join_cost = k_pairs + jf1.at.size() + jr1.at.size()
+                                              + jf2.at.size() + jr2.at.size();
+                do_join = join_cost < cart_cost;
+                if (do_join) ++join_pick_local; else ++cart_pick_local;
             }
             const auto for_each_join = [&](const std::function<void(double, double, long, long,
                                                                     bool)>& cb) {
@@ -1123,8 +1193,10 @@ HaplotypeResult genotype_haplotype_pairs(
                     // was 12-29x MORE work than the product it replaced: the support is mean +/- 4sd,
                     // about 400 lengths, so it pays only above ~400 placements per mate, which is far
                     // beyond any copy number here. Advancing a window over the reverse coordinates
-                    // that actually EXIST costs one visit per in-support combination instead, which
-                    // is bounded by the product and normally far below it.
+                    // that actually EXIST costs one visit per in-support combination instead. That is
+                    // never more than the product and usually far less, but it is not a smaller
+                    // COMPLEXITY class: if every reverse coordinate sits inside every forward
+                    // window, K = |F| x |R| and the join degenerates to the product plus sorting.
                     std::vector<std::pair<long, std::pair<double, double>>> R(RA.at.begin(),
                                                                               RA.at.end());
                     std::size_t wlo = 0, whi = 0;   // [wlo, whi) = reverse ends inside the prior
@@ -1261,6 +1333,8 @@ HaplotypeResult genotype_haplotype_pairs(
             out.completeness.join_operations += join_local;
             out.completeness.rescue_positions += rescue_pos_local;
             out.completeness.rescue_placements += rescue_placed_local;
+            out.completeness.join_chosen += join_pick_local;
+            out.completeness.cartesian_chosen += cart_pick_local;
             if (options.joint_depth) {
                 for (std::size_t hi = 0; hi < nh; ++hi) {
                     out.completeness.placements_before_grouping += placements[fi * nh + hi].size();
