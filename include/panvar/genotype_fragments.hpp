@@ -180,7 +180,7 @@ struct HaplotypeScoreOptions : FragmentScoreOptions {
     // anchoring depend on how many haplotypes were shortlisted, and it did -- at cyp2d6 NA18939 the
     // same reads gave the truth rank 2 at --max-haplotypes 48 and rank 1 at 96, purely because the
     // larger shortlist pushed more codes past a shared cap.
-    // 64, changed from 8 on measurement. Inside a tandem array a cap of 8 discards most of the
+    // LEFT AT 8. Raising it to 64 was measured and NOT adopted. Inside a tandem array a cap of 8 discards most of the
     // array's own syncmers, so its fragments never anchor and the array contributes nothing.
     //
     // Measured over all 10 lpa donors, not the sweep sample: total excess 793,921 -> 542,595, -32%.
@@ -190,14 +190,20 @@ struct HaplotypeScoreOptions : FragmentScoreOptions {
     //   -90% NA18508   -91% HG01106   -81% HG02572   -38% HG01975   -18% HG00146
     //    -2% HG04184     0% HG00735     0% HG02391     0% NA19240   +45% HG03239
     //
-    // So one donor is materially WORSE at 64. The change is kept because the aggregate is a clear
-    // gain, it costs 7 s -> 12 s at lpa and nothing at cyp2d6, and no cap value can be right for a
-    // locus with and without arrays at once -- but a cap is the wrong instrument and this number
-    // should not be quoted as a fix. The better policy keeps repetitive anchors and weights them by
-    // inverse occurrence, seeding each fragment from its rarest syncmers.
+    // A 32% aggregate gain with one donor 45% worse is evidence for an occurrence-aware anchoring
+    // redesign, not for moving a global default -- the same conclusion, on the same shape of
+    // evidence, that this project reached for --edge-weight, where a locus-dependent optimum meant
+    // the default stayed put. A single cap cannot be right for a locus with and without arrays at
+    // once. The replacement keeps repetitive anchors and weights them by inverse occurrence, seeding
+    // each fragment from its rarest syncmers, and caps candidate start bins rather than marker
+    // multiplicity. Until that exists the default does not move.
+    //
+    // Consequence for the joint model's baseline: lpa's target excess is the cap-8 figure, 793,921,
+    // and 542,595 is what a different anchoring policy would already recover. Both are recorded so
+    // the model is not credited with anchoring's share.
     //
     // lpa remains 542,595 above a panel floor of 7,835. The cap was a contributor, not the cause.
-    std::size_t max_anchor_occ = 64;
+    std::size_t max_anchor_occ = 8;
     std::size_t anchor_slack = 40;     // bases of window either side of an anchored read start
     // Haplotype pairs to report the likelihood's opinion of, by name. Probing costs nothing: the
     // pair scores already exist.

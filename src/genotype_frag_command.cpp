@@ -81,7 +81,7 @@ void print_help() {
         << "                              or scored and close. Repeatable; costs nothing, the pair\n"
         << "                              scores already exist\n"
         << "      --max-anchor-occ <N>    Occurrences PER HAPLOTYPE above which a syncmer anchors\n"
-        << "                              nothing (default 64): inside a tandem array it points\n"
+        << "                              nothing (default 8): inside a tandem array it points\n"
         << "                              everywhere. Per haplotype, not across the shortlist -- a\n"
         << "                              shared cap makes anchoring depend on shortlist size, and\n"
         << "                              it did: at cyp2d6 NA18939 the same reads put the truth at\n"

@@ -1123,23 +1123,52 @@ MosaicFloors mosaic_floors(const std::vector<BlockAlleles>& blocks,
     }
     out.complete = best_total == std::numeric_limits<std::size_t>::max() ? 0 : best_total;
 
-    // free: the nearest allele at every block, independently
+    // free: the nearest allele at every block. LEXICOGRAPHIC -- minimise edits first, then minimise
+    // SWITCHES among the paths achieving that minimum.
+    //
+    // Taking the first minimum-cost haplotype independently at each block gives the right edit total
+    // and an arbitrary switch count: wherever several haplotypes carry the same optimal allele, the
+    // choice among them is free, and picking by index invents switches that no path needs. The switch
+    // count is the number that says whether a mosaic gain is buyable with evidence, so an inflated one
+    // makes the mosaic layer look less attainable than it is.
     {
-        std::size_t total = 0, sw = 0;
-        long prev = -1;
+        std::size_t total = 0;
         for (std::size_t bi = 0; bi < nb; ++bi) {
             std::size_t best = std::numeric_limits<std::size_t>::max();
-            long arg = -1;
-            for (std::size_t h = 0; h < nh; ++h) {
-                if (cost[bi][h] < best) { best = cost[bi][h]; arg = static_cast<long>(h); }
-            }
-            if (arg < 0) continue;
-            total += best;
-            if (prev >= 0 && arg != prev) ++sw;
-            prev = arg;
+            for (std::size_t h = 0; h < nh; ++h) best = std::min(best, cost[bi][h]);
+            if (best != std::numeric_limits<std::size_t>::max()) total += best;
         }
         out.free_mosaic = total;
-        out.switches_free = sw;
+
+        // Among optimal-cost paths only, a DP whose cost is the switch count. A haplotype is a legal
+        // state at a block only if it attains that block's minimum; staying is free and moving costs
+        // one, so this is the minimum number of source changes any optimal path requires.
+        const std::size_t kInf = std::numeric_limits<std::size_t>::max() / 4;
+        std::vector<std::size_t> dp(nh, kInf);
+        bool started = false;
+        for (std::size_t bi = 0; bi < nb; ++bi) {
+            std::size_t best = std::numeric_limits<std::size_t>::max();
+            for (std::size_t h = 0; h < nh; ++h) best = std::min(best, cost[bi][h]);
+            if (best == std::numeric_limits<std::size_t>::max()) continue;
+            if (!started) {
+                for (std::size_t h = 0; h < nh; ++h) dp[h] = (cost[bi][h] == best) ? 0 : kInf;
+                started = true;
+                continue;
+            }
+            std::size_t global = kInf;
+            for (std::size_t h = 0; h < nh; ++h) global = std::min(global, dp[h]);
+            std::vector<std::size_t> next(nh, kInf);
+            for (std::size_t h = 0; h < nh; ++h) {
+                if (cost[bi][h] != best) continue;              // not an optimal state here
+                const std::size_t stay = dp[h];
+                const std::size_t move = global == kInf ? kInf : global + 1;
+                next[h] = std::min(stay, move);
+            }
+            dp.swap(next);
+        }
+        std::size_t sw = kInf;
+        for (std::size_t h = 0; h < nh; ++h) sw = std::min(sw, dp[h]);
+        out.switches_free = (sw >= kInf || !started) ? 0 : sw;
     }
 
     // penalised: Viterbi over source haplotype, with a cost for switching. The min-plus structure
