@@ -307,6 +307,138 @@ else
   bad "rung zero did not score both pairs"
 fi
 
+# =============================================================================================
+# THE EMISSION CONVENTION, ON EVERY SCORER PATH
+#
+# error_rate is the TOTAL substitution probability, so a SPECIFIC observed mismatch costs eps/3.
+# There are three independent implementations of that constant -- the exhaustive reference, the
+# accelerated haplotype scorer, and the block-local scorer -- and they drifted apart once already:
+# two of the three were left on log(eps) while the third moved to log(eps/3), and every test in this
+# repository still passed. The reason is structural, so it is worth stating: with ZERO mismatches
+# log(eps) and log(eps/3) produce identical scores, and every fixture was error-free.
+#
+# These assertions measure the SLOPE of score against injected mismatch count, which is exactly the
+# constant and nothing else:  log((1-eps)/(eps/3)) = 5.694  vs  log((1-eps)/eps) = 4.595.
+# One assertion per path, so any one of the three reverting alone is caught by its own assertion.
+"$PY" - "$OUT" <<'PYEOF'
+import sys, os, random
+out = sys.argv[1]
+names, seqs = [], []
+for l in open(os.path.join(out, "reads.fa")):
+    (names if l[0] == ">" else seqs).append(l.strip())
+random.seed(7)
+# the SAME read in every variant, mismatched mid-read so recruitment still finds syncmers either side
+for m in (0, 1, 2, 3):
+    s = list(seqs)
+    r = list(s[0])
+    for i in range(m):
+        c = r[60 + i*3]
+        r[60 + i*3] = random.choice([b for b in "ACGT" if b != c])
+    s[0] = "".join(r)
+    with open(os.path.join(out, "mm%d.fa" % m), "w") as fh:
+        for n, q in zip(names, s):
+            fh.write(n + "\n" + q + "\n")
+# and an all-pair read set where EVERY read carries one substitution. Subsampled to every 4th
+# fragment: the exhaustive reference costs ~12s per pair on the full set and this arm scores all 28
+# pairs, which is minutes of wall clock for an assertion about whether ONE OFFSET is shared across
+# pairs -- a property that does not need more fragments, only more pairs.
+with open(os.path.join(out, "reads_err.fa"), "w") as fh:
+    for k in range(0, len(names), 2):
+        if (k // 2) % 4: continue
+        for n, q in ((names[k], seqs[k]), (names[k+1], seqs[k+1])):
+            r = list(q)
+            i = random.randrange(20, len(r) - 20)
+            r[i] = random.choice([b for b in "ACGT" if b != r[i]])
+            fh.write(n + "\n" + "".join(r) + "\n")
+PYEOF
+
+slope_check() {  # <label> <s0> <s1> <s2> <s3>
+  "$PY" - "$@" <<'PYEOF'
+import sys, math, statistics
+label = sys.argv[1]
+v = [float(x) for x in sys.argv[2:6]]
+eps = 0.01
+steps = [v[i] - v[i+1] for i in range(3)]
+slope = statistics.mean(steps)
+third, plain = math.log((1-eps)/(eps/3)), math.log((1-eps)/eps)
+print(f"  .... {label}: {slope:.3f} nats per mismatch "
+      f"(eps/3 predicts {third:.3f}, eps predicts {plain:.3f})")
+sys.exit(0 if abs(slope - third) < 0.15 else 1)
+PYEOF
+}
+
+# --- path 1: the accelerated haplotype scorer
+A=()
+for m in 0 1 2 3; do
+  "$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/mmh$m" -R "$OUT/mm$m.fa" \
+    --haplotype-mode --rung-zero --hamming-emission --top-pairs 40 $P -q >/dev/null 2>&1
+  A+=("$(awk -F'\t' 'NR>1 && (($2=="hA"&&$3=="hB")||($2=="hB"&&$3=="hA")){print $4}' "$OUT/mmh$m.hap_pairs.tsv")")
+done
+if [ -n "${A[3]:-}" ]; then
+  slope_check "accelerated haplotype scorer" "${A[0]}" "${A[1]}" "${A[2]}" "${A[3]}" \
+    && ok "accelerated scorer charges a mismatch log((1-eps)/(eps/3))" \
+    || bad "accelerated scorer's per-mismatch constant is not the eps/3 convention"
+else
+  bad "accelerated scorer produced no hA/hB score for the mismatch ladder"
+fi
+
+# --- path 2: the block-local scorer (what builds the shortlist)
+B=()
+for m in 0 1 2 3; do
+  "$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/mmb$m" -R "$OUT/mm$m.fa" \
+    --hamming-emission $P -q >/dev/null 2>&1
+  B+=("$(awk -F'\t' 'NR==2{print $10}' "$OUT/mmb$m.frag_blocks.tsv")")
+done
+if [ -n "${B[3]:-}" ]; then
+  slope_check "block-local scorer" "${B[0]}" "${B[1]}" "${B[2]}" "${B[3]}" \
+    && ok "block-local scorer charges a mismatch log((1-eps)/(eps/3))" \
+    || bad "block-local scorer's per-mismatch constant is not the eps/3 convention"
+else
+  bad "block-local scorer produced no block score for the mismatch ladder"
+fi
+
+# --- path 3 is the reference, pinned analytically in genotype_frag_reference.sh.
+
+# --- all-pair differential ON READS THAT CONTAIN ERRORS. The error-free all-pair comparison above
+# cannot see this class of drift at all: the constant is multiplied by zero. Here every read carries
+# a substitution, so a divergence between the two implementations shows up as a per-pair-varying
+# offset rather than a shared constant.
+: > "$OUT/referr.tsv"
+for i in $HAPS; do
+  for j in $HAPS; do
+    [[ "$i" > "$j" ]] && continue
+    v=$("$BIN" genotype-frag --reference-score "$OUT/$i.fa" "$OUT/$j.fa" -R "$OUT/reads_err.fa" $P 2>/dev/null)
+    printf '%s/%s\t%s\n' "$i" "$j" "$v" >> "$OUT/referr.tsv"
+  done
+done
+"$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/rzerr" -R "$OUT/reads_err.fa" \
+  --haplotype-mode --rung-zero --hamming-emission --top-pairs 100 $P -q >/dev/null 2>&1
+awk -F'\t' 'NR>1{a=$2;b=$3; if(a>b){t=a;a=b;b=t} print a"/"b"\t"$4}' "$OUT/rzerr.hap_pairs.tsv" > "$OUT/rzerr.tsv"
+"$PY" - "$OUT/referr.tsv" "$OUT/rzerr.tsv" <<'PYEOF'
+import sys, statistics
+def load(p):
+    d = {}
+    for l in open(p):
+        f = l.rstrip("\n").split("\t")
+        if len(f) < 2: continue
+        try: d[f[0]] = float(f[1])
+        except ValueError: pass
+    return d
+ref, rz = load(sys.argv[1]), load(sys.argv[2])
+missing, extra = sorted(set(ref) - set(rz)), sorted(set(rz) - set(ref))
+if missing or extra:
+    print(f"  .... key sets differ: {len(missing)} missing {missing[:4]}, {len(extra)} extra {extra[:4]}")
+    sys.exit(1)
+off = {k: rz[k] - ref[k] for k in ref}
+med = statistics.median(off.values())
+dev = max(abs(v - med) for v in off.values())
+print(f"  .... on ERROR-CONTAINING reads: offset median {med:.2f} nats, "
+      f"max deviation {dev:.2f} over {len(off)} pairs")
+sys.exit(0 if dev < 1.0 else 1)
+PYEOF
+[ $? -eq 0 ] && ok "with errors present, every pair still agrees to within 1 nat of one constant" \
+             || bad "with errors present the offset varies by pair -- the emission models differ"
+
 printf "  .... reference separates them by %s nats; then the approximations, one knob at a time:\n" "$REFDIFF"
 for tk in 2 8 32; do
   "$BIN" genotype-frag -i "$OUT/r.gfa" -b "$OUT/rbub" -o "$OUT/rk$tk" -R "$OUT/rreads.fa" \
