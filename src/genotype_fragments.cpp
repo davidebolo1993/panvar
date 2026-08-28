@@ -801,7 +801,8 @@ HaplotypeResult genotype_haplotype_pairs(
     // heuristic invented. Deduplicated by rounded midpoint so two syncmer anchors reaching the same
     // biological placement count once. CSR-packed: a dense array would be 48 haplotypes x every
     // fragment x every placement.
-    std::vector<std::vector<std::pair<std::int32_t, double>>> placements(
+    struct PlacementRec { std::int32_t mid, start, end; double ll; };
+    std::vector<std::vector<PlacementRec>> placements(
         options.joint_depth ? fragments.size() * nh : 0);
 
     run_parallel(fragments.size(), options.threads, [&](std::size_t fi) {
@@ -986,12 +987,23 @@ HaplotypeResult genotype_haplotype_pairs(
                 // midpoint: two anchors that put the fragment in the same place are one placement,
                 // and counting them twice would let anchor density masquerade as depth.
                 auto& into = placements[fi * nh + hi];
-                const auto add = [&](long m, double v) {
+                // With placement_dedup > 0 the old behaviour: collapse placements sharing a midpoint
+                // within that radius, keeping the best. With 0, every distinct (start, end) survives,
+                // which is what the exact reference enumerates -- two different mate pairings across
+                // repeat copies can share a midpoint and are NOT the same state.
+                const auto add = [&](long m, long st, long en, double v) {
                     const std::int32_t key = static_cast<std::int32_t>(m);
                     for (auto& e : into) {
-                        if (std::abs(e.first - key) <= 16) { e.second = std::max(e.second, v); return; }
+                        if (options.placement_dedup > 0) {
+                            if (std::abs(e.mid - key) <= static_cast<long>(options.placement_dedup)) {
+                                e.ll = std::max(e.ll, v); return;
+                            }
+                        } else if (e.start == static_cast<std::int32_t>(st) &&
+                                   e.end == static_cast<std::int32_t>(en)) {
+                            e.ll = std::max(e.ll, v); return;
+                        }
                     }
-                    into.emplace_back(key, v);
+                    into.push_back({key, static_cast<std::int32_t>(st), static_cast<std::int32_t>(en), v});
                 };
                 if (!a1.empty() && !a2.empty()) {
                     for (const Placed& x : a1) {
@@ -1005,13 +1017,13 @@ HaplotypeResult genotype_haplotype_pairs(
                             if (options.use_insert_size) {
                                 v += insert_ll(static_cast<double>(rv.end - fw.start + 1), ins_prior);
                             }
-                            add((fw.start + rv.end) / 2, v);
+                            add((fw.start + rv.end) / 2, fw.start, rv.end, v);
                         }
                     }
                 } else {
-                    for (const Placed& x : a1) add((x.start + x.end) / 2,
+                    for (const Placed& x : a1) add((x.start + x.end) / 2, x.start, x.end,
                                                    read_ll(x.edits, F.r1.size()) + miss2);
-                    for (const Placed& y : a2) add((y.start + y.end) / 2,
+                    for (const Placed& y : a2) add((y.start + y.end) / 2, y.start, y.end,
                                                    miss1 + read_ll(y.edits, F.r2.size()));
                 }
             }
@@ -1053,9 +1065,8 @@ HaplotypeResult genotype_haplotype_pairs(
             const long L = static_cast<long>(haps[it->second].seq.size());
             bool found = false;
             std::uint64_t extra = 0;
-            for (const auto& [mid, v] : placements[fi * nh + it->second]) {
-                (void)v;
-                const long m = static_cast<long>(mid);
+            for (const auto& pr : placements[fi * nh + it->second]) {
+                const long m = static_cast<long>(pr.mid);
                 if (std::abs(m - truth_mid) <= 150 || std::abs((L - m) - truth_mid) <= 150) found = true;
                 else ++extra;
             }
@@ -1263,7 +1274,8 @@ HaplotypeResult genotype_haplotype_pairs(
                 if (floors[fi] == kNegInf) continue;
                 auto& o = opts[fi];
                 const auto gather = [&](std::size_t h, std::uint8_t side, std::size_t nw) {
-                    for (const auto& [mid, v] : placements[fi * nh + h]) {
+                    for (const auto& pr : placements[fi * nh + h]) {
+                        const std::int32_t mid = pr.mid; const double v = pr.ll;
                         if (mid < 0) continue;
                         const std::size_t w = static_cast<std::size_t>(mid) / W;
                         if (w >= nw) continue;
@@ -1423,7 +1435,24 @@ HaplotypeResult genotype_haplotype_pairs(
         if (!options.dump_fragment_mass.empty() && nrescore > 0) {
             // The top pair's per-fragment placement mass, comparable term-for-term with the
             // reference's. Written before the re-sort so it belongs to a named pair.
-            const std::size_t a = pairs[0].hap1, b = pairs[0].hap2;
+            std::size_t a = pairs[0].hap1, b = pairs[0].hap2;
+            if (!options.dump_mass_pair1.empty()) {
+                // A NAMED pair, so the dump is comparable with a reference dump for the same pair.
+                // Defaulting to whatever ranked first lets two files silently describe different
+                // diplotypes and be differenced anyway.
+                long i1 = -1, i2 = -1;
+                for (std::size_t i = 0; i < nh; ++i) {
+                    if (out.shortlist[i] == options.dump_mass_pair1) i1 = static_cast<long>(i);
+                    if (out.shortlist[i] == options.dump_mass_pair2) i2 = static_cast<long>(i);
+                }
+                if (i1 < 0 || i2 < 0) {
+                    throw std::runtime_error("genotype-frag: --dump-mass-pair named a haplotype that "
+                                             "is not in the shortlist; the dump would describe a "
+                                             "different pair from the one asked for");
+                }
+                a = static_cast<std::size_t>(i1);
+                b = static_cast<std::size_t>(i2);
+            }
             const bool homoz = (a == b);
             std::ofstream mf(options.dump_fragment_mass);
             if (mf) {
@@ -1431,9 +1460,9 @@ HaplotypeResult genotype_haplotype_pairs(
                 mf << "fragment\tlog_mass\n";
                 for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
                     double lse = kNegInf;
-                    for (const auto& [mid, v] : placements[fi * nh + a]) { (void)mid; lse = log_add(lse, v); }
+                    for (const auto& pr : placements[fi * nh + a]) lse = log_add(lse, pr.ll);
                     if (!homoz) {
-                        for (const auto& [mid, v] : placements[fi * nh + b]) { (void)mid; lse = log_add(lse, v); }
+                        for (const auto& pr : placements[fi * nh + b]) lse = log_add(lse, pr.ll);
                     } else if (lse != kNegInf) {
                         lse += std::log(2.0);
                     }

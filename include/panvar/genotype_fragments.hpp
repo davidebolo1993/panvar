@@ -265,6 +265,17 @@ struct HaplotypeScoreOptions : FragmentScoreOptions {
     // placement PROBABILITY MASS, not a count of placements: dropping ten negligible placements and
     // dropping one dominant one are the same number and completely different facts.
     std::string dump_fragment_mass;
+    // Which pair the mass dump describes. Empty = whatever ranked first, which is NOT comparable with
+    // a reference dump for a named pair -- the two files can silently describe different diplotypes.
+    std::string dump_mass_pair1, dump_mass_pair2;
+    // Merge radius, in bp, for collapsing placements that share a midpoint. 0 keeps every distinct
+    // (start, end) state.
+    //
+    // This is an APPROXIMATION IN ITS OWN RIGHT and was previously hard-coded at 16 bp inside what was
+    // called "unrestricted recruitment". Inside a tandem array, mate pairings across non-adjacent
+    // copies can share a midpoint and were being collapsed by max, so a mass loss attributed to
+    // syncmer recruitment may have been this instead. It gets its own rung.
+    std::size_t placement_dedup = 16;
     // How a haplotype-pair posterior becomes a per-block allele pair.
     //
     //   map      take the best pair's alleles. The answer is then a real pair some haplotype pair

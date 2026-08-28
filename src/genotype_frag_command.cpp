@@ -313,11 +313,16 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             hopt.max_anchor_occ = std::numeric_limits<std::size_t>::max();
             hopt.placement_topk = std::numeric_limits<std::size_t>::max();
             hopt.placement_bin = 1;
+            hopt.placement_dedup = 0;      // keep every distinct (start, end) state
             hopt.joint_top_pairs = 0;
         }
         else if (a == "--placement-bin") hopt.placement_bin = cli::parse_size_arg(a, value(i, a));
         else if (a == "--hamming-emission") hopt.hamming_emission = true;
         else if (a == "--dump-fragment-mass") hopt.dump_fragment_mass = value(i, a);
+        else if (a == "--dump-mass-pair") { const std::vector<std::string> two = split_commas(value(i, a));
+            if (two.size() != 2) throw std::runtime_error("genotype-frag: --dump-mass-pair needs two names");
+            hopt.dump_mass_pair1 = two[0]; hopt.dump_mass_pair2 = two[1]; }
+        else if (a == "--placement-dedup") hopt.placement_dedup = cli::parse_size_arg(a, value(i, a));
         else if (a == "--joint-reverse-order") hopt.joint_reverse_order = true;
         else if (a == "--equivalence-tolerance") hopt.equivalence_tolerance = std::stod(value(i, a));
         else if (a == "--joint-top-pairs") hopt.joint_top_pairs = cli::parse_size_arg(a, value(i, a));

@@ -65,67 +65,122 @@ FEWER="${L}$(rep 9)${SPC}${N}"      # 9 copies  -- one unit short
   printf 'P\tfewer\t1+,2+,3+,4+,5+,6+,7+,8+,9+,10+,12+,14+\t*\n'
 } > "$OUT/g.gfa"
 "$BIN" bubble -i "$OUT/g.gfa" -r ref -o "$OUT/bub" --min-variant-bp 0 -q >/dev/null 2>&1
-printf '>fewer\n%s\n' "$FEWER" > "$OUT/one.fa"; printf '>many\n%s\n' "$MANY" > "$OUT/two.fa"
+# FASTA basenames must match the PANEL path names, or a named-pair mass dump cannot be requested and
+# the reference winner cannot be looked up in the accelerated output.
+printf '>fewer\n%s\n' "$FEWER" > "$OUT/fewer.fa"; printf '>many\n%s\n' "$MANY" > "$OUT/many.fa"
 { emit_pairs "$MANY" tA 20; emit_pairs "$MANY" tB 20 10; } > "$OUT/reads.fa"
 echo "  panel: 10-copy array against 9-copy, sample homozygous for 10; $(grep -c '/1$' "$OUT/reads.fa") fragments"
 
 P="--haploid-depth 0.05 --fragment-len 150 --fragment-sd 20 --error-rate 0.01"
-R2=$("$BIN" genotype-frag --reference-score "$OUT/two.fa" "$OUT/two.fa" -R "$OUT/reads.fa" $P \
-       --dump-fragment-mass "$OUT/ref.mass" 2>/dev/null)
-R1=$("$BIN" genotype-frag --reference-score "$OUT/one.fa" "$OUT/one.fa" -R "$OUT/reads.fa" $P 2>/dev/null)
-MARGIN=$("$PY" -c "print(f'{float('$R2')-float('$R1'):.1f}')")
-echo "  reference: many/many $R2, fewer/fewer $R1, margin $MARGIN nats (winner: many)"
-echo
-printf "  %-34s %9s %9s %9s %8s %8s %6s\n" rung many/many sep err_vs_ref mass% sec winner
 
-rung() {   # label, extra flags
-  local lbl="$1"; shift
-  local t0 t1 t o sep err mass rss
+# EVERY diplotype, so the margin is the reference winner's own margin. Scoring only many/many against
+# fewer/fewer gives a two-copy diploid contrast, not the nearest alternative, and cannot say what the
+# exact model's global winner is -- which is the quantity "the approximation flipped the winner" is
+# about.
+printf '>ref\n%s\n' "${L}${SEG}${SPCALT}${N}" > "$OUT/ref.fa"
+: > "$OUT/refscores.tsv"
+for i in ref fewer many; do
+  for j in ref fewer many; do
+    [[ "$i" > "$j" ]] && continue
+    v=$("$BIN" genotype-frag --reference-score "$OUT/$i.fa" "$OUT/$j.fa" -R "$OUT/reads.fa" $P 2>/dev/null)
+    printf '%s/%s\t%s\n' "$i" "$j" "$v" >> "$OUT/refscores.tsv"
+  done
+done
+read -r REFWIN R2 MARGIN < <("$PY" - "$OUT/refscores.tsv" <<'PYEOF'
+import sys
+rows=[l.split("\t") for l in open(sys.argv[1]) if l.strip()]
+sc=sorted(((float(v), k) for k,v in rows), reverse=True)
+print(sc[0][1], f"{sc[0][0]:.6f}", f"{sc[0][0]-sc[1][0]:.2f}")
+PYEOF
+)
+echo "  reference winner: $REFWIN at $R2; margin over the runner-up: $MARGIN nats"
+sed 's/^/    /' "$OUT/refscores.tsv"
+echo
+# reference mass for the winner, so the accelerated dump is compared with the SAME pair
+RW1=${REFWIN%%/*}; RW2=${REFWIN##*/}
+"$BIN" genotype-frag --reference-score "$OUT/$RW1.fa" "$OUT/$RW2.fa" -R "$OUT/reads.fa" $P \
+  --dump-fragment-mass "$OUT/ref.mass" >/dev/null 2>&1
+# MANDATORY FIXTURE SELF-CHECK. The accelerated path scores the panel's SPELLED haplotypes while the
+# reference scores the FASTA files, and nothing else in this harness notices if they differ. Measured:
+# a 10-copy tandem array built as a chain of identical nodes spelled `many` at 1100 bp against a
+# 1500 bp FASTA and `fewer` at 0 bp, and the ladder still produced a full table of plausible
+# percentages. Refuse to run rather than report numbers from two different sequences.
+"$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/chk" -R "$OUT/reads.fa" \
+  --haplotype-mode --top-pairs 1 $P -q >/dev/null 2>&1
+badfix=0
+while IFS=$'\t' read -r nm bp rest; do
+  [ "$nm" = "haplotype" ] && continue
+  want=$(awk '!/^>/{n+=length($0)} END{print n+0}' "$OUT/$nm.fa" 2>/dev/null)
+  if [ -z "$want" ] || [ "$want" = "0" ] || [ "$bp" != "$want" ]; then
+    printf "  FIXTURE MISMATCH: panel spells %s as %s bp, reference FASTA is %s bp\n" "$nm" "$bp" "${want:-missing}"
+    badfix=1
+  fi
+done < "$OUT/chk.hap_scores.tsv"
+if [ "$badfix" -ne 0 ]; then
+  echo
+  echo "  The panel and the reference are not scoring the same sequences. No ladder number from this"
+  echo "  fixture means anything, so none is produced. A tandem array built as a chain of identical"
+  echo "  nodes does not decompose into the alleles this harness assumes; the fixture needs rebuilding"
+  echo "  before the ladder can run on a high-copy case."
+  exit 1
+fi
+ok_fixture="all panel haplotypes spell exactly what the reference scores"
+printf "  ok   %s\n\n" "$ok_fixture"
+printf "  %-38s %10s %10s %8s %7s %6s\n" rung "winner_sc" "err_vs_ref" "mass%" sec winner
+
+rung() {   # label, tag, extra flags
+  local lbl="$1" tag="$2"; shift 2
+  local pfx="$OUT/rung_$tag"
+  rm -f "$pfx".* 2>/dev/null || true
+  local t0 t1 rc=0
   t0=$(date +%s)
-  /usr/bin/time -l "$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/r" -R "$OUT/reads.fa" \
+  /usr/bin/time -l "$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$pfx" -R "$OUT/reads.fa" \
     --haplotype-mode --joint-marginal --hamming-emission --joint-top-pairs 0 --top-pairs 20 \
-    --dump-fragment-mass "$OUT/r.mass" $P "$@" -q > /dev/null 2> "$OUT/time.txt" || true
+    --dump-fragment-mass "$pfx.mass" --dump-mass-pair "$RW1,$RW2" $P "$@" -q \
+    > /dev/null 2> "$pfx.time" || rc=$?
   t1=$(date +%s)
-  rss=$(awk '/maximum resident set size/{printf "%.0f", $1/1048576}' "$OUT/time.txt")
-  t=$(awk -F'\t' 'NR>1 && $2=="many" && $3=="many"{print $4}' "$OUT/r.hap_pairs.tsv")
-  o=$(awk -F'\t' 'NR>1 && $2=="fewer" && $3=="fewer"{print $4}' "$OUT/r.hap_pairs.tsv")
-  local win; win=$(sed -n 2p "$OUT/r.hap_pairs.tsv" | awk -F'\t' '{print ($2==$3)?$2:$2"/"$3}')
-  "$PY" - "$R2" "$t" "$o" "$MARGIN" "$OUT/ref.mass" "$OUT/r.mass" "$lbl" "$((t1-t0))" "$win" "${rss:-0}" <<'PYEOF'
+  # No `|| true`: a failed rung must not be reported using the previous rung's files.
+  if [ $rc -ne 0 ] || [ ! -s "$pfx.hap_pairs.tsv" ] || [ ! -s "$pfx.mass" ]; then
+    printf "  %-38s FAILED (rc=%d) -- not reported\n" "$lbl" "$rc"; return 1
+  fi
+  local rss; rss=$(awk '/maximum resident set size/{printf "%.0f", $1/1048576}' "$pfx.time")
+  local sc; sc=$(awk -F'\t' -v a="$RW1" -v b="$RW2" 'NR>1 && (($2==a&&$3==b)||($2==b&&$3==a)){print $4}' "$pfx.hap_pairs.tsv")
+  local win; win=$(sed -n 2p "$pfx.hap_pairs.tsv" | awk -F'\t' '{print ($2==$3)?$2:$2"/"$3}')
+  "$PY" - "$R2" "${sc:-nan}" "$MARGIN" "$OUT/ref.mass" "$pfx.mass" "$lbl" "$((t1-t0))" "$win" "${rss:-0}" "$RW1" "$RW2" <<'PYEOF'
 import sys, math
-ref2, t, o, margin, refmass, fastmass, lbl, secs, win, rss = sys.argv[1:11]
-ref2, t, o, margin = float(ref2), float(t or 0), float(o or 0), float(margin)
+ref2, sc, margin, refmass, fastmass, lbl, secs, win, rss, w1, w2 = sys.argv[1:12]
+ref2, margin = float(ref2), float(margin)
+try: sc = float(sc)
+except ValueError: print(f"  {lbl:<38} winner pair absent from the accelerated output"); sys.exit(1)
 def load(p):
-    d={}
+    d, hdr = {}, ""
     for l in open(p):
+        if l.startswith("# pair"): hdr = l.strip()
         if l.startswith("#") or l.startswith("fragment"): continue
-        k,v=l.rstrip("\n").split("\t")
-        d[k]=float(v)
-    return d
-rm, fm = load(refmass), load(fastmass)
-common=[k for k in rm if k in fm and rm[k] > -1e300]
-# retained placement MASS, weighted by the reference's own mass so that dominant placements dominate
-num=sum(math.exp(fm[k]-rm[k]) * math.exp(rm[k]-max(rm.values())) for k in common)
-den=sum(math.exp(rm[k]-max(rm.values())) for k in common)
-retained = 100.0 * num / den if den else 0.0
-sep = t - o
-err = abs(t - ref2)
-safe = "yes" if err < margin else "NO"
-print(f"  {lbl:<34} {t:9.1f} {sep:9.1f} {err:9.2f} {retained:7.1f}% {secs:>7}s {win:>6}"
-      f"   decision-safe: {safe}, peak {rss} MB")
+        k, v = l.rstrip("\n").split("\t"); d[k] = float(v)
+    return d, hdr
+rm, _ = load(refmass); fm, hdr = load(fastmass)
+# The accelerated dump must describe the SAME pair as the reference dump.
+if hdr and not (w1 in hdr and w2 in hdr):
+    print(f"  {lbl:<38} mass dump describes a different pair: {hdr}"); sys.exit(1)
+common = [k for k in rm if k in fm and rm[k] > -1e300]
+mx = max(rm[k] for k in common)
+num = sum(math.exp(fm[k]-rm[k]) * math.exp(rm[k]-mx) for k in common)
+den = sum(math.exp(rm[k]-mx) for k in common)
+retained = 100.0*num/den if den else 0.0
+err = abs(sc - ref2)
+print(f"  {lbl:<38} {sc:10.1f} {err:10.2f} {retained:7.1f}% {secs:>6}s {win:>6}"
+      f"   safe: {'yes' if err < margin else 'NO'}, {rss} MB")
 PYEOF
 }
 
-rung "1 unrestricted recruitment"        --rung-zero
-rung "2 + start binning (64)"            --rung-zero --placement-bin 64
-rung "3 + anchor cap (8)"                --rung-zero --placement-bin 64 --max-anchor-occ 8
-rung "4 + placement top-k (2)"           --rung-zero --placement-bin 64 --max-anchor-occ 8 --placement-topk 2
+rung "1 recruitment, exact (start,end) states" r1 --rung-zero
+rung "2 + midpoint dedup (16 bp)"              r2 --rung-zero --placement-dedup 16
+rung "3 + start binning (64)"                  r3 --rung-zero --placement-dedup 16 --placement-bin 64
+rung "4 + anchor cap (8)"                      r4 --rung-zero --placement-dedup 16 --placement-bin 64 --max-anchor-occ 8
+rung "5 + placement top-k (2)"                 r5 --rung-zero --placement-dedup 16 --placement-bin 64 --max-anchor-occ 8 --placement-topk 2
 echo
-echo "  a rung is decision-safe only while its score error is smaller than the margin it must preserve"
-echo
-echo "  CAVEAT on this fixture: the reference's own margin between 10 copies and 9 is only ~0.6 nats,"
-echo "  because placement multiplicity favours the longer array by n*log(10/9) = 14.3 nats while its"
-echo "  extra exposure penalises it by lambda*2*100 = 10.0. The two nearly cancel, so a one-unit copy"
-echo "  difference is near-degenerate at this depth FOR THE EXACT MODEL TOO. Every approximation"
-echo "  therefore flips the winner, and the decision-safety column carries no information here --"
-echo "  the retained-mass column is what to read. A fixture with a larger copy difference is needed"
-echo "  before decision-safety at an array can be assessed at all."
+echo "  A rung is decision-safe only while its score error is smaller than the reference winner's"
+echo "  margin. Midpoint deduplication is now its own rung: it was previously hard-coded inside what"
+echo "  was called unrestricted recruitment, so any mass loss attributed to recruitment may have been"
+echo "  this instead."
