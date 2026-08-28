@@ -825,6 +825,11 @@ HaplotypeResult genotype_haplotype_pairs(
     // scale and therefore the contrast between candidates.
     const double log_half_strand = std::log(0.5);
 
+    // Actual omitted placement mass, so the tolerance is a measurement and not a promise. The help
+    // previously said a failure to meet the bound would be reported and nothing reported it.
+    double omitted_mass_max = 0.0, omitted_mass_sum = 0.0;
+    std::size_t omitted_mass_n = 0;
+
     std::vector<double> ll(fragments.size() * nh, kNegInf);
     std::vector<double> floors(fragments.size(), kNegInf);
     // Where each fragment landed on each haplotype, or -1 where it did not land at all. The depth
@@ -1084,6 +1089,14 @@ HaplotypeResult genotype_haplotype_pairs(
                     }
                     grouped.push_back(p);
                 }
+                // Prune by GROUP MASS, not by representative likelihood. A lower-likelihood group
+                // with high multiplicity can carry more probability than a singleton above it, so
+                // sorting on `ll` alone drops the wrong tail -- which is the same confusion between
+                // placement COUNT and placement MASS this whole feature exists to remove.
+                std::sort(grouped.begin(), grouped.end(),
+                          [](const PlacementRec& a, const PlacementRec& b) {
+                              return (a.ll + a.log_mult) > (b.ll + b.log_mult);
+                          });
                 // Prune by omitted MASS, not by count: drop the tail only while what it carries stays
                 // under the tolerance.
                 double total = kNegInf;
@@ -1100,6 +1113,14 @@ HaplotypeResult genotype_haplotype_pairs(
                         --keep;
                     }
                     grouped.resize(keep);
+                    if (dropped != kNegInf) {
+                        const double frac = std::exp(dropped - total);
+                        static std::mutex om;
+                        std::lock_guard<std::mutex> lk(om);
+                        omitted_mass_max = std::max(omitted_mass_max, frac);
+                        omitted_mass_sum += frac;
+                        ++omitted_mass_n;
+                    }
                 }
                 v.swap(grouped);
             }
@@ -1152,6 +1173,9 @@ HaplotypeResult genotype_haplotype_pairs(
         out.completeness.recall_measured = out.completeness.truth_resolvable > 0;
     }
     out.completeness.fragments_total = fragments.size();
+    out.completeness.omitted_mass_max = omitted_mass_max;
+    out.completeness.omitted_mass_mean =
+        omitted_mass_n == 0 ? 0.0 : omitted_mass_sum / static_cast<double>(omitted_mass_n);
 
     for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
         double lo = kNegInf, hi = kNegInf;

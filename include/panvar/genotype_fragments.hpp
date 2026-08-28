@@ -290,13 +290,18 @@ struct HaplotypeScoreOptions : FragmentScoreOptions {
     // Pruning is then by RETAINED MASS rather than by count: groups are dropped only while the
     // omitted probability mass stays under `mass_tolerance`. If that cannot be met the run says so
     // instead of silently keeping two placements.
-    // STATUS: promising, NOT yet validated as exact. On the 10-copy fixture it recovers the correct
-    // winner and 100% of the placement mass where the cap retains 4% and top-k 7%, but it leaves a
-    // 0.19-nat residual against the exact reference that rung 1 (the same recruitment WITHOUT
-    // grouping) does not have. That residual is invariant to --mass-tolerance from 1e-2 to 1e-12, to
-    // --placement-bin and to --placement-dedup, so it is the grouping itself and not the pruning.
-    // Its source is unidentified. Do not adopt this as a default, and do not run the synthetic grid
-    // or any donor against it, until the residual is explained.
+    // STATUS on the 10-copy fixture: the grouping is EXACT. Scored under --rung-zero, so that the
+    // exact contract exposure is used on both sides, it gives 0.0022 nats against the reference --
+    // identical to the same recruitment without grouping. The cap retains 4% of the placement mass
+    // and top-k 7%, and both flip the call; this retains 100% and keeps the correct winner.
+    //
+    // An earlier 0.19-nat residual was attributed to the grouping and that was wrong: the arm had
+    // been run WITHOUT --rung-zero, so it changed the grouping and the exposure model at once, and
+    // the difference was entirely the window exposure.
+    //
+    // Restricted to the global marginal model, where a placement's position does not enter the score.
+    // Under the windowed model equal-likelihood placements in different windows are not
+    // interchangeable and collapsing them would move coverage between windows.
     bool multiplicity_aware = false;
     double mass_tolerance = 1e-3;
     // How a haplotype-pair posterior becomes a per-block allele pair.
@@ -486,6 +491,10 @@ struct PlacementCompleteness {
     // needs. Counted separately from recall because raising placement_topk trades one against the
     // other, and a single "completeness" number hides which is moving.
     std::uint64_t spurious_placements = 0;
+    // What --mass-tolerance actually omitted, measured. A declared bound that is never checked is a
+    // promise, not a guarantee.
+    double omitted_mass_max = 0.0;
+    double omitted_mass_mean = 0.0;
 };
 
 struct HaplotypeScore {

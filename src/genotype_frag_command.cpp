@@ -663,6 +663,20 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         return 0;
     }
 
+    if (hopt.multiplicity_aware && !hopt.joint_marginal) {
+        // Grouping by likelihood is exact only where POSITION is irrelevant, which is the global
+        // marginal scorer. In the windowed or hard-assignment models, equal-likelihood placements in
+        // different windows cannot share one representative coordinate, and collapsing them would
+        // move coverage between windows.
+        throw std::runtime_error(
+            "genotype-frag: --multiplicity-aware requires --joint-marginal. Grouping placements by "
+            "likelihood is exact only for the global marginal model, where a placement's position "
+            "does not enter the score; under the windowed model equal-likelihood placements in "
+            "different windows are not interchangeable");
+    }
+    if (hopt.multiplicity_aware && !(hopt.mass_tolerance > 0.0 && hopt.mass_tolerance < 1.0)) {
+        throw std::runtime_error("genotype-frag: --mass-tolerance must lie strictly between 0 and 1");
+    }
     if (hap_mode && hopt.joint_depth && hopt.haploid_depth <= 0.0) {
         throw std::runtime_error(
             "genotype-frag: --joint-depth requires --haploid-depth. The depth rate must come from "
@@ -748,6 +762,15 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             const double capped_pct = c.fragments_total == 0 ? 0.0
                 : 100.0 * static_cast<double>(c.fragments_truncated) /
                   static_cast<double>(c.fragments_total);
+            if (hopt.multiplicity_aware) {
+                char buf[160];
+                std::snprintf(buf, sizeof(buf),
+                              "placement mass omitted by --mass-tolerance %.1e: max %.3e, mean %.3e "
+                              "per fragment-haplotype (bound %s)",
+                              hopt.mass_tolerance, c.omitted_mass_max, c.omitted_mass_mean,
+                              c.omitted_mass_max <= hopt.mass_tolerance ? "met" : "NOT MET");
+                log.info(buf);
+            }
             log.info("post-anchor cluster retention " + std::to_string(static_cast<int>(kept_pct)) +
                      "% (NOT total completeness); anchor occurrences dropped by --max-anchor-occ " +
                      std::to_string(static_cast<int>(anch_pct)) + "%; fragments capped by "

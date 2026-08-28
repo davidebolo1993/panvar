@@ -186,7 +186,10 @@ rung "  top-k (2) alone, no anchor cap"        r6 --rung-zero --placement-dedup 
 rung "  anchor cap (8) alone, no top-k"        r7 --rung-zero --placement-dedup 16 --placement-bin 64 --max-anchor-occ 8
 # The proposed replacement: no anchor discarded for being frequent, no top-k, equal-likelihood
 # placements grouped with their multiplicity, and pruning by omitted MASS instead of by count.
-rung "  multiplicity-aware compression"        r8 --joint-marginal --multiplicity-aware --placement-bin 64 --placement-dedup 0
+# The ISOLATED arm: --rung-zero so exact contract exposure is used, exactly as rungs 1-3 use it.
+# Invoking it without --rung-zero changes grouping AND the exposure model at once, and the 0.19-nat
+# difference that produced was entirely the exposure -- not the grouping, which is exact.
+rung "  multiplicity-aware compression"        r8 --rung-zero --multiplicity-aware
 echo
 echo "  A rung is decision-safe only while its score error is smaller than the reference winner's"
 echo "  margin. Midpoint deduplication is now its own rung: it was previously hard-coded inside what"
