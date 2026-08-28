@@ -181,17 +181,22 @@ struct HaplotypeScoreOptions : FragmentScoreOptions {
     // same reads gave the truth rank 2 at --max-haplotypes 48 and rank 1 at 96, purely because the
     // larger shortlist pushed more codes past a shared cap.
     // 64, changed from 8 on measurement. Inside a tandem array a cap of 8 discards most of the
-    // array's own syncmers, so its fragments never anchor and the array contributes nothing to the
-    // score. Swept at 8/16/32/64/128:
+    // array's own syncmers, so its fragments never anchor and the array contributes nothing.
     //
-    //   lpa  HG01106  61,305 -> 5,608 excess    (91% of the error was this parameter)
-    //   lpa  HG02572  55,515 -> 11,008          (80%)
-    //   cyp2d6, four donors: unchanged or one edit better, and 4-5 s either way
+    // Measured over all 10 lpa donors, not the sweep sample: total excess 793,921 -> 542,595, -32%.
+    // The effect is strongly heterogeneous and the two donors in the 8/16/32/64/128 sweep were the
+    // two best cases, so the -91% and -81% they showed are NOT representative:
     //
-    // Saturates by 64 at both loci and costs 7 s -> 12 s at lpa, nothing at cyp2d6. This is still a
-    // blunt instrument -- the better policy keeps repetitive anchors and weights them by inverse
-    // occurrence, seeding each fragment from its rarest syncmers -- but the default should not be a
-    // value measured to throw away most of an array.
+    //   -90% NA18508   -91% HG01106   -81% HG02572   -38% HG01975   -18% HG00146
+    //    -2% HG04184     0% HG00735     0% HG02391     0% NA19240   +45% HG03239
+    //
+    // So one donor is materially WORSE at 64. The change is kept because the aggregate is a clear
+    // gain, it costs 7 s -> 12 s at lpa and nothing at cyp2d6, and no cap value can be right for a
+    // locus with and without arrays at once -- but a cap is the wrong instrument and this number
+    // should not be quoted as a fix. The better policy keeps repetitive anchors and weights them by
+    // inverse occurrence, seeding each fragment from its rarest syncmers.
+    //
+    // lpa remains 542,595 above a panel floor of 7,835. The cap was a contributor, not the cause.
     std::size_t max_anchor_occ = 64;
     std::size_t anchor_slack = 40;     // bases of window either side of an anchored read start
     // Haplotype pairs to report the likelihood's opinion of, by name. Probing costs nothing: the
