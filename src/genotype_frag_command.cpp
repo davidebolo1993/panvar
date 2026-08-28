@@ -291,6 +291,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--marginalise-placements") hopt.marginalise_placements = true;
         else if (a == "--placement-topk") hopt.placement_topk = cli::parse_size_arg(a, value(i, a));
         else if (a == "--joint-depth") hopt.joint_depth = true;
+        else if (a == "--joint-marginal") { hopt.joint_depth = true; hopt.joint_marginal = true; }
+        else if (a == "--joint-reverse-order") hopt.joint_reverse_order = true;
         else if (a == "--joint-top-pairs") hopt.joint_top_pairs = cli::parse_size_arg(a, value(i, a));
         else if (a == "--joint-window") hopt.joint_window = cli::parse_size_arg(a, value(i, a));
         else if (a == "--joint-iterations") hopt.joint_iterations = cli::parse_size_arg(a, value(i, a));
@@ -623,6 +625,13 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             log.info("best pair: " + hr.shortlist[hr.top_pairs[0].hap1] + " / " +
                      hr.shortlist[hr.top_pairs[0].hap2] + " (posterior " +
                      std::to_string(hr.top_pairs[0].posterior) + ")");
+        }
+        if (hr.convergence.pairs_rescored > 0 && !hopt.joint_marginal) {
+            log.info("joint assignment: " + std::to_string(hr.convergence.pairs_converged) + "/" +
+                     std::to_string(hr.convergence.pairs_rescored) + " pairs reached a fixed point; "
+                     "max iterations used " + std::to_string(hr.convergence.max_iterations_used) +
+                     "; fragments still moving in the last pass " +
+                     std::to_string(hr.convergence.total_moves_last_iteration));
         }
         log.info(std::to_string(hr.n_informative) + " of " + std::to_string(hr.n_fragments) +
                  " fragments discriminate between shortlisted haplotypes");

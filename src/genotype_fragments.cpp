@@ -775,7 +775,12 @@ HaplotypeResult genotype_haplotype_pairs(
         if (!F.r2.empty()) { gather(F.r2, true, c2); gather(r2rc, false, c2); }
 
         const auto reduce = [&](std::vector<Cand>& c) {
-            // Bucket implied starts to 64 bp and keep, per haplotype, the two commonest.
+            // Bucket implied starts to 64 bp and keep, per haplotype, the `placement_topk`
+            // commonest. NOTE, so no downstream comment overstates it: this is NOT every plausible
+            // placement. Anchors occurring more than `max_anchor_occ` times per haplotype were
+            // already dropped, and of the clusters that remain only the top few survive here, so a
+            // fragment inside a repeat with many copies is represented by a few of them, not all.
+            // Whether that approximation matters is an open question, not a settled one.
             std::map<std::pair<std::uint32_t, long>, std::pair<int, long>> tally;
             for (const Cand& x : c) {
                 auto& e = tally[{x.hap, (x.fwd ? 1 : -1) * (x.start / 64 + 1)}];
@@ -1085,6 +1090,7 @@ HaplotypeResult genotype_haplotype_pairs(
             ? pairs.size() : std::min(options.joint_top_pairs, pairs.size());
         std::vector<double> joint(nrescore, kNegInf);
         std::vector<std::size_t> ambiguous(nrescore, 0), nulls(nrescore, 0);
+        std::vector<std::size_t> conv_iters(nrescore, 0), conv_moves(nrescore, 0);
 
         run_parallel(nrescore, options.threads, [&](std::size_t pi) {
             const std::size_t a = pairs[pi].hap1, b = pairs[pi].hap2;
@@ -1128,6 +1134,28 @@ HaplotypeResult genotype_haplotype_pairs(
                 return homozygous ? 2.0 * e : e;
             };
 
+            if (options.joint_marginal) {
+                // Observed-data likelihood: sum over placements, no assignment at all.
+                double total = 0.0;
+                double exposure_total = 0.0;
+                for (std::size_t w = 0; w < wa; ++w) exposure_total += expect_of(0, w);
+                if (!homozygous) for (std::size_t w = 0; w < wb; ++w) exposure_total += expect_of(1, w);
+                total -= exposure_total;
+                const double log_lam = std::log(std::max(lambda_joint, 1e-300));
+                const double lmix = std::log1p(-options.outlier_mix);
+                const double lout = std::log(options.outlier_mix);
+                for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
+                    if (floors[fi] == kNegInf) continue;
+                    double lse = kNegInf;
+                    for (const Opt& o : opts[fi]) lse = log_add(lse, o.ll);
+                    const double placed = (lse == kNegInf) ? kNegInf : lmix + log_lam + lse;
+                    total += log_add(placed, lout + floors[fi]);
+                }
+                joint[pi] = total;
+                conv_iters[pi] = 0;
+                return;
+            }
+
             // start from each fragment's best placement, then let depth redistribute it
             for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
                 if (opts[fi].empty()) continue;
@@ -1141,9 +1169,13 @@ HaplotypeResult genotype_haplotype_pairs(
                 (o.side == 0 ? ca : cb)[static_cast<std::size_t>(o.w)] += 1.0;
             }
 
+            std::size_t iters_used = 0, last_moves = 0;
             for (std::size_t it = 0; it < options.joint_iterations; ++it) {
-                bool moved = false;
-                for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
+                std::size_t moves = 0;
+                iters_used = it + 1;
+                for (std::size_t oi = 0; oi < fragments.size(); ++oi) {
+                    const std::size_t fi = options.joint_reverse_order
+                        ? fragments.size() - 1 - oi : oi;
                     if (floors[fi] == kNegInf || opts[fi].empty()) continue;
                     if (z[fi] >= 0) {
                         const Opt& o = opts[fi][static_cast<std::size_t>(z[fi])];
@@ -1159,15 +1191,18 @@ HaplotypeResult genotype_haplotype_pairs(
                         const double gain = wll(cnt[w] + 1.0, e) - wll(cnt[w], e);
                         if (o.ll + gain > bs) { bs = o.ll + gain; best = static_cast<int>(j); }
                     }
-                    if (best != z[fi]) moved = true;
+                    if (best != z[fi]) ++moves;
                     z[fi] = best;
                     if (best >= 0) {
                         const Opt& o = opts[fi][static_cast<std::size_t>(best)];
                         (o.side == 0 ? ca : cb)[static_cast<std::size_t>(o.w)] += 1.0;
                     }
                 }
-                if (!moved) break;
+                last_moves = moves;
+                if (moves == 0) break;
             }
+            conv_iters[pi] = iters_used;
+            conv_moves[pi] = last_moves;
 
             double total = 0.0;
             double assigned = 0.0;
@@ -1203,6 +1238,13 @@ HaplotypeResult genotype_haplotype_pairs(
             joint[pi] = total;
         });
 
+        out.convergence.pairs_rescored = nrescore;
+        for (std::size_t pi = 0; pi < nrescore; ++pi) {
+            if (conv_moves[pi] == 0) ++out.convergence.pairs_converged;
+            out.convergence.max_iterations_used =
+                std::max(out.convergence.max_iterations_used, conv_iters[pi]);
+            out.convergence.total_moves_last_iteration += conv_moves[pi];
+        }
         for (std::size_t pi = 0; pi < nrescore; ++pi) pairs[pi].score = joint[pi];
         std::stable_sort(pairs.begin(), pairs.begin() + static_cast<long>(nrescore),
                          [](const HaplotypePairScore& x, const HaplotypePairScore& y) {

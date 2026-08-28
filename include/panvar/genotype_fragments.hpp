@@ -287,8 +287,30 @@ struct HaplotypeScoreOptions : FragmentScoreOptions {
     // it, which is the mechanism a copy-number difference is visible through and the one an
     // independent per-haplotype count destroys.
     bool joint_depth = false;
+    // Sum over placements instead of assigning each fragment to one of them:
+    //
+    //   log L(a,b) = -lambda * E(a,b)
+    //              + sum_f log[ eta * P_bg(f) + (1-eta) * lambda * sum_p P(f | p) ]
+    //
+    // where p ranges over the fragment's placements on EITHER homologue and E is the pair's total
+    // exposure. This is the observed-data likelihood of a Poisson process: each physical fragment
+    // still enters once, placement multiplicity carries copy number by itself -- a fragment with two
+    // placements on a two-copy haplotype contributes twice the density -- and there is no freedom to
+    // pick a window assignment that flatters the depth profile.
+    //
+    // Parameter-free relative to the hard assignment: it removes a degree of freedom rather than
+    // adding a regulariser. It exists because the hard-assignment arm gained about +575 nats where a
+    // real length difference exists and lost about -437 nats where none does, and assignment freedom
+    // is the suspect -- untested until this arm runs.
+    bool joint_marginal = false;
     std::size_t joint_top_pairs = 32;   // candidate pairs re-scored jointly, by alignment rank
-    std::size_t joint_iterations = 5;
+    // Cap, not a schedule: the optimiser stops early when no fragment moves. Whether it actually
+    // reached that state is reported rather than assumed -- a stable fragment-count invariant says
+    // nothing about having reached an optimum.
+    std::size_t joint_iterations = 50;
+    // Reverse the order fragments are visited in. Coordinate ascent is order-dependent, so a result
+    // that changes under this is optimiser instability rather than evidence about the model.
+    bool joint_reverse_order = false;
     std::size_t joint_window = 500;
     // Sequence compatibility and copy number are different signals and a read alignment cannot carry
     // both. Measured, at cyp2d6 leave-ZERO-out: NA18939's haplotype 1 is 13.6 kb longer than the
@@ -375,6 +397,16 @@ struct HaplotypeProbe {
     std::size_t placed2 = 0;    // apart from a likelihood failure
 };
 
+// Whether the coordinate ascent actually converged, per rescored pair. Reported because "it ran five
+// iterations" and "it reached a fixed point" are different claims and only one of them licenses
+// reading the result as the model's opinion.
+struct JointConvergence {
+    std::size_t pairs_rescored = 0;
+    std::size_t pairs_converged = 0;
+    std::size_t max_iterations_used = 0;
+    std::size_t total_moves_last_iteration = 0;
+};
+
 struct HaplotypeResult {
     std::vector<std::string> shortlist;         // haplotype names actually scored
     std::vector<HaplotypeScore> haplotypes;
@@ -383,6 +415,7 @@ struct HaplotypeResult {
     std::size_t n_informative = 0;
     std::vector<BlockProjection> blocks;
     std::vector<HaplotypeProbe> probes;
+    JointConvergence convergence;
 };
 
 HaplotypeResult genotype_haplotype_pairs(
