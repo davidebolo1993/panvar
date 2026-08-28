@@ -935,6 +935,51 @@ HaplotypeResult genotype_haplotype_pairs(
         }
     });
 
+    // True-origin placement recall. wgsim names each fragment "<haplotype>_<start>_<end>_...", so when
+    // the origin haplotype is in the shortlist the placement the recruiter SHOULD have found is known
+    // exactly. Reported because raising placement_topk restores true placements and adds false ones at
+    // the same time, and a retention percentage cannot distinguish those.
+    if (options.joint_depth) {
+        std::unordered_map<std::string, std::size_t> by_name;
+        for (std::size_t h = 0; h < nh; ++h) by_name.emplace(out.shortlist[h], h);
+        for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
+            const std::string& nm = fragments[fi].name;
+            // trailing fields are _start_end_e1_e2_idx; the haplotype name carries no underscore
+            const std::size_t p1 = nm.find('_');
+            if (p1 == std::string::npos) continue;
+            const std::size_t p2 = nm.find('_', p1 + 1);
+            const std::size_t p3 = nm.find('_', p2 == std::string::npos ? p1 + 1 : p2 + 1);
+            if (p2 == std::string::npos || p3 == std::string::npos) continue;
+            const auto it = by_name.find(nm.substr(0, p1));
+            if (it == by_name.end()) continue;
+            long ts = 0, te = 0;
+            try {
+                ts = std::stol(nm.substr(p1 + 1, p2 - p1 - 1));
+                te = std::stol(nm.substr(p2 + 1, p3 - p2 - 1));
+            } catch (...) { continue; }
+            const long truth_mid = (ts + te) / 2;
+            ++out.completeness.truth_resolvable;
+            // EITHER ORIENTATION. A haplotype's block-concatenated spelling can be the reverse
+            // complement of the path spelling the reads were simulated from -- measured, one of
+            // HG04036's two haplotypes is, and checking only the forward coordinate reported 48%
+            // recall where the true figure is 100%. The alignment already tries both strands, so
+            // this is a property of the coordinate frame and not of the placement.
+            const long L = static_cast<long>(haps[it->second].seq.size());
+            bool found = false;
+            std::uint64_t extra = 0;
+            for (const auto& [mid, v] : placements[fi * nh + it->second]) {
+                (void)v;
+                const long m = static_cast<long>(mid);
+                if (std::abs(m - truth_mid) <= 150 || std::abs((L - m) - truth_mid) <= 150) found = true;
+                else ++extra;
+            }
+            if (found) ++out.completeness.truth_recovered;
+            out.completeness.spurious_placements += extra;
+        }
+        out.completeness.recall_measured = out.completeness.truth_resolvable > 0;
+    }
+    out.completeness.fragments_total = fragments.size();
+
     for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
         double lo = kNegInf, hi = kNegInf;
         for (std::size_t h = 0; h < nh; ++h) {

@@ -391,11 +391,28 @@ struct BlockProjection {
 // result saying "350 bp cannot resolve this" is a statement about max_anchor_occ and placement_topk,
 // not about the reads. Nothing may be called an information limit while these are far from complete.
 struct PlacementCompleteness {
-    std::uint64_t anchor_occurrences_seen = 0;      // syncmer hits in the index before the cap
-    std::uint64_t anchor_occurrences_dropped = 0;   // ...excluded by max_anchor_occ
-    std::uint64_t clusters_found = 0;               // distinct implied-start clusters, per mate
+    // POST-ANCHOR retention. These clusters are what survives max_anchor_occ, so a high figure here
+    // says placement_topk was not binding -- it does NOT say the recruiter saw everything. Naming it
+    // "completeness" invites exactly that misreading, which is why the two stages are separate.
+    std::uint64_t clusters_found = 0;               // implied-start clusters offered, per mate, post-anchor
     std::uint64_t clusters_kept = 0;                // ...surviving placement_topk
     std::uint64_t fragments_truncated = 0;          // fragments where placement_topk actually bound
+    std::uint64_t fragments_total = 0;
+    // The stage BEFORE that, which the above cannot see.
+    std::uint64_t anchor_occurrences_seen = 0;
+    std::uint64_t anchor_occurrences_dropped = 0;   // excluded by max_anchor_occ
+    // Ground truth, available only when the reads were simulated from haplotypes that are IN the
+    // panel: wgsim encodes each fragment's origin in its name, so the placement the recruiter should
+    // have found is known. Raising placement_topk restores true placements AND adds false ones, so a
+    // retention figure alone cannot say whether the evidence improved.
+    bool recall_measured = false;
+    std::uint64_t truth_resolvable = 0;   // fragments whose origin haplotype is in the shortlist
+    std::uint64_t truth_recovered = 0;    // ...with a retained placement at the true position
+    // Retained placements elsewhere on the ORIGIN haplotype. Not necessarily errors: inside a repeat
+    // the other copies are legitimate alternatives, and they are exactly what a copy-number model
+    // needs. Counted separately from recall because raising placement_topk trades one against the
+    // other, and a single "completeness" number hides which is moving.
+    std::uint64_t spurious_placements = 0;
 };
 
 struct HaplotypeScore {

@@ -668,11 +668,29 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             const double anch_pct = c.anchor_occurrences_seen == 0 ? 0.0
                 : 100.0 * static_cast<double>(c.anchor_occurrences_dropped) /
                   static_cast<double>(c.anchor_occurrences_seen);
-            log.info("placement completeness: " + std::to_string(static_cast<int>(kept_pct)) +
-                     "% of implied-start clusters kept, " + std::to_string(static_cast<int>(anch_pct)) +
-                     "% of anchor occurrences dropped by --max-anchor-occ, " +
-                     std::to_string(c.fragments_truncated) + " fragments hit --placement-topk. "
-                     "Nothing may be called an information limit while these are far from complete");
+            const double capped_pct = c.fragments_total == 0 ? 0.0
+                : 100.0 * static_cast<double>(c.fragments_truncated) /
+                  static_cast<double>(c.fragments_total);
+            log.info("post-anchor cluster retention " + std::to_string(static_cast<int>(kept_pct)) +
+                     "% (NOT total completeness); anchor occurrences dropped by --max-anchor-occ " +
+                     std::to_string(static_cast<int>(anch_pct)) + "%; fragments capped by "
+                     "--placement-topk " + std::to_string(static_cast<int>(capped_pct)) + "%");
+            if (c.recall_measured) {
+                const double recall = 100.0 * static_cast<double>(c.truth_recovered) /
+                                      static_cast<double>(c.truth_resolvable);
+                const double spur = static_cast<double>(c.spurious_placements) /
+                                    static_cast<double>(c.truth_resolvable);
+                log.info("true-origin placement recall " + std::to_string(static_cast<int>(recall)) +
+                         "% over " + std::to_string(c.truth_resolvable) + " fragments; " +
+                         std::to_string(spur).substr(0, 4) + " additional placements per fragment "
+                         "elsewhere on the origin haplotype (inside a repeat these are legitimate "
+                         "alternatives, not errors). Nothing may be called an information limit "
+                         "while recall is low");
+            } else {
+                log.info("true-origin recall not measurable here (needs reads simulated from "
+                         "haplotypes that are IN the panel); retention alone cannot distinguish "
+                         "restored true placements from added false ones");
+            }
         }
         log.info("call margin " + std::to_string(hr.equivalence.margin) + " nats; " +
                  std::to_string(hr.equivalence.size) + " pair(s) within tolerance; " +
