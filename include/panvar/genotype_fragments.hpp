@@ -294,16 +294,15 @@ struct HaplotypeScoreOptions : FragmentScoreOptions {
     //
     // where p ranges over the fragment's placements on EITHER homologue and E is the pair's total
     // exposure. This is the observed-data likelihood of a Poisson process: each physical fragment
-    // still enters once, placement multiplicity carries copy number by itself -- a fragment with two
-    // placements on a two-copy haplotype contributes twice the density -- and there is no freedom to
-    // pick a window assignment that flatters the depth profile.
+    // enters once, and there is no freedom to pick a window assignment that flatters the depth
+    // profile.
     //
-    // TRUNCATED, and the distinction matters: this is a placement-marginal over the placements the
-    // recruiter kept, not over all of them. `max_anchor_occ` drops common anchors and
+    // In the IDEAL form, placement multiplicity would carry copy number on its own -- a fragment with
+    // two placements on a two-copy haplotype contributes twice the density. **This implementation is
+    // truncated and does not have that property.** `max_anchor_occ` drops common anchors and
     // `placement_topk` keeps only the top few implied-start clusters per mate, so inside a repeat the
-    // placement count saturates well below the true copy number. So it is NOT true that placement
-    // multiplicity carries copy number by itself in this implementation -- it carries it up to the
-    // truncation, and how much that costs is unmeasured.
+    // placement count saturates well below the true copy number. Multiplicity carries copy number
+    // only up to that truncation, and the cost of the truncation is unmeasured.
     //
     // Parameter-free relative to the hard assignment: it removes a degree of freedom rather than
     // adding a regulariser. It exists because the hard-assignment arm gained about +575 nats where a
@@ -318,6 +317,11 @@ struct HaplotypeScoreOptions : FragmentScoreOptions {
     // Reverse the order fragments are visited in. Coordinate ascent is order-dependent, so a result
     // that changes under this is optimiser instability rather than evidence about the model.
     bool joint_reverse_order = false;
+    // Score tolerance, in nats, defining the equivalence set. Pairs within this of the best are
+    // reported as not distinguished by the evidence rather than ranked against each other. 0 means
+    // exact ties only.
+    double equivalence_tolerance = 0.0;
+    std::size_t equivalence_max_report = 16;
     std::size_t joint_window = 500;
     // Sequence compatibility and copy number are different signals and a read alignment cannot carry
     // both. Measured, at cyp2d6 leave-ZERO-out: NA18939's haplotype 1 is 13.6 kb longer than the
@@ -368,6 +372,10 @@ struct BlockProjection {
     int allele1 = -1;
     int allele2 = -1;
     double posterior = 0.0;
+    // True when every member of the equivalence set carries this same allele pair here. A block can
+    // be determined even where the haplotype pair is not, and that is the part of the answer worth
+    // reporting when allocation is ambiguous.
+    bool determined = false;
     int truth_a = -1;
     int truth_b = -1;
     bool exact = false;
@@ -378,6 +386,18 @@ struct BlockProjection {
 // tens of thousands of terms and nothing about it is checkable from the sum: whether a haplotype
 // lost on sequence or on depth, whether its reads placed at all, whether the coarse stage even gave
 // it a chance. These are the columns that answer that.
+// How much of the placement evidence the recruiter actually kept. Reported so that a read-length
+// ladder cannot mistake a RECRUITMENT limit for an INFORMATION limit: if completeness is low, a
+// result saying "350 bp cannot resolve this" is a statement about max_anchor_occ and placement_topk,
+// not about the reads. Nothing may be called an information limit while these are far from complete.
+struct PlacementCompleteness {
+    std::uint64_t anchor_occurrences_seen = 0;      // syncmer hits in the index before the cap
+    std::uint64_t anchor_occurrences_dropped = 0;   // ...excluded by max_anchor_occ
+    std::uint64_t clusters_found = 0;               // distinct implied-start clusters, per mate
+    std::uint64_t clusters_kept = 0;                // ...surviving placement_topk
+    std::uint64_t fragments_truncated = 0;          // fragments where placement_topk actually bound
+};
+
 struct HaplotypeScore {
     std::string name;
     std::size_t bp = 0;
@@ -414,6 +434,25 @@ struct JointConvergence {
     std::size_t total_moves_last_iteration = 0;
 };
 
+// What the evidence actually distinguishes, as opposed to which pair happened to rank first.
+//
+// Measured reason this is not a nicety: at cyp2d6 HG04036 the sequence-correct pair sits 100-262 nats
+// behind the winner out of a score near 200,000, and the two differ by 12,161 edits of reconstruction.
+// Reporting one pair there asserts a distinction the data does not support. An equivalence set states
+// the ambiguity instead of resolving it arbitrarily, and it is the honest short-read output at an
+// array whether or not any depth model is ever adopted.
+struct EquivalenceSet {
+    double margin = 0.0;            // best score minus the runner-up: how much the call is actually won by
+    std::size_t size = 0;           // pairs within `tolerance` of the best
+    double posterior_mass = 0.0;    // their combined posterior
+    // Alleles the set AGREES on, per block: where every member carries the same pair, the call is
+    // determined even though the haplotype pair is not. This is the part of the answer that survives
+    // the ambiguity, and at a locus where allocation is unidentifiable it may be most of it.
+    std::size_t blocks_determined = 0;
+    std::size_t blocks_total = 0;
+    std::vector<std::string> members;   // names, capped for reporting
+};
+
 struct HaplotypeResult {
     std::vector<std::string> shortlist;         // haplotype names actually scored
     std::vector<HaplotypeScore> haplotypes;
@@ -423,6 +462,8 @@ struct HaplotypeResult {
     std::vector<BlockProjection> blocks;
     std::vector<HaplotypeProbe> probes;
     JointConvergence convergence;
+    EquivalenceSet equivalence;
+    PlacementCompleteness completeness;
 };
 
 HaplotypeResult genotype_haplotype_pairs(

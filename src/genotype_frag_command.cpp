@@ -293,6 +293,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--joint-depth") hopt.joint_depth = true;
         else if (a == "--joint-marginal") { hopt.joint_depth = true; hopt.joint_marginal = true; }
         else if (a == "--joint-reverse-order") hopt.joint_reverse_order = true;
+        else if (a == "--equivalence-tolerance") hopt.equivalence_tolerance = std::stod(value(i, a));
         else if (a == "--joint-top-pairs") hopt.joint_top_pairs = cli::parse_size_arg(a, value(i, a));
         else if (a == "--joint-window") hopt.joint_window = cli::parse_size_arg(a, value(i, a));
         else if (a == "--joint-iterations") hopt.joint_iterations = cli::parse_size_arg(a, value(i, a));
@@ -660,8 +661,25 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                      "%); bubble blocks " + std::to_string(bub_ex) + "/" + std::to_string(bub_rep));
         }
         write_haplotype_results(out_prefix, hr, have_truth);
+        {
+            const auto& c = hr.completeness;
+            const double kept_pct = c.clusters_found == 0 ? 100.0
+                : 100.0 * static_cast<double>(c.clusters_kept) / static_cast<double>(c.clusters_found);
+            const double anch_pct = c.anchor_occurrences_seen == 0 ? 0.0
+                : 100.0 * static_cast<double>(c.anchor_occurrences_dropped) /
+                  static_cast<double>(c.anchor_occurrences_seen);
+            log.info("placement completeness: " + std::to_string(static_cast<int>(kept_pct)) +
+                     "% of implied-start clusters kept, " + std::to_string(static_cast<int>(anch_pct)) +
+                     "% of anchor occurrences dropped by --max-anchor-occ, " +
+                     std::to_string(c.fragments_truncated) + " fragments hit --placement-topk. "
+                     "Nothing may be called an information limit while these are far from complete");
+        }
+        log.info("call margin " + std::to_string(hr.equivalence.margin) + " nats; " +
+                 std::to_string(hr.equivalence.size) + " pair(s) within tolerance; " +
+                 std::to_string(hr.equivalence.blocks_determined) + "/" +
+                 std::to_string(hr.equivalence.blocks_total) + " blocks determined by all of them");
         log.wrote({out_prefix + ".hap_blocks.tsv", out_prefix + ".hap_pairs.tsv",
-                   out_prefix + ".hap_scores.tsv"});
+                   out_prefix + ".hap_scores.tsv", out_prefix + ".equivalence.tsv"});
         log.done();
         return 0;
     }

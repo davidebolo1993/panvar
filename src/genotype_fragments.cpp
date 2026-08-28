@@ -717,7 +717,11 @@ HaplotypeResult genotype_haplotype_pairs(
         const std::vector<KmerOccurrence> sy = collect_syncmers(haps[hi].seq, k, s);
         for (const KmerOccurrence& o : sy) ++per_hap[o.code];
         for (const KmerOccurrence& o : sy) {
-            if (per_hap[o.code] > options.max_anchor_occ) continue;
+            ++out.completeness.anchor_occurrences_seen;
+            if (per_hap[o.code] > options.max_anchor_occ) {
+                ++out.completeness.anchor_occurrences_dropped;
+                continue;
+            }
             anchors[o.code].emplace_back(static_cast<std::uint32_t>(hi),
                                          static_cast<std::uint32_t>(o.start));
         }
@@ -774,6 +778,8 @@ HaplotypeResult genotype_haplotype_pairs(
         gather(r1rc, false, c1);
         if (!F.r2.empty()) { gather(F.r2, true, c2); gather(r2rc, false, c2); }
 
+        std::uint64_t found_local = 0, kept_local = 0;
+        bool trunc_local = false;
         const auto reduce = [&](std::vector<Cand>& c) {
             // Bucket implied starts to 64 bp and keep, per haplotype, the `placement_topk`
             // commonest. NOTE, so no downstream comment overstates it: this is NOT every plausible
@@ -792,16 +798,28 @@ HaplotypeResult genotype_haplotype_pairs(
                 per_hap[key.first].push_back({val.first, {key.second > 0, val.second}});
             }
             std::vector<Cand> keep;
+            bool truncated = false;
             for (auto& [hi, v] : per_hap) {
                 std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                found_local += v.size();
+                if (v.size() > options.placement_topk) truncated = true;
                 for (std::size_t i = 0; i < std::min(options.placement_topk, v.size()); ++i) {
                     keep.push_back({hi, v[i].second.first, v[i].second.second});
+                    ++kept_local;
                 }
             }
+            if (truncated) trunc_local = true;
             c.swap(keep);
         };
         reduce(c1);
         reduce(c2);
+        {
+            static std::mutex comp_mu;
+            std::lock_guard<std::mutex> lk(comp_mu);
+            out.completeness.clusters_found += found_local;
+            out.completeness.clusters_kept += kept_local;
+            if (trunc_local) ++out.completeness.fragments_truncated;
+        }
 
         const std::size_t band1 =
             static_cast<std::size_t>(options.max_divergence * static_cast<double>(F.r1.size())) + 1;
@@ -1266,6 +1284,22 @@ HaplotypeResult genotype_haplotype_pairs(
     for (const HaplotypePairScore& p : pairs) norm = log_add(norm, p.score);
     for (HaplotypePairScore& p : pairs) p.posterior = std::exp(p.score - norm);
 
+    // ---- what the evidence actually distinguishes ---------------------------------------------
+    {
+        EquivalenceSet& eq = out.equivalence;
+        const double best = pairs.front().score;
+        eq.margin = pairs.size() > 1 ? best - pairs[1].score : std::numeric_limits<double>::infinity();
+        for (const HaplotypePairScore& p : pairs) {
+            if (best - p.score > options.equivalence_tolerance) break;
+            ++eq.size;
+            eq.posterior_mass += p.posterior;
+            if (eq.members.size() < options.equivalence_max_report) {
+                eq.members.push_back(out.shortlist[p.hap1] + "/" + out.shortlist[p.hap2]);
+            }
+        }
+        eq.blocks_total = chain.size();
+    }
+
     // ---- project onto blocks ------------------------------------------------------------------
     out.blocks.resize(chain.size());
     for (std::size_t bi = 0; bi < chain.size(); ++bi) {
@@ -1298,6 +1332,23 @@ HaplotypeResult genotype_haplotype_pairs(
             }
             P.posterior = best < 0.0 ? 0.0 : best;
         }
+        // Determined = every member of the equivalence set agrees here. Computed even when the set
+        // has one member, where it is trivially true, so the column means one thing throughout.
+        {
+            const double best = pairs.front().score;
+            bool agree = true;
+            int fa = -2, fb = -2;
+            for (const HaplotypePairScore& p : pairs) {
+                if (best - p.score > options.equivalence_tolerance) break;
+                int x = haps[p.hap1].allele[bi], y = haps[p.hap2].allele[bi];
+                if (x > y) std::swap(x, y);
+                if (fa == -2) { fa = x; fb = y; }
+                else if (x != fa || y != fb) { agree = false; break; }
+            }
+            P.determined = agree;
+            if (agree) ++out.equivalence.blocks_determined;
+        }
+
         if (truth_allele1 != nullptr && truth_allele2 != nullptr &&
             bi < truth_allele1->size() && bi < truth_allele2->size()) {
             P.truth_a = (*truth_allele1)[bi];
@@ -1503,14 +1554,15 @@ void write_haplotype_results(const std::string& out_prefix,
     const std::string bp = out_prefix + ".hap_blocks.tsv";
     std::ofstream bf(bp);
     if (!bf) throw std::runtime_error("genotype-frag: cannot write " + bp);
-    bf << "block\tkind\tbubble_id\tn_alleles\tallele1\tallele2\tposterior";
+    bf << "block\tkind\tbubble_id\tn_alleles\tallele1\tallele2\tposterior\tdetermined";
     if (have_truth) bf << "\ttruth_a\ttruth_b\trepresentable\texact";
     bf << '\n';
     for (const BlockProjection& p : result.blocks) {
         const char* kind = p.kind == BlockKind::Bubble ? "bubble"
                          : p.kind == BlockKind::Backbone ? "backbone" : "flank";
         bf << p.block_index << '\t' << kind << '\t' << p.bubble_id << '\t' << p.n_alleles << '\t'
-           << p.allele1 << '\t' << p.allele2 << '\t' << p.posterior;
+           << p.allele1 << '\t' << p.allele2 << '\t' << p.posterior << '\t'
+           << (p.determined ? 1 : 0);
         if (have_truth) {
             bf << '\t' << p.truth_a << '\t' << p.truth_b << '\t' << (p.truth_representable ? 1 : 0)
                << '\t' << (p.truth_representable ? (p.exact ? "1" : "0") : "NA");
@@ -1543,6 +1595,20 @@ void write_haplotype_results(const std::string& out_prefix,
         }
         qf.flush();
         if (!qf) throw std::runtime_error("genotype-frag: write failed for " + qp);
+    }
+
+    {
+        const std::string ep = out_prefix + ".equivalence.tsv";
+        std::ofstream ef(ep);
+        if (!ef) throw std::runtime_error("genotype-frag: cannot write " + ep);
+        ef << "margin\tset_size\tposterior_mass\tblocks_determined\tblocks_total\n";
+        ef << result.equivalence.margin << '\t' << result.equivalence.size << '\t'
+           << result.equivalence.posterior_mass << '\t' << result.equivalence.blocks_determined
+           << '\t' << result.equivalence.blocks_total << '\n';
+        ef << "# members within tolerance of the best score\n";
+        for (const std::string& m : result.equivalence.members) ef << m << '\n';
+        ef.flush();
+        if (!ef) throw std::runtime_error("genotype-frag: write failed for " + ep);
     }
 
     const std::string pp = out_prefix + ".hap_pairs.tsv";
