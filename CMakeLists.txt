@@ -338,6 +338,19 @@ if(PANVAR_BUILD_TESTING)
             set_tests_properties(panvar_genotype_frag_reference PROPERTIES TIMEOUT 600)
         endif()
 
+        # Accelerated scorer against the exact reference. Measures the approximation; it does not
+        # tune anything. The repeat fixture is the one that matters -- it is where placement
+        # truncation bites -- and it currently reports the fast path recovering about half the
+        # copy-number separation the contract specifies.
+        set(PANVAR_GENOTYPE_FRAG_DIFF ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_frag_differential.sh)
+        if(EXISTS ${PANVAR_GENOTYPE_FRAG_DIFF} AND PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE)
+            add_test(
+                NAME panvar_genotype_frag_differential
+                COMMAND /usr/bin/env bash ${PANVAR_GENOTYPE_FRAG_DIFF} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/genotype_frag_differential
+            )
+            set_tests_properties(panvar_genotype_frag_differential PROPERTIES TIMEOUT 900)
+        endif()
+
         # Opt-in regressions against the committed real loci. Several contracts are only reachable
         # on real data: ANKRD36C is the only locus that ever produced overlapping sites, LPA KIV-2 is
         # the folding case with 466 haplotypes, whether the POA guards SKIP anything is a property of
