@@ -1013,6 +1013,52 @@ HaplotypeResult genotype_haplotype_pairs(
                                                         : place_all(c2, hi, F.r2, r2rc, band2);
             if (!a1.empty()) mates_seeded[fi * nh + hi] |= 4u;
             if (!a2.empty()) mates_seeded[fi * nh + hi] |= 8u;
+
+            // ---- one-mate rescue ---------------------------------------------------------------
+            // Exactly one mate placed: the other is searched in the interval FR orientation and the
+            // insert prior allow, on this same haplotype. No truth is used -- the interval follows
+            // from the anchored placement, the strand and the prior's support.
+            std::vector<Placed> resc1, resc2;
+            if (options.mate_rescue && !F.r2.empty() && (a1.empty() != a2.empty())) {
+                const bool have1 = !a1.empty();
+                const std::vector<Placed>& have = have1 ? a1 : a2;
+                const std::string& want_fwd = have1 ? F.r2 : F.r1;
+                const std::string& want_rev = have1 ? r2rc : r1rc;
+                const std::size_t want_band = have1 ? band2 : band1;
+                std::vector<Placed>& into = have1 ? resc2 : resc1;
+                const long n = static_cast<long>(haps[hi].seq.size());
+                for (const Placed& p : have) {
+                    // FR: if the anchored mate is forward, the partner is reverse and DOWNSTREAM,
+                    // ending between start+lo and start+hi. If reverse, the partner is upstream.
+                    const std::string& q = p.fwd ? want_rev : want_fwd;
+                    if (q.empty()) continue;
+                    long lo_s, hi_s;
+                    if (p.fwd) {
+                        lo_s = p.start + ins_prior.lo - static_cast<long>(q.size());
+                        hi_s = p.start + ins_prior.hi - static_cast<long>(q.size());
+                    } else {
+                        lo_s = p.end - ins_prior.hi + 1;
+                        hi_s = p.end - ins_prior.lo + 1;
+                    }
+                    lo_s = std::max<long>(0, lo_s);
+                    hi_s = std::min<long>(hi_s, n - static_cast<long>(q.size()));
+                    for (long st = lo_s; st <= hi_s; ++st) {
+                        std::size_t mism = 0;
+                        for (std::size_t bi2 = 0; bi2 < q.size() && mism <= want_band; ++bi2) {
+                            if (q[bi2] != haps[hi].seq[static_cast<std::size_t>(st) + bi2]) ++mism;
+                        }
+                        if (mism > want_band) continue;
+                        Placed r;
+                        r.ok = true; r.edits = mism; r.start = st;
+                        r.end = st + static_cast<long>(q.size()) - 1;
+                        r.fwd = !p.fwd;
+                        into.push_back(r);
+                    }
+                }
+                if (!into.empty()) mates_seeded[fi * nh + hi] |= 32u;   // rescued
+            }
+            const std::vector<Placed>& b1 = resc1.empty() ? a1 : resc1;
+            const std::vector<Placed>& b2 = resc2.empty() ? a2 : resc2;
             double lp = kNegInf;      // the accumulated likelihood: max, or the sum when marginalising
             double best = kNegInf;    // always the best single placement, so the midpoint is a real one
             long mid = -1;
@@ -1022,11 +1068,11 @@ HaplotypeResult genotype_haplotype_pairs(
                 if (v > best) { best = v; mid = m; }
                 lp = options.marginalise_placements ? log_add(lp, v) : std::max(lp, v);
             };
-            if (!a1.empty() && !a2.empty()) {
+            if (!b1.empty() && !b2.empty()) {
                 // Both mates placed: the pair's placements are the COMBINATIONS, and the single-mate
                 // terms below would double count them, so they are skipped.
-                for (const Placed& x : a1) {
-                    for (const Placed& y : a2) {
+                for (const Placed& x : b1) {
+                    for (const Placed& y : b2) {
                         // FR only: the two mates of a fragment face each other. Combining same-strand
                         // placements invents fragments the library cannot produce.
                         if (x.fwd == y.fwd) continue;
@@ -1043,9 +1089,9 @@ HaplotypeResult genotype_haplotype_pairs(
                     }
                 }
             } else {
-                for (const Placed& x : a1) consider(read_ll(x.edits, F.r1.size()) + miss2,
+                for (const Placed& x : b1) consider(read_ll(x.edits, F.r1.size()) + miss2,
                                                     (x.start + x.end) / 2);
-                for (const Placed& y : a2) consider(miss1 + read_ll(y.edits, F.r2.size()),
+                for (const Placed& y : b2) consider(miss1 + read_ll(y.edits, F.r2.size()),
                                                     (y.start + y.end) / 2);
             }
             if (lp == kNegInf) { ll[fi * nh + hi] = floors[fi]; continue; }
@@ -1076,9 +1122,9 @@ HaplotypeResult genotype_haplotype_pairs(
                     into.push_back({key, static_cast<std::int32_t>(st),
                                     static_cast<std::int32_t>(en), fwd, v});
                 };
-                if (!a1.empty() && !a2.empty()) {
-                    for (const Placed& x : a1) {
-                        for (const Placed& y : a2) {
+                if (!b1.empty() && !b2.empty()) {
+                    for (const Placed& x : b1) {
+                        for (const Placed& y : b2) {
                             ++combos_local;
                             if (x.fwd == y.fwd) continue;
                             const Placed& fw = x.fwd ? x : y;
@@ -1093,9 +1139,9 @@ HaplotypeResult genotype_haplotype_pairs(
                         }
                     }
                 } else {
-                    for (const Placed& x : a1) add((x.start + x.end) / 2, x.start, x.end, x.fwd,
+                    for (const Placed& x : b1) add((x.start + x.end) / 2, x.start, x.end, x.fwd,
                                                    read_ll(x.edits, F.r1.size()) + miss2);
-                    for (const Placed& y : a2) add((y.start + y.end) / 2, y.start, y.end, y.fwd,
+                    for (const Placed& y : b2) add((y.start + y.end) / 2, y.start, y.end, y.fwd,
                                                    miss1 + read_ll(y.edits, F.r2.size()));
                 }
             }

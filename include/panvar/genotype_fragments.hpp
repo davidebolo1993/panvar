@@ -302,6 +302,15 @@ struct HaplotypeScoreOptions : FragmentScoreOptions {
     // Restricted to the global marginal model, where a placement's position does not enter the score.
     // Under the windowed model equal-likelihood placements in different windows are not
     // interchangeable and collapsing them would move coverage between windows.
+    // ONE-MATE RESCUE. When only one mate anchors, the other is currently searched nowhere and the
+    // fragment falls to the single-mate path, losing the paired evidence the exhaustive reference
+    // finds. Measured: that stratum -- one mate seeded, that mate placed, no valid FR pair -- carries
+    // 87-96% of the whole recruitment deficit.
+    //
+    // The rescue is truth-independent by construction: given an anchored mate's placement on a
+    // candidate haplotype, FR orientation and the insert prior's support fix an interval on that same
+    // haplotype where the other mate must lie, and it is searched there and nowhere else.
+    bool mate_rescue = false;
     bool multiplicity_aware = false;
     double mass_tolerance = 1e-3;
     // How a haplotype-pair posterior becomes a per-block allele pair.

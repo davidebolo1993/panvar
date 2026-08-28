@@ -28,8 +28,8 @@ EQ_TOL=1.0        # predeclared: the compressed optimum must be within this of t
 MASS_BOUND=1e-3   # predeclared: omitted placement mass
 
 printf "  equivalence tolerance %s nats, mass bound %s; reads stochastic from the scorer's own model\n\n" "$EQ_TOL" "$MASS_BOUND"
-printf "  %-5s %-7s %-5s | %-10s %-9s %-8s %-8s | %-9s %-9s %-6s\n" \
-       copies replen seed "ref_best" "U-R signed" "max|G-U|" "in_class" "combos" "groups" "sec"
+printf "  %-5s %-7s %-5s | %-10s %-9s %-10s %-8s %-6s | %-8s %-8s %-7s %-5s\n" \
+       copies replen seed "ref_best" "U-R" "rescued-R" "max|G-U|" "in_cls" "combos" "combosM" "groups" "sec"
 
 for CN in ${COPIES//,/ }; do
 for RL in ${REPLENS//,/ }; do
@@ -139,6 +139,7 @@ PYEOF
   # for many/many while evaluating U-R at G's own optimum compares different pairs, and they differ in
   # exactly the cells that fail.
   run_arm U --dump-fragment-mass "$W/U.mass" --dump-mass-pair many,many || continue
+  run_arm M --mate-rescue --dump-fragment-mass "$W/M.mass" --dump-mass-pair many,many || continue
   run_arm G --multiplicity-aware --mass-tolerance "$MASS_BOUND" --dump-fragment-mass "$W/G.mass" --dump-mass-pair many,many || continue
   "$BIN" genotype-frag --reference-score "$W/many.fa" "$W/many.fa" -R "$W/reads.fa" $P \
     --dump-fragment-mass "$W/R.mass" >/dev/null 2>&1
@@ -174,6 +175,7 @@ def score_of(tag, key):
         if "/".join(sorted((f[1], f[2]))) == key: return float(f[3])
     return float("nan")
 PAIR = "many/many"
+m_at_p = score_of("M", PAIR)
 u_at_g = score_of("U", PAIR)
 gval = score_of("G", PAIR)
 gkey = PAIR
@@ -200,8 +202,11 @@ def grab(pat, d="?"):
     m = re.search(pat, log); return m.group(1) if m else d
 combos = grab(r"(\d+) mate combinations")
 groups = grab(r"(\d+) groups after")
-print(f"  {cn:<5} {rl:<7} {sd:<5} | {best:10.2f} {e_recruit:+9.2f} {e_group:8.3f}{group_note:<3} "
-      f"{('yes' if gkey in top_class else 'NO'):<8} | {combos:<9} {groups:<9} {secs:<6}")
+e_rescue = (m_at_p - refv) if refv == refv and m_at_p == m_at_p else float("nan")
+mlog = open(os.path.join(W,"M.log")).read() + open(os.path.join(W,"M.time")).read()
+mcombos = (re.search(r"(\d+) mate combinations", mlog) or [None,"?"])[1]
+print(f"  {cn:<5} {rl:<7} {sd:<5} | {best:10.2f} {e_recruit:+9.2f} {e_rescue:+10.2f} {e_group:7.3f}{group_note:<3} "
+      f"{('yes' if gkey in top_class else 'NO'):<6} | {combos:<8} {mcombos:<8} {groups:<7} {secs:<5}")
 PYEOF
   # Per-fragment decomposition of the deficit by seeding stratum. A fragment is the unit: one
   # anchored mate can rescue the other through the insert constraint.
