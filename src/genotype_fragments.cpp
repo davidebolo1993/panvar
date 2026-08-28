@@ -859,12 +859,14 @@ HaplotypeResult genotype_haplotype_pairs(
         // Clustering on the implied START rather than on the match position is what lets one anchor
         // stand in for the whole read.
         struct Cand { std::uint32_t hap; bool fwd; long start; };
+        std::uint64_t found_local = 0, kept_local = 0, anchor_hits_local = 0, combos_local = 0;
         const auto gather = [&](const std::string& r, bool fwd,
                                 std::vector<Cand>& into) {
             for (const KmerOccurrence& o : collect_syncmers(r, k, s)) {
                 const auto it = anchors.find(o.code);
                 if (it == anchors.end()) continue;
                 for (const auto& [hi, pos] : it->second) {
+                    ++anchor_hits_local;
                     into.push_back({hi, fwd, static_cast<long>(pos) - static_cast<long>(o.start)});
                 }
             }
@@ -877,7 +879,6 @@ HaplotypeResult genotype_haplotype_pairs(
         gather(r1rc, false, c1);
         if (!F.r2.empty()) { gather(F.r2, true, c2); gather(r2rc, false, c2); }
 
-        std::uint64_t found_local = 0, kept_local = 0;
         bool trunc_local = false;
         const auto reduce = [&](std::vector<Cand>& c) {
             // Bucket implied starts to 64 bp and keep, per haplotype, the `placement_topk`
@@ -918,6 +919,7 @@ HaplotypeResult genotype_haplotype_pairs(
             std::lock_guard<std::mutex> lk(comp_mu);
             out.completeness.clusters_found += found_local;
             out.completeness.clusters_kept += kept_local;
+            out.completeness.anchor_hits += anchor_hits_local;
             if (trunc_local) ++out.completeness.fragments_truncated;
         }
 
@@ -1052,6 +1054,7 @@ HaplotypeResult genotype_haplotype_pairs(
                 if (!a1.empty() && !a2.empty()) {
                     for (const Placed& x : a1) {
                         for (const Placed& y : a2) {
+                            ++combos_local;
                             if (x.fwd == y.fwd) continue;
                             const Placed& fw = x.fwd ? x : y;
                             const Placed& rv = x.fwd ? y : x;
@@ -1069,6 +1072,16 @@ HaplotypeResult genotype_haplotype_pairs(
                                                    read_ll(x.edits, F.r1.size()) + miss2);
                     for (const Placed& y : a2) add((y.start + y.end) / 2, y.start, y.end, y.fwd,
                                                    miss1 + read_ll(y.edits, F.r2.size()));
+                }
+            }
+        }
+        {
+            static std::mutex cm;
+            std::lock_guard<std::mutex> lk(cm);
+            out.completeness.mate_combinations += combos_local;
+            if (options.joint_depth) {
+                for (std::size_t hi = 0; hi < nh; ++hi) {
+                    out.completeness.placements_before_grouping += placements[fi * nh + hi].size();
                 }
             }
         }
@@ -1113,14 +1126,16 @@ HaplotypeResult genotype_haplotype_pairs(
                         --keep;
                     }
                     grouped.resize(keep);
-                    if (dropped != kNegInf) {
-                        const double frac = std::exp(dropped - total);
-                        static std::mutex om;
-                        std::lock_guard<std::mutex> lk(om);
-                        omitted_mass_max = std::max(omitted_mass_max, frac);
-                        omitted_mass_sum += frac;
-                        ++omitted_mass_n;
-                    }
+                    // Every non-empty fragment-haplotype counts, contributing zero when nothing was
+                    // pruned. Counting only the cases that dropped something makes the mean the mean
+                    // OF THE DROPS, which is a different and much larger quantity than the mean
+                    // omission per placement set -- and it is the latter the tolerance is about.
+                    const double frac = (dropped == kNegInf) ? 0.0 : std::exp(dropped - total);
+                    static std::mutex om;
+                    std::lock_guard<std::mutex> lk(om);
+                    omitted_mass_max = std::max(omitted_mass_max, frac);
+                    omitted_mass_sum += frac;
+                    ++omitted_mass_n;
                 }
                 v.swap(grouped);
             }
@@ -1176,6 +1191,11 @@ HaplotypeResult genotype_haplotype_pairs(
     out.completeness.omitted_mass_max = omitted_mass_max;
     out.completeness.omitted_mass_mean =
         omitted_mass_n == 0 ? 0.0 : omitted_mass_sum / static_cast<double>(omitted_mass_n);
+    if (options.joint_depth) {
+        for (std::size_t i = 0; i < placements.size(); ++i) {
+            out.completeness.groups_after_grouping += placements[i].size();
+        }
+    }
 
     for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
         double lo = kNegInf, hi = kNegInf;

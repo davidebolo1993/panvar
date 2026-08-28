@@ -771,6 +771,18 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                               c.omitted_mass_max <= hopt.mass_tolerance ? "met" : "NOT MET");
                 log.info(buf);
             }
+            if (hopt.joint_depth) {
+                char cb[220];
+                std::snprintf(cb, sizeof(cb),
+                              "cost: %llu anchor hits, %llu mate combinations scored, %llu placements "
+                              "before grouping, %llu groups after -- compression is DOWNSTREAM, so it "
+                              "restores evidence without avoiding the work",
+                              (unsigned long long)c.anchor_hits,
+                              (unsigned long long)c.mate_combinations,
+                              (unsigned long long)c.placements_before_grouping,
+                              (unsigned long long)c.groups_after_grouping);
+                log.info(cb);
+            }
             log.info("post-anchor cluster retention " + std::to_string(static_cast<int>(kept_pct)) +
                      "% (NOT total completeness); anchor occurrences dropped by --max-anchor-occ " +
                      std::to_string(static_cast<int>(anch_pct)) + "%; fragments capped by "

@@ -364,6 +364,18 @@ if(PANVAR_BUILD_TESTING)
             set_tests_properties(panvar_genotype_frag_ladder PROPERTIES TIMEOUT 900)
         endif()
 
+        # The synthetic grid. A MEASUREMENT of whether multiplicity-aware compression is accurate
+        # under stochastic reads and affordable as copy number grows -- neither is established, and
+        # the grid is where that gets settled. Not registered as an assertion: it reports numbers.
+        set(PANVAR_GENOTYPE_FRAG_GRID ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_frag_grid.sh)
+        if(EXISTS ${PANVAR_GENOTYPE_FRAG_GRID} AND PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE AND PANVAR_SLOW_TESTS)
+            add_test(
+                NAME panvar_genotype_frag_grid
+                COMMAND /usr/bin/env bash ${PANVAR_GENOTYPE_FRAG_GRID} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/genotype_frag_grid
+            )
+            set_tests_properties(panvar_genotype_frag_grid PROPERTIES TIMEOUT 1800 LABELS slow)
+        endif()
+
         # Opt-in regressions against the committed real loci. Several contracts are only reachable
         # on real data: ANKRD36C is the only locus that ever produced overlapping sites, LPA KIV-2 is
         # the folding case with 466 haplotypes, whether the POA guards SKIP anything is a property of

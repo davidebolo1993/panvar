@@ -495,6 +495,15 @@ struct PlacementCompleteness {
     // promise, not a guarantee.
     double omitted_mass_max = 0.0;
     double omitted_mass_mean = 0.0;
+    // COST, so that "correct" and "tractable" are separate claims. The compression is DOWNSTREAM:
+    // anchors are still expanded, every recruited placement is still aligned, and mate combinations
+    // are still formed -- only then are equal likelihoods grouped. So it restores the evidence the
+    // cap and top-k destroyed, but it may retain the work they were introduced to avoid. An array
+    // costs one group rather than N placements only AFTER enumeration.
+    std::uint64_t anchor_hits = 0;                  // index lookups that yielded a position
+    std::uint64_t mate_combinations = 0;            // (mate1, mate2) pairs actually scored
+    std::uint64_t placements_before_grouping = 0;
+    std::uint64_t groups_after_grouping = 0;
 };
 
 struct HaplotypeScore {
