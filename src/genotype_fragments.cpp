@@ -1136,6 +1136,15 @@ HaplotypeResult genotype_haplotype_pairs(
 
             if (options.joint_marginal) {
                 // Observed-data likelihood: sum over placements, no assignment at all.
+                //
+                // A homozygous pair is TWO copies of one sequence. Its exposure is doubled below, and
+                // its event INTENSITY must be doubled with it: a fragment could have come from either
+                // copy, so the density it sees is 2 * lambda * sum_p, not lambda * sum_p. Omitting it
+                // costs log(2) on every placed fragment -- about 14,000 nats over 20,000 fragments --
+                // and silently penalises every homozygous call. Placements are gathered once because
+                // the two copies are the same sequence and offer the same positions; the factor, not
+                // a second gather, is what represents the second copy.
+                const double copies = homozygous ? 2.0 : 1.0;
                 double total = 0.0;
                 double exposure_total = 0.0;
                 for (std::size_t w = 0; w < wa; ++w) exposure_total += expect_of(0, w);
@@ -1148,7 +1157,8 @@ HaplotypeResult genotype_haplotype_pairs(
                     if (floors[fi] == kNegInf) continue;
                     double lse = kNegInf;
                     for (const Opt& o : opts[fi]) lse = log_add(lse, o.ll);
-                    const double placed = (lse == kNegInf) ? kNegInf : lmix + log_lam + lse;
+                    const double placed = (lse == kNegInf) ? kNegInf
+                                        : lmix + log_lam + std::log(copies) + lse;
                     total += log_add(placed, lout + floors[fi]);
                 }
                 joint[pi] = total;

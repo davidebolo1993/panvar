@@ -298,6 +298,13 @@ struct HaplotypeScoreOptions : FragmentScoreOptions {
     // placements on a two-copy haplotype contributes twice the density -- and there is no freedom to
     // pick a window assignment that flatters the depth profile.
     //
+    // TRUNCATED, and the distinction matters: this is a placement-marginal over the placements the
+    // recruiter kept, not over all of them. `max_anchor_occ` drops common anchors and
+    // `placement_topk` keeps only the top few implied-start clusters per mate, so inside a repeat the
+    // placement count saturates well below the true copy number. So it is NOT true that placement
+    // multiplicity carries copy number by itself in this implementation -- it carries it up to the
+    // truncation, and how much that costs is unmeasured.
+    //
     // Parameter-free relative to the hard assignment: it removes a degree of freedom rather than
     // adding a regulariser. It exists because the hard-assignment arm gained about +575 nats where a
     // real length difference exists and lost about -437 nats where none does, and assignment freedom

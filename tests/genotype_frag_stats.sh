@@ -287,6 +287,25 @@ else
   bad "joint depth failed on the duplication fixture: $jerr"
 fi
 
+# ------------------------------------------- homozygous intensity: the log(2) per placed fragment
+# A homozygous pair is two copies of one sequence, so its exposure doubles AND its event intensity
+# doubles. Doubling only the exposure charges the pair for coverage it is not credited with -- log(2)
+# per placed fragment, thousands of nats -- and silently penalises every homozygous call.
+#
+# The fixture is a genuinely homozygous sample: reads from ONE haplotype at full depth. The correct
+# call is that haplotype against itself, and under the bug it loses to a heterozygous pair.
+emit_pairs "$H1" homo 12 > "$OUT/homo.fa"
+if "$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/homo" -R "$OUT/homo.fa" \
+     --haplotype-mode --joint-marginal --haploid-depth 0.05 --joint-top-pairs 0 \
+     --fragment-len 350 --fragment-sd 50 -t 2 -q >/dev/null 2>&1; then
+  hs=$(awk -F'\t' 'NR==2{print ($2==$3) ? "hom" : "het"}' "$OUT/homo.hap_pairs.tsv")
+  [ "$hs" = "hom" ] \
+    && ok "a homozygous sample is called homozygous under --joint-marginal (intensity doubled with exposure)" \
+    || bad "a homozygous sample was called heterozygous: the homozygous intensity is missing its factor of two"
+else
+  bad "--joint-marginal failed on the homozygous fixture"
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then echo "genotype-frag stats: all assertions passed"; else
   echo "genotype-frag stats: $fails assertion(s) failed"; fi
