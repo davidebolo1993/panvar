@@ -683,6 +683,9 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         }
         std::vector<std::string> names;
         for (const PathRecord& p : panel_graph.paths) names.push_back(p.name);
+        // Refuse to score before the decomposition is known to round-trip. Without this the caller
+        // silently scores sequences the panel does not contain.
+        verify_block_spelling(panel_graph, blocks, names);
         log.info("scoring " + std::to_string(names.size()) + " panel haplotypes (shortlist " +
                  std::to_string(hopt.max_haplotypes) + ") over " + std::to_string(frags.size()) +
                  " fragments");

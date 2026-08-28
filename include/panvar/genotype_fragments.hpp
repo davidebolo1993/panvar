@@ -18,6 +18,7 @@
 // only worth building if this one passes its gate.
 
 #include "panvar/genotype_blocks.hpp"
+#include "panvar/gfa.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -532,6 +533,21 @@ struct HaplotypeResult {
     EquivalenceSet equivalence;
     PlacementCompleteness completeness;
 };
+
+// Whole-haplotype mode rests on an assumption it never checked:
+//
+//     concatenated block alleles for path X  ==  the raw GFA spelling of path X
+//
+// When it fails the caller scores a sequence the panel does not contain, silently. Measured on a
+// tandem array built as a chain of identical nodes: one haplotype spelled 1100 bp against its true
+// 1500, another spelled 0 bp, and a full table of plausible numbers came out anyway. A test-only
+// check is not enough -- any graph whose decomposition does not round-trip produces this.
+//
+// Throws naming the path, both lengths and the first mismatching offset.
+void verify_block_spelling(
+    const Graph& graph,
+    const std::vector<BlockAlleles>& blocks,
+    const std::vector<std::string>& haplotype_names);
 
 HaplotypeResult genotype_haplotype_pairs(
     const std::vector<Block>& chain,

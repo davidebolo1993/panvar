@@ -37,39 +37,39 @@ emit_pairs() { awk -v s="$1" -v tag="$2" -v step="$3" -v off="${4:-0}" 'BEGIN{
         rc=rc (c=="A"?"T":c=="C"?"G":c=="G"?"C":"A")}
       printf ">%s_%d/1\n%s\n>%s_%d/2\n%s\n", tag,i,r1,tag,i,rc } }'; }
 
-# A HIGH-COPY panel, because the approximations must actually bind or the ladder measures nothing.
-# With a 2-copy repeat, top-k 2 keeps both copies and an occurrence cap of 8 never fires -- measured,
-# all four rungs then report identical scores and the ladder is vacuous.
+# A HIGH-COPY panel as ONE THREE-ALLELE BUBBLE, not a chain of identical nodes.
 #
-# Here a 100 bp segment is repeated 10 times against 9, so a fragment inside the array has ten valid
-# placements: the anchor cap of 8 removes its syncmers outright, and top-k 2 keeps two placements of
-# ten. Scaled down (100 bp segments, 60 bp mates, 150 bp inserts) so the exhaustive reference is still
-# affordable.
+#   source --+-- ref   : SEG + alternate spacer --+-- sink
+#            +-- fewer : SEG x9  + spacer         |
+#            +-- many  : SEG x10 + spacer         |
+#
+# The fragment scorer works on spelled sequence, so the array only has to exist INSIDE an allele --
+# it does not need to be a path through repeated nodes, and representing it that way does not
+# decompose: measured, a chain of ten identical nodes spelled one haplotype at 1100 bp against its
+# true 1500 and another at 0 bp, and the harness still produced a full table of numbers.
+#
+# This still exercises everything intended: repeated syncmers occur 9-10 times within the spelled
+# allele, so --max-anchor-occ 8 binds; top-k sees many implied starts; the exact scorer enumerates
+# every repeat placement; and the bubble decomposition is unambiguous.
 L=$(seq_of 200 3); N=$(seq_of 200 5)
 SEG=$(seq_of 100 31); SPC=$(seq_of 100 32); SPCALT=$(seq_of 100 33)
 rep() { local out="" i; for ((i=0;i<$1;i++)); do out="$out$SEG"; done; printf '%s' "$out"; }
-MANY="${L}$(rep 10)${SPC}${N}"      # 10 copies -- the truth
-FEWER="${L}$(rep 9)${SPC}${N}"      # 9 copies  -- one unit short
+A_REF="${SEG}${SPCALT}"; A_FEW="$(rep 9)${SPC}"; A_MANY="$(rep 10)${SPC}"
 { printf 'H\tVN:Z:1.0\n'
   printf 'S\t1\t%s\n' "$L"
-  for i in $(seq 2 11); do printf 'S\t%d\t%s\n' "$i" "$SEG"; done
-  printf 'S\t12\t%s\n' "$SPC"; printf 'S\t13\t%s\n' "$SPCALT"; printf 'S\t14\t%s\n' "$N"
-  printf 'L\t1\t+\t2\t+\t0M\n'
-  for i in $(seq 2 10); do printf 'L\t%d\t+\t%d\t+\t0M\n' "$i" "$((i+1))"; done
-  printf 'L\t11\t+\t12\t+\t0M\n'          # 10 copies -> spacer
-  printf 'L\t10\t+\t12\t+\t0M\n'          # 9 copies  -> spacer
-  printf 'L\t2\t+\t13\t+\t0M\n'           # ref: one copy then its own spacer
-  printf 'L\t12\t+\t14\t+\t0M\nL\t13\t+\t14\t+\t0M\n'
-  printf 'P\tref\t1+,2+,13+,14+\t*\n'
-  printf 'P\tmany\t1+,2+,3+,4+,5+,6+,7+,8+,9+,10+,11+,12+,14+\t*\n'
-  printf 'P\tfewer\t1+,2+,3+,4+,5+,6+,7+,8+,9+,10+,12+,14+\t*\n'
+  printf 'S\t2\t%s\n' "$A_REF"; printf 'S\t3\t%s\n' "$A_FEW"; printf 'S\t4\t%s\n' "$A_MANY"
+  printf 'S\t5\t%s\n' "$N"
+  for a in 2 3 4; do printf 'L\t1\t+\t%s\t+\t0M\nL\t%s\t+\t5\t+\t0M\n' "$a" "$a"; done
+  printf 'P\tref\t1+,2+,5+\t*\n'
+  printf 'P\tfewer\t1+,3+,5+\t*\n'
+  printf 'P\tmany\t1+,4+,5+\t*\n'
 } > "$OUT/g.gfa"
 "$BIN" bubble -i "$OUT/g.gfa" -r ref -o "$OUT/bub" --min-variant-bp 0 -q >/dev/null 2>&1
-# FASTA basenames must match the PANEL path names, or a named-pair mass dump cannot be requested and
-# the reference winner cannot be looked up in the accelerated output.
-printf '>fewer\n%s\n' "$FEWER" > "$OUT/fewer.fa"; printf '>many\n%s\n' "$MANY" > "$OUT/many.fa"
-{ emit_pairs "$MANY" tA 20; emit_pairs "$MANY" tB 20 10; } > "$OUT/reads.fa"
-echo "  panel: 10-copy array against 9-copy, sample homozygous for 10; $(grep -c '/1$' "$OUT/reads.fa") fragments"
+printf '>ref\n%s\n'   "${L}${A_REF}${N}"  > "$OUT/ref.fa"
+printf '>fewer\n%s\n' "${L}${A_FEW}${N}"  > "$OUT/fewer.fa"
+printf '>many\n%s\n'  "${L}${A_MANY}${N}" > "$OUT/many.fa"
+{ emit_pairs "${L}${A_MANY}${N}" tA 20; emit_pairs "${L}${A_MANY}${N}" tB 20 10; } > "$OUT/reads.fa"
+echo "  panel: 10-copy array against 9-copy, one bubble; sample homozygous for 10; $(grep -c '/1$' "$OUT/reads.fa") fragments"
 
 P="--haploid-depth 0.05 --fragment-len 150 --fragment-sd 20 --error-rate 0.01"
 
@@ -174,11 +174,16 @@ print(f"  {lbl:<38} {sc:10.1f} {err:10.2f} {retained:7.1f}% {secs:>6}s {win:>6}"
 PYEOF
 }
 
-rung "1 recruitment, exact (start,end) states" r1 --rung-zero
+rung "1 exact recruited states (incl. strand)"  r1 --rung-zero
 rung "2 + midpoint dedup (16 bp)"              r2 --rung-zero --placement-dedup 16
 rung "3 + start binning (64)"                  r3 --rung-zero --placement-dedup 16 --placement-bin 64
 rung "4 + anchor cap (8)"                      r4 --rung-zero --placement-dedup 16 --placement-bin 64 --max-anchor-occ 8
 rung "5 + placement top-k (2)"                 r5 --rung-zero --placement-dedup 16 --placement-bin 64 --max-anchor-occ 8 --placement-topk 2
+# The cumulative order hides top-k's OWN cost: by rung 5 the anchor cap has already deleted the
+# array's syncmers, so there are no placements left for top-k to truncate and its increment is zero
+# for a reason that has nothing to do with top-k. Measured separately, without the cap.
+rung "  top-k (2) alone, no anchor cap"        r6 --rung-zero --placement-dedup 16 --placement-bin 64 --placement-topk 2
+rung "  anchor cap (8) alone, no top-k"        r7 --rung-zero --placement-dedup 16 --placement-bin 64 --max-anchor-occ 8
 echo
 echo "  A rung is decision-safe only while its score error is smaller than the reference winner's"
 echo "  margin. Midpoint deduplication is now its own rung: it was previously hard-coded inside what"

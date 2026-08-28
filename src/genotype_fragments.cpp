@@ -651,6 +651,9 @@ struct HaplotypeSeq {
     std::string seq;
     std::vector<int> allele;        // per block, this haplotype's allele index (-1 = absent)
 };
+}   // close the anonymous namespace so the spelling check can use these
+using HaplotypeSeqPub = HaplotypeSeq;
+namespace {
 
 HaplotypeSeq spell_haplotype(const std::vector<BlockAlleles>& blocks, const std::string& name) {
     HaplotypeSeq h;
@@ -665,6 +668,29 @@ HaplotypeSeq spell_haplotype(const std::vector<BlockAlleles>& blocks, const std:
 }
 
 } // namespace
+
+void verify_block_spelling(const Graph& graph,
+                           const std::vector<BlockAlleles>& blocks,
+                           const std::vector<std::string>& haplotype_names) {
+    const auto by_name = path_records_by_name(graph);
+    for (const std::string& name : haplotype_names) {
+        const auto it = by_name.find(name);
+        if (it == by_name.end() || it->second == nullptr) continue;
+        bool complete = false;
+        const std::string raw = spell_path_steps_sequence(graph, it->second->steps, &complete);
+        if (!complete) continue;                    // a path the graph cannot spell is not our claim
+        const HaplotypeSeq built = spell_haplotype(blocks, name);
+        if (built.seq == raw) continue;
+        std::size_t at = 0;
+        while (at < built.seq.size() && at < raw.size() && built.seq[at] == raw[at]) ++at;
+        throw std::runtime_error(
+            "genotype-frag: block decomposition does not round-trip for path '" + name +
+            "': concatenated block alleles are " + std::to_string(built.seq.size()) +
+            " bp, the graph spells " + std::to_string(raw.size()) +
+            " bp, first difference at offset " + std::to_string(at) +
+            ". Whole-haplotype mode would score a sequence the panel does not contain.");
+    }
+}
 
 HaplotypeResult genotype_haplotype_pairs(
     const std::vector<Block>& chain,
@@ -801,7 +827,9 @@ HaplotypeResult genotype_haplotype_pairs(
     // heuristic invented. Deduplicated by rounded midpoint so two syncmer anchors reaching the same
     // biological placement count once. CSR-packed: a dense array would be 48 haplotypes x every
     // fragment x every placement.
-    struct PlacementRec { std::int32_t mid, start, end; double ll; };
+    // Orientation is part of the state. Two strands with identical coordinates are DIFFERENT states
+    // under the contract and must not be merged when exact states are being retained.
+    struct PlacementRec { std::int32_t mid, start, end; bool fwd; double ll; };
     std::vector<std::vector<PlacementRec>> placements(
         options.joint_depth ? fragments.size() * nh : 0);
 
@@ -991,7 +1019,7 @@ HaplotypeResult genotype_haplotype_pairs(
                 // within that radius, keeping the best. With 0, every distinct (start, end) survives,
                 // which is what the exact reference enumerates -- two different mate pairings across
                 // repeat copies can share a midpoint and are NOT the same state.
-                const auto add = [&](long m, long st, long en, double v) {
+                const auto add = [&](long m, long st, long en, bool fwd, double v) {
                     const std::int32_t key = static_cast<std::int32_t>(m);
                     for (auto& e : into) {
                         if (options.placement_dedup > 0) {
@@ -999,11 +1027,12 @@ HaplotypeResult genotype_haplotype_pairs(
                                 e.ll = std::max(e.ll, v); return;
                             }
                         } else if (e.start == static_cast<std::int32_t>(st) &&
-                                   e.end == static_cast<std::int32_t>(en)) {
+                                   e.end == static_cast<std::int32_t>(en) && e.fwd == fwd) {
                             e.ll = std::max(e.ll, v); return;
                         }
                     }
-                    into.push_back({key, static_cast<std::int32_t>(st), static_cast<std::int32_t>(en), v});
+                    into.push_back({key, static_cast<std::int32_t>(st),
+                                    static_cast<std::int32_t>(en), fwd, v});
                 };
                 if (!a1.empty() && !a2.empty()) {
                     for (const Placed& x : a1) {
@@ -1017,13 +1046,13 @@ HaplotypeResult genotype_haplotype_pairs(
                             if (options.use_insert_size) {
                                 v += insert_ll(static_cast<double>(rv.end - fw.start + 1), ins_prior);
                             }
-                            add((fw.start + rv.end) / 2, fw.start, rv.end, v);
+                            add((fw.start + rv.end) / 2, fw.start, rv.end, x.fwd, v);
                         }
                     }
                 } else {
-                    for (const Placed& x : a1) add((x.start + x.end) / 2, x.start, x.end,
+                    for (const Placed& x : a1) add((x.start + x.end) / 2, x.start, x.end, x.fwd,
                                                    read_ll(x.edits, F.r1.size()) + miss2);
-                    for (const Placed& y : a2) add((y.start + y.end) / 2, y.start, y.end,
+                    for (const Placed& y : a2) add((y.start + y.end) / 2, y.start, y.end, y.fwd,
                                                    miss1 + read_ll(y.edits, F.r2.size()));
                 }
             }
