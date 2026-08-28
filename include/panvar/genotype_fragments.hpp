@@ -180,7 +180,19 @@ struct HaplotypeScoreOptions : FragmentScoreOptions {
     // anchoring depend on how many haplotypes were shortlisted, and it did -- at cyp2d6 NA18939 the
     // same reads gave the truth rank 2 at --max-haplotypes 48 and rank 1 at 96, purely because the
     // larger shortlist pushed more codes past a shared cap.
-    std::size_t max_anchor_occ = 8;
+    // 64, changed from 8 on measurement. Inside a tandem array a cap of 8 discards most of the
+    // array's own syncmers, so its fragments never anchor and the array contributes nothing to the
+    // score. Swept at 8/16/32/64/128:
+    //
+    //   lpa  HG01106  61,305 -> 5,608 excess    (91% of the error was this parameter)
+    //   lpa  HG02572  55,515 -> 11,008          (80%)
+    //   cyp2d6, four donors: unchanged or one edit better, and 4-5 s either way
+    //
+    // Saturates by 64 at both loci and costs 7 s -> 12 s at lpa, nothing at cyp2d6. This is still a
+    // blunt instrument -- the better policy keeps repetitive anchors and weights them by inverse
+    // occurrence, seeding each fragment from its rarest syncmers -- but the default should not be a
+    // value measured to throw away most of an array.
+    std::size_t max_anchor_occ = 64;
     std::size_t anchor_slack = 40;     // bases of window either side of an anchored read start
     // Haplotype pairs to report the likelihood's opinion of, by name. Probing costs nothing: the
     // pair scores already exist.
