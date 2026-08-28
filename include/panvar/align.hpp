@@ -39,4 +39,15 @@ struct NwAlign {
 // residual (edits) is split into sub-threshold vs >= threshold contiguous blocks.
 NwAlign nw_edit_distance(const std::string& a, const std::string& b, std::size_t min_event_bp = 0);
 
+// Global edit distance with an edit budget. `ok` is false when the true distance exceeds `band`, in
+// which case `edits` is meaningless -- the caller must widen the band or fall back to the unbanded
+// form. Exact whenever it reports ok: edlib's k-limited NW returns the true distance or nothing.
+// Exists because an unbanded global alignment of two 200 kb haplotypes does not finish in useful
+// time, while the distances it is used on are tens to a few thousand edits.
+struct NwBanded {
+    bool ok = false;
+    std::size_t edits = 0;
+};
+NwBanded nw_edit_distance_banded(const std::string& a, const std::string& b, std::size_t band);
+
 } // namespace panvar

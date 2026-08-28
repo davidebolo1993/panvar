@@ -321,6 +321,23 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         const std::string a = slurp(exact_distance[0]);
         const std::string b = slurp(exact_distance[1]);
         if (a.empty() || b.empty()) { std::cout << (a.size() + b.size()) << '\n'; return 0; }
+        // Progressive banding. An unbanded global alignment of two 200 kb haplotypes is quadratic in
+        // practice and does not finish in useful time, but the distances this is used on are small --
+        // a panel floor is tens to a few thousand edits over 200 kb. edlib returns the EXACT distance
+        // whenever it is within the band, so doubling from a small band is exact and fast in the
+        // common case and only falls back to the full computation when the sequences really are far
+        // apart. The band actually used is reported on stderr so a number can never be mistaken for
+        // an unbanded one.
+        for (const std::size_t band : {std::size_t{1024}, std::size_t{4096}, std::size_t{16384},
+                                      std::size_t{65536}, std::size_t{262144}}) {
+            const NwBanded r = nw_edit_distance_banded(a, b, band);
+            if (r.ok) {
+                std::fprintf(stderr, "band %zu sufficed\n", band);
+                std::cout << r.edits << '\n';
+                return 0;
+            }
+        }
+        std::fprintf(stderr, "no band sufficed; computing unbanded\n");
         std::cout << nw_edit_distance(a, b).edits << '\n';
         return 0;
     }

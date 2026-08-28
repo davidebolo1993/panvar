@@ -35,10 +35,19 @@ for ((p=0; p<DONORS_N && p<ND; p++)); do
   rm -rf "$OUT/fa"; "$PY" "$REPO/scripts/spell_paths.py" -i "$G" -o "$OUT/fa" --paths "$H1,$H2" >/dev/null
   T1=$(ls "$OUT"/fa/*.fa | head -1); T2=$(ls "$OUT"/fa/*.fa | tail -1)
   cat $(ls "$OUT"/panel_all/*.fa | grep -v "$DONOR") > "$OUT/panel_loo.fa"
-  line=$(EXACT_BINARY="$BIN" EXACT_TOPK="$TOPK" EXACT_TMP="$OUT" \
-         "$PY" "$REPO/scripts/genotype_panel_floor.py" "$T1" "$T2" "$OUT/panel_loo.fa" "$DONOR")
-  nf=$(awk -F'\t' '{print NF}' <<<"$line")
-  if [[ "$nf" -lt 11 ]]; then echo "  $DONOR: exact mode produced no result" >&2; continue; fi
+  # Written to a file and rc checked explicitly rather than captured in $(...): under `set -e` a
+  # command substitution that fails takes the whole run down before the failure can be reported, and
+  # a partially-written line is indistinguishable from a short one.
+  rc=0
+  EXACT_BINARY="$BIN" EXACT_TOPK="$TOPK" EXACT_TMP="$OUT" \
+    "$PY" "$REPO/scripts/genotype_panel_floor.py" "$T1" "$T2" "$OUT/panel_loo.fa" "$DONOR" \
+    > "$OUT/line.txt" 2>>"$OUT/provenance.txt" || rc=$?
+  if [[ $rc -ne 0 || ! -s "$OUT/line.txt" ]]; then
+    echo "  $DONOR: exact floor failed (rc=$rc)" >&2; continue
+  fi
+  line=$(cat "$OUT/line.txt")
+  nf=$(awk -F'\t' 'NR==1{print NF}' "$OUT/line.txt")
+  if [[ "${nf:-0}" -lt 11 ]]; then echo "  $DONOR: exact mode produced no result" >&2; continue; fi
   printf '%s\t%s\n' "$LOCUS" "$line" >> "$RES"
   awk -F'\t' -v D="$DONOR" '{printf "  %-10s approx=%-8s exact=%-8s  diff=%+d   (per hap approx %s/%s exact %s/%s)\n",
       D,$2,$3,$3-$2,$4,$5,$6,$7}' <<<"$line"
