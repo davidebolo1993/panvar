@@ -228,6 +228,65 @@ dup=$("$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/dup" -R "$OUT/
   && ok "a third read under one fragment name is reported, not silently dropped" \
   || bad "a duplicate read name produced no warning; fragment counts could be wrong with no trace"
 
+# ============================================================ joint depth: the duplication fixture
+# The decisive case for one-fragment-one-placement. A haplotype carrying a segment TWICE, against one
+# carrying it once, with reads generated from the single-copy sample. Every read from that segment has
+# two valid placements on the two-copy candidate.
+#
+#   best-placement scoring pins all of them to one arbitrary copy, leaves the other falsely empty, and
+#   then charges the candidate for absence its own heuristic invented;
+#   complete assignment distributes them across both copies without counting any read twice.
+#
+# The assertion is not that the two-copy candidate loses -- it should, the sample has one copy -- but
+# that the model refuses to run without an external depth rate, that the invariant holds, and that the
+# answer does not depend on thread count.
+D=$(seq_of 700 41)      # the duplicated segment
+U=$(seq_of 500 42)      # unique spacer
+{ printf 'H\tVN:Z:1.0\n'
+  printf 'S\t1\t%s\n' "$L"; printf 'S\t2\t%s\n' "$D"; printf 'S\t3\t%s\n' "$U"
+  printf 'S\t4\t%s\n' "$D"; printf 'S\t5\t%s\n' "$N"
+  printf 'L\t1\t+\t2\t+\t0M\nL\t2\t+\t3\t+\t0M\nL\t3\t+\t4\t+\t0M\nL\t4\t+\t5\t+\t0M\n'
+  printf 'L\t3\t+\t5\t+\t0M\n'
+  printf 'P\tref\t1+,2+,3+,5+\t*\n'
+  for i in 1 2 3; do printf 'P\tone%d\t1+,2+,3+,5+\t*\n' "$i"; done
+  for i in 1 2 3; do printf 'P\ttwo%d\t1+,2+,3+,4+,5+\t*\n' "$i"; done
+} > "$OUT/dup.gfa"
+"$BIN" bubble -i "$OUT/dup.gfa" -r ref -o "$OUT/dupbub" --min-variant-bp 0 -q >/dev/null 2>&1
+DH="${L}${D}${U}${N}"
+emit_pairs "$DH" dupA 25 >  "$OUT/dupreads.fa"
+emit_pairs "$DH" dupB 25 >> "$OUT/dupreads.fa"
+
+if "$BIN" genotype-frag -i "$OUT/dup.gfa" -b "$OUT/dupbub" -o "$OUT/dupj" -R "$OUT/dupreads.fa" \
+     --haplotype-mode --joint-depth -q >/dev/null 2>&1; then
+  bad "--joint-depth ran without --haploid-depth; the rate must come from outside the candidate set"
+else
+  ok "--joint-depth refuses to run without an externally supplied --haploid-depth"
+fi
+
+jrun() { "$BIN" genotype-frag -i "$OUT/dup.gfa" -b "$OUT/dupbub" -o "$1" -R "$OUT/dupreads.fa" \
+           --haplotype-mode --joint-depth --haploid-depth 0.05 --joint-top-pairs 0 \
+           --fragment-len 350 --fragment-sd 50 "${@:2}" -q 2>&1; }
+if jerr=$(jrun "$OUT/dj1" -t 1) && [ -s "$OUT/dj1.hap_pairs.tsv" ]; then
+  ok "joint depth completes on the duplication fixture (window/assignment invariant held)"
+  jrun "$OUT/dj4" -t 4 >/dev/null 2>&1
+  if cmp -s "$OUT/dj1.hap_blocks.tsv" "$OUT/dj4.hap_blocks.tsv"; then
+    ok "joint depth is identical at -t 1 and -t 4"
+  else bad "joint depth differs across thread counts"; fi
+  # The single-copy sample must not be called as the two-copy haplotype. NOTE, measured: alignment
+  # alone already gets this right on this fixture, so this assertion does not by itself demonstrate
+  # the assignment mechanism -- it guards against the joint model BREAKING a case alignment handles.
+  # What the fixture does test of the mechanism is the invariant above: with every read having two
+  # valid placements on the two-copy candidate, window counts still sum to exactly the number of
+  # assigned fragments, so no read was counted twice.
+  top=$(sed -n 2p "$OUT/dj1.hap_pairs.tsv" | cut -f2,3)
+  case "$top" in
+    *two*) bad "a one-copy sample was called as the two-copy haplotype: $top" ;;
+    *) ok "a one-copy sample is not called as the two-copy haplotype" ;;
+  esac
+else
+  bad "joint depth failed on the duplication fixture: $jerr"
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then echo "genotype-frag stats: all assertions passed"; else
   echo "genotype-frag stats: $fails assertion(s) failed"; fi

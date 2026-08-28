@@ -586,6 +586,13 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         return 0;
     }
 
+    if (hap_mode && hopt.joint_depth && hopt.haploid_depth <= 0.0) {
+        throw std::runtime_error(
+            "genotype-frag: --joint-depth requires --haploid-depth. The depth rate must come from "
+            "outside the candidate set -- invariant flanks, or genome-wide depth, or a known "
+            "simulation rate. Fitting it from the alignment-best pair lets the expectation follow "
+            "the hypothesis it is meant to test, and that is what the first implementation did");
+    }
     if (hap_mode) {
         // Summing over placements without dividing by the number of positions a haplotype offers
         // rewards a repetitive haplotype for offering more places to land. The two go together.
