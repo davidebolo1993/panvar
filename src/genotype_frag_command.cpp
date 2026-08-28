@@ -351,6 +351,33 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else throw std::runtime_error("genotype-frag: unknown option " + a);
     }
 
+    // Flag-consistency checks run HERE, before any early-exit mode (--reference-score,
+    // --exact-distance, --mosaic-floor ...) returns. Placed after them, as they first were, an
+    // inconsistent combination was accepted silently in exactly the modes used for oracle
+    // comparison -- where a silent mismatch does the most damage.
+    if (hopt.mate_rescue && !hopt.hamming_emission) {
+        // The rescue matches the unanchored mate at fixed positions by Hamming distance, because the
+        // interval it searches is defined by coordinates. The default emission is banded local
+        // alignment, which can slide. Allowing both at once would silently mix two emission models
+        // within a single fragment -- one mate scored by alignment, its partner by Hamming.
+        throw std::runtime_error(
+            "genotype-frag: --mate-rescue currently requires --hamming-emission. The rescued mate is "
+            "scored at fixed positions by Hamming distance, so combining it with the banded "
+            "local-alignment emission would mix two emission models inside one fragment. A "
+            "fixed-start edit likelihood for the normal emission would lift this restriction");
+    }
+    if (hopt.multiplicity_aware && !hopt.joint_marginal) {
+        // Grouping by likelihood is exact only where POSITION is irrelevant, which is the global
+        // marginal scorer. In the windowed or hard-assignment models, equal-likelihood placements in
+        // different windows cannot share one representative coordinate, and collapsing them would
+        // move coverage between windows.
+        throw std::runtime_error(
+            "genotype-frag: --multiplicity-aware requires --joint-marginal. Grouping placements by "
+            "likelihood is exact only for the global marginal model, where a placement's position "
+            "does not enter the score; under the windowed model equal-likelihood placements in "
+            "different windows are not interchangeable");
+    }
+
     if (!reference_pair.empty()) {
         if (read_paths.empty()) throw std::runtime_error("genotype-frag: --reference-score needs --reads");
         const auto slurp_fa = [](const std::string& path) {
@@ -666,17 +693,6 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         return 0;
     }
 
-    if (hopt.multiplicity_aware && !hopt.joint_marginal) {
-        // Grouping by likelihood is exact only where POSITION is irrelevant, which is the global
-        // marginal scorer. In the windowed or hard-assignment models, equal-likelihood placements in
-        // different windows cannot share one representative coordinate, and collapsing them would
-        // move coverage between windows.
-        throw std::runtime_error(
-            "genotype-frag: --multiplicity-aware requires --joint-marginal. Grouping placements by "
-            "likelihood is exact only for the global marginal model, where a placement's position "
-            "does not enter the score; under the windowed model equal-likelihood placements in "
-            "different windows are not interchangeable");
-    }
     if (hopt.multiplicity_aware && !(hopt.mass_tolerance > 0.0 && hopt.mass_tolerance < 1.0)) {
         throw std::runtime_error("genotype-frag: --mass-tolerance must lie strictly between 0 and 1");
     }

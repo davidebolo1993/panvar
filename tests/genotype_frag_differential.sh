@@ -55,9 +55,14 @@ Y1=$(seq_of 300 21); Y2=$(seq_of 300 22)
 S_hA="${L}${X1}${M}${Y1}${N}"; S_hB="${L}${X2}${M}${Y2}${N}"
 S_hC="${L}${X3}${M}${Y1}${N}"; S_hD="${L}${X1}${M}${Y2}${N}"
 S_hE="${L}${X2}${M}${Y1}${N}"; S_hF="${L}${X3}${M}${Y2}${N}"
+# ref is a CANDIDATE like any other -- path 1+,5+,6+,7+,9+ -- and the shortlist scores it. It had no
+# FASTA, so the reference loop produced seven empty scores that silently dropped out of the
+# comparison and reappeared as seven "extra" accelerated pairs.
+S_ref="${L}${X4}${M}${Y1}${N}"
 seq_for() { case "$1" in hA) printf '%s' "$S_hA";; hB) printf '%s' "$S_hB";; hC) printf '%s' "$S_hC";;
-                        hD) printf '%s' "$S_hD";; hE) printf '%s' "$S_hE";; hF) printf '%s' "$S_hF";; esac; }
-for h in hA hB hC hD hE hF; do printf '>%s\n%s\n' "$h" "$(seq_for "$h")" > "$OUT/$h.fa"; done
+                        hD) printf '%s' "$S_hD";; hE) printf '%s' "$S_hE";; hF) printf '%s' "$S_hF";;
+                        ref) printf '%s' "$S_ref";; esac; }
+for h in hA hB hC hD hE hF ref; do printf '>%s\n%s\n' "$h" "$(seq_for "$h")" > "$OUT/$h.fa"; done
 
 # a diploid sample: hA / hB
 emit_pairs() { awk -v s="$1" -v tag="$2" -v step="$3" -v off="${4:-0}" 'BEGIN{
@@ -91,10 +96,15 @@ ok "fixture self-check: all 7 haplotypes spell $WANT bp and reach the shortlist"
 
 P="--haploid-depth 0.05 --fragment-len 350 --fragment-sd 50 --error-rate 0.01"
 
-# reference: every unordered pair
+# reference: every unordered pair, over the haplotypes THE SHORTLIST ACTUALLY CONTAINS rather than a
+# hardcoded list. Hardcoded, the enumeration silently stopped covering the shortlist the moment a
+# scoring change altered which haplotypes reach it: the key-set assertion then reported 7 "extra"
+# accelerated pairs that were really 7 reference pairs never computed. Deriving the list keeps the
+# two sides comparing the same candidates by construction.
+HAPS=$(awk -F'\t' 'NR>1{print $1}' "$OUT/chk.hap_scores.tsv" | sort -u)
 : > "$OUT/ref.tsv"
-for i in hA hB hC hD hE hF; do
-  for j in hA hB hC hD hE hF; do
+for i in $HAPS; do
+  for j in $HAPS; do
     [[ "$i" > "$j" ]] && continue
     v=$("$BIN" genotype-frag --reference-score "$OUT/$i.fa" "$OUT/$j.fa" -R "$OUT/reads.fa" $P 2>/dev/null)
     printf '%s/%s\t%s\n' "$i" "$j" "$v" >> "$OUT/ref.tsv"

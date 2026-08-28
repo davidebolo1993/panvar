@@ -157,7 +157,11 @@ def load(p):
     for l in open(p):
         if l.startswith("# pair"): hdr = l.strip()
         if l.startswith("#") or l.startswith("fragment"): continue
-        k, v = l.rstrip("\n").split("\t"); d[k] = float(v)
+        # first two fields only: the dump grew a mates_seeded and a contrib column, and unpacking
+        # into exactly two names turned that into a crash rather than a reading.
+        f = l.rstrip("\n").split("\t")
+        if len(f) < 2: continue
+        d[f[0]] = float(f[1])
     return d, hdr
 rm, _ = load(refmass); fm, hdr = load(fastmass)
 # The accelerated dump must describe the SAME pair as the reference dump.

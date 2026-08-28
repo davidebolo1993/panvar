@@ -174,6 +174,49 @@ PYEOF
 [ $? -eq 0 ] && ok "unexplained fragments cost the derived bound, not the emission they would earn" \
              || bad "background cost does not match the derived bound"
 
+# ------------------------------------------------- the emission convention, with REAL mismatches
+# Every other fixture here is error-free, and an error-free fixture cannot detect a wrong per-mismatch
+# constant: with zero edits, log(eps) and log(eps/3) give the same score. Measured consequence of that
+# blind spot: the reference and the accelerated scorer disagreed on this constant for a whole round of
+# experiments, the reconciliation still closed -- it sums each model's own contributions -- and a
+# rescue result was reported from a comparison of two different likelihoods.
+#
+# One read placed at a known position with a known number of mismatches. Its contribution is derivable:
+#   log[(1-eta)*lambda*(1/2)*pi(L)*eps3^m*(1-eps)^(n-m) + eta*Pbg]   summed over the placements it has.
+# Asserting the SIGN of the per-mismatch slope is enough to pin the constant: adding one mismatch must
+# cost log((1-eps)/eps3) = log(0.99/0.003333) = 5.69 nats, not log(0.99/0.01) = 4.60.
+"$PY" - "$OUT" <<'PYEOF'
+import sys, os, random
+out = sys.argv[1]
+random.seed(3)
+core = "".join(random.choice("ACGT") for _ in range(1200))
+open(os.path.join(out, "mm_hap.fa"), "w").write(">h\n" + core + "\n")
+def rc(s): return s.translate(str.maketrans("ACGT","TGCA"))[::-1]
+def sub(c): return random.choice([b for b in "ACGT" if b != c])
+# the SAME fragment, placed identically, differing only in how many bases mismatch
+for m in (0, 1):
+    st, ins, rl = 300, 350, 120
+    r1 = list(core[st:st+rl]); r2 = rc(core[st+ins-rl:st+ins])
+    for i in range(m):
+        r1[10+i] = sub(r1[10+i])
+    open(os.path.join(out, "mm%d.fa" % m), "w").write(
+        ">f/1\n" + "".join(r1) + "\n>f/2\n" + r2 + "\n")
+PYEOF
+S0=$(score "$OUT/mm_hap.fa" "$OUT/mm_hap.fa" "$OUT/mm0.fa")
+S1=$(score "$OUT/mm_hap.fa" "$OUT/mm_hap.fa" "$OUT/mm1.fa")
+"$PY" - "$S0" "$S1" <<'PYEOF'
+import sys, math
+s0, s1 = float(sys.argv[1]), float(sys.argv[2])
+eps = 0.01
+cost = s0 - s1
+want_third = math.log((1-eps) / (eps/3))   # 5.69 -- a specific mismatching base
+want_plain = math.log((1-eps) / eps)       # 4.60 -- "some substitution", the wrong convention
+print(f"  .... one mismatch costs {cost:.3f} nats; eps/3 predicts {want_third:.3f}, eps predicts {want_plain:.3f}")
+sys.exit(0 if abs(cost - want_third) < 0.15 else 1)
+PYEOF
+[ $? -eq 0 ] && ok "a mismatch costs log((1-eps)/(eps/3)), the specific-base convention" \
+             || bad "the per-mismatch constant does not match the eps/3 convention"
+
 echo
 if [ "$fails" -eq 0 ]; then echo "reference scorer: all assertions passed"; else
   echo "reference scorer: $fails assertion(s) failed"; fi

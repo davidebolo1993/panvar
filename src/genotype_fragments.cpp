@@ -366,7 +366,8 @@ std::vector<BlockFragmentResult> genotype_fragments(
             bg_ref += consensus.substr(cons_off[bi] + cons_len[bi]);
         }
 
-        const double log_eps = std::log(options.error_rate);
+        // Same convention as the haplotype scorer and the reference: a specific mismatch is eps/3.
+        const double log_eps = std::log(options.error_rate / 3.0);
         const double log_1meps = std::log1p(-options.error_rate);
         const double log_mix = std::log1p(-options.outlier_mix);
         const double log_out = std::log(options.outlier_mix);
@@ -808,7 +809,6 @@ HaplotypeResult genotype_haplotype_pairs(
         }
     }
 
-    const double log_eps = std::log(options.error_rate);
     const double log_1meps = std::log1p(-options.error_rate);
     // CONVENTION: `error_rate` is the total substitution probability at a base, so a SPECIFIC
     // observed mismatch has probability error_rate/3 -- which is what the simulator draws, choosing
@@ -2119,7 +2119,12 @@ double reference_pair_loglik(const std::string& hap_a, const std::string& hap_b,
                              const ReferenceParams& params,
                              std::vector<double>* fragment_mass,
                              std::vector<double>* fragment_contrib) {
-    const double log_eps = std::log(params.error_rate);
+    // error_rate is the TOTAL substitution probability; a SPECIFIC observed mismatch has
+    // probability error_rate/3, which is what the simulator draws. Must match the accelerated
+    // scorer exactly or the two compute different likelihoods and no differential between them
+    // is meaningful -- the per-fragment reconciliation would still close, because it sums each
+    // model's own contributions.
+    const double log_eps = std::log(params.error_rate / 3.0);
     const double log_1meps = std::log1p(-params.error_rate);
 
     // One prior, shared by the event term and the exposure. Its lower bound is the longest fragment
