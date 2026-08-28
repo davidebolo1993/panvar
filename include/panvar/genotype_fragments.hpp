@@ -277,6 +277,28 @@ struct HaplotypeScoreOptions : FragmentScoreOptions {
     // copies can share a midpoint and were being collapsed by max, so a mass loss attributed to
     // syncmer recruitment may have been this instead. It gets its own rung.
     std::size_t placement_dedup = 16;
+    // MULTIPLICITY-PRESERVING COMPRESSION, replacing the two fixed pruning heuristics.
+    //
+    // Measured: on a 10-copy array `--max-anchor-occ 8` retains 4% of the placement mass and
+    // `--placement-topk 2` retains 7%, and each flips the call. Both discard evidence to bound work.
+    // Raising them instead trades correctness for unbounded runtime, which is not a fix.
+    //
+    // The compression is exact where it matters: inside a perfect repeat every copy yields the SAME
+    // likelihood, so N identical placements are one group carrying log P + log(N). An array costs one
+    // group rather than N placements, and nothing is thrown away.
+    //
+    // Pruning is then by RETAINED MASS rather than by count: groups are dropped only while the
+    // omitted probability mass stays under `mass_tolerance`. If that cannot be met the run says so
+    // instead of silently keeping two placements.
+    // STATUS: promising, NOT yet validated as exact. On the 10-copy fixture it recovers the correct
+    // winner and 100% of the placement mass where the cap retains 4% and top-k 7%, but it leaves a
+    // 0.19-nat residual against the exact reference that rung 1 (the same recruitment WITHOUT
+    // grouping) does not have. That residual is invariant to --mass-tolerance from 1e-2 to 1e-12, to
+    // --placement-bin and to --placement-dedup, so it is the grouping itself and not the pruning.
+    // Its source is unidentified. Do not adopt this as a default, and do not run the synthetic grid
+    // or any donor against it, until the residual is explained.
+    bool multiplicity_aware = false;
+    double mass_tolerance = 1e-3;
     // How a haplotype-pair posterior becomes a per-block allele pair.
     //
     //   map      take the best pair's alleles. The answer is then a real pair some haplotype pair

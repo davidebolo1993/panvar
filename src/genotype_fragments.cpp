@@ -675,10 +675,20 @@ void verify_block_spelling(const Graph& graph,
     const auto by_name = path_records_by_name(graph);
     for (const std::string& name : haplotype_names) {
         const auto it = by_name.find(name);
-        if (it == by_name.end() || it->second == nullptr) continue;
+        if (it == by_name.end() || it->second == nullptr) {
+            // Skipping this would exempt exactly the paths least likely to be trustworthy.
+            throw std::runtime_error(
+                "genotype-frag: path '" + name + "' is scored as a panel haplotype but has no record "
+                "in the graph, so its block spelling cannot be verified against anything");
+        }
         bool complete = false;
         const std::string raw = spell_path_steps_sequence(graph, it->second->steps, &complete);
-        if (!complete) continue;                    // a path the graph cannot spell is not our claim
+        if (!complete) {
+            throw std::runtime_error(
+                "genotype-frag: the graph cannot fully spell path '" + name + "' (a step has no "
+                "sequence), so whole-haplotype mode would score a haplotype it cannot verify. "
+                "Previously this path was silently skipped by the round-trip check");
+        }
         const HaplotypeSeq built = spell_haplotype(blocks, name);
         if (built.seq == raw) continue;
         std::size_t at = 0;
@@ -829,7 +839,7 @@ HaplotypeResult genotype_haplotype_pairs(
     // fragment x every placement.
     // Orientation is part of the state. Two strands with identical coordinates are DIFFERENT states
     // under the contract and must not be merged when exact states are being retained.
-    struct PlacementRec { std::int32_t mid, start, end; bool fwd; double ll; };
+    struct PlacementRec { std::int32_t mid, start, end; bool fwd; double ll; double log_mult = 0.0; };
     std::vector<std::vector<PlacementRec>> placements(
         options.joint_depth ? fragments.size() * nh : 0);
 
@@ -1055,6 +1065,43 @@ HaplotypeResult genotype_haplotype_pairs(
                     for (const Placed& y : a2) add((y.start + y.end) / 2, y.start, y.end, y.fwd,
                                                    miss1 + read_ll(y.edits, F.r2.size()));
                 }
+            }
+        }
+        if (options.multiplicity_aware) {
+            for (std::size_t hi = 0; hi < nh; ++hi) {
+                auto& v = placements[fi * nh + hi];
+                if (v.size() < 2) continue;
+                // Group placements of EQUAL likelihood -- which is what every copy of a perfect
+                // repeat produces -- into one carrying log P + log(multiplicity). Exact, and it turns
+                // an N-copy array from N placements into one.
+                std::sort(v.begin(), v.end(),
+                          [](const PlacementRec& a, const PlacementRec& b) { return a.ll > b.ll; });
+                std::vector<PlacementRec> grouped;
+                for (const PlacementRec& p : v) {
+                    if (!grouped.empty() && std::abs(grouped.back().ll - p.ll) < 1e-9) {
+                        grouped.back().log_mult = log_add(grouped.back().log_mult, 0.0);
+                        continue;
+                    }
+                    grouped.push_back(p);
+                }
+                // Prune by omitted MASS, not by count: drop the tail only while what it carries stays
+                // under the tolerance.
+                double total = kNegInf;
+                for (const PlacementRec& p : grouped) total = log_add(total, p.ll + p.log_mult);
+                if (total != kNegInf) {
+                    const double keep_floor = total + std::log(options.mass_tolerance);
+                    double dropped = kNegInf;
+                    std::size_t keep = grouped.size();
+                    while (keep > 1) {
+                        const PlacementRec& last = grouped[keep - 1];
+                        const double next = log_add(dropped, last.ll + last.log_mult);
+                        if (next > keep_floor) break;
+                        dropped = next;
+                        --keep;
+                    }
+                    grouped.resize(keep);
+                }
+                v.swap(grouped);
             }
         }
         for (std::size_t hi = 0; hi < nh; ++hi) {
@@ -1304,7 +1351,7 @@ HaplotypeResult genotype_haplotype_pairs(
                 auto& o = opts[fi];
                 const auto gather = [&](std::size_t h, std::uint8_t side, std::size_t nw) {
                     for (const auto& pr : placements[fi * nh + h]) {
-                        const std::int32_t mid = pr.mid; const double v = pr.ll;
+                        const std::int32_t mid = pr.mid; const double v = pr.ll + pr.log_mult;
                         if (mid < 0) continue;
                         const std::size_t w = static_cast<std::size_t>(mid) / W;
                         if (w >= nw) continue;
@@ -1489,9 +1536,9 @@ HaplotypeResult genotype_haplotype_pairs(
                 mf << "fragment\tlog_mass\n";
                 for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
                     double lse = kNegInf;
-                    for (const auto& pr : placements[fi * nh + a]) lse = log_add(lse, pr.ll);
+                    for (const auto& pr : placements[fi * nh + a]) lse = log_add(lse, pr.ll + pr.log_mult);
                     if (!homoz) {
-                        for (const auto& pr : placements[fi * nh + b]) lse = log_add(lse, pr.ll);
+                        for (const auto& pr : placements[fi * nh + b]) lse = log_add(lse, pr.ll + pr.log_mult);
                     } else if (lse != kNegInf) {
                         lse += std::log(2.0);
                     }

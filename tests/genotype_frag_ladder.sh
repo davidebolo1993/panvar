@@ -184,6 +184,9 @@ rung "5 + placement top-k (2)"                 r5 --rung-zero --placement-dedup 
 # for a reason that has nothing to do with top-k. Measured separately, without the cap.
 rung "  top-k (2) alone, no anchor cap"        r6 --rung-zero --placement-dedup 16 --placement-bin 64 --placement-topk 2
 rung "  anchor cap (8) alone, no top-k"        r7 --rung-zero --placement-dedup 16 --placement-bin 64 --max-anchor-occ 8
+# The proposed replacement: no anchor discarded for being frequent, no top-k, equal-likelihood
+# placements grouped with their multiplicity, and pruning by omitted MASS instead of by count.
+rung "  multiplicity-aware compression"        r8 --joint-marginal --multiplicity-aware --placement-bin 64 --placement-dedup 0
 echo
 echo "  A rung is decision-safe only while its score error is smaller than the reference winner's"
 echo "  margin. Midpoint deduplication is now its own rung: it was previously hard-coded inside what"
