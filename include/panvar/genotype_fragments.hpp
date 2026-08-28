@@ -491,8 +491,10 @@ struct PlacementCompleteness {
     // needs. Counted separately from recall because raising placement_topk trades one against the
     // other, and a single "completeness" number hides which is moving.
     std::uint64_t spurious_placements = 0;
-    // What --mass-tolerance actually omitted, measured. A declared bound that is never checked is a
-    // promise, not a guarantee.
+    // What --mass-tolerance omitted from the placements RECRUITMENT FOUND. It is not placement
+    // completeness: states recruitment never generated are not in the denominator, and measured on
+    // stochastic reads that omission is far larger. Naming this "omitted mass" without the
+    // qualification invites reading "bound met" as "nothing was lost".
     double omitted_mass_max = 0.0;
     double omitted_mass_mean = 0.0;
     // COST, so that "correct" and "tractable" are separate claims. The compression is DOWNSTREAM:

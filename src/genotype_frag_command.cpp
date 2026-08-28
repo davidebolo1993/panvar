@@ -765,9 +765,12 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             if (hopt.multiplicity_aware) {
                 char buf[160];
                 std::snprintf(buf, sizeof(buf),
-                              "placement mass omitted by --mass-tolerance %.1e: max %.3e, mean %.3e "
-                              "per fragment-haplotype (bound %s)",
-                              hopt.mass_tolerance, c.omitted_mass_max, c.omitted_mass_mean,
+                              "POST-RECRUITMENT pruning omitted: max %.3e, mean %.3e per "
+                              "fragment-haplotype against --mass-tolerance %.1e (bound %s). This is "
+                              "mass discarded from what recruitment FOUND -- it says nothing about "
+                              "states recruitment never generated, which is a separate and currently "
+                              "larger loss",
+                              c.omitted_mass_max, c.omitted_mass_mean, hopt.mass_tolerance,
                               c.omitted_mass_max <= hopt.mass_tolerance ? "met" : "NOT MET");
                 log.info(buf);
             }
