@@ -372,16 +372,17 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         rp.fragment_len = hopt.fragment_len;
         rp.fragment_sd = hopt.fragment_sd;
         rp.bg_divergence = hopt.bg_divergence;
-        std::vector<double> mass;
+        std::vector<double> mass, contrib;
         const double v = reference_pair_loglik(slurp_fa(reference_pair[0]), slurp_fa(reference_pair[1]),
                                                frags, rp,
-                                               hopt.dump_fragment_mass.empty() ? nullptr : &mass);
+                                               hopt.dump_fragment_mass.empty() ? nullptr : &mass,
+                                               hopt.dump_fragment_mass.empty() ? nullptr : &contrib);
         if (!hopt.dump_fragment_mass.empty()) {
             std::ofstream mf(hopt.dump_fragment_mass);
             if (!mf) throw std::runtime_error("genotype-frag: cannot write " + hopt.dump_fragment_mass);
-            mf << "# reference\n" << "fragment\tlog_mass\tmates_seeded\n";
+            mf << "# reference\n" << "fragment\tlog_mass\tmates_seeded\tcontrib\n";
             for (std::size_t i = 0; i < mass.size() && i < frags.size(); ++i) {
-                mf << frags[i].name << '\t' << mass[i] << "\tNA\n";
+                mf << frags[i].name << '\t' << mass[i] << "\tNA\t" << contrib[i] << '\n';
             }
         }
         std::printf("%.6f\n", v);

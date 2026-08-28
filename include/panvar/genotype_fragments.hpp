@@ -693,7 +693,12 @@ double reference_pair_loglik(
     const ReferenceParams& params,
     // Optional: per-fragment log SUM_p P(f|p) over both homologues, in fragment order. This is the
     // exact placement mass the accelerated recruiter is trying to retain.
-    std::vector<double>* fragment_mass = nullptr);
+    std::vector<double>* fragment_mass = nullptr,
+    // The full per-fragment likelihood term, log[(1-eta)*lambda*e^m + eta*P_bg]. Needed so the
+    // decomposition reconciles: at a fixed pair the exposure cancels, so per-fragment deltas must sum
+    // exactly to the whole-pair difference. Placement mass alone cannot do that -- a fragment with no
+    // placement has mass -inf while its real contribution is the finite background term.
+    std::vector<double>* fragment_contrib = nullptr);
 
 void write_fragment_results(
     const std::string& out_prefix,

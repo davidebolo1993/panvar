@@ -71,7 +71,10 @@ mu, sd_i, rlen, eps, lam, disc = 150.0, 20.0, 60, 0.01, 0.05, 0.01
 # over-represents long inserts, which have fewer valid starts to occupy. It barely moves the U/R
 # differential, since all arms see the same reads, but it is the difference between a calibrated
 # stochastic fixture and a draw from the model -- and only the latter licenses calling R the truth.
-lo_i, hi_i = int(mu - 4*sd_i), int(mu + 4*sd_i)
+# lo is clamped to the shortest POSSIBLE fragment before normalisation, exactly as the scorer builds
+# it (min_len = |r1| + |r2|). Including shorter inserts in the prior and then discarding them after
+# sampling puts mass into the exposure and the Poisson intensity that no event can ever occupy.
+lo_i, hi_i = max(2*rlen, int(mu - 4*sd_i)), int(mu + 4*sd_i)
 span = hi_i - lo_i + 1
 pri = [ (1-disc)*math.exp(-0.5*((Lv-mu)/sd_i)**2)/(sd_i*math.sqrt(2*math.pi)) + disc/span
         for Lv in range(lo_i, hi_i+1) ]
@@ -132,8 +135,11 @@ PYEOF
     fi
   }
   t0=$(date +%s)
+  # ONE named pair throughout -- many/many -- for the dumps AND for the reported U-R. Dumping mass
+  # for many/many while evaluating U-R at G's own optimum compares different pairs, and they differ in
+  # exactly the cells that fail.
   run_arm U --dump-fragment-mass "$W/U.mass" --dump-mass-pair many,many || continue
-  run_arm G --multiplicity-aware --mass-tolerance "$MASS_BOUND" || continue
+  run_arm G --multiplicity-aware --mass-tolerance "$MASS_BOUND" --dump-fragment-mass "$W/G.mass" --dump-mass-pair many,many || continue
   "$BIN" genotype-frag --reference-score "$W/many.fa" "$W/many.fa" -R "$W/reads.fa" $P \
     --dump-fragment-mass "$W/R.mass" >/dev/null 2>&1
   t1=$(date +%s)
@@ -167,8 +173,11 @@ def score_of(tag, key):
         f = l.rstrip("\n").split("\t")
         if "/".join(sorted((f[1], f[2]))) == key: return float(f[3])
     return float("nan")
-u_at_g = score_of("U", gkey)
-refv = ref.get(gkey, float("nan"))
+PAIR = "many/many"
+u_at_g = score_of("U", PAIR)
+gval = score_of("G", PAIR)
+gkey = PAIR
+refv = ref.get(PAIR, float("nan"))
 # SIGNED. Exhaustive and recruited scoring share the same exposure, so recruitment can only REMOVE
 # event mass and U - R must be <= 0. A positive value would mean recruitment invented mass and is a
 # finding, not a rounding artefact -- taking the absolute value would have hidden it.
@@ -196,32 +205,48 @@ print(f"  {cn:<5} {rl:<7} {sd:<5} | {best:10.2f} {e_recruit:+9.2f} {e_group:8.3f
 PYEOF
   # Per-fragment decomposition of the deficit by seeding stratum. A fragment is the unit: one
   # anchored mate can rescue the other through the insert constraint.
-  "$PY" - "$W/R.mass" "$W/U.mass" <<'PYEOF'
-import sys, math, collections
+  # The decomposition is GATED on reconciling: at a fixed pair the exposure is common to both arms,
+  # so the per-fragment contribution deltas must sum EXACTLY to the whole-pair U - R. If they do not,
+  # the strata are describing something other than the reported number and must not be read.
+  RU=$(awk -F'\t' -v a=many -v b=many 'NR>1 && (($2==a&&$3==b)){print $4}' "$W/U.hap_pairs.tsv")
+  "$PY" - "$W/R.mass" "$W/U.mass" "${RU:-nan}" "$(awk -F'\t' '$1=="many/many"{print $2}' "$W/ref.tsv")" <<'PYEOF'
+import sys, collections
 def load(p):
     d={}
     for l in open(p):
         if l.startswith("#") or l.startswith("fragment"): continue
         f=l.rstrip("\n").split("\t")
-        d[f[0]]=(float(f[1]), f[2] if len(f)>2 else "NA")
+        # name -> (log_mass, mates_seeded, contrib)
+        d[f[0]]=(float(f[1]), f[2] if len(f)>2 else "NA", float(f[3]) if len(f)>3 else float("nan"))
     return d
-try: R, U = load(sys.argv[1]), load(sys.argv[2])
-except OSError: sys.exit()
+try:
+    R, U = load(sys.argv[1]), load(sys.argv[2])
+    u_whole, r_whole = float(sys.argv[3]), float(sys.argv[4])
+except (OSError, ValueError):
+    print("        reconciliation inputs missing"); sys.exit()
 strata=collections.defaultdict(lambda: [0, 0.0])
-for k,(rv,_) in R.items():
+tot_delta = 0.0
+for k,(rv, _, rc) in R.items():
     if k not in U: continue
-    uv, seeded = U[k]
-    if rv <= -1e300: continue
-    st = seeded
-    strata[st][0] += 1
-    strata[st][1] += (uv - rv) if uv > -1e300 else 0.0
-tot = sum(v[1] for v in strata.values())
+    uv, seeded, uc = U[k]
+    # Every fragment contributes, including those recruitment found nothing for: their contribution is
+    # the finite BACKGROUND term, not zero. Assigning -inf cases a zero deficit is what made the
+    # zero-seed stratum look free.
+    d = uc - rc
+    tot_delta += d
+    strata[seeded][0] += 1
+    strata[seeded][1] += d
+whole = u_whole - r_whole
+ok = abs(tot_delta - whole) < 0.5
+print(f"        reconciliation: per-fragment deltas sum to {tot_delta:+.2f}, whole-pair U-R is "
+      f"{whole:+.2f} -> {'MATCH' if ok else 'MISMATCH, strata not interpretable'}")
+if not ok: sys.exit()
 parts=[]
 for st in ("2","1","0"):
     if st in strata:
         n, d = strata[st]
-        parts.append(f"{st}-seed n={n} deficit={d:+.0f} ({100*d/tot if tot else 0:.0f}%)")
-print("        fragments by mates seeded: " + ";  ".join(parts))
+        parts.append(f"{st}-seed n={n} deficit={d:+.0f} ({100*d/tot_delta if tot_delta else 0:.0f}%)")
+print("        fragments by mates seeded (for many/many): " + ";  ".join(parts))
 PYEOF
 done; done; done
 echo

@@ -836,10 +836,12 @@ HaplotypeResult genotype_haplotype_pairs(
     // channel is built from this: a haplotype carrying sequence the sample does not have shows up as
     // a run of windows with no fragment in them.
     std::vector<std::int32_t> midpoint(fragments.size() * nh, -1);
-    // How many of a fragment's two mates carried at least one usable anchor. The right unit is the
-    // FRAGMENT, not the read: one anchored mate can rescue the other through the insert constraint,
-    // so a per-read seeding rate does not predict what recruitment recovers.
-    std::vector<std::uint8_t> mates_seeded(fragments.size(), 0);
+    // How many of a fragment's two mates carried a usable anchor ON A GIVEN HAPLOTYPE. Per
+    // (fragment, haplotype), not per fragment: a mate anchored only to some other shortlisted
+    // haplotype is not seeded for the pair being scored, and counting it as seeded attributes its
+    // deficit to the wrong stratum. The right unit is still the FRAGMENT -- one anchored mate can
+    // rescue the other through the insert constraint -- but the haplotype has to match the dump.
+    std::vector<std::uint8_t> mates_seeded(fragments.size() * nh, 0);
     // EVERY distinct placement, not just the best one. A fragment compatible with several copies of a
     // repeat is evidence for a haplotype offering several, and pinning it to one arbitrary copy
     // leaves the others falsely empty -- which then charges the candidate for absence the placement
@@ -918,7 +920,8 @@ HaplotypeResult genotype_haplotype_pairs(
         };
         reduce(c1);
         reduce(c2);
-        mates_seeded[fi] = static_cast<std::uint8_t>((c1.empty() ? 0 : 1) + (c2.empty() ? 0 : 1));
+        for (const Cand& c : c1) mates_seeded[fi * nh + c.hap] |= 1u;
+        for (const Cand& c : c2) mates_seeded[fi * nh + c.hap] |= 2u;
         {
             static std::mutex comp_mu;
             std::lock_guard<std::mutex> lk(comp_mu);
@@ -1582,7 +1585,7 @@ HaplotypeResult genotype_haplotype_pairs(
             std::ofstream mf(options.dump_fragment_mass);
             if (mf) {
                 mf << "# pair\t" << out.shortlist[a] << '\t' << out.shortlist[b] << '\n';
-                mf << "fragment\tlog_mass\tmates_seeded\n";
+                mf << "fragment\tlog_mass\tmates_seeded\tcontrib\n";
                 for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
                     double lse = kNegInf;
                     for (const auto& pr : placements[fi * nh + a]) lse = log_add(lse, pr.ll + pr.log_mult);
@@ -1591,8 +1594,22 @@ HaplotypeResult genotype_haplotype_pairs(
                     } else if (lse != kNegInf) {
                         lse += std::log(2.0);
                     }
-                    mf << fragments[fi].name << '\t' << lse << '\t'
-                       << static_cast<int>(mates_seeded[fi]) << '\n';
+                    // Seeding for THIS pair: a mate counts if it anchored on either homologue.
+                    const std::uint8_t ma = mates_seeded[fi * nh + a];
+                    const std::uint8_t mb = homoz ? ma : mates_seeded[fi * nh + b];
+                    const std::uint8_t both = static_cast<std::uint8_t>(ma | mb);
+                    const int nseed = ((both & 1u) ? 1 : 0) + ((both & 2u) ? 1 : 0);
+                    // The full per-fragment CONTRIBUTION, so a reconciliation is possible: exposure
+                    // is common to both arms at a fixed pair, so the per-fragment deltas must sum
+                    // exactly to the whole-pair difference. A dump of placement mass alone cannot be
+                    // reconciled, because a fragment with no placement has mass -inf and its real
+                    // contribution is the finite background term.
+                    const double contrib = log_add(
+                        lse == kNegInf ? kNegInf
+                                       : std::log1p(-options.outlier_mix) + std::log(lambda_joint) + lse,
+                        std::log(options.outlier_mix) + floors[fi]);
+                    mf << fragments[fi].name << '\t' << lse << '\t' << nseed << '\t'
+                       << contrib << '\n';
                 }
             }
         }
@@ -2029,7 +2046,8 @@ double reference_fragment_on_haplotype(const Fragment& f, const std::string& hap
 double reference_pair_loglik(const std::string& hap_a, const std::string& hap_b,
                              const std::vector<Fragment>& fragments,
                              const ReferenceParams& params,
-                             std::vector<double>* fragment_mass) {
+                             std::vector<double>* fragment_mass,
+                             std::vector<double>* fragment_contrib) {
     const double log_eps = std::log(params.error_rate);
     const double log_1meps = std::log1p(-params.error_rate);
 
@@ -2079,7 +2097,9 @@ double reference_pair_loglik(const std::string& hap_a, const std::string& hap_b,
                               params.bg_divergence * static_cast<double>(len))) * log_1meps;
         if (fragment_mass != nullptr) fragment_mass->push_back(lse);
         const double placed = (lse == kNegInf) ? kNegInf : log_mix + log_lam + lse;
-        total += log_add(placed, log_bg_w + bg);
+        const double contrib = log_add(placed, log_bg_w + bg);
+        if (fragment_contrib != nullptr) fragment_contrib->push_back(contrib);
+        total += contrib;
     }
     return total;
 }
