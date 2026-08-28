@@ -141,6 +141,9 @@ PYEOF
   run_arm U --dump-fragment-mass "$W/U.mass" --dump-mass-pair many,many || continue
   run_arm M --mate-rescue --dump-fragment-mass "$W/M.mass" --dump-mass-pair many,many || continue
   run_arm G --multiplicity-aware --mass-tolerance "$MASS_BOUND" --dump-fragment-mass "$W/G.mass" --dump-mass-pair many,many || continue
+  # J is M with the mate combinations formed by coordinate join instead of by Cartesian product.
+  # Same flags otherwise, so any difference is the join and nothing else.
+  run_arm J --mate-rescue --coordinate-join --dump-fragment-mass "$W/J.mass" --dump-mass-pair many,many || continue
   "$BIN" genotype-frag --reference-score "$W/many.fa" "$W/many.fa" -R "$W/reads.fa" $P \
     --dump-fragment-mass "$W/R.mass" >/dev/null 2>&1
   t1=$(date +%s)
@@ -208,6 +211,53 @@ mcombos = (re.search(r"(\d+) mate combinations", mlog) or [None,"?"])[1]
 print(f"  {cn:<5} {rl:<7} {sd:<5} | {best:10.2f} {e_recruit:+9.2f} {e_rescue:+10.2f} {e_group:7.3f}{group_note:<3} "
       f"{('yes' if gkey in top_class else 'NO'):<6} | {combos:<8} {mcombos:<8} {groups:<7} {secs:<5}")
 PYEOF
+  # ---- join gate: J must equal M NUMERICALLY, on every diplotype, not merely pick the same winner.
+  # The join reorders one sum; it is not a different model and not an approximation, so "same winner"
+  # is far too weak a criterion -- it would pass a join that lost mass everywhere by a constant.
+  "$PY" - "$W" <<'PYEOF'
+import os, re, sys, math
+W = sys.argv[1]
+def all_scores(tag):
+    pf = os.path.join(W, tag + ".hap_pairs.tsv")
+    if not os.path.exists(pf): return {}
+    d = {}
+    for l in list(open(pf))[1:]:
+        f = l.rstrip("\n").split("\t")
+        if len(f) >= 4: d["/".join(sorted((f[1], f[2])))] = float(f[3])
+    return d
+m, j = all_scores("M"), all_scores("J")
+if not m or not j or set(m) != set(j):
+    print(f"        join: KEY SETS DIFFER ({len(m)} cartesian vs {len(j)} join) -- not comparable")
+    sys.exit()
+dev = max(abs(m[k] - j[k]) for k in m)
+def logs(tag):
+    return (open(os.path.join(W, tag + ".log")).read() +
+            open(os.path.join(W, tag + ".time")).read())
+def grab(txt, pat, d="?"):
+    g = re.search(pat, txt); return g.group(1) if g else d
+lm, lj = logs("M"), logs("J")
+cart  = grab(lj, r"(\d+) Cartesian combinations")
+probe = grab(lj, r"(\d+) coordinate-join probes")
+rpos  = grab(lj, r"(\d+) rescue interval positions")
+rpl   = grab(lj, r"(\d+) rescued placements")
+def rss(txt):
+    g = re.search(r"(\d+)\s+maximum resident set size", txt)
+    return f"{int(g.group(1))/1048576:.0f}MB" if g else "?"
+def secs(txt):
+    g = re.search(r"([\d.]+)\s+real", txt)
+    return f"{float(g.group(1)):.2f}s" if g else "?"
+eqm = os.path.join(W, "M.equivalence.tsv"); eqj = os.path.join(W, "J.equivalence.tsv")
+same_cls = "unchanged"
+if os.path.exists(eqm) and os.path.exists(eqj):
+    same_cls = "unchanged" if open(eqm).read() == open(eqj).read() else "CHANGED"
+verdict = "EQUAL" if dev < 1e-9 else ("close" if dev < 1e-6 else "DIFFER")
+print(f"        join: max|cartesian-join| = {dev:.3e} over {len(m)} diplotypes [{verdict}]; "
+      f"equivalence class {same_cls}")
+print(f"        work: {cart} Cartesian hypothetical -> {probe} join probes; "
+      f"rescue examined {rpos} positions -> {rpl} placements; "
+      f"cartesian {secs(lm)}/{rss(lm)}, join {secs(lj)}/{rss(lj)}")
+PYEOF
+
   # Per-fragment decomposition of the deficit by seeding stratum. A fragment is the unit: one
   # anchored mate can rescue the other through the insert constraint.
   # The decomposition is GATED on reconciling: at a fixed pair the exposure is common to both arms,

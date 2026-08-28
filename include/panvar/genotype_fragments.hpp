@@ -311,6 +311,11 @@ struct HaplotypeScoreOptions : FragmentScoreOptions {
     // candidate haplotype, FR orientation and the insert prior's support fix an interval on that same
     // haplotype where the other mate must lie, and it is searched there and nowhere else.
     bool mate_rescue = false;
+    // Join mate placements by coordinate instead of by Cartesian product. Exact, not an
+    // approximation: the insert prior has strictly bounded support [lo, hi] and log_at returns -inf
+    // outside it, so a combination whose implied insert falls outside contributes exactly zero mass
+    // and enumerating it is wasted work, not omitted evidence.
+    bool coordinate_join = false;
     bool multiplicity_aware = false;
     double mass_tolerance = 1e-3;
     // How a haplotype-pair posterior becomes a per-block allele pair.
@@ -513,6 +518,16 @@ struct PlacementCompleteness {
     // costs one group rather than N placements only AFTER enumeration.
     std::uint64_t anchor_hits = 0;                  // index lookups that yielded a position
     std::uint64_t mate_combinations = 0;            // (mate1, mate2) pairs actually scored
+    // Separated so that "correct" and "tractable" cannot be argued from one number. The Cartesian
+    // count is what the product WOULD cost and grows as (copies)^2; the join count is what the
+    // coordinate join actually performs and is bounded by unique starts x insert support, i.e. by
+    // library width rather than repeat copy number. Rescue work is counted apart from both, because
+    // the interval scan is linear in the prior's width per anchored placement and would otherwise
+    // hide inside whichever total it was added to.
+    std::uint64_t cartesian_combinations = 0;       // |b1| x |b2|, formed or not
+    std::uint64_t join_operations = 0;              // (forward start, insert length) probes
+    std::uint64_t rescue_positions = 0;             // interval positions examined by mate rescue
+    std::uint64_t rescue_placements = 0;            // of those, ones that passed the band
     std::uint64_t placements_before_grouping = 0;
     std::uint64_t groups_after_grouping = 0;
 };

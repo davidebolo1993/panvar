@@ -324,6 +324,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             hopt.dump_mass_pair1 = two[0]; hopt.dump_mass_pair2 = two[1]; }
         else if (a == "--placement-dedup") hopt.placement_dedup = cli::parse_size_arg(a, value(i, a));
         else if (a == "--mate-rescue") hopt.mate_rescue = true;
+        else if (a == "--coordinate-join") hopt.coordinate_join = true;
         else if (a == "--multiplicity-aware") {
             hopt.multiplicity_aware = true;
             hopt.max_anchor_occ = std::numeric_limits<std::size_t>::max();
@@ -355,6 +356,15 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     // --exact-distance, --mosaic-floor ...) returns. Placed after them, as they first were, an
     // inconsistent combination was accepted silently in exactly the modes used for oracle
     // comparison -- where a silent mismatch does the most damage.
+    if (hopt.coordinate_join && !hopt.use_insert_size) {
+        // The join enumerates insert lengths over the prior's support. Without the insert term every
+        // FR pair with the reverse mate downstream contributes, the support is the whole haplotype,
+        // and the join would silently become a restriction rather than a re-ordering of the same sum.
+        throw std::runtime_error(
+            "genotype-frag: --coordinate-join requires the insert-size term. The join sweeps insert "
+            "lengths over the prior's bounded support, which is exact only because combinations "
+            "outside it carry zero mass; with the insert term off they do not");
+    }
     if (hopt.mate_rescue && !hopt.hamming_emission) {
         // The rescue matches the unanchored mate at fixed positions by Hamming distance, because the
         // interval it searches is defined by coordinates. The default emission is banded local
@@ -792,6 +802,23 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                               c.omitted_mass_max, c.omitted_mass_mean, hopt.mass_tolerance,
                               c.omitted_mass_max <= hopt.mass_tolerance ? "met" : "NOT MET");
                 log.info(buf);
+            }
+            {
+                // Reported whichever path ran, and SEPARATED: the Cartesian figure is what the
+                // product would cost and grows as the square of the copy number, the join figure is
+                // what was actually performed, and the rescue figures are neither -- the interval
+                // scan is linear in the prior's width per anchored placement. Collapsed into one
+                // "cost" number, a quadratic hidden behind a linear one is invisible.
+                char jb[320];
+                std::snprintf(jb, sizeof(jb),
+                              "work: %llu Cartesian combinations hypothetical, %llu coordinate-join "
+                              "probes actual, %llu rescue interval positions examined -> %llu "
+                              "rescued placements",
+                              (unsigned long long)c.cartesian_combinations,
+                              (unsigned long long)c.join_operations,
+                              (unsigned long long)c.rescue_positions,
+                              (unsigned long long)c.rescue_placements);
+                log.info(jb);
             }
             if (hopt.joint_depth) {
                 char cb[220];

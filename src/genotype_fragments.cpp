@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -67,6 +68,12 @@ InsertPrior make_insert_prior(double mean, double sd, double discordant_rate,
 namespace {
 
 constexpr double kNegInf = -std::numeric_limits<double>::infinity();
+
+// Placements of one mate that share a join coordinate. Two placements of the same mate with the
+// same start are the same (start, L, strand) state; the Cartesian product enumerates both, so this
+// sums their mass rather than deduplicating, and the two agree by construction instead of one of
+// them quietly being the more correct model.
+struct CoordAgg;
 
 double log_add(double a, double b) {
     if (a == kNegInf) return b;
@@ -128,6 +135,18 @@ ReadFit infix_align(const std::string& read, const std::string& context, std::si
 double insert_ll(double implied, const InsertPrior& ip) {
     return ip.log_at(static_cast<long>(implied + 0.5));
 }
+
+struct CoordAgg {
+    std::map<long, std::pair<double, double>> at;   // coordinate -> (summed log mass, best single)
+    void add(long k, double v) {
+        const auto it = at.find(k);
+        if (it == at.end()) at.emplace(k, std::make_pair(v, v));
+        else {
+            it->second.first = log_add(it->second.first, v);
+            if (v > it->second.second) it->second.second = v;
+        }
+    }
+};
 
 // The neighbouring-block sequence on each side of a block, taken from the allele the most panel
 // haplotypes carry. It is identical for every candidate of the block, so it cannot shift any
@@ -880,6 +899,7 @@ HaplotypeResult genotype_haplotype_pairs(
         // stand in for the whole read.
         struct Cand { std::uint32_t hap; bool fwd; long start; };
         std::uint64_t found_local = 0, kept_local = 0, anchor_hits_local = 0, combos_local = 0;
+        std::uint64_t cart_local = 0, join_local = 0, rescue_pos_local = 0, rescue_placed_local = 0;
         const auto gather = [&](const std::string& r, bool fwd,
                                 std::vector<Cand>& into) {
             for (const KmerOccurrence& o : collect_syncmers(r, k, s)) {
@@ -1042,6 +1062,7 @@ HaplotypeResult genotype_haplotype_pairs(
                     }
                     lo_s = std::max<long>(0, lo_s);
                     hi_s = std::min<long>(hi_s, n - static_cast<long>(q.size()));
+                    if (hi_s >= lo_s) rescue_pos_local += static_cast<std::uint64_t>(hi_s - lo_s + 1);
                     for (long st = lo_s; st <= hi_s; ++st) {
                         std::size_t mism = 0;
                         for (std::size_t bi2 = 0; bi2 < q.size() && mism <= want_band; ++bi2) {
@@ -1052,6 +1073,7 @@ HaplotypeResult genotype_haplotype_pairs(
                         r.ok = true; r.edits = mism; r.start = st;
                         r.end = st + static_cast<long>(q.size()) - 1;
                         r.fwd = !p.fwd;
+                        ++rescue_placed_local;
                         into.push_back(r);
                     }
                 }
@@ -1059,6 +1081,76 @@ HaplotypeResult genotype_haplotype_pairs(
             }
             const std::vector<Placed>& b1 = resc1.empty() ? a1 : resc1;
             const std::vector<Placed>& b2 = resc2.empty() ? a2 : resc2;
+            // The hypothetical product, counted whichever path runs, so the two costs are always
+            // comparable rather than each mode reporting only its own.
+            if (!b1.empty() && !b2.empty()) {
+                cart_local += static_cast<std::uint64_t>(b1.size()) * b2.size();
+            }
+
+            // ---- coordinate join -----------------------------------------------------------
+            // Forward placements keyed by start, reverse placements keyed by end. A fragment state
+            // is then (forward start s, insert length L) with the reverse end at s + L - 1, so the
+            // work is unique_starts x insert_support -- bounded by the library's insert width -- in
+            // place of |b1| x |b2|, which grows as the square of the repeat copy number. This is
+            // exact and not a pruning: ins_prior.log_at returns -inf outside [lo, hi], so every
+            // combination the product would form and the join skips carries exactly zero mass.
+            const bool do_join = options.coordinate_join && !b1.empty() && !b2.empty();
+            CoordAgg jf1, jr1, jf2, jr2;
+            if (do_join) {
+                for (const Placed& x : b1) {
+                    (x.fwd ? jf1 : jr1).add(x.fwd ? x.start : x.end, read_ll(x.edits, F.r1.size()));
+                }
+                for (const Placed& y : b2) {
+                    (y.fwd ? jf2 : jr2).add(y.fwd ? y.start : y.end, read_ll(y.edits, F.r2.size()));
+                }
+                // The valid-FR bit means "an FR pair exists with the reverse mate downstream",
+                // which is what the product tests. It is deliberately BROADER than "within the
+                // insert prior's support" -- keeping the same condition here keeps the stage
+                // instrumentation comparable across the two paths.
+                const auto any_fr = [](const CoordAgg& fwd, const CoordAgg& rev) {
+                    return !fwd.at.empty() && !rev.at.empty() &&
+                           rev.at.rbegin()->first >= fwd.at.begin()->first;
+                };
+                if (any_fr(jf1, jr2) || any_fr(jf2, jr1)) mates_seeded[fi * nh + hi] |= 16u;
+            }
+            const auto for_each_join = [&](const std::function<void(double, double, long, long,
+                                                                    bool)>& cb) {
+                const auto sweep = [&](const CoordAgg& FA, const CoordAgg& RA, bool mate1_fwd) {
+                    if (FA.at.empty() || RA.at.empty()) return;
+                    // TWO-POINTER over sorted coordinates, NOT a probe of every allowed insert
+                    // length. The probe form -- for each start, look up start + L - 1 for every L in
+                    // the prior's support -- is what the join was first written as, and measured it
+                    // was 12-29x MORE work than the product it replaced: the support is mean +/- 4sd,
+                    // about 400 lengths, so it pays only above ~400 placements per mate, which is far
+                    // beyond any copy number here. Advancing a window over the reverse coordinates
+                    // that actually EXIST costs one visit per in-support combination instead, which
+                    // is bounded by the product and normally far below it.
+                    std::vector<std::pair<long, std::pair<double, double>>> R(RA.at.begin(),
+                                                                              RA.at.end());
+                    std::size_t wlo = 0, whi = 0;   // [wlo, whi) = reverse ends inside the prior
+                    // FA.at is a std::map, so starts arrive in increasing order and both window
+                    // edges only ever move right: total pointer movement is O(|R|) for the sweep,
+                    // not per start.
+                    for (const auto& fe : FA.at) {
+                        const long s2 = fe.first;
+                        const long elo = s2 + ins_prior.lo - 1, ehi = s2 + ins_prior.hi - 1;
+                        while (wlo < R.size() && R[wlo].first < elo) ++wlo;
+                        if (whi < wlo) whi = wlo;
+                        while (whi < R.size() && R[whi].first <= ehi) ++whi;
+                        for (std::size_t t = wlo; t < whi; ++t) {
+                            ++join_local;
+                            const long e2 = R[t].first;
+                            const double ins = options.use_insert_size
+                                ? ins_prior.log_at(e2 - s2 + 1) : 0.0;
+                            cb(fe.second.first + R[t].second.first + log_half_strand + ins,
+                               fe.second.second + R[t].second.second + log_half_strand + ins,
+                               s2, e2, mate1_fwd);
+                        }
+                    }
+                };
+                sweep(jf1, jr2, true);    // mate 1 forward, mate 2 reverse
+                sweep(jf2, jr1, false);   // mate 2 forward, mate 1 reverse
+            };
             double lp = kNegInf;      // the accumulated likelihood: max, or the sum when marginalising
             double best = kNegInf;    // always the best single placement, so the midpoint is a real one
             long mid = -1;
@@ -1068,7 +1160,16 @@ HaplotypeResult genotype_haplotype_pairs(
                 if (v > best) { best = v; mid = m; }
                 lp = options.marginalise_placements ? log_add(lp, v) : std::max(lp, v);
             };
-            if (!b1.empty() && !b2.empty()) {
+            if (do_join) {
+                for_each_join([&](double mass_v, double best_v, long s, long e, bool) {
+                    // The summed mass and the best single placement are tracked separately: with
+                    // several placements aggregated at one coordinate they are no longer the same
+                    // number, and the midpoint must remain a real placement's.
+                    if (best_v > best) { best = best_v; mid = (s + e) / 2; }
+                    lp = options.marginalise_placements ? log_add(lp, mass_v)
+                                                        : std::max(lp, best_v);
+                });
+            } else if (!b1.empty() && !b2.empty()) {
                 // Both mates placed: the pair's placements are the COMBINATIONS, and the single-mate
                 // terms below would double count them, so they are skipped.
                 for (const Placed& x : b1) {
@@ -1122,7 +1223,13 @@ HaplotypeResult genotype_haplotype_pairs(
                     into.push_back({key, static_cast<std::int32_t>(st),
                                     static_cast<std::int32_t>(en), fwd, v});
                 };
-                if (!b1.empty() && !b2.empty()) {
+                if (do_join) {
+                    // Placements keep the BEST value per state, exactly as the product's `add` does
+                    // on collision, so the two enumerate the same states with the same values.
+                    for_each_join([&](double, double best_v, long s, long e, bool m1f) {
+                        add((s + e) / 2, s, e, m1f, best_v);
+                    });
+                } else if (!b1.empty() && !b2.empty()) {
                     for (const Placed& x : b1) {
                         for (const Placed& y : b2) {
                             ++combos_local;
@@ -1150,6 +1257,10 @@ HaplotypeResult genotype_haplotype_pairs(
             static std::mutex cm;
             std::lock_guard<std::mutex> lk(cm);
             out.completeness.mate_combinations += combos_local;
+            out.completeness.cartesian_combinations += cart_local;
+            out.completeness.join_operations += join_local;
+            out.completeness.rescue_positions += rescue_pos_local;
+            out.completeness.rescue_placements += rescue_placed_local;
             if (options.joint_depth) {
                 for (std::size_t hi = 0; hi < nh; ++hi) {
                     out.completeness.placements_before_grouping += placements[fi * nh + hi].size();
