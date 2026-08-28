@@ -30,8 +30,8 @@ EQ_TOL=1.0        # predeclared: the compressed optimum must be within this of t
 MASS_BOUND=1e-3   # predeclared: omitted placement mass
 
 printf "  equivalence tolerance %s nats, mass bound %s; reads stochastic from the scorer's own model\n\n" "$EQ_TOL" "$MASS_BOUND"
-printf "  %-5s %-7s %-5s | %-10s %-9s %-10s %-8s %-6s | %-8s %-8s %-7s %-5s\n" \
-       copies replen seed "ref_best" "U-R" "rescued-R" "max|G-U|" "in_cls" "combos" "combosM" "groups" "sec"
+printf "  %-5s %-7s %-5s | %-10s %-9s %-10s %-10s %-8s %-6s | %-8s %-8s %-7s %-5s\n" \
+       copies replen seed "ref_best" "U-R" "rescued-R" "zeroseed-R" "max|G-U|" "in_cls" "combos" "combosM" "groups" "sec"
 
 for CN in ${COPIES//,/ }; do
 for RL in ${REPLENS//,/ }; do
@@ -141,11 +141,14 @@ PYEOF
   # for many/many while evaluating U-R at G's own optimum compares different pairs, and they differ in
   # exactly the cells that fail.
   run_arm U --dump-fragment-mass "$W/U.mass" --dump-mass-pair many,many || { GRID_FAILS=$((GRID_FAILS+1)); continue; }
-  run_arm M --mate-rescue --dump-fragment-mass "$W/M.mass" --dump-mass-pair many,many || { GRID_FAILS=$((GRID_FAILS+1)); continue; }
+  run_arm M --mate-rescue --no-coordinate-join --dump-fragment-mass "$W/M.mass" --dump-mass-pair many,many || { GRID_FAILS=$((GRID_FAILS+1)); continue; }
   run_arm G --multiplicity-aware --mass-tolerance "$MASS_BOUND" --dump-fragment-mass "$W/G.mass" --dump-mass-pair many,many || { GRID_FAILS=$((GRID_FAILS+1)); continue; }
   # J is M with the mate combinations formed by coordinate join instead of by Cartesian product.
   # Same flags otherwise, so any difference is the join and nothing else.
-  run_arm J --mate-rescue --coordinate-join --dump-fragment-mass "$W/J.mass" --dump-mass-pair many,many || { GRID_FAILS=$((GRID_FAILS+1)); continue; }
+  run_arm J --mate-rescue --force-join --dump-fragment-mass "$W/J.mass" --dump-mass-pair many,many || { GRID_FAILS=$((GRID_FAILS+1)); continue; }
+  # Z is the zero-seed arm: M plus the lossless fallback, changing nothing else, so the difference
+  # between them is the fallback and nothing else.
+  run_arm Z --mate-rescue --zero-seed-fallback --dump-fragment-mass "$W/Z.mass" --dump-mass-pair many,many || { GRID_FAILS=$((GRID_FAILS+1)); continue; }
   "$BIN" genotype-frag --reference-score "$W/many.fa" "$W/many.fa" -R "$W/reads.fa" $P \
     --dump-fragment-mass "$W/R.mass" >/dev/null 2>&1
   t1=$(date +%s)
@@ -208,9 +211,11 @@ def grab(pat, d="?"):
 combos = grab(r"(\d+) mate combinations")
 groups = grab(r"(\d+) groups after")
 e_rescue = (m_at_p - refv) if refv == refv and m_at_p == m_at_p else float("nan")
+z_at_p = score_of("Z", PAIR)
+e_zero = (z_at_p - refv) if refv == refv and z_at_p == z_at_p else float("nan")
 mlog = open(os.path.join(W,"M.log")).read() + open(os.path.join(W,"M.time")).read()
 mcombos = (re.search(r"(\d+) mate combinations", mlog) or [None,"?"])[1]
-print(f"  {cn:<5} {rl:<7} {sd:<5} | {best:10.2f} {e_recruit:+9.2f} {e_rescue:+10.2f} {e_group:7.3f}{group_note:<3} "
+print(f"  {cn:<5} {rl:<7} {sd:<5} | {best:10.2f} {e_recruit:+9.2f} {e_rescue:+10.2f} {e_zero:+10.2f} {e_group:7.3f}{group_note:<3} "
       f"{('yes' if gkey in top_class else 'NO'):<6} | {combos:<8} {mcombos:<8} {groups:<7} {secs:<5}")
 PYEOF
   # ---- join gate: J must equal M NUMERICALLY, on every diplotype, not merely pick the same winner.
@@ -266,6 +271,35 @@ print(f"        work: {cart} Cartesian hypothetical -> {probe} join probes; "
 # defect, and a changed equivalence class is a changed call. Printing DIFFER and exiting 0 made this
 # whole gate advisory.
 sys.exit(0 if (dev < 1e-9 and same_cls == "unchanged") else 1)
+PYEOF
+
+  "$PY" - "$W" <<'PYEOF' || GRID_FAILS=$((GRID_FAILS+1))
+import os, re, sys
+W = sys.argv[1]
+def all_scores(tag):
+    pf = os.path.join(W, tag + ".hap_pairs.tsv")
+    if not os.path.exists(pf): return {}
+    d = {}
+    for l in list(open(pf))[1:]:
+        f = l.rstrip("\n").split("\t")
+        if len(f) >= 4: d["/".join(sorted((f[1], f[2])))] = float(f[3])
+    return d
+m, z = all_scores("M"), all_scores("Z")
+if not m or not z or set(m) != set(z):
+    print("        zero-seed: KEY SETS DIFFER -- not comparable"); sys.exit(1)
+log = open(os.path.join(W, "Z.log")).read() + open(os.path.join(W, "Z.time")).read()
+g = re.search(r"zero-seed: ran for (\d+) fragment-haplotype pairs \((\d+) pigeonhole, (\d+) "
+              r"exhaustive\); (\d+) candidate starts -> (\d+) verified -> (\d+) placements", log)
+if not g:
+    print("        zero-seed: arm produced no fallback report"); sys.exit(1)
+inv, pig, exh, cand, ver, pl = (int(x) for x in g.groups())
+# The fallback may only ADD evidence: it runs solely where neither mate placed, so no pair may lose
+# score against M. A drop means it perturbed a fragment recruitment had already placed.
+worst = min(z[k] - m[k] for k in m)
+print(f"        zero-seed: {inv} invocations ({pig} pigeonhole / {exh} exhaustive), "
+      f"{cand} candidates -> {ver} verified -> {pl} placements; "
+      f"worst pair change vs rescue-only {worst:+.3f}")
+sys.exit(0 if worst > -1e-9 else 1)
 PYEOF
 
   # Per-fragment decomposition of the deficit by seeding stratum. A fragment is the unit: one

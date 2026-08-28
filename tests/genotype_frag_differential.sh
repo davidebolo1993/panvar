@@ -445,14 +445,24 @@ PYEOF
 # by a constant would keep the winner and be wrong. This lives here, in the fast suite that runs on
 # every build, rather than only in the slow measurement grid: a regression in the default scoring
 # path should not need an opt-in benchmark to surface.
+# --force-join, NOT --coordinate-join. With adaptive dispatch this fixture sends every one of its
+# 576 fragment-haplotype decisions to the product -- measured -- so an assertion written against
+# --coordinate-join compared the product with itself and passed while exercising no join at all.
+# The dispatch counters are asserted below so that this cannot silently become true again.
 for arm in cart join; do
-  extra=""; [ "$arm" = join ] && extra="--coordinate-join"
+  extra="--no-coordinate-join"; [ "$arm" = join ] && extra="--force-join"
   "$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/cj_$arm" -R "$OUT/reads.fa" \
-    --haplotype-mode --rung-zero --hamming-emission --mate-rescue --top-pairs 100 $extra $P -q \
-    >/dev/null 2>&1
+    --haplotype-mode --rung-zero --hamming-emission --mate-rescue --top-pairs 100 $extra $P \
+    > "$OUT/cj_$arm.log" 2>&1
   awk -F'\t' 'NR>1{a=$2;b=$3; if(a>b){t=a;a=b;b=t} print a"/"b"\t"$4}' "$OUT/cj_$arm.hap_pairs.tsv" \
     > "$OUT/cj_$arm.tsv"
 done
+JC=$(grep -o "dispatch [0-9]* join" "$OUT/cj_join.log" | grep -o "[0-9]*" | head -1)
+if [ "${JC:-0}" -gt 0 ]; then
+  ok "the join path actually ran under --force-join ($JC decisions), so the comparison is not vacuous"
+else
+  bad "no decision took the join path -- the equality assertion below would compare Cartesian to itself"
+fi
 "$PY" - "$OUT/cj_cart.tsv" "$OUT/cj_join.tsv" <<'PYEOF'
 import sys
 def load(p):
@@ -473,6 +483,45 @@ sys.exit(0 if dev < 1e-9 else 1)
 PYEOF
 [ $? -eq 0 ] && ok "the coordinate join is numerically identical to the Cartesian product" \
              || bad "the coordinate join does not reproduce the Cartesian product exactly"
+
+# ---- the zero-seed pigeonhole must be an ACCELERATION, not a heuristic.
+# Same band both ways: --max-divergence 0.05 makes the pieces long enough for the filter to engage,
+# and --zero-seed-exhaustive turns it off without touching the band. Comparing by varying
+# max_divergence instead would change which placements are admissible and compare two models.
+ZP="--haploid-depth 0.05 --fragment-len 350 --fragment-sd 50 --error-rate 0.01 --max-divergence 0.05"
+for arm in filt exh; do
+  f="--zero-seed-fallback"; [ "$arm" = exh ] && f="--zero-seed-exhaustive"
+  "$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/zs_$arm" -R "$OUT/reads.fa" \
+    --haplotype-mode --rung-zero --hamming-emission --mate-rescue --top-pairs 100 $f $ZP \
+    > "$OUT/zs_$arm.log" 2>&1
+  awk -F'\t' 'NR>1{a=$2;b=$3; if(a>b){t=a;a=b;b=t} print a"/"b"\t"$4}' "$OUT/zs_$arm.hap_pairs.tsv" \
+    > "$OUT/zs_$arm.tsv"
+done
+PG=$(grep -o "([0-9]* pigeonhole" "$OUT/zs_filt.log" | grep -o "[0-9]*" | head -1)
+if [ "${PG:-0}" -gt 0 ]; then
+  ok "the pigeonhole filter actually engaged ($PG invocations), so the comparison is not vacuous"
+else
+  bad "the pigeonhole never engaged -- the equality below would compare exhaustive with itself"
+fi
+"$PY" - "$OUT/zs_filt.tsv" "$OUT/zs_exh.tsv" <<'PYEOF'
+import sys
+def load(p):
+    d = {}
+    for l in open(p):
+        f = l.rstrip("\n").split("\t")
+        if len(f) < 2: continue
+        try: d[f[0]] = float(f[1])
+        except ValueError: pass
+    return d
+a, b = load(sys.argv[1]), load(sys.argv[2])
+if not a or not b or set(a) != set(b):
+    print(f"  .... key sets differ: {len(a)} filtered vs {len(b)} exhaustive"); sys.exit(1)
+dev = max(abs(a[k] - b[k]) for k in a)
+print(f"  .... pigeonhole vs exhaustive scan: max deviation {dev:.3e} over {len(a)} diplotypes")
+sys.exit(0 if dev < 1e-9 else 1)
+PYEOF
+[ $? -eq 0 ] && ok "the zero-seed pigeonhole returns exactly what scanning every start returns" \
+             || bad "the pigeonhole filter LOSES placements -- it is a heuristic, not an acceleration"
 
 printf "  .... reference separates them by %s nats; then the approximations, one knob at a time:\n" "$REFDIFF"
 for tk in 2 8 32; do

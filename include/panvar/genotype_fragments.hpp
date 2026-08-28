@@ -315,7 +315,29 @@ struct HaplotypeScoreOptions : FragmentScoreOptions {
     // approximation: the insert prior has strictly bounded support [lo, hi] and log_at returns -inf
     // outside it, so a combination whose implied insert falls outside contributes exactly zero mass
     // and enumerating it is wasted work, not omitted evidence.
-    bool coordinate_join = false;
+    //
+    // ON BY DEFAULT, with adaptive dispatch deciding per fragment-haplotype. Justified by
+    // measurement rather than by the asymptotics: on a 2-copy fixture where dispatch sends all
+    // 20550 decisions to the product -- so the maps and the K count are pure overhead -- end-to-end
+    // time is unchanged (0.053s either way), and on a 32-copy array it is 0.293s -> 0.159s. Turn it
+    // off with --no-coordinate-join, which is also how the Cartesian diagnostic arm is selected.
+    bool coordinate_join = true;
+    // DIAGNOSTIC: take the join whenever it is available, bypassing the cost dispatch. Only for
+    // tests that must prove the join path itself ran -- with adaptive dispatch a small fixture can
+    // send every decision to the product, and an equality assertion then compares the product with
+    // itself and passes while testing nothing.
+    bool force_join = false;
+    // Zero-seed fallback: for a candidate haplotype on which NEITHER mate obtained a primary
+    // syncmer placement, find placements directly. Exhaustive under the fixed-position Hamming
+    // contract -- it considers every start and keeps those within the band, which is exactly what
+    // the primary path would keep had recruitment proposed them. Truth-independent, and it
+    // introduces no new seed length to tune.
+    bool zero_seed_fallback = false;
+    // DIAGNOSTIC: disable the pigeonhole filter so the fallback scans every start. The two must
+    // return identical placements at the same band -- that is what makes the filter an acceleration
+    // rather than a heuristic -- and without this flag the only way to compare them is to change
+    // max_divergence, which changes the band and therefore compares two different models.
+    bool zero_seed_exhaustive = false;
     bool multiplicity_aware = false;
     double mass_tolerance = 1e-3;
     // How a haplotype-pair posterior becomes a per-block allele pair.
@@ -519,17 +541,30 @@ struct PlacementCompleteness {
     std::uint64_t anchor_hits = 0;                  // index lookups that yielded a position
     std::uint64_t mate_combinations = 0;            // (mate1, mate2) pairs actually scored
     // Separated so that "correct" and "tractable" cannot be argued from one number. The Cartesian
-    // count is what the product WOULD cost and grows as (copies)^2; the join count is what the
-    // coordinate join actually performs and is bounded by unique starts x insert support, i.e. by
-    // library width rather than repeat copy number. Rescue work is counted apart from both, because
-    // the interval scan is linear in the prior's width per anchored placement and would otherwise
-    // hide inside whichever total it was added to.
+    // count is what the product WOULD cost and grows as (copies)^2 per fragment; the join count is
+    // what the coordinate join actually performs, which is O(|F| + |R| + K) for K coordinate pairs
+    // inside the insert support. K is NOT bounded by the library's insert width: it is quadratic
+    // again whenever coordinates cluster inside one allowed interval, which is what a short tandem
+    // array fitting inside a single insert looks like. Measured linear in copy number on the array
+    // fixtures, which is a measurement and not a bound. Rescue work is counted apart from both,
+    // because the interval scan is linear in the prior's width per anchored placement and would
+    // otherwise hide inside whichever total it was added to. The three counters also have DIFFERENT
+    // UNITS -- a rescue position is a Hamming comparison with early exit, a join probe is a
+    // log-sum-exp -- so their ratio is not a runtime ratio.
     std::uint64_t cartesian_combinations = 0;       // |b1| x |b2|, formed or not
     std::uint64_t join_operations = 0;              // (forward start, insert length) probes
     std::uint64_t rescue_positions = 0;             // interval positions examined by mate rescue
     std::uint64_t rescue_placements = 0;            // of those, ones that passed the band
     std::uint64_t join_chosen = 0;                  // fragment-haplotype decisions dispatched to
     std::uint64_t cartesian_chosen = 0;             // each path by the adaptive rule
+    // Zero-seed fallback, reported apart from every other stage so that what it recovers and what it
+    // costs are both attributable to it alone.
+    std::uint64_t zs_invocations = 0;               // (fragment, haplotype) pairs it ran for
+    std::uint64_t zs_candidate_starts = 0;          // starts proposed, before deduplication
+    std::uint64_t zs_verified_starts = 0;           // distinct starts actually Hamming-verified
+    std::uint64_t zs_placements = 0;                // of those, within the band
+    std::uint64_t zs_pigeonhole = 0;                // invocations accelerated by the q-gram filter
+    std::uint64_t zs_exhaustive = 0;                // invocations that scanned every start
     std::uint64_t placements_before_grouping = 0;
     std::uint64_t groups_after_grouping = 0;
 };

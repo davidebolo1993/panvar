@@ -875,6 +875,62 @@ HaplotypeResult genotype_haplotype_pairs(
     //   bit 2/3 : mate 1 / mate 2 produced a successful placement
     //   bit 4   : a valid FR paired state was formed
     std::vector<std::uint8_t> mates_seeded(fragments.size() * nh, 0);
+
+    // ---- zero-seed fallback index -----------------------------------------------------------
+    // Pigeonhole: a placement with at most d mismatches cannot mismatch inside all of d+1 DISJOINT
+    // pieces of the read, so at least one piece matches exactly and its occurrences propose the
+    // start. Lossless only if the pieces are long enough to be worth looking up: the piece length is
+    // floor(L / (d+1)) and d comes from max_divergence, so at the default 0.20 a 120 bp read gives
+    // 26 pieces of 4 bp, which proposes essentially every position and is no filter at all. Below
+    // kMinPiece the fallback scans every start instead. BOTH PATHS RETURN THE SAME PLACEMENTS -- the
+    // pigeonhole is an acceleration of the exhaustive scan, never a different answer -- so the choice
+    // between them cannot change a score, only the time taken to reach it.
+    //
+    // Occurrences are NOT capped. A capped index would make the fallback lossy in exactly the
+    // repetitive places it exists to serve; repetition is carried as a longer occurrence list.
+    constexpr std::size_t kMinPiece = 12;
+    std::size_t zs_piece = 0;
+    std::unordered_map<std::uint64_t, std::vector<std::pair<std::uint32_t, std::uint32_t>>> zs_index;
+    const auto encode_piece = [](const std::string& t, std::size_t at, std::size_t P) -> std::uint64_t {
+        std::uint64_t code = 0;
+        for (std::size_t i = 0; i < P; ++i) {
+            int b;
+            switch (t[at + i]) {
+                case 'A': case 'a': b = 0; break;
+                case 'C': case 'c': b = 1; break;
+                case 'G': case 'g': b = 2; break;
+                case 'T': case 't': b = 3; break;
+                default: return ~0ull;          // ambiguous base: this piece proposes nothing
+            }
+            code = (code << 2) | static_cast<std::uint64_t>(b);
+        }
+        return code;
+    };
+    if (options.zero_seed_fallback) {
+        // One piece length for the whole run, the largest that stays lossless for EVERY read.
+        std::size_t p_global = 64;
+        for (const Fragment& F : fragments) {
+            for (const std::string* r : {&F.r1, &F.r2}) {
+                if (r->empty()) continue;
+                const std::size_t d =
+                    static_cast<std::size_t>(options.max_divergence * static_cast<double>(r->size())) + 1;
+                p_global = std::min(p_global, r->size() / (d + 1));
+            }
+        }
+        if (p_global >= kMinPiece && !options.zero_seed_exhaustive) {
+            zs_piece = std::min<std::size_t>(p_global, 31);
+            for (std::size_t hi = 0; hi < nh; ++hi) {
+                const std::string& H = haps[hi].seq;
+                if (H.size() < zs_piece) continue;
+                for (std::size_t at = 0; at + zs_piece <= H.size(); ++at) {
+                    const std::uint64_t c = encode_piece(H, at, zs_piece);
+                    if (c == ~0ull) continue;
+                    zs_index[c].emplace_back(static_cast<std::uint32_t>(hi),
+                                             static_cast<std::uint32_t>(at));
+                }
+            }
+        }
+    }
     // EVERY distinct placement, not just the best one. A fragment compatible with several copies of a
     // repeat is evidence for a haplotype offering several, and pinning it to one arbitrary copy
     // leaves the others falsely empty -- which then charges the candidate for absence the placement
@@ -901,6 +957,8 @@ HaplotypeResult genotype_haplotype_pairs(
         std::uint64_t found_local = 0, kept_local = 0, anchor_hits_local = 0, combos_local = 0;
         std::uint64_t cart_local = 0, join_local = 0, rescue_pos_local = 0, rescue_placed_local = 0;
         std::uint64_t join_pick_local = 0, cart_pick_local = 0;
+        std::uint64_t zs_inv_local = 0, zs_cand_local = 0, zs_ver_local = 0, zs_pl_local = 0;
+        std::uint64_t zs_pigeon_local = 0, zs_exh_local = 0;
         const auto gather = [&](const std::string& r, bool fwd,
                                 std::vector<Cand>& into) {
             for (const KmerOccurrence& o : collect_syncmers(r, k, s)) {
@@ -1019,19 +1077,99 @@ HaplotypeResult genotype_haplotype_pairs(
         };
 
         std::vector<std::uint32_t> touched;
-        for (const Cand& c : c1) touched.push_back(c.hap);
-        for (const Cand& c : c2) touched.push_back(c.hap);
-        std::sort(touched.begin(), touched.end());
-        touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
+        if (options.zero_seed_fallback) {
+            // EVERY candidate haplotype, not only those an anchor pointed at. The loop below is the
+            // only place the fallback can run, and a fragment whose mates seed nowhere has an empty
+            // anchor set -- so restricting the loop to anchored haplotypes skips precisely the
+            // fragments the fallback exists for. Measured before this fix: the fallback fired 1-11
+            // times per cell against an unseeded stratum of 2-8 fragments over 6 haplotypes, found
+            // at most 3 placements, and recovered exactly 0.00 nats of deficit.
+            touched.resize(nh);
+            for (std::size_t hx = 0; hx < nh; ++hx) touched[hx] = static_cast<std::uint32_t>(hx);
+        } else {
+            for (const Cand& c : c1) touched.push_back(c.hap);
+            for (const Cand& c : c2) touched.push_back(c.hap);
+            std::sort(touched.begin(), touched.end());
+            touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
+        }
 
         for (const std::uint32_t hi : touched) {
             // Both mates are placed JOINTLY, over every combination of their candidate anchors,
             // rather than each taking its own best position. Independently, inside a duplication the
             // two mates settle on different copies and the pair then looks 13 kb long -- the mates
             // are one observation and have to be placed as one.
-            const std::vector<Placed> a1 = place_all(c1, hi, F.r1, r1rc, band1);
-            const std::vector<Placed> a2 = F.r2.empty() ? std::vector<Placed>{}
-                                                        : place_all(c2, hi, F.r2, r2rc, band2);
+            std::vector<Placed> a1 = place_all(c1, hi, F.r1, r1rc, band1);
+            std::vector<Placed> a2 = F.r2.empty() ? std::vector<Placed>{}
+                                                  : place_all(c2, hi, F.r2, r2rc, band2);
+
+            // ---- zero-seed fallback ------------------------------------------------------------
+            // Runs ONLY when neither mate has a primary placement on this haplotype. A fragment that
+            // recruitment placed is never touched by it, so it cannot perturb an existing
+            // contribution -- that is a structural property of this guard, not a tuning choice.
+            if (options.zero_seed_fallback && a1.empty() && a2.empty()) {
+                ++zs_inv_local;
+                const std::string& H = haps[hi].seq;
+                const auto fallback_place = [&](const std::string& fwd, const std::string& rev,
+                                                std::size_t band) {
+                    std::vector<Placed> got;
+                    for (int o = 0; o < 2; ++o) {
+                        const std::string& q = (o == 0) ? fwd : rev;
+                        if (q.empty() || H.size() < q.size()) continue;
+                        const long last = static_cast<long>(H.size() - q.size());
+                        std::vector<long> starts;
+                        const std::size_t d =
+                            static_cast<std::size_t>(options.max_divergence
+                                                     * static_cast<double>(q.size())) + 1;
+                        if (zs_piece > 0 && q.size() >= (d + 1) * zs_piece) {
+                            ++zs_pigeon_local;
+                            // d+1 disjoint pieces: at most d of them can carry a mismatch.
+                            for (std::size_t pc = 0; pc <= d; ++pc) {
+                                const std::size_t at = pc * zs_piece;
+                                const std::uint64_t code = encode_piece(q, at, zs_piece);
+                                if (code == ~0ull) continue;
+                                const auto it = zs_index.find(code);
+                                if (it == zs_index.end()) continue;
+                                for (const auto& hp : it->second) {
+                                    if (hp.first != hi) continue;
+                                    const long st = static_cast<long>(hp.second)
+                                                  - static_cast<long>(at);
+                                    if (st < 0 || st > last) continue;
+                                    starts.push_back(st);
+                                    ++zs_cand_local;
+                                }
+                            }
+                            std::sort(starts.begin(), starts.end());
+                            starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
+                        } else {
+                            ++zs_exh_local;
+                            starts.reserve(static_cast<std::size_t>(last) + 1);
+                            for (long st = 0; st <= last; ++st) starts.push_back(st);
+                            zs_cand_local += static_cast<std::uint64_t>(last) + 1;
+                        }
+                        for (const long st : starts) {
+                            ++zs_ver_local;
+                            std::size_t mism = 0;
+                            for (std::size_t bi2 = 0; bi2 < q.size() && mism <= band; ++bi2) {
+                                if (q[bi2] != H[static_cast<std::size_t>(st) + bi2]) ++mism;
+                            }
+                            if (mism > band) continue;
+                            Placed r;
+                            r.ok = true; r.edits = mism; r.start = st;
+                            r.end = st + static_cast<long>(q.size()) - 1;
+                            r.fwd = (o == 0);
+                            ++zs_pl_local;
+                            got.push_back(r);
+                        }
+                    }
+                    return got;
+                };
+                a1 = fallback_place(F.r1, r1rc, band1);
+                if (!F.r2.empty()) a2 = fallback_place(F.r2, r2rc, band2);
+                // Whatever the fallback produced now flows through the SAME machinery as any other
+                // placement: one mate only goes to interval rescue below, both go to the adaptive
+                // coordinate join. No second scoring path exists for it.
+                if (!a1.empty() || !a2.empty()) mates_seeded[fi * nh + hi] |= 64u;
+            }
             if (!a1.empty()) mates_seeded[fi * nh + hi] |= 4u;
             if (!a2.empty()) mates_seeded[fi * nh + hi] |= 8u;
 
@@ -1053,11 +1191,18 @@ HaplotypeResult genotype_haplotype_pairs(
                 // intervals are merged, so each position is examined ONCE however many anchored
                 // placements propose it.
                 //
-                // Merging is not only a saving. Scanning per anchored placement pushes the same
-                // (start, strand) state once per proposing placement, and overlapping intervals are
-                // the normal case in a tandem array -- copies sit closer together than the insert
-                // width, so their intervals overlap heavily. Those duplicates then reach the join,
-                // which sums their mass, and one physical placement is counted several times.
+                // Merging also makes the rescued set duplicate-free BY CONSTRUCTION: merged
+                // intervals within a group are disjoint, and the two groups differ in strand, so no
+                // (start, strand) state can be proposed twice. Scanning per anchored placement could
+                // push the same state once per proposing placement.
+                //
+                // That is stated as a property of the construction, NOT as a repair of an observed
+                // defect. Removing those duplicates changed no score in any configuration measured
+                // -- joint-marginal and plain, max and marginalised -- so whether they ever inflated
+                // a likelihood is UNDEMONSTRATED, and the measured effect of merging here is a 9%
+                // reduction in positions examined and nothing else. Rescue fires only when exactly
+                // one mate placed, so the anchored list is short and its intervals largely do not
+                // overlap; there is little to merge.
                 for (int g = 0; g < 2; ++g) {
                     const bool anchored_fwd = (g == 0);
                     const std::string& q = anchored_fwd ? want_rev : want_fwd;
@@ -1180,7 +1325,7 @@ HaplotypeResult genotype_haplotype_pairs(
                 const std::uint64_t k_pairs = count_pairs(jf1, jr2) + count_pairs(jf2, jr1);
                 const std::uint64_t join_cost = k_pairs + jf1.at.size() + jr1.at.size()
                                               + jf2.at.size() + jr2.at.size();
-                do_join = join_cost < cart_cost;
+                do_join = options.force_join || join_cost < cart_cost;
                 if (do_join) ++join_pick_local; else ++cart_pick_local;
             }
             const auto for_each_join = [&](const std::function<void(double, double, long, long,
@@ -1335,6 +1480,12 @@ HaplotypeResult genotype_haplotype_pairs(
             out.completeness.rescue_placements += rescue_placed_local;
             out.completeness.join_chosen += join_pick_local;
             out.completeness.cartesian_chosen += cart_pick_local;
+            out.completeness.zs_invocations += zs_inv_local;
+            out.completeness.zs_candidate_starts += zs_cand_local;
+            out.completeness.zs_verified_starts += zs_ver_local;
+            out.completeness.zs_placements += zs_pl_local;
+            out.completeness.zs_pigeonhole += zs_pigeon_local;
+            out.completeness.zs_exhaustive += zs_exh_local;
             if (options.joint_depth) {
                 for (std::size_t hi = 0; hi < nh; ++hi) {
                     out.completeness.placements_before_grouping += placements[fi * nh + hi].size();

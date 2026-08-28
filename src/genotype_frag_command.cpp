@@ -325,6 +325,11 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--placement-dedup") hopt.placement_dedup = cli::parse_size_arg(a, value(i, a));
         else if (a == "--mate-rescue") hopt.mate_rescue = true;
         else if (a == "--coordinate-join") hopt.coordinate_join = true;
+        else if (a == "--no-coordinate-join") { hopt.coordinate_join = false; hopt.force_join = false; }
+        else if (a == "--force-join") { hopt.coordinate_join = true; hopt.force_join = true; }
+        else if (a == "--zero-seed-fallback") hopt.zero_seed_fallback = true;
+        else if (a == "--zero-seed-exhaustive") { hopt.zero_seed_fallback = true;
+                                                  hopt.zero_seed_exhaustive = true; }
         else if (a == "--multiplicity-aware") {
             hopt.multiplicity_aware = true;
             hopt.max_anchor_occ = std::numeric_limits<std::size_t>::max();
@@ -364,6 +369,13 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             "genotype-frag: --coordinate-join requires the insert-size term. The join sweeps insert "
             "lengths over the prior's bounded support, which is exact only because combinations "
             "outside it carry zero mass; with the insert term off they do not");
+    }
+    if (hopt.zero_seed_fallback && !hopt.hamming_emission) {
+        throw std::runtime_error(
+            "genotype-frag: --zero-seed-fallback requires --hamming-emission. The fallback verifies "
+            "candidate starts at FIXED positions by Hamming distance; under the banded "
+            "local-alignment emission a read can slide, and the placements it returns would not be "
+            "the ones the scorer then evaluates");
     }
     if (hopt.mate_rescue && !hopt.hamming_emission) {
         // The rescue matches the unanchored mate at fixed positions by Hamming distance, because the
@@ -821,6 +833,20 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                               (unsigned long long)c.join_chosen,
                               (unsigned long long)c.cartesian_chosen);
                 log.info(jb);
+            }
+            if (hopt.zero_seed_fallback) {
+                char zb[320];
+                std::snprintf(zb, sizeof(zb),
+                              "zero-seed: ran for %llu fragment-haplotype pairs (%llu pigeonhole, "
+                              "%llu exhaustive); %llu candidate starts -> %llu verified -> %llu "
+                              "placements",
+                              (unsigned long long)c.zs_invocations,
+                              (unsigned long long)c.zs_pigeonhole,
+                              (unsigned long long)c.zs_exhaustive,
+                              (unsigned long long)c.zs_candidate_starts,
+                              (unsigned long long)c.zs_verified_starts,
+                              (unsigned long long)c.zs_placements);
+                log.info(zb);
             }
             if (hopt.joint_depth) {
                 char cb[220];
