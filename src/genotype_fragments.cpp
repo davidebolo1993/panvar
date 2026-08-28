@@ -26,6 +26,44 @@ KSEQ_INIT(gzFile, gzread)
 
 namespace panvar {
 
+double InsertPrior::exposure(std::size_t hap_len) const {
+    const long n = static_cast<long>(hap_len);
+    double e = 0.0;
+    for (long L = lo; L <= hi; ++L) {
+        const double starts = static_cast<double>(std::max<long>(0, n - L + 1));
+        if (starts > 0.0) e += std::exp(log_at(L)) * starts;
+    }
+    return e;
+}
+
+InsertPrior make_insert_prior(double mean, double sd, double discordant_rate,
+                              int sigmas, long min_len) {
+    InsertPrior ip;
+    ip.lo = std::max<long>(min_len, static_cast<long>(mean - sigmas * sd));
+    ip.hi = static_cast<long>(mean + sigmas * sd);
+    if (ip.hi < ip.lo) ip.hi = ip.lo;
+    const double span = static_cast<double>(ip.hi - ip.lo + 1);
+    std::vector<double> w;
+    double total = -std::numeric_limits<double>::infinity();
+    const auto ladd = [](double a, double b) {
+        if (a == -std::numeric_limits<double>::infinity()) return b;
+        if (b == -std::numeric_limits<double>::infinity()) return a;
+        const double hi2 = a > b ? a : b, lo2 = a > b ? b : a;
+        return hi2 + std::log1p(std::exp(lo2 - hi2));
+    };
+    for (long L = ip.lo; L <= ip.hi; ++L) {
+        const double z = (static_cast<double>(L) - mean) / sd;
+        const double conc = std::log1p(-discordant_rate) - 0.5 * z * z
+                          - std::log(sd) - 0.9189385332046727;
+        const double disc = std::log(discordant_rate) - std::log(span);
+        const double v = ladd(conc, disc);
+        w.push_back(v);
+        total = ladd(total, v);
+    }
+    for (const double v : w) ip.logp.push_back(v - total);
+    return ip;
+}
+
 namespace {
 
 constexpr double kNegInf = -std::numeric_limits<double>::infinity();
@@ -84,11 +122,11 @@ ReadFit infix_align(const std::string& read, const std::string& context, std::si
 // Bounded: a Gaussian on the implied insert has unbounded influence and one mis-anchored pair can
 // outvote thousands of ordinary ones. Mixed against a uniform, the worst a pair can say is
 // log(discordant_rate / discordant_span).
-double insert_ll(double implied, const FragmentScoreOptions& o) {
-    const double z = (implied - o.fragment_len) / o.fragment_sd;
-    const double concordant = -0.5 * z * z - std::log(o.fragment_sd) - 0.9189385332046727;
-    const double discordant = std::log(o.discordant_rate) - std::log(o.discordant_span);
-    return log_add(std::log1p(-o.discordant_rate) + concordant, discordant);
+// The SHARED normalised discrete prior, so the two scorers agree by construction. The old form was a
+// continuous Gaussian plus a uniform term divided by a fixed span, which is neither normalised nor
+// the same distribution the reference integrates.
+double insert_ll(double implied, const InsertPrior& ip) {
+    return ip.log_at(static_cast<long>(implied + 0.5));
 }
 
 // The neighbouring-block sequence on each side of a block, taken from the allele the most panel
@@ -332,6 +370,13 @@ std::vector<BlockFragmentResult> genotype_fragments(
         const double log_1meps = std::log1p(-options.error_rate);
         const double log_mix = std::log1p(-options.outlier_mix);
         const double log_out = std::log(options.outlier_mix);
+        long min_frag_len_b = 1;
+        for (const std::uint32_t fi : recruited[t]) {
+            min_frag_len_b = std::max<long>(min_frag_len_b,
+                static_cast<long>(fragments[fi].r1.size() + fragments[fi].r2.size()));
+        }
+        const InsertPrior ins_prior = make_insert_prior(options.fragment_len, options.fragment_sd,
+                                                        options.discordant_rate, 4, min_frag_len_b);
         const auto read_ll = [&](std::size_t edits, std::size_t len) {
             return static_cast<double>(edits) * log_eps +
                    static_cast<double>(len - std::min(edits, len)) * log_1meps;
@@ -405,7 +450,7 @@ std::vector<BlockFragmentResult> genotype_fragments(
                     // still gets voted on.
                     const std::size_t lo = std::min(f1.start, f2.start);
                     const std::size_t hi = std::max(f1.end, f2.end);
-                    lp += insert_ll(static_cast<double>(hi - lo + 1), options);
+                    lp += insert_ll(static_cast<double>(hi - lo + 1), ins_prior);
                 }
                 if (want_debug) {
                     const std::size_t e = (f1.ok ? f1.edits : band1) +
@@ -733,6 +778,16 @@ HaplotypeResult genotype_haplotype_pairs(
         return static_cast<double>(edits) * log_eps +
                static_cast<double>(len - std::min(edits, len)) * log_1meps;
     };
+    long min_frag_len = 1;
+    for (const Fragment& f : fragments) {
+        min_frag_len = std::max<long>(min_frag_len, static_cast<long>(f.r1.size() + f.r2.size()));
+    }
+    const InsertPrior ins_prior = make_insert_prior(options.fragment_len, options.fragment_sd,
+                                                    options.discordant_rate, 4, min_frag_len);
+    // Explicit 1/2 per strand, matching the reference. It is a per-fragment constant only while the
+    // placement term is compared with itself; mixed against a background it changes the placement
+    // scale and therefore the contrast between candidates.
+    const double log_half_strand = std::log(0.5);
 
     std::vector<double> ll(fragments.size() * nh, kNegInf);
     std::vector<double> floors(fragments.size(), kNegInf);
@@ -789,7 +844,8 @@ HaplotypeResult genotype_haplotype_pairs(
             // Whether that approximation matters is an open question, not a settled one.
             std::map<std::pair<std::uint32_t, long>, std::pair<int, long>> tally;
             for (const Cand& x : c) {
-                auto& e = tally[{x.hap, (x.fwd ? 1 : -1) * (x.start / 64 + 1)}];
+                auto& e = tally[{x.hap, (x.fwd ? 1 : -1) *
+                                 (x.start / static_cast<long>(std::max<std::size_t>(1, options.placement_bin)) + 1)}];
                 ++e.first;
                 e.second = x.start;
             }
@@ -826,7 +882,9 @@ HaplotypeResult genotype_haplotype_pairs(
         const std::size_t band2 = F.r2.empty() ? 1 :
             static_cast<std::size_t>(options.max_divergence * static_cast<double>(F.r2.size())) + 1;
 
-        struct Placed { bool ok = false; std::size_t edits = 0; long start = 0; long end = 0; };
+        // `fwd` records which orientation the query was in, so only valid FR combinations are
+        // paired. Without it, two mates in the SAME orientation could be combined into a "fragment".
+        struct Placed { bool ok = false; std::size_t edits = 0; long start = 0; long end = 0; bool fwd = true; };
         const auto place_all = [&](const std::vector<Cand>& cands, std::uint32_t hi,
                                    const std::string& fwd_seq, const std::string& rev_seq,
                                    std::size_t band) {
@@ -848,6 +906,7 @@ HaplotypeResult genotype_haplotype_pairs(
                 p.edits = f.edits;
                 p.start = lo + static_cast<long>(f.start);
                 p.end = lo + static_cast<long>(f.end);
+                p.fwd = c.fwd;
                 found.push_back(p);
             }
             return found;
@@ -881,12 +940,18 @@ HaplotypeResult genotype_haplotype_pairs(
                 // terms below would double count them, so they are skipped.
                 for (const Placed& x : a1) {
                     for (const Placed& y : a2) {
-                        double v = read_ll(x.edits, F.r1.size()) + read_ll(y.edits, F.r2.size());
+                        // FR only: the two mates of a fragment face each other. Combining same-strand
+                        // placements invents fragments the library cannot produce.
+                        if (x.fwd == y.fwd) continue;
+                        const Placed& fw = x.fwd ? x : y;
+                        const Placed& rv = x.fwd ? y : x;
+                        if (rv.end < fw.start) continue;          // reverse mate must lie downstream
+                        double v = read_ll(x.edits, F.r1.size()) + read_ll(y.edits, F.r2.size())
+                                 + log_half_strand;
                         if (options.use_insert_size) {
-                            v += insert_ll(static_cast<double>(std::max(x.end, y.end) -
-                                                               std::min(x.start, y.start) + 1), options);
+                            v += insert_ll(static_cast<double>(rv.end - fw.start + 1), ins_prior);
                         }
-                        consider(v, (std::min(x.start, y.start) + std::max(x.end, y.end)) / 2);
+                        consider(v, (fw.start + rv.end) / 2);
                     }
                 }
             } else {
@@ -914,12 +979,16 @@ HaplotypeResult genotype_haplotype_pairs(
                 if (!a1.empty() && !a2.empty()) {
                     for (const Placed& x : a1) {
                         for (const Placed& y : a2) {
-                            double v = read_ll(x.edits, F.r1.size()) + read_ll(y.edits, F.r2.size());
+                            if (x.fwd == y.fwd) continue;
+                            const Placed& fw = x.fwd ? x : y;
+                            const Placed& rv = x.fwd ? y : x;
+                            if (rv.end < fw.start) continue;
+                            double v = read_ll(x.edits, F.r1.size()) + read_ll(y.edits, F.r2.size())
+                                     + log_half_strand;
                             if (options.use_insert_size) {
-                                v += insert_ll(static_cast<double>(std::max(x.end, y.end) -
-                                                                   std::min(x.start, y.start) + 1), options);
+                                v += insert_ll(static_cast<double>(rv.end - fw.start + 1), ins_prior);
                             }
-                            add((std::min(x.start, y.start) + std::max(x.end, y.end)) / 2, v);
+                            add((fw.start + rv.end) / 2, v);
                         }
                     }
                 } else {
@@ -1180,7 +1249,10 @@ HaplotypeResult genotype_haplotype_pairs(
                     for (const auto& [mid, v] : placements[fi * nh + h]) {
                         if (mid < 0) continue;
                         const std::size_t w = static_cast<std::size_t>(mid) / W;
-                        if (w >= nw || exposure[h][w] <= 0.0) continue;   // unobservable window
+                        if (w >= nw) continue;
+                        // Window observability is part of the window approximation, so rung zero must
+                        // not apply it: under the contract every start is a state.
+                        if (!options.rung_zero && exposure[h][w] <= 0.0) continue;
                         o.push_back({side, static_cast<std::int32_t>(w), v});
                     }
                 };
@@ -1200,6 +1272,13 @@ HaplotypeResult genotype_haplotype_pairs(
             if (options.joint_marginal) {
                 // Observed-data likelihood: sum over placements, no assignment at all.
                 //
+                // RUNG ZERO uses the CONTRACT's exposure -- SUM_L pi(L) * max(0, |H| - L + 1) -- in
+                // place of the window approximation. The window form measures midpoints against
+                // anchorable windows and an average fragment length, so its normaliser ranges over a
+                // different state space from its event term, which is the invariant the contract
+                // exists to enforce. Until they agree, a difference from the reference is a model
+                // difference and no ladder of approximations below it means anything.
+                //
                 // A homozygous pair is TWO copies of one sequence. Its exposure is doubled below, and
                 // its event INTENSITY must be doubled with it: a fragment could have come from either
                 // copy, so the density it sees is 2 * lambda * sum_p, not lambda * sum_p. Omitting it
@@ -1207,12 +1286,18 @@ HaplotypeResult genotype_haplotype_pairs(
                 // and silently penalises every homozygous call. Placements are gathered once because
                 // the two copies are the same sequence and offer the same positions; the factor, not
                 // a second gather, is what represents the second copy.
-                const double copies = homozygous ? 2.0 : 1.0;
                 double total = 0.0;
                 double exposure_total = 0.0;
-                for (std::size_t w = 0; w < wa; ++w) exposure_total += expect_of(0, w);
-                if (!homozygous) for (std::size_t w = 0; w < wb; ++w) exposure_total += expect_of(1, w);
+                if (options.rung_zero) {
+                    const double ea = ins_prior.exposure(haps[a].seq.size());
+                    const double eb = homozygous ? ea : ins_prior.exposure(haps[b].seq.size());
+                    exposure_total = lambda_joint * (homozygous ? 2.0 * ea : ea + eb);
+                } else {
+                    for (std::size_t w = 0; w < wa; ++w) exposure_total += expect_of(0, w);
+                    if (!homozygous) for (std::size_t w = 0; w < wb; ++w) exposure_total += expect_of(1, w);
+                }
                 total -= exposure_total;
+                const double copies = homozygous ? 2.0 : 1.0;
                 const double log_lam = std::log(std::max(lambda_joint, 1e-300));
                 const double lmix = std::log1p(-options.outlier_mix);
                 const double lout = std::log(options.outlier_mix);
@@ -1698,38 +1783,7 @@ double reference_emission(const std::string& read, const std::string& target, st
 //     and the "likelihood" is then not a density over anything;
 //   * a pure Gaussian here against a mixture in the fast path is a model difference, so a discrepancy
 //     between them could not be attributed to acceleration.
-struct InsertPrior {
-    long lo = 0, hi = 0;
-    std::vector<double> logp;   // indexed by L - lo, normalised to sum to 1
-    double log_at(long L) const {
-        if (L < lo || L > hi) return kNegInf;
-        return logp[static_cast<std::size_t>(L - lo)];
-    }
-};
 
-InsertPrior make_insert_prior(const ReferenceParams& p, long min_len) {
-    InsertPrior ip;
-    ip.lo = std::max<long>(min_len,
-                           static_cast<long>(p.fragment_len - p.insert_sigmas * p.fragment_sd));
-    ip.hi = static_cast<long>(p.fragment_len + p.insert_sigmas * p.fragment_sd);
-    if (ip.hi < ip.lo) ip.hi = ip.lo;
-    const double span = static_cast<double>(ip.hi - ip.lo + 1);
-    std::vector<double> w;
-    w.reserve(static_cast<std::size_t>(span));
-    double total = kNegInf;
-    for (long L = ip.lo; L <= ip.hi; ++L) {
-        const double z = (static_cast<double>(L) - p.fragment_len) / p.fragment_sd;
-        const double conc = std::log1p(-p.discordant_rate) - 0.5 * z * z
-                          - std::log(p.fragment_sd) - 0.9189385332046727;
-        const double disc = std::log(p.discordant_rate) - std::log(span);
-        const double v = log_add(conc, disc);
-        w.push_back(v);
-        total = log_add(total, v);
-    }
-    ip.logp.reserve(w.size());
-    for (const double v : w) ip.logp.push_back(v - total);
-    return ip;
-}
 
 // log sum over every start on ONE haplotype of P(f | start), with the insert prior integrated.
 // One orientation of one fragment against one haplotype: `lead` maps forward at the start and
@@ -1791,7 +1845,8 @@ double reference_pair_loglik(const std::string& hap_a, const std::string& hap_b,
     for (const Fragment& f : fragments) {
         min_len = std::max<long>(min_len, static_cast<long>(f.r1.size() + f.r2.size()));
     }
-    const InsertPrior ip = make_insert_prior(params, min_len);
+    const InsertPrior ip = make_insert_prior(params.fragment_len, params.fragment_sd,
+                                            params.discordant_rate, params.insert_sigmas, min_len);
 
     // Exposure over the SAME (start, L) states the event term sums:
     //

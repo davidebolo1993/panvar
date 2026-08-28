@@ -51,6 +51,25 @@ std::vector<Fragment> load_fragments(
     const std::vector<std::string>& paths,
     FragmentLoadStats* stats = nullptr);
 
+// ONE insert prior, used by the exact reference and by the accelerated scorer alike. They previously
+// had different ones -- a normalised discrete distribution in the reference against a continuous
+// Gaussian plus a uniform term divided by a fixed span in the fast path -- which is a MODEL
+// difference, so any discrepancy between them could not be attributed to acceleration.
+struct InsertPrior {
+    long lo = 0, hi = 0;
+    std::vector<double> logp;          // indexed by L - lo, normalised to sum to 1
+    double log_at(long L) const {
+        if (L < lo || L > hi || logp.empty()) return -std::numeric_limits<double>::infinity();
+        return logp[static_cast<std::size_t>(L - lo)];
+    }
+    // SUM over L of pi(L) * max(0, |H| - L + 1): the number of (start, L) states a haplotype offers,
+    // which is what the contract normalises by.
+    double exposure(std::size_t hap_len) const;
+};
+
+InsertPrior make_insert_prior(double mean, double sd, double discordant_rate,
+                              int sigmas, long min_len);
+
 struct FragmentScoreOptions {
     std::size_t kmer_size = 31;
     std::size_t syncmer_s = 0;          // 0 = default_syncmer_s(k)
@@ -226,6 +245,14 @@ struct HaplotypeScoreOptions : FragmentScoreOptions {
     // Implied-start bins kept per mate per haplotype. 2 is what best-placement scoring used; a sum
     // over placements is only meaningful if the placements are actually enumerated.
     std::size_t placement_topk = 2;
+    // Width of the implied-start bucket used to collapse anchors into one placement. 1 disables the
+    // binning entirely, which rung zero needs.
+    std::size_t placement_bin = 64;
+    // RUNG ZERO: the accelerated event enumeration with none of the approximations -- exact contract
+    // exposure instead of anchor-dependent windows, no anchor cap, no start binning, no topk. If this
+    // does not reproduce the exact reference then the difference is in the model, not in the
+    // acceleration, and no ladder of approximations below it means anything.
+    bool rung_zero = false;
     // How a haplotype-pair posterior becomes a per-block allele pair.
     //
     //   map      take the best pair's alleles. The answer is then a real pair some haplotype pair
@@ -562,6 +589,7 @@ MosaicFloors mosaic_floors(
 // stated bound -- and the fast path is never adjusted to make them agree, because this defines the
 // model and the fast path only approximates it.
 struct ReferenceParams {
+    // kept in step with FragmentScoreOptions so both scorers build the same prior
     double lambda = 0.05;        // fragments per start position
     double eta = 0.05;           // background weight
     double error_rate = 0.01;

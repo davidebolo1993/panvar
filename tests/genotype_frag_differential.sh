@@ -212,7 +212,28 @@ else
   bad "reference does not prefer the 2-copy haplotype: $R2 vs $R1"
 fi
 REFDIFF=$("$PY" -c "import sys;print(f'{float(sys.argv[1])-float(sys.argv[2]):.1f}')" "$R2" "$R1")
-printf "  .... reference separates them by %s nats; the accelerated path at several topk:\n" "$REFDIFF"
+# RUNG ZERO first: the accelerated enumeration with none of its approximations. If this does not
+# reproduce the reference, the difference is in the MODEL and the rungs below it are uninterpretable.
+"$BIN" genotype-frag -i "$OUT/r.gfa" -b "$OUT/rbub" -o "$OUT/rz" -R "$OUT/rreads.fa" \
+  --haplotype-mode --rung-zero --top-pairs 20 $P -q >/dev/null 2>&1
+rzt=$(awk -F'\t' 'NR>1 && $2=="two" && $3=="two"{print $4}' "$OUT/rz.hap_pairs.tsv")
+rzo=$(awk -F'\t' 'NR>1 && $2=="one" && $3=="one"{print $4}' "$OUT/rz.hap_pairs.tsv")
+if [ -n "$rzt" ] && [ -n "$rzo" ]; then
+  "$PY" - "$R2" "$R1" "$rzt" "$rzo" <<'PYEOF'
+import sys
+r2, r1, t, o = (float(x) for x in sys.argv[1:5])
+ref_sep, rz_sep = r2 - r1, t - o
+print(f"  .... rung zero: two/two {t:.1f} (reference {r2:.1f}), separation {rz_sep:.1f} of {ref_sep:.1f}"
+      f" = {100*rz_sep/ref_sep:.0f}%")
+sys.exit(0 if rz_sep > 0.9 * ref_sep else 1)
+PYEOF
+  [ $? -eq 0 ] && ok "rung zero reproduces the reference separation to within 10%" \
+               || bad "rung zero does NOT reproduce the reference -- the models still differ"
+else
+  bad "rung zero did not score both pairs"
+fi
+
+printf "  .... reference separates them by %s nats; then the approximations, one knob at a time:\n" "$REFDIFF"
 for tk in 2 8 32; do
   "$BIN" genotype-frag -i "$OUT/r.gfa" -b "$OUT/rbub" -o "$OUT/rk$tk" -R "$OUT/rreads.fa" \
     --haplotype-mode --joint-marginal --joint-top-pairs 0 --placement-topk $tk \

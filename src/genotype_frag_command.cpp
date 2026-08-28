@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -305,6 +306,16 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--placement-topk") hopt.placement_topk = cli::parse_size_arg(a, value(i, a));
         else if (a == "--joint-depth") hopt.joint_depth = true;
         else if (a == "--joint-marginal") { hopt.joint_depth = true; hopt.joint_marginal = true; }
+        else if (a == "--rung-zero") {
+            // The accelerated event enumeration with NONE of the approximations, so that a
+            // difference from the exact reference can only be the enumeration itself.
+            hopt.joint_depth = true; hopt.joint_marginal = true; hopt.rung_zero = true;
+            hopt.max_anchor_occ = std::numeric_limits<std::size_t>::max();
+            hopt.placement_topk = std::numeric_limits<std::size_t>::max();
+            hopt.placement_bin = 1;
+            hopt.joint_top_pairs = 0;
+        }
+        else if (a == "--placement-bin") hopt.placement_bin = cli::parse_size_arg(a, value(i, a));
         else if (a == "--joint-reverse-order") hopt.joint_reverse_order = true;
         else if (a == "--equivalence-tolerance") hopt.equivalence_tolerance = std::stod(value(i, a));
         else if (a == "--joint-top-pairs") hopt.joint_top_pairs = cli::parse_size_arg(a, value(i, a));
