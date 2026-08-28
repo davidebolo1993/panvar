@@ -252,7 +252,15 @@ struct HaplotypeScoreOptions : FragmentScoreOptions {
     // exposure instead of anchor-dependent windows, no anchor cap, no start binning, no topk. If this
     // does not reproduce the exact reference then the difference is in the model, not in the
     // acceleration, and no ladder of approximations below it means anything.
+    // NOT "no approximations": the anchor cap, start binning and top-k are removed, but placements
+    // are still reached by syncmer recruitment and banded local alignment rather than by enumerating
+    // every (start, L, strand) state. Those two remain until this matches the reference exactly.
     bool rung_zero = false;
+    // Emission by Hamming distance at the anchor's implied start, with no alignment. The reference
+    // scores a placement at a FIXED position; banded local alignment can slide a read to a better
+    // offset and so create placements the reference rejects, which is a model difference and not an
+    // acceleration. This exists to remove it from the comparison.
+    bool hamming_emission = false;
     // How a haplotype-pair posterior becomes a per-block allele pair.
     //
     //   map      take the best pair's alleles. The answer is then a real pair some haplotype pair

@@ -306,6 +306,41 @@ else
   bad "--joint-marginal failed on the homozygous fixture"
 fi
 
+# ---------------------------------------------- same-strand mates must not form a fragment
+# A real correctness defect, not test scaffolding: mate placements were combined without checking
+# orientation, so two same-strand reads could be joined into a "fragment" the library cannot produce.
+#
+# The fixture emits the SAME pairs twice: once correctly (mate 2 reverse-complemented) and once with
+# mate 2 left forward. A valid FR pair must score better than a same-strand one, because the
+# same-strand pair should earn no concordant-fragment evidence at all.
+emit_same_strand() { awk -v s="$1" -v tag="$2" -v step="$3" 'BEGIN{
+    rl=150; ins=350; n=length(s);
+    for(i=1;i+ins-1<=n;i+=step){
+      printf ">%s_%d/1\n%s\n>%s_%d/2\n%s\n", tag,i,substr(s,i,rl),tag,i,substr(s,i+ins-rl,rl) } }'; }
+emit_same_strand "$H1" ss 25 > "$OUT/ss_bad.fa"
+emit_pairs      "$H1" ss 25 > "$OUT/ss_good.fa"
+SG=$("$BIN" genotype-frag --reference-score "$OUT/truth1.fa" "$OUT/truth1.fa" -R "$OUT/ss_good.fa" \
+       --haploid-depth 0.05 --fragment-len 350 --fragment-sd 50 2>/dev/null)
+SB=$("$BIN" genotype-frag --reference-score "$OUT/truth1.fa" "$OUT/truth1.fa" -R "$OUT/ss_bad.fa" \
+       --haploid-depth 0.05 --fragment-len 350 --fragment-sd 50 2>/dev/null)
+awk -v a="$SG" -v b="$SB" 'BEGIN{ exit !(a > b + 1) }' \
+  && ok "same-strand mates earn less than a valid FR pair ($SG vs $SB)" \
+  || bad "same-strand mates score as well as FR pairs: $SG vs $SB"
+
+# ------------------------------------------- strand prior: a haplotype and its revcomp score alike
+# The 1/2-per-strand factor and the both-orientations search must agree, and the scorer must be
+# strand-symmetric. Not cosmetic: real panel sequence contains haplotypes spelled reverse-complemented
+# by block concatenation, which is what made an earlier recall measurement read 48% instead of 100%.
+RCSEQ=$(printf '%s' "$H1" | tr 'ACGT' 'TGCA' | rev)
+printf '>rc\n%s\n' "$RCSEQ" > "$OUT/rc.fa"
+FS=$("$BIN" genotype-frag --reference-score "$OUT/truth1.fa" "$OUT/truth1.fa" -R "$OUT/ss_good.fa" \
+       --haploid-depth 0.05 --fragment-len 350 --fragment-sd 50 2>/dev/null)
+RS=$("$BIN" genotype-frag --reference-score "$OUT/rc.fa" "$OUT/rc.fa" -R "$OUT/ss_good.fa" \
+       --haploid-depth 0.05 --fragment-len 350 --fragment-sd 50 2>/dev/null)
+awk -v a="$FS" -v b="$RS" 'BEGIN{ d=a-b; if(d<0) d=-d; exit !(d < 0.000001) }' \
+  && ok "strand prior: a haplotype and its reverse complement score identically ($FS)" \
+  || bad "strand handling is asymmetric: $FS vs $RS"
+
 echo
 if [ "$fails" -eq 0 ]; then echo "genotype-frag stats: all assertions passed"; else
   echo "genotype-frag stats: $fails assertion(s) failed"; fi

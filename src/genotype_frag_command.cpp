@@ -316,6 +316,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             hopt.joint_top_pairs = 0;
         }
         else if (a == "--placement-bin") hopt.placement_bin = cli::parse_size_arg(a, value(i, a));
+        else if (a == "--hamming-emission") hopt.hamming_emission = true;
         else if (a == "--joint-reverse-order") hopt.joint_reverse_order = true;
         else if (a == "--equivalence-tolerance") hopt.equivalence_tolerance = std::stod(value(i, a));
         else if (a == "--joint-top-pairs") hopt.joint_top_pairs = cli::parse_size_arg(a, value(i, a));

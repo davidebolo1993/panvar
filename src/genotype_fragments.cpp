@@ -897,11 +897,28 @@ HaplotypeResult genotype_haplotype_pairs(
                 const long hi_end = std::min<long>(static_cast<long>(haps[hi].seq.size()),
                                                    c.start + static_cast<long>(q.size() + options.anchor_slack));
                 if (hi_end - lo < static_cast<long>(q.size()) / 2) continue;
+                Placed p;
+                if (options.hamming_emission) {
+                    // Fixed position, no sliding: exactly what the reference scores.
+                    if (c.start < 0 || c.start + static_cast<long>(q.size()) >
+                                       static_cast<long>(haps[hi].seq.size())) continue;
+                    std::size_t mism = 0;
+                    for (std::size_t bi2 = 0; bi2 < q.size(); ++bi2) {
+                        if (q[bi2] != haps[hi].seq[static_cast<std::size_t>(c.start) + bi2]) ++mism;
+                    }
+                    if (mism > band) continue;
+                    p.ok = true;
+                    p.edits = mism;
+                    p.start = c.start;
+                    p.end = c.start + static_cast<long>(q.size()) - 1;
+                    p.fwd = c.fwd;
+                    found.push_back(p);
+                    continue;
+                }
                 const std::string window = haps[hi].seq.substr(static_cast<std::size_t>(lo),
                                                                static_cast<std::size_t>(hi_end - lo));
                 const ReadFit f = infix_align(q, window, band);
                 if (!f.ok) continue;
-                Placed p;
                 p.ok = true;
                 p.edits = f.edits;
                 p.start = lo + static_cast<long>(f.start);

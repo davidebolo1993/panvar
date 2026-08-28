@@ -156,6 +156,34 @@ PYEOF
 [ $? -eq 0 ] && ok "accelerated scorer picks the same pair as the exact reference" \
              || bad "accelerated scorer picks a DIFFERENT pair from the exact reference"
 
+# Per-pair agreement, not merely the winner: with the models identical the two scorers should differ
+# by ONE candidate-independent constant. A constant that varies by pair is a model difference hiding
+# behind a correct ranking.
+"$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/rz0" -R "$OUT/reads.fa" \
+  --haplotype-mode --rung-zero --hamming-emission --top-pairs 100 $P -q >/dev/null 2>&1
+awk -F'\t' 'NR>1{a=$2;b=$3; if(a>b){t=a;a=b;b=t} print a"/"b"\t"$4}' "$OUT/rz0.hap_pairs.tsv" > "$OUT/rz0.tsv"
+"$PY" - "$OUT/ref.tsv" "$OUT/rz0.tsv" <<'PYEOF'
+import sys, statistics
+def load(p):
+    d={}
+    for l in open(p):
+        k,v=l.rstrip("\n").split("\t")
+        try: d[k]=float(v)
+        except ValueError: pass
+    return d
+ref, rz = load(sys.argv[1]), load(sys.argv[2])
+common=[k for k in ref if k in rz]
+if len(common) < 3: print("  .... too few pairs"); sys.exit(1)
+off=[rz[k]-ref[k] for k in common]
+c=statistics.median(off)
+resid=max(abs(o-c) for o in off)
+print(f"  .... per-pair offset: median {c:.2f} nats, max deviation from it {resid:.2f} over "
+      f"{len(common)} pairs")
+sys.exit(0 if resid < 1.0 else 1)
+PYEOF
+[ $? -eq 0 ] && ok "every pair agrees with the reference to within 1 nat of one shared constant" \
+             || bad "the offset between the scorers varies by pair -- a model difference remains"
+
 # ============================================================== the case truncation actually bites
 # A panel where one haplotype carries a segment TWICE. Every fragment from that segment has two valid
 # placements, which is exactly the mass placement_topk discards, so this is where the accelerated
@@ -212,10 +240,17 @@ else
   bad "reference does not prefer the 2-copy haplotype: $R2 vs $R1"
 fi
 REFDIFF=$("$PY" -c "import sys;print(f'{float(sys.argv[1])-float(sys.argv[2]):.1f}')" "$R2" "$R1")
-# RUNG ZERO first: the accelerated enumeration with none of its approximations. If this does not
-# reproduce the reference, the difference is in the MODEL and the rungs below it are uninterpretable.
+# UNBOUNDED RECRUITED PLACEMENTS first -- deliberately not called "no approximations", because it is
+# not. It removes the anchor cap, the start binning and top-k, but it still reaches placements through
+# syncmer recruitment and banded local alignment rather than enumerating every (start, L, strand)
+# state as the reference does. Those two remain, and until this matches the reference exactly they are
+# candidate explanations for any difference. If it does not match, the rungs below it are
+# uninterpretable.
+# With --hamming-emission the last known model difference is removed too: the reference scores a
+# placement at a FIXED position, and banded local alignment can slide a read to a better offset,
+# creating placements the reference rejects. Measured on this fixture: 96% without it, 100% with.
 "$BIN" genotype-frag -i "$OUT/r.gfa" -b "$OUT/rbub" -o "$OUT/rz" -R "$OUT/rreads.fa" \
-  --haplotype-mode --rung-zero --top-pairs 20 $P -q >/dev/null 2>&1
+  --haplotype-mode --rung-zero --hamming-emission --top-pairs 20 $P -q >/dev/null 2>&1
 rzt=$(awk -F'\t' 'NR>1 && $2=="two" && $3=="two"{print $4}' "$OUT/rz.hap_pairs.tsv")
 rzo=$(awk -F'\t' 'NR>1 && $2=="one" && $3=="one"{print $4}' "$OUT/rz.hap_pairs.tsv")
 if [ -n "$rzt" ] && [ -n "$rzo" ]; then
@@ -223,12 +258,14 @@ if [ -n "$rzt" ] && [ -n "$rzo" ]; then
 import sys
 r2, r1, t, o = (float(x) for x in sys.argv[1:5])
 ref_sep, rz_sep = r2 - r1, t - o
-print(f"  .... rung zero: two/two {t:.1f} (reference {r2:.1f}), separation {rz_sep:.1f} of {ref_sep:.1f}"
-      f" = {100*rz_sep/ref_sep:.0f}%")
-sys.exit(0 if rz_sep > 0.9 * ref_sep else 1)
+print(f"  .... unbounded recruited placements: two/two {t:.1f} (reference {r2:.1f}), separation "
+      f"{rz_sep:.1f} of {ref_sep:.1f} = {100*rz_sep/ref_sep:.0f}%")
+# TWO-SIDED. A one-sided ">= 0.9x" passes a result at 150%, which is just as much a disagreement --
+# an accelerated scorer that over-separates has invented evidence.
+sys.exit(0 if abs(rz_sep / ref_sep - 1.0) <= 0.10 else 1)
 PYEOF
-  [ $? -eq 0 ] && ok "rung zero reproduces the reference separation to within 10%" \
-               || bad "rung zero does NOT reproduce the reference -- the models still differ"
+  [ $? -eq 0 ] && ok "unbounded recruited placements reproduce the reference separation within +/-10%" \
+               || bad "unbounded recruited placements do NOT match the reference -- the models still differ"
 else
   bad "rung zero did not score both pairs"
 fi
