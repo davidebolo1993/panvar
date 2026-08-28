@@ -290,6 +290,10 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--project-marginal") hopt.project_map = false;
         else if (a == "--marginalise-placements") hopt.marginalise_placements = true;
         else if (a == "--placement-topk") hopt.placement_topk = cli::parse_size_arg(a, value(i, a));
+        else if (a == "--joint-depth") hopt.joint_depth = true;
+        else if (a == "--joint-top-pairs") hopt.joint_top_pairs = cli::parse_size_arg(a, value(i, a));
+        else if (a == "--joint-window") hopt.joint_window = cli::parse_size_arg(a, value(i, a));
+        else if (a == "--joint-iterations") hopt.joint_iterations = cli::parse_size_arg(a, value(i, a));
         else if (a == "--total-depth") hopt.total_depth = true;
         else if (a == "--haploid-depth") { hopt.haploid_depth = std::stod(value(i, a)); hopt.total_depth = true; }
         else if (a == "--truth-total-bp") hopt.truth_total_bp = std::stod(value(i, a));

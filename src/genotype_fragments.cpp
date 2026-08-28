@@ -986,6 +986,98 @@ HaplotypeResult genotype_haplotype_pairs(
                          return x.score > y.score;
                      });
 
+    // ---- joint fragment-assignment + window-depth rescoring ----------------------------------
+    if (options.joint_depth && !pairs.empty()) {
+        // lambda is fitted ONCE, from the alignment-best pair, and then held fixed for every pair
+        // rescored. Re-fitting it per candidate is what made the per-haplotype channel blind: a
+        // candidate that explains its own coverage badly could simply lower its own expectation.
+        double lambda_joint = options.haploid_depth;
+        if (lambda_joint <= 0.0) {
+            const std::size_t a0 = pairs.front().hap1, b0 = pairs.front().hap2;
+            std::size_t placed = 0;
+            for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
+                if (midpoint[fi * nh + a0] >= 0 || midpoint[fi * nh + b0] >= 0) ++placed;
+            }
+            const double bp = static_cast<double>(haps[a0].seq.size() + haps[b0].seq.size());
+            if (bp > 0.0) lambda_joint = static_cast<double>(placed) / bp;
+        }
+
+        const std::size_t nrescore = std::min(options.joint_top_pairs, pairs.size());
+        std::vector<double> joint(nrescore, kNegInf);
+        run_parallel(nrescore, options.threads, [&](std::size_t pi) {
+            const std::size_t a = pairs[pi].hap1, b = pairs[pi].hap2;
+            const std::size_t wa = haps[a].seq.size() / options.joint_window + 1;
+            const std::size_t wb = haps[b].seq.size() / options.joint_window + 1;
+            const double expect = lambda_joint * static_cast<double>(options.joint_window);
+            if (expect <= 0.0) { joint[pi] = pairs[pi].score; return; }
+
+            // assignment: 0 = null, 1 = homologue a, 2 = homologue b
+            std::vector<std::uint8_t> z(fragments.size(), 0);
+            std::vector<double> ca(wa, 0.0), cb(wb, 0.0);
+            const auto win = [&](std::size_t h, std::size_t fi) {
+                const std::int32_t m = midpoint[fi * nh + h];
+                return m < 0 ? std::size_t(-1) : static_cast<std::size_t>(m) / options.joint_window;
+            };
+            // start from the likelihood-only assignment, then let depth move fragments
+            for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
+                if (floors[fi] == kNegInf) continue;
+                const double la = ll[fi * nh + a], lb = ll[fi * nh + b];
+                if (la <= floors[fi] && lb <= floors[fi]) { z[fi] = 0; continue; }
+                z[fi] = (la >= lb) ? 1 : 2;
+                const std::size_t w = win(z[fi] == 1 ? a : b, fi);
+                if (z[fi] == 1 && w < wa) ca[w] += 1.0;
+                else if (z[fi] == 2 && w < wb) cb[w] += 1.0;
+            }
+
+            // Poisson log-density of one window count, up to a constant common to every assignment
+            const auto wll = [&](double n) { return n * std::log(expect) - std::lgamma(n + 1.0); };
+
+            for (std::size_t it = 0; it < options.joint_iterations; ++it) {
+                bool moved = false;
+                for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
+                    if (floors[fi] == kNegInf) continue;
+                    const std::size_t iwa = win(a, fi), iwb = win(b, fi);
+                    // remove this fragment from its current window before scoring alternatives
+                    if (z[fi] == 1 && iwa < wa) ca[iwa] -= 1.0;
+                    else if (z[fi] == 2 && iwb < wb) cb[iwb] -= 1.0;
+
+                    const double base_a = (iwa < wa) ? wll(ca[iwa]) : 0.0;
+                    const double base_b = (iwb < wb) ? wll(cb[iwb]) : 0.0;
+                    // each option is scored ONCE, as sequence plus the depth it would create
+                    const double s_null = floors[fi];
+                    const double s_a = (iwa < wa) ? ll[fi * nh + a] + (wll(ca[iwa] + 1.0) - base_a) : kNegInf;
+                    const double s_b = (iwb < wb) ? ll[fi * nh + b] + (wll(cb[iwb] + 1.0) - base_b) : kNegInf;
+
+                    std::uint8_t best = 0; double bs = s_null;
+                    if (s_a > bs) { bs = s_a; best = 1; }
+                    if (s_b > bs) { bs = s_b; best = 2; }
+                    if (best != z[fi]) moved = true;
+                    z[fi] = best;
+                    if (best == 1 && iwa < wa) ca[iwa] += 1.0;
+                    else if (best == 2 && iwb < wb) cb[iwb] += 1.0;
+                }
+                if (!moved) break;
+            }
+
+            double total = 0.0;
+            for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
+                if (floors[fi] == kNegInf) continue;
+                total += (z[fi] == 0) ? floors[fi]
+                       : (z[fi] == 1 ? ll[fi * nh + a] : ll[fi * nh + b]);
+            }
+            // Every window of both homologues, including the empty ones -- an uncovered window is
+            // the observation this whole model exists to make.
+            for (std::size_t w = 0; w < wa; ++w) total += ca[w] * std::log(expect) - expect - std::lgamma(ca[w] + 1.0);
+            for (std::size_t w = 0; w < wb; ++w) total += cb[w] * std::log(expect) - expect - std::lgamma(cb[w] + 1.0);
+            joint[pi] = total;
+        });
+        for (std::size_t pi = 0; pi < nrescore; ++pi) pairs[pi].score = joint[pi];
+        std::stable_sort(pairs.begin(), pairs.begin() + static_cast<long>(nrescore),
+                         [](const HaplotypePairScore& x, const HaplotypePairScore& y) {
+                             return x.score > y.score;
+                         });
+    }
+
     double norm = kNegInf;
     for (const HaplotypePairScore& p : pairs) norm = log_add(norm, p.score);
     for (HaplotypePairScore& p : pairs) p.posterior = std::exp(p.score - norm);

@@ -267,6 +267,29 @@ struct HaplotypeScoreOptions : FragmentScoreOptions {
     // which no caller can know. It bounds what perfect dosage knowledge could buy, so a failure here
     // means the tail is not a dosage problem at all.
     double truth_total_bp = 0.0;
+    // JOINT FRAGMENT-ASSIGNMENT + WINDOW-DEPTH MODEL.
+    //
+    // The hypothesis, pre-registered in docs/reports/genotype-fragment-joint-model.md: localised
+    // depth with each fragment assigned EXACTLY ONCE recovers error that neither alignment nor total
+    // dosage can. Both cheap answers are already measured out -- a correctly calibrated scalar total
+    // is worth 8.6 nats on a 12 kb error against alignment differences of 10^3-10^4, and the
+    // per-haplotype window channel counted every fragment on every haplotype it placed on, so one
+    // real fragment made every candidate copy look covered.
+    //
+    // What changes here is the constraint, not the weight. For a candidate PAIR, each fragment is
+    // assigned to one homologue or to a null state, window counts are built from those assignments
+    // alone, and the objective is a single likelihood:
+    //
+    //     sum_f log P(fragment | its assignment)  +  sum_w log Poisson(n_w | lambda * window)
+    //
+    // There is deliberately no weight between the two terms. Coordinate ascent: assign, recount,
+    // repeat. A fragment that both homologues explain equally contributes to whichever window needs
+    // it, which is the mechanism a copy-number difference is visible through and the one an
+    // independent per-haplotype count destroys.
+    bool joint_depth = false;
+    std::size_t joint_top_pairs = 32;   // candidate pairs re-scored jointly, by alignment rank
+    std::size_t joint_iterations = 5;
+    std::size_t joint_window = 500;
     // Sequence compatibility and copy number are different signals and a read alignment cannot carry
     // both. Measured, at cyp2d6 leave-ZERO-out: NA18939's haplotype 1 is 13.6 kb longer than the
     // panel's typical haplotype -- a duplication -- and the reads from the extra copy align perfectly

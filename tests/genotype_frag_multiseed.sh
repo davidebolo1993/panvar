@@ -49,7 +49,8 @@ for DONOR in "${DONORS[@]}"; do
     exp_run "$OUT/f${s}" "$OUT/f${s}.hap_blocks.tsv" "$OUT/f${s}.hap_scores.tsv" -- \
       "$BIN" genotype-frag -i "$G" -b "$PFX" -o "$OUT/f${s}" \
       -R "$OUT/r_1.fq.gz" -R "$OUT/r_2.fq.gz" --haplotype-mode \
-      --exclude-haplotypes "$H1,$H2" --max-haplotypes "$MAXHAP" -q || { echo "  $DONOR seed $s FAILED"; continue; }
+      --exclude-haplotypes "$H1,$H2" --max-haplotypes "$MAXHAP" ${FRAG_EXTRA:-} -q \
+      || { echo "  $DONOR seed $s FAILED"; continue; }
 
     : > "$OUT/shortlist.fa"
     while IFS= read -r n; do
