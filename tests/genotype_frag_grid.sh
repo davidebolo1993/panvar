@@ -217,7 +217,8 @@ def load(p):
         if l.startswith("#") or l.startswith("fragment"): continue
         f=l.rstrip("\n").split("\t")
         # name -> (log_mass, mates_seeded, contrib)
-        d[f[0]]=(float(f[1]), f[2] if len(f)>2 else "NA", float(f[3]) if len(f)>3 else float("nan"))
+        d[f[0]]=(float(f[1]), f[2] if len(f)>2 else "NA", float(f[3]) if len(f)>3 else float("nan"),
+                 f[4] if len(f)>4 else "NA", f[5] if len(f)>5 else "NA")
     return d
 try:
     R, U = load(sys.argv[1]), load(sys.argv[2])
@@ -226,27 +227,32 @@ except (OSError, ValueError):
     print("        reconciliation inputs missing"); sys.exit()
 strata=collections.defaultdict(lambda: [0, 0.0])
 tot_delta = 0.0
-for k,(rv, _, rc) in R.items():
+for k,(rv, _, rc, _rp, _rf) in R.items():
     if k not in U: continue
-    uv, seeded, uc = U[k]
+    uv, seeded, uc, placed, fr = U[k]
     # Every fragment contributes, including those recruitment found nothing for: their contribution is
     # the finite BACKGROUND term, not zero. Assigning -inf cases a zero deficit is what made the
     # zero-seed stratum look free.
     d = uc - rc
     tot_delta += d
-    strata[seeded][0] += 1
-    strata[seeded][1] += d
+    strata[(seeded, placed, fr)][0] += 1
+    strata[(seeded, placed, fr)][1] += d
 whole = u_whole - r_whole
-ok = abs(tot_delta - whole) < 0.5
+# Numerical-rounding scale, not a tolerance for real disagreement. Exposure cancels at a
+# fixed pair, so this identity is exact arithmetic and anything above rounding is a defect.
+ok = abs(tot_delta - whole) < 1e-6
 print(f"        reconciliation: per-fragment deltas sum to {tot_delta:+.2f}, whole-pair U-R is "
       f"{whole:+.2f} -> {'MATCH' if ok else 'MISMATCH, strata not interpretable'}")
 if not ok: sys.exit()
+# seed -> placement -> valid FR, so the stage the evidence disappears at is visible
 parts=[]
-for st in ("2","1","0"):
-    if st in strata:
-        n, d = strata[st]
-        parts.append(f"{st}-seed n={n} deficit={d:+.0f} ({100*d/tot_delta if tot_delta else 0:.0f}%)")
-print("        fragments by mates seeded (for many/many): " + ";  ".join(parts))
+for key in sorted(strata, key=lambda k: -abs(strata[k][1])):
+    seeded, placed, fr = key
+    n, d = strata[key]
+    if n == 0: continue
+    parts.append(f"seed{seeded}/place{placed}/fr{fr}: n={n} deficit={d:+.0f} "
+                 f"({100*d/tot_delta if tot_delta else 0:.0f}%)")
+print("        by stage (many/many): " + ";  ".join(parts[:5]))
 PYEOF
 done; done; done
 echo

@@ -810,8 +810,15 @@ HaplotypeResult genotype_haplotype_pairs(
 
     const double log_eps = std::log(options.error_rate);
     const double log_1meps = std::log1p(-options.error_rate);
+    // CONVENTION: `error_rate` is the total substitution probability at a base, so a SPECIFIC
+    // observed mismatch has probability error_rate/3 -- which is what the simulator draws, choosing
+    // uniformly among the other three bases. Using log(error_rate) per mismatch would be the
+    // probability of "some substitution", counted once per observed base, and overstates every
+    // mismatched read by log(3) per edit. It cancels between the two scorers, so it never showed in a
+    // differential, but it is wrong for a calibrated likelihood and therefore for GQ.
+    const double log_eps3 = std::log(options.error_rate / 3.0);
     const auto read_ll = [&](std::size_t edits, std::size_t len) {
-        return static_cast<double>(edits) * log_eps +
+        return static_cast<double>(edits) * log_eps3 +
                static_cast<double>(len - std::min(edits, len)) * log_1meps;
     };
     long min_frag_len = 1;
@@ -841,6 +848,13 @@ HaplotypeResult genotype_haplotype_pairs(
     // haplotype is not seeded for the pair being scored, and counting it as seeded attributes its
     // deficit to the wrong stratum. The right unit is still the FRAGMENT -- one anchored mate can
     // rescue the other through the insert constraint -- but the haplotype has to match the dump.
+    // THREE states, not one. "Seeded" only means a seed candidate survived for that mate on that
+    // haplotype; it does not mean the candidate produced a placement, nor that the two mates formed a
+    // valid FR fragment. The evidence can disappear at any of the three, and only splitting them says
+    // which.
+    //   bit 0/1 : mate 1 / mate 2 had a seed candidate
+    //   bit 2/3 : mate 1 / mate 2 produced a successful placement
+    //   bit 4   : a valid FR paired state was formed
     std::vector<std::uint8_t> mates_seeded(fragments.size() * nh, 0);
     // EVERY distinct placement, not just the best one. A fragment compatible with several copies of a
     // repeat is evidence for a haplotype offering several, and pinning it to one arbitrary copy
@@ -997,6 +1011,8 @@ HaplotypeResult genotype_haplotype_pairs(
             const std::vector<Placed> a1 = place_all(c1, hi, F.r1, r1rc, band1);
             const std::vector<Placed> a2 = F.r2.empty() ? std::vector<Placed>{}
                                                         : place_all(c2, hi, F.r2, r2rc, band2);
+            if (!a1.empty()) mates_seeded[fi * nh + hi] |= 4u;
+            if (!a2.empty()) mates_seeded[fi * nh + hi] |= 8u;
             double lp = kNegInf;      // the accumulated likelihood: max, or the sum when marginalising
             double best = kNegInf;    // always the best single placement, so the midpoint is a real one
             long mid = -1;
@@ -1017,6 +1033,7 @@ HaplotypeResult genotype_haplotype_pairs(
                         const Placed& fw = x.fwd ? x : y;
                         const Placed& rv = x.fwd ? y : x;
                         if (rv.end < fw.start) continue;          // reverse mate must lie downstream
+                        mates_seeded[fi * nh + hi] |= 16u;
                         double v = read_ll(x.edits, F.r1.size()) + read_ll(y.edits, F.r2.size())
                                  + log_half_strand;
                         if (options.use_insert_size) {
@@ -1584,8 +1601,9 @@ HaplotypeResult genotype_haplotype_pairs(
             const bool homoz = (a == b);
             std::ofstream mf(options.dump_fragment_mass);
             if (mf) {
+                mf.precision(17);
                 mf << "# pair\t" << out.shortlist[a] << '\t' << out.shortlist[b] << '\n';
-                mf << "fragment\tlog_mass\tmates_seeded\tcontrib\n";
+                mf << "fragment\tlog_mass\tmates_seeded\tcontrib\tmates_placed\tvalid_fr\n";
                 for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
                     double lse = kNegInf;
                     for (const auto& pr : placements[fi * nh + a]) lse = log_add(lse, pr.ll + pr.log_mult);
@@ -1598,7 +1616,9 @@ HaplotypeResult genotype_haplotype_pairs(
                     const std::uint8_t ma = mates_seeded[fi * nh + a];
                     const std::uint8_t mb = homoz ? ma : mates_seeded[fi * nh + b];
                     const std::uint8_t both = static_cast<std::uint8_t>(ma | mb);
-                    const int nseed = ((both & 1u) ? 1 : 0) + ((both & 2u) ? 1 : 0);
+                    const int nseed  = ((both & 1u) ? 1 : 0) + ((both & 2u) ? 1 : 0);
+                    const int nplace = ((both & 4u) ? 1 : 0) + ((both & 8u) ? 1 : 0);
+                    const int fr     = (both & 16u) ? 1 : 0;
                     // The full per-fragment CONTRIBUTION, so a reconciliation is possible: exposure
                     // is common to both arms at a fixed pair, so the per-fragment deltas must sum
                     // exactly to the whole-pair difference. A dump of placement mass alone cannot be
@@ -1609,7 +1629,7 @@ HaplotypeResult genotype_haplotype_pairs(
                                        : std::log1p(-options.outlier_mix) + std::log(lambda_joint) + lse,
                         std::log(options.outlier_mix) + floors[fi]);
                     mf << fragments[fi].name << '\t' << lse << '\t' << nseed << '\t'
-                       << contrib << '\n';
+                       << contrib << '\t' << nplace << '\t' << fr << '\n';
                 }
             }
         }
@@ -1954,6 +1974,9 @@ void write_haplotype_results(const std::string& out_prefix,
     const std::string pp = out_prefix + ".hap_pairs.tsv";
     std::ofstream pf(pp);
     if (!pf) throw std::runtime_error("genotype-frag: cannot write " + pp);
+    // Full precision: the reconciliation identity is exact arithmetic, so a 6-significant-digit score
+    // makes a correct decomposition look like a mismatch at the 1e-6 gate.
+    pf.precision(17);
     pf << "rank\thap1\thap2\tscore\tdelta\tposterior\n";
     const double best = result.top_pairs.empty() ? 0.0 : result.top_pairs.front().score;
     for (std::size_t i = 0; i < result.top_pairs.size(); ++i) {
@@ -1975,6 +1998,8 @@ namespace {
 // the fragment either agrees with the sequence there or it does not. Indels inside a read would need
 // alignment and would make "the set of starts" ambiguous, which is exactly the ambiguity the contract
 // removes. Fixtures are built without them.
+// `log_eps` here is log(error_rate/3): the probability of a SPECIFIC mismatching base, matching the
+// simulator, which substitutes uniformly among the other three.
 double reference_emission(const std::string& read, const std::string& target, std::size_t offset,
                           double log_eps, double log_1meps) {
     if (offset + read.size() > target.size()) return kNegInf;

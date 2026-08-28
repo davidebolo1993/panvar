@@ -380,12 +380,13 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         if (!hopt.dump_fragment_mass.empty()) {
             std::ofstream mf(hopt.dump_fragment_mass);
             if (!mf) throw std::runtime_error("genotype-frag: cannot write " + hopt.dump_fragment_mass);
+            mf.precision(17);
             mf << "# reference\n" << "fragment\tlog_mass\tmates_seeded\tcontrib\n";
             for (std::size_t i = 0; i < mass.size() && i < frags.size(); ++i) {
                 mf << frags[i].name << '\t' << mass[i] << "\tNA\t" << contrib[i] << '\n';
             }
         }
-        std::printf("%.6f\n", v);
+        std::printf("%.17g\n", v);
         return 0;
     }
     if (!exact_distance.empty()) {

@@ -157,13 +157,15 @@ BG=$(score "$OUT/A.fa" "$OUT/A.fa" "$OUT/reads_bg.fa")
 "$PY" - "$AA" "$BG" <<'PYEOF'
 import sys, math
 aa, bg = float(sys.argv[1]), float(sys.argv[2])
+# error_rate is the TOTAL substitution probability, so a specific mismatching base has eps/3 --
+# the same convention the scorer and the simulator use.
 eta, eps, bgdiv, n = 0.05, 0.01, 0.10, 240
 e_bg = int(bgdiv * n)
-floor = math.log(eta) + e_bg*math.log(eps) + (n-e_bg)*math.log1p(-eps)
+floor = math.log(eta) + e_bg*math.log(eps/3) + (n-e_bg)*math.log1p(-eps)
 placed = math.log(1-eta) + math.log(0.05) + math.log(0.5) - 4.83
 predicted = 5 * (placed - floor)
 e_rand = int(0.75 * n)
-unbounded = 5 * (placed - (e_rand*math.log(eps) + (n-e_rand)*math.log1p(-eps)))
+unbounded = 5 * (placed - (e_rand*math.log(eps/3) + (n-e_rand)*math.log1p(-eps)))
 drop = aa - bg
 print(f"  .... five unexplained fragments cost {drop:.1f} nats; bound predicts ~{predicted:.0f}, "
       f"unbounded would be ~{unbounded:.0f}")
