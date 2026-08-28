@@ -1691,10 +1691,44 @@ double reference_emission(const std::string& read, const std::string& target, st
            static_cast<double>(read.size() - mism) * log_1meps;
 }
 
-// log Pr(insert length L) under the library prior, normalised over the range actually summed.
-double reference_insert_logprior(double L, double mean, double sd) {
-    const double z = (L - mean) / sd;
-    return -0.5 * z * z - std::log(sd) - 0.9189385332046727;
+// The discrete insert prior pi(L), NORMALISED over exactly the range summed, and using the same
+// concordant/discordant mixture the accelerated path uses. Both properties matter:
+//
+//   * unnormalised, the event term and the exposure disagree by a constant that depends on the range,
+//     and the "likelihood" is then not a density over anything;
+//   * a pure Gaussian here against a mixture in the fast path is a model difference, so a discrepancy
+//     between them could not be attributed to acceleration.
+struct InsertPrior {
+    long lo = 0, hi = 0;
+    std::vector<double> logp;   // indexed by L - lo, normalised to sum to 1
+    double log_at(long L) const {
+        if (L < lo || L > hi) return kNegInf;
+        return logp[static_cast<std::size_t>(L - lo)];
+    }
+};
+
+InsertPrior make_insert_prior(const ReferenceParams& p, long min_len) {
+    InsertPrior ip;
+    ip.lo = std::max<long>(min_len,
+                           static_cast<long>(p.fragment_len - p.insert_sigmas * p.fragment_sd));
+    ip.hi = static_cast<long>(p.fragment_len + p.insert_sigmas * p.fragment_sd);
+    if (ip.hi < ip.lo) ip.hi = ip.lo;
+    const double span = static_cast<double>(ip.hi - ip.lo + 1);
+    std::vector<double> w;
+    w.reserve(static_cast<std::size_t>(span));
+    double total = kNegInf;
+    for (long L = ip.lo; L <= ip.hi; ++L) {
+        const double z = (static_cast<double>(L) - p.fragment_len) / p.fragment_sd;
+        const double conc = std::log1p(-p.discordant_rate) - 0.5 * z * z
+                          - std::log(p.fragment_sd) - 0.9189385332046727;
+        const double disc = std::log(p.discordant_rate) - std::log(span);
+        const double v = log_add(conc, disc);
+        w.push_back(v);
+        total = log_add(total, v);
+    }
+    ip.logp.reserve(w.size());
+    for (const double v : w) ip.logp.push_back(v - total);
+    return ip;
 }
 
 // log sum over every start on ONE haplotype of P(f | start), with the insert prior integrated.
@@ -1702,33 +1736,31 @@ double reference_insert_logprior(double L, double mean, double sd) {
 // `trail` maps forward at start + L - |trail|.
 double reference_orientation(const std::string& lead, const std::string& trail,
                              const std::string& hap, const ReferenceParams& p,
+                             const InsertPrior& ip,
                              double log_eps, double log_1meps) {
     if (hap.empty() || lead.empty()) return kNegInf;
-    const Fragment tmp;
-    (void)tmp;
-    const long lo_ins = std::max<long>(static_cast<long>(lead.size() + trail.size()),
-                                       static_cast<long>(p.fragment_len - p.insert_sigmas * p.fragment_sd));
-    const long hi_ins = static_cast<long>(p.fragment_len + p.insert_sigmas * p.fragment_sd);
     double acc = kNegInf;
     const long n = static_cast<long>(hap.size());
+    // The state is (start, L). Exactly these states are what the exposure counts, so the event term
+    // and its normaliser range over the same space -- the invariant the whole contract turns on.
     for (long s = 0; s + static_cast<long>(lead.size()) <= n; ++s) {
         const double e1 = reference_emission(lead, hap, static_cast<std::size_t>(s), log_eps, log_1meps);
         if (e1 == kNegInf) continue;
         if (trail.empty()) { acc = log_add(acc, e1); continue; }
-        for (long L = lo_ins; L <= hi_ins; ++L) {
+        for (long L = ip.lo; L <= ip.hi; ++L) {
+            if (s + L > n) break;                  // this start cannot host this insert length
             const long m2 = s + L - static_cast<long>(trail.size());
-            if (m2 < 0 || m2 + static_cast<long>(trail.size()) > n) continue;
+            if (m2 < 0) continue;
             const double e2 = reference_emission(trail, hap, static_cast<std::size_t>(m2), log_eps, log_1meps);
             if (e2 == kNegInf) continue;
-            acc = log_add(acc, e1 + e2 +
-                          reference_insert_logprior(static_cast<double>(L), p.fragment_len, p.fragment_sd));
+            acc = log_add(acc, e1 + e2 + ip.log_at(L));
         }
     }
     return acc;
 }
 
 double reference_fragment_on_haplotype(const Fragment& f, const std::string& hap,
-                                       const ReferenceParams& p,
+                                       const ReferenceParams& p, const InsertPrior& ip,
                                        const std::string& r2rc,
                                        double log_eps, double log_1meps) {
     if (hap.empty() || f.r1.empty()) return kNegInf;
@@ -1738,8 +1770,8 @@ double reference_fragment_on_haplotype(const Fragment& f, const std::string& hap
     // reverse-complemented by block concatenation, so a scorer that assumes one strand is wrong on
     // real panel sequence, not only on a contrived fixture.
     const std::string r1rc = reverse_complement(f.r1);
-    const double fwd = reference_orientation(f.r1, r2rc, hap, p, log_eps, log_1meps);
-    const double rev = reference_orientation(f.r2, r1rc, hap, p, log_eps, log_1meps);
+    const double fwd = reference_orientation(f.r1, r2rc, hap, p, ip, log_eps, log_1meps);
+    const double rev = reference_orientation(f.r2, r1rc, hap, p, ip, log_eps, log_1meps);
     const double half = std::log(0.5);
     return log_add(fwd == kNegInf ? kNegInf : half + fwd,
                    rev == kNegInf ? kNegInf : half + rev);
@@ -1753,15 +1785,31 @@ double reference_pair_loglik(const std::string& hap_a, const std::string& hap_b,
     const double log_eps = std::log(params.error_rate);
     const double log_1meps = std::log1p(-params.error_rate);
 
-    // Exposure is a count of START POSITIONS, over exactly the starts the placement sum below ranges
-    // over. Both homologues are counted, so a homozygous pair (the same sequence passed twice) gets
-    // double exposure and a doubled placement set, which is the whole of what homozygosity means here.
-    const auto starts_of = [&](const std::string& h) {
+    // One prior, shared by the event term and the exposure. Its lower bound is the longest fragment
+    // present, because an insert shorter than the two mates is not a state at all.
+    long min_len = 1;
+    for (const Fragment& f : fragments) {
+        min_len = std::max<long>(min_len, static_cast<long>(f.r1.size() + f.r2.size()));
+    }
+    const InsertPrior ip = make_insert_prior(params, min_len);
+
+    // Exposure over the SAME (start, L) states the event term sums:
+    //
+    //     E_h = SUM over L of pi(L) * max(0, |H_h| - L + 1)
+    //
+    // Counting starts that admit only the SHORTEST insert credits a start near the end of a
+    // haplotype with lengths it cannot host, so the normaliser would cover states the event term
+    // never visits.
+    const auto exposure_of = [&](const std::string& h) {
         const long n = static_cast<long>(h.size());
-        const long need = static_cast<long>(params.fragment_len - params.insert_sigmas * params.fragment_sd);
-        return static_cast<double>(std::max<long>(0, n - std::max<long>(1, need) + 1));
+        double e = 0.0;
+        for (long L = ip.lo; L <= ip.hi; ++L) {
+            const double starts = static_cast<double>(std::max<long>(0, n - L + 1));
+            if (starts > 0.0) e += std::exp(ip.log_at(L)) * starts;
+        }
+        return e;
     };
-    const double exposure = starts_of(hap_a) + starts_of(hap_b);
+    const double exposure = exposure_of(hap_a) + exposure_of(hap_b);
 
     double total = -params.lambda * exposure;
     const double log_lam = std::log(params.lambda);
@@ -1773,8 +1821,8 @@ double reference_pair_loglik(const std::string& hap_a, const std::string& hap_b,
         if (len == 0) continue;
         const std::string r2rc = f.r2.empty() ? std::string() : reverse_complement(f.r2);
         // The fragment may have come from either homologue: one sum over the union of their starts.
-        double lse = reference_fragment_on_haplotype(f, hap_a, params, r2rc, log_eps, log_1meps);
-        lse = log_add(lse, reference_fragment_on_haplotype(f, hap_b, params, r2rc, log_eps, log_1meps));
+        double lse = reference_fragment_on_haplotype(f, hap_a, params, ip, r2rc, log_eps, log_1meps);
+        lse = log_add(lse, reference_fragment_on_haplotype(f, hap_b, params, ip, r2rc, log_eps, log_1meps));
 
         const double bg = static_cast<double>(
                               static_cast<std::size_t>(params.bg_divergence * static_cast<double>(len))) * log_eps +

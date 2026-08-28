@@ -569,6 +569,10 @@ struct ReferenceParams {
     double fragment_sd = 50.0;
     double bg_divergence = 0.10; // the background's implied per-base disagreement
     int insert_sigmas = 4;       // how far into the insert prior's tails to sum
+    // Same concordant/discordant mixture the accelerated path uses. A pure Gaussian here would be a
+    // MODEL difference, so any discrepancy between the two scorers could not be blamed on
+    // acceleration -- which is the only thing the differential test is for.
+    double discordant_rate = 0.01;
 };
 
 // log L(a,b) under the contract. `hap_a` and `hap_b` are the two homologues; pass the same sequence

@@ -101,10 +101,22 @@ NF=$(grep -c '/1$' "$R")
 "$PY" - "$AA" "$A0" "$NF" <<'PYEOF'
 import sys, math
 aa, a0, nf = float(sys.argv[1]), float(sys.argv[2]), int(sys.argv[3])
-# starts(A) with fragment_len 350, sd 50, 4 sigmas -> need = 350-200 = 150; starts = 1400-150+1 = 1251
-expected = -0.05 * 1251 + nf * math.log(2)
+# Exposure is over (start, L), so E = SUM_L pi(L) * (N - L + 1), with pi the NORMALISED
+# concordant/discordant mixture over the range actually summed. Computed here rather than
+# hard-coded, so that the prediction tracks the contract instead of a previous implementation.
+N, mu, sd, disc = 1400, 350.0, 50.0, 0.01
+lo, hi = int(mu - 4*sd), int(mu + 4*sd)
+span = hi - lo + 1
+w = []
+for L in range(lo, hi + 1):
+    z = (L - mu) / sd
+    conc = (1 - disc) * math.exp(-0.5*z*z) / (sd * math.sqrt(2*math.pi))
+    w.append(conc + disc / span)
+tot = sum(w)
+E = sum((wi / tot) * max(0, N - L + 1) for wi, L in zip(w, range(lo, hi + 1)))
+expected = -0.05 * E + nf * math.log(2)
 got = aa - a0
-print(f"  .... predicted {expected:.3f}, observed {got:.3f}")
+print(f"  .... exposure {E:.1f} start-length states; predicted {expected:.3f}, observed {got:.3f}")
 sys.exit(0 if abs(expected - got) < 0.6 else 1)
 PYEOF
 [ $? -eq 0 ] && ok "homozygous doubling matches the analytic prediction (-lambda*starts + n*log2)" \

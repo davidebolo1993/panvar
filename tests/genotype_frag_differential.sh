@@ -60,9 +60,9 @@ seq_for() { case "$1" in hA) printf '%s' "$S_hA";; hB) printf '%s' "$S_hB";; hC)
 for h in hA hB hC hD hE hF; do printf '>%s\n%s\n' "$h" "$(seq_for "$h")" > "$OUT/$h.fa"; done
 
 # a diploid sample: hA / hB
-emit_pairs() { awk -v s="$1" -v tag="$2" -v step="$3" 'BEGIN{
+emit_pairs() { awk -v s="$1" -v tag="$2" -v step="$3" -v off="${4:-0}" 'BEGIN{
     rl=120; ins=350; n=length(s);
-    for(i=0;i+ins-1<=n;i+=step){
+    for(i=off;i+ins-1<=n;i+=step){
       r1=substr(s,i+1,rl); r2=substr(s,i+ins-rl+1,rl);
       rc=""; for(j=length(r2);j>0;j--){c=substr(r2,j,1);
         rc=rc (c=="A"?"T":c=="C"?"G":c=="G"?"C":"A")}
@@ -136,6 +136,15 @@ err=[abs(rd[k]-fd[k]) for k in common]
 spread=max(rd.values())-min(rd.values())
 print(f"  .... reference spread {spread:.1f} nats; max error in pairwise differences {max(err):.1f}"
       f" ({100*max(err)/spread:.1f}% of spread)")
+# A percentage of the TOTAL spread can hide a large error next to the winner, which is the only place
+# it can change a call. What matters is the error among the top pairs against the winner's margin:
+# the acceleration is decision-safe only while the former is smaller than the latter.
+order_ref_all=sorted(common,key=lambda k:-ref[k])
+margin = ref[order_ref_all[0]] - ref[order_ref_all[1]] if len(order_ref_all) > 1 else float("inf")
+top = order_ref_all[:5]
+top_err = max(abs(rd[k]-fd[k]) for k in top)
+print(f"  .... winner's margin {margin:.1f} nats; max error among the top 5 pairs {top_err:.1f}"
+      f"  -> {'DECISION-SAFE' if top_err < margin else 'NOT decision-safe'}")
 order_ref=sorted(common,key=lambda k:-ref[k])
 order_fast=sorted(common,key=lambda k:-fast[k])
 top3=order_ref[:3]==order_fast[:3]
@@ -171,7 +180,30 @@ TWO="${L}${SEG}${SEG}${SPC}${N}"
 } > "$OUT/r.gfa"
 "$BIN" bubble -i "$OUT/r.gfa" -r ref -o "$OUT/rbub" --min-variant-bp 0 -q >/dev/null 2>&1
 printf '>one\n%s\n' "$ONE" > "$OUT/one.fa"; printf '>two\n%s\n' "$TWO" > "$OUT/two.fa"
-emit_pairs "$TWO" t 20 > "$OUT/rreads.fa"     # sample is homozygous for the TWO-copy haplotype
+# TWO INDEPENDENT STREAMS. The sample is homozygous for TWO, so at lambda per HOMOLOGUE it carries
+# two homologues' worth of fragments. Emitting one stream gives the sample half the coverage both
+# candidate models assume, which is itself a factor of two and would be mistaken for one in the
+# scorer. Offset starts so the two streams are not identical fragments.
+{ emit_pairs "$TWO" tA 20; emit_pairs "$TWO" tB 20 10; } > "$OUT/rreads.fa"
+# The observed fragment count must match what lambda and the pair's exposure predict, or the fixture
+# and the model disagree before any scorer is compared.
+NRF=$(grep -c '/1$' "$OUT/rreads.fa")
+"$PY" - "$NRF" "${#TWO}" <<'PYEOF'
+import sys, math
+n, N = int(sys.argv[1]), int(sys.argv[2])
+mu, sd, disc, lam = 350.0, 50.0, 0.01, 0.05
+lo, hi = int(mu-4*sd), int(mu+4*sd); span = hi-lo+1
+w = [ (1-disc)*math.exp(-0.5*((L-mu)/sd)**2)/(sd*math.sqrt(2*math.pi)) + disc/span
+      for L in range(lo, hi+1) ]
+tot = sum(w)
+E = sum((wi/tot)*max(0, N-L+1) for wi, L in zip(w, range(lo, hi+1)))
+expected = lam * 2 * E                       # homozygous: two homologues
+print(f"  .... {n} fragments observed; model expects lambda*E(two,two) = {expected:.0f}")
+sys.exit(0 if abs(n-expected) < 0.35*expected else 1)
+PYEOF
+[ $? -eq 0 ] && ok "observed fragment count agrees with lambda x exposure for the homozygous pair" \
+             || bad "fragment count disagrees with the model's expectation; the fixture is miscalibrated"
+
 R2=$("$BIN" genotype-frag --reference-score "$OUT/two.fa" "$OUT/two.fa" -R "$OUT/rreads.fa" $P 2>/dev/null)
 R1=$("$BIN" genotype-frag --reference-score "$OUT/one.fa" "$OUT/one.fa" -R "$OUT/rreads.fa" $P 2>/dev/null)
 if gt "$R2" "$R1"; then
