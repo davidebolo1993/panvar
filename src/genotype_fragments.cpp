@@ -836,6 +836,10 @@ HaplotypeResult genotype_haplotype_pairs(
     // channel is built from this: a haplotype carrying sequence the sample does not have shows up as
     // a run of windows with no fragment in them.
     std::vector<std::int32_t> midpoint(fragments.size() * nh, -1);
+    // How many of a fragment's two mates carried at least one usable anchor. The right unit is the
+    // FRAGMENT, not the read: one anchored mate can rescue the other through the insert constraint,
+    // so a per-read seeding rate does not predict what recruitment recovers.
+    std::vector<std::uint8_t> mates_seeded(fragments.size(), 0);
     // EVERY distinct placement, not just the best one. A fragment compatible with several copies of a
     // repeat is evidence for a haplotype offering several, and pinning it to one arbitrary copy
     // leaves the others falsely empty -- which then charges the candidate for absence the placement
@@ -914,6 +918,7 @@ HaplotypeResult genotype_haplotype_pairs(
         };
         reduce(c1);
         reduce(c2);
+        mates_seeded[fi] = static_cast<std::uint8_t>((c1.empty() ? 0 : 1) + (c2.empty() ? 0 : 1));
         {
             static std::mutex comp_mu;
             std::lock_guard<std::mutex> lk(comp_mu);
@@ -1577,7 +1582,7 @@ HaplotypeResult genotype_haplotype_pairs(
             std::ofstream mf(options.dump_fragment_mass);
             if (mf) {
                 mf << "# pair\t" << out.shortlist[a] << '\t' << out.shortlist[b] << '\n';
-                mf << "fragment\tlog_mass\n";
+                mf << "fragment\tlog_mass\tmates_seeded\n";
                 for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
                     double lse = kNegInf;
                     for (const auto& pr : placements[fi * nh + a]) lse = log_add(lse, pr.ll + pr.log_mult);
@@ -1586,7 +1591,8 @@ HaplotypeResult genotype_haplotype_pairs(
                     } else if (lse != kNegInf) {
                         lse += std::log(2.0);
                     }
-                    mf << fragments[fi].name << '\t' << lse << '\n';
+                    mf << fragments[fi].name << '\t' << lse << '\t'
+                       << static_cast<int>(mates_seeded[fi]) << '\n';
                 }
             }
         }
