@@ -523,6 +523,57 @@ PYEOF
 [ $? -eq 0 ] && ok "the zero-seed pigeonhole returns exactly what scanning every start returns" \
              || bad "the pigeonhole filter LOSES placements -- it is a heuristic, not an acceleration"
 
+# ---- ambiguous bases must not make the pigeonhole lossy.
+# encode_piece rejects any piece containing a non-ACGT base. Where the read AND the haplotype both
+# carry N at a position this Hamming model scores it a MATCH, so that piece can be the only
+# mismatch-free one -- and skipping it leaves d pieces, which cannot corner d mismatches. The fixture
+# below is built so that is exactly what happens: N at read offset 5 (piece 0) against an N in the
+# haplotype, and one substitution inside each of pieces 1..6, six mismatches in total and within the
+# band. Mutation-tested: skipping unencodable pieces rather than falling back to the exhaustive scan
+# finds 2 placements where the scan finds 4.
+NW="$OUT/nfix"; mkdir -p "$NW"
+"$PY" - "$NW" <<'PYEOF'
+import sys, random
+out = sys.argv[1]; random.seed(41)
+def rnd(n): return "".join(random.choice("ACGT") for _ in range(n))
+def rc(s):  return s.translate(str.maketrans("ACGTN", "TGCAN"))[::-1]
+def sub(c): return random.choice([b for b in "ACGT" if b != c])
+L, M, Nf, X1, X2 = rnd(500), rnd(200), rnd(300), rnd(150), rnd(150)
+core = list(rnd(400)); core[105] = "N"; core = "".join(core)
+hA = L + core + X1 + M + Nf
+open(out + "/g.gfa", "w").write(
+    "H\tVN:Z:1.0\n"
+    + "S\t1\t" + L + core + "\nS\t2\t" + X1 + "\nS\t3\t" + X2 + "\nS\t4\t" + M + "\nS\t5\t" + Nf + "\n"
+    + "L\t1\t+\t2\t+\t0M\nL\t1\t+\t3\t+\t0M\nL\t2\t+\t4\t+\t0M\nL\t3\t+\t4\t+\t0M\nL\t4\t+\t5\t+\t0M\n"
+    + "P\thA\t1+,2+,4+,5+\t*\nP\thB\t1+,3+,4+,5+\t*\n")
+def damage(seq):
+    r = list(seq)
+    for pos in (20, 34, 48, 62, 76, 90): r[pos] = sub(r[pos])
+    return "".join(r)
+st, ins, rl = 600, 250, 100
+recs = [">z/1\n" + damage(hA[st:st+rl]) + "\n>z/2\n" + damage(rc(hA[st+ins-rl:st+ins])) + "\n"]
+for j, s2 in enumerate((60, 130, 1400, 1470)):
+    recs.append(">b%d/1\n%s\n>b%d/2\n%s\n" % (j, hA[s2:s2+rl], j, rc(hA[s2+ins-rl:s2+ins])))
+open(out + "/reads.fa", "w").write("".join(recs))
+PYEOF
+"$BIN" bubble -i "$NW/g.gfa" -r hA -o "$NW/bub" --min-variant-bp 0 -q >/dev/null 2>&1
+NP="--haploid-depth 0.05 --fragment-len 250 --fragment-sd 30 --error-rate 0.01 --max-divergence 0.05"
+for arm in filt exh; do
+  f="--zero-seed-fallback"; [ "$arm" = exh ] && f="--zero-seed-exhaustive"
+  "$BIN" genotype-frag -i "$NW/g.gfa" -b "$NW/bub" -o "$NW/$arm" -R "$NW/reads.fa" \
+    --haplotype-mode --rung-zero --hamming-emission --mate-rescue --top-pairs 10 $f $NP \
+    > "$NW/$arm.log" 2>&1
+done
+NF_F=$(grep -o "> [0-9]* placements" "$NW/filt.log" | grep -o "[0-9]*")
+NF_E=$(grep -o "> [0-9]* placements" "$NW/exh.log" | grep -o "[0-9]*")
+printf "  .... ambiguous-base fixture: filtered found %s placements, exhaustive scan %s\n" \
+       "${NF_F:-?}" "${NF_E:-?}"
+if [ -n "$NF_F" ] && [ "$NF_F" = "$NF_E" ] && [ "${NF_E:-0}" -gt 0 ]; then
+  ok "the pigeonhole keeps every placement when a piece contains an ambiguous base"
+else
+  bad "the pigeonhole LOSES placements over ambiguous bases (filtered $NF_F vs exhaustive $NF_E)"
+fi
+
 printf "  .... reference separates them by %s nats; then the approximations, one knob at a time:\n" "$REFDIFF"
 for tk in 2 8 32; do
   "$BIN" genotype-frag -i "$OUT/r.gfa" -b "$OUT/rbub" -o "$OUT/rk$tk" -R "$OUT/rreads.fa" \

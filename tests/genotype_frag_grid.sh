@@ -287,19 +287,48 @@ def all_scores(tag):
 m, z = all_scores("M"), all_scores("Z")
 if not m or not z or set(m) != set(z):
     print("        zero-seed: KEY SETS DIFFER -- not comparable"); sys.exit(1)
+ref = {}
+for l in open(os.path.join(W, "ref.tsv")):
+    k, _, v = l.rstrip("\n").partition("\t")
+    try: ref[k] = float(v)
+    except ValueError: pass
 log = open(os.path.join(W, "Z.log")).read() + open(os.path.join(W, "Z.time")).read()
 g = re.search(r"zero-seed: ran for (\d+) fragment-haplotype pairs \((\d+) pigeonhole, (\d+) "
               r"exhaustive\); (\d+) candidate starts -> (\d+) verified -> (\d+) placements", log)
 if not g:
     print("        zero-seed: arm produced no fallback report"); sys.exit(1)
 inv, pig, exh, cand, ver, pl = (int(x) for x in g.groups())
-# The fallback may only ADD evidence: it runs solely where neither mate placed, so no pair may lose
-# score against M. A drop means it perturbed a fragment recruitment had already placed.
+# MONOTONICITY IS NOT CORRECTNESS. "no pair loses score against rescue-only" passes a fallback that
+# adds mass everywhere, which is the characteristic failure of a search that proposes placements the
+# model would not accept. The binding comparison is against the exhaustive reference, at the named
+# pair AND over every diplotype, plus the reference's own equivalence class.
+# Two thresholds, deliberately different, and neither chosen to make this pass.
+#   named pair: 0.05 nats. This is the decision-relevant score and it measures 0.0000-0.0002.
+#   all diplotypes: 1.0 nat, the SAME equivalence tolerance the rest of this grid already uses, so
+#     the criterion is "cannot move a call" rather than "matches to rounding".
+# The all-diplotype residual is NOT zero and it GROWS with copy number -- 0.045, 0.083, 0.109, 0.243
+# nats at 4, 8, 16, 32 copies, on non-truth pairs while the named pair stays exact. It is far below
+# anything that can reorder a call, but it is unexplained, so the measured value is printed on every
+# run, passing or failing, rather than only when it breaches.
+ZTOL = 0.05
+ZTOL_ALL = 1.0
 worst = min(z[k] - m[k] for k in m)
+common = sorted(set(z) & set(ref))
+named = "many/many"
+named_err = abs(z[named] - ref[named]) if named in z and named in ref else float("nan")
+all_err = max(abs(z[k] - ref[k]) for k in common) if common else float("nan")
+rbest = max(ref[k] for k in common) if common else float("nan")
+zbest = max(z[k] for k in common) if common else float("nan")
+rcls = {k for k in common if rbest - ref[k] <= 1.0}
+zcls = {k for k in common if zbest - z[k] <= 1.0}
 print(f"        zero-seed: {inv} invocations ({pig} pigeonhole / {exh} exhaustive), "
-      f"{cand} candidates -> {ver} verified -> {pl} placements; "
-      f"worst pair change vs rescue-only {worst:+.3f}")
-sys.exit(0 if worst > -1e-9 else 1)
+      f"{cand} candidates -> {ver} verified -> {pl} placements")
+print(f"        zero-seed vs REFERENCE: named pair {named_err:.4f}, worst over {len(common)} "
+      f"diplotypes {all_err:.4f} (tol {ZTOL_ALL}); class {'preserved' if zcls == rcls else 'CHANGED'}; "
+      f"no pair lost vs rescue-only ({worst:+.3f})")
+ok = (pl > 0 and named_err == named_err and named_err < ZTOL and all_err < ZTOL_ALL
+      and zcls == rcls and worst > -1e-9)
+sys.exit(0 if ok else 1)
 PYEOF
 
   # Per-fragment decomposition of the deficit by seeding stratum. A fragment is the unit: one

@@ -1120,13 +1120,28 @@ HaplotypeResult genotype_haplotype_pairs(
                         const std::size_t d =
                             static_cast<std::size_t>(options.max_divergence
                                                      * static_cast<double>(q.size())) + 1;
-                        if (zs_piece > 0 && q.size() >= (d + 1) * zs_piece) {
+                        // Every one of the d+1 pieces must be encodable, or the pigeonhole
+                        // guarantee is void. Skipping an unencodable piece leaves only d pieces, and
+                        // d pieces cannot corner d mismatches. The case is real rather than
+                        // hypothetical: where the read and the haplotype BOTH carry N at a position,
+                        // this Hamming model scores it a match ('N' == 'N') while encode_piece
+                        // rejects both sides, so the index would never propose the start. A
+                        // haplotype N against a read base needs no special handling -- that already
+                        // counts as a mismatch, so such a piece is not mismatch-free anyway.
+                        bool all_encodable = zs_piece > 0 && q.size() >= (d + 1) * zs_piece;
+                        if (all_encodable) {
+                            for (std::size_t pc = 0; pc <= d; ++pc) {
+                                if (encode_piece(q, pc * zs_piece, zs_piece) == ~0ull) {
+                                    all_encodable = false; break;
+                                }
+                            }
+                        }
+                        if (all_encodable) {
                             ++zs_pigeon_local;
                             // d+1 disjoint pieces: at most d of them can carry a mismatch.
                             for (std::size_t pc = 0; pc <= d; ++pc) {
                                 const std::size_t at = pc * zs_piece;
                                 const std::uint64_t code = encode_piece(q, at, zs_piece);
-                                if (code == ~0ull) continue;
                                 const auto it = zs_index.find(code);
                                 if (it == zs_index.end()) continue;
                                 for (const auto& hp : it->second) {
