@@ -327,8 +327,15 @@ struct HaplotypeScoreOptions : FragmentScoreOptions {
     // send every decision to the product, and an equality assertion then compares the product with
     // itself and passes while testing nothing.
     bool force_join = false;
-    // Zero-seed fallback: for a candidate haplotype on which NEITHER mate obtained a primary
-    // syncmer placement, find placements directly. Exhaustive under the fixed-position Hamming
+    // NAMING, because the flag is misleading and the distinction matters: this is a
+    // NO-PRIMARY-PLACEMENT fallback, not strictly a zero-seed one. The guard tests
+    // a1.empty() && a2.empty() AFTER placement, so it fires when recruitment produced no surviving
+    // placement -- which includes fragments that seeded fine but whose anchors all failed to align
+    // within the band, not only fragments with no seed. The flag name is kept because the tests and
+    // the recorded measurements use it.
+    //
+    // For a candidate haplotype on which neither mate obtained a primary placement, find placements
+    // directly. Exhaustive under the fixed-position Hamming
     // contract -- it considers every start and keeps those within the band, which is exactly what
     // the primary path would keep had recruitment proposed them. Truth-independent, and it
     // introduces no new seed length to tune.
@@ -338,6 +345,12 @@ struct HaplotypeScoreOptions : FragmentScoreOptions {
     // rather than a heuristic -- and without this flag the only way to compare them is to change
     // max_divergence, which changes the band and therefore compares two different models.
     bool zero_seed_exhaustive = false;
+    // DIAGNOSTIC, not a production proposal: run the fallback for EVERY fragment-haplotype pair and
+    // union its placements with the primary ones. The shipped guard only fires when recruitment
+    // found nothing at all, so a fragment that recruited one placement but missed its other
+    // repeat-copy placements keeps an incomplete list. This measures whether that incompleteness is
+    // what the growing non-truth residual is made of.
+    bool zero_seed_complete = false;
     bool multiplicity_aware = false;
     double mass_tolerance = 1e-3;
     // How a haplotype-pair posterior becomes a per-block allele pair.

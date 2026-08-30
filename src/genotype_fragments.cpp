@@ -1106,7 +1106,9 @@ HaplotypeResult genotype_haplotype_pairs(
             // Runs ONLY when neither mate has a primary placement on this haplotype. A fragment that
             // recruitment placed is never touched by it, so it cannot perturb an existing
             // contribution -- that is a structural property of this guard, not a tuning choice.
-            if (options.zero_seed_fallback && a1.empty() && a2.empty()) {
+            const bool zs_run = options.zero_seed_fallback
+                && (options.zero_seed_complete || (a1.empty() && a2.empty()));
+            if (zs_run) {
                 ++zs_inv_local;
                 const std::string& H = haps[hi].seq;
                 const auto fallback_place = [&](const std::string& fwd, const std::string& rev,
@@ -1178,8 +1180,28 @@ HaplotypeResult genotype_haplotype_pairs(
                     }
                     return got;
                 };
-                a1 = fallback_place(F.r1, r1rc, band1);
-                if (!F.r2.empty()) a2 = fallback_place(F.r2, r2rc, band2);
+                std::vector<Placed> f1 = fallback_place(F.r1, r1rc, band1);
+                std::vector<Placed> f2 = F.r2.empty() ? std::vector<Placed>{}
+                                                      : fallback_place(F.r2, r2rc, band2);
+                if (options.zero_seed_complete) {
+                    // Union, deduplicated on (start, strand). Under the fixed-position Hamming
+                    // contract that pair identifies the state -- the end follows from the read
+                    // length -- so a placement recruitment already found is not added twice.
+                    const auto merge = [](std::vector<Placed>& into, const std::vector<Placed>& add) {
+                        for (const Placed& p : add) {
+                            bool seen = false;
+                            for (const Placed& q : into) {
+                                if (q.start == p.start && q.fwd == p.fwd) { seen = true; break; }
+                            }
+                            if (!seen) into.push_back(p);
+                        }
+                    };
+                    merge(a1, f1);
+                    merge(a2, f2);
+                } else {
+                    a1 = std::move(f1);
+                    a2 = std::move(f2);
+                }
                 // Whatever the fallback produced now flows through the SAME machinery as any other
                 // placement: one mate only goes to interval rescue below, both go to the adaptive
                 // coordinate join. No second scoring path exists for it.

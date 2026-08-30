@@ -328,6 +328,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--no-coordinate-join") { hopt.coordinate_join = false; hopt.force_join = false; }
         else if (a == "--force-join") { hopt.coordinate_join = true; hopt.force_join = true; }
         else if (a == "--zero-seed-fallback") hopt.zero_seed_fallback = true;
+        else if (a == "--zero-seed-complete") { hopt.zero_seed_fallback = true;
+                                                hopt.zero_seed_complete = true; }
         else if (a == "--zero-seed-exhaustive") { hopt.zero_seed_fallback = true;
                                                   hopt.zero_seed_exhaustive = true; }
         else if (a == "--multiplicity-aware") {
@@ -837,7 +839,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             if (hopt.zero_seed_fallback) {
                 char zb[320];
                 std::snprintf(zb, sizeof(zb),
-                              "zero-seed: ran for %llu fragment-haplotype pairs (%llu pigeonhole, "
+                              "no-primary-placement fallback (--zero-seed-*): ran for %llu "
+                              "fragment-haplotype pairs (%llu pigeonhole, "
                               "%llu exhaustive); %llu candidate starts -> %llu verified -> %llu "
                               "placements",
                               (unsigned long long)c.zs_invocations,

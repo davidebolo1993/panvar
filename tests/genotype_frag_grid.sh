@@ -293,7 +293,7 @@ for l in open(os.path.join(W, "ref.tsv")):
     try: ref[k] = float(v)
     except ValueError: pass
 log = open(os.path.join(W, "Z.log")).read() + open(os.path.join(W, "Z.time")).read()
-g = re.search(r"zero-seed: ran for (\d+) fragment-haplotype pairs \((\d+) pigeonhole, (\d+) "
+g = re.search(r"fallback \(--zero-seed-\*\): ran for (\d+) fragment-haplotype pairs \((\d+) pigeonhole, (\d+) "
               r"exhaustive\); (\d+) candidate starts -> (\d+) verified -> (\d+) placements", log)
 if not g:
     print("        zero-seed: arm produced no fallback report"); sys.exit(1)
@@ -304,8 +304,10 @@ inv, pig, exh, cand, ver, pl = (int(x) for x in g.groups())
 # pair AND over every diplotype, plus the reference's own equivalence class.
 # Two thresholds, deliberately different, and neither chosen to make this pass.
 #   named pair: 0.05 nats. This is the decision-relevant score and it measures 0.0000-0.0002.
-#   all diplotypes: 1.0 nat, the SAME equivalence tolerance the rest of this grid already uses, so
-#     the criterion is "cannot move a call" rather than "matches to rounding".
+#   all diplotypes: 1.0 nat, the SAME equivalence tolerance the rest of this grid already uses.
+#     This does NOT mean "cannot move a call" -- a sub-1-nat perturbation can reorder a call whose
+#     margin is smaller than the perturbation. What is established is narrower and is what the gate
+#     actually asserts: on these fixtures the reference equivalence CLASS is preserved.
 # The all-diplotype residual is NOT zero and it GROWS with copy number -- 0.045, 0.083, 0.109, 0.243
 # nats at 4, 8, 16, 32 copies, on non-truth pairs while the named pair stays exact. It is far below
 # anything that can reorder a call, but it is unexplained, so the measured value is printed on every
@@ -313,7 +315,14 @@ inv, pig, exh, cand, ver, pl = (int(x) for x in g.groups())
 ZTOL = 0.05
 ZTOL_ALL = 1.0
 worst = min(z[k] - m[k] for k in m)
-common = sorted(set(z) & set(ref))
+# EXACT key-set equality, not the intersection. Comparing only shared keys lets an arm that
+# silently dropped diplotypes agree beautifully on the ones it kept -- the same defect this suite
+# already had once, when a duplicated sequence removed the truth pair from the comparison.
+if set(z) != set(ref):
+    print(f"        zero-seed: KEY SETS DIFFER vs reference -- {len(set(ref) - set(z))} missing, "
+          f"{len(set(z) - set(ref))} extra")
+    sys.exit(1)
+common = sorted(z)
 named = "many/many"
 named_err = abs(z[named] - ref[named]) if named in z and named in ref else float("nan")
 all_err = max(abs(z[k] - ref[k]) for k in common) if common else float("nan")
