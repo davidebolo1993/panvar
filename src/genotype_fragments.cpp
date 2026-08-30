@@ -1443,7 +1443,17 @@ HaplotypeResult genotype_haplotype_pairs(
                         consider(v, (fw.start + rv.end) / 2);
                     }
                 }
-            } else {
+            } else if (F.r2.empty()) {
+            // SINGLE-END ONLY. For a PAIRED fragment, one placed mate plus a synthetic partner
+            // pinned at the band boundary is a state the exhaustive reference does not have: the
+            // reference scores complete (start, insert length, orientation) fragments, so a pair no
+            // complete placement explains falls to the background mixture. Granting it partial
+            // credit here made the accelerated scorer score HIGHER than the reference on exactly the
+            // fragments with mates_placed=1 and valid_fr=0, uniformly, and only on diplotypes where
+            // alternative repeat copies offer one-mate-only placements -- which is the non-truth
+            // side of the panel. Measured: all 22 discrepant fragments carried that signature.
+            // With no valid FR placement the mass stays -inf and falls through to floors[fi] below,
+            // which IS the background mixture.
                 for (const Placed& x : b1) consider(read_ll(x.edits, F.r1.size()) + miss2,
                                                     (x.start + x.end) / 2);
                 for (const Placed& y : b2) consider(miss1 + read_ll(y.edits, F.r2.size()),
@@ -1499,7 +1509,9 @@ HaplotypeResult genotype_haplotype_pairs(
                             add((fw.start + rv.end) / 2, fw.start, rv.end, x.fwd, v);
                         }
                     }
-                } else {
+                } else if (F.r2.empty()) {
+                    // Same restriction as the likelihood accumulation above: the partial-credit
+                    // state exists for genuinely single-end fragments only.
                     for (const Placed& x : b1) add((x.start + x.end) / 2, x.start, x.end, x.fwd,
                                                    read_ll(x.edits, F.r1.size()) + miss2);
                     for (const Placed& y : b2) add((y.start + y.end) / 2, y.start, y.end, y.fwd,

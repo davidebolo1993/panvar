@@ -574,6 +574,55 @@ else
   bad "the pigeonhole LOSES placements over ambiguous bases (filtered $NF_F vs exhaustive $NF_E)"
 fi
 
+# ---- a paired fragment with ONE placeable mate must not earn partial credit.
+# The accelerated scorer used to pair a placed mate with a synthetic partner pinned at the band
+# boundary. The exhaustive reference has no such state -- it scores complete (start, insert length,
+# orientation) fragments, so a pair nothing explains falls to the background mixture -- and the
+# pseudo-state made the accelerated score HIGHER than the reference on precisely the fragments with
+# mates_placed=1 and valid_fr=0. Here mate 1 is taken from hA and mate 2 is unrelated sequence that
+# occurs nowhere, so the fragment has one perfect mate and no valid FR placement at all.
+OW="$OUT/orphan"; mkdir -p "$OW"
+"$PY" - "$OW" "$OUT" <<'PYEOF'
+import sys, random
+out, src = sys.argv[1], sys.argv[2]
+random.seed(77)
+hA = "".join(l.strip() for l in open(src + "/hA.fa") if not l.startswith(">"))
+def rc(s): return s.translate(str.maketrans("ACGT", "TGCA"))[::-1]
+recs = []
+for j, st in enumerate((80, 300, 700, 1000)):
+    recs.append(">n%d/1\n%s\n>n%d/2\n%s\n" % (j, hA[st:st+120], j, rc(hA[st+350-120:st+350])))
+# the orphan: mate 1 exact from hA, mate 2 from nowhere
+alien = "".join(random.choice("ACGT") for _ in range(120))
+recs.append(">orphan/1\n%s\n>orphan/2\n%s\n" % (hA[500:620], alien))
+open(out + "/reads.fa", "w").write("".join(recs))
+PYEOF
+"$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OW/acc" -R "$OW/reads.fa" \
+  --haplotype-mode --rung-zero --hamming-emission --mate-rescue --top-pairs 10 \
+  --dump-fragment-mass "$OW/acc.mass" --dump-mass-pair hA,hA $P -q >/dev/null 2>&1
+"$BIN" genotype-frag --reference-score "$OUT/hA.fa" "$OUT/hA.fa" -R "$OW/reads.fa" $P \
+  --dump-fragment-mass "$OW/ref.mass" >/dev/null 2>&1
+"$PY" - "$OW/ref.mass" "$OW/acc.mass" <<'PYEOF'
+import sys
+def load(p):
+    d = {}
+    for l in open(p):
+        if l.startswith("#") or l.startswith("fragment"): continue
+        f = l.rstrip("\n").split("\t")
+        if len(f) >= 4:
+            try: d[f[0]] = float(f[3])
+            except ValueError: pass
+    return d
+r, a = load(sys.argv[1]), load(sys.argv[2])
+if "orphan" not in r or "orphan" not in a:
+    print("  .... orphan fragment missing from a dump -- assertion would be vacuous"); sys.exit(1)
+d = a["orphan"] - r["orphan"]
+print(f"  .... one-placeable-mate fragment: reference {r['orphan']:.4f}, accelerated "
+      f"{a['orphan']:.4f}, difference {d:+.4f}")
+sys.exit(0 if abs(d) < 1e-6 else 1)
+PYEOF
+[ $? -eq 0 ] && ok "a paired fragment with one placeable mate scores the same as in the reference" \
+             || bad "the accelerated scorer gives partial credit the reference does not"
+
 printf "  .... reference separates them by %s nats; then the approximations, one knob at a time:\n" "$REFDIFF"
 for tk in 2 8 32; do
   "$BIN" genotype-frag -i "$OUT/r.gfa" -b "$OUT/rbub" -o "$OUT/rk$tk" -R "$OUT/rreads.fa" \

@@ -216,10 +216,23 @@ bounded=$(awk -v s="$sc" 'BEGIN{print (s==s+0 && s>-50000) ? "yes" : "no"}')
 [ "$bounded" = "yes" ] \
   && ok "a grossly misdeclared insert costs a BOUNDED amount ($sc > -50000)" \
   || bad "score is $sc under a misdeclared insert; an unbounded Gaussian would land near -550000"
-[ "$(called_is_truth "$OUT/badins")" = "yes" ] \
-  && ok "and the correct pair still wins on sequence alone" \
-  || bad "a misdeclared insert changed the call; the insert channel is outvoting sequence"
-
+# THE OLD ASSERTION HERE WAS "and the correct pair still wins on sequence alone". It was wrong, and
+# it passed only because of a defect. Declaring 20 +/- 5 against a real 350 bp library collapses the
+# insert prior's support to the single length min_len, so NO fragment has a valid FR placement and
+# every fragment falls to the background mixture. Verified against the exhaustive reference on the
+# differential fixture: correctly declared it separates hA/hB -1797.0, hA/hC -9476.3, hE/hF -6269.0;
+# misdeclared it returns -21754.822399868175 for all three, an exact tie. The MODEL has no
+# discrimination left under a misdeclared insert.
+#
+# The accelerated scorer used to keep some, because it paired a placed mate with a synthetic partner
+# at the band boundary -- a state the reference does not have. So this assertion was requiring the
+# two scorers to DIFFER. What is true, and what is now asserted, is that the caller degrades into a
+# large equivalence class rather than reporting a confident wrong pair.
+NTOP=$(awk -F'\t' 'NR>1 && $5==0' "$OUT/badins.hap_pairs.tsv" | wc -l | tr -d ' ')
+NALL=$(( $(wc -l < "$OUT/badins.hap_pairs.tsv") - 1 ))
+[ "${NTOP:-0}" -gt 1 ] \
+  && ok "a misdeclared insert leaves the call UNDETERMINED ($NTOP of $NALL pairs tied), as it does in the reference" \
+  || bad "a misdeclared insert still produced a confident call ($NTOP of $NALL tied); the reference ties every pair"
 # ------------------------------------------------------ a third read under one name is not silent
 { cat "$OUT/reads.fa"; printf '>hA_1/1\n%s\n' "$(printf '%s' "$H1" | cut -c1-150)"; } > "$OUT/dup.fa"
 dup=$("$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/dup" -R "$OUT/dup.fa" \
