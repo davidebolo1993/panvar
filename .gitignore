@@ -48,3 +48,6 @@ reports/
 
 build_genotype_review/
 
+
+# external tool, cloned for comparison only -- not a dependency
+external/locityper/
