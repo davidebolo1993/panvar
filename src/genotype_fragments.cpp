@@ -334,6 +334,54 @@ std::vector<BlockFragmentResult> genotype_fragments(
         }
     }
 
+    // ---- fragment -> factor incidence ---------------------------------------------------------
+    // Recruitment offers a fragment to every block that could explain it, so the sets below are the
+    // raw evidence relation, not yet an assignment. The factor a fragment BELONGS to follows from
+    // the shape of that set:
+    //
+    //   0 blocks              unrecruited -- no factor, and it must not silently vanish
+    //   1 block               a local block emission
+    //   2 adjacent blocks     a transition factor across their boundary
+    //   >2 consecutive        a higher-order path factor
+    //   non-consecutive       ambiguous: shared evidence across repeated blocks, which must be
+    //                         retained as shared rather than arbitrarily assigned or double counted
+    //
+    // Emitted so the "exactly once" invariant is checkable: one row per fragment, always.
+    if (!options.incidence_path.empty()) {
+        std::vector<std::vector<std::size_t>> per_fragment(fragments.size());
+        for (std::size_t t = 0; t < tg.size(); ++t) {
+            for (const std::uint32_t fi : recruited[t]) per_fragment[fi].push_back(tg[t].block);
+        }
+        std::ofstream inc(options.incidence_path);
+        if (!inc) throw std::runtime_error("genotype-frag: cannot write " + options.incidence_path);
+        inc << "fragment\tn_blocks\tblocks\tfactor\tblock_a\tblock_b\n";
+        for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
+            std::vector<std::size_t>& b = per_fragment[fi];
+            std::sort(b.begin(), b.end());
+            b.erase(std::unique(b.begin(), b.end()), b.end());
+            const char* factor = "unrecruited";
+            std::string ba = ".", bb = ".";
+            if (b.size() == 1) {
+                factor = "local"; ba = std::to_string(b[0]);
+            } else if (b.size() > 1) {
+                const bool consecutive = (b.back() - b.front() + 1) == b.size();
+                if (consecutive && b.size() == 2) {
+                    factor = "boundary"; ba = std::to_string(b[0]); bb = std::to_string(b[1]);
+                } else if (consecutive) {
+                    factor = "path"; ba = std::to_string(b.front()); bb = std::to_string(b.back());
+                } else {
+                    factor = "ambiguous"; ba = std::to_string(b.front()); bb = std::to_string(b.back());
+                }
+            }
+            inc << fragments[fi].name << '\t' << b.size() << '\t';
+            for (std::size_t i = 0; i < b.size(); ++i) inc << (i ? "," : "") << b[i];
+            if (b.empty()) inc << '.';
+            inc << '\t' << factor << '\t' << ba << '\t' << bb << '\n';
+        }
+        inc.flush();
+        if (!inc) throw std::runtime_error("genotype-frag: write failed for " + options.incidence_path);
+    }
+
     // ---- the rest of the locus, for the competitive background --------------------------------
     std::vector<std::size_t> cons_off, cons_len;
     const std::string consensus =
@@ -2421,6 +2469,38 @@ MosaicFloors mosaic_floors(const std::vector<BlockAlleles>& blocks,
         out.penalised_switches.push_back(sw_count[best_h]);
     }
     return out;
+}
+
+void write_block_calls(const std::string& path, const std::vector<BlockCall>& calls) {
+    std::ofstream f(path);
+    if (!f) throw std::runtime_error("genotype: cannot write " + path);
+    f << "block\tkind\tbubble_id\tstatus\tallele1\tallele2\tallele_set\tdiploid_dosage\t"
+         "dosage_confidence\tallocation_determined\tlocal_gq\tlinkage_gq\tfit\t"
+         "fragments_informing\n";
+    const auto num = [](double v) { return v < 0.0 ? std::string(".") : std::to_string(v); };
+    const auto idx = [](int v) { return v < 0 ? std::string(".") : std::to_string(v); };
+    for (const BlockCall& c : calls) {
+        const char* kind = c.kind == BlockKind::Bubble ? "bubble"
+                         : c.kind == BlockKind::Backbone ? "backbone" : "flank";
+        const char* st = c.status == BlockCallStatus::Called ? "CALLED"
+                       : c.status == BlockCallStatus::Equivalent ? "EQUIVALENT"
+                       : c.status == BlockCallStatus::DosageOnly ? "DOSAGE_ONLY" : "OFF_PANEL";
+        f << c.block_index << '\t' << kind << '\t'
+          << (c.bubble_id < 0 ? std::string(".") : std::to_string(c.bubble_id)) << '\t' << st
+          << '\t' << idx(c.allele1) << '\t' << idx(c.allele2) << '\t';
+        if (c.allele_set.empty()) {
+            f << '.';
+        } else {
+            for (std::size_t i = 0; i < c.allele_set.size(); ++i) {
+                f << (i ? "," : "") << c.allele_set[i].first << '/' << c.allele_set[i].second;
+            }
+        }
+        f << '\t' << idx(c.diploid_dosage) << '\t' << num(c.dosage_confidence) << '\t'
+          << (c.allocation_determined ? "yes" : "no") << '\t' << num(c.local_gq) << '\t'
+          << num(c.linkage_gq) << '\t' << num(c.fit) << '\t' << c.fragments_informing << '\n';
+    }
+    f.flush();
+    if (!f) throw std::runtime_error("genotype: write failed for " + path);
 }
 
 void spell_called_pair(const std::vector<BlockAlleles>& blocks,

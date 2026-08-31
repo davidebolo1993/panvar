@@ -121,6 +121,11 @@ struct FragmentScoreOptions {
     // it" from "the likelihood ranks it below the wrong answer". Forcing removes the first
     // explanation and leaves the second exposed.
     std::vector<std::string> force_haplotypes;
+    // Where to write the fragment -> factor incidence table. Step 3 of the block-evidence plan:
+    // before any factor is scored, it must be possible to say which fragments inform which factor,
+    // and to check that each fragment informs EXACTLY ONE. "A fragment enters the likelihood exactly
+    // once" is already the standing invariant; this makes it inspectable rather than assumed.
+    std::string incidence_path;
     double outlier_mix = 0.05;
     // Divide each candidate's likelihood by the number of fragment start positions its context
     // offers. Without it P(fragment|allele) is not a generative likelihood and a SUPERSET allele is
@@ -721,6 +726,19 @@ std::string spell_block_haplotype(
 // and plausible, which is the same failure mode as the representation drift one layer above.
 std::string allele_catalogue_fingerprint(const std::vector<BlockAlleles>& blocks);
 
+// WHOLE-HAPLOTYPE MODE IS A DIAGNOSTIC ORACLE, NOT THE PRODUCT.
+//
+// Frozen 2026-08-31. It picks one complete panel pair by short-read likelihood, and the LPA
+// investigation established that this objective diverges from sequence reconstruction off-panel:
+// across 29 development donors the panel represents every one within 940 edits while the caller
+// lands a median ~11000 edits above the floor, and a mosaic oracle showed that added
+// representational flexibility recovers only ~134 of that. The divergence is not a bug to tune out
+// -- argmax P(reads|pair) and argmin d(pair,truth) are simply different pairs at a tandem array.
+//
+// It remains valuable and is kept: it generates certified floors, the injection experiments, the
+// equivalence machinery and an internal baseline. What it must NOT become is the module's output
+// contract. That is BlockCall above. Do not add scoring coefficients here in the hope of closing the
+// gap; that was tried and is recorded in the ledger (coverage weighting, refuted across 16 donors).
 HaplotypeResult genotype_haplotype_pairs(
     const std::vector<Block>& chain,
     const std::vector<BlockAlleles>& blocks,
@@ -736,6 +754,70 @@ void write_haplotype_results(
     const HaplotypeResult& result,
     bool have_truth,
     const std::string& catalogue_fingerprint = std::string());
+
+// ---------------------------------------------------------------------------------------------
+// THE BLOCK CALL CONTRACT
+//
+// What `genotype` reports per block once the fragment evidence engine replaces the marker emission.
+// Written as a schema first, deliberately, because the shape of the output is the architectural
+// decision: the module reports what the reads determine about each block, and says so when they
+// determine only part of it. It does NOT primarily report two named whole-locus haplotypes -- that
+// output is retained as a diagnostic oracle.
+//
+// The LPA investigation is the reason for every field here:
+//
+//   * dosage separate from composition -- at a KIV-2 array the reads routinely determine the diploid
+//     TOTAL while leaving the split between homologues unidentifiable. Reporting a confident pair
+//     there was the central failure: the caller returned 29+11 against a truth of 18+18 with the
+//     total nearly right.
+//   * allele_set, not one pair -- 457 alleles at LPA block 13, many observationally identical. The
+//     honest unit is the equivalence class; refining inside it needs linkage that often is not there.
+//   * local_gq and linkage_gq SEPARATE -- they fail independently, and a single margin conflates
+//     them. Measured: margin is anti-correlated with correctness across the development cohort.
+//   * status -- absolute fit, not score separation. A confidently wrong call reported margin 8181
+//     while a correct one reported 3807, so a wide margin is not evidence of a good call.
+//
+// Every field is always emitted. Unknown is "." and never an absent column: a reader must be able
+// to tell "not determined" from "not reported", which is exactly the distinction a vacuous audit
+// column destroys.
+enum class BlockCallStatus {
+    Called,        // an allele pair the fragments support
+    Equivalent,    // a set of pairs the fragments cannot separate
+    DosageOnly,    // total copy number determined, composition or allocation not
+    OffPanel,      // no allele pair explains the fragments adequately
+};
+
+struct BlockCall {
+    std::size_t block_index = 0;
+    BlockKind kind = BlockKind::Bubble;
+    long bubble_id = -1;
+    BlockCallStatus status = BlockCallStatus::OffPanel;
+
+    // Composition. allele1/allele2 are set only when status == Called; otherwise allele_set carries
+    // the members the evidence admits, and -1 means "not determined".
+    int allele1 = -1;
+    int allele2 = -1;
+    std::vector<std::pair<int, int>> allele_set;
+
+    // Dosage, which is often determined when composition is not.
+    int diploid_dosage = -1;          // total copies across both homologues, -1 = not determined
+    double dosage_confidence = -1.0;
+
+    // Allocation between homologues, reported ONLY where linkage supports it.
+    bool allocation_determined = false;
+
+    // Two confidences, because they fail independently: local_gq is "is this the right content",
+    // linkage_gq is "is this the right assignment to homologues".
+    double local_gq = -1.0;
+    double linkage_gq = -1.0;
+
+    // Absolute fit, the basis for OffPanel. Not a margin.
+    double fit = -1.0;                // e.g. posterior-predictive p-value; -1 = not computed
+    std::size_t fragments_informing = 0;
+};
+
+// Write the contract. One row per block, every column always present, "." for not determined.
+void write_block_calls(const std::string& path, const std::vector<BlockCall>& calls);
 
 // Spell a per-block call table into the two sequences it claims the sample carries.
 //

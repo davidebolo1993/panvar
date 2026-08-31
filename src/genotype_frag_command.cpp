@@ -58,7 +58,8 @@ void print_help() {
         << "  -o, --out-prefix <path>     Output prefix (required)\n"
         << "  -R, --reads <path>          FASTA/FASTQ, plain or gzipped; repeatable. Mates are joined\n"
         << "                              by name, so interleaved and split R1/R2 both work\n"
-        << "      --haplotype-mode        Score whole panel HAPLOTYPE pairs end to end and project\n"
+        << "      --haplotype-mode        DIAGNOSTIC ORACLE, not the product. Scores whole panel\n"
+        << "                              HAPLOTYPE pairs end to end and projects\n"
         << "                              the answer onto blocks, instead of scoring each block on\n"
         << "                              its own candidates. Measured reason it exists, at cyp2d6\n"
         << "                              block 5 under leave-ZERO-out: the panel's allele 7 (556 bp)\n"
@@ -340,6 +341,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--placement-bin") hopt.placement_bin = cli::parse_size_arg(a, value(i, a));
         else if (a == "--hamming-emission") hopt.hamming_emission = true;
         else if (a == "--band-floor") hopt.band_floor = true;
+        else if (a == "--incidence") opt.incidence_path = value(i, a);
         else if (a == "--unplaced-neutral") hopt.unplaced_neutral = true;
         else if (a == "--force-haplotypes") {
             for (const std::string& n : split_commas(value(i, a))) hopt.force_haplotypes.push_back(n);

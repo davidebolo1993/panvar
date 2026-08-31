@@ -583,6 +583,39 @@ BOTH=$(sed -n 2p "$OUT/bfneu.hap_pairs.tsv" 2>/dev/null | cut -f2,3)
 [ "$BOTH" = "$BASE" ] && ok "--band-floor and --unplaced-neutral compose" \
                       || bad "--band-floor + --unplaced-neutral gave '$BOTH', expected '$BASE'"
 
+# ------------------------------------------- fragment -> factor incidence (block-evidence step 3)
+# Before any factor is scored it must be possible to say which fragments inform which factor, and to
+# check that each informs EXACTLY ONE. "A fragment enters the likelihood exactly once" is the
+# standing invariant; the table makes it inspectable instead of assumed.
+"$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/inc" -R "$OUT/reads.fa" \
+  --incidence "$OUT/inc.tsv" --fragment-len 350 --fragment-sd 50 -t 2 -q >/dev/null 2>&1
+if [ -s "$OUT/inc.tsv" ]; then
+  ok "--incidence writes a fragment -> factor table"
+else
+  bad "--incidence wrote nothing"
+fi
+
+# THE GATE: one row per fragment, no fragment missing, no fragment twice.
+ROWS=$(( $(wc -l < "$OUT/inc.tsv") - 1 ))
+UNIQ=$(awk -F'\t' 'NR>1{print $1}' "$OUT/inc.tsv" | sort -u | wc -l | tr -d ' ')
+[ "$ROWS" = "$NFRAG" ] && ok "incidence has exactly one row per fragment ($ROWS)" \
+                       || bad "incidence has $ROWS rows for $NFRAG fragments"
+[ "$UNIQ" = "$ROWS" ] && ok "no fragment appears twice in the incidence table" \
+                      || bad "$ROWS rows but only $UNIQ distinct fragments"
+
+# Every row must carry a factor from the closed set -- an unclassified fragment is a silent hole.
+BADF=$(awk -F'\t' 'NR>1 && $4!="local" && $4!="boundary" && $4!="path" && $4!="ambiguous" && $4!="unrecruited"' \
+        "$OUT/inc.tsv" | wc -l | tr -d ' ')
+[ "$BADF" = 0 ] && ok "every fragment carries a factor from the closed set" \
+                || bad "$BADF fragments have an unrecognised factor"
+
+# On this fixture the two bubbles are 100 bp apart and fragments are 350 bp, so boundary-spanning
+# fragments MUST exist -- that is the whole reason the fixture uses M=100. A table showing only
+# local factors would mean the boundary case is unreachable and the assertion above is vacuous.
+NB=$(awk -F'\t' 'NR>1 && $4=="boundary"' "$OUT/inc.tsv" | wc -l | tr -d ' ')
+[ "$NB" -gt 0 ] && ok "boundary-spanning fragments are detected ($NB), so the class is reachable" \
+                || bad "no boundary fragments on a fixture built to produce them"
+
 echo
 if [ "$fails" -eq 0 ]; then echo "genotype-frag stats: all assertions passed"; else
   echo "genotype-frag stats: $fails assertion(s) failed"; fi
