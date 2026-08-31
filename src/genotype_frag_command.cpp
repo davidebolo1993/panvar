@@ -339,6 +339,11 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         }
         else if (a == "--placement-bin") hopt.placement_bin = cli::parse_size_arg(a, value(i, a));
         else if (a == "--hamming-emission") hopt.hamming_emission = true;
+        else if (a == "--band-floor") hopt.band_floor = true;
+        else if (a == "--unplaced-neutral") hopt.unplaced_neutral = true;
+        else if (a == "--force-haplotypes") {
+            for (const std::string& n : split_commas(value(i, a))) hopt.force_haplotypes.push_back(n);
+        }
         else if (a == "--dump-fragment-mass") hopt.dump_fragment_mass = value(i, a);
         else if (a == "--dump-mass-pair") { const std::vector<std::string> two = split_commas(value(i, a));
             if (two.size() != 2) throw std::runtime_error("genotype-frag: --dump-mass-pair needs two names");
@@ -986,6 +991,13 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         }
         log.info(std::to_string(hr.n_informative) + " of " + std::to_string(hr.n_fragments) +
                  " fragments discriminate between shortlisted haplotypes");
+        if (hopt.unplaced_neutral) {
+            // Reported, never assumed: this arm buys neutrality by DISCARDING evidence, and how much
+            // it discards is the cost that has to be weighed against what it fixes.
+            log.info("--unplaced-neutral dropped " + std::to_string(hr.n_neutralised) + " of " +
+                     std::to_string(hr.n_fragments) + " fragments as unseeded on some shortlisted "
+                     "haplotype (search never happened there)");
+        }
         if (have_truth) {
             // Whether the coarse stage kept the answer is reported, never assumed: a candidate
             // generator that drops the truth loses it outright and no score below can recover it.

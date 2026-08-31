@@ -90,6 +90,37 @@ struct FragmentScoreOptions {
     // at the likelihood of a `bg_divergence` read is the bounded-loss answer, at fragment level
     // rather than at marker level where `--marker-outlier` measured it and found it too late.
     double bg_divergence = 0.10;
+    // A fragment that cannot be placed within the band is charged at bg_divergence, which ASSERTS a
+    // divergence the data never showed -- all that is known is that it exceeds max_divergence. The
+    // gap between those two is a cliff at the band edge, and a haplotype carrying more copies of a
+    // tandem unit collects the fragments that fall off it. Measured at LPA: 267 net fragments, 0.9%
+    // of the data, carrying 84% of a 99,148-edit error at ~227 nats each.
+    //
+    // With this on, an unplaceable fragment is charged at the BAND BOUNDARY instead: the least
+    // penalty consistent with having failed to place. That is what the block-local candidate stage
+    // has always done (it adds read_ll(band, len) for a mate that fails to align); the final scorer
+    // dropped it, and the two have disagreed ever since.
+    bool band_floor = false;
+    // THREE fragment-haplotype states, not two. "Unplaceable" currently conflates:
+    //
+    //   (1) a valid placement                      -> the normal likelihood;
+    //   (2) seeds existed, alignment was tried and failed -> genuine negative evidence, charged at
+    //       the band boundary (--band-floor) rather than at an asserted bg_divergence;
+    //   (3) NO seed was ever offered on this haplotype -> the search did not happen. That is missing
+    //       evidence manufactured by the recruiter, and charging it penalises a haplotype for the
+    //       approximation rather than for the data.
+    //
+    // With this on, a fragment unseeded on ANY shortlisted haplotype is dropped from the likelihood
+    // entirely. Dropping globally rather than per pair is deliberate: pair totals must sum over the
+    // SAME fragment set or they are not comparable, and a per-pair set would silently reintroduce
+    // the asymmetry this exists to remove.
+    bool unplaced_neutral = false;
+    // Haplotypes forced into the shortlist regardless of their containment rank. This is how a
+    // known-good pair gets SCORED rather than merely reported as absent: --probe-haplotypes can only
+    // describe a pair the shortlist already holds, so it cannot separate "candidate generation lost
+    // it" from "the likelihood ranks it below the wrong answer". Forcing removes the first
+    // explanation and leaves the second exposed.
+    std::vector<std::string> force_haplotypes;
     double outlier_mix = 0.05;
     // Divide each candidate's likelihood by the number of fragment start positions its context
     // offers. Without it P(fragment|allele) is not a generative likelihood and a SUPERSET allele is
@@ -643,6 +674,9 @@ struct HaplotypeResult {
     std::vector<HaplotypePairScore> top_pairs;
     std::size_t n_fragments = 0;
     std::size_t n_informative = 0;
+    // Fragments dropped by --unplaced-neutral: unseeded on at least one shortlisted haplotype, so
+    // the search never happened there and the fragment cannot discriminate honestly.
+    std::size_t n_neutralised = 0;
     std::vector<BlockProjection> blocks;
     std::vector<HaplotypeProbe> probes;
     JointConvergence convergence;

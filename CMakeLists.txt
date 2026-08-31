@@ -349,7 +349,11 @@ if(PANVAR_BUILD_TESTING)
                 NAME panvar_genotype_frag_differential
                 COMMAND /usr/bin/env bash ${PANVAR_GENOTYPE_FRAG_DIFF} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/genotype_frag_differential
             )
-            set_tests_properties(panvar_genotype_frag_differential PROPERTIES TIMEOUT 900)
+            # 1800, not 900: this test has been measured at 805s, 898s and then a timeout, so it was
+            # sitting inside its own margin and would start failing spuriously on a loaded machine.
+            # The failure it produced was a timeout with ZERO failed assertions, which is the most
+            # expensive kind of red -- it looks like a regression and is not one.
+            set_tests_properties(panvar_genotype_frag_differential PROPERTIES TIMEOUT 1800)
         endif()
 
         # The approximation ladder. Not an assertion suite -- it MEASURES what each acceleration

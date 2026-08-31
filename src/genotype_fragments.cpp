@@ -29,6 +29,18 @@ KSEQ_INIT(gzFile, gzread)
 
 namespace panvar {
 
+namespace {
+// The per-mate alignment band, in edits. Defined once because THREE places need to agree on it: the
+// block-local stage's partial-credit term, the haplotype scorer's placement band, and the
+// band-boundary floor. The +1 matters -- two 150 bp mates at 5% give 8 + 8 = 16, not
+// floor(0.05 * 300) = 15 -- and a floor computed from the fragment's total length instead of
+// per mate is a different number that merely looks like the same one.
+inline std::size_t mate_band_edits(double max_divergence, std::size_t len) {
+    if (len == 0) return 0;
+    return static_cast<std::size_t>(max_divergence * static_cast<double>(len)) + 1;
+}
+} // namespace
+
 double InsertPrior::exposure(std::size_t hap_len) const {
     const long n = static_cast<long>(hap_len);
     double e = 0.0;
@@ -440,10 +452,8 @@ std::vector<BlockFragmentResult> genotype_fragments(
             }
             const std::string r1rc = reverse_complement(F.r1);
             const std::string r2rc = F.r2.empty() ? std::string() : reverse_complement(F.r2);
-            const std::size_t band1 =
-                static_cast<std::size_t>(options.max_divergence * static_cast<double>(F.r1.size())) + 1;
-            const std::size_t band2 =
-                static_cast<std::size_t>(options.max_divergence * static_cast<double>(F.r2.size())) + 1;
+            const std::size_t band1 = mate_band_edits(options.max_divergence, F.r1.size());
+            const std::size_t band2 = mate_band_edits(options.max_divergence, F.r2.size());
 
             const ReadFit p_fwd = infix_align(F.r1, T.contexts[probe], band1);
             const ReadFit p_rev = infix_align(r1rc, T.contexts[probe], band1);
@@ -834,6 +844,21 @@ HaplotypeResult genotype_haplotype_pairs(
         }
         ranked.swap(unique_ranked);
     }
+    // Forced haplotypes are moved to the front of the ranking, so they survive any cut. Their
+    // containment score is left untouched -- only their position changes -- because the score is
+    // reported and must stay the recruiter's own opinion.
+    if (!options.force_haplotypes.empty()) {
+        std::vector<std::pair<double, std::size_t>> forced, rest;
+        for (const auto& r : ranked) {
+            const bool want = std::find(options.force_haplotypes.begin(),
+                                        options.force_haplotypes.end(),
+                                        haplotype_names[r.second]) != options.force_haplotypes.end();
+            (want ? forced : rest).push_back(r);
+        }
+        ranked.clear();
+        ranked.insert(ranked.end(), forced.begin(), forced.end());
+        ranked.insert(ranked.end(), rest.begin(), rest.end());
+    }
     std::size_t nh = std::min(options.max_haplotypes, ranked.size());
     while (nh > 0 && nh < ranked.size() &&
            std::abs(ranked[nh].first - ranked[nh - 1].first) < 1e-12) {
@@ -904,6 +929,7 @@ HaplotypeResult genotype_haplotype_pairs(
 
     std::vector<double> ll(fragments.size() * nh, kNegInf);
     std::vector<double> floors(fragments.size(), kNegInf);
+    std::vector<double> band_floors(fragments.size(), kNegInf);
     // Where each fragment landed on each haplotype, or -1 where it did not land at all. The depth
     // channel is built from this: a haplotype carrying sequence the sample does not have shows up as
     // a run of windows with no fragment in them.
@@ -995,6 +1021,17 @@ HaplotypeResult genotype_haplotype_pairs(
         if (total_len == 0) return;
         floors[fi] = read_ll(
             static_cast<std::size_t>(options.bg_divergence * static_cast<double>(total_len)), total_len);
+        // The least penalty consistent with "did not place": exactly at the band edge, computed PER
+        // MATE so it reproduces the block-local partial-credit term term-for-term. Never harsher than
+        // the background floor, so this can only bound the influence, never raise it.
+        {
+            double b = 0.0;
+            b += read_ll(mate_band_edits(options.max_divergence, F.r1.size()), F.r1.size());
+            if (!F.r2.empty()) {
+                b += read_ll(mate_band_edits(options.max_divergence, F.r2.size()), F.r2.size());
+            }
+            band_floors[fi] = std::max(floors[fi], b);
+        }
 
         // Implied read start per (haplotype, orientation), gathered from the read's own syncmers.
         // Clustering on the implied START rather than on the match position is what lets one anchor
@@ -1505,7 +1542,10 @@ HaplotypeResult genotype_haplotype_pairs(
                 for (const Placed& y : b2) consider(miss1 + read_ll(y.edits, F.r2.size()),
                                                     (y.start + y.end) / 2);
             }
-            if (lp == kNegInf) { ll[fi * nh + hi] = floors[fi]; continue; }
+            if (lp == kNegInf) {
+                ll[fi * nh + hi] = options.band_floor ? band_floors[fi] : floors[fi];
+                continue;
+            }
             midpoint[fi * nh + hi] = static_cast<std::int32_t>(mid);
             ll[fi * nh + hi] = lp;
 
@@ -1643,9 +1683,25 @@ HaplotypeResult genotype_haplotype_pairs(
             }
         }
         for (std::size_t hi = 0; hi < nh; ++hi) {
-            if (ll[fi * nh + hi] == kNegInf) ll[fi * nh + hi] = floors[fi];
+            if (ll[fi * nh + hi] == kNegInf) {
+                ll[fi * nh + hi] = options.band_floor ? band_floors[fi] : floors[fi];
+            }
         }
     });
+
+    // State (3): drop fragments whose search never happened on some candidate. floors[fi] == kNegInf
+    // is the existing "skip this fragment" convention in every scoring loop, so this reuses it rather
+    // than adding a parallel flag that a loop could forget to check.
+    std::size_t neutralised = 0;
+    if (options.unplaced_neutral) {
+        for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
+            if (floors[fi] == kNegInf) continue;
+            for (std::size_t hi = 0; hi < nh; ++hi) {
+                if (mates_seeded[fi * nh + hi] == 0) { floors[fi] = kNegInf; ++neutralised; break; }
+            }
+        }
+    }
+    out.n_neutralised = neutralised;
 
     // True-origin placement recall. wgsim names each fragment "<haplotype>_<start>_<end>_...", so when
     // the origin haplotype is in the shortlist the placement the recruiter SHOULD have found is known

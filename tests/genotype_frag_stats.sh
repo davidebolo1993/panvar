@@ -543,6 +543,46 @@ DB2=$("$BIN" genotype-frag --exact-distance "$OUT/truth1.fa" "$OUT/truth1.fa" --
 [ "$DB2" = "0" ] && ok "--distance-band still returns the exact distance inside the band" \
                  || bad "identical sequences inside the band gave '$DB2', expected 0"
 
+# ------------------------------------------------- the band-boundary floor, and its arithmetic
+# A fragment that cannot be placed within the band was charged at bg_divergence, which ASSERTS a
+# divergence the data never showed -- all that is known is that it exceeds max_divergence. The gap
+# is a cliff at the band edge that a haplotype with more tandem copies collects fragments from.
+#
+# The boundary term is PER MATE and the +1 matters: two 150 bp mates at 5% give 8 + 8 = 16 edits,
+# not floor(0.05 * 300) = 15. A first implementation used the whole-fragment form, which is a
+# different number that merely looks like the same one -- 8 nats per fragment adrift.
+run "$OUT/bf" --band-floor -t 2
+[ -s "$OUT/bf.hap_pairs.tsv" ] && ok "--band-floor runs" || bad "--band-floor produced no output"
+
+# The control that matters: on a fixture with no tandem array and every read an exact substring,
+# every fragment places, so the floor is never reached and the call must not move.
+BASE=$(sed -n 2p "$OUT/base.hap_pairs.tsv" | cut -f2,3)
+BFP=$(sed -n 2p "$OUT/bf.hap_pairs.tsv" | cut -f2,3)
+[ "$BASE" = "$BFP" ] && ok "--band-floor does not change a call where every fragment places" \
+                     || bad "--band-floor moved a call it should not: '$BASE' -> '$BFP'"
+
+# --unplaced-neutral drops fragments unseeded on some shortlisted haplotype. On this fixture the
+# reads are exact substrings of two panel haplotypes, so the count is reportable and the call stands.
+NEU=$("$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/neu" -R "$OUT/reads.fa" \
+        --haplotype-mode --fragment-len 350 --fragment-sd 50 --unplaced-neutral -t 2 2>&1 \
+        | sed -nE 's/.*dropped ([0-9]+) of.*/\1/p')
+if [ -n "$NEU" ]; then
+  ok "--unplaced-neutral reports how many fragments it discards ($NEU)"
+else
+  bad "--unplaced-neutral did not report a discard count"
+fi
+NEUP=$(sed -n 2p "$OUT/neu.hap_pairs.tsv" 2>/dev/null | cut -f2,3)
+[ "$NEUP" = "$BASE" ] && ok "--unplaced-neutral does not change the call on a fully-seeded fixture" \
+                      || bad "--unplaced-neutral moved a call it should not: '$BASE' -> '$NEUP'"
+
+# The two flags must compose rather than conflict.
+"$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/bfneu" -R "$OUT/reads.fa" \
+  --haplotype-mode --fragment-len 350 --fragment-sd 50 --band-floor --unplaced-neutral -t 2 \
+  -q >/dev/null 2>&1
+BOTH=$(sed -n 2p "$OUT/bfneu.hap_pairs.tsv" 2>/dev/null | cut -f2,3)
+[ "$BOTH" = "$BASE" ] && ok "--band-floor and --unplaced-neutral compose" \
+                      || bad "--band-floor + --unplaced-neutral gave '$BOTH', expected '$BASE'"
+
 echo
 if [ "$fails" -eq 0 ]; then echo "genotype-frag stats: all assertions passed"; else
   echo "genotype-frag stats: $fails assertion(s) failed"; fi
