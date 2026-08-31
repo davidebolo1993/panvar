@@ -616,6 +616,59 @@ NB=$(awk -F'\t' 'NR>1 && $4=="boundary"' "$OUT/inc.tsv" | wc -l | tr -d ' ')
 [ "$NB" -gt 0 ] && ok "boundary-spanning fragments are detected ($NB), so the class is reachable" \
                 || bad "no boundary fragments on a fixture built to produce them"
 
+# --- adjacency must be measured on the TARGET CHAIN, not on raw block indices -------------------
+# The assertion above passed while the code was wrong. The main fixture's two bubbles sit at raw
+# block indices 1 and 2, so "adjacent index" and "adjacent target" coincide there and the two
+# definitions cannot be told apart. By default only BUBBLE blocks are targets, so on a real locus
+# consecutive targets are blocks 1,3,5,... and raw-index adjacency makes `boundary` unreachable --
+# measured at LPA, where 128 boundary-spanning fragments were reported as `ambiguous`.
+#
+# This fixture has THREE bubbles, and targets the first and third. They are two apart by index and
+# adjacent in the chain, so the two definitions disagree and only the correct one yields `boundary`.
+L3=$(seq_of 600 41); M3=$(seq_of 40 42); N3=$(seq_of 40 43); T3=$(seq_of 600 44)
+A1=$(seq_of 80 51); A2=$(seq_of 80 52)
+B1=$(seq_of 80 61); B2=$(seq_of 80 62)
+C1=$(seq_of 80 71); C2=$(seq_of 80 72)
+{ printf 'H\tVN:Z:1.0\n'
+  printf 'S\t1\t%s\n' "$L3"; printf 'S\t2\t%s\n' "$A1"; printf 'S\t3\t%s\n' "$A2"
+  printf 'S\t4\t%s\n' "$M3"; printf 'S\t5\t%s\n' "$B1"; printf 'S\t6\t%s\n' "$B2"
+  printf 'S\t7\t%s\n' "$N3"; printf 'S\t8\t%s\n' "$C1"; printf 'S\t9\t%s\n' "$C2"
+  printf 'S\t10\t%s\n' "$T3"
+  for a in 2 3; do printf 'L\t1\t+\t%s\t+\t0M\nL\t%s\t+\t4\t+\t0M\n' "$a" "$a"; done
+  for a in 5 6; do printf 'L\t4\t+\t%s\t+\t0M\nL\t%s\t+\t7\t+\t0M\n' "$a" "$a"; done
+  for a in 8 9; do printf 'L\t7\t+\t%s\t+\t0M\nL\t%s\t+\t10\t+\t0M\n' "$a" "$a"; done
+  printf 'P\tref\t1+,2+,4+,5+,7+,8+,10+\t*\n'
+  for i in 1 2; do printf 'P\thA%d\t1+,2+,4+,5+,7+,8+,10+\n' "$i"; done
+  for i in 1 2; do printf 'P\thB%d\t1+,3+,4+,6+,7+,9+,10+\n' "$i"; done
+} > "$OUT/g3.gfa"
+"$BIN" bubble -i "$OUT/g3.gfa" -r ref -o "$OUT/bub3" --min-variant-bp 0 -q >/dev/null 2>&1
+
+H3="${L3}${A1}${M3}${B1}${N3}${C1}${T3}"
+emit_pairs "$H3" hC 20 > "$OUT/reads3.fa"
+
+# Which raw indices are the bubbles at? The check is only meaningful if they are NOT consecutive.
+"$BIN" genotype-frag -i "$OUT/g3.gfa" -b "$OUT/bub3" -o "$OUT/i3all" -R "$OUT/reads3.fa" \
+  --incidence "$OUT/i3all.tsv" --fragment-len 350 --fragment-sd 50 -t 2 -q >/dev/null 2>&1
+IDX=$(awk -F'\t' 'NR>1 && $3!="."{n=split($3,a,","); for(i=1;i<=n;i++) print a[i]}' "$OUT/i3all.tsv" \
+      | sort -un | tr '\n' ',' | sed 's/,$//')
+case "$IDX" in
+  *,*,*) ok "three-bubble fixture targets blocks $IDX" ;;
+  *) bad "three-bubble fixture produced targets '$IDX', expected three" ;;
+esac
+
+# Target the FIRST and THIRD bubble. Two apart by raw index, adjacent in the chain.
+B1I=${IDX%%,*}; B3I=${IDX##*,}
+"$BIN" genotype-frag -i "$OUT/g3.gfa" -b "$OUT/bub3" -o "$OUT/i3" -R "$OUT/reads3.fa" \
+  --blocks "$B1I,$B3I" --incidence "$OUT/i3.tsv" --fragment-len 350 --fragment-sd 50 -t 2 \
+  -q >/dev/null 2>&1
+NB3=$(awk -F'\t' 'NR>1 && $4=="boundary"' "$OUT/i3.tsv" | wc -l | tr -d ' ')
+NA3=$(awk -F'\t' 'NR>1 && $4=="ambiguous"' "$OUT/i3.tsv" | wc -l | tr -d ' ')
+if [ "$NB3" -gt 0 ] && [ "$NA3" = 0 ]; then
+  ok "targets $B1I and $B3I are two apart by index but ADJACENT in the chain: boundary $NB3, ambiguous $NA3"
+else
+  bad "chain adjacency not honoured: boundary $NB3, ambiguous $NA3 (raw-index adjacency would give 0 and >0)"
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then echo "genotype-frag stats: all assertions passed"; else
   echo "genotype-frag stats: $fails assertion(s) failed"; fi

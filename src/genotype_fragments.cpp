@@ -348,6 +348,18 @@ std::vector<BlockFragmentResult> genotype_fragments(
     //
     // Emitted so the "exactly once" invariant is checkable: one row per fragment, always.
     if (!options.incidence_path.empty()) {
+        // ADJACENCY IS ON THE TARGET CHAIN, NOT ON RAW BLOCK INDICES. By default only bubble blocks
+        // are targets, so consecutive targets are blocks 1,3,5,... and their indices differ by two.
+        // Classifying on raw indices makes "boundary" unreachable and silently reports every
+        // boundary-spanning fragment as "ambiguous" -- measured at LPA, where block sets 15,17 and
+        // 9,11 are adjacent BUBBLES and were being called ambiguous.
+        std::vector<std::size_t> ordered;
+        for (std::size_t t = 0; t < tg.size(); ++t) ordered.push_back(tg[t].block);
+        std::sort(ordered.begin(), ordered.end());
+        ordered.erase(std::unique(ordered.begin(), ordered.end()), ordered.end());
+        std::unordered_map<std::size_t, std::size_t> rank_of;
+        for (std::size_t i = 0; i < ordered.size(); ++i) rank_of[ordered[i]] = i;
+
         std::vector<std::vector<std::size_t>> per_fragment(fragments.size());
         for (std::size_t t = 0; t < tg.size(); ++t) {
             for (const std::uint32_t fi : recruited[t]) per_fragment[fi].push_back(tg[t].block);
@@ -364,7 +376,11 @@ std::vector<BlockFragmentResult> genotype_fragments(
             if (b.size() == 1) {
                 factor = "local"; ba = std::to_string(b[0]);
             } else if (b.size() > 1) {
-                const bool consecutive = (b.back() - b.front() + 1) == b.size();
+                std::vector<std::size_t> r;
+                r.reserve(b.size());
+                for (const std::size_t x : b) r.push_back(rank_of[x]);
+                std::sort(r.begin(), r.end());
+                const bool consecutive = (r.back() - r.front() + 1) == r.size();
                 if (consecutive && b.size() == 2) {
                     factor = "boundary"; ba = std::to_string(b[0]); bb = std::to_string(b[1]);
                 } else if (consecutive) {
