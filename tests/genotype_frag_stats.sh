@@ -228,11 +228,14 @@ bounded=$(awk -v s="$sc" 'BEGIN{print (s==s+0 && s>-50000) ? "yes" : "no"}')
 # at the band boundary -- a state the reference does not have. So this assertion was requiring the
 # two scorers to DIFFER. What is true, and what is now asserted, is that the caller degrades into a
 # large equivalence class rather than reporting a confident wrong pair.
+# EVERY pair, not merely more than one. The reference ties all of them, so "> 1" would accept two
+# tied pairs while the documented result is a complete tie -- a test claiming one thing and checking
+# a much weaker one.
 NTOP=$(awk -F'\t' 'NR>1 && $5==0' "$OUT/badins.hap_pairs.tsv" | wc -l | tr -d ' ')
 NALL=$(( $(wc -l < "$OUT/badins.hap_pairs.tsv") - 1 ))
-[ "${NTOP:-0}" -gt 1 ] \
-  && ok "a misdeclared insert leaves the call UNDETERMINED ($NTOP of $NALL pairs tied), as it does in the reference" \
-  || bad "a misdeclared insert still produced a confident call ($NTOP of $NALL tied); the reference ties every pair"
+[ -n "$NTOP" ] && [ "$NTOP" = "$NALL" ] && [ "${NALL:-0}" -gt 1 ] \
+  && ok "a misdeclared insert ties EVERY pair ($NTOP of $NALL), exactly as the exhaustive reference does" \
+  || bad "a misdeclared insert tied only $NTOP of $NALL pairs; the reference ties all of them"
 # ------------------------------------------------------ a third read under one name is not silent
 { cat "$OUT/reads.fa"; printf '>hA_1/1\n%s\n' "$(printf '%s' "$H1" | cut -c1-150)"; } > "$OUT/dup.fa"
 dup=$("$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/dup" -R "$OUT/dup.fa" \

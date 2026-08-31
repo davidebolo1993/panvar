@@ -450,6 +450,21 @@ std::vector<BlockFragmentResult> genotype_fragments(
             const std::string& q1 = r1_forward ? F.r1 : r1rc;
             const std::string& q2 = r1_forward ? r2rc : F.r2;   // mates are on opposite strands
 
+            // SCOPE OF THE "same model" CLAIM. The exhaustive reference and the final Hamming
+            // haplotype scorer now score the same paired-fragment likelihood: only complete,
+            // orientation-compatible mate placements. THIS STAGE DOES NOT. It accumulates each
+            // mate's contribution independently and substitutes the band-boundary term for a mate
+            // that fails to align, which is the very partial-credit state removed from the final
+            // scorer -- a fragment with one aligning mate still contributes here.
+            //
+            // That is defensible as a PERMISSIVE SHORTLIST heuristic: this stage decides which
+            // candidates are scored at all, and admitting too many costs time while admitting too
+            // few loses the answer irrecoverably. It is not defensible as a likelihood, and nothing
+            // downstream may treat its numbers as one. The consequence for evaluation is concrete:
+            // a donor failure can arise HERE, by the floor pair never reaching the shortlist, and
+            // that is a different defect from the final scorer ranking a shortlisted pair wrongly.
+            // Every donor result must therefore report whether a sequence-floor pair survived the
+            // shortlist, or the two failure modes are indistinguishable in the outcome.
             for (std::size_t c = 0; c < nc; ++c) {
                 const std::string& ctx = T.contexts[c];
                 const ReadFit f1 = infix_align(q1, ctx, band1);
