@@ -466,6 +466,83 @@ if [ -n "$FGOT" ]; then
                         || bad "FASTA record hashes to $FGOT, the TSV says $WANT"
 fi
 
+# ------------------------------------------- allele-index provenance, and the safe spelling route
+# An allele index is an index into ONE catalogue: this graph, this bubble decomposition, this
+# exclusion set. Spelling a call table against a different catalogue is silent and produces a wrong
+# sequence -- measured on LPA, where the completion arm read 56042 edits from truth when the true
+# figure was 21, purely because the spelling run omitted the scoring run's --exclude-haplotypes.
+run "$OUT/prov" -t 2
+head -1 "$OUT/prov.hap_blocks.tsv" | grep -q '^# panvar-allele-catalogue' \
+  && ok "hap_blocks.tsv carries an allele-catalogue manifest" \
+  || bad "hap_blocks.tsv has no allele-catalogue manifest line"
+
+# Same catalogue: spelling must succeed and reproduce a known haplotype.
+"$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/prov.same" \
+  --spell-calls "$OUT/prov.hap_blocks.tsv" -q >/dev/null 2>&1 \
+  && ok "--spell-calls accepts a table from the same catalogue" \
+  || bad "--spell-calls rejected a table from its own catalogue"
+
+# Different catalogue. Note the guard keys on the CATALOGUE, not on the exclusion list: dropping
+# hapAD1 alone leaves hapAD2/3 spelling the same sequences, the catalogue is unchanged and spelling
+# is genuinely safe. To change it, every carrier of an allele must go -- hapCD* and hapCB* are the
+# only paths through node 3, so excluding all six removes one allele from bubble 1 outright.
+ERR=$("$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/prov.diff" \
+        --spell-calls "$OUT/prov.hap_blocks.tsv" \
+        --exclude-haplotypes 'hapCD1,hapCD2,hapCD3,hapCB1,hapCB2,hapCB3' \
+        -q 2>&1 >/dev/null)
+case "$ERR" in
+  *"DIFFERENT allele catalogue"*)
+    ok "--spell-calls REFUSES a table whose catalogue does not match the run" ;;
+  *) bad "--spell-calls accepted a mismatched catalogue (output: ${ERR:-none})" ;;
+esac
+
+# A table with no manifest (production's shape) must still work, with a warning -- unverifiable is
+# not the same as wrong, and cross-caller comparison is a supported use.
+grep -v '^# panvar-allele-catalogue' "$OUT/prov.hap_blocks.tsv" > "$OUT/prov.nomanifest.tsv"
+WARN=$("$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/prov.nom" \
+         --spell-calls "$OUT/prov.nomanifest.tsv" -q 2>&1 >/dev/null)
+if [ -s "$OUT/prov.nom.called.fa" ]; then
+  case "$WARN" in
+    *"no allele-catalogue manifest"*) ok "a manifest-less table still spells, with a warning" ;;
+    *) bad "a manifest-less table spelled but issued no warning" ;;
+  esac
+else
+  bad "a manifest-less table was refused; production's own table has no manifest"
+fi
+
+# --spell-pair goes by PATH NAME, which is stable across all of that. It must give the same sequence
+# as the catalogue route does when the catalogue route is valid.
+"$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/pair" \
+  --spell-pair "$OUT/prov.hap_pairs.tsv" -q >/dev/null 2>&1
+if [ -s "$OUT/pair.called.fa" ]; then
+  P1=$(awk '/^>/{n++; next} n==1' "$OUT/pair.called.fa" | tr -d '\n' | md5_of)
+  P2=$(awk '/^>/{n++; next} n==2' "$OUT/pair.called.fa" | tr -d '\n' | md5_of)
+  H1M=$(printf '%s' "$H1" | md5_of); H2M=$(printf '%s' "$H2" | md5_of)
+  { { [ "$P1" = "$H1M" ] && [ "$P2" = "$H2M" ]; } || { [ "$P1" = "$H2M" ] && [ "$P2" = "$H1M" ]; }; } \
+    && ok "--spell-pair spells the called pair by name, matching the known haplotypes" \
+    || bad "--spell-pair gave $P1/$P2, expected $H1M/$H2M in some order"
+else
+  bad "--spell-pair wrote nothing"
+fi
+
+# --spell-pair must refuse a name the graph does not have, rather than spell something else.
+sed '2s/hap[A-Z]*[0-9]*/notAPath/' "$OUT/prov.hap_pairs.tsv" > "$OUT/badpair.tsv"
+ERR2=$("$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/badpair" \
+         --spell-pair "$OUT/badpair.tsv" -q 2>&1 >/dev/null)
+case "$ERR2" in
+  *"not in"*) ok "--spell-pair refuses a path name the graph does not contain" ;;
+  *) bad "--spell-pair accepted an unknown path name (output: ${ERR2:-none})" ;;
+esac
+
+# --distance-band reports ">N" instead of an unbanded fallback, which is what makes a floor
+# certification affordable. Two unrelated sequences are far apart by construction.
+DB=$("$BIN" genotype-frag --exact-distance "$OUT/truth1.fa" "$OUT/truth2.fa" --distance-band 8 2>/dev/null)
+[ "$DB" = ">8" ] && ok "--distance-band reports >N rather than computing unbanded" \
+                 || bad "--distance-band 8 gave '$DB', expected '>8'"
+DB2=$("$BIN" genotype-frag --exact-distance "$OUT/truth1.fa" "$OUT/truth1.fa" --distance-band 8 2>/dev/null)
+[ "$DB2" = "0" ] && ok "--distance-band still returns the exact distance inside the band" \
+                 || bad "identical sequences inside the band gave '$DB2', expected 0"
+
 echo
 if [ "$fails" -eq 0 ]; then echo "genotype-frag stats: all assertions passed"; else
   echo "genotype-frag stats: $fails assertion(s) failed"; fi

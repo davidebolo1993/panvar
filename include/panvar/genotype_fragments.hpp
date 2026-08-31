@@ -675,6 +675,18 @@ std::string spell_block_haplotype(
     const std::vector<BlockAlleles>& blocks,
     const std::string& name);
 
+// A fingerprint of the ALLELE CATALOGUE that integer allele indices are indices into.
+//
+// An allele index means nothing on its own. It is meaningful only for one exact combination of
+// graph, bubble decomposition, and excluded panel paths -- and the catalogue is the product of all
+// three, so hashing it captures every input at once without having to enumerate them.
+//
+// This exists because spelling a call table against the wrong catalogue is silent. Measured: the
+// LPA pilot's completion arm reported 56042 edits when the true value was 21, purely because the
+// spelling run omitted the --exclude-haplotypes the scoring run had used. The numbers were wrong
+// and plausible, which is the same failure mode as the representation drift one layer above.
+std::string allele_catalogue_fingerprint(const std::vector<BlockAlleles>& blocks);
+
 HaplotypeResult genotype_haplotype_pairs(
     const std::vector<Block>& chain,
     const std::vector<BlockAlleles>& blocks,
@@ -688,7 +700,8 @@ HaplotypeResult genotype_haplotype_pairs(
 void write_haplotype_results(
     const std::string& out_prefix,
     const HaplotypeResult& result,
-    bool have_truth);
+    bool have_truth,
+    const std::string& catalogue_fingerprint = std::string());
 
 // Spell a per-block call table into the two sequences it claims the sample carries.
 //

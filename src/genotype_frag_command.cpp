@@ -176,6 +176,14 @@ void print_help() {
         << "      --all-blocks            Score backbone and flank blocks too. gstm1's worst blocks\n"
         << "                              are BACKBONE blocks carrying 16 and 21 alleles, so the\n"
         << "                              default view omits them\n"
+        << "      --spell-pair <hap_pairs.tsv>  Spell the rank-1 pair BY PATH NAME, straight from the\n"
+        << "                              GFA walks. Prefer this to --spell-calls in haplotype mode:\n"
+        << "                              path names survive a change of graph, decomposition or\n"
+        << "                              exclusion, and integer allele indices do not\n"
+        << "      --distance-band <N>     Cap --exact-distance banding at N; a pair outside it prints\n"
+        << "                              \">N\" instead of falling back to the unbanded computation.\n"
+        << "                              Certifying a panel floor only needs to know what is NEARER\n"
+        << "                              than the best so far\n"
         << "      --dump-scored-sequences <prefix>  Write the exact sequences whole-haplotype mode\n"
         << "                              scores, AFTER --exclude-haplotypes, as <prefix>.scored_sequences\n"
         << "                              .fa plus a .tsv of name, length and md5 beside the raw GFA path\n"
@@ -257,6 +265,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     std::vector<std::string> reference_pair;
     std::string switch_penalties_arg = "0,10,100,1000";
     std::vector<std::string> exact_distance;
+    std::size_t distance_band = 0;
+    std::string spell_pair;
     bool all_blocks = false, quiet = false, hap_mode = false, length_normalize_set = false;
     std::size_t top_pairs = 20;
     HaplotypeScoreOptions hopt;
@@ -278,6 +288,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--blocks") blocks_arg = value(i, a);
         else if (a == "--all-blocks") all_blocks = true;
         else if (a == "--spell-calls") spell_calls = value(i, a);
+        else if (a == "--spell-pair") spell_pair = value(i, a);
+        else if (a == "--distance-band") distance_band = cli::parse_size_arg(a, value(i, a));
         else if (a == "--dump-scored-sequences") dump_sequences = value(i, a);
         else if (a == "--mosaic-floor") mosaic_floor = true;
         else if (a == "--reference-score") { reference_pair.push_back(value(i, a));
@@ -472,14 +484,29 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         // common case and only falls back to the full computation when the sequences really are far
         // apart. The band actually used is reported on stderr so a number can never be mistaken for
         // an unbanded one.
-        for (const std::size_t band : {std::size_t{1024}, std::size_t{4096}, std::size_t{16384},
-                                      std::size_t{65536}, std::size_t{262144}}) {
+        // --distance-band caps the escalation. Certifying a panel floor asks 464 x 2 questions of
+        // the form "is anything nearer than the best so far", and for all but a handful the answer
+        // is a large number nobody needs -- computing it unbanded is most of the cost and none of
+        // the information. With the cap, a pair outside the band reports ">N" and the floor is
+        // certified as long as the winning distance is <= N.
+        std::vector<std::size_t> bands{1024, 4096, 16384, 65536, 262144};
+        if (distance_band != 0) {
+            bands.clear();
+            for (std::size_t b2 = 1024; b2 < distance_band; b2 *= 4) bands.push_back(b2);
+            bands.push_back(distance_band);
+        }
+        for (const std::size_t band : bands) {
             const NwBanded r = nw_edit_distance_banded(a, b, band);
             if (r.ok) {
                 std::fprintf(stderr, "band %zu sufficed\n", band);
                 std::cout << r.edits << '\n';
                 return 0;
             }
+        }
+        if (distance_band != 0) {
+            std::fprintf(stderr, "exceeds band %zu\n", distance_band);
+            std::cout << '>' << distance_band << '\n';
+            return 0;
         }
         std::fprintf(stderr, "no band sufficed; computing unbanded\n");
         std::cout << nw_edit_distance(a, b).edits << '\n';
@@ -489,7 +516,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     if (gfa_path.empty() || out_prefix.empty()) {
         throw std::runtime_error("genotype-frag requires --gfa and --out-prefix");
     }
-    if (read_paths.empty() && spell_calls.empty() && !mosaic_floor && dump_sequences.empty()) {
+    if (read_paths.empty() && spell_calls.empty() && !mosaic_floor && dump_sequences.empty() &&
+        spell_pair.empty()) {
         throw std::runtime_error("genotype-frag requires at least one --reads");
     }
     if (!bubble_prefix_in.empty()) {
@@ -649,11 +677,113 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         }
     }
 
+    // ---- spell a called PAIR by path name ------------------------------------------------------
+    // The safe route for haplotype mode. Path names survive a change of graph, decomposition or
+    // exclusion; integer allele indices do not, which is the whole reason the manifest below exists.
+    // Spelling straight from the GFA walks also bypasses the block decomposition entirely, so this
+    // cannot inherit a decomposition fault.
+    if (!spell_pair.empty()) {
+        std::ifstream pf(spell_pair);
+        if (!pf) throw std::runtime_error("genotype-frag: cannot read " + spell_pair);
+        std::string line;
+        if (!std::getline(pf, line)) throw std::runtime_error("genotype-frag: empty " + spell_pair);
+        std::vector<std::string> header;
+        {
+            std::size_t start = 0;
+            for (std::size_t i = 0; i <= line.size(); ++i) {
+                if (i == line.size() || line[i] == '\t') {
+                    header.push_back(line.substr(start, i - start));
+                    start = i + 1;
+                }
+            }
+        }
+        const auto col = [&](const std::string& n) {
+            for (std::size_t i = 0; i < header.size(); ++i) if (header[i] == n) return static_cast<long>(i);
+            throw std::runtime_error("genotype-frag: --spell-pair table has no column '" + n + "'");
+        };
+        const long c1 = col("hap1"), c2 = col("hap2");
+        if (!std::getline(pf, line)) {
+            throw std::runtime_error("genotype-frag: " + spell_pair + " has a header but no rows");
+        }
+        std::vector<std::string> f;
+        {
+            std::size_t start = 0;
+            for (std::size_t i = 0; i <= line.size(); ++i) {
+                if (i == line.size() || line[i] == '\t') { f.push_back(line.substr(start, i - start)); start = i + 1; }
+            }
+        }
+        if (f.size() <= static_cast<std::size_t>(std::max(c1, c2))) {
+            throw std::runtime_error("genotype-frag: " + spell_pair + " rank-1 row is truncated");
+        }
+        const std::string n1 = f[static_cast<std::size_t>(c1)], n2 = f[static_cast<std::size_t>(c2)];
+        const auto by_name = path_records_by_name(graph);
+        const auto spell_one = [&](const std::string& nm) {
+            const auto it = by_name.find(nm);
+            if (it == by_name.end() || it->second == nullptr) {
+                throw std::runtime_error("genotype-frag: --spell-pair names path '" + nm +
+                                         "' which is not in " + gfa_path);
+            }
+            bool complete = false;
+            const std::string out = spell_path_steps_sequence(graph, it->second->steps, &complete);
+            if (!complete) {
+                throw std::runtime_error("genotype-frag: the graph cannot fully spell path '" + nm + "'");
+            }
+            return out;
+        };
+        const std::string s1 = spell_one(n1), s2 = spell_one(n2);
+        const std::string fa = out_prefix + ".called.fa";
+        std::ofstream of(fa);
+        if (!of) throw std::runtime_error("genotype-frag: cannot write " + fa);
+        of << '>' << n1 << "\n" << s1 << "\n>" << n2 << "\n" << s2 << '\n';
+        of.flush();
+        if (!of) throw std::runtime_error("genotype-frag: write failed for " + fa);
+        log.info("spelled the rank-1 pair by NAME: " + n1 + " (" + std::to_string(s1.size()) +
+                 " bp, md5 " + md5_hex(s1) + ") and " + n2 + " (" + std::to_string(s2.size()) +
+                 " bp, md5 " + md5_hex(s2) + ")");
+        log.wrote({fa});
+        log.done();
+        return 0;
+    }
+
     if (!spell_calls.empty()) {
         std::ifstream cf(spell_calls);
         if (!cf) throw std::runtime_error("genotype-frag: cannot read " + spell_calls);
         std::string line;
         if (!std::getline(cf, line)) throw std::runtime_error("genotype-frag: empty " + spell_calls);
+
+        // PROVENANCE. An allele index is an index into one exact catalogue -- the product of this
+        // graph, this bubble decomposition and this exclusion set. Spelling a table against a
+        // different catalogue produces a wrong sequence and no error, which cost one full LPA pilot:
+        // the completion arm read 56042 edits from truth when the true figure was 21, because the
+        // spelling run omitted the --exclude-haplotypes the scoring run had used.
+        const std::string mine = allele_catalogue_fingerprint(blocks);
+        if (line.rfind("# panvar-allele-catalogue", 0) == 0) {
+            const std::size_t tab = line.find('\t');
+            const std::string theirs = tab == std::string::npos ? std::string()
+                                                               : line.substr(tab + 1);
+            if (theirs != mine) {
+                throw std::runtime_error(
+                    "genotype-frag: --spell-calls table was produced against a DIFFERENT allele "
+                    "catalogue (table " + theirs + ", this run " + mine + "). Allele indices are "
+                    "only meaningful for one combination of graph, bubble decomposition and "
+                    "--exclude-haplotypes; spelling across a mismatch yields a wrong sequence "
+                    "silently. Re-run this command with the same -i / --bubble-prefix-in / "
+                    "--exclude-haplotypes the call table was produced with.");
+            }
+            if (!std::getline(cf, line)) {
+                throw std::runtime_error("genotype-frag: " + spell_calls + " has no header after "
+                                         "its provenance line");
+            }
+        } else {
+            // Production's own table carries no manifest, and comparing the two callers is a
+            // supported use. Unverifiable is not the same as wrong, so this warns rather than
+            // refusing -- but it says so, because the silent case is what caused the defect.
+            std::fprintf(stderr,
+                "[genotype-frag] WARNING: %s carries no allele-catalogue manifest, so its "
+                "provenance cannot be checked. If it came from genotype-frag, re-run the scoring "
+                "with a build that emits one. Allele indices are meaningless against a different "
+                "graph, bubble decomposition or --exclude-haplotypes.\n", spell_calls.c_str());
+        }
         std::vector<std::string> header;
         {
             std::size_t start = 0;
@@ -880,7 +1010,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                      std::to_string(ex) + " (" + std::to_string(rep ? 100 * ex / rep : 0) +
                      "%); bubble blocks " + std::to_string(bub_ex) + "/" + std::to_string(bub_rep));
         }
-        write_haplotype_results(out_prefix, hr, have_truth);
+        write_haplotype_results(out_prefix, hr, have_truth, allele_catalogue_fingerprint(blocks));
         {
             const auto& c = hr.completeness;
             const double kept_pct = c.clusters_found == 0 ? 100.0

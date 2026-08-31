@@ -1,5 +1,7 @@
 #include "panvar/genotype_fragments.hpp"
 
+#include "panvar/md5.hpp"
+
 #include "panvar/align.hpp"
 #include "panvar/graph_utils.hpp"
 #include "panvar/parallel.hpp"
@@ -707,6 +709,30 @@ HaplotypeSeq spell_haplotype(const std::vector<BlockAlleles>& blocks, const std:
 std::string spell_block_haplotype(const std::vector<BlockAlleles>& blocks,
                                   const std::string& name) {
     return spell_haplotype(blocks, name).seq;
+}
+
+std::string allele_catalogue_fingerprint(const std::vector<BlockAlleles>& blocks) {
+    // Per-allele digests are folded in rather than the sequences themselves, so the cost does not
+    // depend on holding the whole panel in one buffer. Block and allele indices are included
+    // because it is the INDEX that the call table stores: two catalogues holding the same set of
+    // sequences in a different order must not agree.
+    std::string acc;
+    acc.reserve(blocks.size() * 64);
+    for (std::size_t bi = 0; bi < blocks.size(); ++bi) {
+        acc += std::to_string(bi);
+        acc += ':';
+        acc += std::to_string(blocks[bi].allele_seq.size());
+        acc += ':';
+        acc += std::to_string(blocks[bi].bypass_allele);
+        for (std::size_t ai = 0; ai < blocks[bi].allele_seq.size(); ++ai) {
+            acc += ',';
+            acc += std::to_string(ai);
+            acc += '=';
+            acc += md5_hex(blocks[bi].allele_seq[ai]);
+        }
+        acc += ';';
+    }
+    return md5_hex(acc);
 }
 
 void verify_block_spelling(const Graph& graph,
@@ -2361,10 +2387,16 @@ void spell_called_pair(const std::vector<BlockAlleles>& blocks,
 
 void write_haplotype_results(const std::string& out_prefix,
                              const HaplotypeResult& result,
-                             bool have_truth) {
+                             bool have_truth,
+                             const std::string& catalogue_fingerprint) {
     const std::string bp = out_prefix + ".hap_blocks.tsv";
     std::ofstream bf(bp);
     if (!bf) throw std::runtime_error("genotype-frag: cannot write " + bp);
+    // Provenance first, so --spell-calls can refuse a table whose allele indices index a different
+    // catalogue than the one it is about to spell against.
+    if (!catalogue_fingerprint.empty()) {
+        bf << "# panvar-allele-catalogue\t" << catalogue_fingerprint << '\n';
+    }
     bf << "block\tkind\tbubble_id\tn_alleles\tallele1\tallele2\tposterior\tdetermined";
     if (have_truth) bf << "\ttruth_a\ttruth_b\trepresentable\texact";
     bf << '\n';
