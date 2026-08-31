@@ -704,6 +704,11 @@ HaplotypeSeq spell_haplotype(const std::vector<BlockAlleles>& blocks, const std:
 
 } // namespace
 
+std::string spell_block_haplotype(const std::vector<BlockAlleles>& blocks,
+                                  const std::string& name) {
+    return spell_haplotype(blocks, name).seq;
+}
+
 void verify_block_spelling(const Graph& graph,
                            const std::vector<BlockAlleles>& blocks,
                            const std::vector<std::string>& haplotype_names) {

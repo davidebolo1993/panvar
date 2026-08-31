@@ -7,6 +7,8 @@
 #include "panvar/genotype_blocks.hpp"
 #include "panvar/genotype_fragments.hpp"
 #include "panvar/gfa.hpp"
+#include "panvar/graph_utils.hpp"
+#include "panvar/md5.hpp"
 #include "panvar/output.hpp"
 #include "panvar/parallel.hpp"
 
@@ -174,6 +176,12 @@ void print_help() {
         << "      --all-blocks            Score backbone and flank blocks too. gstm1's worst blocks\n"
         << "                              are BACKBONE blocks carrying 16 and 21 alleles, so the\n"
         << "                              default view omits them\n"
+        << "      --dump-scored-sequences <prefix>  Write the exact sequences whole-haplotype mode\n"
+        << "                              scores, AFTER --exclude-haplotypes, as <prefix>.scored_sequences\n"
+        << "                              .fa plus a .tsv of name, length and md5 beside the raw GFA path\n"
+        << "                              spelling of the same name. Runs standalone with no --reads. Use\n"
+        << "                              it to check the graph against the assembly it was built from:\n"
+        << "                              the round-trip invariant only checks blocks against the GFA.\n"
         << "      --truth-haplotypes <a,b>  Two panel haplotype names the reads came from. Adds the\n"
         << "                              truth pair's rank, tie count and delta per block\n"
         << "      --exclude-haplotypes <a,b>  Drop these from the panel first. With\n"
@@ -244,7 +252,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
 
     std::string gfa_path, bubble_prefix_in, bubbles_csv_in, out_prefix;
     std::vector<std::string> read_paths;
-    std::string truth_haplotypes, exclude_haplotypes, blocks_arg, spell_calls;
+    std::string truth_haplotypes, exclude_haplotypes, blocks_arg, spell_calls, dump_sequences;
     bool mosaic_floor = false;
     std::vector<std::string> reference_pair;
     std::string switch_penalties_arg = "0,10,100,1000";
@@ -270,6 +278,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--blocks") blocks_arg = value(i, a);
         else if (a == "--all-blocks") all_blocks = true;
         else if (a == "--spell-calls") spell_calls = value(i, a);
+        else if (a == "--dump-scored-sequences") dump_sequences = value(i, a);
         else if (a == "--mosaic-floor") mosaic_floor = true;
         else if (a == "--reference-score") { reference_pair.push_back(value(i, a));
                                              reference_pair.push_back(value(i, a)); }
@@ -480,7 +489,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     if (gfa_path.empty() || out_prefix.empty()) {
         throw std::runtime_error("genotype-frag requires --gfa and --out-prefix");
     }
-    if (read_paths.empty() && spell_calls.empty() && !mosaic_floor) {
+    if (read_paths.empty() && spell_calls.empty() && !mosaic_floor && dump_sequences.empty()) {
         throw std::runtime_error("genotype-frag requires at least one --reads");
     }
     if (!bubble_prefix_in.empty()) {
@@ -550,6 +559,96 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
              " bubbles; chain of " + std::to_string(chain.size()) + " blocks" +
              (held_out.empty() ? "" : "; " + std::to_string(held_out.size()) + " held out"));
 
+    // The held-out haplotypes get their own decomposition: they are gone from `blocks`, so their
+    // own walks can only be spelled from a chain enumerated over them alone. Hoisted out of the
+    // truth branch because it depends on the exclusion, not on whether truth names were given --
+    // the sequence dump needs it with no --truth-haplotypes at all.
+    std::vector<BlockAlleles> held_blocks(chain.size());
+    if (!held_out.empty()) {
+        Graph held_graph = graph;
+        held_graph.paths = held_out;
+        std::vector<BubblePathIndex> held_idx(held_graph.paths.size());
+        for (std::size_t kk = 0; kk < held_graph.paths.size(); ++kk) {
+            held_idx[kk] = build_bubble_path_index(held_graph.paths[kk]);
+        }
+        for (std::size_t bi = 0; bi < chain.size(); ++bi) {
+            held_blocks[bi] = enumerate_block_alleles(held_graph, held_idx, bubbles,
+                                                      chain[bi], opt.threads);
+        }
+    }
+
+    // ---- the sequence dump ---------------------------------------------------------------------
+    // What whole-haplotype mode actually scores, byte for byte, after the exclusion has been
+    // applied -- beside the raw GFA spelling of the same path name.
+    //
+    // This exists because the LPA accuracy numbers were charging a representation difference to the
+    // genotyper. The caller scores sequences spelled from the graph it is given; the truth FASTAs
+    // were spelled from a DIFFERENT stage of the same pipeline, and every distance reported was the
+    // sum of a genotyping error and a drift no one had measured. The existing round-trip invariant
+    // could not see it: it checks the block spelling against the GFA path, never the GFA path
+    // against the assembly the graph was built from. Both columns are emitted here so the two
+    // comparisons are separable, and the md5 is the one that travels -- it can be checked against
+    // an external FASTA with md5sum and nothing else.
+    if (!dump_sequences.empty()) {
+        cli::ensure_parent_dir_for_file(dump_sequences);
+        const std::string tsv = dump_sequences + ".scored_sequences.tsv";
+        const std::string fa = dump_sequences + ".scored_sequences.fa";
+        std::ofstream tf(tsv), ff(fa);
+        if (!tf) throw std::runtime_error("genotype-frag: cannot write " + tsv);
+        if (!ff) throw std::runtime_error("genotype-frag: cannot write " + fa);
+        tf << "group\tname\tscored_bp\tscored_md5\tgfa_bp\tgfa_md5\tgfa_complete\tround_trips\n";
+
+        const auto by_name = path_records_by_name(graph);
+        std::size_t n_mismatch = 0, n_incomplete = 0, n_rows = 0;
+
+        const auto emit = [&](const char* group, const std::vector<BlockAlleles>& src,
+                              const std::string& name) {
+            const std::string scored = spell_block_haplotype(src, name);
+            std::string raw;
+            bool complete = false;
+            const auto it = by_name.find(name);
+            if (it != by_name.end() && it->second != nullptr) {
+                raw = spell_path_steps_sequence(graph, it->second->steps, &complete);
+            }
+            // A path the graph cannot fully spell has no raw sequence to compare against, so it is
+            // reported as such rather than as a round-trip failure -- those are different faults.
+            const bool round_trips = complete && scored == raw;
+            if (!complete) ++n_incomplete;
+            else if (!round_trips) ++n_mismatch;
+            ++n_rows;
+            tf << group << '\t' << name << '\t' << scored.size() << '\t' << md5_hex(scored)
+               << '\t' << (complete ? raw.size() : std::size_t{0}) << '\t'
+               << (complete ? md5_hex(raw) : std::string(".")) << '\t' << (complete ? "yes" : "no")
+               << '\t' << (complete ? (round_trips ? "yes" : "NO") : ".") << '\n';
+            ff << '>' << name << ' ' << group << '\n';
+            for (std::size_t off = 0; off < scored.size(); off += 60) {
+                ff << scored.substr(off, 60) << '\n';
+            }
+            if (scored.empty()) ff << '\n';
+        };
+
+        for (const PathRecord& p : panel_graph.paths) emit("panel", blocks, p.name);
+        for (const PathRecord& p : held_out) emit("held_out", held_blocks, p.name);
+
+        tf.flush();
+        ff.flush();
+        if (!tf) throw std::runtime_error("genotype-frag: write failed for " + tsv);
+        if (!ff) throw std::runtime_error("genotype-frag: write failed for " + fa);
+        log.info("dumped " + std::to_string(n_rows) + " scored sequences (" +
+                 std::to_string(panel_graph.paths.size()) + " panel, " +
+                 std::to_string(held_out.size()) + " held out); " +
+                 std::to_string(n_mismatch) + " do not round-trip against the GFA path, " +
+                 std::to_string(n_incomplete) + " have no complete GFA spelling");
+        log.wrote({tsv, fa});
+        // Standalone when nothing else was asked for: the audit case is a graph and a panel and
+        // nothing else. Combined with another mode the dump is a side effect and the run continues,
+        // so --spell-calls and --mosaic-floor still do their own work.
+        if (read_paths.empty() && spell_calls.empty() && !mosaic_floor) {
+            log.done();
+            return 0;
+        }
+    }
+
     if (!spell_calls.empty()) {
         std::ifstream cf(spell_calls);
         if (!cf) throw std::runtime_error("genotype-frag: cannot read " + spell_calls);
@@ -612,19 +711,6 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         const std::vector<std::string> names = split_commas(truth_haplotypes);
         if (names.size() != 2) {
             throw std::runtime_error("genotype-frag: --truth-haplotypes needs exactly two names");
-        }
-        std::vector<BlockAlleles> held_blocks(chain.size());
-        if (!held_out.empty()) {
-            Graph held_graph = graph;
-            held_graph.paths = held_out;
-            std::vector<BubblePathIndex> held_idx(held_graph.paths.size());
-            for (std::size_t kk = 0; kk < held_graph.paths.size(); ++kk) {
-                held_idx[kk] = build_bubble_path_index(held_graph.paths[kk]);
-            }
-            for (std::size_t bi = 0; bi < chain.size(); ++bi) {
-                held_blocks[bi] = enumerate_block_alleles(held_graph, held_idx, bubbles,
-                                                          chain[bi], opt.threads);
-            }
         }
         const auto resolve = [&](const std::string& name, std::vector<int>& out_alleles,
                                  std::vector<std::string>* out_seq = nullptr) {

@@ -150,6 +150,7 @@ add_library(panvarlib
     src/integrated_snarls.cpp
     src/bubble_alleles.cpp
     src/syncmer.cpp
+    src/md5.cpp
     ${PANVAR_GENOTYPE_LIB_SOURCES}
     src/bubble_path.cpp
     src/bubbles.cpp

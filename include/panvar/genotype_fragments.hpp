@@ -665,6 +665,16 @@ void verify_block_spelling(
     const std::vector<BlockAlleles>& blocks,
     const std::vector<std::string>& haplotype_names);
 
+// The exact sequence whole-haplotype mode scores for `name`: this path's allele in every block of
+// the chain, concatenated, with a block the path bypasses contributing nothing.
+//
+// Exposed for the sequence dump. A diagnostic that re-derived the spelling would be a second
+// implementation able to be correct while the scorer is wrong, which is the one thing it must not
+// be -- so it calls what the scorer calls.
+std::string spell_block_haplotype(
+    const std::vector<BlockAlleles>& blocks,
+    const std::string& name);
+
 HaplotypeResult genotype_haplotype_pairs(
     const std::vector<Block>& chain,
     const std::vector<BlockAlleles>& blocks,

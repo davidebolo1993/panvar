@@ -388,6 +388,84 @@ awk -v a="${FS:-0}" -v b="${RS:-1}" 'BEGIN{ d=a-b; if(d<0) d=-d; exit !(d < 0.5)
   && ok "ACCELERATED: a reverse-complemented panel scores identically ($FS vs $RS)" \
   || bad "accelerated strand handling is asymmetric: $FS vs $RS"
 
+# ------------------------------------------------------- the post-exclusion sequence dump
+# The LPA benchmark spent a whole branch charging a representation difference to the genotyper: the
+# caller scored haplotypes spelled from a FOLDED graph while the truth had been spelled from the
+# unfolded stage, ~4000 edits apart on a 300 kb locus, and every accuracy number carried that drift.
+# The round-trip invariant could not see it -- it checks the block spelling against the GFA path and
+# never the GFA path against the assembly. --dump-scored-sequences is what makes the comparison
+# possible, so what it emits has to be the bytes the scorer uses and not a second spelling of them.
+md5_of() { if command -v md5sum >/dev/null 2>&1; then md5sum | cut -d' ' -f1;
+           else md5 -q; fi; }
+PYTHON_BIN="${PYTHON:-python3}"
+command -v "$PYTHON_BIN" >/dev/null 2>&1 || PYTHON_BIN=""
+
+# Standalone: no --reads at all, because the audit case is a graph and a panel and nothing else.
+"$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/dmp" \
+  --dump-scored-sequences "$OUT/dmp" -q >/dev/null 2>&1
+if [ -s "$OUT/dmp.scored_sequences.tsv" ] && [ -s "$OUT/dmp.scored_sequences.fa" ]; then
+  ok "--dump-scored-sequences runs with no --reads"
+else
+  bad "--dump-scored-sequences wrote nothing without --reads"
+fi
+
+# 13 paths: ref + three each of hapAB/hapCD/hapAD/hapCB.
+NROW=$(( $(wc -l < "$OUT/dmp.scored_sequences.tsv") - 1 ))
+[ "$NROW" = 13 ] && ok "dump covers all 13 panel paths" \
+                 || bad "dump covers $NROW paths, expected 13"
+
+# Every path must round-trip against its own GFA spelling, and the column must SAY so -- a dump that
+# reported the same md5 in both columns by construction would assert nothing.
+NRT=$(awk -F'\t' 'NR>1 && $8=="yes"' "$OUT/dmp.scored_sequences.tsv" | wc -l | tr -d ' ')
+[ "$NRT" = 13 ] && ok "all 13 round-trip: block spelling == GFA path spelling" \
+                || bad "only $NRT of 13 round-trip against the GFA path"
+
+# The bytes are the fixture's, checked against the system md5 rather than against the caller's own
+# other column. hapAD* spells H1 by construction; this is the assertion that would have caught LPA.
+WANT=$(printf '%s' "$H1" | md5_of)
+GOT=$(awk -F'\t' '$2=="hapAD1"{print $4}' "$OUT/dmp.scored_sequences.tsv")
+[ "$GOT" = "$WANT" ] && ok "dumped hapAD1 md5 matches the known haplotype ($WANT)" \
+                     || bad "dumped hapAD1 md5 $GOT, the fixture haplotype is $WANT"
+LEN=$(awk -F'\t' '$2=="hapAD1"{print $3}' "$OUT/dmp.scored_sequences.tsv")
+[ "$LEN" = "${#H1}" ] && ok "dumped hapAD1 length matches (${#H1} bp)" \
+                      || bad "dumped hapAD1 is $LEN bp, the fixture haplotype is ${#H1} bp"
+
+# POST-exclusion, which is the word in the flag's name. An excluded path must leave the panel group
+# and reappear under held_out still spelling its own sequence -- if the dump ignored --exclude-
+# haplotypes it would show the panel the caller does not score, which is the failure mode it exists
+# to rule out.
+"$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/dmpx" \
+  --dump-scored-sequences "$OUT/dmpx" --exclude-haplotypes 'hapAD1,hapCB1' -q >/dev/null 2>&1
+NPAN=$(awk -F'\t' 'NR>1 && $1=="panel"' "$OUT/dmpx.scored_sequences.tsv" | wc -l | tr -d ' ')
+NHLD=$(awk -F'\t' 'NR>1 && $1=="held_out"' "$OUT/dmpx.scored_sequences.tsv" | wc -l | tr -d ' ')
+{ [ "$NPAN" = 11 ] && [ "$NHLD" = 2 ]; } \
+  && ok "exclusion is reflected in the dump: 11 panel, 2 held out" \
+  || bad "after excluding two paths the dump shows $NPAN panel / $NHLD held out, expected 11 / 2"
+grep -q "^panel"$'\t'"hapAD1"$'\t' "$OUT/dmpx.scored_sequences.tsv" \
+  && bad "an excluded path is still listed in the panel group" \
+  || ok "an excluded path is gone from the panel group"
+XGOT=$(awk -F'\t' '$1=="held_out" && $2=="hapAD1"{print $4}' "$OUT/dmpx.scored_sequences.tsv")
+[ "$XGOT" = "$WANT" ] && ok "a held-out path still spells its own sequence from its own blocks" \
+                      || bad "held-out hapAD1 md5 $XGOT, expected $WANT"
+
+# The FASTA and the TSV must agree, or the hash travels while the sequence does not.
+FGOT=""
+[ -n "$PYTHON_BIN" ] && FGOT=$("$PYTHON_BIN" - "$OUT/dmp.scored_sequences.fa" <<'PYEOF' 2>/dev/null || true
+import sys, hashlib
+keep, buf = False, []
+for line in open(sys.argv[1]):
+    if line[0] == '>':
+        if keep: break
+        keep = line[1:].split()[0] == 'hapAD1'
+    elif keep: buf.append(line.strip())
+print(hashlib.md5("".join(buf).encode()).hexdigest())
+PYEOF
+)
+if [ -n "$FGOT" ]; then
+  [ "$FGOT" = "$WANT" ] && ok "the dumped FASTA record matches the md5 in the TSV" \
+                        || bad "FASTA record hashes to $FGOT, the TSV says $WANT"
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then echo "genotype-frag stats: all assertions passed"; else
   echo "genotype-frag stats: $fails assertion(s) failed"; fi
