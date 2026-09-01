@@ -55,6 +55,36 @@ before=$(wc -c < "$GFA")
 [ "$(wc -c < "$GFA")" = "$before" ] && ok "a symlink to the input is refused too" \
                                     || bad "writing through a symlink destroyed the input"
 
+# ------------------------------------------------- the gate line states the bar it decided on
+# The verdict is the hub COUNT against --min-hubs; maxdeg and density are printed as context and
+# are not consulted. Printing the bar beside the count is what stops a reader taking a high maxdeg
+# on a "healthy" line as evidence that it was weighed. Asserted by flipping the bar on ONE graph:
+# the printed value must follow --min-hubs, and the verdict must follow the comparison.
+# Capture to a file rather than piping into grep. `grep -m1` exits on the first line, and the
+# SIGPIPE that follows kills the run before it removes its scratch directory -- leaving artefacts
+# that the cleanliness assertion below then reports as a leak in the tool. The tool is fine; the
+# pipe was the bug.
+gate_of() {
+  "$BIN" rebuild -i "$GFA" -o "$OUT/gate.$1.gfa" --min-hubs "$1" >"$OUT/gate.$1.log" 2>&1
+  grep "gate:" "$OUT/gate.$1.log" | head -1
+}
+hubs=$(gate_of 1 | sed 's/.*#deg>=[0-9]*=\([0-9]*\).*/\1/')
+if [ -n "$hubs" ]; then
+  lo=$hubs                               # a bar the graph MEETS: hubs >= hubs, for any count
+  hi=$(( hubs + 1 ))                     # ... and one it cannot, including when hubs is 0
+  g_lo=$(gate_of "$lo"); g_hi=$(gate_of "$hi")
+  echo "$g_lo" | grep -q "(need $lo)" && echo "$g_hi" | grep -q "(need $hi)" \
+    && ok "the gate prints the --min-hubs bar it actually applied" \
+    || bad "the printed bar does not follow --min-hubs"
+  # Falsifiable both ways: one bar must call it pathological and the other healthy, or the printed
+  # number is decorative and this whole assertion would pass on a gate that ignored it.
+  if echo "$g_lo" | grep -q "PATHOLOGICAL" && echo "$g_hi" | grep -q "healthy"; then
+    ok "  ... and the verdict follows that bar, in both directions"
+  else
+    bad "the verdict did not follow --min-hubs ($hubs hubs: bar $lo and bar $hi agreed)"
+  fi
+fi
+
 # ---------------------------------------------------------------- healthy graph passes through
 "$BIN" rebuild -i "$GFA" -o "$OUT/pass.gfa" >/dev/null 2>&1
 if cmp -s "$GFA" "$OUT/pass.gfa"; then

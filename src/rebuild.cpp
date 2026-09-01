@@ -309,6 +309,11 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
         std::cerr << "[rebuild " << hms() << "] gate: " << sum.raw_nodes
                   << " nodes, " << sum.haplotypes
                   << " haps; #deg>=" << options.hub_degree << "=" << sum.raw_hubs
+                  // The hub COUNT is the whole decision. maxdeg and density are printed as context
+                  // and are not consulted, so the bar is printed beside the number it applies to --
+                  // otherwise a graph rejected at 4 hubs while showing a maxdeg of 122 reads as
+                  // though those figures had been weighed and found acceptable, and they were not.
+                  << " (need " << options.min_hubs << ")"
                   << " maxdeg=" << sum.raw_maxdeg << " density=" << static_cast<long>(sum.raw_density)
                   << "/kb -> " << (sum.pathological ? "PATHOLOGICAL" : "healthy")
                   << "; seed=" << sum.seed << '\n';
