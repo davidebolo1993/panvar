@@ -1061,6 +1061,132 @@ std::string chain_span_sequence(
     const std::vector<int>& alleles,    // one per target in [first_target, last_target]
     std::size_t flank_bp);              // context taken from the chain OUTSIDE the span
 
+// One candidate, ready for the oracle: the AUTHORITATIVE walk bytes plus a verified map from that
+// walk's coordinates to block indices.
+//
+// The oracle must not rebuild candidates by concatenating block alleles. The walk is the haplotype;
+// the concatenation is the decomposition's reconstruction of it and is not guaranteed to reproduce
+// it -- reverse-complemented for antiparallel paths, and short for unprojectable ones. A locally
+// rebuilt candidate would reintroduce exactly the defect the walk rule was established to remove.
+//
+// `ok` is false when the two cannot be reconciled, i.e. there is no trustworthy coordinate map. Such
+// a candidate must not silently contribute a scope: its block boundaries are unknown.
+struct CandidateFrame {
+    std::string seq;                    // walk bytes, authoritative
+    std::vector<std::size_t> offsets;   // segment start offsets IN WALK COORDINATES, ascending
+    // The BLOCK INDEX of each segment, in walk order. For an antiparallel candidate the blocks run
+    // backwards along the walk, so the k-th segment is block (nblocks-1-k) -- and a coordinate
+    // lookup that returned the segment index would report mirrored block numbers. Measured: an
+    // antiparallel duplicate of an existing path changed a fragment's scope from {1} to {1,2},
+    // which is impossible for a strand-symmetric scorer and was exactly this.
+    std::vector<std::uint32_t> block_at;
+    bool reverse_frame = false;
+    bool ok = false;                    // false: no verified coordinate map for this candidate
+};
+
+// Build the frame for one path. `walk` is the authoritative sequence supplied by the caller (from
+// the shared accessor); this function only verifies it against the decomposition and derives the
+// coordinate map, mirroring the offsets when the frames are opposite.
+CandidateFrame build_candidate_frame(
+    const std::vector<BlockAlleles>& blocks,
+    const std::string& name,
+    const std::string& walk);
+
+// THE RECONCILIATION GATE.
+//
+// Given each fragment's candidate-independent scope, score a candidate pair by summing, per
+// fragment, only the origins whose blocks lie inside that fragment's scope -- and charge exposure
+// ONCE for the whole locus rather than per factor.
+//
+// If scope is correct this must equal reference_pair_loglik for EVERY candidate pair, not merely
+// differ from it by a constant: a scope that contains all the mass loses nothing, so there is no
+// constant left to absorb. Recruitment cropping failed exactly here, dropping origins whose
+// availability depended on phase (measured: 2 x 63.4905 nats on two fragments).
+//
+// `scopes[i]` is fragment i's scope, from enumerate_fragment_origins over the whole candidate set.
+// `offsets_a` / `offsets_b` give the block start offsets along each homologue.
+
+// The block span an origin touches, ALWAYS ordered low..high.
+//
+// For an antiparallel candidate the block index decreases along walk coordinates, so a raw
+// (block_of(start), block_of(end)) pair comes back reversed -- and a reversed interval makes every
+// `for (b = lo; b <= hi; ++b)` loop visit nothing, so the origin is silently exempt from the scope
+// test rather than failing it. Every caller goes through this one helper: the same rule
+// reimplemented in four places is how the two previous frame bugs happened.
+std::pair<std::uint32_t, std::uint32_t> ordered_block_span(
+    const CandidateFrame& frame, long start, long end);
+
+// ---------------------------------------------------------------------------------------------
+// PLACEMENT-DEPENDENCY ORACLE
+//
+// The blocker (tests/genotype_frag_factorisation.sh) established that recruitment scoping is not a
+// valid factorisation: a fragment recruited to one block can hold likelihood mass at another, and
+// cropping deletes it. What replaces recruitment is the fragment's ORIGIN UNIVERSE.
+//
+// A correct generative likelihood SUMS over alternative origins -- P(f|G) = SUM_z P(f,z|G) -- so an
+// N-copy array legitimately offering ~N origins is evidence, not a bug. The defects are narrower:
+// top-k discarding origins without preserving their mass; cropping removing origins whose
+// availability depends on another block or on phase; and summed origin mass not balanced by the
+// matching exposure. So this is built to PRESERVE CALIBRATED MASS, not to suppress origin count.
+//
+// CANDIDATE INDEPENDENCE is the load-bearing property. The universe and the scope derived from it
+// are enumerated over the whole candidate set, never over the pair being scored. A candidate may
+// enable, disable or reweight a PREDEFINED origin; it must never decide which variables a factor is
+// allowed to depend on, or the factor topology becomes another genotype-dependent approximation.
+struct FragmentOrigin {
+    std::uint32_t hap = 0;          // index into the candidate list this origin lies on
+    std::int64_t start = 0;         // leading mate's start
+    std::int32_t insert = 0;        // insert length L; the state is (start, L, orientation)
+    bool fwd = true;
+    double emission_ll = 0.0;       // both mates
+    double insert_ll = 0.0;         // log pi(L)
+    std::uint32_t block_lo = 0;     // blocks this origin's span touches, in chain order
+    std::uint32_t block_hi = 0;
+};
+
+struct OriginUniverse {
+    std::vector<FragmentOrigin> origins;
+    double exact_lse = 0.0;               // logsumexp over every origin, every candidate
+    // Block variables ABLE TO CHANGE the sum, which is not the same as "touched by some origin".
+    // The exact emission is finite at every position, so every fragment has an origin in every block
+    // and a union-of-spans scope is always the whole locus -- measured, and it made the first
+    // version of this oracle useless. A block is in scope when deleting every origin that touches it
+    // moves the exact logsumexp by more than `scope_tol` nats.
+    std::vector<std::uint32_t> scope;
+    double retained_lse = 0.0;            // mass the accelerated representation keeps
+    double omitted_lse = 0.0;             // mass it drops
+    // The bound ACHIEVED, verified jointly: the largest |contribution(full) - contribution(scope)|
+    // over candidates, after restricting to `scope`. Testing blocks one at a time does not bound
+    // their combined removal -- ten blocks can each move the contribution by under scope_tol while
+    // together they move it far more -- so the scope is grown until this actually holds.
+    // The residual is DIPLOID: the scorer sums both haplotypes' mass into one mixture before
+    // taking the log, so a guarantee proved one candidate at a time does not imply it. Both
+    // figures below are the worst over all candidate PAIRS, homozygotes included.
+    double initial_bound = 0.0;   // before any greedy add-back
+    double achieved_bound = 0.0;  // after
+    std::uint32_t blocks_added = 0;
+    std::uint32_t worst_pair_a = 0, worst_pair_b = 0;
+    bool bound_holds = false;
+};
+
+// One fragment's complete origin universe over `candidates`. `block_offsets[h]` gives, for candidate
+// h, the cumulative start offset of every block along that candidate, so an origin's span maps to
+// block variables. `retain_topk` mirrors --placement-topk so the omitted mass can be reported; 0
+// keeps everything.
+OriginUniverse enumerate_fragment_origins(
+    const Fragment& fragment,
+    const std::vector<CandidateFrame>& frames,   // sequence AND its verified block map, together
+    const ReferenceParams& params,
+    std::size_t retain_topk,
+    double scope_tol = 1e-6);
+
+double scope_restricted_pair_loglik(
+    const CandidateFrame& frame_a,
+    const CandidateFrame& frame_b,
+    const std::vector<Fragment>& fragments,
+    const std::vector<std::vector<std::uint32_t>>& scopes,
+    const ReferenceParams& params);
+
 void write_fragment_results(
     const std::string& out_prefix,
     const std::vector<BlockFragmentResult>& results,

@@ -2996,4 +2996,398 @@ double reference_pair_loglik(const std::string& hap_a, const std::string& hap_b,
     return total;
 }
 
+CandidateFrame build_candidate_frame(const std::vector<BlockAlleles>& blocks,
+                                     const std::string& name,
+                                     const std::string& walk) {
+    CandidateFrame f;
+    f.seq = walk;
+    std::string concat;
+    std::vector<std::size_t> off;
+    for (std::size_t bi = 0; bi < blocks.size(); ++bi) {
+        off.push_back(concat.size());
+        const auto it = blocks[bi].allele_of.find(name);
+        if (it != blocks[bi].allele_of.end() && it->second < blocks[bi].allele_seq.size()) {
+            concat += blocks[bi].allele_seq[it->second];
+        }
+    }
+    if (concat == walk) {
+        f.offsets = std::move(off);
+        f.block_at.resize(f.offsets.size());
+        for (std::uint32_t k = 0; k < f.block_at.size(); ++k) f.block_at[k] = k;
+        f.ok = true;
+        return f;
+    }
+    if (concat == reverse_complement(walk)) {
+        // Opposite frames. Block b occupies [off[b], off[b+1]) in the CONCAT frame, which maps to
+        // [n - off[b+1], n - off[b]) in the walk frame; so the walk-frame start offsets are the
+        // mirrored ends, in reverse block order.
+        const std::size_t n = walk.size();
+        std::vector<std::size_t> mirrored(off.size(), 0);
+        std::vector<std::uint32_t> at(off.size(), 0);
+        for (std::size_t bi = 0; bi < off.size(); ++bi) {
+            const std::size_t end = (bi + 1 < off.size()) ? off[bi + 1] : concat.size();
+            const std::size_t k = off.size() - 1 - bi;   // walk-order slot for block bi
+            mirrored[k] = n - end;
+            at[k] = static_cast<std::uint32_t>(bi);      // ...and it is still block bi
+        }
+        f.offsets = std::move(mirrored);
+        f.block_at = std::move(at);
+        f.reverse_frame = true;
+        f.ok = true;
+        return f;
+    }
+    // No trustworthy map. Reported rather than guessed: a candidate whose block boundaries are
+    // unknown cannot contribute a scope, and pretending otherwise would put arbitrary blocks into
+    // some fragment's dependency set.
+    f.ok = false;
+    return f;
+}
+
+double scope_restricted_pair_loglik(const CandidateFrame& frame_a, const CandidateFrame& frame_b,
+                                    const std::vector<Fragment>& fragments,
+                                    const std::vector<std::vector<std::uint32_t>>& scopes,
+                                    const ReferenceParams& params) {
+    const std::string& hap_a = frame_a.seq;
+    const std::string& hap_b = frame_b.seq;
+    const double log_eps = std::log(params.error_rate / 3.0);
+    const double log_1meps = std::log1p(-params.error_rate);
+    long min_len = 1;
+    for (const Fragment& f : fragments) {
+        min_len = std::max<long>(min_len, static_cast<long>(f.r1.size() + f.r2.size()));
+    }
+    const InsertPrior ip = make_insert_prior(params.fragment_len, params.fragment_sd,
+                                             params.discordant_rate, params.insert_sigmas, min_len);
+    // EXPOSURE ONCE, over the whole locus, exactly as the reference charges it. Charging it per
+    // factor is what double-counted the latent start space in the recruitment version.
+    const auto exposure_of = [&](const std::string& h) {
+        const long n = static_cast<long>(h.size());
+        double e = 0.0;
+        for (long L = ip.lo; L <= ip.hi; ++L) {
+            const double starts = static_cast<double>(std::max<long>(0, n - L + 1));
+            if (starts > 0.0) e += std::exp(ip.log_at(L)) * starts;
+        }
+        return e;
+    };
+    double total = -params.lambda * (exposure_of(hap_a) + exposure_of(hap_b));
+    const double log_lam = std::log(params.lambda);
+    const double log_mix = std::log1p(-params.eta);
+    const double log_bg_w = std::log(params.eta);
+
+    for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
+        const Fragment& f = fragments[fi];
+        const std::size_t len = f.bases();
+        if (len == 0) continue;
+        const std::vector<std::uint32_t>& sc =
+            fi < scopes.size() ? scopes[fi] : std::vector<std::uint32_t>{};
+        const auto in_scope = [&](std::uint32_t lo, std::uint32_t hi) {
+            for (std::uint32_t b = lo; b <= hi; ++b) {
+                if (!std::binary_search(sc.begin(), sc.end(), b)) return false;
+            }
+            return true;
+        };
+        const std::string r2rc = f.r2.empty() ? std::string() : reverse_complement(f.r2);
+        const std::string r1rc = reverse_complement(f.r1);
+        const double half = std::log(0.5);
+        double lse = kNegInf;
+        for (int side = 0; side < 2; ++side) {
+            const CandidateFrame& fr = side == 0 ? frame_a : frame_b;
+            const std::string& hap = fr.seq;
+            if (hap.empty()) continue;
+            const long n = static_cast<long>(hap.size());
+            for (int orient = 0; orient < 2; ++orient) {
+                const std::string& lead = orient == 0 ? f.r1 : f.r2;
+                const std::string& trail = orient == 0 ? r2rc : r1rc;
+                if (lead.empty()) continue;
+                for (long st = 0; st + static_cast<long>(lead.size()) <= n; ++st) {
+                    const double e1 = reference_emission(lead, hap, static_cast<std::size_t>(st),
+                                                         log_eps, log_1meps);
+                    if (e1 == kNegInf) continue;
+                    if (trail.empty()) {
+                        const auto sp = ordered_block_span(fr, st,
+                                            st + static_cast<long>(lead.size()) - 1);
+                        if (in_scope(sp.first, sp.second)) {
+                            lse = log_add(lse, half + e1);
+                        }
+                        continue;
+                    }
+                    for (long L = ip.lo; L <= ip.hi; ++L) {
+                        if (st + L > n) break;
+                        const long m2 = st + L - static_cast<long>(trail.size());
+                        if (m2 < 0) continue;
+                        const double e2 = reference_emission(trail, hap, static_cast<std::size_t>(m2),
+                                                             log_eps, log_1meps);
+                        if (e2 == kNegInf) continue;
+                        const auto sq = ordered_block_span(fr, st, st + L - 1);
+                        if (!in_scope(sq.first, sq.second)) continue;
+                        lse = log_add(lse, half + e1 + e2 + ip.log_at(L));
+                    }
+                }
+            }
+        }
+        const std::size_t bg_edits =
+            static_cast<std::size_t>(params.bg_divergence * static_cast<double>(len));
+        const double bg = static_cast<double>(bg_edits) * log_eps +
+                          static_cast<double>(len - bg_edits) * log_1meps;
+        total += log_add(lse == kNegInf ? kNegInf : log_mix + log_lam + lse, log_bg_w + bg);
+    }
+    return total;
+}
+
+std::pair<std::uint32_t, std::uint32_t> ordered_block_span(const CandidateFrame& frame,
+                                                          long start, long end) {
+    const auto at = [&](long pos) -> std::uint32_t {
+        if (frame.offsets.empty()) return 0;
+        std::size_t k = 0;
+        while (k + 1 < frame.offsets.size() &&
+               static_cast<long>(frame.offsets[k + 1]) <= pos) ++k;
+        return k < frame.block_at.size() ? frame.block_at[k] : static_cast<std::uint32_t>(k);
+    };
+    const std::uint32_t a = at(start), b = at(end);
+    return {std::min(a, b), std::max(a, b)};
+}
+
+OriginUniverse enumerate_fragment_origins(const Fragment& fragment,
+                                          const std::vector<CandidateFrame>& frames,
+                                          const ReferenceParams& params,
+                                          std::size_t retain_topk,
+                                          double scope_tol) {
+    OriginUniverse out;
+    if (fragment.r1.empty()) return out;
+    const double log_eps = std::log(params.error_rate / 3.0);
+    const double log_1meps = std::log1p(-params.error_rate);
+    const long min_len = static_cast<long>(fragment.r1.size() + fragment.r2.size());
+    const InsertPrior ip = make_insert_prior(params.fragment_len, params.fragment_sd,
+                                             params.discordant_rate, params.insert_sigmas,
+                                             std::max<long>(1, min_len));
+    const std::string r2rc = fragment.r2.empty() ? std::string()
+                                                 : reverse_complement(fragment.r2);
+    const std::string r1rc = reverse_complement(fragment.r1);
+    const double half = std::log(0.5);
+
+    // EXACTLY the states the exposure counts: (start, insert length, orientation). Enumerating a
+    // different set here would make the oracle's sum incomparable with the reference's, which is the
+    // one thing it exists to be compared against.
+    for (std::uint32_t h = 0; h < frames.size(); ++h) {
+        const std::string& hap = frames[h].seq;
+        if (hap.empty() || !frames[h].ok) continue;
+        const long n = static_cast<long>(hap.size());
+        for (int orient = 0; orient < 2; ++orient) {
+            const std::string& lead = orient == 0 ? fragment.r1 : fragment.r2;
+            const std::string& trail = orient == 0 ? r2rc : r1rc;
+            if (lead.empty()) continue;
+            for (long st = 0; st + static_cast<long>(lead.size()) <= n; ++st) {
+                const double e1 = reference_emission(lead, hap, static_cast<std::size_t>(st),
+                                                     log_eps, log_1meps);
+                if (e1 == kNegInf) continue;
+                if (trail.empty()) {
+                    FragmentOrigin o;
+                    o.hap = h; o.start = st; o.insert = static_cast<std::int32_t>(lead.size());
+                    o.fwd = orient == 0; o.emission_ll = half + e1; o.insert_ll = 0.0;
+                    // ORDERED. For an antiparallel candidate block_of DECREASES along walk
+                    // coordinates, so start/end come back reversed. A reversed interval makes the
+                    // touched-block loop visit nothing and makes in_scope() accept the origin
+                    // vacuously -- the origin would be silently exempt from every scope test.
+                    {
+                        const auto sp = ordered_block_span(frames[h], st,
+                                            st + static_cast<long>(lead.size()) - 1);
+                        o.block_lo = sp.first; o.block_hi = sp.second;
+                    }
+                    out.origins.push_back(o);
+                    continue;
+                }
+                for (long L = ip.lo; L <= ip.hi; ++L) {
+                    if (st + L > n) break;
+                    const long m2 = st + L - static_cast<long>(trail.size());
+                    if (m2 < 0) continue;
+                    const double e2 = reference_emission(trail, hap, static_cast<std::size_t>(m2),
+                                                         log_eps, log_1meps);
+                    if (e2 == kNegInf) continue;
+                    FragmentOrigin o;
+                    o.hap = h; o.start = st; o.insert = static_cast<std::int32_t>(L);
+                    o.fwd = orient == 0;
+                    o.emission_ll = half + e1 + e2;
+                    o.insert_ll = ip.log_at(L);
+                    {
+                        const auto sp = ordered_block_span(frames[h], st, st + L - 1);
+                        o.block_lo = sp.first; o.block_hi = sp.second;
+                    }
+                    out.origins.push_back(o);
+                }
+            }
+        }
+    }
+
+    double lse = kNegInf;
+    for (const FragmentOrigin& o : out.origins) lse = log_add(lse, o.emission_ll + o.insert_ll);
+    out.exact_lse = lse;
+
+    // SCOPE, DECIDED PER CANDIDATE AND THEN UNIONED.
+    //
+    // The counterfactual must ask "can this block's allele change the likelihood", and that question
+    // is only meaningful inside ONE candidate. Deleting a block's origins from the aggregate over
+    // every panel candidate measures placement mass located there, which is a different thing, and
+    // it fails in three ways: a block that matters to one low-mass candidate is drowned by unrelated
+    // candidates carrying more mass; duplicating a panel path changes the answer; and the scope then
+    // depends on which haplotypes the panel happens to contain.
+    //
+    // So: for each candidate separately, delete the origins touching block b and ask whether THAT
+    // candidate's own logsumexp moves by more than scope_tol. Union over candidates. Mass is never
+    // averaged across candidates before the decision.
+    //
+    // APPROXIMATION, AND ITS BOUND. The emission is finite at every position, so the exact structural
+    // union is locus-wide for every fragment. This is therefore a THRESHOLDED scope, not the exact
+    // minimal one, and the guarantee it carries is per candidate: for each candidate, the mass
+    // dropped by restricting to the reported scope is at most scope_tol nats of that candidate's own
+    // total. It is not a statement about the aggregate.
+    std::vector<std::uint32_t> touched;
+    for (const FragmentOrigin& o : out.origins) {
+        for (std::uint32_t b = o.block_lo; b <= o.block_hi; ++b) touched.push_back(b);
+    }
+    std::sort(touched.begin(), touched.end());
+    touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
+
+    std::vector<double> per_cand_lse(frames.size(), kNegInf);
+    for (const FragmentOrigin& o : out.origins) {
+        per_cand_lse[o.hap] = log_add(per_cand_lse[o.hap], o.emission_ll + o.insert_ll);
+    }
+    // The threshold applies to the FULL per-fragment contribution, not to the raw placement mass:
+    //
+    //     contrib(M) = log[ (1-eta) * lambda * M  +  eta * P_bg ]
+    //
+    // For a candidate the fragment does not belong to, the placement mass sits far below the
+    // background and the term is background-dominated, so deleting ANY block moves the raw mass a
+    // lot and the contribution not at all. Thresholding the raw mass therefore puts every block in
+    // scope via candidates the fragment never came from -- measured: it put an untouched middle
+    // block into a shared-sequence fragment's scope purely through a candidate that lacks the
+    // shared unit entirely.
+    const std::size_t flen = fragment.bases();
+    const std::size_t bg_edits =
+        static_cast<std::size_t>(params.bg_divergence * static_cast<double>(flen));
+    const double bg_ll = static_cast<double>(bg_edits) * log_eps +
+                         static_cast<double>(flen - bg_edits) * log_1meps;
+    const double log_mix = std::log1p(-params.eta);
+    const double log_bg_w = std::log(params.eta);
+    const double log_lam = std::log(params.lambda);
+    const auto contrib_of = [&](double mass) {
+        return log_add(mass == kNegInf ? kNegInf : log_mix + log_lam + mass, log_bg_w + bg_ll);
+    };
+
+    out.scope.clear();
+    for (const std::uint32_t b : touched) {
+        bool matters = false;
+        for (std::uint32_t h = 0; h < frames.size() && !matters; ++h) {
+            if (per_cand_lse[h] == kNegInf) continue;
+            double without = kNegInf;
+            for (const FragmentOrigin& o : out.origins) {
+                if (o.hap != h) continue;
+                if (b >= o.block_lo && b <= o.block_hi) continue;
+                without = log_add(without, o.emission_ll + o.insert_ll);
+            }
+            if (contrib_of(per_cand_lse[h]) - contrib_of(without) > scope_tol) matters = true;
+        }
+        if (matters) out.scope.push_back(b);
+    }
+
+    // JOINT BOUND. The per-block test above is necessary and not sufficient: it asks what removing
+    // ONE block costs, while the restricted model removes them ALL. Ten blocks each under scope_tol
+    // can sum to far more. So recompute each candidate's contribution using the whole excluded set
+    // at once, and if the bound fails, add excluded blocks back -- greedily, most omitted mass first
+    // -- until it holds. The achieved residual is reported rather than assumed.
+    {
+        const auto restricted_mass = [&](std::uint32_t h,
+                                         const std::vector<std::uint32_t>& sc) {
+            double m = kNegInf;
+            for (const FragmentOrigin& o : out.origins) {
+                if (o.hap != h) continue;
+                bool inside = true;
+                for (std::uint32_t b = o.block_lo; b <= o.block_hi && inside; ++b) {
+                    if (!std::binary_search(sc.begin(), sc.end(), b)) inside = false;
+                }
+                if (inside) m = log_add(m, o.emission_ll + o.insert_ll);
+            }
+            return m;
+        };
+        // DIPLOID residual. `contrib_of` is the haploid mixture, but no genotype is scored that
+        // way: scope_restricted_pair_loglik sums BOTH haplotypes' placement mass into a single
+        // log_add before mixing with the background. A per-candidate guarantee does not imply the
+        // pair guarantee -- two candidates each losing a little mass lose it into the same sum,
+        // and a pair whose partner contributes almost nothing amplifies the survivor's loss. So
+        // the bound is taken over every unordered pair, INCLUDING a == b: the homozygote is a real
+        // genotype and the scorer visits its frame twice, doubling both the full and the
+        // restricted mass, which is not the same residual as the heterozygote's.
+        const auto contrib_pair = [&](double x, double y) {
+            const double s = log_add(x, y);
+            return log_add(s == kNegInf ? kNegInf : log_mix + log_lam + s, log_bg_w + bg_ll);
+        };
+        const auto worst_residual = [&](const std::vector<std::uint32_t>& sc,
+                                        std::uint32_t* wa, std::uint32_t* wb) {
+            std::vector<double> restr(frames.size(), kNegInf);
+            for (std::uint32_t h = 0; h < frames.size(); ++h) {
+                if (per_cand_lse[h] != kNegInf) restr[h] = restricted_mass(h, sc);
+            }
+            double worst = 0.0;
+            for (std::uint32_t a = 0; a < frames.size(); ++a) {
+                for (std::uint32_t b = a; b < frames.size(); ++b) {
+                    const double d = std::abs(contrib_pair(per_cand_lse[a], per_cand_lse[b]) -
+                                              contrib_pair(restr[a], restr[b]));
+                    if (d > worst) { worst = d; if (wa) *wa = a; if (wb) *wb = b; }
+                }
+            }
+            return worst;
+        };
+        std::vector<std::uint32_t> excluded;
+        for (const std::uint32_t b : touched) {
+            if (!std::binary_search(out.scope.begin(), out.scope.end(), b)) excluded.push_back(b);
+        }
+        double worst = worst_residual(out.scope, &out.worst_pair_a, &out.worst_pair_b);
+        out.initial_bound = worst;
+        while (worst > scope_tol && !excluded.empty()) {
+            // add back whichever excluded block carries the most omitted mass
+            std::size_t best_i = 0;
+            double best_mass = kNegInf;
+            for (std::size_t i = 0; i < excluded.size(); ++i) {
+                double m = kNegInf;
+                for (const FragmentOrigin& o : out.origins) {
+                    if (excluded[i] >= o.block_lo && excluded[i] <= o.block_hi) {
+                        m = log_add(m, o.emission_ll + o.insert_ll);
+                    }
+                }
+                if (m > best_mass) { best_mass = m; best_i = i; }
+            }
+            out.scope.push_back(excluded[best_i]);
+            std::sort(out.scope.begin(), out.scope.end());
+            excluded.erase(excluded.begin() + static_cast<long>(best_i));
+            ++out.blocks_added;
+            worst = worst_residual(out.scope, &out.worst_pair_a, &out.worst_pair_b);
+        }
+        out.achieved_bound = worst;
+        out.bound_holds = worst <= scope_tol;
+    }
+
+    // What an accelerated representation keeping only the best `retain_topk` origins per candidate
+    // would retain, and what it would drop. Reported as MASS, because a count says nothing about
+    // whether the discarded origins mattered.
+    if (retain_topk == 0) {
+        out.retained_lse = out.exact_lse;
+        out.omitted_lse = kNegInf;
+    } else {
+        std::vector<std::vector<double>> per_hap(frames.size());
+        for (const FragmentOrigin& o : out.origins) {
+            per_hap[o.hap].push_back(o.emission_ll + o.insert_ll);
+        }
+        double keep = kNegInf, drop = kNegInf;
+        for (auto& v : per_hap) {
+            std::sort(v.begin(), v.end(), std::greater<double>());
+            for (std::size_t i = 0; i < v.size(); ++i) {
+                if (i < retain_topk) keep = log_add(keep, v[i]);
+                else drop = log_add(drop, v[i]);
+            }
+        }
+        out.retained_lse = keep;
+        out.omitted_lse = drop;
+    }
+    return out;
+}
+
+
 } // namespace panvar

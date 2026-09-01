@@ -14,10 +14,12 @@
 #include "panvar/syncmer.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -307,6 +309,9 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     // Escape hatch for the equality gate, which must compare the factor oracle against the
     // whole-haplotype reference over the SAME fragment set. Not for measurement.
     std::string ref_subset;
+    std::string origin_universe;
+    double scope_tol = 1e-6;
+    std::vector<std::string> reconcile_scope;
     std::string switch_penalties_arg = "0,10,100,1000";
     std::vector<std::string> exact_distance;
     std::size_t distance_band = 0;
@@ -339,6 +344,22 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--reference-score") { reference_pair.push_back(value(i, a));
                                              reference_pair.push_back(value(i, a)); }
         else if (a == "--reference-all-fragments") ref_subset = "all";
+        else if (a == "--origin-universe") origin_universe = value(i, a);
+        else if (a == "--scope-tol") {
+            const std::string sv = value(i, a);
+            scope_tol = std::stod(sv);
+            // Zero is meaningful -- it asks for the exact structural scope, every block whose
+            // removal moves the likelihood at all. Negative or non-finite is not: a negative
+            // tolerance puts every touched block in scope and then reports a bound that "holds"
+            // against a threshold no residual can meet, and a NaN makes every comparison false,
+            // so the joint bound silently passes for any scope whatsoever.
+            if (!std::isfinite(scope_tol) || scope_tol < 0.0) {
+                throw std::runtime_error(
+                    "genotype-frag: --scope-tol must be finite and >= 0; got " + sv);
+            }
+        }
+        else if (a == "--reconcile-scope") { reconcile_scope.push_back(value(i, a));
+                                             reconcile_scope.push_back(value(i, a)); }
         else if (a == "--reference-block") {
             // <target_index> <allele_a> <allele_b> -- the exact LOCAL oracle for one target.
             // target_index is a RANK into the scored-block list (bubbles only unless --all-blocks),
@@ -579,7 +600,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         throw std::runtime_error("genotype-frag requires --gfa and --out-prefix");
     }
     if (read_paths.empty() && spell_calls.empty() && !mosaic_floor && dump_sequences.empty() &&
-        spell_pair.empty() && ref_block.empty() && ref_block_pair.empty()) {
+        spell_pair.empty() && ref_block.empty() && ref_block_pair.empty() &&
+        origin_universe.empty() && reconcile_scope.empty()) {
         throw std::runtime_error("genotype-frag requires at least one --reads");
     }
     if (!bubble_prefix_in.empty()) {
@@ -845,6 +867,163 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                  " bp, md5 " + md5_hex(s1) + ") and " + n2 + " (" + std::to_string(s2.size()) +
                  " bp, md5 " + md5_hex(s2) + ")");
         log.wrote({fa});
+        log.done();
+        return 0;
+    }
+
+    if (!reconcile_scope.empty()) {
+        // THE GATE. Scope comes from the origin universe over the WHOLE candidate set, computed
+        // before the pair is looked at, so the factor topology cannot depend on what is being
+        // scored. Then the same pair is scored twice: once by the whole-locus reference, once by
+        // summing only in-scope origins with exposure charged once.
+        const std::vector<Fragment> rfr = load_fragments(read_paths);
+        ReferenceParams rp;
+        rp.lambda = hopt.haploid_depth > 0.0 ? hopt.haploid_depth : 0.05;
+        rp.eta = opt.outlier_mix; rp.error_rate = opt.error_rate;
+        rp.fragment_len = opt.fragment_len; rp.fragment_sd = opt.fragment_sd;
+        rp.bg_divergence = opt.bg_divergence;
+
+        std::vector<CandidateFrame> frames;
+        std::vector<std::string> cname;
+        {
+            const auto by_name = path_records_by_name(graph);
+            for (const PathRecord& pr : panel_graph.paths) {
+                const auto it = by_name.find(pr.name);
+                if (it == by_name.end() || it->second == nullptr) continue;
+                bool complete = false;
+                const std::string walk =
+                    spell_path_steps_sequence(graph, it->second->steps, &complete);
+                if (!complete) continue;
+                const CandidateFrame cf = build_candidate_frame(blocks, pr.name, walk);
+                if (!cf.ok) continue;
+                frames.push_back(cf); cname.push_back(pr.name);
+            }
+        }
+        if (frames.size() != panel_graph.paths.size()) {
+            throw std::runtime_error(
+                "genotype-frag: --reconcile-scope has a verified walk-to-block map for only " +
+                std::to_string(frames.size()) + " of " +
+                std::to_string(panel_graph.paths.size()) + " panel candidates. Reconciling over the "
+                "reduced set would certify a factorisation on a smaller, easier state space than a "
+                "caller would score. Exclude those candidates explicitly with --exclude-haplotypes, "
+                "or fix the decomposition, so the oracle's candidate set and the scored set are the "
+                "same by construction. Run --origin-universe to list them.");
+        }
+        std::vector<std::vector<std::uint32_t>> scopes(rfr.size());
+        for (std::size_t fi = 0; fi < rfr.size(); ++fi) {
+            scopes[fi] = enumerate_fragment_origins(rfr[fi], frames, rp,
+                                                    hopt.placement_topk, scope_tol).scope;
+        }
+        long ia = -1, ib = -1;
+        for (std::size_t i2 = 0; i2 < cname.size(); ++i2) {
+            if (cname[i2] == reconcile_scope[0]) ia = static_cast<long>(i2);
+            if (cname[i2] == reconcile_scope[1]) ib = static_cast<long>(i2);
+        }
+        if (ia < 0 || ib < 0) {
+            throw std::runtime_error("genotype-frag: --reconcile-scope named a path not in the panel");
+        }
+        const double whole = reference_pair_loglik(frames[ia].seq, frames[ib].seq, rfr, rp);
+        const double fact = scope_restricted_pair_loglik(frames[ia], frames[ib], rfr, scopes, rp);
+        std::printf("%.17g\t%.17g\t%.17g\n", whole, fact, whole - fact);
+        log.done();
+        return 0;
+    }
+
+    if (!origin_universe.empty()) {
+        // The candidate-independent origin universe, per fragment, over EVERY panel candidate. It is
+        // enumerated before any candidate is selected precisely so that the scope it yields cannot
+        // depend on the candidate being scored.
+        const std::vector<Fragment> ofr = load_fragments(read_paths);
+        ReferenceParams rp;
+        rp.lambda = hopt.haploid_depth > 0.0 ? hopt.haploid_depth : 0.05;
+        rp.eta = opt.outlier_mix; rp.error_rate = opt.error_rate;
+        rp.fragment_len = opt.fragment_len; rp.fragment_sd = opt.fragment_sd;
+        rp.bg_divergence = opt.bg_divergence;
+
+        // AUTHORITATIVE WALKS, with a verified coordinate map. Rebuilding candidates by
+        // concatenating block alleles here would reintroduce the defect the walk rule removed:
+        // wrong bytes for antiparallel paths and short bytes for unprojectable ones.
+        std::vector<CandidateFrame> frames;
+        std::vector<std::string> cand_names;
+        std::vector<std::pair<std::string, std::string>> skipped_names;
+        {
+            const auto by_name = path_records_by_name(graph);
+            std::size_t skipped = 0, flipped = 0;
+            for (const PathRecord& pr : panel_graph.paths) {
+                const auto it = by_name.find(pr.name);
+                if (it == by_name.end() || it->second == nullptr) {
+                    ++skipped; skipped_names.emplace_back(pr.name, "no path record"); continue;
+                }
+                bool complete = false;
+                const std::string walk =
+                    spell_path_steps_sequence(graph, it->second->steps, &complete);
+                if (!complete) {
+                    ++skipped; skipped_names.emplace_back(pr.name, "graph cannot spell the walk");
+                    continue;
+                }
+                const CandidateFrame cf = build_candidate_frame(blocks, pr.name, walk);
+                if (!cf.ok) {
+                    ++skipped;
+                    skipped_names.emplace_back(pr.name, "no verified walk-to-block map");
+                    continue;
+                }
+                if (cf.reverse_frame) ++flipped;
+                frames.push_back(cf);
+                cand_names.push_back(pr.name);
+            }
+            if (!skipped_names.empty()) {
+                const std::string sp = origin_universe + ".skipped";
+                std::ofstream sf(sp);
+                if (!sf) throw std::runtime_error("genotype-frag: cannot write " + sp);
+                sf << "candidate\treason\n";
+                for (const auto& [nm, why] : skipped_names) sf << nm << '\t' << why << '\n';
+                sf.flush();
+                log.wrote({sp});
+            }
+            // ALL-SKIPPED IS A FAILURE, not a result. With no frames every fragment reports zero
+            // origins, empty scope, and a joint bound of 0 -- a table of plausible-looking zeros
+            // that reads exactly like "the scope is trivially small" rather than "the instrument
+            // never ran". A fixture whose segment names the sorter renumbers lands here, and the
+            // zeros it produced passed three thresholds before the sidecar was read.
+            if (frames.empty()) {
+                throw std::runtime_error(
+                    "genotype-frag: --origin-universe has no usable candidate frames; all " +
+                    std::to_string(skipped_names.size()) + " panel candidates were skipped (see " +
+                    origin_universe + ".skipped). Every value in the table would be a zero "
+                    "produced by an instrument that never ran.");
+            }
+            log.info("candidate frames: " + std::to_string(frames.size()) + " usable (" +
+                     std::to_string(flipped) + " antiparallel, mapped by mirroring), " +
+                     std::to_string(skipped) +
+                     " skipped for want of a verified walk-to-block map");
+        }
+        std::ofstream of(origin_universe);
+        if (!of) throw std::runtime_error("genotype-frag: cannot write " + origin_universe);
+        of.precision(17);
+        of << "fragment\tn_origins\tn_candidates_hit\texact_lse\tretained_lse\tomitted_lse"
+              "\tscope_blocks\tscope\tachieved_bound\tbound_holds"
+              // appended, never inserted: three assertions once changed meaning silently when
+              // columns were added in the middle of this header
+              "\tinitial_bound\tblocks_added\tworst_pair\n";
+        for (const Fragment& F : ofr) {
+            const OriginUniverse u =
+                enumerate_fragment_origins(F, frames, rp, hopt.placement_topk, scope_tol);
+            std::set<std::uint32_t> hits;
+            for (const FragmentOrigin& o : u.origins) hits.insert(o.hap);
+            of << F.name << '\t' << u.origins.size() << '\t' << hits.size() << '\t'
+               << u.exact_lse << '\t' << u.retained_lse << '\t' << u.omitted_lse << '\t'
+               << u.scope.size() << '\t';
+            for (std::size_t q = 0; q < u.scope.size(); ++q) of << (q ? "," : "") << u.scope[q];
+            if (u.scope.empty()) of << '.';
+            of << '\t' << u.achieved_bound << '\t' << (u.bound_holds ? "yes" : "NO")
+               << '\t' << u.initial_bound << '\t' << u.blocks_added
+               << '\t' << u.worst_pair_a << ':' << u.worst_pair_b << '\n';
+        }
+        of.flush();
+        if (!of) throw std::runtime_error("genotype-frag: write failed for " + origin_universe);
+        log.info("origin universe for " + std::to_string(ofr.size()) + " fragments over " +
+                 std::to_string(frames.size()) + " candidates");
+        log.wrote({origin_universe});
         log.done();
         return 0;
     }

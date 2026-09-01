@@ -326,6 +326,22 @@ if(PANVAR_BUILD_TESTING)
             set_tests_properties(panvar_genotype_frag_stats PROPERTIES TIMEOUT 300)
         endif()
 
+        # The placement-dependency oracle: which blocks a fragment's likelihood actually depends on.
+        # This is the instrument the compact factorisation has to be built against, so its own
+        # failure modes are what the fixtures target -- an origin whose block interval comes back
+        # reversed on an antiparallel candidate is exempt from every scope test rather than failing
+        # one, and a joint bound proved per candidate does not hold for the candidate PAIRS the
+        # scorer actually evaluates. Both are asserted here, with fixtures whose expected values are
+        # derivable: the greedy-repair case must land on log(6/5) exactly.
+        set(PANVAR_GENOTYPE_FRAG_ORIGIN ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_frag_origin_scope.sh)
+        if(EXISTS ${PANVAR_GENOTYPE_FRAG_ORIGIN} AND PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE)
+            add_test(
+                NAME panvar_genotype_frag_origin_scope
+                COMMAND /usr/bin/env bash ${PANVAR_GENOTYPE_FRAG_ORIGIN} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/genotype_frag_origin_scope
+            )
+            set_tests_properties(panvar_genotype_frag_origin_scope PROPERTIES TIMEOUT 900)
+        endif()
+
         # The fragment model's exact reference scorer, against fixtures whose values are derivable
         # rather than recorded -- the homozygous-doubling case is checked against
         # -lambda*starts + n*log(2) analytically. It is the oracle the accelerated scorer must be
