@@ -65,13 +65,16 @@ CALLER_ARGS=(--haplotype-mode --hamming-emission --max-divergence 0.05
              --max-anchor-occ 32 --placement-topk 8 --top-pairs 20)
 
 # ---- configuration -------------------------------------------------------------------------------
-# locus <TAB> graph <TAB> bubble-prefix <TAB> reference-path-substring
+# locus <TAB> graph <TAB> bubble-prefix <TAB> reference-path <TAB> donors (comma-separated)
+# The frozen cohort. Written here, in the file, so a baseline is reproducible from the commit alone.
+# These six are present with both homologues at every locus in results/real_data.
+FROZEN_DONORS="${FROZEN_DONORS:-HG00096,HG00171,HG00268}"
 if [ -z "$CFG" ]; then
   CFG="$OUT/config.tsv"
   { for L in acot gstm1 lpa ankrd36c c4 cyp2d6; do
-      printf '%s\t%s\t%s\t%s\n' "$L" \
+      printf '%s\t%s\t%s\t%s\t%s\n' "$L" \
         "$REPO/results/real_data/$L/bubble/bubble.sorted.gfa" \
-        "$REPO/results/real_data/$L/bubble/bubble" "ref"
+        "$REPO/results/real_data/$L/bubble/bubble" "ref" "$FROZEN_DONORS"
     done; } > "$CFG"
 fi
 
@@ -155,7 +158,7 @@ dist() {   # dist <a.fa> <b.fa> -> integer, or empty
   echo ""
 }
 
-while IFS=$'\t' read -r LOCUS GFA PFX REFNAME; do
+while IFS=$'\t' read -r LOCUS GFA PFX REFNAME DONOR_LIST; do
   [ -z "${LOCUS:-}" ] && continue
   case "$LOCUS" in \#*) continue ;; esac
   if [ -n "$ONLY_LOCI" ] && ! printf '%s' " $ONLY_LOCI " | grep -q " $LOCUS "; then continue; fi
@@ -171,10 +174,17 @@ while IFS=$'\t' read -r LOCUS GFA PFX REFNAME; do
   if [ ! -s "$LD/all.scored_sequences.fa" ]; then
     say "REFUSE $LOCUS: could not spell the panel from the graph"; fails=$((fails+1)); continue
   fi
-  DONORS=$(awk -F'\t' 'NR>1{split($2,a,"#"); if(a[2]=="1"||a[2]=="2") c[a[1]]=c[a[1]] a[2]}
-                       END{for(s in c) if(length(c[s])==2) print s}' \
-           "$LD/all.scored_sequences.tsv" | sort | head -"${NDONORS:-2}")
+  # DONORS ARE FROZEN IN THE CONFIGURATION, field 5. `sort | head -N` is not a cohort: it silently
+  # changes when a path is added to or removed from the panel, and a baseline whose membership moves
+  # is not a baseline. A locus with no manifest is REFUSED rather than filled in by discovery.
+  DONORS="${DONOR_LIST:-}"
   [ -n "$ONLY_DONORS" ] && DONORS="$ONLY_DONORS"
+  if [ -z "$DONORS" ]; then
+    say "REFUSE $LOCUS: no frozen donor manifest in the configuration (field 5)"
+    say "       candidates with two homologues: $(awk -F'\t' 'NR>1{split($2,a,"#"); if(a[2]=="1"||a[2]=="2") c[a[1]]=c[a[1]] a[2]} END{for(s in c) if(length(c[s])==2) printf "%s ", s}' "$LD/all.scored_sequences.tsv" | tr ' ' '\n' | sort | tr '\n' ' ')"
+    fails=$((fails+1)); continue
+  fi
+  DONORS="$(printf '%s' "$DONORS" | tr ',' ' ')"
 
   for DONOR in $DONORS; do
     T1=$(awk -F'\t' -v d="$DONOR" 'NR>1 && index($2,d"#1#")==1 {print $2; exit}' "$LD/all.scored_sequences.tsv")
@@ -206,12 +216,17 @@ flush()
 PY
 
     # READS: simulated, one fixed seed, count recorded. A deterministic regression baseline.
-    NPAIRS=$(( COVERAGE * $(awk '/^>/{next}{n+=length($0)}END{print n}' "$DD/truth.fa") / 300 ))
+    # 600, not 300. truth.fa is DIPLOID, so lambda = N/L_diploid. With N = C*L/300 that is
+    # lambda = 0.10 while the caller is told --haploid-depth 0.05: the reads carried twice the depth
+    # the model assumed, and every dosage/exposure term was fitted against the wrong rate.
+    # C*L/600 gives lambda = 0.05. Verified arithmetically, not assumed.
+    NPAIRS=$(( COVERAGE * $(awk '/^>/{next}{n+=length($0)}END{print n}' "$DD/truth.fa") / 600 ))
     if ! wgsim -N "$NPAIRS" -1 150 -2 150 -d 350 -s 50 -e 0.001 -r 0 -R 0 -X 0 -S "$SEED" \
          "$DD/truth.fa" "$DD/r1.fq" "$DD/r2.fq" >/dev/null 2>&1; then
       say "REFUSE $LOCUS/$DONOR: wgsim failed"; fails=$((fails+1)); continue
     fi
-    READS_MD5="$(md5of "$DD/r1.fq")"
+    # BOTH mates. Hashing R1 alone leaves R2 unprovenanced, and R2 is half the evidence.
+    READS_MD5="$(cat "$DD/r1.fq" "$DD/r2.fq" | { if command -v md5 >/dev/null 2>&1; then md5 -q; else md5sum | cut -d' ' -f1; fi; })"
 
     for ARM in LZO LOO; do
       AD="$DD/$ARM"; rm -rf "$AD"; mkdir -p "$AD"
@@ -322,40 +337,27 @@ print(min(v) if v else '')" 2>/dev/null)
       SHORTLIST_MD5=$(awk -F'\t' 'NR>1{print $1}' "$AD/call.hap_scores.tsv" 2>/dev/null | sort | \
                       { if command -v md5 >/dev/null 2>&1; then md5 -q; else md5sum | cut -d' ' -f1; fi; })
       # floor pair survives into the SHORTLIST when both floor haplotypes are scored there
+      # EXACT field match. grep -F on a whole path name still matches a longer name that contains
+      # it, and these names share long prefixes, so a substring hit would report a floor pair as
+      # surviving when a different haplotype was in the shortlist.
       FSURV=yes
       for FH in "$FLOOR_H1" "$FLOOR_H2"; do
-        grep -qF "$FH" "$AD/call.hap_scores.tsv" 2>/dev/null || FSURV=no
+        awk -F'\t' -v n="$FH" 'NR>1 && $1==n {found=1} END{exit !found}' \
+          "$AD/call.hap_scores.tsv" 2>/dev/null || FSURV=no
       done
       EQS=$(awk -F'\t' 'NR==2{print $2}' "$AD/call.equivalence.tsv" 2>/dev/null)
 
-      # NORMALISED FIT. Per fragment, never a raw total: the loci differ by an order of magnitude in
-      # fragment count, so a raw log-likelihood ranks loci by depth. Split by difference --
-      # fit_frag is the fragment-likelihood component taken from the called haplotypes' solo_ll, and
-      # fit_exposure is the REMAINDER, which carries the exposure/dosage coupling. The remainder is
-      # a decomposition-by-difference, not an independently computed term, and is only comparable
-      # within one locus and read regime. The LZO row is the control for the LOO row of the same
-      # donor; nothing here licenses a comparison across loci.
-      FITLINE=$("$PY" - "$AD/call.hap_pairs.tsv" "$AD/call.hap_scores.tsv" "$NPAIRS" "$C1" "$C2" <<'PY'
-import sys
-pairs,scores,n,c1,c2=sys.argv[1:6]; n=int(n)
-sc=None
-for i,l in enumerate(open(pairs)):
-    if i==1: sc=float(l.split('\t')[3]); break
-solo={}
-hdr=None
-for l in open(scores):
-    f=l.rstrip('\n').split('\t')
-    if hdr is None: hdr=f; continue
-    d=dict(zip(hdr,f)); solo[d['haplotype']]=float(d['solo_ll'])
-if sc is None or c1 not in solo or c2 not in solo or n<=0: print(""); sys.exit()
-frag=solo[c1]+solo[c2]
-print("%.6f\t%.6f\t%.6f" % (sc/n, frag/n, (sc-frag)/n))
-PY
-)
-      if [ -z "$FITLINE" ]; then
-        say "REFUSE $LOCUS/$DONOR/$ARM: fit statistic not computable"; fails=$((fails+1)); continue
-      fi
-      read -r FIT FITF FITE <<<"$FITLINE"
+      # NORMALISED FIT: NOT COMPUTED, deliberately.
+      # The previous version summed the two haplotypes' solo_ll and called the remainder
+      # "exposure". That is invalid: the diploid per-fragment term is
+      # log[(1-eta)*lambda*(M_a+M_b) + eta*P_bg], which is not the sum of two haploid terms -- the
+      # background is counted twice and the fragment mass is combined before the log, not after.
+      # A valid split needs the scorer's own terms (fragment_sum, coverage_a, coverage_b, dosage,
+      # total_score) normalised by the LOADED fragment count, and --dump-fragment-mass reaches them
+      # only under --joint-depth, not on the production path. That is the known instrumentation gap.
+      # Emitting NA rather than an invalid number: this cohort has produced five figures from
+      # instruments that never ran, and a plausible-looking fit would be the sixth.
+      FIT=NA; FITF=NA; FITE=NA
 
       # ---- BLOCKS ------------------------------------------------------------------------------
       # Truth alleles per block come from projecting the TRUTH pair on the FULL panel. Allele indices
