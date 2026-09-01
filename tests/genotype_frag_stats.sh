@@ -753,9 +753,18 @@ PYEOF
 if [ -s "$OUT/ctr.hap_blocks.tsv" ]; then
   NUP=$(awk -F'\t' 'NR>2 && $9=="NA"' "$OUT/ctr.hap_blocks.tsv" | wc -l | tr -d ' ')
   NBOTH=$(awk -F'\t' 'NR>2 && $9=="NA" && $8==1' "$OUT/ctr.hap_blocks.tsv" | wc -l | tr -d ' ')
-  [ "${NUP:-0}" -gt 0 ] && ok "a path the decomposition cannot reproduce yields $NUP unprojectable blocks" \
-                        || bad "no unprojectable blocks: the flag never fires and the next check is vacuous"
-  [ "${NBOTH:-0}" = 0 ] && ok "no block is both unprojectable and determined" \
+  # SEMANTICS CHANGED, deliberately. This used to require the flag to fire, because projectability
+  # was all-or-nothing: any difference between a haplotype's block concatenation and its walk marked
+  # EVERY block of it unreliable. hapTRUNC's concatenation is a correct PREFIX of its walk, so every
+  # BLOCK it occupies is complete and the 100 bp difference lies beyond all of them -- reporting
+  # nineteen unreliable blocks because of sequence no block covers was the defect, not the finding.
+  # The trailing sequence is now reported as an explicit unmapped interval by the projection dump.
+  [ "${NUP:-0}" = 0 ] \
+    && ok "a truncated path keeps its reliably mapped blocks projectable (gap is beyond every block)" \
+    || bad "$NUP block(s) of a truncated path are unprojectable; the terminal gap is poisoning blocks it does not touch"
+  # Consequently VACUOUS here, and kept only as an ordering invariant. The unprojectable branch is
+  # exercised for real in genotype_path_blocks.sh, on a candidate with no verified map at all.
+  [ "${NBOTH:-0}" = 0 ] && ok "no block is both unprojectable and determined (vacuous here: $NUP unprojectable)" \
                         || bad "$NBOTH blocks are reported determined despite being unprojectable"
 else
   bad "the truncated-path run produced no block table"

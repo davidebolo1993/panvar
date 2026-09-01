@@ -3033,6 +3033,16 @@ double reference_pair_loglik(const std::string& hap_a, const std::string& hap_b,
     return total;
 }
 
+namespace {
+// Does the decomposition assign this path an allele at this block? Absence means the path does not
+// traverse the block at all, which is different from traversing it and spelling nothing.
+bool sl_block_has_no_allele(const std::vector<BlockAlleles>& blocks, std::uint32_t bi,
+                            const std::string& name) {
+    if (bi >= blocks.size()) return true;
+    return blocks[bi].allele_of.find(name) == blocks[bi].allele_of.end();
+}
+}  // namespace
+
 PathProjection project_path_blocks(const std::vector<BlockAlleles>& projection_blocks,
                                    const std::vector<BlockAlleles>& catalogue_blocks,
                                    const std::string& name,
@@ -3050,6 +3060,15 @@ PathProjection project_path_blocks(const std::vector<BlockAlleles>& projection_b
         const std::size_t b0 = f.offsets[k];
         const std::size_t b1 = (k + 1 < f.offsets.size()) ? f.offsets[k + 1] : f.mapped_hi;
         if (b1 < b0 || b0 < f.mapped_lo || b1 > f.mapped_hi) continue;
+        // A block this path does not OCCUPY is not a block it spells emptily. Both look like a
+        // zero-width slice: a bypassing allele (a deletion spanning the site) is a real, projectable
+        // state with an entry in allele_of, while a block past the end of a truncated path has no
+        // entry at all and lands at the boundary offset with zero width. Emitting the second marks
+        // it projectable and lets a truncated path claim block coordinates it never reached --
+        // measured on hapTRUNC, where the unprojectable flag then never fired anywhere.
+        if (sl_block_has_no_allele(projection_blocks, k < f.block_at.size() ? f.block_at[k]
+                                                                           : static_cast<std::uint32_t>(k),
+                                   name)) continue;
         PathBlockSlice sl;
         sl.block = k < f.block_at.size() ? f.block_at[k] : static_cast<std::uint32_t>(k);
         sl.walk_begin = b0;

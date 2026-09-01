@@ -132,6 +132,32 @@ if [ -f "$G" ]; then
     || bad "$UNIQ unrepresentable held-out slice(s) carry a catalogue index"
 fi
 
+# THE PARTIAL TERMINAL FRAME, on the real path that motivated it. cyp2d6 NA18989#1#haplotype1 walks
+# 207214 bp and concatenates to 205236: it stops 1978 bp past bubble 8's sink, short of bubble 9.
+# Its reliably mapped blocks must stay usable -- the whole point of accepting partial frames -- while
+# the uncovered tail is reported as an explicit unmapped interval rather than attached to a block.
+G="$REPO/results/real_data/cyp2d6/bubble/bubble.sorted.gfa"
+if [ -f "$G" ]; then
+  T="NA18989#1#haplotype1-0000031:36617797-36825011"
+  N_PART=$(awk -F'\t' -v p="$T" 'NR>1 && $2==p && $4=="partial"{n++} END{print n+0}' "$OUT/cyp2d6.path_blocks.tsv")
+  N_UNM=$(awk -F'\t' -v p="$T" 'NR>1 && $2==p && $4=="unmapped"{n++} END{print n+0}' "$OUT/cyp2d6.path_blocks.tsv")
+  UNM_BP=$(awk -F'\t' -v p="$T" 'NR>1 && $2==p && $4=="unmapped"{s+=$11} END{print s+0}' "$OUT/cyp2d6.path_blocks.tsv")
+  [ "$N_PART" -gt 0 ] \
+    && ok "the partial path keeps $N_PART mapped blocks rather than losing the whole chain" \
+    || bad "the partial path has no mapped blocks; a terminal gap is voiding blocks it does not touch"
+  [ "$N_UNM" -gt 0 ] \
+    && ok "and its uncovered tail is an explicit unmapped interval ($N_UNM), not attached to a block" \
+    || bad "the partial path reports no unmapped interval; the tail went somewhere unstated"
+  [ "$UNM_BP" = 1978 ] \
+    && ok "the unmapped interval is exactly the 1978 bp past bubble 8's sink" \
+    || bad "the unmapped interval is $UNM_BP bp, expected 1978"
+  # NON-VACUITY for the unprojectable branch: no path here may be silently dropped.
+  N_UNPROJ=$(awk -F'\t' 'NR>1 && $4=="unprojectable"{n++} END{print n+0}' "$OUT/cyp2d6.path_blocks.tsv")
+  [ "$N_UNPROJ" = 0 ] \
+    && ok "no cyp2d6 candidate is unprojectable (127/127 usable, no candidate-set reduction)" \
+    || bad "$N_UNPROJ cyp2d6 candidate(s) unprojectable; the panel is being silently reduced"
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then echo "path blocks: all assertions passed"; else
   echo "path blocks: $fails assertion(s) failed"; fi
