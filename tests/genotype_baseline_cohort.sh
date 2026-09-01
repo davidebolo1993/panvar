@@ -1,0 +1,437 @@
+#!/usr/bin/env bash
+# genotype_baseline_cohort.sh - the frozen pre-estimator baseline, six loci, LZO and LOO.
+#
+#   genotype_baseline_cohort.sh <out-dir> [config.tsv] [loci] [donors]
+#
+# WHAT THIS IS. The regression baseline the bounded pigeonhole estimator and any later block-level
+# caller are measured against. It is CONFIGURATION-DRIVEN: one table of loci, one code path. Six
+# copied locus branches would drift, and a drifted branch reports a number for the wrong substrate.
+#
+# NO TUNING. Every caller parameter is fixed in CALLER_ARGS below. A baseline that was tuned is not
+# a baseline. If a parameter must change, that is a NEW baseline with a new commit, not an edit.
+#
+# TWO TABLES, because this is meant to become a BLOCK-level genotyper:
+#   runs.tsv    one row per (locus, donor, arm) -- the whole-locus summary
+#   blocks.tsv  one row per block
+# A whole-locus median hides a catastrophic KIV-2 block, and one large array hides otherwise exact
+# ordinary blocks. Neither table is interpretable without the other.
+#
+# CONTRACTS, each of which has already been violated at least once on this branch:
+#
+#  1. THE WALK IS THE SEQUENCE. Truth, candidates and calls are all spelled from the graph walk
+#     (--dump-scored-sequences, --spell-pair), never rebuilt from block alleles and never taken from
+#     a different pipeline stage. `metric` records exact vs bounded, and the band.
+#  2. called_distance >= panel_floor, ALWAYS. A negative excess is not a good result, it is a metric
+#     or substrate mismatch, and the run FAILS rather than reporting it.
+#  3. THE DECOMPOSITION IS FIXED. LOO excludes candidates; it never recomputes bubbles. Recomputing
+#     would change the block indices that blocks.tsv is keyed on, between arms of the same donor.
+#  4. PROVENANCE IS RECORDED AND CHECKED: graph, bubble catalogue, truth FASTA, reads, binary. The
+#     LPA numbers were once measuring panphorte's KIV-2 folding rather than the genotyper.
+#  5. SEED AND READ COUNT ARE RECORDED. This is a DETERMINISTIC regression baseline, one seed. It is
+#     not a scientific estimate; a multi-seed study is a separate thing and must be labelled so.
+#  6. TRUTH IS AN EQUIVALENCE CLASS. Sequence-identical and reverse-complement-equivalent paths all
+#     count as correct; requiring one arbitrary label to win measures path naming, not genotyping.
+#  7. FIT IS NORMALISED PER FRAGMENT and split into fragment and exposure/dosage components, and is
+#     comparable only within a locus and read regime. Raw log-likelihoods across loci rank by depth.
+#  8. REFUSE, DO NOT DEGRADE. Any failed step means NO ROW. A plausible partial row is worse than a
+#     missing one because it will be averaged.
+#
+# NOT COMPUTED, and left blank rather than zero-filled:
+#   * per-block edit distance and per-block floor need block-boundary offsets in walk coordinates,
+#     which no command exposes today. blocks.tsv reports allele identity and availability instead,
+#     which is what determines PASS/OFF_PANEL. A zero here would be a number from an instrument that
+#     never ran -- this cohort has produced four of those already.
+set -uo pipefail
+
+OUT="${1:?usage: genotype_baseline_cohort.sh <out-dir> [config.tsv] [loci] [donors]}"
+CFG="${2:-}"
+ONLY_LOCI="${3:-}"
+ONLY_DONORS="${4:-}"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; REPO="$(cd "$HERE/.." && pwd)"
+BIN="${PANVAR_BIN:-$REPO/build_genotype_review/panvar}"
+PY="${PYTHON:-python3}"
+BAND="${BAND:-4096}"
+SEED="${SEED:-7}"
+COVERAGE="${COVERAGE:-30}"
+mkdir -p "$OUT"
+
+md5of() { if command -v md5 >/dev/null 2>&1; then md5 -q "$1"; else md5sum "$1" | cut -d' ' -f1; fi; }
+say() { printf '%s\n' "$*"; }
+fails=0; rows=0
+
+# ---- the caller, FROZEN --------------------------------------------------------------------------
+CALLER_ARGS=(--haplotype-mode --hamming-emission --max-divergence 0.05
+             --fragment-len 350 --fragment-sd 50 --error-rate 0.001 --haploid-depth 0.05
+             --max-anchor-occ 32 --placement-topk 8 --top-pairs 20)
+
+# ---- configuration -------------------------------------------------------------------------------
+# locus <TAB> graph <TAB> bubble-prefix <TAB> reference-path-substring
+if [ -z "$CFG" ]; then
+  CFG="$OUT/config.tsv"
+  { for L in acot gstm1 lpa ankrd36c c4 cyp2d6; do
+      printf '%s\t%s\t%s\t%s\n' "$L" \
+        "$REPO/results/real_data/$L/bubble/bubble.sorted.gfa" \
+        "$REPO/results/real_data/$L/bubble/bubble" "ref"
+    done; } > "$CFG"
+fi
+
+[ -x "$BIN" ] || { say "FATAL: binary not executable: $BIN"; exit 1; }
+BIN_MD5="$(md5of "$BIN")"
+COMMIT="$(cd "$REPO" && git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+DIRTY="$(cd "$REPO" && git status --porcelain -- src include tests CMakeLists.txt 2>/dev/null | wc -l | tr -d ' ')"
+# The binary is COPIED. A rebuild during the run must not change what is being measured -- that has
+# invalidated a ctest run and a 16-donor cohort on this branch.
+cp "$BIN" "$OUT/panvar.frozen"; BIN="$OUT/panvar.frozen"
+
+{ echo "commit          $COMMIT"
+  echo "tracked_dirty   $DIRTY files"
+  echo "binary_md5      $BIN_MD5"
+  echo "band            $BAND"
+  echo "seed            $SEED"
+  echo "coverage        ${COVERAGE}x"
+  echo "caller_args     ${CALLER_ARGS[*]}"
+  echo "date            $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} > "$OUT/PROVENANCE.txt"
+cat "$OUT/PROVENANCE.txt"
+[ "$DIRTY" != "0" ] && say "WARNING: $DIRTY tracked source file(s) modified; this baseline is not reproducible from $COMMIT alone"
+
+RUNS="$OUT/runs.tsv"; BLOCKS="$OUT/blocks.tsv"
+printf 'commit\tbinary_md5\tlocus\tdonor\tarm\treads\tseed\tn_read_pairs\tgraph_md5\tbubbles_md5\ttruth_md5\treads_md5\tcatalogue_md5\tshortlist_md5\ttruth1\ttruth2\tpanel_floor\tfloor_pair_survived\tcalled1\tcalled2\tcalled_distance\texcess\tmetric\tequiv_set_size\tfit_per_frag\tfit_frag\tfit_exposure\tn_blocks\tn_projectable\tn_determined\tn_exact\tn_wrong\truntime_s\tpeak_rss_bytes\tstatus\n' > "$RUNS"
+printf 'commit\tlocus\tdonor\tarm\tblock\tkind\tbubble_id\tn_alleles\ttruth_a1\ttruth_a2\tcalled_a1\tcalled_a2\tprojectable\tdetermined\tequiv_set_size\tstatus\n' > "$BLOCKS"
+
+# ---- peak RSS, units made explicit ---------------------------------------------------------------
+# Darwin /usr/bin/time -l reports BYTES; GNU time -v reports KILOBYTES. Recording the number without
+# the unit makes a 1000x difference invisible in a table that will be compared across machines.
+peak_rss_bytes() {   # peak_rss_bytes <timefile>
+  local f="$1" v
+  v=$(awk '/maximum resident set size/ {print $1; exit}' "$f" 2>/dev/null)
+  if [ -n "$v" ]; then echo "$v"; return; fi
+  v=$(awk -F': *' '/Maximum resident set size/ {print $2; exit}' "$f" 2>/dev/null)
+  if [ -n "$v" ]; then echo $(( v * 1024 )); return; fi
+  echo ""
+}
+# run_timed <timefile> <cmd...> -> propagates the command's exit code
+run_timed() {
+  local tf="$1"; shift
+  /usr/bin/time -l "$@" 2>"$tf" >/dev/null
+  return $?
+}
+
+# ---- helpers -------------------------------------------------------------------------------------
+# Write one named record out of a scored_sequences.fa, uppercased.
+extract_fa() {   # extract_fa <fa> <name> <out>
+  "$PY" - "$1" "$2" "$3" <<'PY'
+import sys
+fa,want,out=sys.argv[1:4]
+n=None;buf=[];hit=None
+def flush():
+    global hit
+    if n is not None and n==want: hit="".join(buf)
+for l in open(fa):
+    if l[0]=='>':
+        flush()
+        if hit is not None: break
+        n=l[1:].split()[0]; buf=[]
+    else: buf.append(l.strip())
+flush()
+if hit is None: sys.exit(3)
+open(out,'w').write(">s\n"+hit.upper()+"\n")
+PY
+}
+# Exact edit distance between two one-record FASTAs, via the SAME command every other distance uses.
+# Escalates the band until the distance is EXACT, and reports the band it needed. A distance that
+# fell outside the band is not a large distance, it is no distance -- and silently treating the cap
+# as the answer would make a badly wrong call look like a near miss. USED_BAND is set as a side
+# effect so the row can record what the number actually cost.
+USED_BAND=""
+dist() {   # dist <a.fa> <b.fa> -> integer, or empty
+  local v b
+  for b in $BAND 16384 65536 262144; do
+    v=$("$BIN" genotype-frag --exact-distance "$1" "$2" --distance-band "$b" 2>/dev/null | tr -d ' ')
+    case "$v" in ''|*[!0-9]*) continue ;; esac
+    if [ -z "$USED_BAND" ] || [ "$b" -gt "$USED_BAND" ]; then USED_BAND="$b"; fi
+    echo "$v"; return
+  done
+  echo ""
+}
+
+while IFS=$'\t' read -r LOCUS GFA PFX REFNAME; do
+  [ -z "${LOCUS:-}" ] && continue
+  case "$LOCUS" in \#*) continue ;; esac
+  if [ -n "$ONLY_LOCI" ] && ! printf '%s' " $ONLY_LOCI " | grep -q " $LOCUS "; then continue; fi
+  if [ ! -f "$GFA" ] || [ ! -f "$PFX.bubbles.csv" ]; then
+    say "REFUSE $LOCUS: missing substrate ($GFA / $PFX.bubbles.csv)"; fails=$((fails+1)); continue
+  fi
+  GFA_MD5="$(md5of "$GFA")"; BUB_MD5="$(md5of "$PFX.bubbles.csv")"
+  LD="$OUT/$LOCUS"; rm -rf "$LD"; mkdir -p "$LD"
+
+  # Panel inventory, from the graph walks. This is also the candidate catalogue for LZO.
+  "$BIN" genotype-frag -i "$GFA" -b "$PFX" -o "$LD/all" --dump-scored-sequences "$LD/all" -q \
+    >/dev/null 2>&1
+  if [ ! -s "$LD/all.scored_sequences.fa" ]; then
+    say "REFUSE $LOCUS: could not spell the panel from the graph"; fails=$((fails+1)); continue
+  fi
+  DONORS=$(awk -F'\t' 'NR>1{split($2,a,"#"); if(a[2]=="1"||a[2]=="2") c[a[1]]=c[a[1]] a[2]}
+                       END{for(s in c) if(length(c[s])==2) print s}' \
+           "$LD/all.scored_sequences.tsv" | sort | head -"${NDONORS:-2}")
+  [ -n "$ONLY_DONORS" ] && DONORS="$ONLY_DONORS"
+
+  for DONOR in $DONORS; do
+    T1=$(awk -F'\t' -v d="$DONOR" 'NR>1 && index($2,d"#1#")==1 {print $2; exit}' "$LD/all.scored_sequences.tsv")
+    T2=$(awk -F'\t' -v d="$DONOR" 'NR>1 && index($2,d"#2#")==1 {print $2; exit}' "$LD/all.scored_sequences.tsv")
+    if [ -z "$T1" ] || [ -z "$T2" ]; then
+      say "REFUSE $LOCUS/$DONOR: donor does not have two homologues in the panel"; fails=$((fails+1)); continue
+    fi
+    DD="$LD/$DONOR"; mkdir -p "$DD"
+    extract_fa "$LD/all.scored_sequences.fa" "$T1" "$DD/t1.fa" || { say "REFUSE $LOCUS/$DONOR: cannot spell truth 1"; fails=$((fails+1)); continue; }
+    extract_fa "$LD/all.scored_sequences.fa" "$T2" "$DD/t2.fa" || { say "REFUSE $LOCUS/$DONOR: cannot spell truth 2"; fails=$((fails+1)); continue; }
+    cat "$DD/t1.fa" "$DD/t2.fa" > "$DD/truth.fa"; TRUTH_MD5="$(md5of "$DD/truth.fa")"
+
+    # TRUTH EQUIVALENCE CLASS: every panel path whose walk is sequence-identical to a truth
+    # haplotype, or its reverse complement. Requiring one arbitrary label to win measures naming.
+    "$PY" - "$LD/all.scored_sequences.fa" "$DD/t1.fa" "$DD/t2.fa" > "$DD/truth_class.txt" <<'PY'
+import sys
+def one(p):
+    return "".join(l.strip() for l in open(p) if l[0]!='>').upper()
+def rc(s): return s[::-1].translate(str.maketrans('ACGT','TGCA'))
+fa,p1,p2=sys.argv[1:4]
+t=[one(p1),one(p2)]; t+= [rc(x) for x in t]
+n=None;buf=[]
+def flush():
+    if n is not None and "".join(buf).upper() in t: print(n)
+for l in open(fa):
+    if l[0]=='>': flush(); n=l[1:].split()[0]; buf=[]
+    else: buf.append(l.strip())
+flush()
+PY
+
+    # READS: simulated, one fixed seed, count recorded. A deterministic regression baseline.
+    NPAIRS=$(( COVERAGE * $(awk '/^>/{next}{n+=length($0)}END{print n}' "$DD/truth.fa") / 300 ))
+    if ! wgsim -N "$NPAIRS" -1 150 -2 150 -d 350 -s 50 -e 0.001 -r 0 -R 0 -X 0 -S "$SEED" \
+         "$DD/truth.fa" "$DD/r1.fq" "$DD/r2.fq" >/dev/null 2>&1; then
+      say "REFUSE $LOCUS/$DONOR: wgsim failed"; fails=$((fails+1)); continue
+    fi
+    READS_MD5="$(md5of "$DD/r1.fq")"
+
+    for ARM in LZO LOO; do
+      AD="$DD/$ARM"; rm -rf "$AD"; mkdir -p "$AD"
+      EXCL=(); [ "$ARM" = LOO ] && EXCL=(--exclude-haplotypes "$T1,$T2")
+
+      # The candidate catalogue AFTER exclusion. The floor must be computed against exactly this
+      # set: including the held-out truth makes every floor 0, which is uniform enough to look right.
+      "$BIN" genotype-frag -i "$GFA" -b "$PFX" -o "$AD/cat" --dump-scored-sequences "$AD/cat" \
+        ${EXCL[@]+"${EXCL[@]}"} -q >/dev/null 2>&1
+      if [ ! -s "$AD/cat.scored_sequences.fa" ]; then
+        say "REFUSE $LOCUS/$DONOR/$ARM: no candidate catalogue"; fails=$((fails+1)); continue
+      fi
+      CAT_MD5="$(md5of "$AD/cat.scored_sequences.fa")"
+
+      # PANEL FLOOR: the best any remaining candidate PAIR can do, exact, same metric as everything
+      # else. Filtered on the dump's group column -- the held_out group IS the truth.
+      FLOORLINE=$("$PY" - "$AD/cat.scored_sequences.fa" "$AD" "$BIN" "$BAND" "$DD/t1.fa" "$DD/t2.fa" <<'PY'
+import sys, subprocess
+fa,ad,BIN,band,t1,t2=sys.argv[1:7]
+names=[];seqs=[];n=None;grp=None;buf=[]
+def flush():
+    if n is not None and grp!="held_out": names.append(n); seqs.append("".join(buf))
+for l in open(fa):
+    if l[0]=='>':
+        flush(); p=l[1:].split(); n=p[0]; grp=p[1] if len(p)>1 else "panel"; buf=[]
+    else: buf.append(l.strip())
+flush()
+if not seqs: print("NOFLOOR"); sys.exit()
+best=[10**9,10**9]; who=[None,None]
+for nm,s in zip(names,seqs):
+    open(f"{ad}/c.fa","w").write(">c\n"+s.upper()+"\n")
+    for h,t in ((0,t1),(1,t2)):
+        r=subprocess.run([BIN,"genotype-frag","--exact-distance",f"{ad}/c.fa",t,
+                          "--distance-band",band],capture_output=True,text=True)
+        v=r.stdout.strip()
+        if v.isdigit() and int(v)<best[h]: best[h]=int(v); who[h]=nm
+if 10**9 in best: print("NOFLOOR")
+else: print("%d\t%s\t%s" % (best[0]+best[1], who[0], who[1]))
+PY
+)
+      case "$FLOORLINE" in
+        NOFLOOR|"") say "REFUSE $LOCUS/$DONOR/$ARM: floor not computable within band $BAND"
+                    fails=$((fails+1)); continue ;;
+      esac
+      read -r PANEL_FLOOR FLOOR_H1 FLOOR_H2 <<<"$FLOORLINE"
+
+      # THE CALLER, timed, into a directory guaranteed empty. A stale output from a previous run
+      # read back as this run's result is a silent way to report the wrong number.
+      rm -f "$AD/call".* 
+      if ! run_timed "$AD/time.txt" \
+           "$BIN" genotype-frag -i "$GFA" -b "$PFX" -o "$AD/call" \
+             -R "$DD/r1.fq" -R "$DD/r2.fq" ${EXCL[@]+"${EXCL[@]}"} \
+             "${CALLER_ARGS[@]}" -t "${THREADS:-4}" -q; then
+        say "REFUSE $LOCUS/$DONOR/$ARM: caller exited nonzero"; fails=$((fails+1)); continue
+      fi
+      if [ ! -s "$AD/call.hap_pairs.tsv" ]; then
+        say "REFUSE $LOCUS/$DONOR/$ARM: caller produced no hap_pairs.tsv"; fails=$((fails+1)); continue
+      fi
+      # Darwin `time -l` prints "        0.34 real         0.30 user" -- `real` is field 2 and the
+      # number is field 1. Matching /^ *real/ silently yields an empty column.
+      RUNTIME=$(awk '$2=="real" {print $1; exit}' "$AD/time.txt" 2>/dev/null)
+      [ -z "$RUNTIME" ] && RUNTIME=$(awk -F': *' '/Elapsed \(wall clock\)/ {print $2; exit}' "$AD/time.txt")
+      PEAK=$(peak_rss_bytes "$AD/time.txt")
+
+      # SPELL BY NAME, from the walks. Allele indices are valid for one catalogue only and spelling
+      # across a mismatch is silent.
+      "$BIN" genotype-frag -i "$GFA" -b "$PFX" -o "$AD/sp" --spell-pair "$AD/call.hap_pairs.tsv" \
+        -q >/dev/null 2>&1
+      if [ ! -s "$AD/sp.called.fa" ]; then
+        say "REFUSE $LOCUS/$DONOR/$ARM: could not spell the called pair by name"; fails=$((fails+1)); continue
+      fi
+      C1=$(awk -F'\t' 'NR==2{print $2}' "$AD/call.hap_pairs.tsv")
+      C2=$(awk -F'\t' 'NR==2{print $3}' "$AD/call.hap_pairs.tsv")
+      "$PY" - "$AD/sp.called.fa" "$AD/c1.fa" "$AD/c2.fa" <<'PY'
+import sys
+fa,o1,o2=sys.argv[1:4]
+recs=[];n=None;buf=[]
+for l in open(fa):
+    if l[0]=='>':
+        if n is not None: recs.append("".join(buf))
+        n=1;buf=[]
+    else: buf.append(l.strip())
+if n is not None: recs.append("".join(buf))
+if len(recs)<2: sys.exit(3)
+open(o1,'w').write(">c1\n"+recs[0].upper()+"\n"); open(o2,'w').write(">c2\n"+recs[1].upper()+"\n")
+PY
+      [ -s "$AD/c1.fa" ] && [ -s "$AD/c2.fa" ] || { say "REFUSE $LOCUS/$DONOR/$ARM: called pair not spelled as two records"; fails=$((fails+1)); continue; }
+      # best of the two orientation assignments -- the pair is unordered
+      USED_BAND=""
+      D11=$(dist "$AD/c1.fa" "$DD/t1.fa"); D22=$(dist "$AD/c2.fa" "$DD/t2.fa")
+      D12=$(dist "$AD/c1.fa" "$DD/t2.fa"); D21=$(dist "$AD/c2.fa" "$DD/t1.fa")
+      CALLED_D=$("$PY" -c "
+import sys
+v=[]
+for a,b in (('$D11','$D22'),('$D12','$D21')):
+    if a.isdigit() and b.isdigit(): v.append(int(a)+int(b))
+print(min(v) if v else '')" 2>/dev/null)
+      if [ -z "$CALLED_D" ]; then
+        say "REFUSE $LOCUS/$DONOR/$ARM: called distance not computable within band $BAND"
+        fails=$((fails+1)); continue
+      fi
+      # CONTRACT 2. A negative excess is a metric or substrate mismatch, never a good result.
+      if [ "$CALLED_D" -lt "$PANEL_FLOOR" ]; then
+        say "REFUSE $LOCUS/$DONOR/$ARM: called_distance $CALLED_D < panel_floor $PANEL_FLOOR -- metric or substrate mismatch"
+        fails=$((fails+1)); continue
+      fi
+      EXCESS=$(( CALLED_D - PANEL_FLOOR ))
+      SHORTLIST_MD5=$(awk -F'\t' 'NR>1{print $1}' "$AD/call.hap_scores.tsv" 2>/dev/null | sort | \
+                      { if command -v md5 >/dev/null 2>&1; then md5 -q; else md5sum | cut -d' ' -f1; fi; })
+      # floor pair survives into the SHORTLIST when both floor haplotypes are scored there
+      FSURV=yes
+      for FH in "$FLOOR_H1" "$FLOOR_H2"; do
+        grep -qF "$FH" "$AD/call.hap_scores.tsv" 2>/dev/null || FSURV=no
+      done
+      EQS=$(awk -F'\t' 'NR==2{print $2}' "$AD/call.equivalence.tsv" 2>/dev/null)
+
+      # NORMALISED FIT. Per fragment, never a raw total: the loci differ by an order of magnitude in
+      # fragment count, so a raw log-likelihood ranks loci by depth. Split by difference --
+      # fit_frag is the fragment-likelihood component taken from the called haplotypes' solo_ll, and
+      # fit_exposure is the REMAINDER, which carries the exposure/dosage coupling. The remainder is
+      # a decomposition-by-difference, not an independently computed term, and is only comparable
+      # within one locus and read regime. The LZO row is the control for the LOO row of the same
+      # donor; nothing here licenses a comparison across loci.
+      FITLINE=$("$PY" - "$AD/call.hap_pairs.tsv" "$AD/call.hap_scores.tsv" "$NPAIRS" "$C1" "$C2" <<'PY'
+import sys
+pairs,scores,n,c1,c2=sys.argv[1:6]; n=int(n)
+sc=None
+for i,l in enumerate(open(pairs)):
+    if i==1: sc=float(l.split('\t')[3]); break
+solo={}
+hdr=None
+for l in open(scores):
+    f=l.rstrip('\n').split('\t')
+    if hdr is None: hdr=f; continue
+    d=dict(zip(hdr,f)); solo[d['haplotype']]=float(d['solo_ll'])
+if sc is None or c1 not in solo or c2 not in solo or n<=0: print(""); sys.exit()
+frag=solo[c1]+solo[c2]
+print("%.6f\t%.6f\t%.6f" % (sc/n, frag/n, (sc-frag)/n))
+PY
+)
+      if [ -z "$FITLINE" ]; then
+        say "REFUSE $LOCUS/$DONOR/$ARM: fit statistic not computable"; fails=$((fails+1)); continue
+      fi
+      read -r FIT FITF FITE <<<"$FITLINE"
+
+      # ---- BLOCKS ------------------------------------------------------------------------------
+      # Truth alleles per block come from projecting the TRUTH pair on the FULL panel. Allele indices
+      # are only meaningful within one catalogue, so the two tables' catalogue hashes are compared
+      # before any index is read across them. Spelling across a mismatch is silent.
+      # ---- BLOCKS, projected from the WALK -----------------------------------------------------
+      # NOT via --force-haplotypes: that ADDS to the shortlist rather than restricting it, so
+      # forcing HG00731/HG03248 at c4 still returned HG00096 as rank 1 and both "projections" were
+      # the called pair. Every block then compared equal and the table read 11/11 exact for a call
+      # 32732 edits above the floor. lib_block_project.py segments each path's own walk at the
+      # bubble sources and sinks, so it cannot report one pair's alleles under another's name.
+      # `projectable` and `determined` still come from the arm's own call, joined on block index.
+      "$PY" "$HERE/lib_block_project.py" "$GFA" "$PFX.bubbles.csv" "$T1" "$T2" "$C1" "$C2" \
+        > "$AD/proj.tsv" 2>"$AD/proj.err"
+      if [ ! -s "$AD/proj.tsv" ]; then
+        say "REFUSE $LOCUS/$DONOR/$ARM: block projection failed ($(head -1 "$AD/proj.err"))"
+        fails=$((fails+1)); continue
+      fi
+      NB=""; NPROJ=""; NDET=""; NEX=""; NWR=""
+      "$PY" - "$AD/proj.tsv" "$AD/call.hap_blocks.tsv" "$COMMIT" "$LOCUS" "$DONOR" "$ARM" \
+             "${EQS:-1}" "$T1" "$T2" "$C1" "$C2" >> "$BLOCKS" 2>"$AD/bstat.txt" <<'PY'
+import sys
+proj,armcall,commit,locus,donor,arm,eqs,t1,t2,c1,c2=sys.argv[1:12]
+P={}
+for l in open(proj):
+    f=l.rstrip('\n').split('\t')
+    if len(f)<5 or f[1]=='NA': continue
+    P.setdefault(f[0],{})[int(f[1])]=(f[2],f[3],f[4])   # kind, bp, md5
+A={};hdr=None
+for l in open(armcall):
+    if l.startswith('#'): continue
+    f=l.rstrip('\n').split('\t')
+    if hdr is None: hdr=f; continue
+    d=dict(zip(hdr,f)); A[int(d['block'])]=d
+for nm in (t1,t2,c1,c2):
+    if nm not in P:
+        sys.stderr.write("0 0 0 0 0\n"); raise SystemExit("no projection for "+nm)
+blocks=sorted(set(P[t1]) & set(P[t2]) & set(P[c1]) & set(P[c2]))
+if not blocks:
+    sys.stderr.write("0 0 0 0 0\n"); raise SystemExit("no common blocks")
+nb=nproj=ndet=nex=nwr=0
+for b in blocks:
+    a=A.get(b,{})
+    kind=P[t1][b][0]
+    tset={P[t1][b][2],P[t2][b][2]}; cset={P[c1][b][2],P[c2][b][2]}
+    absent = 'ABSENT' in (P[t1][b][1],P[t2][b][1],P[c1][b][1],P[c2][b][1])
+    nb+=1
+    pj=a.get('projectable',''); dt=a.get('determined','')
+    if pj=='yes': nproj+=1
+    if dt=='1': ndet+=1
+    if absent:      st='ABSENT'
+    elif tset==cset: st='PASS'; nex+=1
+    else:            st='WRONG'; nwr+=1
+    sys.stdout.write('\t'.join([commit,locus,donor,arm,str(b),kind,a.get('bubble_id',''),
+        a.get('n_alleles',''),P[t1][b][2][:8],P[t2][b][2][:8],P[c1][b][2][:8],P[c2][b][2][:8],
+        pj,dt,eqs,st])+'\n')
+sys.stderr.write("%d %d %d %d %d\n" % (nb,nproj,ndet,nex,nwr))
+PY
+      read -r NB NPROJ NDET NEX NWR <<<"$(cat "$AD/bstat.txt" 2>/dev/null)"
+
+      printf '%s\t%s\t%s\t%s\t%s\tsim\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\texact(band=%s)\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tOK\n' \
+        "$COMMIT" "$BIN_MD5" "$LOCUS" "$DONOR" "$ARM" "$SEED" "$NPAIRS" \
+        "$GFA_MD5" "$BUB_MD5" "$TRUTH_MD5" "$READS_MD5" "$CAT_MD5" "${SHORTLIST_MD5:-}" \
+        "$T1" "$T2" "$PANEL_FLOOR" "$FSURV" "$C1" "$C2" "$CALLED_D" "$EXCESS" "${USED_BAND:-$BAND}" \
+        "${EQS:-}" "$FIT" "$FITF" "$FITE" \
+        "${NB:-}" "${NPROJ:-}" "${NDET:-}" "${NEX:-}" "${NWR:-}" \
+        "${RUNTIME:-}" "${PEAK:-}" >> "$RUNS"
+      rows=$((rows+1))
+      say "  $LOCUS/$DONOR/$ARM floor=$PANEL_FLOOR called=$CALLED_D excess=$EXCESS blocks=${NEX:-?}/${NB:-?} exact"
+    done
+  done
+done < "$CFG"
+
+say ""
+say "rows written: $rows    refusals: $fails"
+say "  $RUNS"
+say "  $BLOCKS"
+[ "$rows" -gt 0 ] || { say "NO ROWS -- the baseline is empty, which is a failure, not an empty result"; exit 1; }
+exit $(( fails > 0 ? 1 : 0 ))
