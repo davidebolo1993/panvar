@@ -697,6 +697,64 @@ std::vector<BlockFragmentResult> genotype_fragments(
     return out;
 }
 
+std::string chain_left_flank(const std::vector<BlockAlleles>& blocks, std::size_t bi,
+                             std::size_t want) {
+    return left_flank(blocks, bi, want);
+}
+
+std::string chain_right_flank(const std::vector<BlockAlleles>& blocks, std::size_t bi,
+                              std::size_t want) {
+    return right_flank(blocks, bi, want);
+}
+
+double reference_factor_loglik(const std::string& hap_a,
+                               const std::string& hap_b,
+                               const std::vector<Fragment>& fragments,
+                               const ReferenceParams& params) {
+    return reference_pair_loglik(hap_a, hap_b, fragments, params);
+}
+
+std::string chain_span_sequence(const std::vector<BlockAlleles>& blocks,
+                                const std::vector<std::size_t>& targets,
+                                std::size_t first_target,
+                                std::size_t last_target,
+                                const std::vector<int>& alleles,
+                                std::size_t flank_bp) {
+    if (first_target > last_target || last_target >= targets.size()) {
+        throw std::runtime_error("genotype-frag: chain_span_sequence: target range out of order or "
+                                 "past the end of the target list");
+    }
+    if (alleles.size() != last_target - first_target + 1) {
+        throw std::runtime_error("genotype-frag: chain_span_sequence: one allele per target in the "
+                                 "span is required (" + std::to_string(alleles.size()) + " given for " +
+                                 std::to_string(last_target - first_target + 1) + " targets)");
+    }
+    const std::size_t bfirst = targets[first_target], blast = targets[last_target];
+    // Context OUTSIDE the span, from the chain. This is the only place a majority allele is used,
+    // and only for sequence the factor does not model; everything inside the span is explicit.
+    std::string out = left_flank(blocks, bfirst, flank_bp);
+    for (std::size_t bi = bfirst; bi <= blast; ++bi) {
+        // A target's own allele is explicit; INTERVENING blocks (backbone between two bubble
+        // targets) take the majority allele, because they are not part of the factor's state and the
+        // incidence table does not treat them as targets either.
+        bool is_target = false;
+        std::size_t which = 0;
+        for (std::size_t t = first_target; t <= last_target; ++t) {
+            if (targets[t] == bi) { is_target = true; which = t - first_target; break; }
+        }
+        if (is_target) {
+            const int a = alleles[which];
+            if (a >= 0 && static_cast<std::size_t>(a) < blocks[bi].allele_seq.size()) {
+                out += blocks[bi].allele_seq[static_cast<std::size_t>(a)];
+            }
+        } else {
+            out += majority_allele(blocks[bi]);
+        }
+    }
+    out += right_flank(blocks, blast, flank_bp);
+    return out;
+}
+
 void write_fragment_results(const std::string& out_prefix,
                             const std::vector<BlockFragmentResult>& results,
                             bool have_truth) {
@@ -902,20 +960,45 @@ HaplotypeResult genotype_haplotype_pairs(
     // cheap vector-similarity stage and nothing more -- its score never reaches the output. A
     // candidate generator that is wrong here loses the answer outright, so it is deliberately
     // generous, and whether the truth survived it is reported rather than assumed.
+    // ONE source of sequence for every candidate. A run that scored some candidates from walks and
+    // others from block concatenation would be comparing two different reconstructions inside one
+    // likelihood, which is precisely the class of defect this change exists to remove -- so a walk
+    // map that does not cover every scored path is refused rather than silently filled in.
+    std::vector<const std::string*> hap_seq(haplotype_names.size(), nullptr);
+    std::vector<std::string> block_seq_store;
+    if (walk_sequences != nullptr) {
+        std::vector<std::string> missing;
+        for (std::size_t i = 0; i < haplotype_names.size(); ++i) {
+            const auto it = walk_sequences->find(haplotype_names[i]);
+            if (it == walk_sequences->end() || it->second.empty()) {
+                if (missing.size() < 5) missing.push_back(haplotype_names[i]);
+                continue;
+            }
+            hap_seq[i] = &it->second;
+        }
+        if (!missing.empty()) {
+            std::string m;
+            for (const std::string& x : missing) { m += "\n    "; m += x; }
+            throw std::runtime_error(
+                "genotype-frag: the graph cannot completely spell every panel path, so scoring would "
+                "mix walk-derived and block-derived sequence inside one likelihood. Refusing. "
+                "Paths without a complete walk:" + m);
+        }
+    } else {
+        block_seq_store.resize(haplotype_names.size());
+        for (std::size_t i = 0; i < haplotype_names.size(); ++i) {
+            block_seq_store[i] = spell_haplotype(blocks, haplotype_names[i]).seq;
+            hap_seq[i] = &block_seq_store[i];
+        }
+    }
+    const auto seq_of = [&](std::size_t i) { return hap_seq[i]; };
+
     std::vector<std::pair<double, std::size_t>> ranked;
     ranked.reserve(haplotype_names.size());
     {
         std::vector<double> containment(haplotype_names.size(), 0.0);
         run_parallel(haplotype_names.size(), options.threads, [&](std::size_t i) {
-            const std::string* w = nullptr;
-            if (walk_sequences != nullptr) {
-                const auto it = walk_sequences->find(haplotype_names[i]);
-                if (it != walk_sequences->end()) w = &it->second;
-            }
-            const HaplotypeSeq hb = w == nullptr ? spell_haplotype(blocks, haplotype_names[i])
-                                                 : HaplotypeSeq{};
-            const std::string& hseq = w != nullptr ? *w : hb.seq;
-            const std::vector<KmerOccurrence> sy = collect_syncmers(hseq, k, s);
+            const std::vector<KmerOccurrence> sy = collect_syncmers(*seq_of(i), k, s);
             if (sy.empty()) return;
             std::size_t hit = 0;
             for (const KmerOccurrence& o : sy) if (read_codes.count(o.code)) ++hit;
@@ -943,14 +1026,13 @@ HaplotypeResult genotype_haplotype_pairs(
         std::vector<std::pair<double, std::size_t>> unique_ranked;
         unique_ranked.reserve(ranked.size());
         for (const auto& r : ranked) {
-            const std::string* w = nullptr;
-            if (walk_sequences != nullptr) {
-                const auto it = walk_sequences->find(haplotype_names[r.second]);
-                if (it != walk_sequences->end()) w = &it->second;
-            }
-            const std::string sq = w != nullptr ? *w
-                                                : spell_haplotype(blocks, haplotype_names[r.second]).seq;
-            if (seen.insert(sq).second) unique_ranked.push_back(r);
+            // STRAND-CANONICAL key: two paths whose sequences are reverse complements of one another
+            // are the same haplotype seen from opposite strands, and the scorer is strand-symmetric
+            // (every fragment is aligned in both orientations). Keying on the raw sequence would keep
+            // both and let them consume two shortlist slots while carrying identical evidence.
+            const std::string& sq = *seq_of(r.second);
+            const std::string rc = reverse_complement(sq);
+            if (seen.insert(sq < rc ? sq : rc).second) unique_ranked.push_back(r);
         }
         ranked.swap(unique_ranked);
     }
@@ -975,6 +1057,7 @@ HaplotypeResult genotype_haplotype_pairs(
         ++nh;   // the cut fell inside a tie; taking one side of it would be arbitrary
     }
     std::vector<HaplotypeSeq> haps(nh);
+    std::vector<char> proj_exact(nh, 1);
     out.haplotypes.resize(nh);
     // Reported so a run can say whether the shortlist was a real selection or a tie it could not
     // break. `nh` above the requested cap means it was extended through a tie.
@@ -983,11 +1066,15 @@ HaplotypeResult genotype_haplotype_pairs(
         // Alleles from the decomposition (needed to project the answer onto blocks); SEQUENCE from
         // the graph walk when available, because the walk is the haplotype and the concatenation is
         // only an approximation of it.
+        // Alleles from the decomposition (only to PROJECT the answer onto blocks); SEQUENCE from
+        // seq_of, which is the walk when walks were supplied and refuses to be partial.
         haps[i] = spell_haplotype(blocks, haplotype_names[ranked[i].second]);
-        if (walk_sequences != nullptr) {
-            const auto it = walk_sequences->find(haplotype_names[ranked[i].second]);
-            if (it != walk_sequences->end()) haps[i].seq = it->second;
-        }
+        const std::string block_concat = haps[i].seq;   // before it is replaced by the walk
+        haps[i].seq = *seq_of(ranked[i].second);
+        // Does the decomposition reproduce this haplotype? If not, its per-block alleles cannot be
+        // relied on anywhere, and every block of a projection involving it is unprojectable.
+        proj_exact[i] = (block_concat == haps[i].seq) ||
+                        (block_concat == reverse_complement(haps[i].seq));
         out.haplotypes[i].name = haplotype_names[ranked[i].second];
         out.haplotypes[i].bp = haps[i].seq.size();
         out.haplotypes[i].containment = ranked[i].first;
@@ -1986,7 +2073,26 @@ HaplotypeResult genotype_haplotype_pairs(
             mf << fragments[fi].name << '\t' << num << '\t' << ll[fi * nh + a] << '\t'
                << ll[fi * nh + b] << '\t' << floors[fi] << '\t' << contrib << '\n';
         }
-        mf << "# sum_contrib\t" << check << '\n';
+        // FULL RECONCILIATION. A dump that accounts for only the fragment terms and waves at an
+        // unexplained "per-pair constant" cannot be used as a gate: the constant is where the dosage
+        // and coverage terms live, and those are exactly the terms under suspicion at a tandem array.
+        // Every component is named and the residual is reported, so closure is checkable rather than
+        // assumed.
+        const double pair_bp_d = static_cast<double>(haps[a].seq.size() + haps[b].seq.size());
+        double dosage_d = 0.0;
+        if (options.truth_total_bp > 0.0) {
+            dosage_d = -std::abs(pair_bp_d - options.truth_total_bp);
+        } else if (options.total_depth && lambda > 0.0) {
+            const double mean = lambda * pair_bp_d;
+            const double n = static_cast<double>(fragments.size());
+            dosage_d = n * std::log(mean) - mean - std::lgamma(n + 1.0);
+        }
+        const double total_d = check + cov_ll[a] + cov_ll[b] + dosage_d;
+        mf << "# fragment_sum\t" << check << '\n';
+        mf << "# coverage_a\t" << cov_ll[a] << '\n';
+        mf << "# coverage_b\t" << cov_ll[b] << '\n';
+        mf << "# dosage\t" << dosage_d << '\n';
+        mf << "# total_score\t" << total_d << '\n';
         mf.flush();
         if (!mf) throw std::runtime_error("genotype-frag: write failed for " + options.dump_fragment_mass);
     }
@@ -2394,8 +2500,14 @@ HaplotypeResult genotype_haplotype_pairs(
                 if (fa == -2) { fa = x; fb = y; }
                 else if (x != fa || y != fb) { agree = false; break; }
             }
-            P.determined = agree;
-            if (agree) ++out.equivalence.blocks_determined;
+            // A block where the selected pair has no allele is UNPROJECTABLE, not determined.
+            // Agreement on -1 is agreement about nothing: the decomposition does not cover this path
+            // here, so there is no block genotype to report. Emitting one would be a call the
+            // evidence cannot support, which is exactly what the block-level product must not do.
+            P.unprojectable = (fa < 0 || fb < 0) ||
+                              !proj_exact[pairs.front().hap1] || !proj_exact[pairs.front().hap2];
+            P.determined = agree && !P.unprojectable;
+            if (P.determined) ++out.equivalence.blocks_determined;
         }
 
         if (truth_allele1 != nullptr && truth_allele2 != nullptr &&
@@ -2641,7 +2753,8 @@ void write_haplotype_results(const std::string& out_prefix,
     if (!catalogue_fingerprint.empty()) {
         bf << "# panvar-allele-catalogue\t" << catalogue_fingerprint << '\n';
     }
-    bf << "block\tkind\tbubble_id\tn_alleles\tallele1\tallele2\tposterior\tdetermined";
+    bf << "block\tkind\tbubble_id\tn_alleles\tallele1\tallele2\tposterior\tdetermined"
+          "\tprojectable";
     if (have_truth) bf << "\ttruth_a\ttruth_b\trepresentable\texact";
     bf << '\n';
     for (const BlockProjection& p : result.blocks) {
@@ -2649,7 +2762,7 @@ void write_haplotype_results(const std::string& out_prefix,
                          : p.kind == BlockKind::Backbone ? "backbone" : "flank";
         bf << p.block_index << '\t' << kind << '\t' << p.bubble_id << '\t' << p.n_alleles << '\t'
            << p.allele1 << '\t' << p.allele2 << '\t' << p.posterior << '\t'
-           << (p.determined ? 1 : 0);
+           << (p.determined ? 1 : 0) << '\t' << (p.unprojectable ? "NA" : "yes");
         if (have_truth) {
             bf << '\t' << p.truth_a << '\t' << p.truth_b << '\t' << (p.truth_representable ? 1 : 0)
                << '\t' << (p.truth_representable ? (p.exact ? "1" : "0") : "NA");

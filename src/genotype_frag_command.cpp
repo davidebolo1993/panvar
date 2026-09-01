@@ -11,6 +11,7 @@
 #include "panvar/md5.hpp"
 #include "panvar/output.hpp"
 #include "panvar/parallel.hpp"
+#include "panvar/syncmer.hpp"
 
 #include <algorithm>
 #include <fstream>
@@ -264,6 +265,10 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     std::string truth_haplotypes, exclude_haplotypes, blocks_arg, spell_calls, dump_sequences;
     bool mosaic_floor = false;
     std::vector<std::string> reference_pair;
+    std::vector<std::string> ref_block, ref_block_pair;
+    // Escape hatch for the equality gate, which must compare the factor oracle against the
+    // whole-haplotype reference over the SAME fragment set. Not for measurement.
+    std::string ref_subset;
     std::string switch_penalties_arg = "0,10,100,1000";
     std::vector<std::string> exact_distance;
     std::size_t distance_band = 0;
@@ -295,6 +300,16 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--mosaic-floor") mosaic_floor = true;
         else if (a == "--reference-score") { reference_pair.push_back(value(i, a));
                                              reference_pair.push_back(value(i, a)); }
+        else if (a == "--reference-all-fragments") ref_subset = "all";
+        else if (a == "--reference-block") {
+            // <block> <allele_a> <allele_b> -- the exact LOCAL oracle for one block.
+            for (int q = 0; q < 3; ++q) ref_block.push_back(value(i, a));
+        }
+        else if (a == "--reference-block-pair") {
+            // <block> <a1> <b1> <a2> <b2> -- the exact oracle over two ADJACENT blocks. Its
+            // difference from the two unary scores is what a transition factor is worth.
+            for (int q = 0; q < 5; ++q) ref_block_pair.push_back(value(i, a));
+        }
         else if (a == "--switch-penalties") switch_penalties_arg = value(i, a);
         else if (a == "--exact-distance") { exact_distance.push_back(value(i, a));
                                             exact_distance.push_back(value(i, a)); }
@@ -524,7 +539,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         throw std::runtime_error("genotype-frag requires --gfa and --out-prefix");
     }
     if (read_paths.empty() && spell_calls.empty() && !mosaic_floor && dump_sequences.empty() &&
-        spell_pair.empty()) {
+        spell_pair.empty() && ref_block.empty() && ref_block_pair.empty()) {
         throw std::runtime_error("genotype-frag requires at least one --reads");
     }
     if (!bubble_prefix_in.empty()) {
@@ -631,15 +646,38 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         std::ofstream tf(tsv), ff(fa);
         if (!tf) throw std::runtime_error("genotype-frag: cannot write " + tsv);
         if (!ff) throw std::runtime_error("genotype-frag: cannot write " + fa);
-        tf << "group\tname\tscored_bp\tscored_md5\tgfa_bp\tgfa_md5\tgfa_complete\tround_trips"
-              "\tframe\n";
+        tf << "group\tname\tscored_bp\tscored_md5\tblock_bp\tblock_md5\tgfa_bp\tgfa_md5"
+              "\tgfa_complete\tround_trips\tframe\n";
 
         const auto by_name = path_records_by_name(graph);
         std::size_t n_mismatch = 0, n_incomplete = 0, n_rows = 0;
 
         const auto emit = [&](const char* group, const std::vector<BlockAlleles>& src,
                               const std::string& name) {
-            const std::string scored = spell_block_haplotype(src, name);
+            // THE SEQUENCE ACTUALLY SCORED. Whole-haplotype mode scores the graph WALK, so dumping
+            // the block concatenation here would recreate exactly the diagnostic mismatch this
+            // change removed: a dump that disagrees with the thing it claims to describe. The block
+            // spelling is still emitted, in its own column, because the two disagreeing is the
+            // finding the dump exists to surface.
+            std::string scored;
+            {
+                const auto wi = by_name.find(name);
+                bool wok = false;
+                if (wi != by_name.end() && wi->second != nullptr) {
+                    scored = spell_path_steps_sequence(graph, wi->second->steps, &wok);
+                }
+                if (!wok) scored.clear();
+            }
+            const std::string block_spelling = spell_block_haplotype(src, name);
+            if (scored.empty()) {
+                // No fallback. A dump that quietly substituted the block spelling here would report
+                // a sequence the scorer never sees -- the exact defect this dump exists to detect,
+                // reintroduced inside the detector.
+                throw std::runtime_error(
+                    "genotype-frag: the graph cannot completely spell path '" + name +
+                    "', so there is no scored sequence to dump. Refusing rather than substituting "
+                    "the block concatenation, which is not what would be scored.");
+            }
             std::string raw;
             bool complete = false;
             const auto it = by_name.find(name);
@@ -651,15 +689,18 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             // FRAME: the block chain is reference-oriented, so a path antiparallel to the reference
             // spells the reverse complement of its walk. Same sequence, different frame -- reported
             // as a round trip, with the frame named, rather than refused.
+            // round_trips / frame describe the BLOCK spelling against the walk -- that is the
+            // decomposition question. `scored` is the walk and is authoritative regardless.
             const std::string rc = complete ? reverse_complement(raw) : std::string();
-            const bool same_frame = complete && scored == raw;
-            const bool rc_frame = complete && !same_frame && scored == rc;
+            const bool same_frame = complete && block_spelling == raw;
+            const bool rc_frame = complete && !same_frame && block_spelling == rc;
             const bool round_trips = same_frame || rc_frame;
             const char* frame = !complete ? "." : (same_frame ? "fwd" : (rc_frame ? "rc" : "MISMATCH"));
             if (!complete) ++n_incomplete;
             else if (!round_trips) ++n_mismatch;
             ++n_rows;
             tf << group << '\t' << name << '\t' << scored.size() << '\t' << md5_hex(scored)
+               << '\t' << block_spelling.size() << '\t' << md5_hex(block_spelling)
                << '\t' << (complete ? raw.size() : std::size_t{0}) << '\t'
                << (complete ? md5_hex(raw) : std::string(".")) << '\t' << (complete ? "yes" : "no")
                << '\t' << (complete ? (round_trips ? "yes" : "NO") : ".") << '\t' << frame << '\n';
@@ -764,6 +805,104 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                  " bp, md5 " + md5_hex(s1) + ") and " + n2 + " (" + std::to_string(s2.size()) +
                  " bp, md5 " + md5_hex(s2) + ")");
         log.wrote({fa});
+        log.done();
+        return 0;
+    }
+
+    if (!ref_block.empty() || !ref_block_pair.empty()) {
+        if (read_paths.empty()) {
+            throw std::runtime_error("genotype-frag: --reference-block needs --reads");
+        }
+        std::vector<Fragment> rf_all = load_fragments(read_paths);
+
+        // INCIDENCE-SELECTED EVIDENCE. A unary oracle handed the whole read set includes boundary and
+        // unrelated fragments; a transition oracle handed the whole set scores everything. Their
+        // difference then measures the sequences, not the linkage. So each factor sees only the
+        // fragments the incidence rule assigns to it: `local` for a unary factor, `boundary` for an
+        // adjacent-target factor. Ambiguous and unrecruited fragments belong to neither and are
+        // excluded from both -- they need their own factor, not an arbitrary home.
+        ReferenceParams rp;
+        rp.lambda = hopt.haploid_depth > 0.0 ? hopt.haploid_depth : 0.05;
+        rp.eta = opt.outlier_mix;
+        rp.error_rate = opt.error_rate;
+        rp.fragment_len = opt.fragment_len;
+        rp.fragment_sd = opt.fragment_sd;
+        rp.bg_divergence = opt.bg_divergence;
+
+        // Built exactly as the block-local recruiter builds it: syncmer code -> the targets whose
+        // alleles or flanks contain it, then per fragment count HITS per target and keep those
+        // reaching min_recruit_hits. An approximation of this rule here would classify fragments
+        // differently from the incidence table, and the two must agree or the factors are not the
+        // factors the table describes.
+        std::vector<std::size_t> targets;
+        for (std::size_t bi = 0; bi < chain.size(); ++bi) {
+            if (all_blocks || chain[bi].kind == BlockKind::Bubble) targets.push_back(bi);
+        }
+        const std::size_t rk = opt.kmer_size;
+        const std::size_t rs = opt.syncmer_s != 0 ? opt.syncmer_s : default_syncmer_s(rk);
+        std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> recruit;
+        for (std::size_t ti = 0; ti < targets.size(); ++ti) {
+            std::vector<std::uint64_t> codes;
+            const BlockAlleles& b = blocks[targets[ti]];
+            const auto add = [&](const std::string& seq) {
+                for (const KmerOccurrence& o : collect_syncmers(seq, rk, rs)) codes.push_back(o.code);
+            };
+            for (const std::string& a : b.allele_seq) add(a);
+            add(chain_left_flank(blocks, targets[ti], opt.flank_bp));
+            add(chain_right_flank(blocks, targets[ti], opt.flank_bp));
+            std::sort(codes.begin(), codes.end());
+            codes.erase(std::unique(codes.begin(), codes.end()), codes.end());
+            for (const std::uint64_t c : codes) recruit[c].push_back(static_cast<std::uint32_t>(ti));
+        }
+        const auto recruited_targets = [&](const Fragment& F) {
+            std::unordered_map<std::uint32_t, std::uint32_t> hits;
+            const auto scan = [&](const std::string& r) {
+                for (const KmerOccurrence& o : collect_syncmers(r, rk, rs)) {
+                    const auto it = recruit.find(o.code);
+                    if (it == recruit.end()) continue;
+                    for (const std::uint32_t t : it->second) ++hits[t];
+                }
+            };
+            scan(F.r1); scan(F.r2);
+            std::vector<std::size_t> hit;
+            for (const auto& [t, n] : hits) if (n >= opt.min_recruit_hits) hit.push_back(t);
+            std::sort(hit.begin(), hit.end());
+            return hit;
+        };
+
+        if (!ref_block.empty()) {
+            const std::size_t t = static_cast<std::size_t>(std::stoul(ref_block[0]));
+            const int aa = std::stoi(ref_block[1]), ab = std::stoi(ref_block[2]);
+            const std::string ca = chain_span_sequence(blocks, targets, t, t, {aa}, opt.flank_bp);
+            const std::string cb = chain_span_sequence(blocks, targets, t, t, {ab}, opt.flank_bp);
+            std::vector<Fragment> sel;
+            for (const Fragment& F : rf_all) {
+                const auto h = recruited_targets(F);
+                if (h.size() == 1 && h[0] == t) sel.push_back(F);   // LOCAL to this target only
+            }
+            if (!ref_subset.empty()) sel = rf_all;                  // --reference-all-fragments
+            std::fprintf(stderr, "[reference-block] %zu of %zu fragments are local to target %zu\n",
+                         sel.size(), rf_all.size(), t);
+            std::printf("%.17g\n", reference_factor_loglik(ca, cb, sel, rp));
+        }
+        if (!ref_block_pair.empty()) {
+            const std::size_t t = static_cast<std::size_t>(std::stoul(ref_block_pair[0]));
+            const int a1 = std::stoi(ref_block_pair[1]), b1 = std::stoi(ref_block_pair[2]);
+            const int a2 = std::stoi(ref_block_pair[3]), b2 = std::stoi(ref_block_pair[4]);
+            const std::string c1 = chain_span_sequence(blocks, targets, t, t + 1, {a1, b1}, opt.flank_bp);
+            const std::string c2 = chain_span_sequence(blocks, targets, t, t + 1, {a2, b2}, opt.flank_bp);
+            std::vector<Fragment> sel;
+            for (const Fragment& F : rf_all) {
+                const auto h = recruited_targets(F);
+                // BOUNDARY: recruited to exactly these two adjacent targets and no others.
+                if (h.size() == 2 && h[0] == t && h[1] == t + 1) sel.push_back(F);
+            }
+            if (!ref_subset.empty()) sel = rf_all;
+            std::fprintf(stderr,
+                         "[reference-block-pair] %zu of %zu fragments span targets %zu/%zu\n",
+                         sel.size(), rf_all.size(), t, t + 1);
+            std::printf("%.17g\n", reference_factor_loglik(c1, c2, sel, rp));
+        }
         log.done();
         return 0;
     }
@@ -1012,14 +1151,19 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                 if (!complete) continue;
                 const std::string blk = spell_block_haplotype(blocks, nm);
                 if (blk != w) {
-                    if (blk == reverse_complement(w)) { w = reverse_complement(w); ++flipped; }
-                    else ++gapped;   // decomposition does not reproduce the walk; the walk wins
+                    // Reported, NOT converted. The scorer is strand-symmetric -- every fragment is
+                    // aligned in both orientations, and a reverse-complemented panel is asserted to
+                    // score identically -- so converting the walk into the block frame would buy
+                    // nothing and would make the bytes we dump differ from the bytes we score.
+                    // Strand-canonical deduplication handles the rest.
+                    if (blk == reverse_complement(w)) ++flipped;
+                    else ++gapped;
                 }
                 walk_sequences.emplace(nm, std::move(w));
             }
             log.info("scoring the GRAPH WALK for " + std::to_string(walk_sequences.size()) + "/" +
                      std::to_string(names.size()) + " panel paths (" + std::to_string(flipped) +
-                     " reverse-complement frame, " + std::to_string(gapped) +
+                     " antiparallel to the block frame and scored as-is, " + std::to_string(gapped) +
                      " where the block decomposition does not reproduce the walk and the walk wins)");
         }
 

@@ -539,6 +539,18 @@ struct BlockProjection {
     // be determined even where the haplotype pair is not, and that is the part of the answer worth
     // reporting when allocation is ambiguous.
     bool determined = false;
+    // The selected pair has NO allele at this block -- the block decomposition does not cover that
+    // path there. Distinct from "determined": every top pair agreeing on -1 is agreement about
+    // nothing, and reporting it as a determined call would emit a block genotype the decomposition
+    // cannot support. Measured at cyp2d6, where one path's chain stops 1978 bp short of its walk.
+    // No trustworthy block call here. TWO causes, both fatal to a block-level product:
+    //   * the selected pair has no allele at this block (-1); or
+    //   * the decomposition does not reproduce one of the selected haplotypes at all -- its block
+    //     concatenation differs from its graph walk, so NO per-block allele of that haplotype can be
+    //     relied on, even where an allele index exists.
+    // The second is the common case and the narrower -1 test misses it: measured on a fixture whose
+    // block spelling is 1300 bp against a 1400 bp walk, every block still carried an allele index.
+    bool unprojectable = false;
     int truth_a = -1;
     int truth_b = -1;
     bool exact = false;
@@ -689,16 +701,19 @@ struct HaplotypeResult {
     PlacementCompleteness completeness;
 };
 
-// Whole-haplotype mode rests on an assumption it never checked:
+// Compare each path's BLOCK concatenation against its GFA walk, and report the disagreements.
 //
-//     concatenated block alleles for path X  ==  the raw GFA spelling of path X
+// This no longer gates scoring. Whole-haplotype mode scores the WALK -- the haplotype is the walk,
+// and the decomposition is only used to project an answer onto blocks -- so a decomposition gap
+// costs a projection, not a wrong scored sequence. It therefore WARNS on a gap and counts them,
+// rather than throwing.
 //
-// When it fails the caller scores a sequence the panel does not contain, silently. Measured on a
-// tandem array built as a chain of identical nodes: one haplotype spelled 1100 bp against its true
-// 1500, another spelled 0 bp, and a full table of plausible numbers came out anyway. A test-only
-// check is not enough -- any graph whose decomposition does not round-trip produces this.
+// It still THROWS when the graph cannot spell a path at all, because then there is no authoritative
+// sequence to fall back on.
 //
-// Throws naming the path, both lengths and the first mismatching offset.
+// History: while the block concatenation WAS the scored sequence this had to be fatal. Measured on
+// a tandem array built as a chain of identical nodes -- one haplotype spelled 1100 bp against its
+// true 1500, another spelled 0 bp, and a full table of plausible numbers came out anyway.
 void verify_block_spelling(
     const Graph& graph,
     const std::vector<BlockAlleles>& blocks,
@@ -721,12 +736,14 @@ SpellFrame block_spelling_frame(
     const std::vector<BlockAlleles>& blocks,
     const std::string& name);
 
-// The exact sequence whole-haplotype mode scores for `name`: this path's allele in every block of
-// the chain, concatenated, with a block the path bypasses contributing nothing.
+// This path's allele in every block of the chain, concatenated, with a block the path bypasses
+// contributing nothing.
 //
-// Exposed for the sequence dump. A diagnostic that re-derived the spelling would be a second
-// implementation able to be correct while the scorer is wrong, which is the one thing it must not
-// be -- so it calls what the scorer calls.
+// NOT the scored sequence. Whole-haplotype mode scores the graph WALK; this is the DECOMPOSITION's
+// reconstruction of the same path, which is not guaranteed to reproduce it -- measured at cyp2d6,
+// where NA18989#1 concatenates to 205236 bp against a walk of 207214, an exact prefix. Kept because
+// the two disagreeing is a finding worth reporting, and because block alleles are what the answer is
+// projected onto.
 std::string spell_block_haplotype(
     const std::vector<BlockAlleles>& blocks,
     const std::string& name);
@@ -942,6 +959,73 @@ double reference_pair_loglik(
     // exactly to the whole-pair difference. Placement mass alone cannot do that -- a fragment with no
     // placement has mass -inf while its real contribution is the finite background term.
     std::vector<double>* fragment_contrib = nullptr);
+
+// ---------------------------------------------------------------------------------------------
+// EXACT LOCAL REFERENCE SCORERS  (plan step B, prerequisite)
+//
+// The same contract as reference_pair_loglik, restricted to ONE block and to ONE ADJACENT PAIR of
+// blocks. These exist so that a fragment-derived block emission can be checked against an oracle
+// BEFORE it is wired into the chain -- the whole-haplotype reference cannot do that, because it
+// scores a complete haplotype and says nothing about what any single block is worth.
+//
+// They are deliberately separate functions because the incidence table distinguishes the evidence:
+//
+//   local fragment     -> reference_block_loglik            (a unary block emission)
+//   boundary fragment  -> reference_block_pair_loglik       (a transition factor)
+//
+// Putting boundary evidence into a unary emission would double count it or assign it arbitrarily,
+// so the oracle keeps the two apart from the start rather than discovering the distinction later.
+//
+// CONTEXT. A block's sequence alone is not scoreable: a fragment overlapping its edge needs the
+// neighbouring sequence to align against. Both take `flank_bp` and build
+// left_flank + allele(s) + right_flank from the block chain's majority alleles, which is exactly
+// what the block-local candidate stage already does.
+//
+// Cost is that of the whole-haplotype reference on a context-sized sequence, so these are oracles
+// for small blocks and small fragment sets, not callers.
+
+// EXPLICIT STATE, EXPLICIT EVIDENCE. Both take the two homologue sequences already constructed by
+// the caller and the fragment subset the caller selected. Nothing is guessed:
+//
+//   * no majority-allele flanks. A majority flank is a GUESSED haplotype context, and guessing the
+//     flank is the defect already recorded at CYP2D6 block 5 -- an oracle that guesses is not an
+//     oracle. The caller states the context it means.
+//   * no implicit fragment set. The unary oracle must be given only the fragments the incidence
+//     table classified `local` to that block; the transition oracle only those classified
+//     `boundary` for that adjacent pair. Handing either the whole read set makes the unary score
+//     include boundary evidence and the transition score include everything, so their difference
+//     measures nothing.
+//
+// With those supplied, both are exactly reference_pair_loglik over the stated sequences and the
+// stated fragments -- which is the point: the local scorer must BE the reference model restricted to
+// a factor, not a second model that resembles it.
+double reference_factor_loglik(
+    const std::string& hap_a,           // homologue 1's sequence for this factor's span
+    const std::string& hap_b,           // homologue 2's
+    const std::vector<Fragment>& fragments,   // the incidence-selected subset for this factor
+    const ReferenceParams& params);
+
+// The chain's context sequence either side of a block, from majority alleles. Exposed so a caller
+// classifying fragments can build the SAME recruitment index the block-local stage builds -- an
+// approximation of it would classify fragments differently from the incidence table.
+std::string chain_left_flank(const std::vector<BlockAlleles>& blocks, std::size_t bi,
+                             std::size_t want);
+std::string chain_right_flank(const std::vector<BlockAlleles>& blocks, std::size_t bi,
+                              std::size_t want);
+
+// Build one homologue's sequence over a span of the TARGET CHAIN, from explicit alleles.
+//
+// `targets` is the same ordered target list the incidence table uses, so "adjacent" means adjacent
+// TARGETS -- consecutive bubble blocks are targets 1 and 3 by raw index, and any backbone sequence
+// between them is included here. An oracle indexed by raw block index would disagree with the
+// incidence table about what a boundary is.
+std::string chain_span_sequence(
+    const std::vector<BlockAlleles>& blocks,
+    const std::vector<std::size_t>& targets,
+    std::size_t first_target,           // inclusive
+    std::size_t last_target,            // inclusive; == first_target for a unary factor
+    const std::vector<int>& alleles,    // one per target in [first_target, last_target]
+    std::size_t flank_bp);              // context taken from the chain OUTSIDE the span
 
 void write_fragment_results(
     const std::string& out_prefix,

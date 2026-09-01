@@ -416,7 +416,7 @@ NROW=$(( $(wc -l < "$OUT/dmp.scored_sequences.tsv") - 1 ))
 
 # Every path must round-trip against its own GFA spelling, and the column must SAY so -- a dump that
 # reported the same md5 in both columns by construction would assert nothing.
-NRT=$(awk -F'\t' 'NR>1 && $8=="yes"' "$OUT/dmp.scored_sequences.tsv" | wc -l | tr -d ' ')
+NRT=$(awk -F'\t' 'NR>1 && $10=="yes"' "$OUT/dmp.scored_sequences.tsv" | wc -l | tr -d ' ')
 [ "$NRT" = 13 ] && ok "all 13 round-trip: block spelling == GFA path spelling" \
                 || bad "only $NRT of 13 round-trip against the GFA path"
 
@@ -683,10 +683,10 @@ fi
   --dump-scored-sequences "$OUT/rev" -q >/dev/null 2>&1
 if [ -s "$OUT/rev.scored_sequences.tsv" ]; then
   ok "a reverse-oriented path does not abort the dump"
-  NRC=$(awk -F'\t' 'NR>1 && $9=="rc"' "$OUT/rev.scored_sequences.tsv" | wc -l | tr -d ' ')
-  NMM=$(awk -F'\t' 'NR>1 && $9=="MISMATCH"' "$OUT/rev.scored_sequences.tsv" | wc -l | tr -d ' ')
-  NNO=$(awk -F'\t' 'NR>1 && $8=="NO"' "$OUT/rev.scored_sequences.tsv" | wc -l | tr -d ' ')
-  [ "$NMM" = 0 ] && [ "$NNO" = 0 ] \
+  NRC=$(awk -F'\t' 'NR>1 && $11=="rc"' "$OUT/rev.scored_sequences.tsv" | wc -l | tr -d ' ')
+  NMM=$(awk -F'\t' 'NR>1 && $11=="MISMATCH"' "$OUT/rev.scored_sequences.tsv" | wc -l | tr -d ' ')
+  NNO=$(awk -F'\t' 'NR>1 && $10=="NO"' "$OUT/rev.scored_sequences.tsv" | wc -l | tr -d ' ')
+  { [ "$NMM" = 0 ] && [ "$NNO" = 0 ] && [ "${NRC:-0}" -ge 1 ]; } \
     && ok "every path round-trips once the reverse-complement frame is accepted (rc: $NRC)" \
     || bad "reverse-oriented fixture still reports $NNO failures / $NMM mismatches"
 else
@@ -695,22 +695,71 @@ fi
 
 # The frame column must be a real discriminator: a fixture with NO antiparallel path must report
 # none, or the assertion above passes for free.
-NRC0=$(awk -F'\t' 'NR>1 && $9=="rc"' "$OUT/dmp.scored_sequences.tsv" | wc -l | tr -d ' ')
+NRC0=$(awk -F'\t' 'NR>1 && $11=="rc"' "$OUT/dmp.scored_sequences.tsv" | wc -l | tr -d ' ')
 [ "$NRC0" = 0 ] && ok "the all-forward fixture reports no rc frames, so the column discriminates" \
                 || bad "all-forward fixture reported $NRC0 rc frames"
 
 # THE HAPLOTYPE IS THE WALK. Scoring must use the graph walk, not the block concatenation: the two
 # can disagree (measured at cyp2d6, a 205236 bp block spelling against a 207214 bp walk), and the
 # walk is what the panel actually contains.
-LOGW=$("$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/walk" -R "$OUT/reads.fa" \
-        --haplotype-mode --fragment-len 350 --fragment-sd 50 -t 2 2>&1 | grep -c "scoring the GRAPH WALK")
-[ "${LOGW:-0}" -ge 1 ] && ok "whole-haplotype mode scores the graph walk, and says so" \
-                       || bad "no GRAPH WALK line: scoring may still use the block concatenation"
+# WALK AUTHORITY, on a case where walk and block spelling genuinely DISAGREE. revAD is antiparallel,
+# so its block concatenation is the reverse complement of its walk -- the two differ byte for byte.
+# The dump must report the WALK. Asserting on a log line, or on a path where the two agree, would
+# pass while the scorer still used the block concatenation.
+SM=$(awk -F'\t' '$2=="revAD"{print $4}' "$OUT/rev.scored_sequences.tsv")
+BM=$(awk -F'\t' '$2=="revAD"{print $6}' "$OUT/rev.scored_sequences.tsv")
+GM=$(awk -F'\t' '$2=="revAD"{print $8}' "$OUT/rev.scored_sequences.tsv")
+if [ -n "$SM" ] && [ "$BM" != "$GM" ]; then
+  ok "revAD's block spelling and walk differ, so the two can be told apart"
+  [ "$SM" = "$GM" ] && ok "--dump-scored-sequences reports the WALK as the scored sequence" \
+                    || bad "dump's scored_md5 ($SM) is the BLOCK spelling ($BM), not the walk ($GM)"
+else
+  bad "revAD did not produce a block/walk disagreement -- the assertion below would be vacuous"
+fi
 
-# On this fixture walk and block spelling agree, so the call must be unchanged by the switch.
-WP=$(sed -n 2p "$OUT/walk.hap_pairs.tsv" | cut -f2,3)
-[ "$WP" = "$BASE" ] && ok "walk-based scoring reproduces the call where the two spellings agree" \
-                    || bad "walk-based scoring changed a call it should not: '$BASE' -> '$WP'"
+# UNPROJECTABLE, on a path the decomposition genuinely fails to reproduce. hapTRUNC starts
+# mid-locus, so its block concatenation is 1300 bp against a 1400 bp walk. Note the earlier version
+# of this test used an antiparallel path, which has a COMPLETE projection in the other orientation
+# and produced zero NA rows -- it passed while testing nothing.
+{ cat "$OUT/g.gfa"; printf 'P\thapTRUNC\t4+,6+,7+\t*\n'; } > "$OUT/gtr.gfa"
+"$BIN" bubble -i "$OUT/gtr.gfa" -r ref -o "$OUT/btr" --min-variant-bp 0 -q >/dev/null 2>&1
+"$BIN" genotype-frag -i "$OUT/gtr.gfa" -b "$OUT/btr" -o "$OUT/dtr" \
+  --dump-scored-sequences "$OUT/dtr" -q >/dev/null 2>&1
+TW=$(awk -F'\t' '$2=="hapTRUNC"{print $3}' "$OUT/dtr.scored_sequences.tsv")
+TB=$(awk -F'\t' '$2=="hapTRUNC"{print $5}' "$OUT/dtr.scored_sequences.tsv")
+{ [ -n "$TW" ] && [ "$TW" != "$TB" ]; } \
+  && ok "hapTRUNC has a real decomposition gap (walk $TW bp, block concatenation $TB bp)" \
+  || bad "hapTRUNC did not produce a decomposition gap; the assertions below would be vacuous"
+
+# Reads from hapTRUNC itself, so it IS the selected pair and its projection is what gets reported.
+"$PYTHON_BIN" - "$OUT/dtr.scored_sequences.fa" "$OUT/trunc.fa" <<'PYEOF' 2>/dev/null
+import sys
+n=None;buf=[];seq=None
+for l in open(sys.argv[1]):
+    if l[0]=='>':
+        if n=='hapTRUNC': seq="".join(buf); break
+        n=l[1:].split()[0]; buf=[]
+    else: buf.append(l.strip())
+if n=='hapTRUNC' and seq is None: seq="".join(buf)
+o=[]
+for i in range(0,len(seq)-350,15):
+    r1=seq[i:i+150]; r2=seq[i+200:i+350]
+    rc="".join({'A':'T','C':'G','G':'C','T':'A'}[c] for c in reversed(r2))
+    o.append(f">t_{i}/1\n{r1}\n>t_{i}/2\n{rc}\n")
+open(sys.argv[2],"w").write("".join(o))
+PYEOF
+"$BIN" genotype-frag -i "$OUT/gtr.gfa" -b "$OUT/btr" -o "$OUT/ctr" -R "$OUT/trunc.fa" \
+  --haplotype-mode --fragment-len 350 --fragment-sd 50 -t 2 -q >/dev/null 2>&1
+if [ -s "$OUT/ctr.hap_blocks.tsv" ]; then
+  NUP=$(awk -F'\t' 'NR>2 && $9=="NA"' "$OUT/ctr.hap_blocks.tsv" | wc -l | tr -d ' ')
+  NBOTH=$(awk -F'\t' 'NR>2 && $9=="NA" && $8==1' "$OUT/ctr.hap_blocks.tsv" | wc -l | tr -d ' ')
+  [ "${NUP:-0}" -gt 0 ] && ok "a path the decomposition cannot reproduce yields $NUP unprojectable blocks" \
+                        || bad "no unprojectable blocks: the flag never fires and the next check is vacuous"
+  [ "${NBOTH:-0}" = 0 ] && ok "no block is both unprojectable and determined" \
+                        || bad "$NBOTH blocks are reported determined despite being unprojectable"
+else
+  bad "the truncated-path run produced no block table"
+fi
 
 # ------------------------------------------------- production-path per-fragment dump (plan A2)
 # --dump-fragment-mass used to live only inside the joint-depth rescoring block, so the path that
@@ -732,16 +781,60 @@ fi
 # per-pair constant (the dosage and coverage terms, which are not per-fragment). If it does not, the
 # dump is describing something other than the production score and is worse than no dump.
 if [ -s "$OUT/prod.tsv" ]; then
-  SUMC=$(grep '^# sum_contrib' "$OUT/prod.tsv" | cut -f2)
-  SCOREC=$(awk -F'\t' 'NR==2{print $4}' "$OUT/prod.hap_pairs.tsv")
-  OKC=$("$PYTHON_BIN" -c "
-try:
-    s=float('$SUMC'); p=float('$SCOREC')
-    # with no --haploid-depth the dosage term is zero, so the two must agree almost exactly
-    print('yes' if abs(p-s) < 1e-6 else f'no ({p-s})')
-except Exception as e: print('no (%s)' % e)" 2>/dev/null)
-  [ "$OKC" = "yes" ] && ok "the dump sums to the reported pair score (no dosage term configured)" \
-                     || bad "dump does not reproduce the production score: $OKC"
+  RE=$("$PYTHON_BIN" - "$OUT/prod.tsv" "$OUT/prod.hap_pairs.tsv" <<'PYEOF' 2>/dev/null
+import sys
+d={}
+for l in open(sys.argv[1]):
+    if not l.startswith('# '): continue
+    p=l[2:].rstrip().split('\t')
+    if len(p)==2:
+        try: d[p[0]]=float(p[1])
+        except Exception: pass
+sc=float(open(sys.argv[2]).readlines()[1].split('\t')[3])
+need=("fragment_sum","coverage_a","coverage_b","dosage","total_score")
+if not all(k in d for k in need): print("missing:"+",".join(k for k in need if k not in d))
+else: print("%.12f" % abs(sc-d["total_score"]))
+PYEOF
+)
+  case "$RE" in
+    missing:*) bad "the dump omits score components: ${RE#missing:}" ;;
+    "") bad "could not reconcile the dump against the pair score" ;;
+    *) "$PYTHON_BIN" -c "import sys; sys.exit(0 if float('$RE') < 1e-6 else 1)" 2>/dev/null \
+         && ok "dump reconciles to the pair score exactly (residual $RE)" \
+         || bad "dump does not close: residual $RE" ;;
+  esac
+fi
+
+# The arm above has coverage_a = coverage_b = dosage = 0, so it protects only the fragment path.
+# A second arm with the dosage term ACTIVE (--haploid-depth) and the coverage channel ON
+# (--coverage-weight) is what makes "reconciles exactly" mean something for a non-default run --
+# and those are precisely the terms under suspicion at a tandem array.
+"$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/prodd" -R "$OUT/reads.fa" \
+  --haplotype-mode --fragment-len 350 --fragment-sd 50 --haploid-depth 0.05 --coverage-weight 1 \
+  --dump-mass-pair "$P1,$P2" --dump-fragment-mass "$OUT/prodd.tsv" -t 2 -q >/dev/null 2>&1
+if [ -s "$OUT/prodd.tsv" ]; then
+  RD=$("$PYTHON_BIN" - "$OUT/prodd.tsv" "$OUT/prodd.hap_pairs.tsv" <<'PYEOF' 2>/dev/null
+import sys
+d={}
+for l in open(sys.argv[1]):
+    if not l.startswith('# '): continue
+    p=l[2:].rstrip().split('\t')
+    if len(p)==2:
+        try: d[p[0]]=float(p[1])
+        except Exception: pass
+sc=float(open(sys.argv[2]).readlines()[1].split('\t')[3])
+nz=[k for k in ("dosage","coverage_a","coverage_b") if abs(d.get(k,0.0))>1e-12]
+print("%s|%.12f" % (",".join(nz) if nz else "NONE", abs(sc-d.get("total_score",1e18))))
+PYEOF
+)
+  NZ="${RD%%|*}"; RES="${RD##*|}"
+  [ "$NZ" != "NONE" ] && ok "the dosage/coverage arm has nonzero terms ($NZ), so closure is tested there" \
+                      || bad "dosage and coverage are still zero: the reconciliation gate is vacuous"
+  "$PYTHON_BIN" -c "import sys; sys.exit(0 if float('$RES') < 1e-6 else 1)" 2>/dev/null \
+    && ok "dump reconciles exactly with dosage and coverage active (residual $RES)" \
+    || bad "dump does not close with dosage/coverage active: residual $RES"
+else
+  bad "the dosage/coverage dump arm produced nothing"
 fi
 
 # It must refuse a pair it cannot describe, rather than dumping a different one.
@@ -752,6 +845,89 @@ case "$ERRD" in
   *"not in the shortlist"*) ok "--dump-mass-pair refuses a haplotype outside the shortlist" ;;
   *) bad "--dump-mass-pair accepted an unshortlisted haplotype (output: ${ERRD:-none})" ;;
 esac
+
+# --------------------------------- exact LOCAL reference scorers (plan step B prerequisite)
+# A fragment-derived block emission has to be checkable against an oracle BEFORE it is wired into
+# the chain. The whole-haplotype reference cannot do that -- it scores a complete haplotype and says
+# nothing about what a single block is worth. These are the same contract, restricted to one block
+# and to one adjacent pair.
+#
+# THE GATE: on a locus whose chain is one block plus its flanks, the local scorer and the
+# whole-haplotype reference are scoring the same two sequences, so they must agree exactly. If they
+# do not, the local scorer is a different model and nothing built on it can be trusted.
+# THE EQUALITY GATE, actually computed. The local oracle must BE reference_pair_loglik restricted to
+# a factor, not a second model that resembles it. So: build the same two sequences the factor oracle
+# builds, score them with --reference-score (the whole-haplotype reference), and require the two
+# numbers to agree. An earlier version of this test only checked that a number was printed, which
+# would pass for any implementation at all.
+RB=$("$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/rb" -R "$OUT/reads.fa" \
+      --reference-block 0 0 1 --flank-bp 100000 --error-rate 0.01 --fragment-len 350 \
+      --fragment-sd 50 --frag-outlier 0.05 -q 2>/dev/null | tail -1)
+# the same two sequences, spelled independently: target 0 is the first bubble, alleles 0 and 1
+"$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/rbseq" \
+  --dump-scored-sequences "$OUT/rbseq" -q >/dev/null 2>&1
+"$PYTHON_BIN" - "$OUT/rbseq.scored_sequences.fa" "$OUT" <<'PYEOF' 2>/dev/null
+import sys
+# hapAB1 and hapCD1 differ at BOTH bubbles, so they are not the pair the unary factor states.
+# Build the factor's own two sequences instead: identical everywhere except bubble 1's allele.
+n=None;buf=[];seq={}
+for l in open(sys.argv[1]):
+    if l[0]=='>':
+        if n: seq[n]="".join(buf)
+        n=l[1:].split()[0]; buf=[]
+    else: buf.append(l.strip())
+if n: seq[n]="".join(buf)
+a=seq.get("hapAB1"); b=seq.get("hapCB1")
+if a and b:
+    open(sys.argv[2]+"/fa_a.fa","w").write(">a\n"+a+"\n")
+    open(sys.argv[2]+"/fa_b.fa","w").write(">b\n"+b+"\n")
+PYEOF
+if [ -s "$OUT/fa_a.fa" ] && [ -s "$OUT/fa_b.fa" ]; then
+  RS=$("$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/rs" -R "$OUT/reads.fa" \
+        --reference-score "$OUT/fa_a.fa" "$OUT/fa_b.fa" --error-rate 0.01 --fragment-len 350 \
+        --fragment-sd 50 --frag-outlier 0.05 -q 2>/dev/null | tail -1)
+  RBX=$("$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/rbx" -R "$OUT/reads.fa" \
+        --reference-block 0 0 1 --reference-all-fragments --flank-bp 100000 --error-rate 0.01 \
+        --fragment-len 350 --fragment-sd 50 --frag-outlier 0.05 -q 2>/dev/null | tail -1)
+  if [ -n "$RS" ] && [ -n "$RBX" ]; then
+    D=$("$PYTHON_BIN" -c "print('%.9f' % abs(float('$RS')-float('$RBX')))" 2>/dev/null)
+    "$PYTHON_BIN" -c "import sys; sys.exit(0 if float('$D') < 1e-6 else 1)" 2>/dev/null \
+      && ok "the factor oracle EQUALS the whole-haplotype reference on the same sequences (|d| $D)" \
+      || bad "factor oracle and whole reference disagree by $D -- it is a different model"
+  else
+    bad "could not obtain both scores for the equality gate (ref '$RS', factor '$RBX')"
+  fi
+else
+  bad "could not build the two comparison sequences"
+fi
+
+# LINKAGE. The two-target oracle spans an adjacent pair of TARGETS, which is what a transition factor
+# consumes. Phase is the point: hapAD/hapCB and hapAB/hapCD carry the same alleles at each block and
+# differ only in how they are paired across the boundary, so a unary emission cannot separate them.
+RBP_AD=$("$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/rbp1" -R "$OUT/reads.fa" \
+          --reference-block-pair 0 0 1 1 0 --flank-bp 100000 --error-rate 0.01 --fragment-len 350 \
+          --fragment-sd 50 -q 2>/dev/null | tail -1)
+RBP_AB=$("$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/rbp2" -R "$OUT/reads.fa" \
+          --reference-block-pair 0 0 0 1 1 --flank-bp 100000 --error-rate 0.01 --fragment-len 350 \
+          --fragment-sd 50 -q 2>/dev/null | tail -1)
+# The transition oracle must actually SEE boundary fragments, or the phase gate below is vacuous.
+NBF=$("$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/rbpn" -R "$OUT/reads.fa" \
+       --reference-block-pair 0 0 1 1 0 --flank-bp 100000 --error-rate 0.01 --fragment-len 350 \
+       --fragment-sd 50 -q 2>&1 >/dev/null | sed -nE 's/.*\] ([0-9]+) of [0-9]+ fragments span.*/\1/p')
+[ "${NBF:-0}" -gt 0 ] \
+  && ok "the transition oracle is given $NBF boundary-spanning fragments, not the whole read set" \
+  || bad "the transition oracle received no boundary fragments; the phase gate would be vacuous"
+
+if [ -n "$RBP_AD" ] && [ -n "$RBP_AB" ]; then
+  WIN=$("$PYTHON_BIN" -c "
+ad=float('$RBP_AD'); ab=float('$RBP_AB')
+print('AD' if ad>ab else ('AB' if ab>ad else 'tie'))" 2>/dev/null)
+  [ "$WIN" = "AD" ] \
+    && ok "the adjacent-TARGET oracle prefers the true phase (hapAD/hapCB over hapAB/hapCD)" \
+    || bad "the transition oracle prefers '$WIN'; the reads came from hapAD/hapCB"
+else
+  bad "--reference-block-pair produced nothing"
+fi
 
 echo
 if [ "$fails" -eq 0 ]; then echo "genotype-frag stats: all assertions passed"; else
