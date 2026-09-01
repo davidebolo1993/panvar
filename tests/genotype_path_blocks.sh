@@ -158,6 +158,67 @@ if [ -f "$G" ]; then
     || bad "$N_UNPROJ cyp2d6 candidate(s) unprojectable; the panel is being silently reduced"
 fi
 
+# THE ORIENTATION INVARIANT, standalone. c4/HG00171's two haplotypes are BOTH frame=rc, so their
+# scored_sequences.fa records are walk bytes running antiparallel to every forward path's. This
+# tests one property and nothing else: --spell-pair's output must equal the frame-corrected dump
+# byte for byte. Run through the cohort harness instead, the floor computation refuses first
+# ("not computable within band") and the property is never reached -- which is exactly what happened
+# when this was first attempted, so the check has to stand alone.
+# The defect it guards: comparing a reference-oriented called sequence against unoriented truth made
+# c4/HG00171 leave-ZERO-out score its OWN truth pair 240094 edits away, with every block matching.
+G="$REPO/results/real_data/c4/bubble/bubble.sorted.gfa"
+P="$REPO/results/real_data/c4/bubble/bubble"
+if [ -f "$G" ]; then
+  H1="HG00171#1#haplotype1-0000033:140888062-141114404"
+  H2="HG00171#2#haplotype2-0000168:139971845-140204538"
+  printf 'rank\thap1\thap2\tscore\tdelta\tposterior\n1\t%s\t%s\t0\t0\t1\n' "$H1" "$H2" \
+    > "$OUT/orient_pairs.tsv"
+  "$BIN" genotype-frag -i "$G" -b "$P" -o "$OUT/orient" --spell-pair "$OUT/orient_pairs.tsv" -q \
+    >/dev/null 2>&1
+  if [ ! -s "$OUT/orient.called.fa" ]; then
+    bad "orientation: --spell-pair produced nothing for the antiparallel pair"
+  else
+    R=$("$PY" - "$OUT/orient.called.fa" "$OUT/c4.scored_sequences.fa" "$OUT/c4.scored_sequences.tsv" \
+               "$H1" "$H2" <<'PY'
+import sys, hashlib
+called,fa,tsv,h1,h2=sys.argv[1:6]
+def recs(p):
+    out=[];n=None;b=[]
+    for l in open(p):
+        if l[0]=='>':
+            if n is not None: out.append((n,''.join(b)))
+            n=l[1:].split()[0]; b=[]
+        else: b.append(l.strip())
+    if n is not None: out.append((n,''.join(b)))
+    return out
+frame={};h=None
+for l in open(tsv):
+    f=l.rstrip('\n').split('\t')
+    if h is None: h=f; continue
+    d=dict(zip(h,f)); frame[d['name']]=d.get('frame','fwd')
+walks=dict(recs(fa))
+def rc(s): return s[::-1].translate(str.maketrans('ACGTN','TGCAN'))
+def oriented(nm):
+    s=walks[nm].upper()
+    return rc(s) if frame.get(nm,'fwd')=='rc' else s
+sp=[s.upper() for _,s in recs(called)]
+if len(sp)<2: print("NOPAIR"); raise SystemExit
+nrc=sum(1 for nm in (h1,h2) if frame.get(nm)=='rc')
+same=sum(1 for a,b in zip(sp,[oriented(h1),oriented(h2)])
+         if hashlib.md5(a.encode()).hexdigest()==hashlib.md5(b.encode()).hexdigest())
+print("%d %d" % (nrc, same))
+PY
+)
+    read -r NRC SAME <<<"$R"
+    [ "${NRC:-0}" = 2 ] \
+      && ok "orientation: both HG00171 haplotypes really are frame=rc, so the case is not vacuous" \
+      || bad "orientation: expected 2 rc-frame haplotypes, got ${NRC:-?}; this fixture no longer tests orientation"
+    [ "${SAME:-0}" = 2 ] \
+      && ok "orientation: --spell-pair equals the frame-corrected dump byte for byte (2/2)" \
+      || bad "orientation: only ${SAME:-0}/2 records match; the two surfaces disagree on strand"
+  fi
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then echo "path blocks: all assertions passed"; else
   echo "path blocks: $fails assertion(s) failed"; fi
