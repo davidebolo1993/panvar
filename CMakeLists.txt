@@ -342,6 +342,21 @@ if(PANVAR_BUILD_TESTING)
             set_tests_properties(panvar_genotype_frag_origin_scope PROPERTIES TIMEOUT 900)
         endif()
 
+        # The authoritative path->block projection, gated on REAL antiparallel paths rather than a
+        # fixture: 60 of 131 c4 paths and 59 of 127 at cyp2d6 run antiparallel to the block frame,
+        # and the Python projector this replaces returned ABSENT for every block of every one of
+        # them. The donor validated first is forward at both loci, so a donor-level check would not
+        # have caught it. The load-bearing assertion is that block slices reconstruct the walk
+        # byte-for-byte.
+        set(PANVAR_PATH_BLOCKS ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_path_blocks.sh)
+        if(EXISTS ${PANVAR_PATH_BLOCKS} AND PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE)
+            add_test(
+                NAME panvar_genotype_path_blocks
+                COMMAND /usr/bin/env bash ${PANVAR_PATH_BLOCKS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/genotype_path_blocks
+            )
+            set_tests_properties(panvar_genotype_path_blocks PROPERTIES TIMEOUT 600)
+        endif()
+
         # The fragment model's exact reference scorer, against fixtures whose values are derivable
         # rather than recorded -- the homozygous-doubling case is checked against
         # -lambda*starts + n*log(2) analytically. It is the oracle the accelerated scorer must be
