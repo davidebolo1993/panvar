@@ -924,7 +924,14 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         }
         const double whole = reference_pair_loglik(frames[ia].seq, frames[ib].seq, rfr, rp);
         const double fact = scope_restricted_pair_loglik(frames[ia], frames[ib], rfr, scopes, rp);
-        std::printf("%.17g\t%.17g\t%.17g\n", whole, fact, whole - fact);
+        // BLOCK-LEVEL: the part a block-factored model could express. Unattributable mass is
+        // dropped here on purpose. `whole - fact` being zero is guaranteed by always retaining that
+        // mass and so proves nothing; `fact - block` is the component that no block state can carry,
+        // and two candidates with the same block alleles must agree on `block` whatever it is.
+        const double block =
+            scope_restricted_pair_loglik(frames[ia], frames[ib], rfr, scopes, rp, false);
+        std::printf("%.17g\t%.17g\t%.17g\t%.17g\t%.17g\n",
+                    whole, fact, whole - fact, block, fact - block);
         log.done();
         return 0;
     }
@@ -1004,7 +1011,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
               "\tscope_blocks\tscope\tachieved_bound\tbound_holds"
               // appended, never inserted: three assertions once changed meaning silently when
               // columns were added in the middle of this header
-              "\tinitial_bound\tblocks_added\tworst_pair\n";
+              "\tinitial_bound\tblocks_added\tworst_pair\tunmapped_lse\n";
         for (const Fragment& F : ofr) {
             const OriginUniverse u =
                 enumerate_fragment_origins(F, frames, rp, hopt.placement_topk, scope_tol);
@@ -1017,7 +1024,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             if (u.scope.empty()) of << '.';
             of << '\t' << u.achieved_bound << '\t' << (u.bound_holds ? "yes" : "NO")
                << '\t' << u.initial_bound << '\t' << u.blocks_added
-               << '\t' << u.worst_pair_a << ':' << u.worst_pair_b << '\n';
+               << '\t' << u.worst_pair_a << ':' << u.worst_pair_b
+               << '\t' << u.unmapped_lse << '\n';
         }
         of.flush();
         if (!of) throw std::runtime_error("genotype-frag: write failed for " + origin_universe);

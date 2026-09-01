@@ -1082,7 +1082,22 @@ struct CandidateFrame {
     std::vector<std::uint32_t> block_at;
     bool reverse_frame = false;
     bool ok = false;                    // false: no verified coordinate map for this candidate
+    // A PATH MAY END INSIDE A BLOCK. Its assembly contig, or the interval that cut it, can stop
+    // partway through a block, so the concatenated alleles are a correct PREFIX (or suffix) of the
+    // walk rather than the whole of it. That is not a spelling error -- the bytes agree -- but the
+    // "concatenation equals the walk" test cannot certify a map over the uncovered remainder.
+    // Refusing the candidate outright loses it from the panel; inventing a block for the remainder
+    // would be worse. So the map covers [mapped_lo, mapped_hi) in WALK coordinates and the rest is
+    // reported as unmapped, where a position has no block rather than a guessed one.
+    // Measured: cyp2d6 NA18989#1#haplotype1 ends 1978 bp past bubble 8's sink, short of bubble 9.
+    bool partial = false;
+    std::size_t mapped_lo = 0, mapped_hi = 0;
 };
+
+// Returned by ordered_block_span for a position outside [mapped_lo, mapped_hi). Such a position
+// belongs to no block, so its mass is unattributable: it can never be dropped by restricting the
+// scope, and it can never justify adding a block to one.
+inline constexpr std::uint32_t kUnmappedBlock = 0xFFFFFFFFu;
 
 // Build the frame for one path. `walk` is the authoritative sequence supplied by the caller (from
 // the shared accessor); this function only verifies it against the decomposition and derives the
@@ -1155,6 +1170,12 @@ struct OriginUniverse {
     std::vector<std::uint32_t> scope;
     double retained_lse = 0.0;            // mass the accelerated representation keeps
     double omitted_lse = 0.0;             // mass it drops
+    // Mass from origins that belong to NO block, because they fall outside a partial frame's
+    // verified window. Reported SEPARATELY rather than folded into exact_lse silently: a
+    // reconciliation that simply always includes it is zero by construction and proves nothing
+    // about whether a block-level model can represent it. Two candidates with identical block
+    // alleles can differ here, and then their block genotype is NOT determined by block evidence.
+    double unmapped_lse = 0.0;
     // The bound ACHIEVED, verified jointly: the largest |contribution(full) - contribution(scope)|
     // over candidates, after restricting to `scope`. Testing blocks one at a time does not bound
     // their combined removal -- ten blocks can each move the contribution by under scope_tol while
@@ -1180,12 +1201,21 @@ OriginUniverse enumerate_fragment_origins(
     std::size_t retain_topk,
     double scope_tol = 1e-6);
 
+// `include_unmapped` selects WHICH question is being asked, and the two answers differ:
+//   true  -- the EXACT likelihood. Unattributable mass is retained, so this reconciles to the
+//            whole-locus reference. That equality is necessary and, on its own, uninformative:
+//            always including the mass makes the residual zero by construction.
+//   false -- the BLOCK-LEVEL likelihood, the part a block-factored model could actually express.
+//            Two candidates projecting to the same block alleles MUST score equally here. If their
+//            exact scores differ while these agree, the difference is a global/unprojectable
+//            component and the block genotype is ambiguous, not confidently determined.
 double scope_restricted_pair_loglik(
     const CandidateFrame& frame_a,
     const CandidateFrame& frame_b,
     const std::vector<Fragment>& fragments,
     const std::vector<std::vector<std::uint32_t>>& scopes,
-    const ReferenceParams& params);
+    const ReferenceParams& params,
+    bool include_unmapped = true);
 
 void write_fragment_results(
     const std::string& out_prefix,

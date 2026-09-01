@@ -3010,14 +3010,33 @@ CandidateFrame build_candidate_frame(const std::vector<BlockAlleles>& blocks,
             concat += blocks[bi].allele_seq[it->second];
         }
     }
-    if (concat == walk) {
-        f.offsets = std::move(off);
+    // Where `concat` sits inside `target`: 0 if it is a prefix, target.size()-concat.size() if a
+    // suffix, npos otherwise. A truncated assembly loses sequence from an END, so those are the two
+    // placements that can arise; anything else is a genuine disagreement and stays refused.
+    const auto placement_in = [](const std::string& c, const std::string& target) -> std::size_t {
+        if (c.empty() || c.size() > target.size()) return std::string::npos;
+        if (target.compare(0, c.size(), c) == 0) return 0;
+        if (target.compare(target.size() - c.size(), c.size(), c) == 0) {
+            return target.size() - c.size();
+        }
+        return std::string::npos;
+    };
+
+    const std::size_t fwd_at = placement_in(concat, walk);
+    if (fwd_at != std::string::npos) {
+        f.offsets.resize(off.size());
+        for (std::size_t k = 0; k < off.size(); ++k) f.offsets[k] = off[k] + fwd_at;
         f.block_at.resize(f.offsets.size());
         for (std::uint32_t k = 0; k < f.block_at.size(); ++k) f.block_at[k] = k;
+        f.mapped_lo = fwd_at;
+        f.mapped_hi = fwd_at + concat.size();
+        f.partial = concat.size() != walk.size();
         f.ok = true;
         return f;
     }
-    if (concat == reverse_complement(walk)) {
+    const std::string rcw = reverse_complement(walk);
+    const std::size_t rev_at = placement_in(concat, rcw);
+    if (rev_at != std::string::npos) {
         // Opposite frames. Block b occupies [off[b], off[b+1]) in the CONCAT frame, which maps to
         // [n - off[b+1], n - off[b]) in the walk frame; so the walk-frame start offsets are the
         // mirrored ends, in reverse block order.
@@ -3027,12 +3046,15 @@ CandidateFrame build_candidate_frame(const std::vector<BlockAlleles>& blocks,
         for (std::size_t bi = 0; bi < off.size(); ++bi) {
             const std::size_t end = (bi + 1 < off.size()) ? off[bi + 1] : concat.size();
             const std::size_t k = off.size() - 1 - bi;   // walk-order slot for block bi
-            mirrored[k] = n - end;
+            mirrored[k] = n - (rev_at + end);
             at[k] = static_cast<std::uint32_t>(bi);      // ...and it is still block bi
         }
         f.offsets = std::move(mirrored);
         f.block_at = std::move(at);
         f.reverse_frame = true;
+        f.mapped_lo = n - (rev_at + concat.size());
+        f.mapped_hi = n - rev_at;
+        f.partial = concat.size() != walk.size();
         f.ok = true;
         return f;
     }
@@ -3046,7 +3068,8 @@ CandidateFrame build_candidate_frame(const std::vector<BlockAlleles>& blocks,
 double scope_restricted_pair_loglik(const CandidateFrame& frame_a, const CandidateFrame& frame_b,
                                     const std::vector<Fragment>& fragments,
                                     const std::vector<std::vector<std::uint32_t>>& scopes,
-                                    const ReferenceParams& params) {
+                                    const ReferenceParams& params,
+                                    bool include_unmapped) {
     const std::string& hap_a = frame_a.seq;
     const std::string& hap_b = frame_b.seq;
     const double log_eps = std::log(params.error_rate / 3.0);
@@ -3080,6 +3103,10 @@ double scope_restricted_pair_loglik(const CandidateFrame& frame_a, const Candida
         const std::vector<std::uint32_t>& sc =
             fi < scopes.size() ? scopes[fi] : std::vector<std::uint32_t>{};
         const auto in_scope = [&](std::uint32_t lo, std::uint32_t hi) {
+            // Unattributable mass is ALWAYS included. It belongs to no block, so no scope can drop
+            // it -- dropping it would make the restricted model lose likelihood that the whole-locus
+            // model has, and the reconciliation residual would stop being zero.
+            if (lo == kUnmappedBlock) return include_unmapped;
             for (std::uint32_t b = lo; b <= hi; ++b) {
                 if (!std::binary_search(sc.begin(), sc.end(), b)) return false;
             }
@@ -3137,12 +3164,19 @@ std::pair<std::uint32_t, std::uint32_t> ordered_block_span(const CandidateFrame&
                                                           long start, long end) {
     const auto at = [&](long pos) -> std::uint32_t {
         if (frame.offsets.empty()) return 0;
+        // Outside the verified window there is no block, and saying so is the whole point: a
+        // guessed block index here would put an arbitrary block into some fragment's dependency set.
+        if (pos < static_cast<long>(frame.mapped_lo) ||
+            pos >= static_cast<long>(frame.mapped_hi)) return kUnmappedBlock;
         std::size_t k = 0;
         while (k + 1 < frame.offsets.size() &&
                static_cast<long>(frame.offsets[k + 1]) <= pos) ++k;
         return k < frame.block_at.size() ? frame.block_at[k] : static_cast<std::uint32_t>(k);
     };
     const std::uint32_t a = at(start), b = at(end);
+    // An origin touching unmapped sequence is unattributable, not partly attributable: reporting
+    // the mapped endpoint alone would claim the whole origin depends on that block.
+    if (a == kUnmappedBlock || b == kUnmappedBlock) return {kUnmappedBlock, kUnmappedBlock};
     return {std::min(a, b), std::max(a, b)};
 }
 
@@ -3239,8 +3273,17 @@ OriginUniverse enumerate_fragment_origins(const Fragment& fragment,
     // minimal one, and the guarantee it carries is per candidate: for each candidate, the mass
     // dropped by restricting to the reported scope is at most scope_tol nats of that candidate's own
     // total. It is not a statement about the aggregate.
+    // Recorded separately, before any scope decision, so the caller can tell a candidate whose
+    // likelihood is fully block-attributable from one carrying mass no block can express.
+    out.unmapped_lse = kNegInf;
+    for (const FragmentOrigin& o : out.origins) {
+        if (o.block_lo == kUnmappedBlock) {
+            out.unmapped_lse = log_add(out.unmapped_lse, o.emission_ll + o.insert_ll);
+        }
+    }
     std::vector<std::uint32_t> touched;
     for (const FragmentOrigin& o : out.origins) {
+        if (o.block_lo == kUnmappedBlock) continue;   // no block to touch
         for (std::uint32_t b = o.block_lo; b <= o.block_hi; ++b) touched.push_back(b);
     }
     std::sort(touched.begin(), touched.end());
@@ -3300,8 +3343,10 @@ OriginUniverse enumerate_fragment_origins(const Fragment& fragment,
             for (const FragmentOrigin& o : out.origins) {
                 if (o.hap != h) continue;
                 bool inside = true;
-                for (std::uint32_t b = o.block_lo; b <= o.block_hi && inside; ++b) {
-                    if (!std::binary_search(sc.begin(), sc.end(), b)) inside = false;
+                if (o.block_lo != kUnmappedBlock) {
+                    for (std::uint32_t b = o.block_lo; b <= o.block_hi && inside; ++b) {
+                        if (!std::binary_search(sc.begin(), sc.end(), b)) inside = false;
+                    }
                 }
                 if (inside) m = log_add(m, o.emission_ll + o.insert_ll);
             }

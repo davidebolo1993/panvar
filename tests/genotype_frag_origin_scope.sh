@@ -267,9 +267,23 @@ print('yes' if {'1','3'} <= v and '2' not in v else 'no')" 2>/dev/null)
 # concatenating block alleles: the concatenation is reverse-complemented for an antiparallel path and
 # short for an unprojectable one. A candidate with no verifiable map must be skipped, not guessed --
 # guessing puts arbitrary blocks into some fragment's dependency set.
+# truncX starts mid-locus, so its concatenation is a SUFFIX of its walk. That is a TRUNCATION, not
+# a disagreement -- case 16 keeps it as a partial frame, and this case asserts it is kept.
+# NOTHING here should be refused any more, and this fixture cannot produce a case that should be.
+# Two constructions were tried and both are recorded because both are traps:
+#   * an interior disagreement via a 4+ -> 3+ link, so a path can re-enter bubble 1. That MERGES the
+#     two bubbles into one 1+ -> 7+ bubble with five inside nodes, and the re-entering path becomes a
+#     legitimate allele of it -- concat == walk, correctly accepted. With a verified chain
+#     decomposition every interior node belongs to some allele, so that branch is defensive code no
+#     fixture on this substrate can reach.
+#   * a disconnected component with no block alleles. That perturbs the decomposition too: five
+#     candidates then fail to map and uniq_'s scope collapses from one block to none.
+# Refusal is still gated -- case 15a asserts that a panel where NOTHING maps is an instrument
+# failure rather than a table of zeros. This case asserts the complementary half: a truncated path
+# is KEPT.
 { cat "$OUT/g.gfa"
   printf 'P\trevX\t7-,6-,4-,3-,1-\t*\n'          # antiparallel: block spelling is the RC
-  printf 'P\ttruncX\t4+,6+,7+\t*\n'; } > "$OUT/gaf.gfa"   # starts mid-locus: unprojectable
+  printf 'P\ttruncX\t4+,6+,7+\t*\n'; } > "$OUT/gaf.gfa"   # head truncation: KEPT, not refused
 "$BIN" bubble -i "$OUT/gaf.gfa" -r ref -o "$OUT/baf" --min-variant-bp 0 -q >/dev/null 2>&1
 AFLOG=$("$BIN" genotype-frag -i "$OUT/gaf.gfa" -b "$OUT/baf" -o "$OUT/uaf" -R "$OUT/r1.fa" \
          --origin-universe "$OUT/uaf.tsv" "${CF[@]}" 2>&1 >/dev/null | grep -i "candidate frames")
@@ -278,9 +292,9 @@ NSKIP=$(printf '%s' "$AFLOG" | sed -nE 's/.*, ([0-9]+) skipped.*/\1/p')
 [ "${NANTI:-0}" -ge 1 ] \
   && ok "11 an antiparallel path is mapped by mirroring, not rebuilt ($NANTI)" \
   || bad "11 no antiparallel candidate was recognised; the mirroring path is untested ($AFLOG)"
-[ "${NSKIP:-0}" -ge 1 ] \
-  && ok "11 a path with no verified walk-to-block map is SKIPPED, not guessed ($NSKIP)" \
-  || bad "11 the unprojectable path was not skipped ($AFLOG)"
+[ "${NSKIP:-0}" = 0 ] \
+  && ok "11 a truncated path is KEPT as a partial frame, not refused (0 skipped)" \
+  || bad "11 $NSKIP candidate(s) refused; a truncation is not a disagreement ($AFLOG)"
 # and the scope must still be right with those candidates present
 if [ -s "$OUT/uaf.tsv" ]; then
   read -r NBA SCA <<<"$(scope_of "$OUT/uaf.tsv" uniq_)"
@@ -391,9 +405,12 @@ while read -r P Q; do
   [ -z "$P" ] && continue
   LINE=$("$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/b" -o "$OUT/rc" -R "$OUT/r1.fa" \
           --reconcile-scope "$P" "$Q" "${CF[@]}" -q 2>/dev/null | grep -E '^-?[0-9]' | tail -1)
+  # The strict arity check is deliberate and has already earned its keep: when --reconcile-scope
+  # grew from 3 columns to 5 (whole, fact, gap, block, unprojectable) this returned NA and failed
+  # the gate, instead of reading a column that had moved. Keep it exact, not >=.
   D=$($PY -c "
 p='$LINE'.split()
-print('%.9f' % abs(float(p[2])) if len(p)==3 else 'NA')" 2>/dev/null)
+print('%.9f' % abs(float(p[2])) if len(p)==5 else 'NA')" 2>/dev/null)
   RESID="$RESID $D"
 done <<'PAIRS'
 pAD pCB
@@ -534,6 +551,127 @@ elif [ "$R15A" = "$R15B" ]; then
   bad "15c --scope-tol does not reach --reconcile-scope: 1e-6 and 12 both give $R15A"
 else
   ok "15c --scope-tol reaches --reconcile-scope (a 12-nat tolerance changes the residual)"
+fi
+
+# ---------------------------------------------------------------------------------------------
+# 16 -- A PATH THAT ENDS INSIDE A BLOCK. Its concatenated alleles are a correct PREFIX of its walk,
+# not a corrupted version of it, so this is not the spelling defect 6d42578 fixed: the bytes agree
+# and only the coordinate map is in question. Refusing such a candidate loses it from the panel,
+# which collides with the "no candidate-set reduction" requirement; inventing a block for the
+# uncovered tail would be worse. The tail is reported as UNMAPPED, and mass there is unattributable:
+# never dropped by a scope, never a reason to widen one. Measured on real data: cyp2d6
+# NA18989#1#haplotype1 ends 1978 bp past bubble 8's sink.
+# The panel path stops inside the trailing flank, 60 bp short of the end.
+TRUNC="${L}${X1}${M}${Y2}$(printf '%s' "$N" | cut -c1-240)"
+{ printf 'H\tVN:Z:1.0\n'
+  printf 'S\t1\t%s\n' "$L"; printf 'S\t2\t%s\n' "$X1"; printf 'S\t3\t%s\n' "$X2"
+  printf 'S\t4\t%s\n' "$M"; printf 'S\t5\t%s\n' "$Y1"; printf 'S\t6\t%s\n' "$Y2"
+  printf 'S\t7\t%s\n' "$N"; printf 'S\t8\t%s\n' "$(printf '%s' "$N" | cut -c1-240)"
+  for a in 2 3; do printf 'L\t1\t+\t%s\t+\t0M\nL\t%s\t+\t4\t+\t0M\n' "$a" "$a"; done
+  for a in 5 6; do printf 'L\t4\t+\t%s\t+\t0M\nL\t%s\t+\t7\t+\t0M\n' "$a" "$a"; done
+  printf 'L\t6\t+\t8\t+\t0M\n'
+  printf 'P\tref\t1+,2+,4+,5+,7+\t*\n'
+  printf 'P\tfull\t1+,2+,4+,6+,7+\t*\n'
+  printf 'P\ttrunc\t1+,2+,4+,6+,8+\t*\n'
+} > "$OUT/g16.gfa"
+"$BIN" bubble -i "$OUT/g16.gfa" -r ref -o "$OUT/b16" --min-variant-bp 0 -q >/dev/null 2>&1
+: > "$OUT/r16.fa"
+mkpair "$H_AD" u16 20 40 100 "$OUT/r16.fa"     # in the shared left flank
+# TRUNC is L(300)+X1(120)+M(30)+Y2(120)+N[:240] = 810 bp, so its trailing flank runs 570..810 and
+# the concatenated alleles cover only [0,570): a 100 bp insert at 650 lies wholly in unmapped
+# sequence. An offset past the end of TRUNC silently yields empty reads and a vacuous gate.
+mkpair "$TRUNC" t16 650 40 100 "$OUT/r16.fa"   # inside the truncated path's UNMAPPED trailing flank
+"$BIN" genotype-frag -i "$OUT/g16.gfa" -b "$OUT/b16" -o "$OUT/u16" -R "$OUT/r16.fa" \
+  --origin-universe "$OUT/u16.tsv" "${CF[@]}" -q >/dev/null 2>&1
+if [ ! -s "$OUT/u16.tsv" ]; then
+  bad "16 the oracle produced no universe for the truncated-path fixture"
+else
+  SK=$( [ -f "$OUT/u16.tsv.skipped" ] && awk 'NR>1' "$OUT/u16.tsv.skipped" | wc -l | tr -d ' ' || echo 0)
+  [ "${SK:-0}" = 0 ] \
+    && ok "16 a path ending inside a block is KEPT, not skipped (no candidate-set reduction)" \
+    || bad "16 $SK candidate(s) skipped; the truncated path is still being dropped"
+  NO16=$(awk -F'\t' 'NR>1 && index($1,"t16")==1 {print $2; exit}' "$OUT/u16.tsv")
+  [ "${NO16:-0}" -gt 0 ] 2>/dev/null \
+    && ok "16 the fragment over the truncated tail has origins ($NO16)" \
+    || bad "16 the truncated tail yields no origins, so the case below is vacuous"
+  B16=$(awk -F'\t' 'NR>1 && $10=="NO"' "$OUT/u16.tsv" | wc -l | tr -d ' ')
+  [ "${B16:-1}" = 0 ] \
+    && ok "16 the joint diploid bound still holds with unmapped mass present" \
+    || bad "16 $B16 fragment(s) fail the bound once a partial frame is in the panel"
+fi
+# THE GATE THAT MATTERS: exactness must survive. Unmapped mass is unattributable, so if a scope
+# ever dropped it the restricted model would lose likelihood the whole-locus model has, and this
+# residual would stop being zero.
+W16=$("$BIN" genotype-frag -i "$OUT/g16.gfa" -b "$OUT/b16" -o "$OUT/rec16" -R "$OUT/r16.fa" \
+      --reconcile-scope trunc full "${CF[@]}" -q 2>/dev/null | grep -E '^-?[0-9]' | tail -1 | awk '{print $3}')
+if [ -z "$W16" ]; then
+  bad "16 reconciliation over the truncated candidate produced no residual"
+else
+  $PY -c "import sys; sys.exit(0 if abs(float('$W16')) < 1e-6 else 1)" 2>/dev/null \
+    && ok "16 scope-restricted scoring is still EXACT with a partial frame (residual $W16)" \
+    || bad "16 partial frames break exactness: residual $W16"
+fi
+
+# ---------------------------------------------------------------------------------------------
+# 17 -- UNMAPPED MASS MUST NOT DECIDE A BLOCK GENOTYPE. Case 16's exactness gate is zero BY
+# CONSTRUCTION: unattributable mass is always retained, so the restricted model cannot lose any and
+# the residual has to be zero whatever the tails contain. That says nothing about whether a
+# block-level model can represent the mass. Here tA and tB take the SAME allele in every block and
+# differ only in unmapped terminal sequence. The block-level likelihood must not distinguish them.
+# If it did, whole-haplotype scoring could pick one on terminal sequence alone and the shared block
+# genotype would be reported as confidently determined on evidence no block state carries.
+TA="${L}${X1}${M}${Y2}$(printf '%s' "$N" | cut -c1-240)"
+TB="${L}${X1}${M}${Y2}$(seq_of 240 77)"
+{ printf 'H\tVN:Z:1.0\n'
+  printf 'S\t1\t%s\n' "$L"; printf 'S\t2\t%s\n' "$X1"; printf 'S\t3\t%s\n' "$X2"
+  printf 'S\t4\t%s\n' "$M"; printf 'S\t5\t%s\n' "$Y1"; printf 'S\t6\t%s\n' "$Y2"
+  printf 'S\t7\t%s\n' "$N"
+  printf 'S\t8\t%s\n' "$(printf '%s' "$N" | cut -c1-240)"; printf 'S\t9\t%s\n' "$(seq_of 240 77)"
+  for a in 2 3; do printf 'L\t1\t+\t%s\t+\t0M\nL\t%s\t+\t4\t+\t0M\n' "$a" "$a"; done
+  for a in 5 6; do printf 'L\t4\t+\t%s\t+\t0M\nL\t%s\t+\t7\t+\t0M\n' "$a" "$a"; done
+  printf 'L\t6\t+\t8\t+\t0M\nL\t6\t+\t9\t+\t0M\n'
+  printf 'P\tref\t1+,2+,4+,5+,7+\t*\n'
+  printf 'P\ttA\t1+,2+,4+,6+,8+\t*\n'
+  printf 'P\ttB\t1+,2+,4+,6+,9+\t*\n'
+} > "$OUT/g17.gfa"
+"$BIN" bubble -i "$OUT/g17.gfa" -r ref -o "$OUT/b17" --min-variant-bp 0 -q >/dev/null 2>&1
+: > "$OUT/r17.fa"
+mkpair "$H_AD" u17 20 40 100 "$OUT/r17.fa"   # shared left flank
+# ASYMMETRIC on purpose. Reads from BOTH tails make tA/tA and tB/tB score identically by symmetry,
+# and the whole-locus comparison below then compares a number to itself. Only tA's tail is evidenced.
+mkpair "$TA"   a17 650 40 100 "$OUT/r17.fa"  # inside tA's unmapped tail only
+rec17() {  # rec17 <p> <q> -> "whole fact gap block unproj"
+  "$BIN" genotype-frag -i "$OUT/g17.gfa" -b "$OUT/b17" -o "$OUT/rec17.$1.$2" -R "$OUT/r17.fa" \
+    --reconcile-scope "$1" "$2" "${CF[@]}" -q 2>/dev/null | grep -E '^-?[0-9]' | tail -1
+}
+RA="$(rec17 tA tA)"; RB="$(rec17 tB tB)"
+if [ -z "$RA" ] || [ -z "$RB" ]; then
+  bad "17 reconciliation produced no output for the equal-block-allele pair"
+else
+  read -r WA FA GA BA UA <<<"$RA"; read -r WB FB GB BB UB <<<"$RB"
+  # the two candidates must really differ overall, or the case is vacuous
+  $PY -c "import sys; sys.exit(0 if abs(float('$WA')-float('$WB')) > 1.0 else 1)" 2>/dev/null \
+    && ok "17 the two candidates DO differ on whole-locus likelihood ($WA vs $WB)" \
+    || bad "17 the tails do not change the whole-locus score, so nothing is being tested"
+  # ...and must be indistinguishable once only block-attributable evidence is counted
+  $PY -c "import sys; sys.exit(0 if abs(float('$BA')-float('$BB')) < 1e-6 else 1)" 2>/dev/null \
+    && ok "17 identical block alleles score EQUALLY at block level ($BA)" \
+    || bad "17 block-level scores differ ($BA vs $BB): terminal sequence is deciding a block genotype"
+  # and the difference must be reported as an explicit unprojectable component, not hidden
+  # THE IDENTITY. Not "both components are nonzero" -- tB legitimately carries NO unattributable
+  # evidence, since the reads come from tA's tail, and demanding otherwise would be asserting a
+  # false thing. What must hold is that the ENTIRE whole-locus difference lives in the
+  # unprojectable component and none of it in the block-level one.
+  $PY -c "import sys
+dw=float('$WA')-float('$WB'); du=float('$UA')-float('$UB')
+sys.exit(0 if abs(dw-du) < 1e-6 and abs(dw) > 1.0 else 1)" 2>/dev/null \
+    && ok "17 the ENTIRE whole-locus difference is unprojectable (dW $(printf '%.6f' "$($PY -c "print(float('$WA')-float('$WB'))")") == dU $(printf '%.6f' "$($PY -c "print(float('$UA')-float('$UB'))")"))" \
+    || bad "17 whole-locus difference is not fully unprojectable: dW vs dU from $UA / $UB"
+  # the exactness gate must STILL hold -- but it is not what proves the above
+  $PY -c "import sys; sys.exit(0 if abs(float('$GA')) < 1e-6 and abs(float('$GB')) < 1e-6 else 1)" \
+    2>/dev/null \
+    && ok "17 exactness still holds ($GA / $GB), which alone would not have caught this" \
+    || bad "17 exactness broke ($GA / $GB)"
 fi
 
 echo
