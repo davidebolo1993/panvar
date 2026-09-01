@@ -795,7 +795,10 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             if (wi != by_name.end() && wi->second != nullptr) {
                 walk = spell_path_steps_sequence(graph, wi->second->steps, &wok);
             }
-            const PathProjection pr = wok ? project_path_blocks(src, name, walk) : PathProjection{};
+            // src derives the geometry; `blocks` -- the reduced calling panel -- decides
+            // representability, for retained and held-out paths alike.
+            const PathProjection pr =
+                wok ? project_path_blocks(src, blocks, name, walk) : PathProjection{};
             const char* fr = !pr.ok ? "NA" : (pr.reverse_frame ? "rc" : "fwd");
             if (!pr.ok) {
                 ++n_unproj;

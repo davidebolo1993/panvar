@@ -1104,9 +1104,12 @@ inline constexpr std::uint32_t kUnmappedBlock = 0xFFFFFFFFu;
 //
 // Bytes are SLICED from the graph walk through the verified CandidateFrame, never rebuilt by
 // concatenating alleles: concatenation is reverse-complemented for an antiparallel path and short
-// for a truncated one. Consumers (the block projection, --dump-scored-sequences, the origin/scope
-// diagnostics) all call this; a second implementation is how the three previous decomposition bugs
-// happened, and how a Python projector came to assume source->sink order.
+// for a truncated one.
+//
+// The COORDINATE AUTHORITY that is shared is build_candidate_frame(): this function and the
+// origin/scope diagnostics both derive from it, so there is one rule for where a block sits. They do
+// not all call this function -- today only --dump-scored-sequences does -- and claiming otherwise
+// would overstate it.
 struct PathBlockSlice {
     std::uint32_t block = 0;
     // kind/bubble_id are NOT here. They belong to the chain, and this function's one job is
@@ -1132,7 +1135,19 @@ struct PathProjection {
     std::vector<std::pair<std::size_t, std::size_t>> unmapped;
 };
 
-PathProjection project_path_blocks(const std::vector<BlockAlleles>& blocks,
+// GEOMETRY AND CATALOGUE MEMBERSHIP ARE SEPARATE INPUTS, and conflating them was a real defect: a
+// held-out path projected with the held-out block set had its alleles tested against that same
+// held-out catalogue, where they are representable almost by construction, instead of against the
+// reduced calling panel -- which is the only set that answers "could the caller have produced this".
+//   projection_blocks -- contains the named path; derives the verified frame and the coordinates.
+//   catalogue_blocks  -- the reduced calling panel; decides representability and supplies the index.
+// For a retained path the two are the same set.
+//
+// Matching is by EXACT reference-oriented sequence equality, not canonical md5. Canonicalisation is
+// right for identity across whole-path orientation, but inside a block catalogue that is already
+// oriented, collapsing a sequence with its reverse complement would call two different alleles one.
+PathProjection project_path_blocks(const std::vector<BlockAlleles>& projection_blocks,
+                                   const std::vector<BlockAlleles>& catalogue_blocks,
                                    const std::string& name,
                                    const std::string& walk);
 

@@ -2996,11 +2996,12 @@ double reference_pair_loglik(const std::string& hap_a, const std::string& hap_b,
     return total;
 }
 
-PathProjection project_path_blocks(const std::vector<BlockAlleles>& blocks,
+PathProjection project_path_blocks(const std::vector<BlockAlleles>& projection_blocks,
+                                   const std::vector<BlockAlleles>& catalogue_blocks,
                                    const std::string& name,
                                    const std::string& walk) {
     PathProjection out;
-    const CandidateFrame f = build_candidate_frame(blocks, name, walk);
+    const CandidateFrame f = build_candidate_frame(projection_blocks, name, walk);
     if (!f.ok) return out;                       // unprojectable: every block field is NA
     out.ok = true;
     out.partial = f.partial;
@@ -3025,11 +3026,17 @@ PathProjection project_path_blocks(const std::vector<BlockAlleles>& blocks,
         sl.md5 = md5_hex(sl.seq);
         const std::string rc = reverse_complement(sl.seq);
         sl.canonical_md5 = md5_hex(sl.seq < rc ? sl.seq : rc);
-        if (sl.block < blocks.size()) {
-            const auto it = blocks[sl.block].allele_of.find(name);
-            if (it != blocks[sl.block].allele_of.end()) {
-                sl.catalogue_allele = static_cast<long>(it->second);
-                sl.catalogue_representable = it->second < blocks[sl.block].allele_seq.size();
+        // Representability is decided against the CALLING catalogue by exact reference-oriented
+        // sequence equality -- not by looking the path up in allele_of, which for a held-out path
+        // finds it in its own held-out catalogue and answers a question nobody asked.
+        if (sl.block < catalogue_blocks.size()) {
+            const auto& cat = catalogue_blocks[sl.block].allele_seq;
+            for (std::size_t ai = 0; ai < cat.size(); ++ai) {
+                if (cat[ai] == sl.seq) {
+                    sl.catalogue_allele = static_cast<long>(ai);
+                    sl.catalogue_representable = true;
+                    break;
+                }
             }
         }
         out.blocks.push_back(std::move(sl));
