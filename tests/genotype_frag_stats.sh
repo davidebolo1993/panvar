@@ -669,6 +669,90 @@ else
   bad "chain adjacency not honoured: boundary $NB3, ambiguous $NA3 (raw-index adjacency would give 0 and >0)"
 fi
 
+# ------------------------------------ frame, and the walk as the authoritative scored sequence
+# The block chain is reference-oriented, so a path running ANTIPARALLEL to the reference spells the
+# reverse complement of its own walk. Same sequence, different frame. That used to be fatal and it
+# kept c4 (60/127 paths), cyp2d6 (59/127) and ankrd36c (19/465) out of every experiment.
+#
+# A reverse-oriented copy of hapAD1: identical steps, all traversed on the other strand.
+{ cat "$OUT/g.gfa"
+  printf 'P\trevAD\t7-,6-,4-,3-,1-\t*\n'
+} > "$OUT/grev.gfa"
+"$BIN" bubble -i "$OUT/grev.gfa" -r ref -o "$OUT/brev" --min-variant-bp 0 -q >/dev/null 2>&1
+"$BIN" genotype-frag -i "$OUT/grev.gfa" -b "$OUT/brev" -o "$OUT/rev" \
+  --dump-scored-sequences "$OUT/rev" -q >/dev/null 2>&1
+if [ -s "$OUT/rev.scored_sequences.tsv" ]; then
+  ok "a reverse-oriented path does not abort the dump"
+  NRC=$(awk -F'\t' 'NR>1 && $9=="rc"' "$OUT/rev.scored_sequences.tsv" | wc -l | tr -d ' ')
+  NMM=$(awk -F'\t' 'NR>1 && $9=="MISMATCH"' "$OUT/rev.scored_sequences.tsv" | wc -l | tr -d ' ')
+  NNO=$(awk -F'\t' 'NR>1 && $8=="NO"' "$OUT/rev.scored_sequences.tsv" | wc -l | tr -d ' ')
+  [ "$NMM" = 0 ] && [ "$NNO" = 0 ] \
+    && ok "every path round-trips once the reverse-complement frame is accepted (rc: $NRC)" \
+    || bad "reverse-oriented fixture still reports $NNO failures / $NMM mismatches"
+else
+  bad "the dump aborted on a reverse-oriented path"
+fi
+
+# The frame column must be a real discriminator: a fixture with NO antiparallel path must report
+# none, or the assertion above passes for free.
+NRC0=$(awk -F'\t' 'NR>1 && $9=="rc"' "$OUT/dmp.scored_sequences.tsv" | wc -l | tr -d ' ')
+[ "$NRC0" = 0 ] && ok "the all-forward fixture reports no rc frames, so the column discriminates" \
+                || bad "all-forward fixture reported $NRC0 rc frames"
+
+# THE HAPLOTYPE IS THE WALK. Scoring must use the graph walk, not the block concatenation: the two
+# can disagree (measured at cyp2d6, a 205236 bp block spelling against a 207214 bp walk), and the
+# walk is what the panel actually contains.
+LOGW=$("$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/walk" -R "$OUT/reads.fa" \
+        --haplotype-mode --fragment-len 350 --fragment-sd 50 -t 2 2>&1 | grep -c "scoring the GRAPH WALK")
+[ "${LOGW:-0}" -ge 1 ] && ok "whole-haplotype mode scores the graph walk, and says so" \
+                       || bad "no GRAPH WALK line: scoring may still use the block concatenation"
+
+# On this fixture walk and block spelling agree, so the call must be unchanged by the switch.
+WP=$(sed -n 2p "$OUT/walk.hap_pairs.tsv" | cut -f2,3)
+[ "$WP" = "$BASE" ] && ok "walk-based scoring reproduces the call where the two spellings agree" \
+                    || bad "walk-based scoring changed a call it should not: '$BASE' -> '$WP'"
+
+# ------------------------------------------------- production-path per-fragment dump (plan A2)
+# --dump-fragment-mass used to live only inside the joint-depth rescoring block, so the path that
+# actually makes the call could not be inspected per fragment. That is not a cosmetic gap: a
+# partition computed under --joint-depth was once read as if it described the production score, and
+# the two differ by an order of magnitude (-77535 against -9195 on the same pair).
+P1=$(sed -n 2p "$OUT/base.hap_pairs.tsv" | cut -f2)
+P2=$(sed -n 2p "$OUT/base.hap_pairs.tsv" | cut -f3)
+"$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/prod" -R "$OUT/reads.fa" \
+  --haplotype-mode --fragment-len 350 --fragment-sd 50 --dump-mass-pair "$P1,$P2" \
+  --dump-fragment-mass "$OUT/prod.tsv" -t 2 -q >/dev/null 2>&1
+if [ -s "$OUT/prod.tsv" ]; then
+  ok "--dump-fragment-mass works WITHOUT --joint-depth"
+else
+  bad "--dump-fragment-mass still requires --joint-depth"
+fi
+
+# THE GATE: summing the dumped per-fragment terms must reproduce the reported pair score up to one
+# per-pair constant (the dosage and coverage terms, which are not per-fragment). If it does not, the
+# dump is describing something other than the production score and is worse than no dump.
+if [ -s "$OUT/prod.tsv" ]; then
+  SUMC=$(grep '^# sum_contrib' "$OUT/prod.tsv" | cut -f2)
+  SCOREC=$(awk -F'\t' 'NR==2{print $4}' "$OUT/prod.hap_pairs.tsv")
+  OKC=$("$PYTHON_BIN" -c "
+try:
+    s=float('$SUMC'); p=float('$SCOREC')
+    # with no --haploid-depth the dosage term is zero, so the two must agree almost exactly
+    print('yes' if abs(p-s) < 1e-6 else f'no ({p-s})')
+except Exception as e: print('no (%s)' % e)" 2>/dev/null)
+  [ "$OKC" = "yes" ] && ok "the dump sums to the reported pair score (no dosage term configured)" \
+                     || bad "dump does not reproduce the production score: $OKC"
+fi
+
+# It must refuse a pair it cannot describe, rather than dumping a different one.
+ERRD=$("$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/bub" -o "$OUT/prodbad" -R "$OUT/reads.fa" \
+        --haplotype-mode --fragment-len 350 --fragment-sd 50 --dump-mass-pair "notAPath,$P2" \
+        --dump-fragment-mass "$OUT/prodbad.tsv" -t 2 2>&1 >/dev/null)
+case "$ERRD" in
+  *"not in the shortlist"*) ok "--dump-mass-pair refuses a haplotype outside the shortlist" ;;
+  *) bad "--dump-mass-pair accepted an unshortlisted haplotype (output: ${ERRD:-none})" ;;
+esac
+
 echo
 if [ "$fails" -eq 0 ]; then echo "genotype-frag stats: all assertions passed"; else
   echo "genotype-frag stats: $fails assertion(s) failed"; fi

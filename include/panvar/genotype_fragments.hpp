@@ -704,6 +704,23 @@ void verify_block_spelling(
     const std::vector<BlockAlleles>& blocks,
     const std::vector<std::string>& haplotype_names);
 
+// Which FRAME a path's block spelling is in, relative to its own GFA walk.
+//
+// The block chain is oriented along the reference, so a path that runs ANTIPARALLEL to the reference
+// spells reference-oriented blocks: its concatenated alleles are the exact reverse complement of its
+// walk. Both are the same sequence; they differ only in frame. Measured: 60 of 127 paths at cyp2d6
+// and at c4, 19 of 465 at ankrd36c -- and the round-trip invariant refused all three loci outright,
+// which is what kept the two pharmacogene loci out of every experiment.
+enum class SpellFrame { Forward, ReverseComplement, Incomparable };
+
+// Compare a path's block spelling to its walk spelling and report the frame. Incomparable means the
+// graph cannot fully spell the walk, or the two differ by something other than orientation -- which
+// IS a decomposition fault and must still be refused.
+SpellFrame block_spelling_frame(
+    const Graph& graph,
+    const std::vector<BlockAlleles>& blocks,
+    const std::string& name);
+
 // The exact sequence whole-haplotype mode scores for `name`: this path's allele in every block of
 // the chain, concatenated, with a block the path bypasses contributing nothing.
 //
@@ -747,7 +764,20 @@ HaplotypeResult genotype_haplotype_pairs(
     const HaplotypeScoreOptions& options,
     const std::vector<int>* truth_allele1 = nullptr,
     const std::vector<int>* truth_allele2 = nullptr,
-    std::size_t top_pairs_kept = 20);
+    std::size_t top_pairs_kept = 20,
+    // AUTHORITATIVE SEQUENCE. The graph's own walk for each path, name -> sequence, already
+    // canonicalised into the block frame.
+    //
+    // The haplotype IS the walk; the graph is only a convention for storing it, and spelling a P
+    // line end to end recovers it exactly (this is what `odgi paths -f` does). Concatenating
+    // per-block alleles is a DECOMPOSITION artifact and is not guaranteed to reproduce it: measured
+    // at cyp2d6, NA18989#1 spells 205236 bp against a walk of 207214, the block spelling being an
+    // exact PREFIX -- the chain simply stops 1978 bp early and the tail is dropped silently.
+    //
+    // So scoring uses the walk when it is supplied, and the block decomposition is kept only for
+    // PROJECTING the answer back onto blocks. A decomposition gap then costs a projection, never a
+    // wrong scored sequence.
+    const std::unordered_map<std::string, std::string>* walk_sequences = nullptr);
 
 void write_haplotype_results(
     const std::string& out_prefix,

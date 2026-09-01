@@ -631,7 +631,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         std::ofstream tf(tsv), ff(fa);
         if (!tf) throw std::runtime_error("genotype-frag: cannot write " + tsv);
         if (!ff) throw std::runtime_error("genotype-frag: cannot write " + fa);
-        tf << "group\tname\tscored_bp\tscored_md5\tgfa_bp\tgfa_md5\tgfa_complete\tround_trips\n";
+        tf << "group\tname\tscored_bp\tscored_md5\tgfa_bp\tgfa_md5\tgfa_complete\tround_trips"
+              "\tframe\n";
 
         const auto by_name = path_records_by_name(graph);
         std::size_t n_mismatch = 0, n_incomplete = 0, n_rows = 0;
@@ -647,14 +648,21 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             }
             // A path the graph cannot fully spell has no raw sequence to compare against, so it is
             // reported as such rather than as a round-trip failure -- those are different faults.
-            const bool round_trips = complete && scored == raw;
+            // FRAME: the block chain is reference-oriented, so a path antiparallel to the reference
+            // spells the reverse complement of its walk. Same sequence, different frame -- reported
+            // as a round trip, with the frame named, rather than refused.
+            const std::string rc = complete ? reverse_complement(raw) : std::string();
+            const bool same_frame = complete && scored == raw;
+            const bool rc_frame = complete && !same_frame && scored == rc;
+            const bool round_trips = same_frame || rc_frame;
+            const char* frame = !complete ? "." : (same_frame ? "fwd" : (rc_frame ? "rc" : "MISMATCH"));
             if (!complete) ++n_incomplete;
             else if (!round_trips) ++n_mismatch;
             ++n_rows;
             tf << group << '\t' << name << '\t' << scored.size() << '\t' << md5_hex(scored)
                << '\t' << (complete ? raw.size() : std::size_t{0}) << '\t'
                << (complete ? md5_hex(raw) : std::string(".")) << '\t' << (complete ? "yes" : "no")
-               << '\t' << (complete ? (round_trips ? "yes" : "NO") : ".") << '\n';
+               << '\t' << (complete ? (round_trips ? "yes" : "NO") : ".") << '\t' << frame << '\n';
             ff << '>' << name << ' ' << group << '\n';
             for (std::size_t off = 0; off < scored.size(); off += 60) {
                 ff << scored.substr(off, 60) << '\n';
@@ -731,9 +739,17 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                                          "' which is not in " + gfa_path);
             }
             bool complete = false;
-            const std::string out = spell_path_steps_sequence(graph, it->second->steps, &complete);
+            std::string out = spell_path_steps_sequence(graph, it->second->steps, &complete);
             if (!complete) {
                 throw std::runtime_error("genotype-frag: the graph cannot fully spell path '" + nm + "'");
+            }
+            // Emit in the same FRAME as the block spelling. The panel, the truth and every distance
+            // in the benchmarks are reference-oriented block spellings; a walk-oriented sequence for
+            // an antiparallel path would compare as a whole-length mismatch. The flip is DECIDED by
+            // comparison, never assumed, so a path whose two spellings genuinely disagree still
+            // surfaces rather than being silently reverse-complemented into looking fine.
+            if (block_spelling_frame(graph, blocks, nm) == SpellFrame::ReverseComplement) {
+                out = reverse_complement(out);
             }
             return out;
         };
@@ -975,10 +991,43 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         log.info("scoring " + std::to_string(names.size()) + " panel haplotypes (shortlist " +
                  std::to_string(hopt.max_haplotypes) + ") over " + std::to_string(frags.size()) +
                  " fragments");
+        // THE HAPLOTYPE IS THE WALK. Spell every panel path from its own P-line steps -- the same
+        // thing `odgi paths -f` does -- and hand those to the scorer as the authoritative sequence.
+        // Concatenating per-block alleles is a decomposition artifact that is NOT guaranteed to
+        // reproduce the walk: at cyp2d6 one path's block spelling is an exact 205236 bp prefix of a
+        // 207214 bp walk, the chain stopping 1978 bp early with the tail dropped silently.
+        //
+        // Canonicalised into the BLOCK frame, because the block chain is reference-oriented and a
+        // path antiparallel to the reference spells the reverse complement of its walk. The flip is
+        // decided by comparison, never assumed.
+        std::unordered_map<std::string, std::string> walk_sequences;
+        {
+            const auto by_name = path_records_by_name(graph);
+            std::size_t flipped = 0, gapped = 0;
+            for (const std::string& nm : names) {
+                const auto it = by_name.find(nm);
+                if (it == by_name.end() || it->second == nullptr) continue;
+                bool complete = false;
+                std::string w = spell_path_steps_sequence(graph, it->second->steps, &complete);
+                if (!complete) continue;
+                const std::string blk = spell_block_haplotype(blocks, nm);
+                if (blk != w) {
+                    if (blk == reverse_complement(w)) { w = reverse_complement(w); ++flipped; }
+                    else ++gapped;   // decomposition does not reproduce the walk; the walk wins
+                }
+                walk_sequences.emplace(nm, std::move(w));
+            }
+            log.info("scoring the GRAPH WALK for " + std::to_string(walk_sequences.size()) + "/" +
+                     std::to_string(names.size()) + " panel paths (" + std::to_string(flipped) +
+                     " reverse-complement frame, " + std::to_string(gapped) +
+                     " where the block decomposition does not reproduce the walk and the walk wins)");
+        }
+
         const HaplotypeResult hr =
             genotype_haplotype_pairs(chain, blocks, names, frags, hopt,
                                      have_truth ? &truth1 : nullptr,
-                                     have_truth ? &truth2 : nullptr, top_pairs);
+                                     have_truth ? &truth2 : nullptr, top_pairs,
+                                     &walk_sequences);
         if (!hr.top_pairs.empty()) {
             log.info("best pair: " + hr.shortlist[hr.top_pairs[0].hap1] + " / " +
                      hr.shortlist[hr.top_pairs[0].hap2] + " (posterior " +

@@ -813,6 +813,7 @@ void verify_block_spelling(const Graph& graph,
                            const std::vector<BlockAlleles>& blocks,
                            const std::vector<std::string>& haplotype_names) {
     const auto by_name = path_records_by_name(graph);
+    std::size_t gapped = 0;
     for (const std::string& name : haplotype_names) {
         const auto it = by_name.find(name);
         if (it == by_name.end() || it->second == nullptr) {
@@ -831,15 +832,46 @@ void verify_block_spelling(const Graph& graph,
         }
         const HaplotypeSeq built = spell_haplotype(blocks, name);
         if (built.seq == raw) continue;
+        // A path running antiparallel to the reference spells reference-oriented blocks, so its
+        // concatenation is the exact reverse complement of its walk. That is a FRAME difference and
+        // not a decomposition fault: the sequence is the same, and reads are aligned in both
+        // orientations anyway. Refusing it kept c4, cyp2d6 and ankrd36c out of every experiment.
+        if (built.seq == reverse_complement(raw)) continue;
+        // A decomposition gap. This used to be fatal, and rightly so while the SCORED sequence was
+        // the block concatenation -- the caller would have scored a sequence the panel does not
+        // contain. Now the graph walk is authoritative and the decomposition is used only to project
+        // the answer onto blocks, so a gap costs a projection, not a wrong call. Reported loudly and
+        // counted; the caller decides.
         std::size_t at = 0;
         while (at < built.seq.size() && at < raw.size() && built.seq[at] == raw[at]) ++at;
-        throw std::runtime_error(
-            "genotype-frag: block decomposition does not round-trip for path '" + name +
-            "': concatenated block alleles are " + std::to_string(built.seq.size()) +
-            " bp, the graph spells " + std::to_string(raw.size()) +
-            " bp, first difference at offset " + std::to_string(at) +
-            ". Whole-haplotype mode would score a sequence the panel does not contain.");
+        std::fprintf(stderr,
+            "[genotype-frag] WARNING: the block decomposition does not reproduce path '%s': "
+            "concatenated block alleles are %zu bp against a walk of %zu bp, first difference at "
+            "offset %zu. The WALK is scored, so the call is unaffected; the per-block projection for "
+            "this path is incomplete.\n",
+            name.c_str(), built.seq.size(), raw.size(), at);
+        ++gapped;
     }
+    if (gapped > 0) {
+        std::fprintf(stderr,
+            "[genotype-frag] %zu of %zu panel paths have an incomplete block projection (see above). "
+            "Scoring is unaffected.\n", gapped, haplotype_names.size());
+    }
+}
+
+SpellFrame block_spelling_frame(const Graph& graph,
+                                const std::vector<BlockAlleles>& blocks,
+                                const std::string& name) {
+    const auto by_name = path_records_by_name(graph);
+    const auto it = by_name.find(name);
+    if (it == by_name.end() || it->second == nullptr) return SpellFrame::Incomparable;
+    bool complete = false;
+    const std::string raw = spell_path_steps_sequence(graph, it->second->steps, &complete);
+    if (!complete) return SpellFrame::Incomparable;
+    const std::string built = spell_haplotype(blocks, name).seq;
+    if (built == raw) return SpellFrame::Forward;
+    if (built == reverse_complement(raw)) return SpellFrame::ReverseComplement;
+    return SpellFrame::Incomparable;
 }
 
 HaplotypeResult genotype_haplotype_pairs(
@@ -850,7 +882,8 @@ HaplotypeResult genotype_haplotype_pairs(
     const HaplotypeScoreOptions& options,
     const std::vector<int>* truth_allele1,
     const std::vector<int>* truth_allele2,
-    std::size_t top_pairs_kept) {
+    std::size_t top_pairs_kept,
+    const std::unordered_map<std::string, std::string>* walk_sequences) {
 
     HaplotypeResult out;
     out.n_fragments = fragments.size();
@@ -874,8 +907,15 @@ HaplotypeResult genotype_haplotype_pairs(
     {
         std::vector<double> containment(haplotype_names.size(), 0.0);
         run_parallel(haplotype_names.size(), options.threads, [&](std::size_t i) {
-            const HaplotypeSeq h = spell_haplotype(blocks, haplotype_names[i]);
-            const std::vector<KmerOccurrence> sy = collect_syncmers(h.seq, k, s);
+            const std::string* w = nullptr;
+            if (walk_sequences != nullptr) {
+                const auto it = walk_sequences->find(haplotype_names[i]);
+                if (it != walk_sequences->end()) w = &it->second;
+            }
+            const HaplotypeSeq hb = w == nullptr ? spell_haplotype(blocks, haplotype_names[i])
+                                                 : HaplotypeSeq{};
+            const std::string& hseq = w != nullptr ? *w : hb.seq;
+            const std::vector<KmerOccurrence> sy = collect_syncmers(hseq, k, s);
             if (sy.empty()) return;
             std::size_t hit = 0;
             for (const KmerOccurrence& o : sy) if (read_codes.count(o.code)) ++hit;
@@ -903,8 +943,14 @@ HaplotypeResult genotype_haplotype_pairs(
         std::vector<std::pair<double, std::size_t>> unique_ranked;
         unique_ranked.reserve(ranked.size());
         for (const auto& r : ranked) {
-            const HaplotypeSeq h = spell_haplotype(blocks, haplotype_names[r.second]);
-            if (seen.insert(h.seq).second) unique_ranked.push_back(r);
+            const std::string* w = nullptr;
+            if (walk_sequences != nullptr) {
+                const auto it = walk_sequences->find(haplotype_names[r.second]);
+                if (it != walk_sequences->end()) w = &it->second;
+            }
+            const std::string sq = w != nullptr ? *w
+                                                : spell_haplotype(blocks, haplotype_names[r.second]).seq;
+            if (seen.insert(sq).second) unique_ranked.push_back(r);
         }
         ranked.swap(unique_ranked);
     }
@@ -934,7 +980,14 @@ HaplotypeResult genotype_haplotype_pairs(
     // break. `nh` above the requested cap means it was extended through a tie.
     for (std::size_t i = 0; i < nh; ++i) {
         out.shortlist.push_back(haplotype_names[ranked[i].second]);
+        // Alleles from the decomposition (needed to project the answer onto blocks); SEQUENCE from
+        // the graph walk when available, because the walk is the haplotype and the concatenation is
+        // only an approximation of it.
         haps[i] = spell_haplotype(blocks, haplotype_names[ranked[i].second]);
+        if (walk_sequences != nullptr) {
+            const auto it = walk_sequences->find(haplotype_names[ranked[i].second]);
+            if (it != walk_sequences->end()) haps[i].seq = it->second;
+        }
         out.haplotypes[i].name = haplotype_names[ranked[i].second];
         out.haplotypes[i].bp = haps[i].seq.size();
         out.haplotypes[i].containment = ranked[i].first;
@@ -1899,6 +1952,45 @@ HaplotypeResult genotype_haplotype_pairs(
     for (std::size_t a = 0; a < nh; ++a) {
         for (std::size_t b = a; b < nh; ++b) pair_index.emplace_back(a, b);
     }
+    // PRODUCTION-PATH FRAGMENT DUMP. The existing dump lives inside the joint-depth rescoring block,
+    // so the path that actually makes the call could not be inspected per fragment -- which
+    // invalidated one diagnostic outright (a partition computed under --joint-depth was read as if it
+    // described the production score; the two differ by an order of magnitude). This reproduces the
+    // exact term the production loop sums, for one named pair.
+    if (!options.dump_fragment_mass.empty() && !options.joint_depth &&
+        !options.dump_mass_pair1.empty()) {
+        long i1 = -1, i2 = -1;
+        for (std::size_t i = 0; i < nh; ++i) {
+            if (out.shortlist[i] == options.dump_mass_pair1) i1 = static_cast<long>(i);
+            if (out.shortlist[i] == options.dump_mass_pair2) i2 = static_cast<long>(i);
+        }
+        if (i1 < 0 || i2 < 0) {
+            throw std::runtime_error("genotype-frag: --dump-mass-pair named a haplotype that is not "
+                                     "in the shortlist; the dump would describe a different pair");
+        }
+        const std::size_t a = static_cast<std::size_t>(i1), b = static_cast<std::size_t>(i2);
+        const double log_total_len =
+            options.length_normalize ? log_add(log_len[a], log_len[b]) : std::log(2.0);
+        std::ofstream mf(options.dump_fragment_mass);
+        if (!mf) throw std::runtime_error("genotype-frag: cannot write " + options.dump_fragment_mass);
+        mf.precision(17);
+        mf << "# pair\t" << out.shortlist[a] << '\t' << out.shortlist[b] << '\n';
+        mf << "# production path (no --joint-depth); contrib is the exact term the pair score sums\n";
+        mf << "fragment\tlog_mass\tll_a\tll_b\tfloor\tcontrib\n";
+        double check = 0.0;
+        for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
+            if (floors[fi] == kNegInf) continue;
+            const double num = log_add(ll[fi * nh + a], ll[fi * nh + b]);
+            const double contrib = log_add(log_mix + num - log_total_len, log_out + floors[fi]);
+            check += contrib;
+            mf << fragments[fi].name << '\t' << num << '\t' << ll[fi * nh + a] << '\t'
+               << ll[fi * nh + b] << '\t' << floors[fi] << '\t' << contrib << '\n';
+        }
+        mf << "# sum_contrib\t" << check << '\n';
+        mf.flush();
+        if (!mf) throw std::runtime_error("genotype-frag: write failed for " + options.dump_fragment_mass);
+    }
+
     std::vector<double> pair_score(pair_index.size(), 0.0);
     run_parallel(pair_index.size(), options.threads, [&](std::size_t pi) {
         const auto [a, b] = pair_index[pi];
