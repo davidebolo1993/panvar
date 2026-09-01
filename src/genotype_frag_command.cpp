@@ -773,8 +773,81 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             if (scored.empty()) ff << '\n';
         };
 
-        for (const PathRecord& p : panel_graph.paths) emit("panel", blocks, p.name);
-        for (const PathRecord& p : held_out) emit("held_out", held_blocks, p.name);
+        // ---- PATH -> BLOCK PROJECTION, for EVERY path -------------------------------------------
+        // Every path, not a requested subset. A name list is another chance to emit one pair's
+        // alleles under another's label, which is what --force-haplotypes silently did: it ADDS to
+        // the shortlist rather than restricting it, so a "projection" of a named pair came back as
+        // the called pair and every block compared equal. Consumers filter on exact path names.
+        const std::string pbt = dump_sequences + ".path_blocks.tsv";
+        const std::string pbf = dump_sequences + ".path_blocks.fa";
+        std::ofstream pt(pbt), pf(pbf);
+        if (!pt) throw std::runtime_error("genotype-frag: cannot write " + pbt);
+        if (!pf) throw std::runtime_error("genotype-frag: cannot write " + pbf);
+        pt << "group\tpath\tframe\tprojection_status\tblock\tkind\tbubble_id\twalk_begin"
+              "\twalk_end\twalk_strand\tblock_bp\tblock_md5\tcanonical_md5\tcatalogue_allele"
+              "\tcatalogue_representable\n";
+        std::size_t n_unproj = 0, n_partial = 0, n_slices = 0;
+        const auto project = [&](const char* group, const std::vector<BlockAlleles>& src,
+                                 const std::string& name) {
+            const auto wi = by_name.find(name);
+            bool wok = false;
+            std::string walk;
+            if (wi != by_name.end() && wi->second != nullptr) {
+                walk = spell_path_steps_sequence(graph, wi->second->steps, &wok);
+            }
+            const PathProjection pr = wok ? project_path_blocks(src, name, walk) : PathProjection{};
+            const char* fr = !pr.ok ? "NA" : (pr.reverse_frame ? "rc" : "fwd");
+            if (!pr.ok) {
+                ++n_unproj;
+                // NA rather than a best-effort segmentation. A path whose map cannot be verified
+                // has no block coordinates, and inventing them puts arbitrary blocks into whatever
+                // consumes this table.
+                pt << group << '\t' << name << '\t' << fr << "\tunprojectable"
+                   << "\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\n";
+                return;
+            }
+            if (pr.partial) ++n_partial;
+            const char* st = pr.partial ? "partial" : "complete";
+            for (const PathBlockSlice& sl : pr.blocks) {
+                const char* kind = "backbone";
+                std::size_t bub = 0;
+                if (sl.block < chain.size()) {
+                    kind = chain[sl.block].kind == BlockKind::Bubble ? "bubble"
+                         : chain[sl.block].kind == BlockKind::Flank  ? "flank" : "backbone";
+                    bub = chain[sl.block].bubble_id;
+                }
+                pt << group << '\t' << name << '\t' << fr << '\t' << st << '\t'
+                   << sl.block << '\t' << kind << '\t' << bub << '\t'
+                   << sl.walk_begin << '\t' << sl.walk_end << '\t' << (sl.reverse ? '-' : '+')
+                   << '\t' << sl.seq.size() << '\t' << sl.md5 << '\t' << sl.canonical_md5 << '\t';
+                if (sl.catalogue_allele < 0) pt << "NA"; else pt << sl.catalogue_allele;
+                pt << '\t' << (sl.catalogue_representable ? 1 : 0) << '\n';
+                pf << '>' << name << ' ' << group << " block=" << sl.block
+                   << " walk=" << sl.walk_begin << '-' << sl.walk_end
+                   << " strand=" << (sl.reverse ? '-' : '+') << '\n';
+                for (std::size_t off = 0; off < sl.seq.size(); off += 60) {
+                    pf << sl.seq.substr(off, 60) << '\n';
+                }
+                if (sl.seq.empty()) pf << '\n';
+                ++n_slices;
+            }
+            // Explicit unmapped intervals: nothing is silently assigned to the nearest block.
+            for (const auto& [lo, hi] : pr.unmapped) {
+                pt << group << '\t' << name << '\t' << fr << "\tunmapped\tNA\tNA\tNA\t"
+                   << lo << '\t' << hi << "\tNA\t" << (hi - lo) << "\tNA\tNA\tNA\t0\n";
+            }
+        };
+
+        for (const PathRecord& p : panel_graph.paths) { emit("panel", blocks, p.name);
+                                                        project("panel", blocks, p.name); }
+        // Held-out paths are projected against the SAME fixed chain. Their block sequence can be
+        // perfectly valid while catalogue_representable is 0 -- that is the interesting case, not
+        // an error.
+        for (const PathRecord& p : held_out) { emit("held_out", held_blocks, p.name);
+                                               project("held_out", held_blocks, p.name); }
+        pt.flush(); pf.flush();
+        if (!pt) throw std::runtime_error("genotype-frag: write failed for " + pbt);
+        if (!pf) throw std::runtime_error("genotype-frag: write failed for " + pbf);
 
         tf.flush();
         ff.flush();
@@ -785,7 +858,10 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                  std::to_string(held_out.size()) + " held out); " +
                  std::to_string(n_mismatch) + " do not round-trip against the GFA path, " +
                  std::to_string(n_incomplete) + " have no complete GFA spelling");
-        log.wrote({tsv, fa});
+        log.info("path blocks: " + std::to_string(n_slices) + " slices, " +
+                 std::to_string(n_partial) + " partial frames, " +
+                 std::to_string(n_unproj) + " unprojectable");
+        log.wrote({tsv, fa, pbt, pbf});
         // Standalone when nothing else was asked for: the audit case is a graph and a panel and
         // nothing else. Combined with another mode the dump is a side effect and the run continues,
         // so --spell-calls and --mosaic-floor still do their own work.

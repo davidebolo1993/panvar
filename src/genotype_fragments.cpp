@@ -2996,6 +2996,49 @@ double reference_pair_loglik(const std::string& hap_a, const std::string& hap_b,
     return total;
 }
 
+PathProjection project_path_blocks(const std::vector<BlockAlleles>& blocks,
+                                   const std::string& name,
+                                   const std::string& walk) {
+    PathProjection out;
+    const CandidateFrame f = build_candidate_frame(blocks, name, walk);
+    if (!f.ok) return out;                       // unprojectable: every block field is NA
+    out.ok = true;
+    out.partial = f.partial;
+    out.reverse_frame = f.reverse_frame;
+    if (f.mapped_lo > 0) out.unmapped.emplace_back(0, f.mapped_lo);
+    if (f.mapped_hi < walk.size()) out.unmapped.emplace_back(f.mapped_hi, walk.size());
+
+    for (std::size_t k = 0; k < f.offsets.size(); ++k) {
+        const std::size_t b0 = f.offsets[k];
+        const std::size_t b1 = (k + 1 < f.offsets.size()) ? f.offsets[k + 1] : f.mapped_hi;
+        if (b1 < b0 || b0 < f.mapped_lo || b1 > f.mapped_hi) continue;
+        PathBlockSlice sl;
+        sl.block = k < f.block_at.size() ? f.block_at[k] : static_cast<std::uint32_t>(k);
+        sl.walk_begin = b0;
+        sl.walk_end = b1;
+        sl.reverse = f.reverse_frame;
+        const std::string raw = walk.substr(b0, b1 - b0);
+        // Emitted in REFERENCE/BLOCK orientation. The walk slice of an antiparallel path is the
+        // reverse complement of the block's own sequence, and emitting walk bytes would make the
+        // same allele hash differently depending on which strand the assembly happened to be on.
+        sl.seq = f.reverse_frame ? reverse_complement(raw) : raw;
+        sl.md5 = md5_hex(sl.seq);
+        const std::string rc = reverse_complement(sl.seq);
+        sl.canonical_md5 = md5_hex(sl.seq < rc ? sl.seq : rc);
+        if (sl.block < blocks.size()) {
+            const auto it = blocks[sl.block].allele_of.find(name);
+            if (it != blocks[sl.block].allele_of.end()) {
+                sl.catalogue_allele = static_cast<long>(it->second);
+                sl.catalogue_representable = it->second < blocks[sl.block].allele_seq.size();
+            }
+        }
+        out.blocks.push_back(std::move(sl));
+    }
+    std::sort(out.blocks.begin(), out.blocks.end(),
+              [](const PathBlockSlice& a, const PathBlockSlice& b) { return a.block < b.block; });
+    return out;
+}
+
 CandidateFrame build_candidate_frame(const std::vector<BlockAlleles>& blocks,
                                      const std::string& name,
                                      const std::string& walk) {

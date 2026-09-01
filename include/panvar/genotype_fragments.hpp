@@ -1099,6 +1099,43 @@ struct CandidateFrame {
 // scope, and it can never justify adding a block to one.
 inline constexpr std::uint32_t kUnmappedBlock = 0xFFFFFFFFu;
 
+// ---------------------------------------------------------------------------------------------
+// AUTHORITATIVE PATH -> BLOCK PROJECTION. The one place block coordinates are derived.
+//
+// Bytes are SLICED from the graph walk through the verified CandidateFrame, never rebuilt by
+// concatenating alleles: concatenation is reverse-complemented for an antiparallel path and short
+// for a truncated one. Consumers (the block projection, --dump-scored-sequences, the origin/scope
+// diagnostics) all call this; a second implementation is how the three previous decomposition bugs
+// happened, and how a Python projector came to assume source->sink order.
+struct PathBlockSlice {
+    std::uint32_t block = 0;
+    // kind/bubble_id are NOT here. They belong to the chain, and this function's one job is
+    // authoritative path-to-block coordinates and bytes; the writer joins the rest.
+    std::size_t walk_begin = 0;        // half-open, in AUTHORITATIVE WALK coordinates
+    std::size_t walk_end = 0;
+    bool reverse = false;              // the block runs antiparallel to the walk
+    std::string seq;                   // in REFERENCE/BLOCK orientation, not walk orientation
+    std::string md5;                   // of seq as emitted
+    std::string canonical_md5;         // md5(min(seq, revcomp(seq))) -- orientation-independent
+    long catalogue_allele = -1;        // this arm's numeric index, or -1 for NA. PROVENANCE, not
+                                       // identity: exclusion renumbers it.
+    bool catalogue_representable = false;
+};
+
+struct PathProjection {
+    bool ok = false;                   // false => unprojectable; every block field is NA
+    bool partial = false;
+    bool reverse_frame = false;
+    std::vector<PathBlockSlice> blocks;
+    // Half-open walk intervals belonging to NO block, for a partial terminal frame. Emitted
+    // explicitly; nothing is silently assigned to the nearest block.
+    std::vector<std::pair<std::size_t, std::size_t>> unmapped;
+};
+
+PathProjection project_path_blocks(const std::vector<BlockAlleles>& blocks,
+                                   const std::string& name,
+                                   const std::string& walk);
+
 // Build the frame for one path. `walk` is the authoritative sequence supplied by the caller (from
 // the shared accessor); this function only verifies it against the decomposition and derives the
 // coordinate map, mirroring the offsets when the frames are opposite.
