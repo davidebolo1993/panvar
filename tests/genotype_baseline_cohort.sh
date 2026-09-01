@@ -121,11 +121,24 @@ run_timed() {
 }
 
 # ---- helpers -------------------------------------------------------------------------------------
-# Write one named record out of a scored_sequences.fa, uppercased.
-extract_fa() {   # extract_fa <fa> <name> <out>
-  "$PY" - "$1" "$2" "$3" <<'PY'
+# Write one named record out of a scored_sequences.fa, uppercased and in REFERENCE ORIENTATION.
+#
+# scored_sequences.fa carries WALK bytes, and a path whose frame is `rc` runs antiparallel to the
+# reference/block frame -- its walk is the reverse complement of every forward path's. Comparing
+# walk bytes across frames therefore measures STRAND, not genotype: c4/HG00171 leave-ZERO-out, with
+# its own truth in the panel and all 11 blocks matching, reported a distance of 240094. Every
+# distance here (truth, candidate, called) is oriented by the frame column the binary itself
+# reports, which is the same convention the block projection emits.
+extract_fa() {   # extract_fa <fa> <tsv> <name> <out>
+  "$PY" - "$1" "$2" "$3" "$4" <<'PY'
 import sys
-fa,want,out=sys.argv[1:4]
+fa,tsv,want,out=sys.argv[1:5]
+frame={}
+h=None
+for l in open(tsv):
+    f=l.rstrip('\n').split('\t')
+    if h is None: h=f; continue
+    d=dict(zip(h,f)); frame[d['name']]=d.get('frame','fwd')
 n=None;buf=[];hit=None
 def flush():
     global hit
@@ -138,7 +151,10 @@ for l in open(fa):
     else: buf.append(l.strip())
 flush()
 if hit is None: sys.exit(3)
-open(out,'w').write(">s\n"+hit.upper()+"\n")
+seq=hit.upper()
+if frame.get(want,'fwd')=='rc':
+    seq=seq[::-1].translate(str.maketrans('ACGTN','TGCAN'))
+open(out,'w').write(">s\n"+seq+"\n")
 PY
 }
 # Exact edit distance between two one-record FASTAs, via the SAME command every other distance uses.
@@ -193,8 +209,8 @@ while IFS=$'\t' read -r LOCUS GFA PFX REFNAME DONOR_LIST; do
       say "REFUSE $LOCUS/$DONOR: donor does not have two homologues in the panel"; fails=$((fails+1)); continue
     fi
     DD="$LD/$DONOR"; mkdir -p "$DD"
-    extract_fa "$LD/all.scored_sequences.fa" "$T1" "$DD/t1.fa" || { say "REFUSE $LOCUS/$DONOR: cannot spell truth 1"; fails=$((fails+1)); continue; }
-    extract_fa "$LD/all.scored_sequences.fa" "$T2" "$DD/t2.fa" || { say "REFUSE $LOCUS/$DONOR: cannot spell truth 2"; fails=$((fails+1)); continue; }
+    extract_fa "$LD/all.scored_sequences.fa" "$LD/all.scored_sequences.tsv" "$T1" "$DD/t1.fa" || { say "REFUSE $LOCUS/$DONOR: cannot spell truth 1"; fails=$((fails+1)); continue; }
+    extract_fa "$LD/all.scored_sequences.fa" "$LD/all.scored_sequences.tsv" "$T2" "$DD/t2.fa" || { say "REFUSE $LOCUS/$DONOR: cannot spell truth 2"; fails=$((fails+1)); continue; }
     cat "$DD/t1.fa" "$DD/t2.fa" > "$DD/truth.fa"; TRUTH_MD5="$(md5of "$DD/truth.fa")"
 
     # TRUTH EQUIVALENCE CLASS: every panel path whose walk is sequence-identical to a truth
@@ -243,9 +259,18 @@ PY
 
       # PANEL FLOOR: the best any remaining candidate PAIR can do, exact, same metric as everything
       # else. Filtered on the dump's group column -- the held_out group IS the truth.
-      FLOORLINE=$("$PY" - "$AD/cat.scored_sequences.fa" "$AD" "$BIN" "$BAND" "$DD/t1.fa" "$DD/t2.fa" <<'PY'
+      FLOORLINE=$("$PY" - "$AD/cat.scored_sequences.fa" "$AD" "$BIN" "$BAND" "$DD/t1.fa" "$DD/t2.fa" \
+                       "$AD/cat.scored_sequences.tsv" <<'PY'
 import sys, subprocess
-fa,ad,BIN,band,t1,t2=sys.argv[1:7]
+fa,ad,BIN,band,t1,t2,tsv=sys.argv[1:8]
+frame={};h=None
+for l in open(tsv):
+    f=l.rstrip('\n').split('\t')
+    if h is None: h=f; continue
+    d=dict(zip(h,f)); frame[d['name']]=d.get('frame','fwd')
+def orient(nm,s):
+    s=s.upper()
+    return s[::-1].translate(str.maketrans('ACGTN','TGCAN')) if frame.get(nm,'fwd')=='rc' else s
 names=[];seqs=[];n=None;grp=None;buf=[]
 def flush():
     if n is not None and grp!="held_out": names.append(n); seqs.append("".join(buf))
@@ -257,7 +282,7 @@ flush()
 if not seqs: print("NOFLOOR"); sys.exit()
 best=[10**9,10**9]; who=[None,None]
 for nm,s in zip(names,seqs):
-    open(f"{ad}/c.fa","w").write(">c\n"+s.upper()+"\n")
+    open(f"{ad}/c.fa","w").write(">c\n"+orient(nm,s)+"\n")
     for h,t in ((0,t1),(1,t2)):
         r=subprocess.run([BIN,"genotype-frag","--exact-distance",f"{ad}/c.fa",t,
                           "--distance-band",band],capture_output=True,text=True)
@@ -300,6 +325,11 @@ PY
       fi
       C1=$(awk -F'\t' 'NR==2{print $2}' "$AD/call.hap_pairs.tsv")
       C2=$(awk -F'\t' 'NR==2{print $3}' "$AD/call.hap_pairs.tsv")
+      # --spell-pair ALREADY emits reference orientation -- verified: for the antiparallel
+      # c4/HG00171 pair, its record equals the frame-corrected truth byte for byte. Only
+      # scored_sequences.fa carries raw walk bytes and needs orienting. Applying the correction here
+      # too double-flips the called pair, which leaves the distance wrong by exactly as much as
+      # doing nothing did, and looks like the fix having no effect.
       "$PY" - "$AD/sp.called.fa" "$AD/c1.fa" "$AD/c2.fa" <<'PY'
 import sys
 fa,o1,o2=sys.argv[1:4]
@@ -311,7 +341,8 @@ for l in open(fa):
     else: buf.append(l.strip())
 if n is not None: recs.append("".join(buf))
 if len(recs)<2: sys.exit(3)
-open(o1,'w').write(">c1\n"+recs[0].upper()+"\n"); open(o2,'w').write(">c2\n"+recs[1].upper()+"\n")
+open(o1,'w').write(">c1\n"+recs[0].upper()+"\n")
+open(o2,'w').write(">c2\n"+recs[1].upper()+"\n")
 PY
       [ -s "$AD/c1.fa" ] && [ -s "$AD/c2.fa" ] || { say "REFUSE $LOCUS/$DONOR/$ARM: called pair not spelled as two records"; fails=$((fails+1)); continue; }
       # best of the two orientation assignments -- the pair is unordered
@@ -328,6 +359,21 @@ print(min(v) if v else '')" 2>/dev/null)
         say "REFUSE $LOCUS/$DONOR/$ARM: called distance not computable within band $BAND"
         fails=$((fails+1)); continue
       fi
+      # CONTRACT: NAME IDENTITY IMPLIES SEQUENCE IDENTITY. If the caller returned the truth pair by
+      # name, the distance to truth must be exactly 0, whatever the frames involved. This is a check
+      # on the METRIC, not on the caller, and it is what finally caught the orientation defect:
+      # c4/HG00171 leave-zero-out returned its own truth pair and scored it 240094, because
+      # scored_sequences.fa carries walk bytes and both truth paths are antiparallel while
+      # --spell-pair emits reference orientation. The floor was 0 either way, so no floor-based
+      # invariant could see it, and only a donor with an rc-frame haplotype exposes it at all.
+      if "$PY" -c "
+import sys
+t={'$T1','$T2'}; c={'$C1','$C2'}
+sys.exit(0 if t==c else 1)" 2>/dev/null && [ "$CALLED_D" != 0 ]; then
+        say "REFUSE $LOCUS/$DONOR/$ARM: the called pair IS the truth pair by name, but distance is $CALLED_D -- the metric is comparing different orientations, not different genotypes"
+        fails=$((fails+1)); continue
+      fi
+
       # CONTRACT 2. A negative excess is a metric or substrate mismatch, never a good result.
       if [ "$CALLED_D" -lt "$PANEL_FLOOR" ]; then
         say "REFUSE $LOCUS/$DONOR/$ARM: called_distance $CALLED_D < panel_floor $PANEL_FLOOR -- metric or substrate mismatch"
