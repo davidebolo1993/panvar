@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <set>
 #include <cstdio>
 #include <cstdint>
 #include <fstream>
@@ -1074,7 +1075,12 @@ HaplotypeResult genotype_haplotype_pairs(
         ++nh;   // the cut fell inside a tie; taking one side of it would be arbitrary
     }
     std::vector<HaplotypeSeq> haps(nh);
-    std::vector<char> proj_exact(nh, 1);
+    // PER CANDIDATE, PER BLOCK. The old rule was all-or-nothing: any difference between the block
+    // concatenation and the walk marked EVERY block of that haplotype unreliable. That was defensible
+    // while a mismatch meant the decomposition was wrong, but a path may now legitimately END INSIDE
+    // A BLOCK, and its concatenation is then a correct PREFIX of its walk. Under the old rule such a
+    // path poisons all nineteen of its blocks because of one truncated terminal one.
+    std::vector<std::vector<char>> proj_block(nh);
     out.haplotypes.resize(nh);
     // Reported so a run can say whether the shortlist was a real selection or a tie it could not
     // break. `nh` above the requested cap means it was extended through a tie.
@@ -1090,8 +1096,23 @@ HaplotypeResult genotype_haplotype_pairs(
         haps[i].seq = *seq_of(ranked[i].second);
         // Does the decomposition reproduce this haplotype? If not, its per-block alleles cannot be
         // relied on anywhere, and every block of a projection involving it is unprojectable.
-        proj_exact[i] = (block_concat == haps[i].seq) ||
-                        (block_concat == reverse_complement(haps[i].seq));
+        {
+            // Projectability comes from the shared frame: a block is reliable for this candidate
+            // when the verified map covers it. Blocks outside a partial frame's window are not.
+            const PathProjection pr =
+                project_path_blocks(blocks, blocks, haplotype_names[ranked[i].second], haps[i].seq);
+            proj_block[i].assign(blocks.size(), 0);
+            if (pr.ok) {
+                for (const PathBlockSlice& sl : pr.blocks) {
+                    if (sl.block < proj_block[i].size()) proj_block[i][sl.block] = 1;
+                }
+            } else {
+                // No verified map at all: nothing about this candidate's blocks can be trusted.
+                const bool whole = (block_concat == haps[i].seq) ||
+                                   (block_concat == reverse_complement(haps[i].seq));
+                if (whole) proj_block[i].assign(blocks.size(), 1);
+            }
+        }
         out.haplotypes[i].name = haplotype_names[ranked[i].second];
         out.haplotypes[i].bp = haps[i].seq.size();
         out.haplotypes[i].containment = ranked[i].first;
@@ -2508,27 +2529,40 @@ HaplotypeResult genotype_haplotype_pairs(
         // has one member, where it is trivially true, so the column means one thing throughout.
         {
             const double best = pairs.front().score;
-            bool agree = true;
             bool any_inexact = false;   // any member of the equivalence set the decomposition fails
             int fa = -2, fb = -2;
+            // BLOCK EQUIVALENCE SIZE: the number of DISTINCT unordered allele pairs this block is
+            // given by every locus pair within tolerance -- every one of them, not the truncated
+            // reported-member list, which stops at equivalence_max_report and would understate the
+            // ambiguity by however many members were not printed.
+            std::set<std::pair<int, int>> block_pairs;
             for (const HaplotypePairScore& p : pairs) {
                 if (best - p.score > options.equivalence_tolerance) break;
-                // EVERY member contributing to the conclusion must be projectable. Checking only the
-                // rank-one pair would declare a block determined on the strength of members whose
-                // per-block alleles cannot be trusted.
-                if (!proj_exact[p.hap1] || !proj_exact[p.hap2]) any_inexact = true;
+                // EVERY member contributing to the conclusion must be projectable AT THIS BLOCK.
+                // Checking only the rank-one pair would declare a block determined on the strength
+                // of members whose alleles here cannot be trusted; checking the whole haplotype
+                // would discard blocks that are perfectly well mapped.
+                const bool pa = bi < proj_block[p.hap1].size() && proj_block[p.hap1][bi];
+                const bool pb = bi < proj_block[p.hap2].size() && proj_block[p.hap2][bi];
+                if (!pa || !pb) any_inexact = true;
                 int x = haps[p.hap1].allele[bi], y = haps[p.hap2].allele[bi];
                 if (x > y) std::swap(x, y);
                 if (x < 0 || y < 0) any_inexact = true;
+                else if (pa && pb) block_pairs.insert({x, y});
                 if (fa == -2) { fa = x; fb = y; }
-                else if (x != fa || y != fb) { agree = false; break; }
             }
+            const bool agree = block_pairs.size() == 1;
+            // NA, not a count, when any contributing member is unprojectable here: a number would
+            // be a claim about members whose alleles were never established.
+            P.block_equivalence_size = any_inexact ? -1
+                                                   : static_cast<long>(block_pairs.size());
             // A block where the selected pair has no allele is UNPROJECTABLE, not determined.
             // Agreement on -1 is agreement about nothing: the decomposition does not cover this path
             // here, so there is no block genotype to report. Emitting one would be a call the
             // evidence cannot support, which is exactly what the block-level product must not do.
             P.unprojectable = (fa < 0 || fb < 0) || any_inexact;
-            P.determined = agree && !P.unprojectable;
+            // determined = projectable AND the block equivalence size is numeric and exactly 1.
+            P.determined = !P.unprojectable && P.block_equivalence_size == 1;
             if (P.determined) ++out.equivalence.blocks_determined;
         }
 
@@ -2775,8 +2809,10 @@ void write_haplotype_results(const std::string& out_prefix,
     if (!catalogue_fingerprint.empty()) {
         bf << "# panvar-allele-catalogue\t" << catalogue_fingerprint << '\n';
     }
+    // Appended, never inserted: adding a column mid-header once silently changed the meaning of
+    // three assertions that indexed by position.
     bf << "block\tkind\tbubble_id\tn_alleles\tallele1\tallele2\tposterior\tdetermined"
-          "\tprojectable";
+          "\tprojectable\tblock_equivalence_size";
     if (have_truth) bf << "\ttruth_a\ttruth_b\trepresentable\texact";
     bf << '\n';
     for (const BlockProjection& p : result.blocks) {
@@ -2784,7 +2820,8 @@ void write_haplotype_results(const std::string& out_prefix,
                          : p.kind == BlockKind::Backbone ? "backbone" : "flank";
         bf << p.block_index << '\t' << kind << '\t' << p.bubble_id << '\t' << p.n_alleles << '\t'
            << p.allele1 << '\t' << p.allele2 << '\t' << p.posterior << '\t'
-           << (p.determined ? 1 : 0) << '\t' << (p.unprojectable ? "NA" : "yes");
+           << (p.determined ? 1 : 0) << '\t' << (p.unprojectable ? "NA" : "yes") << '\t';
+        if (p.block_equivalence_size < 0) bf << "NA"; else bf << p.block_equivalence_size;
         if (have_truth) {
             bf << '\t' << p.truth_a << '\t' << p.truth_b << '\t' << (p.truth_representable ? 1 : 0)
                << '\t' << (p.truth_representable ? (p.exact ? "1" : "0") : "NA");

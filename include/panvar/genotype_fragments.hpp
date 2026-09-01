@@ -534,6 +534,14 @@ struct BlockProjection {
     // edits phased and 385 unphased.
     int allele1 = -1;
     int allele2 = -1;
+    // Distinct unordered allele pairs this block is given by EVERY locus pair within
+    // equivalence_tolerance -- not the truncated reported-member list, which stops at
+    // equivalence_max_report and would understate the ambiguity by the members it never printed.
+    // -1 means NA: some contributing member could not be projected HERE, so a count would be a
+    // claim about alleles that were never established. This draws the distinction the block table
+    // needs: a caller can select the right allele and still not have DETERMINED it, when equally
+    // supported locus pairs disagree at that block.
+    long block_equivalence_size = -1;
     double posterior = 0.0;
     // True when every member of the equivalence set carries this same allele pair here. A block can
     // be determined even where the haplotype pair is not, and that is the part of the answer worth
