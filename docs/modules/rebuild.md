@@ -29,8 +29,8 @@ Algorithm and worked trace: [algorithms/rebuild.md](../algorithms/rebuild.md).
 | `--min-var <N>` | minimum variant length augmented into the graph; smaller differences stay at the backbone allele | `50` |
 | `--min-align-len <N>` | minimum alignment length that may contribute events; `0` scales it from the haplotype lengths | `0` (auto) |
 | `--min-recovered-identity <X>` | required identity of each recovered walk against its original haplotype | `0.98` |
-| `--min-matched-cover <X>` | required fraction of each haplotype covered by matching bases | `0.95` |
-| `-r, --reference-path <name>` | this path must be recovered within the same bounds; exact match wins, else a unique substring | — |
+| `--min-matched-cover <X>` | advisory: fraction of each haplotype covered by a usable landmark. Reported when unmet, never a rejection | `0.95` |
+| `-r, --reference-path <name>` | this path must be recovered within the identity bound; exact match wins, else a unique substring | — |
 | `--allow-loss` | accept a rebuild that fails the contract, recording what it violated | off |
 | `--audit <path>` | per-path audit TSV | `<out>.rebuild_audit.tsv` |
 | `--tmp-dir <path>` | parent directory for scratch; a dedicated subfolder is created under it and removed on exit | beside `--out` |
@@ -52,10 +52,10 @@ Audit columns:
 | `original_bp` | its length in the input |
 | `recovered_steps` | how many nodes its recovered walk visits |
 | `envelope_cover` | fraction of the haplotype lying between its first and last aligned base — blind to any gap in the middle |
-| `matched_cover` | fraction of the haplotype whose bases actually align and match — gaps in the middle do count against it |
+| `matched_cover` | fraction of the haplotype that sat under a usable landmark. A repeat-dense locus offers few, so this can be low with no sequence lost — advisory only |
 | `chain_identity` | identity within the aligned region |
 | `walk_identity` | identity of the walk re-spelled from the rebuilt graph against the original haplotype |
-| `status` | `ok`, or why this haplotype failed: `not_recovered`, `low_cover`, `low_identity`, `identity_unavailable` |
+| `status` | `ok`; the rejecting reasons `not_recovered`, `identity_unavailable`, `low_identity`; or `low_cover`, which is a remark and not a failure |
 
 The trailing lines record the run's disposition (`#verdict`), the reason if it was refused (`#reason`), and the thresholds that applied.
 

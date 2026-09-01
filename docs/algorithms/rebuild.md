@@ -38,9 +38,20 @@ Separate chains need not be joined by a link, so concatenating them would assert
 
 ### 5. Check and accept
 
-A rebuilt graph is only useful if the haplotypes come back. Each recovered walk is re-spelled from the rebuilt graph and compared against the original haplotype, giving four separate numbers rather than one: how much of the haplotype lies between its first and last aligned base, how much is covered by bases that actually match, the identity within the aligned region, and the identity of the re-spelled walk. The first hides internal gaps and the last does not, so a threshold set on either alone would mean something different.
+A rebuilt graph is only useful if the haplotypes come back. Each haplotype is mapped against the rebuilt graph, and the recovered walk is then re-spelled and compared with the original.
 
-The rebuild is accepted only if every haplotype is recovered, every consecutive step is joined by a link that exists, and each walk clears `--min-matched-cover` and `--min-recovered-identity`. A named `--reference-path` must clear them too, since everything downstream is expressed relative to it. If any check fails the rebuilt graph is discarded and the input is written unchanged, with the reason reported. `--allow-loss` accepts anyway and records what was violated.
+Mapping does not compare base by base. It finds landmarks - short seeds sampled along the haplotype that occur in both - and chains them in order. A seed that occurs too often to locate anything is discarded before chaining, so a repeat-dense region supplies no landmarks and is simply not covered by the chain. Three of the four numbers below are read off that chain and inherit this property; only the fourth is independent of it.
+
+| number | what it measures |
+|--------|------------------|
+| envelope cover | how far apart the first and last landmarks lie, blind to any gap between them |
+| matched cover | how much of the haplotype sat under a landmark at all |
+| chain identity | how well the landmarked part matched |
+| recovered-walk identity | the re-spelled walk aligned against the original haplotype, letter by letter |
+
+Only the last is free of the landmark sampling, so it is the one the contract is stated in. The rebuild is accepted if every haplotype is recovered, every consecutive step is joined by a link that exists, and each walk clears `--min-recovered-identity`. A named `--reference-path` must clear it too, since everything downstream is expressed relative to it. If any check fails the rebuilt graph is discarded and the input is written unchanged, with the reason reported. `--allow-loss` accepts anyway and records what was violated.
+
+`--min-matched-cover` is advisory. Low matched cover cannot distinguish a chain that skipped a genuine gap from one that had nothing to anchor on, and in a repeat-dense locus it reports mostly the second. The failure it guards against still rejects, through identity: a walk that really dropped sequence spells short, and missing bases are edits. Falling below it is reported and the run continues.
 
 Acceptance is about fidelity only. Whether the rebuild actually reduced tangling is measured separately, by re-running the gate's own degree count on the result, and reported rather than enforced.
 
@@ -68,7 +79,7 @@ h5 :  A  U U    [ gap ]   C          assembly gap where B would be
 
 4. Recover walks. `h1` to `h4` each map as a single chain and read out cleanly. `h5` does not: the graph reaches `C` only through `B`, but `h5` has no `B`, so no edge carries it across the gap. Mapping returns two chains, one over `A U U` and one over the lone `C`, with nothing joining them. Concatenating would assert a link the graph does not contain, so the longer chain wins and `h5`'s walk is `A U U`.
 
-5. Check and accept. `h1` to `h4` re-spell their haplotypes within the bounds. `h5` does not: its walk covers only the prefix, so its matched cover falls well below `--min-matched-cover` and it is recorded as `low_cover`. One haplotype failing is enough, so the rebuild is refused and the input graph is written unchanged. Passing `--allow-loss` would accept it instead, with `h5` recorded as the haplotype that was not recovered.
+5. Check and accept. `h1` to `h4` re-spell their haplotypes within the bounds. `h5` does not: its walk holds only the prefix, so the sequence it spells is missing everything after the gap, and those missing bases count as edits against `--min-recovered-identity`. It is recorded as `low_identity`. One haplotype failing is enough, so the rebuild is refused and the input graph is written unchanged. Passing `--allow-loss` would accept it instead, with `h5` recorded as the haplotype that was not recovered.
 
 6. Emit. On an accepted run, segments are renumbered from 1 and links written with orientation, one `P` line per haplotype, followed by the audit giving each haplotype's cover, identity and status.
 

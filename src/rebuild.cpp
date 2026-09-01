@@ -645,7 +645,7 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
             arcs.insert((static_cast<std::uint64_t>(v) << 32) | a.w);
             arcs.insert((static_cast<std::uint64_t>(a.w ^ 1) << 32) | (v ^ 1));
         }
-        std::size_t missing_paths = 0, dangling = 0, failing = 0;
+        std::size_t missing_paths = 0, dangling = 0, failing = 0, low_cover = 0;
         std::string first_bad;
         for (std::size_t h = 0; h < g.paths.size(); ++h) {
             if (walks[h].empty()) {
@@ -665,17 +665,22 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
             // absence of evidence. Treating id < 0 as passing let exactly the unverifiable cases through
             // the one check meant to catch them.
             const double id = h < walk_id.size() ? walk_id[h] : -1.0;
-            if (matched[h] < options.min_matched_cover || id < 0.0 ||
-                id < options.min_recovered_identity) {
+            if (matched[h] < options.min_matched_cover) ++low_cover;
+            // Cover is advisory: it measures how much of the haplotype carried usable landmarks, not
+            // how much came back. The gap it was added to catch -- a chain spanning the query through
+            // a hole -- still rejects here, because a walk missing sequence spells short and short
+            // spelling is edits.
+            if (id < 0.0 || id < options.min_recovered_identity) {
                 ++failing;
                 if (first_bad.empty())
                     first_bad = g.paths[h].name +
                                 (id < 0.0 ? " (recovered-walk identity could not be computed)"
-                                          : " (identity " + fmt2(id) + ", matched cover " +
-                                                fmt2(matched[h]) + ")");
+                                          : " (identity " + fmt2(id) + " below " +
+                                                fmt2(options.min_recovered_identity) + ")");
             }
         }
         sum.paths_failing = failing;
+        sum.paths_low_cover = low_cover;
         sum.dangling_steps = dangling;
 
         // The reference, if named, is held to the same bounds and must be present: everything
@@ -707,12 +712,13 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
                 sum.reject_reason = "reference path was not recovered: " + g.paths[ri].name;
             } else {
                 const double rid = ri < walk_id.size() ? walk_id[ri] : -1.0;
-                if (matched[ri] < options.min_matched_cover || rid < 0.0 ||
-                    rid < options.min_recovered_identity) {
+                if (rid < 0.0 || rid < options.min_recovered_identity) {
                     ref_ok = false;
-                    sum.reject_reason = "reference path recovered below the contract: " +
-                                        g.paths[ri].name + " (identity " + fmt2(rid < 0 ? 0.0 : rid) +
-                                        ", matched cover " + fmt2(matched[ri]) + ")";
+                    sum.reject_reason =
+                        "reference path recovered below the identity bound: " + g.paths[ri].name +
+                        (rid < 0.0 ? " (identity could not be computed)"
+                                   : " (identity " + fmt2(rid) + " below " +
+                                         fmt2(options.min_recovered_identity) + ")");
                 }
             }
         }
@@ -723,9 +729,19 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
             else if (dangling > 0)
                 sum.reject_reason = std::to_string(dangling) + " walk(s) contain a step pair with no edge, first: " + first_bad;
             else if (failing > 0)
-                sum.reject_reason = std::to_string(failing) + " haplotype(s) below the contract, first: " + first_bad;
+                sum.reject_reason = std::to_string(failing) +
+                                    " haplotype(s) below the identity bound, first: " + first_bad;
         }
         sum.accepted = ref_ok && sum.reject_reason.empty();
+
+        // Cover no longer rejects, so it has to be SAID, or demoting it would quietly delete the
+        // one signal that a locus is repeat-dense. Reported whatever the verdict, since a rebuild
+        // can be accepted and still be worth this remark.
+        if (low_cover > 0 && !options.quiet) {
+            std::cerr << "[rebuild " << hms() << "] WARNING: " << low_cover << '/' << g.paths.size()
+                      << " haplotype(s) below --min-matched-cover " << fmt2(options.min_matched_cover)
+                      << " (mean " << fmt2(sum.mean_matched_cover) << ")\n";
+        }
 
         // ---- audit sidecar: one row per path, so the verdict can be read rather than trusted ----
         const std::string audit = !options.audit_path.empty()
@@ -743,10 +759,13 @@ RebuildSummary rebuild_graph(const RebuildOptions& options) {
                 for (std::size_t h = 0; h < g.paths.size(); ++h) {
                     const double id = h < walk_id.size() ? walk_id[h] : -1.0;
                     std::string status = "ok";
+                    // Order matters: the rejecting bounds are tested first, so a path that both
+                    // fails identity and has low cover reports the reason it was actually discarded.
+                    // The old order put low_cover first and hid every real failure behind a warning.
                     if (walks[h].empty()) status = "not_recovered";
-                    else if (matched[h] < options.min_matched_cover) status = "low_cover";
                     else if (id < 0.0) status = "identity_unavailable";
                     else if (id < options.min_recovered_identity) status = "low_identity";
+                    else if (matched[h] < options.min_matched_cover) status = "low_cover";
                     // fmt_exact, not fmt2, for the same reason the thresholds use it: a decision is
                     // `matched[h] < min_matched_cover`, and two values that both print as 0.9900 can
                     // fall on opposite sides of it. Rounding the compared value while printing the

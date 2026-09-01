@@ -104,8 +104,43 @@ if [ -n "$SRC" ] && [ -s "$SRC" ]; then
   # --allow-loss accepts the same run and says so.
   "$BIN" rebuild -i "$GFA" -o "$OUT/loss.gfa" --force --min-recovered-identity 0.999999 \
     --allow-loss > "$OUT/loss.log" 2>&1
-  grep -q "WARNING" "$OUT/loss.log" && ok "--allow-loss accepts but warns" \
-                                    || bad "--allow-loss did not warn"
+  # Match the override's OWN wording, not the bare word WARNING: low matched cover also warns, so
+  # a bare grep would pass on that alone and this assertion would survive --allow-loss going silent.
+  grep -q "accepting a rebuild that fails the contract" "$OUT/loss.log" \
+    && ok "--allow-loss accepts but warns" || bad "--allow-loss did not warn"
+
+  # ---- matched cover is ADVISORY, and must not be able to reject on its own ----
+  # It scores a recovery from landmarks -- seeds sampled along the haplotype, with any seed too
+  # common to locate anything discarded before chaining. A repeat-dense locus therefore leaves much
+  # of itself unlandmarked and the fraction falls with no sequence lost, so it cannot separate "a gap
+  # was found here" from "nothing here could be checked". 1.0 is unsatisfiable by construction (a
+  # rebuild is never byte-identical), so if cover could still reject, this would reject.
+  "$BIN" rebuild -i "$GFA" -o "$OUT/cov.gfa" --force --min-matched-cover 1.0 \
+    --min-recovered-identity 0.97 > "$OUT/cov.log" 2>&1
+  grep -q "rejected" "$OUT/cov.log" \
+    && bad "--min-matched-cover 1.0 rejected the rebuild; cover is meant to be advisory" \
+    || ok "an unsatisfiable --min-matched-cover does not reject"
+  grep -qi "min-matched-cover" "$OUT/cov.log" \
+    && ok "  ... but it is still reported, so the signal is not silently dropped" \
+    || bad "low matched cover was neither rejected nor reported -- the signal vanished"
+
+  # The complement, so the pair above cannot both pass for a run that checks nothing: identity on the
+  # same fixture still rejects. Without this, a build that ignored every bound would look correct.
+  "$BIN" rebuild -i "$GFA" -o "$OUT/idb.gfa" --force --min-matched-cover 1.0 \
+    --min-recovered-identity 0.999999 > "$OUT/idb.log" 2>&1
+  grep -q "identity bound" "$OUT/idb.log" \
+    && ok "identity still rejects, and the message names the bound that failed" \
+    || bad "identity did not reject, or the message does not name the bound"
+
+  # A path failing identity must SAY low_identity even when its cover is also low. The status test
+  # used to run cover first, so every real failure was reported as the advisory reason instead.
+  aud_i="$OUT/idb.gfa.rebuild_audit.tsv"
+  if [ -s "$aud_i" ]; then
+    n_li=$(awk -F'\t' 'NR>1 && $0 !~ /^#/ && $8=="low_identity"' "$aud_i" | wc -l | tr -d ' ')
+    [ "$n_li" -gt 0 ] \
+      && ok "a path failing identity reports low_identity, not the advisory low_cover" \
+      || bad "no path reported low_identity under an unsatisfiable identity bound"
+  fi
 
   # A reference that is not in the graph must reject, whatever else passes.
   "$BIN" rebuild -i "$GFA" -o "$OUT/badref.gfa" --force -r "NOT_A_REAL_PATH_XYZ" \

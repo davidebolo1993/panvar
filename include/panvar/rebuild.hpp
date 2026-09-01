@@ -31,6 +31,7 @@ struct RebuildOptions {
     // back, spelling what it spelled before to within these bounds, or the rebuild is rejected and the
     // original graph is passed through unchanged.
     double min_recovered_identity = 0.98;  // per-path recovered-walk identity
+    // Advisory since the landmark mechanism was understood: see the note on paths_low_cover.
     double min_matched_cover = 0.95;       // per-path matching bases / haplotype length
     std::string reference_path;            // if set, must be recovered and meet the bounds; else reject
     bool allow_loss = false;               // accept a rebuild that fails the contract (records why)
@@ -73,7 +74,15 @@ struct RebuildSummary {
     // ---- acceptance ----
     bool accepted = false;                   // did the rebuild satisfy the contract?
     std::string reject_reason;               // why not, when it did not
-    std::size_t paths_failing = 0;           // paths below the identity/cover bounds
+    std::size_t paths_failing = 0;           // paths below the recovered-walk identity bound
+    // Low matched cover WARNS, it no longer rejects. The mapper scores a recovery from shared
+    // landmarks -- short seeds sampled along the haplotype -- and discards any seed occurring too
+    // often to locate anything. In a repeat-dense locus most seeds are discarded, so matched cover
+    // falls towards "the fraction of this locus that is not repetitive" and stops describing the
+    // rebuild at all. It cannot tell "checked here and found a gap" from "could not check here",
+    // which are opposite verdicts. A genuine internal gap still rejects, via identity: a walk that
+    // really dropped sequence spells short, and dropped bases are edits.
+    std::size_t paths_low_cover = 0;         // paths under min_matched_cover -- advisory only
     std::size_t dangling_steps = 0;          // consecutive P steps with no emitted L
     bool audit_written = false;
 };
