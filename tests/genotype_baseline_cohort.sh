@@ -359,64 +359,106 @@ print(min(v) if v else '')" 2>/dev/null)
       # instruments that never ran, and a plausible-looking fit would be the sixth.
       FIT=NA; FITF=NA; FITE=NA
 
-      # ---- BLOCKS ------------------------------------------------------------------------------
-      # Truth alleles per block come from projecting the TRUTH pair on the FULL panel. Allele indices
-      # are only meaningful within one catalogue, so the two tables' catalogue hashes are compared
-      # before any index is read across them. Spelling across a mismatch is silent.
-      # ---- BLOCKS, projected from the WALK -----------------------------------------------------
-      # NOT via --force-haplotypes: that ADDS to the shortlist rather than restricting it, so
-      # forcing HG00731/HG03248 at c4 still returned HG00096 as rank 1 and both "projections" were
-      # the called pair. Every block then compared equal and the table read 11/11 exact for a call
-      # 32732 edits above the floor. lib_block_project.py segments each path's own walk at the
-      # bubble sources and sinks, so it cannot report one pair's alleles under another's name.
-      # `projectable` and `determined` still come from the arm's own call, joined on block index.
-      "$PY" "$HERE/lib_block_project.py" "$GFA" "$PFX.bubbles.csv" "$T1" "$T2" "$C1" "$C2" \
-        > "$AD/proj.tsv" 2>"$AD/proj.err"
-      if [ ! -s "$AD/proj.tsv" ]; then
-        say "REFUSE $LOCUS/$DONOR/$ARM: block projection failed ($(head -1 "$AD/proj.err"))"
-        fails=$((fails+1)); continue
-      fi
+      # ---- BLOCKS, from the binary's authoritative projection ------------------------------------
+      # $AD/cat.path_blocks.tsv comes from the SAME --dump-scored-sequences run that produced the
+      # candidate catalogue, with this arm's exclusion already applied. So truth arrives as group
+      # held_out, the called pair as group panel, and both are projected against the reduced calling
+      # catalogue. No second invocation, and no second projector.
+      #
+      # The previous implementation used a Python projector that assumed source->sink order in walk
+      # coordinates and returned ABSENT for every block of every ANTIPARALLEL path -- 60 of 131 at
+      # c4, 59 of 127 at cyp2d6. HG00096 is forward at both loci, which is the only reason the first
+      # validated donor looked right. Comparison is on block_md5, which is emitted in
+      # reference/block orientation and so is directly comparable across a forward and a reverse
+      # path; canonical_md5 exists for identity across whole-path orientation and is not used here.
       NB=""; NPROJ=""; NDET=""; NEX=""; NWR=""
-      "$PY" - "$AD/proj.tsv" "$AD/call.hap_blocks.tsv" "$COMMIT" "$LOCUS" "$DONOR" "$ARM" \
-             "${EQS:-1}" "$T1" "$T2" "$C1" "$C2" >> "$BLOCKS" 2>"$AD/bstat.txt" <<'PY'
-import sys
-proj,armcall,commit,locus,donor,arm,eqs,t1,t2,c1,c2=sys.argv[1:12]
-P={}
-for l in open(proj):
+      "$PY" - "$AD/cat.path_blocks.tsv" "$AD/cat.path_blocks.fa" "$AD/call.hap_blocks.tsv" \
+             "$COMMIT" "$LOCUS" "$DONOR" "$ARM" "${EQS:-1}" "$T1" "$T2" "$C1" "$C2" \
+             >> "$BLOCKS" 2>"$AD/bstat.txt" <<'PY'
+import sys, hashlib
+tsv,fasta,armcall,commit,locus,donor,arm,eqs,t1,t2,c1,c2=sys.argv[1:13]
+want=[t1,t2,c1,c2]
+def die(msg):
+    sys.stderr.write("0 0 0 0 0\n"); raise SystemExit("block projection: "+msg)
+rows={};hdr=None
+for l in open(tsv):
     f=l.rstrip('\n').split('\t')
-    if len(f)<5 or f[1]=='NA': continue
-    P.setdefault(f[0],{})[int(f[1])]=(f[2],f[3],f[4])   # kind, bp, md5
-A={};hdr=None
+    if hdr is None: hdr=f; continue
+    d=dict(zip(hdr,f))
+    # EXACT path name. A substring or prefix match would pick up a different haplotype of the same
+    # sample, and these names share long prefixes.
+    if d['path'] in want: rows.setdefault(d['path'],[]).append(d)
+per={}
+for nm in want:
+    rs=rows.get(nm)
+    if not rs: die("no rows for "+nm)
+    if any(r['projection_status']=='unprojectable' for r in rs): die("unprojectable: "+nm)
+    m={}
+    for r in rs:
+        if r['projection_status']=='unmapped': continue
+        b=int(r['block'])
+        if b in m: die("duplicate row for %s block %d" % (nm,b))
+        m[b]=r
+    if not m: die("no mapped blocks for "+nm)
+    per[nm]=m
+sets=[set(per[nm]) for nm in want]
+if any(s!=sets[0] for s in sets):
+    die("block sets differ between requested paths")
+# FASTA must agree with the TSV: length and md5, per slice. A dump whose two halves disagree is
+# not a dump, and nothing downstream would notice.
+seqs={};h=None;buf=[]
+for l in open(fasta):
+    if l[0]=='>':
+        if h: seqs[h]=''.join(buf)
+        p=l[1:].rstrip('\n').split()
+        h=(p[0], int([x for x in p if x.startswith('block=')][0][6:])); buf=[]
+    else: buf.append(l.strip())
+if h: seqs[h]=''.join(buf)
+for nm in want:
+    for b,r in per[nm].items():
+        s=seqs.get((nm,b))
+        if s is None: die("no FASTA record for %s block %d" % (nm,b))
+        if len(s)!=int(r['block_bp']): die("FASTA length disagrees with TSV at %s block %d" % (nm,b))
+        if hashlib.md5(s.encode()).hexdigest()!=r['block_md5']:
+            die("FASTA md5 disagrees with TSV at %s block %d" % (nm,b))
+A={};ah=None
 for l in open(armcall):
     if l.startswith('#'): continue
     f=l.rstrip('\n').split('\t')
-    if hdr is None: hdr=f; continue
-    d=dict(zip(hdr,f)); A[int(d['block'])]=d
-for nm in (t1,t2,c1,c2):
-    if nm not in P:
-        sys.stderr.write("0 0 0 0 0\n"); raise SystemExit("no projection for "+nm)
-blocks=sorted(set(P[t1]) & set(P[t2]) & set(P[c1]) & set(P[c2]))
-if not blocks:
-    sys.stderr.write("0 0 0 0 0\n"); raise SystemExit("no common blocks")
+    if ah is None: ah=f; continue
+    d=dict(zip(ah,f)); A[int(d['block'])]=d
 nb=nproj=ndet=nex=nwr=0
-for b in blocks:
+for b in sorted(sets[0]):
     a=A.get(b,{})
-    kind=P[t1][b][0]
-    tset={P[t1][b][2],P[t2][b][2]}; cset={P[c1][b][2],P[c2][b][2]}
-    absent = 'ABSENT' in (P[t1][b][1],P[t2][b][1],P[c1][b][1],P[c2][b][1])
+    r1,r2,q1,q2=(per[t1][b],per[t2][b],per[c1][b],per[c2][b])
+    # A RETAINED path must have index and representability agreeing. A HELD-OUT path may legitimately
+    # be unrepresentable -- that is the interesting state, not an error.
+    for r in (q1,q2):
+        if (r['catalogue_allele']=='NA') != (r['catalogue_representable']=='0'):
+            die("called path block %d: index and representability disagree" % b)
     nb+=1
     pj=a.get('projectable',''); dt=a.get('determined','')
     if pj=='yes': nproj+=1
     if dt=='1': ndet+=1
-    if absent:      st='ABSENT'
-    elif tset==cset: st='PASS'; nex+=1
-    else:            st='WRONG'; nwr+=1
-    sys.stdout.write('\t'.join([commit,locus,donor,arm,str(b),kind,a.get('bubble_id',''),
-        a.get('n_alleles',''),P[t1][b][2][:8],P[t2][b][2][:8],P[c1][b][2][:8],P[c2][b][2][:8],
+    tset={r1['block_md5'],r2['block_md5']}; cset={q1['block_md5'],q2['block_md5']}
+    st='PASS' if tset==cset else 'WRONG'
+    if st=='PASS': nex+=1
+    else: nwr+=1
+    sys.stdout.write('\t'.join([commit,locus,donor,arm,str(b),
+        a.get('kind',r1.get('kind','')),r1.get('bubble_id',''),a.get('n_alleles',''),
+        r1['block_md5'][:8],r2['block_md5'][:8],q1['block_md5'][:8],q2['block_md5'][:8],
         pj,dt,eqs,st])+'\n')
 sys.stderr.write("%d %d %d %d %d\n" % (nb,nproj,ndet,nex,nwr))
 PY
-      read -r NB NPROJ NDET NEX NWR <<<"$(cat "$AD/bstat.txt" 2>/dev/null)"
+      if [ ! -s "$AD/bstat.txt" ]; then
+        say "REFUSE $LOCUS/$DONOR/$ARM: block projection produced no status"; fails=$((fails+1)); continue
+      fi
+      read -r NB NPROJ NDET NEX NWR <<<"$(head -1 "$AD/bstat.txt")"
+      # An aborted projection writes 0 0 0 0 0 and a reason. It must REFUSE the donor, not leave the
+      # block columns blank and carry on -- a run row with no blocks would still be averaged.
+      if [ "${NB:-0}" = 0 ]; then
+        say "REFUSE $LOCUS/$DONOR/$ARM: $(tail -1 "$AD/bstat.txt")"; fails=$((fails+1)); continue
+      fi
 
       printf '%s\t%s\t%s\t%s\t%s\tsim\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\texact(band=%s)\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tOK\n' \
         "$COMMIT" "$BIN_MD5" "$LOCUS" "$DONOR" "$ARM" "$SEED" "$NPAIRS" \
