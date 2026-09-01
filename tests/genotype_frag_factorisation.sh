@@ -1,11 +1,29 @@
 #!/usr/bin/env bash
-# genotype_frag_factorisation.sh - KNOWN FAILURE. BLOCKS PLAN STEP B.
+# genotype_frag_factorisation.sh - PERMANENT NEGATIVE RESULT. Retained as evidence, not as a gate.
 #
 #   genotype_frag_factorisation.sh <panvar-binary> <out-dir>
 #
-# NOT registered in CMakeLists, deliberately. It does not pass, and it must not be dressed up as an
-# expected failure: WILL_FAIL would hide a crash and would have to be unpicked the moment the model
-# is fixed. Run it by hand; B stays disabled until it becomes a normal passing gate.
+# THIS IS NOT A TODO. Recruitment-based cropping is DISPROVED, and this script is the disproof. It
+# is expected to fail forever, because the model it measures is wrong -- not because the model is
+# unfinished. Do not "fix" it, do not register it, and do not wait on it.
+#
+# It also no longer gates plan step B. That was the wrong condition: it made B wait on a model we
+# had already abandoned. The replacement condition is
+#
+#     the ACCELERATED scope-based model must reproduce the exact origin oracle
+#     (tests/genotype_frag_origin_scope.sh) within a declared DIPLOID likelihood bound
+#
+# which is a statement about the estimator that will actually ship, not about the one this script
+# refutes. Scope-based restriction already reconciles to the whole-locus reference at residual
+# 0.000000000 on the fixture where the recruitment cropping measured below spreads by 126.98 nats.
+#
+# NOT registered in CMakeLists, deliberately -- a permanent failure must not be dressed up as an
+# expected one: WILL_FAIL would hide a crash and would assert that failing is correct behaviour for
+# a script whose whole value is the number it prints. Run it by hand when the 126.98 needs citing.
+#
+# WHY IT IS KEPT. The measurement below is the reason the scope-based oracle exists and the reason
+# scope is defined by a counterfactual on the full per-fragment contribution rather than by
+# recruitment label. Deleting the script would leave that design decision unsupported.
 #
 # WHAT IT ASKS. The exact oracle is exact per factor -- reference_factor_loglik equals
 # reference_pair_loglik on the same sequences and fragments, asserted in the registered suite. That
@@ -186,5 +204,7 @@ echo "EXPECTED: spread 0 (a candidate-independent constant). OBSERVED: max sprea
 echo "cAD/cCB and cAB/cCD hold identical alleles and lengths, so exposure is identical;"
 echo "the phase-dependent term is placement mass cropped by the factor's context."
 echo
-echo "KNOWN FAILURE. Plan step B stays disabled until this is a passing gate."
+echo "PERMANENT NEGATIVE RESULT -- recruitment-based cropping is disproved, not unfinished."
+echo "This does NOT gate plan step B. B's condition is that the accelerated scope-based model"
+echo "reproduce tests/genotype_frag_origin_scope.sh within a declared DIPLOID likelihood bound."
 exit 1
