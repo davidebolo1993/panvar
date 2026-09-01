@@ -257,6 +257,44 @@ std::vector<std::string> split_commas(const std::string& text) {
 
 } // namespace
 
+namespace {
+// THE target list, built once. The oracle previously built its own and ignored --blocks, so it could
+// score a different chain from the one production and the incidence table use -- and then "adjacent
+// target" means two different things in two places.
+std::vector<std::size_t> build_targets(const std::vector<Block>& chain,
+                                       const std::string& blocks_arg,
+                                       bool all_blocks) {
+    std::vector<std::size_t> targets;
+    if (!blocks_arg.empty()) {
+        for (const std::string& tok : split_commas(blocks_arg)) {
+            const std::size_t bi = cli::parse_size_arg("--blocks", tok);
+            if (bi >= chain.size()) {
+                throw std::runtime_error("genotype-frag: --blocks " + tok + " is past the chain (" +
+                                         std::to_string(chain.size()) + " blocks)");
+            }
+            // CHAIN ORDER IS PART OF THE CONTRACT, not a convention. classify_fragment_factors and
+            // chain_span_sequence both index by RANK and derive adjacency from it, so an unsorted or
+            // duplicated list silently redefines what "adjacent target" means. Rejected rather than
+            // sorted: reordering what was asked for would hide the mistake instead of naming it.
+            if (!targets.empty() && bi <= targets.back()) {
+                throw std::runtime_error(
+                    "genotype-frag: --blocks must be strictly increasing in chain order; got " +
+                    std::to_string(bi) + " after " + std::to_string(targets.back()) +
+                    ". Adjacency between targets is derived from this order, so an unsorted or "
+                    "duplicated list would change which fragments count as boundary-spanning.");
+            }
+            targets.push_back(bi);
+        }
+    } else {
+        for (std::size_t bi = 0; bi < chain.size(); ++bi) {
+            if (all_blocks || chain[bi].kind == BlockKind::Bubble) targets.push_back(bi);
+        }
+    }
+    if (targets.empty()) throw std::runtime_error("genotype-frag: no blocks selected");
+    return targets;
+}
+} // namespace
+
 int run_genotype_frag_command(const std::vector<std::string>& args) {
     if (args.empty()) { print_help(); return 0; }
 
@@ -302,11 +340,13 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                                              reference_pair.push_back(value(i, a)); }
         else if (a == "--reference-all-fragments") ref_subset = "all";
         else if (a == "--reference-block") {
-            // <block> <allele_a> <allele_b> -- the exact LOCAL oracle for one block.
+            // <target_index> <allele_a> <allele_b> -- the exact LOCAL oracle for one target.
+            // target_index is a RANK into the scored-block list (bubbles only unless --all-blocks),
+            // not a raw block index: targets 0 and 1 are typically raw blocks 1 and 3.
             for (int q = 0; q < 3; ++q) ref_block.push_back(value(i, a));
         }
         else if (a == "--reference-block-pair") {
-            // <block> <a1> <b1> <a2> <b2> -- the exact oracle over two ADJACENT blocks. Its
+            // <target_index> <a1> <b1> <a2> <b2> -- the exact oracle over two ADJACENT TARGETS. Its
             // difference from the two unary scores is what a transition factor is worth.
             for (int q = 0; q < 5; ++q) ref_block_pair.push_back(value(i, a));
         }
@@ -829,79 +869,87 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         rp.fragment_sd = opt.fragment_sd;
         rp.bg_divergence = opt.bg_divergence;
 
-        // Built exactly as the block-local recruiter builds it: syncmer code -> the targets whose
-        // alleles or flanks contain it, then per fragment count HITS per target and keep those
-        // reaching min_recruit_hits. An approximation of this rule here would classify fragments
-        // differently from the incidence table, and the two must agree or the factors are not the
-        // factors the table describes.
-        std::vector<std::size_t> targets;
-        for (std::size_t bi = 0; bi < chain.size(); ++bi) {
-            if (all_blocks || chain[bi].kind == BlockKind::Bubble) targets.push_back(bi);
-        }
-        const std::size_t rk = opt.kmer_size;
-        const std::size_t rs = opt.syncmer_s != 0 ? opt.syncmer_s : default_syncmer_s(rk);
-        std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> recruit;
-        for (std::size_t ti = 0; ti < targets.size(); ++ti) {
-            std::vector<std::uint64_t> codes;
-            const BlockAlleles& b = blocks[targets[ti]];
-            const auto add = [&](const std::string& seq) {
-                for (const KmerOccurrence& o : collect_syncmers(seq, rk, rs)) codes.push_back(o.code);
-            };
-            for (const std::string& a : b.allele_seq) add(a);
-            add(chain_left_flank(blocks, targets[ti], opt.flank_bp));
-            add(chain_right_flank(blocks, targets[ti], opt.flank_bp));
-            std::sort(codes.begin(), codes.end());
-            codes.erase(std::unique(codes.begin(), codes.end()), codes.end());
-            for (const std::uint64_t c : codes) recruit[c].push_back(static_cast<std::uint32_t>(ti));
-        }
-        const auto recruited_targets = [&](const Fragment& F) {
-            std::unordered_map<std::uint32_t, std::uint32_t> hits;
-            const auto scan = [&](const std::string& r) {
-                for (const KmerOccurrence& o : collect_syncmers(r, rk, rs)) {
-                    const auto it = recruit.find(o.code);
-                    if (it == recruit.end()) continue;
-                    for (const std::uint32_t t : it->second) ++hits[t];
-                }
-            };
-            scan(F.r1); scan(F.r2);
-            std::vector<std::size_t> hit;
-            for (const auto& [t, n] : hits) if (n >= opt.min_recruit_hits) hit.push_back(t);
-            std::sort(hit.begin(), hit.end());
-            return hit;
-        };
+        // ONE classifier, shared with the production recruiter and the incidence dump. Rebuilding
+        // the rule here is how a previous version selected zero boundary fragments where the real
+        // rule selects 177.
+        const std::vector<std::size_t> targets = build_targets(chain, blocks_arg, all_blocks);
+        const FragmentFactorIncidence inc =
+            classify_fragment_factors(blocks, targets, rf_all, opt.kmer_size, opt.syncmer_s,
+                                      opt.flank_bp, opt.min_recruit_hits);
 
         if (!ref_block.empty()) {
             const std::size_t t = static_cast<std::size_t>(std::stoul(ref_block[0]));
+            if (t >= targets.size()) {
+                throw std::runtime_error("genotype-frag: --reference-block takes a TARGET INDEX (a "
+                    "rank into the scored-block list), not a raw block index; there are " +
+                    std::to_string(targets.size()) + " targets");
+            }
             const int aa = std::stoi(ref_block[1]), ab = std::stoi(ref_block[2]);
             const std::string ca = chain_span_sequence(blocks, targets, t, t, {aa}, opt.flank_bp);
             const std::string cb = chain_span_sequence(blocks, targets, t, t, {ab}, opt.flank_bp);
             std::vector<Fragment> sel;
-            for (const Fragment& F : rf_all) {
-                const auto h = recruited_targets(F);
-                if (h.size() == 1 && h[0] == t) sel.push_back(F);   // LOCAL to this target only
+            for (std::size_t fi = 0; fi < rf_all.size(); ++fi) {
+                if (inc.factor_of[fi] == FragmentFactor::Local &&
+                    inc.targets_of[fi].front() == t) sel.push_back(rf_all[fi]);
             }
             if (!ref_subset.empty()) sel = rf_all;                  // --reference-all-fragments
             std::fprintf(stderr, "[reference-block] %zu of %zu fragments are local to target %zu\n",
                          sel.size(), rf_all.size(), t);
-            std::printf("%.17g\n", reference_factor_loglik(ca, cb, sel, rp));
+            // Per-fragment mass, so the factor score can be DIFFERENCED against the whole-locus one
+            // fragment by fragment. A total tells you the factorisation is wrong; only the
+            // per-fragment split says which fragments carry it and how they were classified.
+            std::vector<double> fm, fc;
+            const double v = reference_pair_loglik(ca, cb, sel, rp,
+                                                   opt.incidence_path.empty() ? nullptr : &fm,
+                                                   opt.incidence_path.empty() ? nullptr : &fc);
+            if (!opt.incidence_path.empty()) {
+                std::ofstream mf(opt.incidence_path);
+                mf.precision(17);
+                mf << "fragment\tfactor\ttarget\tlog_mass\tcontrib\n";
+                for (std::size_t q = 0; q < sel.size(); ++q) {
+                    mf << sel[q].name << "\tlocal\t" << t << '\t'
+                       << (q < fm.size() ? fm[q] : 0.0) << '\t'
+                       << (q < fc.size() ? fc[q] : 0.0) << '\n';
+                }
+            }
+            std::printf("%.17g\n", v);
         }
         if (!ref_block_pair.empty()) {
             const std::size_t t = static_cast<std::size_t>(std::stoul(ref_block_pair[0]));
+            if (t + 1 >= targets.size()) {
+                throw std::runtime_error("genotype-frag: --reference-block-pair takes a TARGET INDEX "
+                    "and needs a following target; there are " + std::to_string(targets.size()) +
+                    " targets");
+            }
             const int a1 = std::stoi(ref_block_pair[1]), b1 = std::stoi(ref_block_pair[2]);
             const int a2 = std::stoi(ref_block_pair[3]), b2 = std::stoi(ref_block_pair[4]);
             const std::string c1 = chain_span_sequence(blocks, targets, t, t + 1, {a1, b1}, opt.flank_bp);
             const std::string c2 = chain_span_sequence(blocks, targets, t, t + 1, {a2, b2}, opt.flank_bp);
             std::vector<Fragment> sel;
-            for (const Fragment& F : rf_all) {
-                const auto h = recruited_targets(F);
-                // BOUNDARY: recruited to exactly these two adjacent targets and no others.
-                if (h.size() == 2 && h[0] == t && h[1] == t + 1) sel.push_back(F);
+            for (std::size_t fi = 0; fi < rf_all.size(); ++fi) {
+                if (inc.factor_of[fi] == FragmentFactor::Boundary &&
+                    inc.targets_of[fi].front() == t &&
+                    inc.targets_of[fi].back() == t + 1) sel.push_back(rf_all[fi]);
             }
             if (!ref_subset.empty()) sel = rf_all;
             std::fprintf(stderr,
                          "[reference-block-pair] %zu of %zu fragments span targets %zu/%zu\n",
                          sel.size(), rf_all.size(), t, t + 1);
-            std::printf("%.17g\n", reference_factor_loglik(c1, c2, sel, rp));
+            std::vector<double> fm, fc;
+            const double v = reference_pair_loglik(c1, c2, sel, rp,
+                                                   opt.incidence_path.empty() ? nullptr : &fm,
+                                                   opt.incidence_path.empty() ? nullptr : &fc);
+            if (!opt.incidence_path.empty()) {
+                std::ofstream mf(opt.incidence_path);
+                mf.precision(17);
+                mf << "fragment\tfactor\ttarget\tlog_mass\tcontrib\n";
+                for (std::size_t q = 0; q < sel.size(); ++q) {
+                    mf << sel[q].name << "\tboundary\t" << t << '\t'
+                       << (q < fm.size() ? fm[q] : 0.0) << '\t'
+                       << (q < fc.size() ? fc[q] : 0.0) << '\n';
+                }
+            }
+            std::printf("%.17g\n", v);
         }
         log.done();
         return 0;
@@ -1318,22 +1366,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     }
 
     // ---- which blocks ------------------------------------------------------------------------
-    std::vector<std::size_t> targets;
-    if (!blocks_arg.empty()) {
-        for (const std::string& tok : split_commas(blocks_arg)) {
-            const std::size_t bi = cli::parse_size_arg("--blocks", tok);
-            if (bi >= chain.size()) {
-                throw std::runtime_error("genotype-frag: --blocks " + tok + " is past the chain (" +
-                                         std::to_string(chain.size()) + " blocks)");
-            }
-            targets.push_back(bi);
-        }
-    } else {
-        for (std::size_t bi = 0; bi < chain.size(); ++bi) {
-            if (all_blocks || chain[bi].kind == BlockKind::Bubble) targets.push_back(bi);
-        }
-    }
-    if (targets.empty()) throw std::runtime_error("genotype-frag: no blocks selected");
+    const std::vector<std::size_t> targets = build_targets(chain, blocks_arg, all_blocks);
 
     FragmentLoadStats fstats;
     const std::vector<Fragment> fragments = load_fragments(read_paths, &fstats);

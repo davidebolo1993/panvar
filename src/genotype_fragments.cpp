@@ -289,50 +289,14 @@ std::vector<BlockFragmentResult> genotype_fragments(
         tg[t].rf = right_flank(blocks, targets[t], options.flank_bp);
     }
 
-    // ---- recruitment index: syncmer code -> which target blocks can explain it ----------------
-    // A fragment is NOT forced onto one block. At cyp2d6 the same syncmer occurs in blocks 3 and 5,
-    // and the marker model's answer to that is to delete the marker (over-expected) or the read's
-    // contribution to it (confinement). Here the fragment is offered to both blocks and its
-    // alignment decides -- because a fragment carrying a shared syncmer usually also carries a
-    // block-specific one, and it is that co-occurrence, not a filter, that localises the evidence.
-    std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> recruit;
-    recruit.reserve(1u << 20);
-    {
-        std::vector<std::uint64_t> codes;
-        for (std::size_t t = 0; t < tg.size(); ++t) {
-            codes.clear();
-            const BlockAlleles& b = blocks[tg[t].block];
-            const auto add = [&](const std::string& seq) {
-                for (const KmerOccurrence& o : collect_syncmers(seq, k, s)) codes.push_back(o.code);
-            };
-            for (const std::string& a : b.allele_seq) add(a);
-            add(tg[t].lf);
-            add(tg[t].rf);
-            std::sort(codes.begin(), codes.end());
-            codes.erase(std::unique(codes.begin(), codes.end()), codes.end());
-            for (const std::uint64_t c : codes) recruit[c].push_back(static_cast<std::uint32_t>(t));
-        }
-    }
-
-    std::vector<std::vector<std::uint32_t>> recruited(tg.size());
-    {
-        std::unordered_map<std::uint32_t, std::uint32_t> hits;
-        for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
-            hits.clear();
-            const auto scan = [&](const std::string& r) {
-                for (const KmerOccurrence& o : collect_syncmers(r, k, s)) {
-                    const auto it = recruit.find(o.code);
-                    if (it == recruit.end()) continue;
-                    for (const std::uint32_t t : it->second) ++hits[t];
-                }
-            };
-            scan(fragments[fi].r1);
-            scan(fragments[fi].r2);
-            for (const auto& [t, n] : hits) {
-                if (n >= options.min_recruit_hits) recruited[t].push_back(static_cast<std::uint32_t>(fi));
-            }
-        }
-    }
+    // ---- recruitment, and the factor each fragment belongs to ---------------------------------
+    // ONE implementation, shared with the reference oracle and the incidence dump. A fragment is NOT
+    // forced onto one block: at cyp2d6 the same syncmer occurs in blocks 3 and 5, and the fragment is
+    // offered to both so its alignment can decide.
+    const FragmentFactorIncidence incidence =
+        classify_fragment_factors(blocks, targets, fragments, k, s, options.flank_bp,
+                                  options.min_recruit_hits);
+    const std::vector<std::vector<std::uint32_t>>& recruited = incidence.recruited;
 
     // ---- fragment -> factor incidence ---------------------------------------------------------
     // Recruitment offers a fragment to every block that could explain it, so the sets below are the
@@ -348,51 +312,26 @@ std::vector<BlockFragmentResult> genotype_fragments(
     //
     // Emitted so the "exactly once" invariant is checkable: one row per fragment, always.
     if (!options.incidence_path.empty()) {
-        // ADJACENCY IS ON THE TARGET CHAIN, NOT ON RAW BLOCK INDICES. By default only bubble blocks
-        // are targets, so consecutive targets are blocks 1,3,5,... and their indices differ by two.
-        // Classifying on raw indices makes "boundary" unreachable and silently reports every
-        // boundary-spanning fragment as "ambiguous" -- measured at LPA, where block sets 15,17 and
-        // 9,11 are adjacent BUBBLES and were being called ambiguous.
-        std::vector<std::size_t> ordered;
-        for (std::size_t t = 0; t < tg.size(); ++t) ordered.push_back(tg[t].block);
-        std::sort(ordered.begin(), ordered.end());
-        ordered.erase(std::unique(ordered.begin(), ordered.end()), ordered.end());
-        std::unordered_map<std::size_t, std::size_t> rank_of;
-        for (std::size_t i = 0; i < ordered.size(); ++i) rank_of[ordered[i]] = i;
-
-        std::vector<std::vector<std::size_t>> per_fragment(fragments.size());
-        for (std::size_t t = 0; t < tg.size(); ++t) {
-            for (const std::uint32_t fi : recruited[t]) per_fragment[fi].push_back(tg[t].block);
-        }
         std::ofstream inc(options.incidence_path);
         if (!inc) throw std::runtime_error("genotype-frag: cannot write " + options.incidence_path);
         inc << "fragment\tn_blocks\tblocks\tfactor\tblock_a\tblock_b\n";
-        for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
-            std::vector<std::size_t>& b = per_fragment[fi];
-            std::sort(b.begin(), b.end());
-            b.erase(std::unique(b.begin(), b.end()), b.end());
-            const char* factor = "unrecruited";
-            std::string ba = ".", bb = ".";
-            if (b.size() == 1) {
-                factor = "local"; ba = std::to_string(b[0]);
-            } else if (b.size() > 1) {
-                std::vector<std::size_t> r;
-                r.reserve(b.size());
-                for (const std::size_t x : b) r.push_back(rank_of[x]);
-                std::sort(r.begin(), r.end());
-                const bool consecutive = (r.back() - r.front() + 1) == r.size();
-                if (consecutive && b.size() == 2) {
-                    factor = "boundary"; ba = std::to_string(b[0]); bb = std::to_string(b[1]);
-                } else if (consecutive) {
-                    factor = "path"; ba = std::to_string(b.front()); bb = std::to_string(b.back());
-                } else {
-                    factor = "ambiguous"; ba = std::to_string(b.front()); bb = std::to_string(b.back());
-                }
+        const auto name_of = [](FragmentFactor f) {
+            switch (f) {
+                case FragmentFactor::Local:     return "local";
+                case FragmentFactor::Boundary:  return "boundary";
+                case FragmentFactor::Path:      return "path";
+                case FragmentFactor::Ambiguous: return "ambiguous";
+                default:                        return "unrecruited";
             }
-            inc << fragments[fi].name << '\t' << b.size() << '\t';
-            for (std::size_t i = 0; i < b.size(); ++i) inc << (i ? "," : "") << b[i];
-            if (b.empty()) inc << '.';
-            inc << '\t' << factor << '\t' << ba << '\t' << bb << '\n';
+        };
+        for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
+            const std::vector<std::uint32_t>& tv = incidence.targets_of[fi];
+            inc << fragments[fi].name << '\t' << tv.size() << '\t';
+            for (std::size_t i = 0; i < tv.size(); ++i) inc << (i ? "," : "") << targets[tv[i]];
+            if (tv.empty()) inc << '.';
+            inc << '\t' << name_of(incidence.factor_of[fi]) << '\t'
+                << (tv.empty() ? std::string(".") : std::to_string(targets[tv.front()])) << '\t'
+                << (tv.size() < 2 ? std::string(".") : std::to_string(targets[tv.back()])) << '\n';
         }
         inc.flush();
         if (!inc) throw std::runtime_error("genotype-frag: write failed for " + options.incidence_path);
@@ -697,6 +636,72 @@ std::vector<BlockFragmentResult> genotype_fragments(
     return out;
 }
 
+FragmentFactorIncidence classify_fragment_factors(const std::vector<BlockAlleles>& blocks,
+                                                  const std::vector<std::size_t>& targets,
+                                                  const std::vector<Fragment>& fragments,
+                                                  std::size_t kmer_size,
+                                                  std::size_t syncmer_s,
+                                                  std::size_t flank_bp,
+                                                  std::size_t min_recruit_hits) {
+    const std::size_t k = kmer_size;
+    const std::size_t s = syncmer_s != 0 ? syncmer_s : default_syncmer_s(k);
+    FragmentFactorIncidence out;
+    out.recruited.assign(targets.size(), {});
+    out.targets_of.assign(fragments.size(), {});
+    out.factor_of.assign(fragments.size(), FragmentFactor::Unrecruited);
+
+    std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> recruit;
+    recruit.reserve(1u << 20);
+    {
+        std::vector<std::uint64_t> codes;
+        for (std::size_t t = 0; t < targets.size(); ++t) {
+            codes.clear();
+            const BlockAlleles& b = blocks[targets[t]];
+            const auto add = [&](const std::string& seq) {
+                for (const KmerOccurrence& o : collect_syncmers(seq, k, s)) codes.push_back(o.code);
+            };
+            for (const std::string& a : b.allele_seq) add(a);
+            add(left_flank(blocks, targets[t], flank_bp));
+            add(right_flank(blocks, targets[t], flank_bp));
+            std::sort(codes.begin(), codes.end());
+            codes.erase(std::unique(codes.begin(), codes.end()), codes.end());
+            for (const std::uint64_t c : codes) recruit[c].push_back(static_cast<std::uint32_t>(t));
+        }
+    }
+    std::unordered_map<std::uint32_t, std::uint32_t> hits;
+    for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
+        hits.clear();
+        const auto scan = [&](const std::string& r) {
+            for (const KmerOccurrence& o : collect_syncmers(r, k, s)) {
+                const auto it = recruit.find(o.code);
+                if (it == recruit.end()) continue;
+                for (const std::uint32_t t : it->second) ++hits[t];
+            }
+        };
+        scan(fragments[fi].r1);
+        scan(fragments[fi].r2);
+        for (const auto& [t, n] : hits) {
+            if (n >= min_recruit_hits) {
+                out.recruited[t].push_back(static_cast<std::uint32_t>(fi));
+                out.targets_of[fi].push_back(t);
+            }
+        }
+        auto& tv = out.targets_of[fi];
+        std::sort(tv.begin(), tv.end());
+        if (tv.empty()) {
+            out.factor_of[fi] = FragmentFactor::Unrecruited;
+        } else if (tv.size() == 1) {
+            out.factor_of[fi] = FragmentFactor::Local;
+        } else {
+            const bool consecutive = (tv.back() - tv.front() + 1) == tv.size();
+            out.factor_of[fi] = !consecutive ? FragmentFactor::Ambiguous
+                              : (tv.size() == 2 ? FragmentFactor::Boundary : FragmentFactor::Path);
+        }
+    }
+    for (auto& v : out.recruited) std::sort(v.begin(), v.end());
+    return out;
+}
+
 std::string chain_left_flank(const std::vector<BlockAlleles>& blocks, std::size_t bi,
                              std::size_t want) {
     return left_flank(blocks, bi, want);
@@ -748,6 +753,18 @@ std::string chain_span_sequence(const std::vector<BlockAlleles>& blocks,
                 out += blocks[bi].allele_seq[static_cast<std::size_t>(a)];
             }
         } else {
+            // An INTERVENING block, between two targets. Taking its majority allele would put a
+            // GUESSED sequence inside a state the caller believes it stated explicitly -- the same
+            // defect as majority-flank guessing, one level in. It is only safe when the block is
+            // invariant, so that is asserted rather than assumed.
+            if (blocks[bi].allele_seq.size() > 1) {
+                throw std::runtime_error(
+                    "genotype-frag: chain_span_sequence: block " + std::to_string(bi) +
+                    " lies between two targets and carries " +
+                    std::to_string(blocks[bi].allele_seq.size()) + " alleles, so its sequence cannot "
+                    "be inferred. Make it an explicit target (--all-blocks) rather than letting the "
+                    "span guess it.");
+            }
             out += majority_allele(blocks[bi]);
         }
     }
@@ -2492,11 +2509,17 @@ HaplotypeResult genotype_haplotype_pairs(
         {
             const double best = pairs.front().score;
             bool agree = true;
+            bool any_inexact = false;   // any member of the equivalence set the decomposition fails
             int fa = -2, fb = -2;
             for (const HaplotypePairScore& p : pairs) {
                 if (best - p.score > options.equivalence_tolerance) break;
+                // EVERY member contributing to the conclusion must be projectable. Checking only the
+                // rank-one pair would declare a block determined on the strength of members whose
+                // per-block alleles cannot be trusted.
+                if (!proj_exact[p.hap1] || !proj_exact[p.hap2]) any_inexact = true;
                 int x = haps[p.hap1].allele[bi], y = haps[p.hap2].allele[bi];
                 if (x > y) std::swap(x, y);
+                if (x < 0 || y < 0) any_inexact = true;
                 if (fa == -2) { fa = x; fb = y; }
                 else if (x != fa || y != fb) { agree = false; break; }
             }
@@ -2504,8 +2527,7 @@ HaplotypeResult genotype_haplotype_pairs(
             // Agreement on -1 is agreement about nothing: the decomposition does not cover this path
             // here, so there is no block genotype to report. Emitting one would be a call the
             // evidence cannot support, which is exactly what the block-level product must not do.
-            P.unprojectable = (fa < 0 || fb < 0) ||
-                              !proj_exact[pairs.front().hap1] || !proj_exact[pairs.front().hap2];
+            P.unprojectable = (fa < 0 || fb < 0) || any_inexact;
             P.determined = agree && !P.unprojectable;
             if (P.determined) ++out.equivalence.blocks_determined;
         }

@@ -823,13 +823,15 @@ for l in open(sys.argv[1]):
         try: d[p[0]]=float(p[1])
         except Exception: pass
 sc=float(open(sys.argv[2]).readlines()[1].split('\t')[3])
-nz=[k for k in ("dosage","coverage_a","coverage_b") if abs(d.get(k,0.0))>1e-12]
-print("%s|%.12f" % (",".join(nz) if nz else "NONE", abs(sc-d.get("total_score",1e18))))
+zero=[k for k in ("dosage","coverage_a","coverage_b") if abs(d.get(k,0.0))<=1e-12]
+print("%s|%.12f" % ("ZERO:"+",".join(zero) if zero else "ALLNONZERO",
+                    abs(sc-d.get("total_score",1e18))))
 PYEOF
 )
   NZ="${RD%%|*}"; RES="${RD##*|}"
-  [ "$NZ" != "NONE" ] && ok "the dosage/coverage arm has nonzero terms ($NZ), so closure is tested there" \
-                      || bad "dosage and coverage are still zero: the reconciliation gate is vacuous"
+  [ "$NZ" = "ALLNONZERO" ] \
+    && ok "dosage, coverage_a and coverage_b are EACH nonzero, so closure is tested on all of them" \
+    || bad "some score components are still zero ($NZ); the reconciliation gate is partly vacuous"
   "$PYTHON_BIN" -c "import sys; sys.exit(0 if float('$RES') < 1e-6 else 1)" 2>/dev/null \
     && ok "dump reconciles exactly with dosage and coverage active (residual $RES)" \
     || bad "dump does not close with dosage/coverage active: residual $RES"
@@ -928,6 +930,33 @@ print('AD' if ad>ab else ('AB' if ab>ad else 'tie'))" 2>/dev/null)
 else
   bad "--reference-block-pair produced nothing"
 fi
+
+# The factorisation question -- does whole-locus == sum(factors) up to a candidate-independent
+# constant -- is NOT asserted here. It currently FAILS, and it is preserved as a standalone
+# diagnostic in tests/genotype_frag_factorisation.sh, labelled KNOWN FAILURE. Registering it as an
+# expected failure would hide a crash and would have to be unpicked when the model is fixed.
+
+# ------------------------------------------ --blocks must be strictly increasing in CHAIN ORDER
+# classify_fragment_factors and chain_span_sequence index by RANK and derive adjacency from it, so
+# an unsorted or duplicated target list silently changes which fragments count as boundary-spanning.
+# Rejected rather than sorted: reordering what was asked for hides the mistake instead of naming it.
+EDEC=$("$BIN" genotype-frag -i "$OUT/g3.gfa" -b "$OUT/bub3" -o "$OUT/ord1" -R "$OUT/reads3.fa" \
+        --blocks 3,1 --incidence "$OUT/ord1.tsv" -t 2 2>&1 >/dev/null)
+case "$EDEC" in
+  *"strictly increasing"*) ok "--blocks rejects a DECREASING target list" ;;
+  *) bad "--blocks 3,1 was accepted (output: ${EDEC:-none})" ;;
+esac
+EDUP=$("$BIN" genotype-frag -i "$OUT/g3.gfa" -b "$OUT/bub3" -o "$OUT/ord2" -R "$OUT/reads3.fa" \
+        --blocks 3,3 --incidence "$OUT/ord2.tsv" -t 2 2>&1 >/dev/null)
+case "$EDUP" in
+  *"strictly increasing"*) ok "--blocks rejects a DUPLICATE target" ;;
+  *) bad "--blocks 3,3 was accepted (output: ${EDUP:-none})" ;;
+esac
+# and the valid form still works, or the two above would pass by rejecting everything
+"$BIN" genotype-frag -i "$OUT/g3.gfa" -b "$OUT/bub3" -o "$OUT/ord3" -R "$OUT/reads3.fa" \
+  --blocks 1,3 --incidence "$OUT/ord3.tsv" -t 2 -q >/dev/null 2>&1
+[ -s "$OUT/ord3.tsv" ] && ok "an increasing target list is still accepted" \
+                      || bad "--blocks 1,3 was rejected too; the check rejects everything"
 
 echo
 if [ "$fails" -eq 0 ]; then echo "genotype-frag stats: all assertions passed"; else

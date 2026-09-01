@@ -1005,6 +1005,40 @@ double reference_factor_loglik(
     const std::vector<Fragment>& fragments,   // the incidence-selected subset for this factor
     const ReferenceParams& params);
 
+// ---------------------------------------------------------------------------------------------
+// FRAGMENT -> FACTOR INCIDENCE, computed ONCE
+//
+// Recruitment offers a fragment to every target whose alleles or flanks share enough syncmers with
+// it. The SHAPE of that target set is what decides which factor the fragment belongs to. Three
+// places need this answer -- the incidence table, the reference oracle, and eventually the block
+// emission -- and a second implementation of the rule classifies fragments differently: an
+// approximation that counted alleles rather than syncmer hits selected ZERO boundary fragments where
+// the real rule selects 177, which would have made a phase gate pass while measuring nothing.
+enum class FragmentFactor {
+    Unrecruited,   // no target: outside the modelled evidence, counted explicitly
+    Local,         // exactly one target -> a unary block emission
+    Boundary,      // two ADJACENT targets -> a transition factor
+    Path,          // more than two consecutive targets -> a higher-order factor
+    Ambiguous,     // non-consecutive targets: shared evidence across repeated blocks
+};
+
+struct FragmentFactorIncidence {
+    std::vector<std::vector<std::uint32_t>> targets_of;  // per fragment, sorted target ranks
+    std::vector<FragmentFactor> factor_of;               // per fragment
+    std::vector<std::vector<std::uint32_t>> recruited;   // per target, the fragment indices
+};
+
+// `targets` are BLOCK indices, in chain order; a fragment's targets_of holds RANKS into that list,
+// so adjacency means adjacent TARGETS (consecutive bubble targets are raw blocks 1 and 3).
+FragmentFactorIncidence classify_fragment_factors(
+    const std::vector<BlockAlleles>& blocks,
+    const std::vector<std::size_t>& targets,
+    const std::vector<Fragment>& fragments,
+    std::size_t kmer_size,
+    std::size_t syncmer_s,
+    std::size_t flank_bp,
+    std::size_t min_recruit_hits);
+
 // The chain's context sequence either side of a block, from majority alleles. Exposed so a caller
 // classifying fragments can build the SAME recruitment index the block-local stage builds -- an
 // approximation of it would classify fragments differently from the incidence table.
