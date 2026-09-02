@@ -99,8 +99,8 @@ cat "$OUT/PROVENANCE.txt"
 [ "$DIRTY" != "0" ] && say "WARNING: $DIRTY tracked source file(s) modified; this baseline is not reproducible from $COMMIT alone"
 
 RUNS="$OUT/runs.tsv"; BLOCKS="$OUT/blocks.tsv"
-printf 'commit\tbinary_md5\tlocus\tdonor\tarm\treads\tseed\tn_read_pairs\tgraph_md5\tbubbles_md5\ttruth_md5\treads_md5\tcatalogue_md5\tshortlist_md5\ttruth1\ttruth2\tpanel_floor\tfloor_pair_survived\tcalled1\tcalled2\tcalled_distance\texcess\tmetric\tequiv_set_size\tfit_per_frag\tfit_frag\tfit_exposure\tn_blocks\tn_projectable\tn_determined\tn_exact\tn_wrong\truntime_s\tpeak_rss_bytes\tstatus\n' > "$RUNS"
-printf 'commit\tlocus\tdonor\tarm\tblock\tkind\tbubble_id\tn_alleles\ttruth_a1\ttruth_a2\tcalled_a1\tcalled_a2\tprojectable\tdetermined\tequiv_set_size\tstatus\n' > "$BLOCKS"
+printf 'commit\tbinary_md5\tlocus\tdonor\tarm\treads\tseed\tn_read_pairs\tgraph_md5\tbubbles_md5\ttruth_md5\treads_md5\tcatalogue_md5\tshortlist_md5\ttruth1\ttruth2\tpanel_floor\tfloor_pair_survived\tcalled1\tcalled2\tcalled_distance\texcess\tmetric\tequiv_set_size\tfit_per_frag\tfit_frag\tfit_exposure\tn_blocks\tn_projectable\tn_determined\tn_exact\tn_wrong\truntime_s\tpeak_rss_bytes\tblock_sum_distance\tblock_sum_residual\tstatus\n' > "$RUNS"
+printf 'commit\tlocus\tdonor\tarm\tblock\tkind\tbubble_id\tn_alleles\ttruth_a1\ttruth_a2\tcalled_a1\tcalled_a2\tprojectable\tdetermined\tblock_equivalence_size\tstatus\tblock_called_distance\tblock_floor\tblock_excess\ttruth_bp\tcalled_bp\tmetric\n' > "$BLOCKS"
 
 # ---- peak RSS, units made explicit ---------------------------------------------------------------
 # Darwin /usr/bin/time -l reports BYTES; GNU time -v reports KILOBYTES. Recording the number without
@@ -420,9 +420,10 @@ sys.exit(0 if t==c else 1)" 2>/dev/null && [ "$CALLED_D" != 0 ]; then
       NB=""; NPROJ=""; NDET=""; NEX=""; NWR=""
       "$PY" - "$AD/cat.path_blocks.tsv" "$AD/cat.path_blocks.fa" "$AD/call.hap_blocks.tsv" \
              "$COMMIT" "$LOCUS" "$DONOR" "$ARM" "${EQS:-1}" "$T1" "$T2" "$C1" "$C2" \
+             "$BIN" "$AD" "$BAND" \
              >> "$BLOCKS" 2>"$AD/bstat.txt" <<'PY'
-import sys, hashlib
-tsv,fasta,armcall,commit,locus,donor,arm,eqs,t1,t2,c1,c2=sys.argv[1:13]
+import sys, hashlib, subprocess, os
+tsv,fasta,armcall,commit,locus,donor,arm,eqs,t1,t2,c1,c2,BIN,AD,band=sys.argv[1:16]
 want=[t1,t2,c1,c2]
 def die(msg):
     sys.stderr.write("0 0 0 0 0\n"); raise SystemExit("block projection: "+msg)
@@ -473,7 +474,62 @@ for l in open(armcall):
     f=l.rstrip('\n').split('\t')
     if ah is None: ah=f; continue
     d=dict(zip(ah,f)); A[int(d['block'])]=d
+# PER-BLOCK EXACT DISTANCE AND FLOOR, under the SAME metric and the same unordered diploid rule as
+# the whole-locus number: min[d(t1,c1)+d(t2,c2), d(t1,c2)+d(t2,c1)].
+#
+# The floor is over PANEL ALLELES at the block, chosen independently per homologue. That is exact
+# rather than a lower bound, because at a single block any two panel alleles are jointly realisable:
+# they are carried by some pair of candidates, and nothing at this level couples them. Linkage
+# between blocks is precisely what the whole-locus floor measures and this one does not -- which is
+# why the two are reported separately and their difference is not an error.
+alleles={}   # block -> {md5: seq} over every PANEL path, from the same dump
+for l in open(tsv):
+    pass
+seqs_all={}
+h=None;buf=[];key=None
+for l in open(fasta):
+    if l[0]=='>':
+        if key: seqs_all[key]=''.join(buf)
+        p=l[1:].rstrip('\n').split()
+        key=(p[0], int([x for x in p if x.startswith('block=')][0][6:])); buf=[]
+    else: buf.append(l.strip())
+if key: seqs_all[key]=''.join(buf)
+grp={}
+hh=None
+for l in open(tsv):
+    f=l.rstrip('\n').split('\t')
+    if hh is None: hh=f; continue
+    d=dict(zip(hh,f))
+    if d['projection_status']!='complete' and d['projection_status']!='partial': continue
+    if d['group']!='panel': continue
+    try: b=int(d['block'])
+    except ValueError: continue
+    sq=seqs_all.get((d['path'],b))
+    if sq is not None: alleles.setdefault(b,{})[d['block_md5']]=sq
+_dcache={}
+def dist(a,b):
+    if a==b: return 0
+    k=(hashlib.md5(a.encode()).hexdigest(),hashlib.md5(b.encode()).hexdigest())
+    if k in _dcache: return _dcache[k]
+    fa=os.path.join(AD,'_da.fa'); fb=os.path.join(AD,'_db.fa')
+    open(fa,'w').write(">a\n"+a+"\n"); open(fb,'w').write(">b\n"+b+"\n")
+    v=None
+    for bd in (band,'16384','65536','262144'):
+        r=subprocess.run([BIN,"genotype-frag","--exact-distance",fa,fb,"--distance-band",bd],
+                         capture_output=True,text=True)
+        t=r.stdout.strip()
+        if t.isdigit(): v=int(t); break
+    _dcache[k]=v
+    return v
+def pair_dist(x1,x2,y1,y2):
+    a=[dist(x1,y1),dist(x2,y2)]; b=[dist(x1,y2),dist(x2,y1)]
+    v=[]
+    if None not in a: v.append(a[0]+a[1])
+    if None not in b: v.append(b[0]+b[1])
+    return min(v) if v else None
+def na(x): return "NA" if x is None else str(x)
 nb=nproj=ndet=nex=nwr=0
+sum_bd=0; sum_ok=True
 for b in sorted(sets[0]):
     a=A.get(b,{})
     r1,r2,q1,q2=(per[t1][b],per[t2][b],per[c1][b],per[c2][b])
@@ -490,29 +546,55 @@ for b in sorted(sets[0]):
     st='PASS' if tset==cset else 'WRONG'
     if st=='PASS': nex+=1
     else: nwr+=1
+    ts1=seqs_all.get((t1,b),''); ts2=seqs_all.get((t2,b),'')
+    cs1=seqs_all.get((c1,b),''); cs2=seqs_all.get((c2,b),'')
+    bd=pair_dist(ts1,ts2,cs1,cs2)
+    # Floor: best panel allele for each truth homologue, independently.
+    cand=list(alleles.get(b,{}).values())
+    if cand:
+        d1=[dist(ts1,x) for x in cand]; d2=[dist(ts2,x) for x in cand]
+        d1=[x for x in d1 if x is not None]; d2=[x for x in d2 if x is not None]
+        bf=(min(d1)+min(d2)) if (d1 and d2) else None
+    else:
+        bf=None
+    bx=None if (bd is None or bf is None) else bd-bf
+    if bd is None: sum_ok=False
+    else: sum_bd+=bd
+    if bx is not None and bx<0:
+        sys.stderr.write("0 0 0 0 0\n")
+        raise SystemExit("block %d: called distance %d below floor %d" % (b,bd,bf))
+    eqb=a.get('block_equivalence_size','NA')
     sys.stdout.write('\t'.join([commit,locus,donor,arm,str(b),
         a.get('kind',r1.get('kind','')),r1.get('bubble_id',''),a.get('n_alleles',''),
         r1['block_md5'][:8],r2['block_md5'][:8],q1['block_md5'][:8],q2['block_md5'][:8],
-        pj,dt,eqs,st])+'\n')
-sys.stderr.write("%d %d %d %d %d\n" % (nb,nproj,ndet,nex,nwr))
+        pj,dt,eqb,st,na(bd),na(bf),na(bx),str(len(ts1))+"/"+str(len(ts2)),
+        str(len(cs1))+"/"+str(len(cs2)),"exact"])+'\n')
+sys.stderr.write("%d %d %d %d %d %s\n" % (nb,nproj,ndet,nex,nwr,
+                 str(sum_bd) if sum_ok else "NA"))
 PY
       if [ ! -s "$AD/bstat.txt" ]; then
         say "REFUSE $LOCUS/$DONOR/$ARM: block projection produced no status"; fails=$((fails+1)); continue
       fi
-      read -r NB NPROJ NDET NEX NWR <<<"$(head -1 "$AD/bstat.txt")"
+      read -r NB NPROJ NDET NEX NWR BSUM <<<"$(head -1 "$AD/bstat.txt")"
       # An aborted projection writes 0 0 0 0 0 and a reason. It must REFUSE the donor, not leave the
       # block columns blank and carry on -- a run row with no blocks would still be averaged.
       if [ "${NB:-0}" = 0 ]; then
         say "REFUSE $LOCUS/$DONOR/$ARM: $(tail -1 "$AD/bstat.txt")"; fails=$((fails+1)); continue
       fi
 
-      printf '%s\t%s\t%s\t%s\t%s\tsim\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\texact(band=%s)\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tOK\n' \
+      # BLOCK-SUM RESIDUAL, reported and NOT enforced. The sum of per-block global alignments need
+      # not equal the whole-locus global alignment: a locus alignment can place gaps across a block
+      # boundary that no per-block alignment is allowed to. A nonzero residual is information about
+      # how much of the distance is boundary-crossing, not a discrepancy to fix. Requiring equality
+      # would be wrong and would fail on every indel spanning a bubble edge.
+      if [ "${BSUM:-NA}" != "NA" ]; then BRESID=$(( CALLED_D - BSUM )); else BRESID=NA; fi
+      printf '%s\t%s\t%s\t%s\t%s\tsim\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\texact(band=%s)\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tOK\n' \
         "$COMMIT" "$BIN_MD5" "$LOCUS" "$DONOR" "$ARM" "$SEED" "$NPAIRS" \
         "$GFA_MD5" "$BUB_MD5" "$TRUTH_MD5" "$READS_MD5" "$CAT_MD5" "${SHORTLIST_MD5:-}" \
         "$T1" "$T2" "$PANEL_FLOOR" "$FSURV" "$C1" "$C2" "$CALLED_D" "$EXCESS" "${USED_BAND:-$BAND}" \
         "${EQS:-}" "$FIT" "$FITF" "$FITE" \
         "${NB:-}" "${NPROJ:-}" "${NDET:-}" "${NEX:-}" "${NWR:-}" \
-        "${RUNTIME:-}" "${PEAK:-}" >> "$RUNS"
+        "${RUNTIME:-}" "${PEAK:-}" "${BSUM:-NA}" "${BRESID:-NA}" >> "$RUNS"
       rows=$((rows+1))
       say "  $LOCUS/$DONOR/$ARM floor=$PANEL_FLOOR called=$CALLED_D excess=$EXCESS blocks=${NEX:-?}/${NB:-?} exact"
     done
