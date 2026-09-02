@@ -170,7 +170,7 @@ say "preflight: every requested locus/donor cell has a complete diploid"
 say ""
 
 RUNS="$OUT/runs.tsv"; BLOCKS="$OUT/blocks.tsv"
-printf 'commit\tbinary_md5\tlocus\tdonor\tarm\treads\tseed\tn_read_pairs\tgraph_md5\tbubbles_md5\ttruth_md5\treads_md5\tcatalogue_md5\tshortlist_md5\ttruth1\ttruth2\tpanel_floor\tfloor_pair_survived\tcalled1\tcalled2\tcalled_distance\texcess\tmetric\tequiv_set_size\tfit_per_frag\tfit_frag\tfit_exposure\tn_blocks\tn_projectable\tn_determined\tn_exact\tn_wrong\truntime_s\tpeak_rss_bytes\tblock_sum_distance\tblock_sum_residual\tstatus\n' > "$RUNS"
+printf 'commit\tbinary_md5\tlocus\tdonor\tarm\treads\tseed\tn_read_pairs\tgraph_md5\tbubbles_md5\ttruth_md5\treads_md5\tcatalogue_md5\tshortlist_md5\ttruth1\ttruth2\tpanel_floor\tfloor_pair_survived\tcalled1\tcalled2\tcalled_distance\texcess\tmetric\tequiv_set_size\tfit_per_frag\tfit_frag\tfit_exposure\tn_blocks\tn_projectable\tn_determined\tn_exact\tn_wrong\truntime_s\tpeak_rss_bytes\tblock_sum_distance\tblock_sum_residual\tirreducible_bp\trecoverable_bp\tstatus\n' > "$RUNS"
 printf 'commit\tlocus\tdonor\tarm\tblock\tkind\tbubble_id\tn_alleles\ttruth_a1\ttruth_a2\tcalled_a1\tcalled_a2\tprojectable\tdetermined\tblock_equivalence_size\tstatus\tblock_called_distance\tblock_floor\tblock_excess\ttruth_bp\tcalled_bp\tmetric\n' > "$BLOCKS"
 
 # ---- peak RSS, units made explicit ---------------------------------------------------------------
@@ -359,10 +359,16 @@ best=[10**9,10**9]; who=[None,None]
 for nm,s in zip(names,seqs):
     open(f"{ad}/c.fa","w").write(">c\n"+orient(nm,s)+"\n")
     for h,t in ((0,t1),(1,t2)):
-        r=subprocess.run([BIN,"genotype-frag","--exact-distance",f"{ad}/c.fa",t,
-                          "--distance-band",band],capture_output=True,text=True)
-        v=r.stdout.strip()
-        if v.isdigit() and int(v)<best[h]: best[h]=int(v); who[h]=nm
+        # ESCALATE, like the called distance does. A floor that refuses at the default band aborts
+        # the whole donor -- ankrd36c/NA19240/LOO was lost that way -- and a candidate outside the
+        # band is not a distant candidate, it is an unmeasured one.
+        v=None
+        for bd in (band,'16384','65536','262144'):
+            r=subprocess.run([BIN,"genotype-frag","--exact-distance",f"{ad}/c.fa",t,
+                              "--distance-band",bd],capture_output=True,text=True)
+            o=r.stdout.strip()
+            if o.isdigit(): v=int(o); break
+        if v is not None and v<best[h]: best[h]=v; who[h]=nm
 if 10**9 in best: print("NOFLOOR")
 else: print("%d\t%s\t%s" % (best[0]+best[1], who[0], who[1]))
 PY
@@ -604,7 +610,7 @@ def pair_dist(x1,x2,y1,y2):
     return min(v) if v else None
 def na(x): return "NA" if x is None else str(x)
 nb=nproj=ndet=nex=nwr=0
-sum_bd=0; sum_ok=True
+sum_bd=0; sum_ok=True; sum_bf=0; sum_bx=0
 for b in sorted(sets[0]):
     a=A.get(b,{})
     r1,r2,q1,q2=(per[t1][b],per[t2][b],per[c1][b],per[c2][b])
@@ -635,6 +641,8 @@ for b in sorted(sets[0]):
     bx=None if (bd is None or bf is None) else bd-bf
     if bd is None: sum_ok=False
     else: sum_bd+=bd
+    if bf is not None: sum_bf+=bf
+    if bx is not None: sum_bx+=bx
     if bx is not None and bx<0:
         sys.stderr.write("0 0 0 0 0\n")
         raise SystemExit("block %d: called distance %d below floor %d" % (b,bd,bf))
@@ -644,13 +652,19 @@ for b in sorted(sets[0]):
         r1['block_md5'][:8],r2['block_md5'][:8],q1['block_md5'][:8],q2['block_md5'][:8],
         pj,dt,eqb,st,na(bd),na(bf),na(bx),str(len(ts1))+"/"+str(len(ts2)),
         str(len(cs1))+"/"+str(len(cs2)),"exact"])+'\n')
-sys.stderr.write("%d %d %d %d %d %s\n" % (nb,nproj,ndet,nex,nwr,
-                 str(sum_bd) if sum_ok else "NA"))
+# THE DECOMPOSITION, PER EDIT AND NOT PER BLOCK. Classifying a whole block by whether its floor is
+# zero assigns the ENTIRE called distance to "unrepresentable" whenever the floor is even 1 edit, so
+# a block whose nearest panel allele is 10 edits away and whose call is 10000 away contributes 10000
+# irreducible instead of 10. That inverted the headline of the first sweep: lpa looked like a 94835
+# edit coverage dead end when it is ~1075 irreducible and ~94k of recoverable headroom.
+#   irreducible = sum(block_floor)      recoverable = sum(block_excess)
+sys.stderr.write("%d %d %d %d %d %s %s %s\n" % (nb,nproj,ndet,nex,nwr,
+                 str(sum_bd) if sum_ok else "NA", str(sum_bf), str(sum_bx)))
 PY
       if [ ! -s "$AD/bstat.txt" ]; then
         say "REFUSE $LOCUS/$DONOR/$ARM: block projection produced no status"; fails=$((fails+1)); continue
       fi
-      read -r NB NPROJ NDET NEX NWR BSUM <<<"$(head -1 "$AD/bstat.txt")"
+      read -r NB NPROJ NDET NEX NWR BSUM BIRR BREC <<<"$(head -1 "$AD/bstat.txt")"
       # An aborted projection writes 0 0 0 0 0 and a reason. It must REFUSE the donor, not leave the
       # block columns blank and carry on -- a run row with no blocks would still be averaged.
       if [ "${NB:-0}" = 0 ]; then
@@ -663,13 +677,13 @@ PY
       # how much of the distance is boundary-crossing, not a discrepancy to fix. Requiring equality
       # would be wrong and would fail on every indel spanning a bubble edge.
       if [ "${BSUM:-NA}" != "NA" ]; then BRESID=$(( CALLED_D - BSUM )); else BRESID=NA; fi
-      printf '%s\t%s\t%s\t%s\t%s\tsim\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\texact(band=%s)\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tOK\n' \
+      printf '%s\t%s\t%s\t%s\t%s\tsim\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\texact(band=%s)\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tOK\n' \
         "$COMMIT" "$BIN_MD5" "$LOCUS" "$DONOR" "$ARM" "$SEED" "$NPAIRS" \
         "$GFA_MD5" "$BUB_MD5" "$TRUTH_MD5" "$READS_MD5" "$CAT_MD5" "${SHORTLIST_MD5:-}" \
         "$T1" "$T2" "$PANEL_FLOOR" "$FSURV" "$C1" "$C2" "$CALLED_D" "$EXCESS" "${USED_BAND:-$BAND}" \
         "${EQS:-}" "$FIT" "$FITF" "$FITE" \
         "${NB:-}" "${NPROJ:-}" "${NDET:-}" "${NEX:-}" "${NWR:-}" \
-        "${RUNTIME:-}" "${PEAK:-}" "${BSUM:-NA}" "${BRESID:-NA}" >> "$RUNS"
+        "${RUNTIME:-}" "${PEAK:-}" "${BSUM:-NA}" "${BRESID:-NA}" "${BIRR:-NA}" "${BREC:-NA}" >> "$RUNS"
       rows=$((rows+1))
       say "  $LOCUS/$DONOR/$ARM floor=$PANEL_FLOOR called=$CALLED_D excess=$EXCESS blocks=${NEX:-?}/${NB:-?} exact"
     done
