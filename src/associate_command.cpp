@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -58,6 +60,64 @@ double parse_num(const std::string& t) {
     } catch (const std::exception&) {
         return kNaN;
     }
+}
+
+// ---- BIMBAM row scanning, without a string per cell -------------------------------------------
+//
+// The genotype matrix is the largest input associate reads, and splitting each row into a
+// vector<string> allocated one std::string per SAMPLE per ROW -- 16.5 million of them for the
+// 2,745-feature, 6,000-sample LPA cohort -- before a single number was parsed. Each was then trimmed
+// (another allocation) and handed to std::stod, which THROWS on a non-numeric cell, so every NA paid
+// for an exception.
+//
+// The line buffer is split in place instead: commas become NULs, so each field is already a C string
+// strtod can read with no copy. strtod is what std::stod calls underneath, so the numeric
+// interpretation is unchanged -- leading whitespace skipped, parsing stops at the first character
+// that cannot continue the number.
+struct BimbamRowScanner {
+    std::vector<char*> fields;   // reused across rows; no per-row allocation once warm
+
+    std::size_t scan(std::string& line) {
+        fields.clear();
+        char* p = line.data();
+        char* const end = p + line.size();
+        fields.push_back(p);
+        for (; p != end; ++p) {
+            if (*p == ',') {
+                *p = '\0';
+                fields.push_back(p + 1);
+            }
+        }
+        *end = '\0';   // std::string guarantees a writable NUL at data()[size()]
+        return fields.size();
+    }
+};
+
+// The NA vocabulary of is_na_token, applied to a NUL-terminated field without copying it. Deliberately
+// kept next to that function: the two must agree, and "-9" meaning MISSING rather than the number -9
+// is the one whose divergence would silently corrupt a result rather than fail.
+bool is_na_field(const char* t) {
+    while (*t != '\0' && std::isspace(static_cast<unsigned char>(*t))) ++t;
+    const char* e = t + std::strlen(t);
+    while (e > t && std::isspace(static_cast<unsigned char>(e[-1]))) --e;
+    const std::size_t n = static_cast<std::size_t>(e - t);
+    if (n == 0) return true;
+    if (n > 4) return false;                    // longer than any NA token
+    char buf[5];
+    for (std::size_t i = 0; i < n; ++i)
+        buf[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(t[i])));
+    buf[n] = '\0';
+    return std::strcmp(buf, "na") == 0 || std::strcmp(buf, "nan") == 0 ||
+           std::strcmp(buf, ".") == 0 || std::strcmp(buf, "-9") == 0 ||
+           std::strcmp(buf, "null") == 0;
+}
+
+// Numeric value of one in-place field. Same result as parse_num on the equivalent std::string.
+double parse_field(const char* t) {
+    if (is_na_field(t)) return kNaN;
+    char* endp = nullptr;
+    const double v = std::strtod(t, &endp);
+    return endp == t ? kNaN : v;   // no conversion at all: what stod would have thrown on
 }
 
 // Two-sided Wald p-value from a z statistic. Computed as the upper tail directly via erfc
@@ -1201,13 +1261,14 @@ int run_associate_command(const std::vector<std::string>& args) {
     GzLineReader gr(opt.genotypes);
     if (!gr.ok()) throw std::runtime_error("cannot open --genotypes: " + opt.genotypes);
     std::string line;
+    BimbamRowScanner scanner;
     while (gr.getline(line)) {
         if (line.empty()) continue;
         // BIMBAM mean genotype: id, A, B, dose1, dose2, ...   (comma-separated, possibly space-padded)
-        std::vector<std::string> f = split(line, ',');
-        if (f.size() < 3 + geno_samples.size()) continue;  // malformed / wrong sample count
+        if (scanner.scan(line) < 3 + geno_samples.size()) continue;  // malformed / wrong sample count
+        const std::vector<char*>& f = scanner.fields;
         ++n_geno_rows;
-        const std::string id = trim(f[0]);
+        const std::string id = trim(std::string(f[0]));
 
         // collect genotype dosage for used samples. GLM/logistic drop NA samples per feature; LMM keeps
         // every used sample (the rotation is over a fixed set) and mean-imputes NA.
@@ -1221,7 +1282,7 @@ int run_associate_command(const std::vector<std::string>& args) {
             for (std::size_t c = 0; c < geno_samples.size(); ++c) {
                 if (col_to_used[c] < 0) continue;
                 const std::size_t u = static_cast<std::size_t>(col_to_used[c]);
-                const double dose = parse_num(f[3 + c]);
+                const double dose = parse_field(f[3 + c]);
                 glmm(static_cast<Eigen::Index>(u)) = dose;
                 if (std::isfinite(dose)) { sum += dose; ++nf; g.push_back(dose); }
             }
@@ -1232,7 +1293,7 @@ int run_associate_command(const std::vector<std::string>& args) {
         } else {
             for (std::size_t c = 0; c < geno_samples.size(); ++c) {
                 if (col_to_used[c] < 0) continue;
-                const double dose = parse_num(f[3 + c]);
+                const double dose = parse_field(f[3 + c]);
                 if (!std::isfinite(dose)) continue;  // genuinely missing (NA = non-traversing)
                 const std::size_t u = static_cast<std::size_t>(col_to_used[c]);
                 g.push_back(dose);
@@ -1342,7 +1403,7 @@ int run_associate_command(const std::vector<std::string>& args) {
                 double sum = 0.0; std::size_t nf = 0;
                 for (std::size_t c = 0; c < geno_samples.size(); ++c) {
                     if (col_to_used[c] < 0) continue;
-                    const double dose = parse_num(f[3 + c]);
+                    const double dose = parse_field(f[3 + c]);
                     if (!std::isfinite(dose)) continue;
                     vd(static_cast<Eigen::Index>(col_to_used[c])) = dose; sum += dose; ++nf;
                 }
@@ -1575,13 +1636,13 @@ int run_associate_command(const std::vector<std::string>& args) {
         // of the lead's variant collapses. Two bounded streaming passes (no feature x sample matrix kept).
         // `obs` records which rows carried a real dosage, so the conditional fit below can use the same
         // complete cases the marginal test used rather than mean-imputed stand-ins.
-        auto parse_full = [&](const std::vector<std::string>& f, Eigen::VectorXd& vd,
+        auto parse_full = [&](const std::vector<char*>& f, Eigen::VectorXd& vd,
                               std::vector<char>* obs = nullptr) -> bool {
             vd = Eigen::VectorXd::Constant(static_cast<Eigen::Index>(n_used), kNaN);
             double sum = 0.0; std::size_t nf = 0;
             for (std::size_t c = 0; c < geno_samples.size(); ++c) {
                 if (col_to_used[c] < 0) continue;
-                const double dose = parse_num(f[3 + c]);
+                const double dose = parse_field(f[3 + c]);
                 if (!std::isfinite(dose)) continue;
                 vd(static_cast<Eigen::Index>(col_to_used[c])) = dose; sum += dose; ++nf;
             }
@@ -1604,21 +1665,23 @@ int run_associate_command(const std::vector<std::string>& args) {
         const std::size_t need_cols = 3 + geno_samples.size();
         Eigen::VectorXd gl;  // pass 1: capture the lead feature's dosage
         std::vector<char> lead_obs;
-        { GzLineReader g2(opt.genotypes); std::string line;
+        { GzLineReader g2(opt.genotypes); std::string line; BimbamRowScanner sc2;
           while (g2.getline(line)) {
               if (line.empty()) continue;
-              std::vector<std::string> f = split(line, ',');
-              if (f.size() < need_cols) continue;
-              if (trim(f[0]) == lead_id) { parse_full(f, gl, &lead_obs); break; }
+              if (sc2.scan(line) < need_cols) continue;
+              if (trim(std::string(sc2.fields[0])) == lead_id) {
+                  parse_full(sc2.fields, gl, &lead_obs);
+                  break;
+              }
           } }
         if (gl.size() == static_cast<Eigen::Index>(n_used)) {
             const std::size_t pc = p_dim + 1;  // intercept, g_i, covariates, g_lead
-            GzLineReader g3(opt.genotypes); std::string line;
+            GzLineReader g3(opt.genotypes); std::string line; BimbamRowScanner sc3;
             while (g3.getline(line)) {
                 if (line.empty()) continue;
-                std::vector<std::string> f = split(line, ',');
-                if (f.size() < need_cols) continue;
-                const auto it = id_to_row.find(trim(f[0]));
+                if (sc3.scan(line) < need_cols) continue;
+                const std::vector<char*>& f = sc3.fields;
+                const auto it = id_to_row.find(trim(std::string(f[0])));
                 if (it == id_to_row.end()) continue;
                 const std::size_t i = it->second;
                 if (i == lead_idx) { cond_role[i] = "lead"; continue; }
