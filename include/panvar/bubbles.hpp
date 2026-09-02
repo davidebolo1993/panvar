@@ -81,6 +81,9 @@ struct BubbleCallOptions {
     // Optional merge of nearby bubbles on graph distance (bp) between sink/source boundaries.
     // 0 disables merging.
     std::size_t merge_nearby_bp = 0;
+    // Worker threads for the per-bubble scoring loop (0 = hardware concurrency). Output is identical
+    // regardless of thread count: each bubble writes only its own record.
+    std::size_t threads = 0;
     // Suppress the stderr progress bar (output files are unaffected).
     bool quiet = false;
 };

@@ -1709,6 +1709,9 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
         // panphorte could disappear from the call-ready CSV with nothing said. The threshold is an
         // option now, and any input bubble missing afterwards is reported.
         bopts.min_variant_bp = options.resnarl_min_variant_bp;
+        // The re-snarl is the dominant cost of a panphorte run; it gets the same worker count the
+        // rest of the module was given rather than silently defaulting to every core.
+        bopts.threads = options.threads;
         bopts.snarl_pairs_override = find_top_level_snarls_cactus(snarl_input_from_model(model));
     bopts.snarl_source_supplied = true;
         bopts.quiet = options.quiet;
@@ -1716,7 +1719,9 @@ void panphorte_normalize(const PanphorteOptions& options, PanphorteSummary* summ
         ParseGfaOptions parse_options;
         parse_options.include_paths = true;
         parse_options.include_sequences = true;
-        const Graph sorted_graph = parse_gfa(sorted_gfa, parse_options);
+        // From the model, not by re-reading the file written above: same graph, one fewer full
+        // serialise-and-parse of the normalized graph (gfa_io.hpp states the equivalence).
+        const Graph sorted_graph = graph_from_model(model, parse_options);
         const BubbleCallReport report = call_bubbles_report(sorted_graph, bopts);
         write_bubbles_csv(staged.stage(options.out_prefix + ".bubbles.csv"), report.bubbles);
         // Bubble ids are REASSIGNED by the re-snarl, so comparing input ids against output ids says

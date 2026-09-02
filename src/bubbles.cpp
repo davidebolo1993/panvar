@@ -3,6 +3,7 @@
 #include "panvar/bubble_path.hpp"
 
 #include "panvar/cli_utils.hpp"
+#include "panvar/parallel.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -12,6 +13,7 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <queue>
 #include <stdexcept>
@@ -66,7 +68,11 @@ using PathIndex = BubblePathIndex;
 // How many endpoint pairs fell back from the graph-derived interior to the path-derived one because
 // the handle traversal hit its cap. The fallback is a silent downgrade of a stated contract -- the
 // interior stops being "what the graph carries between the boundaries" and becomes "what this panel
-// happened to walk" -- so the run must say when it happened. Atomic because discovery is threaded.
+// happened to walk" -- so the run must say when it happened.
+//
+// Atomic, although both writers (candidate discovery and merging) are serial: it is file-scope mutable
+// state in a translation unit that now runs a parallel loop, and the atomic costs nothing against
+// being wrong later. The comment here used to claim discovery was threaded, which it never was.
 std::atomic<std::size_t> g_interior_traversal_truncated{0};
 
 // Defined below, next to the rest of the interior machinery; declared here because merging needs to
@@ -881,7 +887,13 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
     const auto compute_bubble_metrics = [&](std::vector<Bubble>& target, const char* progress_label) {
         // An empty label suppresses the bar (honors --quiet).
         cli::ProgressBar progress(options.quiet ? "" : progress_label, target.size());
-        for (auto& bubble : target) {
+        // Each iteration writes only its own Bubble and reads the graph, the path indexes and the
+        // options, all const here -- no accumulator to reconcile, so the result cannot depend on the
+        // thread count. This is the re-snarl's inner loop, which `panphorte` runs as well as `bubble`,
+        // so it is the same work twice per pipeline.
+        std::mutex progress_mutex;
+        run_parallel(target.size(), options.threads, [&](std::size_t bubble_index) {
+            Bubble& bubble = target[bubble_index];
             std::size_t supported_paths = 0;
             std::size_t min_inside_bp = std::numeric_limits<std::size_t>::max();
             std::size_t max_inside_bp = 0;
@@ -987,8 +999,13 @@ BubbleCallReport call_bubbles_report(const Graph& graph, const BubbleCallOptions
             bubble.long_path_support = long_path_support;
             bubble.inversion_signal = inversion_signal;
             bubble.cyclic = cyclic || inversion_signal;
-            progress.tick();
-        }
+            {
+                // ProgressBar is not thread-safe and the bar is the only shared mutable state left.
+                // Contention is negligible: each iteration above walks every path of the bubble.
+                std::lock_guard<std::mutex> lock(progress_mutex);
+                progress.tick();
+            }
+        });
     };
 
     compute_bubble_metrics(bubbles, "Scoring bubbles");

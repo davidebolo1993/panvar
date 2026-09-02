@@ -72,6 +72,8 @@ void print_bubble_help() {
         << "                                   BETWEEN the facing boundaries is <= N bp. Ordering and\n"
         << "                                   distance are both in reference coordinates, so bubbles\n"
         << "                                   that abut have a gap of 0 (default: 0, disabled)\n"
+        << "      --threads <N>                Worker threads for bubble scoring (0 = auto). Output is\n"
+        << "                                   identical regardless of thread count\n"
         << "  -q, --quiet                      Disable the progress bar\n"
         << "  -h, --help                       Show this help\n";
 }
@@ -188,6 +190,10 @@ int run_bubble_command(const std::vector<std::string>& args) {
             options.merge_nearby_bp = cli::parse_size_arg(arg, require_value(arg));
             continue;
         }
+        if (arg == "--threads") {
+            options.threads = cli::parse_size_arg(arg, require_value(arg));
+            continue;
+        }
         if (arg == "-q" || arg == "--quiet") {
             options.quiet = true;
             continue;
@@ -269,7 +275,11 @@ int run_bubble_command(const std::vector<std::string>& args) {
         write_gfa_model(sorted_gfa_staged, model);
         effective_gfa = sorted_gfa_path;
 
-        graph = parse_gfa(sorted_gfa_staged, parse_options);
+        // Built from the model in memory rather than by re-reading the file just written. The write
+        // stays -- the sorted GFA is a wanted output -- but serialising and re-parsing a
+        // multi-hundred-megabyte graph purely to convert between two in-memory representations does
+        // not have to. graph_from_model is proven equivalent to this round trip (gfa_io.hpp).
+        graph = graph_from_model(model, parse_options);
         // Sequences are needed because the bp filters measure interior span; overlaps must be a
         // verified 0M for the same reason -- span is summed over whole segments.
         validate_graph_paths(graph, "bubble", true, true);

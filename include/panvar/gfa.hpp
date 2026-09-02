@@ -47,4 +47,17 @@ struct ParseGfaOptions {
 
 Graph parse_gfa(const std::string& gfa_path, const ParseGfaOptions& options = {});
 
+// The two halves of L-line handling, exposed so a Graph built from an in-memory GfaModel cannot drift
+// from one parsed out of the file that model would have written. Both `parse_gfa` and
+// `graph_from_model` (gfa_io.hpp) go through these, so there is one definition of what a link means.
+
+// '*' on an L line means the overlap is UNKNOWN, not zero: it yields -1. "10M" and "10" both yield 10.
+int parse_gfa_overlap(const std::string& field);
+
+// Attach one oriented link, applying the side mapping and the duplicate check. Silently ignores a link
+// whose endpoints are not both present, which is what parse_gfa does for an L line that names a
+// segment with no S line.
+void add_gfa_edge(Graph& graph, const std::string& from, char from_orient,
+                  const std::string& to, char to_orient, int overlap);
+
 } // namespace panvar

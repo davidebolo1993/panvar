@@ -115,7 +115,7 @@ for L in "${LOCI[@]}"; do
   IN="$G"
   [ -s "$D/rebuilt.gfa" ] && IN="$D/rebuilt.gfa"
 
-  run "$L bubble" "$BIN" bubble -i "$IN" -r "$R" -o "$D/bub" --quiet || continue
+  run "$L bubble" "$BIN" bubble -i "$IN" -r "$R" -o "$D/bub" ${THREAD_OPT[@]+"${THREAD_OPT[@]}"} --quiet || continue
   SORTED="$D/bub.sorted.gfa"
 
   # inspect: one bubble (with clustering) and the all-bubbles sweep.

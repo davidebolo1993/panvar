@@ -62,4 +62,16 @@ void write_gfa_model(const std::string& out_path, const GfaModel& model);
 // the given sequence (appended to node_order). Returns the new id as a string.
 std::string add_new_node(GfaModel& model, const std::string& sequence);
 
+// The traversal Graph this model describes, built in memory.
+//
+// Equivalent to write_gfa_model() followed by parse_gfa() on the result, and that equivalence is the
+// contract: node ids and sequences, the adjacency (including neighbour ORDER, which follows
+// model.edges), overlaps, and path names -- a W line becomes sample#hap#seqid:start-end, the same rule
+// gfa_path_name applies -- all match what a round trip through the file would have produced.
+//
+// It exists because `bubble` and `panphorte` both sort a model, write it, and then re-read the file
+// they just wrote purely to obtain this Graph. The write stays (the sorted GFA is a wanted output);
+// the serialize-and-reparse of a multi-hundred-megabyte file in between does not have to.
+Graph graph_from_model(const GfaModel& model, const ParseGfaOptions& options = {});
+
 } // namespace panvar
