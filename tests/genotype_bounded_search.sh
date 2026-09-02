@@ -102,6 +102,34 @@
 # Exact multiplicity-aware compression stays permitted internally: it must change neither the
 # in-band mass nor the exposure.
 #
+# BUILD ORDER for stage 1, frozen with the contract so the sequence is not re-litigated mid-build:
+#   1. complete SINGLE-MATE Hamming search -- split into d+1 pieces, index EVERY occurrence with no
+#      cap, infer the fixed start from each occurrence, deduplicate starts, verify Hamming <= d;
+#   2. both strands, and reads with no usable current syncmer seed;
+#   3. combine mate placements into valid FR fragment states (orientation, reverse mate downstream,
+#      insert inside the prior's support);
+#   4. preserve repeat-origin multiplicity while deduplicating rediscoveries of the SAME state --
+#      the same placement reached through several pieces is one state, two repeat copies are two;
+#   5. exact in-band mass, analytic exposure, and the outside-band bound;
+#   6. propagate those bounds through haplotypes, diploid pairs, and the background mixture -- the
+#      bound must survive the mixture, since log[(1-eta)*lambda*M + eta*P_bg] is where it is used;
+#   7. apply certification (G) and emit the equivalence set.
+# Mutation-test every fixture BEFORE running c4. A fixture that cannot fail is not evidence, and
+# five vacuous checks have already been caught on this branch by asking that question late.
+#
+# TWO DIAGNOSTIC QUANTITIES, kept in separate columns and never merged:
+#   * BEST in-band placement -- what the current max-placement caller actually uses, and the
+#     quantity that reclassifies c4's 23 competitor-only and 53 truth-only fragments;
+#   * SUMMED in-band placement mass -- what the reference model requires and what any future
+#     linkage factor consumes.
+# They answer different questions. Sharing one column would make a max-placement result look like
+# evidence about the marginal model, which is precisely the confusion that produced the retracted
+# "collapsed multiplicity caused the c4 failures" claim.
+#
+# FIRST SCIENTIFIC RESULT, in this order: the c4 table of which of the 23 competitor-only and 53
+# truth-only fragments remain EXCLUSIVE under complete in-band search, then the resulting lower and
+# upper genotype intervals. Not "the search runs".
+#
 # STATUS: the search is NOT IMPLEMENTED. This file exits 77 (skip) until the entry point exists, so
 # it can be registered now and start gating the moment there is something to gate. It must never be
 # made to pass by weakening a condition.
