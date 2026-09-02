@@ -902,18 +902,31 @@ void call_variants(
         std::vector<DupGeneTarget> dup_targets;   // DUPs needing per-gene CN (when --gtf is active)
     };
 
-    // Genomic 1-based start of a bubble node from the reference path (first occurrence).
+    // Genomic 1-based start of each node's FIRST occurrence on the reference walk. Built once, for
+    // the whole reference, rather than per bubble.
+    //
+    // The per-bubble version rescanned every step of the reference walk to answer a question about
+    // the handful of nodes one bubble owns, which is O(bubbles x |reference walk|) for an answer that
+    // is the same subset of one fixed map every time. `emplace` keeps the first occurrence, which is
+    // exactly what the `!pos.count(id)` guard did.
+    std::unordered_map<std::string, std::size_t> ref_first_pos;
+    ref_first_pos.reserve(ref_path->steps.size() * 2);
+    for (std::size_t k = 0; k < ref_path->steps.size(); ++k) {
+        ref_first_pos.emplace(ref_path->steps[k].node_id,
+                              ref_meta.region_start_1based + ref_prefix[k]);
+    }
+
+    // A bubble's own slice of that map: the same content the scan produced, by lookup.
     auto build_ref_node_pos = [&](const Bubble& bubble) {
         std::unordered_map<std::string, std::size_t> pos; // node -> 1-based genomic start
-        std::unordered_set<std::string> bnodes(bubble.inside.begin(), bubble.inside.end());
-        bnodes.insert(bubble.source);
-        bnodes.insert(bubble.sink);
-        for (std::size_t k = 0; k < ref_path->steps.size(); ++k) {
-            const std::string& id = ref_path->steps[k].node_id;
-            if (bnodes.count(id) && !pos.count(id)) {
-                pos[id] = ref_meta.region_start_1based + ref_prefix[k];
-            }
-        }
+        pos.reserve(bubble.inside.size() + 2);
+        const auto take = [&](const std::string& id) {
+            const auto it = ref_first_pos.find(id);
+            if (it != ref_first_pos.end()) pos.emplace(id, it->second);
+        };
+        take(bubble.source);
+        take(bubble.sink);
+        for (const std::string& id : bubble.inside) take(id);
         return pos;
     };
 
