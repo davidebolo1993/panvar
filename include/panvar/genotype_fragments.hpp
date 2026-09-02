@@ -1108,6 +1108,42 @@ struct CandidateFrame {
 inline constexpr std::uint32_t kUnmappedBlock = 0xFFFFFFFFu;
 
 // ---------------------------------------------------------------------------------------------
+// BOUNDED-COMPLETE SINGLE-MATE PLACEMENT (stage 1, Hamming).
+//
+// Every start where `read` matches `hap` within `max_edits` MISMATCHES -- fixed position, no gaps,
+// the same emission reference_emission implements. Pigeonhole: a placement with at most d mismatches
+// cannot mismatch inside all of d+1 DISJOINT pieces, so at least one piece matches exactly and its
+// occurrences propose the start. Every proposal is then VERIFIED by counting mismatches, so the
+// pigeonhole only ever restricts which starts are examined -- it cannot admit a placement the
+// exhaustive scan would reject, and cannot reject one it would accept.
+//
+// Occurrences are NOT capped and there is no top-k. A cap makes completeness a function of a tuning
+// parameter, which is the property this search exists to remove.
+struct MatePlacement {
+    long start = 0;             // offset into hap
+    std::uint32_t edits = 0;    // Hamming distance at that offset
+    bool operator<(const MatePlacement& o) const { return start < o.start; }
+    bool operator==(const MatePlacement& o) const { return start == o.start; }
+};
+
+// Work done, so a search that skips can be caught saying so.
+struct SearchWork {
+    std::uint64_t pieces = 0;            // d+1 per read
+    std::uint64_t candidate_starts = 0;  // proposals before dedup
+    std::uint64_t distinct_starts = 0;   // after dedup
+    std::uint64_t verified = 0;          // Hamming actually computed
+    std::uint64_t accepted = 0;          // within band
+    bool exhaustive_fallback = false;    // piece too short to filter; scanned every start
+};
+
+std::vector<MatePlacement> bounded_mate_placements(
+    const std::string& read, const std::string& hap, std::size_t max_edits, SearchWork* work);
+
+// The reference this is certified against: every start, Hamming counted, nothing skipped.
+std::vector<MatePlacement> exhaustive_mate_placements(
+    const std::string& read, const std::string& hap, std::size_t max_edits);
+
+// ---------------------------------------------------------------------------------------------
 // AUTHORITATIVE PATH -> BLOCK PROJECTION. The one place block coordinates are derived.
 //
 // Bytes are SLICED from the graph walk through the verified CandidateFrame, never rebuilt by

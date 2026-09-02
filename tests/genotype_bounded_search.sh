@@ -137,6 +137,11 @@ set -uo pipefail
 BIN="${1:?usage: genotype_bounded_search.sh <panvar> <outdir>}"
 OUT="${2:?}"; mkdir -p "$OUT"
 
+PY="${PYTHON:-python3}"
+fails=0
+ok()  { printf '  ok   %s\n' "$*"; }
+bad() { printf '  FAIL %s\n' "$*"; fails=$((fails+1)); }
+
 if ! "$BIN" genotype-frag --help 2>&1 | grep -q -- "--bounded-search"; then
   echo "SKIP: --bounded-search is not implemented yet; gates are frozen and waiting"
   echo "      acceptance: in-band mass and exposure EXACT; omitted mass validly BOUNDED, with"
@@ -149,7 +154,103 @@ if ! "$BIN" genotype-frag --help 2>&1 | grep -q -- "--bounded-search"; then
   exit 77
 fi
 
-echo "FAIL: --bounded-search exists but its gates have not been written."
-echo "      Implementing the search without implementing these checks is the failure mode this"
-echo "      file exists to prevent. Write the assertions, do not delete the file."
-exit 1
+# ---- FIXTURES ---------------------------------------------------------------------------------
+# SMALL by necessity, not convenience: the exhaustive reference is O(|hap| x |read|) per cell, and on
+# real c4 (131 paths x 226kb) a ten-read comparison is ~1e11 character operations and does not
+# finish. Small fixtures are what makes exhaustive agreement checkable at all.
+OUT="$OUT/run.$$"; rm -rf "$OUT"; mkdir -p "$OUT"
+seq_of() { awk -v n="$1" -v s="$2" 'BEGIN{x=s; b="ACGT";
+           for(i=0;i<n;i++){x=(1103515245*x+12345)%2147483648; printf "%s", substr(b,(int(x/65536)%4)+1,1)} }'; }
+
+U=$(seq_of 400 11); RPT=$(seq_of 200 12); V=$(seq_of 400 13); W=$(seq_of 400 14)
+# hapA: unique - repeat - unique - repeat - unique. Two identical copies, so a read inside the
+# repeat has TWO distinct origins that must both survive; collapsing them is the copy-number loss.
+HA="${U}${RPT}${V}${RPT}${W}"
+HB="${U}${RPT}${V}"
+{ printf 'H\tVN:Z:1.0\n'
+  printf 'S\t1\t%s\n' "$HA"; printf 'S\t2\t%s\n' "$HB"
+  printf 'L\t1\t+\t2\t+\t0M\n'
+  printf 'P\tref\t1+\t*\n'; printf 'P\thapB\t2+\t*\n'; } > "$OUT/g.gfa"
+"$BIN" bubble -i "$OUT/g.gfa" -r ref -o "$OUT/b" --min-variant-bp 0 -q >/dev/null 2>&1
+
+emit() {  # emit <name> <seq>
+  printf '>%s/1\n%s\n' "$1" "$2" >> "$OUT/reads.fa"
+  printf '>%s/2\n%s\n' "$1" "$(printf '%s' "$2" | rev | tr ACGTacgt TGCAtgca)" >> "$OUT/reads.fa"
+}
+: > "$OUT/reads.fa"
+EXACT=$(printf '%s' "$HA" | cut -c101-220)                 # unique flank, exact
+SUBST=$(printf '%s' "$HA" | cut -c301-420 | sed 's/^\(.\{10\}\)./\1N/;s/N/A/')   # one substitution
+INREP=$(printf '%s' "$HA" | cut -c451-570)                 # inside the repeat: two origins in hapA
+JUNCT=$(printf '%s' "$HA" | cut -c580-699)                 # spans repeat->unique junction
+# PIGEONHOLE-CRITICAL read. The other fixtures are near-exact and are found even with too FEW
+# pieces, so they cannot detect a broken pigeonhole -- measured: cutting d+1 to d left every
+# assertion passing. This read carries exactly d mismatches positioned to spoil all d pieces of the
+# mutant split while leaving one piece of the correct d+1 split clean. read=120, d=6:
+#   correct: 7 pieces of 17 -> mismatches at 5,25,45,65,85,105 hit pieces 0,1,2,3,5,6; piece 4 CLEAN
+#   mutant : 6 pieces of 20 -> the same positions hit all six; nothing is proposed and the
+#            placement is LOST, which is exactly what the exhaustive comparison must catch.
+PIG=$("$PY" - "$HA" <<'PYEOF'
+import sys
+h=sys.argv[1][700:820].upper()
+sub={'A':'C','C':'G','G':'T','T':'A'}
+b=list(h)
+for pos in (5,25,45,65,85,105): b[pos]=sub[b[pos]]
+print("".join(b))
+PYEOF
+)
+emit pigeon_ "$PIG"
+emit sub_    "$SUBST"
+emit uniq_   "$EXACT"
+emit rep_    "$INREP"
+emit junc_   "$JUNCT"
+
+# ---- A/B: exact agreement with the exhaustive scan ---------------------------------------------
+if ! "$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/b" -o "$OUT/o" -R "$OUT/reads.fa" \
+      --max-divergence 0.05 --bounded-search "$OUT/bs.tsv" -q >/dev/null 2>&1; then
+  bad "the bounded search exited nonzero -- it disagreed with the exhaustive reference"
+elif [ ! -s "$OUT/bs.tsv" ]; then
+  bad "no bounded-search output"
+else
+  N=$(awk -F'\t' 'NR>1' "$OUT/bs.tsv" | wc -l | tr -d ' ')
+  DIS=$(awk -F'\t' 'NR>1 && $7!="yes"' "$OUT/bs.tsv" | wc -l | tr -d ' ')
+  [ "$N" -gt 0 ] && ok "compared $N (mate,strand,haplotype) cells against exhaustive" \
+                 || bad "no cells compared"
+  [ "$DIS" = 0 ] && ok "bounded == exhaustive on every cell (condition A)" \
+                 || bad "$DIS cell(s) disagree with the exhaustive scan"
+  # NON-VACUITY: placements must actually be found, or agreement is 0 == 0 everywhere.
+  PL=$(awk -F'\t' 'NR>1{s+=$5} END{print s+0}' "$OUT/bs.tsv")
+  [ "$PL" -gt 0 ] && ok "and the comparison is not vacuous ($PL placements found)" \
+                  || bad "zero placements anywhere; agreement is 0==0 and proves nothing"
+  # REPEAT MULTIPLICITY: a read inside the duplicated unit must have TWO origins on hapA and ONE on
+  # hapB. This is the condition that distinguishes state dedup from multiplicity collapse.
+  RA=$(awk -F'\t' 'NR>1 && index($1,"rep_")==1 && $4=="ref" && $5>0{print $5; exit}' "$OUT/bs.tsv")
+  RB=$(awk -F'\t' 'NR>1 && index($1,"rep_")==1 && $4=="hapB" && $5>0{print $5; exit}' "$OUT/bs.tsv")
+  [ "${RA:-0}" -ge 2 ] && ok "a read in the duplicated unit keeps BOTH origins on the 2-copy path ($RA)" \
+                       || bad "the duplicated unit yielded ${RA:-0} origin(s); multiplicity collapsed"
+  [ "${RB:-0}" = 1 ] && ok "and exactly one on the 1-copy path ($RB), so copy number is visible" \
+                     || bad "the 1-copy path yielded ${RB:-0} origins, expected 1"
+  # BOTH STRANDS exercised.
+  # The pigeonhole-critical read MUST place, or the mutation test above is vacuous.
+  PG=$(awk -F'\t' 'NR>1 && index($1,"pigeon_")==1 && $5>0' "$OUT/bs.tsv" | wc -l | tr -d ' ')
+  PGE=$(awk -F'\t' 'NR>1 && index($1,"pigeon_")==1 && $8>=0{print $8; exit}' "$OUT/bs.tsv")
+  [ "${PG:-0}" -gt 0 ] \
+    && ok "the pigeonhole-critical read (d mismatches, one clean piece) places, at $PGE edits" \
+    || bad "the pigeonhole-critical read did not place; a broken d+1 split would go undetected"
+  FS=$(awk -F'\t' 'NR>1 && $3=="+" && $5>0' "$OUT/bs.tsv" | wc -l | tr -d ' ')
+  RS=$(awk -F'\t' 'NR>1 && $3=="-" && $5>0' "$OUT/bs.tsv" | wc -l | tr -d ' ')
+  { [ "$FS" -gt 0 ] && [ "$RS" -gt 0 ]; } \
+    && ok "both strands place ($FS forward, $RS reverse cells)" \
+    || bad "only one strand places (fwd=$FS rev=$RS); the reverse case is untested"
+  # WORK REPORTED, and the pigeonhole actually filtering rather than silently falling back.
+  FB=$(awk -F'\t' 'NR>1 && $13==1' "$OUT/bs.tsv" | wc -l | tr -d ' ')
+  VER=$(awk -F'\t' 'NR>1{s+=$12} END{print s+0}' "$OUT/bs.tsv")
+  [ "$VER" -gt 0 ] && ok "verified starts reported ($VER), $FB cell(s) on the exhaustive fallback" \
+                   || bad "no verified-start counts reported; the search cannot say what it skipped"
+fi
+
+echo
+if [ "$fails" -eq 0 ]; then echo "bounded search: stage-1 A/B assertions passed"; else
+  echo "bounded search: $fails assertion(s) failed"; fi
+echo "NOTE: conditions C-G (omitted-mass bound, diploid propagation, interval certification) are"
+echo "      NOT yet asserted -- the mass and exposure work is not implemented."
+exit "$fails"

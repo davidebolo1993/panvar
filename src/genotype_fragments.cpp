@@ -3043,6 +3043,85 @@ bool sl_block_has_no_allele(const std::vector<BlockAlleles>& blocks, std::uint32
 }
 }  // namespace
 
+std::vector<MatePlacement> exhaustive_mate_placements(const std::string& read,
+                                                      const std::string& hap,
+                                                      std::size_t max_edits) {
+    std::vector<MatePlacement> out;
+    if (read.empty() || hap.size() < read.size()) return out;
+    for (std::size_t st = 0; st + read.size() <= hap.size(); ++st) {
+        std::size_t mism = 0;
+        for (std::size_t i = 0; i < read.size() && mism <= max_edits; ++i) {
+            if (read[i] != hap[st + i]) ++mism;
+        }
+        if (mism <= max_edits) {
+            out.push_back({static_cast<long>(st), static_cast<std::uint32_t>(mism)});
+        }
+    }
+    return out;
+}
+
+std::vector<MatePlacement> bounded_mate_placements(const std::string& read, const std::string& hap,
+                                                   std::size_t max_edits, SearchWork* work) {
+    SearchWork w;
+    std::vector<MatePlacement> out;
+    if (read.empty() || hap.size() < read.size()) {
+        if (work) *work = w;
+        return out;
+    }
+    const std::size_t npieces = max_edits + 1;
+    const std::size_t P = read.size() / npieces;
+    w.pieces = npieces;
+    // Below this the pieces propose essentially every position and filter nothing; scanning is both
+    // simpler and faster. The two paths must return the SAME placements -- this is an acceleration
+    // of the exhaustive scan, never a different answer.
+    constexpr std::size_t kMinPiece = 12;
+    if (P < kMinPiece) {
+        w.exhaustive_fallback = true;
+        out = exhaustive_mate_placements(read, hap, max_edits);
+        w.candidate_starts = w.distinct_starts = w.verified =
+            hap.size() >= read.size() ? hap.size() - read.size() + 1 : 0;
+        w.accepted = out.size();
+        if (work) *work = w;
+        return out;
+    }
+    std::vector<long> proposals;
+    for (std::size_t pi = 0; pi < npieces; ++pi) {
+        const std::size_t at = pi * P;
+        // An ambiguous base makes this piece propose nothing; the pigeonhole still holds because
+        // some OTHER piece must match exactly for an in-band placement -- unless the mismatches are
+        // spread so that every piece is spoiled, which only ambiguity in the read can cause. That is
+        // why the caller must treat N-containing reads as exhaustive.
+        if (read.find_first_of("Nn", at) < at + P) continue;
+        const std::string piece = read.substr(at, P);
+        std::size_t pos = hap.find(piece, 0);
+        while (pos != std::string::npos) {
+            const long st = static_cast<long>(pos) - static_cast<long>(at);
+            if (st >= 0 && st + static_cast<long>(read.size()) <= static_cast<long>(hap.size())) {
+                proposals.push_back(st);
+                ++w.candidate_starts;
+            }
+            pos = hap.find(piece, pos + 1);
+        }
+    }
+    std::sort(proposals.begin(), proposals.end());
+    proposals.erase(std::unique(proposals.begin(), proposals.end()), proposals.end());
+    w.distinct_starts = proposals.size();
+    for (const long st : proposals) {
+        ++w.verified;
+        std::size_t mism = 0;
+        for (std::size_t i = 0; i < read.size() && mism <= max_edits; ++i) {
+            if (read[i] != hap[static_cast<std::size_t>(st) + i]) ++mism;
+        }
+        if (mism <= max_edits) {
+            out.push_back({st, static_cast<std::uint32_t>(mism)});
+        }
+    }
+    std::sort(out.begin(), out.end());
+    w.accepted = out.size();
+    if (work) *work = w;
+    return out;
+}
+
 PathProjection project_path_blocks(const std::vector<BlockAlleles>& projection_blocks,
                                    const std::vector<BlockAlleles>& catalogue_blocks,
                                    const std::string& name,

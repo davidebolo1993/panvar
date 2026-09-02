@@ -188,6 +188,11 @@ void print_help() {
         << "                              \">N\" instead of falling back to the unbanded computation.\n"
         << "                              Certifying a panel floor only needs to know what is NEARER\n"
         << "                              than the best so far\n"
+        << "      --bounded-search <out.tsv>  STAGE 1 (Hamming). For every (mate, strand,\n"
+           "                              haplotype), find every placement within the divergence\n"
+           "                              band by pigeonhole and verify each against the exhaustive\n"
+           "                              scan. No occurrence cap, no top-k. Exits nonzero if the\n"
+           "                              two ever disagree. O(panel x reference) -- for fixtures.\n"
         << "      --dump-scored-sequences <prefix>  Write the exact sequences whole-haplotype mode\n"
         << "                              scores, AFTER --exclude-haplotypes, as <prefix>.scored_sequences\n"
         << "                              .fa plus a .tsv of name, length and md5 beside the raw GFA path\n"
@@ -311,6 +316,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     std::string ref_subset;
     std::string origin_universe;
     double scope_tol = 1e-6;
+    std::string bounded_search;
     std::vector<std::string> reconcile_scope;
     std::string switch_penalties_arg = "0,10,100,1000";
     std::vector<std::string> exact_distance;
@@ -345,6 +351,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                                              reference_pair.push_back(value(i, a)); }
         else if (a == "--reference-all-fragments") ref_subset = "all";
         else if (a == "--origin-universe") origin_universe = value(i, a);
+        else if (a == "--bounded-search") bounded_search = value(i, a);
         else if (a == "--scope-tol") {
             const std::string sv = value(i, a);
             scope_tol = std::stod(sv);
@@ -1011,6 +1018,83 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             scope_restricted_pair_loglik(frames[ia], frames[ib], rfr, scopes, rp, false);
         std::printf("%.17g\t%.17g\t%.17g\t%.17g\t%.17g\n",
                     whole, fact, whole - fact, block, fact - block);
+        log.done();
+        return 0;
+    }
+
+    // ---- BOUNDED-COMPLETE SINGLE-MATE SEARCH, against the exhaustive reference ------------------
+    // Stage 1 is HAMMING only: reference_emission counts mismatches at a fixed offset and has no gap
+    // model, so this is the emission it can certify. An indel-aware search needs its own oracle.
+    if (!bounded_search.empty()) {
+        const std::vector<Fragment> bfr = load_fragments(read_paths);
+        if (bfr.empty()) throw std::runtime_error("genotype-frag: --bounded-search needs reads");
+        std::vector<std::string> names;
+        std::vector<std::string> seqs;
+        // HOISTED. path_records_by_name returns BY VALUE, so calling it inside the loop left `it`
+        // pointing into a destroyed temporary and compared it against an iterator from a second,
+        // different temporary -- undefined behaviour that segfaulted immediately.
+        const auto by_name_bs = path_records_by_name(graph);
+        for (const PathRecord& p : panel_graph.paths) {
+            const auto it = by_name_bs.find(p.name);
+            if (it == by_name_bs.end() || it->second == nullptr) continue;
+            bool ok = false;
+            std::string w = spell_path_steps_sequence(graph, it->second->steps, &ok);
+            if (!ok) continue;
+            names.push_back(p.name); seqs.push_back(std::move(w));
+        }
+        if (seqs.empty()) throw std::runtime_error("genotype-frag: --bounded-search found no panel walks");
+        std::ofstream bf(bounded_search);
+        if (!bf) throw std::runtime_error("genotype-frag: cannot write " + bounded_search);
+        bf << "fragment\tmate\tstrand\thaplotype\tbounded_n\texhaustive_n\tagree"
+              "\tbest_edits\tpieces\tcandidate_starts\tdistinct_starts\tverified\tfallback\n";
+        std::size_t rows = 0, disagree = 0;
+        std::uint64_t tot_cand = 0, tot_ver = 0, tot_exh = 0;
+        for (const Fragment& F : bfr) {
+            for (int m = 0; m < 2; ++m) {
+                const std::string& raw = m == 0 ? F.r1 : F.r2;
+                if (raw.empty()) continue;
+                for (int strand = 0; strand < 2; ++strand) {
+                    const std::string r = strand == 0 ? raw : reverse_complement(raw);
+                    const std::size_t d =
+                        static_cast<std::size_t>(opt.max_divergence * static_cast<double>(r.size()));
+                    for (std::size_t h = 0; h < seqs.size(); ++h) {
+                        SearchWork w;
+                        const auto b = bounded_mate_placements(r, seqs[h], d, &w);
+                        const auto e = exhaustive_mate_placements(r, seqs[h], d);
+                        const bool same = b.size() == e.size() &&
+                            std::equal(b.begin(), b.end(), e.begin(),
+                                       [](const MatePlacement& x, const MatePlacement& y) {
+                                           return x.start == y.start && x.edits == y.edits; });
+                        if (!same) ++disagree;
+                        tot_cand += w.candidate_starts; tot_ver += w.verified;
+                        tot_exh += seqs[h].size() >= r.size() ? seqs[h].size() - r.size() + 1 : 0;
+                        std::uint32_t best = 0xFFFFFFFFu;
+                        for (const MatePlacement& p2 : b) best = std::min(best, p2.edits);
+                        bf << F.name << '\t' << (m + 1) << '\t' << (strand == 0 ? '+' : '-')
+                           << '\t' << names[h] << '\t' << b.size() << '\t' << e.size() << '\t'
+                           << (same ? "yes" : "NO") << '\t'
+                           << (best == 0xFFFFFFFFu ? -1 : static_cast<long>(best)) << '\t'
+                           << w.pieces << '\t' << w.candidate_starts << '\t' << w.distinct_starts
+                           << '\t' << w.verified << '\t' << (w.exhaustive_fallback ? 1 : 0) << '\n';
+                        ++rows;
+                    }
+                }
+            }
+        }
+        bf.flush();
+        if (!bf) throw std::runtime_error("genotype-frag: write failed for " + bounded_search);
+        log.info("bounded search: " + std::to_string(rows) + " (mate,strand,haplotype) cells, " +
+                 std::to_string(disagree) + " disagree with exhaustive; verified " +
+                 std::to_string(tot_ver) + " starts against " + std::to_string(tot_exh) +
+                 " exhaustive (" +
+                 std::to_string(tot_exh ? 100.0 * static_cast<double>(tot_ver) /
+                                          static_cast<double>(tot_exh) : 0.0) + "%)");
+        log.wrote({bounded_search});
+        if (disagree != 0) {
+            throw std::runtime_error("genotype-frag: --bounded-search disagreed with the exhaustive "
+                                     "reference on " + std::to_string(disagree) + " cell(s); the "
+                                     "search is not complete within the band");
+        }
         log.done();
         return 0;
     }
