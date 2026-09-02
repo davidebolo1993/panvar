@@ -1051,6 +1051,34 @@ std::vector<SparseKmerEntry> filtered_feature_counts_with_nodes(
     return out;
 }
 
+// Per-feature, per-haplotype k-mer dosage, keyed by the path's INDEX rather than its name.
+//
+// This is the hottest map in describe by a wide margin: measured on gstm1, the pooling pass costs
+// 6.4s of a 12.8s run while the stats and JSONL passes together -- which spell and count the same
+// sequences -- cost about 1.9s. The work is not the spelling or the counting, it is this insert,
+// executed once per kept k-mer per path (millions of times), each one hashing a ~40-character path
+// name and allocating a copy of it as the inner key. An index is 4 bytes, hashes trivially and owns
+// nothing; the name is recovered once per feature when the BIMBAM row is built.
+using KmerPool = std::unordered_map<std::uint64_t, std::unordered_map<std::uint32_t, std::uint64_t>>;
+
+// The diploid roll-up: feature -> SAMPLE NAME -> summed dosage over that sample's haplotype paths.
+// A separate type from KmerPool although the shape used to be identical, because it is keyed by a
+// different thing. Sharing one alias for both is what let a change to the haplotype pool's key type
+// silently land here.
+using KmerSamplePool =
+    std::unordered_map<std::uint64_t, std::unordered_map<std::string, std::uint64_t>>;
+
+// Writes the per-bubble sparse counts AND, when `pool` is given, accumulates the pooled BIMBAM
+// dosage from the same numbers.
+//
+// These used to be two passes over the paths. Both spelled the bubble's sequence for every path and
+// counted its features; the second (accumulate_kmer_counts) then threw the node provenance away and
+// kept only the counts. On gstm1 that redundant pass was about 5s of a 13s describe run.
+//
+// Folding them is exact rather than approximate: the two spellers accept the same paths (a node
+// missing or with an empty sequence makes the path incomplete in both) and produce the same
+// sequence, and the two counters walk the same occurrence list with the same saturation guard, so
+// the counts here are the counts that pass computed.
 void write_sparse_jsonl(
     const std::string& path,
     const Graph& graph,
@@ -1060,7 +1088,8 @@ void write_sparse_jsonl(
     const std::unordered_map<std::uint64_t, std::size_t>& feature_id_by_code,
     const DescribeOptions& options,
     std::vector<std::unordered_set<std::string>>& feature_nodes,
-    const std::unordered_set<std::string>* variant_nodes = nullptr) {
+    const std::unordered_set<std::string>* variant_nodes = nullptr,
+    KmerPool* pool = nullptr) {
 
     GzipWriter out(path);
     std::unordered_map<std::uint64_t, KmerPathCount> counts;
@@ -1078,6 +1107,17 @@ void write_sparse_jsonl(
         }
         count_selected_features_with_nodes(path_sequence, options, counts);
         const auto sparse = filtered_feature_counts_with_nodes(counts, feature_id_by_code);
+
+        // Same keep rule the separate pass applied: a code is pooled iff it is one of the
+        // discriminative features, which is exactly membership of feature_id_by_code.
+        if (pool != nullptr) {
+            const auto path_key = static_cast<std::uint32_t>(meta.path_index);
+            for (const auto& [code, path_count] : counts) {
+                if (path_count.count > 0 && feature_id_by_code.count(code) != 0) {
+                    (*pool)[code][path_key] += path_count.count;
+                }
+            }
+        }
 
         out.write("{\"bubble_id\":");
         out.write(std::to_string(bubble.id));
@@ -1234,38 +1274,7 @@ void write_params_json(const DescribeOptions& options, const std::string& path) 
 
 // K-mer cohort pool: kmer code -> (path name -> summed count), over discriminative features only,
 // aggregated across bubbles (the same canonical k-mer in two bubbles sums). Feeds the BIMBAM export.
-using KmerPool = std::unordered_map<std::uint64_t, std::unordered_map<std::string, std::uint64_t>>;
 
-void accumulate_kmer_counts(
-    const Graph& graph,
-    const Bubble& bubble,
-    const std::vector<BubblePathIndex>& path_indexes,
-    const std::vector<PathMeta>& paths,
-    const std::vector<std::uint64_t>& features,
-    const DescribeOptions& options,
-    const std::unordered_set<std::string>* variant_nodes,
-    KmerPool& pool) {
-
-    const std::unordered_set<std::uint64_t> keep(features.begin(), features.end());
-    if (keep.empty()) {
-        return;
-    }
-    std::unordered_map<std::uint64_t, std::uint32_t> counts;
-    for (const PathMeta& meta : paths) {
-        bool complete = false;
-        const std::string sequence = path_sequence_for_bubble(
-            graph, bubble, graph.paths[meta.path_index], path_indexes[meta.path_index], &complete, variant_nodes, options.variant_flank_bp);
-        if (!complete) {
-            continue;
-        }
-        count_selected_features(sequence, options, counts);
-        for (const auto& [code, c] : counts) {
-            if (c > 0 && keep.count(code) != 0) {
-                pool[code][meta.path_name] += c;
-            }
-        }
-    }
-}
 
 // Per-feature, per-haplotype node/edge dosage pool: the graph-substrate analogue of KmerPool,
 // keyed by the real graph coordinate (a node id, or a "from>to" edge key) so it stays traceable
@@ -1485,7 +1494,8 @@ BubbleDescribeResult describe_one_bubble(
             feature_id_by_code,
             options,
             feature_nodes,
-            variant_nodes);
+            variant_nodes,
+            kmer_pool);
         write_feature_map(kmer_features_file, features, stats, feature_nodes, options.kmer_size, paths.size());
 
         // Carry each kept k-mer's node provenance up to the pooled BIMBAM/feature_annot (so a pooled
@@ -1498,9 +1508,6 @@ BubbleDescribeResult describe_one_bubble(
             }
         }
 
-        if (kmer_pool != nullptr) {
-            accumulate_kmer_counts(graph, bubble, path_indexes, paths, features, options, variant_nodes, *kmer_pool);
-        }
 
         const bool wide_allowed_by_cap =
             options.max_wide_features == 0 || features.size() <= options.max_wide_features;
@@ -2131,9 +2138,12 @@ void describe_kmers_from_graph(
         if (want_kmer_pool) {
             for (auto& [code, carriers] : task_kmer[bi]) {
                 auto& dst = kmer_pool[code];
-                for (const auto& [path, c] : carriers) dst[path] += c;
+                for (const auto& [path_index, c] : carriers) dst[path_index] += c;
                 if (want_bimbam) feature_bubbles_k[code].push_back(bubble.id);
             }
+            // Released as soon as it is merged. Holding every per-bubble pool until the end of the
+            // loop kept two copies of the whole cohort's dosage live at once.
+            KmerPool().swap(task_kmer[bi]);
             if (want_bimbam) {
                 for (auto& [code, ns] : results[bi].kmer_nodes) {
                     auto& dst = feature_nodes_k[code];
@@ -2227,7 +2237,9 @@ void describe_kmers_from_graph(
                     ? join_nodes(std::vector<std::string>(nit->second.begin(), nit->second.end())) : ".";
                 const auto fb = feature_bubbles_k.find(code);
                 if (fb != feature_bubbles_k.end()) r.bubbles = fb->second;
-                for (const auto& [path, c] : carriers) r.carriers[path] = static_cast<double>(c);
+                // Index -> name, once per feature rather than once per (feature, path) insert.
+                for (const auto& [path_index, c] : carriers)
+                    r.carriers[graph.paths[path_index].name] = static_cast<double>(c);
                 rows.push_back(std::move(r));
             }
             sort_rows(rows);
@@ -2316,13 +2328,21 @@ void describe_kmers_from_graph(
                 write_samples_s(dir);
                 GzipWriter annot((dir / "feature_annot.kmers.tsv.gz").string());
                 annot.write(pool_header);
-                KmerPool sample_pool;
+                // path INDEX -> the samples that path belongs to, resolved once. The pool is keyed
+                // by index now, and looking the name up per (feature, carrier) would put the string
+                // hash back into the loop this change exists to take it out of.
+                std::vector<const std::vector<std::string>*> samples_of_path(graph.paths.size(), nullptr);
+                for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
+                    const auto it = path_to_samples.find(graph.paths[pi].name);
+                    if (it != path_to_samples.end()) samples_of_path[pi] = &it->second;
+                }
+                KmerSamplePool sample_pool;
                 for (const auto& [code, carriers] : kmer_pool) {
                     auto& out = sample_pool[code];
-                    for (const auto& [path, count] : carriers) {
-                        const auto it = path_to_samples.find(path);
-                        if (it == path_to_samples.end()) continue;
-                        for (const std::string& s : it->second) out[s] += count;
+                    for (const auto& [path_index, count] : carriers) {
+                        const std::vector<std::string>* samples = samples_of_path[path_index];
+                        if (samples == nullptr) continue;
+                        for (const std::string& s : *samples) out[s] += count;
                     }
                 }
                 std::vector<BimbamRow> rows; rows.reserve(sample_pool.size());
