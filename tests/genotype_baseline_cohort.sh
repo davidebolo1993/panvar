@@ -68,7 +68,13 @@ CALLER_ARGS=(--haplotype-mode --hamming-emission --max-divergence 0.05
 # locus <TAB> graph <TAB> bubble-prefix <TAB> reference-path <TAB> donors (comma-separated)
 # The frozen cohort. Written here, in the file, so a baseline is reproducible from the commit alone.
 # These six are present with both homologues at every locus in results/real_data.
-FROZEN_DONORS="${FROZEN_DONORS:-HG00096,HG00171,HG00268}"
+# THE FOUR DONORS PRESENT WITH BOTH HOMOLOGUES IN ALL SIX PANELS. The six locus graphs were built
+# from DIFFERENT sample cohorts -- 232/231/231/231 complete diploid donors at acot/gstm1/lpa/
+# ankrd36c against 64 at c4 and 59 at cyp2d6 -- so a donor chosen from the pharmacogene panels is
+# usually absent entirely from the others. HG00096/HG00171/HG00268 are in c4 and cyp2d6 only.
+# Frozen as a SET, so the cohort is not selected on results. Development/regression donors, not a
+# holdout.
+FROZEN_DONORS="${FROZEN_DONORS:-HG00733,HG02818,NA19036,NA19240}"
 if [ -z "$CFG" ]; then
   CFG="$OUT/config.tsv"
   { for L in acot gstm1 lpa ankrd36c c4 cyp2d6; do
@@ -81,13 +87,17 @@ fi
 [ -x "$BIN" ] || { say "FATAL: binary not executable: $BIN"; exit 1; }
 BIN_MD5="$(md5of "$BIN")"
 COMMIT="$(cd "$REPO" && git rev-parse --short HEAD 2>/dev/null || echo unknown)"
-DIRTY="$(cd "$REPO" && git status --porcelain -- src include tests CMakeLists.txt 2>/dev/null | wc -l | tr -d ' ')"
+# Tracked modifications and untracked files are DIFFERENT facts. Counting them together made an
+# untracked test fixture look like a source change and reported tracked_dirty 1 on a clean tree.
+DIRTY="$(cd "$REPO" && git status --porcelain --untracked-files=no -- src include tests CMakeLists.txt 2>/dev/null | wc -l | tr -d ' ')"
+UNTRACKED="$(cd "$REPO" && git ls-files --others --exclude-standard -- src include tests CMakeLists.txt 2>/dev/null | wc -l | tr -d ' ')"
 # The binary is COPIED. A rebuild during the run must not change what is being measured -- that has
 # invalidated a ctest run and a 16-donor cohort on this branch.
 cp "$BIN" "$OUT/panvar.frozen"; BIN="$OUT/panvar.frozen"
 
 { echo "commit          $COMMIT"
   echo "tracked_dirty   $DIRTY files"
+  echo "untracked       $UNTRACKED files (not part of the build)"
   echo "binary_md5      $BIN_MD5"
   echo "band            $BAND"
   echo "seed            $SEED"
@@ -96,7 +106,68 @@ cp "$BIN" "$OUT/panvar.frozen"; BIN="$OUT/panvar.frozen"
   echo "date            $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$OUT/PROVENANCE.txt"
 cat "$OUT/PROVENANCE.txt"
-[ "$DIRTY" != "0" ] && say "WARNING: $DIRTY tracked source file(s) modified; this baseline is not reproducible from $COMMIT alone"
+# A FROZEN run ABORTS on tracked modifications. A baseline that cannot be rebuilt from its recorded
+# commit is not a baseline, and a warning is too easy to scroll past. FROZEN=0 for diagnostic runs.
+if [ "$DIRTY" != "0" ]; then
+  if [ "${FROZEN:-1}" = "1" ]; then
+    say "FATAL: $DIRTY tracked source file(s) modified; this baseline would not be reproducible from $COMMIT."
+    say "       Commit them, or re-run with FROZEN=0 to take a diagnostic (non-baseline) measurement."
+    exit 1
+  fi
+  say "WARNING: $DIRTY tracked file(s) modified; FROZEN=0, so this is a diagnostic run, NOT a baseline"
+fi
+
+# ---- PREFLIGHT ------------------------------------------------------------------------------
+# The WHOLE configuration is validated before a single read is simulated or a single row written.
+# Discovering at locus five that a donor is absent leaves four loci of results already on disk that
+# nobody will delete, and they will be read as "the baseline" with a footnote nobody applies. The
+# preflight reports h1_found/h2_found per requested cell and refuses the entire run if any is
+# missing, before any work.
+PRE="$OUT/preflight.tsv"
+printf 'locus	donor	h1_found	h2_found	paths_for_donor	status
+' > "$PRE"
+pre_fail=0
+while IFS=$'	' read -r LOCUS GFA PFX REFNAME DONOR_LIST; do
+  [ -z "${LOCUS:-}" ] && continue
+  case "$LOCUS" in \#*) continue ;; esac
+  if [ -n "$ONLY_LOCI" ] && ! printf '%s' " $ONLY_LOCI " | grep -q " $LOCUS "; then continue; fi
+  if [ ! -f "$GFA" ] || [ ! -f "$PFX.bubbles.csv" ]; then
+    printf '%s	-	-	-	-	NO_SUBSTRATE
+' "$LOCUS" >> "$PRE"; pre_fail=$((pre_fail+1)); continue
+  fi
+  PD="$OUT/.pre_$LOCUS"; mkdir -p "$PD"
+  "$BIN" genotype-frag -i "$GFA" -b "$PFX" -o "$PD/p" --dump-scored-sequences "$PD/p" -q     >/dev/null 2>&1
+  if [ ! -s "$PD/p.scored_sequences.tsv" ]; then
+    printf '%s	-	-	-	-	NO_PANEL
+' "$LOCUS" >> "$PRE"; pre_fail=$((pre_fail+1)); continue
+  fi
+  DL="${ONLY_DONORS:-$DONOR_LIST}"
+  DL="$(printf '%s' "$DL" | tr ',' ' ')"
+  if [ -z "$DL" ]; then
+    printf '%s	-	-	-	-	NO_MANIFEST
+' "$LOCUS" >> "$PRE"; pre_fail=$((pre_fail+1)); continue
+  fi
+  for D in $DL; do
+    H1=$(awk -F'	' -v d="$D" 'NR>1 && index($2,d"#1#")==1{print "yes"; exit}' "$PD/p.scored_sequences.tsv")
+    H2=$(awk -F'	' -v d="$D" 'NR>1 && index($2,d"#2#")==1{print "yes"; exit}' "$PD/p.scored_sequences.tsv")
+    NP=$(awk -F'	' -v d="$D" 'NR>1 && index($2,d"#")==1{n++} END{print n+0}' "$PD/p.scored_sequences.tsv")
+    ST=OK; [ -z "$H1" ] || [ -z "$H2" ] && { ST=MISSING; pre_fail=$((pre_fail+1)); }
+    printf '%s	%s	%s	%s	%s	%s
+' "$LOCUS" "$D" "${H1:-no}" "${H2:-no}" "$NP" "$ST" >> "$PRE"
+  done
+  rm -rf "$PD"
+done < "$CFG"
+column -t "$PRE" 2>/dev/null || cat "$PRE"
+if [ "$pre_fail" != 0 ]; then
+  say ""
+  say "FATAL: preflight failed for $pre_fail cell(s). Nothing was simulated and no rows were written."
+  say "       The six locus graphs come from DIFFERENT cohorts -- 232/231/231/231 complete diploid"
+  say "       donors at acot/gstm1/lpa/ankrd36c against 64 at c4 and 59 at cyp2d6 -- so a donor"
+  say "       present in one panel is often absent from another entirely."
+  exit 1
+fi
+say "preflight: every requested locus/donor cell has a complete diploid"
+say ""
 
 RUNS="$OUT/runs.tsv"; BLOCKS="$OUT/blocks.tsv"
 printf 'commit\tbinary_md5\tlocus\tdonor\tarm\treads\tseed\tn_read_pairs\tgraph_md5\tbubbles_md5\ttruth_md5\treads_md5\tcatalogue_md5\tshortlist_md5\ttruth1\ttruth2\tpanel_floor\tfloor_pair_survived\tcalled1\tcalled2\tcalled_distance\texcess\tmetric\tequiv_set_size\tfit_per_frag\tfit_frag\tfit_exposure\tn_blocks\tn_projectable\tn_determined\tn_exact\tn_wrong\truntime_s\tpeak_rss_bytes\tblock_sum_distance\tblock_sum_residual\tstatus\n' > "$RUNS"
@@ -206,7 +277,11 @@ while IFS=$'\t' read -r LOCUS GFA PFX REFNAME DONOR_LIST; do
     T1=$(awk -F'\t' -v d="$DONOR" 'NR>1 && index($2,d"#1#")==1 {print $2; exit}' "$LD/all.scored_sequences.tsv")
     T2=$(awk -F'\t' -v d="$DONOR" 'NR>1 && index($2,d"#2#")==1 {print $2; exit}' "$LD/all.scored_sequences.tsv")
     if [ -z "$T1" ] || [ -z "$T2" ]; then
-      say "REFUSE $LOCUS/$DONOR: donor does not have two homologues in the panel"; fails=$((fails+1)); continue
+      # "does not have two homologues" was misleading: most often the donor is absent from this
+      # panel ENTIRELY -- zero paths, not one -- because the six graphs come from different cohorts.
+      NFOUND=$(awk -F'\t' -v d="$DONOR" 'NR>1 && index($2,d"#")==1{n++} END{print n+0}' "$LD/all.scored_sequences.tsv")
+      say "REFUSE $LOCUS/$DONOR: $NFOUND path(s) for this donor (h1=$([ -n "$T1" ] && echo yes || echo no) h2=$([ -n "$T2" ] && echo yes || echo no)); the panel does not carry a complete diploid"
+      fails=$((fails+1)); continue
     fi
     DD="$LD/$DONOR"; mkdir -p "$DD"
     extract_fa "$LD/all.scored_sequences.fa" "$LD/all.scored_sequences.tsv" "$T1" "$DD/t1.fa" || { say "REFUSE $LOCUS/$DONOR: cannot spell truth 1"; fails=$((fails+1)); continue; }
