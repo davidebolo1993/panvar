@@ -244,6 +244,9 @@ struct BlockCall {
     bool is_array = false;
     std::size_t hap1 = 0;        // most probable panel haplotype pair at this block
     std::size_t hap2 = 0;
+    // Largest posterior of ONE ORDERED haplotype-pair state -- emitted as
+    // best_ordered_pair_posterior. Not the genotype posterior: gq comes from the probability
+    // aggregated over all path pairs giving the same unordered allele pair.
     double hap_posterior = 0.0;
     std::string filter = "PASS";     // quality only: PASS / LOWGQ / OFFPANEL / NOCALL
     // Where the call came from, kept separate from quality. `local` = this block's own markers decided

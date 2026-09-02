@@ -357,6 +357,20 @@ if(PANVAR_BUILD_TESTING)
             set_tests_properties(panvar_genotype_path_blocks PROPERTIES TIMEOUT 600)
         endif()
 
+        # The bounded-complete placement search: gates frozen BEFORE the implementation, and
+        # registered now so nobody can add --bounded-search without this running. It reports SKIP
+        # (77) until the entry point exists, and FAILS if the entry point appears without its
+        # assertions -- the one outcome it must never do is pass by having a condition weakened.
+        set(PANVAR_BOUNDED_SEARCH ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_bounded_search.sh)
+        if(EXISTS ${PANVAR_BOUNDED_SEARCH} AND PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE)
+            add_test(
+                NAME panvar_genotype_bounded_search
+                COMMAND /usr/bin/env bash ${PANVAR_BOUNDED_SEARCH} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/genotype_bounded_search
+            )
+            set_tests_properties(panvar_genotype_bounded_search PROPERTIES
+                TIMEOUT 900 SKIP_RETURN_CODE 77)
+        endif()
+
         # The fragment model's exact reference scorer, against fixtures whose values are derivable
         # rather than recorded -- the homozygous-doubling case is checked against
         # -lambda*starts + n*log(2) analytically. It is the oracle the accelerated scorer must be

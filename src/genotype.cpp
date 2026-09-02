@@ -1045,6 +1045,14 @@ std::vector<BlockCall> genotype_sample(
                 allele_post[(static_cast<std::uint64_t>(lo) << 32) | hi] += p;
             }
         }
+        // NOT the genotype's posterior. This is the largest posterior of ONE ordered haplotype-pair
+        // state; `gq` below is derived from allele_post, which aggregates every path pair spelling
+        // the same unordered ALLELE pair. Sequence-identical representatives and pair ordering split
+        // one genotype's mass across several states, so this sits near 1/k for k equivalent states
+        // and does NOT rise with depth even when the aggregated probability does -- measured at c4
+        // block 7: constant 0.250 from 10x to 60x while gq went 41.3 -> 68.5. Read as evidence of
+        // miscalibration by exactly that mistake, which is why the column is no longer called
+        // hap_posterior.
         c.hap_posterior = best_hp;
         if (allele_post.empty()) { c.filter = "NOCALL"; ++nocall; continue; }
 
@@ -1297,7 +1305,8 @@ void write_genotypes(
     std::ofstream g(gpath);
     if (!g) throw std::runtime_error("genotype: cannot write " + gpath);
     g << "block_index\tblock_kind\tbubble_id\tsource\tsink\tn_alleles\tn_markers"
-         "\tallele1\tallele2\thaplotype1\thaplotype2\thap_posterior\tgq\texplained\tdetected"
+         "\tallele1\tallele2\thaplotype1\thaplotype2\tbest_ordered_pair_posterior\tgq"
+         "\texplained\tdetected"
          "\tcalled_bp\tmass_bp\tmass_bp_sd\tcov_bp\tno_marker_alleles\tmax_copies\tblock_class"
          "\tevidence\tfilter\ttruth1\ttruth2\ttruth_rank\ttruth_delta\ttruth_ties"
           "\tn_scored_alleles\tcalled_emission_rank\tcalled_emission_delta"
