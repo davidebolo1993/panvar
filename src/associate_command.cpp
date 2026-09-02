@@ -1,9 +1,12 @@
 #include "panvar/associate_command.hpp"
 #include "panvar/cli_utils.hpp"
+#include "panvar/parallel.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -58,6 +61,64 @@ double parse_num(const std::string& t) {
     } catch (const std::exception&) {
         return kNaN;
     }
+}
+
+// ---- BIMBAM row scanning, without a string per cell -------------------------------------------
+//
+// The genotype matrix is the largest input associate reads, and splitting each row into a
+// vector<string> allocated one std::string per SAMPLE per ROW -- 16.5 million of them for the
+// 2,745-feature, 6,000-sample LPA cohort -- before a single number was parsed. Each was then trimmed
+// (another allocation) and handed to std::stod, which THROWS on a non-numeric cell, so every NA paid
+// for an exception.
+//
+// The line buffer is split in place instead: commas become NULs, so each field is already a C string
+// strtod can read with no copy. strtod is what std::stod calls underneath, so the numeric
+// interpretation is unchanged -- leading whitespace skipped, parsing stops at the first character
+// that cannot continue the number.
+struct BimbamRowScanner {
+    std::vector<char*> fields;   // reused across rows; no per-row allocation once warm
+
+    std::size_t scan(std::string& line) {
+        fields.clear();
+        char* p = line.data();
+        char* const end = p + line.size();
+        fields.push_back(p);
+        for (; p != end; ++p) {
+            if (*p == ',') {
+                *p = '\0';
+                fields.push_back(p + 1);
+            }
+        }
+        *end = '\0';   // std::string guarantees a writable NUL at data()[size()]
+        return fields.size();
+    }
+};
+
+// The NA vocabulary of is_na_token, applied to a NUL-terminated field without copying it. Deliberately
+// kept next to that function: the two must agree, and "-9" meaning MISSING rather than the number -9
+// is the one whose divergence would silently corrupt a result rather than fail.
+bool is_na_field(const char* t) {
+    while (*t != '\0' && std::isspace(static_cast<unsigned char>(*t))) ++t;
+    const char* e = t + std::strlen(t);
+    while (e > t && std::isspace(static_cast<unsigned char>(e[-1]))) --e;
+    const std::size_t n = static_cast<std::size_t>(e - t);
+    if (n == 0) return true;
+    if (n > 4) return false;                    // longer than any NA token
+    char buf[5];
+    for (std::size_t i = 0; i < n; ++i)
+        buf[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(t[i])));
+    buf[n] = '\0';
+    return std::strcmp(buf, "na") == 0 || std::strcmp(buf, "nan") == 0 ||
+           std::strcmp(buf, ".") == 0 || std::strcmp(buf, "-9") == 0 ||
+           std::strcmp(buf, "null") == 0;
+}
+
+// Numeric value of one in-place field. Same result as parse_num on the equivalent std::string.
+double parse_field(const char* t) {
+    if (is_na_field(t)) return kNaN;
+    char* endp = nullptr;
+    const double v = std::strtod(t, &endp);
+    return endp == t ? kNaN : v;   // no conversion at all: what stod would have thrown on
 }
 
 // Two-sided Wald p-value from a z statistic. Computed as the upper tail directly via erfc
@@ -770,6 +831,9 @@ struct Options {
     double ld_r2 = 0.8;          // variant tier: genotype r^2 above which a variant is an LD shadow of a lead
     long min_ac = 3;             // variant tier: minor-allele-count floor below which a call is flagged low_af
     double cojo_p = -1.0;        // variant tier: forward-stepwise (COJO) entry p; <0 -> use 0.05/Meff
+    // Worker threads for the per-feature loop (0 = auto). Output is identical at any thread count:
+    // features are scored into per-index slots and appended in file order.
+    std::size_t threads = 0;
     bool quiet = false;
 };
 
@@ -828,6 +892,8 @@ void print_help() {
         << "                         for --model lmm / --pca. panvar is local, so it does not build a GRM itself;\n"
         << "                         supply a genome-wide one, or use PC columns in the phenotype table.\n"
         << "  --pca <N>              add the top-N kinship PCs as covariates to the GLM (needs --kinship)\n"
+        << "      --threads <N>      worker threads for the per-feature loop (0 = auto). Output is\n"
+        << "                         identical regardless of thread count\n"
         << "  -q, --quiet            less logging\n\n"
         << "Outputs: <prefix>.assoc.tsv (per-feature beta/se/p/p_bonf/p_bonf_meff/q_bh, af/an/low_af,\n"
         << "  clump/is_lead[/gene]) and <prefix>.summary.tsv (n_tests, meff, Bonferroni thresholds, significant\n"
@@ -871,6 +937,7 @@ int run_associate_command(const std::vector<std::string>& args) {
         else if (a == "--model") opt.model = need(i);
         else if (a == "--kinship") opt.kinship = need(i);
         else if (a == "--pca") opt.pca = std::stoi(need(i));
+        else if (a == "--threads") opt.threads = static_cast<std::size_t>(std::stoul(need(i)));
         else if (a == "-q" || a == "--quiet") opt.quiet = true;
         else throw std::runtime_error("Unknown option for associate: " + a);
     }
@@ -1201,162 +1268,222 @@ int run_associate_command(const std::vector<std::string>& args) {
     GzLineReader gr(opt.genotypes);
     if (!gr.ok()) throw std::runtime_error("cannot open --genotypes: " + opt.genotypes);
     std::string line;
-    while (gr.getline(line)) {
-        if (line.empty()) continue;
-        // BIMBAM mean genotype: id, A, B, dose1, dose2, ...   (comma-separated, possibly space-padded)
-        std::vector<std::string> f = split(line, ',');
-        if (f.size() < 3 + geno_samples.size()) continue;  // malformed / wrong sample count
-        ++n_geno_rows;
-        const std::string id = trim(f[0]);
-
-        // collect genotype dosage for used samples. GLM/logistic drop NA samples per feature; LMM keeps
-        // every used sample (the rotation is over a fixed set) and mean-imputes NA.
-        std::vector<double> g; g.reserve(n_used);
-        std::vector<double> yy; yy.reserve(n_used);
-        std::vector<std::vector<double>> zz; zz.reserve(n_used);
-        Eigen::VectorXd glmm;            // full-length imputed genotype (LMM only)
-        if (is_lmm) {
-            glmm.resize(n_used);
-            double sum = 0.0; std::size_t nf = 0;
-            for (std::size_t c = 0; c < geno_samples.size(); ++c) {
-                if (col_to_used[c] < 0) continue;
-                const std::size_t u = static_cast<std::size_t>(col_to_used[c]);
-                const double dose = parse_num(f[3 + c]);
-                glmm(static_cast<Eigen::Index>(u)) = dose;
-                if (std::isfinite(dose)) { sum += dose; ++nf; g.push_back(dose); }
-            }
-            if (nf == 0) { ++n_dropped_fit; continue; }
-            const double mean = sum / static_cast<double>(nf);
-            for (std::size_t u = 0; u < n_used; ++u)
-                if (!std::isfinite(glmm(static_cast<Eigen::Index>(u)))) glmm(static_cast<Eigen::Index>(u)) = mean;
-        } else {
-            for (std::size_t c = 0; c < geno_samples.size(); ++c) {
-                if (col_to_used[c] < 0) continue;
-                const double dose = parse_num(f[3 + c]);
-                if (!std::isfinite(dose)) continue;  // genuinely missing (NA = non-traversing)
-                const std::size_t u = static_cast<std::size_t>(col_to_used[c]);
-                g.push_back(dose);
-                yy.push_back(y[u]);
-                zz.push_back(Z[u]);
-            }
-        }
-        const std::size_t n = is_lmm ? n_used : g.size();
-        if (n < p_dim + 1) { ++n_dropped_fit; continue; }
-
-        // minor (non-modal) genotype frequency: 1 - freq(most common rounded dosage). Works for both
-        // presence/absence (0/1) and CN dosage (drops invariant / cohort-rare features). Computed on the
-        // observed (non-imputed) dosages collected in g.
-        std::unordered_map<long long, std::size_t> cat;
-        for (double v : g) ++cat[std::llround(v)];
-        std::size_t mode = 0;
-        for (const auto& kv : cat) mode = std::max(mode, kv.second);
-        const double minor_freq = 1.0 - static_cast<double>(mode) / static_cast<double>(g.size());
-        if (minor_freq < opt.min_maf) { ++n_dropped_maf; continue; }
-
-        FitResult fr;
-        std::string row_effect_status = "ok";
-        std::string row_p_method = is_lmm ? "lmm" : "t";
-        if (is_lmm) {
-            fr = lmm_test(lmm, glmm);
-        } else {
-            // design matrix: intercept, genotype, covariates(+PCs)
-            std::vector<double> X(n * p_dim);
-            for (std::size_t i = 0; i < n; ++i) {
-                X[i * p_dim + 0] = 1.0;
-                X[i * p_dim + 1] = g[i];
-                for (std::size_t j = 0; j < ncov_eff; ++j) X[i * p_dim + 2 + j] = zz[i][j];
-            }
-            fr = (model == "logistic") ? fit_logistic(X, yy, n, p_dim) : fit_linear(X, yy, n, p_dim);
-            if (model == "logistic") {
-                bool separated = false;
-                // Keep the Wald fit's beta/se as the effect size, but report the SCORE test's p. The two
-                // agree for common features and diverge exactly where the Wald one breaks -- a rare
-                // variant in an unbalanced case/control study, where near-separation inflates the
-                // standard error and collapses the statistic.
-                const FitResult sc = score_logistic(X, yy, n, p_dim);
-                // The contract is that a logistic p is ALWAYS the score test's. If the score test fails
-                // there is no valid p to report: keeping the Wald one and labelling it `score` is the
-                // silent fallback the contract exists to forbid, so the feature is dropped instead.
-                if (!sc.ok) { fr.ok = false; }
-                if (sc.ok) {
-                    if (!fr.ok) {
-                        // ML diverged. Recover a finite effect size with Firth's penalised likelihood
-                        // rather than reporting none; the p-value stays the score test's either way.
-                        std::vector<double> fb, finv;
-                        if (firth_logistic(X, yy, n, p_dim, fb, finv) && finv.size() == p_dim * p_dim &&
-                            finv[1 * p_dim + 1] > 0.0) {
-                            fr.beta = fb[1];
-                            fr.se = std::sqrt(finv[1 * p_dim + 1]);
-                        } else {
-                            fr.beta = kNaN; fr.se = kNaN;
-                        }
-                        separated = true;
-                    }
-                    fr.z = sc.z; fr.p = sc.p; fr.ok = true;
-                }
-                if (separated) row_effect_status = "separation";
-                row_p_method = sc.exact_tail ? "score_exact" : (sc.spa ? "score_spa" : "score");
-            }
-        }
-        if (!fr.ok) { ++n_dropped_fit; continue; }
-
+    BimbamRowScanner scanner;
+    // ---- per-feature association, batched across worker threads --------------------------------
+    //
+    // Every feature is an independent test -- an IRLS null fit, a score statistic, and past the cutoff
+    // a saddlepoint root-solve -- reading shared const state and writing one row. None of it was
+    // threaded, in a tree where ten other translation units use run_parallel. On the 6,000-sample LPA
+    // cohort a binary phenotype spent 35s here against 4s for a quantitative one, because only the
+    // binary path pays for the IRLS fit and the saddlepoint.
+    //
+    // Batched rather than streamed, because the input is read sequentially: read a batch of lines,
+    // score them in parallel into per-index slots, then append IN FILE ORDER. The order is load-
+    // bearing -- var_dose and var_obs are positionally parallel to rows and everything downstream
+    // indexes all three together -- so appending is the serial step and scoring is not. The result
+    // therefore cannot depend on the thread count.
+    struct RowResult {
+        bool counted = false;      // enough fields to be a genotype row at all
+        bool dropped_maf = false;
+        bool dropped_fit = false;
+        bool keep = false;
         Row row;
-        row.effect_status = row_effect_status;
-        row.p_method = row_p_method;
-        row.id = id;
-        std::string ann_gene;
-        if (auto it = annot.find(id); it != annot.end()) {
-            row.layer = it->second.layer; row.bubbles = it->second.bubbles; row.nodes = it->second.nodes;
-            row.svtype = it->second.svtype; row.af = it->second.af; row.an = it->second.an;
-            ann_gene = it->second.gene;
-        } else { row.layer = "."; row.bubbles = "."; row.nodes = "."; }
-        // gene: the variant sidecar's GENES if present, else the node->gene join.
-        row.gene = (ann_gene != "." && !ann_gene.empty()) ? ann_gene : genes_for(row.nodes);
-        // low_af: too few minority observations -> underpowered / asymptotically unstable p. Use the
-        // OBSERVED non-modal genotype count (minor_freq * n), not the VCF carrier-AF: for a DUP the
-        // dosage is the continuous CN gradient, so a carrier-AF near 1 still carries ample variance and
-        // must not be flagged. This metric is uniform for binary (0/1) and copy-number genotypes.
-        if (variant_mode)
-            row.low_af = (minor_freq * static_cast<double>(n) < static_cast<double>(opt.min_ac)) ? 1 : 0;
-        if (binary && g.size() == yy.size() && !g.empty()) {
-            long long modal = 0; std::size_t best = 0;
-            for (const auto& kv : cat) if (kv.second > best) { best = kv.second; modal = kv.first; }
-            long ca = 0, co = 0;
-            for (std::size_t t = 0; t < g.size(); ++t)
-                if (std::llround(g[t]) != modal) { if (yy[t] > 0.5) ++ca; else ++co; }
-            row.mac_case = ca; row.mac_ctrl = co;
-        }
-        row.n = n; row.minor_freq = minor_freq;
-        row.beta = fr.beta; row.se = fr.se; row.z = fr.z; row.p = fr.p;
-        rows.push_back(std::move(row));
+        Eigen::VectorXd vd;        // variant tier only
+        std::vector<char> obs;
+    };
 
-        // Retain a full-length mean-imputed dosage for variant-tier LD-clumping (cheap: few variants).
-        if (variant_mode) {
-            Eigen::VectorXd vd(n_used);
-            std::vector<char> obs(n_used, 1);
+    constexpr std::size_t kRowBatch = 256;
+    std::vector<std::string> batch;
+    std::vector<RowResult> batch_out;
+    // One scanner per batch slot: scan() mutates its line, so workers cannot share one.
+    std::vector<BimbamRowScanner> scanners(kRowBatch);
+    batch.reserve(kRowBatch);
+
+    const auto score_row = [&](std::string& line, BimbamRowScanner& sc, RowResult& out) {
+            // BIMBAM mean genotype: id, A, B, dose1, dose2, ...   (comma-separated, possibly space-padded)
+            // Empty lines are filtered by the reader loop below, before a line reaches a batch.
+            if (sc.scan(line) < 3 + geno_samples.size()) return;  // malformed / wrong sample count
+            const std::vector<char*>& f = sc.fields;
+            out.counted = true;
+            const std::string id = trim(std::string(f[0]));
+
+            // collect genotype dosage for used samples. GLM/logistic drop NA samples per feature; LMM keeps
+            // every used sample (the rotation is over a fixed set) and mean-imputes NA.
+            std::vector<double> g; g.reserve(n_used);
+            std::vector<double> yy; yy.reserve(n_used);
+            std::vector<std::vector<double>> zz; zz.reserve(n_used);
+            Eigen::VectorXd glmm;            // full-length imputed genotype (LMM only)
             if (is_lmm) {
-                vd = glmm;  // already full-length, mean-imputed (the LMM rotation needs a fixed set)
-            } else {
-                for (std::size_t u = 0; u < n_used; ++u) vd(static_cast<Eigen::Index>(u)) =
-                    std::numeric_limits<double>::quiet_NaN();
+                glmm.resize(n_used);
                 double sum = 0.0; std::size_t nf = 0;
                 for (std::size_t c = 0; c < geno_samples.size(); ++c) {
                     if (col_to_used[c] < 0) continue;
-                    const double dose = parse_num(f[3 + c]);
-                    if (!std::isfinite(dose)) continue;
-                    vd(static_cast<Eigen::Index>(col_to_used[c])) = dose; sum += dose; ++nf;
+                    const std::size_t u = static_cast<std::size_t>(col_to_used[c]);
+                    const double dose = parse_field(f[3 + c]);
+                    glmm(static_cast<Eigen::Index>(u)) = dose;
+                    if (std::isfinite(dose)) { sum += dose; ++nf; g.push_back(dose); }
                 }
-                const double mean = nf ? sum / static_cast<double>(nf) : 0.0;
+                if (nf == 0) { out.dropped_fit = true; return; }
+                const double mean = sum / static_cast<double>(nf);
                 for (std::size_t u = 0; u < n_used; ++u)
-                    if (!std::isfinite(vd(static_cast<Eigen::Index>(u)))) {
-                        vd(static_cast<Eigen::Index>(u)) = mean;
-                        obs[u] = 0;
-                    }
+                    if (!std::isfinite(glmm(static_cast<Eigen::Index>(u)))) glmm(static_cast<Eigen::Index>(u)) = mean;
+            } else {
+                for (std::size_t c = 0; c < geno_samples.size(); ++c) {
+                    if (col_to_used[c] < 0) continue;
+                    const double dose = parse_field(f[3 + c]);
+                    if (!std::isfinite(dose)) return;  // genuinely missing (NA = non-traversing)
+                    const std::size_t u = static_cast<std::size_t>(col_to_used[c]);
+                    g.push_back(dose);
+                    yy.push_back(y[u]);
+                    zz.push_back(Z[u]);
+                }
             }
-            var_dose.push_back(std::move(vd));
-            var_obs.push_back(std::move(obs));
+            const std::size_t n = is_lmm ? n_used : g.size();
+            if (n < p_dim + 1) { out.dropped_fit = true; return; }
+
+            // minor (non-modal) genotype frequency: 1 - freq(most common rounded dosage). Works for both
+            // presence/absence (0/1) and CN dosage (drops invariant / cohort-rare features). Computed on the
+            // observed (non-imputed) dosages collected in g.
+            std::unordered_map<long long, std::size_t> cat;
+            for (double v : g) ++cat[std::llround(v)];
+            std::size_t mode = 0;
+            for (const auto& kv : cat) mode = std::max(mode, kv.second);
+            const double minor_freq = 1.0 - static_cast<double>(mode) / static_cast<double>(g.size());
+            if (minor_freq < opt.min_maf) { out.dropped_maf = true; return; }
+
+            FitResult fr;
+            std::string row_effect_status = "ok";
+            std::string row_p_method = is_lmm ? "lmm" : "t";
+            if (is_lmm) {
+                fr = lmm_test(lmm, glmm);
+            } else {
+                // design matrix: intercept, genotype, covariates(+PCs)
+                std::vector<double> X(n * p_dim);
+                for (std::size_t i = 0; i < n; ++i) {
+                    X[i * p_dim + 0] = 1.0;
+                    X[i * p_dim + 1] = g[i];
+                    for (std::size_t j = 0; j < ncov_eff; ++j) X[i * p_dim + 2 + j] = zz[i][j];
+                }
+                fr = (model == "logistic") ? fit_logistic(X, yy, n, p_dim) : fit_linear(X, yy, n, p_dim);
+                if (model == "logistic") {
+                    bool separated = false;
+                    // Keep the Wald fit's beta/se as the effect size, but report the SCORE test's p. The two
+                    // agree for common features and diverge exactly where the Wald one breaks -- a rare
+                    // variant in an unbalanced case/control study, where near-separation inflates the
+                    // standard error and collapses the statistic.
+                    const FitResult sc = score_logistic(X, yy, n, p_dim);
+                    // The contract is that a logistic p is ALWAYS the score test's. If the score test fails
+                    // there is no valid p to report: keeping the Wald one and labelling it `score` is the
+                    // silent fallback the contract exists to forbid, so the feature is dropped instead.
+                    if (!sc.ok) { fr.ok = false; }
+                    if (sc.ok) {
+                        if (!fr.ok) {
+                            // ML diverged. Recover a finite effect size with Firth's penalised likelihood
+                            // rather than reporting none; the p-value stays the score test's either way.
+                            std::vector<double> fb, finv;
+                            if (firth_logistic(X, yy, n, p_dim, fb, finv) && finv.size() == p_dim * p_dim &&
+                                finv[1 * p_dim + 1] > 0.0) {
+                                fr.beta = fb[1];
+                                fr.se = std::sqrt(finv[1 * p_dim + 1]);
+                            } else {
+                                fr.beta = kNaN; fr.se = kNaN;
+                            }
+                            separated = true;
+                        }
+                        fr.z = sc.z; fr.p = sc.p; fr.ok = true;
+                    }
+                    if (separated) row_effect_status = "separation";
+                    row_p_method = sc.exact_tail ? "score_exact" : (sc.spa ? "score_spa" : "score");
+                }
+            }
+            if (!fr.ok) { out.dropped_fit = true; return; }
+
+            Row row;
+            row.effect_status = row_effect_status;
+            row.p_method = row_p_method;
+            row.id = id;
+            std::string ann_gene;
+            if (auto it = annot.find(id); it != annot.end()) {
+                row.layer = it->second.layer; row.bubbles = it->second.bubbles; row.nodes = it->second.nodes;
+                row.svtype = it->second.svtype; row.af = it->second.af; row.an = it->second.an;
+                ann_gene = it->second.gene;
+            } else { row.layer = "."; row.bubbles = "."; row.nodes = "."; }
+            // gene: the variant sidecar's GENES if present, else the node->gene join.
+            row.gene = (ann_gene != "." && !ann_gene.empty()) ? ann_gene : genes_for(row.nodes);
+            // low_af: too few minority observations -> underpowered / asymptotically unstable p. Use the
+            // OBSERVED non-modal genotype count (minor_freq * n), not the VCF carrier-AF: for a DUP the
+            // dosage is the continuous CN gradient, so a carrier-AF near 1 still carries ample variance and
+            // must not be flagged. This metric is uniform for binary (0/1) and copy-number genotypes.
+            if (variant_mode)
+                row.low_af = (minor_freq * static_cast<double>(n) < static_cast<double>(opt.min_ac)) ? 1 : 0;
+            if (binary && g.size() == yy.size() && !g.empty()) {
+                long long modal = 0; std::size_t best = 0;
+                for (const auto& kv : cat) if (kv.second > best) { best = kv.second; modal = kv.first; }
+                long ca = 0, co = 0;
+                for (std::size_t t = 0; t < g.size(); ++t)
+                    if (std::llround(g[t]) != modal) { if (yy[t] > 0.5) ++ca; else ++co; }
+                row.mac_case = ca; row.mac_ctrl = co;
+            }
+            row.n = n; row.minor_freq = minor_freq;
+            row.beta = fr.beta; row.se = fr.se; row.z = fr.z; row.p = fr.p;
+            out.row = std::move(row);
+        out.keep = true;
+
+            // Retain a full-length mean-imputed dosage for variant-tier LD-clumping (cheap: few variants).
+            if (variant_mode) {
+                Eigen::VectorXd vd(n_used);
+                std::vector<char> obs(n_used, 1);
+                if (is_lmm) {
+                    vd = glmm;  // already full-length, mean-imputed (the LMM rotation needs a fixed set)
+                } else {
+                    for (std::size_t u = 0; u < n_used; ++u) vd(static_cast<Eigen::Index>(u)) =
+                        std::numeric_limits<double>::quiet_NaN();
+                    double sum = 0.0; std::size_t nf = 0;
+                    for (std::size_t c = 0; c < geno_samples.size(); ++c) {
+                        if (col_to_used[c] < 0) continue;
+                        const double dose = parse_field(f[3 + c]);
+                        if (!std::isfinite(dose)) continue;
+                        vd(static_cast<Eigen::Index>(col_to_used[c])) = dose; sum += dose; ++nf;
+                    }
+                    const double mean = nf ? sum / static_cast<double>(nf) : 0.0;
+                    for (std::size_t u = 0; u < n_used; ++u)
+                        if (!std::isfinite(vd(static_cast<Eigen::Index>(u)))) {
+                            vd(static_cast<Eigen::Index>(u)) = mean;
+                            obs[u] = 0;
+                        }
+                }
+                out.vd = std::move(vd);
+                out.obs = std::move(obs);
+            }
+    };
+
+    const auto drain_batch = [&]() {
+        if (batch.empty()) return;
+        batch_out.assign(batch.size(), RowResult{});
+        run_parallel(batch.size(), opt.threads, [&](std::size_t bi) {
+            score_row(batch[bi], scanners[bi], batch_out[bi]);
+        });
+        for (RowResult& r : batch_out) {
+            if (r.counted) ++n_geno_rows;
+            if (r.dropped_maf) ++n_dropped_maf;
+            if (r.dropped_fit) ++n_dropped_fit;
+            if (!r.keep) continue;
+            rows.push_back(std::move(r.row));
+            if (variant_mode) {
+                var_dose.push_back(std::move(r.vd));
+                var_obs.push_back(std::move(r.obs));
+            }
         }
+        batch.clear();
+    };
+
+    while (gr.getline(line)) {
+        if (line.empty()) continue;
+        batch.push_back(line);
+        if (batch.size() == kRowBatch) drain_batch();
     }
+    drain_batch();
+
 
     // ---- multiple testing over the ACTUALLY TESTED features (not genome-wide) ----
     const std::size_t n_tests = rows.size();
@@ -1575,13 +1702,13 @@ int run_associate_command(const std::vector<std::string>& args) {
         // of the lead's variant collapses. Two bounded streaming passes (no feature x sample matrix kept).
         // `obs` records which rows carried a real dosage, so the conditional fit below can use the same
         // complete cases the marginal test used rather than mean-imputed stand-ins.
-        auto parse_full = [&](const std::vector<std::string>& f, Eigen::VectorXd& vd,
+        auto parse_full = [&](const std::vector<char*>& f, Eigen::VectorXd& vd,
                               std::vector<char>* obs = nullptr) -> bool {
             vd = Eigen::VectorXd::Constant(static_cast<Eigen::Index>(n_used), kNaN);
             double sum = 0.0; std::size_t nf = 0;
             for (std::size_t c = 0; c < geno_samples.size(); ++c) {
                 if (col_to_used[c] < 0) continue;
-                const double dose = parse_num(f[3 + c]);
+                const double dose = parse_field(f[3 + c]);
                 if (!std::isfinite(dose)) continue;
                 vd(static_cast<Eigen::Index>(col_to_used[c])) = dose; sum += dose; ++nf;
             }
@@ -1604,21 +1731,23 @@ int run_associate_command(const std::vector<std::string>& args) {
         const std::size_t need_cols = 3 + geno_samples.size();
         Eigen::VectorXd gl;  // pass 1: capture the lead feature's dosage
         std::vector<char> lead_obs;
-        { GzLineReader g2(opt.genotypes); std::string line;
+        { GzLineReader g2(opt.genotypes); std::string line; BimbamRowScanner sc2;
           while (g2.getline(line)) {
               if (line.empty()) continue;
-              std::vector<std::string> f = split(line, ',');
-              if (f.size() < need_cols) continue;
-              if (trim(f[0]) == lead_id) { parse_full(f, gl, &lead_obs); break; }
+              if (sc2.scan(line) < need_cols) continue;
+              if (trim(std::string(sc2.fields[0])) == lead_id) {
+                  parse_full(sc2.fields, gl, &lead_obs);
+                  break;
+              }
           } }
         if (gl.size() == static_cast<Eigen::Index>(n_used)) {
             const std::size_t pc = p_dim + 1;  // intercept, g_i, covariates, g_lead
-            GzLineReader g3(opt.genotypes); std::string line;
+            GzLineReader g3(opt.genotypes); std::string line; BimbamRowScanner sc3;
             while (g3.getline(line)) {
                 if (line.empty()) continue;
-                std::vector<std::string> f = split(line, ',');
-                if (f.size() < need_cols) continue;
-                const auto it = id_to_row.find(trim(f[0]));
+                if (sc3.scan(line) < need_cols) continue;
+                const std::vector<char*>& f = sc3.fields;
+                const auto it = id_to_row.find(trim(std::string(f[0])));
                 if (it == id_to_row.end()) continue;
                 const std::size_t i = it->second;
                 if (i == lead_idx) { cond_role[i] = "lead"; continue; }

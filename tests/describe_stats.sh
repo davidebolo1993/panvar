@@ -383,5 +383,31 @@ check "an input under an owned output name is refused" "$(verdict $?)" "refused"
 check "and that input still exists" \
       "$([ -s "$OUT/alias_dir/bubble_1/b.csv" ] && echo yes || echo no)" "yes"
 
+# describe.index.tsv must name files that EXIST.
+#
+# The index is the documented entry point to a describe run, and every path column in it pointed
+# inside the staging directory -- which is renamed into place at commit, so nothing it named was
+# there afterwards. A consumer following the index found nothing at all.
+IDXD="$OUT/idx"
+"$BIN" describe -i "$OUT/ab.sorted.gfa" --bubble-prefix-in "$OUT/ab" \
+   --out-dir "$IDXD" --no-wide-matrix -q >/dev/null 2>&1
+missing=0
+if [ -s "$IDXD/describe.index.tsv" ]; then
+  # columns 7,8,9 (k-mer) and 18,19 (graph) are paths; "." means "not written".
+  while IFS= read -r p; do
+    [ "$p" = "." ] && continue
+    [ -f "$p" ] || missing=$((missing + 1))
+  done <<EOF
+$(cut -f7,8,9,18,19 "$IDXD/describe.index.tsv" | tail -n +2 | tr '\t' '\n')
+EOF
+else
+  missing=-1
+fi
+check "every path in describe.index.tsv resolves to a file" "$missing" "0"
+# grep -c prints its count AND exits 1 on no match, so a `|| echo 0` fallback appends a SECOND zero
+# and the comparison reads "0 0" against "0". No `set -e` here, so the exit status can just be ignored.
+check "no describe.index.tsv path names the staging directory" \
+      "$(grep -c 'describe-staging' "$IDXD/describe.index.tsv" 2>/dev/null)" "0"
+
 printf "%d assertion(s) failed\n" "$fails"
 [ "$fails" -eq 0 ]

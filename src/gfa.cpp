@@ -85,10 +85,12 @@ std::vector<PathStep> parse_w_steps(const std::string& walk) {
     return steps;
 }
 
+} // namespace
+
 // `*` on an L line means the overlap is UNKNOWN, not that it is zero. Reporting it as 0 lets a caller
 // that concatenates segments believe it verified something it did not, so it is distinguished here and
 // consumers decide: -1 = unknown.
-int parse_overlap(const std::string& field) {
+int parse_gfa_overlap(const std::string& field) {
     if (field == "*") {
         return -1;
     }
@@ -98,7 +100,33 @@ int parse_overlap(const std::string& field) {
     return std::stoi(field);
 }
 
-} // namespace
+// The side mapping for one oriented link, and the duplicate check. Exported (declared in gfa.hpp) so
+// that graph_from_model builds the SAME adjacency this function builds from a file -- a second copy of
+// these four branches is exactly the kind of divergence the rest of this codebase keeps paying for.
+void add_gfa_edge(Graph& graph, const std::string& from, char from_orient,
+                  const std::string& to, char to_orient, int overlap) {
+    if (graph.nodes.find(from) == graph.nodes.end() ||
+        graph.nodes.find(to) == graph.nodes.end()) {
+        return;
+    }
+
+    const bool from_start = (from_orient == '-');
+    const bool to_end = (to_orient == '-');
+
+    if (from_start && to_end) {
+        add_neighbor(graph.nodes[from].start, Neighbor{to, 1, overlap});
+        add_neighbor(graph.nodes[to].end, Neighbor{from, 0, overlap});
+    } else if (from_start && !to_end) {
+        add_neighbor(graph.nodes[from].start, Neighbor{to, 0, overlap});
+        add_neighbor(graph.nodes[to].start, Neighbor{from, 0, overlap});
+    } else if (!from_start && !to_end) {
+        add_neighbor(graph.nodes[from].end, Neighbor{to, 0, overlap});
+        add_neighbor(graph.nodes[to].start, Neighbor{from, 1, overlap});
+    } else {
+        add_neighbor(graph.nodes[from].end, Neighbor{to, 1, overlap});
+        add_neighbor(graph.nodes[to].end, Neighbor{from, 1, overlap});
+    }
+}
 
 std::vector<std::string> Graph::neighbors_of(const std::string& node_id) const {
     const auto it = nodes.find(node_id);
@@ -172,7 +200,7 @@ Graph parse_gfa(const std::string& gfa_path, const ParseGfaOptions& options) {
             edge.from_orient = fields[2].empty() ? '+' : fields[2][0];
             edge.to = fields[3];
             edge.to_orient = fields[4].empty() ? '+' : fields[4][0];
-            edge.overlap = parse_overlap(fields[5]);
+            edge.overlap = parse_gfa_overlap(fields[5]);
             raw_edges.push_back(std::move(edge));
         } else if (rec == "P" && options.include_paths) {
             if (fields.size() < 3) {
@@ -196,27 +224,7 @@ Graph parse_gfa(const std::string& gfa_path, const ParseGfaOptions& options) {
     }
 
     for (const auto& edge : raw_edges) {
-        if (graph.nodes.find(edge.from) == graph.nodes.end() ||
-            graph.nodes.find(edge.to) == graph.nodes.end()) {
-            continue;
-        }
-
-        const bool from_start = (edge.from_orient == '-');
-        const bool to_end = (edge.to_orient == '-');
-
-        if (from_start && to_end) {
-            add_neighbor(graph.nodes[edge.from].start, Neighbor{edge.to, 1, edge.overlap});
-            add_neighbor(graph.nodes[edge.to].end, Neighbor{edge.from, 0, edge.overlap});
-        } else if (from_start && !to_end) {
-            add_neighbor(graph.nodes[edge.from].start, Neighbor{edge.to, 0, edge.overlap});
-            add_neighbor(graph.nodes[edge.to].start, Neighbor{edge.from, 0, edge.overlap});
-        } else if (!from_start && !to_end) {
-            add_neighbor(graph.nodes[edge.from].end, Neighbor{edge.to, 0, edge.overlap});
-            add_neighbor(graph.nodes[edge.to].start, Neighbor{edge.from, 1, edge.overlap});
-        } else {
-            add_neighbor(graph.nodes[edge.from].end, Neighbor{edge.to, 1, edge.overlap});
-            add_neighbor(graph.nodes[edge.to].end, Neighbor{edge.from, 1, edge.overlap});
-        }
+        add_gfa_edge(graph, edge.from, edge.from_orient, edge.to, edge.to_orient, edge.overlap);
     }
 
     return graph;

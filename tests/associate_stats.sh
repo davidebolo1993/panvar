@@ -172,6 +172,41 @@ for cfg in "indep:3" "same:1" "blocks:2"; do
                        || bad "Li-Ji Meff on '$nm' = $got, expected $want"
 done
 
+# ------------------------------------------------- variant tier: no race, and thread-independent
+#
+# The per-feature loop is scored across worker threads. The first version of that change left
+# var_dose.push_back and var_obs.push_back inside the parallel region, so workers appended to a shared
+# vector concurrently: 20 crashes in 30 runs (SIGSEGV, SIGABRT, bad_alloc). It survived hand-checking
+# because those two lines sit behind `if (variant_mode)`, and the substrate being checked by hand was
+# the k-mer one.
+#
+# So this exercises the VARIANT tier specifically, repeatedly (a race that fires two times in three
+# still passes a single run), and asserts both that it survives and that what it produces does not
+# depend on the thread count.
+mk_meff race "r1, A, B, $A" "r2, A, B, $B" "r3, A, B, $C" "r4, A, B, $A" "r5, A, B, $B" "r6, A, B, $C"
+race_fail=0
+for i in $(seq 1 12); do
+  "$BIN" associate --genotypes "$OUT/race.bimbam.gz" --samples "$OUT/m.samples.gz" \
+    --feature-annot "$OUT/race.annot.tsv.gz" --phenotype "$OUT/m.pheno" --min-maf 0 \
+    -o "$OUT/race.$i" --quiet >/dev/null 2>&1 || race_fail=$((race_fail + 1))
+done
+check "12 consecutive variant-tier runs all succeed" "$race_fail" "0"
+
+race_same=1
+for i in $(seq 2 12); do
+  cmp -s "$OUT/race.1.assoc.tsv" "$OUT/race.$i.assoc.tsv" || race_same=0
+done
+check "and all 12 produce identical results" "$race_same" "1"
+
+"$BIN" associate --genotypes "$OUT/race.bimbam.gz" --samples "$OUT/m.samples.gz" \
+  --feature-annot "$OUT/race.annot.tsv.gz" --phenotype "$OUT/m.pheno" --min-maf 0 \
+  -o "$OUT/race.t1" --threads 1 --quiet >/dev/null 2>&1
+if cmp -s "$OUT/race.1.assoc.tsv" "$OUT/race.t1.assoc.tsv"; then
+  ok "variant-tier output is identical at 1 thread and at auto"
+else
+  bad "variant-tier output depends on the thread count"
+fi
+
 # ------------------------------------------------- input validation
 dup_s="$OUT/dup.samples"; gunzip -c "$OUT/lin.samples.gz" > "$dup_s"; echo "s1" >> "$dup_s"
 gzip -cf "$dup_s" > "$dup_s.gz"

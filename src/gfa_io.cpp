@@ -196,6 +196,44 @@ void write_gfa_model(const std::string& out_path, const GfaModel& model) {
     }
 }
 
+Graph graph_from_model(const GfaModel& model, const ParseGfaOptions& options) {
+    Graph graph;
+    graph.nodes.reserve(model.node_order.size() * 2);
+
+    // S lines, in node_order -- the order write_gfa_model emits them and therefore the order
+    // parse_gfa would encounter them. A sequence absent from `seq` is written as '*' and read back as
+    // empty, so the two agree without a special case.
+    for (const std::string& id : model.node_order) {
+        Node& node = graph.nodes[id];
+        node.id = id;
+        const auto it = model.seq.find(id);
+        if (options.include_sequences && it != model.seq.end()) {
+            node.sequence = it->second;
+        } else {
+            node.sequence.clear();
+        }
+    }
+
+    // L lines, in model.edges order. Neighbour vectors are ordered, so iterating in any other order
+    // would build a Graph that compares unequal to the parsed one even though it describes the same
+    // links. The overlap is stored raw here and interpreted by the same parser parse_gfa uses.
+    for (const GfaEdge& e : model.edges) {
+        add_gfa_edge(graph, e.from, e.from_orient, e.to, e.to_orient, parse_gfa_overlap(e.overlap));
+    }
+
+    if (options.include_paths) {
+        graph.paths.reserve(model.paths.size());
+        for (const GfaPath& p : model.paths) {
+            PathRecord rec;
+            rec.type = p.type;
+            rec.name = gfa_path_name(p);   // the one canonical naming rule, W lines included
+            rec.steps = p.steps;
+            graph.paths.push_back(std::move(rec));
+        }
+    }
+    return graph;
+}
+
 std::string add_new_node(GfaModel& model, const std::string& sequence) {
     std::uint64_t max_id = 0;
     for (const std::string& id : model.node_order) {

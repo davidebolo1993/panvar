@@ -344,6 +344,34 @@ e=$("$BIN" rebuild -i "$OUT/e_star.gfa" -o "$OUT/e_star.out.gfa" 2>&1 | grep -c 
                || bad "an unknown ('*') overlap was accepted as zero"
 
 
+# A pass-through must emit a GFA, not a copy of whatever bytes arrived.
+#
+# `-i foo.gfa.gz -o out.gfa` on a healthy graph used to byte-copy the input, so the "GFA" it wrote
+# was gzip. panvar's own readers sniff the magic and never noticed, but --out is documented as a GFA
+# and every other consumer got binary -- and the REBUILT branch writes plain text, so one flag
+# produced two formats depending on whether the input happened to be compressed.
+printf 'H\tVN:Z:1.0\nS\t1\tACGTACGTAC\nS\t2\tTTTTGGGGCC\nL\t1\t+\t2\t+\t0M\nP\tp1\t1+,2+\t*\n' \
+  > "$OUT/pt.gfa"
+gzip -cf "$OUT/pt.gfa" > "$OUT/pt.gfa.gz"
+"$BIN" rebuild -i "$OUT/pt.gfa.gz" -o "$OUT/pt.out.gfa" --quiet >/dev/null 2>&1
+if [ -s "$OUT/pt.out.gfa" ]; then
+  head -c 2 "$OUT/pt.out.gfa" | od -An -tx1 | tr -d ' \n' | grep -q '^1f8b' \
+    && bad "a gzipped input was passed through as gzip under a .gfa name" \
+    || ok "a gzipped input is decompressed on pass-through"
+  cmp -s "$OUT/pt.gfa" "$OUT/pt.out.gfa" \
+    && ok "the passed-through GFA is byte-identical to the decompressed input" \
+    || bad "pass-through altered the graph"
+else
+  bad "pass-through produced no output"
+fi
+
+# ...and an already-plain input must still round-trip byte for byte.
+"$BIN" rebuild -i "$OUT/pt.gfa" -o "$OUT/pt.plain.gfa" --quiet >/dev/null 2>&1
+cmp -s "$OUT/pt.gfa" "$OUT/pt.plain.gfa" \
+  && ok "a plain input passes through byte-identically" \
+  || bad "pass-through altered a plain input"
+
+
 echo
 if [ "$fails" -eq 0 ]; then echo "rebuild_stats: all assertions passed"; exit 0; fi
 echo "rebuild_stats: $fails assertion(s) FAILED"; exit 1
