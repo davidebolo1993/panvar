@@ -39,14 +39,40 @@
 #   6. REPORTED WORK: candidate starts, verified starts, placements kept, runtime, and the
 #      omitted-mass bound. A search that cannot say what it skipped cannot be trusted not to skip.
 #
-# THE ACCEPTANCE EQUALITY, which subsumes the rest:
+# THE ACCEPTANCE CONDITIONS. An earlier draft demanded
 #
 #     bounded likelihood mass == exhaustive likelihood mass
-#     bounded exposure        == exhaustive exposure
 #
-# for EVERY candidate and every diploid pair on the small fixtures, with exact multiplicity-aware
-# compression permitted internally. Anything that changes either quantity is a different model, not
-# a faster one.
+# which is IMPOSSIBLE and would have made this gate unsatisfiable. The exhaustive reference
+# integrates every start and every insert length and does NOT truncate at max_divergence --
+# reference_emission is finite at every position, which is exactly why a union-of-spans scope came
+# out locus-wide in the oracle work and had to be replaced by a counterfactual test. So out-of-band
+# states carry small but NONZERO probability, and a search complete only within the band cannot
+# equal the total. Requiring it would force the bounded search to evaluate the outside-band tail
+# exactly, defeating its purpose, or would need a separate hard-band reference -- a DIFFERENT MODEL
+# from the current exhaustive one, not a faster implementation of it.
+#
+# What must hold instead:
+#
+#   A. bounded IN-BAND mass == exhaustive IN-BAND mass        (exact, every in-band placement found)
+#   B. bounded exposure     == exhaustive exposure            (exact, analytic)
+#   C. the omitted mass is BOUNDED, and the bound is valid:
+#
+#          M_found <= M_exhaustive <= M_found + M_omitted_bound
+#
+#      in log space, log M_exhaustive lies in
+#          [ log M_found , log_add(log M_found, log M_omitted_bound) ]
+#
+#   D. per fragment, per candidate AND per diploid pair -- a per-fragment bound does not imply the
+#      pair bound, the same reason the scope oracle's guarantee had to be made diploid;
+#   E. the exhaustive reference PAIR SCORE lies inside the reported interval;
+#   F. the interval WIDTH meets a declared tolerance before a call is certified. A bound that holds
+#      trivially because it is enormous certifies nothing.
+#
+# This is not a weaker gate. It stops the test both from demanding an impossible equality and from
+# passing merely because omitted likelihood rounds to zero on fixtures small enough to hide it.
+# Exact multiplicity-aware compression stays permitted internally: it must change neither the
+# in-band mass nor the exposure.
 #
 # STATUS: the search is NOT IMPLEMENTED. This file exits 77 (skip) until the entry point exists, so
 # it can be registered now and start gating the moment there is something to gate. It must never be
@@ -57,8 +83,10 @@ OUT="${2:?}"; mkdir -p "$OUT"
 
 if ! "$BIN" genotype-frag --help 2>&1 | grep -q -- "--bounded-search"; then
   echo "SKIP: --bounded-search is not implemented yet; gates are frozen and waiting"
-  echo "      acceptance: bounded mass == exhaustive mass AND bounded exposure == exhaustive"
-  echo "                  exposure, per candidate and per diploid pair, on 6 fixture classes"
+  echo "      acceptance: in-band mass and exposure EXACT; omitted mass validly BOUNDED, with"
+  echo "                  log M_exhaustive in [log M_found, logadd(log M_found, log M_bound)],"
+  echo "                  per fragment/candidate/pair; reference score inside the interval;"
+  echo "                  interval width within tolerance before certifying. 6 fixture classes"
   echo "                  (substitution, indel, reverse strand, repeat, junction, unseeded);"
   echo "                  completeness within band, no cap/top-k, valid-FR join, exact"
   echo "                  multiplicity-aware compression allowed, work and omitted-mass reported"

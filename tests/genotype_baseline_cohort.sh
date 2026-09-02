@@ -481,7 +481,21 @@ sys.exit(0 if t==c else 1)" 2>/dev/null && [ "$CALLED_D" != 0 ]; then
       done
       EQS=$(awk -F'\t' 'NR==2{print $2}' "$AD/call.equivalence.tsv" 2>/dev/null)
 
-      # NORMALISED FIT: NOT COMPUTED, deliberately.
+      # NORMALISED FIT. Definition, since the denominator is a real choice and not a detail:
+      #
+      #     fit = mean_f [ log P(f | called pair) - log P_bg(f) ]
+      #
+      # PURE background as the denominator, not the mixture-weighted eta*P_bg. The two differ by a
+      # constant -log(eta) per fragment, which is arbitrary and would ride on every locus's number
+      # while looking like signal. A mixture-weighted variant may be kept, but must be NAMED as such
+      # rather than reported under the same column.
+      #
+      # NOT COMPUTED YET, but no longer blocked: --dump-fragment-mass works on the production path
+      # (its own header says "production path (no --joint-depth)"), so the plan doc's claim that it
+      # requires --joint-depth is stale. What remains is to wire the dump into this harness and
+      # calibrate the distribution separately per locus and depth against the LZO controls -- an
+      # absolute fit compared across loci or depths without that calibration is not comparable.
+      # OLD NOTE, retained because the reasoning still applies to the previous attempt:
       # The previous version summed the two haplotypes' solo_ll and called the remainder
       # "exposure". That is invalid: the diploid per-fragment term is
       # log[(1-eta)*lambda*(M_a+M_b) + eta*P_bg], which is not the sum of two haploid terms -- the
