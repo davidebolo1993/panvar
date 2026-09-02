@@ -19,6 +19,21 @@ fails=0
 ok()  { printf '  ok   %s\n' "$*"; }
 bad() { printf '  FAIL %s\n' "$*"; fails=$((fails+1)); }
 
+# NO CANDIDATE IS UNPROJECTABLE, at any of the six loci. Measured: 0 of 2122 paths. This is the
+# invariant behind "no candidate-set reduction", and it is also why block_equivalence_size's NA
+# branch -- which fires when an equivalence member cannot be projected at a block -- is DEFENSIVE
+# CODE with no reachable fixture on this substrate. Recorded as an assertion rather than left as an
+# untested branch pretending to be tested: if this ever fails, that branch becomes live and needs
+# its own gate.
+for LOCUS in acot gstm1 lpa ankrd36c c4 cyp2d6; do
+  G="$REPO/results/real_data/$LOCUS/bubble/bubble.sorted.gfa"
+  [ -f "$G" ] || continue
+  "$BIN" genotype-frag -i "$G" -b "$REPO/results/real_data/$LOCUS/bubble/bubble"     -o "$OUT/u_$LOCUS" --dump-scored-sequences "$OUT/u_$LOCUS" -q >/dev/null 2>&1
+  NU=$(awk -F'	' 'NR>1 && $4=="unprojectable"{u[$2]=1} END{print length(u)+0}' "$OUT/u_$LOCUS.path_blocks.tsv")
+  NP=$(awk -F'	' 'NR>1{p[$2]=1} END{print length(p)+0}' "$OUT/u_$LOCUS.path_blocks.tsv")
+  { [ "${NU:-1}" = 0 ] && [ "${NP:-0}" -gt 0 ]; }     && ok "$LOCUS: 0 of $NP candidates unprojectable"     || bad "$LOCUS: $NU of $NP candidates unprojectable; the panel is being reduced"
+done
+
 for LOCUS in c4 cyp2d6; do
   G="$REPO/results/real_data/$LOCUS/bubble/bubble.sorted.gfa"
   P="$REPO/results/real_data/$LOCUS/bubble/bubble"
