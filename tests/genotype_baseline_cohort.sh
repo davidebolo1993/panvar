@@ -231,15 +231,22 @@ PY
 # Exact edit distance between two one-record FASTAs, via the SAME command every other distance uses.
 # Escalates the band until the distance is EXACT, and reports the band it needed. A distance that
 # fell outside the band is not a large distance, it is no distance -- and silently treating the cap
-# as the answer would make a badly wrong call look like a near miss. USED_BAND is set as a side
-# effect so the row can record what the number actually cost.
-USED_BAND=""
+# as the answer would make a badly wrong call look like a near miss.
+#
+# The band actually used is written to a FILE, not a variable. dist() runs inside a command
+# substitution -- a subshell -- so an assignment there never reaches the caller: the metric column
+# reported band=4096 for a distance of 93723, which is arithmetically impossible and went unnoticed
+# because the DISTANCES were right. Only the certification was wrong.
+BANDFILE=""
 dist() {   # dist <a.fa> <b.fa> -> integer, or empty
   local v b
   for b in $BAND 16384 65536 262144; do
     v=$("$BIN" genotype-frag --exact-distance "$1" "$2" --distance-band "$b" 2>/dev/null | tr -d ' ')
     case "$v" in ''|*[!0-9]*) continue ;; esac
-    if [ -z "$USED_BAND" ] || [ "$b" -gt "$USED_BAND" ]; then USED_BAND="$b"; fi
+    if [ -n "$BANDFILE" ]; then
+      prev=$(cat "$BANDFILE" 2>/dev/null || echo 0)
+      [ "$b" -gt "${prev:-0}" ] && printf '%s' "$b" > "$BANDFILE"
+    fi
     echo "$v"; return
   done
   echo ""
@@ -427,7 +434,7 @@ open(o2,'w').write(">c2\n"+recs[1].upper()+"\n")
 PY
       [ -s "$AD/c1.fa" ] && [ -s "$AD/c2.fa" ] || { say "REFUSE $LOCUS/$DONOR/$ARM: called pair not spelled as two records"; fails=$((fails+1)); continue; }
       # best of the two orientation assignments -- the pair is unordered
-      USED_BAND=""
+      BANDFILE="$AD/used_band"; printf '0' > "$BANDFILE"
       D11=$(dist "$AD/c1.fa" "$DD/t1.fa"); D22=$(dist "$AD/c2.fa" "$DD/t2.fa")
       D12=$(dist "$AD/c1.fa" "$DD/t2.fa"); D21=$(dist "$AD/c2.fa" "$DD/t1.fa")
       CALLED_D=$("$PY" -c "
@@ -680,7 +687,7 @@ PY
       printf '%s\t%s\t%s\t%s\t%s\tsim\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\texact(band=%s)\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tOK\n' \
         "$COMMIT" "$BIN_MD5" "$LOCUS" "$DONOR" "$ARM" "$SEED" "$NPAIRS" \
         "$GFA_MD5" "$BUB_MD5" "$TRUTH_MD5" "$READS_MD5" "$CAT_MD5" "${SHORTLIST_MD5:-}" \
-        "$T1" "$T2" "$PANEL_FLOOR" "$FSURV" "$C1" "$C2" "$CALLED_D" "$EXCESS" "${USED_BAND:-$BAND}" \
+        "$T1" "$T2" "$PANEL_FLOOR" "$FSURV" "$C1" "$C2" "$CALLED_D" "$EXCESS" "$(cat "$AD/used_band" 2>/dev/null || echo "$BAND")" \
         "${EQS:-}" "$FIT" "$FITF" "$FITE" \
         "${NB:-}" "${NPROJ:-}" "${NDET:-}" "${NEX:-}" "${NWR:-}" \
         "${RUNTIME:-}" "${PEAK:-}" "${BSUM:-NA}" "${BRESID:-NA}" "${BIRR:-NA}" "${BREC:-NA}" >> "$RUNS"
