@@ -32,10 +32,25 @@
 #      needs. The gate compares LIKELIHOOD and EXPOSURE against exhaustive enumeration, never
 #      storage. Collapsing distinct origins destroys copy-number information in a marginal placement
 #      model and must change neither placement mass nor exposure.
-#   5. EXHAUSTIVE AGREEMENT on small fixtures: substitution, indel, reverse strand, repeat, junction,
-#      and unseeded -- meaning no usable CURRENT syncmer seed. Not "no exact seed anywhere": under
-#      the pigeonhole construction a read within d edits must contain an exact piece, ambiguous
-#      bases aside, so a fixture claiming otherwise would be testing an impossibility.
+#   5. EXHAUSTIVE AGREEMENT on small fixtures. "Unseeded" means no usable CURRENT syncmer seed --
+#      NOT "no exact seed anywhere": under the pigeonhole construction a read within d edits must
+#      contain an exact piece, ambiguous bases aside, so the latter would test an impossibility.
+#
+#      TWO STAGES, because the emissions differ and must not be conflated:
+#
+#      STAGE 1 -- HAMMING-COMPLETE. Pigeonhole recruitment plus exhaustive verification of candidate
+#      starts, certified against the current reference. reference_emission is FIXED-POSITION
+#      HAMMING: it counts mismatches at one offset and has no gap model (src/genotype_fragments.cpp,
+#      reference_emission). It can therefore certify substitution, reverse strand, repeat, junction
+#      and unseeded fixtures, and nothing else. This stage alone unblocks the c4 76-fragment audit,
+#      which was run with --hamming-emission.
+#
+#      STAGE 2 -- INDEL-AWARE, and NOT gated by this file until it has its own oracle. With indels,
+#      start, reference consumption, end coordinate and insert length all need a defined alignment
+#      contract, and an exhaustive edit-distance oracle must be written against that same
+#      definition. Activating an indel fixture against the Hamming reference would compare two
+#      DIFFERENT EMISSIONS and call the difference an acceleration defect -- the exact
+#      reference-versus-accelerated confusion this branch has already paid for twice.
 #   6. REPORTED WORK: candidate starts, verified starts, placements kept, runtime, and the
 #      omitted-mass bound. A search that cannot say what it skipped cannot be trusted not to skip.
 #
@@ -66,8 +81,21 @@
 #   D. per fragment, per candidate AND per diploid pair -- a per-fragment bound does not imply the
 #      pair bound, the same reason the scope oracle's guarantee had to be made diploid;
 #   E. the exhaustive reference PAIR SCORE lies inside the reported interval;
-#   F. the interval WIDTH meets a declared tolerance before a call is certified. A bound that holds
-#      trivially because it is enormous certifies nothing.
+#   F. TWO TOLERANCES, recorded separately, because they are different kinds of quantity:
+#        * NUMERICAL, for the exact in-band equalities A and B -- floating-point agreement;
+#        * APPROXIMATION, for the omitted mass in C -- expressed as NATS PER FRAGMENT or as an
+#          omitted-mass fraction, never as one raw-likelihood threshold. A shared absolute threshold
+#          is meaningless across loci whose totals differ by orders of magnitude: c4 pair scores run
+#          near -1.1e6 while the deciding margin is ~500 nats.
+#
+#   G. CERTIFICATION USES THE INTERVALS, not the width alone:
+#
+#          certified(g)  iff  L(g) > max over other genotypes of U(other)
+#
+#      A narrow interval does not certify a winner whose interval still overlaps a competitor's.
+#      Genotypes whose intervals overlap are reported as an equivalence set. At c4/NA19240 the
+#      winner already changes between the pessimistic and optimistic tail treatments, so it fails
+#      even the weaker same-winner test and "unresolved" is the correct output there.
 #
 # This is not a weaker gate. It stops the test both from demanding an impossible equality and from
 # passing merely because omitted likelihood rounds to zero on fixtures small enough to hide it.
