@@ -17,6 +17,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include <zlib.h>
+
 #include "panvar/align.hpp"
 #include "panvar/gfa.hpp"
 #include "panvar/graph_utils.hpp"
@@ -168,17 +170,46 @@ void commit_staged(const std::filesystem::path& staged, const std::string& final
     }
 }
 
+// Pass the input graph through to the output, DECOMPRESSING it if it arrived gzipped.
+//
+// A byte copy was wrong for the only input the pipeline actually hands this module: `-i foo.gfa.gz
+// -o out.gfa` wrote the gzip bytes verbatim under a name that says GFA. panvar's own readers sniff
+// the magic and so never noticed, but `--out` is documented as a GFA, every non-panvar consumer
+// (vg, odgi, Bandage, awk) got binary, and -- worst of the three -- the same flag produced two
+// different formats depending on whether the input happened to be compressed, since the REBUILT
+// branch writes plain text. The pass-through has to agree with it.
+//
+// gzread is transparent for non-gzip input, so one loop covers both cases and stays byte-exact for
+// an already-plain file.
 void copy_file(const std::string& from, const std::string& to) {
     // Staged then renamed: writing straight to `to` truncates it on open, which destroyed the input
     // outright when the same path was given for -i and -o. The guard in run_rebuild rejects that case,
     // but a pass-through should not depend on the caller having been checked.
     const std::filesystem::path staged = staging_path(to);
     {
-        std::ifstream in(from, std::ios::binary);
-        if (!in) throw std::runtime_error("rebuild: cannot open input: " + from);
+        gzFile in = gzopen(from.c_str(), "rb");
+        if (in == nullptr) throw std::runtime_error("rebuild: cannot open input: " + from);
         std::ofstream out(staged, std::ios::binary);
-        if (!out) throw std::runtime_error("rebuild: cannot open output: " + staged.string());
-        out << in.rdbuf();
+        if (!out) {
+            gzclose(in);
+            throw std::runtime_error("rebuild: cannot open output: " + staged.string());
+        }
+        std::vector<char> buf(1 << 16);
+        for (;;) {
+            const int n = gzread(in, buf.data(), static_cast<unsigned int>(buf.size()));
+            if (n < 0) {
+                gzclose(in);
+                throw std::runtime_error("rebuild: cannot read input: " + from);
+            }
+            if (n == 0) break;
+            out.write(buf.data(), n);
+            if (!out) {
+                gzclose(in);
+                throw std::runtime_error("rebuild: failed writing " + staged.string());
+            }
+        }
+        gzclose(in);
+        out.flush();
         if (!out) throw std::runtime_error("rebuild: failed writing " + staged.string());
     }
     commit_staged(staged, to);

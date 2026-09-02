@@ -1424,11 +1424,24 @@ BubbleDescribeResult describe_one_bubble(
     const std::filesystem::path out_dir(options.out_dir);
     const std::filesystem::path bubble_dir = out_dir / ("bubble_" + std::to_string(bubble.id));
     std::filesystem::create_directories(bubble_dir);
-    result.feature_map_path = (bubble_dir / "kmer_features.tsv.gz").string();
-    result.matrix_path = (bubble_dir / "kmer_matrix.tsv.gz").string();
-    result.counts_jsonl_path = (bubble_dir / "kmer_counts.jsonl.gz").string();
-    result.graph_feature_map_path = (bubble_dir / "graph_features.tsv.gz").string();
-    result.graph_matrix_path = (bubble_dir / "graph_matrix.tsv.gz").string();
+
+    // Writes go to `bubble_dir` (under the staging directory during a real run); the paths RECORDED
+    // for the index are built from `report_out_dir`, which is where those files will actually be once
+    // the run commits. Keeping the two apart is the whole fix: a recorded staging path names a
+    // directory that has been renamed away by the time the index is read.
+    const std::filesystem::path report_bubble_dir =
+        (options.report_out_dir.empty() ? out_dir : std::filesystem::path(options.report_out_dir)) /
+        ("bubble_" + std::to_string(bubble.id));
+    const std::string kmer_features_file = (bubble_dir / "kmer_features.tsv.gz").string();
+    const std::string kmer_matrix_file = (bubble_dir / "kmer_matrix.tsv.gz").string();
+    const std::string kmer_counts_file = (bubble_dir / "kmer_counts.jsonl.gz").string();
+    const std::string graph_features_file = (bubble_dir / "graph_features.tsv.gz").string();
+    const std::string graph_matrix_file = (bubble_dir / "graph_matrix.tsv.gz").string();
+    result.feature_map_path = (report_bubble_dir / "kmer_features.tsv.gz").string();
+    result.matrix_path = (report_bubble_dir / "kmer_matrix.tsv.gz").string();
+    result.counts_jsonl_path = (report_bubble_dir / "kmer_counts.jsonl.gz").string();
+    result.graph_feature_map_path = (report_bubble_dir / "graph_features.tsv.gz").string();
+    result.graph_matrix_path = (report_bubble_dir / "graph_matrix.tsv.gz").string();
 
     std::unordered_map<std::uint64_t, KmerStats> stats;
     stats.reserve(4096);
@@ -1464,7 +1477,7 @@ BubbleDescribeResult describe_one_bubble(
 
         std::vector<std::unordered_set<std::string>> feature_nodes(features.size() + 1);
         write_sparse_jsonl(
-            result.counts_jsonl_path,
+            kmer_counts_file,
             graph,
             bubble,
             path_indexes,
@@ -1473,7 +1486,7 @@ BubbleDescribeResult describe_one_bubble(
             options,
             feature_nodes,
             variant_nodes);
-        write_feature_map(result.feature_map_path, features, stats, feature_nodes, options.kmer_size, paths.size());
+        write_feature_map(kmer_features_file, features, stats, feature_nodes, options.kmer_size, paths.size());
 
         // Carry each kept k-mer's node provenance up to the pooled BIMBAM/feature_annot (so a pooled
         // k-mer keeps a node link for traceback and gene annotation; per-bubble detail stays in the map).
@@ -1492,7 +1505,7 @@ BubbleDescribeResult describe_one_bubble(
         const bool wide_allowed_by_cap =
             options.max_wide_features == 0 || features.size() <= options.max_wide_features;
         if (options.write_wide_matrix && (options.force_wide_matrix || wide_allowed_by_cap)) {
-            write_wide_matrix(result.matrix_path, graph, bubble, path_indexes, paths, features, options, variant_nodes);
+            write_wide_matrix(kmer_matrix_file, graph, bubble, path_indexes, paths, features, options, variant_nodes);
             result.matrix_written = true;
             result.matrix_reason = "written";
         } else if (!options.write_wide_matrix) {
@@ -1528,7 +1541,7 @@ BubbleDescribeResult describe_one_bubble(
                                     *graph_pool, variant_nodes, options.variant_flank_bp);
         }
         write_graph_feature_map(
-            result.graph_feature_map_path, node_features, edge_features, node_stats, edge_stats, paths.size());
+            graph_features_file, node_features, edge_features, node_stats, edge_stats, paths.size());
         // The same cap the k-mer matrix obeys. It guarded only that one, so --max-wide-features
         // bounded half the dense output and a node+edge matrix could grow without limit.
         const bool graph_wide_allowed =
@@ -1536,7 +1549,7 @@ BubbleDescribeResult describe_one_bubble(
             node_features.size() + edge_features.size() <= options.max_wide_features;
         if (options.write_wide_matrix && (options.force_wide_matrix || graph_wide_allowed)) {
             write_graph_matrix(
-                result.graph_matrix_path, graph, bubble, path_indexes, paths, node_features, edge_features,
+                graph_matrix_file, graph, bubble, path_indexes, paths, node_features, edge_features,
                 variant_nodes, options.variant_flank_bp);
             result.graph_matrix_written = true;
         } else {

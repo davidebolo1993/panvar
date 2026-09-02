@@ -15,6 +15,13 @@ struct DescribeOptions {
     std::string gfa_path;
     std::string bubbles_csv_in;
     std::string out_dir = "describe_out";
+    // Where the outputs will FINALLY live, when `out_dir` is a staging directory the command layer
+    // renames into place once the run succeeds. Only the paths RECORDED in describe.index.tsv are
+    // built from this; every write still goes to `out_dir`. Empty means the two are the same.
+    //
+    // Without it the index named files inside the staging directory, which no longer exists by the
+    // time anyone reads the index -- so every path column in the run's own manifest was dead.
+    std::string report_out_dir;
     std::vector<std::size_t> bubble_ids;
     std::size_t kmer_size = 31;
     // Syncmer sampling is the default: a compact, evenly distributed,

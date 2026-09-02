@@ -311,6 +311,9 @@ int run_describe_command(const std::vector<std::string>& args) {
     {
         DescribeOptions staged = options;
         staged.out_dir = stage_dir.string();
+        // The index records where its files will be READ from, which is the destination, not the
+        // staging directory this run happens to write into and then renames away.
+        staged.report_out_dir = final_dir.string();
         if (graph_substrates) {
             describe_kmers_from_graph(staged, &summary);
         }
