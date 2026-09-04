@@ -1065,13 +1065,17 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             // wrong support both admits states the model rejects (insert 200-239) and omits valid
             // ones (501-550), so the audit would classify against a different fragment model than
             // the production C4 result it is meant to explain.
-            long min_frag_len_bs = std::numeric_limits<long>::max();
+            // MAXIMUM, from 1, over EVERY loaded fragment -- singletons included. One shared insert
+            // prior has to be valid for the LONGEST fragment, so the longest sets the lower support
+            // bound; a minimum would put the bound below the length some fragments already occupy.
+            // This mirrors the production loop exactly (std::max<long>, seeded at 1, no skipping).
+            // The first version took the minimum AND skipped singletons, and a fixture of uniform
+            // 120+120 pairs cannot tell the two apart -- min and max are both 240 there.
+            long min_frag_len_bs = 1;
             for (const Fragment& F : bfr) {
-                if (F.r1.empty() || F.r2.empty()) continue;
-                min_frag_len_bs = std::min<long>(min_frag_len_bs,
+                min_frag_len_bs = std::max<long>(min_frag_len_bs,
                                                  static_cast<long>(F.r1.size() + F.r2.size()));
             }
-            if (min_frag_len_bs == std::numeric_limits<long>::max()) min_frag_len_bs = 0;
             const InsertPrior bs_prior = make_insert_prior(opt.fragment_len, opt.fragment_sd,
                                                            opt.discordant_rate, 4, min_frag_len_bs);
             const long ilo = bs_prior.lo, ihi = bs_prior.hi;

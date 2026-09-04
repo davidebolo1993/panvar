@@ -202,6 +202,13 @@ emit_pair() {  # emit_pair <name> <hapseq> <1-based fragment start>
   m2=$(printf '%s' "$h" | cut -c$((st+INSERT-120))-$((st+INSERT-1)) | rev | tr ACGTacgt TGCAtgca)
   printf '>%s/1\n%s\n>%s/2\n%s\n' "$nm" "$m1" "$nm" "$m2" >> "$OUT/reads.fa"
 }
+emit_pair150() {  # a 150+150 pair, so max(r1+r2) is 300 while min stays 240
+  local nm="$1" h="$2" st="$3"
+  local m1 m2
+  m1=$(printf '%s' "$h" | cut -c$((st))-$((st+149)))
+  m2=$(printf '%s' "$h" | cut -c$((st+INSERT-150))-$((st+INSERT-1)) | rev | tr ACGTacgt TGCAtgca)
+  printf '>%s/1\n%s\n>%s/2\n%s\n' "$nm" "$m1" "$nm" "$m2" >> "$OUT/reads.fa"
+}
 emit_pairB() {  # the SAME fragment with mate roles swapped: mate 2 forward, mate 1 reverse
   local nm="$1" h="$2" st="$3"
   local f r
@@ -269,6 +276,10 @@ emit junc_   "$JUNCT"
 emit_pair  pairU_ "$HA" 101
 emit_pair  pairR_ "$HA" 451     # wholly inside repeat copy 1 (401..900): two origins on hapA
 emit_pairB pairB_ "$HA" 151     # mate roles swapped: exercises library orientation B
+# MIXED MATE LENGTHS. With uniform 120+120 pairs the minimum and maximum combined length are both
+# 240, so taking the min instead of the max is invisible. This 150+150 pair makes the maximum 300,
+# and the shared lower support bound must follow the LONGEST fragment.
+emit_pair150 pair150_ "$HA" 1301
 
 # ---- A/B: exact agreement with the exhaustive scan ---------------------------------------------
 if ! "$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/b" -o "$OUT/o" -R "$OUT/reads.fa" \
@@ -350,9 +361,12 @@ else
     # both admits states the model rejects and omits valid ones between 501 and 550.
     ILO=$(awk -F'\t' 'NR==2{print $8}' "$OUT/bs.tsv.states.tsv")
     IHI=$(awk -F'\t' 'NR==2{print $9}' "$OUT/bs.tsv.states.tsv")
-    { [ "${ILO:-0}" = 240 ] && [ "${IHI:-0}" = 550 ]; } \
-      && ok "the enumerator uses the production insert support ([$ILO,$IHI])" \
-      || bad "insert support is [${ILO:-?},${IHI:-?}], production gives [240,550] for 120 bp mates"
+    # The reads mix 120+120 and 150+150 pairs, so max(r1+r2)=300 and min=240. Production floors lo
+    # at the MAXIMUM, so the shared support is [300,550]; taking the minimum would give [240,550]
+    # and this assertion is what tells them apart.
+    { [ "${ILO:-0}" = 300 ] && [ "${IHI:-0}" = 550 ]; } \
+      && ok "the shared insert support follows the LONGEST fragment ([$ILO,$IHI])" \
+      || bad "insert support is [${ILO:-?},${IHI:-?}]; production floors lo at max(r1+r2)=300, not min=240"
     # HAPLOTYPE IDENTITY as a key, tested directly: two haplotypes' identical states must not
     # collapse. Per-haplotype vectors cannot show this -- each holds one haplotype value.
     if [ -s "$OUT/bs.tsv.hapkey.tsv" ]; then
