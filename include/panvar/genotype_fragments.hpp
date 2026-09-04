@@ -1107,6 +1107,15 @@ struct CandidateFrame {
 // scope, and it can never justify adding a block to one.
 inline constexpr std::uint32_t kUnmappedBlock = 0xFFFFFFFFu;
 
+// THE PRODUCTION BAND, in one place. floor(divergence * len) + 1, and the +1 matters: at 5% a
+// 120 bp read gives 7 here and 6 if the expression is re-derived without it, so a search certified
+// against the re-derived value silently loses exactly the boundary placements. It was file-local,
+// and the first --bounded-search gate duplicated the formula and got it wrong.
+inline std::size_t mate_band_edits(double max_divergence, std::size_t len) {
+    if (len == 0) return 0;
+    return static_cast<std::size_t>(max_divergence * static_cast<double>(len)) + 1;
+}
+
 // ---------------------------------------------------------------------------------------------
 // BOUNDED-COMPLETE SINGLE-MATE PLACEMENT (stage 1, Hamming).
 //

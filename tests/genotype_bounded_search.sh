@@ -167,10 +167,23 @@ U=$(seq_of 400 11); RPT=$(seq_of 200 12); V=$(seq_of 400 13); W=$(seq_of 400 14)
 # repeat has TWO distinct origins that must both survive; collapsing them is the copy-number loss.
 HA="${U}${RPT}${V}${RPT}${W}"
 HB="${U}${RPT}${V}"
+# hapN carries AMBIGUOUS BASES. An N in the read meeting an N in the haplotype costs NO Hamming
+# mismatch, so a read can sit at zero edits while every one of its d+1 pieces is spoiled by
+# ambiguity -- the pigeonhole then proposes nothing. Ns in the READ ALONE cannot produce this: each
+# would be a mismatch against an ACGT haplotype, so spoiling d+1 pieces needs more than d
+# mismatches and the read is out of band anyway. Measured: that first version placed nowhere and the
+# non-vacuity assertion caught it.
+HN=$("$PY" - "$(seq_of 500 15)" <<'PYEOF'
+import sys
+h=list(sys.argv[1].upper())
+for x in range(10, len(h), 13): h[x]='N'
+print("".join(h))
+PYEOF
+)
 { printf 'H\tVN:Z:1.0\n'
-  printf 'S\t1\t%s\n' "$HA"; printf 'S\t2\t%s\n' "$HB"
-  printf 'L\t1\t+\t2\t+\t0M\n'
-  printf 'P\tref\t1+\t*\n'; printf 'P\thapB\t2+\t*\n'; } > "$OUT/g.gfa"
+  printf 'S\t1\t%s\n' "$HA"; printf 'S\t2\t%s\n' "$HB"; printf 'S\t3\t%s\n' "$HN"
+  printf 'L\t1\t+\t2\t+\t0M\n'; printf 'L\t2\t+\t3\t+\t0M\n'
+  printf 'P\tref\t1+\t*\n'; printf 'P\thapB\t2+\t*\n'; printf 'P\thapN\t3+\t*\n'; } > "$OUT/g.gfa"
 "$BIN" bubble -i "$OUT/g.gfa" -r ref -o "$OUT/b" --min-variant-bp 0 -q >/dev/null 2>&1
 
 emit() {  # emit <name> <seq>
@@ -189,16 +202,41 @@ JUNCT=$(printf '%s' "$HA" | cut -c580-699)                 # spans repeat->uniqu
 #   correct: 7 pieces of 17 -> mismatches at 5,25,45,65,85,105 hit pieces 0,1,2,3,5,6; piece 4 CLEAN
 #   mutant : 6 pieces of 20 -> the same positions hit all six; nothing is proposed and the
 #            placement is LOST, which is exactly what the exhaustive comparison must catch.
-PIG=$("$PY" - "$HA" <<'PYEOF'
+# GENERATED from the production band, never hard-coded. mate_band_edits is floor(div*len)+1, so a
+# 120 bp read at 5% gives d=7, not the 6 an open-coded floor() produces -- and a fixture built for
+# the wrong d tests a narrower band than production accepts.
+PIG=$("$PY" - "$HA" 120 0.05 <<'PYEOF'
 import sys
-h=sys.argv[1][700:820].upper()
-sub={'A':'C','C':'G','G':'T','T':'A'}
-b=list(h)
-for pos in (5,25,45,65,85,105): b[pos]=sub[b[pos]]
+h=sys.argv[1]; L=int(sys.argv[2]); div=float(sys.argv[3])
+d=int(div*L)+1                      # mate_band_edits
+npc, npm = d+1, d                   # correct split vs the mutant one
+Pc, Pm = L//npc, L//npm
+sub={'A':'C','C':'G','G':'T','T':'A','a':'C','c':'G','g':'T','t':'A'}
+# one mismatch inside each MUTANT piece, chosen to leave at least one CORRECT piece clean
+pos=[]
+for i in range(npm):
+    lo,hi=i*Pm,min((i+1)*Pm,L)-1
+    # prefer a position whose correct-piece index is already used, so a correct piece stays clean
+    best=None
+    for x in range(lo,hi+1):
+        c=min(x//Pc, npc-1)
+        if best is None or (c in [min(y//Pc,npc-1) for y in pos]): best=x; break
+    pos.append(best if best is not None else lo)
+clean=set(range(npc))-{min(x//Pc,npc-1) for x in pos}
+if not clean or len(pos)!=d:
+    sys.stderr.write("fixture construction failed: d=%d clean=%s\n"%(d,sorted(clean))); sys.exit(3)
+b=list(h[700:700+L].upper())
+for x in pos: b[x]=sub[b[x]]
+sys.stderr.write("d=%d correct=%dx%d mutant=%dx%d clean_correct_pieces=%s\n"%(d,npc,Pc,npm,Pm,sorted(clean)))
 print("".join(b))
 PYEOF
 )
 emit pigeon_ "$PIG"
+# AMBIGUITY. An N in the read meeting an N in the haplotype costs no mismatch, so a read can be
+# inside the band while every piece is spoiled by ambiguity. Such a read MUST take the exhaustive
+# fallback; skipping the pieces without falling back loses the placement silently.
+AMB=$(printf '%s' "$HN" | cut -c101-220)   # exact substring of hapN, Ns included: zero edits
+emit amb_ "$AMB"
 emit sub_    "$SUBST"
 emit uniq_   "$EXACT"
 emit rep_    "$INREP"
@@ -236,6 +274,22 @@ else
   [ "${PG:-0}" -gt 0 ] \
     && ok "the pigeonhole-critical read (d mismatches, one clean piece) places, at $PGE edits" \
     || bad "the pigeonhole-critical read did not place; a broken d+1 split would go undetected"
+  # THE BAND MUST BE PRODUCTION'"'"'S. floor(div*len) is one edit narrower than mate_band_edits and
+  # would certify a search that loses exactly the boundary placements.
+  MB=$(awk -F'\t' 'NR>1 && index($1,"pigeon_")==1{print $9; exit}' "$OUT/bs.tsv")
+  EXP=$("$PY" -c "print(int(0.05*120)+1)")
+  [ "${MB:-0}" = "$EXP" ] \
+    && ok "the gate uses the production band ($MB = mate_band_edits(0.05,120))" \
+    || bad "the gate ran at max_edits=${MB:-?}, production uses $EXP; a narrower band certifies less"
+  # AMBIGUOUS READS take the exhaustive fallback and still place.
+  AF=$(awk -F'\t' 'NR>1 && index($1,"amb_")==1 && $14==1' "$OUT/bs.tsv" | wc -l | tr -d ' ')
+  AP=$(awk -F'\t' 'NR>1 && index($1,"amb_")==1 && $4=="hapN" && $5>0' "$OUT/bs.tsv" | wc -l | tr -d ' ')
+  [ "${AF:-0}" -gt 0 ] \
+    && ok "an ambiguous read takes the exhaustive fallback ($AF cells)" \
+    || bad "no ambiguous read fell back; N-spoiled pieces would lose placements silently"
+  [ "${AP:-0}" -gt 0 ] \
+    && ok "and still places ($AP cells), so the fallback is not merely skipping it" \
+    || bad "the ambiguous read places nowhere; the fallback assertion above is vacuous"
   FS=$(awk -F'\t' 'NR>1 && $3=="+" && $5>0' "$OUT/bs.tsv" | wc -l | tr -d ' ')
   RS=$(awk -F'\t' 'NR>1 && $3=="-" && $5>0' "$OUT/bs.tsv" | wc -l | tr -d ' ')
   { [ "$FS" -gt 0 ] && [ "$RS" -gt 0 ]; } \

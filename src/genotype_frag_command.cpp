@@ -1046,7 +1046,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         std::ofstream bf(bounded_search);
         if (!bf) throw std::runtime_error("genotype-frag: cannot write " + bounded_search);
         bf << "fragment\tmate\tstrand\thaplotype\tbounded_n\texhaustive_n\tagree"
-              "\tbest_edits\tpieces\tcandidate_starts\tdistinct_starts\tverified\tfallback\n";
+              "\tbest_edits\tmax_edits\tpieces\tcandidate_starts\tdistinct_starts\tverified\tfallback\n";
         std::size_t rows = 0, disagree = 0;
         std::uint64_t tot_cand = 0, tot_ver = 0, tot_exh = 0;
         for (const Fragment& F : bfr) {
@@ -1055,8 +1055,9 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                 if (raw.empty()) continue;
                 for (int strand = 0; strand < 2; ++strand) {
                     const std::string r = strand == 0 ? raw : reverse_complement(raw);
-                    const std::size_t d =
-                        static_cast<std::size_t>(opt.max_divergence * static_cast<double>(r.size()));
+                    // THE PRODUCTION BAND, from the shared helper. Re-deriving it here gave
+                    // floor(div*len) and certified a band one edit NARROWER than production.
+                    const std::size_t d = mate_band_edits(opt.max_divergence, r.size());
                     for (std::size_t h = 0; h < seqs.size(); ++h) {
                         SearchWork w;
                         const auto b = bounded_mate_placements(r, seqs[h], d, &w);
@@ -1074,7 +1075,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                            << '\t' << names[h] << '\t' << b.size() << '\t' << e.size() << '\t'
                            << (same ? "yes" : "NO") << '\t'
                            << (best == 0xFFFFFFFFu ? -1 : static_cast<long>(best)) << '\t'
-                           << w.pieces << '\t' << w.candidate_starts << '\t' << w.distinct_starts
+                           << d << '\t' << w.pieces << '\t' << w.candidate_starts << '\t' << w.distinct_starts
                            << '\t' << w.verified << '\t' << (w.exhaustive_fallback ? 1 : 0) << '\n';
                         ++rows;
                     }

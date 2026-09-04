@@ -36,10 +36,6 @@ namespace {
 // band-boundary floor. The +1 matters -- two 150 bp mates at 5% give 8 + 8 = 16, not
 // floor(0.05 * 300) = 15 -- and a floor computed from the fragment's total length instead of
 // per mate is a different number that merely looks like the same one.
-inline std::size_t mate_band_edits(double max_divergence, std::size_t len) {
-    if (len == 0) return 0;
-    return static_cast<std::size_t>(max_divergence * static_cast<double>(len)) + 1;
-}
 } // namespace
 
 double InsertPrior::exposure(std::size_t hap_len) const {
@@ -3075,7 +3071,13 @@ std::vector<MatePlacement> bounded_mate_placements(const std::string& read, cons
     // simpler and faster. The two paths must return the SAME placements -- this is an acceleration
     // of the exhaustive scan, never a different answer.
     constexpr std::size_t kMinPiece = 12;
-    if (P < kMinPiece) {
+    // AMBIGUITY FORCES THE EXHAUSTIVE PATH. A piece containing N proposes nothing, but an N in the
+    // read that meets an N in the haplotype costs NO Hamming mismatch -- so a read can be well
+    // inside the band while every one of its d+1 pieces is spoiled by ambiguity, and the pigeonhole
+    // then proposes nothing at all and the placement is lost. Skipping such pieces without falling
+    // back, which is what the first version did, is silently lossy exactly where reads are worst.
+    const bool ambiguous = read.find_first_not_of("ACGTacgt") != std::string::npos;
+    if (P < kMinPiece || ambiguous) {
         w.exhaustive_fallback = true;
         out = exhaustive_mate_placements(read, hap, max_edits);
         w.candidate_starts = w.distinct_starts = w.verified =
