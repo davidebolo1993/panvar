@@ -1049,6 +1049,62 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
               "\tbest_edits\tmax_edits\tpieces\tcandidate_starts\tdistinct_starts\tverified\tfallback\n";
         std::size_t rows = 0, disagree = 0;
         std::uint64_t tot_cand = 0, tot_ver = 0, tot_exh = 0;
+        // FRAGMENT STATES, built independently from the bounded and exhaustive placement vectors.
+        // Comparing only single-mate placements cannot catch a lost library orientation, a wrong
+        // combination of the four vectors, collapsed states, or lost haplotype identity.
+        const std::string fs_path = bounded_search + ".states.tsv";
+        std::ofstream sf(fs_path);
+        if (!sf) throw std::runtime_error("genotype-frag: cannot write " + fs_path);
+        sf << "fragment\thaplotype\tbounded_states\texhaustive_states\tagree\torientA\torientB\n";
+        std::size_t st_dis = 0, tot_a = 0, tot_b = 0, tot_states = 0;
+        {
+            const long ilo = static_cast<long>(opt.fragment_len) - 3 * static_cast<long>(opt.fragment_sd);
+            const long ihi = static_cast<long>(opt.fragment_len) + 3 * static_cast<long>(opt.fragment_sd);
+            for (const Fragment& F : bfr) {
+                if (F.r1.empty() || F.r2.empty()) continue;
+                const std::string r1rc = reverse_complement(F.r1);
+                const std::string r2rc = reverse_complement(F.r2);
+                const std::size_t d1 = mate_band_edits(opt.max_divergence, F.r1.size());
+                const std::size_t d2 = mate_band_edits(opt.max_divergence, F.r2.size());
+                for (std::size_t h = 0; h < seqs.size(); ++h) {
+                    const auto bf1 = bounded_mate_placements(F.r1, seqs[h], d1, nullptr);
+                    const auto br1 = bounded_mate_placements(r1rc, seqs[h], d1, nullptr);
+                    const auto bf2 = bounded_mate_placements(F.r2, seqs[h], d2, nullptr);
+                    const auto br2 = bounded_mate_placements(r2rc, seqs[h], d2, nullptr);
+                    const auto ef1 = exhaustive_mate_placements(F.r1, seqs[h], d1);
+                    const auto er1 = exhaustive_mate_placements(r1rc, seqs[h], d1);
+                    const auto ef2 = exhaustive_mate_placements(F.r2, seqs[h], d2);
+                    const auto er2 = exhaustive_mate_placements(r2rc, seqs[h], d2);
+                    const auto bs = enumerate_fragment_states(static_cast<std::uint32_t>(h),
+                        bf1, br1, bf2, br2, F.r1.size(), F.r2.size(), ilo, ihi);
+                    const auto es = enumerate_fragment_states(static_cast<std::uint32_t>(h),
+                        ef1, er1, ef2, er2, F.r1.size(), F.r2.size(), ilo, ihi);
+                    const bool same = bs.size() == es.size() &&
+                        std::equal(bs.begin(), bs.end(), es.begin(),
+                                   [](const FragmentState& x, const FragmentState& y) {
+                                       return x == y && x.m1_edits == y.m1_edits &&
+                                              x.m2_edits == y.m2_edits; });
+                    if (!same) ++st_dis;
+                    std::size_t na = 0, nb = 0;
+                    for (const FragmentState& z : bs) { if (z.m1_fwd) ++na; else ++nb; }
+                    tot_a += na; tot_b += nb; tot_states += bs.size();
+                    if (!bs.empty() || !es.empty()) {
+                        sf << F.name << '\t' << names[h] << '\t' << bs.size() << '\t' << es.size()
+                           << '\t' << (same ? "yes" : "NO") << '\t' << na << '\t' << nb << '\n';
+                    }
+                }
+            }
+        }
+        sf.flush();
+        log.wrote({fs_path});
+        log.info("fragment states: " + std::to_string(tot_states) + " built, " +
+                 std::to_string(st_dis) + " cell(s) disagree with exhaustive; orientation A " +
+                 std::to_string(tot_a) + ", orientation B " + std::to_string(tot_b));
+        if (st_dis != 0) {
+            throw std::runtime_error("genotype-frag: bounded and exhaustive fragment-state sets "
+                                     "differ on " + std::to_string(st_dis) + " cell(s)");
+        }
+
         for (const Fragment& F : bfr) {
             for (int m = 0; m < 2; ++m) {
                 const std::string& raw = m == 0 ? F.r1 : F.r2;
@@ -1105,7 +1161,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             };
             std::size_t wrong = 0;
             for (const C& c : cases) {
-                const bool v = valid_fr_state(c.fs, c.re, c.lo, c.hi);
+                const bool v = valid_fr_coordinates(c.fs, c.re, c.lo, c.hi);
                 if (v != c.want) ++wrong;
                 ff << c.name << '\t' << c.fs << '\t' << c.re << '\t' << c.lo << '\t' << c.hi
                    << '\t' << (c.re - c.fs + 1) << '\t' << (v ? 1 : 0) << '\t' << (c.want ? 1 : 0)
@@ -1116,6 +1172,15 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             if (wrong != 0) {
                 throw std::runtime_error("genotype-frag: the valid-FR rule is wrong on " +
                                          std::to_string(wrong) + " synthetic case(s)");
+            }
+            // The shared window must agree with the predicate, or the join and the test can drift.
+            for (const C& c : cases) {
+                const auto w2 = fr_reverse_end_window(c.fs, c.lo, c.hi);
+                const bool inwin = c.re >= w2.first && c.re <= w2.second;
+                if (inwin != valid_fr_coordinates(c.fs, c.re, c.lo, c.hi)) {
+                    throw std::runtime_error("genotype-frag: fr_reverse_end_window disagrees with "
+                                             "valid_fr_coordinates");
+                }
             }
         }
         log.info("bounded search: " + std::to_string(rows) + " (mate,strand,haplotype) cells, " +

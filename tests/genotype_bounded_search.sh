@@ -162,7 +162,10 @@ OUT="$OUT/run.$$"; rm -rf "$OUT"; mkdir -p "$OUT"
 seq_of() { awk -v n="$1" -v s="$2" 'BEGIN{x=s; b="ACGT";
            for(i=0;i<n;i++){x=(1103515245*x+12345)%2147483648; printf "%s", substr(b,(int(x/65536)%4)+1,1)} }'; }
 
-U=$(seq_of 400 11); RPT=$(seq_of 200 12); V=$(seq_of 400 13); W=$(seq_of 400 14)
+# RPT is 500 bp, LONGER than the 350 bp insert, so a whole fragment fits inside one copy and hapA
+# offers TWO fragment origins. At 200 bp no fragment fits and pairR_ had a single origin on both
+# paths -- the multiplicity assertion was then about single mates only.
+U=$(seq_of 400 11); RPT=$(seq_of 500 12); V=$(seq_of 400 13); W=$(seq_of 400 14)
 # hapA: unique - repeat - unique - repeat - unique. Two identical copies, so a read inside the
 # repeat has TWO distinct origins that must both survive; collapsing them is the copy-number loss.
 HA="${U}${RPT}${V}${RPT}${W}"
@@ -186,7 +189,27 @@ PYEOF
   printf 'P\tref\t1+\t*\n'; printf 'P\thapB\t2+\t*\n'; printf 'P\thapN\t3+\t*\n'; } > "$OUT/g.gfa"
 "$BIN" bubble -i "$OUT/g.gfa" -r ref -o "$OUT/b" --min-variant-bp 0 -q >/dev/null 2>&1
 
-emit() {  # emit <name> <seq>
+# A REAL PAIR: mate 1 forward at the fragment start, mate 2 reverse-complemented from the fragment
+# END, so the implied insert is INSERT and lands inside the prior's support. The first version wrote
+# both mates from the SAME 120 bp window, making every implied insert 120 against a support of
+# [200,500] -- so no valid-FR state could form and the state comparison silently had nothing to
+# compare. Measured: 0 cells, 0 states.
+INSERT=350
+emit_pair() {  # emit_pair <name> <hapseq> <1-based fragment start>
+  local nm="$1" h="$2" st="$3"
+  local m1 m2
+  m1=$(printf '%s' "$h" | cut -c$((st))-$((st+119)))
+  m2=$(printf '%s' "$h" | cut -c$((st+INSERT-120))-$((st+INSERT-1)) | rev | tr ACGTacgt TGCAtgca)
+  printf '>%s/1\n%s\n>%s/2\n%s\n' "$nm" "$m1" "$nm" "$m2" >> "$OUT/reads.fa"
+}
+emit_pairB() {  # the SAME fragment with mate roles swapped: mate 2 forward, mate 1 reverse
+  local nm="$1" h="$2" st="$3"
+  local f r
+  f=$(printf '%s' "$h" | cut -c$((st))-$((st+119)))
+  r=$(printf '%s' "$h" | cut -c$((st+INSERT-120))-$((st+INSERT-1)) | rev | tr ACGTacgt TGCAtgca)
+  printf '>%s/1\n%s\n>%s/2\n%s\n' "$nm" "$r" "$nm" "$f" >> "$OUT/reads.fa"
+}
+emit() {  # single-mate fixtures: both records from one window, for the MATE-level comparison only
   printf '>%s/1\n%s\n' "$1" "$2" >> "$OUT/reads.fa"
   printf '>%s/2\n%s\n' "$1" "$(printf '%s' "$2" | rev | tr ACGTacgt TGCAtgca)" >> "$OUT/reads.fa"
 }
@@ -241,10 +264,16 @@ emit sub_    "$SUBST"
 emit uniq_   "$EXACT"
 emit rep_    "$INREP"
 emit junc_   "$JUNCT"
+# PAIRED fixtures, for the fragment-state comparison. pairU sits in unique sequence; pairR starts
+# inside the first repeat copy so hapA offers TWO fragment origins and hapB one.
+emit_pair  pairU_ "$HA" 101
+emit_pair  pairR_ "$HA" 451     # wholly inside repeat copy 1 (401..900): two origins on hapA
+emit_pairB pairB_ "$HA" 151     # mate roles swapped: exercises library orientation B
 
 # ---- A/B: exact agreement with the exhaustive scan ---------------------------------------------
 if ! "$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/b" -o "$OUT/o" -R "$OUT/reads.fa" \
-      --max-divergence 0.05 --bounded-search "$OUT/bs.tsv" -q >/dev/null 2>&1; then
+      --max-divergence 0.05 --fragment-len 350 --fragment-sd 50 \
+      --bounded-search "$OUT/bs.tsv" -q >/dev/null 2>&1; then
   bad "the bounded search exited nonzero -- it disagreed with the exhaustive reference"
 elif [ ! -s "$OUT/bs.tsv" ]; then
   bad "no bounded-search output"
@@ -305,6 +334,34 @@ else
       || bad "the FR cases are one-sided ($FRA accept, $FRR reject); a constant rule would pass"
   else
     bad "no valid-FR case table was written"
+  fi
+  # FRAGMENT STATES: built independently from the bounded and exhaustive placement vectors and
+  # compared as complete sets. Single-mate agreement cannot catch a lost library orientation, a
+  # wrong combination of the four vectors, collapsed states, or lost haplotype identity.
+  if [ ! -s "$OUT/bs.tsv.states.tsv" ]; then
+    bad "no fragment-state table; enumerate_fragment_states never ran"
+  else
+    SN=$(awk -F'\t' 'NR>1{s+=$3} END{print s+0}' "$OUT/bs.tsv.states.tsv")
+    SD=$(awk -F'\t' 'NR>1 && $5!="yes"' "$OUT/bs.tsv.states.tsv" | wc -l | tr -d ' ')
+    SA=$(awk -F'\t' 'NR>1{s+=$6} END{print s+0}' "$OUT/bs.tsv.states.tsv")
+    SB=$(awk -F'\t' 'NR>1{s+=$7} END{print s+0}' "$OUT/bs.tsv.states.tsv")
+    [ "$SN" -gt 0 ] && ok "fragment states built ($SN) from bounded and exhaustive placements" \
+                    || bad "zero fragment states; the comparison below is vacuous"
+    [ "${SD:-1}" = 0 ] && ok "bounded and exhaustive fragment-state SETS are identical" \
+                       || bad "$SD cell(s) have differing fragment-state sets"
+    { [ "$SA" -gt 0 ] && [ "$SB" -gt 0 ]; } \
+      && ok "both library orientations occur (A=$SA, B=$SB)" \
+      || bad "only one orientation occurs (A=$SA, B=$SB); dropping the other would go undetected"
+    # multiplicity at FRAGMENT level: the repeat is longer than the insert, so a fragment wholly
+    # inside copy 1 has a twin inside copy 2 on the two-copy path and none on the one-copy path.
+    MR=$(awk -F'\t' 'NR>1 && index($1,"pairR_")==1 && $2=="ref"{print $3; exit}' "$OUT/bs.tsv.states.tsv")
+    MB=$(awk -F'\t' 'NR>1 && index($1,"pairR_")==1 && $2=="hapB"{print $3; exit}' "$OUT/bs.tsv.states.tsv")
+    [ "${MR:-0}" -ge 2 ] \
+      && ok "a fragment inside the duplicated unit keeps BOTH origins on the 2-copy path ($MR)" \
+      || bad "the 2-copy path gave ${MR:-0} fragment origin(s); fragment-level multiplicity collapsed"
+    [ "${MB:-0}" = 1 ] \
+      && ok "and one on the 1-copy path ($MB), so copy number is visible at fragment level" \
+      || bad "the 1-copy path gave ${MB:-0} fragment origins, expected 1"
   fi
   FS=$(awk -F'\t' 'NR>1 && $3=="+" && $5>0' "$OUT/bs.tsv" | wc -l | tr -d ' ')
   RS=$(awk -F'\t' 'NR>1 && $3=="-" && $5>0' "$OUT/bs.tsv" | wc -l | tr -d ' ')

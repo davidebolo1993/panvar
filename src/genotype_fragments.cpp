@@ -3053,7 +3053,7 @@ std::vector<FragmentState> enumerate_fragment_states(
         for (const MatePlacement& f : fwd) {
             for (const MatePlacement& r : rev) {
                 const long rev_end = r.start + static_cast<long>(rev_len) - 1;
-                if (!valid_fr_state(f.start, rev_end, insert_lo, insert_hi)) continue;
+                if (!valid_fr_coordinates(f.start, rev_end, insert_lo, insert_hi)) continue;
                 FragmentState st;
                 st.hap = hap;
                 st.m1_start = fwd_is_m1 ? f.start : r.start;

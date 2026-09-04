@@ -1153,15 +1153,23 @@ std::vector<MatePlacement> bounded_mate_placements(
 std::vector<MatePlacement> exhaustive_mate_placements(
     const std::string& read, const std::string& hap, std::size_t max_edits);
 
-// THE VALID-FR RULE, in one place. Three conditions, not one:
-//   * opposite strands (forward mate and reverse mate);
-//   * the reverse mate DOWNSTREAM -- its end at or after the forward mate's start;
-//   * the implied insert inside the prior's support [lo, hi].
-// Orientation alone admits pairs the model gives zero probability. The accelerated scorer's
-// coordinate join tests exactly this; it is stated here so a second pairing rule is not written.
-inline bool valid_fr_state(long fwd_start, long rev_end, long insert_lo, long insert_hi) {
+// THE COORDINATE HALF of the valid-FR rule. Named for what it actually checks: the previous name,
+// valid_fr_state, claimed three conditions while taking no strand arguments at all.
+//   * checked HERE: the reverse mate DOWNSTREAM -- its end at or after the forward mate's start --
+//     and the implied insert inside the prior's support [lo, hi];
+//   * enforced by the CALLER, through which vectors it is given: opposite strands. A caller passing
+//     two forward vectors gets same-strand pairs and this function cannot tell.
+// So the synthetic case table tests COORDINATES; orientation is covered separately by asserting
+// that both library orientations actually occur among the enumerated states.
+inline bool valid_fr_coordinates(long fwd_start, long rev_end, long insert_lo, long insert_hi) {
     const long insert = rev_end - fwd_start + 1;
     return rev_end >= fwd_start && insert >= insert_lo && insert <= insert_hi;
+}
+
+// The allowed reverse-END interval for a forward start, shared so the coordinate join's window
+// arithmetic and this predicate cannot drift apart.
+inline std::pair<long, long> fr_reverse_end_window(long fwd_start, long insert_lo, long insert_hi) {
+    return {fwd_start + insert_lo - 1, fwd_start + insert_hi - 1};
 }
 
 // One fragment state. The KEY is every field: two placements differing in any of them are distinct
