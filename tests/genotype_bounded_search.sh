@@ -290,6 +290,22 @@ else
   [ "${AP:-0}" -gt 0 ] \
     && ok "and still places ($AP cells), so the fallback is not merely skipping it" \
     || bad "the ambiguous read places nowhere; the fallback assertion above is vacuous"
+  # THE VALID-FR RULE, on synthetic coordinates. Three conditions, not one: opposite strands, the
+  # reverse mate downstream, and the insert inside the prior's support. Checked directly because a
+  # state-set comparison can agree while both sides share the same wrong rule.
+  if [ -s "$OUT/bs.tsv.fr.tsv" ]; then
+    FRW=$(awk -F'\t' 'NR>1 && $7!=$8' "$OUT/bs.tsv.fr.tsv" | wc -l | tr -d ' ')
+    FRN=$(awk -F'\t' 'NR>1' "$OUT/bs.tsv.fr.tsv" | wc -l | tr -d ' ')
+    FRA=$(awk -F'\t' 'NR>1 && $8==1' "$OUT/bs.tsv.fr.tsv" | wc -l | tr -d ' ')
+    FRR=$(awk -F'\t' 'NR>1 && $8==0' "$OUT/bs.tsv.fr.tsv" | wc -l | tr -d ' ')
+    [ "${FRW:-1}" = 0 ] && ok "the valid-FR rule is right on all $FRN synthetic cases" \
+                        || bad "$FRW valid-FR case(s) disagree with the expected verdict"
+    { [ "${FRA:-0}" -gt 0 ] && [ "${FRR:-0}" -gt 0 ]; } \
+      && ok "and covers both verdicts ($FRA accepted, $FRR rejected: below/above support, reverse upstream)" \
+      || bad "the FR cases are one-sided ($FRA accept, $FRR reject); a constant rule would pass"
+  else
+    bad "no valid-FR case table was written"
+  fi
   FS=$(awk -F'\t' 'NR>1 && $3=="+" && $5>0' "$OUT/bs.tsv" | wc -l | tr -d ' ')
   RS=$(awk -F'\t' 'NR>1 && $3=="-" && $5>0' "$OUT/bs.tsv" | wc -l | tr -d ' ')
   { [ "$FS" -gt 0 ] && [ "$RS" -gt 0 ]; } \

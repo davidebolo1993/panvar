@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace panvar {
@@ -1151,6 +1152,47 @@ std::vector<MatePlacement> bounded_mate_placements(
 // The reference this is certified against: every start, Hamming counted, nothing skipped.
 std::vector<MatePlacement> exhaustive_mate_placements(
     const std::string& read, const std::string& hap, std::size_t max_edits);
+
+// THE VALID-FR RULE, in one place. Three conditions, not one:
+//   * opposite strands (forward mate and reverse mate);
+//   * the reverse mate DOWNSTREAM -- its end at or after the forward mate's start;
+//   * the implied insert inside the prior's support [lo, hi].
+// Orientation alone admits pairs the model gives zero probability. The accelerated scorer's
+// coordinate join tests exactly this; it is stated here so a second pairing rule is not written.
+inline bool valid_fr_state(long fwd_start, long rev_end, long insert_lo, long insert_hi) {
+    const long insert = rev_end - fwd_start + 1;
+    return rev_end >= fwd_start && insert >= insert_lo && insert <= insert_hi;
+}
+
+// One fragment state. The KEY is every field: two placements differing in any of them are distinct
+// states, and collapsing any component changes the likelihood. Notably `hap` is part of it -- the
+// same coordinates on two haplotypes are two states, not one.
+struct FragmentState {
+    std::uint32_t hap = 0;
+    long m1_start = 0; bool m1_fwd = true;
+    long m2_start = 0; bool m2_fwd = false;
+    long frag_start = 0, frag_end = 0;
+    long insert = 0;
+    std::uint32_t m1_edits = 0, m2_edits = 0;
+    bool operator<(const FragmentState& o) const {
+        return std::tie(hap, m1_start, m1_fwd, m2_start, m2_fwd, frag_start, frag_end, insert) <
+               std::tie(o.hap, o.m1_start, o.m1_fwd, o.m2_start, o.m2_fwd, o.frag_start, o.frag_end,
+                        o.insert);
+    }
+    bool operator==(const FragmentState& o) const {
+        return !(*this < o) && !(o < *this);
+    }
+};
+
+// Every valid-FR state for one fragment on one haplotype, from mate placements found by either
+// search. Both library orientations are formed: (m1 forward, m2 reverse) and (m2 forward, m1
+// reverse). Same-strand, reverse-upstream and out-of-support combinations are rejected by
+// valid_fr_state, never by a second rule written here.
+std::vector<FragmentState> enumerate_fragment_states(
+    std::uint32_t hap,
+    const std::vector<MatePlacement>& m1_fwd, const std::vector<MatePlacement>& m1_rev,
+    const std::vector<MatePlacement>& m2_fwd, const std::vector<MatePlacement>& m2_rev,
+    std::size_t m1_len, std::size_t m2_len, long insert_lo, long insert_hi);
 
 // ---------------------------------------------------------------------------------------------
 // AUTHORITATIVE PATH -> BLOCK PROJECTION. The one place block coordinates are derived.

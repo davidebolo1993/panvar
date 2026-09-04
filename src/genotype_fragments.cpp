@@ -3039,6 +3039,44 @@ bool sl_block_has_no_allele(const std::vector<BlockAlleles>& blocks, std::uint32
 }
 }  // namespace
 
+std::vector<FragmentState> enumerate_fragment_states(
+    std::uint32_t hap,
+    const std::vector<MatePlacement>& m1_fwd, const std::vector<MatePlacement>& m1_rev,
+    const std::vector<MatePlacement>& m2_fwd, const std::vector<MatePlacement>& m2_rev,
+    std::size_t m1_len, std::size_t m2_len, long insert_lo, long insert_hi) {
+    std::vector<FragmentState> out;
+    // Orientation A: mate 1 forward, mate 2 reverse. Orientation B: mate 2 forward, mate 1 reverse.
+    // Both are valid library orientations and BOTH must be formed; taking only one loses half the
+    // states for every fragment whose mates happen to map the other way round.
+    const auto build = [&](const std::vector<MatePlacement>& fwd, std::size_t fwd_len, bool fwd_is_m1,
+                           const std::vector<MatePlacement>& rev, std::size_t rev_len) {
+        for (const MatePlacement& f : fwd) {
+            for (const MatePlacement& r : rev) {
+                const long rev_end = r.start + static_cast<long>(rev_len) - 1;
+                if (!valid_fr_state(f.start, rev_end, insert_lo, insert_hi)) continue;
+                FragmentState st;
+                st.hap = hap;
+                st.m1_start = fwd_is_m1 ? f.start : r.start;
+                st.m1_fwd   = fwd_is_m1;
+                st.m2_start = fwd_is_m1 ? r.start : f.start;
+                st.m2_fwd   = !fwd_is_m1;
+                st.m1_edits = fwd_is_m1 ? f.edits : r.edits;
+                st.m2_edits = fwd_is_m1 ? r.edits : f.edits;
+                st.frag_start = f.start;
+                st.frag_end   = rev_end;
+                st.insert     = rev_end - f.start + 1;
+                out.push_back(st);
+            }
+        }
+        (void)fwd_len;
+    };
+    build(m1_fwd, m1_len, true,  m2_rev, m2_len);
+    build(m2_fwd, m2_len, false, m1_rev, m1_len);
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
 std::vector<MatePlacement> exhaustive_mate_placements(const std::string& read,
                                                       const std::string& hap,
                                                       std::size_t max_edits) {

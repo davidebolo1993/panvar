@@ -1084,6 +1084,40 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         }
         bf.flush();
         if (!bf) throw std::runtime_error("genotype-frag: write failed for " + bounded_search);
+
+        // ---- VALID-FR RULE, exercised directly ---------------------------------------------
+        // Asserting the rule on synthetic coordinates rather than only through fragment counts:
+        // a state-set comparison can agree while the rule is wrong in a way both sides share.
+        {
+            const std::string fr = bounded_search + ".fr.tsv";
+            std::ofstream ff(fr);
+            if (!ff) throw std::runtime_error("genotype-frag: cannot write " + fr);
+            ff << "case\tfwd_start\trev_end\tinsert_lo\tinsert_hi\tinsert\tvalid\texpected\n";
+            struct C { const char* name; long fs, re, lo, hi; bool want; };
+            const C cases[] = {
+                {"in_support",        100, 449, 200, 500, true},
+                {"at_lo_edge",        100, 299, 200, 500, true},
+                {"at_hi_edge",        100, 599, 200, 500, true},
+                {"below_support",     100, 250, 200, 500, false},
+                {"above_support",     100, 700, 200, 500, false},
+                {"reverse_upstream",  500,  99, 200, 500, false},
+                {"same_position",     100,  99, 200, 500, false},
+            };
+            std::size_t wrong = 0;
+            for (const C& c : cases) {
+                const bool v = valid_fr_state(c.fs, c.re, c.lo, c.hi);
+                if (v != c.want) ++wrong;
+                ff << c.name << '\t' << c.fs << '\t' << c.re << '\t' << c.lo << '\t' << c.hi
+                   << '\t' << (c.re - c.fs + 1) << '\t' << (v ? 1 : 0) << '\t' << (c.want ? 1 : 0)
+                   << '\n';
+            }
+            ff.flush();
+            log.wrote({fr});
+            if (wrong != 0) {
+                throw std::runtime_error("genotype-frag: the valid-FR rule is wrong on " +
+                                         std::to_string(wrong) + " synthetic case(s)");
+            }
+        }
         log.info("bounded search: " + std::to_string(rows) + " (mate,strand,haplotype) cells, " +
                  std::to_string(disagree) + " disagree with exhaustive; verified " +
                  std::to_string(tot_ver) + " starts against " + std::to_string(tot_exh) +
