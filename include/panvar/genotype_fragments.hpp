@@ -1161,9 +1161,16 @@ std::vector<MatePlacement> exhaustive_mate_placements(
 //     two forward vectors gets same-strand pairs and this function cannot tell.
 // So the synthetic case table tests COORDINATES; orientation is covered separately by asserting
 // that both library orientations actually occur among the enumerated states.
+// The DOWNSTREAM half on its own, because the accelerated Cartesian path needs exactly this and not
+// the support test: it applies the support through insert_ll returning -inf, which carries the same
+// mass but keeps the `mates_seeded` valid-FR bit deliberately BROADER than the prior's support.
+// Substituting the full predicate there would silently narrow that bit, so the shared thing is the
+// rule both actually agree on.
+inline bool fr_reverse_downstream(long fwd_start, long rev_end) { return rev_end >= fwd_start; }
+
 inline bool valid_fr_coordinates(long fwd_start, long rev_end, long insert_lo, long insert_hi) {
     const long insert = rev_end - fwd_start + 1;
-    return rev_end >= fwd_start && insert >= insert_lo && insert <= insert_hi;
+    return fr_reverse_downstream(fwd_start, rev_end) && insert >= insert_lo && insert <= insert_hi;
 }
 
 // The allowed reverse-END interval for a forward start, shared so the coordinate join's window

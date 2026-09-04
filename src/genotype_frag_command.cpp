@@ -1055,11 +1055,28 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         const std::string fs_path = bounded_search + ".states.tsv";
         std::ofstream sf(fs_path);
         if (!sf) throw std::runtime_error("genotype-frag: cannot write " + fs_path);
-        sf << "fragment\thaplotype\tbounded_states\texhaustive_states\tagree\torientA\torientB\n";
+        sf << "fragment\thaplotype\tbounded_states\texhaustive_states\tagree\torientA\torientB"
+              "\tinsert_lo\tinsert_hi\tstate_hap\n";
         std::size_t st_dis = 0, tot_a = 0, tot_b = 0, tot_states = 0;
         {
-            const long ilo = static_cast<long>(opt.fragment_len) - 3 * static_cast<long>(opt.fragment_sd);
-            const long ihi = static_cast<long>(opt.fragment_len) + 3 * static_cast<long>(opt.fragment_sd);
+            // THE PRODUCTION PRIOR, not a re-derived one. make_insert_prior uses 4 sigmas and
+            // floors lo at the mates' combined length: for 120 bp mates that is [240,550], where a
+            // hard-coded mean +/- 3sd gives [200,550-50] = [200,500]. Comparing states under the
+            // wrong support both admits states the model rejects (insert 200-239) and omits valid
+            // ones (501-550), so the audit would classify against a different fragment model than
+            // the production C4 result it is meant to explain.
+            long min_frag_len_bs = std::numeric_limits<long>::max();
+            for (const Fragment& F : bfr) {
+                if (F.r1.empty() || F.r2.empty()) continue;
+                min_frag_len_bs = std::min<long>(min_frag_len_bs,
+                                                 static_cast<long>(F.r1.size() + F.r2.size()));
+            }
+            if (min_frag_len_bs == std::numeric_limits<long>::max()) min_frag_len_bs = 0;
+            const InsertPrior bs_prior = make_insert_prior(opt.fragment_len, opt.fragment_sd,
+                                                           opt.discordant_rate, 4, min_frag_len_bs);
+            const long ilo = bs_prior.lo, ihi = bs_prior.hi;
+            log.info("bounded-search insert support [" + std::to_string(ilo) + "," +
+                     std::to_string(ihi) + "] from the production prior");
             for (const Fragment& F : bfr) {
                 if (F.r1.empty() || F.r2.empty()) continue;
                 const std::string r1rc = reverse_complement(F.r1);
@@ -1089,11 +1106,35 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                     for (const FragmentState& z : bs) { if (z.m1_fwd) ++na; else ++nb; }
                     tot_a += na; tot_b += nb; tot_states += bs.size();
                     if (!bs.empty() || !es.empty()) {
+                        // state_hap is FragmentState::hap, not the loop variable: printing the
+                        // enclosing name would show the right answer even if the key lost it.
                         sf << F.name << '\t' << names[h] << '\t' << bs.size() << '\t' << es.size()
-                           << '\t' << (same ? "yes" : "NO") << '\t' << na << '\t' << nb << '\n';
+                           << '\t' << (same ? "yes" : "NO") << '\t' << na << '\t' << nb
+                           << '\t' << ilo << '\t' << ihi << '\t'
+                           << (bs.empty() ? h : bs.front().hap) << '\n';
                     }
                 }
             }
+        // HAPLOTYPE IDENTITY, exercised directly. States are enumerated per haplotype into separate
+        // vectors, so removing `hap` from the key cannot collapse anything there -- every vector
+        // holds one haplotype value. (An earlier mutation run reported this as "caught"; it was not,
+        // something else had failed.) Here two otherwise-identical states from two haplotypes are
+        // unioned, sorted and uniqued: the key must keep them apart.
+        {
+            std::vector<MatePlacement> f1{{100, 0}}, r1{}, f2{}, r2{{100 + ihi - 120, 0}};
+            const auto s0 = enumerate_fragment_states(0, f1, r1, f2, r2, 120, 120, ilo, ihi);
+            const auto s1 = enumerate_fragment_states(1, f1, r1, f2, r2, 120, 120, ilo, ihi);
+            std::vector<FragmentState> both = s0;
+            both.insert(both.end(), s1.begin(), s1.end());
+            std::sort(both.begin(), both.end());
+            both.erase(std::unique(both.begin(), both.end()), both.end());
+            const std::string hp = bounded_search + ".hapkey.tsv";
+            std::ofstream hf(hp);
+            hf << "states_hap0\tstates_hap1\tunioned_unique\n"
+               << s0.size() << '\t' << s1.size() << '\t' << both.size() << '\n';
+            hf.flush();
+            log.wrote({hp});
+        }
         }
         sf.flush();
         log.wrote({fs_path});

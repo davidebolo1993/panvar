@@ -1754,7 +1754,8 @@ HaplotypeResult genotype_haplotype_pairs(
                         if (x.fwd == y.fwd) continue;
                         const Placed& fw = x.fwd ? x : y;
                         const Placed& rv = x.fwd ? y : x;
-                        if (rv.end < fw.start) continue;          // reverse mate must lie downstream
+                        // SHARED with the bounded search's rule, so the two cannot drift.
+                        if (!fr_reverse_downstream(fw.start, rv.end)) continue;
                         mates_seeded[fi * nh + hi] |= 16u;
                         double v = read_ll(x.edits, F.r1.size()) + read_ll(y.edits, F.r2.size())
                                  + log_half_strand;
@@ -1824,7 +1825,7 @@ HaplotypeResult genotype_haplotype_pairs(
                             if (x.fwd == y.fwd) continue;
                             const Placed& fw = x.fwd ? x : y;
                             const Placed& rv = x.fwd ? y : x;
-                            if (rv.end < fw.start) continue;
+                            if (!fr_reverse_downstream(fw.start, rv.end)) continue;
                             double v = read_ll(x.edits, F.r1.size()) + read_ll(y.edits, F.r2.size())
                                      + log_half_strand;
                             if (options.use_insert_size) {

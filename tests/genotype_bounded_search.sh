@@ -345,6 +345,25 @@ else
     SD=$(awk -F'\t' 'NR>1 && $5!="yes"' "$OUT/bs.tsv.states.tsv" | wc -l | tr -d ' ')
     SA=$(awk -F'\t' 'NR>1{s+=$6} END{print s+0}' "$OUT/bs.tsv.states.tsv")
     SB=$(awk -F'\t' 'NR>1{s+=$7} END{print s+0}' "$OUT/bs.tsv.states.tsv")
+    # THE PRODUCTION INSERT SUPPORT. make_insert_prior uses 4 sigmas and floors lo at the mates'
+    # combined length: 120 bp mates give [240,550]. A hard-coded mean +/- 3sd gives [200,500], which
+    # both admits states the model rejects and omits valid ones between 501 and 550.
+    ILO=$(awk -F'\t' 'NR==2{print $8}' "$OUT/bs.tsv.states.tsv")
+    IHI=$(awk -F'\t' 'NR==2{print $9}' "$OUT/bs.tsv.states.tsv")
+    { [ "${ILO:-0}" = 240 ] && [ "${IHI:-0}" = 550 ]; } \
+      && ok "the enumerator uses the production insert support ([$ILO,$IHI])" \
+      || bad "insert support is [${ILO:-?},${IHI:-?}], production gives [240,550] for 120 bp mates"
+    # HAPLOTYPE IDENTITY as a key, tested directly: two haplotypes' identical states must not
+    # collapse. Per-haplotype vectors cannot show this -- each holds one haplotype value.
+    if [ -s "$OUT/bs.tsv.hapkey.tsv" ]; then
+      HU=$(awk -F'\t' 'NR==2{print $3}' "$OUT/bs.tsv.hapkey.tsv")
+      H0=$(awk -F'\t' 'NR==2{print $1}' "$OUT/bs.tsv.hapkey.tsv")
+      { [ "${H0:-0}" -gt 0 ] && [ "${HU:-0}" = $(( H0 * 2 )) ]; } \
+        && ok "haplotype is part of the state key (2 x $H0 states stay $HU after unique)" \
+        || bad "unioning two haplotypes identical states gave ${HU:-?} from 2 x ${H0:-?}; hap is not in the key"
+    else
+      bad "no haplotype-key table was written"
+    fi
     [ "$SN" -gt 0 ] && ok "fragment states built ($SN) from bounded and exhaustive placements" \
                     || bad "zero fragment states; the comparison below is vacuous"
     [ "${SD:-1}" = 0 ] && ok "bounded and exhaustive fragment-state SETS are identical" \
