@@ -1063,6 +1063,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         std::size_t st_dis = 0, tot_a = 0, tot_b = 0, tot_states = 0;
         std::size_t mass_dis = 0, bound_viol = 0, mass_cells = 0, interval_miss = 0;
         std::size_t adaptive_miss = 0, adaptive_tight = 0;
+        long bs_prior_lo = 0, bs_prior_hi = 0;
+        InsertPrior bs_prior_g;
         {
             // THE PRODUCTION PRIOR, not a re-derived one. make_insert_prior uses 4 sigmas and
             // floors lo at the mates' combined length: for 120 bp mates that is [240,550], where a
@@ -1084,6 +1086,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             const InsertPrior bs_prior = make_insert_prior(opt.fragment_len, opt.fragment_sd,
                                                            opt.discordant_rate, 4, min_frag_len_bs);
             const long ilo = bs_prior.lo, ihi = bs_prior.hi;
+            bs_prior_lo = ilo; bs_prior_hi = ihi; bs_prior_g = bs_prior;
             log.info("bounded-search insert support [" + std::to_string(ilo) + "," +
                      std::to_string(ihi) + "] from the production prior");
             for (const Fragment& F : bfr) {
@@ -1184,6 +1187,108 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                     }
                 }
             }
+        // ---- MULTIPLICITY, isolated to one edit class -----------------------------------------
+        // K distinct states at the SAME likelihood must sum to log K above a single one, and all K
+        // coordinates must survive deduplication. Reported per (fragment, haplotype) at the exact
+        // (d1+1, 0) class, so a repeat's omitted copies are visible as a COUNT rather than inferred
+        // from a log-space subtraction.
+        {
+            const std::string mp = bounded_search + ".editclass.tsv";
+            std::ofstream mf(mp);
+            if (!mf) throw std::runtime_error("genotype-frag: cannot write " + mp);
+            mf << "fragment\thaplotype\te1\te2\tcount\tclass_mass\tper_state_mass"
+                  "\tmin_start\tmax_start\tspan\tdistinct_starts\n";
+            const double lep2 = std::log(opt.error_rate / 3.0);
+            const double l1m2 = std::log1p(-opt.error_rate);
+            for (const Fragment& F : bfr) {
+                if (F.r1.empty() || F.r2.empty()) continue;
+                const std::size_t D1 = mate_band_edits(opt.max_divergence, F.r1.size()) + 1;
+                const std::size_t D2 = mate_band_edits(opt.max_divergence, F.r2.size()) + 1;
+                const std::string a1 = reverse_complement(F.r1), a2 = reverse_complement(F.r2);
+                for (std::size_t h = 0; h < seqs.size(); ++h) {
+                    const auto st = enumerate_fragment_states(static_cast<std::uint32_t>(h),
+                        bounded_mate_placements(F.r1, seqs[h], D1, nullptr),
+                        bounded_mate_placements(a1, seqs[h], D1, nullptr),
+                        bounded_mate_placements(F.r2, seqs[h], D2, nullptr),
+                        bounded_mate_placements(a2, seqs[h], D2, nullptr),
+                        F.r1.size(), F.r2.size(), bs_prior_lo, bs_prior_hi);
+                    for (std::uint32_t e1 = 0; e1 <= 1; ++e1) {
+                        const EditClass ec = edit_class_mass(st, e1, 0, F.r1.size(), F.r2.size(),
+                                                             bs_prior_g, lep2, l1m2);
+                        if (ec.count == 0) continue;
+                        // The COUNT alone is not enough: extra starts, inserts or orientations
+                        // inside the first eight copies could reach 9 or 16 while later copies stay
+                        // truncated. The coordinate SPAN shows which copies actually contributed.
+                        long lo_s = 0, hi_s = 0; bool firstv = true;
+                        std::set<long> starts;
+                        for (const FragmentState& z : st) {
+                            if (z.m1_edits != e1 || z.m2_edits != 0) continue;
+                            starts.insert(z.frag_start);
+                            if (firstv) { lo_s = hi_s = z.frag_start; firstv = false; }
+                            lo_s = std::min(lo_s, z.frag_start);
+                            hi_s = std::max(hi_s, z.frag_start);
+                        }
+                        mf << F.name << '\t' << names[h] << '\t' << e1 << "\t0\t"
+                           << ec.count << '\t' << ec.mass << '\t'
+                           << (ec.mass - std::log(static_cast<double>(ec.count))) << '\t'
+                           << lo_s << '\t' << hi_s << '\t' << (hi_s - lo_s) << '\t'
+                           << starts.size() << '\n';
+                    }
+                }
+            }
+            mf.flush();
+            log.wrote({mp});
+        }
+
+        // ---- D-BOUNDARY: the terminal case ----------------------------------------------------
+        // At D equal to the maximum possible mate mismatch count -- the read length -- every
+        // (start, insert, orientation) in the universe is in band, so the residual set is EMPTY,
+        // the bound is -inf, and lower, upper and the exhaustive mass must agree numerically. This
+        // closes the induction: every intermediate D is bracketed between the production band and
+        // an endpoint where the bound is provably exact.
+        {
+            const std::string bp = bounded_search + ".dboundary.tsv";
+            std::ofstream df(bp);
+            if (!df) throw std::runtime_error("genotype-frag: cannot write " + bp);
+            df << "fragment\thaplotype\tn_omitted_bound\tlower\tupper\treference\tagree\n";
+            const double lep3 = std::log(opt.error_rate / 3.0);
+            const double l1m3 = std::log1p(-opt.error_rate);
+            std::size_t dbad = 0;
+            for (const Fragment& F : bfr) {
+                if (F.r1.empty() || F.r2.empty()) continue;
+                const std::string a1 = reverse_complement(F.r1), a2 = reverse_complement(F.r2);
+                for (std::size_t h = 0; h < seqs.size(); ++h) {
+                    const std::size_t D1 = F.r1.size(), D2 = F.r2.size();
+                    const auto st = enumerate_fragment_states(static_cast<std::uint32_t>(h),
+                        bounded_mate_placements(F.r1, seqs[h], D1, nullptr),
+                        bounded_mate_placements(a1, seqs[h], D1, nullptr),
+                        bounded_mate_placements(F.r2, seqs[h], D2, nullptr),
+                        bounded_mate_placements(a2, seqs[h], D2, nullptr),
+                        F.r1.size(), F.r2.size(), bs_prior_lo, bs_prior_hi);
+                    const double m = fragment_states_mass(st, F.r1.size(), F.r2.size(),
+                                                          bs_prior_g, lep3, l1m3);
+                    const double b = omitted_mass_bound(seqs[h].size(), F.r1.size(), F.r2.size(),
+                                                        D1, D2, bs_prior_g, lep3, l1m3, st);
+                    ReferenceParams rp3;
+                    rp3.error_rate = opt.error_rate; rp3.fragment_len = opt.fragment_len;
+                    rp3.fragment_sd = opt.fragment_sd; rp3.bg_divergence = opt.bg_divergence;
+                    const double r = reference_fragment_on_haplotype(F, seqs[h], rp3, bs_prior_g,
+                                                                     a2, lep3, l1m3);
+                    const bool agree = (b == -std::numeric_limits<double>::infinity()) &&
+                                       ((m == r) || (m != -std::numeric_limits<double>::infinity() &&
+                                                     r != -std::numeric_limits<double>::infinity() &&
+                                                     std::abs(m - r) < 1e-9));
+                    if (!agree) ++dbad;
+                    df << F.name << '\t' << names[h] << '\t' << b << '\t' << m << '\t' << m
+                       << '\t' << r << '\t' << (agree ? 1 : 0) << '\n';
+                }
+            }
+            df.flush();
+            log.wrote({bp});
+            log.info("D-boundary: " + std::to_string(dbad) + " cell(s) where the residual is "
+                     "non-empty or lower/upper/reference disagree at D = read length");
+        }
+
         // HAPLOTYPE IDENTITY, exercised directly. States are enumerated per haplotype into separate
         // vectors, so removing `hap` from the key cannot collapse anything there -- every vector
         // holds one haplotype value. (An earlier mutation run reported this as "caught"; it was not,

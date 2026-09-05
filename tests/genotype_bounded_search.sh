@@ -176,6 +176,12 @@ HB="${U}${RPT}${V}"
 # would be a mismatch against an ACGT haplotype, so spoiling d+1 pieces needs more than d
 # mismatches and the read is out of band anyway. Measured: that first version placed nowhere and the
 # non-vacuity assertion caught it.
+# NINE and SIXTEEN adjacent identical copies. A fragment inside one copy therefore has 9 and 16
+# origins -- above any plausible top-2 or top-8 cap. The 1-vs-2 case cannot distinguish "keeps every
+# origin" from "keeps the first eight", which is exactly the production failure this work targets
+# (--placement-topk 8 is a real flag in this codebase).
+HK9=""; for i in 1 2 3 4 5 6 7 8 9; do HK9="${HK9}${RPT}"; done
+HK16=""; for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do HK16="${HK16}${RPT}"; done
 HN=$("$PY" - "$(seq_of 500 15)" <<'PYEOF'
 import sys
 h=list(sys.argv[1].upper())
@@ -186,7 +192,10 @@ PYEOF
 { printf 'H\tVN:Z:1.0\n'
   printf 'S\t1\t%s\n' "$HA"; printf 'S\t2\t%s\n' "$HB"; printf 'S\t3\t%s\n' "$HN"
   printf 'L\t1\t+\t2\t+\t0M\n'; printf 'L\t2\t+\t3\t+\t0M\n'
-  printf 'P\tref\t1+\t*\n'; printf 'P\thapB\t2+\t*\n'; printf 'P\thapN\t3+\t*\n'; } > "$OUT/g.gfa"
+  printf 'S\t4\t%s\n' "$HK9"; printf 'S\t5\t%s\n' "$HK16"
+  printf 'L\t3\t+\t4\t+\t0M\nL\t4\t+\t5\t+\t0M\n'
+  printf 'P\tref\t1+\t*\n'; printf 'P\thapB\t2+\t*\n'; printf 'P\thapN\t3+\t*\n'
+  printf 'P\thapK9\t4+\t*\n'; printf 'P\thapK16\t5+\t*\n'; } > "$OUT/g.gfa"
 "$BIN" bubble -i "$OUT/g.gfa" -r ref -o "$OUT/b" --min-variant-bp 0 -q >/dev/null 2>&1
 
 # A REAL PAIR: mate 1 forward at the fragment start, mate 2 reverse-complemented from the fragment
@@ -505,6 +514,54 @@ else
     [ "${IS:-1}" = 0 ] \
       && ok "the production-band mass is unchanged at every D (deepening only reallocates the tail)" \
       || bad "$IS cell(s) changed their production-band mass as D grew; D is altering the model"
+    # OMITTED MULTIPLICITY, isolated to ONE edit class. reference-minus-in-band is the wrong
+    # quantity: extra copies also add unrelated starts, junctions, insert lengths and orientations,
+    # all with finite emission, so that difference measures everything the extra sequence brought --
+    # and log-space subtraction is fragile near cancellation besides. So K states at the SAME
+    # likelihood are summed directly: class_mass - log(count) must be IDENTICAL across different K,
+    # which is exactly log M_K - log M_1 = log K.
+    if [ ! -s "$OUT/bs.tsv.editclass.tsv" ]; then
+      bad "no edit-class table; multiplicity is not isolated"
+    else
+      KM=$(awk -F'\t' 'NR>1 && $5>1{n++} END{print n+0}' "$OUT/bs.tsv.editclass.tsv")
+      KU=$(awk -F'\t' 'NR>1{printf "%.6f\n",$7}' "$OUT/bs.tsv.editclass.tsv" | sort -u | wc -l | tr -d ' ')
+      KV=$(awk -F'\t' 'NR>1{printf "%.6f\n",$7}' "$OUT/bs.tsv.editclass.tsv" | sort | uniq -c | awk '$1>1{n++} END{print n+0}')
+      # ABOVE ANY CAP, and EXACT rather than ">=". The unit is 500 bp and each copy contributes
+      # exactly one state at this class, so 9 copies span 8*500 = 4000 and 16 span 15*500 = 7500.
+      # A count reached by extra starts inside the first eight copies would have the right TOTAL and
+      # the wrong SPAN, which is why the span is asserted and not just the count.
+      K9=$(awk -F'\t' 'NR>1 && $2=="hapK9" && $5>1{print $5; exit}' "$OUT/bs.tsv.editclass.tsv")
+      K16=$(awk -F'\t' 'NR>1 && $2=="hapK16" && $5>1{print $5; exit}' "$OUT/bs.tsv.editclass.tsv")
+      S9=$(awk -F'\t' 'NR>1 && $2=="hapK9" && $5>1{print $10; exit}' "$OUT/bs.tsv.editclass.tsv")
+      S16=$(awk -F'\t' 'NR>1 && $2=="hapK16" && $5>1{print $10; exit}' "$OUT/bs.tsv.editclass.tsv")
+      { [ "${K9:-0}" = 9 ] && [ "${S9:-0}" = 4000 ]; } \
+        && ok "hapK9: exactly 9 states spanning all 9 copies (span $S9 = 8 x 500)" \
+        || bad "hapK9 has ${K9:-0} states spanning ${S9:-0}; expected 9 spanning 4000"
+      { [ "${K16:-0}" = 16 ] && [ "${S16:-0}" = 7500 ]; } \
+        && ok "hapK16: exactly 16 states spanning all copies (span $S16 = 15 x 500), above any top-8 cap" \
+        || bad "hapK16 has ${K16:-0} states spanning ${S16:-0}; expected 16 spanning 7500"
+      [ "${KM:-0}" -gt 0 ] \
+        && ok "multiplicity is present: $KM edit class(es) hold more than one distinct state" \
+        || bad "no edit class has count > 1; the log K property cannot be tested"
+      [ "${KV:-0}" -gt 0 ] \
+        && ok "and per-state mass is IDENTICAL across different K, so class mass differs by log K" \
+        || bad "no per-state mass is shared between a K=1 and a K>1 class; log K is unverified"
+    fi
+    # D-BOUNDARY, the terminal case: at D = read length every state is in band, so the residual is
+    # empty, the bound is -inf, and lower == reference exactly.
+    if [ ! -s "$OUT/bs.tsv.dboundary.tsv" ]; then
+      bad "no D-boundary table"
+    else
+      DN=$(awk -F'\t' 'NR>1{n++} END{print n+0}' "$OUT/bs.tsv.dboundary.tsv")
+      DA=$(awk -F'\t' 'NR>1 && $7==1{n++} END{print n+0}' "$OUT/bs.tsv.dboundary.tsv")
+      DI=$(awk -F'\t' 'NR>1 && $3=="-inf"{n++} END{print n+0}' "$OUT/bs.tsv.dboundary.tsv")
+      { [ "${DN:-0}" -gt 0 ] && [ "${DA:-0}" = "${DN:-1}" ]; } \
+        && ok "at D = read length, lower == upper == exhaustive on all $DN cells" \
+        || bad "$(( DN - DA )) cell(s) disagree at the D boundary"
+      [ "${DI:-0}" = "${DN:-1}" ] \
+        && ok "and the residual set is empty everywhere (bound = -inf)" \
+        || bad "$(( DN - DI )) cell(s) still have a non-empty residual at D = read length"
+    fi
     # EXPOSURE is analytic and depends on haplotype length, so two different haplotypes must differ.
     NE=$(awk -F'\t' 'NR>1{print $18}' "$OUT/bs.tsv.states.tsv" | sort -u | wc -l | tr -d ' ')
     [ "${NE:-0}" -ge 2 ] \
@@ -552,8 +609,8 @@ echo "          genotype."
 echo "          Mixed mass (eps=0.30, logadd moves the upper bound by 0.066 nats), and the three"
 echo "          refinement invariants: exact mass never decreases with D, the upper bound never"
 echo "          increases, and the PRODUCTION-BAND mass is unchanged at every D."
+echo "          Omitted multiplicity, isolated to one edit class (log K), and the D-boundary"
+echo "          terminal case (residual empty, lower == upper == exhaustive)."
 echo "NOT ASSERTED: diploid/background propagation, and G (certification by"
-echo "              L(g) > max U(other) with overlapping intervals). Still missing from C: the"
-echo "              omitted-MULTIPLICITY fixture -- K copies of an out-of-band unit must move the"
-echo "              exact tail by log K, with neither dedup nor the bound collapsing it."
+echo "              L(g) > max U(other) with overlapping intervals)."
 exit "$fails"

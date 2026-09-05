@@ -3075,6 +3075,20 @@ double omitted_mass_bound(std::size_t hap_len, std::size_t m1_len, std::size_t m
     return std::log(0.5) + B + acc;
 }
 
+EditClass edit_class_mass(const std::vector<FragmentState>& states,
+                          std::uint32_t e1, std::uint32_t e2,
+                          std::size_t m1_len, std::size_t m2_len,
+                          const InsertPrior& ip, double log_eps, double log_1meps) {
+    std::vector<FragmentState> sel;
+    for (const FragmentState& st : states) {
+        if (st.m1_edits == e1 && st.m2_edits == e2) sel.push_back(st);
+    }
+    EditClass out;
+    out.count = sel.size();
+    out.mass = fragment_states_mass(sel, m1_len, m2_len, ip, log_eps, log_1meps);
+    return out;
+}
+
 TailInterval adaptive_tail_interval(const std::string& r1, const std::string& r2,
                                     const std::string& hap, std::size_t d1, std::size_t d2,
                                     const InsertPrior& ip, double log_eps, double log_1meps,
@@ -3212,6 +3226,21 @@ std::vector<MatePlacement> bounded_mate_placements(const std::string& read, cons
     if (read.empty() || hap.size() < read.size()) {
         if (work) *work = w;
         return out;
+    }
+    // TERMINAL DEPTH, PER MATE. Once max_edits reaches THIS read's length every position is
+    // trivially in band and d+1 non-empty pieces cannot be constructed. Short-circuit to the
+    // exhaustive scan. Applied per mate, so a short mate can be exhaustive while its longer partner
+    // still uses pigeonhole recruitment.
+    if (max_edits >= read.size()) {
+        SearchWork w2;
+        w2.pieces = 0;
+        w2.exhaustive_fallback = true;
+        auto all = exhaustive_mate_placements(read, hap, max_edits);
+        w2.candidate_starts = w2.distinct_starts = w2.verified =
+            hap.size() >= read.size() ? hap.size() - read.size() + 1 : 0;
+        w2.accepted = all.size();
+        if (work) *work = w2;
+        return all;
     }
     const std::size_t npieces = max_edits + 1;
     const std::size_t P = read.size() / npieces;

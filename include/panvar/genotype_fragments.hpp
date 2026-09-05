@@ -1234,6 +1234,23 @@ std::vector<FragmentState> enumerate_fragment_states(
 // It counts the AGGREGATE of omitted origins, not one representative: a repeat with many omitted
 // copies contributes all of them through N_omitted. That is the property that makes it safe at an
 // array, where bounding a single origin would understate the tail by the copy number.
+// STATES AT EXACTLY ONE MISMATCH LEVEL, and their summed mass.
+//
+// For the multiplicity property, "reference minus in-band" is the WRONG quantity: extra repeat
+// copies also add unrelated starts, junction states, insert lengths and orientations, all with
+// finite emission, so that difference measures everything the extra sequence brought. Subtraction
+// in log space is fragile near cancellation besides, and shows nothing about WHICH states supplied
+// the mass. So the class is isolated directly: exactly the states whose two mates carry (e1, e2)
+// mismatches, counted and summed.
+struct EditClass {
+    std::size_t count = 0;
+    double mass = 0.0;
+};
+EditClass edit_class_mass(const std::vector<FragmentState>& states,
+                          std::uint32_t e1, std::uint32_t e2,
+                          std::size_t m1_len, std::size_t m2_len,
+                          const InsertPrior& ip, double log_eps, double log_1meps);
+
 // ADAPTIVE TAIL. The bound above charges B -- one mate at d+1, the other perfect -- to EVERY
 // omitted state, when most omitted states are far worse (a random position mismatches ~3/4 of the
 // read). That is where the looseness lives: per-insert-length summation removed only ~0.8 nats of a
