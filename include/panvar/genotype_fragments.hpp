@@ -1209,6 +1209,69 @@ std::vector<FragmentState> enumerate_fragment_states(
     const std::vector<MatePlacement>& m2_fwd, const std::vector<MatePlacement>& m2_rev,
     std::size_t m1_len, std::size_t m2_len, long insert_lo, long insert_hi);
 
+// AN UPPER BOUND ON THE MASS THIS SEARCH DOES NOT REACH.
+//
+// An omitted state is one where some mate exceeds its edit band. Its per-state likelihood is at
+// most the best such state: one mate at exactly d+1 edits and the other perfect, whichever pairing
+// is larger, times the largest insert prior in support. The COUNT of omitted states is bounded by
+// the total (start, insert, orientation) combinations minus those found -- so the bound is
+//
+//     log M_omitted <= log(0.5) + B + log SUM_L N_omitted(L) * pi(L)
+//
+// SUMMED PER INSERT LENGTH, not N_omitted * max_L pi(L). The latter charges the largest insert
+// probability to every omitted state, and pi varies by orders of magnitude across the support, so
+// it inflates the bound by roughly that ratio. Measured on the tail-only fixture: the flat form
+// gave -39.6 against a true reference of -133.0, loose by 93 nats.
+//
+// N_omitted(L) is taken from the SAME universe exposure integrates over,
+//     N_total(L) = 2 * max(0, |H| - L + 1),
+// minus the distinct found states at that L, so the mass and exposure invariant is preserved.
+//
+// B is the best a state OUTSIDE the band can achieve: ONE mate perfect and the other exactly one
+// edit past its band -- not both mates out, which is strictly worse and would understate nothing
+// but is not the maximum.
+//
+// It counts the AGGREGATE of omitted origins, not one representative: a repeat with many omitted
+// copies contributes all of them through N_omitted. That is the property that makes it safe at an
+// array, where bounding a single origin would understate the tail by the copy number.
+// ADAPTIVE TAIL. The bound above charges B -- one mate at d+1, the other perfect -- to EVERY
+// omitted state, when most omitted states are far worse (a random position mismatches ~3/4 of the
+// read). That is where the looseness lives: per-insert-length summation removed only ~0.8 nats of a
+// 93-nat slack, because pi sums to 1 and the flat form over-counted by roughly a factor of two.
+//
+// So: enumerate EXACTLY through a deeper band D >= d, and bound only what lies beyond D, using
+// D+1 mismatches. Each increase in D moves B down by about one log_eps per edit while the exact
+// part absorbs the states that used to be bounded. D grows until the interval width meets the
+// declared tolerance or the cap is reached, at which point the fragment is reported UNCERTIFIABLE
+// rather than certified on a width nobody checked.
+struct TailInterval {
+    double lower = 0.0;        // exact mass through D
+    double upper = 0.0;        // logadd(lower, bound beyond D)
+    double bound = 0.0;        // the beyond-D bound alone
+    std::size_t depth = 0;     // the D actually used
+    std::size_t states = 0;    // exact states through D
+    bool within_tolerance = false;
+    // REFINEMENT INVARIANTS, recorded per fragment so deepening cannot go wrong silently.
+    // The last is the one that matters most: deepening D must only REALLOCATE tail accounting, and
+    // must leave the production-band mass untouched. If it changes, D is altering the in-band model
+    // rather than resolving its tail, and every in-band number computed at a different D is a
+    // different quantity.
+    bool lower_monotone = true;      // exact mass never decreases as D grows
+    bool upper_monotone = true;      // upper never increases as D grows
+    bool inband_stable = true;       // mass at the PRODUCTION band d is unchanged at every D
+    double inband_at_d = 0.0;        // that production-band mass, for reporting
+};
+
+TailInterval adaptive_tail_interval(const std::string& r1, const std::string& r2,
+                                    const std::string& hap, std::size_t d1, std::size_t d2,
+                                    const InsertPrior& ip, double log_eps, double log_1meps,
+                                    double tolerance_nats, std::size_t max_depth_mult);
+
+double omitted_mass_bound(std::size_t hap_len, std::size_t m1_len, std::size_t m2_len,
+                          std::size_t d1, std::size_t d2, const InsertPrior& ip,
+                          double log_eps, double log_1meps,
+                          const std::vector<FragmentState>& found);
+
 // EXACT IN-BAND MASS over a state set, in the reference's own terms: for each state,
 // e1 + e2 + log_pi(insert), summed in log space. reference_pair_loglik accumulates exactly
 // e1 + e2 + ip.log_at(L) per (start, insert) and this mirrors it, so agreement is a statement about

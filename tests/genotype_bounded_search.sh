@@ -280,6 +280,29 @@ emit_pairB pairB_ "$HA" 151     # mate roles swapped: exercises library orientat
 # 240, so taking the min instead of the max is invisible. This 150+150 pair makes the maximum 300,
 # and the shared lower support bound must follow the LONGEST fragment.
 emit_pair150 pair150_ "$HA" 1301
+# TAIL-ONLY. Both mates carry MORE than d mismatches at their true position, so no in-band state
+# exists anywhere -- lower = -inf -- while the untruncated reference still has finite mass there.
+# This is the case that tests whether the omitted bound bounds ANYTHING: with an empty in-band set
+# the interval is [-inf, bound] and the reference must sit inside it.
+TAILP=$("$PY" - "$HA" 120 0.05 <<'PYEOF'
+import sys
+h=sys.argv[1]; L=int(sys.argv[2]); div=float(sys.argv[3])
+d=int(div*L)+1
+sub={'A':'C','C':'G','G':'T','T':'A'}
+def mut(seg, k):
+    b=list(seg.upper())
+    for i in range(k): b[(i*7+3) % len(b)]=sub[b[(i*7+3) % len(b)]]
+    return "".join(b)
+st=1001   # HA is 2200 bp; 2001+350 runs past the end and truncated mate 2, dropping the pair
+m1=mut(h[st-1:st-1+L], d+4)                      # d+4 mismatches: comfortably out of band
+tail=h[st-1+350-L:st-1+350]
+rc=lambda s: s[::-1].translate(str.maketrans("ACGT","TGCA"))
+m2=rc(mut(tail, d+4))
+print(m1); print(m2)
+PYEOF
+)
+printf '>tail_/1\n%s\n>tail_/2\n%s\n' "$(printf '%s' "$TAILP" | sed -n 1p)" \
+  "$(printf '%s' "$TAILP" | sed -n 2p)" >> "$OUT/reads.fa"
 
 # ---- A/B: exact agreement with the exhaustive scan ---------------------------------------------
 if ! "$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/b" -o "$OUT/o" -R "$OUT/reads.fa" \
@@ -394,6 +417,99 @@ else
     [ "${MV:-1}" = 0 ] \
       && ok "and no cell exceeds the untruncated reference (M_in_band <= M_reference)" \
       || bad "$MV cell(s) have in-band mass ABOVE the reference integral that contains it"
+    # CONDITION C, the interval. Containment on every cell, and at least one cell with a POSITIVE
+    # width -- otherwise the bound is being "satisfied" by a quantity that is always zero.
+    IC=$(awk -F'\t' 'NR>1 && $16==1{n++} END{print n+0}' "$OUT/bs.tsv.states.tsv")
+    IN=$(awk -F'\t' 'NR>1{n++} END{print n+0}' "$OUT/bs.tsv.states.tsv")
+    IW=$(awk -F'\t' 'NR>1 && $17>0{n++} END{print n+0}' "$OUT/bs.tsv.states.tsv")
+    { [ "${IN:-0}" -gt 0 ] && [ "${IC:-0}" = "${IN:-1}" ]; } \
+      && ok "the exact reference lies inside [lower, upper] on all $IN cells" \
+      || bad "the reference falls outside the interval on $(( IN - IC )) of $IN cells"
+    [ "${IW:-0}" -gt 0 ] \
+      && ok "and $IW cell(s) have a POSITIVE interval width, so the bound is not always zero" \
+      || bad "every interval has zero width; the containment assertion above is vacuous"
+    # TAIL-ONLY: every placement out of band, so the in-band set is EMPTY and lower = -inf, while
+    # the untruncated reference still has finite mass. This is the case the bound exists for, and
+    # emitting only cells with states hid it completely -- the fixture produced no rows at all.
+    TN=$(awk -F'\t' 'NR>1 && index($1,"tail_")==1{n++} END{print n+0}' "$OUT/bs.tsv.states.tsv")
+    TZ=$(awk -F'\t' 'NR>1 && index($1,"tail_")==1 && $3==0 && $11=="-inf" && $16==1{n++} END{print n+0}' "$OUT/bs.tsv.states.tsv")
+    TF=$(awk -F'\t' 'NR>1 && index($1,"tail_")==1 && $13!="-inf" && $13<0{n++} END{print n+0}' "$OUT/bs.tsv.states.tsv")
+    { [ "${TN:-0}" -gt 0 ] && [ "${TZ:-0}" = "${TN:-1}" ] && [ "${TF:-0}" = "${TN:-1}" ]; } \
+      && ok "tail-only: $TN cells with an EMPTY in-band set, finite reference mass, all contained" \
+      || bad "tail-only case is not exercised (rows=$TN empty+contained=$TZ finite_ref=$TF)"
+    # CONDITION F, the adaptive tail. The flat bound charges "one mate at d+1" to every omitted
+    # state and was 93 nats loose on the tail-only fragment -- an interval of [-inf,-40.45] against
+    # a true reference of -133.03, which certifies nothing. Deepening the exact band to D and
+    # bounding only beyond D recovers it exactly.
+    AC=$(awk -F'\t' 'NR>1 && $24==1{n++} END{print n+0}' "$OUT/bs.tsv.states.tsv")
+    AN=$(awk -F'\t' 'NR>1{n++} END{print n+0}' "$OUT/bs.tsv.states.tsv")
+    [ "${AC:-0}" = "${AN:-1}" ] \
+      && ok "the adaptive-tail interval contains the exact reference on all $AN cells" \
+      || bad "$(( AN - AC )) cell(s) have the reference outside the adaptive interval"
+    # The tightening must be demonstrated where the flat bound failed, not merely on easy cells.
+    TW=$(awk -F'\t' 'NR>1 && index($1,"tail_")==1 && $2=="ref"{print $22; exit}' "$OUT/bs.tsv.states.tsv")
+    TL=$(awk -F'\t' 'NR>1 && index($1,"tail_")==1 && $2=="ref"{print $11; exit}' "$OUT/bs.tsv.states.tsv")
+    TT=$(awk -F'\t' 'NR>1 && index($1,"tail_")==1 && $2=="ref"{print $23; exit}' "$OUT/bs.tsv.states.tsv")
+    { [ "${TL:-x}" = "-inf" ] && [ "${TT:-0}" = 1 ]; } \
+      && ok "on the tail-only fragment the flat lower bound is -inf but the adaptive one is tight (width $TW)" \
+      || bad "the tail-only tightening is not demonstrated (flat_lower=${TL:-?} tol_ok=${TT:-?})"
+    # And a cell it CANNOT tighten must be reported uncertifiable, never certified on an unchecked
+    # width. hapB/hapN hold the read far outside any reachable band.
+    UN=$(awk -F'\t' 'NR>1 && index($1,"tail_")==1 && $2!="ref" && $23==0{n++} END{print n+0}' "$OUT/bs.tsv.states.tsv")
+    [ "${UN:-0}" -gt 0 ] \
+      && ok "and $UN cell(s) it cannot tighten are flagged WIDE-RAW-MASS, not silently accepted" \
+      || bad "no cell is flagged wide; the tolerance check cannot be failing anywhere"
+    # NAMING, deliberately. A wide RAW-MASS bound is not an uncertifiable GENOTYPE. Certification is
+    # a statement about the final per-fragment diploid contribution,
+    #     log((1-eta)*lambda*(M_a + M_b) + eta*P_bg),
+    # and the two diverge in BOTH directions: a candidate with a hugely uncertain but tiny mass can
+    # still give a narrow contribution once the background dominates, while two individually
+    # acceptable candidate bounds can accumulate into a consequential genotype interval. Condition F
+    # belongs on the contribution; this column stays a diagnostic until that layer exists.
+    # MIXED MASS: substantial mass BOTH inside and outside the band, so upper = logadd(lower, bound)
+  # is a genuinely non-trivial addition rather than lower + epsilon. At eps=0.001 the tail is
+  # suppressed by ~8 nats per extra mismatch and can never be substantial; a HIGHER error rate makes
+  # it so. This tests the bound's arithmetic, not a typical sequencing regime, and skipping it
+  # because the usual regime is quiet would leave logadd untested. eps=0.15 was not enough -- the
+  # bound still sat ~10 nats below the in-band mass and logadd moved the upper bound by 1e-4.
+  "$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/b" -o "$OUT/mx" -R "$OUT/reads.fa" \
+    --max-divergence 0.05 --fragment-len 350 --fragment-sd 50 --error-rate 0.30 \
+    --bounded-search "$OUT/mx.tsv" -q >/dev/null 2>&1
+  if [ ! -s "$OUT/mx.tsv.states.tsv" ]; then
+    bad "the mixed-mass arm produced no states"
+  else
+    MXC=$(awk -F'\t' 'NR>1 && $16==1{n++} END{print n+0}' "$OUT/mx.tsv.states.tsv")
+    MXN=$(awk -F'\t' 'NR>1{n++} END{print n+0}' "$OUT/mx.tsv.states.tsv")
+    # a cell with BOTH finite in-band mass AND an omitted bound within 20 nats of it: the logadd
+    # genuinely moves the upper bound rather than being swamped by one term.
+    MXB=$(awk -F'\t' 'NR>1 && $11!="-inf" && $14!="-inf" && $17>0.05{n++} END{print n+0}' "$OUT/mx.tsv.states.tsv")
+    [ "${MXC:-0}" = "${MXN:-1}" ] \
+      && ok "mixed mass (eps=0.30): the reference stays inside the interval on all $MXN cells" \
+      || bad "mixed mass: $(( MXN - MXC )) cell(s) fall outside the interval"
+    [ "${MXB:-0}" -gt 0 ] \
+      && ok "and $MXB cell(s) have in-band and omitted mass comparable, so logadd does real work" \
+      || bad "no cell has comparable in-band and omitted mass; logadd is untested"
+  fi
+
+  # REFINEMENT INVARIANTS. Deepening D must only reallocate TAIL accounting.
+    LM=$(awk -F'\t' 'NR>1 && $25==0{n++} END{print n+0}' "$OUT/bs.tsv.states.tsv")
+    UM=$(awk -F'\t' 'NR>1 && $26==0{n++} END{print n+0}' "$OUT/bs.tsv.states.tsv")
+    IS=$(awk -F'\t' 'NR>1 && $27==0{n++} END{print n+0}' "$OUT/bs.tsv.states.tsv")
+    [ "${LM:-1}" = 0 ] && ok "exact mass never DECREASES as D grows" \
+                       || bad "$LM cell(s) lost exact mass at a deeper D"
+    [ "${UM:-1}" = 0 ] && ok "the upper bound never INCREASES as D grows" \
+                       || bad "$UM cell(s) had the upper bound rise at a deeper D"
+    # THE ONE THAT MATTERS MOST: the production-band mass must be IDENTICAL at every D. If it moves,
+    # D is changing the in-band model rather than resolving its tail, and in-band numbers computed
+    # at different depths are different quantities.
+    [ "${IS:-1}" = 0 ] \
+      && ok "the production-band mass is unchanged at every D (deepening only reallocates the tail)" \
+      || bad "$IS cell(s) changed their production-band mass as D grew; D is altering the model"
+    # EXPOSURE is analytic and depends on haplotype length, so two different haplotypes must differ.
+    NE=$(awk -F'\t' 'NR>1{print $18}' "$OUT/bs.tsv.states.tsv" | sort -u | wc -l | tr -d ' ')
+    [ "${NE:-0}" -ge 2 ] \
+      && ok "analytic exposure varies with haplotype length ($NE distinct values)" \
+      || bad "exposure has ${NE:-0} distinct value(s); it is not tracking haplotype length"
     [ "$SN" -gt 0 ] && ok "fragment states built ($SN) from bounded and exhaustive placements" \
                     || bad "zero fragment states; the comparison below is vacuous"
     [ "${SD:-1}" = 0 ] && ok "bounded and exhaustive fragment-state SETS are identical" \
@@ -427,6 +543,17 @@ fi
 echo
 if [ "$fails" -eq 0 ]; then echo "bounded search: stage-1 A/B assertions passed"; else
   echo "bounded search: $fails assertion(s) failed"; fi
-echo "NOTE: conditions C-G (omitted-mass bound, diploid propagation, interval certification) are"
-echo "      NOT yet asserted -- the mass and exposure work is not implemented."
+echo "ASSERTED: A/B (state sets, in-band mass), C (omitted-mass bound, tail-only case),"
+echo "          adaptive tail tightening on RAW CANDIDATE MASS, and analytic exposure."
+echo "NOT YET CONDITION F: F is a tolerance on the final per-fragment DIPLOID CONTRIBUTION"
+echo "          log((1-eta)*lambda*(M_a+M_b) + eta*P_bg), not on raw log M. What is measured here"
+echo "          is a raw-mass diagnostic; it neither implies nor is implied by a certifiable"
+echo "          genotype."
+echo "          Mixed mass (eps=0.30, logadd moves the upper bound by 0.066 nats), and the three"
+echo "          refinement invariants: exact mass never decreases with D, the upper bound never"
+echo "          increases, and the PRODUCTION-BAND mass is unchanged at every D."
+echo "NOT ASSERTED: diploid/background propagation, and G (certification by"
+echo "              L(g) > max U(other) with overlapping intervals). Still missing from C: the"
+echo "              omitted-MULTIPLICITY fixture -- K copies of an out-of-band unit must move the"
+echo "              exact tail by log K, with neither dedup nor the bound collapsing it."
 exit "$fails"

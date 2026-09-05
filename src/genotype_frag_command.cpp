@@ -1056,9 +1056,13 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         std::ofstream sf(fs_path);
         if (!sf) throw std::runtime_error("genotype-frag: cannot write " + fs_path);
         sf << "fragment\thaplotype\tbounded_states\texhaustive_states\tagree\torientA\torientB"
-              "\tinsert_lo\tinsert_hi\tstate_hap\tmass_bounded\tmass_exhaustive\tmass_reference\n";
+              "\tinsert_lo\tinsert_hi\tstate_hap\tmass_bounded\tmass_exhaustive\tmass_reference"
+              "\tomitted_bound\tupper\tcontains_ref\tinterval_nats\texposure"
+              "\tad_depth\tad_lower\tad_upper\tad_width\tad_tol_ok\tad_contains"
+              "\tad_lower_mono\tad_upper_mono\tad_inband_stable\tad_inband_at_d\n";
         std::size_t st_dis = 0, tot_a = 0, tot_b = 0, tot_states = 0;
-        std::size_t mass_dis = 0, bound_viol = 0, mass_cells = 0;
+        std::size_t mass_dis = 0, bound_viol = 0, mass_cells = 0, interval_miss = 0;
+        std::size_t adaptive_miss = 0, adaptive_tight = 0;
         {
             // THE PRODUCTION PRIOR, not a re-derived one. make_insert_prior uses 4 sigmas and
             // floors lo at the mates' combined length: for 120 bp mates that is [240,550], where a
@@ -1132,14 +1136,50 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                     // only floating-point associativity can separate them.
                     if (!mass_eq) ++mass_dis;
                     if (mb != kNegInfBs && mr != kNegInfBs && mb > mr + 1e-9) ++bound_viol;
-                    if (!bs.empty() || !es.empty()) {
+                    // THE INTERVAL. lower = in-band mass, upper = logadd(lower, omitted bound).
+                    // The exact reference must lie inside it, or the bound does not bound.
+                    const double ob = omitted_mass_bound(seqs[h].size(), F.r1.size(), F.r2.size(),
+                                                         d1, d2, bs_prior, lep, l1m, bs);
+                    const double up = (mb == kNegInfBs) ? ob
+                                    : (ob == kNegInfBs ? mb
+                                       : std::max(mb, ob) + std::log1p(std::exp(-std::abs(mb - ob))));
+                    const bool contains = (mr == kNegInfBs) ||
+                                          (mr <= up + 1e-9 &&
+                                           (mb == kNegInfBs || mr >= mb - 1e-9));
+                    if (!contains) ++interval_miss;
+                    const double width = (up == kNegInfBs || mb == kNegInfBs) ? -1.0 : up - mb;
+                    const double expo = bs_prior.exposure(seqs[h].size());
+                    // ADAPTIVE TAIL: deepen D until the width meets tolerance, or report it as
+                    // uncertifiable. 1 nat is a deliberately demanding target for a single
+                    // fragment-haplotype cell.
+                    const TailInterval ti = adaptive_tail_interval(
+                        F.r1, F.r2, seqs[h], d1, d2, bs_prior, lep, l1m, 1.0, 6);
+                    const double ti_width = (ti.upper == kNegInfBs || ti.lower == kNegInfBs)
+                                          ? -1.0 : ti.upper - ti.lower;
+                    const bool ti_ok = (mr == kNegInfBs) ||
+                                       (mr <= ti.upper + 1e-9 &&
+                                        (ti.lower == kNegInfBs || mr >= ti.lower - 1e-9));
+                    if (!ti_ok) ++adaptive_miss;
+                    if (ti.within_tolerance) ++adaptive_tight;
+                    // EMIT EVEN WITH NO STATES. The tail-only case -- every placement out of band,
+                    // so the in-band set is empty and lower = -inf -- is precisely where the
+                    // omitted bound has to do work, and skipping empty cells hid it entirely.
+                    {
                         // state_hap is FragmentState::hap, not the loop variable: printing the
                         // enclosing name would show the right answer even if the key lost it.
                         sf << F.name << '\t' << names[h] << '\t' << bs.size() << '\t' << es.size()
                            << '\t' << (same ? "yes" : "NO") << '\t' << na << '\t' << nb
                            << '\t' << ilo << '\t' << ihi << '\t'
                            << (bs.empty() ? h : bs.front().hap) << '\t'
-                           << mb << '\t' << me << '\t' << mr << '\n';
+                           << mb << '\t' << me << '\t' << mr << '\t'
+                           << ob << '\t' << up << '\t' << (contains ? 1 : 0) << '\t'
+                           << width << '\t' << expo << '\t'
+                           << ti.depth << '\t' << ti.lower << '\t' << ti.upper << '\t'
+                           << ti_width << '\t' << (ti.within_tolerance ? 1 : 0) << '\t'
+                           << (ti_ok ? 1 : 0) << '\t'
+                           << (ti.lower_monotone ? 1 : 0) << '\t'
+                           << (ti.upper_monotone ? 1 : 0) << '\t'
+                           << (ti.inband_stable ? 1 : 0) << '\t' << ti.inband_at_d << '\n';
                         ++mass_cells;
                     }
                 }
@@ -1173,6 +1213,21 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         log.info("in-band mass: " + std::to_string(mass_cells) + " cells, " +
                  std::to_string(mass_dis) + " bounded/exhaustive disagreements, " +
                  std::to_string(bound_viol) + " exceeding the untruncated reference");
+        log.info("adaptive tail: " + std::to_string(adaptive_tight) + " of " +
+                 std::to_string(mass_cells) + " cells within 1 nat, " +
+                 std::to_string(adaptive_miss) + " not containing the reference");
+        if (adaptive_miss != 0) {
+            throw std::runtime_error("genotype-frag: the adaptive-tail interval does not contain "
+                                     "the exact reference on " + std::to_string(adaptive_miss) +
+                                     " cell(s)");
+        }
+        log.info("intervals: " + std::to_string(interval_miss) +
+                 " cell(s) where the exact reference falls outside [lower, upper]");
+        if (interval_miss != 0) {
+            throw std::runtime_error("genotype-frag: the exact reference mass falls OUTSIDE the "
+                                     "reported interval on " + std::to_string(interval_miss) +
+                                     " cell(s); the omitted-mass bound does not bound");
+        }
         if (mass_dis != 0) {
             throw std::runtime_error("genotype-frag: bounded and exhaustive in-band MASS differ on " +
                                      std::to_string(mass_dis) + " cell(s)");

@@ -3042,6 +3042,92 @@ bool sl_block_has_no_allele(const std::vector<BlockAlleles>& blocks, std::uint32
 }
 }  // namespace
 
+double omitted_mass_bound(std::size_t hap_len, std::size_t m1_len, std::size_t m2_len,
+                          std::size_t d1, std::size_t d2, const InsertPrior& ip,
+                          double log_eps, double log_1meps,
+                          const std::vector<FragmentState>& found) {
+    const long n = static_cast<long>(hap_len);
+    // Found states per insert length, so the omitted count is exact at every L rather than lumped.
+    std::unordered_map<long, std::size_t> found_at;
+    for (const FragmentState& st : found) ++found_at[st.insert];
+
+    const auto read_ll = [&](std::size_t edits, std::size_t len) {
+        const std::size_t e = std::min(edits, len);
+        return static_cast<double>(e) * log_eps + static_cast<double>(len - e) * log_1meps;
+    };
+    // ONE mate perfect, the other exactly one edit past its band. Both mates out is strictly worse.
+    const double B = std::max(read_ll(d1 + 1, m1_len) + read_ll(0, m2_len),
+                              read_ll(0, m1_len) + read_ll(d2 + 1, m2_len));
+
+    // log SUM_L N_omitted(L) * pi(L), accumulated in log space.
+    double acc = kNegInf;
+    for (long L = ip.lo; L <= ip.hi; ++L) {
+        const double starts = static_cast<double>(std::max<long>(0, n - L + 1));
+        if (starts <= 0.0) continue;
+        const double n_total_L = 2.0 * starts;               // the two library orientations
+        const auto it = found_at.find(L);
+        const double n_found_L = it == found_at.end() ? 0.0 : static_cast<double>(it->second);
+        const double n_om = n_total_L - n_found_L;
+        if (n_om <= 0.0) continue;
+        acc = log_add(acc, std::log(n_om) + ip.log_at(L));
+    }
+    if (acc == kNegInf) return kNegInf;
+    return std::log(0.5) + B + acc;
+}
+
+TailInterval adaptive_tail_interval(const std::string& r1, const std::string& r2,
+                                    const std::string& hap, std::size_t d1, std::size_t d2,
+                                    const InsertPrior& ip, double log_eps, double log_1meps,
+                                    double tolerance_nats, std::size_t max_depth_mult) {
+    TailInterval out;
+    const std::string r1rc = reverse_complement(r1);
+    const std::string r2rc = reverse_complement(r2);
+    double prev_lower = kNegInf, prev_upper = std::numeric_limits<double>::infinity();
+    double inband_ref = kNegInf;
+    bool have_inband = false;
+    for (std::size_t mult = 1; mult <= std::max<std::size_t>(1, max_depth_mult); ++mult) {
+        const std::size_t D1 = d1 * mult, D2 = d2 * mult;
+        const auto f1 = bounded_mate_placements(r1, hap, D1, nullptr);
+        const auto v1 = bounded_mate_placements(r1rc, hap, D1, nullptr);
+        const auto f2 = bounded_mate_placements(r2, hap, D2, nullptr);
+        const auto v2 = bounded_mate_placements(r2rc, hap, D2, nullptr);
+        const auto st = enumerate_fragment_states(0, f1, v1, f2, v2, r1.size(), r2.size(),
+                                                  ip.lo, ip.hi);
+        const double m = fragment_states_mass(st, r1.size(), r2.size(), ip, log_eps, log_1meps);
+        const double b = omitted_mass_bound(hap.size(), r1.size(), r2.size(), D1, D2, ip,
+                                            log_eps, log_1meps, st);
+        const double up = (m == kNegInf) ? b : (b == kNegInf ? m : log_add(m, b));
+        // The PRODUCTION-band mass, recomputed at every depth from the same deeper state set:
+        // states whose mates are both within the original d. It must not move.
+        {
+            std::vector<FragmentState> inband;
+            for (const FragmentState& z : st) {
+                if (z.m1_edits <= d1 && z.m2_edits <= d2) inband.push_back(z);
+            }
+            const double mi = fragment_states_mass(inband, r1.size(), r2.size(), ip,
+                                                   log_eps, log_1meps);
+            if (!have_inband) { inband_ref = mi; have_inband = true; }
+            else if (!(mi == inband_ref ||
+                       (mi != kNegInf && inband_ref != kNegInf &&
+                        std::abs(mi - inband_ref) < 1e-9))) {
+                out.inband_stable = false;
+            }
+            out.inband_at_d = inband_ref;
+        }
+        if (prev_lower != kNegInf && m != kNegInf && m < prev_lower - 1e-9) out.lower_monotone = false;
+        if (prev_upper != std::numeric_limits<double>::infinity() && up != kNegInf &&
+            up > prev_upper + 1e-9) out.upper_monotone = false;
+        prev_lower = m; prev_upper = up;
+        out.lower = m; out.upper = up; out.bound = b;
+        out.depth = mult; out.states = st.size();
+        const double width = (up == kNegInf || m == kNegInf) ? std::numeric_limits<double>::infinity()
+                                                             : up - m;
+        out.within_tolerance = width <= tolerance_nats;
+        if (out.within_tolerance) break;
+    }
+    return out;
+}
+
 double fragment_states_mass(const std::vector<FragmentState>& states,
                             std::size_t m1_len, std::size_t m2_len,
                             const InsertPrior& ip, double log_eps, double log_1meps) {
