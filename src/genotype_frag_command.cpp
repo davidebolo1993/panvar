@@ -1056,8 +1056,9 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         std::ofstream sf(fs_path);
         if (!sf) throw std::runtime_error("genotype-frag: cannot write " + fs_path);
         sf << "fragment\thaplotype\tbounded_states\texhaustive_states\tagree\torientA\torientB"
-              "\tinsert_lo\tinsert_hi\tstate_hap\n";
+              "\tinsert_lo\tinsert_hi\tstate_hap\tmass_bounded\tmass_exhaustive\tmass_reference\n";
         std::size_t st_dis = 0, tot_a = 0, tot_b = 0, tot_states = 0;
+        std::size_t mass_dis = 0, bound_viol = 0, mass_cells = 0;
         {
             // THE PRODUCTION PRIOR, not a re-derived one. make_insert_prior uses 4 sigmas and
             // floors lo at the mates' combined length: for 120 bp mates that is [240,550], where a
@@ -1109,13 +1110,37 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                     std::size_t na = 0, nb = 0;
                     for (const FragmentState& z : bs) { if (z.m1_fwd) ++na; else ++nb; }
                     tot_a += na; tot_b += nb; tot_states += bs.size();
+                    // IN-BAND MASS, in the reference's terms, plus the untruncated reference for
+                    // the same fragment and haplotype. The first two must be EQUAL (same states,
+                    // same formula); the third must be >= them, because the reference integrates
+                    // out-of-band states this search deliberately does not reach.
+                    const double lep = std::log(opt.error_rate / 3.0);
+                    const double l1m = std::log1p(-opt.error_rate);
+                    const double mb = fragment_states_mass(bs, F.r1.size(), F.r2.size(),
+                                                           bs_prior, lep, l1m);
+                    const double me = fragment_states_mass(es, F.r1.size(), F.r2.size(),
+                                                           bs_prior, lep, l1m);
+                    ReferenceParams rp_bs;
+                    rp_bs.error_rate = opt.error_rate; rp_bs.fragment_len = opt.fragment_len;
+                    rp_bs.fragment_sd = opt.fragment_sd; rp_bs.bg_divergence = opt.bg_divergence;
+                    const double mr = reference_fragment_on_haplotype(
+                        F, seqs[h], rp_bs, bs_prior, reverse_complement(F.r2), lep, l1m);
+                    const double kNegInfBs = -std::numeric_limits<double>::infinity();
+                    const bool mass_eq = (mb == kNegInfBs && me == kNegInfBs) ||
+                                         std::abs(mb - me) < 1e-9;
+                    // 1e-9 absolute on log mass: these are the same additions in the same order, so
+                    // only floating-point associativity can separate them.
+                    if (!mass_eq) ++mass_dis;
+                    if (mb != kNegInfBs && mr != kNegInfBs && mb > mr + 1e-9) ++bound_viol;
                     if (!bs.empty() || !es.empty()) {
                         // state_hap is FragmentState::hap, not the loop variable: printing the
                         // enclosing name would show the right answer even if the key lost it.
                         sf << F.name << '\t' << names[h] << '\t' << bs.size() << '\t' << es.size()
                            << '\t' << (same ? "yes" : "NO") << '\t' << na << '\t' << nb
                            << '\t' << ilo << '\t' << ihi << '\t'
-                           << (bs.empty() ? h : bs.front().hap) << '\n';
+                           << (bs.empty() ? h : bs.front().hap) << '\t'
+                           << mb << '\t' << me << '\t' << mr << '\n';
+                        ++mass_cells;
                     }
                 }
             }
@@ -1145,6 +1170,18 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         log.info("fragment states: " + std::to_string(tot_states) + " built, " +
                  std::to_string(st_dis) + " cell(s) disagree with exhaustive; orientation A " +
                  std::to_string(tot_a) + ", orientation B " + std::to_string(tot_b));
+        log.info("in-band mass: " + std::to_string(mass_cells) + " cells, " +
+                 std::to_string(mass_dis) + " bounded/exhaustive disagreements, " +
+                 std::to_string(bound_viol) + " exceeding the untruncated reference");
+        if (mass_dis != 0) {
+            throw std::runtime_error("genotype-frag: bounded and exhaustive in-band MASS differ on " +
+                                     std::to_string(mass_dis) + " cell(s)");
+        }
+        if (bound_viol != 0) {
+            throw std::runtime_error("genotype-frag: in-band mass EXCEEDS the untruncated reference "
+                                     "on " + std::to_string(bound_viol) + " cell(s); the in-band sum "
+                                     "cannot be larger than the integral that contains it");
+        }
         if (st_dis != 0) {
             throw std::runtime_error("genotype-frag: bounded and exhaustive fragment-state sets "
                                      "differ on " + std::to_string(st_dis) + " cell(s)");

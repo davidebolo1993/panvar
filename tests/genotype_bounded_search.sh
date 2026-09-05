@@ -378,6 +378,22 @@ else
     else
       bad "no haplotype-key table was written"
     fi
+    # IN-BAND MASS, in the reference's own terms. Two relations, and they are different claims:
+    #   * bounded == exhaustive: same states, same formula, so only FP associativity may separate;
+    #   * bounded <= reference: the reference integrates EVERY start and insert and does not
+    #     truncate at the divergence band, so the in-band sum cannot exceed the integral containing
+    #     it. This caught a real parity bug -- the state mass omitted log(0.5) per orientation while
+    #     the reference averages over them, so it sat exactly log(2) = 0.6931 ABOVE the reference on
+    #     every cell.
+    MC=$(awk -F'\t' 'NR>1{n++} END{print n+0}' "$OUT/bs.tsv.states.tsv")
+    MD=$(awk -F'\t' 'NR>1 && $11!=$12{n++} END{print n+0}' "$OUT/bs.tsv.states.tsv")
+    MV=$(awk -F'\t' 'NR>1 && $11>$13+1e-9{n++} END{print n+0}' "$OUT/bs.tsv.states.tsv")
+    { [ "${MC:-0}" -gt 0 ] && [ "${MD:-1}" = 0 ]; } \
+      && ok "bounded and exhaustive in-band MASS agree on all $MC cells" \
+      || bad "$MD of ${MC:-0} cells differ in in-band mass"
+    [ "${MV:-1}" = 0 ] \
+      && ok "and no cell exceeds the untruncated reference (M_in_band <= M_reference)" \
+      || bad "$MV cell(s) have in-band mass ABOVE the reference integral that contains it"
     [ "$SN" -gt 0 ] && ok "fragment states built ($SN) from bounded and exhaustive placements" \
                     || bad "zero fragment states; the comparison below is vacuous"
     [ "${SD:-1}" = 0 ] && ok "bounded and exhaustive fragment-state SETS are identical" \

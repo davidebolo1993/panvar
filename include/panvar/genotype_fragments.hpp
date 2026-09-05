@@ -1209,6 +1209,28 @@ std::vector<FragmentState> enumerate_fragment_states(
     const std::vector<MatePlacement>& m2_fwd, const std::vector<MatePlacement>& m2_rev,
     std::size_t m1_len, std::size_t m2_len, long insert_lo, long insert_hi);
 
+// EXACT IN-BAND MASS over a state set, in the reference's own terms: for each state,
+// e1 + e2 + log_pi(insert), summed in log space. reference_pair_loglik accumulates exactly
+// e1 + e2 + ip.log_at(L) per (start, insert) and this mirrors it, so agreement is a statement about
+// the same quantity rather than about two similar ones.
+//
+// NOTE ON THE COMPARISON THIS SUPPORTS. The reference integrates EVERY start and insert and does
+// NOT truncate at max_divergence, so the in-band mass computed here can never equal the reference's
+// total -- out-of-band states carry small but nonzero probability. The correct relation is
+//     M_in_band <= M_reference <= M_in_band + M_omitted_bound
+// and demanding equality with the untruncated reference would either be impossible or would force
+// the bounded search to evaluate the tail exactly, which defeats its purpose.
+// The untruncated reference for one fragment on one haplotype: every start, every insert in the
+// prior's support, no divergence band. This is the upper side of the in-band interval.
+double reference_fragment_on_haplotype(const Fragment& f, const std::string& hap,
+                                       const ReferenceParams& p, const InsertPrior& ip,
+                                       const std::string& r2rc,
+                                       double log_eps, double log_1meps);
+
+double fragment_states_mass(const std::vector<FragmentState>& states,
+                            std::size_t m1_len, std::size_t m2_len,
+                            const InsertPrior& ip, double log_eps, double log_1meps);
+
 // ---------------------------------------------------------------------------------------------
 // AUTHORITATIVE PATH -> BLOCK PROJECTION. The one place block coordinates are derived.
 //

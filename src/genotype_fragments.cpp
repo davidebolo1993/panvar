@@ -2944,6 +2944,10 @@ double reference_orientation(const std::string& lead, const std::string& trail,
     return acc;
 }
 
+}  // namespace -- reference_fragment_on_haplotype is EXPORTED: the bounded search
+   // needs the untruncated reference as the upper side of its in-band interval,
+   // and a second copy of that integral in the command would be the duplicated-rule
+   // failure this branch has paid for three times.
 double reference_fragment_on_haplotype(const Fragment& f, const std::string& hap,
                                        const ReferenceParams& p, const InsertPrior& ip,
                                        const std::string& r2rc,
@@ -2961,8 +2965,6 @@ double reference_fragment_on_haplotype(const Fragment& f, const std::string& hap
     return log_add(fwd == kNegInf ? kNegInf : half + fwd,
                    rev == kNegInf ? kNegInf : half + rev);
 }
-
-} // namespace
 
 double reference_pair_loglik(const std::string& hap_a, const std::string& hap_b,
                              const std::vector<Fragment>& fragments,
@@ -3039,6 +3041,28 @@ bool sl_block_has_no_allele(const std::vector<BlockAlleles>& blocks, std::uint32
     return blocks[bi].allele_of.find(name) == blocks[bi].allele_of.end();
 }
 }  // namespace
+
+double fragment_states_mass(const std::vector<FragmentState>& states,
+                            std::size_t m1_len, std::size_t m2_len,
+                            const InsertPrior& ip, double log_eps, double log_1meps) {
+    const auto read_ll = [&](std::uint32_t edits, std::size_t len) {
+        return static_cast<double>(edits) * log_eps +
+               static_cast<double>(len - edits) * log_1meps;
+    };
+    // log(0.5) PER STATE. Each state belongs to ONE of the two library orientations, and the
+    // reference averages over them -- log_add(half + fwd, half + rev) -- rather than summing.
+    // Omitting it makes this mass exactly log(2) = 0.6931 larger than the reference on every cell,
+    // which is how the bound assertion caught it: an in-band sum cannot exceed the integral that
+    // contains it, and it did, by that constant everywhere.
+    const double log_half_strand = std::log(0.5);
+    double acc = kNegInf;
+    for (const FragmentState& st : states) {
+        const double e1 = read_ll(st.m1_edits, m1_len);
+        const double e2 = read_ll(st.m2_edits, m2_len);
+        acc = log_add(acc, log_half_strand + e1 + e2 + ip.log_at(st.insert));
+    }
+    return acc;
+}
 
 std::vector<FragmentState> enumerate_fragment_states(
     std::uint32_t hap,
