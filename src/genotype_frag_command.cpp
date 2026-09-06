@@ -321,6 +321,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     bool bounded_verify = false;
     std::string interval_score, interval_cands;
     double interval_tau = 0.0, interval_tol = 1.0;
+    bool interval_contrib = false;
     std::vector<std::string> reconcile_scope;
     std::string switch_penalties_arg = "0,10,100,1000";
     std::vector<std::string> exact_distance;
@@ -361,6 +362,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--interval-candidates") interval_cands = value(i, a);
         else if (a == "--interval-tau") interval_tau = std::stod(value(i, a));
         else if (a == "--interval-tol") interval_tol = std::stod(value(i, a));
+        else if (a == "--interval-contrib") interval_contrib = true;
         else if (a == "--scope-tol") {
             const std::string sv = value(i, a);
             scope_tol = std::stod(sv);
@@ -1153,11 +1155,14 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         // assumed. 12697 fragment-candidate cells widened under complete recruitment, including
         // fragments outside the audited 76 -- "the 20 reclassified fragments caused the reversal"
         // does not follow from the reversal alone and has to be decomposed.
+        // OFF BY DEFAULT. One row per (fragment, class): at 131 candidates that is 8646 unordered
+        // diplotypes x 23953 fragments = 207 million rows. It exists for ATTRIBUTION on a handful of
+        // named candidates, not for a full shortlist.
         const std::string cfp = interval_score + ".contrib.tsv";
-        std::ofstream cf(cfp);
-        if (!cf) throw std::runtime_error("genotype-frag: cannot write " + cfp);
-        cf.precision(12);
-        cf << "fragment\tclass\tcontrib_lower\n";
+        std::ofstream cf;
+        if (interval_contrib) cf.open(cfp);
+        if (interval_contrib && !cf) throw std::runtime_error("genotype-frag: cannot write " + cfp);
+        if (interval_contrib) { cf.precision(12); cf << "fragment\tclass\tcontrib_lower\n"; }
         std::vector<MassInterval> classes;
         std::vector<std::string> clabel;
         std::vector<double> nominal;
@@ -1172,7 +1177,9 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                                                                  log_bgw_i, bg[fi]);
                     sum.lower += c.lower;
                     sum.upper += c.upper;
-                    cf << ifr[fi].name << '\t' << a << '_' << b << '\t' << c.lower << '\n';
+                    if (interval_contrib) {
+                        cf << ifr[fi].name << '\t' << a << '_' << b << '\t' << c.lower << '\n';
+                    }
                 }
                 const double ea = ip_i.exposure(iseqs[a].size());
                 const double eb = ip_i.exposure(iseqs[b].size());
@@ -1185,8 +1192,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                     << (tot.upper - tot.lower) << '\t' << tot.lower << '\n';
             }
         }
-        cf.flush();
-        log.wrote({cfp});
+        if (interval_contrib) { cf.flush(); log.wrote({cfp}); }
         const auto t1 = std::chrono::steady_clock::now();
         const double secs = std::chrono::duration<double>(t1 - t0).count();
         const Certification cert = certify(classes, interval_tau);
@@ -1221,6 +1227,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         isf << "# all_plausible_tight\t" << (all_tight ? 1 : 0) << '\n';
         isf << "# interval_tol\t" << interval_tol << '\n';
         isf << "# fragments\t" << ifr.size() << '\n';
+        isf << "# candidates\t" << nc << '\n';
+        isf << "# diplotypes\t" << classes.size() << '\n';
         isf << "# cells_widened\t" << refined_cells << '\n';
         isf << "# cells_exact\t" << tol_ok_cells << '\n';
         isf << "# seconds\t" << secs << '\n';

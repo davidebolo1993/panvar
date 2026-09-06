@@ -41,6 +41,7 @@ set -uo pipefail
 OUT="${1:?out}"; REPO="${2:?repo}"; BIN="${3:?bin}"
 mkdir -p "$OUT"; PY="${PYTHON:-python3}"
 md5of() { if command -v md5 >/dev/null 2>&1; then md5 -q "$1"; else md5sum "$1" | cut -d' ' -f1; fi; }
+T_ALL_START=$(date +%s)
 fails=0
 ok()  { printf '  ok   %s\n' "$*"; }
 bad() { printf '  FAIL %s\n' "$*"; fails=$((fails+1)); }
@@ -92,10 +93,16 @@ wgsim -N "$N" -1 150 -2 150 -d "$FLEN" -s "$FSD" -e "$ERR" -r 0 -R 0 -X 0 -S "$S
   && ok "reads reproduce their pinned md5 ($N pairs)" \
   || bad "read md5 is $(md5of "$OUT/r1.fq"), expected $EXP_R1_MD5"
 
+# RUNTIMES REPORTED SEPARATELY. Conflating them reads as a contradiction: --interval-score is
+# 0.8 s on the 76-fragment deciding set (where --bounded-search did not finish in 10 minutes) and
+# ~261 s on all 23953 fragments. Those are different inputs, and the scorer's time is not the
+# regression's time -- spelling the panel and simulating reads dominate the setup.
+T_SCORE_START=$(date +%s)
 "$BIN" genotype-frag -i "$G" -b "$P" -o "$OUT/is" -R "$OUT/r1.fq" -R "$OUT/r2.fq" \
   --max-divergence "$DIV" --fragment-len "$FLEN" --fragment-sd "$FSD" --error-rate "$ERR" \
   --interval-score "$OUT/is.tsv" --interval-tol "$TOL" --interval-tau 0.0 \
   --interval-candidates "$T1,$TE,$WC" -q >/dev/null 2>&1
+T_SCORE=$(( $(date +%s) - T_SCORE_START ))
 if [ ! -s "$OUT/is.tsv" ]; then
   bad "no interval score produced"
 else
@@ -134,6 +141,12 @@ else
     && ok "production-band placements on the truth-equivalent haplotype: $PB of $EXP_FRAGS" \
     || bad "only ${PB:-0} production-band placements, expected > 19000"
 fi
+SCORER_SECS=$(grep -E "^# seconds" "$OUT/is.tsv" 2>/dev/null | cut -f2)
+echo
+echo "  runtimes, separately (they are not the same quantity):"
+echo "    interval_score_scorer      ${SCORER_SECS:-?} s   (the interval computation itself)"
+echo "    interval_score_invocation  ${T_SCORE:-?} s   (that command end to end)"
+echo "    total_regression           $(( $(date +%s) - T_ALL_START )) s   (incl. panel spelling and read simulation)"
 echo "  provenance: binary $(md5of "$BIN"), commit $(cd "$REPO" && git rev-parse --short HEAD 2>/dev/null)"
 echo
 if [ "$fails" -eq 0 ]; then echo "c4 certified interval: all assertions passed"; else
