@@ -1372,6 +1372,15 @@ struct Certification {
 };
 Certification certify(const std::vector<MassInterval>& classes, double tau);
 
+// THREE OUTCOMES, and the third must never be read as biological ambiguity:
+//   CERTIFIED  -- exactly one plausible class;
+//   UNRESOLVED -- several plausible, but every one reached the tolerance or an exact endpoint;
+//   INCOMPLETE -- refinement stopped early, so overlap may be budget rather than data.
+enum class Verdict { Certified, Unresolved, Incomplete };
+const char* verdict_name(Verdict v);
+Verdict verdict_of(const std::vector<MassInterval>& classes, const Certification& cert,
+                   double tol);
+
 // Aggregate representatives of one biological class: L(C) = log SUM_i w_i exp(L(g_i)).
 // Weights must sum to 1 for sequence-identical aliases, so adding a duplicate alias cannot change
 // the class score -- otherwise a genotype gains confidence purely from catalogue multiplicity.

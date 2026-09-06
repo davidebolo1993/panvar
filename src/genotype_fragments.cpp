@@ -3119,6 +3119,26 @@ Certification certify(const std::vector<MassInterval>& classes, double tau) {
     return out;
 }
 
+const char* verdict_name(Verdict v) {
+    switch (v) {
+        case Verdict::Certified:  return "CERTIFIED";
+        case Verdict::Unresolved: return "UNRESOLVED";
+        default:                  return "INCOMPLETE";
+    }
+}
+
+Verdict verdict_of(const std::vector<MassInterval>& classes, const Certification& cert,
+                   double tol) {
+    if (cert.certified) return Verdict::Certified;
+    // UNRESOLVED only if every plausible class actually reached the tolerance. Otherwise the
+    // overlap may be an artefact of stopping early, and reporting it as ambiguity would attribute
+    // a resource limit to the data.
+    for (std::size_t i : cert.plausible) {
+        if (classes[i].upper - classes[i].lower > tol) return Verdict::Incomplete;
+    }
+    return Verdict::Unresolved;
+}
+
 MassInterval aggregate_class(const std::vector<MassInterval>& reps,
                              const std::vector<double>& weights) {
     MassInterval out;

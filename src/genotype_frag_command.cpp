@@ -14,6 +14,7 @@
 #include "panvar/syncmer.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <fstream>
 #include <iostream>
@@ -317,6 +318,9 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     std::string origin_universe;
     double scope_tol = 1e-6;
     std::string bounded_search;
+    bool bounded_verify = false;
+    std::string interval_score, interval_cands;
+    double interval_tau = 0.0, interval_tol = 1.0;
     std::vector<std::string> reconcile_scope;
     std::string switch_penalties_arg = "0,10,100,1000";
     std::vector<std::string> exact_distance;
@@ -352,6 +356,11 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--reference-all-fragments") ref_subset = "all";
         else if (a == "--origin-universe") origin_universe = value(i, a);
         else if (a == "--bounded-search") bounded_search = value(i, a);
+        else if (a == "--bounded-verify") bounded_verify = true;
+        else if (a == "--interval-score") interval_score = value(i, a);
+        else if (a == "--interval-candidates") interval_cands = value(i, a);
+        else if (a == "--interval-tau") interval_tau = std::stod(value(i, a));
+        else if (a == "--interval-tol") interval_tol = std::stod(value(i, a));
         else if (a == "--scope-tol") {
             const std::string sv = value(i, a);
             scope_tol = std::stod(sv);
@@ -1022,6 +1031,209 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         return 0;
     }
 
+    // ---- INTERVAL SCORING over named candidates -------------------------------------------------
+    // The real experiment path. No exhaustive A/B here: that is O(|hap|) per cell and exists to
+    // CERTIFY the bounded search on fixtures, not to run on 23953 fragments. Correctness of the
+    // bounded search is established by tests/genotype_bounded_search.sh; this consumes it.
+    if (!interval_score.empty()) {
+        if (interval_cands.empty()) {
+            throw std::runtime_error("genotype-frag: --interval-score needs --interval-candidates");
+        }
+        const std::vector<std::string> want = split_commas(interval_cands);
+        const std::vector<Fragment> ifr = load_fragments(read_paths);
+        if (ifr.empty()) throw std::runtime_error("genotype-frag: --interval-score needs reads");
+        const auto by_name_i = path_records_by_name(graph);
+        std::vector<std::string> inames, iseqs;
+        for (const std::string& nm : want) {
+            const auto it = by_name_i.find(nm);
+            if (it == by_name_i.end() || it->second == nullptr) {
+                throw std::runtime_error("genotype-frag: --interval-candidates names a path not in "
+                                         "the graph: " + nm);
+            }
+            bool ok = false;
+            std::string w = spell_path_steps_sequence(graph, it->second->steps, &ok);
+            if (!ok) throw std::runtime_error("genotype-frag: cannot spell " + nm);
+            inames.push_back(nm); iseqs.push_back(std::move(w));
+        }
+        long min_len_i = 1;
+        for (const Fragment& F : ifr) {
+            min_len_i = std::max<long>(min_len_i,
+                                       static_cast<long>(F.r1.size() + F.r2.size()));
+        }
+        const InsertPrior ip_i = make_insert_prior(opt.fragment_len, opt.fragment_sd,
+                                                   opt.discordant_rate, 4, min_len_i);
+        const double lep_i = std::log(opt.error_rate / 3.0);
+        const double l1m_i = std::log1p(-opt.error_rate);
+        const double lambda_i = hopt.haploid_depth > 0.0 ? hopt.haploid_depth : 0.05;
+        const double log_mix_i = std::log1p(-opt.outlier_mix);
+        const double log_bgw_i = std::log(opt.outlier_mix);
+        const double log_lam_i = std::log(lambda_i);
+        const std::size_t nc = iseqs.size();
+
+        // Per (fragment, candidate) mass intervals, from the adaptive tail.
+        std::vector<std::vector<MassInterval>> M(ifr.size(), std::vector<MassInterval>(nc));
+        // THREE DISTINCT PROPERTIES, emitted side by side so one implementation reproduces the
+        // original audit partition AND identifies tail-only placements, instead of two tools
+        // classifying subtly different things and being treated as interchangeable:
+        //   production_band_exists -- a state exists at the FIXED production band d;
+        //   adaptive_tail_exists   -- a state appears only after deeper refinement (D > d);
+        //   the contribution interval -- the quantity actually used for scoring.
+        // Measured: two c4 fragments differ between the two, placing on the truth-equivalent
+        // haplotype ~100 nats down, reachable only at D = 4d. They contribute 0.00 to the swing.
+        std::vector<std::vector<char>> PB(ifr.size(), std::vector<char>(nc, 0));
+        std::vector<std::size_t> depth_hist(8, 0);
+        std::size_t refined_cells = 0, tol_ok_cells = 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        run_parallel(ifr.size(), opt.threads, [&](std::size_t fi) {
+            const Fragment& F = ifr[fi];
+            if (F.r1.empty() || F.r2.empty()) return;
+            const std::size_t d1 = mate_band_edits(opt.max_divergence, F.r1.size());
+            const std::size_t d2 = mate_band_edits(opt.max_divergence, F.r2.size());
+            const std::string a1 = reverse_complement(F.r1), a2 = reverse_complement(F.r2);
+            for (std::size_t h = 0; h < nc; ++h) {
+                // At the PRODUCTION band only -- no deepening. This is what the original audit
+                // classified on.
+                const auto pst = enumerate_fragment_states(static_cast<std::uint32_t>(h),
+                    bounded_mate_placements(F.r1, iseqs[h], d1, nullptr),
+                    bounded_mate_placements(a1, iseqs[h], d1, nullptr),
+                    bounded_mate_placements(F.r2, iseqs[h], d2, nullptr),
+                    bounded_mate_placements(a2, iseqs[h], d2, nullptr),
+                    F.r1.size(), F.r2.size(), ip_i.lo, ip_i.hi);
+                PB[fi][h] = pst.empty() ? 0 : 1;
+                const TailInterval ti = adaptive_tail_interval(F.r1, F.r2, iseqs[h], d1, d2, ip_i,
+                                                               lep_i, l1m_i, interval_tol, 4);
+                M[fi][h] = MassInterval{ti.lower, ti.upper};
+            }
+        });
+        for (std::size_t fi = 0; fi < ifr.size(); ++fi) {
+            for (std::size_t h = 0; h < nc; ++h) {
+                if (M[fi][h].lower != M[fi][h].upper) ++refined_cells; else ++tol_ok_cells;
+            }
+        }
+        // PER-FRAGMENT, PER-CANDIDATE placement table. This is what a classification consumer
+        // needs, and it costs nothing extra here -- the intervals are already computed. The audit
+        // previously called --bounded-search for this, which runs the exhaustive A/B on every cell:
+        // that is the tool that CERTIFIES the bounded search on fixtures, and on three 226 kb
+        // haplotypes it did not finish in 10 minutes. Verification and use are different jobs.
+        {
+            const std::string fp = interval_score + ".placements.tsv";
+            std::ofstream pf(fp);
+            if (!pf) throw std::runtime_error("genotype-frag: cannot write " + fp);
+            pf << "fragment\tcandidate\tproduction_band_exists\tadaptive_tail_exists"
+                  "\ttail_only\tlower\tupper\n";
+            for (std::size_t fi = 0; fi < ifr.size(); ++fi) {
+                if (ifr[fi].r1.empty() || ifr[fi].r2.empty()) continue;
+                for (std::size_t h = 0; h < nc; ++h) {
+                    const bool ad =
+                        M[fi][h].lower != -std::numeric_limits<double>::infinity();
+                    const bool pb = PB[fi][h] != 0;
+                    pf << ifr[fi].name << '\t' << inames[h] << '\t' << (pb ? 1 : 0) << '\t'
+                       << (ad ? 1 : 0) << '\t' << ((ad && !pb) ? 1 : 0) << '\t'
+                       << M[fi][h].lower << '\t' << M[fi][h].upper << '\n';
+                }
+            }
+            pf.flush();
+            log.wrote({fp});
+        }
+        // Background per fragment.
+        std::vector<double> bg(ifr.size(), 0.0);
+        for (std::size_t fi = 0; fi < ifr.size(); ++fi) {
+            const std::size_t len = ifr[fi].bases();
+            const std::size_t be = static_cast<std::size_t>(opt.bg_divergence *
+                                                            static_cast<double>(len));
+            bg[fi] = static_cast<double>(be) * lep_i +
+                     static_cast<double>(len - be) * l1m_i;
+        }
+        // Six unordered diplotypes for three candidates, INCLUDING homozygotes.
+        std::ofstream isf(interval_score);
+        if (!isf) throw std::runtime_error("genotype-frag: cannot write " + interval_score);
+        isf.precision(10);
+        isf << "class\thap_a\thap_b\thomozygous\tlower\tupper\twidth\tnominal\n";
+        // PER-FRAGMENT CONTRIBUTIONS per class, so a score swing can be ATTRIBUTED rather than
+        // assumed. 12697 fragment-candidate cells widened under complete recruitment, including
+        // fragments outside the audited 76 -- "the 20 reclassified fragments caused the reversal"
+        // does not follow from the reversal alone and has to be decomposed.
+        const std::string cfp = interval_score + ".contrib.tsv";
+        std::ofstream cf(cfp);
+        if (!cf) throw std::runtime_error("genotype-frag: cannot write " + cfp);
+        cf.precision(12);
+        cf << "fragment\tclass\tcontrib_lower\n";
+        std::vector<MassInterval> classes;
+        std::vector<std::string> clabel;
+        std::vector<double> nominal;
+        for (std::size_t a = 0; a < nc; ++a) {
+            for (std::size_t b = a; b < nc; ++b) {
+                const bool hom = (a == b);
+                MassInterval sum{0.0, 0.0};
+                for (std::size_t fi = 0; fi < ifr.size(); ++fi) {
+                    if (ifr[fi].r1.empty() || ifr[fi].r2.empty()) continue;
+                    const MassInterval c = fragment_contribution(M[fi][a], M[fi][b], hom,
+                                                                 log_mix_i, log_lam_i,
+                                                                 log_bgw_i, bg[fi]);
+                    sum.lower += c.lower;
+                    sum.upper += c.upper;
+                    cf << ifr[fi].name << '\t' << a << '_' << b << '\t' << c.lower << '\n';
+                }
+                const double ea = ip_i.exposure(iseqs[a].size());
+                const double eb = ip_i.exposure(iseqs[b].size());
+                const MassInterval tot = representative_total(sum, ea, eb, hom, lambda_i, 0.0);
+                classes.push_back(tot);
+                clabel.push_back(inames[a] + " | " + inames[b]);
+                nominal.push_back(tot.lower);
+                isf << clabel.back() << '\t' << inames[a] << '\t' << inames[b] << '\t'
+                    << (hom ? 1 : 0) << '\t' << tot.lower << '\t' << tot.upper << '\t'
+                    << (tot.upper - tot.lower) << '\t' << tot.lower << '\n';
+            }
+        }
+        cf.flush();
+        log.wrote({cfp});
+        const auto t1 = std::chrono::steady_clock::now();
+        const double secs = std::chrono::duration<double>(t1 - t0).count();
+        const Certification cert = certify(classes, interval_tau);
+        // ROBUST LEADER is argmax L(C), not the nominal point winner. Reported separately so a
+        // divergence between them is visible rather than assumed away.
+        std::size_t leader = 0;
+        for (std::size_t i = 1; i < classes.size(); ++i) {
+            if (classes[i].lower > classes[leader].lower) leader = i;
+        }
+        std::size_t nom_win = 0;
+        for (std::size_t i = 1; i < nominal.size(); ++i) {
+            if (nominal[i] > nominal[nom_win]) nom_win = i;
+        }
+        double worst_other_upper = -std::numeric_limits<double>::infinity();
+        for (std::size_t i = 0; i < classes.size(); ++i) {
+            if (i == leader) continue;
+            worst_other_upper = std::max(worst_other_upper, classes[i].upper);
+        }
+        const double robust_gap = classes[leader].lower - worst_other_upper;
+        // THREE OUTCOMES, and the third must not be reported as biological ambiguity. A run stopped
+        // by the depth cap with intervals still overlapping is UNFINISHED, not unresolved.
+        const Verdict vd = verdict_of(classes, cert, interval_tol);
+        const char* verdict = verdict_name(vd);
+        const bool all_tight = (vd != Verdict::Incomplete);
+        isf << "# robust_leader\t" << clabel[leader] << '\n';
+        isf << "# nominal_winner\t" << clabel[nom_win] << '\n';
+        isf << "# leaders_agree\t" << (leader == nom_win ? 1 : 0) << '\n';
+        isf << "# robust_gap\t" << robust_gap << '\n';
+        isf << "# tau\t" << interval_tau << '\n';
+        isf << "# n_plausible\t" << cert.plausible.size() << '\n';
+        isf << "# verdict\t" << verdict << '\n';
+        isf << "# all_plausible_tight\t" << (all_tight ? 1 : 0) << '\n';
+        isf << "# interval_tol\t" << interval_tol << '\n';
+        isf << "# fragments\t" << ifr.size() << '\n';
+        isf << "# cells_widened\t" << refined_cells << '\n';
+        isf << "# cells_exact\t" << tol_ok_cells << '\n';
+        isf << "# seconds\t" << secs << '\n';
+        isf.flush();
+        if (!isf) throw std::runtime_error("genotype-frag: write failed for " + interval_score);
+        log.info(std::string(verdict) + ": robust leader " + clabel[leader] + ", gap " +
+                 std::to_string(robust_gap) + ", " + std::to_string(cert.plausible.size()) +
+                 " plausible of " + std::to_string(classes.size()));
+        log.wrote({interval_score});
+        log.done();
+        return 0;
+    }
+
     // ---- BOUNDED-COMPLETE SINGLE-MATE SEARCH, against the exhaustive reference ------------------
     // Stage 1 is HAMMING only: reference_emission counts mismatches at a fixed offset and has no gap
     // model, so this is the emission it can certify. An indel-aware search needs its own oracle.
@@ -1187,6 +1399,13 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                     }
                 }
             }
+        // THE THREE BLOCKS BELOW ARE FIXTURE-SCALE and run only under --bounded-verify. Each is
+        // O(|haplotype|) or worse PER CELL: the exhaustive A/B, the edit-class extraction at D+1,
+        // and the D-boundary case at D = read length, which is a full exhaustive scan by
+        // construction. Measured: leaving them unconditional made the 76-fragment c4 audit -- three
+        // haplotypes of ~226 kb -- run for 90 minutes without finishing. They CERTIFY the bounded
+        // search on small fixtures; they are not part of using it.
+        if (bounded_verify) {
         // ---- MULTIPLICITY, isolated to one edit class -----------------------------------------
         // K distinct states at the SAME likelihood must sum to log K above a single one, and all K
         // coordinates must survive deduplication. Reported per (fragment, haplotype) at the exact
@@ -1478,6 +1697,29 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                    << (bad_pruned > 0 ? 1 : 0) << '\n';
                 if (bad_pruned == 0) ++gbad;
             }
+            // THREE OUTCOMES, non-vacuously. The same overlapping case must read INCOMPLETE under a
+            // restricted budget and CERTIFIED once refined, so "unresolved" can never be produced by
+            // simply stopping early.
+            {
+                const std::vector<MassInterval> wide{{-10.0, -5.0}, {-11.0, -4.0}};
+                const std::vector<MassInterval> tight{{-10.0, -9.99}, {-14.0, -13.99}};
+                const std::vector<MassInterval> tie{{-10.0, -10.0}, {-10.0, -10.0}};
+                struct VC { const char* nm; const std::vector<MassInterval>* cs; double tol;
+                            Verdict want; };
+                const VC vcs[] = {
+                    {"verdict_incomplete", &wide,  0.5, Verdict::Incomplete},
+                    {"verdict_certified",  &tight, 0.5, Verdict::Certified},
+                    {"verdict_unresolved", &tie,   0.5, Verdict::Unresolved},
+                };
+                for (const VC& v : vcs) {
+                    const Certification cc = certify(*v.cs, 0.0);
+                    const Verdict got = verdict_of(*v.cs, cc, v.tol);
+                    const bool good = got == v.want;
+                    if (!good) ++gbad;
+                    gf << v.nm << '\t' << cc.plausible.size() << '\t' << (cc.certified ? 1 : 0)
+                       << "\t0\t" << (good ? 1 : 0) << '\n';
+                }
+            }
             gf.flush();
             log.wrote({gp});
             log.info("certification gates: " + std::to_string(gbad) + " failed");
@@ -1487,6 +1729,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             log.wrote({ap});
             log.info("aggregation gates: " + std::to_string(abad) + " failed");
         }
+
+        }  // end --bounded-verify
 
         // HAPLOTYPE IDENTITY, exercised directly. States are enumerated per haplotype into separate
         // vectors, so removing `hap` from the key cannot collapse anything there -- every vector

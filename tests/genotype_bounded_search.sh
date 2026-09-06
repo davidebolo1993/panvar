@@ -316,7 +316,7 @@ printf '>tail_/1\n%s\n>tail_/2\n%s\n' "$(printf '%s' "$TAILP" | sed -n 1p)" \
 # ---- A/B: exact agreement with the exhaustive scan ---------------------------------------------
 if ! "$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/b" -o "$OUT/o" -R "$OUT/reads.fa" \
       --max-divergence 0.05 --fragment-len 350 --fragment-sd 50 \
-      --bounded-search "$OUT/bs.tsv" -q >/dev/null 2>&1; then
+      --bounded-search "$OUT/bs.tsv" --bounded-verify -q >/dev/null 2>&1; then
   bad "the bounded search exited nonzero -- it disagreed with the exhaustive reference"
 elif [ ! -s "$OUT/bs.tsv" ]; then
   bad "no bounded-search output"
@@ -483,7 +483,7 @@ else
   # bound still sat ~10 nats below the in-band mass and logadd moved the upper bound by 1e-4.
   "$BIN" genotype-frag -i "$OUT/g.gfa" -b "$OUT/b" -o "$OUT/mx" -R "$OUT/reads.fa" \
     --max-divergence 0.05 --fragment-len 350 --fragment-sd 50 --error-rate 0.30 \
-    --bounded-search "$OUT/mx.tsv" -q >/dev/null 2>&1
+    --bounded-search "$OUT/mx.tsv" --bounded-verify -q >/dev/null 2>&1
   if [ ! -s "$OUT/mx.tsv.states.tsv" ]; then
     bad "the mixed-mass arm produced no states"
   else
@@ -620,6 +620,15 @@ else
       [ "${TU:-0}" = 1 ] \
         && ok "and the tighter rule U(C) < B is shown UNSAFE, so the correction cannot regress" \
         || bad "the tighter pruning rule looks safe here; the fixture lacks a class in [B-tau, B)"
+      # THREE OUTCOMES, non-vacuously. INCOMPLETE must be distinguishable from UNRESOLVED: the
+      # first says refinement stopped early, the second says the data cannot separate the classes.
+      # Reporting a budget limit as biological ambiguity is the failure this separation prevents.
+      VI=$(awk -F'\t' 'NR>1 && $1=="verdict_incomplete"{print $5}' "$OUT/bs.tsv.certify.tsv")
+      VC=$(awk -F'\t' 'NR>1 && $1=="verdict_certified"{print $5}' "$OUT/bs.tsv.certify.tsv")
+      VU=$(awk -F'\t' 'NR>1 && $1=="verdict_unresolved"{print $5}' "$OUT/bs.tsv.certify.tsv")
+      { [ "${VI:-0}" = 1 ] && [ "${VC:-0}" = 1 ] && [ "${VU:-0}" = 1 ]; } \
+        && ok "all three verdicts occur: wide overlap is INCOMPLETE, refined is CERTIFIED, exact tie is UNRESOLVED" \
+        || bad "verdict outcomes wrong (incomplete=${VI:-?} certified=${VC:-?} unresolved=${VU:-?})"
       # NON-VACUITY: both outcomes must occur, or a constant would pass.
       { [ "${GC:-0}" -gt 0 ] && [ "${GU:-0}" -gt 0 ]; } \
         && ok "and both outcomes occur ($GC certified, $GU unresolved), so a constant cannot pass" \
