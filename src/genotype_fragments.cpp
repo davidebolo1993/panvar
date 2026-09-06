@@ -3075,6 +3075,38 @@ double omitted_mass_bound(std::size_t hap_len, std::size_t m1_len, std::size_t m
     return std::log(0.5) + B + acc;
 }
 
+MassInterval fragment_contribution(const MassInterval& ma, const MassInterval& mb, bool homozygous,
+                                   double log_mix, double log_lambda, double log_bg_weight,
+                                   double log_p_bg) {
+    const double log_two = std::log(2.0);
+    const auto one = [&](double a, double b) {
+        // TWO CHROMOSOME COPIES for a homozygote: 2*M_a, i.e. log M_a + log 2. Not M_a + M_a mixed
+        // twice with the background -- that would count eta*P_bg once per copy.
+        const double m = homozygous ? (a == kNegInf ? kNegInf : a + log_two) : log_add(a, b);
+        const double sig = (m == kNegInf) ? kNegInf : log_mix + log_lambda + m;
+        return log_add(sig, log_bg_weight + log_p_bg);
+    };
+    MassInterval out;
+    out.lower = one(ma.lower, mb.lower);
+    out.upper = one(ma.upper, mb.upper);
+    return out;
+}
+
+MassInterval aggregate_class(const std::vector<MassInterval>& reps,
+                             const std::vector<double>& weights) {
+    MassInterval out;
+    out.lower = kNegInf;
+    out.upper = kNegInf;
+    for (std::size_t i = 0; i < reps.size(); ++i) {
+        const double w = i < weights.size() ? weights[i] : 0.0;
+        if (w <= 0.0) continue;
+        const double lw = std::log(w);
+        if (reps[i].lower != kNegInf) out.lower = log_add(out.lower, lw + reps[i].lower);
+        if (reps[i].upper != kNegInf) out.upper = log_add(out.upper, lw + reps[i].upper);
+    }
+    return out;
+}
+
 EditClass edit_class_mass(const std::vector<FragmentState>& states,
                           std::uint32_t e1, std::uint32_t e2,
                           std::size_t m1_len, std::size_t m2_len,

@@ -1312,6 +1312,36 @@ double fragment_states_mass(const std::vector<FragmentState>& states,
                             const InsertPrior& ip, double log_eps, double log_1meps);
 
 // ---------------------------------------------------------------------------------------------
+// DIPLOID PROPAGATION AND CLASS AGGREGATION.
+//
+// ORDER MATTERS, and getting it wrong builds a different model:
+//   1. sum every fragment's contribution for ONE FIXED representative diplotype g_i;
+//   2. add that representative's exact exposure and any declared prior;
+//   3. only THEN aggregate representatives of a biological class C.
+// Aggregating per FRAGMENT instead would let a different full-path representative explain each
+// fragment -- an implicit mosaic model, not a diplotype likelihood.
+//
+// The homozygous factor 2*M_a represents TWO PHYSICAL CHROMOSOME COPIES. It is unrelated to any
+// log 2 from enumerating (a,b) and (b,a); the pair is unordered and is counted once.
+struct MassInterval {
+    double lower = 0.0;
+    double upper = 0.0;
+};
+
+// One fragment's diploid contribution: the two candidate masses are combined ONCE, then mixed with
+// the background ONCE. A homozygote contributes 2*M_a -- not two independently mixed background
+// terms, which would double-count eta*P_bg.
+MassInterval fragment_contribution(const MassInterval& ma, const MassInterval& mb, bool homozygous,
+                                   double log_mix, double log_lambda, double log_bg_weight,
+                                   double log_p_bg);
+
+// Aggregate representatives of one biological class: L(C) = log SUM_i w_i exp(L(g_i)).
+// Weights must sum to 1 for sequence-identical aliases, so adding a duplicate alias cannot change
+// the class score -- otherwise a genotype gains confidence purely from catalogue multiplicity.
+MassInterval aggregate_class(const std::vector<MassInterval>& reps,
+                             const std::vector<double>& weights);
+
+// ---------------------------------------------------------------------------------------------
 // AUTHORITATIVE PATH -> BLOCK PROJECTION. The one place block coordinates are derived.
 //
 // Bytes are SLICED from the graph walk through the verified CandidateFrame, never rebuilt by

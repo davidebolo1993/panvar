@@ -562,6 +562,27 @@ else
         && ok "and the residual set is empty everywhere (bound = -inf)" \
         || bad "$(( DN - DI )) cell(s) still have a non-empty residual at D = read length"
     fi
+    # AGGREGATION. Analytic fixtures over the order: per-representative fragment sum -> exposure ->
+    # class aggregation. Four assert INVARIANCE and two assert a DIFFERENCE, so an implementation
+    # that collapses everything cannot pass them all.
+    if [ ! -s "$OUT/bs.tsv.aggregate.tsv" ]; then
+      bad "no aggregation table"
+    else
+      AG=$(awk -F'\t' 'NR>1 && $4==0{n++} END{print n+0}' "$OUT/bs.tsv.aggregate.tsv")
+      AN=$(awk -F'\t' 'NR>1{n++} END{print n+0}' "$OUT/bs.tsv.aggregate.tsv")
+      [ "${AG:-1}" = 0 ] \
+        && ok "all $AN aggregation gates hold (swap, homozygous doubling, alias, split, and two differences)" \
+        || bad "$AG of $AN aggregation gates failed"
+      # The two DIFFERENCE gates by name, so an inverted comparison cannot pass silently.
+      ND=$(awk -F'\t' 'NR>1 && $1=="naive_differs" && $4==1{print 1}' "$OUT/bs.tsv.aggregate.tsv")
+      MD=$(awk -F'\t' 'NR>1 && $1=="mosaic_differs" && $4==1{print 1}' "$OUT/bs.tsv.aggregate.tsv")
+      [ "${ND:-0}" = 1 ] \
+        && ok "unweighted summing DIFFERS from the weighted class, so duplicate aliases cannot inflate a score" \
+        || bad "unweighted summing equals the weighted class; the weights are inert"
+      [ "${MD:-0}" = 1 ] \
+        && ok "per-FRAGMENT aggregation DIFFERS from per-representative, so the mosaic model is excluded" \
+        || bad "per-fragment and per-representative aggregation agree; the mosaic model is not excluded"
+    fi
     # EXPOSURE is analytic and depends on haplotype length, so two different haplotypes must differ.
     NE=$(awk -F'\t' 'NR>1{print $18}' "$OUT/bs.tsv.states.tsv" | sort -u | wc -l | tr -d ' ')
     [ "${NE:-0}" -ge 2 ] \
@@ -611,6 +632,8 @@ echo "          refinement invariants: exact mass never decreases with D, the up
 echo "          increases, and the PRODUCTION-BAND mass is unchanged at every D."
 echo "          Omitted multiplicity, isolated to one edit class (log K), and the D-boundary"
 echo "          terminal case (residual empty, lower == upper == exhaustive)."
-echo "NOT ASSERTED: diploid/background propagation, and G (certification by"
-echo "              L(g) > max U(other) with overlapping intervals)."
+echo "          Diploid contribution (mass combined once, background mixed once, homozygous 2M_a)"
+echo "          and class aggregation (per-representative sum THEN aggregate; mosaic excluded)."
+echo "NOT ASSERTED: exposure charged once outside the fragment sum, lazy interval pruning, and G"
+echo "              (certification by L(C) > max U(other classes)) on SUMMED genotype intervals."
 exit "$fails"

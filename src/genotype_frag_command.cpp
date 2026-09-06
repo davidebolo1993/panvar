@@ -1289,6 +1289,85 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                      "non-empty or lower/upper/reference disagree at D = read length");
         }
 
+        // ---- AGGREGATION GATES ------------------------------------------------------------------
+        // Analytic fixtures, not data-driven: each isolates one property of the order
+        // per-representative sum -> exposure -> class aggregation.
+        {
+            const std::string ap = bounded_search + ".aggregate.tsv";
+            std::ofstream af(ap);
+            if (!af) throw std::runtime_error("genotype-frag: cannot write " + ap);
+            af << "case\tvalue_a\tvalue_b\tequal\n";
+            const double lmix = std::log(0.9), llam = std::log(0.05);
+            const double lbgw = std::log(0.1), lpbg = -12.0;
+            const auto eq = [](double x, double y) { return std::abs(x - y) < 1e-9; };
+            std::size_t abad = 0;
+            const auto emit = [&](const char* nm, double x, double y) {
+                const bool e = eq(x, y);
+                if (!e) ++abad;
+                af << nm << '\t' << x << '\t' << y << '\t' << (e ? 1 : 0) << '\n';
+            };
+            const MassInterval A{-3.0, -2.5}, B{-4.0, -3.2};
+
+            // 1. SWAPPING a and b leaves the contribution unchanged: the pair is unordered.
+            const auto ab = fragment_contribution(A, B, false, lmix, llam, lbgw, lpbg);
+            const auto ba = fragment_contribution(B, A, false, lmix, llam, lbgw, lpbg);
+            emit("swap_ab_lower", ab.lower, ba.lower);
+            emit("swap_ab_upper", ab.upper, ba.upper);
+
+            // 2. HOMOZYGOUS DOUBLING is present EXACTLY ONCE: 2*M_a, and the background is mixed
+            //    once. Compared against combining A with itself as if heterozygous, which gives the
+            //    same 2*M_a -- the two must agree, proving the doubling is not applied twice.
+            const auto hom = fragment_contribution(A, A, true, lmix, llam, lbgw, lpbg);
+            const auto het_aa = fragment_contribution(A, A, false, lmix, llam, lbgw, lpbg);
+            emit("hom_doubling_once", hom.lower, het_aa.lower);
+
+            // 3. ADDING AN IDENTICAL ALIAS must not change the class: weights sum to one, so
+            //    catalogue multiplicity cannot manufacture confidence.
+            const MassInterval R{-5.0, -4.0};
+            const auto c1 = aggregate_class({R}, {1.0});
+            const auto c2 = aggregate_class({R, R}, {0.5, 0.5});
+            emit("alias_lower", c1.lower, c2.lower);
+            emit("alias_upper", c1.upper, c2.upper);
+
+            // 4. SPLITTING one representative into two half-weight aliases is a no-op.
+            const auto c3 = aggregate_class({R, R, R}, {0.5, 0.25, 0.25});
+            emit("split_lower", c1.lower, c3.lower);
+
+            // 5. NAIVE SUMMING (weights all 1.0) must NOT equal the weighted class -- otherwise the
+            //    weighting is inert and duplicates would inflate the score. This one asserts a
+            //    DIFFERENCE, so a degenerate implementation cannot pass everything above.
+            const auto naive = aggregate_class({R, R}, {1.0, 1.0});
+            af << "naive_differs\t" << naive.lower << '\t' << c1.lower << '\t'
+               << (eq(naive.lower, c1.lower) ? 0 : 1) << '\n';
+            if (eq(naive.lower, c1.lower)) ++abad;
+
+            // 6. PER-FRAGMENT aggregation differs from per-representative aggregation whenever
+            //    different representatives explain different fragments. Two fragments, two
+            //    representatives, each strong on one: aggregating per fragment lets BOTH be
+            //    explained well -- a mosaic -- while the correct order forces one representative to
+            //    explain both. The two must NOT agree.
+            const MassInterval P1{-1.0, -1.0}, P2{-9.0, -9.0};
+            const auto rep1 = fragment_contribution(P1, P1, true, lmix, llam, lbgw, lpbg);
+            const auto rep1b = fragment_contribution(P2, P2, true, lmix, llam, lbgw, lpbg);
+            const auto rep2 = fragment_contribution(P2, P2, true, lmix, llam, lbgw, lpbg);
+            const auto rep2b = fragment_contribution(P1, P1, true, lmix, llam, lbgw, lpbg);
+            // correct: sum per representative, then aggregate the two totals
+            const MassInterval t1{rep1.lower + rep1b.lower, rep1.upper + rep1b.upper};
+            const MassInterval t2{rep2.lower + rep2b.lower, rep2.upper + rep2b.upper};
+            const auto correct = aggregate_class({t1, t2}, {0.5, 0.5});
+            // mosaic: aggregate per fragment, then sum
+            const auto f1 = aggregate_class({rep1, rep2}, {0.5, 0.5});
+            const auto f2 = aggregate_class({rep1b, rep2b}, {0.5, 0.5});
+            const double mosaic = f1.lower + f2.lower;
+            af << "mosaic_differs\t" << mosaic << '\t' << correct.lower << '\t'
+               << (eq(mosaic, correct.lower) ? 0 : 1) << '\n';
+            if (eq(mosaic, correct.lower)) ++abad;
+
+            af.flush();
+            log.wrote({ap});
+            log.info("aggregation gates: " + std::to_string(abad) + " failed");
+        }
+
         // HAPLOTYPE IDENTITY, exercised directly. States are enumerated per haplotype into separate
         // vectors, so removing `hap` from the key cannot collapse anything there -- every vector
         // holds one haplotype value. (An earlier mutation run reported this as "caught"; it was not,
