@@ -583,6 +583,48 @@ else
         && ok "per-FRAGMENT aggregation DIFFERS from per-representative, so the mosaic model is excluded" \
         || bad "per-fragment and per-representative aggregation agree; the mosaic model is not excluded"
     fi
+    # EXPOSURE, charged ONCE outside the fragment sum. Four properties: zero fragments leave exactly
+    # -lambda(E_a+E_b); adding fragments does not repeat the charge; homozygous exposure is
+    # -2*lambda*E_a, matching the 2*M_a chromosome-copy factor; and representatives of DIFFERENT
+    # length carry different exposure, which is why it must be added before class aggregation.
+    EX=$(awk -F'\t' 'NR>1 && index($1,"exposure_")==1{n++} END{print n+0}' "$OUT/bs.tsv.aggregate.tsv")
+    EB2=$(awk -F'\t' 'NR>1 && index($1,"exposure_")==1 && $4==0{n++} END{print n+0}' "$OUT/bs.tsv.aggregate.tsv")
+    { [ "${EX:-0}" -ge 4 ] && [ "${EB2:-1}" = 0 ]; } \
+      && ok "all $EX exposure properties hold (once, not repeated, homozygous 2E, length-dependent)" \
+      || bad "$EB2 of ${EX:-0} exposure properties failed"
+    # CONDITION G on class intervals. B = max_C L(C); plausible = { C : U(C) >= B - tau };
+    # certified iff exactly one plausible class.
+    if [ ! -s "$OUT/bs.tsv.certify.tsv" ]; then
+      bad "no certification table"
+    else
+      GN=$(awk -F'\t' 'NR>1{n++} END{print n+0}' "$OUT/bs.tsv.certify.tsv")
+      GB=$(awk -F'\t' 'NR>1 && $5==0{n++} END{print n+0}' "$OUT/bs.tsv.certify.tsv")
+      GC=$(awk -F'\t' 'NR>1 && $3==1{n++} END{print n+0}' "$OUT/bs.tsv.certify.tsv")
+      GU=$(awk -F'\t' 'NR>1 && $3==0{n++} END{print n+0}' "$OUT/bs.tsv.certify.tsv")
+      [ "${GB:-1}" = 0 ] \
+        && ok "all $GN certification cases behave as specified" \
+        || bad "$GB of $GN certification cases are wrong"
+      # LAZY PRUNING agrees with the unpruned reference at EVERY tested tau, prunes something
+      # (non-vacuity), keeps pruned classes pruned as B rises, and demonstrates that the tighter
+      # rule U(C) < B is UNSAFE -- it would discard a class the tolerance-expanded set keeps.
+      LZ=$(awk -F'\t' 'NR>1 && index($1,"lazy_tau")==1 && $5==0{n++} END{print n+0}' "$OUT/bs.tsv.certify.tsv")
+      LN=$(awk -F'\t' 'NR>1 && index($1,"lazy_tau")==1{n++} END{print n+0}' "$OUT/bs.tsv.certify.tsv")
+      PS=$(awk -F'\t' 'NR>1 && $1=="pruned_stays_pruned"{print $5}' "$OUT/bs.tsv.certify.tsv")
+      TU=$(awk -F'\t' 'NR>1 && $1=="tighter_rule_is_unsafe"{print $5}' "$OUT/bs.tsv.certify.tsv")
+      { [ "${LN:-0}" -ge 3 ] && [ "${LZ:-1}" = 0 ]; } \
+        && ok "lazy pruning matches the unpruned reference at all $LN tested tolerances" \
+        || bad "$LZ of ${LN:-0} lazy/unpruned comparisons disagree"
+      [ "${PS:-0}" = 1 ] \
+        && ok "a safely pruned class stays pruned as B rises" \
+        || bad "a pruned class could become plausible again; B monotonicity is not being used"
+      [ "${TU:-0}" = 1 ] \
+        && ok "and the tighter rule U(C) < B is shown UNSAFE, so the correction cannot regress" \
+        || bad "the tighter pruning rule looks safe here; the fixture lacks a class in [B-tau, B)"
+      # NON-VACUITY: both outcomes must occur, or a constant would pass.
+      { [ "${GC:-0}" -gt 0 ] && [ "${GU:-0}" -gt 0 ]; } \
+        && ok "and both outcomes occur ($GC certified, $GU unresolved), so a constant cannot pass" \
+        || bad "certification is one-sided ($GC certified, $GU unresolved)"
+    fi
     # EXPOSURE is analytic and depends on haplotype length, so two different haplotypes must differ.
     NE=$(awk -F'\t' 'NR>1{print $18}' "$OUT/bs.tsv.states.tsv" | sort -u | wc -l | tr -d ' ')
     [ "${NE:-0}" -ge 2 ] \
@@ -634,6 +676,10 @@ echo "          Omitted multiplicity, isolated to one edit class (log K), and th
 echo "          terminal case (residual empty, lower == upper == exhaustive)."
 echo "          Diploid contribution (mass combined once, background mixed once, homozygous 2M_a)"
 echo "          and class aggregation (per-representative sum THEN aggregate; mosaic excluded)."
-echo "NOT ASSERTED: exposure charged once outside the fragment sum, lazy interval pruning, and G"
-echo "              (certification by L(C) > max U(other classes)) on SUMMED genotype intervals."
+echo "          Exposure charged once outside the fragment sum, and condition G on class"
+echo "          intervals (clear winner, overlap unresolved, exact tie, point argmax, tau)."
+echo "          Lazy pruning at U(C) < B - tau, agreeing with the unpruned reference at every"
+echo "          tested tolerance, with the tighter U(C) < B rule shown unsafe."
+echo "NOT ASSERTED: G applied to genotype intervals SUMMED over all fragments of a real locus"
+echo "              rather than to analytic fixtures."
 exit "$fails"

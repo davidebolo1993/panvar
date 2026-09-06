@@ -3092,6 +3092,33 @@ MassInterval fragment_contribution(const MassInterval& ma, const MassInterval& m
     return out;
 }
 
+MassInterval representative_total(const MassInterval& fragment_sum, double exposure_a,
+                                  double exposure_b, bool homozygous, double lambda,
+                                  double log_prior) {
+    // ONCE, outside the fragment sum. Charging it per fragment would multiply it by the read count.
+    const double e = homozygous ? 2.0 * exposure_a : exposure_a + exposure_b;
+    const double term = -lambda * e + log_prior;
+    MassInterval out;
+    out.lower = fragment_sum.lower + term;
+    out.upper = fragment_sum.upper + term;
+    return out;
+}
+
+Certification certify(const std::vector<MassInterval>& classes, double tau) {
+    Certification out;
+    out.best_lower = kNegInf;
+    for (const MassInterval& c : classes) out.best_lower = std::max(out.best_lower, c.lower);
+    // tau applied in ONE place: a class stays plausible if its upper reaches within tau of the best
+    // established lower bound. Mixing a strict test here with an approximate one elsewhere is how a
+    // tolerance silently stops meaning anything.
+    const double threshold = out.best_lower - tau;
+    for (std::size_t i = 0; i < classes.size(); ++i) {
+        if (classes[i].upper >= threshold) out.plausible.push_back(i);
+    }
+    out.certified = out.plausible.size() == 1;
+    return out;
+}
+
 MassInterval aggregate_class(const std::vector<MassInterval>& reps,
                              const std::vector<double>& weights) {
     MassInterval out;

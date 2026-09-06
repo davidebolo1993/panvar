@@ -1335,6 +1335,43 @@ MassInterval fragment_contribution(const MassInterval& ma, const MassInterval& m
                                    double log_mix, double log_lambda, double log_bg_weight,
                                    double log_p_bg);
 
+// One representative's TOTAL: the summed fragment contributions plus its exposure, charged ONCE
+// outside the fragment loop. Exposure is -lambda * (E_a + E_b), or -2*lambda*E_a for a homozygote
+// -- two chromosome copies, matching the 2*M_a factor. It belongs to the REPRESENTATIVE and must be
+// added before class aggregation, because equivalent output representatives can differ in length
+// and therefore in exposure.
+MassInterval representative_total(const MassInterval& fragment_sum, double exposure_a,
+                                  double exposure_b, bool homozygous, double lambda,
+                                  double log_prior);
+
+// CONDITION G, stated once so no caller re-derives it:
+//
+//     B      = max over classes C of L(C)
+//     P_tau  = { C : U(C) >= B - tau }
+//     certified iff |P_tau| == 1
+//
+// tau only ever ENLARGES the plausible set -- raising it lowers the threshold, so a class already
+// in P can never leave it. It is applied in exactly ONE place; a tolerance meaning one thing in the
+// plausible test and another in the tie test silently stops meaning anything.
+//
+// PRUNING USES THE SAME THRESHOLD. A class is safely prunable only when
+//
+//     U(C) < B - tau
+//
+// and NOT merely when U(C) < B. Pruning on the tighter test would discard classes that legitimately
+// belong to the tolerance-expanded equivalence set, so the lazy arm would report a SMALLER plausible
+// set than the exhaustive one -- an efficiency shortcut silently changing the answer. Since B only
+// rises during refinement, a safely pruned class can never become plausible again.
+inline bool safely_prunable(const MassInterval& c, double best_lower, double tau) {
+    return c.upper < best_lower - tau;
+}
+struct Certification {
+    std::vector<std::size_t> plausible;   // indices of classes that could still win
+    bool certified = false;               // exactly one plausible class
+    double best_lower = 0.0;
+};
+Certification certify(const std::vector<MassInterval>& classes, double tau);
+
 // Aggregate representatives of one biological class: L(C) = log SUM_i w_i exp(L(g_i)).
 // Weights must sum to 1 for sequence-identical aliases, so adding a duplicate alias cannot change
 // the class score -- otherwise a genotype gains confidence purely from catalogue multiplicity.

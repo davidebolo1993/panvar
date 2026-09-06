@@ -1297,6 +1297,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             std::ofstream af(ap);
             if (!af) throw std::runtime_error("genotype-frag: cannot write " + ap);
             af << "case\tvalue_a\tvalue_b\tequal\n";
+            const double kNegInfBs2 = -std::numeric_limits<double>::infinity();
             const double lmix = std::log(0.9), llam = std::log(0.05);
             const double lbgw = std::log(0.1), lpbg = -12.0;
             const auto eq = [](double x, double y) { return std::abs(x - y) < 1e-9; };
@@ -1362,6 +1363,125 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             af << "mosaic_differs\t" << mosaic << '\t' << correct.lower << '\t'
                << (eq(mosaic, correct.lower) ? 0 : 1) << '\n';
             if (eq(mosaic, correct.lower)) ++abad;
+
+            // ---- EXPOSURE ------------------------------------------------------------------
+            const MassInterval ZERO{kNegInfBs2, kNegInfBs2};
+            const double EA = 1000.0, EB = 600.0, LAM = 0.05;
+            // Zero fragments must leave exactly -lambda(E_a + E_b).
+            const auto z = representative_total(MassInterval{0.0, 0.0}, EA, EB, false, LAM, 0.0);
+            emit("exposure_zero_frags", z.lower, -LAM * (EA + EB));
+            // Adding fragments must not repeat the charge: the exposure term is identical.
+            const auto withf = representative_total(MassInterval{-42.0, -41.0}, EA, EB, false, LAM, 0.0);
+            emit("exposure_not_repeated", withf.lower - (-42.0), z.lower);
+            // Homozygous exposure is -2*lambda*E_a, matching the 2*M_a chromosome-copy factor.
+            const auto hz = representative_total(MassInterval{0.0, 0.0}, EA, EA, true, LAM, 0.0);
+            emit("exposure_homozygous", hz.lower, -2.0 * LAM * EA);
+            // Representatives of DIFFERENT length carry different exposure, so it must be added
+            // before class aggregation -- equivalent output representatives are not interchangeable
+            // at this step.
+            const auto rA = representative_total(MassInterval{-10.0, -10.0}, EA, EA, true, LAM, 0.0);
+            const auto rB = representative_total(MassInterval{-10.0, -10.0}, EB, EB, true, LAM, 0.0);
+            af << "exposure_length_matters\t" << rA.lower << '\t' << rB.lower << '\t'
+               << (eq(rA.lower, rB.lower) ? 0 : 1) << '\n';
+            if (eq(rA.lower, rB.lower)) ++abad;
+
+            // ---- CONDITION G --------------------------------------------------------------
+            const std::string gp = bounded_search + ".certify.tsv";
+            std::ofstream gf(gp);
+            gf << "case\tn_plausible\tcertified\texpect_certified\tok\n";
+            std::size_t gbad = 0;
+            const auto gcase = [&](const char* nm, const std::vector<MassInterval>& cs,
+                                   double tau, bool want_cert, std::size_t want_n) {
+                const Certification c = certify(cs, tau);
+                const bool good = (c.certified == want_cert) && (c.plausible.size() == want_n);
+                if (!good) ++gbad;
+                gf << nm << '\t' << c.plausible.size() << '\t' << (c.certified ? 1 : 0) << '\t'
+                   << (want_cert ? 1 : 0) << '\t' << (good ? 1 : 0) << '\n';
+            };
+            // clear winner: its lower is above every other upper
+            gcase("clear_winner", {{-10.0, -9.0}, {-20.0, -19.0}}, 0.0, true, 1);
+            // point-estimate winner but OVERLAPPING intervals -> unresolved, not certified
+            gcase("overlap_unresolved", {{-10.0, -5.0}, {-11.0, -4.0}}, 0.0, false, 2);
+            // exact ties -> equivalence set
+            gcase("exact_tie", {{-10.0, -10.0}, {-10.0, -10.0}}, 0.0, false, 2);
+            // exact POINT intervals recover the ordinary argmax
+            gcase("point_argmax", {{-10.0, -10.0}, {-12.0, -12.0}}, 0.0, true, 1);
+            // tau widens the plausible set consistently
+            gcase("tau_widens", {{-10.0, -10.0}, {-10.5, -10.5}}, 1.0, false, 2);
+            // MONOTONICITY of tau: raising it can only ENLARGE the plausible set. Asserted rather
+            // than assumed, because a sign error in the threshold would shrink it instead and every
+            // single-tau case above would still pass.
+            {
+                const std::vector<MassInterval> cs{{-10.0, -10.0}, {-10.5, -10.5}, {-14.0, -14.0}};
+                std::size_t prev = 0; bool mono = true;
+                for (double t : {0.0, 0.25, 1.0, 5.0}) {
+                    const std::size_t n = certify(cs, t).plausible.size();
+                    if (n < prev) mono = false;
+                    prev = n;
+                }
+                gf << "tau_monotone\t" << prev << "\t0\t0\t" << (mono ? 1 : 0) << '\n';
+                if (!mono) ++gbad;
+            }
+            // ---- LAZY PRUNING, against the unpruned reference ------------------------------
+            // The pruned arm is an OPTIMIZATION measured against the complete one; the unpruned
+            // path stays runnable and is the reference in every case below.
+            {
+                // The fourth class is the DISCRIMINATING one: at tau=2, B=-10.0 so the plausible
+                // threshold is -12.0. Its upper of -11.0 sits between -12.0 and B, so the correct
+                // rule KEEPS it while the tighter U(C) < B rule would prune it. Without a class in
+                // that band the unsafety of the tighter rule cannot be demonstrated -- measured,
+                // the first version of this fixture reported 0 wrongly-pruned classes.
+                const std::vector<MassInterval> cs{
+                    {-10.0, -9.5}, {-10.4, -9.8}, {-13.0, -11.0},
+                    {-14.0, -13.5}, {-30.0, -29.0}};
+                for (double t : {0.0, 0.5, 2.0}) {
+                    const Certification full = certify(cs, t);
+                    // lazy: drop everything safely prunable at this tau, then certify the rest
+                    std::vector<MassInterval> kept;
+                    std::size_t pruned = 0;
+                    for (const MassInterval& c : cs) {
+                        if (safely_prunable(c, full.best_lower, t)) { ++pruned; continue; }
+                        kept.push_back(c);
+                    }
+                    const Certification lazy = certify(kept, t);
+                    const bool same = (lazy.plausible.size() == full.plausible.size()) &&
+                                      (lazy.certified == full.certified);
+                    // NON-VACUITY: pruning must actually remove something, or "agrees" is trivial.
+                    const bool nonvac = pruned > 0;
+                    gf << "lazy_tau" << t << '\t' << lazy.plausible.size() << '\t'
+                       << (lazy.certified ? 1 : 0) << '\t' << (full.certified ? 1 : 0) << '\t'
+                       << ((same && nonvac) ? 1 : 0) << '\n';
+                    if (!same || !nonvac) ++gbad;
+                }
+                // A class pruned at tau=0 must stay pruned as B rises: B only ever increases during
+                // refinement, so the threshold only ever moves away from a pruned class.
+                const Certification c0 = certify(cs, 0.0);
+                bool stays = true;
+                for (const MassInterval& c : cs) {
+                    if (!safely_prunable(c, c0.best_lower, 0.0)) continue;
+                    if (!safely_prunable(c, c0.best_lower + 5.0, 0.0)) stays = false;
+                }
+                gf << "pruned_stays_pruned\t0\t0\t0\t" << (stays ? 1 : 0) << '\n';
+                if (!stays) ++gbad;
+                // And the tighter rule U(C) < B is UNSAFE: at tau > 0 it removes a class the
+                // plausible set keeps. Asserted as a DIFFERENCE so the correction cannot regress.
+                const double tt = 2.0;
+                const Certification ft = certify(cs, tt);
+                std::size_t bad_pruned = 0;
+                for (std::size_t i = 0; i < cs.size(); ++i) {
+                    const bool wrong_rule = cs[i].upper < ft.best_lower;          // no tau
+                    const bool in_plausible =
+                        std::find(ft.plausible.begin(), ft.plausible.end(), i) != ft.plausible.end();
+                    if (wrong_rule && in_plausible) ++bad_pruned;
+                }
+                gf << "tighter_rule_is_unsafe\t" << bad_pruned << "\t0\t0\t"
+                   << (bad_pruned > 0 ? 1 : 0) << '\n';
+                if (bad_pruned == 0) ++gbad;
+            }
+            gf.flush();
+            log.wrote({gp});
+            log.info("certification gates: " + std::to_string(gbad) + " failed");
+            abad += gbad;
 
             af.flush();
             log.wrote({ap});
