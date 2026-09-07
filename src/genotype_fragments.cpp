@@ -4128,6 +4128,65 @@ FragmentOwner assign_fragment_owner(const Fragment& fragment,
     return out;
 }
 
+LinkagePotential linkage_potential(const Fragment& fragment,
+                                   const std::vector<std::string>& alleles_a,
+                                   const std::vector<std::string>& alleles_b,
+                                   const std::string& context,
+                                   const std::string& lflank, const std::string& rflank,
+                                   const InsertPrior& ip, double max_divergence,
+                                   double log_eps, double log_1meps, double log_p_bg) {
+    LinkagePotential out;
+    out.log_p_bg = log_p_bg;
+    out.n_a = alleles_a.size();
+    out.n_b = alleles_b.size();
+    if (out.n_a == 0 || out.n_b == 0 || fragment.r1.empty() || fragment.r2.empty()) return out;
+    out.mass.assign(out.n_a * out.n_b, kNegInf);
+    out.exposure.assign(out.n_a * out.n_b, 0.0);
+
+    // The background floor arrives from the caller on the SAME definition fragment_contribution
+    // uses, so a phase contrast is floored exactly as a genotype contrast is. It stays inside the
+    // mixture the edge forms; it is not a term that cancels.
+    const std::size_t d1 = mate_band_edits(max_divergence, fragment.r1.size());
+    const std::size_t d2 = mate_band_edits(max_divergence, fragment.r2.size());
+    const std::string a1 = reverse_complement(fragment.r1);
+    const std::string a2 = reverse_complement(fragment.r2);
+    const double log_half_strand = std::log(0.5);
+    out.min_window = std::numeric_limits<std::size_t>::max();
+    bool affine_all = true;
+
+    for (std::size_t al = 0; al < out.n_a; ++al) {
+        for (std::size_t be = 0; be < out.n_b; ++be) {
+            // ONE WINDOW PER CONFIGURATION, built the same way every time: only the two alleles
+            // differ, so nothing about the flanks or the context can express a preference.
+            const std::string win = lflank + alleles_a[al] + context + alleles_b[be] + rflank;
+            const std::size_t idx = al * out.n_b + be;
+            out.min_window = std::min(out.min_window, win.size());
+            const ExposureCheck ec = check_exposure(win.size(), ip);
+            // EXACT, always. Correct in both regimes; the affine surrogate is only recorded.
+            out.exposure[idx] = ec.exact;
+            if (!ec.in_regime) affine_all = false;
+            const auto f1 = bounded_mate_placements(fragment.r1, win, d1, nullptr, nullptr);
+            const auto v1 = bounded_mate_placements(a1, win, d1, nullptr, nullptr);
+            const auto f2 = bounded_mate_placements(fragment.r2, win, d2, nullptr, nullptr);
+            const auto v2 = bounded_mate_placements(a2, win, d2, nullptr, nullptr);
+            const auto st = enumerate_fragment_states(0, f1, v1, f2, v2, fragment.r1.size(),
+                                                      fragment.r2.size(), ip.lo, ip.hi);
+            double m = kNegInf;
+            for (const FragmentState& z : st) {
+                const double e1 = static_cast<double>(z.m1_edits) * log_eps +
+                                  static_cast<double>(fragment.r1.size() - z.m1_edits) * log_1meps;
+                const double e2 = static_cast<double>(z.m2_edits) * log_eps +
+                                  static_cast<double>(fragment.r2.size() - z.m2_edits) * log_1meps;
+                m = log_add(m, log_half_strand + e1 + e2 + ip.log_at(z.insert));
+            }
+            out.mass[idx] = m;
+        }
+    }
+    out.exposure_affine = affine_all;
+    out.ok = true;
+    return out;
+}
+
 OwnershipLedger ownership_ledger(const std::vector<FragmentOwner>& owners) {
     OwnershipLedger L;
     // Pooled in-band placement mass per class. This is a SIZE statistic: it says how much placement

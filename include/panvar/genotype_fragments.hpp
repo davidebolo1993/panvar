@@ -1695,6 +1695,58 @@ struct OwnershipLedger {
 };
 OwnershipLedger ownership_ledger(const std::vector<FragmentOwner>& owners);
 
+// ---------------------------------------------------------------------------------------------
+// THE LINKAGE POTENTIAL, psi_f, for one fragment owned by one variable-target edge (A, B).
+//
+// A linkage-owned fragment's mass depends on the two blocks' alleles and on nothing else, so its
+// whole contribution is a table over (allele at A, allele at B). The window scored for each entry is
+//
+//     flank + allele_alpha(A) + FIXED CONTEXT + allele_beta(B) + flank
+//
+// where the context is the concatenation of the intervening blocks, every one of which is fixed --
+// that is what made the fragment pairwise rather than Wide. The flanks are taken from a candidate's
+// actual walk and VERIFIED identical across all candidates over the bases used; where they differ
+// the fragment is not representable by this factor and is refused, never guessed.
+//
+// THE MIXTURE KEEPS ITS BACKGROUND. Each configuration's contribution is
+//
+//     log[ (1-eta) * lambda * (m(alpha1,beta1) + m(alpha2,beta2)) + eta * P_bg ]
+//
+// with P_bg INSIDE the log. It does not cancel between configurations -- it is a floor that decides
+// how much a weakly-placing fragment may say about phase -- and dropping it turns a 0.0064-nat
+// contrast into 10.0000 nats of manufactured signal.
+//
+// EXPOSURE IS NOT IN HERE. It belongs to the edge and is charged ONCE, outside the fragment sum;
+// folding it into psi_f would multiply it by the fragment count. `exposure` below is the per
+// (alpha, beta) window exposure for the edge to use once, computed EXACTLY rather than assumed to
+// cancel: the affine cancellation holds only above the insert support, and a deletion or bypass
+// allele can drop a window below it. Using the exact value is correct in both regimes and needs no
+// precondition; `exposure_affine` records whether the regime happened to hold, so the claim stays
+// auditable instead of assumed.
+struct LinkagePotential {
+    std::uint32_t block_a = 0, block_b = 0;    // the two VARIABLE blocks this edge joins
+    std::size_t n_a = 0, n_b = 0;              // allele counts at A and B
+    std::vector<double> mass;                  // [alpha * n_b + beta] -> log placement mass m
+    std::vector<double> exposure;              // [alpha * n_b + beta] -> EXACT window exposure
+    // This fragment's own background, SUPPLIED BY THE CALLER on the same definition
+    // fragment_contribution uses (bg_divergence over the fragment's length). It is not derivable
+    // here -- bg_divergence is not a parameter of this function -- and inventing a floor locally
+    // would silently give phase contrasts a different floor from genotype contrasts.
+    double log_p_bg = 0.0;
+    std::size_t min_window = 0;
+    bool exposure_affine = false;              // did every window clear the insert support?
+    bool ok = false;                           // false: flanks disagree; refuse, do not guess
+};
+
+// `context` is the fixed sequence between A and B, `lflank`/`rflank` the verified invariant flanks.
+LinkagePotential linkage_potential(const Fragment& fragment,
+                                   const std::vector<std::string>& alleles_a,
+                                   const std::vector<std::string>& alleles_b,
+                                   const std::string& context,
+                                   const std::string& lflank, const std::string& rflank,
+                                   const InsertPrior& ip, double max_divergence,
+                                   double log_eps, double log_1meps, double log_p_bg);
+
 void write_ownership_table(const std::string& path,
                            const std::vector<Fragment>& fragments,
                            const std::vector<FragmentOwner>& owners);

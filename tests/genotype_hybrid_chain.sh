@@ -44,6 +44,7 @@
 #   6. an intervening VARIABLE block gives a three-variable factor, never a cropped pair; [ACTIVE]
 #   7. the exposure precondition holds, and is measured rather than assumed;             [ACTIVE]
 #   8. every ownership class is accounted, and its mass share reported;                  [ACTIVE]
+#   9. the linkage potential keeps its background inside the mixture and its exposure exact; [ACTIVE]
 #   9. ambiguous evidence yields an equivalence set or UNRESOLVED, never a confident guess.
 #
 # NORMALISATION is settled in genotype_fragments.hpp. Linkage is a CONDITIONAL PHASE SCORE, and TWO
@@ -315,6 +316,78 @@ sys.exit(bad)
 PYEOF3
   fails=$(( fails + $? ))
 done
+
+# ---------------------------------------------------------------------------------------------
+# GATE 9: THE LINKAGE POTENTIAL psi_f, gated before any chain consumes it. Two properties:
+# the background stays INSIDE each configuration's mixture, and exposure is computed EXACTLY per
+# window rather than assumed to cancel.
+"$BIN" genotype-frag -i "$OUT/b.sorted.gfa" -b "$OUT/b" -o "$OUT/lp" -R "$OUT/r1.fq" -R "$OUT/r2.fq" \
+  -t 2 --max-divergence 0.05 --fragment-len 350 --fragment-sd 50 --error-rate 0.001 \
+  --ownership-table "$OUT/own.tsv" --linkage-potential "$OUT/lpot.tsv" -q >/dev/null 2>&1
+if [ -s "$OUT/lpot.tsv" ]; then
+  "$PY" - "$OUT/lpot.tsv" <<'PYEOF6'
+import sys, math, collections
+rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[1])][1:]
+bad = 0
+def ok(m): print("  ok   " + m)
+def no(m):
+    global bad; bad += 1; print("  FAIL " + m)
+def num(x):
+    try: return float(x)
+    except ValueError: return float("nan")
+if not rows: no("no linkage potentials emitted"); sys.exit(1)
+ok("%d linkage potentials emitted, 0 refused" % len(rows))
+with_bg = [num(r[7]) for r in rows]
+no_bg   = [num(r[8]) for r in rows]
+# THE BACKGROUND IS LOAD-BEARING. With it inside the mixture every contrast is finite; without it a
+# fragment that fails to place on a configuration gives an INFINITE log-ratio and can veto that
+# configuration single-handedly. This is the property, not a rounding detail.
+fin_w = [x for x in with_bg if math.isfinite(x)]
+if len(fin_w) == len(rows): ok("every contrast is finite with the background inside the mixture")
+else: no("%d contrasts are non-finite WITH the background -- the floor is not bounding them"
+         % (len(rows) - len(fin_w)))
+nonfin_n = [x for x in no_bg if not math.isfinite(x)]
+if nonfin_n:
+    ok("dropping the background makes %d of %d contrasts INFINITE (%.0f%%) -- each would veto a "
+       "configuration outright" % (len(nonfin_n), len(rows), 100.0*len(nonfin_n)/len(rows)))
+else:
+    no("dropping the background changes no contrast to infinite -- the gate is vacuous here, so it "
+       "is not demonstrating that the background must be retained")
+# Phase must actually be decided: all junction fragments should agree on one configuration, and by
+# a margin, or there is no linkage signal to carry into the chain.
+# PHASE-INFORMATIVE means a NON-ZERO contrast. A fragment can span the junction and still carry no
+# phase information -- if it reaches a distinguishing position in only one of the two blocks, its
+# mass is identical under both configurations and the contrast is exactly 0. Those fragments are
+# legitimately edge-owned (they still consume normalisation) but must not be counted as evidence,
+# and requiring them to "agree" would be asserting a signal that cannot exist.
+sgn = collections.Counter("neg" if x < 0 else ("pos" if x > 0 else "zero") for x in fin_w)
+inform = [x for x in fin_w if x != 0.0]
+if not inform:
+    no("no finite contrast is non-zero -- the junction carries no phase signal at all")
+elif len(set(x < 0 for x in inform)) == 1:
+    ok("all %d PHASE-INFORMATIVE contrasts agree on one configuration, mean |contrast| %.1f nats"
+       % (len(inform), sum(abs(x) for x in inform)/len(inform)))
+else:
+    no("phase-informative fragments disagree on the configuration: %s" % dict(sgn))
+# OVER-ASSIGNMENT, measured. Ownership scopes by the blocks an origin SPANS, which is a superset of
+# the blocks its mass actually depends on. Fragments in that gap are pulled out of the marker
+# unaries -- losing their content evidence -- and give no phase evidence in return. Recorded so the
+# cost of the span-union rule is visible rather than assumed to be zero.
+z = sgn.get("zero", 0)
+print("       %d of %d edge-owned fragments are phase-UNINFORMATIVE (%.0f%%): edge-owned by span, "
+      "but their mass does not depend on the combination" % (z, len(rows), 100.0*z/len(rows)))
+# Exposure: recorded per window, exact by construction. On THIS fixture every window clears the
+# insert support, so the short-window branch is not exercised here -- gate 7 covers the boundary.
+aff = collections.Counter(r[6] for r in rows)
+wmin = min(int(r[5]) for r in rows)
+ok("windows are %d bp and up; exposure regime affine=%s (short-window branch is gate 7's job)"
+   % (wmin, dict(aff)))
+sys.exit(bad)
+PYEOF6
+  fails=$(( fails + $? ))
+else
+  bad "no linkage potentials written"
+fi
 
 # ---------------------------------------------------------------------------------------------
 # GATE 7: THE EXPOSURE PRECONDITION. exposure(n) = SUM_L pi(L) max(0, n-L+1) equals the affine

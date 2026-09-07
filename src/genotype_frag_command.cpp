@@ -334,6 +334,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     std::string interval_rounds;
     std::string ownership_table;
     std::string exposure_probe;
+    std::string linkage_potential_out;
     std::vector<std::string> reconcile_scope;
     std::string switch_penalties_arg = "0,10,100,1000";
     std::vector<std::string> exact_distance;
@@ -382,6 +383,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--interval-rounds") interval_rounds = value(i, a);
         else if (a == "--ownership-table") ownership_table = value(i, a);
         else if (a == "--exposure-probe") exposure_probe = value(i, a);
+        else if (a == "--linkage-potential") linkage_potential_out = value(i, a);
         else if (a == "--scope-tol") {
             const std::string sv = value(i, a);
             scope_tol = std::stod(sv);
@@ -1169,6 +1171,112 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                                                opt.max_divergence, lep_o, l1m_o, scope_tol,
                                                opidx.empty() ? nullptr : &opidx);
         });
+        // ---- LINKAGE POTENTIALS for the edge-owned fragments -------------------------------
+        // Emitted before the chain exists so the two normalisation properties can be gated on real
+        // data rather than trusted: the background must stay inside the mixture, and exposure must
+        // be exact rather than assumed to cancel.
+        if (!linkage_potential_out.empty()) {
+            // Walk range of a block within one candidate's frame, from the verified map.
+            const auto block_span = [&](std::size_t h, std::uint32_t b,
+                                        std::size_t& lo, std::size_t& hi) -> bool {
+                const CandidateFrame& F = frames[h];
+                bool seen = false;
+                for (std::size_t k = 0; k < F.block_at.size(); ++k) {
+                    if (F.block_at[k] != b) continue;
+                    const std::size_t s0 = F.offsets[k];
+                    const std::size_t s1 = (k + 1 < F.offsets.size()) ? F.offsets[k + 1]
+                                                                     : F.seq.size();
+                    if (!seen) { lo = s0; hi = s1; seen = true; }
+                    else { lo = std::min(lo, s0); hi = std::max(hi, s1); }
+                }
+                return seen;
+            };
+            const std::size_t FLANK = static_cast<std::size_t>(ip_o.hi);
+            std::ofstream lp(linkage_potential_out);
+            if (!lp) throw std::runtime_error("genotype-frag: cannot write " + linkage_potential_out);
+            lp.precision(10);
+            lp << "fragment\tblock_a\tblock_b\tn_a\tn_b\tmin_window\texposure_affine"
+                  "\tcis_with_bg\tcis_no_bg\tbg_effect\tflanks_agree\n";
+            std::size_t emitted = 0, refused = 0;
+            for (std::size_t fi = 0; fi < ofr.size(); ++fi) {
+                if (owners[fi].kind != OwnerKind::Linkage) continue;
+                const std::uint32_t A = owners[fi].block_lo, B = owners[fi].block_hi;
+                std::size_t alo = 0, ahi = 0, blo = 0, bhi = 0;
+                if (!block_span(0, A, alo, ahi) || !block_span(0, B, blo, bhi)) { ++refused; continue; }
+                if (ahi > blo) { ++refused; continue; }
+                const std::string& w0 = frames[0].seq;
+                const std::string context = w0.substr(ahi, blo - ahi);
+                const std::size_t l0 = alo > FLANK ? alo - FLANK : 0;
+                const std::size_t r1 = std::min(w0.size(), bhi + FLANK);
+                const std::string lflank = w0.substr(l0, alo - l0);
+                const std::string rflank = w0.substr(bhi, r1 - bhi);
+                // THE FLANKS MUST AGREE ACROSS CANDIDATES. Where they do not, this fragment is not
+                // representable by a pairwise factor over (A, B) and is REFUSED, not guessed.
+                bool agree = true;
+                for (std::size_t h = 1; h < frames.size() && agree; ++h) {
+                    std::size_t a2 = 0, a3 = 0, b2 = 0, b3 = 0;
+                    if (!block_span(h, A, a2, a3) || !block_span(h, B, b2, b3)) { agree = false; break; }
+                    const std::string& wh = frames[h].seq;
+                    if (a3 > b2) { agree = false; break; }
+                    if (wh.substr(a3, b2 - a3) != context) { agree = false; break; }
+                    const std::size_t h0 = a2 > FLANK ? a2 - FLANK : 0;
+                    const std::size_t h1 = std::min(wh.size(), b3 + FLANK);
+                    if (wh.substr(h0, a2 - h0) != lflank || wh.substr(b3, h1 - b3) != rflank) {
+                        agree = false;
+                    }
+                }
+                if (!agree) { ++refused; continue; }
+                const std::size_t len = ofr[fi].bases();
+                const std::size_t be = static_cast<std::size_t>(opt.bg_divergence *
+                                                                static_cast<double>(len));
+                const double bgf = static_cast<double>(be) * lep_o +
+                                   static_cast<double>(len - be) * l1m_o;
+                const LinkagePotential P = linkage_potential(
+                    ofr[fi], blocks[A].allele_seq, blocks[B].allele_seq, context, lflank, rflank,
+                    ip_o, opt.max_divergence, lep_o, l1m_o, bgf);
+                if (!P.ok || P.n_a < 2 || P.n_b < 2) { ++refused; continue; }
+                // The cis/trans contrast this fragment supplies, WITH the background inside the
+                // mixture and WITHOUT it, so the gate can see that dropping it changes the answer.
+                const double lam_o = hopt.haploid_depth > 0.0 ? hopt.haploid_depth : 0.05;
+                const double lam = std::log(lam_o), mix = std::log1p(-opt.outlier_mix);
+                const double bgw = std::log(opt.outlier_mix);
+                const auto ladd = [](double x, double y) {
+                    const double ninf = -std::numeric_limits<double>::infinity();
+                    if (x == ninf) return y;
+                    if (y == ninf) return x;
+                    const double m = std::max(x, y);
+                    return m + std::log1p(std::exp(-std::abs(x - y)));
+                };
+                const auto conf = [&](std::size_t a1, std::size_t b1, std::size_t a2i,
+                                      std::size_t b2i, bool with_bg) {
+                    const double m1 = P.mass[a1 * P.n_b + b1];
+                    const double m2 = P.mass[a2i * P.n_b + b2i];
+                    double sig = -std::numeric_limits<double>::infinity();
+                    if (m1 != -std::numeric_limits<double>::infinity()) sig = m1;
+                    if (m2 != -std::numeric_limits<double>::infinity()) {
+                        sig = (sig == -std::numeric_limits<double>::infinity())
+                                  ? m2 : ladd(sig, m2);
+                    }
+                    if (sig != -std::numeric_limits<double>::infinity()) sig += mix + lam;
+                    if (!with_bg) return sig;
+                    return (sig == -std::numeric_limits<double>::infinity())
+                               ? (bgw + P.log_p_bg) : ladd(sig, bgw + P.log_p_bg);
+                };
+                const double cis_bg  = conf(0, 0, 1, 1, true)  - conf(0, 1, 1, 0, true);
+                const double cis_nbg = conf(0, 0, 1, 1, false) - conf(0, 1, 1, 0, false);
+                lp << ofr[fi].name << '\t' << A << '\t' << B << '\t' << P.n_a << '\t' << P.n_b
+                   << '\t' << P.min_window << '\t' << (P.exposure_affine ? 1 : 0)
+                   << '\t' << cis_bg << '\t' << cis_nbg << '\t' << (cis_nbg - cis_bg)
+                   << '\t' << 1 << '\n';
+                ++emitted;
+            }
+            lp.flush();
+            log.info("linkage potentials: " + std::to_string(emitted) + " emitted, " +
+                     std::to_string(refused) + " refused (flanks or context differ across "
+                     "candidates -- not representable by a pairwise factor)");
+            log.wrote({linkage_potential_out});
+        }
+
         const OwnershipLedger led = ownership_ledger(owners);
         write_ownership_table(ownership_table, ofr, owners);
         {
