@@ -789,7 +789,7 @@ std::string allele_catalogue_fingerprint(const std::vector<BlockAlleles>& blocks
 //
 // It remains valuable and is kept: it generates certified floors, the injection experiments, the
 // equivalence machinery and an internal baseline. What it must NOT become is the module's output
-// contract. That is BlockCall above. Do not add scoring coefficients here in the hope of closing the
+// contract. That is FragmentBlockCall above. Do not add scoring coefficients here in the hope of closing the
 // gap; that was tried and is recorded in the ledger (coverage weighting, refuted across 16 donors).
 HaplotypeResult genotype_haplotype_pairs(
     const std::vector<Block>& chain,
@@ -845,18 +845,22 @@ void write_haplotype_results(
 // Every field is always emitted. Unknown is "." and never an absent column: a reader must be able
 // to tell "not determined" from "not reported", which is exactly the distinction a vacuous audit
 // column destroys.
-enum class BlockCallStatus {
+enum class FragmentBlockCallStatus {
     Called,        // an allele pair the fragments support
     Equivalent,    // a set of pairs the fragments cannot separate
     DosageOnly,    // total copy number determined, composition or allocation not
     OffPanel,      // no allele pair explains the fragments adequately
 };
 
-struct BlockCall {
+// NAMED FragmentBlockCall, not BlockCall. genotype.hpp declares a DIFFERENT BlockCall in the same
+// namespace -- the marker caller's -- and the two headers could not be included together, which
+// blocked the genotype command from using anything in this file. Two unrelated types sharing a name
+// in one namespace was the defect; renaming the fragment-side one is the fix.
+struct FragmentBlockCall {
     std::size_t block_index = 0;
     BlockKind kind = BlockKind::Bubble;
     long bubble_id = -1;
-    BlockCallStatus status = BlockCallStatus::OffPanel;
+    FragmentBlockCallStatus status = FragmentBlockCallStatus::OffPanel;
 
     // Composition. allele1/allele2 are set only when status == Called; otherwise allele_set carries
     // the members the evidence admits, and -1 means "not determined".
@@ -882,7 +886,7 @@ struct BlockCall {
 };
 
 // Write the contract. One row per block, every column always present, "." for not determined.
-void write_block_calls(const std::string& path, const std::vector<BlockCall>& calls);
+void write_block_calls(const std::string& path, const std::vector<FragmentBlockCall>& calls);
 
 // Spell a per-block call table into the two sequences it claims the sample carries.
 //

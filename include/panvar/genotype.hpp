@@ -1,5 +1,6 @@
 #pragma once
 
+#include "panvar/chain_kernel.hpp"
 #include "panvar/genotype_blocks.hpp"
 #include "panvar/genotype_reads.hpp"
 
@@ -14,6 +15,12 @@
 namespace panvar {
 
 struct GenotypeOptions {
+    // ACTIVE LINKAGE EDGES from a committed hybrid transaction, or null. Sized n_blocks, where
+    // edges[b] joins block b-1 to b. Null -- or every entry inactive -- takes the factorised path at
+    // every edge and reproduces the legacy chain EXACTLY, which is what makes "hybrid disabled" a
+    // structural property rather than a tolerance. A refused edge never arrives here: it is either
+    // absent or the whole transaction was abandoned.
+    const std::vector<ChainEdgeLinkage>* linkage_edges = nullptr;
     double recomb_rate = 1.0;          // Li-Stephens switch scaling; 1.0 = one expected switch per locus
     // How much block-local emission a state may give up and still be reachable by the chain. Any
     // diploid state losing more than this to the block's best is excluded BEFORE forward-backward,

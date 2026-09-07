@@ -2755,7 +2755,7 @@ MosaicFloors mosaic_floors(const std::vector<BlockAlleles>& blocks,
     return out;
 }
 
-void write_block_calls(const std::string& path, const std::vector<BlockCall>& calls) {
+void write_block_calls(const std::string& path, const std::vector<FragmentBlockCall>& calls) {
     std::ofstream f(path);
     if (!f) throw std::runtime_error("genotype: cannot write " + path);
     f << "block\tkind\tbubble_id\tstatus\tallele1\tallele2\tallele_set\tdiploid_dosage\t"
@@ -2763,12 +2763,12 @@ void write_block_calls(const std::string& path, const std::vector<BlockCall>& ca
          "fragments_informing\n";
     const auto num = [](double v) { return v < 0.0 ? std::string(".") : std::to_string(v); };
     const auto idx = [](int v) { return v < 0 ? std::string(".") : std::to_string(v); };
-    for (const BlockCall& c : calls) {
+    for (const FragmentBlockCall& c : calls) {
         const char* kind = c.kind == BlockKind::Bubble ? "bubble"
                          : c.kind == BlockKind::Backbone ? "backbone" : "flank";
-        const char* st = c.status == BlockCallStatus::Called ? "CALLED"
-                       : c.status == BlockCallStatus::Equivalent ? "EQUIVALENT"
-                       : c.status == BlockCallStatus::DosageOnly ? "DOSAGE_ONLY" : "OFF_PANEL";
+        const char* st = c.status == FragmentBlockCallStatus::Called ? "CALLED"
+                       : c.status == FragmentBlockCallStatus::Equivalent ? "EQUIVALENT"
+                       : c.status == FragmentBlockCallStatus::DosageOnly ? "DOSAGE_ONLY" : "OFF_PANEL";
         f << c.block_index << '\t' << kind << '\t'
           << (c.bubble_id < 0 ? std::string(".") : std::to_string(c.bubble_id)) << '\t' << st
           << '\t' << idx(c.allele1) << '\t' << idx(c.allele2) << '\t';
@@ -3657,7 +3657,7 @@ FrameCoverage assess_frame_coverage(const Graph& graph,
     std::vector<std::string> a = hmm_states, b = C.framed_names;
     std::sort(a.begin(), a.end());
     std::sort(b.begin(), b.end());
-    C.coverage_complete = C.names_unique && C.missing_names.empty() && a == b;
+    C.all_states_usable = C.names_unique && C.missing_names.empty() && a == b;
     return C;
 }
 

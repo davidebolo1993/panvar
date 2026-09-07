@@ -15,7 +15,7 @@ namespace panvar {
 // THE CANDIDATE FRAME: a panel haplotype's walk bytes together with its VERIFIED block map.
 //
 // Extracted into its own header so the genotype command can use it without pulling in
-// genotype_fragments.hpp, which declares a second, unrelated BlockCall and therefore cannot coexist
+// genotype_fragments.hpp. (That collision is since fixed: the fragment-side type is now
 // with genotype.hpp. Splitting the shared type is the right fix; making one of the callers work
 // around the collision would not be.
 struct CandidateFrame {
@@ -81,7 +81,10 @@ struct FrameCoverage {
     // Names must be UNIQUE on both sides before they can be compared. Sorted-vector equality alone
     // would let a duplicated state appear on both sides and cancel out.
     bool names_unique = false;
-    bool coverage_complete = false;            // unique, nothing missing, and the name sets equal
+    // EVERY DECLARED STATE HAS A USABLE VERIFIED FRAME. NOT "every frame covers its whole walk":
+    // an accepted partial terminal frame is usable, and CYP2D6 is all-states-usable with one. The
+    // old name coverage_complete invited exactly that misreading.
+    bool all_states_usable = false;
 };
 
 FrameCoverage assess_frame_coverage(const Graph& graph,

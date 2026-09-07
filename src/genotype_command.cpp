@@ -7,6 +7,7 @@
 #include "panvar/genotype.hpp"
 
 #include "panvar/candidate_frame.hpp"
+#include "panvar/genotype_fragments.hpp"
 #include "panvar/genotype_index.hpp"
 #include "panvar/graph_utils.hpp"
 #include "panvar/genotype_reads.hpp"
@@ -132,6 +133,11 @@ void print_genotype_help() {
         << "                              cannot drag it), or bases (total read bases over reference\n"
         << "                              length, independent of block structure)\n"
         << "      --depth-quantile <q>    Quantile for --depth-model quantile (default 0.75)\n"
+        << "      --hybrid-call           Marker unaries plus certified fragment linkage. Linkage-\n"
+        << "                              owned fragments leave the marker counts and feed edge\n"
+        << "                              factors instead; the whole exchange is transactional, so\n"
+        << "                              any refusal leaves the legacy call untouched.\n"
+        << "      --hybrid-status <path>  Where the hybrid status report is written.\n"
         << "      --hybrid-preflight <p>  Report candidate-frame coverage over the HMM's declared\n"
         << "                              state universe, before any hybrid wiring.\n"
         << "      --exclude-fragments <f> Fragment names (one per line) whose reads must NOT be\n"
@@ -324,6 +330,11 @@ int run_genotype_command(const std::vector<std::string>& args) {
     std::string dump_markers;
     std::string exclude_fragments_path;
     std::string hybrid_preflight;
+    bool hybrid_call = false;
+    double hybrid_fragment_sd = 50.0;
+    double hybrid_divergence = 0.05;
+    double hybrid_error_rate = 0.001;
+    std::string hybrid_status_path;
     double depth_quantile = 0.75;
     long dump_block = -1;
     long ledger_block = -1;
@@ -432,6 +443,11 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--depth-quantile") depth_quantile = std::stod(require_value(arg));
         else if (arg == "--exclude-fragments") exclude_fragments_path = require_value(arg);
         else if (arg == "--hybrid-preflight") hybrid_preflight = require_value(arg);
+        else if (arg == "--hybrid-call") hybrid_call = true;
+        else if (arg == "--hybrid-status") hybrid_status_path = require_value(arg);
+        else if (arg == "--hybrid-fragment-sd") hybrid_fragment_sd = std::stod(require_value(arg));
+        else if (arg == "--hybrid-divergence") hybrid_divergence = std::stod(require_value(arg));
+        else if (arg == "--hybrid-error-rate") hybrid_error_rate = std::stod(require_value(arg));
         else if (arg == "--dump-markers") dump_markers = require_value(arg);
         else if (arg == "--dump-anchors") dump_markers = require_value(arg);  // former name
         else if (arg == "--depth-estimator") {
@@ -1431,6 +1447,119 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 log.wrote({out_prefix + ".nodecov.sample.tsv", out_prefix + ".nodecov.panel.tsv"});
             }
 
+            // THE HMM'S DECLARED STATE UNIVERSE, built here because the hybrid transaction must be
+            // planned BEFORE marker counting: its exclusion set is an input to counting.
+            std::vector<std::string> hap_names;
+            hap_names.reserve(panel_graph.paths.size());
+            for (const PathRecord& p : panel_graph.paths) hap_names.push_back(p.name);
+
+            // ---- HYBRID TRANSACTION -------------------------------------------------------
+            // Planned in full before a single occurrence is subtracted. Every failure path leaves
+            // the marker counts untouched, so the legacy call remains exactly what it would be.
+            FrameCoverage hyb_cov;
+            HybridActivation hyb_act;
+            std::unordered_set<std::string> hyb_exclusions;
+            std::size_t hyb_fragments_loaded = 0, hyb_edges_considered = 0;
+            if (hybrid_call) {
+                hyb_cov = assess_frame_coverage(graph, blocks, hap_names);
+                if (!hyb_cov.all_states_usable) {
+                    hyb_act.refusal = "candidate-frame-coverage";
+                } else {
+                    const std::vector<Fragment> hf = load_fragments(read_paths);
+                    hyb_fragments_loaded = hf.size();
+                    std::vector<char> block_variable(blocks.size(), 0);
+                    for (std::size_t b = 0; b < blocks.size(); ++b) {
+                        block_variable[b] = blocks[b].n_alleles > 1 ? 1 : 0;
+                    }
+                    long min_len = 1;
+                    for (const Fragment& F : hf) {
+                        min_len = std::max<long>(min_len,
+                                                 static_cast<long>(F.r1.size() + F.r2.size()));
+                    }
+                    const InsertPrior ip = make_insert_prior(fragment_len, hybrid_fragment_sd,
+                                                             0.01, 4, min_len);
+                    const double lep = std::log(hybrid_error_rate / 3.0);
+                    const double l1m = std::log1p(-hybrid_error_rate);
+                    // OWNERSHIP over the SAME frames the preflight reported: the object is passed,
+                    // not recomputed, so report and decision cannot describe different runs.
+                    std::vector<FragmentOwner> owners(hf.size());
+                    run_parallel(hf.size(), options.threads, [&](std::size_t fi) {
+                        owners[fi] = assign_fragment_owner(hf[fi], hyb_cov.frames, block_variable,
+                                                           ip, hybrid_divergence, lep, l1m, 1e-6,
+                                                           nullptr);
+                    });
+                    std::map<std::pair<std::uint32_t, std::uint32_t>,
+                             std::vector<std::size_t>> by_edge;
+                    for (std::size_t fi = 0; fi < hf.size(); ++fi) {
+                        if (owners[fi].kind == OwnerKind::Linkage) {
+                            by_edge[{owners[fi].block_lo, owners[fi].block_hi}].push_back(fi);
+                        }
+                    }
+                    hyb_edges_considered = by_edge.size();
+                    std::vector<std::vector<std::string>> ballele(blocks.size());
+                    for (std::size_t b = 0; b < blocks.size(); ++b) {
+                        ballele[b] = blocks[b].allele_seq;
+                    }
+                    std::map<std::pair<std::uint32_t, std::uint32_t>, LinkageEdge> edge_map;
+                    std::vector<EdgeStatusEntry> edge_status;
+                    const std::size_t FLANK = static_cast<std::size_t>(ip.hi);
+                    for (const auto& kv : by_edge) {
+                        EdgeStatusEntry es;
+                        es.block_a = kv.first.first; es.block_b = kv.first.second;
+                        es.n_fragments = kv.second.size();
+                        const LinkageGeometry geom = build_linkage_geometry(
+                            hyb_cov.frames, ballele, es.block_a, es.block_b, FLANK, ip);
+                        if (!geom.ok) {
+                            es.status = LinkageStatus::NotComputed;
+                            edge_status.push_back(es);
+                            continue;
+                        }
+                        std::vector<LinkageEmission> ems;
+                        ems.reserve(kv.second.size());
+                        for (std::size_t fi : kv.second) {
+                            const std::size_t len = hf[fi].bases();
+                            const std::size_t be =
+                                static_cast<std::size_t>(0.10 * static_cast<double>(len));
+                            const double bgf = static_cast<double>(be) * lep +
+                                               static_cast<double>(len - be) * l1m;
+                            ems.push_back(linkage_emission(hf[fi], geom, ip, hybrid_divergence,
+                                                           lep, l1m, bgf));
+                        }
+                        LinkageEdge E = aggregate_linkage_edge(ems, geom, 0.05,
+                                                               std::log1p(-0.05), std::log(0.05));
+                        es.status = E.status;
+                        edge_status.push_back(es);
+                        if (E.usable()) edge_map.emplace(kv.first, std::move(E));
+                    }
+                    // Haplotype -> allele per block, validated at the int -> unsigned boundary.
+                    std::vector<AlleleMapping> maps(blocks.size());
+                    for (std::size_t b = 0; b < blocks.size(); ++b) {
+                        std::vector<int> av(hap_names.size(), -1);
+                        for (std::size_t h = 0; h < hap_names.size(); ++h) {
+                            const auto it = blocks[b].allele_of.find(hap_names[h]);
+                            if (it != blocks[b].allele_of.end()) {
+                                av[h] = static_cast<int>(it->second);
+                            }
+                        }
+                        maps[b] = build_allele_mapping(av, blocks[b].n_alleles,
+                                                       blocks[b].bypass_allele);
+                    }
+                    hyb_act = plan_hybrid_activation(hf, owners, edge_status, edge_map, maps,
+                                                     blocks.size());
+                    if (hyb_act.hybrid_activated) {
+                        hyb_exclusions.insert(hyb_act.excluded_fragments.begin(),
+                                              hyb_act.excluded_fragments.end());
+                    }
+                }
+                log.info(std::string("hybrid: ") +
+                         hybrid_call_status_name(hyb_act.call_status) + ", " +
+                         std::to_string(hyb_fragments_loaded) + " fragments, " +
+                         std::to_string(hyb_edges_considered) + " candidate edge(s), " +
+                         std::to_string(hyb_act.active_edges) + " active, " +
+                         std::to_string(hyb_exclusions.size()) + " excluded from markers" +
+                         (hyb_act.refusal.empty() ? "" : "; " + hyb_act.refusal));
+            }
+
             // MARKER OCCURRENCE EXCLUSION. Fragments owned by a linkage edge contribute their
             // sequence there and must leave the marker counts, or the same read is counted twice.
             // Only their OCCURRENCES are subtracted: a marker they share with a unary-owned
@@ -1445,6 +1574,9 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     if (!line.empty()) excl.insert(line);
                 }
             }
+            // The hybrid's exclusions are the COMMITTED ones: empty unless the transaction
+            // activated, so a refusal cannot subtract anything.
+            for (const std::string& nm : hyb_exclusions) excl.insert(nm);
             std::size_t excluded_reads = 0;
             ReadCounts rc = count_reads(read_paths, read_panel, options.threads,
                                         excl.empty() ? nullptr : &excl, &excluded_reads);
@@ -1508,9 +1640,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
             // fitted depth, so an audit written at this point would describe a state the emission
             // never used. `raw_anchor_*` are untouched by any model, so nothing is lost by waiting.
 
-            std::vector<std::string> hap_names;
-            hap_names.reserve(panel_graph.paths.size());
-            for (const PathRecord& p : panel_graph.paths) hap_names.push_back(p.name);
+            // hap_names is built earlier now: the hybrid transaction has to be planned BEFORE
+            // marker counting, because its exclusion set is an input to counting.
             // ---- HYBRID PREFLIGHT ---------------------------------------------------------
             // THE REQUIREMENT IS OVER THE HMM'S DECLARED STATE UNIVERSE, not the raw panel paths.
             // A recorded state reduction is legitimate; silently dropping candidates because their
@@ -1537,7 +1668,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 pf << "accepted_partial_frames\t" << cov.partial_names.size() << '\n';
                 pf << "missing_states\t" << cov.missing_names.size() << '\n';
                 pf << "names_unique\t" << (cov.names_unique ? 1 : 0) << '\n';
-                pf << "coverage_complete\t" << (cov.coverage_complete ? 1 : 0) << '\n';
+                pf << "all_states_usable\t" << (cov.all_states_usable ? 1 : 0) << '\n';
                 std::vector<std::string> states = hap_names;
                 std::sort(states.begin(), states.end());
                 for (const std::string& nm : states) pf << "hmm_state\t" << nm << '\n';
@@ -1553,8 +1684,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
                          " complete + " + std::to_string(cov.partial_names.size()) +
                          " accepted partial, " + std::to_string(cov.missing_names.size()) +
                          " missing; coverage " +
-                         (cov.coverage_complete ? "COMPLETE" : "INCOMPLETE"));
-                if (!cov.coverage_complete) {
+                         (cov.all_states_usable ? "all states usable" : "NOT all states usable"));
+                if (!cov.all_states_usable) {
                     // A SUBSTRATE result, not a biological one, and named so it cannot be read as
                     // genotype ambiguity.
                     log.info("hybrid_status INCOMPLETE / reason candidate-frame-coverage / "
@@ -2115,6 +2246,9 @@ int run_genotype_command(const std::vector<std::string>& args) {
                          "), NOT this sample's truth");
             }
             gopt.probe_pairs = probe_pairs;
+            // ACTIVE EDGES ONLY, and only from a committed transaction. Null otherwise, which takes
+            // the factorised path at every edge and reproduces the legacy chain exactly.
+            if (hyb_act.hybrid_activated) gopt.linkage_edges = &hyb_act.kernel_edges;
             std::vector<ProbePairResult> probe_rows;
             std::vector<BlockCall> calls =
                 genotype_sample(chain, blocks, read_panel, rc, depth, hap_names, gopt, &gsum,

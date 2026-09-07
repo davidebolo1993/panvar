@@ -511,7 +511,7 @@ def ok(m): print("  ok   " + m)
 def no(m):
     global bad; bad += 1; print("  FAIL " + m)
 for k in ("raw_panel_paths","hmm_states","framed_states","complete_frames",
-          "accepted_partial_frames","missing_states","names_unique","coverage_complete"):
+          "accepted_partial_frames","missing_states","names_unique","all_states_usable"):
     if k not in kv: no("preflight missing metric %s" % k); sys.exit(1)
 # THE UNIVERSE IS NAMED, not counted, so it is reproducible and a later disagreement is attributable.
 if len(states) == int(kv["hmm_states"]):
@@ -535,8 +535,8 @@ if len(set(states)) == len(states):
 else:
     no("the enumerated state universe repeats a name")
 # Counts agreeing is not enough: the NAMES must be the same set, or a state could be replaced.
-if kv["coverage_complete"] == "1":
-    ok("coverage_complete: unique names, nothing missing, framed set equals the state set")
+if kv["all_states_usable"] == "1":
+    ok("all_states_usable: unique names, nothing missing, framed set equals the state set")
 else:
     no("coverage incomplete -- this is a hybrid-SUBSTRATE result, not biological ambiguity")
 # A VERIFIED PARTIAL TERMINAL FRAME IS ACCEPTED, not missing. Reported separately so the case stays
@@ -1213,30 +1213,86 @@ else
   bad "no ownership ledger written"
 fi
 
-if ! "$BIN" genotype-frag --help 2>&1 | grep -q -- "--hybrid-call"; then
-  echo
-  echo "  PENDING, held behind --hybrid-call (the chain that forms the mixtures does not exist):"
-  echo "    * hybrid DISABLED -> exactly the legacy marker / Li-Stephens result;"
-  echo "    * hybrid ENABLED but NO linkage-owned fragments -> exactly the legacy result;"
-  echo "    * hybrid ENABLED with linkage fragments -> content calls pass the block-content"
-  echo "      regression. Reproducing the legacy result here is NOT the gate and cannot be:"
-  echo "      those fragments' content evidence was deliberately removed from the unaries.;"
-  echo "    * with linkage, correct phase while preserving unordered block content;"
-  echo "    * the background RETAINED inside each configuration's mixture;"
-  echo "    * Li-Stephens prior and fragment linkage each applied exactly once;"
-  echo "    * a global swap of the two homologues leaves the output unchanged;"
-  echo "    * Wide-owned fragments are reported UNSUPPORTED/INCOMPLETE, never silently dropped;"
-  echo "    * ambiguous evidence gives an equivalence set or UNRESOLVED, not a confident guess."
-  echo "  This file must FAIL, not skip, once --hybrid-call appears without satisfying them."
+# ---------------------------------------------------------------------------------------------
+# GATE 23: THE END-TO-END HYBRID CALL. The sentinel that used to stand here checked
+# `genotype-frag --help`, but the entry point landed on `genotype`, where the architecture put it --
+# so it guarded a flag that could never appear and had gone vacuous. It is replaced by the real
+# assertions, and the flag is looked for on the command that actually has it.
+if ! "$BIN" genotype --help 2>&1 | grep -q -- "--hybrid-call"; then
+  bad "--hybrid-call is missing from the genotype command; the end-to-end gates cannot run"
 else
-  # THE SENTINEL. Without this branch the paragraph above is a promise nothing enforces: the moment
-  # --hybrid-call exists the `if` is simply skipped and the file exits 0 having tested none of the
-  # chain. That is the vacuous-gate pattern this suite exists to prevent, so the arrival of the
-  # entry point FAILS here until the assertions above replace this block.
-  bad "--hybrid-call exists but none of the chain gates are implemented."
-  echo "       Replace this sentinel with the real assertions. Until then its presence is the"
-  echo "       failure: an entry point that no gate constrains is worse than no entry point."
+  # 1. NO FLAG: byte-identical legacy output. Structural, not a tolerance -- with no linkage edges
+  #    the kernel takes the factorised path at every edge.
+  "$BIN" genotype -i "$OUT/b.sorted.gfa" -b "$OUT/b" -r hapAA -o "$OUT/e2e.leg" \
+    -R "$OUT/r1.fq" -R "$OUT/r2.fq" --fragment-len 350 -q >/dev/null 2>&1
+  "$BIN" genotype -i "$OUT/b.sorted.gfa" -b "$OUT/b" -r hapAA -o "$OUT/e2e.hyb" \
+    -R "$OUT/r1.fq" -R "$OUT/r2.fq" --fragment-len 350 --hybrid-call -q >/dev/null 2>&1
+  if [ -s "$OUT/e2e.leg.genotypes.tsv" ] && [ -s "$OUT/e2e.hyb.genotypes.tsv" ]; then
+    ok "both arms produced a call table"
+    # 2. CONTENT PRESERVED, PHASE CORRECTED. The fixture is built so per-block allele content is
+    #    identical under either phase; only a junction-spanning fragment can decide between them.
+    "$PY" - "$OUT/e2e.leg.genotypes.tsv" "$OUT/e2e.hyb.genotypes.tsv" <<'PYEOFI'
+import sys
+def load(p):
+    rows = []
+    for i, l in enumerate(open(p)):
+        f = l.rstrip("\n").split("\t")
+        if i == 0: continue
+        rows.append(f)
+    return rows
+L, H = load(sys.argv[1]), load(sys.argv[2])
+bad = 0
+def ok(m): print("  ok   " + m)
+def no(m):
+    global bad; bad += 1; print("  FAIL " + m)
+if len(L) != len(H): no("block counts differ: %d vs %d" % (len(L), len(H))); sys.exit(1)
+content_same = all(l[7] == h[7] and l[8] == h[8] for l, h in zip(L, H))
+if content_same:
+    ok("block CONTENT is unchanged by linkage (allele1/allele2 identical at every block)")
+else:
+    no("linkage changed block content: %s" % [(l[0], l[7], l[8], h[7], h[8])
+                                              for l, h in zip(L, H) if l[7] != h[7] or l[8] != h[8]])
+lp = {(l[9], l[10]) for l in L}
+hp = {(h[9], h[10]) for h in H}
+truth = {("hapAB", "hapBA"), ("hapBA", "hapAB")}
+if lp & truth:
+    no("the legacy caller already recovered the phase; the gate would prove nothing")
+else:
+    ok("the marker caller alone gets the phase WRONG (%s) -- as the fixture intends" % sorted(lp))
+if hp <= truth and hp:
+    ok("the hybrid caller recovers the CORRECT phase (%s)" % sorted(hp))
+else:
+    no("hybrid phase is %s, expected hapAB/hapBA" % sorted(hp))
+# Posterior mass must move too, not just the argmax.
+try:
+    lm = max(float(l[11]) for l in L); hm = max(float(h[11]) for h in H)
+    if hm > lm: ok("posterior mass on the called pair rises %.3f -> %.3f" % (lm, hm))
+    else: no("posterior mass did not rise: %.3f -> %.3f" % (lm, hm))
+except (ValueError, IndexError):
+    no("could not read the pair posterior column")
+sys.exit(bad)
+PYEOFI
+    fails=$(( fails + $? ))
+  else
+    bad "an end-to-end arm produced no call table"
+  fi
+  # 3. THE EXCLUSION IDENTITY, end to end: reads removed == 2 x fragments consumed by active edges.
+  HL=$("$BIN" genotype -i "$OUT/b.sorted.gfa" -b "$OUT/b" -r hapAA -o "$OUT/e2e.h2" \
+       -R "$OUT/r1.fq" -R "$OUT/r2.fq" --fragment-len 350 --hybrid-call 2>&1)
+  NEX=$(echo "$HL" | sed -nE 's/.*hybrid: .*, ([0-9]+) excluded from markers.*/\1/p')
+  NRD=$(echo "$HL" | sed -nE 's/.*marker exclusion: ([0-9]+) fragment\(s\) named, ([0-9]+) reads.*/\2/p')
+  NAC=$(echo "$HL" | sed -nE 's/.*hybrid: [A-Z]+, [0-9]+ fragments, [0-9]+ candidate edge\(s\), ([0-9]+) active.*/\1/p')
+  STAT=$(echo "$HL" | sed -nE 's/.*hybrid: ([A-Z]+),.*/\1/p')
+  [ "${STAT:-}" = "COMPLETE" ] && ok "hybrid status is COMPLETE on the fixture" \
+                               || bad "hybrid status is ${STAT:-none}"
+  [ "${NAC:-0}" -ge 1 ] && ok "$NAC linkage edge(s) active" || bad "no linkage edge activated"
+  if [ -n "${NEX:-}" ] && [ -n "${NRD:-}" ] && [ "$NRD" = "$(( NEX * 2 ))" ]; then
+    ok "exclusion is exact end to end: $NEX fragments -> $NRD reads (both mates, no more)"
+  else
+    bad "excluded $NEX fragments but $NRD reads left the counts (expected $(( ${NEX:-0} * 2 )))"
+  fi
 fi
+
 echo
 if [ "$fails" -eq 0 ]; then echo "hybrid chain: all active assertions passed"; else
   echo "hybrid chain: $fails assertion(s) failed"; fi

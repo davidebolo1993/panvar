@@ -920,14 +920,21 @@ std::vector<BlockCall> genotype_sample(
     // the factorised O(n_h^2) arithmetic below is preserved exactly, so the legacy result is
     // reproduced structurally rather than to a tolerance.
     ChainKernelStats kernel_stats;
-    std::vector<ChainEdgeLinkage> kernel_edges;   // empty: every edge factorised, legacy behaviour
+    // The edges come from a COMMITTED hybrid transaction, or are absent. Nothing is constructed
+    // here: a refused edge never reaches this point, because the transaction that would have
+    // supplied it was abandoned before any evidence was moved.
+    const std::vector<ChainEdgeLinkage>* kernel_edges = options.linkage_edges;
+    if (kernel_edges != nullptr && kernel_edges->size() != nb) {
+        throw std::runtime_error("genotype: linkage edge vector has " +
+                                 std::to_string(kernel_edges->size()) + " entries for " +
+                                 std::to_string(nb) + " blocks");
+    }
     auto run_fb = [&]() {
         chain_forward_backward(nh, nb, r,
                                [&](std::size_t bi, std::vector<double>& ev) {
                                    block_emissions(bi, ev);
                                },
-                               kernel_edges.empty() ? nullptr : &kernel_edges,
-                               fwd, bwd, &kernel_stats);
+                               kernel_edges, fwd, bwd, &kernel_stats);
     };
     run_fb();
 
