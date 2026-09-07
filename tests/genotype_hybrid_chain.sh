@@ -58,6 +58,10 @@
 #      be present but unused;                                                               [ACTIVE]
 #  17. marker occurrence exclusion subtracts a linkage fragment's OCCURRENCES and never deletes a
 #      marker shared with unary-owned fragments;                                            [ACTIVE]
+#  22. every state in the marker HMM's DECLARED universe has a verified candidate frame, with the
+#      universe enumerated by name; a shortfall is an INCOMPLETE hybrid-SUBSTRATE result labelled
+#      reason=candidate-frame-coverage, never biological ambiguity. Measured on real panels:
+#      C4 131/131, CYP2D6 127/127, LPA 466/466, names matching exactly;                     [ACTIVE]
 #  21. the four status conditions stay distinct -- ownership_complete, factors_buildable,
 #      hybrid_activated -- and call_status is COMPLETE only when all three hold. A run can be
 #      ownership-complete and factor-INcomplete, and must then report INCOMPLETE;           [ACTIVE]
@@ -479,6 +483,59 @@ PYEOF7
   fails=$(( fails + $? ))
 else
   bad "no edge aggregate written"
+fi
+
+# GATE 22: CANDIDATE-FRAME COVERAGE OVER THE HMM STATE UNIVERSE. The requirement is over the
+# states the marker HMM actually declares, NOT the raw panel paths: a recorded state reduction is
+# legitimate, silently dropping candidates whose frame construction failed is not -- that would make
+# the linkage topology and the posterior depend on an undocumented change of state space.
+#
+# A panel that fails is an INCOMPLETE hybrid-SUBSTRATE result, not evidence that the biological
+# genotype is ambiguous, and the report must say so:
+#     hybrid_status INCOMPLETE / reason candidate-frame-coverage / legacy_call_status AVAILABLE
+"$BIN" genotype -i "$OUT/b.sorted.gfa" -b "$OUT/b" -r hapAA -o "$OUT/pf" \
+  -R "$OUT/r1.fq" -R "$OUT/r2.fq" --hybrid-preflight "$OUT/preflight.tsv" -q >/dev/null 2>&1
+if [ -s "$OUT/preflight.tsv" ]; then
+  "$PY" - "$OUT/preflight.tsv" <<'PYEOFH'
+import sys
+kv = {}; states = []; missing = []
+for l in open(sys.argv[1]):
+    f = l.rstrip("\n").split("\t")
+    if f[0] == "hmm_state": states.append(f[1])
+    elif f[0] == "missing": missing.append((f[1], f[2] if len(f) > 2 else "?"))
+    elif len(f) >= 2: kv[f[0]] = f[1]
+bad = 0
+def ok(m): print("  ok   " + m)
+def no(m):
+    global bad; bad += 1; print("  FAIL " + m)
+for k in ("raw_panel_paths","hmm_states","framed_states","missing_states",
+          "state_names_equal_framed_names"):
+    if k not in kv: no("preflight missing metric %s" % k); sys.exit(1)
+# THE UNIVERSE IS NAMED, not counted, so it is reproducible and a later disagreement is attributable.
+if len(states) == int(kv["hmm_states"]):
+    ok("the HMM state universe is enumerated by name (%d states), not just counted" % len(states))
+else:
+    no("%d state names listed but hmm_states says %s" % (len(states), kv["hmm_states"]))
+if kv["framed_states"] == kv["hmm_states"] and kv["missing_states"] == "0":
+    ok("every HMM state has a verified candidate frame (%s/%s)"
+       % (kv["framed_states"], kv["hmm_states"]))
+else:
+    no("only %s of %s HMM states framed; missing: %s"
+       % (kv["framed_states"], kv["hmm_states"], missing[:3]))
+# Counts agreeing is not enough: the NAMES must be the same set, or a state could be replaced.
+if kv["state_names_equal_framed_names"] == "1":
+    ok("framed candidate names equal the HMM state names exactly (not merely the same count)")
+else:
+    no("framed names differ from the HMM state names -- a state was substituted, not just counted")
+if len(missing) != int(kv["missing_states"]):
+    no("%d missing rows but missing_states says %s" % (len(missing), kv["missing_states"]))
+else:
+    ok("every missing state would be listed with a reason (%d here)" % len(missing))
+sys.exit(bad)
+PYEOFH
+  fails=$(( fails + $? ))
+else
+  bad "hybrid preflight produced no output"
 fi
 
 # GATE 20: TRANSACTIONAL ACTIVATION. Subtracting linkage-owned fragments from the marker unaries

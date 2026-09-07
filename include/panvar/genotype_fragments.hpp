@@ -18,6 +18,7 @@
 // only worth building if this one passes its gate.
 
 #include "panvar/chain_kernel.hpp"
+#include "panvar/candidate_frame.hpp"
 #include "panvar/genotype_blocks.hpp"
 #include "panvar/gfa.hpp"
 
@@ -1088,34 +1089,6 @@ std::string chain_span_sequence(
 //
 // `ok` is false when the two cannot be reconciled, i.e. there is no trustworthy coordinate map. Such
 // a candidate must not silently contribute a scope: its block boundaries are unknown.
-struct CandidateFrame {
-    std::string seq;                    // walk bytes, authoritative
-    std::vector<std::size_t> offsets;   // segment start offsets IN WALK COORDINATES, ascending
-    // The BLOCK INDEX of each segment, in walk order. For an antiparallel candidate the blocks run
-    // backwards along the walk, so the k-th segment is block (nblocks-1-k) -- and a coordinate
-    // lookup that returned the segment index would report mirrored block numbers. Measured: an
-    // antiparallel duplicate of an existing path changed a fragment's scope from {1} to {1,2},
-    // which is impossible for a strand-symmetric scorer and was exactly this.
-    std::vector<std::uint32_t> block_at;
-    bool reverse_frame = false;
-    bool ok = false;                    // false: no verified coordinate map for this candidate
-    // A PATH MAY END INSIDE A BLOCK. Its assembly contig, or the interval that cut it, can stop
-    // partway through a block, so the concatenated alleles are a correct PREFIX (or suffix) of the
-    // walk rather than the whole of it. That is not a spelling error -- the bytes agree -- but the
-    // "concatenation equals the walk" test cannot certify a map over the uncovered remainder.
-    // Refusing the candidate outright loses it from the panel; inventing a block for the remainder
-    // would be worse. So the map covers [mapped_lo, mapped_hi) in WALK coordinates and the rest is
-    // reported as unmapped, where a position has no block rather than a guessed one.
-    // Measured: cyp2d6 NA18989#1#haplotype1 ends 1978 bp past bubble 8's sink, short of bubble 9.
-    bool partial = false;
-    std::size_t mapped_lo = 0, mapped_hi = 0;
-};
-
-// Returned by ordered_block_span for a position outside [mapped_lo, mapped_hi). Such a position
-// belongs to no block, so its mass is unattributable: it can never be dropped by restricting the
-// scope, and it can never justify adding a block to one.
-inline constexpr std::uint32_t kUnmappedBlock = 0xFFFFFFFFu;
-
 // THE PRODUCTION BAND, in one place. floor(divergence * len) + 1, and the +1 matters: at 5% a
 // 120 bp read gives 7 here and 6 if the expression is re-derived without it, so a search certified
 // against the re-derived value silently loses exactly the boundary placements. It was file-local,
@@ -1496,10 +1469,6 @@ PathProjection project_path_blocks(const std::vector<BlockAlleles>& projection_b
 // Build the frame for one path. `walk` is the authoritative sequence supplied by the caller (from
 // the shared accessor); this function only verifies it against the decomposition and derives the
 // coordinate map, mirroring the offsets when the frames are opposite.
-CandidateFrame build_candidate_frame(
-    const std::vector<BlockAlleles>& blocks,
-    const std::string& name,
-    const std::string& walk);
 
 // THE RECONCILIATION GATE.
 //
@@ -1522,8 +1491,6 @@ CandidateFrame build_candidate_frame(
 // `for (b = lo; b <= hi; ++b)` loop visit nothing, so the origin is silently exempt from the scope
 // test rather than failing it. Every caller goes through this one helper: the same rule
 // reimplemented in four places is how the two previous frame bugs happened.
-std::pair<std::uint32_t, std::uint32_t> ordered_block_span(
-    const CandidateFrame& frame, long start, long end);
 
 // ---------------------------------------------------------------------------------------------
 // EVIDENCE OWNERSHIP -- the rule the hybrid block caller rests on.

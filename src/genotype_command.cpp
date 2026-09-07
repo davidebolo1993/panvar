@@ -5,6 +5,8 @@
 #include "panvar/genotype_blocks.hpp"
 #include "panvar/genotype_markers.hpp"
 #include "panvar/genotype.hpp"
+
+#include "panvar/candidate_frame.hpp"
 #include "panvar/genotype_index.hpp"
 #include "panvar/graph_utils.hpp"
 #include "panvar/genotype_reads.hpp"
@@ -130,6 +132,8 @@ void print_genotype_help() {
         << "                              cannot drag it), or bases (total read bases over reference\n"
         << "                              length, independent of block structure)\n"
         << "      --depth-quantile <q>    Quantile for --depth-model quantile (default 0.75)\n"
+        << "      --hybrid-preflight <p>  Report candidate-frame coverage over the HMM's declared\n"
+        << "                              state universe, before any hybrid wiring.\n"
         << "      --exclude-fragments <f> Fragment names (one per line) whose reads must NOT be\n"
         << "                              counted into the marker panel. Their occurrences are\n"
         << "                              subtracted; the markers themselves stay in the panel.\n"
@@ -319,6 +323,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
     DepthEstimator depth_estimator = DepthEstimator::Median;
     std::string dump_markers;
     std::string exclude_fragments_path;
+    std::string hybrid_preflight;
     double depth_quantile = 0.75;
     long dump_block = -1;
     long ledger_block = -1;
@@ -426,6 +431,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
         }
         else if (arg == "--depth-quantile") depth_quantile = std::stod(require_value(arg));
         else if (arg == "--exclude-fragments") exclude_fragments_path = require_value(arg);
+        else if (arg == "--hybrid-preflight") hybrid_preflight = require_value(arg);
         else if (arg == "--dump-markers") dump_markers = require_value(arg);
         else if (arg == "--dump-anchors") dump_markers = require_value(arg);  // former name
         else if (arg == "--depth-estimator") {
@@ -1505,6 +1511,70 @@ int run_genotype_command(const std::vector<std::string>& args) {
             std::vector<std::string> hap_names;
             hap_names.reserve(panel_graph.paths.size());
             for (const PathRecord& p : panel_graph.paths) hap_names.push_back(p.name);
+            // ---- HYBRID PREFLIGHT ---------------------------------------------------------
+            // THE REQUIREMENT IS OVER THE HMM'S DECLARED STATE UNIVERSE, not the raw panel paths.
+            // A recorded state reduction is legitimate; silently dropping candidates because their
+            // frame construction failed is not -- it would make the linkage topology and the
+            // posterior depend on an undocumented change of state space.
+            //
+            // Reported before any wiring so a disagreement with the earlier frame-coverage results
+            // (131/131 on C4, 127/127 on CYP2D6) surfaces as a reconciliation problem rather than
+            // as an inference difference nobody can attribute.
+            if (!hybrid_preflight.empty()) {
+                std::ofstream pf(hybrid_preflight);
+                if (!pf) throw std::runtime_error("genotype: cannot write " + hybrid_preflight);
+                const auto by_name = path_records_by_name(graph);
+                std::vector<std::string> framed, missing;
+                std::vector<std::string> reasons;
+                for (const std::string& nm : hap_names) {
+                    const auto it = by_name.find(nm);
+                    if (it == by_name.end() || it->second == nullptr) {
+                        missing.push_back(nm); reasons.push_back("absent-from-graph"); continue;
+                    }
+                    bool complete = false;
+                    const std::string walk =
+                        spell_path_steps_sequence(graph, it->second->steps, &complete);
+                    if (!complete) {
+                        missing.push_back(nm); reasons.push_back("walk-not-spellable"); continue;
+                    }
+                    const CandidateFrame cf = build_candidate_frame(blocks, nm, walk);
+                    if (!cf.ok) {
+                        missing.push_back(nm);
+                        reasons.push_back(cf.partial ? "frame-partial" : "frame-unverified");
+                        continue;
+                    }
+                    framed.push_back(nm);
+                }
+                std::sort(framed.begin(), framed.end());
+                std::vector<std::string> states = hap_names;
+                std::sort(states.begin(), states.end());
+                const bool exact = (framed == states);
+                pf << "metric\tvalue\n";
+                pf << "raw_panel_paths\t" << panel_graph.paths.size() << '\n';
+                pf << "hmm_states\t" << hap_names.size() << '\n';
+                pf << "framed_states\t" << framed.size() << '\n';
+                pf << "missing_states\t" << missing.size() << '\n';
+                pf << "state_names_equal_framed_names\t" << (exact ? 1 : 0) << '\n';
+                // The universe itself, named, so it is reproducible rather than a count.
+                for (const std::string& nm : states) pf << "hmm_state\t" << nm << '\n';
+                for (std::size_t i = 0; i < missing.size(); ++i) {
+                    pf << "missing\t" << missing[i] << '\t' << reasons[i] << '\n';
+                }
+                pf.flush();
+                if (!pf) throw std::runtime_error("genotype: write failed for " + hybrid_preflight);
+                log.info("hybrid preflight: " + std::to_string(hap_names.size()) +
+                         " HMM states, " + std::to_string(framed.size()) + " framed, " +
+                         std::to_string(missing.size()) + " missing; names " +
+                         (exact ? "MATCH exactly" : "DO NOT match"));
+                if (!exact) {
+                    // A SUBSTRATE result, not a biological one. Named as such so it cannot be read
+                    // as genotype ambiguity.
+                    log.info("hybrid_status INCOMPLETE / reason candidate-frame-coverage / "
+                             "legacy_call_status AVAILABLE / hybrid_call NA");
+                }
+                log.wrote({hybrid_preflight});
+            }
+
             GenotypeOptions gopt = make_genotype_options();
             gopt.scale_weight = scale_weight;
             GenotypeSummary gsum;
