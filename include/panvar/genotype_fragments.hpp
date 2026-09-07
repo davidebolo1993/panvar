@@ -1892,6 +1892,42 @@ struct LinkageEdge {
 // with homologue 1 taking (allele_a[i], allele_b[i2]) and homologue 2 taking (allele_a[j],
 // allele_b[j2]) -- in that order, with no implicit swap. A haplotype that BYPASSES a block must map
 // to that block's bypass_allele, never to -1.
+// ---------------------------------------------------------------------------------------------
+// HAPLOTYPE -> ALLELE MAPPING, built through one validated path.
+//
+// THE DANGEROUS BOUNDARY IS int -> unsigned. BlockAlleles reports a haplotype's allele as an int
+// with -1 for "no allele here", while ChainEdgeLinkage indexes log_psi with unsigned values. A bare
+// cast turns -1 into 4294967295 and the subsequent log_psi[...] reads far out of bounds -- silently,
+// because nothing downstream range-checks it. So every value is validated BEFORE conversion:
+//
+//   a < 0  and the block HAS a bypass allele  -> resolve to bypass_allele. A haplotype that does not
+//          traverse the block is not missing data; it bypasses, which is a well-defined state;
+//   a < 0  and the block has NO bypass allele -> MissingMapping. The edge is REFUSED and the result
+//          INCOMPLETE. Never cast, never guessed, never defaulted to allele 0;
+//   a >= n_alleles                            -> OutOfRange, refused for the same reason;
+//   otherwise                                 -> converted, and it is now known to be in range.
+//
+// A HAPLOTYPE INDEX IS NOT AN ALLELE INDEX. The panel can hold hundreds of haplotypes over a
+// handful of alleles, and the two coincide only in a fixture that was not designed to catch this.
+enum class MappingStatus { Ok, MissingMapping, OutOfRange };
+const char* mapping_status_name(MappingStatus s);
+
+struct AlleleMapping {
+    // Per panel haplotype. EMPTY unless status == Ok -- a refused mapping exposes no partial answer,
+    // for the same reason a refused LinkageEdge exposes no table: a half-filled vector invites a
+    // consumer that checked the wrong thing to index it.
+    std::vector<std::uint32_t> allele;
+    std::size_t n_alleles = 0;
+    std::size_t n_bypass_resolved = 0;   // haplotypes that bypass and were resolved, not dropped
+    MappingStatus status = MappingStatus::MissingMapping;
+    std::size_t first_bad_haplotype = 0;
+    int first_bad_value = 0;
+};
+
+// `allele_of_block[h]` is BlockAlleles' int for haplotype h, -1 where it found none.
+AlleleMapping build_allele_mapping(const std::vector<int>& allele_of_block,
+                                   std::size_t n_alleles, int bypass_allele);
+
 struct HybridEdge {
     bool has_linkage = false;
     std::size_t n_a = 0, n_b = 0;

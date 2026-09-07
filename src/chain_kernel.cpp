@@ -23,7 +23,14 @@ inline double psi_weight(const ChainEdgeLinkage& e, double shift,
     // In that order, with no implicit swap.
     const std::size_t a1 = e.allele_a[i],  b1 = e.allele_b[i2];
     const std::size_t a2 = e.allele_a[j],  b2 = e.allele_b[j2];
-    return std::exp(e.log_psi[((a1 * e.n_b + b1) * e.n_a + a2) * e.n_b + b2] - shift);
+    // RANGE-CHECKED AT THE POINT OF USE. build_allele_mapping() already refuses anything out of
+    // range, but this is where a bad index would corrupt memory rather than produce a wrong number,
+    // so the check is repeated here and a violation degrades to a neutral 1.0 instead of reading
+    // past the table.
+    if (a1 >= e.n_a || a2 >= e.n_a || b1 >= e.n_b || b2 >= e.n_b) return 1.0;
+    const std::size_t idx = ((a1 * e.n_b + b1) * e.n_a + a2) * e.n_b + b2;
+    if (idx >= e.log_psi.size()) return 1.0;
+    return std::exp(e.log_psi[idx] - shift);
 }
 
 }  // namespace

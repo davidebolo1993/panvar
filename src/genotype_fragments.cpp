@@ -4283,6 +4283,54 @@ LinkageEmission linkage_emission(const Fragment& fragment, const LinkageGeometry
     return out;
 }
 
+const char* mapping_status_name(MappingStatus s) {
+    switch (s) {
+        case MappingStatus::Ok:             return "ok";
+        case MappingStatus::MissingMapping: return "missing-mapping";
+        default:                            return "allele-out-of-range";
+    }
+}
+
+AlleleMapping build_allele_mapping(const std::vector<int>& allele_of_block,
+                                   std::size_t n_alleles, int bypass_allele) {
+    AlleleMapping m;
+    m.n_alleles = n_alleles;
+    if (n_alleles == 0) {
+        m.status = MappingStatus::OutOfRange;
+        return m;
+    }
+    m.allele.resize(allele_of_block.size(), 0);
+    for (std::size_t h = 0; h < allele_of_block.size(); ++h) {
+        int a = allele_of_block[h];
+        if (a < 0) {
+            // A bypassing haplotype resolves to the block's bypass allele -- a real state, not
+            // missing data. Without one there is nothing to resolve to, and inventing allele 0
+            // would put the haplotype on somebody else's sequence.
+            if (bypass_allele < 0) {
+                m.status = MappingStatus::MissingMapping;
+                m.first_bad_haplotype = h;
+                m.first_bad_value = a;
+                m.allele.clear();   // refused means NOTHING indexable, not a half-filled vector
+                return m;
+            }
+            a = bypass_allele;
+            ++m.n_bypass_resolved;
+        }
+        // VALIDATED BEFORE CONVERSION, both ends. a >= 0 is now established; the range check comes
+        // before the cast, so no negative value can ever reach the unsigned index.
+        if (a < 0 || static_cast<std::size_t>(a) >= n_alleles) {
+            m.status = MappingStatus::OutOfRange;
+            m.first_bad_haplotype = h;
+            m.first_bad_value = a;
+            m.allele.clear();   // same rule: a refused mapping exposes no partial answer
+            return m;
+        }
+        m.allele[h] = static_cast<std::uint32_t>(a);
+    }
+    m.status = MappingStatus::Ok;
+    return m;
+}
+
 const char* linkage_status_name(LinkageStatus s) {
     switch (s) {
         case LinkageStatus::Ok:                    return "ok";

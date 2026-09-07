@@ -58,6 +58,15 @@
 #      be present but unused;                                                               [ACTIVE]
 #  17. marker occurrence exclusion subtracts a linkage fragment's OCCURRENCES and never deletes a
 #      marker shared with unary-owned fragments;                                            [ACTIVE]
+#  18. the haplotype -> allele mapping validates every value BEFORE the int -> unsigned conversion:
+#      permuted and normal mappings resolve, a bypassing haplotype resolves to bypass_allele, and a
+#      missing or out-of-range value is refused with nothing left indexable;                [ACTIVE]
+#
+# STILL OWED AT STEP 4, and easy to lose: under --hybrid-call the exclusion list must be GENERATED
+# from the same ownership ledger that builds the linkage factors, and the identity
+#     excluded fragment IDs == linkage-owned fragment IDs
+# asserted end to end. Ownership and counting can each be correct while disagreeing about which
+# fragments they cover, and --exclude-fragments today only validates the counting mechanism.
 #  16. every generated linkage edge is finite, mean-one per content class, and bounded by
 #      max log psi <= log|C| <= log 4, so exp(log psi) cannot overflow. An earlier version of this
 #      contract claimed exp would OVERFLOW at the 16043-nat spread; that spread is entirely on the
@@ -456,6 +465,60 @@ PYEOF7
   fails=$(( fails + $? ))
 else
   bad "no edge aggregate written"
+fi
+
+# GATE 18: HAPLOTYPE -> ALLELE MAPPING. The int -> unsigned boundary is where this breaks silently:
+# BlockAlleles reports -1 for "no allele here", and a bare cast makes that 4294967295, which then
+# indexes log_psi far out of bounds without any downstream check noticing. Every value is validated
+# BEFORE conversion, and a refused mapping exposes an EMPTY vector so a consumer that checked the
+# wrong thing has nothing to index.
+"$BIN" genotype-frag -i /dev/null -b none -o "$OUT/mp" --mapping-selftest > "$OUT/map.tsv" 2>/dev/null
+if [ -s "$OUT/map.tsv" ]; then
+  "$PY" - "$OUT/map.tsv" <<'PYEOFE'
+import sys
+rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[1])]
+hdr, rows = rows[0], rows[1:]
+d = {r[0]: r for r in rows}
+bad = 0
+def ok(m): print("  ok   " + m)
+def no(m):
+    global bad; bad += 1; print("  FAIL " + m)
+need = ("normal","permuted","bypass","missing","missing_large","out_of_range","bad_bypass")
+miss = [k for k in need if k not in d]
+if miss: no("mapping self-test missing cases: %s" % ", ".join(miss)); sys.exit(1)
+# A HAPLOTYPE INDEX IS NOT AN ALLELE INDEX. The permuted case maps 3 haplotypes onto 2 alleles with
+# no fixed point at haplotype 0, so anything treating one as the other is wrong here.
+if d["normal"][1] == "ok" and d["normal"][6] == "0,1,0":
+    ok("normal mapping resolves (%s)" % d["normal"][6])
+else: no("normal mapping failed: %s %s" % (d["normal"][1], d["normal"][6]))
+if d["permuted"][1] == "ok" and d["permuted"][6] == "1,0,1":
+    ok("permuted mapping resolves (%s) -- haplotype index is never used as an allele index"
+       % d["permuted"][6])
+else: no("permuted mapping failed: %s %s" % (d["permuted"][1], d["permuted"][6]))
+# A BYPASSING haplotype resolves to bypass_allele -- a real state -- not to -1 and not to allele 0.
+b = d["bypass"]
+if b[1] == "ok" and b[3] == "1" and b[6] == "0,2,1":
+    ok("a bypassing haplotype resolves to bypass_allele (%s), not -1 and not allele 0" % b[6])
+else: no("bypass mapping gave status=%s resolved=%s mapping=%s" % (b[1], b[3], b[6]))
+# REFUSALS: never cast, never wrapped, never partially exposed.
+for case, want in (("missing","missing-mapping"), ("missing_large","missing-mapping"),
+                   ("out_of_range","allele-out-of-range"), ("bad_bypass","allele-out-of-range")):
+    r = d[case]
+    if r[1] != want:
+        no("%s: status %s, expected %s" % (case, r[1], want)); continue
+    if r[7] != "0":
+        no("%s: refused but still exposes a %s-element vector to index" % (case, r[7])); continue
+    ok("%s: refused as %s at haplotype %s (value %s), nothing indexable" % (case, r[1], r[4], r[5]))
+# The large negative must be REFUSED, not wrapped into a huge unsigned index.
+if d["missing_large"][5] == "-999" and d["missing_large"][1] == "missing-mapping":
+    ok("a large negative (-999) is refused at the boundary, not cast to 4294966297")
+else:
+    no("a large negative was not caught at the int -> unsigned boundary")
+sys.exit(bad)
+PYEOFE
+  fails=$(( fails + $? ))
+else
+  bad "mapping self-test produced no output"
 fi
 
 # GATE 17: MARKER OCCURRENCE EXCLUSION. A fragment owned by a linkage edge contributes its sequence

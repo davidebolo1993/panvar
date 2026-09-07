@@ -338,6 +338,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     std::string linkage_potential_out;
     bool linkage_selftest = false;
     bool hybrid_oracle = false;
+    bool mapping_selftest = false;
     std::vector<std::string> reconcile_scope;
     std::string switch_penalties_arg = "0,10,100,1000";
     std::vector<std::string> exact_distance;
@@ -389,6 +390,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--linkage-potential") linkage_potential_out = value(i, a);
         else if (a == "--linkage-selftest") linkage_selftest = true;
         else if (a == "--hybrid-oracle") hybrid_oracle = true;
+        else if (a == "--mapping-selftest") mapping_selftest = true;
         else if (a == "--scope-tol") {
             const std::string sv = value(i, a);
             scope_tol = std::stod(sv);
@@ -650,7 +652,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     if (read_paths.empty() && spell_calls.empty() && !mosaic_floor && dump_sequences.empty() &&
         spell_pair.empty() && ref_block.empty() && ref_block_pair.empty() &&
         origin_universe.empty() && reconcile_scope.empty() && !linkage_selftest &&
-        !hybrid_oracle) {
+        !hybrid_oracle && !mapping_selftest) {
         throw std::runtime_error("genotype-frag requires at least one --reads");
     }
     if (!bubble_prefix_in.empty()) {
@@ -683,6 +685,45 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     ParseGfaOptions parse_options;
     parse_options.include_paths = true;
     parse_options.include_sequences = true;
+    // ---- HAPLOTYPE -> ALLELE MAPPING SELF-TEST --------------------------------------------------
+    // The int -> unsigned boundary is where this breaks silently: BlockAlleles reports -1 for "no
+    // allele here", and a bare cast makes that 4294967295, which then indexes log_psi far out of
+    // bounds. Every case below is checked at the boundary rather than downstream.
+    if (mapping_selftest) {
+        std::printf("case\tstatus\tn_alleles\tbypass_resolved\tbad_hap\tbad_value\tmapping"
+                    "\tvector_size\n");
+        const auto show = [&](const char* name, const std::vector<int>& av,
+                              std::size_t na, int bypass) {
+            const AlleleMapping m = build_allele_mapping(av, na, bypass);
+            std::string mp;
+            if (m.status == MappingStatus::Ok) {
+                for (std::size_t k = 0; k < m.allele.size(); ++k) {
+                    mp += (k ? "," : "") + std::to_string(m.allele[k]);
+                }
+            } else {
+                mp = "-";
+            }
+            std::printf("%s\t%s\t%zu\t%zu\t%zu\t%d\t%s\t%zu\n", name,
+                        mapping_status_name(m.status), m.n_alleles, m.n_bypass_resolved,
+                        m.first_bad_haplotype, m.first_bad_value, mp.c_str(), m.allele.size());
+        };
+        // A NORMAL mapping, and a deliberately PERMUTED one: 3 haplotypes over 2 alleles, where the
+        // haplotype index is not the allele index anywhere.
+        show("normal",        {0, 1, 0},    2, -1);
+        show("permuted",      {1, 0, 1},    2, -1);
+        // A BYPASSING haplotype resolves to the block's bypass allele, not to -1 and not to 0.
+        show("bypass",        {0, -1, 1},   3,  2);
+        // NO bypass allele to resolve to: refused, never cast.
+        show("missing",       {0, -1, 1},   2, -1);
+        // A large negative must not wrap; it is refused at the same gate.
+        show("missing_large", {0, -999, 1}, 2, -1);
+        // An allele index past the block's allele count is refused before it can index anything.
+        show("out_of_range",  {0, 5, 1},    2, -1);
+        // A bypass index that is itself out of range must not be trusted either.
+        show("bad_bypass",    {0, -1, 1},   2,  7);
+        return 0;
+    }
+
     // ---- HYBRID CHAIN vs BRUTE-FORCE PATH ORACLE ------------------------------------------------
     // The forward-backward recursion is checked against an independent enumeration of EVERY ordered
     // diploid state path. That is the only comparison that catches linkage applied at the wrong
