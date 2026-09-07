@@ -3168,6 +3168,37 @@ EditClass edit_class_mass(const std::vector<FragmentState>& states,
     return out;
 }
 
+TailLevel tail_interval_level(const std::string& r1, const std::string& r2,
+                              const std::string& r1rc, const std::string& r2rc,
+                              const std::string& hap, std::size_t d1, std::size_t d2,
+                              std::size_t mult, const InsertPrior& ip,
+                              double log_eps, double log_1meps, const PieceIndex* idx) {
+    TailLevel out;
+    const std::size_t D1 = d1 * mult, D2 = d2 * mult;
+    const auto f1 = bounded_mate_placements(r1, hap, D1, nullptr, idx);
+    const auto v1 = bounded_mate_placements(r1rc, hap, D1, nullptr, idx);
+    const auto f2 = bounded_mate_placements(r2, hap, D2, nullptr, idx);
+    const auto v2 = bounded_mate_placements(r2rc, hap, D2, nullptr, idx);
+    const auto st = enumerate_fragment_states(0, f1, v1, f2, v2, r1.size(), r2.size(),
+                                              ip.lo, ip.hi);
+    const double m = fragment_states_mass(st, r1.size(), r2.size(), ip, log_eps, log_1meps);
+    const double b = omitted_mass_bound(hap.size(), r1.size(), r2.size(), D1, D2, ip,
+                                        log_eps, log_1meps, st);
+    out.lower = m;
+    out.upper = (m == kNegInf) ? b : (b == kNegInf ? m : log_add(m, b));
+    out.bound = b;
+    out.states = st.size();
+    out.nonempty = !st.empty();
+    // The PRODUCTION-band mass, recomputed at this depth from the same deeper state set: states
+    // whose mates are both within the original d. It must not move as mult grows.
+    std::vector<FragmentState> inband;
+    for (const FragmentState& z : st) {
+        if (z.m1_edits <= d1 && z.m2_edits <= d2) inband.push_back(z);
+    }
+    out.inband_at_d = fragment_states_mass(inband, r1.size(), r2.size(), ip, log_eps, log_1meps);
+    return out;
+}
+
 TailInterval adaptive_tail_interval(const std::string& r1, const std::string& r2,
                                     const std::string& hap, std::size_t d1, std::size_t d2,
                                     const InsertPrior& ip, double log_eps, double log_1meps,
@@ -3180,26 +3211,11 @@ TailInterval adaptive_tail_interval(const std::string& r1, const std::string& r2
     double inband_ref = kNegInf;
     bool have_inband = false;
     for (std::size_t mult = 1; mult <= std::max<std::size_t>(1, max_depth_mult); ++mult) {
-        const std::size_t D1 = d1 * mult, D2 = d2 * mult;
-        const auto f1 = bounded_mate_placements(r1, hap, D1, nullptr, idx);
-        const auto v1 = bounded_mate_placements(r1rc, hap, D1, nullptr, idx);
-        const auto f2 = bounded_mate_placements(r2, hap, D2, nullptr, idx);
-        const auto v2 = bounded_mate_placements(r2rc, hap, D2, nullptr, idx);
-        const auto st = enumerate_fragment_states(0, f1, v1, f2, v2, r1.size(), r2.size(),
-                                                  ip.lo, ip.hi);
-        const double m = fragment_states_mass(st, r1.size(), r2.size(), ip, log_eps, log_1meps);
-        const double b = omitted_mass_bound(hap.size(), r1.size(), r2.size(), D1, D2, ip,
-                                            log_eps, log_1meps, st);
-        const double up = (m == kNegInf) ? b : (b == kNegInf ? m : log_add(m, b));
-        // The PRODUCTION-band mass, recomputed at every depth from the same deeper state set:
-        // states whose mates are both within the original d. It must not move.
+        const TailLevel lv = tail_interval_level(r1, r2, r1rc, r2rc, hap, d1, d2, mult, ip,
+                                                 log_eps, log_1meps, idx);
+        const double m = lv.lower, up = lv.upper;
         {
-            std::vector<FragmentState> inband;
-            for (const FragmentState& z : st) {
-                if (z.m1_edits <= d1 && z.m2_edits <= d2) inband.push_back(z);
-            }
-            const double mi = fragment_states_mass(inband, r1.size(), r2.size(), ip,
-                                                   log_eps, log_1meps);
+            const double mi = lv.inband_at_d;
             if (!have_inband) { inband_ref = mi; have_inband = true; }
             else if (!(mi == inband_ref ||
                        (mi != kNegInf && inband_ref != kNegInf &&
@@ -3212,9 +3228,9 @@ TailInterval adaptive_tail_interval(const std::string& r1, const std::string& r2
         if (prev_upper != std::numeric_limits<double>::infinity() && up != kNegInf &&
             up > prev_upper + 1e-9) out.upper_monotone = false;
         prev_lower = m; prev_upper = up;
-        if (mult == 1) out.depth1_nonempty = !st.empty();
-        out.lower = m; out.upper = up; out.bound = b;
-        out.depth = mult; out.states = st.size();
+        if (mult == 1) out.depth1_nonempty = lv.nonempty;
+        out.lower = m; out.upper = up; out.bound = lv.bound;
+        out.depth = mult; out.states = lv.states;
         const double width = (up == kNegInf || m == kNegInf) ? std::numeric_limits<double>::infinity()
                                                              : up - m;
         out.within_tolerance = width <= tolerance_nats;

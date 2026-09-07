@@ -28,6 +28,8 @@
 #include <string>
 #include <vector>
 
+#include <sys/resource.h>
+
 namespace panvar {
 
 namespace {
@@ -328,6 +330,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     bool interval_contrib = false;
     std::string interval_ckpt;
     std::size_t interval_batch = 500;
+    bool interval_lazy = false, interval_screen_only = false;
+    std::string interval_rounds;
     std::vector<std::string> reconcile_scope;
     std::string switch_penalties_arg = "0,10,100,1000";
     std::vector<std::string> exact_distance;
@@ -371,6 +375,9 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--interval-contrib") interval_contrib = true;
         else if (a == "--interval-checkpoint") interval_ckpt = value(i, a);
         else if (a == "--interval-batch") interval_batch = cli::parse_size_arg(a, value(i, a));
+        else if (a == "--interval-lazy") interval_lazy = true;
+        else if (a == "--interval-screen-only") { interval_lazy = true; interval_screen_only = true; }
+        else if (a == "--interval-rounds") interval_rounds = value(i, a);
         else if (a == "--scope-tol") {
             const std::string sv = value(i, a);
             scope_tol = std::stod(sv);
@@ -1091,6 +1098,14 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         // Measured: two c4 fragments differ between the two, placing on the truth-equivalent
         // haplotype ~100 nats down, reachable only at D = 4d. They contribute 0.00 to the swing.
         std::vector<std::vector<char>> PB(ifr.size(), std::vector<char>(nc, 0));
+        // LAZY REFINEMENT LEVEL per cell. 1 = the production band alone -- the CHEAP COARSE BOUND,
+        // exact mass within d plus the analytic bound on everything beyond it. Deepening raises the
+        // lower bound and lowers the upper bound MONOTONICALLY, so a class eliminated at one level
+        // can never re-enter at a deeper one. 0 = not yet computed.
+        std::vector<std::vector<std::uint8_t>> LV(ifr.size(), std::vector<std::uint8_t>(nc, 0));
+        // The depth cap is the same one the eager scorer uses; lazy must not win by refining less
+        // deeply than the oracle was allowed to.
+        const std::size_t max_mult = 4;
         // ONE INDEX PER CANDIDATE, built once and reused across all fragments. The piece length is
         // read.size()/(d+1) and reads here are uniform, so a single length covers the run; a
         // fragment whose length differs falls back to the scanning path, which returns the same
@@ -1120,7 +1135,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         std::string ck_sig;
         {
             std::ostringstream sig;
-            sig << md5_hex(std::string(reinterpret_cast<const char*>(&opt.max_divergence),
+            sig << "v2|" << (interval_lazy ? "lazy|" : "eager|")
+                << md5_hex(std::string(reinterpret_cast<const char*>(&opt.max_divergence),
                                        sizeof(double)))
                 << '|' << opt.fragment_len << '|' << opt.fragment_sd << '|' << opt.error_rate
                 << '|' << opt.bg_divergence << '|' << opt.outlier_mix << '|' << lambda_i
@@ -1154,10 +1170,11 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                         if (!(ls >> fi) || fi >= ifr.size()) continue;
                         bool ok = true;
                         for (std::size_t h = 0; h < nc; ++h) {
-                            double lo = 0, up = 0; int pb = 0;
-                            if (!(ls >> lo >> up >> pb)) { ok = false; break; }
+                            double lo = 0, up = 0; int pb = 0, lv = 0;
+                            if (!(ls >> lo >> up >> pb >> lv)) { ok = false; break; }
                             M[fi][h] = MassInterval{lo, up};
                             PB[fi][h] = static_cast<char>(pb);
+                            LV[fi][h] = static_cast<std::uint8_t>(lv);
                         }
                         if (ok) { frag_done[fi] = 1; ++resumed; }
                     }
@@ -1180,7 +1197,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                 out << fi;
                 for (std::size_t h = 0; h < nc; ++h) {
                     out << ' ' << M[fi][h].lower << ' ' << M[fi][h].upper
-                        << ' ' << static_cast<int>(PB[fi][h]);
+                        << ' ' << static_cast<int>(PB[fi][h])
+                        << ' ' << static_cast<int>(LV[fi][h]);
                 }
                 out << '\n';
             }
@@ -1206,10 +1224,22 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                 // straight 2x on the dominant loop. adaptive_tail_interval now reports whether its
                 // depth-1 state set was non-empty, so the production-band answer comes free.
                 const PieceIndex* ix = pidx.empty() ? nullptr : &pidx[h];
-                const TailInterval ti = adaptive_tail_interval(F.r1, F.r2, iseqs[h], d1, d2, ip_i,
-                                                               lep_i, l1m_i, interval_tol, 4, ix);
-                PB[fi][h] = ti.depth1_nonempty ? 1 : 0;
-                M[fi][h] = MassInterval{ti.lower, ti.upper};
+                if (interval_lazy) {
+                    // COARSE PASS. Every cell gets the production-band level and NOTHING more. This
+                    // is a screen, not an approximation: [lower, upper] is a certified enclosure of
+                    // the same quantity the eager scorer converges to, just a wider one.
+                    const TailLevel lv = tail_interval_level(F.r1, F.r2, a1, a2, iseqs[h], d1, d2,
+                                                             1, ip_i, lep_i, l1m_i, ix);
+                    PB[fi][h] = lv.nonempty ? 1 : 0;
+                    M[fi][h] = MassInterval{lv.lower, lv.upper};
+                    LV[fi][h] = 1;
+                } else {
+                    const TailInterval ti = adaptive_tail_interval(F.r1, F.r2, iseqs[h], d1, d2, ip_i,
+                                                                   lep_i, l1m_i, interval_tol, 4, ix);
+                    PB[fi][h] = ti.depth1_nonempty ? 1 : 0;
+                    M[fi][h] = MassInterval{ti.lower, ti.upper};
+                    LV[fi][h] = static_cast<std::uint8_t>(ti.depth);
+                }
             }
             // PROGRESS, so a long run is observable and can be judged rather than waited out. The
             // full-panel run emitted nothing for 12 hours and was killed with no partial result.
@@ -1241,9 +1271,255 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         // INCOMPLETE if any fragment is unfinished: an interrupted run must never be interpreted.
         std::size_t unfinished = 0;
         for (std::size_t fi = 0; fi < ifr.size(); ++fi) if (!frag_done[fi]) ++unfinished;
+
+        // Background per fragment. Needed BEFORE lazy refinement, because what makes a cell worth
+        // deepening is its effect on a diploid CONTRIBUTION -- which is mixed with this floor --
+        // and not the width of its raw mass interval in isolation.
+        std::vector<double> bg(ifr.size(), 0.0);
+        for (std::size_t fi = 0; fi < ifr.size(); ++fi) {
+            const std::size_t len = ifr[fi].bases();
+            const std::size_t be = static_cast<std::size_t>(opt.bg_divergence *
+                                                            static_cast<double>(len));
+            bg[fi] = static_cast<double>(be) * lep_i +
+                     static_cast<double>(len - be) * l1m_i;
+        }
+
+        // ---- CANDIDATE-LEVEL LAZY REFINEMENT --------------------------------------------------
+        //
+        // THE SAFETY RULE, and it is the whole design: a candidate is dropped only when EVERY
+        // genotype class containing it satisfies U(C) < B - tau. A candidate can be hopeless with
+        // one partner and decisive with another, so a per-candidate score cutoff -- a marker
+        // shortlist, a point likelihood, any single number per haplotype -- would reopen exactly
+        // the recruitment defect this whole line of work exists to characterise. Elimination is a
+        // consequence of class elimination, never a judgement about a candidate on its own.
+        //
+        // Correctness rests on monotonicity: deepening raises lower bounds and lowers upper bounds,
+        // so B never falls and an eliminated class can never re-enter. The tolerance in the pruning
+        // test is the SAME tau as in the plausible-set test -- pruning at U < B would discard
+        // classes that legitimately belong to the tolerance-expanded set.
+        struct RoundStat {
+            std::size_t round = 0, plausible = 0, candidates = 0, marked = 0, deepened = 0;
+            double best_lower = 0.0, worst_other_upper = 0.0, secs = 0.0;
+            std::string phase;
+        };
+        std::vector<RoundStat> round_log;
+        std::size_t coarse_nontol = 0, lazy_rounds = 0, lazy_gap_passes = 0;
+        if (interval_lazy && unfinished == 0) {
+            // THE EAGER DEEPENING BASELINE, measured from this run's own coarse pass rather than
+            // quoted from the oracle. The eager scorer deepens exactly those cells whose
+            // production-band interval misses the tolerance, so counting them here gives the two
+            // arms a common denominator instead of comparing against cells_widened, which is a
+            // different quantity (a cell can end non-degenerate without ever having been deepened).
+            for (std::size_t fi = 0; fi < ifr.size(); ++fi) {
+                if (ifr[fi].r1.empty() || ifr[fi].r2.empty()) continue;
+                for (std::size_t h = 0; h < nc; ++h) {
+                    const double w = M[fi][h].upper - M[fi][h].lower;
+                    if (!(w <= interval_tol)) ++coarse_nontol;      // inf/NaN-safe
+                }
+            }
+            std::vector<std::pair<std::size_t, std::size_t>> cpair;
+            for (std::size_t a = 0; a < nc; ++a)
+                for (std::size_t b = a; b < nc; ++b) cpair.emplace_back(a, b);
+            const std::size_t ncls = cpair.size();
+            std::vector<double> exa(nc, 0.0);
+            for (std::size_t h = 0; h < nc; ++h) exa[h] = ip_i.exposure(iseqs[h].size());
+            std::vector<MassInterval> cls(ncls);
+            auto build_classes = [&]() {
+                run_parallel(ncls, opt.threads, [&](std::size_t ci) {
+                    const std::size_t a = cpair[ci].first, b = cpair[ci].second;
+                    const bool hom = (a == b);
+                    MassInterval sum{0.0, 0.0};
+                    for (std::size_t fi = 0; fi < ifr.size(); ++fi) {
+                        if (ifr[fi].r1.empty() || ifr[fi].r2.empty()) continue;
+                        const MassInterval c = fragment_contribution(M[fi][a], M[fi][b], hom,
+                                                                     log_mix_i, log_lam_i,
+                                                                     log_bgw_i, bg[fi]);
+                        sum.lower += c.lower;
+                        sum.upper += c.upper;
+                    }
+                    cls[ci] = representative_total(sum, exa[a], exa[b], hom, lambda_i, 0.0);
+                });
+            };
+            // Deepen exactly the cells that can still move one of the named classes. "Can still
+            // move" is a STRUCTURAL test, not a tuned threshold: if a cell's diploid contribution
+            // interval has zero width, refining it cannot change the class interval at any depth;
+            // if the cell is already exact (no omitted mass left to bound) or at the depth cap,
+            // there is nothing to compute. No coefficient, no ranking, no top-k.
+            auto refine_for = [&](const std::vector<std::size_t>& which,
+                                  std::size_t& marked_out) -> std::size_t {
+                std::vector<std::vector<char>> mk(ifr.size(), std::vector<char>(nc, 0));
+                run_parallel(ifr.size(), opt.threads, [&](std::size_t fi) {
+                    if (ifr[fi].r1.empty() || ifr[fi].r2.empty()) return;
+                    for (std::size_t ci : which) {
+                        const std::size_t a = cpair[ci].first, b = cpair[ci].second;
+                        const MassInterval c = fragment_contribution(M[fi][a], M[fi][b], a == b,
+                                                                     log_mix_i, log_lam_i,
+                                                                     log_bgw_i, bg[fi]);
+                        if (c.upper > c.lower) { mk[fi][a] = 1; mk[fi][b] = 1; }
+                    }
+                });
+                std::atomic<std::size_t> marked{0}, deep{0};
+                run_parallel(ifr.size(), opt.threads, [&](std::size_t fi) {
+                    const Fragment& F = ifr[fi];
+                    if (F.r1.empty() || F.r2.empty()) return;
+                    const std::size_t d1 = mate_band_edits(opt.max_divergence, F.r1.size());
+                    const std::size_t d2 = mate_band_edits(opt.max_divergence, F.r2.size());
+                    std::string a1, a2;
+                    std::size_t lm = 0, ld = 0;
+                    for (std::size_t h = 0; h < nc; ++h) {
+                        if (!mk[fi][h]) continue;
+                        ++lm;
+                        // THE SAME PER-CELL STOPPING RULE THE EAGER SCORER USES, on the same
+                        // declared interval_tol -- not a second, lazy-only threshold. Without it the
+                        // lazy arm could take a cell DEEPER than the oracle ever did, which would
+                        // make it tighter than the thing it is being validated against and could
+                        // cost more work than it saves. With it, every lazy cell depth is bounded by
+                        // the eager depth for the same cell, so lazy work is a strict subset of
+                        // eager work and the ledger below compares like with like.
+                        if (M[fi][h].upper - M[fi][h].lower <= interval_tol) continue;
+                        if (LV[fi][h] >= max_mult) continue;
+                        if (M[fi][h].lower == M[fi][h].upper) continue;  // nothing omitted to bound
+                        if (a1.empty()) {
+                            a1 = reverse_complement(F.r1);
+                            a2 = reverse_complement(F.r2);
+                        }
+                        const PieceIndex* ix = pidx.empty() ? nullptr : &pidx[h];
+                        const std::size_t nl = static_cast<std::size_t>(LV[fi][h]) + 1;
+                        const TailLevel lv = tail_interval_level(F.r1, F.r2, a1, a2, iseqs[h],
+                                                                 d1, d2, nl, ip_i, lep_i, l1m_i, ix);
+                        M[fi][h] = MassInterval{lv.lower, lv.upper};
+                        LV[fi][h] = static_cast<std::uint8_t>(nl);
+                        ++ld;
+                    }
+                    marked += lm;
+                    deep += ld;
+                });
+                marked_out += marked.load();
+                return deep.load();
+            };
+            auto elapsed = [&]() {
+                return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            };
+            std::size_t lead = 0;
+            // SCREEN. Refine the leader (to raise B) and every class not yet safely prunable (to
+            // lower its upper), until nothing contests the leader or nothing can be refined.
+            for (std::size_t round = 1; ; ++round) {
+                build_classes();
+                lead = 0;
+                for (std::size_t i = 1; i < ncls; ++i) if (cls[i].lower > cls[lead].lower) lead = i;
+                const double B = cls[lead].lower;
+                std::vector<std::size_t> contest;
+                double wou = -std::numeric_limits<double>::infinity();
+                for (std::size_t i = 0; i < ncls; ++i) {
+                    if (i == lead) continue;
+                    wou = std::max(wou, cls[i].upper);
+                    if (!safely_prunable(cls[i], B, interval_tau)) contest.push_back(i);
+                }
+                std::vector<char> alive(nc, 0);
+                alive[cpair[lead].first] = 1; alive[cpair[lead].second] = 1;
+                for (std::size_t i : contest) {
+                    alive[cpair[i].first] = 1; alive[cpair[i].second] = 1;
+                }
+                RoundStat rs;
+                rs.round = round; rs.phase = "screen";
+                rs.plausible = contest.size() + 1;
+                rs.candidates = static_cast<std::size_t>(std::count(alive.begin(), alive.end(), 1));
+                rs.best_lower = B; rs.worst_other_upper = wou;
+                if (contest.empty()) {
+                    rs.secs = elapsed();
+                    round_log.push_back(rs);
+                    lazy_rounds = round;
+                    log.info("lazy screen: certified after " + std::to_string(round) +
+                             " round(s); 1 plausible of " + std::to_string(ncls));
+                    break;
+                }
+                // REPORTED BEFORE THE ROUND IS SPENT, not after. These counts describe the state
+                // the screen is starting from, and a round costs minutes: printing them only on
+                // completion hides exactly the number being measured -- how much the CHEAP bounds
+                // eliminated -- behind the expensive work they were supposed to avoid.
+                log.info("lazy round " + std::to_string(round) + ": " +
+                         std::to_string(rs.plausible) + " plausible of " + std::to_string(ncls) +
+                         ", " + std::to_string(rs.candidates) + " candidates alive, B " +
+                         std::to_string(B) + ", worst rival upper " + std::to_string(wou));
+                if (interval_screen_only) {
+                    rs.secs = elapsed();
+                    round_log.push_back(rs);
+                    lazy_rounds = round;
+                    log.info("screen-only: stopping before refinement");
+                    break;
+                }
+                std::vector<std::size_t> which = contest;
+                which.push_back(lead);
+                std::size_t marked = 0;
+                const std::size_t deep = refine_for(which, marked);
+                rs.marked = marked; rs.deepened = deep; rs.secs = elapsed();
+                round_log.push_back(rs);
+                lazy_rounds = round;
+                log.info("  round " + std::to_string(round) + " deepened " +
+                         std::to_string(deep) + " of " + std::to_string(marked) +
+                         " marked cells in " + std::to_string(rs.secs) + " s");
+                {
+                    std::lock_guard<std::mutex> lk(ck_mu);
+                    ck_flush();
+                }
+                if (deep == 0) break;   // nothing left to refine; the verdict stands as it is
+            }
+            // GAP STAGE. Certification only needs every rival upper below B - tau. The REPORTED
+            // robust gap is B minus the LARGEST rival upper, so reproducing the oracle's gap needs
+            // that particular rival -- and the leader -- refined to the declared tolerance; every
+            // other eliminated class may stay coarse. The argmax rival is recomputed each pass,
+            // because lowering one upper can promote another. The leader cannot change here: a
+            // rival was eliminated with upper < B - tau, so its lower is below B, and B only rises.
+            for (std::size_t pass = 1; !interval_screen_only; ++pass) {
+                build_classes();
+                std::size_t nlead = 0;
+                for (std::size_t i = 1; i < ncls; ++i) if (cls[i].lower > cls[nlead].lower) nlead = i;
+                lead = nlead;
+                std::size_t rival = (lead == 0 && ncls > 1) ? 1 : 0;
+                for (std::size_t i = 0; i < ncls; ++i) {
+                    if (i == lead) continue;
+                    if (cls[i].upper > cls[rival].upper) rival = i;
+                }
+                if (rival == lead) break;
+                const double wl = cls[lead].upper - cls[lead].lower;
+                const double wr = cls[rival].upper - cls[rival].lower;
+                RoundStat rs;
+                rs.round = pass; rs.phase = "gap";
+                rs.plausible = 1; rs.best_lower = cls[lead].lower;
+                rs.worst_other_upper = cls[rival].upper;
+                rs.candidates = 0;
+                if (wl <= interval_tol && wr <= interval_tol) {
+                    rs.secs = elapsed();
+                    round_log.push_back(rs);
+                    break;
+                }
+                std::size_t marked = 0;
+                const std::size_t deep = refine_for({lead, rival}, marked);
+                rs.marked = marked; rs.deepened = deep; rs.secs = elapsed();
+                round_log.push_back(rs);
+                lazy_gap_passes = pass;
+                log.info("lazy gap pass " + std::to_string(pass) + ": leader width " +
+                         std::to_string(wl) + ", rival width " + std::to_string(wr) +
+                         ", deepened " + std::to_string(deep) + " cells");
+                {
+                    std::lock_guard<std::mutex> lk(ck_mu);
+                    ck_flush();
+                }
+                if (deep == 0) break;
+            }
+        }
+
+        // Cell-level accounting, over the FINAL state of every cell.
+        std::size_t deepened_cells = 0, level_steps = 0, coarse_cells = 0;
         for (std::size_t fi = 0; fi < ifr.size(); ++fi) {
             for (std::size_t h = 0; h < nc; ++h) {
                 if (M[fi][h].lower != M[fi][h].upper) ++refined_cells; else ++tol_ok_cells;
+                if (ifr[fi].r1.empty() || ifr[fi].r2.empty()) continue;
+                ++coarse_cells;
+                if (LV[fi][h] > 1) {
+                    ++deepened_cells;
+                    level_steps += static_cast<std::size_t>(LV[fi][h]) - 1;
+                }
             }
         }
         // PER-FRAGMENT, PER-CANDIDATE placement table. This is what a classification consumer
@@ -1270,15 +1546,6 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             }
             pf.flush();
             log.wrote({fp});
-        }
-        // Background per fragment.
-        std::vector<double> bg(ifr.size(), 0.0);
-        for (std::size_t fi = 0; fi < ifr.size(); ++fi) {
-            const std::size_t len = ifr[fi].bases();
-            const std::size_t be = static_cast<std::size_t>(opt.bg_divergence *
-                                                            static_cast<double>(len));
-            bg[fi] = static_cast<double>(be) * lep_i +
-                     static_cast<double>(len - be) * l1m_i;
         }
         // Six unordered diplotypes for three candidates, INCLUDING homozygotes.
         std::ofstream isf(interval_score);
@@ -1369,11 +1636,57 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         isf << "# cells_widened\t" << refined_cells << '\n';
         isf << "# cells_exact\t" << tol_ok_cells << '\n';
         isf << "# seconds\t" << secs << '\n';
+        // CPU time alongside wall time. On four workers they differ by up to 4x, and an
+        // acceleration that only moves wall time by taking more cores is not an acceleration.
+        double cpu_secs = 0.0;
+        {
+            struct rusage ru {};
+            if (getrusage(RUSAGE_SELF, &ru) == 0) {
+                cpu_secs = static_cast<double>(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) +
+                           1e-6 * static_cast<double>(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec);
+            }
+        }
+        isf << "# cpu_seconds\t" << cpu_secs << '\n';
+        // THE ACCELERATION LEDGER. Four different counts that have been conflated before, so each
+        // is named for exactly what it measures:
+        //   coarse_cells        every fragment x candidate cell, all of which get a cheap bound;
+        //   coarse_nontolerant  cells whose production-band interval misses the tolerance -- the
+        //                       set the EAGER scorer deepens, and therefore the baseline. Only the
+        //                       lazy arm can report it directly, because only it keeps a cell at
+        //                       level 1; for the eager arm the SAME set is deepened_cells, since
+        //                       eager deepens a cell exactly when level 1 missed the tolerance.
+        //                       So lazy's coarse_nontolerant and eager's deepened_cells are two
+        //                       measurements of one quantity, and their agreement is a check;
+        //   deepened_cells      cells this run actually took beyond the production band;
+        //   level_steps         total depth increments, since a cell can be deepened repeatedly.
+        // Comparing deepened_cells against the eager run's cells_widened would compare two
+        // different quantities: a cell can end non-degenerate without ever having been deepened.
+        isf << "# lazy\t" << (interval_lazy ? 1 : 0) << '\n';
+        isf << "# coarse_cells\t" << coarse_cells << '\n';
+        isf << "# coarse_nontolerant\t" << coarse_nontol << '\n';
+        isf << "# deepened_cells\t" << deepened_cells << '\n';
+        isf << "# level_steps\t" << level_steps << '\n';
+        isf << "# lazy_screen_rounds\t" << lazy_rounds << '\n';
+        isf << "# lazy_gap_passes\t" << lazy_gap_passes << '\n';
         isf.flush();
         if (!isf) throw std::runtime_error("genotype-frag: write failed for " + interval_score);
         log.info(std::string(verdict) + ": robust leader " + clabel[leader] + ", gap " +
                  std::to_string(robust_gap) + ", " + std::to_string(cert.plausible.size()) +
                  " plausible of " + std::to_string(classes.size()));
+        if (!interval_rounds.empty()) {
+            std::ofstream rf(interval_rounds);
+            if (!rf) throw std::runtime_error("genotype-frag: cannot write " + interval_rounds);
+            rf.precision(10);
+            rf << "phase\tround\tplausible\tcandidates_alive\tcells_marked\tcells_deepened"
+                  "\tbest_lower\tworst_other_upper\tseconds\n";
+            for (const RoundStat& r : round_log) {
+                rf << r.phase << '\t' << r.round << '\t' << r.plausible << '\t' << r.candidates
+                   << '\t' << r.marked << '\t' << r.deepened << '\t' << r.best_lower << '\t'
+                   << r.worst_other_upper << '\t' << r.secs << '\n';
+            }
+            rf.flush();
+            log.wrote({interval_rounds});
+        }
         log.wrote({interval_score});
         log.done();
         return 0;

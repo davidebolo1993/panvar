@@ -1312,6 +1312,25 @@ TailInterval adaptive_tail_interval(const std::string& r1, const std::string& r2
                                     double tolerance_nats, std::size_t max_depth_mult,
                                     const PieceIndex* idx = nullptr);
 
+// ONE LEVEL of that ladder, exposed so a LAZY scorer can deepen a cell by exactly one step instead
+// of recomputing every shallower level from scratch. adaptive_tail_interval is literally this
+// function in a loop plus the monotonicity and in-band-stability checks, so the eager and lazy arms
+// cannot drift apart: they call the same code for the same D.
+struct TailLevel {
+    double lower = 0.0;        // exact mass through D = d * mult
+    double upper = 0.0;        // logadd(lower, bound beyond D)
+    double bound = 0.0;
+    double inband_at_d = 0.0;  // mass restricted to the PRODUCTION band d, recomputed at this D
+    std::size_t states = 0;
+    bool nonempty = false;
+};
+TailLevel tail_interval_level(const std::string& r1, const std::string& r2,
+                              const std::string& r1rc, const std::string& r2rc,
+                              const std::string& hap, std::size_t d1, std::size_t d2,
+                              std::size_t mult, const InsertPrior& ip,
+                              double log_eps, double log_1meps,
+                              const PieceIndex* idx = nullptr);
+
 double omitted_mass_bound(std::size_t hap_len, std::size_t m1_len, std::size_t m2_len,
                           std::size_t d1, std::size_t d2, const InsertPrior& ip,
                           double log_eps, double log_1meps,
