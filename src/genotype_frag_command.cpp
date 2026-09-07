@@ -694,8 +694,11 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     // makes those fragments vanish from BOTH models -- gone from the marker counts, consumed by no
     // edge -- leaving a run quietly weaker than the legacy caller it extends.
     if (activation_selftest) {
-        std::printf("case\tactivated\tcomplete\tactive_edges\texcluded\tconsumed\tunique"
-                    "\tequality\trefusal\n");
+        // FOUR CONDITIONS, reported separately. Collapsing them into one "complete" is how an
+        // INCOMPLETE call comes to look finished -- mapping_refused is ownership-complete and
+        // factor-INcomplete, and its final status must be INCOMPLETE.
+        std::printf("case\townership_complete\tfactors_buildable\thybrid_activated\tcall_status"
+                    "\tactive_edges\texcluded\tconsumed\tunique\tequality\trefusal\n");
         const auto frag = [](const char* n2) { Fragment f; f.name = n2; f.r1 = "A"; f.r2 = "C";
                                                return f; };
         const auto own = [](OwnerKind k, std::uint32_t lo, std::uint32_t hi) {
@@ -723,10 +726,11 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                 if (b < A.kernel_edges.size() && A.kernel_edges[b].active) consumed.insert(fr[i].name);
             }
             const bool eq = (ex == consumed);
-            std::printf("%s\t%d\t%d\t%zu\t%zu\t%zu\t%zu\t%d\t%s\n", name,
-                        A.activated ? 1 : 0, A.report.complete ? 1 : 0, A.active_edges,
-                        A.excluded_fragments.size(), A.consumed_fragments, ex.size(), eq ? 1 : 0,
-                        A.refusal.empty() ? "-" : A.refusal.c_str());
+            std::printf("%s\t%d\t%d\t%d\t%s\t%zu\t%zu\t%zu\t%zu\t%d\t%s\n", name,
+                        A.ownership_complete ? 1 : 0, A.factors_buildable ? 1 : 0,
+                        A.hybrid_activated ? 1 : 0, hybrid_call_status_name(A.call_status),
+                        A.active_edges, A.excluded_fragments.size(), A.consumed_fragments,
+                        ex.size(), eq ? 1 : 0, A.refusal.empty() ? "-" : A.refusal.c_str());
         };
         using OK = OwnerKind;  using LS = LinkageStatus;
         // No linkage evidence at all: complete, activated, nothing excluded -> legacy inference.
@@ -759,8 +763,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     // like a legitimately linkage-free edge -- so a refused edge would silently become neutral and
     // the posterior would look complete while a reduced evidence model ran.
     if (completeness_selftest) {
-        std::printf("case\tcomplete\towned\tinvariant\tunary\tlinkage\twide\trefused_edge"
-                    "\tunusable\tn_refusals\treasons\twide_scopes\n");
+        std::printf("case\townership_complete\towned\tinvariant\tunary\tlinkage\twide"
+                    "\trefused_edge\tunusable\tn_refusals\treasons\twide_scopes\n");
         const auto mkown = [](OwnerKind k, std::uint32_t lo, std::uint32_t hi,
                               std::vector<std::uint32_t> vs = {}) {
             FragmentOwner o;
@@ -785,7 +789,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             }
             if (scopes.empty()) scopes = "-";
             std::printf("%s\t%d\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t%s\t%s\n",
-                        name, R.complete ? 1 : 0, R.owned_total, R.invariant, R.consumed_unary,
+                        name, R.ownership_complete ? 1 : 0, R.owned_total, R.invariant,
+                        R.consumed_unary,
                         R.consumed_linkage, R.unconsumed_wide, R.unconsumed_refused_edge,
                         R.unconsumed_unusable, R.refusals.size(), reasons.c_str(), scopes.c_str());
         };

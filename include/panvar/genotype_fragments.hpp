@@ -1969,7 +1969,10 @@ struct EdgeRefusal {
 };
 
 struct HybridCompletenessReport {
-    bool complete = false;
+    // OWNERSHIP completeness only: every fragment has a valid disposition. This is NOT the call
+    // status -- an ownership-complete run can still fail to build its factors, and reporting this
+    // field as "complete" is how an INCOMPLETE call comes to look finished.
+    bool ownership_complete = false;
     std::size_t owned_total = 0;
     std::size_t invariant = 0;              // need no consumer
     std::size_t consumed_unary = 0;
@@ -2014,11 +2017,25 @@ ChainEdgeLinkage make_kernel_edge(const LinkageEdge& edge,
 //     {excluded fragments} == {fragments consumed by ACTIVE linkage edges}
 //
 // and each excluded fragment is consumed exactly once.
+// FOUR DISTINCT CONDITIONS, kept apart because collapsing them is how an INCOMPLETE call comes to
+// look finished. The mapping_refused case is ownership-complete yet factor-incomplete, and its final
+// status must be INCOMPLETE:
+//
+//   ownership_complete   every fragment has a valid disposition;
+//   factors_buildable    every required edge and mapping was constructed;
+//   hybrid_activated     evidence subtraction and linkage activation actually committed;
+//   call_status          COMPLETE only when all of the above hold.
+enum class HybridCallStatus { Complete, Incomplete };
+const char* hybrid_call_status_name(HybridCallStatus s);
+
 struct HybridActivation {
-    bool activated = false;                        // did the hybrid model actually run?
+    bool ownership_complete = false;
+    bool factors_buildable = false;
+    bool hybrid_activated = false;
+    HybridCallStatus call_status = HybridCallStatus::Incomplete;
     HybridCompletenessReport report;
-    std::vector<std::string> excluded_fragments;   // empty unless activated
-    std::vector<ChainEdgeLinkage> kernel_edges;    // all inactive unless activated
+    std::vector<std::string> excluded_fragments;   // empty unless hybrid_activated
+    std::vector<ChainEdgeLinkage> kernel_edges;    // all inactive unless hybrid_activated
     std::size_t active_edges = 0;
     std::size_t consumed_fragments = 0;            // by active edges
     std::string refusal;                           // why the hybrid did not activate

@@ -4293,7 +4293,8 @@ HybridActivation plan_hybrid_activation(const std::vector<Fragment>& fragments,
     HybridActivation A;
     A.kernel_edges.assign(n_blocks, ChainEdgeLinkage{});   // inactive: the safe default
     A.report = assess_hybrid_completeness(owners, edge_status);
-    if (!A.report.complete) {
+    A.ownership_complete = A.report.ownership_complete;
+    if (!A.ownership_complete) {
         // TRANSACTIONAL REFUSAL. Nothing is subtracted and nothing is activated, so the marker
         // unaries are exactly what the legacy caller would see. Subtracting here and then failing
         // to activate would delete this evidence from BOTH models.
@@ -4333,9 +4334,11 @@ HybridActivation plan_hybrid_activation(const std::vector<Fragment>& fragments,
         A.excluded_fragments.push_back(fragments[i].name);
         ++A.consumed_fragments;
     }
+    A.factors_buildable = true;
     A.kernel_edges = std::move(built);
     for (const ChainEdgeLinkage& k : A.kernel_edges) if (k.active) ++A.active_edges;
-    A.activated = true;
+    A.hybrid_activated = true;
+    A.call_status = HybridCallStatus::Complete;   // all four conditions hold
     return A;
 }
 
@@ -4394,9 +4397,13 @@ HybridCompletenessReport assess_hybrid_completeness(const std::vector<FragmentOw
         r.status = e.status; r.n_fragments = e.n_fragments;
         R.refusals.push_back(r);             // every one, in edge order
     }
-    R.complete = (R.unconsumed_wide == 0 && R.unconsumed_refused_edge == 0 &&
+    R.ownership_complete = (R.unconsumed_wide == 0 && R.unconsumed_refused_edge == 0 &&
                   R.unconsumed_unusable == 0);
     return R;
+}
+
+const char* hybrid_call_status_name(HybridCallStatus s) {
+    return s == HybridCallStatus::Complete ? "COMPLETE" : "INCOMPLETE";
 }
 
 const char* mapping_status_name(MappingStatus s) {

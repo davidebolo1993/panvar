@@ -58,6 +58,14 @@
 #      be present but unused;                                                               [ACTIVE]
 #  17. marker occurrence exclusion subtracts a linkage fragment's OCCURRENCES and never deletes a
 #      marker shared with unary-owned fragments;                                            [ACTIVE]
+#  21. the four status conditions stay distinct -- ownership_complete, factors_buildable,
+#      hybrid_activated -- and call_status is COMPLETE only when all three hold. A run can be
+#      ownership-complete and factor-INcomplete, and must then report INCOMPLETE;           [ACTIVE]
+#
+# EXIT-CODE POLICY, so a pipeline can tell the two apart: a model-level INCOMPLETE is a VALID program
+# result and exits zero with an explicit status. Malformed input or internal inconsistency exits
+# nonzero. "The model cannot represent this evidence" is not "the command failed".
+#
 #  20. activation is TRANSACTIONAL: nothing is subtracted from the marker unaries unless every
 #      required edge was built and the model is complete, and
 #          {excluded fragments} == {fragments consumed by ACTIVE linkage edges}, each once;  [ACTIVE]
@@ -497,41 +505,55 @@ need = ("no_linkage","complete","refused_edge","wide_present","mapping_refused",
 miss = [k for k in need if k not in d]
 if miss: no("activation self-test missing: %s" % ", ".join(miss)); sys.exit(1)
 # THE EQUALITY must hold in every case, activated or not.
-viol = [k for k in need if d[k][7] != "1"]
+viol = [k for k in need if d[k][9] != "1"]
 if viol: no("excluded != consumed-by-active-edges in: %s" % ", ".join(viol))
 else: ok("excluded IDs equal active-edge-consumed IDs in all %d cases" % len(need))
 # Each excluded fragment consumed exactly once: the excluded list has no duplicates.
-dup = [k for k in need if d[k][4] != d[k][6]]
+dup = [k for k in need if d[k][6] != d[k][8]]
 if dup: no("duplicate exclusions in: %s" % ", ".join(dup))
 else: ok("each excluded fragment is consumed exactly once (no duplicates)")
 # No linkage evidence -> activated, nothing excluded: the inference is legacy by construction.
 n0 = d["no_linkage"]
-if n0[1] == "1" and n0[4] == "0" and n0[3] == "0":
+if n0[3] == "1" and n0[6] == "0" and n0[5] == "0":
     ok("no linkage evidence: activates with 0 active edges and 0 exclusions -- legacy inference")
-else: no("no_linkage gave activated=%s edges=%s excluded=%s" % (n0[1], n0[3], n0[4]))
+else: no("no_linkage gave activated=%s edges=%s excluded=%s" % (n0[3], n0[5], n0[6]))
 # A complete hybrid excludes exactly the fragments its active edges consume.
 c = d["complete"]
-if c[1] == "1" and c[3] == "1" and c[4] == "2" and c[5] == "2":
+if c[3] == "1" and c[5] == "1" and c[6] == "2" and c[7] == "2":
     ok("complete hybrid: 1 active edge consuming 2 fragments, both excluded")
-else: no("complete gave activated=%s edges=%s excluded=%s consumed=%s" % (c[1],c[3],c[4],c[5]))
+else: no("complete gave activated=%s edges=%s excluded=%s consumed=%s" % (c[3],c[5],c[6],c[7]))
 # THE TRANSACTIONAL PROPERTY: every failure path excludes NOTHING. Otherwise the fragments would be
 # gone from the markers and consumed by nobody.
 for case in ("refused_edge","wide_present","mapping_refused","unusable_present"):
     r = d[case]
-    if r[1] == "0" and r[4] == "0" and r[3] == "0":
-        ok("%s: no activation, NOTHING subtracted, reason recorded" % case)
+    if r[3] == "0" and r[6] == "0" and r[5] == "0" and r[4] == "INCOMPLETE":
+        ok("%s: no activation, NOTHING subtracted, status INCOMPLETE, reason recorded" % case)
     else:
-        no("%s: activated=%s excluded=%s active_edges=%s -- a partial transaction committed"
-           % (case, r[1], r[4], r[3]))
+        no("%s: activated=%s excluded=%s active_edges=%s status=%s -- a partial transaction committed"
+           % (case, r[3], r[6], r[5], r[4]))
 # Completeness passing is NOT sufficient: an edge that cannot be built must still abandon the whole
 # transaction rather than run with a hole.
+# THE FOUR CONDITIONS MUST STAY DISTINCT. mapping_refused is OWNERSHIP-complete and
+# FACTOR-incomplete, and its final call_status must be INCOMPLETE -- reporting a single "complete"
+# here is how an incomplete call comes to look finished.
 m = d["mapping_refused"]
-if m[2] == "1" and m[1] == "0" and m[4] == "0":
-    ok("mapping_refused: completeness passed yet activation was abandoned, nothing subtracted")
+if m[1] == "1" and m[2] == "0" and m[3] == "0" and m[4] == "INCOMPLETE" and m[6] == "0":
+    ok("mapping_refused: ownership-complete but factor-INcomplete -> call_status INCOMPLETE, "
+       "nothing subtracted")
 else:
-    no("mapping_refused: complete=%s activated=%s excluded=%s" % (m[2], m[1], m[4]))
+    no("mapping_refused: ownership=%s factors=%s activated=%s status=%s excluded=%s"
+       % (m[1], m[2], m[3], m[4], m[6]))
+# call_status is COMPLETE only when all three conditions hold, never on a subset.
 for case in need:
-    if d[case][1] == "0" and d[case][8] == "-":
+    r = d[case]
+    allthree = (r[1] == "1" and r[2] == "1" and r[3] == "1")
+    if (r[4] == "COMPLETE") != allthree:
+        no("%s: call_status %s but conditions were %s/%s/%s" % (case, r[4], r[1], r[2], r[3]))
+        break
+else:
+    ok("call_status is COMPLETE exactly when ownership, factors and activation all hold")
+for case in need:
+    if d[case][3] == "0" and d[case][10] == "-":
         no("%s: refused activation without recording a reason" % case)
 sys.exit(bad)
 PYEOFG
