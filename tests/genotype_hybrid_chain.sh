@@ -56,6 +56,8 @@
 #      block marginal, with a linkage-free control and a non-vacuity check;                 [ACTIVE]
 #  15. ONE chain exercises BOTH kernel edge paths -- factorised and linked -- so neither branch can
 #      be present but unused;                                                               [ACTIVE]
+#  17. marker occurrence exclusion subtracts a linkage fragment's OCCURRENCES and never deletes a
+#      marker shared with unary-owned fragments;                                            [ACTIVE]
 #  16. every generated linkage edge is finite, mean-one per content class, and bounded by
 #      max log psi <= log|C| <= log 4, so exp(log psi) cannot overflow. An earlier version of this
 #      contract claimed exp would OVERFLOW at the 16043-nat spread; that spread is entirely on the
@@ -454,6 +456,106 @@ PYEOF7
   fails=$(( fails + $? ))
 else
   bad "no edge aggregate written"
+fi
+
+# GATE 17: MARKER OCCURRENCE EXCLUSION. A fragment owned by a linkage edge contributes its sequence
+# there and must leave the marker counts, or the same read is counted twice. What must be subtracted
+# is its OCCURRENCES, not the markers themselves: a marker it shares with unary-owned fragments has
+# to keep their counts and stay in the panel. Deleting the marker instead would remove evidence that
+# was never double counted, and at a marker-poor block that is the difference between a call and a
+# no-call.
+#
+# The claim is exact and is asserted as such: counts(excluded) == counts(all) - counts(that fragment
+# alone), slot by slot. Overlapping fragments guarantee shared markers, which is the case that
+# matters; a fixture whose fragments shared nothing would assert nothing.
+"$PY" - "$OUT" <<'PYEOFC'
+import sys, random
+out = sys.argv[1]; B = "ACGT"
+def seq(n, s):
+    r = random.Random(s); return "".join(r.choice(B) for _ in range(n))
+def mut(s, k, sd):
+    r = random.Random(sd); s = list(s)
+    for p in r.sample(range(len(s)), k): s[p] = r.choice([c for c in B if c != s[p]])
+    return "".join(s)
+X = seq(3000,1); A1 = seq(500,2); B1 = mut(A1,70,3); J = seq(40,4)
+A2 = seq(500,5); B2 = mut(A2,70,6); Z = seq(3000,7)
+segs = [("1",X),("2",A1),("3",B1),("4",J),("5",A2),("6",B2),("7",Z)]
+links = [("1","2"),("1","3"),("2","4"),("3","4"),("4","5"),("4","6"),("5","7"),("6","7")]
+paths = {"hapAA":["1","2","4","5","7"],"hapAB":["1","2","4","6","7"],
+         "hapBA":["1","3","4","5","7"],"hapBB":["1","3","4","6","7"]}
+d = dict(segs)
+with open(out+"/mx.gfa","w") as g:
+    g.write("H\tVN:Z:1.0\n")
+    for n,x in segs: g.write("S\t%s\t%s\n"%(n,x))
+    for a,b in links: g.write("L\t%s\t+\t%s\t+\t0M\n"%(a,b))
+    for n,st in paths.items(): g.write("P\t%s\t%s\t*\n"%(n,",".join(x+"+" for x in st)))
+h = "".join(d[x] for x in paths["hapAB"])
+comp = {"A":"T","C":"G","G":"C","T":"A"}
+k = 0
+with open(out+"/mx.r1.fq","w") as f1, open(out+"/mx.r2.fq","w") as f2:
+    for i in range(0, len(h)-360, 4):
+        a = h[i:i+150]; b = h[i+200:i+350]
+        if len(b) < 150: break
+        rc = "".join(comp[c] for c in reversed(b))
+        f1.write("@f%d/1\n%s\n+\n%s\n"%(k,a,"I"*150))
+        f2.write("@f%d/2\n%s\n+\n%s\n"%(k,rc,"I"*150))
+        k += 1
+PYEOFC
+"$BIN" bubble -i "$OUT/mx.gfa" -r hapAA -o "$OUT/mxb" --min-variant-bp 0 -q >/dev/null 2>&1
+echo "f400" > "$OUT/mx.excl.txt"
+awk '/^@f400\/1$/{p=1} p{print; if(++n==4) exit}' "$OUT/mx.r1.fq" > "$OUT/mx.one.r1.fq"
+awk '/^@f400\/2$/{p=1} p{print; if(++n==4) exit}' "$OUT/mx.r2.fq" > "$OUT/mx.one.r2.fq"
+"$BIN" genotype -i "$OUT/mxb.sorted.gfa" -b "$OUT/mxb" -r hapAA -o "$OUT/mx.all" \
+  -R "$OUT/mx.r1.fq" -R "$OUT/mx.r2.fq" --dump-markers "$OUT/mx.all.tsv" -q >/dev/null 2>&1
+"$BIN" genotype -i "$OUT/mxb.sorted.gfa" -b "$OUT/mxb" -r hapAA -o "$OUT/mx.one" \
+  -R "$OUT/mx.one.r1.fq" -R "$OUT/mx.one.r2.fq" --dump-markers "$OUT/mx.one.tsv" -q >/dev/null 2>&1
+"$BIN" genotype -i "$OUT/mxb.sorted.gfa" -b "$OUT/mxb" -r hapAA -o "$OUT/mx.ex" \
+  -R "$OUT/mx.r1.fq" -R "$OUT/mx.r2.fq" --exclude-fragments "$OUT/mx.excl.txt" \
+  --dump-markers "$OUT/mx.ex.tsv" -q >/dev/null 2>&1
+if [ -s "$OUT/mx.all.tsv" ] && [ -s "$OUT/mx.one.tsv" ] && [ -s "$OUT/mx.ex.tsv" ]; then
+  "$PY" - "$OUT/mx.all.tsv" "$OUT/mx.one.tsv" "$OUT/mx.ex.tsv" <<'PYEOFD'
+import sys
+def load(p):
+    rows = {}
+    for i, l in enumerate(open(p)):
+        if i == 0: continue
+        f = l.rstrip("\n").split("\t")
+        rows[(f[0], f[3], f[4])] = int(f[5])
+    return rows
+A, O, E = (load(x) for x in sys.argv[1:4])
+bad = 0
+def ok(m): print("  ok   " + m)
+def no(m):
+    global bad; bad += 1; print("  FAIL " + m)
+if set(A) == set(O) == set(E):
+    ok("no marker was deleted: all %d slots present in every arm" % len(A))
+else:
+    no("the marker panel differs between arms -- exclusion removed markers, not occurrences")
+mism = [k for k in A if E[k] != A[k] - O[k]]
+if not mism:
+    ok("exclusion subtracts exactly the fragment's occurrences, slot by slot (%d slots)" % len(A))
+else:
+    no("%d slots where excluded != all - fragment_alone, e.g. %s" % (len(mism), mism[0]))
+touched = [k for k in A if O[k] > 0]
+shared = [k for k in touched if A[k] > O[k]]
+zeroed = [k for k in shared if E[k] == 0]
+if not shared:
+    no("the excluded fragment shares no marker with any other -- the gate asserts nothing")
+elif zeroed:
+    no("%d SHARED markers were zeroed by exclusion; they must keep the other fragments' counts"
+       % len(zeroed))
+else:
+    kk = shared[0]
+    ok("%d of %d touched markers are shared, none zeroed (e.g. %d -> %d, minus %d)"
+       % (len(shared), len(touched), A[kk], E[kk], O[kk]))
+ta, to, te = sum(A.values()), sum(O.values()), sum(E.values())
+if te == ta - to: ok("total occurrences: %d - %d = %d" % (ta, to, te))
+else: no("total occurrences %d != %d - %d" % (te, ta, to))
+sys.exit(bad)
+PYEOFD
+  fails=$(( fails + $? ))
+else
+  bad "marker exclusion fixture produced no dumps"
 fi
 
 # GATE 14: THE BRUTE-FORCE PATH ORACLE. Forward-backward is compared against an INDEPENDENT

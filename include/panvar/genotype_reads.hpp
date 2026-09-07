@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace panvar {
@@ -116,10 +117,26 @@ struct ReadCounts {
 
 // Project reads onto the panel exactly as syng's -noAddK does: take each read's closed syncmers in
 // order, map them to known markers, and treat anything unmatched as absent rather than as new.
+//
+// `exclude_fragments`, when non-null, names fragments whose reads must NOT be counted. This is how
+// the hybrid caller keeps marker unaries and fragment linkage from counting the same evidence
+// twice: a fragment owned by a linkage edge contributes its sequence there and must leave the
+// marker counts.
+//
+// IT SUBTRACTS OCCURRENCES, NOT MARKERS. Skipping a read removes exactly that read's contribution
+// to each slot; a marker also carried by unary-owned fragments keeps their counts. Deleting the
+// marker from the panel instead would remove evidence that was never double counted and silently
+// change what the unary can measure -- and at a block whose markers are few, that is the difference
+// between a call and a no-call.
+//
+// Reads are matched to fragments through fragment_name(), the one naming authority, so a mate
+// suffix cannot cause half a pair to be excluded.
 ReadCounts count_reads(
     const std::vector<std::string>& read_paths,
     const ReadPanel& panel,
-    std::size_t threads);
+    std::size_t threads,
+    const std::unordered_set<std::string>* exclude_fragments = nullptr,
+    std::size_t* excluded_reads = nullptr);
 
 // Where a block's fitted depth came from. Inheriting the region's depth is the right thing to do for a
 // block with too few anchors of its own, and the wrong thing to hide: at a tandem array the fitted

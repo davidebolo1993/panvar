@@ -96,9 +96,16 @@ double log_add(double a, double b) {
     return hi + std::log1p(std::exp(lo - hi));
 }
 
+}  // namespace
+
 // wgsim and `samtools fastq` both give the two mates one shared name with a /1 or /2 suffix, so the
 // pairing can be recovered from the name alone -- which means interleaved input and split R1/R2
 // files go through the same code and neither has to be declared.
+//
+// EXPORTED because the read counter has to agree with it exactly. Marker exclusion identifies a
+// read by the FRAGMENT it belongs to, so a second copy of this rule in the counter would silently
+// exclude the wrong reads the moment either drifted -- the same duplicated-derivation defect the
+// shared linkage geometry exists to prevent.
 std::string fragment_name(const char* raw, std::size_t len) {
     std::string name(raw, len);
     const std::size_t sp = name.find_first_of(" \t");
@@ -109,6 +116,8 @@ std::string fragment_name(const char* raw, std::size_t len) {
     }
     return name;
 }
+
+namespace {
 
 // One read against one candidate context. `edits` is the infix (Hamming-window) edit distance, so
 // the read may sit anywhere in the context with no end-gap penalty; `start` is where it landed,

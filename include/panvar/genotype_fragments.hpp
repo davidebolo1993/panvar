@@ -31,6 +31,11 @@ namespace panvar {
 
 // One physical fragment: the two mates of a pair, or a single read. Mates are joined by name, so
 // this works for interleaved input and for split R1/R2 files without being told which it is.
+// THE ONE FRAGMENT-NAMING RULE. Strips a trailing /1 or /2 and anything after whitespace, so both
+// mates map to one fragment. Exported because marker exclusion identifies reads by fragment, and a
+// second copy of this rule would exclude the wrong reads the moment the two drifted apart.
+std::string fragment_name(const char* raw, std::size_t len);
+
 struct Fragment {
     std::string name;
     std::string r1;

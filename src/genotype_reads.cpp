@@ -1,5 +1,7 @@
 #include "panvar/genotype_reads.hpp"
 
+#include "panvar/genotype_fragments.hpp"
+
 #include "panvar/syncmer.hpp"
 
 #include <algorithm>
@@ -76,7 +78,9 @@ double central_value(const std::vector<double>& v, DepthEstimator estimator) {
 ReadCounts count_reads(
     const std::vector<std::string>& read_paths,
     const ReadPanel& panel,
-    std::size_t threads) {
+    std::size_t threads,
+    const std::unordered_set<std::string>* exclude_fragments,
+    std::size_t* excluded_reads) {
 
     std::unordered_map<std::uint64_t, std::uint32_t> node_slot;
     std::unordered_map<std::uint64_t, std::uint32_t> edge_slot;
@@ -99,6 +103,7 @@ ReadCounts count_reads(
     const std::size_t s = panel.syncmer_s != 0 ? panel.syncmer_s : default_syncmer_s(k);
 
     std::mutex merge_mu;
+    std::atomic<std::size_t> skipped{0};
     for (const std::string& path : read_paths) {
         gzFile fp = gzopen(path.c_str(), "r");
         if (fp == nullptr) throw std::runtime_error("genotype: cannot open reads " + path);
@@ -119,6 +124,15 @@ ReadCounts count_reads(
                     {
                         std::lock_guard<std::mutex> lock(read_mu);
                         while (batch.size() < 4096 && kseq_read(seq) >= 0) {
+                            // EXCLUDED AT THE READ, so only this fragment's occurrences leave the
+                            // counts. The marker itself stays in the panel and keeps every count
+                            // contributed by unary-owned fragments.
+                            if (exclude_fragments != nullptr &&
+                                exclude_fragments->count(
+                                    fragment_name(seq->name.s, seq->name.l)) != 0) {
+                                ++skipped;
+                                continue;
+                            }
                             batch.emplace_back(seq->seq.s, seq->seq.l);
                         }
                     }
@@ -157,6 +171,7 @@ ReadCounts count_reads(
         kseq_destroy(seq);
         gzclose(fp);
     }
+    if (excluded_reads != nullptr) *excluded_reads = skipped.load();
     return total;
 }
 

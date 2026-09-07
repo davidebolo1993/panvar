@@ -130,6 +130,9 @@ void print_genotype_help() {
         << "                              cannot drag it), or bases (total read bases over reference\n"
         << "                              length, independent of block structure)\n"
         << "      --depth-quantile <q>    Quantile for --depth-model quantile (default 0.75)\n"
+        << "      --exclude-fragments <f> Fragment names (one per line) whose reads must NOT be\n"
+        << "                              counted into the marker panel. Their occurrences are\n"
+        << "                              subtracted; the markers themselves stay in the panel.\n"
         << "      --dump-markers <path>   Write every marker count, one row per (block, marker):\n"
         << "                              anchor or informative, k-mer GC, offset and clump, per-allele\n"
         << "                              multiplicity, and with --truth-haplotypes this sample's own\n"
@@ -315,6 +318,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
     DepthModel depth_model = DepthModel::Joint;
     DepthEstimator depth_estimator = DepthEstimator::Median;
     std::string dump_markers;
+    std::string exclude_fragments_path;
     double depth_quantile = 0.75;
     long dump_block = -1;
     long ledger_block = -1;
@@ -421,6 +425,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
             else throw std::runtime_error("genotype: --depth-model must be median|quantile|bases|joint");
         }
         else if (arg == "--depth-quantile") depth_quantile = std::stod(require_value(arg));
+        else if (arg == "--exclude-fragments") exclude_fragments_path = require_value(arg);
         else if (arg == "--dump-markers") dump_markers = require_value(arg);
         else if (arg == "--dump-anchors") dump_markers = require_value(arg);  // former name
         else if (arg == "--depth-estimator") {
@@ -1420,7 +1425,28 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 log.wrote({out_prefix + ".nodecov.sample.tsv", out_prefix + ".nodecov.panel.tsv"});
             }
 
-            ReadCounts rc = count_reads(read_paths, read_panel, options.threads);
+            // MARKER OCCURRENCE EXCLUSION. Fragments owned by a linkage edge contribute their
+            // sequence there and must leave the marker counts, or the same read is counted twice.
+            // Only their OCCURRENCES are subtracted: a marker they share with a unary-owned
+            // fragment keeps that fragment's counts and stays in the panel.
+            std::unordered_set<std::string> excl;
+            if (!exclude_fragments_path.empty()) {
+                std::ifstream ef(exclude_fragments_path);
+                if (!ef) throw std::runtime_error("genotype: cannot read " + exclude_fragments_path);
+                std::string line;
+                while (std::getline(ef, line)) {
+                    while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+                    if (!line.empty()) excl.insert(line);
+                }
+            }
+            std::size_t excluded_reads = 0;
+            ReadCounts rc = count_reads(read_paths, read_panel, options.threads,
+                                        excl.empty() ? nullptr : &excl, &excluded_reads);
+            if (!excl.empty()) {
+                log.info("marker exclusion: " + std::to_string(excl.size()) +
+                         " fragment(s) named, " + std::to_string(excluded_reads) +
+                         " reads left the marker counts (their markers remain in the panel)");
+            }
             log.info("reads: " + std::to_string(rc.reads) + " (" + std::to_string(rc.bases / 1000) +
                      " kb); " + std::to_string(rc.syncmers) + " syncmers, " +
                      std::to_string(100 * rc.matched_syncmers / std::max<std::uint64_t>(1, rc.syncmers)) +
