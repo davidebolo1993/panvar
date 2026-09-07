@@ -48,6 +48,8 @@
 #  10. psi is formed by edge-level diploid aggregation, sums to 1 per content class, and is
 #      invariant under a global homologue swap;                                           [ACTIVE]
 #  11. a three-allele fixture pins the indexing a 0/1 fixture cannot reach;                [ACTIVE]
+#  12. an edge carrying NO phase information is exactly neutral: zero fragments, flat emissions
+#      or all-unplaced emissions each give an identically zero log factor.                  [ACTIVE]
 #   9. ambiguous evidence yields an equivalence set or UNRESOLVED, never a confident guess.
 #
 # NORMALISATION is settled in genotype_fragments.hpp. Linkage is a CONDITIONAL PHASE SCORE, and TWO
@@ -413,10 +415,12 @@ for r in rows:
     tag = "edge %s-%s" % (r[0], r[1])
     if ncfg == na*nb*na*nb: ok("%s: %d configurations over %dx%d alleles" % (tag, ncfg, na, nb))
     else: no("%s: %d configurations, expected %d" % (tag, ncfg, na*nb*na*nb))
-    # psi is a conditional distribution over phase GIVEN endpoint content, so it must sum to 1
-    # within each unordered-content class and contribute nothing to content ranking.
-    if psisum < 1e-9: ok("%s: psi sums to 1 within every content class (worst dev %.2e)" % (tag, psisum))
-    else: no("%s: psi deviates from 1 by %.2e within a content class" % (tag, psisum))
+    # psi is a MEAN-ONE likelihood ratio within each unordered-content class -- NOT a sum-one
+    # conditional distribution. It multiplies into the Li-Stephens transition, which already carries
+    # a phase prior, and sum-one would both double that normalisation and leave a -log|C| content
+    # penalty on an edge that says nothing (classes have sizes 1, 2 and 4).
+    if psisum < 1e-9: ok("%s: psi is mean-one within every content class (worst dev %.2e)" % (tag, psisum))
+    else: no("%s: psi mean deviates from 1 by %.2e within a content class" % (tag, psisum))
     # GLOBAL HOMOLOGUE SWAP: (a1,b1,a2,b2) and (a2,b2,a1,b1) are one diploid state written twice.
     if swap < 1e-9: ok("%s: global homologue swap leaves psi unchanged (%.2e)" % (tag, swap))
     else: no("%s: swapping the homologues changes psi by %.4g -- ordered state leaked in" % (tag, swap))
@@ -436,6 +440,61 @@ PYEOF7
   fails=$(( fails + $? ))
 else
   bad "no edge aggregate written"
+fi
+
+# GATE 12: NEUTRALITY OF AN UNINFORMATIVE EDGE. This is the assertion that matters most, and it
+# cannot be produced from a read fixture: it needs an edge with NO fragments, and one whose emissions
+# are identical across every configuration. --linkage-selftest constructs both directly, over content
+# classes of all three cardinalities (1, 2 and 4) -- exactly where a sum-one normalisation leaks a
+# -log|C| penalty against heterozygous content.
+"$BIN" genotype-frag -i /dev/null -b none -o "$OUT/st" --linkage-selftest > "$OUT/self.tsv" 2>/dev/null
+if [ -s "$OUT/self.tsv" ]; then
+  "$PY" - "$OUT/self.tsv" <<'PYEOFA'
+import sys
+rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[1])][1:]
+d = {r[0]: r for r in rows}
+bad = 0
+def ok(m): print("  ok   " + m)
+def no(m):
+    global bad; bad += 1; print("  FAIL " + m)
+need = ("zero_fragments", "flat_emissions", "all_unplaced", "informative")
+miss = [k for k in need if k not in d]
+if miss: no("self-test missing cases: %s" % ", ".join(miss)); sys.exit(1)
+sizes = d["zero_fragments"][5]
+if "1x" in sizes and "2x" in sizes and "4x" in sizes:
+    ok("self-test covers content classes of all three cardinalities (%s)" % sizes)
+else:
+    no("self-test does not cover class sizes 1, 2 and 4: %s" % sizes)
+# THE NEUTRALITY PROPERTY. No fragments, flat emissions, or emissions that are all unplaced (pure
+# background) must ALL give an identically zero log factor -- otherwise the edge moves the
+# Li-Stephens model while carrying no phase information.
+for case in ("zero_fragments", "flat_emissions", "all_unplaced"):
+    v = float(d[case][2])
+    if v == 0.0: ok("%s: log psi is identically zero -- the edge is exactly neutral" % case)
+    else: no("%s: max |log psi| = %.10g, so an edge with no phase information still moves the "
+             "model (sum-one leaks log 4 = 1.3863 here)" % (case, v))
+# Mean-one, and swap symmetry, on the informative case.
+inf = d["informative"]
+if float(inf[2]) > 0.0: ok("informative: log psi is non-zero (max %.2f nats) -- the gate is not vacuous"
+                           % float(inf[2]))
+else: no("informative: log psi is zero -- the self-test asserts nothing")
+for case in need:
+    if float(d[case][3]) > 1e-9:
+        no("%s: mean(exp(log psi)) deviates from 1 by %.2e" % (case, float(d[case][3])))
+        break
+else:
+    ok("every case is mean-one within each content class (worst dev %.2e)"
+       % max(float(d[k][3]) for k in need))
+for case in need:
+    if float(d[case][4]) > 1e-12:
+        no("%s: global homologue swap changes log psi by %.2e" % (case, float(d[case][4]))); break
+else:
+    ok("global homologue swap leaves log psi unchanged in every case")
+sys.exit(bad)
+PYEOFA
+  fails=$(( fails + $? ))
+else
+  bad "linkage self-test produced no output"
 fi
 
 # GATE 11: THREE ALLELES PER BLOCK. The 2-allele fixture exercises only the 0/1 cis-trans pair, so

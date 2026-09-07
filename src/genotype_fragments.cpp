@@ -4307,10 +4307,25 @@ LinkageEdge aggregate_linkage_edge(const std::vector<LinkageEmission>& emissions
         acc -= lambda * (geom.exposure[a1 * nb + b1] + geom.exposure[a2 * nb + b2]);
         E.score[c] = acc;
     }
-    // PHASE ONLY: remove the baseline WITHIN each unordered-content class, so psi is a conditional
-    // distribution over phase given endpoint content and adds nothing to content ranking. Done after
-    // aggregation, never per fragment -- per-fragment normalisation would let each fragment choose
-    // its own configuration, which is the mosaic error one level down.
+    // PHASE ONLY, as a MEAN-ONE LIKELIHOOD RATIO within each unordered-content class:
+    //
+    //     log psi(c) = S(c) - logmeanexp_{c' in C} S(c') = S(c) - logsumexp + log|C|
+    //
+    // NOT a sum-one conditional distribution. psi is MULTIPLIED INTO the existing Li-Stephens
+    // transition, which already carries its own phase prior; a sum-one factor would count that
+    // normalisation twice. Worse, it is not neutral when the edge says nothing: with S flat,
+    // sum-one gives log psi = -log|C|, and the classes have DIFFERENT cardinalities -- 1 for
+    // hom/hom, 2 for het/hom, 4 for het/het -- so a phase-uninformative edge would penalise
+    // heterozygous content by up to log 4 = 1.3863 nats purely from class size. Mean-one centering
+    // gives exactly 0 for every class size, so an uninformative edge is genuinely neutral.
+    //
+    // Done after aggregation, never per fragment -- per-fragment normalisation would let each
+    // fragment choose its own configuration, the mosaic error one level down.
+    //
+    // WHAT THIS GUARANTEES, and no more: an edge with no phase information leaves the Li-Stephens
+    // model untouched. It does NOT guarantee that an INFORMATIVE edge never changes content
+    // ranking -- phase evidence can still move marginal content posteriors once it interacts with
+    // nonuniform Li-Stephens weights, and claiming otherwise would overstate the centering.
     std::vector<char> done(ncfg, 0);
     for (std::size_t a1 = 0; a1 < na; ++a1)
     for (std::size_t b1 = 0; b1 < nb; ++b1)
@@ -4330,7 +4345,8 @@ LinkageEdge aggregate_linkage_edge(const std::vector<LinkageEmission>& emissions
         cls.erase(std::unique(cls.begin(), cls.end()), cls.end());
         double lse = kNegInf;
         for (std::size_t k : cls) lse = log_add(lse, E.score[k]);
-        for (std::size_t k : cls) { E.log_psi[k] = E.score[k] - lse; done[k] = 1; }
+        const double lmean = lse - std::log(static_cast<double>(cls.size()));
+        for (std::size_t k : cls) { E.log_psi[k] = E.score[k] - lmean; done[k] = 1; }
     }
     E.ok = true;
     return E;

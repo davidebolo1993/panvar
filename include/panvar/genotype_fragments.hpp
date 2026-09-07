@@ -1773,14 +1773,28 @@ LinkageEmission linkage_emission(const Fragment& fragment, const LinkageGeometry
 //                 - lambda*(E(a1,b1) + E(a2,b2))
 //
 // combine the two homologues ONCE, mix the background ONCE, sum over fragments, charge exposure
-// ONCE for the edge. Then the phase-only factor is
+// ONCE for the edge. Then the phase factor is a MEAN-ONE LIKELIHOOD RATIO within each
+// unordered-content class:
 //
-//   log psi_e(config) = S_e(config) - logsumexp over configurations with the SAME UNORDERED content
+//   log psi_e(c) = S_e(c) - logmeanexp over configurations of the SAME UNORDERED content
+//                = S_e(c) - logsumexp + log|C|
 //
-// so psi is a conditional distribution over phase given endpoint content and contributes nothing to
-// content ranking. NORMALISING PER FRAGMENT WOULD BE A DIFFERENT MODEL: it would let each fragment
-// pick its own phase configuration independently, which is the mosaic error excluded at the
-// diplotype level, reappearing one level down.
+// A PHASE LIKELIHOOD RATIO, NOT A CONDITIONAL DISTRIBUTION. psi multiplies INTO the Li-Stephens
+// transition, which already carries a phase prior; a sum-one factor would count that normalisation
+// a second time. It would also not be neutral on an uninformative edge: with S flat, sum-one gives
+// log psi = -log|C|, and content classes have different cardinalities -- 1 for hom/hom, 2 for
+// het/hom, 4 for het/het -- so an edge carrying NO phase information would penalise heterozygous
+// content by up to log 4 = 1.3863 nats from class size alone. Mean-one centering gives exactly 0
+// for every class size.
+//
+// GUARANTEED: an edge with no phase information leaves the Li-Stephens model unchanged.
+// NOT GUARANTEED: that an informative edge never changes content ranking. Phase evidence can still
+// move marginal content posteriors through its interaction with nonuniform Li-Stephens weights, so
+// "neutral when phase-uninformative" is the claim, and "never changes content ranking" is not.
+//
+// NORMALISING PER FRAGMENT WOULD BE A DIFFERENT MODEL: it would let each fragment pick its own
+// phase configuration independently, the mosaic error excluded at the diplotype level reappearing
+// one level down.
 struct LinkageEdge {
     std::uint32_t block_a = 0, block_b = 0;
     std::size_t n_a = 0, n_b = 0;
@@ -1789,7 +1803,7 @@ struct LinkageEdge {
                                      // evidence entering psi. The rest consume normalisation only.
     // Indexed [((a1 * n_b + b1) * n_a + a2) * n_b + b2].
     std::vector<double> score;       // S_e, the full diploid edge score
-    std::vector<double> log_psi;     // phase-only, baseline removed within each content class
+    std::vector<double> log_psi;     // MEAN-ONE phase ratio within each content class
     bool ok = false;
 };
 

@@ -336,6 +336,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     std::string ownership_table;
     std::string exposure_probe;
     std::string linkage_potential_out;
+    bool linkage_selftest = false;
     std::vector<std::string> reconcile_scope;
     std::string switch_penalties_arg = "0,10,100,1000";
     std::vector<std::string> exact_distance;
@@ -385,6 +386,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--ownership-table") ownership_table = value(i, a);
         else if (a == "--exposure-probe") exposure_probe = value(i, a);
         else if (a == "--linkage-potential") linkage_potential_out = value(i, a);
+        else if (a == "--linkage-selftest") linkage_selftest = true;
         else if (a == "--scope-tol") {
             const std::string sv = value(i, a);
             scope_tol = std::stod(sv);
@@ -639,9 +641,13 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     if (gfa_path.empty() || out_prefix.empty()) {
         throw std::runtime_error("genotype-frag requires --gfa and --out-prefix");
     }
+    // --linkage-selftest builds its own geometry and emissions, so it needs no reads. Requiring a
+    // fixture would defeat it: the neutrality cases it covers -- an edge with no fragments, and one
+    // whose emissions are identical everywhere -- are exactly what a read fixture cannot produce on
+    // demand.
     if (read_paths.empty() && spell_calls.empty() && !mosaic_floor && dump_sequences.empty() &&
         spell_pair.empty() && ref_block.empty() && ref_block_pair.empty() &&
-        origin_universe.empty() && reconcile_scope.empty()) {
+        origin_universe.empty() && reconcile_scope.empty() && !linkage_selftest) {
         throw std::runtime_error("genotype-frag requires at least one --reads");
     }
     if (!bubble_prefix_in.empty()) {
@@ -674,6 +680,78 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     ParseGfaOptions parse_options;
     parse_options.include_paths = true;
     parse_options.include_sequences = true;
+    // ---- LINKAGE FACTOR SELF-TEST ---------------------------------------------------------------
+    // The neutrality property cannot be produced reliably from a read fixture: it needs an edge with
+    // NO fragments, and one whose emissions are identical across every configuration. Both are
+    // constructed here directly, over content classes of all three cardinalities (1, 2 and 4), which
+    // is exactly where a sum-one normalisation would have leaked a -log|C| content penalty.
+    if (linkage_selftest) {
+        LinkageGeometry g;
+        g.block_a = 0; g.block_b = 1;
+        // EQUAL-LENGTH alleles, so the edge's exposure is identical across configurations and the
+        // test isolates the phase factor from the exposure term.
+        g.alleles_a = {std::string(600, 'A'), std::string(600, 'C')};
+        g.alleles_b = {std::string(600, 'G'), std::string(600, 'T')};
+        g.context = std::string(40, 'A');
+        g.lflank = std::string(600, 'A');
+        g.rflank = std::string(600, 'A');
+        g.window_len.assign(4, 2440);
+        g.exposure.assign(4, 1000.0);
+        g.exposure_affine = true;
+        g.ok = true;
+        const double lam = 0.05, mix = std::log1p(-0.05), bgw = std::log(0.05);
+        const auto report = [&](const char* name, const std::vector<LinkageEmission>& ems) {
+            const LinkageEdge E = aggregate_linkage_edge(ems, g, lam, mix, bgw);
+            const std::size_t na = E.n_a, nb = E.n_b;
+            double maxabs = 0.0, worst_mean = 0.0, swap = 0.0;
+            std::map<std::size_t, std::size_t> class_sizes;
+            std::vector<char> seen(E.log_psi.size(), 0);
+            for (std::size_t a1 = 0; a1 < na; ++a1)
+            for (std::size_t b1 = 0; b1 < nb; ++b1)
+            for (std::size_t a2 = 0; a2 < na; ++a2)
+            for (std::size_t b2 = 0; b2 < nb; ++b2) {
+                const std::size_t c = ((a1*nb + b1)*na + a2)*nb + b2;
+                maxabs = std::max(maxabs, std::abs(E.log_psi[c]));
+                const std::size_t cs = ((a2*nb + b2)*na + a1)*nb + b1;
+                swap = std::max(swap, std::abs(E.log_psi[c] - E.log_psi[cs]));
+                if (seen[c]) continue;
+                const std::size_t A2[2] = {a1, a2}, B2[2] = {b1, b2};
+                std::vector<std::size_t> cls;
+                for (int q1 = 0; q1 < 2; ++q1) for (int q2 = 0; q2 < 2; ++q2)
+                    cls.push_back(((A2[q1]*nb + B2[q2])*na + A2[1-q1])*nb + B2[1-q2]);
+                std::sort(cls.begin(), cls.end());
+                cls.erase(std::unique(cls.begin(), cls.end()), cls.end());
+                double m = 0.0;
+                for (std::size_t z : cls) { m += std::exp(E.log_psi[z]); seen[z] = 1; }
+                m /= static_cast<double>(cls.size());
+                worst_mean = std::max(worst_mean, std::abs(m - 1.0));
+                ++class_sizes[cls.size()];
+            }
+            std::string sizes;
+            for (const auto& kv : class_sizes) {
+                sizes += (sizes.empty() ? "" : ",") + std::to_string(kv.first) + "x" +
+                         std::to_string(kv.second);
+            }
+            std::printf("%s\t%zu\t%.17g\t%.17g\t%.17g\t%s\n", name, ems.size(), maxabs,
+                        worst_mean, swap, sizes.c_str());
+        };
+        const auto mk = [&](const std::vector<double>& mass) {
+            LinkageEmission m;
+            m.n_a = 2; m.n_b = 2; m.mass = mass; m.log_p_bg = -400.0; m.ok = true;
+            return m;
+        };
+        std::printf("case\tfragments\tmax_abs_log_psi\tworst_mean_dev\tswap_asym\tclass_sizes\n");
+        report("zero_fragments", {});
+        report("flat_emissions", {mk({-100.0, -100.0, -100.0, -100.0}),
+                                  mk({-100.0, -100.0, -100.0, -100.0})});
+        report("all_unplaced",   {mk({-std::numeric_limits<double>::infinity(),
+                                      -std::numeric_limits<double>::infinity(),
+                                      -std::numeric_limits<double>::infinity(),
+                                      -std::numeric_limits<double>::infinity()})});
+        report("informative",    {mk({-100.0, -140.0, -140.0, -100.0})});
+        return 0;
+    }
+
     const Graph graph = parse_gfa(gfa_path, parse_options);
     if (graph.paths.empty()) throw std::runtime_error("genotype-frag: no paths in " + gfa_path);
 
