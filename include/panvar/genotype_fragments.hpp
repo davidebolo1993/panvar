@@ -1811,6 +1811,38 @@ LinkageEmission linkage_emission(const Fragment& fragment, const LinkageGeometry
 // AN OWNED FRAGMENT WITH NO EMISSION MAKES THE EDGE INCOMPLETE. It must never be skipped: dropping
 // it would quietly shrink the evidence set and report a confident answer from less data than the
 // ownership partition claims.
+// ONE STATUS, and usability DERIVED from it. There were two booleans -- `ok` meaning "computed"
+// and `usable` meaning "safe to consume" -- and an unsupported edge deliberately set ok=true,
+// usable=false. Any consumer testing the wrong one silently consumes a refused edge. A single enum
+// removes the confusion rather than testing for it.
+enum class LinkageStatus {
+    NotComputed,
+    Ok,
+    ExposureDoesNotCancel,   // a short window broke the cancellation the contract requires
+    InvalidEmissions,        // an owned fragment produced no emission -> INCOMPLETE
+    TooManyConfigurations,   // the dense table would not fit; REFUSED, never truncated
+};
+const char* linkage_status_name(LinkageStatus s);
+
+// THE DENSE-STATE LIMIT, and why it is a refusal and not a cap.
+//
+// A LinkageEdge is dense over n_A * n_B * n_A * n_B configurations. That is fine at fixture scale
+// and impossible at locus scale:
+//
+//     2 x 2      ->             16 configs      0.000 GB
+//     32 x 32    ->      1,048,576 configs      0.017 GB
+//     64 x 64    ->     16,777,216 configs      0.268 GB
+//     457 x 410  -> 35,107,516,900 configs    561.720 GB      (LPA-sized)
+//
+// So the dense representation CANNOT claim to handle all loci, and a sparse or on-demand
+// active-allele representation is required before real loci. Until it exists this REFUSES with
+// TooManyConfigurations rather than truncating, because a silent truncation here would let the
+// marker top-K become an uncertified linkage cutoff -- reintroducing, at the factor level, exactly
+// the uncertified-shortlist defect this whole line of work exists to remove.
+//
+// An arbitrary diploid edge potential also destroys the Li-Stephens O(n_h^2) transition
+// factorisation, making a linkage edge O(n_h^4). That is a separate cost from the table size and is
+// equally a locus-scale blocker.
 struct LinkageEdge {
     std::uint32_t block_a = 0, block_b = 0;
     std::size_t n_a = 0, n_b = 0;
@@ -1823,15 +1855,20 @@ struct LinkageEdge {
     std::vector<double> log_psi;     // MEAN-ONE phase ratio within each content class
     double exposure_asymmetry = 0.0; // worst |E(a1,b1)+E(a2,b2) - E(a1,b2)+E(a2,b1)| in a class
     bool exposure_cancels = false;
-    // false -> propagate UNSUPPORTED/INCOMPLETE; log_psi is zeroed and must not be used.
-    bool usable = false;
-    std::string status;              // "ok", "exposure-does-not-cancel", "invalid-emissions"
-    bool ok = false;
+    LinkageStatus status = LinkageStatus::NotComputed;
+    // THE ONLY TEST A CONSUMER SHOULD MAKE, and it must be made BEFORE touching score or log_psi.
+    // On a refusal those vectors are EMPTY, not zero-filled -- TooManyConfigurations refuses
+    // precisely so the allocation never happens -- while n_a and n_b are still set. Indexing them
+    // by n_a/n_b without checking this reads out of bounds; that is not hypothetical, it segfaulted
+    // the self-test the moment the refusal case was added.
+    bool usable() const { return status == LinkageStatus::Ok; }
 };
 
+// `max_configs` bounds the dense table; 0 means the default. Exceeding it is a REFUSAL.
 LinkageEdge aggregate_linkage_edge(const std::vector<LinkageEmission>& emissions,
                                    const LinkageGeometry& geom, double lambda,
-                                   double log_mix, double log_bg_weight);
+                                   double log_mix, double log_bg_weight,
+                                   std::size_t max_configs = 0);
 
 void write_ownership_table(const std::string& path,
                            const std::vector<Fragment>& fragments,

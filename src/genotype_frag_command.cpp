@@ -703,6 +703,14 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         const auto report = [&](const char* name, const std::vector<LinkageEmission>& ems,
                                 const LinkageGeometry* gover = nullptr) {
             const LinkageEdge E = aggregate_linkage_edge(ems, gover ? *gover : g, lam, mix, bgw);
+            // GUARD BEFORE INDEXING. A refused edge has EMPTY score/log_psi with n_a and n_b still
+            // set, so looping over n_a*n_b reads out of bounds.
+            if (!E.usable()) {
+                std::printf("%s\t%zu\t%s\t%s\t%s\t%s\t%d\t%zu\t%s\t%.17g\n",
+                            name, ems.size(), "0", "0", "0", "-", 0, E.n_invalid,
+                            linkage_status_name(E.status), E.exposure_asymmetry);
+                return;
+            }
             const std::size_t na = E.n_a, nb = E.n_b;
             double maxabs = 0.0, worst_mean = 0.0, swap = 0.0;
             std::map<std::size_t, std::size_t> class_sizes;
@@ -735,7 +743,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             }
             std::printf("%s\t%zu\t%.17g\t%.17g\t%.17g\t%s\t%d\t%zu\t%s\t%.17g\n",
                         name, ems.size(), maxabs, worst_mean, swap, sizes.c_str(),
-                        E.usable ? 1 : 0, E.n_invalid, E.status.c_str(), E.exposure_asymmetry);
+                        E.usable() ? 1 : 0, E.n_invalid, linkage_status_name(E.status), E.exposure_asymmetry);
         };
         const auto mk = [&](const std::vector<double>& mass) {
             LinkageEmission m;
@@ -768,6 +776,17 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         {
             LinkageEmission bad_em;   // ok == false
             report("invalid_emission", {mk({-100.0, -140.0, -140.0, -100.0}), bad_em});
+        }
+        // THE DENSE TABLE MUST REFUSE, NOT TRUNCATE. A locus-scale block pair (LPA: 457 x 410) is
+        // 35.1 billion configurations and 561.7 GB, so the dense form cannot claim to handle all
+        // loci. Refusing keeps the marker shortlist from becoming an uncertified linkage cutoff.
+        {
+            LinkageGeometry gb2 = g;
+            gb2.alleles_a.assign(64, std::string(600, 'A'));
+            gb2.alleles_b.assign(64, std::string(600, 'C'));
+            gb2.window_len.assign(64 * 64, 2440);
+            gb2.exposure.assign(64 * 64, 1000.0);
+            report("too_many_configs", {}, &gb2);
         }
         return 0;
     }
@@ -1361,7 +1380,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                 // unordered-content class, so each class's psi sums to 1. Reported, not assumed.
                 double worst = 0.0, swap_asym = 0.0;
                 std::size_t bestc = 0; double bestv = -1e300;   // SPREAD within a class, not level
-                {
+                if (E.usable()) {
                     const std::size_t na = E.n_a, nb = E.n_b;
                     std::vector<char> seen(E.log_psi.size(), 0);
                     for (std::size_t a1 = 0; a1 < na; ++a1)
@@ -1417,13 +1436,13 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                    << '\t' << E.n_fragments << '\t' << E.n_informative << '\t' << E.n_invalid
                    << '\t' << E.log_psi.size() << '\t' << (geom.exposure_affine ? 1 : 0) << '\t'
                    << worst << '\t' << bestc << '\t' << bestv << '\t'
-                   << swap_asym << '\t' << (E.usable ? 1 : 0) << '\t' << E.status << '\t'
+                   << swap_asym << '\t' << (E.usable() ? 1 : 0) << '\t' << linkage_status_name(E.status) << '\t'
                    << E.exposure_asymmetry << '\n';
                 // An unusable edge must PROPAGATE, not be quietly omitted from the summary.
-                if (!E.usable) {
+                if (!E.usable()) {
                     log.info("edge " + std::to_string(geom.block_a) + "-" +
                              std::to_string(geom.block_b) + " is UNSUPPORTED/INCOMPLETE: " +
-                             E.status + " (its log psi is zeroed and must not be consumed)");
+                             std::string(linkage_status_name(E.status)) + " (its log psi is zeroed and must not be consumed)");
                 }
             }
             lp.flush(); ef.flush();

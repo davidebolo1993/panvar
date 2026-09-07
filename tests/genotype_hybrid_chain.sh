@@ -49,7 +49,9 @@
 #      invariant under a global homologue swap;                                           [ACTIVE]
 #  11. a three-allele fixture pins the indexing a 0/1 fixture cannot reach;                [ACTIVE]
 #  12. an edge carrying NO phase information is exactly neutral: zero fragments, flat emissions
-#      or all-unplaced emissions each give an identically zero log factor.                  [ACTIVE]
+#      or all-unplaced emissions each give an identically zero log factor;                  [ACTIVE]
+#  13. exposure that does not cancel, an unformable emission, and an oversized dense table are each
+#      REFUSED with a status, never truncated or silently skipped.                          [ACTIVE]
 #   9. ambiguous evidence yields an equivalence set or UNRESOLVED, never a confident guess.
 #
 # NORMALISATION is settled in genotype_fragments.hpp. Linkage is a CONDITIONAL PHASE SCORE, and TWO
@@ -462,9 +464,18 @@ def ok(m): print("  ok   " + m)
 def no(m):
     global bad; bad += 1; print("  FAIL " + m)
 need = ("zero_fragments", "flat_emissions", "all_unplaced", "informative",
-        "unequal_exposure", "unequal_exposure_with_frags", "invalid_emission")
+        "unequal_exposure", "unequal_exposure_with_frags", "invalid_emission",
+        "too_many_configs")
 miss = [k for k in need if k not in d]
 if miss: no("self-test missing cases: %s" % ", ".join(miss)); sys.exit(1)
+# THE DENSE TABLE MUST REFUSE, NOT TRUNCATE. At LPA scale (457 x 410) it is 35.1 billion
+# configurations and 561.7 GB, so the dense form cannot claim to handle every locus. A silent
+# truncation would let the marker shortlist become an uncertified linkage cutoff.
+tm = d["too_many_configs"]
+if tm[6] == "0" and tm[8] == "too-many-configurations":
+    ok("too_many_configs: a 64x64 edge (16.8M configs) is REFUSED, not truncated")
+else:
+    no("too_many_configs: usable=%s status=%s -- an oversized edge was accepted" % (tm[6], tm[8]))
 sizes = d["zero_fragments"][5]
 if "1x" in sizes and "2x" in sizes and "4x" in sizes:
     ok("self-test covers content classes of all three cardinalities (%s)" % sizes)
@@ -483,14 +494,15 @@ inf = d["informative"]
 if float(inf[2]) > 0.0: ok("informative: log psi is non-zero (max %.2f nats) -- the gate is not vacuous"
                            % float(inf[2]))
 else: no("informative: log psi is zero -- the self-test asserts nothing")
-for case in need:
+usable_cases = [k for k in need if d[k][6] == "1"]
+for case in usable_cases:
     if float(d[case][3]) > 1e-9:
         no("%s: mean(exp(log psi)) deviates from 1 by %.2e" % (case, float(d[case][3])))
         break
 else:
-    ok("every case is mean-one within each content class (worst dev %.2e)"
-       % max(float(d[k][3]) for k in need))
-for case in need:
+    ok("every USABLE case is mean-one within each content class (worst dev %.2e)"
+       % max(float(d[k][3]) for k in usable_cases))
+for case in usable_cases:
     if float(d[case][4]) > 1e-12:
         no("%s: global homologue swap changes log psi by %.2e" % (case, float(d[case][4]))); break
 else:
@@ -506,6 +518,15 @@ for case in ("unequal_exposure", "unequal_exposure_with_frags"):
            % (case, d[case][6], d[case][8]))
     if float(d[case][2]) != 0.0:
         no("%s: log psi is non-zero (%.4g) on an unusable edge" % (case, float(d[case][2])))
+# A REFUSED EDGE MUST NOT BE INDEXED. score/log_psi are EMPTY on refusal while n_a/n_b remain set,
+# so a consumer that checks the wrong thing reads out of bounds -- this segfaulted the self-test the
+# moment the refusal case was added, which is why usable() is now the single derived test.
+for case in ("unequal_exposure", "invalid_emission", "too_many_configs"):
+    if d[case][5] != "-":
+        no("%s: class sizes were computed on a refused edge (%s)" % (case, d[case][5]))
+        break
+else:
+    ok("refused edges expose no class structure -- consumers cannot index them by accident")
 # AN OWNED FRAGMENT WITH NO EMISSION makes the edge INCOMPLETE; it must never be silently skipped.
 iv = d["invalid_emission"]
 if iv[6] == "0" and iv[7] == "1" and iv[8] == "invalid-emissions":

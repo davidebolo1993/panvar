@@ -4272,14 +4272,36 @@ LinkageEmission linkage_emission(const Fragment& fragment, const LinkageGeometry
     return out;
 }
 
+const char* linkage_status_name(LinkageStatus s) {
+    switch (s) {
+        case LinkageStatus::Ok:                    return "ok";
+        case LinkageStatus::ExposureDoesNotCancel: return "exposure-does-not-cancel";
+        case LinkageStatus::InvalidEmissions:      return "invalid-emissions";
+        case LinkageStatus::TooManyConfigurations: return "too-many-configurations";
+        default:                                   return "not-computed";
+    }
+}
+
 LinkageEdge aggregate_linkage_edge(const std::vector<LinkageEmission>& emissions,
                                    const LinkageGeometry& geom, double lambda,
-                                   double log_mix, double log_bg_weight) {
+                                   double log_mix, double log_bg_weight,
+                                   std::size_t max_configs) {
     LinkageEdge E;
     if (!geom.ok) return E;
     E.block_a = geom.block_a; E.block_b = geom.block_b;
     E.n_a = geom.alleles_a.size(); E.n_b = geom.alleles_b.size();
-    const std::size_t na = E.n_a, nb = E.n_b, ncfg = na * nb * na * nb;
+    const std::size_t na = E.n_a, nb = E.n_b;
+    // REFUSE, DO NOT TRUNCATE. At LPA scale (457 x 410) this table is 35.1 billion entries and
+    // 561.7 GB; quietly restricting to the top few alleles would turn the marker shortlist into an
+    // uncertified linkage cutoff, which is the defect this work exists to remove.
+    const std::size_t cap = max_configs ? max_configs : 1000000u;
+    const bool overflow = na != 0 && nb != 0 &&
+                          (static_cast<double>(na) * nb * na * nb > static_cast<double>(cap));
+    if (overflow) {
+        E.status = LinkageStatus::TooManyConfigurations;
+        return E;
+    }
+    const std::size_t ncfg = na * nb * na * nb;
     E.score.assign(ncfg, 0.0);
     E.log_psi.assign(ncfg, 0.0);
     E.n_fragments = emissions.size();
@@ -4304,15 +4326,11 @@ LinkageEdge aggregate_linkage_edge(const std::vector<LinkageEmission>& emissions
     }
     E.exposure_cancels = E.exposure_asymmetry <= 1e-9;
     if (!E.exposure_cancels) {
-        E.status = "exposure-does-not-cancel";
-        E.ok = true;          // computed, and deliberately unusable
-        E.usable = false;
+        E.status = LinkageStatus::ExposureDoesNotCancel;
         return E;             // log_psi stays all-zero and must not be consumed
     }
     if (E.n_invalid > 0) {
-        E.status = "invalid-emissions";
-        E.ok = true;
-        E.usable = false;
+        E.status = LinkageStatus::InvalidEmissions;
         return E;
     }
     // S_e: the two homologues combined ONCE, background mixed ONCE, summed over fragments, and
@@ -4382,9 +4400,7 @@ LinkageEdge aggregate_linkage_edge(const std::vector<LinkageEmission>& emissions
         const double lmean = lse - std::log(static_cast<double>(cls.size()));
         for (std::size_t k : cls) { E.log_psi[k] = E.score[k] - lmean; done[k] = 1; }
     }
-    E.status = "ok";
-    E.usable = true;
-    E.ok = true;
+    E.status = LinkageStatus::Ok;
     return E;
 }
 
