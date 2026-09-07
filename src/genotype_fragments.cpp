@@ -4128,43 +4128,103 @@ FragmentOwner assign_fragment_owner(const Fragment& fragment,
     return out;
 }
 
-LinkagePotential linkage_potential(const Fragment& fragment,
-                                   const std::vector<std::string>& alleles_a,
-                                   const std::vector<std::string>& alleles_b,
-                                   const std::string& context,
-                                   const std::string& lflank, const std::string& rflank,
-                                   const InsertPrior& ip, double max_divergence,
-                                   double log_eps, double log_1meps, double log_p_bg) {
-    LinkagePotential out;
-    out.log_p_bg = log_p_bg;
-    out.n_a = alleles_a.size();
-    out.n_b = alleles_b.size();
-    if (out.n_a == 0 || out.n_b == 0 || fragment.r1.empty() || fragment.r2.empty()) return out;
-    out.mass.assign(out.n_a * out.n_b, kNegInf);
-    out.exposure.assign(out.n_a * out.n_b, 0.0);
+LinkageGeometry build_linkage_geometry(const std::vector<CandidateFrame>& frames,
+                                       const std::vector<std::vector<std::string>>& block_alleles,
+                                       std::uint32_t block_a, std::uint32_t block_b,
+                                       std::size_t flank_bp, const InsertPrior& ip) {
+    LinkageGeometry g;
+    g.block_a = block_a; g.block_b = block_b; g.flank_bp = flank_bp;
+    if (frames.empty() || block_a >= block_alleles.size() || block_b >= block_alleles.size()) {
+        g.refusal = "block index out of range";
+        return g;
+    }
+    // Walk range of a block within one candidate's frame, from the VERIFIED map. Derived here once
+    // so no consumer re-implements block geometry.
+    const auto span = [&](std::size_t h, std::uint32_t b, std::size_t& lo, std::size_t& hi) {
+        const CandidateFrame& F = frames[h];
+        bool seen = false;
+        for (std::size_t k = 0; k < F.block_at.size(); ++k) {
+            if (F.block_at[k] != b) continue;
+            const std::size_t s0 = F.offsets[k];
+            const std::size_t s1 = (k + 1 < F.offsets.size()) ? F.offsets[k + 1] : F.seq.size();
+            if (!seen) { lo = s0; hi = s1; seen = true; }
+            else { lo = std::min(lo, s0); hi = std::max(hi, s1); }
+        }
+        return seen;
+    };
+    std::size_t alo = 0, ahi = 0, blo = 0, bhi = 0;
+    if (!span(0, block_a, alo, ahi) || !span(0, block_b, blo, bhi)) {
+        g.refusal = "block absent from the reference candidate's map";
+        return g;
+    }
+    if (ahi > blo) { g.refusal = "blocks overlap or are out of order"; return g; }
+    const std::string& w0 = frames[0].seq;
+    g.context = w0.substr(ahi, blo - ahi);
+    const std::size_t l0 = alo > flank_bp ? alo - flank_bp : 0;
+    const std::size_t r1 = std::min(w0.size(), bhi + flank_bp);
+    g.lflank = w0.substr(l0, alo - l0);
+    g.rflank = w0.substr(bhi, r1 - bhi);
+    // THE CONTEXT AND FLANKS MUST AGREE ACROSS EVERY CANDIDATE. Where they do not, this edge is not
+    // representable by a pairwise factor and is REFUSED. Guessing one candidate's context would let
+    // the factor express a preference that belongs to a block outside it.
+    for (std::size_t h = 1; h < frames.size(); ++h) {
+        std::size_t a2 = 0, a3 = 0, b2 = 0, b3 = 0;
+        if (!span(h, block_a, a2, a3) || !span(h, block_b, b2, b3)) {
+            g.refusal = "block absent from candidate " + std::to_string(h); return g;
+        }
+        if (a3 > b2) { g.refusal = "blocks out of order on candidate " + std::to_string(h); return g; }
+        const std::string& wh = frames[h].seq;
+        if (wh.substr(a3, b2 - a3) != g.context) {
+            g.refusal = "intervening context differs on candidate " + std::to_string(h); return g;
+        }
+        const std::size_t h0 = a2 > flank_bp ? a2 - flank_bp : 0;
+        const std::size_t h1 = std::min(wh.size(), b3 + flank_bp);
+        if (wh.substr(h0, a2 - h0) != g.lflank || wh.substr(b3, h1 - b3) != g.rflank) {
+            g.refusal = "flank differs on candidate " + std::to_string(h); return g;
+        }
+    }
+    g.alleles_a = block_alleles[block_a];
+    g.alleles_b = block_alleles[block_b];
+    const std::size_t na = g.alleles_a.size(), nb = g.alleles_b.size();
+    if (na == 0 || nb == 0) { g.refusal = "a block offers no allele"; return g; }
+    // EXPOSURE, ONCE PER CONFIGURATION, on the edge. Exact in both regimes; the affine surrogate is
+    // only recorded so the cancellation claim stays auditable.
+    g.window_len.assign(na * nb, 0);
+    g.exposure.assign(na * nb, 0.0);
+    bool affine = true;
+    for (std::size_t al = 0; al < na; ++al) {
+        for (std::size_t be = 0; be < nb; ++be) {
+            const std::size_t idx = al * nb + be;
+            g.window_len[idx] = g.lflank.size() + g.alleles_a[al].size() + g.context.size() +
+                                g.alleles_b[be].size() + g.rflank.size();
+            const ExposureCheck ec = check_exposure(g.window_len[idx], ip);
+            g.exposure[idx] = ec.exact;
+            if (!ec.in_regime) affine = false;
+        }
+    }
+    g.exposure_affine = affine;
+    g.ok = true;
+    return g;
+}
 
-    // The background floor arrives from the caller on the SAME definition fragment_contribution
-    // uses, so a phase contrast is floored exactly as a genotype contrast is. It stays inside the
-    // mixture the edge forms; it is not a term that cancels.
+LinkageEmission linkage_emission(const Fragment& fragment, const LinkageGeometry& geom,
+                                 const InsertPrior& ip, double max_divergence,
+                                 double log_eps, double log_1meps, double log_p_bg) {
+    LinkageEmission out;
+    out.log_p_bg = log_p_bg;
+    if (!geom.ok || fragment.r1.empty() || fragment.r2.empty()) return out;
+    out.n_a = geom.alleles_a.size();
+    out.n_b = geom.alleles_b.size();
+    out.mass.assign(out.n_a * out.n_b, kNegInf);
     const std::size_t d1 = mate_band_edits(max_divergence, fragment.r1.size());
     const std::size_t d2 = mate_band_edits(max_divergence, fragment.r2.size());
     const std::string a1 = reverse_complement(fragment.r1);
     const std::string a2 = reverse_complement(fragment.r2);
-    const double log_half_strand = std::log(0.5);
-    out.min_window = std::numeric_limits<std::size_t>::max();
-    bool affine_all = true;
-
+    const double half = std::log(0.5);
     for (std::size_t al = 0; al < out.n_a; ++al) {
         for (std::size_t be = 0; be < out.n_b; ++be) {
-            // ONE WINDOW PER CONFIGURATION, built the same way every time: only the two alleles
-            // differ, so nothing about the flanks or the context can express a preference.
-            const std::string win = lflank + alleles_a[al] + context + alleles_b[be] + rflank;
-            const std::size_t idx = al * out.n_b + be;
-            out.min_window = std::min(out.min_window, win.size());
-            const ExposureCheck ec = check_exposure(win.size(), ip);
-            // EXACT, always. Correct in both regimes; the affine surrogate is only recorded.
-            out.exposure[idx] = ec.exact;
-            if (!ec.in_regime) affine_all = false;
+            const std::string win = geom.lflank + geom.alleles_a[al] + geom.context +
+                                    geom.alleles_b[be] + geom.rflank;
             const auto f1 = bounded_mate_placements(fragment.r1, win, d1, nullptr, nullptr);
             const auto v1 = bounded_mate_placements(a1, win, d1, nullptr, nullptr);
             const auto f2 = bounded_mate_placements(fragment.r2, win, d2, nullptr, nullptr);
@@ -4177,14 +4237,103 @@ LinkagePotential linkage_potential(const Fragment& fragment,
                                   static_cast<double>(fragment.r1.size() - z.m1_edits) * log_1meps;
                 const double e2 = static_cast<double>(z.m2_edits) * log_eps +
                                   static_cast<double>(fragment.r2.size() - z.m2_edits) * log_1meps;
-                m = log_add(m, log_half_strand + e1 + e2 + ip.log_at(z.insert));
+                m = log_add(m, half + e1 + e2 + ip.log_at(z.insert));
             }
-            out.mass[idx] = m;
+            out.mass[al * out.n_b + be] = m;
         }
     }
-    out.exposure_affine = affine_all;
+    // INFORMATIVE means the mass varies with the COMBINATION, not merely with one endpoint. A
+    // fragment reaching a distinguishing position in only one block spans the junction yet says
+    // nothing about phase: measured at 16 of 116 on the phase fixture.
+    for (std::size_t al = 0; al < out.n_a && !out.informative; ++al) {
+        for (std::size_t be = 1; be < out.n_b; ++be) {
+            const double d = out.mass[al * out.n_b + be] - out.mass[al * out.n_b];
+            if (!(std::abs(d) < 1e-12) &&
+                !(out.mass[al * out.n_b + be] == kNegInf && out.mass[al * out.n_b] == kNegInf)) {
+                out.informative = true; break;
+            }
+        }
+    }
+    if (out.informative) {
+        // ...and it must vary with A too, or it is a one-endpoint signal that the unary already owns.
+        bool varies_a = false;
+        for (std::size_t be = 0; be < out.n_b && !varies_a; ++be) {
+            for (std::size_t al = 1; al < out.n_a; ++al) {
+                const double d = out.mass[al * out.n_b + be] - out.mass[be];
+                if (!(std::abs(d) < 1e-12) &&
+                    !(out.mass[al * out.n_b + be] == kNegInf && out.mass[be] == kNegInf)) {
+                    varies_a = true; break;
+                }
+            }
+        }
+        out.informative = varies_a;
+    }
     out.ok = true;
     return out;
+}
+
+LinkageEdge aggregate_linkage_edge(const std::vector<LinkageEmission>& emissions,
+                                   const LinkageGeometry& geom, double lambda,
+                                   double log_mix, double log_bg_weight) {
+    LinkageEdge E;
+    if (!geom.ok) return E;
+    E.block_a = geom.block_a; E.block_b = geom.block_b;
+    E.n_a = geom.alleles_a.size(); E.n_b = geom.alleles_b.size();
+    const std::size_t na = E.n_a, nb = E.n_b, ncfg = na * nb * na * nb;
+    E.score.assign(ncfg, 0.0);
+    E.log_psi.assign(ncfg, 0.0);
+    E.n_fragments = emissions.size();
+    for (const LinkageEmission& m : emissions) if (m.informative) ++E.n_informative;
+    const double log_lambda = std::log(lambda);
+    // S_e: the two homologues combined ONCE, background mixed ONCE, summed over fragments, and
+    // exposure charged ONCE for the edge -- outside the fragment loop, from the geometry.
+    for (std::size_t a1 = 0; a1 < na; ++a1)
+    for (std::size_t b1 = 0; b1 < nb; ++b1)
+    for (std::size_t a2 = 0; a2 < na; ++a2)
+    for (std::size_t b2 = 0; b2 < nb; ++b2) {
+        const std::size_t c = ((a1 * nb + b1) * na + a2) * nb + b2;
+        double acc = 0.0;
+        for (const LinkageEmission& m : emissions) {
+            if (!m.ok) continue;
+            const double m1 = m.mass[a1 * nb + b1];
+            const double m2 = m.mass[a2 * nb + b2];
+            double sig = kNegInf;
+            if (m1 != kNegInf) sig = m1;
+            if (m2 != kNegInf) sig = (sig == kNegInf) ? m2 : log_add(sig, m2);
+            if (sig != kNegInf) sig += log_mix + log_lambda;
+            const double bg = log_bg_weight + m.log_p_bg;
+            acc += (sig == kNegInf) ? bg : log_add(sig, bg);
+        }
+        acc -= lambda * (geom.exposure[a1 * nb + b1] + geom.exposure[a2 * nb + b2]);
+        E.score[c] = acc;
+    }
+    // PHASE ONLY: remove the baseline WITHIN each unordered-content class, so psi is a conditional
+    // distribution over phase given endpoint content and adds nothing to content ranking. Done after
+    // aggregation, never per fragment -- per-fragment normalisation would let each fragment choose
+    // its own configuration, which is the mosaic error one level down.
+    std::vector<char> done(ncfg, 0);
+    for (std::size_t a1 = 0; a1 < na; ++a1)
+    for (std::size_t b1 = 0; b1 < nb; ++b1)
+    for (std::size_t a2 = 0; a2 < na; ++a2)
+    for (std::size_t b2 = 0; b2 < nb; ++b2) {
+        const std::size_t c = ((a1 * nb + b1) * na + a2) * nb + b2;
+        if (done[c]) continue;
+        // The class sharing this unordered endpoint content: the same {a1,a2} at A and {b1,b2} at B,
+        // over both pairings and both homologue orders.
+        std::vector<std::size_t> cls;
+        const std::size_t A[2] = {a1, a2}, Bb[2] = {b1, b2};
+        for (int p = 0; p < 2; ++p) for (int q = 0; q < 2; ++q) {
+            const std::size_t x1 = A[p], y1 = Bb[q], x2 = A[1 - p], y2 = Bb[1 - q];
+            cls.push_back(((x1 * nb + y1) * na + x2) * nb + y2);
+        }
+        std::sort(cls.begin(), cls.end());
+        cls.erase(std::unique(cls.begin(), cls.end()), cls.end());
+        double lse = kNegInf;
+        for (std::size_t k : cls) lse = log_add(lse, E.score[k]);
+        for (std::size_t k : cls) { E.log_psi[k] = E.score[k] - lse; done[k] = 1; }
+    }
+    E.ok = true;
+    return E;
 }
 
 OwnershipLedger ownership_ledger(const std::vector<FragmentOwner>& owners) {

@@ -17,6 +17,7 @@
 #include <atomic>
 #include <cstdio>
 #include <sstream>
+#include <map>
 #include <mutex>
 #include <chrono>
 #include <cmath>
@@ -1176,70 +1177,56 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         // data rather than trusted: the background must stay inside the mixture, and exposure must
         // be exact rather than assumed to cancel.
         if (!linkage_potential_out.empty()) {
-            // Walk range of a block within one candidate's frame, from the verified map.
-            const auto block_span = [&](std::size_t h, std::uint32_t b,
-                                        std::size_t& lo, std::size_t& hi) -> bool {
-                const CandidateFrame& F = frames[h];
-                bool seen = false;
-                for (std::size_t k = 0; k < F.block_at.size(); ++k) {
-                    if (F.block_at[k] != b) continue;
-                    const std::size_t s0 = F.offsets[k];
-                    const std::size_t s1 = (k + 1 < F.offsets.size()) ? F.offsets[k + 1]
-                                                                     : F.seq.size();
-                    if (!seen) { lo = s0; hi = s1; seen = true; }
-                    else { lo = std::min(lo, s0); hi = std::max(hi, s1); }
-                }
-                return seen;
-            };
+            // GEOMETRY COMES FROM THE SHARED BUILDER. Window, context and flank construction lives
+            // in build_linkage_geometry() and nowhere else -- duplicating it here would force the
+            // genotype command to re-derive the same rule, which is the pattern that produced the
+            // earlier block-coordinate defects.
+            std::vector<std::vector<std::string>> ballele(blocks.size());
+            for (std::size_t b = 0; b < blocks.size(); ++b) ballele[b] = blocks[b].allele_seq;
             const std::size_t FLANK = static_cast<std::size_t>(ip_o.hi);
+            const double lam_o = hopt.haploid_depth > 0.0 ? hopt.haploid_depth : 0.05;
+            const double mix = std::log1p(-opt.outlier_mix), bgw = std::log(opt.outlier_mix);
+
+            // Group edge-owned fragments by the edge they own.
+            std::map<std::pair<std::uint32_t, std::uint32_t>, std::vector<std::size_t>> by_edge;
+            for (std::size_t fi = 0; fi < ofr.size(); ++fi) {
+                if (owners[fi].kind != OwnerKind::Linkage) continue;
+                by_edge[{owners[fi].block_lo, owners[fi].block_hi}].push_back(fi);
+            }
             std::ofstream lp(linkage_potential_out);
             if (!lp) throw std::runtime_error("genotype-frag: cannot write " + linkage_potential_out);
             lp.precision(10);
             lp << "fragment\tblock_a\tblock_b\tn_a\tn_b\tmin_window\texposure_affine"
-                  "\tcis_with_bg\tcis_no_bg\tbg_effect\tflanks_agree\n";
+                  "\tcis_with_bg\tcis_no_bg\tbg_effect\tinformative\n";
+            const std::string ep = linkage_potential_out + ".edges.tsv";
+            std::ofstream ef(ep);
+            if (!ef) throw std::runtime_error("genotype-frag: cannot write " + ep);
+            ef.precision(10);
+            ef << "block_a\tblock_b\tn_a\tn_b\tfragments\tinformative\tconfigs"
+                  "\texposure_affine\tpsi_sum_in_class\tbest_phase_config\tmax_phase_spread\tswap_asymmetry\n";
             std::size_t emitted = 0, refused = 0;
-            for (std::size_t fi = 0; fi < ofr.size(); ++fi) {
-                if (owners[fi].kind != OwnerKind::Linkage) continue;
-                const std::uint32_t A = owners[fi].block_lo, B = owners[fi].block_hi;
-                std::size_t alo = 0, ahi = 0, blo = 0, bhi = 0;
-                if (!block_span(0, A, alo, ahi) || !block_span(0, B, blo, bhi)) { ++refused; continue; }
-                if (ahi > blo) { ++refused; continue; }
-                const std::string& w0 = frames[0].seq;
-                const std::string context = w0.substr(ahi, blo - ahi);
-                const std::size_t l0 = alo > FLANK ? alo - FLANK : 0;
-                const std::size_t r1 = std::min(w0.size(), bhi + FLANK);
-                const std::string lflank = w0.substr(l0, alo - l0);
-                const std::string rflank = w0.substr(bhi, r1 - bhi);
-                // THE FLANKS MUST AGREE ACROSS CANDIDATES. Where they do not, this fragment is not
-                // representable by a pairwise factor over (A, B) and is REFUSED, not guessed.
-                bool agree = true;
-                for (std::size_t h = 1; h < frames.size() && agree; ++h) {
-                    std::size_t a2 = 0, a3 = 0, b2 = 0, b3 = 0;
-                    if (!block_span(h, A, a2, a3) || !block_span(h, B, b2, b3)) { agree = false; break; }
-                    const std::string& wh = frames[h].seq;
-                    if (a3 > b2) { agree = false; break; }
-                    if (wh.substr(a3, b2 - a3) != context) { agree = false; break; }
-                    const std::size_t h0 = a2 > FLANK ? a2 - FLANK : 0;
-                    const std::size_t h1 = std::min(wh.size(), b3 + FLANK);
-                    if (wh.substr(h0, a2 - h0) != lflank || wh.substr(b3, h1 - b3) != rflank) {
-                        agree = false;
-                    }
+            for (const auto& kv : by_edge) {
+                const LinkageGeometry geom = build_linkage_geometry(
+                    frames, ballele, kv.first.first, kv.first.second, FLANK, ip_o);
+                if (!geom.ok) {
+                    refused += kv.second.size();
+                    log.info("edge " + std::to_string(kv.first.first) + "-" +
+                             std::to_string(kv.first.second) + " refused: " + geom.refusal);
+                    continue;
                 }
-                if (!agree) { ++refused; continue; }
-                const std::size_t len = ofr[fi].bases();
-                const std::size_t be = static_cast<std::size_t>(opt.bg_divergence *
-                                                                static_cast<double>(len));
-                const double bgf = static_cast<double>(be) * lep_o +
-                                   static_cast<double>(len - be) * l1m_o;
-                const LinkagePotential P = linkage_potential(
-                    ofr[fi], blocks[A].allele_seq, blocks[B].allele_seq, context, lflank, rflank,
-                    ip_o, opt.max_divergence, lep_o, l1m_o, bgf);
-                if (!P.ok || P.n_a < 2 || P.n_b < 2) { ++refused; continue; }
-                // The cis/trans contrast this fragment supplies, WITH the background inside the
-                // mixture and WITHOUT it, so the gate can see that dropping it changes the answer.
-                const double lam_o = hopt.haploid_depth > 0.0 ? hopt.haploid_depth : 0.05;
-                const double lam = std::log(lam_o), mix = std::log1p(-opt.outlier_mix);
-                const double bgw = std::log(opt.outlier_mix);
+                std::vector<LinkageEmission> ems;
+                ems.reserve(kv.second.size());
+                for (std::size_t fi : kv.second) {
+                    const std::size_t len = ofr[fi].bases();
+                    const std::size_t be = static_cast<std::size_t>(opt.bg_divergence *
+                                                                    static_cast<double>(len));
+                    const double bgf = static_cast<double>(be) * lep_o +
+                                       static_cast<double>(len - be) * l1m_o;
+                    ems.push_back(linkage_emission(ofr[fi], geom, ip_o, opt.max_divergence,
+                                                   lep_o, l1m_o, bgf));
+                }
+                const LinkageEdge E = aggregate_linkage_edge(ems, geom, lam_o, mix, bgw);
+                // Per-fragment contrast, with and without the background, so its role stays visible.
                 const auto ladd = [](double x, double y) {
                     const double ninf = -std::numeric_limits<double>::infinity();
                     if (x == ninf) return y;
@@ -1247,34 +1234,94 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                     const double m = std::max(x, y);
                     return m + std::log1p(std::exp(-std::abs(x - y)));
                 };
-                const auto conf = [&](std::size_t a1, std::size_t b1, std::size_t a2i,
-                                      std::size_t b2i, bool with_bg) {
-                    const double m1 = P.mass[a1 * P.n_b + b1];
-                    const double m2 = P.mass[a2i * P.n_b + b2i];
-                    double sig = -std::numeric_limits<double>::infinity();
-                    if (m1 != -std::numeric_limits<double>::infinity()) sig = m1;
-                    if (m2 != -std::numeric_limits<double>::infinity()) {
-                        sig = (sig == -std::numeric_limits<double>::infinity())
-                                  ? m2 : ladd(sig, m2);
+                for (std::size_t k = 0; k < ems.size(); ++k) {
+                    const LinkageEmission& m = ems[k];
+                    if (!m.ok || m.n_a < 2 || m.n_b < 2) { ++refused; continue; }
+                    const auto conf = [&](std::size_t x1, std::size_t y1, std::size_t x2,
+                                          std::size_t y2, bool with_bg) {
+                        const double ninf = -std::numeric_limits<double>::infinity();
+                        const double p = m.mass[x1 * m.n_b + y1], q = m.mass[x2 * m.n_b + y2];
+                        double sig = ninf;
+                        if (p != ninf) sig = p;
+                        if (q != ninf) sig = (sig == ninf) ? q : ladd(sig, q);
+                        if (sig != ninf) sig += mix + std::log(lam_o);
+                        if (!with_bg) return sig;
+                        return (sig == ninf) ? (bgw + m.log_p_bg) : ladd(sig, bgw + m.log_p_bg);
+                    };
+                    const double cb = conf(0,0,1,1,true)  - conf(0,1,1,0,true);
+                    const double cn = conf(0,0,1,1,false) - conf(0,1,1,0,false);
+                    std::size_t wmin = std::numeric_limits<std::size_t>::max();
+                    for (std::size_t w : geom.window_len) wmin = std::min(wmin, w);
+                    lp << ofr[kv.second[k]].name << '\t' << geom.block_a << '\t' << geom.block_b
+                       << '\t' << m.n_a << '\t' << m.n_b << '\t' << wmin << '\t'
+                       << (geom.exposure_affine ? 1 : 0) << '\t' << cb << '\t' << cn << '\t'
+                       << (cn - cb) << '\t' << (m.informative ? 1 : 0) << '\n';
+                    ++emitted;
+                }
+                // EDGE LEVEL: psi must be a conditional distribution over phase within each
+                // unordered-content class, so each class's psi sums to 1. Reported, not assumed.
+                double worst = 0.0, swap_asym = 0.0;
+                std::size_t bestc = 0; double bestv = -1e300;   // SPREAD within a class, not level
+                {
+                    const std::size_t na = E.n_a, nb = E.n_b;
+                    std::vector<char> seen(E.log_psi.size(), 0);
+                    for (std::size_t a1 = 0; a1 < na; ++a1)
+                    for (std::size_t b1 = 0; b1 < nb; ++b1)
+                    for (std::size_t a2 = 0; a2 < na; ++a2)
+                    for (std::size_t b2 = 0; b2 < nb; ++b2) {
+                        const std::size_t c = ((a1*nb + b1)*na + a2)*nb + b2;
+                        if (seen[c]) continue;
+                        const std::size_t A2[2] = {a1, a2}, B2[2] = {b1, b2};
+                        std::vector<std::size_t> cls;
+                        for (int q1 = 0; q1 < 2; ++q1) for (int q2 = 0; q2 < 2; ++q2) {
+                            cls.push_back(((A2[q1]*nb + B2[q2])*na + A2[1-q1])*nb + B2[1-q2]);
+                        }
+                        std::sort(cls.begin(), cls.end());
+                        cls.erase(std::unique(cls.begin(), cls.end()), cls.end());
+                        double sum = 0.0;
+                        for (std::size_t z : cls) { sum += std::exp(E.log_psi[z]); seen[z] = 1; }
+                        worst = std::max(worst, std::abs(sum - 1.0));
+                        // THE PHASE SPREAD WITHIN A CLASS is the only thing psi can say. A class
+                        // with one configuration has none by construction -- a homozygous endpoint
+                        // has no phase to choose -- so reporting the global best log_psi would
+                        // report 0 from a degenerate class and look like a decided edge.
+                        if (cls.size() > 1) {
+                            double hi = -1e300, lo2 = 1e300;
+                            for (std::size_t z : cls) {
+                                hi = std::max(hi, E.log_psi[z]);
+                                lo2 = std::min(lo2, E.log_psi[z]);
+                            }
+                            if (hi - lo2 > bestv) {
+                                bestv = hi - lo2;
+                                for (std::size_t z : cls) if (E.log_psi[z] == hi) bestc = z;
+                            }
+                        }
                     }
-                    if (sig != -std::numeric_limits<double>::infinity()) sig += mix + lam;
-                    if (!with_bg) return sig;
-                    return (sig == -std::numeric_limits<double>::infinity())
-                               ? (bgw + P.log_p_bg) : ladd(sig, bgw + P.log_p_bg);
-                };
-                const double cis_bg  = conf(0, 0, 1, 1, true)  - conf(0, 1, 1, 0, true);
-                const double cis_nbg = conf(0, 0, 1, 1, false) - conf(0, 1, 1, 0, false);
-                lp << ofr[fi].name << '\t' << A << '\t' << B << '\t' << P.n_a << '\t' << P.n_b
-                   << '\t' << P.min_window << '\t' << (P.exposure_affine ? 1 : 0)
-                   << '\t' << cis_bg << '\t' << cis_nbg << '\t' << (cis_nbg - cis_bg)
-                   << '\t' << 1 << '\n';
-                ++emitted;
+                    if (bestv < -1e299) bestv = 0.0;
+                    // GLOBAL HOMOLOGUE SWAP must leave psi unchanged: (a1,b1,a2,b2) and
+                    // (a2,b2,a1,b1) are the same diploid state written two ways. Any asymmetry here
+                    // means the ordered state leaked into the potential, and the caller would then
+                    // prefer one labelling of the same genotype.
+                    for (std::size_t a1 = 0; a1 < na; ++a1)
+                    for (std::size_t b1 = 0; b1 < nb; ++b1)
+                    for (std::size_t a2 = 0; a2 < na; ++a2)
+                    for (std::size_t b2 = 0; b2 < nb; ++b2) {
+                        const std::size_t c  = ((a1*nb + b1)*na + a2)*nb + b2;
+                        const std::size_t cs = ((a2*nb + b2)*na + a1)*nb + b1;
+                        swap_asym = std::max(swap_asym, std::abs(E.log_psi[c] - E.log_psi[cs]));
+                    }
+                }
+                ef << geom.block_a << '\t' << geom.block_b << '\t' << E.n_a << '\t' << E.n_b
+                   << '\t' << E.n_fragments << '\t' << E.n_informative << '\t'
+                   << E.log_psi.size() << '\t' << (geom.exposure_affine ? 1 : 0) << '\t'
+                   << worst << '\t' << bestc << '\t' << bestv << '\t'
+                   << swap_asym << '\n';
             }
-            lp.flush();
-            log.info("linkage potentials: " + std::to_string(emitted) + " emitted, " +
-                     std::to_string(refused) + " refused (flanks or context differ across "
-                     "candidates -- not representable by a pairwise factor)");
-            log.wrote({linkage_potential_out});
+            lp.flush(); ef.flush();
+            log.info("linkage: " + std::to_string(by_edge.size()) + " edge(s), " +
+                     std::to_string(emitted) + " fragment emissions, " +
+                     std::to_string(refused) + " refused");
+            log.wrote({linkage_potential_out, ep});
         }
 
         const OwnershipLedger led = ownership_ledger(owners);

@@ -1723,29 +1723,79 @@ OwnershipLedger ownership_ledger(const std::vector<FragmentOwner>& owners);
 // allele can drop a window below it. Using the exact value is correct in both regimes and needs no
 // precondition; `exposure_affine` records whether the regime happened to hold, so the claim stays
 // auditable instead of assumed.
-struct LinkagePotential {
-    std::uint32_t block_a = 0, block_b = 0;    // the two VARIABLE blocks this edge joins
+// ONE FRAGMENT'S HAPLOID EMISSION TABLE. This is NOT psi: it is the raw m_f(alpha, beta) a single
+// homologue would produce. The edge potential still has to combine the two homologues once, mix the
+// background once, sum over every fragment owned by the edge, charge exposure once, and only then
+// remove the content baseline. LinkageEdge below does that; nothing here may be used as a factor.
+struct LinkageEmission {
     std::size_t n_a = 0, n_b = 0;              // allele counts at A and B
     std::vector<double> mass;                  // [alpha * n_b + beta] -> log placement mass m
-    std::vector<double> exposure;              // [alpha * n_b + beta] -> EXACT window exposure
     // This fragment's own background, SUPPLIED BY THE CALLER on the same definition
     // fragment_contribution uses (bg_divergence over the fragment's length). It is not derivable
     // here -- bg_divergence is not a parameter of this function -- and inventing a floor locally
     // would silently give phase contrasts a different floor from genotype contrasts.
     double log_p_bg = 0.0;
-    std::size_t min_window = 0;
-    bool exposure_affine = false;              // did every window clear the insert support?
-    bool ok = false;                           // false: flanks disagree; refuse, do not guess
+    bool informative = false;   // mass actually varies with the (alpha, beta) COMBINATION
+    bool ok = false;
 };
 
-// `context` is the fixed sequence between A and B, `lflank`/`rflank` the verified invariant flanks.
-LinkagePotential linkage_potential(const Fragment& fragment,
-                                   const std::vector<std::string>& alleles_a,
-                                   const std::vector<std::string>& alleles_b,
-                                   const std::string& context,
-                                   const std::string& lflank, const std::string& rflank,
-                                   const InsertPrior& ip, double max_divergence,
-                                   double log_eps, double log_1meps, double log_p_bg);
+// THE SHARED GEOMETRY. Window, context and flank construction lives HERE and nowhere else. It was
+// briefly inlined in the genotype-frag diagnostic, which would have forced the genotype command to
+// re-derive the same rule -- duplicated geometry is precisely the pattern that produced the earlier
+// block-coordinate defects, and the reason build_candidate_frame became the single authority.
+struct LinkageGeometry {
+    std::uint32_t block_a = 0, block_b = 0;
+    std::vector<std::string> alleles_a, alleles_b;
+    std::string context, lflank, rflank;
+    std::size_t flank_bp = 0;
+    // Every window's length, [alpha * n_b + beta]. EXPOSURE LIVES ON THE EDGE, not on a fragment:
+    // it is charged once per configuration, and a per-fragment copy makes accidental multiplication
+    // by the fragment count easy however loudly the comments forbid it.
+    std::vector<std::size_t> window_len;
+    std::vector<double> exposure;              // EXACT per configuration, computed once
+    bool exposure_affine = false;
+    bool ok = false;   // false: flanks or context differ across candidates -- refuse, never guess
+    std::string refusal;
+};
+
+LinkageGeometry build_linkage_geometry(const std::vector<CandidateFrame>& frames,
+                                       const std::vector<std::vector<std::string>>& block_alleles,
+                                       std::uint32_t block_a, std::uint32_t block_b,
+                                       std::size_t flank_bp, const InsertPrior& ip);
+
+LinkageEmission linkage_emission(const Fragment& fragment, const LinkageGeometry& geom,
+                                 const InsertPrior& ip, double max_divergence,
+                                 double log_eps, double log_1meps, double log_p_bg);
+
+// THE EDGE POTENTIAL, aggregated in the one order that is a diploid likelihood:
+//
+//   S_e(config) = SUM_f log[(1-eta)*lambda*(m_f(a1,b1) + m_f(a2,b2)) + eta*P_bg,f]
+//                 - lambda*(E(a1,b1) + E(a2,b2))
+//
+// combine the two homologues ONCE, mix the background ONCE, sum over fragments, charge exposure
+// ONCE for the edge. Then the phase-only factor is
+//
+//   log psi_e(config) = S_e(config) - logsumexp over configurations with the SAME UNORDERED content
+//
+// so psi is a conditional distribution over phase given endpoint content and contributes nothing to
+// content ranking. NORMALISING PER FRAGMENT WOULD BE A DIFFERENT MODEL: it would let each fragment
+// pick its own phase configuration independently, which is the mosaic error excluded at the
+// diplotype level, reappearing one level down.
+struct LinkageEdge {
+    std::uint32_t block_a = 0, block_b = 0;
+    std::size_t n_a = 0, n_b = 0;
+    std::size_t n_fragments = 0;     // owned by this edge
+    std::size_t n_informative = 0;   // ...whose emission varies with the combination: the real
+                                     // evidence entering psi. The rest consume normalisation only.
+    // Indexed [((a1 * n_b + b1) * n_a + a2) * n_b + b2].
+    std::vector<double> score;       // S_e, the full diploid edge score
+    std::vector<double> log_psi;     // phase-only, baseline removed within each content class
+    bool ok = false;
+};
+
+LinkageEdge aggregate_linkage_edge(const std::vector<LinkageEmission>& emissions,
+                                   const LinkageGeometry& geom, double lambda,
+                                   double log_mix, double log_bg_weight);
 
 void write_ownership_table(const std::string& path,
                            const std::vector<Fragment>& fragments,

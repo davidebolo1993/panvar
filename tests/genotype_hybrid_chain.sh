@@ -44,7 +44,10 @@
 #   6. an intervening VARIABLE block gives a three-variable factor, never a cropped pair; [ACTIVE]
 #   7. the exposure precondition holds, and is measured rather than assumed;             [ACTIVE]
 #   8. every ownership class is accounted, and its mass share reported;                  [ACTIVE]
-#   9. the linkage potential keeps its background inside the mixture and its exposure exact; [ACTIVE]
+#   9. the linkage EMISSION keeps its background inside the mixture, exposure exact;      [ACTIVE]
+#  10. psi is formed by edge-level diploid aggregation, sums to 1 per content class, and is
+#      invariant under a global homologue swap;                                           [ACTIVE]
+#  11. a three-allele fixture pins the indexing a 0/1 fixture cannot reach;                [ACTIVE]
 #   9. ambiguous evidence yields an equivalence set or UNRESOLVED, never a confident guess.
 #
 # NORMALISATION is settled in genotype_fragments.hpp. Linkage is a CONDITIONAL PHASE SCORE, and TWO
@@ -387,6 +390,126 @@ PYEOF6
   fails=$(( fails + $? ))
 else
   bad "no linkage potentials written"
+fi
+
+# GATE 10: EDGE-LEVEL AGGREGATION. psi is formed only AFTER the two homologues are combined once,
+# the background mixed once, every owned fragment summed, and exposure charged once for the edge.
+# Normalising per fragment would let each fragment pick its own phase configuration -- the mosaic
+# error excluded at the diplotype level, reappearing one level down.
+if [ -s "$OUT/lpot.tsv.edges.tsv" ]; then
+  "$PY" - "$OUT/lpot.tsv.edges.tsv" "$OUT/lpot.tsv" <<'PYEOF7'
+import sys
+rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[1])][1:]
+frs  = [l.rstrip("\n").split("\t") for l in open(sys.argv[2])][1:]
+bad = 0
+def ok(m): print("  ok   " + m)
+def no(m):
+    global bad; bad += 1; print("  FAIL " + m)
+if not rows: no("no linkage edge aggregated"); sys.exit(1)
+for r in rows:
+    na, nb = int(r[2]), int(r[3])
+    nfrag, ninf, ncfg = int(r[4]), int(r[5]), int(r[6])
+    psisum, spread, swap = float(r[8]), float(r[10]), float(r[11])
+    tag = "edge %s-%s" % (r[0], r[1])
+    if ncfg == na*nb*na*nb: ok("%s: %d configurations over %dx%d alleles" % (tag, ncfg, na, nb))
+    else: no("%s: %d configurations, expected %d" % (tag, ncfg, na*nb*na*nb))
+    # psi is a conditional distribution over phase GIVEN endpoint content, so it must sum to 1
+    # within each unordered-content class and contribute nothing to content ranking.
+    if psisum < 1e-9: ok("%s: psi sums to 1 within every content class (worst dev %.2e)" % (tag, psisum))
+    else: no("%s: psi deviates from 1 by %.2e within a content class" % (tag, psisum))
+    # GLOBAL HOMOLOGUE SWAP: (a1,b1,a2,b2) and (a2,b2,a1,b1) are one diploid state written twice.
+    if swap < 1e-9: ok("%s: global homologue swap leaves psi unchanged (%.2e)" % (tag, swap))
+    else: no("%s: swapping the homologues changes psi by %.4g -- ordered state leaked in" % (tag, swap))
+    if spread > 0.0: ok("%s: phase is decided, spread %.1f nats within a content class" % (tag, spread))
+    else: no("%s: psi is flat -- the edge decides no phase at all" % tag)
+    # BOTH COUNTS. Edge-owned is what leaves the unaries; phase-informative is what actually enters
+    # psi. Reporting only the first overstates the evidence the factor carries.
+    ok("%s: %d fragments edge-owned, %d phase-informative (%.0f%%)"
+       % (tag, nfrag, ninf, 100.0*ninf/nfrag if nfrag else 0.0))
+# The per-fragment informative flag must agree with the edge's count -- two paths, one answer.
+finf = sum(1 for r in frs if r[10] == "1")
+einf = sum(int(r[5]) for r in rows)
+if finf == einf: ok("per-fragment and edge-level informative counts agree (%d)" % finf)
+else: no("per-fragment informative %d, edge-level %d" % (finf, einf))
+sys.exit(bad)
+PYEOF7
+  fails=$(( fails + $? ))
+else
+  bad "no edge aggregate written"
+fi
+
+# GATE 11: THREE ALLELES PER BLOCK. The 2-allele fixture exercises only the 0/1 cis-trans pair, so
+# an indexing defect touching allele 2 or above would pass unseen -- and real blocks have hundreds.
+# The sample's true haplotypes are DELIBERATELY absent from the panel: the factor must express a
+# combination no single panel haplotype carries, which is the point of factorising at all.
+"$PY" - "$OUT" <<'PYEOF8'
+import sys, random
+out = sys.argv[1]; B = "ACGT"
+def seq(n, s):
+    r = random.Random(s); return "".join(r.choice(B) for _ in range(n))
+def mut(s, k, sd):
+    r = random.Random(sd); s = list(s)
+    for p in r.sample(range(len(s)), k): s[p] = r.choice([c for c in B if c != s[p]])
+    return "".join(s)
+X = seq(4000,1); J = seq(40,4); Z = seq(4000,7)
+A1 = seq(600,2); A2 = mut(A1,90,3); A3 = mut(A1,90,31)
+B1 = seq(600,5); B2 = mut(B1,90,6); B3 = mut(B1,90,61)
+segs = [("1",X),("2",A1),("3",A2),("4",A3),("5",J),("6",B1),("7",B2),("8",B3),("9",Z)]
+links = [("1","2"),("1","3"),("1","4"),("2","5"),("3","5"),("4","5"),
+         ("5","6"),("5","7"),("5","8"),("6","9"),("7","9"),("8","9")]
+paths = {"hap1":["1","2","5","6","9"],"hap2":["1","3","5","7","9"],"hap3":["1","4","5","8","9"]}
+d = dict(segs)
+with open(out+"/a3.gfa","w") as g:
+    g.write("H\tVN:Z:1.0\n")
+    for n,x in segs: g.write("S\t%s\t%s\n"%(n,x))
+    for a,b in links: g.write("L\t%s\t+\t%s\t+\t0M\n"%(a,b))
+    for n,st in paths.items(): g.write("P\t%s\t%s\t*\n"%(n,",".join(x+"+" for x in st)))
+comp = {"A":"T","C":"G","G":"C","T":"A"}
+truth = {"tA3B2": X+A3+J+B2+Z, "tA2B3": X+A2+J+B3+Z}
+with open(out+"/a3.r1.fq","w") as f1, open(out+"/a3.r2.fq","w") as f2:
+    k = 0
+    for nm,h in truth.items():
+        for i in range(0,len(h)-360,6):
+            a = h[i:i+150]; b = h[i+200:i+350]
+            if len(b) < 150: break
+            rc = "".join(comp[c] for c in reversed(b))
+            f1.write("@%s_%d/1\n%s\n+\n%s\n"%(nm,k,a,"I"*150))
+            f2.write("@%s_%d/2\n%s\n+\n%s\n"%(nm,k,rc,"I"*150))
+            k += 1
+PYEOF8
+"$BIN" bubble -i "$OUT/a3.gfa" -r hap1 -o "$OUT/a3b" --min-variant-bp 0 -q >/dev/null 2>&1
+"$BIN" genotype-frag -i "$OUT/a3b.sorted.gfa" -b "$OUT/a3b" -o "$OUT/a3o" \
+  -R "$OUT/a3.r1.fq" -R "$OUT/a3.r2.fq" -t 2 --max-divergence 0.05 --fragment-len 350 \
+  --fragment-sd 50 --error-rate 0.001 --ownership-table "$OUT/a3.own.tsv" \
+  --linkage-potential "$OUT/a3.lpot.tsv" -q >/dev/null 2>&1
+if [ -s "$OUT/a3.lpot.tsv.edges.tsv" ]; then
+  "$PY" - "$OUT/a3.lpot.tsv.edges.tsv" <<'PYEOF9'
+import sys
+rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[1])][1:]
+bad = 0
+def ok(m): print("  ok   " + m)
+def no(m):
+    global bad; bad += 1; print("  FAIL " + m)
+if not rows: no("3-allele fixture produced no edge"); sys.exit(1)
+r = rows[0]; na, nb = int(r[2]), int(r[3])
+if na >= 3 and nb >= 3: ok("3-allele fixture: %dx%d alleles, %s configurations" % (na, nb, r[6]))
+else: no("3-allele fixture collapsed to %dx%d alleles" % (na, nb))
+# The truth is (A3,B2)+(A2,B3) = allele indices (2,1) and (1,2), so the winning configuration must
+# be a1=2,b1=1,a2=1,b2=2 (or its global swap). Decoding it pins the INDEXING, which a 2-allele
+# fixture cannot: index 2 is used at both blocks.
+best = int(r[9])
+b2 = best % nb; t = best // nb; a2 = t % na; t //= na; b1 = t % nb; a1 = t // nb
+got = ((a1,b1),(a2,b2)); want = {((2,1),(1,2)), ((1,2),(2,1))}
+if got in want: ok("3-allele fixture recovers the true phase (a1=%d,b1=%d | a2=%d,b2=%d), using "
+                   "allele index 2 at both blocks" % (a1,b1,a2,b2))
+else: no("3-allele fixture chose (a1=%d,b1=%d | a2=%d,b2=%d); truth is (2,1)|(1,2)" % (a1,b1,a2,b2))
+if float(r[11]) < 1e-9: ok("3-allele fixture: swap symmetry holds (%.2e)" % float(r[11]))
+else: no("3-allele fixture: swap asymmetry %.4g" % float(r[11]))
+sys.exit(bad)
+PYEOF9
+  fails=$(( fails + $? ))
+else
+  bad "3-allele fixture produced no edge aggregate"
 fi
 
 # ---------------------------------------------------------------------------------------------
