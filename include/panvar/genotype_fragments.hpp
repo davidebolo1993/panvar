@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <tuple>
 #include <vector>
 
@@ -1146,6 +1147,29 @@ struct SearchWork {
     bool exhaustive_fallback = false;    // piece too short to filter; scanned every start
 };
 
+// REUSABLE UNCAPPED OCCURRENCE INDEX over one haplotype at one piece length.
+//
+// Without it, bounded_mate_placements locates each piece with hap.find(piece, pos) in a loop, which
+// RESCANS the whole haplotype per piece: at 9 pieces x 2 mates x 2 strands that is ~36 full scans of
+// a 226 kb sequence per fragment-candidate cell. Measured: ~72 ms per cell, which is 20 hours for
+// 23953 fragments x 131 candidates and is why the full-panel run did not finish in 12 hours. The
+// index is built ONCE per (haplotype, piece length) and reused across every fragment.
+//
+// EVERY occurrence is retained -- no cap, no top-k. A capped index would destroy exactly the
+// copy-number information the multiplicity gates exist to protect.
+struct PieceIndex {
+    std::size_t piece = 0;
+    std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> at;
+    bool usable() const { return piece > 0 && !at.empty(); }
+};
+PieceIndex build_piece_index(const std::string& hap, std::size_t piece);
+
+// Same contract as the un-indexed overload; `idx` must have been built over `hap` at the piece
+// length this call would use, or it is ignored.
+std::vector<MatePlacement> bounded_mate_placements(
+    const std::string& read, const std::string& hap, std::size_t max_edits, SearchWork* work,
+    const PieceIndex* idx);
+
 std::vector<MatePlacement> bounded_mate_placements(
     const std::string& read, const std::string& hap, std::size_t max_edits, SearchWork* work);
 
@@ -1277,12 +1301,16 @@ struct TailInterval {
     bool upper_monotone = true;      // upper never increases as D grows
     bool inband_stable = true;       // mass at the PRODUCTION band d is unchanged at every D
     double inband_at_d = 0.0;        // that production-band mass, for reporting
+    // Whether the FIRST iteration -- D = d, the production band -- found any state. Reported here so
+    // callers do not recompute the production band separately, which doubled the dominant loop.
+    bool depth1_nonempty = false;
 };
 
 TailInterval adaptive_tail_interval(const std::string& r1, const std::string& r2,
                                     const std::string& hap, std::size_t d1, std::size_t d2,
                                     const InsertPrior& ip, double log_eps, double log_1meps,
-                                    double tolerance_nats, std::size_t max_depth_mult);
+                                    double tolerance_nats, std::size_t max_depth_mult,
+                                    const PieceIndex* idx = nullptr);
 
 double omitted_mass_bound(std::size_t hap_len, std::size_t m1_len, std::size_t m2_len,
                           std::size_t d1, std::size_t d2, const InsertPrior& ip,

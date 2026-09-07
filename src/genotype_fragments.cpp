@@ -3171,7 +3171,8 @@ EditClass edit_class_mass(const std::vector<FragmentState>& states,
 TailInterval adaptive_tail_interval(const std::string& r1, const std::string& r2,
                                     const std::string& hap, std::size_t d1, std::size_t d2,
                                     const InsertPrior& ip, double log_eps, double log_1meps,
-                                    double tolerance_nats, std::size_t max_depth_mult) {
+                                    double tolerance_nats, std::size_t max_depth_mult,
+                                    const PieceIndex* idx) {
     TailInterval out;
     const std::string r1rc = reverse_complement(r1);
     const std::string r2rc = reverse_complement(r2);
@@ -3180,10 +3181,10 @@ TailInterval adaptive_tail_interval(const std::string& r1, const std::string& r2
     bool have_inband = false;
     for (std::size_t mult = 1; mult <= std::max<std::size_t>(1, max_depth_mult); ++mult) {
         const std::size_t D1 = d1 * mult, D2 = d2 * mult;
-        const auto f1 = bounded_mate_placements(r1, hap, D1, nullptr);
-        const auto v1 = bounded_mate_placements(r1rc, hap, D1, nullptr);
-        const auto f2 = bounded_mate_placements(r2, hap, D2, nullptr);
-        const auto v2 = bounded_mate_placements(r2rc, hap, D2, nullptr);
+        const auto f1 = bounded_mate_placements(r1, hap, D1, nullptr, idx);
+        const auto v1 = bounded_mate_placements(r1rc, hap, D1, nullptr, idx);
+        const auto f2 = bounded_mate_placements(r2, hap, D2, nullptr, idx);
+        const auto v2 = bounded_mate_placements(r2rc, hap, D2, nullptr, idx);
         const auto st = enumerate_fragment_states(0, f1, v1, f2, v2, r1.size(), r2.size(),
                                                   ip.lo, ip.hi);
         const double m = fragment_states_mass(st, r1.size(), r2.size(), ip, log_eps, log_1meps);
@@ -3211,6 +3212,7 @@ TailInterval adaptive_tail_interval(const std::string& r1, const std::string& r2
         if (prev_upper != std::numeric_limits<double>::infinity() && up != kNegInf &&
             up > prev_upper + 1e-9) out.upper_monotone = false;
         prev_lower = m; prev_upper = up;
+        if (mult == 1) out.depth1_nonempty = !st.empty();
         out.lower = m; out.upper = up; out.bound = b;
         out.depth = mult; out.states = st.size();
         const double width = (up == kNegInf || m == kNegInf) ? std::numeric_limits<double>::infinity()
@@ -3295,6 +3297,84 @@ std::vector<MatePlacement> exhaustive_mate_placements(const std::string& read,
             out.push_back({static_cast<long>(st), static_cast<std::uint32_t>(mism)});
         }
     }
+    return out;
+}
+
+namespace {
+inline std::uint64_t encode_piece_at(const std::string& t, std::size_t at, std::size_t P) {
+    std::uint64_t code = 0;
+    for (std::size_t i = 0; i < P; ++i) {
+        int b;
+        switch (t[at + i]) {
+            case 'A': case 'a': b = 0; break;
+            case 'C': case 'c': b = 1; break;
+            case 'G': case 'g': b = 2; break;
+            case 'T': case 't': b = 3; break;
+            default: return ~0ull;          // ambiguous: proposes nothing
+        }
+        code = (code << 2) | static_cast<std::uint64_t>(b);
+    }
+    return code;
+}
+}  // namespace
+
+PieceIndex build_piece_index(const std::string& hap, std::size_t piece) {
+    PieceIndex ix;
+    if (piece == 0 || piece > 31 || hap.size() < piece) return ix;
+    ix.piece = piece;
+    ix.at.reserve(hap.size() * 2);
+    for (std::size_t i = 0; i + piece <= hap.size(); ++i) {
+        const std::uint64_t c = encode_piece_at(hap, i, piece);
+        if (c == ~0ull) continue;
+        ix.at[c].push_back(static_cast<std::uint32_t>(i));
+    }
+    return ix;
+}
+
+std::vector<MatePlacement> bounded_mate_placements(const std::string& read, const std::string& hap,
+                                                   std::size_t max_edits, SearchWork* work,
+                                                   const PieceIndex* idx) {
+    SearchWork w;
+    std::vector<MatePlacement> out;
+    if (read.empty() || hap.size() < read.size()) { if (work) *work = w; return out; }
+    if (max_edits >= read.size()) return bounded_mate_placements(read, hap, max_edits, work);
+    const std::size_t npieces = max_edits + 1;
+    const std::size_t P = read.size() / npieces;
+    constexpr std::size_t kMinPiece = 12;
+    const bool ambiguous = read.find_first_not_of("ACGTacgt") != std::string::npos;
+    if (P < kMinPiece || ambiguous || idx == nullptr || !idx->usable() || idx->piece != P) {
+        return bounded_mate_placements(read, hap, max_edits, work);   // same answer, slower path
+    }
+    w.pieces = npieces;
+    std::vector<long> proposals;
+    for (std::size_t pi = 0; pi < npieces; ++pi) {
+        const std::size_t at = pi * P;
+        const std::uint64_t c = encode_piece_at(read, at, P);
+        if (c == ~0ull) continue;
+        const auto it = idx->at.find(c);
+        if (it == idx->at.end()) continue;
+        for (const std::uint32_t pos : it->second) {
+            const long st = static_cast<long>(pos) - static_cast<long>(at);
+            if (st >= 0 && st + static_cast<long>(read.size()) <= static_cast<long>(hap.size())) {
+                proposals.push_back(st);
+                ++w.candidate_starts;
+            }
+        }
+    }
+    std::sort(proposals.begin(), proposals.end());
+    proposals.erase(std::unique(proposals.begin(), proposals.end()), proposals.end());
+    w.distinct_starts = proposals.size();
+    for (const long st : proposals) {
+        ++w.verified;
+        std::size_t mism = 0;
+        for (std::size_t i = 0; i < read.size() && mism <= max_edits; ++i) {
+            if (read[i] != hap[static_cast<std::size_t>(st) + i]) ++mism;
+        }
+        if (mism <= max_edits) out.push_back({st, static_cast<std::uint32_t>(mism)});
+    }
+    std::sort(out.begin(), out.end());
+    w.accepted = out.size();
+    if (work) *work = w;
     return out;
 }
 

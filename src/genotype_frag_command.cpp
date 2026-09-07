@@ -14,6 +14,7 @@
 #include "panvar/syncmer.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <fstream>
@@ -1083,6 +1084,23 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         // Measured: two c4 fragments differ between the two, placing on the truth-equivalent
         // haplotype ~100 nats down, reachable only at D = 4d. They contribute 0.00 to the swing.
         std::vector<std::vector<char>> PB(ifr.size(), std::vector<char>(nc, 0));
+        // ONE INDEX PER CANDIDATE, built once and reused across all fragments. The piece length is
+        // read.size()/(d+1) and reads here are uniform, so a single length covers the run; a
+        // fragment whose length differs falls back to the scanning path, which returns the same
+        // placements.
+        std::size_t idx_piece = 0;
+        for (const Fragment& F : ifr) {
+            if (F.r1.empty()) continue;
+            idx_piece = F.r1.size() / (mate_band_edits(opt.max_divergence, F.r1.size()) + 1);
+            break;
+        }
+        std::vector<PieceIndex> pidx(nc);
+        if (idx_piece >= 12) {
+            for (std::size_t h = 0; h < nc; ++h) pidx[h] = build_piece_index(iseqs[h], idx_piece);
+            log.info("piece index: " + std::to_string(nc) + " candidates at " +
+                     std::to_string(idx_piece) + " bp");
+        }
+        std::atomic<std::size_t> done_frags{0};
         std::vector<std::size_t> depth_hist(8, 0);
         std::size_t refined_cells = 0, tol_ok_cells = 0;
         const auto t0 = std::chrono::steady_clock::now();
@@ -1095,16 +1113,22 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             for (std::size_t h = 0; h < nc; ++h) {
                 // At the PRODUCTION band only -- no deepening. This is what the original audit
                 // classified on.
-                const auto pst = enumerate_fragment_states(static_cast<std::uint32_t>(h),
-                    bounded_mate_placements(F.r1, iseqs[h], d1, nullptr),
-                    bounded_mate_placements(a1, iseqs[h], d1, nullptr),
-                    bounded_mate_placements(F.r2, iseqs[h], d2, nullptr),
-                    bounded_mate_placements(a2, iseqs[h], d2, nullptr),
-                    F.r1.size(), F.r2.size(), ip_i.lo, ip_i.hi);
-                PB[fi][h] = pst.empty() ? 0 : 1;
+                // The adaptive tail's FIRST iteration uses D = d1*1 = d1, which is exactly the
+                // production band. Computing PB separately did that work twice per cell -- a
+                // straight 2x on the dominant loop. adaptive_tail_interval now reports whether its
+                // depth-1 state set was non-empty, so the production-band answer comes free.
+                const PieceIndex* ix = pidx.empty() ? nullptr : &pidx[h];
                 const TailInterval ti = adaptive_tail_interval(F.r1, F.r2, iseqs[h], d1, d2, ip_i,
-                                                               lep_i, l1m_i, interval_tol, 4);
+                                                               lep_i, l1m_i, interval_tol, 4, ix);
+                PB[fi][h] = ti.depth1_nonempty ? 1 : 0;
                 M[fi][h] = MassInterval{ti.lower, ti.upper};
+            }
+            // PROGRESS, so a long run is observable and can be judged rather than waited out. The
+            // full-panel run emitted nothing for 12 hours and was killed with no partial result.
+            const std::size_t n = ++done_frags;
+            if ((n % 2000) == 0) {
+                log.info("interval-score: " + std::to_string(n) + " / " +
+                         std::to_string(ifr.size()) + " fragments");
             }
         });
         for (std::size_t fi = 0; fi < ifr.size(); ++fi) {
