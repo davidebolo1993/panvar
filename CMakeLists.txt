@@ -361,6 +361,17 @@ if(PANVAR_BUILD_TESTING)
         # registered now so nobody can add --bounded-search without this running. It reports SKIP
         # (77) until the entry point exists, and FAILS if the entry point appears without its
         # assertions -- the one outcome it must never do is pass by having a condition weakened.
+        # Stop/resume equivalence for the interval scorer. A full-panel run was killed after 13.5
+        # hours having produced nothing, because output was written only at the end.
+        set(PANVAR_INTERVAL_CKPT ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_interval_checkpoint.sh)
+        if(EXISTS ${PANVAR_INTERVAL_CKPT} AND PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE)
+            add_test(
+                NAME panvar_genotype_interval_checkpoint
+                COMMAND /usr/bin/env bash ${PANVAR_INTERVAL_CKPT} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/genotype_interval_checkpoint
+            )
+            set_tests_properties(panvar_genotype_interval_checkpoint PROPERTIES TIMEOUT 900)
+        endif()
+
         set(PANVAR_BOUNDED_SEARCH ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_bounded_search.sh)
         if(EXISTS ${PANVAR_BOUNDED_SEARCH} AND PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE)
             add_test(

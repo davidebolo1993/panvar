@@ -15,6 +15,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <sstream>
+#include <mutex>
 #include <chrono>
 #include <cmath>
 #include <fstream>
@@ -323,6 +326,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     std::string interval_score, interval_cands;
     double interval_tau = 0.0, interval_tol = 1.0;
     bool interval_contrib = false;
+    std::string interval_ckpt;
+    std::size_t interval_batch = 500;
     std::vector<std::string> reconcile_scope;
     std::string switch_penalties_arg = "0,10,100,1000";
     std::vector<std::string> exact_distance;
@@ -364,6 +369,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--interval-tau") interval_tau = std::stod(value(i, a));
         else if (a == "--interval-tol") interval_tol = std::stod(value(i, a));
         else if (a == "--interval-contrib") interval_contrib = true;
+        else if (a == "--interval-checkpoint") interval_ckpt = value(i, a);
+        else if (a == "--interval-batch") interval_batch = cli::parse_size_arg(a, value(i, a));
         else if (a == "--scope-tol") {
             const std::string sv = value(i, a);
             scope_tol = std::stod(sv);
@@ -1101,12 +1108,93 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                      std::to_string(idx_piece) + " bp");
         }
         std::atomic<std::size_t> done_frags{0};
+
+        // ---- CHECKPOINT / RESUME -----------------------------------------------------------
+        // A multi-hour run that loses everything on interruption is not usable. Results are
+        // checkpointed per fragment BATCH and written atomically (temp + rename), so a kill at any
+        // moment leaves either the previous complete checkpoint or the new one -- never a torn file.
+        //
+        // RESUME IS REFUSED unless the binary, reads, graph, candidate manifest and parameters all
+        // match. Resuming across any of those would silently splice two different computations
+        // together, which is worse than starting over.
+        std::string ck_sig;
+        {
+            std::ostringstream sig;
+            sig << md5_hex(std::string(reinterpret_cast<const char*>(&opt.max_divergence),
+                                       sizeof(double)))
+                << '|' << opt.fragment_len << '|' << opt.fragment_sd << '|' << opt.error_rate
+                << '|' << opt.bg_divergence << '|' << opt.outlier_mix << '|' << lambda_i
+                << '|' << interval_tol << '|' << ifr.size() << '|' << nc << '|';
+            std::string names_cat;
+            for (const std::string& n : inames) names_cat += n + ",";
+            sig << md5_hex(names_cat);
+            std::string seq_cat;
+            for (const std::string& q : iseqs) seq_cat += md5_hex(q);
+            sig << '|' << md5_hex(seq_cat);
+            ck_sig = sig.str();
+        }
+        std::vector<char> frag_done(ifr.size(), 0);
+        std::size_t resumed = 0;
+        if (!interval_ckpt.empty()) {
+            std::ifstream ck(interval_ckpt);
+            if (ck) {
+                std::string line;
+                bool sig_ok = false;
+                if (std::getline(ck, line) && line.rfind("#sig	", 0) == 0) {
+                    sig_ok = (line.substr(5) == ck_sig);
+                }
+                if (!sig_ok) {
+                    log.info("checkpoint present but its signature does not match this run "
+                             "(binary, reads, graph, candidates or parameters differ); starting over");
+                } else {
+                    while (std::getline(ck, line)) {
+                        if (line.empty() || line[0] == '#') continue;
+                        std::istringstream ls(line);
+                        std::size_t fi = 0;
+                        if (!(ls >> fi) || fi >= ifr.size()) continue;
+                        bool ok = true;
+                        for (std::size_t h = 0; h < nc; ++h) {
+                            double lo = 0, up = 0; int pb = 0;
+                            if (!(ls >> lo >> up >> pb)) { ok = false; break; }
+                            M[fi][h] = MassInterval{lo, up};
+                            PB[fi][h] = static_cast<char>(pb);
+                        }
+                        if (ok) { frag_done[fi] = 1; ++resumed; }
+                    }
+                    log.info("resumed " + std::to_string(resumed) + " of " +
+                             std::to_string(ifr.size()) + " fragments from the checkpoint");
+                }
+            }
+        }
+        std::mutex ck_mu;
+        std::vector<std::size_t> pending;
+        auto ck_flush = [&]() {
+            if (interval_ckpt.empty()) return;
+            const std::string tmp = interval_ckpt + ".tmp";
+            std::ofstream out(tmp, std::ios::trunc);
+            if (!out) return;
+            out.precision(17);
+            out << "#sig\t" << ck_sig << '\n';
+            for (std::size_t fi = 0; fi < ifr.size(); ++fi) {
+                if (!frag_done[fi]) continue;
+                out << fi;
+                for (std::size_t h = 0; h < nc; ++h) {
+                    out << ' ' << M[fi][h].lower << ' ' << M[fi][h].upper
+                        << ' ' << static_cast<int>(PB[fi][h]);
+                }
+                out << '\n';
+            }
+            out.flush();
+            if (out) { out.close(); std::rename(tmp.c_str(), interval_ckpt.c_str()); }
+        };
+        auto hb_last = std::chrono::steady_clock::now();
         std::vector<std::size_t> depth_hist(8, 0);
         std::size_t refined_cells = 0, tol_ok_cells = 0;
         const auto t0 = std::chrono::steady_clock::now();
         run_parallel(ifr.size(), opt.threads, [&](std::size_t fi) {
             const Fragment& F = ifr[fi];
-            if (F.r1.empty() || F.r2.empty()) return;
+            if (F.r1.empty() || F.r2.empty()) { frag_done[fi] = 1; return; }
+            if (frag_done[fi]) return;                       // already in the checkpoint
             const std::size_t d1 = mate_band_edits(opt.max_divergence, F.r1.size());
             const std::size_t d2 = mate_band_edits(opt.max_divergence, F.r2.size());
             const std::string a1 = reverse_complement(F.r1), a2 = reverse_complement(F.r2);
@@ -1125,12 +1213,34 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             }
             // PROGRESS, so a long run is observable and can be judged rather than waited out. The
             // full-panel run emitted nothing for 12 hours and was killed with no partial result.
+            frag_done[fi] = 1;
             const std::size_t n = ++done_frags;
-            if ((n % 2000) == 0) {
-                log.info("interval-score: " + std::to_string(n) + " / " +
-                         std::to_string(ifr.size()) + " fragments");
+            // TIME-BASED HEARTBEAT plus a batched atomic checkpoint. A count-based line alone can go
+            // quiet for a long time when cells are slow, which is exactly when progress matters.
+            {
+                std::lock_guard<std::mutex> lk(ck_mu);
+                pending.push_back(fi);
+                const auto now = std::chrono::steady_clock::now();
+                const bool due_time =
+                    std::chrono::duration<double>(now - hb_last).count() >= 60.0;
+                const bool due_batch = pending.size() >= interval_batch;
+                if (due_time || due_batch) {
+                    ck_flush();
+                    pending.clear();
+                    hb_last = now;
+                    log.info("interval-score: " + std::to_string(n + resumed) + " / " +
+                             std::to_string(ifr.size()) + " fragments" +
+                             (interval_ckpt.empty() ? "" : " (checkpointed)"));
+                }
             }
         });
+        {
+            std::lock_guard<std::mutex> lk(ck_mu);
+            ck_flush();
+        }
+        // INCOMPLETE if any fragment is unfinished: an interrupted run must never be interpreted.
+        std::size_t unfinished = 0;
+        for (std::size_t fi = 0; fi < ifr.size(); ++fi) if (!frag_done[fi]) ++unfinished;
         for (std::size_t fi = 0; fi < ifr.size(); ++fi) {
             for (std::size_t h = 0; h < nc; ++h) {
                 if (M[fi][h].lower != M[fi][h].upper) ++refined_cells; else ++tol_ok_cells;
@@ -1238,7 +1348,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         const double robust_gap = classes[leader].lower - worst_other_upper;
         // THREE OUTCOMES, and the third must not be reported as biological ambiguity. A run stopped
         // by the depth cap with intervals still overlapping is UNFINISHED, not unresolved.
-        const Verdict vd = verdict_of(classes, cert, interval_tol);
+        Verdict vd = verdict_of(classes, cert, interval_tol);
+        if (unfinished > 0) vd = Verdict::Incomplete;
         const char* verdict = verdict_name(vd);
         const bool all_tight = (vd != Verdict::Incomplete);
         isf << "# robust_leader\t" << clabel[leader] << '\n';
@@ -1251,6 +1362,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         isf << "# all_plausible_tight\t" << (all_tight ? 1 : 0) << '\n';
         isf << "# interval_tol\t" << interval_tol << '\n';
         isf << "# fragments\t" << ifr.size() << '\n';
+        isf << "# unfinished\t" << unfinished << '\n';
+        isf << "# resumed\t" << resumed << '\n';
         isf << "# candidates\t" << nc << '\n';
         isf << "# diplotypes\t" << classes.size() << '\n';
         isf << "# cells_widened\t" << refined_cells << '\n';
