@@ -3984,12 +3984,14 @@ const char* owner_kind_name(OwnerKind k) {
         case OwnerKind::Unary:    return "unary";
         case OwnerKind::Linkage:  return "linkage";
         case OwnerKind::Wide:     return "wide";
+        case OwnerKind::Invariant: return "invariant";
         default:                  return "unusable";
     }
 }
 
 FragmentOwner assign_fragment_owner(const Fragment& fragment,
                                     const std::vector<CandidateFrame>& frames,
+                                    const std::vector<char>& block_variable,
                                     const InsertPrior& ip, double max_divergence,
                                     double log_eps, double log_1meps, double scope_tol,
                                     const std::vector<PieceIndex>* pidx) {
@@ -4082,11 +4084,28 @@ FragmentOwner assign_fragment_owner(const Fragment& fragment,
         out.kind = OwnerKind::Unusable;
         return out;
     }
-    out.block_lo = sc.front();
-    out.block_hi = sc.back();
-    if (sc.size() == 1) out.kind = OwnerKind::Unary;
-    else if (sc.size() == 2 && sc[1] == sc[0] + 1) out.kind = OwnerKind::Linkage;
-    else out.kind = OwnerKind::Wide;
+
+    // ARITY COMES FROM THE VARIABLE BLOCKS ONLY. A block whose sequence is identical across every
+    // candidate carries no genotype state, so spanning it costs no arity: it enters the factor as
+    // sequence context. Counting physical blocks instead would make a bubble--backbone--bubble
+    // fragment Wide and throw away most of the real linkage evidence at any locus whose bubbles
+    // have reference sequence between them, which is most of them.
+    for (std::uint32_t b : sc) {
+        if (b < block_variable.size() && block_variable[b]) out.var_scope.push_back(b);
+    }
+    if (out.var_scope.empty()) {
+        // No genotype dependence at all. Still owned, because it still carries depth and still
+        // consumes normalisation -- dropping it here would silently unbalance both.
+        out.kind = OwnerKind::Invariant;
+        out.block_lo = sc.front();
+        out.block_hi = sc.back();
+        return out;
+    }
+    out.block_lo = out.var_scope.front();
+    out.block_hi = out.var_scope.back();
+    if (out.var_scope.size() == 1) out.kind = OwnerKind::Unary;
+    else if (out.var_scope.size() == 2) out.kind = OwnerKind::Linkage;
+    else out.kind = OwnerKind::Wide;   // three or more variables; never cropped to a pair
     return out;
 }
 
@@ -4096,12 +4115,16 @@ void write_ownership_table(const std::string& path,
     std::ofstream f(path);
     if (!f) throw std::runtime_error("genotype-frag: cannot write " + path);
     f.precision(10);
-    f << "fragment\towner\tblock_lo\tblock_hi\tscope_size\torigins\tin_band\tomitted_bound"
+    f << "fragment\towner\tblock_lo\tblock_hi\tscope_size\tvar_scope_size\tspan_lo\tspan_hi"
+         "\torigins\tin_band\tomitted_bound"
          "\tunmapped\tdropped_nats\tcertified\n";
     for (std::size_t i = 0; i < owners.size() && i < fragments.size(); ++i) {
         const FragmentOwner& o = owners[i];
         f << fragments[i].name << '\t' << owner_kind_name(o.kind) << '\t'
-          << o.block_lo << '\t' << o.block_hi << '\t' << o.scope.size() << '\t' << o.origins
+          << o.block_lo << '\t' << o.block_hi << '\t' << o.scope.size() << '\t'
+          << o.var_scope.size() << '\t'
+          << (o.scope.empty() ? 0u : o.scope.front()) << '\t'
+          << (o.scope.empty() ? 0u : o.scope.back()) << '\t' << o.origins
           << '\t' << o.in_band << '\t' << o.omitted_bound << '\t' << o.unmapped << '\t'
           << o.dropped << '\t' << (o.certified ? 1 : 0) << '\n';
     }

@@ -1524,13 +1524,33 @@ std::pair<std::uint32_t, std::uint32_t> ordered_block_span(
 // Marker unary factors and fragment linkage factors must NOT count the same read evidence twice, so
 // every fragment is OWNED by exactly one factor:
 //
-//   Unary(b)        certified scope is the single block b -> feeds b's marker unary;
-//   Linkage(b,b+1)  certified scope is two ADJACENT blocks -> feeds their linkage factor ONCE,
-//                   sequence evidence included;
-//   Wide            certified scope is wider, or two non-adjacent blocks -> needs a wider factor.
-//                   It is NEVER cropped into adjacent factors: tests/genotype_frag_factorisation.sh
-//                   already established that cropping deletes real mass;
+//   Unary(A)        depends on ONE variable block A -> feeds A's marker unary;
+//   Linkage(A,B)    depends on TWO variable blocks -> feeds their linkage factor ONCE, sequence
+//                   evidence included;
+//   Wide            depends on THREE OR MORE variable blocks -> needs a wider factor. It is NEVER
+//                   cropped into narrower factors: tests/genotype_frag_factorisation.sh already
+//                   established that cropping deletes real mass;
+//   Invariant       depends on NO variable block. It still carries depth and still consumes
+//                   normalisation, so it is owned rather than discarded, but it supplies no
+//                   genotype evidence to any factor;
 //   Unusable        no certified scope at all, or mass that belongs to no block.
+//
+// ARITY IS COUNTED IN VARIABLE BLOCKS, NOT PHYSICAL BLOCKS CROSSED, and the distinction is not
+// cosmetic -- getting it wrong throws away most of the real linkage evidence, because real bubbles
+// commonly have reference sequence between them. A block whose sequence is IDENTICAL across every
+// candidate carries no genotype state and no phase decision: a fragment spanning
+//
+//     variable A -- fixed backbone -- variable B
+//
+// still defines the pairwise factor psi(A, B). The backbone enters as sequence CONTEXT and nothing
+// more. This is the distinction target-chain ranks and chain_span_sequence() already embodied:
+// invariant intervening sequence is carried through, variable intervening sequence must become an
+// explicit target or a wider factor.
+//
+// A fragment is genuinely Wide only when three or more VARIABLE blocks are involved. An intervening
+// block whose sequence varies is itself variable, so it lands in the variable scope and pushes the
+// arity to three by construction -- there is no separate rule for it, and no way for it to be
+// silently carried as context.
 //
 // Ownership is a PARTITION, which is why "counted twice" and "silently dropped" are one assertion.
 //
@@ -1544,13 +1564,16 @@ std::pair<std::uint32_t, std::uint32_t> ordered_block_span(
 // has an origin in every block and a union-of-spans scope is the whole locus. Inside the production
 // band only real placements survive, and what lies outside it is bounded rather than ignored --
 // so the scope below is certified, with `dropped` reporting exactly what restricting to it costs.
-enum class OwnerKind { Unary, Linkage, Wide, Unusable };
+enum class OwnerKind { Unary, Linkage, Wide, Invariant, Unusable };
 const char* owner_kind_name(OwnerKind k);
 
 struct FragmentOwner {
     OwnerKind kind = OwnerKind::Unusable;
-    std::uint32_t block_lo = 0, block_hi = 0;   // Unary: lo == hi. Linkage: hi == lo + 1.
-    std::vector<std::uint32_t> scope;           // certified, ascending
+    // The VARIABLE blocks the factor is over. Unary: lo == hi. Linkage: lo < hi, and every block
+    // strictly between them is fixed -- they need NOT be physically adjacent.
+    std::uint32_t block_lo = 0, block_hi = 0;
+    std::vector<std::uint32_t> scope;           // physical blocks touched, certified, ascending
+    std::vector<std::uint32_t> var_scope;       // the variable subset; arity comes from THIS
     double in_band = 0.0;         // logsumexp over in-band origins, all candidates
     double omitted_bound = 0.0;   // certified bound on everything outside the band
     double unmapped = 0.0;        // in-band mass belonging to NO block (partial frames)
@@ -1561,8 +1584,37 @@ struct FragmentOwner {
 
 // One fragment's owning factor. `pidx`, when given, is the per-candidate piece index the bounded
 // search uses; it changes speed only.
+// ---------------------------------------------------------------------------------------------
+// NORMALISATION, DECIDED EXPLICITLY. Partitioning the observed fragments does NOT by itself
+// partition the likelihood normalisation: exposure and background are sums over states, including
+// states no fragment occupies, and they can be double-charged or dropped independently of who owns
+// which read.
+//
+// THE CHOICE MADE HERE: linkage is a CONDITIONAL PHASE SCORE, and the exposure term cancels.
+//
+// It cancels EXACTLY, not approximately, and the reason is worth stating because it is what makes
+// the choice safe. exposure(n) = SUM_L pi(L) * max(0, n - L + 1), and for any candidate longer than
+// the insert support every term is positive, so
+//
+//     exposure(n) = n + 1 - E[L]
+//
+// -- affine in length. A junction's competing configurations are phase assignments of the SAME
+// allele multiset: cis = (a1b1, a2b2) against trans = (a1b2, a2b1). Both carry
+// len(a1)+len(a2)+len(b1)+len(b2) in total, so E_a + E_b is identical and the difference is zero by
+// construction rather than by tolerance. The background term is likewise identical: the same
+// fragments are scored in every configuration, each contributing its floor once.
+//
+// WHAT THIS DELIBERATELY AVOIDS: scoring a local junction window with the whole-locus contribution
+// formula. A shorter window has a different exposure, so an absolute score computed that way would
+// carry a length preference that has nothing to do with phase -- the same class of defect as the
+// exposure/length cancellation still open at C4. A ratio over configurations on one fixed window
+// never forms that normaliser at all.
+//
+// `block_variable[b]` is nonzero when block b's sequence differs between candidates. A fixed block
+// is context, never a factor variable.
 FragmentOwner assign_fragment_owner(const Fragment& fragment,
                                     const std::vector<CandidateFrame>& frames,
+                                    const std::vector<char>& block_variable,
                                     const InsertPrior& ip, double max_divergence,
                                     double log_eps, double log_1meps, double scope_tol,
                                     const std::vector<PieceIndex>* pidx = nullptr);

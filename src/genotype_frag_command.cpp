@@ -1108,25 +1108,56 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                 }
             }
         }
+        // WHICH BLOCKS ARE VARIABLES. A block whose sequence is identical across every candidate
+        // holds no genotype state: it is context, and spanning it must not cost a fragment any
+        // factor arity. n_alleles counts DISTINCT SEQUENCES and a bypassing haplotype ALREADY has
+        // an allele of its own in that count, so the test is exactly n_alleles > 1. Adding
+        // `|| bypass_allele >= 0` marked every degenerate flank variable, because an empty block
+        // reports allele 0 as its bypass -- one state, not two.
+        std::vector<char> block_variable(blocks.size(), 0);
+        std::size_t n_var = 0;
+        for (std::size_t b = 0; b < blocks.size(); ++b) {
+            const bool var = blocks[b].n_alleles > 1;
+            block_variable[b] = var ? 1 : 0;
+            if (var) ++n_var;
+        }
+        {
+            const std::string bp = ownership_table + ".blocks.tsv";
+            std::ofstream bf(bp);
+            if (!bf) throw std::runtime_error("genotype-frag: cannot write " + bp);
+            bf << "block\tkind\tn_alleles\tbypass\tvariable\n";
+            for (std::size_t b = 0; b < blocks.size() && b < chain.size(); ++b) {
+                bf << b << '\t' << (chain[b].kind == BlockKind::Bubble ? "bubble" :
+                                    chain[b].kind == BlockKind::Backbone ? "backbone" : "flank")
+                   << '\t' << blocks[b].n_alleles << '\t' << blocks[b].bypass_allele
+                   << '\t' << static_cast<int>(block_variable[b]) << '\n';
+            }
+            bf.flush();
+            log.wrote({bp});
+        }
         std::vector<FragmentOwner> owners(ofr.size());
         run_parallel(ofr.size(), opt.threads, [&](std::size_t fi) {
-            owners[fi] = assign_fragment_owner(ofr[fi], frames, ip_o, opt.max_divergence,
-                                               lep_o, l1m_o, scope_tol,
+            owners[fi] = assign_fragment_owner(ofr[fi], frames, block_variable, ip_o,
+                                               opt.max_divergence, lep_o, l1m_o, scope_tol,
                                                opidx.empty() ? nullptr : &opidx);
         });
-        std::size_t n_un = 0, n_li = 0, n_wi = 0, n_no = 0;
+        std::size_t n_un = 0, n_li = 0, n_wi = 0, n_iv = 0, n_no = 0;
         for (const FragmentOwner& o2 : owners) {
             switch (o2.kind) {
-                case OwnerKind::Unary:   ++n_un; break;
-                case OwnerKind::Linkage: ++n_li; break;
-                case OwnerKind::Wide:    ++n_wi; break;
-                default:                 ++n_no; break;
+                case OwnerKind::Unary:     ++n_un; break;
+                case OwnerKind::Linkage:   ++n_li; break;
+                case OwnerKind::Wide:      ++n_wi; break;
+                case OwnerKind::Invariant: ++n_iv; break;
+                default:                   ++n_no; break;
             }
         }
         write_ownership_table(ownership_table, ofr, owners);
-        log.info("ownership over " + std::to_string(frames.size()) + " candidates: " +
+        log.info("ownership over " + std::to_string(frames.size()) + " candidates, " +
+                 std::to_string(n_var) + " of " + std::to_string(blocks.size()) +
+                 " blocks variable: " +
                  std::to_string(n_un) + " unary, " + std::to_string(n_li) + " linkage, " +
-                 std::to_string(n_wi) + " wide, " + std::to_string(n_no) + " unusable");
+                 std::to_string(n_wi) + " wide, " + std::to_string(n_iv) + " invariant, " +
+                 std::to_string(n_no) + " unusable");
         log.wrote({ownership_table});
         log.done();
         return 0;
