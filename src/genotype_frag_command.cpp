@@ -337,6 +337,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     std::string exposure_probe;
     std::string linkage_potential_out;
     bool linkage_selftest = false;
+    bool hybrid_oracle = false;
     std::vector<std::string> reconcile_scope;
     std::string switch_penalties_arg = "0,10,100,1000";
     std::vector<std::string> exact_distance;
@@ -387,6 +388,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--exposure-probe") exposure_probe = value(i, a);
         else if (a == "--linkage-potential") linkage_potential_out = value(i, a);
         else if (a == "--linkage-selftest") linkage_selftest = true;
+        else if (a == "--hybrid-oracle") hybrid_oracle = true;
         else if (a == "--scope-tol") {
             const std::string sv = value(i, a);
             scope_tol = std::stod(sv);
@@ -647,7 +649,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     // demand.
     if (read_paths.empty() && spell_calls.empty() && !mosaic_floor && dump_sequences.empty() &&
         spell_pair.empty() && ref_block.empty() && ref_block_pair.empty() &&
-        origin_universe.empty() && reconcile_scope.empty() && !linkage_selftest) {
+        origin_universe.empty() && reconcile_scope.empty() && !linkage_selftest &&
+        !hybrid_oracle) {
         throw std::runtime_error("genotype-frag requires at least one --reads");
     }
     if (!bubble_prefix_in.empty()) {
@@ -680,6 +683,109 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     ParseGfaOptions parse_options;
     parse_options.include_paths = true;
     parse_options.include_sequences = true;
+    // ---- HYBRID CHAIN vs BRUTE-FORCE PATH ORACLE ------------------------------------------------
+    // The forward-backward recursion is checked against an independent enumeration of EVERY ordered
+    // diploid state path. That is the only comparison that catches linkage applied at the wrong
+    // edge, either factor applied twice, an accidental transition row-normalisation, an
+    // ordered-state mapping error, or a correct best call resting on wrong posterior mass -- a
+    // best-path comparison catches none of them.
+    //
+    // THE FIXTURE USES 3 HAPLOTYPES BUT 2 ALLELES PER BLOCK, with a deliberately non-identity map
+    // (allele_a = [0,1,1], allele_b = [0,0,1]). If anything ever treats the haplotype index as an
+    // allele index, the tables are the wrong shape and the oracle disagrees immediately.
+    if (hybrid_oracle) {
+        const std::size_t nh = 3, nb = 3, ns = nh * nh;
+        HybridChain ch;
+        ch.n_hap = nh; ch.n_blocks = nb; ch.recomb = 0.10;
+        // Deterministic, asymmetric emissions: nothing here may be symmetric by accident, or a
+        // mapping error could cancel itself.
+        ch.log_emission.assign(nb, std::vector<double>(ns, 0.0));
+        for (std::size_t b = 0; b < nb; ++b) {
+            for (std::size_t i = 0; i < nh; ++i)
+            for (std::size_t j = 0; j < nh; ++j) {
+                ch.log_emission[b][i * nh + j] =
+                    -0.37 * static_cast<double>((b + 1) * (i + 1)) -
+                     0.11 * static_cast<double>((j + 2) * (b + 3)) -
+                     0.05 * static_cast<double>(i * j);
+            }
+        }
+        ch.edges.assign(nb, HybridEdge{});
+        // edges[1]: LINKAGE-FREE. Its transition must remain exactly Li-Stephens.
+        ch.edges[1].has_linkage = false;
+        // edges[2]: an INFORMATIVE linkage edge, built through the real aggregation path so the
+        // oracle sees the same mean-one table the chain does.
+        {
+            LinkageGeometry g;
+            g.block_a = 1; g.block_b = 2;
+            g.alleles_a = {std::string(600, 'A'), std::string(600, 'C')};
+            g.alleles_b = {std::string(600, 'G'), std::string(600, 'T')};
+            g.context = std::string(40, 'A');
+            g.lflank = std::string(600, 'A');
+            g.rflank = std::string(600, 'A');
+            g.window_len.assign(4, 2440);
+            g.exposure.assign(4, 1000.0);
+            g.exposure_affine = true;
+            g.ok = true;
+            LinkageEmission m;
+            m.n_a = 2; m.n_b = 2; m.log_p_bg = -400.0; m.ok = true; m.informative = true;
+            m.mass = {-100.0, -137.0, -142.0, -103.0};
+            const LinkageEdge E = aggregate_linkage_edge({m}, g, 0.05,
+                                                         std::log1p(-0.05), std::log(0.05));
+            if (!E.usable()) { std::fprintf(stderr, "oracle: linkage edge unusable\n"); return 2; }
+            ch.edges[2].has_linkage = true;
+            ch.edges[2].n_a = E.n_a; ch.edges[2].n_b = E.n_b;
+            ch.edges[2].log_psi = E.log_psi;
+            ch.edges[2].allele_a = {0, 1, 1};   // 3 haplotypes -> 2 alleles, NOT the identity
+            ch.edges[2].allele_b = {0, 0, 1};
+        }
+        const HybridPosterior fb = hybrid_forward_backward(ch);
+        const HybridPosterior bf = hybrid_bruteforce(ch);
+        if (!fb.ok || !bf.ok) { std::fprintf(stderr, "oracle: a run failed\n"); return 2; }
+        double worst_marg = 0.0;
+        for (std::size_t b = 0; b < nb; ++b)
+            for (std::size_t s = 0; s < ns; ++s)
+                worst_marg = std::max(worst_marg,
+                                      std::abs(std::exp(fb.log_marginal[b][s]) -
+                                               std::exp(bf.log_marginal[b][s])));
+        // A linkage-FREE control: with every edge plain Li-Stephens the two must still agree, which
+        // separates "the recursion is right" from "the linkage table is right".
+        HybridChain plain = ch;
+        for (auto& e : plain.edges) { e.has_linkage = false; }
+        const HybridPosterior fb0 = hybrid_forward_backward(plain);
+        const HybridPosterior bf0 = hybrid_bruteforce(plain);
+        double worst_marg0 = 0.0;
+        for (std::size_t b = 0; b < nb; ++b)
+            for (std::size_t s = 0; s < ns; ++s)
+                worst_marg0 = std::max(worst_marg0,
+                                       std::abs(std::exp(fb0.log_marginal[b][s]) -
+                                                std::exp(bf0.log_marginal[b][s])));
+        // Marginals must be distributions, and linkage must actually MOVE them, or the comparison
+        // would pass on a chain where the factor does nothing.
+        double worst_sum = 0.0, linkage_effect = 0.0;
+        for (std::size_t b = 0; b < nb; ++b) {
+            double sum = 0.0;
+            for (std::size_t s = 0; s < ns; ++s) {
+                sum += std::exp(fb.log_marginal[b][s]);
+                linkage_effect = std::max(linkage_effect,
+                                          std::abs(std::exp(fb.log_marginal[b][s]) -
+                                                   std::exp(fb0.log_marginal[b][s])));
+            }
+            worst_sum = std::max(worst_sum, std::abs(sum - 1.0));
+        }
+        std::printf("metric\tvalue\n");
+        std::printf("log_partition_fb\t%.17g\n", fb.log_partition);
+        std::printf("log_partition_bruteforce\t%.17g\n", bf.log_partition);
+        std::printf("log_partition_abs_diff\t%.17g\n",
+                    std::abs(fb.log_partition - bf.log_partition));
+        std::printf("worst_marginal_abs_diff\t%.17g\n", worst_marg);
+        std::printf("log_partition_abs_diff_no_linkage\t%.17g\n",
+                    std::abs(fb0.log_partition - bf0.log_partition));
+        std::printf("worst_marginal_abs_diff_no_linkage\t%.17g\n", worst_marg0);
+        std::printf("worst_marginal_sum_dev\t%.17g\n", worst_sum);
+        std::printf("linkage_marginal_effect\t%.17g\n", linkage_effect);
+        return 0;
+    }
+
     // ---- LINKAGE FACTOR SELF-TEST ---------------------------------------------------------------
     // The neutrality property cannot be produced reliably from a read fixture: it needs an edge with
     // NO fragments, and one whose emissions are identical across every configuration. Both are

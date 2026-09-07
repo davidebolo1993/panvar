@@ -51,7 +51,9 @@
 #  12. an edge carrying NO phase information is exactly neutral: zero fragments, flat emissions
 #      or all-unplaced emissions each give an identically zero log factor;                  [ACTIVE]
 #  13. exposure that does not cancel, an unformable emission, and an oversized dense table are each
-#      REFUSED with a status, never truncated or silently skipped.                          [ACTIVE]
+#      REFUSED with a status, never truncated or silently skipped;                          [ACTIVE]
+#  14. forward-backward agrees with a BRUTE-FORCE path oracle on the log partition and on every
+#      block marginal, with a linkage-free control and a non-vacuity check.                 [ACTIVE]
 #   9. ambiguous evidence yields an equivalence set or UNRESOLVED, never a confident guess.
 #
 # NORMALISATION is settled in genotype_fragments.hpp. Linkage is a CONDITIONAL PHASE SCORE, and TWO
@@ -446,6 +448,56 @@ PYEOF7
   fails=$(( fails + $? ))
 else
   bad "no edge aggregate written"
+fi
+
+# GATE 14: THE BRUTE-FORCE PATH ORACLE. Forward-backward is compared against an INDEPENDENT
+# enumeration of every ordered diploid state path, scoring
+#     SUM_b log E_b(s_b) + SUM_b log T_LS(s_{b-1},s_b) + SUM_b log psi_b(s_{b-1},s_b)
+# from scratch. Both the total log partition and every block marginal must agree. A best-path
+# comparison would catch none of: linkage at the wrong edge, either factor applied twice, an
+# accidental transition row-normalisation, an ordered-state mapping error, or a correct best call
+# resting on wrong posterior mass.
+#
+# The oracle does NOT share the recursion's potential helper. Sharing it would make a bug inside
+# that helper move both arms identically and cancel out of the comparison -- the mapping error above
+# all, which is the single place catalogue indices, path identities and ordered homologues can be
+# confused. Measured with the shared helper deliberately restored, all four mutations below are
+# caught: linkage at the wrong edge 0.056, linkage twice 0.106, mapping swapped 0.056, Li-Stephens
+# twice 0.446 nats of log-partition disagreement.
+"$BIN" genotype-frag -i /dev/null -b none -o "$OUT/ho" --hybrid-oracle > "$OUT/oracle.tsv" 2>/dev/null
+if [ -s "$OUT/oracle.tsv" ]; then
+  "$PY" - "$OUT/oracle.tsv" <<'PYEOFB'
+import sys
+d = dict(l.rstrip("\n").split("\t") for l in open(sys.argv[1]) if "\t" in l)
+bad = 0
+def ok(m): print("  ok   " + m)
+def no(m):
+    global bad; bad += 1; print("  FAIL " + m)
+TOL = 1e-9
+for key, label in (("log_partition_abs_diff", "log partition"),
+                   ("worst_marginal_abs_diff", "every block marginal")):
+    v = float(d[key])
+    if v < TOL: ok("%s agrees with the brute-force path oracle (%.2e)" % (label, v))
+    else: no("%s disagrees with the oracle by %.6g" % (label, v))
+# A LINKAGE-FREE control separates "the recursion is right" from "the linkage table is right".
+for key, label in (("log_partition_abs_diff_no_linkage", "log partition"),
+                   ("worst_marginal_abs_diff_no_linkage", "block marginals")):
+    v = float(d[key])
+    if v < TOL: ok("linkage-free control: %s agrees (%.2e)" % (label, v))
+    else: no("linkage-free control: %s disagrees by %.6g" % (label, v))
+sd = float(d["worst_marginal_sum_dev"])
+if sd < 1e-9: ok("block marginals are distributions (worst sum deviation %.2e)" % sd)
+else: no("a block marginal sums to 1 +/- %.4g" % sd)
+# NON-VACUITY: linkage must actually move the posterior, or the agreement above proves only that
+# two implementations of plain Li-Stephens match.
+le = float(d["linkage_marginal_effect"])
+if le > 1e-6: ok("linkage moves the posterior by %.4f -- the comparison is not vacuous" % le)
+else: no("linkage changes the posterior by only %.2e; the oracle asserts nothing about psi" % le)
+sys.exit(bad)
+PYEOFB
+  fails=$(( fails + $? ))
+else
+  bad "hybrid oracle produced no output"
 fi
 
 # GATE 12: NEUTRALITY OF AN UNINFORMATIVE EDGE. This is the assertion that matters most, and it

@@ -4473,3 +4473,147 @@ void write_ownership_table(const std::string& path,
 }
 
 } // namespace panvar
+
+namespace panvar {
+namespace {
+
+// log T_LS for the ordered diploid transition. The two homologues copy independently:
+//   t(i -> i') = (1 - r) * [i == i'] + r / n_hap
+// and T((i,j) -> (i2,j2)) = t(i->i2) * t(j->j2). Written out per pair here rather than using the
+// factorised recursion, because a linkage edge is not separable and the oracle must see exactly the
+// same potential the recursion uses.
+inline double ls_log_t(std::size_t a, std::size_t b, std::size_t nh, double r) {
+    const double v = (a == b ? (1.0 - r) : 0.0) + r / static_cast<double>(nh);
+    return std::log(v);
+}
+
+inline double edge_log_phi(const HybridChain& c, std::size_t b,
+                           std::size_t i, std::size_t j, std::size_t i2, std::size_t j2) {
+    const std::size_t nh = c.n_hap;
+    double lp = ls_log_t(i, i2, nh, c.recomb) + ls_log_t(j, j2, nh, c.recomb);
+    const HybridEdge& e = c.edges[b];
+    if (!e.has_linkage) return lp;
+    // THE MAPPING. Homologue 1 takes (allele at A of i, allele at B of i2); homologue 2 takes
+    // (allele at A of j, allele at B of j2). In that order, no implicit swap.
+    const std::size_t a1 = e.allele_a[i],  b1 = e.allele_b[i2];
+    const std::size_t a2 = e.allele_a[j],  b2 = e.allele_b[j2];
+    const std::size_t cfg = ((a1 * e.n_b + b1) * e.n_a + a2) * e.n_b + b2;
+    return lp + e.log_psi[cfg];
+}
+
+}  // namespace
+
+HybridPosterior hybrid_forward_backward(const HybridChain& c) {
+    HybridPosterior out;
+    const std::size_t nh = c.n_hap, nb = c.n_blocks, ns = nh * nh;
+    if (nh == 0 || nb == 0 || c.log_emission.size() != nb || c.edges.size() != nb) return out;
+
+    std::vector<std::vector<double>> alpha(nb, std::vector<double>(ns, kNegInf));
+    std::vector<std::vector<double>> beta(nb, std::vector<double>(ns, kNegInf));
+    alpha[0] = c.log_emission[0];
+    for (std::size_t b = 1; b < nb; ++b) {
+        for (std::size_t i2 = 0; i2 < nh; ++i2)
+        for (std::size_t j2 = 0; j2 < nh; ++j2) {
+            double acc = kNegInf;
+            for (std::size_t i = 0; i < nh; ++i)
+            for (std::size_t j = 0; j < nh; ++j) {
+                const double a = alpha[b - 1][i * nh + j];
+                if (a == kNegInf) continue;
+                acc = log_add(acc, a + edge_log_phi(c, b, i, j, i2, j2));
+            }
+            const double e = c.log_emission[b][i2 * nh + j2];
+            alpha[b][i2 * nh + j2] = (acc == kNegInf || e == kNegInf) ? kNegInf : acc + e;
+        }
+    }
+    std::fill(beta[nb - 1].begin(), beta[nb - 1].end(), 0.0);
+    for (std::size_t b = nb - 1; b-- > 0;) {
+        for (std::size_t i = 0; i < nh; ++i)
+        for (std::size_t j = 0; j < nh; ++j) {
+            double acc = kNegInf;
+            for (std::size_t i2 = 0; i2 < nh; ++i2)
+            for (std::size_t j2 = 0; j2 < nh; ++j2) {
+                const double e = c.log_emission[b + 1][i2 * nh + j2];
+                const double bt = beta[b + 1][i2 * nh + j2];
+                if (e == kNegInf || bt == kNegInf) continue;
+                acc = log_add(acc, edge_log_phi(c, b + 1, i, j, i2, j2) + e + bt);
+            }
+            beta[b][i * nh + j] = acc;
+        }
+    }
+    double z = kNegInf;
+    for (std::size_t s = 0; s < ns; ++s) z = log_add(z, alpha[nb - 1][s]);
+    out.log_partition = z;
+    out.log_marginal.assign(nb, std::vector<double>(ns, kNegInf));
+    for (std::size_t b = 0; b < nb; ++b) {
+        for (std::size_t s = 0; s < ns; ++s) {
+            const double a = alpha[b][s], bt = beta[b][s];
+            out.log_marginal[b][s] = (a == kNegInf || bt == kNegInf) ? kNegInf : a + bt - z;
+        }
+    }
+    out.ok = true;
+    return out;
+}
+
+HybridPosterior hybrid_bruteforce(const HybridChain& c) {
+    HybridPosterior out;
+    const std::size_t nh = c.n_hap, nb = c.n_blocks, ns = nh * nh;
+    if (nh == 0 || nb == 0 || c.log_emission.size() != nb || c.edges.size() != nb) return out;
+    // ns^nb paths. Fixtures only; refuse rather than hang if someone points it at a real chain.
+    double total_paths = 1.0;
+    for (std::size_t b = 0; b < nb; ++b) total_paths *= static_cast<double>(ns);
+    if (total_paths > 5.0e7) return out;
+
+    out.log_marginal.assign(nb, std::vector<double>(ns, kNegInf));
+    double z = kNegInf;
+    std::vector<std::size_t> path(nb, 0);
+    for (;;) {
+        // Score this path from scratch: emissions at every block, plus one edge potential per edge.
+        // Nothing is reused from the recursion, which is what makes this an independent check.
+        double lp = 0.0;
+        bool dead = false;
+        for (std::size_t b = 0; b < nb && !dead; ++b) {
+            const double e = c.log_emission[b][path[b]];
+            if (e == kNegInf) { dead = true; break; }
+            lp += e;
+        }
+        if (!dead) {
+            for (std::size_t b = 1; b < nb; ++b) {
+                const std::size_t i = path[b - 1] / nh, j = path[b - 1] % nh;
+                const std::size_t i2 = path[b] / nh, j2 = path[b] % nh;
+                // COMPUTED INDEPENDENTLY, not through edge_log_phi. Sharing that helper would make
+                // a bug inside it -- the ordered-state mapping above all -- move both arms
+                // identically and cancel out of the comparison, which is exactly the class of error
+                // this oracle exists to catch.
+                const double r = c.recomb;
+                const double ti = (i == i2 ? (1.0 - r) : 0.0) + r / static_cast<double>(nh);
+                const double tj = (j == j2 ? (1.0 - r) : 0.0) + r / static_cast<double>(nh);
+                lp += std::log(ti) + std::log(tj);
+                const HybridEdge& e = c.edges[b];
+                if (e.has_linkage) {
+                    // Homologue 1: allele of i at the LEFT block, allele of i2 at the RIGHT.
+                    // Homologue 2: allele of j at the LEFT block, allele of j2 at the RIGHT.
+                    const std::size_t h1a = e.allele_a[i],  h1b = e.allele_b[i2];
+                    const std::size_t h2a = e.allele_a[j],  h2b = e.allele_b[j2];
+                    lp += e.log_psi[((h1a * e.n_b + h1b) * e.n_a + h2a) * e.n_b + h2b];
+                }
+            }
+            z = log_add(z, lp);
+            for (std::size_t b = 0; b < nb; ++b) {
+                out.log_marginal[b][path[b]] = log_add(out.log_marginal[b][path[b]], lp);
+            }
+        }
+        std::size_t k = 0;
+        for (; k < nb; ++k) { if (++path[k] < ns) break; path[k] = 0; }
+        if (k == nb) break;
+    }
+    out.log_partition = z;
+    for (std::size_t b = 0; b < nb; ++b) {
+        for (std::size_t s = 0; s < ns; ++s) {
+            if (out.log_marginal[b][s] != kNegInf) out.log_marginal[b][s] -= z;
+        }
+    }
+    out.ok = true;
+    return out;
+}
+
+}  // namespace panvar

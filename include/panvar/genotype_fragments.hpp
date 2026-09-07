@@ -1864,6 +1864,62 @@ struct LinkageEdge {
     bool usable() const { return status == LinkageStatus::Ok; }
 };
 
+// ---------------------------------------------------------------------------------------------
+// FIXTURE-SCALE HYBRID CHAIN. Ordered diploid states over a haplotype panel, with
+//
+//     log phi_b(s, s') = log T_LS(s, s') + log psi_b(s, s')
+//
+// as an UNNORMALISED edge potential. It is never row-normalised: forward-backward normalises its
+// messages globally, and row-normalising T_hybrid would change the model and make the linkage at
+// one edge depend on unrelated outgoing states.
+//
+// THE HIDDEN STATE STAYS ORDERED, (i, j), so phase survives inference. Unordered genotypes are
+// formed only when reporting.
+//
+// THE MAPPING GATED HERE is the one place catalogue indices, path identities and ordered homologues
+// can be confused:
+//
+//     ordered state (i, j) at block A, (i2, j2) at block B
+//       -> allele_a[i], allele_a[j]      (allele index at A, via BlockAlleles::allele_of)
+//       -> allele_b[i2], allele_b[j2]    (allele index at B)
+//       -> config ((a1*n_b + b1)*n_a + a2)*n_b + b2
+//
+// with homologue 1 taking (allele_a[i], allele_b[i2]) and homologue 2 taking (allele_a[j],
+// allele_b[j2]) -- in that order, with no implicit swap. A haplotype that BYPASSES a block must map
+// to that block's bypass_allele, never to -1.
+struct HybridEdge {
+    bool has_linkage = false;
+    std::size_t n_a = 0, n_b = 0;
+    std::vector<std::uint32_t> allele_a;   // per panel haplotype: allele index at the LEFT block
+    std::vector<std::uint32_t> allele_b;   // per panel haplotype: allele index at the RIGHT block
+    std::vector<double> log_psi;           // from LinkageEdge; empty when has_linkage is false
+};
+
+struct HybridChain {
+    std::size_t n_hap = 0;
+    std::size_t n_blocks = 0;
+    double recomb = 0.0;                          // Li-Stephens switch probability r
+    std::vector<std::vector<double>> log_emission; // [block][i * n_hap + j], ordered states
+    std::vector<HybridEdge> edges;                 // edges[b] joins block b-1 to b; edges[0] unused
+};
+
+struct HybridPosterior {
+    double log_partition = 0.0;
+    std::vector<std::vector<double>> log_marginal;  // [block][i * n_hap + j], normalised
+    bool ok = false;
+};
+
+// Forward-backward over the ordered diploid states.
+HybridPosterior hybrid_forward_backward(const HybridChain& chain);
+
+// THE ORACLE. Enumerates EVERY ordered diploid state path and sums
+//   SUM_b log E_b(s_b) + SUM_b log T_LS(s_{b-1}, s_b) + SUM_b log psi_b(s_{b-1}, s_b)
+// independently of the recursion. Exponential in the chain length, so it is for fixtures only --
+// but it is the only check that catches linkage applied at the wrong edge, either factor applied
+// twice, an accidental row-normalisation, an ordered-state mapping error, or a correct best call
+// produced from wrong posterior mass. A best-path comparison alone catches none of those.
+HybridPosterior hybrid_bruteforce(const HybridChain& chain);
+
 // `max_configs` bounds the dense table; 0 means the default. Exceeding it is a REFUSAL.
 LinkageEdge aggregate_linkage_edge(const std::vector<LinkageEmission>& emissions,
                                    const LinkageGeometry& geom, double lambda,
