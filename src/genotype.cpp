@@ -1,5 +1,7 @@
 #include "panvar/genotype.hpp"
 
+#include "panvar/chain_kernel.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -911,56 +913,23 @@ std::vector<BlockCall> genotype_sample(
         compute_emissions(bi, e);
     };
 
-    std::vector<double> e(nh * nh);
-    std::vector<double> beta(nh * nh), rowsum(nh), colsum(nh);
-    auto run_forward = [&]() {
-    block_emissions(0, e);
-    fwd[0] = e;
-    normalize(fwd[0]);
-    for (std::size_t bi = 1; bi < nb; ++bi) {
-        const std::vector<double>& prev = fwd[bi - 1];
-        std::fill(rowsum.begin(), rowsum.end(), 0.0);
-        for (std::size_t i = 0; i < nh; ++i)
-            for (std::size_t j = 0; j < nh; ++j) rowsum[i] += prev[i * nh + j];
-        for (std::size_t i = 0; i < nh; ++i)
-            for (std::size_t j = 0; j < nh; ++j)
-                beta[i * nh + j] = (1.0 - r) * prev[i * nh + j] + (r / nh) * rowsum[i];
-        std::fill(colsum.begin(), colsum.end(), 0.0);
-        for (std::size_t i = 0; i < nh; ++i)
-            for (std::size_t j = 0; j < nh; ++j) colsum[j] += beta[i * nh + j];
-        block_emissions(bi, e);
-        for (std::size_t i = 0; i < nh; ++i)
-            for (std::size_t j = 0; j < nh; ++j)
-                fwd[bi][i * nh + j] = e[i * nh + j] * ((1.0 - r) * beta[i * nh + j] + (r / nh) * colsum[j]);
-        normalize(fwd[bi]);
-    }
+    // ONE INFERENCE KERNEL, shared with the hybrid chain. There were two forward-backward
+    // implementations already; adding a hybrid variant here would have made three, and three
+    // implementations of one recursion is how a factorised branch and a linked branch end up
+    // disagreeing without either looking wrong. chain_forward_backward() carries both edge paths:
+    // the factorised O(n_h^2) arithmetic below is preserved exactly, so the legacy result is
+    // reproduced structurally rather than to a tolerance.
+    ChainKernelStats kernel_stats;
+    std::vector<ChainEdgeLinkage> kernel_edges;   // empty: every edge factorised, legacy behaviour
+    auto run_fb = [&]() {
+        chain_forward_backward(nh, nb, r,
+                               [&](std::size_t bi, std::vector<double>& ev) {
+                                   block_emissions(bi, ev);
+                               },
+                               kernel_edges.empty() ? nullptr : &kernel_edges,
+                               fwd, bwd, &kernel_stats);
     };
-
-    auto run_backward = [&]() {
-    std::fill(bwd[nb - 1].begin(), bwd[nb - 1].end(), 1.0);
-    normalize(bwd[nb - 1]);
-    for (std::size_t bi = nb - 1; bi-- > 0;) {
-        block_emissions(bi + 1, e);
-        std::vector<double> t(nh * nh);
-        for (std::size_t i = 0; i < nh * nh; ++i) t[i] = bwd[bi + 1][i] * e[i];
-        std::fill(rowsum.begin(), rowsum.end(), 0.0);
-        for (std::size_t i = 0; i < nh; ++i)
-            for (std::size_t j = 0; j < nh; ++j) rowsum[i] += t[i * nh + j];
-        for (std::size_t i = 0; i < nh; ++i)
-            for (std::size_t j = 0; j < nh; ++j)
-                beta[i * nh + j] = (1.0 - r) * t[i * nh + j] + (r / nh) * rowsum[i];
-        std::fill(colsum.begin(), colsum.end(), 0.0);
-        for (std::size_t i = 0; i < nh; ++i)
-            for (std::size_t j = 0; j < nh; ++j) colsum[j] += beta[i * nh + j];
-        for (std::size_t i = 0; i < nh; ++i)
-            for (std::size_t j = 0; j < nh; ++j)
-                bwd[bi][i * nh + j] = (1.0 - r) * beta[i * nh + j] + (r / nh) * colsum[j];
-        normalize(bwd[bi]);
-    }
-    };
-
-    run_forward();
-    run_backward();
+    run_fb();
 
     // Most probable allele pair per block, from whatever fwd/bwd currently hold. Used both for the
     // reported call and, with a block neutralized, to see which blocks that call actually depended on.
@@ -1235,8 +1204,7 @@ std::vector<BlockCall> genotype_sample(
         std::vector<std::vector<std::pair<double, std::size_t>>> influence(nb);
         for (std::size_t j = 0; j < nb; ++j) {
             neutral_block = j;
-            run_forward();
-            run_backward();
+            run_fb();
             const std::vector<double> alt = pair_posterior(base);
             for (std::size_t b = 0; b < nb; ++b) {
                 const double drop = base_post[b] - alt[b];

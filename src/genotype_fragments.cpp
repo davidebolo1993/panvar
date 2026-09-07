@@ -1,5 +1,7 @@
 #include "panvar/genotype_fragments.hpp"
 
+#include "panvar/chain_kernel.hpp"
+
 #include "panvar/md5.hpp"
 
 #include "panvar/align.hpp"
@@ -4508,46 +4510,50 @@ HybridPosterior hybrid_forward_backward(const HybridChain& c) {
     const std::size_t nh = c.n_hap, nb = c.n_blocks, ns = nh * nh;
     if (nh == 0 || nb == 0 || c.log_emission.size() != nb || c.edges.size() != nb) return out;
 
-    std::vector<std::vector<double>> alpha(nb, std::vector<double>(ns, kNegInf));
-    std::vector<std::vector<double>> beta(nb, std::vector<double>(ns, kNegInf));
-    alpha[0] = c.log_emission[0];
-    for (std::size_t b = 1; b < nb; ++b) {
-        for (std::size_t i2 = 0; i2 < nh; ++i2)
-        for (std::size_t j2 = 0; j2 < nh; ++j2) {
-            double acc = kNegInf;
-            for (std::size_t i = 0; i < nh; ++i)
-            for (std::size_t j = 0; j < nh; ++j) {
-                const double a = alpha[b - 1][i * nh + j];
-                if (a == kNegInf) continue;
-                acc = log_add(acc, a + edge_log_phi(c, b, i, j, i2, j2));
-            }
-            const double e = c.log_emission[b][i2 * nh + j2];
-            alpha[b][i2 * nh + j2] = (acc == kNegInf || e == kNegInf) ? kNegInf : acc + e;
-        }
+    // THROUGH THE SHARED KERNEL, not a second recursion. This path used to carry its own generic
+    // log-space forward-backward; keeping it would have left two implementations of one recursion
+    // with only the oracle to notice them drifting apart. The kernel works in scaled probabilities,
+    // so each block's emissions are shifted by their own maximum and the shifts are added back into
+    // the partition -- a per-block constant, which cancels in the normalisation.
+    std::vector<double> shift(nb, 0.0);
+    for (std::size_t b = 0; b < nb; ++b) {
+        double m = kNegInf;
+        for (double v : c.log_emission[b]) m = std::max(m, v);
+        shift[b] = std::isfinite(m) ? m : 0.0;
     }
-    std::fill(beta[nb - 1].begin(), beta[nb - 1].end(), 0.0);
-    for (std::size_t b = nb - 1; b-- > 0;) {
-        for (std::size_t i = 0; i < nh; ++i)
-        for (std::size_t j = 0; j < nh; ++j) {
-            double acc = kNegInf;
-            for (std::size_t i2 = 0; i2 < nh; ++i2)
-            for (std::size_t j2 = 0; j2 < nh; ++j2) {
-                const double e = c.log_emission[b + 1][i2 * nh + j2];
-                const double bt = beta[b + 1][i2 * nh + j2];
-                if (e == kNegInf || bt == kNegInf) continue;
-                acc = log_add(acc, edge_log_phi(c, b + 1, i, j, i2, j2) + e + bt);
-            }
-            beta[b][i * nh + j] = acc;
-        }
+    std::vector<ChainEdgeLinkage> edges(nb);
+    for (std::size_t b = 0; b < nb; ++b) {
+        const HybridEdge& e = c.edges[b];
+        if (!e.has_linkage) continue;
+        edges[b].active = true;
+        edges[b].n_a = e.n_a; edges[b].n_b = e.n_b;
+        edges[b].allele_a = e.allele_a;
+        edges[b].allele_b = e.allele_b;
+        edges[b].log_psi = e.log_psi;
     }
-    double z = kNegInf;
-    for (std::size_t s = 0; s < ns; ++s) z = log_add(z, alpha[nb - 1][s]);
-    out.log_partition = z;
+    std::vector<std::vector<double>> fwd, bwd;
+    ChainKernelStats st;
+    chain_forward_backward(nh, nb, c.recomb,
+                           [&](std::size_t b, std::vector<double>& ev) {
+                               ev.assign(ns, 0.0);
+                               for (std::size_t k = 0; k < ns; ++k) {
+                                   const double v = c.log_emission[b][k];
+                                   ev[k] = (v == kNegInf) ? 0.0 : std::exp(v - shift[b]);
+                               }
+                           },
+                           &edges, fwd, bwd, &st);
+    if (fwd.size() != nb) return out;
+    out.log_partition = st.log_scale;
+    for (std::size_t b = 0; b < nb; ++b) out.log_partition += shift[b];
+    out.factorised_edges = st.factorised_edges;
+    out.linked_edges = st.linked_edges;
     out.log_marginal.assign(nb, std::vector<double>(ns, kNegInf));
     for (std::size_t b = 0; b < nb; ++b) {
-        for (std::size_t s = 0; s < ns; ++s) {
-            const double a = alpha[b][s], bt = beta[b][s];
-            out.log_marginal[b][s] = (a == kNegInf || bt == kNegInf) ? kNegInf : a + bt - z;
+        double z = 0.0;
+        for (std::size_t k = 0; k < ns; ++k) z += fwd[b][k] * bwd[b][k];
+        for (std::size_t k = 0; k < ns; ++k) {
+            const double v = fwd[b][k] * bwd[b][k];
+            out.log_marginal[b][k] = (v > 0.0 && z > 0.0) ? std::log(v / z) : kNegInf;
         }
     }
     out.ok = true;

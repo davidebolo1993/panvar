@@ -783,6 +783,13 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         std::printf("worst_marginal_abs_diff_no_linkage\t%.17g\n", worst_marg0);
         std::printf("worst_marginal_sum_dev\t%.17g\n", worst_sum);
         std::printf("linkage_marginal_effect\t%.17g\n", linkage_effect);
+        // BOTH KERNEL PATHS MUST HAVE RUN, in this one chain. A branch that exists but is never
+        // taken is not covered, however many assertions surround it -- and the whole point of the
+        // shared kernel is that the factorised and linked paths cannot drift apart unnoticed.
+        std::printf("factorised_edges\t%zu\n", fb.factorised_edges);
+        std::printf("linked_edges\t%zu\n", fb.linked_edges);
+        std::printf("factorised_edges_no_linkage\t%zu\n", fb0.factorised_edges);
+        std::printf("linked_edges_no_linkage\t%zu\n", fb0.linked_edges);
         return 0;
     }
 

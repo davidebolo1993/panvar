@@ -23,6 +23,7 @@ option(PANVAR_SLOW_TESTS "Enable the slow test label (the ~6 minute rebuild suit
 # Every source below is reachable only from `genotype`: node_coverage and pangenie_model are its two
 # alternative evidence paths, not shared utilities.
 set(PANVAR_GENOTYPE_LIB_SOURCES
+    src/chain_kernel.cpp
     src/genotype.cpp
     src/genotype_blocks.cpp
     src/genotype_index.cpp

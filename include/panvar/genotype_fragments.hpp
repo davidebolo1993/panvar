@@ -1906,6 +1906,10 @@ struct HybridChain {
 struct HybridPosterior {
     double log_partition = 0.0;
     std::vector<std::vector<double>> log_marginal;  // [block][i * n_hap + j], normalised
+    // Which kernel edge paths actually RAN. A fixture must exercise both in one chain, or the
+    // factorised branch or the linked branch can be present and never taken.
+    std::size_t factorised_edges = 0;
+    std::size_t linked_edges = 0;
     bool ok = false;
 };
 

@@ -53,7 +53,9 @@
 #  13. exposure that does not cancel, an unformable emission, and an oversized dense table are each
 #      REFUSED with a status, never truncated or silently skipped;                          [ACTIVE]
 #  14. forward-backward agrees with a BRUTE-FORCE path oracle on the log partition and on every
-#      block marginal, with a linkage-free control and a non-vacuity check.                 [ACTIVE]
+#      block marginal, with a linkage-free control and a non-vacuity check;                 [ACTIVE]
+#  15. ONE chain exercises BOTH kernel edge paths -- factorised and linked -- so neither branch can
+#      be present but unused.                                                               [ACTIVE]
 #   9. ambiguous evidence yields an equivalence set or UNRESOLVED, never a confident guess.
 #
 # NORMALISATION is settled in genotype_fragments.hpp. Linkage is a CONDITIONAL PHASE SCORE, and TWO
@@ -493,6 +495,19 @@ else: no("a block marginal sums to 1 +/- %.4g" % sd)
 le = float(d["linkage_marginal_effect"])
 if le > 1e-6: ok("linkage moves the posterior by %.4f -- the comparison is not vacuous" % le)
 else: no("linkage changes the posterior by only %.2e; the oracle asserts nothing about psi" % le)
+# BOTH KERNEL EDGE PATHS MUST RUN IN ONE CHAIN. There is a single inference kernel with a
+# factorised O(n_h^2) path and a linked O(n_h^4) path; a branch that is present but never taken is
+# not covered. The linkage-free control must take the factorised path only.
+fac, lnk = int(d["factorised_edges"]), int(d["linked_edges"])
+if fac > 0 and lnk > 0:
+    ok("one chain exercised BOTH kernel paths: %d factorised edge(s), %d linked" % (fac, lnk))
+else:
+    no("the fixture took only one kernel path: %d factorised, %d linked" % (fac, lnk))
+fac0, lnk0 = int(d["factorised_edges_no_linkage"]), int(d["linked_edges_no_linkage"])
+if lnk0 == 0 and fac0 > 0:
+    ok("the linkage-free control takes the factorised path only (%d edges)" % fac0)
+else:
+    no("the linkage-free control took %d linked edge(s)" % lnk0)
 sys.exit(bad)
 PYEOFB
   fails=$(( fails + $? ))
