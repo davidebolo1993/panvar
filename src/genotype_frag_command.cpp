@@ -333,6 +333,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     bool interval_lazy = false, interval_screen_only = false;
     std::string interval_rounds;
     std::string ownership_table;
+    std::string exposure_probe;
     std::vector<std::string> reconcile_scope;
     std::string switch_penalties_arg = "0,10,100,1000";
     std::vector<std::string> exact_distance;
@@ -380,6 +381,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--interval-screen-only") { interval_lazy = true; interval_screen_only = true; }
         else if (a == "--interval-rounds") interval_rounds = value(i, a);
         else if (a == "--ownership-table") ownership_table = value(i, a);
+        else if (a == "--exposure-probe") exposure_probe = value(i, a);
         else if (a == "--scope-tol") {
             const std::string sv = value(i, a);
             scope_tol = std::stod(sv);
@@ -1050,6 +1052,32 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         return 0;
     }
 
+    // ---- EXPOSURE PRECONDITION PROBE ------------------------------------------------------------
+    // Linkage is a conditional phase score whose exposure cancels only while every constructed
+    // window exceeds the insert support; below that max(0, n - L + 1) clips and the affine form
+    // stops describing the exposure at all. This prints both forms so the precondition is a
+    // measurement, not an assumption -- a deletion or bypass allele can easily produce a short
+    // window, and then the cancellation the linkage factor relies on is simply false.
+    if (!exposure_probe.empty()) {
+        long min_len_e = 1;
+        const std::vector<Fragment> efr = load_fragments(read_paths);
+        for (const Fragment& F : efr) {
+            min_len_e = std::max<long>(min_len_e, static_cast<long>(F.r1.size() + F.r2.size()));
+        }
+        const InsertPrior ip_e = make_insert_prior(opt.fragment_len, opt.fragment_sd,
+                                                   opt.discordant_rate, 4, min_len_e);
+        std::printf("window\texact\taffine\tdiff\tin_regime\tinsert_lo\tinsert_hi\n");
+        for (const std::string& w : split_commas(exposure_probe)) {
+            const std::size_t n2 = static_cast<std::size_t>(std::stoul(w));
+            const ExposureCheck c = check_exposure(n2, ip_e);
+            std::printf("%zu\t%.10g\t%.10g\t%.10g\t%d\t%ld\t%ld\n",
+                        n2, c.exact, c.affine, c.exact - c.affine, c.in_regime ? 1 : 0,
+                        ip_e.lo, ip_e.hi);
+        }
+        log.done();
+        return 0;
+    }
+
     // ---- EVIDENCE OWNERSHIP ---------------------------------------------------------------------
     // Which factor each fragment belongs to, decided ONCE over the whole candidate set before any
     // genotype is scored. This is the rule that keeps marker unaries and fragment linkage factors
@@ -1141,23 +1169,42 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                                                opt.max_divergence, lep_o, l1m_o, scope_tol,
                                                opidx.empty() ? nullptr : &opidx);
         });
-        std::size_t n_un = 0, n_li = 0, n_wi = 0, n_iv = 0, n_no = 0;
-        for (const FragmentOwner& o2 : owners) {
-            switch (o2.kind) {
-                case OwnerKind::Unary:     ++n_un; break;
-                case OwnerKind::Linkage:   ++n_li; break;
-                case OwnerKind::Wide:      ++n_wi; break;
-                case OwnerKind::Invariant: ++n_iv; break;
-                default:                   ++n_no; break;
-            }
-        }
+        const OwnershipLedger led = ownership_ledger(owners);
         write_ownership_table(ownership_table, ofr, owners);
+        {
+            const std::string lp = ownership_table + ".ledger.tsv";
+            std::ofstream lf(lp);
+            if (!lf) throw std::runtime_error("genotype-frag: cannot write " + lp);
+            lf.precision(10);
+            lf << "metric\tvalue\n"
+               << "candidates\t" << frames.size() << '\n'
+               << "blocks\t" << blocks.size() << '\n'
+               << "blocks_variable\t" << n_var << '\n'
+               << "fragments\t" << led.total << '\n'
+               << "unary\t" << led.unary << '\n'
+               << "linkage\t" << led.linkage << '\n'
+               << "wide\t" << led.wide << '\n'
+               << "invariant\t" << led.invariant << '\n'
+               << "unusable\t" << led.unusable << '\n'
+               // THE TRADEOFF, quantified. Linkage-owned fragments leave the marker unaries and,
+               // under a factor conditional on endpoint content, keep only their phase information.
+               // This is the content evidence given up to buy a clean partition.
+               << "excluded_fraction\t" << led.excluded_fraction << '\n'
+               << "excluded_mass_fraction\t" << led.excluded_mass_fraction << '\n';
+            lf.flush();
+            log.wrote({lp});
+        }
         log.info("ownership over " + std::to_string(frames.size()) + " candidates, " +
                  std::to_string(n_var) + " of " + std::to_string(blocks.size()) +
                  " blocks variable: " +
-                 std::to_string(n_un) + " unary, " + std::to_string(n_li) + " linkage, " +
-                 std::to_string(n_wi) + " wide, " + std::to_string(n_iv) + " invariant, " +
-                 std::to_string(n_no) + " unusable");
+                 std::to_string(led.unary) + " unary, " + std::to_string(led.linkage) +
+                 " linkage, " + std::to_string(led.wide) + " wide, " +
+                 std::to_string(led.invariant) + " invariant, " +
+                 std::to_string(led.unusable) + " unusable");
+        log.info("content evidence excluded from the unaries: " +
+                 std::to_string(led.linkage) + " of " + std::to_string(led.total) +
+                 " fragments (" + std::to_string(100.0 * led.excluded_fraction) + "%), " +
+                 std::to_string(100.0 * led.excluded_mass_fraction) + "% of in-band mass");
         log.wrote({ownership_table});
         log.done();
         return 0;

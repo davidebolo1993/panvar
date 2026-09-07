@@ -3979,6 +3979,25 @@ OriginUniverse enumerate_fragment_origins(const Fragment& fragment,
 
 namespace panvar {
 
+ExposureCheck check_exposure(std::size_t window_len, const InsertPrior& ip) {
+    ExposureCheck out;
+    const double n = static_cast<double>(window_len);
+    double mean_len = 0.0;
+    for (long L = ip.lo; L <= ip.hi; ++L) {
+        const double lp = ip.log_at(L);
+        if (lp == kNegInf) continue;
+        const double p = std::exp(lp);
+        mean_len += p * static_cast<double>(L);
+        out.exact += p * std::max(0.0, n - static_cast<double>(L) + 1.0);
+    }
+    out.affine = n + 1.0 - mean_len;
+    // The clip max(0, n - L + 1) only bites once n < L - 1 for some L in support, so the two forms
+    // coincide from hi - 1 upwards. Below that the affine surrogate is simply a different function
+    // and the cis/trans cancellation it justifies does not hold.
+    out.in_regime = static_cast<long>(window_len) >= ip.hi - 1;
+    return out;
+}
+
 const char* owner_kind_name(OwnerKind k) {
     switch (k) {
         case OwnerKind::Unary:    return "unary";
@@ -4107,6 +4126,33 @@ FragmentOwner assign_fragment_owner(const Fragment& fragment,
     else if (out.var_scope.size() == 2) out.kind = OwnerKind::Linkage;
     else out.kind = OwnerKind::Wide;   // three or more variables; never cropped to a pair
     return out;
+}
+
+OwnershipLedger ownership_ledger(const std::vector<FragmentOwner>& owners) {
+    OwnershipLedger L;
+    double mass_all = kNegInf, mass_link = kNegInf;
+    for (const FragmentOwner& o : owners) {
+        switch (o.kind) {
+            case OwnerKind::Unary:     ++L.unary; break;
+            case OwnerKind::Linkage:   ++L.linkage; break;
+            case OwnerKind::Wide:      ++L.wide; break;
+            case OwnerKind::Invariant: ++L.invariant; break;
+            default:                   ++L.unusable; break;
+        }
+        if (o.in_band == kNegInf) continue;
+        mass_all = log_add(mass_all, o.in_band);
+        if (o.kind == OwnerKind::Linkage) mass_link = log_add(mass_link, o.in_band);
+    }
+    L.total = owners.size();
+    // THE EXCLUDED SHARE. Linkage-owned fragments leave the marker unaries, and a linkage factor
+    // conditional on endpoint content keeps only their PHASE information -- their content evidence
+    // is discarded. That is what buys the clean partition, and it is not lossless, so the size of
+    // the loss is reported rather than left to be discovered later.
+    L.excluded_fraction = L.total ? static_cast<double>(L.linkage) /
+                                    static_cast<double>(L.total) : 0.0;
+    L.excluded_mass_fraction = (mass_all == kNegInf || mass_link == kNegInf)
+                                   ? 0.0 : std::exp(mass_link - mass_all);
+    return L;
 }
 
 void write_ownership_table(const std::string& path,

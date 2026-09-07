@@ -1601,14 +1601,49 @@ struct FragmentOwner {
 // -- affine in length. A junction's competing configurations are phase assignments of the SAME
 // allele multiset: cis = (a1b1, a2b2) against trans = (a1b2, a2b1). Both carry
 // len(a1)+len(a2)+len(b1)+len(b2) in total, so E_a + E_b is identical and the difference is zero by
-// construction rather than by tolerance. The background term is likewise identical: the same
-// fragments are scored in every configuration, each contributing its floor once.
+// construction rather than by tolerance.
+//
+// TWO PRECONDITIONS, both of which an earlier version of this comment got wrong.
+//
+// (1) THE BACKGROUND DOES NOT CANCEL, and must stay INSIDE each configuration's mixture. It is
+//     genotype-independent, but it sits inside the log, so it is not a common additive term:
+//
+//         log(A_x + eta*P_bg) - log(A_y + eta*P_bg)  !=  log A_x - log A_y
+//
+//     It is a FLOOR, and it decides how much a weakly-placing fragment is allowed to say about
+//     phase. Measured: for a contrast well above the floor the two forms agree to 0.0000 nats; for
+//     one near the floor, dropping the background turns a true 0.0064-nat contrast into 10.0000 --
+//     overstating it by 9.9936, essentially manufacturing the entire signal. This is the same
+//     failure mode the band floor already exists to prevent, arriving by a different route.
+//
+// (2) EXPOSURE IS AFFINE ONLY WHILE EVERY CONSTRUCTED WINDOW EXCEEDS THE INSERT SUPPORT. The
+//     max(0, n - L + 1) clips below that, and the cancellation fails with it. Measured against a
+//     [200, 500] prior: exact and affine agree at n = 499 and n = 600, differ by 16.4 nats at
+//     n = 400 and by 199 at n = 150. A deletion or bypass allele can easily produce a short window,
+//     so this is a live case and not a corner: check_exposure() below reports both values and
+//     whether the regime holds, and every phase configuration must be checked. Outside the regime,
+//     either enlarge the fixed flanks or retain the exact exposure difference -- never assume it.
 //
 // WHAT THIS DELIBERATELY AVOIDS: scoring a local junction window with the whole-locus contribution
 // formula. A shorter window has a different exposure, so an absolute score computed that way would
 // carry a length preference that has nothing to do with phase -- the same class of defect as the
 // exposure/length cancellation still open at C4. A ratio over configurations on one fixed window
 // never forms that normaliser at all.
+//
+// AN INTENTIONAL INFORMATION TRADEOFF, recorded rather than glossed. Excluding linkage-owned
+// fragments from the marker unaries AND normalising their linkage factor conditional on endpoint
+// content discards their CONTENT evidence: only phase survives. That is what makes the partition
+// safe against double counting, but it is NOT a lossless likelihood factorisation. The excluded
+// share must be measured, and block-content calls must not regress because of it.
+
+// The exact exposure and its affine surrogate side by side, so precondition (2) is CHECKED rather
+// than assumed. They coincide once the window reaches hi - 1; below that the clipping bites.
+struct ExposureCheck {
+    double exact = 0.0;
+    double affine = 0.0;      // n + 1 - E[L]
+    bool in_regime = false;   // window >= hi - 1, where the two coincide and cancellation is exact
+};
+ExposureCheck check_exposure(std::size_t window_len, const InsertPrior& ip);
 //
 // `block_variable[b]` is nonzero when block b's sequence differs between candidates. A fixed block
 // is context, never a factor variable.
@@ -1618,6 +1653,14 @@ FragmentOwner assign_fragment_owner(const Fragment& fragment,
                                     const InsertPrior& ip, double max_divergence,
                                     double log_eps, double log_1meps, double scope_tol,
                                     const std::vector<PieceIndex>* pidx = nullptr);
+
+// The partition's headline counts plus the share of evidence the tradeoff above discards.
+struct OwnershipLedger {
+    std::size_t total = 0, unary = 0, linkage = 0, wide = 0, invariant = 0, unusable = 0;
+    double excluded_fraction = 0.0;        // linkage-owned fragments / all fragments
+    double excluded_mass_fraction = 0.0;   // their share of total in-band placement mass
+};
+OwnershipLedger ownership_ledger(const std::vector<FragmentOwner>& owners);
 
 void write_ownership_table(const std::string& path,
                            const std::vector<Fragment>& fragments,

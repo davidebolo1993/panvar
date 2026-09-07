@@ -42,12 +42,27 @@
 #   4. no factor loses candidate-dependent placement mass;                               [ACTIVE]
 #   5. two variable bubbles separated by a FIXED backbone still form a pairwise factor;   [ACTIVE]
 #   6. an intervening VARIABLE block gives a three-variable factor, never a cropped pair; [ACTIVE]
-#   7. ambiguous evidence yields an equivalence set or UNRESOLVED, never a confident guess.
+#   7. the exposure precondition holds, and is measured rather than assumed;             [ACTIVE]
+#   8. the discarded-content tradeoff is quantified;                                     [ACTIVE]
+#   9. ambiguous evidence yields an equivalence set or UNRESOLVED, never a confident guess.
 #
-# NORMALISATION is settled in genotype_fragments.hpp and asserted at the arithmetic level below:
-# linkage is a CONDITIONAL PHASE SCORE and exposure cancels exactly, because exposure(n) = n+1-E[L]
-# is affine in length and cis/trans partition the same allele multiset. Partitioning observed
-# fragments does not partition normalisation on its own, so this is chosen rather than assumed.
+# NORMALISATION is settled in genotype_fragments.hpp. Linkage is a CONDITIONAL PHASE SCORE, and TWO
+# preconditions come with it -- both of which an earlier version of this contract got wrong:
+#
+#   * THE BACKGROUND DOES NOT CANCEL. log(A_x + eta*P_bg) - log(A_y + eta*P_bg) != log A_x - log A_y.
+#     It is genotype-independent but sits inside the log, so it is a FLOOR that decides how much a
+#     weakly-placing fragment may say about phase. Measured: a contrast near the floor is 0.0064
+#     nats with the background retained and 10.0000 without -- dropping it manufactures the entire
+#     signal. Each configuration must keep its own background inside its mixture. Held behind
+#     --hybrid-call, since only the chain forms the mixture.
+#   * EXPOSURE IS AFFINE ONLY ABOVE THE INSERT SUPPORT, so the cis/trans cancellation is conditional
+#     on every constructed window clearing it. A deletion or bypass allele can produce a short
+#     window; then the cancellation is simply false. Gate 7 measures the boundary directly.
+#
+# THE TRADEOFF, recorded not glossed: excluding linkage-owned fragments from the unaries while
+# normalising the linkage factor conditional on endpoint content discards their CONTENT evidence and
+# keeps only phase. That is not a lossless factorisation. Gate 8 quantifies the loss; block-content
+# calls must not regress because of it.
 #
 # Gates 5 (C4 block 7 keeps the marker caller's 48/48) and 6 (exact leave-zero-out controls do not
 # regress) are real-panel regressions and live in tests/regressions/: they need the C4 graph and
@@ -285,10 +300,92 @@ PYEOF3
   fails=$(( fails + $? ))
 done
 
+# ---------------------------------------------------------------------------------------------
+# GATE 7: THE EXPOSURE PRECONDITION. exposure(n) = SUM_L pi(L) max(0, n-L+1) equals the affine
+# surrogate n+1-E[L] only once the window clears the insert support; the clip bites below that and
+# the cis/trans cancellation goes with it. Asserted at the boundary rather than trusted.
+"$BIN" genotype-frag -i "$OUT/b.sorted.gfa" -b "$OUT/b" -o "$OUT/e" -R "$OUT/r1.fq" -R "$OUT/r2.fq" \
+  --fragment-len 350 --fragment-sd 50 --error-rate 0.001 \
+  --exposure-probe 100,300,548,549,550,4000 -q > "$OUT/expo.tsv" 2>/dev/null
+if [ -s "$OUT/expo.tsv" ]; then
+  "$PY" - "$OUT/expo.tsv" <<'PYEOF4'
+import sys
+rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[1])][1:]
+d = {int(r[0]): (float(r[1]), float(r[2]), float(r[3]), r[4] == "1", int(r[6])) for r in rows}
+bad = 0
+def ok(m): print("  ok   " + m)
+def no(m):
+    global bad; bad += 1; print("  FAIL " + m)
+hi = next(iter(d.values()))[4]
+inside  = [n for n, v in d.items() if v[3]]
+outside = [n for n, v in d.items() if not v[3]]
+if not inside or not outside:
+    no("the probe does not straddle the regime boundary (insert_hi=%d)" % hi)
+else:
+    ok("probe straddles the regime boundary at insert_hi=%d: in %s, out %s"
+       % (hi, sorted(inside), sorted(outside)))
+# Inside the regime the two forms must agree to floating point.
+worst_in = max(abs(d[n][2]) for n in inside)
+if worst_in < 1e-6: ok("inside the regime exact and affine agree (worst %.2e nats)" % worst_in)
+else: no("inside the regime they differ by %.4g nats -- cancellation is not exact" % worst_in)
+# Outside it they must NOT: a gate that passes because the difference is negligible everywhere
+# would be asserting nothing.
+worst_out = max(abs(d[n][2]) for n in outside)
+if worst_out > 1.0:
+    ok("outside the regime they diverge (worst %.4g nats) -- the precondition is real" % worst_out)
+else:
+    no("outside the regime they differ by only %.4g nats -- gate is vacuous" % worst_out)
+# The boundary must sit exactly at hi-1, not near it.
+if d.get(hi - 1, (0,0,0,False,0))[3] and not d.get(hi - 2, (0,0,0,True,0))[3]:
+    ok("the regime begins exactly at hi-1 = %d" % (hi - 1))
+else:
+    no("the regime boundary is not at hi-1 = %d" % (hi - 1))
+sys.exit(bad)
+PYEOF4
+  fails=$(( fails + $? ))
+else
+  bad "exposure probe produced nothing"
+fi
+
+# GATE 8: THE DISCARDED-CONTENT TRADEOFF, quantified. Linkage-owned fragments leave the marker
+# unaries; under a factor conditional on endpoint content only their phase information survives.
+# This is not lossless, so its size is recorded here and block-content calls must not regress.
+if [ -s "$OUT/own.tsv.ledger.tsv" ]; then
+  "$PY" - "$OUT/own.tsv.ledger.tsv" <<'PYEOF5'
+import sys
+d = dict(l.rstrip("\n").split("\t") for l in open(sys.argv[1]))
+bad = 0
+def ok(m): print("  ok   " + m)
+def no(m):
+    global bad; bad += 1; print("  FAIL " + m)
+n = int(d["fragments"]); link = int(d["linkage"])
+fr = float(d["excluded_fraction"]); mf = float(d["excluded_mass_fraction"])
+tot = sum(int(d[k]) for k in ("unary","linkage","wide","invariant","unusable"))
+if tot == n: ok("the ledger's classes sum to every fragment (%d)" % n)
+else: no("ledger classes sum to %d, %d fragments loaded" % (tot, n))
+if link > 0 and fr > 0: ok("content evidence given up: %d of %d fragments (%.2f%%), %.2f%% of in-band mass"
+                           % (link, n, 100*fr, 100*mf))
+else: no("no linkage fragments -- the tradeoff gate measures nothing")
+# A first implementation may give up a few percent; giving up most of the evidence is a different
+# design and must not pass silently.
+if fr < 0.25: ok("the excluded share is small enough for a first implementation (%.2f%% < 25%%)" % (100*fr))
+else: no("%.2f%% of fragments would lose their content evidence -- too much to accept silently" % (100*fr))
+sys.exit(bad)
+PYEOF5
+  fails=$(( fails + $? ))
+else
+  bad "no ownership ledger written"
+fi
+
 if ! "$BIN" genotype-frag --help 2>&1 | grep -q -- "--hybrid-call"; then
   echo
-  echo "  PENDING gates 1, 2 and 7: the chain entry point (--hybrid-call) does not exist yet."
-  echo "  Ownership is pinned and asserted above; the chain that consumes it is not built."
+  echo "  PENDING, held behind --hybrid-call (the chain that forms the mixtures does not exist):"
+  echo "    * without linkage, EXACT reproduction of the marker / Li-Stephens caller;"
+  echo "    * with linkage, correct phase while preserving unordered block content;"
+  echo "    * the background RETAINED inside each configuration's mixture;"
+  echo "    * Li-Stephens prior and fragment linkage each applied exactly once;"
+  echo "    * a global swap of the two homologues leaves the output unchanged;"
+  echo "    * ambiguous evidence gives an equivalence set or UNRESOLVED, not a confident guess."
   echo "  This file must FAIL, not skip, once --hybrid-call appears without satisfying them."
 fi
 echo
