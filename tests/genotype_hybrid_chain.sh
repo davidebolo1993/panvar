@@ -43,7 +43,7 @@
 #   5. two variable bubbles separated by a FIXED backbone still form a pairwise factor;   [ACTIVE]
 #   6. an intervening VARIABLE block gives a three-variable factor, never a cropped pair; [ACTIVE]
 #   7. the exposure precondition holds, and is measured rather than assumed;             [ACTIVE]
-#   8. the discarded-content tradeoff is quantified;                                     [ACTIVE]
+#   8. every ownership class is accounted, and its mass share reported;                  [ACTIVE]
 #   9. ambiguous evidence yields an equivalence set or UNRESOLVED, never a confident guess.
 #
 # NORMALISATION is settled in genotype_fragments.hpp. Linkage is a CONDITIONAL PHASE SCORE, and TWO
@@ -61,8 +61,18 @@
 #
 # THE TRADEOFF, recorded not glossed: excluding linkage-owned fragments from the unaries while
 # normalising the linkage factor conditional on endpoint content discards their CONTENT evidence and
-# keeps only phase. That is not a lossless factorisation. Gate 8 quantifies the loss; block-content
-# calls must not regress because of it.
+# keeps only phase. That is not a lossless factorisation.
+#
+# GATE 8 MEASURES SIZE, NOT INFORMATION. Pooled in-band placement mass says how much mass a class
+# holds, not how much a call depends on it -- a fragment with a negligible share can still carry a
+# decisive likelihood RATIO, and a ratio is what a call turns on. So no mass figure here may be
+# quoted as evidence that the content loss is harmless. Only the block-content regression, on C4 and
+# the exact leave-zero-out controls, can establish that.
+#
+# EVERY CLASS NEEDS A DISPOSITION or the partition leaks: Unary is marker content; Linkage is
+# conditional phase, content given up; Wide is NOT representable by a pairwise transition and must
+# be reported unsupported/unresolved rather than deleted or cropped; Invariant is ignorable for
+# ranking but belongs to absolute-fit calibration; Unusable is explicitly reported missing evidence.
 #
 # Gates 5 (C4 block 7 keeps the marker caller's 48/48) and 6 (exact leave-zero-out controls do not
 # regress) are real-panel regressions and live in tests/regressions/: they need the C4 graph and
@@ -359,17 +369,31 @@ def ok(m): print("  ok   " + m)
 def no(m):
     global bad; bad += 1; print("  FAIL " + m)
 n = int(d["fragments"]); link = int(d["linkage"])
-fr = float(d["excluded_fraction"]); mf = float(d["excluded_mass_fraction"])
-tot = sum(int(d[k]) for k in ("unary","linkage","wide","invariant","unusable"))
+fr = float(d["linkage_fragment_share"])
+CLASSES = ("unary", "linkage", "wide", "invariant", "unusable")
+tot = sum(int(d[k]) for k in CLASSES)
 if tot == n: ok("the ledger's classes sum to every fragment (%d)" % n)
 else: no("ledger classes sum to %d, %d fragments loaded" % (tot, n))
-if link > 0 and fr > 0: ok("content evidence given up: %d of %d fragments (%.2f%%), %.2f%% of in-band mass"
-                           % (link, n, 100*fr, 100*mf))
-else: no("no linkage fragments -- the tradeoff gate measures nothing")
-# A first implementation may give up a few percent; giving up most of the evidence is a different
-# design and must not pass silently.
-if fr < 0.25: ok("the excluded share is small enough for a first implementation (%.2f%% < 25%%)" % (100*fr))
-else: no("%.2f%% of fragments would lose their content evidence -- too much to accept silently" % (100*fr))
+# EVERY class must be reported, so none can go unaccounted when the chain decides its disposition.
+missing = [c for c in CLASSES if "%s_in_band_mass_share" % c not in d]
+if missing: no("no in-band mass share reported for: %s" % ", ".join(missing))
+else:
+    ok("every ownership class reports its share: " +
+       ", ".join("%s %.2f%%" % (c, 100 * float(d["%s_in_band_mass_share" % c])) for c in CLASSES))
+shares = sum(float(d["%s_in_band_mass_share" % c]) for c in CLASSES)
+if abs(shares - 1.0) < 1e-6: ok("the class mass shares account for all in-band mass (sum %.6f)" % shares)
+else: no("class mass shares sum to %.6f, not 1 -- mass is unaccounted" % shares)
+# NON-VACUITY, not an acceptance cutoff. An arbitrary "< 25%" threshold would be a tuned pass
+# condition on a fixture; what matters is that the gate measures something real and that the
+# BLOCK-CONTENT regression -- C4 and the exact leave-zero-out controls -- decides whether the
+# deliberate content loss is acceptable. The mass share is a size statistic and cannot decide it:
+# a fragment holding a negligible share can still carry a decisive likelihood ratio.
+if link > 0 and fr > 0:
+    ok("linkage-owned: %d of %d fragments (%.2f%%), holding %.2f%% of pooled in-band mass"
+       % (link, n, 100 * fr, 100 * float(d["linkage_in_band_mass_share"])))
+    ok("      (a SIZE statistic -- only the block-content regression measures information lost)")
+else:
+    no("no linkage fragments -- the tradeoff gate measures nothing")
 sys.exit(bad)
 PYEOF5
   fails=$(( fails + $? ))
@@ -380,7 +404,11 @@ fi
 if ! "$BIN" genotype-frag --help 2>&1 | grep -q -- "--hybrid-call"; then
   echo
   echo "  PENDING, held behind --hybrid-call (the chain that forms the mixtures does not exist):"
-  echo "    * without linkage, EXACT reproduction of the marker / Li-Stephens caller;"
+  echo "    * hybrid DISABLED -> exactly the legacy marker / Li-Stephens result;"
+  echo "    * hybrid ENABLED but NO linkage-owned fragments -> exactly the legacy result;"
+  echo "    * hybrid ENABLED with linkage fragments -> content calls pass the block-content"
+  echo "      regression. Reproducing the legacy result here is NOT the gate and cannot be:"
+  echo "      those fragments' content evidence was deliberately removed from the unaries.;"
   echo "    * with linkage, correct phase while preserving unordered block content;"
   echo "    * the background RETAINED inside each configuration's mixture;"
   echo "    * Li-Stephens prior and fragment linkage each applied exactly once;"

@@ -4130,7 +4130,21 @@ FragmentOwner assign_fragment_owner(const Fragment& fragment,
 
 OwnershipLedger ownership_ledger(const std::vector<FragmentOwner>& owners) {
     OwnershipLedger L;
-    double mass_all = kNegInf, mass_link = kNegInf;
+    // Pooled in-band placement mass per class. This is a SIZE statistic: it says how much placement
+    // mass a class holds, not how much any call depends on it. A fragment with a negligible share
+    // can still carry a decisive likelihood RATIO between two candidates, and a ratio is what a
+    // call turns on -- so this must never be quoted as the information a class contributes.
+    double mass_all = kNegInf;
+    double mass[5] = {kNegInf, kNegInf, kNegInf, kNegInf, kNegInf};
+    const auto slot = [](OwnerKind k) -> int {
+        switch (k) {
+            case OwnerKind::Unary:     return 0;
+            case OwnerKind::Linkage:   return 1;
+            case OwnerKind::Wide:      return 2;
+            case OwnerKind::Invariant: return 3;
+            default:                   return 4;
+        }
+    };
     for (const FragmentOwner& o : owners) {
         switch (o.kind) {
             case OwnerKind::Unary:     ++L.unary; break;
@@ -4141,17 +4155,21 @@ OwnershipLedger ownership_ledger(const std::vector<FragmentOwner>& owners) {
         }
         if (o.in_band == kNegInf) continue;
         mass_all = log_add(mass_all, o.in_band);
-        if (o.kind == OwnerKind::Linkage) mass_link = log_add(mass_link, o.in_band);
+        const int i = slot(o.kind);
+        mass[i] = log_add(mass[i], o.in_band);
     }
     L.total = owners.size();
-    // THE EXCLUDED SHARE. Linkage-owned fragments leave the marker unaries, and a linkage factor
-    // conditional on endpoint content keeps only their PHASE information -- their content evidence
-    // is discarded. That is what buys the clean partition, and it is not lossless, so the size of
-    // the loss is reported rather than left to be discovered later.
-    L.excluded_fraction = L.total ? static_cast<double>(L.linkage) /
-                                    static_cast<double>(L.total) : 0.0;
-    L.excluded_mass_fraction = (mass_all == kNegInf || mass_link == kNegInf)
-                                   ? 0.0 : std::exp(mass_link - mass_all);
+    L.linkage_fragment_share = L.total ? static_cast<double>(L.linkage) /
+                                         static_cast<double>(L.total) : 0.0;
+    const auto share = [&](int i) {
+        return (mass_all == kNegInf || mass[i] == kNegInf) ? 0.0 : std::exp(mass[i] - mass_all);
+    };
+    // EVERY class, so none of them can go unaccounted when the chain decides what to do with it.
+    L.unary_in_band_mass_share     = share(0);
+    L.linkage_in_band_mass_share   = share(1);
+    L.wide_in_band_mass_share      = share(2);
+    L.invariant_in_band_mass_share = share(3);
+    L.unusable_in_band_mass_share  = share(4);
     return L;
 }
 

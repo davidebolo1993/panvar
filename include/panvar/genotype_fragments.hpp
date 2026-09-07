@@ -1617,9 +1617,10 @@ struct FragmentOwner {
 //     failure mode the band floor already exists to prevent, arriving by a different route.
 //
 // (2) EXPOSURE IS AFFINE ONLY WHILE EVERY CONSTRUCTED WINDOW EXCEEDS THE INSERT SUPPORT. The
-//     max(0, n - L + 1) clips below that, and the cancellation fails with it. Measured against a
-//     [200, 500] prior: exact and affine agree at n = 499 and n = 600, differ by 16.4 nats at
-//     n = 400 and by 199 at n = 150. A deletion or bypass allele can easily produce a short window,
+//     max(0, n - L + 1) clips below that, and the cancellation fails with it. Measured against the
+//     fixture's [300, 550] prior: exact and affine agree to 2e-13 at n = 549 (= hi - 1) and above,
+//     and differ by 5.0e-05 at n = 548, 63.9 at n = 300 and 263.9 at n = 100. A deletion or bypass
+//     allele can easily produce a short window,
 //     so this is a live case and not a corner: check_exposure() below reports both values and
 //     whether the regime holds, and every phase configuration must be checked. Outside the regime,
 //     either enlarge the fixed flanks or retain the exact exposure difference -- never assume it.
@@ -1633,8 +1634,26 @@ struct FragmentOwner {
 // AN INTENTIONAL INFORMATION TRADEOFF, recorded rather than glossed. Excluding linkage-owned
 // fragments from the marker unaries AND normalising their linkage factor conditional on endpoint
 // content discards their CONTENT evidence: only phase survives. That is what makes the partition
-// safe against double counting, but it is NOT a lossless likelihood factorisation. The excluded
-// share must be measured, and block-content calls must not regress because of it.
+// safe against double counting, but it is NOT a lossless likelihood factorisation.
+//
+// WHAT THE MASS SHARE IS NOT. ownership_ledger() pools in-band placement mass in log space across
+// fragments and candidates. That is a MASS share, not information and not a likelihood
+// contribution: a fragment holding a tiny share of pooled mass can still carry a decisive
+// likelihood RATIO between two candidates, which is the quantity a call actually turns on. So the
+// share is a size statistic and nothing more. Only the block-content regression -- C4 and the exact
+// leave-zero-out controls -- can establish what information the exclusion costs, and the mass share
+// must never be quoted as evidence that the loss is harmless.
+//
+// EVERY OWNERSHIP CLASS NEEDS A DISPOSITION, or the partition leaks somewhere unexamined:
+//
+//   Unary      marker CONTENT evidence, into that block's unary factor;
+//   Linkage    conditional PHASE evidence, into one edge factor, content deliberately given up;
+//   Wide       three or more variables. NOT representable by a pairwise transition, so it must be
+//              reported as unsupported/unresolved -- never silently deleted, and never cropped
+//              into a pair, which is the defect tests/genotype_frag_factorisation.sh refuted;
+//   Invariant  no genotype dependence, so ignorable for RANKING, but it still carries depth and
+//              still belongs to absolute-fit calibration;
+//   Unusable   explicitly reported MISSING evidence, not silence.
 
 // The exact exposure and its affine surrogate side by side, so precondition (2) is CHECKED rather
 // than assumed. They coincide once the window reaches hi - 1; below that the clipping bites.
@@ -1654,11 +1673,20 @@ FragmentOwner assign_fragment_owner(const Fragment& fragment,
                                     double log_eps, double log_1meps, double scope_tol,
                                     const std::vector<PieceIndex>* pidx = nullptr);
 
-// The partition's headline counts plus the share of evidence the tradeoff above discards.
+// The partition's headline counts, plus each class's share of pooled in-band placement mass.
+//
+// THE MASS SHARES ARE SIZE STATISTICS, NOT INFORMATION. They say how much in-band placement mass a
+// class pools, not how much a call depends on it -- a low-mass fragment can still carry a decisive
+// likelihood ratio. Named for what they measure so they cannot be quoted as a loss figure.
+// EVERY class is reported, so no class can go unaccounted.
 struct OwnershipLedger {
     std::size_t total = 0, unary = 0, linkage = 0, wide = 0, invariant = 0, unusable = 0;
-    double excluded_fraction = 0.0;        // linkage-owned fragments / all fragments
-    double excluded_mass_fraction = 0.0;   // their share of total in-band placement mass
+    double linkage_fragment_share = 0.0;   // linkage-owned fragments / all fragments
+    double unary_in_band_mass_share = 0.0;
+    double linkage_in_band_mass_share = 0.0;
+    double wide_in_band_mass_share = 0.0;
+    double invariant_in_band_mass_share = 0.0;
+    double unusable_in_band_mass_share = 0.0;
 };
 OwnershipLedger ownership_ledger(const std::vector<FragmentOwner>& owners);
 

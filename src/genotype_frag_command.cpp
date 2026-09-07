@@ -1186,11 +1186,16 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                << "wide\t" << led.wide << '\n'
                << "invariant\t" << led.invariant << '\n'
                << "unusable\t" << led.unusable << '\n'
-               // THE TRADEOFF, quantified. Linkage-owned fragments leave the marker unaries and,
-               // under a factor conditional on endpoint content, keep only their phase information.
-               // This is the content evidence given up to buy a clean partition.
-               << "excluded_fraction\t" << led.excluded_fraction << '\n'
-               << "excluded_mass_fraction\t" << led.excluded_mass_fraction << '\n';
+               // SIZE STATISTICS, not information. Pooled in-band placement mass per class; a
+               // low-mass class can still hold decisive likelihood ratios, so none of these is a
+               // measure of what the linkage exclusion costs. Only the block-content regression
+               // can establish that. Every class is listed so none goes unaccounted.
+               << "linkage_fragment_share\t" << led.linkage_fragment_share << '\n'
+               << "unary_in_band_mass_share\t" << led.unary_in_band_mass_share << '\n'
+               << "linkage_in_band_mass_share\t" << led.linkage_in_band_mass_share << '\n'
+               << "wide_in_band_mass_share\t" << led.wide_in_band_mass_share << '\n'
+               << "invariant_in_band_mass_share\t" << led.invariant_in_band_mass_share << '\n'
+               << "unusable_in_band_mass_share\t" << led.unusable_in_band_mass_share << '\n';
             lf.flush();
             log.wrote({lp});
         }
@@ -1201,10 +1206,11 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                  " linkage, " + std::to_string(led.wide) + " wide, " +
                  std::to_string(led.invariant) + " invariant, " +
                  std::to_string(led.unusable) + " unusable");
-        log.info("content evidence excluded from the unaries: " +
+        log.info("linkage-owned (content evidence leaves the unaries): " +
                  std::to_string(led.linkage) + " of " + std::to_string(led.total) +
-                 " fragments (" + std::to_string(100.0 * led.excluded_fraction) + "%), " +
-                 std::to_string(100.0 * led.excluded_mass_fraction) + "% of in-band mass");
+                 " fragments (" + std::to_string(100.0 * led.linkage_fragment_share) +
+                 "%), holding " + std::to_string(100.0 * led.linkage_in_band_mass_share) +
+                 "% of pooled in-band mass -- a SIZE statistic, not the information cost");
         log.wrote({ownership_table});
         log.done();
         return 0;
