@@ -1281,7 +1281,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             if (!ef) throw std::runtime_error("genotype-frag: cannot write " + ep);
             ef.precision(10);
             ef << "block_a\tblock_b\tn_a\tn_b\tfragments\tinformative\tconfigs"
-                  "\texposure_affine\tpsi_sum_in_class\tbest_phase_config\tmax_phase_spread\tswap_asymmetry\n";
+                  "\texposure_affine\tpsi_mean_dev_in_class\tbest_phase_config\tmax_phase_spread\tswap_asymmetry\n";
             std::size_t emitted = 0, refused = 0;
             for (const auto& kv : by_edge) {
                 const LinkageGeometry geom = build_linkage_geometry(
@@ -1356,9 +1356,12 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                         }
                         std::sort(cls.begin(), cls.end());
                         cls.erase(std::unique(cls.begin(), cls.end()), cls.end());
-                        double sum = 0.0;
-                        for (std::size_t z : cls) { sum += std::exp(E.log_psi[z]); seen[z] = 1; }
-                        worst = std::max(worst, std::abs(sum - 1.0));
+                        // MEAN, not sum: psi is a mean-one likelihood ratio within the class.
+                        // Measuring the sum here reported a deviation of |C|-1 on every class and
+                        // was simply the stale form of this check.
+                        double acc2 = 0.0;
+                        for (std::size_t z : cls) { acc2 += std::exp(E.log_psi[z]); seen[z] = 1; }
+                        worst = std::max(worst, std::abs(acc2 / static_cast<double>(cls.size()) - 1.0));
                         // THE PHASE SPREAD WITHIN A CLASS is the only thing psi can say. A class
                         // with one configuration has none by construction -- a homozygous endpoint
                         // has no phase to choose -- so reporting the global best log_psi would
