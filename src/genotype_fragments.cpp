@@ -4283,6 +4283,62 @@ LinkageEmission linkage_emission(const Fragment& fragment, const LinkageGeometry
     return out;
 }
 
+HybridActivation plan_hybrid_activation(const std::vector<Fragment>& fragments,
+                                        const std::vector<FragmentOwner>& owners,
+                                        const std::vector<EdgeStatusEntry>& edge_status,
+                                        const std::map<std::pair<std::uint32_t, std::uint32_t>,
+                                                       LinkageEdge>& edges,
+                                        const std::vector<AlleleMapping>& maps,
+                                        std::size_t n_blocks) {
+    HybridActivation A;
+    A.kernel_edges.assign(n_blocks, ChainEdgeLinkage{});   // inactive: the safe default
+    A.report = assess_hybrid_completeness(owners, edge_status);
+    if (!A.report.complete) {
+        // TRANSACTIONAL REFUSAL. Nothing is subtracted and nothing is activated, so the marker
+        // unaries are exactly what the legacy caller would see. Subtracting here and then failing
+        // to activate would delete this evidence from BOTH models.
+        A.refusal = "hybrid model incomplete: " +
+                    std::to_string(A.report.unconsumed_wide) + " wide, " +
+                    std::to_string(A.report.unconsumed_refused_edge) + " on refused edges, " +
+                    std::to_string(A.report.unconsumed_unusable) + " unusable";
+        return A;
+    }
+    // Build every kernel edge FIRST. If any required edge fails to build -- a mapping refused, an
+    // allele count disagreeing -- the whole activation is abandoned rather than run with a hole.
+    std::vector<ChainEdgeLinkage> built(n_blocks);
+    for (const auto& kv : edges) {
+        const std::uint32_t a = kv.first.first, b = kv.first.second;
+        if (b >= n_blocks || a >= maps.size() || b >= maps.size()) {
+            A.refusal = "edge " + std::to_string(a) + "-" + std::to_string(b) + " is out of range";
+            return A;
+        }
+        const ChainEdgeLinkage k = make_kernel_edge(kv.second, maps[a], maps[b]);
+        if (!k.active) {
+            A.refusal = "edge " + std::to_string(a) + "-" + std::to_string(b) +
+                        " passed completeness but could not be built for the kernel";
+            return A;
+        }
+        built[b] = k;
+    }
+    // Only now, with every edge built, is the transaction allowed to commit. The exclusion list is
+    // derived from fragments consumed by an ACTIVE edge -- not from "linkage-owned" -- so a refused
+    // edge cannot satisfy the exclusion side.
+    for (std::size_t i = 0; i < owners.size() && i < fragments.size(); ++i) {
+        if (owners[i].kind != OwnerKind::Linkage) continue;
+        const std::uint32_t b = owners[i].block_hi;
+        if (b >= n_blocks || !built[b].active) {
+            A.refusal = "fragment " + fragments[i].name + " is owned by an edge that is not active";
+            return A;
+        }
+        A.excluded_fragments.push_back(fragments[i].name);
+        ++A.consumed_fragments;
+    }
+    A.kernel_edges = std::move(built);
+    for (const ChainEdgeLinkage& k : A.kernel_edges) if (k.active) ++A.active_edges;
+    A.activated = true;
+    return A;
+}
+
 ChainEdgeLinkage make_kernel_edge(const LinkageEdge& edge,
                                   const AlleleMapping& map_a, const AlleleMapping& map_b) {
     ChainEdgeLinkage out;   // inactive by default: the safe answer, not the convenient one

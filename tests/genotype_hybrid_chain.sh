@@ -58,6 +58,9 @@
 #      be present but unused;                                                               [ACTIVE]
 #  17. marker occurrence exclusion subtracts a linkage fragment's OCCURRENCES and never deletes a
 #      marker shared with unary-owned fragments;                                            [ACTIVE]
+#  20. activation is TRANSACTIONAL: nothing is subtracted from the marker unaries unless every
+#      required edge was built and the model is complete, and
+#          {excluded fragments} == {fragments consumed by ACTIVE linkage edges}, each once;  [ACTIVE]
 #  19. hybrid COMPLETE <=> every non-invariant owned fragment has a supported consumer; a refused
 #      edge or Wide fragment makes the run INCOMPLETE (not "unresolved"), all reasons are retained,
 #      and no refused edge ever reaches the kernel;                                         [ACTIVE]
@@ -468,6 +471,73 @@ PYEOF7
   fails=$(( fails + $? ))
 else
   bad "no edge aggregate written"
+fi
+
+# GATE 20: TRANSACTIONAL ACTIVATION. Subtracting linkage-owned fragments from the marker unaries
+# and activating their edges is ONE transaction. Half of it makes those fragments vanish from BOTH
+# models -- removed from the marker counts, consumed by no edge because the edge was refused --
+# leaving a run quietly WEAKER than the legacy caller it extends. So nothing is subtracted unless
+# every required edge was built and the model is complete.
+#
+# THE EQUALITY is phrased against ACTIVE edges, not merely linkage-owned fragments, so a refused
+# edge cannot satisfy the exclusion side by accident:
+#     {excluded fragments} == {fragments consumed by ACTIVE linkage edges},  each exactly once.
+"$BIN" genotype-frag -i /dev/null -b none -o "$OUT/ac" --activation-selftest \
+  > "$OUT/act.tsv" 2>/dev/null
+if [ -s "$OUT/act.tsv" ]; then
+  "$PY" - "$OUT/act.tsv" <<'PYEOFG'
+import sys
+rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[1])]
+d = {r[0]: r for r in rows[1:]}
+bad = 0
+def ok(m): print("  ok   " + m)
+def no(m):
+    global bad; bad += 1; print("  FAIL " + m)
+need = ("no_linkage","complete","refused_edge","wide_present","mapping_refused","unusable_present")
+miss = [k for k in need if k not in d]
+if miss: no("activation self-test missing: %s" % ", ".join(miss)); sys.exit(1)
+# THE EQUALITY must hold in every case, activated or not.
+viol = [k for k in need if d[k][7] != "1"]
+if viol: no("excluded != consumed-by-active-edges in: %s" % ", ".join(viol))
+else: ok("excluded IDs equal active-edge-consumed IDs in all %d cases" % len(need))
+# Each excluded fragment consumed exactly once: the excluded list has no duplicates.
+dup = [k for k in need if d[k][4] != d[k][6]]
+if dup: no("duplicate exclusions in: %s" % ", ".join(dup))
+else: ok("each excluded fragment is consumed exactly once (no duplicates)")
+# No linkage evidence -> activated, nothing excluded: the inference is legacy by construction.
+n0 = d["no_linkage"]
+if n0[1] == "1" and n0[4] == "0" and n0[3] == "0":
+    ok("no linkage evidence: activates with 0 active edges and 0 exclusions -- legacy inference")
+else: no("no_linkage gave activated=%s edges=%s excluded=%s" % (n0[1], n0[3], n0[4]))
+# A complete hybrid excludes exactly the fragments its active edges consume.
+c = d["complete"]
+if c[1] == "1" and c[3] == "1" and c[4] == "2" and c[5] == "2":
+    ok("complete hybrid: 1 active edge consuming 2 fragments, both excluded")
+else: no("complete gave activated=%s edges=%s excluded=%s consumed=%s" % (c[1],c[3],c[4],c[5]))
+# THE TRANSACTIONAL PROPERTY: every failure path excludes NOTHING. Otherwise the fragments would be
+# gone from the markers and consumed by nobody.
+for case in ("refused_edge","wide_present","mapping_refused","unusable_present"):
+    r = d[case]
+    if r[1] == "0" and r[4] == "0" and r[3] == "0":
+        ok("%s: no activation, NOTHING subtracted, reason recorded" % case)
+    else:
+        no("%s: activated=%s excluded=%s active_edges=%s -- a partial transaction committed"
+           % (case, r[1], r[4], r[3]))
+# Completeness passing is NOT sufficient: an edge that cannot be built must still abandon the whole
+# transaction rather than run with a hole.
+m = d["mapping_refused"]
+if m[2] == "1" and m[1] == "0" and m[4] == "0":
+    ok("mapping_refused: completeness passed yet activation was abandoned, nothing subtracted")
+else:
+    no("mapping_refused: complete=%s activated=%s excluded=%s" % (m[2], m[1], m[4]))
+for case in need:
+    if d[case][1] == "0" and d[case][8] == "-":
+        no("%s: refused activation without recording a reason" % case)
+sys.exit(bad)
+PYEOFG
+  fails=$(( fails + $? ))
+else
+  bad "activation self-test produced no output"
 fi
 
 # GATE 19: HYBRID COMPLETENESS. Three situations must stay distinct: no linkage-owned evidence (a

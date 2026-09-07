@@ -23,6 +23,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <tuple>
@@ -1993,6 +1994,45 @@ HybridCompletenessReport assess_hybrid_completeness(const std::vector<FragmentOw
 // carried by HybridCompletenessReport instead, where it makes the run INCOMPLETE.
 ChainEdgeLinkage make_kernel_edge(const LinkageEdge& edge,
                                   const AlleleMapping& map_a, const AlleleMapping& map_b);
+
+// ---------------------------------------------------------------------------------------------
+// TRANSACTIONAL ACTIVATION.
+//
+// Subtracting linkage-owned fragments from the marker unaries and activating their edges are ONE
+// transaction. Doing the first without the second makes those fragments disappear from BOTH models:
+// removed from the marker counts, and not consumed by any edge because the edge was refused. The
+// run would then be quietly weaker than the legacy caller it is meant to extend.
+//
+// So: build ownership and every required edge, validate mappings and completeness, and only if the
+// hybrid model is COMPLETE subtract and activate. If it is not, nothing is subtracted, no edge is
+// activated, and the untouched legacy block-content call is what gets reported -- with the hybrid
+// result labelled INCOMPLETE and never presented as the primary call.
+//
+// THE EQUALITY, phrased against ACTIVE edges rather than merely linkage-owned fragments, so a
+// refused edge cannot satisfy the exclusion side by accident:
+//
+//     {excluded fragments} == {fragments consumed by ACTIVE linkage edges}
+//
+// and each excluded fragment is consumed exactly once.
+struct HybridActivation {
+    bool activated = false;                        // did the hybrid model actually run?
+    HybridCompletenessReport report;
+    std::vector<std::string> excluded_fragments;   // empty unless activated
+    std::vector<ChainEdgeLinkage> kernel_edges;    // all inactive unless activated
+    std::size_t active_edges = 0;
+    std::size_t consumed_fragments = 0;            // by active edges
+    std::string refusal;                           // why the hybrid did not activate
+};
+
+// `edges` and `maps` are indexed by the edge's (block_lo, block_hi); `maps[b]` is block b's
+// haplotype -> allele mapping. `n_blocks` sizes the returned kernel edge vector.
+HybridActivation plan_hybrid_activation(const std::vector<Fragment>& fragments,
+                                        const std::vector<FragmentOwner>& owners,
+                                        const std::vector<EdgeStatusEntry>& edge_status,
+                                        const std::map<std::pair<std::uint32_t, std::uint32_t>,
+                                                       LinkageEdge>& edges,
+                                        const std::vector<AlleleMapping>& maps,
+                                        std::size_t n_blocks);
 
 struct HybridEdge {
     bool has_linkage = false;

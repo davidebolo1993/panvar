@@ -340,6 +340,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     bool hybrid_oracle = false;
     bool mapping_selftest = false;
     bool completeness_selftest = false;
+    bool activation_selftest = false;
     std::vector<std::string> reconcile_scope;
     std::string switch_penalties_arg = "0,10,100,1000";
     std::vector<std::string> exact_distance;
@@ -393,6 +394,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--hybrid-oracle") hybrid_oracle = true;
         else if (a == "--mapping-selftest") mapping_selftest = true;
         else if (a == "--completeness-selftest") completeness_selftest = true;
+        else if (a == "--activation-selftest") activation_selftest = true;
         else if (a == "--scope-tol") {
             const std::string sv = value(i, a);
             scope_tol = std::stod(sv);
@@ -654,7 +656,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     if (read_paths.empty() && spell_calls.empty() && !mosaic_floor && dump_sequences.empty() &&
         spell_pair.empty() && ref_block.empty() && ref_block_pair.empty() &&
         origin_universe.empty() && reconcile_scope.empty() && !linkage_selftest &&
-        !hybrid_oracle && !mapping_selftest && !completeness_selftest) {
+        !hybrid_oracle && !mapping_selftest && !completeness_selftest && !activation_selftest) {
         throw std::runtime_error("genotype-frag requires at least one --reads");
     }
     if (!bubble_prefix_in.empty()) {
@@ -687,6 +689,70 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     ParseGfaOptions parse_options;
     parse_options.include_paths = true;
     parse_options.include_sequences = true;
+    // ---- TRANSACTIONAL ACTIVATION SELF-TEST -----------------------------------------------------
+    // Subtracting linkage-owned fragments and activating their edges is ONE transaction. Half of it
+    // makes those fragments vanish from BOTH models -- gone from the marker counts, consumed by no
+    // edge -- leaving a run quietly weaker than the legacy caller it extends.
+    if (activation_selftest) {
+        std::printf("case\tactivated\tcomplete\tactive_edges\texcluded\tconsumed\tunique"
+                    "\tequality\trefusal\n");
+        const auto frag = [](const char* n2) { Fragment f; f.name = n2; f.r1 = "A"; f.r2 = "C";
+                                               return f; };
+        const auto own = [](OwnerKind k, std::uint32_t lo, std::uint32_t hi) {
+            FragmentOwner o; o.kind = k; o.block_lo = lo; o.block_hi = hi;
+            if (k == OwnerKind::Wide) o.var_scope = {lo, (lo + hi) / 2, hi};
+            return o;
+        };
+        LinkageEdge good;
+        good.n_a = 2; good.n_b = 2; good.status = LinkageStatus::Ok; good.log_psi.assign(16, 0.0);
+        const AlleleMapping mok = build_allele_mapping({0, 1, 1}, 2, -1);
+        const AlleleMapping mbad = build_allele_mapping({0, -1, 1}, 2, -1);   // refused
+        const auto run = [&](const char* name, const std::vector<Fragment>& fr,
+                             const std::vector<FragmentOwner>& ow,
+                             const std::vector<EdgeStatusEntry>& es,
+                             const std::map<std::pair<std::uint32_t, std::uint32_t>,
+                                            LinkageEdge>& ed,
+                             const std::vector<AlleleMapping>& mp) {
+            const HybridActivation A = plan_hybrid_activation(fr, ow, es, ed, mp, 3);
+            // THE EQUALITY: excluded == consumed by ACTIVE edges, each exactly once.
+            std::set<std::string> ex(A.excluded_fragments.begin(), A.excluded_fragments.end());
+            std::set<std::string> consumed;
+            for (std::size_t i = 0; i < ow.size() && i < fr.size(); ++i) {
+                if (ow[i].kind != OwnerKind::Linkage) continue;
+                const std::uint32_t b = ow[i].block_hi;
+                if (b < A.kernel_edges.size() && A.kernel_edges[b].active) consumed.insert(fr[i].name);
+            }
+            const bool eq = (ex == consumed);
+            std::printf("%s\t%d\t%d\t%zu\t%zu\t%zu\t%zu\t%d\t%s\n", name,
+                        A.activated ? 1 : 0, A.report.complete ? 1 : 0, A.active_edges,
+                        A.excluded_fragments.size(), A.consumed_fragments, ex.size(), eq ? 1 : 0,
+                        A.refusal.empty() ? "-" : A.refusal.c_str());
+        };
+        using OK = OwnerKind;  using LS = LinkageStatus;
+        // No linkage evidence at all: complete, activated, nothing excluded -> legacy inference.
+        run("no_linkage", {frag("u1"), frag("u2")}, {own(OK::Unary,1,1), own(OK::Unary,2,2)},
+            {}, {}, {mok, mok, mok});
+        // A complete hybrid: two fragments consumed by one active edge, both excluded.
+        run("complete", {frag("u1"), frag("l1"), frag("l2")},
+            {own(OK::Unary,1,1), own(OK::Linkage,1,2), own(OK::Linkage,1,2)},
+            {{1,2,LS::Ok,2}}, {{{1,2}, good}}, {mok, mok, mok});
+        // A REFUSED EDGE: nothing excluded, nothing activated. Its fragments stay in the markers.
+        run("refused_edge", {frag("u1"), frag("l1")},
+            {own(OK::Unary,1,1), own(OK::Linkage,1,2)},
+            {{1,2,LS::TooManyConfigurations,1}}, {}, {mok, mok, mok});
+        // A WIDE fragment: no pairwise consumer, so the whole activation is refused.
+        run("wide_present", {frag("u1"), frag("w1")},
+            {own(OK::Unary,1,1), own(OK::Wide,0,2)}, {}, {}, {mok, mok, mok});
+        // Completeness passes but a MAPPING is refused: the edge cannot be built, so the
+        // transaction is abandoned rather than run with a hole.
+        run("mapping_refused", {frag("l1")}, {own(OK::Linkage,1,2)},
+            {{1,2,LS::Ok,1}}, {{{1,2}, good}}, {mok, mbad, mok});
+        // An UNUSABLE fragment: explicitly missing evidence, so no activation.
+        run("unusable_present", {frag("u1"), frag("x1")},
+            {own(OK::Unary,1,1), own(OK::Unusable,0,0)}, {}, {}, {mok, mok, mok});
+        return 0;
+    }
+
     // ---- HYBRID COMPLETENESS SELF-TEST ----------------------------------------------------------
     // The third situation is the one that gets lost: linkage or Wide evidence EXISTS but cannot be
     // represented. An inactive ChainEdgeLinkage cannot express it -- the kernel reads that exactly
