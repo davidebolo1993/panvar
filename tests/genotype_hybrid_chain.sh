@@ -71,8 +71,14 @@
 #
 # EVERY CLASS NEEDS A DISPOSITION or the partition leaks: Unary is marker content; Linkage is
 # conditional phase, content given up; Wide is NOT representable by a pairwise transition and must
-# be reported unsupported/unresolved rather than deleted or cropped; Invariant is ignorable for
+# be reported UNSUPPORTED/INCOMPLETE rather than deleted or cropped; Invariant is ignorable for
 # ranking but belongs to absolute-fit calibration; Unusable is explicitly reported missing evidence.
+#
+# WIDE IS NOT "UNRESOLVED". Unresolved means the implemented model evaluated the evidence and could
+# not separate the states -- a statement about the data. Wide means the pairwise model could not
+# CONSUME the evidence at all -- a statement about the model's reach. Reporting the second as the
+# first would blame the data for a modelling limit, which is the same error as calling a run stopped
+# by a depth cap "ambiguous".
 #
 # Gates 5 (C4 block 7 keeps the marker caller's 48/48) and 6 (exact leave-zero-out controls do not
 # regress) are real-panel regressions and live in tests/regressions/: they need the C4 graph and
@@ -413,8 +419,17 @@ if ! "$BIN" genotype-frag --help 2>&1 | grep -q -- "--hybrid-call"; then
   echo "    * the background RETAINED inside each configuration's mixture;"
   echo "    * Li-Stephens prior and fragment linkage each applied exactly once;"
   echo "    * a global swap of the two homologues leaves the output unchanged;"
+  echo "    * Wide-owned fragments are reported UNSUPPORTED/INCOMPLETE, never silently dropped;"
   echo "    * ambiguous evidence gives an equivalence set or UNRESOLVED, not a confident guess."
   echo "  This file must FAIL, not skip, once --hybrid-call appears without satisfying them."
+else
+  # THE SENTINEL. Without this branch the paragraph above is a promise nothing enforces: the moment
+  # --hybrid-call exists the `if` is simply skipped and the file exits 0 having tested none of the
+  # chain. That is the vacuous-gate pattern this suite exists to prevent, so the arrival of the
+  # entry point FAILS here until the assertions above replace this block.
+  bad "--hybrid-call exists but none of the chain gates are implemented."
+  echo "       Replace this sentinel with the real assertions. Until then its presence is the"
+  echo "       failure: an entry point that no gate constrains is worse than no entry point."
 fi
 echo
 if [ "$fails" -eq 0 ]; then echo "hybrid chain: all active assertions passed"; else

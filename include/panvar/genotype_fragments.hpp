@@ -1649,8 +1649,13 @@ struct FragmentOwner {
 //   Unary      marker CONTENT evidence, into that block's unary factor;
 //   Linkage    conditional PHASE evidence, into one edge factor, content deliberately given up;
 //   Wide       three or more variables. NOT representable by a pairwise transition, so it must be
-//              reported as unsupported/unresolved -- never silently deleted, and never cropped
-//              into a pair, which is the defect tests/genotype_frag_factorisation.sh refuted;
+//              reported UNSUPPORTED/INCOMPLETE -- never silently deleted, and never cropped into a
+//              pair, which is the defect tests/genotype_frag_factorisation.sh refuted. NOT
+//              "unresolved": unresolved means the model evaluated the evidence and could not
+//              separate the states, a statement about the DATA, whereas Wide means the pairwise
+//              model could not consume the evidence at all, a statement about the MODEL's reach.
+//              Reporting the second as the first blames the data for a modelling limit -- the same
+//              error as calling a depth-capped run "ambiguous";
 //   Invariant  no genotype dependence, so ignorable for RANKING, but it still carries depth and
 //              still belongs to absolute-fit calibration;
 //   Unusable   explicitly reported MISSING evidence, not silence.
