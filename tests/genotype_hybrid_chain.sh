@@ -55,7 +55,11 @@
 #  14. forward-backward agrees with a BRUTE-FORCE path oracle on the log partition and on every
 #      block marginal, with a linkage-free control and a non-vacuity check;                 [ACTIVE]
 #  15. ONE chain exercises BOTH kernel edge paths -- factorised and linked -- so neither branch can
-#      be present but unused.                                                               [ACTIVE]
+#      be present but unused;                                                               [ACTIVE]
+#  16. every generated linkage edge is finite, mean-one per content class, and bounded by
+#      max log psi <= log|C| <= log 4, so exp(log psi) cannot overflow. An earlier version of this
+#      contract claimed exp would OVERFLOW at the 16043-nat spread; that spread is entirely on the
+#      NEGATIVE side (losing configurations underflowing), and the claim was wrong.         [ACTIVE]
 #   9. ambiguous evidence yields an equivalence set or UNRESOLVED, never a confident guess.
 #
 # NORMALISATION is settled in genotype_fragments.hpp. Linkage is a CONDITIONAL PHASE SCORE, and TWO
@@ -476,13 +480,13 @@ def ok(m): print("  ok   " + m)
 def no(m):
     global bad; bad += 1; print("  FAIL " + m)
 TOL = 1e-9
-for key, label in (("log_partition_abs_diff", "log partition"),
+for key, label in (("log_weight_sum_abs_diff", "log weight sum"),
                    ("worst_marginal_abs_diff", "every block marginal")):
     v = float(d[key])
     if v < TOL: ok("%s agrees with the brute-force path oracle (%.2e)" % (label, v))
     else: no("%s disagrees with the oracle by %.6g" % (label, v))
 # A LINKAGE-FREE control separates "the recursion is right" from "the linkage table is right".
-for key, label in (("log_partition_abs_diff_no_linkage", "log partition"),
+for key, label in (("log_weight_sum_abs_diff_no_linkage", "log weight sum"),
                    ("worst_marginal_abs_diff_no_linkage", "block marginals")):
     v = float(d[key])
     if v < TOL: ok("linkage-free control: %s agrees (%.2e)" % (label, v))
@@ -569,6 +573,18 @@ for case in usable_cases:
 else:
     ok("every USABLE case is mean-one within each content class (worst dev %.2e)"
        % max(float(d[k][3]) for k in usable_cases))
+# THE MEAN-ONE BOUND, asserted rather than reasoned about.
+import math as _m
+for case in usable_cases:
+    mx, mn = float(d[case][10]), float(d[case][11])
+    nf, ob = int(d[case][12]), int(d[case][13])
+    if nf: no("%s: %d non-finite log psi values" % (case, nf))
+    elif ob: no("%s: %d configurations exceed log|C| -- psi is not mean-one" % (case, ob))
+    elif mx > _m.log(4.0) + 1e-9:
+        no("%s: max log psi %.6f exceeds log 4 = %.6f" % (case, mx, _m.log(4.0)))
+    else:
+        ok("%s: max log psi %.6f <= log|C| (min %.4g, all finite) -- exp cannot overflow"
+           % (case, mx, mn))
 for case in usable_cases:
     if float(d[case][4]) > 1e-12:
         no("%s: global homologue swap changes log psi by %.2e" % (case, float(d[case][4]))); break

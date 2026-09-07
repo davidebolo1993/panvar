@@ -4543,8 +4543,8 @@ HybridPosterior hybrid_forward_backward(const HybridChain& c) {
                            },
                            &edges, fwd, bwd, &st);
     if (fwd.size() != nb) return out;
-    out.log_partition = st.log_scale;
-    for (std::size_t b = 0; b < nb; ++b) out.log_partition += shift[b];
+    out.log_partition_unnormalised = st.log_weight_sum;
+    for (std::size_t b = 0; b < nb; ++b) out.log_partition_unnormalised += shift[b];
     out.factorised_edges = st.factorised_edges;
     out.linked_edges = st.linked_edges;
     out.log_marginal.assign(nb, std::vector<double>(ns, kNegInf));
@@ -4612,7 +4612,7 @@ HybridPosterior hybrid_bruteforce(const HybridChain& c) {
         for (; k < nb; ++k) { if (++path[k] < ns) break; path[k] = 0; }
         if (k == nb) break;
     }
-    out.log_partition = z;
+    out.log_partition_unnormalised = z;
     for (std::size_t b = 0; b < nb; ++b) {
         for (std::size_t s = 0; s < ns; ++s) {
             if (out.log_marginal[b][s] != kNegInf) out.log_marginal[b][s] -= z;

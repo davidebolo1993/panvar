@@ -30,13 +30,22 @@ namespace panvar {
 //                      row-normalising would change the model and make one edge's linkage depend on
 //                      unrelated outgoing states.
 //
-// NUMERICAL NOTE, and it is not optional. The production recurrence works in scaled PROBABILITIES,
-// while psi is a log ratio whose spread reaches thousands of nats on real fixtures (16043 measured
-// on the two-bubble phase fixture). exp() of that overflows outright. So each linkage edge is
-// shifted by its own maximum log psi before exponentiating; the shift is a constant per edge, it
-// cancels in the per-block normalisation, and it is accumulated into `log_scale` so the partition
-// function is still recoverable. Configurations far below the maximum underflow to zero, which is
-// the arithmetically correct answer for something e^-16000 times less likely.
+// NUMERICAL NOTE. An earlier version of this comment claimed exp(log psi) would OVERFLOW because
+// the phase spread reaches 16043 nats on the two-bubble fixture. That was wrong. psi is mean-one
+// within each content class, so over a class of size |C| the values average to 1 and therefore
+//
+//     max log psi <= log|C| <= log 4 = 1.3863
+//
+// -- measured: the informative self-test case peaks at exactly log 2 = 0.693147. The large
+// magnitudes are all NEGATIVE (its minimum is -39.3), losing configurations underflowing toward
+// zero, which is the arithmetically correct answer for something e^-39 less likely. exp() of a
+// mean-one psi cannot exceed |C|.
+//
+// The per-edge shift below is therefore NOT rescuing an overflow. It is kept because it costs
+// nothing, cancels exactly in the per-block normalisation, and makes this kernel safe if it is ever
+// handed an arbitrary unnormalised log-potential rather than a mean-one one -- at which point the
+// bound above no longer holds. It is accumulated into the weight sum so the partition stays
+// recoverable. The mean-one invariant itself is asserted by --linkage-selftest, not assumed here.
 struct ChainEdgeLinkage {
     bool active = false;
     std::size_t n_a = 0, n_b = 0;
@@ -50,7 +59,14 @@ struct ChainEdgeLinkage {
 struct ChainKernelStats {
     std::size_t factorised_edges = 0;
     std::size_t linked_edges = 0;
-    double log_scale = 0.0;    // sum of log normalisers plus every linkage shift: log Z
+    // THE LOG OF AN UNNORMALISED WEIGHT SUM, not a probability-model partition function. The initial
+    // ordered states are given weight 1 each, NOT a uniform prior 1/n_hap^2, so this exceeds the
+    // partition of a model carrying that prior by exactly 2*log(n_hap). Block posteriors are
+    // unaffected -- the difference is a constant that divides out -- and the brute-force oracle uses
+    // the same convention, so their agreement is real. It matters only if this value is ever used
+    // for absolute fit, calibration, or comparison across panels of different sizes, which is why it
+    // is named for what it is rather than called a partition.
+    double log_weight_sum = 0.0;
 };
 
 // `block_emissions(bi, e)` must fill `e` with n_hap*n_hap unnormalised emission WEIGHTS (not logs)

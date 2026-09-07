@@ -50,7 +50,7 @@ void chain_forward_backward(
         const double s = std::accumulate(v.begin(), v.end(), 0.0);
         if (s > 0.0) {
             for (double& x : v) x /= s;
-            st.log_scale += std::log(s);
+            st.log_weight_sum += std::log(s);
         }
     };
 
@@ -83,7 +83,7 @@ void chain_forward_backward(
             // O(n_h^4). The potential is used UNNORMALISED.
             ++st.linked_edges;
             const double shift = linkage_shift(*lk);
-            st.log_scale += shift;
+            st.log_weight_sum += shift;
             for (std::size_t i2 = 0; i2 < nh; ++i2)
                 for (std::size_t j2 = 0; j2 < nh; ++j2) {
                     double acc = 0.0;

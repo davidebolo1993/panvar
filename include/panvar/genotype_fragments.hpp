@@ -1904,7 +1904,11 @@ struct HybridChain {
 };
 
 struct HybridPosterior {
-    double log_partition = 0.0;
+    // UNNORMALISED. Initial ordered states carry weight 1, not a uniform prior 1/n_hap^2, so this
+    // exceeds a prior-carrying model's partition by exactly 2*log(n_hap). Block marginals are
+    // unaffected and the brute-force oracle uses the same convention, so the two agreeing is a real
+    // check. Named for what it is, because an absolute-fit or cross-panel use would be wrong.
+    double log_partition_unnormalised = 0.0;
     std::vector<std::vector<double>> log_marginal;  // [block][i * n_hap + j], normalised
     // Which kernel edge paths actually RAN. A fixture must exercise both in one chain, or the
     // factorised branch or the linked branch can be present and never taken.

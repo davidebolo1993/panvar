@@ -773,13 +773,13 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             worst_sum = std::max(worst_sum, std::abs(sum - 1.0));
         }
         std::printf("metric\tvalue\n");
-        std::printf("log_partition_fb\t%.17g\n", fb.log_partition);
-        std::printf("log_partition_bruteforce\t%.17g\n", bf.log_partition);
-        std::printf("log_partition_abs_diff\t%.17g\n",
-                    std::abs(fb.log_partition - bf.log_partition));
+        std::printf("log_weight_sum_fb\t%.17g\n", fb.log_partition_unnormalised);
+        std::printf("log_weight_sum_bruteforce\t%.17g\n", bf.log_partition_unnormalised);
+        std::printf("log_weight_sum_abs_diff\t%.17g\n",
+                    std::abs(fb.log_partition_unnormalised - bf.log_partition_unnormalised));
         std::printf("worst_marginal_abs_diff\t%.17g\n", worst_marg);
-        std::printf("log_partition_abs_diff_no_linkage\t%.17g\n",
-                    std::abs(fb0.log_partition - bf0.log_partition));
+        std::printf("log_weight_sum_abs_diff_no_linkage\t%.17g\n",
+                    std::abs(fb0.log_partition_unnormalised - bf0.log_partition_unnormalised));
         std::printf("worst_marginal_abs_diff_no_linkage\t%.17g\n", worst_marg0);
         std::printf("worst_marginal_sum_dev\t%.17g\n", worst_sum);
         std::printf("linkage_marginal_effect\t%.17g\n", linkage_effect);
@@ -819,9 +819,11 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             // GUARD BEFORE INDEXING. A refused edge has EMPTY score/log_psi with n_a and n_b still
             // set, so looping over n_a*n_b reads out of bounds.
             if (!E.usable()) {
-                std::printf("%s\t%zu\t%s\t%s\t%s\t%s\t%d\t%zu\t%s\t%.17g\n",
+                std::printf("%s\t%zu\t%s\t%s\t%s\t%s\t%d\t%zu\t%s\t%.17g"
+                            "\t%s\t%s\t%s\t%s\n",
                             name, ems.size(), "0", "0", "0", "-", 0, E.n_invalid,
-                            linkage_status_name(E.status), E.exposure_asymmetry);
+                            linkage_status_name(E.status), E.exposure_asymmetry,
+                            "0", "0", "0", "0");
                 return;
             }
             const std::size_t na = E.n_a, nb = E.n_b;
@@ -854,9 +856,44 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                 sizes += (sizes.empty() ? "" : ",") + std::to_string(kv.first) + "x" +
                          std::to_string(kv.second);
             }
-            std::printf("%s\t%zu\t%.17g\t%.17g\t%.17g\t%s\t%d\t%zu\t%s\t%.17g\n",
+            // THE MEAN-ONE INVARIANT, stated as a bound rather than assumed. psi averages to one
+            // over a class of size |C|, so no configuration can exceed |C| and
+            //     max log psi <= log|C| <= log 4 = 1.3863.
+            // The large magnitudes a linkage edge produces are all NEGATIVE -- losing
+            // configurations underflowing toward zero -- so exp(log psi) cannot overflow. Measured
+            // here rather than reasoned about, with non-finite values counted separately.
+            double max_log = -std::numeric_limits<double>::infinity();
+            double min_log = std::numeric_limits<double>::infinity();
+            std::size_t nonfinite = 0, over_bound = 0;
+            {
+                std::vector<char> seen2(E.log_psi.size(), 0);
+                for (std::size_t a1 = 0; a1 < na; ++a1)
+                for (std::size_t b1 = 0; b1 < nb; ++b1)
+                for (std::size_t a2 = 0; a2 < na; ++a2)
+                for (std::size_t b2 = 0; b2 < nb; ++b2) {
+                    const std::size_t c = ((a1*nb + b1)*na + a2)*nb + b2;
+                    const double v = E.log_psi[c];
+                    if (!std::isfinite(v)) ++nonfinite;
+                    else { max_log = std::max(max_log, v); min_log = std::min(min_log, v); }
+                    if (seen2[c]) continue;
+                    const std::size_t A3[2] = {a1, a2}, B3[2] = {b1, b2};
+                    std::vector<std::size_t> cl;
+                    for (int q1 = 0; q1 < 2; ++q1) for (int q2 = 0; q2 < 2; ++q2)
+                        cl.push_back(((A3[q1]*nb + B3[q2])*na + A3[1-q1])*nb + B3[1-q2]);
+                    std::sort(cl.begin(), cl.end());
+                    cl.erase(std::unique(cl.begin(), cl.end()), cl.end());
+                    const double bound = std::log(static_cast<double>(cl.size()));
+                    for (std::size_t z : cl) {
+                        seen2[z] = 1;
+                        if (std::isfinite(E.log_psi[z]) && E.log_psi[z] > bound + 1e-9) ++over_bound;
+                    }
+                }
+            }
+            std::printf("%s\t%zu\t%.17g\t%.17g\t%.17g\t%s\t%d\t%zu\t%s\t%.17g"
+                        "\t%.17g\t%.17g\t%zu\t%zu\n",
                         name, ems.size(), maxabs, worst_mean, swap, sizes.c_str(),
-                        E.usable() ? 1 : 0, E.n_invalid, linkage_status_name(E.status), E.exposure_asymmetry);
+                        E.usable() ? 1 : 0, E.n_invalid, linkage_status_name(E.status),
+                        E.exposure_asymmetry, max_log, min_log, nonfinite, over_bound);
         };
         const auto mk = [&](const std::vector<double>& mass) {
             LinkageEmission m;
@@ -864,7 +901,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             return m;
         };
         std::printf("case\tfragments\tmax_abs_log_psi\tworst_mean_dev\tswap_asym\tclass_sizes"
-                    "\tusable\tn_invalid\tstatus\texposure_asym\n");
+                    "\tusable\tn_invalid\tstatus\texposure_asym"
+                    "\tmax_log_psi\tmin_log_psi\tnonfinite\tover_class_bound\n");
         report("zero_fragments", {});
         report("flat_emissions", {mk({-100.0, -100.0, -100.0, -100.0}),
                                   mk({-100.0, -100.0, -100.0, -100.0})});
