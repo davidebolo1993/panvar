@@ -332,6 +332,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     std::size_t interval_batch = 500;
     bool interval_lazy = false, interval_screen_only = false;
     std::string interval_rounds;
+    std::string ownership_table;
     std::vector<std::string> reconcile_scope;
     std::string switch_penalties_arg = "0,10,100,1000";
     std::vector<std::string> exact_distance;
@@ -378,6 +379,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--interval-lazy") interval_lazy = true;
         else if (a == "--interval-screen-only") { interval_lazy = true; interval_screen_only = true; }
         else if (a == "--interval-rounds") interval_rounds = value(i, a);
+        else if (a == "--ownership-table") ownership_table = value(i, a);
         else if (a == "--scope-tol") {
             const std::string sv = value(i, a);
             scope_tol = std::stod(sv);
@@ -1044,6 +1046,88 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             scope_restricted_pair_loglik(frames[ia], frames[ib], rfr, scopes, rp, false);
         std::printf("%.17g\t%.17g\t%.17g\t%.17g\t%.17g\n",
                     whole, fact, whole - fact, block, fact - block);
+        log.done();
+        return 0;
+    }
+
+    // ---- EVIDENCE OWNERSHIP ---------------------------------------------------------------------
+    // Which factor each fragment belongs to, decided ONCE over the whole candidate set before any
+    // genotype is scored. This is the rule that keeps marker unaries and fragment linkage factors
+    // from counting the same read twice; see FragmentOwner in genotype_fragments.hpp.
+    if (!ownership_table.empty()) {
+        const std::vector<Fragment> ofr = load_fragments(read_paths);
+        if (ofr.empty()) throw std::runtime_error("genotype-frag: --ownership-table needs reads");
+        std::vector<CandidateFrame> frames;
+        std::vector<std::string> cname;
+        {
+            const auto by_name = path_records_by_name(graph);
+            for (const PathRecord& pr : panel_graph.paths) {
+                const auto it = by_name.find(pr.name);
+                if (it == by_name.end() || it->second == nullptr) continue;
+                bool complete = false;
+                const std::string walk =
+                    spell_path_steps_sequence(graph, it->second->steps, &complete);
+                if (!complete) continue;
+                const CandidateFrame cf = build_candidate_frame(blocks, pr.name, walk);
+                if (!cf.ok) continue;
+                frames.push_back(cf); cname.push_back(pr.name);
+            }
+        }
+        // THE SAME REFUSAL --reconcile-scope makes, for the same reason: a scope computed over a
+        // REDUCED candidate set is a scope for a smaller, easier problem than the one a caller
+        // scores, and candidate independence is the property that makes ownership meaningful.
+        if (frames.size() != panel_graph.paths.size()) {
+            throw std::runtime_error(
+                "genotype-frag: --ownership-table has a verified walk-to-block map for only " +
+                std::to_string(frames.size()) + " of " +
+                std::to_string(panel_graph.paths.size()) + " panel candidates. Assigning ownership "
+                "over the reduced set would make the factor topology depend on which candidates "
+                "happened to decompose. Exclude them explicitly with --exclude-haplotypes, or fix "
+                "the decomposition. Run --origin-universe to list them.");
+        }
+        long min_len_o = 1;
+        for (const Fragment& F : ofr) {
+            min_len_o = std::max<long>(min_len_o, static_cast<long>(F.r1.size() + F.r2.size()));
+        }
+        const InsertPrior ip_o = make_insert_prior(opt.fragment_len, opt.fragment_sd,
+                                                   opt.discordant_rate, 4, min_len_o);
+        const double lep_o = std::log(opt.error_rate / 3.0);
+        const double l1m_o = std::log1p(-opt.error_rate);
+        std::vector<PieceIndex> opidx;
+        {
+            std::size_t piece = 0;
+            for (const Fragment& F : ofr) {
+                if (F.r1.empty()) continue;
+                piece = F.r1.size() / (mate_band_edits(opt.max_divergence, F.r1.size()) + 1);
+                break;
+            }
+            if (piece >= 12) {
+                opidx.resize(frames.size());
+                for (std::size_t h = 0; h < frames.size(); ++h) {
+                    opidx[h] = build_piece_index(frames[h].seq, piece);
+                }
+            }
+        }
+        std::vector<FragmentOwner> owners(ofr.size());
+        run_parallel(ofr.size(), opt.threads, [&](std::size_t fi) {
+            owners[fi] = assign_fragment_owner(ofr[fi], frames, ip_o, opt.max_divergence,
+                                               lep_o, l1m_o, scope_tol,
+                                               opidx.empty() ? nullptr : &opidx);
+        });
+        std::size_t n_un = 0, n_li = 0, n_wi = 0, n_no = 0;
+        for (const FragmentOwner& o2 : owners) {
+            switch (o2.kind) {
+                case OwnerKind::Unary:   ++n_un; break;
+                case OwnerKind::Linkage: ++n_li; break;
+                case OwnerKind::Wide:    ++n_wi; break;
+                default:                 ++n_no; break;
+            }
+        }
+        write_ownership_table(ownership_table, ofr, owners);
+        log.info("ownership over " + std::to_string(frames.size()) + " candidates: " +
+                 std::to_string(n_un) + " unary, " + std::to_string(n_li) + " linkage, " +
+                 std::to_string(n_wi) + " wide, " + std::to_string(n_no) + " unusable");
+        log.wrote({ownership_table});
         log.done();
         return 0;
     }

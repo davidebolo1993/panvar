@@ -1519,6 +1519,59 @@ std::pair<std::uint32_t, std::uint32_t> ordered_block_span(
     const CandidateFrame& frame, long start, long end);
 
 // ---------------------------------------------------------------------------------------------
+// EVIDENCE OWNERSHIP -- the rule the hybrid block caller rests on.
+//
+// Marker unary factors and fragment linkage factors must NOT count the same read evidence twice, so
+// every fragment is OWNED by exactly one factor:
+//
+//   Unary(b)        certified scope is the single block b -> feeds b's marker unary;
+//   Linkage(b,b+1)  certified scope is two ADJACENT blocks -> feeds their linkage factor ONCE,
+//                   sequence evidence included;
+//   Wide            certified scope is wider, or two non-adjacent blocks -> needs a wider factor.
+//                   It is NEVER cropped into adjacent factors: tests/genotype_frag_factorisation.sh
+//                   already established that cropping deletes real mass;
+//   Unusable        no certified scope at all, or mass that belongs to no block.
+//
+// Ownership is a PARTITION, which is why "counted twice" and "silently dropped" are one assertion.
+//
+// CANDIDATE INDEPENDENCE is load-bearing and is why the scope is computed over the WHOLE candidate
+// set at once, never over the pair being scored. A candidate may reweight an origin; it must never
+// decide which variables a factor depends on, or the factor topology becomes another
+// genotype-dependent approximation -- the defect this whole line of work exists to remove.
+//
+// WHY THE BAND AND NOT THE EXACT ORACLE. enumerate_fragment_origins is O(|hap|) per candidate and
+// exists to certify, not to run: the exact emission is finite at every position, so every fragment
+// has an origin in every block and a union-of-spans scope is the whole locus. Inside the production
+// band only real placements survive, and what lies outside it is bounded rather than ignored --
+// so the scope below is certified, with `dropped` reporting exactly what restricting to it costs.
+enum class OwnerKind { Unary, Linkage, Wide, Unusable };
+const char* owner_kind_name(OwnerKind k);
+
+struct FragmentOwner {
+    OwnerKind kind = OwnerKind::Unusable;
+    std::uint32_t block_lo = 0, block_hi = 0;   // Unary: lo == hi. Linkage: hi == lo + 1.
+    std::vector<std::uint32_t> scope;           // certified, ascending
+    double in_band = 0.0;         // logsumexp over in-band origins, all candidates
+    double omitted_bound = 0.0;   // certified bound on everything outside the band
+    double unmapped = 0.0;        // in-band mass belonging to NO block (partial frames)
+    double dropped = 0.0;         // NATS the scope restriction costs; certified <= scope_tol
+    std::size_t origins = 0;
+    bool certified = false;
+};
+
+// One fragment's owning factor. `pidx`, when given, is the per-candidate piece index the bounded
+// search uses; it changes speed only.
+FragmentOwner assign_fragment_owner(const Fragment& fragment,
+                                    const std::vector<CandidateFrame>& frames,
+                                    const InsertPrior& ip, double max_divergence,
+                                    double log_eps, double log_1meps, double scope_tol,
+                                    const std::vector<PieceIndex>* pidx = nullptr);
+
+void write_ownership_table(const std::string& path,
+                           const std::vector<Fragment>& fragments,
+                           const std::vector<FragmentOwner>& owners);
+
+// ---------------------------------------------------------------------------------------------
 // PLACEMENT-DEPENDENCY ORACLE
 //
 // The blocker (tests/genotype_frag_factorisation.sh) established that recruitment scoping is not a

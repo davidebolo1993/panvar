@@ -3976,3 +3976,137 @@ OriginUniverse enumerate_fragment_origins(const Fragment& fragment,
 
 
 } // namespace panvar
+
+namespace panvar {
+
+const char* owner_kind_name(OwnerKind k) {
+    switch (k) {
+        case OwnerKind::Unary:    return "unary";
+        case OwnerKind::Linkage:  return "linkage";
+        case OwnerKind::Wide:     return "wide";
+        default:                  return "unusable";
+    }
+}
+
+FragmentOwner assign_fragment_owner(const Fragment& fragment,
+                                    const std::vector<CandidateFrame>& frames,
+                                    const InsertPrior& ip, double max_divergence,
+                                    double log_eps, double log_1meps, double scope_tol,
+                                    const std::vector<PieceIndex>* pidx) {
+    FragmentOwner out;
+    out.in_band = kNegInf;
+    out.omitted_bound = kNegInf;
+    out.unmapped = kNegInf;
+    if (fragment.r1.empty() || fragment.r2.empty()) return out;
+
+    const std::size_t d1 = mate_band_edits(max_divergence, fragment.r1.size());
+    const std::size_t d2 = mate_band_edits(max_divergence, fragment.r2.size());
+    const std::string a1 = reverse_complement(fragment.r1);
+    const std::string a2 = reverse_complement(fragment.r2);
+    const double log_half_strand = std::log(0.5);
+
+    // One origin per in-band state, carrying its own mass and the block span it touches. Collected
+    // over EVERY candidate before anything is decided: the scope must not depend on which pair is
+    // being scored.
+    struct Origin { double mass; std::uint32_t lo, hi; };
+    std::vector<Origin> origins;
+    for (std::uint32_t h = 0; h < frames.size(); ++h) {
+        if (!frames[h].ok || frames[h].seq.empty()) continue;
+        const PieceIndex* ix = (pidx && pidx->size() == frames.size()) ? &(*pidx)[h] : nullptr;
+        const std::string& hap = frames[h].seq;
+        const auto f1 = bounded_mate_placements(fragment.r1, hap, d1, nullptr, ix);
+        const auto v1 = bounded_mate_placements(a1, hap, d1, nullptr, ix);
+        const auto f2 = bounded_mate_placements(fragment.r2, hap, d2, nullptr, ix);
+        const auto v2 = bounded_mate_placements(a2, hap, d2, nullptr, ix);
+        const auto st = enumerate_fragment_states(h, f1, v1, f2, v2, fragment.r1.size(),
+                                                  fragment.r2.size(), ip.lo, ip.hi);
+        // The band's own omitted-mass bound, per candidate, so what lies OUTSIDE the band is
+        // bounded rather than assumed away. Summed across candidates: dropping it would make the
+        // scope look certified when the evidence for it was never examined.
+        const double b = omitted_mass_bound(hap.size(), fragment.r1.size(), fragment.r2.size(),
+                                            d1, d2, ip, log_eps, log_1meps, st);
+        if (b != kNegInf) out.omitted_bound = log_add(out.omitted_bound, b);
+        for (const FragmentState& z : st) {
+            const double e1 = static_cast<double>(z.m1_edits) * log_eps +
+                              static_cast<double>(fragment.r1.size() - z.m1_edits) * log_1meps;
+            const double e2 = static_cast<double>(z.m2_edits) * log_eps +
+                              static_cast<double>(fragment.r2.size() - z.m2_edits) * log_1meps;
+            const double m = log_half_strand + e1 + e2 + ip.log_at(z.insert);
+            // frag_start/frag_end, NOT start+insert: the state already carries its ordered span,
+            // and re-deriving it would get an antiparallel candidate's interval backwards -- the
+            // defect that once turned a fragment's scope from {1} into {1,2}.
+            const auto span = ordered_block_span(frames[h], z.frag_start, z.frag_end);
+            out.in_band = log_add(out.in_band, m);
+            if (span.first == kUnmappedBlock || span.second == kUnmappedBlock) {
+                // Unattributable: it belongs to no block, so it can never be dropped by narrowing
+                // the scope and can never justify widening it. Kept separate, never folded in.
+                out.unmapped = log_add(out.unmapped, m);
+                continue;
+            }
+            origins.push_back(Origin{m, span.first, span.second});
+        }
+    }
+    out.origins = origins.size();
+    if (origins.empty()) return out;
+
+    // THE ESSENTIAL ORIGIN SET. Origins are taken in decreasing mass until everything still
+    // excluded -- the remaining origins, the unmapped mass and the out-of-band bound together --
+    // costs at most scope_tol nats off the total. The scope is the union of the blocks THOSE
+    // origins span. Anything outside it is provably worth less than the declared tolerance, which
+    // is what makes this a certified scope rather than a recruitment heuristic.
+    std::sort(origins.begin(), origins.end(),
+              [](const Origin& x, const Origin& y) { return x.mass > y.mass; });
+    double total = out.in_band;
+    if (out.omitted_bound != kNegInf) total = log_add(total, out.omitted_bound);
+    double kept = kNegInf;
+    std::size_t n_keep = 0;
+    for (; n_keep < origins.size(); ++n_keep) {
+        if (total - kept <= scope_tol) break;
+        kept = log_add(kept, origins[n_keep].mass);
+    }
+    out.dropped = (kept == kNegInf) ? std::numeric_limits<double>::infinity() : total - kept;
+    out.certified = out.dropped <= scope_tol;
+
+    std::vector<std::uint32_t> sc;
+    for (std::size_t i = 0; i < n_keep; ++i) {
+        for (std::uint32_t b = origins[i].lo; b <= origins[i].hi; ++b) sc.push_back(b);
+    }
+    std::sort(sc.begin(), sc.end());
+    sc.erase(std::unique(sc.begin(), sc.end()), sc.end());
+    out.scope = sc;
+
+    if (!out.certified || sc.empty()) { out.kind = OwnerKind::Unusable; return out; }
+    // Unattributable mass above the tolerance means a block-factored model cannot express this
+    // fragment at all. It is NOT quietly assigned to the nearest block.
+    if (out.unmapped != kNegInf && total - out.unmapped < scope_tol) {
+        out.kind = OwnerKind::Unusable;
+        return out;
+    }
+    out.block_lo = sc.front();
+    out.block_hi = sc.back();
+    if (sc.size() == 1) out.kind = OwnerKind::Unary;
+    else if (sc.size() == 2 && sc[1] == sc[0] + 1) out.kind = OwnerKind::Linkage;
+    else out.kind = OwnerKind::Wide;
+    return out;
+}
+
+void write_ownership_table(const std::string& path,
+                           const std::vector<Fragment>& fragments,
+                           const std::vector<FragmentOwner>& owners) {
+    std::ofstream f(path);
+    if (!f) throw std::runtime_error("genotype-frag: cannot write " + path);
+    f.precision(10);
+    f << "fragment\towner\tblock_lo\tblock_hi\tscope_size\torigins\tin_band\tomitted_bound"
+         "\tunmapped\tdropped_nats\tcertified\n";
+    for (std::size_t i = 0; i < owners.size() && i < fragments.size(); ++i) {
+        const FragmentOwner& o = owners[i];
+        f << fragments[i].name << '\t' << owner_kind_name(o.kind) << '\t'
+          << o.block_lo << '\t' << o.block_hi << '\t' << o.scope.size() << '\t' << o.origins
+          << '\t' << o.in_band << '\t' << o.omitted_bound << '\t' << o.unmapped << '\t'
+          << o.dropped << '\t' << (o.certified ? 1 : 0) << '\n';
+    }
+    f.flush();
+    if (!f) throw std::runtime_error("genotype-frag: write failed for " + path);
+}
+
+} // namespace panvar

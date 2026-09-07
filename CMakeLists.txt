@@ -385,6 +385,19 @@ if(PANVAR_BUILD_TESTING)
             set_tests_properties(panvar_genotype_lazy_refinement PROPERTIES TIMEOUT 900)
         endif()
 
+        # The hybrid block caller's contract: evidence ownership, then the chain that consumes it.
+        # Gates 3 and 4 run today against --ownership-table; 1, 2 and 7 are held behind --hybrid-call
+        # and this test must FAIL, not skip, once that entry point exists without satisfying them.
+        set(PANVAR_HYBRID_CHAIN ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_hybrid_chain.sh)
+        if(EXISTS ${PANVAR_HYBRID_CHAIN} AND PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE)
+            add_test(
+                NAME panvar_genotype_hybrid_chain
+                COMMAND /usr/bin/env bash ${PANVAR_HYBRID_CHAIN} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/genotype_hybrid_chain
+            )
+            set_tests_properties(panvar_genotype_hybrid_chain PROPERTIES
+                TIMEOUT 900 SKIP_RETURN_CODE 77)
+        endif()
+
         set(PANVAR_BOUNDED_SEARCH ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_bounded_search.sh)
         if(EXISTS ${PANVAR_BOUNDED_SEARCH} AND PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE)
             add_test(
