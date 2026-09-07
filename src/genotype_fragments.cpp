@@ -4283,8 +4283,38 @@ LinkageEdge aggregate_linkage_edge(const std::vector<LinkageEmission>& emissions
     E.score.assign(ncfg, 0.0);
     E.log_psi.assign(ncfg, 0.0);
     E.n_fragments = emissions.size();
-    for (const LinkageEmission& m : emissions) if (m.informative) ++E.n_informative;
+    for (const LinkageEmission& m : emissions) {
+        if (!m.ok) ++E.n_invalid;
+        else if (m.informative) ++E.n_informative;
+    }
     const double log_lambda = std::log(lambda);
+
+    // EXPOSURE MUST CANCEL WITHIN EVERY CONTENT CLASS, and is then not carried at all. Checking it
+    // rather than assuming it is the whole point: the affine argument holds only above the insert
+    // support, and a short window from a deletion or bypass breaks it. Where it fails the edge is
+    // UNSUPPORTED -- keeping it would let an edge with no fragments move the model through an
+    // exposure difference, which is exactly the guarantee being made here.
+    for (std::size_t a1 = 0; a1 < na; ++a1)
+    for (std::size_t b1 = 0; b1 < nb; ++b1)
+    for (std::size_t a2 = 0; a2 < na; ++a2)
+    for (std::size_t b2 = 0; b2 < nb; ++b2) {
+        const double straight = geom.exposure[a1 * nb + b1] + geom.exposure[a2 * nb + b2];
+        const double crossed  = geom.exposure[a1 * nb + b2] + geom.exposure[a2 * nb + b1];
+        E.exposure_asymmetry = std::max(E.exposure_asymmetry, std::abs(straight - crossed));
+    }
+    E.exposure_cancels = E.exposure_asymmetry <= 1e-9;
+    if (!E.exposure_cancels) {
+        E.status = "exposure-does-not-cancel";
+        E.ok = true;          // computed, and deliberately unusable
+        E.usable = false;
+        return E;             // log_psi stays all-zero and must not be consumed
+    }
+    if (E.n_invalid > 0) {
+        E.status = "invalid-emissions";
+        E.ok = true;
+        E.usable = false;
+        return E;
+    }
     // S_e: the two homologues combined ONCE, background mixed ONCE, summed over fragments, and
     // exposure charged ONCE for the edge -- outside the fragment loop, from the geometry.
     for (std::size_t a1 = 0; a1 < na; ++a1)
@@ -4294,7 +4324,9 @@ LinkageEdge aggregate_linkage_edge(const std::vector<LinkageEmission>& emissions
         const std::size_t c = ((a1 * nb + b1) * na + a2) * nb + b2;
         double acc = 0.0;
         for (const LinkageEmission& m : emissions) {
-            if (!m.ok) continue;
+            // No !m.ok skip here: an invalid emission has already made the edge unusable above.
+            // Skipping it silently would shrink the evidence set and report a confident answer from
+            // fewer fragments than the ownership partition claims.
             const double m1 = m.mass[a1 * nb + b1];
             const double m2 = m.mass[a2 * nb + b2];
             double sig = kNegInf;
@@ -4304,7 +4336,9 @@ LinkageEdge aggregate_linkage_edge(const std::vector<LinkageEmission>& emissions
             const double bg = log_bg_weight + m.log_p_bg;
             acc += (sig == kNegInf) ? bg : log_add(sig, bg);
         }
-        acc -= lambda * (geom.exposure[a1 * nb + b1] + geom.exposure[a2 * nb + b2]);
+        // NO EXPOSURE TERM. It is required to cancel (verified above) and is therefore not
+        // carried, so an edge with zero fragments has S == 0 everywhere and log psi == 0 by
+        // construction -- not by the accident of its alleles happening to be equal length.
         E.score[c] = acc;
     }
     // PHASE ONLY, as a MEAN-ONE LIKELIHOOD RATIO within each unordered-content class:
@@ -4348,6 +4382,8 @@ LinkageEdge aggregate_linkage_edge(const std::vector<LinkageEmission>& emissions
         const double lmean = lse - std::log(static_cast<double>(cls.size()));
         for (std::size_t k : cls) { E.log_psi[k] = E.score[k] - lmean; done[k] = 1; }
     }
+    E.status = "ok";
+    E.usable = true;
     E.ok = true;
     return E;
 }

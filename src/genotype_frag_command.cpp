@@ -700,8 +700,9 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         g.exposure_affine = true;
         g.ok = true;
         const double lam = 0.05, mix = std::log1p(-0.05), bgw = std::log(0.05);
-        const auto report = [&](const char* name, const std::vector<LinkageEmission>& ems) {
-            const LinkageEdge E = aggregate_linkage_edge(ems, g, lam, mix, bgw);
+        const auto report = [&](const char* name, const std::vector<LinkageEmission>& ems,
+                                const LinkageGeometry* gover = nullptr) {
+            const LinkageEdge E = aggregate_linkage_edge(ems, gover ? *gover : g, lam, mix, bgw);
             const std::size_t na = E.n_a, nb = E.n_b;
             double maxabs = 0.0, worst_mean = 0.0, swap = 0.0;
             std::map<std::size_t, std::size_t> class_sizes;
@@ -732,15 +733,17 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                 sizes += (sizes.empty() ? "" : ",") + std::to_string(kv.first) + "x" +
                          std::to_string(kv.second);
             }
-            std::printf("%s\t%zu\t%.17g\t%.17g\t%.17g\t%s\n", name, ems.size(), maxabs,
-                        worst_mean, swap, sizes.c_str());
+            std::printf("%s\t%zu\t%.17g\t%.17g\t%.17g\t%s\t%d\t%zu\t%s\t%.17g\n",
+                        name, ems.size(), maxabs, worst_mean, swap, sizes.c_str(),
+                        E.usable ? 1 : 0, E.n_invalid, E.status.c_str(), E.exposure_asymmetry);
         };
         const auto mk = [&](const std::vector<double>& mass) {
             LinkageEmission m;
             m.n_a = 2; m.n_b = 2; m.mass = mass; m.log_p_bg = -400.0; m.ok = true;
             return m;
         };
-        std::printf("case\tfragments\tmax_abs_log_psi\tworst_mean_dev\tswap_asym\tclass_sizes\n");
+        std::printf("case\tfragments\tmax_abs_log_psi\tworst_mean_dev\tswap_asym\tclass_sizes"
+                    "\tusable\tn_invalid\tstatus\texposure_asym\n");
         report("zero_fragments", {});
         report("flat_emissions", {mk({-100.0, -100.0, -100.0, -100.0}),
                                   mk({-100.0, -100.0, -100.0, -100.0})});
@@ -749,6 +752,23 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                                       -std::numeric_limits<double>::infinity(),
                                       -std::numeric_limits<double>::infinity()})});
         report("informative",    {mk({-100.0, -140.0, -140.0, -100.0})});
+        // EXPOSURE THAT DOES NOT CANCEL. The equal-length alleles above make exposure
+        // phase-invariant, so they CANNOT detect an edge whose exposure differs between phases --
+        // which is exactly what unequal short alleles produce once a window drops below the insert
+        // support. Set directly here so the check is tested rather than the fixture's luck:
+        // E(0,0)+E(1,1) = 0+9 = 9 against E(0,1)+E(1,0) = 1+4 = 5.
+        {
+            LinkageGeometry gu = g;
+            gu.exposure = {0.0, 1.0, 4.0, 9.0};
+            gu.exposure_affine = false;
+            report("unequal_exposure", {}, &gu);
+            report("unequal_exposure_with_frags", {mk({-100.0, -140.0, -140.0, -100.0})}, &gu);
+        }
+        // AN OWNED FRAGMENT WITH NO EMISSION must make the edge INCOMPLETE, never vanish.
+        {
+            LinkageEmission bad_em;   // ok == false
+            report("invalid_emission", {mk({-100.0, -140.0, -140.0, -100.0}), bad_em});
+        }
         return 0;
     }
 
@@ -1280,8 +1300,9 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             std::ofstream ef(ep);
             if (!ef) throw std::runtime_error("genotype-frag: cannot write " + ep);
             ef.precision(10);
-            ef << "block_a\tblock_b\tn_a\tn_b\tfragments\tinformative\tconfigs"
-                  "\texposure_affine\tpsi_mean_dev_in_class\tbest_phase_config\tmax_phase_spread\tswap_asymmetry\n";
+            ef << "block_a\tblock_b\tn_a\tn_b\tfragments\tinformative\tinvalid\tconfigs"
+                  "\texposure_affine\tpsi_mean_dev_in_class\tbest_phase_config\tmax_phase_spread"
+                  "\tswap_asymmetry\tusable\tstatus\texposure_asym\n";
             std::size_t emitted = 0, refused = 0;
             for (const auto& kv : by_edge) {
                 const LinkageGeometry geom = build_linkage_geometry(
@@ -1393,10 +1414,17 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                     }
                 }
                 ef << geom.block_a << '\t' << geom.block_b << '\t' << E.n_a << '\t' << E.n_b
-                   << '\t' << E.n_fragments << '\t' << E.n_informative << '\t'
-                   << E.log_psi.size() << '\t' << (geom.exposure_affine ? 1 : 0) << '\t'
+                   << '\t' << E.n_fragments << '\t' << E.n_informative << '\t' << E.n_invalid
+                   << '\t' << E.log_psi.size() << '\t' << (geom.exposure_affine ? 1 : 0) << '\t'
                    << worst << '\t' << bestc << '\t' << bestv << '\t'
-                   << swap_asym << '\n';
+                   << swap_asym << '\t' << (E.usable ? 1 : 0) << '\t' << E.status << '\t'
+                   << E.exposure_asymmetry << '\n';
+                // An unusable edge must PROPAGATE, not be quietly omitted from the summary.
+                if (!E.usable) {
+                    log.info("edge " + std::to_string(geom.block_a) + "-" +
+                             std::to_string(geom.block_b) + " is UNSUPPORTED/INCOMPLETE: " +
+                             E.status + " (its log psi is zeroed and must not be consumed)");
+                }
             }
             lp.flush(); ef.flush();
             log.info("linkage: " + std::to_string(by_edge.size()) + " edge(s), " +

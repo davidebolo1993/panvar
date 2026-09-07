@@ -410,8 +410,12 @@ def no(m):
 if not rows: no("no linkage edge aggregated"); sys.exit(1)
 for r in rows:
     na, nb = int(r[2]), int(r[3])
-    nfrag, ninf, ncfg = int(r[4]), int(r[5]), int(r[6])
-    psisum, spread, swap = float(r[8]), float(r[10]), float(r[11])
+    nfrag, ninf, ninv, ncfg = int(r[4]), int(r[5]), int(r[6]), int(r[7])
+    psisum, spread, swap = float(r[9]), float(r[11]), float(r[12])
+    usable, status = r[13] == "1", r[14]
+    if not usable:
+        no("edge %s-%s is %s -- it must not be consumed" % (r[0], r[1], status)); continue
+    if ninv: no("edge %s-%s has %d owned fragments with no emission yet is usable" % (r[0],r[1],ninv))
     tag = "edge %s-%s" % (r[0], r[1])
     if ncfg == na*nb*na*nb: ok("%s: %d configurations over %dx%d alleles" % (tag, ncfg, na, nb))
     else: no("%s: %d configurations, expected %d" % (tag, ncfg, na*nb*na*nb))
@@ -432,7 +436,7 @@ for r in rows:
        % (tag, nfrag, ninf, 100.0*ninf/nfrag if nfrag else 0.0))
 # The per-fragment informative flag must agree with the edge's count -- two paths, one answer.
 finf = sum(1 for r in frs if r[10] == "1")
-einf = sum(int(r[5]) for r in rows)
+einf = sum(int(r[5]) for r in rows if r[13] == "1")
 if finf == einf: ok("per-fragment and edge-level informative counts agree (%d)" % finf)
 else: no("per-fragment informative %d, edge-level %d" % (finf, einf))
 sys.exit(bad)
@@ -457,7 +461,8 @@ bad = 0
 def ok(m): print("  ok   " + m)
 def no(m):
     global bad; bad += 1; print("  FAIL " + m)
-need = ("zero_fragments", "flat_emissions", "all_unplaced", "informative")
+need = ("zero_fragments", "flat_emissions", "all_unplaced", "informative",
+        "unequal_exposure", "unequal_exposure_with_frags", "invalid_emission")
 miss = [k for k in need if k not in d]
 if miss: no("self-test missing cases: %s" % ", ".join(miss)); sys.exit(1)
 sizes = d["zero_fragments"][5]
@@ -490,6 +495,29 @@ for case in need:
         no("%s: global homologue swap changes log psi by %.2e" % (case, float(d[case][4]))); break
 else:
     ok("global homologue swap leaves log psi unchanged in every case")
+# EXPOSURE MUST CANCEL, or the edge is UNSUPPORTED. Equal-length alleles make exposure
+# phase-invariant and so cannot detect this; the unequal_exposure cases set it directly. Without the
+# requirement, a ZERO-FRAGMENT edge moves the model by 0.105 nats on pure exposure asymmetry.
+for case in ("unequal_exposure", "unequal_exposure_with_frags"):
+    if d[case][6] == "0" and d[case][8] == "exposure-does-not-cancel":
+        ok("%s: edge refused as UNSUPPORTED (exposure asymmetry %s)" % (case, d[case][9]))
+    else:
+        no("%s: usable=%s status=%s -- a non-cancelling exposure was accepted"
+           % (case, d[case][6], d[case][8]))
+    if float(d[case][2]) != 0.0:
+        no("%s: log psi is non-zero (%.4g) on an unusable edge" % (case, float(d[case][2])))
+# AN OWNED FRAGMENT WITH NO EMISSION makes the edge INCOMPLETE; it must never be silently skipped.
+iv = d["invalid_emission"]
+if iv[6] == "0" and iv[7] == "1" and iv[8] == "invalid-emissions":
+    ok("invalid_emission: 1 unformable emission makes the edge INCOMPLETE, not smaller")
+else:
+    no("invalid_emission: usable=%s n_invalid=%s status=%s -- the fragment was skipped silently"
+       % (iv[6], iv[7], iv[8]))
+for case in ("zero_fragments", "flat_emissions", "all_unplaced", "informative"):
+    if d[case][6] != "1":
+        no("%s: a well-formed edge was marked unusable (%s)" % (case, d[case][8])); break
+else:
+    ok("well-formed edges stay usable; only the refused cases are unusable")
 sys.exit(bad)
 PYEOFA
   fails=$(( fails + $? ))
@@ -556,14 +584,14 @@ else: no("3-allele fixture collapsed to %dx%d alleles" % (na, nb))
 # The truth is (A3,B2)+(A2,B3) = allele indices (2,1) and (1,2), so the winning configuration must
 # be a1=2,b1=1,a2=1,b2=2 (or its global swap). Decoding it pins the INDEXING, which a 2-allele
 # fixture cannot: index 2 is used at both blocks.
-best = int(r[9])
+best = int(r[10])
 b2 = best % nb; t = best // nb; a2 = t % na; t //= na; b1 = t % nb; a1 = t // nb
 got = ((a1,b1),(a2,b2)); want = {((2,1),(1,2)), ((1,2),(2,1))}
 if got in want: ok("3-allele fixture recovers the true phase (a1=%d,b1=%d | a2=%d,b2=%d), using "
                    "allele index 2 at both blocks" % (a1,b1,a2,b2))
 else: no("3-allele fixture chose (a1=%d,b1=%d | a2=%d,b2=%d); truth is (2,1)|(1,2)" % (a1,b1,a2,b2))
-if float(r[11]) < 1e-9: ok("3-allele fixture: swap symmetry holds (%.2e)" % float(r[11]))
-else: no("3-allele fixture: swap asymmetry %.4g" % float(r[11]))
+if float(r[12]) < 1e-9: ok("3-allele fixture: swap symmetry holds (%.2e)" % float(r[12]))
+else: no("3-allele fixture: swap asymmetry %.4g" % float(r[12]))
 sys.exit(bad)
 PYEOF9
   fails=$(( fails + $? ))

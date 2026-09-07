@@ -1795,15 +1795,37 @@ LinkageEmission linkage_emission(const Fragment& fragment, const LinkageGeometry
 // NORMALISING PER FRAGMENT WOULD BE A DIFFERENT MODEL: it would let each fragment pick its own
 // phase configuration independently, the mosaic error excluded at the diplotype level reappearing
 // one level down.
+// THE CONTRACT, chosen explicitly: LINKAGE IS OBSERVED-FRAGMENT PHASE EVIDENCE. Exposure is
+// therefore REQUIRED to cancel within every content class, and is not carried in S at all -- so an
+// edge with no fragments gives log psi == 0 by construction, not by luck of allele lengths.
+//
+// The alternative -- treating the ABSENCE of edge fragments as phase evidence -- would need the
+// edge exposures to form a non-overlapping partition across the whole chain, or overlapping windows
+// double-charge the zero-event exposure. That is not established here, so it is not assumed.
+//
+// WHERE CANCELLATION FAILS the edge is UNSUPPORTED, and the result must say so. Exposure is affine
+// only above the insert support; a deletion or bypass can drop a window below it, and then
+// E(a1,b1) + E(a2,b2) genuinely differs between phases. Silently keeping such an edge would let a
+// zero-fragment edge move the model, which is the property this contract exists to guarantee.
+//
+// AN OWNED FRAGMENT WITH NO EMISSION MAKES THE EDGE INCOMPLETE. It must never be skipped: dropping
+// it would quietly shrink the evidence set and report a confident answer from less data than the
+// ownership partition claims.
 struct LinkageEdge {
     std::uint32_t block_a = 0, block_b = 0;
     std::size_t n_a = 0, n_b = 0;
     std::size_t n_fragments = 0;     // owned by this edge
     std::size_t n_informative = 0;   // ...whose emission varies with the combination: the real
                                      // evidence entering psi. The rest consume normalisation only.
+    std::size_t n_invalid = 0;       // ...owned but with no formable emission -> INCOMPLETE
     // Indexed [((a1 * n_b + b1) * n_a + a2) * n_b + b2].
-    std::vector<double> score;       // S_e, the full diploid edge score
+    std::vector<double> score;       // S_e, the summed fragment contributions (no exposure term)
     std::vector<double> log_psi;     // MEAN-ONE phase ratio within each content class
+    double exposure_asymmetry = 0.0; // worst |E(a1,b1)+E(a2,b2) - E(a1,b2)+E(a2,b1)| in a class
+    bool exposure_cancels = false;
+    // false -> propagate UNSUPPORTED/INCOMPLETE; log_psi is zeroed and must not be used.
+    bool usable = false;
+    std::string status;              // "ok", "exposure-does-not-cancel", "invalid-emissions"
     bool ok = false;
 };
 
