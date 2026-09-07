@@ -3616,6 +3616,51 @@ CandidateFrame build_candidate_frame(const std::vector<BlockAlleles>& blocks,
     return f;
 }
 
+FrameCoverage assess_frame_coverage(const Graph& graph,
+                                    const std::vector<BlockAlleles>& blocks,
+                                    const std::vector<std::string>& hmm_states) {
+    FrameCoverage C;
+    const auto by_name = path_records_by_name(graph);
+    for (const std::string& nm : hmm_states) {
+        const auto it = by_name.find(nm);
+        if (it == by_name.end() || it->second == nullptr) {
+            C.missing_names.push_back(nm);
+            C.missing_reasons.push_back("absent-from-graph");
+            continue;
+        }
+        bool spelled = false;
+        const std::string walk = spell_path_steps_sequence(graph, it->second->steps, &spelled);
+        if (!spelled) {
+            C.missing_names.push_back(nm);
+            C.missing_reasons.push_back("walk-not-spellable");
+            continue;
+        }
+        CandidateFrame cf = build_candidate_frame(blocks, nm, walk);
+        if (!cf.ok) {
+            // The ONLY failure this function has: no trustworthy map at all. A partial frame is a
+            // SUCCESS with an unmapped remainder, and never arrives here.
+            C.missing_names.push_back(nm);
+            C.missing_reasons.push_back("frame-unverified");
+            continue;
+        }
+        (cf.partial ? C.partial_names : C.complete_names).push_back(nm);
+        C.framed_names.push_back(nm);
+        C.frames.push_back(std::move(cf));
+    }
+    // UNIQUENESS FIRST. Comparing sorted vectors alone would let a duplicated state name appear on
+    // both sides and pass, so neither side may contain a repeat.
+    const auto unique = [](std::vector<std::string> v) {
+        std::sort(v.begin(), v.end());
+        return std::adjacent_find(v.begin(), v.end()) == v.end();
+    };
+    C.names_unique = unique(hmm_states) && unique(C.framed_names);
+    std::vector<std::string> a = hmm_states, b = C.framed_names;
+    std::sort(a.begin(), a.end());
+    std::sort(b.begin(), b.end());
+    C.coverage_complete = C.names_unique && C.missing_names.empty() && a == b;
+    return C;
+}
+
 double scope_restricted_pair_loglik(const CandidateFrame& frame_a, const CandidateFrame& frame_b,
                                     const std::vector<Fragment>& fragments,
                                     const std::vector<std::vector<std::uint32_t>>& scopes,

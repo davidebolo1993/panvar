@@ -1521,54 +1521,42 @@ int run_genotype_command(const std::vector<std::string>& args) {
             // (131/131 on C4, 127/127 on CYP2D6) surfaces as a reconciliation problem rather than
             // as an inference difference nobody can attribute.
             if (!hybrid_preflight.empty()) {
+                // ONE structured result. The writer below only SERIALISES it; hybrid activation
+                // will consume the same object rather than recomputing coverage, so the report and
+                // the decision cannot describe different runs.
+                const FrameCoverage cov = assess_frame_coverage(graph, blocks, hap_names);
                 std::ofstream pf(hybrid_preflight);
                 if (!pf) throw std::runtime_error("genotype: cannot write " + hybrid_preflight);
-                const auto by_name = path_records_by_name(graph);
-                std::vector<std::string> framed, missing;
-                std::vector<std::string> reasons;
-                for (const std::string& nm : hap_names) {
-                    const auto it = by_name.find(nm);
-                    if (it == by_name.end() || it->second == nullptr) {
-                        missing.push_back(nm); reasons.push_back("absent-from-graph"); continue;
-                    }
-                    bool complete = false;
-                    const std::string walk =
-                        spell_path_steps_sequence(graph, it->second->steps, &complete);
-                    if (!complete) {
-                        missing.push_back(nm); reasons.push_back("walk-not-spellable"); continue;
-                    }
-                    const CandidateFrame cf = build_candidate_frame(blocks, nm, walk);
-                    if (!cf.ok) {
-                        missing.push_back(nm);
-                        reasons.push_back(cf.partial ? "frame-partial" : "frame-unverified");
-                        continue;
-                    }
-                    framed.push_back(nm);
-                }
-                std::sort(framed.begin(), framed.end());
-                std::vector<std::string> states = hap_names;
-                std::sort(states.begin(), states.end());
-                const bool exact = (framed == states);
                 pf << "metric\tvalue\n";
                 pf << "raw_panel_paths\t" << panel_graph.paths.size() << '\n';
                 pf << "hmm_states\t" << hap_names.size() << '\n';
-                pf << "framed_states\t" << framed.size() << '\n';
-                pf << "missing_states\t" << missing.size() << '\n';
-                pf << "state_names_equal_framed_names\t" << (exact ? 1 : 0) << '\n';
-                // The universe itself, named, so it is reproducible rather than a count.
+                pf << "framed_states\t" << cov.framed_names.size() << '\n';
+                pf << "complete_frames\t" << cov.complete_names.size() << '\n';
+                // ACCEPTED, not missing: a path ending inside a block gives a correct prefix whose
+                // bytes agree, with only the remainder unmapped. Reported so the case stays visible.
+                pf << "accepted_partial_frames\t" << cov.partial_names.size() << '\n';
+                pf << "missing_states\t" << cov.missing_names.size() << '\n';
+                pf << "names_unique\t" << (cov.names_unique ? 1 : 0) << '\n';
+                pf << "coverage_complete\t" << (cov.coverage_complete ? 1 : 0) << '\n';
+                std::vector<std::string> states = hap_names;
+                std::sort(states.begin(), states.end());
                 for (const std::string& nm : states) pf << "hmm_state\t" << nm << '\n';
-                for (std::size_t i = 0; i < missing.size(); ++i) {
-                    pf << "missing\t" << missing[i] << '\t' << reasons[i] << '\n';
+                for (const std::string& nm : cov.partial_names) pf << "partial\t" << nm << '\n';
+                for (std::size_t i2 = 0; i2 < cov.missing_names.size(); ++i2) {
+                    pf << "missing\t" << cov.missing_names[i2] << '\t'
+                       << cov.missing_reasons[i2] << '\n';
                 }
                 pf.flush();
                 if (!pf) throw std::runtime_error("genotype: write failed for " + hybrid_preflight);
                 log.info("hybrid preflight: " + std::to_string(hap_names.size()) +
-                         " HMM states, " + std::to_string(framed.size()) + " framed, " +
-                         std::to_string(missing.size()) + " missing; names " +
-                         (exact ? "MATCH exactly" : "DO NOT match"));
-                if (!exact) {
-                    // A SUBSTRATE result, not a biological one. Named as such so it cannot be read
-                    // as genotype ambiguity.
+                         " HMM states, " + std::to_string(cov.complete_names.size()) +
+                         " complete + " + std::to_string(cov.partial_names.size()) +
+                         " accepted partial, " + std::to_string(cov.missing_names.size()) +
+                         " missing; coverage " +
+                         (cov.coverage_complete ? "COMPLETE" : "INCOMPLETE"));
+                if (!cov.coverage_complete) {
+                    // A SUBSTRATE result, not a biological one, and named so it cannot be read as
+                    // genotype ambiguity.
                     log.info("hybrid_status INCOMPLETE / reason candidate-frame-coverage / "
                              "legacy_call_status AVAILABLE / hybrid_call NA");
                 }

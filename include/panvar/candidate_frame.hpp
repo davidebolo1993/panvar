@@ -1,6 +1,7 @@
 #pragma once
 
 #include "panvar/genotype_blocks.hpp"
+#include "panvar/gfa.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -56,5 +57,35 @@ CandidateFrame build_candidate_frame(
     const std::vector<BlockAlleles>& blocks,
     const std::string& name,
     const std::string& walk);
+
+// ---------------------------------------------------------------------------------------------
+// FRAME COVERAGE over the marker HMM's DECLARED state universe.
+//
+// ONE structured result, produced once. The audit writer only serialises this; hybrid activation
+// consumes the same object rather than recomputing coverage independently, so the report and the
+// decision can never describe different runs.
+//
+// A VERIFIED PARTIAL TERMINAL FRAME IS ACCEPTED, not missing. A path may end inside a block -- its
+// contig or the cutting interval stops partway -- and the concatenation is then a correct PREFIX of
+// the walk. The bytes agree; only the uncovered remainder is unmapped. Those are reported as
+// `partial_names` so the case stays visible (CYP2D6 has one), NOT as a refusal reason: an earlier
+// version listed "frame-partial" among the missing reasons, which was unreachable code, because
+// CandidateFrame::partial is set only on branches that also set ok = true.
+struct FrameCoverage {
+    std::vector<CandidateFrame> frames;        // parallel to framed_names
+    std::vector<std::string> framed_names;     // complete + partial, in state order
+    std::vector<std::string> complete_names;
+    std::vector<std::string> partial_names;    // ACCEPTED, verified partial terminal frames
+    std::vector<std::string> missing_names;
+    std::vector<std::string> missing_reasons;  // parallel to missing_names
+    // Names must be UNIQUE on both sides before they can be compared. Sorted-vector equality alone
+    // would let a duplicated state appear on both sides and cancel out.
+    bool names_unique = false;
+    bool coverage_complete = false;            // unique, nothing missing, and the name sets equal
+};
+
+FrameCoverage assess_frame_coverage(const Graph& graph,
+                                    const std::vector<BlockAlleles>& blocks,
+                                    const std::vector<std::string>& hmm_states);
 
 }  // namespace panvar

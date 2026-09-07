@@ -59,9 +59,11 @@
 #  17. marker occurrence exclusion subtracts a linkage fragment's OCCURRENCES and never deletes a
 #      marker shared with unary-owned fragments;                                            [ACTIVE]
 #  22. every state in the marker HMM's DECLARED universe has a verified candidate frame, with the
-#      universe enumerated by name; a shortfall is an INCOMPLETE hybrid-SUBSTRATE result labelled
-#      reason=candidate-frame-coverage, never biological ambiguity. Measured on real panels:
-#      C4 131/131, CYP2D6 127/127, LPA 466/466, names matching exactly;                     [ACTIVE]
+#      universe enumerated by name and checked UNIQUE before comparison; a verified partial terminal
+#      frame is ACCEPTED and reported separately, never counted as missing; a shortfall is an
+#      INCOMPLETE hybrid-SUBSTRATE result labelled reason=candidate-frame-coverage, never biological
+#      ambiguity. Measured on real panels: C4 131 complete, CYP2D6 126 complete + 1 accepted partial
+#      (NA18989#1#haplotype1), LPA 466 complete; 0 missing everywhere;                      [ACTIVE]
 #  21. the four status conditions stay distinct -- ownership_complete, factors_buildable,
 #      hybrid_activated -- and call_status is COMPLETE only when all three hold. A run can be
 #      ownership-complete and factor-INcomplete, and must then report INCOMPLETE;           [ACTIVE]
@@ -508,8 +510,8 @@ bad = 0
 def ok(m): print("  ok   " + m)
 def no(m):
     global bad; bad += 1; print("  FAIL " + m)
-for k in ("raw_panel_paths","hmm_states","framed_states","missing_states",
-          "state_names_equal_framed_names"):
+for k in ("raw_panel_paths","hmm_states","framed_states","complete_frames",
+          "accepted_partial_frames","missing_states","names_unique","coverage_complete"):
     if k not in kv: no("preflight missing metric %s" % k); sys.exit(1)
 # THE UNIVERSE IS NAMED, not counted, so it is reproducible and a later disagreement is attributable.
 if len(states) == int(kv["hmm_states"]):
@@ -522,11 +524,35 @@ if kv["framed_states"] == kv["hmm_states"] and kv["missing_states"] == "0":
 else:
     no("only %s of %s HMM states framed; missing: %s"
        % (kv["framed_states"], kv["hmm_states"], missing[:3]))
-# Counts agreeing is not enough: the NAMES must be the same set, or a state could be replaced.
-if kv["state_names_equal_framed_names"] == "1":
-    ok("framed candidate names equal the HMM state names exactly (not merely the same count)")
+# UNIQUENESS BEFORE COMPARISON. Sorted-vector equality alone would let a duplicated state name
+# appear on both sides and cancel out, so neither side may contain a repeat.
+if kv["names_unique"] == "1":
+    ok("HMM state names and framed names are each unique -- duplicates cannot cancel out")
 else:
-    no("framed names differ from the HMM state names -- a state was substituted, not just counted")
+    no("a duplicate name exists; a sorted comparison would pass on both sides regardless")
+if len(set(states)) == len(states):
+    ok("the enumerated state universe contains no repeated name (%d distinct)" % len(set(states)))
+else:
+    no("the enumerated state universe repeats a name")
+# Counts agreeing is not enough: the NAMES must be the same set, or a state could be replaced.
+if kv["coverage_complete"] == "1":
+    ok("coverage_complete: unique names, nothing missing, framed set equals the state set")
+else:
+    no("coverage incomplete -- this is a hybrid-SUBSTRATE result, not biological ambiguity")
+# A VERIFIED PARTIAL TERMINAL FRAME IS ACCEPTED, not missing. Reported separately so the case stays
+# visible; on CYP2D6 exactly one path (NA18989#1#haplotype1) ends inside a block.
+if int(kv["complete_frames"]) + int(kv["accepted_partial_frames"]) == int(kv["framed_states"]):
+    ok("framed = complete (%s) + accepted partial (%s), reported separately"
+       % (kv["complete_frames"], kv["accepted_partial_frames"]))
+else:
+    no("complete %s + partial %s != framed %s"
+       % (kv["complete_frames"], kv["accepted_partial_frames"], kv["framed_states"]))
+# "frame-partial" must never appear as a REFUSAL reason: it was unreachable code, and it implied
+# partial frames are rejected when the contract accepts them.
+if any(r == "frame-partial" for _, r in missing):
+    no("a state was refused with reason frame-partial; verified partial frames are ACCEPTED")
+else:
+    ok("no state is refused as frame-partial (that reason was unreachable and is gone)")
 if len(missing) != int(kv["missing_states"]):
     no("%d missing rows but missing_states says %s" % (len(missing), kv["missing_states"]))
 else:
