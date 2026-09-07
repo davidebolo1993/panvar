@@ -4283,6 +4283,66 @@ LinkageEmission linkage_emission(const Fragment& fragment, const LinkageGeometry
     return out;
 }
 
+ChainEdgeLinkage make_kernel_edge(const LinkageEdge& edge,
+                                  const AlleleMapping& map_a, const AlleleMapping& map_b) {
+    ChainEdgeLinkage out;   // inactive by default: the safe answer, not the convenient one
+    if (!edge.usable()) return out;
+    if (map_a.status != MappingStatus::Ok || map_b.status != MappingStatus::Ok) return out;
+    if (map_a.n_alleles != edge.n_a || map_b.n_alleles != edge.n_b) return out;
+    if (map_a.allele.size() != map_b.allele.size()) return out;
+    if (edge.log_psi.size() != edge.n_a * edge.n_b * edge.n_a * edge.n_b) return out;
+    out.active = true;
+    out.n_a = edge.n_a;
+    out.n_b = edge.n_b;
+    out.allele_a = map_a.allele;
+    out.allele_b = map_b.allele;
+    out.log_psi = edge.log_psi;
+    return out;
+}
+
+HybridCompletenessReport assess_hybrid_completeness(const std::vector<FragmentOwner>& owners,
+                                                    const std::vector<EdgeStatusEntry>& edges) {
+    HybridCompletenessReport R;
+    R.owned_total = owners.size();
+    std::map<std::pair<std::uint32_t, std::uint32_t>, LinkageStatus> st;
+    for (const EdgeStatusEntry& e : edges) st[{e.block_a, e.block_b}] = e.status;
+    for (const FragmentOwner& o : owners) {
+        switch (o.kind) {
+            case OwnerKind::Invariant:
+                ++R.invariant;               // carries depth, not genotype evidence
+                break;
+            case OwnerKind::Unary:
+                ++R.consumed_unary;          // the block's marker unary consumes it
+                break;
+            case OwnerKind::Linkage: {
+                const auto it = st.find({o.block_lo, o.block_hi});
+                if (it != st.end() && it->second == LinkageStatus::Ok) ++R.consumed_linkage;
+                else ++R.unconsumed_refused_edge;
+                break;
+            }
+            case OwnerKind::Wide:
+                // No pairwise consumer exists for three or more variables. Reported with its scope
+                // rather than counted anonymously, and never cropped into a pair.
+                ++R.unconsumed_wide;
+                R.wide_scopes.push_back(o.var_scope);
+                break;
+            default:
+                ++R.unconsumed_unusable;     // explicitly reported missing evidence
+                break;
+        }
+    }
+    for (const EdgeStatusEntry& e : edges) {
+        if (e.status == LinkageStatus::Ok) continue;
+        EdgeRefusal r;
+        r.block_a = e.block_a; r.block_b = e.block_b;
+        r.status = e.status; r.n_fragments = e.n_fragments;
+        R.refusals.push_back(r);             // every one, in edge order
+    }
+    R.complete = (R.unconsumed_wide == 0 && R.unconsumed_refused_edge == 0 &&
+                  R.unconsumed_unusable == 0);
+    return R;
+}
+
 const char* mapping_status_name(MappingStatus s) {
     switch (s) {
         case MappingStatus::Ok:             return "ok";

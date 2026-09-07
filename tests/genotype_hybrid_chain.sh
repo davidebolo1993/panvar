@@ -58,6 +58,9 @@
 #      be present but unused;                                                               [ACTIVE]
 #  17. marker occurrence exclusion subtracts a linkage fragment's OCCURRENCES and never deletes a
 #      marker shared with unary-owned fragments;                                            [ACTIVE]
+#  19. hybrid COMPLETE <=> every non-invariant owned fragment has a supported consumer; a refused
+#      edge or Wide fragment makes the run INCOMPLETE (not "unresolved"), all reasons are retained,
+#      and no refused edge ever reaches the kernel;                                         [ACTIVE]
 #  18. the haplotype -> allele mapping validates every value BEFORE the int -> unsigned conversion:
 #      permuted and normal mappings resolve, a bypassing haplotype resolves to bypass_allele, and a
 #      missing or out-of-range value is refused with nothing left indexable;                [ACTIVE]
@@ -465,6 +468,82 @@ PYEOF7
   fails=$(( fails + $? ))
 else
   bad "no edge aggregate written"
+fi
+
+# GATE 19: HYBRID COMPLETENESS. Three situations must stay distinct: no linkage-owned evidence (a
+# valid legacy edge), linkage successfully represented (a valid linked edge), and linkage or Wide
+# evidence that EXISTS but cannot be represented (INCOMPLETE/UNSUPPORTED). An inactive
+# ChainEdgeLinkage cannot express the third -- the kernel reads it exactly like the first -- so a
+# refused edge would silently become neutral and the posterior would be presented as complete while
+# a reduced evidence model ran.
+#
+#     hybrid COMPLETE  <=>  every non-invariant owned fragment has a SUPPORTED CONSUMER
+#
+# NOT "unresolved": the model did not evaluate the evidence, it could not consume it.
+"$BIN" genotype-frag -i /dev/null -b none -o "$OUT/cp" --completeness-selftest \
+  > "$OUT/comp.tsv" 2>/dev/null
+if [ -s "$OUT/comp.tsv" ]; then
+  "$PY" - "$OUT/comp.tsv" <<'PYEOFF'
+import sys
+lines = [l.rstrip("\n").split("\t") for l in open(sys.argv[1])]
+comp = {}; kern = {}
+mode = None
+for f in lines:
+    if f[0] == "case": mode = "comp"; continue
+    if f[0] == "kernel_edge_case": mode = "kern"; continue
+    (comp if mode == "comp" else kern)[f[0]] = f
+bad = 0
+def ok(m): print("  ok   " + m)
+def no(m):
+    global bad; bad += 1; print("  FAIL " + m)
+def want(case, complete):
+    r = comp.get(case)
+    if r is None: no("completeness case %s missing" % case); return None
+    got = r[1] == "1"
+    if got == complete:
+        ok("%s -> %s" % (case, "COMPLETE" if complete else "INCOMPLETE"))
+    else:
+        no("%s reported %s, expected %s"
+           % (case, "COMPLETE" if got else "INCOMPLETE", "COMPLETE" if complete else "INCOMPLETE"))
+    return r
+want("no_linkage", True); want("linkage_ok", True); want("invariant_only", True)
+for c in ("too_many_configs","exposure_refused","invalid_emission","mapping_refused",
+          "wide_fragment","unusable_fragment"):
+    want(c, False)
+# EVERY refusal survives, not just the last -- which is when the report matters most.
+m = comp.get("multi_refusal")
+if m and m[9] == "3" and m[10].count(";") == 2 and len({x.split(":")[1] for x in m[10].split(";")}) == 3:
+    ok("multi_refusal retains all 3 refusals with 3 DISTINCT reasons (%s)" % m[10])
+else:
+    no("multi_refusal lost refusals or reasons: n=%s reasons=%s" % (m[9] if m else "?", m[10] if m else "?"))
+# A Wide fragment is reported with the variable scope it actually depended on.
+w = comp.get("wide_fragment")
+if w and w[6] == "1" and w[11] != "-":
+    ok("a Wide fragment is unsupported and reports its variable scope (%s)" % w[11])
+else:
+    no("Wide fragment scope not reported: wide=%s scopes=%s" % (w[6] if w else "?", w[11] if w else "?"))
+# An invariant fragment needs no consumer and must not make the run incomplete.
+iv = comp.get("invariant_only")
+if iv and iv[3] == "2" and iv[1] == "1":
+    ok("invariant fragments need no consumer and keep the run complete")
+else:
+    no("invariant handling wrong: %s" % (iv if iv else "missing"))
+# NO REFUSED EDGE TABLE REACHES THE KERNEL.
+if kern.get("usable_edge", ["","0"])[1] == "1":
+    ok("a usable edge builds an ACTIVE kernel entry (psi %s)" % kern["usable_edge"][4])
+else:
+    no("a usable edge did not build an active kernel entry")
+leaked = [k for k, v in kern.items() if k != "usable_edge" and (v[1] != "0" or v[4] != "0")]
+if leaked:
+    no("refused edges reached the kernel with a table: %s" % ", ".join(leaked))
+else:
+    ok("every refused edge and refused mapping yields an INACTIVE entry with no table (%d cases)"
+       % (len(kern) - 1))
+sys.exit(bad)
+PYEOFF
+  fails=$(( fails + $? ))
+else
+  bad "completeness self-test produced no output"
 fi
 
 # GATE 18: HAPLOTYPE -> ALLELE MAPPING. The int -> unsigned boundary is where this breaks silently:

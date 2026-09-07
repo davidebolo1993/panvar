@@ -17,6 +17,7 @@
 // dosage channel. A block is scored on its own fragments. Those are the next layers and they are
 // only worth building if this one passes its gate.
 
+#include "panvar/chain_kernel.hpp"
 #include "panvar/genotype_blocks.hpp"
 #include "panvar/gfa.hpp"
 
@@ -1927,6 +1928,71 @@ struct AlleleMapping {
 // `allele_of_block[h]` is BlockAlleles' int for haplotype h, -1 where it found none.
 AlleleMapping build_allele_mapping(const std::vector<int>& allele_of_block,
                                    std::size_t n_alleles, int bypass_allele);
+
+// ---------------------------------------------------------------------------------------------
+// HYBRID COMPLETENESS.
+//
+// THREE SITUATIONS THAT MUST STAY DISTINCT, and the third is the one that gets lost:
+//
+//   1. no linkage-owned evidence at this edge  -> a valid factorised (legacy) edge;
+//   2. linkage evidence successfully represented -> a valid linked edge;
+//   3. linkage or Wide evidence EXISTS but cannot be represented -> INCOMPLETE / UNSUPPORTED.
+//
+// An inactive ChainEdgeLinkage cannot express the third: the kernel reads it exactly like case 1,
+// so a refused edge would silently become a neutral one and the posterior would be presented as
+// complete while a reduced evidence model actually ran. Refusal is therefore carried HERE, outside
+// anything the kernel sees, and a refused edge is never handed to it at all.
+//
+// NOT "UNRESOLVED". Unresolved means the model evaluated the evidence and could not separate the
+// states. Here the model did not evaluate it -- the same distinction Wide already carries.
+//
+// THE INVARIANT:
+//
+//     hybrid COMPLETE  <=>  every non-invariant owned fragment has a SUPPORTED CONSUMER
+//
+// Unary fragments are consumed by their block's marker unary; Linkage fragments by their edge, but
+// only while that edge is usable; Invariant fragments need no consumer, since they carry no
+// genotype evidence. Wide and Unusable fragments have no consumer in a pairwise model at all.
+// Block-content calls may still be emitted -- the marker unaries are unaffected -- but the PHASE
+// across an affected edge, and the hybrid call as a whole, are INCOMPLETE.
+struct EdgeStatusEntry {
+    std::uint32_t block_a = 0, block_b = 0;
+    LinkageStatus status = LinkageStatus::NotComputed;
+    std::size_t n_fragments = 0;
+};
+
+struct EdgeRefusal {
+    std::uint32_t block_a = 0, block_b = 0;
+    LinkageStatus status = LinkageStatus::NotComputed;
+    std::size_t n_fragments = 0;   // owned fragments left without a consumer by this refusal
+};
+
+struct HybridCompletenessReport {
+    bool complete = false;
+    std::size_t owned_total = 0;
+    std::size_t invariant = 0;              // need no consumer
+    std::size_t consumed_unary = 0;
+    std::size_t consumed_linkage = 0;
+    std::size_t unconsumed_wide = 0;        // three or more variables: no pairwise consumer
+    std::size_t unconsumed_refused_edge = 0;
+    std::size_t unconsumed_unusable = 0;
+    // EVERY refusal, not the last one. A single "reason" field loses the others exactly when
+    // several edges fail for different reasons, which is when the report matters most.
+    std::vector<EdgeRefusal> refusals;
+    // The variable scope of Wide fragments, so an unsupported fragment is reported with what it
+    // actually depended on rather than as an anonymous count.
+    std::vector<std::vector<std::uint32_t>> wide_scopes;
+};
+
+HybridCompletenessReport assess_hybrid_completeness(const std::vector<FragmentOwner>& owners,
+                                                    const std::vector<EdgeStatusEntry>& edges);
+
+// THE ONE PLACE A KERNEL EDGE IS BUILT. A refused LinkageEdge, or either endpoint's mapping having
+// been refused, yields an INACTIVE entry carrying no table -- so a refused edge can never reach the
+// kernel, which has no way to tell one from a legitimately linkage-free edge. The refusal is
+// carried by HybridCompletenessReport instead, where it makes the run INCOMPLETE.
+ChainEdgeLinkage make_kernel_edge(const LinkageEdge& edge,
+                                  const AlleleMapping& map_a, const AlleleMapping& map_b);
 
 struct HybridEdge {
     bool has_linkage = false;

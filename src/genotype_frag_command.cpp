@@ -339,6 +339,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     bool linkage_selftest = false;
     bool hybrid_oracle = false;
     bool mapping_selftest = false;
+    bool completeness_selftest = false;
     std::vector<std::string> reconcile_scope;
     std::string switch_penalties_arg = "0,10,100,1000";
     std::vector<std::string> exact_distance;
@@ -391,6 +392,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--linkage-selftest") linkage_selftest = true;
         else if (a == "--hybrid-oracle") hybrid_oracle = true;
         else if (a == "--mapping-selftest") mapping_selftest = true;
+        else if (a == "--completeness-selftest") completeness_selftest = true;
         else if (a == "--scope-tol") {
             const std::string sv = value(i, a);
             scope_tol = std::stod(sv);
@@ -652,7 +654,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     if (read_paths.empty() && spell_calls.empty() && !mosaic_floor && dump_sequences.empty() &&
         spell_pair.empty() && ref_block.empty() && ref_block_pair.empty() &&
         origin_universe.empty() && reconcile_scope.empty() && !linkage_selftest &&
-        !hybrid_oracle && !mapping_selftest) {
+        !hybrid_oracle && !mapping_selftest && !completeness_selftest) {
         throw std::runtime_error("genotype-frag requires at least one --reads");
     }
     if (!bubble_prefix_in.empty()) {
@@ -685,6 +687,98 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     ParseGfaOptions parse_options;
     parse_options.include_paths = true;
     parse_options.include_sequences = true;
+    // ---- HYBRID COMPLETENESS SELF-TEST ----------------------------------------------------------
+    // The third situation is the one that gets lost: linkage or Wide evidence EXISTS but cannot be
+    // represented. An inactive ChainEdgeLinkage cannot express it -- the kernel reads that exactly
+    // like a legitimately linkage-free edge -- so a refused edge would silently become neutral and
+    // the posterior would look complete while a reduced evidence model ran.
+    if (completeness_selftest) {
+        std::printf("case\tcomplete\towned\tinvariant\tunary\tlinkage\twide\trefused_edge"
+                    "\tunusable\tn_refusals\treasons\twide_scopes\n");
+        const auto mkown = [](OwnerKind k, std::uint32_t lo, std::uint32_t hi,
+                              std::vector<std::uint32_t> vs = {}) {
+            FragmentOwner o;
+            o.kind = k; o.block_lo = lo; o.block_hi = hi; o.var_scope = std::move(vs);
+            return o;
+        };
+        const auto run = [&](const char* name, const std::vector<FragmentOwner>& owners,
+                             const std::vector<EdgeStatusEntry>& edges) {
+            const HybridCompletenessReport R = assess_hybrid_completeness(owners, edges);
+            std::string reasons;
+            for (const EdgeRefusal& r : R.refusals) {
+                reasons += (reasons.empty() ? "" : ";") + std::to_string(r.block_a) + "-" +
+                           std::to_string(r.block_b) + ":" + linkage_status_name(r.status) +
+                           "(" + std::to_string(r.n_fragments) + ")";
+            }
+            if (reasons.empty()) reasons = "-";
+            std::string scopes;
+            for (const auto& sc : R.wide_scopes) {
+                std::string one;
+                for (std::uint32_t b : sc) one += (one.empty() ? "" : ".") + std::to_string(b);
+                scopes += (scopes.empty() ? "" : ";") + one;
+            }
+            if (scopes.empty()) scopes = "-";
+            std::printf("%s\t%d\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t%s\t%s\n",
+                        name, R.complete ? 1 : 0, R.owned_total, R.invariant, R.consumed_unary,
+                        R.consumed_linkage, R.unconsumed_wide, R.unconsumed_refused_edge,
+                        R.unconsumed_unusable, R.refusals.size(), reasons.c_str(), scopes.c_str());
+        };
+        using OK = OwnerKind;  using LS = LinkageStatus;
+        // 1. No owned linkage at all: pure legacy shape, complete.
+        run("no_linkage", {mkown(OK::Unary,1,1), mkown(OK::Unary,2,2), mkown(OK::Invariant,0,0)}, {});
+        // 2. Linkage present and representable: complete.
+        run("linkage_ok", {mkown(OK::Unary,1,1), mkown(OK::Linkage,1,2)},
+            {{1,2,LS::Ok,1}});
+        // 3-6. Each refusal reason leaves its fragments without a consumer -> INCOMPLETE.
+        run("too_many_configs", {mkown(OK::Linkage,1,2)}, {{1,2,LS::TooManyConfigurations,1}});
+        run("exposure_refused", {mkown(OK::Linkage,1,2)}, {{1,2,LS::ExposureDoesNotCancel,1}});
+        run("invalid_emission", {mkown(OK::Linkage,1,2)}, {{1,2,LS::InvalidEmissions,1}});
+        run("mapping_refused",  {mkown(OK::Linkage,1,2)}, {{1,2,LS::NotComputed,1}});
+        // 7. A Wide fragment has no pairwise consumer; its VARIABLE scope is reported.
+        run("wide_fragment", {mkown(OK::Unary,1,1), mkown(OK::Wide,1,3,{1,2,3})}, {});
+        // 8. Several refusals, for DIFFERENT reasons: all must survive, not only the last.
+        run("multi_refusal",
+            {mkown(OK::Linkage,1,2), mkown(OK::Linkage,3,4), mkown(OK::Linkage,5,6)},
+            {{1,2,LS::TooManyConfigurations,1}, {3,4,LS::ExposureDoesNotCancel,1},
+             {5,6,LS::InvalidEmissions,1}});
+        // 9. An Unusable fragment is explicitly reported missing evidence, not silence.
+        run("unusable_fragment", {mkown(OK::Unary,1,1), mkown(OK::Unusable,0,0)}, {});
+        // 10. Invariant fragments need no consumer and must not make the run incomplete.
+        run("invariant_only", {mkown(OK::Invariant,0,0), mkown(OK::Invariant,0,0)}, {});
+        // NO REFUSED EDGE TABLE REACHES THE KERNEL. make_kernel_edge() is the one construction
+        // path, and it yields an INACTIVE entry with no table for any refused edge or refused
+        // mapping -- because the kernel cannot tell a refused edge from a linkage-free one.
+        std::printf("kernel_edge_case\tactive\tn_a\tn_b\tpsi_size\n");
+        {
+            LinkageEdge good;
+            good.n_a = 2; good.n_b = 2; good.status = LinkageStatus::Ok;
+            good.log_psi.assign(16, 0.0);
+            const AlleleMapping ma = build_allele_mapping({0, 1, 1}, 2, -1);
+            const AlleleMapping mb = build_allele_mapping({0, 0, 1}, 2, -1);
+            const auto emit = [&](const char* nm, const ChainEdgeLinkage& k) {
+                std::printf("%s\t%d\t%zu\t%zu\t%zu\n", nm, k.active ? 1 : 0, k.n_a, k.n_b,
+                            k.log_psi.size());
+            };
+            emit("usable_edge", make_kernel_edge(good, ma, mb));
+            for (const auto& bad : {LinkageStatus::TooManyConfigurations,
+                                    LinkageStatus::ExposureDoesNotCancel,
+                                    LinkageStatus::InvalidEmissions,
+                                    LinkageStatus::NotComputed}) {
+                LinkageEdge e = good;
+                e.status = bad;
+                emit(linkage_status_name(bad), make_kernel_edge(e, ma, mb));
+            }
+            emit("refused_mapping_a",
+                 make_kernel_edge(good, build_allele_mapping({0, -1, 1}, 2, -1), mb));
+            emit("refused_mapping_b",
+                 make_kernel_edge(good, ma, build_allele_mapping({0, 5, 1}, 2, -1)));
+            LinkageEdge mismatched = good;
+            mismatched.n_a = 3;   // allele count disagrees with the mapping
+            emit("allele_count_mismatch", make_kernel_edge(mismatched, ma, mb));
+        }
+        return 0;
+    }
+
     // ---- HAPLOTYPE -> ALLELE MAPPING SELF-TEST --------------------------------------------------
     // The int -> unsigned boundary is where this breaks silently: BlockAlleles reports -1 for "no
     // allele here", and a bare cast makes that 4294967295, which then indexes log_psi far out of
