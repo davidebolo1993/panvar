@@ -3616,6 +3616,33 @@ CandidateFrame build_candidate_frame(const std::vector<BlockAlleles>& blocks,
     return f;
 }
 
+std::string chain_oriented_sequence(const CandidateFrame& frame) {
+    // An antiparallel candidate's walk bytes ARE the reverse complement of its chain-oriented
+    // sequence; returning them raw makes a correct frame look like a different haplotype.
+    return frame.reverse_frame ? reverse_complement(frame.seq) : frame.seq;
+}
+
+bool chain_oriented_block_span(const CandidateFrame& frame, std::uint32_t block,
+                               std::size_t& lo, std::size_t& hi) {
+    bool seen = false;
+    std::size_t wlo = 0, whi = 0;
+    for (std::size_t k = 0; k < frame.block_at.size(); ++k) {
+        if (frame.block_at[k] != block) continue;
+        const std::size_t s0 = frame.offsets[k];
+        const std::size_t s1 = (k + 1 < frame.offsets.size()) ? frame.offsets[k + 1]
+                                                              : frame.seq.size();
+        if (!seen) { wlo = s0; whi = s1; seen = true; }
+        else { wlo = std::min(wlo, s0); whi = std::max(whi, s1); }
+    }
+    if (!seen) return false;
+    if (!frame.reverse_frame) { lo = wlo; hi = whi; return true; }
+    // Mirror the interval: reversing the sequence maps [wlo, whi) to [n - whi, n - wlo).
+    const std::size_t n = frame.seq.size();
+    lo = n - whi;
+    hi = n - wlo;
+    return true;
+}
+
 FrameCoverage assess_frame_coverage(const Graph& graph,
                                     const std::vector<BlockAlleles>& blocks,
                                     const std::vector<std::string>& hmm_states) {
@@ -4194,19 +4221,15 @@ LinkageGeometry build_linkage_geometry(const std::vector<CandidateFrame>& frames
         g.refusal = "block index out of range";
         return g;
     }
-    // Walk range of a block within one candidate's frame, from the VERIFIED map. Derived here once
-    // so no consumer re-implements block geometry.
+    // CHAIN ORIENTATION THROUGHOUT. Spans and sequence both come from the chain-oriented view, so
+    // an antiparallel candidate is compared on the same footing as a forward one. Working in raw
+    // walk coordinates made `a3 > b2` fire on every correct antiparallel frame.
+    std::vector<std::string> chain_seq(frames.size());
+    for (std::size_t h = 0; h < frames.size(); ++h) {
+        chain_seq[h] = chain_oriented_sequence(frames[h]);
+    }
     const auto span = [&](std::size_t h, std::uint32_t b, std::size_t& lo, std::size_t& hi) {
-        const CandidateFrame& F = frames[h];
-        bool seen = false;
-        for (std::size_t k = 0; k < F.block_at.size(); ++k) {
-            if (F.block_at[k] != b) continue;
-            const std::size_t s0 = F.offsets[k];
-            const std::size_t s1 = (k + 1 < F.offsets.size()) ? F.offsets[k + 1] : F.seq.size();
-            if (!seen) { lo = s0; hi = s1; seen = true; }
-            else { lo = std::min(lo, s0); hi = std::max(hi, s1); }
-        }
-        return seen;
+        return chain_oriented_block_span(frames[h], b, lo, hi);
     };
     std::size_t alo = 0, ahi = 0, blo = 0, bhi = 0;
     if (!span(0, block_a, alo, ahi) || !span(0, block_b, blo, bhi)) {
@@ -4214,7 +4237,7 @@ LinkageGeometry build_linkage_geometry(const std::vector<CandidateFrame>& frames
         return g;
     }
     if (ahi > blo) { g.refusal = "blocks overlap or are out of order"; return g; }
-    const std::string& w0 = frames[0].seq;
+    const std::string& w0 = chain_seq[0];
     g.context = w0.substr(ahi, blo - ahi);
     const std::size_t l0 = alo > flank_bp ? alo - flank_bp : 0;
     const std::size_t r1 = std::min(w0.size(), bhi + flank_bp);
@@ -4229,7 +4252,7 @@ LinkageGeometry build_linkage_geometry(const std::vector<CandidateFrame>& frames
             g.refusal = "block absent from candidate " + std::to_string(h); return g;
         }
         if (a3 > b2) { g.refusal = "blocks out of order on candidate " + std::to_string(h); return g; }
-        const std::string& wh = frames[h].seq;
+        const std::string& wh = chain_seq[h];
         if (wh.substr(a3, b2 - a3) != g.context) {
             g.refusal = "intervening context differs on candidate " + std::to_string(h); return g;
         }

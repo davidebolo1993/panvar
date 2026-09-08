@@ -5,6 +5,7 @@
 #include "panvar/genotype_blocks.hpp"
 #include "panvar/genotype_markers.hpp"
 #include "panvar/genotype.hpp"
+#include "panvar/md5.hpp"
 
 #include "panvar/candidate_frame.hpp"
 #include "panvar/genotype_fragments.hpp"
@@ -343,6 +344,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
     std::string hybrid_preflight;
     bool hybrid_call = false;
     std::string hybrid_geometry_probe;
+    std::string hybrid_orientation_probe;
     HybridLinkageParameters hyb_params;
     std::string hybrid_status_path;
     double depth_quantile = 0.75;
@@ -455,6 +457,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--hybrid-preflight") hybrid_preflight = require_value(arg);
         else if (arg == "--hybrid-call") hybrid_call = true;
         else if (arg == "--hybrid-geometry-probe") hybrid_geometry_probe = require_value(arg);
+        else if (arg == "--hybrid-orientation-probe") hybrid_orientation_probe = require_value(arg);
         else if (arg == "--hybrid-status") hybrid_status_path = require_value(arg);
         else if (arg == "--hybrid-fragment-sd") hyb_params.fragment_sd = std::stod(require_value(arg));
         else if (arg == "--hybrid-divergence") hyb_params.max_divergence = std::stod(require_value(arg));
@@ -1474,6 +1477,35 @@ int run_genotype_command(const std::vector<std::string>& args) {
             std::vector<std::string> hap_names;
             hap_names.reserve(panel_graph.paths.size());
             for (const PathRecord& p : panel_graph.paths) hap_names.push_back(p.name);
+
+            // ---- ORIENTATION PROBE --------------------------------------------------------
+            // Every candidate's CHAIN-ORIENTED sequence and block spans. An exact reverse-complement
+            // duplicate must be indistinguishable here from its original: same spans, same bytes.
+            // Comparing raw walk coordinates instead is what refused every C4 edge.
+            if (!hybrid_orientation_probe.empty()) {
+                const FrameCoverage ocov = assess_frame_coverage(graph, blocks, hap_names);
+                std::ofstream op(hybrid_orientation_probe);
+                if (!op) throw std::runtime_error("genotype: cannot write " +
+                                                  hybrid_orientation_probe);
+                op << "candidate\treverse_frame\tchain_seq_md5\tchain_len\tblock_spans\n";
+                for (std::size_t h = 0; h < ocov.frames.size(); ++h) {
+                    const CandidateFrame& F = ocov.frames[h];
+                    const std::string cs = chain_oriented_sequence(F);
+                    std::string spans;
+                    for (std::size_t b = 0; b < blocks.size(); ++b) {
+                        std::size_t lo = 0, hi = 0;
+                        if (!chain_oriented_block_span(F, static_cast<std::uint32_t>(b), lo, hi)) {
+                            continue;
+                        }
+                        spans += (spans.empty() ? "" : ",") + std::to_string(b) + ":" +
+                                 std::to_string(lo) + "-" + std::to_string(hi);
+                    }
+                    op << ocov.framed_names[h] << '\t' << (F.reverse_frame ? 1 : 0) << '\t'
+                       << md5_hex(cs) << '\t' << cs.size() << '\t' << spans << '\n';
+                }
+                op.flush();
+                log.wrote({hybrid_orientation_probe});
+            }
 
             // ---- LINKAGE GEOMETRY PROBE ---------------------------------------------------
             // Geometry depends only on the frames, the block alleles and the flank width -- NOT on

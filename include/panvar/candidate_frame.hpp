@@ -59,6 +59,23 @@ CandidateFrame build_candidate_frame(
     const std::string& walk);
 
 // ---------------------------------------------------------------------------------------------
+// CHAIN ORIENTATION.
+//
+// A candidate's walk may run ANTIPARALLEL to the chain. Its bytes are then the reverse complement of
+// the reference-oriented sequence, and its block spans run backwards: block b sits at a LATER walk
+// offset than block b+1. Anything that compares sequence or orders intervals across candidates must
+// therefore work in chain orientation, never in raw walk coordinates.
+//
+// Measured consequence of not doing so: build_linkage_geometry tested `a3 > b2` on raw walk offsets
+// and refused every C4 edge with "blocks out of order", on frames that were perfectly correct. The
+// same class of defect once turned a fragment's scope from {1} into {1,2}.
+std::string chain_oriented_sequence(const CandidateFrame& frame);
+
+// Block `block`'s span in CHAIN coordinates, [lo, hi). False when the frame does not carry it.
+bool chain_oriented_block_span(const CandidateFrame& frame, std::uint32_t block,
+                               std::size_t& lo, std::size_t& hi);
+
+// ---------------------------------------------------------------------------------------------
 // FRAME COVERAGE over the marker HMM's DECLARED state universe.
 //
 // ONE structured result, produced once. The audit writer only serialises this; hybrid activation

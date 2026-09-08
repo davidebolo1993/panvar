@@ -58,6 +58,9 @@
 #      be present but unused;                                                               [ACTIVE]
 #  17. marker occurrence exclusion subtracts a linkage fragment's OCCURRENCES and never deletes a
 #      marker shared with unary-owned fragments;                                            [ACTIVE]
+#  24. an EXACT reverse-complement duplicate is indistinguishable in CHAIN orientation -- same
+#      sequence, same block spans -- while still flagged antiparallel, and a mixed forward/reverse
+#      panel builds geometry and recovers phase;                                            [ACTIVE]
 #  22. every state in the marker HMM's DECLARED universe has a verified candidate frame, with the
 #      universe enumerated by name and checked UNIQUE before comparison; a verified partial terminal
 #      frame is ACCEPTED and reported separately, never counted as missing; a shortfall is an
@@ -487,6 +490,80 @@ else
   bad "no edge aggregate written"
 fi
 
+# ---------------------------------------------------------------------------------------------
+# GATE 24: CHAIN ORIENTATION. A candidate's walk may run ANTIPARALLEL to the chain; its bytes are
+# then the reverse complement of the reference-oriented sequence and its block spans run backwards.
+# Anything comparing sequence or ordering intervals across candidates must work in CHAIN
+# coordinates. Testing raw walk offsets refused every C4 edge with "blocks out of order", on frames
+# that were perfectly correct.
+#
+# THE DECISIVE CASE is an EXACT reverse-complement duplicate: same steps reversed, every sign
+# flipped. In chain orientation it must be indistinguishable from its original -- same span, same
+# bytes -- while still being FLAGGED reverse_frame, and a mixed forward/reverse panel must build
+# geometry and call normally.
+"$PY" - "$OUT" <<'PYEOFJ'
+import sys
+d = sys.argv[1]
+lines = open(d + "/g.gfa").read().rstrip("\n").split("\n")
+out = []
+for l in lines:
+    out.append(l)
+    f = l.split("\t")
+    if f[0] == "P" and f[1] == "hapAA":
+        steps = f[2].split(",")
+        rc = ",".join(s[:-1] + ("-" if s[-1] == "+" else "+") for s in reversed(steps))
+        out.append("P\thapAA_rc\t%s\t*" % rc)
+open(d + "/g_rc.gfa", "w").write("\n".join(out) + "\n")
+PYEOFJ
+"$BIN" bubble -i "$OUT/g_rc.gfa" -r hapAA -o "$OUT/brc" --min-variant-bp 0 -q >/dev/null 2>&1
+"$BIN" genotype -i "$OUT/brc.sorted.gfa" -b "$OUT/brc" -r hapAA -o "$OUT/orc" \
+  -R "$OUT/r1.fq" -R "$OUT/r2.fq" --fragment-len 350 \
+  --hybrid-orientation-probe "$OUT/orient.tsv" -q >/dev/null 2>&1
+"$BIN" genotype -i "$OUT/brc.sorted.gfa" -b "$OUT/brc" -r hapAA -o "$OUT/hrc" \
+  -R "$OUT/r1.fq" -R "$OUT/r2.fq" --fragment-len 350 --hybrid-call -q >/dev/null 2>&1
+if [ -s "$OUT/orient.tsv" ] && [ -s "$OUT/hrc.genotypes.tsv" ]; then
+  "$PY" - "$OUT/orient.tsv" "$OUT/hrc.genotypes.tsv" <<'PYEOFK'
+import sys
+rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[1])][1:]
+d = {r[0]: r for r in rows}
+bad = 0
+def ok(m): print("  ok   " + m)
+def no(m):
+    global bad; bad += 1; print("  FAIL " + m)
+if "hapAA" not in d or "hapAA_rc" not in d:
+    no("the reverse-complement duplicate is not in the panel"); sys.exit(1)
+a, b = d["hapAA"], d["hapAA_rc"]
+if a[1] == "0" and b[1] == "1":
+    ok("the duplicate is FLAGGED antiparallel (reverse_frame 0 vs 1), not silently normalised")
+else:
+    no("reverse_frame flags are %s and %s" % (a[1], b[1]))
+if a[2] == b[2] and a[3] == b[3]:
+    ok("chain-oriented SEQUENCE is identical (md5 %s, %s bp)" % (a[2][:12], a[3]))
+else:
+    no("chain-oriented sequence differs: %s/%s vs %s/%s" % (a[2][:12], a[3], b[2][:12], b[3]))
+if a[4] == b[4]:
+    ok("chain-oriented BLOCK SPANS are identical (%s)" % a[4])
+else:
+    no("chain-oriented block spans differ: %s vs %s" % (a[4], b[4]))
+g = [l.rstrip("\n").split("\t") for l in open(sys.argv[2])][1:]
+pairs = {(r[9], r[10]) for r in g}
+if pairs and pairs <= {("hapAB", "hapBA"), ("hapBA", "hapAB")}:
+    ok("a MIXED forward/reverse panel still recovers the correct phase (%s)" % sorted(pairs))
+else:
+    no("mixed panel phase is %s, expected hapAB/hapBA" % sorted(pairs))
+sys.exit(bad)
+PYEOFK
+  fails=$(( fails + $? ))
+  "$BIN" genotype -i "$OUT/brc.sorted.gfa" -b "$OUT/brc" -r hapAA -o "$OUT/grc" \
+    -R "$OUT/r1.fq" -R "$OUT/r2.fq" --fragment-len 350 \
+    --hybrid-geometry-probe "$OUT/geom_rc.tsv" -q >/dev/null 2>&1
+  GOK=$(awk -F'\t' '$1==1 && $2==2 && $7==0 {print $8}' "$OUT/geom_rc.tsv" 2>/dev/null)
+  [ "${GOK:-0}" = "1" ] \
+    && ok "linkage geometry builds across the variable pair on a mixed-orientation panel" \
+    || bad "geometry still refuses the variable pair on a mixed panel (ok=${GOK:-none})"
+else
+  bad "the orientation probe or the mixed-panel call produced nothing"
+fi
 # GATE 22: CANDIDATE-FRAME COVERAGE OVER THE HMM STATE UNIVERSE. The requirement is over the
 # states the marker HMM actually declares, NOT the raw panel paths: a recorded state reduction is
 # legitimate, silently dropping candidates whose frame construction failed is not -- that would make
