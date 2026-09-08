@@ -1124,60 +1124,93 @@ if le > 1e-6: ok("linkage moves the posterior by %.4f -- the comparison is not v
 else: no("linkage changes the posterior by only %.2e; the oracle asserts nothing about psi" % le)
 # THE GROUPED SPARSE CONTRACTION must equal the dense kernel exactly:
 #     F'(y) = F'_LS(y) + SUM_x F(x) T(x,y) [psi(x,y) - 1]
-# with the first term the existing factorised O(n_h^2) recurrence and only non-neutral classes
-# contributing. psi - 1 is formed with expm1 so a psi near one keeps its correction.
-sp = {}
+# across the regimes a single recombination rate or a single class would conceal: r = 0 (identity
+# term only), r = 1 (uniform switch only), an intermediate r with all four expanded terms live,
+# several classes on one edge, several haplotypes per allele, TWO linked edges in one chain, and a
+# near-total cancellation.
 rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[1])]
-hdr_i = [i for i, r in enumerate(rows) if r and r[0] == "sparse_case"]
-if hdr_i:
-    h = rows[hdr_i[0]]
-    for r in rows[hdr_i[0]+1:]:
+hi = [k for k, r in enumerate(rows) if r and r[0] == "sparse_case"]
+sp = {}
+if hi:
+    h = rows[hi[0]]
+    for r in rows[hi[0]+1:]:
         if len(r) == len(h): sp[r[0]] = dict(zip(h, r))
 if not sp:
     no("no grouped-sparse comparison was reported")
 else:
+    need = ("r0_identity_only", "r1_uniform_switch", "r_intermediate", "two_linked_edges",
+            "no_linkage_control", "multi_class_3x3", "multi_class_r0", "multi_class_r1",
+            "adversarial_mass_in_zero_phase", "swapsym_no_linkage", "swapsym_linked",
+            "swapsym_multi_class")
+    miss = [k for k in need if k not in sp]
+    if miss: no("grouped-kernel cases missing: %s" % ", ".join(miss))
+    else: ok("grouped kernel covered over %d cases: r=0, r=1, intermediate, multi-class, two edges"
+             % len(need))
     worst_w = max(float(v["logw_absdiff"]) for v in sp.values())
     worst_m = max(float(v["marg_absdiff"]) for v in sp.values())
     if worst_w < 1e-9 and worst_m < 1e-9:
-        ok("grouped sparse equals the dense kernel: weight sum %.1e, marginals %.1e, over %d cases"
-           % (worst_w, worst_m, len(sp)))
+        ok("grouped == dense everywhere: weight sums %.1e, marginals %.1e" % (worst_w, worst_m))
     else:
-        no("grouped sparse differs from dense: weight sum %.4g, marginals %.4g" % (worst_w, worst_m))
-    # An edge with NO classes must take the factorised path unchanged, not a zero-adding loop.
-    ctl = sp.get("no_linkage_control")
-    if ctl and ctl["classes"] == "0" and ctl["corrections"] == "0":
-        ok("an edge with zero classes applies NO corrections -- the factorised path is unchanged")
-    elif ctl:
+        bad_cases = [k for k, v in sp.items()
+                     if float(v["logw_absdiff"]) >= 1e-9 or float(v["marg_absdiff"]) >= 1e-9]
+        no("grouped differs from dense in: %s" % ", ".join(bad_cases))
+    # Each regime must actually exercise its terms: r=0 and r=1 must give DIFFERENT posteriors, or
+    # the transition terms are not being distinguished at all.
+    if abs(float(sp["r0_identity_only"]["block1_max_marginal"]) -
+           float(sp["r1_uniform_switch"]["block1_max_marginal"])) > 1e-6:
+        ok("r=0 and r=1 give distinct posteriors (%.4f vs %.4f) -- both terms are live"
+           % (float(sp["r0_identity_only"]["block1_max_marginal"]),
+              float(sp["r1_uniform_switch"]["block1_max_marginal"])))
+    else:
+        no("r=0 and r=1 give the same posterior; the transition terms are not distinguished")
+    # An edge with no classes takes the factorised path unchanged.
+    c = sp["no_linkage_control"]
+    if c["classes"] == "0" and c["corrections"] == "0":
+        ok("an edge with zero classes applies NO corrections -- factorised path unchanged")
+    else:
         no("the no-linkage control applied %s corrections over %s classes"
-           % (ctl["corrections"], ctl["classes"]))
-    # NON-VACUITY: the correction must move the posterior away from the no-linkage control.
-    ordy = sp.get("ordinary")
-    if ctl and ordy and abs(float(ctl["block1_max_marginal"]) -
-                            float(ordy["block1_max_marginal"])) > 1e-6:
-        ok("the correction moves the posterior (%.4f -> %.4f), so the agreement is not vacuous"
-           % (float(ctl["block1_max_marginal"]), float(ordy["block1_max_marginal"])))
+           % (c["corrections"], c["classes"]))
+    # Several classes, and several corrections per class.
+    mc = sp["multi_class_3x3"]
+    if int(mc["classes"]) > 1 and int(mc["corrections"]) > int(sp["r_intermediate"]["corrections"]):
+        ok("a 3x3 edge carries %s classes and %s corrections, against %s for the 2x2 single class"
+           % (mc["classes"], mc["corrections"], sp["r_intermediate"]["corrections"]))
     else:
-        no("linkage does not move the posterior; the dense/grouped agreement proves nothing")
-    # THE ADVERSARIAL CASE: the dominant LS mass sits in the phase psi drives to zero, so the
-    # correction must cancel nearly the whole baseline. It must be genuinely DIFFERENT from the
-    # ordinary case, or it is not adversarial -- the first three attempts here were all saturated at
-    # psi_straight = 2, psi_crossed = 0 and gave identical marginals.
-    adv = sp.get("adversarial_mass_in_zero_phase")
-    if not adv:
-        no("the adversarial near-cancellation case is missing")
-    elif ordy and abs(float(adv["block1_max_marginal"]) -
-                      float(ordy["block1_max_marginal"])) < 1e-6:
-        no("the adversarial case is indistinguishable from the ordinary one -- it is not adversarial")
+        no("the multi-class case is not richer than the single-class one")
+    # TWO LINKED EDGES in one chain, not one linked plus one factorised.
+    if int(sp["two_linked_edges"]["linked_edges"]) == 2 and \
+       int(sp["two_linked_edges"]["corrections"]) == 2 * int(sp["r_intermediate"]["corrections"]):
+        ok("two linked edges in one chain apply exactly twice the corrections")
     else:
-        ok("adversarial near-cancellation is a DISTINCT regime (%.4f vs %.4f) and still agrees"
-           % (float(adv["block1_max_marginal"]), float(ordy["block1_max_marginal"])))
-        if int(adv["clamped"]) == 0:
-            ok("no weight went negative under near-total cancellation")
-        else:
-            ok("%s tiny negatives clamped, worst %s -- recorded, not silently absorbed"
-               % (adv["clamped"], adv["worst_negative"]))
+        no("two linked edges: %s edges, %s corrections"
+           % (sp["two_linked_edges"]["linked_edges"], sp["two_linked_edges"]["corrections"]))
+    # HOMOLOGUE-SWAP INVARIANCE is a property of the KERNEL and can only be tested against
+    # emissions that are themselves symmetric. Measured against the deliberately asymmetric default
+    # emissions it fails even with NO linkage (0.108), which says nothing about the kernel.
+    asym = float(sp["no_linkage_control"]["swap_absdiff"])
+    sym = max(float(sp[k]["swap_absdiff"]) for k in
+              ("swapsym_no_linkage", "swapsym_linked", "swapsym_multi_class"))
+    if sym < 1e-12 and asym > 1e-3:
+        ok("with symmetric emissions the posterior is swap-invariant (%.1e); the asymmetric fixture "
+           "differs by %.3f even unlinked, so that arm tests the fixture, not the kernel"
+           % (sym, asym))
+    elif sym >= 1e-12:
+        no("the posterior is not swap-invariant under symmetric emissions: %.4g" % sym)
+    else:
+        no("the asymmetric control shows no swap difference; the comparison proves nothing")
+    # NEAR-TOTAL CANCELLATION must remain a distinct regime and produce no material negative weight.
+    adv = sp["adversarial_mass_in_zero_phase"]
+    if abs(float(adv["block1_max_marginal"]) -
+           float(sp["r_intermediate"]["block1_max_marginal"])) < 1e-6:
+        no("the adversarial case is indistinguishable from the ordinary one")
+    elif int(adv["clamped"]) == 0:
+        ok("near-total cancellation stays a distinct regime (%.4f) with NO negative weights"
+           % float(adv["block1_max_marginal"]))
+    else:
+        ok("near-total cancellation clamped %s tiny negatives, worst %s -- recorded, not absorbed"
+           % (adv["clamped"], adv["worst_negative"]))
 
-# BOTH KERNEL EDGE PATHS MUST RUN IN ONE CHAIN. There is a single inference kernel with a
+# BOTH KERNEL EDGE PATHS MUST RUN IN ONE CHAIN.# BOTH KERNEL EDGE PATHS MUST RUN IN ONE CHAIN. There is a single inference kernel with a
 # factorised O(n_h^2) path and a linked O(n_h^4) path; a branch that is present but never taken is
 # not covered. The linkage-free control must take the factorised path only.
 fac, lnk = int(d["factorised_edges"]), int(d["linked_edges"])
