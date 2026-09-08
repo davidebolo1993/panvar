@@ -4352,6 +4352,13 @@ LinkageEmission linkage_emission(const Fragment& fragment, const LinkageGeometry
         for (std::size_t be = 0; be < out.n_b; ++be) {
             const std::string win = geom.lflank + geom.alleles_a[al] + geom.context +
                                     geom.alleles_b[be] + geom.rflank;
+            // NOTE ON COST, measured rather than assumed. This materialises and searches EVERY
+            // (alpha, beta) window: C4's ten edges need 1,154,642 of them and the construction did
+            // not finish. Building a piece index per window was tried and does NOT fix it -- the
+            // index costs O(|win|) to build, which at 1.15M windows is the same order as the
+            // scanning it replaces. The real reduction has to come from proposing only the allele
+            // pairs a fragment's seeds can reach, which is a separate bounded-complete search, so
+            // this stays the straightforward form until that exists.
             const auto f1 = bounded_mate_placements(fragment.r1, win, d1, nullptr, nullptr);
             const auto v1 = bounded_mate_placements(a1, win, d1, nullptr, nullptr);
             const auto f2 = bounded_mate_placements(fragment.r2, win, d2, nullptr, nullptr);
@@ -4397,6 +4404,98 @@ LinkageEmission linkage_emission(const Fragment& fragment, const LinkageGeometry
     }
     out.ok = true;
     return out;
+}
+
+SparseEdgeLinkage make_sparse_kernel_edge(const SparseLinkageEdge& edge,
+                                          const AlleleMapping& map_a, const AlleleMapping& map_b) {
+    SparseEdgeLinkage out;   // inactive by default: the safe answer
+    if (!edge.usable()) return out;
+    if (map_a.status != MappingStatus::Ok || map_b.status != MappingStatus::Ok) return out;
+    if (map_a.n_alleles != edge.n_a || map_b.n_alleles != edge.n_b) return out;
+    if (map_a.allele.size() != map_b.allele.size()) return out;
+    out.n_a = edge.n_a;
+    out.n_b = edge.n_b;
+    out.allele_a = map_a.allele;
+    out.allele_b = map_b.allele;
+    out.group_a.assign(edge.n_a, {});
+    out.group_b.assign(edge.n_b, {});
+    for (std::uint32_t h = 0; h < out.allele_a.size(); ++h) {
+        if (out.allele_a[h] >= edge.n_a || out.allele_b[h] >= edge.n_b) return SparseEdgeLinkage{};
+        out.group_a[out.allele_a[h]].push_back(h);
+        out.group_b[out.allele_b[h]].push_back(h);
+    }
+    out.classes.reserve(edge.delta.size());
+    for (const auto& kv : edge.delta) {
+        const std::size_t amin = static_cast<std::size_t>((kv.first >> 48) & 0xFFFF);
+        const std::size_t amax = static_cast<std::size_t>((kv.first >> 32) & 0xFFFF);
+        const std::size_t bmin = static_cast<std::size_t>((kv.first >> 16) & 0xFFFF);
+        const std::size_t bmax = static_cast<std::size_t>(kv.first & 0xFFFF);
+        SparsePhaseClass c;
+        c.amin = static_cast<std::uint32_t>(amin); c.amax = static_cast<std::uint32_t>(amax);
+        c.bmin = static_cast<std::uint32_t>(bmin); c.bmax = static_cast<std::uint32_t>(bmax);
+        // expm1, so a psi near one keeps its correction rather than losing it to cancellation.
+        c.straight_m1 = std::expm1(edge.log_psi(amin, bmin, amax, bmax));
+        c.crossed_m1 = std::expm1(edge.log_psi(amin, bmax, amax, bmin));
+        out.classes.push_back(c);
+    }
+    out.active = true;
+    return out;
+}
+
+HybridActivation plan_hybrid_activation_sparse(
+    const std::vector<Fragment>& fragments,
+    const std::vector<FragmentOwner>& owners,
+    const std::vector<EdgeStatusEntry>& edge_status,
+    const std::map<std::pair<std::uint32_t, std::uint32_t>, SparseLinkageEdge>& edges,
+    const std::vector<AlleleMapping>& maps,
+    std::size_t n_blocks) {
+    HybridActivation A;
+    A.kernel_edges.assign(n_blocks, ChainEdgeLinkage{});
+    A.sparse_kernel_edges.assign(n_blocks, SparseEdgeLinkage{});
+    A.report = assess_hybrid_completeness(owners, edge_status);
+    A.ownership_complete = A.report.ownership_complete;
+    if (!A.ownership_complete) {
+        A.refusal = "hybrid model incomplete: " +
+                    std::to_string(A.report.unconsumed_wide) + " wide, " +
+                    std::to_string(A.report.unconsumed_refused_edge) + " on refused edges, " +
+                    std::to_string(A.report.unconsumed_unusable) + " unusable";
+        return A;
+    }
+    // BUILD EVERY EDGE FIRST. Nine successes and one failure is still a failure: the transaction is
+    // over all edges, not each edge separately.
+    std::vector<SparseEdgeLinkage> built(n_blocks);
+    for (const auto& kv : edges) {
+        const std::uint32_t a = kv.first.first, b = kv.first.second;
+        if (b >= n_blocks || a >= maps.size() || b >= maps.size()) {
+            A.refusal = "edge " + std::to_string(a) + "-" + std::to_string(b) + " is out of range";
+            return A;
+        }
+        const SparseEdgeLinkage k = make_sparse_kernel_edge(kv.second, maps[a], maps[b]);
+        if (!k.active) {
+            A.refusal = "edge " + std::to_string(a) + "-" + std::to_string(b) +
+                        " passed completeness but could not be built for the kernel";
+            return A;
+        }
+        built[b] = k;
+    }
+    for (std::size_t i = 0; i < owners.size() && i < fragments.size(); ++i) {
+        if (owners[i].kind != OwnerKind::Linkage) continue;
+        const std::uint32_t b = owners[i].block_hi;
+        // ACTIVE means built, whether or not it carries classes: a sparse-neutral edge is a
+        // legitimate consumer that simply contributes no correction.
+        if (b >= n_blocks || !built[b].active) {
+            A.refusal = "fragment " + fragments[i].name + " is owned by an edge that is not active";
+            return A;
+        }
+        A.excluded_fragments.push_back(fragments[i].name);
+        ++A.consumed_fragments;
+    }
+    A.factors_buildable = true;
+    A.sparse_kernel_edges = std::move(built);
+    for (const SparseEdgeLinkage& k : A.sparse_kernel_edges) if (k.active) ++A.active_edges;
+    A.hybrid_activated = true;
+    A.call_status = HybridCallStatus::Complete;
+    return A;
 }
 
 HybridActivation plan_hybrid_activation(const std::vector<Fragment>& fragments,
@@ -4592,6 +4691,8 @@ const char* linkage_status_name(LinkageStatus s) {
         case LinkageStatus::ExposureDoesNotCancel: return "exposure-does-not-cancel";
         case LinkageStatus::InvalidEmissions:      return "invalid-emissions";
         case LinkageStatus::TooManyConfigurations: return "too-many-configurations";
+        case LinkageStatus::ResourceExceeded:      return "resource-exceeded";
+        case LinkageStatus::CountOverflow:         return "count-overflow";
         default:                                   return "not-computed";
     }
 }
@@ -4627,7 +4728,8 @@ double SparseLinkageEdge::log_psi(std::size_t a1, std::size_t b1,
 
 SparseLinkageEdge build_sparse_linkage_edge(const std::vector<LinkageEmission>& emissions,
                                             const LinkageGeometry& geom, double lambda,
-                                            double log_mix, double log_bg_weight) {
+                                            double log_mix, double log_bg_weight,
+                                            const SparseResourceLimits& limits) {
     SparseLinkageEdge E;
     if (!geom.ok) return E;
     E.block_a = geom.block_a; E.block_b = geom.block_b;
@@ -4660,6 +4762,24 @@ SparseLinkageEdge build_sparse_linkage_edge(const std::vector<LinkageEmission>& 
         }
     }
     for (const auto& v : at_cell) if (!v.empty()) ++E.support_cells;
+
+    // PREDICT BEFORE BUILDING. Each supported cell (alpha, beta) induces at most
+    // (n_a - 1) * (n_b - 1) classes, so the total is bounded before a single one is allocated. The
+    // arithmetic is OVERFLOW-CHECKED: a wrapped estimate would silently authorise an unbounded
+    // build, which is the opposite of a budget.
+    {
+        std::size_t per_cell = 0, bound = 0;
+        if (__builtin_mul_overflow(na - 1, nb - 1, &per_cell) ||
+            __builtin_mul_overflow(E.support_cells, per_cell, &bound)) {
+            E.status = LinkageStatus::CountOverflow;
+            return E;
+        }
+        E.predicted_classes = bound;
+        if (bound > limits.max_classes) {
+            E.status = LinkageStatus::ResourceExceeded;
+            return E;
+        }
+    }
 
     // AFFECTED CLASSES are induced by that support: a class matters only if one of its four corners
     // carries mass somewhere. Enumerated from the support rather than over all allele quadruples.
@@ -4714,6 +4834,18 @@ SparseLinkageEdge build_sparse_linkage_edge(const std::vector<LinkageEmission>& 
                     E.delta.size() * (sizeof(std::uint64_t) + sizeof(double) + sizeof(void*));
     E.bytes_support = at_cell.capacity() * sizeof(std::vector<std::uint32_t>);
     for (const auto& v : at_cell) E.bytes_support += v.capacity() * sizeof(std::uint32_t);
+    // ...and the MEASURED footprint is checked too. The prediction is an upper bound on classes,
+    // not on bytes, so a build that fits the class budget can still exceed the byte budget.
+    if (E.bytes_total() > limits.max_bytes) {
+        // NOTHING PARTIALLY BUILT REMAINS INDEXABLE: the tables are released, exactly as a refused
+        // dense edge exposes none.
+        E.delta.clear();
+        E.stored_classes = 0;
+        E.bytes_delta = 0;
+        E.bytes_support = 0;
+        E.status = LinkageStatus::ResourceExceeded;
+        return E;
+    }
     E.status = LinkageStatus::Ok;
     return E;
 }

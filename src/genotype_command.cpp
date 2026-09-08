@@ -31,6 +31,7 @@
 #include <atomic>
 #include <chrono>
 #include <fstream>
+#include <sys/resource.h>
 #include <iomanip>
 
 #include <iostream>
@@ -140,6 +141,14 @@ void print_genotype_help() {
         << "                              owned fragments leave the marker counts and feed edge\n"
         << "                              factors instead; the whole exchange is transactional, so\n"
         << "                              any refusal leaves the legacy call untouched.\n"
+        << "      --hybrid-edges <path>   Per-edge sparse construction measurements, serialised\n"
+        << "                              from the objects the caller builds.\n"
+        << "      --hybrid-dry-run        Plan the transaction and report, then stop before calling.\n"
+        << "      --hybrid-max-classes <n>  Operational budget: stored phase classes per edge.\n"
+        << "      --hybrid-max-bytes <n>    Operational budget: measured bytes per edge.\n"
+        << "      --hybrid-max-emission-work <n>  Operational budget: window alignments summed\n"
+        << "                              over edges (fragments x n_A x n_B). Exceeding it gives\n"
+        << "                              INCOMPLETE: emission-work-limit, nothing subtracted.\n"
         << "      --hybrid-status <path>  Where the hybrid status report is written, including\n"
         << "                              every linkage parameter used.\n"
         << "      --hybrid-lambda-estimate  Estimate lambda candidate-independently as\n"
@@ -346,6 +355,23 @@ int run_genotype_command(const std::vector<std::string>& args) {
     std::string hybrid_geometry_probe;
     std::string hybrid_orientation_probe;
     HybridLinkageParameters hyb_params;
+    // OPERATIONAL limits: bytes and counts, never a likelihood or score. A resource refusal must be
+    // attributable to the machine, not to which genotype looked good.
+    std::size_t hybrid_max_classes = 50000000;
+    std::size_t hybrid_max_bytes = 2000000000;
+    // Window alignments summed over edges. C4 needs 1,154,642 and does not finish, so the default
+    // refuses it explicitly rather than hanging.
+    std::size_t hybrid_max_emission_work = 200000;
+    std::string hybrid_edges_path;
+    bool hybrid_dry_run = false;
+    struct EdgeRow {
+        std::uint32_t a = 0, b = 0;
+        std::size_t na = 0, nb = 0, owned = 0, informative = 0, support = 0, stored = 0,
+                    predicted = 0, theoretical = 0, bytes = 0;
+        double build_s = 0.0;
+        std::string status;
+    };
+    std::vector<EdgeRow> edge_rows;
     std::string hybrid_status_path;
     double depth_quantile = 0.75;
     long dump_block = -1;
@@ -464,6 +490,12 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--hybrid-error-rate") hyb_params.error_rate = std::stod(require_value(arg));
         else if (arg == "--hybrid-bg-divergence") hyb_params.bg_divergence = std::stod(require_value(arg));
         else if (arg == "--hybrid-outlier-mix") hyb_params.outlier_mix = std::stod(require_value(arg));
+        else if (arg == "--hybrid-max-classes") hybrid_max_classes = std::stoull(require_value(arg));
+        else if (arg == "--hybrid-max-bytes") hybrid_max_bytes = std::stoull(require_value(arg));
+        else if (arg == "--hybrid-max-emission-work")
+            hybrid_max_emission_work = std::stoull(require_value(arg));
+        else if (arg == "--hybrid-edges") hybrid_edges_path = require_value(arg);
+        else if (arg == "--hybrid-dry-run") hybrid_dry_run = true;
         else if (arg == "--hybrid-lambda-estimate") {
             hyb_params.lambda_source = HybridLinkageParameters::LambdaSource::Estimated;
         }
@@ -1661,11 +1693,46 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         }
                     }
                     hyb_edges_considered = by_edge.size();
+                    // AN OPERATIONAL WORK GUARD on dense emission construction, until the
+                    // support search exists. The cost is fragments x n_A x n_B window alignments
+                    // per edge; C4 needs 1,154,642 and does not finish. This is a WORK count -- no
+                    // likelihood, no score -- so exceeding it is a machine refusal, and the command
+                    // says so quickly instead of appearing to hang.
+                    std::size_t emission_work = 0;
+                    bool work_overflow = false;
+                    for (const auto& kv : by_edge) {
+                        const std::size_t na2 = blocks[kv.first.first].n_alleles;
+                        const std::size_t nb2 = blocks[kv.first.second].n_alleles;
+                        std::size_t w = 0;
+                        if (__builtin_mul_overflow(na2, nb2, &w) ||
+                            __builtin_mul_overflow(w, kv.second.size(), &w) ||
+                            __builtin_add_overflow(emission_work, w, &emission_work)) {
+                            work_overflow = true;
+                            break;
+                        }
+                    }
+                    if (work_overflow || emission_work > hybrid_max_emission_work) {
+                        hyb_act = HybridActivation{};
+                        hyb_act.refusal = work_overflow
+                            ? "emission-work-limit: the work estimate overflowed"
+                            : "emission-work-limit: " + std::to_string(emission_work) +
+                              " window alignments exceeds the budget of " +
+                              std::to_string(hybrid_max_emission_work) +
+                              " (fragments x n_A x n_B summed over edges)";
+                        log.info("hybrid: " + hyb_act.refusal +
+                                 "; no edge built, nothing subtracted");
+                    } else {
                     std::vector<std::vector<std::string>> ballele(blocks.size());
                     for (std::size_t b = 0; b < blocks.size(); ++b) {
                         ballele[b] = blocks[b].allele_seq;
                     }
-                    std::map<std::pair<std::uint32_t, std::uint32_t>, LinkageEdge> edge_map;
+                    // SPARSE IS THE PRODUCTION BUILDER. The dense LinkageEdge is reachable only
+                    // from fixtures and oracles now; production never consults its configuration
+                    // cap, which is why a C4-sized edge no longer refuses here.
+                    std::map<std::pair<std::uint32_t, std::uint32_t>, SparseLinkageEdge> edge_map;
+                    SparseResourceLimits rlim;
+                    rlim.max_classes = hybrid_max_classes;
+                    rlim.max_bytes = hybrid_max_bytes;
                     std::vector<EdgeStatusEntry> edge_status;
                     const std::size_t FLANK = static_cast<std::size_t>(ip.hi);
                     for (const auto& kv : by_edge) {
@@ -1685,6 +1752,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         }
                         std::vector<LinkageEmission> ems;
                         ems.reserve(kv.second.size());
+                        std::size_t n_inform = 0;
                         for (std::size_t fi : kv.second) {
                             const std::size_t len = hf[fi].bases();
                             const std::size_t be = static_cast<std::size_t>(
@@ -1693,11 +1761,25 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                                static_cast<double>(len - be) * l1m;
                             ems.push_back(linkage_emission(hf[fi], geom, ip, hyb_params.max_divergence,
                                                            lep, l1m, bgf));
+                            if (ems.back().informative) ++n_inform;
                         }
-                        LinkageEdge E = aggregate_linkage_edge(
+                        const auto t_build = std::chrono::steady_clock::now();
+                        SparseLinkageEdge E = build_sparse_linkage_edge(
                             ems, geom, hyb_params.lambda,
-                            std::log1p(-hyb_params.outlier_mix), std::log(hyb_params.outlier_mix));
+                            std::log1p(-hyb_params.outlier_mix), std::log(hyb_params.outlier_mix),
+                            rlim);
+                        const double build_s = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - t_build).count();
                         es.status = E.status;
+                        // PER-EDGE MEASUREMENT, from the production build itself rather than a
+                        // second profiler that would rebuild the support independently and could
+                        // measure something the caller never used.
+                        edge_rows.push_back(EdgeRow{
+                            es.block_a, es.block_b, blocks[es.block_a].n_alleles,
+                            blocks[es.block_b].n_alleles, kv.second.size(), n_inform,
+                            E.support_cells, E.stored_classes, E.predicted_classes,
+                            E.theoretical_configs, E.bytes_total(), build_s,
+                            linkage_status_name(E.status)});
                         edge_status.push_back(es);
                         if (E.usable()) edge_map.emplace(kv.first, std::move(E));
                     }
@@ -1714,12 +1796,62 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         maps[b] = build_allele_mapping(av, blocks[b].n_alleles,
                                                        blocks[b].bypass_allele);
                     }
-                    hyb_act = plan_hybrid_activation(hf, owners, edge_status, edge_map, maps,
-                                                     blocks.size());
+                    hyb_act = plan_hybrid_activation_sparse(hf, owners, edge_status, edge_map,
+                                                            maps, blocks.size());
                     if (hyb_act.hybrid_activated) {
                         hyb_exclusions.insert(hyb_act.excluded_fragments.begin(),
                                               hyb_act.excluded_fragments.end());
                     }
+                    }   // end of the work-guard else
+                }
+                // PER-EDGE MEASUREMENT, serialised from the objects the caller actually built.
+                if (!hybrid_edges_path.empty()) {
+                    std::ofstream ef(hybrid_edges_path);
+                    if (!ef) throw std::runtime_error("genotype: cannot write " + hybrid_edges_path);
+                    ef.precision(6);
+                    ef << "block_a\tblock_b\tn_alleles_a\tn_alleles_b\towned_fragments"
+                          "\tinformative_fragments\tsupport_cells\tstored_classes"
+                          "\tpredicted_classes\ttheoretical_configs\tsparse_bytes"
+                          "\tbuild_seconds\tstatus\n";
+                    std::size_t tot_stored = 0, tot_bytes = 0, tot_support = 0, usable = 0;
+                    double tot_build = 0.0;
+                    for (const EdgeRow& r : edge_rows) {
+                        ef << r.a << '\t' << r.b << '\t' << r.na << '\t' << r.nb << '\t'
+                           << r.owned << '\t' << r.informative << '\t' << r.support << '\t'
+                           << r.stored << '\t' << r.predicted << '\t' << r.theoretical << '\t'
+                           << r.bytes << '\t' << r.build_s << '\t' << r.status << '\n';
+                        tot_stored += r.stored; tot_bytes += r.bytes; tot_support += r.support;
+                        tot_build += r.build_s;
+                        if (r.status == std::string("ok")) ++usable;
+                    }
+                    // AGGREGATE, because production holds every edge at once. A sum of isolated
+                    // per-edge estimates is not what the process actually needs.
+                    struct rusage ru {};
+                    double peak_mb = 0.0;
+                    if (getrusage(RUSAGE_SELF, &ru) == 0) {
+#ifdef __APPLE__
+                        peak_mb = static_cast<double>(ru.ru_maxrss) / 1048576.0;   // bytes
+#else
+                        peak_mb = static_cast<double>(ru.ru_maxrss) / 1024.0;      // kilobytes
+#endif
+                    }
+                    ef << "#total_edges\t" << edge_rows.size() << '\n';
+                    ef << "#usable_edges\t" << usable << '\n';
+                    ef << "#refused_edges\t" << (edge_rows.size() - usable) << '\n';
+                    ef << "#total_support_cells\t" << tot_support << '\n';
+                    ef << "#total_stored_classes\t" << tot_stored << '\n';
+                    ef << "#total_sparse_bytes\t" << tot_bytes << '\n';
+                    ef << "#total_build_seconds\t" << tot_build << '\n';
+                    ef << "#peak_rss_mb\t" << peak_mb << '\n';
+                    ef << "#hybrid_status\t" << hybrid_call_status_name(hyb_act.call_status) << '\n';
+                    ef << "#active_edges\t" << hyb_act.active_edges << '\n';
+                    ef << "#fragments_excluded\t" << hyb_exclusions.size() << '\n';
+                    ef << "#max_classes_limit\t" << hybrid_max_classes << '\n';
+                    ef << "#max_bytes_limit\t" << hybrid_max_bytes << '\n';
+                    ef.flush();
+                    if (!ef) throw std::runtime_error("genotype: write failed for " +
+                                                      hybrid_edges_path);
+                    log.wrote({hybrid_edges_path});
                 }
                 // PROVENANCE. Every parameter the linkage factors used, written with the result,
                 // so a real-data number is interpretable later without reading the source. lambda is
@@ -1788,6 +1920,15 @@ int run_genotype_command(const std::vector<std::string>& args) {
                          std::to_string(hyb_act.active_edges) + " active, " +
                          std::to_string(hyb_exclusions.size()) + " excluded from markers" +
                          (hyb_act.refusal.empty() ? "" : "; " + hyb_act.refusal));
+            }
+
+            // A DRY RUN stops after transactional planning, having serialised the exact edge
+            // objects and counters normal inference would consume -- not a second code path that
+            // rebuilds them.
+            if (hybrid_call && hybrid_dry_run) {
+                log.info("hybrid dry run: planning complete, stopping before inference");
+                log.done();
+                return 0;
             }
 
             // MARKER OCCURRENCE EXCLUSION. Fragments owned by a linkage edge contribute their
@@ -2478,7 +2619,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
             gopt.probe_pairs = probe_pairs;
             // ACTIVE EDGES ONLY, and only from a committed transaction. Null otherwise, which takes
             // the factorised path at every edge and reproduces the legacy chain exactly.
-            if (hyb_act.hybrid_activated) gopt.linkage_edges = &hyb_act.kernel_edges;
+            if (hyb_act.hybrid_activated) gopt.sparse_linkage_edges = &hyb_act.sparse_kernel_edges;
             std::vector<ProbePairResult> probe_rows;
             std::vector<BlockCall> calls =
                 genotype_sample(chain, blocks, read_panel, rc, depth, hap_names, gopt, &gsum,

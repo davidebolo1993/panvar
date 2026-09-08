@@ -924,9 +924,15 @@ std::vector<BlockCall> genotype_sample(
     // here: a refused edge never reaches this point, because the transaction that would have
     // supplied it was abandoned before any evidence was moved.
     const std::vector<ChainEdgeLinkage>* kernel_edges = options.linkage_edges;
+    const std::vector<SparseEdgeLinkage>* sparse_edges = options.sparse_linkage_edges;
     if (kernel_edges != nullptr && kernel_edges->size() != nb) {
         throw std::runtime_error("genotype: linkage edge vector has " +
                                  std::to_string(kernel_edges->size()) + " entries for " +
+                                 std::to_string(nb) + " blocks");
+    }
+    if (sparse_edges != nullptr && sparse_edges->size() != nb) {
+        throw std::runtime_error("genotype: sparse linkage edge vector has " +
+                                 std::to_string(sparse_edges->size()) + " entries for " +
                                  std::to_string(nb) + " blocks");
     }
     auto run_fb = [&]() {
@@ -934,7 +940,7 @@ std::vector<BlockCall> genotype_sample(
                                [&](std::size_t bi, std::vector<double>& ev) {
                                    block_emissions(bi, ev);
                                },
-                               kernel_edges, fwd, bwd, &kernel_stats);
+                               kernel_edges, fwd, bwd, &kernel_stats, sparse_edges);
     };
     run_fb();
 

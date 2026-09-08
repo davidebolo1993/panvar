@@ -1817,7 +1817,9 @@ enum class LinkageStatus {
     Ok,
     ExposureDoesNotCancel,   // a short window broke the cancellation the contract requires
     InvalidEmissions,        // an owned fragment produced no emission -> INCOMPLETE
-    TooManyConfigurations,   // the dense table would not fit; REFUSED, never truncated
+    TooManyConfigurations,   // the DENSE table would not fit; a fixture/oracle limit only
+    ResourceExceeded,        // the SPARSE build would exceed its declared byte or class budget
+    CountOverflow,           // a support/class estimate overflowed; refuse rather than wrap
 };
 const char* linkage_status_name(LinkageStatus s);
 
@@ -1990,6 +1992,7 @@ HybridCompletenessReport assess_hybrid_completeness(const std::vector<FragmentOw
 ChainEdgeLinkage make_kernel_edge(const LinkageEdge& edge,
                                   const AlleleMapping& map_a, const AlleleMapping& map_b);
 
+
 // ---------------------------------------------------------------------------------------------
 // EVERY PARAMETER THE LINKAGE FACTORS USE, in one object, reported with the result.
 //
@@ -2083,6 +2086,7 @@ struct HybridActivation {
     HybridCompletenessReport report;
     std::vector<std::string> excluded_fragments;   // empty unless hybrid_activated
     std::vector<ChainEdgeLinkage> kernel_edges;    // all inactive unless hybrid_activated
+    std::vector<SparseEdgeLinkage> sparse_kernel_edges;   // the production representation
     std::size_t active_edges = 0;
     std::size_t consumed_fragments = 0;            // by active edges
     std::string refusal;                           // why the hybrid did not activate
@@ -2177,6 +2181,7 @@ struct SparseLinkageEdge {
     // is between measured things rather than between a payload and an allocation.
     std::size_t bytes_delta = 0;      // hash: buckets, nodes, keys and values
     std::size_t bytes_support = 0;    // the (alpha, beta) -> fragment index
+    std::size_t predicted_classes = 0;   // the pre-build upper bound actually checked
     std::size_t bytes_total() const { return bytes_delta + bytes_support; }
     LinkageStatus status = LinkageStatus::NotComputed;
     bool usable() const { return status == LinkageStatus::Ok; }
@@ -2184,9 +2189,37 @@ struct SparseLinkageEdge {
     double log_psi(std::size_t a1, std::size_t b1, std::size_t a2, std::size_t b2) const;
 };
 
+// AN OPERATIONAL BUDGET, never a statistical one. These are bytes and counts; no likelihood,
+// score or top-K may ever appear here, because a resource refusal must be about the machine and not
+// about which genotype looks good. Exceeding it is a REFUSAL that keeps its own reason, so an
+// INCOMPLETE run can be attributed to memory rather than to the data.
+struct SparseResourceLimits {
+    std::size_t max_classes = 50000000;        // stored phase classes for one edge
+    std::size_t max_bytes = 2000000000;        // that edge's measured footprint
+};
+
 SparseLinkageEdge build_sparse_linkage_edge(const std::vector<LinkageEmission>& emissions,
                                             const LinkageGeometry& geom, double lambda,
-                                            double log_mix, double log_bg_weight);
+                                            double log_mix, double log_bg_weight,
+                                            const SparseResourceLimits& limits = {});
+
+// THE PRODUCTION CONSTRUCTOR. A refused sparse edge, or a refused mapping at either endpoint, gives
+// an INACTIVE entry carrying no classes -- the kernel cannot tell a refused edge from a
+// linkage-free one, so refusal is carried by the completeness report instead. An edge that is
+// usable but carries NO classes is legitimately sparse-neutral and takes the factorised path.
+SparseEdgeLinkage make_sparse_kernel_edge(const SparseLinkageEdge& edge,
+                                          const AlleleMapping& map_a, const AlleleMapping& map_b);
+
+// The sparse planner. Identical transactional contract to the dense one: on ANY failure nothing is
+// subtracted, no edge is activated, and the untouched legacy call remains reportable. Nine
+// successful edges plus one refusal still means zero active edges and zero excluded fragments.
+HybridActivation plan_hybrid_activation_sparse(
+    const std::vector<Fragment>& fragments,
+    const std::vector<FragmentOwner>& owners,
+    const std::vector<EdgeStatusEntry>& edge_status,
+    const std::map<std::pair<std::uint32_t, std::uint32_t>, SparseLinkageEdge>& edges,
+    const std::vector<AlleleMapping>& maps,
+    std::size_t n_blocks);
 
 LinkageEdge aggregate_linkage_edge(const std::vector<LinkageEmission>& emissions,
                                    const LinkageGeometry& geom, double lambda,

@@ -1344,7 +1344,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         // classes that are absent are provably neutral.
         {
             std::printf("large_case\tn_a\tn_b\ttheoretical_configs\tstored_classes"
-                        "\tsupport_cells\tstatus\tfragments\tsparse_bytes\tdense_gb\n");
+                        "\tsupport_cells\tstatus\tfragments\tsparse_bytes\tdense_gb"
+                        "\tdense_status_at_tiny_cap\n");
             for (const auto& dims : {std::pair<std::size_t, std::size_t>{118, 119},
                                      std::pair<std::size_t, std::size_t>{457, 410}}) {
                 LinkageGeometry gl;
@@ -1375,16 +1376,22 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                     }
                     ems.push_back(std::move(m));
                 }
+                // THE DENSE CAP MUST NOT BE CONSULTED HERE. This edge's theoretical size far
+                // exceeds the dense limit, and a production build that still asked it would refuse.
+                // Passing a deliberately tiny dense cap alongside proves the sparse path ignores it.
                 const SparseLinkageEdge SL = build_sparse_linkage_edge(ems, gl, 0.05,
                                                                        std::log1p(-0.05),
                                                                        std::log(0.05));
+                const LinkageEdge DENSE_REFUSED = aggregate_linkage_edge(
+                    ems, gl, 0.05, std::log1p(-0.05), std::log(0.05), 1000u);
                 // A CONSISTENT DENSE BASELINE: LinkageEdge holds TWO double tables (score and
                 // log_psi), so the dense cost is 16 bytes per ordered configuration, not 8.
                 const double dense_gb = static_cast<double>(SL.theoretical_configs) * 16.0 / 1e9;
-                std::printf("%zux%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t%s\t%zu\t%zu\t%.3f\n",
+                std::printf("%zux%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t%s\t%zu\t%zu\t%.3f\t%s\n",
                             dims.first, dims.second, dims.first, dims.second,
                             SL.theoretical_configs, SL.stored_classes, SL.support_cells,
-                            linkage_status_name(SL.status), ems.size(), SL.bytes_total(), dense_gb);
+                            linkage_status_name(SL.status), ems.size(), SL.bytes_total(), dense_gb,
+                            linkage_status_name(DENSE_REFUSED.status));
             }
         }
         // THE DENSE TABLE MUST REFUSE, NOT TRUNCATE. A locus-scale block pair (LPA: 457 x 410) is

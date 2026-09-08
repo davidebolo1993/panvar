@@ -90,6 +90,8 @@
 #     excluded fragment IDs == linkage-owned fragment IDs
 # asserted end to end. Ownership and counting can each be correct while disagreeing about which
 # fragments they cover, and --exclude-fragments today only validates the counting mechanism.
+#  28. the emission WORK guard (fragments x n_A x n_B summed over edges) is operational, not
+#      statistical, and refuses transactionally with its own reason;                        [ACTIVE]
 #  27. the GROUPED sparse contraction equals the dense kernel on weight sums and marginals, an edge
 #      with no classes takes the factorised path unchanged, and an adversarial case placing the
 #      dominant Li-Stephens mass in the phase psi drives to zero still agrees;             [ACTIVE]
@@ -1294,10 +1296,18 @@ for l in open(sys.argv[1]):
 if lc:
     for k, f in sorted(lc.items()):
         if f[6] == "ok" and int(f[4]) > 0:
-            ok("a %s edge completes: %s configurations -> %s stored classes (%.0fx fewer)"
-               % (k, f[3], f[4], float(f[3]) / max(1.0, float(f[4]))))
+            ok("a %s edge completes: %s configurations -> %s stored classes (%.0fx fewer), %s bytes"
+               % (k, f[3], f[4], float(f[3]) / max(1.0, float(f[4])), f[8]))
         else:
             no("a %s edge did not complete: status %s, stored %s" % (k, f[6], f[4]))
+        # THE DENSE CAP MUST NOT BE CONSULTED. The same edge built through the dense path with a
+        # deliberately tiny configuration cap refuses; the sparse path must be indifferent to it, or
+        # production is still gated on the obsolete limit.
+        if len(f) > 10 and f[10] == "too-many-configurations" and f[6] == "ok":
+            ok("      the same edge refuses at a tiny DENSE cap while sparse succeeds -- production "
+               "does not consult it")
+        elif len(f) > 10:
+            no("dense-cap control for %s: dense %s, sparse %s" % (k, f[10], f[6]))
 else:
     no("no large-edge case was reported; the scale claim is untested")
 
@@ -1633,6 +1643,37 @@ PYEOFI
   else
     bad "an end-to-end arm produced no call table"
   fi
+  # 2b. THE EMISSION WORK GUARD is operational, not statistical: a count of window alignments, no
+  #     likelihood anywhere in it. Exceeding it must refuse TRANSACTIONALLY -- nothing subtracted,
+  #     legacy call intact -- rather than appear to hang. Forced here by setting the budget below
+  #     what the fixture needs.
+  "$BIN" genotype -i "$OUT/b.sorted.gfa" -b "$OUT/b" -r hapAA -o "$OUT/e2e.wg" \
+    -R "$OUT/r1.fq" -R "$OUT/r2.fq" --fragment-len 350 --hybrid-call \
+    --hybrid-max-emission-work 1 --hybrid-status "$OUT/wg.tsv" -q >/dev/null 2>&1
+  if [ -s "$OUT/wg.tsv" ] && [ -s "$OUT/e2e.wg.genotypes.tsv" ]; then
+    WST=$(awk -F'\t' '$1=="hybrid_status"{print $2}' "$OUT/wg.tsv")
+    WEX=$(awk -F'\t' '$1=="fragments_excluded"{print $2}' "$OUT/wg.tsv")
+    WAC=$(awk -F'\t' '$1=="active_edges"{print $2}' "$OUT/wg.tsv")
+    WRE=$(awk -F'\t' '$1=="reason"{print $2}' "$OUT/wg.tsv")
+    if [ "$WST" = "INCOMPLETE" ] && [ "${WEX:-1}" = "0" ] && [ "${WAC:-1}" = "0" ]; then
+      ok "the emission work guard refuses transactionally: INCOMPLETE, 0 active, 0 excluded"
+    else
+      bad "work guard: status=$WST active=$WAC excluded=$WEX"
+    fi
+    case "$WRE" in
+      emission-work-limit*) ok "the refusal keeps its own reason ($(echo "$WRE" | cut -c1-40)...)" ;;
+      *) bad "the work refusal lost its reason: '$WRE'" ;;
+    esac
+    # And the legacy call must be untouched by a refusal.
+    if cmp -s "$OUT/e2e.leg.genotypes.tsv" "$OUT/e2e.wg.genotypes.tsv"; then
+      ok "a work refusal leaves the legacy call byte-identical"
+    else
+      bad "a work refusal changed the legacy call"
+    fi
+  else
+    bad "the work-guard arm produced nothing"
+  fi
+
   # 3. THE LINKAGE PARAMETER CONTRACT. Every parameter reported with the result, and actually USED
   #    rather than echoed -- changing lambda must change the answer, or the report is decoration.
   "$BIN" genotype -i "$OUT/b.sorted.gfa" -b "$OUT/b" -r hapAA -o "$OUT/e2e.p1" \
