@@ -2453,7 +2453,19 @@ struct SparseLinkageEdge {
     std::size_t bytes_delta = 0;      // hash: buckets, nodes, keys and values
     std::size_t bytes_support = 0;    // the (alpha, beta) -> fragment index
     std::size_t predicted_classes = 0;   // the pre-build upper bound actually checked
-    std::size_t bytes_total() const { return bytes_delta + bytes_support; }
+    // ---- THE GROUPED REPRESENTATION -------------------------------------------------------------
+    // q(a, b) depends on a only through its signature ROW and on b only through its COLUMN, so a
+    // class quadruple's delta is a function of (row(amin), row(amax), col(bmin), col(bmax)) alone.
+    // Storing it that way is what keeps the edge off the content-class table entirely: RA^2 * RB^2
+    // entries instead of C(n_a,2) * C(n_b,2), and no enumeration of the latter at any point.
+    // The allele -> class vectors stay here; the chain kernel never sees them, because collapsing
+    // alleles as HMM STATES would discard marker and Li-Stephens evidence the fragments never saw.
+    bool grouped = false;
+    std::vector<std::uint32_t> row_class, col_class;      // per allele at A and at B
+    std::size_t n_row_classes = 0, n_col_classes = 0;
+    std::unordered_map<std::uint64_t, double> delta_class;   // ordered class quadruple -> Delta
+    std::size_t bytes_grouped = 0;
+    std::size_t bytes_total() const { return bytes_delta + bytes_support + bytes_grouped; }
     LinkageStatus status = LinkageStatus::NotComputed;
     bool usable() const { return status == LinkageStatus::Ok; }
     // The SAME quantity aggregate_linkage_edge's dense table holds, reconstructed.
@@ -2468,6 +2480,28 @@ struct SparseResourceLimits {
     std::size_t max_classes = 50000000;        // stored phase classes for one edge
     std::size_t max_bytes = 2000000000;        // that edge's measured footprint
 };
+
+// Measured work of the grouped build. Reported so the claim "the content-class table is never
+// visited" is a counter rather than an assertion: oracle_visits must be 0.
+struct GroupedBuildStats {
+    std::size_t oracle_visits = 0;              // content classes enumerated -- MUST stay 0
+    std::size_t representative_visits = 0;      // ordered realisable class quadruples
+    std::size_t pattern_evaluations = 0;        // deltas actually computed
+    std::size_t row_classes = 0, col_classes = 0;
+    std::size_t bytes_cell_signatures = 0, bytes_matrix = 0, bytes_members = 0,
+                bytes_pattern_cache = 0, bytes_delta_class = 0;
+    double build_seconds = 0.0;
+    bool estimates_checked = false;             // every allocation bounded BEFORE it was made
+};
+
+// THE GROUPED CONSTRUCTOR. `cell_signatures` is one vector per fragment, each indexed a * n_b + b,
+// as produced by linkage_emission_supported. Refuses rather than degrades: an unsound signature, a
+// class count that will not fit the key, or an estimate over budget all yield a refused edge.
+SparseLinkageEdge build_sparse_linkage_edge_grouped(
+    const std::vector<LinkageEmission>& emissions,
+    const std::vector<std::vector<std::string>>& cell_signatures,
+    const LinkageGeometry& geom, double lambda, double log_mix, double log_bg_weight,
+    const SparseResourceLimits& limits = {}, GroupedBuildStats* stats = nullptr);
 
 SparseLinkageEdge build_sparse_linkage_edge(const std::vector<LinkageEmission>& emissions,
                                             const LinkageGeometry& geom, double lambda,

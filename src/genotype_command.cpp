@@ -143,6 +143,11 @@ void print_genotype_help() {
         << "                              any refusal leaves the legacy call untouched.\n"
         << "      --hybrid-edges <path>   Per-edge sparse construction measurements, serialised\n"
         << "                              from the objects the caller builds.\n"
+        << "      --hybrid-grouped        Build linkage edges through EXACT signature grouping:\n"
+        << "                              alleles indistinguishable to this edge's fragments share\n"
+        << "                              one delta, and the content-class table is never visited.\n"
+        << "                              Alleles remain distinct HMM states throughout.\n"
+        << "      --hybrid-grouped-report <path>  Per-edge grouped build measurements.\n"
         << "      --hybrid-edge-signature <a,b,path>  JOINT structural emission signatures on one\n"
         << "                              edge: per-fragment classes, their sum, and the joint\n"
         << "                              classes after intersecting every fragment's partition.\n"
@@ -395,6 +400,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
     std::string hybrid_edges_path;
     bool hybrid_dry_run = false;
     std::string hybrid_edge_oracle;      // "<a>,<b>:<path>" -- one edge, both paths, compared
+    bool hybrid_grouped = false;         // build edges through exact signature grouping
+    std::string hybrid_grouped_report;   // per-edge grouped build measurements
     std::string hybrid_edge_signature;   // "<a>,<b>,<path>" -- joint emission signatures
     std::string hybrid_exposure_probe;   // per-configuration window length and exposure
     struct EdgeRow {
@@ -546,6 +553,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--hybrid-edges") hybrid_edges_path = require_value(arg);
         else if (arg == "--hybrid-dry-run") hybrid_dry_run = true;
         else if (arg == "--hybrid-edge-oracle") hybrid_edge_oracle = require_value(arg);
+        else if (arg == "--hybrid-grouped") hybrid_grouped = true;
+        else if (arg == "--hybrid-grouped-report") hybrid_grouped_report = require_value(arg);
         else if (arg == "--hybrid-edge-signature") hybrid_edge_signature = require_value(arg);
         else if (arg == "--hybrid-exposure-probe") hybrid_exposure_probe = require_value(arg);
         else if (arg == "--hybrid-lambda-estimate") {
@@ -2379,6 +2388,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             }
                         }
                         std::vector<LinkageEmission> ems;
+                        std::vector<std::vector<std::string>> edge_sigs;
                         ems.reserve(kv.second.size());
                         std::size_t n_inform = 0;
                         std::size_t e_seed_hits = 0, e_proposed = 0, e_verified = 0,
@@ -2390,9 +2400,12 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             const double bgf = static_cast<double>(be) * lep +
                                                static_cast<double>(len - be) * l1m;
                             AlleleProductSupport sup;
+                            std::vector<std::string> csig;
                             ems.push_back(linkage_emission_supported(
                                 hf[fi], geom, ip, hyb_params.max_divergence, lep, l1m, bgf, &sup,
-                                aidx.ok ? &aidx : nullptr, &work));
+                                aidx.ok ? &aidx : nullptr, &work,
+                                hybrid_grouped ? &csig : nullptr));
+                            if (hybrid_grouped) edge_sigs.push_back(std::move(csig));
                             if (ems.back().work_refused) break;
                             if (ems.back().informative) ++n_inform;
                             // THE SEARCH'S OWN COUNTERS, not the dense budget's. Seed hits,
@@ -2409,10 +2422,47 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             if (sup.exhaustive_fallback) ++e_fallback;
                         }
                         const auto t_build = std::chrono::steady_clock::now();
-                        SparseLinkageEdge E = build_sparse_linkage_edge(
-                            ems, geom, hyb_params.lambda,
-                            std::log1p(-hyb_params.outlier_mix), std::log(hyb_params.outlier_mix),
-                            rlim);
+                        GroupedBuildStats gstats;
+                        SparseLinkageEdge E =
+                            hybrid_grouped
+                                ? build_sparse_linkage_edge_grouped(
+                                      ems, edge_sigs, geom, hyb_params.lambda,
+                                      std::log1p(-hyb_params.outlier_mix),
+                                      std::log(hyb_params.outlier_mix), rlim, &gstats)
+                                : build_sparse_linkage_edge(
+                                      ems, geom, hyb_params.lambda,
+                                      std::log1p(-hyb_params.outlier_mix),
+                                      std::log(hyb_params.outlier_mix), rlim);
+                        if (hybrid_grouped && !hybrid_grouped_report.empty()) {
+                            static bool gh = false;
+                            std::ofstream gr(hybrid_grouped_report,
+                                             gh ? std::ios::app : std::ios::trunc);
+                            if (!gh) {
+                                gr << "block_a\tblock_b\tn_a\tn_b\towned_fragments"
+                                      "\tfragments_contributed\toracle_visits"
+                                      "\trepresentative_visits\tpattern_evaluations"
+                                      "\trow_classes\tcol_classes\tstored_class_quadruples"
+                                      "\tpredicted_classes\tsupport_cells\tbytes_cell_signatures"
+                                      "\tbytes_matrix\tbytes_members\tbytes_delta_class"
+                                      "\tbytes_total\testimates_checked\tbuild_seconds"
+                                      "\tstatus\n";
+                                gh = true;
+                            }
+                            gr << es.block_a << '\t' << es.block_b << '\t'
+                               << blocks[es.block_a].n_alleles << '\t'
+                               << blocks[es.block_b].n_alleles << '\t' << kv.second.size() << '\t'
+                               << edge_sigs.size() << '\t' << gstats.oracle_visits << '\t'
+                               << gstats.representative_visits << '\t'
+                               << gstats.pattern_evaluations << '\t' << gstats.row_classes << '\t'
+                               << gstats.col_classes << '\t' << E.delta_class.size() << '\t'
+                               << E.predicted_classes << '\t' << E.support_cells << '\t'
+                               << gstats.bytes_cell_signatures << '\t' << gstats.bytes_matrix
+                               << '\t' << gstats.bytes_members << '\t'
+                               << gstats.bytes_delta_class << '\t' << E.bytes_total() << '\t'
+                               << (gstats.estimates_checked ? 1 : 0) << '\t'
+                               << gstats.build_seconds << '\t'
+                               << linkage_status_name(E.status) << '\n';
+                        }
                         const double build_s = std::chrono::duration<double>(
                             std::chrono::steady_clock::now() - t_build).count();
                         // PER EDGE, AS IT COMPLETES. A silent multi-minute loop is what made every

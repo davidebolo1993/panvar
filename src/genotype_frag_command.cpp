@@ -1012,6 +1012,33 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                 "the grouped delta map equals the direct one entry for entry (" +
                 std::to_string(orig.delta.size()) + " classes, " +
                 std::to_string(pcache.size()) + " patterns)");
+            // THE PRODUCTION BUILDERS, compared against each other rather than against a map
+            // assembled by the test. This is what production will actually run.
+            {
+                GroupedBuildStats gs;
+                const SparseLinkageEdge ub =
+                    build_sparse_linkage_edge(ems, g, lambda, log_mix, log_bg_weight);
+                const SparseLinkageEdge gb = build_sparse_linkage_edge_grouped(
+                    ems, sigs, g, lambda, log_mix, log_bg_weight, {}, &gs);
+                ok_(ub.usable() && gb.usable() && gb.grouped,
+                    "both builders produce a usable edge, and the grouped one is grouped");
+                ok_(gs.oracle_visits == 0,
+                    "the grouped build NEVER enumerates a content class (oracle visits " +
+                    std::to_string(gs.oracle_visits) + ")");
+                double wp = 0.0;
+                for (std::size_t a1 = 0; a1 < NA; ++a1)
+                for (std::size_t a2 = 0; a2 < NA; ++a2)
+                for (std::size_t b1 = 0; b1 < NB; ++b1)
+                for (std::size_t b2 = 0; b2 < NB; ++b2)
+                    wp = std::max(wp, std::abs(ub.log_psi(a1, b1, a2, b2) -
+                                               gb.log_psi(a1, b1, a2, b2)));
+                ok_(wp == kExact,
+                    "the GROUPED BUILDER's psi equals the ungrouped builder's for every ordered "
+                    "content class (worst " + sci(wp) + ", tolerance " + sci(kExact) + "); " +
+                    std::to_string(ub.stored_classes) + " content classes vs " +
+                    std::to_string(gb.stored_classes) + " class quadruples, " +
+                    std::to_string(gs.representative_visits) + " representative visits");
+            }
             // PSI for every real content class, both orientations.
             double worst_psi = 0.0;
             for (std::size_t a1 = 0; a1 < NA; ++a1)

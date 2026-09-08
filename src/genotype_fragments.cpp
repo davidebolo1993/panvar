@@ -5469,9 +5469,19 @@ double SparseLinkageEdge::log_psi(std::size_t a1, std::size_t b1,
     if (a1 == a2 || b1 == b2) return 0.0;
     const std::size_t amin = std::min(a1, a2), amax = std::max(a1, a2);
     const std::size_t bmin = std::min(b1, b2), bmax = std::max(b1, b2);
-    const auto it = delta.find(class_key(amin, amax, bmin, bmax));
-    if (it == delta.end()) return 0.0;   // no corner carries in-band mass: exactly neutral
-    const double d = it->second;
+    double d = 0.0;
+    if (grouped) {
+        // THE GROUPED LOOKUP. Alleles map to their signature classes and the class quadruple
+        // carries the delta; the content class itself is never stored or visited.
+        const auto itg = delta_class.find(class_key(row_class[amin], row_class[amax],
+                                                    col_class[bmin], col_class[bmax]));
+        if (itg == delta_class.end()) return 0.0;
+        d = itg->second;
+    } else {
+        const auto it = delta.find(class_key(amin, amax, bmin, bmax));
+        if (it == delta.end()) return 0.0;   // no corner carries in-band mass: exactly neutral
+        d = it->second;
+    }
     // STRAIGHT pairs amin with bmin. Homologue 1 carries (a1, b1), so the query is straight when
     // that pairing matches -- in either homologue order, which is the same biological phase.
     const bool straight = (a1 == amin && b1 == bmin) || (a1 == amax && b1 == bmax);
@@ -5481,6 +5491,153 @@ double SparseLinkageEdge::log_psi(std::size_t a1, std::size_t b1,
     if (x > 700.0) return kLog2 - x;
     if (x < -700.0) return kLog2;
     return kLog2 - std::log1p(std::exp(x));
+}
+
+SparseLinkageEdge build_sparse_linkage_edge_grouped(
+    const std::vector<LinkageEmission>& emissions,
+    const std::vector<std::vector<std::string>>& cell_signatures,
+    const LinkageGeometry& geom, double lambda, double log_mix, double log_bg_weight,
+    const SparseResourceLimits& limits, GroupedBuildStats* stats) {
+    const auto t0 = std::chrono::steady_clock::now();
+    SparseLinkageEdge E;
+    GroupedBuildStats st;
+    E.block_a = geom.block_a; E.block_b = geom.block_b;
+    const std::size_t na = geom.alleles_a.size(), nb = geom.alleles_b.size();
+    E.n_a = na; E.n_b = nb;
+    E.theoretical_configs = na * nb * na * nb;
+    if (na < 2 || nb < 2) { E.status = LinkageStatus::Ok; return E; }
+    for (const LinkageEmission& m : emissions) {
+        if (!m.ok) { E.status = LinkageStatus::InvalidEmissions; return E; }
+    }
+    if (cell_signatures.size() != emissions.size()) {
+        E.status = LinkageStatus::InvalidEmissions; return E;
+    }
+    // Exposure must cancel, unchanged: the representation is grouped, the contract is not.
+    double asym = 0.0;
+    for (std::size_t a1 = 0; a1 < na; ++a1)
+    for (std::size_t b1 = 0; b1 < nb; ++b1)
+    for (std::size_t a2 = 0; a2 < na; ++a2)
+    for (std::size_t b2 = 0; b2 < nb; ++b2) {
+        asym = std::max(asym, std::abs((geom.exposure[a1 * nb + b1] + geom.exposure[a2 * nb + b2]) -
+                                       (geom.exposure[a1 * nb + b2] + geom.exposure[a2 * nb + b1])));
+    }
+    if (asym > 1e-9) { E.status = LinkageStatus::ExposureDoesNotCancel; return E; }
+
+    // ---- ESTIMATE BEFORE ALLOCATING ------------------------------------------------------------
+    // Every major allocation is bounded first. An estimate computed after the fact is not a budget.
+    std::size_t est_sig = 0;
+    for (const auto& cs : cell_signatures) {
+        if (cs.size() != na * nb) { E.status = LinkageStatus::InvalidEmissions; return E; }
+        for (const std::string& x : cs) est_sig += x.size() + sizeof(std::string);
+    }
+    const std::size_t est_joint = na * nb * (sizeof(std::string) + 4 * cell_signatures.size());
+    if (est_sig + est_joint > limits.max_bytes) {
+        E.status = LinkageStatus::ResourceExceeded;
+        E.bytes_grouped = est_sig + est_joint;
+        return E;
+    }
+    st.estimates_checked = true;
+    st.bytes_cell_signatures = est_sig;
+
+    // The joint signature per cell: the concatenation over fragments, length-prefixed so two
+    // different splits cannot alias.
+    std::vector<std::string> joint(na * nb);
+    for (const auto& cs : cell_signatures) {
+        for (std::size_t k = 0; k < na * nb; ++k) {
+            const std::uint32_t n = static_cast<std::uint32_t>(cs[k].size());
+            joint[k].append(reinterpret_cast<const char*>(&n), 4);
+            joint[k].append(cs[k]);
+        }
+    }
+    const SignatureMatrix M = build_signature_matrix(joint, na, nb);
+    if (!M.ok) { E.status = LinkageStatus::InvalidEmissions; return E; }
+    const std::size_t RA = M.row_members.size(), RB = M.col_members.size();
+    // THE KEY PACKS FOUR 16-BIT FIELDS. A locus with more classes than that would silently alias
+    // two quadruples into one delta, so it is refused rather than approximated.
+    if (RA > 65535 || RB > 65535) { E.status = LinkageStatus::CountOverflow; return E; }
+    st.row_classes = RA; st.col_classes = RB;
+    // Predicted grouped classes, checked BEFORE the delta map is built.
+    std::size_t pred = 0;
+    if (__builtin_mul_overflow(RA * RA, RB * RB, &pred)) {
+        E.status = LinkageStatus::CountOverflow; return E;
+    }
+    E.predicted_classes = pred;
+    if (pred > limits.max_classes) { E.status = LinkageStatus::ResourceExceeded; return E; }
+
+    // Support cells, for the report; this is a per-cell scan, not a content-class one.
+    for (std::size_t k = 0; k < na * nb; ++k) {
+        for (const LinkageEmission& m : emissions)
+            if (m.mass[k] != kNegInf) { ++E.support_cells; break; }
+    }
+
+    // ---- THE COLLAPSED TRAVERSAL ---------------------------------------------------------------
+    // Ordered class pairs, kept only when some real member pair realises that order. Orientation
+    // depends on it: for a class pair {i,j} which corner counts as straight turns on whether the
+    // class-i member has the smaller allele index, and both orders occur because members are
+    // scattered through the allele order.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> apairs, bpairs;
+    for (std::uint32_t i = 0; i < RA; ++i)
+    for (std::uint32_t j = 0; j < RA; ++j) {
+        const bool okp = (i == j) ? M.row_members[i].size() >= 2
+                                  : M.row_min[i] < M.row_max[j];
+        if (okp) apairs.emplace_back(i, j);
+    }
+    for (std::uint32_t u = 0; u < RB; ++u)
+    for (std::uint32_t v = 0; v < RB; ++v) {
+        const bool okp = (u == v) ? M.col_members[u].size() >= 2
+                                  : M.col_min[u] < M.col_max[v];
+        if (okp) bpairs.emplace_back(u, v);
+    }
+    const double log_lambda = std::log(lambda);
+    const auto mix = [&](double p, double q, double log_p_bg) {
+        double sig = kNegInf;
+        if (p != kNegInf) sig = p;
+        if (q != kNegInf) sig = (sig == kNegInf) ? q : log_add(sig, q);
+        if (sig != kNegInf) sig += log_mix + log_lambda;
+        const double bg = log_bg_weight + log_p_bg;
+        return (sig == kNegInf) ? bg : log_add(sig, bg);
+    };
+    for (const auto& ap : apairs) {
+        for (const auto& bp : bpairs) {
+            ++st.representative_visits;
+            // Representative alleles realising this ordered class quadruple. Their signature ids --
+            // and therefore every corner mass -- are shared by every member of the same classes.
+            const std::size_t a1 = M.row_members[ap.first].front();
+            const std::size_t a2 = (ap.first == ap.second) ? M.row_members[ap.first][1]
+                                                           : M.row_members[ap.second].front();
+            const std::size_t b1 = M.col_members[bp.first].front();
+            const std::size_t b2 = (bp.first == bp.second) ? M.col_members[bp.first][1]
+                                                           : M.col_members[bp.second].front();
+            double d = 0.0;
+            for (const LinkageEmission& m : emissions) {
+                d += mix(m.mass[a1 * nb + b1], m.mass[a2 * nb + b2], m.log_p_bg) -
+                     mix(m.mass[a1 * nb + b2], m.mass[a2 * nb + b1], m.log_p_bg);
+            }
+            ++st.pattern_evaluations;
+            if (d != 0.0) {
+                E.delta_class.emplace(class_key(ap.first, ap.second, bp.first, bp.second), d);
+            }
+        }
+    }
+    E.grouped = true;
+    E.row_class = M.row_class; E.col_class = M.col_class;
+    E.n_row_classes = RA; E.n_col_classes = RB;
+    E.stored_classes = E.delta_class.size();
+    st.bytes_matrix = M.cell_to_signature.size() * sizeof(std::uint32_t);
+    st.bytes_members = (M.row_class.size() + M.col_class.size()) * sizeof(std::uint32_t) +
+                       (na + nb) * sizeof(std::uint32_t);
+    st.bytes_delta_class = E.delta_class.size() * (sizeof(std::uint64_t) + sizeof(double) +
+                                                   2 * sizeof(void*));
+    E.bytes_grouped = st.bytes_matrix + st.bytes_members + st.bytes_delta_class +
+                      (E.row_class.size() + E.col_class.size()) * sizeof(std::uint32_t);
+    if (E.bytes_total() > limits.max_bytes) {
+        E.status = LinkageStatus::ResourceExceeded; return E;
+    }
+    E.status = LinkageStatus::Ok;
+    st.build_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    if (stats != nullptr) *stats = st;
+    return E;
 }
 
 SparseLinkageEdge build_sparse_linkage_edge(const std::vector<LinkageEmission>& emissions,
