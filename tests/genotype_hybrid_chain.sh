@@ -642,6 +642,13 @@ need = ("offpanel_A2_B1", "junction_crossing_seed", "seed_spans_A_ctx_B", "A_onl
 miss = [k for k in need if k not in d]
 if miss: no("support cases missing: %s" % ", ".join(miss)); sys.exit(1)
 ok("support search covered over %d cases" % len(need))
+# STAGE COUNTERS must be populated, or a stage is silently not running.
+st = d["c4_scale_118x119"]
+if int(st["states_after"]) > 0 and int(st["fr_joins"]) > 0:
+    ok("positional stages are live: %s states after dedup, %s valid-FR joins"
+       % (st["states_after"], st["fr_joins"]))
+else:
+    no("positional stages are empty: states=%s joins=%s" % (st["states_after"], st["fr_joins"]))
 # EXACTNESS, everywhere.
 diff = [k for k, v in d.items() if v["cells_differ"] != "0"]
 if diff: no("finite-support cells differ from the dense oracle in: %s" % ", ".join(diff))
@@ -688,11 +695,12 @@ else:
     no("zero-state handling differs: %s" % z)
 # Multiplicity: nine identical origins must be preserved, not collapsed.
 ni = d["nine_identical_origins"]
-if int(ni["seed_hits"]) > 100 and ni["worst_mass_diff"] == "0":
-    ok("nine identical repeat origins are preserved with identical mass (%s seed hits)"
-       % ni["seed_hits"])
+if int(ni["seed_occurrences"]) > 100 and ni["worst_mass_diff"] == "0":
+    ok("nine identical repeat origins are preserved with identical mass (%s seed occurrences)"
+       % ni["seed_occurrences"])
 else:
-    no("repeat multiplicity: seed_hits=%s mass_diff=%s" % (ni["seed_hits"], ni["worst_mass_diff"]))
+    no("repeat multiplicity: seed_occurrences=%s mass_diff=%s"
+       % (ni["seed_occurrences"], ni["worst_mass_diff"]))
 # THE REDUCTION, at C4 scale.
 c4 = d["c4_scale_118x119"]
 if float(c4["reduction"]) > 5.0 and c4["cells_differ"] == "0":

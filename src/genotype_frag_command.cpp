@@ -698,9 +698,11 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     // same log mass, same informative classification. Not "the same phase call" -- that would pass
     // while multiplicity or an off-panel combination went missing.
     if (support_selftest) {
-        std::printf("case\tn_a\tn_b\tdense_pairs\tproposed\tverified\tseed_hits\tfallback"
-                    "\tcells_differ\tworst_mass_diff\tfinite_dense\tfinite_supported"
-                    "\tinformative_match\treduction\n");
+        // STAGE COUNTERS reported separately, so it is visible whether cost moves out of window
+        // verification and into tuple construction or joining rather than disappearing.
+        std::printf("case\tn_a\tn_b\tdense_pairs\tproposed\tverified\tseed_occurrences"
+                    "\tfallback\tcells_differ\tworst_mass_diff\tfinite_dense\tfinite_supported"
+                    "\tinformative_match\treduction\tstates_before\tstates_after\tfr_joins\n");
         std::mt19937_64 rng(20260908);
         const auto rseq = [&](std::size_t n) {
             static const char* B = "ACGT";
@@ -720,9 +722,16 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         const auto run = [&](const char* name, const LinkageGeometry& g, const Fragment& f,
                              const InsertPrior& ip) {
             const LinkageEmission D = linkage_emission(f, g, ip, 0.05, lep, l1m, -400.0);
+            // THE INDEX IS BUILT HERE, at this fragment's own piece length. Without it the search
+            // takes the exhaustive fallback and the comparison silently stops testing the search.
+            const std::size_t dd = mate_band_edits(0.05, f.r1.size());
+            const std::size_t pp = f.r1.size() / (dd + 1);
+            const AlleleProductIndex aix = (pp >= 8 && pp <= 32)
+                ? build_allele_product_index(g, pp) : AlleleProductIndex{};
             AlleleProductSupport sup;
             const LinkageEmission S2 = linkage_emission_supported(f, g, ip, 0.05, lep, l1m,
-                                                                  -400.0, &sup);
+                                                                  -400.0, &sup,
+                                                                  aix.ok ? &aix : nullptr);
             std::size_t differ = 0, fin_d = 0, fin_s = 0;
             double worst = 0.0;
             for (std::size_t k = 0; k < D.mass.size(); ++k) {
@@ -734,14 +743,17 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                 if (fx != fy) { ++differ; continue; }
                 if (fx) worst = std::max(worst, std::abs(x - y));
             }
+            const std::size_t ver = sup.exhaustive_fallback ? sup.dense_pairs
+                                                            : sup.proposals.size();
             std::printf("%s\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t%d\t%zu\t%.3g\t%zu\t%zu"
-                        "\t%d\t%.2f\n",
-                        name, D.n_a, D.n_b, sup.dense_pairs, sup.proposed_states,
-                        sup.proposals.size(), sup.seed_hits, sup.exhaustive_fallback ? 1 : 0,
+                        "\t%d\t%.2f\t%zu\t%zu\t%zu\n",
+                        name, D.n_a, D.n_b, sup.dense_pairs, sup.proposed_states, ver,
+                        sup.seed_occurrences, sup.exhaustive_fallback ? 1 : 0,
                         differ, worst, fin_d, fin_s,
                         D.informative == S2.informative ? 1 : 0,
-                        sup.proposals.empty() ? 0.0
-                            : static_cast<double>(sup.dense_pairs) / sup.proposals.size());
+                        ver == 0 ? 0.0 : static_cast<double>(sup.dense_pairs) / ver,
+                        sup.positional_states_before_dedup, sup.positional_states_after_dedup,
+                        sup.valid_fr_joins);
         };
         const auto geom_of = [&](const std::vector<std::string>& A,
                                  const std::vector<std::string>& Bv, const std::string& ctx,

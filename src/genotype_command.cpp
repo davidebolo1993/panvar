@@ -1819,6 +1819,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                  std::to_string(kv.second.size()) + " frags, " +
                                  std::to_string(e_verified) + " verified of " +
                                  std::to_string(e_dense) + " dense, " +
+                                 std::to_string(e_fallback) + " fallbacks, idx=" +
+                                 (aidx.ok ? "ok" : "none") + ", " +
                                  std::to_string(build_s) + " s");
                         es.status = E.status;
                         // PER-EDGE MEASUREMENT, from the production build itself rather than a

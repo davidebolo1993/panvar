@@ -1795,10 +1795,24 @@ LinkageGeometry build_linkage_geometry(const std::vector<CandidateFrame>& frames
 // is looked up as "which alleles end with piece[0..j)" and "which begin with piece[j..p)", and the
 // proposal is the PRODUCT of those two small sets -- computed without ever visiting the pairs that
 // match neither.
+// ONE POSITIONAL MATE STATE. A seed proposes; the existing Hamming scorer still decides.
+struct AlleleMateProposal {
+    std::uint32_t alpha = 0;
+    std::uint32_t beta = 0;
+    long start = 0;
+    bool reverse = false;
+};
+
 struct AlleleProductSupport {
     // Pairs whose window must be materialised and verified. Everything else is provably empty.
     std::vector<std::pair<std::uint32_t, std::uint32_t>> proposals;
-    std::size_t seed_hits = 0;        // exact piece occurrences found
+    // STAGES REPORTED SEPARATELY, so it is visible whether time moves out of window verification
+    // and into tuple construction or joining rather than disappearing.
+    std::size_t seed_occurrences = 0;
+    std::size_t positional_states_before_dedup = 0;
+    std::size_t positional_states_after_dedup = 0;
+    std::size_t valid_fr_joins = 0;
+    std::size_t seed_hits = 0;        // retained: total seed occurrences
     std::size_t proposed_states = 0;  // (alpha, beta) pairs proposed, before dedup
     std::size_t dense_pairs = 0;      // n_A * n_B, for the reduction factor
     // Set when the pigeonhole proof does not apply -- a non-ACGT read, or a piece shorter than the
@@ -1814,21 +1828,42 @@ struct AlleleProductSupport {
 //
 // Pieces are encoded 2 bits per base, so a piece longer than 32 bases cannot be keyed; that case
 // takes the exhaustive fallback rather than a silently different search.
+// WHERE a piece occurs, not merely THAT it occurs. The offset is what lets the insert prior filter:
+// a seed coordinate implies a mate start, and the two mates' starts must satisfy the valid-FR
+// relationship. Recording only allele identity was measured on real C4 and proposed 1260 of 1260
+// pairs -- a 16 bp seed matches nearly every allele at a block whose alleles are variants of one
+// another, so identity alone discriminates nothing.
+struct AlleleSeedHit {
+    std::uint32_t allele = 0;
+    std::uint32_t offset = 0;   // within the component
+};
+
 struct AlleleProductIndex {
     std::size_t piece = 0;
     bool ok = false;
-    // piece code -> the alleles containing it. Occurrences are not deduplicated across alleles.
-    std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> in_a, in_b;
-    // Junction split: alleles ending with / beginning with a given prefix code, per split length.
+    // piece code -> (allele, offset within that allele). Occurrences are NOT deduplicated: two
+    // identical repeat copies are two origins at different offsets.
+    std::unordered_map<std::uint64_t, std::vector<AlleleSeedHit>> in_a, in_b;
+    // Boundary neighbourhoods, kept separate so their coordinates can be derived correctly: the
+    // offset in a boundary string is not an offset in the allele.
+    std::unordered_map<std::uint64_t, std::vector<AlleleSeedHit>> la_bound, ac_bound;
+    std::unordered_map<std::uint64_t, std::vector<AlleleSeedHit>> cb_bound, br_bound;
+    // The direct A->B junction, per split length. These retain the alpha-beta CORRELATION: the pair
+    // proposed is (allele ending with the left part, allele starting with the right part), not two
+    // independent flags.
     std::vector<std::unordered_map<std::uint64_t, std::vector<std::uint32_t>>> a_suffix, b_prefix;
-    // The invariant components, which constrain neither allele.
-    std::unordered_set<std::uint64_t> in_invariant;
+    // Invariant components, with offsets: a seed there constrains neither allele but still fixes a
+    // start, which the join can still use.
+    std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> in_l, in_c, in_r;
 };
 
 AlleleProductIndex build_allele_product_index(const LinkageGeometry& geom, std::size_t piece);
 
+// The insert prior is REQUIRED: it is what turns positional states into a filter. Without it the
+// join degenerates to "both mates reach this pair", which on a panel of similar alleles is every
+// pair.
 AlleleProductSupport propose_allele_pairs(const Fragment& fragment, const LinkageGeometry& geom,
-                                          double max_divergence,
+                                          const InsertPrior& ip, double max_divergence,
                                           const AlleleProductIndex* index = nullptr);
 
 // THE DENSE EMISSION, now the ORACLE: it materialises and scores every (alpha, beta) window. Kept
