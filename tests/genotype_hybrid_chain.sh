@@ -90,8 +90,14 @@
 #     excluded fragment IDs == linkage-owned fragment IDs
 # asserted end to end. Ownership and counting can each be correct while disagreeing about which
 # fragments they cover, and --exclude-fragments today only validates the counting mechanism.
-#  28. the emission WORK guard (fragments x n_A x n_B summed over edges) is operational, not
-#      statistical, and refuses transactionally with its own reason;                        [ACTIVE]
+#  29. the allele-product SUPPORT SEARCH equals the dense oracle cell for cell -- finite cells, log
+#      mass and informative classification -- including an off-panel (alpha,beta) combination no
+#      panel haplotype carries, free-dimension expansion, repeat multiplicity, the exhaustive
+#      non-ACGT fallback and zero-state cells;                                              [ACTIVE]
+#  28. the DENSE-EMISSION window guard (dense_emission_window_alignments = fragments x n_A x n_B
+#      summed over edges) is operational, not statistical, and refuses transactionally with its own
+#      reason. Named for the construction it bounds, so the forthcoming support search reports its
+#      own counters rather than reusing this budget;                                        [ACTIVE]
 #  27. the GROUPED sparse contraction equals the dense kernel on weight sums and marginals, an edge
 #      with no classes takes the factorised path unchanged, and an adversarial case placing the
 #      dominant Li-Stephens mass in the phase psi drives to zero still agrees;             [ACTIVE]
@@ -610,6 +616,97 @@ PYEOFM
 else
   bad "the derived-flank fixture produced no geometry probe"
 fi
+# ---------------------------------------------------------------------------------------------
+# GATE 29: THE ALLELE-PRODUCT SUPPORT SEARCH must equal the DENSE ORACLE cell for cell -- same
+# finite cells, same log mass, same informative classification. "The same phase call" would pass
+# while multiplicity or an off-panel combination went missing.
+#
+# THE DECISIVE CASE is an (alpha, beta) combination NO panel haplotype carries. Ownership placements
+# are placements on complete panel candidates, so deciding support from them would collapse the
+# hybrid back toward complete-panel haplotypes -- and would pass every other gate here.
+"$BIN" genotype-frag -i /dev/null -b none -o "$OUT/ss" --support-selftest \
+  > "$OUT/support.tsv" 2>/dev/null
+if [ -s "$OUT/support.tsv" ]; then
+  "$PY" - "$OUT/support.tsv" <<'PYEOFS'
+import sys
+rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[1])]
+h, rows = rows[0], rows[1:]
+d = {r[0]: dict(zip(h, r)) for r in rows if len(r) == len(h)}
+bad = 0
+def ok(m): print("  ok   " + m)
+def no(m):
+    global bad; bad += 1; print("  FAIL " + m)
+need = ("offpanel_A2_B1", "junction_crossing_seed", "seed_spans_A_ctx_B", "A_only_constraint",
+        "B_only_constraint", "invariant_only_seed", "reverse_strand", "nine_identical_origins",
+        "non_acgt_fallback", "zero_state_cells", "c4_scale_118x119", "c4_scale_dup_alleles")
+miss = [k for k in need if k not in d]
+if miss: no("support cases missing: %s" % ", ".join(miss)); sys.exit(1)
+ok("support search covered over %d cases" % len(need))
+# EXACTNESS, everywhere.
+diff = [k for k, v in d.items() if v["cells_differ"] != "0"]
+if diff: no("finite-support cells differ from the dense oracle in: %s" % ", ".join(diff))
+else: ok("identical finite-support cells in every case")
+worst = max(float(v["worst_mass_diff"]) for v in d.values())
+if worst == 0.0: ok("identical log mass in every case (exactly 0 difference)")
+else: no("log mass differs by %.4g" % worst)
+mism = [k for k, v in d.items() if v["informative_match"] != "1"]
+if mism: no("informative classification differs in: %s" % ", ".join(mism))
+else: ok("identical informative/uninformative classification in every case")
+# The off-panel combination must actually be FOUND, not merely agreed upon as absent.
+op = d["offpanel_A2_B1"]
+if int(op["finite_supported"]) > 0:
+    ok("the off-panel (A2,B1) combination is found (%s finite cell) -- no panel path carries it"
+       % op["finite_supported"])
+else:
+    no("the off-panel combination has no finite cell; the fixture proves nothing")
+# A free dimension is EXPANDED, not discarded.
+for k, lab in (("A_only_constraint", "beta"), ("B_only_constraint", "alpha")):
+    v = d[k]
+    if int(v["finite_supported"]) > 1 and int(v["verified"]) > 1:
+        ok("%s: the free %s dimension is expanded (%s verified, %s finite)"
+           % (k, lab, v["verified"], v["finite_supported"]))
+    else:
+        no("%s: the free %s dimension was discarded" % (k, lab))
+# An invariant-only seed constrains neither and must force the full product.
+iv = d["invariant_only_seed"]
+if int(iv["verified"]) == int(iv["dense_pairs"]):
+    ok("an invariant-only seed constrains neither allele and expands to all %s pairs"
+       % iv["dense_pairs"])
+else:
+    no("an invariant-only seed verified only %s of %s pairs" % (iv["verified"], iv["dense_pairs"]))
+# Non-ACGT must take the EXHAUSTIVE fallback and still match.
+na = d["non_acgt_fallback"]
+if na["fallback"] == "1" and na["cells_differ"] == "0":
+    ok("a non-ACGT read falls back to the exhaustive allele product and still matches exactly")
+else:
+    no("non-ACGT: fallback=%s cells_differ=%s" % (na["fallback"], na["cells_differ"]))
+# Zero-state cells are still emitted.
+z = d["zero_state_cells"]
+if z["finite_dense"] == "0" and z["finite_supported"] == "0" and z["cells_differ"] == "0":
+    ok("a fragment with no placement still emits every cell, as -inf")
+else:
+    no("zero-state handling differs: %s" % z)
+# Multiplicity: nine identical origins must be preserved, not collapsed.
+ni = d["nine_identical_origins"]
+if int(ni["seed_hits"]) > 100 and ni["worst_mass_diff"] == "0":
+    ok("nine identical repeat origins are preserved with identical mass (%s seed hits)"
+       % ni["seed_hits"])
+else:
+    no("repeat multiplicity: seed_hits=%s mass_diff=%s" % (ni["seed_hits"], ni["worst_mass_diff"]))
+# THE REDUCTION, at C4 scale.
+c4 = d["c4_scale_118x119"]
+if float(c4["reduction"]) > 5.0 and c4["cells_differ"] == "0":
+    ok("at C4 scale %s dense pairs collapse to %s verified (%.1fx) with no loss"
+       % (c4["dense_pairs"], c4["verified"], float(c4["reduction"])))
+else:
+    no("C4-scale reduction is only %sx" % c4["reduction"])
+sys.exit(bad)
+PYEOFS
+  fails=$(( fails + $? ))
+else
+  bad "the support self-test produced no output"
+fi
+
 # ---------------------------------------------------------------------------------------------
 # GATE 24: CHAIN ORIENTATION. A candidate's walk may run ANTIPARALLEL to the chain; its bytes are
 # then the reverse complement of the reference-oriented sequence and its block spans run backwards.
@@ -1643,25 +1740,26 @@ PYEOFI
   else
     bad "an end-to-end arm produced no call table"
   fi
-  # 2b. THE EMISSION WORK GUARD is operational, not statistical: a count of window alignments, no
-  #     likelihood anywhere in it. Exceeding it must refuse TRANSACTIONALLY -- nothing subtracted,
-  #     legacy call intact -- rather than appear to hang. Forced here by setting the budget below
-  #     what the fixture needs.
+  # 2b. THE VERIFIED-WINDOW GUARD is operational, not statistical: a count of windows the support
+  #     search actually verifies, no likelihood anywhere in it. It replaced the dense-emission
+  #     budget, which bounded a cross-product production no longer computes -- testing the retired
+  #     budget would assert nothing. Exceeding it must refuse TRANSACTIONALLY: nothing subtracted,
+  #     legacy call intact, rather than appearing to hang.
   "$BIN" genotype -i "$OUT/b.sorted.gfa" -b "$OUT/b" -r hapAA -o "$OUT/e2e.wg" \
     -R "$OUT/r1.fq" -R "$OUT/r2.fq" --fragment-len 350 --hybrid-call \
-    --hybrid-max-emission-work 1 --hybrid-status "$OUT/wg.tsv" -q >/dev/null 2>&1
+    --hybrid-max-verified-windows 1 --hybrid-status "$OUT/wg.tsv" -q >/dev/null 2>&1
   if [ -s "$OUT/wg.tsv" ] && [ -s "$OUT/e2e.wg.genotypes.tsv" ]; then
     WST=$(awk -F'\t' '$1=="hybrid_status"{print $2}' "$OUT/wg.tsv")
     WEX=$(awk -F'\t' '$1=="fragments_excluded"{print $2}' "$OUT/wg.tsv")
     WAC=$(awk -F'\t' '$1=="active_edges"{print $2}' "$OUT/wg.tsv")
     WRE=$(awk -F'\t' '$1=="reason"{print $2}' "$OUT/wg.tsv")
     if [ "$WST" = "INCOMPLETE" ] && [ "${WEX:-1}" = "0" ] && [ "${WAC:-1}" = "0" ]; then
-      ok "the emission work guard refuses transactionally: INCOMPLETE, 0 active, 0 excluded"
+      ok "the verified-window guard refuses transactionally: INCOMPLETE, 0 active, 0 excluded"
     else
       bad "work guard: status=$WST active=$WAC excluded=$WEX"
     fi
     case "$WRE" in
-      emission-work-limit*) ok "the refusal keeps its own reason ($(echo "$WRE" | cut -c1-40)...)" ;;
+      verified-window-limit*) ok "the refusal keeps its own reason ($(echo "$WRE" | cut -c1-40)...)" ;;
       *) bad "the work refusal lost its reason: '$WRE'" ;;
     esac
     # And the legacy call must be untouched by a refusal.

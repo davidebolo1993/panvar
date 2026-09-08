@@ -146,9 +146,10 @@ void print_genotype_help() {
         << "      --hybrid-dry-run        Plan the transaction and report, then stop before calling.\n"
         << "      --hybrid-max-classes <n>  Operational budget: stored phase classes per edge.\n"
         << "      --hybrid-max-bytes <n>    Operational budget: measured bytes per edge.\n"
-        << "      --hybrid-max-emission-work <n>  Operational budget: window alignments summed\n"
-        << "                              over edges (fragments x n_A x n_B). Exceeding it gives\n"
-        << "                              INCOMPLETE: emission-work-limit, nothing subtracted.\n"
+        << "      --hybrid-max-dense-emission-windows <n>  Operational budget on DENSE emission\n"
+        << "                              construction: fragments x n_A x n_B summed over edges.\n"
+        << "                              Exceeding it gives INCOMPLETE:\n"
+        << "                              dense-emission-window-limit, nothing subtracted.\n"
         << "      --hybrid-status <path>  Where the hybrid status report is written, including\n"
         << "                              every linkage parameter used.\n"
         << "      --hybrid-lambda-estimate  Estimate lambda candidate-independently as\n"
@@ -359,9 +360,16 @@ int run_genotype_command(const std::vector<std::string>& args) {
     // attributable to the machine, not to which genotype looked good.
     std::size_t hybrid_max_classes = 50000000;
     std::size_t hybrid_max_bytes = 2000000000;
-    // Window alignments summed over edges. C4 needs 1,154,642 and does not finish, so the default
-    // refuses it explicitly rather than hanging.
-    std::size_t hybrid_max_emission_work = 200000;
+    // DENSE-EMISSION window alignments summed over edges: fragments x n_A x n_B. Named for the
+    // construction it bounds, so that when the bounded-complete support search lands it reports its
+    // OWN counters -- seed hits, proposed states, verified states -- and this budget cannot silently
+    // acquire a new meaning. C4 needs 1,154,642 and does not finish, so the default refuses it.
+    std::size_t hybrid_max_dense_emission_windows = 200000;
+    // WINDOWS ACTUALLY VERIFIED, summed over edges -- the work production does, as opposed to the
+    // dense cross-product it avoids. Its own name and its own budget, so neither figure can be
+    // mistaken for the other.
+    std::size_t hybrid_max_verified_windows = 5000000;
+    std::size_t verified_windows_total = 0;
     std::string hybrid_edges_path;
     bool hybrid_dry_run = false;
     struct EdgeRow {
@@ -370,6 +378,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     predicted = 0, theoretical = 0, bytes = 0;
         double build_s = 0.0;
         std::string status;
+        // The SUPPORT SEARCH's own counters, distinct from the dense baseline.
+        std::size_t seed_hits = 0, proposed = 0, verified = 0, dense_windows = 0, fallbacks = 0;
     };
     std::vector<EdgeRow> edge_rows;
     std::string hybrid_status_path;
@@ -492,8 +502,10 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--hybrid-outlier-mix") hyb_params.outlier_mix = std::stod(require_value(arg));
         else if (arg == "--hybrid-max-classes") hybrid_max_classes = std::stoull(require_value(arg));
         else if (arg == "--hybrid-max-bytes") hybrid_max_bytes = std::stoull(require_value(arg));
-        else if (arg == "--hybrid-max-emission-work")
-            hybrid_max_emission_work = std::stoull(require_value(arg));
+        else if (arg == "--hybrid-max-verified-windows")
+            hybrid_max_verified_windows = std::stoull(require_value(arg));
+        else if (arg == "--hybrid-max-dense-emission-windows")
+            hybrid_max_dense_emission_windows = std::stoull(require_value(arg));
         else if (arg == "--hybrid-edges") hybrid_edges_path = require_value(arg);
         else if (arg == "--hybrid-dry-run") hybrid_dry_run = true;
         else if (arg == "--hybrid-lambda-estimate") {
@@ -1698,7 +1710,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     // per edge; C4 needs 1,154,642 and does not finish. This is a WORK count -- no
                     // likelihood, no score -- so exceeding it is a machine refusal, and the command
                     // says so quickly instead of appearing to hang.
-                    std::size_t emission_work = 0;
+                    std::size_t dense_emission_window_alignments = 0;
                     bool work_overflow = false;
                     for (const auto& kv : by_edge) {
                         const std::size_t na2 = blocks[kv.first.first].n_alleles;
@@ -1706,19 +1718,21 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         std::size_t w = 0;
                         if (__builtin_mul_overflow(na2, nb2, &w) ||
                             __builtin_mul_overflow(w, kv.second.size(), &w) ||
-                            __builtin_add_overflow(emission_work, w, &emission_work)) {
+                            __builtin_add_overflow(dense_emission_window_alignments, w,
+                                                   &dense_emission_window_alignments)) {
                             work_overflow = true;
                             break;
                         }
                     }
-                    if (work_overflow || emission_work > hybrid_max_emission_work) {
+                    // THE DENSE FIGURE IS NOW A BASELINE, NOT A GATE. Production verifies only
+                    // the windows the support search proposes, so bounding work by the dense
+                    // cross-product would refuse work that is never done. It is still computed --
+                    // the reduction is measured against it -- and an estimate that OVERFLOWS is
+                    // still a refusal, because a wrapped baseline is not a baseline.
+                    if (work_overflow) {
                         hyb_act = HybridActivation{};
-                        hyb_act.refusal = work_overflow
-                            ? "emission-work-limit: the work estimate overflowed"
-                            : "emission-work-limit: " + std::to_string(emission_work) +
-                              " window alignments exceeds the budget of " +
-                              std::to_string(hybrid_max_emission_work) +
-                              " (fragments x n_A x n_B summed over edges)";
+                        hyb_act.refusal = "dense-emission-window-limit: the baseline estimate "
+                                          "overflowed";
                         log.info("hybrid: " + hyb_act.refusal +
                                  "; no edge built, nothing subtracted");
                     } else {
@@ -1750,18 +1764,44 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             edge_status.push_back(es);
                             continue;
                         }
+                        // THE ALLELE INDEX, ONCE PER EDGE. Built from this edge's own piece
+                        // length; every fragment then does hash lookups instead of re-scanning
+                        // alleles up to 26 kb. Scanning per fragment is 1,274,940 full-allele scans
+                        // on C4 and does not finish.
+                        AlleleProductIndex aidx;
+                        if (!kv.second.empty()) {
+                            const Fragment& f0 = hf[kv.second.front()];
+                            const std::size_t d0 =
+                                mate_band_edits(hyb_params.max_divergence, f0.r1.size());
+                            const std::size_t p0 = f0.r1.size() / (d0 + 1);
+                            if (p0 >= 8 && p0 <= 32) aidx = build_allele_product_index(geom, p0);
+                        }
                         std::vector<LinkageEmission> ems;
                         ems.reserve(kv.second.size());
                         std::size_t n_inform = 0;
+                        std::size_t e_seed_hits = 0, e_proposed = 0, e_verified = 0,
+                                    e_dense = 0, e_fallback = 0;
                         for (std::size_t fi : kv.second) {
                             const std::size_t len = hf[fi].bases();
                             const std::size_t be = static_cast<std::size_t>(
                                 hyb_params.bg_divergence * static_cast<double>(len));
                             const double bgf = static_cast<double>(be) * lep +
                                                static_cast<double>(len - be) * l1m;
-                            ems.push_back(linkage_emission(hf[fi], geom, ip, hyb_params.max_divergence,
-                                                           lep, l1m, bgf));
+                            AlleleProductSupport sup;
+                            ems.push_back(linkage_emission_supported(
+                                hf[fi], geom, ip, hyb_params.max_divergence, lep, l1m, bgf, &sup,
+                                aidx.ok ? &aidx : nullptr));
                             if (ems.back().informative) ++n_inform;
+                            // THE SEARCH'S OWN COUNTERS, not the dense budget's. Seed hits,
+                            // proposed states and verified windows describe what production
+                            // actually did; the dense figure is kept only as the baseline it is
+                            // measured against.
+                            e_seed_hits += sup.seed_hits;
+                            e_proposed += sup.proposed_states;
+                            e_verified += sup.exhaustive_fallback ? sup.dense_pairs
+                                                                  : sup.proposals.size();
+                            e_dense += sup.dense_pairs;
+                            if (sup.exhaustive_fallback) ++e_fallback;
                         }
                         const auto t_build = std::chrono::steady_clock::now();
                         SparseLinkageEdge E = build_sparse_linkage_edge(
@@ -1770,6 +1810,16 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             rlim);
                         const double build_s = std::chrono::duration<double>(
                             std::chrono::steady_clock::now() - t_build).count();
+                        // PER EDGE, AS IT COMPLETES. A silent multi-minute loop is what made every
+                        // previous attempt uninterpretable until it was killed.
+                        log.info("hybrid: edge " + std::to_string(es.block_a) + "-" +
+                                 std::to_string(es.block_b) + " " +
+                                 std::to_string(blocks[es.block_a].n_alleles) + "x" +
+                                 std::to_string(blocks[es.block_b].n_alleles) + ", " +
+                                 std::to_string(kv.second.size()) + " frags, " +
+                                 std::to_string(e_verified) + " verified of " +
+                                 std::to_string(e_dense) + " dense, " +
+                                 std::to_string(build_s) + " s");
                         es.status = E.status;
                         // PER-EDGE MEASUREMENT, from the production build itself rather than a
                         // second profiler that would rebuild the support independently and could
@@ -1779,10 +1829,28 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             blocks[es.block_b].n_alleles, kv.second.size(), n_inform,
                             E.support_cells, E.stored_classes, E.predicted_classes,
                             E.theoretical_configs, E.bytes_total(), build_s,
-                            linkage_status_name(E.status)});
+                            linkage_status_name(E.status), e_seed_hits, e_proposed, e_verified,
+                            e_dense, e_fallback});
                         edge_status.push_back(es);
                         if (E.usable()) edge_map.emplace(kv.first, std::move(E));
+                        // A BUDGET ON THE WORK PRODUCTION ACTUALLY DOES: windows verified, summed
+                        // over edges. Checked as it accumulates so an expensive locus refuses
+                        // early rather than after paying for every edge.
+                        verified_windows_total += e_verified;
+                        if (verified_windows_total > hybrid_max_verified_windows) {
+                            work_overflow = true;   // reuse the transactional refusal path
+                            break;
+                        }
                     }
+                    if (work_overflow && !edge_status.empty()) {
+                        hyb_act = HybridActivation{};
+                        hyb_act.refusal = "verified-window-limit: " +
+                                          std::to_string(verified_windows_total) +
+                                          " verified windows exceeds the budget of " +
+                                          std::to_string(hybrid_max_verified_windows);
+                        log.info("hybrid: " + hyb_act.refusal +
+                                 "; no edge activated, nothing subtracted");
+                    } else {
                     // Haplotype -> allele per block, validated at the int -> unsigned boundary.
                     std::vector<AlleleMapping> maps(blocks.size());
                     for (std::size_t b = 0; b < blocks.size(); ++b) {
@@ -1802,7 +1870,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         hyb_exclusions.insert(hyb_act.excluded_fragments.begin(),
                                               hyb_act.excluded_fragments.end());
                     }
-                    }   // end of the work-guard else
+                    }   // end of the verified-window budget else
+                    }   // end of the overflow guard else
                 }
                 // PER-EDGE MEASUREMENT, serialised from the objects the caller actually built.
                 if (!hybrid_edges_path.empty()) {
@@ -1812,14 +1881,19 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     ef << "block_a\tblock_b\tn_alleles_a\tn_alleles_b\towned_fragments"
                           "\tinformative_fragments\tsupport_cells\tstored_classes"
                           "\tpredicted_classes\ttheoretical_configs\tsparse_bytes"
-                          "\tbuild_seconds\tstatus\n";
+                          "\tbuild_seconds\tstatus\tseed_hits\tproposed_states"
+                          "\tverified_windows\tdense_windows\tfallbacks\treduction\n";
                     std::size_t tot_stored = 0, tot_bytes = 0, tot_support = 0, usable = 0;
                     double tot_build = 0.0;
                     for (const EdgeRow& r : edge_rows) {
                         ef << r.a << '\t' << r.b << '\t' << r.na << '\t' << r.nb << '\t'
                            << r.owned << '\t' << r.informative << '\t' << r.support << '\t'
                            << r.stored << '\t' << r.predicted << '\t' << r.theoretical << '\t'
-                           << r.bytes << '\t' << r.build_s << '\t' << r.status << '\n';
+                           << r.bytes << '\t' << r.build_s << '\t' << r.status << '\t'
+                           << r.seed_hits << '\t' << r.proposed << '\t' << r.verified << '\t'
+                           << r.dense_windows << '\t' << r.fallbacks << '\t'
+                           << (r.verified ? static_cast<double>(r.dense_windows) / r.verified : 0.0)
+                           << '\n';
                         tot_stored += r.stored; tot_bytes += r.bytes; tot_support += r.support;
                         tot_build += r.build_s;
                         if (r.status == std::string("ok")) ++usable;
@@ -1841,7 +1915,20 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     ef << "#total_support_cells\t" << tot_support << '\n';
                     ef << "#total_stored_classes\t" << tot_stored << '\n';
                     ef << "#total_sparse_bytes\t" << tot_bytes << '\n';
+                    std::size_t tot_seed = 0, tot_prop = 0, tot_ver = 0, tot_dense = 0,
+                                tot_fb = 0;
+                    for (const EdgeRow& r : edge_rows) {
+                        tot_seed += r.seed_hits; tot_prop += r.proposed; tot_ver += r.verified;
+                        tot_dense += r.dense_windows; tot_fb += r.fallbacks;
+                    }
                     ef << "#total_build_seconds\t" << tot_build << '\n';
+                    ef << "#total_seed_hits\t" << tot_seed << '\n';
+                    ef << "#total_proposed_states\t" << tot_prop << '\n';
+                    ef << "#total_verified_windows\t" << tot_ver << '\n';
+                    ef << "#total_dense_windows\t" << tot_dense << '\n';
+                    ef << "#total_exhaustive_fallbacks\t" << tot_fb << '\n';
+                    ef << "#overall_reduction\t"
+                       << (tot_ver ? static_cast<double>(tot_dense) / tot_ver : 0.0) << '\n';
                     ef << "#peak_rss_mb\t" << peak_mb << '\n';
                     ef << "#hybrid_status\t" << hybrid_call_status_name(hyb_act.call_status) << '\n';
                     ef << "#active_edges\t" << hyb_act.active_edges << '\n';

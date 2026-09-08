@@ -19,6 +19,7 @@
 #include <sstream>
 #include <map>
 #include <mutex>
+#include <random>
 #include <chrono>
 #include <cmath>
 #include <fstream>
@@ -339,6 +340,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     bool linkage_selftest = false;
     bool hybrid_oracle = false;
     bool mapping_selftest = false;
+    bool support_selftest = false;
     bool completeness_selftest = false;
     bool activation_selftest = false;
     std::vector<std::string> reconcile_scope;
@@ -393,6 +395,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--linkage-selftest") linkage_selftest = true;
         else if (a == "--hybrid-oracle") hybrid_oracle = true;
         else if (a == "--mapping-selftest") mapping_selftest = true;
+        else if (a == "--support-selftest") support_selftest = true;
         else if (a == "--completeness-selftest") completeness_selftest = true;
         else if (a == "--activation-selftest") activation_selftest = true;
         else if (a == "--scope-tol") {
@@ -656,7 +659,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     if (read_paths.empty() && spell_calls.empty() && !mosaic_floor && dump_sequences.empty() &&
         spell_pair.empty() && ref_block.empty() && ref_block_pair.empty() &&
         origin_universe.empty() && reconcile_scope.empty() && !linkage_selftest &&
-        !hybrid_oracle && !mapping_selftest && !completeness_selftest && !activation_selftest) {
+        !hybrid_oracle && !mapping_selftest && !completeness_selftest && !activation_selftest &&
+        !support_selftest) {
         throw std::runtime_error("genotype-frag requires at least one --reads");
     }
     if (!bubble_prefix_in.empty()) {
@@ -689,6 +693,154 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     ParseGfaOptions parse_options;
     parse_options.include_paths = true;
     parse_options.include_sequences = true;
+    // ---- ALLELE-PRODUCT SUPPORT SEARCH SELF-TEST ------------------------------------------------
+    // The support-restricted emission must equal the DENSE ORACLE cell for cell: same finite cells,
+    // same log mass, same informative classification. Not "the same phase call" -- that would pass
+    // while multiplicity or an off-panel combination went missing.
+    if (support_selftest) {
+        std::printf("case\tn_a\tn_b\tdense_pairs\tproposed\tverified\tseed_hits\tfallback"
+                    "\tcells_differ\tworst_mass_diff\tfinite_dense\tfinite_supported"
+                    "\tinformative_match\treduction\n");
+        std::mt19937_64 rng(20260908);
+        const auto rseq = [&](std::size_t n) {
+            static const char* B = "ACGT";
+            std::string s2(n, 'A');
+            for (std::size_t i = 0; i < n; ++i) s2[i] = B[rng() & 3];
+            return s2;
+        };
+        const auto mutate = [&](std::string x, std::size_t k) {
+            for (std::size_t i = 0; i < k; ++i) {
+                const std::size_t p2 = rng() % x.size();
+                const char c = "ACGT"[rng() & 3];
+                x[p2] = (x[p2] == c) ? "ACGT"[(rng() & 3)] : c;
+            }
+            return x;
+        };
+        const double lep = std::log(0.001 / 3.0), l1m = std::log1p(-0.001);
+        const auto run = [&](const char* name, const LinkageGeometry& g, const Fragment& f,
+                             const InsertPrior& ip) {
+            const LinkageEmission D = linkage_emission(f, g, ip, 0.05, lep, l1m, -400.0);
+            AlleleProductSupport sup;
+            const LinkageEmission S2 = linkage_emission_supported(f, g, ip, 0.05, lep, l1m,
+                                                                  -400.0, &sup);
+            std::size_t differ = 0, fin_d = 0, fin_s = 0;
+            double worst = 0.0;
+            for (std::size_t k = 0; k < D.mass.size(); ++k) {
+                const double x = D.mass[k], y = S2.mass[k];
+                const bool fx = x != -std::numeric_limits<double>::infinity();
+                const bool fy = y != -std::numeric_limits<double>::infinity();
+                if (fx) ++fin_d;
+                if (fy) ++fin_s;
+                if (fx != fy) { ++differ; continue; }
+                if (fx) worst = std::max(worst, std::abs(x - y));
+            }
+            std::printf("%s\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t%d\t%zu\t%.3g\t%zu\t%zu"
+                        "\t%d\t%.2f\n",
+                        name, D.n_a, D.n_b, sup.dense_pairs, sup.proposed_states,
+                        sup.proposals.size(), sup.seed_hits, sup.exhaustive_fallback ? 1 : 0,
+                        differ, worst, fin_d, fin_s,
+                        D.informative == S2.informative ? 1 : 0,
+                        sup.proposals.empty() ? 0.0
+                            : static_cast<double>(sup.dense_pairs) / sup.proposals.size());
+        };
+        const auto geom_of = [&](const std::vector<std::string>& A,
+                                 const std::vector<std::string>& Bv, const std::string& ctx,
+                                 const std::string& lf, const std::string& rf) {
+            LinkageGeometry g;
+            g.block_a = 0; g.block_b = 1;
+            g.alleles_a = A; g.alleles_b = Bv; g.context = ctx; g.lflank = lf; g.rflank = rf;
+            g.window_len.assign(A.size() * Bv.size(), 0);
+            g.exposure.assign(A.size() * Bv.size(), 1000.0);
+            g.exposure_affine = true; g.ok = true;
+            return g;
+        };
+        const auto frag_from = [&](const std::string& win, std::size_t start, std::size_t ins) {
+            Fragment f;
+            f.name = "f";
+            f.r1 = win.substr(start, 100);
+            const std::string tail = win.substr(start + ins - 100, 100);
+            f.r2 = reverse_complement(tail);
+            return f;
+        };
+        InsertPrior ip = make_insert_prior(300.0, 40.0, 0.01, 4, 200);
+
+        // Three A alleles and three B alleles; the sample's truth (A2, B1) is a combination NO
+        // panel haplotype need carry. This is the case that fails if support is taken from panel
+        // placements rather than from seeds.
+        const std::string L = rseq(400), C = rseq(60), R = rseq(400);
+        std::vector<std::string> A = {rseq(500), rseq(500), rseq(500)};
+        std::vector<std::string> Bv = {rseq(500), rseq(500), rseq(500)};
+        const LinkageGeometry g3 = geom_of(A, Bv, C, L, R);
+        {
+            // OFF-PANEL COMBINATION: read pair drawn from A2 + C + B1.
+            const std::string win = L + A[2] + C + Bv[1] + R;
+            run("offpanel_A2_B1", g3, frag_from(win, 850, 300), ip);
+            // A SEED CROSSING THE DIRECT A->B JUNCTION, context emptied.
+            const LinkageGeometry g0 = geom_of(A, Bv, "", L, R);
+            const std::string w0 = L + A[1] + Bv[2] + R;
+            run("junction_crossing_seed", g0, frag_from(w0, 860, 280), ip);
+            // A SEED SPANNING A -> short context -> B.
+            const LinkageGeometry gs = geom_of(A, Bv, rseq(12), L, R);
+            const std::string ws = L + A[0] + gs.context + Bv[0] + R;
+            run("seed_spans_A_ctx_B", gs, frag_from(ws, 870, 260), ip);
+            // A-ONLY: both mates land inside A, leaving beta unconstrained.
+            run("A_only_constraint", g3, frag_from(win, 450, 260), ip);
+            // B-ONLY: both mates inside B.
+            run("B_only_constraint", g3, frag_from(win, 1000, 260), ip);
+            // INVARIANT-ONLY: both mates inside the left flank, constraining neither allele.
+            run("invariant_only_seed", g3, frag_from(win, 20, 260), ip);
+            // REVERSE STRAND, as the library actually produces it: mate 1 is the reverse-
+            // complement of the DOWNSTREAM end and mate 2 the forward UPSTREAM end, which is the
+            // other valid-FR orientation. Swapping and complementing both mates instead gives a
+            // fragment that is not FR-valid at all -- both arms then agree on ZERO cells, which
+            // compares nothing.
+            {
+                Fragment r;
+                r.name = "rev";
+                r.r1 = reverse_complement(win.substr(850 + 300 - 100, 100));
+                r.r2 = win.substr(850, 100);
+                run("reverse_strand", g3, r, ip);
+            }
+            // MORE THAN EIGHT IDENTICAL ORIGINS: a repeat placed nine times in the context.
+            {
+                const std::string unit = rseq(120);
+                std::string rep;
+                for (int i = 0; i < 9; ++i) rep += unit;
+                const LinkageGeometry gr = geom_of(A, Bv, rep, L, R);
+                const std::string wr = L + A[0] + rep + Bv[0] + R;
+                run("nine_identical_origins", gr, frag_from(wr, 950, 240), ip);
+            }
+            // NON-ACGT: must take the exhaustive fallback over the virtual allele product.
+            {
+                Fragment f = frag_from(win, 850, 300);
+                f.r1[10] = 'N';
+                run("non_acgt_fallback", g3, f, ip);
+            }
+            // ZERO-STATE: a read from unrelated sequence. Every cell must still be emitted, as -inf.
+            {
+                Fragment f;
+                f.name = "z"; f.r1 = rseq(100); f.r2 = rseq(100);
+                run("zero_state_cells", g3, f, ip);
+            }
+            // AT C4 SCALE, and with the DERIVED flank of zero that C4 actually has -- so an
+            // invariant-only seed cannot occur and the reduction is the one production would see.
+            {
+                std::vector<std::string> A2v, B2v;
+                for (int i = 0; i < 118; ++i) A2v.push_back(rseq(500));
+                for (int i = 0; i < 119; ++i) B2v.push_back(rseq(500));
+                const LinkageGeometry gl = geom_of(A2v, B2v, "", "", "");
+                const std::string wl = A2v[40] + B2v[77];
+                run("c4_scale_118x119", gl, frag_from(wl, 400, 300), ip);
+                // A repeated allele: several A alleles sharing sequence must all be proposed.
+                std::vector<std::string> A3v = A2v;
+                A3v[7] = A3v[40]; A3v[91] = A3v[40];
+                const LinkageGeometry gd = geom_of(A3v, B2v, "", "", "");
+                run("c4_scale_dup_alleles", gd, frag_from(wl, 400, 300), ip);
+            }
+        }
+        return 0;
+    }
+
     // ---- TRANSACTIONAL ACTIVATION SELF-TEST -----------------------------------------------------
     // Subtracting linkage-owned fragments and activating their edges is ONE transaction. Half of it
     // makes those fragments vanish from BOTH models -- gone from the marker counts, consumed by no

@@ -1760,9 +1760,92 @@ LinkageGeometry build_linkage_geometry(const std::vector<CandidateFrame>& frames
                                        std::uint32_t block_a, std::uint32_t block_b,
                                        std::size_t flank_bp, const InsertPrior& ip);
 
+// ---------------------------------------------------------------------------------------------
+// BOUNDED-COMPLETE ALLELE-PRODUCT SUPPORT SEARCH.
+//
+// The dense emission scores every (alpha, beta) window: fragments x n_A x n_B alignments, 1,154,642
+// on C4's ten edges, which does not finish. This proposes only the allele pairs a fragment's seeds
+// can reach, and the emission verifies those.
+//
+// COMPLETENESS comes from the pigeonhole, not from a score. A mate of length m within band d is
+// split into d+1 pieces of length m/(d+1); a placement with at most d mismatches cannot mismatch
+// inside every piece, so at least one piece matches EXACTLY. If no piece of either mate occurs
+// anywhere in the virtual window
+//
+//     L + A_alpha + C + B_beta + R
+//
+// then that window admits no in-band placement and its mass is -inf. Not proposed therefore means
+// provably empty -- the same guarantee bounded_mate_placements already rests on.
+//
+// OWNERSHIP PLACEMENTS ARE SEEDS, NEVER THE AUTHORITY. They are placements on complete PANEL
+// candidates, and the hybrid model deliberately admits an (alpha, beta) combination no panel
+// haplotype carries -- the three-allele fixture's truth (A3,B2)+(A2,B3) is exactly that. Deciding
+// support from panel-carried pairs would collapse the hybrid back toward complete-panel haplotypes
+// while passing every other gate.
+//
+// A SEED CONSTRAINS WHAT IT TOUCHES, AND NOTHING MORE:
+//   inside A_alpha        -> constrains alpha, leaves beta free  -> expand over beta
+//   inside B_beta         -> constrains beta, leaves alpha free  -> expand over alpha
+//   inside L, C or R      -> constrains NEITHER                  -> expand over both
+//   crossing a boundary   -> constrains whichever components it overlaps
+// Expansion may be deferred but never discarded: a free dimension is unconstrained, not irrelevant.
+//
+// THE A->B JUNCTION IS SPLIT, NOT ENUMERATED. When the context is empty a piece may straddle
+// A_alpha and B_beta directly. Rather than building n_A x n_B boundary strings, each split point j
+// is looked up as "which alleles end with piece[0..j)" and "which begin with piece[j..p)", and the
+// proposal is the PRODUCT of those two small sets -- computed without ever visiting the pairs that
+// match neither.
+struct AlleleProductSupport {
+    // Pairs whose window must be materialised and verified. Everything else is provably empty.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> proposals;
+    std::size_t seed_hits = 0;        // exact piece occurrences found
+    std::size_t proposed_states = 0;  // (alpha, beta) pairs proposed, before dedup
+    std::size_t dense_pairs = 0;      // n_A * n_B, for the reduction factor
+    // Set when the pigeonhole proof does not apply -- a non-ACGT read, or a piece shorter than the
+    // index can use. The caller must then fall back to the exhaustive allele-product model, NOT to
+    // panel-carried pairs.
+    bool exhaustive_fallback = false;
+};
+
+// THE ALLELE INDEX, built ONCE PER EDGE and reused by every fragment. The alleles do not change
+// between fragments, so scanning them per fragment repeats the same work: on C4 that is 1,274,940
+// full-allele scans, against alleles up to 26,487 bp, and it does not finish. Indexed, each piece
+// becomes a hash lookup and the per-edge cost is one pass over the allele sequence.
+//
+// Pieces are encoded 2 bits per base, so a piece longer than 32 bases cannot be keyed; that case
+// takes the exhaustive fallback rather than a silently different search.
+struct AlleleProductIndex {
+    std::size_t piece = 0;
+    bool ok = false;
+    // piece code -> the alleles containing it. Occurrences are not deduplicated across alleles.
+    std::unordered_map<std::uint64_t, std::vector<std::uint32_t>> in_a, in_b;
+    // Junction split: alleles ending with / beginning with a given prefix code, per split length.
+    std::vector<std::unordered_map<std::uint64_t, std::vector<std::uint32_t>>> a_suffix, b_prefix;
+    // The invariant components, which constrain neither allele.
+    std::unordered_set<std::uint64_t> in_invariant;
+};
+
+AlleleProductIndex build_allele_product_index(const LinkageGeometry& geom, std::size_t piece);
+
+AlleleProductSupport propose_allele_pairs(const Fragment& fragment, const LinkageGeometry& geom,
+                                          double max_divergence,
+                                          const AlleleProductIndex* index = nullptr);
+
+// THE DENSE EMISSION, now the ORACLE: it materialises and scores every (alpha, beta) window. Kept
+// explicit so the support-restricted form has something exact to be compared against.
 LinkageEmission linkage_emission(const Fragment& fragment, const LinkageGeometry& geom,
                                  const InsertPrior& ip, double max_divergence,
                                  double log_eps, double log_1meps, double log_p_bg);
+
+// The SUPPORT-RESTRICTED emission: identical output, computed by verifying only the allele pairs
+// propose_allele_pairs() reaches. A pair it does not propose is provably empty by the pigeonhole, so
+// its cell is -inf -- the same value the dense form would compute, not an approximation of it.
+// `out_support`, when given, receives the search's counters.
+LinkageEmission linkage_emission_supported(const Fragment& fragment, const LinkageGeometry& geom,
+                                           const InsertPrior& ip, double max_divergence,
+                                           double log_eps, double log_1meps, double log_p_bg,
+                                           AlleleProductSupport* out_support = nullptr,
+                                           const AlleleProductIndex* index = nullptr);
 
 // THE EDGE POTENTIAL, aggregated in the one order that is a diploid likelihood:
 //
