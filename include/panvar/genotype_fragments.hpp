@@ -2140,6 +2140,47 @@ HybridPosterior hybrid_forward_backward(const HybridChain& chain);
 HybridPosterior hybrid_bruteforce(const HybridChain& chain);
 
 // `max_configs` bounds the dense table; 0 means the default. Exceeding it is a REFUSAL.
+// ---------------------------------------------------------------------------------------------
+// THE SPARSE PHASE FACTOR, exact rather than approximate.
+//
+// psi's own structure removes the dense ordered four-index table; a generic hash of four allele
+// indices would store the same redundancy in a different container.
+//
+//   * IF EITHER ENDPOINT IS HOMOZYGOUS there is no alternative phase: the class members are
+//     homologue swaps of one another, so S is equal across them and mean-one centering gives
+//     log psi = 0 EXACTLY. Only het-at-A x het-at-B classes can carry phase information.
+//   * EACH SUCH CLASS HAS ONLY TWO BIOLOGICAL PHASES -- straight (a1b1, a2b2) and crossed
+//     (a1b2, a2b1); the other two ordered configurations are homologue-order duplicates. So one
+//     contrast per class suffices:
+//
+//         Delta = S_straight - S_crossed
+//         log psi_straight = log 2 - log(1 + e^-Delta)
+//         log psi_crossed  = log 2 - log(1 + e^+Delta)
+//
+//     Verified: mean(exp(log psi)) = 1.000000000000000 over Delta from 0 to 1e4, and the maximum is
+//     log 2 -- not log 4 -- because a het x het class carries TWO configurations at the maximum.
+//   * A CLASS WHOSE FOUR HAPLOID CORNERS (a1,b1), (a1,b2), (a2,b1), (a2,b2) ALL LACK in-band mass
+//     for every edge-owned fragment has both phases equal to the same all-background sum, so
+//     Delta = 0 and psi = 1 exactly. It is never stored. This follows from the emission SUPPORT --
+//     it is not threshold pruning, and no score or top-K enters.
+struct SparseLinkageEdge {
+    std::uint32_t block_a = 0, block_b = 0;
+    std::size_t n_a = 0, n_b = 0;
+    // Canonical key (amin, amax, bmin, bmax) -> Delta. Absent means exactly neutral.
+    std::unordered_map<std::uint64_t, double> delta;
+    std::size_t stored_classes = 0;
+    std::size_t theoretical_configs = 0;   // the dense ordered count, for the report
+    std::size_t support_cells = 0;         // haploid (alpha, beta) cells with in-band mass
+    LinkageStatus status = LinkageStatus::NotComputed;
+    bool usable() const { return status == LinkageStatus::Ok; }
+    // The SAME quantity aggregate_linkage_edge's dense table holds, reconstructed.
+    double log_psi(std::size_t a1, std::size_t b1, std::size_t a2, std::size_t b2) const;
+};
+
+SparseLinkageEdge build_sparse_linkage_edge(const std::vector<LinkageEmission>& emissions,
+                                            const LinkageGeometry& geom, double lambda,
+                                            double log_mix, double log_bg_weight);
+
 LinkageEdge aggregate_linkage_edge(const std::vector<LinkageEmission>& emissions,
                                    const LinkageGeometry& geom, double lambda,
                                    double log_mix, double log_bg_weight,

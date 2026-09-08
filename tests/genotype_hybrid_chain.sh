@@ -90,6 +90,9 @@
 #     excluded fragment IDs == linkage-owned fragment IDs
 # asserted end to end. Ownership and counting can each be correct while disagreeing about which
 # fragments they cover, and --exclude-fragments today only validates the counting mechanism.
+#  26. sparse psi equals dense psi on EVERY configuration of every densely-testable edge; a class
+#      with no in-band corner is proved exactly neutral and never stored; and a C4-scale edge that
+#      the dense table refuses (197,177,764 configurations) completes.                      [ACTIVE]
 #  16. every generated linkage edge is finite, mean-one per content class, and bounded by
 #      max log psi <= log|C| <= log 4, so exp(log psi) cannot overflow. An earlier version of this
 #      contract claimed exp would OVERFLOW at the 16043-nat spread; that spread is entirely on the
@@ -1185,8 +1188,48 @@ for case in usable_cases:
 else:
     ok("every USABLE case is mean-one within each content class (worst dev %.2e)"
        % max(float(d[k][3]) for k in usable_cases))
+# A C4-SCALE EDGE MUST COMPLETE. 118 x 119 is 197,177,764 ordered configurations -- the dense table
+# refuses it outright -- and the sparse form must build it without truncation or any score cutoff.
+lc = {}
+for l in open(sys.argv[1]):
+    f = l.rstrip("\n").split("\t")
+    if len(f) >= 7 and "x" in f[0] and f[0].replace("x", "").isdigit():
+        lc[f[0]] = f
+if lc:
+    for k, f in sorted(lc.items()):
+        if f[6] == "ok" and int(f[4]) > 0:
+            ok("a %s edge completes: %s configurations -> %s stored classes (%.0fx fewer)"
+               % (k, f[3], f[4], float(f[3]) / max(1.0, float(f[4]))))
+        else:
+            no("a %s edge did not complete: status %s, stored %s" % (k, f[6], f[4]))
+else:
+    no("no large-edge case was reported; the scale claim is untested")
+
 # THE MEAN-ONE BOUND, asserted rather than reasoned about.
 import math as _m
+# SPARSE psi IS EXACT, NOT AN APPROXIMATION. Its structure removes the dense ordered table:
+# a homozygous endpoint has no alternative phase (log psi = 0 by swap invariance), each het x het
+# class has only TWO biological phases, so ONE contrast Delta = S_straight - S_crossed reconstructs
+# both mean-one ratios; and a class whose four haploid corners all lack in-band mass has both phases
+# equal to the same all-background sum, so it is exactly neutral and never stored. None of that is
+# threshold pruning -- it follows from the emission support.
+for case in usable_cases:
+    sd = float(d[case][14]); nchk = int(d[case][15])
+    if nchk == 0:
+        no("%s: sparse psi was compared on ZERO configurations" % case)
+    elif sd > 1e-9:
+        no("%s: sparse psi differs from dense by %.4g" % (case, sd))
+    else:
+        ok("%s: sparse == dense on all %d configurations (%.1e), %s stored vs %s theoretical"
+           % (case, nchk, sd, d[case][16], d[case][17]))
+# A flat edge has SUPPORT but stores nothing: the corners exist, the phases are equal, Delta is 0.
+fl = d.get("flat_emissions")
+if fl and int(fl[18]) > 0 and int(fl[16]) == 0:
+    ok("flat_emissions has %s support cells yet stores 0 classes -- proven neutral, not pruned"
+       % fl[18])
+elif fl:
+    no("flat_emissions: support %s, stored %s -- a provably neutral class was stored" % (fl[18], fl[16]))
+
 # LAMBDA MUST REACH THE FACTORS, asserted where it is observable: near the background crossover,
 # where the mixture is in transition and lambda is not a removable constant.
 if "lambda_crossover_lo" in d and "lambda_crossover_hi" in d:

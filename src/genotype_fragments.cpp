@@ -4596,6 +4596,122 @@ const char* linkage_status_name(LinkageStatus s) {
     }
 }
 
+namespace {
+inline std::uint64_t class_key(std::size_t amin, std::size_t amax,
+                               std::size_t bmin, std::size_t bmax) {
+    return (static_cast<std::uint64_t>(amin) << 48) | (static_cast<std::uint64_t>(amax) << 32) |
+           (static_cast<std::uint64_t>(bmin) << 16) | static_cast<std::uint64_t>(bmax);
+}
+}  // namespace
+
+double SparseLinkageEdge::log_psi(std::size_t a1, std::size_t b1,
+                                  std::size_t a2, std::size_t b2) const {
+    // A homozygous endpoint has no alternative phase: the class members are homologue swaps of one
+    // another, S is equal across them, and mean-one centering gives exactly zero.
+    if (a1 == a2 || b1 == b2) return 0.0;
+    const std::size_t amin = std::min(a1, a2), amax = std::max(a1, a2);
+    const std::size_t bmin = std::min(b1, b2), bmax = std::max(b1, b2);
+    const auto it = delta.find(class_key(amin, amax, bmin, bmax));
+    if (it == delta.end()) return 0.0;   // no corner carries in-band mass: exactly neutral
+    const double d = it->second;
+    // STRAIGHT pairs amin with bmin. Homologue 1 carries (a1, b1), so the query is straight when
+    // that pairing matches -- in either homologue order, which is the same biological phase.
+    const bool straight = (a1 == amin && b1 == bmin) || (a1 == amax && b1 == bmax);
+    const double x = straight ? -d : d;
+    // log 2 - log(1 + e^x), guarded so a large |Delta| neither overflows nor loses the branch.
+    const double kLog2 = std::log(2.0);
+    if (x > 700.0) return kLog2 - x;
+    if (x < -700.0) return kLog2;
+    return kLog2 - std::log1p(std::exp(x));
+}
+
+SparseLinkageEdge build_sparse_linkage_edge(const std::vector<LinkageEmission>& emissions,
+                                            const LinkageGeometry& geom, double lambda,
+                                            double log_mix, double log_bg_weight) {
+    SparseLinkageEdge E;
+    if (!geom.ok) return E;
+    E.block_a = geom.block_a; E.block_b = geom.block_b;
+    E.n_a = geom.alleles_a.size(); E.n_b = geom.alleles_b.size();
+    const std::size_t na = E.n_a, nb = E.n_b;
+    E.theoretical_configs = na * nb * na * nb;
+    if (na < 2 || nb < 2) { E.status = LinkageStatus::Ok; return E; }   // no phase to carry
+    for (const LinkageEmission& m : emissions) {
+        if (!m.ok) { E.status = LinkageStatus::InvalidEmissions; return E; }
+    }
+    // Exposure must cancel, exactly as in the dense path: the contract is unchanged, only the
+    // representation is.
+    double asym = 0.0;
+    for (std::size_t a1 = 0; a1 < na; ++a1)
+    for (std::size_t b1 = 0; b1 < nb; ++b1)
+    for (std::size_t a2 = 0; a2 < na; ++a2)
+    for (std::size_t b2 = 0; b2 < nb; ++b2) {
+        asym = std::max(asym, std::abs((geom.exposure[a1 * nb + b1] + geom.exposure[a2 * nb + b2]) -
+                                       (geom.exposure[a1 * nb + b2] + geom.exposure[a2 * nb + b1])));
+    }
+    if (asym > 1e-9) { E.status = LinkageStatus::ExposureDoesNotCancel; return E; }
+
+    // THE SUPPORT: haploid cells carrying in-band mass, and which fragments carry them. Everything
+    // outside is all-background and cannot separate the phases.
+    std::vector<std::vector<std::uint32_t>> at_cell(na * nb);
+    for (std::uint32_t fi = 0; fi < emissions.size(); ++fi) {
+        const LinkageEmission& m = emissions[fi];
+        for (std::size_t k = 0; k < m.mass.size(); ++k) {
+            if (m.mass[k] != kNegInf) at_cell[k].push_back(fi);
+        }
+    }
+    for (const auto& v : at_cell) if (!v.empty()) ++E.support_cells;
+
+    // AFFECTED CLASSES are induced by that support: a class matters only if one of its four corners
+    // carries mass somewhere. Enumerated from the support rather than over all allele quadruples.
+    std::unordered_map<std::uint64_t, char> affected;
+    for (std::size_t al = 0; al < na; ++al)
+    for (std::size_t be = 0; be < nb; ++be) {
+        if (at_cell[al * nb + be].empty()) continue;
+        for (std::size_t a2 = 0; a2 < na; ++a2) {
+            if (a2 == al) continue;
+            for (std::size_t b2 = 0; b2 < nb; ++b2) {
+                if (b2 == be) continue;
+                affected[class_key(std::min(al, a2), std::max(al, a2),
+                                   std::min(be, b2), std::max(be, b2))] = 1;
+            }
+        }
+    }
+    const double log_lambda = std::log(lambda);
+    for (const auto& kv : affected) {
+        const std::size_t amin = static_cast<std::size_t>((kv.first >> 48) & 0xFFFF);
+        const std::size_t amax = static_cast<std::size_t>((kv.first >> 32) & 0xFFFF);
+        const std::size_t bmin = static_cast<std::size_t>((kv.first >> 16) & 0xFFFF);
+        const std::size_t bmax = static_cast<std::size_t>(kv.first & 0xFFFF);
+        // Only fragments touching one of the four corners can differ between the phases; the rest
+        // contribute the same all-background term to both and cancel exactly.
+        std::vector<std::uint32_t> frags;
+        for (const std::size_t c : {amin * nb + bmin, amin * nb + bmax,
+                                    amax * nb + bmin, amax * nb + bmax}) {
+            frags.insert(frags.end(), at_cell[c].begin(), at_cell[c].end());
+        }
+        std::sort(frags.begin(), frags.end());
+        frags.erase(std::unique(frags.begin(), frags.end()), frags.end());
+        double d = 0.0;
+        for (std::uint32_t fi : frags) {
+            const LinkageEmission& m = emissions[fi];
+            const auto mix = [&](double p, double q) {
+                double sig = kNegInf;
+                if (p != kNegInf) sig = p;
+                if (q != kNegInf) sig = (sig == kNegInf) ? q : log_add(sig, q);
+                if (sig != kNegInf) sig += log_mix + log_lambda;
+                const double bg = log_bg_weight + m.log_p_bg;
+                return (sig == kNegInf) ? bg : log_add(sig, bg);
+            };
+            d += mix(m.mass[amin * nb + bmin], m.mass[amax * nb + bmax]) -
+                 mix(m.mass[amin * nb + bmax], m.mass[amax * nb + bmin]);
+        }
+        if (d != 0.0) E.delta.emplace(kv.first, d);
+    }
+    E.stored_classes = E.delta.size();
+    E.status = LinkageStatus::Ok;
+    return E;
+}
+
 LinkageEdge aggregate_linkage_edge(const std::vector<LinkageEmission>& emissions,
                                    const LinkageGeometry& geom, double lambda,
                                    double log_mix, double log_bg_weight,

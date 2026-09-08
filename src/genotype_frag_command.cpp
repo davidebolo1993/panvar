@@ -1028,10 +1028,10 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             // set, so looping over n_a*n_b reads out of bounds.
             if (!E.usable()) {
                 std::printf("%s\t%zu\t%s\t%s\t%s\t%s\t%d\t%zu\t%s\t%.17g"
-                            "\t%s\t%s\t%s\t%s\n",
+                            "\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
                             name, ems.size(), "0", "0", "0", "-", 0, E.n_invalid,
                             linkage_status_name(E.status), E.exposure_asymmetry,
-                            "0", "0", "0", "0");
+                            "0", "0", "0", "0", "0", "0", "0", "0", "0");
                 return;
             }
             const std::size_t na = E.n_a, nb = E.n_b;
@@ -1097,11 +1097,32 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                     }
                 }
             }
+            // SPARSE vs DENSE, over EVERY configuration. The sparse form is exact, not an
+            // approximation, so any difference at all is a defect -- including at the extremely
+            // negative losing phases, where the reconstruction must not lose the branch.
+            const SparseLinkageEdge SP = build_sparse_linkage_edge(ems, gover ? *gover : g,
+                                                                   lam_over > 0.0 ? lam_over : lam,
+                                                                   mix, bgw);
+            double sparse_diff = 0.0;
+            std::size_t sparse_checked = 0;
+            if (SP.usable()) {
+                for (std::size_t a1 = 0; a1 < na; ++a1)
+                for (std::size_t b1 = 0; b1 < nb; ++b1)
+                for (std::size_t a2 = 0; a2 < na; ++a2)
+                for (std::size_t b2 = 0; b2 < nb; ++b2) {
+                    const std::size_t c = ((a1 * nb + b1) * na + a2) * nb + b2;
+                    sparse_diff = std::max(sparse_diff,
+                                           std::abs(E.log_psi[c] - SP.log_psi(a1, b1, a2, b2)));
+                    ++sparse_checked;
+                }
+            }
             std::printf("%s\t%zu\t%.17g\t%.17g\t%.17g\t%s\t%d\t%zu\t%s\t%.17g"
-                        "\t%.17g\t%.17g\t%zu\t%zu\n",
+                        "\t%.17g\t%.17g\t%zu\t%zu\t%.17g\t%zu\t%zu\t%zu\t%zu\n",
                         name, ems.size(), maxabs, worst_mean, swap, sizes.c_str(),
                         E.usable() ? 1 : 0, E.n_invalid, linkage_status_name(E.status),
-                        E.exposure_asymmetry, max_log, min_log, nonfinite, over_bound);
+                        E.exposure_asymmetry, max_log, min_log, nonfinite, over_bound,
+                        sparse_diff, sparse_checked, SP.stored_classes, SP.theoretical_configs,
+                        SP.support_cells);
         };
         const auto mk = [&](const std::vector<double>& mass) {
             LinkageEmission m;
@@ -1110,7 +1131,9 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         };
         std::printf("case\tfragments\tmax_abs_log_psi\tworst_mean_dev\tswap_asym\tclass_sizes"
                     "\tusable\tn_invalid\tstatus\texposure_asym"
-                    "\tmax_log_psi\tmin_log_psi\tnonfinite\tover_class_bound\n");
+                    "\tmax_log_psi\tmin_log_psi\tnonfinite\tover_class_bound"
+                    "\tsparse_vs_dense\tconfigs_checked\tstored_classes\ttheoretical_configs"
+                    "\tsupport_cells\n");
         report("zero_fragments", {});
         report("flat_emissions", {mk({-100.0, -100.0, -100.0, -100.0}),
                                   mk({-100.0, -100.0, -100.0, -100.0})});
@@ -1151,6 +1174,52 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             const std::vector<LinkageEmission> e = {near_floor({-398.0, -402.0, -402.0, -398.0})};
             report("lambda_crossover_lo", e, nullptr, 0.001);
             report("lambda_crossover_hi", e, nullptr, 1.000);
+        }
+        // A C4-SCALE EDGE. The dense table refuses these outright (118 x 119 is 197 million
+        // ordered configurations, 1.6 GB); the sparse form stores one contrast per class that any
+        // fragment's support can actually reach. Nothing is truncated and no score enters -- the
+        // classes that are absent are provably neutral.
+        {
+            std::printf("large_case\tn_a\tn_b\ttheoretical_configs\tstored_classes"
+                        "\tsupport_cells\tstatus\tfragments\n");
+            for (const auto& dims : {std::pair<std::size_t, std::size_t>{118, 119},
+                                     std::pair<std::size_t, std::size_t>{457, 410}}) {
+                LinkageGeometry gl;
+                gl.block_a = 0; gl.block_b = 1;
+                gl.alleles_a.assign(dims.first, std::string(400, 'A'));
+                gl.alleles_b.assign(dims.second, std::string(400, 'C'));
+                gl.context = std::string(40, 'A');
+                gl.lflank.clear(); gl.rflank.clear();
+                gl.window_len.assign(dims.first * dims.second, 840);
+                gl.exposure.assign(dims.first * dims.second, 1000.0);
+                gl.exposure_affine = true;
+                gl.ok = true;
+                // A handful of fragments, each placing on a few allele pairs -- which is what a real
+                // fragment does: it does not place on every allele of a 118-allele block.
+                std::vector<LinkageEmission> ems;
+                for (int f = 0; f < 20; ++f) {
+                    LinkageEmission m;
+                    m.n_a = dims.first; m.n_b = dims.second;
+                    m.mass.assign(dims.first * dims.second,
+                                  -std::numeric_limits<double>::infinity());
+                    m.log_p_bg = -400.0; m.ok = true; m.informative = true;
+                    for (int k = 0; k < 3; ++k) {
+                        const std::size_t al = static_cast<std::size_t>((f * 7 + k * 13) %
+                                                                        dims.first);
+                        const std::size_t be = static_cast<std::size_t>((f * 5 + k * 11) %
+                                                                        dims.second);
+                        m.mass[al * dims.second + be] = -390.0 - k;
+                    }
+                    ems.push_back(std::move(m));
+                }
+                const SparseLinkageEdge SL = build_sparse_linkage_edge(ems, gl, 0.05,
+                                                                       std::log1p(-0.05),
+                                                                       std::log(0.05));
+                std::printf("%zux%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t%s\t%zu\n",
+                            dims.first, dims.second, dims.first, dims.second,
+                            SL.theoretical_configs, SL.stored_classes, SL.support_cells,
+                            linkage_status_name(SL.status), ems.size());
+            }
         }
         // THE DENSE TABLE MUST REFUSE, NOT TRUNCATE. A locus-scale block pair (LPA: 457 x 410) is
         // 35.1 billion configurations and 561.7 GB, so the dense form cannot claim to handle all
