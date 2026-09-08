@@ -1705,6 +1705,62 @@ OwnershipLedger ownership_ledger(const std::vector<FragmentOwner>& owners);
 // homologue would produce. The edge potential still has to combine the two homologues once, mix the
 // background once, sum over every fragment owned by the edge, charge exposure once, and only then
 // remove the content baseline. LinkageEdge below does that; nothing here may be used as a factor.
+// THE SIGNATURE MATRIX: which allele pairs the fragments on ONE edge cannot tell apart.
+//
+// IT IS A FACTOR-EVALUATION DEVICE AND NEVER A STATE REDUCTION. A row class says the fragments
+// owning THIS edge cannot distinguish those A alleles. Marker unaries and Li-Stephens transitions
+// still can, and must -- collapsing them as HMM states would discard evidence the linkage factor
+// never saw. So this type stays inside the edge builder and never reaches the chain kernel, which
+// continues to see every allele with its own unary and its own transition weight.
+//
+// Equality of distinct pattern SETS is equality of vocabulary, not of the factor application: a set
+// comparison discards how many content classes realise each pattern, which alleles realise it, the
+// sign attached to each occurrence, and the weights of those members. Hence the full member lists
+// and the realisability bounds below -- they are exactly what a set comparison throws away.
+struct SignatureMatrix {
+    std::size_t n_a = 0, n_b = 0;
+    std::vector<std::uint32_t> cell_to_signature;   // n_a * n_b, dense
+    std::size_t n_signatures = 0;
+    std::vector<std::uint32_t> row_class, col_class;             // per allele
+    std::vector<std::vector<std::uint32_t>> row_members, col_members;
+    // Smallest and largest member INDEX of each class. An ordered class pair (i,j) is realisable as
+    // a1 < a2 only when some member of i precedes some member of j; within one class it needs two
+    // members. Orientation depends on this, and dropping it merges delta with -delta.
+    std::vector<std::uint32_t> row_min, row_max, col_min, col_max;
+    bool ok = false;
+    std::string refusal;
+    // The emission model these signatures were derived under. Exactness is a property of that
+    // model, so a consumer must check it rather than assume it.
+    std::string model_tag;
+    std::uint32_t signature_at(std::size_t a, std::size_t b) const {
+        return cell_to_signature[a * n_b + b];
+    }
+    // Every original cell must reconstruct its own signature id through its row and column classes.
+    bool validate() const;
+};
+
+// TWO SCOPE CONSTRAINTS, both of which a later reader would violate by default.
+//
+// 1. THESE CLASSES ARE RELATIVE TO ONE READ SET. A signature class says "these alleles are
+//    equidistant from THESE fragments" -- it is a computational equivalence, not a biological one,
+//    and two alleles differing at distinct positions land in one class simply because each costs
+//    one mismatch. So recompute per read set. Never carry a matrix across donors, seeds or depths:
+//    the fragments define the equivalence, and different fragments define a different one.
+//
+// 2. THE SIGNATURE IS EXACT FOR THIS EMISSION MODEL ONLY. (m1_edits, m2_edits, insert) determines
+//    the mass because the model is uniform-error Hamming with a fixed insert prior. Base-quality
+//    weighting, position-dependent error, or indels would each make two placements with equal edit
+//    COUNTS carry different likelihood, and the signature would silently stop being exact. The
+//    model tag below is carried so a changed model cannot reuse a matrix built under the old one.
+constexpr const char* kSignatureModelTag = "hamming-uniform-eps/insert-prior/v1";
+
+// Build it from one signature per cell. `cell_signatures` is indexed a * n_b + b. `model_tag`
+// records the emission model the signatures were derived under; a mismatch is a refusal, not a
+// warning.
+SignatureMatrix build_signature_matrix(const std::vector<std::string>& cell_signatures,
+                                       std::size_t n_a, std::size_t n_b,
+                                       const char* model_tag = kSignatureModelTag);
+
 // OPERATIONAL WORK BUDGET, enforced INCREMENTALLY inside the support search.
 //
 // The previous budget named the wrong quantity and checked it in the wrong place. It counted

@@ -617,6 +617,23 @@ else
   bad "the derived-flank fixture produced no geometry probe"
 fi
 # ---------------------------------------------------------------------------------------------
+# GATE 29c: EXACT SIGNATURE GROUPING -- member-weighted HMM equivalence, not just factor values.
+# Two allele pairs may share a linkage contribution only when the whole vector of per-fragment
+# structural signatures agrees. This checks that the grouped representation reproduces the
+# UNCOMPRESSED one through psi, the partition weight and every marginal, under adversarial weights:
+# unequal marker unaries among alleles sharing a class, unequal class sizes, r at both extremes.
+# Three mutations must FAIL -- dropping mismatch counts, merging straight with crossed, and
+# ignoring membership -- or the assertions above are measuring nothing.
+if "$BIN" genotype-frag -i /dev/null -b none -o "$OUT/gr" --grouping-selftest \
+     > "$OUT/group.txt" 2>/dev/null; then
+  while IFS=$'\t' read -r v m; do
+    [ "$v" = ok ] && ok "$m" || { [ -n "${m:-}" ] && bad "$m"; }
+  done < <(grep -E '^(ok|FAIL)\t' "$OUT/group.txt")
+else
+  bad "grouping selftest reported failures"
+  sed -n 's/^FAIL\t/  /p' "$OUT/group.txt"
+fi
+
 # GATE 29b: THE OPERATIONAL WORK BUDGET, at unit level. The production gate above proves the
 # refusal is transactional; this proves it is charged BEFORE the work, that an unlimited budget is
 # bit-inert, and that an unaffordable dense fallback never enumerates a window.

@@ -4795,6 +4795,100 @@ void mark_informative(LinkageEmission& out) {
 
 }  // namespace
 
+SignatureMatrix build_signature_matrix(const std::vector<std::string>& cell_signatures,
+                                       std::size_t n_a, std::size_t n_b, const char* model_tag) {
+    SignatureMatrix M;
+    M.n_a = n_a; M.n_b = n_b;
+    M.model_tag = model_tag != nullptr ? model_tag : "";
+    if (M.model_tag != kSignatureModelTag) {
+        // The signature's exactness is a property of the emission model. A matrix built for a
+        // different one is not a smaller answer, it is an unsound cache.
+        M.refusal = "signature model tag '" + M.model_tag + "' is not '" +
+                    std::string(kSignatureModelTag) + "'";
+        return M;
+    }
+    if (cell_signatures.size() != n_a * n_b) {
+        M.refusal = "cell signature count does not match the allele product";
+        return M;
+    }
+    std::unordered_map<std::string, std::uint32_t> sid;
+    M.cell_to_signature.resize(n_a * n_b);
+    for (std::size_t k = 0; k < cell_signatures.size(); ++k) {
+        M.cell_to_signature[k] = sid.emplace(cell_signatures[k],
+            static_cast<std::uint32_t>(sid.size())).first->second;
+    }
+    M.n_signatures = sid.size();
+    // ROW AND COLUMN CLASSES, over the COMPLETE vector of signature ids -- a row class is not
+    // "these alleles agree somewhere", it is "these alleles agree at every B allele".
+    const auto classify = [](std::size_t outer, std::size_t inner,
+                             const std::vector<std::uint32_t>& cells, bool by_row,
+                             std::size_t n_bb,
+                             std::vector<std::uint32_t>& cls,
+                             std::vector<std::vector<std::uint32_t>>& members,
+                             std::vector<std::uint32_t>& lo,
+                             std::vector<std::uint32_t>& hi) {
+        std::unordered_map<std::string, std::uint32_t> id;
+        cls.assign(outer, 0);
+        for (std::size_t o = 0; o < outer; ++o) {
+            std::string key(inner * 4, '\0');
+            for (std::size_t i = 0; i < inner; ++i) {
+                const std::uint32_t v = by_row ? cells[o * n_bb + i] : cells[i * n_bb + o];
+                std::memcpy(&key[i * 4], &v, 4);
+            }
+            cls[o] = id.emplace(key, static_cast<std::uint32_t>(id.size())).first->second;
+        }
+        members.assign(id.size(), {});
+        lo.assign(id.size(), std::numeric_limits<std::uint32_t>::max());
+        hi.assign(id.size(), 0);
+        for (std::size_t o = 0; o < outer; ++o) {
+            const std::uint32_t c = cls[o];
+            members[c].push_back(static_cast<std::uint32_t>(o));
+            lo[c] = std::min(lo[c], static_cast<std::uint32_t>(o));
+            hi[c] = std::max(hi[c], static_cast<std::uint32_t>(o));
+        }
+    };
+    classify(n_a, n_b, M.cell_to_signature, true, n_b, M.row_class, M.row_members,
+             M.row_min, M.row_max);
+    classify(n_b, n_a, M.cell_to_signature, false, n_b, M.col_class, M.col_members,
+             M.col_min, M.col_max);
+    if (!M.validate()) {
+        M.refusal = "a cell does not reconstruct its signature from its row and column classes";
+        return M;
+    }
+    M.ok = true;
+    return M;
+}
+
+bool SignatureMatrix::validate() const {
+    if (cell_to_signature.size() != n_a * n_b) return false;
+    if (row_class.size() != n_a || col_class.size() != n_b) return false;
+    // MEMBERSHIP IS A PARTITION: every allele in exactly one class, every class non-empty.
+    std::size_t seen = 0;
+    for (const auto& m : row_members) { if (m.empty()) return false; seen += m.size(); }
+    if (seen != n_a) return false;
+    seen = 0;
+    for (const auto& m : col_members) { if (m.empty()) return false; seen += m.size(); }
+    if (seen != n_b) return false;
+    // THE RECONSTRUCTION: members of one row class must agree at EVERY column, and members of one
+    // column class at every row. If that fails the classes are not equivalence classes and every
+    // count derived from them is meaningless.
+    for (const auto& m : row_members) {
+        for (std::size_t b = 0; b < n_b; ++b) {
+            const std::uint32_t want = cell_to_signature[m[0] * n_b + b];
+            for (std::uint32_t a : m)
+                if (cell_to_signature[a * n_b + b] != want) return false;
+        }
+    }
+    for (const auto& m : col_members) {
+        for (std::size_t a = 0; a < n_a; ++a) {
+            const std::uint32_t want = cell_to_signature[a * n_b + m[0]];
+            for (std::uint32_t b : m)
+                if (cell_to_signature[a * n_b + b] != want) return false;
+        }
+    }
+    return true;
+}
+
 bool HybridWorkBudget::charge_cells(std::uint64_t n, const char* why) {
     if (exhausted) return false;
     proposed_cells += n;

@@ -343,6 +343,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     bool support_selftest = false;
     bool coordinate_selftest = false;
     bool budget_selftest = false;
+    bool grouping_selftest = false;
     bool completeness_selftest = false;
     bool activation_selftest = false;
     std::vector<std::string> reconcile_scope;
@@ -400,6 +401,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--support-selftest") support_selftest = true;
         else if (a == "--coordinate-selftest") coordinate_selftest = true;
         else if (a == "--budget-selftest") budget_selftest = true;
+        else if (a == "--grouping-selftest") grouping_selftest = true;
         else if (a == "--completeness-selftest") completeness_selftest = true;
         else if (a == "--activation-selftest") activation_selftest = true;
         else if (a == "--scope-tol") {
@@ -664,7 +666,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         spell_pair.empty() && ref_block.empty() && ref_block_pair.empty() &&
         origin_universe.empty() && reconcile_scope.empty() && !linkage_selftest &&
         !hybrid_oracle && !mapping_selftest && !completeness_selftest && !activation_selftest &&
-        !support_selftest && !coordinate_selftest && !budget_selftest) {
+        !support_selftest && !coordinate_selftest && !budget_selftest && !grouping_selftest) {
         throw std::runtime_error("genotype-frag requires at least one --reads");
     }
     if (!bubble_prefix_in.empty()) {
@@ -697,6 +699,482 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     ParseGfaOptions parse_options;
     parse_options.include_paths = true;
     parse_options.include_sequences = true;
+    // ---- EXACT SIGNATURE GROUPING SELF-TEST -----------------------------------------------------
+    // Equality of distinct pattern SETS is equality of vocabulary, not of the factor application. A
+    // set comparison discards how many content classes realise each pattern, which alleles realise
+    // it, the SIGN attached to each occurrence, and the weights of those members. So this compares
+    // EVERY content class, member-weighted and signed, and then carries the comparison through psi,
+    // the forward-backward weight sum and every marginal.
+    if (grouping_selftest) {
+        std::size_t fails = 0;
+        const auto ok_ = [&](bool c, const std::string& what) {
+            std::printf("%s\t%s\n", c ? "ok" : "FAIL", what.c_str());
+            if (!c) ++fails;
+        };
+        // RESIDUALS IN SCIENTIFIC NOTATION, against a DECLARED tolerance. "0.000000" cannot
+        // distinguish an exact zero from 1e-9, and that difference is the whole claim.
+        const auto sci = [](double x) {
+            char buf[32];
+            std::snprintf(buf, sizeof buf, "%.3e", x);
+            return std::string(buf);
+        };
+        const double kExact = 0.0;        // bit-identical required
+        const double kTolMarg = 1e-15;    // marginals, after normalisation
+        const double kTolZ = 1e-12;       // partition weight, psi, swap
+        std::mt19937_64 rng(20260908);
+        const auto rseq = [&](std::size_t n) {
+            static const char* B = "ACGT";
+            std::string t(n, 'A');
+            for (std::size_t i = 0; i < n; ++i) t[i] = B[rng() & 3];
+            return t;
+        };
+        // A FIXTURE THAT ACTUALLY COLLAPSES: three distinct A sequences each carried by two
+        // alleles, four distinct B sequences each carried by two. If the row and column classes do
+        // not come out at 3 and 4 the fixture is vacuous and every later assertion is meaningless,
+        // so that is asserted first.
+        // THE ALLELES MUST DIFFER BY SUBSTITUTIONS, not be independent sequences. Independent
+        // sequences make every non-matching cell -inf, so a cell's mismatch count never varies
+        // while its insert structure stays fixed -- and then dropping mismatch counts from the
+        // signature merges nothing and the mutation cannot fail. Real C4 is the substitution case:
+        // 119 of 126 B alleles matched a fragment perfectly and 7 cost exactly one mismatch.
+        const auto sub = [](std::string x, std::size_t at, char c) {
+            x[at] = (x[at] == c) ? (c == 'A' ? 'C' : 'A') : c;
+            return x;
+        };
+        const std::string A0 = rseq(120), B0 = rseq(140);
+        std::vector<std::string> A3 = {A0, sub(A0, 40, 'G'), sub(A0, 41, 'T')};
+        std::vector<std::string> B4 = {B0, sub(B0, 60, 'G'), sub(B0, 61, 'T'),
+                                       sub(sub(B0, 60, 'G'), 61, 'T')};
+        LinkageGeometry g;
+        g.block_a = 0; g.block_b = 1;
+        // UNEQUAL CLASS SIZES on purpose: a grouped implementation that treated members uniformly
+        // would pass on classes that all happen to be the same size.
+        // AND INTERLEAVED, not contiguous. Laid out in blocks, class(a1) <= class(a2) holds for
+        // every a1 < a2, so only ONE orientation of each class pair is ever realisable and a
+        // mutation that merges straight with crossed has nothing to collide -- the test would pass
+        // while measuring nothing. Real classes are scattered through the allele order, as C4's
+        // are, and scattering them here is what makes the orientation gate load-bearing.
+        for (std::size_t k : {0u, 1u, 2u, 1u, 2u, 2u}) g.alleles_a.push_back(A3[k]);
+        for (std::size_t k : {0u, 1u, 2u, 3u, 1u, 2u, 3u, 3u}) g.alleles_b.push_back(B4[k]);
+        g.context = rseq(60); g.lflank = rseq(900); g.rflank = rseq(900);
+        const std::size_t NA = g.alleles_a.size(), NB = g.alleles_b.size();
+        g.window_len.assign(NA * NB, 0);
+        g.exposure.assign(NA * NB, 1000.0);
+        g.exposure_affine = true; g.ok = true;
+        InsertPrior ip; ip.lo = 200; ip.hi = 600;
+        ip.logp.assign(static_cast<std::size_t>(ip.hi - ip.lo + 1),
+                       -std::log(static_cast<double>(ip.hi - ip.lo + 1)));
+        const auto ix = build_allele_product_index(g, 16);
+        const double lep = std::log(0.001 / 3.0), l1m = std::log(1.0 - 0.001);
+
+        // Fragments planted across several windows so the signatures actually differ.
+        std::vector<Fragment> frags;
+        for (std::size_t al : {std::size_t(0), std::size_t(1), std::size_t(2),
+                               std::size_t(4), std::size_t(5)}) {
+            for (std::size_t be : {std::size_t(0), std::size_t(3), std::size_t(6)}) {
+                VirtualWindow vw; vw.geom = &g;
+                vw.alpha = static_cast<std::uint32_t>(al);
+                vw.beta = static_cast<std::uint32_t>(be);
+                const std::size_t start = g.lflank.size() - 30;
+                Fragment f;
+                f.name = "f" + std::to_string(al) + "_" + std::to_string(be);
+                for (std::size_t i = 0; i < 150; ++i) f.r1.push_back(vw.base_at(start + i));
+                std::string tail;
+                for (std::size_t i = 0; i < 150; ++i) tail.push_back(vw.base_at(start + 260 + i));
+                f.r2 = reverse_complement(tail);
+                frags.push_back(f);
+            }
+        }
+        std::vector<LinkageEmission> ems;
+        std::vector<std::vector<std::string>> sigs;
+        for (const Fragment& f : frags) {
+            std::vector<std::string> cs;
+            const std::size_t len = f.bases();
+            const double bgf = static_cast<double>(len) * 0.10 * lep +
+                               static_cast<double>(len) * 0.90 * l1m;
+            ems.push_back(linkage_emission_supported(f, g, ip, 0.05, lep, l1m, bgf,
+                                                     nullptr, &ix, nullptr, &cs));
+            sigs.push_back(std::move(cs));
+        }
+        // The joint signature per cell is the concatenation over fragments, length-prefixed.
+        std::vector<std::string> joint(NA * NB);
+        for (std::size_t k = 0; k < NA * NB; ++k) {
+            for (const auto& cs : sigs) {
+                const std::uint32_t n = static_cast<std::uint32_t>(cs[k].size());
+                joint[k].append(reinterpret_cast<const char*>(&n), 4);
+                joint[k].append(cs[k]);
+            }
+        }
+        const SignatureMatrix M = build_signature_matrix(joint, NA, NB);
+        ok_(M.ok, "the signature matrix validates: classes partition and every cell reconstructs");
+        ok_(M.row_members.size() == 3 && M.col_members.size() == 3,
+            "the fixture COLLAPSES as designed: " + std::to_string(M.row_members.size()) +
+            " row classes of " + std::to_string(NA) + ", " +
+            std::to_string(M.col_members.size()) + " column classes of " + std::to_string(NB));
+        // WHY THREE COLUMN CLASSES FROM FOUR DISTINCT B SEQUENCES, and not four. Two alleles
+        // carrying substitutions at DIFFERENT positions are different sequences, yet each sits
+        // exactly one mismatch from the observed reads, so both yield the same
+        // (m1_edits, m2_edits, insert) multiset and land in one signature class. Signature
+        // equivalence is equidistance from THESE fragments, not sequence identity -- which is
+        // exactly the C4 phenomenon that makes the collapse large, and is worth asserting rather
+        // than discovering again.
+        {
+            bool distinct_share = false;
+            for (const auto& mem : M.col_members)
+                for (std::size_t i = 0; i + 1 < mem.size() && !distinct_share; ++i)
+                    for (std::size_t j = i + 1; j < mem.size(); ++j)
+                        if (g.alleles_b[mem[i]] != g.alleles_b[mem[j]]) { distinct_share = true; break; }
+            ok_(distinct_share,
+                "two DIFFERENT B sequences share a signature class -- equidistance, not identity");
+        }
+
+        // THE FACTOR APPLICATION, per content class. mix() is the sparse builder's own combiner,
+        // reproduced here so the two cannot drift; delta is straight minus crossed, SIGNED.
+        const double eta = 0.05, lambda = 0.05;
+        const double log_mix = std::log1p(-eta), log_bg_weight = std::log(eta);
+        const double log_lambda = std::log(lambda);
+        const double NEG = -std::numeric_limits<double>::infinity();
+        const auto log_add_d = [&](double x, double y) {
+            if (x == NEG) return y;
+            if (y == NEG) return x;
+            const double hi = std::max(x, y), lo = std::min(x, y);
+            return hi + std::log1p(std::exp(lo - hi));
+        };
+        const auto mix = [&](double p, double q, double log_p_bg) {
+            double sig = NEG;
+            if (p != NEG) sig = p;
+            if (q != NEG) sig = (sig == NEG) ? q : log_add_d(sig, q);
+            if (sig != NEG) sig += log_mix + log_lambda;
+            const double bg = log_bg_weight + log_p_bg;
+            return (sig == NEG) ? bg : log_add_d(sig, bg);
+        };
+        // Delta for one content class, computed from the emissions themselves.
+        const auto delta_direct = [&](std::size_t a1, std::size_t a2, std::size_t b1,
+                                      std::size_t b2, int sig_mode) {
+            double d = 0.0;
+            for (const LinkageEmission& m : ems) {
+                const double s = mix(m.mass[a1 * NB + b1], m.mass[a2 * NB + b2], m.log_p_bg);
+                const double c = mix(m.mass[a1 * NB + b2], m.mass[a2 * NB + b1], m.log_p_bg);
+                d += (sig_mode == 2) ? (s + c) : (s - c);   // mode 2 merges straight with crossed
+            }
+            return d;
+        };
+        // A 16-BYTE pattern key. The earlier four 16-bit fields packed into 64 bits would silently
+        // alias two patterns once a locus carried more than 65535 signatures, and a silent
+        // collision in a CHECKER makes the equivalence it tests pass spuriously.
+        const auto pattern_key = [&](std::uint32_t q11, std::uint32_t q22, std::uint32_t q12,
+                                     std::uint32_t q21, bool merge_phase) {
+            std::uint32_t sA = std::min(q11, q22), sB = std::max(q11, q22);
+            std::uint32_t cA = std::min(q12, q21), cB = std::max(q12, q21);
+            if (merge_phase && (std::make_pair(cA, cB) < std::make_pair(sA, sB))) {
+                std::swap(sA, cA); std::swap(sB, cB);   // the mutation: sorts ACROSS the phases
+            }
+            std::string k(16, '\0');
+            std::memcpy(&k[0], &sA, 4); std::memcpy(&k[4], &sB, 4);
+            std::memcpy(&k[8], &cA, 4); std::memcpy(&k[12], &cB, 4);
+            return k;
+        };
+        // THE COMPARISON over every content class: a pattern's delta is computed ONCE, from the
+        // first class realising it, and every later member must reproduce it exactly.
+        const auto run = [&](int sig_mode, bool merge_phase, bool members_matter,
+                             double* worst_out, std::size_t* patterns_out) {
+            std::unordered_map<std::string, double> cache;
+            double worst = 0.0;
+            for (std::size_t a1 = 0; a1 + 1 < NA; ++a1)
+            for (std::size_t a2 = a1 + 1; a2 < NA; ++a2)
+            for (std::size_t b1 = 0; b1 + 1 < NB; ++b1)
+            for (std::size_t b2 = b1 + 1; b2 < NB; ++b2) {
+                std::uint32_t q11 = M.signature_at(a1, b1), q22 = M.signature_at(a2, b2);
+                std::uint32_t q12 = M.signature_at(a1, b2), q21 = M.signature_at(a2, b1);
+                if (sig_mode == 1) {   // the mutation: signature ignores WHICH alleles, using only
+                    q11 = q22 = q12 = q21 = 0;   // membership-free grouping
+                }
+                const std::string k = pattern_key(q11, q22, q12, q21, merge_phase);
+                const double d = delta_direct(a1, a2, b1, b2, merge_phase ? 2 : 0);
+                const auto it = cache.find(k);
+                if (it == cache.end()) cache.emplace(k, d);
+                else worst = std::max(worst, std::abs(it->second - d));
+                (void)members_matter;
+            }
+            if (worst_out != nullptr) *worst_out = worst;
+            if (patterns_out != nullptr) *patterns_out = cache.size();
+            return worst;
+        };
+        double worst = 0.0; std::size_t npat = 0;
+        run(0, false, true, &worst, &npat);
+        ok_(worst == kExact,
+            "every content class sharing a pattern has the IDENTICAL signed delta (worst " +
+            sci(worst) + ", tolerance " + sci(kExact) + ", over " + std::to_string(npat) + " patterns)");
+
+        // NON-VACUITY: some delta must be non-zero, or the equality above is trivially satisfied.
+        double maxabs = 0.0;
+        for (std::size_t a1 = 0; a1 + 1 < NA; ++a1)
+        for (std::size_t a2 = a1 + 1; a2 < NA; ++a2)
+        for (std::size_t b1 = 0; b1 + 1 < NB; ++b1)
+        for (std::size_t b2 = b1 + 1; b2 < NB; ++b2)
+            maxabs = std::max(maxabs, std::abs(delta_direct(a1, a2, b1, b2, 0)));
+        ok_(maxabs > 1e-6, "the fixture carries real phase signal (max |delta| " +
+                           sci(maxabs) + ")");
+
+        // THE SIGN GATE. Swapping the two B alleles exchanges straight with crossed, so the delta
+        // must be the exact negative. Merging the phases would make these equal instead.
+        double worst_sign = 0.0;
+        for (std::size_t a1 = 0; a1 + 1 < NA; ++a1)
+        for (std::size_t a2 = a1 + 1; a2 < NA; ++a2)
+        for (std::size_t b1 = 0; b1 + 1 < NB; ++b1)
+        for (std::size_t b2 = b1 + 1; b2 < NB; ++b2) {
+            const double d1 = delta_direct(a1, a2, b1, b2, 0);
+            const double d2 = delta_direct(a1, a2, b2, b1, 0);
+            worst_sign = std::max(worst_sign, std::abs(d1 + d2));
+        }
+        ok_(worst_sign < 1e-9,
+            "reversing straight and crossed gives exactly the opposite delta (worst " +
+            sci(worst_sign) + ", tolerance 1.000e-09)");
+
+        // THE FLAT GATE. Two alleles in one row class are indistinguishable to every fragment, so
+        // straight and crossed coincide and the class must be neutral.
+        double worst_flat = 0.0; std::size_t n_flat = 0;
+        for (const auto& mem : M.row_members) {
+            if (mem.size() < 2) continue;
+            for (std::size_t b1 = 0; b1 + 1 < NB; ++b1)
+            for (std::size_t b2 = b1 + 1; b2 < NB; ++b2) {
+                ++n_flat;
+                worst_flat = std::max(worst_flat,
+                                      std::abs(delta_direct(mem[0], mem[1], b1, b2, 0)));
+            }
+        }
+        ok_(n_flat > 0 && worst_flat < 1e-12,
+            "a class whose two A alleles share a signature row is exactly neutral (" +
+            std::to_string(n_flat) + " classes, worst " + sci(worst_flat) + ", tolerance 1.000e-12)");
+
+        // THE COLUMN GATE, symmetric to the row one. Two B alleles sharing a signature column are
+        // indistinguishable to every fragment, so their class must be neutral too. Testing only the
+        // row direction would leave an asymmetric implementation passing.
+        double worst_flat_b = 0.0; std::size_t n_flat_b = 0;
+        for (const auto& mem : M.col_members) {
+            if (mem.size() < 2) continue;
+            for (std::size_t a1 = 0; a1 + 1 < NA; ++a1)
+            for (std::size_t a2 = a1 + 1; a2 < NA; ++a2) {
+                ++n_flat_b;
+                worst_flat_b = std::max(worst_flat_b,
+                                        std::abs(delta_direct(a1, a2, mem[0], mem[1], 0)));
+            }
+        }
+        ok_(n_flat_b > 0 && worst_flat_b < 1e-12,
+            "a class whose two B alleles share a signature column is exactly neutral (" +
+            std::to_string(n_flat_b) + " classes, worst " + sci(worst_flat_b) + ", tolerance 1.000e-12)");
+
+        // ---- END TO END: the grouped delta must survive the WEIGHTED chain computation ----------
+        // Member-resolved factor equivalence is not member-weighted HMM equivalence: marker
+        // unaries, Li-Stephens weights and the forward/backward messages have not yet passed
+        // through the grouped representation. They do here, against deliberately adversarial
+        // weights -- unequal unaries among alleles that share a signature class, unequal class
+        // sizes, and r at both ends of its range as well as in between.
+        {
+            // The sparse edge's own key shape. It is file-local to genotype_fragments.cpp, so it
+            // is restated here -- and if the restatement were wrong, log_psi would find no entry,
+            // every class would read as neutral, and the non-vacuity gate below would fail. The
+            // test cannot silently pass on a mismatched key.
+            const auto ckey = [](std::size_t amin, std::size_t amax,
+                                 std::size_t bmin, std::size_t bmax) {
+                return (static_cast<std::uint64_t>(amin) << 48) |
+                       (static_cast<std::uint64_t>(amax) << 32) |
+                       (static_cast<std::uint64_t>(bmin) << 16) |
+                       static_cast<std::uint64_t>(bmax);
+            };
+            SparseLinkageEdge orig, grp;
+            orig.block_a = 0; orig.block_b = 1; orig.n_a = NA; orig.n_b = NB;
+            grp = orig;
+            std::unordered_map<std::string, double> pcache;
+            for (std::size_t a1 = 0; a1 + 1 < NA; ++a1)
+            for (std::size_t a2 = a1 + 1; a2 < NA; ++a2)
+            for (std::size_t b1 = 0; b1 + 1 < NB; ++b1)
+            for (std::size_t b2 = b1 + 1; b2 < NB; ++b2) {
+                const double d = delta_direct(a1, a2, b1, b2, 0);
+                if (d != 0.0) orig.delta.emplace(ckey(a1, a2, b1, b2), d);
+                // THE GROUPED PATH: one delta per pattern, reused by every member class.
+                const std::string k = pattern_key(M.signature_at(a1, b1), M.signature_at(a2, b2),
+                                                  M.signature_at(a1, b2), M.signature_at(a2, b1),
+                                                  false);
+                auto it = pcache.find(k);
+                if (it == pcache.end()) it = pcache.emplace(k, d).first;
+                if (it->second != 0.0) grp.delta.emplace(ckey(a1, a2, b1, b2), it->second);
+            }
+            orig.status = LinkageStatus::Ok; grp.status = LinkageStatus::Ok;
+            orig.stored_classes = orig.delta.size(); grp.stored_classes = grp.delta.size();
+            bool maps_equal = orig.delta.size() == grp.delta.size();
+            if (maps_equal)
+                for (const auto& kv : orig.delta) {
+                    const auto it = grp.delta.find(kv.first);
+                    if (it == grp.delta.end() || it->second != kv.second) { maps_equal = false; break; }
+                }
+            ok_(maps_equal && !orig.delta.empty(),
+                "the grouped delta map equals the direct one entry for entry (" +
+                std::to_string(orig.delta.size()) + " classes, " +
+                std::to_string(pcache.size()) + " patterns)");
+            // PSI for every real content class, both orientations.
+            double worst_psi = 0.0;
+            for (std::size_t a1 = 0; a1 < NA; ++a1)
+            for (std::size_t a2 = 0; a2 < NA; ++a2)
+            for (std::size_t b1 = 0; b1 < NB; ++b1)
+            for (std::size_t b2 = 0; b2 < NB; ++b2)
+                worst_psi = std::max(worst_psi, std::abs(orig.log_psi(a1, b1, a2, b2) -
+                                                          grp.log_psi(a1, b1, a2, b2)));
+            ok_(worst_psi == kExact, "log psi is identical for every ordered content class (worst " +
+                                  sci(worst_psi) + ", tolerance " + sci(kExact) + ")");
+            // THE WEIGHTED CHAIN. Six haplotypes, deliberately spanning signature classes so that
+            // members of one class carry different unaries and different forward mass.
+            const std::size_t nh = 6, nbk = 3, ns = nh * nh;
+            AlleleMapping ma, mb;
+            ma.n_alleles = NA; mb.n_alleles = NB;
+            ma.status = MappingStatus::Ok; mb.status = MappingStatus::Ok;
+            ma.allele = {0, 1, 2, 3, 4, 5};        // one haplotype per A allele, classes 1/2/3
+            mb.allele = {0, 1, 2, 3, 5, 7};        // spanning all four B classes
+            std::vector<std::vector<double>> em(nbk, std::vector<double>(ns, 1.0));
+            for (std::size_t b = 0; b < nbk; ++b)
+                for (std::size_t i = 0; i < nh; ++i)
+                    for (std::size_t j = 0; j < nh; ++j)
+                        em[b][i * nh + j] = std::exp(-0.37 * (b + 1) * (i + 1) -
+                                                     0.11 * (j + 2) * (b + 3) - 0.05 * i * j);
+            const auto emit_fn = [&](std::size_t b, std::vector<double>& ev) { ev = em[b]; };
+            const SparseEdgeLinkage se_o = make_sparse_kernel_edge(orig, ma, mb);
+            const SparseEdgeLinkage se_g = make_sparse_kernel_edge(grp, ma, mb);
+            // SWAP INVARIANCE NEEDS SYMMETRIC EMISSIONS. The adversarial emissions above are
+            // asymmetric in i and j on purpose -- which is right for the marginal and partition
+            // identities and useless here: (i,j) and (j,i) then carry different mass with NO
+            // linkage at all, and the check would measure the fixture instead of the kernel.
+            std::vector<std::vector<double>> sym(nbk, std::vector<double>(ns, 1.0));
+            for (std::size_t b = 0; b < nbk; ++b)
+                for (std::size_t i = 0; i < nh; ++i)
+                    for (std::size_t j = 0; j < nh; ++j) {
+                        const double v = std::exp(-0.21 * (b + 1) * (i + 1) * (j + 1) -
+                                                  0.05 * (i + j));
+                        sym[b][i * nh + j] = v; sym[b][j * nh + i] = v;
+                    }
+            const auto emit_sym = [&](std::size_t b, std::vector<double>& ev) { ev = sym[b]; };
+            double worst_marg = 0.0, worst_z = 0.0, worst_swap = 0.0, max_shift = 0.0;
+            for (double r : {0.0, 0.3, 1.0}) {
+                std::vector<SparseEdgeLinkage> so(nbk), sg(nbk), snone(nbk);
+                so[2] = se_o; sg[2] = se_g;
+                std::vector<std::vector<double>> f1, b1v, f2, b2v, f0, b0v;
+                ChainKernelStats s1, s2, s0;
+                chain_forward_backward(nh, nbk, r, emit_fn, nullptr, f1, b1v, &s1, &so);
+                chain_forward_backward(nh, nbk, r, emit_fn, nullptr, f2, b2v, &s2, &sg);
+                chain_forward_backward(nh, nbk, r, emit_fn, nullptr, f0, b0v, &s0, &snone);
+                worst_z = std::max(worst_z, std::abs(s1.log_weight_sum - s2.log_weight_sum));
+                for (std::size_t b = 0; b < nbk; ++b) {
+                    double z1 = 0.0, z2 = 0.0, z0 = 0.0;
+                    for (std::size_t k = 0; k < ns; ++k) {
+                        z1 += f1[b][k] * b1v[b][k];
+                        z2 += f2[b][k] * b2v[b][k];
+                        z0 += f0[b][k] * b0v[b][k];
+                    }
+                    for (std::size_t i = 0; i < nh; ++i)
+                    for (std::size_t j = 0; j < nh; ++j) {
+                        const std::size_t k = i * nh + j, ks = j * nh + i;
+                        const double p1 = z1 > 0 ? f1[b][k] * b1v[b][k] / z1 : 0.0;
+                        const double p2 = z2 > 0 ? f2[b][k] * b2v[b][k] / z2 : 0.0;
+                        const double p0 = z0 > 0 ? f0[b][k] * b0v[b][k] / z0 : 0.0;
+                        const double p2s = z2 > 0 ? f2[b][ks] * b2v[b][ks] / z2 : 0.0;
+                        worst_marg = std::max(worst_marg, std::abs(p1 - p2));
+                        (void)p2s;
+                        max_shift = std::max(max_shift, std::abs(p2 - p0));
+                    }
+                }
+            }
+            ok_(worst_marg <= kTolMarg, "every block marginal agrees across r in {0, 0.3, 1} (worst " +
+                                    sci(worst_marg) + ", tolerance " + sci(kTolMarg) + ")");
+            ok_(worst_z <= kTolZ, "the unnormalised partition weight agrees (worst " +
+                                 sci(worst_z) + ", tolerance " + sci(kTolZ) + ")");
+            for (double r : {0.0, 0.3, 1.0}) {
+                std::vector<SparseEdgeLinkage> sg(nbk);
+                sg[2] = se_g;
+                std::vector<std::vector<double>> f2, b2v;
+                ChainKernelStats s2;
+                chain_forward_backward(nh, nbk, r, emit_sym, nullptr, f2, b2v, &s2, &sg);
+                for (std::size_t b = 0; b < nbk; ++b) {
+                    double z2 = 0.0;
+                    for (std::size_t k = 0; k < ns; ++k) z2 += f2[b][k] * b2v[b][k];
+                    for (std::size_t i = 0; i < nh; ++i)
+                    for (std::size_t j = 0; j < nh; ++j) {
+                        const std::size_t k = i * nh + j, ks = j * nh + i;
+                        const double p = z2 > 0 ? f2[b][k] * b2v[b][k] / z2 : 0.0;
+                        const double ps = z2 > 0 ? f2[b][ks] * b2v[b][ks] / z2 : 0.0;
+                        worst_swap = std::max(worst_swap, std::abs(p - ps));
+                    }
+                }
+            }
+            ok_(worst_swap <= kTolZ, "homologue swap invariance holds under the grouped edge, on "
+                                    "SYMMETRIC emissions (worst " +
+                                    sci(worst_swap) + ", tolerance " + sci(kTolZ) + ")");
+            // NON-VACUITY: the linkage must actually move a posterior, or every identity above is
+            // an identity between two copies of the linkage-free answer.
+            ok_(max_shift > 1e-6, "linkage MATERIALLY changes a posterior against no edge (max " +
+                                  sci(max_shift) + ")");
+        }
+
+        // MUTATION 1: drop mismatch counts from the signature. Cells differing only by a mismatch
+        // then share a signature, and their deltas must stop agreeing.
+        {
+            std::vector<std::string> jm(NA * NB);
+            for (std::size_t k = 0; k < NA * NB; ++k) {
+                for (const auto& cs : sigs) {
+                    // keep only the insert field of each triple, discarding both edit counts
+                    for (std::size_t j = 0; j + 12 <= cs[k].size(); j += 12)
+                        jm[k].append(&cs[k][j + 8], 4);
+                    jm[k].push_back('|');
+                }
+            }
+            const SignatureMatrix Mm = build_signature_matrix(jm, NA, NB);
+            std::unordered_map<std::string, double> cache;
+            double w = 0.0;
+            for (std::size_t a1 = 0; a1 + 1 < NA; ++a1)
+            for (std::size_t a2 = a1 + 1; a2 < NA; ++a2)
+            for (std::size_t b1 = 0; b1 + 1 < NB; ++b1)
+            for (std::size_t b2 = b1 + 1; b2 < NB; ++b2) {
+                const std::string k = pattern_key(Mm.signature_at(a1, b1), Mm.signature_at(a2, b2),
+                                                  Mm.signature_at(a1, b2), Mm.signature_at(a2, b1),
+                                                  false);
+                const double d = delta_direct(a1, a2, b1, b2, 0);
+                const auto it = cache.find(k);
+                if (it == cache.end()) cache.emplace(k, d);
+                else w = std::max(w, std::abs(it->second - d));
+            }
+            ok_(w > 1e-6, "MUTATION removing mismatch counts BREAKS the equality (worst " +
+                          sci(w) + ", must exceed 1.000e-06)");
+        }
+        // MUTATION 2: merge straight with crossed in the key. The sign gate must then fail.
+        {
+            double w = 0.0;
+            std::unordered_map<std::string, double> cache;
+            for (std::size_t a1 = 0; a1 + 1 < NA; ++a1)
+            for (std::size_t a2 = a1 + 1; a2 < NA; ++a2)
+            for (std::size_t b1 = 0; b1 + 1 < NB; ++b1)
+            for (std::size_t b2 = b1 + 1; b2 < NB; ++b2) {
+                const std::string k = pattern_key(M.signature_at(a1, b1), M.signature_at(a2, b2),
+                                                  M.signature_at(a1, b2), M.signature_at(a2, b1),
+                                                  true);
+                const double d = delta_direct(a1, a2, b1, b2, 0);
+                const auto it = cache.find(k);
+                if (it == cache.end()) cache.emplace(k, d);
+                else w = std::max(w, std::abs(it->second - d));
+            }
+            ok_(w > 1e-6, "MUTATION merging straight with crossed BREAKS the equality (worst " +
+                          sci(w) + ", must exceed 1.000e-06)");
+        }
+        // MUTATION 3: ignore membership entirely -- every cell gets the same signature id, so all
+        // content classes collapse into one pattern.
+        {
+            double w = 0.0; std::size_t np = 0;
+            run(1, false, false, &w, &np);
+            ok_(w > 1e-6 && np == 1,
+                "MUTATION ignoring membership BREAKS the equality (" + std::to_string(np) +
+                " pattern, worst " + sci(w) + ")");
+        }
+        std::printf("grouping selftest: %zu failure(s)\n", fails);
+        return fails == 0 ? 0 : 1;
+    }
+
     // ---- OPERATIONAL WORK BUDGET SELF-TEST ------------------------------------------------------
     // The budget must bound work BEFORE it is done, and exhaustion must be a refusal carrying no
     // mass. A budget checked afterwards, or one that returns a partially enumerated support, is
