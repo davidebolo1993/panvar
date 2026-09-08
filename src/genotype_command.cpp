@@ -1526,17 +1526,34 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 std::ofstream gp(hybrid_geometry_probe);
                 if (!gp) throw std::runtime_error("genotype: cannot write " + hybrid_geometry_probe);
                 gp << "block_a\tblock_b\tn_alleles_a\tn_alleles_b\tvariable_a\tvariable_b"
-                      "\tflank_bp\tok\treason\n";
-                for (std::size_t b = 1; b < blocks.size(); ++b) {
-                    const std::size_t a = b - 1;
+                      "\tflank_bp\tlflank_derived\trflank_derived\tok\treason\n";
+                // ADJACENT VARIABLE PAIRS, which is what ownership actually produces -- not
+                // adjacent physical pairs. They coincide only where every block is variable (C4);
+                // where a fixed backbone separates two bubbles the real edge skips over it, and
+                // probing physical neighbours would miss exactly the edge that carries phase.
+                std::vector<std::size_t> varb;
+                for (std::size_t b = 0; b < blocks.size(); ++b) {
+                    if (blocks[b].n_alleles > 1) varb.push_back(b);
+                }
+                for (std::size_t vi = 1; vi < varb.size(); ++vi) {
+                    const std::size_t a = varb[vi - 1], b = varb[vi];
+                    // Three widths: the production reach, an intermediate one where the REQUEST
+                    // is smaller than the available invariant context (so the cap must bite
+                    // exactly), and zero.
                     for (std::size_t flank : {static_cast<std::size_t>(gip.hi),
+                                              static_cast<std::size_t>(100),
                                               static_cast<std::size_t>(0)}) {
+                        std::vector<char> gvar(blocks.size(), 0);
+                        for (std::size_t q = 0; q < blocks.size(); ++q) {
+                            gvar[q] = blocks[q].n_alleles > 1 ? 1 : 0;
+                        }
                         const LinkageGeometry g2 = build_linkage_geometry(
-                            gcov.frames, ball, static_cast<std::uint32_t>(a),
+                            gcov.frames, ball, gvar, static_cast<std::uint32_t>(a),
                             static_cast<std::uint32_t>(b), flank, gip);
                         gp << a << '\t' << b << '\t' << blocks[a].n_alleles << '\t'
                            << blocks[b].n_alleles << '\t' << (blocks[a].n_alleles > 1 ? 1 : 0)
                            << '\t' << (blocks[b].n_alleles > 1 ? 1 : 0) << '\t' << flank << '\t'
+                           << g2.lflank_bp << '\t' << g2.rflank_bp << '\t'
                            << (g2.ok ? 1 : 0) << '\t'
                            << (g2.refusal.empty() ? "-" : g2.refusal) << '\n';
                     }
@@ -1656,7 +1673,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         es.block_a = kv.first.first; es.block_b = kv.first.second;
                         es.n_fragments = kv.second.size();
                         const LinkageGeometry geom = build_linkage_geometry(
-                            hyb_cov.frames, ballele, es.block_a, es.block_b, FLANK, ip);
+                            hyb_cov.frames, ballele, block_variable, es.block_a, es.block_b,
+                            FLANK, ip);
                         if (!geom.ok) {
                             // THE REASON, kept. Recording only "not-computed" made the first C4
                             // refusal undiagnosable without re-reading the source.

@@ -4213,6 +4213,7 @@ FragmentOwner assign_fragment_owner(const Fragment& fragment,
 
 LinkageGeometry build_linkage_geometry(const std::vector<CandidateFrame>& frames,
                                        const std::vector<std::vector<std::string>>& block_alleles,
+                                       const std::vector<char>& block_variable,
                                        std::uint32_t block_a, std::uint32_t block_b,
                                        std::size_t flank_bp, const InsertPrior& ip) {
     LinkageGeometry g;
@@ -4239,10 +4240,55 @@ LinkageGeometry build_linkage_geometry(const std::vector<CandidateFrame>& frames
     if (ahi > blo) { g.refusal = "blocks overlap or are out of order"; return g; }
     const std::string& w0 = chain_seq[0];
     g.context = w0.substr(ahi, blo - ahi);
-    const std::size_t l0 = alo > flank_bp ? alo - flank_bp : 0;
-    const std::size_t r1 = std::min(w0.size(), bhi + flank_bp);
-    g.lflank = w0.substr(l0, alo - l0);
-    g.rflank = w0.substr(bhi, r1 - bhi);
+
+    // ---- DERIVE THE FLANK LENGTHS -------------------------------------------------------------
+    // Each side is bounded by the nearest EXTERNAL VARIABLE BLOCK (never borrow a third variable as
+    // context) and by the COMMON VERIFIED MAPPED boundary (an accepted partial terminal frame
+    // verifies less than the catalogue holds, and unverified bytes must not become context), then
+    // capped by the requested flank_bp. Zero is a correct derived answer, not a failure.
+    long prev_var = -1, next_var = -1;
+    for (long b = static_cast<long>(block_a) - 1; b >= 0; --b) {
+        if (static_cast<std::size_t>(b) < block_variable.size() && block_variable[b]) {
+            prev_var = b; break;
+        }
+    }
+    for (std::size_t b = block_b + 1; b < block_variable.size(); ++b) {
+        if (block_variable[b]) { next_var = static_cast<long>(b); break; }
+    }
+    std::size_t lmax = flank_bp, rmax = flank_bp;
+    for (std::size_t h = 0; h < frames.size(); ++h) {
+        std::size_t a2 = 0, a3 = 0, b2 = 0, b3 = 0;
+        if (!span(h, block_a, a2, a3) || !span(h, block_b, b2, b3)) {
+            g.refusal = "block absent from candidate " + std::to_string(h);
+            return g;
+        }
+        std::size_t mlo = frames[h].mapped_lo, mhi = frames[h].mapped_hi;
+        if (frames[h].reverse_frame) {
+            const std::size_t n = frames[h].seq.size();
+            const std::size_t t = n - mhi;
+            mhi = n - mlo;
+            mlo = t;
+        }
+        std::size_t lo_limit = mlo, hi_limit = mhi;
+        if (prev_var >= 0) {
+            std::size_t p2 = 0, p3 = 0;
+            if (span(h, static_cast<std::uint32_t>(prev_var), p2, p3)) {
+                lo_limit = std::max(lo_limit, p3);
+            }
+        }
+        if (next_var >= 0) {
+            std::size_t n2 = 0, n3 = 0;
+            if (span(h, static_cast<std::uint32_t>(next_var), n2, n3)) {
+                hi_limit = std::min(hi_limit, n2);
+            }
+        }
+        lmax = std::min(lmax, a2 > lo_limit ? a2 - lo_limit : 0);
+        rmax = std::min(rmax, hi_limit > b3 ? hi_limit - b3 : 0);
+    }
+    g.lflank_bp = lmax;
+    g.rflank_bp = rmax;
+    g.lflank = w0.substr(alo - lmax, lmax);
+    g.rflank = w0.substr(bhi, rmax);
     // THE CONTEXT AND FLANKS MUST AGREE ACROSS EVERY CANDIDATE. Where they do not, this edge is not
     // representable by a pairwise factor and is REFUSED. Guessing one candidate's context would let
     // the factor express a preference that belongs to a block outside it.
@@ -4256,9 +4302,11 @@ LinkageGeometry build_linkage_geometry(const std::vector<CandidateFrame>& frames
         if (wh.substr(a3, b2 - a3) != g.context) {
             g.refusal = "intervening context differs on candidate " + std::to_string(h); return g;
         }
-        const std::size_t h0 = a2 > flank_bp ? a2 - flank_bp : 0;
-        const std::size_t h1 = std::min(wh.size(), b3 + flank_bp);
-        if (wh.substr(h0, a2 - h0) != g.lflank || wh.substr(b3, h1 - b3) != g.rflank) {
+        // THE BYTE COMPARISON REMAINS, though the flank is now derived structurally. "Invariant
+        // per the block catalogue" and "identical in every authoritative walk" should agree; a
+        // disagreement is a refusal, not something to reconcile silently.
+        if (a2 < lmax || wh.substr(a2 - lmax, lmax) != g.lflank ||
+            wh.substr(b3, rmax) != g.rflank) {
             g.refusal = "flank differs on candidate " + std::to_string(h); return g;
         }
     }

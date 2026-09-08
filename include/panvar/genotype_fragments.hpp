@@ -1725,7 +1725,10 @@ struct LinkageGeometry {
     std::uint32_t block_a = 0, block_b = 0;
     std::vector<std::string> alleles_a, alleles_b;
     std::string context, lflank, rflank;
-    std::size_t flank_bp = 0;
+    std::size_t flank_bp = 0;          // the REQUESTED maximum
+    // DERIVED lengths, after both limits are applied. Zero is a correct answer, not a failure: at a
+    // locus whose blocks are all variable there is no invariant sequence to include.
+    std::size_t lflank_bp = 0, rflank_bp = 0;
     // Every window's length, [alpha * n_b + beta]. EXPOSURE LIVES ON THE EDGE, not on a fragment:
     // it is charged once per configuration, and a per-fragment copy makes accidental multiplication
     // by the fragment count easy however loudly the comments forbid it.
@@ -1736,8 +1739,24 @@ struct LinkageGeometry {
     std::string refusal;
 };
 
+// THE FLANK IS DERIVED, not configured. A pairwise A-B factor may include only sequence that is
+// invariant OUTSIDE A and B; a fixed reach borrows the neighbouring variable block and the geometry
+// then correctly refuses. Each side is bounded by BOTH:
+//
+//   * the nearest EXTERNAL VARIABLE BLOCK boundary -- never reach into a third variable;
+//   * the COMMON VERIFIED MAPPED boundary over all frames -- an accepted partial terminal frame
+//     verifies less of its walk than the catalogue holds, and unverified bytes must not become
+//     context.
+//
+// and then capped by `flank_bp`. Adjacent variable blocks therefore derive length ZERO, which is
+// the correct answer rather than a failure.
+//
+// THE BYTE COMPARISON STAYS. "Invariant according to the block catalogue" and "identical in every
+// authoritative walk" should agree; where they do not, that disagreement is a refusal, not something
+// to reconcile silently.
 LinkageGeometry build_linkage_geometry(const std::vector<CandidateFrame>& frames,
                                        const std::vector<std::vector<std::string>>& block_alleles,
+                                       const std::vector<char>& block_variable,
                                        std::uint32_t block_a, std::uint32_t block_b,
                                        std::size_t flank_bp, const InsertPrior& ip);
 

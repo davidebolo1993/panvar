@@ -1699,8 +1699,12 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                   "\tswap_asymmetry\tusable\tstatus\texposure_asym\n";
             std::size_t emitted = 0, refused = 0;
             for (const auto& kv : by_edge) {
+                std::vector<char> gvar(blocks.size(), 0);
+                for (std::size_t q = 0; q < blocks.size(); ++q) {
+                    gvar[q] = blocks[q].n_alleles > 1 ? 1 : 0;
+                }
                 const LinkageGeometry geom = build_linkage_geometry(
-                    frames, ballele, kv.first.first, kv.first.second, FLANK, ip_o);
+                    frames, ballele, gvar, kv.first.first, kv.first.second, FLANK, ip_o);
                 if (!geom.ok) {
                     refused += kv.second.size();
                     log.info("edge " + std::to_string(kv.first.first) + "-" +

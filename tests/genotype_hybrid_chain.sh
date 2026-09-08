@@ -491,6 +491,118 @@ else
 fi
 
 # ---------------------------------------------------------------------------------------------
+# GATE 25: THE DERIVED INVARIANT FLANK. A pairwise A-B factor may include only sequence that is
+# invariant OUTSIDE A and B. A fixed reach borrows the neighbouring variable block, and the geometry
+# then correctly refuses -- which is what refused every C4 edge once orientation was fixed. Each side
+# is bounded by BOTH the nearest external VARIABLE boundary and the COMMON VERIFIED MAPPED boundary
+# (a partial terminal frame verifies less than the catalogue holds), then capped by the request.
+#
+# THE FIXTURE has three bubbles separated by GENUINE backbone blocks, so invariant sequence exists
+# outside the scored pair -- every earlier fixture had its variable blocks spanning to the chain
+# ends, where the derived flank is zero for a structural reason and proves nothing about the cap.
+"$PY" - "$OUT" <<'PYEOFL'
+import sys, random
+out = sys.argv[1]; B = "ACGT"
+def seq(n, s):
+    r = random.Random(s); return "".join(r.choice(B) for _ in range(n))
+def mut(s, k, sd):
+    r = random.Random(sd); s = list(s)
+    for p in r.sample(range(len(s)), k): s[p] = r.choice([c for c in B if c != s[p]])
+    return "".join(s)
+X = seq(1500,1); A = seq(400,2); Bb = mut(A,60,3)
+S1 = seq(20,11); M1 = seq(150,4); S2 = seq(20,12)
+C = seq(400,5); D = mut(C,60,6)
+S3 = seq(20,13); M2 = seq(300,7); S4 = seq(20,14)
+E = seq(400,8); F = mut(E,60,9); Z = seq(1500,10)
+segs = [("1",X),("2",A),("3",Bb),("4",S1),("5",M1),("6",S2),("7",C),("8",D),
+        ("9",S3),("10",M2),("11",S4),("12",E),("13",F),("14",Z)]
+links = [("1","2"),("1","3"),("2","4"),("3","4"),("4","5"),("5","6"),("6","7"),("6","8"),
+         ("7","9"),("8","9"),("9","10"),("10","11"),("11","12"),("11","13"),("12","14"),("13","14")]
+paths = {"h1":["1","2","4","5","6","7","9","10","11","12","14"],
+         "h2":["1","3","4","5","6","8","9","10","11","13","14"],
+         "h3":["1","2","4","5","6","8","9","10","11","12","14"],
+         "h4":["1","3","4","5","6","7","9","10","11","13","14"]}
+d = dict(segs)
+for tag, extra in (("fl", None), ("fx", "13")):
+    with open("%s/%s.gfa" % (out, tag), "w") as g:
+        g.write("H\tVN:Z:1.0\n")
+        for n, x in segs:
+            if extra is not None and n == extra:
+                x = "".join(("A" if c != "A" else "T") if i % 7 == 0 else c
+                            for i, c in enumerate(x))
+            g.write("S\t%s\t%s\n" % (n, x))
+        for a, b in links: g.write("L\t%s\t+\t%s\t+\t0M\n" % (a, b))
+        for n, st in paths.items(): g.write("P\t%s\t%s\t*\n" % (n, ",".join(y+"+" for y in st)))
+comp = {"A":"T","C":"G","G":"C","T":"A"}
+h = "".join(d[x] for x in paths["h1"])
+k = 0
+with open(out+"/fl.r1.fq","w") as f1, open(out+"/fl.r2.fq","w") as f2:
+    for i in range(0, len(h)-360, 8):
+        a = h[i:i+150]; b = h[i+200:i+350]
+        if len(b) < 150: break
+        rc = "".join(comp[c] for c in reversed(b))
+        f1.write("@f%d/1\n%s\n+\n%s\n" % (k, a, "I"*150))
+        f2.write("@f%d/2\n%s\n+\n%s\n" % (k, rc, "I"*150)); k += 1
+open(out+"/fl.sizes.txt","w").write("%d %d" % (len(M1), len(M2)))
+PYEOFL
+for TAG in fl fx; do
+  "$BIN" bubble -i "$OUT/$TAG.gfa" -r h1 -o "$OUT/$TAG.b" --min-variant-bp 0 -q >/dev/null 2>&1
+  "$BIN" genotype -i "$OUT/$TAG.b.sorted.gfa" -b "$OUT/$TAG.b" -r h1 -o "$OUT/$TAG.g" \
+    -R "$OUT/fl.r1.fq" -R "$OUT/fl.r2.fq" --fragment-len 350 \
+    --hybrid-geometry-probe "$OUT/$TAG.geom.tsv" -q >/dev/null 2>&1
+done
+if [ -s "$OUT/fl.geom.tsv" ] && [ -s "$OUT/fx.geom.tsv" ]; then
+  "$PY" - "$OUT/fl.geom.tsv" "$OUT/fx.geom.tsv" "$OUT/fl.sizes.txt" <<'PYEOFM'
+import sys
+def load(p):
+    return [l.rstrip("\n").split("\t") for l in open(p)][1:]
+A, Bx = load(sys.argv[1]), load(sys.argv[2])
+m1, m2 = (int(x) for x in open(sys.argv[3]).read().split())
+bad = 0
+def ok(m): print("  ok   " + m)
+def no(m):
+    global bad; bad += 1; print("  FAIL " + m)
+def row(rows, a, b, fl):
+    for r in rows:
+        if int(r[0]) == a and int(r[1]) == b and int(r[6]) == fl: return r
+    return None
+if any(r[9] != "1" for r in A):
+    no("some edge refuses geometry: %s" % [(r[0], r[1], r[6], r[10]) for r in A if r[9] != "1"])
+else:
+    ok("every adjacent-variable edge builds geometry at all requested widths")
+# EXTERNAL invariant block contributes real context, bounded by the next variable.
+r = row(A, 1, 3, 550)
+if r and int(r[8]) == m2: ok("external invariant block contributes exactly %d bp of right flank" % m2)
+else: no("edge 1-3 right flank is %s, expected %d" % (r[8] if r else "?", m2))
+r = row(A, 3, 5, 550)
+if r and int(r[7]) == m1: ok("external invariant block contributes exactly %d bp of left flank" % m1)
+else: no("edge 3-5 left flank is %s, expected %d" % (r[7] if r else "?", m1))
+# ADJACENT to the chain end -> derived zero, for a structural reason.
+r = row(A, 1, 3, 550)
+if r and int(r[7]) == 0: ok("no invariant sequence available on the outer side -> derived flank 0")
+else: no("edge 1-3 left flank is %s, expected 0" % (r[7] if r else "?"))
+# REQUEST SMALLER THAN AVAILABLE -> exactly the request.
+r = row(A, 1, 3, 100)
+if r and int(r[8]) == 100: ok("a request of 100 below the available %d yields exactly 100" % m2)
+else: no("capped right flank is %s, expected 100" % (r[8] if r else "?"))
+r = row(A, 3, 5, 100)
+if r and int(r[7]) == 100: ok("a request of 100 below the available %d yields exactly 100" % m1)
+else: no("capped left flank is %s, expected 100" % (r[7] if r else "?"))
+# CHANGING AN EXTERNAL VARIABLE ALLELE must not touch A-B geometry.
+p, q = row(A, 1, 3, 550), row(Bx, 1, 3, 550)
+if p and q and p[7:10] == q[7:10]:
+    ok("mutating an EXTERNAL variable allele leaves edge 1-3 geometry unchanged (%s/%s)"
+       % (p[7], p[8]))
+else:
+    no("external allele change altered edge 1-3 geometry: %s vs %s"
+       % (p[7:10] if p else "?", q[7:10] if q else "?"))
+sys.exit(bad)
+PYEOFM
+  fails=$(( fails + $? ))
+else
+  bad "the derived-flank fixture produced no geometry probe"
+fi
+# ---------------------------------------------------------------------------------------------
 # GATE 24: CHAIN ORIENTATION. A candidate's walk may run ANTIPARALLEL to the chain; its bytes are
 # then the reverse complement of the reference-oriented sequence and its block spans run backwards.
 # Anything comparing sequence or ordering intervals across candidates must work in CHAIN
@@ -557,7 +669,11 @@ PYEOFK
   "$BIN" genotype -i "$OUT/brc.sorted.gfa" -b "$OUT/brc" -r hapAA -o "$OUT/grc" \
     -R "$OUT/r1.fq" -R "$OUT/r2.fq" --fragment-len 350 \
     --hybrid-geometry-probe "$OUT/geom_rc.tsv" -q >/dev/null 2>&1
-  GOK=$(awk -F'\t' '$1==1 && $2==2 && $7==0 {print $8}' "$OUT/geom_rc.tsv" 2>/dev/null)
+  # COLUMN LOOKED UP BY NAME. This read column 8 by position and silently started reading
+  # lflank_derived when the derived-flank columns were added -- the same staleness that made the
+  # psi mean/sum check report a phantom failure.
+  GOK=$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++) if($i=="ok") c=i; next}
+                     $1==1 && $2==2 && $7==0 {print $c}' "$OUT/geom_rc.tsv" 2>/dev/null)
   [ "${GOK:-0}" = "1" ] \
     && ok "linkage geometry builds across the variable pair on a mixed-orientation panel" \
     || bad "geometry still refuses the variable pair on a mixed panel (ok=${GOK:-none})"
