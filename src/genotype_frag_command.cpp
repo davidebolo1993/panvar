@@ -341,6 +341,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     bool hybrid_oracle = false;
     bool mapping_selftest = false;
     bool support_selftest = false;
+    bool coordinate_selftest = false;
     bool completeness_selftest = false;
     bool activation_selftest = false;
     std::vector<std::string> reconcile_scope;
@@ -396,6 +397,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--hybrid-oracle") hybrid_oracle = true;
         else if (a == "--mapping-selftest") mapping_selftest = true;
         else if (a == "--support-selftest") support_selftest = true;
+        else if (a == "--coordinate-selftest") coordinate_selftest = true;
         else if (a == "--completeness-selftest") completeness_selftest = true;
         else if (a == "--activation-selftest") activation_selftest = true;
         else if (a == "--scope-tol") {
@@ -660,7 +662,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         spell_pair.empty() && ref_block.empty() && ref_block_pair.empty() &&
         origin_universe.empty() && reconcile_scope.empty() && !linkage_selftest &&
         !hybrid_oracle && !mapping_selftest && !completeness_selftest && !activation_selftest &&
-        !support_selftest) {
+        !support_selftest && !coordinate_selftest) {
         throw std::runtime_error("genotype-frag requires at least one --reads");
     }
     if (!bubble_prefix_in.empty()) {
@@ -693,6 +695,127 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     ParseGfaOptions parse_options;
     parse_options.include_paths = true;
     parse_options.include_sequences = true;
+    // ---- COORDINATE VALIDATION SELF-TEST -------------------------------------------------------
+    // The derived start is the one thing direct verification cannot recover from being wrong: a
+    // misplaced coordinate does not fail loudly, it silently verifies the wrong bases and drops the
+    // placement. So check the coordinate itself, three ways.
+    if (coordinate_selftest) {
+        std::size_t fails = 0;
+        const auto ok_ = [&](bool c, const char* what) {
+            std::printf("%s\t%s\n", c ? "ok" : "FAIL", what);
+            if (!c) ++fails;
+        };
+        std::mt19937_64 rng(20260908);
+        const auto rseq = [&](std::size_t n) {
+            static const char* B = "ACGT";
+            std::string t(n, 'A');
+            for (std::size_t i = 0; i < n; ++i) t[i] = B[rng() & 3];
+            return t;
+        };
+        const auto geom_of = [&](const std::vector<std::string>& A,
+                                 const std::vector<std::string>& Bv, const std::string& ctx,
+                                 const std::string& lf, const std::string& rf) {
+            LinkageGeometry g;
+            g.block_a = 0; g.block_b = 1;
+            g.alleles_a = A; g.alleles_b = Bv; g.context = ctx; g.lflank = lf; g.rflank = rf;
+            g.window_len.assign(A.size() * Bv.size(), 0);
+            g.exposure.assign(A.size() * Bv.size(), 1000.0);
+            g.exposure_affine = true; g.ok = true;
+            return g;
+        };
+
+        // (1) THE VIEW AND THE STRING AGREE. materialize() is the oracle's window; base_at() is the
+        // verifier's. If these ever diverge the two paths silently score different sequence.
+        {
+            const auto g = geom_of({rseq(40), rseq(400)}, {rseq(90), rseq(7)}, rseq(30),
+                                   rseq(600), rseq(600));
+            bool same = true;
+            for (std::uint32_t al = 0; al < 2 && same; ++al) {
+                for (std::uint32_t be = 0; be < 2 && same; ++be) {
+                    VirtualWindow vw; vw.geom = &g; vw.alpha = al; vw.beta = be;
+                    const std::string m = vw.materialize();
+                    if (m.size() != vw.size()) { same = false; break; }
+                    for (std::size_t i = 0; i < m.size(); ++i)
+                        if (m[i] != vw.base_at(i)) { same = false; break; }
+                }
+            }
+            ok_(same, "base_at agrees with materialize on every position of every window");
+        }
+
+        // (2) THE LENGTH SHIFT, isolated. One B allele, two A alleles differing greatly in length,
+        // and a read planted INSIDE B. The two derived starts must differ by exactly |A2|-|A1| --
+        // that shift is the whole positional content of a B-side seed.
+        {
+            const std::string A1 = rseq(50), A2 = rseq(950);
+            const auto g = geom_of({A1, A2}, {rseq(500)}, rseq(40), rseq(700), rseq(700));
+            const std::size_t piece = 16;
+            const auto ix = build_allele_product_index(g, piece);
+            VirtualWindow w1; w1.geom = &g; w1.alpha = 0; w1.beta = 0;
+            VirtualWindow w2; w2.geom = &g; w2.alpha = 1; w2.beta = 0;
+            // A 150 bp read wholly inside B of window (alpha=0), and the SAME sequence inside
+            // window (alpha=1), where it sits |A2|-|A1| further along.
+            const std::size_t inb = g.lflank.size() + A1.size() + g.context.size() + 120;
+            std::string read;
+            for (std::size_t i = 0; i < 150; ++i) read.push_back(w1.base_at(inb + i));
+            Fragment f; f.name = "c";
+            f.r1 = read;
+            std::string tail;
+            for (std::size_t i = 0; i < 150; ++i) tail.push_back(w1.base_at(inb + 200 + i));
+            f.r2 = reverse_complement(tail);
+            InsertPrior ip; ip.lo = 200; ip.hi = 600;
+            ip.logp.assign(static_cast<std::size_t>(ip.hi - ip.lo + 1),
+                              -std::log(static_cast<double>(ip.hi - ip.lo + 1)));
+            const auto sup = propose_allele_pairs(f, g, ip, 0.05, &ix);
+            long s0 = -1, s1 = -1;
+            for (const auto& st : sup.mate_states[0]) {
+                const std::uint32_t al = static_cast<std::uint32_t>(st.first >> 32);
+                if (al == 0 && w1.count_mismatches(f.r1, st.second, 0) == 0) s0 = st.second;
+                if (al == 1 && w2.count_mismatches(f.r1, st.second, 0) == 0) s1 = st.second;
+            }
+            ok_(s0 == static_cast<long>(inb), "the B-side read verifies at its planted start");
+            ok_(s1 >= 0 && s1 - s0 == static_cast<long>(A2.size()) - static_cast<long>(A1.size()),
+                "the two derived B starts differ by exactly |A2| - |A1|");
+        }
+
+        // (3) THE SEED INVARIANT ON REAL PROPOSALS: at every proposed start that verifies, the
+        // window content under the read equals the read. Checked through the view, on a geometry
+        // with an EMPTY allele -- the case the previous six-map index could not seed at all.
+        {
+            const std::string A1 = rseq(60);
+            const auto g = geom_of({A1, ""}, {rseq(80), rseq(3)}, rseq(25), rseq(500), rseq(500));
+            const std::size_t piece = 16;
+            const auto ix = build_allele_product_index(g, piece);
+            ok_(ix.ok && ix.complete, "an empty allele still yields a COMPLETE index");
+            VirtualWindow w; w.geom = &g; w.alpha = 1; w.beta = 1;   // empty A, short B
+            const std::size_t at = g.lflank.size() - 40;             // spans L, (empty A), C, B, R
+            std::string read;
+            for (std::size_t i = 0; i < 150; ++i) read.push_back(w.base_at(at + i));
+            Fragment f; f.name = "e"; f.r1 = read;
+            std::string tail;
+            for (std::size_t i = 0; i < 150; ++i) tail.push_back(w.base_at(at + 200 + i));
+            f.r2 = reverse_complement(tail);
+            InsertPrior ip; ip.lo = 200; ip.hi = 600;
+            ip.logp.assign(static_cast<std::size_t>(ip.hi - ip.lo + 1),
+                              -std::log(static_cast<double>(ip.hi - ip.lo + 1)));
+            const auto sup = propose_allele_pairs(f, g, ip, 0.05, &ix);
+            bool found = false, all_consistent = true;
+            for (const auto& st : sup.mate_states[0]) {
+                const std::uint32_t al = static_cast<std::uint32_t>(st.first >> 32);
+                const std::uint32_t be = static_cast<std::uint32_t>(st.first & 0xFFFFFFFFu);
+                VirtualWindow v; v.geom = &g; v.alpha = al; v.beta = be;
+                if (v.count_mismatches(f.r1, st.second, 0) != 0) continue;
+                for (std::size_t i = 0; i < f.r1.size(); ++i)
+                    if (v.base_at(static_cast<std::size_t>(st.second) + i) != f.r1[i])
+                        all_consistent = false;
+                if (al == 1 && be == 1 && st.second == static_cast<long>(at)) found = true;
+            }
+            ok_(found, "a read spanning an EMPTY allele is seeded at its true start");
+            ok_(all_consistent, "window content under every verified start equals the read");
+        }
+        std::printf("coordinate selftest: %zu failure(s)\n", fails);
+        return fails == 0 ? 0 : 1;
+    }
+
     // ---- ALLELE-PRODUCT SUPPORT SEARCH SELF-TEST ------------------------------------------------
     // The support-restricted emission must equal the DENSE ORACLE cell for cell: same finite cells,
     // same log mass, same informative classification. Not "the same phase call" -- that would pass
@@ -702,7 +825,9 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         // verification and into tuple construction or joining rather than disappearing.
         std::printf("case\tn_a\tn_b\tdense_pairs\tproposed\tverified\tseed_occurrences"
                     "\tfallback\tcells_differ\tworst_mass_diff\tfinite_dense\tfinite_supported"
-                    "\tinformative_match\treduction\tstates_before\tstates_after\tfr_joins\n");
+                    "\tinformative_match\treduction\tseed_start_proposals\tunique_seed_starts"
+                    "\tseed_compatible_joins\tfull_read_verifications\taccepted_mate_placements"
+                    "\tverified_fr_states\tfinite_emission_cells\n");
         std::mt19937_64 rng(20260908);
         const auto rseq = [&](std::size_t n) {
             static const char* B = "ACGT";
@@ -746,14 +871,16 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             const std::size_t ver = sup.exhaustive_fallback ? sup.dense_pairs
                                                             : sup.proposals.size();
             std::printf("%s\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t%d\t%zu\t%.3g\t%zu\t%zu"
-                        "\t%d\t%.2f\t%zu\t%zu\t%zu\n",
+                        "\t%d\t%.2f\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t%zu\n",
                         name, D.n_a, D.n_b, sup.dense_pairs, sup.proposed_states, ver,
                         sup.seed_occurrences, sup.exhaustive_fallback ? 1 : 0,
                         differ, worst, fin_d, fin_s,
                         D.informative == S2.informative ? 1 : 0,
                         ver == 0 ? 0.0 : static_cast<double>(sup.dense_pairs) / ver,
-                        sup.positional_states_before_dedup, sup.positional_states_after_dedup,
-                        sup.valid_fr_joins);
+                        sup.seed_start_proposals, sup.unique_seed_starts,
+                        sup.seed_compatible_joins, S2.full_read_verifications,
+                        S2.accepted_mate_placements, S2.verified_fr_states,
+                        S2.finite_emission_cells);
         };
         const auto geom_of = [&](const std::vector<std::string>& A,
                                  const std::vector<std::string>& Bv, const std::string& ctx,

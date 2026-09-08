@@ -380,6 +380,9 @@ int run_genotype_command(const std::vector<std::string>& args) {
         std::string status;
         // The SUPPORT SEARCH's own counters, distinct from the dense baseline.
         std::size_t seed_hits = 0, proposed = 0, verified = 0, dense_windows = 0, fallbacks = 0;
+        // Direct verification's own work, which is what production now pays: whole reads checked
+        // at seeded starts, and the emission cells that came out finite.
+        std::size_t read_verifications = 0, finite_cells = 0;
     };
     std::vector<EdgeRow> edge_rows;
     std::string hybrid_status_path;
@@ -1780,7 +1783,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         ems.reserve(kv.second.size());
                         std::size_t n_inform = 0;
                         std::size_t e_seed_hits = 0, e_proposed = 0, e_verified = 0,
-                                    e_dense = 0, e_fallback = 0;
+                                    e_dense = 0, e_fallback = 0, e_reads = 0, e_finite = 0;
                         for (std::size_t fi : kv.second) {
                             const std::size_t len = hf[fi].bases();
                             const std::size_t be = static_cast<std::size_t>(
@@ -1801,6 +1804,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             e_verified += sup.exhaustive_fallback ? sup.dense_pairs
                                                                   : sup.proposals.size();
                             e_dense += sup.dense_pairs;
+                            e_reads += ems.back().full_read_verifications;
+                            e_finite += ems.back().finite_emission_cells;
                             if (sup.exhaustive_fallback) ++e_fallback;
                         }
                         const auto t_build = std::chrono::steady_clock::now();
@@ -1819,8 +1824,10 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                  std::to_string(kv.second.size()) + " frags, " +
                                  std::to_string(e_verified) + " verified of " +
                                  std::to_string(e_dense) + " dense, " +
-                                 std::to_string(e_fallback) + " fallbacks, idx=" +
-                                 (aidx.ok ? "ok" : "none") + ", " +
+                                 std::to_string(e_fallback) + " fallbacks, " +
+                                 std::to_string(e_reads) + " read checks -> " +
+                                 std::to_string(e_finite) + " finite cells, idx=" +
+                                 (aidx.ok ? (aidx.complete ? "ok" : "incomplete") : "none") + ", " +
                                  std::to_string(build_s) + " s");
                         es.status = E.status;
                         // PER-EDGE MEASUREMENT, from the production build itself rather than a
@@ -1832,7 +1839,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             E.support_cells, E.stored_classes, E.predicted_classes,
                             E.theoretical_configs, E.bytes_total(), build_s,
                             linkage_status_name(E.status), e_seed_hits, e_proposed, e_verified,
-                            e_dense, e_fallback});
+                            e_dense, e_fallback, e_reads, e_finite});
                         edge_status.push_back(es);
                         if (E.usable()) edge_map.emplace(kv.first, std::move(E));
                         // A BUDGET ON THE WORK PRODUCTION ACTUALLY DOES: windows verified, summed
@@ -1884,7 +1891,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
                           "\tinformative_fragments\tsupport_cells\tstored_classes"
                           "\tpredicted_classes\ttheoretical_configs\tsparse_bytes"
                           "\tbuild_seconds\tstatus\tseed_hits\tproposed_states"
-                          "\tverified_windows\tdense_windows\tfallbacks\treduction\n";
+                          "\tverified_windows\tdense_windows\tfallbacks"
+                          "\tread_verifications\tfinite_cells\treduction\n";
                     std::size_t tot_stored = 0, tot_bytes = 0, tot_support = 0, usable = 0;
                     double tot_build = 0.0;
                     for (const EdgeRow& r : edge_rows) {
@@ -1894,6 +1902,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                            << r.bytes << '\t' << r.build_s << '\t' << r.status << '\t'
                            << r.seed_hits << '\t' << r.proposed << '\t' << r.verified << '\t'
                            << r.dense_windows << '\t' << r.fallbacks << '\t'
+                           << r.read_verifications << '\t' << r.finite_cells << '\t'
                            << (r.verified ? static_cast<double>(r.dense_windows) / r.verified : 0.0)
                            << '\n';
                         tot_stored += r.stored; tot_bytes += r.bytes; tot_support += r.support;

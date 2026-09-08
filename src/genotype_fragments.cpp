@@ -4390,6 +4390,45 @@ void index_all_positions(const std::string& seq, std::size_t piece, std::uint32_
 
 }  // namespace
 
+std::size_t VirtualWindow::size() const {
+    if (geom == nullptr) return 0;
+    return geom->lflank.size() + geom->alleles_a[alpha].size() + geom->context.size() +
+           geom->alleles_b[beta].size() + geom->rflank.size();
+}
+
+char VirtualWindow::base_at(std::size_t pos) const {
+    const std::size_t lL = geom->lflank.size();
+    if (pos < lL) return geom->lflank[pos];
+    pos -= lL;
+    const std::string& A = geom->alleles_a[alpha];
+    if (pos < A.size()) return A[pos];
+    pos -= A.size();
+    if (pos < geom->context.size()) return geom->context[pos];
+    pos -= geom->context.size();
+    const std::string& B = geom->alleles_b[beta];
+    if (pos < B.size()) return B[pos];
+    pos -= B.size();
+    return geom->rflank[pos];
+}
+
+std::size_t VirtualWindow::count_mismatches(const std::string& read, long start,
+                                            std::size_t cap) const {
+    const std::size_t n = size();
+    if (start < 0 || static_cast<std::size_t>(start) + read.size() > n) return cap + 1;
+    std::size_t mm = 0;
+    for (std::size_t i = 0; i < read.size(); ++i) {
+        if (base_at(static_cast<std::size_t>(start) + i) != read[i]) {
+            if (++mm > cap) return mm;   // give up as soon as the band is exceeded
+        }
+    }
+    return mm;
+}
+
+std::string VirtualWindow::materialize() const {
+    return geom->lflank + geom->alleles_a[alpha] + geom->context + geom->alleles_b[beta] +
+           geom->rflank;
+}
+
 AlleleProductIndex build_allele_product_index(const LinkageGeometry& geom, std::size_t piece) {
     AlleleProductIndex ix;
     ix.piece = piece;
@@ -4414,37 +4453,26 @@ AlleleProductIndex build_allele_product_index(const LinkageGeometry& geom, std::
             into[code].push_back(static_cast<std::uint32_t>(at));
         }
     };
-    for (std::uint32_t al = 0; al < geom.alleles_a.size(); ++al) {
-        index_into(geom.alleles_a[al], al, ix.in_a);
-    }
-    for (std::uint32_t be = 0; be < geom.alleles_b.size(); ++be) {
-        index_into(geom.alleles_b[be], be, ix.in_b);
-    }
     index_plain(geom.lflank, ix.in_l);
     index_plain(geom.context, ix.in_c);
     index_plain(geom.rflank, ix.in_r);
-    // BOUNDARY NEIGHBOURHOODS, only as wide as a piece requires. Kept in their own maps because the
-    // offset inside a boundary string is not an offset inside the allele, and conflating the two
-    // would put the derived start in the wrong place.
+    // ALLELE CONTEXTS. One string per allele, wide enough that every piece TOUCHING that allele
+    // falls inside it: a piece touching A starts no earlier than |L|-(p-1) and, when the context is
+    // at least p-1 long, ends no later than |L|+|A|+(p-1).
     const auto tail = [&](const std::string& x, std::size_t n) {
         return x.size() <= n ? x : x.substr(x.size() - n);
     };
     const auto head = [&](const std::string& x, std::size_t n) {
         return x.size() <= n ? x : x.substr(0, n);
     };
-    if (piece > 1) {
-        for (std::uint32_t al = 0; al < geom.alleles_a.size(); ++al) {
-            index_into(tail(geom.lflank, piece - 1) + head(geom.alleles_a[al], piece - 1), al,
-                       ix.la_bound);
-            index_into(tail(geom.alleles_a[al], piece - 1) + head(geom.context, piece - 1), al,
-                       ix.ac_bound);
-        }
-        for (std::uint32_t be = 0; be < geom.alleles_b.size(); ++be) {
-            index_into(tail(geom.context, piece - 1) + head(geom.alleles_b[be], piece - 1), be,
-                       ix.cb_bound);
-            index_into(tail(geom.alleles_b[be], piece - 1) + head(geom.rflank, piece - 1), be,
-                       ix.br_bound);
-        }
+    const std::size_t back = piece - 1;
+    for (std::uint32_t al = 0; al < geom.alleles_a.size(); ++al) {
+        index_into(tail(geom.lflank, back) + geom.alleles_a[al] + head(geom.context, back), al,
+                   ix.a_ctx);
+    }
+    for (std::uint32_t be = 0; be < geom.alleles_b.size(); ++be) {
+        index_into(tail(geom.context, back) + geom.alleles_b[be] + head(geom.rflank, back), be,
+                   ix.b_ctx);
     }
     // THE DIRECT A->B JUNCTION, split at every interior point. The two sides are looked up
     // separately and their PRODUCT is proposed -- which keeps the alpha-beta correlation that
@@ -4466,6 +4494,16 @@ AlleleProductIndex build_allele_product_index(const LinkageGeometry& geom, std::
             }
         }
     }
+    // THE COMPLETENESS PREDICATE, stated as the span shape it excludes. A piece that touches L and
+    // reaches past C into B needs |A_alpha| + |C| < p - 1; symmetrically on the right. Everything
+    // else is reachable: inside one component, inside an allele context, or across the A->B
+    // junction above (which requires the piece to start in A and end in B, both guaranteed there).
+    ix.complete = true;
+    const std::size_t lC = geom.context.size();
+    for (const std::string& A : geom.alleles_a)
+        if (A.size() + lC < piece - 1) ix.complete = false;
+    for (const std::string& B : geom.alleles_b)
+        if (lC + B.size() < piece - 1) ix.complete = false;
     ix.ok = true;
     return ix;
 }
@@ -4480,7 +4518,11 @@ AlleleProductSupport propose_allele_pairs(const Fragment& fragment, const Linkag
         S.exhaustive_fallback = true;
         return S;
     }
-    if (index == nullptr || !index->ok) { S.exhaustive_fallback = true; return S; }
+    if (index == nullptr || !index->ok || !index->complete) {
+        // An incomplete index cannot be verified against: a piece it cannot reach is a placement
+        // the direct verifier would silently never test.
+        S.exhaustive_fallback = true; return S;
+    }
     const std::size_t d1 = mate_band_edits(max_divergence, fragment.r1.size());
     const std::size_t d2 = mate_band_edits(max_divergence, fragment.r2.size());
     const std::string rc1 = reverse_complement(fragment.r1), rc2 = reverse_complement(fragment.r2);
@@ -4557,79 +4599,33 @@ AlleleProductSupport propose_allele_pairs(const Fragment& fragment, const Linkag
                     }
                 }
             }
-            // --- inside A: constrains alpha, beta free ----------------------------------------
+            // --- the A context: constrains alpha, beta free -----------------------------
+            // The context string starts at window  |L| - min(|L|, p-1), which does NOT depend on
+            // alpha: everything left of A is invariant. What depends on alpha is the B side below.
             {
-                const auto it = index->in_a.find(code);
-                if (it != index->in_a.end()) {
+                const auto it = index->a_ctx.find(code);
+                if (it != index->a_ctx.end()) {
                     S.seed_occurrences += it->second.size();
+                    const long base = static_cast<long>(lL - std::min(lL, p - 1));
                     for (const AlleleSeedHit& h : it->second) {
-                        const long st = static_cast<long>(lL + h.offset) - back;
+                        const long st = base + static_cast<long>(h.offset) - back;
                         for (std::uint32_t y = 0; y < nb; ++y) out.emplace_back(key(h.allele, y), st);
                     }
                 }
             }
-            // --- inside B: constrains beta; its coordinate still depends on |A_alpha| ---------
+            // --- the B context: constrains beta; its coordinate SHIFTS by |A_alpha| ------------
+            // This shift is the discrimination the positional search adds over a set of flags. It
+            // cancels in the insert length when both mates sit inside B, so proposing every pair
+            // there is a genuine answer, not a lost filter.
             {
-                const auto it = index->in_b.find(code);
-                if (it != index->in_b.end()) {
+                const auto it = index->b_ctx.find(code);
+                if (it != index->b_ctx.end()) {
                     S.seed_occurrences += it->second.size();
+                    const long base = static_cast<long>(lL + lC - std::min(lC, p - 1));
                     for (const AlleleSeedHit& h : it->second) {
                         for (std::uint32_t x = 0; x < na; ++x) {
-                            const long st = static_cast<long>(
-                                lL + geom.alleles_a[x].size() + lC + h.offset) - back;
-                            out.emplace_back(key(x, h.allele), st);
-                        }
-                    }
-                }
-            }
-            // --- boundaries ------------------------------------------------------------------
-            {
-                const std::size_t lt = std::min(lL, p - 1);
-                const auto it = index->la_bound.find(code);
-                if (it != index->la_bound.end()) {
-                    S.seed_occurrences += it->second.size();
-                    for (const AlleleSeedHit& h : it->second) {
-                        const long st = static_cast<long>(lL - lt + h.offset) - back;
-                        for (std::uint32_t y = 0; y < nb; ++y) out.emplace_back(key(h.allele, y), st);
-                    }
-                }
-            }
-            {
-                const auto it = index->ac_bound.find(code);
-                if (it != index->ac_bound.end()) {
-                    S.seed_occurrences += it->second.size();
-                    for (const AlleleSeedHit& h : it->second) {
-                        const std::size_t at = std::min(geom.alleles_a[h.allele].size(), p - 1);
-                        const long st = static_cast<long>(
-                            lL + geom.alleles_a[h.allele].size() - at + h.offset) - back;
-                        for (std::uint32_t y = 0; y < nb; ++y) out.emplace_back(key(h.allele, y), st);
-                    }
-                }
-            }
-            {
-                const std::size_t ct = std::min(lC, p - 1);
-                const auto it = index->cb_bound.find(code);
-                if (it != index->cb_bound.end()) {
-                    S.seed_occurrences += it->second.size();
-                    for (const AlleleSeedHit& h : it->second) {
-                        for (std::uint32_t x = 0; x < na; ++x) {
-                            const long st = static_cast<long>(
-                                lL + geom.alleles_a[x].size() + lC - ct + h.offset) - back;
-                            out.emplace_back(key(x, h.allele), st);
-                        }
-                    }
-                }
-            }
-            {
-                const auto it = index->br_bound.find(code);
-                if (it != index->br_bound.end()) {
-                    S.seed_occurrences += it->second.size();
-                    for (const AlleleSeedHit& h : it->second) {
-                        const std::size_t bt = std::min(geom.alleles_b[h.allele].size(), p - 1);
-                        for (std::uint32_t x = 0; x < na; ++x) {
-                            const long st = static_cast<long>(
-                                lL + geom.alleles_a[x].size() + lC +
-                                geom.alleles_b[h.allele].size() - bt + h.offset) - back;
+                            const long st = base + static_cast<long>(geom.alleles_a[x].size()) +
+                                            static_cast<long>(h.offset) - back;
                             out.emplace_back(key(x, h.allele), st);
                         }
                     }
@@ -4665,9 +4661,11 @@ AlleleProductSupport propose_allele_pairs(const Fragment& fragment, const Linkag
             }
         }
         S.positional_states_before_dedup += out.size();
+        S.seed_start_proposals += out.size();
         std::sort(out.begin(), out.end());
         out.erase(std::unique(out.begin(), out.end()), out.end());
         S.positional_states_after_dedup += out.size();
+        S.unique_seed_starts += out.size();
     }
 
     // THE VALID-FR JOIN, per orientation, applied BEFORE the pair set is formed. Intersecting mate
@@ -4692,7 +4690,7 @@ AlleleProductSupport propose_allele_pairs(const Fragment& fragment, const Linkag
                     const long rev_end = rev[b].second + static_cast<long>(rev_len) - 1;
                     // THE SHARED RULE, not a second copy of it.
                     if (valid_fr_coordinates(fwd[a].second, rev_end, ip.lo, ip.hi)) {
-                        ++S.valid_fr_joins;
+                        ++S.seed_compatible_joins;
                         keep[al * nb + be] = 1;
                         break;
                     }
@@ -4711,6 +4709,9 @@ AlleleProductSupport propose_allele_pairs(const Fragment& fragment, const Linkag
     S.seed_hits = S.seed_occurrences;
     S.proposed_states = pairs.size();
     S.proposals = std::move(pairs);
+    // The positional states are RETAINED: the emission verifies at these starts rather than
+    // searching each window again, which is the whole point of having derived them.
+    S.mate_states = std::move(states);
     return S;
 }
 
@@ -4753,6 +4754,15 @@ double score_window(const Fragment& fragment, const LinkageGeometry& geom, const
         m = log_add(m, half + e1 + e2 + ip.log_at(z.insert));
     }
     return m;
+}
+
+// Membership in the seed-compatible pair set, kept as a lookup rather than a second copy of the
+// selection rule.
+bool keep_pair(const AlleleProductSupport& sup, std::uint32_t al, std::uint32_t be,
+               std::size_t n_b) {
+    (void)n_b;
+    const auto want = std::make_pair(al, be);
+    return std::binary_search(sup.proposals.begin(), sup.proposals.end(), want);
 }
 
 void mark_informative(LinkageEmission& out) {
@@ -4806,12 +4816,76 @@ LinkageEmission linkage_emission_supported(const Fragment& fragment, const Linka
                 out.mass[al * out.n_b + be] =
                     score_window(fragment, geom, ip, al, be, d1, d2, a1, a2, log_eps, log_1meps);
     } else {
-        for (const auto& pr : sup.proposals) {
-            out.mass[pr.first * out.n_b + pr.second] =
-                score_window(fragment, geom, ip, pr.first, pr.second, d1, d2, a1, a2,
-                             log_eps, log_1meps);
+        // DIRECT POSITIONAL VERIFICATION. The positional search has already done the work the
+        // window search would repeat: it produced, per mate variant, the starts at which that mate
+        // COULD sit. So verify the whole mate at exactly those starts, through the shared virtual
+        // window, and accumulate the fragment mass from the surviving placements. Nothing is
+        // materialised, and score_window is not called at all on this path.
+        struct Placed { long start; std::uint32_t edits; };
+        std::vector<std::vector<std::pair<std::uint64_t, Placed>>> ver(4);
+        const std::string* seqs[4] = {&fragment.r1, &a1, &fragment.r2, &a2};
+        const std::size_t bands[4] = {d1, d1, d2, d2};
+        for (int mi = 0; mi < 4; ++mi) {
+            VirtualWindow vw; vw.geom = &geom;
+            std::uint64_t cur = ~0ull;
+            for (const auto& st : sup.mate_states[mi]) {
+                const std::uint32_t al = static_cast<std::uint32_t>(st.first >> 32);
+                const std::uint32_t be = static_cast<std::uint32_t>(st.first & 0xFFFFFFFFu);
+                // Only pairs the seed-compatible join kept can carry a verified state: verified
+                // starts are a SUBSET of seeded starts, so a pair with no seed-compatible join has
+                // no verified one either. Skipping the rest is a sound prefilter, not a heuristic.
+                if (!keep_pair(sup, al, be, out.n_b)) continue;
+                if (st.first != cur) { vw.alpha = al; vw.beta = be; cur = st.first; }
+                ++out.full_read_verifications;
+                const std::size_t mm = vw.count_mismatches(*seqs[mi], st.second, bands[mi]);
+                if (mm > bands[mi]) continue;
+                ++out.accepted_mate_placements;
+                ver[mi].push_back({st.first, Placed{st.second, static_cast<std::uint32_t>(mm)}});
+            }
         }
+        const double half = std::log(0.5);
+        const auto read_ll = [&](std::uint32_t e, std::size_t len) {
+            return static_cast<double>(e) * log_eps +
+                   static_cast<double>(len - e) * log_1meps;
+        };
+        // THE SHARED valid-FR RULE again, now over VERIFIED placements: this is the point at which
+        // a state stops being a proposal and becomes a fragment placement.
+        const auto join = [&](int fi_v, int ri_v, bool fwd_is_m1) {
+            const auto& F = ver[fi_v];
+            const auto& R = ver[ri_v];
+            const std::size_t rev_len = fwd_is_m1 ? fragment.r2.size() : fragment.r1.size();
+            std::size_t fi = 0, ri = 0;
+            while (fi < F.size() && ri < R.size()) {
+                if (F[fi].first < R[ri].first) { ++fi; continue; }
+                if (R[ri].first < F[fi].first) { ++ri; continue; }
+                const std::uint64_t kk = F[fi].first;
+                std::size_t fe = fi, re = ri;
+                while (fe < F.size() && F[fe].first == kk) ++fe;
+                while (re < R.size() && R[re].first == kk) ++re;
+                const std::size_t cell = static_cast<std::size_t>(kk >> 32) * out.n_b +
+                                         static_cast<std::size_t>(kk & 0xFFFFFFFFu);
+                for (std::size_t a = fi; a < fe; ++a) {
+                    for (std::size_t b = ri; b < re; ++b) {
+                        const long rev_end = R[b].second.start + static_cast<long>(rev_len) - 1;
+                        if (!valid_fr_coordinates(F[a].second.start, rev_end, ip.lo, ip.hi)) continue;
+                        ++out.verified_fr_states;
+                        const std::uint32_t e1 = fwd_is_m1 ? F[a].second.edits : R[b].second.edits;
+                        const std::uint32_t e2 = fwd_is_m1 ? R[b].second.edits : F[a].second.edits;
+                        const long insert = rev_end - F[a].second.start + 1;
+                        out.mass[cell] = log_add(out.mass[cell],
+                                                 half + read_ll(e1, fragment.r1.size()) +
+                                                 read_ll(e2, fragment.r2.size()) +
+                                                 ip.log_at(insert));
+                    }
+                }
+                fi = fe; ri = re;
+            }
+        };
+        join(0, 3, true);    // r1 forward with r2 reverse-complemented
+        join(2, 1, false);   // r2 forward with r1 reverse-complemented
     }
+    for (const double m : out.mass)
+        if (m != kNegInf) ++out.finite_emission_cells;
     if (out_support != nullptr) *out_support = sup;
     mark_informative(out);
     out.ok = true;

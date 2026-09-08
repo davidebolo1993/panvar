@@ -617,6 +617,20 @@ else
   bad "the derived-flank fixture produced no geometry probe"
 fi
 # ---------------------------------------------------------------------------------------------
+# GATE 29a: COORDINATE VALIDATION. Direct verification cannot recover from a wrong derived start:
+# it does not fail loudly, it verifies the wrong bases and silently drops the placement. So the
+# coordinate is checked on its own -- the view against the materialised window, the |A2|-|A1| shift
+# of a B-side seed, and an EMPTY allele, which the earlier six-map index could not seed at all.
+if "$BIN" genotype-frag -i /dev/null -b none -o "$OUT/co" --coordinate-selftest \
+     > "$OUT/coord.txt" 2>/dev/null; then
+  while IFS=$'\t' read -r v m; do
+    [ "$v" = ok ] && ok "$m" || { [ -n "${m:-}" ] && bad "$m"; }
+  done < <(grep -E '^(ok|FAIL)\t' "$OUT/coord.txt")
+else
+  bad "coordinate selftest reported failures"
+  sed -n 's/^FAIL\t/  /p' "$OUT/coord.txt"
+fi
+
 # GATE 29: THE ALLELE-PRODUCT SUPPORT SEARCH must equal the DENSE ORACLE cell for cell -- same
 # finite cells, same log mass, same informative classification. "The same phase call" would pass
 # while multiplicity or an off-panel combination went missing.
@@ -644,11 +658,35 @@ if miss: no("support cases missing: %s" % ", ".join(miss)); sys.exit(1)
 ok("support search covered over %d cases" % len(need))
 # STAGE COUNTERS must be populated, or a stage is silently not running.
 st = d["c4_scale_118x119"]
-if int(st["states_after"]) > 0 and int(st["fr_joins"]) > 0:
-    ok("positional stages are live: %s states after dedup, %s valid-FR joins"
-       % (st["states_after"], st["fr_joins"]))
+stages = ("seed_start_proposals", "unique_seed_starts", "seed_compatible_joins",
+          "full_read_verifications", "accepted_mate_placements", "verified_fr_states",
+          "finite_emission_cells")
+empty = [k for k in stages if int(st[k]) == 0]
+if not empty:
+    ok("every positional stage is live: " + ", ".join("%s=%s" % (k, st[k]) for k in stages))
 else:
-    no("positional stages are empty: states=%s joins=%s" % (st["states_after"], st["fr_joins"]))
+    no("positional stages are empty on c4_scale_118x119: %s" % ", ".join(empty))
+# DIRECT VERIFICATION, not a window rescan: the whole read must be checked at FEWER starts than
+# were proposed, and every verified FR state must come from an accepted placement.
+if int(st["full_read_verifications"]) <= int(st["unique_seed_starts"]):
+    ok("full-read verification runs at %s of %s seeded starts -- the window is never rebuilt"
+       % (st["full_read_verifications"], st["unique_seed_starts"]))
+else:
+    no("more verifications (%s) than seeded starts (%s)"
+       % (st["full_read_verifications"], st["unique_seed_starts"]))
+if int(st["accepted_mate_placements"]) <= int(st["full_read_verifications"]):
+    ok("accepted placements are a subset of the reads actually verified")
+else:
+    no("accepted (%s) exceeds verified (%s)"
+       % (st["accepted_mate_placements"], st["full_read_verifications"]))
+# nine_identical_origins keeps EVERY repeat origin: 9 cells but many more FR states.
+ni = d["nine_identical_origins"]
+if int(ni["verified_fr_states"]) > int(ni["finite_emission_cells"]):
+    ok("identical repeat origins stay distinct states (%s states over %s cells)"
+       % (ni["verified_fr_states"], ni["finite_emission_cells"]))
+else:
+    no("repeat origins collapsed: %s states over %s cells"
+       % (ni["verified_fr_states"], ni["finite_emission_cells"]))
 # EXACTNESS, everywhere.
 diff = [k for k, v in d.items() if v["cells_differ"] != "0"]
 if diff: no("finite-support cells differ from the dense oracle in: %s" % ", ".join(diff))

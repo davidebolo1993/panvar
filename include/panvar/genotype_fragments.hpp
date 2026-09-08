@@ -1706,6 +1706,11 @@ OwnershipLedger ownership_ledger(const std::vector<FragmentOwner>& owners);
 // background once, sum over every fragment owned by the edge, charge exposure once, and only then
 // remove the content baseline. LinkageEdge below does that; nothing here may be used as a factor.
 struct LinkageEmission {
+    // Verification counters, distinguishing seed work from read work from accepted placements.
+    std::size_t full_read_verifications = 0;
+    std::size_t accepted_mate_placements = 0;
+    std::size_t verified_fr_states = 0;
+    std::size_t finite_emission_cells = 0;
     std::size_t n_a = 0, n_b = 0;              // allele counts at A and B
     std::vector<double> mass;                  // [alpha * n_b + beta] -> log placement mass m
     // This fragment's own background, SUPPLIED BY THE CALLER on the same definition
@@ -1795,6 +1800,23 @@ LinkageGeometry build_linkage_geometry(const std::vector<CandidateFrame>& frames
 // is looked up as "which alleles end with piece[0..j)" and "which begin with piece[j..p)", and the
 // proposal is the PRODUCT of those two small sets -- computed without ever visiting the pairs that
 // match neither.
+// THE VIRTUAL WINDOW: one shared view over  L + A_alpha + C + B_beta + R.
+//
+// Both the direct verifier and the dense oracle read the window through THIS, so their
+// component-coordinate rules cannot drift apart. materialize() exists for the oracle and for tests;
+// production never calls it, because building a 26-98 kb string per allele pair is the cost the
+// positional search exists to avoid.
+struct VirtualWindow {
+    const LinkageGeometry* geom = nullptr;
+    std::uint32_t alpha = 0, beta = 0;
+    std::size_t size() const;
+    char base_at(std::size_t pos) const;
+    // Hamming distance of `read` placed at `start`, giving up once it exceeds `cap`. Returns a
+    // value greater than cap when the read does not fit inside the window.
+    std::size_t count_mismatches(const std::string& read, long start, std::size_t cap) const;
+    std::string materialize() const;   // oracle and tests only
+};
+
 // ONE POSITIONAL MATE STATE. A seed proposes; the existing Hamming scorer still decides.
 struct AlleleMateProposal {
     std::uint32_t alpha = 0;
@@ -1811,7 +1833,15 @@ struct AlleleProductSupport {
     std::size_t seed_occurrences = 0;
     std::size_t positional_states_before_dedup = 0;
     std::size_t positional_states_after_dedup = 0;
-    std::size_t valid_fr_joins = 0;
+    // Renamed: this counts SEED-COMPATIBLE joins -- pairs whose seed-derived starts satisfy the
+    // insert relation -- not verified fragment placements. Those are counted separately once the
+    // whole read has been checked.
+    std::size_t seed_compatible_joins = 0;
+    std::size_t seed_start_proposals = 0;
+    std::size_t unique_seed_starts = 0;
+    // Positional states per mate variant, kept so the emission can verify at these starts instead
+    // of searching the window again: (alpha<<32 | beta, start), sorted and deduplicated.
+    std::vector<std::vector<std::pair<std::uint64_t, long>>> mate_states;
     std::size_t seed_hits = 0;        // retained: total seed occurrences
     std::size_t proposed_states = 0;  // (alpha, beta) pairs proposed, before dedup
     std::size_t dense_pairs = 0;      // n_A * n_B, for the reduction factor
@@ -1841,13 +1871,24 @@ struct AlleleSeedHit {
 struct AlleleProductIndex {
     std::size_t piece = 0;
     bool ok = false;
-    // piece code -> (allele, offset within that allele). Occurrences are NOT deduplicated: two
-    // identical repeat copies are two origins at different offsets.
-    std::unordered_map<std::uint64_t, std::vector<AlleleSeedHit>> in_a, in_b;
-    // Boundary neighbourhoods, kept separate so their coordinates can be derived correctly: the
-    // offset in a boundary string is not an offset in the allele.
-    std::unordered_map<std::uint64_t, std::vector<AlleleSeedHit>> la_bound, ac_bound;
-    std::unordered_map<std::uint64_t, std::vector<AlleleSeedHit>> cb_bound, br_bound;
+    // SEED COMPLETENESS. Once the emission verifies AT the seeded starts instead of rescanning the
+    // window, a missed seed is a missed placement and therefore wrong mass -- it is no longer
+    // merely a missed pair that an exhaustive rescan would recover. So the index must cover EVERY
+    // piece that touches A or B, and where it provably cannot, it says so and the caller falls
+    // back to the dense oracle.
+    //
+    // A piece that touches A lies inside  tail(L,p-1) + A_alpha + head(C,p-1), and one that touches
+    // B lies inside  tail(C,p-1) + B_beta + head(R,p-1) -- UNLESS it runs clean through A or B into
+    // the component beyond. Those contexts are indexed whole (subsuming the former in_a/la_bound/
+    // ac_bound and in_b/cb_bound/br_bound), which is what makes an EMPTY allele work: with |A|=0 the
+    // L|C junction has no boundary map of its own, and the previous six-map form indexed nothing
+    // there at all.
+    // piece code -> (allele, offset within the allele's context string). Occurrences are NOT
+    // deduplicated: two identical repeat copies are two origins at different offsets.
+    std::unordered_map<std::uint64_t, std::vector<AlleleSeedHit>> a_ctx, b_ctx;
+    // False when some piece could run through a whole allele AND its neighbouring context -- the
+    // one span shape neither the contexts nor the A->B junction below can reach.
+    bool complete = false;
     // The direct A->B junction, per split length. These retain the alpha-beta CORRELATION: the pair
     // proposed is (allele ending with the left part, allele starting with the right part), not two
     // independent flags.
