@@ -1020,8 +1020,10 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         g.ok = true;
         const double lam = 0.05, mix = std::log1p(-0.05), bgw = std::log(0.05);
         const auto report = [&](const char* name, const std::vector<LinkageEmission>& ems,
-                                const LinkageGeometry* gover = nullptr) {
-            const LinkageEdge E = aggregate_linkage_edge(ems, gover ? *gover : g, lam, mix, bgw);
+                                const LinkageGeometry* gover = nullptr, double lam_over = 0.0) {
+            const LinkageEdge E = aggregate_linkage_edge(ems, gover ? *gover : g,
+                                                         lam_over > 0.0 ? lam_over : lam,
+                                                         mix, bgw);
             // GUARD BEFORE INDEXING. A refused edge has EMPTY score/log_psi with n_a and n_b still
             // set, so looping over n_a*n_b reads out of bounds.
             if (!E.usable()) {
@@ -1133,6 +1135,22 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         {
             LinkageEmission bad_em;   // ok == false
             report("invalid_emission", {mk({-100.0, -140.0, -140.0, -100.0}), bad_em});
+        }
+        // LAMBDA MUST REACH THE FACTORS. It cancels out wherever every configuration sits far
+        // above or far below the background -- there it is a constant per fragment and the mean-one
+        // centering removes it, which is why the saturated phase fixture is insensitive to it. Near
+        // the crossover it must move psi, and if it does not, the parameter is decoration.
+        {
+            const auto near_floor = [&](const std::vector<double>& mass) {
+                LinkageEmission m;
+                m.n_a = 2; m.n_b = 2; m.mass = mass; m.log_p_bg = -400.0; m.ok = true;
+                m.informative = true;
+                return m;
+            };
+            // Masses straddling the -400 background, so the mixture is genuinely in transition.
+            const std::vector<LinkageEmission> e = {near_floor({-398.0, -402.0, -402.0, -398.0})};
+            report("lambda_crossover_lo", e, nullptr, 0.001);
+            report("lambda_crossover_hi", e, nullptr, 1.000);
         }
         // THE DENSE TABLE MUST REFUSE, NOT TRUNCATE. A locus-scale block pair (LPA: 457 x 410) is
         // 35.1 billion configurations and 561.7 GB, so the dense form cannot claim to handle all

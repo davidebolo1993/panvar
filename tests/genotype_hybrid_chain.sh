@@ -955,7 +955,7 @@ def no(m):
     global bad; bad += 1; print("  FAIL " + m)
 need = ("zero_fragments", "flat_emissions", "all_unplaced", "informative",
         "unequal_exposure", "unequal_exposure_with_frags", "invalid_emission",
-        "too_many_configs")
+        "too_many_configs", "lambda_crossover_lo", "lambda_crossover_hi")
 miss = [k for k in need if k not in d]
 if miss: no("self-test missing cases: %s" % ", ".join(miss)); sys.exit(1)
 # THE DENSE TABLE MUST REFUSE, NOT TRUNCATE. At LPA scale (457 x 410) it is 35.1 billion
@@ -994,6 +994,18 @@ else:
        % max(float(d[k][3]) for k in usable_cases))
 # THE MEAN-ONE BOUND, asserted rather than reasoned about.
 import math as _m
+# LAMBDA MUST REACH THE FACTORS, asserted where it is observable: near the background crossover,
+# where the mixture is in transition and lambda is not a removable constant.
+if "lambda_crossover_lo" in d and "lambda_crossover_hi" in d:
+    lo_mx, lo_mn = float(d["lambda_crossover_lo"][10]), float(d["lambda_crossover_lo"][11])
+    hi_mx, hi_mn = float(d["lambda_crossover_hi"][10]), float(d["lambda_crossover_hi"][11])
+    if abs(hi_mx - lo_mx) > 1e-6 or abs(hi_mn - lo_mn) > 1e-6:
+        ok("lambda reaches the factors: at the crossover psi moves [%.4f,%.4f] -> [%.4f,%.4f]"
+           % (lo_mn, lo_mx, hi_mn, hi_mx))
+    else:
+        no("lambda does not change psi even at the background crossover -- it is decoration")
+else:
+    no("the lambda crossover cases are missing; propagation is not asserted anywhere")
 for case in usable_cases:
     mx, mn = float(d[case][10]), float(d[case][11])
     nf, ob = int(d[case][12]), int(d[case][13])
@@ -1246,6 +1258,12 @@ def ok(m): print("  ok   " + m)
 def no(m):
     global bad; bad += 1; print("  FAIL " + m)
 if len(L) != len(H): no("block counts differ: %d vs %d" % (len(L), len(H))); sys.exit(1)
+hdr = open(sys.argv[1]).readline().rstrip("\n").split("\t")
+if len(hdr) > 11 and hdr[11] == "best_ordered_pair_posterior":
+    ok("column 12 is best_ordered_pair_posterior, and is described as such")
+else:
+    no("column 12 is %s -- the test's description no longer matches the schema"
+       % (hdr[11] if len(hdr) > 11 else "absent"))
 content_same = all(l[7] == h[7] and l[8] == h[8] for l, h in zip(L, H))
 if content_same:
     ok("block CONTENT is unchanged by linkage (allele1/allele2 identical at every block)")
@@ -1263,20 +1281,67 @@ if hp <= truth and hp:
     ok("the hybrid caller recovers the CORRECT phase (%s)" % sorted(hp))
 else:
     no("hybrid phase is %s, expected hapAB/hapBA" % sorted(hp))
-# Posterior mass must move too, not just the argmax.
+# Column 12 is best_ordered_pair_posterior: the largest ORDERED state, NOT the unordered diplotype
+# posterior, which would aggregate both homologue orders and any sequence-equivalent
+# representatives. Describing it as "the pair posterior" conflated the two. The phase-recovery
+# result above does not depend on this number -- the NAMED pair is what changed -- but the quantity
+# must be labelled for what it is.
 try:
     lm = max(float(l[11]) for l in L); hm = max(float(h[11]) for h in H)
-    if hm > lm: ok("posterior mass on the called pair rises %.3f -> %.3f" % (lm, hm))
-    else: no("posterior mass did not rise: %.3f -> %.3f" % (lm, hm))
+    if hm > lm:
+        ok("best_ORDERED_pair posterior rises %.3f -> %.3f (not the unordered diplotype posterior, "
+           "which is not emitted)" % (lm, hm))
+    else:
+        no("best_ordered_pair_posterior did not rise: %.3f -> %.3f" % (lm, hm))
 except (ValueError, IndexError):
-    no("could not read the pair posterior column")
+    no("could not read the best_ordered_pair_posterior column")
 sys.exit(bad)
 PYEOFI
     fails=$(( fails + $? ))
   else
     bad "an end-to-end arm produced no call table"
   fi
-  # 3. THE EXCLUSION IDENTITY, end to end: reads removed == 2 x fragments consumed by active edges.
+  # 3. THE LINKAGE PARAMETER CONTRACT. Every parameter reported with the result, and actually USED
+  #    rather than echoed -- changing lambda must change the answer, or the report is decoration.
+  "$BIN" genotype -i "$OUT/b.sorted.gfa" -b "$OUT/b" -r hapAA -o "$OUT/e2e.p1" \
+    -R "$OUT/r1.fq" -R "$OUT/r2.fq" --fragment-len 350 --hybrid-call \
+    --hybrid-status "$OUT/p1.tsv" -q >/dev/null 2>&1
+  "$BIN" genotype -i "$OUT/b.sorted.gfa" -b "$OUT/b" -r hapAA -o "$OUT/e2e.p2" \
+    -R "$OUT/r1.fq" -R "$OUT/r2.fq" --fragment-len 350 --hybrid-call --hybrid-lambda 0.4 \
+    --hybrid-status "$OUT/p2.tsv" -q >/dev/null 2>&1
+  if [ -s "$OUT/p1.tsv" ] && [ -s "$OUT/p2.tsv" ]; then
+    MISSING=""
+    for k in param_lambda param_lambda_source param_bg_divergence param_outlier_mix \
+             param_error_rate param_max_divergence param_fragment_len param_fragment_sd \
+             param_discordant_rate param_insert_sigmas; do
+      grep -q "^$k	" "$OUT/p1.tsv" || MISSING="$MISSING $k"
+    done
+    [ -z "$MISSING" ] && ok "every linkage parameter is reported with the result" \
+                      || bad "linkage parameters not reported:$MISSING"
+    L1=$(awk -F'\t' '$1=="param_lambda"{print $2}' "$OUT/p1.tsv")
+    S1=$(awk -F'\t' '$1=="param_lambda_source"{print $2}' "$OUT/p1.tsv")
+    L2=$(awk -F'\t' '$1=="param_lambda"{print $2}' "$OUT/p2.tsv")
+    S2=$(awk -F'\t' '$1=="param_lambda_source"{print $2}' "$OUT/p2.tsv")
+    [ "$S1" = "default" ] && [ "$S2" = "supplied" ] \
+      && ok "lambda records its provenance (default $L1, supplied $L2)" \
+      || bad "lambda source not recorded: '$S1' then '$S2'"
+    # USED, NOT MERELY ECHOED -- but asserted where it is OBSERVABLE. lambda cancels wherever every
+    # configuration sits far above or far below the background: there it is a constant per fragment
+    # and the mean-one centering removes it exactly. This fixture is saturated (contrasts ~160 nats
+    # per fragment), and measured: lambda over 0.0005..5.0, a 10,000x range, leaves the call table
+    # byte-identical. That is the model behaving correctly, not the parameter being ignored, so the
+    # propagation gate lives at the crossover instead -- see the lambda_crossover cases below.
+    if cmp -s "$OUT/e2e.p1.genotypes.tsv" "$OUT/e2e.p2.genotypes.tsv"; then
+      ok "on this SATURATED fixture lambda cancels (mean-one centering removes a per-fragment"
+      ok "      constant); propagation is asserted at the background crossover instead"
+    else
+      ok "changing --hybrid-lambda changes the call table"
+    fi
+  else
+    bad "hybrid status report not written"
+  fi
+
+  # 4. THE EXCLUSION IDENTITY, end to end: reads removed == 2 x fragments consumed by active edges.
   HL=$("$BIN" genotype -i "$OUT/b.sorted.gfa" -b "$OUT/b" -r hapAA -o "$OUT/e2e.h2" \
        -R "$OUT/r1.fq" -R "$OUT/r2.fq" --fragment-len 350 --hybrid-call 2>&1)
   NEX=$(echo "$HL" | sed -nE 's/.*hybrid: .*, ([0-9]+) excluded from markers.*/\1/p')

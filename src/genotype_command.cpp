@@ -137,7 +137,13 @@ void print_genotype_help() {
         << "                              owned fragments leave the marker counts and feed edge\n"
         << "                              factors instead; the whole exchange is transactional, so\n"
         << "                              any refusal leaves the legacy call untouched.\n"
-        << "      --hybrid-status <path>  Where the hybrid status report is written.\n"
+        << "      --hybrid-status <path>  Where the hybrid status report is written, including\n"
+        << "                              every linkage parameter used.\n"
+        << "      --hybrid-lambda <x>     Fragment-start intensity for the linkage factors. NOT the\n"
+        << "                              marker model's lambda_hap (different units), and never\n"
+        << "                              fitted to the winning candidate. Default 0.05.\n"
+        << "      --hybrid-bg-divergence <x>  Background per-base disagreement. Default 0.10.\n"
+        << "      --hybrid-outlier-mix <x>    Background weight eta. Default 0.05.\n"
         << "      --hybrid-preflight <p>  Report candidate-frame coverage over the HMM's declared\n"
         << "                              state universe, before any hybrid wiring.\n"
         << "      --exclude-fragments <f> Fragment names (one per line) whose reads must NOT be\n"
@@ -331,9 +337,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
     std::string exclude_fragments_path;
     std::string hybrid_preflight;
     bool hybrid_call = false;
-    double hybrid_fragment_sd = 50.0;
-    double hybrid_divergence = 0.05;
-    double hybrid_error_rate = 0.001;
+    HybridLinkageParameters hyb_params;
     std::string hybrid_status_path;
     double depth_quantile = 0.75;
     long dump_block = -1;
@@ -445,9 +449,17 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--hybrid-preflight") hybrid_preflight = require_value(arg);
         else if (arg == "--hybrid-call") hybrid_call = true;
         else if (arg == "--hybrid-status") hybrid_status_path = require_value(arg);
-        else if (arg == "--hybrid-fragment-sd") hybrid_fragment_sd = std::stod(require_value(arg));
-        else if (arg == "--hybrid-divergence") hybrid_divergence = std::stod(require_value(arg));
-        else if (arg == "--hybrid-error-rate") hybrid_error_rate = std::stod(require_value(arg));
+        else if (arg == "--hybrid-fragment-sd") hyb_params.fragment_sd = std::stod(require_value(arg));
+        else if (arg == "--hybrid-divergence") hyb_params.max_divergence = std::stod(require_value(arg));
+        else if (arg == "--hybrid-error-rate") hyb_params.error_rate = std::stod(require_value(arg));
+        else if (arg == "--hybrid-bg-divergence") hyb_params.bg_divergence = std::stod(require_value(arg));
+        else if (arg == "--hybrid-outlier-mix") hyb_params.outlier_mix = std::stod(require_value(arg));
+        else if (arg == "--hybrid-lambda") {
+            // FRAGMENT-START INTENSITY, supplied. Never derived from the marker model's lambda_hap
+            // (different units) and never fitted to the winning candidate.
+            hyb_params.lambda = std::stod(require_value(arg));
+            hyb_params.lambda_supplied = true;
+        }
         else if (arg == "--dump-markers") dump_markers = require_value(arg);
         else if (arg == "--dump-anchors") dump_markers = require_value(arg);  // former name
         else if (arg == "--depth-estimator") {
@@ -1476,16 +1488,19 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         min_len = std::max<long>(min_len,
                                                  static_cast<long>(F.r1.size() + F.r2.size()));
                     }
-                    const InsertPrior ip = make_insert_prior(fragment_len, hybrid_fragment_sd,
-                                                             0.01, 4, min_len);
-                    const double lep = std::log(hybrid_error_rate / 3.0);
-                    const double l1m = std::log1p(-hybrid_error_rate);
+                    hyb_params.fragment_len = fragment_len;   // the library geometry in force
+                    const InsertPrior ip = make_insert_prior(hyb_params.fragment_len,
+                                                             hyb_params.fragment_sd,
+                                                             hyb_params.discordant_rate,
+                                                             hyb_params.insert_sigmas, min_len);
+                    const double lep = std::log(hyb_params.error_rate / 3.0);
+                    const double l1m = std::log1p(-hyb_params.error_rate);
                     // OWNERSHIP over the SAME frames the preflight reported: the object is passed,
                     // not recomputed, so report and decision cannot describe different runs.
                     std::vector<FragmentOwner> owners(hf.size());
                     run_parallel(hf.size(), options.threads, [&](std::size_t fi) {
                         owners[fi] = assign_fragment_owner(hf[fi], hyb_cov.frames, block_variable,
-                                                           ip, hybrid_divergence, lep, l1m, 1e-6,
+                                                           ip, hyb_params.max_divergence, lep, l1m, 1e-6,
                                                            nullptr);
                     });
                     std::map<std::pair<std::uint32_t, std::uint32_t>,
@@ -1518,15 +1533,16 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         ems.reserve(kv.second.size());
                         for (std::size_t fi : kv.second) {
                             const std::size_t len = hf[fi].bases();
-                            const std::size_t be =
-                                static_cast<std::size_t>(0.10 * static_cast<double>(len));
+                            const std::size_t be = static_cast<std::size_t>(
+                                hyb_params.bg_divergence * static_cast<double>(len));
                             const double bgf = static_cast<double>(be) * lep +
                                                static_cast<double>(len - be) * l1m;
-                            ems.push_back(linkage_emission(hf[fi], geom, ip, hybrid_divergence,
+                            ems.push_back(linkage_emission(hf[fi], geom, ip, hyb_params.max_divergence,
                                                            lep, l1m, bgf));
                         }
-                        LinkageEdge E = aggregate_linkage_edge(ems, geom, 0.05,
-                                                               std::log1p(-0.05), std::log(0.05));
+                        LinkageEdge E = aggregate_linkage_edge(
+                            ems, geom, hyb_params.lambda,
+                            std::log1p(-hyb_params.outlier_mix), std::log(hyb_params.outlier_mix));
                         es.status = E.status;
                         edge_status.push_back(es);
                         if (E.usable()) edge_map.emplace(kv.first, std::move(E));
@@ -1550,6 +1566,54 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         hyb_exclusions.insert(hyb_act.excluded_fragments.begin(),
                                               hyb_act.excluded_fragments.end());
                     }
+                }
+                // PROVENANCE. Every parameter the linkage factors used, written with the result,
+                // so a real-data number is interpretable later without reading the source. lambda is
+                // marked supplied or default because "which lambda" is the first question anyone
+                // will ask of a C4 result.
+                if (!hybrid_status_path.empty()) {
+                    std::ofstream hs(hybrid_status_path);
+                    if (!hs) throw std::runtime_error("genotype: cannot write " + hybrid_status_path);
+                    hs.precision(10);
+                    hs << "field\tvalue\n";
+                    hs << "hybrid_status\t" << hybrid_call_status_name(hyb_act.call_status) << '\n';
+                    hs << "ownership_complete\t" << (hyb_act.ownership_complete ? 1 : 0) << '\n';
+                    hs << "factors_buildable\t" << (hyb_act.factors_buildable ? 1 : 0) << '\n';
+                    hs << "hybrid_activated\t" << (hyb_act.hybrid_activated ? 1 : 0) << '\n';
+                    hs << "legacy_call_status\tAVAILABLE\n";
+                    hs << "reason\t" << (hyb_act.refusal.empty() ? "-" : hyb_act.refusal) << '\n';
+                    hs << "all_states_usable\t" << (hyb_cov.all_states_usable ? 1 : 0) << '\n';
+                    hs << "fragments_loaded\t" << hyb_fragments_loaded << '\n';
+                    hs << "candidate_edges\t" << hyb_edges_considered << '\n';
+                    hs << "active_edges\t" << hyb_act.active_edges << '\n';
+                    hs << "fragments_excluded\t" << hyb_exclusions.size() << '\n';
+                    hs << "owned_unary\t" << hyb_act.report.consumed_unary << '\n';
+                    hs << "owned_linkage\t" << hyb_act.report.consumed_linkage << '\n';
+                    hs << "owned_invariant\t" << hyb_act.report.invariant << '\n';
+                    hs << "unconsumed_wide\t" << hyb_act.report.unconsumed_wide << '\n';
+                    hs << "unconsumed_refused_edge\t" << hyb_act.report.unconsumed_refused_edge << '\n';
+                    hs << "unconsumed_unusable\t" << hyb_act.report.unconsumed_unusable << '\n';
+                    for (const EdgeRefusal& r : hyb_act.report.refusals) {
+                        hs << "edge_refusal\t" << r.block_a << '-' << r.block_b << ':'
+                           << linkage_status_name(r.status) << '(' << r.n_fragments << ")\n";
+                    }
+                    // THE PARAMETER CONTRACT. These do not all come from one place, so each is named
+                    // for what it is rather than grouped as "the model".
+                    hs << "param_lambda\t" << hyb_params.lambda << '\n';
+                    hs << "param_lambda_source\t"
+                       << (hyb_params.lambda_supplied ? "supplied" : "default") << '\n';
+                    hs << "param_bg_divergence\t" << hyb_params.bg_divergence << '\n';
+                    hs << "param_outlier_mix\t" << hyb_params.outlier_mix << '\n';
+                    hs << "param_error_rate\t" << hyb_params.error_rate << '\n';
+                    hs << "param_max_divergence\t" << hyb_params.max_divergence << '\n';
+                    hs << "param_fragment_len\t" << hyb_params.fragment_len << '\n';
+                    hs << "param_fragment_sd\t" << hyb_params.fragment_sd << '\n';
+                    hs << "param_discordant_rate\t" << hyb_params.discordant_rate << '\n';
+                    hs << "param_insert_sigmas\t" << hyb_params.insert_sigmas << '\n';
+                    hs.flush();
+                    if (!hs) throw std::runtime_error("genotype: write failed for " +
+                                                      hybrid_status_path);
+                    log.wrote({hybrid_status_path});
                 }
                 log.info(std::string("hybrid: ") +
                          hybrid_call_status_name(hyb_act.call_status) + ", " +

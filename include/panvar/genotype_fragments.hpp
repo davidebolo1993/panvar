@@ -1970,6 +1970,38 @@ ChainEdgeLinkage make_kernel_edge(const LinkageEdge& edge,
                                   const AlleleMapping& map_a, const AlleleMapping& map_b);
 
 // ---------------------------------------------------------------------------------------------
+// EVERY PARAMETER THE LINKAGE FACTORS USE, in one object, reported with the result.
+//
+// These came from literals scattered through the caller -- 0.10, 0.05, 0.05 -- and a real-data
+// result obtained that way is not interpretable, because nothing records what model produced it.
+//
+// THEY DO NOT ALL COME FROM THE SAME PLACE, and grouping them must not imply they do:
+//
+//   lambda           FRAGMENT-START INTENSITY. NOT the marker model's lambda_hap, which is a
+//                    per-marker depth in different units; copying that across would be a unit error
+//                    wearing the appearance of plumbing. Supplied explicitly, or left at the
+//                    documented default -- and never fitted to the winning candidate, which would
+//                    make the parameter depend on the answer;
+//   bg_divergence    emission model: the background's implied per-base disagreement;
+//   outlier_mix      emission model: the weight eta on that background;
+//   error_rate       alignment/emission: per-base edit probability;
+//   max_divergence   alignment: the band a placement must fall within;
+//   fragment_len/sd, discordant_rate, insert_sigmas
+//                    library geometry, inferred or supplied, from which the insert prior is built.
+struct HybridLinkageParameters {
+    double lambda = 0.05;
+    bool lambda_supplied = false;      // false: the documented default, recorded as such
+    double bg_divergence = 0.10;
+    double outlier_mix = 0.05;
+    double error_rate = 0.001;
+    double max_divergence = 0.05;
+    double fragment_len = 350.0;
+    double fragment_sd = 50.0;
+    double discordant_rate = 0.01;
+    int insert_sigmas = 4;
+};
+
+// ---------------------------------------------------------------------------------------------
 // TRANSACTIONAL ACTIVATION.
 //
 // Subtracting linkage-owned fragments from the marker unaries and activating their edges are ONE
