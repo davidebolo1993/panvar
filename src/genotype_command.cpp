@@ -2153,10 +2153,88 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                 // because the mixture is symmetric in its two arguments. Two
                                 // content classes can share straight corners and differ on crossed,
                                 // so K^2 is not the count of production factor states.
-                                std::unordered_set<std::uint64_t> patterns;
-                                std::size_t affected = 0;
                                 const std::size_t NA = blocks[es.block_a].n_alleles;
                                 const std::size_t NB = blocks[es.block_b].n_alleles;
+                                // THE TRAVERSAL QUESTION, which is separate from the scoring one.
+                                // A quadruple's pattern depends on q only through four cells, so
+                                // two A alleles with IDENTICAL signature rows are interchangeable
+                                // in every pattern, and likewise two B alleles with identical
+                                // columns. If the matrix has RA distinct rows and RB distinct
+                                // columns, the enumeration is C(RA,2)*C(RB,2)-shaped instead of
+                                // C(na,2)*C(nb,2) -- and nothing ever visits the full table.
+                                // Reducing distinct DELTA VALUES to a small number would not by
+                                // itself achieve that; this is what does.
+                                std::unordered_map<std::string, std::uint32_t> rowid, colid;
+                                std::vector<std::uint32_t> arow(NA), bcol(NB);
+                                for (std::size_t a = 0; a < NA; ++a) {
+                                    std::string key(NB * 4, '\0');
+                                    for (std::size_t b = 0; b < NB; ++b)
+                                        std::memcpy(&key[b * 4], &qid[a * NB + b], 4);
+                                    arow[a] = rowid.emplace(key,
+                                        static_cast<std::uint32_t>(rowid.size())).first->second;
+                                }
+                                for (std::size_t b = 0; b < NB; ++b) {
+                                    std::string key(NA * 4, '\0');
+                                    for (std::size_t a = 0; a < NA; ++a)
+                                        std::memcpy(&key[a * 4], &qid[a * NB + b], 4);
+                                    bcol[b] = colid.emplace(key,
+                                        static_cast<std::uint32_t>(colid.size())).first->second;
+                                }
+                                const std::size_t RA = rowid.size(), RB = colid.size();
+                                // TWO representatives per class where the class has two members.
+                                // A quadruple whose two A alleles come from the SAME row class is a
+                                // real class -- and a FLAT one, since identical rows force
+                                // q11==q12 and q21==q22, hence straight == crossed and delta 0.
+                                // Visiting only distinct classes would silently drop every one of
+                                // them, which is what the first version of this check did.
+                                std::vector<std::size_t> arep(RA, SIZE_MAX), arep2(RA, SIZE_MAX);
+                                std::vector<std::size_t> brep(RB, SIZE_MAX), brep2(RB, SIZE_MAX);
+                                for (std::size_t a = 0; a < NA; ++a) {
+                                    if (arep[arow[a]] == SIZE_MAX) arep[arow[a]] = a;
+                                    else if (arep2[arow[a]] == SIZE_MAX) arep2[arow[a]] = a;
+                                }
+                                for (std::size_t b = 0; b < NB; ++b) {
+                                    if (brep[bcol[b]] == SIZE_MAX) brep[bcol[b]] = b;
+                                    else if (brep2[bcol[b]] == SIZE_MAX) brep2[bcol[b]] = b;
+                                }
+                                // ORIENTATION MATTERS, and representatives alone cannot express
+                                // it. The full scan keys a quadruple with a1<a2 and b1<b2, so which
+                                // corner counts as STRAIGHT depends on the index order between the
+                                // two classes' members -- and both orders occur, because class
+                                // members are scattered through index space. Visiting one
+                                // representative pair per unordered class pair therefore realises
+                                // only one orientation and silently drops delta's mirror image.
+                                // So: enumerate ORDERED class pairs, and keep one only when some
+                                // real member pair actually realises that order.
+                                std::vector<std::size_t> amin(RA, SIZE_MAX), amax(RA, 0),
+                                                         acount(RA, 0);
+                                std::vector<std::size_t> bmin(RB, SIZE_MAX), bmax(RB, 0),
+                                                         bcount(RB, 0);
+                                for (std::size_t a = 0; a < NA; ++a) {
+                                    amin[arow[a]] = std::min(amin[arow[a]], a);
+                                    amax[arow[a]] = std::max(amax[arow[a]], a);
+                                    ++acount[arow[a]];
+                                }
+                                for (std::size_t b = 0; b < NB; ++b) {
+                                    bmin[bcol[b]] = std::min(bmin[bcol[b]], b);
+                                    bmax[bcol[b]] = std::max(bmax[bcol[b]], b);
+                                    ++bcount[bcol[b]];
+                                }
+                                // Ordered class pair (i,j) is realisable as a1<a2 iff some member
+                                // of i precedes some member of j; within one class it needs two.
+                                std::vector<std::pair<std::size_t, std::size_t>> apairs, bpairs;
+                                for (std::size_t i = 0; i < RA; ++i)
+                                for (std::size_t j = 0; j < RA; ++j) {
+                                    const bool okp = (i == j) ? acount[i] >= 2 : amin[i] < amax[j];
+                                    if (okp) apairs.emplace_back(i, j);
+                                }
+                                for (std::size_t u = 0; u < RB; ++u)
+                                for (std::size_t v = 0; v < RB; ++v) {
+                                    const bool okp = (u == v) ? bcount[u] >= 2 : bmin[u] < bmax[v];
+                                    if (okp) bpairs.emplace_back(u, v);
+                                }
+                                std::unordered_set<std::uint64_t> patterns;
+                                std::size_t affected = 0, flat_full = 0;
                                 for (std::size_t a1 = 0; a1 + 1 < NA; ++a1)
                                 for (std::size_t a2 = a1 + 1; a2 < NA; ++a2)
                                 for (std::size_t b1 = 0; b1 + 1 < NB; ++b1)
@@ -2181,6 +2259,48 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                     const std::uint64_t cA = std::min(q12, q21);
                                     const std::uint64_t cB = std::max(q12, q21);
                                     patterns.insert((sA << 48) | (sB << 32) | (cA << 16) | cB);
+                                    if (sA == cA && sB == cB) ++flat_full;
+                                }
+                                // THE COLLAPSED ENUMERATION, over class REPRESENTATIVES only.
+                                // Its pattern set must equal the one from full enumeration, or the
+                                // row/column collapse is not equivalence-preserving. Distinct
+                                // classes may still share a representative pair when RA<NA, so
+                                // ordered representative pairs are used, both orders, to reach the
+                                // patterns a strict a1<a2 scan over representatives would miss.
+                                std::unordered_set<std::uint64_t> patterns_collapsed;
+                                std::size_t collapsed_visits = 0;
+                                for (const auto& ap : apairs)
+                                for (const auto& bp : bpairs) {
+                                    // CLASS indices now, in the realised order: the first element
+                                    // plays the role the smaller-indexed allele plays in the full
+                                    // scan. No re-sorting by allele index, which is what discarded
+                                    // the orientation before.
+                                    const std::size_t A1 = arep[ap.first], A2 = arep[ap.second];
+                                    const std::size_t B1 = brep[bp.first], B2 = brep[bp.second];
+                                    ++collapsed_visits;
+                                    const std::uint32_t q11 = qid[A1 * NB + B1];
+                                    const std::uint32_t q22 = qid[A2 * NB + B2];
+                                    const std::uint32_t q12 = qid[A1 * NB + B2];
+                                    const std::uint32_t q21 = qid[A2 * NB + B1];
+                                    // THE SAME emptiness test as the full scan, byte for byte. A
+                                    // joint key is never zero-length -- it always carries one
+                                    // length prefix per fragment -- so testing .empty() here while
+                                    // the full scan tests for all-zero bytes would compare two
+                                    // different sets and call the difference a finding.
+                                    if (joint[A1 * NB + B1].find_first_not_of('\0') ==
+                                            std::string::npos &&
+                                        joint[A2 * NB + B2].find_first_not_of('\0') ==
+                                            std::string::npos &&
+                                        joint[A1 * NB + B2].find_first_not_of('\0') ==
+                                            std::string::npos &&
+                                        joint[A2 * NB + B1].find_first_not_of('\0') ==
+                                            std::string::npos) continue;
+                                    const std::uint64_t sA = std::min(q11, q22);
+                                    const std::uint64_t sB = std::max(q11, q22);
+                                    const std::uint64_t cA = std::min(q12, q21);
+                                    const std::uint64_t cB = std::max(q12, q21);
+                                    patterns_collapsed.insert(
+                                        (sA << 48) | (sB << 32) | (cA << 16) | cB);
                                 }
                                 std::sort(per_frag.begin(), per_frag.end());
                                 const double ssec = std::chrono::duration<double>(
@@ -2209,6 +2329,16 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                    << '\n'
                                    << "#affected_classes\t" << affected << '\n'
                                    << "#distinct_phase_patterns\t" << patterns.size() << '\n'
+                                   << "#signature_rows_A\t" << RA << " of " << NA << '\n'
+                                   << "#signature_cols_B\t" << RB << " of " << NB << '\n'
+                                   << "#collapsed_visits\t" << collapsed_visits << '\n'
+                                   << "#collapsed_patterns\t" << patterns_collapsed.size() << '\n'
+                                   << "#flat_quadruples_full\t" << flat_full << '\n'
+                                   << "#collapse_equivalent\t"
+                                   << (patterns_collapsed == patterns ? 1 : 0) << '\n'
+                                   << "#traversal_reduction\t"
+                                   << (collapsed_visits ? static_cast<double>(affected) /
+                                                          collapsed_visits : 0.0) << '\n'
                                    << "#full_read_verifications\t" << sb.full_read_verifications
                                    << '\n'
                                    << "#seconds\t" << ssec << '\n';
@@ -2240,7 +2370,11 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                          std::to_string(per_frag.empty() ? 0 : per_frag.back()) +
                                          " (min/med/max), JOINT " + std::to_string(jc) +
                                          ", phase patterns " + std::to_string(patterns.size()) +
-                                         " over " + std::to_string(affected) + " affected classes, " +
+                                         " over " + std::to_string(affected) + " affected classes; "
+                                         "signature rows/cols " + std::to_string(RA) + "/" +
+                                         std::to_string(RB) + ", collapsed visits " +
+                                         std::to_string(collapsed_visits) + ", equivalent=" +
+                                         (patterns_collapsed == patterns ? "yes" : "NO") + ", " +
                                          std::to_string(ssec) + " s");
                             }
                         }
