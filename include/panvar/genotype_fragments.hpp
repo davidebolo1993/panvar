@@ -1911,6 +1911,29 @@ LinkageGeometry build_linkage_geometry(const std::vector<CandidateFrame>& frames
 // production never calls it, because building a 26-98 kb string per allele pair is the cost the
 // positional search exists to avoid.
 struct VirtualWindow {
+    // NON-OWNING AND NON-COPYABLE, and meant to live no longer than the scoring call that made it.
+    // Its segments are raw pointers into allele and context strings owned elsewhere, so a copy
+    // outliving its geometry, an owner leaving scope, or a backing vector reallocating would all
+    // dangle. Deleting the copy operations prevents the copy case structurally; the other two are
+    // prevented by construction -- every VirtualWindow here is a local in the call that scores
+    // against immutable geometry whose lifetime encloses it -- and are checked under ASan rather
+    // than by a unit test, which cannot observe a lifetime error that has not yet been triggered.
+    VirtualWindow() = default;
+    VirtualWindow(const VirtualWindow&) = delete;
+    VirtualWindow& operator=(const VirtualWindow&) = delete;
+    // ONE segment walk, for any number of variable blocks. The two-block case is this same code
+    // over five segments (L, A_alpha, C, B_beta, R); a four-block window is nine. Concatenation
+    // logic exists only here, so a probe and the production scorer cannot come to disagree about
+    // where a component begins -- which is precisely how the earlier non-adjacent-geometry bug
+    // stayed invisible.
+    std::vector<const std::string*> segments;
+    // Convenience for the pair case: fills `segments` from a two-block geometry.
+    void bind_pair(const LinkageGeometry& g, std::uint32_t a, std::uint32_t b);
+    // For k consecutive blocks: lflank, then (allele, context)... , last allele, rflank.
+    void bind_chain(const std::string& lflank,
+                    const std::vector<const std::string*>& alleles,
+                    const std::vector<const std::string*>& contexts,
+                    const std::string& rflank);
     const LinkageGeometry* geom = nullptr;
     std::uint32_t alpha = 0, beta = 0;
     std::size_t size() const;

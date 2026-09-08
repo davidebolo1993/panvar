@@ -151,6 +151,22 @@ void print_genotype_help() {
         << "      --hybrid-edge-signature <a,b,path>  JOINT structural emission signatures on one\n"
         << "                              edge: per-fragment classes, their sum, and the joint\n"
         << "                              classes after intersecting every fragment's partition.\n"
+        << "      --hybrid-context-dependence <ctx,b1,...,path>  Does block ctx affect ANY\n"
+        << "                              fragment signature of the factor over b1..bk? Exact:\n"
+        << "                              a state can touch ctx only via an accepted placement\n"
+        << "                              there, so it enumerates those directly.\n"
+        << "      --hybrid-wide-inventory <path>  Every Wide fragment's exact variable scope,\n"
+        << "                              grouped, with the minimal factor interval each would\n"
+        << "                              need. Wide evidence keeps the model INCOMPLETE, so this\n"
+        << "                              says how many higher-order factors a COMPLETE call needs.\n"
+        << "      --hybrid-super-ledger <b1,...,bk,path>  EVIDENCE ACCOUNTING for a candidate\n"
+        << "                              super-factor over those blocks: which fragments would\n"
+        << "                              enter it, each exactly once, and what else claims them.\n"
+        << "      --hybrid-arity-probe <b1,...,bk,path>  Geometry over k consecutive variable\n"
+        << "                              blocks: EVERY haploid window length by complete\n"
+        << "                              enumeration, the affine boundary, and whether exposure\n"
+        << "                              cancellation follows by algebra.\n"
+        << "      --hybrid-triple-probe <...>  DEPRECATED alias for --hybrid-arity-probe.\n"
         << "      --hybrid-exposure-probe <path>  Per-configuration window length and exposure for\n"
         << "                              every candidate edge, with the affine regime boundary.\n"
         << "      --hybrid-edge-oracle <a,b,path>  Run ONE edge through BOTH the supported search\n"
@@ -404,6 +420,11 @@ int run_genotype_command(const std::vector<std::string>& args) {
     std::string hybrid_grouped_report;   // per-edge grouped build measurements
     std::string hybrid_edge_signature;   // "<a>,<b>,<path>" -- joint emission signatures
     std::string hybrid_exposure_probe;   // per-configuration window length and exposure
+    std::string hybrid_triple_probe;     // "<b1>,...,<bk>,<path>" -- k-variable geometry
+    std::string hybrid_super_ledger;     // "<b1>,...,<bk>,<path>" -- evidence accounting
+    std::string hybrid_wide_inventory;   // every Wide fragment's scope, grouped
+    std::string hybrid_context_dependence;  // "<ctx>,<b1>,...,<path>" -- is ctx emission-relevant?
+    bool hybrid_triple_alias_used = false;
     struct EdgeRow {
         std::uint32_t a = 0, b = 0;
         std::size_t na = 0, nb = 0, owned = 0, informative = 0, support = 0, stored = 0,
@@ -557,6 +578,17 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--hybrid-grouped-report") hybrid_grouped_report = require_value(arg);
         else if (arg == "--hybrid-edge-signature") hybrid_edge_signature = require_value(arg);
         else if (arg == "--hybrid-exposure-probe") hybrid_exposure_probe = require_value(arg);
+        else if (arg == "--hybrid-arity-probe") hybrid_triple_probe = require_value(arg);
+        else if (arg == "--hybrid-super-ledger") hybrid_super_ledger = require_value(arg);
+        else if (arg == "--hybrid-wide-inventory") hybrid_wide_inventory = require_value(arg);
+        else if (arg == "--hybrid-context-dependence")
+            hybrid_context_dependence = require_value(arg);
+        else if (arg == "--hybrid-triple-probe") {
+            // DEPRECATED: the probe takes any number of consecutive blocks now, so "triple" names
+            // a case rather than the feature. Accepted, and said out loud.
+            hybrid_triple_probe = require_value(arg);
+            hybrid_triple_alias_used = true;
+        }
         else if (arg == "--hybrid-lambda-estimate") {
             hyb_params.lambda_source = HybridLinkageParameters::LambdaSource::Estimated;
         }
@@ -1606,6 +1638,276 @@ int run_genotype_command(const std::vector<std::string>& args) {
             // ten-minute ownership pass. Written because the first C4 run refused all ten edges and
             // the status recorded only "not-computed": the reason string was dropped, so the
             // failure could not be diagnosed without guessing.
+            // ---- THREE-VARIABLE GEOMETRY FEASIBILITY ------------------------------------------
+            // A single window below hi-1 kills the whole option, so it is checked first and
+            // cheaply, over EVERY haploid combination rather than from the arithmetic
+            // 721 - min|A4| -- that shortcut assumes the three minimising alleles co-occur, which
+            // is exactly the kind of assumption that has had to be retracted here before.
+            if (!hybrid_triple_probe.empty()) {
+                if (hybrid_triple_alias_used) {
+                    log.info("hybrid: --hybrid-triple-probe is deprecated; it is "
+                             "--hybrid-arity-probe, which takes any number of consecutive blocks");
+                }
+                std::vector<std::string> parts;
+                std::string cur;
+                for (char c : hybrid_triple_probe) {
+                    if (c == ',') { parts.push_back(cur); cur.clear(); } else cur.push_back(c);
+                }
+                parts.push_back(cur);
+                if (parts.size() < 4) {
+                    throw std::runtime_error(
+                        "genotype: --hybrid-triple-probe expects <b1>,<b2>,...,<path>");
+                }
+                // GENERALISED to any number of consecutive variable blocks. The three-block form
+                // was hardcoded, and its cancellation gate SAMPLED eight alleles per block -- which
+                // inverted the conclusion, because the single deciding window used an allele
+                // outside the sample. Complete enumeration is now structural rather than optional.
+                std::vector<std::size_t> bl;
+                for (std::size_t q = 0; q + 1 < parts.size(); ++q) bl.push_back(std::stoul(parts[q]));
+                const std::size_t ba = bl.front(), bb = bl.size() > 1 ? bl[1] : bl.front(),
+                                  bc = bl.back();
+                // THE PATH IS THE LAST FIELD, not the fourth. With three blocks those coincide;
+                // with four the fourth field is a BLOCK, and the probe silently wrote a file named
+                // "5" and reported nothing.
+                std::ofstream tp(parts.back());
+                if (!tp) throw std::runtime_error("genotype: cannot write " + parts.back());
+                if (ba >= blocks.size() || bb >= blocks.size() || bc >= blocks.size()) {
+                    throw std::runtime_error("genotype: --hybrid-triple-probe block out of range");
+                }
+                const auto& A = blocks[ba].allele_seq;
+                const auto& Bv = blocks[bb].allele_seq;
+                const auto& Cv = blocks[bc].allele_seq;
+                // The two intervening contexts, taken from the pairwise geometries so this probe
+                // measures the SAME sequence the pairwise factors do rather than a second opinion.
+                const FrameCoverage tcov = assess_frame_coverage(graph, blocks, hap_names);
+                std::vector<std::vector<std::string>> tball(blocks.size());
+                std::vector<char> tvar(blocks.size(), 0);
+                for (std::size_t q = 0; q < blocks.size(); ++q) {
+                    tball[q] = blocks[q].allele_seq;
+                    tvar[q] = blocks[q].n_alleles > 1 ? 1 : 0;
+                }
+                const InsertPrior tip = make_insert_prior(fragment_len, hyb_params.fragment_sd,
+                                                          hyb_params.discordant_rate,
+                                                          hyb_params.insert_sigmas, 1);
+                const std::size_t tflank = static_cast<std::size_t>(tip.hi);
+                const std::size_t affine_from =
+                    static_cast<std::size_t>(std::max<long>(0, tip.hi - 1));
+                tp << "field\tvalue\n";
+                {
+                    std::string bs, as;
+                    std::size_t prod = 1;
+                    for (std::size_t q = 0; q < bl.size(); ++q) {
+                        bs += (q ? "," : "") + std::to_string(bl[q]);
+                        as += (q ? "x" : "") + std::to_string(blocks[bl[q]].n_alleles);
+                        prod *= blocks[bl[q]].n_alleles;
+                    }
+                    tp << "blocks\t" << bs << '\n';
+                    tp << "alleles\t" << as << '\n';
+                    tp << "haploid_windows\t" << prod << '\n';
+                }
+                // CONSECUTIVE geometries only. The three-block form used g1 = (b0,b1) and
+                // g2 = (b1,b2), which for four blocks asks for a geometry between blocks that are
+                // not adjacent -- and it refused with "intervening context differs" while reporting
+                // the wrong block list.
+                bool chain_ok = true;
+                std::string chain_refusal;
+                for (std::size_t q = 0; q + 1 < bl.size(); ++q) {
+                    const LinkageGeometry gq = build_linkage_geometry(
+                        tcov.frames, tball, tvar, static_cast<std::uint32_t>(bl[q]),
+                        static_cast<std::uint32_t>(bl[q + 1]), tflank, tip);
+                    tp << "pair_" << bl[q] << "_" << bl[q + 1] << "_ok\t" << (gq.ok ? 1 : 0)
+                       << "\t" << (gq.refusal.empty() ? "-" : gq.refusal) << '\n';
+                    if (!gq.ok) { chain_ok = false; chain_refusal = gq.refusal; }
+                }
+                if (!chain_ok) {
+                    tp << "REFUSED\ta consecutive pairwise geometry is unavailable: "
+                       << chain_refusal << '\n';
+                } else if (bl.size() > 3) {
+                    // ---- GENERAL ARITY: complete enumeration over the whole haploid product ----
+                    // Contexts come from the consecutive pairwise geometries, so this measures the
+                    // same sequence the pairwise factors do.
+                    std::vector<std::size_t> ctx;
+                    std::size_t lfl = 0, rfl = 0;
+                    for (std::size_t q = 0; q + 1 < bl.size(); ++q) {
+                        const LinkageGeometry gq = build_linkage_geometry(
+                            tcov.frames, tball, tvar, static_cast<std::uint32_t>(bl[q]),
+                            static_cast<std::uint32_t>(bl[q + 1]), tflank, tip);
+                        ctx.push_back(gq.context.size());
+                        if (q == 0) lfl = gq.lflank.size();
+                        if (q + 2 == bl.size()) rfl = gq.rflank.size();
+                    }
+                    {
+                        std::size_t fixed = lfl + rfl;
+                        for (std::size_t c : ctx) fixed += c;
+                        std::vector<std::vector<std::size_t>> lens;
+                        std::size_t total = 1;
+                        for (std::size_t b : bl) {
+                            std::vector<std::size_t> v;
+                            for (const std::string& x : blocks[b].allele_seq) v.push_back(x.size());
+                            total *= v.size();
+                            lens.push_back(std::move(v));
+                        }
+                        tp << "haploid_windows_total\t" << total << '\n';
+                        tp << "fixed_context_bp\t" << fixed << '\n';
+                        // Odometer over the complete product: no sampling, no recursion depth cap.
+                        std::vector<std::size_t> idx(bl.size(), 0);
+                        std::size_t minw = SIZE_MAX, maxw = 0, below = 0, visited = 0;
+                        double worst_affine_gap = 0.0;
+                        bool done = false;
+                        while (!done) {
+                            std::size_t w = fixed;
+                            for (std::size_t q = 0; q < bl.size(); ++q) w += lens[q][idx[q]];
+                            ++visited;
+                            minw = std::min(minw, w); maxw = std::max(maxw, w);
+                            if (static_cast<long>(w) < tip.hi - 1) ++below;
+                            const ExposureCheck ec = check_exposure(w, tip);
+                            worst_affine_gap = std::max(worst_affine_gap,
+                                                        std::abs(ec.exact - ec.affine));
+                            for (std::size_t q = 0; ; ++q) {
+                                if (q == bl.size()) { done = true; break; }
+                                if (++idx[q] < lens[q].size()) break;
+                                idx[q] = 0;
+                            }
+                        }
+                        tp << "haploid_windows_visited\t" << visited << '\n';
+                        tp << "complete_enumeration\t" << (visited == total ? 1 : 0) << '\n';
+                        tp << "affine_from\t" << (tip.hi - 1) << '\n';
+                        tp << "min_window\t" << minw << '\n';
+                        tp << "max_window\t" << maxw << '\n';
+                        tp << "windows_below_affine\t" << below << '\n';
+                        tp << "all_windows_affine\t" << (below == 0 ? 1 : 0) << '\n';
+                        // THE ALGEBRAIC INVARIANT, gated exhaustively rather than sampled. If exact
+                        // equals affine at EVERY window, then E(w) = w + 1 - E[L] identically;
+                        // a diploid's total is E(w1) + E(w2) = (w1 + w2) + 2(1 - E[L]); and
+                        // w1 + w2 sums each block's two allele lengths, which no re-pairing of the
+                        // homologues can change. Cancellation is then exact by algebra, over ALL
+                        // relative phase arrangements, without enumerating any of them.
+                        // THE INVARIANT IS PROVED, NOT MEASURED. In regime, max(0, n - L + 1) is
+                        // n - L + 1 for every L in the support, so exact = sum p(L)(n - L + 1) =
+                        // n + 1 - E[L] = affine IDENTICALLY in real arithmetic. Hence
+                        // below == 0 alone establishes it; a diploid's E(w1) + E(w2) is then
+                        // (w1 + w2) + 2(1 - E[L]), and w1 + w2 sums each block's two allele
+                        // lengths, which no re-pairing of the homologues changes. Cancellation is
+                        // exact over every relative phase arrangement without enumerating one.
+                        //
+                        // The residual below is therefore a NUMERICAL cross-check, not the gate:
+                        // `exact` accumulates one term per insert length while `affine` is closed
+                        // form, so they differ by double rounding. Reported with its relative size
+                        // so a real discrepancy could not hide inside it -- and NOT used to relax
+                        // the gate, because a threshold chosen to make a result pass is not a gate.
+                        tp << "worst_exact_minus_affine_abs\t" << worst_affine_gap << '\n';
+                        tp << "worst_exact_minus_affine_rel\t"
+                           << (maxw ? worst_affine_gap / static_cast<double>(maxw) : 0.0) << '\n';
+                        tp << "all_in_affine_regime\t" << (below == 0 ? 1 : 0) << '\n';
+                        tp << "cancellation_follows_by_algebra\t" << (below == 0 ? 1 : 0) << '\n';
+                        log.info("hybrid arity probe over " + std::to_string(bl.size()) +
+                                 " blocks: " + std::to_string(visited) + " of " +
+                                 std::to_string(total) + " windows, " + std::to_string(minw) + "-" +
+                                 std::to_string(maxw) + " bp, " + std::to_string(below) +
+                                 " below affine, worst exact-affine gap " +
+                                 std::to_string(worst_affine_gap));
+                    }
+                } else {
+                    // THE THREE-BLOCK FORM, and the only place these two geometries are built.
+                    // Constructing g2 = (second, last) unconditionally meant that for four blocks
+                    // it asked for a geometry between non-adjacent blocks -- dead, malformed, and
+                    // a standing hazard even while unused.
+                    const LinkageGeometry g1 = build_linkage_geometry(
+                        tcov.frames, tball, tvar, static_cast<std::uint32_t>(ba),
+                        static_cast<std::uint32_t>(bb), tflank, tip);
+                    const LinkageGeometry g2 = build_linkage_geometry(
+                        tcov.frames, tball, tvar, static_cast<std::uint32_t>(bb),
+                        static_cast<std::uint32_t>(bc), tflank, tip);
+                    const std::size_t c1 = g1.context.size(), c2 = g2.context.size();
+                    tp << "context_ab\t" << c1 << '\n';
+                    tp << "context_bc\t" << c2 << '\n';
+                    tp << "lflank\t" << g1.lflank.size() << '\n';
+                    tp << "rflank\t" << g2.rflank.size() << '\n';
+                    std::size_t minw = SIZE_MAX, maxw = 0, below = 0;
+                    for (const std::string& x : A)
+                    for (const std::string& y : Bv)
+                    for (const std::string& z : Cv) {
+                        const std::size_t w = g1.lflank.size() + x.size() + c1 + y.size() + c2 +
+                                              z.size() + g2.rflank.size();
+                        minw = std::min(minw, w); maxw = std::max(maxw, w);
+                        if (w < affine_from) ++below;
+                    }
+                    tp << "insert_hi\t" << tip.hi << '\n';
+                    tp << "affine_from\t" << affine_from << '\n';
+                    tp << "min_window\t" << minw << '\n';
+                    tp << "max_window\t" << maxw << '\n';
+                    tp << "windows_below_affine\t" << below << '\n';
+                    tp << "all_windows_affine\t" << (below == 0 ? 1 : 0) << '\n';
+                    // EXPOSURE ACROSS ALL FOUR ARRANGEMENTS. With three heterozygous blocks,
+                    // fixing the A assignment leaves two choices at B and two at C: four relative
+                    // phase arrangements, not straight versus crossed. Cancellation must hold over
+                    // all of them, and is asserted rather than argued from affineness.
+                    const auto expo = [&](const std::string& x, const std::string& y,
+                                          const std::string& z) {
+                        const std::size_t w = g1.lflank.size() + x.size() + c1 + y.size() + c2 +
+                                              z.size() + g2.rflank.size();
+                        return check_exposure(w, tip).exact;
+                    };
+                    // EVERY arrangement, not a sample. Capping the loops at eight alleles per
+                    // block would have left the one sub-affine window possibly outside the checked
+                    // set -- and that window is the entire question, so a sampled answer about it
+                    // is no answer. 16^2 * 10^2 * 8^2 is 1.6M tuples and costs nothing.
+                    double asym = 0.0;
+                    const std::size_t la = A.size(), lb = Bv.size(), lc = Cv.size();
+                    for (std::size_t i1 = 0; i1 < la; ++i1)
+                    for (std::size_t i2 = 0; i2 < la; ++i2)
+                    for (std::size_t j1 = 0; j1 < lb; ++j1)
+                    for (std::size_t j2 = 0; j2 < lb; ++j2)
+                    for (std::size_t k1 = 0; k1 < lc; ++k1)
+                    for (std::size_t k2 = 0; k2 < lc; ++k2) {
+                        const double base = expo(A[i1], Bv[j1], Cv[k1]) +
+                                            expo(A[i2], Bv[j2], Cv[k2]);
+                        const double alt1 = expo(A[i1], Bv[j2], Cv[k1]) +
+                                            expo(A[i2], Bv[j1], Cv[k2]);
+                        const double alt2 = expo(A[i1], Bv[j1], Cv[k2]) +
+                                            expo(A[i2], Bv[j2], Cv[k1]);
+                        const double alt3 = expo(A[i1], Bv[j2], Cv[k2]) +
+                                            expo(A[i2], Bv[j1], Cv[k1]);
+                        asym = std::max(asym, std::abs(base - alt1));
+                        asym = std::max(asym, std::abs(base - alt2));
+                        asym = std::max(asym, std::abs(base - alt3));
+                    }
+                    // THE SAME GATE AS THE GENERAL BRANCH. Reporting a numeric-equality verdict
+                    // here while k > 3 uses the proved invariant would be two different answers to
+                    // one question, and the numeric one reads as a failure on pure rounding.
+                    tp << "max_exposure_asymmetry_all_arrangements\t" << asym << '\n';
+                    tp << "all_in_affine_regime\t" << (below == 0 ? 1 : 0) << '\n';
+                    tp << "cancellation_follows_by_algebra\t" << (below == 0 ? 1 : 0) << '\n';
+                    // WHICH window is short, and by how much. One window below the boundary is a
+                    // different situation from many, and the size of the shortfall says whether
+                    // the residual asymmetry is a rounding artefact or a real term.
+                    std::size_t sa = 0, sb = 0, sc = 0;
+                    std::size_t worst_short = 0;
+                    for (std::size_t i = 0; i < A.size(); ++i)
+                    for (std::size_t j = 0; j < Bv.size(); ++j)
+                    for (std::size_t k = 0; k < Cv.size(); ++k) {
+                        const std::size_t w = g1.lflank.size() + A[i].size() + c1 + Bv[j].size() +
+                                              c2 + Cv[k].size() + g2.rflank.size();
+                        if (w < affine_from && (worst_short == 0 || w < worst_short)) {
+                            worst_short = w; sa = i; sb = j; sc = k;
+                        }
+                    }
+                    if (worst_short != 0) {
+                        tp << "shortest_window_alleles\t" << sa << "," << sb << "," << sc << '\n';
+                        tp << "shortest_window_bp\t" << worst_short << '\n';
+                        tp << "shortfall_bp\t" << (affine_from - worst_short) << '\n';
+                        tp << "allele_lengths\t" << A[sa].size() << "," << Bv[sb].size() << ","
+                           << Cv[sc].size() << '\n';
+                    }
+                    log.info("hybrid triple probe " + std::to_string(ba) + "," +
+                             std::to_string(bb) + "," + std::to_string(bc) + ": " +
+                             std::to_string(A.size()) + "x" + std::to_string(Bv.size()) + "x" +
+                             std::to_string(Cv.size()) + ", windows " + std::to_string(minw) +
+                             "-" + std::to_string(maxw) + ", affine from " +
+                             std::to_string(affine_from) + ", " + std::to_string(below) +
+                             " below, asymmetry " + std::to_string(asym));
+                }
+            }
             if (!hybrid_geometry_probe.empty()) {
                 const FrameCoverage gcov = assess_frame_coverage(graph, blocks, hap_names);
                 std::vector<std::vector<std::string>> ball(blocks.size());
@@ -1754,6 +2056,324 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         }
                     }
                     hyb_edges_considered = by_edge.size();
+                    // ---- CONTEXT DEPENDENCE ---------------------------------------------------
+                    // Does a neighbouring block change any fragment's STRUCTURAL SIGNATURE, or is
+                    // it only sequence that makes the window long enough for exposure to be affine?
+                    //
+                    // The question is exact and does not need a four-dimensional search. A state
+                    // lying wholly to the right of block ctx shifts uniformly when ctx's allele
+                    // changes: its start moves, its mismatch counts, insert length and multiplicity
+                    // do not, so its signature is invariant by construction. Only a state TOUCHING
+                    // ctx can differ -- and a state touches ctx only if one of the four mate
+                    // variants has an accepted placement overlapping ctx's span. So enumerate
+                    // exactly those: placements wholly inside each ctx allele, and placements
+                    // straddling its right boundary, which reach at most one read length past it.
+                    //
+                    // If there are none, ctx cannot affect any signature, and the factor's
+                    // statistical scope excludes it however much sequence it contributes.
+                    if (!hybrid_context_dependence.empty()) {
+                        std::vector<std::string> cp;
+                        std::string cu;
+                        for (char c : hybrid_context_dependence) {
+                            if (c == ',') { cp.push_back(cu); cu.clear(); } else cu.push_back(c);
+                        }
+                        cp.push_back(cu);
+                        const std::uint32_t ctx_b = static_cast<std::uint32_t>(std::stoul(cp[0]));
+                        std::vector<std::uint32_t> fb;
+                        for (std::size_t q = 1; q + 1 < cp.size(); ++q) {
+                            fb.push_back(static_cast<std::uint32_t>(std::stoul(cp[q])));
+                        }
+                        std::set<std::uint32_t> fbset(fb.begin(), fb.end());
+                        std::ofstream cd(cp.back());
+                        if (!cd) throw std::runtime_error("genotype: cannot write " + cp.back());
+                        // THE FACTOR'S EVIDENCE: the pairwise owners inside the block set plus the
+                        // Wide fragments whose whole variable scope lies inside it.
+                        std::vector<std::size_t> fset;
+                        for (const auto& kv : by_edge) {
+                            if (fbset.count(kv.first.first) && fbset.count(kv.first.second))
+                                fset.insert(fset.end(), kv.second.begin(), kv.second.end());
+                        }
+                        for (std::size_t fi = 0; fi < hf.size(); ++fi) {
+                            if (owners[fi].kind != OwnerKind::Wide) continue;
+                            bool inside = !owners[fi].var_scope.empty();
+                            for (std::uint32_t b : owners[fi].var_scope)
+                                if (!fbset.count(b)) { inside = false; break; }
+                            if (inside) fset.push_back(fi);
+                        }
+                        std::sort(fset.begin(), fset.end());
+                        fset.erase(std::unique(fset.begin(), fset.end()), fset.end());
+                        // The downstream sequence immediately after ctx, from ctx's own pairwise
+                        // geometry so it is the same sequence the factor would see.
+                        std::vector<std::vector<std::string>> cball(blocks.size());
+                        for (std::size_t q = 0; q < blocks.size(); ++q)
+                            cball[q] = blocks[q].allele_seq;
+                        // THE CONTEXT MAY SIT ON EITHER SIDE. Building (ctx, factor.front())
+                        // unconditionally asks for a geometry in the wrong order when ctx is to the
+                        // RIGHT, and the probe then refused with "blocks overlap or are out of
+                        // order" -- reporting nothing rather than testing block 7 at all.
+                        const bool ctx_left = ctx_b < fb.front();
+                        const std::uint32_t ga = ctx_left ? ctx_b : fb.back();
+                        const std::uint32_t gb = ctx_left ? fb.front() : ctx_b;
+                        const LinkageGeometry gctx = build_linkage_geometry(
+                            hyb_cov.frames, cball, block_variable, ga, gb,
+                            static_cast<std::size_t>(ip.hi), ip);
+                        cd << "field\tvalue\n";
+                        cd << "context_block\t" << ctx_b << '\n';
+                        cd << "factor_blocks\t" << cp[1];
+                        for (std::size_t q = 2; q + 1 < cp.size(); ++q) cd << "," << cp[q];
+                        cd << '\n';
+                        cd << "evidence_fragments\t" << fset.size() << '\n';
+                        cd << "context_alleles\t" << blocks[ctx_b].n_alleles << '\n';
+                        cd << "downstream_geometry_ok\t" << (gctx.ok ? 1 : 0) << '\n';
+                        if (!gctx.ok) {
+                            cd << "REFUSED\t" << gctx.refusal << '\n';
+                        } else {
+                            std::size_t touching = 0, placements = 0;
+                            std::vector<std::size_t> touch_frags;
+                            const auto& ctx_alleles = blocks[ctx_b].allele_seq;
+                            // Which neighbour sequence abuts the context on the side facing the
+                            // factor: its own alleles when the context is on the right.
+                            const std::vector<std::string>& abut =
+                                ctx_left ? gctx.alleles_b : gctx.alleles_a;
+                            // One index per context allele, reused across every fragment.
+                            for (std::size_t ai = 0; ai < ctx_alleles.size(); ++ai) {
+                                const std::string& A2 = ctx_alleles[ai];
+                                if (A2.empty()) continue;
+                                PieceIndex px;
+                                bool have_px = false;
+                                for (std::size_t k = 0; k < fset.size(); ++k) {
+                                    const Fragment& f = hf[fset[k]];
+                                    const std::size_t d1 = mate_band_edits(
+                                        hyb_params.max_divergence, f.r1.size());
+                                    const std::size_t d2 = mate_band_edits(
+                                        hyb_params.max_divergence, f.r2.size());
+                                    const std::size_t p1 = f.r1.size() / (d1 + 1);
+                                    if (!have_px && p1 >= 12 && A2.size() > 8 * p1) {
+                                        px = build_piece_index(A2, p1); have_px = true;
+                                    }
+                                    const std::string a1 = reverse_complement(f.r1);
+                                    const std::string a2s = reverse_complement(f.r2);
+                                    const std::string* mv[4] = {&f.r1, &a1, &f.r2, &a2s};
+                                    const std::size_t bd[4] = {d1, d1, d2, d2};
+                                    std::size_t hits = 0;
+                                    for (int m = 0; m < 4; ++m) {
+                                        // Wholly inside the context allele.
+                                        const auto pl = bounded_mate_placements(
+                                            *mv[m], A2, bd[m], nullptr,
+                                            have_px ? &px : nullptr);
+                                        hits += pl.size();
+                                        // Straddling its right boundary: at most one read length
+                                        // of the allele's tail plus the same of what follows.
+                                        const std::size_t L = mv[m]->size();
+                                        if (L > 1) {
+                                            const std::string tailA =
+                                                A2.size() <= L - 1 ? A2 : A2.substr(A2.size() - (L - 1));
+                                            const std::string headA =
+                                                A2.size() <= L - 1 ? A2 : A2.substr(0, L - 1);
+                                            for (const std::string& nx : abut) {
+                                                // Facing side: for a left context the factor is
+                                                // downstream, for a right context it is upstream.
+                                                const std::string near =
+                                                    ctx_left
+                                                        ? (nx.size() <= L - 1 ? nx : nx.substr(0, L - 1))
+                                                        : (nx.size() <= L - 1 ? nx
+                                                                              : nx.substr(nx.size() - (L - 1)));
+                                                const std::string bstr =
+                                                    ctx_left ? tailA + gctx.context + near
+                                                             : near + gctx.context + headA;
+                                                const std::size_t ctx_lo =
+                                                    ctx_left ? 0 : near.size() + gctx.context.size();
+                                                const std::size_t ctx_hi =
+                                                    ctx_left ? tailA.size() : bstr.size();
+                                                const auto pb = bounded_mate_placements(
+                                                    *mv[m], bstr, bd[m], nullptr, nullptr);
+                                                for (const MatePlacement& q : pb) {
+                                                    const long e = q.start + static_cast<long>(L);
+                                                    if (q.start < static_cast<long>(ctx_hi) &&
+                                                        e > static_cast<long>(ctx_lo)) ++hits;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if (hits > 0) {
+                                        placements += hits;
+                                        touch_frags.push_back(fset[k]);
+                                    }
+                                }
+                            }
+                            std::sort(touch_frags.begin(), touch_frags.end());
+                            touch_frags.erase(std::unique(touch_frags.begin(), touch_frags.end()),
+                                              touch_frags.end());
+                            touching = touch_frags.size();
+                            // WHOSE fragments they are. The evidence set here is every pairwise
+                            // owner inside the block span plus the Wide fragments scoped to it --
+                            // which for {4,5,6} includes edge 4-5's owners, and those belong to a
+                            // DIFFERENT factor. Without this breakdown a touch by someone else's
+                            // fragment reads as a dependency of this one.
+                            std::size_t touch_wide = 0, touch_link = 0;
+                            std::map<std::pair<std::uint32_t,std::uint32_t>, std::size_t> touch_edge;
+                            for (std::size_t fi : touch_frags) {
+                                if (owners[fi].kind == OwnerKind::Wide) ++touch_wide;
+                                else if (owners[fi].kind == OwnerKind::Linkage) {
+                                    ++touch_link;
+                                    touch_edge[{owners[fi].block_lo, owners[fi].block_hi}] += 1;
+                                }
+                            }
+                            std::size_t ev_wide = 0, ev_link = 0;
+                            for (std::size_t fi : fset) {
+                                if (owners[fi].kind == OwnerKind::Wide) ++ev_wide; else ++ev_link;
+                            }
+                            cd << "evidence_wide\t" << ev_wide << '\n';
+                            cd << "evidence_linkage\t" << ev_link << '\n';
+                            cd << "touching_wide\t" << touch_wide << '\n';
+                            cd << "touching_linkage\t" << touch_link << '\n';
+                            for (const auto& te : touch_edge) {
+                                cd << "touching_from_edge_" << te.first.first << "_"
+                                   << te.first.second << "\t" << te.second << '\n';
+                            }
+                            cd << "fragments_with_a_placement_touching_context\t" << touching
+                               << '\n';
+                            cd << "total_touching_placements\t" << placements << '\n';
+                            cd << "context_is_emission_relevant\t" << (touching ? 1 : 0) << '\n';
+                            cd << "effective_statistical_scope\t"
+                               << (touching ? "includes block " + std::to_string(ctx_b)
+                                            : "EXCLUDES block " + std::to_string(ctx_b)) << '\n';
+                            log.info("hybrid context dependence: block " + std::to_string(ctx_b) +
+                                     " over " + std::to_string(fset.size()) + " evidence "
+                                     "fragments -- " + std::to_string(touching) +
+                                     " have a placement touching it, " +
+                                     std::to_string(placements) + " placements");
+                        }
+                    }
+                    // ---- WIDE INVENTORY -------------------------------------------------------
+                    // Wide fragments are unconsumed evidence, and under the locus-wide transaction
+                    // ANY unconsumed Wide keeps the model INCOMPLETE. So repairing the exposure
+                    // edges is necessary and NOT sufficient: without this inventory the project
+                    // could finish that work and find C4 still unreachable for a reason already
+                    // visible now. Grouped by exact variable scope, because that is what decides
+                    // which factor could ever consume them.
+                    if (!hybrid_wide_inventory.empty()) {
+                        std::map<std::vector<std::uint32_t>, std::size_t> by_scope;
+                        std::size_t n_wide = 0;
+                        for (std::size_t fi = 0; fi < hf.size(); ++fi) {
+                            if (owners[fi].kind != OwnerKind::Wide) continue;
+                            ++n_wide;
+                            by_scope[owners[fi].var_scope] += 1;
+                        }
+                        std::ofstream wi(hybrid_wide_inventory);
+                        if (!wi) throw std::runtime_error("genotype: cannot write " +
+                                                          hybrid_wide_inventory);
+                        wi << "var_scope\tarity\tfragments\tmin_block\tmax_block"
+                              "\tminimal_factor_interval\tinterval_blocks\tconsecutive_variable"
+                              "\tcovered_by_existing_edge\n";
+                        std::size_t need_higher = 0, covered = 0;
+                        for (const auto& kv : by_scope) {
+                            const auto& sc = kv.first;
+                            std::string ss;
+                            for (std::size_t q = 0; q < sc.size(); ++q)
+                                ss += (q ? "," : "") + std::to_string(sc[q]);
+                            const std::uint32_t lo = sc.empty() ? 0 : sc.front();
+                            const std::uint32_t hi = sc.empty() ? 0 : sc.back();
+                            // The minimal factor interval is the variable run from lo to hi: a
+                            // factor cannot depend on a subset of the variables a fragment reads.
+                            std::size_t interval_blocks = 0;
+                            for (std::size_t b = lo; b <= hi && b < blocks.size(); ++b)
+                                if (blocks[b].n_alleles > 1) ++interval_blocks;
+                            const bool consec = interval_blocks == sc.size();
+                            // An existing PAIRWISE edge covers it only when the scope is exactly
+                            // two variable blocks with nothing variable between them.
+                            const bool by_pair = sc.size() == 2 && consec;
+                            if (by_pair) covered += kv.second; else need_higher += kv.second;
+                            wi << ss << '\t' << sc.size() << '\t' << kv.second << '\t' << lo
+                               << '\t' << hi << '\t' << lo << "-" << hi << '\t'
+                               << interval_blocks << '\t' << (consec ? 1 : 0) << '\t'
+                               << (by_pair ? 1 : 0) << '\n';
+                        }
+                        wi << "#total_wide_fragments\t" << n_wide << '\n';
+                        wi << "#distinct_scopes\t" << by_scope.size() << '\n';
+                        wi << "#fragments_needing_higher_order\t" << need_higher << '\n';
+                        wi << "#fragments_a_pairwise_edge_could_take\t" << covered << '\n';
+                        log.info("hybrid wide inventory: " + std::to_string(n_wide) +
+                                 " Wide fragments over " + std::to_string(by_scope.size()) +
+                                 " distinct scopes; " + std::to_string(need_higher) +
+                                 " need a higher-order factor");
+                    }
+                    // ---- EVIDENCE ACCOUNTING for a candidate super-factor ----------------------
+                    // Defined BEFORE any search is generalised: a factor whose input set is not
+                    // pinned is a factor whose cost cannot be judged and whose double-counting
+                    // cannot be excluded. Every fragment that would enter, exactly once, and every
+                    // competing claim on it, enumerated rather than assumed.
+                    if (!hybrid_super_ledger.empty()) {
+                        std::vector<std::string> lp;
+                        std::string cu;
+                        for (char c : hybrid_super_ledger) {
+                            if (c == ',') { lp.push_back(cu); cu.clear(); } else cu.push_back(c);
+                        }
+                        lp.push_back(cu);
+                        std::vector<std::uint32_t> sb;
+                        for (std::size_t q = 0; q + 1 < lp.size(); ++q) {
+                            sb.push_back(static_cast<std::uint32_t>(std::stoul(lp[q])));
+                        }
+                        std::set<std::uint32_t> sbset(sb.begin(), sb.end());
+                        std::ofstream lg(lp.back());
+                        if (!lg) throw std::runtime_error("genotype: cannot write " + lp.back());
+                        lg << "field\tvalue\n";
+                        std::string bs;
+                        for (std::size_t q = 0; q < sb.size(); ++q)
+                            bs += (q ? "," : "") + std::to_string(sb[q]);
+                        lg << "blocks\t" << bs << '\n';
+                        // The pairwise edges the super-factor would subsume: consecutive pairs
+                        // inside the block set.
+                        std::vector<std::size_t> uni;
+                        std::size_t pair_total = 0;
+                        std::map<std::pair<std::uint32_t,std::uint32_t>, std::size_t> per_pair;
+                        for (const auto& kv : by_edge) {
+                            if (sbset.count(kv.first.first) && sbset.count(kv.first.second)) {
+                                per_pair[kv.first] = kv.second.size();
+                                pair_total += kv.second.size();
+                                uni.insert(uni.end(), kv.second.begin(), kv.second.end());
+                            }
+                        }
+                        for (const auto& pp : per_pair) {
+                            lg << "owners_" << pp.first.first << "_" << pp.first.second << "\t"
+                               << pp.second << '\n';
+                        }
+                        std::sort(uni.begin(), uni.end());
+                        const std::size_t before = uni.size();
+                        uni.erase(std::unique(uni.begin(), uni.end()), uni.end());
+                        lg << "sum_of_pair_owner_counts\t" << pair_total << '\n';
+                        lg << "union_size\t" << uni.size() << '\n';
+                        // DISJOINTNESS is a property to check, not to hope for: a fragment owned by
+                        // two pairwise edges would be counted twice by a naive union.
+                        lg << "pairwise_sets_disjoint\t" << (before == uni.size() ? 1 : 0) << '\n';
+                        // WIDE fragments whose variable scope lies inside the block set: they are
+                        // currently unconsumed, and a super-factor spanning their scope is exactly
+                        // what could consume them. Listed either way.
+                        std::size_t wide_in = 0, wide_out = 0;
+                        for (std::size_t fi = 0; fi < hf.size(); ++fi) {
+                            if (owners[fi].kind != OwnerKind::Wide) continue;
+                            bool inside = !owners[fi].var_scope.empty();
+                            for (std::uint32_t b : owners[fi].var_scope)
+                                if (!sbset.count(b)) { inside = false; break; }
+                            if (inside) ++wide_in; else ++wide_out;
+                        }
+                        lg << "wide_scope_inside_blocks\t" << wide_in << '\n';
+                        lg << "wide_scope_outside_blocks\t" << wide_out << '\n';
+                        // NO OTHER CLAIM: none of these fragments may be Unary-owned or already
+                        // consumed elsewhere. Ownership is a partition, so this must hold by
+                        // construction -- which is why it is worth asserting rather than assuming.
+                        std::size_t misclassified = 0;
+                        for (std::size_t fi : uni)
+                            if (owners[fi].kind != OwnerKind::Linkage) ++misclassified;
+                        lg << "non_linkage_in_union\t" << misclassified << '\n';
+                        lg << "every_fragment_exactly_once\t"
+                           << ((before == uni.size() && misclassified == 0) ? 1 : 0) << '\n';
+                        log.info("hybrid super ledger over blocks " + bs + ": union " +
+                                 std::to_string(uni.size()) + " of " + std::to_string(pair_total) +
+                                 " pairwise owners, disjoint=" +
+                                 std::string(before == uni.size() ? "yes" : "NO") + ", wide inside " +
+                                 std::to_string(wide_in));
+                    }
                     // AN OPERATIONAL WORK GUARD on dense emission construction, until the
                     // support search exists. The cost is fragments x n_A x n_B window alignments
                     // per edge; C4 needs 1,154,642 and does not finish. This is a WORK count -- no

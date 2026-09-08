@@ -772,9 +772,9 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         for (std::size_t al : {std::size_t(0), std::size_t(1), std::size_t(2),
                                std::size_t(4), std::size_t(5)}) {
             for (std::size_t be : {std::size_t(0), std::size_t(3), std::size_t(6)}) {
-                VirtualWindow vw; vw.geom = &g;
-                vw.alpha = static_cast<std::uint32_t>(al);
-                vw.beta = static_cast<std::uint32_t>(be);
+                VirtualWindow vw;
+                vw.bind_pair(g, static_cast<std::uint32_t>(al),
+                             static_cast<std::uint32_t>(be));
                 const std::size_t start = g.lflank.size() - 30;
                 Fragment f;
                 f.name = "f" + std::to_string(al) + "_" + std::to_string(be);
@@ -1230,7 +1230,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         InsertPrior ip; ip.lo = 200; ip.hi = 600;
         ip.logp.assign(static_cast<std::size_t>(ip.hi - ip.lo + 1),
                        -std::log(static_cast<double>(ip.hi - ip.lo + 1)));
-        VirtualWindow vw; vw.geom = &g; vw.alpha = 1; vw.beta = 2;
+        VirtualWindow vw; vw.bind_pair(g, 1, 2);
         const std::size_t at = g.lflank.size() - 60;
         Fragment f; f.name = "b";
         for (std::size_t i = 0; i < 150; ++i) f.r1.push_back(vw.base_at(at + i));
@@ -1330,7 +1330,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             bool same = true;
             for (std::uint32_t al = 0; al < 2 && same; ++al) {
                 for (std::uint32_t be = 0; be < 2 && same; ++be) {
-                    VirtualWindow vw; vw.geom = &g; vw.alpha = al; vw.beta = be;
+                    VirtualWindow vw; vw.bind_pair(g, al, be);
                     const std::string m = vw.materialize();
                     if (m.size() != vw.size()) { same = false; break; }
                     for (std::size_t i = 0; i < m.size(); ++i)
@@ -1348,8 +1348,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             const auto g = geom_of({A1, A2}, {rseq(500)}, rseq(40), rseq(700), rseq(700));
             const std::size_t piece = 16;
             const auto ix = build_allele_product_index(g, piece);
-            VirtualWindow w1; w1.geom = &g; w1.alpha = 0; w1.beta = 0;
-            VirtualWindow w2; w2.geom = &g; w2.alpha = 1; w2.beta = 0;
+            VirtualWindow w1; w1.bind_pair(g, 0, 0);
+            VirtualWindow w2; w2.bind_pair(g, 1, 0);
             // A 150 bp read wholly inside B of window (alpha=0), and the SAME sequence inside
             // window (alpha=1), where it sits |A2|-|A1| further along.
             const std::size_t inb = g.lflank.size() + A1.size() + g.context.size() + 120;
@@ -1384,7 +1384,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             const std::size_t piece = 16;
             const auto ix = build_allele_product_index(g, piece);
             ok_(ix.ok && ix.complete, "an empty allele still yields a COMPLETE index");
-            VirtualWindow w; w.geom = &g; w.alpha = 1; w.beta = 1;   // empty A, short B
+            VirtualWindow w; w.bind_pair(g, 1, 1);   // empty A, short B
             const std::size_t at = g.lflank.size() - 40;             // spans L, (empty A), C, B, R
             std::string read;
             for (std::size_t i = 0; i < 150; ++i) read.push_back(w.base_at(at + i));
@@ -1400,7 +1400,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             for (const auto& st : sup.mate_states[0]) {
                 const std::uint32_t al = static_cast<std::uint32_t>(st.first >> 32);
                 const std::uint32_t be = static_cast<std::uint32_t>(st.first & 0xFFFFFFFFu);
-                VirtualWindow v; v.geom = &g; v.alpha = al; v.beta = be;
+                VirtualWindow v; v.bind_pair(g, al, be);
                 if (v.count_mismatches(f.r1, st.second, 0) != 0) continue;
                 for (std::size_t i = 0; i < f.r1.size(); ++i)
                     if (v.base_at(static_cast<std::size_t>(st.second) + i) != f.r1[i])

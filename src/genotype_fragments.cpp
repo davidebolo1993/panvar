@@ -4392,13 +4392,49 @@ void index_all_positions(const std::string& seq, std::size_t piece, std::uint32_
 
 }  // namespace
 
+void VirtualWindow::bind_pair(const LinkageGeometry& g, std::uint32_t a, std::uint32_t b) {
+    geom = &g; alpha = a; beta = b;
+    segments.clear();
+    segments.push_back(&g.lflank);
+    segments.push_back(&g.alleles_a[a]);
+    segments.push_back(&g.context);
+    segments.push_back(&g.alleles_b[b]);
+    segments.push_back(&g.rflank);
+}
+
+void VirtualWindow::bind_chain(const std::string& lflank,
+                               const std::vector<const std::string*>& alleles,
+                               const std::vector<const std::string*>& contexts,
+                               const std::string& rflank) {
+    geom = nullptr;
+    segments.clear();
+    segments.push_back(&lflank);
+    for (std::size_t i = 0; i < alleles.size(); ++i) {
+        segments.push_back(alleles[i]);
+        if (i + 1 < alleles.size()) segments.push_back(contexts[i]);
+    }
+    segments.push_back(&rflank);
+}
+
 std::size_t VirtualWindow::size() const {
+    if (!segments.empty()) {
+        std::size_t n = 0;
+        for (const std::string* s : segments) n += s->size();
+        return n;
+    }
     if (geom == nullptr) return 0;
     return geom->lflank.size() + geom->alleles_a[alpha].size() + geom->context.size() +
            geom->alleles_b[beta].size() + geom->rflank.size();
 }
 
 char VirtualWindow::base_at(std::size_t pos) const {
+    if (!segments.empty()) {
+        for (const std::string* s : segments) {
+            if (pos < s->size()) return (*s)[pos];
+            pos -= s->size();
+        }
+        return 'N';   // out of range; callers bound-check before entering
+    }
     const std::size_t lL = geom->lflank.size();
     if (pos < lL) return geom->lflank[pos];
     pos -= lL;
@@ -4427,6 +4463,12 @@ std::size_t VirtualWindow::count_mismatches(const std::string& read, long start,
 }
 
 std::string VirtualWindow::materialize() const {
+    if (!segments.empty()) {
+        std::string out;
+        out.reserve(size());
+        for (const std::string* s : segments) out += *s;
+        return out;
+    }
     return geom->lflank + geom->alleles_a[alpha] + geom->context + geom->alleles_b[beta] +
            geom->rflank;
 }
@@ -4992,7 +5034,7 @@ LinkageEmission linkage_emission_supported(const Fragment& fragment, const Linka
         const std::string* seqs[4] = {&fragment.r1, &a1, &fragment.r2, &a2};
         const std::size_t bands[4] = {d1, d1, d2, d2};
         for (int mi = 0; mi < 4; ++mi) {
-            VirtualWindow vw; vw.geom = &geom;
+            VirtualWindow vw;
             std::uint64_t cur = ~0ull;
             for (const auto& st : sup.mate_states[mi]) {
                 const std::uint32_t al = static_cast<std::uint32_t>(st.first >> 32);
@@ -5001,7 +5043,7 @@ LinkageEmission linkage_emission_supported(const Fragment& fragment, const Linka
                 // starts are a SUBSET of seeded starts, so a pair with no seed-compatible join has
                 // no verified one either. Skipping the rest is a sound prefilter, not a heuristic.
                 if (!keep_pair(sup, al, be, out.n_b)) continue;
-                if (st.first != cur) { vw.alpha = al; vw.beta = be; cur = st.first; }
+                if (st.first != cur) { vw.bind_pair(geom, al, be); cur = st.first; }
                 // CHARGED BEFORE THE COMPARISON, so the limit bounds work done rather than work
                 // already paid for.
                 if (budget != nullptr &&
