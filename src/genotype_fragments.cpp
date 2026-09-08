@@ -20,6 +20,8 @@
 #include <map>
 #include <mutex>
 #include <stdexcept>
+#include <array>
+#include <cstring>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -4820,7 +4822,8 @@ LinkageEmission linkage_emission_supported(const Fragment& fragment, const Linka
                                            double log_eps, double log_1meps, double log_p_bg,
                                            AlleleProductSupport* out_support,
                                            const AlleleProductIndex* index,
-                                           HybridWorkBudget* budget) {
+                                           HybridWorkBudget* budget,
+                                           std::vector<std::string>* out_cell_signatures) {
     LinkageEmission out;
     out.log_p_bg = log_p_bg;
     if (!geom.ok || fragment.r1.empty() || fragment.r2.empty()) return out;
@@ -4919,6 +4922,7 @@ LinkageEmission linkage_emission_supported(const Fragment& fragment, const Linka
                 ver[mi].push_back({st.first, Placed{st.second, static_cast<std::uint32_t>(mm)}});
             }
         }
+        std::vector<std::vector<std::array<std::uint32_t, 3>>>* collect = nullptr;
         const double half = std::log(0.5);
         const auto read_ll = [&](std::uint32_t e, std::size_t len) {
             return static_cast<double>(e) * log_eps +
@@ -4949,6 +4953,12 @@ LinkageEmission linkage_emission_supported(const Fragment& fragment, const Linka
                         const std::uint32_t e1 = fwd_is_m1 ? F[a].second.edits : R[b].second.edits;
                         const std::uint32_t e2 = fwd_is_m1 ? R[b].second.edits : F[a].second.edits;
                         const long insert = rev_end - F[a].second.start + 1;
+                        // THE SAME STATE that contributes the mass contributes the signature, so
+                        // the two cannot come to describe different things.
+                        if (collect != nullptr) {
+                            (*collect)[cell].push_back(
+                                {e1, e2, static_cast<std::uint32_t>(insert)});
+                        }
                         out.mass[cell] = log_add(out.mass[cell],
                                                  half + read_ll(e1, fragment.r1.size()) +
                                                  read_ll(e2, fragment.r2.size()) +
@@ -4958,8 +4968,24 @@ LinkageEmission linkage_emission_supported(const Fragment& fragment, const Linka
                 fi = fe; ri = re;
             }
         };
+        // THE STRUCTURAL SIGNATURE, collected alongside the mass from the same states, so the two
+        // cannot describe different things.
+        std::vector<std::vector<std::array<std::uint32_t, 3>>> sig;
+        if (out_cell_signatures != nullptr) sig.assign(out.n_a * out.n_b, {});
+        collect = out_cell_signatures != nullptr ? &sig : nullptr;
         join(0, 3, true);    // r1 forward with r2 reverse-complemented
         join(2, 1, false);   // r2 forward with r1 reverse-complemented
+        if (out_cell_signatures != nullptr) {
+            out_cell_signatures->assign(out.n_a * out.n_b, std::string());
+            for (std::size_t k = 0; k < sig.size(); ++k) {
+                std::sort(sig[k].begin(), sig[k].end());
+                std::string& b = (*out_cell_signatures)[k];
+                b.resize(sig[k].size() * 12);
+                for (std::size_t j = 0; j < sig[k].size(); ++j) {
+                    std::memcpy(&b[j * 12], sig[k][j].data(), 12);
+                }
+            }
+        }
     }
     for (const double m : out.mass)
         if (m != kNegInf) ++out.finite_emission_cells;

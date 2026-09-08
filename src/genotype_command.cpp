@@ -143,6 +143,11 @@ void print_genotype_help() {
         << "                              any refusal leaves the legacy call untouched.\n"
         << "      --hybrid-edges <path>   Per-edge sparse construction measurements, serialised\n"
         << "                              from the objects the caller builds.\n"
+        << "      --hybrid-edge-signature <a,b,path>  JOINT structural emission signatures on one\n"
+        << "                              edge: per-fragment classes, their sum, and the joint\n"
+        << "                              classes after intersecting every fragment's partition.\n"
+        << "      --hybrid-exposure-probe <path>  Per-configuration window length and exposure for\n"
+        << "                              every candidate edge, with the affine regime boundary.\n"
         << "      --hybrid-edge-oracle <a,b,path>  Run ONE edge through BOTH the supported search\n"
         << "                              and the dense oracle and compare them cell by cell --\n"
         << "                              finite set, multiplicity and mass -- writing the full\n"
@@ -390,6 +395,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
     std::string hybrid_edges_path;
     bool hybrid_dry_run = false;
     std::string hybrid_edge_oracle;      // "<a>,<b>:<path>" -- one edge, both paths, compared
+    std::string hybrid_edge_signature;   // "<a>,<b>,<path>" -- joint emission signatures
+    std::string hybrid_exposure_probe;   // per-configuration window length and exposure
     struct EdgeRow {
         std::uint32_t a = 0, b = 0;
         std::size_t na = 0, nb = 0, owned = 0, informative = 0, support = 0, stored = 0,
@@ -539,6 +546,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--hybrid-edges") hybrid_edges_path = require_value(arg);
         else if (arg == "--hybrid-dry-run") hybrid_dry_run = true;
         else if (arg == "--hybrid-edge-oracle") hybrid_edge_oracle = require_value(arg);
+        else if (arg == "--hybrid-edge-signature") hybrid_edge_signature = require_value(arg);
+        else if (arg == "--hybrid-exposure-probe") hybrid_exposure_probe = require_value(arg);
         else if (arg == "--hybrid-lambda-estimate") {
             hyb_params.lambda_source = HybridLinkageParameters::LambdaSource::Estimated;
         }
@@ -1805,6 +1814,99 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             edge_status.push_back(es);
                             continue;
                         }
+                        // ---- EXPOSURE GEOMETRY, no emissions built -------------------------
+                        // Cancellation is exact when exposure is AFFINE in the window length,
+                        // because window_len = const + |A_alpha| + |B_beta| makes it additive and
+                        // the crossed and straight sums coincide. Below hi-1 it is not affine, and
+                        // no amount of support work repairs that -- so the question is purely how
+                        // many configurations fall short, and by how much.
+                        if (!hybrid_exposure_probe.empty()) {
+                            static bool exp_hdr = false;
+                            std::ofstream xp(hybrid_exposure_probe,
+                                             exp_hdr ? std::ios::app : std::ios::trunc);
+                            if (!exp_hdr) {
+                                xp << "block_a\tblock_b\tn_a\tn_b\tconfigs\tinsert_hi"
+                                      "\taffine_from\tmin_window\tmax_window\tconfigs_below"
+                                      "\tshortfall_bp\tmin_exposure\tmax_exposure"
+                                      "\tmax_asymmetry\tlflank\trflank\texposure_affine"
+                                      "\tleft_block_common_suffix\tright_block_common_prefix"
+                                      "\treachable_min_window\tcould_become_affine\n";
+                                exp_hdr = true;
+                            }
+                            const std::size_t na2 = geom.alleles_a.size();
+                            const std::size_t nb2 = geom.alleles_b.size();
+                            std::size_t below = 0, minw = SIZE_MAX, maxw = 0;
+                            double mine = 1e300, maxe = -1e300, asym = 0.0;
+                            const std::size_t affine_from =
+                                static_cast<std::size_t>(std::max<long>(0, ip.hi - 1));
+                            for (std::size_t k = 0; k < geom.window_len.size(); ++k) {
+                                minw = std::min(minw, geom.window_len[k]);
+                                maxw = std::max(maxw, geom.window_len[k]);
+                                mine = std::min(mine, geom.exposure[k]);
+                                maxe = std::max(maxe, geom.exposure[k]);
+                                if (geom.window_len[k] < affine_from) ++below;
+                            }
+                            for (std::size_t a1 = 0; a1 < na2; ++a1)
+                            for (std::size_t b1 = 0; b1 < nb2; ++b1)
+                            for (std::size_t a2 = 0; a2 < na2; ++a2)
+                            for (std::size_t b2 = 0; b2 < nb2; ++b2) {
+                                asym = std::max(asym, std::abs(
+                                    (geom.exposure[a1 * nb2 + b1] + geom.exposure[a2 * nb2 + b2]) -
+                                    (geom.exposure[a1 * nb2 + b2] + geom.exposure[a2 * nb2 + b1])));
+                            }
+                            // INVARIANT CONTEXT INSIDE A VARIABLE BLOCK. A zero derived flank
+                            // means no complete fixed block sits outside the edge -- it does NOT
+                            // mean the neighbouring block offers no candidate-independent
+                            // sequence. Every allele of the block to the left may share a common
+                            // SUFFIX, and every allele of the block to the right a common PREFIX;
+                            // those are invariant even though the block is variable, and they are
+                            // legitimate flank. Measured before concluding the refusal is genuine.
+                            const auto common_suffix = [](const std::vector<std::string>& v) {
+                                if (v.empty()) return static_cast<std::size_t>(0);
+                                std::size_t n = v[0].size();
+                                for (const std::string& x : v) n = std::min(n, x.size());
+                                std::size_t k = 0;
+                                while (k < n) {
+                                    const char c = v[0][v[0].size() - 1 - k];
+                                    bool same = true;
+                                    for (const std::string& x : v)
+                                        if (x[x.size() - 1 - k] != c) { same = false; break; }
+                                    if (!same) break;
+                                    ++k;
+                                }
+                                return k;
+                            };
+                            const auto common_prefix = [](const std::vector<std::string>& v) {
+                                if (v.empty()) return static_cast<std::size_t>(0);
+                                std::size_t n = v[0].size();
+                                for (const std::string& x : v) n = std::min(n, x.size());
+                                std::size_t k = 0;
+                                while (k < n) {
+                                    const char c = v[0][k];
+                                    bool same = true;
+                                    for (const std::string& x : v)
+                                        if (x[k] != c) { same = false; break; }
+                                    if (!same) break;
+                                    ++k;
+                                }
+                                return k;
+                            };
+                            std::size_t left_inv = 0, right_inv = 0;
+                            if (es.block_a > 0)
+                                left_inv = common_suffix(blocks[es.block_a - 1].allele_seq);
+                            if (es.block_b + 1 < blocks.size())
+                                right_inv = common_prefix(blocks[es.block_b + 1].allele_seq);
+                            const std::size_t reachable = minw + left_inv + right_inv;
+                            xp << es.block_a << '\t' << es.block_b << '\t' << na2 << '\t' << nb2
+                               << '\t' << geom.window_len.size() << '\t' << ip.hi << '\t'
+                               << affine_from << '\t' << minw << '\t' << maxw << '\t' << below
+                               << '\t' << (minw < affine_from ? affine_from - minw : 0) << '\t'
+                               << mine << '\t' << maxe << '\t' << asym << '\t'
+                               << geom.lflank.size() << '\t' << geom.rflank.size() << '\t'
+                               << (geom.exposure_affine ? 1 : 0) << '\t'
+                               << left_inv << '\t' << right_inv << '\t' << reachable << '\t'
+                               << (reachable >= affine_from ? 1 : 0) << '\n';
+                        }
                         // THE ALLELE INDEX, ONCE PER EDGE. Built from this edge's own piece
                         // length; every fragment then does hash lookups instead of re-scanning
                         // alleles up to 26 kb. Scanning per fragment is 1,274,940 full-allele scans
@@ -1967,6 +2069,179 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                          std::to_string(fin_s) + " of " +
                                          std::to_string(fin_d) + " finite, " +
                                          std::to_string(secs) + " s");
+                            }
+                        }
+                        // ---- JOINT EMISSION SIGNATURES -------------------------------------
+                        // Per-fragment classes can CUT ACROSS one another, so their sum is not the
+                        // achievable compression and pooled equal masses are not shareable at all.
+                        // Two allele pairs may be collapsed only when the WHOLE vector of
+                        // per-fragment signatures is identical, which is what this intersects.
+                        if (!hybrid_edge_signature.empty()) {
+                            const std::size_t s1 = hybrid_edge_signature.find(',');
+                            const std::size_t s2 = s1 == std::string::npos ? s1
+                                : hybrid_edge_signature.find(',', s1 + 1);
+                            if (s1 != std::string::npos && s2 != std::string::npos &&
+                                std::stoul(hybrid_edge_signature.substr(0, s1)) == es.block_a &&
+                                std::stoul(hybrid_edge_signature.substr(s1 + 1, s2 - s1 - 1)) ==
+                                    es.block_b) {
+                                const std::string spath = hybrid_edge_signature.substr(s2 + 1);
+                                const auto ts = std::chrono::steady_clock::now();
+                                const std::size_t ncell = static_cast<std::size_t>(
+                                    blocks[es.block_a].n_alleles) * blocks[es.block_b].n_alleles;
+                                std::vector<std::string> joint(ncell);
+                                std::ofstream sf(spath);
+                                sf << "fragment\tfinite_cells\tdistinct_signatures\n";
+                                HybridWorkBudget sb;
+                                sb.max_proposed_cells = hybrid_max_proposed_cells;
+                                sb.max_full_read_verifications =
+                                    hybrid_max_full_read_verifications;
+                                std::uint64_t sum_per_fragment = 0;
+                                std::size_t n_fb = 0, n_refused = 0, n_badsize = 0,
+                                            n_contributed = 0;
+                                std::vector<std::size_t> per_frag;
+                                for (std::size_t fi : kv.second) {
+                                    const std::size_t len = hf[fi].bases();
+                                    const std::size_t bee = static_cast<std::size_t>(
+                                        hyb_params.bg_divergence * static_cast<double>(len));
+                                    const double bgf = static_cast<double>(bee) * lep +
+                                                       static_cast<double>(len - bee) * l1m;
+                                    AlleleProductSupport sp;
+                                    std::vector<std::string> cs;
+                                    const LinkageEmission S = linkage_emission_supported(
+                                        hf[fi], geom, ip, hyb_params.max_divergence, lep, l1m, bgf,
+                                        &sp, aidx.ok ? &aidx : nullptr, &sb, &cs);
+                                    // FAIL CLOSED. A fragment that falls back, runs out of budget
+                                    // or returns a malformed vector is COUNTED, never skipped: a
+                                    // joint class computed over a subset of the fragments is not a
+                                    // smaller answer, it is a wrong one -- and silently smaller in
+                                    // exactly the flattering direction.
+                                    if (sp.exhaustive_fallback) { ++n_fb; continue; }
+                                    if (S.work_refused) { ++n_refused; continue; }
+                                    if (cs.size() != ncell) { ++n_badsize; continue; }
+                                    ++n_contributed;
+                                    std::unordered_set<std::string> own(cs.begin(), cs.end());
+                                    sum_per_fragment += own.size();
+                                    per_frag.push_back(own.size());
+                                    std::size_t fin = 0;
+                                    for (std::size_t k = 0; k < ncell; ++k) {
+                                        if (!cs[k].empty()) ++fin;
+                                        // The joint key is the CONCATENATION over fragments, with a
+                                        // length prefix so two different splits cannot alias.
+                                        const std::uint32_t n =
+                                            static_cast<std::uint32_t>(cs[k].size());
+                                        joint[k].append(reinterpret_cast<const char*>(&n), 4);
+                                        joint[k].append(cs[k]);
+                                    }
+                                    sf << hf[fi].name << '\t' << fin << '\t' << own.size() << '\n';
+                                }
+                                const bool sound = n_contributed == kv.second.size() &&
+                                                   n_fb == 0 && n_refused == 0 && n_badsize == 0;
+                                // SIGNATURE IDs, so the phase pattern can be keyed by them.
+                                std::unordered_map<std::string, std::uint32_t> sid;
+                                std::vector<std::uint32_t> qid(ncell, 0);
+                                for (std::size_t k = 0; k < ncell; ++k) {
+                                    const auto it = sid.emplace(joint[k],
+                                        static_cast<std::uint32_t>(sid.size())).first;
+                                    qid[k] = it->second;
+                                }
+                                const std::uint64_t jc = sid.size();
+                                // THE FOUR-SIGNATURE PHASE PATTERN, which is what psi actually
+                                // stores. K joint haploid signatures bound the RAW diploid score
+                                // pairs by K^2, but a class is keyed by an unordered A-pair and an
+                                // unordered B-pair and its delta is built from FOUR corners --
+                                // straight {q11,q22} against crossed {q12,q21}, each unordered
+                                // because the mixture is symmetric in its two arguments. Two
+                                // content classes can share straight corners and differ on crossed,
+                                // so K^2 is not the count of production factor states.
+                                std::unordered_set<std::uint64_t> patterns;
+                                std::size_t affected = 0;
+                                const std::size_t NA = blocks[es.block_a].n_alleles;
+                                const std::size_t NB = blocks[es.block_b].n_alleles;
+                                for (std::size_t a1 = 0; a1 + 1 < NA; ++a1)
+                                for (std::size_t a2 = a1 + 1; a2 < NA; ++a2)
+                                for (std::size_t b1 = 0; b1 + 1 < NB; ++b1)
+                                for (std::size_t b2 = b1 + 1; b2 < NB; ++b2) {
+                                    const std::uint32_t q11 = qid[a1 * NB + b1];
+                                    const std::uint32_t q22 = qid[a2 * NB + b2];
+                                    const std::uint32_t q12 = qid[a1 * NB + b2];
+                                    const std::uint32_t q21 = qid[a2 * NB + b1];
+                                    // A class matters only if some corner carries mass; an
+                                    // all-empty quadruple contributes nothing to psi.
+                                    if (joint[a1 * NB + b1].find_first_not_of('\0') ==
+                                            std::string::npos &&
+                                        joint[a2 * NB + b2].find_first_not_of('\0') ==
+                                            std::string::npos &&
+                                        joint[a1 * NB + b2].find_first_not_of('\0') ==
+                                            std::string::npos &&
+                                        joint[a2 * NB + b1].find_first_not_of('\0') ==
+                                            std::string::npos) continue;
+                                    ++affected;
+                                    const std::uint64_t sA = std::min(q11, q22);
+                                    const std::uint64_t sB = std::max(q11, q22);
+                                    const std::uint64_t cA = std::min(q12, q21);
+                                    const std::uint64_t cB = std::max(q12, q21);
+                                    patterns.insert((sA << 48) | (sB << 32) | (cA << 16) | cB);
+                                }
+                                std::sort(per_frag.begin(), per_frag.end());
+                                const double ssec = std::chrono::duration<double>(
+                                    std::chrono::steady_clock::now() - ts).count();
+                                sf << "#edge\t" << es.block_a << '-' << es.block_b << '\n'
+                                   << "#alleles\t" << blocks[es.block_a].n_alleles << 'x'
+                                   << blocks[es.block_b].n_alleles << '\n'
+                                   << "#owned_fragments\t" << kv.second.size() << '\n'
+                                   << "#fragments_contributed\t" << n_contributed << '\n'
+                                   << "#fallback_fragments\t" << n_fb << '\n'
+                                   << "#work_refused_fragments\t" << n_refused << '\n'
+                                   << "#bad_signature_size\t" << n_badsize << '\n'
+                                   << "#sound\t" << (sound ? 1 : 0) << '\n'
+                                   << "#allele_pair_cells\t" << ncell << '\n'
+                                   << "#per_fragment_classes_min\t"
+                                   << (per_frag.empty() ? 0 : per_frag.front()) << '\n'
+                                   << "#per_fragment_classes_median\t"
+                                   << (per_frag.empty() ? 0 : per_frag[per_frag.size() / 2]) << '\n'
+                                   << "#per_fragment_classes_max\t"
+                                   << (per_frag.empty() ? 0 : per_frag.back()) << '\n'
+                                   << "#sum_per_fragment_classes\t" << sum_per_fragment << '\n'
+                                   << "#joint_classes\t" << jc << '\n'
+                                   << "#joint_compression\t"
+                                   << (jc ? static_cast<double>(ncell) / jc : 0.0) << '\n'
+                                   << "#raw_diploid_signature_pairs_upper_bound\t" << jc * jc
+                                   << '\n'
+                                   << "#affected_classes\t" << affected << '\n'
+                                   << "#distinct_phase_patterns\t" << patterns.size() << '\n'
+                                   << "#full_read_verifications\t" << sb.full_read_verifications
+                                   << '\n'
+                                   << "#seconds\t" << ssec << '\n';
+                                if (!sound) {
+                                    sf << "#REFUSED\tjoint classes not emitted: "
+                                          "contributed " << n_contributed << " of "
+                                       << kv.second.size() << ", fallbacks " << n_fb
+                                       << ", work-refused " << n_refused
+                                       << ", malformed " << n_badsize << '\n';
+                                }
+                                if (!sound) {
+                                    throw std::runtime_error(
+                                        "genotype: --hybrid-edge-signature refuses on edge " +
+                                        std::to_string(es.block_a) + "-" +
+                                        std::to_string(es.block_b) + ": " +
+                                        std::to_string(n_contributed) + " of " +
+                                        std::to_string(kv.second.size()) + " fragments "
+                                        "contributed (fallbacks " + std::to_string(n_fb) +
+                                        ", work-refused " + std::to_string(n_refused) +
+                                        ", malformed " + std::to_string(n_badsize) + "). A joint "
+                                        "class over a subset of the fragments is not a result.");
+                                }
+                                log.info("hybrid edge signature " + std::to_string(es.block_a) +
+                                         "-" + std::to_string(es.block_b) + ": " +
+                                         std::to_string(ncell) + " cells, per-fragment classes " +
+                                         std::to_string(per_frag.empty() ? 0 : per_frag.front()) +
+                                         "/" + std::to_string(per_frag.empty() ? 0
+                                                : per_frag[per_frag.size() / 2]) + "/" +
+                                         std::to_string(per_frag.empty() ? 0 : per_frag.back()) +
+                                         " (min/med/max), JOINT " + std::to_string(jc) +
+                                         ", phase patterns " + std::to_string(patterns.size()) +
+                                         " over " + std::to_string(affected) + " affected classes, " +
+                                         std::to_string(ssec) + " s");
                             }
                         }
                         std::vector<LinkageEmission> ems;

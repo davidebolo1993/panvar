@@ -1965,12 +1965,19 @@ LinkageEmission linkage_emission(const Fragment& fragment, const LinkageGeometry
 // propose_allele_pairs() reaches. A pair it does not propose is provably empty by the pigeonhole, so
 // its cell is -inf -- the same value the dense form would compute, not an approximation of it.
 // `out_support`, when given, receives the search's counters.
+// `out_cell_signatures`, when non-null, receives one STRUCTURAL signature per allele-pair cell:
+// the canonical (sorted) multiset of (m1_edits, m2_edits, insert) over that cell's verified
+// fragment states, serialised to bytes. With read lengths, epsilon and the insert prior fixed for a
+// fragment, that multiset DETERMINES the cell's mass exactly -- so two cells with equal signatures
+// have equal mass by construction, with no tolerance anywhere. Equal mass does NOT imply equal
+// signature, which is why the signature and not the mass is what may define a class.
 LinkageEmission linkage_emission_supported(const Fragment& fragment, const LinkageGeometry& geom,
                                            const InsertPrior& ip, double max_divergence,
                                            double log_eps, double log_1meps, double log_p_bg,
                                            AlleleProductSupport* out_support = nullptr,
                                            const AlleleProductIndex* index = nullptr,
-                                           HybridWorkBudget* budget = nullptr);
+                                           HybridWorkBudget* budget = nullptr,
+                                           std::vector<std::string>* out_cell_signatures = nullptr);
 
 // THE EDGE POTENTIAL, aggregated in the one order that is a diploid likelihood:
 //
