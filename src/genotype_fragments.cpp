@@ -4404,6 +4404,22 @@ ChainEdgeLinkage make_kernel_edge(const LinkageEdge& edge,
     return out;
 }
 
+double estimate_fragment_lambda(std::size_t n_fragments,
+                                const std::vector<std::size_t>& panel_lengths,
+                                std::size_t* median_length_out) {
+    if (median_length_out != nullptr) *median_length_out = 0;
+    if (n_fragments == 0 || panel_lengths.empty()) return 0.0;
+    std::vector<std::size_t> v = panel_lengths;
+    std::sort(v.begin(), v.end());
+    // MEDIAN, not mean: a panel with one truncated or one unusually long haplotype should not move
+    // the depth scale, and at a length-variable locus the mean is exactly what does move.
+    const std::size_t med = v.size() % 2 ? v[v.size() / 2]
+                                         : (v[v.size() / 2 - 1] + v[v.size() / 2]) / 2;
+    if (median_length_out != nullptr) *median_length_out = med;
+    if (med == 0) return 0.0;
+    return static_cast<double>(n_fragments) / (2.0 * static_cast<double>(med));
+}
+
 HybridCompletenessReport assess_hybrid_completeness(const std::vector<FragmentOwner>& owners,
                                                     const std::vector<EdgeStatusEntry>& edges) {
     HybridCompletenessReport R;
@@ -4439,7 +4455,7 @@ HybridCompletenessReport assess_hybrid_completeness(const std::vector<FragmentOw
         if (e.status == LinkageStatus::Ok) continue;
         EdgeRefusal r;
         r.block_a = e.block_a; r.block_b = e.block_b;
-        r.status = e.status; r.n_fragments = e.n_fragments;
+        r.status = e.status; r.n_fragments = e.n_fragments; r.detail = e.detail;
         R.refusals.push_back(r);             // every one, in edge order
     }
     R.ownership_complete = (R.unconsumed_wide == 0 && R.unconsumed_refused_edge == 0 &&

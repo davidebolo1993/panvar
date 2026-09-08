@@ -27,6 +27,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <atomic>
+#include <chrono>
 #include <fstream>
 #include <iomanip>
 
@@ -139,6 +141,9 @@ void print_genotype_help() {
         << "                              any refusal leaves the legacy call untouched.\n"
         << "      --hybrid-status <path>  Where the hybrid status report is written, including\n"
         << "                              every linkage parameter used.\n"
+        << "      --hybrid-lambda-estimate  Estimate lambda candidate-independently as\n"
+        << "                              N_fragments / (2 * median panel haplotype length). The\n"
+        << "                              only option available on real data.\n"
         << "      --hybrid-lambda <x>     Fragment-start intensity for the linkage factors. NOT the\n"
         << "                              marker model's lambda_hap (different units), and never\n"
         << "                              fitted to the winning candidate. Default 0.05.\n"
@@ -337,6 +342,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
     std::string exclude_fragments_path;
     std::string hybrid_preflight;
     bool hybrid_call = false;
+    std::string hybrid_geometry_probe;
     HybridLinkageParameters hyb_params;
     std::string hybrid_status_path;
     double depth_quantile = 0.75;
@@ -448,17 +454,21 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--exclude-fragments") exclude_fragments_path = require_value(arg);
         else if (arg == "--hybrid-preflight") hybrid_preflight = require_value(arg);
         else if (arg == "--hybrid-call") hybrid_call = true;
+        else if (arg == "--hybrid-geometry-probe") hybrid_geometry_probe = require_value(arg);
         else if (arg == "--hybrid-status") hybrid_status_path = require_value(arg);
         else if (arg == "--hybrid-fragment-sd") hyb_params.fragment_sd = std::stod(require_value(arg));
         else if (arg == "--hybrid-divergence") hyb_params.max_divergence = std::stod(require_value(arg));
         else if (arg == "--hybrid-error-rate") hyb_params.error_rate = std::stod(require_value(arg));
         else if (arg == "--hybrid-bg-divergence") hyb_params.bg_divergence = std::stod(require_value(arg));
         else if (arg == "--hybrid-outlier-mix") hyb_params.outlier_mix = std::stod(require_value(arg));
+        else if (arg == "--hybrid-lambda-estimate") {
+            hyb_params.lambda_source = HybridLinkageParameters::LambdaSource::Estimated;
+        }
         else if (arg == "--hybrid-lambda") {
             // FRAGMENT-START INTENSITY, supplied. Never derived from the marker model's lambda_hap
             // (different units) and never fitted to the winning candidate.
             hyb_params.lambda = std::stod(require_value(arg));
-            hyb_params.lambda_supplied = true;
+            hyb_params.lambda_source = HybridLinkageParameters::LambdaSource::Supplied;
         }
         else if (arg == "--dump-markers") dump_markers = require_value(arg);
         else if (arg == "--dump-anchors") dump_markers = require_value(arg);  // former name
@@ -1465,6 +1475,44 @@ int run_genotype_command(const std::vector<std::string>& args) {
             hap_names.reserve(panel_graph.paths.size());
             for (const PathRecord& p : panel_graph.paths) hap_names.push_back(p.name);
 
+            // ---- LINKAGE GEOMETRY PROBE ---------------------------------------------------
+            // Geometry depends only on the frames, the block alleles and the flank width -- NOT on
+            // any fragment -- so every candidate edge can be tested in seconds instead of behind a
+            // ten-minute ownership pass. Written because the first C4 run refused all ten edges and
+            // the status recorded only "not-computed": the reason string was dropped, so the
+            // failure could not be diagnosed without guessing.
+            if (!hybrid_geometry_probe.empty()) {
+                const FrameCoverage gcov = assess_frame_coverage(graph, blocks, hap_names);
+                std::vector<std::vector<std::string>> ball(blocks.size());
+                for (std::size_t b = 0; b < blocks.size(); ++b) ball[b] = blocks[b].allele_seq;
+                long minl = 1;
+                for (const std::string& rp : read_paths) { (void)rp; }
+                const InsertPrior gip = make_insert_prior(fragment_len, hyb_params.fragment_sd,
+                                                          hyb_params.discordant_rate,
+                                                          hyb_params.insert_sigmas,
+                                                          std::max<long>(1, minl));
+                std::ofstream gp(hybrid_geometry_probe);
+                if (!gp) throw std::runtime_error("genotype: cannot write " + hybrid_geometry_probe);
+                gp << "block_a\tblock_b\tn_alleles_a\tn_alleles_b\tvariable_a\tvariable_b"
+                      "\tflank_bp\tok\treason\n";
+                for (std::size_t b = 1; b < blocks.size(); ++b) {
+                    const std::size_t a = b - 1;
+                    for (std::size_t flank : {static_cast<std::size_t>(gip.hi),
+                                              static_cast<std::size_t>(0)}) {
+                        const LinkageGeometry g2 = build_linkage_geometry(
+                            gcov.frames, ball, static_cast<std::uint32_t>(a),
+                            static_cast<std::uint32_t>(b), flank, gip);
+                        gp << a << '\t' << b << '\t' << blocks[a].n_alleles << '\t'
+                           << blocks[b].n_alleles << '\t' << (blocks[a].n_alleles > 1 ? 1 : 0)
+                           << '\t' << (blocks[b].n_alleles > 1 ? 1 : 0) << '\t' << flank << '\t'
+                           << (g2.ok ? 1 : 0) << '\t'
+                           << (g2.refusal.empty() ? "-" : g2.refusal) << '\n';
+                    }
+                }
+                gp.flush();
+                log.wrote({hybrid_geometry_probe});
+            }
+
             // ---- HYBRID TRANSACTION -------------------------------------------------------
             // Planned in full before a single occurrence is subtracted. Every failure path leaves
             // the marker counts untouched, so the legacy call remains exactly what it would be.
@@ -1489,6 +1537,20 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                                  static_cast<long>(F.r1.size() + F.r2.size()));
                     }
                     hyb_params.fragment_len = fragment_len;   // the library geometry in force
+                    // ALWAYS COMPUTED, even when a supplied lambda is used, so the ratio between
+                    // the two is reportable and the arms are comparable.
+                    std::vector<std::size_t> panel_lengths;
+                    panel_lengths.reserve(hyb_cov.frames.size());
+                    for (const CandidateFrame& F : hyb_cov.frames) {
+                        panel_lengths.push_back(F.seq.size());
+                    }
+                    hyb_params.n_fragments = hf.size();
+                    hyb_params.lambda_estimated = estimate_fragment_lambda(
+                        hf.size(), panel_lengths, &hyb_params.median_panel_length);
+                    if (hyb_params.lambda_source ==
+                        HybridLinkageParameters::LambdaSource::Estimated) {
+                        hyb_params.lambda = hyb_params.lambda_estimated;
+                    }
                     const InsertPrior ip = make_insert_prior(hyb_params.fragment_len,
                                                              hyb_params.fragment_sd,
                                                              hyb_params.discordant_rate,
@@ -1497,12 +1559,51 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     const double l1m = std::log1p(-hyb_params.error_rate);
                     // OWNERSHIP over the SAME frames the preflight reported: the object is passed,
                     // not recomputed, so report and decision cannot describe different runs.
+                    // THE PIECE INDEX, built once over the panel and reused for every fragment.
+                    // Without it bounded_mate_placements scans each candidate linearly: on C4 that
+                    // is 131 candidates x 226 kb x 4 mates x 23953 fragments, and the run did not
+                    // finish in 55 minutes. The index is the same pigeonhole structure the interval
+                    // scorer uses; omitting it here was a wiring omission, not a design choice.
+                    std::vector<PieceIndex> pidx;
+                    {
+                        std::size_t piece = 0;
+                        for (const Fragment& F : hf) {
+                            if (F.r1.empty()) continue;
+                            piece = F.r1.size() /
+                                    (mate_band_edits(hyb_params.max_divergence, F.r1.size()) + 1);
+                            break;
+                        }
+                        if (piece >= 12) {
+                            pidx.resize(hyb_cov.frames.size());
+                            run_parallel(hyb_cov.frames.size(), options.threads,
+                                         [&](std::size_t h) {
+                                             pidx[h] = build_piece_index(hyb_cov.frames[h].seq,
+                                                                         piece);
+                                         });
+                            log.info("hybrid: piece index over " +
+                                     std::to_string(hyb_cov.frames.size()) + " candidates at " +
+                                     std::to_string(piece) + " bp");
+                        }
+                    }
                     std::vector<FragmentOwner> owners(hf.size());
+                    std::atomic<std::size_t> own_done{0};
+                    const auto own_t0 = std::chrono::steady_clock::now();
                     run_parallel(hf.size(), options.threads, [&](std::size_t fi) {
                         owners[fi] = assign_fragment_owner(hf[fi], hyb_cov.frames, block_variable,
-                                                           ip, hyb_params.max_divergence, lep, l1m, 1e-6,
-                                                           nullptr);
+                                                           ip, hyb_params.max_divergence, lep, l1m,
+                                                           1e-6, pidx.empty() ? nullptr : &pidx);
+                        // PROGRESS. A silent multi-minute pass is exactly what made the first C4
+                        // attempt uninterpretable until it was killed.
+                        const std::size_t n = ++own_done;
+                        if (n % 5000 == 0) {
+                            log.info("hybrid: ownership " + std::to_string(n) + " / " +
+                                     std::to_string(hf.size()) + " fragments");
+                        }
                     });
+                    log.info("hybrid: ownership over " + std::to_string(hf.size()) +
+                             " fragments in " +
+                             std::to_string(std::chrono::duration<double>(
+                                 std::chrono::steady_clock::now() - own_t0).count()) + " s");
                     std::map<std::pair<std::uint32_t, std::uint32_t>,
                              std::vector<std::size_t>> by_edge;
                     for (std::size_t fi = 0; fi < hf.size(); ++fi) {
@@ -1525,7 +1626,10 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         const LinkageGeometry geom = build_linkage_geometry(
                             hyb_cov.frames, ballele, es.block_a, es.block_b, FLANK, ip);
                         if (!geom.ok) {
+                            // THE REASON, kept. Recording only "not-computed" made the first C4
+                            // refusal undiagnosable without re-reading the source.
                             es.status = LinkageStatus::NotComputed;
+                            es.detail = geom.refusal;
                             edge_status.push_back(es);
                             continue;
                         }
@@ -1595,13 +1699,25 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     hs << "unconsumed_unusable\t" << hyb_act.report.unconsumed_unusable << '\n';
                     for (const EdgeRefusal& r : hyb_act.report.refusals) {
                         hs << "edge_refusal\t" << r.block_a << '-' << r.block_b << ':'
-                           << linkage_status_name(r.status) << '(' << r.n_fragments << ")\n";
+                           << linkage_status_name(r.status) << '(' << r.n_fragments << ')'
+                           << (r.detail.empty() ? "" : " " + r.detail) << '\n';
                     }
                     // THE PARAMETER CONTRACT. These do not all come from one place, so each is named
                     // for what it is rather than grouped as "the model".
                     hs << "param_lambda\t" << hyb_params.lambda << '\n';
                     hs << "param_lambda_source\t"
-                       << (hyb_params.lambda_supplied ? "supplied" : "default") << '\n';
+                       << (hyb_params.lambda_source ==
+                               HybridLinkageParameters::LambdaSource::Supplied  ? "supplied"
+                         : hyb_params.lambda_source ==
+                               HybridLinkageParameters::LambdaSource::Estimated ? "estimated"
+                                                                                : "default")
+                       << '\n';
+                    hs << "param_lambda_estimated\t" << hyb_params.lambda_estimated << '\n';
+                    hs << "param_median_panel_length\t" << hyb_params.median_panel_length << '\n';
+                    hs << "param_n_fragments\t" << hyb_params.n_fragments << '\n';
+                    hs << "param_lambda_ratio_used_over_estimated\t"
+                       << (hyb_params.lambda_estimated > 0.0
+                               ? hyb_params.lambda / hyb_params.lambda_estimated : 0.0) << '\n';
                     hs << "param_bg_divergence\t" << hyb_params.bg_divergence << '\n';
                     hs << "param_outlier_mix\t" << hyb_params.outlier_mix << '\n';
                     hs << "param_error_rate\t" << hyb_params.error_rate << '\n';

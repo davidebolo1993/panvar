@@ -1931,12 +1931,14 @@ struct EdgeStatusEntry {
     std::uint32_t block_a = 0, block_b = 0;
     LinkageStatus status = LinkageStatus::NotComputed;
     std::size_t n_fragments = 0;
+    std::string detail;   // the geometry's own refusal text, kept so a refusal is diagnosable
 };
 
 struct EdgeRefusal {
     std::uint32_t block_a = 0, block_b = 0;
     LinkageStatus status = LinkageStatus::NotComputed;
     std::size_t n_fragments = 0;   // owned fragments left without a consumer by this refusal
+    std::string detail;
 };
 
 struct HybridCompletenessReport {
@@ -1988,9 +1990,32 @@ ChainEdgeLinkage make_kernel_edge(const LinkageEdge& edge,
 //   max_divergence   alignment: the band a placement must fall within;
 //   fragment_len/sd, discordant_rate, insert_sigmas
 //                    library geometry, inferred or supplied, from which the insert prior is built.
+// CANDIDATE-INDEPENDENT fragment-start intensity:
+//
+//     lambda_hat = N_fragments / (2 * median(panel haplotype length))
+//
+// The 2 is the diploid genome: a fragment can start on either homologue, so the exposed length is
+// twice a haplotype's. CANDIDATE-INDEPENDENT BY CONSTRUCTION -- the median runs over the WHOLE
+// panel, so no candidate, least of all the winning one, can move it. Fitting lambda to the winner
+// would make the parameter depend on the answer.
+//
+// This is the only estimator available on real data, where no generator lambda exists. It did NOT
+// previously exist as a function: 0.05 was supplied as a literal at every call site, with the
+// arithmetic recorded only in a comment in tests/genotype_baseline_cohort.sh. It is written here so
+// there is one definition rather than a formula copied into each caller.
+double estimate_fragment_lambda(std::size_t n_fragments,
+                                const std::vector<std::size_t>& panel_lengths,
+                                std::size_t* median_length_out = nullptr);
+
 struct HybridLinkageParameters {
     double lambda = 0.05;
-    bool lambda_supplied = false;      // false: the documented default, recorded as such
+    // How lambda was obtained, reported with every result. "estimated" is the only option available
+    // on real data; "supplied" preserves the exact comparison with a simulation's generator value.
+    enum class LambdaSource { Default, Supplied, Estimated };
+    LambdaSource lambda_source = LambdaSource::Default;
+    double lambda_estimated = 0.0;     // always computed, for the ratio, even when not used
+    std::size_t median_panel_length = 0;
+    std::size_t n_fragments = 0;
     double bg_divergence = 0.10;
     double outlier_mix = 0.05;
     double error_rate = 0.001;
