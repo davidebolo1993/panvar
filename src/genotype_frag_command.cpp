@@ -996,6 +996,144 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         std::printf("linked_edges\t%zu\n", fb.linked_edges);
         std::printf("factorised_edges_no_linkage\t%zu\n", fb0.factorised_edges);
         std::printf("linked_edges_no_linkage\t%zu\n", fb0.linked_edges);
+
+        // ---- GROUPED SPARSE vs DENSE KERNEL -----------------------------------------------
+        // The same chain, run three ways: the dense n_h^4 table, the grouped sparse correction, and
+        // (above) the independent brute force. The grouped path must agree with both.
+        //
+        // TWO EMISSION SETS. The second is ADVERSARIAL: the dominant Li-Stephens mass sits entirely
+        // in a phase whose psi is near zero, so the correction very nearly cancels the factorised
+        // baseline. That is where baseline + correction arithmetic breaks if it is going to.
+        {
+            std::printf("sparse_case\tlogw_dense\tlogw_grouped\tlogw_absdiff\tmarg_absdiff"
+                        "\tclasses\tcorrections\tclamped\tworst_negative"
+                        "\tblock1_max_marginal\tblock1_argmax\n");
+            const auto run_pair = [&](const char* name, const std::vector<double>& mass,
+                                      const std::vector<std::size_t>& favour = {}) {
+                LinkageGeometry g;
+                g.block_a = 1; g.block_b = 2;
+                g.alleles_a = {std::string(600, 'A'), std::string(600, 'C')};
+                g.alleles_b = {std::string(600, 'G'), std::string(600, 'T')};
+                g.context = std::string(40, 'A');
+                g.lflank = std::string(600, 'A');
+                g.rflank = std::string(600, 'A');
+                g.window_len.assign(4, 2440);
+                g.exposure.assign(4, 1000.0);
+                g.exposure_affine = true;
+                g.ok = true;
+                LinkageEmission m;
+                m.n_a = 2; m.n_b = 2; m.log_p_bg = -400.0; m.ok = true; m.informative = true;
+                m.mass = mass;
+                const double lam = 0.05, mx = std::log1p(-0.05), bw = std::log(0.05);
+                const LinkageEdge DE = aggregate_linkage_edge({m}, g, lam, mx, bw);
+                const SparseLinkageEdge SE = build_sparse_linkage_edge({m}, g, lam, mx, bw);
+                if (!DE.usable() || !SE.usable()) {
+                    std::printf("%s\tunusable\t-\t-\t-\t-\t-\t-\t-\n", name);
+                    return;
+                }
+                const std::size_t nh2 = 3, nb2 = 3, ns2 = nh2 * nh2;
+                const std::vector<std::uint32_t> aa = {0, 1, 1}, ab = {0, 0, 1};
+                std::vector<std::vector<double>> em(nb2, std::vector<double>(ns2, 0.0));
+                for (std::size_t b = 0; b < nb2; ++b)
+                    for (std::size_t i = 0; i < nh2; ++i)
+                        for (std::size_t j = 0; j < nh2; ++j)
+                            em[b][i * nh2 + j] = std::exp(-0.37 * (b + 1) * (i + 1) -
+                                                          0.11 * (j + 2) * (b + 3) - 0.05 * i * j);
+                // STEER THE LI-STEPHENS MASS. `favour` names states at blocks 1 and 2 that carry
+                // essentially all the emission weight. Pointing it at states whose configuration is
+                // the phase psi drives to zero is the adversarial case: the correction must then
+                // cancel almost the entire factorised baseline, which is exactly where
+                // baseline + correction arithmetic fails if it is going to.
+                if (!favour.empty()) {
+                    for (std::size_t b = 1; b < nb2; ++b) {
+                        for (std::size_t k = 0; k < ns2; ++k) em[b][k] = 1e-12;
+                    }
+                    for (std::size_t k : favour) {
+                        if (k < ns2) { em[1][k] = 1.0; em[2][k] = 1.0; }
+                    }
+                }
+                // DENSE arm.
+                std::vector<ChainEdgeLinkage> de(nb2);
+                de[2].active = true; de[2].n_a = DE.n_a; de[2].n_b = DE.n_b;
+                de[2].allele_a = aa; de[2].allele_b = ab; de[2].log_psi = DE.log_psi;
+                // GROUPED SPARSE arm, from the SAME emissions.
+                std::vector<SparseEdgeLinkage> se(nb2);
+                se[2].active = true; se[2].n_a = SE.n_a; se[2].n_b = SE.n_b;
+                se[2].allele_a = aa; se[2].allele_b = ab;
+                se[2].group_a.assign(SE.n_a, {});
+                se[2].group_b.assign(SE.n_b, {});
+                for (std::uint32_t h = 0; h < nh2; ++h) {
+                    se[2].group_a[aa[h]].push_back(h);
+                    se[2].group_b[ab[h]].push_back(h);
+                }
+                for (std::size_t a1 = 0; a1 < SE.n_a; ++a1)
+                for (std::size_t a2 = a1 + 1; a2 < SE.n_a; ++a2)
+                for (std::size_t b1 = 0; b1 < SE.n_b; ++b1)
+                for (std::size_t b2 = b1 + 1; b2 < SE.n_b; ++b2) {
+                    const double ls = SE.log_psi(a1, b1, a2, b2);
+                    const double lc = SE.log_psi(a1, b2, a2, b1);
+                    if (ls == 0.0 && lc == 0.0) continue;
+                    SparsePhaseClass c;
+                    c.amin = static_cast<std::uint32_t>(a1); c.amax = static_cast<std::uint32_t>(a2);
+                    c.bmin = static_cast<std::uint32_t>(b1); c.bmax = static_cast<std::uint32_t>(b2);
+                    // expm1, so a psi near one keeps its correction instead of losing it.
+                    c.straight_m1 = std::expm1(ls);
+                    c.crossed_m1 = std::expm1(lc);
+                    se[2].classes.push_back(c);
+                }
+                const auto emit_fn = [&](std::size_t b, std::vector<double>& ev) { ev = em[b]; };
+                std::vector<std::vector<double>> f1, b1v, f2, b2v;
+                ChainKernelStats s1, s2;
+                chain_forward_backward(nh2, nb2, 0.10, emit_fn, &de, f1, b1v, &s1, nullptr);
+                chain_forward_backward(nh2, nb2, 0.10, emit_fn, nullptr, f2, b2v, &s2, &se);
+                double worst = 0.0;
+                for (std::size_t b = 0; b < nb2; ++b) {
+                    double z1 = 0.0, z2 = 0.0;
+                    for (std::size_t k = 0; k < ns2; ++k) {
+                        z1 += f1[b][k] * b1v[b][k];
+                        z2 += f2[b][k] * b2v[b][k];
+                    }
+                    for (std::size_t k = 0; k < ns2; ++k) {
+                        const double p1 = z1 > 0 ? f1[b][k] * b1v[b][k] / z1 : 0.0;
+                        const double p2 = z2 > 0 ? f2[b][k] * b2v[b][k] / z2 : 0.0;
+                        worst = std::max(worst, std::abs(p1 - p2));
+                    }
+                }
+                // NON-VACUITY: the correction must actually move the posterior, and the
+                // adversarial cases must move it DIFFERENTLY from the ordinary one. Identical
+                // marginals across cases would mean psi is doing nothing and the agreement above
+                // would only be two implementations of plain Li-Stephens matching.
+                double max_marg = 0.0;
+                std::size_t argmax = 0;
+                {
+                    double z = 0.0;
+                    for (std::size_t k = 0; k < ns2; ++k) z += f2[1][k] * b2v[1][k];
+                    for (std::size_t k = 0; k < ns2; ++k) {
+                        const double pk = z > 0 ? f2[1][k] * b2v[1][k] / z : 0.0;
+                        if (pk > max_marg) { max_marg = pk; argmax = k; }
+                    }
+                }
+                std::printf("%s\t%.17g\t%.17g\t%.17g\t%.17g\t%zu\t%zu\t%zu\t%.3g"
+                            "\t%.10f\t%zu\n",
+                            name, s1.log_weight_sum, s2.log_weight_sum,
+                            std::abs(s1.log_weight_sum - s2.log_weight_sum), worst,
+                            se[2].classes.size(), s2.corrections_applied, s2.clamped_negatives,
+                            s2.worst_negative, max_marg, argmax);
+            };
+            run_pair("no_linkage_control", {-400.0, -400.0, -400.0, -400.0});
+            run_pair("ordinary", {-100.0, -137.0, -142.0, -103.0});
+            // ADVERSARIAL: the straight phase is overwhelmingly favoured, so psi_crossed ~ 0 and its
+            // correction must cancel almost the whole factorised baseline for those states.
+            run_pair("psi_near_zero", {-100.0, -400.0, -400.0, -100.0});
+            run_pair("psi_near_zero_extreme", {-100.0, -1000.0, -1000.0, -100.0});
+            // THE ADVERSARIAL CASE. allele_a = {0,1,1}, allele_b = {0,0,1}, so the CROSSED
+            // configuration (a1,b1,a2,b2) = (0,1,1,0) is reached by sources (i,j) with
+            // aa[i]=0, aa[j]=1 -- states 1 and 2 -- and targets (i2,j2) with ab[i2]=1, ab[j2]=0 --
+            // states 6 and 7. Concentrating the emission there puts the dominant LS mass exactly in
+            // the phase whose psi is ~0.
+            run_pair("adversarial_mass_in_zero_phase", {-100.0, -1000.0, -1000.0, -100.0},
+                     {1, 2, 6, 7});
+        }
         return 0;
     }
 
@@ -1181,7 +1319,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         // classes that are absent are provably neutral.
         {
             std::printf("large_case\tn_a\tn_b\ttheoretical_configs\tstored_classes"
-                        "\tsupport_cells\tstatus\tfragments\n");
+                        "\tsupport_cells\tstatus\tfragments\tsparse_bytes\tdense_gb\n");
             for (const auto& dims : {std::pair<std::size_t, std::size_t>{118, 119},
                                      std::pair<std::size_t, std::size_t>{457, 410}}) {
                 LinkageGeometry gl;
@@ -1215,10 +1353,13 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                 const SparseLinkageEdge SL = build_sparse_linkage_edge(ems, gl, 0.05,
                                                                        std::log1p(-0.05),
                                                                        std::log(0.05));
-                std::printf("%zux%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t%s\t%zu\n",
+                // A CONSISTENT DENSE BASELINE: LinkageEdge holds TWO double tables (score and
+                // log_psi), so the dense cost is 16 bytes per ordered configuration, not 8.
+                const double dense_gb = static_cast<double>(SL.theoretical_configs) * 16.0 / 1e9;
+                std::printf("%zux%zu\t%zu\t%zu\t%zu\t%zu\t%zu\t%s\t%zu\t%zu\t%.3f\n",
                             dims.first, dims.second, dims.first, dims.second,
                             SL.theoretical_configs, SL.stored_classes, SL.support_cells,
-                            linkage_status_name(SL.status), ems.size());
+                            linkage_status_name(SL.status), ems.size(), SL.bytes_total(), dense_gb);
             }
         }
         // THE DENSE TABLE MUST REFUSE, NOT TRUNCATE. A locus-scale block pair (LPA: 457 x 410) is

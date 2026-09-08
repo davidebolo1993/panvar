@@ -2171,6 +2171,13 @@ struct SparseLinkageEdge {
     std::size_t stored_classes = 0;
     std::size_t theoretical_configs = 0;   // the dense ordered count, for the report
     std::size_t support_cells = 0;         // haploid (alpha, beta) cells with in-band mass
+    // ACTUAL FOOTPRINT, not the payload alone. stored_classes * 8 counts only the Delta doubles and
+    // understates the real cost: the hash carries keys, bucket pointers and per-node overhead, and
+    // the support index carries its own vectors. Reported so the comparison against a dense table
+    // is between measured things rather than between a payload and an allocation.
+    std::size_t bytes_delta = 0;      // hash: buckets, nodes, keys and values
+    std::size_t bytes_support = 0;    // the (alpha, beta) -> fragment index
+    std::size_t bytes_total() const { return bytes_delta + bytes_support; }
     LinkageStatus status = LinkageStatus::NotComputed;
     bool usable() const { return status == LinkageStatus::Ok; }
     // The SAME quantity aggregate_linkage_edge's dense table holds, reconstructed.

@@ -90,6 +90,9 @@
 #     excluded fragment IDs == linkage-owned fragment IDs
 # asserted end to end. Ownership and counting can each be correct while disagreeing about which
 # fragments they cover, and --exclude-fragments today only validates the counting mechanism.
+#  27. the GROUPED sparse contraction equals the dense kernel on weight sums and marginals, an edge
+#      with no classes takes the factorised path unchanged, and an adversarial case placing the
+#      dominant Li-Stephens mass in the phase psi drives to zero still agrees;             [ACTIVE]
 #  26. sparse psi equals dense psi on EVERY configuration of every densely-testable edge; a class
 #      with no in-band corner is proved exactly neutral and never stored; and a C4-scale edge that
 #      the dense table refuses (197,177,764 configurations) completes.                      [ACTIVE]
@@ -1089,7 +1092,12 @@ fi
 if [ -s "$OUT/oracle.tsv" ]; then
   "$PY" - "$OUT/oracle.tsv" <<'PYEOFB'
 import sys
-d = dict(l.rstrip("\n").split("\t") for l in open(sys.argv[1]) if "\t" in l)
+# ONLY the key/value lines: the probe also emits wide grouped-sparse rows, and a bare
+# dict(split) over every line fails on them.
+d = {}
+for _l in open(sys.argv[1]):
+    _f = _l.rstrip("\n").split("\t")
+    if len(_f) == 2: d[_f[0]] = _f[1]
 bad = 0
 def ok(m): print("  ok   " + m)
 def no(m):
@@ -1114,6 +1122,61 @@ else: no("a block marginal sums to 1 +/- %.4g" % sd)
 le = float(d["linkage_marginal_effect"])
 if le > 1e-6: ok("linkage moves the posterior by %.4f -- the comparison is not vacuous" % le)
 else: no("linkage changes the posterior by only %.2e; the oracle asserts nothing about psi" % le)
+# THE GROUPED SPARSE CONTRACTION must equal the dense kernel exactly:
+#     F'(y) = F'_LS(y) + SUM_x F(x) T(x,y) [psi(x,y) - 1]
+# with the first term the existing factorised O(n_h^2) recurrence and only non-neutral classes
+# contributing. psi - 1 is formed with expm1 so a psi near one keeps its correction.
+sp = {}
+rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[1])]
+hdr_i = [i for i, r in enumerate(rows) if r and r[0] == "sparse_case"]
+if hdr_i:
+    h = rows[hdr_i[0]]
+    for r in rows[hdr_i[0]+1:]:
+        if len(r) == len(h): sp[r[0]] = dict(zip(h, r))
+if not sp:
+    no("no grouped-sparse comparison was reported")
+else:
+    worst_w = max(float(v["logw_absdiff"]) for v in sp.values())
+    worst_m = max(float(v["marg_absdiff"]) for v in sp.values())
+    if worst_w < 1e-9 and worst_m < 1e-9:
+        ok("grouped sparse equals the dense kernel: weight sum %.1e, marginals %.1e, over %d cases"
+           % (worst_w, worst_m, len(sp)))
+    else:
+        no("grouped sparse differs from dense: weight sum %.4g, marginals %.4g" % (worst_w, worst_m))
+    # An edge with NO classes must take the factorised path unchanged, not a zero-adding loop.
+    ctl = sp.get("no_linkage_control")
+    if ctl and ctl["classes"] == "0" and ctl["corrections"] == "0":
+        ok("an edge with zero classes applies NO corrections -- the factorised path is unchanged")
+    elif ctl:
+        no("the no-linkage control applied %s corrections over %s classes"
+           % (ctl["corrections"], ctl["classes"]))
+    # NON-VACUITY: the correction must move the posterior away from the no-linkage control.
+    ordy = sp.get("ordinary")
+    if ctl and ordy and abs(float(ctl["block1_max_marginal"]) -
+                            float(ordy["block1_max_marginal"])) > 1e-6:
+        ok("the correction moves the posterior (%.4f -> %.4f), so the agreement is not vacuous"
+           % (float(ctl["block1_max_marginal"]), float(ordy["block1_max_marginal"])))
+    else:
+        no("linkage does not move the posterior; the dense/grouped agreement proves nothing")
+    # THE ADVERSARIAL CASE: the dominant LS mass sits in the phase psi drives to zero, so the
+    # correction must cancel nearly the whole baseline. It must be genuinely DIFFERENT from the
+    # ordinary case, or it is not adversarial -- the first three attempts here were all saturated at
+    # psi_straight = 2, psi_crossed = 0 and gave identical marginals.
+    adv = sp.get("adversarial_mass_in_zero_phase")
+    if not adv:
+        no("the adversarial near-cancellation case is missing")
+    elif ordy and abs(float(adv["block1_max_marginal"]) -
+                      float(ordy["block1_max_marginal"])) < 1e-6:
+        no("the adversarial case is indistinguishable from the ordinary one -- it is not adversarial")
+    else:
+        ok("adversarial near-cancellation is a DISTINCT regime (%.4f vs %.4f) and still agrees"
+           % (float(adv["block1_max_marginal"]), float(ordy["block1_max_marginal"])))
+        if int(adv["clamped"]) == 0:
+            ok("no weight went negative under near-total cancellation")
+        else:
+            ok("%s tiny negatives clamped, worst %s -- recorded, not silently absorbed"
+               % (adv["clamped"], adv["worst_negative"]))
+
 # BOTH KERNEL EDGE PATHS MUST RUN IN ONE CHAIN. There is a single inference kernel with a
 # factorised O(n_h^2) path and a linked O(n_h^4) path; a branch that is present but never taken is
 # not covered. The linkage-free control must take the factorised path only.

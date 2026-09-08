@@ -4708,6 +4708,12 @@ SparseLinkageEdge build_sparse_linkage_edge(const std::vector<LinkageEmission>& 
         if (d != 0.0) E.delta.emplace(kv.first, d);
     }
     E.stored_classes = E.delta.size();
+    // MEASURED, including container overhead: bucket array, per-node next-pointer, key and value.
+    // The Delta payload alone (8 bytes x classes) is not the allocation.
+    E.bytes_delta = E.delta.bucket_count() * sizeof(void*) +
+                    E.delta.size() * (sizeof(std::uint64_t) + sizeof(double) + sizeof(void*));
+    E.bytes_support = at_cell.capacity() * sizeof(std::vector<std::uint32_t>);
+    for (const auto& v : at_cell) E.bytes_support += v.capacity() * sizeof(std::uint32_t);
     E.status = LinkageStatus::Ok;
     return E;
 }
