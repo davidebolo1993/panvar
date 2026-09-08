@@ -1705,12 +1705,60 @@ OwnershipLedger ownership_ledger(const std::vector<FragmentOwner>& owners);
 // homologue would produce. The edge potential still has to combine the two homologues once, mix the
 // background once, sum over every fragment owned by the edge, charge exposure once, and only then
 // remove the content baseline. LinkageEdge below does that; nothing here may be used as a factor.
+// OPERATIONAL WORK BUDGET, enforced INCREMENTALLY inside the support search.
+//
+// The previous budget named the wrong quantity and checked it in the wrong place. It counted
+// "verified windows" -- which after direct positional verification are not windows and are not
+// verified, they are the allele-pair cells the search retained -- and it checked the total only
+// once an edge's emissions had all been built. A limit tested after the work finishes cannot
+// prevent the work.
+//
+// So the two quantities are separated and both are charged BEFORE the work they pay for:
+//   proposed_cells            distinct allele-pair cells retained,
+//   full_read_verifications   positional starts subjected to whole-read Hamming verification.
+// bases_compared_upper_bound is reported, not enforced: with variable read lengths one verification
+// is an imperfect cost unit, and the base count says by how much.
+//
+// Exhaustion is a MODEL-LEVEL REFUSAL, never a partial emission: an emission that runs out of
+// budget returns no mass at all, and the edge -- and with it the activation -- refuses.
+struct HybridWorkBudget {
+    std::uint64_t max_proposed_cells = 0;            // 0 means unlimited
+    std::uint64_t max_full_read_verifications = 0;   // 0 means unlimited
+    std::uint64_t proposed_cells = 0;
+    std::uint64_t full_read_verifications = 0;
+    std::uint64_t bases_compared_upper_bound = 0;
+    bool exhausted = false;
+    std::string reason;
+
+    // Would `n` more cells fit? Asked before the dense fallback commits to enumerating them.
+    bool cells_fit(std::uint64_t n) const {
+        return !exhausted && (max_proposed_cells == 0 ||
+                              n <= max_proposed_cells - std::min(proposed_cells, max_proposed_cells));
+    }
+    bool verifications_fit(std::uint64_t n) const {
+        return !exhausted && (max_full_read_verifications == 0 ||
+                              n <= max_full_read_verifications -
+                                   std::min(full_read_verifications, max_full_read_verifications));
+    }
+    bool charge_cells(std::uint64_t n, const char* why);
+    bool charge_verification(std::size_t read_len, const char* why);
+};
+
 struct LinkageEmission {
+    // Set when the work budget was exhausted while this emission was being formed. The emission
+    // carries NO mass in that case -- a partially enumerated support is not a smaller model, it is
+    // a wrong one.
+    bool work_refused = false;
+    std::string work_refusal;
     // Verification counters, distinguishing seed work from read work from accepted placements.
     std::size_t full_read_verifications = 0;
     std::size_t accepted_mate_placements = 0;
     std::size_t verified_fr_states = 0;
     std::size_t finite_emission_cells = 0;
+    // MULTIPLICITY PER CELL: how many verified fragment states contributed to it. Mass alone
+    // cannot distinguish one placement from several that happen to sum to the same number, and
+    // identical repeat copies are exactly that case -- so the oracle comparison checks this too.
+    std::vector<std::uint32_t> cell_states;
     std::size_t n_a = 0, n_b = 0;              // allele counts at A and B
     std::vector<double> mass;                  // [alpha * n_b + beta] -> log placement mass m
     // This fragment's own background, SUPPLIED BY THE CALLER on the same definition
@@ -1921,7 +1969,8 @@ LinkageEmission linkage_emission_supported(const Fragment& fragment, const Linka
                                            const InsertPrior& ip, double max_divergence,
                                            double log_eps, double log_1meps, double log_p_bg,
                                            AlleleProductSupport* out_support = nullptr,
-                                           const AlleleProductIndex* index = nullptr);
+                                           const AlleleProductIndex* index = nullptr,
+                                           HybridWorkBudget* budget = nullptr);
 
 // THE EDGE POTENTIAL, aggregated in the one order that is a diploid likelihood:
 //

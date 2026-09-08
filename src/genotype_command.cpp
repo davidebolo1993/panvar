@@ -143,9 +143,21 @@ void print_genotype_help() {
         << "                              any refusal leaves the legacy call untouched.\n"
         << "      --hybrid-edges <path>   Per-edge sparse construction measurements, serialised\n"
         << "                              from the objects the caller builds.\n"
+        << "      --hybrid-edge-oracle <a,b,path>  Run ONE edge through BOTH the supported search\n"
+        << "                              and the dense oracle and compare them cell by cell --\n"
+        << "                              finite set, multiplicity and mass -- writing the full\n"
+        << "                              counter set and the per-fragment proposal distribution.\n"
         << "      --hybrid-dry-run        Plan the transaction and report, then stop before calling.\n"
         << "      --hybrid-max-classes <n>  Operational budget: stored phase classes per edge.\n"
         << "      --hybrid-max-bytes <n>    Operational budget: measured bytes per edge.\n"
+        << "      --hybrid-max-proposed-cells <n>  Operational budget: distinct allele-pair\n"
+        << "                              cells retained by the support search, over the locus.\n"
+        << "      --hybrid-max-full-read-verifications <n>  Operational budget: positional\n"
+        << "                              starts subjected to whole-read Hamming verification.\n"
+        << "                              Both are charged BEFORE the work, and exhaustion is a\n"
+        << "                              model-level refusal, never a partial emission.\n"
+        << "      --hybrid-max-verified-windows <n>  DEPRECATED alias for\n"
+        << "                              --hybrid-max-proposed-cells (same quantity, honest name).\n"
         << "      --hybrid-max-dense-emission-windows <n>  Operational budget on DENSE emission\n"
         << "                              construction: fragments x n_A x n_B summed over edges.\n"
         << "                              Exceeding it gives INCOMPLETE:\n"
@@ -368,10 +380,16 @@ int run_genotype_command(const std::vector<std::string>& args) {
     // WINDOWS ACTUALLY VERIFIED, summed over edges -- the work production does, as opposed to the
     // dense cross-product it avoids. Its own name and its own budget, so neither figure can be
     // mistaken for the other.
-    std::size_t hybrid_max_verified_windows = 5000000;
+    // SEPARATE OPERATIONAL COUNTERS. "verified windows" named a quantity that, after direct
+    // positional verification, is neither verified nor a window.
+    std::uint64_t hybrid_max_proposed_cells = 5000000;
+    std::uint64_t hybrid_max_full_read_verifications = 200000000;
+    bool hybrid_verified_windows_alias_used = false;
     std::size_t verified_windows_total = 0;
+    std::uint64_t hyb_work_proposed = 0, hyb_work_verifications = 0, hyb_work_bases = 0;
     std::string hybrid_edges_path;
     bool hybrid_dry_run = false;
+    std::string hybrid_edge_oracle;      // "<a>,<b>:<path>" -- one edge, both paths, compared
     struct EdgeRow {
         std::uint32_t a = 0, b = 0;
         std::size_t na = 0, nb = 0, owned = 0, informative = 0, support = 0, stored = 0,
@@ -505,12 +523,22 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--hybrid-outlier-mix") hyb_params.outlier_mix = std::stod(require_value(arg));
         else if (arg == "--hybrid-max-classes") hybrid_max_classes = std::stoull(require_value(arg));
         else if (arg == "--hybrid-max-bytes") hybrid_max_bytes = std::stoull(require_value(arg));
-        else if (arg == "--hybrid-max-verified-windows")
-            hybrid_max_verified_windows = std::stoull(require_value(arg));
+        else if (arg == "--hybrid-max-proposed-cells")
+            hybrid_max_proposed_cells = std::stoull(require_value(arg));
+        else if (arg == "--hybrid-max-full-read-verifications")
+            hybrid_max_full_read_verifications = std::stoull(require_value(arg));
+        else if (arg == "--hybrid-max-verified-windows") {
+            // DEPRECATED ALIAS, kept because its old meaning -- allele-pair cells retained -- is
+            // exactly what --hybrid-max-proposed-cells now names. Accepted rather than silently
+            // reinterpreted, and it says so.
+            hybrid_max_proposed_cells = std::stoull(require_value(arg));
+            hybrid_verified_windows_alias_used = true;
+        }
         else if (arg == "--hybrid-max-dense-emission-windows")
             hybrid_max_dense_emission_windows = std::stoull(require_value(arg));
         else if (arg == "--hybrid-edges") hybrid_edges_path = require_value(arg);
         else if (arg == "--hybrid-dry-run") hybrid_dry_run = true;
+        else if (arg == "--hybrid-edge-oracle") hybrid_edge_oracle = require_value(arg);
         else if (arg == "--hybrid-lambda-estimate") {
             hyb_params.lambda_source = HybridLinkageParameters::LambdaSource::Estimated;
         }
@@ -1739,6 +1767,16 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         log.info("hybrid: " + hyb_act.refusal +
                                  "; no edge built, nothing subtracted");
                     } else {
+                    // ONE BUDGET FOR THE LOCUS, charged incrementally inside every emission.
+                    HybridWorkBudget work;
+                    work.max_proposed_cells = hybrid_max_proposed_cells;
+                    work.max_full_read_verifications = hybrid_max_full_read_verifications;
+                    if (hybrid_verified_windows_alias_used) {
+                        log.info("hybrid: --hybrid-max-verified-windows is deprecated; it sets "
+                                 "--hybrid-max-proposed-cells (" +
+                                 std::to_string(hybrid_max_proposed_cells) + "), the same "
+                                 "quantity under an honest name");
+                    }
                     std::vector<std::vector<std::string>> ballele(blocks.size());
                     for (std::size_t b = 0; b < blocks.size(); ++b) {
                         ballele[b] = blocks[b].allele_seq;
@@ -1779,6 +1817,158 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             const std::size_t p0 = f0.r1.size() / (d0 + 1);
                             if (p0 >= 8 && p0 <= 32) aidx = build_allele_product_index(geom, p0);
                         }
+                        // ---- ONE-EDGE ORACLE COMPARISON ------------------------------------
+                        // Counters can show speed; only this can show the likelihood survived.
+                        // The supported search and the dense oracle must agree on WHICH cells are
+                        // finite, on HOW MANY states built each one, and on the mass exactly.
+                        if (!hybrid_edge_oracle.empty()) {
+                            std::size_t c1 = hybrid_edge_oracle.find(',');
+                            std::size_t c2 = hybrid_edge_oracle.find(',', c1 + 1);
+                            if (c1 != std::string::npos && c2 != std::string::npos &&
+                                std::stoul(hybrid_edge_oracle.substr(0, c1)) == es.block_a &&
+                                std::stoul(hybrid_edge_oracle.substr(c1 + 1, c2 - c1 - 1)) ==
+                                    es.block_b) {
+                                const std::string path = hybrid_edge_oracle.substr(c2 + 1);
+                                std::ofstream eo(path);
+                                const auto t0 = std::chrono::steady_clock::now();
+                                HybridWorkBudget wb;
+                                wb.max_proposed_cells = hybrid_max_proposed_cells;
+                                wb.max_full_read_verifications = hybrid_max_full_read_verifications;
+                                std::size_t cells_differ = 0, mult_differ = 0, fin_s = 0, fin_d = 0,
+                                            fb = 0, refused = 0;
+                                double worst = 0.0;
+                                std::uint64_t states_s = 0, states_d = 0;
+                                eo << "distinct_masses\tmass_spread\t"
+                                      "fragment\tdense_pairs\tproposed\tunique_seed_starts"
+                                      "\tfull_read_verifications\taccepted_placements"
+                                      "\tverified_fr_states\tfinite_cells\tfallback\n";
+                                for (std::size_t fi : kv.second) {
+                                    const std::size_t len = hf[fi].bases();
+                                    const std::size_t bee = static_cast<std::size_t>(
+                                        hyb_params.bg_divergence * static_cast<double>(len));
+                                    const double bgf = static_cast<double>(bee) * lep +
+                                                       static_cast<double>(len - bee) * l1m;
+                                    AlleleProductSupport sp;
+                                    const LinkageEmission S = linkage_emission_supported(
+                                        hf[fi], geom, ip, hyb_params.max_divergence, lep, l1m, bgf,
+                                        &sp, aidx.ok ? &aidx : nullptr, &wb);
+                                    const LinkageEmission D = linkage_emission(
+                                        hf[fi], geom, ip, hyb_params.max_divergence, lep, l1m, bgf);
+                                    if (S.work_refused) { ++refused; continue; }
+                                    if (sp.exhaustive_fallback) ++fb;
+                                    for (std::size_t k = 0; k < D.mass.size(); ++k) {
+                                        const bool fx = D.mass[k] != -INFINITY;
+                                        const bool fy = S.mass[k] != -INFINITY;
+                                        if (fx) ++fin_d;
+                                        if (fy) ++fin_s;
+                                        states_d += D.cell_states[k];
+                                        states_s += S.cell_states[k];
+                                        if (fx != fy) { ++cells_differ; continue; }
+                                        if (D.cell_states[k] != S.cell_states[k]) ++mult_differ;
+                                        if (fx) worst = std::max(worst,
+                                                                 std::abs(D.mass[k] - S.mass[k]));
+                                    }
+                                    // PER FRAGMENT, not only totals: a mean hides whether a few
+                                    // fragments propose everything or all of them propose a lot.
+                                    // HOW MANY DISTINCT VALUES the mass actually takes over the
+                                    // finite cells. If 126 beta cells carry two values, the support
+                                    // is not reducible but the ALLELE SET is -- and that is a
+                                    // different optimisation from a better seed filter.
+                                    std::vector<double> vals;
+                                    vals.reserve(D.mass.size());
+                                    for (double m : D.mass)
+                                        if (m != -INFINITY) vals.push_back(m);
+                                    std::sort(vals.begin(), vals.end());
+                                    const std::size_t n_distinct =
+                                        static_cast<std::size_t>(
+                                            std::unique(vals.begin(), vals.end(),
+                                                        [](double x, double y) {
+                                                            return std::abs(x - y) < 1e-9;
+                                                        }) - vals.begin());
+                                    const double spread = vals.empty() ? 0.0
+                                                        : vals.back() - vals.front();
+                                    eo << n_distinct << '\t' << spread << '\t'
+                                       << hf[fi].name << '\t' << sp.dense_pairs << '\t'
+                                       << sp.proposals.size() << '\t' << sp.unique_seed_starts
+                                       << '\t' << S.full_read_verifications << '\t'
+                                       << S.accepted_mate_placements << '\t'
+                                       << S.verified_fr_states << '\t' << S.finite_emission_cells
+                                       << '\t' << (sp.exhaustive_fallback ? 1 : 0) << '\n';
+                                }
+                                // ONE FRAGMENT'S CELLS IN FULL, against the B allele LENGTH.
+                                // If every beta is finite but the mass still varies, the question
+                                // is what beta is varying THROUGH. Length moves the insert; content
+                                // moves the Hamming term. Dumping both makes that separable
+                                // instead of a matter of opinion.
+                                if (!kv.second.empty()) {
+                                    const std::size_t f0i = kv.second.front();
+                                    const std::size_t len0 = hf[f0i].bases();
+                                    const std::size_t be0 = static_cast<std::size_t>(
+                                        hyb_params.bg_divergence * static_cast<double>(len0));
+                                    const double bgf0 = static_cast<double>(be0) * lep +
+                                                        static_cast<double>(len0 - be0) * l1m;
+                                    const LinkageEmission C = linkage_emission(
+                                        hf[f0i], geom, ip, hyb_params.max_divergence, lep, l1m,
+                                        bgf0);
+                                    std::ofstream cf(path + ".cells.tsv");
+                                    cf << "alpha\tbeta\ta_len\tb_len\tmass\tstates\n";
+                                    cf.setf(std::ios::fixed);
+                                    cf.precision(12);
+                                    for (std::size_t al = 0; al < C.n_a; ++al) {
+                                        for (std::size_t be = 0; be < C.n_b; ++be) {
+                                            cf << al << '\t' << be << '\t'
+                                               << geom.alleles_a[al].size() << '\t'
+                                               << geom.alleles_b[be].size() << '\t'
+                                               << C.mass[al * C.n_b + be] << '\t'
+                                               << C.cell_states[al * C.n_b + be] << '\n';
+                                        }
+                                    }
+                                }
+                                const double secs = std::chrono::duration<double>(
+                                    std::chrono::steady_clock::now() - t0).count();
+                                eo << "#edge\t" << es.block_a << '-' << es.block_b << '\n'
+                                   << "#owned_fragments\t" << kv.second.size() << '\n'
+                                   << "#alleles\t" << blocks[es.block_a].n_alleles << 'x'
+                                   << blocks[es.block_b].n_alleles << '\n'
+                                   << "#total_possible_cells\t"
+                                   << static_cast<std::uint64_t>(blocks[es.block_a].n_alleles) *
+                                      blocks[es.block_b].n_alleles * kv.second.size() << '\n'
+                                   << "#proposed_cells\t" << wb.proposed_cells << '\n'
+                                   << "#full_read_verifications\t" << wb.full_read_verifications
+                                   << '\n'
+                                   << "#bases_compared_upper_bound\t"
+                                   << wb.bases_compared_upper_bound << '\n'
+                                   << "#fallbacks\t" << fb << '\n'
+                                   << "#work_refused_fragments\t" << refused << '\n'
+                                   << "#index_ok\t" << (aidx.ok ? 1 : 0) << '\n'
+                                   << "#index_complete\t" << (aidx.complete ? 1 : 0) << '\n'
+                                   << "#finite_cells_supported\t" << fin_s << '\n'
+                                   << "#finite_cells_dense\t" << fin_d << '\n'
+                                   << "#states_supported\t" << states_s << '\n'
+                                   << "#states_dense\t" << states_d << '\n'
+                                   << "#cells_differ\t" << cells_differ << '\n'
+                                   << "#multiplicity_differ\t" << mult_differ << '\n'
+                                   << "#worst_mass_diff\t" << worst << '\n'
+                                   << "#seconds\t" << secs << '\n'
+                                   << "#peak_rss_mb\t" << [] {
+                                          struct rusage r {};
+                                          if (getrusage(RUSAGE_SELF, &r) != 0) return 0.0;
+#ifdef __APPLE__
+                                          return static_cast<double>(r.ru_maxrss) / 1048576.0;
+#else
+                                          return static_cast<double>(r.ru_maxrss) / 1024.0;
+#endif
+                                      }() << '\n';
+                                log.info("hybrid edge oracle " + std::to_string(es.block_a) + "-" +
+                                         std::to_string(es.block_b) + ": " +
+                                         std::to_string(cells_differ) + " cells differ, " +
+                                         std::to_string(mult_differ) + " multiplicities differ, "
+                                         "worst mass " + std::to_string(worst) + ", " +
+                                         std::to_string(fin_s) + " of " +
+                                         std::to_string(fin_d) + " finite, " +
+                                         std::to_string(secs) + " s");
+                            }
+                        }
                         std::vector<LinkageEmission> ems;
                         ems.reserve(kv.second.size());
                         std::size_t n_inform = 0;
@@ -1793,7 +1983,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             AlleleProductSupport sup;
                             ems.push_back(linkage_emission_supported(
                                 hf[fi], geom, ip, hyb_params.max_divergence, lep, l1m, bgf, &sup,
-                                aidx.ok ? &aidx : nullptr));
+                                aidx.ok ? &aidx : nullptr, &work));
+                            if (ems.back().work_refused) break;
                             if (ems.back().informative) ++n_inform;
                             // THE SEARCH'S OWN COUNTERS, not the dense budget's. Seed hits,
                             // proposed states and verified windows describe what production
@@ -1846,17 +2037,25 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         // over edges. Checked as it accumulates so an expensive locus refuses
                         // early rather than after paying for every edge.
                         verified_windows_total += e_verified;
-                        if (verified_windows_total > hybrid_max_verified_windows) {
-                            work_overflow = true;   // reuse the transactional refusal path
-                            break;
-                        }
+                        // THE BUDGET IS ALREADY ENFORCED INSIDE THE SEARCH. What is left here is
+                        // only to propagate its refusal transactionally: an exhausted budget means
+                        // some emission carries no mass, and a model missing an emission is not a
+                        // smaller model.
+                        if (work.exhausted) { work_overflow = true; break; }
                     }
+                    hyb_work_proposed = work.proposed_cells;
+                    hyb_work_verifications = work.full_read_verifications;
+                    hyb_work_bases = work.bases_compared_upper_bound;
                     if (work_overflow && !edge_status.empty()) {
                         hyb_act = HybridActivation{};
-                        hyb_act.refusal = "verified-window-limit: " +
-                                          std::to_string(verified_windows_total) +
-                                          " verified windows exceeds the budget of " +
-                                          std::to_string(hybrid_max_verified_windows);
+                        hyb_act.refusal = work.exhausted
+                            ? work.reason + ": " + std::to_string(work.proposed_cells) +
+                              " proposed cells, " +
+                              std::to_string(work.full_read_verifications) +
+                              " full-read verifications (limits " +
+                              std::to_string(hybrid_max_proposed_cells) + " / " +
+                              std::to_string(hybrid_max_full_read_verifications) + ")"
+                            : "verified-window-limit: the baseline estimate overflowed";
                         log.info("hybrid: " + hyb_act.refusal +
                                  "; no edge activated, nothing subtracted");
                     } else {
@@ -1984,6 +2183,13 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     }
                     // THE PARAMETER CONTRACT. These do not all come from one place, so each is named
                     // for what it is rather than grouped as "the model".
+                    // OPERATIONAL WORK ACTUALLY DONE, beside the limits it was held to.
+                    hs << "work_proposed_cells\t" << hyb_work_proposed << '\n';
+                    hs << "work_full_read_verifications\t" << hyb_work_verifications << '\n';
+                    hs << "work_bases_compared_upper_bound\t" << hyb_work_bases << '\n';
+                    hs << "limit_proposed_cells\t" << hybrid_max_proposed_cells << '\n';
+                    hs << "limit_full_read_verifications\t"
+                       << hybrid_max_full_read_verifications << '\n';
                     hs << "param_lambda\t" << hyb_params.lambda << '\n';
                     hs << "param_lambda_source\t"
                        << (hyb_params.lambda_source ==

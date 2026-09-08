@@ -4722,7 +4722,7 @@ namespace {
 double score_window(const Fragment& fragment, const LinkageGeometry& geom, const InsertPrior& ip,
                     std::size_t al, std::size_t be, std::size_t d1, std::size_t d2,
                     const std::string& a1, const std::string& a2,
-                    double log_eps, double log_1meps) {
+                    double log_eps, double log_1meps, std::uint32_t* n_states = nullptr) {
     const std::string win = geom.lflank + geom.alleles_a[al] + geom.context +
                             geom.alleles_b[be] + geom.rflank;
     // ONE PIECE INDEX PER WINDOW, used by all four mate searches. Reverted once on the arithmetic
@@ -4745,6 +4745,7 @@ double score_window(const Fragment& fragment, const LinkageGeometry& geom, const
                                               fragment.r2.size(), ip.lo, ip.hi);
     const double half = std::log(0.5);
     double m = kNegInf;
+    if (n_states != nullptr) *n_states = static_cast<std::uint32_t>(st.size());
     // EVERY DISTINCT ORIGIN, with its multiplicity: identical repeat copies are separate states.
     for (const FragmentState& z : st) {
         const double e1 = static_cast<double>(z.m1_edits) * log_eps +
@@ -4792,11 +4793,34 @@ void mark_informative(LinkageEmission& out) {
 
 }  // namespace
 
+bool HybridWorkBudget::charge_cells(std::uint64_t n, const char* why) {
+    if (exhausted) return false;
+    proposed_cells += n;
+    if (max_proposed_cells != 0 && proposed_cells > max_proposed_cells) {
+        exhausted = true; reason = why;
+        return false;
+    }
+    return true;
+}
+
+bool HybridWorkBudget::charge_verification(std::size_t read_len, const char* why) {
+    if (exhausted) return false;
+    ++full_read_verifications;
+    bases_compared_upper_bound += read_len;
+    if (max_full_read_verifications != 0 &&
+        full_read_verifications > max_full_read_verifications) {
+        exhausted = true; reason = why;
+        return false;
+    }
+    return true;
+}
+
 LinkageEmission linkage_emission_supported(const Fragment& fragment, const LinkageGeometry& geom,
                                            const InsertPrior& ip, double max_divergence,
                                            double log_eps, double log_1meps, double log_p_bg,
                                            AlleleProductSupport* out_support,
-                                           const AlleleProductIndex* index) {
+                                           const AlleleProductIndex* index,
+                                           HybridWorkBudget* budget) {
     LinkageEmission out;
     out.log_p_bg = log_p_bg;
     if (!geom.ok || fragment.r1.empty() || fragment.r2.empty()) return out;
@@ -4805,17 +4829,62 @@ LinkageEmission linkage_emission_supported(const Fragment& fragment, const Linka
     // EVERY CELL EXISTS, including the empty ones: a pair with no placement is -inf, which is a
     // value the consumer needs, not a cell to omit.
     out.mass.assign(out.n_a * out.n_b, kNegInf);
+    out.cell_states.assign(out.n_a * out.n_b, 0);
     const std::size_t d1 = mate_band_edits(max_divergence, fragment.r1.size());
     const std::size_t d2 = mate_band_edits(max_divergence, fragment.r2.size());
     const std::string a1 = reverse_complement(fragment.r1), a2 = reverse_complement(fragment.r2);
     AlleleProductSupport sup = propose_allele_pairs(fragment, geom, ip, max_divergence, index);
+    // THE REFUSAL PATH, taken before any enumeration begins.
+    const auto refuse = [&](const char* why) {
+        out.mass.assign(out.n_a * out.n_b, kNegInf);
+        out.cell_states.assign(out.n_a * out.n_b, 0);
+        out.work_refused = true;
+        out.work_refusal = why;
+        out.ok = false;
+        if (out_support != nullptr) *out_support = sup;
+        return out;
+    };
+    if (budget != nullptr && budget->exhausted) return refuse(budget->reason.c_str());
     if (sup.exhaustive_fallback) {
+        // THE FALLBACK MUST FIT BEFORE IT STARTS. An incomplete index or a non-ACGT read used to
+        // drop straight into dense score_window() enumeration -- materialising one window per
+        // allele pair -- with the budget consulted only afterwards, by which time every window had
+        // been built. The dense cost is knowable in advance, so it is charged in advance.
+        if (budget != nullptr) {
+            const std::uint64_t cells = static_cast<std::uint64_t>(out.n_a) *
+                                        static_cast<std::uint64_t>(out.n_b);
+            // Upper bound on the whole-read comparisons the dense scan can perform: four mate
+            // variants, each offered every start inside each window.
+            std::uint64_t starts = 0;
+            const std::size_t rlen = std::max(fragment.r1.size(), fragment.r2.size());
+            for (std::size_t al = 0; al < out.n_a; ++al) {
+                for (std::size_t be = 0; be < out.n_b; ++be) {
+                    const std::size_t wlen = geom.lflank.size() + geom.alleles_a[al].size() +
+                                             geom.context.size() + geom.alleles_b[be].size() +
+                                             geom.rflank.size();
+                    if (wlen >= rlen) starts += 4ull * (wlen - rlen + 1);
+                }
+            }
+            if (!budget->cells_fit(cells) || !budget->verifications_fit(starts)) {
+                budget->exhausted = true;
+                budget->reason = "support-search-fallback-work-limit";
+                return refuse("support-search-fallback-work-limit");
+            }
+            if (!budget->charge_cells(cells, "support-search-fallback-work-limit"))
+                return refuse("support-search-fallback-work-limit");
+        }
         // EXHAUSTIVE OVER THE VIRTUAL ALLELE PRODUCT -- every pair -- not over panel-carried pairs.
         for (std::size_t al = 0; al < out.n_a; ++al)
             for (std::size_t be = 0; be < out.n_b; ++be)
                 out.mass[al * out.n_b + be] =
-                    score_window(fragment, geom, ip, al, be, d1, d2, a1, a2, log_eps, log_1meps);
+                    score_window(fragment, geom, ip, al, be, d1, d2, a1, a2, log_eps, log_1meps,
+                                 &out.cell_states[al * out.n_b + be]);
     } else {
+        if (budget != nullptr &&
+            !budget->charge_cells(static_cast<std::uint64_t>(sup.proposals.size()),
+                                  "support-search-proposed-cell-limit")) {
+            return refuse("support-search-proposed-cell-limit");
+        }
         // DIRECT POSITIONAL VERIFICATION. The positional search has already done the work the
         // window search would repeat: it produced, per mate variant, the starts at which that mate
         // COULD sit. So verify the whole mate at exactly those starts, through the shared virtual
@@ -4836,6 +4905,13 @@ LinkageEmission linkage_emission_supported(const Fragment& fragment, const Linka
                 // no verified one either. Skipping the rest is a sound prefilter, not a heuristic.
                 if (!keep_pair(sup, al, be, out.n_b)) continue;
                 if (st.first != cur) { vw.alpha = al; vw.beta = be; cur = st.first; }
+                // CHARGED BEFORE THE COMPARISON, so the limit bounds work done rather than work
+                // already paid for.
+                if (budget != nullptr &&
+                    !budget->charge_verification(seqs[mi]->size(),
+                                                 "support-search-verification-limit")) {
+                    return refuse("support-search-verification-limit");
+                }
                 ++out.full_read_verifications;
                 const std::size_t mm = vw.count_mismatches(*seqs[mi], st.second, bands[mi]);
                 if (mm > bands[mi]) continue;
@@ -4869,6 +4945,7 @@ LinkageEmission linkage_emission_supported(const Fragment& fragment, const Linka
                         const long rev_end = R[b].second.start + static_cast<long>(rev_len) - 1;
                         if (!valid_fr_coordinates(F[a].second.start, rev_end, ip.lo, ip.hi)) continue;
                         ++out.verified_fr_states;
+                        ++out.cell_states[cell];
                         const std::uint32_t e1 = fwd_is_m1 ? F[a].second.edits : R[b].second.edits;
                         const std::uint32_t e2 = fwd_is_m1 ? R[b].second.edits : F[a].second.edits;
                         const long insert = rev_end - F[a].second.start + 1;
@@ -4901,6 +4978,7 @@ LinkageEmission linkage_emission(const Fragment& fragment, const LinkageGeometry
     out.n_a = geom.alleles_a.size();
     out.n_b = geom.alleles_b.size();
     out.mass.assign(out.n_a * out.n_b, kNegInf);
+    out.cell_states.assign(out.n_a * out.n_b, 0);
     const std::size_t d1 = mate_band_edits(max_divergence, fragment.r1.size());
     const std::size_t d2 = mate_band_edits(max_divergence, fragment.r2.size());
     const std::string a1 = reverse_complement(fragment.r1);
@@ -4923,6 +5001,7 @@ LinkageEmission linkage_emission(const Fragment& fragment, const LinkageGeometry
             const auto v2 = bounded_mate_placements(a2, win, d2, nullptr, nullptr);
             const auto st = enumerate_fragment_states(0, f1, v1, f2, v2, fragment.r1.size(),
                                                       fragment.r2.size(), ip.lo, ip.hi);
+            out.cell_states[al * out.n_b + be] = static_cast<std::uint32_t>(st.size());
             double m = kNegInf;
             for (const FragmentState& z : st) {
                 const double e1 = static_cast<double>(z.m1_edits) * log_eps +

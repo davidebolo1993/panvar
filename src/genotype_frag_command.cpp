@@ -342,6 +342,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     bool mapping_selftest = false;
     bool support_selftest = false;
     bool coordinate_selftest = false;
+    bool budget_selftest = false;
     bool completeness_selftest = false;
     bool activation_selftest = false;
     std::vector<std::string> reconcile_scope;
@@ -398,6 +399,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--mapping-selftest") mapping_selftest = true;
         else if (a == "--support-selftest") support_selftest = true;
         else if (a == "--coordinate-selftest") coordinate_selftest = true;
+        else if (a == "--budget-selftest") budget_selftest = true;
         else if (a == "--completeness-selftest") completeness_selftest = true;
         else if (a == "--activation-selftest") activation_selftest = true;
         else if (a == "--scope-tol") {
@@ -662,7 +664,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         spell_pair.empty() && ref_block.empty() && ref_block_pair.empty() &&
         origin_universe.empty() && reconcile_scope.empty() && !linkage_selftest &&
         !hybrid_oracle && !mapping_selftest && !completeness_selftest && !activation_selftest &&
-        !support_selftest && !coordinate_selftest) {
+        !support_selftest && !coordinate_selftest && !budget_selftest) {
         throw std::runtime_error("genotype-frag requires at least one --reads");
     }
     if (!bubble_prefix_in.empty()) {
@@ -695,6 +697,97 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     ParseGfaOptions parse_options;
     parse_options.include_paths = true;
     parse_options.include_sequences = true;
+    // ---- OPERATIONAL WORK BUDGET SELF-TEST ------------------------------------------------------
+    // The budget must bound work BEFORE it is done, and exhaustion must be a refusal carrying no
+    // mass. A budget checked afterwards, or one that returns a partially enumerated support, is
+    // worse than none: it reports a smaller model rather than an unfinished one.
+    if (budget_selftest) {
+        std::size_t fails = 0;
+        const auto ok_ = [&](bool c, const char* what) {
+            std::printf("%s\t%s\n", c ? "ok" : "FAIL", what);
+            if (!c) ++fails;
+        };
+        std::mt19937_64 rng(20260908);
+        const auto rseq = [&](std::size_t n) {
+            static const char* B = "ACGT";
+            std::string t(n, 'A');
+            for (std::size_t i = 0; i < n; ++i) t[i] = B[rng() & 3];
+            return t;
+        };
+        LinkageGeometry g;
+        g.block_a = 0; g.block_b = 1;
+        g.alleles_a = {rseq(120), rseq(120), rseq(120)};
+        g.alleles_b = {rseq(140), rseq(140), rseq(140)};
+        g.context = rseq(60); g.lflank = rseq(800); g.rflank = rseq(800);
+        g.window_len.assign(9, 0); g.exposure.assign(9, 1000.0);
+        g.exposure_affine = true; g.ok = true;
+        const auto ix = build_allele_product_index(g, 16);
+        InsertPrior ip; ip.lo = 200; ip.hi = 600;
+        ip.logp.assign(static_cast<std::size_t>(ip.hi - ip.lo + 1),
+                       -std::log(static_cast<double>(ip.hi - ip.lo + 1)));
+        VirtualWindow vw; vw.geom = &g; vw.alpha = 1; vw.beta = 2;
+        const std::size_t at = g.lflank.size() - 60;
+        Fragment f; f.name = "b";
+        for (std::size_t i = 0; i < 150; ++i) f.r1.push_back(vw.base_at(at + i));
+        std::string tail;
+        for (std::size_t i = 0; i < 150; ++i) tail.push_back(vw.base_at(at + 250 + i));
+        f.r2 = reverse_complement(tail);
+        const double lep = std::log(0.001 / 3.0), l1m = std::log(1.0 - 0.001);
+
+        // (1) INERT WHEN NOT BINDING: a generous budget must not change one bit of the answer.
+        const auto ref = linkage_emission_supported(f, g, ip, 0.05, lep, l1m, -300.0, nullptr, &ix,
+                                                    nullptr);
+        HybridWorkBudget big; big.max_proposed_cells = 0; big.max_full_read_verifications = 0;
+        const auto same = linkage_emission_supported(f, g, ip, 0.05, lep, l1m, -300.0, nullptr, &ix,
+                                                     &big);
+        ok_(!same.work_refused && same.mass == ref.mass,
+            "an unlimited budget leaves the emission bit-identical");
+        ok_(big.full_read_verifications > 0 && big.proposed_cells > 0 &&
+            big.bases_compared_upper_bound >= big.full_read_verifications,
+            "the budget counts the work it observed, and bases >= verifications");
+
+        // (2) THE CELL LIMIT refuses, and carries NO mass.
+        HybridWorkBudget c1; c1.max_proposed_cells = 1; c1.max_full_read_verifications = 0;
+        const auto rc1 = linkage_emission_supported(f, g, ip, 0.05, lep, l1m, -300.0, nullptr, &ix,
+                                                    &c1);
+        bool no_mass = !rc1.mass.empty();
+        for (double m : rc1.mass) if (m != -std::numeric_limits<double>::infinity()) no_mass = false;
+        ok_(rc1.work_refused && !rc1.ok && no_mass &&
+            rc1.work_refusal == "support-search-proposed-cell-limit",
+            "the proposed-cell limit refuses with no mass at all");
+
+        // (3) THE VERIFICATION LIMIT is charged BEFORE the comparison, so it stops the work.
+        HybridWorkBudget v1; v1.max_proposed_cells = 0; v1.max_full_read_verifications = 2;
+        const auto rv1 = linkage_emission_supported(f, g, ip, 0.05, lep, l1m, -300.0, nullptr, &ix,
+                                                    &v1);
+        // THE ORDERING IS THE POINT. Charged BEFORE the comparison, the number of whole-read
+        // comparisons actually PERFORMED never exceeds the limit. Charged after, the limit is
+        // discovered by overrunning it -- one comparison too late, every time.
+        ok_(rv1.work_refused && rv1.work_refusal == "support-search-verification-limit" &&
+            rv1.full_read_verifications <= v1.max_full_read_verifications,
+            "no more whole-read comparisons are PERFORMED than the limit allows");
+
+        // (4) THE FALLBACK MUST NOT BEGIN. A non-ACGT read forces the dense path; with a budget it
+        //     cannot afford, no window may be enumerated at all.
+        Fragment nf = f; nf.r1[10] = 'N';
+        HybridWorkBudget fb; fb.max_proposed_cells = 4; fb.max_full_read_verifications = 10;
+        const auto rfb = linkage_emission_supported(nf, g, ip, 0.05, lep, l1m, -300.0, nullptr, &ix,
+                                                    &fb);
+        bool fb_empty = !rfb.mass.empty();
+        for (double m : rfb.mass) if (m != -std::numeric_limits<double>::infinity()) fb_empty = false;
+        ok_(rfb.work_refused && rfb.work_refusal == "support-search-fallback-work-limit" &&
+            fb_empty && fb.full_read_verifications == 0,
+            "an unaffordable dense fallback refuses BEFORE enumerating any window");
+        // And the same fallback with room must actually produce the dense answer.
+        HybridWorkBudget fb2; fb2.max_proposed_cells = 0; fb2.max_full_read_verifications = 0;
+        const auto rfb2 = linkage_emission_supported(nf, g, ip, 0.05, lep, l1m, -300.0, nullptr, &ix,
+                                                     &fb2);
+        ok_(!rfb2.work_refused && rfb2.ok,
+            "the same fallback with budget to spare still computes the dense emission");
+        std::printf("budget selftest: %zu failure(s)\n", fails);
+        return fails == 0 ? 0 : 1;
+    }
+
     // ---- COORDINATE VALIDATION SELF-TEST -------------------------------------------------------
     // The derived start is the one thing direct verification cannot recover from being wrong: a
     // misplaced coordinate does not fail loudly, it silently verifies the wrong bases and drops the

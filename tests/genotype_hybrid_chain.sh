@@ -617,6 +617,19 @@ else
   bad "the derived-flank fixture produced no geometry probe"
 fi
 # ---------------------------------------------------------------------------------------------
+# GATE 29b: THE OPERATIONAL WORK BUDGET, at unit level. The production gate above proves the
+# refusal is transactional; this proves it is charged BEFORE the work, that an unlimited budget is
+# bit-inert, and that an unaffordable dense fallback never enumerates a window.
+if "$BIN" genotype-frag -i /dev/null -b none -o "$OUT/bg" --budget-selftest \
+     > "$OUT/budget.txt" 2>/dev/null; then
+  while IFS=$'\t' read -r v m; do
+    [ "$v" = ok ] && ok "$m" || { [ -n "${m:-}" ] && bad "$m"; }
+  done < <(grep -E '^(ok|FAIL)\t' "$OUT/budget.txt")
+else
+  bad "budget selftest reported failures"
+  sed -n 's/^FAIL\t/  /p' "$OUT/budget.txt"
+fi
+
 # GATE 29a: COORDINATE VALIDATION. Direct verification cannot recover from a wrong derived start:
 # it does not fail loudly, it verifies the wrong bases and silently drops the placement. So the
 # coordinate is checked on its own -- the view against the materialised window, the |A2|-|A1| shift
@@ -1786,36 +1799,64 @@ PYEOFI
   else
     bad "an end-to-end arm produced no call table"
   fi
-  # 2b. THE VERIFIED-WINDOW GUARD is operational, not statistical: a count of windows the support
-  #     search actually verifies, no likelihood anywhere in it. It replaced the dense-emission
-  #     budget, which bounded a cross-product production no longer computes -- testing the retired
-  #     budget would assert nothing. Exceeding it must refuse TRANSACTIONALLY: nothing subtracted,
-  #     legacy call intact, rather than appearing to hang.
+  # 2b. THE WORK GUARDS are operational, not statistical: counts of what the support search does,
+  #     no likelihood anywhere in them. There are now TWO, because after direct positional
+  #     verification one number cannot name both -- proposed cells are allele pairs retained,
+  #     full-read verifications are positional starts actually compared. Exceeding either must
+  #     refuse TRANSACTIONALLY: nothing subtracted, legacy call intact, rather than appearing to
+  #     hang. Both are charged BEFORE the work; tests/genotype_hybrid_chain's unit companion
+  #     (--budget-selftest) proves the ordering, this proves the transaction.
+  for guard in "--hybrid-max-proposed-cells 1" "--hybrid-max-full-read-verifications 1"; do
   "$BIN" genotype -i "$OUT/b.sorted.gfa" -b "$OUT/b" -r hapAA -o "$OUT/e2e.wg" \
     -R "$OUT/r1.fq" -R "$OUT/r2.fq" --fragment-len 350 --hybrid-call \
-    --hybrid-max-verified-windows 1 --hybrid-status "$OUT/wg.tsv" -q >/dev/null 2>&1
+    $guard --hybrid-status "$OUT/wg.tsv" -q >/dev/null 2>&1
   if [ -s "$OUT/wg.tsv" ] && [ -s "$OUT/e2e.wg.genotypes.tsv" ]; then
     WST=$(awk -F'\t' '$1=="hybrid_status"{print $2}' "$OUT/wg.tsv")
     WEX=$(awk -F'\t' '$1=="fragments_excluded"{print $2}' "$OUT/wg.tsv")
     WAC=$(awk -F'\t' '$1=="active_edges"{print $2}' "$OUT/wg.tsv")
     WRE=$(awk -F'\t' '$1=="reason"{print $2}' "$OUT/wg.tsv")
     if [ "$WST" = "INCOMPLETE" ] && [ "${WEX:-1}" = "0" ] && [ "${WAC:-1}" = "0" ]; then
-      ok "the verified-window guard refuses transactionally: INCOMPLETE, 0 active, 0 excluded"
+      ok "$guard refuses transactionally: INCOMPLETE, 0 active, 0 excluded"
     else
-      bad "work guard: status=$WST active=$WAC excluded=$WEX"
+      bad "work guard $guard: status=$WST active=$WAC excluded=$WEX"
     fi
     case "$WRE" in
-      verified-window-limit*) ok "the refusal keeps its own reason ($(echo "$WRE" | cut -c1-40)...)" ;;
+      support-search-*-limit*) ok "the refusal names WHICH limit ($(echo "$WRE" | cut -c1-46)...)" ;;
       *) bad "the work refusal lost its reason: '$WRE'" ;;
     esac
     # And the legacy call must be untouched by a refusal.
     if cmp -s "$OUT/e2e.leg.genotypes.tsv" "$OUT/e2e.wg.genotypes.tsv"; then
-      ok "a work refusal leaves the legacy call byte-identical"
+      ok "a $guard refusal leaves the legacy call byte-identical"
     else
-      bad "a work refusal changed the legacy call"
+      bad "a $guard refusal changed the legacy call"
     fi
   else
-    bad "the work-guard arm produced nothing"
+    bad "the work-guard arm produced nothing for $guard"
+  fi
+  done
+  # THE DEPRECATED ALIAS still refuses, and says it is deprecated rather than silently meaning
+  # something new.
+  "$BIN" genotype -i "$OUT/b.sorted.gfa" -b "$OUT/b" -r hapAA -o "$OUT/e2e.al" \
+    -R "$OUT/r1.fq" -R "$OUT/r2.fq" --fragment-len 350 --hybrid-call \
+    --hybrid-max-verified-windows 1 --hybrid-status "$OUT/al.tsv" > "$OUT/al.log" 2>&1
+  AST=$(awk -F'\t' '$1=="hybrid_status"{print $2}' "$OUT/al.tsv" 2>/dev/null)
+  if [ "$AST" = "INCOMPLETE" ] && grep -qi "deprecated" "$OUT/al.log"; then
+    ok "--hybrid-max-verified-windows still refuses, and is reported as DEPRECATED"
+  else
+    bad "the deprecated alias: status=$AST, deprecation notice $(grep -ci deprecated "$OUT/al.log")"
+  fi
+  # THE WORK ACTUALLY DONE is reported beside the limits it was held to -- on an UNREFUSED run,
+  # since a refused one has by construction stopped counting.
+  "$BIN" genotype -i "$OUT/b.sorted.gfa" -b "$OUT/b" -r hapAA -o "$OUT/e2e.wk" \
+    -R "$OUT/r1.fq" -R "$OUT/r2.fq" --fragment-len 350 --hybrid-call \
+    --hybrid-status "$OUT/wk.tsv" -q >/dev/null 2>&1
+  WP=$(awk -F'\t' '$1=="work_proposed_cells"{print $2}' "$OUT/wk.tsv" 2>/dev/null)
+  WV=$(awk -F'\t' '$1=="work_full_read_verifications"{print $2}' "$OUT/wk.tsv" 2>/dev/null)
+  WB=$(awk -F'\t' '$1=="work_bases_compared_upper_bound"{print $2}' "$OUT/wk.tsv" 2>/dev/null)
+  if [ "${WP:-0}" -gt 0 ] && [ "${WV:-0}" -gt 0 ] && [ "${WB:-0}" -ge "${WV:-1}" ]; then
+    ok "an unrefused run reports its work: $WP cells, $WV verifications, $WB bases (upper bound)"
+  else
+    bad "work counters not reported: cells=$WP verifications=$WV bases=$WB"
   fi
 
   # 3. THE LINKAGE PARAMETER CONTRACT. Every parameter reported with the result, and actually USED
