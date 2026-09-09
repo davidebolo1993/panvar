@@ -617,6 +617,23 @@ else
   bad "the derived-flank fixture produced no geometry probe"
 fi
 # ---------------------------------------------------------------------------------------------
+# GATE 29g: HIGHER-ORDER INFERENCE, unoptimised, against COMPLETE brute force. The exact model is
+# prod U_b(X_b) * prod T(X_{b-1},X_b) * F1 * F2 with X_b an ORDERED PAIR of panel-template
+# identities. Li-Stephens permits a different template at each block, so F1 is genuinely FOURTH
+# order -- grouping makes its lookup cheap but does not reduce its order -- and the stay term
+# (1-r)I depends on exact template identity, so a message may NOT be collapsed to signature classes
+# without a contraction proof. This carries the full history the factors need and is deliberately
+# unoptimised; it establishes what any contraction must reproduce.
+if "$BIN" genotype-frag -i /dev/null -b none -o "$OUT/ho" --hoinfer-selftest \
+     > "$OUT/hoinfer.txt" 2>/dev/null; then
+  while IFS=$'\t' read -r v m; do
+    [ "$v" = ok ] && ok "$m" || { [ -n "${m:-}" ] && bad "$m"; }
+  done < <(grep -E '^(ok|FAIL)\t' "$OUT/hoinfer.txt")
+else
+  bad "higher-order inference selftest reported failures"
+  sed -n 's/^FAIL\t/  /p' "$OUT/hoinfer.txt"
+fi
+
 # GATE 29f: THE HIGHER-ORDER FACTOR CONSTRUCTOR. One production operation -- group, combine raw
 # contributions through the shared mix(), validate global-swap completeness, centre ONCE per content
 # class, expand through the member mapping, enforce the per-class bound -- against an oracle that

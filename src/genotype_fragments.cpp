@@ -5565,11 +5565,11 @@ IntervalGrouping build_interval_grouping(
     const auto pairs = [](std::size_t n) { return n * (n + 1) / 2; };
     G.content_classes_raw = 1;
     G.content_classes_grouped = 1;
-    G.ordered_configurations = 1;
+    G.factor_lookup_configurations = 1;
     for (std::size_t j = 0; j < k; ++j) {
         G.content_classes_raw *= pairs(geom.alleles[j].size());
         G.content_classes_grouped *= pairs(G.classes_per_block[j]);
-        G.ordered_configurations *= G.classes_per_block[j] * G.classes_per_block[j];
+        G.factor_lookup_configurations *= G.classes_per_block[j] * G.classes_per_block[j];
     }
     // Classes with at most one heterozygous block have a single biological phase and are EXACTLY
     // neutral, so they need never be stored. Counted here so the prediction below is honest about
@@ -5590,8 +5590,8 @@ IntervalGrouping build_interval_grouping(
     // them, so "one double per class" understates it by the mean phase count. The totals follow
     // from sums already known: every class contributes 2^m ordered configurations and their sum is
     // exactly prod(R_j^2); the m <= 1 classes contribute m0 + 2*m1 of those and store nothing.
-    G.stored_ordered_values = G.ordered_configurations > G.ordered_in_m_le_1
-                            ? G.ordered_configurations - G.ordered_in_m_le_1 : 0;
+    G.stored_ordered_values = G.factor_lookup_configurations > G.ordered_in_m_le_1
+                            ? G.factor_lookup_configurations - G.ordered_in_m_le_1 : 0;
     G.stored_canonical_values = G.stored_ordered_values / 2;   // two ordered per biological phase
     // Canonical storage: one key per class that carries a value, plus one double per phase.
     G.predicted_bytes =

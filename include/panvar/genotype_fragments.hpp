@@ -1878,7 +1878,13 @@ struct IntervalGrouping {
     std::size_t distinct_cell_signatures = 0;
     std::size_t content_classes_raw = 0;      // product of C(n_j + 1, 2)
     std::size_t content_classes_grouped = 0;  // product of C(R_j + 1, 2)
-    std::size_t ordered_configurations = 0;   // product of R_j^2
+    // FACTOR-LOOKUP configurations: the ordered class-tuple pairs this factor can be QUERIED at.
+    // NOT inference states. The HMM state is an ordered pair of panel-template identities, and the
+    // Li-Stephens stay term (1-r)I depends on exact template identity -- two templates inside one
+    // signature class can carry different continuation probabilities. Classes are sufficient to
+    // look the factor up; they are not sufficient to carry an HMM message, and treating this
+    // number as a clique size would assume the contraction it has yet to be given.
+    std::size_t factor_lookup_configurations = 0;   // product of R_j^2
     std::size_t classes_m_le_1 = 0;           // exactly neutral by construction
     // THE JOINT CLAIM, verified rather than argued. Per-block slice equality gives a chain of
     // one-block swaps, from which joint equality FOLLOWS -- but the grouping is only sound if every
@@ -1886,7 +1892,7 @@ struct IntervalGrouping {
     // is checked over every cell rather than deduced.
     std::size_t cells_checked = 0, cells_disagreeing_with_representative = 0;
     bool joint_equality_verified = false;
-    std::size_t ordered_in_m_le_1 = 0;        // ordered configs inside neutral classes
+    std::size_t ordered_in_m_le_1 = 0;        // lookup configs inside neutral classes
     std::size_t stored_ordered_values = 0;    // ordered configs that carry a value
     std::size_t stored_canonical_values = 0;  // biological phases that carry a value
     // Computed BEFORE any table is allocated, and it counts STORED PHASE VALUES: a non-neutral

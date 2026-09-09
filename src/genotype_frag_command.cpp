@@ -347,6 +347,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     bool interval_selftest = false;
     bool normalisation_selftest = false;
     bool factor_selftest = false;
+    bool hoinfer_selftest = false;
     bool completeness_selftest = false;
     bool activation_selftest = false;
     std::vector<std::string> reconcile_scope;
@@ -408,6 +409,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--interval-selftest") interval_selftest = true;
         else if (a == "--normalisation-selftest") normalisation_selftest = true;
         else if (a == "--factor-selftest") factor_selftest = true;
+        else if (a == "--hoinfer-selftest") hoinfer_selftest = true;
         else if (a == "--completeness-selftest") completeness_selftest = true;
         else if (a == "--activation-selftest") activation_selftest = true;
         else if (a == "--scope-tol") {
@@ -673,7 +675,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         origin_universe.empty() && reconcile_scope.empty() && !linkage_selftest &&
         !hybrid_oracle && !mapping_selftest && !completeness_selftest && !activation_selftest &&
         !support_selftest && !coordinate_selftest && !budget_selftest && !grouping_selftest &&
-        !interval_selftest && !normalisation_selftest && !factor_selftest) {
+        !interval_selftest && !normalisation_selftest && !factor_selftest &&
+        !hoinfer_selftest) {
         throw std::runtime_error("genotype-frag requires at least one --reads");
     }
     if (!bubble_prefix_in.empty()) {
@@ -706,6 +709,218 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     ParseGfaOptions parse_options;
     parse_options.include_paths = true;
     parse_options.include_sequences = true;
+    // ---- HIGHER-ORDER INFERENCE, UNOPTIMISED, AGAINST COMPLETE BRUTE FORCE ---------------------
+    // The exact model is
+    //     prod_b U_b(X_b) * prod_b T(X_{b-1}, X_b) * F1(c1..c4) * F2(c3..c5)
+    // with X_b an ORDERED PAIR of panel-template identities. Li-Stephens permits a different
+    // template at each block, so F1 is genuinely FOURTH order: grouping makes its lookup cheap but
+    // does not reduce its order, and the stay term (1-r)I depends on exact template identity, so a
+    // message may not be collapsed to signature classes without a contraction proof.
+    //
+    // This establishes what any such contraction must REPRODUCE. It carries the full history the
+    // factors need and is deliberately unoptimised; the reference enumerates every path.
+    if (hoinfer_selftest) {
+        std::size_t fails = 0;
+        const auto ok_ = [&](bool c, const std::string& w) {
+            std::printf("%s\t%s\n", c ? "ok" : "FAIL", w.c_str());
+            if (!c) ++fails;
+        };
+        const auto sci = [](double x) {
+            char b[32]; std::snprintf(b, sizeof b, "%.3e", x); return std::string(b);
+        };
+        std::mt19937_64 rng(20260909);
+        const std::size_t NH = 3, NB = 6;              // templates, blocks
+        const std::size_t NS = NH * NH;                // ordered diploid template pairs
+        // Each template's allele at each block, and the factors' spans.
+        // THREE alleles per block, mapped by a NON-IDENTITY function to TWO signature classes, so
+        // the class map is genuinely a map and not a relabelling -- and so several templates share
+        // a class while carrying different unary weights, which is the case where collapsing to
+        // classes for the MESSAGE (rather than only for the factor lookup) would be wrong.
+        std::vector<std::vector<std::uint32_t>> tal(NH, std::vector<std::uint32_t>(NB, 0));
+        for (std::size_t t = 0; t < NH; ++t)
+            for (std::size_t b = 0; b < NB; ++b)
+                tal[t][b] = static_cast<std::uint32_t>(rng() % 3);   // three alleles per block
+        // allele -> class: {0,2} -> 0, {1} -> 1. Non-identity, non-injective.
+        const auto cls = [](std::uint32_t a) { return static_cast<std::uint32_t>(a == 1 ? 1 : 0); };
+        const std::vector<std::size_t> span1 = {1, 2, 3, 4};   // F1
+        const std::vector<std::size_t> span2 = {3, 4, 5};      // F2, overlapping on 3 and 4
+        // Unary weights per diploid state per block, deliberately asymmetric.
+        std::vector<std::vector<double>> U(NB, std::vector<double>(NS, 0.0));
+        for (std::size_t b = 0; b < NB; ++b)
+            for (std::size_t x = 0; x < NS; ++x)
+                U[b][x] = std::uniform_real_distribution<double>(0.2, 1.8)(rng);
+        // The two factors, as functions of the ORDERED allele tuples of the two homologues, made
+        // invariant under GLOBAL SWAP so they are legitimate phase factors.
+        const auto key_of = [&](const std::vector<std::size_t>& span,
+                                const std::vector<std::size_t>& xs) {
+            std::string k;
+            for (std::size_t q = 0; q < span.size(); ++q) {
+                const std::size_t x = xs[q];
+                k.push_back(static_cast<char>('0' + cls(tal[x / NH][span[q]])));
+            }
+            k.push_back('|');
+            for (std::size_t q = 0; q < span.size(); ++q) {
+                const std::size_t x = xs[q];
+                k.push_back(static_cast<char>('0' + cls(tal[x % NH][span[q]])));
+            }
+            return k;
+        };
+        std::unordered_map<std::string, double> F1v, F2v;
+        const auto factor = [&](std::unordered_map<std::string, double>& M,
+                                const std::vector<std::size_t>& span,
+                                const std::vector<std::size_t>& xs) {
+            std::string k = key_of(span, xs);
+            // Global swap: exchange the two homologues everywhere.
+            const std::size_t half = k.find('|');
+            std::string sw = k.substr(half + 1) + "|" + k.substr(0, half);
+            const std::string canon = std::min(k, sw);
+            auto it = M.find(canon);
+            if (it == M.end())
+                it = M.emplace(canon,
+                               std::uniform_real_distribution<double>(0.3, 3.0)(rng)).first;
+            return it->second;
+        };
+        double r = 0.25;
+        const auto Tw = [&](std::size_t from, std::size_t to) {
+            const double stay = (from == to) ? (1.0 - r) : 0.0;
+            return stay + r / static_cast<double>(NH);
+        };
+        const auto Tdip = [&](std::size_t xp, std::size_t x) {
+            return Tw(xp / NH, x / NH) * Tw(xp % NH, x % NH);
+        };
+        // Every arm: r at both extremes and between, and a SYMMETRIC-emission arm in which the
+        // unaries are invariant under exchanging the two homologues -- the only setting where
+        // homologue-swap invariance of the posterior is a property of the KERNEL rather than of
+        // the fixture.
+        struct Arm { double r; bool symmetric; const char* name; };
+        const Arm arms[] = {{0.0, false, "r=0"}, {0.25, false, "r=0.25"}, {1.0, false, "r=1"},
+                            {0.25, true, "r=0.25 symmetric emissions"}};
+        std::vector<std::vector<double>> Usave = U;
+        for (const Arm& arm : arms) {
+        r = arm.r;
+        U = Usave;
+        if (arm.symmetric) {
+            for (std::size_t b = 0; b < NB; ++b)
+                for (std::size_t i = 0; i < NH; ++i)
+                    for (std::size_t j = 0; j < NH; ++j)
+                        U[b][j * NH + i] = U[b][i * NH + j];
+        }
+        // ---- COMPLETE BRUTE FORCE: every path of diploid states -------------------------------
+        std::vector<std::vector<double>> marg_bf(NB, std::vector<double>(NS, 0.0));
+        double Z_bf = 0.0;
+        {
+            std::vector<std::size_t> path(NB, 0);
+            std::size_t total = 1;
+            for (std::size_t b = 0; b < NB; ++b) total *= NS;
+            for (std::size_t code = 0; code < total; ++code) {
+                std::size_t c = code;
+                for (std::size_t b = 0; b < NB; ++b) { path[b] = c % NS; c /= NS; }
+                double w = 1.0;
+                for (std::size_t b = 0; b < NB; ++b) w *= U[b][path[b]];
+                for (std::size_t b = 1; b < NB; ++b) w *= Tdip(path[b - 1], path[b]);
+                std::vector<std::size_t> xs1, xs2;
+                for (std::size_t q : span1) xs1.push_back(path[q]);
+                for (std::size_t q : span2) xs2.push_back(path[q]);
+                w *= factor(F1v, span1, xs1);
+                w *= factor(F2v, span2, xs2);
+                Z_bf += w;
+                for (std::size_t b = 0; b < NB; ++b) marg_bf[b][path[b]] += w;
+            }
+        }
+        ok_(Z_bf > 0.0, std::string(arm.name) + ": brute force over " + std::to_string(NS) + "^" +
+                        std::to_string(NB) + " = " +
+                        std::to_string(static_cast<std::size_t>(std::pow(NS, NB))) +
+                        " diploid paths gives Z = " + sci(Z_bf));
+        // ---- UNOPTIMISED INFERENCE: carry exactly the history the factors need ----------------
+        // Eliminating left to right, the running scope is the set of block variables an
+        // un-applied factor still needs. F1 needs blocks 1..4, F2 needs 3..5, so the maximum
+        // carried history is three earlier variables plus the current one.
+        std::vector<std::vector<double>> marg_inf(NB, std::vector<double>(NS, 0.0));
+        double Z_inf = 0.0;
+        {
+            // State: (x1, x2, x3, x_cur) as needed. Implemented as a map from the tuple of
+            // retained variables to weight, advanced block by block.
+            std::map<std::vector<std::size_t>, double> msg;
+            for (std::size_t x = 0; x < NS; ++x) msg[{x}] = U[0][x];
+            for (std::size_t b = 1; b < NB; ++b) {
+                std::map<std::vector<std::size_t>, double> nxt;
+                for (const auto& kv : msg) {
+                    for (std::size_t x = 0; x < NS; ++x) {
+                        double w = kv.second * Tdip(kv.first.back(), x) * U[b][x];
+                        if (w == 0.0) continue;
+                        std::vector<std::size_t> hist = kv.first;
+                        hist.push_back(x);
+                        // Apply a factor as soon as its last block is reached.
+                        if (b == span1.back()) {
+                            std::vector<std::size_t> xs;
+                            for (std::size_t q : span1) xs.push_back(hist[q]);
+                            w *= factor(F1v, span1, xs);
+                        }
+                        if (b == span2.back()) {
+                            std::vector<std::size_t> xs;
+                            for (std::size_t q : span2) xs.push_back(hist[q]);
+                            w *= factor(F2v, span2, xs);
+                        }
+                        nxt[hist] += w;
+                    }
+                }
+                msg.swap(nxt);
+            }
+            for (const auto& kv : msg) {
+                Z_inf += kv.second;
+                for (std::size_t b = 0; b < NB; ++b) marg_inf[b][kv.first[b]] += kv.second;
+            }
+        }
+        ok_(std::abs(Z_inf - Z_bf) / Z_bf < 1e-12,
+            std::string(arm.name) +
+            ": the unoptimised inference reproduces the partition weight (" + sci(Z_inf) +
+            " vs " + sci(Z_bf) + ", relative " + sci(std::abs(Z_inf - Z_bf) / Z_bf) + ")");
+        double worst_m = 0.0;
+        for (std::size_t b = 0; b < NB; ++b)
+            for (std::size_t x = 0; x < NS; ++x)
+                worst_m = std::max(worst_m,
+                                   std::abs(marg_inf[b][x] - marg_bf[b][x]) / Z_bf);
+        ok_(worst_m < 1e-12, std::string(arm.name) + ": and every block marginal, over all " +
+                             std::to_string(NB * NS) + " (worst relative " + sci(worst_m) + ")");
+        // HOMOLOGUE-SWAP INVARIANCE, only meaningful on the symmetric arm: with asymmetric unaries
+        // (i,j) and (j,i) carry different mass with NO factors at all, so a swap check there would
+        // measure the fixture.
+        if (arm.symmetric) {
+            double worst_sw = 0.0;
+            for (std::size_t b = 0; b < NB; ++b)
+                for (std::size_t i = 0; i < NH; ++i)
+                    for (std::size_t j = 0; j < NH; ++j)
+                        worst_sw = std::max(worst_sw,
+                                            std::abs(marg_bf[b][i * NH + j] -
+                                                     marg_bf[b][j * NH + i]) / Z_bf);
+            ok_(worst_sw < 1e-12,
+                "homologue-swap invariance holds on SYMMETRIC emissions (worst relative " +
+                sci(worst_sw) + ")");
+        }
+        // NON-VACUITY: the factors must actually move the answer.
+        {
+            double Z_nf = 0.0;
+            std::vector<std::size_t> path(NB, 0);
+            std::size_t total = 1;
+            for (std::size_t b = 0; b < NB; ++b) total *= NS;
+            for (std::size_t code = 0; code < total; ++code) {
+                std::size_t c = code;
+                for (std::size_t b = 0; b < NB; ++b) { path[b] = c % NS; c /= NS; }
+                double w = 1.0;
+                for (std::size_t b = 0; b < NB; ++b) w *= U[b][path[b]];
+                for (std::size_t b = 1; b < NB; ++b) w *= Tdip(path[b - 1], path[b]);
+                Z_nf += w;
+            }
+            ok_(std::abs(Z_bf - Z_nf) / Z_nf > 0.05,
+                std::string(arm.name) +
+                ": the higher-order factors MATERIALLY change the partition weight (" + sci(Z_bf) +
+                " with, " + sci(Z_nf) + " without)");
+        }
+        }   // arms
+        std::printf("higher-order inference selftest: %zu failure(s)\n", fails);
+        return fails == 0 ? 0 : 1;
+    }
+
     // ---- HIGHER-ORDER FACTOR CONSTRUCTION SELF-TEST ---------------------------------------------
     // The production constructor against an oracle that computes the diploid formula from its OWN
     // arithmetic. It must not call mix(): a defect there would move both sides together and the

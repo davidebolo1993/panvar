@@ -1,0 +1,132 @@
+# Higher-order inference: elimination scopes, written before allocation
+
+## The exact model
+
+    P  =  prod_b U_b(X_b)  *  prod_b T(X_{b-1}, X_b)
+          *  F1( c2(X_2), c3(X_3), c4(X_4), c5(X_5) )
+          *  F2( c4(X_4), c5(X_5), c6(X_6) )
+
+`X_b` is the ORDERED PAIR of panel-template identities in force at block b. `c_b` maps a template
+pair to the signature-class pair the factor is indexed by. `U_b` is the marker unary, `T` the
+Li-Stephens transition, and the eight retained pairwise linkage factors are absorbed into their own
+`T`-adjacent terms exactly as today.
+
+## Two facts that constrain every plan
+
+**F1 is genuinely fourth-order.** Li-Stephens permits a chromosome to copy a different template at
+each block, so `X_2 .. X_5` are four distinct variables. The allele tuple stays well defined under
+switching, but the factor still couples four time steps. Grouping does NOT reduce its order.
+
+**Classes are sufficient to look the factor up, not to carry a message.** `T` decomposes as
+
+    T = (1 - r) I  +  (r / n) 1 1^T
+
+The stay term is diagonal in TEMPLATE IDENTITY. Two templates inside one signature class may have
+different continuation probabilities, so a message collapsed to classes loses the information the
+stay term needs. Any collapse must come with a contraction proof, not an assumption.
+
+## Sizes, named honestly
+
+  factor_lookup_configurations   F1  (2*16*10*8)^2 = 6,553,600      F2  144^2 = 20,736
+  factor-label separator {4,5}   10*8 = 80 haploid, 6,400 ordered diploid ALLELE assignments
+
+F1 distinguishes all 10 block-4 and all 8 block-5 alleles while F2 uses 6 and 8, so F1 refines F2
+there and the common refinement is F1's own -- a common refinement can never be coarser than either
+input. These are FACTOR-LOOKUP sizes. The exact inference separator may still require structured
+template information and is not yet derived.
+
+## Elimination scopes, symbolically
+
+Order the blocks 0..10. Eliminating left to right, the running scope after block b is the set of
+variables still needed by an un-applied factor:
+
+  after X_2   {X_2}                     F1 pending, needs c2
+  after X_3   {X_2, X_3}                F1 pending
+  after X_4   {X_2, X_3, X_4}           F1 pending; F2 begins, needs c4
+  after X_5   {X_2..X_5} then F1 APPLIES and X_2, X_3 drop; {X_4, X_5} remain for F2
+  after X_6   {X_4, X_5, X_6} then F2 APPLIES and all drop
+
+So the maximal elimination scope is four consecutive block variables, each an ordered template pair.
+Over raw template identities that is (131^2)^4 -- not constructible. Over signature classes it is
+6,553,600, but that is exactly the collapse the stay term forbids without proof.
+
+## The structured contraction to derive
+
+Expanding `T = (1-r)I + (r/n)11^T` across the span turns the sum into run-partition terms, each
+partitioning the span into RUNS of constant template. The count is `4^(span-1)`, NOT `2^(span-1)`:
+the expansion is per homologue, and the ORDERED DIPLOID state has four stay/switch combinations per
+edge. F1's four-block span therefore has 64 joint transition-component patterns, not eight. Within a run the template is fixed, so that
+run's class values are determined by ONE template identity, and the sum over templates inside a run
+can be grouped by the class tuple that template induces over the run's blocks. Between runs the
+switch term is rank one and contributes a grouped sum.
+
+The message therefore wants to be a mixture: exact template identity where a run is still open, and
+grouped class history where it has closed.
+
+THE TWO HOMOLOGUES CANNOT BE CONTRACTED INDEPENDENTLY AND SQUARED. Marker unaries couple them at
+every block, F1 and F2 couple their class histories, and the stay components retain exact template
+identity on each side. So `(131 * 2,560)^2` is a WARNING BOUND on how large a naive joint
+representation could get -- not a justified message layout. The term-by-term stay/switch expansion
+may avoid ever materialising that product, because a run that has CLOSED can be summed immediately
+rather than carried. The quantity to predict before allocating is the largest
+augmented message -- its exact-template entries, its class-history entries, the operation count and
+the bytes -- and to refuse if it exceeds the limit.
+
+That derivation is NOT done. Until it is, the only sound implementation is the unoptimised one on a
+small fixture, checked against complete brute force.
+
+## Gate order
+
+0. THE FIXTURE ITSELF must contain, or the oracle proves little:
+   a four-block factor and an overlapping three-block factor SIMULTANEOUSLY;
+   at least three templates;
+   several templates mapping to ONE signature class while carrying UNEQUAL unary weights;
+   non-identity class mappings;
+   asymmetric marker emissions, plus a separate SYMMETRIC homologue-swap arm;
+   r = 0, an intermediate value, and r = 1;
+   non-neutral F1 and F2, plus zero-factor controls;
+   the unnormalised partition weight AND every block marginal compared.
+   The brute-force oracle enumerates complete ordered-template-pair histories independently. It may
+   share the already-validated factor tables; it may NOT share the proposed contraction.
+1. unoptimised higher-order inference on a small fixture, against complete brute force
+2. the structured contraction, with its own proof and mutations
+3. real-C4 prediction: largest augmented message, exact-template entries, class-history entries,
+   operations, bytes -- refusing before allocation if over limit
+4. two elimination plans agreeing with each other and with the same independent oracle
+5. the factor-assignment ledger: every unary, every LS transition, the eight retained pairwise
+   factors, F1 and F2 -- each exactly once; edges 3-4 and 4-5 absent from the kernel entirely
+6. the 4-5 LS transition caught separately when omitted and when doubled
+7. feature-disabled and zero-higher-order-factor cases reproducing the existing kernel byte for byte
+
+## Predicted resources for the structured contraction (derived, not guessed)
+
+Message state inside a span, per homologue: (classes at blocks whose run has CLOSED) x (current
+template identity). The OPEN run needs no history -- its classes follow from the current template --
+and the run start is implicit in the history length, so it is not a separate dimension.
+
+                              F1 {2,3,4,5}          F2 {4,5,6}
+  signature classes           2 x 16 x 10 x 8       6 x 8 x 3
+  peak STORED message         17,658,669 = 141 MB   634,957 = 5.1 MB
+  last position, STREAMED     1,774,945,069         40,173,901
+  operations across the span  1.79e9                4.08e7
+  outgoing after the factor   17,161                17,161
+  warning bound (131*2560)^2  900 GB                --
+
+TWO ARITHMETIC CORRECTIONS MADE WHILE DERIVING THIS, both worth keeping:
+
+  * A first estimate put F1 at 3e13 operations -- four orders too high -- because it assumed dense
+    O(S^2) transitions. Li-Stephens factorises as (1-r)I + (r/n)11^T and the existing kernel already
+    exploits it. With the factorisation the STAY component leaves (history, X) untouched while the
+    SWITCH component sums over X, closes the run, appends its classes and redistributes uniformly:
+    O(entering) plus O(new histories x DIP), never O(entering x DIP).
+
+  * The peak is NOT at the last position. Its 1.77e9 states would be 14 GB, but the factor applies
+    there and collapses everything to DIP = 17,161, so they are generated and consumed streaming
+    and never stored. Peak STORAGE is one position earlier, at 141 MB.
+
+What makes this fit at all is that a CLOSED run can be summed immediately rather than carried. That
+is the mechanism which keeps the message off the 900 GB warning bound, and any implementation that
+carries full class history alongside full template identity will hit that bound instead.
+
+These are PRE-ALLOCATION estimates. The implementation must compute them first and REFUSE above its
+limit rather than allocate and discover.

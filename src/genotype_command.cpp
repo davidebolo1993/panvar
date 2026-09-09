@@ -2331,7 +2331,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                 fo << "content_classes_raw\t" << GR.content_classes_raw << '\n';
                                 fo << "content_classes_grouped\t" << GR.content_classes_grouped
                                    << '\n';
-                                fo << "ordered_configurations\t" << GR.ordered_configurations
+                                fo << "factor_lookup_configurations\t" << GR.factor_lookup_configurations
                                    << '\n';
                                 fo << "classes_m_le_1_neutral\t" << GR.classes_m_le_1 << '\n';
                                 fo << "classes_carrying_a_value\t"
