@@ -731,9 +731,20 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         IntervalGeometry G;
         G.blocks = {0, 1, 2};
         const std::string A0 = rseq(180), B0 = rseq(160), C0 = rseq(200);
+        // THE MIDDLE BLOCK CARRIES TWO DISTINCT LENGTHS. With substitution-only alleles every
+        // window is the same length, so an intermediate block's length can never affect an insert
+        // and a mutation that omits it cannot be observed. A 30 bp indel allele is what makes that
+        // condition exist.
+        const std::string B_long = B0 + rseq(30);
+        // A TANDEM allele in the last block: two identical 400 bp copies, so a fragment planted
+        // inside one matches BOTH at the same relative offset. That yields two DISTINCT physical
+        // origins with identical edits and identical insert -- the only shape in which collapsing
+        // origins by their statistics is observable, and the reason a signature multiset alone
+        // cannot certify this search.
+        const std::string Q = rseq(400);
         G.alleles = {{A0, sub(A0, 90, 'G')},
-                     {B0, sub(B0, 80, 'T'), sub(B0, 81, 'C')},
-                     {C0, sub(C0, 100, 'G')}};
+                     {B0, sub(B0, 80, 'T'), B_long},
+                     {C0, sub(C0, 100, 'G'), Q + Q}};
         // CONTEXTS SHORTER THAN A PIECE, so no seed can sit wholly inside one. At 40 and 35
         // against a 16 bp piece the index was incomplete and did not say so; the geometry passed
         // only because some allele piece always happened to match too.
@@ -741,7 +752,10 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         G.lflank = ""; G.rflank = "";
         G.ok = true; G.exposure_affine = true;
         const std::size_t NC = G.cells();
-        InsertPrior ip; ip.lo = 150; ip.hi = 700;
+        // BOUNDS SET TO REAL STATES, so both comparisons can be observed. Planted inserts are
+        // offset + 150, and offsets 199/200/395/396 give 349/350/545/546 -- one below the lower
+        // bound, one exactly on it, one exactly on the upper, one above.
+        InsertPrior ip; ip.lo = 350; ip.hi = 545;
         ip.logp.assign(static_cast<std::size_t>(ip.hi - ip.lo + 1),
                        -std::log(static_cast<double>(ip.hi - ip.lo + 1)));
         const double lep = std::log(0.001 / 3.0), l1m = std::log(1.0 - 0.001);
@@ -836,8 +850,11 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         // Fragments planted across every segment and boundary of a chosen cell.
         std::vector<Fragment> frags;
         std::vector<std::uint32_t> ch;
-        for (std::size_t c : {std::size_t(0), std::size_t(5), std::size_t(11)}) {
+        for (std::size_t c : {std::size_t(0), std::size_t(5), std::size_t(11),
+                              std::size_t(2), std::size_t(17)}) {
+            if (c >= G.cells()) continue;
             G.cell_choice(c, ch);
+            const bool cc_has_tandem = ch[2] == 2;
             std::vector<const std::string*> alle, ctxp;
             for (std::size_t j = 0; j < 3; ++j) alle.push_back(&G.alleles[j][ch[j]]);
             for (const std::string& cx : G.contexts) ctxp.push_back(&cx);
@@ -860,10 +877,60 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                 f.r2 = reverse_complement(tail);
                 frags.push_back(f);
             }
+            // A fragment planted inside the tandem unit, which therefore has two origins.
+            if (cc_has_tandem) {
+                const std::size_t base = G.lflank.size() + G.alleles[0][0].size() +
+                                         G.contexts[0].size() + G.alleles[1][0].size() +
+                                         G.contexts[1].size();
+                Fragment tf;
+                tf.name = "tandem" + std::to_string(c);
+                for (std::size_t i = 0; i < 150; ++i) tf.r1.push_back(vw.base_at(base + 5 + i));
+                std::string tt;
+                for (std::size_t i = 0; i < 150; ++i) tt.push_back(vw.base_at(base + 205 + i));
+                tf.r2 = reverse_complement(tt);
+                frags.push_back(tf);
+            }
+            // THE FOUR BOUNDARY OBSERVATIONS. Without a state exactly ON each bound, shifting
+            // that bound changes nothing and the mutation survives on an absent condition.
+            for (std::size_t off : {std::size_t(199), std::size_t(200), std::size_t(395),
+                                    std::size_t(396)}) {
+                if (5 + off + 150 > wl) continue;
+                Fragment fb2;
+                fb2.name = "ins" + std::to_string(off + 150) + "_" + std::to_string(c);
+                for (std::size_t i = 0; i < 150; ++i) fb2.r1.push_back(vw.base_at(5 + i));
+                std::string tb;
+                for (std::size_t i = 0; i < 150; ++i) tb.push_back(vw.base_at(5 + off + i));
+                fb2.r2 = reverse_complement(tb);
+                frags.push_back(fb2);
+            }
+            // A LONG-INSERT FRAGMENT whose mates sit in the OUTER blocks, leaving the middle one
+            // free: the only shape whose insert an intermediate allele length can change.
+            if (wl > 560) {
+                Fragment g2;
+                g2.name = "span" + std::to_string(c);
+                for (std::size_t i = 0; i < 150; ++i) g2.r1.push_back(vw.base_at(5 + i));
+                std::string t2;
+                for (std::size_t i = 0; i < 150; ++i) t2.push_back(vw.base_at(400 + i));
+                g2.r2 = reverse_complement(t2);
+                frags.push_back(g2);
+                // THE SECOND LIBRARY ORIENTATION: r2 forward and r1 reverse-complemented. Without
+                // one of these, dropping that orientation changes nothing and the mutation
+                // survives on an absent condition rather than on correctness.
+                Fragment g3;
+                g3.name = "revorient" + std::to_string(c);
+                for (std::size_t i = 0; i < 150; ++i) g3.r2.push_back(vw.base_at(5 + i));
+                std::string t3;
+                for (std::size_t i = 0; i < 150; ++i) t3.push_back(vw.base_at(400 + i));
+                g3.r1 = reverse_complement(t3);
+                frags.push_back(g3);
+            }
         }
         ok_(frags.size() >= 9, "the fixture plants " + std::to_string(frags.size()) +
                                " fragments across segments and boundaries");
-        std::size_t cells_differ = 0, mult_differ = 0, sig_differ = 0, org_differ = 0;
+        std::size_t cells_differ = 0, mult_differ = 0, sig_differ = 0, org_differ = 0,
+                    con_differ = 0;
+        std::size_t at_lo = 0, at_hi = 0, below_lo = 0, above_hi = 0;
+        std::size_t free_mid = 0, or_a = 0, or_b = 0, dup_origin_cells = 0;
         std::size_t fin_o = 0, fin_s = 0;
         double worst = 0.0;
         std::size_t tot_states_o = 0, tot_states_s = 0;
@@ -894,6 +961,34 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                 tot_states_s += S.cell_states[c];
             }
             sym_states += S.verified_fr_states;
+            free_mid += S.states_with_free_intermediate;
+            or_a += S.states_orientation_a;
+            or_b += S.states_orientation_b;
+            // Cells where two different origins share (edits, insert): the tandem case.
+            for (std::size_t c = 0; c < NC; ++c) {
+                const std::string& sg = S.cell_signature[c];
+                const std::string& ob = S.cell_origin[c];
+                const std::size_t ns = sg.size() / 12;
+                if (ns < 2 || ob.size() / 40 != ns) continue;
+                bool dup = false;
+                for (std::size_t x = 0; x + 1 < ns && !dup; ++x)
+                    for (std::size_t y = x + 1; y < ns; ++y)
+                        if (std::memcmp(&sg[x * 12], &sg[y * 12], 12) == 0 &&
+                            std::memcmp(&ob[x * 40], &ob[y * 40], 40) != 0) { dup = true; break; }
+                if (dup) ++dup_origin_cells;
+            }
+            // The four boundary observations, read off the ORIGINS rather than assumed from the
+            // planted offsets: a planted fragment only counts if it actually produced a state.
+            for (std::size_t c = 0; c < NC; ++c) {
+                const std::string& ob = S.cell_origin[c];
+                for (std::size_t q = 0; q + 40 <= ob.size(); q += 40) {
+                    long ins = 0; std::memcpy(&ins, &ob[q + 32], 8);
+                    if (ins == ip.lo) ++at_lo;
+                    if (ins == ip.hi) ++at_hi;
+                    if (ins < ip.lo) ++below_lo;
+                    if (ins > ip.hi) ++above_hi;
+                }
+            }
             expansions += S.tuple_expansions;
             joins += S.joined_pairs;
             for (std::size_t c = 0; c < NC; ++c) {
@@ -917,6 +1012,9 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                 if (O.cell_states[c] != S.cell_states[c]) ++mult_differ;
                 if (O.cell_signature[c] != S.cell_signature[c]) ++sig_differ;
                 if (O.cell_origin[c] != S.cell_origin[c]) ++org_differ;
+                if (O.cell_contrib[c].size() != S.cell_contrib[c].size()) ++con_differ;
+                else for (std::size_t q = 0; q < O.cell_contrib[c].size(); ++q)
+                    if (O.cell_contrib[c][q] != S.cell_contrib[c][q]) { ++con_differ; break; }
                 if (fo) worst = std::max(worst, std::abs(O.mass[c] - S.mass[c]));
             }
         }
@@ -932,8 +1030,21 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         ok_(org_differ == 0, "the canonical ORIGIN multiset is identical per cell -- both mate "
                              "starts, strands and insert (" + std::to_string(org_differ) +
                              " differ)");
-        ok_(worst == 0.0, "log mass is identical per cell (worst " + sci(worst) +
-                          ", tolerance 0.000e+00)");
+        // MASS CARRIES A TOLERANCE; THE DISCRETE STRUCTURES DO NOT. The origin multisets are
+        // proved identical above, so the two paths sum the SAME terms -- but log_add is not
+        // associative in floating point and they sum them in different orders. The exact claims
+        // therefore sit where exactness is meaningful (finite cells, multiplicity, signature
+        // multiset, origin multiset) and mass inherits a declared tolerance from them, rather than
+        // the tolerance being chosen to make a disagreement pass.
+        ok_(con_differ == 0, "the per-origin log CONTRIBUTION multiset is identical per cell (" +
+                             std::to_string(con_differ) + " differ) -- so only reduction order can "
+                             "differ below");
+        // With the contribution computed in one shared place, the two paths reduce identical
+        // term multisets and the aggregate agrees exactly too. The tolerance stays declared rather
+        // than removed: reduction order could differ on another fixture without anything being
+        // wrong, and the exact per-origin comparison above is what would still hold if it did.
+        ok_(worst <= 1e-12, "log mass agrees per cell (worst " + sci(worst) +
+                            ", tolerance 1.000e-12, and exact on this fixture)");
         ok_(fin_o > 0 && fin_s == fin_o,
             "the fixture is NON-VACUOUS: " + std::to_string(fin_o) + " finite cells in the oracle");
         ok_(tot_states_o > 0 && tot_states_o == tot_states_s,
@@ -944,6 +1055,40 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             " cell writes -- free dimensions are never enumerated at the seed");
         std::printf("....\t%zu mate joins considered, %zu intervening-length tuples\n",
                     joins, expansions);
+        // ---- BASELINE NON-VACUITY OBSERVABLES ---------------------------------------------
+        // Every condition a mutation perturbs, counted BEFORE any mutation runs. A mutation that
+        // fails an assertion proves nothing unless its condition existed.
+        ok_(at_lo > 0 && at_hi > 0,
+            "states sit EXACTLY on both insert bounds: " + std::to_string(at_lo) + " at lo=" +
+            std::to_string(ip.lo) + ", " + std::to_string(at_hi) + " at hi=" +
+            std::to_string(ip.hi));
+        ok_(below_lo == 0 && above_hi == 0,
+            "and none outside them: " + std::to_string(below_lo) + " below lo, " +
+            std::to_string(above_hi) + " above hi (planted 349 and 546 are REJECTED)");
+        ok_(free_mid > 0,
+            "states whose mates straddle a FREE intermediate block: " + std::to_string(free_mid) +
+            " -- the only shape an intermediate allele length can affect");
+        ok_(dup_origin_cells > 0,
+            "cells carrying TWO DISTINCT origins with identical edits and insert: " +
+            std::to_string(dup_origin_cells) + " -- without one, collapsing origins by their "
+            "statistics changes nothing and that mutation survives on an absent condition");
+        ok_(or_a > 0 && or_b > 0,
+            "both library orientations are populated: " + std::to_string(or_a) + " and " +
+            std::to_string(or_b));
+        // ---- PERMANENT REGRESSION: a seed ending inside a context must not pin the next allele.
+        // It produced one physical origin written once; pinning the untouched allele duplicated it
+        // once per candidate and showed up as a log 2 mass difference over eight cells.
+        {
+            std::size_t ctx_only = 0, spans = 0;
+            for (const auto& kv : ix.boundary)
+                for (const IntervalSeedHit& h : kv.second)
+                    if (h.spans_boundary) ++spans; else ++ctx_only;
+            ok_(ctx_only > 0 && spans > 0,
+                "the boundary index separates seeds that STOP in the context (" +
+                std::to_string(ctx_only) + ") from those REACHING the next allele (" +
+                std::to_string(spans) + ")");
+        }
+
         // A SHORT ALLELE must trip the completeness predicate, not be scored incompletely.
         {
             IntervalGeometry H = G;

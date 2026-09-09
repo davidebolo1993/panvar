@@ -4918,6 +4918,21 @@ IntervalGeometry build_interval_geometry(const std::vector<CandidateFrame>& fram
 
 namespace {
 
+// THE PER-ORIGIN LOG CONTRIBUTION, in ONE place. Both paths sum the same terms, but floating-point
+// addition is not associative: grouping them differently makes two mathematically identical
+// contributions differ in the last bits, and then a per-origin comparison can only be made with a
+// tolerance. Computing it here makes that comparison EXACT, which is what justifies the aggregate
+// mass tolerance instead of the tolerance justifying itself.
+inline double origin_contribution(std::uint32_t e1, std::size_t len1, std::uint32_t e2,
+                                  std::size_t len2, long insert, double log_eps, double log_1meps,
+                                  const InsertPrior& ip) {
+    const double a = static_cast<double>(e1) * log_eps +
+                     static_cast<double>(len1 - e1) * log_1meps;
+    const double b = static_cast<double>(e2) * log_eps +
+                     static_cast<double>(len2 - e2) * log_1meps;
+    return std::log(0.5) + a + b + ip.log_at(insert);
+}
+
 // One verified placement of one mate: the alleles it pins, where it starts inside the FIRST block
 // it touches, and its edit count. Blocks outside [first, last] are untouched and stay free.
 struct IntervalPlacement {
@@ -5102,7 +5117,7 @@ IntervalEmission interval_emission(const Fragment& fragment, const IntervalGeome
     std::vector<std::vector<std::array<std::uint32_t, 3>>> sigacc;
     if (want_signatures) sigacc.assign(out.cells, {});
     std::vector<std::vector<std::array<long, 5>>> orgacc;
-    if (want_origins) orgacc.assign(out.cells, {});
+    if (want_origins) { orgacc.assign(out.cells, {}); out.cell_contrib.assign(out.cells, {}); }
     // Absolute start of a block, for THIS cell. The symbolic path never needs this to decide a
     // state -- the FR predicate uses only the difference -- so it is computed solely to report the
     // origin, and the comparison against the oracle stays non-circular on the join arithmetic.
@@ -5111,7 +5126,6 @@ IntervalEmission interval_emission(const Fragment& fragment, const IntervalGeome
         for (std::size_t j = 0; j < b; ++j) pfx += static_cast<long>(seg(j, cc[j]));
         return pfx;
     };
-    const double half = std::log(0.5);
     std::vector<int> pin(k, -1);
     std::vector<std::uint32_t> cell(k, 0);
     // Write one verified state into every cell its constraints cover: pinned dimensions are fixed,
@@ -5122,12 +5136,8 @@ IntervalEmission interval_emission(const Fragment& fragment, const IntervalGeome
         std::vector<std::size_t> freed;
         for (std::size_t j = 0; j < k; ++j) if (pins[j] < 0) freed.push_back(j);
         std::vector<std::uint32_t> idx(freed.size(), 0);
-        const double e = half +
-            static_cast<double>(e1) * log_eps +
-            static_cast<double>(fragment.r1.size() - e1) * log_1meps +
-            static_cast<double>(e2) * log_eps +
-            static_cast<double>(fragment.r2.size() - e2) * log_1meps +
-            ip.log_at(insert);
+        const double e = origin_contribution(e1, fragment.r1.size(), e2, fragment.r2.size(),
+                                             insert, log_eps, log_1meps, ip);
         bool done = false;
         while (!done) {
             for (std::size_t j = 0; j < k; ++j)
@@ -5135,6 +5145,7 @@ IntervalEmission interval_emission(const Fragment& fragment, const IntervalGeome
             for (std::size_t q = 0; q < freed.size(); ++q) cell[freed[q]] = idx[q];
             const std::size_t ci = geom.cell_index(cell);
             out.mass[ci] = log_add(out.mass[ci], e);
+            if (want_origins) out.cell_contrib[ci].push_back(e);
             ++out.cell_states[ci];
             if (want_signatures)
                 sigacc[ci].push_back({e1, e2, static_cast<std::uint32_t>(insert)});
@@ -5192,6 +5203,8 @@ IntervalEmission interval_emission(const Fragment& fragment, const IntervalGeome
                     if (valid_fr_coordinates(0, delta + static_cast<long>(rev_len) - 1,
                                              ip.lo, ip.hi)) {
                         ++out.verified_fr_states;
+                        if (!mid.empty()) ++out.states_with_free_intermediate;
+                        if (fwd_is_m1) ++out.states_orientation_a; else ++out.states_orientation_b;
                         emit_state(pins, fwd_is_m1 ? P.edits : Q.edits,
                                    fwd_is_m1 ? Q.edits : P.edits,
                                    delta + static_cast<long>(rev_len),
@@ -5214,6 +5227,7 @@ IntervalEmission interval_emission(const Fragment& fragment, const IntervalGeome
     if (want_origins) {
         out.cell_origin.assign(out.cells, std::string());
         for (std::size_t c = 0; c < out.cells; ++c) {
+            std::sort(out.cell_contrib[c].begin(), out.cell_contrib[c].end());
             std::sort(orgacc[c].begin(), orgacc[c].end());
             std::string& b = out.cell_origin[c];
             b.resize(orgacc[c].size() * 40);
@@ -5246,7 +5260,10 @@ IntervalEmission interval_emission_oracle(const Fragment& fragment, const Interv
     out.mass.assign(out.cells, kNegInf);
     out.cell_states.assign(out.cells, 0);
     if (want_signatures) out.cell_signature.assign(out.cells, std::string());
-    if (want_origins) out.cell_origin.assign(out.cells, std::string());
+    if (want_origins) {
+        out.cell_origin.assign(out.cells, std::string());
+        out.cell_contrib.assign(out.cells, {});
+    }
     const std::size_t d1 = mate_band_edits(max_divergence, fragment.r1.size());
     const std::size_t d2 = mate_band_edits(max_divergence, fragment.r2.size());
     const std::string a1 = reverse_complement(fragment.r1);
@@ -5271,18 +5288,22 @@ IntervalEmission interval_emission_oracle(const Fragment& fragment, const Interv
         const auto st = enumerate_fragment_states(0, f1, v1, f2, v2, fragment.r1.size(),
                                                   fragment.r2.size(), ip.lo, ip.hi);
         out.cell_states[c] = static_cast<std::uint32_t>(st.size());
+        for (const FragmentState& z : st) {
+            if (z.m1_fwd) ++out.states_orientation_a; else ++out.states_orientation_b;
+        }
         double m = kNegInf;
         std::vector<std::array<std::uint32_t, 3>> sig;
         for (const FragmentState& z : st) {
-            const double e1 = static_cast<double>(z.m1_edits) * log_eps +
-                              static_cast<double>(fragment.r1.size() - z.m1_edits) * log_1meps;
-            const double e2 = static_cast<double>(z.m2_edits) * log_eps +
-                              static_cast<double>(fragment.r2.size() - z.m2_edits) * log_1meps;
-            m = log_add(m, half + e1 + e2 + ip.log_at(z.insert));
+            const double contrib = origin_contribution(z.m1_edits, fragment.r1.size(), z.m2_edits,
+                                                       fragment.r2.size(), z.insert, log_eps,
+                                                       log_1meps, ip);
+            m = log_add(m, contrib);
+            if (want_origins) out.cell_contrib[c].push_back(contrib);
             if (want_signatures) {
                 sig.push_back({z.m1_edits, z.m2_edits, static_cast<std::uint32_t>(z.insert)});
             }
         }
+        if (want_origins) std::sort(out.cell_contrib[c].begin(), out.cell_contrib[c].end());
         if (want_origins) {
             // The FULL origin, from the oracle's own absolute coordinates.
             std::vector<std::array<long, 5>> og;
@@ -5363,15 +5384,33 @@ IntervalSeedIndex build_interval_seed_index(const IntervalGeometry& geom, std::s
             const std::string& A = geom.alleles[j][a];
             const std::size_t ta = A.size() < piece - 1 ? A.size() : piece - 1;
             const std::string tail = A.substr(A.size() - ta);
+            // A SEED THAT LEAVES THE ALLELE BUT STOPS INSIDE THE CONTEXT constrains block j ONLY.
+            // Recording it as spanning the boundary would pin the NEXT allele it never touched --
+            // once per candidate, so the same physical placement arrives with several different
+            // run lengths and each emits its own state. That is a double count of exactly one
+            // state, and it shows up as a log 2 mass difference.
+            {
+                const std::string ac = tail + C;
+                for (std::size_t at = 0; at + piece <= ac.size(); ++at) {
+                    if (at + piece <= ta) continue;          // wholly inside A: already in `inside`
+                    std::uint64_t code = 0;
+                    if (!encode_piece(ac, at, piece, code)) continue;
+                    IntervalSeedHit h;
+                    h.block = static_cast<std::uint32_t>(j);
+                    h.allele = a;
+                    h.offset = static_cast<std::uint32_t>(A.size() - ta + at);
+                    h.spans_boundary = false;
+                    ix.boundary[code].push_back(h);
+                }
+            }
             for (std::uint32_t b = 0; b < geom.alleles[j + 1].size(); ++b) {
                 const std::string& B = geom.alleles[j + 1][b];
                 const std::size_t hb = B.size() < piece - 1 ? B.size() : piece - 1;
                 const std::string joined = tail + C + B.substr(0, hb);
                 for (std::size_t at = 0; at + piece <= joined.size(); ++at) {
-                    // Only seeds that actually CROSS the boundary belong here; ones lying wholly
-                    // inside either allele are already in `inside`, and indexing them twice would
-                    // double their multiplicity.
-                    if (at + piece <= ta) continue;
+                    // Only seeds that genuinely REACH THE NEXT ALLELE pin it. Ones lying wholly in
+                    // either allele are in `inside`; ones stopping in the context are above.
+                    if (at + piece <= ta + C.size()) continue;
                     if (at >= ta + C.size()) continue;
                     std::uint64_t code = 0;
                     if (!encode_piece(joined, at, piece, code)) continue;

@@ -1801,6 +1801,11 @@ struct IntervalEmission {
     // comparison that used it alone would accept a path that swapped two origins. This is what the
     // comparison actually needs, and it is what makes "collapse distinct origins" a real mutation.
     std::vector<std::string> cell_origin;
+    // The per-origin log contributions, sorted. Equal origins and equal signatures should imply
+    // equal contributions, but asserting it DIRECTLY is what proves that only the reduction order
+    // differs between two paths -- and that is what makes an aggregate mass tolerance well founded
+    // rather than a threshold chosen to absorb a disagreement.
+    std::vector<std::vector<double>> cell_contrib;
     double log_p_bg = 0.0;
     bool ok = false;
     bool work_refused = false;
@@ -1814,6 +1819,12 @@ struct IntervalEmission {
     std::size_t accepted_placements = 0;
     std::size_t verified_fr_states = 0;
     std::size_t finite_cells = 0;
+    // BASELINE NON-VACUITY. A mutation that fails an assertion proves nothing unless the condition
+    // it perturbs existed beforehand, so the conditions are counted directly: states whose mates
+    // straddle a FREE intermediate block (the only ones an intermediate length can affect), and
+    // states in each library orientation.
+    std::size_t states_with_free_intermediate = 0;
+    std::size_t states_orientation_a = 0, states_orientation_b = 0;
 };
 
 // THE REFERENCE: every cell, window materialised, every start scanned. Correct by construction and
