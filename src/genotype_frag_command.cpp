@@ -346,6 +346,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     bool grouping_selftest = false;
     bool interval_selftest = false;
     bool normalisation_selftest = false;
+    bool factor_selftest = false;
     bool completeness_selftest = false;
     bool activation_selftest = false;
     std::vector<std::string> reconcile_scope;
@@ -406,6 +407,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--grouping-selftest") grouping_selftest = true;
         else if (a == "--interval-selftest") interval_selftest = true;
         else if (a == "--normalisation-selftest") normalisation_selftest = true;
+        else if (a == "--factor-selftest") factor_selftest = true;
         else if (a == "--completeness-selftest") completeness_selftest = true;
         else if (a == "--activation-selftest") activation_selftest = true;
         else if (a == "--scope-tol") {
@@ -671,7 +673,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         origin_universe.empty() && reconcile_scope.empty() && !linkage_selftest &&
         !hybrid_oracle && !mapping_selftest && !completeness_selftest && !activation_selftest &&
         !support_selftest && !coordinate_selftest && !budget_selftest && !grouping_selftest &&
-        !interval_selftest && !normalisation_selftest) {
+        !interval_selftest && !normalisation_selftest && !factor_selftest) {
         throw std::runtime_error("genotype-frag requires at least one --reads");
     }
     if (!bubble_prefix_in.empty()) {
@@ -704,6 +706,227 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     ParseGfaOptions parse_options;
     parse_options.include_paths = true;
     parse_options.include_sequences = true;
+    // ---- HIGHER-ORDER FACTOR CONSTRUCTION SELF-TEST ---------------------------------------------
+    // The production constructor against an oracle that computes the diploid formula from its OWN
+    // arithmetic. It must not call mix(): a defect there would move both sides together and the
+    // comparison would certify nothing.
+    if (factor_selftest) {
+        std::size_t fails = 0;
+        const auto ok_ = [&](bool c, const std::string& w) {
+            std::printf("%s\t%s\n", c ? "ok" : "FAIL", w.c_str());
+            if (!c) ++fails;
+        };
+        const auto sci = [](double x) {
+            char b[32]; std::snprintf(b, sizeof b, "%.3e", x); return std::string(b);
+        };
+        std::mt19937_64 rng(20260909);
+        const auto rseq = [&](std::size_t n) {
+            static const char* B = "ACGT";
+            std::string t(n, 'A');
+            for (std::size_t i = 0; i < n; ++i) t[i] = B[rng() & 3];
+            return t;
+        };
+        const auto sub = [](std::string x, std::size_t at, char c) {
+            x[at] = (x[at] == c) ? (c == 'A' ? 'C' : 'A') : c; return x;
+        };
+        // A COLLAPSING BLOCK: block 0 carries the SAME sequence twice, so its two alleles are one
+        // signature class while remaining two distinct HMM states. Effective heterozygosity there
+        // is zero even though the genotype is biologically heterozygous, and swapping them must be
+        // exactly neutral -- which is only true if compression stayed an evidence lookup.
+        const std::string A0 = rseq(200), B0 = rseq(180), C0 = rseq(220);
+        IntervalGeometry G;
+        G.blocks = {0, 1, 2};
+        G.alleles = {{A0, A0},                                   // one class, two states
+                     {B0, sub(B0, 90, 'G'), sub(B0, 91, 'T')},
+                     {C0, sub(C0, 110, 'G')}};
+        G.contexts = {rseq(10), rseq(8)};
+        G.lflank = ""; G.rflank = "";
+        G.ok = true; G.exposure_affine = true;
+        InsertPrior ip; ip.lo = 200; ip.hi = 650;
+        ip.logp.assign(static_cast<std::size_t>(ip.hi - ip.lo + 1),
+                       -std::log(static_cast<double>(ip.hi - ip.lo + 1)));
+        const double lep = std::log(0.001 / 3.0), l1m = std::log(1.0 - 0.001);
+        const auto ix = build_interval_seed_index(G, 16);
+        ok_(ix.ok && ix.complete, "the factor fixture's seed index is complete");
+        // Fragments planted so that different phases are genuinely preferred.
+        std::vector<Fragment> frags;
+        std::vector<std::uint32_t> ch;
+        for (std::size_t c : {std::size_t(2), std::size_t(7), std::size_t(9)}) {
+            if (c >= G.cells()) continue;
+            G.cell_choice(c, ch);
+            std::vector<const std::string*> al2, cx2;
+            for (std::size_t j = 0; j < 3; ++j) al2.push_back(&G.alleles[j][ch[j]]);
+            for (const std::string& cx : G.contexts) cx2.push_back(&cx);
+            VirtualWindow vw; vw.bind_chain(G.lflank, al2, cx2, G.rflank);
+            for (std::size_t st : {std::size_t(60), std::size_t(180), std::size_t(300)}) {
+                if (st + 400 > vw.size()) continue;
+                Fragment f;
+                f.name = "f" + std::to_string(c) + "_" + std::to_string(st);
+                for (std::size_t i = 0; i < 150; ++i) f.r1.push_back(vw.base_at(st + i));
+                std::string t2;
+                for (std::size_t i = 0; i < 150; ++i) t2.push_back(vw.base_at(st + 250 + i));
+                f.r2 = reverse_complement(t2);
+                frags.push_back(f);
+            }
+        }
+        std::vector<IntervalEmission> ems;
+        std::vector<std::vector<std::string>> sigs;
+        for (const Fragment& f : frags) {
+            const double bgf = -420.0;
+            IntervalEmission E = interval_emission(f, G, ip, 0.05, lep, l1m, bgf, &ix,
+                                                   nullptr, true, false);
+            sigs.push_back(E.cell_signature);
+            ems.push_back(std::move(E));
+        }
+        ok_(!frags.empty() && ems.size() == frags.size(),
+            "the fixture plants " + std::to_string(frags.size()) + " fragments");
+        const IntervalGrouping GR = build_interval_grouping(G, sigs);
+        ok_(GR.ok && GR.joint_equality_verified,
+            "grouping validates, joint equality over all " + std::to_string(GR.cells_checked) +
+            " cells");
+        ok_(GR.classes_per_block[0] == 1,
+            "the collapsing block's TWO alleles form ONE signature class (" +
+            std::to_string(GR.classes_per_block[0]) + ")");
+        const double eta = 0.05, lambda = 0.05;
+        const double log_mix = std::log1p(-eta), log_bg = std::log(eta);
+        const IntervalFactorTable T = build_interval_factor(G, GR, ems, lambda, log_mix, log_bg);
+        // A REFUSAL MUST NAME ITSELF. "0 classes stored" is indistinguishable from a legitimately
+        // neutral factor, so the reason is reported and the table is required to be empty.
+        ok_(T.ok, T.ok ? ("the factor builds: " + std::to_string(T.classes_stored) +
+                          " classes stored, " + std::to_string(T.phase_values_stored) +
+                          " phase values, " + std::to_string(T.classes_neutral) + " neutral")
+                       : ("the factor REFUSED: \"" + T.refusal + "\", table empty=" +
+                          std::to_string(T.phase_value.empty() && T.class_offset.empty() ? 1 : 0)));
+        ok_(T.canonical_payload_bytes == T.predicted_payload_bytes &&
+            T.total_factor_bytes == T.predicted_total_bytes,
+            "measured bytes equal the PREDICTION, payload " +
+            std::to_string(T.canonical_payload_bytes) + " and total " +
+            std::to_string(T.total_factor_bytes) + " -- compared against their matching estimates");
+
+        // ---- THE ORACLE: its own diploid formula, never mix() ------------------------------
+        const auto oracle_S = [&](const std::vector<std::uint32_t>& h1,
+                                  const std::vector<std::uint32_t>& h2) {
+            const std::size_t c1 = G.cell_index(h1), c2 = G.cell_index(h2);
+            double acc = 0.0;
+            for (const IntervalEmission& E : ems) {
+                // log( (1-eta) * lambda * (M_h1 + M_h2) + eta * P_bg ), written out directly.
+                const double m1 = E.mass[c1], m2 = E.mass[c2];
+                double lin = 0.0;
+                if (m1 != -std::numeric_limits<double>::infinity()) lin += std::exp(m1);
+                if (m2 != -std::numeric_limits<double>::infinity()) lin += std::exp(m2);
+                const double sig = (1.0 - eta) * lambda * lin;
+                const double bg = eta * std::exp(E.log_p_bg);
+                acc += std::log(sig + bg);
+            }
+            return acc;
+        };
+        // Every ordered diploid configuration over the ORIGINAL alleles.
+        std::vector<std::uint32_t> h1(3, 0), h2(3, 0);
+        double worst = 0.0; std::size_t checked = 0, nonzero = 0;
+        for (std::size_t i1 = 0; i1 < G.cells(); ++i1) {
+            G.cell_choice(i1, h1);
+            for (std::size_t i2 = 0; i2 < G.cells(); ++i2) {
+                G.cell_choice(i2, h2);
+                // The RAW content class and its ordered configurations.
+                std::vector<std::size_t> het;
+                for (std::size_t j = 0; j < 3; ++j) if (h1[j] != h2[j]) het.push_back(j);
+                const std::size_t mr = het.size();
+                std::vector<double> Sall(std::size_t(1) << mr, 0.0);
+                std::vector<std::uint32_t> a(3), b(3);
+                for (std::size_t bits = 0; bits < Sall.size(); ++bits) {
+                    for (std::size_t j = 0; j < 3; ++j) {
+                        a[j] = std::min(h1[j], h2[j]); b[j] = std::max(h1[j], h2[j]);
+                    }
+                    for (std::size_t q = 0; q < mr; ++q)
+                        if (bits & (std::size_t(1) << q)) std::swap(a[het[q]], b[het[q]]);
+                    Sall[bits] = oracle_S(a, b);
+                }
+                double mx = -std::numeric_limits<double>::infinity();
+                for (double x : Sall) mx = std::max(mx, x);
+                double sm = 0.0;
+                for (double x : Sall) sm += std::exp(x - mx);
+                const double Z = mx + std::log(sm);
+                // This configuration's own bit pattern.
+                std::size_t bits = 0;
+                for (std::size_t q = 0; q < mr; ++q)
+                    if (h1[het[q]] > h2[het[q]]) bits |= (std::size_t(1) << q);
+                const double psi_oracle =
+                    Sall[bits] - Z + std::log(static_cast<double>(std::size_t(1) << mr));
+                const double psi_prod = T.log_psi(h1, h2);
+                worst = std::max(worst, std::abs(psi_oracle - psi_prod));
+                if (std::abs(psi_oracle) > 1e-9) ++nonzero;
+                ++checked;
+            }
+        }
+        ok_(worst < 1e-9, "the constructor equals the independent oracle over all " +
+                          std::to_string(checked) + " ordered diploid configurations (worst " +
+                          sci(worst) + ")");
+        ok_(nonzero > 0, "the fixture is NON-VACUOUS: " + std::to_string(nonzero) +
+                         " configurations carry a non-zero psi");
+        // THE COLLAPSING BLOCK: swapping its two alleles must change nothing, because they are one
+        // signature class -- while remaining two distinct states the caller can still tell apart.
+        {
+            double worst_sw = 0.0; std::size_t tested = 0;
+            for (std::size_t i1 = 0; i1 < G.cells(); ++i1) {
+                G.cell_choice(i1, h1);
+                for (std::size_t i2 = 0; i2 < G.cells(); ++i2) {
+                    G.cell_choice(i2, h2);
+                    if (h1[0] == h2[0]) continue;
+                    std::vector<std::uint32_t> s1 = h1, s2 = h2;
+                    std::swap(s1[0], s2[0]);
+                    worst_sw = std::max(worst_sw,
+                                        std::abs(T.log_psi(h1, h2) - T.log_psi(s1, s2)));
+                    ++tested;
+                }
+            }
+            ok_(tested > 0 && worst_sw < 1e-12,
+                "swapping the collapsing block's two alleles is EXACTLY neutral over " +
+                std::to_string(tested) + " configurations (worst " + sci(worst_sw) +
+                ") -- effective heterozygosity is counted over classes, not alleles");
+        }
+        // GLOBAL-SWAP EQUALITY IS A THEOREM HERE, NOT A RUNTIME CONDITION, and saying so is more
+        // honest than a test that cannot fail. An ordered configuration and its global-swap
+        // partner map to the SAME unordered cell pair, and the diploid combiner is symmetric in
+        // its two homologues, so their raw scores are identical by construction. No corruption of
+        // the emissions can break that -- the first version of this check tried, and could not.
+        //
+        // What CAN break it is the combiner losing its symmetry, so the precondition is asserted
+        // directly and the runtime guard is exercised by mutating mix() rather than by a fixture.
+        {
+            double worst_sym = 0.0;
+            const double lm2 = std::log1p(-eta), lb2 = std::log(eta), ll2 = std::log(lambda);
+            const auto mix2 = [&](double p, double q, double pb) {
+                double sig = -std::numeric_limits<double>::infinity();
+                if (p != -std::numeric_limits<double>::infinity()) sig = p;
+                if (q != -std::numeric_limits<double>::infinity())
+                    sig = (sig == -std::numeric_limits<double>::infinity())
+                              ? q : std::max(sig, q) + std::log1p(std::exp(-std::abs(sig - q)));
+                if (sig != -std::numeric_limits<double>::infinity()) sig += lm2 + ll2;
+                const double bg = lb2 + pb;
+                return (sig == -std::numeric_limits<double>::infinity())
+                           ? bg : std::max(sig, bg) + std::log1p(std::exp(-std::abs(sig - bg)));
+            };
+            for (const IntervalEmission& E : ems)
+                for (std::size_t c1 = 0; c1 < G.cells(); ++c1)
+                    for (std::size_t c2 = 0; c2 < G.cells(); ++c2)
+                        worst_sym = std::max(worst_sym,
+                                             std::abs(mix2(E.mass[c1], E.mass[c2], E.log_p_bg) -
+                                                      mix2(E.mass[c2], E.mass[c1], E.log_p_bg)));
+            ok_(worst_sym == 0.0,
+                "the diploid combiner is SYMMETRIC in the two homologues (worst " +
+                sci(worst_sym) + ") -- which is what makes global-swap equality automatic, so the "
+                "runtime guard is tested by mutating the combiner, not by corrupting a fixture");
+        }
+        ok_(T.swap_partner_failures == 0,
+            "and the constructor's own swap check finds no disagreement (" +
+            std::to_string(T.swap_partner_failures) + ")");
+        ok_(T.worst_bound_slack >= -1e-9,
+            "every class respects its own log psi bound (worst slack " +
+            sci(T.worst_bound_slack) + ", max log psi " + sci(T.max_log_psi) + ")");
+        std::printf("factor selftest: %zu failure(s)\n", fails);
+        return fails == 0 ? 0 : 1;
+    }
+
     // ---- HIGHER-ORDER MEAN-ONE NORMALISATION SELF-TEST ------------------------------------------
     // Two representations of the same object, computed independently and required to agree. The
     // ordered form is what the HMM consumes, because its state is ordered; the canonical

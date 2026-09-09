@@ -2196,6 +2196,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             std::size_t done_n = 0;
                             double score_s = 0.0, oracle_s = 0.0;
                             std::vector<std::vector<std::string>> frag_sigs;
+                            std::vector<IntervalEmission> ems_kept;
                             const auto t_prog = std::chrono::steady_clock::now();
                             for (std::size_t fi : ev) {
                                 const std::size_t len = hf[fi].bases();
@@ -2212,6 +2213,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                 if (E.work_refused || !E.ok) { ++refused; continue; }
                                 ++contributed;
                                 frag_sigs.push_back(E.cell_signature);
+                                ems_kept.push_back(E);
                                 seedh += E.seed_hits; symst += E.symbolic_states;
                                 pbd += E.placements_before_dedup; pad += E.placements_after_dedup;
                                 joins += E.joined_pairs; tup += E.tuple_expansions;
@@ -2355,6 +2357,46 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                          " alleles -> " + cpb + " signature classes; content "
                                          "classes " + std::to_string(GR.content_classes_raw) +
                                          " -> " + std::to_string(GR.content_classes_grouped));
+                            }
+                            // ---- BUILD THE ACTUAL FACTOR -------------------------------------
+                            if (GR.ok) {
+                                const auto t_fac = std::chrono::steady_clock::now();
+                                const IntervalFactorTable FT = build_interval_factor(
+                                    FG, GR, ems_kept, hyb_params.lambda,
+                                    std::log1p(-hyb_params.outlier_mix),
+                                    std::log(hyb_params.outlier_mix));
+                                const double fac_s = std::chrono::duration<double>(
+                                    std::chrono::steady_clock::now() - t_fac).count();
+                                fo << "factor_ok\t" << (FT.ok ? 1 : 0) << '\n';
+                                fo << "factor_refusal\t"
+                                   << (FT.refusal.empty() ? "-" : FT.refusal) << '\n';
+                                fo << "factor_table_empty_on_refusal\t"
+                                   << ((FT.ok || (FT.phase_value.empty() &&
+                                                  FT.class_offset.empty())) ? 1 : 0) << '\n';
+                                fo << "factor_classes_stored\t" << FT.classes_stored << '\n';
+                                fo << "factor_phase_values\t" << FT.phase_values_stored << '\n';
+                                fo << "factor_classes_neutral\t" << FT.classes_neutral << '\n';
+                                fo << "factor_swap_failures\t" << FT.swap_partner_failures << '\n';
+                                fo << "factor_max_log_psi\t" << FT.max_log_psi << '\n';
+                                fo << "factor_worst_bound_slack\t" << FT.worst_bound_slack << '\n';
+                                fo << "factor_payload_bytes\t" << FT.canonical_payload_bytes
+                                   << '\n';
+                                fo << "factor_payload_predicted\t" << FT.predicted_payload_bytes
+                                   << '\n';
+                                fo << "factor_total_bytes\t" << FT.total_factor_bytes << '\n';
+                                fo << "factor_total_predicted\t" << FT.predicted_total_bytes
+                                   << '\n';
+                                fo << "factor_bytes_match_prediction\t"
+                                   << ((FT.canonical_payload_bytes == FT.predicted_payload_bytes &&
+                                        FT.total_factor_bytes == FT.predicted_total_bytes) ? 1 : 0)
+                                   << '\n';
+                                fo << "factor_build_seconds\t" << fac_s << '\n';
+                                log.info("hybrid factor " + fbstr + " table: " +
+                                         (FT.ok ? "usable" : "REFUSED " + FT.refusal) + ", " +
+                                         std::to_string(FT.classes_stored) + " classes, " +
+                                         std::to_string(FT.phase_values_stored) + " phase values, " +
+                                         std::to_string(FT.total_factor_bytes) + " bytes, " +
+                                         std::to_string(fac_s) + " s");
                             }
                             const double run_s = std::chrono::duration<double>(
                                 std::chrono::steady_clock::now() - t_run).count();

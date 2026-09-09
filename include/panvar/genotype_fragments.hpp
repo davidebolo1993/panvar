@@ -1913,6 +1913,47 @@ IntervalGrouping build_interval_grouping(
     const IntervalGeometry& geom,
     const std::vector<std::vector<std::string>>& per_fragment_signatures);
 
+// THE HIGHER-ORDER FACTOR ITSELF. One production operation builds it; the self-test's oracle
+// reproduces the result from an independent computation of the diploid formula.
+//
+// STORED OVER SIGNATURE CLASSES, QUERIED OVER ALLELES. The key is the per-block unordered pair of
+// class ids plus the ordered assignment within the class; a query maps each haplotype's alleles to
+// their classes and looks up. The alleles never merge -- they stay distinct HMM states carrying
+// their own marker unaries and Li-Stephens weights, and only their EVIDENCE contribution is shared.
+struct IntervalFactorTable {
+    std::vector<std::vector<std::uint32_t>> allele_class;   // per block, per allele -> class id
+    std::vector<std::size_t> classes_per_block;
+    // CLASSES ARE ADDRESSED ARITHMETICALLY, not hashed. The unordered class pairs of block j are
+    // enumerated in a fixed order, so a class has a mixed-radix ordinal and its phase values live
+    // at a prefix-sum offset. No keys are stored at all, which is why the byte account can be
+    // exact rather than an estimate of hash overhead.
+    std::vector<std::size_t> class_offset;    // size classes+1; offset[i+1]-offset[i] = phases
+    std::vector<double> phase_value;          // canonical biological-phase values, concatenated
+    std::size_t classes_stored = 0, phase_values_stored = 0;
+    std::size_t classes_neutral = 0;          // m <= 1, never stored
+    std::size_t swap_partner_failures = 0;
+    double max_log_psi = 0.0;                 // the largest value actually produced
+    double worst_bound_slack = 0.0;           // bound minus max, per class; negative means violated
+    // TWO byte accounts, because comparing a total against a payload estimate hides the overhead
+    // that actually grows: the payload is the doubles, the total adds keys, hash capacity, the
+    // allele->class maps and the class offsets.
+    std::size_t canonical_payload_bytes = 0, total_factor_bytes = 0;
+    std::size_t predicted_payload_bytes = 0, predicted_total_bytes = 0;
+    bool ok = false;
+    std::string refusal;
+    // log psi for an ORDERED diploid configuration, given each homologue's allele tuple.
+    double log_psi(const std::vector<std::uint32_t>& hap1,
+                   const std::vector<std::uint32_t>& hap2) const;
+};
+
+// Build it from the per-fragment emissions over this factor's geometry. `emissions[f].mass[cell]`
+// is the haploid mass; the diploid combination, the normalisation and the bound all happen here,
+// once, so there is no second implementation for a caller to drift from.
+IntervalFactorTable build_interval_factor(const IntervalGeometry& geom,
+                                          const IntervalGrouping& grouping,
+                                          const std::vector<IntervalEmission>& emissions,
+                                          double lambda, double log_mix, double log_bg_weight);
+
 // ---- HIGHER-ORDER MEAN-ONE NORMALISATION -----------------------------------------------------
 //
 // A CONTENT CLASS is one unordered allele multiset per block. Within it the diploid can be phased

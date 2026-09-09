@@ -617,6 +617,25 @@ else
   bad "the derived-flank fixture produced no geometry probe"
 fi
 # ---------------------------------------------------------------------------------------------
+# GATE 29f: THE HIGHER-ORDER FACTOR CONSTRUCTOR. One production operation -- group, combine raw
+# contributions through the shared mix(), validate global-swap completeness, centre ONCE per content
+# class, expand through the member mapping, enforce the per-class bound -- against an oracle that
+# computes log((1-eta) lambda (M_h1 + M_h2) + eta P_bg) from its OWN linear-space arithmetic. The
+# oracle must never call mix(), or a defect there would move both sides together.
+#
+# The fixture carries a COLLAPSING BLOCK: two distinct alleles with identical sequence form one
+# signature class. Swapping them is biologically heterozygous yet must be EXACTLY neutral, because
+# effective heterozygosity is counted over classes -- while the alleles stay separate HMM states.
+if "$BIN" genotype-frag -i /dev/null -b none -o "$OUT/fc" --factor-selftest \
+     > "$OUT/factor.txt" 2>/dev/null; then
+  while IFS=$'\t' read -r v m; do
+    [ "$v" = ok ] && ok "$m" || { [ -n "${m:-}" ] && bad "$m"; }
+  done < <(grep -E '^(ok|FAIL)\t' "$OUT/factor.txt")
+else
+  bad "factor constructor selftest reported failures"
+  sed -n 's/^FAIL\t/  /p' "$OUT/factor.txt"
+fi
+
 # GATE 29e: HIGHER-ORDER MEAN-ONE NORMALISATION. The centring constant depends on the
 # representation and getting it wrong is silent: with all 2^m ORDERED configurations retained the
 # constant is log(2^m), and using the canonical form's log(2^(m-1)) there makes the mean psi one

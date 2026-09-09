@@ -5602,6 +5602,220 @@ IntervalGrouping build_interval_grouping(
     return G;
 }
 
+namespace {
+
+// The index of the unordered pair (lo <= hi) among the C(R+1, 2) pairs of R classes, in a fixed
+// enumeration: (0,0), (0,1), ... (0,R-1), (1,1), ...
+inline std::size_t pair_ordinal(std::size_t lo, std::size_t hi, std::size_t R) {
+    return lo * R - lo * (lo - 1) / 2 + (hi - lo);
+}
+
+}  // namespace
+
+double IntervalFactorTable::log_psi(const std::vector<std::uint32_t>& hap1,
+                                    const std::vector<std::uint32_t>& hap2) const {
+    if (!ok || class_offset.empty()) return 0.0;
+    const std::size_t k = allele_class.size();
+    std::size_t ordinal = 0, m = 0;
+    std::uint32_t bits = 0;
+    for (std::size_t j = 0; j < k; ++j) {
+        const std::uint32_t c1 = allele_class[j][hap1[j]];
+        const std::uint32_t c2 = allele_class[j][hap2[j]];
+        const std::size_t R = classes_per_block[j];
+        const std::size_t lo = std::min(c1, c2), hi = std::max(c1, c2);
+        ordinal = ordinal * (R * (R + 1) / 2) + pair_ordinal(lo, hi, R);
+        // EFFECTIVE heterozygosity: a block is a phase dimension only when the two homologues
+        // carry DIFFERENT CLASSES. Two distinct alleles inside one class are biologically
+        // heterozygous and yet indistinguishable here, so swapping them stays neutral.
+        if (c1 != c2) {
+            if (c1 != lo) bits |= (1u << m);
+            ++m;
+        }
+    }
+    if (m <= 1) return 0.0;   // one biological phase: no preference is expressible
+    // Canonicalise under global swap, which flips every bit.
+    const std::uint32_t mask = (1u << m) - 1u;
+    if (bits & 1u) bits = (~bits) & mask;
+    const std::size_t phase = bits >> 1;
+    const std::size_t off = class_offset[ordinal];
+    if (off + phase >= class_offset[ordinal + 1]) return 0.0;
+    return phase_value[off + phase];
+}
+
+IntervalFactorTable build_interval_factor(const IntervalGeometry& geom,
+                                          const IntervalGrouping& grouping,
+                                          const std::vector<IntervalEmission>& emissions,
+                                          double lambda, double log_mix, double log_bg_weight) {
+    IntervalFactorTable T;
+    const std::size_t k = geom.alleles.size();
+    if (!grouping.ok) { T.refusal = "grouping is not usable"; return T; }
+    T.allele_class = grouping.allele_class;
+    T.classes_per_block = grouping.classes_per_block;
+    // One representative ALLELE per class, for reading the emission. Any member gives the same
+    // signature, which is exactly what the joint-equality check established.
+    std::vector<std::vector<std::uint32_t>> rep(k);
+    for (std::size_t j = 0; j < k; ++j) {
+        rep[j].assign(grouping.classes_per_block[j], std::numeric_limits<std::uint32_t>::max());
+        for (std::uint32_t a = 0; a < geom.alleles[j].size(); ++a) {
+            const std::uint32_t c = grouping.allele_class[j][a];
+            if (rep[j][c] == std::numeric_limits<std::uint32_t>::max()) rep[j][c] = a;
+        }
+    }
+    std::size_t n_classes = 1;
+    std::vector<std::size_t> pairs_per_block(k);
+    for (std::size_t j = 0; j < k; ++j) {
+        const std::size_t R = grouping.classes_per_block[j];
+        pairs_per_block[j] = R * (R + 1) / 2;
+        n_classes *= pairs_per_block[j];
+    }
+    T.class_offset.assign(n_classes + 1, 0);
+    // PREDICT BEFORE ALLOCATING, and predict the two accounts separately.
+    T.predicted_payload_bytes = grouping.stored_canonical_values * sizeof(double);
+    T.predicted_total_bytes = T.predicted_payload_bytes +
+                              (n_classes + 1) * sizeof(std::size_t);
+    for (std::size_t j = 0; j < k; ++j)
+        T.predicted_total_bytes += geom.alleles[j].size() * sizeof(std::uint32_t);
+    const double log_lambda = std::log(lambda);
+    // THE SHARED COMBINER. Production uses it; the oracle must NOT, or a defect here would move
+    // both sides of the comparison together.
+    const auto mix = [&](double p, double q, double log_p_bg) {
+        double sig = kNegInf;
+        if (p != kNegInf) sig = p;
+        if (q != kNegInf) sig = (sig == kNegInf) ? q : log_add(sig, q);
+        if (sig != kNegInf) sig += log_mix + log_lambda;
+        const double bg = log_bg_weight + log_p_bg;
+        return (sig == kNegInf) ? bg : log_add(sig, bg);
+    };
+    // Walk every content class in the same mixed-radix order log_psi uses.
+    std::vector<std::size_t> pidx(k, 0);
+    std::vector<std::uint32_t> lo(k, 0), hi(k, 0), h1(k, 0), h2(k, 0);
+    std::vector<double> S;
+    std::size_t cursor = 0;
+    bool done = n_classes == 0;
+    std::size_t ordinal = 0;
+    while (!done) {
+        // Decode this class's per-block unordered class pair from its pair ordinals.
+        std::size_t m = 0;
+        std::vector<std::size_t> hetj;
+        for (std::size_t j = 0; j < k; ++j) {
+            const std::size_t R = grouping.classes_per_block[j];
+            std::size_t p = pidx[j], a = 0;
+            while (p >= R - a) { p -= (R - a); ++a; }
+            lo[j] = static_cast<std::uint32_t>(a);
+            hi[j] = static_cast<std::uint32_t>(a + p);
+            if (lo[j] != hi[j]) { hetj.push_back(j); ++m; }
+        }
+        T.class_offset[ordinal] = cursor;
+        if (m >= 2) {
+            const ContentClassNorm N = content_class_norm(m);
+            const std::size_t nph = N.biological_phases;
+            // ---- GLOBAL-SWAP COMPLETENESS, checked on the ORDERED configurations -------------
+            // Every ordered configuration must have its partner under swapping both homologues,
+            // and the two must carry the IDENTICAL raw score -- that equality is what licenses
+            // folding 2^m ordered configurations onto 2^(m-1) biological phases at all. Averaging
+            // over a class whose partners disagree would weight one phase more than the other, so
+            // a disagreement is a REFUSAL and not a smaller factor.
+            const std::size_t nord = N.ordered_configs;
+            std::vector<double> So(nord, 0.0);
+            for (std::size_t bits = 0; bits < nord; ++bits) {
+                for (std::size_t j = 0; j < k; ++j) { h1[j] = rep[j][lo[j]]; h2[j] = rep[j][hi[j]]; }
+                for (std::size_t b = 0; b < m; ++b) {
+                    if (bits & (std::size_t(1) << b)) {
+                        const std::size_t j = hetj[b];
+                        h1[j] = rep[j][hi[j]]; h2[j] = rep[j][lo[j]];
+                    }
+                }
+                const std::size_t d1 = geom.cell_index(h1), d2 = geom.cell_index(h2);
+                double acc = 0.0;
+                for (const IntervalEmission& E : emissions)
+                    acc += mix(E.mass[d1], E.mass[d2], E.log_p_bg);
+                So[bits] = acc;
+            }
+            const std::size_t omask = nord - 1;
+            for (std::size_t bits = 0; bits < nord; ++bits) {
+                const std::size_t partner = (~bits) & omask;
+                if (std::abs(So[bits] - So[partner]) > 1e-9) ++T.swap_partner_failures;
+            }
+            if (T.swap_partner_failures != 0) {
+                T.refusal = "global-swap partners disagree on the raw score";
+                T.phase_value.clear(); T.class_offset.clear();
+                return T;
+            }
+            S.assign(nph, 0.0);
+            for (std::size_t ph = 0; ph < nph; ++ph) {
+                // Canonical phase ph: bit 0 is always 0, the remaining bits are ph.
+                const std::uint32_t bits = static_cast<std::uint32_t>(ph << 1);
+                for (std::size_t j = 0; j < k; ++j) { h1[j] = rep[j][lo[j]]; h2[j] = rep[j][hi[j]]; }
+                for (std::size_t b = 0; b < m; ++b) {
+                    if (bits & (1u << b)) {
+                        const std::size_t j = hetj[b];
+                        h1[j] = rep[j][hi[j]]; h2[j] = rep[j][lo[j]];
+                    }
+                }
+                const std::size_t c1 = geom.cell_index(h1), c2 = geom.cell_index(h2);
+                // THE DIPLOID FORMULA, once per fragment: the two haplotype masses combined, the
+                // background mixed in, and only THEN summed across fragments. Summing haploid log
+                // masses, or centring per fragment, are different models.
+                double acc = 0.0;
+                for (const IntervalEmission& E : emissions)
+                    acc += mix(E.mass[c1], E.mass[c2], E.log_p_bg);
+                S[ph] = acc;
+            }
+            double mx = -std::numeric_limits<double>::infinity();
+            for (double x : S) mx = std::max(mx, x);
+            double sum = 0.0;
+            for (double x : S) sum += std::exp(x - mx);
+            const double Z = mx + std::log(sum);
+            double top = -std::numeric_limits<double>::infinity();
+            for (std::size_t ph = 0; ph < nph; ++ph) {
+                const double v = S[ph] - Z + N.centring_canonical;
+                T.phase_value.push_back(v);
+                top = std::max(top, v);
+            }
+            T.max_log_psi = std::max(T.max_log_psi, top);
+            const double slack = N.max_log_psi_bound - top;
+            if (T.classes_stored == 0 || slack < T.worst_bound_slack) T.worst_bound_slack = slack;
+            if (slack < -1e-9) {
+                T.refusal = "a class exceeded its own log psi bound";
+                T.phase_value.clear(); T.class_offset.clear();   // no indexable partial table
+                return T;
+            }
+            // AND THE ARRANGEMENT COUNT ITSELF. A class that produced fewer phase values than
+            // its heterozygosity demands is INCOMPLETE, and an incomplete factor must refuse
+            // rather than present a smaller one -- "zero classes stored" is indistinguishable
+            // from a legitimately neutral factor, which is exactly the ambiguity to avoid.
+            if (T.phase_value.size() != cursor + nph) {
+                T.refusal = "missing arrangement: a class produced " +
+                            std::to_string(T.phase_value.size() - cursor) + " of " +
+                            std::to_string(nph) + " biological phases";
+                T.phase_value.clear(); T.class_offset.clear();
+                return T;
+            }
+            cursor += nph;
+            ++T.classes_stored;
+            T.phase_values_stored += nph;
+        } else {
+            ++T.classes_neutral;
+        }
+        ++ordinal;
+        for (std::size_t j = k; ; ) {
+            if (j == 0) { done = true; break; }
+            --j;
+            if (++pidx[j] < pairs_per_block[j]) break;
+            pidx[j] = 0;
+            if (j == 0) { done = true; break; }
+        }
+    }
+    T.class_offset[n_classes] = cursor;
+    T.canonical_payload_bytes = T.phase_value.size() * sizeof(double);
+    T.total_factor_bytes = T.canonical_payload_bytes +
+                           T.class_offset.size() * sizeof(std::size_t);
+    for (std::size_t j = 0; j < k; ++j)
+        T.total_factor_bytes += T.allele_class[j].size() * sizeof(std::uint32_t);
+    T.ok = true;
+    return T;
+}
+
 ContentClassNorm content_class_norm(std::size_t m_het) {
     ContentClassNorm n;
     n.m_het = m_het;
