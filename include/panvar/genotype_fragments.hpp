@@ -427,6 +427,11 @@ struct HaplotypeScoreOptions : FragmentScoreOptions {
     // repeat-copy placements keeps an incomplete list. This measures whether that incompleteness is
     // what the growing non-truth residual is made of.
     bool zero_seed_complete = false;
+    // Where to write the CONTAINMENT certificate for --dump-mass-pair. The bounded search is a
+    // LOWER bound on placement mass and the untruncated reference is its UPPER side, so equality
+    // between them was never the contract -- containment is. See the certificate's own header for
+    // the four assertions it makes.
+    std::string dump_containment;
     bool multiplicity_aware = false;
     double mass_tolerance = 1e-3;
     // How a haplotype-pair posterior becomes a per-block allele pair.

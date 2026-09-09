@@ -492,6 +492,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             for (const std::string& n : split_commas(value(i, a))) hopt.force_haplotypes.push_back(n);
         }
         else if (a == "--dump-fragment-mass") hopt.dump_fragment_mass = value(i, a);
+        else if (a == "--dump-containment") hopt.dump_containment = value(i, a);
         else if (a == "--dump-mass-pair") { const std::vector<std::string> two = split_commas(value(i, a));
             if (two.size() != 2) throw std::runtime_error("genotype-frag: --dump-mass-pair needs two names");
             hopt.dump_mass_pair1 = two[0]; hopt.dump_mass_pair2 = two[1]; }

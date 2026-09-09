@@ -2500,6 +2500,136 @@ HaplotypeResult genotype_haplotype_pairs(
                        << contrib << '\t' << nplace << '\t' << fr << '\n';
                 }
             }
+            // ---- THE CONTAINMENT CERTIFICATE -------------------------------------------------
+            // Production is a LOWER bound on placement mass; the untruncated reference is its
+            // UPPER side, summing every (start, L) including matches far outside the declared edit
+            // band. A fixed-tolerance equality between them was never the contract, and it fails
+            // wherever the band legitimately omits mass -- a fragment whose mates place nowhere IN
+            // BAND still has finite Hamming mass at every position.
+            //
+            // PRODUCTION IS THE AUTHORITATIVE LOWER ENDPOINT. `lse` already carries the real origin
+            // multiplicities and orientations, so it is used directly and never recomputed. It
+            // does need converting into the REFERENCE's units: fragment_states_mass applies
+            // log(0.5) per state because the reference AVERAGES the two library orientations,
+            // while lse SUMS them. That is a derivation, not a fitted constant, and the identity
+            // check below is what proves it -- with an exhaustive in-band search the converted
+            // production mass must equal the enumerated in-band mass exactly.
+            //
+            // THE ASSERTIONS, in mass units and then in contribution units:
+            //   L_h = lse_h + log(0.5)          production, in reference units
+            //   T_h = certified omitted bound   same units
+            //   U_h = logaddexp(L_h, T_h)
+            //   (1) identity   L_h == in-band enumeration   (search completeness)
+            //   (2) mass       L_h <= R_h <= U_h            per fragment and haplotype
+            //   (3) contrib    C_lower <= C_ref <= C_upper  per fragment
+            //   (4) sums       the same, summed like with like
+            // The mass-level assertion is the one that matters: background dominance can hide a
+            // log 2 mass error completely once the mixture is applied.
+            if (!options.dump_containment.empty()) {
+                std::ofstream cf(options.dump_containment);
+                if (cf) {
+                    cf.precision(17);
+                    const double log_half = std::log(0.5);
+                    ReferenceParams rp;
+                    rp.lambda = lambda_joint;
+                    rp.eta = options.outlier_mix;
+                    rp.error_rate = options.error_rate;
+                    rp.fragment_len = options.fragment_len;
+                    rp.fragment_sd = options.fragment_sd;
+                    rp.bg_divergence = options.bg_divergence;
+                    // The prior is passed in directly (ins_prior), so the parameters that would
+                    // rebuild it are not copied here -- one prior, shared, rather than two
+                    // constructions that must be kept in step.
+                    cf << "# pair\t" << out.shortlist[a] << '\t' << out.shortlist[b] << '\n';
+                    cf << "fragment\tL_a\tT_a\tU_a\tR_a\tL_b\tT_b\tU_b\tR_b"
+                          "\tC_lower\tC_ref\tC_upper\tident_delta_a\tstratum\n";
+                    std::size_t n_ident = 0, n_ident_bad = 0;
+                    std::size_t n_mass_bad = 0, n_contrib_bad = 0, n_strict = 0;
+                    std::size_t s_paired = 0, s_one = 0, s_absent = 0;
+                    double sum_lo = 0.0, sum_ref = 0.0, sum_hi = 0.0;
+                    const double eps = 1e-9;
+                    for (std::size_t fi = 0; fi < fragments.size(); ++fi) {
+                        const Fragment& F = fragments[fi];
+                        const std::string r1rc = reverse_complement(F.r1);
+                        const std::string r2rc =
+                            F.r2.empty() ? std::string() : reverse_complement(F.r2);
+                        const std::size_t d1 = mate_band_edits(options.max_divergence, F.r1.size());
+                        const std::size_t d2 = mate_band_edits(options.max_divergence, F.r2.size());
+                        double Lm[2], Tm[2], Um[2], Rm[2];
+                        double ident_delta = 0.0;
+                        std::size_t hs[2] = {a, b};
+                        for (int k = 0; k < 2; ++k) {
+                            const std::size_t h = hs[k];
+                            double lse_h = kNegInf;
+                            for (const auto& pr : placements[fi * nh + h])
+                                lse_h = log_add(lse_h, pr.ll + pr.log_mult);
+                            Lm[k] = (lse_h == kNegInf) ? kNegInf : lse_h + log_half;
+                            const TailLevel t =
+                                tail_interval_level(F.r1, F.r2, r1rc, r2rc, haps[h].seq, d1, d2, 1,
+                                                    ins_prior, log_eps3, log_1meps, nullptr);
+                            Tm[k] = t.bound;
+                            Um[k] = (Lm[k] == kNegInf) ? Tm[k]
+                                   : (Tm[k] == kNegInf ? Lm[k] : log_add(Lm[k], Tm[k]));
+                            Rm[k] = reference_fragment_on_haplotype(F, haps[h].seq, rp, ins_prior,
+                                                                    r2rc, log_eps3, log_1meps);
+                            if (k == 0) {
+                                ++n_ident;
+                                ident_delta = (Lm[0] == kNegInf || t.lower == kNegInf)
+                                                  ? 0.0 : (Lm[0] - t.lower);
+                                const bool same =
+                                    (Lm[0] == kNegInf && t.lower == kNegInf) ||
+                                    (Lm[0] != kNegInf && t.lower != kNegInf &&
+                                     std::abs(Lm[0] - t.lower) <= eps);
+                                if (!same) ++n_ident_bad;
+                            }
+                            const bool lo_ok = (Lm[k] == kNegInf) || (Rm[k] >= Lm[k] - eps);
+                            const bool hi_ok = (Rm[k] == kNegInf) || (Rm[k] <= Um[k] + eps);
+                            if (!lo_ok || !hi_ok) ++n_mass_bad;
+                            if (Lm[k] != kNegInf && Rm[k] > Lm[k] + eps && Rm[k] < Um[k] - eps)
+                                ++n_strict;
+                        }
+                        const bool homoz2 = (a == b);
+                        const MassInterval ia{Lm[0], Um[0]}, ib{Lm[1], Um[1]};
+                        const MassInterval ci =
+                            fragment_contribution(ia, ib, homoz2,
+                                                  std::log1p(-options.outlier_mix),
+                                                  std::log(lambda_joint),
+                                                  std::log(options.outlier_mix), floors[fi]);
+                        const MassInterval ir{Rm[0], Rm[1]};
+                        const MassInterval cr =
+                            fragment_contribution(ir, ir.lower == ir.upper ? ir : ir, homoz2,
+                                                  std::log1p(-options.outlier_mix),
+                                                  std::log(lambda_joint),
+                                                  std::log(options.outlier_mix), floors[fi]);
+                        const double c_ref = cr.lower;
+                        if (!(c_ref >= ci.lower - eps && c_ref <= ci.upper + eps)) ++n_contrib_bad;
+                        sum_lo += ci.lower; sum_ref += c_ref; sum_hi += ci.upper;
+                        const std::uint8_t both = mates_seeded[fi * nh + a];
+                        const int nplace = ((both & 4u) ? 1 : 0) + ((both & 8u) ? 1 : 0);
+                        const int fr = (both & 16u) ? 1 : 0;
+                        const char* stratum = (nplace == 0) ? "absent"
+                                            : (fr == 0 ? "one_mate_no_pair" : "paired");
+                        if (nplace == 0) ++s_absent; else if (fr == 0) ++s_one; else ++s_paired;
+                        cf << F.name << '\t' << Lm[0] << '\t' << Tm[0] << '\t' << Um[0] << '\t'
+                           << Rm[0] << '\t' << Lm[1] << '\t' << Tm[1] << '\t' << Um[1] << '\t'
+                           << Rm[1] << '\t' << ci.lower << '\t' << c_ref << '\t' << ci.upper
+                           << '\t' << ident_delta << '\t' << stratum << '\n';
+                    }
+                    cf << "# identity_checked\t" << n_ident << '\n';
+                    cf << "# identity_failures\t" << n_ident_bad << '\n';
+                    cf << "# mass_containment_failures\t" << n_mass_bad << '\n';
+                    cf << "# contribution_containment_failures\t" << n_contrib_bad << '\n';
+                    cf << "# strict_containments\t" << n_strict << '\n';
+                    cf << "# stratum_paired\t" << s_paired << '\n';
+                    cf << "# stratum_one_mate_no_pair\t" << s_one << '\n';
+                    cf << "# stratum_absent\t" << s_absent << '\n';
+                    cf << "# contrib_sum_lower\t" << sum_lo << '\n';
+                    cf << "# contrib_sum_reference\t" << sum_ref << '\n';
+                    cf << "# contrib_sum_upper\t" << sum_hi << '\n';
+                    cf << "# sum_containment\t"
+                       << ((sum_ref >= sum_lo - 1e-6 && sum_ref <= sum_hi + 1e-6) ? 1 : 0) << '\n';
+                }
+            }
         }
         for (std::size_t pi = 0; pi < nrescore; ++pi) pairs[pi].score = joint[pi];
         std::stable_sort(pairs.begin(), pairs.begin() + static_cast<long>(nrescore),
