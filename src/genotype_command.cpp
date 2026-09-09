@@ -425,9 +425,19 @@ int run_genotype_command(const std::vector<std::string>& args) {
     std::string hybrid_wide_inventory;   // every Wide fragment's scope, grouped
     std::string hybrid_context_dependence;  // "<ctx>,<b1>,...,<path>" -- is ctx emission-relevant?
     std::string hybrid_interval_probe;      // "<b1>,...,<path>" -- the generic k-block geometry
-    std::string hybrid_factor_run;          // "<b1>,...,<path>" -- run a real interval factor
+    // REPEATABLE. Two overlapping factors have to exist AT THE SAME TIME for the higher-order
+    // recurrence to be run on them, and building them in separate processes cannot show that.
+    std::vector<std::string> hybrid_factor_runs;   // each "<b1>,...,<path>"
+    std::string hybrid_higher_bench;               // where to write the recurrence benchmark
+    std::uint64_t hybrid_max_message_entries = 0;  // 0 = unbounded; exceeding it is a REFUSAL
+    std::size_t hybrid_plan_threads = 1;
+    bool hybrid_plan_only = false;                 // report requirements, allocate nothing
     bool hybrid_factor_oracle = false;      // also run the exhaustive oracle and compare
-    std::string hybrid_factor_supersede;    // "a-b,c-d": pairwise edges this factor REPLACES
+    // REPEATABLE AND POSITIONAL, matched to --hybrid-factor-run in order. Two factors do not
+    // supersede the same edges -- F1 over {2,3,4,5} replaces 3-4 and 4-5, F2 over {4,5,6}
+    // replaces nothing -- so one global list cannot describe both, and applying F1's list to F2
+    // would hand F2 evidence that belongs to F1.
+    std::vector<std::string> hybrid_factor_supersedes;   // "a-b,c-d" per factor run
     bool hybrid_triple_alias_used = false;
     struct EdgeRow {
         std::uint32_t a = 0, b = 0;
@@ -588,10 +598,16 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--hybrid-context-dependence")
             hybrid_context_dependence = require_value(arg);
         else if (arg == "--hybrid-interval-probe") hybrid_interval_probe = require_value(arg);
-        else if (arg == "--hybrid-factor-run") hybrid_factor_run = require_value(arg);
+        else if (arg == "--hybrid-factor-run") hybrid_factor_runs.push_back(require_value(arg));
+        else if (arg == "--hybrid-higher-bench") hybrid_higher_bench = require_value(arg);
+        else if (arg == "--hybrid-max-message-entries")
+            hybrid_max_message_entries = std::stoull(require_value(arg));
+        else if (arg == "--hybrid-plan-threads")
+            hybrid_plan_threads = static_cast<std::size_t>(std::stoul(require_value(arg)));
+        else if (arg == "--hybrid-plan-only") hybrid_plan_only = true;
         else if (arg == "--hybrid-factor-oracle") hybrid_factor_oracle = true;
         else if (arg == "--hybrid-factor-supersede")
-            hybrid_factor_supersede = require_value(arg);
+            hybrid_factor_supersedes.push_back(require_value(arg));
         else if (arg == "--hybrid-triple-probe") {
             // DEPRECATED: the probe takes any number of consecutive blocks now, so "triple" names
             // a case rather than the feature. Accepted, and said out loud.
@@ -2069,7 +2085,13 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     // Its evidence is the pairwise owners inside the block span plus the Wide
                     // fragments whose whole variable scope lies inside it -- the same rule the
                     // ledger used, so the counts must reconcile with it exactly.
-                    if (!hybrid_factor_run.empty()) {
+                    std::vector<IntervalFactorTable> built_tables;
+                    std::vector<std::vector<std::uint32_t>> built_blocks;
+                    for (std::size_t frun = 0; frun < hybrid_factor_runs.size(); ++frun) {
+                        const std::string& hybrid_factor_run = hybrid_factor_runs[frun];
+                        const std::string hybrid_factor_supersede =
+                            frun < hybrid_factor_supersedes.size()
+                                ? hybrid_factor_supersedes[frun] : std::string();
                         std::vector<std::string> fp;
                         std::string fcu;
                         for (char c : hybrid_factor_run) {
@@ -2371,7 +2393,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             // ---- BUILD THE ACTUAL FACTOR -------------------------------------
                             if (GR.ok) {
                                 const auto t_fac = std::chrono::steady_clock::now();
-                                const IntervalFactorTable FT = build_interval_factor(
+                                IntervalFactorTable FT = build_interval_factor(
                                     FG, GR, ems_kept, hyb_params.lambda,
                                     std::log1p(-hyb_params.outlier_mix),
                                     std::log(hyb_params.outlier_mix));
@@ -2407,6 +2429,12 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                          std::to_string(FT.phase_values_stored) + " phase values, " +
                                          std::to_string(FT.total_factor_bytes) + " bytes, " +
                                          std::to_string(fac_s) + " s");
+                                // RETAINED so the recurrence can be run on the real tables rather
+                                // than on a reconstruction of them.
+                                if (FT.ok) {
+                                    built_tables.push_back(std::move(FT));
+                                    built_blocks.push_back(fbl);
+                                }
                             }
                             const double run_s = std::chrono::duration<double>(
                                 std::chrono::steady_clock::now() - t_run).count();
@@ -2465,6 +2493,182 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                           std::to_string(org_differ) : ""));
                         }
                     }
+                    // ---- THE RECURRENCE, ON THE REAL TABLES -----------------------------------
+                    // Not a synthetic loop: the factors just built, the real panel, the real block
+                    // chain. EMISSIONS ARE UNIFORM, and deliberately so -- nothing here prunes on
+                    // emission value, so every reachable state is enumerated whatever the emissions
+                    // are, and uniform ones give the same work as real ones. A degenerate emission
+                    // could only remove states, never add them, so this is the upper end.
+                    if (!hybrid_higher_bench.empty()) {
+                        std::ofstream bo(hybrid_higher_bench);
+                        if (!bo) throw std::runtime_error("genotype: cannot write " +
+                                                          hybrid_higher_bench);
+                        bo << "field\tvalue\n";
+                        bo << "factors_built\t" << built_tables.size() << '\n';
+                        std::size_t lo_b = blocks.size(), hi_b = 0;
+                        for (const auto& bl : built_blocks)
+                            for (std::uint32_t q : bl) {
+                                lo_b = std::min<std::size_t>(lo_b, q);
+                                hi_b = std::max<std::size_t>(hi_b, q);
+                            }
+                        if (built_tables.empty()) {
+                            bo << "status\tNO_FACTORS\n";
+                        } else {
+                            // THE SLICE is exactly the blocks the factors span. Extending it would
+                            // add plain Li-Stephens steps that measure the existing kernel, not
+                            // this recurrence.
+                            bool continue_after_plan = false;
+                            const std::size_t NB = hi_b - lo_b + 1;
+                            std::vector<std::size_t> keep_h;
+                            for (std::size_t h = 0; h < hap_names.size(); ++h) {
+                                bool full = true;
+                                for (std::size_t q = lo_b; q <= hi_b && full; ++q)
+                                    if (!blocks[q].allele_of.count(hap_names[h])) full = false;
+                                if (full) keep_h.push_back(h);
+                            }
+                            const std::size_t NH = keep_h.size();
+                            bo << "slice_blocks\t" << lo_b << "-" << hi_b << '\n';
+                            bo << "slice_n_blocks\t" << NB << '\n';
+                            bo << "panel_haplotypes\t" << hap_names.size() << '\n';
+                            bo << "haplotypes_spanning_slice\t" << NH << '\n';
+                            HybridChain HC;
+                            // ANY r IN (0,1) GIVES THE SAME WORK. The enumeration depends on r
+                            // only through whether the stay and switch components are active, not
+                            // through their weights, so the reachable state set -- and therefore
+                            // every count below -- is identical for any interior r. Only r = 0 or
+                            // r = 1 would change it, by deleting a component.
+                            HC.n_hap = NH; HC.n_blocks = NB; HC.recomb = 0.5;
+                            HC.edges.assign(NB, HybridEdge{});
+                            HC.log_emission.assign(NB, std::vector<double>(NH * NH, 0.0));
+                            HC.hap_allele.assign(NH, std::vector<std::uint32_t>(NB, 0));
+                            for (std::size_t i = 0; i < NH; ++i)
+                                for (std::size_t q = 0; q < NB; ++q)
+                                    HC.hap_allele[i][q] = static_cast<std::uint32_t>(
+                                        blocks[lo_b + q].allele_of.at(hap_names[keep_h[i]]));
+                            for (std::size_t f = 0; f < built_tables.size(); ++f) {
+                                HybridHigherFactor HF;
+                                for (std::uint32_t q : built_blocks[f])
+                                    HF.blocks.push_back(static_cast<std::uint32_t>(q - lo_b));
+                                HF.table = &built_tables[f];
+                                HC.higher.push_back(HF);
+                                bo << "factor_" << f << "_blocks\t";
+                                for (std::size_t j = 0; j < built_blocks[f].size(); ++j)
+                                    bo << (j ? "," : "") << built_blocks[f][j];
+                                bo << '\n';
+                                bo << "factor_" << f << "_classes\t"
+                                   << built_tables[f].classes_stored << '\n';
+                            }
+                            // ---- THE PLAN, ALWAYS, BEFORE ANYTHING IS ALLOCATED ----------
+                            const auto t_pl = std::chrono::steady_clock::now();
+                            const HigherOrderPlan PL =
+                                plan_higher_order(HC, hybrid_plan_threads);
+                            const double pl_s = std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - t_pl).count();
+                            bo << "plan_ok\t" << (PL.ok ? 1 : 0) << '\n';
+                            bo << "plan_refusal\t" << (PL.refusal.empty() ? "-" : PL.refusal)
+                               << '\n';
+                            bo << "plan_seconds\t" << pl_s << '\n';
+                            if (PL.ok) {
+                                for (std::size_t q = 0; q < PL.haploid_states.size(); ++q) {
+                                    bo << "plan_block_" << (lo_b + q) << "_refinement\t"
+                                       << PL.refinement_classes[q] << '\n';
+                                    bo << "plan_block_" << (lo_b + q) << "_haploid_states\t"
+                                       << PL.haploid_states[q] << '\n';
+                                    bo << "plan_block_" << (lo_b + q) << "_message_entries\t"
+                                       << PL.message_entries[q] << '\n';
+                                }
+                                bo << "plan_peak_message_entries\t"
+                                   << PL.peak_message_entries << '\n';
+                                bo << "plan_total_message_entries\t"
+                                   << PL.total_message_entries << '\n';
+                                bo << "plan_forward_updates\t" << PL.forward_updates << '\n';
+                                bo << "plan_adjoint_updates\t" << PL.adjoint_updates << '\n';
+                                bo << "plan_total_updates\t"
+                                   << (PL.forward_updates + PL.adjoint_updates) << '\n';
+                                bo << "plan_dense_equivalent_updates\t"
+                                   << PL.dense_equivalent_updates << '\n';
+                                bo << "plan_multiplier_reconstructions\t"
+                                   << PL.multiplier_reconstructions << '\n';
+                                bo << "plan_factor_lookups\t" << PL.factor_lookups << '\n';
+                                bo << "plan_history_ops\t" << PL.history_ops << '\n';
+                                bo << "plan_grouping_ops\t" << PL.grouping_ops << '\n';
+                                bo << "plan_payload_bytes\t" << PL.payload_bytes << '\n';
+                                bo << "plan_container_bytes\t" << PL.container_bytes << '\n';
+                                bo << "plan_temporary_bytes\t" << PL.temporary_bytes << '\n';
+                                bo << "plan_threads\t" << PL.threads << '\n';
+                                bo << "plan_per_thread_bytes\t" << PL.per_thread_bytes << '\n';
+                                bo << "plan_total_bytes\t" << PL.total_bytes << '\n';
+                                bo << "plan_total_gb\t"
+                                   << (static_cast<double>(PL.total_bytes) / 1073741824.0) << '\n';
+                            }
+                            if (hybrid_plan_only) {
+                                bo << "status\tPLAN_ONLY\n";
+                                log.info("higher-order PLAN ONLY on blocks " +
+                                         std::to_string(lo_b) + "-" + std::to_string(hi_b) + ": " +
+                                         (PL.ok ? (std::to_string(PL.forward_updates) +
+                                                   " forward updates, " +
+                                                   std::to_string(PL.total_bytes / 1048576) +
+                                                   " MB")
+                                                : ("REFUSED " + PL.refusal)));
+                                continue_after_plan = true;
+                            }
+                            if (!continue_after_plan) {
+                            const auto t_ho = std::chrono::steady_clock::now();
+                            HigherOrderStats HS;
+                            const HybridPosterior HP = hybrid_higher_order(
+                                HC, hybrid_max_message_entries, &HS);
+                            const double ho_s = std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - t_ho).count();
+                            bo << "status\t" << (HP.ok ? "COMPLETE" : "REFUSED") << '\n';
+                            bo << "refusal\t" << (HS.refusal.empty() ? "-" : HS.refusal) << '\n';
+                            bo << "recomb\t" << HC.recomb << '\n';
+                            bo << "recomb_note\tany interior r gives the same enumeration\n";
+                            bo << "forward_updates\t" << HS.forward_updates << '\n';
+                            bo << "adjoint_updates\t" << HS.adjoint_updates << '\n';
+                            bo << "total_updates\t"
+                               << (HS.forward_updates + HS.adjoint_updates) << '\n';
+                            bo << "forward_equals_adjoint\t"
+                               << (HS.forward_updates == HS.adjoint_updates ? 1 : 0) << '\n';
+                            // SEPARATE CATEGORIES. The tape-free adjoint buys memory with
+                            // recomputation, so these are not interchangeable with the updates.
+                            bo << "multiplier_reconstructions\t"
+                               << HS.multiplier_reconstructions << '\n';
+                            bo << "factor_lookups\t" << HS.factor_lookups << '\n';
+                            bo << "history_ops\t" << HS.history_ops << '\n';
+                            bo << "grouping_ops\t" << HS.grouping_ops << '\n';
+                            bo << "peak_message_entries\t" << HS.peak_message_entries << '\n';
+                            bo << "total_message_entries\t" << HS.total_message_entries << '\n';
+                            bo << "predicted_payload_bytes\t"
+                               << HS.predicted_payload_bytes << '\n';
+                            bo << "predicted_payload_note\tmessages and adjoints only; excludes "
+                                  "hash index, allocator overhead, factor tables, temporaries and "
+                                  "any reduction buffers\n";
+                            bo << "forward_seconds\t" << HS.forward_seconds << '\n';
+                            bo << "adjoint_seconds\t" << HS.adjoint_seconds << '\n';
+                            bo << "total_seconds\t" << ho_s << '\n';
+                            struct rusage bru {};
+                            double bpk = 0.0;
+                            if (getrusage(RUSAGE_SELF, &bru) == 0) {
+#ifdef __APPLE__
+                                bpk = static_cast<double>(bru.ru_maxrss) / 1048576.0;
+#else
+                                bpk = static_cast<double>(bru.ru_maxrss) / 1024.0;
+#endif
+                            }
+                            // WHOLE-PROCESS peak, which includes everything built before this
+                            // point -- the factor tables above all. Not the recurrence's own.
+                            bo << "process_peak_rss_mb\t" << bpk << '\n';
+                            bo << "process_peak_rss_attribution\tUNMEASURED\n";
+                            log.info("higher-order recurrence on blocks " + std::to_string(lo_b) +
+                                     "-" + std::to_string(hi_b) + ": " +
+                                     (HP.ok ? "COMPLETE" : "REFUSED " + HS.refusal) + ", " +
+                                     std::to_string(HS.forward_updates) + " forward + " +
+                                     std::to_string(HS.adjoint_updates) + " adjoint updates, " +
+                                     std::to_string(ho_s) + " s");
+                            }
+                        }
+                    }
+
                     // ---- INTERVAL GEOMETRY CROSS-CHECK ----------------------------------------
                     // The generic k-block geometry, reported through the type the factor will
                     // actually use. Its window statistics must reproduce the arity probe's, which

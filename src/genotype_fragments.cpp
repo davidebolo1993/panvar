@@ -5616,11 +5616,23 @@ double IntervalFactorTable::log_psi(const std::vector<std::uint32_t>& hap1,
                                     const std::vector<std::uint32_t>& hap2) const {
     if (!ok || class_offset.empty()) return 0.0;
     const std::size_t k = allele_class.size();
+    std::vector<std::uint32_t> c1(k), c2(k);
+    for (std::size_t j = 0; j < k; ++j) {
+        c1[j] = allele_class[j][hap1[j]];
+        c2[j] = allele_class[j][hap2[j]];
+    }
+    return log_psi_classes(c1, c2);
+}
+
+double IntervalFactorTable::log_psi_classes(const std::vector<std::uint32_t>& cls1,
+                                            const std::vector<std::uint32_t>& cls2) const {
+    if (!ok || class_offset.empty()) return 0.0;
+    const std::size_t k = allele_class.size();
     std::size_t ordinal = 0, m = 0;
     std::uint32_t bits = 0;
     for (std::size_t j = 0; j < k; ++j) {
-        const std::uint32_t c1 = allele_class[j][hap1[j]];
-        const std::uint32_t c2 = allele_class[j][hap2[j]];
+        const std::uint32_t c1 = cls1[j];
+        const std::uint32_t c2 = cls2[j];
         const std::size_t R = classes_per_block[j];
         const std::size_t lo = std::min(c1, c2), hi = std::max(c1, c2);
         ordinal = ordinal * (R * (R + 1) / 2) + pair_ordinal(lo, hi, R);
@@ -7077,6 +7089,761 @@ HybridPosterior hybrid_forward_backward(const HybridChain& c) {
     return out;
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// THE HIGHER-ORDER RECURRENCE
+//
+// The message carries, per homologue, the REFINED CLASS of every block whose run has already
+// CLOSED, plus the current template. The open run needs no history -- its classes follow from the
+// current template -- and the run start is implicit in how many blocks are closed.
+//
+// THE REFINEMENT IS NOT OPTIONAL. A block inside two factors gets two class partitions, and the
+// history must hold their COMMON REFINEMENT: storing either factor's partition alone would discard
+// information the other one needs, and a common refinement is never coarser than either input.
+// ---------------------------------------------------------------------------------------------
+namespace {
+
+struct HoPlan {
+    std::size_t nh = 0, nb = 0;
+    std::vector<std::size_t> hist_block;                  // blocks needing history, ascending
+    std::vector<std::size_t> hist_pos;                    // block -> index in hist_block, or npos
+    std::vector<std::vector<std::uint32_t>> refined;      // [block][hap] -> refined class id
+    std::vector<std::size_t> n_refined;                   // [block]
+    // For factor f, block position j: refined class -> that factor's own class id.
+    std::vector<std::vector<std::vector<std::uint32_t>>> to_factor;
+    std::vector<std::vector<std::size_t>> ends_at;        // block -> factor indices ending there
+    std::size_t last_factor_block = 0;
+    std::vector<std::size_t> radix;                       // per hist position, n_refined
+    // AFTER block b, the first history position any UNAPPLIED factor still needs. Everything
+    // below it is DEAD: its factor has already consumed it, and carrying it multiplies the state
+    // space by a product nothing will ever read. Positions below this are zeroed so the states
+    // that differed only there MERGE.
+    std::vector<std::size_t> base_after;
+    std::vector<std::uint64_t> offset;                    // offset[k] = first index with k closed
+    std::uint64_t per_hom = 0;                            // total per-homologue states
+    std::uint64_t per_hom_hist = 0;                       // the same with the template removed
+    bool ok = false;
+    std::string refusal;
+};
+
+std::size_t ho_closed_before(const HoPlan& P, std::size_t b) {
+    std::size_t k = 0;
+    while (k < P.hist_block.size() && P.hist_block[k] < b) ++k;
+    return k;
+}
+
+HoPlan ho_build_plan(const HybridChain& c) {
+    HoPlan P;
+    P.nh = c.n_hap; P.nb = c.n_blocks;
+    if (c.hap_allele.size() != c.n_hap) { P.refusal = "hap_allele missing"; return P; }
+    for (const auto& row : c.hap_allele)
+        if (row.size() != c.n_blocks) { P.refusal = "hap_allele row wrong length"; return P; }
+    P.ends_at.assign(c.n_blocks, {});
+    P.n_refined.assign(c.n_blocks, 1);
+    P.refined.assign(c.n_blocks, std::vector<std::uint32_t>(c.n_hap, 0));
+    P.to_factor.resize(c.higher.size());
+
+    for (std::size_t f = 0; f < c.higher.size(); ++f) {
+        const auto& H = c.higher[f];
+        if (H.blocks.empty() || H.table == nullptr || !H.table->ok) {
+            P.refusal = "higher factor " + std::to_string(f) + " is unusable"; return P;
+        }
+        if (H.table->allele_class.size() != H.blocks.size()) {
+            P.refusal = "higher factor " + std::to_string(f) + " arity mismatch"; return P;
+        }
+        for (std::size_t j = 0; j + 1 < H.blocks.size(); ++j)
+            if (H.blocks[j] + 1 != H.blocks[j + 1]) {
+                P.refusal = "higher factor " + std::to_string(f) + " span is not contiguous";
+                return P;
+            }
+        if (H.blocks.back() >= c.n_blocks) {
+            P.refusal = "higher factor " + std::to_string(f) + " runs past the chain"; return P;
+        }
+        P.ends_at[H.blocks.back()].push_back(f);
+        P.last_factor_block = std::max(P.last_factor_block, std::size_t(H.blocks.back()));
+    }
+
+    // The common refinement, per block, built from the tuple of every factor's class there.
+    for (std::size_t b = 0; b < c.n_blocks; ++b) {
+        std::map<std::vector<std::uint32_t>, std::uint32_t> seen;
+        bool touched = false;
+        for (std::size_t t = 0; t < c.n_hap; ++t) {
+            std::vector<std::uint32_t> key;
+            for (std::size_t f = 0; f < c.higher.size(); ++f) {
+                const auto& H = c.higher[f];
+                for (std::size_t j = 0; j < H.blocks.size(); ++j)
+                    if (H.blocks[j] == b) {
+                        touched = true;
+                        key.push_back(H.table->allele_class[j][c.hap_allele[t][b]]);
+                    }
+            }
+            auto it = seen.find(key);
+            if (it == seen.end())
+                it = seen.emplace(key, static_cast<std::uint32_t>(seen.size())).first;
+            P.refined[b][t] = it->second;
+        }
+        P.n_refined[b] = touched ? seen.size() : 1;
+        if (!touched) for (std::size_t t = 0; t < c.n_hap; ++t) P.refined[b][t] = 0;
+    }
+
+    // refined -> factor class. Well defined precisely BECAUSE the refinement refines each factor.
+    for (std::size_t f = 0; f < c.higher.size(); ++f) {
+        const auto& H = c.higher[f];
+        P.to_factor[f].assign(H.blocks.size(), {});
+        for (std::size_t j = 0; j < H.blocks.size(); ++j) {
+            const std::size_t b = H.blocks[j];
+            P.to_factor[f][j].assign(P.n_refined[b], 0);
+            std::vector<char> set(P.n_refined[b], 0);
+            for (std::size_t t = 0; t < c.n_hap; ++t) {
+                const std::uint32_t rc = P.refined[b][t];
+                const std::uint32_t fc = H.table->allele_class[j][c.hap_allele[t][b]];
+                if (set[rc] && P.to_factor[f][j][rc] != fc) {
+                    P.refusal = "the refinement does not refine factor " + std::to_string(f);
+                    return P;
+                }
+                P.to_factor[f][j][rc] = fc; set[rc] = 1;
+            }
+        }
+    }
+
+    P.hist_pos.assign(c.n_blocks, static_cast<std::size_t>(-1));
+    for (std::size_t b = 0; b <= P.last_factor_block && b < c.n_blocks; ++b)
+        if (P.n_refined[b] > 1) { P.hist_pos[b] = P.hist_block.size(); P.hist_block.push_back(b); }
+
+    P.radix.resize(P.hist_block.size());
+    for (std::size_t i = 0; i < P.hist_block.size(); ++i) P.radix[i] = P.n_refined[P.hist_block[i]];
+    const std::size_t K = P.hist_block.size();
+    P.base_after.assign(c.n_blocks, K);
+    for (std::size_t b = 0; b < c.n_blocks; ++b) {
+        std::size_t lo = K;
+        for (std::size_t f = 0; f < c.higher.size(); ++f) {
+            const auto& H = c.higher[f];
+            if (H.blocks.back() <= b) continue;      // this factor is done with its span
+            for (std::uint32_t q : H.blocks) {
+                const std::size_t i = P.hist_pos[q];
+                if (i != static_cast<std::size_t>(-1)) lo = std::min(lo, i);
+            }
+        }
+        P.base_after[b] = lo;
+    }
+    P.offset.assign(P.hist_block.size() + 2, 0);
+    long double prod = 1.0L, acc = 0.0L;
+    for (std::size_t k = 0; k <= P.hist_block.size(); ++k) {
+        P.offset[k] = static_cast<std::uint64_t>(acc);
+        acc += prod * static_cast<long double>(P.nh);
+        if (acc > 4.0e18L) { P.refusal = "per-homologue state space overflows"; return P; }
+        if (k < P.radix.size()) prod *= static_cast<long double>(P.radix[k]);
+    }
+    P.offset[P.hist_block.size() + 1] = static_cast<std::uint64_t>(acc);
+    P.per_hom = static_cast<std::uint64_t>(acc);
+    P.per_hom_hist = P.per_hom / P.nh;
+    if (P.per_hom == 0 || P.per_hom > 4.0e9) {
+        P.refusal = "per-homologue state space too large (" + std::to_string(P.per_hom) + ")";
+        return P;
+    }
+    P.ok = true;
+    return P;
+}
+
+// One homologue's state, packed. `k` closed blocks, their digits, and the current template.
+struct HoHom { std::size_t k = 0; std::uint64_t digits = 0; std::uint32_t t = 0; };
+
+inline std::uint64_t ho_pack(const HoPlan& P, const HoHom& h) {
+    return P.offset[h.k] + h.digits * P.nh + h.t;
+}
+inline HoHom ho_unpack(const HoPlan& P, std::uint64_t idx) {
+    HoHom h;
+    std::size_t k = 0;
+    while (k + 1 <= P.hist_block.size() && idx >= P.offset[k + 1]) ++k;
+    const std::uint64_t rel = idx - P.offset[k];
+    h.k = k; h.t = static_cast<std::uint32_t>(rel % P.nh); h.digits = rel / P.nh;
+    return h;
+}
+// Digit for hist position i, given `k` closed blocks and the packed digit word.
+inline std::uint32_t ho_digit(const HoPlan& P, const HoHom& h, std::size_t i) {
+    std::uint64_t d = h.digits;
+    for (std::size_t q = 0; q < i; ++q) d /= P.radix[q];
+    return static_cast<std::uint32_t>(d % P.radix[i]);
+}
+// A HISTORY-ONLY index: the same packing with the template dimension removed. The switch
+// components aggregate over the old template, so their group key must not mention it.
+inline std::uint64_t ho_hist_index(const HoPlan& P, const HoHom& h) {
+    return P.offset[h.k] / P.nh + h.digits;      // offset[k] is a multiple of nh by construction
+}
+inline HoHom ho_from_hist(const HoPlan& P, std::uint64_t idx) {
+    HoHom h; std::size_t k = 0;
+    while (k + 1 <= P.hist_block.size() && idx >= P.offset[k + 1] / P.nh) ++k;
+    h.k = k; h.digits = idx - P.offset[k] / P.nh; return h;
+}
+// DROP THE DEAD HISTORY. Positions below `base` belong to factors that have already applied, so
+// nothing will read them again; zeroing them collapses every state that differed only there. The
+// closed count moves up with them, or states that differ only in how much dead history they had
+// closed would stay apart while meaning the same thing.
+inline void ho_project(const HoPlan& P, HoHom& h, std::size_t b) {
+    const std::size_t base = P.base_after[b];
+    if (base == 0) return;
+    std::uint64_t low = 1;
+    for (std::size_t i = 0; i < base && i < P.radix.size(); ++i) low *= P.radix[i];
+    h.digits = (h.digits / low) * low;          // zero every dead digit, keep the live ones in place
+    if (h.k < base) h.k = std::min(base, P.hist_block.size());
+}
+
+// The refined class of block `b` for a homologue: history when closed, current template otherwise.
+inline std::uint32_t ho_class_at(const HoPlan& P, const HoHom& h, std::size_t b) {
+    const std::size_t i = P.hist_pos[b];
+    if (i != static_cast<std::size_t>(-1) && i < h.k) return ho_digit(P, h, i);
+    return P.refined[b][h.t];
+}
+
+}  // namespace
+
+
+namespace {
+// Overflow-checked arithmetic. A resource plan that silently wraps is worse than no plan: it
+// reports a small number for something that will not fit.
+inline bool ck_mul(std::uint64_t a, std::uint64_t b, std::uint64_t& out) {
+    if (a != 0 && b > std::numeric_limits<std::uint64_t>::max() / a) return false;
+    out = a * b; return true;
+}
+inline bool ck_add(std::uint64_t a, std::uint64_t b, std::uint64_t& out) {
+    if (a > std::numeric_limits<std::uint64_t>::max() - b) return false;
+    out = a + b; return true;
+}
+}  // namespace
+
+HigherOrderPlan plan_higher_order(const HybridChain& c, std::size_t threads) {
+    HigherOrderPlan pl;
+    pl.threads = threads == 0 ? 1 : threads;
+    const std::size_t nh = c.n_hap, nb = c.n_blocks;
+    if (nh == 0 || nb == 0 || c.log_emission.size() != nb || c.edges.size() != nb) {
+        pl.refusal = "malformed chain"; return pl;
+    }
+    const HoPlan P = ho_build_plan(c);
+    if (!P.ok) { pl.refusal = P.refusal; return pl; }
+    pl.n_blocks = nb; pl.n_hap = nh;
+    pl.refinement_classes = P.n_refined;
+
+    const double r = c.recomb;
+    const bool has_stay = (1.0 - r) != 0.0, has_switch = (r / static_cast<double>(nh)) != 0.0;
+
+    bool overflow = false;
+    const auto mul = [&](std::uint64_t a, std::uint64_t b) {
+        std::uint64_t o = 0; if (!ck_mul(a, b, o)) overflow = true; return o;
+    };
+    const auto add = [&](std::uint64_t& acc, std::uint64_t v) {
+        std::uint64_t o = 0; if (!ck_add(acc, v, o)) overflow = true; else acc = o;
+    };
+
+    // THE HAPLOID REACHABILITY PASS. At most per_hom states, which is the product of the
+    // refinement sizes times the panel -- enumerable even where the diploid message is not.
+    std::vector<std::uint64_t> R;
+    R.reserve(nh);
+    for (std::uint32_t t = 0; t < nh; ++t) { HoHom h; h.t = t; R.push_back(ho_pack(P, h)); }
+    std::sort(R.begin(), R.end());
+    pl.haploid_states.assign(nb, 0);
+    pl.message_entries.assign(nb, 0);
+    pl.haploid_states[0] = R.size();
+    pl.message_entries[0] = mul(R.size(), R.size());
+    pl.peak_message_entries = pl.message_entries[0];
+    pl.total_message_entries = pl.message_entries[0];
+    if (!P.ends_at[0].empty())
+        add(pl.factor_lookups, mul(pl.message_entries[0], P.ends_at[0].size()));
+
+    std::uint64_t peak_temp_entries = 0;
+    std::vector<std::uint64_t> nextR, Hset;
+    for (std::size_t b = 1; b < nb; ++b) {
+        const std::uint64_t Rp = R.size();
+        // The extended histories, and the total number of digits the extension appends.
+        Hset.clear();
+        std::uint64_t D = 0;
+        const std::size_t kb = ho_closed_before(P, b);
+        for (std::uint64_t key : R) {
+            const HoHom h = ho_unpack(P, key);
+            HoHom e = h;
+            for (std::size_t i = h.k; i < kb; ++i) {
+                std::uint64_t place = 1;
+                for (std::size_t q = 0; q < i; ++q) place *= P.radix[q];
+                e.digits += static_cast<std::uint64_t>(P.refined[P.hist_block[i]][h.t]) * place;
+                ++D;
+            }
+            e.k = std::max(h.k, kb);
+            Hset.push_back(ho_hist_index(P, e));
+        }
+        std::sort(Hset.begin(), Hset.end());
+        Hset.erase(std::unique(Hset.begin(), Hset.end()), Hset.end());
+        const std::uint64_t H = has_switch ? Hset.size() : 0;
+
+        // The destinations: stay keeps the state, switch frees the template over every panel entry.
+        nextR.clear();
+        if (has_stay) for (std::uint64_t key : R) nextR.push_back(key);
+        if (has_switch)
+            for (std::uint64_t hidx : Hset) {
+                HoHom e = ho_from_hist(P, hidx);
+                for (std::uint32_t n = 0; n < nh; ++n) { e.t = n; nextR.push_back(ho_pack(P, e)); }
+            }
+        for (std::uint64_t& key : nextR) {
+            HoHom h = ho_unpack(P, key); ho_project(P, h, b); key = ho_pack(P, h);
+        }
+        std::sort(nextR.begin(), nextR.end());
+        nextR.erase(std::unique(nextR.begin(), nextR.end()), nextR.end());
+
+        // ---- THE COUNTS, in closed form from Rp, H and D ------------------------------------
+        std::uint64_t upd = 0;
+        if (has_stay) add(upd, mul(Rp, Rp));
+        if (has_switch && has_stay) add(upd, mul(mul(2ull, mul(H, Rp)), nh));
+        if (has_switch) add(upd, mul(mul(H, H), mul(nh, nh)));
+        add(pl.forward_updates, upd);
+        add(pl.adjoint_updates, upd);                       // the gather visits the same set
+        add(pl.multiplier_reconstructions, mul(2ull, upd)); // one per sweep
+        if (!P.ends_at[b].empty())
+            add(pl.factor_lookups, mul(mul(2ull, upd), P.ends_at[b].size()));
+        add(pl.dense_equivalent_updates, mul(mul(Rp, Rp), mul(nh + 1, nh + 1)));
+        // Aggregate accumulations: three per source forward, three more in the adjoint's key pass.
+        if (has_switch) add(pl.grouping_ops, mul(6ull, mul(Rp, Rp)));
+        // History appends: twice per diploid source forward, four times in the adjoint (its key
+        // pass and its broadcast each rebuild the keys rather than remembering them).
+        if (has_switch) add(pl.history_ops, mul(6ull, mul(Rp, D)));
+
+        std::uint64_t temp = 0;
+        if (has_switch && has_stay) add(temp, mul(2ull, mul(H, Rp)));
+        if (has_switch) add(temp, mul(H, H));
+        peak_temp_entries = std::max(peak_temp_entries, temp);
+
+        R.swap(nextR);
+        pl.haploid_states[b] = R.size();
+        pl.message_entries[b] = mul(R.size(), R.size());
+        pl.peak_message_entries = std::max(pl.peak_message_entries, pl.message_entries[b]);
+        add(pl.total_message_entries, pl.message_entries[b]);
+        if (overflow) { pl.refusal = "the resource plan overflows 64 bits"; return pl; }
+    }
+
+    // ---- BYTES ------------------------------------------------------------------------------
+    // PAYLOAD is the doubles. CONTAINER is what the hash actually costs around them: a node per
+    // entry (key, value, next pointer, cached hash) plus a bucket array, sized here at one bucket
+    // per entry. It is allocator-dependent and therefore an ESTIMATE, which is exactly why it is
+    // reported apart from the payload rather than folded into it.
+    pl.payload_bytes = mul(mul(2ull, pl.total_message_entries), sizeof(double));
+    pl.container_bytes = mul(mul(2ull, pl.total_message_entries), 40ull);
+    pl.temporary_bytes = mul(peak_temp_entries, 40ull);
+    pl.per_thread_bytes = mul(pl.peak_message_entries, sizeof(double));
+    std::uint64_t tot = 0;
+    add(tot, pl.payload_bytes); add(tot, pl.container_bytes); add(tot, pl.temporary_bytes);
+    add(tot, mul(pl.threads, pl.per_thread_bytes));
+    pl.total_bytes = tot;
+    if (overflow) { pl.refusal = "the resource plan overflows 64 bits"; return pl; }
+    pl.ok = true;
+    return pl;
+}
+
+// ONE CORE, TWO TRANSITIONS. The plan, the packing, the emissions, the factor application, the
+// history extension, the marginals and the refusals are SHARED, so the only thing that differs
+// between the production recurrence and its oracle is the transition enumeration -- which is the
+// thing being compared. Anything else in common would be a second place for them to drift.
+static HybridPosterior ho_run(const HybridChain& c, std::uint64_t max_message_entries,
+                              HigherOrderStats* stats, bool dense, HigherOrderTrace* trace) {
+    HybridPosterior out;
+    HigherOrderStats st;
+    const std::size_t nh = c.n_hap, nb = c.n_blocks, ns = nh * nh;
+    if (nh == 0 || nb == 0 || c.log_emission.size() != nb || c.edges.size() != nb) {
+        st.refused = true; st.refusal = "malformed chain";
+        if (stats) *stats = st;
+        return out;
+    }
+    const HoPlan P = ho_build_plan(c);
+    if (!P.ok) {
+        st.refused = true; st.refusal = P.refusal;
+        if (stats) *stats = st;
+        return out;
+    }
+    // REFUSAL BEFORE ALLOCATION, from the SAME plan the recurrence then follows. This is not a
+    // guard that happens to agree with a separate estimate: the plan is computed here, the budget
+    // is checked against it, and the fixtures require the plan's counts to equal the realised
+    // ones exactly. Nothing has been allocated at this point beyond the plan itself.
+    const HigherOrderPlan PL = plan_higher_order(c, 1);
+    if (!PL.ok) {
+        st.refused = true; st.refusal = "resource plan: " + PL.refusal;
+        if (stats) *stats = st;
+        return out;
+    }
+    st.planned_peak_message_entries = PL.peak_message_entries;
+    st.planned_forward_updates = PL.forward_updates;
+    st.planned_total_bytes = PL.total_bytes;
+    if (max_message_entries != 0 && PL.peak_message_entries > max_message_entries) {
+        st.refused = true;
+        st.refusal = "planned peak message of " + std::to_string(PL.peak_message_entries) +
+                     " entries exceeds max_message_entries (" +
+                     std::to_string(max_message_entries) + ")";
+        if (stats) *stats = st;
+        return out;
+    }
+
+    std::vector<double> shift(nb, 0.0);
+    for (std::size_t b = 0; b < nb; ++b) {
+        double m = kNegInf;
+        for (double v : c.log_emission[b]) m = std::max(m, v);
+        shift[b] = std::isfinite(m) ? m : 0.0;
+    }
+    const double r = c.recomb;
+    const double w_stay = 1.0 - r, w_switch = r / static_cast<double>(nh);
+
+    // The emission of a diploid state, in scaled probability space.
+    auto emit = [&](std::size_t b, std::uint32_t t1, std::uint32_t t2) {
+        const double v = c.log_emission[b][static_cast<std::size_t>(t1) * nh + t2];
+        return (v == kNegInf) ? 0.0 : std::exp(v - shift[b]);
+    };
+
+    // The factors that close at block b, applied to the joint class tuple of the span.
+    std::vector<std::uint32_t> ca, cb;
+    auto apply_factors = [&](std::size_t b, const HoHom& h1, const HoHom& h2) {
+        double m = 1.0;
+        for (std::size_t f : P.ends_at[b]) {
+            const auto& H = c.higher[f];
+            ca.resize(H.blocks.size()); cb.resize(H.blocks.size());
+            for (std::size_t j = 0; j < H.blocks.size(); ++j) {
+                const std::size_t q = H.blocks[j];
+                ca[j] = P.to_factor[f][j][ho_class_at(P, h1, q)];
+                cb[j] = P.to_factor[f][j][ho_class_at(P, h2, q)];
+            }
+            ++st.factor_lookups;
+            const double lp = H.table->log_psi_classes(ca, cb);
+            if (lp != 0.0) m *= std::exp(lp);
+        }
+        return m;
+    };
+
+    // Advance one homologue by one block. `sw` selects the switch component; `nt` is the new
+    // template. On a switch every block whose run has just closed is appended to the history --
+    // that is the only place history grows, and it is counted.
+    auto advance = [&](const HoHom& cur, std::size_t b, bool sw, std::uint32_t nt) {
+        HoHom nx = cur;
+        if (sw) {
+            const std::size_t kb = ho_closed_before(P, b);
+            for (std::size_t i = cur.k; i < kb; ++i) {
+                std::uint64_t place = 1;
+                for (std::size_t q = 0; q < i; ++q) place *= P.radix[q];
+                nx.digits += static_cast<std::uint64_t>(P.refined[P.hist_block[i]][cur.t]) * place;
+                ++st.history_ops;
+            }
+            nx.k = std::max(cur.k, kb);
+            nx.t = nt;
+        }
+        return nx;
+    };
+
+    // ---- FORWARD ------------------------------------------------------------------------------
+    const auto t_fwd = std::chrono::steady_clock::now();
+    std::vector<std::unordered_map<std::uint64_t, double>> msg(nb);
+    for (std::uint32_t t1 = 0; t1 < nh; ++t1)
+        for (std::uint32_t t2 = 0; t2 < nh; ++t2) {
+            HoHom h1, h2; h1.t = t1; h2.t = t2;
+            double w = emit(0, t1, t2);
+            if (!P.ends_at[0].empty()) w *= apply_factors(0, h1, h2);
+            if (w == 0.0) continue;
+            msg[0][ho_pack(P, h1) * P.per_hom + ho_pack(P, h2)] += w;
+        }
+    st.peak_message_entries = msg[0].size();
+    st.total_message_entries = msg[0].size();
+
+    // The four transition components, kept apart because Li-Stephens FACTORISES:
+    //   T = (1-r) I + (r/n) 11^T.
+    // Enumerating (n1, n2) per source would cost O(entering x n_hap^2) -- the dense assumption that
+    // makes a real locus four orders of magnitude too expensive. Instead each SWITCH component
+    // AGGREGATES over the old template first (the closed run's classes are appended before the sum,
+    // which is what lets the sum happen at all) and only then redistributes over the new template.
+    const double c_ss = w_stay * w_stay, c_ws = w_switch * w_stay, c_ww = w_switch * w_switch;
+    // STAY/STAY NEEDS NO AGGREGATE. Its group key IS the source key -- one source, one
+    // destination -- so grouping it would allocate a second copy of the whole message to buy
+    // nothing. Only the switch components actually merge sources.
+    std::unordered_map<std::uint64_t, double> gWS, gSW, gWW;
+    for (std::size_t b = 1; b < nb; ++b) {
+        auto& nxt = msg[b];
+        gWS.clear(); gSW.clear(); gWW.clear();
+        // Counted for BOTH implementations: it is the yardstick, so it cannot live inside the
+        // branch that is being measured against it.
+        st.dense_equivalent_updates +=
+            static_cast<std::uint64_t>(msg[b - 1].size()) *
+            (static_cast<std::uint64_t>(nh) + 1) * (static_cast<std::uint64_t>(nh) + 1);
+        if (dense) {
+        for (const auto& kv : msg[b - 1]) {
+            const HoHom c1 = ho_unpack(P, kv.first / P.per_hom);
+            const HoHom c2 = ho_unpack(P, kv.first % P.per_hom);
+            for (int s1 = 0; s1 < 2; ++s1) for (int s2 = 0; s2 < 2; ++s2) {
+                const double w1 = s1 ? w_switch : w_stay, w2 = s2 ? w_switch : w_stay;
+                if (w1 == 0.0 || w2 == 0.0) continue;
+                const std::uint32_t lo1 = s1 ? 0 : c1.t, hi1 = s1 ? nh : c1.t + 1;
+                const std::uint32_t lo2 = s2 ? 0 : c2.t, hi2 = s2 ? nh : c2.t + 1;
+                for (std::uint32_t n1 = lo1; n1 < hi1; ++n1)
+                for (std::uint32_t n2 = lo2; n2 < hi2; ++n2) {
+                    const HoHom a = advance(c1, b, s1 != 0, n1);
+                    const HoHom d = advance(c2, b, s2 != 0, n2);
+                    double m = w1 * w2 * emit(b, n1, n2);
+                    ++st.multiplier_reconstructions;
+                    if (!P.ends_at[b].empty()) m *= apply_factors(b, a, d);
+                    HoHom a2 = a, d2 = d;
+                    ho_project(P, a2, b); ho_project(P, d2, b);
+                    nxt[ho_pack(P, a2) * P.per_hom + ho_pack(P, d2)] += kv.second * m;
+                    ++st.forward_updates;
+                }
+            }
+        }
+        } else {
+        // ---- AGGREGATE ---------------------------------------------------------------------
+        for (const auto& kv : msg[b - 1]) {
+            const HoHom c1 = ho_unpack(P, kv.first / P.per_hom);
+            const HoHom c2 = ho_unpack(P, kv.first % P.per_hom);
+            // The closed runs are appended ONCE per source, before any aggregation -- that is what
+            // makes the switch components summable at all. With r = 0 no run ever closes here and
+            // the extension is not even computed.
+            HoHom e1 = c1, e2 = c2;
+            if (c_ws != 0.0 || c_ww != 0.0) {
+                e1 = advance(c1, b, true, 0); e2 = advance(c2, b, true, 0);
+            }
+            const double w = kv.second;
+            if (c_ws != 0.0) {
+                gWS[ho_hist_index(P, e1) * P.per_hom + ho_pack(P, c2)] += w * c_ws;
+                gSW[ho_pack(P, c1) * P.per_hom_hist + ho_hist_index(P, e2)] += w * c_ws;
+                st.grouping_ops += 2;
+            }
+            if (c_ww != 0.0) {
+                gWW[ho_hist_index(P, e1) * P.per_hom_hist + ho_hist_index(P, e2)] += w * c_ww;
+                ++st.grouping_ops;
+            }
+        }
+        // ---- REDISTRIBUTE ------------------------------------------------------------------
+        const auto place = [&](HoHom a, HoHom d, double g) {
+            double m = emit(b, a.t, d.t);
+            ++st.multiplier_reconstructions;
+            if (!P.ends_at[b].empty()) m *= apply_factors(b, a, d);
+            ho_project(P, a, b); ho_project(P, d, b);
+            nxt[ho_pack(P, a) * P.per_hom + ho_pack(P, d)] += g * m;
+            ++st.forward_updates;
+        };
+        if (c_ss != 0.0)
+            for (const auto& kv : msg[b - 1])
+                place(ho_unpack(P, kv.first / P.per_hom), ho_unpack(P, kv.first % P.per_hom),
+                      kv.second * c_ss);
+        for (const auto& kv : gWS) {
+            HoHom a = ho_from_hist(P, kv.first / P.per_hom);
+            const HoHom d = ho_unpack(P, kv.first % P.per_hom);
+            for (std::uint32_t n1 = 0; n1 < nh; ++n1) { a.t = n1; place(a, d, kv.second); }
+        }
+        for (const auto& kv : gSW) {
+            const HoHom a = ho_unpack(P, kv.first / P.per_hom_hist);
+            HoHom d = ho_from_hist(P, kv.first % P.per_hom_hist);
+            for (std::uint32_t n2 = 0; n2 < nh; ++n2) { d.t = n2; place(a, d, kv.second); }
+        }
+        for (const auto& kv : gWW) {
+            HoHom a = ho_from_hist(P, kv.first / P.per_hom_hist);
+            HoHom d = ho_from_hist(P, kv.first % P.per_hom_hist);
+            for (std::uint32_t n1 = 0; n1 < nh; ++n1) {
+                a.t = n1;
+                for (std::uint32_t n2 = 0; n2 < nh; ++n2) { d.t = n2; place(a, d, kv.second); }
+            }
+        }
+        }
+        // The plan said this would fit. If the realised message disagrees with it the plan is
+        // WRONG, and continuing would mean allocating past a budget that was already approved --
+        // so this refuses transactionally, clearing every message rather than leaving partials.
+        if (nxt.size() > PL.message_entries[b]) {
+            for (auto& m : msg) m.clear();
+            st.refused = true;
+            st.refusal = "message at block " + std::to_string(b) + " has " +
+                         std::to_string(nxt.size()) + " entries, more than the planned " +
+                         std::to_string(PL.message_entries[b]);
+            if (stats) *stats = st;
+            return out;
+        }
+        st.peak_message_entries = std::max<std::uint64_t>(st.peak_message_entries, nxt.size());
+        st.total_message_entries += nxt.size();
+    }
+    st.forward_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t_fwd).count();
+
+    double Z = 0.0;
+    for (const auto& kv : msg[nb - 1]) Z += kv.second;
+    if (!(Z > 0.0)) {
+        st.refused = true; st.refusal = "zero partition weight";
+        if (stats) *stats = st;
+        return out;
+    }
+
+    // ---- THE TAPE-FREE ADJOINT ----------------------------------------------------------------
+    // bar_b(s) = d Z / d msg_b(s). The update  dst += src * m  has adjoint  bar_src += bar_dst * m,
+    // so this re-walks the SAME loop and RECOMPUTES m rather than reading it from a tape: one tape
+    // entry per update would dominate every other cost at scale.
+    //
+    // PARALLEL SAFETY: the outer loop is over SOURCES and each iteration accumulates only into its
+    // own source's adjoint, so threads over sources need no reduction and no atomic accumulation.
+    const auto t_adj = std::chrono::steady_clock::now();
+    std::vector<std::unordered_map<std::uint64_t, double>> bar(nb);
+    for (const auto& kv : msg[nb - 1]) bar[nb - 1][kv.first] = 1.0;
+    // THE ADJOINT OF A FACTORISED STEP. Forward was AGGREGATE then REDISTRIBUTE; reversed, that is
+    // GATHER (each group's adjoint from its destinations) then BROADCAST (each source reads the
+    // groups it fed). Both halves stay contention-free: the gather writes one entry per GROUP, the
+    // broadcast writes one entry per SOURCE, and neither ever writes another's.
+    if (dense) {
+    for (std::size_t b = nb - 1; b-- > 0;) {
+        auto& here = bar[b];
+        const auto& next = bar[b + 1];
+        for (const auto& kv : msg[b]) {
+            const HoHom c1 = ho_unpack(P, kv.first / P.per_hom);
+            const HoHom c2 = ho_unpack(P, kv.first % P.per_hom);
+            double acc = 0.0;
+            for (int s1 = 0; s1 < 2; ++s1) for (int s2 = 0; s2 < 2; ++s2) {
+                const double w1 = s1 ? w_switch : w_stay, w2 = s2 ? w_switch : w_stay;
+                if (w1 == 0.0 || w2 == 0.0) continue;
+                const std::uint32_t lo1 = s1 ? 0 : c1.t, hi1 = s1 ? nh : c1.t + 1;
+                const std::uint32_t lo2 = s2 ? 0 : c2.t, hi2 = s2 ? nh : c2.t + 1;
+                for (std::uint32_t n1 = lo1; n1 < hi1; ++n1)
+                for (std::uint32_t n2 = lo2; n2 < hi2; ++n2) {
+                    const HoHom a = advance(c1, b + 1, s1 != 0, n1);
+                    const HoHom d = advance(c2, b + 1, s2 != 0, n2);
+                    double m = w1 * w2 * emit(b + 1, n1, n2);
+                    ++st.multiplier_reconstructions;
+                    if (!P.ends_at[b + 1].empty()) m *= apply_factors(b + 1, a, d);
+                    HoHom a2 = a, d2 = d;
+                    ho_project(P, a2, b + 1); ho_project(P, d2, b + 1);
+                    const auto it = next.find(ho_pack(P, a2) * P.per_hom + ho_pack(P, d2));
+                    if (it == next.end()) continue;
+                    acc += it->second * m;
+                    ++st.adjoint_updates;
+                }
+            }
+            here[kv.first] = acc;
+        }
+    }
+    } else {
+    std::unordered_map<std::uint64_t, double> aWS, aSW, aWW;
+    for (std::size_t b = nb - 1; b-- > 0;) {
+        const std::size_t bb = b + 1;
+        auto& here = bar[b];
+        aWS.clear(); aSW.clear(); aWW.clear();
+        // The group KEYS, recomputed from the sources -- a tape is exactly what we are refusing
+        // to store, so they are derived again rather than remembered.
+        const auto keys_of = [&](std::uint64_t key, std::uint64_t& kWS,
+                                 std::uint64_t& kSW, std::uint64_t& kWW) {
+            const HoHom c1 = ho_unpack(P, key / P.per_hom);
+            const HoHom c2 = ho_unpack(P, key % P.per_hom);
+            HoHom e1 = c1, e2 = c2;
+            if (c_ws != 0.0 || c_ww != 0.0) {
+                e1 = advance(c1, bb, true, 0); e2 = advance(c2, bb, true, 0);
+            }
+            kWS = ho_hist_index(P, e1) * P.per_hom + ho_pack(P, c2);
+            kSW = ho_pack(P, c1) * P.per_hom_hist + ho_hist_index(P, e2);
+            kWW = ho_hist_index(P, e1) * P.per_hom_hist + ho_hist_index(P, e2);
+        };
+        for (const auto& kv : msg[b]) {
+            std::uint64_t kWS, kSW, kWW;
+            keys_of(kv.first, kWS, kSW, kWW);
+            if (c_ws != 0.0) {
+                aWS.emplace(kWS, 0.0); aSW.emplace(kSW, 0.0); st.grouping_ops += 2;
+            }
+            if (c_ww != 0.0) { aWW.emplace(kWW, 0.0); ++st.grouping_ops; }
+        }
+        const auto& next = bar[bb];
+        const auto gather = [&](HoHom a, HoHom d) {
+            double m = emit(bb, a.t, d.t);
+            ++st.multiplier_reconstructions;
+            if (!P.ends_at[bb].empty()) m *= apply_factors(bb, a, d);
+            ho_project(P, a, bb); ho_project(P, d, bb);
+            const auto it = next.find(ho_pack(P, a) * P.per_hom + ho_pack(P, d));
+            ++st.adjoint_updates;
+            return it == next.end() ? 0.0 : it->second * m;
+        };
+        for (auto& kv : aWS) {
+            HoHom a = ho_from_hist(P, kv.first / P.per_hom);
+            const HoHom d = ho_unpack(P, kv.first % P.per_hom);
+            double acc = 0.0;
+            for (std::uint32_t n1 = 0; n1 < nh; ++n1) { a.t = n1; acc += gather(a, d); }
+            kv.second = acc;
+        }
+        for (auto& kv : aSW) {
+            const HoHom a = ho_unpack(P, kv.first / P.per_hom_hist);
+            HoHom d = ho_from_hist(P, kv.first % P.per_hom_hist);
+            double acc = 0.0;
+            for (std::uint32_t n2 = 0; n2 < nh; ++n2) { d.t = n2; acc += gather(a, d); }
+            kv.second = acc;
+        }
+        for (auto& kv : aWW) {
+            HoHom a = ho_from_hist(P, kv.first / P.per_hom_hist);
+            HoHom d = ho_from_hist(P, kv.first % P.per_hom_hist);
+            double acc = 0.0;
+            for (std::uint32_t n1 = 0; n1 < nh; ++n1) {
+                a.t = n1;
+                for (std::uint32_t n2 = 0; n2 < nh; ++n2) { d.t = n2; acc += gather(a, d); }
+            }
+            kv.second = acc;
+        }
+        // BROADCAST. Each source accumulates only into its own adjoint.
+        for (const auto& kv : msg[b]) {
+            std::uint64_t kWS, kSW, kWW;
+            keys_of(kv.first, kWS, kSW, kWW);
+            double acc = 0.0;
+            if (c_ss != 0.0)
+                acc += c_ss * gather(ho_unpack(P, kv.first / P.per_hom),
+                                     ho_unpack(P, kv.first % P.per_hom));
+            if (c_ws != 0.0) acc += c_ws * (aWS[kWS] + aSW[kSW]);
+            if (c_ww != 0.0) acc += c_ww * aWW[kWW];
+            here[kv.first] = acc;
+        }
+    }
+    }
+    st.adjoint_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t_adj).count();
+
+    // marginal(b, x) = SUM over states s with template pair x of msg_b(s) * bar_b(s).
+    out.log_marginal.assign(nb, std::vector<double>(ns, kNegInf));
+    for (std::size_t b = 0; b < nb; ++b) {
+        std::vector<double> mg(ns, 0.0);
+        for (const auto& kv : msg[b]) {
+            const auto it = bar[b].find(kv.first);
+            if (it == bar[b].end()) continue;
+            const HoHom h1 = ho_unpack(P, kv.first / P.per_hom);
+            const HoHom h2 = ho_unpack(P, kv.first % P.per_hom);
+            mg[static_cast<std::size_t>(h1.t) * nh + h2.t] += kv.second * it->second;
+        }
+        double z = 0.0;
+        for (double v : mg) z += v;
+        for (std::size_t x = 0; x < ns; ++x)
+            out.log_marginal[b][x] = (mg[x] > 0.0 && z > 0.0) ? std::log(mg[x] / z) : kNegInf;
+    }
+    out.log_partition_unnormalised = std::log(Z);
+    for (std::size_t b = 0; b < nb; ++b) out.log_partition_unnormalised += shift[b];
+    out.linked_edges = 0;
+    out.factorised_edges = nb > 0 ? nb - 1 : 0;
+    out.ok = true;
+    // PAYLOAD ONLY -- the message and adjoint values. Not a memory total: it excludes the hash
+    // index, allocator overhead, the factor tables, temporaries and any reduction buffers.
+    st.predicted_payload_bytes = st.total_message_entries * 2ull * sizeof(double);
+    // THE TRACE, for fixture comparison only: both implementations use the same HoPlan, so their
+    // message keys are directly comparable and a disagreement can be localised to a state rather
+    // than only showing up as a marginal that moved.
+    if (trace) {
+        trace->messages.assign(nb, {});
+        trace->adjoints.assign(nb, {});
+        for (std::size_t b = 0; b < nb; ++b) {
+            for (const auto& kv : msg[b]) trace->messages[b].push_back(kv);
+            for (const auto& kv : bar[b]) trace->adjoints[b].push_back(kv);
+            std::sort(trace->messages[b].begin(), trace->messages[b].end());
+            std::sort(trace->adjoints[b].begin(), trace->adjoints[b].end());
+        }
+    }
+    if (stats) *stats = st;
+    return out;
+}
+
+HybridPosterior hybrid_higher_order(const HybridChain& c, std::uint64_t max_message_entries,
+                                    HigherOrderStats* stats, HigherOrderTrace* trace) {
+    return ho_run(c, max_message_entries, stats, /*dense=*/false, trace);
+}
+
+HybridPosterior hybrid_higher_order_dense_oracle(const HybridChain& c,
+                                                 std::uint64_t max_message_entries,
+                                                 HigherOrderStats* stats,
+                                                 HigherOrderTrace* trace) {
+    return ho_run(c, max_message_entries, stats, /*dense=*/true, trace);
+}
+
 HybridPosterior hybrid_bruteforce(const HybridChain& c) {
     HybridPosterior out;
     const std::size_t nh = c.n_hap, nb = c.n_blocks, ns = nh * nh;
@@ -7119,6 +7886,19 @@ HybridPosterior hybrid_bruteforce(const HybridChain& c) {
                     const std::size_t h2a = e.allele_a[j],  h2b = e.allele_b[j2];
                     lp += e.log_psi[((h1a * e.n_b + h1b) * e.n_a + h2a) * e.n_b + h2b];
                 }
+            }
+            // THE HIGHER FACTORS, read off the whole path directly -- no message, no history, no
+            // class refinement. Everything the recurrence carries state for is here a plain index
+            // into the path, which is what makes the comparison independent.
+            for (const HybridHigherFactor& H : c.higher) {
+                if (H.table == nullptr || !H.table->ok) continue;
+                std::vector<std::uint32_t> a1(H.blocks.size()), a2(H.blocks.size());
+                for (std::size_t j = 0; j < H.blocks.size(); ++j) {
+                    const std::size_t b = H.blocks[j];
+                    a1[j] = c.hap_allele[path[b] / nh][b];
+                    a2[j] = c.hap_allele[path[b] % nh][b];
+                }
+                lp += H.table->log_psi(a1, a2);
             }
             z = log_add(z, lp);
             for (std::size_t b = 0; b < nb; ++b) {

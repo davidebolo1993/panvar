@@ -1423,6 +1423,332 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                 " with, " + sci(Z_nf) + " without)");
         }
         }   // arms
+
+        // ==========================================================================================
+        // THROUGH THE PRODUCTION FUNCTION, with REAL factor tables.
+        //
+        // Everything above is a fixture reimplementation. It proves the mathematics; it does not
+        // prove that hybrid_higher_order does the same thing, and a gate that only exercises the
+        // fixture would let the production recurrence drift away from it silently. So this arm
+        // builds two OVERLAPPING IntervalFactorTables through build_interval_factor, hands them to
+        // hybrid_higher_order, and requires agreement with hybrid_bruteforce -- which reads the
+        // factors straight off each path and carries no message, no history and no refinement.
+        {
+            std::mt19937_64 rng2(20260910);
+            const auto rseq = [&](std::size_t n) {
+                static const char* B = "ACGT";
+                std::string t(n, 'A');
+                for (std::size_t i = 0; i < n; ++i) t[i] = B[rng2() & 3];
+                return t;
+            };
+            const auto sub = [](std::string x, std::size_t at, char ch) {
+                x[at] = (x[at] == ch) ? (ch == 'A' ? 'C' : 'A') : ch; return x;
+            };
+            // Build one real factor. `ident[j][a]` says WHICH SEQUENCE allele a of block j carries:
+            // two alleles sharing an id are byte-identical, so they collapse into one signature
+            // class while remaining distinct HMM states. That is the lever that lets two factors
+            // induce DIFFERENT class partitions on a shared block -- without it both partitions are
+            // the discrete one, either factor's history would do, and the common refinement the
+            // recurrence carries would never be tested.
+            const auto make_factor = [&](const std::vector<std::vector<int>>& ident,
+                                         IntervalGeometry& G) {
+                G.blocks.clear();
+                for (std::size_t j = 0; j < ident.size(); ++j)
+                    G.blocks.push_back(static_cast<std::uint32_t>(j));
+                G.alleles.clear();
+                for (std::size_t j = 0; j < ident.size(); ++j) {
+                    const std::string base = rseq(200);
+                    int nseq = 0;
+                    for (int id : ident[j]) nseq = std::max(nseq, id + 1);
+                    std::vector<std::string> distinct{base};
+                    for (int q = 1; q < nseq; ++q)
+                        distinct.push_back(sub(base, 40 + 7 * static_cast<std::size_t>(q),
+                                               "CGTA"[q & 3]));
+                    std::vector<std::string> alt;
+                    for (int id : ident[j]) alt.push_back(distinct[static_cast<std::size_t>(id)]);
+                    G.alleles.push_back(alt);
+                }
+                G.contexts.assign(ident.size() - 1, rseq(9));
+                G.lflank.clear(); G.rflank.clear();
+                G.ok = true; G.exposure_affine = true;
+                InsertPrior ip; ip.lo = 200; ip.hi = 700;
+                ip.logp.assign(static_cast<std::size_t>(ip.hi - ip.lo + 1),
+                               -std::log(static_cast<double>(ip.hi - ip.lo + 1)));
+                const double lep = std::log(0.001 / 3.0), l1m = std::log(1.0 - 0.001);
+                const auto ix = build_interval_seed_index(G, 16);
+                std::vector<Fragment> frags;
+                std::vector<std::uint32_t> ch;
+                for (std::size_t cell = 0; cell < G.cells(); cell += 3) {
+                    G.cell_choice(cell, ch);
+                    std::vector<const std::string*> al2, cx2;
+                    for (std::size_t j = 0; j < ident.size(); ++j)
+                        al2.push_back(&G.alleles[j][ch[j]]);
+                    for (const std::string& cx : G.contexts) cx2.push_back(&cx);
+                    VirtualWindow vw; vw.bind_chain(G.lflank, al2, cx2, G.rflank);
+                    for (std::size_t stt : {std::size_t(30), std::size_t(210)}) {
+                        if (stt + 400 > vw.size()) continue;
+                        Fragment f;
+                        f.name = "g" + std::to_string(cell) + "_" + std::to_string(stt);
+                        for (std::size_t i = 0; i < 150; ++i) f.r1.push_back(vw.base_at(stt + i));
+                        std::string t2;
+                        for (std::size_t i = 0; i < 150; ++i) t2.push_back(vw.base_at(stt + 250 + i));
+                        f.r2 = reverse_complement(t2);
+                        frags.push_back(f);
+                    }
+                }
+                std::vector<IntervalEmission> ems;
+                std::vector<std::vector<std::string>> sigs;
+                for (const Fragment& f : frags) {
+                    IntervalEmission E = interval_emission(f, G, ip, 0.05, lep, l1m, -420.0, &ix,
+                                                           nullptr, true, false);
+                    sigs.push_back(E.cell_signature);
+                    ems.push_back(std::move(E));
+                }
+                const IntervalGrouping GR = build_interval_grouping(G, sigs);
+                return build_interval_factor(G, GR, ems, 0.05, std::log1p(-0.05), std::log(0.05));
+            };
+
+            const std::size_t NHp = 4, NBp = 5, NSp = NHp * NHp;
+            // Allele counts per chain block. Blocks 2 and 3 sit in BOTH factors, so their history
+            // must carry the common refinement of two different class partitions.
+            const std::vector<std::size_t> nA = {2, 3, 3, 2, 3};
+            IntervalGeometry GA, GB;
+            // Chain block 2 is shared, and the two factors partition its three alleles
+            // INCOMPATIBLY: FA merges alleles 0 and 1, FB merges alleles 1 and 2. Neither
+            // partition refines the other, so the history must carry their common refinement --
+            // all three alleles apart -- and storing either factor's own classes loses the
+            // other's information.
+            const IntervalFactorTable FA = make_factor({{0, 1, 2}, {0, 0, 1}, {0, 1}}, GA);
+            const IntervalFactorTable FB = make_factor({{0, 1, 1}, {0, 1}, {0, 1, 2}}, GB);
+            ok_(FA.ok && FB.ok, std::string("production gate: both real factors build (") +
+                std::to_string(FA.classes_stored) + " and " +
+                std::to_string(FB.classes_stored) + " classes)");
+            // MEASURED, not asserted: the common refinement of the two partitions at the shared
+            // block must be STRICTLY FINER than either. Equal class counts would not show this --
+            // two different 2-class partitions and two identical ones both report 2.
+            std::size_t refined_here = 0;
+            if (FA.allele_class.size() == 3 && FB.allele_class.size() == 3) {
+                std::set<std::pair<std::uint32_t, std::uint32_t>> pairs;
+                for (std::size_t a = 0; a < nA[2]; ++a)
+                    pairs.insert({FA.allele_class[1][a], FB.allele_class[0][a]});
+                refined_here = pairs.size();
+            }
+            ok_(refined_here > FA.classes_per_block[1] && refined_here > FB.classes_per_block[0],
+                "production gate: the common refinement at the shared block is STRICTLY FINER "
+                "than either factor's partition (" + std::to_string(refined_here) + " vs FA " +
+                std::to_string(FA.classes_per_block[1]) + " and FB " +
+                std::to_string(FB.classes_per_block[0]) + "), so neither refines the other");
+
+            HybridChain ch;
+            ch.n_hap = NHp; ch.n_blocks = NBp; ch.recomb = 0.2;
+            ch.edges.assign(NBp, HybridEdge{});
+            ch.hap_allele.assign(NHp, std::vector<std::uint32_t>(NBp, 0));
+            for (std::size_t t = 0; t < NHp; ++t)
+                for (std::size_t b = 0; b < NBp; ++b)
+                    ch.hap_allele[t][b] = static_cast<std::uint32_t>((t + b) % nA[b]);
+            std::mt19937_64 rng3(20260911);
+            std::uniform_real_distribution<double> ud(-3.0, 0.0);
+            ch.log_emission.assign(NBp, std::vector<double>(NSp, 0.0));
+            for (std::size_t b = 0; b < NBp; ++b)
+                for (std::size_t k = 0; k < NSp; ++k) ch.log_emission[b][k] = ud(rng3);
+            ch.higher.push_back(HybridHigherFactor{{1, 2, 3}, &FA});
+            ch.higher.push_back(HybridHigherFactor{{2, 3, 4}, &FB});
+
+            HigherOrderStats hs;
+            HigherOrderTrace tr;
+            const HybridPosterior got = hybrid_higher_order(ch, 0, &hs, &tr);
+            ok_(got.ok && !hs.refused,
+                std::string("production gate: hybrid_higher_order runs") +
+                (hs.refused ? (" -- REFUSED: " + hs.refusal) : ""));
+            const HybridPosterior bf2 = hybrid_bruteforce(ch);
+            ok_(bf2.ok, "production gate: brute force runs over " +
+                std::to_string(NSp) + "^" + std::to_string(NBp) + " paths");
+            if (got.ok && bf2.ok) {
+                double worst = 0.0, worstZ = std::abs(got.log_partition_unnormalised -
+                                                      bf2.log_partition_unnormalised);
+                for (std::size_t b = 0; b < NBp; ++b)
+                    for (std::size_t x = 0; x < NSp; ++x) {
+                        const double a = std::exp(got.log_marginal[b][x]);
+                        const double e = std::exp(bf2.log_marginal[b][x]);
+                        worst = std::max(worst, std::abs(a - e));
+                    }
+                ok_(worstZ < 1e-9, "production gate: the PARTITION agrees with brute force (log "
+                    "difference " + sci(worstZ) + ")");
+                ok_(worst < 1e-9, "production gate: EVERY block marginal agrees with brute force "
+                    "(worst absolute " + sci(worst) + ")");
+            }
+            ok_(hs.forward_updates == hs.adjoint_updates,
+                "production gate: forward and adjoint enumerate the same loop (" +
+                std::to_string(hs.forward_updates) + " each, total " +
+                std::to_string(hs.forward_updates + hs.adjoint_updates) + ")");
+            ok_(hs.history_ops > 0 && hs.factor_lookups > 0,
+                "production gate: auxiliary work is counted separately -- " +
+                std::to_string(hs.multiplier_reconstructions) + " multiplier reconstructions, " +
+                std::to_string(hs.factor_lookups) + " factor lookups, " +
+                std::to_string(hs.history_ops) + " history appends, " +
+                std::to_string(hs.grouping_ops) + " aggregate accumulations; peak message " +
+                std::to_string(hs.peak_message_entries) + " entries, predicted payload " +
+                std::to_string(hs.predicted_payload_bytes) + " bytes");
+            // ---- THE PLAN MUST EQUAL WHAT HAPPENED ------------------------------------------
+            // Predicted == actual, counter by counter. A plan that merely BOUNDS the work would
+            // let --plan-only report a number nobody can act on; equality is what makes it a
+            // contract. The plan is exact because the diploid reachable set is the square of the
+            // haploid one, which the planner enumerates outright.
+            {
+                const HigherOrderPlan pl = plan_higher_order(ch, 4);
+                ok_(pl.ok, pl.ok ? "production gate: the resource plan builds"
+                                 : ("production gate: the plan REFUSED: " + pl.refusal));
+                std::vector<std::string> off;
+                const auto eq = [&](const char* nm, std::uint64_t p2, std::uint64_t a) {
+                    if (p2 != a) off.push_back(std::string(nm) + " planned " +
+                                               std::to_string(p2) + " actual " + std::to_string(a));
+                };
+                eq("forward_updates", pl.forward_updates, hs.forward_updates);
+                eq("adjoint_updates", pl.adjoint_updates, hs.adjoint_updates);
+                eq("multiplier_reconstructions", pl.multiplier_reconstructions,
+                   hs.multiplier_reconstructions);
+                eq("factor_lookups", pl.factor_lookups, hs.factor_lookups);
+                eq("history_ops", pl.history_ops, hs.history_ops);
+                eq("grouping_ops", pl.grouping_ops, hs.grouping_ops);
+                eq("peak_message_entries", pl.peak_message_entries, hs.peak_message_entries);
+                eq("total_message_entries", pl.total_message_entries, hs.total_message_entries);
+                eq("dense_equivalent", pl.dense_equivalent_updates, hs.dense_equivalent_updates);
+                std::string why;
+                for (std::size_t i = 0; i < off.size(); ++i) why += (i ? "; " : "") + off[i];
+                ok_(off.empty(), off.empty()
+                    ? ("production gate: EVERY planned count equals the realised one (" +
+                       std::to_string(pl.forward_updates) + " forward updates, " +
+                       std::to_string(pl.peak_message_entries) + " peak entries, " +
+                       std::to_string(pl.total_bytes) + " total bytes over " +
+                       std::to_string(pl.threads) + " threads)")
+                    : ("production gate: the plan DISAGREES with what happened -- " + why));
+                // And the plan's per-block message sizes must match, not just the peak.
+                bool per_block = true;
+                for (std::size_t b = 0; b < tr.messages.size(); ++b)
+                    if (pl.message_entries[b] != tr.messages[b].size()) per_block = false;
+                ok_(per_block, "production gate: the planned message size is right at EVERY "
+                    "block, not only at the peak");
+                ok_(pl.total_bytes > pl.payload_bytes,
+                    "production gate: the byte account separates payload " +
+                    std::to_string(pl.payload_bytes) + ", container " +
+                    std::to_string(pl.container_bytes) + ", temporaries " +
+                    std::to_string(pl.temporary_bytes) + " and " + std::to_string(pl.threads) +
+                    " x " + std::to_string(pl.per_thread_bytes) + " per-thread");
+            }
+
+            // ---- WHAT THE BENCHMARK IS ALLOWED TO CLAIM ------------------------------------
+            // A runtime benchmark may use uniform emissions ONLY IF values never change topology.
+            // So: run the same chain with uniform emissions and with deterministic nonuniform
+            // ones, and require IDENTICAL message sizes and identical operation counters. If that
+            // holds, the benchmark measures computation -- not numerical behaviour, and not
+            // accuracy, neither of which it is entitled to say anything about.
+            {
+                HybridChain uni = ch;
+                for (auto& row : uni.log_emission) row.assign(NSp, 0.0);
+                HigherOrderStats hu;
+                HigherOrderTrace tu;
+                const HybridPosterior up = hybrid_higher_order(uni, 0, &hu, &tu);
+                bool same_shape = up.ok && tu.messages.size() == tr.messages.size();
+                for (std::size_t b = 0; b < tr.messages.size() && same_shape; ++b)
+                    if (tu.messages[b].size() != tr.messages[b].size() ||
+                        tu.adjoints[b].size() != tr.adjoints[b].size()) same_shape = false;
+                const bool same_ops =
+                    hu.forward_updates == hs.forward_updates &&
+                    hu.adjoint_updates == hs.adjoint_updates &&
+                    hu.multiplier_reconstructions == hs.multiplier_reconstructions &&
+                    hu.factor_lookups == hs.factor_lookups &&
+                    hu.history_ops == hs.history_ops &&
+                    hu.grouping_ops == hs.grouping_ops &&
+                    hu.peak_message_entries == hs.peak_message_entries &&
+                    hu.total_message_entries == hs.total_message_entries;
+                ok_(same_shape && same_ops,
+                    "production gate: UNIFORM and nonuniform emissions give identical message "
+                    "sizes and identical operation counters, so a runtime benchmark on uniform "
+                    "emissions measures computation and claims nothing about accuracy");
+            }
+
+            // ---- AGAINST THE DENSE ORACLE, ENTRY BY ENTRY ----------------------------------
+            // Marginals agreeing is necessary and not sufficient: two different messages can give
+            // the same marginals. Both implementations share one HoPlan, so their keys mean the
+            // same thing and every message and adjoint entry is directly comparable.
+            HigherOrderStats hd;
+            HigherOrderTrace td;
+            const HybridPosterior dn = hybrid_higher_order_dense_oracle(ch, 0, &hd, &td);
+            bool same_keys = dn.ok && td.messages.size() == tr.messages.size();
+            double worst_msg = 0.0, worst_bar = 0.0;
+            std::size_t entries_compared = 0;
+            for (std::size_t b = 0; b < tr.messages.size() && same_keys; ++b) {
+                if (td.messages[b].size() != tr.messages[b].size() ||
+                    td.adjoints[b].size() != tr.adjoints[b].size()) { same_keys = false; break; }
+                for (std::size_t i = 0; i < tr.messages[b].size(); ++i) {
+                    if (td.messages[b][i].first != tr.messages[b][i].first) {
+                        same_keys = false; break;
+                    }
+                    const double a = tr.messages[b][i].second, e = td.messages[b][i].second;
+                    worst_msg = std::max(worst_msg,
+                                         std::abs(a - e) / (std::abs(e) > 0.0 ? std::abs(e) : 1.0));
+                    ++entries_compared;
+                }
+                for (std::size_t i = 0; i < tr.adjoints[b].size() && same_keys; ++i) {
+                    if (td.adjoints[b][i].first != tr.adjoints[b][i].first) {
+                        same_keys = false; break;
+                    }
+                    const double a = tr.adjoints[b][i].second, e = td.adjoints[b][i].second;
+                    worst_bar = std::max(worst_bar,
+                                         std::abs(a - e) / (std::abs(e) > 0.0 ? std::abs(e) : 1.0));
+                }
+            }
+            ok_(same_keys, "production gate: the factorised recurrence reaches EXACTLY the same "
+                "states as the dense oracle, block by block");
+            ok_(same_keys && worst_msg < 1e-12 && worst_bar < 1e-12,
+                "production gate: every MESSAGE and ADJOINT entry agrees with the dense oracle (" +
+                std::to_string(entries_compared) + " message entries, worst relative " +
+                sci(worst_msg) + " and " + sci(worst_bar) + ")");
+            ok_(dn.ok && std::abs(dn.log_partition_unnormalised -
+                                  got.log_partition_unnormalised) < 1e-9,
+                "production gate: and the same partition (log difference " +
+                sci(std::abs(dn.log_partition_unnormalised -
+                             got.log_partition_unnormalised)) + ")");
+            ok_(hd.forward_updates == hd.dense_equivalent_updates,
+                "production gate: the DENSE oracle costs exactly its dense-equivalent (" +
+                std::to_string(hd.forward_updates) + " = " +
+                std::to_string(hd.dense_equivalent_updates) + "), so the ratio below is real work "
+                "removed and not an accounting artefact");
+            ok_(hs.forward_updates <= hs.dense_equivalent_updates,
+                "production gate: the Li-Stephens FACTORISATION never costs more than the dense "
+                "fan-out (" + std::to_string(hs.forward_updates) + " updates against " +
+                std::to_string(hs.dense_equivalent_updates) + " dense-equivalent)");
+            // WITHOUT the factors the same chain must reduce to the legacy pairwise path.
+            HybridChain plain = ch;
+            plain.higher.clear();
+            const HybridPosterior lo = hybrid_forward_backward(plain);
+            const HybridPosterior lb = hybrid_bruteforce(plain);
+            double worst_leg = 0.0;
+            if (lo.ok && lb.ok)
+                for (std::size_t b = 0; b < NBp; ++b)
+                    for (std::size_t x = 0; x < NSp; ++x)
+                        worst_leg = std::max(worst_leg, std::abs(std::exp(lo.log_marginal[b][x]) -
+                                                                 std::exp(lb.log_marginal[b][x])));
+            ok_(lo.ok && lb.ok && worst_leg < 1e-9,
+                "production gate: with NO higher factors the chain still takes the legacy pairwise "
+                "path and matches brute force (worst " + sci(worst_leg) + ")");
+            // AND THE RECURRENCE ITSELF MUST DEGENERATE. With no factors there is no history and
+            // no refinement, so hybrid_higher_order reduces to plain Li-Stephens -- if it does not,
+            // the history machinery is contributing something it should not.
+            HigherOrderStats hs0;
+            const HybridPosterior deg = hybrid_higher_order(plain, 0, &hs0);
+            double worst_deg = 0.0;
+            if (deg.ok && lb.ok)
+                for (std::size_t b = 0; b < NBp; ++b)
+                    for (std::size_t x = 0; x < NSp; ++x)
+                        worst_deg = std::max(worst_deg, std::abs(std::exp(deg.log_marginal[b][x]) -
+                                                                 std::exp(lb.log_marginal[b][x])));
+            ok_(deg.ok && worst_deg < 1e-9 && hs0.history_ops == 0 && hs0.factor_lookups == 0,
+                "production gate: the recurrence DEGENERATES to plain Li-Stephens with no factors "
+                "(worst " + sci(worst_deg) + ", " + std::to_string(hs0.history_ops) +
+                " history appends, " + std::to_string(hs0.factor_lookups) + " factor lookups)");
+        }
+
         std::printf("higher-order inference selftest: %zu failure(s)\n", fails);
         return fails == 0 ? 0 : 1;
     }

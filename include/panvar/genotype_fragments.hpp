@@ -1950,6 +1950,13 @@ struct IntervalFactorTable {
     // log psi for an ORDERED diploid configuration, given each homologue's allele tuple.
     double log_psi(const std::vector<std::uint32_t>& hap1,
                    const std::vector<std::uint32_t>& hap2) const;
+    // THE SAME OPERATION addressed by class id instead of allele index. log_psi uses its allele
+    // arguments ONLY through allele_class, so a message that already carries class ids must not
+    // map back to a representative allele just to map forward again -- that round trip is
+    // arithmetically neutral and would still cost a lookup per block per update. log_psi is
+    // implemented in terms of this, so there is one body and no second convention to drift.
+    double log_psi_classes(const std::vector<std::uint32_t>& cls1,
+                           const std::vector<std::uint32_t>& cls2) const;
 };
 
 // Build it from the per-fragment emissions over this factor's geometry. `emissions[f].mass[cell]`
@@ -2694,13 +2701,70 @@ struct HybridEdge {
     std::vector<double> log_psi;           // from LinkageEdge; empty when has_linkage is false
 };
 
+// A HIGHER-ORDER FACTOR: one IntervalFactorTable applied over a contiguous span of blocks.
+//
+// SCOPE IS NOT OWNERSHIP. The factor DEPENDS on every block in `blocks`; it CONSUMES only the
+// fragments assigned to it. Two factors may share blocks while sharing no evidence, which is why
+// overlapping spans are legal here and why the pairwise edges they supersede must be removed by
+// the caller rather than detected here.
+//
+// The factor applies ONCE, at the last block of its span, to the joint class tuple of both
+// homologues over the span. Everything before that is history the message has to carry.
+struct HybridHigherFactor {
+    std::vector<std::uint32_t> blocks;             // ascending, contiguous
+    const IntervalFactorTable* table = nullptr;    // NON-OWNING; must outlive the chain
+};
+
 struct HybridChain {
     std::size_t n_hap = 0;
     std::size_t n_blocks = 0;
     double recomb = 0.0;                          // Li-Stephens switch probability r
     std::vector<std::vector<double>> log_emission; // [block][i * n_hap + j], ordered states
     std::vector<HybridEdge> edges;                 // edges[b] joins block b-1 to b; edges[0] unused
+    // EMPTY IS THE LEGACY PATH. With no higher factors the chain is exactly the pairwise model and
+    // hybrid_forward_backward keeps its existing kernel route unchanged -- the pairwise path is
+    // preserved structurally, not reimplemented as a special case of the higher-order recurrence.
+    std::vector<HybridHigherFactor> higher;
+    // [hap][block] -> allele index. REQUIRED when `higher` is non-empty and unused otherwise: a
+    // higher factor is evaluated on the class tuple of a whole span, which the pairwise edges'
+    // two-block allele vectors cannot express.
+    std::vector<std::vector<std::uint32_t>> hap_allele;
 };
+
+// What the higher-order recurrence actually did, reported in the categories that differ from each
+// other. MESSAGE-ENTRY UPDATES are accumulations into a next-message state; the rest is the CPU
+// work the tape-free adjoint buys back by not storing a tape, and it is not interchangeable with
+// the update count -- on the fixture the history operations outnumber the updates threefold.
+struct HigherOrderStats {
+    std::uint64_t forward_updates = 0;
+    std::uint64_t adjoint_updates = 0;
+    std::uint64_t multiplier_reconstructions = 0;
+    std::uint64_t factor_lookups = 0;
+    std::uint64_t history_ops = 0;
+    // Accumulations into the SWITCH aggregates. Not message-entry updates: they land in the
+    // intermediate sums the Li-Stephens factorisation introduces, and they scale with the
+    // entering message rather than with its fan-out.
+    std::uint64_t grouping_ops = 0;
+    // What the SAME message would have cost with the dense (1 + n_hap)^2 fan-out per source, i.e.
+    // without exploiting T = (1-r)I + (r/n)11^T. Reported so the factorisation's benefit is a
+    // measured ratio rather than a claim; it can never be smaller than forward_updates.
+    std::uint64_t dense_equivalent_updates = 0;
+    std::uint64_t peak_message_entries = 0;
+    std::uint64_t total_message_entries = 0;
+    // PAYLOAD ONLY: the message and adjoint values. It EXCLUDES allocator overhead, the hash index
+    // itself, the factor tables, temporaries, and any thread-local reduction buffers. It is a
+    // lower bound on inference memory and must not be reported as a total.
+    std::uint64_t predicted_payload_bytes = 0;
+    double forward_seconds = 0.0, adjoint_seconds = 0.0;
+    // WHAT THE PLAN SAID, carried alongside what happened, so the two can be compared without
+    // running the planner a second time and hoping it answers the same way.
+    std::uint64_t planned_peak_message_entries = 0;
+    std::uint64_t planned_forward_updates = 0;
+    std::uint64_t planned_total_bytes = 0;
+    bool refused = false;
+    std::string refusal;
+};
+
 
 struct HybridPosterior {
     // UNNORMALISED. Initial ordered states carry weight 1, not a uniform prior 1/n_hap^2, so this
@@ -2726,6 +2790,72 @@ HybridPosterior hybrid_forward_backward(const HybridChain& chain);
 // twice, an accidental row-normalisation, an ordered-state mapping error, or a correct best call
 // produced from wrong posterior mass. A best-path comparison alone catches none of those.
 HybridPosterior hybrid_bruteforce(const HybridChain& chain);
+// THE HIGHER-ORDER RECURRENCE: forward messages carrying closed-run class history, then the
+// TAPE-FREE ADJOINT for the marginals. The adjoint re-walks the forward loop and RECOMPUTES each
+// multiplier rather than storing a tape, which would be one entry per update.
+//
+// `max_message_entries` bounds the message before it is built; 0 means unbounded. Exceeding it is
+// a REFUSAL that leaves no partial messages, not a truncation.
+// WHAT THE RECURRENCE WILL COST, COMPUTED BEFORE ANY OF IT IS ALLOCATED.
+//
+// This is exact, not a bound, and the reason is structural: the two homologues transition
+// INDEPENDENTLY, and no emission or factor value can ever delete a state (a zero weight still
+// occupies its key). So the diploid reachable set at every block is exactly the SQUARE of the
+// haploid one -- and the haploid set is small enough to enumerate outright. Everything below
+// follows from the per-block haploid counts by closed-form arithmetic.
+//
+// The recurrence CONSUMES this plan. It is not a parallel estimate that might disagree.
+struct HigherOrderPlan {
+    bool ok = false;
+    std::string refusal;
+    std::size_t n_blocks = 0, n_hap = 0;
+    std::vector<std::size_t> refinement_classes;   // common refinement size, per block
+    std::vector<std::uint64_t> haploid_states;     // |R_b|
+    std::vector<std::uint64_t> message_entries;    // |R_b|^2, the diploid message
+    std::uint64_t peak_message_entries = 0;
+    std::uint64_t total_message_entries = 0;
+    std::uint64_t forward_updates = 0;
+    std::uint64_t adjoint_updates = 0;
+    std::uint64_t dense_equivalent_updates = 0;
+    std::uint64_t multiplier_reconstructions = 0;
+    std::uint64_t factor_lookups = 0;
+    std::uint64_t history_ops = 0;
+    std::uint64_t grouping_ops = 0;
+    // THREE SEPARATE BYTE ACCOUNTS, because they grow differently and a single total hides that.
+    std::uint64_t payload_bytes = 0;        // message and adjoint VALUES only
+    std::uint64_t container_bytes = 0;      // hash nodes and buckets for those entries (estimate)
+    std::uint64_t temporary_bytes = 0;      // the switch aggregates, at their peak block
+    std::uint64_t per_thread_bytes = 0;     // ONE forward reduction buffer
+    std::uint64_t threads = 1;
+    std::uint64_t total_bytes = 0;          // payload + container + temporary + threads * buffer
+};
+
+// `threads` sizes the forward pass's per-thread reduction buffers -- the forward direction is the
+// contended one. The adjoint partitions by source and needs none, so it adds nothing here.
+HigherOrderPlan plan_higher_order(const HybridChain& chain, std::size_t threads);
+
+// Every message and adjoint, keyed by the packed state, sorted. FIXTURES ONLY -- it is the whole
+// message, so asking for it at real scale would cost more than the inference.
+struct HigherOrderTrace {
+    std::vector<std::vector<std::pair<std::uint64_t, double>>> messages;
+    std::vector<std::vector<std::pair<std::uint64_t, double>>> adjoints;
+};
+
+HybridPosterior hybrid_higher_order(const HybridChain& chain,
+                                    std::uint64_t max_message_entries,
+                                    HigherOrderStats* stats,
+                                    HigherOrderTrace* trace = nullptr);
+
+// THE DENSE ORACLE -- FIXTURES ONLY, NEVER A PRODUCTION PATH.
+//
+// It enumerates every (new template 1, new template 2) pair per source, which is O(entering x
+// n_hap^2): correct, and four orders of magnitude too expensive at a real locus. It exists so the
+// factorised recurrence can be compared against a version whose transition makes no use of
+// T = (1-r)I + (r/n)11^T, and it is deliberately NOT reachable from any command-line path.
+HybridPosterior hybrid_higher_order_dense_oracle(const HybridChain& chain,
+                                                 std::uint64_t max_message_entries,
+                                                 HigherOrderStats* stats,
+                                                 HigherOrderTrace* trace = nullptr);
 
 // `max_configs` bounds the dense table; 0 means the default. Exceeding it is a REFUSAL.
 // ---------------------------------------------------------------------------------------------
