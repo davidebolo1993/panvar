@@ -8,6 +8,7 @@ Documentation for the `panvar` CLI.
 | **[algorithms/](algorithms/)** | how each module works and how its options change the result. |
 | **[walkthrough.md](walkthrough.md)** | the whole pipeline on one real locus, step by step with commands and plots. |
 | **[gwas.md](gwas.md)** | the association worked example on that locus: phenotype, multiple-testing correction, structure control. |
+| **[describe_formats.md](describe_formats.md)** | reader's guide to every file `describe` writes, with an example of each. |
 | **[references.md](references.md)** | tools and papers behind each module. |
 
 ## Pipeline
