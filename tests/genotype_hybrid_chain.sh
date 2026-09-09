@@ -617,6 +617,34 @@ else
   bad "the derived-flank fixture produced no geometry probe"
 fi
 # ---------------------------------------------------------------------------------------------
+# GATE 29d: THE K-BLOCK INTERVAL EMISSION. C4 needs factors over three and four variable blocks,
+# because Wide fragments read three at once and no pairwise edge can consume them. The symbolic
+# path -- which keeps allele constraints unexpanded until the mate join has narrowed them -- must
+# equal an exhaustive oracle PER CELL and PER ORIGIN, not in totals: totals agree whenever two
+# errors cancel, and origin identity is what distinguishes one repeat copy from another with the
+# same statistics. The seed index's completeness predicate is validated by an exhaustive
+# seed-start coverage oracle rather than by one inequality per shape.
+#
+# WHAT THIS GATE DOES NOT YET ESTABLISH: FIXTURE EQUALITY IS PROVED, JOIN MINIMALITY IS NOT. Of
+# eleven mutation checks the join arithmetic needs, two are caught (ignoring an allele conflict,
+# dropping the first library orientation) and nine are outstanding: five survive on FIXTURE GAPS --
+# no fragment whose mates straddle a FREE intermediate block, no state sitting exactly on an insert
+# bound, none planted in the second orientation -- two are unwritten (collapsing distinct origins
+# with equal statistics, failing to deduplicate one origin found by several pieces), and two are
+# permanent regressions for defects found here and not yet pinned (removing the long-context
+# completeness check, restoring the allele-only verify_run window that lost 36 cells). A surviving
+# mutation is evidence of a missing fixture, never of correctness.
+
+if "$BIN" genotype-frag -i /dev/null -b none -o "$OUT/iv" --interval-selftest \
+     > "$OUT/interval.txt" 2>/dev/null; then
+  while IFS=$'\t' read -r v m; do
+    [ "$v" = ok ] && ok "$m" || { [ -n "${m:-}" ] && bad "$m"; }
+  done < <(grep -E '^(ok|FAIL)\t' "$OUT/interval.txt")
+else
+  bad "interval emission selftest reported failures"
+  sed -n 's/^FAIL\t/  /p' "$OUT/interval.txt"
+fi
+
 # GATE 29c: EXACT SIGNATURE GROUPING -- member-weighted HMM equivalence, not just factor values.
 # Two allele pairs may share a linkage contribution only when the whole vector of per-fragment
 # structural signatures agrees. This checks that the grouped representation reproduces the

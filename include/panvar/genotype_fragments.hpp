@@ -1750,6 +1750,92 @@ IntervalGeometry build_interval_geometry(const std::vector<CandidateFrame>& fram
                                          const std::vector<std::uint32_t>& blocks,
                                          std::size_t flank_bp, const InsertPrior& ip);
 
+// ---- THE K-BLOCK SEED INDEX ------------------------------------------------------------------
+//
+// With no invariant flank or context -- which is the C4 case for both higher-order factors -- every
+// seed lands inside a variable allele, so every proposed start is offset by the sum of ALL
+// preceding allele lengths. Expanding that into concrete allele tuples at the seed hit would
+// rebuild the dense product before the mate join has a chance to constrain it, so a hit is kept
+// SYMBOLIC: it names one block and one allele, and leaves every other dimension free.
+struct IntervalSeedHit {
+    std::uint32_t block = 0;     // index into IntervalGeometry::blocks
+    std::uint32_t allele = 0;    // the allele this hit constrains at that block
+    std::uint32_t offset = 0;    // offset within that allele's own sequence
+    // A hit that straddles the boundary into the NEXT block also constrains that one; kNoAllele
+    // when it does not.
+    std::uint32_t next_allele = 0;
+    bool spans_boundary = false;
+};
+
+struct IntervalSeedIndex {
+    std::size_t piece = 0;
+    bool ok = false;
+    // COMPLETENESS. A seed spans three alleles exactly when some allele lies entirely inside it,
+    // which with empty contexts means |A_j| <= piece - 2. The two-boundary shapes below are indexed;
+    // a THREE-boundary shape is not, so where an allele is short enough to permit one the index
+    // says so and the caller refuses or falls back under its work budget rather than silently
+    // missing placements. This is a predicate about the locus, never an assumption about it.
+    bool complete = false;
+    std::size_t shortest_allele = 0;
+    std::uint32_t shortest_at_block = 0;
+    std::size_t longest_context = 0;
+    // Inside one allele: piece code -> hits at (block, allele, offset).
+    std::unordered_map<std::uint64_t, std::vector<IntervalSeedHit>> inside;
+    // Across one boundary: the suffix of block j's allele followed by the prefix of block j+1's,
+    // which retains the CORRELATION between the two -- flattening them into independent
+    // constraints is what loses the phase information the factor exists to measure.
+    std::unordered_map<std::uint64_t, std::vector<IntervalSeedHit>> boundary;
+};
+
+IntervalSeedIndex build_interval_seed_index(const IntervalGeometry& geom, std::size_t piece);
+
+// One fragment's emission over a k-block interval factor.
+struct IntervalEmission {
+    std::size_t cells = 0;
+    std::vector<double> mass;                  // per cell, row-major over the allele product
+    std::vector<std::uint32_t> cell_states;    // how many verified states built each cell
+    std::vector<std::string> cell_signature;   // structural signature, when asked for
+    // CANONICAL ORIGIN DESCRIPTORS per cell: both mate starts and strands, and the insert. The
+    // signature multiset above is what DETERMINES the mass and is the right key for grouping, but
+    // it cannot tell one repeat origin from another with identical statistics -- so an oracle
+    // comparison that used it alone would accept a path that swapped two origins. This is what the
+    // comparison actually needs, and it is what makes "collapse distinct origins" a real mutation.
+    std::vector<std::string> cell_origin;
+    double log_p_bg = 0.0;
+    bool ok = false;
+    bool work_refused = false;
+    std::string refusal;
+    // Measured work, so "the join constrains the product" is a counter and not a hope.
+    std::size_t seed_hits = 0;             // index lookups that matched
+    std::size_t symbolic_states = 0;       // seed hits kept with free dimensions unexpanded
+    std::size_t joined_pairs = 0;          // mate pairs whose allele constraints are compatible
+    std::size_t tuple_expansions = 0;      // concrete assignments the join actually enumerated
+    std::size_t full_read_verifications = 0;
+    std::size_t accepted_placements = 0;
+    std::size_t verified_fr_states = 0;
+    std::size_t finite_cells = 0;
+};
+
+// THE REFERENCE: every cell, window materialised, every start scanned. Correct by construction and
+// far too slow for production -- which is the point. The fast path is certified against it.
+IntervalEmission interval_emission_oracle(const Fragment& fragment, const IntervalGeometry& geom,
+                                          const InsertPrior& ip, double max_divergence,
+                                          double log_eps, double log_1meps, double log_p_bg,
+                                          bool want_signatures = false, bool want_origins = false);
+
+struct HybridWorkBudget;   // defined below; only a pointer is needed here
+
+// THE FAST PATH. Constraints stay symbolic until the mate join has had its chance to narrow them:
+// a seed names one block's allele and leaves the rest free, the read is verified over only the
+// blocks it actually overlaps, and the insert is computed from only the blocks lying BETWEEN the
+// two mates. Expanding wildcards at the seed hit would rebuild the dense product first.
+IntervalEmission interval_emission(const Fragment& fragment, const IntervalGeometry& geom,
+                                   const InsertPrior& ip, double max_divergence,
+                                   double log_eps, double log_1meps, double log_p_bg,
+                                   const IntervalSeedIndex* index,
+                                   HybridWorkBudget* budget = nullptr,
+                                   bool want_signatures = false, bool want_origins = false);
+
 // THE SIGNATURE MATRIX: which allele pairs the fragments on ONE edge cannot tell apart.
 //
 // IT IS A FACTOR-EVALUATION DEVICE AND NEVER A STATE REDUCTION. A row class says the fragments

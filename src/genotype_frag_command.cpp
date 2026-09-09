@@ -344,6 +344,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     bool coordinate_selftest = false;
     bool budget_selftest = false;
     bool grouping_selftest = false;
+    bool interval_selftest = false;
     bool completeness_selftest = false;
     bool activation_selftest = false;
     std::vector<std::string> reconcile_scope;
@@ -402,6 +403,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--coordinate-selftest") coordinate_selftest = true;
         else if (a == "--budget-selftest") budget_selftest = true;
         else if (a == "--grouping-selftest") grouping_selftest = true;
+        else if (a == "--interval-selftest") interval_selftest = true;
         else if (a == "--completeness-selftest") completeness_selftest = true;
         else if (a == "--activation-selftest") activation_selftest = true;
         else if (a == "--scope-tol") {
@@ -666,7 +668,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         spell_pair.empty() && ref_block.empty() && ref_block_pair.empty() &&
         origin_universe.empty() && reconcile_scope.empty() && !linkage_selftest &&
         !hybrid_oracle && !mapping_selftest && !completeness_selftest && !activation_selftest &&
-        !support_selftest && !coordinate_selftest && !budget_selftest && !grouping_selftest) {
+        !support_selftest && !coordinate_selftest && !budget_selftest && !grouping_selftest &&
+        !interval_selftest) {
         throw std::runtime_error("genotype-frag requires at least one --reads");
     }
     if (!bubble_prefix_in.empty()) {
@@ -699,6 +702,265 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     ParseGfaOptions parse_options;
     parse_options.include_paths = true;
     parse_options.include_sequences = true;
+    // ---- K-BLOCK INTERVAL EMISSION SELF-TEST ----------------------------------------------------
+    // The symbolic path must equal the exhaustive oracle PER CELL AND PER STATE, not in totals.
+    // Totals agree whenever two errors cancel, and the specific error this guards against --
+    // one state expanded into the same cell twice by overlapping symbolic coverage -- is exactly
+    // the kind that leaves totals intact while corrupting multiplicity.
+    if (interval_selftest) {
+        std::size_t fails = 0;
+        const auto ok_ = [&](bool c, const std::string& w) {
+            std::printf("%s\t%s\n", c ? "ok" : "FAIL", w.c_str());
+            if (!c) ++fails;
+        };
+        const auto sci = [](double x) {
+            char b[32]; std::snprintf(b, sizeof b, "%.3e", x); return std::string(b);
+        };
+        std::mt19937_64 rng(20260909);
+        const auto rseq = [&](std::size_t n) {
+            static const char* B = "ACGT";
+            std::string t(n, 'A');
+            for (std::size_t i = 0; i < n; ++i) t[i] = B[rng() & 3];
+            return t;
+        };
+        const auto sub = [](std::string x, std::size_t at, char c) {
+            x[at] = (x[at] == c) ? (c == 'A' ? 'C' : 'A') : c; return x;
+        };
+        // THREE variable blocks with substitution alleles, long enough that no allele can sit
+        // wholly inside a seed -- the completeness predicate must hold, and is asserted.
+        IntervalGeometry G;
+        G.blocks = {0, 1, 2};
+        const std::string A0 = rseq(180), B0 = rseq(160), C0 = rseq(200);
+        G.alleles = {{A0, sub(A0, 90, 'G')},
+                     {B0, sub(B0, 80, 'T'), sub(B0, 81, 'C')},
+                     {C0, sub(C0, 100, 'G')}};
+        // CONTEXTS SHORTER THAN A PIECE, so no seed can sit wholly inside one. At 40 and 35
+        // against a 16 bp piece the index was incomplete and did not say so; the geometry passed
+        // only because some allele piece always happened to match too.
+        G.contexts = {rseq(12), rseq(10)};
+        G.lflank = ""; G.rflank = "";
+        G.ok = true; G.exposure_affine = true;
+        const std::size_t NC = G.cells();
+        InsertPrior ip; ip.lo = 150; ip.hi = 700;
+        ip.logp.assign(static_cast<std::size_t>(ip.hi - ip.lo + 1),
+                       -std::log(static_cast<double>(ip.hi - ip.lo + 1)));
+        const double lep = std::log(0.001 / 3.0), l1m = std::log(1.0 - 0.001);
+        const auto ix = build_interval_seed_index(G, 16);
+        ok_(ix.ok && ix.complete,
+            "the seed index is COMPLETE: shortest allele " +
+            std::to_string(ix.shortest_allele) + " >= piece - 1, longest context " +
+            std::to_string(ix.longest_context) + " < piece");
+        {
+            IntervalGeometry LC = G;
+            LC.contexts[0] = rseq(40);   // long enough to hold a whole seed
+            const auto lx = build_interval_seed_index(LC, 16);
+            ok_(lx.ok && !lx.complete,
+                "a context at least as long as a piece makes the index INCOMPLETE (" +
+                std::to_string(lx.longest_context) + " >= 16) -- a seed could sit wholly inside it");
+        }
+        // ---- SEED-START COVERAGE ORACLE ---------------------------------------------------
+        // The completeness predicate is a claim about EVERY seed shape, so it is validated as a
+        // whole rather than by accumulating one inequality per shape I happened to think of: for
+        // every haploid cell and every possible seed start, either the index carries a hit that
+        // reproduces that exact window position, or complete is false. Shapes I never enumerated --
+        // allele into context, context into allele, allele across a short context into the next
+        // allele, and anything touching a flank -- are covered by construction.
+        {
+            const auto prefix_at = [&](const std::vector<std::uint32_t>& cc, std::size_t b) {
+                std::size_t pfx = G.lflank.size();
+                for (std::size_t j = 0; j < b; ++j)
+                    pfx += G.alleles[j][cc[j]].size() + (j + 1 < G.alleles.size()
+                                                             ? G.contexts[j].size() : 0);
+                return pfx;
+            };
+            const auto coverage = [&](const IntervalGeometry& GG, const IntervalSeedIndex& XX,
+                                      std::size_t* uncovered, std::size_t* checked) {
+                *uncovered = 0; *checked = 0;
+                std::vector<std::uint32_t> cc;
+                for (std::size_t c = 0; c < GG.cells(); ++c) {
+                    GG.cell_choice(c, cc);
+                    std::vector<const std::string*> alle, ctxp;
+                    for (std::size_t j = 0; j < GG.alleles.size(); ++j)
+                        alle.push_back(&GG.alleles[j][cc[j]]);
+                    for (const std::string& cx : GG.contexts) ctxp.push_back(&cx);
+                    VirtualWindow vw;
+                    vw.bind_chain(GG.lflank, alle, ctxp, GG.rflank);
+                    const std::string W = vw.materialize();
+                    for (std::size_t at = 0; at + XX.piece <= W.size(); ++at) {
+                        ++(*checked);
+                        std::uint64_t code = 0;
+                        bool enc = true;
+                        code = 0;
+                        for (std::size_t q = 0; q < XX.piece && enc; ++q) {
+                            const char ch = W[at + q];
+                            const int v = ch == 'A' ? 0 : ch == 'C' ? 1 : ch == 'G' ? 2
+                                        : ch == 'T' ? 3 : -1;
+                            if (v < 0) enc = false; else code = (code << 2) | std::uint64_t(v);
+                        }
+                        if (!enc) continue;
+                        bool cov = false;
+                        for (int pass = 0; pass < 2 && !cov; ++pass) {
+                            const auto& mp = pass == 0 ? XX.inside : XX.boundary;
+                            const auto it = mp.find(code);
+                            if (it == mp.end()) continue;
+                            for (const IntervalSeedHit& h : it->second) {
+                                if (cc[h.block] != h.allele) continue;
+                                if (h.spans_boundary && h.block + 1 < cc.size() &&
+                                    cc[h.block + 1] != h.next_allele) continue;
+                                if (prefix_at(cc, h.block) + h.offset == at) { cov = true; break; }
+                            }
+                        }
+                        if (!cov) ++(*uncovered);
+                    }
+                }
+            };
+            std::size_t unc = 0, chk = 0;
+            coverage(G, ix, &unc, &chk);
+            ok_(unc == 0 && chk > 0,
+                "SEED-START COVERAGE: every one of " + std::to_string(chk) +
+                " seed starts over every cell is represented by the index (" +
+                std::to_string(unc) + " uncovered)");
+            // And the predicate must be HONEST in the other direction: a geometry it calls
+            // incomplete really does have uncovered starts.
+            IntervalGeometry LG = G;
+            LG.contexts[0] = rseq(40);
+            const auto lx = build_interval_seed_index(LG, 16);
+            std::size_t unc2 = 0, chk2 = 0;
+            coverage(LG, lx, &unc2, &chk2);
+            ok_(!lx.complete && unc2 > 0,
+                "a geometry the predicate calls INCOMPLETE genuinely has " +
+                std::to_string(unc2) + " uncovered seed starts -- the predicate is not merely "
+                "conservative here");
+        }
+
+        // Fragments planted across every segment and boundary of a chosen cell.
+        std::vector<Fragment> frags;
+        std::vector<std::uint32_t> ch;
+        for (std::size_t c : {std::size_t(0), std::size_t(5), std::size_t(11)}) {
+            G.cell_choice(c, ch);
+            std::vector<const std::string*> alle, ctxp;
+            for (std::size_t j = 0; j < 3; ++j) alle.push_back(&G.alleles[j][ch[j]]);
+            for (const std::string& cx : G.contexts) ctxp.push_back(&cx);
+            VirtualWindow vw;
+            vw.bind_chain(G.lflank, alle, ctxp, G.rflank);
+            const std::size_t wl = vw.size();
+            // READ LENGTH IS NOT FREE: the band is floor(0.05 * len) + 1 and the piece is
+            // len / (band + 1), so 150 bp gives piece 16 and matches the index. At 100 bp the
+            // piece is 14, the symbolic path refuses on a piece mismatch, and every comparison is
+            // silently skipped -- which is how the first version of this fixture "passed" three
+            // assertions while scoring nothing at all.
+            for (std::size_t st : {std::size_t(5), std::size_t(120), std::size_t(190),
+                                   std::size_t(240), std::size_t(260)}) {
+                if (st + 350 > wl) continue;
+                Fragment f;
+                f.name = "c" + std::to_string(c) + "_" + std::to_string(st);
+                for (std::size_t i = 0; i < 150; ++i) f.r1.push_back(vw.base_at(st + i));
+                std::string tail;
+                for (std::size_t i = 0; i < 150; ++i) tail.push_back(vw.base_at(st + 200 + i));
+                f.r2 = reverse_complement(tail);
+                frags.push_back(f);
+            }
+        }
+        ok_(frags.size() >= 9, "the fixture plants " + std::to_string(frags.size()) +
+                               " fragments across segments and boundaries");
+        std::size_t cells_differ = 0, mult_differ = 0, sig_differ = 0, org_differ = 0;
+        std::size_t fin_o = 0, fin_s = 0;
+        double worst = 0.0;
+        std::size_t tot_states_o = 0, tot_states_s = 0;
+        std::size_t sym_states = 0, expansions = 0, joins = 0;
+        for (const Fragment& f : frags) {
+            const double bgf = -400.0;
+            const IntervalEmission O = interval_emission_oracle(f, G, ip, 0.05, lep, l1m, bgf,
+                                                                true, true);
+            const IntervalEmission S = interval_emission(f, G, ip, 0.05, lep, l1m, bgf, &ix,
+                                                         nullptr, true, true);
+            // A REFUSAL IS A FAILURE HERE, not a skip: skipping is what made the comparison
+            // vacuous, because the loop below never ran and every per-cell assertion passed on an
+            // empty set.
+            if (!O.ok || !S.ok) {
+                ++cells_differ;
+                std::printf("FAIL\tinterval emission refused on %s: oracle_ok=%d fast_ok=%d %s\n",
+                            f.name.c_str(), O.ok ? 1 : 0, S.ok ? 1 : 0, S.refusal.c_str());
+                ++fails;
+                continue;
+            }
+            // THESE COUNT DIFFERENT THINGS. The oracle visits every cell, so its
+            // verified_fr_states is a count of state-CELL writes; the symbolic path counts JOINED
+            // states before expansion, each covering many cells. Comparing them directly is a
+            // category error -- the comparable quantity is the total cell-state writes, which is
+            // the sum of cell_states on both sides.
+            for (std::size_t c = 0; c < NC; ++c) {
+                tot_states_o += O.cell_states[c];
+                tot_states_s += S.cell_states[c];
+            }
+            sym_states += S.verified_fr_states;
+            expansions += S.tuple_expansions;
+            joins += S.joined_pairs;
+            for (std::size_t c = 0; c < NC; ++c) {
+                const bool fo = O.mass[c] != -std::numeric_limits<double>::infinity();
+                const bool fsx = S.mass[c] != -std::numeric_limits<double>::infinity();
+                if (fo) ++fin_o;
+                if (fsx) ++fin_s;
+                if (fo != fsx) {
+                    ++cells_differ;
+                    if (cells_differ <= 3) {
+                        std::vector<std::uint32_t> dc;
+                        G.cell_choice(c, dc);
+                        std::printf("....\tdiff %s cell %zu (%u,%u,%u): oracle=%s fast=%s "
+                                    "oracle_states=%u fast_states=%u\n",
+                                    f.name.c_str(), c, dc[0], dc[1], dc[2],
+                                    fo ? "finite" : "-inf", fsx ? "finite" : "-inf",
+                                    O.cell_states[c], S.cell_states[c]);
+                    }
+                    continue;
+                }
+                if (O.cell_states[c] != S.cell_states[c]) ++mult_differ;
+                if (O.cell_signature[c] != S.cell_signature[c]) ++sig_differ;
+                if (O.cell_origin[c] != S.cell_origin[c]) ++org_differ;
+                if (fo) worst = std::max(worst, std::abs(O.mass[c] - S.mass[c]));
+            }
+        }
+        ok_(cells_differ == 0, "the same cells are finite in both paths (" +
+                               std::to_string(cells_differ) + " differ)");
+        ok_(mult_differ == 0, "state MULTIPLICITY is identical per cell (" +
+                              std::to_string(mult_differ) + " differ)");
+        ok_(sig_differ == 0, "the structural signature MULTISET is identical per cell (" +
+                             std::to_string(sig_differ) + " differ)");
+        // THE STRONGER COMPARISON: full origin identity -- both mate starts, both strands and the
+        // insert. Equal signatures cannot tell one repeat origin from another with the same
+        // statistics, so this is what makes the origin-collapse mutation meaningful.
+        ok_(org_differ == 0, "the canonical ORIGIN multiset is identical per cell -- both mate "
+                             "starts, strands and insert (" + std::to_string(org_differ) +
+                             " differ)");
+        ok_(worst == 0.0, "log mass is identical per cell (worst " + sci(worst) +
+                          ", tolerance 0.000e+00)");
+        ok_(fin_o > 0 && fin_s == fin_o,
+            "the fixture is NON-VACUOUS: " + std::to_string(fin_o) + " finite cells in the oracle");
+        ok_(tot_states_o > 0 && tot_states_o == tot_states_s,
+            "total cell-state WRITES agree (" + std::to_string(tot_states_o) + ")");
+        ok_(sym_states > 0 && sym_states <= tot_states_s,
+            "the symbolic path forms " + std::to_string(sym_states) +
+            " joined states covering " + std::to_string(tot_states_s) +
+            " cell writes -- free dimensions are never enumerated at the seed");
+        std::printf("....\t%zu mate joins considered, %zu intervening-length tuples\n",
+                    joins, expansions);
+        // A SHORT ALLELE must trip the completeness predicate, not be scored incompletely.
+        {
+            IntervalGeometry H = G;
+            H.alleles[1].push_back(rseq(8));   // shorter than piece - 1
+            const auto hx = build_interval_seed_index(H, 16);
+            ok_(hx.ok && !hx.complete,
+                "an allele shorter than piece - 1 makes the index INCOMPLETE (shortest " +
+                std::to_string(hx.shortest_allele) + ")");
+            const IntervalEmission R = interval_emission(frags[0], H, ip, 0.05, lep, l1m, -400.0,
+                                                         &hx, nullptr, false);
+            ok_(R.work_refused && R.refusal == "interval-seed-index-incomplete",
+                "and the emission REFUSES on it rather than scoring incompletely");
+        }
+        std::printf("interval selftest: %zu failure(s)\n", fails);
+        return fails == 0 ? 0 : 1;
+    }
+
     // ---- EXACT SIGNATURE GROUPING SELF-TEST -----------------------------------------------------
     // Equality of distinct pattern SETS is equality of vocabulary, not of the factor application. A
     // set comparison discards how many content classes realise each pattern, which alleles realise

@@ -4916,6 +4916,481 @@ IntervalGeometry build_interval_geometry(const std::vector<CandidateFrame>& fram
     return G;
 }
 
+namespace {
+
+// One verified placement of one mate: the alleles it pins, where it starts inside the FIRST block
+// it touches, and its edit count. Blocks outside [first, last] are untouched and stay free.
+struct IntervalPlacement {
+    std::uint32_t first_block = 0, last_block = 0;
+    std::vector<std::uint32_t> alleles;   // one per block in [first_block, last_block]
+    long offset_in_first = 0;             // may be 0..|A_first|-1
+    std::uint32_t edits = 0;
+};
+
+}  // namespace
+
+IntervalEmission interval_emission(const Fragment& fragment, const IntervalGeometry& geom,
+                                   const InsertPrior& ip, double max_divergence,
+                                   double log_eps, double log_1meps, double log_p_bg,
+                                   const IntervalSeedIndex* index, HybridWorkBudget* budget,
+                                   bool want_signatures, bool want_origins) {
+    IntervalEmission out;
+    out.log_p_bg = log_p_bg;
+    if (!geom.ok || fragment.r1.empty() || fragment.r2.empty()) return out;
+    out.cells = geom.cells();
+    out.mass.assign(out.cells, kNegInf);
+    out.cell_states.assign(out.cells, 0);
+    const std::size_t k = geom.alleles.size();
+    const auto refuse = [&](const char* why) {
+        out.mass.assign(out.cells, kNegInf);
+        out.cell_states.assign(out.cells, 0);
+        out.cell_signature.clear();
+        out.work_refused = true;
+        out.refusal = why;
+        out.ok = false;
+        return out;
+    };
+    // AN INCOMPLETE INDEX CANNOT BE VERIFIED AGAINST. A seed shape it cannot reach is a placement
+    // this path would never test, and a silently missing placement is wrong mass -- so it refuses
+    // and the caller falls back or declines under its own budget.
+    if (index == nullptr || !index->ok) return refuse("interval-seed-index-missing");
+    if (!index->complete) return refuse("interval-seed-index-incomplete");
+    const std::size_t p = index->piece;
+    const std::size_t d1 = mate_band_edits(max_divergence, fragment.r1.size());
+    const std::size_t d2 = mate_band_edits(max_divergence, fragment.r2.size());
+    const std::string rc1 = reverse_complement(fragment.r1), rc2 = reverse_complement(fragment.r2);
+    const std::string* mv[4] = {&fragment.r1, &rc1, &fragment.r2, &rc2};
+    const std::size_t bd[4] = {d1, d1, d2, d2};
+    for (int m = 0; m < 4; ++m) {
+        if (!acgt_only(*mv[m])) return refuse("non-acgt-read");
+        if (mv[m]->size() / (bd[m] + 1) != p) return refuse("piece-length-mismatch");
+    }
+    for (const std::string& c : geom.contexts)
+        if (!acgt_only(c)) return refuse("non-acgt-context");
+
+    // Segment length helper: block j's allele plus the context that follows it.
+    const auto seg = [&](std::size_t j, std::uint32_t a) {
+        return geom.alleles[j][a].size() + (j + 1 < k ? geom.contexts[j].size() : 0);
+    };
+    // Verify one read over a concrete run of blocks, through the shared window walk.
+    const auto verify_run = [&](const std::string& read, std::size_t first,
+                                const std::vector<std::uint32_t>& al, long off,
+                                std::size_t cap, std::size_t* edits) {
+        // THE TRAILING CONTEXT BELONGS TO THE WINDOW. seg(j) counts block j's allele PLUS the
+        // context that follows it, so a run's span includes that context -- and a read reaching
+        // into it was being verified against a window that stopped at the allele, failing to fit
+        // and vanishing. The span and the window must be built from the same definition.
+        std::vector<const std::string*> alle, ctxp;
+        for (std::size_t j = 0; j < al.size(); ++j) {
+            alle.push_back(&geom.alleles[first + j][al[j]]);
+            if (j + 1 < al.size()) ctxp.push_back(&geom.contexts[first + j]);
+        }
+        static const std::string kEmpty;
+        const std::size_t last = first + al.size() - 1;
+        const std::string& trail = last + 1 < k ? geom.contexts[last] : geom.rflank;
+        VirtualWindow vw;
+        vw.bind_chain(kEmpty, alle, ctxp, trail);
+        const std::size_t mm = vw.count_mismatches(read, off, cap);
+        if (mm > cap) return false;
+        *edits = mm;
+        return true;
+    };
+    // From a seed anchor, enumerate the concrete allele runs that cover the read, expanding left
+    // while the start is negative and right while the read is not yet covered. Only the blocks the
+    // read TOUCHES are enumerated; every other dimension stays free.
+    std::vector<IntervalPlacement> place[4];
+    for (int m = 0; m < 4; ++m) {
+        const std::string& read = *mv[m];
+        const std::size_t cap = bd[m];
+        std::vector<std::pair<std::size_t, IntervalSeedHit>> hits;
+        for (std::size_t q = 0; q <= cap; ++q) {
+            if (q * p + p > read.size()) break;
+            std::uint64_t code = 0;
+            if (!encode_piece(read, q * p, p, code)) return refuse("non-acgt-seed");
+            const auto ii = index->inside.find(code);
+            if (ii != index->inside.end())
+                for (const IntervalSeedHit& h : ii->second) hits.emplace_back(q, h);
+            const auto ib = index->boundary.find(code);
+            if (ib != index->boundary.end())
+                for (const IntervalSeedHit& h : ib->second) hits.emplace_back(q, h);
+        }
+        out.seed_hits += hits.size();
+        out.symbolic_states += hits.size();
+        for (const auto& hq : hits) {
+            const std::size_t q = hq.first;
+            const IntervalSeedHit& h = hq.second;
+            // Start of the read relative to the anchor block's own beginning.
+            long s = static_cast<long>(h.offset) - static_cast<long>(q * p);
+            std::size_t first = h.block;
+            std::vector<std::uint32_t> al{h.allele};
+            if (h.spans_boundary) al.push_back(h.next_allele);
+            // Expand LEFT while the read starts before this block.
+            std::function<void(std::size_t, std::vector<std::uint32_t>&, long)> grow_left =
+                [&](std::size_t fb, std::vector<std::uint32_t>& acc, long soff) {
+                    if (soff >= 0 || fb == 0) {
+                        // Expand RIGHT until the read is covered, then verify.
+                        std::function<void(std::vector<std::uint32_t>&)> grow_right =
+                            [&](std::vector<std::uint32_t>& run) {
+                                std::size_t span = 0;
+                                for (std::size_t j = 0; j < run.size(); ++j)
+                                    span += seg(fb + j, run[j]);
+                                const long need = soff + static_cast<long>(read.size());
+                                if (need > static_cast<long>(span) && fb + run.size() < k) {
+                                    for (std::uint32_t a2 = 0;
+                                         a2 < geom.alleles[fb + run.size()].size(); ++a2) {
+                                        run.push_back(a2);
+                                        ++out.tuple_expansions;
+                                        grow_right(run);
+                                        run.pop_back();
+                                    }
+                                    return;
+                                }
+                                if (soff < 0 || need > static_cast<long>(span)) return;
+                                if (budget != nullptr &&
+                                    !budget->charge_verification(read.size(),
+                                                                 "interval-verification-limit")) {
+                                    return;
+                                }
+                                ++out.full_read_verifications;
+                                std::size_t e = 0;
+                                if (!verify_run(read, fb, run, soff, cap, &e)) return;
+                                ++out.accepted_placements;
+                                IntervalPlacement pl;
+                                pl.first_block = static_cast<std::uint32_t>(fb);
+                                pl.last_block = static_cast<std::uint32_t>(fb + run.size() - 1);
+                                pl.alleles = run;
+                                pl.offset_in_first = soff;
+                                pl.edits = static_cast<std::uint32_t>(e);
+                                place[m].push_back(std::move(pl));
+                            };
+                        std::vector<std::uint32_t> run = acc;
+                        grow_right(run);
+                        return;
+                    }
+                    for (std::uint32_t a0 = 0; a0 < geom.alleles[fb - 1].size(); ++a0) {
+                        std::vector<std::uint32_t> acc2;
+                        acc2.push_back(a0);
+                        acc2.insert(acc2.end(), acc.begin(), acc.end());
+                        ++out.tuple_expansions;
+                        grow_left(fb - 1, acc2, soff + static_cast<long>(seg(fb - 1, a0)));
+                    }
+                };
+            grow_left(first, al, s);
+            if (out.work_refused) return out;
+        }
+        // Identical placements arise from different seeds; a repeat origin is a DIFFERENT start and
+        // must survive, so dedup is on the whole descriptor rather than on the cell.
+        auto& v = place[m];
+        std::sort(v.begin(), v.end(), [](const IntervalPlacement& x, const IntervalPlacement& y) {
+            return std::tie(x.first_block, x.last_block, x.alleles, x.offset_in_first, x.edits) <
+                   std::tie(y.first_block, y.last_block, y.alleles, y.offset_in_first, y.edits);
+        });
+        v.erase(std::unique(v.begin(), v.end(),
+                            [](const IntervalPlacement& x, const IntervalPlacement& y) {
+                                return x.first_block == y.first_block &&
+                                       x.last_block == y.last_block && x.alleles == y.alleles &&
+                                       x.offset_in_first == y.offset_in_first &&
+                                       x.edits == y.edits;
+                            }),
+                v.end());
+    }
+    // ---- THE MATE JOIN ------------------------------------------------------------------------
+    // Both FR predicates depend only on rev_end - fwd_start, so this works in RELATIVE coordinates
+    // and never needs an absolute prefix -- which is what lets the blocks before the fragment stay
+    // free. delta = rev_start - fwd_start = sum_{f0 <= j < g0} seg(j) + o2 - o1, signed by which
+    // mate sits first, and every intervening allele and context is counted exactly once.
+    std::vector<std::vector<std::array<std::uint32_t, 3>>> sigacc;
+    if (want_signatures) sigacc.assign(out.cells, {});
+    std::vector<std::vector<std::array<long, 5>>> orgacc;
+    if (want_origins) orgacc.assign(out.cells, {});
+    // Absolute start of a block, for THIS cell. The symbolic path never needs this to decide a
+    // state -- the FR predicate uses only the difference -- so it is computed solely to report the
+    // origin, and the comparison against the oracle stays non-circular on the join arithmetic.
+    const auto prefix_of = [&](const std::vector<std::uint32_t>& cc, std::size_t b) {
+        long pfx = static_cast<long>(geom.lflank.size());
+        for (std::size_t j = 0; j < b; ++j) pfx += static_cast<long>(seg(j, cc[j]));
+        return pfx;
+    };
+    const double half = std::log(0.5);
+    std::vector<int> pin(k, -1);
+    std::vector<std::uint32_t> cell(k, 0);
+    // Write one verified state into every cell its constraints cover: pinned dimensions are fixed,
+    // free ones range over everything, because the state holds for all of them.
+    const auto emit_state = [&](const std::vector<int>& pins, std::uint32_t e1, std::uint32_t e2,
+                                long insert, std::size_t fb_blk, long fb_off, std::size_t rb_blk,
+                                long rb_off, bool fwd_is_m1) {
+        std::vector<std::size_t> freed;
+        for (std::size_t j = 0; j < k; ++j) if (pins[j] < 0) freed.push_back(j);
+        std::vector<std::uint32_t> idx(freed.size(), 0);
+        const double e = half +
+            static_cast<double>(e1) * log_eps +
+            static_cast<double>(fragment.r1.size() - e1) * log_1meps +
+            static_cast<double>(e2) * log_eps +
+            static_cast<double>(fragment.r2.size() - e2) * log_1meps +
+            ip.log_at(insert);
+        bool done = false;
+        while (!done) {
+            for (std::size_t j = 0; j < k; ++j)
+                cell[j] = pins[j] >= 0 ? static_cast<std::uint32_t>(pins[j]) : 0;
+            for (std::size_t q = 0; q < freed.size(); ++q) cell[freed[q]] = idx[q];
+            const std::size_t ci = geom.cell_index(cell);
+            out.mass[ci] = log_add(out.mass[ci], e);
+            ++out.cell_states[ci];
+            if (want_signatures)
+                sigacc[ci].push_back({e1, e2, static_cast<std::uint32_t>(insert)});
+            if (want_origins) {
+                const long fs = prefix_of(cell, fb_blk) + fb_off;
+                const long rs = prefix_of(cell, rb_blk) + rb_off;
+                const long m1s = fwd_is_m1 ? fs : rs;
+                const long m2s = fwd_is_m1 ? rs : fs;
+                orgacc[ci].push_back({m1s, fwd_is_m1 ? 1L : 0L, m2s, fwd_is_m1 ? 0L : 1L, insert});
+            }
+            for (std::size_t q = 0; ; ++q) {
+                if (q == freed.size()) { done = true; break; }
+                if (++idx[q] < geom.alleles[freed[q]].size()) break;
+                idx[q] = 0;
+            }
+            if (freed.empty()) done = true;
+        }
+    };
+    const auto do_join = [&](int fi, int ri, bool fwd_is_m1) {
+        const std::size_t rev_len = fwd_is_m1 ? fragment.r2.size() : fragment.r1.size();
+        for (const IntervalPlacement& P : place[fi]) {
+            for (const IntervalPlacement& Q : place[ri]) {
+                ++out.joined_pairs;
+                // 1. INTERSECT the pinned constraints; a conflict is not a state.
+                std::fill(pin.begin(), pin.end(), -1);
+                bool conflict = false;
+                for (std::size_t j = 0; j < P.alleles.size(); ++j)
+                    pin[P.first_block + j] = static_cast<int>(P.alleles[j]);
+                for (std::size_t j = 0; j < Q.alleles.size() && !conflict; ++j) {
+                    const std::size_t b = Q.first_block + j;
+                    const int a = static_cast<int>(Q.alleles[j]);
+                    if (pin[b] >= 0 && pin[b] != a) conflict = true;
+                    else pin[b] = a;
+                }
+                if (conflict) continue;
+                // 2. Only the blocks BETWEEN the two mates affect the insert; unpinned ones there
+                //    are enumerated, and everything outside stays free.
+                const std::size_t lo_b = std::min(P.first_block, Q.first_block);
+                const std::size_t hi_b = std::max(P.first_block, Q.first_block);
+                const int sign = Q.first_block >= P.first_block ? 1 : -1;
+                std::vector<std::size_t> mid;
+                for (std::size_t j = lo_b; j < hi_b; ++j) if (pin[j] < 0) mid.push_back(j);
+                std::vector<std::uint32_t> mi(mid.size(), 0);
+                bool mdone = false;
+                while (!mdone) {
+                    std::vector<int> pins = pin;
+                    for (std::size_t q = 0; q < mid.size(); ++q)
+                        pins[mid[q]] = static_cast<int>(mi[q]);
+                    ++out.tuple_expansions;
+                    long dsum = 0;
+                    for (std::size_t j = lo_b; j < hi_b; ++j)
+                        dsum += static_cast<long>(seg(j, static_cast<std::uint32_t>(pins[j])));
+                    const long delta = sign * dsum + Q.offset_in_first - P.offset_in_first;
+                    // 3. THE SHARED RULE, in relative coordinates.
+                    if (valid_fr_coordinates(0, delta + static_cast<long>(rev_len) - 1,
+                                             ip.lo, ip.hi)) {
+                        ++out.verified_fr_states;
+                        emit_state(pins, fwd_is_m1 ? P.edits : Q.edits,
+                                   fwd_is_m1 ? Q.edits : P.edits,
+                                   delta + static_cast<long>(rev_len),
+                                   P.first_block, P.offset_in_first,
+                                   Q.first_block, Q.offset_in_first, fwd_is_m1);
+                    }
+                    for (std::size_t q = 0; ; ++q) {
+                        if (q == mid.size()) { mdone = true; break; }
+                        if (++mi[q] < geom.alleles[mid[q]].size()) break;
+                        mi[q] = 0;
+                    }
+                    if (mid.empty()) mdone = true;
+                }
+            }
+        }
+    };
+    do_join(0, 3, true);    // r1 forward with r2 reverse-complemented
+    do_join(2, 1, false);   // r2 forward with r1 reverse-complemented
+    for (double mm : out.mass) if (mm != kNegInf) ++out.finite_cells;
+    if (want_origins) {
+        out.cell_origin.assign(out.cells, std::string());
+        for (std::size_t c = 0; c < out.cells; ++c) {
+            std::sort(orgacc[c].begin(), orgacc[c].end());
+            std::string& b = out.cell_origin[c];
+            b.resize(orgacc[c].size() * 40);
+            for (std::size_t q = 0; q < orgacc[c].size(); ++q)
+                std::memcpy(&b[q * 40], orgacc[c][q].data(), 40);
+        }
+    }
+    if (want_signatures) {
+        out.cell_signature.assign(out.cells, std::string());
+        for (std::size_t c = 0; c < out.cells; ++c) {
+            std::sort(sigacc[c].begin(), sigacc[c].end());
+            std::string& b = out.cell_signature[c];
+            b.resize(sigacc[c].size() * 12);
+            for (std::size_t q = 0; q < sigacc[c].size(); ++q)
+                std::memcpy(&b[q * 12], sigacc[c][q].data(), 12);
+        }
+    }
+    out.ok = true;
+    return out;
+}
+
+IntervalEmission interval_emission_oracle(const Fragment& fragment, const IntervalGeometry& geom,
+                                          const InsertPrior& ip, double max_divergence,
+                                          double log_eps, double log_1meps, double log_p_bg,
+                                          bool want_signatures, bool want_origins) {
+    IntervalEmission out;
+    out.log_p_bg = log_p_bg;
+    if (!geom.ok || fragment.r1.empty() || fragment.r2.empty()) return out;
+    out.cells = geom.cells();
+    out.mass.assign(out.cells, kNegInf);
+    out.cell_states.assign(out.cells, 0);
+    if (want_signatures) out.cell_signature.assign(out.cells, std::string());
+    if (want_origins) out.cell_origin.assign(out.cells, std::string());
+    const std::size_t d1 = mate_band_edits(max_divergence, fragment.r1.size());
+    const std::size_t d2 = mate_band_edits(max_divergence, fragment.r2.size());
+    const std::string a1 = reverse_complement(fragment.r1);
+    const std::string a2 = reverse_complement(fragment.r2);
+    const double half = std::log(0.5);
+    std::vector<std::uint32_t> choice;
+    for (std::size_t c = 0; c < out.cells; ++c) {
+        geom.cell_choice(c, choice);
+        // THE SHARED WINDOW. Building the concatenation here by hand would be the second
+        // implementation the segment walk exists to prevent.
+        std::vector<const std::string*> alle, ctxp;
+        for (std::size_t j = 0; j < geom.alleles.size(); ++j)
+            alle.push_back(&geom.alleles[j][choice[j]]);
+        for (const std::string& cx : geom.contexts) ctxp.push_back(&cx);
+        VirtualWindow vw;
+        vw.bind_chain(geom.lflank, alle, ctxp, geom.rflank);
+        const std::string win = vw.materialize();
+        const auto f1 = bounded_mate_placements(fragment.r1, win, d1, nullptr, nullptr);
+        const auto v1 = bounded_mate_placements(a1, win, d1, nullptr, nullptr);
+        const auto f2 = bounded_mate_placements(fragment.r2, win, d2, nullptr, nullptr);
+        const auto v2 = bounded_mate_placements(a2, win, d2, nullptr, nullptr);
+        const auto st = enumerate_fragment_states(0, f1, v1, f2, v2, fragment.r1.size(),
+                                                  fragment.r2.size(), ip.lo, ip.hi);
+        out.cell_states[c] = static_cast<std::uint32_t>(st.size());
+        double m = kNegInf;
+        std::vector<std::array<std::uint32_t, 3>> sig;
+        for (const FragmentState& z : st) {
+            const double e1 = static_cast<double>(z.m1_edits) * log_eps +
+                              static_cast<double>(fragment.r1.size() - z.m1_edits) * log_1meps;
+            const double e2 = static_cast<double>(z.m2_edits) * log_eps +
+                              static_cast<double>(fragment.r2.size() - z.m2_edits) * log_1meps;
+            m = log_add(m, half + e1 + e2 + ip.log_at(z.insert));
+            if (want_signatures) {
+                sig.push_back({z.m1_edits, z.m2_edits, static_cast<std::uint32_t>(z.insert)});
+            }
+        }
+        if (want_origins) {
+            // The FULL origin, from the oracle's own absolute coordinates.
+            std::vector<std::array<long, 5>> og;
+            for (const FragmentState& z : st) {
+                og.push_back({z.m1_start, z.m1_fwd ? 1L : 0L, z.m2_start, z.m2_fwd ? 1L : 0L,
+                              z.insert});
+            }
+            std::sort(og.begin(), og.end());
+            std::string& b = out.cell_origin[c];
+            b.resize(og.size() * 40);
+            for (std::size_t q = 0; q < og.size(); ++q) std::memcpy(&b[q * 40], og[q].data(), 40);
+        }
+        out.mass[c] = m;
+        if (m != kNegInf) ++out.finite_cells;
+        out.verified_fr_states += st.size();
+        if (want_signatures) {
+            std::sort(sig.begin(), sig.end());
+            std::string& b = out.cell_signature[c];
+            b.resize(sig.size() * 12);
+            for (std::size_t q = 0; q < sig.size(); ++q) std::memcpy(&b[q * 12], sig[q].data(), 12);
+        }
+    }
+    out.ok = true;
+    return out;
+}
+
+IntervalSeedIndex build_interval_seed_index(const IntervalGeometry& geom, std::size_t piece) {
+    IntervalSeedIndex ix;
+    ix.piece = piece;
+    if (!geom.ok || piece == 0 || piece > 32) return ix;
+    const std::size_t k = geom.alleles.size();
+    // THE COMPLETENESS PREDICATE FIRST, so a locus that cannot be indexed completely is known
+    // before anything is built rather than after a placement has already been missed.
+    ix.shortest_allele = SIZE_MAX;
+    for (std::size_t j = 0; j < k; ++j) {
+        for (const std::string& a : geom.alleles[j]) {
+            if (a.size() < ix.shortest_allele) {
+                ix.shortest_allele = a.size();
+                ix.shortest_at_block = static_cast<std::uint32_t>(j);
+            }
+        }
+    }
+    if (ix.shortest_allele == SIZE_MAX) ix.shortest_allele = 0;
+    // An allele shorter than piece - 1 could sit wholly inside one seed, making a three-allele
+    // span reachable. Those shapes are not indexed, so the index is incomplete.
+    ix.complete = ix.shortest_allele + 1 >= piece;
+    // AND A CONTEXT AT LEAST AS LONG AS A PIECE can hold a seed WHOLLY INSIDE IT. Such a seed
+    // constrains no allele and is indexed nowhere here, so a read whose every matching piece falls
+    // in a context would be missed entirely -- pigeonhole guarantees a piece matches, not that the
+    // matching piece is one this index carries. C4's contexts are empty, so this never bites there;
+    // it is a predicate about the locus and the generic path must refuse rather than assume.
+    // Every INVARIANT segment, flanks included: they are indexed nowhere either, so a long flank
+    // hides the same gap as a long context.
+    ix.longest_context = 0;
+    for (const std::string& c : geom.contexts)
+        ix.longest_context = std::max(ix.longest_context, c.size());
+    ix.longest_context = std::max(ix.longest_context, geom.lflank.size());
+    ix.longest_context = std::max(ix.longest_context, geom.rflank.size());
+    if (ix.longest_context + 1 > piece) ix.complete = false;
+    for (std::size_t j = 0; j < k; ++j) {
+        for (std::uint32_t a = 0; a < geom.alleles[j].size(); ++a) {
+            const std::string& A = geom.alleles[j][a];
+            for (std::size_t at = 0; at + piece <= A.size(); ++at) {
+                std::uint64_t code = 0;
+                if (!encode_piece(A, at, piece, code)) continue;
+                IntervalSeedHit h;
+                h.block = static_cast<std::uint32_t>(j);
+                h.allele = a;
+                h.offset = static_cast<std::uint32_t>(at);
+                ix.inside[code].push_back(h);
+            }
+        }
+    }
+    // BOUNDARIES, one per adjacent pair, keeping the two alleles CORRELATED in a single hit.
+    for (std::size_t j = 0; j + 1 < k; ++j) {
+        const std::string& C = geom.contexts[j];
+        for (std::uint32_t a = 0; a < geom.alleles[j].size(); ++a) {
+            const std::string& A = geom.alleles[j][a];
+            const std::size_t ta = A.size() < piece - 1 ? A.size() : piece - 1;
+            const std::string tail = A.substr(A.size() - ta);
+            for (std::uint32_t b = 0; b < geom.alleles[j + 1].size(); ++b) {
+                const std::string& B = geom.alleles[j + 1][b];
+                const std::size_t hb = B.size() < piece - 1 ? B.size() : piece - 1;
+                const std::string joined = tail + C + B.substr(0, hb);
+                for (std::size_t at = 0; at + piece <= joined.size(); ++at) {
+                    // Only seeds that actually CROSS the boundary belong here; ones lying wholly
+                    // inside either allele are already in `inside`, and indexing them twice would
+                    // double their multiplicity.
+                    if (at + piece <= ta) continue;
+                    if (at >= ta + C.size()) continue;
+                    std::uint64_t code = 0;
+                    if (!encode_piece(joined, at, piece, code)) continue;
+                    IntervalSeedHit h;
+                    h.block = static_cast<std::uint32_t>(j);
+                    h.allele = a;
+                    // Offset back into block j's own coordinates: the tail began at |A| - ta.
+                    h.offset = static_cast<std::uint32_t>(A.size() - ta + at);
+                    h.next_allele = b;
+                    h.spans_boundary = true;
+                    ix.boundary[code].push_back(h);
+                }
+            }
+        }
+    }
+    ix.ok = true;
+    return ix;
+}
+
 SignatureMatrix build_signature_matrix(const std::vector<std::string>& cell_signatures,
                                        std::size_t n_a, std::size_t n_b, const char* model_tag) {
     SignatureMatrix M;
