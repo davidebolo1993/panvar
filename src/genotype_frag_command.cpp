@@ -897,6 +897,261 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                 "homologue-swap invariance holds on SYMMETRIC emissions (worst relative " +
                 sci(worst_sw) + ")");
         }
+        // ---- THE STRUCTURED CONTRACTION -------------------------------------------------------
+        // T = (1-r)I + (r/n)11^T. The STAY component leaves the template and the open run
+        // untouched; the SWITCH component closes the run -- appending the classes that run
+        // contributed, which follow from the template it held -- and redraws the template
+        // uniformly. Exact template identity is preserved for as long as a run is OPEN, which is
+        // what MH6 shows is required; only CLOSED runs are reduced to class history.
+        //
+        // THE OPERATION COUNTER counts MESSAGE-ENTRY UPDATES: one per accumulation into a state of
+        // the next message, each being a multiply and an add in linear space. It is not a count of
+        // floating-point instructions, and it is reported as such.
+        {
+            struct St { std::vector<std::uint32_t> h1, h2; std::size_t x; };
+            // clamp_b < 0 means "no clamp"; otherwise block clamp_b is restricted to state clamp_x,
+            // so the returned Z IS that block's unnormalised marginal. Marginals therefore come
+            // from the SAME contraction rather than from a second code path.
+            // Shared by both directions, so the two passes cannot disagree about state identity.
+            const auto keyof = [](const St& s2) {
+                std::string k;
+                for (std::uint32_t v : s2.h1) k.push_back(static_cast<char>('a' + v));
+                k.push_back('|');
+                for (std::uint32_t v : s2.h2) k.push_back(static_cast<char>('a' + v));
+                k.push_back('|');
+                k += std::to_string(s2.x);
+                return k;
+            };
+            std::uint64_t ops_tot = 0, peak_tot = 0;
+            const auto contract = [&](int clamp_b, std::size_t clamp_x) {
+            // Span 1 is blocks 1..4; span 2 is 3..5. Run the contraction over the WHOLE chain,
+            // closing each factor when its last block is passed.
+            std::map<std::string, std::pair<St, double>> msg;
+            {
+                for (std::size_t x = 0; x < NS; ++x) {
+                    if (clamp_b == 0 && x != clamp_x) continue;
+                    St s2; s2.x = x;
+                    msg[keyof(s2)] = {s2, U[0][x]};
+                }
+            }
+            std::uint64_t ops = 0, peak_entries = msg.size();
+            for (std::size_t b = 1; b < NB; ++b) {
+                std::map<std::string, std::pair<St, double>> nxt;
+                for (const auto& kv : msg) {
+                    const St& cur = kv.second.first;
+                    const double w = kv.second.second;
+                    const std::size_t t1 = cur.x / NH, t2 = cur.x % NH;
+                    // The four stay/switch combinations of the ordered diploid edge.
+                    for (int c1 = 0; c1 < 2; ++c1) {
+                        for (int c2 = 0; c2 < 2; ++c2) {
+                            const double w1 = (c1 == 0) ? (1.0 - r) : (r / double(NH));
+                            const double w2 = (c2 == 0) ? (1.0 - r) : (r / double(NH));
+                            if (w1 == 0.0 || w2 == 0.0) continue;
+                            // Which templates the new state can take.
+                            const std::size_t lo1 = (c1 == 0) ? t1 : 0;
+                            const std::size_t hi1 = (c1 == 0) ? t1 + 1 : NH;
+                            const std::size_t lo2 = (c2 == 0) ? t2 : 0;
+                            const std::size_t hi2 = (c2 == 0) ? t2 + 1 : NH;
+                            for (std::size_t n1 = lo1; n1 < hi1; ++n1) {
+                                for (std::size_t n2 = lo2; n2 < hi2; ++n2) {
+                                    St s2 = cur;
+                                    // A SWITCH closes the open run: the classes it contributed at
+                                    // every position from its start to b-1 are appended, and they
+                                    // follow from the template that run held.
+                                    if (c1 == 1)
+                                        for (std::size_t q = s2.h1.size(); q < b; ++q)
+                                            s2.h1.push_back(cls(tal[t1][q]));
+                                    if (c2 == 1)
+                                        for (std::size_t q = s2.h2.size(); q < b; ++q)
+                                            s2.h2.push_back(cls(tal[t2][q]));
+                                    s2.x = n1 * NH + n2;
+                                    if (clamp_b == static_cast<int>(b) && s2.x != clamp_x) continue;
+                                    double nw = w * w1 * w2 * U[b][s2.x];
+                                    // Close a factor the moment its last block is passed: the open
+                                    // run's remaining classes come from the CURRENT template.
+                                    const auto close = [&](const std::vector<std::size_t>& span,
+                                                           std::unordered_map<std::string, double>& M) {
+                                        std::vector<std::size_t> xs;
+                                        for (std::size_t q : span) {
+                                            const std::uint32_t a1 = q < s2.h1.size()
+                                                ? s2.h1[q] : cls(tal[n1][q]);
+                                            const std::uint32_t a2 = q < s2.h2.size()
+                                                ? s2.h2[q] : cls(tal[n2][q]);
+                                            xs.push_back(a1 * NH + a2);   // placeholder, see below
+                                            (void)a1; (void)a2;
+                                        }
+                                        return xs;
+                                    };
+                                    (void)close;
+                                    if (b == span1.back() || b == span2.back()) {
+                                        const auto& span = (b == span1.back()) ? span1 : span2;
+                                        auto& M = (b == span1.back()) ? F1v : F2v;
+                                        std::string k;
+                                        for (std::size_t q : span)
+                                            k.push_back(static_cast<char>('0' +
+                                                (q < s2.h1.size() ? s2.h1[q] : cls(tal[n1][q]))));
+                                        k.push_back('|');
+                                        for (std::size_t q : span)
+                                            k.push_back(static_cast<char>('0' +
+                                                (q < s2.h2.size() ? s2.h2[q] : cls(tal[n2][q]))));
+                                        const std::size_t half = k.find('|');
+                                        const std::string sw =
+                                            k.substr(half + 1) + "|" + k.substr(0, half);
+                                        const std::string canon = std::min(k, sw);
+                                        auto it = M.find(canon);
+                                        if (it == M.end())
+                                            it = M.emplace(canon,
+                                                std::uniform_real_distribution<double>(0.3, 3.0)(rng)).first;
+                                        nw *= it->second;
+                                    }
+                                    // Both factors closed: the histories are spent.
+                                    if (b == span2.back()) { s2.h1.clear(); s2.h2.clear(); }
+                                    ++ops;
+                                    const std::string kk = keyof(s2);
+                                    auto f = nxt.find(kk);
+                                    if (f == nxt.end()) nxt.emplace(kk, std::make_pair(s2, nw));
+                                    else f->second.second += nw;
+                                }
+                            }
+                        }
+                    }
+                }
+                msg.swap(nxt);
+                peak_entries = std::max<std::uint64_t>(peak_entries, msg.size());
+            }
+            double Zc = 0.0;
+            for (const auto& kv : msg) Zc += kv.second.second;
+            ops_tot += ops;
+            peak_tot = std::max(peak_tot, peak_entries);
+            return Zc;
+            };
+            const double Z_con = contract(-1, 0);
+            ok_(std::abs(Z_con - Z_bf) / Z_bf < 1e-12,
+                std::string(arm.name) + ": the STRUCTURED CONTRACTION reproduces the partition "
+                "weight (" + sci(Z_con) + " vs " + sci(Z_bf) + ", relative " +
+                sci(std::abs(Z_con - Z_bf) / Z_bf) + "); peak " + std::to_string(peak_tot) +
+                " message entries, " + std::to_string(ops_tot) + " message-entry updates");
+            // ---- BACKWARD CONTRACTION AND THE FORWARD/BACKWARD JOIN ----------------------
+            // Clamping proves correctness but is not the production marginal algorithm: it costs
+            // one full contraction per (block, state). Production needs messages from both ends.
+            //
+            // A FACTOR STRADDLING BLOCK b IS APPLIED AT THE JOIN, not in either pass, or it would
+            // be counted twice. The forward message carries the classes of positions whose run has
+            // closed to the LEFT, the backward message those closed to the RIGHT, and the open run
+            // on both sides is covered by the SAME X_b -- which is what makes the two histories
+            // joinable into one class tuple.
+            const auto contract_back = [&](int clamp_b, std::size_t clamp_x) {
+                std::map<std::string, std::pair<St, double>> msg;
+                for (std::size_t x = 0; x < NS; ++x) {
+                    if (clamp_b == static_cast<int>(NB) - 1 && x != clamp_x) continue;
+                    St s2; s2.x = x;
+                    msg[keyof(s2)] = {s2, U[NB - 1][x]};
+                }
+                for (std::size_t bb = NB - 1; bb-- > 0;) {
+                    std::map<std::string, std::pair<St, double>> nxt;
+                    for (const auto& kv : msg) {
+                        const St& cur = kv.second.first;
+                        const double w = kv.second.second;
+                        const std::size_t t1 = cur.x / NH, t2 = cur.x % NH;
+                        for (int c1 = 0; c1 < 2; ++c1) {
+                            for (int c2 = 0; c2 < 2; ++c2) {
+                                const double w1 = (c1 == 0) ? (1.0 - r) : (r / double(NH));
+                                const double w2 = (c2 == 0) ? (1.0 - r) : (r / double(NH));
+                                if (w1 == 0.0 || w2 == 0.0) continue;
+                                const std::size_t lo1 = (c1 == 0) ? t1 : 0;
+                                const std::size_t hi1 = (c1 == 0) ? t1 + 1 : NH;
+                                const std::size_t lo2 = (c2 == 0) ? t2 : 0;
+                                const std::size_t hi2 = (c2 == 0) ? t2 + 1 : NH;
+                                for (std::size_t n1 = lo1; n1 < hi1; ++n1) {
+                                    for (std::size_t n2 = lo2; n2 < hi2; ++n2) {
+                                        St s2 = cur;
+                                        // Going LEFT, a switch closes the run that extended to the
+                                        // right; its classes are prepended.
+                                        if (c1 == 1)
+                                            for (std::size_t q = NB - 1 - s2.h1.size(); q > bb; --q)
+                                                s2.h1.push_back(cls(tal[t1][q]));
+                                        if (c2 == 1)
+                                            for (std::size_t q = NB - 1 - s2.h2.size(); q > bb; --q)
+                                                s2.h2.push_back(cls(tal[t2][q]));
+                                        s2.x = n1 * NH + n2;
+                                        if (clamp_b == static_cast<int>(bb) && s2.x != clamp_x)
+                                            continue;
+                                        double nw = w * w1 * w2 * U[bb][s2.x];
+                                        // A factor closes going left when its FIRST block is
+                                        // reached.
+                                        for (int fsel = 0; fsel < 2; ++fsel) {
+                                            const auto& span = fsel == 0 ? span1 : span2;
+                                            if (bb != span.front()) continue;
+                                            auto& M = fsel == 0 ? F1v : F2v;
+                                            std::string k;
+                                            for (std::size_t q : span) {
+                                                const std::size_t back = NB - 1 - q;
+                                                k.push_back(static_cast<char>('0' +
+                                                    (back < s2.h1.size() ? s2.h1[back]
+                                                                         : cls(tal[n1][q]))));
+                                            }
+                                            k.push_back('|');
+                                            for (std::size_t q : span) {
+                                                const std::size_t back = NB - 1 - q;
+                                                k.push_back(static_cast<char>('0' +
+                                                    (back < s2.h2.size() ? s2.h2[back]
+                                                                         : cls(tal[n2][q]))));
+                                            }
+                                            const std::size_t half = k.find('|');
+                                            const std::string sw =
+                                                k.substr(half + 1) + "|" + k.substr(0, half);
+                                            const std::string canon = std::min(k, sw);
+                                            auto it = M.find(canon);
+                                            if (it == M.end())
+                                                it = M.emplace(canon,
+                                                    std::uniform_real_distribution<double>(0.3, 3.0)(rng)).first;
+                                            nw *= it->second;
+                                        }
+                                        if (bb == span1.front()) { s2.h1.clear(); s2.h2.clear(); }
+                                        const std::string kk = keyof(s2);
+                                        auto f = nxt.find(kk);
+                                        if (f == nxt.end()) nxt.emplace(kk, std::make_pair(s2, nw));
+                                        else f->second.second += nw;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    msg.swap(nxt);
+                }
+                double Zb = 0.0;
+                for (const auto& kv : msg) Zb += kv.second.second;
+                return Zb;
+            };
+            // The backward contraction must reproduce the same partition weight, computed by an
+            // independent traversal in the opposite direction.
+            const double Z_back = contract_back(-1, 0);
+            ok_(std::abs(Z_back - Z_bf) / Z_bf < 1e-12,
+                std::string(arm.name) + ": the BACKWARD contraction independently reproduces the "
+                "partition weight (" + sci(Z_back) + " vs " + sci(Z_bf) + ", relative " +
+                sci(std::abs(Z_back - Z_bf) / Z_bf) + ")");
+            double worst_bm = 0.0;
+            for (std::size_t b = 0; b < NB; ++b)
+                for (std::size_t x = 0; x < NS; ++x)
+                    worst_bm = std::max(worst_bm,
+                                        std::abs(contract_back(static_cast<int>(b), x) -
+                                                 marg_bf[b][x]) / Z_bf);
+            ok_(worst_bm < 1e-12,
+                std::string(arm.name) + ": and the BACKWARD marginals match brute force over all " +
+                std::to_string(NB * NS) + " (worst relative " + sci(worst_bm) + ")");
+
+            // EVERY MARGINAL, by clamping each block to each state in turn.
+            double worst_c = 0.0;
+            for (std::size_t b = 0; b < NB; ++b)
+                for (std::size_t x = 0; x < NS; ++x)
+                    worst_c = std::max(worst_c,
+                                       std::abs(contract(static_cast<int>(b), x) -
+                                                marg_bf[b][x]) / Z_bf);
+            ok_(worst_c < 1e-12,
+                std::string(arm.name) + ": and every block marginal from the contraction, over "
+                "all " + std::to_string(NB * NS) + " (worst relative " + sci(worst_c) + ")");
+        }
+
         // NON-VACUITY: the factors must actually move the answer.
         {
             double Z_nf = 0.0;

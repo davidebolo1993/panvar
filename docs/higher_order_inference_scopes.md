@@ -130,3 +130,41 @@ carries full class history alongside full template identity will hit that bound 
 
 These are PRE-ALLOCATION estimates. The implementation must compute them first and REFUSE above its
 limit rather than allocate and discover.
+
+## Both elimination orders, predicted (and they differ per factor)
+
+  factor          order    peak entries      peak MB          streamed          updates
+  F1 {2,3,4,5}    fwd        17,658,669        141.3     1,774,945,069    1,792,689,543
+  F1 {2,3,4,5}    bwd       110,945,865        887.6    28,227,528,265   28,339,589,595
+  F2 {4,5,6}      fwd           634,957          5.1        40,173,901       40,808,858
+  F2 {4,5,6}      bwd           171,610          1.4        10,056,346       10,227,956
+
+F1 is 16x cheaper FORWARD and F2 is 4x cheaper BACKWARD **IN ISOLATION** -- and those two
+preferences DO NOT COMPOSE. F1 and F2 overlap on blocks 4 and 5, so "F1 forward, F2 backward" is not
+a schedule but two incompatible eliminations. A single global order must be chosen and costed whole:
+
+  schedule       peak stored       MB   peak at        streamed          updates
+  forward         17,572,864    140.6   block 4   1,757,286,400    3,769,756,870
+  backward       109,830,400    878.6   block 3  28,116,582,400   56,473,144,224
+
+The global schedule is FORWARD: 6x cheaper in memory and 15x in updates. Its 3.77e9 updates are
+about twice F1's 1.79e9 alone, because F2 contributes its own span rather than coming free.
+
+AND THE OVERLAP FORCES A REFINEMENT. Block 4 is needed by both factors with DIFFERENT class
+groupings -- F1 gives it 10 classes, F2 gives 6 -- so the carried history must hold the COMMON
+REFINEMENT, which is F1's 10 because F1 refines F2 there. Storing F2's 6 would discard information
+F1 requires. A common refinement can never be coarser than either input.
+
+The per-factor figures below are retained only to show WHY the orders differ. The mechanism is mechanical: history cost is
+the product of class counts for the blocks whose runs have CLOSED, so the cheaper order is the one
+that puts the SMALLEST class counts first. F1's classes are (2,16,10,8) and forward begins at 2;
+F2's are (6,8,3) and backward begins at 3. Assuming a single order for both would have left F2 four
+times more expensive than necessary, which is why both are predicted rather than one chosen.
+
+## What the operation counter measures
+
+MESSAGE-ENTRY UPDATES: one accumulation into a state of the next message -- a multiply and an add in
+linear space. NOT floating-point instructions, and not comparable to a FLOP count. The C4 figures
+above are RESOURCE ESTIMATES; memory fitting is established, RUNTIME IS NOT, and neither is until
+the contraction runs on C4 and reports measured forward time, backward time, actual updates, peak
+entries and bytes, and RSS separately.
