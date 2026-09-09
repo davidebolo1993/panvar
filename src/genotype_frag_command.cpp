@@ -345,6 +345,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     bool budget_selftest = false;
     bool grouping_selftest = false;
     bool interval_selftest = false;
+    bool normalisation_selftest = false;
     bool completeness_selftest = false;
     bool activation_selftest = false;
     std::vector<std::string> reconcile_scope;
@@ -404,6 +405,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--budget-selftest") budget_selftest = true;
         else if (a == "--grouping-selftest") grouping_selftest = true;
         else if (a == "--interval-selftest") interval_selftest = true;
+        else if (a == "--normalisation-selftest") normalisation_selftest = true;
         else if (a == "--completeness-selftest") completeness_selftest = true;
         else if (a == "--activation-selftest") activation_selftest = true;
         else if (a == "--scope-tol") {
@@ -669,7 +671,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         origin_universe.empty() && reconcile_scope.empty() && !linkage_selftest &&
         !hybrid_oracle && !mapping_selftest && !completeness_selftest && !activation_selftest &&
         !support_selftest && !coordinate_selftest && !budget_selftest && !grouping_selftest &&
-        !interval_selftest) {
+        !interval_selftest && !normalisation_selftest) {
         throw std::runtime_error("genotype-frag requires at least one --reads");
     }
     if (!bubble_prefix_in.empty()) {
@@ -702,6 +704,155 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     ParseGfaOptions parse_options;
     parse_options.include_paths = true;
     parse_options.include_sequences = true;
+    // ---- HIGHER-ORDER MEAN-ONE NORMALISATION SELF-TEST ------------------------------------------
+    // Two representations of the same object, computed independently and required to agree. The
+    // ordered form is what the HMM consumes, because its state is ordered; the canonical
+    // biological-phase form is the check on it.
+    if (normalisation_selftest) {
+        std::size_t fails = 0;
+        const auto ok_ = [&](bool c, const std::string& w) {
+            std::printf("%s\t%s\n", c ? "ok" : "FAIL", w.c_str());
+            if (!c) ++fails;
+        };
+        const auto sci = [](double x) {
+            char b[32]; std::snprintf(b, sizeof b, "%.3e", x); return std::string(b);
+        };
+        std::mt19937_64 rng(20260909);
+        const double kTol = 1e-12;
+        // The constants themselves, per heterozygosity.
+        for (std::size_t m = 0; m <= 4; ++m) {
+            const ContentClassNorm N = content_class_norm(m);
+            const std::size_t exp_ord = std::size_t(1) << m;
+            const std::size_t exp_bio = m == 0 ? 1 : (std::size_t(1) << (m - 1));
+            ok_(N.ok && N.ordered_configs == exp_ord && N.biological_phases == exp_bio,
+                "m=" + std::to_string(m) + ": " + std::to_string(N.ordered_configs) +
+                " ordered configs, " + std::to_string(N.biological_phases) +
+                " biological phases, bound log psi <= " + sci(N.max_log_psi_bound));
+        }
+        // THE TRAP, as its own assertion: the ordered centring constant is log(2^m). Using
+        // log(2^(m-1)) there -- the canonical form's constant -- makes the mean psi one HALF.
+        {
+            const ContentClassNorm N = content_class_norm(3);
+            ok_(std::abs(N.centring_ordered - N.centring_canonical - std::log(2.0)) < kTol,
+                "the ordered and canonical centring constants differ by exactly log 2 (" +
+                sci(N.centring_ordered) + " vs " + sci(N.centring_canonical) + ")");
+        }
+        // Now the two normalisations, over random raw scores, for every m.
+        for (std::size_t m = 0; m <= 4; ++m) {
+            const ContentClassNorm N = content_class_norm(m);
+            const std::size_t no = N.ordered_configs;
+            // A raw score per BIOLOGICAL phase; each ordered configuration inherits its phase's
+            // score, which is what "global swap leaves the score unchanged" means.
+            std::vector<double> Sb(N.biological_phases);
+            for (double& x : Sb) x = std::uniform_real_distribution<double>(-8.0, 8.0)(rng);
+            // Ordered index o in [0, 2^m); its biological phase is o with the top bit folded,
+            // because flipping every homologue maps o to its complement.
+            const auto phase_of = [&](std::size_t o) {
+                if (m == 0) return std::size_t(0);
+                const std::size_t comp = (~o) & (no - 1);
+                return std::min(o, comp) % N.biological_phases;
+            };
+            std::vector<double> So(no);
+            for (std::size_t o = 0; o < no; ++o) So[o] = Sb[phase_of(o)];
+            // GLOBAL-SWAP PARTNERS must exist and score identically.
+            bool swap_ok = true;
+            for (std::size_t o = 0; o < no; ++o) {
+                const std::size_t partner = (~o) & (no - 1);
+                if (partner >= no) { swap_ok = false; break; }
+                if (So[o] != So[partner]) { swap_ok = false; break; }
+            }
+            ok_(swap_ok, "m=" + std::to_string(m) +
+                         ": every ordered configuration has its global-swap partner with the "
+                         "identical raw score" +
+                         std::string(m == 0 ? " (and is its own partner)" : ""));
+            const auto lse = [](const std::vector<double>& v) {
+                double mx = -std::numeric_limits<double>::infinity();
+                for (double x : v) mx = std::max(mx, x);
+                double acc = 0.0;
+                for (double x : v) acc += std::exp(x - mx);
+                return mx + std::log(acc);
+            };
+            const double Zo = lse(So), Zb = lse(Sb);
+            std::vector<double> psi_o(no), psi_b(N.biological_phases);
+            for (std::size_t o = 0; o < no; ++o) psi_o[o] = So[o] - Zo + N.centring_ordered;
+            for (std::size_t b = 0; b < N.biological_phases; ++b)
+                psi_b[b] = Sb[b] - Zb + N.centring_canonical;
+            // (1) MEAN ONE, in the ordered representation.
+            double mean_o = 0.0;
+            for (double x : psi_o) mean_o += std::exp(x);
+            mean_o /= static_cast<double>(no);
+            ok_(std::abs(mean_o - 1.0) < kTol,
+                "m=" + std::to_string(m) + ": mean psi over ORDERED configurations is one (" +
+                sci(mean_o) + ")");
+            // (2) THE TWO REPRESENTATIONS AGREE per ordered configuration.
+            double worst = 0.0;
+            for (std::size_t o = 0; o < no; ++o)
+                worst = std::max(worst, std::abs(psi_o[o] - psi_b[phase_of(o)]));
+            ok_(worst < kTol,
+                "m=" + std::to_string(m) + ": ordered and canonical psi agree per configuration (" +
+                sci(worst) + ")");
+            // (3) THE PER-CLASS BOUND holds, and is the SAME in both forms.
+            double mx = -std::numeric_limits<double>::infinity();
+            for (double x : psi_o) mx = std::max(mx, x);
+            ok_(mx <= N.max_log_psi_bound + kTol,
+                "m=" + std::to_string(m) + ": max log psi " + sci(mx) + " <= bound " +
+                sci(N.max_log_psi_bound));
+            // (4) m <= 1 IS EXACTLY NEUTRAL: one biological phase, no preference expressible.
+            if (m <= 1) {
+                double worst_n = 0.0;
+                for (double x : psi_o) worst_n = std::max(worst_n, std::abs(x));
+                ok_(worst_n < kTol,
+                    "m=" + std::to_string(m) + ": a single biological phase gives an EXACTLY "
+                    "neutral factor (" + sci(worst_n) + ")");
+            }
+        }
+        // (5) THE BOUND MUST BE TIGHT, not merely valid. A "max <= bound" check passes for any
+        //     bound that is too large, so it cannot detect one. Saturate the class -- put all the
+        //     mass on ONE biological phase -- and the maximum must EQUAL log(2^(m-1)) exactly.
+        for (std::size_t m = 2; m <= 4; ++m) {
+            const ContentClassNorm N = content_class_norm(m);
+            const std::size_t no = N.ordered_configs;
+            const auto phase_of = [&](std::size_t o) {
+                const std::size_t comp = (~o) & (no - 1);
+                return std::min(o, comp) % N.biological_phases;
+            };
+            std::vector<double> Sb(N.biological_phases, -400.0);
+            Sb[0] = 0.0;                       // one phase carries everything
+            std::vector<double> So(no);
+            for (std::size_t o = 0; o < no; ++o) So[o] = Sb[phase_of(o)];
+            double mxs = -std::numeric_limits<double>::infinity();
+            for (double x : So) mxs = std::max(mxs, x);
+            double acc = 0.0;
+            for (double x : So) acc += std::exp(x - mxs);
+            const double Zo = mxs + std::log(acc);
+            double top = -std::numeric_limits<double>::infinity();
+            for (std::size_t o = 0; o < no; ++o)
+                top = std::max(top, So[o] - Zo + N.centring_ordered);
+            ok_(std::abs(top - N.max_log_psi_bound) < 1e-9,
+                "m=" + std::to_string(m) + ": a SATURATED class ATTAINS the bound exactly (" +
+                sci(top) + " vs " + sci(N.max_log_psi_bound) + ") -- so the bound is tight, not "
+                "merely valid");
+        }
+
+        // (6) ZERO EVIDENCE is neutral: with no fragments every raw score is equal.
+        {
+            const ContentClassNorm N = content_class_norm(3);
+            std::vector<double> So(N.ordered_configs, 0.0);
+            double mx = -std::numeric_limits<double>::infinity();
+            double Z;
+            {
+                double acc = 0.0;
+                for (double x : So) acc += std::exp(x);
+                Z = std::log(acc);
+            }
+            for (std::size_t o = 0; o < So.size(); ++o)
+                mx = std::max(mx, std::abs(So[o] - Z + N.centring_ordered));
+            ok_(mx < kTol, "a factor owning NO fragments is exactly neutral (" + sci(mx) + ")");
+        }
+        std::printf("normalisation selftest: %zu failure(s)\n", fails);
+        return fails == 0 ? 0 : 1;
+    }
+
     // ---- K-BLOCK INTERVAL EMISSION SELF-TEST ----------------------------------------------------
     // The symbolic path must equal the exhaustive oracle PER CELL AND PER STATE, not in totals.
     // Totals agree whenever two errors cancel, and the specific error this guards against --

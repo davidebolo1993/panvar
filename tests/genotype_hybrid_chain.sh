@@ -617,6 +617,24 @@ else
   bad "the derived-flank fixture produced no geometry probe"
 fi
 # ---------------------------------------------------------------------------------------------
+# GATE 29e: HIGHER-ORDER MEAN-ONE NORMALISATION. The centring constant depends on the
+# representation and getting it wrong is silent: with all 2^m ORDERED configurations retained the
+# constant is log(2^m), and using the canonical form's log(2^(m-1)) there makes the mean psi one
+# HALF. Both forms share the same MAXIMUM, log(2^(m-1)), and that bound is PER CONTENT CLASS -- a
+# two-heterozygous-block class in a four-block factor is bounded by log 2, not log 8. Classes with
+# m <= 1 have a single biological phase and must come out exactly neutral. The bound is checked for
+# TIGHTNESS as well as validity: a saturated class must ATTAIN it, since "max <= bound" passes for
+# any bound that is merely too large.
+if "$BIN" genotype-frag -i /dev/null -b none -o "$OUT/nz" --normalisation-selftest \
+     > "$OUT/norm.txt" 2>/dev/null; then
+  while IFS=$'\t' read -r v m; do
+    [ "$v" = ok ] && ok "$m" || { [ -n "${m:-}" ] && bad "$m"; }
+  done < <(grep -E '^(ok|FAIL)\t' "$OUT/norm.txt")
+else
+  bad "normalisation selftest reported failures"
+  sed -n 's/^FAIL\t/  /p' "$OUT/norm.txt"
+fi
+
 # GATE 29d: THE K-BLOCK INTERVAL EMISSION. C4 needs factors over three and four variable blocks,
 # because Wide fragments read three at once and no pairwise edge can consume them. The symbolic
 # path -- which keeps allele constraints unexpanded until the mate join has narrowed them -- must

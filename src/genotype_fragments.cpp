@@ -5477,6 +5477,147 @@ IntervalSeedIndex build_interval_seed_index(const IntervalGeometry& geom, std::s
     return ix;
 }
 
+IntervalGrouping build_interval_grouping(
+    const IntervalGeometry& geom,
+    const std::vector<std::vector<std::string>>& per_fragment_signatures) {
+    IntervalGrouping G;
+    const std::size_t k = geom.alleles.size();
+    const std::size_t ncell = geom.cells();
+    for (const auto& v : per_fragment_signatures) {
+        if (v.size() != ncell) {
+            G.refusal = "a fragment's signature vector does not span the cell product";
+            return G;
+        }
+    }
+    // The JOINT signature per cell, length-prefixed per fragment so two different splits cannot
+    // alias, then interned to a dense id.
+    std::unordered_map<std::string, std::uint32_t> intern;
+    G.cell_signature_id.assign(ncell, 0);
+    {
+        std::string key;
+        for (std::size_t c = 0; c < ncell; ++c) {
+            key.clear();
+            for (const auto& v : per_fragment_signatures) {
+                const std::uint32_t n = static_cast<std::uint32_t>(v[c].size());
+                key.append(reinterpret_cast<const char*>(&n), 4);
+                key.append(v[c]);
+            }
+            G.cell_signature_id[c] = intern.emplace(key,
+                static_cast<std::uint32_t>(intern.size())).first->second;
+        }
+    }
+    G.distinct_cell_signatures = intern.size();
+    // Per block: two alleles are equivalent when their whole SLICE of signature ids agrees. The
+    // slice is taken over every combination of the other blocks, so this is equivalence across the
+    // entire remaining product, not agreement at a sampled point.
+    G.allele_class.resize(k);
+    G.classes_per_block.assign(k, 0);
+    std::vector<std::size_t> stride(k, 1);
+    for (std::size_t j = k; j-- > 0;)
+        stride[j] = (j + 1 < k) ? stride[j + 1] * geom.alleles[j + 1].size() : 1;
+    for (std::size_t j = 0; j < k; ++j) {
+        const std::size_t nj = geom.alleles[j].size();
+        std::unordered_map<std::string, std::uint32_t> cls;
+        G.allele_class[j].assign(nj, 0);
+        for (std::uint32_t a = 0; a < nj; ++a) {
+            std::string slice;
+            slice.reserve((ncell / nj) * 4);
+            for (std::size_t c = 0; c < ncell; ++c) {
+                if ((c / stride[j]) % nj != a) continue;
+                const std::uint32_t id = G.cell_signature_id[c];
+                slice.append(reinterpret_cast<const char*>(&id), 4);
+            }
+            G.allele_class[j][a] = cls.emplace(slice,
+                static_cast<std::uint32_t>(cls.size())).first->second;
+        }
+        G.classes_per_block[j] = cls.size();
+    }
+    // ---- THE JOINT EQUALITY CHECK -------------------------------------------------------------
+    // Every original cell must carry the IDENTICAL signature to the representative cell of its
+    // class tuple -- not merely agree marginally at each block. One representative per class tuple
+    // is taken from the first allele of each class, and every cell is compared against it.
+    {
+        std::vector<std::vector<std::uint32_t>> first_of_class(k);
+        for (std::size_t j = 0; j < k; ++j) {
+            first_of_class[j].assign(G.classes_per_block[j],
+                                     std::numeric_limits<std::uint32_t>::max());
+            for (std::uint32_t a = 0; a < geom.alleles[j].size(); ++a) {
+                const std::uint32_t cl = G.allele_class[j][a];
+                if (first_of_class[j][cl] == std::numeric_limits<std::uint32_t>::max())
+                    first_of_class[j][cl] = a;
+            }
+        }
+        std::vector<std::uint32_t> ch, rep(k, 0);
+        for (std::size_t c = 0; c < ncell; ++c) {
+            geom.cell_choice(c, ch);
+            for (std::size_t j = 0; j < k; ++j)
+                rep[j] = first_of_class[j][G.allele_class[j][ch[j]]];
+            ++G.cells_checked;
+            if (G.cell_signature_id[c] != G.cell_signature_id[geom.cell_index(rep)])
+                ++G.cells_disagreeing_with_representative;
+        }
+        G.joint_equality_verified = G.cells_disagreeing_with_representative == 0;
+    }
+    if (!G.joint_equality_verified) {
+        G.refusal = "cells sharing a class tuple do not share a signature";
+        return G;
+    }
+    const auto pairs = [](std::size_t n) { return n * (n + 1) / 2; };
+    G.content_classes_raw = 1;
+    G.content_classes_grouped = 1;
+    G.ordered_configurations = 1;
+    for (std::size_t j = 0; j < k; ++j) {
+        G.content_classes_raw *= pairs(geom.alleles[j].size());
+        G.content_classes_grouped *= pairs(G.classes_per_block[j]);
+        G.ordered_configurations *= G.classes_per_block[j] * G.classes_per_block[j];
+    }
+    // Classes with at most one heterozygous block have a single biological phase and are EXACTLY
+    // neutral, so they need never be stored. Counted here so the prediction below is honest about
+    // how many classes actually carry a value.
+    {
+        std::size_t m0 = 1, m1 = 0;
+        for (std::size_t j = 0; j < k; ++j) {
+            const std::size_t R = G.classes_per_block[j];
+            const std::size_t hom = R, het = R * (R - 1) / 2;
+            m1 = m1 * hom + m0 * het;
+            m0 *= hom;
+        }
+        G.classes_m_le_1 = m0 + m1;
+        G.ordered_in_m_le_1 = m0 + 2 * m1;
+    }
+    // PREDICTED BYTES, before a single entry is allocated -- and it must count STORED PHASE
+    // VALUES, not classes. A non-neutral class carries one value per biological phase, 2^(m-1) of
+    // them, so "one double per class" understates it by the mean phase count. The totals follow
+    // from sums already known: every class contributes 2^m ordered configurations and their sum is
+    // exactly prod(R_j^2); the m <= 1 classes contribute m0 + 2*m1 of those and store nothing.
+    G.stored_ordered_values = G.ordered_configurations > G.ordered_in_m_le_1
+                            ? G.ordered_configurations - G.ordered_in_m_le_1 : 0;
+    G.stored_canonical_values = G.stored_ordered_values / 2;   // two ordered per biological phase
+    // Canonical storage: one key per class that carries a value, plus one double per phase.
+    G.predicted_bytes =
+        (G.content_classes_grouped - G.classes_m_le_1) *
+            (sizeof(std::uint64_t) + 2 * sizeof(void*)) +
+        G.stored_canonical_values * sizeof(double);
+    G.ok = true;
+    return G;
+}
+
+ContentClassNorm content_class_norm(std::size_t m_het) {
+    ContentClassNorm n;
+    n.m_het = m_het;
+    if (m_het > 30) { n.refusal = "too many heterozygous blocks to enumerate"; return n; }
+    n.ordered_configs = static_cast<std::size_t>(1) << m_het;
+    // m = 0 has ONE configuration which is its own global-swap partner, and one biological phase.
+    n.biological_phases = m_het == 0 ? 1 : (static_cast<std::size_t>(1) << (m_het - 1));
+    n.centring_ordered = std::log(static_cast<double>(n.ordered_configs));
+    n.centring_canonical = std::log(static_cast<double>(n.biological_phases));
+    // The maximum is log(number of biological phases) in BOTH forms: the ordered form's larger
+    // constant is exactly cancelled by its two equal representatives inside the logsumexp.
+    n.max_log_psi_bound = std::log(static_cast<double>(n.biological_phases));
+    n.ok = true;
+    return n;
+}
+
 SignatureMatrix build_signature_matrix(const std::vector<std::string>& cell_signatures,
                                        std::size_t n_a, std::size_t n_b, const char* model_tag) {
     SignatureMatrix M;

@@ -1861,6 +1861,93 @@ IntervalEmission interval_emission(const Fragment& fragment, const IntervalGeome
                                    HybridWorkBudget* budget = nullptr,
                                    bool want_signatures = false, bool want_origins = false);
 
+// K-DIMENSIONAL SIGNATURE GROUPING. Two alleles of block j are equivalent when, across EVERY
+// combination of the other blocks and EVERY owned fragment, the cell signatures are identical --
+// the k-block generalisation of the row/column classes of the pairwise case.
+//
+// This is what makes the factor constructible at all. A content class is one unordered allele pair
+// per block, so over raw alleles F1 would have C(101,2) * C(17,2) * C(11,2) * C(9,2) = 1.4e9 of
+// them and the dense diploid table is 128,000^2. Over signature classes the same space is the
+// product of C(R_j+1, 2), which is small when the R_j are. It is a FACTOR-EVALUATION device only:
+// the alleles remain distinct HMM states, because marker and Li-Stephens evidence still separates
+// what these fragments cannot.
+struct IntervalGrouping {
+    std::vector<std::vector<std::uint32_t>> allele_class;   // per block, per allele -> class id
+    std::vector<std::size_t> classes_per_block;
+    std::vector<std::uint32_t> cell_signature_id;           // per cell, dense
+    std::size_t distinct_cell_signatures = 0;
+    std::size_t content_classes_raw = 0;      // product of C(n_j + 1, 2)
+    std::size_t content_classes_grouped = 0;  // product of C(R_j + 1, 2)
+    std::size_t ordered_configurations = 0;   // product of R_j^2
+    std::size_t classes_m_le_1 = 0;           // exactly neutral by construction
+    // THE JOINT CLAIM, verified rather than argued. Per-block slice equality gives a chain of
+    // one-block swaps, from which joint equality FOLLOWS -- but the grouping is only sound if every
+    // original cell carries the identical complete signature to its class representative, so that
+    // is checked over every cell rather than deduced.
+    std::size_t cells_checked = 0, cells_disagreeing_with_representative = 0;
+    bool joint_equality_verified = false;
+    std::size_t ordered_in_m_le_1 = 0;        // ordered configs inside neutral classes
+    std::size_t stored_ordered_values = 0;    // ordered configs that carry a value
+    std::size_t stored_canonical_values = 0;  // biological phases that carry a value
+    // Computed BEFORE any table is allocated, and it counts STORED PHASE VALUES: a non-neutral
+    // class holds one per biological phase, 2^(m-1) of them, so counting one per class understates
+    // it. Measured allocation is compared against this same formula afterwards.
+    std::size_t predicted_bytes = 0;
+    // EFFECTIVE HETEROZYGOSITY. A block contributes a phase dimension only when the two homologues
+    // carry DIFFERENT SIGNATURE CLASSES. Two distinct alleles in one class are biologically
+    // heterozygous yet indistinguishable to this factor, so swapping them must stay neutral --
+    // m must be counted over class ids, never over allele ids.
+    std::size_t effective_m(const std::vector<std::uint32_t>& hap1,
+                            const std::vector<std::uint32_t>& hap2) const {
+        std::size_t m = 0;
+        for (std::size_t j = 0; j < allele_class.size(); ++j)
+            if (allele_class[j][hap1[j]] != allele_class[j][hap2[j]]) ++m;
+        return m;
+    }
+    bool ok = false;
+    std::string refusal;
+};
+
+// `per_fragment_signatures[f][cell]` as produced by interval_emission with want_signatures.
+IntervalGrouping build_interval_grouping(
+    const IntervalGeometry& geom,
+    const std::vector<std::vector<std::string>>& per_fragment_signatures);
+
+// ---- HIGHER-ORDER MEAN-ONE NORMALISATION -----------------------------------------------------
+//
+// A CONTENT CLASS is one unordered allele multiset per block. Within it the diploid can be phased
+// several ways, and the factor's job is to say which phasing the fragments prefer -- centred so it
+// says nothing on average.
+//
+// THE CENTRING CONSTANT DEPENDS ON THE REPRESENTATION, and getting this wrong is silent. With m
+// heterozygous blocks a class has 2^m ORDERED configurations and 2^(m-1) distinct BIOLOGICAL
+// phases, because swapping both homologues everywhere is the same biology. So:
+//
+//     ordered form:     log psi_o = S_o - logsumexp_o' S_o' + log(2^m)
+//     canonical form:   log psi_b = S_b - logsumexp_b' S_b' + log(2^(m-1))
+//
+// Retaining all 2^m ordered configurations while adding only log(2^(m-1)) would make the mean psi
+// one HALF, not one. Both forms give the same MAXIMUM, log(2^(m-1)): when one biological phase
+// holds all the mass its two ordered representatives are equal, so the ordered logsumexp is
+// S + log 2 and log psi_o = log(2^m) - log 2.
+//
+// THE BOUND IS PER CLASS, not per factor. A four-heterozygous-block class in F1 is bounded by
+// log 8; a two-heterozygous-block class in the same factor by log 2. With m <= 1 there is ONE
+// biological phase, the factor can express no preference, and it must come out exactly neutral.
+struct ContentClassNorm {
+    std::size_t m_het = 0;              // heterozygous blocks in this class
+    std::size_t ordered_configs = 0;    // 2^m
+    std::size_t biological_phases = 0;  // 2^(m-1), or 1 when m == 0
+    double centring_ordered = 0.0;      // log(2^m)
+    double centring_canonical = 0.0;    // log(2^(m-1))
+    double max_log_psi_bound = 0.0;     // log(2^(m-1)) in BOTH representations
+    bool ok = false;
+    std::string refusal;
+};
+
+// Derive the class's normalisation constants from its heterozygosity alone.
+ContentClassNorm content_class_norm(std::size_t m_het);
+
 // THE SIGNATURE MATRIX: which allele pairs the fragments on ONE edge cannot tell apart.
 //
 // IT IS A FACTOR-EVALUATION DEVICE AND NEVER A STATE REDUCTION. A row class says the fragments

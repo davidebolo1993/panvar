@@ -2195,6 +2195,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             // killing it. A long silent loop is not a measurement.
                             std::size_t done_n = 0;
                             double score_s = 0.0, oracle_s = 0.0;
+                            std::vector<std::vector<std::string>> frag_sigs;
                             const auto t_prog = std::chrono::steady_clock::now();
                             for (std::size_t fi : ev) {
                                 const std::size_t len = hf[fi].bases();
@@ -2210,6 +2211,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                     std::chrono::steady_clock::now() - t_sc0).count();
                                 if (E.work_refused || !E.ok) { ++refused; continue; }
                                 ++contributed;
+                                frag_sigs.push_back(E.cell_signature);
                                 seedh += E.seed_hits; symst += E.symbolic_states;
                                 pbd += E.placements_before_dedup; pad += E.placements_after_dedup;
                                 joins += E.joined_pairs; tup += E.tuple_expansions;
@@ -2300,6 +2302,59 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                              std::to_string(el / static_cast<double>(done_n) *
                                                             static_cast<double>(ev.size())) + " s");
                                 }
+                            }
+                            // ---- K-DIMENSIONAL GROUPING, on this factor's real signatures ----
+                            // The content-class space over RAW alleles is the product of
+                            // C(n_j + 1, 2) and is far too large to enumerate; over signature
+                            // classes it is the product of C(R_j + 1, 2). Whether the factor is
+                            // constructible at all turns on that ratio.
+                            const auto t_grp = std::chrono::steady_clock::now();
+                            const IntervalGrouping GR =
+                                build_interval_grouping(FG, frag_sigs);
+                            const double grp_s = std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - t_grp).count();
+                            fo << "grouping_ok\t" << (GR.ok ? 1 : 0) << '\n';
+                            if (GR.ok) {
+                                std::string cpb;
+                                for (std::size_t j = 0; j < GR.classes_per_block.size(); ++j)
+                                    cpb += (j ? "x" : "") +
+                                           std::to_string(GR.classes_per_block[j]);
+                                std::string apb;
+                                for (std::size_t j = 0; j < FG.alleles.size(); ++j)
+                                    apb += (j ? "x" : "") + std::to_string(FG.alleles[j].size());
+                                fo << "alleles_per_block\t" << apb << '\n';
+                                fo << "signature_classes_per_block\t" << cpb << '\n';
+                                fo << "distinct_cell_signatures\t" << GR.distinct_cell_signatures
+                                   << '\n';
+                                fo << "content_classes_raw\t" << GR.content_classes_raw << '\n';
+                                fo << "content_classes_grouped\t" << GR.content_classes_grouped
+                                   << '\n';
+                                fo << "ordered_configurations\t" << GR.ordered_configurations
+                                   << '\n';
+                                fo << "classes_m_le_1_neutral\t" << GR.classes_m_le_1 << '\n';
+                                fo << "classes_carrying_a_value\t"
+                                   << (GR.content_classes_grouped - GR.classes_m_le_1) << '\n';
+                                fo << "ordered_in_m_le_1\t" << GR.ordered_in_m_le_1 << '\n';
+                                fo << "stored_canonical_values\t" << GR.stored_canonical_values
+                                   << '\n';
+                                fo << "stored_ordered_values\t" << GR.stored_ordered_values
+                                   << '\n';
+                                fo << "predicted_bytes_canonical\t" << GR.predicted_bytes << '\n';
+                                fo << "cells_checked\t" << GR.cells_checked << '\n';
+                                fo << "cells_disagreeing_with_representative\t"
+                                   << GR.cells_disagreeing_with_representative << '\n';
+                                fo << "joint_equality_verified\t"
+                                   << (GR.joint_equality_verified ? 1 : 0) << '\n';
+                                fo << "content_class_reduction\t"
+                                   << (GR.content_classes_grouped
+                                        ? static_cast<double>(GR.content_classes_raw) /
+                                          static_cast<double>(GR.content_classes_grouped) : 0.0)
+                                   << '\n';
+                                fo << "grouping_seconds\t" << grp_s << '\n';
+                                log.info("hybrid factor " + fbstr + " grouping: " + apb +
+                                         " alleles -> " + cpb + " signature classes; content "
+                                         "classes " + std::to_string(GR.content_classes_raw) +
+                                         " -> " + std::to_string(GR.content_classes_grouped));
                             }
                             const double run_s = std::chrono::duration<double>(
                                 std::chrono::steady_clock::now() - t_run).count();
