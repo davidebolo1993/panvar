@@ -91,13 +91,38 @@ run_arm () {  # <binary> <root>
   done
 }
 
-# ONE documented digest command, over content with the output root normalised away.
+# ONE documented digest command:  shasum -a 256 <file>
+#
+# NORMALISATION IS NARROW AND EXPLICIT. Exactly two outputs embed the absolute output root --
+# describe.index.tsv and describe.params.json -- and only those are filtered before hashing.
+# Everything else is hashed RAW.
+#
+# The first version of this filtered EVERY file through sed. On the gzipped outputs sed fails with
+# "illegal byte sequence" and emits nothing, so several hundred binary files were being hashed as
+# the digest of an EMPTY STREAM -- identical to each other and to any change in them. The run came
+# back "IDENTICAL" while comparing almost nothing. Hence the empty-digest guard below: a hash that
+# equals sha256("") means the file was not really read, and that is a harness failure, not a pass.
+EMPTY_SHA=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+VOLATILE='describe\.index\.tsv$|describe\.params\.json$'
+
 manifest () {  # <root> <outfile>
-  local R=$1 M=$2
+  local R=$1 M=$2 rc=0
   ( cd "$R" && find . -type f | LC_ALL=C sort | while read -r f; do
-      printf '%s\t%s\n' "${f#./}" \
-        "$(sed "s#$R#<ROOT>#g" "$f" | shasum -a 256 | cut -d' ' -f1)"
+      local h
+      if printf '%s' "${f#./}" | grep -qE "$VOLATILE"; then
+        h=$(LC_ALL=C sed "s#$R#<ROOT>#g" "$f" | shasum -a 256 | cut -d' ' -f1)
+      else
+        h=$(shasum -a 256 "$f" | cut -d' ' -f1)
+      fi
+      printf '%s\t%s\n' "${f#./}" "$h"
     done ) > "$M"
+  # No file may hash as an empty stream unless it is genuinely empty.
+  while IFS=$'\t' read -r f h; do
+    if [ "$h" = "$EMPTY_SHA" ] && [ -s "$R/$f" ]; then
+      echo "HARNESS FAILURE: $f hashed as an empty stream but is $(wc -c < "$R/$f") bytes"; rc=1
+    fi
+  done < "$M"
+  return $rc
 }
 
 verify_manifest () {  # <root> <manifest>  -- the harness checking its own output
@@ -107,11 +132,19 @@ verify_manifest () {  # <root> <manifest>  -- the harness checking its own outpu
   echo "MANIFEST DOES NOT DESCRIBE ITS OWN TREE ($R)"; diff "$M" "$tmp" | head -5; rm -f "$tmp"; return 1
 }
 
+# REUSE exists so a harness fix can be re-checked against trees that are already built. It never
+# skips hashing or comparison -- only the pipeline runs -- and it says so, because a run that
+# silently reused a stale tree would be a baseline nobody can trust for the second time today.
+REUSE=${LEGACY_AB_REUSE:-0}
 echo "A: $A"; echo "B: $B"
-run_arm "$A" "$W/A" || { echo "arm A FAILED"; exit 1; }
-run_arm "$B" "$W/B" || { echo "arm B FAILED"; exit 1; }
-manifest "$W/A" "$W/A.manifest.tsv"
-manifest "$W/B" "$W/B.manifest.tsv"
+if [ "$REUSE" = 1 ] && [ -d "$W/A" ] && [ -d "$W/B" ]; then
+  echo "REUSING the existing output trees; only the manifests are recomputed"
+else
+  run_arm "$A" "$W/A" || { echo "arm A FAILED"; exit 1; }
+  run_arm "$B" "$W/B" || { echo "arm B FAILED"; exit 1; }
+fi
+manifest "$W/A" "$W/A.manifest.tsv" || { echo "manifest A is not trustworthy"; exit 1; }
+manifest "$W/B" "$W/B.manifest.tsv" || { echo "manifest B is not trustworthy"; exit 1; }
 verify_manifest "$W/A" "$W/A.manifest.tsv" || exit 1
 verify_manifest "$W/B" "$W/B.manifest.tsv" || exit 1
 echo "manifests verify against their own trees ($(wc -l < "$W/A.manifest.tsv" | tr -d ' ') files each)"
