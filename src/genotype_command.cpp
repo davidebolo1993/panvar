@@ -425,6 +425,9 @@ int run_genotype_command(const std::vector<std::string>& args) {
     std::string hybrid_wide_inventory;   // every Wide fragment's scope, grouped
     std::string hybrid_context_dependence;  // "<ctx>,<b1>,...,<path>" -- is ctx emission-relevant?
     std::string hybrid_interval_probe;      // "<b1>,...,<path>" -- the generic k-block geometry
+    std::string hybrid_factor_run;          // "<b1>,...,<path>" -- run a real interval factor
+    bool hybrid_factor_oracle = false;      // also run the exhaustive oracle and compare
+    std::string hybrid_factor_supersede;    // "a-b,c-d": pairwise edges this factor REPLACES
     bool hybrid_triple_alias_used = false;
     struct EdgeRow {
         std::uint32_t a = 0, b = 0;
@@ -585,6 +588,10 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--hybrid-context-dependence")
             hybrid_context_dependence = require_value(arg);
         else if (arg == "--hybrid-interval-probe") hybrid_interval_probe = require_value(arg);
+        else if (arg == "--hybrid-factor-run") hybrid_factor_run = require_value(arg);
+        else if (arg == "--hybrid-factor-oracle") hybrid_factor_oracle = true;
+        else if (arg == "--hybrid-factor-supersede")
+            hybrid_factor_supersede = require_value(arg);
         else if (arg == "--hybrid-triple-probe") {
             // DEPRECATED: the probe takes any number of consecutive blocks now, so "triple" names
             // a case rather than the feature. Accepted, and said out loud.
@@ -2058,6 +2065,299 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         }
                     }
                     hyb_edges_considered = by_edge.size();
+                    // ---- RUN A REAL INTERVAL FACTOR ------------------------------------------
+                    // Its evidence is the pairwise owners inside the block span plus the Wide
+                    // fragments whose whole variable scope lies inside it -- the same rule the
+                    // ledger used, so the counts must reconcile with it exactly.
+                    if (!hybrid_factor_run.empty()) {
+                        std::vector<std::string> fp;
+                        std::string fcu;
+                        for (char c : hybrid_factor_run) {
+                            if (c == ',') { fp.push_back(fcu); fcu.clear(); } else fcu.push_back(c);
+                        }
+                        fp.push_back(fcu);
+                        std::vector<std::uint32_t> fbl;
+                        for (std::size_t q = 0; q + 1 < fp.size(); ++q)
+                            fbl.push_back(static_cast<std::uint32_t>(std::stoul(fp[q])));
+                        std::set<std::uint32_t> fbs(fbl.begin(), fbl.end());
+                        std::vector<std::vector<std::string>> fball(blocks.size());
+                        for (std::size_t q = 0; q < blocks.size(); ++q)
+                            fball[q] = blocks[q].allele_seq;
+                        const IntervalGeometry FG = build_interval_geometry(
+                            hyb_cov.frames, fball, block_variable, fbl,
+                            static_cast<std::size_t>(ip.hi), ip);
+                        std::ofstream fo(fp.back());
+                        if (!fo) throw std::runtime_error("genotype: cannot write " + fp.back());
+                        fo << "field\tvalue\n";
+                        std::string fbstr;
+                        for (std::size_t q = 0; q < fbl.size(); ++q)
+                            fbstr += (q ? "," : "") + std::to_string(fbl[q]);
+                        fo << "blocks\t" << fbstr << '\n';
+                        fo << "geometry_ok\t" << (FG.ok ? 1 : 0) << '\n';
+                        if (!FG.ok) {
+                            fo << "refusal\t" << FG.refusal << '\n';
+                        } else {
+                            // THE EVIDENCE SET. SCOPE IS NOT OWNERSHIP: a factor depends on the
+                            // blocks in its span, but it consumes only the fragments assigned to
+                            // it. Taking every pairwise owner inside the span is wrong -- for
+                            // {4,5,6} that sweeps in edge 4-5's owners, which belong to F1, and
+                            // edge 5-6's, which stay with the pairwise factor that is RETAINED.
+                            // A factor consumes a pairwise edge's owners only when it SUPERSEDES
+                            // that edge, which is a stated fact about the model and not something
+                            // to infer from block membership.
+                            std::set<std::pair<std::uint32_t, std::uint32_t>> sup_edges;
+                            {
+                                std::string tok;
+                                std::vector<std::string> toks;
+                                for (char c : hybrid_factor_supersede) {
+                                    if (c == ',') { toks.push_back(tok); tok.clear(); }
+                                    else tok.push_back(c);
+                                }
+                                if (!tok.empty()) toks.push_back(tok);
+                                for (const std::string& t : toks) {
+                                    const std::size_t dash = t.find('-');
+                                    if (dash == std::string::npos) {
+                                        throw std::runtime_error(
+                                            "genotype: --hybrid-factor-supersede expects a-b,c-d");
+                                    }
+                                    sup_edges.insert({
+                                        static_cast<std::uint32_t>(std::stoul(t.substr(0, dash))),
+                                        static_cast<std::uint32_t>(std::stoul(t.substr(dash + 1)))});
+                                }
+                            }
+                            std::vector<std::size_t> ev;
+                            std::size_t n_from_superseded = 0;
+                            for (const auto& kv : by_edge) {
+                                if (!sup_edges.count(kv.first)) continue;
+                                if (!fbs.count(kv.first.first) || !fbs.count(kv.first.second)) {
+                                    throw std::runtime_error(
+                                        "genotype: superseded edge " +
+                                        std::to_string(kv.first.first) + "-" +
+                                        std::to_string(kv.first.second) +
+                                        " is not inside the factor's own scope");
+                                }
+                                ev.insert(ev.end(), kv.second.begin(), kv.second.end());
+                                n_from_superseded += kv.second.size();
+                            }
+                            std::size_t n_wide_in = 0;
+                            for (std::size_t fi = 0; fi < hf.size(); ++fi) {
+                                if (owners[fi].kind != OwnerKind::Wide) continue;
+                                bool inside = !owners[fi].var_scope.empty();
+                                for (std::uint32_t b : owners[fi].var_scope)
+                                    if (!fbs.count(b)) { inside = false; break; }
+                                if (inside) { ev.push_back(fi); ++n_wide_in; }
+                            }
+                            std::sort(ev.begin(), ev.end());
+                            const std::size_t before_u = ev.size();
+                            ev.erase(std::unique(ev.begin(), ev.end()), ev.end());
+                            fo << "haploid_cells\t" << FG.cells() << '\n';
+                            fo << "min_window\t" << FG.min_window << '\n';
+                            fo << "exposure_affine\t" << (FG.exposure_affine ? 1 : 0) << '\n';
+                            fo << "superseded_edges\t"
+                               << (hybrid_factor_supersede.empty() ? "-" : hybrid_factor_supersede)
+                               << '\n';
+                            fo << "evidence_from_superseded_edges\t" << n_from_superseded << '\n';
+                            fo << "evidence_fragments\t" << ev.size() << '\n';
+                            fo << "evidence_unique\t" << (before_u == ev.size() ? 1 : 0) << '\n';
+                            fo << "evidence_wide\t" << n_wide_in << '\n';
+                            const std::size_t piece0 = ev.empty() ? 16
+                                : hf[ev.front()].r1.size() /
+                                  (mate_band_edits(hyb_params.max_divergence,
+                                                   hf[ev.front()].r1.size()) + 1);
+                            const auto t_ix = std::chrono::steady_clock::now();
+                            const IntervalSeedIndex FX = build_interval_seed_index(FG, piece0);
+                            const double ix_s = std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - t_ix).count();
+                            fo << "piece\t" << piece0 << '\n';
+                            fo << "index_ok\t" << (FX.ok ? 1 : 0) << '\n';
+                            fo << "index_complete\t" << (FX.complete ? 1 : 0) << '\n';
+                            fo << "shortest_allele\t" << FX.shortest_allele << '\n';
+                            fo << "longest_invariant\t" << FX.longest_context << '\n';
+                            fo << "index_build_seconds\t" << ix_s << '\n';
+                            fo << "index_inside_keys\t" << FX.inside.size() << '\n';
+                            fo << "index_boundary_keys\t" << FX.boundary.size() << '\n';
+                            std::size_t contributed = 0, refused = 0, fin_tot = 0;
+                            std::uint64_t seedh = 0, symst = 0, joins = 0, tup = 0, ver = 0,
+                                          acc = 0, frst = 0, writes = 0, pbd = 0, pad = 0;
+                            std::size_t cells_differ = 0, org_differ = 0, sig_differ2 = 0,
+                                        con_differ2 = 0, oracle_cells = 0, oracle_finite = 0,
+                                        oracle_absent = 0;
+                            double worst_mass = 0.0;
+                            std::ofstream mf;
+                            if (hybrid_factor_oracle) {
+                                mf.open(fp.back() + ".manifest.tsv");
+                                if (mf) mf << "fragment\tcell\tallele_tuple\n";
+                            }
+                            const auto t_run = std::chrono::steady_clock::now();
+                            // PROGRESS, per fragment. The first attempt at this run went 40
+                            // minutes with no output: unable to say whether it was a tenth done or
+                            // nearly finished, and therefore unable to justify either waiting or
+                            // killing it. A long silent loop is not a measurement.
+                            std::size_t done_n = 0;
+                            double score_s = 0.0, oracle_s = 0.0;
+                            const auto t_prog = std::chrono::steady_clock::now();
+                            for (std::size_t fi : ev) {
+                                const std::size_t len = hf[fi].bases();
+                                const std::size_t be = static_cast<std::size_t>(
+                                    hyb_params.bg_divergence * static_cast<double>(len));
+                                const double bgf = static_cast<double>(be) * lep +
+                                                   static_cast<double>(len - be) * l1m;
+                                const auto t_sc0 = std::chrono::steady_clock::now();
+                                const IntervalEmission E = interval_emission(
+                                    hf[fi], FG, ip, hyb_params.max_divergence, lep, l1m, bgf,
+                                    &FX, nullptr, true, hybrid_factor_oracle);
+                                score_s += std::chrono::duration<double>(
+                                    std::chrono::steady_clock::now() - t_sc0).count();
+                                if (E.work_refused || !E.ok) { ++refused; continue; }
+                                ++contributed;
+                                seedh += E.seed_hits; symst += E.symbolic_states;
+                                pbd += E.placements_before_dedup; pad += E.placements_after_dedup;
+                                joins += E.joined_pairs; tup += E.tuple_expansions;
+                                ver += E.full_read_verifications; acc += E.accepted_placements;
+                                frst += E.verified_fr_states; fin_tot += E.finite_cells;
+                                for (std::uint32_t cs : E.cell_states) writes += cs;
+                                const auto t_or0 = std::chrono::steady_clock::now();
+                                if (hybrid_factor_oracle) {
+                                    // THE FROZEN MANIFEST, selected WITHOUT looking at any result:
+                                    // a deterministic hash of the fragment name strides through the
+                                    // cell space, plus the length extremes, the all-non-reference
+                                    // tuple, and -- for a four-block factor -- a cross grid over
+                                    // the OUTER blocks, which is where the 122x fan-out lives. The
+                                    // selection is written to disk before a single comparison runs
+                                    // and is never adjusted afterwards.
+                                    std::uint64_t hsh = 1469598103934665603ull;
+                                    for (char ch : hf[fi].name) {
+                                        hsh ^= static_cast<std::uint64_t>(
+                                            static_cast<unsigned char>(ch));
+                                        hsh *= 1099511628211ull;
+                                    }
+                                    std::set<std::size_t> pick;
+                                    const std::size_t NCELL = FG.cells();
+                                    for (std::size_t q = 0; q < 32; ++q)
+                                        pick.insert((hsh + q * 2654435761ull) % NCELL);
+                                    // Length extremes and the all-non-reference tuple.
+                                    std::vector<std::uint32_t> tmin(FG.alleles.size(), 0),
+                                                               tmax(FG.alleles.size(), 0),
+                                                               tnr(FG.alleles.size(), 0);
+                                    for (std::size_t j = 0; j < FG.alleles.size(); ++j) {
+                                        std::size_t lo2 = SIZE_MAX, hi2 = 0;
+                                        for (std::uint32_t a = 0; a < FG.alleles[j].size(); ++a) {
+                                            const std::size_t L = FG.alleles[j][a].size();
+                                            if (L < lo2) { lo2 = L; tmin[j] = a; }
+                                            if (L > hi2) { hi2 = L; tmax[j] = a; }
+                                        }
+                                        tnr[j] = FG.alleles[j].size() > 1 ? 1 : 0;
+                                    }
+                                    pick.insert(FG.cell_index(tmin));
+                                    pick.insert(FG.cell_index(tmax));
+                                    pick.insert(FG.cell_index(tnr));
+                                    // The outer-block cross grid, on ONE fragment, capped.
+                                    if (FG.alleles.size() == 4 && done_n == 0) {
+                                        std::vector<std::uint32_t> t(4, 0);
+                                        for (std::uint32_t a0 = 0;
+                                             a0 < FG.alleles[0].size() && a0 < 25; ++a0)
+                                        for (std::uint32_t a3 = 0; a3 < FG.alleles[3].size(); ++a3) {
+                                            t[0] = a0; t[1] = 0; t[2] = 0; t[3] = a3;
+                                            pick.insert(FG.cell_index(t));
+                                        }
+                                    }
+                                    for (std::size_t c : pick) {
+                                        if (mf) {
+                                            std::vector<std::uint32_t> tc;
+                                            FG.cell_choice(c, tc);
+                                            mf << hf[fi].name << '\t' << c << '\t';
+                                            for (std::size_t j = 0; j < tc.size(); ++j)
+                                                mf << (j ? "," : "") << tc[j];
+                                            mf << '\n';
+                                        }
+                                        ++oracle_cells;
+                                        const IntervalOracleCell Oc = interval_oracle_cell(
+                                            hf[fi], FG, ip, hyb_params.max_divergence, lep, l1m, c);
+                                        const bool a1 = E.mass[c] != -INFINITY;
+                                        const bool b1 = Oc.mass != -INFINITY;
+                                        if (a1) ++oracle_finite; else ++oracle_absent;
+                                        if (a1 != b1) { ++cells_differ; continue; }
+                                        if (E.cell_origin[c] != Oc.origin) ++org_differ;
+                                        if (E.cell_signature[c] != Oc.signature) ++sig_differ2;
+                                        if (E.cell_contrib[c].size() != Oc.contrib.size()) ++con_differ2;
+                                        else for (std::size_t q = 0; q < Oc.contrib.size(); ++q)
+                                            if (E.cell_contrib[c][q] != Oc.contrib[q]) {
+                                                ++con_differ2; break;
+                                            }
+                                        if (a1) worst_mass = std::max(worst_mass,
+                                                                      std::abs(E.mass[c] - Oc.mass));
+                                    }
+                                }
+                                oracle_s += std::chrono::duration<double>(
+                                    std::chrono::steady_clock::now() - t_or0).count();
+                                if (++done_n % 2 == 0 || done_n == ev.size()) {
+                                    const double el = std::chrono::duration<double>(
+                                        std::chrono::steady_clock::now() - t_prog).count();
+                                    log.info("hybrid factor " + fbstr + ": " +
+                                             std::to_string(done_n) + "/" +
+                                             std::to_string(ev.size()) + " fragments, " +
+                                             std::to_string(el) + " s elapsed, projected " +
+                                             std::to_string(el / static_cast<double>(done_n) *
+                                                            static_cast<double>(ev.size())) + " s");
+                                }
+                            }
+                            const double run_s = std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - t_run).count();
+                            fo << "fragments_contributed\t" << contributed << '\n';
+                            fo << "fragments_refused\t" << refused << '\n';
+                            fo << "all_contributed\t"
+                               << ((contributed == ev.size() && refused == 0) ? 1 : 0) << '\n';
+                            fo << "seed_hits\t" << seedh << '\n';
+                            fo << "symbolic_states\t" << symst << '\n';
+                            fo << "joined_pairs\t" << joins << '\n';
+                            fo << "tuple_expansions\t" << tup << '\n';
+                            fo << "full_read_verifications\t" << ver << '\n';
+                            fo << "accepted_placements\t" << acc << '\n';
+                            fo << "placements_before_dedup\t" << pbd << '\n';
+                            fo << "placements_after_dedup\t" << pad << '\n';
+                            fo << "verified_fr_states\t" << frst << '\n';
+                            fo << "cell_state_writes\t" << writes << '\n';
+                            fo << "finite_fragment_cells\t" << fin_tot << '\n';
+                            // THREE DIFFERENT QUANTITIES, and conflating them would make a
+                            // production figure look thirty times worse than it is. Symbolic
+                            // scoring is what production would pay; the manifest, oracle and
+                            // comparison exist only to certify it and would never run in a call.
+                            fo << "symbolic_scoring_seconds\t" << score_s << '\n';
+                            fo << "manifest_oracle_compare_seconds\t" << oracle_s << '\n';
+                            fo << "factor_total_seconds\t" << run_s << '\n';
+                            if (hybrid_factor_oracle) {
+                                fo << "oracle_cells_checked\t" << oracle_cells << '\n';
+                                fo << "oracle_cells_finite\t" << oracle_finite << '\n';
+                                fo << "oracle_cells_absent\t" << oracle_absent << '\n';
+                                fo << "oracle_cells_differ\t" << cells_differ << '\n';
+                                fo << "oracle_origin_differ\t" << org_differ << '\n';
+                                fo << "oracle_signature_differ\t" << sig_differ2 << '\n';
+                                fo << "oracle_contribution_differ\t" << con_differ2 << '\n';
+                                fo << "oracle_worst_mass\t" << worst_mass << '\n';
+                            }
+                            struct rusage ru {};
+                            double pk = 0.0;
+                            if (getrusage(RUSAGE_SELF, &ru) == 0) {
+#ifdef __APPLE__
+                                pk = static_cast<double>(ru.ru_maxrss) / 1048576.0;
+#else
+                                pk = static_cast<double>(ru.ru_maxrss) / 1024.0;
+#endif
+                            }
+                            // WHOLE-PROCESS RSS, not this factor's. What the difference from the
+                            // pre-factor baseline is attributable to has NOT been measured, and
+                            // naming a cause without phase-level measurement would be a guess.
+                            fo << "process_peak_rss_mb\t" << pk << '\n';
+                            fo << "process_peak_rss_attribution\tUNMEASURED\n";
+                            log.info("hybrid factor " + fbstr + ": " + std::to_string(contributed) +
+                                     "/" + std::to_string(ev.size()) + " fragments, " +
+                                     std::to_string(FG.cells()) + " cells, index complete=" +
+                                     (FX.complete ? "yes" : "NO") + ", " + std::to_string(run_s) +
+                                     " s" + (hybrid_factor_oracle
+                                        ? ", oracle differ " + std::to_string(cells_differ) + "/" +
+                                          std::to_string(org_differ) : ""));
+                        }
+                    }
                     // ---- INTERVAL GEOMETRY CROSS-CHECK ----------------------------------------
                     // The generic k-block geometry, reported through the type the factor will
                     // actually use. Its window statistics must reproduce the arity probe's, which

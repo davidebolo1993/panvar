@@ -1811,6 +1811,7 @@ struct IntervalEmission {
     bool work_refused = false;
     std::string refusal;
     // Measured work, so "the join constrains the product" is a counter and not a hope.
+    std::size_t placements_before_dedup = 0, placements_after_dedup = 0;
     std::size_t seed_hits = 0;             // index lookups that matched
     std::size_t symbolic_states = 0;       // seed hits kept with free dimensions unexpanded
     std::size_t joined_pairs = 0;          // mate pairs whose allele constraints are compatible
@@ -1826,6 +1827,19 @@ struct IntervalEmission {
     std::size_t states_with_free_intermediate = 0;
     std::size_t states_orientation_a = 0, states_orientation_b = 0;
 };
+
+// ONE CELL of the reference, so a stratified manifest can be checked without materialising the
+// whole product. Returns the cell's mass; fills the origin and contribution descriptors when asked.
+struct IntervalOracleCell {
+    double mass = 0.0;
+    std::uint32_t states = 0;
+    std::string origin;       // canonical, sorted: (m1_start, m1_fwd, m2_start, m2_fwd, insert)
+    std::string signature;    // canonical, sorted: (m1_edits, m2_edits, insert)
+    std::vector<double> contrib;
+};
+IntervalOracleCell interval_oracle_cell(const Fragment& fragment, const IntervalGeometry& geom,
+                                        const InsertPrior& ip, double max_divergence,
+                                        double log_eps, double log_1meps, std::size_t cell);
 
 // THE REFERENCE: every cell, window materialised, every start scanned. Correct by construction and
 // far too slow for production -- which is the point. The fast path is certified against it.

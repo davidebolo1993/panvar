@@ -5096,6 +5096,7 @@ IntervalEmission interval_emission(const Fragment& fragment, const IntervalGeome
         // Identical placements arise from different seeds; a repeat origin is a DIFFERENT start and
         // must survive, so dedup is on the whole descriptor rather than on the cell.
         auto& v = place[m];
+        out.placements_before_dedup += v.size();
         std::sort(v.begin(), v.end(), [](const IntervalPlacement& x, const IntervalPlacement& y) {
             return std::tie(x.first_block, x.last_block, x.alleles, x.offset_in_first, x.edits) <
                    std::tie(y.first_block, y.last_block, y.alleles, y.offset_in_first, y.edits);
@@ -5108,6 +5109,7 @@ IntervalEmission interval_emission(const Fragment& fragment, const IntervalGeome
                                        x.edits == y.edits;
                             }),
                 v.end());
+        out.placements_after_dedup += v.size();
     }
     // ---- THE MATE JOIN ------------------------------------------------------------------------
     // Both FR predicates depend only on rev_end - fwd_start, so this works in RELATIVE coordinates
@@ -5246,6 +5248,51 @@ IntervalEmission interval_emission(const Fragment& fragment, const IntervalGeome
         }
     }
     out.ok = true;
+    return out;
+}
+
+IntervalOracleCell interval_oracle_cell(const Fragment& fragment, const IntervalGeometry& geom,
+                                        const InsertPrior& ip, double max_divergence,
+                                        double log_eps, double log_1meps, std::size_t cell) {
+    IntervalOracleCell out;
+    out.mass = kNegInf;
+    const std::size_t d1 = mate_band_edits(max_divergence, fragment.r1.size());
+    const std::size_t d2 = mate_band_edits(max_divergence, fragment.r2.size());
+    const std::string a1 = reverse_complement(fragment.r1);
+    const std::string a2 = reverse_complement(fragment.r2);
+    std::vector<std::uint32_t> choice;
+    geom.cell_choice(cell, choice);
+    std::vector<const std::string*> alle, ctxp;
+    for (std::size_t j = 0; j < geom.alleles.size(); ++j)
+        alle.push_back(&geom.alleles[j][choice[j]]);
+    for (const std::string& cx : geom.contexts) ctxp.push_back(&cx);
+    VirtualWindow vw;
+    vw.bind_chain(geom.lflank, alle, ctxp, geom.rflank);
+    const std::string win = vw.materialize();
+    const auto f1 = bounded_mate_placements(fragment.r1, win, d1, nullptr, nullptr);
+    const auto v1 = bounded_mate_placements(a1, win, d1, nullptr, nullptr);
+    const auto f2 = bounded_mate_placements(fragment.r2, win, d2, nullptr, nullptr);
+    const auto v2 = bounded_mate_placements(a2, win, d2, nullptr, nullptr);
+    const auto st = enumerate_fragment_states(0, f1, v1, f2, v2, fragment.r1.size(),
+                                              fragment.r2.size(), ip.lo, ip.hi);
+    out.states = static_cast<std::uint32_t>(st.size());
+    std::vector<std::array<long, 5>> og;
+    std::vector<std::array<std::uint32_t, 3>> sg;
+    for (const FragmentState& z : st) {
+        const double c = origin_contribution(z.m1_edits, fragment.r1.size(), z.m2_edits,
+                                             fragment.r2.size(), z.insert, log_eps, log_1meps, ip);
+        out.mass = log_add(out.mass, c);
+        out.contrib.push_back(c);
+        og.push_back({z.m1_start, z.m1_fwd ? 1L : 0L, z.m2_start, z.m2_fwd ? 1L : 0L, z.insert});
+        sg.push_back({z.m1_edits, z.m2_edits, static_cast<std::uint32_t>(z.insert)});
+    }
+    std::sort(out.contrib.begin(), out.contrib.end());
+    std::sort(og.begin(), og.end());
+    std::sort(sg.begin(), sg.end());
+    out.origin.resize(og.size() * 40);
+    for (std::size_t q = 0; q < og.size(); ++q) std::memcpy(&out.origin[q * 40], og[q].data(), 40);
+    out.signature.resize(sg.size() * 12);
+    for (std::size_t q = 0; q < sg.size(); ++q) std::memcpy(&out.signature[q * 12], sg[q].data(), 12);
     return out;
 }
 
