@@ -1140,6 +1140,257 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                 std::string(arm.name) + ": and the BACKWARD marginals match brute force over all " +
                 std::to_string(NB * NS) + " (worst relative " + sci(worst_bm) + ")");
 
+            // ---- THE ADJOINT SWEEP: marginals from the FORWARD circuit ---------------------
+            // The forward contraction is an arithmetic circuit for Z, and Z is LINEAR in every
+            // unary, so a reverse-mode sweep through that same circuit yields every marginal:
+            //
+            //     marginal(b, x) = SUM over states s at block b with X(s) = x of  msg_b(s) * bar_b(s)
+            //
+            // where bar_b(s) = dZ/d msg_b(s) is the weight of everything downstream. Each forward
+            // update  dst += src * m  has adjoint  bar_src += bar_dst * m, so the sweep reuses the
+            // forward history organisation and never builds the right-to-left history that makes an
+            // independent backward contraction expensive. The independent backward implementation
+            // stays as an ORACLE; it is not the production algorithm.
+            {
+                // Forward again, retaining every message and its update list.
+                struct UpdK { std::string src, dst; double m; };
+                std::vector<std::map<std::string, std::pair<St, double>>> keep;
+                std::vector<std::vector<UpdK>> tape;
+                std::map<std::string, std::pair<St, double>> msg;
+                for (std::size_t x = 0; x < NS; ++x) { St s2; s2.x = x; msg[keyof(s2)] = {s2, U[0][x]}; }
+                keep.push_back(msg);
+                std::uint64_t adj_ops = 0;
+                std::uint64_t fw_mult = 0, fw_lookup = 0, fw_hist = 0;
+                for (std::size_t b = 1; b < NB; ++b) {
+                    std::map<std::string, std::pair<St, double>> nxt;
+                    std::vector<UpdK> tpk;
+                    for (const auto& kv : msg) {
+                        const St& cur = kv.second.first; const double w = kv.second.second;
+                        const std::size_t t1 = cur.x / NH, t2 = cur.x % NH;
+                        for (int c1 = 0; c1 < 2; ++c1) for (int c2 = 0; c2 < 2; ++c2) {
+                            const double w1 = (c1 == 0) ? (1.0 - r) : (r / double(NH));
+                            const double w2 = (c2 == 0) ? (1.0 - r) : (r / double(NH));
+                            if (w1 == 0.0 || w2 == 0.0) continue;
+                            const std::size_t lo1 = (c1 == 0) ? t1 : 0, hi1 = (c1 == 0) ? t1 + 1 : NH;
+                            const std::size_t lo2 = (c2 == 0) ? t2 : 0, hi2 = (c2 == 0) ? t2 + 1 : NH;
+                            for (std::size_t n1 = lo1; n1 < hi1; ++n1)
+                            for (std::size_t n2 = lo2; n2 < hi2; ++n2) {
+                                St s2 = cur;
+                                if (c1 == 1) for (std::size_t q = s2.h1.size(); q < b; ++q)
+                                    { s2.h1.push_back(cls(tal[t1][q])); ++fw_hist; }
+                                if (c2 == 1) for (std::size_t q = s2.h2.size(); q < b; ++q)
+                                    { s2.h2.push_back(cls(tal[t2][q])); ++fw_hist; }
+                                s2.x = n1 * NH + n2;
+                                double m = w1 * w2 * U[b][s2.x];
+                                ++fw_mult;
+                                if (b == span1.back() || b == span2.back()) {
+                                    const auto& span = (b == span1.back()) ? span1 : span2;
+                                    auto& M = (b == span1.back()) ? F1v : F2v;
+                                    std::string k;
+                                    for (std::size_t q : span) k.push_back(static_cast<char>('0' +
+                                        (q < s2.h1.size() ? s2.h1[q] : cls(tal[n1][q]))));
+                                    k.push_back('|');
+                                    for (std::size_t q : span) k.push_back(static_cast<char>('0' +
+                                        (q < s2.h2.size() ? s2.h2[q] : cls(tal[n2][q]))));
+                                    const std::size_t half = k.find('|');
+                                    const std::string sw = k.substr(half+1) + "|" + k.substr(0,half);
+                                    const std::string canon = std::min(k, sw);
+                                    auto it = M.find(canon);
+                                    ++fw_lookup;
+                                    if (it == M.end()) it = M.emplace(canon,
+                                        std::uniform_real_distribution<double>(0.3,3.0)(rng)).first;
+                                    m *= it->second;
+                                }
+                                if (b == span2.back()) { s2.h1.clear(); s2.h2.clear(); }
+                                const std::string kk = keyof(s2);
+                                auto f = nxt.find(kk);
+                                if (f == nxt.end()) nxt.emplace(kk, std::make_pair(s2, w * m));
+                                else f->second.second += w * m;
+                                // The tape records the DESTINATION KEY, not an index into a map
+                                // that is still growing: a position taken mid-insert would be
+                                // invalidated by the next insertion.
+                                tpk.push_back({kv.first, kk, m});
+                                ++adj_ops;
+                            }
+                        }
+                    }
+                    tape.push_back(std::move(tpk));
+                    msg.swap(nxt);
+                    keep.push_back(msg);
+                }
+                // ---- THE TAPE-FREE ADJOINT --------------------------------------------------
+                // The tape above costs one entry per forward update -- at C4 scale ~1.9e9 entries,
+                // dwarfing everything else -- so production must RECOMPUTE each multiplier by
+                // re-walking the same loop over the retained messages. Same message-entry update
+                // count; different CPU work, which is counted separately below.
+                std::uint64_t fwd_updates = adj_ops;   // everything so far was the forward pass
+
+                // The count is PREDICTABLE before either sweep runs: each retained state expands
+                // into (stay ? 1 : 0) + (switch ? NH : 0) targets per homologue, and the forward
+                // pass inserts every one of them, so the adjoint -- enumerating the same loop in
+                // reverse -- must visit exactly the same number. An inequality here means the two
+                // enumerations have drifted apart, which no marginal check would necessarily catch
+                // if the drift happened to be mass-preserving.
+                const std::uint64_t per_hom =
+                    ((1.0 - r) != 0.0 ? 1u : 0u) + ((r / double(NH)) != 0.0 ? NH : 0u);
+                std::uint64_t pred_updates = 0;
+                for (std::size_t b = 0; b + 1 < NB; ++b)
+                    pred_updates += std::uint64_t(keep[b].size()) * per_hom * per_hom;
+                ok_(fwd_updates == pred_updates, std::string(arm.name) +
+                    ": the forward update count matches its closed-form prediction (" +
+                    std::to_string(fwd_updates) + " = " + std::to_string(pred_updates) + ")");
+                // PARALLEL SAFETY. The outer loop is over SOURCES and each iteration
+                // accumulates only into barf[b][its own source key], reading barf[b+1] read-only.
+                // So the adjoint partitions by source with no contention and no reduction buffer.
+                // (The FORWARD pass is the contended one -- many sources reach one destination.)
+                // The `rev` parameter exists to prove it: visiting sources in the opposite order
+                // must give BITWISE identical adjoints, which it cannot if any two sources shared
+                // an accumulator.
+                std::uint64_t tf_updates = 0, tf_mult_recon = 0, tf_factor_lookups = 0,
+                              tf_hist_ops = 0;
+                auto sweep = [&](bool rev) {
+                std::vector<std::map<std::string, double>> barf(NB);
+                for (const auto& kv : keep[NB - 1]) barf[NB - 1][kv.first] = 1.0;
+                for (std::size_t b = NB - 1; b-- > 0;) {
+                    for (const auto& kv : keep[b]) barf[b][kv.first] = 0.0;
+                    std::vector<const std::pair<const std::string,
+                                std::pair<St, double>>*> order;
+                    for (const auto& e : keep[b]) order.push_back(&e);
+                    if (rev) std::reverse(order.begin(), order.end());
+                    for (const auto* ep : order) { const auto& kv = *ep;
+                        const St& cur = kv.second.first;
+                        const std::size_t t1 = cur.x / NH, t2 = cur.x % NH;
+                        for (int c1 = 0; c1 < 2; ++c1) for (int c2 = 0; c2 < 2; ++c2) {
+                            const double w1 = (c1 == 0) ? (1.0 - r) : (r / double(NH));
+                            const double w2 = (c2 == 0) ? (1.0 - r) : (r / double(NH));
+                            if (w1 == 0.0 || w2 == 0.0) continue;
+                            const std::size_t lo1 = (c1 == 0) ? t1 : 0, hi1 = (c1 == 0) ? t1 + 1 : NH;
+                            const std::size_t lo2 = (c2 == 0) ? t2 : 0, hi2 = (c2 == 0) ? t2 + 1 : NH;
+                            for (std::size_t n1 = lo1; n1 < hi1; ++n1)
+                            for (std::size_t n2 = lo2; n2 < hi2; ++n2) {
+                                St s2 = cur;
+                                if (c1 == 1) { for (std::size_t q = s2.h1.size(); q < b + 1; ++q)
+                                    { s2.h1.push_back(cls(tal[t1][q])); ++tf_hist_ops; } }
+                                if (c2 == 1) { for (std::size_t q = s2.h2.size(); q < b + 1; ++q)
+                                    { s2.h2.push_back(cls(tal[t2][q])); ++tf_hist_ops; } }
+                                s2.x = n1 * NH + n2;
+                                double m = w1 * w2 * U[b + 1][s2.x];
+                                ++tf_mult_recon;
+                                const std::size_t bb = b + 1;
+                                if (bb == span1.back() || bb == span2.back()) {
+                                    const auto& span = (bb == span1.back()) ? span1 : span2;
+                                    auto& M = (bb == span1.back()) ? F1v : F2v;
+                                    std::string k;
+                                    for (std::size_t q : span) k.push_back(static_cast<char>('0' +
+                                        (q < s2.h1.size() ? s2.h1[q] : cls(tal[n1][q]))));
+                                    k.push_back('|');
+                                    for (std::size_t q : span) k.push_back(static_cast<char>('0' +
+                                        (q < s2.h2.size() ? s2.h2[q] : cls(tal[n2][q]))));
+                                    const std::size_t half = k.find('|');
+                                    const std::string sw = k.substr(half+1) + "|" + k.substr(0,half);
+                                    auto it = M.find(std::min(k, sw));
+                                    ++tf_factor_lookups;
+                                    if (it != M.end()) m *= it->second;
+                                }
+                                if (bb == span2.back()) { s2.h1.clear(); s2.h2.clear(); }
+                                const auto itb = barf[b + 1].find(keyof(s2));
+                                if (itb == barf[b + 1].end()) continue;
+                                barf[b][kv.first] += itb->second * m;
+                                ++tf_updates;
+                            }
+                        }
+                    }
+                }
+                return barf;
+                };
+                std::uint64_t z1 = 0, z2 = 0, z3 = 0, z4 = 0;
+                const auto barf = sweep(false);
+                z1 = tf_updates; z2 = tf_mult_recon; z3 = tf_factor_lookups; z4 = tf_hist_ops;
+                tf_updates = tf_mult_recon = tf_factor_lookups = tf_hist_ops = 0;
+                const auto barf_rev = sweep(true);
+                bool bitwise = (tf_updates == z1);
+                for (std::size_t b = 0; b < NB && bitwise; ++b) {
+                    if (barf[b].size() != barf_rev[b].size()) { bitwise = false; break; }
+                    auto i1 = barf[b].begin(); auto i2 = barf_rev[b].begin();
+                    for (; i1 != barf[b].end(); ++i1, ++i2)
+                        if (i1->first != i2->first ||
+                            std::memcmp(&i1->second, &i2->second, sizeof(double)) != 0)
+                            { bitwise = false; break; }
+                }
+                tf_updates = z1; tf_mult_recon = z2; tf_factor_lookups = z3; tf_hist_ops = z4;
+                ok_(bitwise, std::string(arm.name) +
+                    ": the adjoint PARTITIONS BY SOURCE -- reversing the source visit order gives "
+                    "bitwise identical adjoints, so threads over sources need no reduction and no "
+                    "atomic accumulation");
+                double worst_tf = 0.0;
+                for (std::size_t b = 0; b < NB; ++b) {
+                    std::vector<double> mg(NS, 0.0);
+                    for (const auto& kv : keep[b]) {
+                        const auto it = barf[b].find(kv.first);
+                        if (it == barf[b].end()) continue;
+                        mg[kv.second.first.x] += kv.second.second * it->second;
+                    }
+                    for (std::size_t x = 0; x < NS; ++x)
+                        worst_tf = std::max(worst_tf, std::abs(mg[x] - marg_bf[b][x]) / Z_bf);
+                }
+                ok_(tf_updates == fwd_updates && tf_updates == pred_updates,
+                    std::string(arm.name) + ": forward and reverse enumerate the SAME loop (" +
+                    std::to_string(fwd_updates) + " forward, " + std::to_string(tf_updates) +
+                    " adjoint, " + std::to_string(pred_updates) + " predicted)");
+                ok_(worst_tf < 1e-12, std::string(arm.name) +
+                    ": the TAPE-FREE adjoint gives every marginal (worst relative " +
+                    sci(worst_tf) + "); forward " + std::to_string(fwd_updates) + " updates, "
+                    "adjoint " + std::to_string(tf_updates) + ", total " +
+                    std::to_string(fwd_updates + tf_updates) + "; " +
+                    std::to_string(tf_mult_recon) + " multiplier reconstructions, " +
+                    std::to_string(tf_factor_lookups) + " factor lookups, " +
+                    std::to_string(tf_hist_ops) + " history appends (forward, separately: " +
+                    std::to_string(fw_mult) + " / " + std::to_string(fw_lookup) + " / " +
+                    std::to_string(fw_hist) + ")");
+
+                // ---- THE TAPED ADJOINT, kept only as a cross-check ---------------------------
+                // bar at the last block is 1 for every state: Z is their plain sum. Then every
+                // forward update  dst += src * m  contributes  bar_src += bar_dst * m, walked in
+                // reverse. This is the ONLY reverse traversal production needs.
+                std::vector<std::map<std::string, double>> bar(NB);
+                for (const auto& kv : keep[NB - 1]) bar[NB - 1][kv.first] = 1.0;
+                for (std::size_t b = NB - 1; b-- > 0;) {
+                    for (const auto& kv : keep[b]) bar[b][kv.first] = 0.0;
+                    for (const UpdK& u : tape[b]) {
+                        const auto it = bar[b + 1].find(u.dst);
+                        if (it == bar[b + 1].end()) continue;
+                        bar[b][u.src] += it->second * u.m;
+                        ++adj_ops;
+                    }
+                }
+                // marginal(b, x) = sum over states at b carrying X = x of msg * bar
+                double worst_a = 0.0;
+                for (std::size_t b = 0; b < NB; ++b) {
+                    std::vector<double> mg(NS, 0.0);
+                    for (const auto& kv : keep[b]) {
+                        const auto it = bar[b].find(kv.first);
+                        if (it == bar[b].end()) continue;
+                        mg[kv.second.first.x] += kv.second.second * it->second;
+                    }
+                    for (std::size_t x = 0; x < NS; ++x)
+                        worst_a = std::max(worst_a, std::abs(mg[x] - marg_bf[b][x]) / Z_bf);
+                }
+                ok_(worst_a < 1e-12, std::string(arm.name) +
+                    ": the TAPED adjoint agrees too (worst relative " + sci(worst_a) +
+                    ") -- it is a cross-check on the tape-free one, not the production path");
+                double worst_tt = 0.0;
+                for (std::size_t b = 0; b < NB; ++b)
+                    for (const auto& kv : keep[b]) {
+                        const auto a1 = bar[b].find(kv.first);
+                        const auto a2 = barf[b].find(kv.first);
+                        if (a1 == bar[b].end() || a2 == barf[b].end()) continue;
+                        worst_tt = std::max(worst_tt, std::abs(a1->second - a2->second));
+                    }
+                ok_(worst_tt < 1e-12, std::string(arm.name) +
+                    ": taped and TAPE-FREE adjoints agree entry for entry (worst " +
+                    sci(worst_tt) + ")");
+            }
+
             // EVERY MARGINAL, by clamping each block to each state in turn.
             double worst_c = 0.0;
             for (std::size_t b = 0; b < NB; ++b)

@@ -2347,6 +2347,16 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                    << GR.cells_disagreeing_with_representative << '\n';
                                 fo << "joint_equality_verified\t"
                                    << (GR.joint_equality_verified ? 1 : 0) << '\n';
+                                // THE ACTUAL ALLELE -> CLASS VECTORS, per block. Equal class
+                                // COUNTS on a shared block do not prove identical partitions, and
+                                // a refinement claim between two factors must be checked on the
+                                // mappings themselves.
+                                for (std::size_t j = 0; j < GR.allele_class.size(); ++j) {
+                                    fo << "allele_class_block_" << FG.blocks[j] << '\t';
+                                    for (std::size_t a = 0; a < GR.allele_class[j].size(); ++a)
+                                        fo << (a ? "," : "") << GR.allele_class[j][a];
+                                    fo << '\n';
+                                }
                                 fo << "content_class_reduction\t"
                                    << (GR.content_classes_grouped
                                         ? static_cast<double>(GR.content_classes_raw) /

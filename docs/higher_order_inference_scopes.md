@@ -161,10 +161,75 @@ that puts the SMALLEST class counts first. F1's classes are (2,16,10,8) and forw
 F2's are (6,8,3) and backward begins at 3. Assuming a single order for both would have left F2 four
 times more expensive than necessary, which is why both are predicted rather than one chosen.
 
+## The adjoint sweep is the production marginal algorithm
+
+Z is an arithmetic circuit in the forward messages and is LINEAR in every message entry, so the
+reverse-mode adjoint gives all block marginals at forward cost:
+
+    marginal(b, x) = SUM over s with X(s) = x of  msg_b(s) * bar_b(s)
+
+with bar seeded at 1 on the last block and swept backwards through the SAME updates the forward pass
+made. This replaces the independent backward contraction, which stays only as an oracle: the
+backward direction builds a right-to-left history the forward direction never needs.
+
+PRODUCTION IS TAPE-FREE. Recording one tape entry per update would be ~1.9e9 entries at C4 scale and
+would dominate every other cost, so the reverse sweep RE-WALKS the forward loop over the retained
+messages and RECOMPUTES each multiplier. That preserves the message-entry update count exactly; it
+does NOT preserve total CPU work, which is why the auxiliary categories are counted separately.
+
+On the six-block fixture (four arms: r=0, r=0.25, r=1, and symmetric emissions), at r=0.25:
+
+    message-entry updates      forward   22,608
+                               adjoint   22,608
+                               total     45,216
+    multiplier reconstructions           22,608   per sweep
+    factor lookups                       19,584   per sweep
+    class/history append ops             74,088   per sweep   <-- 3.3x the update count
+
+The last line is the point of separating them: history mapping, not the multiply-add, is the largest
+per-sweep operation category, and an update count alone would have hidden that by a factor of three.
+
+The fixture's forward count is also PREDICTED before either sweep runs, as
+sum over b of |msg_b| * fanout^2 with fanout = (stay ? 1 : 0) + (switch ? NH : 0), and the adjoint
+must match it exactly -- an inequality means the two enumerations have drifted apart, which a
+marginal check would not necessarily catch if the drift were mass-preserving.
+
+## Parallelization: the adjoint partitions by source, the forward pass does not
+
+The reverse sweep's outer loop is over SOURCES, and each iteration accumulates only into its own
+source's adjoint while reading the next block's adjoints read-only. So threads over sources need no
+reduction buffer, no locks, and NO ATOMIC FLOATING-POINT ACCUMULATION -- which would be
+non-deterministic in ordering and is excluded outright.
+
+This is asserted as a GATE, not a design intent: visiting sources in the opposite order must give
+BITWISE identical adjoints, and does in all four arms. Mutating the accumulation so two sources share
+one destination breaks it in three arms.
+
+The contended direction is the FORWARD pass, where many sources reach one destination. That is where
+a deterministic thread-local reduction is required, and its buffers must be counted in the memory
+prediction before allocation.
+
 ## What the operation counter measures
 
 MESSAGE-ENTRY UPDATES: one accumulation into a state of the next message -- a multiply and an add in
-linear space. NOT floating-point instructions, and not comparable to a FLOP count. The C4 figures
-above are RESOURCE ESTIMATES; memory fitting is established, RUNTIME IS NOT, and neither is until
-the contraction runs on C4 and reports measured forward time, backward time, actual updates, peak
-entries and bytes, and RSS separately.
+linear space. NOT floating-point instructions, and not comparable to a FLOP count. It is also not
+total CPU work: multiplier reconstructions, factor lookups and class/history mapping operations are
+counted and reported SEPARATELY, because the tape-free adjoint trades storage for recomputation and
+because history mapping outnumbers the updates themselves on the fixture.
+
+PREDICTED INFERENCE PAYLOAD: the message and adjoint arrays only. It EXCLUDES allocator overhead,
+the factor lookup structures, temporary buffers, and the forward pass's thread-local reduction
+arrays. It is therefore a lower bound on inference memory, not a total, and must not be quoted as
+one; the benchmark reports RSS separately.
+
+## STATUS OF THE C4 FIGURES IN THIS DOCUMENT
+
+The per-factor and per-schedule tables above are PROSE, not program output: no code in the tree
+derives them, and they cannot be re-derived from the class counts stated alongside them (17,658,669
+is not a diploid square, so it does not follow from the (2,16,10,8) x 131 state model as written).
+They are retained for the QUALITATIVE conclusions they support, all of which are independently
+argued: forward beats backward globally, the peak is not at the last position, a closed run can be
+summed immediately, and block 4 must carry the common refinement. The absolute counts and byte
+figures are NOT to be quoted until the benchmark on a representative C4 slice replaces them with
+measured forward time, adjoint time, actual updates in each of the four categories, peak entries,
+predicted payload, and RSS.
