@@ -424,6 +424,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
     std::string hybrid_super_ledger;     // "<b1>,...,<bk>,<path>" -- evidence accounting
     std::string hybrid_wide_inventory;   // every Wide fragment's scope, grouped
     std::string hybrid_context_dependence;  // "<ctx>,<b1>,...,<path>" -- is ctx emission-relevant?
+    std::string hybrid_interval_probe;      // "<b1>,...,<path>" -- the generic k-block geometry
     bool hybrid_triple_alias_used = false;
     struct EdgeRow {
         std::uint32_t a = 0, b = 0;
@@ -583,6 +584,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--hybrid-wide-inventory") hybrid_wide_inventory = require_value(arg);
         else if (arg == "--hybrid-context-dependence")
             hybrid_context_dependence = require_value(arg);
+        else if (arg == "--hybrid-interval-probe") hybrid_interval_probe = require_value(arg);
         else if (arg == "--hybrid-triple-probe") {
             // DEPRECATED: the probe takes any number of consecutive blocks now, so "triple" names
             // a case rather than the feature. Accepted, and said out loud.
@@ -2056,6 +2058,70 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         }
                     }
                     hyb_edges_considered = by_edge.size();
+                    // ---- INTERVAL GEOMETRY CROSS-CHECK ----------------------------------------
+                    // The generic k-block geometry, reported through the type the factor will
+                    // actually use. Its window statistics must reproduce the arity probe's, which
+                    // computed them by an independent path -- a new type agreeing with an existing
+                    // measurement is worth more than the same code reporting itself twice.
+                    if (!hybrid_interval_probe.empty()) {
+                        std::vector<std::string> ipp;
+                        std::string icu;
+                        for (char c : hybrid_interval_probe) {
+                            if (c == ',') { ipp.push_back(icu); icu.clear(); } else icu.push_back(c);
+                        }
+                        ipp.push_back(icu);
+                        std::vector<std::uint32_t> ib;
+                        for (std::size_t q = 0; q + 1 < ipp.size(); ++q)
+                            ib.push_back(static_cast<std::uint32_t>(std::stoul(ipp[q])));
+                        std::vector<std::vector<std::string>> iball(blocks.size());
+                        for (std::size_t q = 0; q < blocks.size(); ++q)
+                            iball[q] = blocks[q].allele_seq;
+                        const IntervalGeometry IG = build_interval_geometry(
+                            hyb_cov.frames, iball, block_variable, ib,
+                            static_cast<std::size_t>(ip.hi), ip);
+                        std::ofstream io(ipp.back());
+                        if (!io) throw std::runtime_error("genotype: cannot write " + ipp.back());
+                        io << "field\tvalue\n";
+                        std::string ibs;
+                        for (std::size_t q = 0; q < ib.size(); ++q)
+                            ibs += (q ? "," : "") + std::to_string(ib[q]);
+                        io << "blocks\t" << ibs << '\n';
+                        io << "ok\t" << (IG.ok ? 1 : 0) << '\n';
+                        if (!IG.ok) {
+                            io << "refusal\t" << IG.refusal << '\n';
+                        } else {
+                            io << "arity\t" << IG.arity() << '\n';
+                            io << "cells\t" << IG.cells() << '\n';
+                            std::string as;
+                            for (std::size_t q = 0; q < IG.alleles.size(); ++q)
+                                as += (q ? "x" : "") + std::to_string(IG.alleles[q].size());
+                            io << "alleles\t" << as << '\n';
+                            io << "lflank\t" << IG.lflank.size() << '\n';
+                            io << "rflank\t" << IG.rflank.size() << '\n';
+                            std::string cs;
+                            for (std::size_t q = 0; q < IG.contexts.size(); ++q)
+                                cs += (q ? "," : "") + std::to_string(IG.contexts[q].size());
+                            io << "contexts\t" << cs << '\n';
+                            io << "min_window\t" << IG.min_window << '\n';
+                            io << "max_window\t" << IG.max_window << '\n';
+                            io << "windows_below_affine\t" << IG.windows_below_affine << '\n';
+                            io << "exposure_affine\t" << (IG.exposure_affine ? 1 : 0) << '\n';
+                            // ROUND TRIP: cell_index and cell_choice must invert each other over
+                            // the whole product, or every tensor index derived from them is wrong.
+                            std::vector<std::uint32_t> ch;
+                            std::size_t bad = 0;
+                            for (std::size_t k2 = 0; k2 < IG.cells(); ++k2) {
+                                IG.cell_choice(k2, ch);
+                                if (IG.cell_index(ch) != k2) ++bad;
+                            }
+                            io << "index_roundtrip_failures\t" << bad << '\n';
+                        }
+                        log.info("hybrid interval geometry " + ibs + ": cells " +
+                                 std::to_string(IG.ok ? IG.cells() : 0) + ", windows " +
+                                 std::to_string(IG.min_window) + "-" +
+                                 std::to_string(IG.max_window) + ", affine=" +
+                                 (IG.exposure_affine ? "yes" : "no"));
+                    }
                     // ---- CONTEXT DEPENDENCE ---------------------------------------------------
                     // Does a neighbouring block change any fragment's STRUCTURAL SIGNATURE, or is
                     // it only sequence that makes the window long enough for exposure to be affine?

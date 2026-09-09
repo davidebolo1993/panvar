@@ -1705,6 +1705,51 @@ OwnershipLedger ownership_ledger(const std::vector<FragmentOwner>& owners);
 // homologue would produce. The edge potential still has to combine the two homologues once, mix the
 // background once, sum over every fragment owned by the edge, charge exposure once, and only then
 // remove the content baseline. LinkageEdge below does that; nothing here may be used as a factor.
+// ---- THE GENERIC INTERVAL FACTOR -------------------------------------------------------------
+//
+// A factor over k consecutive VARIABLE blocks. The pairwise edge is the k = 2 case; C4 needs k = 4
+// over {2,3,4,5} and k = 3 over {4,5,6}, because Wide fragments read three variable blocks at once
+// and no pairwise edge can ever consume them.
+//
+// SCOPE IS NOT OWNERSHIP. `blocks` says which genotype variables the factor depends on; the
+// evidence it consumes is passed separately and must be disjoint from every other factor's. Two
+// factors may share variables -- F1 and F2 share {4,5} -- while sharing no fragment.
+//
+// The window is  lflank + A_1 + C_1 + A_2 + ... + C_{k-1} + A_k + rflank,  which is exactly what
+// VirtualWindow::bind_chain walks, so the probe, the scorer and the oracle cannot drift about where
+// a component begins.
+struct IntervalGeometry {
+    std::vector<std::uint32_t> blocks;                     // ascending, all variable
+    std::vector<std::vector<std::string>> alleles;         // per block, in block order
+    std::vector<std::string> contexts;                     // k-1 invariant strings between them
+    std::string lflank, rflank;
+    // Exposure is affine iff every window reaches hi-1; then a diploid's total depends only on the
+    // unordered allele content and cancels across every relative phase arrangement.
+    bool exposure_affine = false;
+    std::size_t min_window = 0, max_window = 0;
+    std::size_t windows_below_affine = 0;
+    bool ok = false;
+    std::string refusal;
+    std::size_t arity() const { return blocks.size(); }
+    std::size_t cells() const {
+        std::size_t n = 1;
+        for (const auto& a : alleles) n *= a.size();
+        return n;
+    }
+    // Row-major over the allele product: index = ((i1 * n2 + i2) * n3 + i3) ...
+    std::size_t cell_index(const std::vector<std::uint32_t>& choice) const;
+    void cell_choice(std::size_t index, std::vector<std::uint32_t>& out) const;
+    std::size_t window_len(const std::vector<std::uint32_t>& choice) const;
+};
+
+// Built from the consecutive PAIRWISE geometries, so the contexts and flanks are the same sequence
+// the pairwise factors already use rather than a second opinion about them.
+IntervalGeometry build_interval_geometry(const std::vector<CandidateFrame>& frames,
+                                         const std::vector<std::vector<std::string>>& block_alleles,
+                                         const std::vector<char>& block_variable,
+                                         const std::vector<std::uint32_t>& blocks,
+                                         std::size_t flank_bp, const InsertPrior& ip);
+
 // THE SIGNATURE MATRIX: which allele pairs the fragments on ONE edge cannot tell apart.
 //
 // IT IS A FACTOR-EVALUATION DEVICE AND NEVER A STATE REDUCTION. A row class says the fragments

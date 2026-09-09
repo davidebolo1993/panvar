@@ -4837,6 +4837,85 @@ void mark_informative(LinkageEmission& out) {
 
 }  // namespace
 
+std::size_t IntervalGeometry::cell_index(const std::vector<std::uint32_t>& choice) const {
+    std::size_t idx = 0;
+    for (std::size_t j = 0; j < alleles.size(); ++j) idx = idx * alleles[j].size() + choice[j];
+    return idx;
+}
+
+void IntervalGeometry::cell_choice(std::size_t index, std::vector<std::uint32_t>& out) const {
+    out.assign(alleles.size(), 0);
+    for (std::size_t j = alleles.size(); j-- > 0;) {
+        out[j] = static_cast<std::uint32_t>(index % alleles[j].size());
+        index /= alleles[j].size();
+    }
+}
+
+std::size_t IntervalGeometry::window_len(const std::vector<std::uint32_t>& choice) const {
+    std::size_t n = lflank.size() + rflank.size();
+    for (std::size_t j = 0; j < alleles.size(); ++j) {
+        n += alleles[j][choice[j]].size();
+        if (j + 1 < alleles.size()) n += contexts[j].size();
+    }
+    return n;
+}
+
+IntervalGeometry build_interval_geometry(const std::vector<CandidateFrame>& frames,
+                                         const std::vector<std::vector<std::string>>& block_alleles,
+                                         const std::vector<char>& block_variable,
+                                         const std::vector<std::uint32_t>& blocks,
+                                         std::size_t flank_bp, const InsertPrior& ip) {
+    IntervalGeometry G;
+    G.blocks = blocks;
+    if (blocks.size() < 2) { G.refusal = "an interval factor needs at least two blocks"; return G; }
+    for (std::size_t j = 0; j + 1 < blocks.size(); ++j) {
+        if (blocks[j] >= blocks[j + 1]) {
+            G.refusal = "blocks must be ascending"; return G;
+        }
+    }
+    for (std::uint32_t b : blocks) {
+        if (b >= block_variable.size() || !block_variable[b]) {
+            G.refusal = "block " + std::to_string(b) + " is not variable"; return G;
+        }
+    }
+    // THE CONSECUTIVE PAIRWISE GEOMETRIES supply the contexts and the outer flanks. Deriving them
+    // independently here would be a second opinion about the same sequence, and the two would
+    // eventually disagree -- which is how a non-adjacent geometry once went unnoticed.
+    for (std::size_t j = 0; j + 1 < blocks.size(); ++j) {
+        const LinkageGeometry g = build_linkage_geometry(frames, block_alleles, block_variable,
+                                                         blocks[j], blocks[j + 1], flank_bp, ip);
+        if (!g.ok) {
+            G.refusal = "pair " + std::to_string(blocks[j]) + "-" +
+                        std::to_string(blocks[j + 1]) + ": " + g.refusal;
+            return G;
+        }
+        G.contexts.push_back(g.context);
+        if (j == 0) G.lflank = g.lflank;
+        if (j + 2 == blocks.size()) G.rflank = g.rflank;
+    }
+    for (std::uint32_t b : blocks) G.alleles.push_back(block_alleles[b]);
+    // EVERY window, by complete enumeration. A sampled affine gate inverted a conclusion in this
+    // work once; there is no sampled path here.
+    std::vector<std::uint32_t> choice(G.alleles.size(), 0);
+    G.min_window = SIZE_MAX; G.max_window = 0; G.windows_below_affine = 0;
+    const long affine_from = std::max<long>(0, ip.hi - 1);
+    bool done = false;
+    while (!done) {
+        const std::size_t w = G.window_len(choice);
+        G.min_window = std::min(G.min_window, w);
+        G.max_window = std::max(G.max_window, w);
+        if (static_cast<long>(w) < affine_from) ++G.windows_below_affine;
+        for (std::size_t j = 0; ; ++j) {
+            if (j == choice.size()) { done = true; break; }
+            if (++choice[j] < G.alleles[j].size()) break;
+            choice[j] = 0;
+        }
+    }
+    G.exposure_affine = G.windows_below_affine == 0;
+    G.ok = true;
+    return G;
+}
+
 SignatureMatrix build_signature_matrix(const std::vector<std::string>& cell_signatures,
                                        std::size_t n_a, std::size_t n_b, const char* model_tag) {
     SignatureMatrix M;
