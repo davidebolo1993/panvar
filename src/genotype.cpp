@@ -1,6 +1,7 @@
 #include "panvar/genotype.hpp"
 
 #include "panvar/chain_kernel.hpp"
+#include "panvar/genotype_fragments.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -935,7 +936,69 @@ std::vector<BlockCall> genotype_sample(
                                  std::to_string(sparse_edges->size()) + " entries for " +
                                  std::to_string(nb) + " blocks");
     }
+    // THE HIGHER-ORDER PATH, when factors are supplied. fwd and bwd are only ever consumed as
+    // their PRODUCT -- a per-block unnormalised posterior -- in all three places that read them, so
+    // the recurrence's marginals go into fwd and bwd is left at one. That keeps every downstream
+    // consumer, including the block-influence re-run below, working on exactly what it already
+    // expects instead of on a second convention.
+    const std::vector<HybridHigherFactor>* higher = options.higher_factors;
+    const bool use_higher = higher != nullptr && !higher->empty();
+    bool higher_refused = false;
+    std::string higher_refusal;
+    if (use_higher && (options.hap_allele == nullptr || options.hap_allele->size() != nh)) {
+        throw std::runtime_error("genotype: higher-order factors supplied without a matching "
+                                 "hap_allele table");
+    }
+    if (use_higher && sparse_edges != nullptr) {
+        for (const SparseEdgeLinkage& e : *sparse_edges) {
+            if (!e.has_corrections()) continue;
+            // Both paths carrying the same edge would apply it TWICE. The higher-order list owns
+            // every factor when it is in use, retained pairwise edges included.
+            throw std::runtime_error("genotype: a sparse linkage edge and the higher-order factor "
+                                     "list both carry corrections; every factor must be applied "
+                                     "exactly once, from one list");
+        }
+    }
     auto run_fb = [&]() {
+        if (use_higher) {
+            HybridChain HC;
+            HC.n_hap = nh; HC.n_blocks = nb; HC.recomb = r;
+            HC.edges.assign(nb, HybridEdge{});
+            HC.hap_allele = *options.hap_allele;
+            HC.higher = *higher;
+            HC.log_emission.assign(nb, std::vector<double>(nh * nh, 0.0));
+            std::vector<double> ev;
+            for (std::size_t bi = 0; bi < nb; ++bi) {
+                block_emissions(bi, ev);
+                for (std::size_t k = 0; k < nh * nh; ++k)
+                    HC.log_emission[bi][k] = ev[k] > 0.0 ? std::log(ev[k])
+                                                         : -std::numeric_limits<double>::infinity();
+            }
+            HigherOrderStats hst;
+            const HybridPosterior hp =
+                hybrid_higher_order(HC, options.higher_max_message_entries, &hst);
+            if (options.higher_stats != nullptr) *options.higher_stats = hst;
+            if (!hp.ok) {
+                higher_refused = true;
+                higher_refusal = hst.refusal.empty() ? "higher-order inference failed"
+                                                     : hst.refusal;
+                for (std::size_t bi = 0; bi < nb; ++bi) {
+                    std::fill(fwd[bi].begin(), fwd[bi].end(), 0.0);
+                    std::fill(bwd[bi].begin(), bwd[bi].end(), 0.0);
+                }
+                return;
+            }
+            for (std::size_t bi = 0; bi < nb; ++bi) {
+                for (std::size_t k = 0; k < nh * nh; ++k) {
+                    const double lm = hp.log_marginal[bi][k];
+                    fwd[bi][k] = (lm == -std::numeric_limits<double>::infinity()) ? 0.0
+                                                                                 : std::exp(lm);
+                    bwd[bi][k] = 1.0;
+                }
+            }
+            kernel_stats.log_weight_sum = hp.log_partition_unnormalised;
+            return;
+        }
         chain_forward_backward(nh, nb, r,
                                [&](std::size_t bi, std::vector<double>& ev) {
                                    block_emissions(bi, ev);
@@ -943,6 +1006,11 @@ std::vector<BlockCall> genotype_sample(
                                kernel_edges, fwd, bwd, &kernel_stats, sparse_edges);
     };
     run_fb();
+    if (higher_refused) {
+        // TRANSACTIONAL: no partial call is produced. The caller reports INCOMPLETE, excludes
+        // nothing, and runs the legacy path unchanged.
+        throw std::runtime_error("genotype: higher-order inference refused: " + higher_refusal);
+    }
 
     // Most probable allele pair per block, from whatever fwd/bwd currently hold. Used both for the
     // reported call and, with a block neutralized, to see which blocks that call actually depended on.

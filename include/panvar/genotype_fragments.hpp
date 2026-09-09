@@ -69,6 +69,13 @@ std::vector<Fragment> load_fragments(
 struct InsertPrior {
     long lo = 0, hi = 0;
     std::vector<double> logp;          // indexed by L - lo, normalised to sum to 1
+    // THE TAIL THIS SUPPORT DOES NOT COVER, as a log probability under the untruncated Gaussian.
+    // Recorded rather than called zero: truncating at any finite sigma leaves residual mass, and a
+    // caller that wants a certified answer must propagate this through the same contribution-width
+    // machinery the ownership audit uses. For C4 at six sigma it is negligible; "negligible" is a
+    // measurement, not a definition.
+    double log_residual_below = -std::numeric_limits<double>::infinity();
+    double log_residual_above = -std::numeric_limits<double>::infinity();
     double log_at(long L) const {
         if (L < lo || L > hi || logp.empty()) return -std::numeric_limits<double>::infinity();
         return logp[static_cast<std::size_t>(L - lo)];
@@ -81,7 +88,30 @@ struct InsertPrior {
 InsertPrior make_insert_prior(double mean, double sd, double discordant_rate,
                               int sigmas, long min_len);
 
+// THE INSERT FLOOR, IN ONE PLACE.
+//
+// An insert cannot be shorter than its LONGEST mate. It can be shorter than their SUM: the mates
+// simply overlap, sharing sequence. Using |r1| + |r2| silently declares every overlapping pair
+// impossible -- on a 350 +- 50 library with 150 bp mates that is 15.9% of fragments, and on C4 it
+// was 3,746 of 3,747 "unusable" reads, none of which any amount of edit-band deepening could have
+// recovered because the rejection was never about edits.
+//
+// Overlapping mates remain a correct likelihood: conditional on the template the two reads are
+// separate observations with separate sequencing errors, so their emissions still multiply.
+//
+// ONE RULE FOR EVERY CONSUMER -- ownership, reference and interval scoring, exposure, pairwise
+// factors and the higher-order factors. If the caller and its certification oracle disagreed here
+// they would be scoring different fragment universes, and every differential between them would be
+// meaningless.
+//
+// `allow_overlap = false` restores the old floor for compatibility only; it is not the model.
+long fragment_insert_floor(const std::vector<Fragment>& fragments, bool allow_overlap = true);
+long fragment_insert_floor(const Fragment& fragment, bool allow_overlap = true);
+
 struct FragmentScoreOptions {
+    // OVERLAPPING MATES ARE VALID. The insert floor is max(|r1|, |r2|), not their sum -- see
+    // fragment_insert_floor. False restores the pre-correction floor for compatibility only.
+    bool allow_overlapping_pairs = true;
     std::size_t kmer_size = 31;
     std::size_t syncmer_s = 0;          // 0 = default_syncmer_s(k)
     // Bases of neighbouring-block sequence glued to each side of a candidate allele. A fragment
@@ -952,6 +982,11 @@ MosaicFloors mosaic_floors(
 // stated bound -- and the fast path is never adjusted to make them agree, because this defines the
 // model and the fast path only approximates it.
 struct ReferenceParams {
+    // OVERLAPPING MATES ARE VALID -- the same rule the caller uses. If this oracle and the caller
+    // disagreed here they would be scoring different fragment universes and no differential
+    // between them would mean anything. See fragment_insert_floor.
+    bool allow_overlapping_pairs = true;
+
     // kept in step with FragmentScoreOptions so both scorers build the same prior
     double lambda = 0.05;        // fragments per start position
     double eta = 0.05;           // background weight
@@ -959,7 +994,13 @@ struct ReferenceParams {
     double fragment_len = 350.0;
     double fragment_sd = 50.0;
     double bg_divergence = 0.10; // the background's implied per-base disagreement
-    int insert_sigmas = 4;       // how far into the insert prior's tails to sum
+    // SIX SIGMA IS A DECLARED MODEL-WIDE POLICY, not a threshold picked to admit one fragment.
+    // Four sigma truncates a 350 +- 50 library at 550, which rejected a perfectly-matching,
+    // correctly-oriented 573 bp pair -- 4.46 sd out, and expected about once at this dataset size.
+    // Discarding real linkage because the computational support stopped early is not a modelling
+    // choice, it is an artefact. The principled rule is to widen until the residual tail's
+    // contribution is below the global tolerance; six sigma is that rule's practical setting here.
+    int insert_sigmas = 6;       // how far into the insert prior's tails to sum
     // Same concordant/discordant mixture the accelerated path uses. A pure Gaussian here would be a
     // MODEL difference, so any discrepancy between the two scorers could not be blamed on
     // acceleration -- which is the only thing the differential test is for.
@@ -1542,11 +1583,42 @@ PathProjection project_path_blocks(const std::vector<BlockAlleles>& projection_b
 // has an origin in every block and a union-of-spans scope is the whole locus. Inside the production
 // band only real placements survive, and what lies outside it is bounded rather than ignored --
 // so the scope below is certified, with `dropped` reporting exactly what restricting to it costs.
+// THERE IS DELIBERATELY NO "OutsideModel" KIND.
+//
+// One existed briefly, for fragments with no in-band mass on any candidate, justified by their raw
+// tail bound being small. That justification was wrong -- see the note at the NoInBandOrigins
+// classification -- and an inactive but unsafe category is an invitation to reuse it without
+// re-deriving the proof. It comes back only with a rule that survives the contribution audit.
 enum class OwnerKind { Unary, Linkage, Wide, Invariant, Unusable };
 const char* owner_kind_name(OwnerKind k);
 
+// WHY a fragment has no owner. One policy cannot serve all of these, and lumping them together is
+// what let 3,747 C4 fragments look like a single undifferentiated blocker:
+//
+//   * NoInBandOrigins / EmptyRead -- the certified linkage-placement search found no in-band
+//     state. THAT IS NOT THE SAME AS "outside the genotyper": these fragments REMAIN IN THE
+//     MARKER COUNTS and can still rank genotypes through the block marker unaries. It also does
+//     not make the adaptive tail candidate-independent -- the tail-only fixture already showed
+//     states = 0 alongside finite candidate-specific reference mass.
+//   * EmptyRead -- one mate absent; nothing to place at all.
+//   * ScopeNotCertified -- the tail could not be bounded below the tolerance. Adaptive refinement
+//     is the answer; the mass IS attributable, the search simply stopped too early.
+//   * EmptyScope -- certified, but the kept origins spanned no block.
+//   * UnmappedMassDominant -- candidate-DEPENDENT mass belonging to no block. The decomposition
+//     is genuinely incomplete and this must keep the call INCOMPLETE.
+enum class UnusableReason : std::uint8_t {
+    None = 0,
+    EmptyRead,
+    NoInBandOrigins,
+    ScopeNotCertified,
+    EmptyScope,
+    UnmappedMassDominant,
+};
+const char* unusable_reason_name(UnusableReason r);
+
 struct FragmentOwner {
     OwnerKind kind = OwnerKind::Unusable;
+    UnusableReason why = UnusableReason::None;   // set only when kind == Unusable
     // The VARIABLE blocks the factor is over. Unary: lo == hi. Linkage: lo < hi, and every block
     // strictly between them is fixed -- they need NOT be physically adjacent.
     std::uint32_t block_lo = 0, block_hi = 0;
@@ -2562,8 +2634,13 @@ struct HybridCompletenessReport {
     std::size_t invariant = 0;              // need no consumer
     std::size_t consumed_unary = 0;
     std::size_t consumed_linkage = 0;
-    std::size_t unconsumed_wide = 0;        // three or more variables: no pairwise consumer
+    std::size_t unconsumed_wide = 0;        // three or more variables: no PAIRWISE consumer
     std::size_t unconsumed_refused_edge = 0;
+    // Consumed by a HIGHER factor instead: Wide fragments inside a span, and the owners of the
+    // edges that span explicitly supersedes. Both are moved out of the unconsumed counts above,
+    // which is exactly why a higher factor can make an otherwise INCOMPLETE model complete.
+    std::size_t consumed_higher_wide = 0;
+    std::size_t consumed_higher_superseded = 0;
     std::size_t unconsumed_unusable = 0;
     // EVERY refusal, not the last one. A single "reason" field loses the others exactly when
     // several edges fail for different reasons, which is when the report matters most.
@@ -2573,8 +2650,32 @@ struct HybridCompletenessReport {
     std::vector<std::vector<std::uint32_t>> wide_scopes;
 };
 
-HybridCompletenessReport assess_hybrid_completeness(const std::vector<FragmentOwner>& owners,
-                                                    const std::vector<EdgeStatusEntry>& edges);
+// WHAT A HIGHER FACTOR CONSUMES. A factor DEPENDS on every block in its span but CONSUMES only
+// two things: the Wide fragments whose whole variable scope lies inside the span, and the owners of
+// the pairwise edges it explicitly SUPERSEDES. Superseding is a stated fact about the model, never
+// inferred from block membership -- a factor spanning {4,5,6} must not silently swallow edge 5-6's
+// owners, which belong to a pairwise factor that is RETAINED.
+struct HigherFactorScope {
+    std::vector<std::uint32_t> blocks;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> superseded;
+    bool covers(const std::vector<std::uint32_t>& scope) const {
+        if (scope.empty()) return false;
+        for (std::uint32_t q : scope)
+            if (std::find(blocks.begin(), blocks.end(), q) == blocks.end()) return false;
+        return true;
+    }
+    bool supersedes(std::uint32_t a, std::uint32_t b) const {
+        return std::find(superseded.begin(), superseded.end(),
+                         std::make_pair(a, b)) != superseded.end();
+    }
+};
+
+// An EMPTY scope list reproduces the pairwise-only assessment exactly; it is the legacy case, not
+// a special case.
+HybridCompletenessReport assess_hybrid_completeness(
+    const std::vector<FragmentOwner>& owners,
+    const std::vector<EdgeStatusEntry>& edges,
+    const std::vector<HigherFactorScope>& higher = {});
 
 // THE ONE PLACE A KERNEL EDGE IS BUILT. A refused LinkageEdge, or either endpoint's mapping having
 // been refused, yields an INACTIVE entry carrying no table -- so a refused edge can never reach the
@@ -2621,6 +2722,9 @@ double estimate_fragment_lambda(std::size_t n_fragments,
                                 std::size_t* median_length_out = nullptr);
 
 struct HybridLinkageParameters {
+    // OVERLAPPING MATES ARE VALID. The insert floor is max(|r1|, |r2|), not their sum -- see
+    // fragment_insert_floor. False restores the pre-correction floor for compatibility only.
+    bool allow_overlapping_pairs = true;
     double lambda = 0.05;
     // How lambda was obtained, reported with every result. "estimated" is the only option available
     // on real data; "supplied" preserves the exact comparison with a simulation's generator value.
@@ -2636,7 +2740,7 @@ struct HybridLinkageParameters {
     double fragment_len = 350.0;
     double fragment_sd = 50.0;
     double discordant_rate = 0.01;
-    int insert_sigmas = 4;
+    int insert_sigmas = 6;   // see FragmentScoreOptions::insert_sigmas -- one policy, model-wide
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -2710,9 +2814,34 @@ struct HybridEdge {
 //
 // The factor applies ONCE, at the last block of its span, to the joint class tuple of both
 // homologues over the span. Everything before that is history the message has to carry.
+// A RETAINED PAIRWISE EDGE IS JUST A TWO-BLOCK FACTOR, and is carried here as one rather than as
+// a separate mechanism. That is not tidiness: the recurrence AGGREGATES over the source template
+// at every switch, which would destroy the left endpoint a pairwise potential depends on. Putting
+// it in this list makes block b-1 part of the carried history automatically, by exactly the
+// machinery that already does it for interval factors -- and it makes "every factor is applied
+// exactly once" structural, because there is one list and one application site.
 struct HybridHigherFactor {
     std::vector<std::uint32_t> blocks;             // ascending, contiguous
-    const IntervalFactorTable* table = nullptr;    // NON-OWNING; must outlive the chain
+    // EXACTLY ONE of these is set. NON-OWNING; both must outlive the chain.
+    const IntervalFactorTable* table = nullptr;    // an interval factor, arity >= 2
+    const SparseEdgeLinkage* pairwise = nullptr;   // a retained pairwise edge, arity 2
+
+    bool usable() const {
+        if ((table != nullptr) == (pairwise != nullptr)) return false;
+        if (table != nullptr) return table->ok && table->allele_class.size() == blocks.size();
+        return pairwise->active && blocks.size() == 2;
+    }
+    // How many classes block position `j` has, and which class an allele falls in. A pairwise edge
+    // separates every allele -- it has no signature grouping -- so its map is the identity.
+    std::size_t classes_at(std::size_t j, std::size_t n_alleles) const {
+        return table != nullptr ? table->classes_per_block[j] : n_alleles;
+    }
+    std::uint32_t class_of(std::size_t j, std::uint32_t allele) const {
+        return table != nullptr ? table->allele_class[j][allele] : allele;
+    }
+    // log psi for an ORDERED diploid configuration, given each homologue's class tuple.
+    double log_psi_classes(const std::vector<std::uint32_t>& c1,
+                           const std::vector<std::uint32_t>& c2) const;
 };
 
 struct HybridChain {
@@ -2761,6 +2890,17 @@ struct HigherOrderStats {
     std::uint64_t planned_peak_message_entries = 0;
     std::uint64_t planned_forward_updates = 0;
     std::uint64_t planned_total_bytes = 0;
+    // WHAT THE PLAN'S EQUALITY IS CONDITIONAL ON.
+    //
+    // The initial message skips states whose scaled emission is zero -- a -inf log emission, or
+    // one so far below its block maximum that it underflows. The planner cannot know which those
+    // are without evaluating the emissions, so it counts them all. When every state has a finite,
+    // nonzero scaled emission the plan is EXACT; otherwise it is an upper BOUND.
+    //
+    // This flag says which contract held for THIS run, so a caller never has to guess. The
+    // benchmark's exactness is a property of its all-finite inputs, not of the planner in general.
+    bool all_initial_emissions_finite = true;
+    std::uint64_t initial_states_dropped = 0;
     bool refused = false;
     std::string refusal;
 };
@@ -2805,6 +2945,11 @@ HybridPosterior hybrid_bruteforce(const HybridChain& chain);
 // follows from the per-block haploid counts by closed-form arithmetic.
 //
 // The recurrence CONSUMES this plan. It is not a parallel estimate that might disagree.
+//
+// EXACT, OR AN UPPER BOUND -- and which one is reported, not assumed. Equality holds when every
+// initial state has a finite nonzero scaled emission; a state whose emission underflows to zero is
+// dropped from the initial message, and the plan, which does not evaluate emissions, still counts
+// it. See HigherOrderStats::all_initial_emissions_finite.
 struct HigherOrderPlan {
     bool ok = false;
     std::string refusal;
@@ -2903,6 +3048,10 @@ struct SparseLinkageEdge {
     // entries instead of C(n_a,2) * C(n_b,2), and no enumeration of the latter at any point.
     // The allele -> class vectors stay here; the chain kernel never sees them, because collapsing
     // alleles as HMM STATES would discard marker and Li-Stephens evidence the fragments never saw.
+    // Set when `status` is a refusal that has a MAGNITUDE worth seeing. "Exposure does not cancel"
+    // covers a short-window clipping failure and accumulated rounding under a wider insert support;
+    // an absolute tolerance cannot distinguish them, and the number can.
+    std::string refusal_detail;
     bool grouped = false;
     std::vector<std::uint32_t> row_class, col_class;      // per allele at A and at B
     std::size_t n_row_classes = 0, n_col_classes = 0;
@@ -2967,7 +3116,8 @@ HybridActivation plan_hybrid_activation_sparse(
     const std::vector<EdgeStatusEntry>& edge_status,
     const std::map<std::pair<std::uint32_t, std::uint32_t>, SparseLinkageEdge>& edges,
     const std::vector<AlleleMapping>& maps,
-    std::size_t n_blocks);
+    std::size_t n_blocks,
+    const std::vector<HigherFactorScope>& higher = {});
 
 LinkageEdge aggregate_linkage_edge(const std::vector<LinkageEmission>& emissions,
                                    const LinkageGeometry& geom, double lambda,

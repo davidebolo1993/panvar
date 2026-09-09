@@ -52,6 +52,19 @@ double InsertPrior::exposure(std::size_t hap_len) const {
     return e;
 }
 
+long fragment_insert_floor(const Fragment& f, bool allow_overlap) {
+    return allow_overlap
+        ? static_cast<long>(std::max(f.r1.size(), f.r2.size()))
+        : static_cast<long>(f.r1.size() + f.r2.size());
+}
+
+long fragment_insert_floor(const std::vector<Fragment>& fragments, bool allow_overlap) {
+    long m = 1;
+    for (const Fragment& f : fragments)
+        m = std::max<long>(m, fragment_insert_floor(f, allow_overlap));
+    return m;
+}
+
 InsertPrior make_insert_prior(double mean, double sd, double discordant_rate,
                               int sigmas, long min_len) {
     InsertPrior ip;
@@ -77,6 +90,21 @@ InsertPrior make_insert_prior(double mean, double sd, double discordant_rate,
         total = ladd(total, v);
     }
     for (const double v : w) ip.logp.push_back(v - total);
+    // WHAT THE SUPPORT LEAVES OUT. The concordant component is Gaussian, so the residual beyond
+    // each endpoint is a tail probability; the discordant component is uniform on the support and
+    // has no tail by construction. Reported, not assumed away.
+    const auto log_upper_tail = [&](double x) {
+        const double z = (x - mean) / sd;
+        if (z <= -8.0) return 0.0;
+        const double q = 0.5 * std::erfc(z / std::sqrt(2.0));
+        return q > 0.0 ? std::log(q) : -std::numeric_limits<double>::infinity();
+    };
+    const double lconc = std::log1p(-discordant_rate);
+    ip.log_residual_above = lconc + log_upper_tail(static_cast<double>(ip.hi) + 0.5);
+    const double zlo = (static_cast<double>(ip.lo) - 0.5 - mean) / sd;
+    const double qlo = 0.5 * std::erfc(-zlo / std::sqrt(2.0));
+    ip.log_residual_below =
+        qlo > 0.0 ? lconc + std::log(qlo) : -std::numeric_limits<double>::infinity();
     return ip;
 }
 
@@ -1162,10 +1190,7 @@ HaplotypeResult genotype_haplotype_pairs(
         return static_cast<double>(edits) * log_eps3 +
                static_cast<double>(len - std::min(edits, len)) * log_1meps;
     };
-    long min_frag_len = 1;
-    for (const Fragment& f : fragments) {
-        min_frag_len = std::max<long>(min_frag_len, static_cast<long>(f.r1.size() + f.r2.size()));
-    }
+    const long min_frag_len = fragment_insert_floor(fragments, options.allow_overlapping_pairs);
     const InsertPrior ins_prior = make_insert_prior(options.fragment_len, options.fragment_sd,
                                                     options.discordant_rate, 4, min_frag_len);
     // Explicit 1/2 per strand, matching the reference. It is a per-fragment constant only while the
@@ -2994,10 +3019,7 @@ double reference_pair_loglik(const std::string& hap_a, const std::string& hap_b,
 
     // One prior, shared by the event term and the exposure. Its lower bound is the longest fragment
     // present, because an insert shorter than the two mates is not a state at all.
-    long min_len = 1;
-    for (const Fragment& f : fragments) {
-        min_len = std::max<long>(min_len, static_cast<long>(f.r1.size() + f.r2.size()));
-    }
+    const long min_len = fragment_insert_floor(fragments, params.allow_overlapping_pairs);
     const InsertPrior ip = make_insert_prior(params.fragment_len, params.fragment_sd,
                                             params.discordant_rate, params.insert_sigmas, min_len);
 
@@ -3699,10 +3721,7 @@ double scope_restricted_pair_loglik(const CandidateFrame& frame_a, const Candida
     const std::string& hap_b = frame_b.seq;
     const double log_eps = std::log(params.error_rate / 3.0);
     const double log_1meps = std::log1p(-params.error_rate);
-    long min_len = 1;
-    for (const Fragment& f : fragments) {
-        min_len = std::max<long>(min_len, static_cast<long>(f.r1.size() + f.r2.size()));
-    }
+    const long min_len = fragment_insert_floor(fragments, params.allow_overlapping_pairs);
     const InsertPrior ip = make_insert_prior(params.fragment_len, params.fragment_sd,
                                              params.discordant_rate, params.insert_sigmas, min_len);
     // EXPOSURE ONCE, over the whole locus, exactly as the reference charges it. Charging it per
@@ -3814,7 +3833,7 @@ OriginUniverse enumerate_fragment_origins(const Fragment& fragment,
     if (fragment.r1.empty()) return out;
     const double log_eps = std::log(params.error_rate / 3.0);
     const double log_1meps = std::log1p(-params.error_rate);
-    const long min_len = static_cast<long>(fragment.r1.size() + fragment.r2.size());
+    const long min_len = fragment_insert_floor(fragment, params.allow_overlapping_pairs);
     const InsertPrior ip = make_insert_prior(params.fragment_len, params.fragment_sd,
                                              params.discordant_rate, params.insert_sigmas,
                                              std::max<long>(1, min_len));
@@ -4103,7 +4122,10 @@ FragmentOwner assign_fragment_owner(const Fragment& fragment,
     out.in_band = kNegInf;
     out.omitted_bound = kNegInf;
     out.unmapped = kNegInf;
-    if (fragment.r1.empty() || fragment.r2.empty()) return out;
+    if (fragment.r1.empty() || fragment.r2.empty()) {
+        out.why = UnusableReason::EmptyRead;   // set HERE: this return is the reachable one
+        return out;
+    }
 
     const std::size_t d1 = mate_band_edits(max_divergence, fragment.r1.size());
     const std::size_t d2 = mate_band_edits(max_divergence, fragment.r2.size());
@@ -4153,7 +4175,30 @@ FragmentOwner assign_fragment_owner(const Fragment& fragment,
         }
     }
     out.origins = origins.size();
-    if (origins.empty()) return out;
+    if (origins.empty()) {
+        out.why = UnusableReason::NoInBandOrigins;
+        // NO RECLASSIFICATION HERE, DELIBERATELY.
+        //
+        // The obvious rule -- "omitted_bound is tiny, so the fragment is neutral" -- compares a
+        // RAW PLACEMENT MASS against an absolute constant, and that is the same conflation this
+        // codebase already had to unlearn once in interval scoring. What the caller actually
+        // evaluates is
+        //
+        //     log( (1-eta) * lambda * (M_a + M_b) + eta * P_bg )
+        //
+        // so a tail of e^-55 is negligible only RELATIVE to eta * P_bg. If the background floor
+        // sits at e^-200, that same tail dominates the mixture and moves the fragment's
+        // contribution by ~145 nats. Nor does "no in-band origins" mean the tail is
+        // candidate-INDEPENDENT: it means the production-band search found nothing, and the
+        // tail-only fixture already showed states = 0 alongside finite candidate-specific
+        // reference mass.
+        //
+        // A defensible disposition needs the contribution INTERVAL through the real mixture, per
+        // candidate, summed over every such fragment and compared to a declared global tolerance
+        // -- which is what the ownership audit computes. Until that audit passes, the fragment
+        // stays Unusable and keeps the call INCOMPLETE.
+        return out;
+    }
 
     // THE ESSENTIAL ORIGIN SET. Origins are taken in decreasing mass until everything still
     // excluded -- the remaining origins, the unmapped mass and the out-of-band bound together --
@@ -4181,11 +4226,17 @@ FragmentOwner assign_fragment_owner(const Fragment& fragment,
     sc.erase(std::unique(sc.begin(), sc.end()), sc.end());
     out.scope = sc;
 
-    if (!out.certified || sc.empty()) { out.kind = OwnerKind::Unusable; return out; }
+    if (!out.certified) {
+        out.kind = OwnerKind::Unusable; out.why = UnusableReason::ScopeNotCertified; return out;
+    }
+    if (sc.empty()) {
+        out.kind = OwnerKind::Unusable; out.why = UnusableReason::EmptyScope; return out;
+    }
     // Unattributable mass above the tolerance means a block-factored model cannot express this
     // fragment at all. It is NOT quietly assigned to the nearest block.
     if (out.unmapped != kNegInf && total - out.unmapped < scope_tol) {
         out.kind = OwnerKind::Unusable;
+        out.why = UnusableReason::UnmappedMassDominant;
         return out;
     }
 
@@ -5624,6 +5675,24 @@ double IntervalFactorTable::log_psi(const std::vector<std::uint32_t>& hap1,
     return log_psi_classes(c1, c2);
 }
 
+// The two factor kinds behind one call. The pairwise arithmetic is the SparsePhaseClass
+// convention from chain_kernel: straight pairs (amin,bmin) with (amax,bmax), crossed pairs
+// (amin,bmax) with (amax,bmin). With a homozygous endpoint the two coincide and either is right.
+double HybridHigherFactor::log_psi_classes(const std::vector<std::uint32_t>& c1,
+                                           const std::vector<std::uint32_t>& c2) const {
+    if (table != nullptr) return table->log_psi_classes(c1, c2);
+    if (pairwise == nullptr || !pairwise->active || c1.size() != 2 || c2.size() != 2) return 0.0;
+    const std::uint32_t a1 = c1[0], b1 = c1[1], a2 = c2[0], b2 = c2[1];
+    const std::uint32_t amin = std::min(a1, a2), amax = std::max(a1, a2);
+    const std::uint32_t bmin = std::min(b1, b2), bmax = std::max(b1, b2);
+    const bool crossed = (a1 < a2 && b1 > b2) || (a1 > a2 && b1 < b2);
+    for (const SparsePhaseClass& k : pairwise->classes) {
+        if (k.amin != amin || k.amax != amax || k.bmin != bmin || k.bmax != bmax) continue;
+        return std::log1p(crossed ? k.crossed_m1 : k.straight_m1);
+    }
+    return 0.0;   // absent means exactly neutral
+}
+
 double IntervalFactorTable::log_psi_classes(const std::vector<std::uint32_t>& cls1,
                                             const std::vector<std::uint32_t>& cls2) const {
     if (!ok || class_offset.empty()) return 0.0;
@@ -6254,11 +6323,12 @@ HybridActivation plan_hybrid_activation_sparse(
     const std::vector<EdgeStatusEntry>& edge_status,
     const std::map<std::pair<std::uint32_t, std::uint32_t>, SparseLinkageEdge>& edges,
     const std::vector<AlleleMapping>& maps,
-    std::size_t n_blocks) {
+    std::size_t n_blocks,
+    const std::vector<HigherFactorScope>& higher) {
     HybridActivation A;
     A.kernel_edges.assign(n_blocks, ChainEdgeLinkage{});
     A.sparse_kernel_edges.assign(n_blocks, SparseEdgeLinkage{});
-    A.report = assess_hybrid_completeness(owners, edge_status);
+    A.report = assess_hybrid_completeness(owners, edge_status, higher);
     A.ownership_complete = A.report.ownership_complete;
     if (!A.ownership_complete) {
         A.refusal = "hybrid model incomplete: " +
@@ -6272,6 +6342,11 @@ HybridActivation plan_hybrid_activation_sparse(
     std::vector<SparseEdgeLinkage> built(n_blocks);
     for (const auto& kv : edges) {
         const std::uint32_t a = kv.first.first, b = kv.first.second;
+        // A SUPERSEDED EDGE IS NOT BUILT AT ALL. Building it and then declining to use it would
+        // leave a second copy of the same evidence one wiring mistake away from being applied.
+        bool gone = false;
+        for (const HigherFactorScope& h : higher) if (h.supersedes(a, b)) { gone = true; break; }
+        if (gone) continue;
         if (b >= n_blocks || a >= maps.size() || b >= maps.size()) {
             A.refusal = "edge " + std::to_string(a) + "-" + std::to_string(b) + " is out of range";
             return A;
@@ -6285,6 +6360,22 @@ HybridActivation plan_hybrid_activation_sparse(
         built[b] = k;
     }
     for (std::size_t i = 0; i < owners.size() && i < fragments.size(); ++i) {
+        // CONSUMED BY A HIGHER FACTOR: a Wide fragment inside a span, or the owner of an edge that
+        // span supersedes. Excluded exactly like a pairwise consumer's, so that the excluded set
+        // and the consumed set stay the same set.
+        bool by_higher = false;
+        for (const HigherFactorScope& h : higher) {
+            if (owners[i].kind == OwnerKind::Wide && h.covers(owners[i].var_scope)) {
+                by_higher = true; break;
+            }
+            if (owners[i].kind == OwnerKind::Linkage &&
+                h.supersedes(owners[i].block_lo, owners[i].block_hi)) { by_higher = true; break; }
+        }
+        if (by_higher) {
+            A.excluded_fragments.push_back(fragments[i].name);
+            ++A.consumed_fragments;
+            continue;
+        }
         if (owners[i].kind != OwnerKind::Linkage) continue;
         const std::uint32_t b = owners[i].block_hi;
         // ACTIVE means built, whether or not it carries classes: a sparse-neutral edge is a
@@ -6396,8 +6487,10 @@ double estimate_fragment_lambda(std::size_t n_fragments,
     return static_cast<double>(n_fragments) / (2.0 * static_cast<double>(med));
 }
 
-HybridCompletenessReport assess_hybrid_completeness(const std::vector<FragmentOwner>& owners,
-                                                    const std::vector<EdgeStatusEntry>& edges) {
+HybridCompletenessReport assess_hybrid_completeness(
+    const std::vector<FragmentOwner>& owners,
+    const std::vector<EdgeStatusEntry>& edges,
+    const std::vector<HigherFactorScope>& higher) {
     HybridCompletenessReport R;
     R.owned_total = owners.size();
     std::map<std::pair<std::uint32_t, std::uint32_t>, LinkageStatus> st;
@@ -6411,17 +6504,30 @@ HybridCompletenessReport assess_hybrid_completeness(const std::vector<FragmentOw
                 ++R.consumed_unary;          // the block's marker unary consumes it
                 break;
             case OwnerKind::Linkage: {
+                // A SUPERSEDED edge's owners belong to the factor that replaced it -- checked
+                // before the edge's own status, because a superseded edge's refusal is no longer
+                // anyone's problem.
+                bool taken = false;
+                for (const HigherFactorScope& h : higher)
+                    if (h.supersedes(o.block_lo, o.block_hi)) { taken = true; break; }
+                if (taken) { ++R.consumed_higher_superseded; break; }
                 const auto it = st.find({o.block_lo, o.block_hi});
                 if (it != st.end() && it->second == LinkageStatus::Ok) ++R.consumed_linkage;
                 else ++R.unconsumed_refused_edge;
                 break;
             }
-            case OwnerKind::Wide:
-                // No pairwise consumer exists for three or more variables. Reported with its scope
-                // rather than counted anonymously, and never cropped into a pair.
+            case OwnerKind::Wide: {
+                // A higher factor consumes it when its WHOLE variable scope is inside the span.
+                bool taken = false;
+                for (const HigherFactorScope& h : higher)
+                    if (h.covers(o.var_scope)) { taken = true; break; }
+                if (taken) { ++R.consumed_higher_wide; break; }
+                // Otherwise no consumer exists for three or more variables. Reported with its
+                // scope rather than counted anonymously, and never cropped into a pair.
                 ++R.unconsumed_wide;
                 R.wide_scopes.push_back(o.var_scope);
                 break;
+            }
             default:
                 ++R.unconsumed_unusable;     // explicitly reported missing evidence
                 break;
@@ -6429,6 +6535,10 @@ HybridCompletenessReport assess_hybrid_completeness(const std::vector<FragmentOw
     }
     for (const EdgeStatusEntry& e : edges) {
         if (e.status == LinkageStatus::Ok) continue;
+        bool superseded = false;
+        for (const HigherFactorScope& h : higher)
+            if (h.supersedes(e.block_a, e.block_b)) { superseded = true; break; }
+        if (superseded) continue;   // replaced, so its refusal is not a defect in the model
         EdgeRefusal r;
         r.block_a = e.block_a; r.block_b = e.block_b;
         r.status = e.status; r.n_fragments = e.n_fragments; r.detail = e.detail;
@@ -6562,7 +6672,21 @@ SparseLinkageEdge build_sparse_linkage_edge_grouped(
         E.status = LinkageStatus::InvalidEmissions; return E;
     }
     // Exposure must cancel, unchanged: the representation is grouped, the contract is not.
-    double asym = 0.0;
+    // CANCELLATION IS ACCEPTED STRUCTURALLY, NOT NUMERICALLY.
+    //
+    // When every window is at least insert_hi - 1, exposure is AFFINE in the window length --
+    // window_len = const + |A_alpha| + |B_beta| makes it additive, and the straight and crossed
+    // sums coincide algebraically. `exposure_affine` is exactly that predicate, decided per
+    // configuration when the geometry was built.
+    //
+    // The numerical difference is a DIAGNOSTIC and must not be the gate. A fixed absolute
+    // tolerance rejected C4's edge 6-7 at 1.048e-9 with ZERO short windows -- rounding from
+    // summing 650 prior terms instead of 401. Rescaling it would fix that case and introduce the
+    // opposite failure: a genuine non-affine difference, small only because the exposure scale is
+    // large, would pass. The algebraic precondition has neither failure mode, so it is the gate,
+    // and the measured residual is carried alongside it for inspection.
+    double asym = 0.0, scale = 1.0;
+    for (const double e : geom.exposure) scale = std::max(scale, std::abs(e));
     for (std::size_t a1 = 0; a1 < na; ++a1)
     for (std::size_t b1 = 0; b1 < nb; ++b1)
     for (std::size_t a2 = 0; a2 < na; ++a2)
@@ -6570,7 +6694,17 @@ SparseLinkageEdge build_sparse_linkage_edge_grouped(
         asym = std::max(asym, std::abs((geom.exposure[a1 * nb + b1] + geom.exposure[a2 * nb + b2]) -
                                        (geom.exposure[a1 * nb + b2] + geom.exposure[a2 * nb + b1])));
     }
-    if (asym > 1e-9) { E.status = LinkageStatus::ExposureDoesNotCancel; return E; }
+    {
+        char msg[128];
+        std::snprintf(msg, sizeof msg,
+                      "exposure residual %.6e absolute, %.6e relative to scale %.6e over "
+                      "%zu x %zu cells", asym, asym / scale, scale, na, nb);
+        E.refusal_detail = msg;   // a diagnostic on every edge, refused or not
+    }
+    if (!geom.exposure_affine) {
+        E.status = LinkageStatus::ExposureDoesNotCancel;
+        return E;
+    }
 
     // ---- ESTIMATE BEFORE ALLOCATING ------------------------------------------------------------
     // Every major allocation is bounded first. An estimate computed after the fact is not a budget.
@@ -6705,7 +6839,21 @@ SparseLinkageEdge build_sparse_linkage_edge(const std::vector<LinkageEmission>& 
     }
     // Exposure must cancel, exactly as in the dense path: the contract is unchanged, only the
     // representation is.
-    double asym = 0.0;
+    // CANCELLATION IS ACCEPTED STRUCTURALLY, NOT NUMERICALLY.
+    //
+    // When every window is at least insert_hi - 1, exposure is AFFINE in the window length --
+    // window_len = const + |A_alpha| + |B_beta| makes it additive, and the straight and crossed
+    // sums coincide algebraically. `exposure_affine` is exactly that predicate, decided per
+    // configuration when the geometry was built.
+    //
+    // The numerical difference is a DIAGNOSTIC and must not be the gate. A fixed absolute
+    // tolerance rejected C4's edge 6-7 at 1.048e-9 with ZERO short windows -- rounding from
+    // summing 650 prior terms instead of 401. Rescaling it would fix that case and introduce the
+    // opposite failure: a genuine non-affine difference, small only because the exposure scale is
+    // large, would pass. The algebraic precondition has neither failure mode, so it is the gate,
+    // and the measured residual is carried alongside it for inspection.
+    double asym = 0.0, scale = 1.0;
+    for (const double e : geom.exposure) scale = std::max(scale, std::abs(e));
     for (std::size_t a1 = 0; a1 < na; ++a1)
     for (std::size_t b1 = 0; b1 < nb; ++b1)
     for (std::size_t a2 = 0; a2 < na; ++a2)
@@ -6713,7 +6861,17 @@ SparseLinkageEdge build_sparse_linkage_edge(const std::vector<LinkageEmission>& 
         asym = std::max(asym, std::abs((geom.exposure[a1 * nb + b1] + geom.exposure[a2 * nb + b2]) -
                                        (geom.exposure[a1 * nb + b2] + geom.exposure[a2 * nb + b1])));
     }
-    if (asym > 1e-9) { E.status = LinkageStatus::ExposureDoesNotCancel; return E; }
+    {
+        char msg[128];
+        std::snprintf(msg, sizeof msg,
+                      "exposure residual %.6e absolute, %.6e relative to scale %.6e over "
+                      "%zu x %zu cells", asym, asym / scale, scale, na, nb);
+        E.refusal_detail = msg;   // a diagnostic on every edge, refused or not
+    }
+    if (!geom.exposure_affine) {
+        E.status = LinkageStatus::ExposureDoesNotCancel;
+        return E;
+    }
 
     // THE SUPPORT: haploid cells carrying in-band mass, and which fragments carry them. Everything
     // outside is all-background and cannot separate the phases.
@@ -7145,11 +7303,8 @@ HoPlan ho_build_plan(const HybridChain& c) {
 
     for (std::size_t f = 0; f < c.higher.size(); ++f) {
         const auto& H = c.higher[f];
-        if (H.blocks.empty() || H.table == nullptr || !H.table->ok) {
+        if (H.blocks.empty() || !H.usable()) {
             P.refusal = "higher factor " + std::to_string(f) + " is unusable"; return P;
-        }
-        if (H.table->allele_class.size() != H.blocks.size()) {
-            P.refusal = "higher factor " + std::to_string(f) + " arity mismatch"; return P;
         }
         for (std::size_t j = 0; j + 1 < H.blocks.size(); ++j)
             if (H.blocks[j] + 1 != H.blocks[j + 1]) {
@@ -7174,7 +7329,7 @@ HoPlan ho_build_plan(const HybridChain& c) {
                 for (std::size_t j = 0; j < H.blocks.size(); ++j)
                     if (H.blocks[j] == b) {
                         touched = true;
-                        key.push_back(H.table->allele_class[j][c.hap_allele[t][b]]);
+                        key.push_back(H.class_of(j, c.hap_allele[t][b]));
                     }
             }
             auto it = seen.find(key);
@@ -7196,7 +7351,7 @@ HoPlan ho_build_plan(const HybridChain& c) {
             std::vector<char> set(P.n_refined[b], 0);
             for (std::size_t t = 0; t < c.n_hap; ++t) {
                 const std::uint32_t rc = P.refined[b][t];
-                const std::uint32_t fc = H.table->allele_class[j][c.hap_allele[t][b]];
+                const std::uint32_t fc = H.class_of(j, c.hap_allele[t][b]);
                 if (set[rc] && P.to_factor[f][j][rc] != fc) {
                     P.refusal = "the refinement does not refine factor " + std::to_string(f);
                     return P;
@@ -7505,7 +7660,7 @@ static HybridPosterior ho_run(const HybridChain& c, std::uint64_t max_message_en
                 cb[j] = P.to_factor[f][j][ho_class_at(P, h2, q)];
             }
             ++st.factor_lookups;
-            const double lp = H.table->log_psi_classes(ca, cb);
+            const double lp = H.log_psi_classes(ca, cb);
             if (lp != 0.0) m *= std::exp(lp);
         }
         return m;
@@ -7538,7 +7693,13 @@ static HybridPosterior ho_run(const HybridChain& c, std::uint64_t max_message_en
             HoHom h1, h2; h1.t = t1; h2.t = t2;
             double w = emit(0, t1, t2);
             if (!P.ends_at[0].empty()) w *= apply_factors(0, h1, h2);
-            if (w == 0.0) continue;
+            if (w == 0.0) {
+                // Dropped, and RECORDED. The plan counted this state; saying so is what turns
+                // "the plan was exact" from a claim into a checkable condition.
+                st.all_initial_emissions_finite = false;
+                ++st.initial_states_dropped;
+                continue;
+            }
             msg[0][ho_pack(P, h1) * P.per_hom + ho_pack(P, h2)] += w;
         }
     st.peak_message_entries = msg[0].size();
@@ -7641,9 +7802,11 @@ static HybridPosterior ho_run(const HybridChain& c, std::uint64_t max_message_en
             }
         }
         }
-        // The plan said this would fit. If the realised message disagrees with it the plan is
-        // WRONG, and continuing would mean allocating past a budget that was already approved --
-        // so this refuses transactionally, clearing every message rather than leaving partials.
+        // The plan said this would fit. The realised message may be SMALLER (dropped initial
+        // states propagate), but never larger: the plan is an upper bound always, and exact when
+        // every initial emission is finite. Exceeding it means the plan is wrong, and continuing
+        // would allocate past a budget that was already approved -- so this refuses
+        // transactionally, clearing every message rather than leaving partials.
         if (nxt.size() > PL.message_entries[b]) {
             for (auto& m : msg) m.clear();
             st.refused = true;
@@ -7891,14 +8054,14 @@ HybridPosterior hybrid_bruteforce(const HybridChain& c) {
             // class refinement. Everything the recurrence carries state for is here a plain index
             // into the path, which is what makes the comparison independent.
             for (const HybridHigherFactor& H : c.higher) {
-                if (H.table == nullptr || !H.table->ok) continue;
-                std::vector<std::uint32_t> a1(H.blocks.size()), a2(H.blocks.size());
+                if (!H.usable()) continue;
+                std::vector<std::uint32_t> k1(H.blocks.size()), k2(H.blocks.size());
                 for (std::size_t j = 0; j < H.blocks.size(); ++j) {
                     const std::size_t b = H.blocks[j];
-                    a1[j] = c.hap_allele[path[b] / nh][b];
-                    a2[j] = c.hap_allele[path[b] % nh][b];
+                    k1[j] = H.class_of(j, c.hap_allele[path[b] / nh][b]);
+                    k2[j] = H.class_of(j, c.hap_allele[path[b] % nh][b]);
                 }
-                lp += H.table->log_psi(a1, a2);
+                lp += H.log_psi_classes(k1, k2);
             }
             z = log_add(z, lp);
             for (std::size_t b = 0; b < nb; ++b) {
@@ -7919,4 +8082,16 @@ HybridPosterior hybrid_bruteforce(const HybridChain& c) {
     return out;
 }
 
+const char* unusable_reason_name(UnusableReason r) {
+    switch (r) {
+        case UnusableReason::EmptyRead:            return "empty_read";
+        case UnusableReason::NoInBandOrigins:      return "no_in_band_origins";
+        case UnusableReason::ScopeNotCertified:    return "scope_not_certified";
+        case UnusableReason::EmptyScope:           return "empty_scope";
+        case UnusableReason::UnmappedMassDominant: return "unmapped_mass_dominant";
+        default:                                   return "none";
+    }
+}
+
 }  // namespace panvar
+

@@ -14,6 +14,9 @@
 
 namespace panvar {
 
+struct HybridHigherFactor;
+struct HigherOrderStats;
+
 struct GenotypeOptions {
     // ACTIVE LINKAGE EDGES from a committed hybrid transaction, or null. Sized n_blocks, where
     // edges[b] joins block b-1 to b. Null -- or every entry inactive -- takes the factorised path at
@@ -26,6 +29,19 @@ struct GenotypeOptions {
     // or active with no classes -- takes the factorised path at every edge and reproduces the
     // legacy chain exactly.
     const std::vector<SparseEdgeLinkage>* sparse_linkage_edges = nullptr;
+    // Declared, not included: genotype_fragments.hpp includes this header, and the command layer
+    // deliberately uses genotype.hpp without pulling the fragment side in.
+    // THE HIGHER-ORDER FACTORS, and the per-haplotype allele table they are evaluated on. Null or
+    // empty takes the pairwise kernel above, unchanged -- the legacy path is the empty case, not a
+    // special case. When non-empty EVERY factor lives in this one list, retained pairwise edges
+    // included, so each is applied exactly once by construction and `sparse_linkage_edges` must
+    // NOT also carry them.
+    const std::vector<HybridHigherFactor>* higher_factors = nullptr;
+    const std::vector<std::vector<std::uint32_t>>* hap_allele = nullptr;
+    std::uint64_t higher_max_message_entries = 0;   // 0 = unbounded; exceeding it is a REFUSAL
+    // Filled in by the run. A refusal here means the caller must report INCOMPLETE and fall back
+    // to the legacy call with NOTHING excluded.
+    HigherOrderStats* higher_stats = nullptr;
     double recomb_rate = 1.0;          // Li-Stephens switch scaling; 1.0 = one expected switch per locus
     // How much block-local emission a state may give up and still be reachable by the chain. Any
     // diploid state losing more than this to the block's best is excluded BEFORE forward-backward,

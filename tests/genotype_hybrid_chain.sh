@@ -580,19 +580,26 @@ def row(rows, a, b, fl):
     for r in rows:
         if int(r[0]) == a and int(r[1]) == b and int(r[6]) == fl: return r
     return None
+def prod(rows, a, b):
+    # THE PRODUCTION REACH IS THE INSERT PRIOR'S UPPER SUPPORT, not a constant. It was 550 at a
+    # four-sigma prior and is 650 at six; hard-coding either turns a change of declared model
+    # policy into a test failure about flank DERIVATION, which is what these assertions are
+    # actually about. Take the widest row the probe emitted for this edge.
+    c = [r for r in rows if int(r[0]) == a and int(r[1]) == b]
+    return max(c, key=lambda r: int(r[6])) if c else None
 if any(r[9] != "1" for r in A):
     no("some edge refuses geometry: %s" % [(r[0], r[1], r[6], r[10]) for r in A if r[9] != "1"])
 else:
     ok("every adjacent-variable edge builds geometry at all requested widths")
 # EXTERNAL invariant block contributes real context, bounded by the next variable.
-r = row(A, 1, 3, 550)
+r = prod(A, 1, 3)
 if r and int(r[8]) == m2: ok("external invariant block contributes exactly %d bp of right flank" % m2)
 else: no("edge 1-3 right flank is %s, expected %d" % (r[8] if r else "?", m2))
-r = row(A, 3, 5, 550)
+r = prod(A, 3, 5)
 if r and int(r[7]) == m1: ok("external invariant block contributes exactly %d bp of left flank" % m1)
 else: no("edge 3-5 left flank is %s, expected %d" % (r[7] if r else "?", m1))
 # ADJACENT to the chain end -> derived zero, for a structural reason.
-r = row(A, 1, 3, 550)
+r = prod(A, 1, 3)
 if r and int(r[7]) == 0: ok("no invariant sequence available on the outer side -> derived flank 0")
 else: no("edge 1-3 left flank is %s, expected 0" % (r[7] if r else "?"))
 # REQUEST SMALLER THAN AVAILABLE -> exactly the request.
@@ -603,7 +610,7 @@ r = row(A, 3, 5, 100)
 if r and int(r[7]) == 100: ok("a request of 100 below the available %d yields exactly 100" % m1)
 else: no("capped left flank is %s, expected 100" % (r[7] if r else "?"))
 # CHANGING AN EXTERNAL VARIABLE ALLELE must not touch A-B geometry.
-p, q = row(A, 1, 3, 550), row(Bx, 1, 3, 550)
+p, q = prod(A, 1, 3), prod(Bx, 1, 3)
 if p and q and p[7:10] == q[7:10]:
     ok("mutating an EXTERNAL variable allele leaves edge 1-3 geometry unchanged (%s/%s)"
        % (p[7], p[8]))

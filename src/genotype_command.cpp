@@ -432,6 +432,11 @@ int run_genotype_command(const std::vector<std::string>& args) {
     std::uint64_t hybrid_max_message_entries = 0;  // 0 = unbounded; exceeding it is a REFUSAL
     std::size_t hybrid_plan_threads = 1;
     bool hybrid_plan_only = false;                 // report requirements, allocate nothing
+    bool hybrid_higher = false;                    // route the call through the higher-order chain
+    std::string hybrid_higher_report;              // realised counts, written AFTER the call
+    // COMPATIBILITY ONLY. The model's insert floor is max(|r1|, |r2|); this restores |r1| + |r2|,
+    // which declares every overlapping pair impossible.
+    bool hybrid_no_overlap_pairs = false;
     bool hybrid_factor_oracle = false;      // also run the exhaustive oracle and compare
     // REPEATABLE AND POSITIONAL, matched to --hybrid-factor-run in order. Two factors do not
     // supersede the same edges -- F1 over {2,3,4,5} replaces 3-4 and 4-5, F2 over {4,5,6}
@@ -605,6 +610,16 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--hybrid-plan-threads")
             hybrid_plan_threads = static_cast<std::size_t>(std::stoul(require_value(arg)));
         else if (arg == "--hybrid-plan-only") hybrid_plan_only = true;
+        else if (arg == "--hybrid-higher") {
+            hybrid_higher = true;
+            // GROUPED CONSTRUCTION IS NOT OPTIONAL HERE. Ungrouped, edge 6-7 predicts 1.97e8
+            // classes against a 5e7 cap and refuses on resources; grouped, the same edge is a few
+            // thousand. Leaving that to a second flag makes a forgotten switch look like a
+            // modelling limit, which is exactly what it did.
+            hybrid_grouped = true;
+        }
+        else if (arg == "--hybrid-higher-report") hybrid_higher_report = require_value(arg);
+        else if (arg == "--no-overlap-pairs") hybrid_no_overlap_pairs = true;
         else if (arg == "--hybrid-factor-oracle") hybrid_factor_oracle = true;
         else if (arg == "--hybrid-factor-supersede")
             hybrid_factor_supersedes.push_back(require_value(arg));
@@ -1988,6 +2003,22 @@ int run_genotype_command(const std::vector<std::string>& args) {
             FrameCoverage hyb_cov;
             HybridActivation hyb_act;
             std::unordered_set<std::string> hyb_exclusions;
+            // THE HIGHER-ORDER MATERIAL, declared where the genotyper can still see it. The
+            // tables must outlive every pointer into them, so they live here rather than in the
+            // block that builds them.
+            std::vector<IntervalFactorTable> built_tables;
+            std::vector<std::vector<std::uint32_t>> built_blocks;
+            std::vector<std::string> built_supersede;
+            std::vector<HybridHigherFactor> higher_factors;
+            std::vector<std::vector<std::uint32_t>> higher_hap_allele;
+            HigherOrderPlan higher_plan;
+            HigherOrderStats higher_stats;
+            std::string higher_refusal;
+            bool higher_active = false;
+            // Rendered where `owners` is in scope; printed with the status file later.
+            std::vector<std::string> unusable_lines;
+            long min_len_recorded = 0, ip_lo_recorded = 0, ip_hi_recorded = 0;
+            double ip_residual_lo = 0.0, ip_residual_hi = 0.0;
             std::size_t hyb_fragments_loaded = 0, hyb_edges_considered = 0;
             if (hybrid_call) {
                 hyb_cov = assess_frame_coverage(graph, blocks, hap_names);
@@ -2000,11 +2031,24 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     for (std::size_t b = 0; b < blocks.size(); ++b) {
                         block_variable[b] = blocks[b].n_alleles > 1 ? 1 : 0;
                     }
-                    long min_len = 1;
-                    for (const Fragment& F : hf) {
-                        min_len = std::max<long>(min_len,
-                                                 static_cast<long>(F.r1.size() + F.r2.size()));
-                    }
+                    // THE INSERT SUPPORT, and the assumption hidden in it.
+                    //
+                    // r1 + r2 as the minimum says "an insert shorter than the two mates is not a
+                    // state at all", which is only true if the mates cannot OVERLAP. They can:
+                    // a 350 +- 50 library with 150 bp mates puts 15.9% of fragments under 300 bp,
+                    // and those pairs are physically real -- the two reads simply share sequence.
+                    // Their emissions still multiply correctly conditional on the template,
+                    // because the sequencing errors are separate observations.
+                    //
+                    // --hybrid-overlap-pairs uses max(r1, r2) instead, which is the true floor:
+                    // an insert cannot be shorter than its longest mate. It is a FLAG rather than
+                    // the default because widening the support changes the prior normalisation,
+                    // the exposure, every fragment mass, ownership, and therefore which fragments
+                    // F1 and F2 own -- so the ledger and the real factors have to be rebuilt after
+                    // it, not merely re-read.
+                    hyb_params.allow_overlapping_pairs = !hybrid_no_overlap_pairs;
+                    const long min_len =
+                        fragment_insert_floor(hf, hyb_params.allow_overlapping_pairs);
                     hyb_params.fragment_len = fragment_len;   // the library geometry in force
                     // ALWAYS COMPUTED, even when a supplied lambda is used, so the ratio between
                     // the two is reportable and the arms are comparable.
@@ -2020,10 +2064,14 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         HybridLinkageParameters::LambdaSource::Estimated) {
                         hyb_params.lambda = hyb_params.lambda_estimated;
                     }
+                    min_len_recorded = min_len;
                     const InsertPrior ip = make_insert_prior(hyb_params.fragment_len,
                                                              hyb_params.fragment_sd,
                                                              hyb_params.discordant_rate,
                                                              hyb_params.insert_sigmas, min_len);
+                    ip_lo_recorded = ip.lo; ip_hi_recorded = ip.hi;
+                    ip_residual_lo = ip.log_residual_below;
+                    ip_residual_hi = ip.log_residual_above;
                     const double lep = std::log(hyb_params.error_rate / 3.0);
                     const double l1m = std::log1p(-hyb_params.error_rate);
                     // OWNERSHIP over the SAME frames the preflight reported: the object is passed,
@@ -2085,8 +2133,6 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     // Its evidence is the pairwise owners inside the block span plus the Wide
                     // fragments whose whole variable scope lies inside it -- the same rule the
                     // ledger used, so the counts must reconcile with it exactly.
-                    std::vector<IntervalFactorTable> built_tables;
-                    std::vector<std::vector<std::uint32_t>> built_blocks;
                     for (std::size_t frun = 0; frun < hybrid_factor_runs.size(); ++frun) {
                         const std::string& hybrid_factor_run = hybrid_factor_runs[frun];
                         const std::string hybrid_factor_supersede =
@@ -2434,6 +2480,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                 if (FT.ok) {
                                     built_tables.push_back(std::move(FT));
                                     built_blocks.push_back(fbl);
+                                    built_supersede.push_back(hybrid_factor_supersede);
                                 }
                             }
                             const double run_s = std::chrono::duration<double>(
@@ -3828,11 +3875,338 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         maps[b] = build_allele_mapping(av, blocks[b].n_alleles,
                                                        blocks[b].bypass_allele);
                     }
+                    // ---- WHY EACH UNUSABLE FRAGMENT IS UNUSABLE ---------------------------
+                    // One policy cannot serve all of these. A fragment with NO IN-BAND ORIGINS is
+                    // candidate-INDEPENDENT and cannot rank genotypes; one whose scope merely
+                    // failed to certify has attributable mass and needs a deeper search; one with
+                    // dominant UNMAPPED mass is candidate-DEPENDENT evidence the block chain
+                    // cannot express, and only that last category may legitimately block the call.
+                    {
+                        struct RCat {
+                            std::size_t n = 0, bases = 0;
+                            double in_band = -std::numeric_limits<double>::infinity();
+                            double omitted = -std::numeric_limits<double>::infinity();
+                            double unmapped = -std::numeric_limits<double>::infinity();
+                            std::size_t origins = 0, scope_blocks = 0, max_span = 0;
+                        };
+                        std::map<std::string, RCat> cats;
+                        const auto la = [](double x, double y) {
+                            const double ninf = -std::numeric_limits<double>::infinity();
+                            if (x == ninf) return y;
+                            if (y == ninf) return x;
+                            const double m = std::max(x, y);
+                            return m + std::log(std::exp(x - m) + std::exp(y - m));
+                        };
+                        for (std::size_t i = 0; i < owners.size(); ++i) {
+                            if (owners[i].kind != OwnerKind::Unusable) continue;
+                            RCat& c = cats[unusable_reason_name(owners[i].why)];
+                            ++c.n;
+                            c.in_band = la(c.in_band, owners[i].in_band);
+                            c.omitted = la(c.omitted, owners[i].omitted_bound);
+                            c.unmapped = la(c.unmapped, owners[i].unmapped);
+                            c.origins += owners[i].origins;
+                            c.scope_blocks += owners[i].scope.size();
+                            if (!owners[i].scope.empty())
+                                c.max_span = std::max<std::size_t>(
+                                    c.max_span,
+                                    owners[i].scope.back() - owners[i].scope.front() + 1);
+                            if (i < hf.size()) c.bases += hf[i].r1.size() + hf[i].r2.size();
+                        }
+                        const auto num = [](double v) {
+                            char b[40];
+                            if (v == -std::numeric_limits<double>::infinity())
+                                return std::string("-inf");
+                            std::snprintf(b, sizeof b, "%.6f", v); return std::string(b);
+                        };
+                        for (const auto& kv : cats) {
+                            const std::string k = "unusable_" + kv.first + "_";
+                            unusable_lines.push_back(k + "count\t" +
+                                                     std::to_string(kv.second.n) + "\n");
+                            unusable_lines.push_back(k + "read_bases\t" +
+                                                     std::to_string(kv.second.bases) + "\n");
+                            unusable_lines.push_back(k + "log_in_band\t" +
+                                                     num(kv.second.in_band) + "\n");
+                            unusable_lines.push_back(k + "log_omitted_bound\t" +
+                                                     num(kv.second.omitted) + "\n");
+                            unusable_lines.push_back(k + "log_unmapped\t" +
+                                                     num(kv.second.unmapped) + "\n");
+                            unusable_lines.push_back(k + "origins\t" +
+                                                     std::to_string(kv.second.origins) + "\n");
+                            unusable_lines.push_back(k + "scope_blocks\t" +
+                                                     std::to_string(kv.second.scope_blocks) + "\n");
+                            unusable_lines.push_back(k + "max_block_span\t" +
+                                                     std::to_string(kv.second.max_span) + "\n");
+                        }
+                        // ---- THE ONLY QUESTION THAT MATTERS FOR THESE FRAGMENTS ----------
+                        // Not "is the raw tail mass small" -- every read probability is tiny --
+                        // but "how far can the tail move this fragment's CONTRIBUTION", which is
+                        //
+                        //     log( (1-eta) * lambda * (M_a + M_b) + eta * P_bg )
+                        //
+                        // evaluated at M = 0 and at M = the certified omitted bound. The width of
+                        // that interval is what a tail can do to the log-likelihood, and it is
+                        // governed by the tail RELATIVE to eta * P_bg, not by its absolute size.
+                        //
+                        // A per-fragment width is not the guarantee either: 3,740 individually
+                        // negligible widths can sum to something that reorders genotypes. So the
+                        // widths are SUMMED and the aggregate is what must fit the declared
+                        // tolerance.
+                        //
+                        // THIS IS AN UPPER BOUND ON THE WIDTH, NOT AN ESTIMATED EFFECT.
+                        // The omitted bound used here is aggregated over ALL candidates, and both
+                        // homologues are given it, so every fragment is charged more tail than any
+                        // single candidate pair could actually carry. A number produced this way
+                        // says "no more than this"; it does not say what the biological effect is,
+                        // and it must not be quoted as one. Per-candidate bounds would tighten it,
+                        // and that is what adaptive deepening should use.
+                        //
+                        // The counts are also not a statement about the genotyper as a whole:
+                        // these fragments REMAIN IN THE MARKER COUNTS and can still rank genotypes
+                        // through the block unaries. "No in-band placement" is a statement about
+                        // the certified linkage-placement model only.
+                        {
+                            const double lmix = std::log1p(-hyb_params.outlier_mix);
+                            const double lbgw = std::log(hyb_params.outlier_mix);
+                            const double llam = std::log(hyb_params.lambda);
+                            double sum_w = 0.0, worst_w = 0.0, worst_bg = -1e308;
+                            std::size_t n_audited = 0, n_infinite = 0;
+                            for (std::size_t i = 0; i < owners.size() && i < hf.size(); ++i) {
+                                if (owners[i].kind != OwnerKind::Unusable) continue;
+                                if (owners[i].why != UnusableReason::NoInBandOrigins) continue;
+                                const std::size_t len = hf[i].bases();
+                                const std::size_t bee = static_cast<std::size_t>(
+                                    hyb_params.bg_divergence * static_cast<double>(len));
+                                const double bgf = static_cast<double>(bee) * lep +
+                                                   static_cast<double>(len - bee) * l1m;
+                                MassInterval m{-std::numeric_limits<double>::infinity(),
+                                               owners[i].omitted_bound};
+                                const MassInterval ci =
+                                    fragment_contribution(m, m, false, lmix, llam, lbgw, bgf);
+                                ++n_audited;
+                                if (!std::isfinite(ci.upper) || !std::isfinite(ci.lower)) {
+                                    ++n_infinite; continue;
+                                }
+                                const double w = ci.upper - ci.lower;
+                                sum_w += w;
+                                worst_w = std::max(worst_w, w);
+                                worst_bg = std::max(worst_bg, bgf);
+                            }
+                            unusable_lines.push_back(
+                                "audit_no_in_band_audited\t" + std::to_string(n_audited) + "\n");
+                            unusable_lines.push_back(
+                                "audit_no_in_band_nonfinite\t" + std::to_string(n_infinite)+"\n");
+                            char nb[64];
+                            std::snprintf(nb, sizeof nb, "%.6f", worst_w);
+                            unusable_lines.push_back(
+                                std::string("audit_worst_contribution_width_upper_bound_nats\t") + nb + "\n");
+                            std::snprintf(nb, sizeof nb, "%.6f", sum_w);
+                            unusable_lines.push_back(
+                                std::string("audit_summed_contribution_width_upper_bound_nats\t") + nb+"\n");
+                            std::snprintf(nb, sizeof nb, "%.6f", worst_bg);
+                            unusable_lines.push_back(
+                                std::string("audit_worst_log_p_bg\t") + nb + "\n");
+                            // DECLARED, not inferred. A total of 1e-3 nats cannot reorder a call
+                            // whose margins are measured in nats; anything above it is not
+                            // dismissible and the fragments stay Unusable.
+                            const double kGlobalToleranceNats = 1e-3;
+                            std::snprintf(nb, sizeof nb, "%.6f", kGlobalToleranceNats);
+                            unusable_lines.push_back(
+                                std::string("audit_global_tolerance_nats\t") + nb + "\n");
+                            unusable_lines.push_back(
+                                "audit_bound_kind\tall-candidate aggregate, both homologues; "
+                                "UPPER BOUND on the width, not an effect estimate\n");
+                            // ---- WHICH DIMENSION ACTUALLY REJECTED THEM ----------------------
+                            // Before deepening anything, ask whether the edit band was ever the
+                            // binding constraint. The lower insert tail has already accounted for
+                            // 3,746 of these; the UPPER tail predicts about 0.76 fragments beyond
+                            // mean + 4 sd for this library, so a survivor is more likely a long
+                            // insert than a hard read. Deepening edits would attack the wrong
+                            // dimension a second time.
+                            for (std::size_t i = 0; i < owners.size() && i < hf.size(); ++i) {
+                                if (owners[i].kind != OwnerKind::Unusable) continue;
+                                if (owners[i].why != UnusableReason::NoInBandOrigins) continue;
+                                const Fragment& F = hf[i];
+                                long best = -1; std::size_t e1 = 0, e2 = 0; bool both = false;
+                                const std::size_t d1 =
+                                    mate_band_edits(hyb_params.max_divergence, F.r1.size());
+                                const std::size_t d2 =
+                                    mate_band_edits(hyb_params.max_divergence, F.r2.size());
+                                const std::string rc2 = F.r2.empty() ? std::string()
+                                                                     : reverse_complement(F.r2);
+                                for (const CandidateFrame& fr : hyb_cov.frames) {
+                                    if (!fr.ok || fr.seq.empty()) continue;
+                                    const auto p1 = bounded_mate_placements(F.r1, fr.seq, d1,
+                                                                            nullptr, nullptr);
+                                    const auto p2 = bounded_mate_placements(rc2, fr.seq, d2,
+                                                                            nullptr, nullptr);
+                                    if (p1.empty() || p2.empty()) continue;
+                                    both = true;
+                                    for (const auto& a : p1)
+                                        for (const auto& b : p2) {
+                                            const long ins = static_cast<long>(b.start) +
+                                                             static_cast<long>(F.r2.size()) -
+                                                             static_cast<long>(a.start);
+                                            if (ins <= 0) continue;
+                                            if (best < 0 || ins < best) {
+                                                best = ins; e1 = a.edits; e2 = b.edits;
+                                            }
+                                        }
+                                }
+                                unusable_lines.push_back(
+                                    "residual_fragment\t" + F.name + "\tmates_place_individually=" +
+                                    (both ? "1" : "0") + "\tbest_unrestricted_insert=" +
+                                    std::to_string(best) + "\tedits=" + std::to_string(e1) + "+" +
+                                    std::to_string(e2) + "\tsupport=" +
+                                    std::to_string(ip_lo_recorded) + "-" +
+                                    std::to_string(ip_hi_recorded) + "\tabove_upper=" +
+                                    ((best > ip_hi_recorded) ? "1" : "0") + "\n");
+                            }
+                            unusable_lines.push_back(
+                                "audit_marker_occurrences\tNOT MEASURED -- these fragments remain "
+                                "in the marker counts and may still rank genotypes\n");
+                            unusable_lines.push_back(
+                                std::string("audit_aggregate_within_tolerance\t") +
+                                ((n_infinite == 0 && sum_w <= kGlobalToleranceNats) ? "1" : "0") +
+                                "\n");
+                        }
+                        // THE ONE CATEGORY THAT MUST BLOCK.
+                        unusable_lines.push_back(
+                            "unusable_blocking_count\t" +
+                            std::to_string(cats.count("unmapped_mass_dominant")
+                                               ? cats["unmapped_mass_dominant"].n : 0) + "\n");
+                    }
+                    // THE FACTOR SCOPES, stated before the transaction so completeness is
+                    // assessed against the model that will actually run. Without --hybrid-higher
+                    // this is empty and the assessment is the pairwise one, unchanged.
+                    std::vector<HigherFactorScope> higher_scopes;
+                    if (hybrid_higher)
+                        for (std::size_t f = 0; f < built_blocks.size(); ++f) {
+                            HigherFactorScope hsc;
+                            hsc.blocks = built_blocks[f];
+                            std::string tok;
+                            const std::string spec =
+                                f < built_supersede.size() ? built_supersede[f] : std::string();
+                            for (char ch : spec + ",") {
+                                if (ch != ',') { tok.push_back(ch); continue; }
+                                const std::size_t dash = tok.find('-');
+                                if (dash != std::string::npos)
+                                    hsc.superseded.push_back({
+                                        static_cast<std::uint32_t>(std::stoul(tok.substr(0, dash))),
+                                        static_cast<std::uint32_t>(std::stoul(tok.substr(dash+1)))});
+                                tok.clear();
+                            }
+                            higher_scopes.push_back(hsc);
+                        }
                     hyb_act = plan_hybrid_activation_sparse(hf, owners, edge_status, edge_map,
-                                                            maps, blocks.size());
-                    if (hyb_act.hybrid_activated) {
+                                                            maps, blocks.size(), higher_scopes);
+                    // ---- THE HIGHER-ORDER TRANSACTION ------------------------------------
+                    // ORDER MATTERS AND IS THE POINT. The plan is computed on the ACTUAL
+                    // production chain -- every block, the real panel -- BEFORE a single read is
+                    // excluded and before any message is allocated. If anything here refuses, the
+                    // whole transaction is abandoned: no factors, no exclusions, and the legacy
+                    // call proceeds untouched.
+                    if (hybrid_higher && !built_tables.empty()) {
+                        higher_hap_allele.assign(hap_names.size(),
+                                                 std::vector<std::uint32_t>(blocks.size(), 0));
+                        bool spanned = true;
+                        for (std::size_t h = 0; h < hap_names.size() && spanned; ++h)
+                            for (std::size_t b = 0; b < blocks.size(); ++b) {
+                                const auto it = blocks[b].allele_of.find(hap_names[h]);
+                                if (it == blocks[b].allele_of.end()) { spanned = false; break; }
+                                higher_hap_allele[h][b] =
+                                    static_cast<std::uint32_t>(it->second);
+                            }
+                        // EVERY superseded edge, from every factor's own list.
+                        std::set<std::pair<std::uint32_t, std::uint32_t>> superseded;
+                        for (const std::string& spec : built_supersede) {
+                            std::string tok;
+                            for (char ch : spec + ",") {
+                                if (ch != ',') { tok.push_back(ch); continue; }
+                                const std::size_t dash = tok.find('-');
+                                if (dash != std::string::npos)
+                                    superseded.insert({
+                                        static_cast<std::uint32_t>(std::stoul(tok.substr(0, dash))),
+                                        static_cast<std::uint32_t>(std::stoul(tok.substr(dash+1)))});
+                                tok.clear();
+                            }
+                        }
+                        // ONE LIST. Retained pairwise edges first, then the interval factors --
+                        // a superseded edge is never added, so it cannot be applied at all.
+                        std::size_t retained_pairwise = 0, dropped_superseded = 0;
+                        for (std::size_t b = 1; b < hyb_act.sparse_kernel_edges.size(); ++b) {
+                            const SparseEdgeLinkage& e = hyb_act.sparse_kernel_edges[b];
+                            if (!e.has_corrections()) continue;
+                            const std::pair<std::uint32_t, std::uint32_t> key{
+                                static_cast<std::uint32_t>(b - 1), static_cast<std::uint32_t>(b)};
+                            if (superseded.count(key)) { ++dropped_superseded; continue; }
+                            HybridHigherFactor HF;
+                            HF.blocks = {key.first, key.second};
+                            HF.pairwise = &hyb_act.sparse_kernel_edges[b];
+                            higher_factors.push_back(HF);
+                            ++retained_pairwise;
+                        }
+                        for (std::size_t f = 0; f < built_tables.size(); ++f) {
+                            HybridHigherFactor HF;
+                            HF.blocks = built_blocks[f];
+                            HF.table = &built_tables[f];
+                            higher_factors.push_back(HF);
+                        }
+                        HybridChain PC;
+                        PC.n_hap = hap_names.size(); PC.n_blocks = blocks.size();
+                        PC.recomb = 0.5;   // the plan does not depend on r beyond r in (0,1)
+                        PC.edges.assign(blocks.size(), HybridEdge{});
+                        PC.log_emission.assign(blocks.size(),
+                                               std::vector<double>(PC.n_hap * PC.n_hap, 0.0));
+                        PC.hap_allele = higher_hap_allele;
+                        PC.higher = higher_factors;
+                        higher_plan = spanned ? plan_higher_order(PC, 1) : HigherOrderPlan{};
+                        if (!spanned) higher_plan.refusal =
+                            "not every panel haplotype spans every block";
+                        const bool fits = higher_plan.ok &&
+                            (hybrid_max_message_entries == 0 ||
+                             higher_plan.peak_message_entries <= hybrid_max_message_entries);
+                        if (!fits) {
+                            higher_refusal = higher_plan.ok
+                                ? ("planned peak message of " +
+                                   std::to_string(higher_plan.peak_message_entries) +
+                                   " entries exceeds --hybrid-max-message-entries")
+                                : higher_plan.refusal;
+                            higher_factors.clear(); higher_hap_allele.clear();
+                            log.info("hybrid higher-order: REFUSED before allocation (" +
+                                     higher_refusal + "); nothing excluded, legacy call stands");
+                        } else if (!hyb_act.hybrid_activated) {
+                            // THE TRANSACTION IS ONE TRANSACTION. If the pairwise side did not
+                            // activate, the model is INCOMPLETE and the higher factors must not
+                            // run either -- a partly-higher-order call is not a defined object.
+                            higher_refusal = "the hybrid transaction did not activate (" +
+                                             hyb_act.refusal + ")";
+                            higher_factors.clear(); higher_hap_allele.clear();
+                            log.info("hybrid higher-order: STOOD DOWN because the transaction is "
+                                     "incomplete; nothing excluded, legacy call stands");
+                        } else {
+                            higher_active = true;
+                            log.info("hybrid higher-order: " +
+                                     std::to_string(retained_pairwise) + " retained pairwise + " +
+                                     std::to_string(built_tables.size()) + " interval factors, " +
+                                     std::to_string(dropped_superseded) + " superseded edges "
+                                     "excluded; planned peak " +
+                                     std::to_string(higher_plan.peak_message_entries) +
+                                     " entries, " +
+                                     std::to_string(higher_plan.total_bytes / 1048576) + " MB, " +
+                                     std::to_string(higher_plan.forward_updates) +
+                                     " forward updates");
+                        }
+                    }
+                    // EXCLUSIONS ONLY NOW, and only if nothing refused. A higher-order refusal
+                    // must leave the read set untouched.
+                    if (hyb_act.hybrid_activated &&
+                        (!hybrid_higher || built_tables.empty() || higher_active)) {
                         hyb_exclusions.insert(hyb_act.excluded_fragments.begin(),
                                               hyb_act.excluded_fragments.end());
+                    } else if (hyb_act.hybrid_activated) {
+                        hyb_act.hybrid_activated = false;
+                        hyb_act.call_status = HybridCallStatus::Incomplete;
+                        hyb_act.refusal = "higher-order: " + higher_refusal;
                     }
                     }   // end of the verified-window budget else
                     }   // end of the overflow guard else
@@ -3916,6 +4290,22 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     hs.precision(10);
                     hs << "field\tvalue\n";
                     hs << "hybrid_status\t" << hybrid_call_status_name(hyb_act.call_status) << '\n';
+                    // PROVENANCE: which fragment universe this run scored. Two runs under
+                    // different insert floors are not comparable, and the difference is invisible
+                    // in every other field.
+                    hs << "insert_floor_policy\t"
+                       << (hyb_params.allow_overlapping_pairs
+                               ? "max(|r1|,|r2|) -- overlapping pairs are valid"
+                               : "|r1|+|r2| -- COMPATIBILITY, overlapping pairs excluded")
+                       << '\n';
+                    hs << "insert_floor_bp\t" << min_len_recorded << '\n';
+                    hs << "insert_support\t" << ip_lo_recorded << "-" << ip_hi_recorded << '\n';
+                    hs << "insert_sigmas\t" << hyb_params.insert_sigmas << '\n';
+                    // NOT CALLED ZERO. Any finite support leaves Gaussian tail mass outside it;
+                    // reporting it is what lets a later caller certify the residual through the
+                    // same contribution-width machinery instead of assuming it away.
+                    hs << "insert_residual_log_below\t" << ip_residual_lo << '\n';
+                    hs << "insert_residual_log_above\t" << ip_residual_hi << '\n';
                     hs << "ownership_complete\t" << (hyb_act.ownership_complete ? 1 : 0) << '\n';
                     hs << "factors_buildable\t" << (hyb_act.factors_buildable ? 1 : 0) << '\n';
                     hs << "hybrid_activated\t" << (hyb_act.hybrid_activated ? 1 : 0) << '\n';
@@ -3926,6 +4316,85 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     hs << "candidate_edges\t" << hyb_edges_considered << '\n';
                     hs << "active_edges\t" << hyb_act.active_edges << '\n';
                     hs << "fragments_excluded\t" << hyb_exclusions.size() << '\n';
+                    // ---- THE HIGHER-ORDER ACCOUNTING ---------------------------------------
+                    // Every claim a C4 acceptance would rest on, emitted as a number rather than
+                    // left to be inferred from the log.
+                    hs << "higher_order_requested\t" << (hybrid_higher ? 1 : 0) << '\n';
+                    hs << "higher_order_active\t" << (higher_active ? 1 : 0) << '\n';
+                    hs << "higher_order_refusal\t"
+                       << (higher_refusal.empty() ? "-" : higher_refusal) << '\n';
+                    if (hybrid_higher) {
+                        std::size_t n_pw = 0, n_iv = 0;
+                        std::set<std::string> factor_keys;
+                        bool dup = false;
+                        for (const HybridHigherFactor& f : higher_factors) {
+                            std::string k;
+                            for (std::uint32_t q : f.blocks) k += std::to_string(q) + ".";
+                            k += f.table != nullptr ? "I" : "P";
+                            if (!factor_keys.insert(k).second) dup = true;
+                            if (f.table != nullptr) ++n_iv; else ++n_pw;
+                        }
+                        hs << "higher_retained_pairwise_factors\t" << n_pw << '\n';
+                        hs << "higher_interval_factors\t" << n_iv << '\n';
+                        hs << "higher_each_factor_once\t" << (dup ? 0 : 1) << '\n';
+                        hs << "higher_ls_transitions\t"
+                           << (blocks.empty() ? 0 : blocks.size() - 1) << '\n';
+                        for (const HybridHigherFactor& f : higher_factors) {
+                            hs << "higher_factor\t";
+                            for (std::size_t j = 0; j < f.blocks.size(); ++j)
+                                hs << (j ? "," : "") << f.blocks[j];
+                            hs << (f.table != nullptr ? "\tinterval\t" : "\tpairwise\t")
+                               << (f.table != nullptr ? f.table->classes_stored
+                                                      : f.pairwise->classes.size()) << '\n';
+                        }
+                        hs << "higher_plan_ok\t" << (higher_plan.ok ? 1 : 0) << '\n';
+                        hs << "higher_plan_peak_message_entries\t"
+                           << higher_plan.peak_message_entries << '\n';
+                        hs << "higher_plan_forward_updates\t"
+                           << higher_plan.forward_updates << '\n';
+                        hs << "higher_plan_total_bytes\t" << higher_plan.total_bytes << '\n';
+                        hs << "higher_planned_before_exclusions\t1\n";
+                        // The REALISED counts are not known here -- this file is written before
+                        // the genotyper runs. They go to --hybrid-higher-report, afterwards.
+                        hs << "higher_actuals\tsee --hybrid-higher-report\n";
+                        if (false) {
+                            hs << "higher_actual_forward_updates\t"
+                               << higher_stats.forward_updates << '\n';
+                            hs << "higher_actual_adjoint_updates\t"
+                               << higher_stats.adjoint_updates << '\n';
+                            hs << "higher_actual_peak_message_entries\t"
+                               << higher_stats.peak_message_entries << '\n';
+                            hs << "higher_all_initial_emissions_finite\t"
+                               << (higher_stats.all_initial_emissions_finite ? 1 : 0) << '\n';
+                            hs << "higher_initial_states_dropped\t"
+                               << higher_stats.initial_states_dropped << '\n';
+                            // EXACT when every initial emission is finite; a BOUND otherwise. Both
+                            // are checked, and which one applied is reported.
+                            const bool exact = higher_stats.all_initial_emissions_finite;
+                            const bool holds = exact
+                                ? (higher_stats.forward_updates == higher_plan.forward_updates &&
+                                   higher_stats.peak_message_entries ==
+                                       higher_plan.peak_message_entries)
+                                : (higher_stats.forward_updates <= higher_plan.forward_updates &&
+                                   higher_stats.peak_message_entries <=
+                                       higher_plan.peak_message_entries);
+                            hs << "higher_plan_contract\t" << (exact ? "EQUAL" : "BOUND") << '\n';
+                            hs << "higher_plan_contract_holds\t" << (holds ? 1 : 0) << '\n';
+                            hs << "higher_forward_seconds\t"
+                               << higher_stats.forward_seconds << '\n';
+                            hs << "higher_adjoint_seconds\t"
+                               << higher_stats.adjoint_seconds << '\n';
+                        }
+                    }
+                    for (const std::string& ln : unusable_lines) hs << ln;
+                    hs << "consumed_higher_wide\t"
+                       << hyb_act.report.consumed_higher_wide << '\n';
+                    hs << "consumed_higher_superseded\t"
+                       << hyb_act.report.consumed_higher_superseded << '\n';
+                    hs << "consumed_fragments\t" << hyb_act.consumed_fragments << '\n';
+                    hs << "excluded_equals_consumed\t"
+                       << ((hyb_act.excluded_fragments.size() == hyb_act.consumed_fragments &&
+                            hyb_exclusions.size() == hyb_act.consumed_fragments) ? 1 : 0) << '\n';
                     hs << "owned_unary\t" << hyb_act.report.consumed_unary << '\n';
                     hs << "owned_linkage\t" << hyb_act.report.consumed_linkage << '\n';
                     hs << "owned_invariant\t" << hyb_act.report.invariant << '\n';
@@ -4679,12 +5148,58 @@ int run_genotype_command(const std::vector<std::string>& args) {
             gopt.probe_pairs = probe_pairs;
             // ACTIVE EDGES ONLY, and only from a committed transaction. Null otherwise, which takes
             // the factorised path at every edge and reproduces the legacy chain exactly.
-            if (hyb_act.hybrid_activated) gopt.sparse_linkage_edges = &hyb_act.sparse_kernel_edges;
+            if (hyb_act.hybrid_activated && !higher_active)
+                gopt.sparse_linkage_edges = &hyb_act.sparse_kernel_edges;
+            if (higher_active) {
+                // ONE LIST OWNS EVERY FACTOR. The sparse edges stay null precisely so nothing can
+                // be applied twice.
+                gopt.higher_factors = &higher_factors;
+                gopt.hap_allele = &higher_hap_allele;
+                gopt.higher_max_message_entries = hybrid_max_message_entries;
+                gopt.higher_stats = &higher_stats;
+            }
             std::vector<ProbePairResult> probe_rows;
             std::vector<BlockCall> calls =
                 genotype_sample(chain, blocks, read_panel, rc, depth, hap_names, gopt, &gsum,
                                 pa1.empty() ? nullptr : &pa1, pa2.empty() ? nullptr : &pa2,
                                 evidence == "syncmer" ? nullptr : &cev, &probe_rows);
+
+            // ---- WHAT THE RECURRENCE ACTUALLY DID, after it has done it -----------------------
+            if (!hybrid_higher_report.empty()) {
+                std::ofstream hr(hybrid_higher_report);
+                if (!hr) throw std::runtime_error("genotype: cannot write " +
+                                                  hybrid_higher_report);
+                hr << "field\tvalue\n";
+                hr << "higher_order_active\t" << (higher_active ? 1 : 0) << '\n';
+                hr << "refusal\t" << (higher_refusal.empty() ? "-" : higher_refusal) << '\n';
+                if (higher_active) {
+                    const bool exact = higher_stats.all_initial_emissions_finite;
+                    hr << "plan_contract\t" << (exact ? "EQUAL" : "BOUND") << '\n';
+                    hr << "all_initial_emissions_finite\t" << (exact ? 1 : 0) << '\n';
+                    hr << "initial_states_dropped\t"
+                       << higher_stats.initial_states_dropped << '\n';
+                    hr << "planned_forward_updates\t" << higher_plan.forward_updates << '\n';
+                    hr << "actual_forward_updates\t" << higher_stats.forward_updates << '\n';
+                    hr << "actual_adjoint_updates\t" << higher_stats.adjoint_updates << '\n';
+                    hr << "planned_peak_message_entries\t"
+                       << higher_plan.peak_message_entries << '\n';
+                    hr << "actual_peak_message_entries\t"
+                       << higher_stats.peak_message_entries << '\n';
+                    const bool holds = exact
+                        ? (higher_stats.forward_updates == higher_plan.forward_updates &&
+                           higher_stats.peak_message_entries == higher_plan.peak_message_entries)
+                        : (higher_stats.forward_updates <= higher_plan.forward_updates &&
+                           higher_stats.peak_message_entries <=
+                               higher_plan.peak_message_entries);
+                    hr << "plan_contract_holds\t" << (holds ? 1 : 0) << '\n';
+                    hr << "factor_lookups\t" << higher_stats.factor_lookups << '\n';
+                    hr << "history_ops\t" << higher_stats.history_ops << '\n';
+                    hr << "grouping_ops\t" << higher_stats.grouping_ops << '\n';
+                    hr << "forward_seconds\t" << higher_stats.forward_seconds << '\n';
+                    hr << "adjoint_seconds\t" << higher_stats.adjoint_seconds << '\n';
+                    hr << "blocks_called\t" << calls.size() << '\n';
+                }
+            }
 
             if (model_pangenie) {
                 // Same panel, same counts, same depth -- only the model differs, which is the whole

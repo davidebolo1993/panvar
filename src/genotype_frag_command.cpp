@@ -347,6 +347,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     bool interval_selftest = false;
     bool normalisation_selftest = false;
     bool factor_selftest = false;
+    bool contribution_selftest = false;
     bool hoinfer_selftest = false;
     bool completeness_selftest = false;
     bool activation_selftest = false;
@@ -409,6 +410,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--interval-selftest") interval_selftest = true;
         else if (a == "--normalisation-selftest") normalisation_selftest = true;
         else if (a == "--factor-selftest") factor_selftest = true;
+        else if (a == "--contribution-selftest") contribution_selftest = true;
         else if (a == "--hoinfer-selftest") hoinfer_selftest = true;
         else if (a == "--completeness-selftest") completeness_selftest = true;
         else if (a == "--activation-selftest") activation_selftest = true;
@@ -676,7 +678,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         !hybrid_oracle && !mapping_selftest && !completeness_selftest && !activation_selftest &&
         !support_selftest && !coordinate_selftest && !budget_selftest && !grouping_selftest &&
         !interval_selftest && !normalisation_selftest && !factor_selftest &&
-        !hoinfer_selftest) {
+        !hoinfer_selftest && !contribution_selftest) {
         throw std::runtime_error("genotype-frag requires at least one --reads");
     }
     if (!bubble_prefix_in.empty()) {
@@ -1531,6 +1533,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                 std::set<std::pair<std::uint32_t, std::uint32_t>> pairs;
                 for (std::size_t a = 0; a < nA[2]; ++a)
                     pairs.insert({FA.allele_class[1][a], FB.allele_class[0][a]});
+                (void)0;
                 refined_here = pairs.size();
             }
             ok_(refined_here > FA.classes_per_block[1] && refined_here > FB.classes_per_block[0],
@@ -1551,8 +1554,41 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             ch.log_emission.assign(NBp, std::vector<double>(NSp, 0.0));
             for (std::size_t b = 0; b < NBp; ++b)
                 for (std::size_t k = 0; k < NSp; ++k) ch.log_emission[b][k] = ud(rng3);
-            ch.higher.push_back(HybridHigherFactor{{1, 2, 3}, &FA});
-            ch.higher.push_back(HybridHigherFactor{{2, 3, 4}, &FB});
+            // A RETAINED PAIRWISE EDGE, carried in the same list. Without one the pairwise
+            // branch is present and never taken, and the aggregation over source templates would
+            // silently destroy the left endpoint it depends on. Edge 0-1 is OUTSIDE both interval
+            // factors, so it also makes block 0 enter the carried history on its own account.
+            SparseEdgeLinkage PW;
+            PW.active = true;
+            PW.n_a = nA[0]; PW.n_b = nA[1];
+            PW.allele_a.resize(NHp); PW.allele_b.resize(NHp);
+            for (std::size_t t = 0; t < NHp; ++t) {
+                PW.allele_a[t] = static_cast<std::uint32_t>(t % nA[0]);
+                PW.allele_b[t] = static_cast<std::uint32_t>((t + 1) % nA[1]);
+            }
+            {
+                std::mt19937_64 rp(20260912);
+                std::uniform_real_distribution<double> pd(-0.9, 0.9);
+                for (std::uint32_t amin = 0; amin < nA[0]; ++amin)
+                for (std::uint32_t amax = amin; amax < nA[0]; ++amax)
+                for (std::uint32_t bmin = 0; bmin < nA[1]; ++bmin)
+                for (std::uint32_t bmax = bmin; bmax < nA[1]; ++bmax) {
+                    if (amin == amax || bmin == bmax) continue;   // no phase to express
+                    SparsePhaseClass k;
+                    k.amin = amin; k.amax = amax; k.bmin = bmin; k.bmax = bmax;
+                    const double d = pd(rp);
+                    k.straight_m1 = std::expm1(d);
+                    k.crossed_m1 = std::expm1(-d);
+                    PW.classes.push_back(k);
+                }
+            }
+            ch.higher.push_back(HybridHigherFactor{{0, 1}, nullptr, &PW});
+            ch.higher.push_back(HybridHigherFactor{{1, 2, 3}, &FA, nullptr});
+            ch.higher.push_back(HybridHigherFactor{{2, 3, 4}, &FB, nullptr});
+            ok_(PW.has_corrections(),
+                "production gate: the fixture carries a RETAINED PAIRWISE edge with " +
+                std::to_string(PW.classes.size()) + " non-neutral phase classes, alongside the "
+                "two interval factors");
 
             HigherOrderStats hs;
             HigherOrderTrace tr;
@@ -1615,6 +1651,10 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                 eq("dense_equivalent", pl.dense_equivalent_updates, hs.dense_equivalent_updates);
                 std::string why;
                 for (std::size_t i = 0; i < off.size(); ++i) why += (i ? "; " : "") + off[i];
+                ok_(hs.all_initial_emissions_finite && hs.initial_states_dropped == 0,
+                    "production gate: every initial state has a finite nonzero scaled emission, "
+                    "which is the condition under which the plan is EXACT rather than an upper "
+                    "bound");
                 ok_(off.empty(), off.empty()
                     ? ("production gate: EVERY planned count equals the realised one (" +
                        std::to_string(pl.forward_updates) + " forward updates, " +
@@ -1634,6 +1674,34 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                     std::to_string(pl.container_bytes) + ", temporaries " +
                     std::to_string(pl.temporary_bytes) + " and " + std::to_string(pl.threads) +
                     " x " + std::to_string(pl.per_thread_bytes) + " per-thread");
+            }
+
+            // ---- AND WHAT HAPPENS WHEN AN EMISSION IS NOT FINITE ---------------------------
+            // With a -inf emission the initial message drops states the plan counted, so the plan
+            // becomes an upper BOUND. Both halves are asserted: the run must say so, and the
+            // counts must stay under the plan rather than merely differ from it.
+            {
+                HybridChain deadch = ch;
+                deadch.log_emission[0][0] = -std::numeric_limits<double>::infinity();
+                deadch.log_emission[0][5] = -std::numeric_limits<double>::infinity();
+                HigherOrderStats hz;
+                const HybridPosterior zp = hybrid_higher_order(deadch, 0, &hz);
+                const HigherOrderPlan pz = plan_higher_order(deadch, 1);
+                ok_(zp.ok && !hz.all_initial_emissions_finite && hz.initial_states_dropped == 2,
+                    "production gate: a -inf emission is REPORTED as dropping initial states (" +
+                    std::to_string(hz.initial_states_dropped) + " dropped, all-finite=" +
+                    std::to_string(hz.all_initial_emissions_finite ? 1 : 0) + ")");
+                ok_(pz.ok && hz.forward_updates <= pz.forward_updates &&
+                    hz.peak_message_entries <= pz.peak_message_entries &&
+                    hz.total_message_entries <= pz.total_message_entries,
+                    "production gate: and the plan then BOUNDS the work rather than equalling it "
+                    "(" + std::to_string(hz.forward_updates) + " <= " +
+                    std::to_string(pz.forward_updates) + " updates, " +
+                    std::to_string(hz.peak_message_entries) + " <= " +
+                    std::to_string(pz.peak_message_entries) + " peak entries)");
+                ok_(hz.forward_updates < pz.forward_updates,
+                    "production gate: the bound is STRICT here, so the two contracts are really "
+                    "distinguishable and the exact one is not passing by accident");
             }
 
             // ---- WHAT THE BENCHMARK IS ALLOWED TO CLAIM ------------------------------------
@@ -1750,6 +1818,238 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         }
 
         std::printf("higher-order inference selftest: %zu failure(s)\n", fails);
+        return fails == 0 ? 0 : 1;
+    }
+
+    // =============================================================================================
+    // THE CONTRIBUTION AUDIT, on fixtures that separate the four ways it can be wrong.
+    //
+    // What a fragment's omitted tail can do is NOT its raw mass. The caller evaluates
+    //     log( (1-eta) * lambda * (M_a + M_b) + eta * P_bg )
+    // so the tail matters only RELATIVE to eta * P_bg. A real C4 run has P_bg at e^-240 and tails
+    // at e^-55, which is 186 nats per fragment -- and dismissing those tails on their raw size is
+    // exactly the error these fixtures exist to catch.
+    if (contribution_selftest) {
+        std::size_t fails = 0;
+        const auto ok_ = [&](bool c, const std::string& what) {
+            std::printf("%s\t%s\n", c ? "ok" : "FAIL", what.c_str());
+            if (!c) ++fails;
+        };
+        const auto sci = [](double x) {
+            char b[32]; std::snprintf(b, sizeof b, "%.3e", x); return std::string(b);
+        };
+        const double eta = 0.05;
+        const double lmix = std::log1p(-eta), lbgw = std::log(eta), llam = std::log(0.05);
+        const double ninf = -std::numeric_limits<double>::infinity();
+        // The width of the contribution interval for a fragment with NO in-band mass and a
+        // certified tail bound `omitted`, against a background floor `log_p_bg`.
+        const auto width = [&](double omitted, double log_p_bg) {
+            const MassInterval m{ninf, omitted};
+            const MassInterval c = fragment_contribution(m, m, false, lmix, llam, lbgw, log_p_bg);
+            return c.upper - c.lower;
+        };
+
+        // ---- 1. ZERO IN-BAND STATES, BUT THE TAIL IS CANDIDATE-SPECIFIC -------------------------
+        // states = 0 does not make a fragment neutral. Two candidates with DIFFERENT tail bounds
+        // give different contributions, so the fragment can still order them.
+        {
+            const double bg = -240.0;
+            const double wa = width(-55.0, bg), wb = width(-70.0, bg);
+            ok_(std::abs(wa - wb) > 1.0,
+                "zero in-band states still ORDER two candidates whose tails differ: widths " +
+                sci(wa) + " and " + sci(wb) + " nats apart by " + sci(std::abs(wa - wb)));
+        }
+
+        // ---- 2. TINY RAW MASS, LARGE CONTRIBUTION ----------------------------------------------
+        // The C4 case. e^-55 is negligible against 1e-6 and catastrophic against e^-240.
+        {
+            const double w_low_bg = width(-55.0, -240.0);
+            const double w_high_bg = width(-55.0, -40.0);
+            ok_(w_low_bg > 100.0 && w_high_bg < 1e-3,
+                "the SAME raw tail of e^-55 is worth " + sci(w_low_bg) +
+                " nats against a background of e^-240 and " + sci(w_high_bg) +
+                " against e^-40 -- so the raw mass alone decides nothing");
+        }
+
+        // ---- 3. INDIVIDUALLY SMALL WIDTHS WHOSE SUM FAILS --------------------------------------
+        // The reason the guarantee is on the AGGREGATE. Each of these would pass a per-fragment
+        // test at 1e-3 nats; 3,740 of them do not.
+        // The width rises monotonically with the tail bound, so a target width is reached by
+        // bisecting on it. Scanning and hoping to land in the band is how the first version of
+        // this fixture accidentally chose a width that passed BOTH tests and proved nothing.
+        const auto omitted_for_width = [&](double target, double bg) {
+            double lo = -600.0, hi = 0.0;
+            for (int it = 0; it < 200; ++it) {
+                const double mid = 0.5 * (lo + hi);
+                if (width(mid, bg) < target) lo = mid; else hi = mid;
+            }
+            return 0.5 * (lo + hi);
+        };
+        {
+            const double tol = 1e-3;
+            const std::size_t n = 3740;
+            // Individually a hundredth of the tolerance; together thirty-seven times it.
+            const double target = tol / 100.0;
+            const double one = width(omitted_for_width(target, -240.0), -240.0);
+            const double summed = one * static_cast<double>(n);
+            ok_(one < tol && summed > tol,
+                "each of " + std::to_string(n) + " fragments is individually negligible (" +
+                sci(one) + " nats < " + sci(tol) + ") yet their SUM is not (" + sci(summed) +
+                ") -- a per-fragment threshold would have passed this");
+        }
+
+        // ---- 4. A GENUINELY NEGLIGIBLE AGGREGATE PASSES ----------------------------------------
+        // The gate must be able to say yes, or it is not a test -- and it must do so with a
+        // NONZERO width, or the pass is just underflow.
+        {
+            const double tol = 1e-3;
+            const std::size_t n = 3740;
+            const double target = tol / (10.0 * static_cast<double>(n));
+            const double one = width(omitted_for_width(target, -240.0), -240.0);
+            const double summed = one * static_cast<double>(n);
+            ok_(one > 0.0 && summed <= tol,
+                "and a genuinely negligible set PASSES with nonzero widths: " +
+                std::to_string(n) + " x " + sci(one) + " = " + sci(summed) + " nats, within " +
+                sci(tol));
+        }
+
+        // ---- 5. THE BOUND IS CONSERVATIVE IN THE DIRECTION CLAIMED -----------------------------
+        // The audit charges both homologues the all-candidate aggregate. That must never
+        // UNDERstate a per-candidate interval.
+        {
+            const double bg = -240.0;
+            const MassInterval agg{ninf, -55.0};
+            const MassInterval per{ninf, -58.0};   // one candidate's share of the same tail
+            const double w_agg = fragment_contribution(agg, agg, false, lmix, llam, lbgw, bg).upper -
+                                 fragment_contribution(agg, agg, false, lmix, llam, lbgw, bg).lower;
+            const double w_per = fragment_contribution(per, per, false, lmix, llam, lbgw, bg).upper -
+                                 fragment_contribution(per, per, false, lmix, llam, lbgw, bg).lower;
+            ok_(w_agg >= w_per,
+                "the all-candidate aggregate bound never understates a per-candidate one (" +
+                sci(w_agg) + " >= " + sci(w_per) + "), so it is an UPPER bound on the width");
+        }
+
+        // ---- 6. OVERLAPPING MATES ARE A VALID FRAGMENT ----------------------------------------
+        // The insert floor used to be r1 + r2, on the reasoning that "an insert shorter than the
+        // two mates is not a state at all". That is only true if mates cannot OVERLAP. A
+        // 350 +- 50 library with 150 bp mates puts 15.9% of fragments under 300 bp, and on C4
+        // exactly that share -- 3,740 of 23,953 -- had no in-band placement at all. The true floor
+        // is max(r1, r2): an insert cannot be shorter than its longest mate.
+        {
+            std::mt19937_64 rq(20260913);
+            std::string ref(3000, 'A');
+            static const char* B = "ACGT";
+            for (char& c : ref) c = B[rq() & 3];
+            std::vector<BlockAlleles> blk;   // one block spanning the whole reference
+            CandidateFrame fr;
+            fr.seq = ref; fr.ok = true; fr.partial = false;
+            fr.offsets = {0}; fr.block_at = {0};
+            fr.mapped_lo = 0; fr.mapped_hi = ref.size();
+            std::vector<CandidateFrame> frames{fr};
+            std::vector<char> block_var{1};
+
+            // An OVERLAPPING pair: r1 = [400,550), r2 = revcomp of [500,650). The physical
+            // fragment is 250 bp, shorter than r1 + r2 = 300.
+            Fragment f;
+            f.name = "overlap";
+            f.r1 = ref.substr(400, 150);
+            f.r2 = reverse_complement(ref.substr(500, 150));
+            const long true_insert = 250;
+
+            const double lep = std::log(0.001 / 3.0), l1m = std::log1p(-0.001);
+            const auto owner_with_floor = [&](long floor_len) {
+                const InsertPrior ip = make_insert_prior(350.0, 50.0, 0.0, 4, floor_len);
+                return assign_fragment_owner(f, frames, block_var, ip, 0.05, lep, l1m, 1e-6,
+                                             nullptr);
+            };
+            const FragmentOwner sum_floor = owner_with_floor(
+                static_cast<long>(f.r1.size() + f.r2.size()));          // 300 -- excludes it
+            const FragmentOwner max_floor = owner_with_floor(
+                static_cast<long>(std::max(f.r1.size(), f.r2.size()))); // 150 -- admits it
+
+            ok_(sum_floor.origins == 0 &&
+                sum_floor.why == UnusableReason::NoInBandOrigins,
+                "an overlapping pair (insert " + std::to_string(true_insert) +
+                " bp, mates 150+150) has NO in-band origin under the r1+r2 floor -- which is the "
+                "3,740-fragment C4 signature, reproduced in one fixture");
+            ok_(max_floor.origins > 0 && max_floor.kind != OwnerKind::Unusable,
+                "and it places normally under the max(r1,r2) floor: " +
+                std::to_string(max_floor.origins) + " origin(s), kind " +
+                owner_kind_name(max_floor.kind));
+            // The mates must place INDIVIDUALLY either way -- it is the pair join, not the search
+            // depth, that rejects them. Adaptive deepening could never have repaired this.
+            ok_(sum_floor.omitted_bound > -1e300,
+                "the mates place individually under both floors (out-of-band bound " +
+                sci(sum_floor.omitted_bound) + "), so the rejection was the INSERT SUPPORT and "
+                "not the edit band -- deepening would not have found them");
+        }
+
+        // ---- 7. BOTH INSERT BOUNDS, AND WHAT RESTORING EITHER ONE COSTS ------------------------
+        // The two tails of one distribution. A 350 +- 50 library with 150 bp mates puts 15.9% of
+        // fragments below a 300 floor and about 3.2e-5 above a 550 ceiling; on C4 that was 3,746
+        // and 1 fragment respectively. Neither is an edit-band case: the C4 survivor matched both
+        // mates with ZERO mismatches at 573 bp.
+        {
+            std::mt19937_64 rq(20260914);
+            std::string ref(4000, 'A');
+            static const char* B = "ACGT";
+            for (char& c : ref) c = B[rq() & 3];
+            CandidateFrame fr;
+            fr.seq = ref; fr.ok = true; fr.partial = false;
+            fr.offsets = {0}; fr.block_at = {0};
+            fr.mapped_lo = 0; fr.mapped_hi = ref.size();
+            std::vector<CandidateFrame> frames{fr};
+            std::vector<char> block_var{1};
+            const double lep = std::log(0.001 / 3.0), l1m = std::log1p(-0.001);
+
+            // A pair whose insert is 573 bp -- 4.46 sd out, zero mismatches, correctly oriented.
+            Fragment lng;
+            lng.name = "long_insert_573";
+            lng.r1 = ref.substr(1000, 150);
+            lng.r2 = reverse_complement(ref.substr(1000 + 573 - 150, 150));
+            const auto owner_at = [&](int sigmas, long floor_len) {
+                const InsertPrior ip = make_insert_prior(350.0, 50.0, 0.0, sigmas, floor_len);
+                return assign_fragment_owner(lng, frames, block_var, ip, 0.05, lep, l1m, 1e-6,
+                                             nullptr);
+            };
+            const FragmentOwner at4 = owner_at(4, 150);   // support 150-550: rejects it
+            const FragmentOwner at6 = owner_at(6, 150);   // support 150-650: admits it
+            ok_(at4.origins == 0,
+                "restoring the FOUR-sigma ceiling (550) loses a 573 bp pair with zero mismatches "
+                "-- the C4 survivor's exact signature");
+            ok_(at6.origins > 0 && at6.kind != OwnerKind::Unusable,
+                "and the declared SIX-sigma support (650) recovers it: " +
+                std::to_string(at6.origins) + " origin(s), kind " + owner_kind_name(at6.kind));
+
+            // And the lower bound, restored, must still fail on the overlapping pair.
+            Fragment ov;
+            ov.name = "overlap_250";
+            ov.r1 = ref.substr(2000, 150);
+            ov.r2 = reverse_complement(ref.substr(2100, 150));
+            const InsertPrior ip300 = make_insert_prior(350.0, 50.0, 0.0, 6, 300);
+            const InsertPrior ip150 = make_insert_prior(350.0, 50.0, 0.0, 6, 150);
+            const FragmentOwner lo_bad =
+                assign_fragment_owner(ov, frames, block_var, ip300, 0.05, lep, l1m, 1e-6, nullptr);
+            const FragmentOwner lo_ok =
+                assign_fragment_owner(ov, frames, block_var, ip150, 0.05, lep, l1m, 1e-6, nullptr);
+            ok_(lo_bad.origins == 0 && lo_ok.origins > 0,
+                "restoring the |r1|+|r2| floor (300) loses the overlapping pair that max(|r1|,"
+                "|r2|) (150) keeps -- both bounds are gated, not just the one just changed");
+
+            // THE RESIDUAL IS MEASURED, NOT DECLARED ZERO.
+            ok_(std::isfinite(ip150.log_residual_above) &&
+                ip150.log_residual_above < std::log(1e-8),
+                "the six-sigma support reports the tail it does NOT cover rather than calling it "
+                "zero: log residual above = " + sci(ip150.log_residual_above) +
+                " (below = " + sci(ip150.log_residual_below) + ")");
+            const InsertPrior ip4 = make_insert_prior(350.0, 50.0, 0.0, 4, 150);
+            ok_(ip4.log_residual_above > ip150.log_residual_above,
+                "and a narrower support reports MORE residual (" + sci(ip4.log_residual_above) +
+                " at four sigma against " + sci(ip150.log_residual_above) + " at six), so the "
+                "number tracks the support rather than being a constant");
+        }
+
+        std::printf("contribution selftest: %zu failure(s)\n", fails);
         return fails == 0 ? 0 : 1;
     }
 
