@@ -2467,6 +2467,20 @@ HaplotypeResult genotype_haplotype_pairs(
                 b = static_cast<std::size_t>(i2);
             }
             const bool homoz = (a == b);
+            // ONE DEFINITION of a haplotype's placement mass, so the dump and the containment
+            // certificate cannot describe different quantities. These are the records the final
+            // score is built from: placements -> opts -> lse -> joint, and joint overwrites every
+            // pair score at the end. ll[] is NOT the source of truth on this path.
+            //
+            // The records ALREADY carry log_half_strand -- both the coordinate-join and the
+            // Cartesian path add it when the record is made -- so they are in the reference's
+            // units as they stand. Adding it again here is exactly the -log 2 the first version of
+            // the certificate reported as "two strand conventions".
+            const auto hap_mass = [&](std::size_t fi2, std::size_t h) {
+                double m = kNegInf;
+                for (const auto& pr : placements[fi2 * nh + h]) m = log_add(m, pr.ll + pr.log_mult);
+                return m;
+            };
             std::ofstream mf(options.dump_fragment_mass);
             if (mf) {
                 mf.precision(17);
@@ -2529,7 +2543,6 @@ HaplotypeResult genotype_haplotype_pairs(
                 std::ofstream cf(options.dump_containment);
                 if (cf) {
                     cf.precision(17);
-                    const double log_half = std::log(0.5);
                     ReferenceParams rp;
                     rp.lambda = lambda_joint;
                     rp.eta = options.outlier_mix;
@@ -2544,6 +2557,8 @@ HaplotypeResult genotype_haplotype_pairs(
                     cf << "fragment\tL_a\tT_a\tU_a\tR_a\tL_b\tT_b\tU_b\tR_b"
                           "\tC_lower\tC_ref\tC_upper\tident_delta_a\tstratum\n";
                     std::size_t n_ident = 0, n_ident_bad = 0;
+                    std::size_t n_both_inf = 0, n_prod_inf_only = 0, n_oracle_inf_only = 0,
+                                n_finite_equal = 0, n_finite_unequal = 0;
                     std::size_t n_mass_bad = 0, n_contrib_bad = 0, n_strict = 0;
                     std::size_t s_paired = 0, s_one = 0, s_absent = 0;
                     double sum_lo = 0.0, sum_ref = 0.0, sum_hi = 0.0;
@@ -2560,10 +2575,7 @@ HaplotypeResult genotype_haplotype_pairs(
                         std::size_t hs[2] = {a, b};
                         for (int k = 0; k < 2; ++k) {
                             const std::size_t h = hs[k];
-                            double lse_h = kNegInf;
-                            for (const auto& pr : placements[fi * nh + h])
-                                lse_h = log_add(lse_h, pr.ll + pr.log_mult);
-                            Lm[k] = (lse_h == kNegInf) ? kNegInf : lse_h + log_half;
+                            Lm[k] = hap_mass(fi, h);   // already in reference units
                             const TailLevel t =
                                 tail_interval_level(F.r1, F.r2, r1rc, r2rc, haps[h].seq, d1, d2, 1,
                                                     ins_prior, log_eps3, log_1meps, nullptr);
@@ -2572,16 +2584,22 @@ HaplotypeResult genotype_haplotype_pairs(
                                    : (Tm[k] == kNegInf ? Lm[k] : log_add(Lm[k], Tm[k]));
                             Rm[k] = reference_fragment_on_haplotype(F, haps[h].seq, rp, ins_prior,
                                                                     r2rc, log_eps3, log_1meps);
-                            if (k == 0) {
-                                ++n_ident;
-                                ident_delta = (Lm[0] == kNegInf || t.lower == kNegInf)
-                                                  ? 0.0 : (Lm[0] - t.lower);
-                                const bool same =
-                                    (Lm[0] == kNegInf && t.lower == kNegInf) ||
-                                    (Lm[0] != kNegInf && t.lower != kNegInf &&
-                                     std::abs(Lm[0] - t.lower) <= eps);
-                                if (!same) ++n_ident_bad;
-                            }
+                            // BOTH haplotypes, and -inf parity reported as its own category.
+                            // Printing 0 for an infinite comparison is not a small delta, it is a
+                            // different question answered with a number that looks like agreement.
+                            ++n_ident;
+                            const bool lp_inf = (Lm[k] == kNegInf), tp_inf = (t.lower == kNegInf);
+                            if (lp_inf && tp_inf) ++n_both_inf;
+                            else if (lp_inf) ++n_prod_inf_only;
+                            else if (tp_inf) ++n_oracle_inf_only;
+                            else if (std::abs(Lm[k] - t.lower) <= eps) ++n_finite_equal;
+                            else ++n_finite_unequal;
+                            if (lp_inf != tp_inf || (!lp_inf && std::abs(Lm[k] - t.lower) > eps))
+                                ++n_ident_bad;
+                            if (k == 0)
+                                ident_delta = (lp_inf || tp_inf)
+                                    ? std::numeric_limits<double>::quiet_NaN()
+                                    : (Lm[0] - t.lower);
                             const bool lo_ok = (Lm[k] == kNegInf) || (Rm[k] >= Lm[k] - eps);
                             const bool hi_ok = (Rm[k] == kNegInf) || (Rm[k] <= Um[k] + eps);
                             if (!lo_ok || !hi_ok) ++n_mass_bad;
@@ -2595,16 +2613,20 @@ HaplotypeResult genotype_haplotype_pairs(
                                                   std::log1p(-options.outlier_mix),
                                                   std::log(lambda_joint),
                                                   std::log(options.outlier_mix), floors[fi]);
-                        const MassInterval ir{Rm[0], Rm[1]};
+                        // TWO POINT INTERVALS, one per homologue. Collapsing {R_a, R_b} into a
+                        // single interval and passing it for both is harmless on a homozygote and
+                        // wrong everywhere else.
+                        const MassInterval ra{Rm[0], Rm[0]}, rb2{Rm[1], Rm[1]};
                         const MassInterval cr =
-                            fragment_contribution(ir, ir.lower == ir.upper ? ir : ir, homoz2,
+                            fragment_contribution(ra, rb2, homoz2,
                                                   std::log1p(-options.outlier_mix),
                                                   std::log(lambda_joint),
                                                   std::log(options.outlier_mix), floors[fi]);
                         const double c_ref = cr.lower;
                         if (!(c_ref >= ci.lower - eps && c_ref <= ci.upper + eps)) ++n_contrib_bad;
                         sum_lo += ci.lower; sum_ref += c_ref; sum_hi += ci.upper;
-                        const std::uint8_t both = mates_seeded[fi * nh + a];
+                        const std::uint8_t both = static_cast<std::uint8_t>(
+                            mates_seeded[fi * nh + a] | mates_seeded[fi * nh + b]);
                         const int nplace = ((both & 4u) ? 1 : 0) + ((both & 8u) ? 1 : 0);
                         const int fr = (both & 16u) ? 1 : 0;
                         const char* stratum = (nplace == 0) ? "absent"
@@ -2615,7 +2637,17 @@ HaplotypeResult genotype_haplotype_pairs(
                            << Rm[1] << '\t' << ci.lower << '\t' << c_ref << '\t' << ci.upper
                            << '\t' << ident_delta << '\t' << stratum << '\n';
                     }
+                    // MULTIPLICITY-AWARE PRUNES IN-BAND MASS, which would have to be added to
+                    // the omitted bound before containment could hold. Refused rather than
+                    // silently certified against a bound that does not cover it.
+                    cf << "# multiplicity_aware\t" << (options.multiplicity_aware ? 1 : 0) << '\n';
+                    cf << "# certificate_valid\t" << (options.multiplicity_aware ? 0 : 1) << '\n';
                     cf << "# identity_checked\t" << n_ident << '\n';
+                    cf << "# both_neg_inf\t" << n_both_inf << '\n';
+                    cf << "# production_only_neg_inf\t" << n_prod_inf_only << '\n';
+                    cf << "# oracle_only_neg_inf\t" << n_oracle_inf_only << '\n';
+                    cf << "# finite_equal\t" << n_finite_equal << '\n';
+                    cf << "# finite_unequal\t" << n_finite_unequal << '\n';
                     cf << "# identity_failures\t" << n_ident_bad << '\n';
                     cf << "# mass_containment_failures\t" << n_mass_bad << '\n';
                     cf << "# contribution_containment_failures\t" << n_contrib_bad << '\n';
