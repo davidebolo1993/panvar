@@ -7450,6 +7450,401 @@ void write_ownership_table(const std::string& path,
     if (!f) throw std::runtime_error("genotype-frag: write failed for " + path);
 }
 
+
+// ---- THE EXHAUSTIVE SCOPE ORACLE -------------------------------------------------------------
+// Deliberately independent: its own log-sum-exp, its own placement walk, its own mixture. Sharing
+// any of them with production would let one defect move both sides of every comparison together.
+namespace {
+
+double so_log_add(double a, double b) {
+    if (a == -std::numeric_limits<double>::infinity()) return b;
+    if (b == -std::numeric_limits<double>::infinity()) return a;
+    const double hi = a > b ? a : b, lo = a > b ? b : a;
+    return hi + std::log1p(std::exp(lo - hi));
+}
+
+char so_comp(char c) {
+    switch (c) {
+        case 'A': case 'a': return 'T';
+        case 'C': case 'c': return 'G';
+        case 'G': case 'g': return 'C';
+        case 'T': case 't': return 'A';
+        default: return 'N';
+    }
+}
+
+std::string so_revcomp(const std::string& s) {
+    std::string o(s.size(), 'N');
+    for (std::size_t i = 0; i < s.size(); ++i) o[s.size() - 1 - i] = so_comp(s[i]);
+    return o;
+}
+
+// Hamming at every start. No band, no seeding, no early exit: the point of an oracle is that it
+// cannot miss a placement the production search would have skipped.
+std::vector<std::size_t> so_edits_at_every_start(const std::string& read, const std::string& hap) {
+    std::vector<std::size_t> out;
+    if (read.empty() || hap.size() < read.size()) return out;
+    out.resize(hap.size() - read.size() + 1, 0);
+    for (std::size_t s = 0; s + read.size() <= hap.size(); ++s) {
+        std::size_t e = 0;
+        for (std::size_t i = 0; i < read.size(); ++i) if (hap[s + i] != read[i]) ++e;
+        out[s] = e;
+    }
+    return out;
+}
+
+}  // namespace
+
+double ScopeOracleParams::log_at(long L) const {
+    if (L < insert_lo || L > insert_hi || insert_logp.empty())
+        return -std::numeric_limits<double>::infinity();
+    return insert_logp[static_cast<std::size_t>(L - insert_lo)];
+}
+
+std::vector<std::vector<std::uint32_t>> scope_oracle_domain(const ScopeOracleLocus& locus,
+                                                            ScopeOracleDomain domain) {
+    if (domain == ScopeOracleDomain::PanelOnly) return locus.panel_tuples;
+    // THE FULL CARTESIAN PRODUCT ACROSS THE WHOLE LOCUS. Not a window around a previously inferred
+    // scope: defining the domain from the old scope is the circularity that produced the bug.
+    std::vector<std::vector<std::uint32_t>> out;
+    const std::size_t n = locus.blocks();
+    if (n == 0) return out;
+    std::vector<std::uint32_t> t(n, 0);
+    for (;;) {
+        out.push_back(t);
+        std::size_t j = n;
+        while (j > 0) {
+            --j;
+            if (++t[j] < locus.block_alleles[j].size()) break;
+            t[j] = 0;
+            if (j == 0) return out;
+        }
+        if (j == 0 && t[0] == 0) break;
+    }
+    return out;
+}
+
+std::string scope_oracle_haplotype(const ScopeOracleLocus& locus,
+                                   const std::vector<std::uint32_t>& tuple) {
+    std::string h;
+    for (std::size_t b = 0; b < locus.blocks() && b < tuple.size(); ++b) {
+        const auto& al = locus.block_alleles[b];
+        if (tuple[b] < al.size()) h += al[tuple[b]];
+    }
+    return h;
+}
+
+double scope_oracle_emission(const std::string& r1, const std::string& r2,
+                             const std::string& hap, const ScopeOracleParams& prm,
+                             std::size_t* n_origins, std::size_t* best_edits,
+                             std::vector<std::size_t>* in_band_positions) {
+    const double kNI = -std::numeric_limits<double>::infinity();
+    if (n_origins) *n_origins = 0;
+    if (best_edits) *best_edits = std::numeric_limits<std::size_t>::max();
+    if (in_band_positions) in_band_positions->clear();
+    if (r1.empty() || r2.empty() || hap.empty()) return kNI;
+
+    // Four tables: each mate, forward and reverse-complemented, at every start.
+    const std::vector<std::size_t> f1 = so_edits_at_every_start(r1, hap);
+    const std::vector<std::size_t> v1 = so_edits_at_every_start(so_revcomp(r1), hap);
+    const std::vector<std::size_t> f2 = so_edits_at_every_start(r2, hap);
+    const std::vector<std::size_t> v2 = so_edits_at_every_start(so_revcomp(r2), hap);
+
+    const auto read_ll = [&](std::size_t edits, std::size_t len) {
+        return static_cast<double>(edits) * prm.log_eps +
+               static_cast<double>(len - edits) * prm.log_1meps;
+    };
+    const double log_half_strand = std::log(0.5);
+    double total = kNI;
+    std::size_t norigins = 0, best = std::numeric_limits<std::size_t>::max();
+
+    // BOTH LIBRARY ORIENTATIONS, enumerated the same way: one mate forward, the other reverse.
+    // insert = rev_end - fwd_start + 1, the same coordinate rule production uses, so the fixture
+    // stays comparable even though none of the code is shared.
+    for (int which = 0; which < 2; ++which) {
+        const std::vector<std::size_t>& fwd = which == 0 ? f1 : f2;
+        const std::vector<std::size_t>& rev = which == 0 ? v2 : v1;
+        const std::size_t flen = which == 0 ? r1.size() : r2.size();
+        const std::size_t rlen = which == 0 ? r2.size() : r1.size();
+        for (std::size_t fs = 0; fs < fwd.size(); ++fs) {
+            for (long L = prm.insert_lo; L <= prm.insert_hi; ++L) {
+                const double lp = prm.log_at(L);
+                if (lp == kNI) continue;
+                // rev_end = fwd_start + L - 1, so the reverse mate STARTS at rev_end - rlen + 1.
+                const long rev_end = static_cast<long>(fs) + L - 1;
+                const long rs = rev_end - static_cast<long>(rlen) + 1;
+                if (rs < 0 || rs >= static_cast<long>(rev.size())) continue;
+                if (rev_end < static_cast<long>(fs)) continue;          // FR: reverse downstream
+                if (rev_end >= static_cast<long>(hap.size())) continue;
+                const std::size_t e = fwd[fs] + rev[static_cast<std::size_t>(rs)];
+                const double m = log_half_strand + read_ll(fwd[fs], flen) +
+                                 read_ll(rev[static_cast<std::size_t>(rs)], rlen) + lp;
+                total = so_log_add(total, m);
+                ++norigins;
+                if (e < best) best = e;
+                if (e <= prm.band_edits && in_band_positions) {
+                    in_band_positions->push_back(static_cast<std::size_t>(fs));
+                    in_band_positions->push_back(static_cast<std::size_t>(rev_end));
+                }
+            }
+        }
+    }
+    if (n_origins) *n_origins = norigins;
+    if (best_edits) *best_edits = best;
+    return total;
+}
+
+// How many DISTINCT physical origins attain the best edit count. One is an ordinary placement;
+// more than one is a repeat, and collapsing them loses mass in proportion to the multiplicity.
+std::size_t scope_oracle_best_multiplicity(const std::string& r1, const std::string& r2,
+                                           const std::string& hap, const ScopeOracleParams& prm,
+                                           std::size_t best_edits,
+                                           std::vector<std::pair<std::size_t, std::size_t>>* out) {
+    ScopeOracleParams tight = prm;
+    tight.band_edits = best_edits;
+    std::vector<std::size_t> pos;
+    std::size_t no = 0, be = 0;
+    scope_oracle_emission(r1, r2, hap, tight, &no, &be, &pos);
+    std::set<std::pair<std::size_t, std::size_t>> ids;
+    for (std::size_t k = 0; k + 1 < pos.size(); k += 2) ids.insert({pos[k], pos[k + 1]});
+    if (out != nullptr) out->assign(ids.begin(), ids.end());
+    return ids.size();
+}
+
+double scope_oracle_residual(const ScopeOracleFragmentResult& r,
+                             const std::vector<std::uint32_t>& scope,
+                             const ScopeOracleParams& prm) {
+    // THE SUFFICIENCY TEST FOR A CLAIMED SCOPE. If the scope really captures everything the
+    // fragment depends on, two tuples AGREEING on it must give the same diploid contribution.
+    // Whatever they differ by is what the scope threw away -- measured through the same mixture
+    // the demotion budget is declared in, so the two numbers are on one scale and comparable.
+    const double kNI = -std::numeric_limits<double>::infinity();
+    const double log_mix = std::log1p(-prm.eta), log_bgw = std::log(prm.eta);
+    const double log_lambda = std::log(prm.lambda);
+    const auto psi = [&](double ma, double mb) {
+        double sig = kNI;
+        if (ma != kNI) sig = ma;
+        if (mb != kNI) sig = (sig == kNI) ? mb : so_log_add(sig, mb);
+        if (sig != kNI) sig += log_mix + log_lambda;
+        const double bg = log_bgw + prm.log_p_bg;
+        return (sig == kNI) ? bg : so_log_add(sig, bg);
+    };
+    const auto agree = [&](const std::vector<std::uint32_t>& a,
+                           const std::vector<std::uint32_t>& b) {
+        for (std::uint32_t s : scope) if (s < a.size() && s < b.size() && a[s] != b[s]) return false;
+        return true;
+    };
+    double worst = 0.0;
+    // DIPLOID, because that is what the caller scores: hold one homologue fixed and vary the other
+    // between two tuples the scope cannot tell apart.
+    for (std::size_t i = 0; i < r.tuples.size(); ++i)
+        for (std::size_t j = 0; j < r.tuples.size(); ++j) {
+            if (!agree(r.tuples[i], r.tuples[j])) continue;
+            for (std::size_t k = 0; k < r.tuples.size(); ++k)
+                worst = std::max(worst, std::abs(psi(r.emission[i], r.emission[k]) -
+                                                 psi(r.emission[j], r.emission[k])));
+        }
+    return worst;
+}
+
+ScopeOracleFragmentResult run_scope_oracle(const ScopeOracleLocus& locus,
+                                           const std::string& name,
+                                           const std::string& r1, const std::string& r2,
+                                           const ScopeOracleParams& prm,
+                                           ScopeOracleDomain domain,
+                                           double demotion_tolerance,
+                                           std::size_t max_tuples) {
+    ScopeOracleFragmentResult R;
+    R.name = name;
+    R.tuples = scope_oracle_domain(locus, domain);
+    const std::size_t nb = locus.blocks();
+    R.structural.assign(nb, 0);
+    R.block_delta.assign(nb, 0.0);
+    R.block_witness.assign(nb, {0, 0});
+    // THE RESOURCE BUDGET, CHECKED BEFORE ANY WORK. Exceeding it refuses outright: there is no
+    // narrower domain to retreat to, because retreating to one is the defect.
+    if (R.tuples.size() > max_tuples) {
+        R.refusal = "domain of " + std::to_string(R.tuples.size()) +
+                    " tuples exceeds the budget of " + std::to_string(max_tuples);
+        return R;
+    }
+
+    // ---- EVERY TUPLE, MATERIALISED IN FULL ---------------------------------------------------
+    std::vector<std::size_t> best_edits(R.tuples.size(), 0);
+    std::set<std::uint32_t> span;
+    for (std::size_t t = 0; t < R.tuples.size(); ++t) {
+        const std::string hap = scope_oracle_haplotype(locus, R.tuples[t]);
+        std::size_t no = 0, be = 0;
+        std::vector<std::size_t> band_pos;
+        R.emission.push_back(scope_oracle_emission(r1, r2, hap, prm, &no, &be, &band_pos));
+        R.origins_enumerated += no;
+        best_edits[t] = be;
+        // IDENTITY, not statistics: (forward start, reverse end) separates two copies of a tandem
+        // repeat that agree on edits and insert exactly.
+        std::vector<std::pair<std::size_t, std::size_t>> ids;
+        for (std::size_t k = 0; k + 1 < band_pos.size(); k += 2)
+            ids.push_back({band_pos[k], band_pos[k + 1]});
+        std::sort(ids.begin(), ids.end());
+        R.in_band_origins.push_back(ids);
+        R.best_origin_multiplicity.push_back(
+            scope_oracle_best_multiplicity(r1, r2, hap, prm, be));
+        if (be <= prm.band_edits) {
+            R.any_in_band = true;
+            // Which blocks an in-band origin physically touches -- the SPAN, which is not the
+            // dependency set and is reported separately so the two can be compared.
+            std::vector<std::size_t> bounds;
+            std::size_t acc = 0;
+            for (std::size_t b = 0; b < nb; ++b) {
+                bounds.push_back(acc);
+                acc += locus.block_alleles[b][R.tuples[t][b]].size();
+            }
+            bounds.push_back(acc);
+            for (std::size_t k = 0; k + 1 < band_pos.size(); k += 2)
+                for (std::size_t b = 0; b < nb; ++b)
+                    if (band_pos[k] < bounds[b + 1] && band_pos[k + 1] >= bounds[b])
+                        span.insert(static_cast<std::uint32_t>(b));
+        }
+    }
+    R.apparent_span.assign(span.begin(), span.end());
+
+    // ---- LAYER 1: STRUCTURAL DEPENDENCY, FROM HAPLOID EMISSION CHANGES ------------------------
+    // Two tuples differing at EXACTLY ONE block. On the panel domain such a pair often does not
+    // exist -- the panel ties blocks together -- and then the domain cannot even pose the question.
+    // That is recorded as `unaskable` rather than silently read as "independent".
+    for (std::size_t b = 0; b < nb; ++b) {
+        bool askable = false, moves = false;
+        for (std::size_t i = 0; i < R.tuples.size() && !moves; ++i)
+            for (std::size_t j = i + 1; j < R.tuples.size(); ++j) {
+                std::size_t diffs = 0;
+                bool at_b = false;
+                for (std::size_t k = 0; k < nb; ++k)
+                    if (R.tuples[i][k] != R.tuples[j][k]) { ++diffs; if (k == b) at_b = true; }
+                if (diffs != 1 || !at_b) continue;
+                askable = true;
+                if (R.emission[i] != R.emission[j]) { moves = true; break; }
+            }
+        R.structural[b] = moves ? 1 : 0;
+        if (!askable) R.unaskable.push_back(static_cast<std::uint32_t>(b));
+    }
+
+    // ---- LAYER 2: CERTIFIED DEMOTION, THROUGH THE COMPLETE DIPLOID MIXTURE -------------------
+    // psi = log( (1-eta) * lambda * (M_a + M_b) + eta * P_bg ), the contribution the caller
+    // actually scores. NOT raw placement mass: a tail that is negligible against a 1e-6 floor is
+    // decisive against e^-200, and this codebase has already paid for that conflation once.
+    const double kNI = -std::numeric_limits<double>::infinity();
+    const double log_mix = std::log1p(-prm.eta), log_bgw = std::log(prm.eta);
+    const double log_lambda = std::log(prm.lambda);
+    const auto psi = [&](double ma, double mb) {
+        double sig = kNI;
+        if (ma != kNI) sig = ma;
+        if (mb != kNI) sig = (sig == kNI) ? mb : so_log_add(sig, mb);
+        if (sig != kNI) sig += log_mix + log_lambda;
+        const double bg = log_bgw + prm.log_p_bg;
+        return (sig == kNI) ? bg : so_log_add(sig, bg);
+    };
+    // The worst swing block b can cause, over EVERY diploid pair in the domain, varying b on
+    // either homologue while everything else is held fixed.
+    for (std::size_t b = 0; b < nb; ++b) {
+        double worst = 0.0;
+        std::pair<std::size_t, std::size_t> wit{0, 0};
+        for (std::size_t ia = 0; ia < R.tuples.size(); ++ia)
+            for (std::size_t ib = 0; ib < R.tuples.size(); ++ib) {
+                for (std::size_t ja = 0; ja < R.tuples.size(); ++ja) {
+                    bool only_b = true;
+                    for (std::size_t k = 0; k < nb; ++k)
+                        if (k != b && R.tuples[ia][k] != R.tuples[ja][k]) { only_b = false; break; }
+                    if (!only_b) continue;
+                    const double d = std::abs(psi(R.emission[ia], R.emission[ib]) -
+                                              psi(R.emission[ja], R.emission[ib]));
+                    if (d > worst) { worst = d; wit = {ia, ja}; }
+                }
+            }
+        R.block_delta[b] = worst;
+        R.block_witness[b] = wit;      // the two tuples that force the dependency
+    }
+
+    // ---- THE SCOPE: STRUCTURAL AND NOT DEMOTABLE ---------------------------------------------
+    // PER FRAGMENT, and therefore PROVISIONAL. Demotion is a locus-level claim; see
+    // aggregate_scope_oracle, which is what a caller must actually act on.
+    for (std::size_t b = 0; b < nb; ++b)
+        if (R.structural[b] && R.block_delta[b] > demotion_tolerance)
+            R.scope.push_back(static_cast<std::uint32_t>(b));
+    return R;
+}
+
+ScopeOracleLocusResult aggregate_scope_oracle(
+    const std::vector<ScopeOracleFragmentResult>& per_fragment, double locus_budget) {
+    ScopeOracleLocusResult out;
+    out.budget = locus_budget;
+    std::size_t nb = 0;
+    for (const ScopeOracleFragmentResult& r : per_fragment) nb = std::max(nb, r.structural.size());
+    out.block_delta_sum.assign(nb, 0.0);
+
+    // ---- THE STRUCTURAL SCOPE, RECORDED BEFORE ANY APPROXIMATION -----------------------------
+    for (const ScopeOracleFragmentResult& r : per_fragment) {
+        std::vector<std::uint32_t> sc;
+        for (std::size_t b = 0; b < r.structural.size(); ++b)
+            if (r.structural[b]) sc.push_back(static_cast<std::uint32_t>(b));
+        out.structural_scope.push_back(std::move(sc));
+    }
+    for (const ScopeOracleFragmentResult& r : per_fragment)
+        for (std::size_t b = 0; b < r.structural.size(); ++b)
+            if (r.structural[b]) out.block_delta_sum[b] += r.block_delta[b];
+
+    // ---- A REFUSED FRAGMENT INVALIDATES THE WHOLE CERTIFICATE --------------------------------
+    // Not "contributes zero and the rest proceeds". Its scope is UNKNOWN, so it may depend on
+    // blocks the allocation below just spent budget removing from everyone else. The entire
+    // previous ownership ledger stands, unchanged, and the transaction does not activate.
+    for (std::size_t i = 0; i < per_fragment.size(); ++i) {
+        if (per_fragment[i].usable()) continue;
+        out.refusal = "fragment " + per_fragment[i].name + " refused certification (" +
+                      per_fragment[i].refusal + "); the aggregate certificate is void";
+        out.effective_scope = out.structural_scope;   // nothing is demoted, nothing changes
+        out.certified = false;
+        return out;
+    }
+
+    // ---- ONE BUDGET, OVER (FRAGMENT, BLOCK) PAIRS -------------------------------------------
+    // The atoms are per-fragment-per-block, because that is the granularity at which a dependency
+    // is actually dropped. Aggregating to whole blocks first would force a fragment with a 1e-30
+    // dependence on block 1 to carry it merely because some other fragment needs block 1 badly.
+    //
+    // ALLOCATION: cheapest first, deterministic, stopping at the budget. Ties break on
+    // (fragment, block) so the result cannot depend on iteration order. This is exact rather than
+    // optimal -- any subset whose bounds sum inside the budget carries the same guarantee -- and a
+    // tighter allocator would be an optimization, not a change of contract.
+    struct Cand { double bound; std::size_t frag; std::uint32_t block; };
+    std::vector<Cand> cands;
+    for (std::size_t i = 0; i < per_fragment.size(); ++i)
+        for (std::size_t b = 0; b < per_fragment[i].structural.size(); ++b)
+            if (per_fragment[i].structural[b])
+                cands.push_back({per_fragment[i].block_delta[b], i,
+                                 static_cast<std::uint32_t>(b)});
+    std::sort(cands.begin(), cands.end(), [](const Cand& x, const Cand& y) {
+        if (x.bound != y.bound) return x.bound < y.bound;
+        if (x.frag != y.frag) return x.frag < y.frag;
+        return x.block < y.block;
+    });
+    std::vector<std::set<std::uint32_t>> removed(per_fragment.size());
+    for (const Cand& c : cands) {
+        if (out.total_demoted_bound + c.bound > locus_budget) continue;
+        out.total_demoted_bound += c.bound;
+        out.removals.push_back({c.frag, c.block, c.bound});
+        removed[c.frag].insert(c.block);
+    }
+
+    // ---- THE EFFECTIVE SCOPE: STRUCTURAL MINUS WHAT THE BUDGET PAID FOR ----------------------
+    for (std::size_t i = 0; i < per_fragment.size(); ++i) {
+        std::vector<std::uint32_t> sc;
+        for (std::uint32_t b : out.structural_scope[i])
+            if (!removed[i].count(b)) sc.push_back(b);
+        out.effective_scope.push_back(std::move(sc));
+    }
+    out.certified = out.total_demoted_bound <= locus_budget;
+    return out;
+}
+
+
 } // namespace panvar
 
 namespace panvar {

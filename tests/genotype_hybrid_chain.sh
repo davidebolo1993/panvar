@@ -653,6 +653,36 @@ fi
 # The fixture carries a COLLAPSING BLOCK: two distinct alleles with identical sequence form one
 # signature class. Swapping them is biologically heterozygous yet must be EXACTLY neutral, because
 # effective heterozygosity is counted over classes -- while the alleles stay separate HMM states.
+# GATE 29d-bis: THE EXHAUSTIVE SCOPE ORACLE, over the full local allele product.
+#
+# Scope certification places mates on PANEL haplotypes, so what it certifies holds only if the
+# truth is a panel path -- while the caller's own Li-Stephens transition switches at every block
+# and reaches recombinant tuples no panel path carries. This fixture makes the gap concrete: the
+# panel ties block 1 to block 2, and a fragment whose edits are 0+2 on one panel allele pair and
+# 2+0 on the other is EXACTLY constant on every panel path while the recombinant scores 0+0.
+#
+# The oracle enumerates the whole product, materialises each complete recombinant haplotype, and
+# walks every start, orientation and FR-valid insert with no band at all. It shares no code with
+# production scoring -- its own log-sum-exp, its own mixture -- because a defect in the shared
+# combiner would otherwise move both sides of the comparison together.
+#
+# Structural dependency and certified demotion stay SEPARATE. The structural layer is deliberately
+# maximal (the emission is finite everywhere, so nearly every block qualifies); blocks are removed
+# only by a bound on the complete diploid signal-plus-background contribution. The fixture proves
+# that split is load-bearing: a fragment that gains an off-panel origin no better than one it
+# already has is correctly demoted at 0.4 nats, while one that gains a strictly better origin is
+# not. The mutation is the defect itself -- derive scopes from panel tuples only, and they must
+# fail sufficiency when scored over the model's real domain.
+if "$BIN" genotype-frag -i /dev/null -b none -o "$OUT/so" --scope-oracle-selftest \
+     > "$OUT/scope_oracle.txt" 2>/dev/null; then
+  while IFS=$'\t' read -r v m; do
+    [ "$v" = ok ] && ok "$m" || { [ -n "${m:-}" ] && bad "$m"; }
+  done < <(grep -E '^(ok|FAIL)\t' "$OUT/scope_oracle.txt")
+else
+  bad "exhaustive scope oracle selftest reported failures"
+  sed -n 's/^FAIL\t/  /p' "$OUT/scope_oracle.txt"
+fi
+
 if "$BIN" genotype-frag -i /dev/null -b none -o "$OUT/fc" --factor-selftest \
      > "$OUT/factor.txt" 2>/dev/null; then
   while IFS=$'\t' read -r v m; do

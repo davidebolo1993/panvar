@@ -348,6 +348,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     bool normalisation_selftest = false;
     bool factor_selftest = false;
     bool contribution_selftest = false;
+    bool scope_oracle_selftest = false;
     bool hoinfer_selftest = false;
     bool completeness_selftest = false;
     bool activation_selftest = false;
@@ -411,6 +412,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         else if (a == "--normalisation-selftest") normalisation_selftest = true;
         else if (a == "--factor-selftest") factor_selftest = true;
         else if (a == "--contribution-selftest") contribution_selftest = true;
+        else if (a == "--scope-oracle-selftest") scope_oracle_selftest = true;
         else if (a == "--hoinfer-selftest") hoinfer_selftest = true;
         else if (a == "--completeness-selftest") completeness_selftest = true;
         else if (a == "--activation-selftest") activation_selftest = true;
@@ -715,7 +717,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         !hybrid_oracle && !mapping_selftest && !completeness_selftest && !activation_selftest &&
         !support_selftest && !coordinate_selftest && !budget_selftest && !grouping_selftest &&
         !interval_selftest && !normalisation_selftest && !factor_selftest &&
-        !hoinfer_selftest && !contribution_selftest) {
+        !hoinfer_selftest && !contribution_selftest && !scope_oracle_selftest) {
         throw std::runtime_error("genotype-frag requires at least one --reads");
     }
     if (!bubble_prefix_in.empty()) {
@@ -1866,6 +1868,542 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
     // so the tail matters only RELATIVE to eta * P_bg. A real C4 run has P_bg at e^-240 and tails
     // at e^-55, which is 186 nats per fragment -- and dismissing those tails on their raw size is
     // exactly the error these fixtures exist to catch.
+    if (scope_oracle_selftest) {
+        std::size_t fails = 0;
+        const auto ok_ = [&](bool c, const std::string& what) {
+            std::printf("%s\t%s\n", c ? "ok" : "FAIL", what.c_str());
+            if (!c) ++fails;
+        };
+        const auto f3 = [](double x) {
+            char b[48]; std::snprintf(b, sizeof b, "%.3f", x); return std::string(b);
+        };
+        const auto show = [](const std::vector<std::uint32_t>& v) {
+            if (v.empty()) return std::string("{}");
+            std::string s = "{";
+            for (std::size_t i = 0; i < v.size(); ++i)
+                s += (i ? "," : "") + std::to_string(v[i]);
+            return s + "}";
+        };
+
+        // ---- THE FIXTURE LOCUS ------------------------------------------------------------
+        // Six blocks of twenty-base motifs. Small enough to enumerate exhaustively, structured
+        // so that the PANEL ties block 1 to block 2 -- which is exactly the correlation that
+        // lets a panel-domain certifier conclude "neither matters" about two blocks that both do.
+        std::mt19937_64 rng(20260910ULL);
+        const char* ACGT = "ACGT";
+        const auto motif = [&](std::size_t n) {
+            std::string s(n, 'A');
+            for (std::size_t i = 0; i < n; ++i) s[i] = ACGT[rng() & 3u];
+            return s;
+        };
+        // `n` substitutions at fixed, spread positions: the edit distance between an allele and
+        // its partner is then EXACT and known, which is what makes the flatness below exact.
+        const auto sub = [&](std::string s, std::size_t n) {
+            for (std::size_t i = 0; i < n && i < s.size(); ++i) {
+                const std::size_t p = (i * 7 + 3) % s.size();
+                char c = s[p];
+                while (c == s[p]) c = ACGT[rng() & 3u];
+                s[p] = c;
+            }
+            return s;
+        };
+        const std::string A1 = motif(20), A2 = motif(20), A3 = motif(20);
+        const std::string P = motif(20), W = motif(20), G = motif(20), Y = motif(20);
+        const std::string Q = motif(20), U = motif(20), H = motif(20), N = motif(20);
+        const std::string S = motif(20), T2 = motif(20);
+        const std::string Z1 = motif(20), Z2 = motif(20);
+        const std::string P2 = sub(P, 2), W2 = sub(W, 6), G2 = sub(G, 6), Y2 = sub(Y, 6);
+        const std::string Q2 = sub(Q, 2), V  = sub(U, 6), K  = sub(H, 6), N2 = sub(N, 6);
+        const std::string S2 = sub(S, 6);
+        // Block 3 carries W with TWO substitutions, not W itself. That keeps span_outside's
+        // always-present origin in band -- so a span-based reading still reports {3,4} -- while
+        // leaving the off-panel origin at blocks 1-2 strictly better. With an exact copy here the
+        // two origins are equally good, the off-panel one merely doubles the mass, and the
+        // dependency is CORRECTLY demoted at 0.405 nats: a real dependency has to be worth
+        // something, and the fixture has to make it so rather than assume it.
+        const std::string W3 = sub(W, 2);
+
+        ScopeOracleLocus L;
+        L.block_alleles = {
+            {A1 + A2 + A3},                                 // 0 invariant flank    [  0,  60)
+            {P + W + G + Y,      P2 + W2 + G2 + Y2},        // 1 variable           [ 60, 140)
+            {Q + U + H + N,      Q2 + V  + K  + N2},        // 2 variable           [140, 220)
+            {W3 + S + Y,         W3 + S2 + Y},              // 3 variable; W3 and Y
+                                                            //   SHARED, only S varies [220, 280)
+            {V + N2 + S + T2},                              // 4 invariant; carries a
+                                                            //   second copy of V, N2
+                                                            //   and S              [280, 360)
+            {Z1 + Z2 + Z1 + Z2},                            // 5 invariant repeat   [360, 440)
+        };
+        // THE PANEL CARRIES ONLY b1 == b2. Four of the eight tuples, and the four it omits are
+        // exactly the recombinants Li-Stephens can still reach by switching between blocks.
+        for (std::uint32_t b3 = 0; b3 < 2; ++b3) {
+            L.panel_tuples.push_back({0, 0, 0, b3, 0, 0});
+            L.panel_tuples.push_back({0, 1, 1, b3, 0, 0});
+        }
+
+        ScopeOracleParams prm;
+        prm.insert_lo = 40; prm.insert_hi = 120;
+        prm.insert_logp.assign(static_cast<std::size_t>(prm.insert_hi - prm.insert_lo + 1),
+                               -std::log(static_cast<double>(prm.insert_hi - prm.insert_lo + 1)));
+        prm.log_eps = std::log(0.01); prm.log_1meps = std::log1p(-0.01);
+        prm.eta = 0.05; prm.lambda = 0.05; prm.log_p_bg = -200.0; prm.band_edits = 3;
+        // DECLARED BEFORE ANY RESULT IS READ. One number, used as both the per-fragment demotion
+        // threshold and the locus-level aggregate budget, so the fixture can show that the same
+        // budget gives different answers depending on which of the two it is applied to.
+        const double TOL = 1.0;     // nats
+
+        struct Frag { std::string name, r1, r2; };
+        const std::vector<Frag> frags = {
+            // 1. FLAT ON EVERY PANEL PATH, decisive off it. r1 is block 1's first motif, r2 the
+            //    reverse complement of block 2's ALTERNATE first motif, and the two alleles sit
+            //    2 substitutions apart on each side. On a panel path the edits are 0+2 or 2+0 --
+            //    identical -- so the panel domain sees a constant. The recombinant (b1=0, b2=1)
+            //    scores 0+0 and no panel path can reach it.
+            {"flat_on_panel", P, reverse_complement(Q2)},
+            // 2. NO IN-BAND ORIGIN ON ANY PANEL PATH, a perfect one off it. Same idea at 6
+            //    substitutions, which puts every panel placement outside the band: production
+            //    would record NoInBandOrigins and call the fragment unusable.
+            {"unusable_on_panel", G, reverse_complement(K)},
+            // 3. MULTIPLE PHYSICAL ORIGINS WITH IDENTICAL STATISTICS. Block 5 is Z1 Z2 Z1 Z2, so
+            //    this fragment places twice at 0 edits and the SAME insert. An enumeration keyed
+            //    on (edits, insert) would collapse them and lose half the mass.
+            {"tandem_repeat", Z1, reverse_complement(Z2)},
+            // 4. A DEPENDENCY OUTSIDE THE PANEL-DERIVED APPARENT SPAN. Its in-band panel origin
+            //    is block 3 to block 4 (both motifs invariant there), so a span-based reading
+            //    reports {3,4}. Off panel it gains a second origin at blocks 1-2 entirely.
+            {"span_outside", W, reverse_complement(V)},
+            // 5. THE CONTROL. Placed in the invariant flank; the domain correction must not move
+            //    it. A fixture where every fragment is reclassified proves nothing.
+            {"invariant_control", A1, reverse_complement(A2)},
+            // 6. STRUCTURAL, BUT CERTIFIABLY DEMOTED -- and the two are not the same thing. This
+            //    fragment gains a genuine off-panel origin at blocks 1-2, exactly as
+            //    span_outside does, but the origin it already has (block 3 to block 4) is JUST AS
+            //    GOOD, so the recombinant merely doubles the mass: about 0.4 nats through the
+            //    mixture, under the declared budget. The dependency is real and may still be
+            //    dropped. The invariant controls cannot test this -- they have no structural
+            //    dependence at all -- and without it "structural" and "retained" would be
+            //    indistinguishable in this fixture.
+            {"structural_but_demoted", Y, reverse_complement(N2)},
+            // 7-9. AGGREGATE DEMOTION. Three fragments whose only material dependency is block 3:
+            //    each gains a second, equally good origin when block 3 carries allele 0, worth
+            //    about 0.4 nats apiece. Individually every one of them passes a 1.0-nat test.
+            //    TOGETHER they cost about 1.2, and demoting block 3 loses all of it. Deciding
+            //    demotion per fragment is the same per-item-versus-aggregate error the omitted-
+            //    mass bound made; here it would silently drop a block three fragments depend on.
+            //    The three differ by a single substitution each, so they are distinct sequences
+            //    rather than one fragment counted three times.
+            {"aggregate_1", S,          reverse_complement(T2)},
+            {"aggregate_2", sub(S, 1),  reverse_complement(T2)},
+            {"aggregate_3", sub(S, 2),  reverse_complement(T2)},
+        };
+
+        std::printf("#\tfragment\tdomain\tin_band\tapparent_span\tscope\tunaskable\n");
+        std::vector<ScopeOracleFragmentResult> panel, full;
+        for (const Frag& f : frags) {
+            panel.push_back(run_scope_oracle(L, f.name, f.r1, f.r2, prm,
+                                             ScopeOracleDomain::PanelOnly, TOL));
+            full.push_back(run_scope_oracle(L, f.name, f.r1, f.r2, prm,
+                                            ScopeOracleDomain::FullProduct, TOL));
+            std::printf("#\t%s\tpanel\t%d\t%s\t%s\t%s\n", f.name.c_str(),
+                        panel.back().any_in_band ? 1 : 0,
+                        show(panel.back().apparent_span).c_str(),
+                        show(panel.back().scope).c_str(),
+                        show(panel.back().unaskable).c_str());
+            std::printf("#\t%s\tfull\t%d\t%s\t%s\t%s\n", f.name.c_str(),
+                        full.back().any_in_band ? 1 : 0,
+                        show(full.back().apparent_span).c_str(),
+                        show(full.back().scope).c_str(),
+                        show(full.back().unaskable).c_str());
+        }
+        const auto idx = [&](const std::string& n) {
+            for (std::size_t i = 0; i < frags.size(); ++i) if (frags[i].name == n) return i;
+            return frags.size();
+        };
+        const std::size_t iFLAT = idx("flat_on_panel"), iUNU = idx("unusable_on_panel");
+        const std::size_t iREP = idx("tandem_repeat"), iSPAN = idx("span_outside");
+        const std::size_t iCTL = idx("invariant_control");
+        const std::size_t iDEM = idx("structural_but_demoted");
+        const std::size_t iAG1 = idx("aggregate_1"), iAG2 = idx("aggregate_2");
+        const std::size_t iAG3 = idx("aggregate_3");
+
+        // ---- THE FIXTURE MUST ACTUALLY CONTAIN WHAT IT CLAIMS -----------------------------
+        ok_(L.panel_tuples.size() == 4 &&
+            scope_oracle_domain(L, ScopeOracleDomain::FullProduct).size() == 8,
+            "the panel carries 4 of the 8 tuples, so half the domain is off-panel");
+        {
+            // The repeat case, asserted on ORIGINS rather than on a summary statistic.
+            const std::string hap = scope_oracle_haplotype(L, {0, 0, 0, 0, 0, 0});
+            std::size_t no = 0, be = 0;
+            const double m = scope_oracle_emission(Z1, reverse_complement(Z2), hap, prm, &no, &be);
+            // One copy alone: the same reads against a locus holding a single Z1 Z2.
+            ScopeOracleLocus one = L; one.block_alleles[5] = {Z1 + Z2};
+            std::size_t no1 = 0, be1 = 0;
+            const double m1 = scope_oracle_emission(
+                Z1, reverse_complement(Z2), scope_oracle_haplotype(one, {0, 0, 0, 0, 0, 0}),
+                prm, &no1, &be1);
+            ok_(be == 0 && be1 == 0 && m > m1 + 0.5,
+                "two physically distinct origins with identical edits and insert carry " +
+                f3(m - m1) + " nats more than one copy, so they are not collapsed");
+        }
+        ok_(!panel[iUNU].any_in_band && full[iUNU].any_in_band,
+            "unusable_on_panel has NO in-band origin on any panel path and gains one off panel");
+        ok_(panel[iSPAN].apparent_span == std::vector<std::uint32_t>({3, 4}),
+            "span_outside looks like a block " + show(panel[iSPAN].apparent_span) +
+            " fragment from its in-band panel origins alone");
+
+        // ---- 1. THE PANEL-DOMAIN ORACLE REPRODUCES THE OLD, NARROWER CLASSIFICATION -------
+        ok_(panel[iFLAT].scope.empty(),
+            "PANEL domain: flat_on_panel is scored INVARIANT (scope {}), the old answer");
+        ok_(panel[iSPAN].scope.empty(),
+            "PANEL domain: span_outside is scored INVARIANT, missing blocks 1 and 2 entirely");
+        ok_(!panel[iUNU].any_in_band,
+            "PANEL domain: unusable_on_panel is scored UNUSABLE (NoInBandOrigins)");
+        ok_(!panel[iFLAT].unaskable.empty(),
+            "PANEL domain: blocks " + show(panel[iFLAT].unaskable) + " have no single-block "
+            "variation in the panel at all, so the domain cannot even pose the question");
+
+        // ---- 2. THE FULL-DOMAIN ORACLE RETURNS THE WIDER, CORRECT CLASSIFICATION ----------
+        const std::vector<std::uint32_t> want12{1, 2};
+        ok_(full[iFLAT].scope == want12,
+            "FULL domain: flat_on_panel depends on " + show(full[iFLAT].scope) +
+            " -- Invariant becomes Linkage");
+        ok_(full[iUNU].scope == want12,
+            "FULL domain: unusable_on_panel depends on " + show(full[iUNU].scope) +
+            " -- Unusable becomes Linkage");
+        ok_(full[iSPAN].scope == want12,
+            "FULL domain: span_outside depends on " + show(full[iSPAN].scope) +
+            ", disjoint from its apparent span " + show(panel[iSPAN].apparent_span));
+        ok_(full[iCTL].scope.empty() && panel[iCTL].scope.empty(),
+            "the invariant control is unmoved by the correction, in both domains");
+        ok_(full[iREP].scope.empty() && panel[iREP].scope.empty(),
+            "the tandem-repeat fragment is demoted in both domains: structural, but bounded");
+
+        // ---- 2b. STRUCTURAL DEPENDENCE THAT IS CERTIFIABLY DEMOTED ------------------------
+        // Both layers, on one fragment, disagreeing. The dependency is real -- a recombinant
+        // origin appears that no panel path offers -- and it is still safe to drop, because the
+        // fragment already had an equally good origin and the mixture barely moves. A design that
+        // only ever reported "depends" or "does not depend" could not express this.
+        {
+            const bool structural_12 = full[iDEM].structural.size() > 2 &&
+                                       full[iDEM].structural[1] && full[iDEM].structural[2];
+            const double d = std::max(full[iDEM].block_delta[1], full[iDEM].block_delta[2]);
+            ok_(structural_12 && d > 0.0 && d <= TOL && full[iDEM].scope.empty(),
+                "structural_but_demoted DEPENDS on blocks 1 and 2 structurally, yet the worst "
+                "mixture effect is " + f3(d) + " nats -- inside the " + f3(TOL) +
+                " budget -- so the effective scope is correctly " + show(full[iDEM].scope));
+            ok_(d > 0.05,
+                "and that dependency is not a rounding artefact: " + f3(d) +
+                " nats is a real, measurable difference that simply does not matter");
+        }
+
+        // ---- 2c. AGGREGATE DEMOTION: EACH PASSES, THE SUM DOES NOT ------------------------
+        // The per-item-versus-aggregate error, in a new place. Three fragments each lose about
+        // 0.4 nats if block 3 is dropped; a per-fragment test at 1.0 nats demotes all three and
+        // loses 1.2. Only the locus-level sum can see it.
+        {
+            const double d1 = full[iAG1].block_delta[3], d2 = full[iAG2].block_delta[3];
+            const double d3 = full[iAG3].block_delta[3];
+            const double sum = d1 + d2 + d3;
+            ok_(d1 <= TOL && d2 <= TOL && d3 <= TOL,
+                "each aggregate fragment loses at most " + f3(std::max(d1, std::max(d2, d3))) +
+                " nats on block 3, so every one of them passes the budget INDIVIDUALLY");
+            ok_(sum > TOL,
+                "but together they lose " + f3(sum) + " nats, above the same " + f3(TOL) +
+                " budget -- a per-fragment rule would drop block 3 and pay all of it");
+            const ScopeOracleLocusResult agg = aggregate_scope_oracle(full, TOL);
+            ok_(agg.certified && agg.total_demoted_bound <= TOL,
+                "the locus certificate spends " + f3(agg.total_demoted_bound) +
+                " nats of its " + f3(TOL) + " budget in total, over " +
+                std::to_string(agg.removals.size()) + " removed dependencies");
+            std::size_t kept = 0;
+            for (std::size_t i : {iAG1, iAG2, iAG3})
+                if (std::find(agg.effective_scope[i].begin(), agg.effective_scope[i].end(), 3u) !=
+                    agg.effective_scope[i].end()) ++kept;
+            ok_(kept >= 1,
+                "block 3 survives in " + std::to_string(kept) +
+                " of the three aggregate fragments: the budget cannot buy all of them");
+            ok_(agg.effective_scope[iCTL].empty(),
+                "the invariant control keeps an empty effective scope under the locus rule too");
+            // STRUCTURAL AND EFFECTIVE ARE SEPARATE RECORDS, and every gap between them is
+            // explained by a row in the ledger. A scope that shrank for no recorded reason is
+            // exactly what an audit has to be able to rule out.
+            std::size_t gap = 0;
+            for (std::size_t i = 0; i < frags.size(); ++i)
+                gap += agg.structural_scope[i].size() - agg.effective_scope[i].size();
+            ok_(gap == agg.removals.size(),
+                "every one of the " + std::to_string(gap) + " dependencies dropped between the "
+                "structural and effective scopes has a ledger row explaining it");
+            double ledger = 0.0;
+            for (const auto& rm : agg.removals) ledger += rm.bound;
+            ok_(std::abs(ledger - agg.total_demoted_bound) < 1e-12,
+                "and the ledger rows sum to the reported total, so nothing is spent off-book");
+        }
+
+        // ---- 2d. WITNESSES, ORIGIN IDENTITY AND MULTIPLICITY ------------------------------
+        // What an optimized certifier must reproduce beyond the answer: the pair of tuples that
+        // forces each retained dependency, and the origin multiset that produced the emission.
+        {
+            const auto& w = full[iFLAT].block_witness[1];
+            const bool differ_only_at_1 =
+                w.first < full[iFLAT].tuples.size() && w.second < full[iFLAT].tuples.size() &&
+                full[iFLAT].tuples[w.first][1] != full[iFLAT].tuples[w.second][1];
+            ok_(differ_only_at_1,
+                "every retained dependency carries a WITNESS pair: block 1 of flat_on_panel is "
+                "forced by tuples " + std::to_string(w.first) + " and " +
+                std::to_string(w.second));
+            // The witness must be a tuple the PANEL cannot supply, or it would not have been
+            // missed in the first place.
+            const auto on_panel = [&](const std::vector<std::uint32_t>& t) {
+                for (const auto& pt : L.panel_tuples) if (pt == t) return true;
+                return false;
+            };
+            // AT LEAST ONE, not both: the witness is a pair, and the pair is unreachable as soon
+            // as either half is off-panel. Requiring both to be off-panel would be a stronger
+            // claim than the argument needs and would fail on a perfectly good witness.
+            ok_(!on_panel(full[iFLAT].tuples[w.first]) ||
+                !on_panel(full[iFLAT].tuples[w.second]),
+                "and at least one witness tuple is off-panel, which is why the panel domain "
+                "could not find it");
+            // ORIGIN IDENTITY VERSUS ORIGIN STATISTICS. Block 5 is Z1 Z2 Z1 Z2, so the fragment
+            // places at 0 edits three ways: within the first copy, within the second, and ACROSS
+            // the two. Two of the three share an insert of 40 exactly; the third spans 80. A
+            // count keyed on (edits, insert) would see two origins where there are three, and one
+            // where there are two -- which is why identity is (start, end) and nothing else.
+            std::vector<std::pair<std::size_t, std::size_t>> best_ids;
+            const std::string rep_hap = scope_oracle_haplotype(L, {0, 0, 0, 0, 0, 0});
+            const std::size_t mult = scope_oracle_best_multiplicity(
+                Z1, reverse_complement(Z2), rep_hap, prm, 0, &best_ids);
+            ok_(mult == 3 && best_ids.size() == 3,
+                "origin MULTIPLICITY is reported, not inferred: the tandem-repeat fragment has " +
+                std::to_string(mult) + " distinct zero-edit origins");
+            std::map<std::size_t, std::size_t> by_insert;
+            for (const auto& id : best_ids) ++by_insert[id.second - id.first + 1];
+            std::size_t shared = 0;
+            for (const auto& kv : by_insert) shared = std::max(shared, kv.second);
+            ok_(shared == 2 && by_insert.size() == 2,
+                "and two of them are physically distinct while sharing IDENTICAL edits and "
+                "insert, so statistics alone cannot separate origins");
+        }
+
+        // ---- 2e. A REFUSED CERTIFICATION CHANGES NOTHING ----------------------------------
+        {
+            const ScopeOracleFragmentResult r =
+                run_scope_oracle(L, "budget", P, reverse_complement(Q2), prm,
+                                 ScopeOracleDomain::FullProduct, TOL, /*max_tuples=*/4);
+            ok_(!r.usable() && r.scope.empty() && r.structural.empty() == false,
+                "a domain over the resource budget REFUSES (" + r.refusal +
+                ") instead of retreating to a narrower one");
+            std::vector<ScopeOracleFragmentResult> mixed = full;
+            mixed.push_back(r);
+            const ScopeOracleLocusResult agg = aggregate_scope_oracle(mixed, TOL);
+            // NOT "contributes zero and the rest proceeds". A refused fragment's scope is unknown,
+            // so it may depend on blocks the allocator would otherwise have spent budget removing
+            // from everyone else. The whole certificate is void and EVERY fragment keeps the
+            // ownership it already had.
+            ok_(!agg.certified && !agg.refusal.empty() && agg.removals.empty() &&
+                agg.total_demoted_bound == 0.0,
+                "one refused fragment VOIDS the aggregate certificate: " + agg.refusal);
+            bool all_preserved = true;
+            for (std::size_t i = 0; i < mixed.size(); ++i)
+                if (agg.effective_scope[i] != agg.structural_scope[i]) all_preserved = false;
+            ok_(all_preserved,
+                "and the entire previous ownership ledger is preserved -- no fragment is demoted "
+                "on the strength of a certificate that does not hold");
+        }
+
+        // ---- 2f. ONE BUDGET ACROSS BLOCKS, NOT ONE BUDGET PER BLOCK -----------------------
+        // A second locus, built for this alone. Two variable blocks, two fragments depending on
+        // each, every dependency worth about 0.4 nats. Per block the total is ~0.81 -- inside a
+        // 1.0-nat budget. Across both blocks it is ~1.62, and demoting everything would spend
+        // 62% more than the budget holds. A rule that applies the whole budget to each block
+        // independently overspends it by a factor of however many blocks there are.
+        //
+        // Each fragment here has an always-available origin in the invariant tail and a second,
+        // EQUALLY GOOD origin that exists only when its block carries allele 0 -- so the
+        // dependency is real, small, and identical in shape across all four.
+        {
+            const std::string E1 = motif(20), E2 = motif(20), E3 = motif(20);
+            const std::string F1m = motif(20), Fx = motif(20), Fy = motif(20);
+            const std::string G1m = motif(20), Gx = motif(20), Gy = motif(20);
+            const std::string Hx = motif(20);
+            const std::string F1b = sub(F1m, 6), G1b = sub(G1m, 6);
+            ScopeOracleLocus L2;
+            L2.block_alleles = {
+                {E1 + E2 + E3},                               // 0 invariant   [  0,  60)
+                {F1m + Fx + Fy,  F1b + Fx + Fy},              // 1 variable    [ 60, 120)
+                {G1m + Gx + Gy,  G1b + Gx + Gy},              // 2 variable    [120, 180)
+                {F1m + G1m + Hx},                             // 3 invariant tail carrying a
+                                                              //   second copy of each motif
+                                                              //               [180, 240)
+            };
+            // Every tuple is panel-carried here: this case is about the BUDGET, not the domain,
+            // and mixing the two would leave it unclear which mechanism produced the result.
+            for (std::uint32_t a = 0; a < 2; ++a)
+                for (std::uint32_t b = 0; b < 2; ++b)
+                    L2.panel_tuples.push_back({0, a, b, 0});
+            ScopeOracleParams p2 = prm;
+            p2.insert_lo = 40; p2.insert_hi = 200;
+            p2.insert_logp.assign(static_cast<std::size_t>(p2.insert_hi - p2.insert_lo + 1),
+                                  -std::log(static_cast<double>(p2.insert_hi - p2.insert_lo + 1)));
+            const std::vector<std::pair<std::string, std::pair<std::string, std::string>>> f2 = {
+                {"b1_dep_a", {F1m,         reverse_complement(Hx)}},
+                {"b1_dep_b", {sub(F1m, 1), reverse_complement(Hx)}},
+                {"b2_dep_a", {G1m,         reverse_complement(Hx)}},
+                {"b2_dep_b", {sub(G1m, 1), reverse_complement(Hx)}},
+            };
+            std::vector<ScopeOracleFragmentResult> R2;
+            for (const auto& f : f2)
+                R2.push_back(run_scope_oracle(L2, f.first, f.second.first, f.second.second, p2,
+                                              ScopeOracleDomain::FullProduct, TOL));
+            const ScopeOracleLocusResult a2 = aggregate_scope_oracle(R2, TOL);
+            const double c1 = a2.block_delta_sum[1], c2 = a2.block_delta_sum[2];
+            ok_(c1 > 0.1 && c2 > 0.1,
+                "cross-block fixture: block 1 costs " + f3(c1) + " nats to demote and block 2 " +
+                f3(c2) + ", both real dependencies");
+            ok_(c1 <= TOL && c2 <= TOL,
+                "each block is individually affordable against the " + f3(TOL) + " budget");
+            ok_(c1 + c2 > TOL,
+                "but demoting BOTH would cost " + f3(c1 + c2) +
+                " nats -- more than the budget holds");
+            ok_(a2.certified && a2.total_demoted_bound <= TOL,
+                "the certificate spends " + f3(a2.total_demoted_bound) +
+                " nats in total and stays inside the single locus budget");
+            // The load-bearing assertion: something had to be retained. A per-block rule would
+            // have removed all four dependencies and reported success.
+            std::size_t retained = 0;
+            for (const auto& sc : a2.effective_scope) retained += sc.size();
+            ok_(retained > 0,
+                "so " + std::to_string(retained) + " dependencies are RETAINED: the budget is "
+                "spent once across both blocks, not once per block");
+            ok_(a2.removals.size() + retained ==
+                    a2.structural_scope[0].size() + a2.structural_scope[1].size() +
+                    a2.structural_scope[2].size() + a2.structural_scope[3].size(),
+                "and every structural dependency is either retained or has a ledger row");
+            // MUTATION: the per-block rule, run explicitly, to show it overspends.
+            const double per_block_spend = (c1 <= TOL ? c1 : 0.0) + (c2 <= TOL ? c2 : 0.0);
+            ok_(per_block_spend > TOL,
+                "MUTATION: applying the full budget to each block independently spends " +
+                f3(per_block_spend) + " nats against a " + f3(TOL) + " budget");
+        }
+
+        // ---- 3. FULL SCORING AND CORRECTED SCOPED SCORING AGREE ---------------------------
+        {
+            double worst = 0.0;
+            std::string who;
+            for (std::size_t i = 0; i < frags.size(); ++i) {
+                const double r = scope_oracle_residual(full[i], full[i].scope, prm);
+                if (r > worst) { worst = r; who = frags[i].name; }
+            }
+            ok_(worst <= TOL,
+                "scoring restricted to the CORRECTED scope loses at most " + f3(worst) +
+                " nats (worst: " + (who.empty() ? "none" : who) + "), inside the declared " +
+                f3(TOL));
+        }
+
+        // ---- 4. THE OLD SCOPED SCORING DIFFERS MATERIALLY ---------------------------------
+        {
+            double worst = 0.0;
+            std::string who;
+            for (std::size_t i = 0; i < frags.size(); ++i) {
+                // The old scope, evaluated where it has to hold: over the full domain.
+                const double r = scope_oracle_residual(full[i], panel[i].scope, prm);
+                if (r > worst) { worst = r; who = frags[i].name; }
+            }
+            ok_(worst > 10.0 * TOL,
+                "the PANEL-derived scope loses " + f3(worst) + " nats on " + who +
+                " when scored over the model's own domain -- " + f3(worst / TOL) +
+                "x the tolerance, not a rounding difference");
+        }
+
+        // ---- 5. THE MUTATION: ENUMERATE PANEL HAPLOTYPES ONLY, AND THE GATE MUST FAIL -----
+        // This is the defect itself, reintroduced deliberately. A certifier that derives scopes
+        // from panel tuples produces scopes that do not survive check 3 over the real domain. If
+        // this ever passes, the oracle has stopped being able to detect the bug it exists for.
+        {
+            std::size_t survived = 0;
+            for (std::size_t i = 0; i < frags.size(); ++i)
+                if (scope_oracle_residual(full[i], panel[i].scope, prm) <= TOL) ++survived;
+            ok_(survived < frags.size(),
+                "MUTATION: panel-only enumeration yields scopes that fail sufficiency for " +
+                std::to_string(frags.size() - survived) + " of " +
+                std::to_string(frags.size()) + " fragments");
+        }
+        // ---- 5b. MUTATION: TREAT `unaskable` AS INDEPENDENT -------------------------------
+        // The precise inference that produced the original bug. The panel cannot form a pair of
+        // haplotypes differing only at block 2, and silence was read as "block 2 does not
+        // matter". A certifier making that inference must fail sufficiency.
+        {
+            std::size_t bad = 0;
+            for (std::size_t i = 0; i < frags.size(); ++i) {
+                std::vector<std::uint32_t> sc;
+                for (std::size_t b = 0; b < full[i].structural.size(); ++b) {
+                    if (!full[i].structural[b]) continue;
+                    const bool unaskable_on_panel =
+                        std::find(panel[i].unaskable.begin(), panel[i].unaskable.end(),
+                                  static_cast<std::uint32_t>(b)) != panel[i].unaskable.end();
+                    if (!unaskable_on_panel && full[i].block_delta[b] > TOL)
+                        sc.push_back(static_cast<std::uint32_t>(b));
+                }
+                if (scope_oracle_residual(full[i], sc, prm) > TOL) ++bad;
+            }
+            ok_(bad > 0,
+                "MUTATION: reading `unaskable` as `independent` breaks sufficiency for " +
+                std::to_string(bad) + " fragment(s) -- absence of a comparison is not evidence");
+        }
+
+        // ---- 5c. MUTATION: STOP SEARCHING AT THE PANEL-DERIVED SPAN ------------------------
+        // A certifier that only looks inside the blocks an in-band panel origin touches. For
+        // span_outside that is {3,4}, and its real dependency is {1,2}: disjoint, so the search
+        // never reaches the answer however carefully it looks within the span.
+        {
+            std::size_t bad = 0;
+            for (std::size_t i = 0; i < frags.size(); ++i) {
+                std::vector<std::uint32_t> sc;
+                for (std::uint32_t b : full[i].scope)
+                    if (std::find(panel[i].apparent_span.begin(), panel[i].apparent_span.end(), b)
+                        != panel[i].apparent_span.end())
+                        sc.push_back(b);
+                if (scope_oracle_residual(full[i], sc, prm) > TOL) ++bad;
+            }
+            ok_(bad > 0,
+                "MUTATION: restricting the search to the panel-derived span breaks sufficiency "
+                "for " + std::to_string(bad) + " fragment(s)");
+        }
+
+        // ---- 5d. MUTATION: APPLY THE TOLERANCE PER FRAGMENT, NOT GLOBALLY ------------------
+        // Every fragment passes; the locus does not. Stated as a mutation as well as a positive
+        // result above, because this is the form the mistake actually takes in code -- a loop
+        // over fragments each checked against the budget.
+        {
+            const ScopeOracleLocusResult agg = aggregate_scope_oracle(full, TOL);
+            double per_fragment_spend = 0.0;
+            bool all_pass_individually = true;
+            for (std::size_t i : {iAG1, iAG2, iAG3}) {
+                if (full[i].block_delta[3] > TOL) all_pass_individually = false;
+                per_fragment_spend += full[i].block_delta[3];
+            }
+            ok_(all_pass_individually && per_fragment_spend > TOL &&
+                agg.total_demoted_bound <= TOL,
+                "MUTATION: a per-fragment rule removes all three block-3 dependencies and spends " +
+                f3(per_fragment_spend) + " nats against a " + f3(TOL) +
+                " budget; the global ledger spends " + f3(agg.total_demoted_bound) +
+                " and stays inside it");
+        }
+
+        // And the converse, so the check above cannot pass by being vacuously strict.
+        {
+            bool all_ok = true;
+            for (std::size_t i = 0; i < frags.size(); ++i)
+                if (scope_oracle_residual(full[i], full[i].scope, prm) > TOL) all_ok = false;
+            ok_(all_ok, "the same sufficiency test PASSES for every full-domain scope, so it is "
+                        "detecting the domain and not merely rejecting everything");
+        }
+
+        std::printf("scope oracle selftest: %zu failure(s)\n", fails);
+        return fails == 0 ? 0 : 1;
+    }
+
     if (contribution_selftest) {
         std::size_t fails = 0;
         const auto ok_ = [&](bool c, const std::string& what) {

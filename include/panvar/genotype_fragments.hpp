@@ -3304,4 +3304,162 @@ void write_fragment_results(
     const std::vector<BlockFragmentResult>& results,
     bool have_truth);
 
+
+// ---- THE EXHAUSTIVE SCOPE ORACLE -------------------------------------------------------------
+//
+// A reference implementation of "which blocks does this fragment depend on", built to be OBVIOUSLY
+// right rather than fast, so an optimized certifier can be checked against it. It shares no code
+// with production scoring: its own placement enumeration, its own log-sum-exp, its own mixture.
+// A defect in the shared combiner would otherwise move both sides of the comparison together.
+//
+// THE DOMAIN IS THE WHOLE POINT. `assign_fragment_owner_panel_domain` places mates on panel
+// haplotypes, so it answers a question conditional on the truth being a panel path. This oracle
+// enumerates the FULL CARTESIAN PRODUCT of per-block alleles across the whole locus and
+// materialises the complete recombinant haplotype for each tuple -- not a local window around a
+// previously inferred scope, which would define the domain using the very answer being computed.
+//
+// TWO LAYERS, KEPT APART. Conflating them is what produced a "block 2 is irrelevant" conclusion
+// that was true on 105 panel tuples and false on the other 15,895:
+//
+//   STRUCTURAL DEPENDENCY  some pair of domain tuples differing ONLY at block b gives a different
+//                          haploid emission. Deliberately maximal: the emission is finite at every
+//                          position, so nearly every block qualifies. It is a safety net, not an
+//                          answer.
+//   CERTIFIED DEMOTION     the block's worst effect on the COMPLETE diploid signal-plus-background
+//                          contribution, aggregated over fragments, is below a declared tolerance.
+//                          This is where blocks are actually removed, and it is computed through
+//                          the mixture -- never on raw placement mass.
+//
+// The reported scope is: structurally dependent AND not certifiably demotable.
+struct ScopeOracleLocus {
+    // [block][allele] -> sequence. Alleles of one block need not share a length.
+    std::vector<std::vector<std::string>> block_alleles;
+    // The allele tuples panel haplotypes actually carry. A STRICT SUBSET of the product in any
+    // interesting case; that gap is the defect this oracle exists to measure.
+    std::vector<std::vector<std::uint32_t>> panel_tuples;
+    std::size_t blocks() const { return block_alleles.size(); }
+};
+
+struct ScopeOracleParams {
+    long insert_lo = 0, insert_hi = 0;
+    std::vector<double> insert_logp;    // indexed by L - insert_lo, normalised
+    double log_eps = 0.0, log_1meps = 0.0;
+    double eta = 0.05;                  // background weight
+    double lambda = 0.05;
+    double log_p_bg = -200.0;
+    // What "in band" means when EMULATING the production search. The oracle's own enumeration is
+    // unbanded; this only decides which origins production would have seen.
+    std::size_t band_edits = 3;
+    double log_at(long L) const;
+};
+
+enum class ScopeOracleDomain { PanelOnly, FullProduct };
+
+struct ScopeOracleFragmentResult {
+    std::string name;
+    std::vector<std::vector<std::uint32_t>> tuples;   // the domain actually enumerated
+    std::vector<double> emission;                     // haploid log M per tuple, exhaustive
+    std::vector<char> structural;                     // per block
+    std::vector<double> block_delta;                  // worst diploid mixture swing, nats
+    std::vector<std::uint32_t> scope;                 // structural AND not demotable
+    // Blocks touched by IN-BAND origins over this domain: what a span-based reading would report.
+    std::vector<std::uint32_t> apparent_span;
+    bool any_in_band = false;                         // false => production's NoInBandOrigins
+    // Blocks with no varying pair in this domain at all. On the panel domain this is the
+    // circularity made visible: the domain cannot even ask about them.
+    std::vector<std::uint32_t> unaskable;
+    std::size_t origins_enumerated = 0;
+    // A WITNESS FOR EVERY RETAINED DEPENDENCY: the two domain tuples realising `block_delta[b]`.
+    // A certifier that agrees on the scope but cannot produce the pair that forces it has not
+    // reproduced the reasoning, only the conclusion.
+    std::vector<std::pair<std::size_t, std::size_t>> block_witness;
+    // ORIGIN IDENTITY AND MULTIPLICITY, per tuple. Identity is (forward start, reverse end): the
+    // statistics alone cannot separate two copies of a tandem repeat, and an enumeration that
+    // dedupes on (edits, insert) silently halves the mass.
+    std::vector<std::vector<std::pair<std::size_t, std::size_t>>> in_band_origins;
+    std::vector<std::size_t> best_origin_multiplicity;   // origins attaining the best edit count
+    // RESOURCE REFUSAL. Non-empty means the domain exceeded the declared cap and NOTHING here is
+    // to be acted on: ownership stays exactly as it was.
+    std::string refusal;
+    bool usable() const { return refusal.empty(); }
+};
+
+// ---- THE LOCUS CERTIFICATE: ONE BUDGET, SPENT ONCE -------------------------------------------
+//
+// Demotion is an approximation, and approximations are paid for out of a SINGLE call-level budget
+// spanning every removed (fragment, block) dependency. Two ways of getting this wrong have already
+// been made in this codebase, in different places:
+//
+//   PER ITEM      three fragments at 0.4 nats each pass a 1.0-nat test individually and lose 1.2
+//                 together. This is the omitted-mass error, in a new location.
+//   PER BLOCK     block 1 costs 0.6 and block 2 costs 0.6; each fits a 1.0-nat budget on its own,
+//                 and demoting both spends 1.2. Applying the whole budget independently to each
+//                 block overspends it by however many blocks there are.
+//
+// WHY THE BOUNDS MAY BE SUMMED. `block_delta[b]` is a SUPREMUM over the whole domain with every
+// other allele variable free, not a difference measured at one configuration. So changing several
+// coordinates can be decomposed into one-coordinate steps, each bounded by its own block's
+// supremum, and the total change is bounded by the sum -- the usual telescoping argument. A bound
+// measured with the other coordinates held fixed would not support this and the sum would be
+// meaningless.
+struct ScopeOracleLocusResult {
+    std::vector<double> block_delta_sum;                     // per block, over fragments: reporting
+    // STORED SEPARATELY, DELIBERATELY. The structural scope is what the model says the fragment
+    // depends on; the effective scope is what survives after approximation. Collapsing them loses
+    // the record of what was given up and makes the ledger below unauditable.
+    std::vector<std::vector<std::uint32_t>> structural_scope;
+    std::vector<std::vector<std::uint32_t>> effective_scope;
+    // EVERY REMOVED DEPENDENCY, with the bound that justified removing it. One row per
+    // (fragment, block): the explanation, not just the outcome.
+    struct Removal { std::size_t fragment; std::uint32_t block; double bound; };
+    std::vector<Removal> removals;
+    double total_demoted_bound = 0.0;   // the sum of every row above -- THE global ledger
+    double budget = 0.0;
+    // The transaction may activate ONLY if this is true: no fragment refused, and the summed
+    // bound is inside the budget.
+    bool certified = false;
+    // Non-empty invalidates the WHOLE certificate. A refused fragment does not contribute a
+    // numerical zero and let the rest proceed -- its scope is unknown, so every other fragment's
+    // ownership must stand unchanged too.
+    std::string refusal;
+};
+ScopeOracleLocusResult aggregate_scope_oracle(
+    const std::vector<ScopeOracleFragmentResult>& per_fragment, double locus_budget);
+
+// Every allele tuple in the domain, ascending in mixed-radix order.
+std::vector<std::vector<std::uint32_t>> scope_oracle_domain(const ScopeOracleLocus& locus,
+                                                            ScopeOracleDomain domain);
+// The COMPLETE haplotype for a tuple -- every block, concatenated, recombinant or not.
+std::string scope_oracle_haplotype(const ScopeOracleLocus& locus,
+                                   const std::vector<std::uint32_t>& tuple);
+// Exhaustive haploid emission: every start, both orientations, every FR-valid insert in support.
+double scope_oracle_emission(const std::string& r1, const std::string& r2,
+                             const std::string& hap, const ScopeOracleParams& prm,
+                             std::size_t* n_origins = nullptr,
+                             std::size_t* best_edits = nullptr,
+                             std::vector<std::size_t>* in_band_positions = nullptr);
+// How many DISTINCT physical origins attain the best edit count on this haplotype.
+std::size_t scope_oracle_best_multiplicity(const std::string& r1, const std::string& r2,
+                                           const std::string& hap, const ScopeOracleParams& prm,
+                                           std::size_t best_edits,
+                                           std::vector<std::pair<std::size_t, std::size_t>>*
+                                               ids = nullptr);
+// One fragment, one domain, both layers.
+// `max_tuples` is a RESOURCE BUDGET, not a tuning knob: a domain larger than this returns a
+// result carrying a refusal, and a refused certification must leave ownership unchanged rather
+// than fall back to a narrower domain -- falling back is how the panel domain became the default
+// in the first place.
+ScopeOracleFragmentResult run_scope_oracle(const ScopeOracleLocus& locus,
+                                           const std::string& name,
+                                           const std::string& r1, const std::string& r2,
+                                           const ScopeOracleParams& prm,
+                                           ScopeOracleDomain domain,
+                                           double demotion_tolerance,
+                                           std::size_t max_tuples = 100000);
+// Worst diploid mixture difference between tuples that AGREE on `scope`. This is the check that a
+// claimed scope is sufficient: if it exceeds the tolerance, the scope is too small.
+double scope_oracle_residual(const ScopeOracleFragmentResult& r,
+                             const std::vector<std::uint32_t>& scope,
+                             const ScopeOracleParams& prm);
+
 } // namespace panvar
