@@ -6654,6 +6654,52 @@ double estimate_fragment_lambda(std::size_t n_fragments,
     return static_cast<double>(n_fragments) / (2.0 * static_cast<double>(med));
 }
 
+std::vector<HigherFactorScope> plan_higher_factors(
+    const std::vector<FragmentOwner>& owners,
+    const std::vector<EdgeStatusEntry>& edge_status,
+    std::size_t n_blocks) {
+    // 1 + 2: every Wide fragment's minimal certified scope, closed over [min, max].
+    std::set<std::pair<std::uint32_t, std::uint32_t>> spans;
+    for (const FragmentOwner& o : owners) {
+        if (o.kind != OwnerKind::Wide || o.var_scope.empty()) continue;
+        std::uint32_t lo = o.var_scope.front(), hi = o.var_scope.front();
+        for (std::uint32_t b : o.var_scope) { lo = std::min(lo, b); hi = std::max(hi, b); }
+        if (hi < n_blocks) spans.insert({lo, hi});
+    }
+    // 3: drop any span contained in another.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> keep;
+    for (const auto& a : spans) {
+        bool contained = false;
+        for (const auto& b : spans) {
+            if (a == b) continue;
+            if (b.first <= a.first && a.second <= b.second) { contained = true; break; }
+        }
+        if (!contained) keep.push_back(a);
+    }
+    std::sort(keep.begin(), keep.end());
+    std::vector<HigherFactorScope> out;
+    for (const auto& sp : keep) {
+        HigherFactorScope f;
+        for (std::uint32_t b = sp.first; b <= sp.second; ++b) f.blocks.push_back(b);
+        out.push_back(std::move(f));
+    }
+    // 4: a REFUSED edge's owners have no consumer, so they transfer to the smallest span
+    // containing both endpoints. A usable edge transfers nothing and is never superseded.
+    for (const EdgeStatusEntry& e : edge_status) {
+        if (e.status == LinkageStatus::Ok) continue;
+        long best = -1; std::size_t best_w = 0;
+        for (std::size_t i = 0; i < out.size(); ++i) {
+            const auto& bl = out[i].blocks;
+            if (bl.empty() || e.block_a < bl.front() || e.block_b > bl.back()) continue;
+            const std::size_t w = bl.size();
+            if (best < 0 || w < best_w) { best = static_cast<long>(i); best_w = w; }
+        }
+        if (best >= 0) out[static_cast<std::size_t>(best)].superseded.push_back(
+            {e.block_a, e.block_b});
+    }
+    return out;
+}
+
 HybridCompletenessReport assess_hybrid_completeness(
     const std::vector<FragmentOwner>& owners,
     const std::vector<EdgeStatusEntry>& edges,

@@ -2680,6 +2680,36 @@ struct HigherFactorScope {
     }
 };
 
+// THE CANONICAL FACTORISATION RULE, applied per sample.
+//
+// A hand-written factor list is fitted to whichever reads produced it. C4's {2,3,4,5} and {4,5,6}
+// came from one read set and left 48 of 1,767 Wide fragments across a 64-donor cohort with no
+// consumer -- and the sixth distinct scope only appeared at the 38th donor, so no amount of
+// surveying makes a fixed list safe. This derives the factors from THIS sample's ledger instead:
+//
+//   1. EVERY WIDE FRAGMENT'S MINIMAL CERTIFIED SCOPE is a candidate span. Minimal, because the
+//      scope is already the certified answer to "what does this fragment depend on"; enlarging it
+//      speculatively is what a factor list fitted to one cohort does.
+//   2. A span must be CONTIGUOUS, so each candidate is closed over [min, max]. That is the only
+//      enlargement, and it is forced by representability, not chosen.
+//   3. A candidate CONTAINED in another is dropped -- the container already consumes its
+//      fragments. Applied to C4 this turns six observed scopes into four factors, and the four it
+//      produces are exactly the cheapest covering set, at 668,500 allele-product cells against
+//      15,604,460 for the single-wide-factor alternative. That is a consequence of the rule, not a
+//      cost comparison standing in for one.
+//   4. SUPERSESSION FOLLOWS EVIDENCE, NEVER SPAN. A factor supersedes a pairwise edge only when
+//      that edge is REFUSED -- so its owners have no consumer at all -- and both its blocks lie in
+//      the span. Spanning the same blocks as a usable edge transfers nothing and supersedes
+//      nothing: {0,1,2} consuming seven Wide fragments must not silently swallow edges 0-1 and 1-2
+//      whose own pairwise factors are perfectly good.
+//
+// Deterministic: candidates are canonically ordered, so the same ledger always yields the same
+// plan, and a refused edge inside several spans goes to the SMALLEST containing span.
+std::vector<HigherFactorScope> plan_higher_factors(
+    const std::vector<FragmentOwner>& owners,
+    const std::vector<EdgeStatusEntry>& edge_status,
+    std::size_t n_blocks);
+
 // An EMPTY scope list reproduces the pairwise-only assessment exactly; it is the legacy case, not
 // a special case.
 HybridCompletenessReport assess_hybrid_completeness(

@@ -2024,6 +2024,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
             // Rendered where `owners` is in scope; printed with the status file later.
             std::vector<std::string> unusable_lines;
             std::size_t neutral_pairwise_reported = 0, superseded_reported = 0;
+            std::vector<HigherFactorScope> higher_scopes;      // the derived plan, for the report
+            std::vector<std::size_t> plan_wide_consumed;       // Wide fragments each factor takes
             long min_len_recorded = 0, ip_lo_recorded = 0, ip_hi_recorded = 0;
             double ip_residual_lo = 0.0, ip_residual_hi = 0.0;
             std::size_t hyb_fragments_loaded = 0, hyb_edges_considered = 0;
@@ -4085,8 +4087,36 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     // THE FACTOR SCOPES, stated before the transaction so completeness is
                     // assessed against the model that will actually run. Without --hybrid-higher
                     // this is empty and the assessment is the pairwise one, unchanged.
-                    std::vector<HigherFactorScope> higher_scopes;
-                    if (hybrid_higher)
+                    // THE PLANNER, when no factor list was supplied. A hand-written list is fitted
+                    // to the reads that produced it; this derives the factors from THIS sample's
+                    // own ledger, so a donor whose fragments span blocks nobody anticipated still
+                    // gets a factor that consumes them.
+                    if (hybrid_higher && hybrid_factor_runs.empty()) {
+                        higher_scopes = plan_higher_factors(owners, edge_status, blocks.size());
+                        std::string desc;
+                        for (const HigherFactorScope& f : higher_scopes) {
+                            desc += " {";
+                            for (std::size_t q = 0; q < f.blocks.size(); ++q)
+                                desc += (q ? "," : "") + std::to_string(f.blocks[q]);
+                            desc += "}";
+                            if (!f.superseded.empty()) {
+                                desc += "<-";
+                                for (std::size_t q = 0; q < f.superseded.size(); ++q)
+                                    desc += (q ? "," : "") +
+                                            std::to_string(f.superseded[q].first) + "-" +
+                                            std::to_string(f.superseded[q].second);
+                            }
+                        }
+                        log.info("factor plan (derived from this sample's ledger):" +
+                                 (desc.empty() ? std::string(" none") : desc));
+                    }
+                    // The ledger, counted where `owners` is live.
+                    plan_wide_consumed.assign(higher_scopes.size(), 0);
+                    for (std::size_t i = 0; i < higher_scopes.size(); ++i)
+                        for (const FragmentOwner& o2 : owners)
+                            if (o2.kind == OwnerKind::Wide &&
+                                higher_scopes[i].covers(o2.var_scope)) ++plan_wide_consumed[i];
+                    if (hybrid_higher && !hybrid_factor_runs.empty())
                         for (std::size_t f = 0; f < built_blocks.size(); ++f) {
                             HigherFactorScope hsc;
                             hsc.blocks = built_blocks[f];
@@ -4338,6 +4368,26 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     // Every claim a C4 acceptance would rest on, emitted as a number rather than
                     // left to be inferred from the log.
                     hs << "higher_order_requested\t" << (hybrid_higher ? 1 : 0) << '\n';
+                    // THE PLAN AND ITS EVIDENCE LEDGER. Which factors the rule derived, what each
+                    // one consumes, and what it supersedes -- so "supersession follows evidence"
+                    // is a checkable statement rather than a described intention.
+                    hs << "factor_plan_source\t"
+                       << (hybrid_factor_runs.empty() ? "planner" : "explicit --hybrid-factor-run")
+                       << '\n';
+                    hs << "factor_plan_size\t" << higher_scopes.size() << '\n';
+                    for (const HigherFactorScope& f : higher_scopes) {
+                        hs << "factor_plan\t";
+                        for (std::size_t q = 0; q < f.blocks.size(); ++q)
+                            hs << (q ? "," : "") << f.blocks[q];
+                        hs << '\t';
+                        hs << (&f - higher_scopes.data() < (long)plan_wide_consumed.size()
+                                   ? plan_wide_consumed[&f - higher_scopes.data()] : 0) << '\t';
+                        if (f.superseded.empty()) hs << '-';
+                        for (std::size_t q = 0; q < f.superseded.size(); ++q)
+                            hs << (q ? "," : "") << f.superseded[q].first << '-'
+                               << f.superseded[q].second;
+                        hs << '\n';
+                    }
                     hs << "higher_order_active\t" << (higher_active ? 1 : 0) << '\n';
                     hs << "higher_order_refusal\t"
                        << (higher_refusal.empty() ? "-" : higher_refusal) << '\n';
