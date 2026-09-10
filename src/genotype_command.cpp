@@ -434,6 +434,11 @@ int run_genotype_command(const std::vector<std::string>& args) {
     bool hybrid_plan_only = false;                 // report requirements, allocate nothing
     bool hybrid_higher = false;                    // route the call through the higher-order chain
     std::string hybrid_higher_report;              // realised counts, written AFTER the call
+    // THE BLOCK CATALOGUE, for an evaluator that must not reconstruct blocks from raw graph
+    // coordinates. Emits exactly what the caller itself indexes: each block's allele sequences, and
+    // each panel path's allele index per block. An accuracy harness can then take truth and called
+    // sequences from the same projection the call was made in, rather than a parallel one.
+    std::string dump_block_catalogue;
     // COMPATIBILITY ONLY. The model's insert floor is max(|r1|, |r2|); this restores |r1| + |r2|,
     // which declares every overlapping pair impossible.
     bool hybrid_no_overlap_pairs = false;
@@ -619,6 +624,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
             hybrid_grouped = true;
         }
         else if (arg == "--hybrid-higher-report") hybrid_higher_report = require_value(arg);
+        else if (arg == "--dump-block-catalogue") dump_block_catalogue = require_value(arg);
         else if (arg == "--no-overlap-pairs") hybrid_no_overlap_pairs = true;
         else if (arg == "--hybrid-factor-oracle") hybrid_factor_oracle = true;
         else if (arg == "--hybrid-factor-supersede")
@@ -2017,6 +2023,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
             bool higher_active = false;
             // Rendered where `owners` is in scope; printed with the status file later.
             std::vector<std::string> unusable_lines;
+            std::size_t neutral_pairwise_reported = 0, superseded_reported = 0;
             long min_len_recorded = 0, ip_lo_recorded = 0, ip_hi_recorded = 0;
             double ip_residual_lo = 0.0, ip_residual_hi = 0.0;
             std::size_t hyb_fragments_loaded = 0, hyb_edges_considered = 0;
@@ -4132,9 +4139,16 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         }
                         // ONE LIST. Retained pairwise edges first, then the interval factors --
                         // a superseded edge is never added, so it cannot be applied at all.
-                        std::size_t retained_pairwise = 0, dropped_superseded = 0;
+                        std::size_t retained_pairwise = 0, dropped_superseded = 0,
+                                    neutral_pairwise = 0;
                         for (std::size_t b = 1; b < hyb_act.sparse_kernel_edges.size(); ++b) {
                             const SparseEdgeLinkage& e = hyb_act.sparse_kernel_edges[b];
+                            // ACTIVE IS NOT THE SAME AS CARRYING A CORRECTION. An edge that built
+                            // but stored no non-neutral phase class contributes exactly 1 and is
+                            // not added -- correct, but it means active_edges is NOT evidence that
+                            // that many pairwise factors reached inference. Counted separately so
+                            // the two numbers can never be read as the same claim.
+                            if (e.active && e.classes.empty()) ++neutral_pairwise;
                             if (!e.has_corrections()) continue;
                             const std::pair<std::uint32_t, std::uint32_t> key{
                                 static_cast<std::uint32_t>(b - 1), static_cast<std::uint32_t>(b)};
@@ -4185,8 +4199,12 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                      "incomplete; nothing excluded, legacy call stands");
                         } else {
                             higher_active = true;
+                            neutral_pairwise_reported = neutral_pairwise;
+                            superseded_reported = dropped_superseded;
                             log.info("hybrid higher-order: " +
-                                     std::to_string(retained_pairwise) + " retained pairwise + " +
+                                     std::to_string(retained_pairwise) + " retained pairwise (" +
+                                     std::to_string(neutral_pairwise) + " active but exactly "
+                                     "neutral, contributing nothing) + " +
                                      std::to_string(built_tables.size()) + " interval factors, " +
                                      std::to_string(dropped_superseded) + " superseded edges "
                                      "excluded; planned peak " +
@@ -4335,6 +4353,11 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             if (f.table != nullptr) ++n_iv; else ++n_pw;
                         }
                         hs << "higher_retained_pairwise_factors\t" << n_pw << '\n';
+                        hs << "higher_neutral_pairwise_edges\t" << neutral_pairwise_reported
+                           << '\n';
+                        hs << "higher_pairwise_accounted\t"
+                           << ((n_pw + neutral_pairwise_reported + superseded_reported ==
+                                hyb_act.active_edges + superseded_reported) ? 1 : 0) << '\n';
                         hs << "higher_interval_factors\t" << n_iv << '\n';
                         hs << "higher_each_factor_once\t" << (dup ? 0 : 1) << '\n';
                         hs << "higher_ls_transitions\t"
@@ -4399,6 +4422,15 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     hs << "owned_linkage\t" << hyb_act.report.consumed_linkage << '\n';
                     hs << "owned_invariant\t" << hyb_act.report.invariant << '\n';
                     hs << "unconsumed_wide\t" << hyb_act.report.unconsumed_wide << '\n';
+                    // THE SCOPES THEMSELVES. "1 wide" says a fragment has no consumer; it does not
+                    // say which blocks it depends on, which is the only thing that tells you
+                    // whether a factor set covers a cohort or was fitted to one donor's reads.
+                    for (const std::vector<std::uint32_t>& sc : hyb_act.report.wide_scopes) {
+                        hs << "unconsumed_wide_scope\t";
+                        for (std::size_t q = 0; q < sc.size(); ++q)
+                            hs << (q ? "," : "") << sc[q];
+                        hs << '\n';
+                    }
                     hs << "unconsumed_refused_edge\t" << hyb_act.report.unconsumed_refused_edge << '\n';
                     hs << "unconsumed_unusable\t" << hyb_act.report.unconsumed_unusable << '\n';
                     for (const EdgeRefusal& r : hyb_act.report.refusals) {
@@ -5163,6 +5195,39 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 genotype_sample(chain, blocks, read_panel, rc, depth, hap_names, gopt, &gsum,
                                 pa1.empty() ? nullptr : &pa1, pa2.empty() ? nullptr : &pa2,
                                 evidence == "syncmer" ? nullptr : &cev, &probe_rows);
+
+            // ---- THE BLOCK CATALOGUE ---------------------------------------------------------
+            // Exactly the projection the call was made in: allele_seq is what the reported allele
+            // indices index into, and allele_of is how a panel path maps onto them. An evaluator
+            // reading this cannot drift from the caller the way one rebuilding blocks from graph
+            // coordinates can. The catalogue fingerprint is emitted so a harness can assert that
+            // two runs indexed the same catalogue before comparing any allele number between them.
+            if (!dump_block_catalogue.empty()) {
+                std::ofstream bc(dump_block_catalogue);
+                if (!bc) throw std::runtime_error("genotype: cannot write " +
+                                                  dump_block_catalogue);
+                bc << "# catalogue_fingerprint\t" << allele_catalogue_fingerprint(blocks) << '\n';
+                bc << "# blocks\t" << blocks.size() << '\n';
+                bc << "# paths\t" << hap_names.size() << '\n';
+                bc << "kind\tblock\tkey\tvalue\n";
+                for (std::size_t b = 0; b < blocks.size(); ++b) {
+                    bc << "block_kind\t" << b << "\t-\t"
+                       << (chain[b].kind == BlockKind::Bubble ? "bubble"
+                           : chain[b].kind == BlockKind::Backbone ? "backbone" : "flank")
+                       << '\n';
+                    for (std::size_t ai = 0; ai < blocks[b].allele_seq.size(); ++ai)
+                        bc << "allele\t" << b << '\t' << ai << '\t'
+                           << blocks[b].allele_seq[ai] << '\n';
+                    for (const std::string& nm : hap_names) {
+                        const auto it = blocks[b].allele_of.find(nm);
+                        bc << "path\t" << b << '\t' << nm << '\t'
+                           << (it == blocks[b].allele_of.end()
+                                   ? std::string("-") : std::to_string(it->second)) << '\n';
+                    }
+                }
+                log.info("block catalogue: " + std::to_string(blocks.size()) + " blocks, " +
+                         std::to_string(hap_names.size()) + " paths -> " + dump_block_catalogue);
+            }
 
             // ---- WHAT THE RECURRENCE ACTUALLY DID, after it has done it -----------------------
             if (!hybrid_higher_report.empty()) {
