@@ -1632,14 +1632,19 @@ struct FragmentOwner {
     // The VARIABLE blocks the factor is over. Unary: lo == hi. Linkage: lo < hi, and every block
     // strictly between them is fixed -- they need NOT be physically adjacent.
     std::uint32_t block_lo = 0, block_hi = 0;
-    std::vector<std::uint32_t> scope;           // physical blocks touched, certified, ascending
-    std::vector<std::uint32_t> var_scope;       // the variable subset; arity comes from THIS
+    // PANEL-DOMAIN, both of them: the blocks that matter GIVEN a panel haplotype. Under the
+    // caller's own transition model the reachable set is the full allele product, where these
+    // may be too small. Never read as a full-domain scope.
+    std::vector<std::uint32_t> panel_domain_scope;      // physical blocks touched, ascending
+    std::vector<std::uint32_t> panel_domain_var_scope;  // the variable subset; arity comes from THIS
     double in_band = 0.0;         // logsumexp over in-band origins, all candidates
     double omitted_bound = 0.0;   // certified bound on everything outside the band
     double unmapped = 0.0;        // in-band mass belonging to NO block (partial frames)
     double dropped = 0.0;         // NATS the scope restriction costs; certified <= scope_tol
     std::size_t origins = 0;
-    bool certified = false;
+    // Certified AGAINST THE OUT-OF-BAND BOUND, OVER PANEL ORIGINS. Not a statement about
+    // recombinant tuples, which this search never enumerates.
+    bool panel_domain_certified = false;
 };
 
 // One fragment's owning factor. `pidx`, when given, is the per-candidate piece index the bounded
@@ -1731,12 +1736,27 @@ ExposureCheck check_exposure(std::size_t window_len, const InsertPrior& ip);
 //
 // `block_variable[b]` is nonzero when block b's sequence differs between candidates. A fixed block
 // is context, never a factor variable.
-FragmentOwner assign_fragment_owner(const Fragment& fragment,
-                                    const std::vector<CandidateFrame>& frames,
-                                    const std::vector<char>& block_variable,
-                                    const InsertPrior& ip, double max_divergence,
-                                    double log_eps, double log_1meps, double scope_tol,
-                                    const std::vector<PieceIndex>* pidx = nullptr);
+//
+// THE NAME STATES THE DOMAIN, BECAUSE THE DOMAIN IS THE LIMITATION. Origins are enumerated by
+// placing the two mates on PANEL haplotype frames, one frame at a time. Everything this function
+// certifies is therefore conditional on the true sequence being a panel haplotype -- and the
+// caller's transition model is Li-Stephens, which switches at every block and so reaches the full
+// Cartesian product of per-block alleles, recombinants included.
+//
+// The gap is not small. On C4, block 2 is EXACTLY flat across all 105 panel-carried tuples of
+// {2,3,4} and moves the diploid score by 333.61 nats elsewhere in the 16,000 cells the factor
+// scores. A scope certified here is silent about more than 99% of the model domain.
+//
+// So this is kept, and kept NAMED, as the panel-domain scope. Its historical output stands as
+// what it always was and must not be reinterpreted as a full-domain result; the full-domain
+// certifier is a separate function and will say so in its own name.
+FragmentOwner assign_fragment_owner_panel_domain(const Fragment& fragment,
+                                                 const std::vector<CandidateFrame>& frames,
+                                                 const std::vector<char>& block_variable,
+                                                 const InsertPrior& ip, double max_divergence,
+                                                 double log_eps, double log_1meps,
+                                                 double scope_tol,
+                                                 const std::vector<PieceIndex>* pidx = nullptr);
 
 // The partition's headline counts, plus each class's share of pooled in-band placement mass.
 //
@@ -3226,7 +3246,10 @@ struct OriginUniverse {
     // and a union-of-spans scope is always the whole locus -- measured, and it made the first
     // version of this oracle useless. A block is in scope when deleting every origin that touches it
     // moves the exact logsumexp by more than `scope_tol` nats.
-    std::vector<std::uint32_t> scope;
+    // PANEL-DOMAIN, like every scope in this header: enumerate_fragment_origins walks the
+    // candidate frames, so a block absent from this list is only known not to matter along a
+    // panel haplotype. The exhaustive full-domain oracle is a separate object.
+    std::vector<std::uint32_t> panel_domain_scope;
     double retained_lse = 0.0;            // mass the accelerated representation keeps
     double omitted_lse = 0.0;             // mass it drops
     // Mass from origins that belong to NO block, because they fall outside a partial frame's

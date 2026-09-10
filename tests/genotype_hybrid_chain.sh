@@ -261,9 +261,12 @@ TOL = 1e-6
 worst = max(float(r[12]) for r in rows)
 if worst <= TOL: ok("no factor loses placement mass (worst restriction costs %.3e nats, tol %g)" % (worst, TOL))
 else: no("a factor loses %.3e nats of placement mass, tolerance %g" % (worst, TOL))
+# PANEL-DOMAIN certification, and the message says so. The origin search places mates on panel
+# haplotype frames only, so this column is silent about the recombinant tuples Li-Stephens can
+# reach -- a distinction that cost a wrong "block 2 is irrelevant" conclusion once already.
 uncert = [r for r in rows if r[13] != "1"]
-if uncert: no("%d fragments have an UNCERTIFIED scope yet were still assigned" % len(uncert))
-else: ok("every assigned scope is certified against the out-of-band bound")
+if uncert: no("%d fragments have an UNCERTIFIED panel-domain scope yet were still assigned" % len(uncert))
+else: ok("every assigned panel-domain scope is certified against the out-of-band bound")
 sys.exit(bad)
 PYEOF
 fails=$(( fails + $? ))

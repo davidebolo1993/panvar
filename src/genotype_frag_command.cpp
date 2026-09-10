@@ -1996,7 +1996,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             const double lep = std::log(0.001 / 3.0), l1m = std::log1p(-0.001);
             const auto owner_with_floor = [&](long floor_len) {
                 const InsertPrior ip = make_insert_prior(350.0, 50.0, 0.0, 4, floor_len);
-                return assign_fragment_owner(f, frames, block_var, ip, 0.05, lep, l1m, 1e-6,
+                return assign_fragment_owner_panel_domain(f, frames, block_var, ip, 0.05, lep, l1m, 1e-6,
                                              nullptr);
             };
             const FragmentOwner sum_floor = owner_with_floor(
@@ -2046,7 +2046,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             lng.r2 = reverse_complement(ref.substr(1000 + 573 - 150, 150));
             const auto owner_at = [&](int sigmas, long floor_len) {
                 const InsertPrior ip = make_insert_prior(350.0, 50.0, 0.0, sigmas, floor_len);
-                return assign_fragment_owner(lng, frames, block_var, ip, 0.05, lep, l1m, 1e-6,
+                return assign_fragment_owner_panel_domain(lng, frames, block_var, ip, 0.05, lep, l1m, 1e-6,
                                              nullptr);
             };
             const FragmentOwner at4 = owner_at(4, 150);   // support 150-550: rejects it
@@ -2066,9 +2066,9 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             const InsertPrior ip300 = make_insert_prior(350.0, 50.0, 0.0, 6, 300);
             const InsertPrior ip150 = make_insert_prior(350.0, 50.0, 0.0, 6, 150);
             const FragmentOwner lo_bad =
-                assign_fragment_owner(ov, frames, block_var, ip300, 0.05, lep, l1m, 1e-6, nullptr);
+                assign_fragment_owner_panel_domain(ov, frames, block_var, ip300, 0.05, lep, l1m, 1e-6, nullptr);
             const FragmentOwner lo_ok =
-                assign_fragment_owner(ov, frames, block_var, ip150, 0.05, lep, l1m, 1e-6, nullptr);
+                assign_fragment_owner_panel_domain(ov, frames, block_var, ip150, 0.05, lep, l1m, 1e-6, nullptr);
             ok_(lo_bad.origins == 0 && lo_ok.origins > 0,
                 "restoring the |r1|+|r2| floor (300) loses the overlapping pair that max(|r1|,"
                 "|r2|) (150) keeps -- both bounds are gated, not just the one just changed");
@@ -3854,7 +3854,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                                                return f; };
         const auto own = [](OwnerKind k, std::uint32_t lo, std::uint32_t hi) {
             FragmentOwner o; o.kind = k; o.block_lo = lo; o.block_hi = hi;
-            if (k == OwnerKind::Wide) o.var_scope = {lo, (lo + hi) / 2, hi};
+            if (k == OwnerKind::Wide) o.panel_domain_var_scope = {lo, (lo + hi) / 2, hi};
             return o;
         };
         LinkageEdge good;
@@ -3919,7 +3919,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         const auto mkown = [](OwnerKind k, std::uint32_t lo, std::uint32_t hi,
                               std::vector<std::uint32_t> vs = {}) {
             FragmentOwner o;
-            o.kind = k; o.block_lo = lo; o.block_hi = hi; o.var_scope = std::move(vs);
+            o.kind = k; o.block_lo = lo; o.block_hi = hi; o.panel_domain_var_scope = std::move(vs);
             return o;
         };
         const auto run = [&](const char* name, const std::vector<FragmentOwner>& owners,
@@ -4916,7 +4916,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         std::vector<std::vector<std::uint32_t>> scopes(rfr.size());
         for (std::size_t fi = 0; fi < rfr.size(); ++fi) {
             scopes[fi] = enumerate_fragment_origins(rfr[fi], frames, rp,
-                                                    hopt.placement_topk, scope_tol).scope;
+                                                    hopt.placement_topk, scope_tol).panel_domain_scope;
         }
         long ia = -1, ib = -1;
         for (std::size_t i2 = 0; i2 < cname.size(); ++i2) {
@@ -5055,7 +5055,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         }
         std::vector<FragmentOwner> owners(ofr.size());
         run_parallel(ofr.size(), opt.threads, [&](std::size_t fi) {
-            owners[fi] = assign_fragment_owner(ofr[fi], frames, block_variable, ip_o,
+            owners[fi] = assign_fragment_owner_panel_domain(ofr[fi], frames, block_variable, ip_o,
                                                opt.max_divergence, lep_o, l1m_o, scope_tol,
                                                opidx.empty() ? nullptr : &opidx);
         });
@@ -6639,7 +6639,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         if (!of) throw std::runtime_error("genotype-frag: cannot write " + origin_universe);
         of.precision(17);
         of << "fragment\tn_origins\tn_candidates_hit\texact_lse\tretained_lse\tomitted_lse"
-              "\tscope_blocks\tscope\tachieved_bound\tbound_holds"
+              "\tpanel_domain_scope_blocks\tpanel_domain_scope\tachieved_bound\tbound_holds"
               // appended, never inserted: three assertions once changed meaning silently when
               // columns were added in the middle of this header
               "\tinitial_bound\tblocks_added\tworst_pair\tunmapped_lse\n";
@@ -6650,9 +6650,9 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             for (const FragmentOrigin& o : u.origins) hits.insert(o.hap);
             of << F.name << '\t' << u.origins.size() << '\t' << hits.size() << '\t'
                << u.exact_lse << '\t' << u.retained_lse << '\t' << u.omitted_lse << '\t'
-               << u.scope.size() << '\t';
-            for (std::size_t q = 0; q < u.scope.size(); ++q) of << (q ? "," : "") << u.scope[q];
-            if (u.scope.empty()) of << '.';
+               << u.panel_domain_scope.size() << '\t';
+            for (std::size_t q = 0; q < u.panel_domain_scope.size(); ++q) of << (q ? "," : "") << u.panel_domain_scope[q];
+            if (u.panel_domain_scope.empty()) of << '.';
             of << '\t' << u.achieved_bound << '\t' << (u.bound_holds ? "yes" : "NO")
                << '\t' << u.initial_bound << '\t' << u.blocks_added
                << '\t' << u.worst_pair_a << ':' << u.worst_pair_b

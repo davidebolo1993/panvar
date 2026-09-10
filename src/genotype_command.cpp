@@ -2133,7 +2133,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     std::atomic<std::size_t> own_done{0};
                     const auto own_t0 = std::chrono::steady_clock::now();
                     run_parallel(hf.size(), options.threads, [&](std::size_t fi) {
-                        owners[fi] = assign_fragment_owner(hf[fi], hyb_cov.frames, block_variable,
+                        owners[fi] = assign_fragment_owner_panel_domain(hf[fi], hyb_cov.frames, block_variable,
                                                            ip, hyb_params.max_divergence, lep, l1m,
                                                            1e-6, pidx.empty() ? nullptr : &pidx);
                         // PROGRESS. A silent multi-minute pass is exactly what made the first C4
@@ -2268,7 +2268,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             std::size_t n_wide_in = 0;
                             for (std::size_t fi = 0; fi < hf.size(); ++fi) {
                                 if (owners[fi].kind != OwnerKind::Wide) continue;
-                                if (owners[fi].var_scope != evidence_scope) continue;
+                                if (owners[fi].panel_domain_var_scope != evidence_scope) continue;
                                 ev.push_back(fi); ++n_wide_in;
                             }
                             std::sort(ev.begin(), ev.end());
@@ -2284,7 +2284,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             std::size_t scope_violations = 0;
                             for (std::size_t fi : ev) {
                                 if (owners[fi].kind != OwnerKind::Wide) continue;
-                                if (owners[fi].var_scope != evidence_scope) ++scope_violations;
+                                if (owners[fi].panel_domain_var_scope != evidence_scope) ++scope_violations;
                             }
                             fo << "evidence_scope\t";
                             for (std::size_t q = 0; q < evidence_scope.size(); ++q)
@@ -3028,8 +3028,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         }
                         for (std::size_t fi = 0; fi < hf.size(); ++fi) {
                             if (owners[fi].kind != OwnerKind::Wide) continue;
-                            bool inside = !owners[fi].var_scope.empty();
-                            for (std::uint32_t b : owners[fi].var_scope)
+                            bool inside = !owners[fi].panel_domain_var_scope.empty();
+                            for (std::uint32_t b : owners[fi].panel_domain_var_scope)
                                 if (!fbset.count(b)) { inside = false; break; }
                             if (inside) fset.push_back(fi);
                         }
@@ -3191,12 +3191,12 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         for (std::size_t fi = 0; fi < hf.size(); ++fi) {
                             if (owners[fi].kind != OwnerKind::Wide) continue;
                             ++n_wide;
-                            by_scope[owners[fi].var_scope] += 1;
+                            by_scope[owners[fi].panel_domain_var_scope] += 1;
                         }
                         std::ofstream wi(hybrid_wide_inventory);
                         if (!wi) throw std::runtime_error("genotype: cannot write " +
                                                           hybrid_wide_inventory);
-                        wi << "var_scope\tarity\tfragments\tmin_block\tmax_block"
+                        wi << "panel_domain_var_scope\tarity\tfragments\tmin_block\tmax_block"
                               "\tminimal_factor_interval\tinterval_blocks\tconsecutive_variable"
                               "\tcovered_by_existing_edge\n";
                         std::size_t need_higher = 0, covered = 0;
@@ -3285,8 +3285,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         std::size_t wide_in = 0, wide_out = 0;
                         for (std::size_t fi = 0; fi < hf.size(); ++fi) {
                             if (owners[fi].kind != OwnerKind::Wide) continue;
-                            bool inside = !owners[fi].var_scope.empty();
-                            for (std::uint32_t b : owners[fi].var_scope)
+                            bool inside = !owners[fi].panel_domain_var_scope.empty();
+                            for (std::uint32_t b : owners[fi].panel_domain_var_scope)
                                 if (!sbset.count(b)) { inside = false; break; }
                             if (inside) ++wide_in; else ++wide_out;
                         }
@@ -4114,11 +4114,11 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             c.omitted = la(c.omitted, owners[i].omitted_bound);
                             c.unmapped = la(c.unmapped, owners[i].unmapped);
                             c.origins += owners[i].origins;
-                            c.scope_blocks += owners[i].scope.size();
-                            if (!owners[i].scope.empty())
+                            c.scope_blocks += owners[i].panel_domain_scope.size();
+                            if (!owners[i].panel_domain_scope.empty())
                                 c.max_span = std::max<std::size_t>(
                                     c.max_span,
-                                    owners[i].scope.back() - owners[i].scope.front() + 1);
+                                    owners[i].panel_domain_scope.back() - owners[i].panel_domain_scope.front() + 1);
                             if (i < hf.size()) c.bases += hf[i].r1.size() + hf[i].r2.size();
                         }
                         const auto num = [](double v) {
@@ -4141,7 +4141,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                                      num(kv.second.unmapped) + "\n");
                             unusable_lines.push_back(k + "origins\t" +
                                                      std::to_string(kv.second.origins) + "\n");
-                            unusable_lines.push_back(k + "scope_blocks\t" +
+                            unusable_lines.push_back(k + "panel_domain_scope_blocks\t" +
                                                      std::to_string(kv.second.scope_blocks) + "\n");
                             unusable_lines.push_back(k + "max_block_span\t" +
                                                      std::to_string(kv.second.max_span) + "\n");
@@ -4446,7 +4446,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     for (std::size_t i = 0; i < higher_scopes.size(); ++i)
                         for (const FragmentOwner& o2 : owners)
                             if (o2.kind == OwnerKind::Wide &&
-                                higher_scopes[i].covers(o2.var_scope)) ++plan_wide_consumed[i];
+                                higher_scopes[i].covers(o2.panel_domain_var_scope)) ++plan_wide_consumed[i];
                     planned_only_stored = higher_scopes;
                     planned_only_reported = higher_scopes.size();
                     // THE LEDGER CREDITS ONLY FACTORS THAT EXIST.

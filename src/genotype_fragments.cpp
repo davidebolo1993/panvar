@@ -4126,7 +4126,7 @@ OriginUniverse enumerate_fragment_origins(const Fragment& fragment,
         return log_add(mass == kNegInf ? kNegInf : log_mix + log_lam + mass, log_bg_w + bg_ll);
     };
 
-    out.scope.clear();
+    out.panel_domain_scope.clear();
     for (const std::uint32_t b : touched) {
         bool matters = false;
         for (std::uint32_t h = 0; h < frames.size() && !matters; ++h) {
@@ -4139,7 +4139,7 @@ OriginUniverse enumerate_fragment_origins(const Fragment& fragment,
             }
             if (contrib_of(per_cand_lse[h]) - contrib_of(without) > scope_tol) matters = true;
         }
-        if (matters) out.scope.push_back(b);
+        if (matters) out.panel_domain_scope.push_back(b);
     }
 
     // JOINT BOUND. The per-block test above is necessary and not sufficient: it asks what removing
@@ -4193,9 +4193,9 @@ OriginUniverse enumerate_fragment_origins(const Fragment& fragment,
         };
         std::vector<std::uint32_t> excluded;
         for (const std::uint32_t b : touched) {
-            if (!std::binary_search(out.scope.begin(), out.scope.end(), b)) excluded.push_back(b);
+            if (!std::binary_search(out.panel_domain_scope.begin(), out.panel_domain_scope.end(), b)) excluded.push_back(b);
         }
-        double worst = worst_residual(out.scope, &out.worst_pair_a, &out.worst_pair_b);
+        double worst = worst_residual(out.panel_domain_scope, &out.worst_pair_a, &out.worst_pair_b);
         out.initial_bound = worst;
         while (worst > scope_tol && !excluded.empty()) {
             // add back whichever excluded block carries the most omitted mass
@@ -4210,11 +4210,11 @@ OriginUniverse enumerate_fragment_origins(const Fragment& fragment,
                 }
                 if (m > best_mass) { best_mass = m; best_i = i; }
             }
-            out.scope.push_back(excluded[best_i]);
-            std::sort(out.scope.begin(), out.scope.end());
+            out.panel_domain_scope.push_back(excluded[best_i]);
+            std::sort(out.panel_domain_scope.begin(), out.panel_domain_scope.end());
             excluded.erase(excluded.begin() + static_cast<long>(best_i));
             ++out.blocks_added;
-            worst = worst_residual(out.scope, &out.worst_pair_a, &out.worst_pair_b);
+            worst = worst_residual(out.panel_domain_scope, &out.worst_pair_a, &out.worst_pair_b);
         }
         out.achieved_bound = worst;
         out.bound_holds = worst <= scope_tol;
@@ -4279,12 +4279,13 @@ const char* owner_kind_name(OwnerKind k) {
     }
 }
 
-FragmentOwner assign_fragment_owner(const Fragment& fragment,
-                                    const std::vector<CandidateFrame>& frames,
-                                    const std::vector<char>& block_variable,
-                                    const InsertPrior& ip, double max_divergence,
-                                    double log_eps, double log_1meps, double scope_tol,
-                                    const std::vector<PieceIndex>* pidx) {
+FragmentOwner assign_fragment_owner_panel_domain(const Fragment& fragment,
+                                                 const std::vector<CandidateFrame>& frames,
+                                                 const std::vector<char>& block_variable,
+                                                 const InsertPrior& ip, double max_divergence,
+                                                 double log_eps, double log_1meps,
+                                                 double scope_tol,
+                                                 const std::vector<PieceIndex>* pidx) {
     FragmentOwner out;
     out.in_band = kNegInf;
     out.omitted_bound = kNegInf;
@@ -4383,7 +4384,7 @@ FragmentOwner assign_fragment_owner(const Fragment& fragment,
         kept = log_add(kept, origins[n_keep].mass);
     }
     out.dropped = (kept == kNegInf) ? std::numeric_limits<double>::infinity() : total - kept;
-    out.certified = out.dropped <= scope_tol;
+    out.panel_domain_certified = out.dropped <= scope_tol;
 
     std::vector<std::uint32_t> sc;
     for (std::size_t i = 0; i < n_keep; ++i) {
@@ -4391,9 +4392,9 @@ FragmentOwner assign_fragment_owner(const Fragment& fragment,
     }
     std::sort(sc.begin(), sc.end());
     sc.erase(std::unique(sc.begin(), sc.end()), sc.end());
-    out.scope = sc;
+    out.panel_domain_scope = sc;
 
-    if (!out.certified) {
+    if (!out.panel_domain_certified) {
         out.kind = OwnerKind::Unusable; out.why = UnusableReason::ScopeNotCertified; return out;
     }
     if (sc.empty()) {
@@ -4413,9 +4414,9 @@ FragmentOwner assign_fragment_owner(const Fragment& fragment,
     // fragment Wide and throw away most of the real linkage evidence at any locus whose bubbles
     // have reference sequence between them, which is most of them.
     for (std::uint32_t b : sc) {
-        if (b < block_variable.size() && block_variable[b]) out.var_scope.push_back(b);
+        if (b < block_variable.size() && block_variable[b]) out.panel_domain_var_scope.push_back(b);
     }
-    if (out.var_scope.empty()) {
+    if (out.panel_domain_var_scope.empty()) {
         // No genotype dependence at all. Still owned, because it still carries depth and still
         // consumes normalisation -- dropping it here would silently unbalance both.
         out.kind = OwnerKind::Invariant;
@@ -4423,10 +4424,10 @@ FragmentOwner assign_fragment_owner(const Fragment& fragment,
         out.block_hi = sc.back();
         return out;
     }
-    out.block_lo = out.var_scope.front();
-    out.block_hi = out.var_scope.back();
-    if (out.var_scope.size() == 1) out.kind = OwnerKind::Unary;
-    else if (out.var_scope.size() == 2) out.kind = OwnerKind::Linkage;
+    out.block_lo = out.panel_domain_var_scope.front();
+    out.block_hi = out.panel_domain_var_scope.back();
+    if (out.panel_domain_var_scope.size() == 1) out.kind = OwnerKind::Unary;
+    else if (out.panel_domain_var_scope.size() == 2) out.kind = OwnerKind::Linkage;
     else out.kind = OwnerKind::Wide;   // three or more variables; never cropped to a pair
     return out;
 }
@@ -6593,7 +6594,7 @@ HybridActivation plan_hybrid_activation_sparse(
         // and the consumed set stay the same set.
         bool by_higher = false;
         for (const HigherFactorScope& h : higher) {
-            if (owners[i].kind == OwnerKind::Wide && h.covers(owners[i].var_scope)) {
+            if (owners[i].kind == OwnerKind::Wide && h.covers(owners[i].panel_domain_var_scope)) {
                 by_higher = true; break;
             }
             if (owners[i].kind == OwnerKind::Linkage &&
@@ -6735,9 +6736,9 @@ std::vector<HigherFactorScope> plan_higher_factors(
     // normalisation, it only multiplies independently normalised potentials.
     std::set<std::vector<std::uint32_t>> scopes;
     for (const FragmentOwner& o : owners) {
-        if (o.kind != OwnerKind::Wide || o.var_scope.empty()) continue;
-        std::uint32_t lo = o.var_scope.front(), hi = o.var_scope.front();
-        for (std::uint32_t b : o.var_scope) { lo = std::min(lo, b); hi = std::max(hi, b); }
+        if (o.kind != OwnerKind::Wide || o.panel_domain_var_scope.empty()) continue;
+        std::uint32_t lo = o.panel_domain_var_scope.front(), hi = o.panel_domain_var_scope.front();
+        for (std::uint32_t b : o.panel_domain_var_scope) { lo = std::min(lo, b); hi = std::max(hi, b); }
         if (hi >= n_blocks) continue;
         std::vector<std::uint32_t> sp;              // contiguous closure, the only enlargement
         for (std::uint32_t b = lo; b <= hi; ++b) sp.push_back(b);
@@ -6804,12 +6805,12 @@ HybridCompletenessReport assess_hybrid_completeness(
                 // A higher factor consumes it when its WHOLE variable scope is inside the span.
                 bool taken = false;
                 for (const HigherFactorScope& h : higher)
-                    if (h.covers(o.var_scope)) { taken = true; break; }
+                    if (h.covers(o.panel_domain_var_scope)) { taken = true; break; }
                 if (taken) { ++R.consumed_higher_wide; break; }
                 // Otherwise no consumer exists for three or more variables. Reported with its
                 // scope rather than counted anonymously, and never cropped into a pair.
                 ++R.unconsumed_wide;
-                R.wide_scopes.push_back(o.var_scope);
+                R.wide_scopes.push_back(o.panel_domain_var_scope);
                 break;
             }
             default:
@@ -7428,18 +7429,22 @@ void write_ownership_table(const std::string& path,
     std::ofstream f(path);
     if (!f) throw std::runtime_error("genotype-frag: cannot write " + path);
     f.precision(10);
-    f << "fragment\towner\tblock_lo\tblock_hi\tscope_size\tvar_scope_size\tspan_lo\tspan_hi"
+    // COLUMN NAMES CARRY THE DOMAIN. A reader who sees "certified" and does not know the
+    // search only ever placed mates on panel haplotypes will draw a stronger conclusion
+    // than the number supports; that is exactly the misreading that has to stop here.
+    f << "fragment\towner\tblock_lo\tblock_hi\tpanel_domain_scope_size"
+         "\tpanel_domain_var_scope_size\tspan_lo\tspan_hi"
          "\torigins\tin_band\tomitted_bound"
-         "\tunmapped\tdropped_nats\tcertified\n";
+         "\tunmapped\tdropped_nats\tpanel_domain_certified\n";
     for (std::size_t i = 0; i < owners.size() && i < fragments.size(); ++i) {
         const FragmentOwner& o = owners[i];
         f << fragments[i].name << '\t' << owner_kind_name(o.kind) << '\t'
-          << o.block_lo << '\t' << o.block_hi << '\t' << o.scope.size() << '\t'
-          << o.var_scope.size() << '\t'
-          << (o.scope.empty() ? 0u : o.scope.front()) << '\t'
-          << (o.scope.empty() ? 0u : o.scope.back()) << '\t' << o.origins
+          << o.block_lo << '\t' << o.block_hi << '\t' << o.panel_domain_scope.size() << '\t'
+          << o.panel_domain_var_scope.size() << '\t'
+          << (o.panel_domain_scope.empty() ? 0u : o.panel_domain_scope.front()) << '\t'
+          << (o.panel_domain_scope.empty() ? 0u : o.panel_domain_scope.back()) << '\t' << o.origins
           << '\t' << o.in_band << '\t' << o.omitted_bound << '\t' << o.unmapped << '\t'
-          << o.dropped << '\t' << (o.certified ? 1 : 0) << '\n';
+          << o.dropped << '\t' << (o.panel_domain_certified ? 1 : 0) << '\n';
     }
     f.flush();
     if (!f) throw std::runtime_error("genotype-frag: write failed for " + path);
