@@ -445,13 +445,18 @@ std::vector<BlockFragmentResult> genotype_fragments(
         const double log_1meps = std::log1p(-options.error_rate);
         const double log_mix = std::log1p(-options.outlier_mix);
         const double log_out = std::log(options.outlier_mix);
+        // THE SHARED RULE, over this haplotype's recruited subset. Computing the floor inline
+        // here is how the bounded search kept the |r1| + |r2| floor after every other path moved
+        // to max(|r1|, |r2|) -- the genotype_bounded_search fixture is what caught it, reporting
+        // a support of [300, 650] where the rest of the model uses [150, 650].
         long min_frag_len_b = 1;
         for (const std::uint32_t fi : recruited[t]) {
-            min_frag_len_b = std::max<long>(min_frag_len_b,
-                static_cast<long>(fragments[fi].r1.size() + fragments[fi].r2.size()));
+            min_frag_len_b = std::max<long>(
+                min_frag_len_b,
+                fragment_insert_floor(fragments[fi], options.allow_overlapping_pairs));
         }
         const InsertPrior ins_prior = make_insert_prior(options.fragment_len, options.fragment_sd,
-                                                        options.discordant_rate, 4, min_frag_len_b);
+                                                        options.discordant_rate, options.insert_sigmas, min_frag_len_b);
         const auto read_ll = [&](std::size_t edits, std::size_t len) {
             return static_cast<double>(edits) * log_eps +
                    static_cast<double>(len - std::min(edits, len)) * log_1meps;
@@ -1192,7 +1197,7 @@ HaplotypeResult genotype_haplotype_pairs(
     };
     const long min_frag_len = fragment_insert_floor(fragments, options.allow_overlapping_pairs);
     const InsertPrior ins_prior = make_insert_prior(options.fragment_len, options.fragment_sd,
-                                                    options.discordant_rate, 4, min_frag_len);
+                                                    options.discordant_rate, options.insert_sigmas, min_frag_len);
     // Explicit 1/2 per strand, matching the reference. It is a per-fragment constant only while the
     // placement term is compared with itself; mixed against a background it changes the placement
     // scale and therefore the contrast between candidates.

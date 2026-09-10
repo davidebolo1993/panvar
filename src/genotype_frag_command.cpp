@@ -493,6 +493,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         }
         else if (a == "--dump-fragment-mass") hopt.dump_fragment_mass = value(i, a);
         else if (a == "--dump-containment") hopt.dump_containment = value(i, a);
+        else if (a == "--insert-sigmas") opt.insert_sigmas = std::stoi(value(i, a));
         else if (a == "--dump-mass-pair") { const std::vector<std::string> two = split_commas(value(i, a));
             if (two.size() != 2) throw std::runtime_error("genotype-frag: --dump-mass-pair needs two names");
             hopt.dump_mass_pair1 = two[0]; hopt.dump_mass_pair2 = two[1]; }
@@ -598,6 +599,41 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         rp.fragment_len = hopt.fragment_len;
         rp.fragment_sd = hopt.fragment_sd;
         rp.bg_divergence = hopt.bg_divergence;
+        // EVERY PRIOR-DEFINING FIELD, copied. Letting ReferenceParams keep its own defaults for
+        // any of these is how the oracle came to integrate over [100,270] while the accelerated
+        // scorer used [100,230]: the two produced different numbers for the same reads and the
+        // difference was read as a modelling failure for an entire session.
+        rp.insert_sigmas = hopt.insert_sigmas;
+        rp.discordant_rate = hopt.discordant_rate;
+        rp.allow_overlapping_pairs = hopt.allow_overlapping_pairs;
+        // AND THE PRIORS MUST THEN BE IDENTICAL. Asserted, not assumed: a differential between two
+        // arms that integrate different insert supports is not a measurement, so this refuses
+        // rather than printing a score.
+        {
+            const long fl_p = fragment_insert_floor(frags, hopt.allow_overlapping_pairs);
+            const long fl_r = fragment_insert_floor(frags, rp.allow_overlapping_pairs);
+            const InsertPrior pp = make_insert_prior(hopt.fragment_len, hopt.fragment_sd,
+                                                     hopt.discordant_rate, hopt.insert_sigmas,
+                                                     fl_p);
+            const InsertPrior pr2 = make_insert_prior(rp.fragment_len, rp.fragment_sd,
+                                                      rp.discordant_rate, rp.insert_sigmas, fl_r);
+            bool same = (fl_p == fl_r) && (pp.lo == pr2.lo) && (pp.hi == pr2.hi) &&
+                        (pp.logp.size() == pr2.logp.size());
+            for (std::size_t q = 0; same && q < pp.logp.size(); ++q)
+                if (std::abs(pp.logp[q] - pr2.logp[q]) > 1e-12) same = false;
+            if (same && (std::abs(pp.log_residual_below - pr2.log_residual_below) > 1e-12 ||
+                         std::abs(pp.log_residual_above - pr2.log_residual_above) > 1e-12))
+                same = false;
+            if (!same) {
+                throw std::runtime_error(
+                    "genotype-frag: the accelerated and reference arms would use DIFFERENT insert "
+                    "priors (floor " + std::to_string(fl_p) + " vs " + std::to_string(fl_r) +
+                    ", support " + std::to_string(pp.lo) + "-" + std::to_string(pp.hi) + " vs " +
+                    std::to_string(pr2.lo) + "-" + std::to_string(pr2.hi) +
+                    "); a differential between different insert-state universes is not a "
+                    "measurement, so no score is produced");
+            }
+        }
         std::vector<double> mass, contrib;
         const double v = reference_pair_loglik(slurp_fa(reference_pair[0]), slurp_fa(reference_pair[1]),
                                                frags, rp,
@@ -4817,10 +4853,11 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         long min_len_e = 1;
         const std::vector<Fragment> efr = load_fragments(read_paths);
         for (const Fragment& F : efr) {
-            min_len_e = std::max<long>(min_len_e, static_cast<long>(F.r1.size() + F.r2.size()));
+            min_len_e = std::max<long>(min_len_e,
+                                       fragment_insert_floor(F, opt.allow_overlapping_pairs));
         }
         const InsertPrior ip_e = make_insert_prior(opt.fragment_len, opt.fragment_sd,
-                                                   opt.discordant_rate, 4, min_len_e);
+                                                   opt.discordant_rate, opt.insert_sigmas, min_len_e);
         std::printf("window\texact\taffine\tdiff\tin_regime\tinsert_lo\tinsert_hi\n");
         for (const std::string& w : split_commas(exposure_probe)) {
             const std::size_t n2 = static_cast<std::size_t>(std::stoul(w));
@@ -4870,10 +4907,11 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         }
         long min_len_o = 1;
         for (const Fragment& F : ofr) {
-            min_len_o = std::max<long>(min_len_o, static_cast<long>(F.r1.size() + F.r2.size()));
+            min_len_o = std::max<long>(min_len_o,
+                                       fragment_insert_floor(F, opt.allow_overlapping_pairs));
         }
         const InsertPrior ip_o = make_insert_prior(opt.fragment_len, opt.fragment_sd,
-                                                   opt.discordant_rate, 4, min_len_o);
+                                                   opt.discordant_rate, opt.insert_sigmas, min_len_o);
         const double lep_o = std::log(opt.error_rate / 3.0);
         const double l1m_o = std::log1p(-opt.error_rate);
         std::vector<PieceIndex> opidx;
@@ -5165,10 +5203,10 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         long min_len_i = 1;
         for (const Fragment& F : ifr) {
             min_len_i = std::max<long>(min_len_i,
-                                       static_cast<long>(F.r1.size() + F.r2.size()));
+                                       fragment_insert_floor(F, opt.allow_overlapping_pairs));
         }
         const InsertPrior ip_i = make_insert_prior(opt.fragment_len, opt.fragment_sd,
-                                                   opt.discordant_rate, 4, min_len_i);
+                                                   opt.discordant_rate, opt.insert_sigmas, min_len_i);
         const double lep_i = std::log(opt.error_rate / 3.0);
         const double l1m_i = std::log1p(-opt.error_rate);
         const double lambda_i = hopt.haploid_depth > 0.0 ? hopt.haploid_depth : 0.05;
@@ -5841,10 +5879,10 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             long min_frag_len_bs = 1;
             for (const Fragment& F : bfr) {
                 min_frag_len_bs = std::max<long>(min_frag_len_bs,
-                                                 static_cast<long>(F.r1.size() + F.r2.size()));
+                                    fragment_insert_floor(F, opt.allow_overlapping_pairs));
             }
             const InsertPrior bs_prior = make_insert_prior(opt.fragment_len, opt.fragment_sd,
-                                                           opt.discordant_rate, 4, min_frag_len_bs);
+                                                           opt.discordant_rate, opt.insert_sigmas, min_frag_len_bs);
             const long ilo = bs_prior.lo, ihi = bs_prior.hi;
             bs_prior_lo = ilo; bs_prior_hi = ihi; bs_prior_g = bs_prior;
             log.info("bounded-search insert support [" + std::to_string(ilo) + "," +

@@ -393,12 +393,16 @@ else
     # both admits states the model rejects and omits valid ones between 501 and 550.
     ILO=$(awk -F'\t' 'NR==2{print $8}' "$OUT/bs.tsv.states.tsv")
     IHI=$(awk -F'\t' 'NR==2{print $9}' "$OUT/bs.tsv.states.tsv")
-    # The reads mix 120+120 and 150+150 pairs, so max(r1+r2)=300 and min=240. Production floors lo
-    # at the MAXIMUM, so the shared support is [300,550]; taking the minimum would give [240,550]
-    # and this assertion is what tells them apart.
-    { [ "${ILO:-0}" = 300 ] && [ "${IHI:-0}" = 550 ]; } \
+    # The reads mix 120+120 and 150+150 pairs. An insert cannot be shorter than its LONGEST MATE,
+    # so each fragment floors at max(|r1|,|r2|) -- 120 and 150 -- and the shared support takes the
+    # MAXIMUM over fragments, 150. Taking the minimum would give 120 and this assertion is what
+    # tells them apart. It was previously [300,550] because the floor was |r1|+|r2|, which declared
+    # every overlapping pair impossible, and because this path kept that rule after the rest of the
+    # model had moved off it.
+    { [ "${ILO:-0}" = 150 ] && [ "${IHI:-0}" = 650 ]; } \
       && ok "the shared insert support follows the LONGEST fragment ([$ILO,$IHI])" \
-      || bad "insert support is [${ILO:-?},${IHI:-?}]; production floors lo at max(r1+r2)=300, not min=240"
+      || bad "insert support is [${ILO:-?},${IHI:-?}]; expected [150,650] -- floor is the max over \
+fragments of max(|r1|,|r2|)=150, not the min 120, and the support runs to mean+6sd"
     # HAPLOTYPE IDENTITY as a key, tested directly: two haplotypes' identical states must not
     # collapse. Per-haplotype vectors cannot show this -- each holds one haplotype value.
     if [ -s "$OUT/bs.tsv.hapkey.tsv" ]; then
@@ -530,10 +534,17 @@ else
       # exactly one state at this class, so 9 copies span 8*500 = 4000 and 16 span 15*500 = 7500.
       # A count reached by extra starts inside the first eight copies would have the right TOTAL and
       # the wrong SPAN, which is why the span is asserted and not just the count.
-      K9=$(awk -F'\t' 'NR>1 && $2=="hapK9" && $5>1{print $5; exit}' "$OUT/bs.tsv.editclass.tsv")
-      K16=$(awk -F'\t' 'NR>1 && $2=="hapK16" && $5>1{print $5; exit}' "$OUT/bs.tsv.editclass.tsv")
-      S9=$(awk -F'\t' 'NR>1 && $2=="hapK9" && $5>1{print $10; exit}' "$OUT/bs.tsv.editclass.tsv")
-      S16=$(awk -F'\t' 'NR>1 && $2=="hapK16" && $5>1{print $10; exit}' "$OUT/bs.tsv.editclass.tsv")
+      # THE BEST-MASS CLASS, not whichever row comes first. A wider insert support ADDS classes --
+      # at six sigma the mates can also sit in ADJACENT copies, which is a real placement about 400x
+      # less likely (per-state mass -13.93 against -7.94) -- and taking the first row silently
+      # started asserting against one of those instead. The claim here is about the class the copies
+      # actually explain, so select it by mass and leave the additions to be counted, not ignored.
+      best_row() {   # <haplotype> <column>
+        awk -F'\t' -v h="$1" -v c="$2" 'NR>1 && $2==h && $5>1 {if (m=="" || $7>m) {m=$7; v=$c}} \
+                                         END{print v}' "$OUT/bs.tsv.editclass.tsv"
+      }
+      K9=$(best_row hapK9 5);  S9=$(best_row hapK9 10)
+      K16=$(best_row hapK16 5); S16=$(best_row hapK16 10)
       { [ "${K9:-0}" = 9 ] && [ "${S9:-0}" = 4000 ]; } \
         && ok "hapK9: exactly 9 states spanning all 9 copies (span $S9 = 8 x 500)" \
         || bad "hapK9 has ${K9:-0} states spanning ${S9:-0}; expected 9 spanning 4000"

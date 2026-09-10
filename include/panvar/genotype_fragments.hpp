@@ -109,6 +109,17 @@ long fragment_insert_floor(const std::vector<Fragment>& fragments, bool allow_ov
 long fragment_insert_floor(const Fragment& fragment, bool allow_overlap = true);
 
 struct FragmentScoreOptions {
+    // SIX SIGMA IS A DECLARED MODEL-WIDE POLICY, not a threshold picked to admit one fragment.
+    // Four sigma truncates a 350 +- 50 library at 550, which rejected a perfectly-matching,
+    // correctly-oriented 573 bp pair -- 4.46 sd out, and expected about once at this dataset size.
+    //
+    // IT LIVES HERE BECAUSE THE SCORING PATHS READ IT HERE. It was previously hard-coded to 4 in
+    // six scoring and diagnostic sites while ReferenceParams defaulted to 6, so the accelerated
+    // scorer and its own certification oracle integrated over DIFFERENT insert supports --
+    // [100,230] against [100,270] on the grid fixture. That is not a tolerance question: the two
+    // arms were not scoring the same model, and every differential between them was meaningless.
+    // A comment in HybridLinkageParameters already pointed at this field before it existed.
+    int insert_sigmas = 6;
     // OVERLAPPING MATES ARE VALID. The insert floor is max(|r1|, |r2|), not their sum -- see
     // fragment_insert_floor. False restores the pre-correction floor for compatibility only.
     bool allow_overlapping_pairs = true;
@@ -999,13 +1010,7 @@ struct ReferenceParams {
     double fragment_len = 350.0;
     double fragment_sd = 50.0;
     double bg_divergence = 0.10; // the background's implied per-base disagreement
-    // SIX SIGMA IS A DECLARED MODEL-WIDE POLICY, not a threshold picked to admit one fragment.
-    // Four sigma truncates a 350 +- 50 library at 550, which rejected a perfectly-matching,
-    // correctly-oriented 573 bp pair -- 4.46 sd out, and expected about once at this dataset size.
-    // Discarding real linkage because the computational support stopped early is not a modelling
-    // choice, it is an artefact. The principled rule is to widen until the residual tail's
-    // contribution is below the global tolerance; six sigma is that rule's practical setting here.
-    int insert_sigmas = 6;       // how far into the insert prior's tails to sum
+    int insert_sigmas = 6;       // see FragmentScoreOptions::insert_sigmas -- ONE policy
     // Same concordant/discordant mixture the accelerated path uses. A pure Gaussian here would be a
     // MODEL difference, so any discrepancy between the two scorers could not be blamed on
     // acceleration -- which is the only thing the differential test is for.

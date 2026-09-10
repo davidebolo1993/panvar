@@ -1742,9 +1742,18 @@ fi
 # GATE 7: THE EXPOSURE PRECONDITION. exposure(n) = SUM_L pi(L) max(0, n-L+1) equals the affine
 # surrogate n+1-E[L] only once the window clears the insert support; the clip bites below that and
 # the cis/trans cancellation goes with it. Asserted at the boundary rather than trusted.
+# THE BOUNDARY POINTS ARE DERIVED, NOT FROZEN. The regime begins at insert_hi - 1, and
+# insert_hi is set by the declared sigma policy: it was 550 at four sigma and is 650 at six.
+# Hard-coding 548,549,550 asserted the boundary of one particular prior, so the gate silently
+# stopped probing the boundary at all when the policy changed. Ask the binary where hi is, then
+# probe around it.
+"$BIN" genotype-frag -i "$OUT/b.sorted.gfa" -b "$OUT/b" -o "$OUT/e0" -R "$OUT/r1.fq" -R "$OUT/r2.fq" \
+  --fragment-len 350 --fragment-sd 50 --error-rate 0.001 \
+  --exposure-probe 4000 -q > "$OUT/expo0.tsv" 2>/dev/null
+IHI=$("$PY" -c "import sys;r=[l.split(chr(9)) for l in open(sys.argv[1])][1:];print(r[0][6].strip() if r else 550)" "$OUT/expo0.tsv" 2>/dev/null || echo 550)
 "$BIN" genotype-frag -i "$OUT/b.sorted.gfa" -b "$OUT/b" -o "$OUT/e" -R "$OUT/r1.fq" -R "$OUT/r2.fq" \
   --fragment-len 350 --fragment-sd 50 --error-rate 0.001 \
-  --exposure-probe 100,300,548,549,550,4000 -q > "$OUT/expo.tsv" 2>/dev/null
+  --exposure-probe "100,300,$((IHI-2)),$((IHI-1)),$IHI,4000" -q > "$OUT/expo.tsv" 2>/dev/null
 if [ -s "$OUT/expo.tsv" ]; then
   "$PY" - "$OUT/expo.tsv" <<'PYEOF4'
 import sys
