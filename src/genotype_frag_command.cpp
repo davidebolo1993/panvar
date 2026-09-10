@@ -2086,6 +2086,103 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                 "number tracks the support rather than being a constant");
         }
 
+        // ---- 8. IS AN ENLARGED BLOCK CONTEXT, OR A DEPENDENCY? --------------------------------
+        // A span enlarged for EXPOSURE is supposed to add normalisation context, not evidence.
+        // That claim is testable: build a factor over four blocks from fragments that span only
+        // the last three, then vary the FIRST block's allele while holding the others fixed. If
+        // the factor's value moves, the enlargement made that block a real dependency and the
+        // statistical model changed -- which matters because a per-donor planner may enlarge
+        // differently for different donors.
+        {
+            std::mt19937_64 rq(20260915);
+            const auto rseq = [&](std::size_t n) {
+                static const char* B = "ACGT";
+                std::string t(n, 'A');
+                for (std::size_t i = 0; i < n; ++i) t[i] = B[rq() & 3];
+                return t;
+            };
+            const auto sub = [](std::string x, std::size_t at, char c) {
+                x[at] = (x[at] == c) ? (c == 'A' ? 'C' : 'A') : c; return x;
+            };
+            IntervalGeometry G;
+            G.blocks = {0, 1, 2, 3};
+            const std::string b0 = rseq(300), b1 = rseq(300), b2 = rseq(300), b3 = rseq(300);
+            G.alleles = {{b0, sub(b0, 40, 'G')},        // the ENLARGED block: 2 alleles
+                         {b1, sub(b1, 50, 'G')},
+                         {b2, sub(b2, 60, 'T')},
+                         {b3, sub(b3, 70, 'C')}};
+            G.contexts = {rseq(8), rseq(8), rseq(8)};
+            G.lflank.clear(); G.rflank.clear(); G.ok = true; G.exposure_affine = true;
+            InsertPrior ip; ip.lo = 200; ip.hi = 700;
+            ip.logp.assign(static_cast<std::size_t>(ip.hi - ip.lo + 1),
+                           -std::log(static_cast<double>(ip.hi - ip.lo + 1)));
+            const double lep = std::log(0.001 / 3.0), l1m = std::log1p(-0.001);
+            const auto ix = build_interval_seed_index(G, 16);
+            // FRAGMENTS THAT NEVER TOUCH BLOCK 0: they start after it.
+            std::vector<Fragment> frags;
+            std::vector<std::uint32_t> ch;
+            for (std::size_t cell = 0; cell < G.cells(); cell += 3) {
+                G.cell_choice(cell, ch);
+                std::vector<const std::string*> al2, cx2;
+                for (std::size_t j = 0; j < 4; ++j) al2.push_back(&G.alleles[j][ch[j]]);
+                for (const std::string& cx : G.contexts) cx2.push_back(&cx);
+                VirtualWindow vw; vw.bind_chain(G.lflank, al2, cx2, G.rflank);
+                const std::size_t after_b0 = 320;
+                for (std::size_t st : {after_b0, after_b0 + 200}) {
+                    if (st + 400 > vw.size()) continue;
+                    Fragment f;
+                    f.name = "e" + std::to_string(cell) + "_" + std::to_string(st);
+                    for (std::size_t i = 0; i < 150; ++i) f.r1.push_back(vw.base_at(st + i));
+                    std::string t2;
+                    for (std::size_t i = 0; i < 150; ++i) t2.push_back(vw.base_at(st + 250 + i));
+                    f.r2 = reverse_complement(t2);
+                    frags.push_back(f);
+                }
+            }
+            std::vector<IntervalEmission> ems;
+            std::vector<std::vector<std::string>> sigs;
+            for (const Fragment& f : frags) {
+                IntervalEmission E = interval_emission(f, G, ip, 0.05, lep, l1m, -420.0, &ix,
+                                                       nullptr, true, false);
+                sigs.push_back(E.cell_signature);
+                ems.push_back(std::move(E));
+            }
+            const IntervalGrouping GR = build_interval_grouping(G, sigs);
+            const IntervalFactorTable T =
+                build_interval_factor(G, GR, ems, 0.05, std::log1p(-0.05), std::log(0.05));
+            ok_(T.ok, "enlargement gate: the four-block factor builds");
+            // Vary block 0 only; hold blocks 1..3 fixed on both homologues.
+            double worst = 0.0; std::size_t compared = 0;
+            for (std::uint32_t a1 = 0; a1 < 2; ++a1)
+            for (std::uint32_t a2 = 0; a2 < 2; ++a2)
+            for (std::uint32_t a3 = 0; a3 < 2; ++a3)
+            for (std::uint32_t b1 = 0; b1 < 2; ++b1)
+            for (std::uint32_t b2 = 0; b2 < 2; ++b2)
+            for (std::uint32_t b3 = 0; b3 < 2; ++b3) {
+                const double ref = T.log_psi({0, a1, a2, a3}, {0, b1, b2, b3});
+                for (std::uint32_t x = 0; x < 2; ++x)
+                for (std::uint32_t y = 0; y < 2; ++y) {
+                    const double v = T.log_psi({x, a1, a2, a3}, {y, b1, b2, b3});
+                    worst = std::max(worst, std::abs(v - ref)); ++compared;
+                }
+            }
+            // AND THE MECHANISM, not just the observation. Fragments that never touch the
+            // enlarged block have identical signatures across its alleles, so signature grouping
+            // collapses it to ONE class. With one class the two homologues always agree there, it
+            // never counts toward effective_m, and the mean-one centring log(2^(m-1)) is
+            // unchanged -- which is precisely why enlarging for exposure cannot alter the
+            // statistical model. If that block ever carried more than one class, the enlargement
+            // WOULD have added a phase dimension the evidence cannot inform.
+            ok_(!GR.classes_per_block.empty() && GR.classes_per_block[0] == 1,
+                "enlargement gate: the enlarged block collapses to ONE signature class (" +
+                std::to_string(GR.classes_per_block.empty() ? 0 : GR.classes_per_block[0]) +
+                "), so it adds no phase dimension and no change of centring");
+            ok_(worst < 1e-12,
+                std::string("enlargement gate: block 0 is CONTEXT, not a dependency -- varying it "
+                "over ") + std::to_string(compared) + " configurations moves the factor by " +
+                sci(worst) + " nats");
+        }
+
         std::printf("contribution selftest: %zu failure(s)\n", fails);
         return fails == 0 ? 0 : 1;
     }

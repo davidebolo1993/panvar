@@ -233,3 +233,59 @@ summed immediately, and block 4 must carry the common refinement. The absolute c
 figures are NOT to be quoted until the benchmark on a representative C4 slice replaces them with
 measured forward time, adjoint time, actual updates in each of the four categories, peak entries,
 predicted payload, and RSS.
+
+## THE CERTIFICATION DOMAIN IS WRONG, AND EVERY OWNERSHIP CLASS INHERITS IT
+
+`assign_fragment_owner` enumerates a fragment's origins by placing its two mates on the PANEL
+haplotype frames, one at a time. The scope it certifies is therefore the set of blocks that matter
+GIVEN THAT THE TRUE SEQUENCE IS A PANEL HAPLOTYPE. That is not the model the caller runs.
+Li-Stephens permits a switch at every block, so the reachable set is the full Cartesian product of
+per-block alleles, and it contains recombinant tuples no panel path carries.
+
+The two domains are not close to each other. Measured on C4, enlarging factor {3,4} to {2,3,4}:
+
+    factor      observed max, full product     observed max, panel tuples only
+    3_4                    333.61 nats                        0 nats
+    3_4_5                  340.10 nats                        0 nats
+    4_5                         0                             0
+    4_5_6                       0                             0
+
+Block 2 is EXACTLY flat across all 105 panel-carried tuples of `{2,3,4}` -- and moves the diploid
+score by 333.61 nats somewhere in the other 15,895 cells the factor scores. A scope certified on
+the left column is silent about the right one. 105 of 16,000 cells for `{2,3,4}` and 105 of 128,000
+for `{2,3,4,5}` are panel-carried, so the certified region is under one percent of the domain.
+
+### What this invalidates
+
+Every ownership class -- Unary, Linkage, Wide, and each Unusable reason -- was derived by this
+machinery, so any of them may be too small: Unary may be Linkage, Linkage may be Wide, and a Wide
+fragment's scope may be wider than recorded. Factor topology, exclusion sets and resource plans all
+follow from the scopes, so none of them is settled either. The C4 COMPLETE run is not withdrawn --
+its arithmetic is unchanged and its explicit F1 span happens to contain block 2 -- but its status is
+PROVISIONAL until every fragment has been re-audited against the full model domain.
+
+Unaffected: the legacy caller, which does not use this machinery at all, and the higher-order
+recurrence's own tests, which are statements about a factorisation given its tables.
+
+### The correction, in two layers
+
+Conflating these two is what produced the contradiction, so they are named separately:
+
+  STRUCTURAL DEPENDENCY   some accepted, model-supported origin depends on the block. Decided over
+                          the full local allele product, never over panel tuples.
+  CERTIFIED DEMOTION      the dependency exists but its complete mixture effect -- through mix(),
+                          with the real background floor, summed over every owned fragment -- is
+                          bounded below a declared locus tolerance, so it may be dropped.
+
+Exact collapse to one signature class remains SUFFICIENT for demotion and is not required. What is
+required is a bound that holds over the whole domain: a quantity that is only an average, or only a
+per-fragment extreme, is not one. This document previously reported such a quantity as a bound; see
+the note below.
+
+### The false bound
+
+The earlier context statistic summed, over fragments, each fragment's worst spread within ITS OWN
+best group. No single configuration need realise that combination, so it was not an upper bound on
+anything. On C4 it read 32.02 nats beside an actual group-wise difference of 333.61. It has been
+removed rather than renamed, and the gate now uses the observed group-wise maximum over the
+certification domain, doubled by the Lipschitz constant of the mean-one normalisation.

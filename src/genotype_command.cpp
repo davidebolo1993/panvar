@@ -442,6 +442,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
     // COMPATIBILITY ONLY. The model's insert floor is max(|r1|, |r2|); this restores |r1| + |r2|,
     // which declares every overlapping pair impossible.
     bool hybrid_no_overlap_pairs = false;
+    // DECLARED, in nats, on how far normalisation context may move a factor's log psi.
+    double hybrid_context_budget = 1e-3;
     bool hybrid_factor_oracle = false;      // also run the exhaustive oracle and compare
     // REPEATABLE AND POSITIONAL, matched to --hybrid-factor-run in order. Two factors do not
     // supersede the same edges -- F1 over {2,3,4,5} replaces 3-4 and 4-5, F2 over {4,5,6}
@@ -626,6 +628,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--hybrid-higher-report") hybrid_higher_report = require_value(arg);
         else if (arg == "--dump-block-catalogue") dump_block_catalogue = require_value(arg);
         else if (arg == "--no-overlap-pairs") hybrid_no_overlap_pairs = true;
+        else if (arg == "--hybrid-context-budget")
+            hybrid_context_budget = std::stod(require_value(arg));
         else if (arg == "--hybrid-factor-oracle") hybrid_factor_oracle = true;
         else if (arg == "--hybrid-factor-supersede")
             hybrid_factor_supersedes.push_back(require_value(arg));
@@ -2015,6 +2019,9 @@ int run_genotype_command(const std::vector<std::string>& args) {
             std::vector<IntervalFactorTable> built_tables;
             std::vector<std::vector<std::uint32_t>> built_blocks;
             std::vector<std::string> built_supersede;
+            // THE EXACT EVIDENCE each built factor consumed. Counts cannot establish that the
+            // excluded set equals the consumed set; identities can.
+            std::vector<std::vector<std::size_t>> built_evidence;
             std::vector<HybridHigherFactor> higher_factors;
             std::vector<std::vector<std::uint32_t>> higher_hap_allele;
             HigherOrderPlan higher_plan;
@@ -2023,10 +2030,19 @@ int run_genotype_command(const std::vector<std::string>& args) {
             bool higher_active = false;
             // Rendered where `owners` is in scope; printed with the status file later.
             std::vector<std::string> unusable_lines;
+            // ONE BUILDER, declared where the call sites can see it and defined where the
+            // geometry inputs are in scope. Returns whether the factor was actually built.
+            // (normalisation span, evidence scope, superseded edges, report path)
+            std::function<bool(const std::vector<std::uint32_t>&,
+                               const std::vector<std::uint32_t>&,
+                               const std::string&, const std::string&)> build_one_factor;
             std::size_t neutral_pairwise_reported = 0, superseded_reported = 0;
             std::vector<HigherFactorScope> higher_scopes;      // scopes CREDITED to the ledger
             std::vector<HigherFactorScope> planned_only_stored; // what the planner proposed
             std::size_t planned_only_reported = 0;
+            std::size_t factors_asked = 0, factors_made = 0;
+            std::vector<std::string> identity_lines;
+            bool plan_honoured_reported = true, built_equals_inferred_reported = true;
             std::vector<std::size_t> plan_wide_consumed;       // Wide fragments each factor takes
             long min_len_recorded = 0, ip_lo_recorded = 0, ip_hi_recorded = 0;
             double ip_residual_lo = 0.0, ip_residual_hi = 0.0;
@@ -2144,20 +2160,23 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     // Its evidence is the pairwise owners inside the block span plus the Wide
                     // fragments whose whole variable scope lies inside it -- the same rule the
                     // ledger used, so the counts must reconcile with it exactly.
-                    for (std::size_t frun = 0; frun < hybrid_factor_runs.size(); ++frun) {
-                        const std::string& hybrid_factor_run = hybrid_factor_runs[frun];
-                        const std::string hybrid_factor_supersede =
-                            frun < hybrid_factor_supersedes.size()
-                                ? hybrid_factor_supersedes[frun] : std::string();
-                        std::vector<std::string> fp;
-                        std::string fcu;
-                        for (char c : hybrid_factor_run) {
-                            if (c == ',') { fp.push_back(fcu); fcu.clear(); } else fcu.push_back(c);
-                        }
-                        fp.push_back(fcu);
-                        std::vector<std::uint32_t> fbl;
-                        for (std::size_t q = 0; q + 1 < fp.size(); ++q)
-                            fbl.push_back(static_cast<std::uint32_t>(std::stoul(fp[q])));
+                    // ---- THE ONE FACTOR BUILDER ---------------------------------------------
+                    // Explicit --hybrid-factor-run specs and planner-derived specs must construct
+                    // factors through the SAME code. Two builders would be two subtly different
+                    // constructions with only a downstream comparison to notice them diverging,
+                    // and the planner's factors were previously not constructed at all.
+                    //
+                    // Declared here so it captures the geometry inputs; CALLED later, once
+                    // edge_status exists, because supersession follows the pairwise REFUSALS and
+                    // those are not known until every edge has been built. The pipeline order is
+                    //   ownership -> pairwise status -> scopes -> evidence -> geometry/exposure
+                    //   -> build -> resource plan -> completeness -> exclusions -> inference.
+                    build_one_factor = [&](const std::vector<std::uint32_t>& fbl,
+                                           const std::vector<std::uint32_t>& evidence_scope,
+                                           const std::string& hybrid_factor_supersede,
+                                           const std::string& report_path) -> bool {
+                        std::vector<std::string> fp{report_path};
+                        bool built_ok = false;   // set only when a usable table is produced
                         std::set<std::uint32_t> fbs(fbl.begin(), fbl.end());
                         std::vector<std::vector<std::string>> fball(blocks.size());
                         for (std::size_t q = 0; q < blocks.size(); ++q)
@@ -2165,14 +2184,30 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         const IntervalGeometry FG = build_interval_geometry(
                             hyb_cov.frames, fball, block_variable, fbl,
                             static_cast<std::size_t>(ip.hi), ip);
-                        std::ofstream fo(fp.back());
-                        if (!fo) throw std::runtime_error("genotype: cannot write " + fp.back());
+                        std::ofstream fo(report_path);
+                        if (!fo) throw std::runtime_error("genotype: cannot write " + report_path);
                         fo << "field\tvalue\n";
                         std::string fbstr;
                         for (std::size_t q = 0; q < fbl.size(); ++q)
                             fbstr += (q ? "," : "") + std::to_string(fbl[q]);
                         fo << "blocks\t" << fbstr << '\n';
                         fo << "geometry_ok\t" << (FG.ok ? 1 : 0) << '\n';
+                        // EXPOSURE MUST CANCEL, OR THERE IS NO FACTOR. A span whose shortest
+                        // window falls below insert_hi - 1 is not in the affine regime, so the
+                        // straight and crossed exposure sums do not coincide and the mean-one
+                        // normalisation is over a quantity that does not divide out. {3,4,5} on
+                        // C4 has a 506 bp minimum window against a 649 bp boundary at six sigma
+                        // and was being built regardless -- the geometry reported
+                        // exposure_affine 0 and nothing acted on it.
+                        if (FG.ok && !FG.exposure_affine) {
+                            fo << "refusal\texposure does not cancel: min_window "
+                               << FG.min_window << " below the affine boundary "
+                               << (ip.hi - 1) << '\n';
+                            log.info("hybrid factor " + fbstr + ": REFUSED, exposure does not "
+                                     "cancel (min window " + std::to_string(FG.min_window) +
+                                     " < " + std::to_string(ip.hi - 1) + ")");
+                            return false;
+                        }
                         if (!FG.ok) {
                             fo << "refusal\t" << FG.refusal << '\n';
                         } else {
@@ -2218,17 +2253,54 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                 ev.insert(ev.end(), kv.second.begin(), kv.second.end());
                                 n_from_superseded += kv.second.size();
                             }
+                            // EXACT SCOPE, NOT CONTAINMENT. A factor is defined by ONE minimal
+                            // dependency scope and normalises over that scope's content classes.
+                            // Taking every fragment whose scope merely FITS inside the span pools
+                            // {3,4}, {4,5} and {3,4,5} evidence into one normalisation, which is a
+                            // different statistical model -- and one that changes per donor with
+                            // whichever scopes happen to occur. Fragments with a different scope
+                            // belong to their own factor; the two are evaluated together by the
+                            // recurrence, which multiplies their independently normalised values.
+                            //
+                            // `evidence_scope` is the factor's dependency scope. It is NOT the
+                            // span when the span was enlarged for exposure: the extra blocks are
+                            // normalisation context and own no evidence.
                             std::size_t n_wide_in = 0;
                             for (std::size_t fi = 0; fi < hf.size(); ++fi) {
                                 if (owners[fi].kind != OwnerKind::Wide) continue;
-                                bool inside = !owners[fi].var_scope.empty();
-                                for (std::uint32_t b : owners[fi].var_scope)
-                                    if (!fbs.count(b)) { inside = false; break; }
-                                if (inside) { ev.push_back(fi); ++n_wide_in; }
+                                if (owners[fi].var_scope != evidence_scope) continue;
+                                ev.push_back(fi); ++n_wide_in;
                             }
                             std::sort(ev.begin(), ev.end());
                             const std::size_t before_u = ev.size();
                             ev.erase(std::unique(ev.begin(), ev.end()), ev.end());
+                            // SCOPE HOMOGENEITY: a statistical factor normalises over ONE
+                            // dependency scope, so every Wide fragment it consumes must have
+                            // exactly that scope. If evidence from two different scopes were
+                            // pooled before normalising, this is where it shows -- and without
+                            // this check pooling is invisible, because the counts, the identities
+                            // and the exclusions all still balance while the model has changed.
+                            // Superseded-edge owners are the factor's own scope by construction.
+                            std::size_t scope_violations = 0;
+                            for (std::size_t fi : ev) {
+                                if (owners[fi].kind != OwnerKind::Wide) continue;
+                                if (owners[fi].var_scope != evidence_scope) ++scope_violations;
+                            }
+                            fo << "evidence_scope\t";
+                            for (std::size_t q = 0; q < evidence_scope.size(); ++q)
+                                fo << (q ? "," : "") << evidence_scope[q];
+                            fo << '\n';
+                            fo << "evidence_scope_homogeneous\t"
+                               << (scope_violations == 0 ? 1 : 0) << '\n';
+                            if (scope_violations != 0) {
+                                fo << "refusal\t" << scope_violations << " fragment(s) with a "
+                                      "different dependency scope were pooled into this factor\n";
+                                log.info("hybrid factor " + fbstr + ": REFUSED, " +
+                                         std::to_string(scope_violations) + " fragment(s) of a "
+                                         "different dependency scope would be pooled into one "
+                                         "normalisation");
+                                return false;
+                            }
                             fo << "haploid_cells\t" << FG.cells() << '\n';
                             fo << "min_window\t" << FG.min_window << '\n';
                             fo << "exposure_affine\t" << (FG.exposure_affine ? 1 : 0) << '\n';
@@ -2447,13 +2519,135 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                          "classes " + std::to_string(GR.content_classes_raw) +
                                          " -> " + std::to_string(GR.content_classes_grouped));
                             }
+                            // ---- NORMALISATION CONTEXT MUST CARRY NO INFORMATION -------------
+                            // A block added to the span for EXPOSURE is context, not a
+                            // dependency. That is only true if the factor's own evidence cannot
+                            // distinguish its alleles -- i.e. it collapses to ONE signature class.
+                            // With more than one class the block enters the class ordinal and can
+                            // raise effective_m, which changes the mean-one centring log(2^(m-1))
+                            // over a phase dimension the evidence cannot inform. The factor would
+                            // then be a different statistical object from the one the scope
+                            // describes.
+                            //
+                            // Measured on C4: enlarging {4,5} to {4,5,6} leaves block 6 with one
+                            // class and is genuine context, but enlarging {3,4} to {2,3,4} leaves
+                            // block 2 with TWO -- so that enlargement is not context and is
+                            // refused rather than silently redefining the factor.
+                            if (GR.ok) {
+                                std::size_t informative_context = 0;
+                                std::string ctx_detail;
+                                for (std::size_t j = 0; j < FG.blocks.size(); ++j) {
+                                    const std::uint32_t b = FG.blocks[j];
+                                    if (std::find(evidence_scope.begin(), evidence_scope.end(), b)
+                                        != evidence_scope.end()) continue;
+                                    const std::size_t nc = j < GR.classes_per_block.size()
+                                                               ? GR.classes_per_block[j] : 1;
+                                    if (nc > 1) {
+                                        ++informative_context;
+                                        ctx_detail += " block " + std::to_string(b) + " has " +
+                                                      std::to_string(nc) + " classes";
+                                    }
+                                }
+                                fo << "context_blocks_exactly_uninformative\t"
+                                   << (informative_context == 0 ? 1 : 0) << '\n';
+                                fo << "context_detail\t"
+                                   << (ctx_detail.empty() ? "-" : ctx_detail) << '\n';
+                            }
                             // ---- BUILD THE ACTUAL FACTOR -------------------------------------
                             if (GR.ok) {
                                 const auto t_fac = std::chrono::steady_clock::now();
+                                // THE CERTIFICATE, not the structural test. More than one
+                                // signature class at a context block proves the alleles are not
+                                // IDENTICAL; it does not prove the difference matters. What
+                                // matters is how far the full signal-plus-background score can
+                                // move, summed over every owned fragment -- and log psi is a
+                                // logmeanexp of those scores, 1-Lipschitz in the maximum norm, so
+                                // a bound of eps on S gives at most 2*eps on the normalised value.
+                                std::vector<std::size_t> ctx_pos;
+                                for (std::size_t j = 0; j < FG.blocks.size(); ++j)
+                                    if (std::find(evidence_scope.begin(), evidence_scope.end(),
+                                                  FG.blocks[j]) == evidence_scope.end())
+                                        ctx_pos.push_back(j);
+                                // WHICH CELLS A PANEL PATH ACTUALLY CARRIES. Ownership scope is
+                                // certified over panel origins; the factor scores the whole
+                                // Cartesian product, recombinants included. If a context block is
+                                // flat on every panel tuple but decisive off-panel, the two
+                                // disagree for a reason -- and that reason is the caller's own
+                                // ability to represent combinations no path carries.
+                                std::vector<char> on_panel(FG.cells(), 0);
+                                {
+                                    std::vector<std::uint32_t> tup(FG.blocks.size(), 0);
+                                    for (const std::string& nm : hap_names) {
+                                        bool full = true;
+                                        for (std::size_t j = 0; j < FG.blocks.size(); ++j) {
+                                            const auto it =
+                                                blocks[FG.blocks[j]].allele_of.find(nm);
+                                            if (it == blocks[FG.blocks[j]].allele_of.end()) {
+                                                full = false; break;
+                                            }
+                                            tup[j] = static_cast<std::uint32_t>(it->second);
+                                        }
+                                        if (!full) continue;
+                                        const std::size_t ci = FG.cell_index(tup);
+                                        if (ci < on_panel.size()) on_panel[ci] = 1;
+                                    }
+                                }
+                                double ctx_delta = 0.0, ctx_obs = 0.0, ctx_obs_panel = 0.0;
                                 IntervalFactorTable FT = build_interval_factor(
                                     FG, GR, ems_kept, hyb_params.lambda,
                                     std::log1p(-hyb_params.outlier_mix),
-                                    std::log(hyb_params.outlier_mix));
+                                    std::log(hyb_params.outlier_mix),
+                                    ctx_pos.empty() ? nullptr : &ctx_pos,
+                                    ctx_pos.empty() ? nullptr : &ctx_delta,
+                                    ctx_pos.empty() ? nullptr : &on_panel,
+                                    ctx_pos.empty() ? nullptr : &ctx_obs,
+                                    ctx_pos.empty() ? nullptr : &ctx_obs_panel);
+
+                                fo << "context_observed_delta_panel_nats\t"
+                                   << ctx_obs_panel << '\n';
+                                {
+                                    std::size_t np = 0;
+                                    for (char c2 : on_panel) np += (c2 ? 1u : 0u);
+                                    fo << "cells_carried_by_panel\t" << np << " of "
+                                       << FG.cells() << '\n';
+                                }
+                                // log psi is a logmeanexp of the S values and is 1-Lipschitz in
+                                // the maximum norm, so the OBSERVED max-norm difference over the
+                                // certification domain gives 2x that on the normalised value.
+                                // ctx_delta is no longer a separate statistic: the earlier
+                                // per-fragment-extreme sum reported 32.02 where the real
+                                // group-wise difference was 333.61 and must not be quoted.
+                                const double ctx_logpsi_bound = 2.0 * ctx_obs;
+                                fo << "context_observed_max_nats\t" << ctx_obs << '\n';
+                                fo << "context_logpsi_bound_nats\t" << ctx_logpsi_bound << '\n';
+                                fo << "context_budget_nats\t" << hybrid_context_budget << '\n';
+                                fo << "context_certified\t"
+                                   << ((ctx_pos.empty() ||
+                                        ctx_logpsi_bound <= hybrid_context_budget) ? 1 : 0)
+                                   << '\n';
+                                // THE DOMAIN THE CERTIFICATE COVERS. Certifying over panel tuples
+                                // alone is what produced the contradiction: block 2 is flat on
+                                // every panel tuple and worth 340 nats off-panel, and Li-Stephens
+                                // switching can assemble exactly those off-panel combinations.
+                                fo << "context_certification_domain\tfull local allele product\n";
+                                fo << "context_observed_max_panel_only_nats\t"
+                                   << ctx_obs_panel << '\n';
+                                if (!ctx_pos.empty() &&
+                                    ctx_logpsi_bound > hybrid_context_budget) {
+                                    fo << "refusal\tnormalisation context moves log psi by up to "
+                                       << ctx_logpsi_bound << " nats, above the declared budget "
+                                       << hybrid_context_budget << '\n';
+                                    log.info("hybrid factor " + fbstr + ": REFUSED, context bound "
+                                             + std::to_string(ctx_logpsi_bound) + " nats exceeds "
+                                             "the budget " +
+                                             std::to_string(hybrid_context_budget));
+                                    return false;
+                                }
+                                if (!ctx_pos.empty())
+                                    log.info("hybrid factor " + fbstr + ": context CERTIFIED, "
+                                             "log psi moves at most " +
+                                             std::to_string(ctx_logpsi_bound) + " nats (budget " +
+                                             std::to_string(hybrid_context_budget) + ")");
                                 const double fac_s = std::chrono::duration<double>(
                                     std::chrono::steady_clock::now() - t_fac).count();
                                 fo << "factor_ok\t" << (FT.ok ? 1 : 0) << '\n';
@@ -2492,6 +2686,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                     built_tables.push_back(std::move(FT));
                                     built_blocks.push_back(fbl);
                                     built_supersede.push_back(hybrid_factor_supersede);
+                                    built_evidence.push_back(ev);   // the exact fragment IDs
+                                    built_ok = true;
                                 }
                             }
                             const double run_s = std::chrono::duration<double>(
@@ -2550,7 +2746,9 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                         ? ", oracle differ " + std::to_string(cells_differ) + "/" +
                                           std::to_string(org_differ) : ""));
                         }
-                    }
+                        return built_ok;
+                    };
+
                     // ---- THE RECURRENCE, ON THE REAL TABLES -----------------------------------
                     // Not a synthetic loop: the factors just built, the real panel, the real block
                     // chain. EMISSIONS ARE UNIFORM, and deliberately so -- nothing here prunes on
@@ -4089,12 +4287,143 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     // THE FACTOR SCOPES, stated before the transaction so completeness is
                     // assessed against the model that will actually run. Without --hybrid-higher
                     // this is empty and the assessment is the pairwise one, unchanged.
+                    // ---- BUILD EVERY FACTOR, BEFORE ANY READ IS EXCLUDED --------------------
+                    // Both sources of specs -- explicit --hybrid-factor-run and the planner --
+                    // go through build_one_factor. This is the only place factors are made, and
+                    // it runs here rather than earlier because supersession follows the pairwise
+                    // REFUSALS, which are not known until edge_status exists.
+                    if (hybrid_higher || !hybrid_factor_runs.empty()) {
+                        std::vector<std::vector<std::uint32_t>> spec_blocks, spec_evidence;
+                        std::vector<std::string> spec_supersede, spec_report;
+                        if (!hybrid_factor_runs.empty()) {
+                            for (std::size_t frun = 0; frun < hybrid_factor_runs.size(); ++frun) {
+                                std::vector<std::string> fp; std::string fcu;
+                                for (char c : hybrid_factor_runs[frun]) {
+                                    if (c == ',') { fp.push_back(fcu); fcu.clear(); }
+                                    else fcu.push_back(c);
+                                }
+                                fp.push_back(fcu);
+                                std::vector<std::uint32_t> fbl;
+                                for (std::size_t q = 0; q + 1 < fp.size(); ++q)
+                                    fbl.push_back(static_cast<std::uint32_t>(std::stoul(fp[q])));
+                                spec_blocks.push_back(fbl);
+                                spec_evidence.push_back(fbl);   // explicit specs: span == scope
+                                spec_supersede.push_back(frun < hybrid_factor_supersedes.size()
+                                                             ? hybrid_factor_supersedes[frun]
+                                                             : std::string());
+                                spec_report.push_back(fp.back());
+                            }
+                        } else {
+                            const std::vector<HigherFactorScope> plan =
+                                plan_higher_factors(owners, edge_status, blocks.size());
+                            planned_only_stored = plan;
+                            planned_only_reported = plan.size();
+                            for (const HigherFactorScope& f : plan) {
+                                spec_blocks.push_back(f.blocks);
+                                spec_evidence.push_back(f.blocks);   // enlargement may widen the
+                                                                     // span; the scope stays put
+                                std::string sup;
+                                for (std::size_t q = 0; q < f.superseded.size(); ++q)
+                                    sup += (q ? "," : "") +
+                                           std::to_string(f.superseded[q].first) + "-" +
+                                           std::to_string(f.superseded[q].second);
+                                spec_supersede.push_back(sup);
+                                std::string tag;
+                                for (std::size_t q = 0; q < f.blocks.size(); ++q)
+                                    tag += (q ? "_" : "") + std::to_string(f.blocks[q]);
+                                spec_report.push_back(out_prefix + ".factor_" + tag + ".tsv");
+                            }
+                        }
+                        // ---- NORMALISATION SCOPE, ENLARGED DETERMINISTICALLY ---------------
+                        // The EVIDENCE scope is what the fragments depend on. The NORMALISATION
+                        // scope may have to be wider for exposure to cancel, and the two are not
+                        // the same thing: enlarging here adds context, it does not claim the
+                        // factor consumes evidence from the added blocks.
+                        //
+                        // The rule is fixed and independent of any accuracy result: take the
+                        // FEWEST added blocks that reach the affine regime; among equals take the
+                        // smaller allele product; among those still equal take the lower start.
+                        // So {3,4,5} becomes whichever of {2,3,4,5} and {3,4,5,6} is cheaper,
+                        // decided by the catalogue rather than by preference.
+                        const auto affine_ok = [&](const std::vector<std::uint32_t>& fbl) {
+                            std::vector<std::vector<std::string>> fball(blocks.size());
+                            for (std::size_t q = 0; q < blocks.size(); ++q)
+                                fball[q] = blocks[q].allele_seq;
+                            const IntervalGeometry g = build_interval_geometry(
+                                hyb_cov.frames, fball, block_variable, fbl,
+                                static_cast<std::size_t>(ip.hi), ip);
+                            return g.ok && g.exposure_affine;
+                        };
+                        const auto product = [&](std::uint32_t lo, std::uint32_t hi2) {
+                            long double p2 = 1.0L;
+                            for (std::uint32_t b = lo; b <= hi2; ++b)
+                                p2 *= static_cast<long double>(blocks[b].n_alleles);
+                            return p2;
+                        };
+                        for (std::size_t q = 0; q < spec_blocks.size(); ++q) {
+                            if (spec_blocks[q].empty() || affine_ok(spec_blocks[q])) continue;
+                            const std::uint32_t elo = spec_blocks[q].front();
+                            const std::uint32_t ehi = spec_blocks[q].back();
+                            bool fixed = false;
+                            for (std::size_t grow = 1; grow <= blocks.size() && !fixed; ++grow) {
+                                std::vector<std::pair<std::uint32_t, std::uint32_t>> cands;
+                                for (std::size_t left = 0; left <= grow; ++left) {
+                                    const long lo2 = static_cast<long>(elo) -
+                                                     static_cast<long>(left);
+                                    const long hi2 = static_cast<long>(ehi) +
+                                                     static_cast<long>(grow - left);
+                                    if (lo2 < 0 || hi2 >= static_cast<long>(blocks.size())) continue;
+                                    cands.push_back({static_cast<std::uint32_t>(lo2),
+                                                     static_cast<std::uint32_t>(hi2)});
+                                }
+                                std::sort(cands.begin(), cands.end(),
+                                          [&](const auto& a, const auto& b) {
+                                              const long double pa = product(a.first, a.second);
+                                              const long double pb = product(b.first, b.second);
+                                              if (pa != pb) return pa < pb;
+                                              return a.first < b.first;
+                                          });
+                                for (const auto& c : cands) {
+                                    std::vector<std::uint32_t> widened;
+                                    for (std::uint32_t b = c.first; b <= c.second; ++b)
+                                        widened.push_back(b);
+                                    if (!affine_ok(widened)) continue;
+                                    std::string before, after;
+                                    for (std::size_t z = 0; z < spec_blocks[q].size(); ++z)
+                                        before += (z ? "," : "") +
+                                                  std::to_string(spec_blocks[q][z]);
+                                    for (std::size_t z = 0; z < widened.size(); ++z)
+                                        after += (z ? "," : "") + std::to_string(widened[z]);
+                                    log.info("factor {" + before + "}: exposure does not cancel; "
+                                             "normalisation scope enlarged to {" + after +
+                                             "} (fewest added blocks, then smallest allele "
+                                             "product)");
+                                    spec_blocks[q] = widened;
+                                    fixed = true; break;
+                                }
+                            }
+                            if (!fixed)
+                                log.info("factor: exposure does not cancel and no enlargement "
+                                         "within the chain reaches the affine regime; it will "
+                                         "refuse");
+                        }
+                        std::size_t asked = spec_blocks.size(), made = 0;
+                        for (std::size_t q = 0; q < spec_blocks.size(); ++q)
+                            if (build_one_factor(spec_blocks[q], spec_evidence[q],
+                                                 spec_supersede[q], spec_report[q]))
+                                ++made;
+                        factors_asked = asked; factors_made = made;
+                        log.info("factor construction: " + std::to_string(made) + " of " +
+                                 std::to_string(asked) + " specified factor(s) built");
+                    }
+
                     // THE PLANNER, when no factor list was supplied. A hand-written list is fitted
                     // to the reads that produced it; this derives the factors from THIS sample's
                     // own ledger, so a donor whose fragments span blocks nobody anticipated still
                     // gets a factor that consumes them.
                     if (hybrid_higher && hybrid_factor_runs.empty()) {
-                        higher_scopes = plan_higher_factors(owners, edge_status, blocks.size());
+                        // Already planned and BUILT above; this only describes what was planned.
+                        higher_scopes = planned_only_stored;
                         std::string desc;
                         for (const HigherFactorScope& f : higher_scopes) {
                             desc += " {";
@@ -4133,7 +4462,10 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     // what was realised.
                     std::vector<HigherFactorScope> planned_only = planned_only_stored;
                     higher_scopes.clear();
-                    if (!hybrid_factor_runs.empty())
+                    // THE LEDGER TAKES BUILT FACTORS, whatever produced their specs. A planner
+                    // spec that built is as real as an explicit one; a spec that did not build is
+                    // not in this list, so nothing it would have consumed is ever credited.
+                    {
                         for (std::size_t f = 0; f < built_blocks.size(); ++f) {
                             HigherFactorScope hsc;
                             hsc.blocks = built_blocks[f];
@@ -4151,6 +4483,16 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             }
                             higher_scopes.push_back(hsc);
                         }
+                    }
+                    // THE IDENTITY, ENFORCED BEFORE ANYTHING IS EXCLUDED: every factor that was
+                    // specified must have been built. A spec that refused leaves its evidence
+                    // unconsumed, and continuing would exclude reads for a consumer that is not
+                    // there -- which is exactly the failure this branch has already had once.
+                    if (factors_asked != factors_made && higher_refusal.empty()) {
+                        higher_refusal = std::to_string(factors_made) + " of " +
+                                         std::to_string(factors_asked) +
+                                         " specified factors were built";
+                    }
                     hyb_act = plan_hybrid_activation_sparse(hf, owners, edge_status, edge_map,
                                                             maps, blocks.size(), higher_scopes);
                     // ---- THE HIGHER-ORDER TRANSACTION ------------------------------------
@@ -4275,8 +4617,38 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     //
                     // THE INVARIANT: a plan with factors in it must have produced factors that
                     // reached inference, or nothing is excluded and the call is INCOMPLETE.
+                    // planned == built == inferred, by IDENTITY not count: every built factor
+                    // must be in the list passed to inference, and nothing else may be.
+                    bool built_equals_inferred = (higher_factors.size() >=
+                                                  built_tables.size());
+                    for (std::size_t f = 0; f < built_blocks.size() && built_equals_inferred; ++f) {
+                        bool found = false;
+                        for (const HybridHigherFactor& hf2 : higher_factors)
+                            if (hf2.table == &built_tables[f] && hf2.blocks == built_blocks[f])
+                                found = true;
+                        if (!found) built_equals_inferred = false;
+                    }
                     const bool plan_is_honoured =
-                        planned_only.empty() ? true : higher_active;
+                        (factors_asked == factors_made) &&
+                        (planned_only.empty() ? true : higher_active) &&
+                        (built_tables.empty() || built_equals_inferred);
+                    plan_honoured_reported = plan_is_honoured;
+                    built_equals_inferred_reported = built_equals_inferred;
+                    // THE REFUSAL MUST NAME THE ACTUAL FAILURE. "none reached inference" is wrong
+                    // when some did; the three ways a plan can go unhonoured are distinct and a
+                    // reader has to be able to tell them apart.
+                    if (hybrid_higher && !plan_is_honoured && higher_refusal.empty()) {
+                        if (factors_asked != factors_made)
+                            higher_refusal = std::to_string(factors_made) + " of " +
+                                             std::to_string(factors_asked) + " factors built";
+                        else if (!built_equals_inferred)
+                            higher_refusal = std::to_string(built_tables.size()) +
+                                             " factor(s) built but " +
+                                             std::to_string(higher_factors.size()) +
+                                             " reached inference";
+                        else
+                            higher_refusal = "the plan was not honoured";
+                    }
                     if (hybrid_higher && !plan_is_honoured && higher_refusal.empty()) {
                         higher_refusal = "the plan plans " + std::to_string(planned_only.size()) +
                                          " factor(s) but none reached inference";
@@ -4289,6 +4661,60 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         hyb_act.call_status = HybridCallStatus::Incomplete;
                         hyb_act.refusal = "higher-order: " + higher_refusal;
                     }
+                    // ---- EVIDENCE IDENTITY, NOT COUNTS ------------------------------------
+                    // The excluded set must be exactly the union of what the ACTIVE consumers
+                    // took: retained pairwise factors plus built higher-order factors. Counts
+                    // cannot see one fragment missing and another duplicated; sets can. The two
+                    // consumer sets must also be disjoint -- a fragment consumed twice is counted
+                    // twice in the likelihood.
+                    {
+                        std::set<std::string> from_pairwise, from_higher, excluded_set;
+                        bool dup_pairwise = false, dup_higher = false;
+                        for (std::size_t i = 0; i < owners.size() && i < hf.size(); ++i) {
+                            if (owners[i].kind != OwnerKind::Linkage) continue;
+                            bool superseded_here = false;
+                            for (const HigherFactorScope& sc : higher_scopes)
+                                if (sc.supersedes(owners[i].block_lo, owners[i].block_hi))
+                                    superseded_here = true;
+                            if (superseded_here) continue;
+                            const std::uint32_t b2 = owners[i].block_hi;
+                            if (b2 < hyb_act.sparse_kernel_edges.size() &&
+                                hyb_act.sparse_kernel_edges[b2].active)
+                                if (!from_pairwise.insert(hf[i].name).second) dup_pairwise = true;
+                        }
+                        for (const std::vector<std::size_t>& ids : built_evidence)
+                            for (std::size_t fi : ids)
+                                if (fi < hf.size())
+                                    if (!from_higher.insert(hf[fi].name).second) dup_higher = true;
+                        for (const std::string& nm : hyb_exclusions) excluded_set.insert(nm);
+                        std::set<std::string> both;
+                        std::set_intersection(from_pairwise.begin(), from_pairwise.end(),
+                                              from_higher.begin(), from_higher.end(),
+                                              std::inserter(both, both.begin()));
+                        std::set<std::string> uni = from_pairwise;
+                        uni.insert(from_higher.begin(), from_higher.end());
+                        std::set<std::string> miss, extra;
+                        std::set_difference(uni.begin(), uni.end(), excluded_set.begin(),
+                                            excluded_set.end(), std::inserter(miss, miss.begin()));
+                        std::set_difference(excluded_set.begin(), excluded_set.end(),
+                                            uni.begin(), uni.end(),
+                                            std::inserter(extra, extra.begin()));
+                        identity_lines.push_back("consumed_by_pairwise\t" +
+                                                 std::to_string(from_pairwise.size()) + "\n");
+                        identity_lines.push_back("consumed_by_higher\t" +
+                                                 std::to_string(from_higher.size()) + "\n");
+                        identity_lines.push_back(std::string("consumer_sets_disjoint\t") +
+                                                 (both.empty() ? "1" : "0") + "\n");
+                        identity_lines.push_back(std::string("consumed_without_duplicates\t") +
+                                                 ((dup_pairwise || dup_higher) ? "0" : "1") + "\n");
+                        identity_lines.push_back(std::string("excluded_ids_equal_consumed_ids\t") +
+                                                 ((uni == excluded_set) ? "1" : "0") + "\n");
+                        identity_lines.push_back("consumed_but_not_excluded\t" +
+                                                 std::to_string(miss.size()) + "\n");
+                        identity_lines.push_back("excluded_but_not_consumed\t" +
+                                                 std::to_string(extra.size()) + "\n");
+                    }
+
                     }   // end of the verified-window budget else
                     }   // end of the overflow guard else
                 }
@@ -4411,8 +4837,11 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     hs << "factor_scopes_credited_to_ledger\t" << higher_scopes.size() << '\n';
                     // THE INVARIANT, REPORTED. planned == built == reached inference, or the call
                     // is not a higher-order call at all.
-                    hs << "factor_plan_honoured\t"
-                       << ((higher_scopes.empty() || higher_active) ? 1 : 0) << '\n';
+                    // REPORTED FROM THE ENFORCED CONDITION, not a second expression that can
+                    // disagree with it -- which it did, printing honoured=1 next to a refusal.
+                    hs << "factor_plan_honoured\t" << (plan_honoured_reported ? 1 : 0) << '\n';
+                    hs << "built_equals_inferred\t"
+                       << (built_equals_inferred_reported ? 1 : 0) << '\n';
                     for (const HigherFactorScope& f : planned_only_stored) {
                         hs << "factor_plan\t";
                         for (std::size_t q = 0; q < f.blocks.size(); ++q)
@@ -4428,7 +4857,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                << f.superseded[q].second;
                         hs << '\n';
                     }
-                    hs << "higher_order_active\t" << (higher_active ? 1 : 0) << '\n';
+                    hs << "higher_order_active\t"
+                       << ((higher_active && plan_honoured_reported) ? 1 : 0) << '\n';
                     hs << "higher_order_refusal\t"
                        << (higher_refusal.empty() ? "-" : higher_refusal) << '\n';
                     if (hybrid_higher) {
@@ -4505,6 +4935,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     hs << "consumed_higher_superseded\t"
                        << hyb_act.report.consumed_higher_superseded << '\n';
                     hs << "consumed_fragments\t" << hyb_act.consumed_fragments << '\n';
+                    for (const std::string& ln : identity_lines) hs << ln;
                     hs << "excluded_equals_consumed\t"
                        << ((hyb_act.excluded_fragments.size() == hyb_act.consumed_fragments &&
                             hyb_exclusions.size() == hyb_act.consumed_fragments) ? 1 : 0) << '\n';

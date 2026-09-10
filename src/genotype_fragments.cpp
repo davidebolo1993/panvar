@@ -5893,7 +5893,12 @@ double IntervalFactorTable::log_psi_classes(const std::vector<std::uint32_t>& cl
 IntervalFactorTable build_interval_factor(const IntervalGeometry& geom,
                                           const IntervalGrouping& grouping,
                                           const std::vector<IntervalEmission>& emissions,
-                                          double lambda, double log_mix, double log_bg_weight) {
+                                          double lambda, double log_mix, double log_bg_weight,
+                                          const std::vector<std::size_t>* context_positions,
+                                          double* worst_context_delta,
+                                          const std::vector<char>* cell_on_panel,
+                                          double* observed_context_delta,
+                                          double* observed_context_delta_panel) {
     IntervalFactorTable T;
     const std::size_t k = geom.alleles.size();
     if (!grouping.ok) { T.refusal = "grouping is not usable"; return T; }
@@ -5934,6 +5939,62 @@ IntervalFactorTable build_interval_factor(const IntervalGeometry& geom,
         const double bg = log_bg_weight + log_p_bg;
         return (sig == kNegInf) ? bg : log_add(sig, bg);
     };
+
+    // ---- THE CONTEXT CERTIFICATE ------------------------------------------------------------
+    // How far can S move when ONLY the normalisation-context blocks change? Cells are grouped by
+    // their choices at the evidence positions; within a group only context alleles differ. For
+    // each fragment the extreme masses in its group bound that fragment's contribution swing
+    // through the REAL mixture -- mix() with its own background floor -- and the sum over
+    // fragments bounds the swing in S. This is a certificate, not an estimate: it is the worst
+    // case over every group and every fragment.
+    if (context_positions != nullptr && worst_context_delta != nullptr) {
+        *worst_context_delta = 0.0;
+        std::map<std::vector<std::uint32_t>, std::vector<std::size_t>> groups;
+        std::vector<std::uint32_t> ch;
+        for (std::size_t c = 0; c < geom.cells(); ++c) {
+            geom.cell_choice(c, ch);
+            std::vector<std::uint32_t> key;
+            for (std::size_t j2 = 0; j2 < ch.size(); ++j2)
+                if (std::find(context_positions->begin(), context_positions->end(), j2) ==
+                    context_positions->end())
+                    key.push_back(ch[j2]);
+            groups[key].push_back(c);
+        }
+        // OBSERVED, not bounded: for each group, the actual S at every context choice, summed
+        // over ALL fragments at the SAME configuration. The spread of those is a difference the
+        // model can really exhibit. The per-fragment sum below is an upper bound instead: each
+        // fragment is allowed its own worst group, which no single configuration need realise.
+        if (observed_context_delta != nullptr) {
+            double obs = 0.0, obs_panel = 0.0;
+            for (const auto& kv : groups) {
+                if (kv.second.size() < 2) continue;
+                double lo3 = std::numeric_limits<double>::infinity(), hi3 = -lo3;
+                double lo3p = lo3, hi3p = hi3;
+                for (std::size_t c : kv.second) {
+                    double acc2 = 0.0;
+                    for (const IntervalEmission& E : emissions)
+                        acc2 += mix(E.mass[c], E.mass[c], E.log_p_bg);
+                    lo3 = std::min(lo3, acc2); hi3 = std::max(hi3, acc2);
+                    if (cell_on_panel != nullptr && c < cell_on_panel->size() &&
+                        (*cell_on_panel)[c]) {
+                        lo3p = std::min(lo3p, acc2); hi3p = std::max(hi3p, acc2);
+                    }
+                }
+                if (hi3 > lo3) obs = std::max(obs, hi3 - lo3);
+                if (hi3p > lo3p) obs_panel = std::max(obs_panel, hi3p - lo3p);
+            }
+            *observed_context_delta = obs;
+            if (observed_context_delta_panel != nullptr) *observed_context_delta_panel = obs_panel;
+        }
+        // THE PER-FRAGMENT-EXTREME SUM IS REMOVED. It summed each fragment's worst spread over
+        // ITS OWN best group, which no single configuration need realise, and it was reported and
+        // gated on as if it were an upper bound. On C4 it read 32.02 nats while the ACTUAL
+        // group-wise difference was 333.61 -- a "bound" an order of magnitude below the thing it
+        // claimed to bound. The observed group-wise maximum above is the max-norm difference over
+        // the certification domain, and that is what the Lipschitz argument needs.
+        if (worst_context_delta != nullptr && observed_context_delta != nullptr)
+            *worst_context_delta = *observed_context_delta;
+    }
     // Walk every content class in the same mixed-radix order log_psi uses.
     std::vector<std::size_t> pidx(k, 0);
     std::vector<std::uint32_t> lo(k, 0), hi(k, 0), h1(k, 0), h2(k, 0);
@@ -6658,45 +6719,55 @@ std::vector<HigherFactorScope> plan_higher_factors(
     const std::vector<FragmentOwner>& owners,
     const std::vector<EdgeStatusEntry>& edge_status,
     std::size_t n_blocks) {
-    // 1 + 2: every Wide fragment's minimal certified scope, closed over [min, max].
-    std::set<std::pair<std::uint32_t, std::uint32_t>> spans;
+    // ONE STATISTICAL FACTOR PER EXACT MINIMAL DEPENDENCY SCOPE.
+    //
+    // An earlier version dropped any scope contained in another, so fragments depending on
+    // {3,4}, {4,5} and {3,4,5} were pooled into a single factor over {3,4,5} and normalised
+    // ONCE. That silently changes the statistical model, and changes it PER DONOR: which scopes
+    // happen to appear decides how the rest of the evidence is normalised. Mean-one
+    // normalisation is defined over a factor's own content classes, so pooling distinct
+    // dependency scopes before normalising is a different model, not an optimisation.
+    //
+    // So containment no longer merges anything. Each distinct scope keeps its own factor and its
+    // own normalisation. Factors that overlap are evaluated together by the recurrence -- the
+    // history already carries the common refinement of every factor touching a block -- and that
+    // shared evaluation is an INFERENCE CLIQUE: it owns no evidence and performs no
+    // normalisation, it only multiplies independently normalised potentials.
+    std::set<std::vector<std::uint32_t>> scopes;
     for (const FragmentOwner& o : owners) {
         if (o.kind != OwnerKind::Wide || o.var_scope.empty()) continue;
         std::uint32_t lo = o.var_scope.front(), hi = o.var_scope.front();
         for (std::uint32_t b : o.var_scope) { lo = std::min(lo, b); hi = std::max(hi, b); }
-        if (hi < n_blocks) spans.insert({lo, hi});
+        if (hi >= n_blocks) continue;
+        std::vector<std::uint32_t> sp;              // contiguous closure, the only enlargement
+        for (std::uint32_t b = lo; b <= hi; ++b) sp.push_back(b);
+        scopes.insert(sp);
     }
-    // 3: drop any span contained in another.
-    std::vector<std::pair<std::uint32_t, std::uint32_t>> keep;
-    for (const auto& a : spans) {
-        bool contained = false;
-        for (const auto& b : spans) {
-            if (a == b) continue;
-            if (b.first <= a.first && a.second <= b.second) { contained = true; break; }
-        }
-        if (!contained) keep.push_back(a);
-    }
-    std::sort(keep.begin(), keep.end());
-    std::vector<HigherFactorScope> out;
-    for (const auto& sp : keep) {
-        HigherFactorScope f;
-        for (std::uint32_t b = sp.first; b <= sp.second; ++b) f.blocks.push_back(b);
-        out.push_back(std::move(f));
-    }
-    // 4: a REFUSED edge's owners have no consumer, so they transfer to the smallest span
-    // containing both endpoints. A usable edge transfers nothing and is never superseded.
+    // A REFUSED pairwise edge leaves its owners with no consumer, and those owners depend on
+    // exactly two blocks. That is its own minimal scope and therefore its own factor -- not
+    // evidence to be folded into whichever wider factor happens to span it.
+    std::set<std::vector<std::uint32_t>> from_edges;
     for (const EdgeStatusEntry& e : edge_status) {
         if (e.status == LinkageStatus::Ok) continue;
-        long best = -1; std::size_t best_w = 0;
-        for (std::size_t i = 0; i < out.size(); ++i) {
-            const auto& bl = out[i].blocks;
-            if (bl.empty() || e.block_a < bl.front() || e.block_b > bl.back()) continue;
-            const std::size_t w = bl.size();
-            if (best < 0 || w < best_w) { best = static_cast<long>(i); best_w = w; }
-        }
-        if (best >= 0) out[static_cast<std::size_t>(best)].superseded.push_back(
-            {e.block_a, e.block_b});
+        if (e.block_b >= n_blocks || e.n_fragments == 0) continue;
+        std::vector<std::uint32_t> sp;
+        for (std::uint32_t b = e.block_a; b <= e.block_b; ++b) sp.push_back(b);
+        scopes.insert(sp);
+        from_edges.insert(sp);
     }
+    std::vector<HigherFactorScope> out;
+    for (const std::vector<std::uint32_t>& sp : scopes) {
+        HigherFactorScope f;
+        f.blocks = sp;
+        // A factor built on a refused edge's scope supersedes THAT edge and nothing else.
+        if (from_edges.count(sp) && sp.size() >= 2)
+            f.superseded.push_back({sp.front(), sp.back()});
+        out.push_back(std::move(f));
+    }
+    std::sort(out.begin(), out.end(),
+              [](const HigherFactorScope& a, const HigherFactorScope& b) {
+                  return a.blocks < b.blocks;
+              });
     return out;
 }
 

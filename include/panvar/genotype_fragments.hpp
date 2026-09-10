@@ -2044,10 +2044,32 @@ struct IntervalFactorTable {
 // Build it from the per-fragment emissions over this factor's geometry. `emissions[f].mass[cell]`
 // is the haploid mass; the diploid combination, the normalisation and the bound all happen here,
 // once, so there is no second implementation for a caller to drift from.
+// `context_positions` names block positions that are NORMALISATION CONTEXT: present in the span
+// for exposure, owning no evidence. When given, `worst_context_delta` receives a CERTIFICATE --
+// an upper bound, in nats, on how much the raw diploid score S can move when only those blocks'
+// alleles change.
+//
+// EXACT COLLAPSE (one signature class) is sufficient but not necessary. What matters is whether
+// the difference is statistically meaningful, and that is a bound on the FULL signal-plus-
+// background contribution -- computed through mix(), with the real background floor and every
+// owned fragment -- not on raw placement mass. Since log psi is a logmeanexp of S values, which
+// is 1-Lipschitz in the maximum norm, a uniform bound of eps on S gives at most 2*eps on the
+// normalised log psi.
 IntervalFactorTable build_interval_factor(const IntervalGeometry& geom,
                                           const IntervalGrouping& grouping,
                                           const std::vector<IntervalEmission>& emissions,
-                                          double lambda, double log_mix, double log_bg_weight);
+                                          double lambda, double log_mix, double log_bg_weight,
+                                          const std::vector<std::size_t>* context_positions = nullptr,
+                                          double* worst_context_delta = nullptr,
+                                          // Per cell: 1 if some PANEL haplotype carries that exact
+                                          // allele tuple. Ownership scope is certified over panel
+                                          // origins, but the factor scores the whole Cartesian
+                                          // product including recombinants no path carries -- so a
+                                          // block can be irrelevant on every panel haplotype and
+                                          // decisive off-panel. These separate the two.
+                                          const std::vector<char>* cell_on_panel = nullptr,
+                                          double* observed_context_delta = nullptr,
+                                          double* observed_context_delta_panel = nullptr);
 
 // ---- HIGHER-ORDER MEAN-ONE NORMALISATION -----------------------------------------------------
 //
