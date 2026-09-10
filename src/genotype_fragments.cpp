@@ -7845,6 +7845,527 @@ ScopeOracleLocusResult aggregate_scope_oracle(
 }
 
 
+
+// ---- THE OPTIMIZED SCOPE CERTIFIER -----------------------------------------------------------
+namespace {
+
+struct CertPlacement {
+    std::uint32_t block = 0; std::size_t off = 0;          // first base
+    std::uint32_t end_block = 0; std::size_t end_off = 0;  // ONE PAST the last base
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> constraint;
+    std::size_t edits = 0;
+    bool operator<(const CertPlacement& o) const {
+        return std::tie(block, off, end_block, end_off, constraint, edits) <
+               std::tie(o.block, o.off, o.end_block, o.end_off, o.constraint, o.edits);
+    }
+};
+
+// Build every template of `need` bases starting at (b, a, o), enumerating the alleles of the
+// following blocks. THIS is the local region: it stops as soon as the read is covered, so an
+// origin constrains a consecutive run and nothing else. Blocks past the run stay free.
+void cert_expand(const ScopeOracleLocus& L, std::uint32_t b, std::uint32_t a, std::size_t o,
+                 std::size_t need, std::string tmpl,
+                 std::vector<std::pair<std::uint32_t, std::uint32_t>> cons,
+                 std::vector<std::pair<std::string, CertPlacement>>& out,
+                 std::size_t& work, const CertifierParams& cp, bool& overflow) {
+    if (overflow || ++work > cp.max_contexts) { overflow = true; return; }
+    if (b >= L.blocks() || a >= L.block_alleles[b].size()) return;
+    if (cp.mut_no_multi_boundary && cons.size() >= 2) return;
+    const std::string& seq = L.block_alleles[b][a];
+    cons.push_back({b, a});
+    const std::size_t take = std::min(seq.size() - std::min(o, seq.size()), need - tmpl.size());
+    tmpl += seq.substr(std::min(o, seq.size()), take);
+    if (tmpl.size() == need) {
+        CertPlacement p;
+        p.end_block = b; p.end_off = o + take;
+        p.constraint = cons;
+        out.push_back({tmpl, p});
+        return;
+    }
+    // Not covered yet: continue into the next block, every allele of it. A short allele here is
+    // what opens a multi-boundary case, and the work guard is what keeps it finite.
+    for (std::uint32_t a2 = 0; a2 + 1 <= L.block_alleles[b + 1 < L.blocks() ? b + 1 : 0].size() &&
+                               b + 1 < L.blocks(); ++a2)
+        cert_expand(L, b + 1, a2, 0, need, tmpl, cons, out, work, cp, overflow);
+}
+
+// Every placement of `read` with at most `d` edits, over the WHOLE locus and the full allele
+// product, found by scanning every start. Complete by construction -- no pigeonhole argument is
+// needed because nothing is skipped -- and linear in the total allele length, not in the product.
+std::vector<CertPlacement> cert_scan(const ScopeOracleLocus& L, const std::string& read,
+                                     std::size_t d, const CertifierParams& cp, bool& overflow,
+                                     std::size_t& contexts) {
+    std::vector<CertPlacement> out;
+    for (std::uint32_t b = 0; b < L.blocks(); ++b)
+        for (std::uint32_t a = 0; a < L.block_alleles[b].size(); ++a)
+            for (std::size_t o = 0; o < L.block_alleles[b][a].size(); ++o) {
+                std::vector<std::pair<std::string, CertPlacement>> ctx;
+                std::size_t work = 0;
+                cert_expand(L, b, a, o, read.size(), std::string(), {}, ctx, work, cp, overflow);
+                contexts += ctx.size();
+                for (auto& cw : ctx) {
+                    if (cw.first.size() != read.size()) continue;
+                    std::size_t e = 0;
+                    for (std::size_t i = 0; i < read.size() && e <= d; ++i)
+                        if (cw.first[i] != read[i]) ++e;
+                    if (e > d) continue;
+                    cw.second.block = b; cw.second.off = o; cw.second.edits = e;
+                    out.push_back(cw.second);
+                }
+            }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end(), [](const CertPlacement& x,
+                                                     const CertPlacement& y) {
+        return !(x < y) && !(y < x);
+    }), out.end());
+    return out;
+}
+
+// The same set, reached by PIGEONHOLE. A placement with at most d edits leaves at least one of
+// its d+1 disjoint pieces exact, so a seed index over allele interiors and junctions must find
+// it. Verified against cert_scan on the fixture: this is the path that makes C4 tractable, and
+// an unverified fast path is how a search silently stops being complete.
+std::vector<CertPlacement> cert_seeded(const ScopeOracleLocus& L, const LocusIndex& ix,
+                                       const std::string& read, std::size_t d,
+                                       const CertifierParams& cp, bool& overflow,
+                                       std::size_t& contexts, std::size_t& seeds) {
+    std::vector<CertPlacement> out;
+    const std::size_t k = ix.k;
+    if (k == 0 || read.size() < k * (d + 1)) { overflow = true; return out; }
+    std::set<std::pair<std::uint32_t, std::pair<std::uint32_t, std::size_t>>> starts;
+    for (std::size_t i = 0; i <= d; ++i) {
+        const std::string piece = read.substr(i * k, k);
+        const auto it = ix.at.find(piece);
+        if (it == ix.at.end()) continue;
+        for (const LocusIndex::Seed& sd : it->second) {
+            ++seeds;
+            // The read would start i*k bases before the seed. Inside this allele, or -- when that
+            // runs off its front -- inside some allele of an earlier block, every one of which is
+            // a candidate: the walk back must not assume which.
+            const long want = static_cast<long>(sd.offset) - static_cast<long>(i * k);
+            if (want >= 0) {
+                starts.insert({sd.block, {sd.allele, static_cast<std::size_t>(want)}});
+                continue;
+            }
+            long deficit = -want;
+            for (long pb = static_cast<long>(sd.block) - 1; pb >= 0 && deficit > 0; --pb) {
+                for (std::uint32_t pa = 0; pa < L.block_alleles[pb].size(); ++pa) {
+                    const long plen = static_cast<long>(L.block_alleles[pb][pa].size());
+                    if (plen >= deficit)
+                        starts.insert({static_cast<std::uint32_t>(pb),
+                                       {pa, static_cast<std::size_t>(plen - deficit)}});
+                }
+                long shortest = std::numeric_limits<long>::max();
+                for (const std::string& s2 : L.block_alleles[pb])
+                    shortest = std::min(shortest, static_cast<long>(s2.size()));
+                deficit -= shortest;
+            }
+        }
+    }
+    for (const auto& st : starts) {
+        std::vector<std::pair<std::string, CertPlacement>> ctx;
+        std::size_t work = 0;
+        cert_expand(L, st.first, st.second.first, st.second.second, read.size(), std::string(),
+                    {}, ctx, work, cp, overflow);
+        contexts += ctx.size();
+        for (auto& cw : ctx) {
+            if (cw.first.size() != read.size()) continue;
+            std::size_t e = 0;
+            for (std::size_t i = 0; i < read.size() && e <= d; ++i)
+                if (cw.first[i] != read[i]) ++e;
+            if (e > d) continue;
+            cw.second.block = st.first; cw.second.off = st.second.second; cw.second.edits = e;
+            out.push_back(cw.second);
+        }
+    }
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end(), [](const CertPlacement& x,
+                                                     const CertPlacement& y) {
+        return !(x < y) && !(y < x);
+    }), out.end());
+    return out;
+}
+
+}  // namespace
+
+LocusIndex build_locus_index(const ScopeOracleLocus& locus, std::size_t k,
+                             const CertifierParams& cp) {
+    LocusIndex ix;
+    ix.k = k;
+    if (k == 0) { ix.refusal = "seed length zero"; return ix; }
+    ix.allele_len.resize(locus.blocks());
+    ix.len_classes.resize(locus.blocks());
+    for (std::size_t b = 0; b < locus.blocks(); ++b) {
+        std::set<std::size_t> ls;
+        for (const std::string& s : locus.block_alleles[b]) {
+            ix.allele_len[b].push_back(s.size());
+            ls.insert(s.size());
+        }
+        ix.len_classes[b].assign(ls.begin(), ls.end());
+    }
+    // PANEL-INDEPENDENT BY CONSTRUCTION: a function of the alleles alone. Interiors, then every
+    // adjacent junction, then the short runs a k-mer can cross. Nothing here has ever seen a path.
+    std::size_t n = 0;
+    for (std::uint32_t b = 0; b < locus.blocks(); ++b)
+        for (std::uint32_t a = 0; a < locus.block_alleles[b].size(); ++a) {
+            const std::string& s = locus.block_alleles[b][a];
+            for (std::size_t o = 0; o + k <= s.size(); ++o) {
+                ix.at[s.substr(o, k)].push_back({b, a, static_cast<std::uint32_t>(o)});
+                if (++n > cp.max_seed_positions) {
+                    ix.refusal = "seed index exceeds " + std::to_string(cp.max_seed_positions) +
+                                 " positions";
+                    return ix;
+                }
+            }
+            // Junction and multi-boundary k-mers: start in this allele's tail and continue into
+            // the following blocks, every allele, until k bases are covered.
+            const std::size_t first = s.size() >= k ? s.size() - k + 1 : 0;
+            for (std::size_t o = first; o < s.size() && !cp.mut_no_junction_seeds; ++o) {
+                bool ovf = false;
+                std::vector<std::pair<std::string, CertPlacement>> ctx;
+                std::size_t work = 0;
+                CertifierParams cp2 = cp;
+                cp2.max_contexts = cp.max_short_run;
+                cert_expand(locus, b, a, o, k, std::string(), {}, ctx, work, cp2, ovf);
+                for (const auto& cw : ctx)
+                    if (cw.first.size() == k) {
+                        ix.at[cw.first].push_back({b, a, static_cast<std::uint32_t>(o)});
+                        if (++n > cp.max_seed_positions) {
+                            ix.refusal = "seed index exceeds " +
+                                         std::to_string(cp.max_seed_positions) + " positions";
+                            return ix;
+                        }
+                    }
+            }
+        }
+    return ix;
+}
+
+
+CertifierResult certify_fragment_scope(const ScopeOracleLocus& locus, const LocusIndex& index,
+                                       const std::string& r1, const std::string& r2,
+                                       const ScopeOracleParams& prm, const CertifierParams& cp) {
+    CertifierResult R;
+    const double kNI = -std::numeric_limits<double>::infinity();
+    const std::size_t nb = locus.blocks();
+    R.block_delta.assign(nb, 0.0);
+    if (!index.usable()) { R.refusal = "index: " + index.refusal; return R; }
+
+    // ---- 1 + 2. SYMBOLIC ORIGIN DISCOVERY, LOCUS-WIDE ---------------------------------------
+    // Both mates, both orientations, over the whole locus. Never seeded from a placement or a
+    // prior scope: a fragment with origins in two distant repeats has BOTH found here, and a
+    // search that started from one of them would call the other region independent.
+    bool ovf = false;
+    std::size_t ctxs = 0, seeds = 0;
+    const std::string a1 = reverse_complement(r1), a2 = reverse_complement(r2);
+    const auto find_all = [&](const std::string& rd) {
+        return cp.use_seeds ? cert_seeded(locus, index, rd, cp.band_edits, cp, ovf, ctxs, seeds)
+                            : cert_scan(locus, rd, cp.band_edits, cp, ovf, ctxs);
+    };
+    const std::vector<CertPlacement> f1 = find_all(r1);
+    const std::vector<CertPlacement> v1 = find_all(a1);
+    const std::vector<CertPlacement> f2 = find_all(r2);
+    const std::vector<CertPlacement> v2 = find_all(a2);
+    R.contexts_examined = ctxs; R.seeds_examined = seeds;
+    // A REFUSAL MUST NAME EVERY BLOCK IT COULD NOT DECIDE. Returning an empty uncertified list
+    // beside a refusal invites exactly the reading this whole exercise exists to stop: an empty
+    // set of problems. Nothing was decided here, so nothing is certified.
+    const auto refuse_all = [&](const std::string& why) {
+        R.refusal = why;
+        R.uncertified_blocks.clear();
+        for (std::uint32_t b = 0; b < nb; ++b) R.uncertified_blocks.push_back(b);
+        R.structural_scope.clear();
+        R.witnesses.clear();
+    };
+    if (ovf) { refuse_all("context expansion exceeded the work budget"); return R; }
+
+    // ---- THE JOIN, BY THE EXACT INSERT RULE -------------------------------------------------
+    const auto read_ll = [&](std::size_t e, std::size_t len) {
+        return static_cast<double>(e) * prm.log_eps +
+               static_cast<double>(len - e) * prm.log_1meps;
+    };
+    const double log_half = std::log(0.5);
+    const auto join = [&](const std::vector<CertPlacement>& fwd,
+                          const std::vector<CertPlacement>& rev,
+                          std::size_t flen, std::size_t rlen, bool m1_forward) {
+        for (const CertPlacement& pf : fwd)
+            for (const CertPlacement& pr : rev) {
+                if (pr.end_block < pf.block) continue;          // reverse mate upstream: not FR
+                // Consistency: where both pin a block they must agree, or this pair of placements
+                // describes no haplotype at all.
+                std::map<std::uint32_t, std::uint32_t> merged;
+                bool clash = false;
+                for (const auto& c : pf.constraint) merged[c.first] = c.second;
+                for (const auto& c : pr.constraint) {
+                    const auto it = merged.find(c.first);
+                    if (it != merged.end() && it->second != c.second) { clash = true; break; }
+                    merged[c.first] = c.second;
+                }
+                if (clash) continue;
+                // insert = sum of block lengths from pf.block to pr.end_block-1, less the start
+                // offset, plus the end offset. Blocks in that span that NEITHER mate reads still
+                // move the insert whenever their alleles differ in length -- a real dependency
+                // through pi(L) alone, recorded as a length constraint rather than ignored.
+                long known = 0;
+                std::vector<std::uint32_t> free_blocks;
+                for (std::uint32_t c = pf.block; c < pr.end_block; ++c) {
+                    const auto it = merged.find(c);
+                    if (it != merged.end()) {
+                        known += static_cast<long>(locus.block_alleles[c][it->second].size());
+                    } else if (index.len_classes[c].size() == 1) {
+                        known += static_cast<long>(index.len_classes[c][0]);
+                    } else {
+                        free_blocks.push_back(c);
+                    }
+                }
+                std::size_t combos = 1;
+                for (std::uint32_t c : free_blocks) combos *= index.len_classes[c].size();
+                if (combos > cp.max_short_run * 16) {
+                    R.uncertified_blocks.insert(R.uncertified_blocks.end(),
+                                                free_blocks.begin(), free_blocks.end());
+                    continue;
+                }
+                for (std::size_t ci = 0; ci < combos; ++ci) {
+                    long extra = 0;
+                    std::size_t rest = ci;
+                    std::vector<std::pair<std::uint32_t, std::size_t>> lc;
+                    for (std::uint32_t c : free_blocks) {
+                        const std::size_t n = index.len_classes[c].size();
+                        const std::size_t pick = rest % n; rest /= n;
+                        extra += static_cast<long>(index.len_classes[c][pick]);
+                        lc.push_back({c, index.len_classes[c][pick]});
+                    }
+                    const long insert = known + extra - static_cast<long>(pf.off) +
+                                        static_cast<long>(pr.end_off);
+                    if (insert < prm.insert_lo || insert > prm.insert_hi) continue;
+                    SymbolicOrigin so;
+                    for (const auto& kv : merged) so.allele_constraint.push_back(kv);
+                    so.length_constraint = lc;
+                    so.fwd_block = pf.block; so.fwd_off = pf.off;
+                    so.rev_block = pr.end_block; so.rev_off = pr.end_off;
+                    so.insert = insert; so.m1_forward = m1_forward;
+                    so.edits = pf.edits + pr.edits;
+                    // Mass is a function of the CONSTRAINT alone, which is what lets every tuple
+                    // compatible with it share one value and the free blocks stay unenumerated.
+                    (void)read_ll; (void)flen; (void)rlen; (void)log_half;
+                    R.origins.push_back(std::move(so));
+                }
+            }
+    };
+    join(f1, v2, r1.size(), r2.size(), true);
+    if (!cp.mut_one_orientation) join(f2, v1, r2.size(), r1.size(), false);
+    // Deduplicate on PHYSICAL IDENTITY only. Two origins with equal edits and equal insert at
+    // different places are two origins, and collapsing them loses exactly their multiplicity.
+    std::vector<SymbolicOrigin> uniq;
+    for (const SymbolicOrigin& o : R.origins) {
+        bool dup = false;
+        for (const SymbolicOrigin& u : uniq) if (u.same_place_as(o)) { dup = true; break; }
+        if (!dup) uniq.push_back(o);
+    }
+    R.origins = std::move(uniq);
+    if (cp.mut_drop_one_origin && !R.origins.empty()) {
+        // The BEST origin, not an arbitrary one: with a wide band the tail holds thousands of
+        // negligible placements and removing one of those is not a defect anyone could observe.
+        // Losing one copy of a tandem repeat is, and this is what that looks like.
+        std::size_t best = 0;
+        for (std::size_t q = 1; q < R.origins.size(); ++q)
+            if (R.origins[q].edits < R.origins[best].edits) best = q;
+        R.origins.erase(R.origins.begin() + static_cast<long>(best));
+    }
+    if (cp.mut_nearest_region_only && !R.origins.empty()) {
+        std::uint32_t lo = R.origins.front().fwd_block;
+        for (const SymbolicOrigin& o : R.origins) lo = std::min(lo, o.fwd_block);
+        std::vector<SymbolicOrigin> near;
+        for (const SymbolicOrigin& o : R.origins) if (o.fwd_block == lo) near.push_back(o);
+        R.origins = std::move(near);
+    }
+
+    // ---- 4. BOUND THE COMPLEMENT ------------------------------------------------------------
+    // Everything past the verified band still has finite Hamming mass. Bound the NUMBER of
+    // omitted (start, insert, orientation) states on one haplotype and their maximum emission,
+    // and carry the product into the same global ledger every demotion is paid from. Calling the
+    // unsearched region independent is the one thing that is not allowed.
+    {
+        std::size_t locus_len = 0;
+        for (std::size_t b = 0; b < nb; ++b) {
+            std::size_t longest = 0;
+            for (const std::string& s : locus.block_alleles[b]) longest = std::max(longest, s.size());
+            locus_len += longest;
+        }
+        const double n_states = static_cast<double>(locus_len) *
+                                static_cast<double>(prm.insert_hi - prm.insert_lo + 1) * 2.0;
+        const std::size_t total_len = r1.size() + r2.size();
+        const std::size_t e = cp.band_edits + 1;                 // the cheapest omitted state
+        const double max_emission = log_half + read_ll(e, total_len) +
+                                    (prm.insert_logp.empty()
+                                         ? 0.0
+                                         : *std::max_element(prm.insert_logp.begin(),
+                                                             prm.insert_logp.end()));
+        R.omitted_bound = cp.mut_no_omitted_tail ? kNI : std::log(n_states) + max_emission;
+    }
+
+    // ---- 5. DEPENDENCY CLOSURE, TO A FIXED POINT --------------------------------------------
+    // The ACTIVE SET is every block any origin constrains -- by allele or by length. A block in
+    // no origin cannot change the in-band emission at all, so it is provably absent from the
+    // scope and the product is taken over the active set alone. That is the whole optimization:
+    // the domain enumerated is local to the origins, not to the locus.
+    std::set<std::uint32_t> active;
+    for (const SymbolicOrigin& o : R.origins) {
+        for (const auto& c : o.allele_constraint) active.insert(c.first);
+        for (const auto& c : o.length_constraint) active.insert(c.first);
+    }
+    if (cp.mut_truncate_closure) {
+        // ONE REGION, NO EXPANSION: the active set taken from the best origin alone. This is what
+        // a scope-guided search does, and on a fragment with origins in two distant repeats it
+        // silently drops the second region.
+        active.clear();
+        std::size_t best = 0;
+        for (std::size_t q = 1; q < R.origins.size(); ++q)
+            if (R.origins[q].edits < R.origins[best].edits) best = q;
+        if (!R.origins.empty()) {
+            for (const auto& c : R.origins[best].allele_constraint) active.insert(c.first);
+            for (const auto& c : R.origins[best].length_constraint) active.insert(c.first);
+        }
+    }
+    for (int round = 0; !cp.mut_truncate_closure; ++round) {
+        const std::size_t before = active.size();
+        (void)round;
+        for (const SymbolicOrigin& o : R.origins) {
+            bool touches = false;
+            for (const auto& c : o.allele_constraint) if (active.count(c.first)) touches = true;
+            for (const auto& c : o.length_constraint) if (active.count(c.first)) touches = true;
+            if (!touches) continue;
+            for (const auto& c : o.allele_constraint) active.insert(c.first);
+            for (const auto& c : o.length_constraint) active.insert(c.first);
+        }
+        if (active.size() == before) break;
+    }
+    std::vector<std::uint32_t> act(active.begin(), active.end());
+    double combos = 1.0;
+    for (std::uint32_t b : act) combos *= static_cast<double>(locus.block_alleles[b].size());
+    if (combos > static_cast<double>(cp.max_contexts)) {
+        // A RESOURCE LIMIT, NOT A FINDING. These blocks are reported uncertified; they are never
+        // reported independent, and the caller must leave their ownership alone.
+        refuse_all("active set of " + std::to_string(act.size()) +
+                   " blocks exceeds the enumeration budget");
+        return R;
+    }
+    // Emission for one assignment of the active set: the sum over origins compatible with it.
+    const auto emission_of = [&](const std::vector<std::uint32_t>& pick) {
+        double tot = kNI;
+        for (const SymbolicOrigin& o : R.origins) {
+            bool ok = true;
+            for (const auto& c : o.allele_constraint) {
+                const auto it = std::find(act.begin(), act.end(), c.first);
+                if (it == act.end()) continue;
+                if (pick[static_cast<std::size_t>(it - act.begin())] != c.second) {
+                    ok = false; break;
+                }
+            }
+            if (!ok) continue;
+            for (const auto& c : o.length_constraint) {
+                const auto it = std::find(act.begin(), act.end(), c.first);
+                if (it == act.end()) continue;
+                const std::uint32_t a = pick[static_cast<std::size_t>(it - act.begin())];
+                if (locus.block_alleles[c.first][a].size() != c.second) { ok = false; break; }
+            }
+            if (!ok) continue;
+            const std::size_t flen = o.m1_forward ? r1.size() : r2.size();
+            const std::size_t rlen = o.m1_forward ? r2.size() : r1.size();
+            const double m = log_half + read_ll(o.edits, flen + rlen) + prm.log_at(o.insert);
+            tot = (tot == kNI) ? m : (m == kNI ? tot
+                                              : (tot > m ? tot + std::log1p(std::exp(m - tot))
+                                                         : m + std::log1p(std::exp(tot - m))));
+        }
+        return tot;
+    };
+    std::vector<std::vector<std::uint32_t>> picks;
+    {
+        std::vector<std::uint32_t> p(act.size(), 0);
+        for (;;) {
+            picks.push_back(p);
+            std::size_t j = act.size();
+            bool done = act.empty();
+            while (j > 0) {
+                --j;
+                if (++p[j] < locus.block_alleles[act[j]].size()) break;
+                p[j] = 0;
+                if (j == 0) done = true;
+            }
+            if (done) break;
+        }
+    }
+    std::vector<double> em;
+    em.reserve(picks.size());
+    for (const auto& p : picks) em.push_back(emission_of(p));
+    R.active_blocks = act;
+    R.active_picks = picks;
+    R.active_emission = em;
+
+    const double log_mix = std::log1p(-prm.eta), log_bgw = std::log(prm.eta);
+    const double log_lambda = std::log(prm.lambda);
+    const auto psi = [&](double ma, double mb) {
+        double sig = kNI;
+        if (ma != kNI) sig = ma;
+        if (mb != kNI) sig = (sig == kNI) ? mb
+                                          : (sig > mb ? sig + std::log1p(std::exp(mb - sig))
+                                                      : mb + std::log1p(std::exp(sig - mb)));
+        if (sig != kNI) sig += log_mix + log_lambda;
+        const double bg = log_bgw + prm.log_p_bg;
+        if (sig == kNI) return bg;
+        return sig > bg ? sig + std::log1p(std::exp(bg - sig))
+                        : bg + std::log1p(std::exp(sig - bg));
+    };
+    for (std::size_t jb = 0; jb < act.size(); ++jb) {
+        const std::uint32_t b = act[jb];
+        bool moves = false;
+        double worst = 0.0;
+        DependencyWitness wit;
+        wit.block = b;
+        for (std::size_t i = 0; i < picks.size(); ++i)
+            for (std::size_t j = 0; j < picks.size(); ++j) {
+                bool only_b = picks[i][jb] != picks[j][jb];
+                for (std::size_t q = 0; q < act.size() && only_b; ++q)
+                    if (q != jb && picks[i][q] != picks[j][q]) only_b = false;
+                if (!only_b) continue;
+                if (em[i] != em[j]) moves = true;
+                for (std::size_t o = 0; o < picks.size(); ++o) {
+                    const double d = std::abs(psi(em[i], em[o]) - psi(em[j], em[o]));
+                    if (d > worst) {
+                        worst = d;
+                        wit.tuple_a = picks[i]; wit.tuple_b = picks[j];
+                        wit.contribution_a = psi(em[i], em[o]);
+                        wit.contribution_b = psi(em[j], em[o]);
+                        wit.observed_difference = d;
+                        std::size_t na = 0, nbb = 0;
+                        for (const SymbolicOrigin& so : R.origins) {
+                            bool ca = true, cb = true;
+                            for (const auto& c : so.allele_constraint) {
+                                const auto it = std::find(act.begin(), act.end(), c.first);
+                                if (it == act.end()) continue;
+                                const std::size_t q = static_cast<std::size_t>(it - act.begin());
+                                if (picks[i][q] != c.second) ca = false;
+                                if (picks[j][q] != c.second) cb = false;
+                            }
+                            na += ca ? 1u : 0u; nbb += cb ? 1u : 0u;
+                        }
+                        wit.origins_a = na; wit.origins_b = nbb;
+                    }
+                }
+            }
+        R.block_delta[b] = worst;
+        if (moves) {
+            R.structural_scope.push_back(b);
+            R.witnesses.push_back(wit);
+        }
+    }
+    std::sort(R.uncertified_blocks.begin(), R.uncertified_blocks.end());
+    R.uncertified_blocks.erase(std::unique(R.uncertified_blocks.begin(),
+                                           R.uncertified_blocks.end()),
+                               R.uncertified_blocks.end());
+    return R;
+}
+
 } // namespace panvar
 
 namespace panvar {

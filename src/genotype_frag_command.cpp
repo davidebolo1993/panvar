@@ -1912,6 +1912,8 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
         const std::string Q = motif(20), U = motif(20), H = motif(20), N = motif(20);
         const std::string S = motif(20), T2 = motif(20);
         const std::string Z1 = motif(20), Z2 = motif(20);
+        const std::string D1 = motif(20), D2 = motif(20), D3 = motif(20);
+        const std::string SH1 = motif(8), SH2 = sub(motif(8), 3);
         const std::string P2 = sub(P, 2), W2 = sub(W, 6), G2 = sub(G, 6), Y2 = sub(Y, 6);
         const std::string Q2 = sub(Q, 2), V  = sub(U, 6), K  = sub(H, 6), N2 = sub(N, 6);
         const std::string S2 = sub(S, 6);
@@ -1934,12 +1936,21 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
                                                             //   second copy of V, N2
                                                             //   and S              [280, 360)
             {Z1 + Z2 + Z1 + Z2},                            // 5 invariant repeat   [360, 440)
+            // 6. SHORT ALLELES -- eight bases, well under the read length, so a read starting
+            //    near the end of block 5 crosses blocks 5, 6 AND 7. Without a block like this the
+            //    multi-boundary machinery is never exercised and its mutation is a no-op: the
+            //    first version of this fixture had 60-base blocks throughout and proved nothing
+            //    about junction seeds spanning three alleles.        [440, 448)
+            {SH1, SH2},
+            {D1 + D2 + D3},                                 // 7 invariant tail     [448, 508)
         };
         // THE PANEL CARRIES ONLY b1 == b2. Four of the eight tuples, and the four it omits are
         // exactly the recombinants Li-Stephens can still reach by switching between blocks.
+        // The panel pins block 6's short allele too: it is invariant along every panel path, and
+        // that is exactly the kind of block a panel-domain certifier would call irrelevant.
         for (std::uint32_t b3 = 0; b3 < 2; ++b3) {
-            L.panel_tuples.push_back({0, 0, 0, b3, 0, 0});
-            L.panel_tuples.push_back({0, 1, 1, b3, 0, 0});
+            L.panel_tuples.push_back({0, 0, 0, b3, 0, 0, 0, 0});
+            L.panel_tuples.push_back({0, 1, 1, b3, 0, 0, 0, 0});
         }
 
         ScopeOracleParams prm;
@@ -1996,6 +2007,16 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             {"aggregate_1", S,          reverse_complement(T2)},
             {"aggregate_2", sub(S, 1),  reverse_complement(T2)},
             {"aggregate_3", sub(S, 2),  reverse_complement(T2)},
+            // 10. MULTI-BOUNDARY. Twenty bases spanning the tail of block 5, the whole of the
+            //     eight-base block 6 and the head of block 7 -- three alleles in one read. A seed
+            //     index that only covers interiors and single junctions cannot find it.
+            {"multi_boundary", (Z2.substr(14) + SH1 + D1).substr(0, 20),
+                               reverse_complement(D2)},
+            // 11. THE SECOND LIBRARY ORIENTATION. Every fragment above is (mate 1 forward, mate 2
+            //     reverse); this one is the other way round, so the (m2 forward, m1 reverse) join
+            //     is the only one that produces an origin for it. Without it, dropping an
+            //     orientation is undetectable -- which it was, in the first version of this gate.
+            {"second_orientation", reverse_complement(D3), D2},
         };
 
         std::printf("#\tfragment\tdomain\tin_band\tapparent_span\tscope\tunaskable\n");
@@ -2029,18 +2050,18 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
 
         // ---- THE FIXTURE MUST ACTUALLY CONTAIN WHAT IT CLAIMS -----------------------------
         ok_(L.panel_tuples.size() == 4 &&
-            scope_oracle_domain(L, ScopeOracleDomain::FullProduct).size() == 8,
-            "the panel carries 4 of the 8 tuples, so half the domain is off-panel");
+            scope_oracle_domain(L, ScopeOracleDomain::FullProduct).size() == 16,
+            "the panel carries 4 of the 16 tuples, so three quarters of the domain is off-panel");
         {
             // The repeat case, asserted on ORIGINS rather than on a summary statistic.
-            const std::string hap = scope_oracle_haplotype(L, {0, 0, 0, 0, 0, 0});
+            const std::string hap = scope_oracle_haplotype(L, {0, 0, 0, 0, 0, 0, 0, 0});
             std::size_t no = 0, be = 0;
             const double m = scope_oracle_emission(Z1, reverse_complement(Z2), hap, prm, &no, &be);
             // One copy alone: the same reads against a locus holding a single Z1 Z2.
             ScopeOracleLocus one = L; one.block_alleles[5] = {Z1 + Z2};
             std::size_t no1 = 0, be1 = 0;
             const double m1 = scope_oracle_emission(
-                Z1, reverse_complement(Z2), scope_oracle_haplotype(one, {0, 0, 0, 0, 0, 0}),
+                Z1, reverse_complement(Z2), scope_oracle_haplotype(one, {0, 0, 0, 0, 0, 0, 0, 0}),
                 prm, &no1, &be1);
             ok_(be == 0 && be1 == 0 && m > m1 + 0.5,
                 "two physically distinct origins with identical edits and insert carry " +
@@ -2171,7 +2192,7 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             // count keyed on (edits, insert) would see two origins where there are three, and one
             // where there are two -- which is why identity is (start, end) and nothing else.
             std::vector<std::pair<std::size_t, std::size_t>> best_ids;
-            const std::string rep_hap = scope_oracle_haplotype(L, {0, 0, 0, 0, 0, 0});
+            const std::string rep_hap = scope_oracle_haplotype(L, {0, 0, 0, 0, 0, 0, 0, 0});
             const std::size_t mult = scope_oracle_best_multiplicity(
                 Z1, reverse_complement(Z2), rep_hap, prm, 0, &best_ids);
             ok_(mult == 3 && best_ids.size() == 3,
@@ -2285,6 +2306,193 @@ int run_genotype_frag_command(const std::vector<std::string>& args) {
             ok_(per_block_spend > TOL,
                 "MUTATION: applying the full budget to each block independently spends " +
                 f3(per_block_spend) + " nats against a " + f3(TOL) + " budget");
+        }
+
+        // ---- 2g. THE OPTIMIZED CERTIFIER, AGAINST THE ORACLE ------------------------------
+        // The oracle enumerates the full product; the certifier never materialises a tuple. On a
+        // fixture this small they must agree EXACTLY -- that is what makes the certifier usable
+        // where the oracle cannot run.
+        {
+            CertifierParams cp;
+            cp.band_edits = 20;          // the whole read: nothing is out of band on the fixture,
+                                         // so the comparison is against the oracle's own domain
+            cp.use_seeds = false;        // and the scan is complete by construction
+            const LocusIndex ix = build_locus_index(L, 7, cp);
+            ok_(ix.usable(), "the locus index builds from the alleles alone, with no panel path");
+
+            std::size_t exact_structural = 0, exact_delta = 0, checked = 0;
+            for (std::size_t i = 0; i < frags.size(); ++i) {
+                const CertifierResult c =
+                    certify_fragment_scope(L, ix, frags[i].r1, frags[i].r2, prm, cp);
+                if (!c.usable()) continue;
+                ++checked;
+                std::vector<std::uint32_t> os;
+                for (std::size_t b = 0; b < full[i].structural.size(); ++b)
+                    if (full[i].structural[b]) os.push_back(static_cast<std::uint32_t>(b));
+                if (c.structural_scope == os) ++exact_structural;
+                bool deltas_agree = true;
+                for (std::uint32_t b : os)
+                    if (std::abs(c.block_delta[b] - full[i].block_delta[b]) > 1e-9)
+                        deltas_agree = false;
+                if (deltas_agree) ++exact_delta;
+            }
+            ok_(checked == frags.size() && exact_structural == frags.size(),
+                "the certifier reproduces the oracle's EXACT structural set for " +
+                std::to_string(exact_structural) + " of " + std::to_string(frags.size()) +
+                " fragments, without enumerating the product");
+            ok_(exact_delta == frags.size(),
+                "and the demotion bounds agree to 1e-9 nats on every retained block");
+
+            // SEEDED == SCANNED. Pigeonhole completeness, checked rather than argued.
+            CertifierParams cs = cp; cs.band_edits = 3; cs.use_seeds = false;
+            CertifierParams ck = cp; ck.band_edits = 3; ck.use_seeds = true;
+            const LocusIndex ix2 = build_locus_index(L, 5, ck);
+            std::size_t same = 0;
+            for (std::size_t i = 0; i < frags.size(); ++i) {
+                const CertifierResult a =
+                    certify_fragment_scope(L, ix2, frags[i].r1, frags[i].r2, prm, cs);
+                const CertifierResult b =
+                    certify_fragment_scope(L, ix2, frags[i].r1, frags[i].r2, prm, ck);
+                if (a.usable() && b.usable() && a.origins.size() == b.origins.size() &&
+                    a.structural_scope == b.structural_scope) ++same;
+            }
+            ok_(same == frags.size(),
+                "the PIGEONHOLE search finds exactly what the exhaustive scan finds, on all " +
+                std::to_string(same) + " fragments -- completeness checked, not assumed");
+
+            // WITNESSES: concrete, and pointing at tuples that differ only at their block.
+            const CertifierResult cf =
+                certify_fragment_scope(L, ix, frags[iFLAT].r1, frags[iFLAT].r2, prm, cp);
+            bool wit_ok = !cf.witnesses.empty();
+            for (const DependencyWitness& w : cf.witnesses) {
+                std::size_t diffs = 0;
+                for (std::size_t q = 0; q < w.tuple_a.size(); ++q)
+                    if (w.tuple_a[q] != w.tuple_b[q]) ++diffs;
+                if (diffs != 1 || w.observed_difference <= 0.0) wit_ok = false;
+            }
+            ok_(wit_ok,
+                "every retained dependency carries a concrete witness: " +
+                std::to_string(cf.witnesses.size()) + " pairs differing at exactly one block, "
+                "with their origin counts and contributions");
+
+            // THE COMPLEMENT IS BOUNDED, NOT IGNORED.
+            // AND AT A NARROW BAND IT DOMINATES, which is the useful thing to know. At d=2 the
+            // bound sits ABOVE the whole in-band emission: the search has verified too little to
+            // certify anything, and the answer is to deepen the band, not to believe the number.
+            // Deepening moves it below the signal. This is why the bound is carried into the
+            // ledger rather than reported as reassurance.
+            CertifierParams cb = cp; cb.band_edits = 2; cb.use_seeds = false;
+            CertifierParams cd = cp; cd.band_edits = 8; cd.use_seeds = false;
+            const CertifierResult narrow =
+                certify_fragment_scope(L, ix, frags[iFLAT].r1, frags[iFLAT].r2, prm, cb);
+            const CertifierResult deep =
+                certify_fragment_scope(L, ix, frags[iFLAT].r1, frags[iFLAT].r2, prm, cd);
+            ok_(narrow.usable() && deep.usable() &&
+                deep.omitted_bound < narrow.omitted_bound,
+                "the omitted-mass bound falls from " + f3(narrow.omitted_bound) + " to " +
+                f3(deep.omitted_bound) + " nats as the verified band deepens from 2 to 8");
+            ok_(narrow.omitted_bound > full[iFLAT].emission[0] &&
+                deep.omitted_bound < full[iFLAT].emission[0],
+                "at d=2 the bound EXCEEDS the in-band emission " +
+                f3(full[iFLAT].emission[0]) + ", so nothing is certifiable and the band must be "
+                "deepened; at d=8 it is safely below");
+
+            // A RESOURCE LIMIT IS UNCERTIFIED, NOT UNASKABLE. Unaskable is a property of a
+            // restricted domain; running out of budget is a property of this run, and recording
+            // it as independence is the original bug in a new costume.
+            CertifierParams cu = cp; cu.max_contexts = 2;
+            const CertifierResult cur =
+                certify_fragment_scope(L, ix, frags[iFLAT].r1, frags[iFLAT].r2, prm, cu);
+            ok_(!cur.usable() && cur.structural_scope.empty() &&
+                cur.uncertified_blocks.size() == L.blocks(),
+                "a certifier out of budget returns UNCERTIFIED over all " +
+                std::to_string(cur.uncertified_blocks.size()) +
+                " blocks and claims no independence: " + cur.refusal);
+        }
+
+        // ---- 2h. THE CERTIFIER MUTATIONS --------------------------------------------------
+        // Each removes one thing completeness rests on. Every one must either disagree with the
+        // exhaustive oracle or lose certification; a mutation that changes nothing would mean the
+        // property was never load-bearing.
+        {
+            CertifierParams base;
+            base.band_edits = 20; base.use_seeds = false;
+            const LocusIndex ixb = build_locus_index(L, 7, base);
+            const auto oracle_structural = [&](std::size_t i) {
+                std::vector<std::uint32_t> os;
+                for (std::size_t b = 0; b < full[i].structural.size(); ++b)
+                    if (full[i].structural[b]) os.push_back(static_cast<std::uint32_t>(b));
+                return os;
+            };
+            // Returns how many fragments the mutation breaks: a differing structural set, a
+            // differing bound, or a refusal.
+            const auto damage = [&](CertifierParams m, const LocusIndex& ixm) {
+                std::size_t bad = 0;
+                for (std::size_t i = 0; i < frags.size(); ++i) {
+                    const CertifierResult c =
+                        certify_fragment_scope(L, ixm, frags[i].r1, frags[i].r2, prm, m);
+                    if (!c.usable()) { ++bad; continue; }
+                    if (c.structural_scope != oracle_structural(i)) { ++bad; continue; }
+                    for (std::uint32_t b : c.structural_scope)
+                        if (std::abs(c.block_delta[b] - full[i].block_delta[b]) > 1e-9) {
+                            ++bad; break;
+                        }
+                }
+                return bad;
+            };
+            struct Mut { const char* name; CertifierParams p; bool reindex; };
+            std::vector<Mut> muts;
+            { CertifierParams m = base; m.use_seeds = true; m.band_edits = 3;
+              m.mut_no_junction_seeds = true; muts.push_back({"off-panel junction seeds", m, true}); }
+            { CertifierParams m = base; m.mut_no_multi_boundary = true;
+              muts.push_back({"multi-boundary contexts", m, false}); }
+            { CertifierParams m = base; m.mut_one_orientation = true;
+              muts.push_back({"one library orientation", m, false}); }
+            { CertifierParams m = base; m.mut_drop_one_origin = true;
+              muts.push_back({"one physical origin", m, false}); }
+            { CertifierParams m = base; m.mut_nearest_region_only = true;
+              muts.push_back({"distant repeat hits", m, false}); }
+            { CertifierParams m = base; m.mut_truncate_closure = true;
+              muts.push_back({"one fixed-point expansion step", m, false}); }
+            std::size_t detected = 0;
+            for (const Mut& mu : muts) {
+                const LocusIndex ixm = mu.reindex ? build_locus_index(L, 5, mu.p) : ixb;
+                const std::size_t bad = damage(mu.p, ixm);
+                const bool caught = bad > 0;
+                if (caught) ++detected;
+                ok_(caught, std::string("MUTATION: removing ") + mu.name + " breaks " +
+                            std::to_string(bad) + " of " + std::to_string(frags.size()) +
+                            " fragments against the oracle");
+            }
+            // The omitted tail is not a structural claim, so it is checked on the BOUND. At a
+            // narrow band there is real out-of-band mass; claiming the complement is empty
+            // understates it, and the understatement is measurable against the oracle.
+            {
+                CertifierParams honest = base; honest.band_edits = 2;
+                CertifierParams lying = honest; lying.mut_no_omitted_tail = true;
+                CertifierParams wide = base; wide.band_edits = 20;
+                const CertifierResult h =
+                    certify_fragment_scope(L, ixb, frags[iFLAT].r1, frags[iFLAT].r2, prm, honest);
+                const CertifierResult l =
+                    certify_fragment_scope(L, ixb, frags[iFLAT].r1, frags[iFLAT].r2, prm, lying);
+                const CertifierResult w =
+                    certify_fragment_scope(L, ixb, frags[iFLAT].r1, frags[iFLAT].r2, prm, wide);
+                // THE COMPLEMENT IS NON-EMPTY, demonstrated by counting rather than by comparing
+                // two log masses -- the first version of this check subtracted one log from
+                // another and called the result a mass, which it is not, and the difference
+                // rounded to exactly zero so the mutation looked harmless.
+                const bool complement_nonempty = w.origins.size() > h.origins.size();
+                const bool caught = complement_nonempty && h.omitted_bound > -1e18 &&
+                                    l.omitted_bound < -1e18;
+                ok_(caught,
+                    "MUTATION: claiming an empty complement asserts nothing lies past the band, "
+                    "while widening it from 2 to 20 edits finds " +
+                    std::to_string(w.origins.size() - h.origins.size()) +
+                    " more origins; the honest bound is " + f3(h.omitted_bound) + " nats");
+                if (caught) ++detected;
+            }
+            ok_(detected == muts.size() + 1,
+                "all " + std::to_string(detected) + " certifier mutations are detected");
         }
 
         // ---- 3. FULL SCORING AND CORRECTED SCOPED SCORING AGREE ---------------------------

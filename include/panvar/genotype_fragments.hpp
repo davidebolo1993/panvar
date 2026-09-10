@@ -3462,4 +3462,116 @@ double scope_oracle_residual(const ScopeOracleFragmentResult& r,
                              const std::vector<std::uint32_t>& scope,
                              const ScopeOracleParams& prm);
 
+
+// ---- THE OPTIMIZED SCOPE CERTIFIER -----------------------------------------------------------
+//
+// The oracle enumerates the full allele product, which is exact and astronomically too slow: C4's
+// product is not 8 tuples. This computes the same answer without ever materialising a tuple.
+//
+// "LOCAL" MEANS LOCAL TO A POSSIBLE ORIGIN, NOT TO A PLACEMENT. A fragment spans at most the
+// insert ceiling, so any ONE origin constrains only a consecutive run of blocks -- but repeats put
+// origins of the SAME fragment in several distant runs, and a search seeded from a panel placement
+// or a prior scope finds one run and calls the rest independent. That is the defect this replaces.
+// The index below is built from the locus alone: every allele interior, every adjacent junction,
+// and the multi-block runs that short alleles make reachable. No panel path seeds it.
+//
+// A SYMBOLIC ORIGIN constrains only the blocks it touches. Everything else stays FREE rather than
+// being enumerated -- that is the whole saving, and it is also what makes the result a statement
+// about the full Cartesian domain rather than about the tuples someone thought to try.
+struct SymbolicOrigin {
+    // The blocks this origin pins, and to which allele. Absent blocks are unconstrained.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> allele_constraint;
+    // Blocks BETWEEN the mates whose allele LENGTH changes the insert. Neither mate reads them,
+    // yet the insert prior does: with indel-carrying alleles an intervening block is a genuine
+    // dependency through pi(L) alone. Recording it as a length constraint keeps that visible.
+    std::vector<std::pair<std::uint32_t, std::size_t>> length_constraint;
+    std::uint32_t fwd_block = 0, rev_block = 0;
+    std::size_t fwd_off = 0, rev_off = 0;   // offsets within those blocks' alleles
+    long insert = 0;
+    std::size_t edits = 0;
+    bool m1_forward = true;
+    // PHYSICAL IDENTITY. Two origins with equal edits and equal insert are still two origins;
+    // deduplication is on this, never on the statistics.
+    bool same_place_as(const SymbolicOrigin& o) const {
+        return fwd_block == o.fwd_block && fwd_off == o.fwd_off && rev_block == o.rev_block &&
+               rev_off == o.rev_off && m1_forward == o.m1_forward &&
+               allele_constraint == o.allele_constraint &&
+               length_constraint == o.length_constraint;
+    }
+};
+
+struct CertifierParams {
+    std::size_t band_edits = 3;      // the VERIFIED band; everything past it is bounded, not ignored
+    std::size_t max_seed_positions = 4000000;   // index size guard
+    std::size_t max_contexts = 200000;          // per-fragment expansion guard
+    std::size_t max_short_run = 12;             // allele products a short run may open up
+    // SEEDED (pigeonhole) or EXHAUSTIVE SCAN. The scan is complete by construction and linear in
+    // the total allele length; the seeded path is what makes a real locus tractable. They must
+    // agree exactly, and the fixture asserts it -- an unverified fast path is how a search stops
+    // being complete without anyone noticing.
+    bool use_seeds = true;
+    // ---- DELIBERATE DEFECTS, for the mutation gate. Each removes one thing the certifier's
+    // completeness rests on, and each must either disagree with the exhaustive oracle or lose
+    // certification outright. A mutation that changes nothing means the property was never
+    // load-bearing and the corresponding assertion was decoration.
+    bool mut_no_junction_seeds = false;   // index allele interiors only
+    bool mut_no_multi_boundary = false;   // refuse contexts spanning three or more blocks
+    bool mut_one_orientation = false;     // only (r1 forward, r2 reverse)
+    bool mut_drop_one_origin = false;     // discard one physical origin after the join
+    bool mut_nearest_region_only = false; // keep only origins in the first region: no distant repeats
+    bool mut_no_omitted_tail = false;     // claim the complement is empty
+    bool mut_truncate_closure = false;    // stop the dependency fixed point after one round
+};
+
+// A witness is what makes a retained dependency auditable: not "block b matters" but the two
+// tuples that force it, what each one's origins are, and how far apart their contributions land.
+struct DependencyWitness {
+    std::uint32_t block = 0;
+    std::vector<std::uint32_t> tuple_a, tuple_b;    // differ ONLY at `block`
+    std::size_t origins_a = 0, origins_b = 0;
+    double contribution_a = 0.0, contribution_b = 0.0;
+    double observed_difference = 0.0;
+};
+
+struct CertifierResult {
+    std::vector<SymbolicOrigin> origins;
+    std::vector<std::uint32_t> structural_scope;
+    std::vector<double> block_delta;
+    std::vector<DependencyWitness> witnesses;
+    // Blocks that could not be compared within the work budget. UNCERTIFIED IS NOT UNASKABLE:
+    // unaskable means the domain contains no pair differing only at that block, which in a full
+    // Cartesian domain happens only for a block with a single allele. Running out of budget is a
+    // statement about this run, and it must never be recorded as independence.
+    std::vector<std::uint32_t> uncertified_blocks;
+    // Everything outside the verified edit band. Finite Hamming mass, bounded rather than assumed
+    // away, and carried into the same global approximation ledger as every demotion.
+    double omitted_bound = -std::numeric_limits<double>::infinity();
+    std::size_t contexts_examined = 0, seeds_examined = 0;
+    // The active set and its emissions, exposed so a caller can check the in-band mass directly
+    // rather than inferring it from the scope.
+    std::vector<std::uint32_t> active_blocks;
+    std::vector<std::vector<std::uint32_t>> active_picks;
+    std::vector<double> active_emission;
+    std::string refusal;
+    bool usable() const { return refusal.empty(); }
+};
+
+// Built once per locus and reused across every fragment and every donor. Panel-independent by
+// construction: it is a function of the block alleles and nothing else.
+struct LocusIndex {
+    struct Seed { std::uint32_t block; std::uint32_t allele; std::uint32_t offset; };
+    std::unordered_map<std::string, std::vector<Seed>> at;
+    std::size_t k = 0;
+    std::vector<std::vector<std::size_t>> allele_len;     // [block][allele]
+    std::vector<std::vector<std::size_t>> len_classes;    // distinct lengths per block
+    std::string refusal;
+    bool usable() const { return refusal.empty(); }
+};
+LocusIndex build_locus_index(const ScopeOracleLocus& locus, std::size_t k,
+                             const CertifierParams& cp);
+
+CertifierResult certify_fragment_scope(const ScopeOracleLocus& locus, const LocusIndex& index,
+                                       const std::string& r1, const std::string& r2,
+                                       const ScopeOracleParams& prm, const CertifierParams& cp);
+
 } // namespace panvar

@@ -444,6 +444,14 @@ int run_genotype_command(const std::vector<std::string>& args) {
     bool hybrid_no_overlap_pairs = false;
     // DECLARED, in nats, on how far normalisation context may move a factor's log psi.
     double hybrid_context_budget = 1e-3;
+    // AUDIT ONLY. Runs the full-domain certifier beside the panel-domain owner and writes the
+    // transition table; it never changes ownership, factors or exclusions.
+    std::string hybrid_scope_audit;
+    std::size_t hybrid_audit_band = 6;
+    std::size_t hybrid_audit_seed_k = 16;
+    std::size_t hybrid_audit_max_contexts = 200000;
+    double hybrid_audit_budget = 1e-3;
+    double hybrid_audit_log_bg = -200.0;
     bool hybrid_factor_oracle = false;      // also run the exhaustive oracle and compare
     // REPEATABLE AND POSITIONAL, matched to --hybrid-factor-run in order. Two factors do not
     // supersede the same edges -- F1 over {2,3,4,5} replaces 3-4 and 4-5, F2 over {4,5,6}
@@ -628,6 +636,17 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (arg == "--hybrid-higher-report") hybrid_higher_report = require_value(arg);
         else if (arg == "--dump-block-catalogue") dump_block_catalogue = require_value(arg);
         else if (arg == "--no-overlap-pairs") hybrid_no_overlap_pairs = true;
+        else if (arg == "--hybrid-scope-audit") hybrid_scope_audit = require_value(arg);
+        else if (arg == "--hybrid-audit-band")
+            hybrid_audit_band = static_cast<std::size_t>(std::stoul(require_value(arg)));
+        else if (arg == "--hybrid-audit-seed-k")
+            hybrid_audit_seed_k = static_cast<std::size_t>(std::stoul(require_value(arg)));
+        else if (arg == "--hybrid-audit-max-contexts")
+            hybrid_audit_max_contexts = static_cast<std::size_t>(std::stoul(require_value(arg)));
+        else if (arg == "--hybrid-audit-budget")
+            hybrid_audit_budget = std::stod(require_value(arg));
+        else if (arg == "--hybrid-audit-log-bg")
+            hybrid_audit_log_bg = std::stod(require_value(arg));
         else if (arg == "--hybrid-context-budget")
             hybrid_context_budget = std::stod(require_value(arg));
         else if (arg == "--hybrid-factor-oracle") hybrid_factor_oracle = true;
@@ -2148,6 +2167,302 @@ int run_genotype_command(const std::vector<std::string>& args) {
                              " fragments in " +
                              std::to_string(std::chrono::duration<double>(
                                  std::chrono::steady_clock::now() - own_t0).count()) + " s");
+                    // ---- THE SCOPE AUDIT, READ-ONLY -----------------------------------------
+                    // Runs the full-domain certifier beside the panel-domain owner and writes the
+                    // transition table. It CHANGES NOTHING: `owners` is untouched, no factor is
+                    // built from it, no read is excluded on it. The point is to measure the size
+                    // of the correction before deciding what to rebuild, and a run that quietly
+                    // acted on the new scopes would destroy the comparison it exists to make.
+                    if (!hybrid_scope_audit.empty()) {
+                        const auto au_t0 = std::chrono::steady_clock::now();
+                        ScopeOracleLocus SL;
+                        for (const auto& B : blocks) SL.block_alleles.push_back(B.allele_seq);
+                        // THE PANEL TUPLES, for reporting only -- and a haplotype ABSENT from a
+                        // block is not absent from the model. It BYPASSES the block, which is a
+                        // well-defined state with its own allele (usually a deletion spanning the
+                        // site). Skipping such a haplotype would shrink the panel-domain side of
+                        // the very comparison that exposed the original bug, and would do it
+                        // silently. Only a block with no bypass allele leaves a state genuinely
+                        // unmappable, and those are named individually below.
+                        std::size_t au_declared = hap_names.size(), au_bypass = 0;
+                        std::vector<std::string> au_skipped;
+                        for (const std::string& nm : hap_names) {
+                            std::vector<std::uint32_t> t;
+                            std::string why;
+                            for (std::size_t bq = 0; bq < blocks.size(); ++bq) {
+                                const auto& B = blocks[bq];
+                                const auto it = B.allele_of.find(nm);
+                                if (it != B.allele_of.end()) {
+                                    t.push_back(static_cast<std::uint32_t>(it->second));
+                                } else if (B.bypass_allele >= 0) {
+                                    t.push_back(static_cast<std::uint32_t>(B.bypass_allele));
+                                    ++au_bypass;
+                                } else {
+                                    why = "block " + std::to_string(bq) +
+                                          " has no allele and no bypass state";
+                                    break;
+                                }
+                            }
+                            if (why.empty()) SL.panel_tuples.push_back(t);
+                            else au_skipped.push_back(nm + " (" + why + ")");
+                        }
+                        ScopeOracleParams sp;
+                        sp.insert_lo = ip.lo; sp.insert_hi = ip.hi;
+                        sp.insert_logp.clear();
+                        for (long Lq = ip.lo; Lq <= ip.hi; ++Lq)
+                            sp.insert_logp.push_back(ip.log_at(Lq));
+                        sp.log_eps = lep; sp.log_1meps = l1m;
+                        sp.eta = hyb_params.outlier_mix; sp.lambda = hyb_params.lambda;
+                        sp.log_p_bg = hybrid_audit_log_bg;
+                        CertifierParams cp;
+                        cp.band_edits = hybrid_audit_band;
+                        cp.max_contexts = hybrid_audit_max_contexts;
+                        const std::size_t seed_k = hybrid_audit_seed_k;
+                        const auto ix_t0 = std::chrono::steady_clock::now();
+                        const LocusIndex LIX = build_locus_index(SL, seed_k, cp);
+                        const double ix_s = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - ix_t0).count();
+                        log.info("scope audit: locus index over " +
+                                 std::to_string(SL.blocks()) + " blocks in " +
+                                 std::to_string(ix_s) + " s" +
+                                 (LIX.usable() ? "" : " -- REFUSED: " + LIX.refusal));
+                        std::vector<CertifierResult> cres(hf.size());
+                        std::vector<std::size_t> cdepth(hf.size(), 0);
+                        std::atomic<std::size_t> au_done{0};
+                        // THE STOPPING RULE IS A CONTRIBUTION WIDTH, NOT A MASS RATIO.
+                        //
+                        // "The tail is smaller than the in-band mass" is not a certificate of
+                        // anything. Equal in-band and tail mass moves the contribution by log 2 =
+                        // 0.693 nats, and a tail only slightly under the signal is still hundreds
+                        // of times a small tolerance. What has to be bounded is the width of the
+                        // contribution INTERVAL through the real diploid mixture: the production
+                        // value with the tail excluded, against the same value with the certified
+                        // omitted mass added. This is the same quantity the ownership audit uses,
+                        // and the same conflation this codebase already had to unlearn once.
+                        //
+                        // The budget is locus-wide, so this first audit allocates it CONSERVATIVELY
+                        // and equally: every fragment must fit budget / fragments. Deepening only
+                        // the fragments that need it, until the summed bound fits, is strictly
+                        // better and is deliberately left for later -- stopping early and then
+                        // reporting a failed aggregate would make the certifier look worse than a
+                        // deeper search would show it to be.
+                        const double per_fragment_budget =
+                            hybrid_audit_budget / static_cast<double>(std::max<std::size_t>(1,
+                                                                                   hf.size()));
+                        std::vector<double> cwidth(hf.size(), 0.0);
+                        std::vector<char> cfits(hf.size(), 0);
+                        const double lmix_a = std::log1p(-hyb_params.outlier_mix);
+                        const double llam_a = std::log(hyb_params.lambda);
+                        const double lbgw_a = std::log(hyb_params.outlier_mix);
+                        run_parallel(hf.size(), options.threads, [&](std::size_t fi) {
+                            // ADAPTIVE DEPTH: an insufficient bound means MORE WORK, never a
+                            // weaker claim.
+                            for (std::size_t d : {hybrid_audit_band, hybrid_audit_band * 2,
+                                                  hybrid_audit_band * 4}) {
+                                CertifierParams cq = cp;
+                                cq.band_edits = d;
+                                cres[fi] = certify_fragment_scope(SL, LIX, hf[fi].r1, hf[fi].r2,
+                                                                  sp, cq);
+                                cdepth[fi] = d;
+                                if (!cres[fi].usable()) break;
+                                // WORST CASE OVER THE DOMAIN: the smallest in-band emission, where
+                                // a fixed tail buys the most. Taking the best would understate the
+                                // width exactly where it matters.
+                                double worst_in_band = std::numeric_limits<double>::infinity();
+                                for (double e : cres[fi].active_emission)
+                                    worst_in_band = std::min(worst_in_band, e);
+                                if (!std::isfinite(worst_in_band))
+                                    worst_in_band = -std::numeric_limits<double>::infinity();
+                                const double up = (cres[fi].omitted_bound ==
+                                                   -std::numeric_limits<double>::infinity())
+                                                      ? worst_in_band
+                                                      : ((worst_in_band ==
+                                                          -std::numeric_limits<double>::infinity())
+                                                             ? cres[fi].omitted_bound
+                                                             : std::max(worst_in_band,
+                                                                        cres[fi].omitted_bound) +
+                                                               std::log1p(std::exp(
+                                                                   -std::abs(worst_in_band -
+                                                                             cres[fi].omitted_bound))));
+                                const MassInterval mi{worst_in_band, up};
+                                const MassInterval ci = fragment_contribution(
+                                    mi, mi, false, lmix_a, llam_a, lbgw_a, sp.log_p_bg);
+                                cwidth[fi] = ci.upper - ci.lower;
+                                if (cwidth[fi] <= per_fragment_budget) { cfits[fi] = 1; break; }
+                            }
+                            const std::size_t n = ++au_done;
+                            if (n % 2000 == 0)
+                                log.info("scope audit: " + std::to_string(n) + " / " +
+                                         std::to_string(hf.size()) + " fragments");
+                        });
+                        const double au_s = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - au_t0).count();
+                        // ---- THE ONE GLOBAL LEDGER ------------------------------------------
+                        std::vector<ScopeOracleFragmentResult> as_frag(hf.size());
+                        for (std::size_t fi = 0; fi < hf.size(); ++fi) {
+                            as_frag[fi].name = hf[fi].name;
+                            as_frag[fi].structural.assign(blocks.size(), 0);
+                            as_frag[fi].block_delta.assign(blocks.size(), 0.0);
+                            if (!cres[fi].usable()) {
+                                as_frag[fi].refusal = cres[fi].refusal;
+                                continue;
+                            }
+                            for (std::uint32_t b : cres[fi].structural_scope)
+                                as_frag[fi].structural[b] = 1;
+                            for (std::size_t b = 0; b < blocks.size(); ++b)
+                                as_frag[fi].block_delta[b] = cres[fi].block_delta[b];
+                        }
+                        const ScopeOracleLocusResult LED =
+                            aggregate_scope_oracle(as_frag, hybrid_audit_budget);
+                        std::ofstream au(hybrid_scope_audit);
+                        if (!au) throw std::runtime_error("genotype: cannot write " +
+                                                          hybrid_scope_audit);
+                        au.precision(10);
+                        au << "fragment\told_kind\told_panel_scope\tnew_structural_scope"
+                              "\tnew_effective_scope\tcertified\tdepth\tcontribution_width"
+                              "\twidth_within_allocation\tdemotion_bound"
+                              "\torigins\tbest_origin_edits\twitness\n";
+                        const auto joinv = [](const std::vector<std::uint32_t>& v) {
+                            if (v.empty()) return std::string(".");
+                            std::string s2;
+                            for (std::size_t q = 0; q < v.size(); ++q)
+                                s2 += (q ? "," : "") + std::to_string(v[q]);
+                            return s2;
+                        };
+                        std::map<std::pair<std::string, std::string>, std::size_t> trans;
+                        std::size_t n_uncert = 0, n_widened = 0, n_same = 0;
+                        double ledger = 0.0;
+                        for (std::size_t fi = 0; fi < hf.size(); ++fi) {
+                            const std::string oldk = owner_kind_name(owners[fi].kind);
+                            std::vector<std::uint32_t> newstruct, neweff;
+                            for (std::size_t b = 0; b < blocks.size(); ++b) {
+                                if (as_frag[fi].structural[b])
+                                    newstruct.push_back(static_cast<std::uint32_t>(b));
+                            }
+                            neweff = LED.effective_scope.size() > fi ? LED.effective_scope[fi]
+                                                                     : newstruct;
+                            const char* newk = !cres[fi].usable() ? "uncertified"
+                                             : neweff.empty()     ? "invariant"
+                                             : neweff.size() == 1 ? "unary"
+                                             : neweff.size() == 2 ? "linkage" : "wide";
+                            trans[{oldk, newk}] += 1;
+                            if (!cres[fi].usable()) ++n_uncert;
+                            else if (neweff.size() > owners[fi].panel_domain_var_scope.size())
+                                ++n_widened;
+                            else if (neweff.size() == owners[fi].panel_domain_var_scope.size())
+                                ++n_same;
+                            double db = 0.0;
+                            for (const auto& rm : LED.removals)
+                                if (rm.fragment == fi) db += rm.bound;
+                            ledger += db;
+                            std::size_t bestedits = 0;
+                            bool have = false;
+                            for (const SymbolicOrigin& o : cres[fi].origins)
+                                if (!have || o.edits < bestedits) { bestedits = o.edits; have = true; }
+                            std::string wit = ".";
+                            if (!cres[fi].witnesses.empty()) {
+                                const DependencyWitness& w = cres[fi].witnesses.front();
+                                wit = "b" + std::to_string(w.block) + ":" +
+                                      joinv(w.tuple_a) + "|" + joinv(w.tuple_b) + ":" +
+                                      std::to_string(w.observed_difference);
+                            }
+                            au << hf[fi].name << '\t' << oldk << '\t'
+                               << joinv(owners[fi].panel_domain_var_scope) << '\t'
+                               << joinv(newstruct) << '\t' << joinv(neweff) << '\t'
+                               << (cres[fi].usable() ? 1 : 0) << '\t' << cdepth[fi] << '\t'
+                               << cwidth[fi] << '\t' << (cfits[fi] ? 1 : 0) << '\t'
+                               << db << '\t' << cres[fi].origins.size() << '\t'
+                               << (have ? static_cast<long>(bestedits) : -1L) << '\t'
+                               << wit << '\n';
+                        }
+                        au << "#\n#field\tvalue\n";
+                        // A PER-FRAGMENT CERTIFICATE PLUS A FAILED GLOBAL LEDGER IS NOT A
+                        // CERTIFIED LOCUS. Nothing in this file authorises a transaction.
+                        au << "#result\tAUDIT_ONLY\n";
+                        au << "#ownership_changed\t0\n";
+                        au << "#fragments\t" << hf.size() << '\n';
+                        au << "#panel_states_declared\t" << au_declared << '\n';
+                        au << "#panel_tuples_formed\t" << SL.panel_tuples.size() << '\n';
+                        au << "#panel_bypass_mappings\t" << au_bypass << '\n';
+                        au << "#panel_states_skipped\t" << au_skipped.size() << '\n';
+                        for (const std::string& sk : au_skipped)
+                            au << "#panel_skipped\t" << sk << '\n';
+                        au << "#uncertified\t" << n_uncert << '\n';
+                        au << "#widened\t" << n_widened << '\n';
+                        au << "#unchanged_width\t" << n_same << '\n';
+                        au << "#locus_budget_nats\t" << hybrid_audit_budget << '\n';
+                        au << "#per_fragment_allocation_nats\t" << per_fragment_budget << '\n';
+                        {
+                            std::size_t fits = 0;
+                            double wsum = 0.0, wmax = 0.0;
+                            for (std::size_t fi = 0; fi < hf.size(); ++fi) {
+                                fits += cfits[fi] ? 1u : 0u;
+                                wsum += cwidth[fi];
+                                wmax = std::max(wmax, cwidth[fi]);
+                            }
+                            au << "#width_within_allocation\t" << fits << '\n';
+                            au << "#width_sum_nats\t" << wsum << '\n';
+                            au << "#width_max_nats\t" << wmax << '\n';
+                        }
+                        au << "#total_demotion_bound_nats\t" << LED.total_demoted_bound << '\n';
+                        au << "#ledger_within_budget\t"
+                           << (LED.certified && LED.refusal.empty() ? 1 : 0) << '\n';
+                        au << "#ledger_refusal\t" << (LED.refusal.empty() ? "-" : LED.refusal)
+                           << '\n';
+                        au << "#index_seconds\t" << ix_s << '\n';
+                        au << "#audit_seconds\t" << au_s << '\n';
+                        au << "#threads\t" << options.threads << '\n';
+                        std::size_t tot_org = 0, tot_ctx = 0, tot_seed = 0;
+                        std::map<std::size_t, std::size_t> by_depth;
+                        for (std::size_t fi = 0; fi < hf.size(); ++fi) {
+                            tot_org += cres[fi].origins.size();
+                            tot_ctx += cres[fi].contexts_examined;
+                            tot_seed += cres[fi].seeds_examined;
+                            by_depth[cdepth[fi]] += 1;
+                        }
+                        au << "#symbolic_origins\t" << tot_org << '\n';
+                        au << "#contexts_examined\t" << tot_ctx << '\n';
+                        au << "#seeds_examined\t" << tot_seed << '\n';
+                        for (const auto& kv : by_depth)
+                            au << "#fragments_at_depth_" << kv.first << '\t' << kv.second << '\n';
+                        // THE FULL MATRIX, ZEROS INCLUDED, with `uncertified` as an explicit
+                        // destination. A transition that does not occur is a result; leaving its
+                        // row out makes "did not happen" and "was not looked for" identical.
+                        au << "#\n#old_kind\tnew_kind\tfragments\n";
+                        static const char* kOld[] = {"unary", "linkage", "wide", "invariant",
+                                                     "unusable"};
+                        static const char* kNew[] = {"unary", "linkage", "wide", "invariant",
+                                                     "uncertified"};
+                        for (const char* ok2 : kOld)
+                            for (const char* nk : kNew) {
+                                const auto it = trans.find({ok2, nk});
+                                au << "#T\t" << ok2 << '\t' << nk << '\t'
+                                   << (it == trans.end() ? 0 : it->second) << '\n';
+                            }
+                        // EVERY Invariant -> owned AND Unusable -> owned CHANGE, INDIVIDUALLY.
+                        // These are the transitions the domain bug predicts, so they are listed
+                        // by name rather than counted.
+                        au << "#\n#promotion\tfragment\told_kind\tnew_effective_scope\n";
+                        for (std::size_t fi = 0; fi < hf.size(); ++fi) {
+                            if (!cres[fi].usable()) continue;
+                            const OwnerKind k = owners[fi].kind;
+                            if (k != OwnerKind::Invariant && k != OwnerKind::Unusable) continue;
+                            if (LED.effective_scope.size() <= fi ||
+                                LED.effective_scope[fi].empty()) continue;
+                            au << "#P\t" << hf[fi].name << '\t' << owner_kind_name(k) << '\t'
+                               << joinv(LED.effective_scope[fi]) << '\n';
+                        }
+                        au.flush();
+                        if (!au) throw std::runtime_error("genotype: write failed for " +
+                                                          hybrid_scope_audit);
+                        log.info("scope audit: " + std::to_string(hf.size()) + " fragments in " +
+                                 std::to_string(au_s) + " s, " + std::to_string(n_uncert) +
+                                 " uncertified, ledger " +
+                                 std::to_string(LED.total_demoted_bound) + " / " +
+                                 std::to_string(hybrid_audit_budget) + " nats -- OWNERSHIP "
+                                 "UNCHANGED");
+                        (void)ledger;
+                    }
                     std::map<std::pair<std::uint32_t, std::uint32_t>,
                              std::vector<std::size_t>> by_edge;
                     for (std::size_t fi = 0; fi < hf.size(); ++fi) {
