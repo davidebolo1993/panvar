@@ -2024,7 +2024,9 @@ int run_genotype_command(const std::vector<std::string>& args) {
             // Rendered where `owners` is in scope; printed with the status file later.
             std::vector<std::string> unusable_lines;
             std::size_t neutral_pairwise_reported = 0, superseded_reported = 0;
-            std::vector<HigherFactorScope> higher_scopes;      // the derived plan, for the report
+            std::vector<HigherFactorScope> higher_scopes;      // scopes CREDITED to the ledger
+            std::vector<HigherFactorScope> planned_only_stored; // what the planner proposed
+            std::size_t planned_only_reported = 0;
             std::vector<std::size_t> plan_wide_consumed;       // Wide fragments each factor takes
             long min_len_recorded = 0, ip_lo_recorded = 0, ip_hi_recorded = 0;
             double ip_residual_lo = 0.0, ip_residual_hi = 0.0;
@@ -4116,7 +4118,22 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         for (const FragmentOwner& o2 : owners)
                             if (o2.kind == OwnerKind::Wide &&
                                 higher_scopes[i].covers(o2.var_scope)) ++plan_wide_consumed[i];
-                    if (hybrid_higher && !hybrid_factor_runs.empty())
+                    planned_only_stored = higher_scopes;
+                    planned_only_reported = higher_scopes.size();
+                    // THE LEDGER CREDITS ONLY FACTORS THAT EXIST.
+                    //
+                    // higher_scopes above is what the planner WOULD build. Handing it to the
+                    // completeness assessment tells the ledger those Wide and superseded fragments
+                    // have consumers, and under the planner they do not: no table is built, so
+                    // nothing consumes them. The assessment must be given the scopes of factors
+                    // that were actually BUILT -- which is `built_blocks` -- so an unbuilt plan
+                    // shows up as unconsumed evidence and refuses, instead of as a complete model.
+                    //
+                    // The planner's output stays in the report as the plan, clearly separate from
+                    // what was realised.
+                    std::vector<HigherFactorScope> planned_only = planned_only_stored;
+                    higher_scopes.clear();
+                    if (!hybrid_factor_runs.empty())
                         for (std::size_t f = 0; f < built_blocks.size(); ++f) {
                             HigherFactorScope hsc;
                             hsc.blocks = built_blocks[f];
@@ -4245,10 +4262,26 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                      " forward updates");
                         }
                     }
-                    // EXCLUSIONS ONLY NOW, and only if nothing refused. A higher-order refusal
-                    // must leave the read set untouched.
-                    if (hyb_act.hybrid_activated &&
-                        (!hybrid_higher || built_tables.empty() || higher_active)) {
+                    // EXCLUSIONS ONLY NOW, AND ONLY FROM ACTIVE CONSUMERS.
+                    //
+                    // `built_tables.empty()` used to appear in this condition as a permissive
+                    // case, and with the planner it was ALWAYS true: the planner supplies scopes
+                    // but no CLI factor runs, so no table is ever built, higher_order_active stays
+                    // 0 -- and the ledger still counted the Wide and superseded fragments as
+                    // consumed. Exclusions were then applied on the strength of consumers that do
+                    // not exist. On one pilot donor that removed 316 fragments from the marker
+                    // counts while zero interval factors reached inference, and the run still
+                    // reported COMPLETE. That is evidence loss, not an incomplete call.
+                    //
+                    // THE INVARIANT: a plan with factors in it must have produced factors that
+                    // reached inference, or nothing is excluded and the call is INCOMPLETE.
+                    const bool plan_is_honoured =
+                        planned_only.empty() ? true : higher_active;
+                    if (hybrid_higher && !plan_is_honoured && higher_refusal.empty()) {
+                        higher_refusal = "the plan plans " + std::to_string(planned_only.size()) +
+                                         " factor(s) but none reached inference";
+                    }
+                    if (hyb_act.hybrid_activated && (!hybrid_higher || plan_is_honoured)) {
                         hyb_exclusions.insert(hyb_act.excluded_fragments.begin(),
                                               hyb_act.excluded_fragments.end());
                     } else if (hyb_act.hybrid_activated) {
@@ -4374,14 +4407,21 @@ int run_genotype_command(const std::vector<std::string>& args) {
                     hs << "factor_plan_source\t"
                        << (hybrid_factor_runs.empty() ? "planner" : "explicit --hybrid-factor-run")
                        << '\n';
-                    hs << "factor_plan_size\t" << higher_scopes.size() << '\n';
-                    for (const HigherFactorScope& f : higher_scopes) {
+                    hs << "factor_plan_size\t" << planned_only_reported << '\n';
+                    hs << "factor_scopes_credited_to_ledger\t" << higher_scopes.size() << '\n';
+                    // THE INVARIANT, REPORTED. planned == built == reached inference, or the call
+                    // is not a higher-order call at all.
+                    hs << "factor_plan_honoured\t"
+                       << ((higher_scopes.empty() || higher_active) ? 1 : 0) << '\n';
+                    for (const HigherFactorScope& f : planned_only_stored) {
                         hs << "factor_plan\t";
                         for (std::size_t q = 0; q < f.blocks.size(); ++q)
                             hs << (q ? "," : "") << f.blocks[q];
                         hs << '\t';
-                        hs << (&f - higher_scopes.data() < (long)plan_wide_consumed.size()
-                                   ? plan_wide_consumed[&f - higher_scopes.data()] : 0) << '\t';
+                        const std::size_t pi =
+                            static_cast<std::size_t>(&f - planned_only_stored.data());
+                        hs << (pi < plan_wide_consumed.size() ? plan_wide_consumed[pi] : 0)
+                           << '\t';
                         if (f.superseded.empty()) hs << '-';
                         for (std::size_t q = 0; q < f.superseded.size(); ++q)
                             hs << (q ? "," : "") << f.superseded[q].first << '-'
