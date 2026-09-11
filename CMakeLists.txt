@@ -8,35 +8,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(PANVAR_BUILD_TESTING "Build tests" ON)
 
-# `genotype` is the one module that has not completed its review pass. It is excluded from the default
-# build entirely -- sources, dispatch, help and tests -- so a released binary cannot be asked to do
-# something the project is not prepared to stand behind. Development continues with
-# -DPANVAR_ENABLE_EXPERIMENTAL_GENOTYPE=ON, which restores all four.
-option(PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE
-       "Build the experimental genotype module (not release-reviewed)" OFF)
-
 # The rebuild suite is the only test that drives minigraph and costs about 5.5 minutes of a 6 minute
 # run, so it is registered but disabled by default. It worked as an undeclared cache variable, which
 # meant it did not appear in ccmake/cmake-gui and a fresh build tree had to be reconfigured to find it.
 option(PANVAR_SLOW_TESTS "Enable the slow test label (the ~6 minute rebuild suite)" OFF)
-
-# Every source below is reachable only from `genotype`: node_coverage and pangenie_model are its two
-# alternative evidence paths, not shared utilities.
-set(PANVAR_GENOTYPE_LIB_SOURCES
-    src/genotype.cpp
-    src/genotype_blocks.cpp
-    src/genotype_index.cpp
-    src/genotype_markers.cpp
-    src/genotype_reads.cpp
-    src/genotype_fragments.cpp
-    src/pangenie_model.cpp
-    src/node_coverage.cpp
-)
-set(PANVAR_GENOTYPE_CLI_SOURCES src/genotype_command.cpp src/genotype_frag_command.cpp)
-if(NOT PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE)
-    set(PANVAR_GENOTYPE_LIB_SOURCES "")
-    set(PANVAR_GENOTYPE_CLI_SOURCES "")
-endif()
 
 find_package(Threads REQUIRED)
 find_package(ZLIB REQUIRED)
@@ -150,7 +125,6 @@ add_library(panvarlib
     src/integrated_snarls.cpp
     src/bubble_alleles.cpp
     src/syncmer.cpp
-    ${PANVAR_GENOTYPE_LIB_SOURCES}
     src/bubble_path.cpp
     src/bubbles.cpp
     src/ref_path.cpp
@@ -196,7 +170,6 @@ add_executable(panvar
     src/bubble_command.cpp
     src/inspect.cpp
     src/call_command.cpp
-    ${PANVAR_GENOTYPE_CLI_SOURCES}
     src/benchmark_command.cpp
     src/describe_command.cpp
     src/panphorte_command.cpp
@@ -205,10 +178,6 @@ add_executable(panvar
     src/associate_command.cpp
 )
 target_include_directories(panvar PRIVATE ${EIGEN_DIR})
-if(PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE)
-    target_compile_definitions(panvar PRIVATE PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE)
-    target_compile_definitions(panvarlib PUBLIC PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE)
-endif()
 target_link_libraries(panvar PRIVATE panvarlib minimap2 Threads::Threads ZLIB::ZLIB)
 if(NOT WIN32)
     target_link_libraries(panvar PRIVATE m)
@@ -235,7 +204,8 @@ include(GNUInstallDirs)
 # supported C++ package and was not one: the exported target referred to `abpoa` and `minigraph`,
 # which are IMPORTED targets that were never exported, and to `ZLIB::ZLIB` with no package config to
 # rediscover it, so `find_package(panvar)` could not configure in a consumer project. The default
-# build also installed the experimental genotype headers whose implementations it deliberately omits.
+# The earlier rules also installed internal headers whose implementations were not part of the
+# installed binary.
 #
 # Advertising a package contract nobody can satisfy is worse than not advertising one. If a C++ API is
 # wanted later it needs a panvarConfig.cmake, dependency discovery and export for every vendored
@@ -292,23 +262,6 @@ if(PANVAR_BUILD_TESTING)
                 COMMAND /usr/bin/env bash ${PANVAR_INSPECT_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/inspect_stats
             )
             set_tests_properties(panvar_inspect_stats PROPERTIES TIMEOUT 180)
-        endif()
-
-        # call coordinate contract. real_smoke.sh checks that call runs and that its files exist, and
-        # asserts nothing about where a record lands -- so an off-by-one in POS/END on every DEL and
-        # INV in the primary output passed the whole suite.
-        # genotype depth contract. CTest exercised `genotype` nowhere at all: every other module has a
-        # stats test and this one, the largest in the tree, had none, while the depth code branches over
-        # local against shrunk against region fallback, three estimators, NA against zero, and the direct
-        # against the indexed route. The fixture feeds exact copies of the sample's haplotypes so lambda
-        # is known by construction rather than recorded from a previous run.
-        set(PANVAR_GENOTYPE_STATS ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_stats.sh)
-        if(EXISTS ${PANVAR_GENOTYPE_STATS} AND PANVAR_ENABLE_EXPERIMENTAL_GENOTYPE)
-            add_test(
-                NAME panvar_genotype_stats
-                COMMAND /usr/bin/env bash ${PANVAR_GENOTYPE_STATS} $<TARGET_FILE:panvar> ${CMAKE_CURRENT_BINARY_DIR}/genotype_stats
-            )
-            set_tests_properties(panvar_genotype_stats PROPERTIES TIMEOUT 300)
         endif()
 
         # Opt-in regressions against the committed real loci. Several contracts are only reachable

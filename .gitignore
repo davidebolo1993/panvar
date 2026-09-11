@@ -45,6 +45,9 @@ docs/reports/
 docs/review_followups.md
 reports/
 
+# External comparison checkout used while designing the replacement genotyper; it is not a Panvar
+# dependency and must never be swept into a commit.
+external/locityper/
+
 
 build_genotype_review/
-
