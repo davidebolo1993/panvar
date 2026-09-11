@@ -3510,6 +3510,14 @@ struct CertifierParams {
     // agree exactly, and the fixture asserts it -- an unverified fast path is how a search stops
     // being complete without anyone noticing.
     bool use_seeds = true;
+    // ---- PER-FRAGMENT LIMITS. Exceeding any of them is UNCERTIFIED -- never a partial origin set
+    // and never an inherited scope. A certifier that quietly returns what it managed to find is
+    // indistinguishable from one that is correct, which is the whole problem.
+    std::size_t max_seed_hits = 2000000;
+    std::size_t max_placements = 200000;
+    std::size_t max_pairs = 20000000;
+    std::size_t max_origins = 500000;
+    double max_seconds = 0.0;            // 0 disables
     // ---- DELIBERATE DEFECTS, for the mutation gate. Each removes one thing the certifier's
     // completeness rests on, and each must either disagree with the exhaustive oracle or lose
     // certification outright. A mutation that changes nothing means the property was never
@@ -3547,6 +3555,23 @@ struct CertifierResult {
     // away, and carried into the same global approximation ledger as every demotion.
     double omitted_bound = -std::numeric_limits<double>::infinity();
     std::size_t contexts_examined = 0, seeds_examined = 0;
+    // ---- PER-STAGE COUNTERS. Code inspection named two suspects; these are what decide between
+    // them, and what distinguishes "the implementation is quadratic" from "the biology really does
+    // produce this many origins", which need completely different fixes.
+    std::size_t seed_queries = 0;        // pieces looked up
+    std::size_t raw_seed_hits = 0;       // index occurrences returned
+    std::size_t unique_starts = 0;       // after collapsing hits to start positions
+    std::size_t fwd_placements = 0, rev_placements = 0;
+    std::size_t pairs_considered = 0;    // the join's outer x inner
+    std::size_t pairs_coord_ok = 0;      // survived the FR and insert tests
+    std::size_t compat_checks = 0;       // allele-constraint compatibility tests
+    std::size_t context_expansions = 0;
+    std::size_t raw_origins = 0, unique_origins = 0;
+    std::size_t best_edits = 0;          // kept so the origin list can be released early
+    std::size_t symbolic_groups = 0;     // distinct allele-constraint sets among origins
+    double verify_seconds = 0.0, join_seconds = 0.0, dedup_seconds = 0.0, total_seconds = 0.0;
+    // PER-FRAGMENT RESOURCE LIMITS, each of which yields UNCERTIFIED rather than a partial answer.
+    bool hit_limit = false;
     // The active set and its emissions, exposed so a caller can check the in-band mass directly
     // rather than inferring it from the scope.
     std::vector<std::uint32_t> active_blocks;
@@ -3560,15 +3585,35 @@ struct CertifierResult {
 // construction: it is a function of the block alleles and nothing else.
 struct LocusIndex {
     struct Seed { std::uint32_t block; std::uint32_t allele; std::uint32_t offset; };
-    std::unordered_map<std::string, std::vector<Seed>> at;
+    // A SORTED FLAT ARRAY, NOT A HASH OF STRINGS. C4 carries 25.4 Mb of allele sequence, so a
+    // std::string key with a per-key vector costs several gigabytes and hundreds of millions of
+    // allocations before any fragment is looked at. Packed 2-bit keys in one contiguous vector,
+    // sorted once and searched by equal_range, cost 16 bytes an entry and allocate twice.
+    // k is therefore capped at 32 bases.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> entries;   // (kmer, packed seed)
     std::size_t k = 0;
     std::vector<std::vector<std::size_t>> allele_len;     // [block][allele]
     std::vector<std::vector<std::size_t>> len_classes;    // distinct lengths per block
+    std::size_t junction_seeds = 0, interior_seeds = 0;
     std::string refusal;
     bool usable() const { return refusal.empty(); }
+    static std::uint64_t pack(std::uint32_t b, std::uint32_t a, std::uint32_t o) {
+        return (static_cast<std::uint64_t>(b) << 56) | (static_cast<std::uint64_t>(a) << 40) |
+               static_cast<std::uint64_t>(o);
+    }
+    static Seed unpack(std::uint64_t v) {
+        return Seed{static_cast<std::uint32_t>(v >> 56),
+                    static_cast<std::uint32_t>((v >> 40) & 0xFFFFu),
+                    static_cast<std::uint32_t>(v & 0xFFFFFFFFULL)};
+    }
 };
 LocusIndex build_locus_index(const ScopeOracleLocus& locus, std::size_t k,
                              const CertifierParams& cp);
+
+// A CHEAP COST PROXY: index lookups only, no expansion, no verification. Used to stratify a
+// profiling sample by the suspected driver without paying what it costs to find out.
+std::size_t count_seed_hits(const LocusIndex& ix, const std::string& r1, const std::string& r2,
+                            std::size_t band_edits);
 
 CertifierResult certify_fragment_scope(const ScopeOracleLocus& locus, const LocusIndex& index,
                                        const std::string& r1, const std::string& r2,

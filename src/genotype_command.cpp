@@ -452,6 +452,18 @@ int run_genotype_command(const std::vector<std::string>& args) {
     std::size_t hybrid_audit_max_contexts = 200000;
     double hybrid_audit_budget = 1e-3;
     double hybrid_audit_log_bg = -200.0;
+    // C4 carries 25.4 Mb of allele sequence, so this is sized in BASES and must be declared, not
+    // guessed: an index that silently indexes less than the whole locus is an incomplete search.
+    std::size_t hybrid_audit_max_seeds = 4000000;
+    std::string hybrid_audit_manifest;   // frozen fragment list: read if present, else written
+    std::string hybrid_audit_profile;    // per-fragment stage counters and timings
+    std::size_t hybrid_audit_sample = 0; // 0 = every fragment
+    // THE CIRCUIT BREAKER. A projected runtime past this aborts the audit instead of occupying
+    // the machine for hours; the 16-hour C4 run was only stopped because someone was watching.
+    double hybrid_audit_max_seconds = 600.0;
+    // PER FRAGMENT, distinct from the whole-audit limit: one pathological fragment must not be
+    // able to hold the run open after the audit has already decided to stop.
+    double hybrid_audit_fragment_seconds = 5.0;
     bool hybrid_factor_oracle = false;      // also run the exhaustive oracle and compare
     // REPEATABLE AND POSITIONAL, matched to --hybrid-factor-run in order. Two factors do not
     // supersede the same edges -- F1 over {2,3,4,5} replaces 3-4 and 4-5, F2 over {4,5,6}
@@ -647,6 +659,16 @@ int run_genotype_command(const std::vector<std::string>& args) {
             hybrid_audit_budget = std::stod(require_value(arg));
         else if (arg == "--hybrid-audit-log-bg")
             hybrid_audit_log_bg = std::stod(require_value(arg));
+        else if (arg == "--hybrid-audit-max-seeds")
+            hybrid_audit_max_seeds = static_cast<std::size_t>(std::stoull(require_value(arg)));
+        else if (arg == "--hybrid-audit-manifest") hybrid_audit_manifest = require_value(arg);
+        else if (arg == "--hybrid-audit-profile") hybrid_audit_profile = require_value(arg);
+        else if (arg == "--hybrid-audit-sample")
+            hybrid_audit_sample = static_cast<std::size_t>(std::stoul(require_value(arg)));
+        else if (arg == "--hybrid-audit-max-seconds")
+            hybrid_audit_max_seconds = std::stod(require_value(arg));
+        else if (arg == "--hybrid-audit-fragment-seconds")
+            hybrid_audit_fragment_seconds = std::stod(require_value(arg));
         else if (arg == "--hybrid-context-budget")
             hybrid_context_budget = std::stod(require_value(arg));
         else if (arg == "--hybrid-factor-oracle") hybrid_factor_oracle = true;
@@ -2217,6 +2239,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         CertifierParams cp;
                         cp.band_edits = hybrid_audit_band;
                         cp.max_contexts = hybrid_audit_max_contexts;
+                        cp.max_seed_positions = hybrid_audit_max_seeds;
                         const std::size_t seed_k = hybrid_audit_seed_k;
                         const auto ix_t0 = std::chrono::steady_clock::now();
                         const LocusIndex LIX = build_locus_index(SL, seed_k, cp);
@@ -2229,6 +2252,87 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         std::vector<CertifierResult> cres(hf.size());
                         std::vector<std::size_t> cdepth(hf.size(), 0);
                         std::atomic<std::size_t> au_done{0};
+                        // ---- THE FROZEN MANIFEST ---------------------------------------------
+                        // Written BEFORE the certifier runs, so the sample cannot be chosen after
+                        // seeing which fragments were slow or which answers changed. If the file
+                        // already exists it is read verbatim, which is what makes a before/after
+                        // comparison a comparison rather than two different experiments.
+                        std::vector<std::size_t> au_sel;
+                        std::map<std::string, std::size_t> by_name;
+                        for (std::size_t fi = 0; fi < hf.size(); ++fi) by_name[hf[fi].name] = fi;
+                        bool manifest_read = false;
+                        if (!hybrid_audit_manifest.empty()) {
+                            std::ifstream mf(hybrid_audit_manifest);
+                            if (mf) {
+                                std::string ln;
+                                while (std::getline(mf, ln)) {
+                                    if (ln.empty() || ln[0] == '#') continue;
+                                    const auto it = by_name.find(ln);
+                                    if (it != by_name.end()) au_sel.push_back(it->second);
+                                }
+                                manifest_read = !au_sel.empty();
+                                log.info("scope audit: manifest read, " +
+                                         std::to_string(au_sel.size()) + " fragments");
+                            }
+                        }
+                        if (!manifest_read && hybrid_audit_sample > 0) {
+                            // A CHEAP SEED-HIT COUNT FIRST -- index lookups only, no expansion --
+                            // so the sample can be stratified by the thing that is expected to
+                            // drive cost without paying the cost to find out.
+                            std::vector<std::pair<std::size_t, std::size_t>> cheap(hf.size());
+                            run_parallel(hf.size(), options.threads, [&](std::size_t fi) {
+                                cheap[fi] = {count_seed_hits(LIX, hf[fi].r1, hf[fi].r2,
+                                                             hybrid_audit_band),
+                                             fi};
+                            });
+                            std::vector<char> taken(hf.size(), 0);
+                            const auto take = [&](std::size_t fi) {
+                                if (fi < hf.size() && !taken[fi]) {
+                                    taken[fi] = 1; au_sel.push_back(fi);
+                                }
+                            };
+                            // 1. every old Wide, Unusable and Invariant, capped.
+                            std::size_t capk = std::max<std::size_t>(8, hybrid_audit_sample / 8);
+                            std::map<std::string, std::size_t> got;
+                            for (std::size_t fi = 0; fi < hf.size(); ++fi) {
+                                const std::string k2 = owner_kind_name(owners[fi].kind);
+                                if (k2 == "unary" || k2 == "linkage") continue;
+                                if (got[k2]++ < capk) take(fi);
+                            }
+                            // 2. the heaviest cheap seed-hit counts: the suspected cost driver.
+                            std::vector<std::pair<std::size_t, std::size_t>> byhits = cheap;
+                            std::sort(byhits.begin(), byhits.end(),
+                                      [](const auto& x, const auto& y) { return x.first > y.first; });
+                            for (std::size_t q = 0; q < byhits.size() &&
+                                                    au_sel.size() < hybrid_audit_sample / 2; ++q)
+                                take(byhits[q].second);
+                            // 3. LOW-hit controls, so a speedup cannot come from the tail alone.
+                            for (std::size_t q = 0; q < byhits.size() &&
+                                                    au_sel.size() < hybrid_audit_sample * 5 / 8;
+                                 ++q)
+                                take(byhits[byhits.size() - 1 - q].second);
+                            // 4. a hash-selected ordinary sample: deterministic, not positional.
+                            for (std::size_t fi = 0; fi < hf.size() &&
+                                                     au_sel.size() < hybrid_audit_sample; ++fi)
+                                if ((std::hash<std::string>{}(hf[fi].name) % 7u) == 3u) take(fi);
+                            for (std::size_t fi = 0; fi < hf.size() &&
+                                                     au_sel.size() < hybrid_audit_sample; ++fi)
+                                take(fi);
+                            std::sort(au_sel.begin(), au_sel.end());
+                            if (!hybrid_audit_manifest.empty()) {
+                                std::ofstream mo(hybrid_audit_manifest);
+                                mo << "# frozen before certification, " << au_sel.size()
+                                   << " fragments\n";
+                                for (std::size_t fi : au_sel) mo << hf[fi].name << '\n';
+                                mo.flush();
+                                if (!mo) throw std::runtime_error("genotype: cannot write " +
+                                                                  hybrid_audit_manifest);
+                                log.info("scope audit: manifest WRITTEN, " +
+                                         std::to_string(au_sel.size()) + " fragments");
+                            }
+                        }
+                        if (au_sel.empty())
+                            for (std::size_t fi = 0; fi < hf.size(); ++fi) au_sel.push_back(fi);
                         // THE STOPPING RULE IS A CONTRIBUTION WIDTH, NOT A MASS RATIO.
                         //
                         // "The tail is smaller than the in-band mass" is not a certificate of
@@ -2254,15 +2358,39 @@ int run_genotype_command(const std::vector<std::string>& args) {
                         const double lmix_a = std::log1p(-hyb_params.outlier_mix);
                         const double llam_a = std::log(hyb_params.lambda);
                         const double lbgw_a = std::log(hyb_params.outlier_mix);
-                        run_parallel(hf.size(), options.threads, [&](std::size_t fi) {
+                        // ---- THE CIRCUIT BREAKER --------------------------------------------
+                        // Progress every 25, an extrapolation once 100 are done, and an automatic
+                        // abort if the projection exceeds the declared limit. An aborted audit
+                        // reports UNCERTIFIED for everything it did not reach; it never inherits a
+                        // scope, and it never runs for hours because nobody was watching.
+                        std::atomic<bool> au_abort{false};
+                        std::string au_abort_why;
+                        std::mutex au_mx;
+                        const auto au_wall0 = std::chrono::steady_clock::now();
+                        run_parallel(au_sel.size(), options.threads, [&](std::size_t si) {
+                            if (au_abort.load()) return;
+                            const std::size_t fi = au_sel[si];
+                            CertifierParams cpf = cp;
+                            cpf.max_seconds = hybrid_audit_fragment_seconds;
                             // ADAPTIVE DEPTH: an insufficient bound means MORE WORK, never a
                             // weaker claim.
+                            // KEEP THE BEST RESULT, NOT THE LAST. Deepening the band raises the
+                            // pigeonhole requirement to k*(d+1) bases, so with a fixed seed length
+                            // a deeper attempt on a 150 bp read simply cannot run -- and writing
+                            // its refusal over an earlier SUCCESS reported the fragment as
+                            // uncertified with "0 seed hits" when depth 6 had certified it
+                            // perfectly well. A failed deeper attempt must lose to a shallower
+                            // certified one, never replace it.
                             for (std::size_t d : {hybrid_audit_band, hybrid_audit_band * 2,
                                                   hybrid_audit_band * 4}) {
-                                CertifierParams cq = cp;
+                                if (hf[fi].r1.size() < seed_k * (d + 1) ||
+                                    hf[fi].r2.size() < seed_k * (d + 1)) break;
+                                CertifierParams cq = cpf;
                                 cq.band_edits = d;
-                                cres[fi] = certify_fragment_scope(SL, LIX, hf[fi].r1, hf[fi].r2,
-                                                                  sp, cq);
+                                CertifierResult trial =
+                                    certify_fragment_scope(SL, LIX, hf[fi].r1, hf[fi].r2, sp, cq);
+                                if (!trial.usable() && cres[fi].usable()) break;   // keep the good one
+                                cres[fi] = std::move(trial);
                                 cdepth[fi] = d;
                                 if (!cres[fi].usable()) break;
                                 // WORST CASE OVER THE DOMAIN: the smallest in-band emission, where
@@ -2290,16 +2418,56 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                 cwidth[fi] = ci.upper - ci.lower;
                                 if (cwidth[fi] <= per_fragment_budget) { cfits[fi] = 1; break; }
                             }
+                            // RELEASE THE HEAVY FIELDS IMMEDIATELY. Keeping every fragment's
+                            // origin list, pick table and emission vector alive costs gigabytes
+                            // at 23,953 fragments -- the full run died here after certifying in
+                            // 18.7 s. Everything downstream needs the scopes, the counters and
+                            // the witnesses, all of which are small.
+                            {
+                                CertifierResult& c = cres[fi];
+                                c.origins.clear(); c.origins.shrink_to_fit();
+                                c.active_picks.clear(); c.active_picks.shrink_to_fit();
+                                c.active_emission.clear(); c.active_emission.shrink_to_fit();
+                                if (c.witnesses.size() > 1) {
+                                    c.witnesses.resize(1);   // one witness per fragment is enough
+                                    c.witnesses.shrink_to_fit();
+                                }
+                            }
                             const std::size_t n = ++au_done;
-                            if (n % 2000 == 0)
+                            const double el = std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - au_wall0).count();
+                            if (n % 25 == 0)
                                 log.info("scope audit: " + std::to_string(n) + " / " +
-                                         std::to_string(hf.size()) + " fragments");
+                                         std::to_string(au_sel.size()) + " fragments, " +
+                                         std::to_string(el) + " s");
+                            // EXTRAPOLATE EARLY AND ACT ON IT. 2,000 fragments in 80 minutes was
+                            // already decisive; the run continued for another two hours because
+                            // nothing was checking.
+                            if (n >= 100 && n % 25 == 0) {
+                                const double projected = el / static_cast<double>(n) *
+                                                         static_cast<double>(au_sel.size());
+                                if (projected > hybrid_audit_max_seconds &&
+                                    !au_abort.exchange(true)) {
+                                    std::lock_guard<std::mutex> lk(au_mx);
+                                    au_abort_why = "projected " + std::to_string(projected) +
+                                                   " s over " + std::to_string(au_sel.size()) +
+                                                   " fragments exceeds the limit of " +
+                                                   std::to_string(hybrid_audit_max_seconds) +
+                                                   " s (measured on " + std::to_string(n) + ")";
+                                    log.info("scope audit: ABORTING -- " + au_abort_why);
+                                }
+                            }
                         });
                         const double au_s = std::chrono::duration<double>(
                             std::chrono::steady_clock::now() - au_t0).count();
                         // ---- THE ONE GLOBAL LEDGER ------------------------------------------
+                        log.info("scope audit stage: A_as_frag");
+                        std::vector<char> au_seen(hf.size(), 0);
+                        for (std::size_t fi : au_sel) au_seen[fi] = 1;
                         std::vector<ScopeOracleFragmentResult> as_frag(hf.size());
                         for (std::size_t fi = 0; fi < hf.size(); ++fi) {
+                            if (!au_seen[fi] && cres[fi].refusal.empty())
+                                cres[fi].refusal = "not in the audited manifest";
                             as_frag[fi].name = hf[fi].name;
                             as_frag[fi].structural.assign(blocks.size(), 0);
                             as_frag[fi].block_delta.assign(blocks.size(), 0.0);
@@ -2312,8 +2480,10 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             for (std::size_t b = 0; b < blocks.size(); ++b)
                                 as_frag[fi].block_delta[b] = cres[fi].block_delta[b];
                         }
+                        log.info("scope audit stage: B_aggregate");
                         const ScopeOracleLocusResult LED =
                             aggregate_scope_oracle(as_frag, hybrid_audit_budget);
+                        log.info("scope audit stage: C_open_audit");
                         std::ofstream au(hybrid_scope_audit);
                         if (!au) throw std::runtime_error("genotype: cannot write " +
                                                           hybrid_scope_audit);
@@ -2355,10 +2525,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
                             for (const auto& rm : LED.removals)
                                 if (rm.fragment == fi) db += rm.bound;
                             ledger += db;
-                            std::size_t bestedits = 0;
-                            bool have = false;
-                            for (const SymbolicOrigin& o : cres[fi].origins)
-                                if (!have || o.edits < bestedits) { bestedits = o.edits; have = true; }
+                            const std::size_t bestedits = cres[fi].best_edits;
+                            const bool have = cres[fi].unique_origins > 0;
                             std::string wit = ".";
                             if (!cres[fi].witnesses.empty()) {
                                 const DependencyWitness& w = cres[fi].witnesses.front();
@@ -2375,7 +2543,45 @@ int run_genotype_command(const std::vector<std::string>& args) {
                                << (have ? static_cast<long>(bestedits) : -1L) << '\t'
                                << wit << '\n';
                         }
+                        log.info("scope audit stage: D_profile");
+                        // ---- THE PROFILE: one row per audited fragment, every stage ---------
+                        if (!hybrid_audit_profile.empty()) {
+                            std::ofstream pf(hybrid_audit_profile);
+                            if (!pf) throw std::runtime_error("genotype: cannot write " +
+                                                              hybrid_audit_profile);
+                            pf.precision(9);
+                            pf << "fragment\told_kind\tcheap_hits\tseed_queries\traw_seed_hits"
+                                  "\tunique_starts\tfwd_placements\trev_placements"
+                                  "\tpairs_considered\tpairs_coord_ok\tcompat_checks"
+                                  "\tcontext_expansions\traw_origins\tunique_origins"
+                                  "\tsymbolic_groups\tverify_s\tjoin_s\tdedup_s\ttotal_s"
+                                  "\tdepth\tcertified\trefusal\n";
+                            for (std::size_t fi : au_sel) {
+                                const CertifierResult& c = cres[fi];
+                                pf << hf[fi].name << '\t' << owner_kind_name(owners[fi].kind)
+                                   << '\t' << count_seed_hits(LIX, hf[fi].r1, hf[fi].r2,
+                                                               hybrid_audit_band)
+                                   << '\t' << c.seed_queries << '\t' << c.raw_seed_hits
+                                   << '\t' << c.unique_starts << '\t' << c.fwd_placements
+                                   << '\t' << c.rev_placements << '\t' << c.pairs_considered
+                                   << '\t' << c.pairs_coord_ok << '\t' << c.compat_checks
+                                   << '\t' << c.context_expansions << '\t' << c.raw_origins
+                                   << '\t' << c.unique_origins << '\t' << c.symbolic_groups
+                                   << '\t' << c.verify_seconds << '\t' << c.join_seconds
+                                   << '\t' << c.dedup_seconds << '\t' << c.total_seconds
+                                   << '\t' << cdepth[fi] << '\t' << (c.usable() ? 1 : 0)
+                                   << '\t' << (c.refusal.empty() ? "-" : c.refusal) << '\n';
+                            }
+                            pf.flush();
+                            if (!pf) throw std::runtime_error("genotype: write failed for " +
+                                                              hybrid_audit_profile);
+                        }
+                        log.info("scope audit stage: E_trailer");
                         au << "#\n#field\tvalue\n";
+                        au << "#audited_fragments\t" << au_sel.size() << '\n';
+                        au << "#aborted\t" << (au_abort.load() ? 1 : 0) << '\n';
+                        au << "#abort_reason\t"
+                           << (au_abort_why.empty() ? "-" : au_abort_why) << '\n';
                         // A PER-FRAGMENT CERTIFICATE PLUS A FAILED GLOBAL LEDGER IS NOT A
                         // CERTIFIED LOCUS. Nothing in this file authorises a transaction.
                         au << "#result\tAUDIT_ONLY\n";
