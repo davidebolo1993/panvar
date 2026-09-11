@@ -125,6 +125,8 @@ add_library(panvarlib
     src/integrated_snarls.cpp
     src/bubble_alleles.cpp
     src/syncmer.cpp
+    src/genotype_model.cpp
+    src/ls_hmm.cpp
     src/bubble_path.cpp
     src/bubbles.cpp
     src/ref_path.cpp
@@ -216,6 +218,14 @@ install(TARGETS panvar RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 if(PANVAR_BUILD_TESTING)
     include(CTest)
     if(BUILD_TESTING)
+        # Mathematical foundation of the replacement mosaic genotyper. This is a direct C++ test so
+        # model code is certified before a CLI exists: fragment-specific overlapping-pair support,
+        # discrete insert normalization, and exact Li-Stephens marginalization over template paths.
+        add_executable(genotype_mosaic_core_test tests/genotype_mosaic_core.cpp)
+        target_link_libraries(genotype_mosaic_core_test PRIVATE panvarlib)
+        target_compile_options(genotype_mosaic_core_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_genotype_mosaic_core COMMAND genotype_mosaic_core_test)
+
         # Fast, dependency-free smoke on a tiny hand-built graph that exercises every
         # call event type + confounders with exact-record assertions (no vg needed).
         set(PANVAR_SYN_SMOKE ${CMAKE_CURRENT_SOURCE_DIR}/tests/synthetic_smoke.sh)
