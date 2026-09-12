@@ -7,8 +7,10 @@
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -141,6 +143,138 @@ void test_library_model() {
                    "an unprovenanced library model must refuse");
 }
 
+panvar::StructuralLocusInput structural_fixture(bool reordered) {
+    panvar::StructuralLocusInput input;
+    input.locus_id = "fixture-locus";
+    input.chain_orientation = panvar::ChainOrientation::Reverse;
+    input.invariant_segments = {"LEFT", "MIDDLE", "RIGHT"};
+    input.blocks = {
+        {"block-0", {{"walk-alt", "TT"}, {"walk-ref-2", "AC"}, {"walk-ref-1", "AC"}}},
+        {"block-1", {{"walk-bypass", ""}, {"walk-one", "CC"}, {"walk-two", "GG"}}},
+    };
+    input.templates = {
+        {"hap-z", panvar::TemplateFrameStatus::Complete, {"walk-alt", "walk-two"}},
+        {"hap-a", panvar::TemplateFrameStatus::Complete, {"walk-ref-1", "walk-one"}},
+        {"hap-m", panvar::TemplateFrameStatus::Complete, {"walk-ref-2", "walk-bypass"}},
+    };
+    if (reordered) {
+        std::reverse(input.blocks[0].alleles.begin(), input.blocks[0].alleles.end());
+        std::reverse(input.blocks[1].alleles.begin(), input.blocks[1].alleles.end());
+        std::reverse(input.templates.begin(), input.templates.end());
+    }
+    return input;
+}
+
+void test_prepared_genotype_model() {
+    static_assert(!std::is_default_constructible<panvar::PreparedGenotypeModel>::value,
+                  "a prepared model must only exist after validated construction");
+
+    const panvar::StructuralLocusInput input = structural_fixture(false);
+    const panvar::PreparedGenotypeModel model = panvar::prepare_genotype_model(input);
+    const panvar::PreparedGenotypeModel reordered =
+        panvar::prepare_genotype_model(structural_fixture(true));
+
+    require(model.locus_id() == "fixture-locus", "prepared model must retain its locus ID");
+    require(model.chain_orientation() == panvar::ChainOrientation::Reverse,
+            "prepared model must retain chain orientation");
+    require(model.frame_status() == panvar::TemplateFrameStatus::Complete,
+            "a constructed model must certify a complete panel frame");
+    require(model.invariant_segments() == std::vector<std::string>({"LEFT", "MIDDLE", "RIGHT"}),
+            "prepared model must retain every ordered invariant segment exactly once");
+    require(model.blocks().size() == 2 && model.panel().block_count() == 2,
+            "prepared structural and panel block counts must agree");
+    require(model.panel().template_names == std::vector<std::string>({"hap-a", "hap-m", "hap-z"}),
+            "template rows must have deterministic name order");
+
+    // Sequence-identical walks are one statistical allele, but their graph aliases and panel
+    // carrier multiplicity survive canonicalization. Empty sequence is a valid bypass allele.
+    require(model.blocks()[0].alleles.size() == 2,
+            "sequence-identical source walks must collapse to one canonical allele");
+    const std::size_t ref_id = model.blocks()[0].allele_id_for_source("walk-ref-1");
+    require(ref_id == model.blocks()[0].allele_id_for_source("walk-ref-2"),
+            "sequence-identical source aliases must resolve to the same allele ID");
+    require(model.allele(0, ref_id).source_ids ==
+                std::vector<std::string>({"walk-ref-1", "walk-ref-2"}),
+            "canonical allele must retain sorted source aliases");
+    require(model.allele(0, ref_id).panel_carrier_count == 2,
+            "canonical allele must retain panel carrier multiplicity");
+    require(model.allele(1, model.blocks()[1].allele_id_for_source("walk-bypass")).sequence.empty(),
+            "empty bypass sequence must remain an explicit allele rather than missing data");
+
+    // Every input template/source mapping round-trips through the canonical block-local allele ID.
+    std::map<std::string, const panvar::PanelTemplateInput*> input_template_by_name;
+    for (const auto& input_template : input.templates) {
+        input_template_by_name.emplace(input_template.name, &input_template);
+    }
+    for (std::size_t h = 0; h < model.panel().template_count(); ++h) {
+        const auto found = input_template_by_name.find(model.panel().template_names[h]);
+        require(found != input_template_by_name.end(), "prepared template must come from panel input");
+        for (std::size_t b = 0; b < model.panel().block_count(); ++b) {
+            const std::size_t expected =
+                model.blocks()[b].allele_id_for_source(found->second->allele_source_ids[b]);
+            require(model.panel().template_alleles[h][b] == expected,
+                    "template/block/allele mapping must round-trip exactly");
+            require(model.allele(b, expected).id == expected,
+                    "canonical allele index and stored stable ID index must agree");
+        }
+    }
+
+    // Reordering source records and template records cannot alter canonical IDs or the panel matrix.
+    require(model.panel().template_names == reordered.panel().template_names &&
+                model.panel().template_alleles == reordered.panel().template_alleles,
+            "panel mapping must be stable under input record reordering");
+    require(model.blocks().size() == reordered.blocks().size(),
+            "reordering must preserve the number of prepared blocks");
+    for (std::size_t b = 0; b < model.blocks().size(); ++b) {
+        require(model.blocks()[b].alleles.size() == reordered.blocks()[b].alleles.size(),
+                "reordering must preserve canonical allele count");
+        for (std::size_t a = 0; a < model.blocks()[b].alleles.size(); ++a) {
+            const auto& lhs = model.blocks()[b].alleles[a];
+            const auto& rhs = reordered.blocks()[b].alleles[a];
+            require(lhs.id == rhs.id && lhs.stable_id == rhs.stable_id &&
+                        lhs.sequence == rhs.sequence && lhs.source_ids == rhs.source_ids &&
+                        lhs.panel_carrier_count == rhs.panel_carrier_count,
+                    "canonical allele identity must be stable under input record reordering");
+        }
+    }
+
+    panvar::StructuralLocusInput duplicate_template = input;
+    duplicate_template.templates.push_back(duplicate_template.templates.front());
+    require_throws([&] { panvar::prepare_genotype_model(duplicate_template); },
+                   "duplicate template names must refuse");
+
+    panvar::StructuralLocusInput missing_mapping = input;
+    missing_mapping.templates.front().allele_source_ids[0] = "not-in-block";
+    require_throws([&] { panvar::prepare_genotype_model(missing_mapping); },
+                   "a template mapping to an absent block allele must refuse");
+
+    panvar::StructuralLocusInput inconsistent_blocks = input;
+    inconsistent_blocks.templates.front().allele_source_ids.pop_back();
+    require_throws([&] { panvar::prepare_genotype_model(inconsistent_blocks); },
+                   "a template missing one block mapping must refuse");
+
+    panvar::StructuralLocusInput partial_frame = input;
+    partial_frame.templates.front().frame_status = panvar::TemplateFrameStatus::Partial;
+    require_throws([&] { panvar::prepare_genotype_model(partial_frame); },
+                   "a partial panel frame must refuse explicitly");
+
+    panvar::StructuralLocusInput duplicate_block = input;
+    duplicate_block.blocks[1].block_id = duplicate_block.blocks[0].block_id;
+    require_throws([&] { panvar::prepare_genotype_model(duplicate_block); },
+                   "duplicate block names must refuse");
+
+    panvar::StructuralLocusInput duplicate_source = input;
+    duplicate_source.blocks[0].alleles[1].source_id =
+        duplicate_source.blocks[0].alleles[0].source_id;
+    require_throws([&] { panvar::prepare_genotype_model(duplicate_source); },
+                   "duplicate source allele names within one block must refuse");
+
+    panvar::StructuralLocusInput missing_context = input;
+    missing_context.invariant_segments.pop_back();
+    require_throws([&] { panvar::prepare_genotype_model(missing_context); },
+                   "an incomplete invariant-context frame must refuse");
+}
+
 void test_li_stephens_prior() {
     panvar::PanelAlleleMatrix panel;
     panel.template_names = {"h0", "h1", "h2"};
@@ -210,6 +344,7 @@ void test_li_stephens_prior() {
 int main() {
     try {
         test_library_model();
+        test_prepared_genotype_model();
         test_li_stephens_prior();
         std::cout << "genotype mosaic core: PASS\n";
         return 0;

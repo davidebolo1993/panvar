@@ -24,7 +24,8 @@ The clean starting point is commit `1d87162`. The first model foundation is comm
 - the fixture explicitly distinguishes exact marginalization from keeping only the best template
   history.
 
-The next implementation phase is **Phase 2: immutable panel/block model**.
+Phase 2 now provides the immutable panel/block model and its refusal/round-trip gates. The next
+implementation phase is **Phase 3: strict mosaic spelling**.
 
 Historical code is available from Git, not from the current source tree:
 
@@ -62,6 +63,62 @@ The design combines two useful ideas:
 
 The caller can recombine block alleles already represented in the graph. It does not invent a new
 block allele sequence.
+
+## What is actually genotyped
+
+The latent call is a **pair of whole-locus mosaic haplotypes**, not a collection of independent block
+genotypes. A haploid mosaic chooses one block allele at every ordered block. Its hidden panel
+template may remain the same or switch at a block boundary under the Li-Stephens transition. The
+workflow is therefore:
+
+1. infer a bounded set of phased, whole-locus mosaic pairs;
+2. spell both complete locus sequences, including invariant contexts;
+3. score paired reads against each complete diploid locus candidate;
+4. choose the winning locus candidate or a certified equivalence set;
+5. project that result back to one unordered allele pair per block for output and evaluation.
+
+Blocks are the state alphabet, legal switch coordinates, and reporting units. They are not called
+independently. A fragment crossing a boundary can therefore reject a locally plausible but
+whole-locus-incoherent combination.
+
+This distinction also states the graph's representation limit precisely. Every original complete
+panel path must respell byte-for-byte, so the block decomposition may not corrupt sequences already
+in the panel. A new mosaic, however, is only a mechanically valid concatenation of represented block
+alleles; it is not automatically a biologically observed haplotype. The switch prior penalizes
+unnecessary recombination and the whole-locus fragment likelihood tests its junctions. The caller
+still cannot recover sequence absent from every block allele, and it can switch only at declared
+block boundaries. LOO availability ceilings must report that representation limit separately from
+caller error.
+
+### Relationship to PanGenie and Locityper
+
+[PanGenie](https://www.nature.com/articles/s41588-022-01043-w) supplies the proposal-side idea: its
+HMM follows pairs of panel haplotype paths along graph bubbles and permits recombination between
+bubbles, thereby modelling the sample as a mosaic. It then obtains local genotype likelihoods from
+that HMM. The replacement Panvar caller retains mosaic generation but makes the retained
+**whole-locus diplotype** the unit of final comparison.
+
+[Locityper](https://pmc.ncbi.nlm.nih.gov/articles/PMC11844405/) supplies the ranking-side idea: align
+and assign paired reads to complete locus haplotypes while accounting for edit likelihood, insert
+size, depth, and competing placements. Locityper selects among supplied reference haplotypes; the
+Panvar candidate set may also contain off-panel mosaics assembled from represented block alleles.
+
+The statement that PanGenie “does not use multiplicity” needs qualification. PanGenie uses observed
+k-mer counts, but deliberately selects k-mers that occur at most once within an allele and nowhere
+outside the bubble. That avoids ambiguous repeated origins; it does not model the repeat-copy
+placement multiplicity that is essential at loci such as LPA. Panvar keeps four different quantities
+separate:
+
+| Quantity | Where it belongs | Required treatment |
+|---|---|---|
+| Sequence-identical graph routes | structural model | collapse to one callable allele, retain every source alias |
+| Panel templates carrying an allele | structural model / prior | retain carrier count; do not mistake it for read evidence |
+| Repeated marker occurrences inside an allele | proposal model | retain exact occurrence count when informative; never reduce blindly to presence/absence |
+| Distinct physical placements of a fragment | final likelihood | sum all valid origins; compress only with exact log-multiplicity |
+
+Thus the intended model is not merely “PanGenie plus Locityper.” It is a PanGenie-like, multiplicity-
+aware mosaic proposal followed by a Locityper-like whole-locus comparison whose fragment likelihood
+preserves repeated physical origins exactly.
 
 ## Non-negotiable statistical contract
 
@@ -304,18 +361,19 @@ Implemented at `fefd4f9`:
 Reviewer checkpoint: verify the exhaustive oracle is independent, the zero-probability arm is not
 skipped, and the fixture distinguishes summing histories from retaining only the best.
 
-### Phase 2 — immutable panel/block model: next
+### Phase 2 — immutable panel/block model: complete
 
-Build one prepared model containing:
+`genotype_model` now builds one prepared model containing:
 
 - ordered blocks and their invariant contexts;
 - every block allele sequence and stable allele ID;
 - panel template names;
 - `template -> block -> allele` mapping;
 - chain orientation and complete/partial-frame status;
-- marker universe and observations only after the structural model passes.
+- a deliberately structural-only interface; marker universe and observations remain absent until
+  the structural model passes.
 
-Acceptance gates:
+Acceptance gates implemented in `genotype_mosaic_core`:
 
 1. Every complete panel template has exactly one allele at every block.
 2. Duplicate names, missing mappings, inconsistent block counts, or partial frames refuse explicitly.
@@ -323,7 +381,13 @@ Acceptance gates:
 4. A complete index round-trip recovers `(template, block, allele)` exactly.
 5. No truth or experiment label is present in the prepared model.
 
-Commit before marker emissions are added.
+Additional multiplicity contract: sequence-identical source walks collapse by exact sequence, but
+their sorted source aliases and panel-carrier counts remain attached to the canonical allele. Empty
+bypass alleles remain explicit states. Block order stays semantic; allele records and template rows
+are canonicalized independently of their input order.
+
+The graph-facing adapter and authoritative byte-for-byte panel-path check belong to Phase 3, where
+the speller exists. No marker emission code may be added before that round-trip passes.
 
 ### Phase 3 — strict mosaic spelling
 

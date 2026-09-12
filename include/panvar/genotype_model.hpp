@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -69,6 +70,94 @@ struct PanelAlleleMatrix {
         return template_alleles.empty() ? 0 : template_alleles.front().size();
     }
 };
+
+// Structural inputs are intentionally separate from truth and experiment metadata. A graph-facing
+// adapter may populate these records later, but the statistical model only accepts this narrow,
+// auditable representation.
+enum class ChainOrientation { Forward, Reverse };
+enum class TemplateFrameStatus { Complete, Partial };
+
+struct BlockAlleleInput {
+    // Block-local identifier of the graph walk/record carrying this sequence. Several source records
+    // may spell identical sequence; they are retained as aliases of one canonical allele.
+    std::string source_id;
+    std::string sequence;
+};
+
+struct GenotypeBlockInput {
+    std::string block_id;
+    std::vector<BlockAlleleInput> alleles;
+};
+
+struct PanelTemplateInput {
+    std::string name;
+    TemplateFrameStatus frame_status = TemplateFrameStatus::Complete;
+    // Exactly one block-local source allele identifier for every ordered block.
+    std::vector<std::string> allele_source_ids;
+};
+
+struct StructuralLocusInput {
+    std::string locus_id;
+    ChainOrientation chain_orientation = ChainOrientation::Forward;
+    std::vector<GenotypeBlockInput> blocks;
+    // There are blocks+1 invariant segments: before block 0, between each adjacent pair, and after
+    // the final block. Empty segments are valid and are not missing data.
+    std::vector<std::string> invariant_segments;
+    std::vector<PanelTemplateInput> templates;
+};
+
+struct CanonicalBlockAllele {
+    std::size_t id = 0;
+    std::string stable_id;
+    std::string sequence;
+    std::vector<std::string> source_ids;
+    std::size_t panel_carrier_count = 0;
+};
+
+struct PreparedGenotypeBlock {
+    std::string block_id;
+    std::vector<CanonicalBlockAllele> alleles;
+    std::map<std::string, std::size_t> allele_id_by_source;
+
+    std::size_t allele_id_for_source(const std::string& source_id) const;
+};
+
+// Immutable after construction: only const accessors expose its components. Construction validates
+// the complete panel frame first, canonicalizes sequence-identical alleles, and assigns IDs from
+// sequence order rather than input record order.
+class PreparedGenotypeModel {
+public:
+    const std::string& locus_id() const noexcept { return locus_id_; }
+    ChainOrientation chain_orientation() const noexcept { return chain_orientation_; }
+    TemplateFrameStatus frame_status() const noexcept { return TemplateFrameStatus::Complete; }
+    const std::vector<PreparedGenotypeBlock>& blocks() const noexcept { return blocks_; }
+    const std::vector<std::string>& invariant_segments() const noexcept {
+        return invariant_segments_;
+    }
+    const PanelAlleleMatrix& panel() const noexcept { return panel_; }
+
+    const CanonicalBlockAllele& allele(
+        std::size_t block_id,
+        std::size_t allele_id) const;
+
+private:
+    friend PreparedGenotypeModel prepare_genotype_model(const StructuralLocusInput& input);
+
+    PreparedGenotypeModel(
+        std::string locus_id,
+        ChainOrientation chain_orientation,
+        std::vector<PreparedGenotypeBlock> blocks,
+        std::vector<std::string> invariant_segments,
+        PanelAlleleMatrix panel);
+
+    std::string locus_id_;
+    ChainOrientation chain_orientation_ = ChainOrientation::Forward;
+    std::vector<PreparedGenotypeBlock> blocks_;
+    std::vector<std::string> invariant_segments_;
+    PanelAlleleMatrix panel_;
+};
+
+PreparedGenotypeModel prepare_genotype_model(const StructuralLocusInput& input);
 
 struct MosaicPath {
     std::vector<std::size_t> alleles;
