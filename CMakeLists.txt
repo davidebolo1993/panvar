@@ -127,6 +127,7 @@ add_library(panvarlib
     src/syncmer.cpp
     src/genotype_model.cpp
     src/ls_hmm.cpp
+    src/mosaic_spelling.cpp
     src/bubble_path.cpp
     src/bubbles.cpp
     src/ref_path.cpp
@@ -219,8 +220,8 @@ if(PANVAR_BUILD_TESTING)
     include(CTest)
     if(BUILD_TESTING)
         # Mathematical foundation of the replacement mosaic genotyper. This is a direct C++ test so
-        # model code is certified before a CLI exists: fragment-specific overlapping-pair support,
-        # discrete insert normalization, and exact Li-Stephens marginalization over template paths.
+        # model code is certified before a CLI exists: immutable block preparation, strict mosaic
+        # spelling, fragment-specific insert normalization, and exact Li-Stephens marginalization.
         add_executable(genotype_mosaic_core_test tests/genotype_mosaic_core.cpp)
         target_link_libraries(genotype_mosaic_core_test PRIVATE panvarlib)
         target_compile_options(genotype_mosaic_core_test PRIVATE -Wall -Wextra -Wpedantic)

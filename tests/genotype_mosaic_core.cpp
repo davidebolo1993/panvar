@@ -1,5 +1,6 @@
 #include "panvar/genotype_model.hpp"
 #include "panvar/ls_hmm.hpp"
+#include "panvar/mosaic_spelling.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -157,6 +158,7 @@ panvar::StructuralLocusInput structural_fixture(bool reordered) {
         {"hap-a", panvar::TemplateFrameStatus::Complete, {"walk-ref-1", "walk-one"}},
         {"hap-m", panvar::TemplateFrameStatus::Complete, {"walk-ref-2", "walk-bypass"}},
     };
+    input.templates[2].source_orientation = panvar::ChainOrientation::Reverse;
     if (reordered) {
         std::reverse(input.blocks[0].alleles.begin(), input.blocks[0].alleles.end());
         std::reverse(input.blocks[1].alleles.begin(), input.blocks[1].alleles.end());
@@ -221,7 +223,9 @@ void test_prepared_genotype_model() {
 
     // Reordering source records and template records cannot alter canonical IDs or the panel matrix.
     require(model.panel().template_names == reordered.panel().template_names &&
-                model.panel().template_alleles == reordered.panel().template_alleles,
+                model.panel().template_alleles == reordered.panel().template_alleles &&
+                model.template_source_orientations() ==
+                    reordered.template_source_orientations(),
             "panel mapping must be stable under input record reordering");
     require(model.blocks().size() == reordered.blocks().size(),
             "reordering must preserve the number of prepared blocks");
@@ -273,6 +277,129 @@ void test_prepared_genotype_model() {
     missing_context.invariant_segments.pop_back();
     require_throws([&] { panvar::prepare_genotype_model(missing_context); },
                    "an incomplete invariant-context frame must refuse");
+}
+
+std::string independent_reverse_complement(const std::string& sequence) {
+    std::string result;
+    result.reserve(sequence.size());
+    for (auto it = sequence.rbegin(); it != sequence.rend(); ++it) {
+        switch (*it) {
+            case 'A': result.push_back('T'); break;
+            case 'C': result.push_back('G'); break;
+            case 'G': result.push_back('C'); break;
+            case 'T': result.push_back('A'); break;
+            default: result.push_back('N'); break;
+        }
+    }
+    return result;
+}
+
+std::size_t template_id(const panvar::PreparedGenotypeModel& model, const std::string& name) {
+    const auto found = std::find(
+        model.panel().template_names.begin(), model.panel().template_names.end(), name);
+    if (found == model.panel().template_names.end()) {
+        throw std::runtime_error("fixture template not found: " + name);
+    }
+    return static_cast<std::size_t>(found - model.panel().template_names.begin());
+}
+
+void test_mosaic_spelling() {
+    const panvar::StructuralLocusInput input = structural_fixture(false);
+    const panvar::PreparedGenotypeModel model = panvar::prepare_genotype_model(input);
+
+    const panvar::HaplotypeSequence hap_a =
+        panvar::spell_panel_template(model, template_id(model, "hap-a"));
+    const panvar::HaplotypeSequence hap_m =
+        panvar::spell_panel_template(model, template_id(model, "hap-m"));
+    const panvar::HaplotypeSequence hap_z =
+        panvar::spell_panel_template(model, template_id(model, "hap-z"));
+    require(hap_a.bases == "LEFTACMIDDLECCRIGHT" &&
+                hap_m.bases == "LEFTACMIDDLERIGHT" &&
+                hap_z.bases == "LEFTTTMIDDLEGGRIGHT",
+            "every panel template must spell in canonical chain orientation");
+
+    const std::vector<panvar::AuthoritativePanelSequence> authoritative = {
+        {"hap-z", "LEFTTTMIDDLEGGRIGHT"},
+        {"hap-m", independent_reverse_complement("LEFTACMIDDLERIGHT")},
+        {"hap-a", "LEFTACMIDDLECCRIGHT"},
+    };
+    panvar::verify_complete_panel_round_trip(model, authoritative);
+
+    // This allele combination is carried by no panel template. It must still spell directly from
+    // the block alphabet, with every invariant segment present once and the bypass allele explicit.
+    const panvar::MosaicPath recombinant{{
+        model.blocks()[0].allele_id_for_source("walk-alt"),
+        model.blocks()[1].allele_id_for_source("walk-bypass"),
+    }};
+    const panvar::HaplotypeSequence novel = panvar::spell_mosaic(model, recombinant);
+    require(novel.bases == "LEFTTTMIDDLERIGHT",
+            "off-panel recombinant must spell the hand-computed locus sequence");
+    require(novel.invariant_intervals ==
+                std::vector<panvar::SequenceInterval>({{0, 4}, {6, 12}, {12, 17}}),
+            "invariant contexts must appear exactly once at their expected coordinates");
+    require(novel.block_intervals ==
+                std::vector<panvar::SequenceInterval>({{4, 6}, {12, 12}}),
+            "block intervals must cover variable lengths and a zero-width bypass exactly");
+
+    // An antiparallel source path has mirrored source coordinates. Comparing this exact result to
+    // the raw chain coordinate makes the historical raw-walk-coordinate mutation non-vacuous.
+    const panvar::SequenceInterval chain_block = hap_m.block_intervals[0];
+    const panvar::SequenceInterval source_block = panvar::interval_in_source_frame(
+        chain_block, hap_m.bases.size(), panvar::ChainOrientation::Reverse);
+    require(chain_block == panvar::SequenceInterval{4, 6},
+            "fixture must pin the forward chain block interval");
+    require(source_block == panvar::SequenceInterval{11, 13} && source_block != chain_block,
+            "reverse source frame must mirror rather than reuse raw chain coordinates");
+    require(panvar::sequence_in_source_frame(
+                hap_m.bases, panvar::ChainOrientation::Reverse) == authoritative[1].source_frame_bases,
+            "reverse source frame must be the exact reverse complement of chain spelling");
+
+    // Source record names and graph-route multiplicity cannot affect the spelled statistical state.
+    panvar::StructuralLocusInput alternative_topology = input;
+    alternative_topology.blocks[0].alleles.push_back({"other-route-ref", "AC"});
+    alternative_topology.blocks[1].alleles.push_back({"other-route-one", "CC"});
+    for (auto& panel_template : alternative_topology.templates) {
+        if (panel_template.name == "hap-a") {
+            panel_template.allele_source_ids = {"other-route-ref", "other-route-one"};
+        }
+    }
+    const panvar::PreparedGenotypeModel alternative =
+        panvar::prepare_genotype_model(alternative_topology);
+    require(model.panel().template_names == alternative.panel().template_names &&
+                model.panel().template_alleles == alternative.panel().template_alleles,
+            "sequence-equivalent graph route aliases must not change the HMM state matrix");
+    for (const std::string& name : model.panel().template_names) {
+        require(panvar::spell_panel_template(model, template_id(model, name)).bases ==
+                    panvar::spell_panel_template(alternative, template_id(alternative, name)).bases,
+                "sequence-equivalent graph route aliases must not change panel spelling");
+    }
+    require(panvar::spell_mosaic(alternative, recombinant).bases == novel.bases,
+            "sequence-equivalent graph route aliases must not change recombinant spelling");
+
+    // The round-trip, rather than construction alone, is what detects a context duplicated or lost
+    // during graph decomposition.
+    panvar::StructuralLocusInput omitted_context_input = input;
+    omitted_context_input.invariant_segments[1].clear();
+    const panvar::PreparedGenotypeModel omitted_context =
+        panvar::prepare_genotype_model(omitted_context_input);
+    require_throws(
+        [&] { panvar::verify_complete_panel_round_trip(omitted_context, authoritative); },
+        "omitting an invariant context must fail authoritative panel round-trip");
+
+    panvar::StructuralLocusInput duplicated_context_input = input;
+    duplicated_context_input.invariant_segments[1] += input.invariant_segments[1];
+    const panvar::PreparedGenotypeModel duplicated_context =
+        panvar::prepare_genotype_model(duplicated_context_input);
+    require_throws(
+        [&] { panvar::verify_complete_panel_round_trip(duplicated_context, authoritative); },
+        "duplicating an invariant context must fail authoritative panel round-trip");
+
+    require_throws(
+        [&] { panvar::spell_mosaic(model, panvar::MosaicPath{{0}}); },
+        "mosaic missing a block allele must refuse");
+    require_throws(
+        [&] { panvar::spell_mosaic(model, panvar::MosaicPath{{0, 99}}); },
+        "mosaic with an out-of-range allele must refuse");
 }
 
 void test_li_stephens_prior() {
@@ -345,6 +472,7 @@ int main() {
     try {
         test_library_model();
         test_prepared_genotype_model();
+        test_mosaic_spelling();
         test_li_stephens_prior();
         std::cout << "genotype mosaic core: PASS\n";
         return 0;

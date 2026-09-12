@@ -149,12 +149,14 @@ PreparedGenotypeModel::PreparedGenotypeModel(
     ChainOrientation chain_orientation,
     std::vector<PreparedGenotypeBlock> blocks,
     std::vector<std::string> invariant_segments,
-    PanelAlleleMatrix panel)
+    PanelAlleleMatrix panel,
+    std::vector<ChainOrientation> template_source_orientations)
     : locus_id_(std::move(locus_id)),
       chain_orientation_(chain_orientation),
       blocks_(std::move(blocks)),
       invariant_segments_(std::move(invariant_segments)),
-      panel_(std::move(panel)) {}
+      panel_(std::move(panel)),
+      template_source_orientations_(std::move(template_source_orientations)) {}
 
 const CanonicalBlockAllele& PreparedGenotypeModel::allele(
     std::size_t block_id,
@@ -249,6 +251,8 @@ PreparedGenotypeModel prepare_genotype_model(const StructuralLocusInput& input) 
     PanelAlleleMatrix panel;
     panel.template_names.reserve(ordered_templates.size());
     panel.template_alleles.reserve(ordered_templates.size());
+    std::vector<ChainOrientation> template_source_orientations;
+    template_source_orientations.reserve(ordered_templates.size());
     std::string previous_name;
     for (const PanelTemplateInput* input_template : ordered_templates) {
         if (input_template->name.empty()) {
@@ -283,6 +287,7 @@ PreparedGenotypeModel prepare_genotype_model(const StructuralLocusInput& input) 
         }
         panel.template_names.push_back(input_template->name);
         panel.template_alleles.push_back(std::move(row));
+        template_source_orientations.push_back(input_template->source_orientation);
     }
     validate_panel(panel);
 
@@ -291,7 +296,8 @@ PreparedGenotypeModel prepare_genotype_model(const StructuralLocusInput& input) 
         input.chain_orientation,
         std::move(blocks),
         input.invariant_segments,
-        std::move(panel));
+        std::move(panel),
+        std::move(template_source_orientations));
 }
 
 } // namespace panvar

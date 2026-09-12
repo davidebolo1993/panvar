@@ -94,10 +94,17 @@ struct PanelTemplateInput {
     TemplateFrameStatus frame_status = TemplateFrameStatus::Complete;
     // Exactly one block-local source allele identifier for every ordered block.
     std::vector<std::string> allele_source_ids;
+    // Orientation of this template's authoritative source path relative to the canonical block
+    // chain. It is retained per template because one panel may contain both parallel and
+    // antiparallel paths.
+    ChainOrientation source_orientation = ChainOrientation::Forward;
 };
 
 struct StructuralLocusInput {
     std::string locus_id;
+    // Blocks, alleles and invariant segments below are already expressed in canonical chain order
+    // and orientation. This records how that canonical chain relates to the external reference
+    // coordinate frame; it must not cause statistical code to reinterpret their bytes.
     ChainOrientation chain_orientation = ChainOrientation::Forward;
     std::vector<GenotypeBlockInput> blocks;
     // There are blocks+1 invariant segments: before block 0, between each adjacent pair, and after
@@ -135,6 +142,9 @@ public:
         return invariant_segments_;
     }
     const PanelAlleleMatrix& panel() const noexcept { return panel_; }
+    const std::vector<ChainOrientation>& template_source_orientations() const noexcept {
+        return template_source_orientations_;
+    }
 
     const CanonicalBlockAllele& allele(
         std::size_t block_id,
@@ -148,13 +158,15 @@ private:
         ChainOrientation chain_orientation,
         std::vector<PreparedGenotypeBlock> blocks,
         std::vector<std::string> invariant_segments,
-        PanelAlleleMatrix panel);
+        PanelAlleleMatrix panel,
+        std::vector<ChainOrientation> template_source_orientations);
 
     std::string locus_id_;
     ChainOrientation chain_orientation_ = ChainOrientation::Forward;
     std::vector<PreparedGenotypeBlock> blocks_;
     std::vector<std::string> invariant_segments_;
     PanelAlleleMatrix panel_;
+    std::vector<ChainOrientation> template_source_orientations_;
 };
 
 PreparedGenotypeModel prepare_genotype_model(const StructuralLocusInput& input);

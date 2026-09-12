@@ -24,8 +24,9 @@ The clean starting point is commit `1d87162`. The first model foundation is comm
 - the fixture explicitly distinguishes exact marginalization from keeping only the best template
   history.
 
-Phase 2 now provides the immutable panel/block model and its refusal/round-trip gates. The next
-implementation phase is **Phase 3: strict mosaic spelling**.
+Phases 2 and the core of Phase 3 now provide the immutable panel/block model and strict mosaic
+speller. The next implementation phase is **Phase 4: marker proposal model**, after the graph-facing
+adapter passes the same panel round-trip on real inputs.
 
 Historical code is available from Git, not from the current source tree:
 
@@ -81,6 +82,12 @@ Blocks are the state alphabet, legal switch coordinates, and reporting units. Th
 independently. A fragment crossing a boundary can therefore reject a locally plausible but
 whole-locus-incoherent combination.
 
+This still permits a different genotype at every block: the two winning mosaics each carry an allele
+at every block and may switch template ancestry at every boundary. The primary block call is the
+projection of one coherent MAP locus pair. Per-block posterior marginals may also be reported, but a
+separate argmax at every block must be labelled as a marginal summary: those independently selected
+alleles can form a chimeric pair that no retained locus candidate realises.
+
 This distinction also states the graph's representation limit precisely. Every original complete
 panel path must respell byte-for-byte, so the block decomposition may not corrupt sequences already
 in the panel. A new mosaic, however, is only a mechanically valid concatenation of represented block
@@ -89,6 +96,15 @@ unnecessary recombination and the whole-locus fragment likelihood tests its junc
 still cannot recover sequence absent from every block allele, and it can switch only at declared
 block boundaries. LOO availability ceilings must report that representation limit separately from
 caller error.
+
+The representation-invariance boundary is equally important. Splitting a graph node, merging nodes,
+renaming internal nodes, changing record order, or providing several routes that spell identical
+bytes must not change a call, provided the resulting ordered block sequences, invariant contexts,
+and panel allele matrix are unchanged. All statistical code therefore starts after exact sequence
+canonicalisation and never reads graph edges. Changing the block boundaries or the panel composition
+is different: those change the allowed switch coordinates or the Li-Stephens prior and consequently
+change the statistical model. Both must receive a model fingerprint in command output when the CLI
+is added.
 
 ### Relationship to PanGenie and Locityper
 
@@ -386,12 +402,13 @@ their sorted source aliases and panel-carrier counts remain attached to the cano
 bypass alleles remain explicit states. Block order stays semantic; allele records and template rows
 are canonicalized independently of their input order.
 
-The graph-facing adapter and authoritative byte-for-byte panel-path check belong to Phase 3, where
-the speller exists. No marker emission code may be added before that round-trip passes.
+The command's graph-facing adapter is not permitted to rebuild these types privately. When it is
+added, it must populate this input and pass Phase 3's authoritative byte-for-byte panel-path check
+before marker emissions are constructed.
 
-### Phase 3 — strict mosaic spelling
+### Phase 3 — strict mosaic spelling: core complete
 
-Create one `MosaicPath`/`HaplotypeSequence` speller. It must handle:
+`mosaic_spelling` provides one `MosaicPath`/`HaplotypeSequence` speller. It handles:
 
 - chain orientation and reverse frames;
 - bypass and empty alleles;
@@ -400,13 +417,23 @@ Create one `MosaicPath`/`HaplotypeSequence` speller. It must handle:
 - recombinant paths with no graph P-line;
 - explicit partial-frame refusal.
 
-Acceptance gates:
+Acceptance gates implemented in `genotype_mosaic_core`:
 
 1. Derive and respell every complete panel path; bytes must equal its authoritative sequence.
 2. Spell an off-panel recombinant with a hand-computed expected sequence.
 3. Cover reverse orientation, boundaries, empty alleles, and variable allele lengths.
 4. Mutation: duplicate or omit an invariant context; round-trip must fail.
 5. Mutation: use raw walk coordinates on a reverse frame; mirrored interval gate must fail.
+
+The authoritative sequences are external structural inputs used only by the verifier; they are not
+stored in the prepared inference model. Per-template source orientation is retained because one
+panel can contain both parallel and antiparallel paths. Spelled candidates and all block intervals
+are always emitted in canonical chain orientation.
+
+The current gates use a complete hand-built panel and an alternative route representation. The
+graph-facing command adapter remains an integration checkpoint: before any real marker model is
+accepted, it must run the same verifier over every complete path of at least the C4 fixture and prove
+that a node-split/node-merge equivalent graph produces the same prepared model fingerprint.
 
 ### Phase 4 — marker proposal model
 
