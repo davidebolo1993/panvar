@@ -263,11 +263,17 @@ after it, because pruning on the fragment term alone would discard candidates th
 rescued. The proposal score is not passed and may never be. Context blocks are modelled but never
 reported as calls. The fingerprint is keyed on the graph's reference frame, not the output prefix.
 
-### Dry run on real C4
+### An LZO run on real C4
 
-One frozen donor simulated at 30x from two panel templates (`HG00096#1` and `HG00268#2`, the latter
-one of the 60 antiparallel ones), 34,415 read pairs, 100 bp mates, insert 350±40, 0.2% substitution
-error, declared library parameters.
+This is a **leave-zero-out run**, not a precursor to one: both truth haplotypes are panel templates,
+which is what LZO means. An earlier draft of this document called Phase 8 "a held-out LZO donor",
+which conflated two senses of held-out. Phase 9's held-out cohort is held out from *development
+inspection*, not removed from the panel; only Phase 10 removes a donor's haplotypes from the panel.
+LZO always has the donor in the panel.
+
+Simulated at 30x from `HG00096#1` and `HG00268#2`, the second one of the 60 antiparallel templates:
+34,415 read pairs, 100 bp mates, insert 350±40, 0.2% substitution error, declared library
+parameters.
 
 | K | Status | Certified gap | Total | Peak RSS |
 |---|---|---|---|---|
@@ -276,32 +282,73 @@ error, declared library parameters.
 
 Against the Phase 8 gate of 90 s and 4 GB: 14x under time, 7.5x under memory. Stage split at K=64:
 model 0.96 s, markers 0.95 s, proposal 0.37 s, spelling 0.00 s, rescoring 4.05 s. Rescoring
-dominates, as expected.
+dominates, as designed for.
 
-**Both called haplotypes are byte-exact matches to the two simulated truth haplotypes** — 226,137
-and 232,743 bp, the second in reverse complement, which is correct because that template is
-antiparallel and the caller emits in canonical chain orientation.
+#### Accuracy, verified at block level
 
-Three things this result is *not*. The truth haplotypes are panel templates, so this is the easy
-end of the problem — Phase 8 is LZO and Phase 10 is LOO, and neither is this. The reads were
-simulated under exactly the declared library model. And the beam returned only 8 unique candidates
-at K=64, so the candidate set is much narrower than K; whether that is the switch prior, the marker
-emissions, or a real property of C4 is a question for the first LZO run.
+Both called haplotypes are byte-exact matches to the two truth haplotypes — 226,137 and 232,743 bp,
+the second in reverse complement, correct because that template is antiparallel and the caller emits
+in canonical chain orientation.
+
+Byte equality does not by itself prove the per-block calls are right: a different combination of
+block alleles could in principle concatenate to the same string. So the allele paths were compared
+directly against the panel rows:
+
+```text
+truth HG00096#1  25,53,61,13,6,0,2,97,22,1,51     called hap1  25,53,61,13,6,0,2,97,22,1,51
+truth HG00268#2  63,65,4,7,4,6,42,64,12,1,32      called hap2  63,65,4,7,4,6,42,64,12,1,32
+```
+
+All **22 block-allele assignments** are correct (11 blocks x 2 haplotypes), including the six context
+blocks, and correctly **phased**: the alleles sit on the right haplotypes, not merely in the right
+unordered pair. The five reported SV calls are `sv:1` 53/65 HET, `sv:3` 13/7 HET, `sv:5` 0/6 HET,
+`sv:7` 97/64 HET, `sv:9` 1/1 HOM, each matching truth.
+
+#### What LZO can and cannot establish
+
+**LZO structurally cannot exercise recombination.** When the donor's haplotypes are panel templates,
+the truth is reachable by copying two panel rows, and the Li-Stephens prior actively prefers that,
+because every switch costs. The winning mosaic here is exactly two panel rows with zero switches. So
+the mosaic machinery — the capability the whole design exists for — was idle throughout this run.
+
+That reframes the candidate-set narrowness. The beam returned only 8 unique candidates at K=64,
+which an earlier draft flagged as a possible defect. In LZO there is little for it to explore,
+because the winner needs no switches; narrowness is the expected behaviour rather than evidence of a
+problem. Whether it is a problem becomes visible only at LOO, where the truth is not copyable.
+
+What this run does establish: the plumbing is correct end to end — adapter, markers, beam, spelling,
+scorer, certification, projection — the runtime gate passes with an order of magnitude to spare, and
+the proposal retains and the ranking certifies a truth that is present in the panel.
+
+Two further caveats. The reads were simulated under exactly the declared library model, so this says
+nothing about robustness to a real library. And the "donor" is a chimera: `HG00096#1` and
+`HG00268#2` are haplotypes of two *different* samples, so this diploid is not one anybody carries.
 
 ## 6. Remaining work order
 
 ### Step 1 — Phase 8 one-donor C4 go/no-go
 
-The runtime half of the gate already passes on the dry run above. What remains is the accuracy half:
-the K = 8..256 ladder with truth-in-candidate rank, per-block true edlib distance, score gap,
-candidate-set probability, and winner stability between K and 2K, on a frozen LZO donor rather than
-a panel member.
+The scenario is already exercised by the LZO run above; what is missing is the protocol, not the
+setting:
+
+- a **real donor**: one sample's two haplotypes. The run above used haplotypes of two different
+  samples, which is a chimera rather than a diploid anyone carries;
+- the **K ladder** 8..256, with truth-in-candidate rank at each K and winner stability between K and
+  2K;
+- per-block true edlib distance, score gap and candidate-set probability;
+- a frozen checkpoint signature covering binary, manifest, parameters, scripts, simulator and seed.
+
+Each run takes about six seconds, so the ladder is minutes of compute.
 
 ### Step 2 — Phases 9 and 10
 
 The development pilot, the held-out LZO cohort, then LOO. Unchanged from the contract.
 
 ### Known limitations, carried forward
+
+- **No LOO evidence yet.** Everything measured so far is LZO, which by construction cannot test
+  whether the caller can build a haplotype absent from the panel. Until a LOO run exists, no claim
+  about the mosaic capability is supported by measurement.
 
 - **Library parameters are declared, not estimated.** `--library` is required. The contract asks for
   estimation with declaration as an option; version one has only the declaration. For a simulated
@@ -345,6 +392,11 @@ The development pilot, the held-out LZO cohort, then LOO. Unchanged from the con
    interval to 0.52. The alternative is that every real run returns `RESCORE_INCOMPLETE`, because
    the unconditional bound cannot be closed by any band the pigeonhole index supports. Confirm the
    policy, its default, and that reporting `fragments_declared_outlier` is sufficient auditing.
-7. **Candidate-set narrowness.** The beam returns 8 unique candidates at K=64 on the C4 dry run.
-   Whether that is the switch prior at 0.01, the marker emissions, or a real property of C4 is not
-   yet established, and it bears directly on the truth-in-candidate rate the go/no-go will measure.
+7. **Candidate-set narrowness, and what LZO can measure.** The beam returns 8 unique candidates at
+   K=64 on the LZO run. Because LZO structurally cannot exercise recombination — the truth is two
+   panel rows and the switch prior prefers exactly that — narrowness there is expected rather than
+   diagnostic. The consequence is that Phase 8's go/no-go can establish the plumbing, the runtime
+   gate, and truth retention, but not the caller's central claim: that it can assemble a haplotype
+   the panel does not contain. Confirm that this is the intended reading of the phase ordering, and
+   whether a single LOO probe should be run alongside Phase 8 rather than waiting for Phase 10 —
+   the ordering as written defers the first test of the mosaic a long way.
