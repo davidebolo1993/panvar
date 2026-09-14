@@ -84,9 +84,17 @@ struct BlockAlleleInput {
     std::string sequence;
 };
 
+// A locus is genotyped as an alternating chain: a variant block is a called bubble, and a context
+// block is the stretch between two consecutive bubbles (or the flanks beyond the outermost ones).
+// Context blocks are not filler. They carry the sub-threshold variation the SV size filter kept out
+// of the bubble list, which is what identifies which panel templates a sample sits on. Only variant
+// blocks are reporting units; both kinds are modelled identically.
+enum class GenotypeBlockKind { Variant, Context };
+
 struct GenotypeBlockInput {
     std::string block_id;
     std::vector<BlockAlleleInput> alleles;
+    GenotypeBlockKind kind = GenotypeBlockKind::Variant;
 };
 
 struct PanelTemplateInput {
@@ -123,6 +131,7 @@ struct CanonicalBlockAllele {
 
 struct PreparedGenotypeBlock {
     std::string block_id;
+    GenotypeBlockKind kind = GenotypeBlockKind::Variant;
     std::vector<CanonicalBlockAllele> alleles;
     std::map<std::string, std::size_t> allele_id_by_source;
 

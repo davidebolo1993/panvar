@@ -219,6 +219,7 @@ PreparedGenotypeModel prepare_genotype_model(const StructuralLocusInput& input) 
 
         PreparedGenotypeBlock block;
         block.block_id = input_block.block_id;
+        block.kind = input_block.kind;
         block.alleles.reserve(sources_by_sequence.size());
         for (auto& sequence_sources : sources_by_sequence) {
             std::sort(sequence_sources.second.begin(), sequence_sources.second.end());

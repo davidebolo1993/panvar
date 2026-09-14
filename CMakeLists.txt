@@ -128,6 +128,9 @@ add_library(panvarlib
     src/genotype_model.cpp
     src/ls_hmm.cpp
     src/mosaic_spelling.cpp
+    src/marker_model.cpp
+    src/mosaic_beam.cpp
+    src/genotype_locus.cpp
     src/bubble_path.cpp
     src/bubbles.cpp
     src/ref_path.cpp
@@ -226,6 +229,21 @@ if(PANVAR_BUILD_TESTING)
         target_link_libraries(genotype_mosaic_core_test PRIVATE panvarlib)
         target_compile_options(genotype_mosaic_core_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME panvar_genotype_mosaic_core COMMAND genotype_mosaic_core_test)
+
+        # bubbles.cpp draws its progress bar from cli_utils, which otherwise only the panvar
+        # executable compiles; this test is the first to link the bubble caller on its own.
+        add_executable(genotype_locus_adapter_test tests/genotype_locus_adapter.cpp src/cli_utils.cpp)
+        target_link_libraries(genotype_locus_adapter_test PRIVATE panvarlib)
+        target_compile_options(genotype_locus_adapter_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_genotype_locus_adapter
+                 COMMAND genotype_locus_adapter_test
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_data/c4.gfa.gz
+                         ${CMAKE_CURRENT_BINARY_DIR}/genotype_locus_c4)
+
+        add_executable(genotype_mosaic_proposal_test tests/genotype_mosaic_proposal.cpp)
+        target_link_libraries(genotype_mosaic_proposal_test PRIVATE panvarlib)
+        target_compile_options(genotype_mosaic_proposal_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_genotype_mosaic_proposal COMMAND genotype_mosaic_proposal_test)
 
         # Fast, dependency-free smoke on a tiny hand-built graph that exercises every
         # call event type + confounders with exact-record assertions (no vg needed).
