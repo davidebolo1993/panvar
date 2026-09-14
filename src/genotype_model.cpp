@@ -42,6 +42,12 @@ void validate_read_pair(const ReadPair& fragment) {
     validate_read(fragment.second, "second");
 }
 
+double log_background_probability(const ReadPair& fragment) {
+    validate_read_pair(fragment);
+    const std::size_t bases = fragment.first.bases.size() + fragment.second.bases.size();
+    return static_cast<double>(bases) * std::log(0.25);
+}
+
 void validate_library_model(const LibraryModel& model) {
     if (!std::isfinite(model.insert_mean_bp) || model.insert_mean_bp <= 0.0) {
         throw std::invalid_argument("insert mean must be finite and positive");
@@ -51,6 +57,19 @@ void validate_library_model(const LibraryModel& model) {
     }
     if (!std::isfinite(model.support_sigmas) || model.support_sigmas <= 0.0) {
         throw std::invalid_argument("insert support sigmas must be finite and positive");
+    }
+    if (!std::isfinite(model.substitution_error) || model.substitution_error <= 0.0 ||
+        model.substitution_error >= 0.75) {
+        throw std::invalid_argument(
+            "library substitution error must be in (0, 0.75): at 0.75 a mismatch is as likely as a "
+            "match under a uniform base model and the emission carries no information");
+    }
+    if (!std::isfinite(model.outlier_weight) || model.outlier_weight < 0.0 ||
+        model.outlier_weight >= 1.0) {
+        throw std::invalid_argument("library outlier weight must be in [0, 1)");
+    }
+    if (!std::isfinite(model.fragment_start_intensity) || model.fragment_start_intensity <= 0.0) {
+        throw std::invalid_argument("library fragment-start intensity must be finite and positive");
     }
     if (model.provenance.empty()) {
         throw std::invalid_argument("library model provenance must not be empty");

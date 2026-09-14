@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -102,6 +103,9 @@ void test_library_model() {
     model.insert_mean_bp = 350.0;
     model.insert_sd_bp = 50.0;
     model.support_sigmas = 6.0;
+    model.substitution_error = 0.01;
+    model.outlier_weight = 0.001;
+    model.fragment_start_intensity = 0.2;
     model.provenance = "fixture: declared";
 
     const panvar::ReadPair overlapping{make_read("r/1", 150), make_read("r/2", 150)};
@@ -137,6 +141,29 @@ void test_library_model() {
     bad_quality.first.qualities.pop_back();
     require_throws([&] { panvar::validate_read_pair(bad_quality); },
                    "base/quality length mismatch must refuse");
+
+    // Every scoring parameter is part of the same declared policy, so each must refuse on its own.
+    for (const auto& mutation : std::vector<std::pair<std::string, panvar::LibraryModel>>{
+             {"zero substitution error", [&] { auto m = model; m.substitution_error = 0.0; return m; }()},
+             {"uninformative substitution error",
+              [&] { auto m = model; m.substitution_error = 0.75; return m; }()},
+             {"outlier weight of one", [&] { auto m = model; m.outlier_weight = 1.0; return m; }()},
+             {"negative outlier weight", [&] { auto m = model; m.outlier_weight = -0.1; return m; }()},
+             {"zero fragment-start intensity",
+              [&] { auto m = model; m.fragment_start_intensity = 0.0; return m; }()},
+         }) {
+        require_throws([&] { panvar::validate_library_model(mutation.second); },
+                       "library model must refuse a " + mutation.first);
+    }
+
+    // The background term depends only on the fragment's own read lengths, so it is the same for
+    // every candidate and can never reorder them.
+    const panvar::ReadPair shorter{make_read("s/1", 100), make_read("s/2", 100)};
+    require_close(panvar::log_background_probability(overlapping), 300.0 * std::log(0.25), 1e-12,
+                  "background probability must be uniform over both mates' bases");
+    require(panvar::log_background_probability(shorter) >
+                panvar::log_background_probability(overlapping),
+            "a shorter fragment must have a larger background probability");
 
     panvar::LibraryModel no_provenance = model;
     no_provenance.provenance.clear();

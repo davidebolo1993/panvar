@@ -22,12 +22,30 @@ struct ReadPair {
 
 // The declared paired-end library model. Estimation and explicit overrides will both produce this
 // object, so every downstream scorer receives the same validated policy and records its provenance.
+// There is one of these, not one per scorer: a private copy of any of these parameters is how two
+// stages start disagreeing about the same library.
 struct LibraryModel {
     double insert_mean_bp = 0.0;
     double insert_sd_bp = 0.0;
     double support_sigmas = 0.0;
+    // Per-base substitution probability. Version one is substitutions only, with a fixed-position
+    // Hamming emission, so this is the whole error model.
+    double substitution_error = 0.0;
+    // Robust outlier mixture weight, eta in the fragment contract. A fragment that belongs to no
+    // candidate -- a chimera, a mismapped pair, contamination -- is absorbed here instead of driving
+    // the score of every candidate to minus infinity together.
+    double outlier_weight = 0.0;
+    // Fragment-start intensity per haplotype base: lambda in the fragment contract. This is a
+    // fragment-start rate, not a marker depth, and the two must not be conflated.
+    double fragment_start_intensity = 0.0;
     std::string provenance;
 };
+
+// The candidate-independent background probability of observing this fragment's bases at all, under
+// a uniform base model over both mates. It is the P_background(f) of the fragment contract: it
+// depends on the fragment's own read lengths and on nothing about any candidate, so it can never
+// reorder candidates -- which is exactly why it is safe to include.
+double log_background_probability(const ReadPair& fragment);
 
 struct InsertSupport {
     std::size_t min_bp = 1;
