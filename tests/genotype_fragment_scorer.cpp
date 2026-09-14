@@ -418,6 +418,213 @@ void test_counters_are_measured() {
               << " classes=" << counters.statistical_state_classes << '\n';
 }
 
+
+// -------------------------------------------------------------------------------------------
+// Gates 11, 12 and 14: certification.
+// -------------------------------------------------------------------------------------------
+
+// Gate 11: the certified interval must contain the exhaustive result.
+//
+// Note a real tension the bound has to carry: the scorer is exact only when the band is at least as
+// wide as the longest mate, and at that band the pigeonhole index has no pieces left to key on. So
+// exactness is never reached through the band -- it is the upper bound that does the certifying, and
+// the reference it is certified against is the oracle, on an independent code path.
+double exact_mass_from_oracle(
+    const std::string& haplotype,
+    const panvar::ReadPair& fragment,
+    const panvar::LibraryModel& model) {
+    const panvar::InsertSupport support = panvar::fragment_insert_support(fragment, model);
+    const panvar::DiscreteInsertDistribution insert =
+        panvar::build_fragment_insert_distribution(fragment, model);
+    const std::size_t unbounded =
+        std::max(fragment.first.bases.size(), fragment.second.bases.size());
+    const auto placements =
+        panvar::enumerate_placements_exhaustive(haplotype, fragment, support, unbounded);
+    return panvar::log_placement_mass(placements, fragment, insert, model);
+}
+
+void test_intervals_contain_truth() {
+    std::mt19937_64 rng(31337);
+    const std::string a = random_bases(rng, 420);
+    std::string b = a;
+    for (int edit = 0; edit < 25; ++edit) b[rng() % b.size()] = "ACGT"[rng() % 4];
+
+    std::vector<panvar::ReadPair> fragments;
+    for (std::size_t start : {30, 140, 250}) {
+        std::string first = a.substr(start, 55);
+        std::string second = a.substr(start + 65, 55);
+        // Three substitutions: beyond a band of two, so the narrow bands genuinely omit mass.
+        first[10] = first[10] == 'A' ? 'G' : 'A';
+        first[30] = first[30] == 'C' ? 'T' : 'C';
+        first[47] = first[47] == 'G' ? 'A' : 'G';
+        fragments.push_back({read("f/1", first), read("f/2", revcomp(second))});
+    }
+    const panvar::InternedHaplotypes interned = intern({a, b});
+    const panvar::LibraryModel model = library();
+
+    std::size_t omitting = 0;
+    for (std::size_t band : {1, 2, 3, 4}) {
+        panvar::FragmentScoringOptions options;
+        options.mismatch_band = band;
+        options.minimum_piece_bp = 8;
+        const panvar::FragmentScoringResult banded = panvar::score_diplotypes(
+            interned, {{0, 0}, {0, 1}, {1, 1}}, fragments, model, options);
+
+        for (std::size_t f = 0; f < fragments.size(); ++f) {
+            for (std::size_t h = 0; h < interned.sequences.size(); ++h) {
+                const double truth =
+                    exact_mass_from_oracle(interned.sequences[h], fragments[f], model);
+                if (truth == kNegInf) continue;
+                require(banded.mass_of(f, h) <= truth + 1e-9,
+                        "a banded mass must never exceed the unbounded mass it approximates");
+                require(banded.log_mass_upper[f * banded.unique_haplotypes + h] >= truth - 1e-9,
+                        "the certified mass interval must contain the exhaustive mass");
+                if (banded.mass_of(f, h) < truth - 1e-9) ++omitting;
+            }
+        }
+        for (const panvar::DiplotypeScore& score : banded.scores) {
+            require(score.log_likelihood_upper > score.log_likelihood,
+                    "a band narrower than the reads must report a genuine interval");
+        }
+    }
+    // If no band ever omitted anything the containment gate would hold trivially.
+    require(omitting > 0,
+            "the fixture must contain placements the narrow bands omit, or containment is vacuous");
+    std::cout << "  interval containment: " << omitting
+              << " (band, fragment, haplotype) cells genuinely omitted mass\n";
+}
+
+// Gate 12: a winner is emitted only when its lower bound beats every competing upper bound.
+void test_winner_requires_proof() {
+    std::mt19937_64 rng(646);
+    const std::string truth = random_bases(rng, 450);
+    std::string decoy = truth;
+    for (int edit = 0; edit < 60; ++edit) decoy[rng() % decoy.size()] = "ACGT"[rng() % 4];
+
+    std::vector<panvar::ReadPair> fragments;
+    for (std::size_t start = 20; start + 130 < truth.size(); start += 25) {
+        fragments.push_back({read("f/1", truth.substr(start, 55)),
+                             read("f/2", revcomp(truth.substr(start + 70, 55)))});
+    }
+    const panvar::InternedHaplotypes interned = intern({truth, decoy});
+    const panvar::LibraryModel model = library();
+    panvar::FragmentScoringOptions options;
+    options.minimum_piece_bp = 8;
+    panvar::CertificationOptions certification;
+    certification.initial_band = 2;
+    certification.maximum_band = 4;
+
+    const panvar::CertifiedRanking ranking = panvar::certify_diplotype_ranking(
+        interned, {{0, 0}, {0, 1}, {1, 1}}, fragments, model, options, certification);
+    require(ranking.status == panvar::RescoreStatus::Complete,
+            "a clearly separated fixture must certify a winner");
+    require(ranking.winner_set.size() == 1 && ranking.winner_set.front() == 0,
+            "the homozygous truth must win");
+    require(ranking.certified_gap > 0.0,
+            "a certified winner must have a positive gap to the best rival upper bound");
+    // The proof, restated independently of the returned status.
+    for (const panvar::CertifiedCandidate& entry : ranking.candidates) {
+        if (entry.candidate_id == ranking.winner_set.front()) continue;
+        require(ranking.candidates.front().score_lower > entry.score_upper,
+                "the winner's lower bound must exceed every competing upper bound");
+    }
+
+    // Two candidates that are genuinely indistinguishable must not produce a winner. Scoring the
+    // same haplotype against itself twice gives two identical candidates.
+    const panvar::InternedHaplotypes tied = panvar::intern_haplotypes(
+        {panvar::MosaicPath{{0}}, panvar::MosaicPath{{1}}}, {truth, truth});
+    require(tied.sequences.size() == 1, "identical bytes intern to one haplotype");
+    const panvar::CertifiedRanking ambiguous = panvar::certify_diplotype_ranking(
+        interned, {{0, 0}, {0, 0}}, fragments, model, options, certification);
+    require(ambiguous.status == panvar::RescoreStatus::RescoreIncomplete,
+            "two identical candidates must not resolve to a winner");
+    require(ambiguous.winner_set.size() == 2,
+            "an undecided ranking must report its equivalence set rather than pick from it");
+    require(ambiguous.certified_gap == 0.0, "an undecided ranking has no certified gap");
+}
+
+// Gate: refinement must deepen only contenders, and the counters must show it did.
+void test_refines_only_contenders() {
+    std::mt19937_64 rng(2024);
+    const std::string truth = random_bases(rng, 400);
+    std::vector<std::string> pool = {truth};
+    for (int d = 0; d < 5; ++d) {
+        std::string decoy = truth;
+        for (int edit = 0; edit < 70; ++edit) decoy[rng() % decoy.size()] = "ACGT"[rng() % 4];
+        pool.push_back(decoy);
+    }
+    std::vector<panvar::ReadPair> fragments;
+    for (std::size_t start = 20; start + 130 < truth.size(); start += 30) {
+        fragments.push_back({read("f/1", truth.substr(start, 55)),
+                             read("f/2", revcomp(truth.substr(start + 70, 55)))});
+    }
+    const panvar::InternedHaplotypes interned = intern(pool);
+    std::vector<panvar::HaplotypeCandidate> candidates;
+    for (std::size_t h = 0; h < pool.size(); ++h) candidates.push_back({h, h});
+
+    panvar::FragmentScoringOptions options;
+    options.minimum_piece_bp = 8;
+    panvar::CertificationOptions certification;
+    certification.initial_band = 1;
+    certification.maximum_band = 5;
+    certification.band_step = 2;
+    options.minimum_piece_bp = 8;
+
+    const panvar::CertifiedRanking ranking = panvar::certify_diplotype_ranking(
+        interned, candidates, fragments, library(), options, certification);
+    require(ranking.status == panvar::RescoreStatus::Complete, "the planted truth must be certified");
+    require(ranking.winner_set.front() == 0, "the planted truth must win");
+    require(ranking.candidates.size() == candidates.size(),
+            "every requested candidate must be reported, decided or not");
+    // If nothing was ever discarded, "refine only contenders" was never exercised.
+    std::cout << "  certification: winner=" << ranking.winner_set.front()
+              << " gap=" << ranking.certified_gap
+              << " deepened=" << ranking.counters.candidates_deepened
+              << " scanned=" << ranking.counters.candidate_bases_scanned << '\n';
+    require(ranking.counters.candidates_deepened < candidates.size() * 3,
+            "refinement must not deepen every candidate at every step");
+
+    // Gate 14: a schedule the reads cannot support must refuse before any candidate is scored,
+    // rather than leaving a partial ranking behind when it runs out of indexable pieces.
+    panvar::CertificationOptions unsupportable = certification;
+    unsupportable.maximum_band = 40;
+    require_throws(
+        [&] {
+            panvar::certify_diplotype_ranking(interned, candidates, fragments, library(), options,
+                                              unsupportable);
+        },
+        "an unsupportable deepening schedule must refuse up front, not mid-loop");
+}
+
+// Gate 10: a proposal score cannot reach the fragment score, because the scorer never sees one.
+void test_proposal_cannot_reach_fragment_score() {
+    std::mt19937_64 rng(9001);
+    const std::string a = random_bases(rng, 350);
+    std::string b = a;
+    for (int edit = 0; edit < 30; ++edit) b[rng() % b.size()] = "ACGT"[rng() % 4];
+    std::vector<panvar::ReadPair> fragments;
+    for (std::size_t start : {25, 160}) {
+        fragments.push_back({read("f/1", a.substr(start, 55)),
+                             read("f/2", revcomp(a.substr(start + 70, 55)))});
+    }
+    const panvar::InternedHaplotypes interned = intern({a, b});
+    panvar::FragmentScoringOptions options;
+    options.mismatch_band = 2;
+    options.minimum_piece_bp = 8;
+    // The API takes haplotypes, candidates, fragments and one library model. There is no argument
+    // through which a proposal score could enter, which is the structural form of this gate; the
+    // check here is that the same inputs give the same score regardless of the order they were
+    // proposed in.
+    const panvar::FragmentScoringResult forward = panvar::score_diplotypes(
+        interned, {{0, 0}, {0, 1}}, fragments, library(), options);
+    const panvar::FragmentScoringResult backward = panvar::score_diplotypes(
+        interned, {{0, 1}, {0, 0}}, fragments, library(), options);
+    require_close(forward.scores[0].log_likelihood, backward.scores[1].log_likelihood, 1e-12,
+                  "a candidate's fragment score must not depend on its proposal rank");
+    require_close(forward.scores[1].log_likelihood, backward.scores[0].log_likelihood, 1e-12,
+                  "a candidate's fragment score must not depend on its proposal rank");
+}
+
 } // namespace
 
 int main() {
@@ -431,6 +638,10 @@ int main() {
         test_homozygote_counts_two_copies();
         test_refusals();
         test_counters_are_measured();
+        test_intervals_contain_truth();
+        test_winner_requires_proof();
+        test_refines_only_contenders();
+        test_proposal_cannot_reach_fragment_score();
         std::cout << "genotype fragment scorer: PASS\n";
         return 0;
     } catch (const std::exception& error) {

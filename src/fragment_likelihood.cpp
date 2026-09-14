@@ -498,7 +498,42 @@ FragmentScoringResult score_diplotypes(
     // log mass of every fragment on every unique haplotype, one chromosome copy.
     const std::size_t unique = haplotypes.sequences.size();
     std::vector<double> mass(fragments.size() * unique, kNegInf);
+    std::vector<double> mass_upper(fragments.size() * unique, kNegInf);
     std::vector<double> exposure(unique, 0.0);
+
+    // A bound on everything the band left out. An omitted origin has more than `band` mismatches on
+    // at least one mate, so its mass is at most the best insert probability times the emission of
+    // exactly band+1 mismatches on that mate and a perfect other mate. There are at most two
+    // orientations times L forward starts times the support width such origins. Loose on purpose:
+    // it only has to be valid, and when it is too loose to separate candidates the answer is to
+    // deepen the band, which is what the certification loop does.
+    const auto omitted_bound = [&](std::size_t haplotype_length, std::size_t f) -> double {
+        const std::size_t first_length = fragments[f].first.bases.size();
+        const std::size_t second_length = fragments[f].second.bases.size();
+        const InsertSupport& support = insert_by_fragment[f].support;
+        if (support.empty()) return kNegInf;
+        const std::size_t over = options.mismatch_band + 1;
+        if (over > first_length && over > second_length) return kNegInf;   // nothing can be omitted
+        double best_emission = kNegInf;
+        if (over <= first_length) {
+            best_emission = std::max(best_emission,
+                log_emission(first_length, over, library.substitution_error) +
+                log_emission(second_length, 0, library.substitution_error));
+        }
+        if (over <= second_length) {
+            best_emission = std::max(best_emission,
+                log_emission(second_length, over, library.substitution_error) +
+                log_emission(first_length, 0, library.substitution_error));
+        }
+        if (best_emission == kNegInf) return kNegInf;
+        double best_insert = kNegInf;
+        for (const double value : insert_by_fragment[f].log_probability_by_offset) {
+            best_insert = std::max(best_insert, value);
+        }
+        const double states = 2.0 * static_cast<double>(haplotype_length) *
+                              static_cast<double>(support.max_bp - support.min_bp + 1);
+        return std::log(states) + best_insert + best_emission;
+    };
 
     std::map<StateKey, std::uint64_t> states;
     for (std::size_t h = 0; h < unique; ++h) {
@@ -587,6 +622,10 @@ FragmentScoringResult score_diplotypes(
             }
             mass[f * unique + h] = total;
         }
+        for (std::size_t f = 0; f < fragments.size(); ++f) {
+            mass_upper[f * unique + h] =
+                log_add_exp(mass[f * unique + h], omitted_bound(haplotype.size(), f));
+        }
     }
 
     for (std::size_t c = 0; c < candidates.size(); ++c) {
@@ -597,17 +636,159 @@ FragmentScoringResult score_diplotypes(
         // both terms, which is what the fragment contract requires.
         score.exposure_term = -library.fragment_start_intensity * (exposure[a] + exposure[b]);
         double fragment_term = 0.0;
+        double fragment_term_upper = 0.0;
         for (std::size_t f = 0; f < fragments.size(); ++f) {
             const double combined =
                 log_add_exp(mass[f * unique + a], mass[f * unique + b]);
             if (combined != kNegInf) ++score.fragments_with_mass;
             fragment_term +=
                 log_fragment_contribution(combined, background_by_fragment[f], library);
+            // The contribution is monotone in the mass, so bounding every fragment's mass from
+            // above bounds the whole term from above.
+            fragment_term_upper += log_fragment_contribution(
+                log_add_exp(mass_upper[f * unique + a], mass_upper[f * unique + b]),
+                background_by_fragment[f], library);
         }
         score.fragment_term = fragment_term;
         score.log_likelihood = score.exposure_term + fragment_term;
+        score.log_likelihood_upper = score.exposure_term + fragment_term_upper;
     }
     result.log_mass = std::move(mass);
+    result.log_mass_upper = std::move(mass_upper);
+    return result;
+}
+
+
+CertifiedRanking certify_diplotype_ranking(
+    const InternedHaplotypes& haplotypes,
+    const std::vector<HaplotypeCandidate>& candidates,
+    const std::vector<ReadPair>& fragments,
+    const LibraryModel& library,
+    const FragmentScoringOptions& options,
+    const CertificationOptions& certification) {
+    if (certification.band_step == 0) {
+        throw std::invalid_argument("certification band step must be positive");
+    }
+    if (certification.maximum_band < certification.initial_band) {
+        throw std::invalid_argument("certification maximum band must not be below the initial band");
+    }
+    if (candidates.empty()) {
+        throw std::invalid_argument("certification needs at least one candidate to rank");
+    }
+    // Refuse a deepening schedule the reads cannot support BEFORE any candidate is scored. Finding
+    // this out mid-loop would leave a partial ranking behind, and a partial ranking presented as a
+    // result is exactly what the contract forbids.
+    for (const ReadPair& fragment : fragments) {
+        validate_read_pair(fragment);
+        const std::size_t shortest =
+            std::min(fragment.first.bases.size(), fragment.second.bases.size());
+        const std::size_t chunk = shortest / (certification.maximum_band + 1);
+        if (std::min<std::size_t>(31, chunk) < options.minimum_piece_bp) {
+            throw std::invalid_argument(
+                "the certification's maximum band would split a read into pieces too short to "
+                "index; lower maximum_band, lower minimum_piece_bp deliberately, or drop the short "
+                "reads before ranking");
+        }
+    }
+
+    CertifiedRanking result;
+    result.candidates.resize(candidates.size());
+    for (std::size_t c = 0; c < candidates.size(); ++c) {
+        result.candidates[c].candidate_id = c;
+    }
+
+    // Undecided candidates: those whose interval still overlaps the best established lower bound.
+    std::vector<std::size_t> undecided(candidates.size());
+    for (std::size_t c = 0; c < candidates.size(); ++c) undecided[c] = c;
+
+    std::size_t band = certification.initial_band;
+    while (true) {
+        // Scan only the haplotypes the undecided candidates actually name. Deepening the band for a
+        // candidate already proven unable to win is exactly the tail work the design forbids.
+        std::map<std::size_t, std::size_t> slot_of;
+        InternedHaplotypes reduced;
+        std::vector<HaplotypeCandidate> reduced_candidates;
+        reduced_candidates.reserve(undecided.size());
+        for (const std::size_t c : undecided) {
+            for (const std::size_t h : {candidates[c].first, candidates[c].second}) {
+                if (slot_of.emplace(h, reduced.sequences.size()).second) {
+                    reduced.sequences.push_back(haplotypes.sequences[h]);
+                }
+            }
+            reduced_candidates.push_back({slot_of.at(candidates[c].first),
+                                          slot_of.at(candidates[c].second)});
+        }
+        reduced.index_of.resize(reduced.sequences.size());
+        for (std::size_t i = 0; i < reduced.index_of.size(); ++i) reduced.index_of[i] = i;
+        reduced.distinct_allele_paths = haplotypes.distinct_allele_paths;
+
+        FragmentScoringOptions banded = options;
+        banded.mismatch_band = band;
+        const FragmentScoringResult scored =
+            score_diplotypes(reduced, reduced_candidates, fragments, library, banded);
+
+        const FragmentScoringCounters& c = scored.counters;
+        result.counters.candidate_bases_scanned += c.candidate_bases_scanned;
+        result.counters.piece_hits += c.piece_hits;
+        result.counters.proposed_starts += c.proposed_starts;
+        result.counters.unique_starts += c.unique_starts;
+        result.counters.full_read_verifications += c.full_read_verifications;
+        result.counters.accepted_mate_placements += c.accepted_mate_placements;
+        result.counters.valid_fr_states += c.valid_fr_states;
+        result.counters.physical_origins += c.physical_origins;
+        result.counters.statistical_state_classes += c.statistical_state_classes;
+
+        for (std::size_t i = 0; i < undecided.size(); ++i) {
+            CertifiedCandidate& entry = result.candidates[undecided[i]];
+            entry.score_lower = scored.scores[i].log_likelihood;
+            entry.score_upper = scored.scores[i].log_likelihood_upper;
+            entry.band_used = band;
+            entry.exact = scored.scores[i].is_exact();
+        }
+
+        double best_lower = -std::numeric_limits<double>::infinity();
+        for (const std::size_t id : undecided) {
+            best_lower = std::max(best_lower, result.candidates[id].score_lower);
+        }
+        std::vector<std::size_t> still;
+        for (const std::size_t id : undecided) {
+            // Discard only on proof: a candidate survives unless its best possible score is below
+            // a score some other candidate is already guaranteed to reach.
+            if (result.candidates[id].score_upper >= best_lower) still.push_back(id);
+        }
+        undecided.swap(still);
+
+        if (undecided.size() == 1) break;
+        if (band >= certification.maximum_band) break;
+        band = std::min(certification.maximum_band, band + certification.band_step);
+        result.counters.candidates_deepened += undecided.size();
+    }
+
+    std::sort(result.candidates.begin(), result.candidates.end(),
+              [](const CertifiedCandidate& lhs, const CertifiedCandidate& rhs) {
+                  if (lhs.score_lower != rhs.score_lower) return lhs.score_lower > rhs.score_lower;
+                  return lhs.candidate_id < rhs.candidate_id;
+              });
+
+    if (undecided.size() == 1) {
+        result.status = RescoreStatus::Complete;
+        result.winner_set = undecided;
+        const double winner_lower = result.candidates.front().score_lower;
+        double best_rival_upper = -std::numeric_limits<double>::infinity();
+        for (const CertifiedCandidate& entry : result.candidates) {
+            if (entry.candidate_id == undecided.front()) continue;
+            best_rival_upper = std::max(best_rival_upper, entry.score_upper);
+        }
+        result.certified_gap = candidates.size() == 1
+            ? std::numeric_limits<double>::infinity()
+            : winner_lower - best_rival_upper;
+    } else {
+        // No candidate's lower bound clears every rival's upper bound. Reporting the highest point
+        // estimate here would present an uncertified pick as a call.
+        result.status = RescoreStatus::RescoreIncomplete;
+        result.winner_set = undecided;
+        result.certified_gap = 0.0;
+    }
     return result;
 }
 

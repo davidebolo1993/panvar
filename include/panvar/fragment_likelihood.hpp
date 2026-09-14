@@ -141,11 +141,18 @@ struct FragmentScoringCounters {
     std::uint64_t candidates_deepened = 0;
 };
 
+// The band omits placements beyond it, so the computed mass is a lower bound on the mass at an
+// unbounded band. `log_likelihood_upper` adds a bound on everything the band left out, so the true
+// score is certified to lie in [log_likelihood, log_likelihood_upper]. When the band is at least as
+// wide as the longest mate nothing can be omitted and the two collapse: the score is then exact.
 struct DiplotypeScore {
     double log_likelihood = 0.0;
+    double log_likelihood_upper = 0.0;
     double fragment_term = 0.0;
     double exposure_term = 0.0;
     std::size_t fragments_with_mass = 0;
+
+    bool is_exact() const noexcept { return log_likelihood_upper <= log_likelihood; }
 };
 
 struct FragmentScoringResult {
@@ -155,6 +162,8 @@ struct FragmentScoringResult {
     // oracle certifies directly; recovering it from a candidate score would compare the two paths
     // through the mixture rather than at the mass itself.
     std::vector<double> log_mass;
+    // Same layout: the mass with a bound on the omitted tail added back.
+    std::vector<double> log_mass_upper;
     std::size_t unique_haplotypes = 0;
     FragmentScoringCounters counters;
 
@@ -169,5 +178,49 @@ FragmentScoringResult score_diplotypes(
     const std::vector<ReadPair>& fragments,
     const LibraryModel& library,
     const FragmentScoringOptions& options);
+
+// ---------------------------------------------------------------------------------------------
+// Certification.
+// ---------------------------------------------------------------------------------------------
+
+enum class RescoreStatus { Complete, RescoreIncomplete };
+
+struct CertifiedCandidate {
+    std::size_t candidate_id = 0;      // index into the requested candidate list
+    double score_lower = 0.0;
+    double score_upper = 0.0;
+    std::size_t band_used = 0;
+    bool exact = false;
+};
+
+struct CertificationOptions {
+    std::size_t initial_band = 2;
+    std::size_t maximum_band = 8;
+    std::size_t band_step = 2;
+};
+
+struct CertifiedRanking {
+    RescoreStatus status = RescoreStatus::RescoreIncomplete;
+    std::vector<CertifiedCandidate> candidates;   // sorted by certified lower bound, descending
+    // One id when a winner is certified; the full undecided set when it is not. A ranking that
+    // cannot certify a winner reports the set rather than picking from it.
+    std::vector<std::size_t> winner_set;
+    // Gap between the winner's lower bound and the best competing upper bound. Positive exactly
+    // when the status is Complete.
+    double certified_gap = 0.0;
+    FragmentScoringCounters counters;
+};
+
+// Scores every candidate at the initial band, then deepens only those whose interval still overlaps
+// the best established lower bound. A winner is emitted only when its lower bound exceeds every
+// competing upper bound; otherwise the undecided set is reported as RescoreIncomplete, never
+// resolved by picking the highest point estimate.
+CertifiedRanking certify_diplotype_ranking(
+    const InternedHaplotypes& haplotypes,
+    const std::vector<HaplotypeCandidate>& candidates,
+    const std::vector<ReadPair>& fragments,
+    const LibraryModel& library,
+    const FragmentScoringOptions& options,
+    const CertificationOptions& certification);
 
 } // namespace panvar
