@@ -17,10 +17,10 @@ Both genotype test binaries pass.
 | 4 marker proposal | `marker_model` | committed `c3b8c38` | pass; gate 3 met on real C4 at `51b6a49` |
 | 5 deterministic top-K | `mosaic_beam` | committed `c3b8c38` | pass against exhaustive oracle |
 | — graph adapter | `genotype_locus` | committed `51b6a49` | pass on real C4 |
-| 6 fragment likelihood | — | **absent** | — |
-| 7 command integration | — | **absent** | — |
+| 6 fragment likelihood | `fragment_likelihood` | committed `98324c9`..`6bb382c` | pass; oracle-certified |
+| 7 command integration | `genotype_command` | committed `7c5a42b` | pass end-to-end on C4 |
 
-`panvar genotype` is not registered in `main.cpp`, as the contract requires at this stage.
+`panvar genotype` is now registered in `main.cpp`, which the contract permits from Phase 7.
 
 The k-way merge over already-sorted allele lists is present in `build_marker_panel`
 (`src/marker_model.cpp:198`), replacing the second N log N sort.
@@ -209,51 +209,111 @@ version one has no allele cap anywhere in the code. On its own that equality pro
 load-bearing assertions are that the panel covers exactly the model's canonical allele set and the
 per-allele marker coverage census above.
 
-## 5. Remaining work order
+## 5. Phase 6 and Phase 7: complete
 
-### Step 1 — Phase 6 candidate-neutral fragment likelihood
+### The fragment likelihood
 
-The largest step, the dominant runtime cost, and the one the previous attempt failed on. Four
-commits:
+Four commits, in the order the contract names them.
 
-- **1a** `LibraryModel` extension: error, insert, background, outlier and fragment-start intensity
-  with provenance, plus validation. Read lengths stay per-fragment observations.
-- **1b** Exhaustive substitution-only oracle, test-only. Independently re-derived, not lifted from
-  `archive/genotype-factor-2026-09-11:src/genotype_fragments.cpp` — that file is 9514 lines of
-  capped, truncated, top-K approximations the contract explicitly bars from being a production base.
-  Its recorded traps become permanent regression fixtures: signed binned starts flipping strand;
-  `FragmentState` ordering omitting edit counts; a run-wide read length raising a short fragment's
-  insert floor; several seeds rediscovering one placement; distinct repeat copies with identical
-  statistics.
-- **1c** Production scorer: inverted pigeonhole piece index over candidates (not a per-candidate
-  position hash), unique-haplotype interning so 2K haploid mosaics of ~230 kb are scored once, exact
-  log-multiplicity state compression with separate physical-origin / statistical-class / mass
-  counters, analytic exposure, and diploid combination by column pair.
-- **1d** Certification: lower/upper score intervals, contender-only refinement, a winner only when
-  one lower bound beats every competing upper bound, otherwise an equivalence set or
-  `RESCORE_INCOMPLETE`.
+`fragment_likelihood` owns the single definition of read emission, insert probability, valid-FR
+geometry, exposure, fragment contribution and log-addition. `log_add_exp` had three copies in the
+tree before this and now has one. The exhaustive `enumerate_placements_exhaustive` is certified
+against hand arithmetic, not against a second implementation of the same idea, and then certifies
+the accelerated scorer: every `(fragment, haplotype)` mass agrees to 1e-9 on planted substitutions,
+tandem repeats, mixed read lengths and twelve random seeds.
 
-All 14 named gates, the four prior mutations that must fail, and the ten runtime counters land with
-1d. Compression is accepted only after it reproduces the oracle's mass exactly.
+The accelerated path inverts the index — pieces of the reads are indexed and each haplotype is
+scanned once, rather than a position hash built per candidate. Piece keys are prefixes of the
+pigeonhole chunks, which preserves the band guarantee because an exact chunk has an exact prefix.
+Reads are bucketed by piece length so mixed read lengths do not lose placements. Unique haplotypes
+are interned by bytes. Statistical classes are compressed by `(insert, edits, edits, orientation)`
+with an exact log-multiplicity, which is the sum rather than an approximation of it; physical
+origins and stored classes are counted separately.
 
-### Step 2 — Phase 7 command integration
+There is no occurrence cap, placement top-K, start bin, midpoint deduplication or best-placement
+mode anywhere in this path.
 
-`panvar genotype` with the eight declared options and no others. Orchestration only: load, count
-markers, propose, spell and intern, recompute the Li-Stephens prior independently of the beam,
-score, certify, project. Five outputs, five statuses, model fingerprint in the output. Per-block
-output covers SV blocks; context blocks are modelled, not reported as calls.
+### Two findings the gates forced
 
-### Step 3 — Phase 8 one-donor C4 go/no-go
+**Exactness is unreachable through the band.** The scorer is exact only when the band is at least
+as wide as the longest mate, and at that band the pigeonhole index has no pieces left to key on. So
+the upper bound is what certifies, and the reference it is certified against is the oracle on an
+independent code path — not the scorer in a different mode, which would have been circular.
 
-K=64 under 90 s and 4 GB with per-stage wall time, then the K = 8..256 ladder with truth-in-candidate
-rank, per-block true edlib distance, score gap, and winner stability. Proposal is measured at 0.20 s
-and 26 MB, so effectively the whole budget belongs to Step 1. No cohort work starts before this
-passes.
+**One unplaceable fragment can swallow every real candidate separation.** A fragment that places on
+no candidate at the working band contributes the outlier arm to the lower bound but the entire
+omitted-tail bound to the upper one. Measured on C4 at 30x: exactly **one fragment in 34,415**
+placed nowhere, and that single fragment produced a **244-nat interval against an 18-nat candidate
+separation** — identical to four decimals across all five candidates, so unable to reorder anything,
+but wide enough that no band the index can support would ever close it.
 
-The beam stay/switch factorization is **not** on this path. The contract permits it; C4 does not need
-it. Revisit only if a later locus has a block count in the hundreds.
+The resolution is a declared model statement, not a relaxed proof: a fragment that places on no
+candidate is an outlier, so its contribution is the outlier arm exactly and its omitted tail is
+zero. That closes the interval from 244 nats to 0.52. It is named, counted in the status file as
+`fragments_declared_outlier`, and can be switched off for a fully unconditional bound. The
+containment gate tests the bound with the policy off; a separate gate proves the policy touches only
+fragments that place nowhere, and never the score itself — only the upper bound.
 
-## 6. Reviewer questions
+### The command
+
+`panvar genotype` with the eight declared options and no others. It runs the declared execution
+order, including the byte-for-byte panel round trip on real input before any statistic is computed
+from those blocks. The exact Li-Stephens prior is passed *into* certification rather than added
+after it, because pruning on the fragment term alone would discard candidates the prior would have
+rescued. The proposal score is not passed and may never be. Context blocks are modelled but never
+reported as calls. The fingerprint is keyed on the graph's reference frame, not the output prefix.
+
+### Dry run on real C4
+
+One frozen donor simulated at 30x from two panel templates (`HG00096#1` and `HG00268#2`, the latter
+one of the 60 antiparallel ones), 34,415 read pairs, 100 bp mates, insert 350±40, 0.2% substitution
+error, declared library parameters.
+
+| K | Status | Certified gap | Total | Peak RSS |
+|---|---|---|---|---|
+| 16 | COMPLETE | 17.02 nats | 5.0 s | — |
+| 64 | COMPLETE | 17.02 nats | **6.3 s** | **544 MB** |
+
+Against the Phase 8 gate of 90 s and 4 GB: 14x under time, 7.5x under memory. Stage split at K=64:
+model 0.96 s, markers 0.95 s, proposal 0.37 s, spelling 0.00 s, rescoring 4.05 s. Rescoring
+dominates, as expected.
+
+**Both called haplotypes are byte-exact matches to the two simulated truth haplotypes** — 226,137
+and 232,743 bp, the second in reverse complement, which is correct because that template is
+antiparallel and the caller emits in canonical chain orientation.
+
+Three things this result is *not*. The truth haplotypes are panel templates, so this is the easy
+end of the problem — Phase 8 is LZO and Phase 10 is LOO, and neither is this. The reads were
+simulated under exactly the declared library model. And the beam returned only 8 unique candidates
+at K=64, so the candidate set is much narrower than K; whether that is the switch prior, the marker
+emissions, or a real property of C4 is a question for the first LZO run.
+
+## 6. Remaining work order
+
+### Step 1 — Phase 8 one-donor C4 go/no-go
+
+The runtime half of the gate already passes on the dry run above. What remains is the accuracy half:
+the K = 8..256 ladder with truth-in-candidate rank, per-block true edlib distance, score gap,
+candidate-set probability, and winner stability between K and 2K, on a frozen LZO donor rather than
+a panel member.
+
+### Step 2 — Phases 9 and 10
+
+The development pilot, the held-out LZO cohort, then LOO. Unchanged from the contract.
+
+### Known limitations, carried forward
+
+- **Library parameters are declared, not estimated.** `--library` is required. The contract asks for
+  estimation with declaration as an option; version one has only the declaration. For a simulated
+  donor this is the right input anyway, but it is a real gap before any real sequencing run.
+- **`--threads` is recorded and not used.** The contract forbids scorer multithreading before the
+  serial algorithm meets its performance gate. It now does, so threading is unblocked but unbuilt.
+- **Blocks carrying a bypass allele are not divergence-trimmed**, so node-split invariance is not
+  proven for them. C4 has no bypasses.
+- **The beam's bypass-allele arm is exercised only through the adapter**, not in the beam's own
+  exhaustive-oracle fixture.
+
+## 7. Reviewer questions
 
 1. **Tiling.** Confirm that promoting the six polymorphic context spans to blocks is the intended
    reading of "ordered blocks and their invariant contexts". At C4 no gap is invariant, so the
@@ -277,4 +337,14 @@ it. Revisit only if a later locus has a block count in the hundreds.
    untrimmed is acceptable for version one.
 5. **Oracle provenance.** Confirm that re-deriving the Phase 6 oracle independently, rather than
    porting the archived exhaustive scorer, is the intended reading of "the archived exhaustive
-   substitution-only fragment model is the oracle".
+   substitution-only fragment model is the oracle". It is now certified against hand arithmetic and
+   in turn certifies the accelerated path on twelve random seeds.
+6. **The declared-outlier policy.** This is the one place where a model statement was added to make
+   certification reachable, and it is the question most worth a reviewer's attention. A fragment
+   that places on no candidate at the working band is declared an outlier, closing a 244-nat
+   interval to 0.52. The alternative is that every real run returns `RESCORE_INCOMPLETE`, because
+   the unconditional bound cannot be closed by any band the pigeonhole index supports. Confirm the
+   policy, its default, and that reporting `fragments_declared_outlier` is sufficient auditing.
+7. **Candidate-set narrowness.** The beam returns 8 unique candidates at K=64 on the C4 dry run.
+   Whether that is the switch prior at 0.01, the marker emissions, or a real property of C4 is not
+   yet established, and it bears directly on the truth-in-candidate rate the go/no-go will measure.
