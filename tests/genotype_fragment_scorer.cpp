@@ -467,6 +467,10 @@ void test_intervals_contain_truth() {
         panvar::FragmentScoringOptions options;
         options.mismatch_band = band;
         options.minimum_piece_bp = 8;
+        // Containment is a property of the BOUND, so it is tested unconditionally. The
+        // declared-outlier policy deliberately drops the tail of a fragment that places nowhere,
+        // which is a model statement rather than a bound, and is gated separately below.
+        options.unplaceable_fragments_are_outliers = false;
         const panvar::FragmentScoringResult banded = panvar::score_diplotypes(
             interned, {{0, 0}, {0, 1}, {1, 1}}, fragments, model, options);
 
@@ -492,6 +496,57 @@ void test_intervals_contain_truth() {
             "the fixture must contain placements the narrow bands omit, or containment is vacuous");
     std::cout << "  interval containment: " << omitting
               << " (band, fragment, haplotype) cells genuinely omitted mass\n";
+
+    // The declared-outlier policy must touch only fragments that place on NO candidate. For every
+    // fragment that does place, the bound must be bit-identical with the policy on or off.
+    panvar::FragmentScoringOptions bounded;
+    bounded.mismatch_band = 2;
+    bounded.minimum_piece_bp = 8;
+    bounded.unplaceable_fragments_are_outliers = false;
+    panvar::FragmentScoringOptions declared = bounded;
+    declared.unplaceable_fragments_are_outliers = true;
+    const panvar::FragmentScoringResult without = panvar::score_diplotypes(
+        interned, {{0, 0}, {0, 1}}, fragments, model, bounded);
+    const panvar::FragmentScoringResult with = panvar::score_diplotypes(
+        interned, {{0, 0}, {0, 1}}, fragments, model, declared);
+    std::size_t unplaceable = 0;
+    for (std::size_t f = 0; f < fragments.size(); ++f) {
+        bool placed = false;
+        for (std::size_t h = 0; h < interned.sequences.size(); ++h) {
+            if (without.mass_of(f, h) != kNegInf) placed = true;
+        }
+        if (!placed) {
+            ++unplaceable;
+            continue;
+        }
+        for (std::size_t h = 0; h < interned.sequences.size(); ++h) {
+            const std::size_t at = f * without.unique_haplotypes + h;
+            require(with.log_mass[at] == without.log_mass[at] &&
+                        with.log_mass_upper[at] == without.log_mass_upper[at],
+                    "the declared-outlier policy must not touch a fragment that places");
+        }
+    }
+    require(with.counters.fragments_declared_outlier == unplaceable,
+            "the policy must declare exactly the fragments that place nowhere, no more and no less");
+
+    // And on a fragment that places nowhere, the policy is what closes the interval.
+    const std::vector<panvar::ReadPair> foreign = {
+        {read("x/1", random_bases(rng, 55)), read("x/2", random_bases(rng, 55))}};
+    const panvar::FragmentScoringResult loose = panvar::score_diplotypes(
+        interned, {{0, 0}}, foreign, model, bounded);
+    const panvar::FragmentScoringResult tight = panvar::score_diplotypes(
+        interned, {{0, 0}}, foreign, model, declared);
+    require(tight.counters.fragments_declared_outlier == 1,
+            "an unplaceable fragment must be counted as a declared outlier, not hidden");
+    require(loose.scores[0].log_likelihood_upper > loose.scores[0].log_likelihood,
+            "without the policy an unplaceable fragment leaves a wide interval");
+    require(tight.scores[0].is_exact(),
+            "with the policy declared, an unplaceable fragment leaves no interval at all");
+    require(tight.scores[0].log_likelihood == loose.scores[0].log_likelihood,
+            "the policy changes only the upper bound, never the score itself");
+    std::cout << "  declared-outlier policy: interval "
+              << (loose.scores[0].log_likelihood_upper - loose.scores[0].log_likelihood)
+              << " nats -> 0 for one unplaceable fragment\n";
 }
 
 // Gate 12: a winner is emitted only when its lower bound beats every competing upper bound.

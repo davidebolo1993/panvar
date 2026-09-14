@@ -131,6 +131,7 @@ add_library(panvarlib
     src/marker_model.cpp
     src/mosaic_beam.cpp
     src/genotype_locus.cpp
+    src/genotype_command.cpp
     src/fragment_likelihood.cpp
     src/bubble_path.cpp
     src/bubbles.cpp
@@ -240,6 +241,13 @@ if(PANVAR_BUILD_TESTING)
                  COMMAND genotype_locus_adapter_test
                          ${CMAKE_CURRENT_SOURCE_DIR}/tests/real_data/c4.gfa.gz
                          ${CMAKE_CURRENT_BINARY_DIR}/genotype_locus_c4)
+
+        add_executable(genotype_command_e2e_test tests/genotype_command_e2e.cpp src/cli_utils.cpp)
+        target_link_libraries(genotype_command_e2e_test PRIVATE panvarlib)
+        target_compile_options(genotype_command_e2e_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_genotype_command_e2e
+                 COMMAND genotype_command_e2e_test ${CMAKE_CURRENT_BINARY_DIR}/genotype_e2e)
+        file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/genotype_e2e)
 
         add_executable(genotype_fragment_oracle_test tests/genotype_fragment_oracle.cpp)
         target_link_libraries(genotype_fragment_oracle_test PRIVATE panvarlib)

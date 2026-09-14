@@ -124,6 +124,14 @@ struct FragmentScoringOptions {
     // Pigeonhole pieces shorter than this are too unspecific to index, so the scorer refuses rather
     // than silently degrading into a quadratic scan.
     std::size_t minimum_piece_bp = 10;
+    // A declared model statement, not a relaxed proof: a fragment that places on NO candidate at the
+    // working band is an outlier, so its contribution is the outlier arm exactly and its omitted
+    // tail is zero. Without it a single unplaceable fragment carries an interval wide enough to
+    // swallow every real candidate separation -- measured at C4, one fragment in 34,415 produced a
+    // 244-nat interval against an 18-nat separation, identical across candidates and therefore
+    // unable to reorder anything. The count of fragments this applies to is reported, so the
+    // assumption is auditable rather than hidden. Turn it off for a fully unconditional bound.
+    bool unplaceable_fragments_are_outliers = true;
 };
 
 // Measured work, not estimated viability. `candidate_bases_scanned` counts haplotype bases actually
@@ -139,6 +147,9 @@ struct FragmentScoringCounters {
     std::uint64_t physical_origins = 0;
     std::uint64_t statistical_state_classes = 0;
     std::uint64_t candidates_deepened = 0;
+    // Fragments that placed on no candidate at the working band and were therefore declared
+    // outliers. Zero when unplaceable_fragments_are_outliers is off.
+    std::uint64_t fragments_declared_outlier = 0;
 };
 
 // The band omits placements beyond it, so the computed mass is a lower bound on the mass at an
@@ -191,6 +202,10 @@ struct CertifiedCandidate {
     double score_upper = 0.0;
     std::size_t band_used = 0;
     bool exact = false;
+    // Fragments that placed anywhere on either homologue at the band used. A fragment that places
+    // nowhere contributes the outlier arm to the lower bound but the whole omitted-tail bound to
+    // the upper one, so this is the number that explains an interval's width.
+    std::size_t fragments_with_mass = 0;
 };
 
 struct CertificationOptions {
@@ -215,12 +230,20 @@ struct CertifiedRanking {
 // the best established lower bound. A winner is emitted only when its lower bound exceeds every
 // competing upper bound; otherwise the undecided set is reported as RescoreIncomplete, never
 // resolved by picking the highest point estimate.
+//
+// `exact_prior` is added to both bounds of the matching candidate. It exists so the exact
+// Li-Stephens prior is part of the quantity being certified: pruning on the fragment term alone
+// would discard candidates the prior would have rescued. It must be exact, which is why it is a
+// separate argument rather than something this function could approximate. Pass an empty vector for
+// a fragment-only ranking. The proposal score is not, and may never be, passed here: it comes from
+// the same reads as the fragment term, and adding both would count that evidence twice.
 CertifiedRanking certify_diplotype_ranking(
     const InternedHaplotypes& haplotypes,
     const std::vector<HaplotypeCandidate>& candidates,
     const std::vector<ReadPair>& fragments,
     const LibraryModel& library,
     const FragmentScoringOptions& options,
-    const CertificationOptions& certification);
+    const CertificationOptions& certification,
+    const std::vector<double>& exact_prior = {});
 
 } // namespace panvar

@@ -628,6 +628,22 @@ FragmentScoringResult score_diplotypes(
         }
     }
 
+    if (options.unplaceable_fragments_are_outliers) {
+        for (std::size_t f = 0; f < fragments.size(); ++f) {
+            bool placed_anywhere = false;
+            for (std::size_t h = 0; h < unique && !placed_anywhere; ++h) {
+                placed_anywhere = mass[f * unique + h] != kNegInf;
+            }
+            if (placed_anywhere) continue;
+            // Declared an outlier: its contribution is the outlier arm on every candidate, so its
+            // omitted tail is dropped rather than bounded. It contributes the same constant to every
+            // candidate either way, so this cannot change a ranking -- only whether one can be
+            // certified.
+            ++counters.fragments_declared_outlier;
+            for (std::size_t h = 0; h < unique; ++h) mass_upper[f * unique + h] = kNegInf;
+        }
+    }
+
     for (std::size_t c = 0; c < candidates.size(); ++c) {
         const std::size_t a = candidates[c].first;
         const std::size_t b = candidates[c].second;
@@ -665,7 +681,11 @@ CertifiedRanking certify_diplotype_ranking(
     const std::vector<ReadPair>& fragments,
     const LibraryModel& library,
     const FragmentScoringOptions& options,
-    const CertificationOptions& certification) {
+    const CertificationOptions& certification,
+    const std::vector<double>& exact_prior) {
+    if (!exact_prior.empty() && exact_prior.size() != candidates.size()) {
+        throw std::invalid_argument("exact prior must be parallel to the candidate list");
+    }
     if (certification.band_step == 0) {
         throw std::invalid_argument("certification band step must be positive");
     }
@@ -737,13 +757,20 @@ CertifiedRanking certify_diplotype_ranking(
         result.counters.valid_fr_states += c.valid_fr_states;
         result.counters.physical_origins += c.physical_origins;
         result.counters.statistical_state_classes += c.statistical_state_classes;
+        result.counters.fragments_declared_outlier = c.fragments_declared_outlier;
 
         for (std::size_t i = 0; i < undecided.size(); ++i) {
             CertifiedCandidate& entry = result.candidates[undecided[i]];
-            entry.score_lower = scored.scores[i].log_likelihood;
-            entry.score_upper = scored.scores[i].log_likelihood_upper;
+            // The prior is exact, so it shifts both bounds by the same amount and the interval keeps
+            // its width. Certifying on the sum is what makes the winner a winner under the declared
+            // model rather than under the fragment term alone.
+            const double prior =
+                exact_prior.empty() ? 0.0 : exact_prior[undecided[i]];
+            entry.score_lower = scored.scores[i].log_likelihood + prior;
+            entry.score_upper = scored.scores[i].log_likelihood_upper + prior;
             entry.band_used = band;
             entry.exact = scored.scores[i].is_exact();
+            entry.fragments_with_mass = scored.scores[i].fragments_with_mass;
         }
 
         double best_lower = -std::numeric_limits<double>::infinity();

@@ -9,6 +9,7 @@
 #include "panvar/call_command.hpp"
 #include "panvar/cli_utils.hpp"
 #include "panvar/describe_command.hpp"
+#include "panvar/genotype_command.hpp"
 #include "panvar/inspect.hpp"
 #include "panvar/panphorte_command.hpp"
 #include "panvar/rebuild_command.hpp"
@@ -36,6 +37,9 @@ int main(int argc, char** argv) {
 
         if (subcommand == "bubble") {
             return panvar::run_bubble_command(args);
+        }
+        if (subcommand == "genotype") {
+            return panvar::run_genotype_command(args);
         }
         if (subcommand == "inspect") {
             return panvar::run_inspect_command(args);
