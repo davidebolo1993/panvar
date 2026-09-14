@@ -13,9 +13,10 @@ Both genotype test binaries pass.
 |---|---|---|---|
 | 1 model foundation | `genotype_model`, `ls_hmm` | committed `fefd4f9` | pass |
 | 2 immutable panel/block | `genotype_model` | committed `715e8ed` | pass |
-| 3 strict spelling | `mosaic_spelling` | committed `d842deb` | pass on hand fixture; **graph checkpoint owed** |
-| 4 marker proposal | `marker_model` (462 lines) | uncommitted | pass on hand fixture; **gate 3 owed** |
-| 5 deterministic top-K | `mosaic_beam` (393 lines) | uncommitted | pass against exhaustive oracle |
+| 3 strict spelling | `mosaic_spelling` | committed `d842deb` | pass; graph checkpoint met at `51b6a49` |
+| 4 marker proposal | `marker_model` | committed `c3b8c38` | pass; gate 3 met on real C4 at `51b6a49` |
+| 5 deterministic top-K | `mosaic_beam` | committed `c3b8c38` | pass against exhaustive oracle |
+| — graph adapter | `genotype_locus` | committed `51b6a49` | pass on real C4 |
 | 6 fragment likelihood | — | **absent** | — |
 | 7 command integration | — | **absent** | — |
 
@@ -102,85 +103,157 @@ Second, the waste is proportional to block count, so the fix matters more elsewh
 locus with a thousand blocks the same code reached 4.58 GB at K=64, over the Phase 8 memory gate on
 its own. At C4's eleven blocks it is 121 MB, which no gate would have caught. It is fixed either way.
 
-## 4. Work order
+## 4. Steps 1 and 2: complete
 
-### Step 1 — graph-facing adapter (`genotype_locus_input`)
+Both landed at `51b6a49`, gated by `tests/genotype_locus_adapter.cpp` against the real C4 panel.
 
-The single blocking item. Both Phase 3 and Phase 4 defer an acceptance gate to it, and nothing after
-Phase 5 can touch real data without it.
+### What the adapter does
 
-It builds `StructuralLocusInput` from a GFA plus a reference path name, **tiling** the locus: SV
-bubbles from `panvar bubble` at its production `--min-variant-bp`, interleaved with context blocks
-covering the spans between them. A context span that is genuinely invariant across all templates
-collapses to a single-allele block and costs nothing; at C4 all six vary. Block records carry whether
-they are SV or context, because only SV blocks are reporting units. It populates the existing types;
-it does not rebuild them.
+It is the only place where graph structure becomes statistical input: every later stage reads
+`StructuralLocusInput` and never touches nodes, edges or walks. It tiles the locus — SV bubbles at
+the production `--min-variant-bp`, interleaved with context blocks covering the spans between and
+beyond them — and emits one source allele per distinct walk, leaving `prepare_genotype_model` to
+collapse sequence-identical walks and retain their aliases.
 
-Gates:
-1. `verify_complete_panel_round_trip` over all 131 C4 templates, byte-for-byte, with the 60
-   antiparallel templates canonicalised.
-2. A node-split and a node-merge equivalent C4 graph produce an identical prepared-model
-   fingerprint (which this step also introduces — the contract requires it in command output).
-3. The census in section 2 is reproduced exactly: 11 blocks, 700 alleles, the per-block allele
-   counts above, 0 partial frames, 60 reverse-oriented templates.
-4. A template that does not traverse every block reports `Partial` and is refused, proven on a
-   synthetic truncated path since C4 has no such case.
+Four decisions were carried over from the archived block chain
+(`archive/genotype-factor-2026-09-11:src/genotype_blocks.cpp`), each of which the archive records as
+a defect it had already paid for:
 
-### Step 2 — Phase 4 gate 3 on real C4
+- bubbles contained in another bubble are dropped, because a chain is a partition and a contained
+  bubble puts the same sequence in two blocks, after which marker confinement strips both bare;
+- a bubble's `source`/`sink` are ordered by node position rather than taken at face value, because a
+  reverse-oriented bubble stores them swapped and the neighbouring context spans would then run
+  straight across its interior;
+- abutting bubbles sharing one boundary node trim it from the later one, or the chain counts those
+  bases twice;
+- a template that does not walk a block **bypasses** it, with an explicit empty allele. Treating
+  that as missing data makes a template whose deletion removed a block's own boundaries
+  unrepresentable at that block, so it could never be called and never be scored.
 
-Run `build_marker_panel` over the real panel and report `scored_alleles == total_alleles` for every
-block — 700 alleles, no cap.
+### The canonicalisation defect, found by the gate
 
-This step also measures `dropped_multiblock_markers`. Dropping a marker that varies in two blocks
-from both blocks is a correctness-preserving choice the implementation made that the contract does
-not describe, and section 2 makes its risk concrete: context block 6 (47.8 kb) and context block 10
-(63.5 kb) flank the C4A/C4B modules and are largely near-duplicate sequence, as are SV block 7's
-longer alleles. Markers shared between them are dropped from all of them. The drop rate is reported
-before the marker model is frozen.
+The node-split gate failed on the first run. Splitting every node in half left the concatenated
+locus byte-identical and the census identical — 11 blocks, 700 alleles, 71 forward / 60 reverse —
+but every block's sequence shifted, some by hundreds of bases, and the fingerprint with it.
 
-### Step 3 — Phase 6 candidate-neutral fragment likelihood
+The cause is that a bubble's source and sink are traversed by every path through it, so their bases
+sit inside the variant block for every allele. Where the graph cuts those boundary nodes is
+representation: a split moves bases between a variant block and its context neighbour.
+
+The fix is to trim each variant block down to the span over which its alleles actually differ,
+pushing the shared prefix and suffix outward into the context neighbours. The maximal trim is the
+same whichever way the boundary node was cut, so both representations converge; the shared flanks
+are identical for every allele, so no template's spelled locus changes; and the result is also the
+honest definition of an SV allele.
+
+The two representations move different amounts and still converge, which is the evidence that the
+trim is doing the work: the original C4 graph moves 1,159 bases outward, the node-split graph moves
+660 — because its context blocks already absorbed half of each cut boundary node — and both arrive
+at the same 11 blocks, the same 700 allele sequences and the same fingerprint. Blocks carrying a
+bypass allele have no common flank and are left alone; that is a remaining limitation, not exercised
+at C4.
+
+### Measured C4 census, after canonicalisation
+
+| Block | Kind | Alleles | Min bp | Max bp |
+|---|---|---|---|---|
+| ctx:0 | context | 68 | 12326 | 12348 |
+| sv:1 | SV | 68 | 0 | 7670 |
+| ctx:2 | context | 100 | 20811 | 20835 |
+| sv:3 | SV | 16 | 117 | 420 |
+| ctx:4 | context | 10 | 325 | 375 |
+| sv:5 | SV | 8 | 0 | 117 |
+| ctx:6 | context | 118 | 47951 | 48003 |
+| sv:7 | SV | 119 | 26346 | 98187 |
+| ctx:8 | context | 62 | 14267 | 14272 |
+| sv:9 | SV | 5 | 0 | 69 |
+| ctx:10 | context | 126 | 63396 | 63467 |
+
+736 source walks collapse to 700 canonical alleles. 71 forward and 60 antiparallel templates, zero
+partial frames, zero bypasses, zero contained bubbles, zero abutting boundaries. The three SV blocks
+with a zero-length allele are deletions: after trimming, the shortest allele of a deletion bubble is
+empty, which is what it should be.
+
+### Gate results
+
+1. **Round trip.** All 131 templates respell byte-for-byte in their own frame, with the 60
+   antiparallel ones canonicalised. Orientation is derived structurally, from the order in which a
+   template visits the chain's boundary nodes — never by comparing bytes against the authoritative
+   sequence, which would make this gate tautological.
+2. **Fingerprint invariance.** Splitting every graph node of length >= 2 in half — changing every node
+   identifier, every walk signature and every edge — leaves the fingerprint at `a58e2656e6209e0c`.
+   The split model also passes its own round trip. Synthetic arms cover walk renaming, record
+   reordering and sequence-identical aliases as invariants, and allele-sequence and block-kind
+   changes as non-invariants.
+3. **Block intervals tile** the spelled haplotype with no gap or overlap.
+4. **Partial frames refuse**, proven synthetically since C4 has none.
+5. **Phase 4 gate 3.** The marker panel covers exactly the 700 canonical alleles.
+
+### Marker results on real C4
+
+At k=31, s=15 over the prepared model: marker universe 47,960, of which 25,167 are invariant
+anchors; **114 markers dropped for varying in more than one block** (0.24% of the universe); no block
+is left without a discriminating marker; 694 of 700 alleles carry at least one.
+
+That answers the `dropped_multiblock_markers` question with a measurement rather than a guess: the
+C4A/C4B duplication does not cost the proposal model anything material, so the current semantics
+stand.
+
+The six alleles without a marker are three empty deletion alleles and three non-empty alleles
+shorter than k, which carry no syncmer at all. Those three are invisible to the marker proposal and
+can only be separated by the fragment likelihood. This is the same mechanism that makes GSTM1 hard,
+now quantified at C4 and small.
+
+One honesty note for the reviewer: `scored_alleles == total_alleles` holds by construction, because
+version one has no allele cap anywhere in the code. On its own that equality proves nothing. The
+load-bearing assertions are that the panel covers exactly the model's canonical allele set and the
+per-allele marker coverage census above.
+
+## 5. Remaining work order
+
+### Step 1 — Phase 6 candidate-neutral fragment likelihood
 
 The largest step, the dominant runtime cost, and the one the previous attempt failed on. Four
 commits:
 
-- **3a** `LibraryModel` extension: error, insert, background, outlier and fragment-start intensity
+- **1a** `LibraryModel` extension: error, insert, background, outlier and fragment-start intensity
   with provenance, plus validation. Read lengths stay per-fragment observations.
-- **3b** Exhaustive substitution-only oracle, test-only. Independently re-derived, not lifted from
+- **1b** Exhaustive substitution-only oracle, test-only. Independently re-derived, not lifted from
   `archive/genotype-factor-2026-09-11:src/genotype_fragments.cpp` — that file is 9514 lines of
   capped, truncated, top-K approximations the contract explicitly bars from being a production base.
   Its recorded traps become permanent regression fixtures: signed binned starts flipping strand;
   `FragmentState` ordering omitting edit counts; a run-wide read length raising a short fragment's
   insert floor; several seeds rediscovering one placement; distinct repeat copies with identical
   statistics.
-- **3c** Production scorer: inverted pigeonhole piece index over candidates (not a per-candidate
+- **1c** Production scorer: inverted pigeonhole piece index over candidates (not a per-candidate
   position hash), unique-haplotype interning so 2K haploid mosaics of ~230 kb are scored once, exact
   log-multiplicity state compression with separate physical-origin / statistical-class / mass
   counters, analytic exposure, and diploid combination by column pair.
-- **3d** Certification: lower/upper score intervals, contender-only refinement, a winner only when
+- **1d** Certification: lower/upper score intervals, contender-only refinement, a winner only when
   one lower bound beats every competing upper bound, otherwise an equivalence set or
   `RESCORE_INCOMPLETE`.
 
 All 14 named gates, the four prior mutations that must fail, and the ten runtime counters land with
-3d. Compression is accepted only after it reproduces the oracle's mass exactly.
+1d. Compression is accepted only after it reproduces the oracle's mass exactly.
 
-### Step 4 — Phase 7 command integration
+### Step 2 — Phase 7 command integration
 
 `panvar genotype` with the eight declared options and no others. Orchestration only: load, count
 markers, propose, spell and intern, recompute the Li-Stephens prior independently of the beam,
 score, certify, project. Five outputs, five statuses, model fingerprint in the output. Per-block
 output covers SV blocks; context blocks are modelled, not reported as calls.
 
-### Step 5 — Phase 8 one-donor C4 go/no-go
+### Step 3 — Phase 8 one-donor C4 go/no-go
 
 K=64 under 90 s and 4 GB with per-stage wall time, then the K = 8..256 ladder with truth-in-candidate
 rank, per-block true edlib distance, score gap, and winner stability. Proposal is measured at 0.20 s
-and 26 MB, so effectively the whole budget belongs to Step 3. No cohort work starts before this
+and 26 MB, so effectively the whole budget belongs to Step 1. No cohort work starts before this
 passes.
 
 The beam stay/switch factorization is **not** on this path. The contract permits it; C4 does not need
 it. Revisit only if a later locus has a block count in the hundreds.
 
-## 5. Reviewer questions
+## 6. Reviewer questions
 
 1. **Tiling.** Confirm that promoting the six polymorphic context spans to blocks is the intended
    reading of "ordered blocks and their invariant contexts". At C4 no gap is invariant, so the
@@ -193,9 +266,15 @@ it. Revisit only if a later locus has a block count in the hundreds.
    choosing a whole template over those spans. Is that the intended resolution for C4, or should
    long blocks be sub-divided at a declared coordinate? This changes the legal switch set and so is
    a model change needing its own gate.
-3. **`dropped_multiblock_markers`.** Is dropping a marker that varies in two blocks from both blocks
-   the intended semantics? It is safe against double-counting but potentially lossy exactly across
-   the C4A/C4B duplication. Decision requested after Step 2 reports the magnitude.
-4. **Oracle provenance.** Confirm that re-deriving the Phase 6 oracle independently, rather than
+3. **`dropped_multiblock_markers` — answered, confirmation requested.** 114 of 47,960 markers are
+   dropped for varying in more than one block, and no block loses its discriminating markers. The
+   C4A/C4B duplication costs the proposal model nothing material, so the current semantics should
+   stand. Confirm rather than decide.
+4. **Divergence trim.** The adapter canonicalises block boundaries by trimming each variant block to
+   the span over which its alleles differ. This is a block-boundary definition, so by the contract's
+   own rule it is a model choice and not merely an implementation detail. It is what makes the
+   node-split fingerprint gate pass. Confirm it, and confirm that leaving blocks with a bypass allele
+   untrimmed is acceptable for version one.
+5. **Oracle provenance.** Confirm that re-deriving the Phase 6 oracle independently, rather than
    porting the archived exhaustive scorer, is the intended reading of "the archived exhaustive
    substitution-only fragment model is the oracle".
