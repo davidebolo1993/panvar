@@ -61,6 +61,11 @@ struct DiscreteInsertDistribution {
     double log_probability(std::size_t insert_bp) const noexcept;
 };
 
+// The one definition of log-space addition. It sits in this lowest layer because both the insert
+// normalisation here and the fragment scorer above need it, and two copies of it is exactly how two
+// stages start disagreeing about the same sum.
+double log_add_exp(double lhs, double rhs);
+
 void validate_read_pair(const ReadPair& fragment);
 void validate_library_model(const LibraryModel& model);
 

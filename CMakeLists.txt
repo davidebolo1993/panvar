@@ -246,6 +246,11 @@ if(PANVAR_BUILD_TESTING)
         target_compile_options(genotype_fragment_oracle_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME panvar_genotype_fragment_oracle COMMAND genotype_fragment_oracle_test)
 
+        add_executable(genotype_fragment_scorer_test tests/genotype_fragment_scorer.cpp)
+        target_link_libraries(genotype_fragment_scorer_test PRIVATE panvarlib)
+        target_compile_options(genotype_fragment_scorer_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_genotype_fragment_scorer COMMAND genotype_fragment_scorer_test)
+
         add_executable(genotype_mosaic_proposal_test tests/genotype_mosaic_proposal.cpp)
         target_link_libraries(genotype_mosaic_proposal_test PRIVATE panvarlib)
         target_compile_options(genotype_mosaic_proposal_test PRIVATE -Wall -Wextra -Wpedantic)

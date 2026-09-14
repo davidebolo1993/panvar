@@ -10,14 +10,6 @@ namespace {
 
 constexpr double kNegInf = -std::numeric_limits<double>::infinity();
 
-double log_add_exp(double a, double b) {
-    if (a == kNegInf) return b;
-    if (b == kNegInf) return a;
-    const double hi = std::max(a, b);
-    const double lo = std::min(a, b);
-    return hi + std::log1p(std::exp(lo - hi));
-}
-
 double log_sum_exp(const std::vector<double>& values) {
     double result = kNegInf;
     for (double value : values) result = log_add_exp(result, value);

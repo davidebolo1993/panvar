@@ -1,6 +1,10 @@
 #include "panvar/fragment_likelihood.hpp"
 
 #include <algorithm>
+#include <map>
+#include <set>
+#include <tuple>
+#include <type_traits>
 #include <cmath>
 #include <stdexcept>
 
@@ -26,6 +30,8 @@ char complement(char base) {
     }
 }
 
+std::string reverse_complement_read(const std::string& bases);
+
 std::string reverse_complement_read(const std::string& bases) {
     std::string out(bases.size(), 'N');
     for (std::size_t i = 0; i < bases.size(); ++i) {
@@ -35,14 +41,6 @@ std::string reverse_complement_read(const std::string& bases) {
 }
 
 } // namespace
-
-double log_add_exp(double lhs, double rhs) {
-    if (lhs == kNegInf) return rhs;
-    if (rhs == kNegInf) return lhs;
-    const double hi = std::max(lhs, rhs);
-    const double lo = std::min(lhs, rhs);
-    return hi + std::log1p(std::exp(lo - hi));
-}
 
 std::optional<std::size_t> count_mismatches(
     const std::string& haplotype,
@@ -206,6 +204,411 @@ double log_placement_mass(
         mass = log_add_exp(mass, term);
     }
     return mass;
+}
+
+
+// -------------------------------------------------------------------------------------------
+// Accelerated scorer.
+// -------------------------------------------------------------------------------------------
+
+namespace {
+
+constexpr std::uint64_t kNoCode = std::numeric_limits<std::uint64_t>::max();
+
+std::uint64_t two_bit(char base) {
+    switch (base) {
+        case 'A': return 0;
+        case 'C': return 1;
+        case 'G': return 2;
+        case 'T': return 3;
+        default: return kNoCode;
+    }
+}
+
+// One oriented copy of one mate, already turned so that it matches the haplotype's forward strand.
+struct ReadForm {
+    std::size_t fragment = 0;
+    std::string bases;
+    bool is_forward_mate_of_first_arm = false;   // bookkeeping only; arms are resolved by role below
+};
+
+// piece code -> (form, offset of the piece inside that form)
+struct PieceEntry {
+    std::uint64_t code = 0;
+    std::uint32_t form = 0;
+    std::uint32_t offset = 0;
+};
+
+struct PieceIndex {
+    std::size_t piece_bp = 0;
+    std::vector<PieceEntry> entries;   // sorted by code
+};
+
+// A verified placement of one read form on one haplotype.
+struct FormPlacement {
+    std::uint32_t start = 0;
+    std::uint32_t mismatches = 0;
+};
+
+// The exact statistical class of a physical origin. Origins sharing all four fields may be stored
+// once with a multiplicity, but only because every term of their mass is identical.
+struct StateKey {
+    std::uint32_t insert_bp = 0;
+    std::uint32_t forward_mismatches = 0;
+    std::uint32_t reverse_mismatches = 0;
+    std::uint32_t orientation = 0;
+
+    bool operator<(const StateKey& other) const noexcept {
+        return std::tie(insert_bp, forward_mismatches, reverse_mismatches, orientation) <
+               std::tie(other.insert_bp, other.forward_mismatches, other.reverse_mismatches,
+                        other.orientation);
+    }
+};
+
+std::vector<PieceIndex> build_piece_indexes(
+    const std::vector<ReadForm>& forms,
+    std::size_t band,
+    std::size_t minimum_piece_bp) {
+    // Reads of different lengths yield pieces of different lengths, and one rolling scan can only
+    // carry one length. Bucket by piece length and scan once per bucket.
+    std::map<std::size_t, std::vector<PieceEntry>> by_length;
+    for (std::size_t f = 0; f < forms.size(); ++f) {
+        const std::size_t length = forms[f].bases.size();
+        // The band guarantees some contiguous 1/(band+1) chunk is exact. Keying on a PREFIX of that
+        // chunk keeps the guarantee, because an exact chunk has an exact prefix, and caps the key at
+        // what a 2-bit code can hold.
+        const std::size_t chunk = length / (band + 1);
+        const std::size_t piece = std::min<std::size_t>(31, chunk);
+        if (piece < minimum_piece_bp) {
+            throw std::invalid_argument(
+                "the declared mismatch band splits a read into pieces too short to index; widen the "
+                "reads, narrow the band, or lower minimum_piece_bp deliberately");
+        }
+        for (std::size_t p = 0; p <= band; ++p) {
+            const std::size_t offset = p * chunk;
+            std::uint64_t code = 0;
+            bool usable = true;
+            for (std::size_t i = 0; i < piece; ++i) {
+                const std::uint64_t bits = two_bit(forms[f].bases[offset + i]);
+                if (bits == kNoCode) { usable = false; break; }
+                code = (code << 2) | bits;
+            }
+            if (!usable) continue;
+            by_length[piece].push_back({code, static_cast<std::uint32_t>(f),
+                                        static_cast<std::uint32_t>(offset)});
+        }
+    }
+    std::vector<PieceIndex> indexes;
+    for (auto& item : by_length) {
+        std::sort(item.second.begin(), item.second.end(),
+                  [](const PieceEntry& lhs, const PieceEntry& rhs) {
+                      return std::tie(lhs.code, lhs.form, lhs.offset) <
+                             std::tie(rhs.code, rhs.form, rhs.offset);
+                  });
+        indexes.push_back({item.first, std::move(item.second)});
+    }
+    return indexes;
+}
+
+// Scan one haplotype once per piece-length bucket, turning every piece hit into an implied read
+// start. This is the inversion the design calls for: the haplotype is walked, not queried once per
+// read against a position hash the size of the locus.
+void collect_form_placements(
+    const std::string& haplotype,
+    const std::vector<ReadForm>& forms,
+    const std::vector<PieceIndex>& indexes,
+    std::size_t band,
+    std::vector<std::vector<FormPlacement>>& out,
+    FragmentScoringCounters& counters) {
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> proposed;   // (form, start)
+
+    for (const PieceIndex& index : indexes) {
+        const std::size_t piece = index.piece_bp;
+        if (haplotype.size() < piece) continue;
+        counters.candidate_bases_scanned += haplotype.size();
+
+        const std::uint64_t mask = piece == 32
+            ? std::numeric_limits<std::uint64_t>::max()
+            : ((std::uint64_t{1} << (2 * piece)) - 1);
+        std::uint64_t code = 0;
+        std::size_t run = 0;
+        for (std::size_t at = 0; at < haplotype.size(); ++at) {
+            const std::uint64_t bits = two_bit(haplotype[at]);
+            if (bits == kNoCode) { run = 0; code = 0; continue; }
+            code = ((code << 2) | bits) & mask;
+            if (++run < piece) continue;
+            const std::size_t piece_start = at + 1 - piece;
+
+            const auto range = std::equal_range(
+                index.entries.begin(), index.entries.end(), code,
+                [](const auto& lhs, const auto& rhs) {
+                    if constexpr (std::is_same_v<std::decay_t<decltype(lhs)>, PieceEntry>) {
+                        return lhs.code < rhs;
+                    } else {
+                        return lhs < rhs.code;
+                    }
+                });
+            for (auto it = range.first; it != range.second; ++it) {
+                ++counters.piece_hits;
+                if (it->offset > piece_start) continue;   // implied start would be negative
+                proposed.emplace_back(it->form,
+                                      static_cast<std::uint32_t>(piece_start - it->offset));
+                ++counters.proposed_starts;
+            }
+        }
+    }
+
+    // Several pieces of one read can rediscover one physical placement. Deduplicate before
+    // verifying, so a placement found three ways is verified once and counted once.
+    std::sort(proposed.begin(), proposed.end());
+    proposed.erase(std::unique(proposed.begin(), proposed.end()), proposed.end());
+    counters.unique_starts += proposed.size();
+
+    for (const auto& item : proposed) {
+        ++counters.full_read_verifications;
+        const std::optional<std::size_t> mismatches =
+            count_mismatches(haplotype, forms[item.first].bases, item.second, band);
+        if (!mismatches.has_value()) continue;
+        out[item.first].push_back({item.second, static_cast<std::uint32_t>(*mismatches)});
+        ++counters.accepted_mate_placements;
+    }
+    for (std::vector<FormPlacement>& list : out) {
+        std::sort(list.begin(), list.end(), [](const FormPlacement& lhs, const FormPlacement& rhs) {
+            return lhs.start < rhs.start;
+        });
+    }
+}
+
+} // namespace
+
+double FragmentScoringResult::mass_of(std::size_t fragment, std::size_t haplotype) const {
+    if (unique_haplotypes == 0 || haplotype >= unique_haplotypes ||
+        fragment * unique_haplotypes + haplotype >= log_mass.size()) {
+        throw std::out_of_range("fragment/haplotype mass index is out of range");
+    }
+    return log_mass[fragment * unique_haplotypes + haplotype];
+}
+
+InternedHaplotypes intern_haplotypes(
+    const std::vector<MosaicPath>& allele_paths,
+    const std::vector<std::string>& sequences) {
+    if (allele_paths.size() != sequences.size()) {
+        throw std::invalid_argument("allele paths and spelled sequences differ in size");
+    }
+    InternedHaplotypes result;
+    result.index_of.reserve(sequences.size());
+    std::map<std::string, std::size_t> slot_by_sequence;
+    std::set<std::vector<std::size_t>> distinct_paths;
+    for (std::size_t i = 0; i < sequences.size(); ++i) {
+        distinct_paths.insert(allele_paths[i].alleles);
+        const auto found = slot_by_sequence.find(sequences[i]);
+        if (found != slot_by_sequence.end()) {
+            result.index_of.push_back(found->second);
+            continue;
+        }
+        const std::size_t slot = result.sequences.size();
+        slot_by_sequence.emplace(sequences[i], slot);
+        result.sequences.push_back(sequences[i]);
+        result.index_of.push_back(slot);
+    }
+    // Two different allele paths can spell identical bytes. They are one haplotype to any read-based
+    // method, so they are scored once -- but the count of distinct paths is retained, because
+    // collapsing them silently would hide that the candidate set is narrower than it looks.
+    result.distinct_allele_paths = distinct_paths.size();
+    return result;
+}
+
+FragmentScoringResult score_diplotypes(
+    const InternedHaplotypes& haplotypes,
+    const std::vector<HaplotypeCandidate>& candidates,
+    const std::vector<ReadPair>& fragments,
+    const LibraryModel& library,
+    const FragmentScoringOptions& options) {
+    validate_library_model(library);
+    if (options.minimum_piece_bp == 0) {
+        throw std::invalid_argument("minimum indexable piece length must be positive");
+    }
+    for (const HaplotypeCandidate& candidate : candidates) {
+        if (candidate.first >= haplotypes.sequences.size() ||
+            candidate.second >= haplotypes.sequences.size()) {
+            throw std::invalid_argument("diplotype candidate names an unknown haplotype");
+        }
+    }
+
+    FragmentScoringResult result;
+    result.scores.resize(candidates.size());
+    result.unique_haplotypes = haplotypes.sequences.size();
+    FragmentScoringCounters& counters = result.counters;
+
+    // Four oriented forms per fragment: each mate as given, and each pre-complemented. Whichever
+    // mate reads off the forward strand is compared as given, so every comparison is forward.
+    std::vector<ReadForm> forms;
+    forms.reserve(fragments.size() * 4);
+    std::vector<DiscreteInsertDistribution> insert_by_fragment;
+    std::vector<double> background_by_fragment;
+    insert_by_fragment.reserve(fragments.size());
+    background_by_fragment.reserve(fragments.size());
+    for (std::size_t f = 0; f < fragments.size(); ++f) {
+        validate_read_pair(fragments[f]);
+        forms.push_back({f, fragments[f].first.bases, true});
+        forms.push_back({f, reverse_complement_read(fragments[f].first.bases), false});
+        forms.push_back({f, fragments[f].second.bases, false});
+        forms.push_back({f, reverse_complement_read(fragments[f].second.bases), true});
+        insert_by_fragment.push_back(
+            build_fragment_insert_distribution(fragments[f], library));
+        background_by_fragment.push_back(log_background_probability(fragments[f]));
+    }
+    const auto form_slot = [](std::size_t fragment, std::size_t which) {
+        return fragment * 4 + which;   // 0: mate1, 1: rc(mate1), 2: mate2, 3: rc(mate2)
+    };
+
+    const std::vector<PieceIndex> indexes =
+        forms.empty() ? std::vector<PieceIndex>{}
+                      : build_piece_indexes(forms, options.mismatch_band, options.minimum_piece_bp);
+
+    // Exposure is a property of the library and the haplotype, not of any one fragment, so it uses
+    // the library's own insert support rather than a fragment-specific floor.
+    InsertSupport library_support;
+    {
+        const double lo = std::ceil(library.insert_mean_bp -
+                                    library.support_sigmas * library.insert_sd_bp);
+        const double hi = std::floor(library.insert_mean_bp +
+                                     library.support_sigmas * library.insert_sd_bp);
+        library_support.min_bp = lo <= 1.0 ? 1 : static_cast<std::size_t>(lo);
+        library_support.max_bp = hi < 1.0 ? 0 : static_cast<std::size_t>(hi);
+    }
+    DiscreteInsertDistribution library_insert;
+    library_insert.support = library_support;
+    if (!library_support.empty()) {
+        double log_z = kNegInf;
+        for (std::size_t length = library_support.min_bp; length <= library_support.max_bp;
+             ++length) {
+            const double z = (static_cast<double>(length) - library.insert_mean_bp) /
+                             library.insert_sd_bp;
+            log_z = log_add_exp(log_z, -0.5 * z * z);
+        }
+        for (std::size_t length = library_support.min_bp; length <= library_support.max_bp;
+             ++length) {
+            const double z = (static_cast<double>(length) - library.insert_mean_bp) /
+                             library.insert_sd_bp;
+            library_insert.log_probability_by_offset.push_back(-0.5 * z * z - log_z);
+        }
+    }
+
+    // log mass of every fragment on every unique haplotype, one chromosome copy.
+    const std::size_t unique = haplotypes.sequences.size();
+    std::vector<double> mass(fragments.size() * unique, kNegInf);
+    std::vector<double> exposure(unique, 0.0);
+
+    std::map<StateKey, std::uint64_t> states;
+    for (std::size_t h = 0; h < unique; ++h) {
+        const std::string& haplotype = haplotypes.sequences[h];
+        exposure[h] = haplotype_exposure(haplotype.size(), library_insert);
+        if (forms.empty()) continue;
+
+        std::vector<std::vector<FormPlacement>> placements(forms.size());
+        collect_form_placements(haplotype, forms, indexes, options.mismatch_band, placements,
+                                counters);
+
+        for (std::size_t f = 0; f < fragments.size(); ++f) {
+            const std::size_t first_length = fragments[f].first.bases.size();
+            const std::size_t second_length = fragments[f].second.bases.size();
+            const InsertSupport& support = insert_by_fragment[f].support;
+            if (support.empty()) continue;
+            states.clear();
+
+            for (int arm = 0; arm < 2; ++arm) {
+                // FirstForward: mate one as given is the forward mate, rc(mate two) the reverse one.
+                const std::vector<FormPlacement>& forward =
+                    placements[form_slot(f, arm == 0 ? 0 : 2)];
+                const std::vector<FormPlacement>& reverse =
+                    placements[form_slot(f, arm == 0 ? 3 : 1)];
+                const std::size_t forward_length = arm == 0 ? first_length : second_length;
+                const std::size_t reverse_length = arm == 0 ? second_length : first_length;
+                if (forward.empty() || reverse.empty()) continue;
+
+                for (const FormPlacement& start : forward) {
+                    // reverse_start + reverse_length - forward_start must lie in the support, so the
+                    // reverse starts form one contiguous window. Two-pointer bounds, no map.
+                    const std::size_t lo_end = static_cast<std::size_t>(start.start) +
+                                               std::max(support.min_bp, std::max(forward_length,
+                                                                                 reverse_length));
+                    const std::size_t hi_end =
+                        static_cast<std::size_t>(start.start) + support.max_bp;
+                    if (hi_end < reverse_length) continue;
+                    const std::size_t lo_start =
+                        lo_end < reverse_length ? 0 : lo_end - reverse_length;
+                    const std::size_t hi_start = hi_end - reverse_length;
+
+                    const auto begin = std::lower_bound(
+                        reverse.begin(), reverse.end(), lo_start,
+                        [](const FormPlacement& lhs, std::size_t value) {
+                            return lhs.start < value;
+                        });
+                    const auto end = std::upper_bound(
+                        begin, reverse.end(), hi_start,
+                        [](std::size_t value, const FormPlacement& rhs) {
+                            return value < rhs.start;
+                        });
+                    for (auto it = begin; it != end; ++it) {
+                        const std::optional<std::size_t> insert = fr_insert_length(
+                            start.start, forward_length, it->start, reverse_length, support);
+                        if (!insert.has_value()) continue;
+                        ++counters.valid_fr_states;
+                        ++counters.physical_origins;
+                        StateKey key;
+                        key.insert_bp = static_cast<std::uint32_t>(*insert);
+                        key.forward_mismatches = start.mismatches;
+                        key.reverse_mismatches = it->mismatches;
+                        key.orientation = static_cast<std::uint32_t>(arm);
+                        ++states[key];
+                    }
+                }
+            }
+            if (states.empty()) continue;
+            counters.statistical_state_classes += states.size();
+
+            double total = kNegInf;
+            for (const auto& item : states) {
+                const std::size_t forward_length =
+                    item.first.orientation == 0 ? first_length : second_length;
+                const std::size_t reverse_length =
+                    item.first.orientation == 0 ? second_length : first_length;
+                // Exact log-multiplicity: every origin in this class has an identical mass term, so
+                // multiplying by the count is not an approximation of summing them, it IS the sum.
+                const double term =
+                    std::log(static_cast<double>(item.second)) +
+                    insert_by_fragment[f].log_probability(item.first.insert_bp) +
+                    log_emission(forward_length, item.first.forward_mismatches,
+                                 library.substitution_error) +
+                    log_emission(reverse_length, item.first.reverse_mismatches,
+                                 library.substitution_error);
+                total = log_add_exp(total, term);
+            }
+            mass[f * unique + h] = total;
+        }
+    }
+
+    for (std::size_t c = 0; c < candidates.size(); ++c) {
+        const std::size_t a = candidates[c].first;
+        const std::size_t b = candidates[c].second;
+        DiplotypeScore& score = result.scores[c];
+        // A homozygote names the same haplotype twice and therefore counts two chromosome copies in
+        // both terms, which is what the fragment contract requires.
+        score.exposure_term = -library.fragment_start_intensity * (exposure[a] + exposure[b]);
+        double fragment_term = 0.0;
+        for (std::size_t f = 0; f < fragments.size(); ++f) {
+            const double combined =
+                log_add_exp(mass[f * unique + a], mass[f * unique + b]);
+            if (combined != kNegInf) ++score.fragments_with_mass;
+            fragment_term +=
+                log_fragment_contribution(combined, background_by_fragment[f], library);
+        }
+        score.fragment_term = fragment_term;
+        score.log_likelihood = score.exposure_term + fragment_term;
+    }
+    result.log_mass = std::move(mass);
+    return result;
 }
 
 } // namespace panvar

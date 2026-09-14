@@ -11,14 +11,6 @@
 namespace panvar {
 namespace {
 
-double log_add_exp(double a, double b) {
-    if (a == -std::numeric_limits<double>::infinity()) return b;
-    if (b == -std::numeric_limits<double>::infinity()) return a;
-    const double hi = std::max(a, b);
-    const double lo = std::min(a, b);
-    return hi + std::log1p(std::exp(lo - hi));
-}
-
 double gaussian_log_weight(std::size_t insert_bp, const LibraryModel& model) {
     const double z = (static_cast<double>(insert_bp) - model.insert_mean_bp) /
                      model.insert_sd_bp;
@@ -36,6 +28,14 @@ void validate_read(const SequencingRead& read, const char* which) {
 }
 
 } // namespace
+
+double log_add_exp(double lhs, double rhs) {
+    if (lhs == -std::numeric_limits<double>::infinity()) return rhs;
+    if (rhs == -std::numeric_limits<double>::infinity()) return lhs;
+    const double hi = std::max(lhs, rhs);
+    const double lo = std::min(lhs, rhs);
+    return hi + std::log1p(std::exp(lo - hi));
+}
 
 void validate_read_pair(const ReadPair& fragment) {
     validate_read(fragment.first, "first");

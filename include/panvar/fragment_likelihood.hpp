@@ -15,8 +15,6 @@ namespace panvar {
 // contribution and log-addition. Every caller uses these; a private copy of any of them is how the
 // accelerated scorer and its oracle start disagreeing about the model they are supposed to share.
 
-double log_add_exp(double lhs, double rhs);
-
 // Which mate is read off the haplotype's forward strand. The other mate matches the haplotype's
 // reverse strand, which is the same as its own reverse complement matching forward, so every
 // comparison below is a forward comparison once the reads are pre-complemented.
@@ -95,5 +93,81 @@ double log_placement_mass(
     const ReadPair& fragment,
     const DiscreteInsertDistribution& insert,
     const LibraryModel& library);
+
+// ---------------------------------------------------------------------------------------------
+// Accelerated scorer.
+// ---------------------------------------------------------------------------------------------
+
+// K diplotype candidates contain at most 2K haploid mosaics, and mosaics that differ in their allele
+// path can still spell identical bytes. Scoring the unique sequences once and combining two columns
+// per candidate is what keeps the cost linear in unique haplotypes rather than quadratic in
+// candidates.
+struct InternedHaplotypes {
+    std::vector<std::string> sequences;
+    // Parallel to the input: which unique sequence each spelled haplotype resolved to.
+    std::vector<std::size_t> index_of;
+    std::size_t distinct_allele_paths = 0;
+};
+
+InternedHaplotypes intern_haplotypes(
+    const std::vector<MosaicPath>& allele_paths,
+    const std::vector<std::string>& sequences);
+
+struct HaplotypeCandidate {
+    std::size_t first = 0;    // index into InternedHaplotypes::sequences
+    std::size_t second = 0;
+};
+
+struct FragmentScoringOptions {
+    // The declared mismatch band. Part of the model: placements beyond it are omitted from the mass.
+    std::size_t mismatch_band = 2;
+    // Pigeonhole pieces shorter than this are too unspecific to index, so the scorer refuses rather
+    // than silently degrading into a quadratic scan.
+    std::size_t minimum_piece_bp = 10;
+};
+
+// Measured work, not estimated viability. `candidate_bases_scanned` counts haplotype bases actually
+// walked, which is the honest denominator; counting hash lookups instead flatters the index.
+struct FragmentScoringCounters {
+    std::uint64_t candidate_bases_scanned = 0;
+    std::uint64_t piece_hits = 0;
+    std::uint64_t proposed_starts = 0;
+    std::uint64_t unique_starts = 0;
+    std::uint64_t full_read_verifications = 0;
+    std::uint64_t accepted_mate_placements = 0;
+    std::uint64_t valid_fr_states = 0;
+    std::uint64_t physical_origins = 0;
+    std::uint64_t statistical_state_classes = 0;
+    std::uint64_t candidates_deepened = 0;
+};
+
+struct DiplotypeScore {
+    double log_likelihood = 0.0;
+    double fragment_term = 0.0;
+    double exposure_term = 0.0;
+    std::size_t fragments_with_mass = 0;
+};
+
+struct FragmentScoringResult {
+    std::vector<DiplotypeScore> scores;     // parallel to the requested candidates
+    // Row-major [fragment * unique_haplotypes + haplotype]: the summed log placement mass of one
+    // fragment on one chromosome copy of one haplotype. Retained because it is what the exhaustive
+    // oracle certifies directly; recovering it from a candidate score would compare the two paths
+    // through the mixture rather than at the mass itself.
+    std::vector<double> log_mass;
+    std::size_t unique_haplotypes = 0;
+    FragmentScoringCounters counters;
+
+    double mass_of(std::size_t fragment, std::size_t haplotype) const;
+};
+
+// Scores exactly the requested candidates and nothing else. The raw score of a candidate does not
+// depend on which other candidates were requested, on their order, or on any proposal score.
+FragmentScoringResult score_diplotypes(
+    const InternedHaplotypes& haplotypes,
+    const std::vector<HaplotypeCandidate>& candidates,
+    const std::vector<ReadPair>& fragments,
+    const LibraryModel& library,
+    const FragmentScoringOptions& options);
 
 } // namespace panvar
