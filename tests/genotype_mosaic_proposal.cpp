@@ -1,0 +1,386 @@
+#include "panvar/genotype_model.hpp"
+#include "panvar/marker_model.hpp"
+#include "panvar/mosaic_beam.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <functional>
+#include <iostream>
+#include <limits>
+#include <map>
+#include <stdexcept>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
+
+namespace {
+
+constexpr double kNegInf = -std::numeric_limits<double>::infinity();
+
+void require(bool condition, const std::string& message) {
+    if (!condition) throw std::runtime_error(message);
+}
+
+void require_close(double observed, double expected, double tolerance, const std::string& message) {
+    if (!std::isfinite(observed) || !std::isfinite(expected) ||
+        std::abs(observed - expected) > tolerance) {
+        throw std::runtime_error(message + ": observed=" + std::to_string(observed) +
+                                 " expected=" + std::to_string(expected));
+    }
+}
+
+void require_throws(const std::function<void()>& operation, const std::string& message) {
+    try {
+        operation();
+    } catch (const std::invalid_argument&) {
+        return;
+    }
+    throw std::runtime_error(message);
+}
+
+std::size_t marker_slot(const panvar::PreparedMarkerPanel& panel, std::uint64_t code) {
+    const auto found = std::lower_bound(panel.codes.begin(), panel.codes.end(), code);
+    if (found == panel.codes.end() || *found != code) {
+        throw std::runtime_error("fixture marker is absent from prepared universe");
+    }
+    return static_cast<std::size_t>(found - panel.codes.begin());
+}
+
+double poisson_kernel(std::uint64_t observed, double mean) {
+    return static_cast<double>(observed) * std::log(mean) - mean;
+}
+
+panvar::StructuralLocusInput marker_fixture(bool two_varying_blocks = false) {
+    panvar::StructuralLocusInput input;
+    input.locus_id = "marker-fixture";
+    input.blocks = {
+        {"b0", {{"a-rich", "AAAAA"}, {"mixed", "AAACC"}, {"a-rich-alias", "AAAAA"}}},
+    };
+    input.invariant_segments = {"CGT", ""};
+    input.templates = {
+        {"h0", panvar::TemplateFrameStatus::Complete, {"a-rich"}},
+        {"h1", panvar::TemplateFrameStatus::Complete, {"mixed"}},
+        {"h2", panvar::TemplateFrameStatus::Complete, {"a-rich-alias"}},
+    };
+    if (two_varying_blocks) {
+        input.blocks.push_back(
+            {"b1", {{"b1-a-rich", "AAAAA"}, {"b1-mixed", "AAACC"}}});
+        input.invariant_segments = {"CGT", "", ""};
+        input.templates[0].allele_source_ids.push_back("b1-a-rich");
+        input.templates[1].allele_source_ids.push_back("b1-mixed");
+        input.templates[2].allele_source_ids.push_back("b1-a-rich");
+    }
+    return input;
+}
+
+panvar::SequencingRead read(const std::string& name, const std::string& bases) {
+    return {name, bases, std::string(bases.size(), 'I')};
+}
+
+void test_marker_model() {
+    const panvar::PreparedGenotypeModel model =
+        panvar::prepare_genotype_model(marker_fixture());
+    const panvar::PreparedMarkerPanel panel = panvar::build_marker_panel(model, 3, 3);
+    require(panel.total_alleles == 2 && panel.scored_alleles == 2,
+            "every canonical block allele must be retained for proposal scoring");
+    require(panel.blocks.size() == 1 && panel.blocks[0].marker_slots.size() == 3,
+            "hand fixture must retain its three varying canonical 3-mers");
+    require(panel.anchor_slots.size() == 1 && panel.anchor_haploid_multiplicity[0] == 1,
+            "constant context marker must remain a separate depth anchor");
+
+    // Independent two-bit expectations: AAA=0, AAC=1, ACC=5, canonical(CGT)=ACG=6.
+    const std::size_t aaa = marker_slot(panel, 0);
+    const std::size_t aac = marker_slot(panel, 1);
+    const std::size_t acc = marker_slot(panel, 5);
+    const std::size_t acg = marker_slot(panel, 6);
+    require(panel.anchor_slots[0] == acg, "hand-coded invariant marker key must match panel path");
+
+    const std::vector<panvar::ReadPair> fragments = {
+        {read("f/1", "AAAAA"), read("f/2", "AAACC")},
+    };
+    const panvar::MarkerObservations observations =
+        panvar::count_marker_observations(panel, fragments);
+    require(observations.reads == 2 && observations.bases == 10 &&
+                observations.syncmer_occurrences == 6 && observations.matched_occurrences == 6,
+            "read marker accounting must count every observed occurrence");
+    require(observations.counts[aaa] == 4 && observations.counts[aac] == 1 &&
+                observations.counts[acc] == 1 && observations.counts[acg] == 0,
+            "hand-counted marker multiplicities must match read projection exactly");
+
+    panvar::MarkerModelParameters parameters;
+    parameters.kmer_size = 3;
+    parameters.syncmer_s = 3;
+    parameters.expected_observations_per_copy = 0.5;
+    parameters.background_observations = 0.5;
+    parameters.provenance = "fixture: explicit";
+    const panvar::PreparedProposalEmissions emissions =
+        panvar::build_proposal_emissions(panel, observations, parameters);
+    require(emissions.every_allele_scored() && emissions.blocks[0].scored_alleles == 2,
+            "proposal table must score every allele without a hidden cap");
+    for (std::size_t first = 0; first < 2; ++first) {
+        for (std::size_t second = 0; second < 2; ++second) {
+            require(emissions.blocks[0].at(first, second) ==
+                        emissions.blocks[0].at(second, first),
+                    "diploid marker emission must be exactly symmetric under homologue swap");
+        }
+    }
+
+    const double base = 0.5;
+    const double expected_aa =
+        poisson_kernel(4, base + 0.5 * 6.0) - poisson_kernel(4, base);
+    const double expected_am =
+        poisson_kernel(4, base + 0.5 * 4.0) - poisson_kernel(4, base) +
+        poisson_kernel(1, base + 0.5) - poisson_kernel(1, base) +
+        poisson_kernel(1, base + 0.5) - poisson_kernel(1, base);
+    const std::size_t a_rich = model.blocks()[0].allele_id_for_source("a-rich");
+    const std::size_t mixed = model.blocks()[0].allele_id_for_source("mixed");
+    require_close(emissions.blocks[0].at(a_rich, a_rich), expected_aa, 1e-15,
+                  "homozygous multiplicity score must equal hand Poisson calculation");
+    require_close(emissions.blocks[0].at(a_rich, mixed), expected_am, 1e-15,
+                  "heterozygous multiplicity score must equal hand Poisson calculation");
+
+    const double constant = emissions.blocks[0].candidate_independent_log_constant;
+    const bool original_order = emissions.blocks[0].at(a_rich, a_rich) <
+                                emissions.blocks[0].at(a_rich, mixed);
+    const bool shifted_order = emissions.blocks[0].at(a_rich, a_rich) + constant <
+                               emissions.blocks[0].at(a_rich, mixed) + constant;
+    require(original_order == shifted_order,
+            "candidate-independent marker constant must not change proposal ranking");
+
+    const panvar::PreparedGenotypeModel multiblock_model =
+        panvar::prepare_genotype_model(marker_fixture(true));
+    const panvar::PreparedMarkerPanel multiblock =
+        panvar::build_marker_panel(multiblock_model, 3, 3);
+    require(multiblock.dropped_multiblock_markers == 3 &&
+                multiblock.blocks[0].marker_slots.empty() &&
+                multiblock.blocks[1].marker_slots.empty(),
+            "a marker varying in two blocks must not be counted in two proposal emissions");
+
+    require_throws([&] { panvar::build_marker_panel(model, 3, 4); },
+                   "syncmer s greater than k must refuse");
+    panvar::MarkerModelParameters bad = parameters;
+    bad.syncmer_s = 0;
+    require_throws([&] { panvar::validate_marker_parameters(bad); },
+                   "zero syncmer s must refuse instead of producing an empty model");
+}
+
+double log_add_exp(double lhs, double rhs) {
+    if (lhs == kNegInf) return rhs;
+    if (rhs == kNegInf) return lhs;
+    const double hi = std::max(lhs, rhs);
+    return hi + std::log1p(std::exp(std::min(lhs, rhs) - hi));
+}
+
+double transition(std::size_t from, std::size_t to, double r, std::size_t n) {
+    const double p = (from == to ? 1.0 - r : 0.0) + r / static_cast<double>(n);
+    return p > 0.0 ? std::log(p) : kNegInf;
+}
+
+struct OracleKey {
+    std::vector<std::size_t> first;
+    std::vector<std::size_t> second;
+    bool operator<(const OracleKey& other) const noexcept {
+        return std::tie(first, second) < std::tie(other.first, other.second);
+    }
+};
+
+struct OracleValue {
+    double best = kNegInf;
+    double logsum = kNegInf;
+    double emission = 0.0;
+    double transition = 0.0;
+    std::size_t histories = 0;
+};
+
+std::map<OracleKey, OracleValue> exhaustive_candidates(
+    const panvar::PanelAlleleMatrix& panel,
+    const panvar::PreparedProposalEmissions& emissions,
+    const std::vector<double>& recombination) {
+    const std::size_t n = panel.template_count();
+    const std::size_t blocks = panel.block_count();
+    std::map<OracleKey, OracleValue> result;
+    std::vector<std::size_t> h1(blocks, 0);
+    std::vector<std::size_t> h2(blocks, 0);
+    std::function<void(std::size_t, double, double)> extend;
+    extend = [&](std::size_t block, double emission_score, double transition_score) {
+        if (block == blocks) {
+            OracleKey key;
+            key.first.resize(blocks);
+            key.second.resize(blocks);
+            for (std::size_t b = 0; b < blocks; ++b) {
+                key.first[b] = panel.template_alleles[h1[b]][b];
+                key.second[b] = panel.template_alleles[h2[b]][b];
+            }
+            if (key.second < key.first) std::swap(key.first, key.second);
+            OracleValue& value = result[key];
+            const double score = emission_score + transition_score;
+            value.logsum = log_add_exp(value.logsum, score);
+            ++value.histories;
+            if (score > value.best) {
+                value.best = score;
+                value.emission = emission_score;
+                value.transition = transition_score;
+            }
+            return;
+        }
+        for (std::size_t a = 0; a < n; ++a) {
+            h1[block] = a;
+            for (std::size_t b = 0; b < n; ++b) {
+                h2[block] = b;
+                double next_transition = transition_score;
+                if (block == 0) {
+                    next_transition = -2.0 * std::log(static_cast<double>(n));
+                } else {
+                    const double t1 = transition(h1[block - 1], a, recombination[block - 1], n);
+                    const double t2 = transition(h2[block - 1], b, recombination[block - 1], n);
+                    if (t1 == kNegInf || t2 == kNegInf) continue;
+                    next_transition += t1 + t2;
+                }
+                const double next_emission = emission_score + emissions.blocks[block].at(
+                    panel.template_alleles[a][block], panel.template_alleles[b][block]);
+                extend(block + 1, next_emission, next_transition);
+            }
+        }
+    };
+    extend(0, 0.0, 0.0);
+    return result;
+}
+
+panvar::PreparedProposalEmissions beam_emissions() {
+    panvar::PreparedProposalEmissions emissions;
+    emissions.total_alleles = 6;
+    emissions.scored_alleles = 6;
+    emissions.blocks.resize(3);
+    const std::vector<std::vector<double>> values = {
+        {0.0, -0.2, -0.2, -1.0},
+        {-0.3, 0.0, 0.0, -0.7},
+        {-0.6, 0.1, 0.1, -0.4},
+    };
+    for (std::size_t block = 0; block < 3; ++block) {
+        emissions.blocks[block].allele_count = 2;
+        emissions.blocks[block].scored_alleles = 2;
+        emissions.blocks[block].log_score = values[block];
+    }
+    return emissions;
+}
+
+void compare_to_oracle(
+    const panvar::PanelAlleleMatrix& panel,
+    const panvar::PreparedProposalEmissions& emissions,
+    const std::vector<double>& recombination) {
+    const auto oracle = exhaustive_candidates(panel, emissions, recombination);
+    panvar::MosaicBeamParameters parameters;
+    parameters.unique_candidate_target = 1000;
+    parameters.raw_history_limit = 729;
+    parameters.expansion_chunk_size = 7;
+    const panvar::MosaicBeamResult actual =
+        panvar::propose_mosaic_diplotypes(panel, emissions, recombination, parameters);
+    require(actual.candidates.size() == oracle.size(),
+            "unpruned beam must recover every exhaustive unique mosaic");
+    require(actual.raw_history_limit_reached && !actual.unique_target_reached,
+            "exhaustive fixture must end at its declared raw-history limit");
+    for (const panvar::MosaicCandidate& candidate : actual.candidates) {
+        const OracleKey key{candidate.diplotype.first.alleles, candidate.diplotype.second.alleles};
+        const auto found = oracle.find(key);
+        require(found != oracle.end(), "beam candidate must exist in exhaustive enumeration");
+        require_close(candidate.best_proposal_score, found->second.best, 2e-14,
+                      "beam best history must equal exhaustive best history");
+        require_close(candidate.retained_logsum_proposal_score, found->second.logsum, 3e-14,
+                      "beam retained history sum must equal exhaustive sum");
+        require_close(candidate.proposal_emission_component, found->second.emission, 2e-14,
+                      "beam best emission component must equal exhaustive value");
+        require_close(candidate.proposal_transition_component, found->second.transition, 2e-14,
+                      "beam best transition component must equal exhaustive value");
+        require(candidate.equivalent_retained_histories == found->second.histories,
+                "beam must preserve every equivalent template history");
+        require(!(candidate.diplotype.second.alleles < candidate.diplotype.first.alleles),
+                "global homologue swap must be canonicalized only in final candidates");
+        require(candidate.every_allele_scored,
+                "candidate manifest must record complete allele scoring");
+    }
+    bool summed_histories_are_live = false;
+    for (const panvar::MosaicCandidate& candidate : actual.candidates) {
+        if (candidate.equivalent_retained_histories > 1 &&
+            candidate.retained_logsum_proposal_score > candidate.best_proposal_score + 1e-6) {
+            summed_histories_are_live = true;
+        }
+    }
+    require(summed_histories_are_live,
+            "fixture must fail a mutation that prematurely keeps only one allele-level history");
+}
+
+void test_mosaic_beam() {
+    panvar::PanelAlleleMatrix panel;
+    panel.template_names = {"h0", "h1", "h2"};
+    panel.template_alleles = {
+        {0, 0, 0},
+        {0, 1, 1},
+        {1, 0, 1},
+    };
+    const panvar::PreparedProposalEmissions emissions = beam_emissions();
+    compare_to_oracle(panel, emissions, {0.0, 0.0});
+    compare_to_oracle(panel, emissions, {0.25, 0.6});
+    compare_to_oracle(panel, emissions, {1.0, 1.0});
+
+    // The transition term is live: replacing the intermediate arm with r=1 changes its oracle.
+    const auto intermediate = exhaustive_candidates(panel, emissions, {0.25, 0.6});
+    const auto mutated_transition = exhaustive_candidates(panel, emissions, {1.0, 1.0});
+    bool transition_mutation_bites = intermediate.size() != mutated_transition.size();
+    for (const auto& item : intermediate) {
+        const auto found = mutated_transition.find(item.first);
+        if (found == mutated_transition.end() ||
+            std::abs(item.second.logsum - found->second.logsum) > 1e-8) {
+            transition_mutation_bites = true;
+            break;
+        }
+    }
+    require(transition_mutation_bites,
+            "fixture must fail a mutation replacing the Li-Stephens transition");
+
+    // Chunk boundaries emulate different scheduling. A total tie order must make them irrelevant.
+    panvar::PreparedProposalEmissions tied = emissions;
+    for (auto& block : tied.blocks) std::fill(block.log_score.begin(), block.log_score.end(), 0.0);
+    panvar::MosaicBeamParameters small_chunk{3, 9, 2};
+    panvar::MosaicBeamParameters large_chunk{3, 9, 1000};
+    const auto first = panvar::propose_mosaic_diplotypes(panel, tied, {1.0, 1.0}, small_chunk);
+    const auto second = panvar::propose_mosaic_diplotypes(panel, tied, {1.0, 1.0}, large_chunk);
+    require(first.candidates.size() == second.candidates.size(),
+            "tie fixture candidate count must not depend on chunking");
+    for (std::size_t i = 0; i < first.candidates.size(); ++i) {
+        require(first.candidates[i].diplotype.first == second.candidates[i].diplotype.first &&
+                    first.candidates[i].diplotype.second == second.candidates[i].diplotype.second &&
+                    first.candidates[i].best_proposal_score ==
+                        second.candidates[i].best_proposal_score,
+                "deterministic tie order must not depend on expansion chunk boundaries");
+    }
+
+    // All templates spell the same alleles: widening cannot manufacture a second unique mosaic.
+    panvar::PanelAlleleMatrix collapsed = panel;
+    collapsed.template_alleles = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
+    const auto limited = panvar::propose_mosaic_diplotypes(
+        collapsed, tied, {1.0, 1.0}, panvar::MosaicBeamParameters{2, 9, 3});
+    require(limited.candidates.size() == 1 && limited.beam_width_used == 9 &&
+                limited.raw_history_limit_reached,
+            "beam must deepen to the raw limit when histories collapse below unique target K");
+
+    require_throws(
+        [&] { panvar::propose_mosaic_diplotypes(
+            panel, emissions, {0.2}, panvar::MosaicBeamParameters{2, 10, 10}); },
+        "missing boundary transition must refuse");
+}
+
+} // namespace
+
+int main() {
+    try {
+        test_marker_model();
+        test_mosaic_beam();
+        std::cout << "genotype mosaic proposal: PASS\n";
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "genotype mosaic proposal: FAIL: " << error.what() << '\n';
+        return 1;
+    }
+}
