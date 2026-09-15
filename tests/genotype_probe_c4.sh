@@ -17,7 +17,7 @@ DONOR="${DONOR:-NA19240}"
 SEED="${SEED:-7}"
 DEPTH="${DEPTH:-30}"
 LADDER="${LADDER:-8 16 32 64 128 256}"
-LOO_K="${LOO_K:-64 256 1024}"
+LOO_K="${LOO_K:-64 256}"
 REF="HG00096#1#haplotype1-0000024:31848049-32074186"
 PANVAR="$BUILD/panvar"
 PROBE="$BUILD/genotype_probe"
@@ -66,22 +66,23 @@ for k in $LOO_K; do run_and_evaluate loo "$OUT/c4.loo.gfa" "$k"; done
 
 # ---- collect ------------------------------------------------------------------------------------------
 {
-  printf 'scheme\tK\tstatus\tunique_candidates\tsequence_candidates\ttruth_in_candidates\ttruth_proposal_rank\ttruth_score_rank\tdecided_by\tcertified_gap\tfragment_gap\tp_set\tblocks_exact\tsv_blocks_exact\tunordered_distance\tavailability_floor\texcess\tphase_switch_blocks\ttruth_spellable\tseconds\tpeak_rss_bytes\twinner_hash\n'
+  printf 'scheme\tK\tstatus\tstate_limit\tunique\tfound\tpruned\texhaustive\ttarget\tconditional\ttruth_in_candidates\ttruth_proposal_rank\ttruth_score_rank\tphase_support\tcontenders\tgenotype_read_supported\tcertified_gap\tfragment_gap\tblocks_exact\tsv_blocks_exact\tunordered_distance\tavailability_floor\texcess\tphase_switch_blocks\ttruth_spellable\tproposal_seconds\tseconds\tpeak_rss_bytes\twinner_hash\n'
   for scheme in lzo loo; do
     ks="$LADDER"; [ "$scheme" = loo ] && ks="$LOO_K"
     for k in $ks; do
       p="$OUT/$scheme/K$k"; s="$p.eval.summary.tsv"
       v() { awk -F'\t' -v key="$1" '$1==key{print $2}' "$s"; }
       hash="NA"; [ -f "$p.mosaic_haplotypes.fa" ] && hash="$(grep -v '^>' "$p.mosaic_haplotypes.fa" | shasum -a 256 | cut -c1-12)"
-      spell="$(v truth_hap1_spellable)/$(v truth_hap2_spellable)"
-      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$scheme" "$k" "$(v status)" "$(v unique_candidates)" "$(v sequence_candidates)" \
-        "$(v truth_in_candidates)" "$(v truth_proposal_rank)" "$(v truth_fragment_score_rank)" \
-        "$(v winner_decided_by)" "$(v certified_gap)" "$(v fragment_term_gap_to_runner_up)" \
-        "$(v winner_candidate_set_probability)" "$(v blocks_exact)" "$(v sv_blocks_exact)" \
+      printf '%s\t' "$scheme" "$k" "$(v status)" "$(v proposal_state_limit)" "$(v unique_candidates)" \
+        "$(v unique_candidates_found)" "$(v proposal_states_pruned)" "$(v proposal_search_exhaustive)" \
+        "$(v proposal_target_reached)" "$(v candidate_set_conditional)" "$(v truth_in_candidates)" \
+        "$(v truth_proposal_rank)" "$(v truth_fragment_score_rank)" "$(v phase_support)" \
+        "$(v fragment_contenders)" "$(v blocks_genotype_read_supported)" "$(v certified_gap)" \
+        "$(v fragment_term_gap_to_runner_up)" "$(v blocks_exact)" "$(v sv_blocks_exact)" \
         "$(v unordered_distance_total)" "$(v availability_floor_total)" "$(v excess_over_floor_total)" \
-        "$(v phase_switch_blocks)" "$spell" "$(v seconds_total)" \
-        "$(awk -F'\t' '{print $2}' "$p.resources.tsv")" "$hash"
+        "$(v phase_switch_blocks)" "$(v truth_hap1_spellable)/$(v truth_hap2_spellable)" \
+        "$(v seconds_proposal)" "$(v seconds_total)" "$(awk -F'\t' '{print $2}' "$p.resources.tsv")"
+      printf '%s\n' "$hash"
     done
   done
 } > "$OUT/ladder.tsv"

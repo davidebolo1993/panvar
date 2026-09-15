@@ -377,10 +377,13 @@ int evaluate(const Args& args) {
 
     std::ofstream summary(out + ".summary.tsv");
     summary << "key\tvalue\nscheme\t" << scheme << "\ndonor\t" << donor << "\nrun\t" << run << '\n';
-    for (const char* key : {"status", "max_candidates", "mismatch_band", "unique_candidates",
-                            "sequence_candidates", "winner_decided_by", "certified_gap",
+    for (const char* key : {"status", "note", "max_candidates", "mismatch_band", "proposal_state_limit",
+                            "unique_candidates", "unique_candidates_found", "proposal_states_pruned",
+                            "proposal_search_exhaustive", "proposal_target_reached",
+                            "candidate_set_conditional", "sequence_candidates", "phase_support",
+                            "fragment_contenders", "blocks_genotype_read_supported", "certified_gap",
                             "fragment_term_gap_to_runner_up", "winner_candidate_set_probability",
-                            "seconds_total", "seconds_rescoring", "model_fingerprint",
+                            "seconds_proposal", "seconds_total", "seconds_rescoring", "model_fingerprint",
                             "marker_depth_rate_per_copy", "marker_background"}) {
         const auto found = status.find(key);
         summary << key << '\t' << (found == status.end() ? "NA" : found->second) << '\n';
@@ -442,12 +445,17 @@ int evaluate(const Args& args) {
     std::ofstream table(out + ".blocks.tsv");
     table << "scheme\tdonor\tmax_candidates\tblock_id\tkind\ttruth1_bp\ttruth2_bp\tcalled1_bp\t"
              "called2_bp\tunordered_distance\tavailability_floor\texcess\ttruth1_available\t"
-             "truth2_available\n";
+             "truth2_available\tgenotype_support\n";
 
     const bool complete = status.count("status") && status.at("status") == "COMPLETE";
     std::vector<std::size_t> hap1;
     std::vector<std::size_t> hap2;
+    std::map<std::string, std::string> genotype_support;
+    const std::string phase_support = status.count("phase_support") ? status.at("phase_support") : "NA";
     if (complete) {
+        for (const auto& row : read_table(run + ".block_genotypes.tsv")) {
+            genotype_support[row.at("block_id")] = row.at("genotype_support");
+        }
         std::string representative;
         for (const auto& row : read_table(run + ".mosaic_scores.tsv")) {
             if (row.at("in_winner_set") == "true") representative = row.at("representative_beam_candidate");
@@ -484,7 +492,7 @@ int evaluate(const Args& args) {
             spellable[1] = spellable[1] && t2.has_value();
             table << scheme << '\t' << donor << '\t' << status.at("max_candidates") << '\t'
                   << block.block_id << '\t' << (variant ? "SV" : "context")
-                  << "\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\n";
+                  << "\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\n";
             continue;
         }
         bool available1 = false;
@@ -524,7 +532,8 @@ int evaluate(const Args& args) {
               << '\t' << (variant ? "SV" : "context") << '\t' << t1->size() << '\t' << t2->size() << '\t'
               << called1_bp << '\t' << called2_bp << '\t' << distance_cell << '\t' << floor << '\t'
               << excess_cell << '\t' << (available1 ? "true" : "false") << '\t'
-              << (available2 ? "true" : "false") << '\n';
+              << (available2 ? "true" : "false") << '\t'
+              << (genotype_support.count(block.block_id) ? genotype_support.at(block.block_id) : "NA") << '\n';
     }
 
     summary << "blocks\t" << model.blocks().size() << "\nsv_blocks\t" << sv_blocks
@@ -541,8 +550,11 @@ int evaluate(const Args& args) {
         }
         summary << "unordered_distance_total\t" << unordered_total
                 << "\nexcess_over_floor_total\t" << unordered_total - floor_total
-                << "\nphased_distance_total\t" << std::min(order_a, order_b)
-                << "\nphase_switch_blocks\t" << switch_blocks
+                // Phase-aware accuracy only where the reads chose the phase.
+                << "\nphased_distance_total\t"
+                << (phase_support == "READS" ? std::to_string(std::min(order_a, order_b)) : std::string("NA"))
+                << "\nphase_switch_blocks\t"
+                << (phase_support == "READS" ? std::to_string(switch_blocks) : std::string("NA"))
                 << "\nblocks_exact\t" << all_exact << "\nsv_blocks_exact\t" << sv_exact << '\n';
 
         // Truth in candidate set: some retained beam candidate spells both truth haplotypes.
