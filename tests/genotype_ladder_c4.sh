@@ -75,7 +75,7 @@ printf '%s\n' $DONORS | xargs -P "$JOBS" -I{} bash -c 'run_donor "$@"' _ {}
 
 # ---- collect ------------------------------------------------------------------------------------------
 {
-  printf 'donor\tstate_limit\tK\tstatus\tunique\tfound\tpruned\texhaustive\ttarget\tconditional\tcandidate_scope\tglobal_certified\ttruth_in_candidates\ttruth_proposal_rank\ttruth_score_rank\tphase_support\tcontenders\tread_supported_blocks\tblocks_exact\tsv_blocks_exact\tread_supported_blocks_exact\tunordered_distance\tsv_distance\tcontext_distance\tavailability_floor\texcess\tcertified_gap\tmarker_termination\twinner_hash\tladder_wall_seconds\tladder_peak_rss_bytes\n'
+  printf 'donor\tstate_limit\tK\tstatus\tunique\tfound\tpruned\texhaustive\ttarget\tconditional\tcandidate_scope\tglobal_certified\ttruth_in_candidates\ttruth_proposal_rank\ttruth_score_rank\tphase_support\tcontenders\tread_supported_blocks\tblocks_exact\tsv_blocks_exact\tread_supported_blocks_exact\tunordered_distance\tsv_distance\tcontext_distance\tavailability_floor\texcess\tnumeric_separation_gap\tmarker_termination\twinner_hash\tladder_wall_seconds\tladder_peak_rss_bytes\n'
   for donor in $DONORS; do
     for limit in $STATE_LIMITS; do
       prefix="$OUT/$donor/lzo/S$limit"
@@ -91,7 +91,7 @@ printf '%s\n' $DONORS | xargs -P "$JOBS" -I{} bash -c 'run_donor "$@"' _ {}
           "$(v phase_support)" "$(v fragment_contenders)" "$(v read_supported_blocks)" "$(v blocks_exact)" \
           "$(v sv_blocks_exact)" "$(v read_supported_blocks_exact)" "$(v unordered_distance_total)" \
           "$(v sv_unordered_distance_total)" "$(v context_unordered_distance_total)" \
-          "$(v availability_floor_total)" "$(v excess_over_floor_total)" "$(w certified_gap)" \
+          "$(v availability_floor_total)" "$(v excess_over_floor_total)" "$(w numeric_separation_gap)$(w certified_gap)" \
           "$(w marker_depth_termination)" "$hash" \
           "$(awk -F'\t' '$1=="wall_seconds"{print $2}' "$prefix.resources.tsv")"
         printf '%s\n' "$(awk -F'\t' '$1=="peak_rss_bytes"{print $2}' "$prefix.resources.tsv")"

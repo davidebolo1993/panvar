@@ -179,6 +179,12 @@ struct RankingSummary {
     bool projection_ambiguous = false;
     // Per block: every fragment contender projects to the winner's unordered allele pair there.
     std::vector<bool> block_genotype_read_supported;
+    // Per block, within the retained candidate set only: the posterior of the winner's unordered genotype, its
+    // quality -10 log10(1 - posterior), and whether every candidate with another genotype there sits below the
+    // winner beyond floating-point error. Conditional, never global, while the set omits candidates.
+    std::vector<double> block_genotype_posterior;
+    std::vector<double> block_genotype_quality;
+    std::vector<bool> block_numerically_separated;
 };
 
 void write_status(
@@ -298,7 +304,9 @@ void write_status(
         }
     }
     if (ranking != nullptr) {
-        out << "certified_gap\t" << ranking->certified_gap << '\n';
+        // Separation of the winner from every retained rival beyond floating-point error: numerical, within the
+        // retained set. It is not a statistical confidence; the block posteriors and GQ are.
+        out << "numeric_separation_gap\t" << ranking->certified_gap << '\n';
         // The gap is certified within the retained candidate set only. It is global only when the search
         // was exhaustive and nothing was truncated from its result.
         out << "global_certified\t"
@@ -372,6 +380,34 @@ std::string audited_phase_support(const std::string& within_candidates, bool aud
     if (within_candidates != "READS_WITHIN_CANDIDATES") return within_candidates;
     if (!audit_complete || !same_winner || !same_block_genotypes) return "UNRESOLVED";
     return audit_phase_support == "READS_WITHIN_CANDIDATES" ? "READS_AUDITED" : "PRIOR_ONLY";
+}
+
+std::vector<BlockGenotypeConfidence> block_genotype_confidence(
+    const std::vector<double>& scores,
+    const std::vector<double>& error_bounds,
+    const std::vector<std::vector<std::pair<std::size_t, std::size_t>>>& genotypes) {
+    if (scores.empty() || error_bounds.size() != scores.size() || genotypes.size() != scores.size()) {
+        throw std::invalid_argument("block genotype confidence needs one score, bound and genotype row per candidate");
+    }
+    const std::size_t blocks = genotypes.front().size();
+    double log_weight = -std::numeric_limits<double>::infinity();
+    for (const double score : scores) log_weight = log_add_exp(log_weight, score);
+    std::vector<double> log_other(blocks, -std::numeric_limits<double>::infinity());
+    std::vector<BlockGenotypeConfidence> out(blocks);
+    for (std::size_t c = 1; c < scores.size(); ++c) {
+        if (genotypes[c].size() != blocks) throw std::invalid_argument("every candidate needs a genotype per block");
+        for (std::size_t b = 0; b < blocks; ++b) {
+            if (genotypes[c][b] == genotypes[0][b]) continue;
+            log_other[b] = log_add_exp(log_other[b], scores[c]);
+            if (scores[c] + error_bounds[c] >= scores[0] - error_bounds[0]) out[b].numerically_separated = false;
+        }
+    }
+    for (std::size_t b = 0; b < blocks; ++b) {
+        const double log_error = log_other[b] - log_weight;
+        out[b].posterior = -std::expm1(log_error);
+        out[b].quality = -10.0 * log_error / std::log(10.0);
+    }
+    return out;
 }
 
 namespace {
@@ -787,6 +823,29 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                                                                              : "PRIOR_ONLY";
             summary.projection_ambiguous = sequence_candidates[best.candidate_id].projection_ambiguous;
         }
+        {
+            // Per block, conditional on the retained candidate set: posterior and GQ of the winner's unordered
+            // genotype, grouping candidates by their representative's genotype there.
+            std::vector<double> ranked_scores;
+            std::vector<double> ranked_bounds;
+            std::vector<std::vector<std::pair<std::size_t, std::size_t>>> ranked_genotypes;
+            for (const CertifiedCandidate& entry : ranking.candidates) {
+                ranked_scores.push_back(entry.score);
+                ranked_bounds.push_back(entry.numeric_error_bound);
+                const MosaicDiplotype& d = candidates[sequence_candidates[entry.candidate_id].representative].diplotype;
+                std::vector<std::pair<std::size_t, std::size_t>> row;
+                for (std::size_t b = 0; b < model.blocks().size(); ++b) {
+                    row.push_back(std::minmax(d.first.alleles[b], d.second.alleles[b]));
+                }
+                ranked_genotypes.push_back(std::move(row));
+            }
+            for (const BlockGenotypeConfidence& block :
+                 block_genotype_confidence(ranked_scores, ranked_bounds, ranked_genotypes)) {
+                summary.block_genotype_posterior.push_back(block.posterior);
+                summary.block_genotype_quality.push_back(block.quality);
+                summary.block_numerically_separated.push_back(block.numerically_separated);
+            }
+        }
 
         SetRanking out;
         out.candidates = std::move(candidates);
@@ -967,7 +1026,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             // what let the mosaic recombine, but they are not SV calls and are not presented as such.
             std::ofstream out = open_output(options.out_prefix + ".genotypes.tsv");
             out << "block_id\tkind\tallele1\tallele2\tallele1_bp\tallele2_bp\tallele1_sources\t"
-                   "allele2_sources\tzygosity\n";
+                   "allele2_sources\tzygosity\tconditional_genotype_posterior\tconditional_GQ\n";
             for (std::size_t b = 0; b < model.blocks().size(); ++b) {
                 const PreparedGenotypeBlock& block = model.blocks()[b];
                 if (block.kind != GenotypeBlockKind::Variant) continue;
@@ -985,7 +1044,9 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                     << block.alleles[a1].sequence.size() << '\t'
                     << block.alleles[a2].sequence.size() << '\t'
                     << sources(a1) << '\t' << sources(a2) << '\t'
-                    << (a1 == a2 ? "HOM" : "HET") << '\n';
+                    << (a1 == a2 ? "HOM" : "HET") << '\t' << std::setprecision(12)
+                    << summary.block_genotype_posterior[b] << '\t' << summary.block_genotype_quality[b]
+                    << std::setprecision(6) << '\n';
             }
         }
         {
@@ -994,7 +1055,8 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             // carries, so the interstitial blocks are distinguished rather than dropped.
             std::ofstream out = open_output(options.out_prefix + ".block_genotypes.tsv");
             out << "block_id\tkind\treportable\tallele1\tallele2\tallele1_bp\tallele2_bp\tzygosity\t"
-                   "projection_ambiguous\tgenotype_support\tphase_support\n";
+                   "projection_ambiguous\tgenotype_support\tphase_support\tconditional_genotype_posterior\t"
+                   "conditional_GQ\tnumerically_separated\tcandidate_scope\n";
             const bool ambiguous = sequence_candidates[winner].projection_ambiguous;
             for (std::size_t b = 0; b < model.blocks().size(); ++b) {
                 const PreparedGenotypeBlock& block = model.blocks()[b];
@@ -1006,7 +1068,10 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                     << block.alleles[a1].sequence.size() << '\t' << block.alleles[a2].sequence.size() << '\t'
                     << (a1 == a2 ? "HOM" : "HET") << '\t' << (ambiguous ? "true" : "false") << '\t'
                     << (summary.block_genotype_read_supported[b] ? "READS" : "PRIOR_ONLY") << '\t'
-                    << summary.phase_support << '\n';
+                    << summary.phase_support << '\t' << std::setprecision(12)
+                    << summary.block_genotype_posterior[b] << '\t' << summary.block_genotype_quality[b]
+                    << std::setprecision(6) << '\t' << (summary.block_numerically_separated[b] ? "true" : "false")
+                    << '\t' << (beam.candidate_set_conditional ? "CONDITIONAL" : "COMPLETE") << '\n';
             }
         }
         {
@@ -1028,7 +1093,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         if (!options.quiet) {
             std::cerr << "[genotype] COMPLETE  fingerprint=" << fingerprint
                       << "  candidates=" << candidates.size()
-                      << "  gap=" << ranking.certified_gap
+                      << "  separation=" << ranking.certified_gap
                       << "  total=" << timings.total << "s\n";
         }
         return GenotypeRunStatus::Complete;

@@ -66,7 +66,7 @@ for k in $LOO_K; do run_and_evaluate loo "$OUT/c4.loo.gfa" "$k"; done
 
 # ---- collect ------------------------------------------------------------------------------------------
 {
-  printf 'scheme\tK\tstatus\tstate_limit\tunique\tfound\tpruned\texhaustive\ttarget\tconditional\ttruth_in_candidates\ttruth_proposal_rank\ttruth_score_rank\tphase_support\tcontenders\tgenotype_read_supported\tcertified_gap\tfragment_gap\tblocks_exact\tsv_blocks_exact\tunordered_distance\tavailability_floor\texcess\tphase_switch_blocks\ttruth_spellable\tproposal_seconds\tseconds\tpeak_rss_bytes\twinner_hash\n'
+  printf 'scheme\tK\tstatus\tstate_limit\tunique\tfound\tpruned\texhaustive\ttarget\tconditional\ttruth_in_candidates\ttruth_proposal_rank\ttruth_score_rank\tphase_support\tcontenders\tgenotype_read_supported\tnumeric_separation_gap\tfragment_gap\tblocks_exact\tsv_blocks_exact\tunordered_distance\tavailability_floor\texcess\tphase_switch_blocks\ttruth_spellable\tproposal_seconds\tseconds\tpeak_rss_bytes\twinner_hash\n'
   for scheme in lzo loo; do
     ks="$LADDER"; [ "$scheme" = loo ] && ks="$LOO_K"
     for k in $ks; do
@@ -77,7 +77,7 @@ for k in $LOO_K; do run_and_evaluate loo "$OUT/c4.loo.gfa" "$k"; done
         "$(v unique_candidates_found)" "$(v proposal_states_pruned)" "$(v proposal_search_exhaustive)" \
         "$(v proposal_target_reached)" "$(v candidate_set_conditional)" "$(v truth_in_candidates)" \
         "$(v truth_proposal_rank)" "$(v truth_fragment_score_rank)" "$(v phase_support)" \
-        "$(v fragment_contenders)" "$(v blocks_genotype_read_supported)" "$(v certified_gap)" \
+        "$(v fragment_contenders)" "$(v blocks_genotype_read_supported)" "$(v numeric_separation_gap)" \
         "$(v fragment_term_gap_to_runner_up)" "$(v blocks_exact)" "$(v sv_blocks_exact)" \
         "$(v unordered_distance_total)" "$(v availability_floor_total)" "$(v excess_over_floor_total)" \
         "$(v phase_switch_blocks)" "$(v truth_hap1_spellable)/$(v truth_hap2_spellable)" \

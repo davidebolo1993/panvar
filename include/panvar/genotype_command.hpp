@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace panvar {
@@ -79,6 +80,22 @@ const char* genotype_run_status_name(GenotypeRunStatus status);
 // other primary claim is unchanged. Exposed for its gate.
 std::string audited_phase_support(const std::string& within_candidates, bool audit_complete, bool same_winner,
                                   bool same_block_genotypes, const std::string& audit_phase_support);
+
+// Per-block genotype confidence within a retained candidate set. Candidate 0 is the winner; scores are total
+// log scores and error_bounds their floating-point bounds; genotypes[c][b] is candidate c's unordered allele
+// pair at block b. The posterior is the set mass of candidates sharing the winner's genotype there; the quality
+// is -10 log10 of the rest, summed in log space so a posterior indistinguishable from one keeps a finite GQ;
+// numerically_separated says every candidate with another genotype is below the winner beyond error.
+// Exposed for its gate.
+struct BlockGenotypeConfidence {
+    double posterior = 1.0;
+    double quality = 0.0;
+    bool numerically_separated = true;
+};
+std::vector<BlockGenotypeConfidence> block_genotype_confidence(
+    const std::vector<double>& scores,
+    const std::vector<double>& error_bounds,
+    const std::vector<std::vector<std::pair<std::size_t, std::size_t>>>& genotypes);
 
 GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options);
 

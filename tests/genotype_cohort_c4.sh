@@ -80,7 +80,7 @@ export OUT PROBE REF SEED DEPTH STATE_LIMIT K AUDIT TIME_FLAG
 printf '%s\n' $DONORS | xargs -P "$JOBS" -I{} bash -c 'run_donor "$@"' _ {}
 
 # ---- collect ------------------------------------------------------------------------------------------
-COLUMNS_OUT="donor status note run_no_call unique found exhaustive target conditional candidate_scope global_certified truth_in_candidates truth_proposal_rank truth_score_rank phase_support phase_unsupported contenders blocks blocks_exact sv_blocks sv_blocks_exact read_supported_blocks read_supported_blocks_exact block_unsupported unordered_distance sv_distance context_distance availability_floor excess read_supported_distance read_supported_excess certified_gap marker_termination audit_status audit_same_winner audit_same_block_calls audit_phase_support phase_reads_not_confirmed wall_seconds peak_rss_bytes"
+COLUMNS_OUT="donor status note run_no_call unique found exhaustive target conditional candidate_scope global_certified truth_in_candidates truth_proposal_rank truth_score_rank phase_support phase_unsupported contenders blocks blocks_exact sv_blocks sv_blocks_exact read_supported_blocks read_supported_blocks_exact block_unsupported unordered_distance sv_distance context_distance availability_floor excess read_supported_distance read_supported_excess numeric_separation_gap marker_termination audit_status audit_same_winner audit_same_block_calls audit_phase_support phase_reads_not_confirmed wall_seconds peak_rss_bytes"
 {
   echo "$COLUMNS_OUT" | tr ' ' '\t'
   for donor in $DONORS; do
@@ -116,7 +116,7 @@ COLUMNS_OUT="donor status note run_no_call unique found exhaustive target condit
       "$(v unordered_distance_total)" "$(v sv_unordered_distance_total)" "$(v context_unordered_distance_total)" \
       "$(v availability_floor_total)" "$(v excess_over_floor_total)" \
       "$(v read_supported_unordered_distance_total)" "$(v read_supported_excess_over_floor_total)" \
-      "$(w certified_gap)" "$(w marker_depth_termination)" "$audit_status" "$same_winner" "$same_calls" \
+      "$(w numeric_separation_gap)$(w certified_gap)" "$(w marker_depth_termination)" "$audit_status" "$same_winner" "$same_calls" \
       "$audit_phase" "$phase_not_confirmed" "$(x wall_seconds)" "$(x peak_rss_bytes)"; do
       row+=("$(na "$value")")
     done

@@ -229,8 +229,8 @@ void test_end_to_end() {
     require(reported.at("templates_refused") == "0", "no panel template may be refused here");
     require(reported.count("model_fingerprint") == 1 && reported.at("model_fingerprint").size() == 16,
             "the run must record a model fingerprint");
-    require(std::stod(reported.at("certified_gap")) > 0.0,
-            "a COMPLETE run must carry a positive certified gap");
+    require(std::stod(reported.at("numeric_separation_gap")) > 0.0,
+            "a COMPLETE run must carry a positive numerical separation gap");
     require(reported.at("threads_used") == "1",
             "version one is serial; a threads_used above one would contradict the contract");
 
@@ -756,6 +756,76 @@ void test_proposal_status_rules() {
 // sampleA and sampleB cannot link neighbouring variants, so the zero-switch phasings are fragment
 // contenders, and the extra carrier lets the prior pick one. The call is made, but its phase must be
 // reported PRIOR_ONLY, while every block genotype -- on which all contenders agree -- stays READS.
+// The per-block conditional posterior, recomputed from the run's own tables: for each block, the summed
+// candidate-set probability of every sequence candidate whose representative carries the winner's unordered
+// genotype there; GQ is -10 log10 of the rest. Scope and separation must be stated on every row.
+void check_block_posteriors(const std::string& prefix) {
+    std::vector<std::vector<std::size_t>> hap1;
+    std::vector<std::vector<std::size_t>> hap2;
+    for (const auto& row : read_rows(path(prefix + ".mosaic_candidates.tsv"))) {
+        hap1.push_back(parse_path(row[2]));
+        hap2.push_back(parse_path(row[3]));
+    }
+    std::vector<std::pair<std::size_t, double>> representatives;   // (candidate index, set probability)
+    std::size_t winner = hap1.size();
+    for (const auto& row : read_rows(path(prefix + ".mosaic_scores.tsv"))) {
+        representatives.emplace_back(std::stoul(row[1]), std::stod(row[10]));
+        if (row[13] == "true") winner = std::stoul(row[1]);
+    }
+    require(winner < hap1.size(), "the scores must name a winner in the manifest");
+    const auto rows = read_rows(path(prefix + ".block_genotypes.tsv"));
+    for (std::size_t b = 0; b < rows.size(); ++b) {
+        const auto called = std::minmax(hap1[winner][b], hap2[winner][b]);
+        double same = 0.0;
+        double other = 0.0;
+        for (const auto& item : representatives) {
+            (std::minmax(hap1[item.first][b], hap2[item.first][b]) == called ? same : other) += item.second;
+        }
+        const double posterior = std::stod(rows[b][11]);
+        const double quality = std::stod(rows[b][12]);
+        require(std::abs(posterior - same) <= 1e-9 && posterior > 0.0 && posterior <= 1.0,
+                prefix + ": block " + rows[b][0] + " posterior " + rows[b][11] + " must be the winner genotype's set mass " +
+                    std::to_string(same));
+        if (other > 1e-9) {
+            require(std::abs(quality + 10.0 * std::log10(other)) <= 1e-3 * std::max(1.0, quality),
+                    prefix + ": block " + rows[b][0] + " GQ must be -10 log10 of the other genotypes' mass");
+        } else {
+            require(quality >= 80.0, prefix + ": block " + rows[b][0] + " with negligible rival mass must have a high GQ");
+        }
+        require((rows[b][13] == "true" || rows[b][13] == "false") &&
+                    (rows[b][14] == "COMPLETE" || rows[b][14] == "CONDITIONAL"),
+                "every block row must state its numerical separation and candidate scope");
+    }
+}
+
+// The confidence calculation on sets where it matters; the C4-like fixtures above give posteriors of one.
+void test_block_genotype_confidence() {
+    using Row = std::vector<std::pair<std::size_t, std::size_t>>;
+    // Winner 0.6 and a same-genotype rival 0.3 at block 0; a rival 0.1 with another genotype at block 0 only.
+    const auto mixed = panvar::block_genotype_confidence(
+        {std::log(0.6), std::log(0.3), std::log(0.1)}, {1e-9, 1e-9, 1e-9},
+        {Row{{0, 1}, {2, 2}}, Row{{0, 1}, {2, 2}}, Row{{1, 1}, {2, 2}}});
+    require(std::abs(mixed[0].posterior - 0.9) <= 1e-12 && std::abs(mixed[0].quality - 10.0) <= 1e-9 &&
+                mixed[0].numerically_separated,
+            "a 0.1 rival with another genotype must give posterior 0.9 and GQ 10");
+    require(mixed[1].posterior == 1.0 && std::isinf(mixed[1].quality) && mixed[1].numerically_separated,
+            "a block on which every candidate agrees must have posterior 1 and unbounded GQ");
+    // A rival with another genotype within floating-point error of the winner is not numerically separated.
+    const auto tied = panvar::block_genotype_confidence({-5.0, -5.0 - 1e-12}, {1e-9, 1e-9},
+                                                        {Row{{0, 0}}, Row{{0, 1}}});
+    require(!tied[0].numerically_separated && std::abs(tied[0].posterior - 0.5) <= 1e-9,
+            "a genotype tied within numerical error must be reported as not separated, at posterior one half");
+    // Rival mass of about 1e-300: in linear space the posterior is exactly one and the GQ infinite; in log space
+    // the GQ is about 3000.
+    const auto tiny = panvar::block_genotype_confidence({0.0, -300.0 * std::log(10.0)}, {1e-9, 1e-9},
+                                                        {Row{{0, 0}}, Row{{1, 1}}});
+    require(tiny[0].posterior == 1.0 && std::isfinite(tiny[0].quality) && std::abs(tiny[0].quality - 3000.0) <= 1e-6,
+            "a negligible rival must still give a finite GQ, got " + std::to_string(tiny[0].quality));
+    std::cout << "  block confidence: posterior " << mixed[0].posterior << " GQ " << mixed[0].quality
+              << "; tie separated=" << (tied[0].numerically_separated ? "true" : "false") << "; 1e-300 rival GQ "
+              << tiny[0].quality << "\n";
+}
+
 void test_prior_only_phase_is_reported() {
     const TinyLocus locus = write_tiny_locus("tiny_duplicate.gfa", 350, 340, true);
     simulate(locus.haplotypes[0], locus.haplotypes[1], path("duplicate_r1.fq"), path("duplicate_r2.fq"), 321);
@@ -778,6 +848,7 @@ void test_prior_only_phase_is_reported() {
     }
     require(supported == rows.size() && reported.at("blocks_genotype_read_supported") == std::to_string(rows.size()),
             "block genotypes on which every fragment contender agrees must remain read-supported");
+    check_block_posteriors("prior_only");
     std::cout << "  prior-only phase: call made, phase PRIOR_ONLY, " << supported << "/" << rows.size()
               << " block genotypes read-supported, " << reported.at("fragment_contenders") << " contenders\n";
 }
@@ -872,6 +943,7 @@ void test_phase_audit() {
     for (const auto& row : read_rows(path("audit_phaseable.block_genotypes.tsv"))) {
         require(row[10] == "READS_AUDITED", "block genotypes must carry the audited phase claim");
     }
+    check_block_posteriors("audit_phaseable");
 
     // A claim the audit cannot check is withdrawn: at 64 merged states the phaseable locus has too few off-panel
     // mosaics for a 64-mosaic audit set, so the pruned audit is refused and the K = 1 claim is not reported.
@@ -927,6 +999,7 @@ int main(int argc, char** argv) {
         test_off_panel_truth_is_recovered();
         test_off_panel_phase_is_not_claimed_from_reads();
         test_proposal_status_rules();
+        test_block_genotype_confidence();
         test_prior_only_phase_is_reported();
         test_phase_audit();
         test_candidate_prefixes_match_standalone();

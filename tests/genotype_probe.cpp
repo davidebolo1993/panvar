@@ -391,7 +391,7 @@ int evaluate(const Args& args) {
                             "unique_candidates", "unique_candidates_found", "proposal_states_pruned",
                             "proposal_search_exhaustive", "proposal_target_reached",
                             "candidate_set_conditional", "sequence_candidates", "phase_support",
-                            "fragment_contenders", "blocks_genotype_read_supported", "certified_gap",
+                            "fragment_contenders", "blocks_genotype_read_supported", "numeric_separation_gap",
                             "fragment_term_gap_to_runner_up", "winner_candidate_set_probability",
                             "seconds_proposal", "seconds_total", "seconds_rescoring", "model_fingerprint",
                             "marker_depth_rate_per_copy", "marker_background"}) {
