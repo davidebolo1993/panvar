@@ -486,8 +486,8 @@ void test_marker_depth_estimation() {
         const auto fixture = make(multiplicity, counts);
         const panvar::MarkerDepthEstimate estimate =
             panvar::estimate_marker_depth(fixture.first, fixture.second, std::nullopt);
-        require(estimate.background_estimated && estimate.converged,
-                "with several anchor multiplicities both parameters must be fitted and converge");
+        require(estimate.background_estimated && estimate.converged && estimate.termination == "interior_stationary",
+                "with several anchor multiplicities both parameters must be fitted and converge in the interior");
         require(std::abs(estimate.rate_per_copy - true_rate) < 0.05 * true_rate,
                 "the per-copy rate must be recovered from anchors: got " +
                     std::to_string(estimate.rate_per_copy));
@@ -500,6 +500,38 @@ void test_marker_depth_estimation() {
         const double old_rate = total / (2.0 * static_cast<double>(counts.size()));
         require(std::abs(old_rate - true_rate) > 0.2 * true_rate,
                 "fixture: the multiplicity-blind estimator must be visibly wrong here");
+    }
+
+    // The boundary optimum -- the NA19240 case. Counts that fit c = 22m - 4 exactly imply a negative
+    // intercept, so the maximum is on the face background = floor: the rate must be the root there, the
+    // background gradient must be negative, and the fit must say so rather than hit its iteration cap.
+    {
+        std::vector<std::uint32_t> multiplicity;
+        std::vector<std::uint64_t> counts;
+        for (int k = 0; k < 3000; ++k) {
+            const std::uint32_t m = 1 + static_cast<std::uint32_t>(k % 3);
+            multiplicity.push_back(m);
+            counts.push_back(22 * m - 4);
+        }
+        const auto fixture = make(multiplicity, counts);
+        const panvar::MarkerDepthEstimate estimate =
+            panvar::estimate_marker_depth(fixture.first, fixture.second, std::nullopt);
+        require(estimate.converged && estimate.background_at_floor && estimate.termination == "boundary_kkt",
+                "a boundary optimum must converge on the boundary face, got " + estimate.termination);
+        double copy_sum = 0.0;
+        for (const auto m : multiplicity) copy_sum += 2.0 * m;
+        require(estimate.gradient_background < 0.0 && std::abs(estimate.gradient_rate) <= 1e-8 * copy_sum,
+                "the boundary estimate must satisfy KKT: negative background gradient, stationary rate");
+        const auto rate_score = [&](double r) {
+            double value = -copy_sum;
+            for (std::size_t k = 0; k < counts.size(); ++k) {
+                const double d = 2.0 * multiplicity[k];
+                value += static_cast<double>(counts[k]) * d / (estimate.background + r * d);
+            }
+            return value;
+        };
+        require(std::abs(rate_score(estimate.rate_per_copy)) <= 1e-8 * copy_sum,
+                "the boundary rate must be the likelihood root with the background on its floor");
     }
 
     // Refusals: an unidentifiable background, and anchors with no observation at all.

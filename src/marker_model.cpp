@@ -510,6 +510,7 @@ MarkerDepthEstimate estimate_marker_depth(
         if (background == 0.0) {
             estimate.rate_per_copy = count_sum / copy_sum;
             estimate.converged = true;
+            estimate.termination = "closed_form";
             estimate.provenance = "anchor Poisson MLE, closed form, background declared 0";
             return estimate;
         }
@@ -535,6 +536,7 @@ MarkerDepthEstimate estimate_marker_depth(
         }
         estimate.rate_per_copy = 0.5 * (lo + hi);
         estimate.converged = true;
+        estimate.termination = "declared_background_root";
         estimate.provenance = "anchor Poisson MLE, one-dimensional, background declared";
         return estimate;
     }
@@ -573,14 +575,15 @@ MarkerDepthEstimate estimate_marker_depth(
     if (!(background > background_floor)) background = std::max(10.0 * background_floor, 0.01 * mean_count);
     double current = log_likelihood(background, rate);
 
-    for (std::size_t iteration = 1; iteration <= 200; ++iteration) {
-        double g_bg = -n;
-        double g_rate = -copy_sum;
-        double h_bb = 0.0;
-        double h_br = 0.0;
-        double h_rr = 0.0;
+    const auto derivatives = [&](double bg, double r, double& g_bg, double& g_rate, double& h_bb,
+                                 double& h_br, double& h_rr) {
+        g_bg = -n;
+        g_rate = -copy_sum;
+        h_bb = 0.0;
+        h_br = 0.0;
+        h_rr = 0.0;
         for (std::size_t k = 0; k < counts.size(); ++k) {
-            const double mean = background + rate * copies[k];
+            const double mean = bg + r * copies[k];
             const double first = counts[k] / mean;
             const double second = counts[k] / (mean * mean);
             g_bg += first;
@@ -589,17 +592,54 @@ MarkerDepthEstimate estimate_marker_depth(
             h_br -= second * copies[k];
             h_rr -= second * copies[k] * copies[k];
         }
+    };
+    // The rate that maximises the likelihood with the background held fixed: the rate score is
+    // strictly decreasing, so its root is found by bisection.
+    const auto rate_given_background = [&](double bg) {
+        const auto score = [&](double r) {
+            double value = -copy_sum;
+            for (std::size_t k = 0; k < counts.size(); ++k) value += counts[k] * copies[k] / (bg + r * copies[k]);
+            return value;
+        };
+        double lo = 0.0;
+        double hi = std::max(1.0, count_sum / copy_sum);
+        while (score(hi) > 0.0) hi *= 2.0;
+        for (int i = 0; i < 300 && hi - lo > 1e-15 * hi; ++i) {
+            const double mid = 0.5 * (lo + hi);
+            (score(mid) > 0.0 ? lo : hi) = mid;
+        }
+        return 0.5 * (lo + hi);
+    };
+
+    estimate.termination = "iteration_cap";
+    double g_bg = 0.0;
+    double g_rate = 0.0;
+    double h_bb = 0.0;
+    double h_br = 0.0;
+    double h_rr = 0.0;
+    for (std::size_t iteration = 1; iteration <= 200; ++iteration) {
+        derivatives(background, rate, g_bg, g_rate, h_bb, h_br, h_rr);
         estimate.iterations = iteration;
-        const bool rate_stationary = std::abs(g_rate) <= 1e-9 * copy_sum;
-        if (std::abs(g_bg) <= 1e-9 * n && rate_stationary) {
+        if (std::abs(g_bg) <= 1e-9 * n && std::abs(g_rate) <= 1e-9 * copy_sum) {
             estimate.converged = true;
+            estimate.termination = "interior_stationary";
             break;
         }
-        // The maximum can sit on the boundary: a background that still wants to fall below its floor.
-        if (background <= background_floor && g_bg < 0.0 && rate_stationary) {
-            estimate.converged = true;
-            estimate.background_at_floor = true;
-            break;
+        // Active constraint. When the background sits on its floor and still wants to fall, the
+        // maximum is on that face: maximise over the rate alone there, then check the Karush-Kuhn-
+        // Tucker condition. Projecting a joint Newton step instead never makes the rate stationary --
+        // on NA19240 that stopped at the iteration cap with a rate 3.4% high.
+        if (background <= background_floor && g_bg <= 0.0) {
+            background = background_floor;
+            rate = rate_given_background(background_floor);
+            current = log_likelihood(background, rate);
+            derivatives(background, rate, g_bg, g_rate, h_bb, h_br, h_rr);
+            if (g_bg <= 0.0 && std::abs(g_rate) <= 1e-9 * copy_sum) {
+                estimate.converged = true;
+                estimate.background_at_floor = true;
+                estimate.termination = "boundary_kkt";
+                break;
+            }
         }
         const double determinant = h_bb * h_rr - h_br * h_br;
         double step_bg = 0.0;
@@ -618,7 +658,7 @@ MarkerDepthEstimate estimate_marker_depth(
             const double next_rate = rate + scale * step_rate;
             if (!(next_rate > 0.0)) continue;
             const double candidate = log_likelihood(next_bg, next_rate);
-            if (candidate >= current) {
+            if (candidate > current) {
                 background = next_bg;
                 rate = next_rate;
                 current = candidate;
@@ -627,16 +667,18 @@ MarkerDepthEstimate estimate_marker_depth(
             }
         }
         if (!moved) {
-            // No ascent at any step length: the iterate is the maximum to machine precision, provided
-            // the gradient agrees.
-            estimate.converged = std::abs(g_bg) <= 1e-6 * n && std::abs(g_rate) <= 1e-6 * copy_sum;
+            estimate.termination = "no_ascent";
             break;
         }
     }
+    derivatives(background, rate, g_bg, g_rate, h_bb, h_br, h_rr);
+    estimate.gradient_background = g_bg;
+    estimate.gradient_rate = g_rate;
+    estimate.log_likelihood = log_likelihood(background, rate);
     estimate.background = background;
     estimate.rate_per_copy = rate;
     estimate.background_estimated = true;
-    estimate.provenance = "anchor Poisson MLE, background and rate jointly by damped Newton";
+    estimate.provenance = "anchor Poisson MLE, background and rate jointly by active-set Newton";
     return estimate;
 }
 

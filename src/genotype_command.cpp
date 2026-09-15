@@ -243,6 +243,11 @@ void write_status(
         out << "marker_background_at_floor\t" << (depth->background_at_floor ? "true" : "false")
             << '\n';
         out << "marker_depth_iterations\t" << depth->iterations << '\n';
+        out << "marker_depth_termination\t" << depth->termination << '\n';
+        out << "marker_depth_gradient_background\t" << depth->gradient_background << '\n';
+        out << "marker_depth_gradient_rate\t" << depth->gradient_rate << '\n';
+        out << "marker_depth_log_likelihood\t" << std::setprecision(15) << depth->log_likelihood
+            << std::setprecision(6) << '\n';
         out << "marker_depth_anchors_used\t" << depth->anchors_used << '\n';
         out << "marker_depth_distinct_multiplicities\t" << depth->distinct_multiplicities << '\n';
         out << "marker_depth_provenance\t" << depth->provenance << '\n';
@@ -258,10 +263,16 @@ void write_status(
         // Any ranking over a set that omits candidates is conditional on that set.
         out << "candidate_set_conditional\t" << (beam->candidate_set_conditional ? "true" : "false")
             << '\n';
+        out << "candidate_scope\t" << (beam->candidate_set_conditional ? "CONDITIONAL" : "COMPLETE") << '\n';
         out << "beam_extensions\t" << beam->extensions_evaluated << '\n';
     }
     if (ranking != nullptr) {
         out << "certified_gap\t" << ranking->certified_gap << '\n';
+        // The gap is certified within the retained candidate set only. It is global only when the search
+        // was exhaustive and nothing was truncated from its result.
+        out << "global_certified\t"
+            << (ranking->status == RescoreStatus::Complete && beam != nullptr && !beam->candidate_set_conditional
+                    ? "true" : "false") << '\n';
         out << "winner_set_size\t" << ranking->winner_set.size() << '\n';
         out << "score_gap_to_runner_up\t" << ranking->score_gap_to_runner_up << '\n';
         out << "candidate_set_log_weight\t" << ranking->candidate_set_log_weight << '\n';
@@ -426,6 +437,18 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         write_status(status_path, GenotypeRunStatus::CandidateIncomplete, fingerprint, options,
                      library, timings, &built.report, &panel, nullptr, nullptr,
                      std::string("marker depth could not be estimated: ") + error.what());
+        return GenotypeRunStatus::CandidateIncomplete;
+    }
+    if (!depth.converged) {
+        // A depth estimate that did not converge is not fed to the proposal: it changes which candidates
+        // reach K. NA19240 used to stop at its iteration cap with a rate 3.4% high and still proceed.
+        timings.markers = seconds_since(mark);
+        timings.total = seconds_since(started);
+        write_status(status_path, GenotypeRunStatus::CandidateIncomplete, fingerprint, options, library,
+                     timings, &built.report, &panel, nullptr, nullptr,
+                     "marker depth fit did not converge (" + depth.termination +
+                         "); declare marker_background to use the one-dimensional fit",
+                     nullptr, &depth);
         return GenotypeRunStatus::CandidateIncomplete;
     }
     marker_parameters.expected_observations_per_copy = depth.rate_per_copy;

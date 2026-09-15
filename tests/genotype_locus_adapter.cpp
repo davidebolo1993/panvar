@@ -353,6 +353,42 @@ void test_c4(const std::string& gfa_path, const std::string& stage_prefix) {
               << panel.total_alleles << " (" << empty_alleles << " are empty deletion alleles)\n";
     require(alleles_with_markers + empty_alleles >= panel.total_alleles - panel.blocks.size(),
             "all but a handful of non-empty alleles must carry a discriminating marker");
+    // Real-C4 depth-fit convergence: the actual anchor multiplicities of the C4 panel, with counts from
+    // three regimes -- an interior optimum, an optimum on the background floor from noisy Poisson counts,
+    // and an exact negative-intercept fit that forces the boundary. Every one must converge and say how.
+    {
+        std::mt19937_64 rng(2026);
+        const auto fit = [&](const std::function<std::uint64_t(std::uint32_t)>& draw, const std::string& label) {
+            panvar::MarkerObservations observations;
+            observations.counts.assign(panel.codes.size(), 0);
+            for (std::size_t k = 0; k < panel.anchor_slots.size(); ++k) {
+                observations.counts[panel.anchor_slots[k]] = draw(panel.anchor_haploid_multiplicity[k]);
+            }
+            const panvar::MarkerDepthEstimate estimate =
+                panvar::estimate_marker_depth(panel, observations, std::nullopt);
+            require(estimate.converged,
+                    "real-C4 depth fit must converge (" + label + "), stopped by " + estimate.termination);
+            std::cout << "  depth fit on C4 anchors, " << label << ": rate " << estimate.rate_per_copy
+                      << ", background " << estimate.background << ", " << estimate.termination << " in "
+                      << estimate.iterations << " iterations\n";
+            return estimate;
+        };
+        const auto interior = fit([&](std::uint32_t m) {
+            return static_cast<std::uint64_t>(std::poisson_distribution<long>(1.5 + 9.32 * 2.0 * m)(rng));
+        }, "interior background 1.5");
+        require(std::abs(interior.rate_per_copy - 9.32) < 0.02 * 9.32 && interior.termination == "interior_stationary",
+                "the interior real-C4 fit must recover the per-copy rate in the interior");
+        const auto noisy_floor = fit([&](std::uint32_t m) {
+            return static_cast<std::uint64_t>(std::poisson_distribution<long>(9.77 * 2.0 * m)(rng));
+        }, "no background, Poisson counts");
+        require(std::abs(noisy_floor.rate_per_copy - 9.77) < 0.02 * 9.77,
+                "the no-background real-C4 fit must recover the per-copy rate");
+        const auto boundary = fit([](std::uint32_t m) { return static_cast<std::uint64_t>(22 * m - 4); },
+                                  "negative intercept");
+        require(boundary.termination == "boundary_kkt" && boundary.background_at_floor &&
+                    boundary.gradient_background < 0.0,
+                "an exact negative-intercept fit on C4 anchors must stop on the boundary by KKT");
+    }
     std::cout << "  markers: universe " << panel.codes.size() << ", anchors "
               << panel.anchor_slots.size() << ", dropped multi-block "
               << panel.dropped_multiblock_markers << '\n';

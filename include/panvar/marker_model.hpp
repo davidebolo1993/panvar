@@ -84,6 +84,14 @@ struct MarkerDepthEstimate {
     bool converged = false;
     // The fitted background reached its positive floor: the data prefer no background at all.
     bool background_at_floor = false;
+    // Why the fit stopped: interior_stationary, boundary_kkt, closed_form, declared_background_root,
+    // no_ascent, or iteration_cap. Only the first four are convergence.
+    std::string termination;
+    // Score components and log-likelihood at the returned estimate, so a status file can show a fit is
+    // stationary rather than assert it. On the boundary the background gradient is negative by design.
+    double gradient_background = 0.0;
+    double gradient_rate = 0.0;
+    double log_likelihood = 0.0;
     std::size_t anchors_used = 0;
     std::size_t distinct_multiplicities = 0;
     std::size_t iterations = 0;

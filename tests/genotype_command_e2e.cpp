@@ -728,6 +728,10 @@ void test_proposal_status_rules() {
                 exhaustive_status.at("candidate_set_conditional") == "false" &&
                 std::stoul(exhaustive_status.at("unique_candidates_found")) < 64,
             "an exhaustive search below K must be reported complete and unconditional");
+    require(exhaustive_status.at("candidate_scope") == "COMPLETE" && exhaustive_status.at("global_certified") == "true",
+            "an exhaustive, untruncated, complete ranking is the only globally certified result");
+    require(exhaustive_status.at("marker_depth_converged") == "true",
+            "a completed run must rest on a converged marker-depth fit");
 }
 
 // Prior-only phase. The unphaseable locus with a second carrier of sampleA's haplotype: reads from
