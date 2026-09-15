@@ -275,6 +275,10 @@ if(PANVAR_BUILD_TESTING)
                  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_source_tree_clean.sh)
         set_tests_properties(panvar_genotype_source_tree_clean PROPERTIES DEPENDS
             "panvar_genotype_mosaic_core;panvar_genotype_locus_adapter;panvar_genotype_command_e2e;panvar_genotype_fragment_oracle;panvar_genotype_fragment_scorer;panvar_genotype_mosaic_proposal")
+        # The frozen-setting selection rule: stable calls, K reached and the declared phase audit reachable.
+        add_test(NAME panvar_genotype_ladder_selection
+                 COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_select_ladder_test.py
+                         ${CMAKE_CURRENT_SOURCE_DIR}/scripts/select_genotype_ladder.py)
 
         # Fast, dependency-free smoke on a tiny hand-built graph that exercises every
         # call event type + confounders with exact-record assertions (no vg needed).

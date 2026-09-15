@@ -4,16 +4,20 @@
     scripts/select_genotype_ladder.py <ladder-dir>
 
 Reads <ladder-dir>/ladder.tsv, written by tests/genotype_ladder_c4.sh, and each run's block calls. The rule is the
-review-round-6 one; it never reads truth distance.
+review-round-7 one; it never reads truth distance.
 
 Every panel diplotype is always a candidate, and K counts only the off-panel mosaics added to it.
 
 * Run eligibility: status COMPLETE, depth fit converged, panel baseline complete.
 * For each donor the reference is the largest setting: the largest state limit at the largest K.
-* The mosaic arm is the smallest setting (state limit first, then K) with K > 0 at which, for every donor, every
-  setting at or above it in both dimensions (K > 0) is eligible and gives the reference winner haplotypes and
-  unordered block calls. Settings where every donor reached the requested K are preferred; if none is stable,
-  the smallest stable setting is chosen and flagged. Audit reachability decides phase claims, not selection.
+* The mosaic arm is the smallest setting (state limit first, then K) with K > 0 that satisfies, for every
+  development donor, all three frozen-setting requirements (review round 7):
+    - primary calls stable: every setting at or above it in both dimensions (K > 0) is eligible and gives the
+      reference winner haplotypes and unordered block calls;
+    - primary K reached;
+    - the declared phase audit reachable (ranked, not MOSAIC_TARGET_UNREACHED) at that state limit.
+  If no setting satisfies all three, nothing is selected. Audit reachability is required so that a frozen
+  setting can distinguish a negative phase result (PRIOR_ONLY) from an undecided one (UNRESOLVED).
 * The panel arm is K = 0 at the mosaic arm's state limit. Whether it gives the reference call is reported per
   donor; it is not a selection criterion.
 * A donor whose two largest state limits disagree at the largest K is listed for extension to the next state
@@ -55,6 +59,7 @@ def main():
                 "blocks": block_call_signature(prefix),
                 "reached": row["target"] == "true",
                 "phase": row["phase_support"],
+                "audit_reachable": row.get("phase_audit_status", "NA") in ("COMPLETE", "RESCORE_INCOMPLETE"),
                 "distance": row["unordered_distance"],
                 "excess": row["excess"],
             }
@@ -76,8 +81,8 @@ def main():
         x, y = runs[(donor,) + setting], runs[(donor,) + reference]
         return x["eligible"] and y["eligible"] and x["winner"] == y["winner"] and x["blocks"] == y["blocks"]
 
-    print("donor\tstate_limit\tK\tstatus\teligible\twinner\tblock_calls\tK_reached\tphase\tdistance\texcess\t"
-          "same_as_reference\tmosaic_stable")
+    print("donor\tstate_limit\tK\tstatus\teligible\twinner\tblock_calls\tK_reached\taudit_reachable\tphase\t"
+          "distance\texcess\tsame_as_reference\tmosaic_stable")
     stable = {}
     unresolved = []
     for donor in donors:
@@ -90,7 +95,8 @@ def main():
             run = runs[(donor, s, k)]
             print("\t".join(str(v) for v in (
                 donor, s, k, run["status"], str(run["eligible"]).lower(), run["winner"], run["blocks"],
-                str(run["reached"]).lower(), run["phase"], run["distance"], run["excess"],
+                str(run["reached"]).lower(), str(run["audit_reachable"]).lower(), run["phase"], run["distance"],
+                run["excess"],
                 str(same_call(donor, (s, k))).lower(),
                 "NA" if k == 0 else str(stable[(donor, s, k)]).lower())))
 
@@ -99,14 +105,20 @@ def main():
         print("extend_to_next_state_limit\t%s" % ",".join(unresolved))
         print("selected\tnone: the two largest state limits disagree for these donors")
         return
-    candidates = [(s, k) for s in limits for k in positive if all(stable[(d, s, k)] for d in donors)]
-    if not candidates:
-        print("selected\tnone: no positive-K setting is stable for every donor")
+    stable_settings = [(s, k) for s in limits for k in positive if all(stable[(d, s, k)] for d in donors)]
+    qualifying = [c for c in stable_settings
+                  if all(runs[(d,) + c]["reached"] and runs[(d,) + c]["audit_reachable"] for d in donors)]
+    for s, k in stable_settings:
+        if (s, k) not in qualifying:
+            print("rejected\tstate_limit=%d\tK=%d\tK_reached_for_every_donor=%s\taudit_reachable_for_every_donor=%s"
+                  % (s, k, str(all(runs[(d, s, k)]["reached"] for d in donors)).lower(),
+                     str(all(runs[(d, s, k)]["audit_reachable"] for d in donors)).lower()))
+    if not qualifying:
+        print("selected\tnone: no positive-K setting is stable, reaches K and reaches the audit for every donor")
         return
-    reached = [c for c in candidates if all(runs[(d,) + c]["reached"] for d in donors)]
-    mosaic = reached[0] if reached else candidates[0]
-    print("mosaic_arm\tstate_limit=%d\tK=%d\tK_reached_for_every_donor=%s"
-          % (mosaic[0], mosaic[1], "true" if reached else "false"))
+    mosaic = qualifying[0]
+    print("mosaic_arm\tstate_limit=%d\tK=%d\tK_reached_for_every_donor=true\taudit_reachable_for_every_donor=true"
+          % mosaic)
     panel = (mosaic[0], 0)
     agreeing = [d for d in donors if same_call(d, panel)]
     print("panel_arm\tstate_limit=%d\tK=0\tsame_call_as_reference=%d/%d%s"

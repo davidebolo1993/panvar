@@ -1,0 +1,22 @@
+# Frozen C4 leave-zero-out settings for the corrected held-out cohort (review round 7). Committed after the
+# round-6 development ladder (tests/results/genotype_ladder_c4_r6_4b4ca7e, clean worktree at 4b4ca7e) and before
+# any corrected held-out donor is simulated, run or examined. The round-5 settings file is unchanged.
+#
+# Two arms are ranked from one proposal and one scoring pass per donor: the panel arm (K = 0, every panel
+# diplotype alone) and the mosaic arm (the panel plus K = 8 off-panel mosaics). The K = 256 phase audit was
+# declared before the ladder and is retained unchanged.
+#
+# Why state limit 1024: on the ladder every setting gave every development donor the same exact winner and
+# block calls, so genotype stability alone selects 256. At 256 the declared K = 256 audit is unreachable for
+# all eight donors (a 256-state beam returned 137-255 off-panel mosaics), which would make every read-phase
+# claim UNRESOLVED by resource setting alone. 1024 is the smallest setting that is stable, reaches K = 8 and
+# reaches the declared audit for every development donor (the review-round-7 selection rule). It was not
+# chosen for accuracy: calls are identical at 256, 1024 and 4096.
+key	value
+state_limit	1024
+panel_arm_mosaic_candidates	0
+mosaic_arm_mosaic_candidates	8
+phase_audit_candidates	256
+seed	7
+depth	30
+ladder_commit	4b4ca7ea057f9881247641b630fbc62430bfd18a

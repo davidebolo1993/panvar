@@ -145,4 +145,79 @@ printf '%s\n' $DONORS | xargs -P "$JOBS" -I{} bash -c 'run_donor "$@"' _ {}
     END { for (k in n) printf "%s\tblocks_exact_%s\t%d/%d\n", substr(k,1,index(k,"\t")-1), substr(k,index(k,"\t")+1), ok[k], n[k]
           if (bad) printf "all\tblock_join_mismatches\t%d\n", bad }'
 } > "$OUT/cohort.summary.tsv"
+
+# ---- per-arm phase categories, distances and resources; paired panel -> mosaic changes ------------------------
+# GQ strata above and everything here are per arm: the arms answer different conditional questions, and are
+# never pooled. The paired table records every block whose call, distance or GQ differs between the arms.
+OUT="$OUT" DONORS="$DONORS" PANEL_K="$PANEL_K" MOSAIC_K="$MOSAIC_K" python3 - >> "$OUT/cohort.summary.tsv" <<'PAIRED'
+import csv, os, statistics
+out = os.environ["OUT"]; donors = os.environ["DONORS"].split()
+arms = {"panel": os.environ["PANEL_K"], "mosaic": os.environ["MOSAIC_K"]}
+rows = list(csv.DictReader(open(os.path.join(out, "cohort.tsv")), delimiter="\t"))
+
+def num(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+for arm in arms:
+    mine = [r for r in rows if r["arm"] == arm and r["run_no_call"] == "false"]
+    phases = {}
+    for r in mine:
+        phases[r["phase_support"]] = phases.get(r["phase_support"], 0) + 1
+    for phase in sorted(phases):
+        print("%s\tphase_%s\t%d" % (arm, phase, phases[phase]))
+    print("%s\tsv_distance_total\t%d" % (arm, sum(int(num(r["sv_distance"]) or 0) for r in mine)))
+    print("%s\tcontext_distance_total\t%d" % (arm, sum(int(num(r["context_distance"]) or 0) for r in mine)))
+
+walls = [num(r["wall_seconds"]) for r in rows if r["arm"] == "panel" and num(r["wall_seconds"]) is not None]
+rss = [num(r["peak_rss_bytes"]) / 1048576 for r in rows if r["arm"] == "panel" and num(r["peak_rss_bytes"]) is not None]
+if walls:
+    # One run per donor ranks both arms from one scoring pass, so resources are shared.
+    print("both\twall_seconds_median_max\t%.1f/%.1f" % (statistics.median(walls), max(walls)))
+    print("both\tpeak_rss_MB_median_max\t%.0f/%.0f" % (statistics.median(rss), max(rss)))
+
+def blocks(donor, k):
+    evaluation = os.path.join(out, donor, "lzo.K%s.eval.blocks.tsv" % k)
+    calls = os.path.join(out, donor, "lzo.K%s.block_genotypes.tsv" % k)
+    if not (os.path.exists(evaluation) and os.path.exists(calls)):
+        return None
+    distance = {r["block_id"]: r["unordered_distance"] for r in csv.DictReader(open(evaluation), delimiter="\t")}
+    result = {}
+    for r in csv.DictReader(open(calls), delimiter="\t"):
+        pair = "/".join(sorted((r["allele1"], r["allele2"]), key=int))
+        result[r["block_id"]] = (pair, distance.get(r["block_id"], "NA"), r["conditional_GQ"], r["kind"])
+    return result
+
+winner = {(r["donor"], r["arm"]): r["winner_hash"] for r in rows}
+compared = changed_winners = changed_blocks = improved = worsened = equal = 0
+with open(os.path.join(out, "cohort.paired.tsv"), "w") as paired:
+    paired.write("donor\tblock_id\tkind\tpanel_call\tmosaic_call\tpanel_distance\tmosaic_distance\t"
+                 "panel_GQ\tmosaic_GQ\tcall_changed\n")
+    for donor in donors:
+        panel, mosaic = blocks(donor, arms["panel"]), blocks(donor, arms["mosaic"])
+        if panel is None or mosaic is None:
+            continue
+        compared += 1
+        if winner.get((donor, "panel")) != winner.get((donor, "mosaic")):
+            changed_winners += 1
+        for block in panel:
+            p, m = panel[block], mosaic[block]
+            changed = p[0] != m[0]
+            if changed:
+                changed_blocks += 1
+                pd, md = num(p[1]), num(m[1])
+                if pd is None or md is None or md == pd:
+                    equal += 1
+                elif md < pd:
+                    improved += 1
+                else:
+                    worsened += 1
+            paired.write("\t".join([donor, block, p[3], p[0], m[0], p[1], m[1], p[2], m[2], str(changed).lower()]) + "\n")
+print("paired\tdonors_compared\t%d" % compared)
+print("paired\tdonors_winner_changed\t%d" % changed_winners)
+print("paired\tblocks_call_changed\t%d" % changed_blocks)
+print("paired\tchanged_blocks_improved_worsened_equal\t%d/%d/%d" % (improved, worsened, equal))
+PAIRED
 column -t -s $'\t' "$OUT/cohort.summary.tsv"
