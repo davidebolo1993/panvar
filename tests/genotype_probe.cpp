@@ -8,6 +8,7 @@
 #include "edlib.h"
 #include "panvar/bubbles.hpp"
 #include "panvar/fragment_likelihood.hpp"
+#include "panvar/genotype_command.hpp"
 #include "panvar/genotype_locus.hpp"
 #include "panvar/genotype_model.hpp"
 #include "panvar/gfa.hpp"
@@ -27,13 +28,13 @@
 #include <limits>
 #include <numeric>
 #include <set>
-#include <tuple>
 #include <map>
 #include <optional>
 #include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -479,6 +480,12 @@ int evaluate(const Args& args) {
 
     long unordered_total = 0;
     long floor_total = 0;
+    long sv_distance_total = 0;
+    long context_distance_total = 0;
+    std::size_t read_supported_blocks = 0;
+    std::size_t read_supported_exact = 0;
+    long read_supported_distance = 0;
+    long read_supported_floor = 0;
     long order_a = 0;
     long order_b = 0;
     std::size_t sv_exact = 0;
@@ -522,6 +529,14 @@ int evaluate(const Args& args) {
             const long swapped = edit_distance(*t1, c2) + edit_distance(*t2, c1);
             const long unordered = std::min(direct, swapped);
             unordered_total += unordered;
+            (variant ? sv_distance_total : context_distance_total) += unordered;
+            const auto support = genotype_support.find(block.block_id);
+            if (support != genotype_support.end() && support->second == "READS") {
+                ++read_supported_blocks;
+                if (unordered == 0) ++read_supported_exact;
+                read_supported_distance += unordered;
+                read_supported_floor += floor;
+            }
             order_a += direct;
             order_b += swapped;
             local_best.push_back(direct < swapped ? 1 : swapped < direct ? -1 : 0);
@@ -542,6 +557,8 @@ int evaluate(const Args& args) {
               << (genotype_support.count(block.block_id) ? genotype_support.at(block.block_id) : "NA") << '\n';
     }
 
+    // The only no-call: no genotype result exists.
+    summary << "run_no_call\t" << (complete ? "false" : "true") << '\n';
     summary << "blocks\t" << model.blocks().size() << "\nsv_blocks\t" << sv_blocks
             << "\nundefined_truth_blocks\t" << undefined_blocks
             << "\nblocks_with_both_truth_alleles_available\t" << blocks_with_both_available
@@ -561,7 +578,19 @@ int evaluate(const Args& args) {
                 << (phase_support == "READS" ? std::to_string(std::min(order_a, order_b)) : std::string("NA"))
                 << "\nphase_switch_blocks\t"
                 << (phase_support == "READS" ? std::to_string(switch_blocks) : std::string("NA"))
-                << "\nblocks_exact\t" << all_exact << "\nsv_blocks_exact\t" << sv_exact << '\n';
+                << "\nblocks_exact\t" << all_exact << "\nsv_blocks_exact\t" << sv_exact
+                << "\nsv_unordered_distance_total\t" << sv_distance_total
+                << "\ncontext_unordered_distance_total\t" << context_distance_total
+                // Accuracy over every emitted block genotype is above; this is the read-supported subset.
+                << "\nread_supported_blocks\t" << read_supported_blocks
+                << "\nread_supported_blocks_exact\t" << read_supported_exact
+                << "\nread_supported_unordered_distance_total\t" << read_supported_distance
+                << "\nread_supported_excess_over_floor_total\t" << read_supported_distance - read_supported_floor
+                // Neither of these is a no-call: a genotype was emitted.
+                << "\nblock_unsupported\t"
+                << std::count_if(genotype_support.begin(), genotype_support.end(),
+                                 [](const auto& item) { return item.second != "READS"; })
+                << "\nphase_unsupported\t" << (phase_support == "READS" ? "false" : "true") << '\n';
 
         // Truth in candidate set: some retained beam candidate spells both truth haplotypes.
         std::string truth_proposal_rank = "absent";
@@ -597,6 +626,56 @@ int evaluate(const Args& args) {
         summary << "truth_in_candidates\t" << (truth_proposal_rank != "absent" ? "true" : "false")
                 << "\ntruth_proposal_rank\t" << truth_proposal_rank
                 << "\ntruth_fragment_score_rank\t" << truth_score_rank << '\n';
+
+        // Availability diagnostics -- evaluation only: they read the truth and never feed a call. The
+        // candidate closest to the truth, whether it attains the availability floor, and how far the
+        // likelihood placed it below the winner. Among several closest candidates, the highest-scoring.
+        std::map<std::string, double> score_of;
+        std::map<std::string, double> fragment_of;
+        std::string winner_sequence;
+        for (const auto& row : read_table(run + ".mosaic_scores.tsv")) {
+            score_of[row.at("sequence_candidate_id")] = std::stod(row.at("score"));
+            fragment_of[row.at("sequence_candidate_id")] = std::stod(row.at("fragment_term"));
+            if (row.at("in_winner_set") == "true") winner_sequence = row.at("sequence_candidate_id");
+        }
+        std::map<std::tuple<std::size_t, std::size_t, std::size_t>, long> distance_cache;
+        const auto truth_distance = [&](std::size_t which, std::size_t b, std::size_t allele) {
+            const auto key = std::make_tuple(which, b, allele);
+            const auto found = distance_cache.find(key);
+            if (found != distance_cache.end()) return found->second;
+            const long value = edit_distance(*truth[which].blocks[b], model.blocks()[b].alleles[allele].sequence);
+            distance_cache.emplace(key, value);
+            return value;
+        };
+        long minimum = -1;
+        std::string closest = "NA";
+        std::string closest_rank = "NA";
+        for (const auto& row : read_table(run + ".mosaic_candidates.tsv")) {   // in proposal rank order
+            const std::vector<std::size_t> a = parse_alleles(row.at("hap1_alleles"));
+            const std::vector<std::size_t> c = parse_alleles(row.at("hap2_alleles"));
+            long total = 0;
+            for (std::size_t b = 0; b < model.blocks().size(); ++b) {
+                if (!truth[0].blocks[b].has_value() || !truth[1].blocks[b].has_value()) continue;
+                total += std::min(truth_distance(0, b, a[b]) + truth_distance(1, b, c[b]),
+                                  truth_distance(0, b, c[b]) + truth_distance(1, b, a[b]));
+            }
+            const std::string id = row.at("sequence_candidate_id");
+            if (minimum < 0 || total < minimum ||
+                (total == minimum && score_of.at(id) > score_of.at(closest))) {
+                minimum = total;
+                closest = id;
+                closest_rank = row.at("unique_rank");
+            }
+        }
+        summary << "availability_floor\t" << floor_total << "\nminimum_candidate_distance\t" << minimum
+                << "\nfloor_attained_in_candidates\t" << (minimum == floor_total ? "true" : "false")
+                << "\nclosest_candidate_proposal_rank\t" << closest_rank
+                << "\nclosest_candidate_sequence_id\t" << closest << std::setprecision(12)
+                << "\nclosest_candidate_fragment_gap_to_winner\t"
+                << fragment_of.at(winner_sequence) - fragment_of.at(closest)
+                << "\nclosest_candidate_total_score_gap_to_winner\t"
+                << score_of.at(winner_sequence) - score_of.at(closest) << std::setprecision(6)
+                << "\nwinner_excess_over_floor\t" << unordered_total - floor_total << '\n';
     } else {
         summary << "accuracy\texcluded: run status is not COMPLETE\n";
     }
@@ -1130,10 +1209,35 @@ int compare(const Args& args) {
 
 } // namespace
 
+// ------------------------------------------------------------------------------------------------
+// genotype: the command with the development candidate-prefix harness, which the CLI does not expose
+// ------------------------------------------------------------------------------------------------
+
+int genotype(const Args& args) {
+    panvar::GenotypeCommandOptions options;
+    options.gfa_path = args.required("gfa");
+    options.reference_path = args.required("reference");
+    options.reads1_path = args.required("reads1");
+    options.reads2_path = args.required("reads2");
+    options.library_path = args.required("library");
+    options.out_prefix = args.required("out-prefix");
+    options.proposal_state_limit = std::stoul(args.get("state-limit", "1024"));
+    for (const std::size_t k : parse_alleles(args.required("prefixes"))) {
+        options.development_candidate_prefixes.push_back(k);
+    }
+    if (options.development_candidate_prefixes.empty()) throw std::runtime_error("--prefixes is empty");
+    options.max_candidates = options.development_candidate_prefixes.back();
+    options.quiet = true;
+    const panvar::GenotypeRunStatus status = panvar::run_genotype(options);
+    std::cout << "genotype " << options.out_prefix << " state limit " << options.proposal_state_limit
+              << ": largest prefix " << panvar::genotype_run_status_name(status) << '\n';
+    return 0;
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc < 2) {
-            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare --key value ...\n";
+            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype --key value ...\n";
             return 2;
         }
         const std::string command = argv[1];
@@ -1142,6 +1246,7 @@ int main(int argc, char** argv) {
         if (command == "loo-gfa") return loo_gfa(args);
         if (command == "evaluate") return evaluate(args);
         if (command == "compare") return compare(args);
+        if (command == "genotype") return genotype(args);
         std::cerr << "unknown probe command: " << command << '\n';
         return 2;
     } catch (const std::exception& error) {
