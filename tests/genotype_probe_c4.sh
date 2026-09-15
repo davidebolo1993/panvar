@@ -54,7 +54,7 @@ run_and_evaluate() {   # scheme graph K
   set +e
   /usr/bin/time "$TIME_FLAG" "$PANVAR" genotype --gfa "$graph" --reference-path "$REF" \
     --reads1 "$OUT/sim/reads_1.fq" --reads2 "$OUT/sim/reads_2.fq" --library "$OUT/sim/library.txt" \
-    --out-prefix "$prefix" --max-candidates "$k" -q 2> "$prefix.time"
+    --out-prefix "$prefix" --max-mosaic-candidates "$k" -q 2> "$prefix.time"
   set -e
   printf 'peak_rss_bytes\t%s\n' "$(rss_of "$prefix.time")" > "$prefix.resources.tsv"
   "$PROBE" evaluate --scheme "$scheme" --donor "$DONOR" --reference "$REF" --run-prefix "$prefix" \
@@ -73,9 +73,9 @@ for k in $LOO_K; do run_and_evaluate loo "$OUT/c4.loo.gfa" "$k"; done
       p="$OUT/$scheme/K$k"; s="$p.eval.summary.tsv"
       v() { awk -F'\t' -v key="$1" '$1==key{print $2}' "$s"; }
       hash="NA"; [ -f "$p.mosaic_haplotypes.fa" ] && hash="$(grep -v '^>' "$p.mosaic_haplotypes.fa" | shasum -a 256 | cut -c1-12)"
-      printf '%s\t' "$scheme" "$k" "$(v status)" "$(v proposal_state_limit)" "$(v unique_candidates)" \
-        "$(v unique_candidates_found)" "$(v proposal_states_pruned)" "$(v proposal_search_exhaustive)" \
-        "$(v proposal_target_reached)" "$(v candidate_set_conditional)" "$(v truth_in_candidates)" \
+      printf '%s\t' "$scheme" "$k" "$(v status)" "$(v proposal_state_limit)" "$(v mosaic_candidates)" \
+        "$(v mosaic_candidates_found)" "$(v proposal_states_pruned)" "$(v proposal_search_exhaustive)" \
+        "$(v mosaic_target_reached)" "$(v candidate_set_conditional)" "$(v truth_in_candidates)" \
         "$(v truth_proposal_rank)" "$(v truth_fragment_score_rank)" "$(v phase_support)" \
         "$(v fragment_contenders)" "$(v blocks_genotype_read_supported)" "$(v numeric_separation_gap)" \
         "$(v fragment_term_gap_to_runner_up)" "$(v blocks_exact)" "$(v sv_blocks_exact)" \

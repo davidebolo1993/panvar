@@ -70,7 +70,7 @@ printf '%s\n' $DONORS | xargs -P "$JOBS" -I{} bash -c 'run_donor "$@"' _ {}
     gq="$( { [ -f "$p.block_genotypes.tsv" ] && awk -F'\t' 'NR>1{if(min==""||$13+0<min+0)min=$13} END{print min}' "$p.block_genotypes.tsv"; } || true)"
     row=()
     for value in "$donor" "$(w status)" "$(w marker_depth_termination)" "$(w marker_depth_converged)" \
-      "$(w panel_baseline_complete)" "$(w panel_diplotypes)" "$(w unique_candidates)" "$(v truth_in_candidates)" \
+      "$(w panel_baseline_complete)" "$(w panel_diplotypes)" "$(w mosaic_candidates)" "$(v truth_in_candidates)" \
       "$(v truth_candidate_source)" "$(v blocks_exact)" "$(v sv_blocks_exact)" "$(v unordered_distance_total)" \
       "$(v excess_over_floor_total)" "$(w phase_support_within_candidates)" "$(w phase_support)" \
       "$(w phase_audit_status)" "$gq" "$(awk -F'\t' '$1=="wall_seconds"{print $2}' "$OUT/$donor.resources.tsv")" \

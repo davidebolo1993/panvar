@@ -46,11 +46,13 @@ The caller is a bounded two-stage model:
 ```text
 paired reads
    |
+   +-- every unordered panel diplotype (protected baseline, review round 6)
+   |
    +-- canonical syncmer counts + block emissions + Li-Stephens transitions
    |       |
-   |       +-- deterministic top-K whole-locus mosaic diplotypes
+   |       +-- deterministic top-K off-panel whole-locus mosaic diplotypes
    |
-   +-- exact/certified paired-read likelihood on only those K candidates
+   +-- exact paired-read likelihood on the panel baseline plus those K mosaics
            |
            +-- final candidate ranking -> one allele pair per block
 ```
@@ -571,7 +573,7 @@ small:
 
 ```text
 --gfa, --bubbles, --reads1, --reads2, --reference-path,
---out-prefix, --threads, --max-candidates
+--out-prefix, --threads, --max-mosaic-candidates
 ```
 
 Library parameters are estimated and recorded; a single optional model/config input may provide
@@ -581,11 +583,11 @@ Execution order:
 
 1. load and validate the structural model;
 2. count markers and construct proposal emissions;
-3. generate unique mosaic candidates;
+3. enumerate every unordered panel diplotype and generate unique off-panel mosaic candidates;
 4. spell and intern candidate haplotypes;
 5. recompute exact Li-Stephens priors independently;
-6. compute/certify fragment likelihoods for requested pairs;
-7. choose a certified winner;
+6. compute fragment likelihoods for the candidate set and separate the winner beyond floating-point error;
+7. choose the winner, its per-block conditional posterior and GQ, and its phase claim;
 8. project its two allele paths to standard per-block output.
 
 Outputs:
@@ -607,6 +609,36 @@ Status is one of:
 - `RESCORE_INCOMPLETE`.
 
 An incomplete run emits diagnostics but no ranking presented as complete.
+
+### Candidate set, confidence and phase (review rounds 5-6)
+
+This section amends the phases above; where they speak of "top-K candidates", read the following.
+
+**Candidate set.** Every unordered pair of panel templates, deduplicated by allele paths, is a protected
+candidate whatever the proposal retains. In leave-zero-out the truth is such a pair, and the proposal beam
+pruned it on four held-out C4 donors. `--max-mosaic-candidates K` adds up to K off-panel mosaic diplotypes from
+the beam (K = 0 scores the panel alone). The predicted panel work, panel pairs times fragments, is checked
+before scoring; a baseline over its budget is refused whole and never scored in part.
+
+**Conditional calls.** A pruned search that finds fewer than K off-panel mosaics still calls, because every
+panel hypothesis was evaluated, and reports `mosaic_target_reached false` and `candidate_scope CONDITIONAL`.
+Refusals remain for a panel baseline over budget, incomplete scoring, a depth fit that does not converge, and
+any partial output. `global_certified` is true only for an exhaustive, untruncated, complete ranking.
+
+**Separation and confidence.** `numeric_separation_gap` is floating-point separation of the winner within the
+retained set, not statistical confidence. Each block reports, within the retained candidate set,
+`conditional_genotype_posterior` (the set mass of candidates sharing the winner's unordered genotype),
+`conditional_GQ`, `numerically_separated` and `candidate_scope`. No low-confidence threshold is applied until
+one is frozen from development simulations at the coverage it will be used at.
+
+**Phase.** Read-supported phase is `READS_WITHIN_CANDIDATES`, a claim about the candidate set only. With a
+declared larger audit set ranked from the same scores, `READS_AUDITED` requires that set to agree on the winner,
+on every block genotype and on read-supported phase; otherwise phase is `PRIOR_ONLY` or `UNRESOLVED`. An
+unreachable audit set leaves phase `UNRESOLVED` and never withholds the block genotypes.
+
+**Marker depth.** The anchor depth fit uses one model-wide background floor (1e-6) shared with proposal
+scoring, and stops when the projected Newton decrement is no larger than the compensated log-likelihood's
+floating-point resolution (Karush-Kuhn-Tucker on the floor); a fit that does not converge refuses the run.
 
 ### Phase 8 — one-donor C4 go/no-go
 
@@ -723,7 +755,8 @@ above; the next phase begins only after discrepancies are resolved or explicitly
 - experimental depth/copy-number likelihoods;
 - indel-aware emission without an independent exact placement oracle;
 - single-end support;
-- global posterior/GQ claims from a truncated candidate set;
+- global posterior/GQ claims from a truncated candidate set (conditional per-block posterior and GQ are
+  reported, labelled by candidate scope);
 - LPA-specific corrections;
 - long-read integration;
 - scorer multithreading before the serial algorithm meets its performance gate.
