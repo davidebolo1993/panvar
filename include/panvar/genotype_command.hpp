@@ -45,6 +45,12 @@ struct GenotypeCommandOptions {
     std::uint64_t max_state_classes = 200000000ULL;
     std::uint64_t max_mass_cells = 200000000ULL;
     bool quiet = false;
+    // Development harness only; not a command-line option. When non-empty (strictly increasing, the
+    // last equal to max_candidates), the model, markers and proposal are computed once, and each prefix
+    // k is then refused, ranked and written under <out_prefix>.K<k> by the same code a standalone run
+    // with max_candidates = k uses: K only truncates the final proposal ordering. Every candidate a
+    // prefix contains is scored; the production refusal rule still applies to each k.
+    std::vector<std::size_t> development_candidate_prefixes;
 };
 
 // A run that cannot complete emits its diagnostics and says so. It never presents a partial ranking

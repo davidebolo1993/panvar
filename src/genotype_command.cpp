@@ -331,15 +331,46 @@ const char* genotype_run_status_name(GenotypeRunStatus status) {
     return "MODEL_INCOMPLETE";
 }
 
+namespace {
+
+void remove_run_outputs(const std::string& out_prefix) {
+    for (const char* suffix : {".genotypes.tsv", ".block_genotypes.tsv", ".mosaic_candidates.tsv",
+                               ".mosaic_scores.tsv", ".mosaic_status.tsv", ".mosaic_haplotypes.fa"}) {
+        std::remove((out_prefix + suffix).c_str());
+    }
+}
+
+// The proposal a standalone run with target k returns. Neither the beam's pruning nor its ordering reads
+// the target: it decides only the final truncation and the two flags below, recomputed here exactly as
+// propose_mosaic_diplotypes computes them. Gated against standalone runs end to end.
+MosaicBeamResult candidate_prefix(const MosaicBeamResult& beam, std::size_t k) {
+    MosaicBeamResult prefix = beam;
+    prefix.unique_target_reached = beam.unique_candidates_found >= k;
+    prefix.candidate_set_conditional = !beam.search_exhaustive || beam.unique_candidates_found > k;
+    if (prefix.candidates.size() > k) prefix.candidates.resize(k);
+    return prefix;
+}
+
+} // namespace
+
 GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     const Clock::time_point started = Clock::now();
     StageTimings timings;
     const std::string status_path = options.out_prefix + ".mosaic_status.tsv";
     // A run owns its output prefix. Outputs an earlier run left under the same prefix are removed before
     // anything else, so a run that stops early can never sit beside a previous ranking and look complete.
-    for (const char* suffix : {".genotypes.tsv", ".block_genotypes.tsv", ".mosaic_candidates.tsv",
-                               ".mosaic_scores.tsv", ".mosaic_status.tsv", ".mosaic_haplotypes.fa"}) {
-        std::remove((options.out_prefix + suffix).c_str());
+    remove_run_outputs(options.out_prefix);
+    if (!options.development_candidate_prefixes.empty()) {
+        const std::vector<std::size_t>& prefixes = options.development_candidate_prefixes;
+        for (std::size_t i = 0; i < prefixes.size(); ++i) {
+            if (prefixes[i] == 0 || (i > 0 && prefixes[i] <= prefixes[i - 1])) {
+                throw std::runtime_error("development candidate prefixes must be positive and increasing");
+            }
+            remove_run_outputs(options.out_prefix + ".K" + std::to_string(prefixes[i]));
+        }
+        if (prefixes.back() != options.max_candidates) {
+            throw std::runtime_error("the largest development candidate prefix must equal max_candidates");
+        }
     }
 
     if (options.gfa_path.empty() || options.reads1_path.empty() || options.reads2_path.empty() ||
@@ -481,20 +512,216 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     }
     timings.proposal = seconds_since(mark);
 
-    // A pruned search that misses its target has omitted candidates it never proposed, and the truth may
-    // be among them. At NA19240 K=8 exactly this produced a certified, fragment-decided, wrong call. An
-    // exhaustive search with fewer candidates than requested is complete; a pruned search that reaches
-    // the target may call, conditionally on its set.
-    if (!beam.search_exhaustive && !beam.unique_target_reached) {
-        timings.total = seconds_since(started);
+    // Everything after the proposal, for one candidate target. A standalone run calls it once; the
+    // development prefix harness calls it once per prefix of the same proposal, so each prefix is ranked,
+    // refused and written by exactly the code a standalone run would use.
+    const auto finish = [&](const MosaicBeamResult& beam, const GenotypeCommandOptions& options,
+                            StageTimings timings) -> GenotypeRunStatus {
+        const std::string status_path = options.out_prefix + ".mosaic_status.tsv";
+        // A pruned search that misses its target has omitted candidates it never proposed, and the truth may
+        // be among them. At NA19240 K=8 exactly this produced a certified, fragment-decided, wrong call. An
+        // exhaustive search with fewer candidates than requested is complete; a pruned search that reaches
+        // the target may call, conditionally on its set.
+        if (!beam.search_exhaustive && !beam.unique_target_reached) {
+            timings.total = seconds_since(started);
+            {
+                // Diagnostics only: what the search did propose. It is not a ranking and carries no scores.
+                std::ofstream out = open_output(options.out_prefix + ".mosaic_candidates.tsv");
+                out << "candidate_id\tunique_rank\thap1_alleles\thap2_alleles\tbest_proposal_score\t"
+                       "retained_logsum_proposal_score\tproposal_emission_component\t"
+                       "proposal_transition_component\tequivalent_retained_histories\tevery_allele_scored\t"
+                       "exact_path_prior\tsequence_candidate_id\thistory_count_saturated\n";
+                for (const MosaicCandidate& candidate : beam.candidates) {
+                    out << candidate.candidate_id << '\t' << candidate.unique_rank << '\t'
+                        << join_alleles(candidate.diplotype.first.alleles) << '\t'
+                        << join_alleles(candidate.diplotype.second.alleles) << '\t'
+                        << candidate.best_proposal_score << '\t'
+                        << candidate.retained_logsum_proposal_score << '\t'
+                        << candidate.proposal_emission_component << '\t'
+                        << candidate.proposal_transition_component << '\t'
+                        << candidate.equivalent_retained_histories << '\t'
+                        << (candidate.every_allele_scored ? "true" : "false") << "\tNA\tNA\t"
+                        << (candidate.history_count_saturated ? "true" : "false") << '\n';
+                }
+            }
+            write_status(status_path, GenotypeRunStatus::CandidateIncomplete, fingerprint, options, library,
+                         timings, &built.report, &panel, &beam, nullptr,
+                         "the proposal pruned merged states and still found fewer than the requested "
+                         "candidates; no call is made from a set that omits unproposed candidates",
+                         nullptr, &depth);
+            return GenotypeRunStatus::CandidateIncomplete;
+        }
+        if (beam.candidates.empty()) {
+            timings.total = seconds_since(started);
+            write_status(status_path, GenotypeRunStatus::CandidateIncomplete, fingerprint, options,
+                         library, timings, &built.report, &panel, &beam, nullptr,
+                         "the proposal produced no mosaic candidate", nullptr, &depth);
+            return GenotypeRunStatus::CandidateIncomplete;
+        }
+
+        // ---- stage 4: spelling and interning --------------------------------------------------------
+        mark = Clock::now();
+        std::vector<MosaicPath> paths;
+        std::vector<std::string> sequences;
+        std::vector<HaplotypeCandidate> pairs;
+        std::map<std::vector<std::size_t>, std::size_t> slot_of_path;
+        const auto slot_for = [&](const MosaicPath& path) {
+            const auto found = slot_of_path.find(path.alleles);
+            if (found != slot_of_path.end()) return found->second;
+            const std::size_t slot = paths.size();
+            slot_of_path.emplace(path.alleles, slot);
+            paths.push_back(path);
+            sequences.push_back(spell_mosaic(model, path).bases);
+            return slot;
+        };
+        for (const MosaicCandidate& candidate : beam.candidates) {
+            pairs.push_back({slot_for(candidate.diplotype.first),
+                             slot_for(candidate.diplotype.second)});
+        }
+        const InternedHaplotypes interned = intern_haplotypes(paths, sequences);
+
+        // Candidates are ranked as unordered pairs of SEQUENCES. Two beam candidates whose allele paths
+        // differ but spell the same two haplotypes are one state to any read-based method; ranking them
+        // separately would leave two candidates with identical fragment evidence and a gap made entirely
+        // of how differently their paths happen to be represented.
+        struct SequenceCandidate {
+            std::size_t first = 0;     // interned sequence, first <= second
+            std::size_t second = 0;
+            std::vector<std::size_t> beam_candidates;
+            std::size_t representative = 0;
+            bool projection_ambiguous = false;
+        };
+        std::vector<SequenceCandidate> sequence_candidates;
+        std::map<std::pair<std::size_t, std::size_t>, std::size_t> slot_of_sequence_pair;
+        std::vector<std::size_t> sequence_candidate_of_beam(beam.candidates.size(), 0);
+        for (std::size_t i = 0; i < beam.candidates.size(); ++i) {
+            std::size_t x = interned.index_of[pairs[i].first];
+            std::size_t y = interned.index_of[pairs[i].second];
+            if (y < x) std::swap(x, y);
+            const auto inserted =
+                slot_of_sequence_pair.emplace(std::make_pair(x, y), sequence_candidates.size());
+            if (inserted.second) {
+                SequenceCandidate fresh;
+                fresh.first = x;
+                fresh.second = y;
+                sequence_candidates.push_back(fresh);
+            }
+            sequence_candidates[inserted.first->second].beam_candidates.push_back(i);
+            sequence_candidate_of_beam[i] = inserted.first->second;
+        }
+        timings.spelling = seconds_since(mark);
+
+        // ---- stage 5: exact prior, recomputed independently of the beam ------------------------------
+        // Both priors are exact and neither reads a beam history. The path prior is kept as a manifest
+        // diagnostic; the ranking uses the sequence-pair prior, which sums every allele path that spells
+        // each haplotype and decides the log(2) multiplicity on bytes.
+        std::vector<double> path_prior;
+        path_prior.reserve(beam.candidates.size());
+        for (const MosaicCandidate& candidate : beam.candidates) {
+            path_prior.push_back(
+                log_unordered_diplotype_prior(model.panel(), candidate.diplotype, switch_probability));
+        }
+        std::vector<double> haploid_sequence_prior(interned.sequences.size());
+        for (std::size_t h = 0; h < interned.sequences.size(); ++h) {
+            haploid_sequence_prior[h] =
+                log_haploid_sequence_prior(model, interned.sequences[h], switch_probability);
+        }
+        std::vector<double> sequence_prior;
+        std::vector<HaplotypeCandidate> ranked_pairs;
+        for (SequenceCandidate& candidate : sequence_candidates) {
+            sequence_prior.push_back(haploid_sequence_prior[candidate.first] +
+                                     haploid_sequence_prior[candidate.second] +
+                                     (candidate.first != candidate.second ? std::log(2.0) : 0.0));
+            ranked_pairs.push_back({candidate.first, candidate.second});
+
+            // Projection needs one allele path per haplotype. Take the member with the highest exact path
+            // prior, ties to beam order, and flag the call if any member projects to different block
+            // alleles: those bytes then do not determine the block genotype.
+            std::size_t best = candidate.beam_candidates.front();
+            for (const std::size_t member : candidate.beam_candidates) {
+                if (path_prior[member] > path_prior[best]) best = member;
+            }
+            candidate.representative = best;
+            const MosaicDiplotype& chosen = beam.candidates[best].diplotype;
+            for (const std::size_t member : candidate.beam_candidates) {
+                const MosaicDiplotype& other = beam.candidates[member].diplotype;
+                for (std::size_t b = 0; b < model.blocks().size(); ++b) {
+                    auto lhs = std::minmax(chosen.first.alleles[b], chosen.second.alleles[b]);
+                    auto rhs = std::minmax(other.first.alleles[b], other.second.alleles[b]);
+                    if (lhs != rhs) candidate.projection_ambiguous = true;
+                }
+            }
+        }
+
+        // ---- stage 6: certified rescoring -----------------------------------------------------------
+        mark = Clock::now();
+        FragmentScoringOptions scoring_options;
+        scoring_options.mismatch_band = options.mismatch_band;
+        scoring_options.minimum_piece_bp = options.minimum_piece_bp;
+        scoring_options.max_piece_hits = options.max_piece_hits;
+        scoring_options.max_proposed_starts_per_haplotype = options.max_proposed_starts_per_haplotype;
+        scoring_options.max_physical_origins = options.max_physical_origins;
+        scoring_options.max_state_classes = options.max_state_classes;
+        scoring_options.max_mass_cells = options.max_mass_cells;
+        CertifiedRanking ranking;
+        try {
+            ranking = certify_diplotype_ranking(interned, ranked_pairs, fragments, library, scoring_options,
+                                                CertificationOptions{}, sequence_prior);
+        } catch (const ResourceExhausted& error) {
+            timings.rescoring = seconds_since(mark);
+            timings.total = seconds_since(started);
+            write_status(status_path, GenotypeRunStatus::RescoreIncomplete, fingerprint, options, library,
+                         timings, &built.report, &panel, &beam, nullptr,
+                         std::string("rescoring stopped at a declared resource cap and returned no "
+                                     "ranking: ") + error.what(),
+                         nullptr, &depth);
+            return GenotypeRunStatus::RescoreIncomplete;
+        }
+        timings.rescoring = seconds_since(mark);
+
+        RankingSummary summary;
+        summary.sequence_candidates = sequence_candidates.size();
+        summary.collapsed_beam_candidates = beam.candidates.size() - sequence_candidates.size();
+        summary.block_genotype_read_supported.assign(model.blocks().size(), true);
         {
-            // Diagnostics only: what the search did propose. It is not a ranking and carries no scores.
+            const CertifiedCandidate& best = ranking.candidates.front();
+            const MosaicDiplotype& winner_diplotype =
+                beam.candidates[sequence_candidates[best.candidate_id].representative].diplotype;
+            summary.fragment_term_gap = ranking.candidates.size() > 1
+                                            ? best.fragment_term - ranking.candidates[1].fragment_term
+                                            : std::numeric_limits<double>::infinity();
+            for (std::size_t i = 1; i < ranking.candidates.size(); ++i) {
+                const CertifiedCandidate& rival = ranking.candidates[i];
+                // A fragment contender: the reads alone do not put it below the winner.
+                if (rival.fragment_term + rival.numeric_error_bound <
+                    best.fragment_term - best.numeric_error_bound) {
+                    continue;
+                }
+                ++summary.fragment_contenders;
+                const MosaicDiplotype& other =
+                    beam.candidates[sequence_candidates[rival.candidate_id].representative].diplotype;
+                for (std::size_t b = 0; b < model.blocks().size(); ++b) {
+                    if (std::minmax(winner_diplotype.first.alleles[b], winner_diplotype.second.alleles[b]) !=
+                        std::minmax(other.first.alleles[b], other.second.alleles[b])) {
+                        summary.block_genotype_read_supported[b] = false;
+                    }
+                }
+            }
+            summary.phase_support = ranking.status != RescoreStatus::Complete ? "UNRESOLVED"
+                                    : summary.fragment_contenders == 0      ? "READS"
+                                                                             : "PRIOR_ONLY";
+            summary.projection_ambiguous = sequence_candidates[best.candidate_id].projection_ambiguous;
+        }
+
+        // ---- outputs --------------------------------------------------------------------------------
+        {
             std::ofstream out = open_output(options.out_prefix + ".mosaic_candidates.tsv");
             out << "candidate_id\tunique_rank\thap1_alleles\thap2_alleles\tbest_proposal_score\t"
                    "retained_logsum_proposal_score\tproposal_emission_component\t"
                    "proposal_transition_component\tequivalent_retained_histories\tevery_allele_scored\t"
                    "exact_path_prior\tsequence_candidate_id\thistory_count_saturated\n";
-            for (const MosaicCandidate& candidate : beam.candidates) {
+            for (std::size_t i = 0; i < beam.candidates.size(); ++i) {
+                const MosaicCandidate& candidate = beam.candidates[i];
                 out << candidate.candidate_id << '\t' << candidate.unique_rank << '\t'
                     << join_alleles(candidate.diplotype.first.alleles) << '\t'
                     << join_alleles(candidate.diplotype.second.alleles) << '\t'
@@ -503,309 +730,132 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                     << candidate.proposal_emission_component << '\t'
                     << candidate.proposal_transition_component << '\t'
                     << candidate.equivalent_retained_histories << '\t'
-                    << (candidate.every_allele_scored ? "true" : "false") << "\tNA\tNA\t"
+                    << (candidate.every_allele_scored ? "true" : "false") << '\t'
+                    << path_prior[i] << '\t' << sequence_candidate_of_beam[i] << '\t'
                     << (candidate.history_count_saturated ? "true" : "false") << '\n';
             }
         }
-        write_status(status_path, GenotypeRunStatus::CandidateIncomplete, fingerprint, options, library,
-                     timings, &built.report, &panel, &beam, nullptr,
-                     "the proposal pruned merged states and still found fewer than the requested "
-                     "candidates; no call is made from a set that omits unproposed candidates",
-                     nullptr, &depth);
-        return GenotypeRunStatus::CandidateIncomplete;
-    }
-    if (beam.candidates.empty()) {
-        timings.total = seconds_since(started);
-        write_status(status_path, GenotypeRunStatus::CandidateIncomplete, fingerprint, options,
-                     library, timings, &built.report, &panel, &beam, nullptr,
-                     "the proposal produced no mosaic candidate", nullptr, &depth);
-        return GenotypeRunStatus::CandidateIncomplete;
-    }
-
-    // ---- stage 4: spelling and interning --------------------------------------------------------
-    mark = Clock::now();
-    std::vector<MosaicPath> paths;
-    std::vector<std::string> sequences;
-    std::vector<HaplotypeCandidate> pairs;
-    std::map<std::vector<std::size_t>, std::size_t> slot_of_path;
-    const auto slot_for = [&](const MosaicPath& path) {
-        const auto found = slot_of_path.find(path.alleles);
-        if (found != slot_of_path.end()) return found->second;
-        const std::size_t slot = paths.size();
-        slot_of_path.emplace(path.alleles, slot);
-        paths.push_back(path);
-        sequences.push_back(spell_mosaic(model, path).bases);
-        return slot;
-    };
-    for (const MosaicCandidate& candidate : beam.candidates) {
-        pairs.push_back({slot_for(candidate.diplotype.first),
-                         slot_for(candidate.diplotype.second)});
-    }
-    const InternedHaplotypes interned = intern_haplotypes(paths, sequences);
-
-    // Candidates are ranked as unordered pairs of SEQUENCES. Two beam candidates whose allele paths
-    // differ but spell the same two haplotypes are one state to any read-based method; ranking them
-    // separately would leave two candidates with identical fragment evidence and a gap made entirely
-    // of how differently their paths happen to be represented.
-    struct SequenceCandidate {
-        std::size_t first = 0;     // interned sequence, first <= second
-        std::size_t second = 0;
-        std::vector<std::size_t> beam_candidates;
-        std::size_t representative = 0;
-        bool projection_ambiguous = false;
-    };
-    std::vector<SequenceCandidate> sequence_candidates;
-    std::map<std::pair<std::size_t, std::size_t>, std::size_t> slot_of_sequence_pair;
-    std::vector<std::size_t> sequence_candidate_of_beam(beam.candidates.size(), 0);
-    for (std::size_t i = 0; i < beam.candidates.size(); ++i) {
-        std::size_t x = interned.index_of[pairs[i].first];
-        std::size_t y = interned.index_of[pairs[i].second];
-        if (y < x) std::swap(x, y);
-        const auto inserted =
-            slot_of_sequence_pair.emplace(std::make_pair(x, y), sequence_candidates.size());
-        if (inserted.second) {
-            SequenceCandidate fresh;
-            fresh.first = x;
-            fresh.second = y;
-            sequence_candidates.push_back(fresh);
-        }
-        sequence_candidates[inserted.first->second].beam_candidates.push_back(i);
-        sequence_candidate_of_beam[i] = inserted.first->second;
-    }
-    timings.spelling = seconds_since(mark);
-
-    // ---- stage 5: exact prior, recomputed independently of the beam ------------------------------
-    // Both priors are exact and neither reads a beam history. The path prior is kept as a manifest
-    // diagnostic; the ranking uses the sequence-pair prior, which sums every allele path that spells
-    // each haplotype and decides the log(2) multiplicity on bytes.
-    std::vector<double> path_prior;
-    path_prior.reserve(beam.candidates.size());
-    for (const MosaicCandidate& candidate : beam.candidates) {
-        path_prior.push_back(
-            log_unordered_diplotype_prior(model.panel(), candidate.diplotype, switch_probability));
-    }
-    std::vector<double> haploid_sequence_prior(interned.sequences.size());
-    for (std::size_t h = 0; h < interned.sequences.size(); ++h) {
-        haploid_sequence_prior[h] =
-            log_haploid_sequence_prior(model, interned.sequences[h], switch_probability);
-    }
-    std::vector<double> sequence_prior;
-    std::vector<HaplotypeCandidate> ranked_pairs;
-    for (SequenceCandidate& candidate : sequence_candidates) {
-        sequence_prior.push_back(haploid_sequence_prior[candidate.first] +
-                                 haploid_sequence_prior[candidate.second] +
-                                 (candidate.first != candidate.second ? std::log(2.0) : 0.0));
-        ranked_pairs.push_back({candidate.first, candidate.second});
-
-        // Projection needs one allele path per haplotype. Take the member with the highest exact path
-        // prior, ties to beam order, and flag the call if any member projects to different block
-        // alleles: those bytes then do not determine the block genotype.
-        std::size_t best = candidate.beam_candidates.front();
-        for (const std::size_t member : candidate.beam_candidates) {
-            if (path_prior[member] > path_prior[best]) best = member;
-        }
-        candidate.representative = best;
-        const MosaicDiplotype& chosen = beam.candidates[best].diplotype;
-        for (const std::size_t member : candidate.beam_candidates) {
-            const MosaicDiplotype& other = beam.candidates[member].diplotype;
-            for (std::size_t b = 0; b < model.blocks().size(); ++b) {
-                auto lhs = std::minmax(chosen.first.alleles[b], chosen.second.alleles[b]);
-                auto rhs = std::minmax(other.first.alleles[b], other.second.alleles[b]);
-                if (lhs != rhs) candidate.projection_ambiguous = true;
+        {
+            // The proposal score is deliberately absent from this table's total: it comes from the same
+            // reads as the fragment term, so adding both would count that evidence twice.
+            std::ofstream out = open_output(options.out_prefix + ".mosaic_scores.tsv");
+            out << "sequence_candidate_id\trepresentative_beam_candidate\tequivalent_beam_candidates\t"
+                   "score\tfragment_term\texposure_term\tsequence_pair_prior\tnumeric_error_bound\t"
+                   "fragments_with_mass\tfragments_total\tcandidate_set_probability\tmismatch_band\t"
+                   "projection_ambiguous\tin_winner_set\n";
+            out << std::setprecision(12);
+            for (const CertifiedCandidate& entry : ranking.candidates) {
+                const SequenceCandidate& candidate = sequence_candidates[entry.candidate_id];
+                const bool in_set =
+                    std::find(ranking.winner_set.begin(), ranking.winner_set.end(),
+                              entry.candidate_id) != ranking.winner_set.end();
+                out << entry.candidate_id << '\t' << candidate.representative << '\t'
+                    << candidate.beam_candidates.size() << '\t' << entry.score << '\t'
+                    << entry.fragment_term << '\t' << entry.exposure_term << '\t' << entry.prior << '\t'
+                    << entry.numeric_error_bound << '\t' << entry.fragments_with_mass << '\t'
+                    << fragments.size() << '\t' << entry.candidate_set_probability << '\t'
+                    << ranking.mismatch_band << '\t'
+                    << (candidate.projection_ambiguous ? "true" : "false") << '\t'
+                    << (in_set ? "true" : "false") << '\n';
             }
         }
-    }
 
-    // ---- stage 6: certified rescoring -----------------------------------------------------------
-    mark = Clock::now();
-    FragmentScoringOptions scoring_options;
-    scoring_options.mismatch_band = options.mismatch_band;
-    scoring_options.minimum_piece_bp = options.minimum_piece_bp;
-    scoring_options.max_piece_hits = options.max_piece_hits;
-    scoring_options.max_proposed_starts_per_haplotype = options.max_proposed_starts_per_haplotype;
-    scoring_options.max_physical_origins = options.max_physical_origins;
-    scoring_options.max_state_classes = options.max_state_classes;
-    scoring_options.max_mass_cells = options.max_mass_cells;
-    CertifiedRanking ranking;
-    try {
-        ranking = certify_diplotype_ranking(interned, ranked_pairs, fragments, library, scoring_options,
-                                            CertificationOptions{}, sequence_prior);
-    } catch (const ResourceExhausted& error) {
-        timings.rescoring = seconds_since(mark);
-        timings.total = seconds_since(started);
-        write_status(status_path, GenotypeRunStatus::RescoreIncomplete, fingerprint, options, library,
-                     timings, &built.report, &panel, &beam, nullptr,
-                     std::string("rescoring stopped at a declared resource cap and returned no "
-                                 "ranking: ") + error.what(),
-                     nullptr, &depth);
-        return GenotypeRunStatus::RescoreIncomplete;
-    }
-    timings.rescoring = seconds_since(mark);
+        if (ranking.status != RescoreStatus::Complete) {
+            timings.total = seconds_since(started);
+            write_status(status_path, GenotypeRunStatus::RescoreIncomplete, fingerprint, options,
+                         library, timings, &built.report, &panel, &beam, &ranking,
+                         "the best candidate cannot be separated from every rival by more than "
+                         "floating-point error; the equivalence set is reported instead of a call",
+                         &summary, &depth);
+            return GenotypeRunStatus::RescoreIncomplete;
+        }
 
-    RankingSummary summary;
-    summary.sequence_candidates = sequence_candidates.size();
-    summary.collapsed_beam_candidates = beam.candidates.size() - sequence_candidates.size();
-    summary.block_genotype_read_supported.assign(model.blocks().size(), true);
-    {
-        const CertifiedCandidate& best = ranking.candidates.front();
-        const MosaicDiplotype& winner_diplotype =
-            beam.candidates[sequence_candidates[best.candidate_id].representative].diplotype;
-        summary.fragment_term_gap = ranking.candidates.size() > 1
-                                        ? best.fragment_term - ranking.candidates[1].fragment_term
-                                        : std::numeric_limits<double>::infinity();
-        for (std::size_t i = 1; i < ranking.candidates.size(); ++i) {
-            const CertifiedCandidate& rival = ranking.candidates[i];
-            // A fragment contender: the reads alone do not put it below the winner.
-            if (rival.fragment_term + rival.numeric_error_bound <
-                best.fragment_term - best.numeric_error_bound) {
-                continue;
-            }
-            ++summary.fragment_contenders;
-            const MosaicDiplotype& other =
-                beam.candidates[sequence_candidates[rival.candidate_id].representative].diplotype;
+        const std::size_t winner = ranking.winner_set.front();
+        const MosaicDiplotype& called =
+            beam.candidates[sequence_candidates[winner].representative].diplotype;
+        {
+            // Only variant blocks are reporting units. Context blocks are modelled identically and are
+            // what let the mosaic recombine, but they are not SV calls and are not presented as such.
+            std::ofstream out = open_output(options.out_prefix + ".genotypes.tsv");
+            out << "block_id\tkind\tallele1\tallele2\tallele1_bp\tallele2_bp\tallele1_sources\t"
+                   "allele2_sources\tzygosity\n";
             for (std::size_t b = 0; b < model.blocks().size(); ++b) {
-                if (std::minmax(winner_diplotype.first.alleles[b], winner_diplotype.second.alleles[b]) !=
-                    std::minmax(other.first.alleles[b], other.second.alleles[b])) {
-                    summary.block_genotype_read_supported[b] = false;
+                const PreparedGenotypeBlock& block = model.blocks()[b];
+                if (block.kind != GenotypeBlockKind::Variant) continue;
+                const std::size_t a1 = called.first.alleles[b];
+                const std::size_t a2 = called.second.alleles[b];
+                const auto sources = [&](std::size_t id) {
+                    std::string joined;
+                    for (const std::string& source : block.alleles[id].source_ids) {
+                        if (!joined.empty()) joined += ',';
+                        joined += source;
+                    }
+                    return joined;
+                };
+                out << block.block_id << "\tSV\t" << a1 << '\t' << a2 << '\t'
+                    << block.alleles[a1].sequence.size() << '\t'
+                    << block.alleles[a2].sequence.size() << '\t'
+                    << sources(a1) << '\t' << sources(a2) << '\t'
+                    << (a1 == a2 ? "HOM" : "HET") << '\n';
+            }
+        }
+        {
+            // Every statistical block, for block-level evaluation. Context blocks are polymorphic and are
+            // genotyped by the same mosaic; `reportable` marks the SV bubbles the SV-facing genotypes table
+            // carries, so the interstitial blocks are distinguished rather than dropped.
+            std::ofstream out = open_output(options.out_prefix + ".block_genotypes.tsv");
+            out << "block_id\tkind\treportable\tallele1\tallele2\tallele1_bp\tallele2_bp\tzygosity\t"
+                   "projection_ambiguous\tgenotype_support\tphase_support\n";
+            const bool ambiguous = sequence_candidates[winner].projection_ambiguous;
+            for (std::size_t b = 0; b < model.blocks().size(); ++b) {
+                const PreparedGenotypeBlock& block = model.blocks()[b];
+                const bool variant = block.kind == GenotypeBlockKind::Variant;
+                const std::size_t a1 = called.first.alleles[b];
+                const std::size_t a2 = called.second.alleles[b];
+                out << block.block_id << '\t' << (variant ? "SV" : "context") << '\t'
+                    << (variant ? "true" : "false") << '\t' << a1 << '\t' << a2 << '\t'
+                    << block.alleles[a1].sequence.size() << '\t' << block.alleles[a2].sequence.size() << '\t'
+                    << (a1 == a2 ? "HOM" : "HET") << '\t' << (ambiguous ? "true" : "false") << '\t'
+                    << (summary.block_genotype_read_supported[b] ? "READS" : "PRIOR_ONLY") << '\t'
+                    << summary.phase_support << '\n';
+            }
+        }
+        {
+            std::ofstream out = open_output(options.out_prefix + ".mosaic_haplotypes.fa");
+            const HaplotypeSequence first = spell_mosaic(model, called.first);
+            const HaplotypeSequence second = spell_mosaic(model, called.second);
+            for (const auto& item : {std::make_pair("hap1", &first), std::make_pair("hap2", &second)}) {
+                out << '>' << options.out_prefix << '_' << item.first
+                    << " fingerprint=" << fingerprint << " bp=" << item.second->bases.size() << '\n';
+                for (std::size_t at = 0; at < item.second->bases.size(); at += 60) {
+                    out << item.second->bases.substr(at, 60) << '\n';
                 }
             }
         }
-        summary.phase_support = ranking.status != RescoreStatus::Complete ? "UNRESOLVED"
-                                : summary.fragment_contenders == 0      ? "READS"
-                                                                         : "PRIOR_ONLY";
-        summary.projection_ambiguous = sequence_candidates[best.candidate_id].projection_ambiguous;
-    }
 
-    // ---- outputs --------------------------------------------------------------------------------
-    {
-        std::ofstream out = open_output(options.out_prefix + ".mosaic_candidates.tsv");
-        out << "candidate_id\tunique_rank\thap1_alleles\thap2_alleles\tbest_proposal_score\t"
-               "retained_logsum_proposal_score\tproposal_emission_component\t"
-               "proposal_transition_component\tequivalent_retained_histories\tevery_allele_scored\t"
-               "exact_path_prior\tsequence_candidate_id\thistory_count_saturated\n";
-        for (std::size_t i = 0; i < beam.candidates.size(); ++i) {
-            const MosaicCandidate& candidate = beam.candidates[i];
-            out << candidate.candidate_id << '\t' << candidate.unique_rank << '\t'
-                << join_alleles(candidate.diplotype.first.alleles) << '\t'
-                << join_alleles(candidate.diplotype.second.alleles) << '\t'
-                << candidate.best_proposal_score << '\t'
-                << candidate.retained_logsum_proposal_score << '\t'
-                << candidate.proposal_emission_component << '\t'
-                << candidate.proposal_transition_component << '\t'
-                << candidate.equivalent_retained_histories << '\t'
-                << (candidate.every_allele_scored ? "true" : "false") << '\t'
-                << path_prior[i] << '\t' << sequence_candidate_of_beam[i] << '\t'
-                << (candidate.history_count_saturated ? "true" : "false") << '\n';
-        }
-    }
-    {
-        // The proposal score is deliberately absent from this table's total: it comes from the same
-        // reads as the fragment term, so adding both would count that evidence twice.
-        std::ofstream out = open_output(options.out_prefix + ".mosaic_scores.tsv");
-        out << "sequence_candidate_id\trepresentative_beam_candidate\tequivalent_beam_candidates\t"
-               "score\tfragment_term\texposure_term\tsequence_pair_prior\tnumeric_error_bound\t"
-               "fragments_with_mass\tfragments_total\tcandidate_set_probability\tmismatch_band\t"
-               "projection_ambiguous\tin_winner_set\n";
-        out << std::setprecision(12);
-        for (const CertifiedCandidate& entry : ranking.candidates) {
-            const SequenceCandidate& candidate = sequence_candidates[entry.candidate_id];
-            const bool in_set =
-                std::find(ranking.winner_set.begin(), ranking.winner_set.end(),
-                          entry.candidate_id) != ranking.winner_set.end();
-            out << entry.candidate_id << '\t' << candidate.representative << '\t'
-                << candidate.beam_candidates.size() << '\t' << entry.score << '\t'
-                << entry.fragment_term << '\t' << entry.exposure_term << '\t' << entry.prior << '\t'
-                << entry.numeric_error_bound << '\t' << entry.fragments_with_mass << '\t'
-                << fragments.size() << '\t' << entry.candidate_set_probability << '\t'
-                << ranking.mismatch_band << '\t'
-                << (candidate.projection_ambiguous ? "true" : "false") << '\t'
-                << (in_set ? "true" : "false") << '\n';
-        }
-    }
-
-    if (ranking.status != RescoreStatus::Complete) {
         timings.total = seconds_since(started);
-        write_status(status_path, GenotypeRunStatus::RescoreIncomplete, fingerprint, options,
-                     library, timings, &built.report, &panel, &beam, &ranking,
-                     "the best candidate cannot be separated from every rival by more than "
-                     "floating-point error; the equivalence set is reported instead of a call",
-                     &summary, &depth);
-        return GenotypeRunStatus::RescoreIncomplete;
-    }
+        write_status(status_path, GenotypeRunStatus::Complete, fingerprint, options, library, timings,
+                     &built.report, &panel, &beam, &ranking, "", &summary, &depth);
+        if (!options.quiet) {
+            std::cerr << "[genotype] COMPLETE  fingerprint=" << fingerprint
+                      << "  candidates=" << beam.candidates.size()
+                      << "  gap=" << ranking.certified_gap
+                      << "  total=" << timings.total << "s\n";
+        }
+        return GenotypeRunStatus::Complete;
+    };
 
-    const std::size_t winner = ranking.winner_set.front();
-    const MosaicDiplotype& called =
-        beam.candidates[sequence_candidates[winner].representative].diplotype;
-    {
-        // Only variant blocks are reporting units. Context blocks are modelled identically and are
-        // what let the mosaic recombine, but they are not SV calls and are not presented as such.
-        std::ofstream out = open_output(options.out_prefix + ".genotypes.tsv");
-        out << "block_id\tkind\tallele1\tallele2\tallele1_bp\tallele2_bp\tallele1_sources\t"
-               "allele2_sources\tzygosity\n";
-        for (std::size_t b = 0; b < model.blocks().size(); ++b) {
-            const PreparedGenotypeBlock& block = model.blocks()[b];
-            if (block.kind != GenotypeBlockKind::Variant) continue;
-            const std::size_t a1 = called.first.alleles[b];
-            const std::size_t a2 = called.second.alleles[b];
-            const auto sources = [&](std::size_t id) {
-                std::string joined;
-                for (const std::string& source : block.alleles[id].source_ids) {
-                    if (!joined.empty()) joined += ',';
-                    joined += source;
-                }
-                return joined;
-            };
-            out << block.block_id << "\tSV\t" << a1 << '\t' << a2 << '\t'
-                << block.alleles[a1].sequence.size() << '\t'
-                << block.alleles[a2].sequence.size() << '\t'
-                << sources(a1) << '\t' << sources(a2) << '\t'
-                << (a1 == a2 ? "HOM" : "HET") << '\n';
-        }
+    if (options.development_candidate_prefixes.empty()) return finish(beam, options, timings);
+    GenotypeRunStatus last = GenotypeRunStatus::Complete;
+    for (const std::size_t k : options.development_candidate_prefixes) {
+        GenotypeCommandOptions prefix_options = options;
+        prefix_options.max_candidates = k;
+        prefix_options.out_prefix = options.out_prefix + ".K" + std::to_string(k);
+        prefix_options.development_candidate_prefixes.clear();
+        remove_run_outputs(prefix_options.out_prefix);
+        last = finish(candidate_prefix(beam, k), prefix_options, timings);
     }
-    {
-        // Every statistical block, for block-level evaluation. Context blocks are polymorphic and are
-        // genotyped by the same mosaic; `reportable` marks the SV bubbles the SV-facing genotypes table
-        // carries, so the interstitial blocks are distinguished rather than dropped.
-        std::ofstream out = open_output(options.out_prefix + ".block_genotypes.tsv");
-        out << "block_id\tkind\treportable\tallele1\tallele2\tallele1_bp\tallele2_bp\tzygosity\t"
-               "projection_ambiguous\tgenotype_support\tphase_support\n";
-        const bool ambiguous = sequence_candidates[winner].projection_ambiguous;
-        for (std::size_t b = 0; b < model.blocks().size(); ++b) {
-            const PreparedGenotypeBlock& block = model.blocks()[b];
-            const bool variant = block.kind == GenotypeBlockKind::Variant;
-            const std::size_t a1 = called.first.alleles[b];
-            const std::size_t a2 = called.second.alleles[b];
-            out << block.block_id << '\t' << (variant ? "SV" : "context") << '\t'
-                << (variant ? "true" : "false") << '\t' << a1 << '\t' << a2 << '\t'
-                << block.alleles[a1].sequence.size() << '\t' << block.alleles[a2].sequence.size() << '\t'
-                << (a1 == a2 ? "HOM" : "HET") << '\t' << (ambiguous ? "true" : "false") << '\t'
-                << (summary.block_genotype_read_supported[b] ? "READS" : "PRIOR_ONLY") << '\t'
-                << summary.phase_support << '\n';
-        }
-    }
-    {
-        std::ofstream out = open_output(options.out_prefix + ".mosaic_haplotypes.fa");
-        const HaplotypeSequence first = spell_mosaic(model, called.first);
-        const HaplotypeSequence second = spell_mosaic(model, called.second);
-        for (const auto& item : {std::make_pair("hap1", &first), std::make_pair("hap2", &second)}) {
-            out << '>' << options.out_prefix << '_' << item.first
-                << " fingerprint=" << fingerprint << " bp=" << item.second->bases.size() << '\n';
-            for (std::size_t at = 0; at < item.second->bases.size(); at += 60) {
-                out << item.second->bases.substr(at, 60) << '\n';
-            }
-        }
-    }
-
-    timings.total = seconds_since(started);
-    write_status(status_path, GenotypeRunStatus::Complete, fingerprint, options, library, timings,
-                 &built.report, &panel, &beam, &ranking, "", &summary, &depth);
-    if (!options.quiet) {
-        std::cerr << "[genotype] COMPLETE  fingerprint=" << fingerprint
-                  << "  candidates=" << beam.candidates.size()
-                  << "  gap=" << ranking.certified_gap
-                  << "  total=" << timings.total << "s\n";
-    }
-    return GenotypeRunStatus::Complete;
+    return last;
 }
 
 int run_genotype_command(const std::vector<std::string>& args) {

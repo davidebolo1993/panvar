@@ -770,6 +770,64 @@ void test_prior_only_phase_is_reported() {
 
 } // namespace
 
+// K truncates one proposal ordering, so the development harness ranks every prefix of a single proposal
+// instead of rerunning it. Each prefix must reproduce a standalone run with that K byte for byte -- its
+// candidate manifest, scores, block calls, haplotypes and status apart from stage timings -- including
+// prefixes the production rule refuses because a pruned search found fewer candidates than they ask for.
+void test_candidate_prefixes_match_standalone() {
+    const std::string r1 = path("phaseable_r1.fq");
+    const std::string r2 = path("phaseable_r2.fq");
+    const auto slurp = [](const std::string& file, bool status_file) {
+        std::ifstream input(file);
+        if (!input) return std::string("<absent>");
+        std::string line;
+        std::string text;
+        while (std::getline(input, line)) {
+            if (status_file && line.rfind("seconds_", 0) == 0) continue;
+            if (!line.empty() && line[0] == '>') line = line.substr(line.find(' '));   // header names the prefix
+            text += line + '\n';
+        }
+        return text;
+    };
+    const std::vector<std::size_t> prefixes = {2, 4, 16, 64};
+    for (const std::size_t state_limit : {std::size_t{64}, std::size_t{1048576}}) {
+        const std::string base = "prefixes_" + std::to_string(state_limit);
+        panvar::GenotypeCommandOptions ladder = tiny_options(base, r1, r2, "tiny_phaseable.gfa");
+        ladder.proposal_state_limit = state_limit;
+        ladder.max_candidates = prefixes.back();
+        ladder.development_candidate_prefixes = prefixes;
+        panvar::run_genotype(ladder);
+        std::size_t refused = 0;
+        std::size_t complete = 0;
+        for (const std::size_t k : prefixes) {
+            const std::string name = base + "_standalone_K" + std::to_string(k);
+            panvar::GenotypeCommandOptions standalone = tiny_options(name, r1, r2, "tiny_phaseable.gfa");
+            standalone.proposal_state_limit = state_limit;
+            standalone.max_candidates = k;
+            const panvar::GenotypeRunStatus status = panvar::run_genotype(standalone);
+            if (status == panvar::GenotypeRunStatus::CandidateIncomplete) ++refused;
+            if (status == panvar::GenotypeRunStatus::Complete) ++complete;
+            const std::string extracted = path(base + ".K" + std::to_string(k));
+            for (const std::string suffix : {".genotypes.tsv", ".block_genotypes.tsv", ".mosaic_candidates.tsv",
+                                             ".mosaic_scores.tsv", ".mosaic_status.tsv", ".mosaic_haplotypes.fa"}) {
+                const bool status_file = suffix == ".mosaic_status.tsv";
+                require(slurp(extracted + suffix, status_file) == slurp(path(name) + suffix, status_file),
+                        "prefix K=" + std::to_string(k) + " at state limit " + std::to_string(state_limit) +
+                            " must reproduce the standalone " + suffix);
+            }
+        }
+        if (state_limit == 64) {
+            require(refused > 0 && complete > 0,
+                    "fixture: at 64 merged states the small prefixes must call and the large ones refuse");
+        } else {
+            require(refused == 0 && complete == prefixes.size(),
+                    "fixture: an exhaustive proposal must complete at every prefix");
+        }
+        std::cout << "  candidate prefixes at state limit " << state_limit << ": " << complete << " complete, "
+                  << refused << " refused, each identical to its standalone run\n";
+    }
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: genotype_command_e2e_test <scratch dir>\n";
@@ -784,6 +842,7 @@ int main(int argc, char** argv) {
         test_off_panel_phase_is_not_claimed_from_reads();
         test_proposal_status_rules();
         test_prior_only_phase_is_reported();
+        test_candidate_prefixes_match_standalone();
         std::cout << "genotype command end-to-end: PASS\n";
         return 0;
     } catch (const std::exception& error) {
