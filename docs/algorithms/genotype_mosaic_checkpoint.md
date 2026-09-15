@@ -4,6 +4,110 @@ Companion to `genotype_mosaic.md`, which remains the authoritative contract. Thi
 what is actually built, what its own gates still owe, and the work order to reach the Phase 8
 go/no-go.
 
+## R3. Review round 3 — response
+
+The reviewer accepted the round-2 scorer and single-donor measurements, then identified one proposal
+blocker and one likelihood-normalisation issue, and set a ten-step sequence. Steps 1–7 are done, each
+committed with its gate. Steps 8–10 — choosing K, the development pilot and the held-out cohort — have not
+been started: the rerun surfaced a leave-one-out instability that bears directly on K, and the archive does
+not identify eight development donors. Section 0 and below are the round-2 and round-1 record.
+
+Branch `genotype-mosaic`, 16 enabled tests pass. The unrelated inspect/cosigt work remains uncommitted.
+
+### R3.1 Item by item
+
+| Review step | Commit | Resolution | Gate |
+|---|---|---|---|
+| 1. Signal/background normalisation | `c8998ed` | Exposure term is `-(1-eta) * lambda * (E_a + E_b)`, the candidate-dependent part of the integrated superposed intensity; the contract formula is updated | The complete signal-plus-background intensity summed over all 4,096 observations of a 14 bp locus equals `(1-eta) * lambda * E + eta` (2.35 = 2.35 at eta = 0.25); the pre-review `lambda * E` visibly fails it |
+| 2. Per-layer equivalence merging | `8ba6942` | State key is the unordered pair of (allele-prefix id, current template); log-summed mass propagated, best-history witness kept, physical multiplicity counted, pruning only after merging; prefixes interned as `intern(previous, allele)` | Exhaustive enumeration at r = 0, 0.25/0.6 and r = 1 on three- and four-template panels: log-summed mass, witness score and components, multiplicity, homologue swap; a fixture where template–prefix association changes the future; identical templates collapse into one mosaic with every history |
+| 3. Proposal status reported separately | `8ba6942` | `proposal_states_pruned`, `proposal_search_exhaustive`, `proposal_target_reached`, `unique_candidates(_found)`, `candidate_set_conditional` | Beam-level: exhaustive below K is unconditional; exhaustive above K, and pruned reaching K, are conditional; pruned missing K reaches neither |
+| 4. Invert the wrong-call test | `8ba6942` | A pruned search that misses K ends CANDIDATE_INCOMPLETE with a diagnostic manifest and no ranking or call | End-to-end: a starved proposal refuses with no ranking or call; an exhaustive search below K completes unconditionally |
+| 5. Crowding fixture under the same budget | `8ba6942` | See R3.2 | Under 64 merged states the diagnostic manifest contains the truth; at an exhaustive budget it is recovered and read-phased |
+| 6. Honest phase support | `8ba6942` | `phase_support` = READS / PRIOR_ONLY / UNRESOLVED over fragment contenders (rivals whose fragment term is not below the winner's beyond numerical error); per-block `genotype_support` | READS on the phaseable truth; UNRESOLVED on the unphaseable one; a fixture with a second carrier of one haplotype makes a prior-decided call reported PRIOR_ONLY with all five block genotypes read-supported |
+| 7. Rerun NA19240 LZO and LOO | `1546df8` | Probe reports the new status; phased distance and phase switches are NA unless phase support is READS | R3.3 |
+
+### R3.2 The crowding fixture
+
+Tiny locus, phaseable truth, neither haplotype a panel row. It has 36 distinct diplotypes.
+
+| Merged-state limit | 16 | 64 | 256 | unbounded |
+|---|---|---|---|---|
+| Unique diplotypes found | 2 | 4 | 16 | 36 (0 pruned) |
+| Truth proposed | no | **yes** | yes | yes |
+| K = 16 | refused | refused | complete | complete |
+
+The same 64-slot budget that held two wrong phasings before merging now proposes the truth. With K = 16 the
+run still refuses, correctly: 64 merged states hold four of the 36 diplotypes. One consequence for K: a
+pruned search that reaches a small K can still omit the truth in its top-K truncation — at 64 states and
+K = 2 the returned pair did not contain it. Under the reviewer's rule that call is allowed and marked
+conditional.
+
+### R3.3 NA19240 rerun
+
+Same simulation and seed as round 2; checkpoint signature under `tests/results/genotype_probe_c4/`.
+Grouped-state limit 1,024 throughout.
+
+**Leave-zero-out** — 561 diplotypes found, 43.1M merged states pruned, target reached at every K:
+
+| K | Truth rank (proposal / score) | Blocks exact | Distance | Phase support | Contenders | Certified gap | Proposal s | Total s | Peak RSS |
+|---|---|---|---|---|---|---|---|---|---|
+| 8 | 1 / 1 | 11/11 | 0 | READS | 0 | 34.7 | 2.75 | 10.7 | 347 MB |
+| 16 | 1 / 1 | 11/11 | 0 | PRIOR_ONLY | 1 | 16.9 | 2.78 | 12.8 | 422 MB |
+| 32 | 1 / 1 | 11/11 | 0 | PRIOR_ONLY | 1 | 16.9 | 2.69 | 15.7 | 346 MB |
+| 64 | 1 / 1 | 11/11 | 0 | PRIOR_ONLY | 1 | 16.9 | 2.62 | 21.8 | 437 MB |
+| 128 | 1 / 1 | 11/11 | 0 | PRIOR_ONLY | 1 | 16.9 | 2.62 | 29.4 | 453 MB |
+| 256 | 1 / 1 | 11/11 | 0 | PRIOR_ONLY | 1 | 16.9 | 2.69 | 46.1 | 490 MB |
+
+- **The round-2 blocker is gone.** At K = 8 the truth was never proposed and a wrong call was certified;
+  now it is rank 1 and exact.
+- The winner is byte-identical at every K. From K = 16 one fragment contender — a rival with an identical
+  fragment term — is retained, so phase is honestly PRIOR_ONLY while all 11 block genotypes stay
+  read-supported.
+- Total time grows with K through rescoring, not proposal.
+
+**Leave-one-out** — NA19240 removed; 129 templates. Haplotype 1 is not spellable from the retained panel:
+
+| K | Blocks exact | SV exact | Distance | Floor | Excess | Phase support | Contenders | Total s | Peak RSS | Winner |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 64 | 8/11 | 5/5 | 4 | 4 | **0** | PRIOR_ONLY | 3 | 23.1 | 438 MB | `6529c792` |
+| 256 | 8/11 | 5/5 | 18 | 4 | **14** | PRIOR_ONLY | 3 | 49.7 | 424 MB | `9ed92c5a` |
+
+**The winner is not stable between K = 64 and K = 256, and the larger set is worse.** What is established:
+
+- The two calls differ only at `ctx:10`, in one haplotype: allele 8 at K = 64 (63,450 bp; edit distance 2,
+  equal to the availability floor) against allele 11 at K = 256 (63,447 bp; distance 16). The truth allele
+  is 63,448 bp and absent from the retained panel.
+- **The reads choose it.** In the K = 256 ranking, the K = 64 winner is score rank 183. Its fragment term is
+  2,871 nats worse than the new winner's; the exposure terms differ by 0.23 nats, and the prior favours the
+  K = 64 winner by 8.4 nats.
+- The K = 64 winner was proposal rank 2; the K = 256 winner is proposal rank 76. K = 64 was accurate only
+  because the candidate the likelihood prefers was outside its top 64. That accuracy came from truncation,
+  not from evidence.
+- Every block genotype is reported read-supported at both K, which is correct: the reads did choose.
+
+What is **not** established is why the fragment likelihood prefers an allele 16 edits away over one 2
+edits away. A first hypothesis — that one allele differs from the truth by substitutions and keeps reads in
+register while the other shifts them by an indel — is contradicted by the lengths: both alleles differ in
+length from the truth (+2 and −1 bp). No explanation is offered here.
+
+### R3.4 Questions before choosing K or starting the pilot
+
+1. **The LOO instability.** Proposed diagnostic, not yet run: localise the 2,871-nat difference to individual
+   fragments — which fragments carry it, where they place on each allele, and whether they fall outside the
+   mismatch band (and so into the outlier arm) on one allele but not the other. Should that precede any K
+   choice?
+2. **Model versus metric.** The substitution-only truncated likelihood and the edlib accuracy metric can
+   rank alleles differently, and here they rank them in opposite order. Is edit distance still the primary
+   metric for the pilot, and is indel-aware emission in scope before the cohort, given it is a stated
+   version-one non-goal?
+3. **K.** LZO is exact and stable at every K ≥ 8. LOO is worse at the larger K. Is K = 64 still the
+   provisional choice, knowing its LOO result depended on truncation?
+4. **The development donors.** Step 9 names eight. The archive froze four as development donors — HG00733,
+   HG02818, NA19036, NA19240 — and lists no eight. Which donors form the pilot?
+5. **Small-K conditional calls.** A pruned search reaching a small K can omit the truth in its top-K
+   truncation and still call, marked conditional. Acceptable, or should accuracy-eligible runs also require
+   the truth-agnostic condition that the returned set is not truncated?
+
 ## 0. Review round 2 — response
 
 The reviewer reproduced the suite and the C4 LZO result, then rejected the certification as resting on
@@ -143,6 +247,9 @@ misspecified or real library, behaviour at lower coverage, an off-panel SV allel
 rate.
 
 ### 0.5 Questions for the reviewer before any cohort run
+
+> **Answered in review round 3.** Crowding is fixed structurally (R3.1); truncated sets now refuse; phase support is reported; the bypass refusal and declared library parameters are accepted for version one.
+
 
 1. **Proposal crowding.** The raw width fills with equivalent template histories of the same allele
    paths, so unique candidates stay far below K (C4: 26 at width 4,096). A structural fix is to merge
