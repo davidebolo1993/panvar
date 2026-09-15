@@ -541,6 +541,12 @@ FragmentScoringResult score_diplotypes(
     }
     std::vector<double> mass(fragments.size() * unique, kNegInf);
     std::vector<double> exposure(unique, 0.0);
+    if (options.record_origin_summary) result.origin_summary.assign(fragments.size() * unique, OriginSummary{});
+    std::vector<char> record_origins(fragments.size(), 0);
+    for (const std::size_t f : options.record_origins_for_fragments) {
+        if (f >= fragments.size()) throw std::invalid_argument("origin recording names an unknown fragment");
+        record_origins[f] = 1;
+    }
 
     // The fragment likelihood conditions on the observed read lengths, and a template shorter than a
     // fragment's longer mate cannot produce that fragment. Exposure therefore averages the analytic
@@ -623,6 +629,31 @@ FragmentScoringResult score_diplotypes(
                         key.reverse_mismatches = it->mismatches;
                         key.orientation = static_cast<std::uint32_t>(arm);
                         ++states[key];
+                        if (options.record_origin_summary || record_origins[f] != 0) {
+                            FragmentPlacement placement;
+                            placement.forward_start = start.start;
+                            placement.reverse_start = it->start;
+                            placement.insert_bp = *insert;
+                            placement.forward_mismatches = start.mismatches;
+                            placement.reverse_mismatches = it->mismatches;
+                            placement.orientation =
+                                arm == 0 ? MateOrientation::FirstForward : MateOrientation::SecondForward;
+                            if (options.record_origin_summary) {
+                                OriginSummary& summary = result.origin_summary[f * unique + h];
+                                ++summary.origins;
+                                const double term =
+                                    kLogMateOrientationPrior + library_insert.log_probability(*insert) +
+                                    log_emission(forward_length, start.mismatches, library.substitution_error) -
+                                    band_mass(forward_length) +
+                                    log_emission(reverse_length, it->mismatches, library.substitution_error) -
+                                    band_mass(reverse_length);
+                                if (term > summary.best_log_term) {
+                                    summary.best_log_term = term;
+                                    summary.best = placement;
+                                }
+                            }
+                            if (record_origins[f] != 0) result.recorded_origins[{f, h}].push_back(placement);
+                        }
                     }
                 }
             }

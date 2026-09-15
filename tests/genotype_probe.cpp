@@ -16,12 +16,18 @@
 #include "panvar/graph_utils.hpp"
 #include "panvar/gz_reader.hpp"
 #include "panvar/integrated_snarls.hpp"
+#include "panvar/mosaic_spelling.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <limits>
+#include <numeric>
+#include <set>
+#include <tuple>
 #include <map>
 #include <optional>
 #include <random>
@@ -598,12 +604,536 @@ int evaluate(const Args& args) {
     return 0;
 }
 
+
+// ------------------------------------------------------------------------------------------------
+// compare: a fixed pair of diplotypes, decomposed fragment by fragment
+// ------------------------------------------------------------------------------------------------
+
+std::vector<panvar::ReadPair> read_pairs(const std::string& first, const std::string& second) {
+    const auto load = [](const std::string& file) {
+        panvar::GzLineReader reader(file);
+        if (!reader.ok()) throw std::runtime_error("cannot read " + file);
+        std::vector<panvar::SequencingRead> reads;
+        std::string header, bases, plus, quality;
+        while (reader.getline(header)) {
+            if (header.empty()) continue;
+            reader.getline(bases);
+            reader.getline(plus);
+            reader.getline(quality);
+            std::string name = header.substr(1);
+            const std::size_t space = name.find_first_of(" \t");
+            if (space != std::string::npos) name.resize(space);
+            reads.push_back({name, bases, quality});
+        }
+        return reads;
+    };
+    const auto a = load(first);
+    const auto b = load(second);
+    if (a.size() != b.size()) throw std::runtime_error("paired read files differ in record count");
+    std::vector<panvar::ReadPair> out;
+    for (std::size_t i = 0; i < a.size(); ++i) out.push_back({a[i], b[i]});
+    return out;
+}
+
+panvar::LibraryModel read_library_file(const std::string& file) {
+    std::ifstream input(file);
+    if (!input) throw std::runtime_error("cannot read " + file);
+    std::map<std::string, double> values;
+    std::string line;
+    while (std::getline(input, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream fields(line);
+        std::string key;
+        double value = 0.0;
+        if (fields >> key >> value) values[key] = value;
+    }
+    panvar::LibraryModel model;
+    model.insert_mean_bp = values.at("insert_mean_bp");
+    model.insert_sd_bp = values.at("insert_sd_bp");
+    model.support_sigmas = values.at("support_sigmas");
+    model.substitution_error = values.at("substitution_error");
+    model.outlier_weight = values.at("outlier_weight");
+    model.fragment_start_intensity = values.at("fragment_start_intensity");
+    model.provenance = "declared: " + file;
+    panvar::validate_library_model(model);
+    return model;
+}
+
+std::pair<std::vector<std::size_t>, std::vector<std::size_t>> winner_paths(const std::string& run) {
+    std::string representative;
+    for (const auto& row : read_table(run + ".mosaic_scores.tsv")) {
+        if (row.at("in_winner_set") == "true") representative = row.at("representative_beam_candidate");
+    }
+    for (const auto& row : read_table(run + ".mosaic_candidates.tsv")) {
+        if (row.at("candidate_id") == representative) {
+            return {parse_alleles(row.at("hap1_alleles")), parse_alleles(row.at("hap2_alleles"))};
+        }
+    }
+    throw std::runtime_error("no winner in " + run);
+}
+
+// The model's generative process on arbitrary haplotype sequences, in memory.
+std::vector<panvar::ReadPair> simulate_from(const std::vector<std::string>& haplotypes,
+                                            const panvar::LibraryModel& library, double depth,
+                                            std::size_t read_length, std::uint64_t seed) {
+    const panvar::DiscreteInsertDistribution insert = panvar::build_library_insert_distribution(library);
+    const double signal_rate = (depth / 2.0) / (2.0 * static_cast<double>(read_length));
+    std::mt19937_64 rng(seed);
+    std::vector<panvar::ReadPair> out;
+    std::size_t serial = 0;
+    for (const std::string& haplotype : haplotypes) {
+        std::vector<std::size_t> lengths;
+        std::vector<double> weights;
+        for (std::size_t i = std::max(insert.support.min_bp, read_length);
+             i <= insert.support.max_bp && i <= haplotype.size(); ++i) {
+            lengths.push_back(i);
+            weights.push_back(std::exp(insert.log_probability(i)) * static_cast<double>(haplotype.size() - i + 1));
+        }
+        const double exposure = panvar::haplotype_exposure(haplotype.size(), insert, read_length);
+        std::poisson_distribution<long> count(signal_rate * exposure);
+        std::discrete_distribution<std::size_t> length_draw(weights.begin(), weights.end());
+        std::bernoulli_distribution orientation(0.5);
+        std::uniform_real_distribution<double> unit(0.0, 1.0);
+        const long templates = count(rng);
+        for (long t = 0; t < templates; ++t) {
+            const std::size_t length = lengths[length_draw(rng)];
+            const std::size_t start = std::uniform_int_distribution<std::size_t>(0, haplotype.size() - length)(rng);
+            const std::string left = haplotype.substr(start, read_length);
+            const std::string right = revcomp(haplotype.substr(start + length - read_length, read_length));
+            const bool first_forward = orientation(rng);
+            std::string m1 = first_forward ? left : right;
+            std::string m2 = first_forward ? right : left;
+            for (std::string* mate : {&m1, &m2}) {
+                for (char& base : *mate) {
+                    if (unit(rng) >= library.substitution_error) continue;
+                    const char* others = base == 'A' ? "CGT" : base == 'C' ? "AGT" : base == 'G' ? "ACT" : "ACG";
+                    base = others[std::uniform_int_distribution<int>(0, 2)(rng)];
+                }
+            }
+            if (m1.find_first_not_of("ACGT") != std::string::npos || m2.find_first_not_of("ACGT") != std::string::npos) {
+                continue;
+            }
+            ++serial;
+            const std::string q(read_length, 'I');
+            out.push_back({{"cal_" + std::to_string(serial) + "/1", m1, q}, {"cal_" + std::to_string(serial) + "/2", m2, q}});
+        }
+    }
+    return out;
+}
+
+// Every accepted origin found by scanning every start position -- no seed index. The Hamming count and
+// FR geometry are the shared primitives; the search is independent of the pigeonhole index.
+std::vector<panvar::FragmentPlacement> scan_origins(const std::string& haplotype, const panvar::ReadPair& fragment,
+                                                    const panvar::InsertSupport& support, std::size_t band) {
+    const auto starts = [&](const std::string& read) {
+        std::vector<std::pair<std::size_t, std::size_t>> out;
+        if (haplotype.size() < read.size()) return out;
+        for (std::size_t p = 0; p + read.size() <= haplotype.size(); ++p) {
+            const auto mismatches = panvar::count_mismatches(haplotype, read, p, band);
+            if (mismatches.has_value()) out.emplace_back(p, *mismatches);
+        }
+        return out;
+    };
+    const std::string rc1 = revcomp(fragment.first.bases);
+    const std::string rc2 = revcomp(fragment.second.bases);
+    std::vector<panvar::FragmentPlacement> out;
+    for (int arm = 0; arm < 2; ++arm) {
+        const std::string& forward = arm == 0 ? fragment.first.bases : fragment.second.bases;
+        const std::string& reverse = arm == 0 ? rc2 : rc1;
+        const auto f_starts = starts(forward);
+        const auto r_starts = starts(reverse);
+        for (const auto& fs : f_starts) {
+            for (const auto& rs : r_starts) {
+                const auto insert = panvar::fr_insert_length(fs.first, forward.size(), rs.first, reverse.size(), support);
+                if (!insert.has_value()) continue;
+                panvar::FragmentPlacement placement;
+                placement.forward_start = fs.first;
+                placement.reverse_start = rs.first;
+                placement.insert_bp = *insert;
+                placement.forward_mismatches = fs.second;
+                placement.reverse_mismatches = rs.second;
+                placement.orientation = arm == 0 ? panvar::MateOrientation::FirstForward : panvar::MateOrientation::SecondForward;
+                out.push_back(placement);
+            }
+        }
+    }
+    return out;
+}
+
+auto placement_key(const panvar::FragmentPlacement& p) {
+    return std::make_tuple(static_cast<int>(p.orientation), p.forward_start, p.reverse_start, p.insert_bp,
+                           p.forward_mismatches, p.reverse_mismatches);
+}
+
+struct EditRun {
+    char op = 'M';
+    std::size_t query_pos = 0;
+    std::size_t target_pos = 0;
+    std::size_t length = 0;
+};
+
+// True edlib global traceback, returned as runs of non-matching operations with positions in both
+// sequences. 'I': bases in the query absent from the target; 'D': bases in the target absent from the
+// query; 'X': substitutions.
+std::vector<EditRun> edit_runs(const std::string& query, const std::string& target, long& distance) {
+    EdlibAlignResult result = edlibAlign(query.data(), static_cast<int>(query.size()), target.data(),
+                                         static_cast<int>(target.size()),
+                                         edlibNewAlignConfig(-1, EDLIB_MODE_NW, EDLIB_TASK_PATH, nullptr, 0));
+    if (result.status != EDLIB_STATUS_OK) throw std::runtime_error("edlib traceback failed");
+    distance = result.editDistance;
+    std::vector<EditRun> runs;
+    std::size_t q = 0;
+    std::size_t t = 0;
+    for (int i = 0; i < result.alignmentLength; ++i) {
+        const unsigned char op = result.alignment[i];
+        char code = op == EDLIB_EDOP_MATCH ? 'M' : op == EDLIB_EDOP_INSERT ? 'I' : op == EDLIB_EDOP_DELETE ? 'D' : 'X';
+        if (code != 'M') {
+            if (!runs.empty() && runs.back().op == code &&
+                runs.back().query_pos + (code == 'D' ? 0 : runs.back().length) == q &&
+                runs.back().target_pos + (code == 'I' ? 0 : runs.back().length) == t) {
+                ++runs.back().length;
+            } else {
+                runs.push_back({code, q, t, 1});
+            }
+        }
+        if (op != EDLIB_EDOP_DELETE) ++q;
+        if (op != EDLIB_EDOP_INSERT) ++t;
+    }
+    edlibFreeAlignResult(result);
+    return runs;
+}
+
+int compare(const Args& args) {
+    const std::string out = args.required("out");
+    const std::string reference = args.required("reference");
+    const std::string block_id = args.required("block");
+    const std::size_t band = std::stoul(args.get("band", "6"));
+    const LoadedModel loaded = load_model(args.required("model-gfa"), reference, out + ".model.sorted.gfa", 50);
+    const panvar::PreparedGenotypeModel& model = *loaded.model;
+    for (const char* run : {"run-a", "run-b"}) {
+        if (read_key_values(args.required(run) + ".mosaic_status.tsv").at("model_fingerprint") != loaded.fingerprint) {
+            throw std::runtime_error(std::string(run) + " was not scored on the rebuilt model");
+        }
+    }
+    const auto a = winner_paths(args.required("run-a"));
+    const auto b = winner_paths(args.required("run-b"));
+    std::size_t block = model.blocks().size();
+    for (std::size_t i = 0; i < model.blocks().size(); ++i) {
+        if (model.blocks()[i].block_id == block_id) block = i;
+    }
+    if (block == model.blocks().size()) throw std::runtime_error("unknown block " + block_id);
+
+    std::ofstream summary(out + ".summary.tsv");
+    summary << std::setprecision(12) << "key\tvalue\n";
+    std::vector<std::string> differing;
+    for (std::size_t i = 0; i < model.blocks().size(); ++i) {
+        if (std::minmax(a.first[i], a.second[i]) != std::minmax(b.first[i], b.second[i])) {
+            differing.push_back(model.blocks()[i].block_id);
+        }
+    }
+    summary << "differing_blocks\t";
+    for (std::size_t i = 0; i < differing.size(); ++i) summary << (i ? "," : "") << differing[i];
+    summary << '\n';
+
+    const std::vector<panvar::MosaicPath> paths = {panvar::MosaicPath{a.first}, panvar::MosaicPath{a.second},
+                                                   panvar::MosaicPath{b.first}, panvar::MosaicPath{b.second}};
+    std::vector<panvar::HaplotypeSequence> spelled;
+    std::vector<std::string> sequences;
+    for (const auto& path : paths) {
+        spelled.push_back(panvar::spell_mosaic(model, path));
+        sequences.push_back(spelled.back().bases);
+    }
+    const panvar::InternedHaplotypes all = panvar::intern_haplotypes(paths, sequences);
+    const panvar::HaplotypeCandidate cand_a{all.index_of[0], all.index_of[1]};
+    const panvar::HaplotypeCandidate cand_b{all.index_of[2], all.index_of[3]};
+    const panvar::LibraryModel library = read_library_file(args.required("library"));
+    const std::vector<panvar::ReadPair> fragments = read_pairs(args.required("reads1"), args.required("reads2"));
+    panvar::FragmentScoringOptions options;
+    options.mismatch_band = band;
+    options.minimum_piece_bp = 12;
+
+    // ---- 2. candidate-set independence ------------------------------------------------------------------
+    const panvar::InternedHaplotypes only_a = panvar::intern_haplotypes({paths[0], paths[1]}, {sequences[0], sequences[1]});
+    const panvar::InternedHaplotypes only_b = panvar::intern_haplotypes({paths[2], paths[3]}, {sequences[2], sequences[3]});
+    const auto alone_a = panvar::score_diplotypes(only_a, {{only_a.index_of[0], only_a.index_of[1]}}, fragments, library, options);
+    const auto alone_b = panvar::score_diplotypes(only_b, {{only_b.index_of[0], only_b.index_of[1]}}, fragments, library, options);
+    panvar::FragmentScoringOptions detailed = options;
+    detailed.record_origin_summary = true;
+    const auto together = panvar::score_diplotypes(all, {cand_a, cand_b}, fragments, library, detailed);
+    const auto same = [](const panvar::DiplotypeScore& x, const panvar::DiplotypeScore& y) {
+        return x.fragment_term == y.fragment_term && x.exposure_term == y.exposure_term &&
+               x.fragments_with_mass == y.fragments_with_mass;
+    };
+    summary << "unique_haplotypes\t" << all.sequences.size() << "\ncandidate_set_independent\t"
+            << (same(alone_a.scores[0], together.scores[0]) && same(alone_b.scores[0], together.scores[1]) ? "true" : "false")
+            << "\nfragment_term_a\t" << together.scores[0].fragment_term << "\nfragment_term_b\t"
+            << together.scores[1].fragment_term << "\nfragments_with_mass_a\t" << together.scores[0].fragments_with_mass
+            << "\nfragments_with_mass_b\t" << together.scores[1].fragments_with_mass << "\nexposure_term_a\t"
+            << together.scores[0].exposure_term << "\nexposure_term_b\t" << together.scores[1].exposure_term << '\n';
+
+    // ---- 3. per-fragment decomposition ------------------------------------------------------------------
+    const std::size_t u = together.unique_haplotypes;
+    struct Row {
+        std::size_t fragment;
+        double mass_a, mass_b, background, contribution_a, contribution_b, delta;
+    };
+    std::vector<Row> rows;
+    double delta_sum = 0.0;
+    double magnitude = 0.0;
+    for (std::size_t f = 0; f < fragments.size(); ++f) {
+        Row row;
+        row.fragment = f;
+        row.mass_a = panvar::log_add_exp(together.log_mass[f * u + cand_a.first], together.log_mass[f * u + cand_a.second]);
+        row.mass_b = panvar::log_add_exp(together.log_mass[f * u + cand_b.first], together.log_mass[f * u + cand_b.second]);
+        row.background = panvar::log_background_probability(fragments[f]);
+        row.contribution_a = panvar::log_fragment_contribution(row.mass_a, row.background, library);
+        row.contribution_b = panvar::log_fragment_contribution(row.mass_b, row.background, library);
+        row.delta = row.contribution_b - row.contribution_a;
+        delta_sum += row.delta;
+        magnitude += std::abs(row.contribution_a) + std::abs(row.contribution_b);
+        rows.push_back(row);
+    }
+    const double gap = together.scores[1].fragment_term - together.scores[0].fragment_term;
+    const double tolerance = static_cast<double>(fragments.size() + 16) * std::numeric_limits<double>::epsilon() * magnitude;
+    summary << "fragment_term_gap_b_minus_a\t" << gap << "\nsum_of_fragment_deltas\t" << delta_sum
+            << "\ndecomposition_residual\t" << delta_sum - gap << "\ndecomposition_tolerance\t" << tolerance
+            << "\ndecomposition_exact\t" << (std::abs(delta_sum - gap) <= tolerance ? "true" : "false") << '\n';
+
+    std::sort(rows.begin(), rows.end(), [](const Row& x, const Row& y) { return x.delta > y.delta; });
+    const auto best_of = [&](std::size_t f, const panvar::HaplotypeCandidate& c) {
+        const auto& s1 = together.origin_summary[f * u + c.first];
+        const auto& s2 = together.origin_summary[f * u + c.second];
+        return s1.best_log_term >= s2.best_log_term ? std::make_pair(c.first, s1) : std::make_pair(c.second, s2);
+    };
+    const auto describe = [](const panvar::FragmentPlacement& p) {
+        return std::string(p.orientation == panvar::MateOrientation::FirstForward ? "F1" : "F2") + ":" +
+               std::to_string(p.forward_start) + "-" + std::to_string(p.reverse_start) + ":ins" +
+               std::to_string(p.insert_bp) + ":mm" + std::to_string(p.forward_mismatches) + "," +
+               std::to_string(p.reverse_mismatches);
+    };
+    {
+        std::ofstream table(out + ".fragments.tsv");
+        table << std::setprecision(10)
+              << "fragment\tread\tmass_a\tmass_b\tbackground\tcontribution_a\tcontribution_b\tdelta\t"
+                 "origins_a1\torigins_a2\torigins_b1\torigins_b2\tbest_a\tbest_b\tsignal_a\tsignal_b\n";
+        for (const Row& row : rows) {
+            const auto ba = best_of(row.fragment, cand_a);
+            const auto bb = best_of(row.fragment, cand_b);
+            table << row.fragment << '\t' << fragments[row.fragment].first.name << '\t' << row.mass_a << '\t'
+                  << row.mass_b << '\t' << row.background << '\t' << row.contribution_a << '\t' << row.contribution_b
+                  << '\t' << row.delta << '\t' << together.origin_summary[row.fragment * u + cand_a.first].origins << '\t'
+                  << together.origin_summary[row.fragment * u + cand_a.second].origins << '\t'
+                  << together.origin_summary[row.fragment * u + cand_b.first].origins << '\t'
+                  << together.origin_summary[row.fragment * u + cand_b.second].origins << '\t'
+                  << (ba.second.origins ? "h" + std::to_string(ba.first) + ":" + describe(ba.second.best) : "none") << '\t'
+                  << (bb.second.origins ? "h" + std::to_string(bb.first) + ":" + describe(bb.second.best) : "none") << '\t'
+                  << (std::isfinite(row.mass_a) ? "true" : "false") << '\t'
+                  << (std::isfinite(row.mass_b) ? "true" : "false") << '\n';
+        }
+    }
+
+    // ---- 4. signal-only fragments and the 90% set --------------------------------------------------------
+    double only_b_delta = 0.0;
+    double only_a_delta = 0.0;
+    std::size_t only_b_count = 0;
+    std::size_t only_a_count = 0;
+    for (const Row& row : rows) {
+        if (std::isfinite(row.mass_b) && !std::isfinite(row.mass_a)) { ++only_b_count; only_b_delta += row.delta; }
+        if (std::isfinite(row.mass_a) && !std::isfinite(row.mass_b)) { ++only_a_count; only_a_delta += row.delta; }
+    }
+    std::size_t ninety = 0;
+    double cumulative = 0.0;
+    while (ninety < rows.size() && cumulative < 0.9 * gap) cumulative += rows[ninety++].delta;
+    summary << "fragments_signal_only_under_b\t" << only_b_count << "\ndelta_from_signal_only_under_b\t" << only_b_delta
+            << "\nshare_of_gap_signal_only_under_b\t" << only_b_delta / gap << "\nfragments_signal_only_under_a\t"
+            << only_a_count << "\ndelta_from_signal_only_under_a\t" << only_a_delta << "\nsmallest_set_explaining_90pct\t"
+            << ninety << "\nits_delta\t" << cumulative << '\n';
+    std::size_t positive = 0;
+    std::size_t negative = 0;
+    for (const Row& row : rows) {
+        if (row.delta > 1e-9) ++positive;
+        if (row.delta < -1e-9) ++negative;
+    }
+    summary << "fragments_favouring_b\t" << positive << "\nfragments_favouring_a\t" << negative << '\n';
+
+    // ---- 5. true edlib traceback at the block ------------------------------------------------------------
+    std::size_t allele_a = 0;
+    std::size_t allele_b = 0;
+    std::size_t hap_a = 0;   // index into sequences of A's haplotype carrying the differing allele
+    std::size_t hap_b = 0;
+    {
+        std::multiset<std::size_t> in_a = {a.first[block], a.second[block]};
+        std::multiset<std::size_t> in_b = {b.first[block], b.second[block]};
+        for (std::size_t x : {a.first[block], a.second[block]}) {
+            if (in_b.count(x) < in_a.count(x)) allele_a = x;
+        }
+        for (std::size_t x : {b.first[block], b.second[block]}) {
+            if (in_a.count(x) < in_b.count(x)) allele_b = x;
+        }
+        hap_a = a.first[block] == allele_a ? 0 : 1;
+        hap_b = b.first[block] == allele_b ? 2 : 3;
+    }
+    const std::string& seq_a = model.blocks()[block].alleles[allele_a].sequence;
+    const std::string& seq_b = model.blocks()[block].alleles[allele_b].sequence;
+    const SortedGraph truth_graph = load_sorted(args.required("truth-gfa"), reference, out + ".truth.sorted.gfa");
+    std::vector<std::string> truth_blocks;
+    for (const panvar::PathRecord* path : donor_paths(truth_graph.graph, args.required("donor"))) {
+        const auto projection = panvar::project_path_onto_locus(truth_graph.graph, loaded.bubbles, loaded.built.report, path->name);
+        if (!projection.has_value() || !projection->blocks[block].has_value()) throw std::runtime_error("truth has no frame at the block");
+        truth_blocks.push_back(*projection->blocks[block]);
+    }
+    std::size_t truth_index = 0;
+    long best_distance = -1;
+    for (std::size_t t = 0; t < truth_blocks.size(); ++t) {
+        const long d = edit_distance(truth_blocks[t], seq_a);
+        if (best_distance < 0 || d < best_distance) { best_distance = d; truth_index = t; }
+    }
+    const std::string& truth = truth_blocks[truth_index];
+    long d_truth_a = 0;
+    long d_truth_b = 0;
+    long d_a_b = 0;
+    const auto runs_truth_a = edit_runs(truth, seq_a, d_truth_a);
+    const auto runs_truth_b = edit_runs(truth, seq_b, d_truth_b);
+    const auto runs_a_b = edit_runs(seq_a, seq_b, d_a_b);
+    summary << "allele_a\t" << allele_a << "\nallele_b\t" << allele_b << "\nallele_a_bp\t" << seq_a.size()
+            << "\nallele_b_bp\t" << seq_b.size() << "\ntruth_bp\t" << truth.size() << "\nedlib_truth_to_a\t" << d_truth_a
+            << "\nedlib_truth_to_b\t" << d_truth_b << "\nedlib_a_to_b\t" << d_a_b << '\n';
+    {
+        std::ofstream table(out + ".alignments.tsv");
+        table << "pair\top\tquery_pos\ttarget_pos\tlength\n";
+        for (const auto& item : {std::make_pair("truth_to_a", &runs_truth_a), std::make_pair("truth_to_b", &runs_truth_b),
+                                 std::make_pair("a_to_b", &runs_a_b)}) {
+            for (const EditRun& run : *item.second) {
+                table << item.first << '\t' << run.op << '\t' << run.query_pos << '\t' << run.target_pos << '\t' << run.length << '\n';
+            }
+        }
+    }
+
+    // ---- map the dominant fragments onto the differing positions -------------------------------------------
+    const std::size_t dominant_count = std::min<std::size_t>(ninety, 200);
+    const auto block_begin_a = spelled[hap_a].block_intervals[block].begin;
+    const auto block_begin_b = spelled[hap_b].block_intervals[block].begin;
+    const auto a_to_b_positions = [&](bool in_a_coordinates) {
+        std::vector<std::pair<std::size_t, std::size_t>> spans;   // [begin, end) of each differing run
+        for (const EditRun& run : runs_a_b) {
+            const std::size_t begin = in_a_coordinates ? run.query_pos : run.target_pos;
+            const std::size_t length = in_a_coordinates ? (run.op == 'D' ? 0 : run.length) : (run.op == 'I' ? 0 : run.length);
+            spans.emplace_back(begin, begin + std::max<std::size_t>(length, 1));
+        }
+        return spans;
+    };
+    const auto spans_a = a_to_b_positions(true);
+    const auto spans_b = a_to_b_positions(false);
+    const auto overlap = [](const std::vector<std::pair<std::size_t, std::size_t>>& spans, long begin, long end) {
+        std::size_t hits = 0;
+        for (const auto& s : spans) {
+            if (static_cast<long>(s.first) < end && static_cast<long>(s.second) > begin) ++hits;
+        }
+        return hits;
+    };
+    {
+        std::ofstream table(out + ".dominant.tsv");
+        table << "rank\tfragment\tread\tdelta\tsignal_a\tsignal_b\tfootprints_on_a_block\tdiffs_a\tfootprints_on_b_block\tdiffs_b\n";
+        for (std::size_t i = 0; i < dominant_count; ++i) {
+            const Row& row = rows[i];
+            const auto& sa = together.origin_summary[row.fragment * u + all.index_of[hap_a]];
+            const auto& sb = together.origin_summary[row.fragment * u + all.index_of[hap_b]];
+            const std::size_t len1 = fragments[row.fragment].first.bases.size();
+            const auto footprint = [&](const panvar::OriginSummary& s, std::size_t begin,
+                                       const std::vector<std::pair<std::size_t, std::size_t>>& spans, std::size_t& diffs) {
+                if (s.origins == 0) return std::string("none");
+                const long f0 = static_cast<long>(s.best.forward_start) - static_cast<long>(begin);
+                const long r0 = static_cast<long>(s.best.reverse_start) - static_cast<long>(begin);
+                diffs = overlap(spans, f0, f0 + static_cast<long>(len1)) + overlap(spans, r0, r0 + static_cast<long>(len1));
+                return std::to_string(f0) + "," + std::to_string(r0);
+            };
+            std::size_t diffs_a = 0;
+            std::size_t diffs_b = 0;
+            const std::string fa = footprint(sa, block_begin_a, spans_a, diffs_a);
+            const std::string fb = footprint(sb, block_begin_b, spans_b, diffs_b);
+            table << i + 1 << '\t' << row.fragment << '\t' << fragments[row.fragment].first.name << '\t' << row.delta << '\t'
+                  << (std::isfinite(row.mass_a) ? "true" : "false") << '\t' << (std::isfinite(row.mass_b) ? "true" : "false")
+                  << '\t' << fa << '\t' << diffs_a << '\t' << fb << '\t' << diffs_b << '\n';
+        }
+    }
+
+    // ---- 6. accelerated origins against an index-free scan, for the dominant fragments -----------------------
+    const std::size_t checked = std::min<std::size_t>(dominant_count, 40);
+    std::vector<panvar::ReadPair> subset;
+    std::vector<std::size_t> subset_ids;
+    for (std::size_t i = 0; i < checked; ++i) {
+        subset.push_back(fragments[rows[i].fragment]);
+        subset_ids.push_back(i);
+    }
+    panvar::FragmentScoringOptions recording = options;
+    recording.record_origins_for_fragments = subset_ids;
+    const auto recorded = panvar::score_diplotypes(all, {cand_a, cand_b}, subset, library, recording);
+    const panvar::DiscreteInsertDistribution insert = panvar::build_library_insert_distribution(library);
+    std::size_t identity_mismatch = 0;
+    std::size_t mass_mismatch = 0;
+    std::size_t origins_compared = 0;
+    for (std::size_t i = 0; i < checked; ++i) {
+        const panvar::InsertSupport support = panvar::fragment_insert_support(subset[i], library);
+        for (std::size_t h = 0; h < all.sequences.size(); ++h) {
+            auto scanned = scan_origins(all.sequences[h], subset[i], support, band);
+            const auto found = recorded.recorded_origins.find({i, h});
+            auto produced = found == recorded.recorded_origins.end() ? std::vector<panvar::FragmentPlacement>{} : found->second;
+            const auto order = [](const panvar::FragmentPlacement& x, const panvar::FragmentPlacement& y) {
+                return placement_key(x) < placement_key(y);
+            };
+            std::sort(scanned.begin(), scanned.end(), order);
+            std::sort(produced.begin(), produced.end(), order);
+            bool identical = scanned.size() == produced.size();
+            for (std::size_t k = 0; identical && k < scanned.size(); ++k) {
+                identical = placement_key(scanned[k]) == placement_key(produced[k]);
+            }
+            if (!identical) ++identity_mismatch;
+            origins_compared += scanned.size();
+            const double scanned_mass = panvar::log_placement_mass(scanned, subset[i], insert, library, band);
+            const double production_mass = recorded.mass_of(i, h);
+            const double full_mass = together.mass_of(rows[i].fragment, h);
+            const bool masses_agree =
+                (!std::isfinite(scanned_mass) && !std::isfinite(production_mass) && !std::isfinite(full_mass)) ||
+                (std::abs(scanned_mass - production_mass) <= 1e-9 && std::abs(production_mass - full_mass) <= 1e-9);
+            if (!masses_agree) ++mass_mismatch;
+        }
+    }
+    summary << "origin_check_fragments\t" << checked << "\norigin_check_origins\t" << origins_compared
+            << "\norigin_identity_mismatches\t" << identity_mismatch << "\norigin_mass_mismatches\t" << mass_mismatch << '\n';
+
+    // ---- 7. calibration: reads from each allele's diplotype ---------------------------------------------------
+    const double depth = std::stod(args.get("depth", "30"));
+    for (const auto& item : {std::make_pair(std::string("from_a"), std::vector<std::string>{sequences[0], sequences[1]}),
+                             std::make_pair(std::string("from_b"), std::vector<std::string>{sequences[2], sequences[3]})}) {
+        const auto reads = simulate_from(item.second, library, depth, fragments.front().first.bases.size(),
+                                         item.first == "from_a" ? 811 : 812);
+        const auto scored = panvar::score_diplotypes(all, {cand_a, cand_b}, reads, library, options);
+        const double calibration_gap = scored.scores[1].fragment_term - scored.scores[0].fragment_term;
+        const bool expected = item.first == "from_a" ? calibration_gap < 0.0 : calibration_gap > 0.0;
+        summary << "calibration_" << item.first << "_fragments\t" << reads.size() << "\ncalibration_" << item.first
+                << "_gap_b_minus_a\t" << calibration_gap << "\ncalibration_" << item.first << "_prefers_generator\t"
+                << (expected ? "true" : "false") << '\n';
+    }
+
+    // ---- 8. mismatch band, diagnostic only -----------------------------------------------------------------------
+    for (const std::size_t trial : {3, 4, 5, 6, 7}) {
+        panvar::FragmentScoringOptions banded = options;
+        banded.mismatch_band = trial;
+        const auto scored = panvar::score_diplotypes(all, {cand_a, cand_b}, fragments, library, banded);
+        summary << "band_" << trial << "_gap_b_minus_a\t" << scored.scores[1].fragment_term - scored.scores[0].fragment_term
+                << "\nband_" << trial << "_fragments_with_mass_a\t" << scored.scores[0].fragments_with_mass
+                << "\nband_" << trial << "_fragments_with_mass_b\t" << scored.scores[1].fragments_with_mass << '\n';
+    }
+    std::cout << "compared " << block_id << ": gap " << gap << ", decomposition residual " << delta_sum - gap << '\n';
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     try {
         if (argc < 2) {
-            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate --key value ...\n";
+            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare --key value ...\n";
             return 2;
         }
         const std::string command = argv[1];
@@ -611,6 +1141,7 @@ int main(int argc, char** argv) {
         if (command == "simulate") return simulate(args);
         if (command == "loo-gfa") return loo_gfa(args);
         if (command == "evaluate") return evaluate(args);
+        if (command == "compare") return compare(args);
         std::cerr << "unknown probe command: " << command << '\n';
         return 2;
     } catch (const std::exception& error) {

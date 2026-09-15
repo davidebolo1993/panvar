@@ -5,9 +5,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace panvar {
@@ -186,6 +188,17 @@ struct FragmentScoringOptions {
     std::uint64_t max_physical_origins = 500000000ULL;
     std::uint64_t max_state_classes = 200000000ULL;
     std::uint64_t max_mass_cells = 200000000ULL;
+    // Diagnostics only; nothing here enters a score or a ranking. When set, the result carries for
+    // every (fragment, haplotype) the accepted physical-origin count and the single highest-mass origin,
+    // and for the listed fragments every accepted origin.
+    bool record_origin_summary = false;
+    std::vector<std::size_t> record_origins_for_fragments;
+};
+
+struct OriginSummary {
+    std::uint64_t origins = 0;
+    FragmentPlacement best;
+    double best_log_term = -std::numeric_limits<double>::infinity();
 };
 
 // Measured work, not estimated viability. `candidate_bases_scanned` counts haplotype bases actually
@@ -224,6 +237,10 @@ struct FragmentScoringResult {
     std::vector<double> exposure;
     std::size_t unique_haplotypes = 0;
     FragmentScoringCounters counters;
+    // Filled only when requested in FragmentScoringOptions; same row-major layout as log_mass.
+    std::vector<OriginSummary> origin_summary;
+    // (fragment, haplotype) -> every accepted origin, for record_origins_for_fragments only.
+    std::map<std::pair<std::size_t, std::size_t>, std::vector<FragmentPlacement>> recorded_origins;
 
     double mass_of(std::size_t fragment, std::size_t haplotype) const;
 };
