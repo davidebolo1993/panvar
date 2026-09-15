@@ -307,7 +307,7 @@ void test_homozygote_counts_two_copies() {
     const double one_copy = panvar::haplotype_exposure(
         a.size(), panvar::build_library_insert_distribution(model), 55);
     require_close(result.scores[0].exposure_term,
-                  -model.fragment_start_intensity * 2.0 * one_copy, 1e-9,
+                  -(1.0 - model.outlier_weight) * model.fragment_start_intensity * 2.0 * one_copy, 1e-9,
                   "a homozygote is exposed as two chromosome copies");
     require(one_copy > 0.0, "exposure must be positive, or the gate above is vacuous");
 }

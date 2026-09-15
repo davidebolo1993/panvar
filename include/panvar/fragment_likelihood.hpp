@@ -104,6 +104,15 @@ double log_fragment_contribution(
     double log_background,
     const LibraryModel& library);
 
+// The candidate-dependent part of the integrated intensity, which is what the -E term of the score
+// must be. The per-fragment intensity is the superposition of a signal process,
+// (1-eta) * lambda * (M_a + M_b), and a background process, eta * P_background(f). Integrated over
+// every possible observation the signal gives (1-eta) * lambda * (E_a + E_b) and the background gives
+// eta per read-length class, the same for every candidate and therefore dropped. The (1-eta) factor
+// is NOT candidate-independent: scoring with lambda * (E_a + E_b) instead ranks haplotypes of different
+// lengths against a density that does not integrate to its own exposure.
+double expected_signal_fragments(double exposure_sum, const LibraryModel& library);
+
 // ---------------------------------------------------------------------------------------------
 // Reference implementation.
 // ---------------------------------------------------------------------------------------------

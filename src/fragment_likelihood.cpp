@@ -165,6 +165,11 @@ double log_fragment_contribution(
     return log_add_exp(signal, std::log(library.outlier_weight) + log_background);
 }
 
+double expected_signal_fragments(double exposure_sum, const LibraryModel& library) {
+    validate_library_model(library);
+    return (1.0 - library.outlier_weight) * library.fragment_start_intensity * exposure_sum;
+}
+
 std::vector<FragmentPlacement> enumerate_placements_exhaustive(
     const std::string& haplotype,
     const ReadPair& fragment,
@@ -656,7 +661,7 @@ FragmentScoringResult score_diplotypes(
         DiplotypeScore& score = result.scores[c];
         // A homozygote names the same haplotype twice and therefore counts two chromosome copies in
         // both terms, which is what the fragment contract requires.
-        score.exposure_term = -library.fragment_start_intensity * (exposure[a] + exposure[b]);
+        score.exposure_term = -expected_signal_fragments(exposure[a] + exposure[b], library);
         score.absolute_term_sum = std::abs(score.exposure_term);
         double fragment_term = 0.0;
         for (std::size_t f = 0; f < fragments.size(); ++f) {

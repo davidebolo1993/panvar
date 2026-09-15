@@ -434,6 +434,65 @@ void test_signal_density_integrates_to_exposure() {
     }
 }
 
+
+// The complete intensity -- signal plus background -- summed over every observation must equal the
+// score's integrated intensity: (1-eta) * lambda * E for the signal, plus eta for the background of this
+// single read-length class. The outlier weight is large here so that the pre-review exposure term,
+// lambda * E without the (1-eta) factor, is visibly wrong and restoring it fails this gate.
+void test_complete_intensity_integrates() {
+    const std::string haplotype = "ACGTTGCAAGTCCA";
+    panvar::LibraryModel model;
+    model.insert_mean_bp = 8.0;
+    model.insert_sd_bp = 2.0;
+    model.support_sigmas = 2.0;
+    model.substitution_error = 0.1;
+    model.outlier_weight = 0.25;
+    model.fragment_start_intensity = 0.4;
+    model.provenance = "fixture: declared";
+    const panvar::DiscreteInsertDistribution insert = panvar::build_library_insert_distribution(model);
+    const std::size_t mate = 3;
+    const std::size_t band = 1;
+    const double exposure = panvar::haplotype_exposure(haplotype.size(), insert, mate);
+
+    // One chromosome copy: the signal density of a single haplotype.
+    double total = 0.0;
+    for (std::size_t code1 = 0; code1 < 64; ++code1) {
+        for (std::size_t code2 = 0; code2 < 64; ++code2) {
+            std::string r1(mate, 'A');
+            std::string r2(mate, 'A');
+            for (std::size_t i = 0; i < mate; ++i) {
+                r1[i] = "ACGT"[(code1 >> (2 * i)) & 3];
+                r2[i] = "ACGT"[(code2 >> (2 * i)) & 3];
+            }
+            const panvar::ReadPair fragment{read("o/1", r1), read("o/2", r2)};
+            const auto placements = panvar::enumerate_placements_exhaustive(
+                haplotype, fragment, panvar::fragment_insert_support(fragment, model), band);
+            const double mass = panvar::log_placement_mass(placements, fragment, insert, model, band);
+            total += std::exp(panvar::log_fragment_contribution(
+                mass, panvar::log_background_probability(fragment), model));
+        }
+    }
+    const double signal = panvar::expected_signal_fragments(exposure, model);
+    require_close(total, signal + model.outlier_weight, 1e-9,
+                  "signal plus background intensity must integrate to (1-eta)*lambda*E + eta");
+    const double unnormalised = model.fragment_start_intensity * exposure;
+    require(std::abs(unnormalised + model.outlier_weight - total) > 1e-3,
+            "fixture: lambda*E without (1-eta) must disagree with the integrated intensity");
+
+    // The scorer's exposure term is exactly the candidate-dependent part of that integral.
+    const std::vector<panvar::ReadPair> fragments = {
+        {read("f/1", haplotype.substr(0, mate)), read("f/2", revcomp(haplotype.substr(6, mate)))}};
+    panvar::FragmentScoringOptions options;
+    options.mismatch_band = band;
+    options.minimum_piece_bp = 1;
+    const panvar::FragmentScoringResult scored = panvar::score_diplotypes(
+        panvar::intern_haplotypes({panvar::MosaicPath{{0}}}, {haplotype}), {{0, 0}}, fragments, model, options);
+    require_close(scored.scores[0].exposure_term, -2.0 * signal, 1e-12,
+                  "a homozygote's exposure term must be minus the integrated signal of two copies");
+    std::cout << "  complete intensity: summed " << total << " = (1-eta)*lambda*E + eta "
+              << signal + model.outlier_weight << '\n';
+}
+
 } // namespace
 
 int main() {
@@ -450,6 +509,7 @@ int main() {
         test_order_and_uniqueness();
         test_truncated_emission_normalises();
         test_signal_density_integrates_to_exposure();
+        test_complete_intensity_integrates();
         std::cout << "genotype fragment oracle: PASS\n";
         return 0;
     } catch (const std::exception& error) {

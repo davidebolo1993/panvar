@@ -154,10 +154,15 @@ separately in the output. Version one has no such term.
 The exact fragment contract is:
 
 ```text
--lambda * (E_a + E_b)
+-(1-eta) * lambda * (E_a + E_b)
 + sum_f log((1-eta) * lambda * (M_f,a + M_f,b) + eta * P_background(f))
 + exact_LS_log_prior(a,b)
 ```
+
+The intensity inside the logarithm is a superposition of a signal process and a background process.
+Its integral over every observation is `(1-eta) * lambda * (E_a + E_b)` plus a candidate-independent
+background term, so the exposure term carries the `(1-eta)` factor (review round 3; gated by summing
+the complete intensity over every observation of a tiny locus).
 
 where:
 

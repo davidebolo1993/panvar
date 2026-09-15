@@ -235,9 +235,11 @@ int simulate(const Args& args) {
     library.support_sigmas = std::stod(args.get("sigmas", "4"));
     library.substitution_error = std::stod(args.get("error", "0.002"));
     library.outlier_weight = std::stod(args.get("outlier", "0.001"));
-    // Templates per base per chromosome copy, summed over both orientations: per-copy coverage is
-    // depth/2, and each template contributes two mates of read_length bases.
-    library.fragment_start_intensity = (depth / 2.0) / (2.0 * static_cast<double>(read_length));
+    // Signal templates per base per chromosome copy, summed over both orientations: per-copy coverage is
+    // depth/2, and each template contributes two mates of read_length bases. The declared lambda is that
+    // rate divided by (1-eta), because the likelihood's signal intensity is (1-eta) * lambda.
+    const double signal_rate = (depth / 2.0) / (2.0 * static_cast<double>(read_length));
+    library.fragment_start_intensity = signal_rate / (1.0 - library.outlier_weight);
     library.provenance = "simulation";
     panvar::validate_library_model(library);
     const panvar::DiscreteInsertDistribution insert =
@@ -273,14 +275,14 @@ int simulate(const Args& args) {
                               static_cast<double>(haplotype.size() - i + 1));
         }
         const double exposure = panvar::haplotype_exposure(haplotype.size(), insert, read_length);
-        std::poisson_distribution<long> count_draw(library.fragment_start_intensity * exposure);
+        std::poisson_distribution<long> count_draw(signal_rate * exposure);
         std::discrete_distribution<std::size_t> length_draw(weights.begin(), weights.end());
         std::bernoulli_distribution orientation_draw(0.5);
         std::uniform_real_distribution<double> unit(0.0, 1.0);
         const long templates = count_draw(rng);
         manifest << "haplotype_" << p << "\t" << paths[p]->name << "\nhaplotype_" << p << "_bp\t"
                  << haplotype.size() << "\nhaplotype_" << p << "_expected_templates\t"
-                 << library.fragment_start_intensity * exposure << "\nhaplotype_" << p
+                 << signal_rate * exposure << "\nhaplotype_" << p
                  << "_templates\t" << templates << '\n';
 
         const auto mutate = [&](std::string& read) {
