@@ -4,6 +4,296 @@ Companion to `genotype_mosaic.md`, which remains the authoritative contract. Thi
 what is actually built, what its own gates still owe, and the work order to reach the Phase 8
 go/no-go.
 
+## R5. Review round 5 — floor, harness, NA19240 rerun and the development ladder
+
+The reviewer accepted the round-4 diagnosis: the scorer is internally consistent, and the substitution-only
+model is inadequate for some leave-one-out indel alternatives. LZO may proceed once one blocker is
+fixed, following a nine-step sequence. This section records steps 1–8. The held-out cohort (step 8) ran and surfaced three findings that need review before its result is reported (R5.8–R5.10).
+Step 9, the multi-donor LOO ladder, is deferred as the reviewer ruled.
+
+Commits:
+
+| Commit | Content |
+|---|---|
+| `8ca8ff6` | One marker background floor, from depth fit to proposal scoring (step 1) |
+| `203fc4e` | Development candidate-prefix harness, gated against standalone runs (step 5) |
+| `28bbc3e` | Probe availability and no-call diagnostics, the `genotype` probe subcommand, the ladder driver (steps 4, 6) |
+| `4488ebf` | Ladder selection script (step 7) |
+| `aa76641` | Held-out cohort driver (step 8) |
+
+Round 4's wording is corrected: the likelihood unit is the paired-end fragment, and R4 now says
+"fragments" throughout.
+
+### R5.1 One marker background floor (step 1)
+
+The depth fit floored its background at 1e-9. The command then raised it to 1e-6 before building proposal
+emissions (`genotype_command.cpp:457`, `std::max(depth.background, 1e-6)`). At an observed marker that a
+candidate gives zero copies, each observation contributes `log(background)`, so that silent change moved
+such scores by log(1000) = 6.9 nats per observation.
+
+- `kMarkerBackgroundFloor = 1e-6` is now the model's only floor.
+  - The fit keeps its background at or above it.
+  - A declared background below it is refused; the declared-zero closed form is removed.
+  - Proposal emissions refuse a background below it.
+  - `proposal_marker_parameters` passes the fitted or declared background through unchanged.
+- The status reports `marker_background_floor` and `marker_background_effective`.
+- 1e-6 is the value round-3 proposal scoring already used. The NA19240 rerun therefore changes only the
+  depth fit.
+- **Gate.** The boundary fit ends on the floor, and the proposal parameters carry its background and rate
+  exactly. The fixture has AAC and ACC each observed once and absent from a-rich/a-rich.
+  - The mixed/mixed versus a-rich/a-rich contrast equals the Poisson kernels at the fitted background.
+  - A 1000-fold background change moves it by 2·log(1000).
+  - A background below the floor is refused.
+  - End to end, the status reports the floor, and the effective background equals the fitted one.
+- The real-C4 negative-intercept depth gate now reports background 1e-06; the other regimes are unchanged.
+
+### R5.2 Clean worktree and NA19240 rerun (steps 2–3)
+
+- **Build.** Isolated worktree at `8ca8ff6`, with submodules checked out at their pinned commits from the
+  local checkouts, Release build. The tree is clean before and after the build, and all 16 tests pass.
+- **Rerun.** `tests/genotype_probe_c4.sh`, same simulation and seed as rounds 2–4. The signature records
+  `git_tree_dirty false`.
+
+Every status reports `marker_depth_termination boundary_kkt`, rate 9.76988 and background 1e-6.
+
+**Leave-zero-out, 1,024 merged states:**
+
+| K | Status | Found | Pruned | Phase | Contenders | Exact | Distance | Winner |
+|---|---|---|---|---|---|---|---|---|
+| 8 | COMPLETE | 593 | 41,338,362 | PRIOR_ONLY | 2 | 11/11 | 0 | `285553cdf54d` |
+| 16 | COMPLETE | 593 | 41,338,362 | PRIOR_ONLY | 2 | 11/11 | 0 | same |
+| 32 | COMPLETE | 593 | 41,338,362 | PRIOR_ONLY | 3 | 11/11 | 0 | same |
+| 64 | COMPLETE | 593 | 41,338,362 | PRIOR_ONLY | 3 | 11/11 | 0 | same |
+| 128 | COMPLETE | 593 | 41,338,362 | PRIOR_ONLY | 3 | 11/11 | 0 | same |
+| 256 | COMPLETE | 593 | 41,338,362 | PRIOR_ONLY | 3 | 11/11 | 0 | same |
+
+What the corrected depth changed:
+
+- **The candidate set.** 593 diplotypes found, where round 3 found 561, with a different pruning count.
+- **Not the winner.** It is byte-identical to round 3 at every K, and exact at every block.
+- **Phase at K = 8.** It is now PRIOR_ONLY (2 contenders) where round 3 had READS; all 11 block genotypes
+  remain read-supported.
+
+**Leave-one-out** (NA19240 removed):
+
+| K | Status | Exact | Distance | Floor | Excess | Winner | Floor attained | Closest candidate: proposal rank, fragment gap, total gap |
+|---|---|---|---|---|---|---|---|---|
+| 64 | COMPLETE | 8/11 | 18 | 4 | 14 | `9ed92c5a` | yes | 1, 2,871.163, 2,863.035 |
+| 256 | COMPLETE | 8/11 | 18 | 4 | 14 | `9ed92c5a` | yes | 1, 2,871.163, 2,863.035 |
+
+- **K = 64 now makes the allele-11 call.** In round 3 it made the floor call (excess 0). That result
+  depended on the unconverged depth fit.
+- **The floor-attaining candidate is proposal rank 1.** The likelihood places it 2,871.163 fragment-term
+  nats below the winner, the round-4 gap. With the proposal corrected, what remains is only the model
+  misspecification R4 identified.
+- **LOO is now stable across K, and consistently over the floor.**
+
+### R5.3 LOO availability diagnostics and no-call metrics (step 4)
+
+`genotype_probe evaluate` now reports the following. Everything that reads the truth is evaluation-only
+and never enters a call.
+
+- **Availability.** `availability_floor`, `minimum_candidate_distance`, `floor_attained_in_candidates`,
+  `closest_candidate_proposal_rank`, `closest_candidate_fragment_gap_to_winner`,
+  `closest_candidate_total_score_gap_to_winner` and `winner_excess_over_floor`. When several candidates
+  attain the minimum, the highest-scoring one is compared.
+- **Calls.** `run_no_call` means no genotype result exists. `block_unsupported` and `phase_unsupported`
+  are reported separately and not counted as no-calls.
+- **Accuracy.** Reported over every emitted block, and again over read-supported blocks only
+  (`read_supported_blocks_exact`, `read_supported_unordered_distance_total`,
+  `read_supported_excess_over_floor_total`), with SV and context distance apart.
+
+**Checked against a known answer.** On the round-3 LOO K = 256 run, it names the K = 64 winner at proposal
+rank 2 and distance 4 (the floor), with a fragment gap of 2,871.163 — the round-4 decomposition.
+
+### R5.4 K prefixes equal standalone K (step 5)
+
+`GenotypeCommandOptions::development_candidate_prefixes` is not a command-line option. It computes the
+model, markers and proposal once. Each prefix k then passes through the same post-proposal code a
+standalone run uses: refusal, spelling, exact prior, certified rescoring and every output.
+
+- `unique_target_reached` and `candidate_set_conditional` are recomputed for k.
+- Neither the beam's pruning nor its ordering reads the target.
+- The production refusal rule applies to each prefix.
+
+**Gate on the phaseable fixture.** Prefixes 2, 4, 16 and 64 must match standalone runs byte for byte:
+manifest, scores, block calls, haplotypes, and status apart from stage timings.
+
+| Merged-state limit | Prefixes that call | Prefixes refused | Identical to standalone |
+|---|---|---|---|
+| 64 | 2 | 2 | all four |
+| exhaustive | 4 | 0 | all four |
+
+Forcing every prefix conditional makes the gate fail.
+
+**Real-data check.** At state limit 1,024 the ladder's extracted NA19240 K = 64 (commit `28bbc3e`) matches
+the standalone K = 64 run from the clean rerun (commit `8ca8ff6`). The manifest, scores, genotypes, block
+calls and haplotypes are identical byte for byte. The status files differ only in their input paths (the
+`gfa` and library provenance), apart from stage timings. Both runs used the same reads.
+
+### R5.5 The development LZO ladder (step 6)
+
+The run:
+
+- `tests/genotype_ladder_c4.sh`, from a clean worktree at `28bbc3e`; `git_tree_dirty false`.
+- The eight manifest development donors, seed 7, 30× depth.
+- Merged-state limits 256, 1,024 and 4,096.
+- One proposal per limit, with K prefixes 8, 16, 32, 64, 128 and 256, and every prefix evaluated.
+
+That is 144 prefix runs.
+
+| Donor | Found at 256 / 1,024 / 4,096 | Winner identical wherever complete | Block calls identical | Distance, excess | K = 256 at state limit 256 |
+|---|---|---|---|---|---|
+| HG00733 | 138 / 661 / 2,952 | yes | yes | 0, 0 | refused (found < 256) |
+| HG02666 | 224 / 819 / 2,677 | yes | yes | 0, 0 | refused |
+| HG02818 | 256 / 1,024 / 4,096 | yes | yes | 0, 0 | complete |
+| HG03371 | 256 / 1,024 / 4,045 | yes | yes | 0, 0 | complete |
+| HG04036 | 256 / 1,024 / 4,006 | yes | yes | 0, 0 | complete |
+| NA19036 | 256 / 1,024 / 3,946 | yes | yes | 0, 0 | complete |
+| NA19240 | 140 / 593 / 3,016 | yes | yes | 0, 0 | refused |
+| NA20509 | 224 / 872 / 3,376 | yes | yes | 0, 0 | refused |
+
+"Found" counts unique diplotypes; no search at any limit was exhaustive.
+
+- **Every completed setting is correct.** It is exact at every block (11/11, and 5/5 SV blocks), and each
+  donor's winner is byte-identical across all 18 settings where it completed.
+- **The only refusals are expected.** Four donors refused K = 256 at state limit 256, because a pruned
+  search found fewer than 256 candidates. The production rule refused them and the harness recorded it.
+- **Marker depth converged in every run:** `boundary_kkt` for seven donors, `interior_stationary` for
+  HG03371.
+- **Runtime.** A proposal plus six ranked prefixes took at most 144, 151 and 157 s at the three limits,
+  with peak RSS at most 436, 424 and 442 MB. Wall time sums over donors to 730, 1,041 and 1,122 s.
+
+**Phase support is not stable in K.** The selection rule ignores phase, but the ladder shows READS phase
+at small K is not always confirmed by a larger candidate set:
+
+- HG04036 is READS at K = 8 and 16 (state limits 1,024 and 4,096), and PRIOR_ONLY from K = 32.
+- HG00733 is READS only at state limit 256 with K = 8.
+
+A small K can drop the rival that makes phase a fragment tie. Block genotypes are unaffected: every rival
+carries the same block calls.
+
+### R5.6 Selection and freeze (step 7)
+
+`scripts/select_genotype_ladder.py` reads the ladder table and each run's block calls, never truth distance.
+
+- **Rule.** For each donor the reference is state limit 4,096 at K = 256. A setting is stable when every
+  setting at or above it in both dimensions completed with the reference winner and unordered block calls.
+- **Extension check.** No donor disagreed between 1,024 and 4,096, so none was extended to 8,192.
+- **Result.** At state limit 256, the refused K = 256 prefix makes every smaller K unstable for four donors.
+  At state limit 1,024 every K is stable for all eight. The selection is **state limit 1,024, K = 8**.
+
+Frozen in `tests/genotype_frozen_settings.tsv` (commit `b1684ae`), before any held-out donor was simulated.
+It is committed together with a declared **audit**: the cohort also ranks each donor's proposal at
+K = 256, and reports separately whether the K = 8 winner and block calls, and any READS phase, survive
+there. The audit exists because of the phase instability above, and it never changes a primary call.
+
+The cohort driver is `tests/genotype_cohort_c4.sh`. It was smoke-tested on NA19240, a development donor,
+into a scratch directory, to check its collection and aggregate; that run is not part of the cohort.
+
+### R5.7 The held-out leave-zero-out cohort (step 8)
+
+**Setup.**
+
+- `tests/genotype_cohort_c4.sh`, from a clean worktree at `b1684ae`; `git_tree_dirty false`.
+- The 56 held-out donors, seed 7, 30× depth.
+- Frozen settings: state limit 1,024, K = 8, with the declared K = 256 audit.
+
+**Collection.** It stopped at NA20355, because of a harness bug fixed in `5d179d2`: a refusal before the
+prefix loop left no per-prefix files. The table below was re-collected from the unchanged run outputs with
+the fixed collection step.
+
+| Quantity | Value |
+|---|---|
+| Donors | 56 |
+| Run no-calls | 1 (NA20355, R5.9) |
+| Called | 55 |
+| Block genotypes emitted, exact | 605, **601** |
+| SV block genotypes, exact | 275, 272 |
+| Read-supported blocks, exact | 604, 600 |
+| Block genotypes not read-supported | 1 (NA19384 `ctx:0`, correct, PRIOR_ONLY) |
+| Unordered distance (SV, context) | 120 (119, 1) |
+| Availability floor, excess | 0, **120 in 4 donors** |
+| Truth diplotype proposed within K = 8 | 51 of 55, at proposal and score rank 1 in all 51 |
+| Globally certified | 0 (every search was pruned) |
+| Audit K = 256: same winner, same block calls | 55 / 55, 55 / 55 |
+| READS phase at K = 8; still READS at K = 256 | 10; **1** |
+| Depth fit termination | 40 `boundary_kkt`, 15 `interior_stationary`, 1 `no_ascent` |
+| Per run: wall time, peak RSS, candidates found | median 57 s (max 87); median 441 MB (max 516); median 992 (564–1,024) |
+
+Per-run wall time covers one proposal and both ranked prefixes.
+
+**The cohort surfaced three findings that need review** before this is reported as a result (R5.8–R5.10).
+No code has been changed for any of them.
+
+### R5.8 Finding 1 — four panel-template truths were never proposed
+
+| Donor | Wrong block | Truth alleles (bp) | Called alleles (bp) | Distance | Certified gap (nats) | Phase at K = 8 |
+|---|---|---|---|---|---|---|
+| HG01573 | `ctx:4` | 374 / 374 | 374 / 374 | 1 | 8.36 | PRIOR_ONLY |
+| HG02492 | `sv:3` | 244 / 244 | 244 / 244 | 1 | **0.0005** | PRIOR_ONLY |
+| HG04217 | `sv:5` | 117 / 0 | 0 / 117 | 1 | 37.39 | READS |
+| NA19331 | `sv:5` | 117 / 117 | 117 / 0 | 117 | **0.27** | PRIOR_ONLY |
+
+**What the cohort run shows.** In all four, the truth is absent from the candidates at K = 8 and at
+K = 256. The winner is the candidate closest to the truth: its gaps to the closest candidate are 0.
+
+**Post-freeze diagnostics.** These are labelled diagnostics, not cohort results, run on the same reads
+with the `b1684ae` build under `tests/results/genotype_cohort_c4_b1684ae_postfreeze_diagnostics/`:
+
+- At state limit 1,024, ranking every candidate the proposal found (994–1,024): the truth is absent, and
+  the winner is unchanged.
+- At state limit 4,096 (3,972–4,024 found), ranking the top 256: the truth is absent, and the winner is
+  unchanged.
+
+**What this establishes.**
+
+- In LZO the truth is a pair of panel templates, reachable with no switch. It is not among the ~1,000
+  proposals at 1,024 states, nor among the top 256 of ~4,000 at 4,096. The fragment likelihood never saw it.
+- Three of the errors are single bases in an equal-length allele. The fourth is a whole 117 bp SV allele,
+  and it is certified by 0.27 nats.
+- **The development ladder could not detect this.** Its rule measures stability, and a truth that is
+  never proposed is stably absent. All eight development donors had the truth at rank 1.
+
+**Not established:** why the proposal misses a zero-switch panel pair. One unverified possibility for the
+single-base cases is that no syncmer discriminates the two alleles, so their marker emissions tie and
+prior mass decides what survives the beam. That would not explain NA19331, whose 117 bp difference should
+be visible to markers.
+
+### R5.9 Finding 2 — a false depth-fit refusal (NA20355)
+
+- **The fit.** It stopped at `no_ascent` after 4 iterations: rate 9.82334, background 0.0745, gradients
+  0.00224 (background) and 0.00450 (rate), log-likelihood 1,002,762.31.
+- **The test.** Interior stationarity requires |g_bg| ≤ 1e-9 · n = 2.5e-5 for 25,167 anchors. The
+  background gradient is about 90× that, which is 9e-8 per anchor.
+- **Likely cause.** At a log-likelihood near 1e6, the gain the Newton step still offers is below double
+  precision, so backtracking finds no strict ascent. The tolerance, introduced in `2d5673d`, is tighter
+  than the arithmetic can resolve.
+- **Status.** Not yet verified or fixed. It is the cohort's only run no-call.
+
+### R5.10 Finding 3 — phase support at K = 8 over-claims
+
+- Ten donors report READS phase at K = 8. When the same proposal is ranked at K = 256, nine of them become
+  PRIOR_ONLY, because a fragment contender outside the top 8 appears.
+- Winners and block genotypes are identical at both K for all 55. Only the phase claim is affected.
+- This matches the development ladder (HG04036), and is why the audit was declared.
+
+### R5.11 Questions for the reviewer
+
+1. **Finding 1.** Is the cohort reportable as it stands (601/605 blocks exact; excess in 4 of 55), or
+   blocked until the proposal miss is understood? The proposed next diagnostic compares the truth pair and
+   the winner on proposal emission and exact prior, block by block, then checks whether the truth path is
+   pruned in the beam or never competitive.
+2. **Finding 2.** Replace the absolute gradient tolerance with a criterion the arithmetic can meet, such as
+   a relative gradient or a Newton decrement at the log-likelihood's floating-point resolution? The gate
+   would reproduce NA20355's anchor counts. After the fix, is rerunning NA20355 part of the cohort, or a
+   diagnostic?
+3. **Finding 3.** Should READS phase require survival at a larger K, or should phase be reported only from
+   a larger candidate set (K = 32 was stable on the development donors)?
+4. **Near-zero certified gaps.** Two wrong calls are certified by 0.0005 and 0.27 nats, because
+   certification only guards floating-point error. Should a call also require a minimum modelled gap, or
+   report such calls as ties?
+
 ## R4. Review round 4 — diagnostic response
 
 The reviewer made six rulings and set eight bounded diagnostic steps, closing with "Stop and report after
@@ -141,24 +431,24 @@ candidate. The window columns search for the truth-haplotype-1 bytes within ±30
 \* A repeat-unit indel can be placed anywhere in the repeat. This ±30 bp window happens to fall where every
 haplotype spells the same bytes.
 
-- **Where allele 11 differs, reads survive.** Only 3 of 107 spanning fragments lose all signal. Hamming
+- **Where allele 11 differs, fragments survive.** Only 3 of 107 spanning fragments lose all signal. Hamming
   placement tolerates the (AAAG)n shifts and the substitution within the band. At 24,150, 39,637 and 45,808
-  the shared homologue also spells the truth bytes and absorbs the reads that the differing allele cannot
+  the shared homologue also spells the truth bytes and absorbs the fragments that the differing allele cannot
   hold (9 of 16, and 22 of 27).
-- **Where allele 8 differs, reads are lost.** 14 of 22 spanning fragments lose all signal. The shared
+- **Where allele 8 differs, fragments are lost.** 14 of 22 spanning fragments lose all signal. The shared
   homologue does not carry the truth bytes at 40,769, so nothing absorbs them. They fall to the background
   arm at about 270 nats each; 14 × 270 ≈ 3,800 matches the 3,815.5 nats measured.
 - **The contrast between the two poly-A sites is the homologue, not homopolymer mechanics.** Both are 1-bp
-  slips at the end of a 25 bp poly-A, yet they lose 1 of 16 and 14 of 22 reads. At 39,637 the donor's other
+  slips at the end of a 25 bp poly-A, yet they lose 1 of 16 and 14 of 22 fragments. At 39,637 the donor's other
   haplotype spells the local truth; at 40,769 it does not.
 - **Not measured:** why 8 of the 22 fragments at 40,769 keep a placement on allele 8. Presumably the site
-  falls close enough to a read end for the shifted tail to stay within the band.
+  falls close enough to a mate's end for the shifted tail to stay within the band.
 
 **Conclusion.** The substitution-only likelihood counts fragments lost to background; edlib counts bases.
 Allele 11 is 16 bases from the truth, but its differences are either Hamming-tolerable or covered by the
 homologue. Allele 8 is 2 bases away, but its one uncovered indel costs 14 fragments. The two rankings
 therefore disagree. The effect is specific to LOO, where the truth allele is absent and the nearest
-available alleles differ from it by indels. In LZO the truth allele is present and places every read.
+available alleles differ from it by indels. In LZO the truth allele is present and places every fragment.
 
 ### R4.5 Corrections to round 3
 
