@@ -54,6 +54,11 @@ struct GenotypeCommandOptions {
     // with max_candidates = k uses: K only truncates the final proposal ordering. Every candidate a
     // prefix contains is scored; the production refusal rule still applies to each k.
     std::vector<std::size_t> development_candidate_prefixes;
+    // Not a command-line option. When positive (and larger than every primary candidate set), the same proposal
+    // and scores are also ranked with this many mosaics, and read-supported phase is reported READS_AUDITED only
+    // if that larger set agrees on the winner, the block genotypes and read-supported phase. Without an audit a
+    // read-supported phase is READS_WITHIN_CANDIDATES.
+    std::size_t phase_audit_candidates = 0;
 };
 
 // A run that cannot complete emits its diagnostics and says so. It never presents a partial ranking
@@ -67,6 +72,13 @@ enum class GenotypeRunStatus {
 };
 
 const char* genotype_run_status_name(GenotypeRunStatus status);
+
+// The phase claim after an audit. A read-supported phase within the primary candidates becomes READS_AUDITED
+// only when the audit set was ranked to completion, agrees on the winner and on every block genotype, and is
+// itself read-supported; with the same call but a phase tie there it is PRIOR_ONLY; otherwise UNRESOLVED. Any
+// other primary claim is unchanged. Exposed for its gate.
+std::string audited_phase_support(const std::string& within_candidates, bool audit_complete, bool same_winner,
+                                  bool same_block_genotypes, const std::string& audit_phase_support);
 
 GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options);
 

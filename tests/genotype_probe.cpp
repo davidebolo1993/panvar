@@ -462,6 +462,8 @@ int evaluate(const Args& args) {
     std::vector<std::size_t> hap2;
     std::map<std::string, std::string> genotype_support;
     const std::string phase_support = status.count("phase_support") ? status.at("phase_support") : "NA";
+    // Phase-aware accuracy only where the reads chose the phase: within the candidates, or audited.
+    const bool phase_claimed = phase_support == "READS_WITHIN_CANDIDATES" || phase_support == "READS_AUDITED";
     if (complete) {
         for (const auto& row : read_table(run + ".block_genotypes.tsv")) {
             genotype_support[row.at("block_id")] = row.at("genotype_support");
@@ -578,9 +580,9 @@ int evaluate(const Args& args) {
                 << "\nexcess_over_floor_total\t" << unordered_total - floor_total
                 // Phase-aware accuracy only where the reads chose the phase.
                 << "\nphased_distance_total\t"
-                << (phase_support == "READS" ? std::to_string(std::min(order_a, order_b)) : std::string("NA"))
+                << (phase_claimed ? std::to_string(std::min(order_a, order_b)) : std::string("NA"))
                 << "\nphase_switch_blocks\t"
-                << (phase_support == "READS" ? std::to_string(switch_blocks) : std::string("NA"))
+                << (phase_claimed ? std::to_string(switch_blocks) : std::string("NA"))
                 << "\nblocks_exact\t" << all_exact << "\nsv_blocks_exact\t" << sv_exact
                 << "\nsv_unordered_distance_total\t" << sv_distance_total
                 << "\ncontext_unordered_distance_total\t" << context_distance_total
@@ -593,7 +595,7 @@ int evaluate(const Args& args) {
                 << "\nblock_unsupported\t"
                 << std::count_if(genotype_support.begin(), genotype_support.end(),
                                  [](const auto& item) { return item.second != "READS"; })
-                << "\nphase_unsupported\t" << (phase_support == "READS" ? "false" : "true") << '\n';
+                << "\nphase_unsupported\t" << (phase_claimed ? "false" : "true") << '\n';
 
         // Truth in candidate set: some retained beam candidate spells both truth haplotypes.
         std::string truth_proposal_rank = "absent";
@@ -1396,6 +1398,7 @@ int genotype(const Args& args) {
     options.library_path = args.required("library");
     options.out_prefix = args.required("out-prefix");
     options.proposal_state_limit = std::stoul(args.get("state-limit", "1024"));
+    options.phase_audit_candidates = std::stoul(args.get("phase-audit", "0"));
     for (const std::size_t k : parse_alleles(args.required("prefixes"))) {
         options.development_candidate_prefixes.push_back(k);
     }

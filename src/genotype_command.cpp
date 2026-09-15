@@ -162,10 +162,18 @@ struct CandidateSetReport {
 struct RankingSummary {
     std::size_t sequence_candidates = 0;
     std::size_t collapsed_beam_candidates = 0;
-    // READS: no retained rival is a fragment contender. PRIOR_ONLY: some rival's fragment term is not
+    // READS_WITHIN_CANDIDATES: no retained rival is a fragment contender -- a claim about this candidate set
+    // only. READS_AUDITED: that, and the declared larger audit set agrees on winner, block genotypes and phase.
+    // PRIOR_ONLY: some rival's fragment term is not
     // below the winner's beyond numerical error, so the prior chose among them. UNRESOLVED: the ranking
     // could not separate a winner at all.
     std::string phase_support;
+    std::string phase_support_within_candidates;
+    std::size_t phase_audit_candidates = 0;
+    std::string phase_audit_status = "NA";
+    std::string phase_audit_same_winner = "NA";
+    std::string phase_audit_same_block_genotypes = "NA";
+    std::string phase_audit_phase_support = "NA";
     std::size_t fragment_contenders = 0;
     double fragment_term_gap = 0.0;
     bool projection_ambiguous = false;
@@ -310,6 +318,14 @@ void write_status(
             // Phase the reads did not choose is not reported as read-supported. Unordered block
             // genotypes can still be, where every fragment contender agrees on them.
             out << "phase_support\t" << summary->phase_support << '\n';
+            out << "phase_support_within_candidates\t" << summary->phase_support_within_candidates << '\n';
+            out << "phase_audit_candidates\t"
+                << (summary->phase_audit_candidates > 0 ? std::to_string(summary->phase_audit_candidates) : "NA")
+                << '\n';
+            out << "phase_audit_status\t" << summary->phase_audit_status << '\n';
+            out << "phase_audit_same_winner\t" << summary->phase_audit_same_winner << '\n';
+            out << "phase_audit_same_block_genotypes\t" << summary->phase_audit_same_block_genotypes << '\n';
+            out << "phase_audit_phase_support\t" << summary->phase_audit_phase_support << '\n';
             out << "fragment_contenders\t" << summary->fragment_contenders << '\n';
             std::size_t supported = 0;
             for (const bool block : summary->block_genotype_read_supported) supported += block ? 1 : 0;
@@ -351,6 +367,13 @@ const char* genotype_run_status_name(GenotypeRunStatus status) {
     return "MODEL_INCOMPLETE";
 }
 
+std::string audited_phase_support(const std::string& within_candidates, bool audit_complete, bool same_winner,
+                                  bool same_block_genotypes, const std::string& audit_phase_support) {
+    if (within_candidates != "READS_WITHIN_CANDIDATES") return within_candidates;
+    if (!audit_complete || !same_winner || !same_block_genotypes) return "UNRESOLVED";
+    return audit_phase_support == "READS_WITHIN_CANDIDATES" ? "READS_AUDITED" : "PRIOR_ONLY";
+}
+
 namespace {
 
 void remove_run_outputs(const std::string& out_prefix) {
@@ -390,6 +413,15 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         }
         if (prefixes.back() != options.max_candidates) {
             throw std::runtime_error("the largest development candidate prefix must equal max_candidates");
+        }
+    }
+
+    if (options.phase_audit_candidates > 0) {
+        const std::size_t largest = options.development_candidate_prefixes.empty()
+                                        ? options.max_candidates
+                                        : options.development_candidate_prefixes.back();
+        if (options.phase_audit_candidates <= largest) {
+            throw std::runtime_error("the phase audit set must be larger than every primary candidate set");
         }
     }
 
@@ -571,7 +603,9 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                                                  : options.development_candidate_prefixes;
     std::size_t scored_mosaics = 0;
     bool any_ranked = false;
-    for (const std::size_t k : targets) {
+    std::vector<std::size_t> score_targets = targets;
+    if (options.phase_audit_candidates > 0) score_targets.push_back(options.phase_audit_candidates);
+    for (const std::size_t k : score_targets) {
         const MosaicBeamResult view = candidate_prefix(mosaics, k);
         if (view.search_exhaustive || view.unique_target_reached) {
             any_ranked = true;
@@ -642,67 +676,27 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     }
     timings.rescoring = seconds_since(mark);
 
-    // Everything after scoring, for one mosaic target. A standalone run calls it once; the development prefix
-    // harness calls it once per prefix of the same proposal and scoring pass, so each prefix is refused,
-    // certified and written by exactly the code a standalone run uses.
-    const auto finish = [&](const MosaicBeamResult& beam, const GenotypeCommandOptions& options,
-                            StageTimings timings) -> GenotypeRunStatus {
-        const std::string status_path = options.out_prefix + ".mosaic_status.tsv";
-        const std::string manifest_header =
-            "candidate_id\tunique_rank\thap1_alleles\thap2_alleles\tbest_proposal_score\t"
-            "retained_logsum_proposal_score\tproposal_emission_component\t"
-            "proposal_transition_component\tequivalent_retained_histories\tevery_allele_scored\t"
-            "exact_path_prior\tsequence_candidate_id\thistory_count_saturated\tsource\n";
-        // A pruned search that misses its mosaic target has omitted mosaics it never proposed. The panel
-        // baseline does not change that: an absent recombinant truth may be among them.
-        if (!beam.search_exhaustive && !beam.unique_target_reached) {
-            timings.total = seconds_since(started);
-            {
-                // Diagnostics only: the mosaics the search did propose. Not a ranking; no scores.
-                std::ofstream out = open_output(options.out_prefix + ".mosaic_candidates.tsv");
-                out << manifest_header;
-                for (const MosaicCandidate& candidate : beam.candidates) {
-                    out << candidate.candidate_id << '\t' << candidate.unique_rank << '\t'
-                        << join_alleles(candidate.diplotype.first.alleles) << '\t'
-                        << join_alleles(candidate.diplotype.second.alleles) << '\t'
-                        << candidate.best_proposal_score << '\t'
-                        << candidate.retained_logsum_proposal_score << '\t'
-                        << candidate.proposal_emission_component << '\t'
-                        << candidate.proposal_transition_component << '\t'
-                        << candidate.equivalent_retained_histories << '\t'
-                        << (candidate.every_allele_scored ? "true" : "false") << "\tNA\tNA\t"
-                        << (candidate.history_count_saturated ? "true" : "false") << "\tmosaic\n";
-                }
-            }
-            write_status(status_path, GenotypeRunStatus::CandidateIncomplete, fingerprint, options, library,
-                         timings, &built.report, &panel, &beam, nullptr,
-                         "the proposal pruned merged states and still found fewer off-panel mosaics than "
-                         "requested; no call is made from a set that omits unproposed candidates",
-                         nullptr, &depth, &candidate_report);
-            return GenotypeRunStatus::CandidateIncomplete;
-        }
-        if (!rescore_failure.empty()) {
-            timings.total = seconds_since(started);
-            write_status(status_path, GenotypeRunStatus::RescoreIncomplete, fingerprint, options, library,
-                         timings, &built.report, &panel, &beam, nullptr,
-                         "rescoring stopped at a declared resource cap and returned no ranking: " +
-                             rescore_failure,
-                         nullptr, &depth, &candidate_report);
-            return GenotypeRunStatus::RescoreIncomplete;
-        }
-
+    // Certification of one candidate set -- the panel baseline plus a mosaic prefix -- from the shared scores.
+    struct SequenceCandidate {
+        std::size_t first = 0;     // interned sequence, first <= second
+        std::size_t second = 0;
+        std::vector<std::size_t> members;
+        std::size_t representative = 0;
+        bool projection_ambiguous = false;
+    };
+    struct SetRanking {
+        std::vector<MosaicCandidate> candidates;
+        std::vector<SequenceCandidate> sequence_candidates;
+        std::vector<std::size_t> sequence_candidate_of;
+        std::vector<double> path_prior;
+        CertifiedRanking ranking;
+        RankingSummary summary;
+    };
+    const auto rank_set = [&](const MosaicBeamResult& beam) {
         // The candidate set: the whole panel baseline first, then this target's mosaics.
         std::vector<MosaicCandidate> candidates = panel_candidates;
         candidates.insert(candidates.end(), beam.candidates.begin(), beam.candidates.end());
-        const std::size_t panel_count = panel_candidates.size();
 
-        struct SequenceCandidate {
-            std::size_t first = 0;     // interned sequence, first <= second
-            std::size_t second = 0;
-            std::vector<std::size_t> members;
-            std::size_t representative = 0;
-            bool projection_ambiguous = false;
-        };
         std::vector<SequenceCandidate> sequence_candidates;
         std::map<std::pair<std::size_t, std::size_t>, std::size_t> slot_of_sequence_pair;
         std::vector<std::size_t> sequence_candidate_of(candidates.size(), 0);
@@ -789,9 +783,118 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                 }
             }
             summary.phase_support = ranking.status != RescoreStatus::Complete ? "UNRESOLVED"
-                                    : summary.fragment_contenders == 0      ? "READS"
+                                    : summary.fragment_contenders == 0      ? "READS_WITHIN_CANDIDATES"
                                                                              : "PRIOR_ONLY";
             summary.projection_ambiguous = sequence_candidates[best.candidate_id].projection_ambiguous;
+        }
+
+        SetRanking out;
+        out.candidates = std::move(candidates);
+        out.sequence_candidates = std::move(sequence_candidates);
+        out.sequence_candidate_of = std::move(sequence_candidate_of);
+        out.path_prior = std::move(path_prior);
+        out.ranking = ranking;
+        out.summary = std::move(summary);
+        return out;
+    };
+
+    // Everything after scoring, for one mosaic target. A standalone run calls it once; the development prefix
+    // harness calls it once per prefix of the same proposal and scoring pass, so each prefix is refused,
+    // certified and written by exactly the code a standalone run uses.
+    const auto finish = [&](const MosaicBeamResult& beam, const GenotypeCommandOptions& options,
+                            StageTimings timings) -> GenotypeRunStatus {
+        const std::string status_path = options.out_prefix + ".mosaic_status.tsv";
+        const std::string manifest_header =
+            "candidate_id\tunique_rank\thap1_alleles\thap2_alleles\tbest_proposal_score\t"
+            "retained_logsum_proposal_score\tproposal_emission_component\t"
+            "proposal_transition_component\tequivalent_retained_histories\tevery_allele_scored\t"
+            "exact_path_prior\tsequence_candidate_id\thistory_count_saturated\tsource\n";
+        // A pruned search that misses its mosaic target has omitted mosaics it never proposed. The panel
+        // baseline does not change that: an absent recombinant truth may be among them.
+        if (!beam.search_exhaustive && !beam.unique_target_reached) {
+            timings.total = seconds_since(started);
+            {
+                // Diagnostics only: the mosaics the search did propose. Not a ranking; no scores.
+                std::ofstream out = open_output(options.out_prefix + ".mosaic_candidates.tsv");
+                out << manifest_header;
+                for (const MosaicCandidate& candidate : beam.candidates) {
+                    out << candidate.candidate_id << '\t' << candidate.unique_rank << '\t'
+                        << join_alleles(candidate.diplotype.first.alleles) << '\t'
+                        << join_alleles(candidate.diplotype.second.alleles) << '\t'
+                        << candidate.best_proposal_score << '\t'
+                        << candidate.retained_logsum_proposal_score << '\t'
+                        << candidate.proposal_emission_component << '\t'
+                        << candidate.proposal_transition_component << '\t'
+                        << candidate.equivalent_retained_histories << '\t'
+                        << (candidate.every_allele_scored ? "true" : "false") << "\tNA\tNA\t"
+                        << (candidate.history_count_saturated ? "true" : "false") << "\tmosaic\n";
+                }
+            }
+            write_status(status_path, GenotypeRunStatus::CandidateIncomplete, fingerprint, options, library,
+                         timings, &built.report, &panel, &beam, nullptr,
+                         "the proposal pruned merged states and still found fewer off-panel mosaics than "
+                         "requested; no call is made from a set that omits unproposed candidates",
+                         nullptr, &depth, &candidate_report);
+            return GenotypeRunStatus::CandidateIncomplete;
+        }
+        if (!rescore_failure.empty()) {
+            timings.total = seconds_since(started);
+            write_status(status_path, GenotypeRunStatus::RescoreIncomplete, fingerprint, options, library,
+                         timings, &built.report, &panel, &beam, nullptr,
+                         "rescoring stopped at a declared resource cap and returned no ranking: " +
+                             rescore_failure,
+                         nullptr, &depth, &candidate_report);
+            return GenotypeRunStatus::RescoreIncomplete;
+        }
+
+        SetRanking primary = rank_set(beam);
+        const std::vector<MosaicCandidate>& candidates = primary.candidates;
+        const std::size_t panel_count = panel_candidates.size();
+        const std::vector<SequenceCandidate>& sequence_candidates = primary.sequence_candidates;
+        const std::vector<std::size_t>& sequence_candidate_of = primary.sequence_candidate_of;
+        const std::vector<double>& path_prior = primary.path_prior;
+        const CertifiedRanking& ranking = primary.ranking;
+        RankingSummary& summary = primary.summary;
+
+        // Phase support from the declared audit set. A small candidate set can omit the rival that makes phase a
+        // fragment tie: in the round-5 held-out cohort nine of ten READS claims at K = 8 vanished at K = 256. The
+        // audit set is ranked from the same scores; READS_AUDITED needs the same winner, the same block genotypes
+        // and read-supported phase there. Even so it is conditional on the audit set, not a global proof.
+        summary.phase_support_within_candidates = summary.phase_support;
+        if (options.phase_audit_candidates > 0) {
+            summary.phase_audit_candidates = options.phase_audit_candidates;
+            bool audit_complete = false;
+            bool same_winner = false;
+            bool same_blocks = false;
+            const MosaicBeamResult audit_view = candidate_prefix(mosaics, options.phase_audit_candidates);
+            if (!audit_view.search_exhaustive && !audit_view.unique_target_reached) {
+                summary.phase_audit_status = "CANDIDATE_INCOMPLETE";
+            } else if (ranking.status != RescoreStatus::Complete) {
+                summary.phase_audit_status = "NOT_RUN";
+            } else {
+                const SetRanking audit = rank_set(audit_view);
+                audit_complete = audit.ranking.status == RescoreStatus::Complete;
+                summary.phase_audit_status = audit_complete ? "COMPLETE" : "RESCORE_INCOMPLETE";
+                summary.phase_audit_phase_support = audit.summary.phase_support;
+                if (audit_complete) {
+                    const SequenceCandidate& mine = sequence_candidates[ranking.winner_set.front()];
+                    const SequenceCandidate& theirs = audit.sequence_candidates[audit.ranking.winner_set.front()];
+                    same_winner = mine.first == theirs.first && mine.second == theirs.second;
+                    const MosaicDiplotype& a = candidates[mine.representative].diplotype;
+                    const MosaicDiplotype& b = audit.candidates[theirs.representative].diplotype;
+                    same_blocks = true;
+                    for (std::size_t block = 0; block < model.blocks().size(); ++block) {
+                        if (std::minmax(a.first.alleles[block], a.second.alleles[block]) !=
+                            std::minmax(b.first.alleles[block], b.second.alleles[block])) {
+                            same_blocks = false;
+                        }
+                    }
+                    summary.phase_audit_same_winner = same_winner ? "true" : "false";
+                    summary.phase_audit_same_block_genotypes = same_blocks ? "true" : "false";
+                }
+            }
+            summary.phase_support = audited_phase_support(summary.phase_support, audit_complete, same_winner,
+                                                          same_blocks, summary.phase_audit_phase_support);
         }
 
         // ---- outputs --------------------------------------------------------------------------------

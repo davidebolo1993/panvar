@@ -591,8 +591,8 @@ void test_off_panel_truth_is_recovered() {
                 (reported.count("note") ? reported.at("note") : ""));
     require(reported.at("proposal_search_exhaustive") == "true" || reported.at("proposal_target_reached") == "true",
             "an accuracy-eligible run must have searched exhaustively or reached its target");
-    require(reported.at("phase_support") == "READS",
-            "the reads, not the prior, must choose the phaseable off-panel truth");
+    require(reported.at("phase_support") == "READS_WITHIN_CANDIDATES",
+            "the reads, not the prior, must choose the phaseable off-panel truth within its candidates");
 
     const TruthFrame frame =
         rebuild_truth_frame(options, reported.at("model_fingerprint"), kTruth1Nodes, kTruth2Nodes);
@@ -619,7 +619,7 @@ void test_off_panel_truth_is_recovered() {
     }
     require(pairing != 0, "fixture: the truth must be heterozygous somewhere, or phase is untested");
     std::cout << "  off-panel truth (phaseable): all " << rows.size()
-              << " blocks called and phased correctly; truth proposed within 64 merged states; phase support READS, "
+              << " blocks called and phased correctly; truth proposed within 64 merged states; phase support READS_WITHIN_CANDIDATES, "
               << "fragment gap " << reported.at("fragment_term_gap_to_runner_up") << '\n';
 }
 
@@ -851,6 +851,69 @@ void test_candidate_prefixes_match_standalone() {
     }
 }
 
+// Phase support from a declared audit set (review round 6). Without an audit, read-supported phase is only
+// READS_WITHIN_CANDIDATES. With one, READS_AUDITED needs the same winner, the same block genotypes and
+// read-supported phase in the larger set; a claim the larger set does not bear out is withdrawn.
+void test_phase_audit() {
+    panvar::GenotypeCommandOptions phaseable = tiny_options(
+        "audit_phaseable", path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa");
+    phaseable.proposal_state_limit = 1048576;
+    phaseable.max_candidates = 4;
+    phaseable.phase_audit_candidates = 64;
+    require(panvar::run_genotype(phaseable) == panvar::GenotypeRunStatus::Complete,
+            "the audited phaseable run must complete");
+    const auto confirmed = read_status(path("audit_phaseable.mosaic_status.tsv"));
+    require(confirmed.at("phase_support_within_candidates") == "READS_WITHIN_CANDIDATES" &&
+                confirmed.at("phase_audit_status") == "COMPLETE" && confirmed.at("phase_audit_same_winner") == "true" &&
+                confirmed.at("phase_audit_same_block_genotypes") == "true" &&
+                confirmed.at("phase_support") == "READS_AUDITED",
+            "a phaseable truth's read-supported phase must be confirmed by the larger audit set, got " +
+                confirmed.at("phase_support"));
+    for (const auto& row : read_rows(path("audit_phaseable.block_genotypes.tsv"))) {
+        require(row[10] == "READS_AUDITED", "block genotypes must carry the audited phase claim");
+    }
+
+    // A claim the audit cannot check is withdrawn: at 64 merged states the phaseable locus has too few off-panel
+    // mosaics for a 64-mosaic audit set, so the pruned audit is refused and the K = 1 claim is not reported.
+    panvar::GenotypeCommandOptions narrow =
+        tiny_options("audit_unreachable", path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa");
+    narrow.proposal_state_limit = 64;
+    narrow.max_candidates = 1;
+    narrow.phase_audit_candidates = 64;
+    require(panvar::run_genotype(narrow) == panvar::GenotypeRunStatus::Complete,
+            "the primary set must still call when its audit set cannot be reached");
+    const auto withdrawn = read_status(path("audit_unreachable.mosaic_status.tsv"));
+    require(withdrawn.at("phase_support_within_candidates") == "READS_WITHIN_CANDIDATES" &&
+                withdrawn.at("phase_audit_status") == "CANDIDATE_INCOMPLETE" &&
+                withdrawn.at("phase_support") == "UNRESOLVED",
+            "a phase claim whose audit set cannot be ranked must be withdrawn, got " + withdrawn.at("phase_support"));
+
+    // Every branch of the decision, including the ones no small fixture reaches: an audit that completes with
+    // the same call but a phase tie, and one that changes the winner or the block genotypes.
+    const auto decide = panvar::audited_phase_support;
+    require(decide("READS_WITHIN_CANDIDATES", true, true, true, "READS_WITHIN_CANDIDATES") == "READS_AUDITED" &&
+                decide("READS_WITHIN_CANDIDATES", true, true, true, "PRIOR_ONLY") == "PRIOR_ONLY" &&
+                decide("READS_WITHIN_CANDIDATES", true, false, true, "READS_WITHIN_CANDIDATES") == "UNRESOLVED" &&
+                decide("READS_WITHIN_CANDIDATES", true, true, false, "READS_WITHIN_CANDIDATES") == "UNRESOLVED" &&
+                decide("READS_WITHIN_CANDIDATES", false, false, false, "NA") == "UNRESOLVED" &&
+                decide("PRIOR_ONLY", true, true, true, "READS_WITHIN_CANDIDATES") == "PRIOR_ONLY" &&
+                decide("UNRESOLVED", true, true, true, "READS_WITHIN_CANDIDATES") == "UNRESOLVED",
+            "the audited phase decision must confirm only an agreeing, read-supported audit");
+
+    bool refused = false;
+    try {
+        panvar::GenotypeCommandOptions invalid = narrow;
+        invalid.phase_audit_candidates = 1;
+        panvar::run_genotype(invalid);
+    } catch (const std::runtime_error&) {
+        refused = true;
+    }
+    require(refused, "an audit set no larger than the primary set must be refused");
+    std::cout << "  phase audit: exhaustive phaseable " << confirmed.at("phase_support") << "; K=1 at 64 states "
+              << withdrawn.at("phase_support_within_candidates") << " -> " << withdrawn.at("phase_support")
+              << " (audit " << withdrawn.at("phase_audit_status") << ")\n";
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: genotype_command_e2e_test <scratch dir>\n";
@@ -865,6 +928,7 @@ int main(int argc, char** argv) {
         test_off_panel_phase_is_not_claimed_from_reads();
         test_proposal_status_rules();
         test_prior_only_phase_is_reported();
+        test_phase_audit();
         test_candidate_prefixes_match_standalone();
         std::cout << "genotype command end-to-end: PASS\n";
         return 0;
