@@ -598,6 +598,7 @@ int evaluate(const Args& args) {
         // Truth in candidate set: some retained beam candidate spells both truth haplotypes.
         std::string truth_proposal_rank = "absent";
         std::string truth_sequence_candidate = "absent";
+        std::string truth_source = "absent";
         for (const auto& row : read_table(run + ".mosaic_candidates.tsv")) {
             const std::vector<std::size_t> a = parse_alleles(row.at("hap1_alleles"));
             const std::vector<std::size_t> c = parse_alleles(row.at("hap2_alleles"));
@@ -613,6 +614,7 @@ int evaluate(const Args& args) {
             if ((spells(a, 0) && spells(c, 1)) || (spells(a, 1) && spells(c, 0))) {
                 truth_proposal_rank = row.at("unique_rank");
                 truth_sequence_candidate = row.at("sequence_candidate_id");
+                truth_source = row.count("source") ? row.at("source") : "mosaic";
                 break;
             }
         }
@@ -627,6 +629,7 @@ int evaluate(const Args& args) {
             }
         }
         summary << "truth_in_candidates\t" << (truth_proposal_rank != "absent" ? "true" : "false")
+                << "\ntruth_candidate_source\t" << truth_source
                 << "\ntruth_proposal_rank\t" << truth_proposal_rank
                 << "\ntruth_fragment_score_rank\t" << truth_score_rank << '\n';
 
@@ -1267,7 +1270,8 @@ int trace(const Args& args) {
         markers, observations, panvar::proposal_marker_parameters(depth, 31, 15));
     const std::vector<double> switches(model.blocks().size() - 1, 0.01);
     panvar::MosaicBeamParameters parameters;
-    parameters.unique_candidate_target = target;
+    // As the command does: return every diplotype found, so off-panel mosaics can be compared exactly.
+    parameters.unique_candidate_target = std::max(state_limit, target + panel.template_count() * panel.template_count());
     parameters.state_limit = state_limit;
     parameters.max_extension_evaluations = 2000000000ULL;
     parameters.trace_target = truth;
@@ -1276,12 +1280,23 @@ int trace(const Args& args) {
         panvar::propose_mosaic_diplotypes(panel, emissions, switches, parameters);
 
     // The traced search must be the run's search.
-    const auto manifest = read_table(run + ".mosaic_candidates.tsv");
+    // A manifest without a source column predates the panel baseline: every row is a beam candidate, and the
+    // beam's own order is compared. Otherwise only mosaic rows, against beam candidates that are not panel pairs.
+    std::vector<std::map<std::string, std::string>> manifest;
+    bool has_source = false;
+    for (const auto& row : read_table(run + ".mosaic_candidates.tsv")) {
+        has_source = has_source || row.count("source") != 0;
+        if (row.count("source") == 0 || row.at("source") == "mosaic") manifest.push_back(row);
+    }
+    const panvar::MosaicBeamResult compared_beam =
+        has_source ? panvar::off_panel_mosaics(result, panvar::panel_diplotypes(panel)) : result;
+    std::vector<const panvar::MosaicCandidate*> beam_mosaics;
+    for (const auto& candidate : compared_beam.candidates) beam_mosaics.push_back(&candidate);
     bool matches_run = !manifest.empty();
-    const std::size_t compared = std::min(manifest.size(), result.candidates.size());
+    const std::size_t compared = std::min(manifest.size(), beam_mosaics.size());
     for (std::size_t i = 0; i < compared && matches_run; ++i) {
-        matches_run = parse_alleles(manifest[i].at("hap1_alleles")) == result.candidates[i].diplotype.first.alleles &&
-                      parse_alleles(manifest[i].at("hap2_alleles")) == result.candidates[i].diplotype.second.alleles;
+        matches_run = parse_alleles(manifest[i].at("hap1_alleles")) == beam_mosaics[i]->diplotype.first.alleles &&
+                      parse_alleles(manifest[i].at("hap2_alleles")) == beam_mosaics[i]->diplotype.second.alleles;
     }
 
     std::ofstream layers(out + ".trace.tsv");

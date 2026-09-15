@@ -733,6 +733,20 @@ void test_proposal_status_rules() {
             "an exhaustive, untruncated, complete ranking is the only globally certified result");
     require(exhaustive_status.at("marker_depth_converged") == "true",
             "a completed run must rest on a converged marker-depth fit");
+    // The protected panel baseline: every unordered panel pair is a candidate, reported complete, and the
+    // manifest carries each once beside the off-panel mosaics that K counts.
+    std::size_t panel_rows = 0;
+    std::size_t mosaic_rows = 0;
+    for (const auto& row : read_rows(path("exhaustive.mosaic_candidates.tsv"))) {
+        require(row.size() == 14 && (row[13] == "panel" || row[13] == "mosaic"),
+                "every manifest row must name its source");
+        (row[13] == "panel" ? panel_rows : mosaic_rows) += 1;
+    }
+    require(exhaustive_status.at("panel_baseline_complete") == "true" &&
+                std::stoul(exhaustive_status.at("panel_diplotypes")) == panel_rows && panel_rows > 0 &&
+                std::stoul(exhaustive_status.at("unique_candidates")) == mosaic_rows &&
+                std::stoul(exhaustive_status.at("candidates_total")) == panel_rows + mosaic_rows,
+            "the status must report the complete panel baseline and the manifest must hold every panel pair");
     require(exhaustive_status.at("marker_background_effective") == exhaustive_status.at("marker_background") &&
                 std::stod(exhaustive_status.at("marker_background_floor")) == panvar::kMarkerBackgroundFloor,
             "the status must report the model floor and the background proposal scoring actually used");
@@ -784,6 +798,15 @@ void test_candidate_prefixes_match_standalone() {
         std::string text;
         while (std::getline(input, line)) {
             if (status_file && line.rfind("seconds_", 0) == 0) continue;
+            // Prefixes share one scoring pass over their union, so its work counters describe that pass.
+            if (status_file) {
+                const std::string key = line.substr(0, line.find('\t'));
+                static const std::set<std::string> shared_work = {
+                    "candidate_bases_scanned", "piece_hits", "proposed_starts", "unique_starts",
+                    "full_read_verifications", "accepted_mate_placements", "valid_fr_states",
+                    "physical_origins", "statistical_state_classes"};
+                if (shared_work.count(key) != 0) continue;
+            }
             if (!line.empty() && line[0] == '>') line = line.substr(line.find(' '));   // header names the prefix
             text += line + '\n';
         }

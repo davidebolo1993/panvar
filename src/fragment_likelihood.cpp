@@ -726,6 +726,25 @@ CertifiedRanking certify_diplotype_ranking(
     if (candidates.empty()) {
         throw std::invalid_argument("certification needs at least one candidate to rank");
     }
+    const FragmentScoringResult scored =
+        score_diplotypes(haplotypes, candidates, fragments, library, options);
+    return certify_scored_ranking(scored.scores, fragments.size(), options.mismatch_band, scored.counters,
+                                  certification, exact_prior);
+}
+
+CertifiedRanking certify_scored_ranking(
+    const std::vector<DiplotypeScore>& scores,
+    std::size_t fragment_count,
+    std::size_t mismatch_band,
+    const FragmentScoringCounters& counters,
+    const CertificationOptions& certification,
+    const std::vector<double>& exact_prior) {
+    if (!exact_prior.empty() && exact_prior.size() != scores.size()) {
+        throw std::invalid_argument("exact prior must be parallel to the candidate list");
+    }
+    if (scores.empty()) {
+        throw std::invalid_argument("certification needs at least one candidate to rank");
+    }
     if (!std::isfinite(certification.minimum_tie_tolerance_nats) ||
         certification.minimum_tie_tolerance_nats < 0.0) {
         throw std::invalid_argument("minimum tie tolerance must be finite and non-negative");
@@ -736,25 +755,22 @@ CertifiedRanking certify_diplotype_ranking(
         }
     }
 
-    const FragmentScoringResult scored =
-        score_diplotypes(haplotypes, candidates, fragments, library, options);
-
     CertifiedRanking result;
-    result.counters = scored.counters;
-    result.mismatch_band = options.mismatch_band;
-    result.candidates.resize(candidates.size());
-    const double terms = static_cast<double>(fragments.size() + 16);
+    result.counters = counters;
+    result.mismatch_band = mismatch_band;
+    result.candidates.resize(scores.size());
+    const double terms = static_cast<double>(fragment_count + 16);
     double log_weight = kNegInf;
-    for (std::size_t c = 0; c < candidates.size(); ++c) {
+    for (std::size_t c = 0; c < scores.size(); ++c) {
         CertifiedCandidate& entry = result.candidates[c];
         entry.candidate_id = c;
         entry.prior = exact_prior.empty() ? 0.0 : exact_prior[c];
-        entry.fragment_term = scored.scores[c].fragment_term;
-        entry.exposure_term = scored.scores[c].exposure_term;
-        entry.score = scored.scores[c].log_likelihood + entry.prior;
-        entry.fragments_with_mass = scored.scores[c].fragments_with_mass;
+        entry.fragment_term = scores[c].fragment_term;
+        entry.exposure_term = scores[c].exposure_term;
+        entry.score = scores[c].log_likelihood + entry.prior;
+        entry.fragments_with_mass = scores[c].fragments_with_mass;
         entry.numeric_error_bound = terms * std::numeric_limits<double>::epsilon() *
-                                    (scored.scores[c].absolute_term_sum + std::abs(entry.prior));
+                                    (scores[c].absolute_term_sum + std::abs(entry.prior));
         entry.numeric_error_bound =
             std::max(entry.numeric_error_bound, 0.5 * certification.minimum_tie_tolerance_nats);
         log_weight = log_add_exp(log_weight, entry.score);

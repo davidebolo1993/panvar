@@ -690,6 +690,90 @@ void test_marker_background_reaches_proposal() {
     require(refused, "proposal emissions must refuse a background below the model floor");
 }
 
+// The protected panel baseline. A zero-switch panel pair that looks bad at the first block and is the best
+// diplotype overall is dropped there by a narrow beam -- the held-out C4 failure -- and can never be
+// recovered by a larger K. The panel baseline contains it by construction, and the off-panel mosaics the
+// beam adds never duplicate a panel pair.
+void test_panel_baseline_retains_a_pruned_pair() {
+    panvar::PanelAlleleMatrix panel;
+    panel.template_names = {"t0", "t1", "t2", "t3"};
+    panel.template_alleles = {{0, 0, 0}, {1, 1, 1}, {2, 2, 2}, {3, 3, 3}};
+    panvar::PreparedProposalEmissions emissions;
+    emissions.total_alleles = 12;
+    emissions.scored_alleles = 12;
+    for (std::size_t b = 0; b < 3; ++b) {
+        panvar::BlockProposalEmissions block;
+        block.allele_count = 4;
+        block.scored_alleles = 4;
+        block.log_score.assign(16, 0.0);
+        // Locally bad at block 0 and best overall. With switches this rare (about -15.2 nats each), a mosaic
+        // that reaches the true alleles after block 0 cannot recover the two switches it needs.
+        const double truth = b == 0 ? -10.0 : 8.0;
+        block.log_score[0 * 4 + 1] = truth;
+        block.log_score[1 * 4 + 0] = truth;
+        emissions.blocks.push_back(block);
+    }
+    const panvar::MosaicDiplotype truth{panvar::MosaicPath{{0, 0, 0}}, panvar::MosaicPath{{1, 1, 1}}};
+    const auto is_truth = [&](const panvar::MosaicDiplotype& d) {
+        return (d.first == truth.first && d.second == truth.second) || (d.first == truth.second && d.second == truth.first);
+    };
+
+    const std::vector<double> rare_switches = {1e-6, 1e-6};
+    const auto wide = panvar::propose_mosaic_diplotypes(panel, emissions, rare_switches, {64, 1u << 20});
+    require(wide.search_exhaustive && is_truth(wide.candidates.front().diplotype),
+            "fixture: exhaustively, the true panel pair must be the best diplotype");
+
+    panvar::MosaicBeamParameters narrow{64, 2};
+    narrow.trace_target = truth;
+    const auto beam = panvar::propose_mosaic_diplotypes(panel, emissions, rare_switches, narrow);
+    bool proposed = false;
+    for (const auto& candidate : beam.candidates) proposed = proposed || is_truth(candidate.diplotype);
+    require(!beam.search_exhaustive && !proposed, "fixture: the narrow beam must not propose the true panel pair");
+    require(beam.trace.front().target_states_offered > 0 && beam.trace.front().target_states_retained == 0,
+            "fixture: the trace must show the true pair dropped at block 0");
+
+    const auto baseline = panvar::panel_diplotypes(panel);
+    require(baseline.size() == 10, "four distinct templates give ten unordered panel diplotypes");
+    bool retained = false;
+    for (std::size_t i = 0; i < baseline.size(); ++i) {
+        retained = retained || is_truth(baseline[i].diplotype);
+        require(baseline[i].candidate_id == i &&
+                    !(baseline[i].diplotype.second.alleles < baseline[i].diplotype.first.alleles),
+                "panel diplotypes must be canonical and numbered in order");
+    }
+    require(retained, "the panel baseline must contain the pruned true pair");
+
+    const auto mosaics = panvar::off_panel_mosaics(beam, baseline);
+    std::size_t beam_panel_pairs = 0;
+    for (const auto& candidate : beam.candidates) {
+        bool in_panel = false;
+        for (const auto& pair : baseline) {
+            in_panel = in_panel || (pair.diplotype.first == candidate.diplotype.first &&
+                                    pair.diplotype.second == candidate.diplotype.second);
+        }
+        beam_panel_pairs += in_panel ? 1 : 0;
+    }
+    require(mosaics.candidates.size() + beam_panel_pairs == beam.candidates.size() &&
+                mosaics.unique_candidates_found == mosaics.candidates.size(),
+            "off-panel mosaics must be exactly the beam's diplotypes that are not panel pairs");
+    for (std::size_t rank = 0; rank < mosaics.candidates.size(); ++rank) {
+        const auto& candidate = mosaics.candidates[rank];
+        require(candidate.unique_rank == rank + 1 && candidate.candidate_id == baseline.size() + rank,
+                "off-panel mosaics must be ranked in proposal order after the panel ids");
+        for (const auto& pair : baseline) {
+            require(!(pair.diplotype.first == candidate.diplotype.first && pair.diplotype.second == candidate.diplotype.second),
+                    "an off-panel mosaic must not duplicate a panel diplotype");
+        }
+    }
+
+    // Identical template rows give one panel diplotype, not two.
+    panvar::PanelAlleleMatrix duplicated = panel;
+    duplicated.template_names.push_back("t0-copy");
+    duplicated.template_alleles.push_back({0, 0, 0});
+    require(panvar::panel_diplotypes(duplicated).size() == 10,
+            "templates with identical allele rows must not add panel diplotypes");
+}
+
 } // namespace
 
 int main() {
@@ -698,6 +782,7 @@ int main() {
         test_mosaic_beam();
         test_marker_depth_estimation();
         test_marker_background_reaches_proposal();
+        test_panel_baseline_retains_a_pruned_pair();
         std::cout << "genotype mosaic proposal: PASS\n";
         return 0;
     } catch (const std::exception& error) {

@@ -307,6 +307,17 @@ struct CertifiedRanking {
 // `exact_prior` is added to the matching candidate's score. It must be exact, which is why it is a
 // separate argument. The proposal score is not, and may never be, passed here: it comes from the
 // same reads as the fragment term, and adding both would count that evidence twice.
+// Certification of scores already computed by score_diplotypes: scores[c] is candidate c. A diplotype's
+// score does not depend on the other candidates it is scored with, so a subset of one scoring pass is
+// ranked exactly as scoring that subset alone would rank it.
+CertifiedRanking certify_scored_ranking(
+    const std::vector<DiplotypeScore>& scores,
+    std::size_t fragment_count,
+    std::size_t mismatch_band,
+    const FragmentScoringCounters& counters,
+    const CertificationOptions& certification,
+    const std::vector<double>& exact_prior = {});
+
 CertifiedRanking certify_diplotype_ranking(
     const InternedHaplotypes& haplotypes,
     const std::vector<HaplotypeCandidate>& candidates,

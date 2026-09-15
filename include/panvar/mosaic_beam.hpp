@@ -94,6 +94,15 @@ struct MosaicBeamResult {
     std::vector<MosaicBeamTraceLayer> trace;   // one per block when a trace target was declared
 };
 
+// The protected panel baseline: every unordered pair of panel templates, deduplicated by allele paths, with
+// the first path not lexicographically greater than the second and ids in enumeration order. In
+// leave-zero-out the truth is one of these, and it is a candidate whatever the beam pruned.
+std::vector<MosaicCandidate> panel_diplotypes(const PanelAlleleMatrix& panel);
+
+// The beam's diplotypes that are not panel pairs, in proposal order, ranked 1.. with ids following the panel
+// baseline; unique_candidates_found counts them. The beam must have returned every diplotype it found.
+MosaicBeamResult off_panel_mosaics(const MosaicBeamResult& beam, const std::vector<MosaicCandidate>& panel);
+
 MosaicBeamResult propose_mosaic_diplotypes(
     const PanelAlleleMatrix& panel,
     const PreparedProposalEmissions& emissions,

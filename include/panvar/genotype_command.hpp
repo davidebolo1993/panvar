@@ -39,6 +39,9 @@ struct GenotypeCommandOptions {
     // Merged proposal states retained per block: a resource cap on the grouped-state search. A search
     // that prunes and still misses max_candidates ends CANDIDATE_INCOMPLETE, whatever this is set to.
     std::size_t proposal_state_limit = 1024;
+    // Panel pairs times fragments: the predicted diploid-combination work of the protected panel baseline.
+    // A baseline over this is refused whole, never scored partially.
+    std::uint64_t max_panel_pair_fragment_evaluations = 20000000000ULL;
     std::uint64_t max_piece_hits = 2000000000ULL;
     std::uint64_t max_proposed_starts_per_haplotype = 50000000ULL;
     std::uint64_t max_physical_origins = 500000000ULL;

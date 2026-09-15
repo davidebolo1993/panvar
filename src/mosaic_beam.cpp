@@ -5,6 +5,7 @@
 #include <limits>
 #include <optional>
 #include <queue>
+#include <set>
 #include <stdexcept>
 #include <tuple>
 #include <unordered_map>
@@ -344,6 +345,45 @@ std::uint64_t extension_upper_bound(std::size_t templates, std::size_t blocks, s
 }
 
 } // namespace
+
+std::vector<MosaicCandidate> panel_diplotypes(const PanelAlleleMatrix& panel) {
+    validate_panel(panel);
+    std::vector<MosaicCandidate> out;
+    std::set<std::pair<std::vector<std::size_t>, std::vector<std::size_t>>> seen;
+    for (std::size_t i = 0; i < panel.template_count(); ++i) {
+        for (std::size_t j = i; j < panel.template_count(); ++j) {
+            MosaicCandidate candidate;
+            candidate.diplotype.first.alleles.assign(panel.template_alleles[i].begin(), panel.template_alleles[i].end());
+            candidate.diplotype.second.alleles.assign(panel.template_alleles[j].begin(), panel.template_alleles[j].end());
+            if (candidate.diplotype.second.alleles < candidate.diplotype.first.alleles) {
+                std::swap(candidate.diplotype.first, candidate.diplotype.second);
+            }
+            if (!seen.emplace(candidate.diplotype.first.alleles, candidate.diplotype.second.alleles).second) continue;
+            candidate.candidate_id = out.size();
+            out.push_back(std::move(candidate));
+        }
+    }
+    return out;
+}
+
+MosaicBeamResult off_panel_mosaics(const MosaicBeamResult& beam, const std::vector<MosaicCandidate>& panel) {
+    std::set<std::pair<std::vector<std::size_t>, std::vector<std::size_t>>> keys;
+    for (const MosaicCandidate& candidate : panel) {
+        keys.emplace(candidate.diplotype.first.alleles, candidate.diplotype.second.alleles);
+    }
+    MosaicBeamResult out = beam;
+    out.candidates.clear();
+    for (const MosaicCandidate& candidate : beam.candidates) {
+        if (keys.count({candidate.diplotype.first.alleles, candidate.diplotype.second.alleles}) != 0) continue;
+        out.candidates.push_back(candidate);
+    }
+    for (std::size_t rank = 0; rank < out.candidates.size(); ++rank) {
+        out.candidates[rank].candidate_id = panel.size() + rank;
+        out.candidates[rank].unique_rank = rank + 1;
+    }
+    out.unique_candidates_found = out.candidates.size();
+    return out;
+}
 
 MosaicBeamResult propose_mosaic_diplotypes(
     const PanelAlleleMatrix& panel,
