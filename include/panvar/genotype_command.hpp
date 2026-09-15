@@ -24,7 +24,9 @@ struct GenotypeCommandOptions {
     // data, so this is required and its provenance is recorded in the status file.
     std::string library_path;
     std::size_t threads = 1;
-    std::size_t max_candidates = 64;
+    // Off-panel mosaic diplotypes added to the protected panel baseline; 0 scores the panel alone. Every
+    // unordered panel diplotype is always a candidate and is not counted here.
+    std::size_t max_mosaic_candidates = 64;
 
     std::size_t kmer_size = 31;
     std::size_t syncmer_s = 15;
@@ -38,7 +40,8 @@ struct GenotypeCommandOptions {
     // values are recorded in the status file. Not command-line options: the public surface is fixed.
     std::uint64_t max_beam_extensions = 2000000000ULL;
     // Merged proposal states retained per block: a resource cap on the grouped-state search. A search
-    // that prunes and still misses max_candidates ends CANDIDATE_INCOMPLETE, whatever this is set to.
+    // that prunes and finds fewer than max_mosaic_candidates off-panel mosaics still calls -- every panel
+    // diplotype was evaluated -- and reports mosaic_target_reached false and candidate_scope CONDITIONAL.
     std::size_t proposal_state_limit = 1024;
     // Panel pairs times fragments: the predicted diploid-combination work of the protected panel baseline.
     // A baseline over this is refused whole, never scored partially.
@@ -50,9 +53,9 @@ struct GenotypeCommandOptions {
     std::uint64_t max_mass_cells = 200000000ULL;
     bool quiet = false;
     // Development harness only; not a command-line option. When non-empty (strictly increasing, the
-    // last equal to max_candidates), the model, markers and proposal are computed once, and each prefix
+    // last equal to max_mosaic_candidates), the model, markers and proposal are computed once, and each prefix
     // k is then refused, ranked and written under <out_prefix>.K<k> by the same code a standalone run
-    // with max_candidates = k uses: K only truncates the final proposal ordering. Every candidate a
+    // with max_mosaic_candidates = k uses: K only truncates the final proposal ordering. Every candidate a
     // prefix contains is scored; the production refusal rule still applies to each k.
     std::vector<std::size_t> development_candidate_prefixes;
     // Not a command-line option. When positive (and larger than every primary candidate set), the same proposal

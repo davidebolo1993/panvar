@@ -22,9 +22,12 @@
 #include "panvar/mosaic_beam.hpp"
 #include "panvar/mosaic_spelling.hpp"
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -387,9 +390,11 @@ int evaluate(const Args& args) {
 
     std::ofstream summary(out + ".summary.tsv");
     summary << "key\tvalue\nscheme\t" << scheme << "\ndonor\t" << donor << "\nrun\t" << run << '\n';
-    for (const char* key : {"status", "note", "max_candidates", "mismatch_band", "proposal_state_limit",
-                            "unique_candidates", "unique_candidates_found", "proposal_states_pruned",
-                            "proposal_search_exhaustive", "proposal_target_reached",
+    for (const char* key : {"status", "note", "max_mosaic_candidates", "mismatch_band", "proposal_state_limit",
+                            "mosaic_candidates", "mosaic_candidates_found", "proposal_states_pruned",
+                            "proposal_search_exhaustive", "mosaic_target_reached", "panel_diplotypes",
+                            "panel_baseline_complete", "candidate_scope", "phase_support_within_candidates",
+                            "phase_audit_status",
                             "candidate_set_conditional", "sequence_candidates", "phase_support",
                             "fragment_contenders", "blocks_genotype_read_supported", "numeric_separation_gap",
                             "fragment_term_gap_to_runner_up", "winner_candidate_set_probability",
@@ -453,7 +458,7 @@ int evaluate(const Args& args) {
     std::size_t blocks_with_both_available = 0;
 
     std::ofstream table(out + ".blocks.tsv");
-    table << "scheme\tdonor\tmax_candidates\tblock_id\tkind\ttruth1_bp\ttruth2_bp\tcalled1_bp\t"
+    table << "scheme\tdonor\tmax_mosaic_candidates\tblock_id\tkind\ttruth1_bp\ttruth2_bp\tcalled1_bp\t"
              "called2_bp\tunordered_distance\tavailability_floor\texcess\ttruth1_available\t"
              "truth2_available\tgenotype_support\n";
 
@@ -508,7 +513,7 @@ int evaluate(const Args& args) {
             ++undefined_blocks;
             spellable[0] = spellable[0] && t1.has_value();
             spellable[1] = spellable[1] && t2.has_value();
-            table << scheme << '\t' << donor << '\t' << status.at("max_candidates") << '\t'
+            table << scheme << '\t' << donor << '\t' << status.at("max_mosaic_candidates") << '\t'
                   << block.block_id << '\t' << (variant ? "SV" : "context")
                   << "\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\tNA\n";
             continue;
@@ -554,7 +559,7 @@ int evaluate(const Args& args) {
             distance_cell = std::to_string(unordered);
             excess_cell = std::to_string(unordered - floor);
         }
-        table << scheme << '\t' << donor << '\t' << status.at("max_candidates") << '\t' << block.block_id
+        table << scheme << '\t' << donor << '\t' << status.at("max_mosaic_candidates") << '\t' << block.block_id
               << '\t' << (variant ? "SV" : "context") << '\t' << t1->size() << '\t' << t2->size() << '\t'
               << called1_bp << '\t' << called2_bp << '\t' << distance_cell << '\t' << floor << '\t'
               << excess_cell << '\t' << (available1 ? "true" : "false") << '\t'
@@ -687,7 +692,7 @@ int evaluate(const Args& args) {
     } else {
         summary << "accuracy\texcluded: run status is not COMPLETE\n";
     }
-    std::cout << "evaluated " << scheme << " " << donor << " K=" << status.at("max_candidates") << '\n';
+    std::cout << "evaluated " << scheme << " " << donor << " K=" << status.at("max_mosaic_candidates") << '\n';
     return 0;
 }
 
@@ -1225,7 +1230,12 @@ int compare(const Args& args) {
 // rows, so a unit test can refit the real anchors without the reads.
 int anchors(const Args& args) {
     const std::string out = args.required("out");
-    const LoadedModel loaded = load_model(args.required("gfa"), args.required("reference"), out + ".model.sorted.gfa", 50);
+    // The staged graph is scratch: it goes to the system temporary directory, never beside the output, which
+    // for a test fixture is the source tree.
+    const std::string stage =
+        (std::filesystem::temp_directory_path() / ("genotype_probe_anchors_" + std::to_string(::getpid()) + ".sorted.gfa")).string();
+    const LoadedModel loaded = load_model(args.required("gfa"), args.required("reference"), stage, 50);
+    std::filesystem::remove(stage);
     const std::vector<panvar::ReadPair> fragments = read_pairs(args.required("reads1"), args.required("reads2"));
     const panvar::PreparedMarkerPanel markers = panvar::build_marker_panel(*loaded.model, 31, 15);
     const panvar::MarkerObservations observations = panvar::count_marker_observations(markers, fragments);
@@ -1403,7 +1413,7 @@ int genotype(const Args& args) {
         options.development_candidate_prefixes.push_back(k);
     }
     if (options.development_candidate_prefixes.empty()) throw std::runtime_error("--prefixes is empty");
-    options.max_candidates = options.development_candidate_prefixes.back();
+    options.max_mosaic_candidates = options.development_candidate_prefixes.back();
     options.quiet = true;
     const panvar::GenotypeRunStatus status = panvar::run_genotype(options);
     std::cout << "genotype " << options.out_prefix << " state limit " << options.proposal_state_limit

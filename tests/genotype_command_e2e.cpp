@@ -205,7 +205,7 @@ void test_end_to_end() {
     options.reads2_path = path("r2.fq");
     options.library_path = path("lib.txt");
     options.out_prefix = path("run");
-    options.max_candidates = 16;
+    options.max_mosaic_candidates = 16;
     options.kmer_size = 21;
     options.syncmer_s = 11;
     options.quiet = true;
@@ -281,7 +281,7 @@ void test_end_to_end() {
     // must not move it.
     panvar::GenotypeCommandOptions again = options;
     again.out_prefix = path("other");
-    again.max_candidates = 8;
+    again.max_mosaic_candidates = 8;
     require(panvar::run_genotype(again) == panvar::GenotypeRunStatus::Complete,
             "the second run must also complete");
     require(read_status(path("other.mosaic_status.tsv")).at("model_fingerprint") ==
@@ -317,7 +317,7 @@ void test_refusals() {
     undeclared.reads2_path = path("r2.fq");
     undeclared.library_path = path("lib_undeclared.txt");
     undeclared.out_prefix = path("undeclared");
-    undeclared.max_candidates = 16;
+    undeclared.max_mosaic_candidates = 16;
     undeclared.kmer_size = 21;
     undeclared.syncmer_s = 11;
     undeclared.quiet = true;
@@ -342,7 +342,7 @@ panvar::GenotypeCommandOptions tiny_options(const std::string& prefix, const std
     options.reads2_path = reads2;
     options.library_path = path("lib.txt");
     options.out_prefix = path(prefix);
-    options.max_candidates = 16;
+    options.max_mosaic_candidates = 16;
     options.kmer_size = 21;
     options.syncmer_s = 11;
     options.quiet = true;
@@ -559,20 +559,22 @@ void test_off_panel_truth_is_recovered() {
     simulate(truths.first, truths.second, path("phaseable_r1.fq"), path("phaseable_r2.fq"), 123);
     // The crowding fixture. Before equivalence merging, a width of 64 filled with template histories of the
     // two zero-switch phasings and the truth was never offered. Under the same budget of 64 merged states
-    // the truth must now be proposed. The locus has 36 distinct diplotypes and 64 merged states hold only
-    // four of them, so with K=16 the search is pruned and misses its target: the run must refuse to call,
-    // and its diagnostic manifest must still show the truth among what was proposed.
+    // the truth must now be proposed. 64 merged states hold too few off-panel mosaics for K=16, so the
+    // search is pruned and misses its mosaic target; every panel diplotype was still scored, so the run calls
+    // and is marked conditional (review round 6), and its manifest shows the truth among what was proposed.
     {
         panvar::GenotypeCommandOptions budget = tiny_options(
             "phaseable_budget", path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa");
         budget.proposal_state_limit = 64;
-        require(panvar::run_genotype(budget) == panvar::GenotypeRunStatus::CandidateIncomplete,
-                "a pruned search that misses K must refuse even when it proposed the truth");
+        require(panvar::run_genotype(budget) == panvar::GenotypeRunStatus::Complete,
+                "a pruned search short of K must still call from the complete panel baseline");
         const auto budget_status = read_status(path("phaseable_budget.mosaic_status.tsv"));
         require(budget_status.at("proposal_search_exhaustive") == "false" &&
-                    budget_status.at("proposal_target_reached") == "false",
+                    budget_status.at("mosaic_target_reached") == "false",
                 "fixture: 64 merged states must prune and miss K=16");
-        require(no_ranking_or_call("phaseable_budget"), "a refused proposal must not rank or call");
+        require(budget_status.at("panel_baseline_complete") == "true" &&
+                    budget_status.at("candidate_scope") == "CONDITIONAL" && exists(path("phaseable_budget.genotypes.tsv")),
+                "a mosaic-deficient call must be marked conditional and still emit its genotypes");
         const TruthFrame budget_frame = rebuild_truth_frame(
             budget, budget_status.at("model_fingerprint"), kTruth1Nodes, kTruth2Nodes);
         require(truth_phasing_in_candidates(budget_frame, path("phaseable_budget.mosaic_candidates.tsv")),
@@ -589,7 +591,7 @@ void test_off_panel_truth_is_recovered() {
             std::string("the phaseable off-panel run must complete, got ") +
                 panvar::genotype_run_status_name(status) + ": " +
                 (reported.count("note") ? reported.at("note") : ""));
-    require(reported.at("proposal_search_exhaustive") == "true" || reported.at("proposal_target_reached") == "true",
+    require(reported.at("proposal_search_exhaustive") == "true" || reported.at("mosaic_target_reached") == "true",
             "an accuracy-eligible run must have searched exhaustively or reached its target");
     require(reported.at("phase_support") == "READS_WITHIN_CANDIDATES",
             "the reads, not the prior, must choose the phaseable off-panel truth within its candidates");
@@ -699,35 +701,62 @@ void test_off_panel_phase_is_not_claimed_from_reads() {
 }
 
 
-// The inverted wrong-call gate. At NA19240 K=8 a pruned proposal that never offered the truth produced a
-// certified, fragment-decided, wrong call. A pruned search that misses its target must now end
-// CANDIDATE_INCOMPLETE with no ranking and no call; an exhaustive search with fewer candidates than
-// requested is complete and unconditional.
+// Candidate-set status rules (review round 6). Every panel diplotype is always scored, so a pruned search that
+// finds fewer off-panel mosaics than K still calls, marked CONDITIONAL with the shortfall explicit; K = 0 scores
+// the panel alone; a panel baseline over its budget is refused whole; an exhaustive search with fewer mosaics
+// than requested is complete and unconditional.
 void test_proposal_status_rules() {
     const std::string r1 = path("phaseable_r1.fq");
     const std::string r2 = path("phaseable_r2.fq");
 
     panvar::GenotypeCommandOptions starved = tiny_options("starved", r1, r2, "tiny_phaseable.gfa");
     starved.proposal_state_limit = 1;
-    require(panvar::run_genotype(starved) == panvar::GenotypeRunStatus::CandidateIncomplete,
-            "a pruned search that misses its target must end CANDIDATE_INCOMPLETE");
+    require(panvar::run_genotype(starved) == panvar::GenotypeRunStatus::Complete,
+            "a pruned search short of its mosaic target must still call from the complete panel baseline");
     const auto starved_status = read_status(path("starved.mosaic_status.tsv"));
     require(starved_status.at("proposal_search_exhaustive") == "false" &&
-                starved_status.at("proposal_target_reached") == "false" &&
-                std::stoull(starved_status.at("proposal_states_pruned")) > 0,
-            "the status must report the pruned, target-unmet search separately");
-    require(no_ranking_or_call("starved"), "a target-unmet pruned search must not rank or call");
+                starved_status.at("mosaic_target_reached") == "false" &&
+                std::stoull(starved_status.at("proposal_states_pruned")) > 0 &&
+                starved_status.at("panel_baseline_complete") == "true" &&
+                starved_status.at("candidate_scope") == "CONDITIONAL" && starved_status.at("global_certified") == "false",
+            "a mosaic-deficient call must report the shortfall, a complete panel and a conditional scope");
+    require(exists(path("starved.genotypes.tsv")) && exists(path("starved.block_genotypes.tsv")),
+            "a mosaic-deficient call must emit its genotypes");
+
+    // K = 0: the complete panel alone.
+    panvar::GenotypeCommandOptions panel_only = tiny_options("panel_only", r1, r2, "tiny_phaseable.gfa");
+    panel_only.max_mosaic_candidates = 0;
+    panel_only.proposal_state_limit = 1048576;
+    require(panvar::run_genotype(panel_only) == panvar::GenotypeRunStatus::Complete, "a K = 0 run must call");
+    const auto panel_only_status = read_status(path("panel_only.mosaic_status.tsv"));
+    std::size_t panel_only_mosaics = 0;
+    for (const auto& row : read_rows(path("panel_only.mosaic_candidates.tsv"))) panel_only_mosaics += row[13] == "mosaic";
+    require(panel_only_mosaics == 0 && panel_only_status.at("mosaic_candidates") == "0" &&
+                panel_only_status.at("panel_baseline_complete") == "true" &&
+                panel_only_status.at("candidate_scope") ==
+                    (std::stoul(panel_only_status.at("mosaic_candidates_found")) > 0 ? "CONDITIONAL" : "COMPLETE") &&
+                exists(path("panel_only.genotypes.tsv")),
+            "K = 0 must rank the panel baseline alone, conditional exactly when the beam found mosaics it omits");
+
+    // A panel baseline over its declared budget is refused whole: no partial baseline, no ranking, no call.
+    panvar::GenotypeCommandOptions over_budget = tiny_options("panel_budget", r1, r2, "tiny_phaseable.gfa");
+    over_budget.max_panel_pair_fragment_evaluations = 1;
+    require(panvar::run_genotype(over_budget) == panvar::GenotypeRunStatus::CandidateIncomplete,
+            "a panel baseline over its budget must refuse");
+    require(read_status(path("panel_budget.mosaic_status.tsv")).at("panel_baseline_complete") == "false" &&
+                no_ranking_or_call("panel_budget"),
+            "a refused panel baseline must not rank or call and must say the baseline is incomplete");
 
     panvar::GenotypeCommandOptions exhaustive = tiny_options("exhaustive", r1, r2, "tiny_phaseable.gfa");
-    exhaustive.max_candidates = 64;
+    exhaustive.max_mosaic_candidates = 64;
     exhaustive.proposal_state_limit = 1048576;
     require(panvar::run_genotype(exhaustive) == panvar::GenotypeRunStatus::Complete,
             "an exhaustive search with fewer candidates than requested must complete");
     const auto exhaustive_status = read_status(path("exhaustive.mosaic_status.tsv"));
     require(exhaustive_status.at("proposal_search_exhaustive") == "true" &&
-                exhaustive_status.at("proposal_target_reached") == "false" &&
+                exhaustive_status.at("mosaic_target_reached") == "false" &&
                 exhaustive_status.at("candidate_set_conditional") == "false" &&
-                std::stoul(exhaustive_status.at("unique_candidates_found")) < 64,
+                std::stoul(exhaustive_status.at("mosaic_candidates_found")) < 64,
             "an exhaustive search below K must be reported complete and unconditional");
     require(exhaustive_status.at("candidate_scope") == "COMPLETE" && exhaustive_status.at("global_certified") == "true",
             "an exhaustive, untruncated, complete ranking is the only globally certified result");
@@ -744,7 +773,7 @@ void test_proposal_status_rules() {
     }
     require(exhaustive_status.at("panel_baseline_complete") == "true" &&
                 std::stoul(exhaustive_status.at("panel_diplotypes")) == panel_rows && panel_rows > 0 &&
-                std::stoul(exhaustive_status.at("unique_candidates")) == mosaic_rows &&
+                std::stoul(exhaustive_status.at("mosaic_candidates")) == mosaic_rows &&
                 std::stoul(exhaustive_status.at("candidates_total")) == panel_rows + mosaic_rows,
             "the status must report the complete panel baseline and the manifest must hold every panel pair");
     require(exhaustive_status.at("marker_background_effective") == exhaustive_status.at("marker_background") &&
@@ -883,12 +912,12 @@ void test_candidate_prefixes_match_standalone() {
         }
         return text;
     };
-    const std::vector<std::size_t> prefixes = {2, 4, 16, 64};
+    const std::vector<std::size_t> prefixes = {0, 2, 4, 16, 64};
     for (const std::size_t state_limit : {std::size_t{64}, std::size_t{1048576}}) {
         const std::string base = "prefixes_" + std::to_string(state_limit);
         panvar::GenotypeCommandOptions ladder = tiny_options(base, r1, r2, "tiny_phaseable.gfa");
         ladder.proposal_state_limit = state_limit;
-        ladder.max_candidates = prefixes.back();
+        ladder.max_mosaic_candidates = prefixes.back();
         ladder.development_candidate_prefixes = prefixes;
         panvar::run_genotype(ladder);
         std::size_t refused = 0;
@@ -897,7 +926,7 @@ void test_candidate_prefixes_match_standalone() {
             const std::string name = base + "_standalone_K" + std::to_string(k);
             panvar::GenotypeCommandOptions standalone = tiny_options(name, r1, r2, "tiny_phaseable.gfa");
             standalone.proposal_state_limit = state_limit;
-            standalone.max_candidates = k;
+            standalone.max_mosaic_candidates = k;
             const panvar::GenotypeRunStatus status = panvar::run_genotype(standalone);
             if (status == panvar::GenotypeRunStatus::CandidateIncomplete) ++refused;
             if (status == panvar::GenotypeRunStatus::Complete) ++complete;
@@ -910,12 +939,11 @@ void test_candidate_prefixes_match_standalone() {
                             " must reproduce the standalone " + suffix);
             }
         }
+        require(refused == 0 && complete == prefixes.size(),
+                "every prefix, K = 0 and mosaic-deficient ones included, must call from the complete panel");
         if (state_limit == 64) {
-            require(refused > 0 && complete > 0,
-                    "fixture: at 64 merged states the small prefixes must call and the large ones refuse");
-        } else {
-            require(refused == 0 && complete == prefixes.size(),
-                    "fixture: an exhaustive proposal must complete at every prefix");
+            require(read_status(path(base + ".K64.mosaic_status.tsv")).at("mosaic_target_reached") == "false",
+                    "fixture: at 64 merged states the largest prefix must be mosaic-deficient");
         }
         std::cout << "  candidate prefixes at state limit " << state_limit << ": " << complete << " complete, "
                   << refused << " refused, each identical to its standalone run\n";
@@ -929,7 +957,7 @@ void test_phase_audit() {
     panvar::GenotypeCommandOptions phaseable = tiny_options(
         "audit_phaseable", path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa");
     phaseable.proposal_state_limit = 1048576;
-    phaseable.max_candidates = 4;
+    phaseable.max_mosaic_candidates = 4;
     phaseable.phase_audit_candidates = 64;
     require(panvar::run_genotype(phaseable) == panvar::GenotypeRunStatus::Complete,
             "the audited phaseable run must complete");
@@ -946,19 +974,20 @@ void test_phase_audit() {
     check_block_posteriors("audit_phaseable");
 
     // A claim the audit cannot check is withdrawn: at 64 merged states the phaseable locus has too few off-panel
-    // mosaics for a 64-mosaic audit set, so the pruned audit is refused and the K = 1 claim is not reported.
+    // mosaics for a 64-mosaic audit set, so phase is UNRESOLVED -- while the block genotypes are still emitted.
     panvar::GenotypeCommandOptions narrow =
         tiny_options("audit_unreachable", path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa");
     narrow.proposal_state_limit = 64;
-    narrow.max_candidates = 1;
+    narrow.max_mosaic_candidates = 1;
     narrow.phase_audit_candidates = 64;
     require(panvar::run_genotype(narrow) == panvar::GenotypeRunStatus::Complete,
             "the primary set must still call when its audit set cannot be reached");
     const auto withdrawn = read_status(path("audit_unreachable.mosaic_status.tsv"));
     require(withdrawn.at("phase_support_within_candidates") == "READS_WITHIN_CANDIDATES" &&
-                withdrawn.at("phase_audit_status") == "CANDIDATE_INCOMPLETE" &&
-                withdrawn.at("phase_support") == "UNRESOLVED",
-            "a phase claim whose audit set cannot be ranked must be withdrawn, got " + withdrawn.at("phase_support"));
+                withdrawn.at("phase_audit_status") == "MOSAIC_TARGET_UNREACHED" &&
+                withdrawn.at("phase_support") == "UNRESOLVED" && exists(path("audit_unreachable.genotypes.tsv")),
+            "an unreachable audit must leave phase UNRESOLVED and still emit genotypes, got " +
+                withdrawn.at("phase_support"));
 
     // Every branch of the decision, including the ones no small fixture reaches: an audit that completes with
     // the same call but a phase tie, and one that changes the winner or the block genotypes.

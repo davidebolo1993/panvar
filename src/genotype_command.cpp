@@ -213,7 +213,7 @@ void write_status(
     out << "syncmer_s\t" << options.syncmer_s << '\n';
     out << "min_variant_bp\t" << options.min_variant_bp << '\n';
     out << "switch_probability\t" << options.switch_probability << '\n';
-    out << "max_candidates\t" << options.max_candidates << '\n';
+    out << "max_mosaic_candidates\t" << options.max_mosaic_candidates << '\n';
     out << "mismatch_band\t" << options.mismatch_band << '\n';
     // Version one is serial by contract: the scorer is not threaded before the serial algorithm
     // meets its performance gate. The requested value is recorded so a run is reproducible.
@@ -282,11 +282,11 @@ void write_status(
     if (beam != nullptr) {
         out << "proposal_state_limit\t" << beam->state_limit_used << '\n';
         out << "proposal_final_states\t" << beam->final_states << '\n';
-        out << "unique_candidates\t" << beam->candidates.size() << '\n';
-        out << "unique_candidates_found\t" << beam->unique_candidates_found << '\n';
+        out << "mosaic_candidates\t" << beam->candidates.size() << '\n';
+        out << "mosaic_candidates_found\t" << beam->unique_candidates_found << '\n';
         out << "proposal_states_pruned\t" << beam->states_pruned << '\n';
         out << "proposal_search_exhaustive\t" << (beam->search_exhaustive ? "true" : "false") << '\n';
-        out << "proposal_target_reached\t" << (beam->unique_target_reached ? "true" : "false") << '\n';
+        out << "mosaic_target_reached\t" << (beam->unique_target_reached ? "true" : "false") << '\n';
         // Any ranking over a set that omits candidates is conditional on that set.
         out << "candidate_set_conditional\t" << (beam->candidate_set_conditional ? "true" : "false")
             << '\n';
@@ -294,8 +294,8 @@ void write_status(
         out << "beam_extensions\t" << beam->extensions_evaluated << '\n';
     }
     if (candidate_set != nullptr) {
-        // unique_candidates, unique_candidates_found and proposal_target_reached above count off-panel
-        // mosaics; the panel baseline is added to them whole.
+        // mosaic_candidates, mosaic_candidates_found and mosaic_target_reached above count off-panel mosaics;
+        // the panel baseline is added to them whole.
         out << "panel_diplotypes\t" << candidate_set->panel_diplotypes << '\n';
         out << "panel_baseline_complete\t" << (candidate_set->panel_baseline_complete ? "true" : "false") << '\n';
         out << "beam_diplotypes_found\t" << candidate_set->beam_diplotypes_found << '\n';
@@ -442,19 +442,19 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     if (!options.development_candidate_prefixes.empty()) {
         const std::vector<std::size_t>& prefixes = options.development_candidate_prefixes;
         for (std::size_t i = 0; i < prefixes.size(); ++i) {
-            if (prefixes[i] == 0 || (i > 0 && prefixes[i] <= prefixes[i - 1])) {
-                throw std::runtime_error("development candidate prefixes must be positive and increasing");
+            if (i > 0 && prefixes[i] <= prefixes[i - 1]) {
+                throw std::runtime_error("development candidate prefixes must be strictly increasing");
             }
             remove_run_outputs(options.out_prefix + ".K" + std::to_string(prefixes[i]));
         }
-        if (prefixes.back() != options.max_candidates) {
-            throw std::runtime_error("the largest development candidate prefix must equal max_candidates");
+        if (prefixes.back() != options.max_mosaic_candidates) {
+            throw std::runtime_error("the largest development candidate prefix must equal max_mosaic_candidates");
         }
     }
 
     if (options.phase_audit_candidates > 0) {
         const std::size_t largest = options.development_candidate_prefixes.empty()
-                                        ? options.max_candidates
+                                        ? options.max_mosaic_candidates
                                         : options.development_candidate_prefixes.back();
         if (options.phase_audit_candidates <= largest) {
             throw std::runtime_error("the phase audit set must be larger than every primary candidate set");
@@ -610,7 +610,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     // The beam returns every diplotype it found -- never more than its state limit -- so the number of
     // off-panel mosaics below is exact, not a count truncated by K.
     beam_parameters.unique_candidate_target =
-        std::max(options.proposal_state_limit, options.max_candidates + panel_candidates.size());
+        std::max(options.proposal_state_limit, options.max_mosaic_candidates + panel_candidates.size());
     beam_parameters.state_limit = options.proposal_state_limit;
     beam_parameters.max_extension_evaluations = options.max_beam_extensions;
     MosaicBeamResult beam;
@@ -635,18 +635,16 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     // A diplotype's fragment score does not depend on which other candidates are scored with it, so the panel
     // and the largest ranked mosaic prefix are scored once and every prefix is certified from those scores.
     const std::vector<std::size_t> targets = options.development_candidate_prefixes.empty()
-                                                 ? std::vector<std::size_t>{options.max_candidates}
+                                                 ? std::vector<std::size_t>{options.max_mosaic_candidates}
                                                  : options.development_candidate_prefixes;
+    // Every target is ranked -- a mosaic-deficient one too, conditionally (review round 6) -- so the union holds
+    // the panel and the largest set of mosaics any primary, prefix or audit set contains.
     std::size_t scored_mosaics = 0;
-    bool any_ranked = false;
+    const bool any_ranked = true;
     std::vector<std::size_t> score_targets = targets;
     if (options.phase_audit_candidates > 0) score_targets.push_back(options.phase_audit_candidates);
     for (const std::size_t k : score_targets) {
-        const MosaicBeamResult view = candidate_prefix(mosaics, k);
-        if (view.search_exhaustive || view.unique_target_reached) {
-            any_ranked = true;
-            scored_mosaics = std::max(scored_mosaics, view.candidates.size());
-        }
+        scored_mosaics = std::max(scored_mosaics, candidate_prefix(mosaics, k).candidates.size());
     }
     mark = Clock::now();
     std::vector<MosaicPath> paths;
@@ -868,34 +866,10 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             "retained_logsum_proposal_score\tproposal_emission_component\t"
             "proposal_transition_component\tequivalent_retained_histories\tevery_allele_scored\t"
             "exact_path_prior\tsequence_candidate_id\thistory_count_saturated\tsource\n";
-        // A pruned search that misses its mosaic target has omitted mosaics it never proposed. The panel
-        // baseline does not change that: an absent recombinant truth may be among them.
-        if (!beam.search_exhaustive && !beam.unique_target_reached) {
-            timings.total = seconds_since(started);
-            {
-                // Diagnostics only: the mosaics the search did propose. Not a ranking; no scores.
-                std::ofstream out = open_output(options.out_prefix + ".mosaic_candidates.tsv");
-                out << manifest_header;
-                for (const MosaicCandidate& candidate : beam.candidates) {
-                    out << candidate.candidate_id << '\t' << candidate.unique_rank << '\t'
-                        << join_alleles(candidate.diplotype.first.alleles) << '\t'
-                        << join_alleles(candidate.diplotype.second.alleles) << '\t'
-                        << candidate.best_proposal_score << '\t'
-                        << candidate.retained_logsum_proposal_score << '\t'
-                        << candidate.proposal_emission_component << '\t'
-                        << candidate.proposal_transition_component << '\t'
-                        << candidate.equivalent_retained_histories << '\t'
-                        << (candidate.every_allele_scored ? "true" : "false") << "\tNA\tNA\t"
-                        << (candidate.history_count_saturated ? "true" : "false") << "\tmosaic\n";
-                }
-            }
-            write_status(status_path, GenotypeRunStatus::CandidateIncomplete, fingerprint, options, library,
-                         timings, &built.report, &panel, &beam, nullptr,
-                         "the proposal pruned merged states and still found fewer off-panel mosaics than "
-                         "requested; no call is made from a set that omits unproposed candidates",
-                         nullptr, &depth, &candidate_report);
-            return GenotypeRunStatus::CandidateIncomplete;
-        }
+        // A pruned search that found fewer off-panel mosaics than requested has omitted mosaics it never proposed,
+        // and the status says so (mosaic_target_reached false, candidate_scope CONDITIONAL). Every panel diplotype
+        // was still evaluated, so the call is made (review round 6): the panel-supported genotype is usable, and
+        // the missing mosaics are explicit rather than a reason to withhold it.
         if (!rescore_failure.empty()) {
             timings.total = seconds_since(started);
             write_status(status_path, GenotypeRunStatus::RescoreIncomplete, fingerprint, options, library,
@@ -927,7 +901,8 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             bool same_blocks = false;
             const MosaicBeamResult audit_view = candidate_prefix(mosaics, options.phase_audit_candidates);
             if (!audit_view.search_exhaustive && !audit_view.unique_target_reached) {
-                summary.phase_audit_status = "CANDIDATE_INCOMPLETE";
+                // An unreachable audit set leaves phase unresolved; it never withholds the block genotypes.
+                summary.phase_audit_status = "MOSAIC_TARGET_UNREACHED";
             } else if (ranking.status != RescoreStatus::Complete) {
                 summary.phase_audit_status = "NOT_RUN";
             } else {
@@ -1100,12 +1075,12 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     };
 
     if (options.development_candidate_prefixes.empty()) {
-        return finish(candidate_prefix(mosaics, options.max_candidates), options, timings);
+        return finish(candidate_prefix(mosaics, options.max_mosaic_candidates), options, timings);
     }
     GenotypeRunStatus last = GenotypeRunStatus::Complete;
     for (const std::size_t k : options.development_candidate_prefixes) {
         GenotypeCommandOptions prefix_options = options;
-        prefix_options.max_candidates = k;
+        prefix_options.max_mosaic_candidates = k;
         prefix_options.out_prefix = options.out_prefix + ".K" + std::to_string(k);
         prefix_options.development_candidate_prefixes.clear();
         remove_run_outputs(prefix_options.out_prefix);
@@ -1130,7 +1105,11 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (flag == "--out-prefix" || flag == "-o") options.out_prefix = need(i);
         else if (flag == "--library") options.library_path = need(i);
         else if (flag == "--threads") options.threads = std::stoul(need(i));
-        else if (flag == "--max-candidates") options.max_candidates = std::stoul(need(i));
+        else if (flag == "--max-mosaic-candidates") options.max_mosaic_candidates = std::stoul(need(i));
+        else if (flag == "--max-candidates") {
+            throw std::runtime_error("--max-candidates is now --max-mosaic-candidates: every panel diplotype is "
+                                     "always a candidate, and K counts only the off-panel mosaics added to it");
+        }
         else if (flag == "-q" || flag == "--quiet") options.quiet = true;
         else if (flag == "-h" || flag == "--help") {
             std::cout <<
@@ -1138,9 +1117,12 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 "  panvar genotype --gfa <graph.gfa> --reference-path <name> \\\n"
                 "                  --reads1 <r1.fq> --reads2 <r2.fq> --library <params.txt> \\\n"
                 "                  [--bubbles <bubbles.csv>] [--out-prefix <prefix>] \\\n"
-                "                  [--threads <N>] [--max-candidates <K>]\n\n"
+                "                  [--threads <N>] [--max-mosaic-candidates <K>]\n\n"
                 "Calls a pair of whole-locus mosaic haplotypes and projects them to one allele\n"
                 "pair per SV block. Paired reads only.\n\n"
+                "Every unordered pair of panel haplotypes is always a candidate. --max-mosaic-candidates\n"
+                "adds up to K recombinant mosaics from the proposal beam (0: the panel alone); when the\n"
+                "beam finds fewer, the call is still made and marked CONDITIONAL.\n\n"
                 "Outputs <prefix>.genotypes.tsv, .block_genotypes.tsv, .mosaic_candidates.tsv,\n"
                 ".mosaic_scores.tsv,"
                 ".mosaic_status.tsv and .mosaic_haplotypes.fa. An incomplete run emits its\n"

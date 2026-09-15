@@ -269,6 +269,12 @@ if(PANVAR_BUILD_TESTING)
         target_link_libraries(genotype_mosaic_proposal_test PRIVATE panvarlib)
         target_compile_options(genotype_mosaic_proposal_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME panvar_genotype_mosaic_proposal COMMAND genotype_mosaic_proposal_test)
+        # Runs after the genotype tests: none of them, nor the developer probes, may leave generated files in
+        # the source tree.
+        add_test(NAME panvar_genotype_source_tree_clean
+                 COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_source_tree_clean.sh)
+        set_tests_properties(panvar_genotype_source_tree_clean PROPERTIES DEPENDS
+            "panvar_genotype_mosaic_core;panvar_genotype_locus_adapter;panvar_genotype_command_e2e;panvar_genotype_fragment_oracle;panvar_genotype_fragment_scorer;panvar_genotype_mosaic_proposal")
 
         # Fast, dependency-free smoke on a tiny hand-built graph that exercises every
         # call event type + confounders with exact-record assertions (no vg needed).
