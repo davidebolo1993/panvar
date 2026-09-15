@@ -493,6 +493,95 @@ void test_li_stephens_prior() {
         "invalid boundary probability must refuse");
 }
 
+
+// Two different allele paths can spell identical complete sequences, and a read-based method cannot
+// tell them apart. The prior of a sequence must aggregate every such path, and the unordered pair's
+// log(2) must be decided on bytes. The oracle here is brute force over every allele path and every
+// ordered path pair, grouped by spelled bytes -- no forward recursion involved.
+void test_sequence_equivalent_prior_aggregation() {
+    const double kNegInf = -std::numeric_limits<double>::infinity();
+    panvar::StructuralLocusInput input;
+    input.locus_id = "sequence-equivalence";
+    input.blocks = {
+        {"b0", {{"a", "A"}, {"at", "AT"}}},
+        {"b1", {{"tg", "TG"}, {"g", "G"}}},
+    };
+    input.invariant_segments = {"C", "", "C"};
+    input.templates = {
+        {"h0", panvar::TemplateFrameStatus::Complete, {"a", "tg"}},    // CATGC
+        {"h1", panvar::TemplateFrameStatus::Complete, {"at", "g"}},    // CATGC, a different path
+        {"h2", panvar::TemplateFrameStatus::Complete, {"a", "g"}},     // CAGC
+        {"h3", panvar::TemplateFrameStatus::Complete, {"at", "tg"}},   // CATTGC
+    };
+    const panvar::PreparedGenotypeModel model = panvar::prepare_genotype_model(input);
+
+    for (double r : {0.0, 0.3, 1.0}) {
+        const std::vector<double> switches = {r};
+        std::vector<panvar::MosaicPath> paths;
+        for (std::size_t a0 = 0; a0 < 2; ++a0) {
+            for (std::size_t a1 = 0; a1 < 2; ++a1) paths.push_back(panvar::MosaicPath{{a0, a1}});
+        }
+        std::map<std::string, double> by_sequence;
+        std::vector<std::string> spelled;
+        std::vector<double> path_prior;
+        for (const panvar::MosaicPath& path : paths) {
+            spelled.push_back(panvar::spell_mosaic(model, path).bases);
+            path_prior.push_back(panvar::log_haploid_mosaic_prior(model.panel(), path, switches));
+            double& slot = by_sequence.emplace(spelled.back(), kNegInf).first->second;
+            slot = panvar::log_add_exp(slot, path_prior.back());
+        }
+        require(by_sequence.count("CATGC") == 1 && spelled.size() == 4 && by_sequence.size() == 3,
+                "fixture: exactly two distinct allele paths must spell CATGC");
+
+        for (const auto& item : by_sequence) {
+            const double dp = panvar::log_haploid_sequence_prior(model, item.first, switches);
+            if (item.second == kNegInf) {
+                require(dp == kNegInf, "an unreachable sequence must have zero prior");
+            } else {
+                require_close(dp, item.second, 1e-12,
+                              "sequence prior must equal the sum over every path spelling it");
+            }
+        }
+        require(panvar::log_haploid_sequence_prior(model, "CAAC", switches) == kNegInf,
+                "a sequence no allele path spells must have zero prior");
+
+        // Ordered path pairs, grouped by the unordered pair of spelled sequences.
+        std::map<std::pair<std::string, std::string>, double> by_pair;
+        for (std::size_t i = 0; i < paths.size(); ++i) {
+            for (std::size_t j = 0; j < paths.size(); ++j) {
+                std::pair<std::string, std::string> key = {spelled[i], spelled[j]};
+                if (key.second < key.first) std::swap(key.first, key.second);
+                double& slot = by_pair.emplace(key, kNegInf).first->second;
+                slot = panvar::log_add_exp(slot, path_prior[i] + path_prior[j]);
+            }
+        }
+        for (const auto& item : by_pair) {
+            const double expected = item.second;
+            const double actual = panvar::log_unordered_sequence_pair_prior(
+                model, item.first.first, item.first.second, switches);
+            if (expected == kNegInf) {
+                require(actual == kNegInf, "an unreachable pair must have zero prior");
+            } else {
+                require_close(actual, expected, 1e-12,
+                              "unordered sequence-pair prior must equal the brute-force sum");
+            }
+        }
+
+        // Mutation: deciding log(2) on allele paths. The two CATGC paths form a SEQUENCE homozygote,
+        // which the path-based prior scores as a heterozygote with log(2) and without aggregation.
+        if (r > 0.0 && r < 1.0) {
+            const double path_based = panvar::log_unordered_diplotype_prior(
+                model.panel(), panvar::MosaicDiplotype{paths[1], paths[2]}, switches);
+            const double sequence_based =
+                panvar::log_unordered_sequence_pair_prior(model, "CATGC", "CATGC", switches);
+            require(spelled[1] == "CATGC" && spelled[2] == "CATGC",
+                    "fixture: paths 1 and 2 must be the two CATGC representations");
+            require(std::abs(path_based - sequence_based) > 1e-6,
+                    "the path-based prior must disagree on a sequence homozygote, or this gate is empty");
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -501,6 +590,7 @@ int main() {
         test_prepared_genotype_model();
         test_mosaic_spelling();
         test_li_stephens_prior();
+        test_sequence_equivalent_prior_aggregation();
         std::cout << "genotype mosaic core: PASS\n";
         return 0;
     } catch (const std::exception& error) {
