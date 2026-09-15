@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -32,6 +33,18 @@ struct GenotypeCommandOptions {
     // search depth, so it is fixed for the whole run and recorded in the status file.
     std::size_t mismatch_band = 6;
     std::size_t minimum_piece_bp = 12;
+    // Declared resource budgets. Reaching one ends the run incomplete with no ranking and no call; the
+    // values are recorded in the status file. Not command-line options: the public surface is fixed.
+    std::uint64_t max_beam_extensions = 2000000000ULL;
+    // Raw template-pair histories the proposal may retain. Zero means max(4 * max_candidates, 64).
+    // Equivalent template histories of one allele path share this width, so it can fill before K
+    // distinct mosaics are found; the status file reports when it did.
+    std::size_t raw_history_limit = 0;
+    std::uint64_t max_piece_hits = 2000000000ULL;
+    std::uint64_t max_proposed_starts_per_haplotype = 50000000ULL;
+    std::uint64_t max_physical_origins = 500000000ULL;
+    std::uint64_t max_state_classes = 200000000ULL;
+    std::uint64_t max_mass_cells = 200000000ULL;
     bool quiet = false;
 };
 

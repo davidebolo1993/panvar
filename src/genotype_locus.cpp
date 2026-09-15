@@ -273,17 +273,41 @@ std::size_t common_suffix(const std::vector<std::string>& values) {
     return length;
 }
 
-void trim_variant_block_to_divergence(
+struct TrimOutcome {
+    std::size_t prefix = 0;
+    std::size_t suffix = 0;
+    bool representation_dependent = false;
+};
+
+TrimOutcome trim_variant_block_to_divergence(
     BlockSequences& before,
     BlockSequences& block,
     BlockSequences& after,
     std::size_t& moved_bases) {
-    if (block.has_bypass || block.sequences.size() < 2) return;
+    TrimOutcome outcome;
+    if (block.sequences.size() < 2) return outcome;
+    if (block.has_bypass) {
+        // The bypassing template has none of the boundary bytes the traversing alleles share, so they
+        // cannot be moved out uniformly. If any exist, the block boundary is where the graph cut a
+        // node, and a node split would change the model.
+        std::vector<std::string> traversing;
+        for (std::size_t i = 0; i < block.sequences.size(); ++i) {
+            if (block.source_ids[i] != "bypass") traversing.push_back(block.sequences[i]);
+        }
+        if (!traversing.empty()) {
+            std::size_t shortest = traversing.front().size();
+            for (const std::string& value : traversing) shortest = std::min(shortest, value.size());
+            const std::size_t prefix = std::min(common_prefix(traversing), shortest);
+            const std::size_t suffix = std::min(common_suffix(traversing), shortest - prefix);
+            outcome.representation_dependent = prefix + suffix > 0;
+        }
+        return outcome;
+    }
     std::size_t shortest = block.sequences.front().size();
     for (const std::string& value : block.sequences) shortest = std::min(shortest, value.size());
     std::size_t prefix = std::min(common_prefix(block.sequences), shortest);
     std::size_t suffix = std::min(common_suffix(block.sequences), shortest - prefix);
-    if (prefix == 0 && suffix == 0) return;
+    if (prefix == 0 && suffix == 0) return outcome;
 
     const std::string prefix_bases = block.sequences.front().substr(0, prefix);
     const std::string suffix_bases =
@@ -296,6 +320,9 @@ void trim_variant_block_to_divergence(
     for (std::string& value : before.sequences) value += prefix_bases;
     for (std::string& value : after.sequences) value = suffix_bases + value;
     moved_bases += prefix + suffix;
+    outcome.prefix = prefix;
+    outcome.suffix = suffix;
+    return outcome;
 }
 
 } // namespace
@@ -402,11 +429,22 @@ LocusInputResult build_locus_input(
     }
 
     std::size_t moved_bases = 0;
+    std::vector<std::size_t> trimmed_prefix(chain.size(), 0);
+    std::vector<std::size_t> trimmed_suffix(chain.size(), 0);
+    std::vector<bool> dependent(chain.size(), false);
     for (std::size_t bi = 0; bi < chain.size(); ++bi) {
         if (chain[bi].kind != ChainBlockKind::Bubble) continue;
         if (bi == 0 || bi + 1 >= chain.size()) continue;
-        trim_variant_block_to_divergence(
+        const TrimOutcome outcome = trim_variant_block_to_divergence(
             block_sequences[bi - 1], block_sequences[bi], block_sequences[bi + 1], moved_bases);
+        trimmed_prefix[bi] = outcome.prefix;
+        trimmed_suffix[bi] = outcome.suffix;
+        if (outcome.representation_dependent) {
+            // Both neighbours share this block's node-defined boundary.
+            dependent[bi - 1] = true;
+            dependent[bi] = true;
+            dependent[bi + 1] = true;
+        }
     }
     report.boundary_bases_moved_to_context = moved_bases;
 
@@ -423,6 +461,10 @@ LocusInputResult build_locus_input(
         block_report.kind = out.kind;
         block_report.bubble_id = is_variant ? chain[bi].bubble_id : 0;
         block_report.bypass_templates = bypass_counts[bi];
+        block_report.trimmed_prefix_bp = trimmed_prefix[bi];
+        block_report.trimmed_suffix_bp = trimmed_suffix[bi];
+        block_report.representation_dependent = dependent[bi];
+        if (dependent[bi]) report.representation_dependent_blocks.push_back(block_report.block_id);
 
         std::set<std::string> distinct_sequences;
         for (std::size_t a = 0; a < sequences.source_ids.size(); ++a) {
@@ -465,6 +507,84 @@ LocusInputResult build_locus_input(
         result.authoritative.push_back(std::move(authoritative));
     }
     return result;
+}
+
+void require_representation_independent(const LocusInputReport& report) {
+    if (report.representation_dependent_blocks.empty()) return;
+    std::string names;
+    for (const std::string& block : report.representation_dependent_blocks) {
+        if (!names.empty()) names += ", ";
+        names += block;
+    }
+    throw std::invalid_argument(
+        "block boundaries depend on graph representation at " + names +
+        ": a bypass allele prevents the divergence trim, so a node split would change the model; "
+        "version one refuses such a locus");
+}
+
+std::optional<PathProjection> project_path_onto_locus(
+    const Graph& graph,
+    const std::vector<Bubble>& bubbles,
+    const LocusInputReport& report,
+    const std::string& path_name) {
+    const PathRecord* path = nullptr;
+    for (const PathRecord& candidate : graph.paths) {
+        if (candidate.name == path_name) {
+            path = &candidate;
+            break;
+        }
+    }
+    if (path == nullptr) {
+        throw std::invalid_argument("projection path is not in the graph: " + path_name);
+    }
+    if (bubbles.empty()) {
+        throw std::invalid_argument("projection needs the bubbles the model was built from");
+    }
+    std::size_t dropped = 0;
+    std::size_t trimmed = 0;
+    const std::vector<const Bubble*> kept = drop_contained(bubbles, dropped);
+    const std::vector<ChainBlock> chain = build_chain(kept, trimmed);
+    if (chain.size() != report.blocks.size()) {
+        throw std::invalid_argument(
+            "projection chain and model report disagree on block count; they were not built from the "
+            "same bubbles");
+    }
+    std::vector<std::string> ordered_boundaries;
+    for (const Bubble* bubble : kept) {
+        ordered_boundaries.push_back(left_boundary(*bubble));
+        ordered_boundaries.push_back(right_boundary(*bubble));
+    }
+    const std::optional<ChainOrientation> orientation = template_orientation(*path, ordered_boundaries);
+    if (!orientation.has_value()) return std::nullopt;
+
+    const BubblePathIndex index = build_bubble_path_index(*path);
+    std::vector<BlockWalk> walks;
+    walks.reserve(chain.size());
+    for (const ChainBlock& block : chain) walks.push_back(walk_block(graph, *path, index, block));
+
+    PathProjection projection;
+    projection.orientation = *orientation;
+    projection.blocks.resize(chain.size());
+    for (std::size_t bi = 0; bi < chain.size(); ++bi) projection.blocks[bi] = walks[bi].sequence;
+
+    for (std::size_t bi = 0; bi < chain.size(); ++bi) {
+        const std::size_t prefix = report.blocks[bi].trimmed_prefix_bp;
+        const std::size_t suffix = report.blocks[bi].trimmed_suffix_bp;
+        if (prefix + suffix == 0 || !walks[bi].traverses || !projection.blocks[bi].has_value()) continue;
+        std::string& own = *projection.blocks[bi];
+        if (own.size() < prefix + suffix) {
+            projection.blocks[bi].reset();
+            continue;
+        }
+        const std::string moved_prefix = own.substr(0, prefix);
+        const std::string moved_suffix = own.substr(own.size() - suffix);
+        own = own.substr(prefix, own.size() - prefix - suffix);
+        if (bi > 0 && projection.blocks[bi - 1].has_value()) *projection.blocks[bi - 1] += moved_prefix;
+        if (bi + 1 < chain.size() && projection.blocks[bi + 1].has_value()) {
+            *projection.blocks[bi + 1] = moved_suffix + *projection.blocks[bi + 1];
+        }
+    }
+    return projection;
 }
 
 std::string model_fingerprint(const PreparedGenotypeModel& model) {

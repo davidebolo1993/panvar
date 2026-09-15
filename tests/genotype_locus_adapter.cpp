@@ -16,6 +16,9 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <random>
+#include <fstream>
+#include <array>
 #include <cstdlib>
 #include <functional>
 #include <iostream>
@@ -155,6 +158,8 @@ void test_bypass_is_a_state() {
 struct PreparedLocus {
     panvar::LocusInputResult built;
     panvar::PreparedGenotypeModel model;
+    panvar::Graph graph;
+    std::vector<panvar::Bubble> bubbles;
 };
 
 panvar::Graph sorted_graph(panvar::GfaModel& model, const std::string& reference,
@@ -188,15 +193,16 @@ PreparedLocus prepare_from_gfa(const std::string& gfa_path, const std::string& r
     panvar::GfaModel model = panvar::read_gfa_model(gfa_path);
     if (rewrite) rewrite(model);
     std::string resolved;
-    const panvar::Graph graph = sorted_graph(model, reference, resolved, stage_path);
-    const std::vector<panvar::Bubble> bubbles = call_sv_bubbles(graph, model, resolved);
+    panvar::Graph graph = sorted_graph(model, reference, resolved, stage_path);
+    std::vector<panvar::Bubble> bubbles = call_sv_bubbles(graph, model, resolved);
 
     panvar::LocusInputOptions options;
     options.locus_id = "c4";
     options.reference_path_name = resolved;
     panvar::LocusInputResult built = panvar::build_locus_input(graph, bubbles, options);
     panvar::PreparedGenotypeModel prepared = panvar::prepare_genotype_model(built.input);
-    return PreparedLocus{std::move(built), std::move(prepared)};
+    return PreparedLocus{std::move(built), std::move(prepared), std::move(graph),
+                         std::move(bubbles)};
 }
 
 // Splitting every node in half is the sharpest representation change that preserves sequence: every
@@ -386,6 +392,156 @@ void test_c4(const std::string& gfa_path, const std::string& stage_prefix) {
     require(panvar::model_fingerprint(split.model) == reference_fingerprint,
             "splitting every graph node must not change the prepared model fingerprint");
     panvar::verify_complete_panel_round_trip(split.model, split.built.authoritative);
+
+    // The evaluation projection frame is the model frame: every panel template projected from the
+    // graph must reproduce its own model row, block by block, across both chain orientations.
+    std::size_t projected = 0;
+    for (std::size_t t = 0; t < locus.model.panel().template_count(); ++t) {
+        const std::string& name = locus.model.panel().template_names[t];
+        const auto projection = panvar::project_path_onto_locus(
+            locus.graph, locus.bubbles, locus.built.report, name);
+        require(projection.has_value(), "every C4 panel template must project onto the chain");
+        require(projection->orientation == locus.model.template_source_orientations()[t],
+                "projection must recover the template's chain orientation");
+        for (std::size_t b = 0; b < locus.model.blocks().size(); ++b) {
+            const std::string& allele =
+                locus.model.blocks()[b].alleles[locus.model.panel().template_alleles[t][b]].sequence;
+            require(projection->blocks[b].has_value() && *projection->blocks[b] == allele,
+                    "projection of " + name + " must equal its model row at " +
+                        locus.model.blocks()[b].block_id);
+        }
+        ++projected;
+    }
+    require(projected == 131, "all 131 C4 templates must be projected and checked");
+
+    // Leave-one-out frame: NA19240 is removed from every proposal source before the model is built,
+    // then projected from the full graph onto that model's blocks. Sorting depends only on the
+    // reference path, so node identifiers name the same sequence in both graphs.
+    const PreparedLocus loo = prepare_from_gfa(
+        gfa_path, reference, stage_prefix + ".loo.gfa", [](panvar::GfaModel& gfa) {
+            gfa.paths.erase(std::remove_if(gfa.paths.begin(), gfa.paths.end(),
+                                           [](const panvar::GfaPath& path) {
+                                               return panvar::gfa_path_name(path).rfind("NA19240#", 0) == 0;
+                                           }),
+                            gfa.paths.end());
+        });
+    require(loo.model.panel().template_count() == 129,
+            "leave-one-out must remove exactly NA19240's two haplotypes");
+    for (const panvar::PathRecord& path : locus.graph.paths) {
+        if (path.name.rfind("NA19240#", 0) != 0) continue;
+        const auto projection =
+            panvar::project_path_onto_locus(locus.graph, loo.bubbles, loo.built.report, path.name);
+        require(projection.has_value(), "the held-out donor must span the leave-one-out chain");
+        std::size_t defined = 0;
+        std::size_t available = 0;
+        for (std::size_t b = 0; b < loo.model.blocks().size(); ++b) {
+            if (!projection->blocks[b].has_value()) continue;
+            ++defined;
+            for (const auto& allele : loo.model.blocks()[b].alleles) {
+                if (allele.sequence == *projection->blocks[b]) {
+                    ++available;
+                    break;
+                }
+            }
+        }
+        std::cout << "  leave-one-out " << path.name << ": " << defined << "/"
+                  << loo.model.blocks().size() << " blocks defined, " << available
+                  << " exactly available in the retained panel\n";
+        require(defined == loo.model.blocks().size(),
+                "every block of the held-out donor must have a positional frame at C4");
+    }
+}
+
+// Fail closed on representation dependence. Template C deletes bubble b1 together with both
+// neighbouring backbones, joining b0's sink directly to b2's source. Its spelling still round-trips,
+// so the round-trip gate does not catch this: the traversing alleles of b1 share boundary-node bytes
+// C does not have, the divergence trim cannot move them, and where the graph cut those boundary nodes
+// would decide what sits in b1 and both its neighbours.
+void test_bypass_representation_dependence(const std::string& stage_prefix) {
+    std::mt19937_64 rng(88);
+    const auto bases = [&](std::size_t length) {
+        std::string out(length, 'A');
+        for (char& base : out) base = "ACGT"[rng() % 4];
+        return out;
+    };
+    // Numeric identifiers in the reference template's order, so node order is reference order.
+    const std::vector<std::pair<std::string, std::string>> nodes = {
+        {"1", bases(300)}, {"2", bases(40)}, {"3", bases(120)}, {"4", bases(70)},
+        {"5", bases(40)}, {"6", bases(200)}, {"7", bases(40)}, {"8", bases(130)},
+        {"9", bases(60)}, {"10", bases(40)}, {"11", bases(200)}, {"12", bases(40)},
+        {"13", bases(110)}, {"14", bases(55)}, {"15", bases(40)}, {"16", bases(300)},
+    };
+    const std::vector<std::pair<std::string, std::vector<std::string>>> all_templates = {
+        {"A#1#x", {"1", "2", "3", "5", "6", "7", "8", "10", "11", "12", "13", "15", "16"}},
+        {"B#1#x", {"1", "2", "4", "5", "6", "7", "9", "10", "11", "12", "14", "15", "16"}},
+        {"C#1#x", {"1", "2", "3", "5", "12", "13", "15", "16"}},
+    };
+    const auto write_gfa = [&](const std::string& file, bool with_bypass) {
+        std::ofstream out(file);
+        out << "H\tVN:Z:1.0\n";
+        for (const auto& node : nodes) out << "S\t" << node.first << '\t' << node.second << '\n';
+        std::set<std::pair<std::string, std::string>> edges;
+        for (const auto& item : all_templates) {
+            if (!with_bypass && item.first == "C#1#x") continue;
+            for (std::size_t i = 1; i < item.second.size(); ++i) {
+                edges.emplace(item.second[i - 1], item.second[i]);
+            }
+        }
+        for (const auto& edge : edges) {
+            out << "L\t" << edge.first << "\t+\t" << edge.second << "\t+\t0M\n";
+        }
+        for (const auto& item : all_templates) {
+            if (!with_bypass && item.first == "C#1#x") continue;
+            out << "P\t" << item.first << '\t';
+            for (std::size_t i = 0; i < item.second.size(); ++i) {
+                out << (i ? "," : "") << item.second[i] << '+';
+            }
+            out << "\t*\n";
+        }
+    };
+    std::vector<panvar::Bubble> bubbles(3);
+    const std::vector<std::array<std::string, 4>> spec = {
+        {"2", "5", "3", "4"}, {"7", "10", "8", "9"}, {"12", "15", "13", "14"}};
+    for (std::size_t i = 0; i < 3; ++i) {
+        bubbles[i].id = i + 1;
+        bubbles[i].source = spec[i][0];
+        bubbles[i].sink = spec[i][1];
+        bubbles[i].inside = {spec[i][2], spec[i][3]};
+    }
+    const auto build = [&](bool with_bypass) {
+        const std::string file = stage_prefix + (with_bypass ? ".bypass.gfa" : ".nobypass.gfa");
+        write_gfa(file, with_bypass);
+        panvar::ParseGfaOptions parse_options;
+        const panvar::Graph graph = panvar::parse_gfa(file, parse_options);
+        panvar::LocusInputOptions options;
+        options.locus_id = "bypass-fixture";
+        options.reference_path_name = "A#1#x";
+        return panvar::build_locus_input(graph, bubbles, options);
+    };
+
+    const panvar::LocusInputResult dependent = build(true);
+    const std::vector<std::string> expected = {"ctx:2", "sv:3", "ctx:4"};
+    require(dependent.report.representation_dependent_blocks == expected,
+            "a bypassed variant block and both its neighbours must be flagged representation-dependent");
+    require(dependent.report.blocks[3].bypass_templates == 1,
+            "fixture: exactly one template must bypass the middle variant block");
+    // The round trip passes: this is the case the byte-for-byte gate cannot see.
+    const panvar::PreparedGenotypeModel model = panvar::prepare_genotype_model(dependent.input);
+    panvar::verify_complete_panel_round_trip(model, dependent.authoritative);
+    bool refused = false;
+    try {
+        panvar::require_representation_independent(dependent.report);
+    } catch (const std::invalid_argument& error) {
+        refused = std::string(error.what()).find("sv:3") != std::string::npos;
+    }
+    require(refused, "a representation-dependent model must be refused, naming its blocks");
+
+    const panvar::LocusInputResult control = build(false);
+    require(control.report.representation_dependent_blocks.empty(),
+            "without the bypassing template no block may be flagged");
+    panvar::require_representation_independent(control.report);
+    require(control.report.blocks[3].trimmed_prefix_bp > 0 && control.report.blocks[3].trimmed_suffix_bp > 0,
+            "without the bypass the middle block must be divergence-trimmed on both sides");
 }
 
 } // namespace
@@ -398,6 +554,7 @@ int main(int argc, char** argv) {
         if (argc > 2) {
             std::cout << "genotype locus adapter: C4 gates\n";
             test_c4(argv[1], argv[2]);
+            test_bypass_representation_dependence(argv[2]);
         } else {
             std::cout << "genotype locus adapter: C4 gates SKIPPED (no fixture path given)\n";
         }

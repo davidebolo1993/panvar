@@ -615,6 +615,70 @@ void test_proposal_cannot_reach_fragment_score() {
                   "a candidate's fragment score must not depend on its proposal rank");
 }
 
+
+// Every declared resource cap stops scoring with ResourceExhausted and returns nothing -- neither a
+// score from score_diplotypes nor a ranking from certification. A ranking assembled from the
+// placements found before a cap would favour whichever haplotypes happened to be scanned first.
+void test_resource_caps_refuse_without_partial_output() {
+    std::mt19937_64 rng(31);
+    const std::string a = random_bases(rng, 500);
+    std::vector<panvar::ReadPair> fragments;
+    for (std::size_t start : {20, 150, 300}) {
+        fragments.push_back({read("f/1", a.substr(start, 55)),
+                             read("f/2", revcomp(a.substr(start + 65, 55)))});
+    }
+    const panvar::InternedHaplotypes interned = intern({a});
+    const panvar::LibraryModel model = library();
+    panvar::FragmentScoringOptions base;
+    base.mismatch_band = 2;
+    base.minimum_piece_bp = 8;
+
+    const panvar::FragmentScoringResult baseline =
+        panvar::score_diplotypes(interned, {{0, 0}}, fragments, model, base);
+    require(baseline.counters.piece_hits > 1 && baseline.counters.proposed_starts > 1 &&
+                baseline.counters.physical_origins > 1 &&
+                baseline.counters.statistical_state_classes > 1,
+            "fixture: the uncapped run must exceed a cap of one on every counter");
+
+    const auto expect_exhausted = [&](const panvar::FragmentScoringOptions& options,
+                                      const std::string& which) {
+        bool thrown = false;
+        try {
+            panvar::score_diplotypes(interned, {{0, 0}}, fragments, model, options);
+        } catch (const panvar::ResourceExhausted&) {
+            thrown = true;
+        }
+        require(thrown, "the " + which + " cap must throw ResourceExhausted from scoring");
+        thrown = false;
+        try {
+            panvar::certify_diplotype_ranking(interned, {{0, 0}}, fragments, model, options, {});
+        } catch (const panvar::ResourceExhausted&) {
+            thrown = true;
+        }
+        require(thrown, "the " + which + " cap must stop certification without a ranking");
+    };
+    panvar::FragmentScoringOptions capped = base;
+    capped.max_piece_hits = 1;
+    expect_exhausted(capped, "piece-hit");
+    capped = base;
+    capped.max_proposed_starts_per_haplotype = 1;
+    expect_exhausted(capped, "proposed-start");
+    capped = base;
+    capped.max_physical_origins = 1;
+    expect_exhausted(capped, "physical-origin");
+    capped = base;
+    capped.max_state_classes = 1;
+    expect_exhausted(capped, "state-class");
+    capped = base;
+    capped.max_mass_cells = 1;
+    expect_exhausted(capped, "mass-cell");
+
+    capped = base;
+    capped.max_physical_origins = 0;
+    require_throws([&] { panvar::score_diplotypes(interned, {{0, 0}}, fragments, model, capped); },
+                   "a zero resource cap is a malformed declaration and must refuse");
+}
+
 } // namespace
 
 int main() {
@@ -629,6 +693,7 @@ int main() {
         test_homozygote_counts_two_copies();
         test_exposure_uses_read_length_distribution();
         test_refusals();
+        test_resource_caps_refuse_without_partial_output();
         test_counters_are_measured();
         test_winner_requires_proof();
         test_candidate_set_probability();

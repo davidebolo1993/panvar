@@ -352,7 +352,8 @@ void collect_form_placements(
     const std::vector<PieceIndex>& indexes,
     std::size_t band,
     std::vector<std::vector<FormPlacement>>& out,
-    FragmentScoringCounters& counters) {
+    FragmentScoringCounters& counters,
+    const FragmentScoringOptions& options) {
     std::vector<std::pair<std::uint32_t, std::uint32_t>> proposed;   // (form, start)
 
     for (const PieceIndex& index : indexes) {
@@ -382,11 +383,20 @@ void collect_form_placements(
                     }
                 });
             for (auto it = range.first; it != range.second; ++it) {
-                ++counters.piece_hits;
+                if (++counters.piece_hits > options.max_piece_hits) {
+                    throw ResourceExhausted(
+                        "fragment scoring reached its piece-hit cap; the locus is too repetitive "
+                        "for the declared caps and no partial ranking is returned");
+                }
                 if (it->offset > piece_start) continue;   // implied start would be negative
                 proposed.emplace_back(it->form,
                                       static_cast<std::uint32_t>(piece_start - it->offset));
                 ++counters.proposed_starts;
+                if (proposed.size() > options.max_proposed_starts_per_haplotype) {
+                    throw ResourceExhausted(
+                        "fragment scoring reached its per-haplotype proposed-start cap; no partial "
+                        "ranking is returned");
+                }
             }
         }
     }
@@ -461,6 +471,11 @@ FragmentScoringResult score_diplotypes(
     if (options.minimum_piece_bp == 0) {
         throw std::invalid_argument("minimum indexable piece length must be positive");
     }
+    if (options.max_piece_hits == 0 || options.max_proposed_starts_per_haplotype == 0 ||
+        options.max_physical_origins == 0 || options.max_state_classes == 0 ||
+        options.max_mass_cells == 0) {
+        throw std::invalid_argument("every fragment-scoring resource cap must be positive");
+    }
     for (const HaplotypeCandidate& candidate : candidates) {
         if (candidate.first >= haplotypes.sequences.size() ||
             candidate.second >= haplotypes.sequences.size()) {
@@ -513,6 +528,12 @@ FragmentScoringResult score_diplotypes(
                       : build_piece_indexes(forms, band, options.minimum_piece_bp);
 
     const std::size_t unique = haplotypes.sequences.size();
+    // Checked before the allocation it guards, so a refusal costs nothing.
+    if (!fragments.empty() && unique > options.max_mass_cells / fragments.size()) {
+        throw ResourceExhausted(
+            "the fragment-by-haplotype mass matrix would exceed its declared cell cap; no partial "
+            "ranking is returned");
+    }
     std::vector<double> mass(fragments.size() * unique, kNegInf);
     std::vector<double> exposure(unique, 0.0);
 
@@ -539,7 +560,7 @@ FragmentScoringResult score_diplotypes(
         if (forms.empty()) continue;
 
         std::vector<std::vector<FormPlacement>> placements(forms.size());
-        collect_form_placements(haplotype, forms, indexes, band, placements, counters);
+        collect_form_placements(haplotype, forms, indexes, band, placements, counters, options);
 
         for (std::size_t f = 0; f < fragments.size(); ++f) {
             const std::size_t first_length = fragments[f].first.bases.size();
@@ -586,7 +607,11 @@ FragmentScoringResult score_diplotypes(
                             start.start, forward_length, it->start, reverse_length, support);
                         if (!insert.has_value()) continue;
                         ++counters.valid_fr_states;
-                        ++counters.physical_origins;
+                        if (++counters.physical_origins > options.max_physical_origins) {
+                            throw ResourceExhausted(
+                                "fragment scoring reached its physical-origin cap; no partial "
+                                "ranking is returned");
+                        }
                         StateKey key;
                         key.insert_bp = static_cast<std::uint32_t>(*insert);
                         key.forward_mismatches = start.mismatches;
@@ -598,6 +623,11 @@ FragmentScoringResult score_diplotypes(
             }
             if (states.empty()) continue;
             counters.statistical_state_classes += states.size();
+            if (counters.statistical_state_classes > options.max_state_classes) {
+                throw ResourceExhausted(
+                    "fragment scoring reached its statistical-class cap; no partial ranking is "
+                    "returned");
+            }
 
             double total = kNegInf;
             for (const auto& item : states) {

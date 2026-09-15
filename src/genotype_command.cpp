@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -151,6 +152,11 @@ std::string join_alleles(const std::vector<std::size_t>& alleles) {
     return out;
 }
 
+std::size_t effective_raw_history_limit(const GenotypeCommandOptions& options) {
+    return options.raw_history_limit != 0 ? options.raw_history_limit
+                                          : std::max<std::size_t>(options.max_candidates * 4, 64);
+}
+
 struct RankingSummary {
     std::size_t sequence_candidates = 0;
     std::size_t collapsed_beam_candidates = 0;
@@ -190,6 +196,12 @@ void write_status(
     // meets its performance gate. The requested value is recorded so a run is reproducible.
     out << "threads_requested\t" << options.threads << '\n';
     out << "threads_used\t1\n";
+    out << "max_beam_extensions\t" << options.max_beam_extensions << '\n';
+    out << "max_piece_hits\t" << options.max_piece_hits << '\n';
+    out << "max_proposed_starts_per_haplotype\t" << options.max_proposed_starts_per_haplotype << '\n';
+    out << "max_physical_origins\t" << options.max_physical_origins << '\n';
+    out << "max_state_classes\t" << options.max_state_classes << '\n';
+    out << "max_mass_cells\t" << options.max_mass_cells << '\n';
     out << "library_provenance\t" << library.provenance << '\n';
     out << "insert_mean_bp\t" << library.insert_mean_bp << '\n';
     out << "insert_sd_bp\t" << library.insert_sd_bp << '\n';
@@ -206,6 +218,11 @@ void write_status(
         out << "templates_refused\t" << model_report->refused_templates.size() << '\n';
         out << "boundary_bases_moved_to_context\t"
             << model_report->boundary_bases_moved_to_context << '\n';
+        std::string dependent;
+        for (const std::string& block : model_report->representation_dependent_blocks) {
+            dependent += (dependent.empty() ? "" : ",") + block;
+        }
+        out << "representation_dependent_blocks\t" << (dependent.empty() ? "none" : dependent) << '\n';
     }
     if (panel != nullptr) {
         out << "marker_universe\t" << panel->codes.size() << '\n';
@@ -235,6 +252,15 @@ void write_status(
         out << "unique_candidates\t" << beam->candidates.size() << '\n';
         out << "beam_extensions\t" << beam->extensions_evaluated << '\n';
         out << "unique_target_reached\t" << (beam->unique_target_reached ? "true" : "false") << '\n';
+        out << "raw_history_limit\t" << effective_raw_history_limit(options) << '\n';
+        out << "raw_history_limit_reached\t" << (beam->raw_history_limit_reached ? "true" : "false")
+            << '\n';
+        // The proposal stopped at its raw width before finding the requested number of distinct
+        // mosaics. The ranking is still exact within the retained set, but a truth the width never
+        // reached cannot be in it.
+        out << "candidate_set_truncated\t"
+            << (beam->raw_history_limit_reached && !beam->unique_target_reached ? "true" : "false")
+            << '\n';
     }
     if (ranking != nullptr) {
         out << "certified_gap\t" << ranking->certified_gap << '\n';
@@ -294,6 +320,12 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     const Clock::time_point started = Clock::now();
     StageTimings timings;
     const std::string status_path = options.out_prefix + ".mosaic_status.tsv";
+    // A run owns its output prefix. Outputs an earlier run left under the same prefix are removed before
+    // anything else, so a run that stops early can never sit beside a previous ranking and look complete.
+    for (const char* suffix : {".genotypes.tsv", ".block_genotypes.tsv", ".mosaic_candidates.tsv",
+                               ".mosaic_scores.tsv", ".mosaic_status.tsv", ".mosaic_haplotypes.fa"}) {
+        std::remove((options.out_prefix + suffix).c_str());
+    }
 
     if (options.gfa_path.empty() || options.reads1_path.empty() || options.reads2_path.empty() ||
         options.reference_path.empty() || options.library_path.empty()) {
@@ -305,43 +337,62 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     const LibraryModel library = read_library(options.library_path, declared_marker_background);
 
     // ---- stage 1: structural model -------------------------------------------------------------
+    // Fail closed. Anything that stops the structural model being built, verified, or accepted as
+    // representation-independent ends the run as MODEL_INCOMPLETE with the reason, rather than escaping
+    // as an exception that leaves no status behind.
     Clock::time_point mark = Clock::now();
-    GfaModel gfa = read_gfa_model(options.gfa_path);
-    GraphSortOptions sort_options;
-    sort_options.reference_path = options.reference_path;
-    sort_options.flip = true;
-    const std::string resolved = sort_graph_reference(gfa, sort_options).resolved_reference;
-    const std::string staged = options.out_prefix + ".sorted.gfa";
-    write_gfa_model(staged, gfa);
-    ParseGfaOptions parse_options;
-    const Graph graph = parse_gfa(staged, parse_options);
-    validate_graph_paths(graph, "genotype", true, true);
+    Graph graph;
+    LocusInputResult built;
+    std::optional<PreparedGenotypeModel> prepared;
+    std::string fingerprint = "NA";
+    try {
+        GfaModel gfa = read_gfa_model(options.gfa_path);
+        GraphSortOptions sort_options;
+        sort_options.reference_path = options.reference_path;
+        sort_options.flip = true;
+        const std::string resolved = sort_graph_reference(gfa, sort_options).resolved_reference;
+        const std::string staged = options.out_prefix + ".sorted.gfa";
+        write_gfa_model(staged, gfa);
+        ParseGfaOptions parse_options;
+        graph = parse_gfa(staged, parse_options);
+        validate_graph_paths(graph, "genotype", true, true);
 
-    std::vector<Bubble> bubbles;
-    if (options.bubbles_path.empty()) {
-        BubbleCallOptions bubble_options;
-        bubble_options.reference_path = resolved;
-        bubble_options.quiet = true;
-        bubble_options.min_variant_bp = options.min_variant_bp;
-        bubble_options.snarl_pairs_override =
-            find_top_level_snarls_cactus(snarl_input_from_model(gfa));
-        bubble_options.snarl_source_supplied = true;
-        bubbles = call_bubbles(graph, bubble_options);
-    } else {
-        bubbles = read_bubbles_csv(options.bubbles_path);
+        std::vector<Bubble> bubbles;
+        if (options.bubbles_path.empty()) {
+            BubbleCallOptions bubble_options;
+            bubble_options.reference_path = resolved;
+            bubble_options.quiet = true;
+            bubble_options.min_variant_bp = options.min_variant_bp;
+            bubble_options.snarl_pairs_override =
+                find_top_level_snarls_cactus(snarl_input_from_model(gfa));
+            bubble_options.snarl_source_supplied = true;
+            bubbles = call_bubbles(graph, bubble_options);
+        } else {
+            bubbles = read_bubbles_csv(options.bubbles_path);
+        }
+
+        LocusInputOptions locus_options;
+        // The locus identity is the graph's own reference frame, never the output path: a fingerprint
+        // that moved when the user renamed their output would be useless for saying whether two runs
+        // scored the same model.
+        locus_options.locus_id = resolved;
+        locus_options.reference_path_name = resolved;
+        built = build_locus_input(graph, bubbles, locus_options);
+        prepared.emplace(prepare_genotype_model(built.input));
+        // The authoritative check, on real input, before any statistic is computed from these blocks.
+        verify_complete_panel_round_trip(*prepared, built.authoritative);
+        fingerprint = model_fingerprint(*prepared);
+        // A model a node split would change is not scored. The round trip cannot see this case.
+        require_representation_independent(built.report);
+    } catch (const std::exception& error) {
+        timings.model = seconds_since(mark);
+        timings.total = seconds_since(started);
+        write_status(status_path, GenotypeRunStatus::ModelIncomplete, fingerprint, options, library,
+                     timings, built.input.blocks.empty() ? nullptr : &built.report, nullptr, nullptr,
+                     nullptr, std::string("the structural model could not be built: ") + error.what());
+        return GenotypeRunStatus::ModelIncomplete;
     }
-
-    LocusInputOptions locus_options;
-    // The locus identity is the graph's own reference frame, never the output path: a fingerprint
-    // that moved when the user renamed their output would be useless for saying whether two runs
-    // scored the same model.
-    locus_options.locus_id = resolved;
-    locus_options.reference_path_name = resolved;
-    const LocusInputResult built = build_locus_input(graph, bubbles, locus_options);
-    const PreparedGenotypeModel model = prepare_genotype_model(built.input);
-    // The authoritative check, on real input, before any statistic is computed from these blocks.
-    verify_complete_panel_round_trip(model, built.authoritative);
-    const std::string fingerprint = model_fingerprint(model);
+    const PreparedGenotypeModel& model = *prepared;
     timings.model = seconds_since(mark);
 
     if (model.blocks().size() < 2 || model.panel().template_count() < 2) {
@@ -391,9 +442,20 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         model.blocks().size() - 1, options.switch_probability);
     MosaicBeamParameters beam_parameters;
     beam_parameters.unique_candidate_target = options.max_candidates;
-    beam_parameters.raw_history_limit = std::max<std::size_t>(options.max_candidates * 4, 64);
-    const MosaicBeamResult beam = propose_mosaic_diplotypes(
-        model.panel(), emissions, switch_probability, beam_parameters);
+    beam_parameters.raw_history_limit = effective_raw_history_limit(options);
+    beam_parameters.max_extension_evaluations = options.max_beam_extensions;
+    MosaicBeamResult beam;
+    try {
+        beam = propose_mosaic_diplotypes(model.panel(), emissions, switch_probability, beam_parameters);
+    } catch (const std::length_error& error) {
+        timings.proposal = seconds_since(mark);
+        timings.total = seconds_since(started);
+        write_status(status_path, GenotypeRunStatus::CandidateIncomplete, fingerprint, options, library,
+                     timings, &built.report, &panel, nullptr, nullptr,
+                     std::string("the proposal exceeded its declared resource budget: ") + error.what(),
+                     nullptr, &depth);
+        return GenotypeRunStatus::CandidateIncomplete;
+    }
     timings.proposal = seconds_since(mark);
 
     if (beam.candidates.empty()) {
@@ -503,9 +565,25 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     FragmentScoringOptions scoring_options;
     scoring_options.mismatch_band = options.mismatch_band;
     scoring_options.minimum_piece_bp = options.minimum_piece_bp;
-    const CertifiedRanking ranking = certify_diplotype_ranking(
-        interned, ranked_pairs, fragments, library, scoring_options, CertificationOptions{},
-        sequence_prior);
+    scoring_options.max_piece_hits = options.max_piece_hits;
+    scoring_options.max_proposed_starts_per_haplotype = options.max_proposed_starts_per_haplotype;
+    scoring_options.max_physical_origins = options.max_physical_origins;
+    scoring_options.max_state_classes = options.max_state_classes;
+    scoring_options.max_mass_cells = options.max_mass_cells;
+    CertifiedRanking ranking;
+    try {
+        ranking = certify_diplotype_ranking(interned, ranked_pairs, fragments, library, scoring_options,
+                                            CertificationOptions{}, sequence_prior);
+    } catch (const ResourceExhausted& error) {
+        timings.rescoring = seconds_since(mark);
+        timings.total = seconds_since(started);
+        write_status(status_path, GenotypeRunStatus::RescoreIncomplete, fingerprint, options, library,
+                     timings, &built.report, &panel, &beam, nullptr,
+                     std::string("rescoring stopped at a declared resource cap and returned no "
+                                 "ranking: ") + error.what(),
+                     nullptr, &depth);
+        return GenotypeRunStatus::RescoreIncomplete;
+    }
     timings.rescoring = seconds_since(mark);
 
     RankingSummary summary;
@@ -612,6 +690,25 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         }
     }
     {
+        // Every statistical block, for block-level evaluation. Context blocks are polymorphic and are
+        // genotyped by the same mosaic; `reportable` marks the SV bubbles the SV-facing genotypes table
+        // carries, so the interstitial blocks are distinguished rather than dropped.
+        std::ofstream out = open_output(options.out_prefix + ".block_genotypes.tsv");
+        out << "block_id\tkind\treportable\tallele1\tallele2\tallele1_bp\tallele2_bp\tzygosity\t"
+               "projection_ambiguous\n";
+        const bool ambiguous = sequence_candidates[winner].projection_ambiguous;
+        for (std::size_t b = 0; b < model.blocks().size(); ++b) {
+            const PreparedGenotypeBlock& block = model.blocks()[b];
+            const bool variant = block.kind == GenotypeBlockKind::Variant;
+            const std::size_t a1 = called.first.alleles[b];
+            const std::size_t a2 = called.second.alleles[b];
+            out << block.block_id << '\t' << (variant ? "SV" : "context") << '\t'
+                << (variant ? "true" : "false") << '\t' << a1 << '\t' << a2 << '\t'
+                << block.alleles[a1].sequence.size() << '\t' << block.alleles[a2].sequence.size() << '\t'
+                << (a1 == a2 ? "HOM" : "HET") << '\t' << (ambiguous ? "true" : "false") << '\n';
+        }
+    }
+    {
         std::ofstream out = open_output(options.out_prefix + ".mosaic_haplotypes.fa");
         const HaplotypeSequence first = spell_mosaic(model, called.first);
         const HaplotypeSequence second = spell_mosaic(model, called.second);
@@ -663,7 +760,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 "                  [--threads <N>] [--max-candidates <K>]\n\n"
                 "Calls a pair of whole-locus mosaic haplotypes and projects them to one allele\n"
                 "pair per SV block. Paired reads only.\n\n"
-                "Outputs <prefix>.genotypes.tsv, .mosaic_candidates.tsv, .mosaic_scores.tsv,\n"
+                "Outputs <prefix>.genotypes.tsv, .block_genotypes.tsv, .mosaic_candidates.tsv,\n"
+                ".mosaic_scores.tsv,"
                 ".mosaic_status.tsv and .mosaic_haplotypes.fa. An incomplete run emits its\n"
                 "diagnostics and says so in the status file; it never presents a partial ranking\n"
                 "as a result.\n\n"

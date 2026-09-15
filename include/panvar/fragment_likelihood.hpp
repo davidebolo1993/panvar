@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -153,12 +154,29 @@ struct HaplotypeCandidate {
     std::size_t second = 0;
 };
 
+// Thrown when a declared resource cap is reached. Scoring stops and returns nothing: a ranking built
+// from the placements found before the cap would silently favour whichever haplotypes were scanned
+// first, which is a partial ranking presented as a result.
+class ResourceExhausted : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 struct FragmentScoringOptions {
     // The declared band of the truncated model. Fixed for a run: changing it changes the model.
     std::size_t mismatch_band = 6;
     // Pigeonhole pieces shorter than this are too unspecific to index, so the scorer refuses rather
     // than silently degrading into a quadratic scan.
     std::size_t minimum_piece_bp = 10;
+    // Operational caps, checked as the work happens rather than estimated beforehand. The defaults
+    // leave two orders of magnitude of headroom over C4 at 30x and K=64 (14.8M piece hits, 1.9M
+    // proposed starts per haplotype, 0.88M physical origins) while stopping a repeat-rich locus such
+    // as LPA before it exhausts memory. Reaching one throws ResourceExhausted.
+    std::uint64_t max_piece_hits = 2000000000ULL;
+    std::uint64_t max_proposed_starts_per_haplotype = 50000000ULL;
+    std::uint64_t max_physical_origins = 500000000ULL;
+    std::uint64_t max_state_classes = 200000000ULL;
+    std::uint64_t max_mass_cells = 200000000ULL;
 };
 
 // Measured work, not estimated viability. `candidate_bases_scanned` counts haplotype bases actually

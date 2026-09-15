@@ -3,12 +3,22 @@
 // presenting a partial ranking, and the model fingerprint identifies the model rather than the run.
 
 #include "panvar/genotype_command.hpp"
+#include "panvar/integrated_snarls.hpp"
+#include "panvar/graph_sort.hpp"
+#include "panvar/gfa_io.hpp"
+#include "panvar/gfa.hpp"
+#include "panvar/genotype_model.hpp"
+#include "panvar/genotype_locus.hpp"
+#include "panvar/bubbles.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <functional>
 #include <iostream>
 #include <map>
+#include <set>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -49,22 +59,27 @@ struct TinyLocus {
     std::string gfa_path;
     std::vector<std::string> haplotypes;
     std::string reference_name;
+    std::map<std::string, std::string> node_sequences;
 };
 
-TinyLocus write_tiny_locus() {
+// `context_left` and `context_right` are the shared spans either side of the sub-threshold variant.
+// At their defaults they are wider than any simulated insert, so no fragment can link neighbouring
+// variants and the locus cannot be phased from reads -- which one gate below relies on.
+TinyLocus write_tiny_locus(const std::string& file = "tiny.gfa", std::size_t context_left = 350,
+                           std::size_t context_right = 340) {
     std::mt19937_64 rng(4);
     TinyLocus locus;
-    locus.gfa_path = path("tiny.gfa");
+    locus.gfa_path = path(file);
 
     struct Node { std::string id, seq; };
     const std::vector<Node> nodes = {
         {"1", random_bases(rng, 700)},     // left flank
         {"2", random_bases(rng, 300)},     // SV block one, reference allele
         {"3", random_bases(rng, 90)},      // SV block one, alternate allele
-        {"4", random_bases(rng, 350)},     // shared context
+        {"4", random_bases(rng, context_left)},    // shared context
         {"5", random_bases(rng, 10)},      // sub-threshold variant, allele one
         {"6", random_bases(rng, 10)},      // sub-threshold variant, allele two
-        {"7", random_bases(rng, 340)},     // shared context
+        {"7", random_bases(rng, context_right)},   // shared context
         {"8", random_bases(rng, 260)},     // SV block two, reference allele
         {"9", random_bases(rng, 80)},      // SV block two, alternate allele
         {"10", random_bases(rng, 700)},    // right flank
@@ -87,6 +102,7 @@ TinyLocus write_tiny_locus() {
     };
     std::map<std::string, std::string> sequence_of;
     for (const Node& node : nodes) sequence_of[node.id] = node.seq;
+    locus.node_sequences = sequence_of;
     for (const auto& item : templates) {
         out << "P\t" << item.first << '\t';
         for (std::size_t i = 0; i < item.second.size(); ++i) {
@@ -105,7 +121,7 @@ TinyLocus write_tiny_locus() {
 void write_library(const std::string& file) {
     std::ofstream out(file);
     out << "insert_mean_bp 300\ninsert_sd_bp 30\nsupport_sigmas 4\n"
-           "substitution_error 0.002\noutlier_weight 0.001\nfragment_start_intensity 0.02\n"
+           "substitution_error 0.002\noutlier_weight 0.001\nfragment_start_intensity 0.085\n"
            // Declared: every invariant anchor of this tiny locus carries one copy, so the marker
            // background is not identifiable from the data. test_refusals proves the run refuses
            // without this line.
@@ -196,8 +212,8 @@ void test_end_to_end() {
                 panvar::genotype_run_status_name(status));
 
     // Every declared output exists.
-    for (const char* suffix : {".genotypes.tsv", ".mosaic_candidates.tsv", ".mosaic_scores.tsv",
-                               ".mosaic_status.tsv", ".mosaic_haplotypes.fa"}) {
+    for (const char* suffix : {".genotypes.tsv", ".block_genotypes.tsv", ".mosaic_candidates.tsv",
+                               ".mosaic_scores.tsv", ".mosaic_status.tsv", ".mosaic_haplotypes.fa"}) {
         require(exists(path("run") + suffix),
                 std::string("the run must emit ") + suffix);
     }
@@ -236,6 +252,26 @@ void test_end_to_end() {
         ++rows;
     }
     require(rows == 2, "the fixture's two SV blocks must both be reported");
+
+    // The block-evaluation table carries every statistical block, context blocks included, and marks
+    // which are reportable SV calls.
+    std::ifstream blocks(path("run.block_genotypes.tsv"));
+    std::getline(blocks, line);
+    std::size_t sv_rows = 0;
+    std::size_t context_rows = 0;
+    while (std::getline(blocks, line)) {
+        if (line.rfind("sv:", 0) == 0) {
+            require(line.find("\tSV\ttrue\t") != std::string::npos, "an SV block must be reportable");
+            ++sv_rows;
+        } else {
+            require(line.find("\tcontext\tfalse\t") != std::string::npos,
+                    "a context block must be present and marked non-reportable");
+            ++context_rows;
+        }
+    }
+    require(sv_rows == std::stoul(reported.at("variant_blocks")) &&
+                context_rows == std::stoul(reported.at("context_blocks")) && context_rows > 0,
+            "the block table must carry every statistical block, not only the SV bubbles");
 
     // The fingerprint identifies the model, not the run: a different output path and a different K
     // must not move it.
@@ -291,6 +327,367 @@ void test_refusals() {
             "a run that never ranked must not emit a ranking or a call");
 }
 
+
+panvar::GenotypeCommandOptions tiny_options(const std::string& prefix, const std::string& reads1,
+                                            const std::string& reads2,
+                                            const std::string& gfa = "tiny.gfa") {
+    panvar::GenotypeCommandOptions options;
+    options.gfa_path = path(gfa);
+    options.reference_path = "sampleA#1#chr1:0-100";
+    options.reads1_path = reads1;
+    options.reads2_path = reads2;
+    options.library_path = path("lib.txt");
+    options.out_prefix = path(prefix);
+    options.max_candidates = 16;
+    options.kmer_size = 21;
+    options.syncmer_s = 11;
+    options.quiet = true;
+    return options;
+}
+
+bool no_ranking_or_call(const std::string& prefix) {
+    return !exists(path(prefix + ".mosaic_scores.tsv")) && !exists(path(prefix + ".genotypes.tsv")) &&
+           !exists(path(prefix + ".block_genotypes.tsv")) && !exists(path(prefix + ".mosaic_haplotypes.fa"));
+}
+
+// Every stage that can stop early ends with a named status, no ranking and no call.
+void test_fail_closed_statuses() {
+    const std::string r1 = path("r1.fq");
+    const std::string r2 = path("r2.fq");
+
+    panvar::GenotypeCommandOptions beam_budget = tiny_options("beam_budget", r1, r2);
+    beam_budget.max_beam_extensions = 1;
+    require(panvar::run_genotype(beam_budget) == panvar::GenotypeRunStatus::CandidateIncomplete,
+            "an exhausted beam budget must end the run as CANDIDATE_INCOMPLETE");
+    require(read_status(path("beam_budget.mosaic_status.tsv")).at("note").find("resource budget") !=
+                std::string::npos,
+            "the status must name the exhausted proposal budget");
+    require(no_ranking_or_call("beam_budget"), "a run stopped in proposal must not rank or call");
+
+    panvar::GenotypeCommandOptions scorer_cap = tiny_options("scorer_cap", r1, r2);
+    scorer_cap.max_physical_origins = 1;
+    require(panvar::run_genotype(scorer_cap) == panvar::GenotypeRunStatus::RescoreIncomplete,
+            "an exhausted scoring cap must end the run as RESCORE_INCOMPLETE");
+    require(read_status(path("scorer_cap.mosaic_status.tsv")).at("note").find("resource cap") !=
+                std::string::npos,
+            "the status must name the exhausted scoring cap");
+    require(no_ranking_or_call("scorer_cap"), "a run stopped in rescoring must not rank or call");
+
+    // Stale outputs: a complete run, then a refused run under the same prefix. The refused run must not
+    // be left beside the earlier ranking.
+    require(panvar::run_genotype(tiny_options("stale", r1, r2)) == panvar::GenotypeRunStatus::Complete,
+            "fixture: the first run under the reused prefix must complete");
+    require(exists(path("stale.genotypes.tsv")), "fixture: the first run must write its call");
+    panvar::GenotypeCommandOptions reused = tiny_options("stale", r1, r2);
+    reused.max_physical_origins = 1;
+    require(panvar::run_genotype(reused) == panvar::GenotypeRunStatus::RescoreIncomplete,
+            "the second run under the reused prefix must refuse");
+    require(no_ranking_or_call("stale"),
+            "a refused run must remove the earlier run's ranking and call from its prefix");
+
+    // A structural failure writes MODEL_INCOMPLETE instead of escaping with no status. One panel path
+    // gives no bubbles and therefore no block chain.
+    {
+        std::ofstream gfa(path("single.gfa"));
+        gfa << "H\tVN:Z:1.0\nS\t1\tACGTACGTACGTACGTACGT\nS\t2\tTTGCATTGCATTGCA\nL\t1\t+\t2\t+\t0M\n"
+               "P\tsolo#1#chr1:0-100\t1+,2+\t*\n";
+    }
+    panvar::GenotypeCommandOptions single = tiny_options("single", r1, r2);
+    single.gfa_path = path("single.gfa");
+    single.reference_path = "solo#1#chr1:0-100";
+    require(panvar::run_genotype(single) == panvar::GenotypeRunStatus::ModelIncomplete,
+            "a locus whose structural model cannot be built must end MODEL_INCOMPLETE");
+    require(read_status(path("single.mosaic_status.tsv")).at("note").find("structural model") !=
+                std::string::npos,
+            "the status must say the structural model could not be built");
+    require(no_ranking_or_call("single"), "a run stopped at the model must not rank or call");
+}
+
+std::vector<std::vector<std::string>> read_rows(const std::string& file) {
+    std::ifstream input(file);
+    require(static_cast<bool>(input), "cannot read " + file);
+    std::vector<std::vector<std::string>> rows;
+    std::string line;
+    std::getline(input, line);
+    while (std::getline(input, line)) {
+        std::vector<std::string> cells;
+        std::stringstream fields(line);
+        for (std::string cell; std::getline(fields, cell, '\t');) cells.push_back(cell);
+        rows.push_back(std::move(cells));
+    }
+    return rows;
+}
+
+std::vector<std::size_t> parse_path(const std::string& joined) {
+    std::vector<std::size_t> out;
+    std::stringstream stream(joined);
+    for (std::string cell; std::getline(stream, cell, ',');) out.push_back(std::stoul(cell));
+    return out;
+}
+
+struct TruthFrame {
+    std::optional<panvar::PreparedGenotypeModel> model;
+    panvar::PathProjection truth1;
+    panvar::PathProjection truth2;
+};
+
+// Rebuilds the model exactly as the command did, refusing unless it reproduces the run's fingerprint,
+// and projects both truth paths onto that model's block frame from a graph that also carries them.
+// Sorting depends only on the reference path, so node identifiers name the same sequence in both.
+TruthFrame rebuild_truth_frame(const panvar::GenotypeCommandOptions& options, const std::string& fingerprint,
+                               const std::vector<std::string>& truth1_nodes,
+                               const std::vector<std::string>& truth2_nodes) {
+    TruthFrame frame;
+    panvar::GfaModel gfa = panvar::read_gfa_model(options.gfa_path);
+    panvar::GraphSortOptions sort_options;
+    sort_options.reference_path = options.reference_path;
+    sort_options.flip = true;
+    const std::string resolved = panvar::sort_graph_reference(gfa, sort_options).resolved_reference;
+    panvar::write_gfa_model(options.out_prefix + ".eval.sorted.gfa", gfa);
+    panvar::ParseGfaOptions parse_options;
+    const panvar::Graph graph = panvar::parse_gfa(options.out_prefix + ".eval.sorted.gfa", parse_options);
+    panvar::BubbleCallOptions bubble_options;
+    bubble_options.reference_path = resolved;
+    bubble_options.quiet = true;
+    bubble_options.min_variant_bp = options.min_variant_bp;
+    bubble_options.snarl_pairs_override = panvar::find_top_level_snarls_cactus(panvar::snarl_input_from_model(gfa));
+    bubble_options.snarl_source_supplied = true;
+    const std::vector<panvar::Bubble> bubbles = panvar::call_bubbles(graph, bubble_options);
+    panvar::LocusInputOptions locus_options;
+    locus_options.locus_id = resolved;
+    locus_options.reference_path_name = resolved;
+    const panvar::LocusInputResult built = panvar::build_locus_input(graph, bubbles, locus_options);
+    frame.model.emplace(panvar::prepare_genotype_model(built.input));
+    require(panvar::model_fingerprint(*frame.model) == fingerprint,
+            "the evaluation must rebuild the exact model the run scored");
+
+    {
+        std::ifstream in(options.gfa_path);
+        std::ofstream out(options.out_prefix + ".truth.gfa");
+        out << in.rdbuf();
+        for (const auto& item : {std::make_pair("truth#1#x", &truth1_nodes),
+                                 std::make_pair("truth#2#x", &truth2_nodes)}) {
+            out << "P\t" << item.first << '\t';
+            for (std::size_t i = 0; i < item.second->size(); ++i) {
+                out << (i ? "," : "") << (*item.second)[i] << '+';
+            }
+            out << "\t*\n";
+        }
+    }
+    panvar::GfaModel truth_gfa = panvar::read_gfa_model(options.out_prefix + ".truth.gfa");
+    panvar::sort_graph_reference(truth_gfa, sort_options);
+    panvar::write_gfa_model(options.out_prefix + ".truth.sorted.gfa", truth_gfa);
+    const panvar::Graph truth_graph = panvar::parse_gfa(options.out_prefix + ".truth.sorted.gfa", parse_options);
+    const auto t1 = panvar::project_path_onto_locus(truth_graph, bubbles, built.report, "truth#1#x");
+    const auto t2 = panvar::project_path_onto_locus(truth_graph, bubbles, built.report, "truth#2#x");
+    require(t1.has_value() && t2.has_value(), "both truth paths must project onto the block chain");
+    frame.truth1 = *t1;
+    frame.truth2 = *t2;
+    const panvar::PreparedGenotypeModel& model = *frame.model;
+    for (std::size_t b = 0; b < model.blocks().size(); ++b) {
+        require(frame.truth1.blocks[b].has_value() && frame.truth2.blocks[b].has_value(),
+                "every truth block must have a positional frame");
+        bool available1 = false;
+        bool available2 = false;
+        for (const auto& allele : model.blocks()[b].alleles) {
+            available1 = available1 || allele.sequence == *frame.truth1.blocks[b];
+            available2 = available2 || allele.sequence == *frame.truth2.blocks[b];
+        }
+        require(available1 && available2, "fixture: every truth block allele must exist in the panel");
+    }
+    // Neither truth haplotype may be a panel row at every block: recombination is required.
+    for (const panvar::PathProjection* truth : {&frame.truth1, &frame.truth2}) {
+        for (std::size_t row = 0; row < model.panel().template_count(); ++row) {
+            bool everywhere = true;
+            for (std::size_t b = 0; b < model.blocks().size(); ++b) {
+                const auto& allele = model.blocks()[b].alleles[model.panel().template_alleles[row][b]];
+                everywhere = everywhere && allele.sequence == *truth->blocks[b];
+            }
+            require(!everywhere, "fixture: a truth haplotype must not be a panel row");
+        }
+    }
+    return frame;
+}
+
+// True when some retained beam candidate spells both truth haplotypes, in either order, at every block.
+bool truth_phasing_in_candidates(const TruthFrame& frame, const std::string& candidates_file) {
+    const panvar::PreparedGenotypeModel& model = *frame.model;
+    for (const auto& row : read_rows(candidates_file)) {
+        const std::vector<std::size_t> hap1 = parse_path(row[2]);
+        const std::vector<std::size_t> hap2 = parse_path(row[3]);
+        const auto spells = [&](const std::vector<std::size_t>& path, const panvar::PathProjection& truth) {
+            for (std::size_t b = 0; b < model.blocks().size(); ++b) {
+                if (model.blocks()[b].alleles[path[b]].sequence != *truth.blocks[b]) return false;
+            }
+            return true;
+        };
+        if ((spells(hap1, frame.truth1) && spells(hap2, frame.truth2)) ||
+            (spells(hap1, frame.truth2) && spells(hap2, frame.truth1))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const std::vector<std::string> kTruth1Nodes = {"1", "2", "4", "5", "7", "9", "10"};
+const std::vector<std::string> kTruth2Nodes = {"1", "3", "4", "6", "7", "8", "10"};
+
+std::pair<std::string, std::string> spell_truths(const TinyLocus& locus) {
+    const auto spell = [&](const std::vector<std::string>& ids) {
+        std::string out;
+        for (const std::string& id : ids) out += locus.node_sequences.at(id);
+        return out;
+    };
+    std::pair<std::string, std::string> truths = {spell(kTruth1Nodes), spell(kTruth2Nodes)};
+    for (const std::string& row : locus.haplotypes) {
+        require(row != truths.first && row != truths.second,
+                "fixture: neither truth haplotype may be a panel row");
+    }
+    return truths;
+}
+
+// The first evidence the mosaic assembles a haplotype the panel does not contain. The contexts are
+// short enough that fragments link neighbouring variants, so the reads can phase the truth. The call
+// must be decided by the fragments, not by the prior, and match the truth at every block, phased.
+void test_off_panel_truth_is_recovered() {
+    const TinyLocus locus = write_tiny_locus("tiny_phaseable.gfa", 80, 70);
+    const auto truths = spell_truths(locus);
+    simulate(truths.first, truths.second, path("phaseable_r1.fq"), path("phaseable_r2.fq"), 123);
+    // At the default raw-history limit the proposal fills its width with equivalent template histories
+    // of the two zero-switch phasings -- which share the truth's genotype at every block, and which the
+    // phase-blind marker emission cannot tell apart -- and never offers the truth. That is a measured
+    // proposal limitation. The run must report its candidate set as truncated, and this arm pins the
+    // limitation so documentation cannot drift from it. If the proposal improves, revisit this arm.
+    const panvar::GenotypeCommandOptions default_limit = tiny_options(
+        "phaseable_default", path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa");
+    require(panvar::run_genotype(default_limit) == panvar::GenotypeRunStatus::Complete,
+            "fixture: the default-limit run must complete within its retained set");
+    const std::map<std::string, std::string> default_status =
+        read_status(path("phaseable_default.mosaic_status.tsv"));
+    require(default_status.at("candidate_set_truncated") == "true",
+            "a proposal that stops at its raw width below target must report a truncated candidate set");
+    const TruthFrame default_frame = rebuild_truth_frame(
+        default_limit, default_status.at("model_fingerprint"), kTruth1Nodes, kTruth2Nodes);
+    require(!truth_phasing_in_candidates(default_frame, path("phaseable_default.mosaic_candidates.tsv")),
+            "known limitation changed: the default-limit proposal now offers the truth; revisit this arm");
+
+    // Exhaustive for this locus: every ordered template-pair history of its 4 templates over 5 blocks,
+    // (4 * 4)^5. Derived from the locus, not from any result.
+    panvar::GenotypeCommandOptions options =
+        tiny_options("phaseable", path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa");
+    options.raw_history_limit = 1048576;
+    const panvar::GenotypeRunStatus status = panvar::run_genotype(options);
+    const std::map<std::string, std::string> reported = read_status(path("phaseable.mosaic_status.tsv"));
+    require(status == panvar::GenotypeRunStatus::Complete,
+            std::string("the phaseable off-panel run must complete, got ") +
+                panvar::genotype_run_status_name(status) + ": " +
+                (reported.count("note") ? reported.at("note") : ""));
+    require(reported.at("winner_decided_by") == "fragments",
+            "the reads, not the prior, must choose the off-panel truth");
+
+    const TruthFrame frame =
+        rebuild_truth_frame(options, reported.at("model_fingerprint"), kTruth1Nodes, kTruth2Nodes);
+    require(truth_phasing_in_candidates(frame, path("phaseable.mosaic_candidates.tsv")),
+            "an exhaustive proposal must offer the off-panel truth");
+    const panvar::PreparedGenotypeModel& model = *frame.model;
+    const auto rows = read_rows(path("phaseable.block_genotypes.tsv"));
+    require(rows.size() == model.blocks().size(), "the block table must carry every block");
+    int pairing = 0;
+    for (std::size_t b = 0; b < rows.size(); ++b) {
+        const auto& alleles = model.blocks()[b].alleles;
+        const std::string& c1 = alleles[std::stoul(rows[b][3])].sequence;
+        const std::string& c2 = alleles[std::stoul(rows[b][4])].sequence;
+        const std::string& a = *frame.truth1.blocks[b];
+        const std::string& d = *frame.truth2.blocks[b];
+        const bool direct = c1 == a && c2 == d;
+        const bool swapped = c1 == d && c2 == a;
+        require(direct || swapped, "block " + rows[b][0] + " must be called as the truth allele pair");
+        if (a != d) {
+            const int here = direct ? 1 : -1;
+            require(pairing == 0 || pairing == here, "the call must be phased consistently with the truth");
+            pairing = here;
+        }
+    }
+    require(pairing != 0, "fixture: the truth must be heterozygous somewhere, or phase is untested");
+    std::cout << "  off-panel truth (phaseable): all " << rows.size()
+              << " blocks called and phased correctly, decided by fragments, fragment gap "
+              << reported.at("fragment_term_gap_to_runner_up") << '\n';
+}
+
+// The same off-panel truth where the reads cannot phase it: every context span is wider than every
+// insert, so no fragment links neighbouring variants. Under the declared prior the zero-switch template
+// phasings that share the truth's genotype are then MORE probable than the truth, which needs a switch on
+// both haplotypes -- so the gate is not "the truth wins" but that phase is never claimed from reads. At an
+// exhaustive proposal width for this locus: every winning candidate carries the truth genotype at every
+// block, the truth phasing is retained with a fragment term identical to the winner's, and the winner is
+// never decided by fragments.
+void test_off_panel_phase_is_not_claimed_from_reads() {
+    const TinyLocus locus = write_tiny_locus();
+    const auto truths = spell_truths(locus);
+    simulate(truths.first, truths.second, path("unphaseable_r1.fq"), path("unphaseable_r2.fq"), 123);
+    panvar::GenotypeCommandOptions options =
+        tiny_options("unphaseable", path("unphaseable_r1.fq"), path("unphaseable_r2.fq"));
+    options.raw_history_limit = 1048576;   // (4 * 4)^5: exhaustive for 4 templates over 5 blocks
+    const panvar::GenotypeRunStatus status = panvar::run_genotype(options);
+    const std::map<std::string, std::string> reported = read_status(path("unphaseable.mosaic_status.tsv"));
+    require(status == panvar::GenotypeRunStatus::RescoreIncomplete ||
+                (status == panvar::GenotypeRunStatus::Complete && reported.at("winner_decided_by") == "prior"),
+            std::string("an unphaseable truth must not be decided by fragments, got ") +
+                panvar::genotype_run_status_name(status) + " decided by " +
+                (reported.count("winner_decided_by") ? reported.at("winner_decided_by") : "NA"));
+    const TruthFrame frame =
+        rebuild_truth_frame(options, reported.at("model_fingerprint"), kTruth1Nodes, kTruth2Nodes);
+    const panvar::PreparedGenotypeModel& model = *frame.model;
+
+    std::map<std::string, double> fragment_term;
+    std::map<std::string, double> error_bound;
+    std::set<std::string> winners;
+    for (const auto& row : read_rows(path("unphaseable.mosaic_scores.tsv"))) {
+        fragment_term[row[0]] = std::stod(row[4]);
+        error_bound[row[0]] = std::stod(row[7]);
+        if (row.back() == "true") winners.insert(row[0]);
+    }
+    require(!winners.empty(), "the ranking must report its winner set");
+
+    std::string truth_candidate;
+    std::size_t winning_members = 0;
+    for (const auto& row : read_rows(path("unphaseable.mosaic_candidates.tsv"))) {
+        const std::vector<std::size_t> hap1 = parse_path(row[2]);
+        const std::vector<std::size_t> hap2 = parse_path(row[3]);
+        bool genotype = true;
+        bool direct_everywhere = true;
+        bool swapped_everywhere = true;
+        for (std::size_t b = 0; b < model.blocks().size(); ++b) {
+            const auto& alleles = model.blocks()[b].alleles;
+            const std::string& c1 = alleles[hap1[b]].sequence;
+            const std::string& c2 = alleles[hap2[b]].sequence;
+            const std::string& a = *frame.truth1.blocks[b];
+            const std::string& d = *frame.truth2.blocks[b];
+            const bool direct = c1 == a && c2 == d;
+            const bool swapped = c1 == d && c2 == a;
+            genotype = genotype && (direct || swapped);
+            direct_everywhere = direct_everywhere && direct;
+            swapped_everywhere = swapped_everywhere && swapped;
+        }
+        if (direct_everywhere || swapped_everywhere) truth_candidate = row[11];
+        if (winners.count(row[11]) != 0) {
+            ++winning_members;
+            require(genotype, "every winning candidate must carry the truth genotype at every block");
+        }
+    }
+    require(winning_members >= winners.size(), "every winner must appear in the candidate manifest");
+    require(!truth_candidate.empty(), "an exhaustive proposal must retain the truth phasing");
+    const std::string winner = *winners.begin();
+    require(std::abs(fragment_term[truth_candidate] - fragment_term[winner]) <=
+                error_bound[truth_candidate] + error_bound[winner],
+            "with no phase-informative fragment the truth and the winner must have the same fragment term");
+    std::cout << "  off-panel truth (unphaseable): " << panvar::genotype_run_status_name(status)
+              << ", decided by " << reported.at("winner_decided_by") << ", " << winners.size()
+              << " winning phasing(s) with the truth genotype; truth phasing retained"
+              << (winners.count(truth_candidate) ? " in the winner set" : " below the winner by prior only")
+              << '\n';
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -302,6 +699,9 @@ int main(int argc, char** argv) {
     try {
         test_end_to_end();
         test_refusals();
+        test_fail_closed_statuses();
+        test_off_panel_truth_is_recovered();
+        test_off_panel_phase_is_not_claimed_from_reads();
         std::cout << "genotype command end-to-end: PASS\n";
         return 0;
     } catch (const std::exception& error) {
