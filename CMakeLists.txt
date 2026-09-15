@@ -249,6 +249,12 @@ if(PANVAR_BUILD_TESTING)
                  COMMAND genotype_command_e2e_test ${CMAKE_CURRENT_BINARY_DIR}/genotype_e2e)
         file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/genotype_e2e)
 
+        # Developer probe: seeded simulation, leave-one-out graphs and truth evaluation. Not a test and
+        # never installed; tests/genotype_probe_c4.sh drives it.
+        add_executable(genotype_probe tests/genotype_probe.cpp src/cli_utils.cpp)
+        target_link_libraries(genotype_probe PRIVATE panvarlib edlib)
+        target_compile_options(genotype_probe PRIVATE -Wall -Wextra -Wpedantic)
+
         add_executable(genotype_fragment_oracle_test tests/genotype_fragment_oracle.cpp)
         target_link_libraries(genotype_fragment_oracle_test PRIVATE panvarlib)
         target_compile_options(genotype_fragment_oracle_test PRIVATE -Wall -Wextra -Wpedantic)
