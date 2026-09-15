@@ -99,6 +99,11 @@ struct MarkerDepthEstimate {
     double gradient_background = 0.0;
     double gradient_rate = 0.0;
     double log_likelihood = 0.0;
+    // Joint fit only: the floating-point resolution of the compensated log-likelihood, and the gain the
+    // Newton model still predicted when the fit stopped (on the boundary, the rate-only face's). Convergence
+    // means the second is no larger than the first.
+    double likelihood_resolution = 0.0;
+    double newton_decrement = 0.0;
     std::size_t anchors_used = 0;
     std::size_t distinct_multiplicities = 0;
     std::size_t iterations = 0;

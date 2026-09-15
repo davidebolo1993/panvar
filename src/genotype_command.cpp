@@ -259,6 +259,8 @@ void write_status(
         out << "marker_depth_gradient_rate\t" << depth->gradient_rate << '\n';
         out << "marker_depth_log_likelihood\t" << std::setprecision(15) << depth->log_likelihood
             << std::setprecision(6) << '\n';
+        out << "marker_depth_likelihood_resolution\t" << depth->likelihood_resolution << '\n';
+        out << "marker_depth_newton_decrement\t" << depth->newton_decrement << '\n';
         out << "marker_depth_anchors_used\t" << depth->anchors_used << '\n';
         out << "marker_depth_distinct_multiplicities\t" << depth->distinct_multiplicities << '\n';
         out << "marker_depth_provenance\t" << depth->provenance << '\n';

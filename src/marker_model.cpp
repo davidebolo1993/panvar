@@ -564,14 +564,63 @@ MarkerDepthEstimate estimate_marker_depth(
     // is concave in (bg, r), so Newton with a backtracking line search reaches the unique maximum
     // quadratically. EM on the same model is only linearly convergent and did not reach tolerance on
     // C4's 25,167 anchors in 20,000 iterations.
+    //
+    // Stopping rule. Every sum is Neumaier-compensated, and the log-likelihood carries its floating-point
+    // resolution (a multiple of epsilon times the sum of its terms' magnitudes). The fit has converged when
+    // the gain the Newton model still predicts is no larger than that resolution: nothing further is
+    // resolvable in the objective. An absolute gradient tolerance cannot express this -- at NA20355 a
+    // background gradient of 9e-8 per anchor offered less gain than the arithmetic resolves near
+    // log L = 1e6, backtracking found no strict ascent, and the run was falsely refused.
     const double n = static_cast<double>(counts.size());
     const double background_floor = kMarkerBackgroundFloor;
-    const auto log_likelihood = [&](double bg, double r) {
-        double value = -n * bg - r * copy_sum;
-        for (std::size_t k = 0; k < counts.size(); ++k) {
-            if (counts[k] > 0.0) value += counts[k] * std::log(bg + r * copies[k]);
+    struct Compensated {
+        double sum = 0.0;
+        double correction = 0.0;
+        double magnitude = 0.0;
+        void add(double x) {
+            const double total = sum + x;
+            correction += std::abs(sum) >= std::abs(x) ? (sum - total) + x : (x - total) + sum;
+            sum = total;
+            magnitude += std::abs(x);
         }
-        return value;
+        double value() const { return sum + correction; }
+    };
+    struct Evaluation {
+        double log_likelihood = 0.0;
+        double resolution = 0.0;
+        double g_bg = 0.0;
+        double g_rate = 0.0;
+        double h_bb = 0.0;
+        double h_br = 0.0;
+        double h_rr = 0.0;
+    };
+    const auto evaluate = [&](double bg, double r) {
+        Compensated ll, gb, gr, hbb, hbr, hrr;
+        ll.add(-n * bg);
+        ll.add(-r * copy_sum);
+        gb.add(-n);
+        gr.add(-copy_sum);
+        for (std::size_t k = 0; k < counts.size(); ++k) {
+            if (!(counts[k] > 0.0)) continue;
+            const double mean = bg + r * copies[k];
+            const double first = counts[k] / mean;
+            const double second = first / mean;
+            ll.add(counts[k] * std::log(mean));
+            gb.add(first);
+            gr.add(first * copies[k]);
+            hbb.add(-second);
+            hbr.add(-second * copies[k]);
+            hrr.add(-second * copies[k] * copies[k]);
+        }
+        Evaluation out;
+        out.log_likelihood = ll.value();
+        out.resolution = 8.0 * std::numeric_limits<double>::epsilon() * std::max(1.0, ll.magnitude);
+        out.g_bg = gb.value();
+        out.g_rate = gr.value();
+        out.h_bb = hbb.value();
+        out.h_br = hbr.value();
+        out.h_rr = hrr.value();
+        return out;
     };
     // Start from least squares on c = bg + r d, pulled into the interior.
     const double mean_copies = copy_sum / n;
@@ -586,33 +635,15 @@ MarkerDepthEstimate estimate_marker_depth(
     if (!(rate > 0.0)) rate = mean_count / mean_copies;
     double background = mean_count - rate * mean_copies;
     if (!(background > background_floor)) background = std::max(10.0 * background_floor, 0.01 * mean_count);
-    double current = log_likelihood(background, rate);
 
-    const auto derivatives = [&](double bg, double r, double& g_bg, double& g_rate, double& h_bb,
-                                 double& h_br, double& h_rr) {
-        g_bg = -n;
-        g_rate = -copy_sum;
-        h_bb = 0.0;
-        h_br = 0.0;
-        h_rr = 0.0;
-        for (std::size_t k = 0; k < counts.size(); ++k) {
-            const double mean = bg + r * copies[k];
-            const double first = counts[k] / mean;
-            const double second = counts[k] / (mean * mean);
-            g_bg += first;
-            g_rate += first * copies[k];
-            h_bb -= second;
-            h_br -= second * copies[k];
-            h_rr -= second * copies[k] * copies[k];
-        }
-    };
-    // The rate that maximises the likelihood with the background held fixed: the rate score is
-    // strictly decreasing, so its root is found by bisection.
+    // The rate that maximises the likelihood with the background held fixed: the rate score is strictly
+    // decreasing, so its root is found by bisection.
     const auto rate_given_background = [&](double bg) {
         const auto score = [&](double r) {
-            double value = -copy_sum;
-            for (std::size_t k = 0; k < counts.size(); ++k) value += counts[k] * copies[k] / (bg + r * copies[k]);
-            return value;
+            Compensated value;
+            value.add(-copy_sum);
+            for (std::size_t k = 0; k < counts.size(); ++k) value.add(counts[k] * copies[k] / (bg + r * copies[k]));
+            return value.value();
         };
         double lo = 0.0;
         double hi = std::max(1.0, count_sum / copy_sum);
@@ -625,44 +656,45 @@ MarkerDepthEstimate estimate_marker_depth(
     };
 
     estimate.termination = "iteration_cap";
-    double g_bg = 0.0;
-    double g_rate = 0.0;
-    double h_bb = 0.0;
-    double h_br = 0.0;
-    double h_rr = 0.0;
+    Evaluation current = evaluate(background, rate);
+    double decrement = std::numeric_limits<double>::infinity();
     for (std::size_t iteration = 1; iteration <= 200; ++iteration) {
-        derivatives(background, rate, g_bg, g_rate, h_bb, h_br, h_rr);
         estimate.iterations = iteration;
-        if (std::abs(g_bg) <= 1e-9 * n && std::abs(g_rate) <= 1e-9 * copy_sum) {
-            estimate.converged = true;
-            estimate.termination = "interior_stationary";
-            break;
-        }
-        // Active constraint. When the background sits on its floor and still wants to fall, the
-        // maximum is on that face: maximise over the rate alone there, then check the Karush-Kuhn-
-        // Tucker condition. Projecting a joint Newton step instead never makes the rate stationary --
-        // on NA19240 that stopped at the iteration cap with a rate 3.4% high.
-        if (background <= background_floor && g_bg <= 0.0) {
+        // Active constraint. When the background sits on its floor and still wants to fall, the maximum is on
+        // that face: maximise over the rate alone there, then check Karush-Kuhn-Tucker with the face's own
+        // decrement. Projecting a joint Newton step instead never makes the rate stationary -- on NA19240 that
+        // stopped at the iteration cap with a rate 3.4% high.
+        if (background <= background_floor && current.g_bg <= 0.0) {
             background = background_floor;
             rate = rate_given_background(background_floor);
-            current = log_likelihood(background, rate);
-            derivatives(background, rate, g_bg, g_rate, h_bb, h_br, h_rr);
-            if (g_bg <= 0.0 && std::abs(g_rate) <= 1e-9 * copy_sum) {
+            current = evaluate(background, rate);
+            decrement = current.h_rr < 0.0 ? 0.5 * current.g_rate * current.g_rate / -current.h_rr
+                                           : std::numeric_limits<double>::infinity();
+            if (current.g_bg <= 0.0 && decrement <= current.resolution) {
                 estimate.converged = true;
                 estimate.background_at_floor = true;
                 estimate.termination = "boundary_kkt";
                 break;
             }
         }
-        const double determinant = h_bb * h_rr - h_br * h_br;
+        const double determinant = current.h_bb * current.h_rr - current.h_br * current.h_br;
         double step_bg = 0.0;
         double step_rate = 0.0;
-        if (determinant > 0.0 && h_bb < 0.0) {
-            step_bg = -(h_rr * g_bg - h_br * g_rate) / determinant;
-            step_rate = -(-h_br * g_bg + h_bb * g_rate) / determinant;
+        if (determinant > 0.0 && current.h_bb < 0.0) {
+            step_bg = -(current.h_rr * current.g_bg - current.h_br * current.g_rate) / determinant;
+            step_rate = -(-current.h_br * current.g_bg + current.h_bb * current.g_rate) / determinant;
+            // Predicted gain of the full Newton step: half of g^T (-H)^{-1} g.
+            decrement = 0.5 * (current.g_bg * step_bg + current.g_rate * step_rate);
         } else {
-            step_bg = g_bg / std::max(1.0, -h_bb);
-            step_rate = g_rate / std::max(1.0, -h_rr);
+            step_bg = current.g_bg / std::max(1.0, -current.h_bb);
+            step_rate = current.g_rate / std::max(1.0, -current.h_rr);
+            decrement = std::numeric_limits<double>::infinity();
+        }
+        const bool on_face = background <= background_floor && current.g_bg <= 0.0;
+        if (!on_face && decrement <= current.resolution) {
+            estimate.converged = true;
+            estimate.termination = "interior_stationary";
+            break;
         }
         bool moved = false;
         double scale = 1.0;
@@ -670,8 +702,8 @@ MarkerDepthEstimate estimate_marker_depth(
             const double next_bg = std::max(background_floor, background + scale * step_bg);
             const double next_rate = rate + scale * step_rate;
             if (!(next_rate > 0.0)) continue;
-            const double candidate = log_likelihood(next_bg, next_rate);
-            if (candidate > current) {
+            const Evaluation candidate = evaluate(next_bg, next_rate);
+            if (candidate.log_likelihood > current.log_likelihood) {
                 background = next_bg;
                 rate = next_rate;
                 current = candidate;
@@ -680,14 +712,17 @@ MarkerDepthEstimate estimate_marker_depth(
             }
         }
         if (!moved) {
+            // No strict ascent while the model still predicts a resolvable gain: not a maximum, refuse.
             estimate.termination = "no_ascent";
             break;
         }
     }
-    derivatives(background, rate, g_bg, g_rate, h_bb, h_br, h_rr);
-    estimate.gradient_background = g_bg;
-    estimate.gradient_rate = g_rate;
-    estimate.log_likelihood = log_likelihood(background, rate);
+    current = evaluate(background, rate);
+    estimate.gradient_background = current.g_bg;
+    estimate.gradient_rate = current.g_rate;
+    estimate.log_likelihood = current.log_likelihood;
+    estimate.likelihood_resolution = current.resolution;
+    estimate.newton_decrement = decrement;
     estimate.background = background;
     estimate.rate_per_copy = rate;
     estimate.background_estimated = true;

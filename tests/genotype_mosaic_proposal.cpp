@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <iostream>
 #include <limits>
@@ -628,6 +629,136 @@ void test_marker_depth_estimation() {
     }
 }
 
+// Real C4 invariant-anchor histograms, {haploid multiplicity, observed count, anchors}, dumped by
+// genotype_probe anchors: NA20355, whose depth fit was falsely refused (no_ascent) in the round-5 cohort, and
+// NA19240, whose optimum is on the background floor.
+struct AnchorRow {
+    std::uint32_t multiplicity;
+    std::uint64_t count;
+    std::uint64_t anchors;
+};
+const std::vector<AnchorRow> kNa20355Anchors = {
+#include "genotype_depth_anchors_na20355.inc"
+};
+const std::vector<AnchorRow> kNa19240Anchors = {
+#include "genotype_depth_anchors_na19240.inc"
+};
+
+struct ProfileFit {
+    double background = 0.0;
+    double rate = 0.0;
+    long double log_likelihood = 0.0L;
+    bool at_floor = false;
+};
+
+// An oracle for the joint depth fit that shares nothing with its Newton iteration. At a fixed background the
+// rate is the root of the strictly decreasing rate score. The profile log-likelihood's slope in the background
+// is the background score at that rate (envelope theorem), and it decreases because the joint log-likelihood is
+// concave: the maximum is on the floor when that slope is already non-positive there, and otherwise at its root.
+// Both roots are bisected on the histogram in long double (which is double on some platforms).
+ProfileFit profile_oracle(const std::vector<AnchorRow>& rows) {
+    using ld = long double;
+    ld n = 0.0L;
+    ld copy_sum = 0.0L;
+    for (const AnchorRow& row : rows) {
+        n += static_cast<ld>(row.anchors);
+        copy_sum += static_cast<ld>(row.anchors) * 2.0L * static_cast<ld>(row.multiplicity);
+    }
+    const auto rate_at = [&](ld bg) {
+        const auto score = [&](ld r) {
+            ld value = -copy_sum;
+            for (const AnchorRow& row : rows) {
+                const ld d = 2.0L * static_cast<ld>(row.multiplicity);
+                value += static_cast<ld>(row.anchors) * static_cast<ld>(row.count) * d / (bg + r * d);
+            }
+            return value;
+        };
+        ld lo = 0.0L;
+        ld hi = 1.0L;
+        while (score(hi) > 0.0L) hi *= 2.0L;
+        for (int i = 0; i < 400; ++i) {
+            const ld mid = 0.5L * (lo + hi);
+            (score(mid) > 0.0L ? lo : hi) = mid;
+        }
+        return 0.5L * (lo + hi);
+    };
+    const auto slope = [&](ld bg) {
+        const ld r = rate_at(bg);
+        ld value = -n;
+        for (const AnchorRow& row : rows) {
+            const ld d = 2.0L * static_cast<ld>(row.multiplicity);
+            value += static_cast<ld>(row.anchors) * static_cast<ld>(row.count) / (bg + r * d);
+        }
+        return value;
+    };
+    const ld floor = static_cast<ld>(panvar::kMarkerBackgroundFloor);
+    ProfileFit fit;
+    ld bg = floor;
+    fit.at_floor = slope(floor) <= 0.0L;
+    if (!fit.at_floor) {
+        ld lo = floor;
+        ld hi = 1.0L;
+        while (slope(hi) > 0.0L) hi *= 2.0L;
+        for (int i = 0; i < 200; ++i) {
+            const ld mid = 0.5L * (lo + hi);
+            (slope(mid) > 0.0L ? lo : hi) = mid;
+        }
+        bg = 0.5L * (lo + hi);
+    }
+    const ld r = rate_at(bg);
+    ld log_likelihood = -n * bg - r * copy_sum;
+    for (const AnchorRow& row : rows) {
+        if (row.count == 0) continue;
+        const ld d = 2.0L * static_cast<ld>(row.multiplicity);
+        log_likelihood += static_cast<ld>(row.anchors) * static_cast<ld>(row.count) * std::log(bg + r * d);
+    }
+    fit.background = static_cast<double>(bg);
+    fit.rate = static_cast<double>(r);
+    fit.log_likelihood = log_likelihood;
+    return fit;
+}
+
+// The production fit must stop by its own rule where the independent oracle puts the maximum: on the same side
+// of the floor, at the same rate and background, with the same log-likelihood within its resolution.
+void test_depth_fit_matches_profile_oracle() {
+    for (const auto& item : {std::make_pair(std::string("NA20355"), &kNa20355Anchors),
+                             std::make_pair(std::string("NA19240"), &kNa19240Anchors)}) {
+        panvar::PreparedMarkerPanel panel;
+        panvar::MarkerObservations observations;
+        std::uint32_t slot = 0;
+        for (const AnchorRow& row : *item.second) {
+            for (std::uint64_t i = 0; i < row.anchors; ++i, ++slot) {
+                panel.codes.push_back(slot);
+                panel.anchor_slots.push_back(slot);
+                panel.anchor_haploid_multiplicity.push_back(row.multiplicity);
+                observations.counts.push_back(row.count);
+            }
+        }
+        require(panel.anchor_slots.size() == 25167, "fixture: " + item.first + " must carry every C4 anchor");
+        const panvar::MarkerDepthEstimate estimate =
+            panvar::estimate_marker_depth(panel, observations, std::nullopt);
+        const ProfileFit oracle = profile_oracle(*item.second);
+        require(estimate.converged && estimate.newton_decrement <= estimate.likelihood_resolution,
+                item.first + ": the depth fit must converge by its decrement rule, stopped by " + estimate.termination);
+        require(estimate.background_at_floor == oracle.at_floor &&
+                    estimate.termination == (oracle.at_floor ? "boundary_kkt" : "interior_stationary"),
+                item.first + ": the fit must stop on the oracle's side of the background floor");
+        require(std::abs(estimate.rate_per_copy - oracle.rate) <= 1e-7 * oracle.rate,
+                item.first + ": the rate must match the profile oracle");
+        require(oracle.at_floor ? estimate.background == panvar::kMarkerBackgroundFloor
+                                : std::abs(estimate.background - oracle.background) <= 1e-5 * oracle.background,
+                item.first + ": the background must match the profile oracle");
+        const double likelihood_gap = std::abs(estimate.log_likelihood - static_cast<double>(oracle.log_likelihood));
+        require(likelihood_gap <= std::max(4.0 * estimate.likelihood_resolution, 1e-7),
+                item.first + ": the log-likelihood must match the profile oracle within its resolution, off by " +
+                    std::to_string(likelihood_gap));
+        std::cout << "  depth fit on " << item.first << " anchors: rate " << estimate.rate_per_copy << " (oracle "
+                  << oracle.rate << "), background " << estimate.background << " (oracle " << oracle.background
+                  << "), " << estimate.termination << " in " << estimate.iterations << " iterations, decrement "
+                  << estimate.newton_decrement << " <= resolution " << estimate.likelihood_resolution << '\n';
+    }
+}
+
 // One background from fit to emission. The NA19240-like boundary fit ends on the model floor, and
 // proposal scoring must use exactly that value. The reads observe AAC and ACC once each; the a-rich
 // allele carries neither, so a-rich/a-rich gives both markers zero copies and each observation
@@ -782,6 +913,7 @@ int main() {
         test_mosaic_beam();
         test_marker_depth_estimation();
         test_marker_background_reaches_proposal();
+        test_depth_fit_matches_profile_oracle();
         test_panel_baseline_retains_a_pruned_pair();
         std::cout << "genotype mosaic proposal: PASS\n";
         return 0;

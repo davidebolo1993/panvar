@@ -1216,6 +1216,33 @@ int compare(const Args& args) {
 } // namespace
 
 // ------------------------------------------------------------------------------------------------
+// anchors: a donor's invariant-anchor counts, for the depth-fit oracle gate
+// ------------------------------------------------------------------------------------------------
+
+// Writes the histogram of (haploid multiplicity, observed count) over the invariant anchors as C++ initialiser
+// rows, so a unit test can refit the real anchors without the reads.
+int anchors(const Args& args) {
+    const std::string out = args.required("out");
+    const LoadedModel loaded = load_model(args.required("gfa"), args.required("reference"), out + ".model.sorted.gfa", 50);
+    const std::vector<panvar::ReadPair> fragments = read_pairs(args.required("reads1"), args.required("reads2"));
+    const panvar::PreparedMarkerPanel markers = panvar::build_marker_panel(*loaded.model, 31, 15);
+    const panvar::MarkerObservations observations = panvar::count_marker_observations(markers, fragments);
+    std::map<std::pair<std::uint32_t, std::uint64_t>, std::uint64_t> histogram;
+    for (std::size_t k = 0; k < markers.anchor_slots.size(); ++k) {
+        ++histogram[{markers.anchor_haploid_multiplicity[k], observations.counts[markers.anchor_slots[k]]}];
+    }
+    std::ofstream file(out);
+    file << "// " << args.required("label") << ": invariant-anchor histogram from genotype_probe anchors\n"
+         << "// {haploid multiplicity, observed count, anchors}; " << markers.anchor_slots.size() << " anchors\n";
+    for (const auto& item : histogram) {
+        file << "{" << item.first.first << ", " << item.first.second << ", " << item.second << "},\n";
+    }
+    std::cout << "anchors " << args.required("label") << ": " << markers.anchor_slots.size() << " anchors, "
+              << histogram.size() << " histogram rows\n";
+    return 0;
+}
+
+// ------------------------------------------------------------------------------------------------
 // trace: follow the leave-zero-out truth pair through every proposal layer
 // ------------------------------------------------------------------------------------------------
 
@@ -1384,7 +1411,7 @@ int genotype(const Args& args) {
 int main(int argc, char** argv) {
     try {
         if (argc < 2) {
-            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace --key value ...\n";
+            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors --key value ...\n";
             return 2;
         }
         const std::string command = argv[1];
@@ -1395,6 +1422,7 @@ int main(int argc, char** argv) {
         if (command == "compare") return compare(args);
         if (command == "genotype") return genotype(args);
         if (command == "trace") return trace(args);
+        if (command == "anchors") return anchors(args);
         std::cerr << "unknown probe command: " << command << '\n';
         return 2;
     } catch (const std::exception& error) {
