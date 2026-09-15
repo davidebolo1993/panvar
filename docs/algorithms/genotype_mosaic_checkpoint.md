@@ -4,6 +4,260 @@ Companion to `genotype_mosaic.md`, which remains the authoritative contract. Thi
 what is actually built, what its own gates still owe, and the work order to reach the Phase 8
 go/no-go.
 
+## R6. Review round 6 — protected panel baseline, depth, phase and confidence
+
+The reviewer ruled on round 5:
+
+- The held-out cohort is preserved as a **frozen pre-correction diagnostic** (R5 and its outputs are
+  unchanged). It is not the final LZO result.
+- The four missing truths are a structural proposal-recall defect.
+- The false no-call and the phase over-claim have direct fixes.
+
+Transparent raw figures for R5 are:
+
+- 55 of 56 donors called;
+- 601 of 605 emitted block genotypes exact (99.34%);
+- 601 of 616 intended block results exact when the no-call is counted (97.56%);
+- 51 of 56 donors completely correct;
+- four errors, each caused by the true panel diplotype never reaching fragment scoring;
+- one false no-call, caused by the convergence criterion.
+
+The reviewer set a twelve-step sequence. Steps 1–10 are recorded here. The run stops before step 11 (the
+development ladder under the new definition of K) for review.
+
+| Step | Commit | Result |
+|---|---|---|
+| 1. Freeze R5 | — | R5 text and `tests/results/genotype_cohort_c4_b1684ae/` untouched; corrected runs go to new directories |
+| 2. Trace the four truths through the beam | `db5647b` | R6.1 |
+| 3. Protected panel-diplotype baseline | `9a0f535` | R6.2 |
+| 4. Fixture where the beam prunes the true pair | `9a0f535` | R6.2 |
+| 5. Benchmark every C4 panel pair on one donor | `9a0f535` | R6.3 |
+| 6. Depth stopping rule, profile-likelihood oracle | `2552a5f` | R6.4 |
+| 7. Phase support from the audit set | `5b3cfa0` | R6.5 |
+| 8. Conditional block posterior and GQ | `301f744` | R6.6 |
+| 9–10. Targeted rerun | `301f744` | R6.7 |
+
+All 16 enabled tests pass at `301f744`.
+
+### R6.1 Where each truth was pruned (step 2)
+
+`MosaicBeamParameters::trace_target` is diagnostic only. It follows one diplotype through every layer:
+states offered and retained, the distinct prefix pairs among the retained states, and the target's offered
+and retained states, mass and rank.
+
+- Its prefixes are looked up without interning, so a traced search returns exactly the untraced search
+  (gated).
+- The trace accounts for every pruned state (gated).
+
+`genotype_probe trace` rebuilds the command's model, markers, depth and emissions and follows the LZO
+donor's own panel pair. Each traced proposal reproduces its cohort run's top 256 candidates.
+
+| Donor | First dropped at | Truth rank among offered states there | Distinct prefix pairs in the 1,024 retained states | Marker score, winner minus truth, all blocks | Exact path prior, truth vs winner |
+|---|---|---|---|---|---|
+| HG01573 | `ctx:4` | 4,573 | 5 | +28.6 | −9.26 vs −25.71 |
+| HG02492 | `ctx:4` | 22,070 | 6 | +30.3 | −9.26 vs −27.09 |
+| HG04217 | `sv:9` | 16,710 | 15 | +37.1 | −9.26 vs −26.40 |
+| NA19331 | `sv:5` | 10,625 | 4 | +46.6 | −9.26 vs −26.12 |
+| HG02011 (exact control) | never | 1 in every layer | — | 0 | identical |
+
+Two mechanisms act together.
+
+1. **The markers prefer the wrong allele.** Summed over all blocks, the proposal's marker score favours the
+   winner by 28–47 nats, more than the truth's roughly 16-nat prior advantage. Even an exhaustive proposal
+   would rank the winner first, so this is not only a pruning accident.
+2. **The width holds very few diplotypes.** At each drop point the 1,024 retained states hold only 4–15
+   distinct prefix pairs; the rest are template copies of a few locally better diplotypes. At `ctx:4`, for
+   instance, 11,025 of the offered states were template variants of the truth's prefix pair alone. The truth's
+   rank among prefix pairs, as opposed to states, was not measured.
+
+The second mechanism matters for LOO as well. Merged-state width is not diplotype width.
+
+### R6.2 The protected panel baseline (steps 3–4)
+
+**Candidate set.** Every unordered panel diplotype (`panel_diplotypes`: deduplicated by allele paths,
+canonical, numbered in order) plus the top-K off-panel mosaics from the beam (`off_panel_mosaics`, in
+proposal order).
+
+- The beam returns every diplotype it found (its target is at least its state limit), so the off-panel count
+  is exact.
+- K, the refusal rule and the conditional flags now apply to those mosaics. The panel is added whole.
+- Predicted work (panel pairs × fragments) is checked before scoring against
+  `max_panel_pair_fragment_evaluations`. A baseline over budget is refused whole, never scored in part.
+
+**Outputs.** The manifest gains a `source` column (`panel` or `mosaic`; panel rows have no rank or proposal
+score). The status reports `panel_diplotypes`, `panel_baseline_complete`, `beam_diplotypes_found` and
+`candidates_total`.
+
+**Scoring once.** The panel and the largest ranked mosaic prefix are spelled, prior-scored and
+fragment-scored once, and `certify_scored_ranking` certifies each prefix from those scores. The
+prefix-equals-standalone gate still holds; only the shared scoring pass's work counters are excluded.
+
+**Gates.**
+
+- A four-template fixture's true pair is locally bad at block 0 and best overall.
+  - It is ranked first by an exhaustive beam.
+  - A narrow beam drops it at block 0, per the trace.
+  - It is present in the panel baseline.
+- No off-panel mosaic duplicates a panel pair.
+- Identical template rows add no pair.
+- End to end, the manifest holds every panel pair and the status reports the baseline complete.
+
+### R6.3 Benchmark: the whole C4 panel on HG01573 (step 5)
+
+Clean worktree at `9a0f535`, the same reads as the frozen cohort, state limit 1,024, K = 8 and K = 256
+from one proposal:
+
+| | Round 5 | With the panel baseline |
+|---|---|---|
+| Candidates | 8 mosaics | 8,515 panel diplotypes + 8 (or 256) mosaics |
+| Truth among candidates | no | yes, source `panel`, score rank 1 |
+| Blocks exact, distance | 10/11, 1 | **11/11, 0** |
+| Wall time, peak RSS | about 76 s, 513 MB (K = 8 and K = 256) | 61.8 s, 663 MB (K = 8 and K = 256) |
+| Of which one scoring pass | — | 57.2 s |
+
+C4 has 131 templates. Their 8,646 unordered pairs deduplicate to 8,515 distinct panel diplotypes, because
+some templates have identical allele rows.
+
+### R6.4 The depth stopping rule (step 6)
+
+**Summation.**
+
+- Likelihood, gradient and Hessian sums are Neumaier-compensated.
+- On this platform (arm64 macOS) `long double` is `double`, so compensation, not width, carries the
+  accuracy.
+- The log-likelihood carries its floating-point resolution: 8 ε times the sum of its terms' magnitudes.
+
+**Stopping.** The fit converges when the projected Newton decrement — half of gᵀ(−H)⁻¹g, or on the floor
+the rate-only face's decrement with a non-positive background score (KKT) — is no larger than that
+resolution. A failed line search while a resolvable gain remains is still refused.
+
+**Oracle gate.** The real C4 anchor histograms of NA20355 and NA19240 (dumped by
+`genotype_probe anchors`) are refitted and compared with an independent profile-likelihood oracle, run in
+long double: bisection for the rate at fixed background, and bisection on the envelope slope for the
+background.
+
+| Anchors | Production | Oracle | Termination | Decrement ≤ resolution |
+|---|---|---|---|---|
+| NA20355 | rate 9.82334, background 0.0744787 | rate 9.82334, background 0.0744787 | `interior_stationary`, 4 iterations | 2.5e-22 ≤ 3.6e-9 |
+| NA19240 | rate 9.76988, background 1e-6 | rate 9.76988, background 1e-6 | `boundary_kkt`, 2 iterations | 3.7e-26 ≤ 3.5e-9 |
+
+Requiring a gain 1e-12 of the resolution makes the depth tests fail. The first gate to fail is the
+simulated interior fixture, which runs before the oracle.
+
+### R6.5 Phase support from the audit set (step 7)
+
+**Claims.**
+
+- Without an audit, read-supported phase is `READS_WITHIN_CANDIDATES`.
+- With `phase_audit_candidates` declared (not a command-line option; larger than every primary set), the
+  same proposal and scores are also ranked as the audit set. `audited_phase_support` reports:
+  - `READS_AUDITED` only when that set completed, agrees on the winner and on every block genotype, and is
+    itself read-supported;
+  - `PRIOR_ONLY` when it agrees on the call but phase ties;
+  - `UNRESOLVED` otherwise, including when the audit set cannot be ranked.
+- `READS_AUDITED` is conditional on the audit set, not a global proof.
+
+The status reports the within-set claim, the audit size and status, and whether winner, block genotypes and
+phase agreed.
+
+**Gates.**
+
+- The exhaustive phaseable fixture is `READS_AUDITED`.
+- At 64 merged states the same fixture's K = 1 claim is withdrawn to `UNRESOLVED`, because the 64-mosaic
+  audit cannot be reached.
+- The decision's truth table covers the branches no small fixture reaches.
+- An audit no larger than the primary set is refused.
+
+With the panel baseline, the unphaseable fixture stays `UNRESOLVED` at every K: the panel already holds the
+tying phasing.
+
+### R6.6 Conditional block posterior and GQ (step 8)
+
+`block_genotype_confidence` works per block, within the retained candidate set:
+
+- the posterior of the winner's unordered genotype, with candidates grouped by their representative's
+  genotype;
+- its quality, −10 log10(1 − posterior), with the rival mass summed in log space;
+- whether every candidate with another genotype lies below the winner beyond floating-point error.
+
+`block_genotypes.tsv` adds `conditional_genotype_posterior`, `conditional_GQ`, `numerically_separated` and
+`candidate_scope`; `genotypes.tsv` adds the posterior and GQ. No LOWCONF threshold is applied, because none
+has been declared. The status key `certified_gap` is now `numeric_separation_gap`, and the drivers read
+either name.
+
+**Gates.**
+
+- Winner 0.6, same-genotype rival 0.3 and other-genotype rival 0.1 give posterior 0.9 and GQ 10.
+- A block where all candidates agree gives posterior 1 and unbounded GQ.
+- A rival within numerical error is not separated.
+- A 1e-300 rival keeps a finite GQ of 3000.
+- End to end, every block's posterior and GQ are recomputed from the run's own manifest and set
+  probabilities.
+
+The C4-like fixtures all give posterior 1, so the direct gate is the one that exercises the calculation.
+
+### R6.7 Targeted rerun (steps 9–10)
+
+**Setup.**
+
+- `tests/genotype_round6_targeted_c4.sh`, from a clean worktree at `301f744` (`git_tree_dirty false`, 16/16
+  tests).
+- The same simulated reads as the frozen round-5 cohort, which is read and not written.
+- State limit 1,024, K = 8, a declared K = 256 phase audit.
+- Output under `tests/results/genotype_round6_targeted_301f744/`.
+
+| Donor (round-5 outcome) | Status | Depth fit | Truth among candidates | Blocks exact (SV) | Distance | Phase within → reported | Lowest block GQ | Wall, peak RSS |
+|---|---|---|---|---|---|---|---|---|
+| NA20355 (false no-call) | COMPLETE | `interior_stationary` | yes, panel | 11/11 (5/5) | 0 | PRIOR_ONLY → PRIOR_ONLY | 155 | 51 s, 478 MB |
+| HG01573 (truth never proposed) | COMPLETE | `boundary_kkt` | yes, panel | 11/11 (5/5) | 0 | READS_WITHIN_CANDIDATES → READS_AUDITED | 117 | 66 s, 553 MB |
+| HG02492 (truth never proposed) | COMPLETE | `boundary_kkt` | yes, panel | 11/11 (5/5) | 0 | READS_WITHIN_CANDIDATES → READS_AUDITED | 201 | 64 s, 541 MB |
+| HG04217 (truth never proposed) | COMPLETE | `boundary_kkt` | yes, panel | 11/11 (5/5) | 0 | READS_WITHIN_CANDIDATES → READS_AUDITED | 328 | 59 s, 636 MB |
+| NA19331 (truth never proposed) | COMPLETE | `boundary_kkt` | yes, panel | 11/11 (5/5) | 0 | READS_WITHIN_CANDIDATES → READS_AUDITED | 353 | 66 s, 653 MB |
+| HG02011 (exact control) | COMPLETE | `boundary_kkt` | yes, panel | 11/11 (5/5) | 0 | PRIOR_ONLY → PRIOR_ONLY | 286 | 53 s, 576 MB |
+
+Every run's depth fit converged with a Newton decrement below 6e-22 against a resolution of about 3.5e-9.
+Every panel baseline was complete (8,515 diplotypes). Every K = 256 audit set was ranked to completion and
+agreed on the winner.
+
+The reviewer's conditions for step 10:
+
+- **Depth convergence: met.** NA20355 converges in the interior, matching its oracle.
+- **Every LZO truth diplotype present: met.** All six truths are candidates, as panel pairs.
+- **No regression in the control: met.** HG02011 has the same exact call and the same phase claim as in
+  round 5.
+- **Bounded runtime and memory: met.** Wall time was 51–66 s against 38–87 s in round 5; peak RSS was
+  478–653 MB against 327–516 MB. The single scoring pass over panel and mosaics takes 46–62 s.
+
+**Observations, not yet interpreted.**
+
+- **The beam proposes almost no panel pairs itself.** For every one of the six donors it found at most one panel
+  diplotype; for NA20355, 1,023 of its 1,024 diplotypes were off-panel. Panel recall now comes entirely from
+  the baseline.
+- **Phase audit results changed.** The four previously missing-truth donors now report `READS_AUDITED`. In
+  round 5, K = 8 read-phase claims mostly vanished at K = 256. Here the audit set agrees, which is plausible
+  now that every panel rival is in both sets. It is six donors, not a cohort.
+- **GQs are large.** The lowest block GQs are 117–353, conditional on a candidate set and a model already
+  known to be misspecified for absent indel alleles (R4). They are not calibrated error rates.
+
+### R6.8 Questions before the ladder refreeze (step 11)
+
+1. **The mosaic refusal rule.** With the whole panel always scored, a pruned search that finds fewer than K
+   off-panel mosaics still refuses the run. Keep that, or call with `candidate_scope CONDITIONAL` since
+   every panel hypothesis was evaluated?
+2. **Beam width.** R6.1 shows the width holds 4–15 distinct prefix pairs at the drop points; the rest is
+   template multiplicity. LZO no longer depends on this, but recombinant (LOO) recall does. Should the beam
+   be limited by distinct prefix pairs rather than merged states, before or after the refreeze?
+3. **Marker overconfidence.** The proposal's marker score preferred the wrong 1-bp allele by 28–47 nats.
+   Correlated syncmers from one fragment are counted as independent. Is tempering the proposal emission in
+   scope now, given it no longer decides LZO?
+4. **The refreeze grid.** K now counts off-panel mosaics. The proposal is to rerun the development ladder
+   at state limits 256 / 1,024 / 4,096 with K prefixes 8–256 and a K = 256 phase audit. Selection would
+   use the same stability rule, adding that the audit set must be reachable, since an unreachable audit
+   makes every read-phase claim UNRESOLVED. Acceptable?
+5. **The LOWCONF threshold.** LZO development simulations contain no errors to calibrate GQ against. Should
+   the threshold be declared from development leave-one-out runs, or left unset for the corrected LZO
+   cohort?
+
 ## R5. Review round 5 — floor, harness, NA19240 rerun and the development ladder
 
 The reviewer accepted the round-4 diagnosis: the scorer is internally consistent, and the substitution-only
