@@ -58,7 +58,7 @@ struct GenotypeCommandOptions {
     // with max_mosaic_candidates = k uses: K only truncates the final proposal ordering. Every candidate a
     // prefix contains is scored; the production refusal rule still applies to each k.
     std::vector<std::size_t> development_candidate_prefixes;
-    // Not a command-line option. When positive (and larger than every primary candidate set), the same proposal
+    // Not a command-line option. When positive (and at least as large as every primary candidate set), the same proposal
     // and scores are also ranked with this many mosaics, and read-supported phase is reported READS_AUDITED only
     // if that larger set agrees on the winner, the block genotypes and read-supported phase. Without an audit a
     // read-supported phase is READS_WITHIN_CANDIDATES.

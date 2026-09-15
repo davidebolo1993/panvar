@@ -1004,12 +1004,13 @@ void test_phase_audit() {
     bool refused = false;
     try {
         panvar::GenotypeCommandOptions invalid = narrow;
-        invalid.phase_audit_candidates = 1;
+        invalid.max_mosaic_candidates = 4;
+        invalid.phase_audit_candidates = 2;
         panvar::run_genotype(invalid);
     } catch (const std::runtime_error&) {
         refused = true;
     }
-    require(refused, "an audit set no larger than the primary set must be refused");
+    require(refused, "an audit set smaller than the primary set must be refused");
     std::cout << "  phase audit: exhaustive phaseable " << confirmed.at("phase_support") << "; K=1 at 64 states "
               << withdrawn.at("phase_support_within_candidates") << " -> " << withdrawn.at("phase_support")
               << " (audit " << withdrawn.at("phase_audit_status") << ")\n";

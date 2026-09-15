@@ -456,8 +456,9 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         const std::size_t largest = options.development_candidate_prefixes.empty()
                                         ? options.max_mosaic_candidates
                                         : options.development_candidate_prefixes.back();
-        if (options.phase_audit_candidates <= largest) {
-            throw std::runtime_error("the phase audit set must be larger than every primary candidate set");
+        // At a primary set as large as the audit, the audit adds no rival and confirms only what the set shows.
+        if (options.phase_audit_candidates < largest) {
+            throw std::runtime_error("the phase audit set must be at least as large as every primary candidate set");
         }
     }
 
