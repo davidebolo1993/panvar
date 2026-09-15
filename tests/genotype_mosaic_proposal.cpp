@@ -445,14 +445,22 @@ void test_marker_depth_estimation() {
         return std::make_pair(panel, observations);
     };
 
-    // Closed form with a declared zero background: rate = sum c / (2 * sum m).
+    // A declared background below the model floor is refused, not held at the floor. A declared zero
+    // used to take a closed form here and then be replaced by 1e-6 before proposal scoring.
     {
         const auto fixture = make({1, 1, 2, 3}, {10, 14, 40, 57});
-        const panvar::MarkerDepthEstimate estimate =
+        bool refused = false;
+        try {
             panvar::estimate_marker_depth(fixture.first, fixture.second, 0.0);
-        require_close(estimate.rate_per_copy, 121.0 / (2.0 * 7.0), 1e-12,
-                      "with no background the rate is total count over total diploid copies");
-        require(!estimate.background_estimated, "a declared background must not be re-estimated");
+        } catch (const std::invalid_argument&) {
+            refused = true;
+        }
+        require(refused, "a declared background below the model floor must refuse");
+        const panvar::MarkerDepthEstimate estimate =
+            panvar::estimate_marker_depth(fixture.first, fixture.second, panvar::kMarkerBackgroundFloor);
+        require(estimate.converged && estimate.background == panvar::kMarkerBackgroundFloor &&
+                    !estimate.background_estimated,
+                "a declared background at the floor must be kept exactly and not re-estimated");
     }
 
     // One-dimensional root with a declared positive background.
@@ -518,6 +526,8 @@ void test_marker_depth_estimation() {
             panvar::estimate_marker_depth(fixture.first, fixture.second, std::nullopt);
         require(estimate.converged && estimate.background_at_floor && estimate.termination == "boundary_kkt",
                 "a boundary optimum must converge on the boundary face, got " + estimate.termination);
+        require(estimate.background == panvar::kMarkerBackgroundFloor,
+                "the fitted boundary background must be the model floor");
         double copy_sum = 0.0;
         for (const auto m : multiplicity) copy_sum += 2.0 * m;
         require(estimate.gradient_background < 0.0 && std::abs(estimate.gradient_rate) <= 1e-8 * copy_sum,
@@ -547,12 +557,74 @@ void test_marker_depth_estimation() {
         const auto empty = make({1, 2}, {0, 0});
         refused = false;
         try {
-            panvar::estimate_marker_depth(empty.first, empty.second, 0.0);
+            panvar::estimate_marker_depth(empty.first, empty.second, panvar::kMarkerBackgroundFloor);
         } catch (const std::invalid_argument&) {
             refused = true;
         }
         require(refused, "anchors with no observation must refuse rather than report zero depth");
     }
+}
+
+// One background from fit to emission. The NA19240-like boundary fit ends on the model floor, and
+// proposal scoring must use exactly that value. The reads observe AAC and ACC once each; the a-rich
+// allele carries neither, so a-rich/a-rich gives both markers zero copies and each observation
+// contributes log(background). The command used to raise a fitted 1e-9 to 1e-6 before scoring, which
+// moves this pair's score by log(1000) per observation; the gate shows the table sees that change.
+void test_marker_background_reaches_proposal() {
+    panvar::PreparedMarkerPanel anchors;
+    panvar::MarkerObservations anchor_counts;
+    for (std::uint32_t k = 0; k < 3000; ++k) {
+        const std::uint32_t m = 1 + k % 3;
+        anchors.codes.push_back(k);
+        anchors.anchor_slots.push_back(k);
+        anchors.anchor_haploid_multiplicity.push_back(m);
+        anchor_counts.counts.push_back(22 * m - 4);
+    }
+    const panvar::MarkerDepthEstimate depth =
+        panvar::estimate_marker_depth(anchors, anchor_counts, std::nullopt);
+    require(depth.converged && depth.background_at_floor && depth.background == panvar::kMarkerBackgroundFloor,
+            "the boundary depth fit must end on the model floor");
+    const panvar::MarkerModelParameters parameters = panvar::proposal_marker_parameters(depth, 3, 3);
+    require(parameters.background_observations == depth.background &&
+                parameters.expected_observations_per_copy == depth.rate_per_copy,
+            "proposal scoring must use the fitted background and rate unchanged");
+
+    const panvar::PreparedGenotypeModel model = panvar::prepare_genotype_model(marker_fixture());
+    const panvar::PreparedMarkerPanel panel = panvar::build_marker_panel(model, 3, 3);
+    const std::vector<panvar::ReadPair> fragments = {
+        {read("f/1", "AAAAA"), read("f/2", "AAACC")},
+    };
+    const panvar::MarkerObservations observations =
+        panvar::count_marker_observations(panel, fragments);
+    require(observations.counts[marker_slot(panel, 1)] == 1 && observations.counts[marker_slot(panel, 5)] == 1,
+            "fixture: AAC and ACC must each be observed once");
+    const std::size_t a_rich = model.blocks()[0].allele_id_for_source("a-rich");
+    const std::size_t mixed = model.blocks()[0].allele_id_for_source("mixed");
+    const auto contrast = [&](const panvar::MarkerModelParameters& p) {
+        const panvar::PreparedProposalEmissions e = panvar::build_proposal_emissions(panel, observations, p);
+        return e.blocks[0].at(mixed, mixed) - e.blocks[0].at(a_rich, a_rich);
+    };
+    const double bg = depth.background;
+    const double r = depth.rate_per_copy;
+    // mixed/mixed: AAA, AAC, ACC two copies each; a-rich/a-rich: AAA six copies, AAC and ACC none.
+    const double expected = poisson_kernel(4, bg + 2.0 * r) - poisson_kernel(4, bg + 6.0 * r) +
+                            2.0 * (poisson_kernel(1, bg + 2.0 * r) - poisson_kernel(1, bg));
+    require_close(contrast(parameters), expected, 1e-9,
+                  "the zero-copy pair contrast must be scored at the fitted background");
+    panvar::MarkerModelParameters raised = parameters;
+    raised.background_observations = 1000.0 * bg;
+    const double shift = contrast(parameters) - contrast(raised);
+    require(std::abs(shift - 2.0 * std::log(1000.0)) < 1e-3,
+            "a 1000-fold background change must move the zero-copy contrast by log(1000) per observation, got " +
+                std::to_string(shift));
+    raised.background_observations = 0.5 * panvar::kMarkerBackgroundFloor;
+    bool refused = false;
+    try {
+        panvar::build_proposal_emissions(panel, observations, raised);
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    require(refused, "proposal emissions must refuse a background below the model floor");
 }
 
 } // namespace
@@ -562,6 +634,7 @@ int main() {
         test_marker_model();
         test_mosaic_beam();
         test_marker_depth_estimation();
+        test_marker_background_reaches_proposal();
         std::cout << "genotype mosaic proposal: PASS\n";
         return 0;
     } catch (const std::exception& error) {

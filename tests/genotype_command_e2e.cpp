@@ -9,6 +9,7 @@
 #include "panvar/gfa.hpp"
 #include "panvar/genotype_model.hpp"
 #include "panvar/genotype_locus.hpp"
+#include "panvar/marker_model.hpp"
 #include "panvar/bubbles.hpp"
 
 #include <cmath>
@@ -732,6 +733,9 @@ void test_proposal_status_rules() {
             "an exhaustive, untruncated, complete ranking is the only globally certified result");
     require(exhaustive_status.at("marker_depth_converged") == "true",
             "a completed run must rest on a converged marker-depth fit");
+    require(exhaustive_status.at("marker_background_effective") == exhaustive_status.at("marker_background") &&
+                std::stod(exhaustive_status.at("marker_background_floor")) == panvar::kMarkerBackgroundFloor,
+            "the status must report the model floor and the background proposal scoring actually used");
 }
 
 // Prior-only phase. The unphaseable locus with a second carrier of sampleA's haplotype: reads from

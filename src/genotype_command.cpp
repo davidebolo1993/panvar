@@ -236,7 +236,10 @@ void write_status(
     }
     if (depth != nullptr) {
         out << "marker_depth_rate_per_copy\t" << depth->rate_per_copy << '\n';
-        out << "marker_background\t" << depth->background << '\n';
+        out << "marker_background\t" << std::setprecision(17) << depth->background << '\n';
+        out << "marker_background_floor\t" << kMarkerBackgroundFloor << '\n';
+        // proposal_marker_parameters passes the depth background to emission unchanged (gated).
+        out << "marker_background_effective\t" << depth->background << std::setprecision(6) << '\n';
         out << "marker_background_estimated\t" << (depth->background_estimated ? "true" : "false")
             << '\n';
         out << "marker_depth_converged\t" << (depth->converged ? "true" : "false") << '\n';
@@ -422,9 +425,6 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     const PreparedMarkerPanel panel =
         build_marker_panel(model, options.kmer_size, options.syncmer_s);
     const MarkerObservations observations = count_marker_observations(panel, fragments);
-    MarkerModelParameters marker_parameters;
-    marker_parameters.kmer_size = options.kmer_size;
-    marker_parameters.syncmer_s = options.syncmer_s;
     // Per-copy depth from the invariant anchors, whose diploid copy number is known whatever the
     // sample's genotype. Variable markers cannot be used: their expected count depends on the very
     // genotype being inferred.
@@ -451,11 +451,10 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                      nullptr, &depth);
         return GenotypeRunStatus::CandidateIncomplete;
     }
-    marker_parameters.expected_observations_per_copy = depth.rate_per_copy;
-    // The proposal emission needs a strictly positive background. A fitted or declared zero is held at
-    // a floor far below one observation, which leaves every marker's expectation unchanged in practice.
-    marker_parameters.background_observations = std::max(depth.background, 1e-6);
-    marker_parameters.provenance = depth.provenance;
+    // The fitted or declared background, unchanged: the fit and the emission share one model floor. This
+    // used to raise a fitted 1e-9 to 1e-6 here, a log(1000) change per zero-copy marker observation.
+    const MarkerModelParameters marker_parameters =
+        proposal_marker_parameters(depth, options.kmer_size, options.syncmer_s);
     const PreparedProposalEmissions emissions =
         build_proposal_emissions(panel, observations, marker_parameters);
     timings.markers = seconds_since(mark);

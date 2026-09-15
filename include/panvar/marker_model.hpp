@@ -11,6 +11,13 @@
 
 namespace panvar {
 
+// The marker model's one background floor, in expected observations per marker. The depth fit keeps
+// its background at or above it, a declared background below it is refused, and proposal emissions
+// refuse a background below it, so the background the fit reports is the background proposal scoring
+// uses. It is not numerically negligible: at an observed marker that a candidate gives zero copies,
+// each observation contributes log(background) to that candidate's score.
+inline constexpr double kMarkerBackgroundFloor = 1e-6;
+
 struct MarkerModelParameters {
     std::size_t kmer_size = 0;
     std::size_t syncmer_s = 0;
@@ -73,10 +80,10 @@ struct PreparedProposalEmissions {
 // count_k ~ Poisson(background + rate * 2 * m_k). A variable marker cannot be used for this: its
 // expected count depends on the genotype being inferred.
 //
-// With a declared background the rate is the one-dimensional Poisson maximum-likelihood root. Without
-// one, both are fitted jointly by damped Newton, identifiable only when the anchors carry at least two
-// distinct multiplicities; with a single multiplicity background and rate trade off exactly, so the
-// fit refuses and the background must be declared.
+// With a declared background (at least kMarkerBackgroundFloor) the rate is the one-dimensional Poisson
+// maximum-likelihood root. Without one, both are fitted jointly by active-set Newton, identifiable only
+// when the anchors carry at least two distinct multiplicities; with a single multiplicity background and
+// rate trade off exactly, so the fit refuses and the background must be declared.
 struct MarkerDepthEstimate {
     double rate_per_copy = 0.0;
     double background = 0.0;
@@ -84,8 +91,8 @@ struct MarkerDepthEstimate {
     bool converged = false;
     // The fitted background reached its positive floor: the data prefer no background at all.
     bool background_at_floor = false;
-    // Why the fit stopped: interior_stationary, boundary_kkt, closed_form, declared_background_root,
-    // no_ascent, or iteration_cap. Only the first four are convergence.
+    // Why the fit stopped: interior_stationary, boundary_kkt, declared_background_root, no_ascent, or
+    // iteration_cap. Only the first three are convergence.
     std::string termination;
     // Score components and log-likelihood at the returned estimate, so a status file can show a fit is
     // stationary rather than assert it. On the boundary the background gradient is negative by design.
@@ -104,6 +111,12 @@ MarkerDepthEstimate estimate_marker_depth(
     std::optional<double> declared_background);
 
 void validate_marker_parameters(const MarkerModelParameters& parameters);
+
+// Proposal parameters from a converged depth fit, with the fitted or declared background unchanged.
+MarkerModelParameters proposal_marker_parameters(
+    const MarkerDepthEstimate& depth,
+    std::size_t kmer_size,
+    std::size_t syncmer_s);
 
 PreparedMarkerPanel build_marker_panel(
     const PreparedGenotypeModel& model,

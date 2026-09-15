@@ -161,12 +161,29 @@ void validate_marker_parameters(const MarkerModelParameters& parameters) {
         throw std::invalid_argument("marker expected observations per copy must be positive");
     }
     if (!std::isfinite(parameters.background_observations) ||
-        parameters.background_observations <= 0.0) {
-        throw std::invalid_argument("marker background observations must be positive");
+        parameters.background_observations < kMarkerBackgroundFloor) {
+        throw std::invalid_argument("marker background observations must be at least the model floor");
     }
     if (parameters.provenance.empty()) {
         throw std::invalid_argument("marker model provenance must not be empty");
     }
+}
+
+MarkerModelParameters proposal_marker_parameters(
+    const MarkerDepthEstimate& depth,
+    std::size_t kmer_size,
+    std::size_t syncmer_s) {
+    if (!depth.converged) {
+        throw std::invalid_argument("proposal marker parameters need a converged depth fit");
+    }
+    MarkerModelParameters parameters;
+    parameters.kmer_size = kmer_size;
+    parameters.syncmer_s = syncmer_s;
+    parameters.expected_observations_per_copy = depth.rate_per_copy;
+    parameters.background_observations = depth.background;
+    parameters.provenance = depth.provenance;
+    validate_marker_parameters(parameters);
+    return parameters;
 }
 
 PreparedMarkerPanel build_marker_panel(
@@ -502,18 +519,14 @@ MarkerDepthEstimate estimate_marker_depth(
 
     if (declared_background.has_value()) {
         const double background = *declared_background;
-        if (!std::isfinite(background) || background < 0.0) {
-            throw std::invalid_argument("declared marker background must be finite and non-negative");
+        // Refused rather than held at the floor: a declared zero used to be fitted as zero here and
+        // then replaced by a different value before proposal scoring.
+        if (!std::isfinite(background) || background < kMarkerBackgroundFloor) {
+            throw std::invalid_argument(
+                "declared marker background must be finite and at least the model floor (1e-6)");
         }
         estimate.background = background;
         estimate.background_estimated = false;
-        if (background == 0.0) {
-            estimate.rate_per_copy = count_sum / copy_sum;
-            estimate.converged = true;
-            estimate.termination = "closed_form";
-            estimate.provenance = "anchor Poisson MLE, closed form, background declared 0";
-            return estimate;
-        }
         // d/dr log L = sum c_k d_k / (bg + r d_k) - sum d_k, strictly decreasing in r.
         const auto score = [&](double rate) {
             double value = -copy_sum;
@@ -552,7 +565,7 @@ MarkerDepthEstimate estimate_marker_depth(
     // quadratically. EM on the same model is only linearly convergent and did not reach tolerance on
     // C4's 25,167 anchors in 20,000 iterations.
     const double n = static_cast<double>(counts.size());
-    const double background_floor = 1e-9;
+    const double background_floor = kMarkerBackgroundFloor;
     const auto log_likelihood = [&](double bg, double r) {
         double value = -n * bg - r * copy_sum;
         for (std::size_t k = 0; k < counts.size(); ++k) {

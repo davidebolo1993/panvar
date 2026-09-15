@@ -237,6 +237,13 @@ Reuse the useful properties of the old marker path, but extract and test them:
 Syncmers from one fragment are correlated and the model is approximate. That is acceptable for
 proposal ranking, not for a second final likelihood term.
 
+The marker background has one model-wide floor, `kMarkerBackgroundFloor` = 1e-6 expected observations
+per marker (review round 5). The anchor depth fit keeps its background at or above the floor, a declared
+background below it is refused, and proposal emission uses the fitted or declared background unchanged;
+the status file reports the floor and the effective background. The floor is not numerically negligible:
+at an observed marker that a candidate gives zero copies, each observation contributes about
+`log(background)` to that candidate, so the floor sets how strongly such markers count against it.
+
 Do not inherit the old default cap of 64 alleles. C4 contains blocks with 118--126 alleles. Version one
 scores every block allele; if a future resource policy prunes, each candidate must report whether its
 allele was scored or received a fallback, and a fallback may not masquerade as evidence.
