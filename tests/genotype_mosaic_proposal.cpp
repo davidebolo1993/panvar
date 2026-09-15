@@ -270,36 +270,40 @@ panvar::PreparedProposalEmissions beam_emissions() {
 void compare_to_oracle(
     const panvar::PanelAlleleMatrix& panel,
     const panvar::PreparedProposalEmissions& emissions,
-    const std::vector<double>& recombination) {
+    const std::vector<double>& recombination,
+    const std::string& label) {
     const auto oracle = exhaustive_candidates(panel, emissions, recombination);
     panvar::MosaicBeamParameters parameters;
-    parameters.unique_candidate_target = 1000;
-    parameters.raw_history_limit = 729;
-    parameters.expansion_chunk_size = 7;
+    parameters.unique_candidate_target = oracle.size() + 5;
+    parameters.state_limit = 1u << 20;
     const panvar::MosaicBeamResult actual =
         panvar::propose_mosaic_diplotypes(panel, emissions, recombination, parameters);
-    require(actual.candidates.size() == oracle.size(),
-            "unpruned beam must recover every exhaustive unique mosaic");
-    require(actual.raw_history_limit_reached && !actual.unique_target_reached,
-            "exhaustive fixture must end at its declared raw-history limit");
+    require(actual.search_exhaustive && actual.states_pruned == 0,
+            label + ": an unbounded merged beam must not prune");
+    require(actual.candidates.size() == oracle.size() && actual.unique_candidates_found == oracle.size(),
+            label + ": the merged beam must recover every exhaustive unique mosaic");
+    require(!actual.unique_target_reached && !actual.candidate_set_conditional,
+            label + ": an exhaustive search with fewer than K candidates is complete, not conditional");
     for (const panvar::MosaicCandidate& candidate : actual.candidates) {
         const OracleKey key{candidate.diplotype.first.alleles, candidate.diplotype.second.alleles};
         const auto found = oracle.find(key);
-        require(found != oracle.end(), "beam candidate must exist in exhaustive enumeration");
-        require_close(candidate.best_proposal_score, found->second.best, 2e-14,
-                      "beam best history must equal exhaustive best history");
-        require_close(candidate.retained_logsum_proposal_score, found->second.logsum, 3e-14,
-                      "beam retained history sum must equal exhaustive sum");
-        require_close(candidate.proposal_emission_component, found->second.emission, 2e-14,
-                      "beam best emission component must equal exhaustive value");
-        require_close(candidate.proposal_transition_component, found->second.transition, 2e-14,
-                      "beam best transition component must equal exhaustive value");
-        require(candidate.equivalent_retained_histories == found->second.histories,
-                "beam must preserve every equivalent template history");
+        require(found != oracle.end(), label + ": beam candidate must exist in exhaustive enumeration");
+        // Merging sums histories in a different order from the oracle, so the log-sum is compared with a
+        // tolerance for that reordering; it is a sum, never a maximum.
+        require_close(candidate.retained_logsum_proposal_score, found->second.logsum, 1e-12,
+                      label + ": merged mass must equal the exhaustive log-sum over histories");
+        require_close(candidate.best_proposal_score, found->second.best, 1e-12,
+                      label + ": the witness must be the exhaustive best history");
+        require_close(candidate.proposal_emission_component, found->second.emission, 1e-12,
+                      label + ": the witness emission component must equal the exhaustive value");
+        require_close(candidate.proposal_transition_component, found->second.transition, 1e-12,
+                      label + ": the witness transition component must equal the exhaustive value");
+        require(candidate.equivalent_retained_histories == found->second.histories &&
+                    !candidate.history_count_saturated,
+                label + ": merged physical history multiplicity must equal the exhaustive count");
         require(!(candidate.diplotype.second.alleles < candidate.diplotype.first.alleles),
-                "global homologue swap must be canonicalized only in final candidates");
-        require(candidate.every_allele_scored,
-                "candidate manifest must record complete allele scoring");
+                label + ": the global homologue swap must be canonicalised in the final candidate");
+        require(candidate.every_allele_scored, label + ": the manifest must record complete allele scoring");
     }
     bool summed_histories_are_live = false;
     for (const panvar::MosaicCandidate& candidate : actual.candidates) {
@@ -309,69 +313,120 @@ void compare_to_oracle(
         }
     }
     require(summed_histories_are_live,
-            "fixture must fail a mutation that prematurely keeps only one allele-level history");
+            label + ": the fixture must contain merged histories whose sum exceeds their maximum");
 }
 
 void test_mosaic_beam() {
-    panvar::PanelAlleleMatrix panel;
-    panel.template_names = {"h0", "h1", "h2"};
-    panel.template_alleles = {
-        {0, 0, 0},
-        {0, 1, 1},
-        {1, 0, 1},
-    };
     const panvar::PreparedProposalEmissions emissions = beam_emissions();
-    compare_to_oracle(panel, emissions, {0.0, 0.0});
-    compare_to_oracle(panel, emissions, {0.25, 0.6});
-    compare_to_oracle(panel, emissions, {1.0, 1.0});
+
+    panvar::PanelAlleleMatrix three;
+    three.template_names = {"h0", "h1", "h2"};
+    three.template_alleles = {{0, 0, 0}, {0, 1, 1}, {1, 0, 1}};
+    compare_to_oracle(three, emissions, {0.0, 0.0}, "three templates, r=0");
+    compare_to_oracle(three, emissions, {0.25, 0.6}, "three templates, intermediate r");
+    compare_to_oracle(three, emissions, {1.0, 1.0}, "three templates, r=1");
+
+    // Four templates in which the pairing of a prefix with its own template decides the future: h0 and h3
+    // spell different prefixes at block 0 and different alleles at block 1. A state key that
+    // canonicalised the prefix pair and the template pair separately would exchange them, and the
+    // exhaustive comparison below would fail.
+    panvar::PanelAlleleMatrix four;
+    four.template_names = {"h0", "h1", "h2", "h3"};
+    four.template_alleles = {{0, 0, 0}, {0, 1, 1}, {1, 0, 1}, {1, 1, 0}};
+    bool association_matters = false;
+    for (std::size_t t = 0; t < 4; ++t) {
+        for (std::size_t u = 0; u < 4; ++u) {
+            if (four.template_alleles[t][0] != four.template_alleles[u][0] &&
+                four.template_alleles[t][1] != four.template_alleles[u][1]) {
+                association_matters = true;
+            }
+        }
+    }
+    require(association_matters, "fixture: template-prefix association must change some future");
+    compare_to_oracle(four, emissions, {0.0, 0.0}, "four templates, r=0");
+    compare_to_oracle(four, emissions, {0.25, 0.6}, "four templates, intermediate r");
+    compare_to_oracle(four, emissions, {1.0, 1.0}, "four templates, r=1");
 
     // The transition term is live: replacing the intermediate arm with r=1 changes its oracle.
-    const auto intermediate = exhaustive_candidates(panel, emissions, {0.25, 0.6});
-    const auto mutated_transition = exhaustive_candidates(panel, emissions, {1.0, 1.0});
+    const auto intermediate = exhaustive_candidates(three, emissions, {0.25, 0.6});
+    const auto mutated_transition = exhaustive_candidates(three, emissions, {1.0, 1.0});
     bool transition_mutation_bites = intermediate.size() != mutated_transition.size();
     for (const auto& item : intermediate) {
         const auto found = mutated_transition.find(item.first);
-        if (found == mutated_transition.end() ||
-            std::abs(item.second.logsum - found->second.logsum) > 1e-8) {
+        if (found == mutated_transition.end() || std::abs(item.second.logsum - found->second.logsum) > 1e-8) {
             transition_mutation_bites = true;
             break;
         }
     }
-    require(transition_mutation_bites,
-            "fixture must fail a mutation replacing the Li-Stephens transition");
+    require(transition_mutation_bites, "fixture must fail a mutation replacing the Li-Stephens transition");
 
-    // Chunk boundaries emulate different scheduling. A total tie order must make them irrelevant.
+    // Search status. An exhaustive search that finds more than K returns a conditional set; a pruned
+    // search that reaches K returns a conditional set; a pruned search that misses K has not reached its
+    // target; only an exhaustive search with at most K candidates is unconditional.
+    const std::size_t total = exhaustive_candidates(four, emissions, {0.25, 0.6}).size();
+    require(total > 3, "fixture: the four-template panel must have more than three unique mosaics");
+
+    const auto over = panvar::propose_mosaic_diplotypes(four, emissions, {0.25, 0.6}, {2, 1u << 20});
+    require(over.search_exhaustive && over.unique_target_reached && over.candidate_set_conditional &&
+                over.candidates.size() == 2 && over.unique_candidates_found == total,
+            "an exhaustive search that finds more than K must return K and mark the set conditional");
+
+    const auto pruned_hit = panvar::propose_mosaic_diplotypes(four, emissions, {0.25, 0.6}, {2, 6});
+    require(!pruned_hit.search_exhaustive && pruned_hit.states_pruned > 0 && pruned_hit.unique_target_reached &&
+                pruned_hit.candidate_set_conditional,
+            "a pruned search that reaches K must mark its candidate set conditional");
+
+    const auto starved = panvar::propose_mosaic_diplotypes(four, emissions, {0.25, 0.6}, {50, 1});
+    require(!starved.search_exhaustive && starved.states_pruned > 0 && !starved.unique_target_reached,
+            "a pruned search that misses K must report neither exhaustiveness nor its target");
+
+    // Ties: with all emissions equal, the order is fully determined by the documented key, and two runs
+    // are identical.
     panvar::PreparedProposalEmissions tied = emissions;
     for (auto& block : tied.blocks) std::fill(block.log_score.begin(), block.log_score.end(), 0.0);
-    panvar::MosaicBeamParameters small_chunk{3, 9, 2};
-    panvar::MosaicBeamParameters large_chunk{3, 9, 1000};
-    const auto first = panvar::propose_mosaic_diplotypes(panel, tied, {1.0, 1.0}, small_chunk);
-    const auto second = panvar::propose_mosaic_diplotypes(panel, tied, {1.0, 1.0}, large_chunk);
-    require(first.candidates.size() == second.candidates.size(),
-            "tie fixture candidate count must not depend on chunking");
+    const auto first = panvar::propose_mosaic_diplotypes(four, tied, {1.0, 1.0}, {5, 7});
+    const auto second = panvar::propose_mosaic_diplotypes(four, tied, {1.0, 1.0}, {5, 7});
+    require(first.candidates.size() == second.candidates.size(), "tie fixture must be deterministic");
     for (std::size_t i = 0; i < first.candidates.size(); ++i) {
         require(first.candidates[i].diplotype.first == second.candidates[i].diplotype.first &&
-                    first.candidates[i].diplotype.second == second.candidates[i].diplotype.second &&
-                    first.candidates[i].best_proposal_score ==
-                        second.candidates[i].best_proposal_score,
-                "deterministic tie order must not depend on expansion chunk boundaries");
+                    first.candidates[i].diplotype.second == second.candidates[i].diplotype.second,
+                "repeated runs must return identical candidates in identical order");
+        if (i > 0) {
+            const auto& a = first.candidates[i - 1];
+            const auto& b = first.candidates[i];
+            const bool ordered =
+                a.retained_logsum_proposal_score > b.retained_logsum_proposal_score ||
+                (a.retained_logsum_proposal_score == b.retained_logsum_proposal_score &&
+                 (a.best_proposal_score > b.best_proposal_score ||
+                  (a.best_proposal_score == b.best_proposal_score &&
+                   std::tie(a.diplotype.first.alleles, a.diplotype.second.alleles) <
+                       std::tie(b.diplotype.first.alleles, b.diplotype.second.alleles))));
+            require(ordered, "candidates must follow mass, then witness, then allele-path order");
+        }
     }
 
-    // All templates spell the same alleles: widening cannot manufacture a second unique mosaic.
-    panvar::PanelAlleleMatrix collapsed = panel;
-    collapsed.template_alleles = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
-    const auto limited = panvar::propose_mosaic_diplotypes(
-        collapsed, tied, {1.0, 1.0}, panvar::MosaicBeamParameters{2, 9, 3});
-    require(limited.candidates.size() == 1 && limited.beam_width_used == 9 &&
-                limited.raw_history_limit_reached,
-            "beam must deepen to the raw limit when histories collapse below unique target K");
+    // All templates spell the same alleles: merging must collapse every history into one mosaic, found
+    // exhaustively within a tiny state budget.
+    panvar::PanelAlleleMatrix collapsed = four;
+    collapsed.template_alleles = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
+    const auto one = panvar::propose_mosaic_diplotypes(collapsed, tied, {0.3, 0.3}, {4, 16});
+    require(one.candidates.size() == 1 && one.search_exhaustive && !one.unique_target_reached &&
+                !one.candidate_set_conditional && one.candidates[0].equivalent_retained_histories == 16 * 16 * 16,
+            "identical templates must merge into one mosaic carrying every physical history");
 
-    require_throws(
-        [&] { panvar::propose_mosaic_diplotypes(
-            panel, emissions, {0.2}, panvar::MosaicBeamParameters{2, 10, 10}); },
-        "missing boundary transition must refuse");
+    require_throws([&] { panvar::propose_mosaic_diplotypes(three, emissions, {0.2}, {2, 10}); },
+                   "a missing boundary transition must refuse");
+    require_throws([&] { panvar::propose_mosaic_diplotypes(three, emissions, {0.2, 0.2}, {2, 0}); },
+                   "a zero state limit must refuse");
+    panvar::MosaicBeamParameters starved_budget{2, 10, 1};
+    bool budget_refused = false;
+    try {
+        panvar::propose_mosaic_diplotypes(three, emissions, {0.2, 0.2}, starved_budget);
+    } catch (const std::length_error&) {
+        budget_refused = true;
+    }
+    require(budget_refused, "an extension budget below the declared work must refuse before searching");
 }
-
 
 // Marker depth comes from the invariant anchors, whose diploid multiplicity is known whatever the
 // sample's genotype. The previous estimate divided every matched occurrence by twice the size of the

@@ -3,275 +3,153 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
-#include <map>
+#include <queue>
 #include <stdexcept>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 
 namespace panvar {
 namespace {
 
 constexpr double kNegInf = -std::numeric_limits<double>::infinity();
-constexpr std::uint32_t kNoPrevious = std::numeric_limits<std::uint32_t>::max();
+constexpr std::uint32_t kRoot = std::numeric_limits<std::uint32_t>::max();
+constexpr std::uint64_t kCountCap = std::numeric_limits<std::uint64_t>::max();
 
-struct BeamNode {
-    double score = kNegInf;
-    double emission_score = 0.0;
-    double transition_score = 0.0;
-    std::uint32_t previous = kNoPrevious;
-    std::uint32_t template1 = 0;
-    std::uint32_t template2 = 0;
-};
-
-struct CandidateKey {
-    std::vector<std::size_t> first;
-    std::vector<std::size_t> second;
-
-    bool operator<(const CandidateKey& other) const noexcept {
-        return std::tie(first, second) < std::tie(other.first, other.second);
+// prefix_id = intern(previous_prefix_id, allele_id). Equal ids are equal allele prefixes, and a prefix is
+// reconstructed by walking parents, so no allele vector is ever copied during the search.
+class PrefixInterner {
+public:
+    std::uint32_t intern(std::uint32_t parent, std::size_t allele) {
+        const std::uint64_t key =
+            (static_cast<std::uint64_t>(parent) << 32) | static_cast<std::uint64_t>(allele);
+        const auto found = index_.find(key);
+        if (found != index_.end()) return found->second;
+        if (parent_.size() >= kRoot) throw std::length_error("mosaic prefix interner exhausted uint32 ids");
+        const std::uint32_t id = static_cast<std::uint32_t>(parent_.size());
+        parent_.push_back(parent);
+        allele_.push_back(static_cast<std::uint32_t>(allele));
+        index_.emplace(key, id);
+        return id;
     }
+
+    std::vector<std::size_t> path(std::uint32_t id, std::size_t blocks) const {
+        std::vector<std::size_t> out(blocks, 0);
+        for (std::size_t b = blocks; b > 0; --b) {
+            if (id == kRoot) throw std::logic_error("mosaic prefix is shorter than the block chain");
+            out[b - 1] = allele_[id];
+            id = parent_[id];
+        }
+        if (id != kRoot) throw std::logic_error("mosaic prefix is longer than the block chain");
+        return out;
+    }
+
+private:
+    std::vector<std::uint32_t> parent_;
+    std::vector<std::uint32_t> allele_;
+    std::unordered_map<std::uint64_t, std::uint32_t> index_;
 };
 
-struct CandidateAccumulator {
-    double best_score = kNegInf;
-    double logsum_score = kNegInf;
+struct State {
+    // Canonical: (prefix1, template1) <= (prefix2, template2). The prefix travels with its own template.
+    std::uint32_t prefix1 = 0;
+    std::uint32_t template1 = 0;
+    std::uint32_t prefix2 = 0;
+    std::uint32_t template2 = 0;
+    double log_mass = kNegInf;
+    double best = kNegInf;
     double best_emission = 0.0;
     double best_transition = 0.0;
-    std::size_t histories = 0;
+    std::uint64_t histories = 0;
+    bool saturated = false;
 };
 
-struct BeamRun {
-    std::vector<std::vector<BeamNode>> layers;
-    std::uint64_t extensions = 0;
-};
-
-double log_add_exp(double lhs, double rhs) {
+double log_add_exp_local(double lhs, double rhs) {
     if (lhs == kNegInf) return rhs;
     if (rhs == kNegInf) return lhs;
     const double hi = std::max(lhs, rhs);
-    const double lo = std::min(lhs, rhs);
-    return hi + std::log1p(std::exp(lo - hi));
+    return hi + std::log1p(std::exp(std::min(lhs, rhs) - hi));
 }
 
-bool better_node(const BeamNode& lhs, const BeamNode& rhs) {
-    if (lhs.score != rhs.score) return lhs.score > rhs.score;
-    if (lhs.previous != rhs.previous) return lhs.previous < rhs.previous;
-    if (lhs.template1 != rhs.template1) return lhs.template1 < rhs.template1;
-    return lhs.template2 < rhs.template2;
-}
-
-void keep_best(std::vector<BeamNode>& nodes, std::size_t width) {
-    if (nodes.size() > width) {
-        std::nth_element(nodes.begin(), nodes.begin() + static_cast<std::ptrdiff_t>(width),
-                         nodes.end(), better_node);
-        nodes.resize(width);
+void add_count(std::uint64_t& total, bool& saturated, std::uint64_t amount, bool amount_saturated) {
+    saturated = saturated || amount_saturated;
+    if (amount > kCountCap - total) {
+        total = kCountCap;
+        saturated = true;
+    } else {
+        total += amount;
     }
-    std::sort(nodes.begin(), nodes.end(), better_node);
 }
 
-void add_extension_count(std::uint64_t& total, std::uint64_t amount) {
+std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t> key_of(const State& state) {
+    return std::make_tuple(state.prefix1, state.template1, state.prefix2, state.template2);
+}
+
+void canonicalise(State& state) {
+    if (std::make_pair(state.prefix2, state.template2) < std::make_pair(state.prefix1, state.template1)) {
+        std::swap(state.prefix1, state.prefix2);
+        std::swap(state.template1, state.template2);
+    }
+}
+
+// Total order used for pruning: more mass first, then a better witness, then the key.
+bool better_state(const State& lhs, const State& rhs) {
+    if (lhs.log_mass != rhs.log_mass) return lhs.log_mass > rhs.log_mass;
+    if (lhs.best != rhs.best) return lhs.best > rhs.best;
+    return key_of(lhs) < key_of(rhs);
+}
+
+void merge_into(State& into, const State& from) {
+    into.log_mass = log_add_exp_local(into.log_mass, from.log_mass);
+    if (from.best > into.best) {
+        into.best = from.best;
+        into.best_emission = from.best_emission;
+        into.best_transition = from.best_transition;
+    }
+    add_count(into.histories, into.saturated, from.histories, from.saturated);
+}
+
+// Keeps the state_limit best states of a layer after every state has been fully merged. Children of
+// different parent prefix pairs never share a key, so a group's children are final when offered here.
+class LayerSelector {
+public:
+    explicit LayerSelector(std::size_t limit) : limit_(limit), heap_(worse_on_top) {}
+
+    void offer(const State& state) {
+        ++offered_;
+        if (heap_.size() < limit_) {
+            heap_.push(state);
+        } else if (better_state(state, heap_.top())) {
+            heap_.pop();
+            heap_.push(state);
+        }
+    }
+
+    std::vector<State> take(std::uint64_t& pruned) {
+        pruned += offered_ - heap_.size();
+        std::vector<State> out;
+        out.reserve(heap_.size());
+        while (!heap_.empty()) {
+            out.push_back(heap_.top());
+            heap_.pop();
+        }
+        std::sort(out.begin(), out.end(),
+                  [](const State& lhs, const State& rhs) { return key_of(lhs) < key_of(rhs); });
+        return out;
+    }
+
+private:
+    static bool worse_on_top(const State& lhs, const State& rhs) { return better_state(lhs, rhs); }
+    std::size_t limit_;
+    std::uint64_t offered_ = 0;
+    std::priority_queue<State, std::vector<State>, bool (*)(const State&, const State&)> heap_;
+};
+
+void add_extensions(std::uint64_t& total, std::uint64_t amount) {
     if (amount > std::numeric_limits<std::uint64_t>::max() - total) {
         throw std::length_error("mosaic beam extension count overflows uint64");
     }
     total += amount;
-}
-
-BeamRun run_beam(
-    const PanelAlleleMatrix& panel,
-    const PreparedProposalEmissions& emissions,
-    const std::vector<std::vector<std::size_t>>& allele_by_block,
-    const std::vector<std::vector<double>>& log_transition_by_boundary,
-    std::size_t width,
-    std::size_t chunk_size) {
-    const std::size_t templates = panel.template_count();
-    const std::size_t blocks = panel.block_count();
-    BeamRun result;
-    result.layers.resize(blocks);
-
-    std::vector<BeamNode>& initial = result.layers[0];
-    if (templates > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::length_error("mosaic beam template index exceeds uint32");
-    }
-    const double initial_prior = -2.0 * std::log(static_cast<double>(templates));
-    const BlockProposalEmissions& initial_emission = emissions.blocks[0];
-    for (std::size_t h1 = 0; h1 < templates; ++h1) {
-        for (std::size_t h2 = 0; h2 < templates; ++h2) {
-            add_extension_count(result.extensions, 1);
-            const double emission = initial_emission.log_score[
-                allele_by_block[0][h1] * initial_emission.allele_count +
-                allele_by_block[0][h2]];
-            const double score = initial_prior + emission;
-            if (!std::isfinite(score)) continue;
-            initial.push_back({score, emission, initial_prior, kNoPrevious,
-                               static_cast<std::uint32_t>(h1),
-                               static_cast<std::uint32_t>(h2)});
-        }
-    }
-    keep_best(initial, width);
-
-    for (std::size_t block = 1; block < blocks; ++block) {
-        const std::vector<BeamNode>& previous = result.layers[block - 1];
-        std::vector<BeamNode> best;
-        std::vector<BeamNode> pool;
-        pool.reserve(width + chunk_size);
-        const BlockProposalEmissions& block_emission = emissions.blocks[block];
-        const std::vector<double>& log_transition = log_transition_by_boundary[block - 1];
-
-        const auto flush = [&] {
-            if (pool.empty()) return;
-            if (!best.empty()) {
-                pool.insert(pool.end(), best.begin(), best.end());
-            }
-            keep_best(pool, width);
-            best.swap(pool);
-            pool.clear();
-            pool.reserve(width + chunk_size);
-        };
-
-        for (std::size_t previous_id = 0; previous_id < previous.size(); ++previous_id) {
-            if (previous_id > std::numeric_limits<std::uint32_t>::max()) {
-                throw std::length_error("mosaic beam backpointer exceeds uint32");
-            }
-            for (std::size_t h1 = 0; h1 < templates; ++h1) {
-                const double transition1 = log_transition[
-                    static_cast<std::size_t>(previous[previous_id].template1) * templates + h1];
-                if (transition1 == kNegInf) {
-                    add_extension_count(result.extensions, templates);
-                    continue;
-                }
-                for (std::size_t h2 = 0; h2 < templates; ++h2) {
-                    add_extension_count(result.extensions, 1);
-                    const double transition2 = log_transition[
-                        static_cast<std::size_t>(previous[previous_id].template2) * templates + h2];
-                    if (transition2 == kNegInf) continue;
-                    const double emission = block_emission.log_score[
-                        allele_by_block[block][h1] * block_emission.allele_count +
-                        allele_by_block[block][h2]];
-                    const double transition = transition1 + transition2;
-                    const double score = previous[previous_id].score + transition + emission;
-                    if (!std::isfinite(score)) continue;
-                    pool.push_back({score,
-                                    previous[previous_id].emission_score + emission,
-                                    previous[previous_id].transition_score + transition,
-                                    static_cast<std::uint32_t>(previous_id),
-                                    static_cast<std::uint32_t>(h1),
-                                    static_cast<std::uint32_t>(h2)});
-                    if (pool.size() >= chunk_size) flush();
-                }
-            }
-        }
-        flush();
-        // `best` carries the expansion pool's buffer after the swap in flush(), whose capacity is
-        // the chunk size. Layers are retained for every block, so moving that buffer in would keep
-        // one chunk-sized allocation per block alive: at C4's complete decomposition that is
-        // gigabytes of untouched capacity. Store exactly the retained nodes instead.
-        result.layers[block].assign(best.begin(), best.end());
-        best.clear();
-        best.shrink_to_fit();
-        if (result.layers[block].empty()) break;
-    }
-    return result;
-}
-
-std::uint64_t extension_upper_bound(
-    std::size_t templates,
-    std::size_t blocks,
-    std::size_t width) {
-    if (templates > std::numeric_limits<std::uint64_t>::max() / templates) {
-        throw std::length_error("mosaic beam template square overflows uint64");
-    }
-    const std::uint64_t template_pairs =
-        static_cast<std::uint64_t>(templates) * static_cast<std::uint64_t>(templates);
-    std::uint64_t result = template_pairs;
-    if (blocks <= 1) return result;
-    if (width > std::numeric_limits<std::uint64_t>::max() / template_pairs) {
-        throw std::length_error("mosaic beam per-block extension bound overflows uint64");
-    }
-    const std::uint64_t per_block = static_cast<std::uint64_t>(width) * template_pairs;
-    if (blocks - 1 > std::numeric_limits<std::uint64_t>::max() / per_block) {
-        throw std::length_error("mosaic beam total extension bound overflows uint64");
-    }
-    const std::uint64_t tail = static_cast<std::uint64_t>(blocks - 1) * per_block;
-    if (tail > std::numeric_limits<std::uint64_t>::max() - result) {
-        throw std::length_error("mosaic beam total extension bound overflows uint64");
-    }
-    return result + tail;
-}
-
-std::map<CandidateKey, CandidateAccumulator> collapse_final_histories(
-    const PanelAlleleMatrix& panel,
-    const BeamRun& run) {
-    std::map<CandidateKey, CandidateAccumulator> candidates;
-    if (run.layers.empty() || run.layers.back().empty()) return candidates;
-    const std::size_t blocks = panel.block_count();
-    const std::vector<BeamNode>& final = run.layers.back();
-    for (std::size_t final_id = 0; final_id < final.size(); ++final_id) {
-        CandidateKey key;
-        key.first.resize(blocks);
-        key.second.resize(blocks);
-        std::size_t node_id = final_id;
-        for (std::size_t reverse_block = blocks; reverse_block > 0; --reverse_block) {
-            const std::size_t block = reverse_block - 1;
-            if (node_id >= run.layers[block].size()) {
-                throw std::logic_error("mosaic beam backpointer is outside its layer");
-            }
-            const BeamNode& node = run.layers[block][node_id];
-            key.first[block] = panel.template_alleles[node.template1][block];
-            key.second[block] = panel.template_alleles[node.template2][block];
-            if (block > 0) node_id = node.previous;
-        }
-        if (key.second < key.first) std::swap(key.first, key.second);
-
-        CandidateAccumulator& accumulator = candidates[key];
-        const BeamNode& best = final[final_id];
-        accumulator.logsum_score = log_add_exp(accumulator.logsum_score, best.score);
-        ++accumulator.histories;
-        if (best.score > accumulator.best_score) {
-            accumulator.best_score = best.score;
-            accumulator.best_emission = best.emission_score;
-            accumulator.best_transition = best.transition_score;
-        }
-    }
-    return candidates;
-}
-
-std::vector<MosaicCandidate> materialize_candidates(
-    const std::map<CandidateKey, CandidateAccumulator>& collapsed,
-    bool every_allele_scored,
-    std::size_t target) {
-    std::vector<MosaicCandidate> result;
-    result.reserve(collapsed.size());
-    for (const auto& item : collapsed) {
-        MosaicCandidate candidate;
-        candidate.diplotype.first.alleles = item.first.first;
-        candidate.diplotype.second.alleles = item.first.second;
-        candidate.best_proposal_score = item.second.best_score;
-        candidate.retained_logsum_proposal_score = item.second.logsum_score;
-        candidate.proposal_emission_component = item.second.best_emission;
-        candidate.proposal_transition_component = item.second.best_transition;
-        candidate.equivalent_retained_histories = item.second.histories;
-        candidate.every_allele_scored = every_allele_scored;
-        result.push_back(std::move(candidate));
-    }
-    std::sort(result.begin(), result.end(), [](const MosaicCandidate& lhs,
-                                               const MosaicCandidate& rhs) {
-        if (lhs.retained_logsum_proposal_score != rhs.retained_logsum_proposal_score) {
-            return lhs.retained_logsum_proposal_score > rhs.retained_logsum_proposal_score;
-        }
-        if (lhs.best_proposal_score != rhs.best_proposal_score) {
-            return lhs.best_proposal_score > rhs.best_proposal_score;
-        }
-        if (lhs.diplotype.first.alleles != rhs.diplotype.first.alleles) {
-            return lhs.diplotype.first.alleles < rhs.diplotype.first.alleles;
-        }
-        return lhs.diplotype.second.alleles < rhs.diplotype.second.alleles;
-    });
-    if (result.size() > target) result.resize(target);
-    for (std::size_t rank = 0; rank < result.size(); ++rank) {
-        result[rank].candidate_id = rank;
-        result[rank].unique_rank = rank + 1;
-    }
-    return result;
 }
 
 void validate_beam_inputs(
@@ -291,20 +169,16 @@ void validate_beam_inputs(
             throw std::invalid_argument("mosaic beam switch probabilities must be in [0,1]");
         }
     }
-    if (parameters.unique_candidate_target == 0 || parameters.raw_history_limit == 0) {
-        throw std::invalid_argument("mosaic beam candidate target and raw limit must be positive");
+    if (parameters.unique_candidate_target == 0 || parameters.state_limit == 0) {
+        throw std::invalid_argument("mosaic beam candidate target and state limit must be positive");
     }
-    if (parameters.expansion_chunk_size == 0) {
-        throw std::invalid_argument("mosaic beam expansion chunk size must be positive");
-    }
-    if (parameters.raw_history_limit > std::numeric_limits<std::uint32_t>::max()) {
-        throw std::invalid_argument("mosaic beam raw history limit exceeds uint32 backpointers");
+    if (panel.template_count() >= kRoot) {
+        throw std::invalid_argument("mosaic beam template index exceeds uint32");
     }
     for (std::size_t block = 0; block < panel.block_count(); ++block) {
         const BlockProposalEmissions& emission = emissions.blocks[block];
         if (emission.allele_count == 0 ||
-            emission.allele_count > std::numeric_limits<std::size_t>::max() /
-                                        emission.allele_count ||
+            emission.allele_count > std::numeric_limits<std::size_t>::max() / emission.allele_count ||
             emission.log_score.size() != emission.allele_count * emission.allele_count) {
             throw std::invalid_argument("proposal emission table is malformed");
         }
@@ -321,6 +195,19 @@ void validate_beam_inputs(
     }
 }
 
+std::uint64_t extension_upper_bound(std::size_t templates, std::size_t blocks, std::size_t limit) {
+    const std::uint64_t pairs = static_cast<std::uint64_t>(templates) * templates;
+    if (blocks <= 1) return pairs;
+    if (limit > std::numeric_limits<std::uint64_t>::max() / pairs) {
+        throw std::length_error("mosaic beam per-block extension bound overflows uint64");
+    }
+    const std::uint64_t per_block = static_cast<std::uint64_t>(limit) * pairs;
+    if (blocks - 1 > (std::numeric_limits<std::uint64_t>::max() - pairs) / per_block) {
+        throw std::length_error("mosaic beam total extension bound overflows uint64");
+    }
+    return pairs + static_cast<std::uint64_t>(blocks - 1) * per_block;
+}
+
 } // namespace
 
 MosaicBeamResult propose_mosaic_diplotypes(
@@ -329,71 +216,221 @@ MosaicBeamResult propose_mosaic_diplotypes(
     const std::vector<double>& switch_probability,
     const MosaicBeamParameters& parameters) {
     validate_beam_inputs(panel, emissions, switch_probability, parameters);
-
-    MosaicBeamResult result;
     const std::size_t templates = panel.template_count();
     const std::size_t blocks = panel.block_count();
-    if (templates > std::numeric_limits<std::size_t>::max() / templates) {
-        throw std::length_error("mosaic beam transition table size overflows size_t");
+
+    MosaicBeamResult result;
+    result.state_limit_used = parameters.state_limit;
+    result.extension_upper_bound = extension_upper_bound(templates, blocks, parameters.state_limit);
+    if (result.extension_upper_bound > parameters.max_extension_evaluations) {
+        throw std::length_error("mosaic beam extension work exceeds the declared pre-allocation budget");
     }
 
-    // These two block-major tables keep vector-of-vector panel lookups and logarithms out of the
-    // tens-of-millions extension loop. They are shared across adaptive-width reruns.
-    std::vector<std::vector<std::size_t>> allele_by_block(
-        blocks, std::vector<std::size_t>(templates, 0));
+    std::vector<std::vector<std::size_t>> allele_by_block(blocks, std::vector<std::size_t>(templates, 0));
     for (std::size_t block = 0; block < blocks; ++block) {
-        for (std::size_t h = 0; h < templates; ++h) {
-            allele_by_block[block][h] = panel.template_alleles[h][block];
-        }
+        for (std::size_t h = 0; h < templates; ++h) allele_by_block[block][h] = panel.template_alleles[h][block];
     }
-    std::vector<std::vector<double>> log_transition_by_boundary;
-    log_transition_by_boundary.reserve(switch_probability.size());
-    for (double r : switch_probability) {
-        std::vector<double> transition_table(templates * templates, kNegInf);
-        for (std::size_t from = 0; from < templates; ++from) {
-            for (std::size_t to = 0; to < templates; ++to) {
-                const double probability = (from == to ? 1.0 - r : 0.0) +
-                                           r / static_cast<double>(templates);
-                if (probability > 0.0) {
-                    transition_table[from * templates + to] = std::log(probability);
-                }
+
+    PrefixInterner prefixes;
+    const double log_templates = std::log(static_cast<double>(templates));
+
+    // ---- block 0: every ordered template pair, merged by key -------------------------------------------
+    std::vector<State> layer;
+    {
+        std::vector<State> initial;
+        initial.reserve(templates * templates);
+        const BlockProposalEmissions& emission = emissions.blocks[0];
+        std::vector<std::uint32_t> prefix_of(templates);
+        for (std::size_t h = 0; h < templates; ++h) prefix_of[h] = prefixes.intern(kRoot, allele_by_block[0][h]);
+        for (std::size_t h1 = 0; h1 < templates; ++h1) {
+            for (std::size_t h2 = 0; h2 < templates; ++h2) {
+                add_extensions(result.extensions_evaluated, 1);
+                const double e = emission.log_score[allele_by_block[0][h1] * emission.allele_count +
+                                                    allele_by_block[0][h2]];
+                State state;
+                state.prefix1 = prefix_of[h1];
+                state.template1 = static_cast<std::uint32_t>(h1);
+                state.prefix2 = prefix_of[h2];
+                state.template2 = static_cast<std::uint32_t>(h2);
+                state.log_mass = -2.0 * log_templates + e;
+                state.best = state.log_mass;
+                state.best_emission = e;
+                state.best_transition = -2.0 * log_templates;
+                state.histories = 1;
+                canonicalise(state);
+                initial.push_back(state);
             }
         }
-        log_transition_by_boundary.push_back(std::move(transition_table));
+        std::sort(initial.begin(), initial.end(),
+                  [](const State& lhs, const State& rhs) { return key_of(lhs) < key_of(rhs); });
+        LayerSelector selector(parameters.state_limit);
+        for (std::size_t i = 0; i < initial.size();) {
+            State merged = initial[i];
+            std::size_t j = i + 1;
+            for (; j < initial.size() && key_of(initial[j]) == key_of(merged); ++j) merge_into(merged, initial[j]);
+            selector.offer(merged);
+            i = j;
+        }
+        layer = selector.take(result.states_pruned);
     }
 
-    std::size_t width = std::min(
-        parameters.raw_history_limit,
-        std::max<std::size_t>(1, parameters.unique_candidate_target));
-    while (true) {
-        const std::uint64_t predicted = extension_upper_bound(templates, blocks, width);
-        if (result.extension_upper_bound > parameters.max_extension_evaluations ||
-            predicted > parameters.max_extension_evaluations - result.extension_upper_bound) {
-            throw std::length_error(
-                "mosaic beam extension work exceeds the declared pre-allocation budget");
+    // ---- blocks 1..B-1: extend each parent prefix-pair group over every ordered template pair ------------
+    std::vector<double> cell_mass(templates * templates, kNegInf);
+    std::vector<double> cell_best(templates * templates, kNegInf);
+    std::vector<double> cell_best_emission(templates * templates, 0.0);
+    std::vector<double> cell_best_transition(templates * templates, 0.0);
+    std::vector<std::uint64_t> cell_histories(templates * templates, 0);
+    std::vector<char> cell_saturated(templates * templates, 0);
+    std::vector<std::size_t> touched;
+
+    for (std::size_t block = 1; block < blocks && !layer.empty(); ++block) {
+        const BlockProposalEmissions& emission = emissions.blocks[block];
+        const double r = switch_probability[block - 1];
+        const double log_same = std::log((1.0 - r) + r / static_cast<double>(templates));
+        const double log_other = r > 0.0 ? std::log(r) - log_templates : kNegInf;
+
+        // Group parents by their prefix pair. States are sorted by key, so prefix1 then template1 order;
+        // re-sort by (prefix1, prefix2) to make each group contiguous.
+        std::sort(layer.begin(), layer.end(), [](const State& lhs, const State& rhs) {
+            return std::tie(lhs.prefix1, lhs.prefix2, lhs.template1, lhs.template2) <
+                   std::tie(rhs.prefix1, rhs.prefix2, rhs.template1, rhs.template2);
+        });
+
+        LayerSelector selector(parameters.state_limit);
+        std::vector<std::uint32_t> child_prefix1(emission.allele_count);
+        std::vector<std::uint32_t> child_prefix2(emission.allele_count);
+        for (std::size_t g = 0; g < layer.size();) {
+            std::size_t end = g + 1;
+            while (end < layer.size() && layer[end].prefix1 == layer[g].prefix1 &&
+                   layer[end].prefix2 == layer[g].prefix2) {
+                ++end;
+            }
+            const std::uint32_t parent1 = layer[g].prefix1;
+            const std::uint32_t parent2 = layer[g].prefix2;
+            const bool symmetric = parent1 == parent2;
+            for (std::size_t a = 0; a < emission.allele_count; ++a) {
+                child_prefix1[a] = prefixes.intern(parent1, a);
+                child_prefix2[a] = symmetric ? child_prefix1[a] : prefixes.intern(parent2, a);
+            }
+
+            // Extending one representative of each merged parent over every ORDERED new template pair is
+            // exact: the swapped ordered history, extended by the swapped pair, lands on the same unordered
+            // child with the same transition product.
+            for (std::size_t p = g; p < end; ++p) {
+                const State& parent = layer[p];
+                for (std::size_t x = 0; x < templates; ++x) {
+                    const double t1 = parent.template1 == x ? log_same : log_other;
+                    if (t1 == kNegInf) {
+                        continue;
+                    }
+                    for (std::size_t y = 0; y < templates; ++y) {
+                        const double t2 = parent.template2 == y ? log_same : log_other;
+                        if (t2 == kNegInf) continue;
+                        add_extensions(result.extensions_evaluated, 1);
+                        const double e = emission.log_score[allele_by_block[block][x] * emission.allele_count +
+                                                            allele_by_block[block][y]];
+                        // A symmetric parent's children (x,y) and (y,x) are one unordered child.
+                        const std::size_t cell = symmetric ? std::min(x, y) * templates + std::max(x, y)
+                                                           : x * templates + y;
+                        if (cell_mass[cell] == kNegInf && cell_histories[cell] == 0) touched.push_back(cell);
+                        const double transition = t1 + t2;
+                        cell_mass[cell] = log_add_exp_local(cell_mass[cell], parent.log_mass + transition + e);
+                        const double candidate_best = parent.best + transition + e;
+                        if (candidate_best > cell_best[cell]) {
+                            cell_best[cell] = candidate_best;
+                            cell_best_emission[cell] = parent.best_emission + e;
+                            cell_best_transition[cell] = parent.best_transition + transition;
+                        }
+                        bool saturated = cell_saturated[cell] != 0;
+                        add_count(cell_histories[cell], saturated, parent.histories, parent.saturated);
+                        cell_saturated[cell] = saturated ? 1 : 0;
+                    }
+                }
+            }
+
+            std::sort(touched.begin(), touched.end());
+            for (const std::size_t cell : touched) {
+                const std::size_t x = cell / templates;
+                const std::size_t y = cell % templates;
+                State child;
+                child.prefix1 = child_prefix1[allele_by_block[block][x]];
+                child.template1 = static_cast<std::uint32_t>(x);
+                child.prefix2 = child_prefix2[allele_by_block[block][y]];
+                child.template2 = static_cast<std::uint32_t>(y);
+                child.log_mass = cell_mass[cell];
+                child.best = cell_best[cell];
+                child.best_emission = cell_best_emission[cell];
+                child.best_transition = cell_best_transition[cell];
+                child.histories = cell_histories[cell];
+                child.saturated = cell_saturated[cell] != 0;
+                canonicalise(child);
+                selector.offer(child);
+                cell_mass[cell] = kNegInf;
+                cell_best[cell] = kNegInf;
+                cell_histories[cell] = 0;
+                cell_saturated[cell] = 0;
+            }
+            touched.clear();
+            g = end;
         }
-        result.extension_upper_bound += predicted;
-        BeamRun run = run_beam(
-            panel, emissions, allele_by_block, log_transition_by_boundary,
-            width, parameters.expansion_chunk_size);
-        add_extension_count(result.extensions_evaluated, run.extensions);
-        const auto collapsed = collapse_final_histories(panel, run);
-        result.beam_width_used = width;
-        result.final_raw_histories = run.layers.empty() ? 0 : run.layers.back().size();
-        result.candidates = materialize_candidates(
-            collapsed, emissions.every_allele_scored(), parameters.unique_candidate_target);
-        result.unique_target_reached =
-            collapsed.size() >= parameters.unique_candidate_target;
-        if (result.unique_target_reached || width == parameters.raw_history_limit) {
-            result.raw_history_limit_reached =
-                width == parameters.raw_history_limit && !result.unique_target_reached;
-            return result;
-        }
-        const std::size_t doubled = width > parameters.raw_history_limit / 2
-            ? parameters.raw_history_limit
-            : width * 2;
-        width = std::max(width + 1, doubled);
+        layer = selector.take(result.states_pruned);
     }
+
+    // ---- final collapse: drop templates, merge by unordered pair of complete allele paths ----------------
+    result.final_states = layer.size();
+    std::sort(layer.begin(), layer.end(), [](const State& lhs, const State& rhs) {
+        return std::tie(lhs.prefix1, lhs.prefix2) < std::tie(rhs.prefix1, rhs.prefix2);
+    });
+    std::vector<MosaicCandidate> candidates;
+    for (std::size_t i = 0; i < layer.size();) {
+        State merged = layer[i];
+        std::size_t j = i + 1;
+        for (; j < layer.size() && layer[j].prefix1 == merged.prefix1 && layer[j].prefix2 == merged.prefix2; ++j) {
+            merge_into(merged, layer[j]);
+        }
+        MosaicCandidate candidate;
+        candidate.diplotype.first.alleles = prefixes.path(merged.prefix1, blocks);
+        candidate.diplotype.second.alleles = prefixes.path(merged.prefix2, blocks);
+        if (candidate.diplotype.second.alleles < candidate.diplotype.first.alleles) {
+            std::swap(candidate.diplotype.first, candidate.diplotype.second);
+        }
+        candidate.best_proposal_score = merged.best;
+        candidate.proposal_emission_component = merged.best_emission;
+        candidate.proposal_transition_component = merged.best_transition;
+        candidate.retained_logsum_proposal_score = merged.log_mass;
+        candidate.equivalent_retained_histories = merged.histories;
+        candidate.history_count_saturated = merged.saturated;
+        candidate.every_allele_scored = emissions.every_allele_scored();
+        candidates.push_back(std::move(candidate));
+        i = j;
+    }
+    std::sort(candidates.begin(), candidates.end(), [](const MosaicCandidate& lhs, const MosaicCandidate& rhs) {
+        if (lhs.retained_logsum_proposal_score != rhs.retained_logsum_proposal_score) {
+            return lhs.retained_logsum_proposal_score > rhs.retained_logsum_proposal_score;
+        }
+        if (lhs.best_proposal_score != rhs.best_proposal_score) {
+            return lhs.best_proposal_score > rhs.best_proposal_score;
+        }
+        if (lhs.diplotype.first.alleles != rhs.diplotype.first.alleles) {
+            return lhs.diplotype.first.alleles < rhs.diplotype.first.alleles;
+        }
+        return lhs.diplotype.second.alleles < rhs.diplotype.second.alleles;
+    });
+
+    result.unique_candidates_found = candidates.size();
+    result.search_exhaustive = result.states_pruned == 0;
+    result.unique_target_reached = candidates.size() >= parameters.unique_candidate_target;
+    result.candidate_set_conditional =
+        !result.search_exhaustive || candidates.size() > parameters.unique_candidate_target;
+    if (candidates.size() > parameters.unique_candidate_target) {
+        candidates.resize(parameters.unique_candidate_target);
+    }
+    for (std::size_t rank = 0; rank < candidates.size(); ++rank) {
+        candidates[rank].candidate_id = rank;
+        candidates[rank].unique_rank = rank + 1;
+    }
+    result.candidates = std::move(candidates);
+    return result;
 }
 
 } // namespace panvar

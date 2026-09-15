@@ -66,7 +66,7 @@ struct TinyLocus {
 // At their defaults they are wider than any simulated insert, so no fragment can link neighbouring
 // variants and the locus cannot be phased from reads -- which one gate below relies on.
 TinyLocus write_tiny_locus(const std::string& file = "tiny.gfa", std::size_t context_left = 350,
-                           std::size_t context_right = 340) {
+                           std::size_t context_right = 340, bool duplicate_first_template = false) {
     std::mt19937_64 rng(4);
     TinyLocus locus;
     locus.gfa_path = path(file);
@@ -100,10 +100,13 @@ TinyLocus write_tiny_locus(const std::string& file = "tiny.gfa", std::size_t con
         {"sampleC#1#chr1:0-100", {"1", "2", "4", "6", "7", "9", "10"}},
         {"sampleD#1#chr1:0-100", {"1", "3", "4", "5", "7", "8", "10"}},
     };
+    std::vector<std::pair<std::string, std::vector<std::string>>> all_templates = templates;
+    // A second carrier of sampleA's haplotype raises its prior without adding any sequence.
+    if (duplicate_first_template) all_templates.push_back({"sampleE#1#chr1:0-100", templates.front().second});
     std::map<std::string, std::string> sequence_of;
     for (const Node& node : nodes) sequence_of[node.id] = node.seq;
     locus.node_sequences = sequence_of;
-    for (const auto& item : templates) {
+    for (const auto& item : all_templates) {
         out << "P\t" << item.first << '\t';
         for (std::size_t i = 0; i < item.second.size(); ++i) {
             if (i != 0) out << ',';
@@ -553,37 +556,42 @@ void test_off_panel_truth_is_recovered() {
     const TinyLocus locus = write_tiny_locus("tiny_phaseable.gfa", 80, 70);
     const auto truths = spell_truths(locus);
     simulate(truths.first, truths.second, path("phaseable_r1.fq"), path("phaseable_r2.fq"), 123);
-    // At the default raw-history limit the proposal fills its width with equivalent template histories
-    // of the two zero-switch phasings -- which share the truth's genotype at every block, and which the
-    // phase-blind marker emission cannot tell apart -- and never offers the truth. That is a measured
-    // proposal limitation. The run must report its candidate set as truncated, and this arm pins the
-    // limitation so documentation cannot drift from it. If the proposal improves, revisit this arm.
-    const panvar::GenotypeCommandOptions default_limit = tiny_options(
-        "phaseable_default", path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa");
-    require(panvar::run_genotype(default_limit) == panvar::GenotypeRunStatus::Complete,
-            "fixture: the default-limit run must complete within its retained set");
-    const std::map<std::string, std::string> default_status =
-        read_status(path("phaseable_default.mosaic_status.tsv"));
-    require(default_status.at("candidate_set_truncated") == "true",
-            "a proposal that stops at its raw width below target must report a truncated candidate set");
-    const TruthFrame default_frame = rebuild_truth_frame(
-        default_limit, default_status.at("model_fingerprint"), kTruth1Nodes, kTruth2Nodes);
-    require(!truth_phasing_in_candidates(default_frame, path("phaseable_default.mosaic_candidates.tsv")),
-            "known limitation changed: the default-limit proposal now offers the truth; revisit this arm");
+    // The crowding fixture. Before equivalence merging, a width of 64 filled with template histories of the
+    // two zero-switch phasings and the truth was never offered. Under the same budget of 64 merged states
+    // the truth must now be proposed. The locus has 36 distinct diplotypes and 64 merged states hold only
+    // four of them, so with K=16 the search is pruned and misses its target: the run must refuse to call,
+    // and its diagnostic manifest must still show the truth among what was proposed.
+    {
+        panvar::GenotypeCommandOptions budget = tiny_options(
+            "phaseable_budget", path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa");
+        budget.proposal_state_limit = 64;
+        require(panvar::run_genotype(budget) == panvar::GenotypeRunStatus::CandidateIncomplete,
+                "a pruned search that misses K must refuse even when it proposed the truth");
+        const auto budget_status = read_status(path("phaseable_budget.mosaic_status.tsv"));
+        require(budget_status.at("proposal_search_exhaustive") == "false" &&
+                    budget_status.at("proposal_target_reached") == "false",
+                "fixture: 64 merged states must prune and miss K=16");
+        require(no_ranking_or_call("phaseable_budget"), "a refused proposal must not rank or call");
+        const TruthFrame budget_frame = rebuild_truth_frame(
+            budget, budget_status.at("model_fingerprint"), kTruth1Nodes, kTruth2Nodes);
+        require(truth_phasing_in_candidates(budget_frame, path("phaseable_budget.mosaic_candidates.tsv")),
+                "under the budget that used to crowd it out, the merged beam must propose the truth");
+    }
 
-    // Exhaustive for this locus: every ordered template-pair history of its 4 templates over 5 blocks,
-    // (4 * 4)^5. Derived from the locus, not from any result.
+    // Recovery, with a budget above every reachable merged state.
     panvar::GenotypeCommandOptions options =
         tiny_options("phaseable", path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa");
-    options.raw_history_limit = 1048576;
+    options.proposal_state_limit = 1048576;
     const panvar::GenotypeRunStatus status = panvar::run_genotype(options);
     const std::map<std::string, std::string> reported = read_status(path("phaseable.mosaic_status.tsv"));
     require(status == panvar::GenotypeRunStatus::Complete,
             std::string("the phaseable off-panel run must complete, got ") +
                 panvar::genotype_run_status_name(status) + ": " +
                 (reported.count("note") ? reported.at("note") : ""));
-    require(reported.at("winner_decided_by") == "fragments",
-            "the reads, not the prior, must choose the off-panel truth");
+    require(reported.at("proposal_search_exhaustive") == "true" || reported.at("proposal_target_reached") == "true",
+            "an accuracy-eligible run must have searched exhaustively or reached its target");
+    require(reported.at("phase_support") == "READS",
+            "the reads, not the prior, must choose the phaseable off-panel truth");
 
     const TruthFrame frame =
         rebuild_truth_frame(options, reported.at("model_fingerprint"), kTruth1Nodes, kTruth2Nodes);
@@ -610,8 +618,8 @@ void test_off_panel_truth_is_recovered() {
     }
     require(pairing != 0, "fixture: the truth must be heterozygous somewhere, or phase is untested");
     std::cout << "  off-panel truth (phaseable): all " << rows.size()
-              << " blocks called and phased correctly, decided by fragments, fragment gap "
-              << reported.at("fragment_term_gap_to_runner_up") << '\n';
+              << " blocks called and phased correctly; truth proposed within 64 merged states; phase support READS, "
+              << "fragment gap " << reported.at("fragment_term_gap_to_runner_up") << '\n';
 }
 
 // The same off-panel truth where the reads cannot phase it: every context span is wider than every
@@ -627,14 +635,15 @@ void test_off_panel_phase_is_not_claimed_from_reads() {
     simulate(truths.first, truths.second, path("unphaseable_r1.fq"), path("unphaseable_r2.fq"), 123);
     panvar::GenotypeCommandOptions options =
         tiny_options("unphaseable", path("unphaseable_r1.fq"), path("unphaseable_r2.fq"));
-    options.raw_history_limit = 1048576;   // (4 * 4)^5: exhaustive for 4 templates over 5 blocks
+    options.proposal_state_limit = 1048576;   // far above every reachable merged state: exhaustive
     const panvar::GenotypeRunStatus status = panvar::run_genotype(options);
     const std::map<std::string, std::string> reported = read_status(path("unphaseable.mosaic_status.tsv"));
-    require(status == panvar::GenotypeRunStatus::RescoreIncomplete ||
-                (status == panvar::GenotypeRunStatus::Complete && reported.at("winner_decided_by") == "prior"),
-            std::string("an unphaseable truth must not be decided by fragments, got ") +
-                panvar::genotype_run_status_name(status) + " decided by " +
-                (reported.count("winner_decided_by") ? reported.at("winner_decided_by") : "NA"));
+    require(reported.at("proposal_search_exhaustive") == "true", "fixture: the unphaseable search must be exhaustive");
+    require((status == panvar::GenotypeRunStatus::RescoreIncomplete && reported.at("phase_support") == "UNRESOLVED") ||
+                (status == panvar::GenotypeRunStatus::Complete && reported.at("phase_support") == "PRIOR_ONLY"),
+            std::string("an unphaseable truth must never be reported as read-phased, got ") +
+                panvar::genotype_run_status_name(status) + " with phase support " +
+                (reported.count("phase_support") ? reported.at("phase_support") : "NA"));
     const TruthFrame frame =
         rebuild_truth_frame(options, reported.at("model_fingerprint"), kTruth1Nodes, kTruth2Nodes);
     const panvar::PreparedGenotypeModel& model = *frame.model;
@@ -682,10 +691,73 @@ void test_off_panel_phase_is_not_claimed_from_reads() {
                 error_bound[truth_candidate] + error_bound[winner],
             "with no phase-informative fragment the truth and the winner must have the same fragment term");
     std::cout << "  off-panel truth (unphaseable): " << panvar::genotype_run_status_name(status)
-              << ", decided by " << reported.at("winner_decided_by") << ", " << winners.size()
+              << ", phase support " << reported.at("phase_support") << ", " << winners.size()
               << " winning phasing(s) with the truth genotype; truth phasing retained"
               << (winners.count(truth_candidate) ? " in the winner set" : " below the winner by prior only")
               << '\n';
+}
+
+
+// The inverted wrong-call gate. At NA19240 K=8 a pruned proposal that never offered the truth produced a
+// certified, fragment-decided, wrong call. A pruned search that misses its target must now end
+// CANDIDATE_INCOMPLETE with no ranking and no call; an exhaustive search with fewer candidates than
+// requested is complete and unconditional.
+void test_proposal_status_rules() {
+    const std::string r1 = path("phaseable_r1.fq");
+    const std::string r2 = path("phaseable_r2.fq");
+
+    panvar::GenotypeCommandOptions starved = tiny_options("starved", r1, r2, "tiny_phaseable.gfa");
+    starved.proposal_state_limit = 1;
+    require(panvar::run_genotype(starved) == panvar::GenotypeRunStatus::CandidateIncomplete,
+            "a pruned search that misses its target must end CANDIDATE_INCOMPLETE");
+    const auto starved_status = read_status(path("starved.mosaic_status.tsv"));
+    require(starved_status.at("proposal_search_exhaustive") == "false" &&
+                starved_status.at("proposal_target_reached") == "false" &&
+                std::stoull(starved_status.at("proposal_states_pruned")) > 0,
+            "the status must report the pruned, target-unmet search separately");
+    require(no_ranking_or_call("starved"), "a target-unmet pruned search must not rank or call");
+
+    panvar::GenotypeCommandOptions exhaustive = tiny_options("exhaustive", r1, r2, "tiny_phaseable.gfa");
+    exhaustive.max_candidates = 64;
+    exhaustive.proposal_state_limit = 1048576;
+    require(panvar::run_genotype(exhaustive) == panvar::GenotypeRunStatus::Complete,
+            "an exhaustive search with fewer candidates than requested must complete");
+    const auto exhaustive_status = read_status(path("exhaustive.mosaic_status.tsv"));
+    require(exhaustive_status.at("proposal_search_exhaustive") == "true" &&
+                exhaustive_status.at("proposal_target_reached") == "false" &&
+                exhaustive_status.at("candidate_set_conditional") == "false" &&
+                std::stoul(exhaustive_status.at("unique_candidates_found")) < 64,
+            "an exhaustive search below K must be reported complete and unconditional");
+}
+
+// Prior-only phase. The unphaseable locus with a second carrier of sampleA's haplotype: reads from
+// sampleA and sampleB cannot link neighbouring variants, so the zero-switch phasings are fragment
+// contenders, and the extra carrier lets the prior pick one. The call is made, but its phase must be
+// reported PRIOR_ONLY, while every block genotype -- on which all contenders agree -- stays READS.
+void test_prior_only_phase_is_reported() {
+    const TinyLocus locus = write_tiny_locus("tiny_duplicate.gfa", 350, 340, true);
+    simulate(locus.haplotypes[0], locus.haplotypes[1], path("duplicate_r1.fq"), path("duplicate_r2.fq"), 321);
+    panvar::GenotypeCommandOptions options =
+        tiny_options("prior_only", path("duplicate_r1.fq"), path("duplicate_r2.fq"), "tiny_duplicate.gfa");
+    options.proposal_state_limit = 1048576;
+    const panvar::GenotypeRunStatus status = panvar::run_genotype(options);
+    const auto reported = read_status(path("prior_only.mosaic_status.tsv"));
+    require(status == panvar::GenotypeRunStatus::Complete,
+            std::string("the prior-only fixture must complete, got ") + panvar::genotype_run_status_name(status) +
+                ": " + (reported.count("note") ? reported.at("note") : ""));
+    require(reported.at("phase_support") == "PRIOR_ONLY" && std::stoul(reported.at("fragment_contenders")) > 0,
+            "a winner chosen among fragment contenders by the prior must be reported PRIOR_ONLY, got " +
+                reported.at("phase_support"));
+    const auto rows = read_rows(path("prior_only.block_genotypes.tsv"));
+    std::size_t supported = 0;
+    for (const auto& row : rows) {
+        require(row[10] == "PRIOR_ONLY", "every block row must carry the run's phase support");
+        if (row[9] == "READS") ++supported;
+    }
+    require(supported == rows.size() && reported.at("blocks_genotype_read_supported") == std::to_string(rows.size()),
+            "block genotypes on which every fragment contender agrees must remain read-supported");
+    std::cout << "  prior-only phase: call made, phase PRIOR_ONLY, " << supported << "/" << rows.size()
+              << " block genotypes read-supported, " << reported.at("fragment_contenders") << " contenders\n";
 }
 
 } // namespace
@@ -702,6 +774,8 @@ int main(int argc, char** argv) {
         test_fail_closed_statuses();
         test_off_panel_truth_is_recovered();
         test_off_panel_phase_is_not_claimed_from_reads();
+        test_proposal_status_rules();
+        test_prior_only_phase_is_reported();
         std::cout << "genotype command end-to-end: PASS\n";
         return 0;
     } catch (const std::exception& error) {
