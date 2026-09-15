@@ -28,8 +28,9 @@ struct GenotypeCommandOptions {
     std::size_t syncmer_s = 15;
     std::size_t min_variant_bp = 50;
     double switch_probability = 0.01;
-    std::size_t initial_band = 2;
-    std::size_t maximum_band = 6;
+    // The declared mismatch band of the truncated fragment likelihood. It is part of the model, not a
+    // search depth, so it is fixed for the whole run and recorded in the status file.
+    std::size_t mismatch_band = 6;
     std::size_t minimum_piece_bp = 12;
     bool quiet = false;
 };

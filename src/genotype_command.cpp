@@ -169,8 +169,7 @@ void write_status(
     out << "min_variant_bp\t" << options.min_variant_bp << '\n';
     out << "switch_probability\t" << options.switch_probability << '\n';
     out << "max_candidates\t" << options.max_candidates << '\n';
-    out << "initial_band\t" << options.initial_band << '\n';
-    out << "maximum_band\t" << options.maximum_band << '\n';
+    out << "mismatch_band\t" << options.mismatch_band << '\n';
     // Version one is serial by contract: the scorer is not threaded before the serial algorithm
     // meets its performance gate. The requested value is recorded so a run is reproducible.
     out << "threads_requested\t" << options.threads << '\n';
@@ -211,6 +210,12 @@ void write_status(
     if (ranking != nullptr) {
         out << "certified_gap\t" << ranking->certified_gap << '\n';
         out << "winner_set_size\t" << ranking->winner_set.size() << '\n';
+        out << "score_gap_to_runner_up\t" << ranking->score_gap_to_runner_up << '\n';
+        out << "candidate_set_log_weight\t" << ranking->candidate_set_log_weight << '\n';
+        out << "winner_candidate_set_probability\t"
+            << ranking->candidates.front().candidate_set_probability << '\n';
+        out << "winner_numeric_error_bound\t" << ranking->candidates.front().numeric_error_bound
+            << '\n';
         const FragmentScoringCounters& counters = ranking->counters;
         out << "candidate_bases_scanned\t" << counters.candidate_bases_scanned << '\n';
         out << "piece_hits\t" << counters.piece_hits << '\n';
@@ -221,8 +226,6 @@ void write_status(
         out << "valid_fr_states\t" << counters.valid_fr_states << '\n';
         out << "physical_origins\t" << counters.physical_origins << '\n';
         out << "statistical_state_classes\t" << counters.statistical_state_classes << '\n';
-        out << "candidates_deepened\t" << counters.candidates_deepened << '\n';
-        out << "fragments_declared_outlier\t" << counters.fragments_declared_outlier << '\n';
     }
     out << std::fixed << std::setprecision(3);
     out << "seconds_model\t" << timings.model << '\n';
@@ -389,13 +392,11 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     // ---- stage 6: certified rescoring -----------------------------------------------------------
     mark = Clock::now();
     FragmentScoringOptions scoring_options;
-    scoring_options.mismatch_band = options.initial_band;
+    scoring_options.mismatch_band = options.mismatch_band;
     scoring_options.minimum_piece_bp = options.minimum_piece_bp;
-    CertificationOptions certification;
-    certification.initial_band = options.initial_band;
-    certification.maximum_band = options.maximum_band;
     const CertifiedRanking ranking = certify_diplotype_ranking(
-        interned, interned_pairs, fragments, library, scoring_options, certification, exact_prior);
+        interned, interned_pairs, fragments, library, scoring_options, CertificationOptions{},
+        exact_prior);
     timings.rescoring = seconds_since(mark);
 
     // ---- outputs --------------------------------------------------------------------------------
@@ -423,18 +424,19 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         // The proposal score is deliberately absent from this table's total: it comes from the same
         // reads as the fragment term, so adding both would count that evidence twice.
         std::ofstream out = open_output(options.out_prefix + ".mosaic_scores.tsv");
-        out << "candidate_id\tscore_lower\tscore_upper\tinterval_width\tfragments_with_mass\t"
-               "fragments_total\tband_used\texact\tdecided\n";
+        out << "candidate_id\tscore\tfragment_term\texposure_term\texact_prior\t"
+               "numeric_error_bound\tfragments_with_mass\tfragments_total\t"
+               "candidate_set_probability\tmismatch_band\tin_winner_set\n";
+        out << std::setprecision(12);
         for (const CertifiedCandidate& entry : ranking.candidates) {
-            const bool undecided =
+            const bool in_set =
                 std::find(ranking.winner_set.begin(), ranking.winner_set.end(),
                           entry.candidate_id) != ranking.winner_set.end();
-            out << entry.candidate_id << '\t' << entry.score_lower << '\t' << entry.score_upper
-                << '\t' << (entry.score_upper - entry.score_lower) << '\t'
-                << entry.fragments_with_mass << '\t' << fragments.size() << '\t'
-                << entry.band_used << '\t' << (entry.exact ? "true" : "false") << '\t'
-                << (undecided && ranking.status != RescoreStatus::Complete ? "false" : "true")
-                << '\n';
+            out << entry.candidate_id << '\t' << entry.score << '\t' << entry.fragment_term << '\t'
+                << entry.exposure_term << '\t' << entry.prior << '\t' << entry.numeric_error_bound
+                << '\t' << entry.fragments_with_mass << '\t' << fragments.size() << '\t'
+                << entry.candidate_set_probability << '\t' << ranking.mismatch_band << '\t'
+                << (in_set ? "true" : "false") << '\n';
         }
     }
 
@@ -442,8 +444,8 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         timings.total = seconds_since(started);
         write_status(status_path, GenotypeRunStatus::RescoreIncomplete, fingerprint, options,
                      library, timings, &built.report, &panel, &beam, &ranking,
-                     "no candidate's lower bound cleared every rival's upper bound; the "
-                     "equivalence set is reported instead of a call");
+                     "the best candidate cannot be separated from every rival by more than "
+                     "floating-point error; the equivalence set is reported instead of a call");
         return GenotypeRunStatus::RescoreIncomplete;
     }
 

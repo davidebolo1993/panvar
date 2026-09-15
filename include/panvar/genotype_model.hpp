@@ -76,6 +76,16 @@ InsertSupport fragment_insert_support(
     const ReadPair& fragment,
     const LibraryModel& model);
 
+// The library's own statistical insert support, before any fragment's physical floor is applied.
+InsertSupport library_insert_support(const LibraryModel& model);
+
+// The discrete Gaussian normalised over the library's statistical support. This is the insert
+// probability of the fragment likelihood: the physical floor of an individual fragment restricts
+// which placements are geometrically possible, but it does not renormalise the probability, because
+// a template shorter than the longer mate is a state of the library that cannot produce that
+// fragment, not a state that was never generated. Exposure uses the same distribution.
+DiscreteInsertDistribution build_library_insert_distribution(const LibraryModel& model);
+
 // Build once per fragment (or per equal mate-length bucket), then reuse for every candidate and
 // placement. This prevents normalization over the support from entering the scoring inner loop.
 // Probabilities are a discrete Gaussian normalized over this fragment's declared insert support.

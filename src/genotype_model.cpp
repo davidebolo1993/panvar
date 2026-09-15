@@ -80,23 +80,43 @@ void validate_library_model(const LibraryModel& model) {
     }
 }
 
-InsertSupport fragment_insert_support(
-    const ReadPair& fragment,
-    const LibraryModel& model) {
-    validate_read_pair(fragment);
+InsertSupport library_insert_support(const LibraryModel& model) {
     validate_library_model(model);
-
-    const std::size_t physical_floor =
-        std::max(fragment.first.bases.size(), fragment.second.bases.size());
     const double raw_lo = std::ceil(
         model.insert_mean_bp - model.support_sigmas * model.insert_sd_bp);
     const double raw_hi = std::floor(
         model.insert_mean_bp + model.support_sigmas * model.insert_sd_bp);
-
-    const std::size_t statistical_floor =
-        raw_lo <= 1.0 ? 1 : static_cast<std::size_t>(raw_lo);
+    const std::size_t lo = raw_lo <= 1.0 ? 1 : static_cast<std::size_t>(raw_lo);
     const std::size_t hi = raw_hi < 1.0 ? 0 : static_cast<std::size_t>(raw_hi);
-    return {std::max(physical_floor, statistical_floor), hi};
+    return {lo, hi};
+}
+
+InsertSupport fragment_insert_support(
+    const ReadPair& fragment,
+    const LibraryModel& model) {
+    validate_read_pair(fragment);
+    const InsertSupport library = library_insert_support(model);
+    const std::size_t physical_floor =
+        std::max(fragment.first.bases.size(), fragment.second.bases.size());
+    return {std::max(physical_floor, library.min_bp), library.max_bp};
+}
+
+DiscreteInsertDistribution build_library_insert_distribution(const LibraryModel& model) {
+    const InsertSupport support = library_insert_support(model);
+    if (support.empty()) return {support, {}};
+    double log_z = -std::numeric_limits<double>::infinity();
+    for (std::size_t length = support.min_bp;; ++length) {
+        log_z = log_add_exp(log_z, gaussian_log_weight(length, model));
+        if (length == support.max_bp) break;
+    }
+    DiscreteInsertDistribution result;
+    result.support = support;
+    result.log_probability_by_offset.reserve(support.max_bp - support.min_bp + 1);
+    for (std::size_t length = support.min_bp;; ++length) {
+        result.log_probability_by_offset.push_back(gaussian_log_weight(length, model) - log_z);
+        if (length == support.max_bp) break;
+    }
+    return result;
 }
 
 double DiscreteInsertDistribution::log_probability(std::size_t insert_bp) const noexcept {

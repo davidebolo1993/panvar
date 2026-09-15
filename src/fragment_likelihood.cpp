@@ -85,6 +85,33 @@ double log_emission(
            static_cast<double>(mismatches) * std::log(substitution_error / 3.0);
 }
 
+double log_band_mass(std::size_t read_length, std::size_t mismatch_band, double substitution_error) {
+    if (!(substitution_error > 0.0) || !(substitution_error < 0.75)) {
+        throw std::invalid_argument("substitution error must be in (0, 0.75)");
+    }
+    if (read_length == 0) throw std::invalid_argument("band mass needs a non-empty read");
+    const std::size_t top = std::min(mismatch_band, read_length);
+    const double n = static_cast<double>(read_length);
+    double total = kNegInf;
+    for (std::size_t m = 0; m <= top; ++m) {
+        const double k = static_cast<double>(m);
+        const double log_choose = std::lgamma(n + 1.0) - std::lgamma(k + 1.0) - std::lgamma(n - k + 1.0);
+        total = log_add_exp(total, log_choose + k * std::log(substitution_error) +
+                                       (n - k) * std::log1p(-substitution_error));
+    }
+    return total;
+}
+
+double log_truncated_emission(
+    std::size_t read_length,
+    std::size_t mismatches,
+    double substitution_error,
+    std::size_t mismatch_band) {
+    if (mismatches > mismatch_band) return kNegInf;
+    return log_emission(read_length, mismatches, substitution_error) -
+           log_band_mass(read_length, mismatch_band, substitution_error);
+}
+
 std::optional<std::size_t> fr_insert_length(
     std::size_t forward_start,
     std::size_t forward_length,
@@ -105,10 +132,12 @@ std::optional<std::size_t> fr_insert_length(
 
 double haplotype_exposure(
     std::size_t haplotype_length,
-    const DiscreteInsertDistribution& insert) {
+    const DiscreteInsertDistribution& insert,
+    std::size_t physical_floor_bp) {
     if (insert.support.empty()) return 0.0;
     double exposure = 0.0;
-    for (std::size_t length = insert.support.min_bp; length <= insert.support.max_bp; ++length) {
+    const std::size_t from = std::max(insert.support.min_bp, physical_floor_bp);
+    for (std::size_t length = from; length <= insert.support.max_bp; ++length) {
         if (haplotype_length < length) continue;
         const double probability = std::exp(insert.log_probability(length));
         exposure += probability * static_cast<double>(haplotype_length - length + 1);
@@ -188,7 +217,8 @@ double log_placement_mass(
     const std::vector<FragmentPlacement>& placements,
     const ReadPair& fragment,
     const DiscreteInsertDistribution& insert,
-    const LibraryModel& library) {
+    const LibraryModel& library,
+    std::size_t mismatch_band) {
     validate_read_pair(fragment);
     validate_library_model(library);
     double mass = kNegInf;
@@ -198,9 +228,12 @@ double log_placement_mass(
         const std::size_t reverse_length = placement.orientation == MateOrientation::FirstForward
             ? fragment.second.bases.size() : fragment.first.bases.size();
         const double term =
+            kLogMateOrientationPrior +
             insert.log_probability(placement.insert_bp) +
-            log_emission(forward_length, placement.forward_mismatches, library.substitution_error) +
-            log_emission(reverse_length, placement.reverse_mismatches, library.substitution_error);
+            log_truncated_emission(forward_length, placement.forward_mismatches,
+                                   library.substitution_error, mismatch_band) +
+            log_truncated_emission(reverse_length, placement.reverse_mismatches,
+                                   library.substitution_error, mismatch_band);
         mass = log_add_exp(mass, term);
     }
     return mass;
@@ -439,14 +472,26 @@ FragmentScoringResult score_diplotypes(
     result.scores.resize(candidates.size());
     result.unique_haplotypes = haplotypes.sequences.size();
     FragmentScoringCounters& counters = result.counters;
+    const std::size_t band = options.mismatch_band;
+    const DiscreteInsertDistribution library_insert = build_library_insert_distribution(library);
+
+    std::map<std::size_t, double> band_mass_by_length;
+    const auto band_mass = [&](std::size_t length) {
+        const auto found = band_mass_by_length.find(length);
+        if (found != band_mass_by_length.end()) return found->second;
+        const double value = log_band_mass(length, band, library.substitution_error);
+        band_mass_by_length.emplace(length, value);
+        return value;
+    };
 
     // Four oriented forms per fragment: each mate as given, and each pre-complemented. Whichever
     // mate reads off the forward strand is compared as given, so every comparison is forward.
     std::vector<ReadForm> forms;
     forms.reserve(fragments.size() * 4);
-    std::vector<DiscreteInsertDistribution> insert_by_fragment;
+    std::vector<InsertSupport> support_by_fragment;
     std::vector<double> background_by_fragment;
-    insert_by_fragment.reserve(fragments.size());
+    std::map<std::size_t, std::size_t> fragments_by_floor;
+    support_by_fragment.reserve(fragments.size());
     background_by_fragment.reserve(fragments.size());
     for (std::size_t f = 0; f < fragments.size(); ++f) {
         validate_read_pair(fragments[f]);
@@ -454,9 +499,10 @@ FragmentScoringResult score_diplotypes(
         forms.push_back({f, reverse_complement_read(fragments[f].first.bases), false});
         forms.push_back({f, fragments[f].second.bases, false});
         forms.push_back({f, reverse_complement_read(fragments[f].second.bases), true});
-        insert_by_fragment.push_back(
-            build_fragment_insert_distribution(fragments[f], library));
+        support_by_fragment.push_back(fragment_insert_support(fragments[f], library));
         background_by_fragment.push_back(log_background_probability(fragments[f]));
+        ++fragments_by_floor[std::max(fragments[f].first.bases.size(),
+                                      fragments[f].second.bases.size())];
     }
     const auto form_slot = [](std::size_t fragment, std::size_t which) {
         return fragment * 4 + which;   // 0: mate1, 1: rc(mate1), 2: mate2, 3: rc(mate2)
@@ -464,91 +510,41 @@ FragmentScoringResult score_diplotypes(
 
     const std::vector<PieceIndex> indexes =
         forms.empty() ? std::vector<PieceIndex>{}
-                      : build_piece_indexes(forms, options.mismatch_band, options.minimum_piece_bp);
+                      : build_piece_indexes(forms, band, options.minimum_piece_bp);
 
-    // Exposure is a property of the library and the haplotype, not of any one fragment, so it uses
-    // the library's own insert support rather than a fragment-specific floor.
-    InsertSupport library_support;
-    {
-        const double lo = std::ceil(library.insert_mean_bp -
-                                    library.support_sigmas * library.insert_sd_bp);
-        const double hi = std::floor(library.insert_mean_bp +
-                                     library.support_sigmas * library.insert_sd_bp);
-        library_support.min_bp = lo <= 1.0 ? 1 : static_cast<std::size_t>(lo);
-        library_support.max_bp = hi < 1.0 ? 0 : static_cast<std::size_t>(hi);
-    }
-    DiscreteInsertDistribution library_insert;
-    library_insert.support = library_support;
-    if (!library_support.empty()) {
-        double log_z = kNegInf;
-        for (std::size_t length = library_support.min_bp; length <= library_support.max_bp;
-             ++length) {
-            const double z = (static_cast<double>(length) - library.insert_mean_bp) /
-                             library.insert_sd_bp;
-            log_z = log_add_exp(log_z, -0.5 * z * z);
-        }
-        for (std::size_t length = library_support.min_bp; length <= library_support.max_bp;
-             ++length) {
-            const double z = (static_cast<double>(length) - library.insert_mean_bp) /
-                             library.insert_sd_bp;
-            library_insert.log_probability_by_offset.push_back(-0.5 * z * z - log_z);
-        }
-    }
-
-    // log mass of every fragment on every unique haplotype, one chromosome copy.
     const std::size_t unique = haplotypes.sequences.size();
     std::vector<double> mass(fragments.size() * unique, kNegInf);
-    std::vector<double> mass_upper(fragments.size() * unique, kNegInf);
     std::vector<double> exposure(unique, 0.0);
 
-    // A bound on everything the band left out. An omitted origin has more than `band` mismatches on
-    // at least one mate, so its mass is at most the best insert probability times the emission of
-    // exactly band+1 mismatches on that mate and a perfect other mate. There are at most two
-    // orientations times L forward starts times the support width such origins. Loose on purpose:
-    // it only has to be valid, and when it is too loose to separate candidates the answer is to
-    // deepen the band, which is what the certification loop does.
-    const auto omitted_bound = [&](std::size_t haplotype_length, std::size_t f) -> double {
-        const std::size_t first_length = fragments[f].first.bases.size();
-        const std::size_t second_length = fragments[f].second.bases.size();
-        const InsertSupport& support = insert_by_fragment[f].support;
-        if (support.empty()) return kNegInf;
-        const std::size_t over = options.mismatch_band + 1;
-        if (over > first_length && over > second_length) return kNegInf;   // nothing can be omitted
-        double best_emission = kNegInf;
-        if (over <= first_length) {
-            best_emission = std::max(best_emission,
-                log_emission(first_length, over, library.substitution_error) +
-                log_emission(second_length, 0, library.substitution_error));
+    // The fragment likelihood conditions on the observed read lengths, and a template shorter than a
+    // fragment's longer mate cannot produce that fragment. Exposure therefore averages the analytic
+    // count over the observed distribution of physical floors, so the -lambda*E term and the signal
+    // density describe the same generated process.
+    for (std::size_t h = 0; h < unique; ++h) {
+        const std::size_t length = haplotypes.sequences[h].size();
+        if (fragments.empty()) {
+            exposure[h] = haplotype_exposure(length, library_insert, 0);
+            continue;
         }
-        if (over <= second_length) {
-            best_emission = std::max(best_emission,
-                log_emission(second_length, over, library.substitution_error) +
-                log_emission(first_length, 0, library.substitution_error));
+        for (const auto& item : fragments_by_floor) {
+            exposure[h] += static_cast<double>(item.second) /
+                           static_cast<double>(fragments.size()) *
+                           haplotype_exposure(length, library_insert, item.first);
         }
-        if (best_emission == kNegInf) return kNegInf;
-        double best_insert = kNegInf;
-        for (const double value : insert_by_fragment[f].log_probability_by_offset) {
-            best_insert = std::max(best_insert, value);
-        }
-        const double states = 2.0 * static_cast<double>(haplotype_length) *
-                              static_cast<double>(support.max_bp - support.min_bp + 1);
-        return std::log(states) + best_insert + best_emission;
-    };
+    }
 
     std::map<StateKey, std::uint64_t> states;
     for (std::size_t h = 0; h < unique; ++h) {
         const std::string& haplotype = haplotypes.sequences[h];
-        exposure[h] = haplotype_exposure(haplotype.size(), library_insert);
         if (forms.empty()) continue;
 
         std::vector<std::vector<FormPlacement>> placements(forms.size());
-        collect_form_placements(haplotype, forms, indexes, options.mismatch_band, placements,
-                                counters);
+        collect_form_placements(haplotype, forms, indexes, band, placements, counters);
 
         for (std::size_t f = 0; f < fragments.size(); ++f) {
             const std::size_t first_length = fragments[f].first.bases.size();
             const std::size_t second_length = fragments[f].second.bases.size();
-            const InsertSupport& support = insert_by_fragment[f].support;
+            const InsertSupport& support = support_by_fragment[f];
             if (support.empty()) continue;
             states.clear();
 
@@ -612,35 +608,15 @@ FragmentScoringResult score_diplotypes(
                 // Exact log-multiplicity: every origin in this class has an identical mass term, so
                 // multiplying by the count is not an approximation of summing them, it IS the sum.
                 const double term =
-                    std::log(static_cast<double>(item.second)) +
-                    insert_by_fragment[f].log_probability(item.first.insert_bp) +
+                    std::log(static_cast<double>(item.second)) + kLogMateOrientationPrior +
+                    library_insert.log_probability(item.first.insert_bp) +
                     log_emission(forward_length, item.first.forward_mismatches,
-                                 library.substitution_error) +
+                                 library.substitution_error) - band_mass(forward_length) +
                     log_emission(reverse_length, item.first.reverse_mismatches,
-                                 library.substitution_error);
+                                 library.substitution_error) - band_mass(reverse_length);
                 total = log_add_exp(total, term);
             }
             mass[f * unique + h] = total;
-        }
-        for (std::size_t f = 0; f < fragments.size(); ++f) {
-            mass_upper[f * unique + h] =
-                log_add_exp(mass[f * unique + h], omitted_bound(haplotype.size(), f));
-        }
-    }
-
-    if (options.unplaceable_fragments_are_outliers) {
-        for (std::size_t f = 0; f < fragments.size(); ++f) {
-            bool placed_anywhere = false;
-            for (std::size_t h = 0; h < unique && !placed_anywhere; ++h) {
-                placed_anywhere = mass[f * unique + h] != kNegInf;
-            }
-            if (placed_anywhere) continue;
-            // Declared an outlier: its contribution is the outlier arm on every candidate, so its
-            // omitted tail is dropped rather than bounded. It contributes the same constant to every
-            // candidate either way, so this cannot change a ranking -- only whether one can be
-            // certified.
-            ++counters.fragments_declared_outlier;
-            for (std::size_t h = 0; h < unique; ++h) mass_upper[f * unique + h] = kNegInf;
         }
     }
 
@@ -651,29 +627,24 @@ FragmentScoringResult score_diplotypes(
         // A homozygote names the same haplotype twice and therefore counts two chromosome copies in
         // both terms, which is what the fragment contract requires.
         score.exposure_term = -library.fragment_start_intensity * (exposure[a] + exposure[b]);
+        score.absolute_term_sum = std::abs(score.exposure_term);
         double fragment_term = 0.0;
-        double fragment_term_upper = 0.0;
         for (std::size_t f = 0; f < fragments.size(); ++f) {
             const double combined =
                 log_add_exp(mass[f * unique + a], mass[f * unique + b]);
             if (combined != kNegInf) ++score.fragments_with_mass;
-            fragment_term +=
+            const double contribution =
                 log_fragment_contribution(combined, background_by_fragment[f], library);
-            // The contribution is monotone in the mass, so bounding every fragment's mass from
-            // above bounds the whole term from above.
-            fragment_term_upper += log_fragment_contribution(
-                log_add_exp(mass_upper[f * unique + a], mass_upper[f * unique + b]),
-                background_by_fragment[f], library);
+            fragment_term += contribution;
+            score.absolute_term_sum += std::abs(contribution);
         }
         score.fragment_term = fragment_term;
         score.log_likelihood = score.exposure_term + fragment_term;
-        score.log_likelihood_upper = score.exposure_term + fragment_term_upper;
     }
     result.log_mass = std::move(mass);
-    result.log_mass_upper = std::move(mass_upper);
+    result.exposure = std::move(exposure);
     return result;
 }
-
 
 CertifiedRanking certify_diplotype_ranking(
     const InternedHaplotypes& haplotypes,
@@ -686,134 +657,81 @@ CertifiedRanking certify_diplotype_ranking(
     if (!exact_prior.empty() && exact_prior.size() != candidates.size()) {
         throw std::invalid_argument("exact prior must be parallel to the candidate list");
     }
-    if (certification.band_step == 0) {
-        throw std::invalid_argument("certification band step must be positive");
-    }
-    if (certification.maximum_band < certification.initial_band) {
-        throw std::invalid_argument("certification maximum band must not be below the initial band");
-    }
     if (candidates.empty()) {
         throw std::invalid_argument("certification needs at least one candidate to rank");
     }
-    // Refuse a deepening schedule the reads cannot support BEFORE any candidate is scored. Finding
-    // this out mid-loop would leave a partial ranking behind, and a partial ranking presented as a
-    // result is exactly what the contract forbids.
-    for (const ReadPair& fragment : fragments) {
-        validate_read_pair(fragment);
-        const std::size_t shortest =
-            std::min(fragment.first.bases.size(), fragment.second.bases.size());
-        const std::size_t chunk = shortest / (certification.maximum_band + 1);
-        if (std::min<std::size_t>(31, chunk) < options.minimum_piece_bp) {
-            throw std::invalid_argument(
-                "the certification's maximum band would split a read into pieces too short to "
-                "index; lower maximum_band, lower minimum_piece_bp deliberately, or drop the short "
-                "reads before ranking");
+    if (!std::isfinite(certification.minimum_tie_tolerance_nats) ||
+        certification.minimum_tie_tolerance_nats < 0.0) {
+        throw std::invalid_argument("minimum tie tolerance must be finite and non-negative");
+    }
+    for (double prior : exact_prior) {
+        if (!std::isfinite(prior)) {
+            throw std::invalid_argument("an exact prior must be finite to rank its candidate");
         }
     }
+
+    const FragmentScoringResult scored =
+        score_diplotypes(haplotypes, candidates, fragments, library, options);
 
     CertifiedRanking result;
+    result.counters = scored.counters;
+    result.mismatch_band = options.mismatch_band;
     result.candidates.resize(candidates.size());
+    const double terms = static_cast<double>(fragments.size() + 16);
+    double log_weight = kNegInf;
     for (std::size_t c = 0; c < candidates.size(); ++c) {
-        result.candidates[c].candidate_id = c;
+        CertifiedCandidate& entry = result.candidates[c];
+        entry.candidate_id = c;
+        entry.prior = exact_prior.empty() ? 0.0 : exact_prior[c];
+        entry.fragment_term = scored.scores[c].fragment_term;
+        entry.exposure_term = scored.scores[c].exposure_term;
+        entry.score = scored.scores[c].log_likelihood + entry.prior;
+        entry.fragments_with_mass = scored.scores[c].fragments_with_mass;
+        entry.numeric_error_bound = terms * std::numeric_limits<double>::epsilon() *
+                                    (scored.scores[c].absolute_term_sum + std::abs(entry.prior));
+        entry.numeric_error_bound =
+            std::max(entry.numeric_error_bound, 0.5 * certification.minimum_tie_tolerance_nats);
+        log_weight = log_add_exp(log_weight, entry.score);
     }
-
-    // Undecided candidates: those whose interval still overlaps the best established lower bound.
-    std::vector<std::size_t> undecided(candidates.size());
-    for (std::size_t c = 0; c < candidates.size(); ++c) undecided[c] = c;
-
-    std::size_t band = certification.initial_band;
-    while (true) {
-        // Scan only the haplotypes the undecided candidates actually name. Deepening the band for a
-        // candidate already proven unable to win is exactly the tail work the design forbids.
-        std::map<std::size_t, std::size_t> slot_of;
-        InternedHaplotypes reduced;
-        std::vector<HaplotypeCandidate> reduced_candidates;
-        reduced_candidates.reserve(undecided.size());
-        for (const std::size_t c : undecided) {
-            for (const std::size_t h : {candidates[c].first, candidates[c].second}) {
-                if (slot_of.emplace(h, reduced.sequences.size()).second) {
-                    reduced.sequences.push_back(haplotypes.sequences[h]);
-                }
-            }
-            reduced_candidates.push_back({slot_of.at(candidates[c].first),
-                                          slot_of.at(candidates[c].second)});
-        }
-        reduced.index_of.resize(reduced.sequences.size());
-        for (std::size_t i = 0; i < reduced.index_of.size(); ++i) reduced.index_of[i] = i;
-        reduced.distinct_allele_paths = haplotypes.distinct_allele_paths;
-
-        FragmentScoringOptions banded = options;
-        banded.mismatch_band = band;
-        const FragmentScoringResult scored =
-            score_diplotypes(reduced, reduced_candidates, fragments, library, banded);
-
-        const FragmentScoringCounters& c = scored.counters;
-        result.counters.candidate_bases_scanned += c.candidate_bases_scanned;
-        result.counters.piece_hits += c.piece_hits;
-        result.counters.proposed_starts += c.proposed_starts;
-        result.counters.unique_starts += c.unique_starts;
-        result.counters.full_read_verifications += c.full_read_verifications;
-        result.counters.accepted_mate_placements += c.accepted_mate_placements;
-        result.counters.valid_fr_states += c.valid_fr_states;
-        result.counters.physical_origins += c.physical_origins;
-        result.counters.statistical_state_classes += c.statistical_state_classes;
-        result.counters.fragments_declared_outlier = c.fragments_declared_outlier;
-
-        for (std::size_t i = 0; i < undecided.size(); ++i) {
-            CertifiedCandidate& entry = result.candidates[undecided[i]];
-            // The prior is exact, so it shifts both bounds by the same amount and the interval keeps
-            // its width. Certifying on the sum is what makes the winner a winner under the declared
-            // model rather than under the fragment term alone.
-            const double prior =
-                exact_prior.empty() ? 0.0 : exact_prior[undecided[i]];
-            entry.score_lower = scored.scores[i].log_likelihood + prior;
-            entry.score_upper = scored.scores[i].log_likelihood_upper + prior;
-            entry.band_used = band;
-            entry.exact = scored.scores[i].is_exact();
-            entry.fragments_with_mass = scored.scores[i].fragments_with_mass;
-        }
-
-        double best_lower = -std::numeric_limits<double>::infinity();
-        for (const std::size_t id : undecided) {
-            best_lower = std::max(best_lower, result.candidates[id].score_lower);
-        }
-        std::vector<std::size_t> still;
-        for (const std::size_t id : undecided) {
-            // Discard only on proof: a candidate survives unless its best possible score is below
-            // a score some other candidate is already guaranteed to reach.
-            if (result.candidates[id].score_upper >= best_lower) still.push_back(id);
-        }
-        undecided.swap(still);
-
-        if (undecided.size() == 1) break;
-        if (band >= certification.maximum_band) break;
-        band = std::min(certification.maximum_band, band + certification.band_step);
-        result.counters.candidates_deepened += undecided.size();
+    result.candidate_set_log_weight = log_weight;
+    for (CertifiedCandidate& entry : result.candidates) {
+        entry.candidate_set_probability = std::exp(entry.score - log_weight);
     }
 
     std::sort(result.candidates.begin(), result.candidates.end(),
               [](const CertifiedCandidate& lhs, const CertifiedCandidate& rhs) {
-                  if (lhs.score_lower != rhs.score_lower) return lhs.score_lower > rhs.score_lower;
+                  if (lhs.score != rhs.score) return lhs.score > rhs.score;
                   return lhs.candidate_id < rhs.candidate_id;
               });
 
-    if (undecided.size() == 1) {
+    const CertifiedCandidate& best = result.candidates.front();
+    if (result.candidates.size() == 1) {
         result.status = RescoreStatus::Complete;
-        result.winner_set = undecided;
-        const double winner_lower = result.candidates.front().score_lower;
-        double best_rival_upper = -std::numeric_limits<double>::infinity();
-        for (const CertifiedCandidate& entry : result.candidates) {
-            if (entry.candidate_id == undecided.front()) continue;
-            best_rival_upper = std::max(best_rival_upper, entry.score_upper);
-        }
-        result.certified_gap = candidates.size() == 1
-            ? std::numeric_limits<double>::infinity()
-            : winner_lower - best_rival_upper;
+        result.winner_set = {best.candidate_id};
+        result.certified_gap = std::numeric_limits<double>::infinity();
+        result.score_gap_to_runner_up = std::numeric_limits<double>::infinity();
+        return result;
+    }
+
+    result.score_gap_to_runner_up = best.score - result.candidates[1].score;
+    const double best_lower = best.score - best.numeric_error_bound;
+    double certified_gap = std::numeric_limits<double>::infinity();
+    std::vector<std::size_t> inseparable = {best.candidate_id};
+    for (std::size_t i = 1; i < result.candidates.size(); ++i) {
+        const CertifiedCandidate& rival = result.candidates[i];
+        const double margin = best_lower - (rival.score + rival.numeric_error_bound);
+        certified_gap = std::min(certified_gap, margin);
+        if (margin <= 0.0) inseparable.push_back(rival.candidate_id);
+    }
+    if (inseparable.size() == 1) {
+        result.status = RescoreStatus::Complete;
+        result.winner_set = inseparable;
+        result.certified_gap = certified_gap;
     } else {
-        // No candidate's lower bound clears every rival's upper bound. Reporting the highest point
-        // estimate here would present an uncertified pick as a call.
+        // The best candidate cannot be separated from these by more than floating-point error. Taking
+        // the highest point estimate here would present an uncertified pick as a call.
         result.status = RescoreStatus::RescoreIncomplete;
-        result.winner_set = undecided;
+        result.winner_set = inseparable;
         result.certified_gap = 0.0;
     }
     return result;

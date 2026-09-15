@@ -191,10 +191,20 @@ void test_single_origin() {
     insert.log_probability_by_offset.assign(support.max_bp - support.min_bp + 1,
                                             std::log(1.0 / 15.0));
     const panvar::LibraryModel model = library();
+    // At band zero a perfect mate's truncated emission is (1-e)^8 / (1-e)^8 = 1, so the mass is the
+    // insert probability times the 1/2 orientation prior, and nothing else.
     require_close(
-        panvar::log_placement_mass(placements, fragment, insert, model),
-        std::log(1.0 / 15.0) + 16.0 * std::log(1.0 - model.substitution_error), 1e-12,
-        "single-origin mass is the insert probability times both perfect emissions");
+        panvar::log_placement_mass(placements, fragment, insert, model, 0),
+        std::log(1.0 / 15.0) + std::log(0.5), 1e-12,
+        "single-origin mass is the insert probability times the orientation prior");
+    // At band one the same origin keeps only the fraction of emission mass the band admits.
+    const double e = model.substitution_error;
+    require_close(
+        panvar::log_placement_mass(placements, fragment, insert, model, 1),
+        std::log(1.0 / 15.0) + std::log(0.5) +
+            2.0 * (8.0 * std::log(1.0 - e) - std::log(std::pow(1.0 - e, 8) + 8.0 * e * std::pow(1.0 - e, 7))),
+        1e-12,
+        "a wider band renormalises each mate by the binomial mass it admits");
 }
 
 // The other library orientation must be populated, not quietly skipped. The physical template spans
@@ -255,8 +265,8 @@ void test_repeat_multiplicity() {
     insert.log_probability_by_offset.assign(support.max_bp - support.min_bp + 1,
                                             std::log(1.0 / 9.0));
     const panvar::LibraryModel model = library();
-    const double both = panvar::log_placement_mass(placements, fragment, insert, model);
-    const double one = panvar::log_placement_mass({placements[0]}, fragment, insert, model);
+    const double both = panvar::log_placement_mass(placements, fragment, insert, model, 0);
+    const double one = panvar::log_placement_mass({placements[0]}, fragment, insert, model, 0);
     require_close(both, one + std::log(2.0), 1e-12,
                   "two origins with equal statistics must contribute exactly twice the mass: "
                   "collapsing them to one would discard real evidence");
@@ -282,8 +292,8 @@ void test_band_is_model() {
     insert.support = support;
     insert.log_probability_by_offset.assign(15, std::log(1.0 / 15.0));
     const panvar::LibraryModel model = library();
-    const double narrow = panvar::log_placement_mass({}, fragment, insert, model);
-    const double wide = panvar::log_placement_mass(banded, fragment, insert, model);
+    const double narrow = panvar::log_placement_mass({}, fragment, insert, model, 0);
+    const double wide = panvar::log_placement_mass(banded, fragment, insert, model, 1);
     require(narrow == kNegInf && std::isfinite(wide),
             "the band changes the mass, so it is part of the model and not an optimisation");
 }
@@ -300,7 +310,7 @@ void test_homozygote_counts_two_copies() {
 
     const auto placements =
         panvar::enumerate_placements_exhaustive(haplotype, fragment, support, 0);
-    const double one_copy = panvar::log_placement_mass(placements, fragment, insert, model);
+    const double one_copy = panvar::log_placement_mass(placements, fragment, insert, model, 0);
     const double two_copies = panvar::log_add_exp(one_copy, one_copy);
     require_close(two_copies, one_copy + std::log(2.0), 1e-12,
                   "a homozygote's mass is twice one chromosome copy's");
@@ -325,9 +335,9 @@ void test_order_and_uniqueness() {
     const panvar::LibraryModel model = library();
 
     auto placements = panvar::enumerate_placements_exhaustive(haplotype, fragment, support, 0);
-    const double forward = panvar::log_placement_mass(placements, fragment, insert, model);
+    const double forward = panvar::log_placement_mass(placements, fragment, insert, model, 0);
     std::reverse(placements.begin(), placements.end());
-    require_close(panvar::log_placement_mass(placements, fragment, insert, model), forward, 1e-12,
+    require_close(panvar::log_placement_mass(placements, fragment, insert, model, 0), forward, 1e-12,
                   "placement order must not change the summed mass");
 
     std::set<std::tuple<std::size_t, std::size_t, int>> distinct;
@@ -337,6 +347,91 @@ void test_order_and_uniqueness() {
     }
     require(distinct.size() == placements.size(),
             "each physical origin must appear exactly once in the enumeration");
+}
+
+
+// The truncated emission is a distribution: summed over every mate sequence of length L it is one,
+// at any band. C(L,m) 3^m sequences carry exactly m mismatches against a fixed reference.
+void test_truncated_emission_normalises() {
+    for (double e : {0.001, 0.02, 0.2}) {
+        for (std::size_t length : {1, 5, 12}) {
+            for (std::size_t band = 0; band <= length + 1; ++band) {
+                double total = 0.0;
+                for (std::size_t m = 0; m <= std::min(band, length); ++m) {
+                    const double sequences = std::exp(std::lgamma(length + 1.0) -
+                                                      std::lgamma(m + 1.0) -
+                                                      std::lgamma(length - m + 1.0)) *
+                                             std::pow(3.0, static_cast<double>(m));
+                    total += sequences *
+                             std::exp(panvar::log_truncated_emission(length, m, e, band));
+                }
+                require_close(total, 1.0, 1e-9,
+                              "the truncated emission must sum to one over every mate sequence");
+            }
+            require(panvar::log_truncated_emission(length, 2, e, 1) == kNegInf,
+                    "a mate beyond the band has zero emission under the truncated model");
+        }
+    }
+}
+
+// The normalisation gate. Summing the signal mass over EVERY possible observation with fixed read
+// lengths must reproduce the exposure exactly: the -lambda*E term and the fragment density describe
+// the same generated process only if this holds. Checked at a band that truncates and at one that
+// does not. Each orientation arm must carry exactly half, which is what proves the 1/2 prior is where
+// it belongs rather than compensated somewhere else.
+void test_signal_density_integrates_to_exposure() {
+    const std::string haplotype = "ACGTTGCAAGTCCA";   // L = 14
+    panvar::LibraryModel model;
+    model.insert_mean_bp = 8.0;
+    model.insert_sd_bp = 2.0;
+    model.support_sigmas = 2.0;          // support [4, 12]
+    model.substitution_error = 0.1;
+    model.outlier_weight = 0.001;
+    model.fragment_start_intensity = 0.05;
+    model.provenance = "fixture: declared";
+    const panvar::DiscreteInsertDistribution insert = panvar::build_library_insert_distribution(model);
+    require(insert.support.min_bp == 4 && insert.support.max_bp == 12,
+            "fixture: the library support must be [4,12]");
+
+    const std::size_t mate = 3;
+    const double exposure = panvar::haplotype_exposure(haplotype.size(), insert, mate);
+    require(exposure > 0.0, "fixture: exposure must be positive, or the identity is vacuous");
+
+    for (std::size_t band : {1, 3}) {
+        double total = 0.0;
+        double first_forward = 0.0;
+        std::size_t observations = 0;
+        for (std::size_t code1 = 0; code1 < 64; ++code1) {
+            for (std::size_t code2 = 0; code2 < 64; ++code2) {
+                std::string r1(mate, 'A');
+                std::string r2(mate, 'A');
+                for (std::size_t i = 0; i < mate; ++i) {
+                    r1[i] = "ACGT"[(code1 >> (2 * i)) & 3];
+                    r2[i] = "ACGT"[(code2 >> (2 * i)) & 3];
+                }
+                const panvar::ReadPair fragment{read("o/1", r1), read("o/2", r2)};
+                const panvar::InsertSupport support = panvar::fragment_insert_support(fragment, model);
+                const auto placements =
+                    panvar::enumerate_placements_exhaustive(haplotype, fragment, support, band);
+                const double mass = panvar::log_placement_mass(placements, fragment, insert, model, band);
+                if (mass != kNegInf) total += std::exp(mass);
+                std::vector<panvar::FragmentPlacement> arm;
+                for (const auto& p : placements) {
+                    if (p.orientation == panvar::MateOrientation::FirstForward) arm.push_back(p);
+                }
+                const double arm_mass = panvar::log_placement_mass(arm, fragment, insert, model, band);
+                if (arm_mass != kNegInf) first_forward += std::exp(arm_mass);
+                ++observations;
+            }
+        }
+        require(observations == 4096, "the gate must sum over every possible observation");
+        require_close(total, exposure, 1e-9,
+                      "the signal density summed over every observation must equal the exposure");
+        require_close(first_forward, 0.5 * exposure, 1e-9,
+                      "each library orientation must carry exactly half of the exposure");
+        std::cout << "  normalisation at band " << band << ": integrated mass " << total
+                  << " = exposure " << exposure << '\n';
+    }
 }
 
 } // namespace
@@ -353,6 +448,8 @@ int main() {
         test_band_is_model();
         test_homozygote_counts_two_copies();
         test_order_and_uniqueness();
+        test_truncated_emission_normalises();
+        test_signal_density_integrates_to_exposure();
         std::cout << "genotype fragment oracle: PASS\n";
         return 0;
     } catch (const std::exception& error) {
