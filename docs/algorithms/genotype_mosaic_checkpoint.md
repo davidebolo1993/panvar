@@ -4,6 +4,121 @@ Companion to `genotype_mosaic.md`, which remains the authoritative contract. Thi
 what is actually built, what its own gates still owe, and the work order to reach the Phase 8
 go/no-go.
 
+## R7. Review round 7 — conditional mosaic calls, K = 0, and the corrected LZO cohort
+
+The reviewer accepted round 6. The protected panel baseline repairs the LZO failure structurally: every panel
+truth is evaluated whatever the beam retains, and the beam only adds recombinant hypotheses.
+
+The reviewer's rulings, as applied:
+
+| Ruling | Applied |
+|---|---|
+| Generated test artifacts out of the source tree | The two untracked `tests/genotype_depth_anchors_*.inc.model.sorted.gfa` files came from `genotype_probe anchors`, not from ctest: the probe staged its rebuilt model graph next to its output, which for the fixtures was `tests/`. It now stages in the system temporary directory. `tests/genotype_source_tree_clean.sh` runs after the genotype tests and fails on any untracked genotype-named generated file (`.gfa`, `.tsv`, `.fa`, `.fq`, `.log`, `.time`) in the source directories. It passes on the real tree and fails on a planted stray graph. |
+| 1. Fewer than K off-panel mosaics | The run calls: `status COMPLETE`, `panel_baseline_complete true`, `mosaic_target_reached false`, `candidate_scope CONDITIONAL`. Refusals remain for a panel baseline over its budget, incomplete scoring, a failed depth fit and partial outputs. An unreachable audit gives `MOSAIC_TARGET_UNREACHED`, phase UNRESOLVED, and still emits the genotypes. |
+| 1. Rename K | `--max-mosaic-candidates`; status keys `max_mosaic_candidates`, `mosaic_candidates`, `mosaic_candidates_found`, `mosaic_target_reached`. The old flag is refused with a pointer to the new name. The contract is updated. |
+| 2. Distinct-prefix beam | Deferred until after the corrected LZO cohort, as ruled; nothing changed. |
+| 3. Marker-score tempering | Not done, as ruled. |
+| 4. Refreeze grid | Ladder: state limits 256 / 1,024 / 4,096, K ∈ {0, 8, 16, 32, 64, 128, 256}, K = 256 audit. Two arms selected: panel (K = 0) and the smallest stable positive K. |
+| 5. LOWCONF | Unset. The corrected cohort reports the conditional posterior, conditional GQ, candidate scope, numerical separation, and block accuracy stratified by GQ. |
+
+Commits:
+
+- `35c396b`: conditional calls, K rename, K = 0, source-tree gate;
+- `0cb15b0`: ladder and cohort drivers, two-arm selection, contract;
+- `4b4ca7e`: an audit set as large as the largest primary set is allowed.
+
+### R7.1 Gates (steps 1–4)
+
+All 17 enabled tests pass at `4b4ca7e`: the 16 genotype and pipeline tests plus the source-tree gate.
+
+| Reviewer's gate | Result |
+|---|---|
+| Complete panel, unreachable K → conditional call | The phaseable fixture at 64 merged states (K = 16) and the starved search (state limit 1) both call COMPLETE, with a complete panel, `mosaic_target_reached false`, CONDITIONAL scope and emitted genotypes. |
+| Incomplete panel baseline → refusal | With `max_panel_pair_fragment_evaluations = 1` the run is CANDIDATE_INCOMPLETE, reports `panel_baseline_complete false`, and neither ranks nor calls. |
+| Unreachable audit → genotype emitted, phase unresolved | At 64 merged states, K = 1 with a 64-mosaic audit: `MOSAIC_TARGET_UNREACHED`, phase UNRESOLVED, genotypes emitted. |
+| K = 0 → panel-only result | Every manifest row is a panel pair, `mosaic_candidates 0`, a call is made, and scope is CONDITIONAL exactly when the beam found mosaics it omits. |
+| K-prefix extraction still matches standalone | K = 0, 2, 4, 16 and 64 at 64 merged states and exhaustively: all ten prefixes call, and each equals its standalone run. |
+
+**Two defects found and fixed before the ladder, not after.**
+
+1. **Deficient prefixes were missing from the scoring pass.** Ranking a mosaic-deficient prefix first failed
+   with a missing key: the shared scoring pass still included only prefixes that had reached their target.
+   Every ranked set now contributes its mosaics.
+2. **Sol's grid was refused.** The ladder's K = 256 audit beside a K = 256 prefix was refused, because the
+   audit had to be strictly larger than every primary set. The first ladder launch was stopped while its
+   worktree was still building, before any genotype run, and its worktree and output directory were
+   removed. The check now refuses only an audit smaller than the largest primary set.
+
+### R7.2 The development ladder (step 5)
+
+**Setup.**
+
+- `tests/genotype_ladder_c4.sh`, from a clean worktree at `4b4ca7e` (clean after build and after all 17 tests).
+- The eight development donors.
+- State limits 256, 1,024 and 4,096; K ∈ {0, 8, 16, 32, 64, 128, 256}, all ranked from one proposal and one
+  scoring pass per limit; a K = 256 phase audit.
+- 168 prefix runs. Output under `tests/results/genotype_ladder_c4_r6_4b4ca7e/`.
+
+**Result.**
+
+- Every run is eligible: COMPLETE, depth fit converged, panel baseline complete.
+- Every run is exact at all 11 blocks.
+- No donor's 1,024 and 4,096 limits disagree, so no extension to 8,192 is needed.
+
+`scripts/select_genotype_ladder.py` gives:
+
+| Arm | Setting | Criterion |
+|---|---|---|
+| Mosaic | state limit 256, K = 8 | smallest positive K stable above it for all eight donors, and K reached for every donor |
+| Panel | state limit 256, K = 0 | same call as the reference (4,096, K = 256) for 8 of 8 donors |
+
+**Per state limit** (K = 0 and K = 8; every call exact):
+
+| | 256 | 1,024 | 4,096 |
+|---|---|---|---|
+| Off-panel mosaics found | 137–255 | 592–1,023 | 2,951–4,095 |
+| K = 256 audit | **MOSAIC_TARGET_UNREACHED** for all 8 | COMPLETE for all 8 | COMPLETE for all 8 |
+| K = 0 phase: within → reported | READS_WITHIN_CANDIDATES → **UNRESOLVED** (8/8) | READS_WITHIN_CANDIDATES → PRIOR_ONLY (8/8) | same as 1,024 |
+| K = 8 phase reported | PRIOR_ONLY 7, UNRESOLVED 1 (HG04036) | PRIOR_ONLY 8 | PRIOR_ONLY 8 |
+| Mean / maximum wall per ladder run | 61 / 80 s | 72 / 82 s | 78 / 87 s |
+| Maximum peak RSS | 624 MB | 617 MB | 632 MB |
+
+A ladder run is one proposal, one scoring pass, the audit and seven ranked prefixes.
+
+Three findings bear on the freeze.
+
+1. **At state limit 256 a K = 256 audit is effectively unreachable.** The beam keeps at most 256 states, so it
+   returns at most 256 diplotypes. The audit is reachable only if every retained final state is a distinct
+   off-panel diplotype; this run found 137–255. Every read-supported phase claim at the selected setting is
+   therefore UNRESOLVED.
+   The genotypes are unaffected, as ruled.
+2. **No read-supported phase survives the audit at K = 0.** Once the audit set ranks at 1,024 or 4,096, all
+   eight panel-only claims (READS_WITHIN_CANDIDATES) become PRIOR_ONLY. At K = 8, seven donors are already
+   PRIOR_ONLY within candidates. HG04036 alone keeps a read-supported claim, which its audit then withdraws.
+   Off-panel phase-swapped mosaics are fragment contenders for phase at these C4 donors.
+3. **Conditional GQ depends strongly on K.** The lowest block GQ at K = 0 is 19,956–47,120 for five donors
+   (HG02818, HG03371, HG04036, NA19036, NA20509) but 117–159 at K = 8. HG00733 is about 67 at both. Adding eight
+   mosaics adds candidates with another genotype at some block and real set mass. Conditional GQ is only
+   meaningful relative to its candidate set.
+
+### R7.3 Stopped before the freeze: questions for the reviewer
+
+The committed rule selects state limit 256. Freezing it would make the declared phase audit unreachable for
+every held-out donor, so no read-supported phase claim could be reported in the corrected cohort. That
+consequence of the rule was not foreseen when the audit was declared, so it is put to the reviewer rather
+than resolved by choosing a different setting after seeing the ladder.
+
+1. **Freeze state limit 256 as selected,** accepting UNRESOLVED phase wherever reads would have supported
+   it? Or **require audit reachability for the frozen state limit,** which selects 1,024 (every audit
+   completes, winners and calls identical, about 11 s more per run)?
+2. **Audit size.** Alternatively, keep 256 and declare the audit size at most the number of off-panel mosaics a
+   256-state beam can return (for example K = 128)? This would be a declaration made after seeing the ladder.
+3. **GQ reporting.** Given the K = 0 versus K = 8 contrast, should the corrected cohort's GQ-stratified
+   accuracy be reported per arm only, never pooled across arms, with the caveat that conditional GQ scales
+   with the candidate set?
+
+No settings file has been frozen, and the corrected cohort has not been run.
+
 ## R6. Review round 6 — protected panel baseline, depth, phase and confidence
 
 The reviewer ruled on round 5:
