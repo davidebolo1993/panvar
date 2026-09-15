@@ -4,6 +4,193 @@ Companion to `genotype_mosaic.md`, which remains the authoritative contract. Thi
 what is actually built, what its own gates still owe, and the work order to reach the Phase 8
 go/no-go.
 
+## R4. Review round 4 — diagnostic response
+
+The reviewer made six rulings and set eight bounded diagnostic steps, closing with "Stop and report after
+these checks. Do not implement an indel-aware scorer yet." All eight steps have been run. No likelihood,
+emission or ranking code has changed. Commits:
+
+- `a87ce76`: donor manifest;
+- `2d5673d`: depth fit, plus `candidate_scope` and `global_certified`;
+- `8cf4164`: diagnostic recording and `genotype_probe compare`.
+
+At `8cf4164` all 16 enabled tests pass. No pilot or cohort run has been made.
+
+**Every R3.3 ladder run predates the depth fix.** Their status files record `marker_depth_converged false`
+after 200 iterations at rate 10.1043. The R3.3 LZO and LOO tables therefore have to be rerun before K or the
+state limit is chosen (R4.6). The `compare` diagnostic in R4.3 is not affected: it scores fixed diplotypes
+with the simulation's declared library intensity and does not use the marker fit or the proposal.
+
+Provenance: the probe runs were built from a working tree whose only uncommitted changes are unrelated
+inspect/cosigt files; no genotype source was modified. Final development runs will be built in a clean,
+isolated worktree at a named commit.
+
+### R4.1 Rulings
+
+| Ruling | Applied |
+|---|---|
+| 1. Diagnose the 2,871-nat LOO difference first | R4.3–R4.4 |
+| 2. True edlib distance stays primary: per-block unordered diploid distance, availability floor and excess, SV and context blocks separately, no-call rate, and phase metrics only under READS | The probe already reports all of these per donor except the no-call rate, which is a cross-donor aggregate for the pilot summariser. Its definition is question 3 in R4.7 |
+| 3. Do not select K = 64 | Not selected |
+| 4. A pruned search that completes is candidate-conditional, not rejected | `2d5673d`: `status COMPLETE`, `candidate_scope CONDITIONAL`, `global_certified false`. The certified gap is certified within the retained set; it is global only when the search was exhaustive, nothing was truncated and the ranking completed |
+| 5. Resolve marker-depth non-convergence before choosing K or the state limit | R4.2 |
+| 6. Eight development donors: the four archive-frozen ones plus four chosen by salted hash, manifest committed first | `a87ce76`, `tests/genotype_development_donors.tsv`. Pool: the 64 samples with both haplotypes in the C4 graph. The hash adds HG02666, HG03371, HG04036 and NA20509, which have not been simulated, run or examined. The other 56 are held out |
+
+### R4.2 Marker-depth fit (step 1)
+
+**Reproduced.** On the NA19240 reads the constrained maximum lies on the face background = floor:
+
+- rate 9.769876;
+- background gradient −5.44, so KKT holds.
+
+Projected joint Newton steps kept clamping the background without making the rate stationary. They stopped
+at the 200-iteration cap:
+
+- rate 10.104, which is 3.4% high;
+- relative rate gradient −3.3%;
+- log-likelihood 284.8 nats below the optimum.
+
+The caller used that estimate anyway.
+
+**Fixed** with active-set Newton. When the background sits on its floor and still wants to fall, the rate is
+maximised on that face and KKT is checked there.
+
+- On the NA19240 reads it converges in 2 iterations to the boundary optimum.
+- The estimate records its termination reason, both gradients and the log-likelihood, and the status file
+  reports them. Termination reasons: `interior_stationary`, `boundary_kkt`, `closed_form`,
+  `declared_background_root`, `no_ascent`, `iteration_cap`.
+- A fit that does not converge now ends the run `CANDIDATE_INCOMPLETE`.
+
+**Gates.** A deterministic negative-intercept fixture must stop on the boundary by KKT with a stationary
+rate. A real-C4 gate uses the actual anchor multiplicities of the C4 panel:
+
+| Regime (counts drawn on C4 anchors) | Rate | Background | Termination | Iterations |
+|---|---|---|---|---|
+| Interior: Poisson(1.5 + 9.32·2m) | 9.19987 | 1.73563 | interior_stationary | 3 |
+| No background: Poisson(9.77·2m) | 9.69415 | 0.13901 | interior_stationary | 3 |
+| Exact negative intercept: 22m − 4 | 9.02185 | 1e-09 (floor) | boundary_kkt | 2 |
+
+**Reconciliation.** Rounds 1 and 2 said the fit "converged in three iterations". That was measured on the
+HG00096/HG00268 simulation, whose optimum is interior (background 1.48). It was generalised without checking
+NA19240, which never converged. The claim is retracted.
+
+### R4.3 The 2,871-nat difference (steps 2–8)
+
+NA19240 LOO, `ctx:10`:
+
+- **A** is the K = 64 winner `6529c792`, with allele 8 on haplotype 1.
+- **B** is the K = 256 winner `9ed92c5a`, with allele 11 on haplotype 1.
+- Haplotype 2 is identical in A, B and the truth (252,695 bp), and it is the only other haplotype in both
+  candidates. Below it is "the shared homologue".
+
+| Check | Result |
+|---|---|
+| 2. A and B scored alone and together | `candidate_set_independent true` |
+| Fragment terms | A −396,285.630, B −393,414.467; gap B − A = **2,871.16306226** |
+| Exposure terms | A −35,877.837, B −35,877.612 |
+| 3. Per-fragment deltas summed | 2,871.16306226; residual −1.36e-11 against a tolerance of 6.25e-6 |
+| Fragments favouring B / A | 74 / 167 (all others identical) |
+| 4. Signal under B only | 14 fragments, **+3,815.5 nats (133% of the gap)** |
+| Signal under A only | 3 fragments, −817.5 nats |
+| Smallest set explaining 90% | 10 fragments, 2,742.7 nats; all have signal under B only, each worth 268–276 nats |
+| 6. Accelerated against index-free origins, dominant 10 | 10 origins; 0 identity mismatches, 0 mass mismatches |
+| 7. Calibration, reads simulated from A | 35,882 fragments; prefers A by 3,098.3 nats |
+| Calibration, reads simulated from B | 36,133 fragments; prefers B by 9,879.5 nats |
+| 8. Band 3 / 4 / 5 / 6 / 7 (diagnostic only) | gap 2,856.1 / 3,103.0 / 3,103.0 / 2,871.2 / 2,871.2; the sign never changes |
+
+**Step 7 passes in both directions.** By the reviewer's rule, this is not a scorer defect; it is
+substitution-model misspecification.
+
+**Step 5, edlib traceback.** Coordinates are block-relative, in the truth frame. Allele lengths: truth
+63,448 bp, allele 8 63,450 bp, allele 11 63,447 bp. Edit distances: truth–8 is 2, truth–11 is 16, 8–11 is 16.
+
+| Truth position | Truth → allele 8 | Truth → allele 11 | Local sequence |
+|---|---|---|---|
+| 6,834 / 6,854 / 6,856 | — | I4, I1, I3 | (AAAG)n repeat, 8 bp |
+| 17,808 / 17,810 | — | D1, D3 | (AAAG)n repeat, 4 bp |
+| 24,150 | — | X | substitution |
+| 33,792 | D1 | D1 | same event in both alleles |
+| 39,637 | — | D1 | end of a 25 bp poly-A, then CAGTCATTCTCC |
+| 40,769 | D1 | — | end of a 25 bp poly-A, then TCTCTGCAAAAC |
+| 45,808 | — | D1 | 11 bp poly-G |
+
+In edlib's convention here, D1 means the allele carries one base the truth lacks. Both alleles carry the
+same event at 33,792. Beyond it, allele 8 differs from the truth by one extra A in a poly-A at 40,769. Allele
+11 differs by repeat-unit indels, one substitution and two homopolymer indels. The net length difference
+says nothing about this structure.
+
+**Dominant fragments.** All ten place on allele 11's haplotype with one mismatch, footprints between 40,401
+and 40,999 in allele 11's frame, each straddling the poly-A site. None of them places on allele 8's
+haplotype or on the shared homologue.
+
+### R4.4 Why the substitution model prefers allele 11
+
+For each site where the two alleles differ, the table follows the truth-haplotype-1 fragments that span the
+site on the allele that matches the truth. It then asks where those fragments are placed in the other
+candidate. The window columns search for the truth-haplotype-1 bytes within ±30 bp of the site.
+
+| Site (truth frame) | Allele that differs | Spanning | Still placed on the differing allele | Only on shared homologue | No signal | Truth window in allele 8 hap / allele 11 hap / shared homologue |
+|---|---|---|---|---|---|---|
+| 6,834 (AAAG)n | 11 | 14 | 12 | 0 | 2 | 1 / 0 / 0 |
+| 17,808 (AAAG)n | 11 | 22 | 22 | 0 | 0 | 1 / 1 / 1 * |
+| 24,150 substitution | 11 | 28 | 28 | 0 | 0 | 1 / 0 / 1 |
+| 39,637 poly-A | 11 | 16 | 6 | 9 | 1 | 1 / 0 / 1 |
+| **40,769 poly-A** | **8** | **22** | **8** | **0** | **14** | **0 / 1 / 0** |
+| 45,808 poly-G | 11 | 27 | 5 | 22 | 0 | 1 / 0 / 1 |
+
+\* A repeat-unit indel can be placed anywhere in the repeat. This ±30 bp window happens to fall where every
+haplotype spells the same bytes.
+
+- **Where allele 11 differs, reads survive.** Only 3 of 107 spanning fragments lose all signal. Hamming
+  placement tolerates the (AAAG)n shifts and the substitution within the band. At 24,150, 39,637 and 45,808
+  the shared homologue also spells the truth bytes and absorbs the reads that the differing allele cannot
+  hold (9 of 16, and 22 of 27).
+- **Where allele 8 differs, reads are lost.** 14 of 22 spanning fragments lose all signal. The shared
+  homologue does not carry the truth bytes at 40,769, so nothing absorbs them. They fall to the background
+  arm at about 270 nats each; 14 × 270 ≈ 3,800 matches the 3,815.5 nats measured.
+- **The contrast between the two poly-A sites is the homologue, not homopolymer mechanics.** Both are 1-bp
+  slips at the end of a 25 bp poly-A, yet they lose 1 of 16 and 14 of 22 reads. At 39,637 the donor's other
+  haplotype spells the local truth; at 40,769 it does not.
+- **Not measured:** why 8 of the 22 fragments at 40,769 keep a placement on allele 8. Presumably the site
+  falls close enough to a read end for the shifted tail to stay within the band.
+
+**Conclusion.** The substitution-only likelihood counts fragments lost to background; edlib counts bases.
+Allele 11 is 16 bases from the truth, but its differences are either Hamming-tolerable or covered by the
+homologue. Allele 8 is 2 bases away, but its one uncovered indel costs 14 fragments. The two rankings
+therefore disagree. The effect is specific to LOO, where the truth allele is absent and the nearest
+available alleles differ from it by indels. In LZO the truth allele is present and places every read.
+
+### R4.5 Corrections to round 3
+
+- R3.3 said an indel-versus-substitution explanation "is contradicted by the lengths". This was wrong:
+  net allele length does not constrain where indels lie. It is retracted; R4.3 shows the structure.
+- The "three iterations" convergence claim is retracted (R4.2).
+- The R3.3 ladder was run with a non-converged depth fit and must be rerun before it informs K (above).
+
+### R4.6 Proposed next steps, pending review
+
+1. From a clean isolated worktree at the reviewed commit, rerun NA19240 LZO and LOO with the fixed fit.
+   Confirm `marker_depth_termination boundary_kkt` and record whether the proposal or the winner changes.
+2. Run the two-dimensional ladder on the eight development donors, LZO and LOO. For each state limit, run
+   the largest K once and evaluate its prefixes. Report the ruled metric set, with `candidate_scope` and
+   `global_certified`.
+3. Choose K and the state limit only if LZO is stable across settings on the development donors; LOO stays
+   provisional. Then run the LZO cohort on the 56 held-out donors.
+
+No indel-aware emission is planned unless the reviewer rules otherwise.
+
+### R4.7 Questions for the reviewer
+
+1. **Misspecification.** Does R4.3–R4.4 settle step 7 as substitution-model misspecification, so the LZO
+   ladder can proceed with LOO reported but provisional? Or should anything else be checked first?
+2. **An LOO flag.** Should the probe report, per LOO donor, whether an availability-floor diplotype was in
+   the candidate set, and its fragment-term gap to the winner? That is evaluation-only, since it uses the
+   truth, and it would expose this failure wherever it recurs.
+3. **No-call rate.** Is a no-call a run whose status is not `COMPLETE`, a block whose `genotype_support` is
+   not read-supported, or both reported separately?
+4. **Ladder grid.** Proposed state limits: 256, 1,024 and 4,096 merged states, with K prefixes 8–256 from a
+   single K = 256 run at each limit. Acceptable, or should the grid differ?
+
 ## R3. Review round 3 — response
 
 The reviewer accepted the round-2 scorer and single-donor measurements, then identified one proposal
