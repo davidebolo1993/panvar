@@ -24,6 +24,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 
@@ -97,7 +98,7 @@ std::vector<ReadPair> read_fragments(const std::string& first_path, const std::s
 
 // Declared library parameters, one `key value` per line. Estimation from the data is not
 // implemented in version one, so the declaration is required and its provenance is recorded.
-LibraryModel read_library(const std::string& path) {
+LibraryModel read_library(const std::string& path, std::optional<double>& marker_background) {
     std::ifstream input(path);
     if (!input) throw std::runtime_error("cannot open library model file: " + path);
     LibraryModel model;
@@ -128,6 +129,10 @@ LibraryModel read_library(const std::string& path) {
     model.fragment_start_intensity = take("fragment_start_intensity");
     model.provenance = "declared: " + path;
     validate_library_model(model);
+    // Optional. When absent the marker background is estimated jointly with the per-copy rate from
+    // the invariant anchors, which is possible whenever those anchors carry two distinct copy numbers.
+    const auto background = values.find("marker_background");
+    if (background != values.end()) marker_background = background->second;
     return model;
 }
 
@@ -166,7 +171,8 @@ void write_status(
     const MosaicBeamResult* beam,
     const CertifiedRanking* ranking,
     const std::string& note,
-    const RankingSummary* summary = nullptr) {
+    const RankingSummary* summary = nullptr,
+    const MarkerDepthEstimate* depth = nullptr) {
     std::ofstream out = open_output(path);
     out << "key\tvalue\n";
     out << "status\t" << genotype_run_status_name(status) << '\n';
@@ -209,6 +215,19 @@ void write_status(
         out << "alleles_total\t" << panel->total_alleles << '\n';
         out << "every_allele_scored\t"
             << (panel->scored_alleles == panel->total_alleles ? "true" : "false") << '\n';
+    }
+    if (depth != nullptr) {
+        out << "marker_depth_rate_per_copy\t" << depth->rate_per_copy << '\n';
+        out << "marker_background\t" << depth->background << '\n';
+        out << "marker_background_estimated\t" << (depth->background_estimated ? "true" : "false")
+            << '\n';
+        out << "marker_depth_converged\t" << (depth->converged ? "true" : "false") << '\n';
+        out << "marker_background_at_floor\t" << (depth->background_at_floor ? "true" : "false")
+            << '\n';
+        out << "marker_depth_iterations\t" << depth->iterations << '\n';
+        out << "marker_depth_anchors_used\t" << depth->anchors_used << '\n';
+        out << "marker_depth_distinct_multiplicities\t" << depth->distinct_multiplicities << '\n';
+        out << "marker_depth_provenance\t" << depth->provenance << '\n';
     }
     if (beam != nullptr) {
         out << "beam_width_used\t" << beam->beam_width_used << '\n';
@@ -282,7 +301,8 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             "genotype requires --gfa, --reads1, --reads2, --reference-path and --library");
     }
 
-    const LibraryModel library = read_library(options.library_path);
+    std::optional<double> declared_marker_background;
+    const LibraryModel library = read_library(options.library_path, declared_marker_background);
 
     // ---- stage 1: structural model -------------------------------------------------------------
     Clock::time_point mark = Clock::now();
@@ -342,15 +362,25 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     MarkerModelParameters marker_parameters;
     marker_parameters.kmer_size = options.kmer_size;
     marker_parameters.syncmer_s = options.syncmer_s;
-    // Expected marker observations per haplotype copy, from the reads actually seen rather than a
-    // declared depth: matched occurrences spread over the marker universe, halved for two copies.
-    marker_parameters.expected_observations_per_copy =
-        panel.codes.empty()
-            ? 1.0
-            : std::max(1e-6, static_cast<double>(observations.matched_occurrences) /
-                                 (2.0 * static_cast<double>(panel.codes.size())));
-    marker_parameters.background_observations = 0.5;
-    marker_parameters.provenance = "estimated from matched marker occurrences";
+    // Per-copy depth from the invariant anchors, whose diploid copy number is known whatever the
+    // sample's genotype. Variable markers cannot be used: their expected count depends on the very
+    // genotype being inferred.
+    MarkerDepthEstimate depth;
+    try {
+        depth = estimate_marker_depth(panel, observations, declared_marker_background);
+    } catch (const std::invalid_argument& error) {
+        timings.markers = seconds_since(mark);
+        timings.total = seconds_since(started);
+        write_status(status_path, GenotypeRunStatus::CandidateIncomplete, fingerprint, options,
+                     library, timings, &built.report, &panel, nullptr, nullptr,
+                     std::string("marker depth could not be estimated: ") + error.what());
+        return GenotypeRunStatus::CandidateIncomplete;
+    }
+    marker_parameters.expected_observations_per_copy = depth.rate_per_copy;
+    // The proposal emission needs a strictly positive background. A fitted or declared zero is held at
+    // a floor far below one observation, which leaves every marker's expectation unchanged in practice.
+    marker_parameters.background_observations = std::max(depth.background, 1e-6);
+    marker_parameters.provenance = depth.provenance;
     const PreparedProposalEmissions emissions =
         build_proposal_emissions(panel, observations, marker_parameters);
     timings.markers = seconds_since(mark);
@@ -370,7 +400,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         timings.total = seconds_since(started);
         write_status(status_path, GenotypeRunStatus::CandidateIncomplete, fingerprint, options,
                      library, timings, &built.report, &panel, &beam, nullptr,
-                     "the proposal produced no mosaic candidate");
+                     "the proposal produced no mosaic candidate", nullptr, &depth);
         return GenotypeRunStatus::CandidateIncomplete;
     }
 
@@ -548,7 +578,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                      library, timings, &built.report, &panel, &beam, &ranking,
                      "the best candidate cannot be separated from every rival by more than "
                      "floating-point error; the equivalence set is reported instead of a call",
-                     &summary);
+                     &summary, &depth);
         return GenotypeRunStatus::RescoreIncomplete;
     }
 
@@ -596,7 +626,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
 
     timings.total = seconds_since(started);
     write_status(status_path, GenotypeRunStatus::Complete, fingerprint, options, library, timings,
-                 &built.report, &panel, &beam, &ranking, "", &summary);
+                 &built.report, &panel, &beam, &ranking, "", &summary, &depth);
     if (!options.quiet) {
         std::cerr << "[genotype] COMPLETE  fingerprint=" << fingerprint
                   << "  candidates=" << beam.candidates.size()
@@ -638,7 +668,8 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 "diagnostics and says so in the status file; it never presents a partial ranking\n"
                 "as a result.\n\n"
                 "--library declares insert_mean_bp, insert_sd_bp, support_sigmas,\n"
-                "substitution_error, outlier_weight and fragment_start_intensity, one per line.\n"
+                "substitution_error, outlier_weight and fragment_start_intensity, one per line,\n"
+                "and optionally marker_background (estimated from invariant anchors when absent).\n"
                 "Version one does not estimate these from the data.\n";
             return 0;
         } else {

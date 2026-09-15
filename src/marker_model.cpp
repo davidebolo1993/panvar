@@ -6,6 +6,7 @@
 #include <cmath>
 #include <limits>
 #include <queue>
+#include <set>
 #include <stdexcept>
 #include <tuple>
 
@@ -457,6 +458,186 @@ PreparedProposalEmissions build_proposal_emissions(
         result.blocks.push_back(std::move(emission));
     }
     return result;
+}
+
+MarkerDepthEstimate estimate_marker_depth(
+    const PreparedMarkerPanel& panel,
+    const MarkerObservations& observations,
+    std::optional<double> declared_background) {
+    if (panel.anchor_slots.size() != panel.anchor_haploid_multiplicity.size()) {
+        throw std::invalid_argument("anchor slots and multiplicities differ in size");
+    }
+    if (observations.counts.size() != panel.codes.size()) {
+        throw std::invalid_argument("marker observations and panel universe differ in size");
+    }
+    std::vector<double> counts;
+    std::vector<double> copies;   // diploid: 2 * haploid multiplicity
+    std::set<std::uint32_t> multiplicities;
+    for (std::size_t k = 0; k < panel.anchor_slots.size(); ++k) {
+        const std::uint32_t haploid = panel.anchor_haploid_multiplicity[k];
+        if (haploid == 0) continue;
+        if (panel.anchor_slots[k] >= observations.counts.size()) {
+            throw std::invalid_argument("anchor slot is outside the observation universe");
+        }
+        counts.push_back(static_cast<double>(observations.counts[panel.anchor_slots[k]]));
+        copies.push_back(2.0 * static_cast<double>(haploid));
+        multiplicities.insert(haploid);
+    }
+    MarkerDepthEstimate estimate;
+    estimate.anchors_used = counts.size();
+    estimate.distinct_multiplicities = multiplicities.size();
+    if (counts.empty()) {
+        throw std::invalid_argument("no invariant anchors are available to estimate marker depth");
+    }
+    double count_sum = 0.0;
+    double copy_sum = 0.0;
+    for (std::size_t k = 0; k < counts.size(); ++k) {
+        count_sum += counts[k];
+        copy_sum += copies[k];
+    }
+    if (!(count_sum > 0.0)) {
+        throw std::invalid_argument(
+            "no read observation matched any invariant anchor, so there is no depth to estimate");
+    }
+
+    if (declared_background.has_value()) {
+        const double background = *declared_background;
+        if (!std::isfinite(background) || background < 0.0) {
+            throw std::invalid_argument("declared marker background must be finite and non-negative");
+        }
+        estimate.background = background;
+        estimate.background_estimated = false;
+        if (background == 0.0) {
+            estimate.rate_per_copy = count_sum / copy_sum;
+            estimate.converged = true;
+            estimate.provenance = "anchor Poisson MLE, closed form, background declared 0";
+            return estimate;
+        }
+        // d/dr log L = sum c_k d_k / (bg + r d_k) - sum d_k, strictly decreasing in r.
+        const auto score = [&](double rate) {
+            double value = -copy_sum;
+            for (std::size_t k = 0; k < counts.size(); ++k) {
+                value += counts[k] * copies[k] / (background + rate * copies[k]);
+            }
+            return value;
+        };
+        if (score(0.0) <= 0.0) {
+            throw std::invalid_argument(
+                "invariant anchors carry no signal above the declared background");
+        }
+        double lo = 0.0;
+        double hi = std::max(1.0, count_sum / copy_sum);
+        while (score(hi) > 0.0) hi *= 2.0;
+        for (int i = 0; i < 200 && hi - lo > 1e-14 * hi; ++i) {
+            const double mid = 0.5 * (lo + hi);
+            (score(mid) > 0.0 ? lo : hi) = mid;
+            estimate.iterations = static_cast<std::size_t>(i + 1);
+        }
+        estimate.rate_per_copy = 0.5 * (lo + hi);
+        estimate.converged = true;
+        estimate.provenance = "anchor Poisson MLE, one-dimensional, background declared";
+        return estimate;
+    }
+
+    if (multiplicities.size() < 2) {
+        throw std::invalid_argument(
+            "every invariant anchor has the same multiplicity, so background and per-copy rate are "
+            "not separately identifiable; declare the marker background");
+    }
+    // Joint maximum likelihood by damped Newton. The log-likelihood
+    //   sum_k c_k log(bg + r d_k) - N bg - r D
+    // is concave in (bg, r), so Newton with a backtracking line search reaches the unique maximum
+    // quadratically. EM on the same model is only linearly convergent and did not reach tolerance on
+    // C4's 25,167 anchors in 20,000 iterations.
+    const double n = static_cast<double>(counts.size());
+    const double background_floor = 1e-9;
+    const auto log_likelihood = [&](double bg, double r) {
+        double value = -n * bg - r * copy_sum;
+        for (std::size_t k = 0; k < counts.size(); ++k) {
+            if (counts[k] > 0.0) value += counts[k] * std::log(bg + r * copies[k]);
+        }
+        return value;
+    };
+    // Start from least squares on c = bg + r d, pulled into the interior.
+    const double mean_copies = copy_sum / n;
+    const double mean_count = count_sum / n;
+    double sxx = 0.0;
+    double sxy = 0.0;
+    for (std::size_t k = 0; k < counts.size(); ++k) {
+        sxx += (copies[k] - mean_copies) * (copies[k] - mean_copies);
+        sxy += (copies[k] - mean_copies) * (counts[k] - mean_count);
+    }
+    double rate = sxx > 0.0 ? sxy / sxx : mean_count / mean_copies;
+    if (!(rate > 0.0)) rate = mean_count / mean_copies;
+    double background = mean_count - rate * mean_copies;
+    if (!(background > background_floor)) background = std::max(10.0 * background_floor, 0.01 * mean_count);
+    double current = log_likelihood(background, rate);
+
+    for (std::size_t iteration = 1; iteration <= 200; ++iteration) {
+        double g_bg = -n;
+        double g_rate = -copy_sum;
+        double h_bb = 0.0;
+        double h_br = 0.0;
+        double h_rr = 0.0;
+        for (std::size_t k = 0; k < counts.size(); ++k) {
+            const double mean = background + rate * copies[k];
+            const double first = counts[k] / mean;
+            const double second = counts[k] / (mean * mean);
+            g_bg += first;
+            g_rate += first * copies[k];
+            h_bb -= second;
+            h_br -= second * copies[k];
+            h_rr -= second * copies[k] * copies[k];
+        }
+        estimate.iterations = iteration;
+        const bool rate_stationary = std::abs(g_rate) <= 1e-9 * copy_sum;
+        if (std::abs(g_bg) <= 1e-9 * n && rate_stationary) {
+            estimate.converged = true;
+            break;
+        }
+        // The maximum can sit on the boundary: a background that still wants to fall below its floor.
+        if (background <= background_floor && g_bg < 0.0 && rate_stationary) {
+            estimate.converged = true;
+            estimate.background_at_floor = true;
+            break;
+        }
+        const double determinant = h_bb * h_rr - h_br * h_br;
+        double step_bg = 0.0;
+        double step_rate = 0.0;
+        if (determinant > 0.0 && h_bb < 0.0) {
+            step_bg = -(h_rr * g_bg - h_br * g_rate) / determinant;
+            step_rate = -(-h_br * g_bg + h_bb * g_rate) / determinant;
+        } else {
+            step_bg = g_bg / std::max(1.0, -h_bb);
+            step_rate = g_rate / std::max(1.0, -h_rr);
+        }
+        bool moved = false;
+        double scale = 1.0;
+        for (int halving = 0; halving < 60; ++halving, scale *= 0.5) {
+            const double next_bg = std::max(background_floor, background + scale * step_bg);
+            const double next_rate = rate + scale * step_rate;
+            if (!(next_rate > 0.0)) continue;
+            const double candidate = log_likelihood(next_bg, next_rate);
+            if (candidate >= current) {
+                background = next_bg;
+                rate = next_rate;
+                current = candidate;
+                moved = true;
+                break;
+            }
+        }
+        if (!moved) {
+            // No ascent at any step length: the iterate is the maximum to machine precision, provided
+            // the gradient agrees.
+            estimate.converged = std::abs(g_bg) <= 1e-6 * n && std::abs(g_rate) <= 1e-6 * copy_sum;
+            break;
+        }
+    }
+    estimate.background = background;
+    estimate.rate_per_copy = rate;
+    estimate.background_estimated = true;
+    estimate.provenance = "anchor Poisson MLE, background and rate jointly by damped Newton";
+    return estimate;
 }
 
 } // namespace panvar

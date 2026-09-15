@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -66,6 +67,33 @@ struct PreparedProposalEmissions {
 
     bool every_allele_scored() const noexcept { return total_alleles == scored_alleles; }
 };
+
+// Per-copy marker depth, estimated from the invariant anchors. Every panel haplotype carries an
+// anchor's fixed copies, so its diploid multiplicity is known whatever the sample's genotype, and
+// count_k ~ Poisson(background + rate * 2 * m_k). A variable marker cannot be used for this: its
+// expected count depends on the genotype being inferred.
+//
+// With a declared background the rate is the one-dimensional Poisson maximum-likelihood root. Without
+// one, both are fitted jointly by damped Newton, identifiable only when the anchors carry at least two
+// distinct multiplicities; with a single multiplicity background and rate trade off exactly, so the
+// fit refuses and the background must be declared.
+struct MarkerDepthEstimate {
+    double rate_per_copy = 0.0;
+    double background = 0.0;
+    bool background_estimated = false;
+    bool converged = false;
+    // The fitted background reached its positive floor: the data prefer no background at all.
+    bool background_at_floor = false;
+    std::size_t anchors_used = 0;
+    std::size_t distinct_multiplicities = 0;
+    std::size_t iterations = 0;
+    std::string provenance;
+};
+
+MarkerDepthEstimate estimate_marker_depth(
+    const PreparedMarkerPanel& panel,
+    const MarkerObservations& observations,
+    std::optional<double> declared_background);
 
 void validate_marker_parameters(const MarkerModelParameters& parameters);
 

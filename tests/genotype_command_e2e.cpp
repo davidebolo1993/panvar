@@ -105,7 +105,11 @@ TinyLocus write_tiny_locus() {
 void write_library(const std::string& file) {
     std::ofstream out(file);
     out << "insert_mean_bp 300\ninsert_sd_bp 30\nsupport_sigmas 4\n"
-           "substitution_error 0.002\noutlier_weight 0.001\nfragment_start_intensity 0.02\n";
+           "substitution_error 0.002\noutlier_weight 0.001\nfragment_start_intensity 0.02\n"
+           // Declared: every invariant anchor of this tiny locus carries one copy, so the marker
+           // background is not identifiable from the data. test_refusals proves the run refuses
+           // without this line.
+           "marker_background 0.01\n";
 }
 
 // Deterministic paired reads from two chosen haplotypes.
@@ -257,6 +261,34 @@ void test_refusals() {
     require(threw, "a run without its required inputs must refuse");
     require(!exists(path("refused.genotypes.tsv")),
             "a refused run must not leave a genotypes table behind");
+
+    // Fail closed on an unidentifiable marker background. The tiny locus's invariant anchors all carry
+    // one copy, so background and per-copy rate trade off exactly and must not be invented.
+    const TinyLocus locus = write_tiny_locus();
+    {
+        std::ofstream out(path("lib_undeclared.txt"));
+        out << "insert_mean_bp 300\ninsert_sd_bp 30\nsupport_sigmas 4\n"
+               "substitution_error 0.002\noutlier_weight 0.001\nfragment_start_intensity 0.02\n";
+    }
+    panvar::GenotypeCommandOptions undeclared;
+    undeclared.gfa_path = locus.gfa_path;
+    undeclared.reference_path = locus.reference_name;
+    undeclared.reads1_path = path("r1.fq");
+    undeclared.reads2_path = path("r2.fq");
+    undeclared.library_path = path("lib_undeclared.txt");
+    undeclared.out_prefix = path("undeclared");
+    undeclared.max_candidates = 16;
+    undeclared.kmer_size = 21;
+    undeclared.syncmer_s = 11;
+    undeclared.quiet = true;
+    require(panvar::run_genotype(undeclared) == panvar::GenotypeRunStatus::CandidateIncomplete,
+            "an unidentifiable marker background must end the run as CANDIDATE_INCOMPLETE");
+    const std::map<std::string, std::string> status = read_status(path("undeclared.mosaic_status.tsv"));
+    require(status.at("status") == "CANDIDATE_INCOMPLETE" &&
+                status.at("note").find("not separately identifiable") != std::string::npos,
+            "the status file must name why the marker depth could not be estimated");
+    require(!exists(path("undeclared.genotypes.tsv")) && !exists(path("undeclared.mosaic_scores.tsv")),
+            "a run that never ranked must not emit a ranking or a call");
 }
 
 } // namespace

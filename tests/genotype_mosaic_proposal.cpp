@@ -9,6 +9,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -371,12 +372,109 @@ void test_mosaic_beam() {
         "missing boundary transition must refuse");
 }
 
+
+// Marker depth comes from the invariant anchors, whose diploid multiplicity is known whatever the
+// sample's genotype. The previous estimate divided every matched occurrence by twice the size of the
+// marker universe, which ignored anchor multiplicity, variable-marker genotype and copy number.
+void test_marker_depth_estimation() {
+    const auto make = [](const std::vector<std::uint32_t>& multiplicity,
+                         const std::vector<std::uint64_t>& counts) {
+        panvar::PreparedMarkerPanel panel;
+        panvar::MarkerObservations observations;
+        for (std::size_t k = 0; k < multiplicity.size(); ++k) {
+            panel.codes.push_back(k);
+            panel.anchor_slots.push_back(static_cast<std::uint32_t>(k));
+            panel.anchor_haploid_multiplicity.push_back(multiplicity[k]);
+            observations.counts.push_back(counts[k]);
+        }
+        return std::make_pair(panel, observations);
+    };
+
+    // Closed form with a declared zero background: rate = sum c / (2 * sum m).
+    {
+        const auto fixture = make({1, 1, 2, 3}, {10, 14, 40, 57});
+        const panvar::MarkerDepthEstimate estimate =
+            panvar::estimate_marker_depth(fixture.first, fixture.second, 0.0);
+        require_close(estimate.rate_per_copy, 121.0 / (2.0 * 7.0), 1e-12,
+                      "with no background the rate is total count over total diploid copies");
+        require(!estimate.background_estimated, "a declared background must not be re-estimated");
+    }
+
+    // One-dimensional root with a declared positive background.
+    {
+        const auto fixture = make({1, 2, 2, 4}, {9, 17, 15, 33});
+        const double background = 1.5;
+        const panvar::MarkerDepthEstimate estimate =
+            panvar::estimate_marker_depth(fixture.first, fixture.second, background);
+        double score = 0.0;
+        const std::vector<double> c = {9, 17, 15, 33};
+        const std::vector<double> d = {2, 4, 4, 8};
+        for (std::size_t k = 0; k < 4; ++k) {
+            score += c[k] * d[k] / (background + estimate.rate_per_copy * d[k]) - d[k];
+        }
+        require(std::abs(score) < 1e-8, "the declared-background rate must be the likelihood root");
+    }
+
+    // Joint recovery from simulated anchors with known generating values.
+    {
+        std::mt19937_64 rng(1234);
+        const double true_background = 3.0;
+        const double true_rate = 7.5;
+        std::vector<std::uint32_t> multiplicity;
+        std::vector<std::uint64_t> counts;
+        for (int k = 0; k < 6000; ++k) {
+            const std::uint32_t m = 1 + static_cast<std::uint32_t>(k % 3);
+            std::poisson_distribution<long> draw(true_background + true_rate * 2.0 * m);
+            multiplicity.push_back(m);
+            counts.push_back(static_cast<std::uint64_t>(draw(rng)));
+        }
+        const auto fixture = make(multiplicity, counts);
+        const panvar::MarkerDepthEstimate estimate =
+            panvar::estimate_marker_depth(fixture.first, fixture.second, std::nullopt);
+        require(estimate.background_estimated && estimate.converged,
+                "with several anchor multiplicities both parameters must be fitted and converge");
+        require(std::abs(estimate.rate_per_copy - true_rate) < 0.05 * true_rate,
+                "the per-copy rate must be recovered from anchors: got " +
+                    std::to_string(estimate.rate_per_copy));
+        require(std::abs(estimate.background - true_background) < 0.25 * true_background,
+                "the background must be recovered from anchors: got " +
+                    std::to_string(estimate.background));
+        // The old estimator, fed the same anchors, is off by the multiplicity structure.
+        double total = 0.0;
+        for (const auto c : counts) total += static_cast<double>(c);
+        const double old_rate = total / (2.0 * static_cast<double>(counts.size()));
+        require(std::abs(old_rate - true_rate) > 0.2 * true_rate,
+                "fixture: the multiplicity-blind estimator must be visibly wrong here");
+    }
+
+    // Refusals: an unidentifiable background, and anchors with no observation at all.
+    {
+        const auto same = make({2, 2, 2}, {20, 22, 19});
+        bool refused = false;
+        try {
+            panvar::estimate_marker_depth(same.first, same.second, std::nullopt);
+        } catch (const std::invalid_argument&) {
+            refused = true;
+        }
+        require(refused, "a single anchor multiplicity must refuse to estimate the background");
+        const auto empty = make({1, 2}, {0, 0});
+        refused = false;
+        try {
+            panvar::estimate_marker_depth(empty.first, empty.second, 0.0);
+        } catch (const std::invalid_argument&) {
+            refused = true;
+        }
+        require(refused, "anchors with no observation must refuse rather than report zero depth");
+    }
+}
+
 } // namespace
 
 int main() {
     try {
         test_marker_model();
         test_mosaic_beam();
+        test_marker_depth_estimation();
         std::cout << "genotype mosaic proposal: PASS\n";
         return 0;
     } catch (const std::exception& error) {
