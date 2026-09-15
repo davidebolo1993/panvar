@@ -85,13 +85,15 @@ COLUMNS_OUT="donor status note run_no_call unique found exhaustive target condit
   echo "$COLUMNS_OUT" | tr ' ' '\t'
   for donor in $DONORS; do
     p="$OUT/$donor/lzo.K$K"; s="$p.eval.summary.tsv"; st="$p.mosaic_status.tsv"; r="$OUT/$donor/lzo.resources.tsv"
+    # A run refused before the proposal finished writes only the base status, and nothing per prefix.
+    [ -f "$st" ] || st="$OUT/$donor/lzo.mosaic_status.tsv"
     v() { [ -f "$s" ] && awk -F'\t' -v key="$1" '$1==key{print $2}' "$s" | head -1 || true; }
     w() { [ -f "$st" ] && awk -F'\t' -v key="$1" '$1==key{print $2}' "$st" | head -1 || true; }
     x() { [ -f "$r" ] && awk -F'\t' -v key="$1" '$1==key{print $2}' "$r" || true; }
     na() { [ -n "$1" ] && printf '%s' "$1" || printf 'NA'; }
     # The audit: the same proposal ranked at K = AUDIT. Reported, never used to change the primary call.
     a="$OUT/$donor/lzo.K$AUDIT"
-    audit_status="$([ -f "$a.mosaic_status.tsv" ] && awk -F'\t' '$1=="status"{print $2}' "$a.mosaic_status.tsv")"
+    audit_status="$( { [ -f "$a.mosaic_status.tsv" ] && awk -F'\t' '$1=="status"{print $2}' "$a.mosaic_status.tsv"; } || true)"
     fasta_hash() { [ -f "$1.mosaic_haplotypes.fa" ] && grep -v '^>' "$1.mosaic_haplotypes.fa" | shasum -a 256 | cut -c1-16 || echo NA; }
     calls_hash() { [ -f "$1.block_genotypes.tsv" ] && awk -F'\t' 'NR>1{a=$4; b=$5; if (a+0>b+0){t=a;a=b;b=t} print $1, a, b}' "$1.block_genotypes.tsv" | shasum -a 256 | cut -c1-16 || echo NA; }
     same_winner=NA; same_calls=NA
@@ -99,11 +101,12 @@ COLUMNS_OUT="donor status note run_no_call unique found exhaustive target condit
       [ "$(fasta_hash "$p")" = "$(fasta_hash "$a")" ] && same_winner=true || same_winner=false
       [ "$(calls_hash "$p")" = "$(calls_hash "$a")" ] && same_calls=true || same_calls=false
     fi
-    audit_phase="$([ -f "$a.mosaic_status.tsv" ] && awk -F'\t' '$1=="phase_support"{print $2}' "$a.mosaic_status.tsv")"
+    audit_phase="$( { [ -f "$a.mosaic_status.tsv" ] && awk -F'\t' '$1=="phase_support"{print $2}' "$a.mosaic_status.tsv"; } || true)"
     phase_not_confirmed=NA
     [ "$(v phase_support)" = READS ] && { [ "$audit_phase" = READS ] && phase_not_confirmed=false || phase_not_confirmed=true; }
     row=()
-    for value in "$donor" "$(w status)" "$(w note | tr '\t' ' ' | cut -c1-80)" "$(v run_no_call)" \
+    no_call="$(v run_no_call)"; [ -n "$no_call" ] || { [ "$(w status)" = COMPLETE ] && no_call=false || no_call=true; }
+    for value in "$donor" "$(w status)" "$(w note | tr '\t' ' ' | cut -c1-80)" "$no_call" \
       "$(w unique_candidates)" "$(w unique_candidates_found)" "$(w proposal_search_exhaustive)" \
       "$(w proposal_target_reached)" "$(w candidate_set_conditional)" "$(w candidate_scope)" \
       "$(w global_certified)" "$(v truth_in_candidates)" "$(v truth_proposal_rank)" \
