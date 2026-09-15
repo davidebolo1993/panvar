@@ -9,6 +9,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -379,6 +380,68 @@ void test_mosaic_beam() {
     const auto starved = panvar::propose_mosaic_diplotypes(four, emissions, {0.25, 0.6}, {50, 1});
     require(!starved.search_exhaustive && starved.states_pruned > 0 && !starved.unique_target_reached,
             "a pruned search that misses K must report neither exhaustiveness nor its target");
+
+    // Tracing is a diagnostic and must not change the search: with a target declared, a pruned search
+    // returns the same candidates, masses and work. The trace must account for every pruned state, keep a
+    // surviving diplotype's states in every layer, and show the layer where a lost diplotype was dropped.
+    {
+        const auto all = panvar::propose_mosaic_diplotypes(four, emissions, {0.25, 0.6}, {1000, 1u << 20});
+        panvar::MosaicBeamParameters narrow{1000, 6};
+        const auto untraced = panvar::propose_mosaic_diplotypes(four, emissions, {0.25, 0.6}, narrow);
+        require(!untraced.search_exhaustive && untraced.trace.empty(),
+                "fixture: the narrow search must prune, and an untraced search must carry no trace");
+        const auto same_diplotype = [](const panvar::MosaicDiplotype& a, const panvar::MosaicDiplotype& b) {
+            return (a.first == b.first && a.second == b.second) || (a.first == b.second && a.second == b.first);
+        };
+        const auto proposed = [&](const panvar::MosaicBeamResult& result, const panvar::MosaicDiplotype& d) {
+            for (const auto& candidate : result.candidates) {
+                if (same_diplotype(candidate.diplotype, d)) return true;
+            }
+            return false;
+        };
+        std::optional<panvar::MosaicDiplotype> kept;
+        std::optional<panvar::MosaicDiplotype> lost;
+        for (const auto& candidate : all.candidates) {
+            if (proposed(untraced, candidate.diplotype)) {
+                if (!kept) kept = candidate.diplotype;
+            } else if (!lost) {
+                lost = candidate.diplotype;
+            }
+        }
+        require(kept.has_value() && lost.has_value(),
+                "fixture: the narrow search must keep one exhaustive diplotype and prune another");
+        for (const auto& item : {std::make_pair(*kept, true), std::make_pair(*lost, false)}) {
+            narrow.trace_target = item.first;
+            const auto traced = panvar::propose_mosaic_diplotypes(four, emissions, {0.25, 0.6}, narrow);
+            bool identical = traced.candidates.size() == untraced.candidates.size() &&
+                             traced.states_pruned == untraced.states_pruned &&
+                             traced.extensions_evaluated == untraced.extensions_evaluated;
+            for (std::size_t i = 0; identical && i < traced.candidates.size(); ++i) {
+                identical = traced.candidates[i].diplotype.first == untraced.candidates[i].diplotype.first &&
+                            traced.candidates[i].diplotype.second == untraced.candidates[i].diplotype.second &&
+                            traced.candidates[i].retained_logsum_proposal_score ==
+                                untraced.candidates[i].retained_logsum_proposal_score &&
+                            traced.candidates[i].best_proposal_score == untraced.candidates[i].best_proposal_score;
+            }
+            require(identical, "a traced search must return exactly the untraced search");
+            require(traced.trace.size() == four.block_count(), "a trace must record one layer per block");
+            std::uint64_t pruned = 0;
+            bool always_retained = true;
+            bool dropped_where_offered = false;
+            for (const auto& layer : traced.trace) {
+                pruned += layer.states_offered - layer.states_retained;
+                always_retained = always_retained && layer.target_states_retained > 0;
+                if (layer.target_states_offered > 0 && layer.target_states_retained == 0) dropped_where_offered = true;
+            }
+            require(pruned == traced.states_pruned, "the trace must account for every pruned state");
+            if (item.second) {
+                require(always_retained, "a proposed diplotype must be retained in every traced layer");
+            } else {
+                require(!always_retained && dropped_where_offered,
+                        "a pruned diplotype's trace must show the layer where it was offered and dropped");
+            }
+        }
+    }
 
     // Ties: with all emissions equal, the order is fully determined by the documented key, and two runs
     // are identical.

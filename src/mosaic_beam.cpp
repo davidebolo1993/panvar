@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <optional>
 #include <queue>
 #include <stdexcept>
 #include <tuple>
@@ -31,6 +32,15 @@ public:
         allele_.push_back(static_cast<std::uint32_t>(allele));
         index_.emplace(key, id);
         return id;
+    }
+
+    // Lookup without interning, for tracing: never changes an id.
+    std::optional<std::uint32_t> find(std::uint32_t parent, std::size_t allele) const {
+        const std::uint64_t key =
+            (static_cast<std::uint64_t>(parent) << 32) | static_cast<std::uint64_t>(allele);
+        const auto found = index_.find(key);
+        if (found == index_.end()) return std::nullopt;
+        return found->second;
     }
 
     std::vector<std::size_t> path(std::uint32_t id, std::size_t blocks) const {
@@ -145,6 +155,121 @@ private:
     std::priority_queue<State, std::vector<State>, bool (*)(const State&, const State&)> heap_;
 };
 
+// Follows a declared diplotype through the layers. It only reads states and the interner.
+class LayerTracer {
+public:
+    LayerTracer(const MosaicBeamParameters& parameters, const PrefixInterner& prefixes)
+        : parameters_(parameters), prefixes_(prefixes) {}
+
+    bool on() const { return parameters_.trace_target.has_value(); }
+
+    void begin(std::size_t block) {
+        if (!on()) return;
+        current_ = MosaicBeamTraceLayer{};
+        current_.block = block;
+        masses_.clear();
+        block_ = block;
+        resolved_ = false;
+    }
+
+    void offer(const State& state) {
+        if (!on()) return;
+        ++current_.states_offered;
+        masses_.push_back(state.log_mass);
+        if (!resolve()) return;
+        if (!matches(state)) return;
+        ++current_.target_states_offered;
+        current_.target_logsum_log_mass = log_add_exp_local(current_.target_logsum_log_mass, state.log_mass);
+        if (state.log_mass > current_.target_best_log_mass) {
+            current_.target_best_log_mass = state.log_mass;
+            current_.target_best_template1 = state.template1;
+            current_.target_best_template2 = state.template2;
+        }
+        if (declared(state)) {
+            current_.declared_templates_offered = true;
+            current_.declared_templates_log_mass = state.log_mass;
+        }
+    }
+
+    void finish(const std::vector<State>& retained, std::vector<MosaicBeamTraceLayer>& out) {
+        if (!on()) return;
+        current_.states_retained = retained.size();
+        current_.target_prefixes_present = resolve();
+        {
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> pairs;
+            pairs.reserve(retained.size());
+            for (const State& state : retained) pairs.emplace_back(state.prefix1, state.prefix2);
+            std::sort(pairs.begin(), pairs.end());
+            current_.prefix_pairs_retained =
+                static_cast<std::size_t>(std::unique(pairs.begin(), pairs.end()) - pairs.begin());
+        }
+        for (const State& state : retained) {
+            current_.retained_min_log_mass = current_.retained_min_log_mass == kNegInf
+                                                 ? state.log_mass
+                                                 : std::min(current_.retained_min_log_mass, state.log_mass);
+            if (current_.target_prefixes_present && matches(state)) {
+                ++current_.target_states_retained;
+                if (declared(state)) current_.declared_templates_retained = true;
+            }
+        }
+        if (current_.target_states_offered > 0) {
+            for (const double mass : masses_) {
+                if (mass > current_.target_best_log_mass) ++current_.offered_above_target_best;
+            }
+        }
+        previous1_ = current_.target_prefixes_present ? std::optional<std::uint32_t>(target1_) : std::nullopt;
+        previous2_ = current_.target_prefixes_present ? std::optional<std::uint32_t>(target2_) : std::nullopt;
+        out.push_back(current_);
+    }
+
+private:
+    // The target's prefix ids at this block exist once their parents' groups have been extended.
+    bool resolve() {
+        if (resolved_) return true;
+        const MosaicDiplotype& target = *parameters_.trace_target;
+        std::optional<std::uint32_t> one;
+        std::optional<std::uint32_t> two;
+        if (block_ == 0) {
+            one = prefixes_.find(kRoot, target.first.alleles[0]);
+            two = prefixes_.find(kRoot, target.second.alleles[0]);
+        } else if (previous1_ && previous2_) {
+            one = prefixes_.find(*previous1_, target.first.alleles[block_]);
+            two = prefixes_.find(*previous2_, target.second.alleles[block_]);
+        }
+        if (!one || !two) return false;
+        target1_ = *one;
+        target2_ = *two;
+        resolved_ = true;
+        return true;
+    }
+
+    bool matches(const State& state) const {
+        return (state.prefix1 == target1_ && state.prefix2 == target2_) ||
+               (state.prefix1 == target2_ && state.prefix2 == target1_);
+    }
+
+    bool declared(const State& state) const {
+        if (!parameters_.trace_templates) return false;
+        const std::uint32_t d1 = static_cast<std::uint32_t>(parameters_.trace_templates->first);
+        const std::uint32_t d2 = static_cast<std::uint32_t>(parameters_.trace_templates->second);
+        return (state.prefix1 == target1_ && state.template1 == d1 && state.prefix2 == target2_ &&
+                state.template2 == d2) ||
+               (state.prefix1 == target2_ && state.template1 == d2 && state.prefix2 == target1_ &&
+                state.template2 == d1);
+    }
+
+    const MosaicBeamParameters& parameters_;
+    const PrefixInterner& prefixes_;
+    MosaicBeamTraceLayer current_;
+    std::vector<double> masses_;
+    std::size_t block_ = 0;
+    bool resolved_ = false;
+    std::uint32_t target1_ = 0;
+    std::uint32_t target2_ = 0;
+    std::optional<std::uint32_t> previous1_;
+    std::optional<std::uint32_t> previous2_;
+};
+
 void add_extensions(std::uint64_t& total, std::uint64_t amount) {
     if (amount > std::numeric_limits<std::uint64_t>::max() - total) {
         throw std::length_error("mosaic beam extension count overflows uint64");
@@ -174,6 +299,16 @@ void validate_beam_inputs(
     }
     if (panel.template_count() >= kRoot) {
         throw std::invalid_argument("mosaic beam template index exceeds uint32");
+    }
+    if (parameters.trace_target) {
+        if (parameters.trace_target->first.alleles.size() != panel.block_count() ||
+            parameters.trace_target->second.alleles.size() != panel.block_count()) {
+            throw std::invalid_argument("mosaic beam trace target must have one allele per block");
+        }
+        if (parameters.trace_templates && (parameters.trace_templates->first >= panel.template_count() ||
+                                           parameters.trace_templates->second >= panel.template_count())) {
+            throw std::invalid_argument("mosaic beam trace templates are outside the panel");
+        }
     }
     for (std::size_t block = 0; block < panel.block_count(); ++block) {
         const BlockProposalEmissions& emission = emissions.blocks[block];
@@ -232,6 +367,7 @@ MosaicBeamResult propose_mosaic_diplotypes(
     }
 
     PrefixInterner prefixes;
+    LayerTracer tracer(parameters, prefixes);
     const double log_templates = std::log(static_cast<double>(templates));
 
     // ---- block 0: every ordered template pair, merged by key -------------------------------------------
@@ -264,14 +400,17 @@ MosaicBeamResult propose_mosaic_diplotypes(
         std::sort(initial.begin(), initial.end(),
                   [](const State& lhs, const State& rhs) { return key_of(lhs) < key_of(rhs); });
         LayerSelector selector(parameters.state_limit);
+        tracer.begin(0);
         for (std::size_t i = 0; i < initial.size();) {
             State merged = initial[i];
             std::size_t j = i + 1;
             for (; j < initial.size() && key_of(initial[j]) == key_of(merged); ++j) merge_into(merged, initial[j]);
             selector.offer(merged);
+            tracer.offer(merged);
             i = j;
         }
         layer = selector.take(result.states_pruned);
+        tracer.finish(layer, result.trace);
     }
 
     // ---- blocks 1..B-1: extend each parent prefix-pair group over every ordered template pair ------------
@@ -297,6 +436,7 @@ MosaicBeamResult propose_mosaic_diplotypes(
         });
 
         LayerSelector selector(parameters.state_limit);
+        tracer.begin(block);
         std::vector<std::uint32_t> child_prefix1(emission.allele_count);
         std::vector<std::uint32_t> child_prefix2(emission.allele_count);
         for (std::size_t g = 0; g < layer.size();) {
@@ -365,6 +505,7 @@ MosaicBeamResult propose_mosaic_diplotypes(
                 child.saturated = cell_saturated[cell] != 0;
                 canonicalise(child);
                 selector.offer(child);
+                tracer.offer(child);
                 cell_mass[cell] = kNegInf;
                 cell_best[cell] = kNegInf;
                 cell_histories[cell] = 0;
@@ -374,6 +515,7 @@ MosaicBeamResult propose_mosaic_diplotypes(
             g = end;
         }
         layer = selector.take(result.states_pruned);
+        tracer.finish(layer, result.trace);
     }
 
     // ---- final collapse: drop templates, merge by unordered pair of complete allele paths ----------------

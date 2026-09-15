@@ -17,6 +17,9 @@
 #include "panvar/graph_utils.hpp"
 #include "panvar/gz_reader.hpp"
 #include "panvar/integrated_snarls.hpp"
+#include "panvar/ls_hmm.hpp"
+#include "panvar/marker_model.hpp"
+#include "panvar/mosaic_beam.hpp"
 #include "panvar/mosaic_spelling.hpp"
 
 #include <algorithm>
@@ -1210,6 +1213,135 @@ int compare(const Args& args) {
 } // namespace
 
 // ------------------------------------------------------------------------------------------------
+// trace: follow the leave-zero-out truth pair through every proposal layer
+// ------------------------------------------------------------------------------------------------
+
+// Rebuilds the command's model, marker panel, depth fit and proposal emissions, then runs the proposal
+// with the donor's own two panel rows declared as the trace target. The traced search is the production
+// search (gated): its candidates are compared with the run's manifest.
+int trace(const Args& args) {
+    const std::string out = args.required("out");
+    const std::string reference = args.required("reference");
+    const std::string donor = args.required("donor");
+    const std::string run = args.required("run");
+    const std::size_t state_limit = std::stoul(args.get("state-limit", "1024"));
+    const std::size_t target = std::stoul(args.get("candidates", "256"));
+    const LoadedModel loaded = load_model(args.required("gfa"), reference, out + ".model.sorted.gfa", 50);
+    const panvar::PreparedGenotypeModel& model = *loaded.model;
+    if (read_key_values(run + ".mosaic_status.tsv").at("model_fingerprint") != loaded.fingerprint) {
+        throw std::runtime_error("the run was not scored on the rebuilt model");
+    }
+    const panvar::PanelAlleleMatrix& panel = model.panel();
+    std::vector<std::size_t> rows;
+    for (std::size_t row = 0; row < panel.template_count(); ++row) {
+        if (panel.template_names[row].rfind(donor + "#", 0) == 0) rows.push_back(row);
+    }
+    std::sort(rows.begin(), rows.end(), [&](std::size_t lhs, std::size_t rhs) {
+        return panel.template_names[lhs] < panel.template_names[rhs];
+    });
+    if (rows.size() != 2) throw std::runtime_error("a leave-zero-out trace needs both donor haplotypes as panel rows");
+    const panvar::MosaicDiplotype truth{
+        panvar::MosaicPath{std::vector<std::size_t>(panel.template_alleles[rows[0]].begin(), panel.template_alleles[rows[0]].end())},
+        panvar::MosaicPath{std::vector<std::size_t>(panel.template_alleles[rows[1]].begin(), panel.template_alleles[rows[1]].end())}};
+    const auto winner = winner_paths(run);
+    const panvar::MosaicDiplotype winner_diplotype{panvar::MosaicPath{winner.first}, panvar::MosaicPath{winner.second}};
+
+    // The command's stages 2 and 3, with its defaults.
+    const std::vector<panvar::ReadPair> fragments = read_pairs(args.required("reads1"), args.required("reads2"));
+    const panvar::PreparedMarkerPanel markers = panvar::build_marker_panel(model, 31, 15);
+    const panvar::MarkerObservations observations = panvar::count_marker_observations(markers, fragments);
+    std::optional<double> declared_background;
+    {
+        std::ifstream library(args.required("library"));
+        std::string key;
+        double value = 0.0;
+        for (std::string line; std::getline(library, line);) {
+            std::istringstream fields(line);
+            if (fields >> key >> value && key == "marker_background") declared_background = value;
+        }
+    }
+    const panvar::MarkerDepthEstimate depth =
+        panvar::estimate_marker_depth(markers, observations, declared_background);
+    if (!depth.converged) throw std::runtime_error("the depth fit did not converge: " + depth.termination);
+    const panvar::PreparedProposalEmissions emissions = panvar::build_proposal_emissions(
+        markers, observations, panvar::proposal_marker_parameters(depth, 31, 15));
+    const std::vector<double> switches(model.blocks().size() - 1, 0.01);
+    panvar::MosaicBeamParameters parameters;
+    parameters.unique_candidate_target = target;
+    parameters.state_limit = state_limit;
+    parameters.max_extension_evaluations = 2000000000ULL;
+    parameters.trace_target = truth;
+    parameters.trace_templates = std::make_pair(rows[0], rows[1]);
+    const panvar::MosaicBeamResult result =
+        panvar::propose_mosaic_diplotypes(panel, emissions, switches, parameters);
+
+    // The traced search must be the run's search.
+    const auto manifest = read_table(run + ".mosaic_candidates.tsv");
+    bool matches_run = !manifest.empty();
+    const std::size_t compared = std::min(manifest.size(), result.candidates.size());
+    for (std::size_t i = 0; i < compared && matches_run; ++i) {
+        matches_run = parse_alleles(manifest[i].at("hap1_alleles")) == result.candidates[i].diplotype.first.alleles &&
+                      parse_alleles(manifest[i].at("hap2_alleles")) == result.candidates[i].diplotype.second.alleles;
+    }
+
+    std::ofstream layers(out + ".trace.tsv");
+    layers << std::setprecision(10)
+           << "block\tblock_id\tkind\ttruth_alleles\ttruth_emission\twinner_alleles\twinner_emission\t"
+              "best_emission_in_block\tstates_offered\tstates_retained\tprefix_pairs_retained\tretained_min_log_mass\t"
+              "truth_prefixes_present\ttruth_states_offered\ttruth_states_retained\ttruth_best_log_mass\t"
+              "truth_logsum_log_mass\ttruth_rank\tdonor_templates_offered\tdonor_templates_log_mass\t"
+              "donor_templates_retained\n";
+    double truth_emission_total = 0.0;
+    double winner_emission_total = 0.0;
+    std::string first_loss = "never";
+    for (const panvar::MosaicBeamTraceLayer& layer : result.trace) {
+        const std::size_t b = layer.block;
+        const panvar::BlockProposalEmissions& emission = emissions.blocks[b];
+        const double truth_e = emission.at(truth.first.alleles[b], truth.second.alleles[b]);
+        const double winner_e = emission.at(winner.first[b], winner.second[b]);
+        truth_emission_total += truth_e;
+        winner_emission_total += winner_e;
+        const double best_e = *std::max_element(emission.log_score.begin(), emission.log_score.end());
+        if (first_loss == "never" && layer.target_states_retained == 0) first_loss = model.blocks()[b].block_id;
+        layers << b << '\t' << model.blocks()[b].block_id << '\t'
+               << (model.blocks()[b].kind == panvar::GenotypeBlockKind::Variant ? "SV" : "context") << '\t'
+               << truth.first.alleles[b] << '/' << truth.second.alleles[b] << '\t' << truth_e << '\t'
+               << winner.first[b] << '/' << winner.second[b] << '\t' << winner_e << '\t' << best_e << '\t'
+               << layer.states_offered << '\t' << layer.states_retained << '\t' << layer.prefix_pairs_retained << '\t'
+               << layer.retained_min_log_mass << '\t'
+               << (layer.target_prefixes_present ? "true" : "false") << '\t' << layer.target_states_offered << '\t'
+               << layer.target_states_retained << '\t' << layer.target_best_log_mass << '\t'
+               << layer.target_logsum_log_mass << '\t'
+               << (layer.target_states_offered > 0 ? std::to_string(layer.offered_above_target_best + 1) : "NA")
+               << '\t' << (layer.declared_templates_offered ? "true" : "false") << '\t'
+               << layer.declared_templates_log_mass << '\t' << (layer.declared_templates_retained ? "true" : "false")
+               << '\n';
+    }
+    bool truth_proposed = false;
+    for (const auto& candidate : result.candidates) {
+        const auto& d = candidate.diplotype;
+        if ((d.first == truth.first && d.second == truth.second) || (d.first == truth.second && d.second == truth.first)) {
+            truth_proposed = true;
+        }
+    }
+    std::ofstream summary(out + ".trace.summary.tsv");
+    summary << std::setprecision(12) << "key\tvalue\ndonor\t" << donor << "\nstate_limit\t" << state_limit
+            << "\ncandidate_target\t" << target << "\nunique_candidates_found\t" << result.unique_candidates_found
+            << "\nstates_pruned\t" << result.states_pruned << "\nproposal_matches_run\t"
+            << (matches_run ? "true" : "false") << "\ncandidates_compared_with_run\t" << compared
+            << "\ntruth_templates\t" << panel.template_names[rows[0]] << ',' << panel.template_names[rows[1]]
+            << "\ntruth_proposed\t" << (truth_proposed ? "true" : "false") << "\nfirst_block_truth_not_retained\t"
+            << first_loss << "\ntruth_emission_total\t" << truth_emission_total << "\nwinner_emission_total\t"
+            << winner_emission_total << "\ntruth_path_prior\t"
+            << panvar::log_unordered_diplotype_prior(panel, truth, switches) << "\nwinner_path_prior\t"
+            << panvar::log_unordered_diplotype_prior(panel, winner_diplotype, switches) << "\nmarker_depth_rate\t"
+            << depth.rate_per_copy << "\nmarker_depth_termination\t" << depth.termination << '\n';
+    std::cout << "traced " << donor << ": truth proposed " << (truth_proposed ? "yes" : "no") << ", first lost at "
+              << first_loss << ", proposal matches run " << (matches_run ? "yes" : "no") << '\n';
+    return 0;
+}
+
+// ------------------------------------------------------------------------------------------------
 // genotype: the command with the development candidate-prefix harness, which the CLI does not expose
 // ------------------------------------------------------------------------------------------------
 
@@ -1237,7 +1369,7 @@ int genotype(const Args& args) {
 int main(int argc, char** argv) {
     try {
         if (argc < 2) {
-            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype --key value ...\n";
+            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace --key value ...\n";
             return 2;
         }
         const std::string command = argv[1];
@@ -1247,6 +1379,7 @@ int main(int argc, char** argv) {
         if (command == "evaluate") return evaluate(args);
         if (command == "compare") return compare(args);
         if (command == "genotype") return genotype(args);
+        if (command == "trace") return trace(args);
         std::cerr << "unknown probe command: " << command << '\n';
         return 2;
     } catch (const std::exception& error) {
