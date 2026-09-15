@@ -119,6 +119,162 @@ than resolved by choosing a different setting after seeing the ladder.
 
 No settings file has been frozen, and the corrected cohort has not been run.
 
+### R7.4 The freeze (steps 6 and the round-7 ruling)
+
+**The ruling.** The reviewer set state limit 1,024, mosaic K = 8, panel K = 0, and kept the predeclared K = 256
+audit.
+
+- **At 256** the genotypes are accurate, but the audit cannot be reached. Every potential phase claim would
+  be UNRESOLVED because of a resource setting.
+- **At 1,024** winners and block genotypes are unchanged, and every audit completes. The ladder's honest
+  answer, PRIOR_ONLY, can then be reported, for about 11 s more per donor.
+- **The audit stays at K = 256.** Shrinking it to K = 128 after seeing that 256 is unreachable would weaken a
+  predeclared check, with no evidence that 128 suffices.
+- **GQ is reported strictly per arm.** The panel arm conditions on every panel diplotype, and the mosaic arm on
+  those plus eight mosaics. A GQ of 30 means different things in the two arms.
+
+**Selection rule** (`scripts/select_genotype_ladder.py`, commit `5937384`). A frozen setting must meet all of
+these for every development donor:
+
+- stable primary calls;
+- the primary K reached;
+- the declared audit reachable at its state limit.
+
+If no setting qualifies, nothing is selected.
+
+**Gate.** `tests/genotype_select_ladder_test.py`, registered in ctest, uses synthetic ladders with identical
+calls:
+
+| Audit reachable at | Selected |
+|---|---|
+| 1,024 and 4,096 only | 1,024 |
+| 256 as well | 256 |
+| nowhere | nothing |
+
+**On the real round-6 ladder** the rule rejects state limit 256 for every positive K: K = 8–128 fail on the
+audit, and K = 256 fails on both K and the audit. It freezes state limit 1,024 with K = 8. The K = 0 panel arm
+gives the reference call for 8 of 8 donors.
+
+**Frozen settings.** `tests/genotype_frozen_settings_r6.tsv`, committed in `5937384` before any corrected
+held-out run:
+
+| Key | Value |
+|---|---|
+| `state_limit` | 1024 |
+| `panel_arm_mosaic_candidates` | 0 |
+| `mosaic_arm_mosaic_candidates` | 8 |
+| `phase_audit_candidates` | 256 |
+| `seed` | 7 |
+| `depth` | 30 |
+
+The file records the reason for 1,024: it is the smallest stable setting that meets the already-declared
+audit contract, not an accuracy gain.
+
+**Also in `5937384`.**
+
+- The source-tree gate treats a `.tsv` as generated only when it is a run-output table, so an uncommitted
+  settings file is not flagged. A planted stray graph or status table still fails it.
+- All 18 tests pass.
+
+### R7.5 The corrected held-out LZO cohort (steps 7–8)
+
+**Setup.**
+
+- `tests/genotype_cohort_c4_r6.sh`, from a clean worktree at `5937384` (clean after the build and after all 18
+  tests; signature `git_tree_dirty false`).
+- The 56 held-out donors, seed 7, 30× depth.
+- Frozen settings: state limit 1,024, and one proposal and one scoring pass per donor ranking both arms (K = 0
+  and K = 8), each with the K = 256 phase audit.
+- A new directory, `tests/results/genotype_cohort_c4_r6_5937384/`. R5, the R6 targeted outputs and the
+  round-6 ladder are unchanged.
+
+**Per arm** (never pooled):
+
+| | Panel arm, K = 0 | Mosaic arm, K = 8 |
+|---|---|---|
+| Run no-calls | 0 of 56 | 0 of 56 |
+| Block genotypes exact, emitted / intended | 616 / 616, 616 / 616 | 616 / 616, 616 / 616 |
+| Donors fully exact | 56 of 56 | 56 of 56 |
+| SV blocks exact | 280 / 280 | 280 / 280 |
+| Read-supported blocks exact | 610 / 610 | 609 / 609 |
+| SV distance, context distance | 0, 0 | 0, 0 |
+| Truth among candidates | 56 (as panel pairs) | 56 (as panel pairs) |
+| Candidate scope | CONDITIONAL, 56 | CONDITIONAL, 56 |
+| Phase within candidates | READS_WITHIN_CANDIDATES 55, PRIOR_ONLY 1 | READS_WITHIN_CANDIDATES 12, PRIOR_ONLY 44 |
+| Phase audit (K = 256) | COMPLETE, 56 | COMPLETE, 56 |
+| Phase reported | READS_AUDITED 5, PRIOR_ONLY 51 | READS_AUDITED 5, PRIOR_ONLY 51 |
+| Conditional GQ strata, blocks exact | GQ ≥ 100: 616 / 616 | GQ ≥ 100: 615 / 615; GQ 50–100: 1 / 1 |
+| Lowest block GQ | 1,370 (HG00512) | 69.7 (NA19384 `ctx:0`) |
+| Depth fit | `boundary_kkt` 40, `interior_stationary` 16 | same fit |
+
+**Paired, panel → mosaic.**
+
+- No donor's winner changed; no block call changed (0 of 616).
+- Adding eight off-panel mosaics changes no LZO genotype.
+- It does change the conditional quantities. Phase claimed within candidates falls from 55 to 12, and the
+  lowest block GQ from 1,370 to 69.7. These are what the added hypotheses should affect: the candidate set
+  now includes recombinant rivals.
+
+**Phase.**
+
+- The same five donors are `READS_AUDITED` in both arms: HG00512, HG01573, HG02492, HG04217 and NA19331. Four of
+  them are the round-5 donors whose truth was never proposed.
+- Every other donor is `PRIOR_ONLY` once the K = 256 audit set is examined. As the reviewer anticipated, this
+  does not show C4 phase is generally read-supported: for 51 of 56 donors, the prior decides phase.
+
+**Not read-supported, all exact.**
+
+- **HG00171:** six blocks, in both arms (`ctx:0`, `ctx:2`, `ctx:6`, `sv:7`, `ctx:8`, `ctx:10`). A fragment
+  contender differs there, so the prior decides. The posterior is still 1 and GQ 8,277, because the conditional
+  posterior includes the prior. A high conditional GQ is therefore not by itself read support.
+- **NA19384:** `ctx:0` (12.3 kb) in the mosaic arm, posterior 0.9999999, GQ 69.7, numerically separated. It was also
+  the one prior-supported block in round 5.
+
+**Round 5 → round 7 on the same 56 donors.** The reads are byte-identical to round 5's for all 56 donors (the
+same simulator, seed and depth), and so is the graph. This is a paired comparison on identical input.
+
+- Run no-calls fall from 1 to 0.
+- Exact intended blocks rise from 601 / 616 to 616 / 616.
+- Fully exact donors rise from 51 to 56.
+- Read-phase claims fall from 10 unaudited (K = 8) to 5 audited.
+
+**Runtime and memory.**
+
+- Median 89.7 s per donor, maximum 111.6 s; 27 of 56 runs exceeded 90 s. Peak RSS median 551 MB, maximum
+  652 MB.
+- Rescoring dominates: the one scoring pass over the 8,515 panel diplotypes and the audit's 256 mosaics took a
+  median of 80.2 s (maximum 102.4 s). Model, markers, proposal and spelling together took about 6 s.
+- Runs shared the machine four at a time, on 4 performance and 6 efficiency cores, while other donors'
+  simulations and evaluations ran.
+- **Serial check (diagnostic, not a cohort output).** The slowest donor, HG03683 (111.6 s in the cohort),
+  was rerun alone from the frozen worktree's build: 60.6 s wall (rescoring 55.7 s), 659 MB, the same winner.
+  Run alone, the command is inside the 60–90 s target. The slow cohort runs came from sharing the machine.
+
+
+### R7.6 Status
+
+Every step of the round-6 sequence is done.
+
+- The rulings are applied and gated.
+- The ladder was run with K = 0.
+- Both arms were frozen before the run, with the audit contract enforced by the selector.
+- The corrected 56-donor cohort ran from a clean worktree into a new directory.
+- R5, the R6 targeted outputs and the round-6 ladder are unchanged.
+
+The primary LZO objective holds on held-out C4 at 30×: every block genotype is exact and every run calls, in
+both arms. The result does not claim C4 phase is read-supported. For 51 of 56 donors the prior decides phase
+once the audit set is examined.
+
+**Deferred work, as ruled, for the reviewer to schedule.**
+
+- A two-level distinct-prefix diversity beam for recombinant (LOO) recall.
+- A marker model that does not count correlated syncmers as independent.
+- A LOWCONF threshold frozen from lower-coverage development LZO simulations.
+- An additional frozen seed and other loci for publication-quality validation. These 56 donors have
+  influenced development.
+
+
+
 ## R6. Review round 6 — protected panel baseline, depth, phase and confidence
 
 The reviewer ruled on round 5:
