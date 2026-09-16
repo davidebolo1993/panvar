@@ -103,19 +103,76 @@ folded into it. That is what made both failures invisible until the round trip.
 myom2 286 across `ctx:17` and `ctx:46`. These templates walk both boundaries and find nothing between them; they
 are not bypasses and must not be refused.
 
-### R10.5 Next
+### R10.5 The behavioural commit (`7e637d4`, `9319cfc`)
 
-The behavioural commit follows separately: `Uncovered` makes the whole template's frame Partial, it emits no
-allele and contributes no bypass count or representation-dependence flag, the refusal is specific
-(`locus_coverage_partial`, naming the missing terminal span), and the byte-for-byte round trip stays as an
-independent backstop. Fixtures owed: a forward path ending before the first bubble; the reverse case; a path
-missing the trailing end; a genuine bracketed internal deletion, which must stay valid; a traversing empty
-allele; a mutation restoring uncovered to bypass, which must fail; and the real cyp2d6 check — NA18989 turns
-Partial, its 1,978 missing bases are reported, it contributes no alleles.
+`Uncovered` now makes the whole template's locus frame Partial: it emits no allele, contributes no bypass count
+and therefore no representation-dependence flag, and `prepare_genotype_model` refuses it as
+`locus_coverage_partial`, naming the terminal anchor and the blocks. The byte-for-byte round trip is kept as an
+independent backstop. Coverage and representation stay separate concepts in the report: `uncovered_blocks` is a
+property of one template, the representation-dependent set a property of the chain.
 
-This will not make cyp2d6 runnable: a partial template still fails model construction closed, which is correct.
-No template is to be dropped silently; any curated-panel experiment records the excluded template and does not
-evaluate that donor as a leave-one-out truth.
+**Two states that are not uncovered, and must not become so.** Both were found by the gates, not by reading.
+
+- A deletion bracketed on both sides is still a bypass -- representable, and still able to make its block and
+  both neighbours representation-dependent. No real locus of the six exercises this; the branch stays because
+  future loci will.
+- A flank whose boundary node is on the path with **nothing beyond it** is empty, not absent. `flank_steps`
+  returns `nullopt` for both cases, and reading them alike refused every template of the end-to-end fixture: a
+  bubble owns its boundary nodes, so a template whose path starts exactly at the first bubble has a zero-length
+  leading flank and has still observed that block. Fixed in `walk_block`, which now separates "boundary absent"
+  from "boundary present, nothing outside it".
+
+A third defect was self-inflicted and is recorded because it is silent: `partial_reason` was first added as the
+third member of `PanelTemplateInput`, an aggregate that fixtures initialise positionally, so
+`{"h0", Complete, {"a-rich"}}` bound the allele list to the new string and left `allele_source_ids` empty. It
+compiles clean and fails at run time. The field now sits last, with a comment saying why.
+
+**Gates.** Six synthetic fixtures run unconditionally: a forward template missing the left terminal, the same in
+reverse, one missing the trailing end, a bracketed deletion that must stay valid, a traversing empty allele, and
+a mutation gate -- adding an uncovered template must leave the allele census byte-identical, which fails the
+moment uncovered is folded back into bypass. The seventh, the real cyp2d6 check, is a reported verification
+rather than a registered gate: that graph lives outside the repository, and adding it to the test data is a
+decision about repository contents.
+
+### R10.6 The required outcomes, measured
+
+| Outcome | Result |
+|---|---|
+| c4, acot, gstm1, ankrd36c fingerprints unchanged | identical at `774e4d9` and `7e637d4`; c4 also matches the value frozen in the round 7/8 cohort at `b1684ae` |
+| cyp2d6 refuses NA18989 before round-trip verification | `locus_coverage_partial: missing left-terminal coverage at ctx:0, sv:1, ctx:2` |
+| NA18989 contributes no allele or bypass record | its representation-dependent trio is gone, which is only possible if `sv:1` carries no bypass from a complete template |
+| cyp2d6 representation dependence disappears | `representation_dependent_blocks` 0 |
+| myom2 reports 384/385 partial, one complete | 63 orientation-refused + 321 uncovered at the trailing anchor; one template complete |
+| gstm1 and myom2 empty alleles stay empty alleles | gstm1 179 at `ctx:11`; myom2 375 pairs across `ctx:17` and `ctx:46`, all still `empty_between_boundaries` |
+| the bridged-bypass branch stays supported | fixture 4: not refused, still bypasses, still flags its trio, round trip passes |
+| full suite | 19/19 enabled tests |
+
+| Locus | fingerprint before (`774e4d9`) | after (`7e637d4`) |
+|---|---|---|
+| c4 | `d2b8c6c2e0b4079d` | `d2b8c6c2e0b4079d` |
+| acot | `d622742f9cf8e7a5` | `d622742f9cf8e7a5` |
+| gstm1 | `b81c194ecdb3324d` | `b81c194ecdb3324d` |
+| ankrd36c | `7c54f51f6177ac11` | `7c54f51f6177ac11` |
+
+**On naming `ctx:2` uncovered.** The reviewer expected `uncovered_blocks` to be `ctx:0, sv:1`, on the reading
+that `ctx:2` traversed normally. It does not. `sv:1` is bounded by nodes 48 and 82 and `ctx:2` by 82 and 248,
+while NA18989's path spans nodes 205-5763: it holds `ctx:2`'s sink but not its source, and a backbone block
+requires both. The 109 bases `ctx:2` spells for that template came from `sv:3`'s divergence trim, not from a
+walk. Block boundary nodes are now in the report so this is settled by node identity rather than by argument.
+
+### R10.7 What remains
+
+This does not make cyp2d6 runnable, and should not: a partial template fails model construction closed. cyp2d6
+is now one explicit curation decision about one template. myom2 is an upstream locus-definition problem -- its
+chain's trailing anchor is reached by one template of 385 -- and the reviewer's ruling stands: do not derive a
+shorter locus automatically from whichever panel happens to be loaded, and produce a coverage-by-boundary table
+of candidate cut positions, retained templates and the features each cut would remove, as a separate model
+decision. No template is to be dropped silently; any curated-panel experiment records the excluded template and
+does not evaluate that donor as a leave-one-out truth.
+
+Still owed from round 9, untouched: a true K = 0 / audit = 0 panel run that skips the beam entirely, gated
+byte-identical; the large-locus pilot at state limit 256 with K = 8 and phase UNRESOLVED; profiling a 2x
+panel-only acot donor before any optimisation; the JOBS = 1 versus 2 benchmark; and disk hygiene.
 
 ## R9. Review round 9 — harness cleanup, and what the other loci cost
 
