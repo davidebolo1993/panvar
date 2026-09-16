@@ -1,6 +1,7 @@
 #include "panvar/fragment_likelihood.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <exception>
 #include <map>
@@ -351,6 +352,31 @@ std::vector<PieceIndex> build_piece_indexes(
     return indexes;
 }
 
+// Process-wide budget for the two caps that bound WORK rather than merely decide acceptance. Shared by
+// every placement worker, so T workers cannot each consume a full cap before anyone refuses -- which is
+// what a per-worker guard silently allowed, and what makes a 64-thread request nearly breaker-free.
+//
+// The verdict is still taken later, on the exact merged totals; this exists to stop the work promptly,
+// not to decide the answer. `cancelled` is what makes "promptly" true: the worker that crosses a cap
+// raises it, and every other worker abandons its range at the next check rather than running to
+// completion.
+struct PlacementBudget {
+    std::atomic<std::uint64_t> piece_hits{0};
+    std::atomic<std::uint64_t> physical_origins{0};
+    std::atomic<bool> cancelled{false};
+    std::uint64_t max_piece_hits = 0;
+    std::uint64_t max_physical_origins = 0;
+    std::uint64_t publish_batch = 4096;
+
+    bool stop() const { return cancelled.load(std::memory_order_relaxed); }
+    void cancel() { cancelled.store(true, std::memory_order_relaxed); }
+};
+
+// Raised by a worker abandoning its range because another worker already crossed a cap. It never
+// escapes score_diplotypes: the cap that was actually crossed is reported instead, so the message a
+// caller sees does not depend on which worker noticed first.
+class PlacementCancelled : public std::exception {};
+
 // Scan one haplotype once per piece-length bucket, turning every piece hit into an implied read
 // start. This is the inversion the design calls for: the haplotype is walked, not queried once per
 // read against a position hash the size of the locus.
@@ -358,11 +384,28 @@ void collect_form_placements(
     const std::string& haplotype,
     const std::vector<ReadForm>& forms,
     const std::vector<PieceIndex>& indexes,
+    PlacementBudget& budget,
     std::size_t band,
     std::vector<std::vector<FormPlacement>>& out,
     FragmentScoringCounters& counters,
     const FragmentScoringOptions& options) {
     std::vector<std::pair<std::uint32_t, std::uint32_t>> proposed;   // (form, start)
+    // Piece hits accumulated since the last publication to the shared budget. Drained before this
+    // function returns, so nothing a worker counted goes unpublished and the merged total stays exact.
+    std::uint64_t unpublished_piece_hits = 0;
+    const auto publish_piece_hits = [&]() {
+        if (unpublished_piece_hits == 0) return;
+        const std::uint64_t total =
+            budget.piece_hits.fetch_add(unpublished_piece_hits, std::memory_order_relaxed) +
+            unpublished_piece_hits;
+        unpublished_piece_hits = 0;
+        if (total > budget.max_piece_hits) {
+            budget.cancel();
+            throw ResourceExhausted(
+                "fragment scoring reached its piece-hit cap; the locus is too repetitive for the "
+                "declared caps and no partial ranking is returned");
+        }
+    };
 
     for (const PieceIndex& index : indexes) {
         const std::size_t piece = index.piece_bp;
@@ -391,10 +434,25 @@ void collect_form_placements(
                     }
                 });
             for (auto it = range.first; it != range.second; ++it) {
-                if (++counters.piece_hits > options.max_piece_hits) {
-                    throw ResourceExhausted(
-                        "fragment scoring reached its piece-hit cap; the locus is too repetitive "
-                        "for the declared caps and no partial ranking is returned");
+                // The hottest counter in the program -- 320M increments on C4 at audit 256 -- so it is
+                // accumulated locally and published to the shared budget in batches. An exact atomic
+                // here would cost more than the threading saves. The overshoot batching admits is
+                // bounded by threads * publish_batch and declared in the header; the exact verdict is
+                // taken later, from the merged totals.
+                ++counters.piece_hits;
+                if (++unpublished_piece_hits >= budget.publish_batch) {
+                    const std::uint64_t total =
+                        budget.piece_hits.fetch_add(unpublished_piece_hits,
+                                                    std::memory_order_relaxed) +
+                        unpublished_piece_hits;
+                    unpublished_piece_hits = 0;
+                    if (total > budget.max_piece_hits) {
+                        budget.cancel();
+                        throw ResourceExhausted(
+                            "fragment scoring reached its piece-hit cap; the locus is too repetitive "
+                            "for the declared caps and no partial ranking is returned");
+                    }
+                    if (budget.stop()) throw PlacementCancelled();
                 }
                 if (it->offset > piece_start) continue;   // implied start would be negative
                 proposed.emplace_back(it->form,
@@ -408,6 +466,10 @@ void collect_form_placements(
             }
         }
     }
+
+    // Drain whatever this haplotype counted below the last batch boundary, so the shared total is the
+    // true total rather than a multiple of publish_batch, and the merged verdict stays exact.
+    publish_piece_hits();
 
     // Several pieces of one read can rediscover one physical placement. Deduplicate before
     // verifying, so a placement found three ways is verified once and counted once.
@@ -474,7 +536,8 @@ FragmentScoringResult score_diplotypes(
     const std::vector<HaplotypeCandidate>& candidates,
     const std::vector<ReadPair>& fragments,
     const LibraryModel& library,
-    const FragmentScoringOptions& options) {
+    const FragmentScoringOptions& options,
+    FragmentScoringCounters* observed_on_failure) {
     validate_library_model(library);
     if (options.minimum_piece_bp == 0) {
         throw std::invalid_argument("minimum indexable piece length must be positive");
@@ -600,6 +663,13 @@ FragmentScoringResult score_diplotypes(
     // crossing point moves with the partition, and the declared contract is that a given input either
     // completes or refuses regardless of thread count. `max_proposed_starts_per_haplotype` is unaffected
     // and still throws locally, because it tests a per-haplotype vector rather than a running total.
+    // One budget for every worker: these two caps bound the work performed, not merely the answer, so
+    // they cannot be per worker without letting T workers each consume a full cap.
+    PlacementBudget budget;
+    budget.max_piece_hits = options.max_piece_hits;
+    budget.max_physical_origins = options.max_physical_origins;
+    budget.publish_batch = std::max<std::uint64_t>(1, options.piece_hit_publish_batch);
+
     const auto place_range = [&](std::size_t first_h, std::size_t last_h,
                                  FragmentScoringCounters& counters) {
     std::map<StateKey, std::uint64_t> states;
@@ -608,7 +678,7 @@ FragmentScoringResult score_diplotypes(
         if (forms.empty()) continue;
 
         std::vector<std::vector<FormPlacement>> placements(forms.size());
-        collect_form_placements(haplotype, forms, indexes, band, placements, counters, options);
+        collect_form_placements(haplotype, forms, indexes, budget, band, placements, counters, options);
 
         for (std::size_t f = 0; f < fragments.size(); ++f) {
             const std::size_t first_length = fragments[f].first.bases.size();
@@ -655,15 +725,20 @@ FragmentScoringResult score_diplotypes(
                             start.start, forward_length, it->start, reverse_length, support);
                         if (!insert.has_value()) continue;
                         ++counters.valid_fr_states;
-                        // Accumulated here, decided after the ordered merge. The local guard uses the
-                        // FULL global cap, never a per-worker share: it can therefore never refuse an
-                        // input the serial path would accept, and exists only so a pathological locus
-                        // cannot grow without bound before the merge gets a chance to refuse it.
-                        if (++counters.physical_origins > options.max_physical_origins) {
+                        // Thirty times cooler than piece_hits (9.4M against 320M on C4), so this one
+                        // carries an exact shared counter: the work bound is tight, with no batching
+                        // overshoot at all. Crossing it cancels every worker rather than letting each
+                        // consume a full cap. The verdict still comes from the merged totals later.
+                        ++counters.physical_origins;
+                        const std::uint64_t origins =
+                            budget.physical_origins.fetch_add(1, std::memory_order_relaxed) + 1;
+                        if (origins > budget.max_physical_origins) {
+                            budget.cancel();
                             throw ResourceExhausted(
                                 "fragment scoring reached its physical-origin cap; no partial "
                                 "ranking is returned");
                         }
+                        if (budget.stop()) throw PlacementCancelled();
                         StateKey key;
                         key.insert_bp = static_cast<std::uint32_t>(*insert);
                         key.forward_mismatches = start.mismatches;
@@ -735,8 +810,27 @@ FragmentScoringResult score_diplotypes(
             : std::max<std::size_t>(1, std::min(options.threads, unique));
     result.threads_used_placement = placement_threads;
 
+    // A refusal reports the work it performed, so the breaker can be held to a bound and not merely to
+    // a verdict. After a worker threw, `counters` is still empty -- the merge below never ran -- and the
+    // budget's published totals are the only global record; after a post-merge check `counters` is exact
+    // and includes the remainders no batch published. The larger of the two is right in both cases. On
+    // the worker path the other fields stay zero: they are per-range sums that were never merged.
+    const auto note_observed_work = [&]() {
+        if (observed_on_failure == nullptr) return;
+        *observed_on_failure = counters;
+        observed_on_failure->piece_hits =
+            std::max(counters.piece_hits, budget.piece_hits.load(std::memory_order_relaxed));
+        observed_on_failure->physical_origins = std::max(
+            counters.physical_origins, budget.physical_origins.load(std::memory_order_relaxed));
+    };
+
     if (placement_threads <= 1) {
-        place_range(0, unique, counters);
+        try {
+            place_range(0, unique, counters);
+        } catch (const ResourceExhausted&) {
+            note_observed_work();
+            throw;
+        }
     } else {
         const std::size_t span = (unique + placement_threads - 1) / placement_threads;
         std::vector<FragmentScoringCounters> local(placement_threads);
@@ -749,14 +843,26 @@ FragmentScoringResult score_diplotypes(
             workers.emplace_back([&, t, first_h, last_h]() {
                 try {
                     place_range(first_h, last_h, local[t]);
+                } catch (const PlacementCancelled&) {
+                    // Another worker crossed a cap and this one abandoned its range. That is the
+                    // breaker working, not a failure of its own: the worker that actually crossed
+                    // reports the cap, so the message does not depend on who noticed first.
                 } catch (...) {
                     failures[t] = std::current_exception();
                 }
             });
         }
         for (std::thread& worker : workers) worker.join();
+        // Rethrown in thread-index order, so which worker's message surfaces does not depend on which
+        // one crossed the cap first. A refusal records the work performed before it stopped.
         for (const std::exception_ptr& failure : failures) {
-            if (failure) std::rethrow_exception(failure);
+            if (!failure) continue;
+            try {
+                std::rethrow_exception(failure);
+            } catch (const ResourceExhausted&) {
+                note_observed_work();
+                throw;
+            }
         }
         // Summed in thread-index order, so the totals a run reports are the serial totals exactly.
         for (const FragmentScoringCounters& part : local) {
@@ -776,15 +882,21 @@ FragmentScoringResult score_diplotypes(
     // mid-loop is what keeps a given input's completion-or-refusal decision the same at any thread
     // count: the crossing point moves with the partition, the total does not.
     if (counters.piece_hits > options.max_piece_hits) {
+        note_observed_work();
         throw ResourceExhausted(
             "fragment scoring reached its piece-hit cap; the locus is too repetitive for the declared "
             "caps and no partial ranking is returned");
     }
     if (counters.physical_origins > options.max_physical_origins) {
+        note_observed_work();
         throw ResourceExhausted(
             "fragment scoring reached its physical-origin cap; no partial ranking is returned");
     }
+    // Unlike the two above, this one bounds nothing in flight: state classes are counted after the
+    // per-fragment merge, so the work and the memory are already spent by the time it is consulted. It
+    // is an acceptance cap on the result, not a breaker, and so it needs no shared budget.
     if (counters.statistical_state_classes > options.max_state_classes) {
+        note_observed_work();
         throw ResourceExhausted(
             "fragment scoring reached its statistical-class cap; no partial ranking is returned");
     }

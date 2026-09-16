@@ -197,6 +197,10 @@ struct CandidateSetReport {
     // falls back to one worker for full-origin recording even when more were asked for.
     std::size_t threads_used_placement = 1;
     std::uint64_t candidate_fragment_evaluations = 0;
+    // Work actually performed when a cap refused the run. Without it a refusal reports nothing, and a
+    // breaker that stopped at the cap is indistinguishable from one that stopped long past it.
+    FragmentScoringCounters observed_counters;
+    bool observed_counters_valid = false;
     // True when no beam ran at all: K = 0, no phase audit and no positive development prefix, so the
     // candidate set is exactly the panel and nothing about it is conditional on a search. Reported as
     // candidate_scope PANEL_ONLY, which is neither COMPLETE nor CONDITIONAL -- both of those describe
@@ -354,6 +358,13 @@ void write_status(
         out << "haploid_prior_evaluations\t" << candidate_set->haploid_prior_evaluations << '\n';
         out << "diploid_prior_lookups\t" << candidate_set->diploid_prior_lookups << '\n';
         out << "candidate_fragment_evaluations\t" << candidate_set->candidate_fragment_evaluations << '\n';
+        if (candidate_set->observed_counters_valid) {
+            // A refused run reports the work it performed, so the breaker can be held to a bound rather
+            // than merely to a verdict.
+            out << "observed_piece_hits\t" << candidate_set->observed_counters.piece_hits << '\n';
+            out << "observed_physical_origins\t" << candidate_set->observed_counters.physical_origins
+                << '\n';
+        }
         // Derived once, here, and used verbatim by every block row.
         out << "candidate_scope\t"
             << candidate_scope_name(candidate_set->panel_only,
@@ -793,7 +804,8 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     std::string rescore_failure;
     if (any_ranked) {
         try {
-            scored = score_diplotypes(interned, scored_pairs, fragments, library, scoring_options);
+            scored = score_diplotypes(interned, scored_pairs, fragments, library, scoring_options,
+                                      &candidate_report.observed_counters);
             timings.rescoring_fragment_preparation = scored.seconds_fragment_preparation;
             timings.rescoring_placement_and_mass = scored.seconds_placement_and_mass;
             timings.rescoring_diploid_combination = scored.seconds_diploid_combination;
@@ -802,6 +814,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             candidate_report.candidate_fragment_evaluations = scored.candidate_fragment_evaluations;
         } catch (const ResourceExhausted& error) {
             rescore_failure = error.what();
+            candidate_report.observed_counters_valid = true;
         }
     }
     timings.rescoring = seconds_since(mark);

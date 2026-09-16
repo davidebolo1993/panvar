@@ -11,6 +11,10 @@
 #include "panvar/genotype_locus.hpp"
 #include "panvar/marker_model.hpp"
 #include "panvar/bubbles.hpp"
+// For the declared piece-hit publication batch: the cap test bounds the work a refused parallel run may
+// perform, and that bound is cap + threads * batch. Reading the default here rather than repeating the
+// number keeps the test honest if the batch is ever retuned.
+#include "panvar/fragment_likelihood.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -1008,7 +1012,10 @@ void test_candidate_prefixes_match_standalone() {
                     // candidates x fragments of the SHARED scoring pass, which covers the union of every
                     // prefix. A standalone run of one K scores only its own set, so this differs for
                     // every prefix, not just K = 0 -- it describes the pass, not the candidate set.
-                    "candidate_fragment_evaluations"};
+                    "candidate_fragment_evaluations",
+                    // Only a refused run emits these, and they measure the work the shared budget
+                    // allowed before it stopped -- a property of the pass, not of the candidate set.
+                    "observed_piece_hits", "observed_physical_origins"};
                 if (shared_work.count(key) != 0) continue;
                 // K = 0 alone is asymmetric, and legitimately so: a standalone K = 0 run requests no
                 // mosaics, no audit and no prefix, so it builds no beam at all, while the K = 0 VIEW of a
@@ -1253,9 +1260,20 @@ void test_resource_caps_are_thread_invariant() {
         else options.max_state_classes = value;
     };
 
+    // 1 and 2 exercise the shared budget, 4 raises the contention, and 64 is deliberately excessive for a
+    // fixture with a handful of haplotypes: it must be clamped to the work available, not honoured. The
+    // verdict has to be the same at all four.
+    const std::size_t thread_counts[4] = {1, 2, 4, 64};
+    // The declared parallel overshoot. piece_hits is published in batches, so a worker can be up to one
+    // batch past the cap when it publishes; physical_origins is an exact atomic, so a worker can be at
+    // most one increment past. Either way the overshoot is per worker and bounded, which is the whole
+    // difference between a shared budget and a per-worker one.
+    const std::uint64_t publish_batch = panvar::FragmentScoringOptions{}.piece_hit_publish_batch;
+
     for (int which = 0; which < 3; ++which) {
-        std::string accepted_counters[3];
-        for (const std::size_t workers : {std::size_t{1}, std::size_t{2}}) {
+        std::vector<std::string> accepted_counters;
+        std::vector<std::uint64_t> work_before_refusal;
+        for (const std::size_t workers : thread_counts) {
             // Just above: a cap equal to the total accepts, and must still call.
             const std::string at_name =
                 "caps_at_" + std::to_string(which) + "_t" + std::to_string(workers);
@@ -1266,9 +1284,9 @@ void test_resource_caps_are_thread_invariant() {
                     std::string(cap_names[which]) + " at exactly the reached total must accept at " +
                         std::to_string(workers) + " thread(s)");
             const auto at_status = read_status(path(at_name) + ".mosaic_status.tsv");
-            accepted_counters[workers] = at_status.at("piece_hits") + "/" +
-                                         at_status.at("physical_origins") + "/" +
-                                         at_status.at("statistical_state_classes");
+            accepted_counters.push_back(at_status.at("piece_hits") + "/" +
+                                        at_status.at("physical_origins") + "/" +
+                                        at_status.at("statistical_state_classes"));
 
             // Just below: one less refuses, ends RESCORE_INCOMPLETE, and leaves no ranking or call.
             const std::string below_name =
@@ -1285,10 +1303,89 @@ void test_resource_caps_are_thread_invariant() {
                     "a refusal must name the exhausted cap");
             require(no_ranking_or_call(below_name),
                     "a refused run must leave no partial ranking or call, at any thread count");
+
+            // The verdict alone does not prove the budget is shared: a per-worker budget refuses on the
+            // same merged totals, just after roughly threads x cap work. So assert the work performed.
+            const auto refused = read_status(path(below_name) + ".mosaic_status.tsv");
+            if (which == 2) {
+                // max_state_classes is a post-merge acceptance cap, not a breaker: classes are counted
+                // after the per-fragment merge, so the pass runs to completion and is judged afterwards.
+                // A refusal here therefore reports a whole run's work. That is the documented difference
+                // from the two caps above, and this is where it is pinned.
+                require(std::stoull(refused.at("observed_piece_hits")) == totals[0],
+                        "a statistical-class refusal must report a complete pass, not a truncated one");
+            } else {
+                const std::string key =
+                    which == 0 ? "observed_piece_hits" : "observed_physical_origins";
+                const std::uint64_t overshoot =
+                    which == 0 ? workers * publish_batch : static_cast<std::uint64_t>(workers);
+                const std::uint64_t observed = std::stoull(refused.at(key));
+                // An upper bound alone is satisfied by a silent zero, which is what a refusal reports if
+                // the plumbing is wrong. The work performed must be real.
+                require(observed > 0, "a refusal must report the work it performed, not a zero");
+                require(observed <= (totals[which] - 1) + overshoot,
+                        std::string("work before refusal must not exceed the cap plus the declared "
+                                    "parallel overshoot for ") +
+                            cap_names[which] + " at " + std::to_string(workers) +
+                            " thread(s): " + std::to_string(observed) + " > " +
+                            std::to_string((totals[which] - 1) + overshoot));
+                work_before_refusal.push_back(observed);
+            }
         }
-        require(accepted_counters[1] == accepted_counters[2],
-                std::string("accepted runs must report identical counters at 1 and 2 threads for ") +
-                    cap_names[which] + ": " + accepted_counters[1] + " vs " + accepted_counters[2]);
+        for (std::size_t i = 1; i < accepted_counters.size(); ++i) {
+            require(accepted_counters[i] == accepted_counters.front(),
+                    std::string("accepted runs must report identical counters at every thread count "
+                                "for ") +
+                        cap_names[which] + ": " + accepted_counters.front() + " vs " +
+                        accepted_counters[i]);
+        }
+        // The shared-budget property itself. Work before refusal must not grow with the thread count
+        // beyond the declared per-worker overshoot; under a per-worker budget it grows toward
+        // threads x cap, and the 4- and 64-thread rows are what catch that.
+        for (std::size_t i = 1; i < work_before_refusal.size(); ++i) {
+            const std::uint64_t overshoot =
+                thread_counts[i] * (which == 0 ? publish_batch : std::uint64_t{1});
+            require(work_before_refusal[i] <= work_before_refusal.front() + overshoot,
+                    std::string("work before refusal must not grow with the thread count for ") +
+                        cap_names[which] + ": " + std::to_string(work_before_refusal.front()) +
+                        " serial vs " + std::to_string(work_before_refusal[i]) + " at " +
+                        std::to_string(thread_counts[i]) + " thread(s)");
+        }
+
+        // The runs above cannot actually tell a shared budget from a per-worker one. With the cap one
+        // below the total no single worker ever reaches it, so every arrangement refuses at the
+        // post-merge check having already done the whole pass -- 28,264 piece hits at 1, 2 and 64
+        // threads alike. Both semantics produce that number.
+        //
+        // Setting the cap far below the total separates them. A shared budget stops near the cap
+        // wherever the work sits; T per-worker budgets each spend a full cap, so the work grows toward
+        // T x cap, which for this fixture is the entire pass.
+        if (which != 2) {
+            const std::uint64_t deep = totals[which] / 4;
+            require(deep > 1, "fixture: the calibrated total must leave room for a quarter cap");
+            for (const std::size_t workers : {std::size_t{1}, std::size_t{4}}) {
+                const std::string name =
+                    "caps_deep_" + std::to_string(which) + "_t" + std::to_string(workers);
+                panvar::GenotypeCommandOptions run = tiny_options(name, r1, r2, "tiny_phaseable.gfa");
+                run.threads = workers;
+                apply_cap(run, which, deep);
+                require(panvar::run_genotype(run) == panvar::GenotypeRunStatus::RescoreIncomplete,
+                        std::string("a cap far below the reached total must refuse for ") +
+                            cap_names[which] + " at " + std::to_string(workers) + " thread(s)");
+                const auto status = read_status(path(name) + ".mosaic_status.tsv");
+                const std::string key =
+                    which == 0 ? "observed_piece_hits" : "observed_physical_origins";
+                const std::uint64_t unit = which == 0 ? publish_batch : std::uint64_t{1};
+                const std::uint64_t observed = std::stoull(status.at(key));
+                require(observed > 0, "a refusal must report the work it performed, not a zero");
+                require(observed <= deep + workers * unit,
+                        std::string("work before refusal must stay within the cap plus the declared "
+                                    "parallel overshoot for ") +
+                            cap_names[which] + " at " + std::to_string(workers) +
+                            " thread(s): " + std::to_string(observed) + " > " +
+                            std::to_string(deep + workers * unit));
+            }
+        }
     }
 }
 

@@ -4,6 +4,107 @@ Companion to `genotype_mosaic.md`, which remains the authoritative contract. Thi
 what is actually built, what its own gates still owe, and the work order to reach the Phase 8
 go/no-go.
 
+## R12. Review round 12 — what the run costs, and making it parallel without making it approximate
+
+Round 11 was accepted. The ordered work was: correct the reporting defects the review named, remove the fixed
+prior cost, then parallelise -- in that order, because measuring a stage that is mislabelled optimises the wrong
+thing. Commits: `990cf21`, `5bce56f`, `f94987a`, `6617d77`, `b2fc0f7`.
+
+### R12.1 One scope, and the exact-path prior computed once (`990cf21`)
+
+`candidate_scope` was derived independently in two places and the two could disagree. It is now computed once by
+`candidate_scope_name(panel_only, conditional)` and used by the status and every block row alike.
+
+The prior was the round's one real fixed cost: **217,622 haploid evaluations over 466 distinct paths** on acot,
+because the diploid prior re-derived each haplotype's prior for every pair it appeared in. The cache is keyed on
+the **complete allele path**, never on spelled sequence -- two representations of the same path must hit the same
+entry, and spelling is the thing representation independence forbids depending on. The diploid prior is then
+`cached(p1) + cached(p2) + (p1 != p2 ? log 2 : 0)`, short-circuiting on `-inf`. `seconds_prior` fell to
+0.14--0.16 s, and residual unaccounted time -- the honest measure of a timing model's completeness -- fell from
+24--28 s to 0.05--0.73 s.
+
+The gate is an invariant, not a timing: **haploid evaluations must equal distinct paths**. Measured 269 = 269 on
+c4 at audit 256 and 466 = 466 on acot. A cache that missed would inflate the first number; one that collided
+would deflate it.
+
+### R12.2 The audit counters, and where rescoring actually splits (`5bce56f`)
+
+Two reporting defects, both found by the review rather than by a gate. Counters were read *after* the phase audit
+had already contributed to them, so an audited run's figures described the audit as well as the run; they are now
+snapshotted first. And `seconds_candidates` was labelled candidate *combination* when it measured candidate
+*grouping* -- which is why an earlier round's attribution of cost to combination was wrong. Rescoring is now split
+into three reported terms, fragment preparation / placement-and-mass / diploid combination, which is the split the
+parallelisation below is organised around. The audit evaluates **269** paths on c4 at audit 256: 130 primary plus
+139 audit, not 130 as previously stated here.
+
+### R12.3 Deterministic parallelism, in two ordered commits (`f94987a`, `b2fc0f7`)
+
+Combination first, then placement. Both partition into **fixed contiguous ranges** with disjoint writes, and
+neither performs a cross-thread floating-point reduction -- so no sum is reordered and no result depends on the
+thread count. Counters merge in thread-index order; exceptions are collected, every worker joined, and only then
+rethrown in thread order, so which worker failed first cannot change which refusal the caller sees.
+
+Measured on the clean-worktree binary `ddfdd8fc`, ordered 1,2,2,1 so within-session drift is visible rather than
+hidden: placement 1.98--1.99x, rescoring 2.11x and 1.99x, totals 1.96x on c4 at audit 256 and 1.52x on acot 2x.
+Peak RSS +4--8%. Every statistical output byte-identical across thread counts.
+
+`6617d77` is the reason those numbers mean anything: the probe never parsed `--threads`, so a run invoked with
+`--threads 2` recorded `threads_requested 1` and measured the serial path four times. The harness's suite guard
+had the same shape of defect -- it grepped `ctest | tail -3` for a pass line that is not in the last three lines,
+so the benchmark skipped itself on a green suite.
+
+### R12.4 The operational caps under parallelism
+
+The review accepted the threading but not the resource contract: the caps had become **per worker**, so with T
+workers a pathological locus could perform roughly T x cap work before refusing. A circuit breaker that scales
+with the thread count is not a breaker.
+
+The caps are now **process-wide budgets**, and the two mechanisms are separated explicitly:
+
+* In flight, `max_piece_hits` and `max_physical_origins` are shared across workers and bound the **work actually
+  performed**. Crossing one cancels every worker promptly. `physical_origins` is an exact shared atomic;
+  `piece_hits` is published in batches of `piece_hit_publish_batch`, because it is the hottest counter in the
+  program -- **319,588,181** increments on c4 at audit 256 against **9,438,337** physical origins, a factor of 34
+  -- so an exact atomic there would plausibly cost more than the threading saves. The overshoot batching admits is
+  bounded and declared: at most `threads * piece_hit_publish_batch`, which is 8,192 against a 2,000,000,000 cap.
+* The **verdict** is taken once, after the counters are merged, on the exact totals. That is what keeps
+  accept-or-refuse identical at any thread count: a total equal to the cap accepts, one above refuses, however the
+  work was partitioned.
+
+`max_state_classes` remains a post-merge acceptance cap only, and the header says so: classes are counted after a
+fragment's states already exist, so bounding them in flight would limit neither memory nor work.
+
+A refused run now reports the work it performed (`observed_piece_hits`, `observed_physical_origins`) rather than
+nothing at all, which is what makes the bound testable instead of merely the verdict.
+
+**The first version of that test did not test what it claimed.** With the cap set one below the reached total, no
+single worker ever reaches it, so every arrangement refuses at the post-merge check having already done the whole
+pass -- 28,264 piece hits at 1, 2 and 64 threads alike. A per-worker budget produces exactly that number too. The
+defect was found by reading the refused status files, not from the green test. The discriminating case sets the
+cap far below the total: a shared budget stops near it, while T per-worker budgets each spend a full cap and the
+work grows toward T x cap, which for this fixture is the entire pass.
+
+Gates: the verdict is identical at 1, 2, 4 and a deliberately excessive 64-thread request, and accepted runs
+report identical counters at every one of them. With the piece-hit cap at 7,066 -- a quarter of the reached total
+-- the work performed before refusing is **10,613** at one thread and **14,642** at four, against **28,264** for a
+whole pass. With the physical-origin cap at 424 it is **425** and **428**: exactly the declared bound of the cap
+plus one increment per worker, against 1,699 for a whole pass. In the piece-hit refusal at four threads only a
+single physical origin was ever recorded, which is cancellation arriving promptly rather than at the next
+convenient boundary. The test also asserts the reported work is non-zero, because an upper bound alone is
+satisfied by a refusal that reports nothing -- the failure mode the plumbing would actually produce if it were
+wrong.
+
+Cost, ordered 1,2,2,1 against the same commit's measurements: placement +1.19% and +0.68% on c4 at 1 and 2
+threads, -0.22% and +0.48% on acot. Within-session drift on the four paired runs was 0.24%, 0.41%, 2.03% and
+0.55% -- so the largest cost figure sits inside the drift band and is not cleanly separable from machine noise.
+Well inside the 5--10% budget the review set. Speedups after the change: placement 1.99x and 1.98x, totals 1.94x
+and 1.52x, RSS +5% and +7%.
+
+**Not measured:** whether an exact atomic on `piece_hits` would also have been affordable. The review asked for
+exact-first-then-benchmark; batching was adopted directly on the 34x volume argument above, which is reasoning,
+not measurement. `piece_hit_publish_batch = 1` makes publication exactly per-increment, so the comparison is cheap
+to run, but it is not plumbed to the probe.
+
 ## R11. Review round 11 — the panel arm runs, and what it actually costs
 
 Round 10 was accepted. The ordered work was: finish the outstanding preflight corrections, implement a true

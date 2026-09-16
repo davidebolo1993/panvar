@@ -183,7 +183,30 @@ struct FragmentScoringOptions {
     // leave two orders of magnitude of headroom over C4 at 30x and K=64 (14.8M piece hits, 1.9M
     // proposed starts per haplotype, 0.88M physical origins) while stopping a repeat-rich locus such
     // as LPA before it exhausts memory. Reaching one throws ResourceExhausted.
+    //
+    // Under parallel placement these are PROCESS-WIDE budgets, not per worker. Two mechanisms, with
+    // different jobs, and the distinction matters:
+    //
+    //   * In flight, max_piece_hits and max_physical_origins are shared across workers and bound the
+    //     WORK actually performed. Crossing one cancels every worker promptly rather than letting each
+    //     consume a full cap -- which is what a circuit breaker is for, and what a per-worker guard
+    //     silently gave up. physical_origins is an exact shared counter; piece_hits is published in
+    //     batches of piece_hit_publish_batch because it is the hottest counter in the program (320M
+    //     increments on C4 at audit 256), so an exact atomic there would cost more than the threading
+    //     saves. The overshoot that batching admits is bounded and declared: at most
+    //     threads * piece_hit_publish_batch beyond the cap, which is 8,192 against a 2,000,000,000
+    //     default.
+    //
+    //   * The VERDICT is taken once, after the counters are merged, on the exact totals. That is what
+    //     keeps a given input's accept-or-refuse decision identical at any thread count: a total equal
+    //     to the cap accepts, one above refuses, however the work was partitioned.
+    //
+    // max_state_classes is deliberately only a post-merge acceptance cap. It is counted after a
+    // fragment's states already exist, so bounding it in flight would limit neither memory nor work.
     std::uint64_t max_piece_hits = 2000000000ULL;
+    // Increments a worker accumulates locally before publishing to the shared piece-hit budget. Larger
+    // is cheaper and admits proportionally more overshoot; the bound is threads * this value.
+    std::uint64_t piece_hit_publish_batch = 4096;
     std::uint64_t max_proposed_starts_per_haplotype = 50000000ULL;
     std::uint64_t max_physical_origins = 500000000ULL;
     std::uint64_t max_state_classes = 200000000ULL;
@@ -269,12 +292,17 @@ struct FragmentScoringResult {
 
 // Scores exactly the requested candidates and nothing else. The raw score of a candidate does not
 // depend on which other candidates were requested, on their order, or on any proposal score.
+// `observed_on_failure`, when given, receives the counters as they stood when a cap was reached, so a
+// refused run can report the work it actually performed rather than nothing at all. Without it a
+// refusal is unfalsifiable: there is no way to tell a breaker that stopped at the cap from one that
+// stopped long after it.
 FragmentScoringResult score_diplotypes(
     const InternedHaplotypes& haplotypes,
     const std::vector<HaplotypeCandidate>& candidates,
     const std::vector<ReadPair>& fragments,
     const LibraryModel& library,
-    const FragmentScoringOptions& options);
+    const FragmentScoringOptions& options,
+    FragmentScoringCounters* observed_on_failure = nullptr);
 
 // ---------------------------------------------------------------------------------------------
 // Certification.
