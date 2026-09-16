@@ -1620,6 +1620,7 @@ int preflight(const Args& args) {
         << "\ntemplates\t" << panel.template_count() << "\ndistinct_template_sequences\t" << distinct.size()
         << "\npanel_diplotypes\t" << panel_pairs
         << "\ntemplate_bp_min_mean_max\t" << (panel.template_count() ? min_bp : 0) << "," << mean_bp << "," << max_bp
+        << "\nmodel_fingerprint\t" << loaded.fingerprint
         << "\npanel_round_trip\t" << round_trip << "\nrepresentation_independent\t" << representation
         << "\nruns_as_is\t" << (runs_as_is ? "true" : "false")
         << "\npredicted_work_within_caps\t" << (within_caps ? "true" : "false")
