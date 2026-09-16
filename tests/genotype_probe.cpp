@@ -1356,8 +1356,51 @@ int preflight(const Args& args) {
     const std::uint64_t max_beam_extensions = std::stoull(args.get("max-beam-extensions", "2000000000"));
     const std::string stage =
         (std::filesystem::temp_directory_path() / ("genotype_probe_preflight_" + std::to_string(::getpid()) + ".sorted.gfa")).string();
-    const LoadedModel loaded = load_model(args.required("gfa"), reference, stage, min_variant_bp);
+    LoadedModel loaded;
+    std::string model_refusal;
+    try {
+        loaded = load_model(args.required("gfa"), reference, stage, min_variant_bp);
+    } catch (const std::exception& error) {
+        model_refusal = error.what();
+    }
     std::filesystem::remove(stage);
+    if (!model_refusal.empty()) {
+        // The locus cannot be modelled as it stands. Report what the structural pass did see -- partial frames
+        // are the usual cause -- rather than only the exception.
+        const SortedGraph sorted = load_sorted(args.required("gfa"), reference, stage + ".refused");
+        std::filesystem::remove(stage + ".refused");
+        panvar::BubbleCallOptions bubble_options;
+        bubble_options.reference_path = sorted.resolved;
+        bubble_options.quiet = true;
+        bubble_options.min_variant_bp = min_variant_bp;
+        bubble_options.snarl_pairs_override =
+            panvar::find_top_level_snarls_cactus(panvar::snarl_input_from_model(sorted.gfa));
+        bubble_options.snarl_source_supplied = true;
+        panvar::LocusInputOptions locus_options;
+        locus_options.locus_id = sorted.resolved;
+        locus_options.reference_path_name = sorted.resolved;
+        const panvar::LocusInputResult built =
+            panvar::build_locus_input(sorted.graph, panvar::call_bubbles(sorted.graph, bubble_options), locus_options);
+        std::ostringstream refused;
+        refused << "key\tvalue\nlocus\t" << sorted.resolved << "\nreference\t" << reference
+                << "\nmodel_refused\t" << model_refusal << "\ntemplates_in_graph\t"
+                << built.report.forward_templates + built.report.reverse_templates
+                << "\npartial_frames_refused\t" << built.report.refused_templates.size() << "\nblocks\t"
+                << built.report.variant_blocks + built.report.context_blocks << "\nvariant_blocks\t"
+                << built.report.variant_blocks << "\ncontext_blocks\t" << built.report.context_blocks
+                << "\ncanonical_alleles\t" << built.report.total_canonical_alleles
+                << "\nrepresentation_dependent_blocks\t" << built.report.representation_dependent_blocks.size()
+                << '\n';
+        for (std::size_t i = 0; i < built.report.refused_templates.size() && i < 10; ++i) {
+            refused << "refused_template_" << i << '\t' << built.report.refused_templates[i] << '\n';
+        }
+        std::cout << refused.str();
+        if (!args.get("out", "").empty()) {
+            std::ofstream file(args.get("out", ""));
+            file << refused.str();
+        }
+        return 0;
+    }
     const panvar::PreparedGenotypeModel& model = *loaded.model;
     const panvar::LocusInputReport& report = loaded.built.report;
     const panvar::PanelAlleleMatrix& panel = model.panel();
