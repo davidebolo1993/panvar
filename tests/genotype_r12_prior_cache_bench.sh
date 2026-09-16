@@ -51,6 +51,19 @@ CASES=(
   "c4_audit0_repeat|$OUT/c4.gfa|$C4_REF|$OUT/c4_reads|0|0"
 )
 
+# ONLY="name name" restricts the run to named cases, for a bounded review batch that must not spend the
+# machine on cases the reviewer did not ask for.
+if [ -n "${ONLY:-}" ]; then
+  SELECTED=()
+  for spec in "${CASES[@]}"; do
+    IFS='|' read -r name _ <<< "$spec"
+    case " $ONLY " in *" $name "*) SELECTED+=("$spec") ;; esac
+  done
+  [ "${#SELECTED[@]}" -gt 0 ] || { echo "ONLY matched no case" >&2; exit 1; }
+  CASES=("${SELECTED[@]}")
+  echo "restricted to: $ONLY"
+fi
+
 echo "=== runs ==="
 for spec in "${CASES[@]}"; do
   IFS='|' read -r name gfa ref reads prefixes audit <<< "$spec"
@@ -68,7 +81,7 @@ rss_mb() { awk '/maximum resident set size/{printf "%.0f", $1/1048576}' "$1" 2>/
 echo
 echo "=== benchmark table ==="
 printf '%-12s %8s %8s %10s %10s %9s %9s %9s %9s %8s\n' \
-  case pairs paths hap_evals dip_lookups s_prior s_cand s_rank s_total rss_MB
+  case pairs paths hap_evals dip_lookups s_prior s_group s_rank s_total rss_MB
 for spec in "${CASES[@]}"; do
   IFS='|' read -r name _ _ _ prefixes _ <<< "$spec"
   k="${prefixes%%,*}"
@@ -76,7 +89,7 @@ for spec in "${CASES[@]}"; do
   printf '%-12s %8s %8s %10s %10s %9s %9s %9s %9s %8s\n' \
     "$name" "$(field "$s" panel_diplotypes)" "$(field "$s" distinct_haplotype_paths)" \
     "$(field "$s" haploid_prior_evaluations)" "$(field "$s" diploid_prior_lookups)" \
-    "$(field "$s" seconds_prior)" "$(field "$s" seconds_candidates)" "$(field "$s" seconds_ranking)" \
+    "$(field "$s" seconds_prior)" "$(field "$s" seconds_candidate_grouping)" "$(field "$s" seconds_ranking)" \
     "$(field "$s" seconds_total)" "$(rss_mb "$OUT/$name/time.txt")"
 done
 
@@ -104,6 +117,8 @@ echo "=== output identity vs the R11 pilots (same reads, unoptimised code) ==="
 for L in acot gstm1 ankrd36c; do
   old="$PILOT/genotype_pilot_${L}_2x_d24e471/panel.K0"
   new="$OUT/${L}_2x/run.K0"
+  # A restricted run compares only what it actually ran; silence here would look like a pass.
+  [ -f "$new.genotypes.tsv" ] || { echo "  skipped    $L (not run in this batch)"; continue; }
   for what in genotypes scores status blocks haplotypes; do
     case "$what" in
       genotypes)  a="$old.genotypes.tsv";       b="$new.genotypes.tsv";       cmp_out=$(diff <(cat "$a") <(cat "$b") 2>&1 || true) ;;
@@ -126,6 +141,21 @@ for spec in "${CASES[@]}"; do
   rows="$(awk -F'\t' 'NR>1{print $NF}' "$OUT/$name/run.K$k.block_genotypes.tsv" 2>/dev/null | sort -u | tr '\n' ' ')"
   if [ "$(echo $rows)" = "$s" ]; then echo "  OK   $name: status $s, rows $rows"
   else echo "  FAIL $name: status $s, rows $rows"; bad=$((bad+1)); fi
+done
+
+echo
+echo "=== rescoring split: which phase actually dominates ==="
+printf '%-14s %10s %10s %10s %10s %9s\n' case rescoring prep place combine 'combine%'
+for spec in "${CASES[@]}"; do
+  IFS='|' read -r name _ _ _ prefixes _ <<< "$spec"
+  k="${prefixes%%,*}"
+  s="$OUT/$name/run.K$k.mosaic_status.tsv"
+  awk -F'\t' -v c="$name" '
+    $1=="seconds_rescoring"{r=$2}
+    $1=="seconds_rescoring_fragment_preparation"{p=$2}
+    $1=="seconds_rescoring_placement_and_mass"{m=$2}
+    $1=="seconds_rescoring_diploid_combination"{d=$2}
+    END{printf "%-14s %10.2f %10.2f %10.2f %10.2f %8.1f%%\n", c, r, p, m, d, (r>0 ? 100*d/r : 0)}' "$s"
 done
 
 echo

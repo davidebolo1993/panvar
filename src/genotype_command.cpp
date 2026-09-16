@@ -49,9 +49,15 @@ struct StageTimings {
     double rescoring = 0.0;
     // Accumulated, not assigned: each ranked set -- primary, every development prefix and the phase
     // audit -- passes through these stages, and a run's cost is their sum over all of them.
-    double candidates = 0.0;   // grouping candidates into sequence-identical classes
+    double candidate_grouping = 0.0;   // grouping candidates into sequence-identical classes ONLY
     double prior = 0.0;        // exact path and sequence priors
     double ranking = 0.0;      // certification, block posteriors and the audit comparison
+    // The three phases inside rescoring, which is 57-93% of a run. Reported separately because
+    // "rescoring" alone cannot say whether the cost is finding placements on each haplotype or
+    // combining those masses across every diploid candidate -- and that decides what to parallelise.
+    double rescoring_fragment_preparation = 0.0;
+    double rescoring_placement_and_mass = 0.0;
+    double rescoring_diploid_combination = 0.0;
     double total = 0.0;
 };
 
@@ -400,7 +406,10 @@ void write_status(
     out << "seconds_proposal\t" << timings.proposal << '\n';
     out << "seconds_spelling\t" << timings.spelling << '\n';
     out << "seconds_rescoring\t" << timings.rescoring << '\n';
-    out << "seconds_candidates\t" << timings.candidates << '\n';
+    out << "seconds_rescoring_fragment_preparation\t" << timings.rescoring_fragment_preparation << '\n';
+    out << "seconds_rescoring_placement_and_mass\t" << timings.rescoring_placement_and_mass << '\n';
+    out << "seconds_rescoring_diploid_combination\t" << timings.rescoring_diploid_combination << '\n';
+    out << "seconds_candidate_grouping\t" << timings.candidate_grouping << '\n';
     out << "seconds_prior\t" << timings.prior << '\n';
     out << "seconds_ranking\t" << timings.ranking << '\n';
     out << "seconds_total\t" << timings.total << '\n';
@@ -769,6 +778,9 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     if (any_ranked) {
         try {
             scored = score_diplotypes(interned, scored_pairs, fragments, library, scoring_options);
+            timings.rescoring_fragment_preparation = scored.seconds_fragment_preparation;
+            timings.rescoring_placement_and_mass = scored.seconds_placement_and_mass;
+            timings.rescoring_diploid_combination = scored.seconds_diploid_combination;
         } catch (const ResourceExhausted& error) {
             rescore_failure = error.what();
         }
@@ -832,7 +844,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             sequence_candidates[inserted.first->second].members.push_back(i);
             sequence_candidate_of[i] = inserted.first->second;
         }
-        timings.candidates += seconds_since(candidates_mark);
+        timings.candidate_grouping += seconds_since(candidates_mark);
 
         // ---- stage 5: exact prior, recomputed independently of the beam ------------------------------
         // The path prior is a manifest diagnostic; the ranking uses the sequence-pair prior, which decides
@@ -1120,9 +1132,15 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         }
 
         if (ranking.status != RescoreStatus::Complete) {
-            timings.candidates = run_timings.candidates;
+            timings.candidate_grouping = run_timings.candidate_grouping;
             timings.prior = run_timings.prior;
             timings.ranking = run_timings.ranking;
+            // The counters are run-level and the audit's ranking contributes to them, so they are read
+            // here rather than from the copy taken before the audit ran -- which reported the primary
+            // set's 130 paths and made "the audit evaluates only 130" look true when it is not.
+            set_report.distinct_haplotype_paths = candidate_report.distinct_haplotype_paths;
+            set_report.haploid_prior_evaluations = candidate_report.haploid_prior_evaluations;
+            set_report.diploid_prior_lookups = candidate_report.diploid_prior_lookups;
             timings.total = seconds_since(started);
             write_status(status_path, GenotypeRunStatus::RescoreIncomplete, fingerprint, options,
                          library, timings, &built.report, &panel, (panel_only ? nullptr : &beam), &ranking,
@@ -1200,9 +1218,14 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             }
         }
 
-        timings.candidates = run_timings.candidates;
+        timings.candidate_grouping = run_timings.candidate_grouping;
         timings.prior = run_timings.prior;
         timings.ranking = run_timings.ranking;
+        // Read after the audit, not from the copy taken before it: these count the whole run, and the
+        // audit's ranking adds its own distinct mosaic paths to the shared cache.
+        set_report.distinct_haplotype_paths = candidate_report.distinct_haplotype_paths;
+        set_report.haploid_prior_evaluations = candidate_report.haploid_prior_evaluations;
+        set_report.diploid_prior_lookups = candidate_report.diploid_prior_lookups;
         timings.total = seconds_since(started);
         write_status(status_path, GenotypeRunStatus::Complete, fingerprint, options, library, timings,
                      &built.report, &panel, (panel_only ? nullptr : &beam), &ranking, "", &summary,

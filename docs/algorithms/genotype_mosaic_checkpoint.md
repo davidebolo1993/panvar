@@ -130,19 +130,27 @@ since two paths can spell identical bytes and must keep distinct path priors -- 
 as `cached(p1) + cached(p2) + (p1 != p2 ? log 2 : 0)`, which is the arithmetic the old function performed,
 including its -inf short circuit.
 
-| Case | Panel pairs | Distinct paths | Haploid evaluations | Diploid lookups | s_prior | s_cand | s_rank | s_total | RSS |
+| Case | Panel pairs | Distinct paths | Haploid evaluations | Diploid lookups | s_prior | s_group | s_rank | s_total | RSS |
 |---|---|---|---|---|---|---|---|---|---|
 | c4, audit 0 | 8,515 | 130 | **130** | 8,515 | 0.007 | 0.003 | 0.005 | 54.68 | 464 MB |
-| c4, audit 256 | 8,515 | 130 | **130** | 8,515 | 0.015 | 0.006 | 0.011 | 94.11 | 560 MB |
+| c4, audit 256 | 8,515 | 269 | **269** | 17,286 | 0.015 | 0.006 | 0.010 | 93.66 | 563 MB |
 | acot 2x | 108,811 | 466 | **466** | 108,811 | 0.140 | 0.054 | 0.158 | 79.45 | 1,635 MB |
 | gstm1 2x | 108,345 | 465 | **465** | 108,345 | 0.157 | 0.050 | 0.156 | 50.32 | 1,514 MB |
 | ankrd36c 2x | 107,880 | 464 | **464** | 107,880 | 0.158 | 0.058 | 0.167 | 98.74 | 2,609 MB |
 | c4, audit 0 (repeat) | 8,515 | 130 | **130** | 8,515 | 0.007 | 0.003 | 0.005 | 54.76 | 459 MB |
 
-Haploid evaluations equal distinct paths in every case, against 8,515-108,811 diplotype lookups. The audited
-c4 run evaluates 130 paths while ranking both its primary set and a 256-candidate audit, so **the audit
-triggers no second set of evaluations** -- the cache is genuinely shared across primary, prefix and audit
-rankings.
+Haploid evaluations equal distinct paths in every case, against 8,515-108,811 diplotype lookups.
+
+**The audited row first reported this wrongly, and the corrected statement is different.** `set_report` was
+copied immediately after the primary ranking and before the audit ran, so the audited c4 run reported the
+primary set's 130 paths and the claim "the audit triggers no second set of evaluations" looked true. It is not
+what happened. Refreshed after the audit, both statuses of that run report **269** distinct paths and 269
+haploid evaluations: the primary ranking evaluates 130, the audit introduces 139 further distinct mosaic paths,
+and **each distinct path is evaluated exactly once** -- the previously cached panel paths are not recomputed.
+That is still a working shared cache, and it is the honest form of the claim: primary and audit together
+evaluate 269 paths once each, rather than recomputing both homologues of every diplotype. Diploid lookups
+legitimately differ between the two statuses of the same run (17,286 and 34,580), because each ranked set
+performs its own lookups against that shared cache.
 
 **It changes nothing statistical.** Against the R11 pilots, on the same frozen reads: genotypes, candidate
 scores with their exact priors, block posteriors and GQ, phase, haplotypes and status are **byte-identical for
@@ -166,7 +174,37 @@ takes its `StageTimings` by value, so the copy was taken at the call site before
 anything, and the three new fields never reached the status. Fixed, and the stages now account for the whole
 run -- residual unattributed time is **0.05-0.73 s**, down from 24-28 s. The dominant cost is now unambiguous:
 **rescoring is 57-93% of every run** -- 93.0% of c4's 54.7 s, 69.4% of acot's 79.4, 57.5% of gstm1's 50.3 and
-69.8% of ankrd36c's 98.7. Candidate combination, prior and ranking together are under 0.4 s.
+69.8% of ankrd36c's 98.7. Candidate grouping, prior and ranking together are under 0.4 s.
+
+**One of those labels was wrong, and the correction matters for what to optimise next.** `seconds_candidates`
+measured only the collapse of candidates into sequence-identical classes, not the diploid combination of
+fragment masses -- that loop is `for every candidate, for every fragment, combine haplotype A and B` and lives
+inside rescoring. Reporting it as "candidate combination" implied the expensive part was already measured and
+cheap. The field is renamed `seconds_candidate_grouping`, and rescoring is now split into fragment preparation,
+placement and mass construction, and diploid combination, so the question that decides the parallelisation
+strategy -- whether the cost is finding placements per haplotype or combining them across ~108,000 diploid
+pairs -- is answered by measurement rather than assumed.
+
+**Measured, placement dominates.** Rescoring splits as:
+
+| Case | Rescoring | Fragment preparation | Placement and mass | Diploid combination | Combination share |
+|---|---|---|---|---|---|
+| c4, audit 256 | 86.99 s | 0.28 | **67.74** | 18.96 | 21.8% |
+| acot 2x | 54.87 s | 0.02 | **41.66** | 13.18 | 24.0% |
+
+The three phases account for rescoring to within 0.01 s. Placement and mass construction is roughly three
+quarters of it on both a small audited panel and a large one; diploid combination, the loop that scales with
+the candidate count, is 22-24%. The counting argument pointed the other way -- acot combines masses about
+289 million times against roughly 1.2 million mass cells -- but a mass cell costs far more than one
+`log_add_exp`, because it is a placement search and a state enumeration. Fragment preparation is negligible.
+Which of the two to parallelise first, and whether the 22-24% is worth taking at the same time, is a decision
+for the review rather than one to pre-empt here.
+
+**Provenance.** The benchmark above ran from a dirty working tree, because the commit had not yet been made.
+Building `990cf21` in a clean detached worktree yields a binary byte-identical to the one measured,
+SHA-256 `6a52fc1a5db8dd24bafcc57f71a9f32d278771de0259e5cb23db52825d8c4c4f`, so these numbers are attributable
+to that commit and not to an unrecorded tree. The worktree reports two porcelain entries: the submodule URL
+rewrites the offline build recipe requires, not source changes.
 
 ### R11.7 What remains
 

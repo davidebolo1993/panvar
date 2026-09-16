@@ -237,6 +237,13 @@ struct FragmentScoringResult {
     std::vector<double> exposure;
     std::size_t unique_haplotypes = 0;
     FragmentScoringCounters counters;
+    // Wall clock of the three phases inside one call, so a caller can attribute rescoring instead of
+    // reporting it whole. Preparation is per fragment; placement and mass construction is per
+    // (fragment, haplotype); diploid combination is per (candidate, fragment) and is the term that
+    // grows with the panel. Which of the last two dominates decides how this should be parallelised.
+    double seconds_fragment_preparation = 0.0;
+    double seconds_placement_and_mass = 0.0;
+    double seconds_diploid_combination = 0.0;
     // Filled only when requested in FragmentScoringOptions; same row-major layout as log_mass.
     std::vector<OriginSummary> origin_summary;
     // (fragment, haplotype) -> every accepted origin, for record_origins_for_fragments only.

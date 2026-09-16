@@ -1,6 +1,7 @@
 #include "panvar/fragment_likelihood.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <map>
 #include <set>
 #include <tuple>
@@ -504,6 +505,11 @@ FragmentScoringResult score_diplotypes(
         return value;
     };
 
+    // Phase 1 of three: per-fragment preparation. Timed so a caller can attribute rescoring rather
+    // than report it whole -- it is 57-93% of a run, and which phase dominates decides how it should
+    // be parallelised.
+    const auto preparation_mark = std::chrono::steady_clock::now();
+
     // Four oriented forms per fragment: each mate as given, and each pre-complemented. Whichever
     // mate reads off the forward strand is compared as given, so every comparison is forward.
     std::vector<ReadForm> forms;
@@ -531,6 +537,11 @@ FragmentScoringResult score_diplotypes(
     const std::vector<PieceIndex> indexes =
         forms.empty() ? std::vector<PieceIndex>{}
                       : build_piece_indexes(forms, band, options.minimum_piece_bp);
+
+    result.seconds_fragment_preparation =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - preparation_mark).count();
+    // Phase 2: placement and mass construction, per (fragment, haplotype).
+    const auto placement_mark = std::chrono::steady_clock::now();
 
     const std::size_t unique = haplotypes.sequences.size();
     // Checked before the allocation it guards, so a refusal costs nothing.
@@ -686,6 +697,12 @@ FragmentScoringResult score_diplotypes(
         }
     }
 
+    result.seconds_placement_and_mass =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - placement_mark).count();
+    // Phase 3: diploid combination, per (candidate, fragment). This is the term that grows with the
+    // panel -- roughly 108,000 candidates on the large loci against 8,515 on c4.
+    const auto combination_mark = std::chrono::steady_clock::now();
+
     for (std::size_t c = 0; c < candidates.size(); ++c) {
         const std::size_t a = candidates[c].first;
         const std::size_t b = candidates[c].second;
@@ -707,6 +724,8 @@ FragmentScoringResult score_diplotypes(
         score.fragment_term = fragment_term;
         score.log_likelihood = score.exposure_term + fragment_term;
     }
+    result.seconds_diploid_combination =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - combination_mark).count();
     result.log_mass = std::move(mass);
     result.exposure = std::move(exposure);
     return result;
