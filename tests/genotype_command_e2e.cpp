@@ -745,12 +745,17 @@ void test_proposal_status_rules() {
     const auto panel_only_status = read_status(path("panel_only.mosaic_status.tsv"));
     std::size_t panel_only_mosaics = 0;
     for (const auto& row : read_rows(path("panel_only.mosaic_candidates.tsv"))) panel_only_mosaics += row[13] == "mosaic";
-    require(panel_only_mosaics == 0 && panel_only_status.at("mosaic_candidates") == "0" &&
-                panel_only_status.at("panel_baseline_complete") == "true" &&
-                panel_only_status.at("candidate_scope") ==
-                    (std::stoul(panel_only_status.at("mosaic_candidates_found")) > 0 ? "CONDITIONAL" : "COMPLETE") &&
+    // With K = 0, no audit and no positive prefix, the beam is not built at all: its diagnostics are
+    // absent rather than zero, and the scope is neither COMPLETE nor CONDITIONAL, since both of those
+    // describe what a search returned. The panel baseline is still scored whole and still calls.
+    require(panel_only_mosaics == 0 && panel_only_status.at("panel_baseline_complete") == "true" &&
+                panel_only_status.at("candidate_scope") == "PANEL_ONLY" &&
+                std::stod(panel_only_status.at("seconds_proposal")) == 0.0 &&
+                panel_only_status.count("mosaic_candidates") == 0 &&
+                panel_only_status.count("mosaic_candidates_found") == 0 &&
+                panel_only_status.count("beam_extensions") == 0 &&
                 exists(path("panel_only.genotypes.tsv")),
-            "K = 0 must rank the panel baseline alone, conditional exactly when the beam found mosaics it omits");
+            "K = 0 with no audit must rank the panel baseline alone, building no beam and reporting none");
 
     // A panel baseline over its declared budget is refused whole: no partial baseline, no ranking, no call.
     panvar::GenotypeCommandOptions over_budget = tiny_options("panel_budget", r1, r2, "tiny_phaseable.gfa");
@@ -905,7 +910,7 @@ void test_prior_only_phase_is_reported() {
 void test_candidate_prefixes_match_standalone() {
     const std::string r1 = path("phaseable_r1.fq");
     const std::string r2 = path("phaseable_r2.fq");
-    const auto slurp = [](const std::string& file, bool status_file) {
+    const auto slurp = [](const std::string& file, bool status_file, bool drop_proposal = false) {
         std::ifstream input(file);
         if (!input) return std::string("<absent>");
         std::string line;
@@ -920,6 +925,17 @@ void test_candidate_prefixes_match_standalone() {
                     "full_read_verifications", "accepted_mate_placements", "valid_fr_states",
                     "physical_origins", "statistical_state_classes"};
                 if (shared_work.count(key) != 0) continue;
+                // K = 0 alone is asymmetric, and legitimately so: a standalone K = 0 run requests no
+                // mosaics, no audit and no prefix, so it builds no beam at all, while the K = 0 VIEW of a
+                // ladder shares the beam its larger prefixes needed. The call must still be identical --
+                // that is what this gate is for -- but the proposal diagnostics describe a search that
+                // happened in one run and not in the other. Dropped for K = 0 only.
+                static const std::set<std::string> proposal_diagnostics = {
+                    "candidate_scope", "candidate_set_conditional", "mosaic_candidates",
+                    "mosaic_candidates_found", "mosaic_target_reached", "proposal_state_limit",
+                    "proposal_final_states", "proposal_states_pruned", "proposal_search_exhaustive",
+                    "beam_extensions", "candidates_total", "beam_diplotypes_found"};
+                if (drop_proposal && proposal_diagnostics.count(key) != 0) continue;
             }
             if (!line.empty() && line[0] == '>') line = line.substr(line.find(' '));   // header names the prefix
             text += line + '\n';
@@ -948,9 +964,24 @@ void test_candidate_prefixes_match_standalone() {
             for (const std::string suffix : {".genotypes.tsv", ".block_genotypes.tsv", ".mosaic_candidates.tsv",
                                              ".mosaic_scores.tsv", ".mosaic_status.tsv", ".mosaic_haplotypes.fa"}) {
                 const bool status_file = suffix == ".mosaic_status.tsv";
-                require(slurp(extracted + suffix, status_file) == slurp(path(name) + suffix, status_file),
+                require(slurp(extracted + suffix, status_file, k == 0) ==
+                            slurp(path(name) + suffix, status_file, k == 0),
                         "prefix K=" + std::to_string(k) + " at state limit " + std::to_string(state_limit) +
                             " must reproduce the standalone " + suffix);
+            }
+            if (k == 0) {
+                // Dropping the proposal diagnostics above is only sound if the two runs really did take
+                // different paths. Assert that they did, so the relaxation cannot quietly widen into
+                // hiding a difference that matters.
+                const auto standalone_status = read_status(path(name) + ".mosaic_status.tsv");
+                const auto view_status = read_status(extracted + ".mosaic_status.tsv");
+                require(standalone_status.at("candidate_scope") == "PANEL_ONLY" &&
+                            standalone_status.count("beam_extensions") == 0,
+                        "a standalone K = 0 run requests no search and must build no beam");
+                require(view_status.count("candidate_scope") == 1 &&
+                            view_status.at("candidate_scope") != "PANEL_ONLY" &&
+                            view_status.count("beam_extensions") == 1,
+                        "the K = 0 view of a ladder shares the beam its larger prefixes required");
             }
         }
         require(refused == 0 && complete == prefixes.size(),
@@ -1030,6 +1061,73 @@ void test_phase_audit() {
               << " (audit " << withdrawn.at("phase_audit_status") << ")\n";
 }
 
+// A true panel-only run builds no beam at all, and must still make exactly the call the former K = 0
+// path made with the beam present. Both paths exist in this binary: a run with development prefixes
+// {0, 8} computes the beam, and its K0 outputs ARE the former path; a run with K = 0, no audit and no
+// prefix takes the new beam-free path. Whole files cannot match -- timings, the proposal diagnostics and
+// the scope column legitimately differ, and the FASTA headers carry the run's own prefix -- so this
+// compares what must not change: the genotype call and the haplotypes it selected.
+void test_panel_only_path() {
+    const TinyLocus locus = write_tiny_locus();
+    write_library(path("lib.txt"));
+    simulate(locus.haplotypes[1], locus.haplotypes[2], path("po_1.fq"), path("po_2.fq"), 99);
+
+    const auto slurp = [](const std::string& file) {
+        std::ifstream in(file);
+        std::string all, line;
+        while (std::getline(in, line)) {
+            all += line;
+            all += '\n';
+        }
+        return all;
+    };
+    const auto sequences_only = [](const std::string& fasta) {
+        std::string out;
+        std::size_t at = 0;
+        while (at < fasta.size()) {
+            const std::size_t end = fasta.find('\n', at);
+            const std::string line = fasta.substr(at, end == std::string::npos ? end : end - at);
+            if (!line.empty() && line.front() != '>') {
+                out += line;
+                out += '\n';
+            }
+            if (end == std::string::npos) break;
+            at = end + 1;
+        }
+        return out;
+    };
+
+    panvar::GenotypeCommandOptions with_beam = tiny_options("po_beam", path("po_1.fq"), path("po_2.fq"));
+    with_beam.max_mosaic_candidates = 8;
+    with_beam.development_candidate_prefixes = {0, 8};
+    require(panvar::run_genotype(with_beam) == panvar::GenotypeRunStatus::Complete,
+            "the reference run that builds a beam must complete");
+
+    panvar::GenotypeCommandOptions panel_only = tiny_options("po_only", path("po_1.fq"), path("po_2.fq"));
+    panel_only.max_mosaic_candidates = 0;
+    panel_only.phase_audit_candidates = 0;
+    require(panvar::run_genotype(panel_only) == panvar::GenotypeRunStatus::Complete,
+            "a panel-only run must complete without building a beam");
+
+    const std::map<std::string, std::string> status = read_status(path("po_only.mosaic_status.tsv"));
+    require(status.at("candidate_scope") == "PANEL_ONLY",
+            "a run with no search reports PANEL_ONLY, which is neither COMPLETE nor CONDITIONAL");
+    require(status.at("phase_support") == "UNRESOLVED",
+            "a panel-only run carries no audit and claims no read-supported phase");
+    require(std::stod(status.at("seconds_proposal")) == 0.0,
+            "no proposal ran, so the proposal took no time");
+    require(status.count("beam_extensions") == 0 && status.count("mosaic_candidates") == 0,
+            "a run with no beam must report no beam diagnostics at all");
+    require(status.at("panel_baseline_complete") == "true",
+            "every panel diplotype is still scored");
+
+    require(slurp(path("po_beam.K0.genotypes.tsv")) == slurp(path("po_only.genotypes.tsv")),
+            "panel-only must make exactly the call the former K=0 path made");
+    require(sequences_only(slurp(path("po_beam.K0.mosaic_haplotypes.fa"))) ==
+                sequences_only(slurp(path("po_only.mosaic_haplotypes.fa"))),
+            "panel-only must select exactly the haplotypes the former K=0 path selected");
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: genotype_command_e2e_test <scratch dir>\n";
@@ -1047,6 +1145,7 @@ int main(int argc, char** argv) {
         test_prior_only_phase_is_reported();
         test_phase_audit();
         test_candidate_prefixes_match_standalone();
+        test_panel_only_path();
         std::cout << "genotype command end-to-end: PASS\n";
         return 0;
     } catch (const std::exception& error) {

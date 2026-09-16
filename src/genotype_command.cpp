@@ -162,6 +162,11 @@ struct CandidateSetReport {
     // per mosaic -- which is what a preflight predicts. It is 0 when no set was ranked. The shared scoring pass
     // may cover more (a prefix scores the union), so this counts the set, not the pass.
     std::size_t unique_haplotypes = 0;
+    // True when no beam ran at all: K = 0, no phase audit and no positive development prefix, so the
+    // candidate set is exactly the panel and nothing about it is conditional on a search. Reported as
+    // candidate_scope PANEL_ONLY, which is neither COMPLETE nor CONDITIONAL -- both of those describe
+    // the outcome of a search that did not happen.
+    bool panel_only = false;
 };
 
 struct RankingSummary {
@@ -306,6 +311,11 @@ void write_status(
         out << "panel_baseline_complete\t" << (candidate_set->panel_baseline_complete ? "true" : "false") << '\n';
         out << "beam_diplotypes_found\t" << candidate_set->beam_diplotypes_found << '\n';
         out << "unique_haplotypes\t" << candidate_set->unique_haplotypes << '\n';
+        if (candidate_set->panel_only) {
+            // No search ran, so neither COMPLETE nor CONDITIONAL applies: both describe what a beam
+            // returned. The candidate set is the panel, entire.
+            out << "candidate_scope\tPANEL_ONLY\n";
+        }
         if (beam != nullptr && candidate_set->panel_baseline_complete) {
             out << "candidates_total\t" << candidate_set->panel_diplotypes + beam->candidates.size() << '\n';
         }
@@ -616,28 +626,42 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     }
     candidate_report.panel_baseline_complete = true;
 
+    // A true panel-only run: no mosaics, no phase audit, and no positive development prefix. The beam
+    // would propose nothing that is ever scored, so it is not built at all -- and its pre-allocation
+    // budget then cannot refuse a call that never needed it. That refusal is what kept acot, gstm1 and
+    // ankrd36c from running an arm whose own work fits every declared cap with room to spare.
+    bool positive_prefix_requested = false;
+    for (const std::size_t k : options.development_candidate_prefixes) {
+        if (k > 0) positive_prefix_requested = true;
+    }
+    const bool panel_only = options.max_mosaic_candidates == 0 &&
+                            options.phase_audit_candidates == 0 && !positive_prefix_requested;
+    candidate_report.panel_only = panel_only;
+
     // ---- stage 3b: mosaic proposal --------------------------------------------------------------------------
     mark = Clock::now();
     const std::vector<double> switch_probability(
         model.blocks().size() - 1, options.switch_probability);
-    MosaicBeamParameters beam_parameters;
-    // The beam returns every diplotype it found -- never more than its state limit -- so the number of
-    // off-panel mosaics below is exact, not a count truncated by K.
-    beam_parameters.unique_candidate_target =
-        std::max(options.proposal_state_limit, options.max_mosaic_candidates + panel_candidates.size());
-    beam_parameters.state_limit = options.proposal_state_limit;
-    beam_parameters.max_extension_evaluations = options.max_beam_extensions;
     MosaicBeamResult beam;
-    try {
-        beam = propose_mosaic_diplotypes(model.panel(), emissions, switch_probability, beam_parameters);
-    } catch (const std::length_error& error) {
-        timings.proposal = seconds_since(mark);
-        timings.total = seconds_since(started);
-        write_status(status_path, GenotypeRunStatus::CandidateIncomplete, fingerprint, options, library,
-                     timings, &built.report, &panel, nullptr, nullptr,
-                     std::string("the proposal exceeded its declared resource budget: ") + error.what(),
-                     nullptr, &depth, &candidate_report);
-        return GenotypeRunStatus::CandidateIncomplete;
+    if (!panel_only) {
+        MosaicBeamParameters beam_parameters;
+        // The beam returns every diplotype it found -- never more than its state limit -- so the number of
+        // off-panel mosaics below is exact, not a count truncated by K.
+        beam_parameters.unique_candidate_target =
+            std::max(options.proposal_state_limit, options.max_mosaic_candidates + panel_candidates.size());
+        beam_parameters.state_limit = options.proposal_state_limit;
+        beam_parameters.max_extension_evaluations = options.max_beam_extensions;
+        try {
+            beam = propose_mosaic_diplotypes(model.panel(), emissions, switch_probability, beam_parameters);
+        } catch (const std::length_error& error) {
+            timings.proposal = seconds_since(mark);
+            timings.total = seconds_since(started);
+            write_status(status_path, GenotypeRunStatus::CandidateIncomplete, fingerprint, options, library,
+                         timings, &built.report, &panel, nullptr, nullptr,
+                         std::string("the proposal exceeded its declared resource budget: ") + error.what(),
+                         nullptr, &depth, &candidate_report);
+            return GenotypeRunStatus::CandidateIncomplete;
+        }
     }
     timings.proposal = seconds_since(mark);
     candidate_report.beam_diplotypes_found = beam.unique_candidates_found;
@@ -830,9 +854,19 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                     }
                 }
             }
-            summary.phase_support = ranking.status != RescoreStatus::Complete ? "UNRESOLVED"
-                                    : summary.fragment_contenders == 0      ? "READS_WITHIN_CANDIDATES"
-                                                                             : "PRIOR_ONLY";
+            // A ranked set with no off-panel rival and no audit cannot speak to phase. Panel diplotypes
+            // are unordered pairs of whole templates, so switching phase within a pair is not even
+            // representable without a mosaic: having no fragment contender is then a property of the
+            // candidate set, not evidence about phase. The condition is on what was RANKED, not on
+            // whether a beam happened to be built -- a K = 0 view of a ladder ranks the same set as a
+            // standalone K = 0 run and must make the same claim. A K = 0 arm carrying an audit is
+            // different: the audit does compare against a larger set, so it keeps its claim.
+            const bool no_rival_to_disagree =
+                beam.candidates.empty() && options.phase_audit_candidates == 0;
+            summary.phase_support = no_rival_to_disagree                        ? "UNRESOLVED"
+                                    : ranking.status != RescoreStatus::Complete ? "UNRESOLVED"
+                                    : summary.fragment_contenders == 0          ? "READS_WITHIN_CANDIDATES"
+                                                                                : "PRIOR_ONLY";
             summary.projection_ambiguous = sequence_candidates[best.candidate_id].projection_ambiguous;
         }
         {
@@ -887,7 +921,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         if (!rescore_failure.empty()) {
             timings.total = seconds_since(started);
             write_status(status_path, GenotypeRunStatus::RescoreIncomplete, fingerprint, options, library,
-                         timings, &built.report, &panel, &beam, nullptr,
+                         timings, &built.report, &panel, (panel_only ? nullptr : &beam), nullptr,
                          "rescoring stopped at a declared resource cap and returned no ranking: " +
                              rescore_failure,
                          nullptr, &depth, &candidate_report);
@@ -1010,7 +1044,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         if (ranking.status != RescoreStatus::Complete) {
             timings.total = seconds_since(started);
             write_status(status_path, GenotypeRunStatus::RescoreIncomplete, fingerprint, options,
-                         library, timings, &built.report, &panel, &beam, &ranking,
+                         library, timings, &built.report, &panel, (panel_only ? nullptr : &beam), &ranking,
                          "the best candidate cannot be separated from every rival by more than "
                          "floating-point error; the equivalence set is reported instead of a call",
                          &summary, &depth, &set_report);
@@ -1087,7 +1121,8 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
 
         timings.total = seconds_since(started);
         write_status(status_path, GenotypeRunStatus::Complete, fingerprint, options, library, timings,
-                     &built.report, &panel, &beam, &ranking, "", &summary, &depth, &set_report);
+                     &built.report, &panel, (panel_only ? nullptr : &beam), &ranking, "", &summary,
+                     &depth, &set_report);
         if (!options.quiet) {
             std::cerr << "[genotype] COMPLETE  fingerprint=" << fingerprint
                       << "  candidates=" << candidates.size()
