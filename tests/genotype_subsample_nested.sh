@@ -3,10 +3,11 @@
 #
 #   tests/genotype_subsample_nested.sh <build dir> <scratch dir>
 #
-# Every fragment kept at a coverage must be kept at every higher coverage, the choice must depend only on the
-# fragment name (so a rerun is byte-identical and a different source coverage with the same ratio keeps the same
-# fragments), mates must stay paired and in order, the kept fraction must be close to the requested one, and the
-# declared fragment-start intensity must follow the coverage.
+# Every fragment kept at a coverage must be kept at every higher coverage, the choice must depend only on the salt
+# and the fragment name (so a rerun is byte-identical and a different source coverage with the same ratio keeps the
+# same fragments), two different salts must give different masks while each stays nested, mates must stay paired
+# and in order, the kept fraction must be close to the requested one, and the declared fragment-start intensity
+# must follow the coverage.
 set -euo pipefail
 BUILD="${1:?usage: tests/genotype_subsample_nested.sh <build dir> <scratch dir>}"
 SCRATCH="${2:?usage: tests/genotype_subsample_nested.sh <build dir> <scratch dir>}"
@@ -41,6 +42,15 @@ mkdir -p "$SCRATCH/repeat" "$SCRATCH/ratio"
   --library "$SCRATCH/source/library.txt" --source-coverage 30 --coverage 10 --out "$SCRATCH/repeat" > /dev/null
 "$PROBE" subsample --reads1 "$SCRATCH/source/reads_1.fq" --reads2 "$SCRATCH/source/reads_2.fq" \
   --library "$SCRATCH/source/library.txt" --source-coverage 3 --coverage 1 --out "$SCRATCH/ratio" > /dev/null
+# Two donors, same source reads: different salts must give different masks, each nested within itself.
+for salt in donorA donorB; do
+  for coverage in 10 5; do
+    mkdir -p "$SCRATCH/$salt.cov$coverage"
+    "$PROBE" subsample --reads1 "$SCRATCH/source/reads_1.fq" --reads2 "$SCRATCH/source/reads_2.fq" \
+      --library "$SCRATCH/source/library.txt" --source-coverage 30 --coverage "$coverage" --name-salt "$salt" \
+      --out "$SCRATCH/$salt.cov$coverage" > /dev/null
+  done
+done
 
 python3 - "$SCRATCH" <<'CHECK'
 import os, sys
@@ -90,6 +100,22 @@ if kept[10] != [n[:-2] for n in names(scratch + "/repeat/reads_1.fq")]:
 if kept[10] != [n[:-2] for n in names(scratch + "/ratio/reads_1.fq")]:
     fail("the same ratio expressed differently keeps different fragments")
 
+salted = {}
+for salt in ("donorA", "donorB"):
+    for coverage in (10, 5):
+        salted[(salt, coverage)] = [n[:-2] for n in names("%s/%s.cov%d/reads_1.fq" % (scratch, salt, coverage))]
+    if not set(salted[(salt, 5)]).issubset(set(salted[(salt, 10)])):
+        fail("the %s 5x set is not nested inside its own 10x set" % salt)
+for coverage in (10, 5):
+    a, b = salted[("donorA", coverage)], salted[("donorB", coverage)]
+    if a == b:
+        fail("two salts produced the same %dx mask" % coverage)
+    shared = len(set(a) & set(b)) / max(1, len(set(a) | set(b)))
+    if shared > 0.5:
+        fail("two salts share %.0f%% of the %dx mask; they should be independent" % (100 * shared, coverage))
+    if a == kept[coverage] or b == kept[coverage]:
+        fail("a salted %dx mask equals the unsalted one" % coverage)
+
 def lambda_of(path):
     for line in open(path):
         if line.startswith("fragment_start_intensity"):
@@ -102,6 +128,6 @@ for coverage in coverages:
     if abs(got - want) > 1e-12:
         fail("the declared intensity at %dx is %g, not %g" % (coverage, got, want))
 
-print("genotype subsample nesting: PASS (%s kept of %d, nested and deterministic)"
+print("genotype subsample nesting: PASS (%s kept of %d, nested and deterministic; two salts differ, each nested)"
       % ("/".join(str(len(kept[c])) for c in coverages), total))
 CHECK

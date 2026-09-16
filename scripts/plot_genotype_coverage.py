@@ -98,7 +98,8 @@ def main():
     blocks = pd.read_csv(args.blocks, sep="\t")
     runs = pd.read_csv(args.runs, sep="\t")
     coverages = sorted(blocks.coverage.unique())
-    block_ids = sorted(blocks.block.unique(), key=lambda b: (b.split(":")[0], int(b.split(":")[1])))
+    # Chain order -- ctx:0, sv:1, ctx:2, ... -- not grouped by type: the blocks alternate along the locus.
+    block_ids = sorted(blocks.block.unique(), key=lambda b: int(b.split(":")[1]))
     role = blocks.role.iloc[0] if len(blocks) else "unknown"
 
     figure, axes = plt.subplots(3, 1, figsize=(max(8, 0.8 * len(block_ids)), 10), constrained_layout=True,

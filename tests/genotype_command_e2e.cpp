@@ -233,6 +233,20 @@ void test_end_to_end() {
             "a COMPLETE run must carry a positive numerical separation gap");
     require(reported.at("threads_used") == "1",
             "version one is serial; a threads_used above one would contradict the contract");
+    {
+        // The option cannot be honoured, so it is refused rather than accepted and ignored.
+        panvar::GenotypeCommandOptions threaded = options;
+        threaded.threads = 2;
+        threaded.out_prefix = path("threaded");
+        bool refused = false;
+        try {
+            panvar::run_genotype(threaded);
+        } catch (const std::runtime_error&) {
+            refused = true;
+        }
+        require(refused && !exists(path("threaded.mosaic_status.tsv")),
+                "a run asking for more than one thread must be refused before it does any work");
+    }
 
     // The called haplotypes must be the simulated truth, in either chain orientation.
     const std::string hap1 = read_fasta_record(path("run.mosaic_haplotypes.fa"), 0);

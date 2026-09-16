@@ -27,6 +27,14 @@ PANEL_K="$(setting panel_arm_mosaic_candidates)"
 MOSAIC_K="$(setting mosaic_arm_mosaic_candidates)"
 AUDIT="$(setting phase_audit_candidates)"
 READ_LENGTH="$(setting read_length)"
+INSERT_MEAN="$(setting insert_mean_bp)"
+INSERT_SD="$(setting insert_sd_bp)"
+SUPPORT_SIGMAS="$(setting support_sigmas)"
+SUBSTITUTION_ERROR="$(setting substitution_error)"
+OUTLIER_WEIGHT="$(setting outlier_weight)"
+[ -n "$READ_LENGTH" ] && [ -n "$INSERT_MEAN" ] && [ -n "$INSERT_SD" ] && [ -n "$SUPPORT_SIGMAS" ] &&
+  [ -n "$SUBSTITUTION_ERROR" ] && [ -n "$OUTLIER_WEIGHT" ] ||
+  { echo "$FROZEN must declare every library parameter" >&2; exit 1; }
 [ -n "$SEED" ] && [ -n "$SOURCE_COVERAGE" ] && [ -n "$COVERAGES" ] && [ -n "$STATE_LIMIT" ] && [ "$PANEL_K" = 0 ] &&
   [ -n "$MOSAIC_K" ] && [ -n "$AUDIT" ] || { echo "incomplete $FROZEN" >&2; exit 1; }
 DONORS="${DONORS:-$(awk -F'\t' -v role="$ROLE" '$2==role{print $1}' "$MANIFEST")}"
@@ -58,21 +66,27 @@ wall_of() {
   printf 'plot_script_sha256\t%s\n' "$(shasum -a 256 "$REPO/scripts/plot_genotype_coverage.py" | cut -d' ' -f1)"
   printf 'manifest_sha256\t%s\n' "$(shasum -a 256 "$MANIFEST" | cut -d' ' -f1)"
   printf 'graph_sha256\t%s\n' "$(shasum -a 256 "$OUT/c4.gfa" | cut -d' ' -f1)"
-  printf 'role\t%s\nseed\t%s\nsource_coverage\t%s\ncoverages\t%s\nstate_limit\t%s\npanel_arm_K\t%s\nmosaic_arm_K\t%s\nphase_audit\t%s\nreference\t%s\ndonors\t%s\n' \
+  printf 'role\t%s\nmaster_seed\t%s\nseed_salt\tdonor name\nsource_coverage\t%s\ncoverages\t%s\nstate_limit\t%s\npanel_arm_K\t%s\nmosaic_arm_K\t%s\nphase_audit\t%s\nreference\t%s\ndonors\t%s\n' \
     "$ROLE" "$SEED" "$SOURCE_COVERAGE" "$COVERAGES" "$STATE_LIMIT" "$PANEL_K" "$MOSAIC_K" "$AUDIT" "$REF" "$(echo $DONORS)"
+  printf 'read_length\t%s\ninsert_mean_bp\t%s\ninsert_sd_bp\t%s\nsupport_sigmas\t%s\nsubstitution_error\t%s\noutlier_weight\t%s\n' \
+    "$READ_LENGTH" "$INSERT_MEAN" "$INSERT_SD" "$SUPPORT_SIGMAS" "$SUBSTITUTION_ERROR" "$OUTLIER_WEIGHT"
 } > "$OUT/signature.tsv"
 
 run_donor() {
   local donor="$1" dir="$OUT/$1"
   mkdir -p "$dir/source"
+  # Every declared library parameter is passed, never left to a simulator default, and the seed is salted with
+  # the donor so no two donors draw the same reads.
   "$PROBE" simulate --gfa "$OUT/c4.gfa" --reference "$REF" --donor "$donor" --depth "$SOURCE_COVERAGE" \
-    --read-length "$READ_LENGTH" --seed "$SEED" --out "$dir/source" > "$dir/source.log" 2>&1
+    --read-length "$READ_LENGTH" --insert-mean "$INSERT_MEAN" --insert-sd "$INSERT_SD" \
+    --sigmas "$SUPPORT_SIGMAS" --error "$SUBSTITUTION_ERROR" --outlier "$OUTLIER_WEIGHT" \
+    --seed "$SEED" --seed-salt "$donor" --out "$dir/source" > "$dir/source.log" 2>&1
   for coverage in $COVERAGES; do
     local reads="$dir/cov$coverage"
     mkdir -p "$reads"
     "$PROBE" subsample --reads1 "$dir/source/reads_1.fq" --reads2 "$dir/source/reads_2.fq" \
       --library "$dir/source/library.txt" --source-coverage "$SOURCE_COVERAGE" --coverage "$coverage" \
-      --out "$reads" >> "$dir/source.log" 2>&1
+      --name-salt "$donor" --out "$reads" >> "$dir/source.log" 2>&1
     local prefix="$reads/lzo"
     /usr/bin/time "$TIME_FLAG" "$PROBE" genotype --gfa "$OUT/c4.gfa" --reference "$REF" \
       --reads1 "$reads/reads_1.fq" --reads2 "$reads/reads_2.fq" --library "$reads/library.txt" \
@@ -91,6 +105,7 @@ run_donor() {
 }
 export -f run_donor rss_of wall_of
 export OUT PROBE REF SEED SOURCE_COVERAGE COVERAGES STATE_LIMIT PANEL_K MOSAIC_K AUDIT READ_LENGTH TIME_FLAG
+export INSERT_MEAN INSERT_SD SUPPORT_SIGMAS SUBSTITUTION_ERROR OUTLIER_WEIGHT
 printf '%s\n' $DONORS | xargs -P "$JOBS" -I{} bash -c 'run_donor "$@"' _ {}
 
 # ---- collect: one row per donor, arm, coverage and block; and one per run --------------------------------

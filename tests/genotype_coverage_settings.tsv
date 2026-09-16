@@ -13,6 +13,11 @@
 #
 # Donor roles come from tests/genotype_development_donors.tsv unchanged: the eight development donors are run
 # first, and the 56 held-out donors only afterwards.
+#
+# Review round 9: the driver now passes every parameter below explicitly instead of relying on simulator
+# defaults, and salts both the simulation seed and the thinning selector with the donor name, so donors no longer
+# share one random stream. The values are unchanged from the completed C4 run, whose simulations used the same
+# numbers through the defaults; that run remains one frozen realization per donor from a shared stream.
 key	value
 seed	20260916
 source_coverage	30
@@ -24,6 +29,9 @@ phase_audit_candidates	256
 read_length	100
 insert_mean_bp	350
 insert_sd_bp	40
+support_sigmas	4
+substitution_error	0.002
+outlier_weight	0.001
 lowconf_gq_threshold	none
 metrics_script	tests/genotype_coverage_c4.sh
 plot_script	scripts/plot_genotype_coverage.py

@@ -71,6 +71,28 @@ Args parse_args(int argc, char** argv, int from) {
     return args;
 }
 
+// fnv1a64_fmix64_top53_v1: FNV-1a over the bytes, finished with the murmur3 avalanche because FNV-1a alone
+// leaves the high bits -- the ones every caller here reads -- poorly mixed for short sequential names.
+std::uint64_t salted_hash(const std::string& text) {
+    std::uint64_t hash = 1469598103934665603ULL;
+    for (const unsigned char byte : text) {
+        hash ^= byte;
+        hash *= 1099511628211ULL;
+    }
+    hash ^= hash >> 33;
+    hash *= 0xff51afd7ed558ccdULL;
+    hash ^= hash >> 33;
+    hash *= 0xc4ceb9fe1a85ec53ULL;
+    hash ^= hash >> 33;
+    return hash;
+}
+
+// A donor's own simulation stream: the master seed and the salt together, so two donors never draw the same
+// reads and a salt-free run keeps the declared seed exactly.
+std::uint64_t salted_seed(std::uint64_t seed, const std::string& salt) {
+    return salt.empty() ? seed : salted_hash(salt + ":" + std::to_string(seed));
+}
+
 std::string revcomp(const std::string& bases) {
     std::string out(bases.size(), 'N');
     for (std::size_t i = 0; i < bases.size(); ++i) {
@@ -240,7 +262,10 @@ int simulate(const Args& args) {
     const std::string donor = args.required("donor");
     const double depth = std::stod(args.get("depth", "30"));
     const std::size_t read_length = std::stoul(args.get("read-length", "100"));
-    const std::uint64_t seed = std::stoull(args.get("seed", "7"));
+    const std::uint64_t declared_seed = std::stoull(args.get("seed", "7"));
+    // Each donor gets its own stream when a salt is given; without one the declared seed is used unchanged.
+    const std::string seed_salt = args.get("seed-salt", "");
+    const std::uint64_t seed = salted_seed(declared_seed, seed_salt);
 
     panvar::LibraryModel library;
     library.insert_mean_bp = std::stod(args.get("insert-mean", "350"));
@@ -267,7 +292,8 @@ int simulate(const Args& args) {
     std::ofstream r2(out_dir + "/reads_2.fq");
     std::ofstream truth(out_dir + "/truth.fa");
     std::ofstream manifest(out_dir + "/simulation.tsv");
-    manifest << "key\tvalue\n" << "donor\t" << donor << "\nseed\t" << seed << "\ndepth\t" << depth
+    manifest << "key\tvalue\n" << "donor\t" << donor << "\nseed\t" << declared_seed << "\nseed_salt\t"
+             << (seed_salt.empty() ? "none" : seed_salt) << "\neffective_seed\t" << seed << "\ndepth\t" << depth
              << "\nread_length\t" << read_length << "\nlambda\t" << library.fragment_start_intensity
              << "\nsimulator\tgenotype_probe simulate\n";
 
@@ -331,7 +357,8 @@ int simulate(const Args& args) {
              << skipped_ambiguous << '\n';
 
     std::ofstream lib(out_dir + "/library.txt");
-    lib << "# declared simulation parameters, genotype_probe simulate seed " << seed << '\n'
+    lib << "# declared simulation parameters, genotype_probe simulate seed " << declared_seed
+        << (seed_salt.empty() ? std::string() : " salted with " + seed_salt) << '\n'
         << "insert_mean_bp " << library.insert_mean_bp << "\ninsert_sd_bp " << library.insert_sd_bp
         << "\nsupport_sigmas " << library.support_sigmas << "\nsubstitution_error "
         << library.substitution_error << "\noutlier_weight " << library.outlier_weight
@@ -731,27 +758,11 @@ std::vector<panvar::ReadPair> read_pairs(const std::string& first, const std::st
 // subsample: nested lower-coverage read sets from one simulation
 // ------------------------------------------------------------------------------------------------
 
-// Keeps a paired fragment when the unit value of a hash of its name falls below coverage/source_coverage.
-// The decision depends only on the name, so the retained sets are nested: every fragment kept at a coverage is
-// kept at every higher one. Resimulating each coverage independently would not nest, and would confound
-// coverage with a fresh draw.
-std::uint64_t fragment_hash(const std::string& name) {
-    std::uint64_t hash = 1469598103934665603ULL;   // FNV-1a
-    for (const unsigned char byte : name) {
-        hash ^= byte;
-        hash *= 1099511628211ULL;
-    }
-    // FNV-1a alone leaves the high bits poorly mixed for short sequential names, and the selector reads exactly
-    // those: at 20x of 30x it kept 85% of probe_1..probe_4000 instead of 67%. Finalise with the murmur3
-    // avalanche so every output bit depends on every input bit.
-    hash ^= hash >> 33;
-    hash *= 0xff51afd7ed558ccdULL;
-    hash ^= hash >> 33;
-    hash *= 0xc4ceb9fe1a85ec53ULL;
-    hash ^= hash >> 33;
-    return hash;
-}
-
+// Keeps a paired fragment when the unit value of a salted hash of its name falls below
+// coverage/source_coverage. The decision depends only on the salt and the name, so the retained sets are nested
+// within a donor -- every fragment kept at a coverage is kept at every higher one -- while two donors given
+// different salts get different masks. Resimulating each coverage would not nest, and would confound coverage
+// with a fresh draw.
 int subsample(const Args& args) {
     const std::string out_dir = args.required("out");
     const double source_coverage = std::stod(args.required("source-coverage"));
@@ -760,6 +771,7 @@ int subsample(const Args& args) {
         throw std::runtime_error("coverage must be positive and at most the source coverage");
     }
     const double fraction = coverage / source_coverage;
+    const std::string name_salt = args.get("name-salt", "");
     const std::vector<panvar::ReadPair> fragments =
         read_pairs(args.required("reads1"), args.required("reads2"));
 
@@ -772,7 +784,8 @@ int subsample(const Args& args) {
         const std::size_t slash = name.rfind('/');
         if (slash != std::string::npos) name.resize(slash);
         // The top 53 bits as a unit value: exact in double, and monotone in the hash.
-        const double unit = static_cast<double>(fragment_hash(name) >> 11) * (1.0 / 9007199254740992.0);
+        const double unit =
+            static_cast<double>(salted_hash(name_salt + "/" + name) >> 11) * (1.0 / 9007199254740992.0);
         if (unit >= fraction) continue;
         ++kept;
         r1 << '@' << fragment.first.name << '\n' << fragment.first.bases << "\n+\n" << fragment.first.qualities << '\n';
@@ -818,7 +831,8 @@ int subsample(const Args& args) {
                  << "\nkept_fragments\t" << kept << "\nobserved_fraction\t"
                  << (fragments.empty() ? 0.0 : static_cast<double>(kept) / static_cast<double>(fragments.size()))
                  << "\nfragment_start_intensity\t" << source_lambda * fraction
-                 << "\nselector\tFNV-1a of the fragment name, nested across coverages\n";
+                 << "\nname_salt\t" << (name_salt.empty() ? "none" : name_salt)
+                 << "\nselector\tfnv1a64_fmix64_top53_v1 over <salt>/<fragment name>, nested across coverages\n";
     }
     std::cout << "subsampled " << kept << " of " << fragments.size() << " fragments to " << coverage << "x\n";
     return 0;

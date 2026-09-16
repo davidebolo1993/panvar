@@ -573,11 +573,14 @@ small:
 
 ```text
 --gfa, --bubbles, --reads1, --reads2, --reference-path,
---out-prefix, --threads, --max-mosaic-candidates
+--out-prefix, --max-mosaic-candidates
 ```
 
 Library parameters are estimated and recorded; a single optional model/config input may provide
 declared simulation parameters. Debug probes live in unit tests or a developer executable.
+
+Version one's scorer is serial. `--threads` is still parsed, and any value but 1 is refused before the run does
+any work rather than accepted and ignored; the status records both `threads_requested` and `threads_used`.
 
 Execution order:
 

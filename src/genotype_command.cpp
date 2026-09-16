@@ -217,6 +217,7 @@ void write_status(
     out << "mismatch_band\t" << options.mismatch_band << '\n';
     // Version one is serial by contract: the scorer is not threaded before the serial algorithm
     // meets its performance gate. The requested value is recorded so a run is reproducible.
+    // Version one is serial, and a request for more is refused before any work; both are recorded.
     out << "threads_requested\t" << options.threads << '\n';
     out << "threads_used\t1\n";
     out << "max_beam_extensions\t" << options.max_beam_extensions << '\n';
@@ -450,6 +451,12 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         if (prefixes.back() != options.max_mosaic_candidates) {
             throw std::runtime_error("the largest development candidate prefix must equal max_mosaic_candidates");
         }
+    }
+
+    // Version one's scorer is serial. The option existed and was silently ignored; a request it cannot honour is
+    // now refused rather than reported back as threads_used 1.
+    if (options.threads != 1) {
+        throw std::runtime_error("version one is serial: --threads must be 1");
     }
 
     if (options.phase_audit_candidates > 0) {
@@ -1105,7 +1112,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (flag == "--reference-path" || flag == "-r") options.reference_path = need(i);
         else if (flag == "--out-prefix" || flag == "-o") options.out_prefix = need(i);
         else if (flag == "--library") options.library_path = need(i);
-        else if (flag == "--threads") options.threads = std::stoul(need(i));
+        else if (flag == "--threads") options.threads = std::stoul(need(i));   // refused unless 1, see run_genotype
         else if (flag == "--max-mosaic-candidates") options.max_mosaic_candidates = std::stoul(need(i));
         else if (flag == "--max-candidates") {
             throw std::runtime_error("--max-candidates is now --max-mosaic-candidates: every panel diplotype is "
@@ -1118,7 +1125,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 "  panvar genotype --gfa <graph.gfa> --reference-path <name> \\\n"
                 "                  --reads1 <r1.fq> --reads2 <r2.fq> --library <params.txt> \\\n"
                 "                  [--bubbles <bubbles.csv>] [--out-prefix <prefix>] \\\n"
-                "                  [--threads <N>] [--max-mosaic-candidates <K>]\n\n"
+                "                  [--max-mosaic-candidates <K>]\n\n"
                 "Calls a pair of whole-locus mosaic haplotypes and projects them to one allele\n"
                 "pair per SV block. Paired reads only.\n\n"
                 "Every unordered pair of panel haplotypes is always a candidate. --max-mosaic-candidates\n"
