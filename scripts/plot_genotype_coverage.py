@@ -28,6 +28,13 @@ ARMS = ["panel", "mosaic"]
 COLOUR = {"panel": "#2166AC", "mosaic": "#B2182B"}
 
 
+def flags(column):
+    """true/false columns, whichever way the reader typed them: pandas 3 infers bool, older readers give str."""
+    if column.dtype == bool:
+        return column
+    return column.astype(str).str.strip().str.lower() == "true"
+
+
 def violins(axis, frame, blocks, coverages, colour):
     positions = []
     data = []
@@ -58,8 +65,8 @@ def rates(axis, runs, coverages):
     width = 0.35
     for index, arm in enumerate(ARMS):
         mine = runs[runs.arm == arm]
-        no_call = [float((mine[mine.coverage == c].run_no_call == "true").mean() or 0.0) for c in coverages]
-        called = mine[mine.run_no_call == "false"]
+        no_call = [float(flags(mine[mine.coverage == c].run_no_call).mean() or 0.0) for c in coverages]
+        called = mine[~flags(mine.run_no_call)]
         exact = []
         for coverage in coverages:
             rows = called[called.coverage == coverage]
@@ -110,12 +117,12 @@ def main():
     for arm in ARMS:
         for coverage in coverages:
             mine = runs[(runs.arm == arm) & (runs.coverage == coverage)]
-            called = mine[mine.run_no_call == "false"]
+            called = mine[~flags(mine.run_no_call)]
             distances = pd.to_numeric(called.unordered_distance, errors="coerce")
             rows = blocks[(blocks.arm == arm) & (blocks.coverage == coverage)]
-            exact_blocks = (rows.exact == "true").sum()
+            exact_blocks = flags(rows.exact).sum()
             summary.append({"arm": arm, "coverage": coverage, "runs": len(mine),
-                            "no_calls": int((mine.run_no_call == "true").sum()),
+                            "no_calls": int(flags(mine.run_no_call).sum()),
                             "donors_fully_exact": int((distances == 0).sum()),
                             "blocks_exact": int(exact_blocks), "blocks": int(len(rows)),
                             "distance_total": int(distances.fillna(0).sum())})
