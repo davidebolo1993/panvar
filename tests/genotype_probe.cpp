@@ -1405,6 +1405,21 @@ int preflight(const Args& args) {
     const panvar::LocusInputReport& report = loaded.built.report;
     const panvar::PanelAlleleMatrix& panel = model.panel();
 
+    // The two gates a real run applies after preparing the model. A preflight that skipped them called a locus
+    // affordable that cannot build its model at all: cyp2d6 passes preparation and then fails the round trip.
+    std::string round_trip = "ok";
+    try {
+        panvar::verify_complete_panel_round_trip(model, loaded.built.authoritative);
+    } catch (const std::exception& error) {
+        round_trip = error.what();
+    }
+    std::string representation = "ok";
+    try {
+        panvar::require_representation_independent(report);
+    } catch (const std::exception& error) {
+        representation = error.what();
+    }
+
     // Every panel haplotype, spelled once: distinct sequences are what the scorer actually holds.
     std::set<std::string> distinct;
     std::size_t total_bp = 0;
@@ -1448,12 +1463,20 @@ int preflight(const Args& args) {
     const double by_mass = c4_slope_seconds * (mass_cells * mean_bp) / (130.0 * c4_fragments * 226000.0);
     const double fixed_seconds = 4.32 + 6.0;   // rescoring intercept plus model, markers, proposal and spelling
 
+    const bool within_caps = mass_cells <= static_cast<double>(max_mass_cells) &&
+                             pair_evaluations <= static_cast<double>(max_panel_pair_evaluations) &&
+                             beam_extensions <= static_cast<double>(max_beam_extensions);
+    const bool runs_as_is = round_trip == "ok" && representation == "ok" && within_caps;
+
     std::ostringstream out;
     out << std::setprecision(10) << "key\tvalue\n"
         << "locus\t" << model.locus_id() << "\nreference\t" << reference
         << "\ntemplates\t" << panel.template_count() << "\ndistinct_template_sequences\t" << distinct.size()
         << "\npanel_diplotypes\t" << panel_pairs
         << "\ntemplate_bp_min_mean_max\t" << (panel.template_count() ? min_bp : 0) << "," << mean_bp << "," << max_bp
+        << "\npanel_round_trip\t" << round_trip << "\nrepresentation_independent\t" << representation
+        << "\nruns_as_is\t" << (runs_as_is ? "true" : "false")
+        << "\npredicted_work_within_caps\t" << (within_caps ? "true" : "false")
         << "\nblocks\t" << model.blocks().size() << "\nvariant_blocks\t" << report.variant_blocks
         << "\ncontext_blocks\t" << report.context_blocks
         << "\nsource_alleles\t" << report.total_source_alleles

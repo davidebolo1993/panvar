@@ -4,6 +4,103 @@ Companion to `genotype_mosaic.md`, which remains the authoritative contract. Thi
 what is actually built, what its own gates still owe, and the work order to reach the Phase 8
 go/no-go.
 
+## R9. Review round 9 — harness cleanup, and what the other loci cost
+
+The reviewer accepted round 8, closed the C4 leave-zero-out milestone, and set a sequence: fix four harness
+issues without touching the C4 model or its result, add a per-locus preflight, then run one development donor at
+2×, 10× and 30× for every non-LPA locus. Steps 1 and 2 are done. Step 3 is blocked: **four of the five remaining
+non-LPA loci cannot run as things stand**, and the preflight found it in minutes rather than hours.
+
+### R9.1 The four harness fixes (commit `77e57c7`)
+
+| Issue | Fix | Gate |
+|---|---|---|
+| Donors shared one random stream: the same seed, and a thinning mask that depended only on names like `probe_123` | `simulate --seed-salt` derives each donor's stream from the master seed and the salt; `subsample --name-salt` hashes `<salt>/<name>`, so donors get different masks while each stays nested across coverages. Without a salt both keep their old behaviour exactly, so the completed C4 run remains reproducible | The nesting gate now also requires two salts to give different masks (sharing at most half the set), each nested within itself, and neither equal to the unsalted mask |
+| The frozen library settings were not passed: the driver relied on simulator defaults | The driver passes read length, insert mean and SD, support sigmas, substitution error and outlier weight, refuses to run if the settings omit any, and records them in the signature | The settings file declares all six; the driver fails closed |
+| The subsample manifest claimed plain FNV-1a while the code applied an avalanche finalizer | The selector is named `fnv1a64_fmix64_top53_v1` over `<salt>/<name>` | — |
+| The coverage plot grouped context and SV blocks separately | Blocks are ordered along the chain (`ctx:0`, `sv:1`, `ctx:2`, …) | — |
+
+The completed C4 results are unchanged and remain one frozen realization per donor from a shared stream.
+
+**Also:** `--threads` accepted a value it ignored. Any value but 1 is now refused before the run does any work
+(gated end to end), the help and the contract's public surface drop it, and the status still records
+`threads_requested` beside `threads_used`. The status also records `unique_haplotypes`, the distinct haplotypes
+of the candidate set it describes — first written as the shared scoring pass's count, which the
+prefix-equals-standalone gate correctly rejected (`384f388`, fixed in `a7aeb17`).
+
+### R9.2 The preflight (commits `384f388`, `a7aeb17`, `b076a5b`)
+
+`genotype_probe preflight` builds a locus's model and marker panel and reports, before any donor is simulated:
+templates and distinct spelled sequences, panel diplotypes, template lengths, blocks and alleles, partial
+frames, blocks with bypass templates, representation-dependent blocks, marker universe and anchors, blocks
+without markers, and the alleles scored. It then predicts the work a leave-zero-out run would do at a declared
+depth — fragments, unique haplotypes, fragment–haplotype mass cells, panel-pair evaluations, the beam extension
+bound — each beside the declared cap it would hit, with the mass-matrix memory.
+
+**The runtime estimate is an extrapolation, and says so.** It is calibrated on the C4 coverage experiment:
+rescoring took 4.32 s + 1.793 ms per fragment at 8,523 candidates over ~130 haplotypes and 226 kb (twelve runs,
+residuals under 3.8 s). One locus cannot separate the per-haplotype mass term from the per-pair term, so the
+estimate is bracketed: the low end scales with candidate pairs, the high end with haplotypes × length. On C4
+itself it predicts 34,230 fragments (31,358–34,310 measured) and 71.7–79.9 s (68.7–69.6 s measured), bracketing
+from above.
+
+A locus whose model is refused now still reports its structure: the refusal text, the templates that do span
+the chain, the partial frames by name, blocks, alleles and representation-dependent blocks.
+
+**A gap the sweep found in the preflight itself.** The first sweep called cyp2d6 the cheapest affordable locus.
+A real run on it ends `MODEL_INCOMPLETE` in 1.1 s: the complete-panel round trip rejects
+`NA18989#1#haplotype1-0000031`, which spells 205,236 bytes against an authoritative 207,214. The preflight had
+prepared the model but never applied the two gates a run applies after preparing it. It now runs both --
+`verify_complete_panel_round_trip` and `require_representation_independent` -- and reports each with its message,
+and `runs_as_is` combines them with the predicted work against every declared cap. A preflight that calls a
+locus affordable when it cannot build its model is worse than no preflight.
+
+### R9.3 The sweep: every non-LPA locus at 30×
+
+| Locus | Templates | Panel diplotypes | Blocks (variant) | Canonical alleles | Beam work ÷ cap | Estimated s/donor | Verdict |
+|---|---|---|---|---|---|---|---|
+| c4 | 131 | 8,515 | 11 (5) | 700 | 0.09 | 72–80 | the completed milestone |
+| cyp2d6 | 127 | 8,131 | 19 (9) | 841 | 0.15 | 65–70 | refuses: panel round trip, and representation-dependent blocks |
+| gstm1 | 466 | 108,345 | 20 (10) | 2,400 | **2.11** | 236–784 | refuses in the proposal |
+| acot | 467 | 108,811 | 19 (9) | 2,910 | **2.01** | 262–831 | refuses in the proposal |
+| ankrd36c | 465 | 107,880 | 21 (10) | 2,560 | **2.21** | 1,040–1,660 | refuses in the proposal |
+| myom2 | 322 spanning | — | 81 (41) | 3,809 | — | — | model refused: 63 partial chain frames |
+
+Mass cells and panel-pair evaluations stay well inside their caps everywhere (at most 0.17 and 0.39 of cap, on
+ankrd36c). The binding constraint is the beam.
+
+**The beam refusal is real, and cheap.** One acot donor simulated at 30× (39,981 fragments) and run at state
+limit 1,024 ends `CANDIDATE_INCOMPLETE` after 12.1 s with the note "the proposal exceeded its declared resource
+budget: mosaic beam extension work exceeds the declared pre-allocation budget". The panel baseline was complete
+(108,811 diplotypes) and `seconds_proposal` is 0.000: the budget is checked before the work, exactly as the
+preflight predicts. Beam extensions scale as templates² × blocks × state limit, and ~466 templates against C4's
+131 is what crosses the 2×10⁹ budget.
+
+**myom2 is a panel problem, not a resource one.** 63 of its 385 templates do not span the chain in a consistent
+direction, so `prepare_genotype_model` refuses the panel. 322 templates do span it. It also has 3
+representation-dependent blocks.
+
+### R9.4 Questions before running any other locus
+
+These are settings and policy decisions, not measurements, so they go to the reviewer rather than being chosen
+here.
+
+1. **The beam budget.** `max_beam_extensions` is a declared pre-allocation budget, not a correctness bound. With
+   the panel baseline protected, the beam supplies only optional mosaics, so for large panels the cheapest fix is
+   a smaller state limit (256 would put all three loci near 0.5 of budget) rather than a larger budget. Either
+   changes a frozen setting. Which, and does K = 8 still stand at a smaller state limit?
+2. **Runtime.** All three large loci exceed the 90 s profiling trigger by 3–18× before any optimisation. Profile
+   first (the reviewer's step 4), or run one development donor per locus at a smaller state limit to get a real
+   measurement to profile against?
+3. **cyp2d6's panel.** It fails the round trip on one template (1,978 bytes short) and has three
+   representation-dependent blocks (`ctx:0`, `sv:1`, `ctx:2`); myom2 has three as well. Is the panel to be
+   curated upstream, or should the round trip and the divergence trim be revisited for these graphs? Only the
+   round trip is a correctness failure; representation dependence is a refusal by policy.
+4. **Partial frames.** myom2's 63 refused templates are a property of the graph, not of the caller. Drop those
+   templates and genotype against the remaining 322, or treat the locus as needing panel curation upstream?
+5. **Scope.** If the answer to 1 unblocks the three large loci, is the order still one development donor at 2×,
+   10× and 30× per locus before any cohort?
+
 ## R8. Review round 8 — C4 leave-zero-out by nested coverage
 
 The reviewer accepted round 7 and closed Phase 8: the C4 30× leave-zero-out milestone. The next experiment asks
