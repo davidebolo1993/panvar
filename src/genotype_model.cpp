@@ -304,7 +304,10 @@ PreparedGenotypeModel prepare_genotype_model(const StructuralLocusInput& input) 
         previous_name = input_template->name;
         if (input_template->frame_status != TemplateFrameStatus::Complete) {
             throw std::invalid_argument(
-                "panel template '" + input_template->name + "' has a partial chain frame");
+                "panel template '" + input_template->name + "' has a partial chain frame" +
+                (input_template->partial_reason.empty()
+                     ? std::string()
+                     : ": " + input_template->partial_reason));
         }
         if (input_template->allele_source_ids.size() != blocks.size()) {
             throw std::invalid_argument(

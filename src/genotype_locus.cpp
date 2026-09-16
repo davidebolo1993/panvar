@@ -186,7 +186,15 @@ BlockWalk walk_block(
         }
     } else if (block.kind == ChainBlockKind::Flank) {
         const bool leading = block.source.empty();
-        steps = flank_steps(path, index, leading ? block.sink : block.source, leading);
+        const std::string& boundary = leading ? block.sink : block.source;
+        steps = flank_steps(path, index, boundary, leading);
+        if (!steps.has_value() && index.positions.find(boundary) != index.positions.end()) {
+            // The boundary is on the path, but nothing lies beyond it: the flank is EMPTY, not
+            // absent. A bubble owns its boundary nodes, so a template whose path starts exactly at
+            // the first bubble has a zero-length leading flank and has still observed the block.
+            // Only a boundary the path never reaches is missing coverage.
+            steps.emplace();
+        }
     } else {
         // The boundary nodes belong to the bubbles either side, so the backbone takes only what lies
         // strictly between them. `interval_steps` decides traversal; `interval_interior_steps`
@@ -356,6 +364,15 @@ LocusInputResult build_locus_input(
     const std::vector<ChainBlock> chain =
         build_chain(kept, report.abutting_boundaries_trimmed);
 
+    // Block identifiers and per-template refusal reasons are needed before any allele is emitted:
+    // the frame decision below names the blocks a template failed to cover.
+    std::vector<std::string> block_ids(chain.size());
+    for (std::size_t bi = 0; bi < chain.size(); ++bi) {
+        block_ids[bi] = (chain[bi].kind == ChainBlockKind::Bubble ? "sv" : "ctx") +
+                        std::string(":") + std::to_string(bi);
+    }
+    std::vector<std::string> partial_reason_by_template(graph.paths.size());
+
     std::vector<std::string> ordered_boundaries;
     for (const Bubble* bubble : kept) {
         ordered_boundaries.push_back(left_boundary(*bubble));
@@ -375,6 +392,11 @@ LocusInputResult build_locus_input(
         orientations[pi] = template_orientation(graph.paths[pi], ordered_boundaries);
         if (!orientations[pi].has_value()) {
             report.refused_templates.push_back(graph.paths[pi].name);
+            partial_reason_by_template[pi] = "no consistent chain frame";
+            PartialTemplateReport partial;
+            partial.name = graph.paths[pi].name;
+            partial.reason = partial_reason_by_template[pi];
+            report.partial_templates.push_back(std::move(partial));
         } else if (*orientations[pi] == ChainOrientation::Forward) {
             ++report.forward_templates;
         } else {
@@ -393,38 +415,98 @@ LocusInputResult build_locus_input(
     std::vector<std::vector<std::string>> allele_source_by_template(
         graph.paths.size(), std::vector<std::string>());
 
-    // Collect every block's walks first: the divergence trim below moves bases between neighbouring
-    // blocks, so no block can be finalised until all of them are known.
-    std::vector<BlockSequences> block_sequences(chain.size());
-    std::vector<std::map<std::string, std::size_t>> slot_by_source(chain.size());
-    std::vector<std::size_t> bypass_counts(chain.size(), 0);
-
+    // Pass one: walk every block once and record what each template did there, emitting no allele
+    // yet. Whether a template may contribute at all cannot be decided until the whole chain has been
+    // walked, and the divergence trim below moves bases between neighbours, so nothing can be
+    // finalised earlier either.
+    std::vector<std::map<std::string, std::string>> sequence_by_source(chain.size());
     for (std::size_t bi = 0; bi < chain.size(); ++bi) {
-        BlockSequences& out = block_sequences[bi];
         for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
             if (!orientations[pi].has_value()) continue;
             const BlockWalk walk = walk_block(graph, graph.paths[pi], indexes[pi], chain[bi]);
             std::string source_id;
             if (!walk.traverses) {
-                // A template that does not walk the block is not missing data: it bypasses it, which
-                // is a well-defined state and usually a deletion spanning the boundaries. Refusing it
-                // would make every template whose deletion removed a boundary unrepresentable at that
-                // block, so it could never be called and never be scored.
                 source_id = "bypass";
-                out.has_bypass = true;
-                ++bypass_counts[bi];
             } else if (walk.signature.empty()) {
                 source_id = "empty";
             } else {
                 source_id = "walk:" + walk.signature;
             }
+            sequence_by_source[bi].emplace(source_id, walk.sequence);
+            allele_source_by_template[pi].push_back(source_id);
+        }
+    }
+
+    // Pass two: decide each template's frame. A block a template does not walk is an admissible
+    // deletion only when the template is observed on BOTH sides of it -- the path brackets the
+    // missing region, so that region really is absent from this haplotype. With no observation on one
+    // side the path simply stopped: the block is uncovered, the template never said anything about
+    // it, and the bases the path does carry there belong to no block at all. Uncovered sequence must
+    // never become a zero-length deletion allele, so such a template's frame is partial and it
+    // contributes nothing -- no allele, no bypass count, and so no representation-dependence flag.
+    std::vector<bool> complete(graph.paths.size(), false);
+    for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
+        if (!orientations[pi].has_value()) continue;
+        const std::vector<std::string>& sources = allele_source_by_template[pi];
+        std::vector<std::string> uncovered;
+        bool missing_left = false;
+        bool missing_right = false;
+        for (std::size_t bi = 0; bi < sources.size(); ++bi) {
+            if (sources[bi] != "bypass") continue;
+            bool observed_left = false;
+            bool observed_right = false;
+            for (std::size_t j = 0; j < bi; ++j) {
+                if (sources[j] != "bypass") { observed_left = true; break; }
+            }
+            for (std::size_t j = bi + 1; j < sources.size(); ++j) {
+                if (sources[j] != "bypass") { observed_right = true; break; }
+            }
+            if (observed_left && observed_right) continue;   // bracketed on both sides: a deletion
+            uncovered.push_back(block_ids[bi]);
+            if (!observed_left) missing_left = true;
+            if (!observed_right) missing_right = true;
+        }
+        complete[pi] = uncovered.empty();
+        if (complete[pi]) continue;
+
+        std::string names;
+        for (const std::string& block : uncovered) {
+            if (!names.empty()) names += ", ";
+            names += block;
+        }
+        PartialTemplateReport partial;
+        partial.name = graph.paths[pi].name;
+        partial.uncovered_blocks = uncovered;
+        partial.missing_terminal_anchor =
+            missing_left && missing_right ? "both" : (missing_left ? "left" : "right");
+        partial.reason = "locus_coverage_partial: missing " + partial.missing_terminal_anchor +
+                         "-terminal coverage at " + names;
+        partial_reason_by_template[pi] = partial.reason;
+        report.partial_templates.push_back(std::move(partial));
+        report.refused_templates.push_back(graph.paths[pi].name);
+    }
+
+    // Pass three: emit alleles, from templates with a complete frame only.
+    std::vector<BlockSequences> block_sequences(chain.size());
+    std::vector<std::map<std::string, std::size_t>> slot_by_source(chain.size());
+    std::vector<std::size_t> bypass_counts(chain.size(), 0);
+    for (std::size_t bi = 0; bi < chain.size(); ++bi) {
+        BlockSequences& out = block_sequences[bi];
+        for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
+            if (!complete[pi]) continue;
+            const std::string& source_id = allele_source_by_template[pi][bi];
+            if (source_id == "bypass") {
+                // A bypass that survives the frame decision is bracketed on both sides: a genuine
+                // deletion, which is a well-defined state and must stay representable.
+                out.has_bypass = true;
+                ++bypass_counts[bi];
+            }
             const auto found = slot_by_source[bi].find(source_id);
             if (found == slot_by_source[bi].end()) {
                 slot_by_source[bi].emplace(source_id, out.source_ids.size());
                 out.source_ids.push_back(source_id);
-                out.sequences.push_back(walk.sequence);
+                out.sequences.push_back(sequence_by_source[bi].at(source_id));
             }
-            allele_source_by_template[pi].push_back(source_id);
         }
     }
 
@@ -454,12 +536,14 @@ LocusInputResult build_locus_input(
 
         GenotypeBlockInput out;
         out.kind = is_variant ? GenotypeBlockKind::Variant : GenotypeBlockKind::Context;
-        out.block_id = (is_variant ? "sv" : "ctx") + std::string(":") + std::to_string(bi);
+        out.block_id = block_ids[bi];
 
         LocusBlockReport block_report;
         block_report.block_id = out.block_id;
         block_report.kind = out.kind;
         block_report.bubble_id = is_variant ? chain[bi].bubble_id : 0;
+        block_report.source_node = chain[bi].source;
+        block_report.sink_node = chain[bi].sink;
         block_report.bypass_templates = bypass_counts[bi];
         block_report.trimmed_prefix_bp = trimmed_prefix[bi];
         block_report.trimmed_suffix_bp = trimmed_suffix[bi];
@@ -526,8 +610,9 @@ LocusInputResult build_locus_input(
     for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
         PanelTemplateInput out;
         out.name = graph.paths[pi].name;
-        if (!orientations[pi].has_value()) {
+        if (!complete[pi]) {
             out.frame_status = TemplateFrameStatus::Partial;
+            out.partial_reason = partial_reason_by_template[pi];
             result.input.templates.push_back(std::move(out));
             continue;
         }

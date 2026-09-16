@@ -1453,7 +1453,9 @@ int coverage_audit(const Args& args) {
         ++by_block[row.block_id][label];
     }
 
-    out << "#block\tkind\ttraversing\tempty_between_boundaries\tbridged_bypass\tuncovered_left\tuncovered_right\n";
+    // The bounding nodes are what a template must actually reach for a block to be covered at all,
+    // so they are what settles whether a block is uncovered or merely bypassed.
+    out << "#block\tkind\tsource_node\tsink_node\ttraversing\tempty_between_boundaries\tbridged_bypass\tuncovered_left\tuncovered_right\n";
     for (const panvar::LocusBlockReport& block : report.blocks) {
         const auto found = by_block.find(block.block_id);
         const auto count = [&](const char* label) -> std::size_t {
@@ -1467,6 +1469,8 @@ int coverage_audit(const Args& args) {
         const std::size_t right = count("uncovered_right");
         out << block.block_id << '\t'
             << (block.kind == panvar::GenotypeBlockKind::Variant ? "variant" : "context") << '\t'
+            << (block.source_node.empty() ? "-" : block.source_node) << '\t'
+            << (block.sink_node.empty() ? "-" : block.sink_node) << '\t'
             << framed - empty - bridged - left - right << '\t' << empty << '\t' << bridged << '\t'
             << left << '\t' << right << '\n';
     }

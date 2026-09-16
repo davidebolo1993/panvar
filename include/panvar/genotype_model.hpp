@@ -139,6 +139,10 @@ struct PanelTemplateInput {
     // chain. It is retained per template because one panel may contain both parallel and
     // antiparallel paths.
     ChainOrientation source_orientation = ChainOrientation::Forward;
+    // Why the frame is partial, for the refusal message; empty when the frame is complete. Last,
+    // because this is an aggregate that fixtures initialise positionally: a new field inserted
+    // ahead of `allele_source_ids` silently swallows the allele list and compiles clean.
+    std::string partial_reason;
 };
 
 struct StructuralLocusInput {

@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <random>
+#include <filesystem>
 #include <fstream>
 #include <array>
 #include <cstdlib>
@@ -580,6 +581,201 @@ void test_bypass_representation_dependence(const std::string& stage_prefix) {
             "without the bypass the middle block must be divergence-trimmed on both sides");
 }
 
+// Locus coverage. A template that does not reach a terminal anchor never observed the blocks out
+// there: it has not deleted them. Recording that as a bypass invents a zero-length deletion allele
+// and silently drops the bases the path does carry, which is what cost cyp2d6 1,978 bases. These
+// gates fix the distinction in both directions -- uncovered must refuse, bracketed must not.
+void test_locus_coverage_partial() {
+    std::mt19937_64 rng(4242);
+    const auto bases = [&](std::size_t length) {
+        std::string out(length, 'A');
+        for (char& base : out) base = "ACGT"[rng() % 4];
+        return out;
+    };
+    const std::vector<std::pair<std::string, std::string>> nodes = {
+        {"1", bases(300)}, {"2", bases(40)}, {"3", bases(120)}, {"4", bases(70)},
+        {"5", bases(40)}, {"6", bases(200)}, {"7", bases(40)}, {"8", bases(130)},
+        {"9", bases(60)}, {"10", bases(40)}, {"11", bases(200)}, {"12", bases(40)},
+        {"13", bases(110)}, {"14", bases(55)}, {"15", bases(40)}, {"16", bases(300)},
+    };
+    // Chain: ctx:0 | sv:1 (2..5) | ctx:2 | sv:3 (7..10) | ctx:4 | sv:5 (12..15) | ctx:6
+    const std::vector<std::string> full_a =
+        {"1", "2", "3", "5", "6", "7", "8", "10", "11", "12", "13", "15", "16"};
+    const std::vector<std::string> full_b =
+        {"1", "2", "4", "5", "6", "7", "9", "10", "11", "12", "14", "15", "16"};
+    const std::vector<std::string> bracketed_deletion = {"1", "2", "3", "5", "12", "13", "15", "16"};
+    const std::vector<std::string> empty_interior =
+        {"1", "2", "3", "5", "7", "8", "10", "11", "12", "13", "15", "16"};
+    const std::vector<std::string> no_left_terminal =
+        {"6", "7", "8", "10", "11", "12", "13", "15", "16"};
+    const std::vector<std::string> no_right_terminal = {"1", "2", "3", "5", "6", "7", "8", "10", "11"};
+
+    struct FixtureTemplate {
+        std::string name;
+        std::vector<std::string> nodes;
+        bool reverse = false;
+    };
+    const auto build = [&](const std::vector<FixtureTemplate>& templates, const std::string& tag) {
+        const std::string file =
+            (std::filesystem::temp_directory_path() / ("genotype_coverage_" + tag + ".gfa")).string();
+        {
+            std::ofstream out(file);
+            out << "H\tVN:Z:1.0\n";
+            for (const auto& node : nodes) out << "S\t" << node.first << '\t' << node.second << '\n';
+            std::set<std::pair<std::string, std::string>> edges;
+            for (const auto& item : templates) {
+                for (std::size_t i = 1; i < item.nodes.size(); ++i) {
+                    edges.emplace(item.nodes[i - 1], item.nodes[i]);
+                }
+            }
+            for (const auto& edge : edges) {
+                out << "L\t" << edge.first << "\t+\t" << edge.second << "\t+\t0M\n";
+            }
+            for (const auto& item : templates) {
+                out << "P\t" << item.name << '\t';
+                for (std::size_t i = 0; i < item.nodes.size(); ++i) {
+                    const std::string& node =
+                        item.reverse ? item.nodes[item.nodes.size() - 1 - i] : item.nodes[i];
+                    out << (i ? "," : "") << node << (item.reverse ? '-' : '+');
+                }
+                out << "\t*\n";
+            }
+        }
+        std::vector<panvar::Bubble> bubbles(3);
+        const std::vector<std::array<std::string, 4>> spec = {
+            {"2", "5", "3", "4"}, {"7", "10", "8", "9"}, {"12", "15", "13", "14"}};
+        for (std::size_t i = 0; i < 3; ++i) {
+            bubbles[i].id = i + 1;
+            bubbles[i].source = spec[i][0];
+            bubbles[i].sink = spec[i][1];
+            bubbles[i].inside = {spec[i][2], spec[i][3]};
+        }
+        panvar::ParseGfaOptions parse_options;
+        const panvar::Graph graph = panvar::parse_gfa(file, parse_options);
+        panvar::LocusInputOptions options;
+        options.locus_id = "coverage-fixture";
+        options.reference_path_name = "A#1#x";
+        panvar::LocusInputResult built = panvar::build_locus_input(graph, bubbles, options);
+        std::filesystem::remove(file);
+        return built;
+    };
+    const auto refusal_message = [](const panvar::StructuralLocusInput& input) {
+        try {
+            panvar::prepare_genotype_model(input);
+        } catch (const std::invalid_argument& error) {
+            return std::string(error.what());
+        }
+        return std::string();
+    };
+    const auto allele_census = [](const panvar::LocusInputResult& built) {
+        std::string census;
+        for (const auto& block : built.input.blocks) {
+            census += block.block_id + "{";
+            std::set<std::string> alleles;
+            for (const auto& allele : block.alleles) alleles.insert(allele.source_id + "=" + allele.sequence);
+            for (const auto& allele : alleles) census += allele + ";";
+            census += "}";
+        }
+        return census;
+    };
+    const auto uncovered_of = [](const panvar::LocusInputResult& built, const std::string& name) {
+        for (const auto& partial : built.report.partial_templates) {
+            if (partial.name == name) return partial;
+        }
+        return panvar::PartialTemplateReport{};
+    };
+
+    // 1. A forward template that does not reach the chain's left terminal anchor.
+    const panvar::LocusInputResult left_gap = build(
+        {{"A#1#x", full_a, false}, {"B#1#x", full_b, false}, {"E#1#x", no_left_terminal, false}},
+        "left");
+    const panvar::PartialTemplateReport left = uncovered_of(left_gap, "E#1#x");
+    require(left.name == "E#1#x", "a template missing the left terminal must be reported partial");
+    require(left.missing_terminal_anchor == "left", "the missing terminal anchor must be named");
+    require(left.uncovered_blocks == std::vector<std::string>({"ctx:0", "sv:1", "ctx:2"}),
+            "the uncovered blocks must be named exactly, in chain order");
+    require(refusal_message(left_gap.input).find("locus_coverage_partial") != std::string::npos,
+            "the refusal must be locus_coverage_partial, not a generic partial frame");
+    for (const auto& block : left_gap.report.blocks) {
+        require(block.bypass_templates == 0,
+                "an uncovered template must contribute no bypass count at any block");
+    }
+    require(left_gap.report.representation_dependent_blocks.empty(),
+            "an uncovered template must not make any block representation-dependent");
+
+    // 2. The same gap on a reverse-oriented template: cyp2d6's NA18989 in miniature.
+    const panvar::LocusInputResult reverse_gap = build(
+        {{"A#1#x", full_a, false}, {"B#1#x", full_b, false}, {"E#1#x", no_left_terminal, true}},
+        "reverse");
+    require(reverse_gap.report.reverse_templates == 1, "fixture: the gapped template must be reverse");
+    require(uncovered_of(reverse_gap, "E#1#x").missing_terminal_anchor == "left",
+            "a reverse template's missing terminal anchor is still the chain's left end");
+    require(uncovered_of(reverse_gap, "E#1#x").uncovered_blocks ==
+                std::vector<std::string>({"ctx:0", "sv:1", "ctx:2"}),
+            "orientation must not change which blocks are uncovered");
+
+    // 3. A template missing the trailing end.
+    const panvar::LocusInputResult right_gap = build(
+        {{"A#1#x", full_a, false}, {"B#1#x", full_b, false}, {"F#1#x", no_right_terminal, false}},
+        "right");
+    require(uncovered_of(right_gap, "F#1#x").missing_terminal_anchor == "right",
+            "a template stopping before the last bubble is uncovered on the right");
+    require(uncovered_of(right_gap, "F#1#x").uncovered_blocks ==
+                std::vector<std::string>({"ctx:4", "sv:5", "ctx:6"}),
+            "the uncovered trailing blocks must be named exactly");
+
+    // 4. A genuine internal deletion, bracketed on both sides, stays a valid bypass. No real locus
+    //    of the six exercises this, and the branch must survive anyway: future loci will.
+    const panvar::LocusInputResult deletion = build(
+        {{"A#1#x", full_a, false}, {"B#1#x", full_b, false}, {"C#1#x", bracketed_deletion, false}},
+        "deletion");
+    require(deletion.report.partial_templates.empty(),
+            "a deletion bracketed on both sides must NOT be refused as uncovered");
+    require(deletion.report.blocks[3].bypass_templates == 1,
+            "a bracketed deletion must still be recorded as a bypass");
+    require(deletion.report.representation_dependent_blocks ==
+                std::vector<std::string>({"ctx:2", "sv:3", "ctx:4"}),
+            "a bracketed bypass must still flag its block and both neighbours");
+    const panvar::PreparedGenotypeModel deletion_model =
+        panvar::prepare_genotype_model(deletion.input);
+    panvar::verify_complete_panel_round_trip(deletion_model, deletion.authoritative);
+
+    // 5. A traversing empty allele is not a bypass: the template walks both boundaries and finds
+    //    nothing between them. gstm1 has 179 of these and myom2 286; they must stay callable.
+    const panvar::LocusInputResult empty = build(
+        {{"A#1#x", full_a, false}, {"B#1#x", full_b, false}, {"G#1#x", empty_interior, false}},
+        "empty");
+    require(empty.report.partial_templates.empty(),
+            "a traversing empty allele must not be refused");
+    require(empty.report.blocks[2].bypass_templates == 0,
+            "a traversing empty allele must not be counted as a bypass");
+    // The state is what must survive, not the byte count: the neighbouring variant block's
+    // divergence trim moves its common flanks into this one, so an empty interior can legitimately
+    // end up carrying trimmed bases. What must never happen is its collapsing into a bypass.
+    bool has_empty_allele = false;
+    bool has_bypass_allele = false;
+    for (const auto& allele : empty.input.blocks[2].alleles) {
+        if (allele.source_id == "empty") has_empty_allele = true;
+        if (allele.source_id == "bypass") has_bypass_allele = true;
+    }
+    require(has_empty_allele, "an empty interior must be its own explicit allele state");
+    require(!has_bypass_allele, "an empty interior must not be recorded as a bypass");
+    panvar::prepare_genotype_model(empty.input);
+
+    // 6. The mutation gate. If uncovered were folded back into bypass, the uncovered template would
+    //    contribute an allele and widen three blocks. Adding it must change nothing at all.
+    const panvar::LocusInputResult without =
+        build({{"A#1#x", full_a, false}, {"B#1#x", full_b, false}}, "without");
+    require(allele_census(left_gap) == allele_census(without),
+            "an uncovered template must not add or widen a single allele anywhere");
+    for (const auto& tpl : left_gap.input.templates) {
+        if (tpl.name != "E#1#x") continue;
+        require(tpl.frame_status == panvar::TemplateFrameStatus::Partial,
+                "an uncovered template's frame must be partial");
+        require(tpl.allele_source_ids.empty(), "an uncovered template must emit no allele record");
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -587,6 +783,7 @@ int main(int argc, char** argv) {
         test_fingerprint_invariance();
         test_partial_frame_refusal();
         test_bypass_is_a_state();
+        test_locus_coverage_partial();
         if (argc > 2) {
             std::cout << "genotype locus adapter: C4 gates\n";
             test_c4(argv[1], argv[2]);

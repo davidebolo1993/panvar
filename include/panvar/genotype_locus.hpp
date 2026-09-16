@@ -33,6 +33,10 @@ struct LocusBlockReport {
     std::size_t min_bp = 0;
     std::size_t max_bp = 0;
     std::size_t bypass_templates = 0;      // templates that do not walk this block at all
+    // The chain nodes bounding this block. A leading flank has no source and a trailing flank no
+    // sink; these are what a template must reach for the block to be covered at all.
+    std::string source_node;
+    std::string sink_node;
     // Bytes the divergence trim moved out of this variant block into its left and right neighbours.
     std::size_t trimmed_prefix_bp = 0;
     std::size_t trimmed_suffix_bp = 0;
@@ -64,6 +68,19 @@ struct TemplateBlockCoverage {
 // "uncovered_left" / "uncovered_right" for Uncovered, the classification name otherwise.
 const char* block_coverage_label(BlockCoverage coverage, bool uncovered_on_left);
 
+// A template whose locus frame is partial, and why. Coverage and representation are reported as
+// separate concepts and must not be conflated: `uncovered_blocks` are blocks this template never
+// observed, which is a property of the template alone, while the blocks a bypass makes
+// representation-dependent are a property of the chain and are reported in the locus report.
+struct PartialTemplateReport {
+    std::string name;
+    std::string reason;
+    std::vector<std::string> uncovered_blocks;
+    // "left", "right" or "both": the terminal anchor of the chain this template fails to reach.
+    // Empty when the frame is partial for a reason other than coverage.
+    std::string missing_terminal_anchor;
+};
+
 struct LocusInputReport {
     std::size_t variant_blocks = 0;
     std::size_t context_blocks = 0;
@@ -89,6 +106,9 @@ struct LocusInputReport {
     // non-traversing pairs are kept: they are the interesting ones and the full cross product is
     // templates x blocks. Reporting only -- no allele, refusal or fingerprint depends on it.
     std::vector<TemplateBlockCoverage> non_traversing_coverage;
+    // Every template refused a complete frame, with the reason. Parallel in content to
+    // `refused_templates`, which keeps only the names.
+    std::vector<PartialTemplateReport> partial_templates;
 };
 
 struct LocusInputResult {
