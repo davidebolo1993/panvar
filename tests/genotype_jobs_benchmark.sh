@@ -32,8 +32,13 @@ PROBE="$BUILD/genotype_probe"
 # A fixed donor subset, taken in sorted order so the two settings score the same donors in the same
 # order. Enough donors to keep two workers busy, few enough that the benchmark is minutes not hours.
 DONOR_COUNT="${DONOR_COUNT:-8}"
+# Neither of these may leave a non-zero status behind: under `set -o pipefail` a `head` that closes the
+# pipe early makes `sort` die of SIGPIPE and takes the whole assignment -- and the script -- with it,
+# before anything is created and with nothing printed. `awk` reads its input to the end, and the
+# explicit `if` does not report "false" for every listed entry that is not a donor directory.
 DONORS="${DONORS:-$(ls -1 "$READS" | while read -r d; do
-  [ -f "$READS/$d/cov$COVERAGE/reads_1.fq" ] && echo "$d"; done | sort | head -n "$DONOR_COUNT")}"
+  if [ -f "$READS/$d/cov$COVERAGE/reads_1.fq" ]; then echo "$d"; fi
+done | sort | awk -v n="$DONOR_COUNT" 'NR <= n')}"
 [ -n "$DONORS" ] || { echo "no donors with cached cov$COVERAGE reads under $READS" >&2; exit 1; }
 
 mkdir -p "$OUT"
@@ -74,7 +79,8 @@ call_hash() {
   local tag="$1"
   find "$OUT/$tag" -name "lzo.K*.mosaic_status.tsv" | sort | while read -r f; do
     printf '%s\n' "${f#$OUT/$tag/}"
-    grep -vE '^(seconds_|peak_rss|wall_|threads_|.*_evaluations|.*_work|beam_extensions)' "$f"
+    # `|| true`: grep -v reports 1 when it filters everything, which would abort the hash under set -e.
+    grep -vE '^(seconds_|peak_rss|wall_|threads_|.*_evaluations|.*_work|beam_extensions)' "$f" || true
   done | shasum -a 256 | cut -d' ' -f1
 }
 
