@@ -157,6 +157,8 @@ struct CandidateSetReport {
     std::size_t panel_diplotypes = 0;
     bool panel_baseline_complete = false;
     std::size_t beam_diplotypes_found = 0;   // every diplotype the beam found, panel pairs included
+    // Distinct haplotype sequences scored once for the whole candidate set: what a preflight predicts.
+    std::size_t unique_haplotypes = 0;
 };
 
 struct RankingSummary {
@@ -300,6 +302,7 @@ void write_status(
         out << "panel_diplotypes\t" << candidate_set->panel_diplotypes << '\n';
         out << "panel_baseline_complete\t" << (candidate_set->panel_baseline_complete ? "true" : "false") << '\n';
         out << "beam_diplotypes_found\t" << candidate_set->beam_diplotypes_found << '\n';
+        out << "unique_haplotypes\t" << candidate_set->unique_haplotypes << '\n';
         if (beam != nullptr && candidate_set->panel_baseline_complete) {
             out << "candidates_total\t" << candidate_set->panel_diplotypes + beam->candidates.size() << '\n';
         }
@@ -677,6 +680,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         }
     }
     const InternedHaplotypes interned = any_ranked ? intern_haplotypes(paths, sequences) : InternedHaplotypes{};
+    candidate_report.unique_haplotypes = interned.sequences.size();
     // Candidates are ranked as unordered pairs of SEQUENCES. Two candidates whose allele paths differ but
     // spell the same two haplotypes are one state to any read-based method.
     const auto sequence_pair = [&](const MosaicCandidate& candidate) {

@@ -1335,6 +1335,118 @@ int compare(const Args& args) {
 } // namespace
 
 // ------------------------------------------------------------------------------------------------
+// preflight: what one locus would cost, before any donor is simulated or run
+// ------------------------------------------------------------------------------------------------
+
+// Reports a locus's structure and the work a leave-zero-out run would do on it, with every predicted count
+// placed beside the declared cap it would hit. The runtime estimate is an extrapolation from the C4 coverage
+// experiment, whose rescoring time was 4.32 s + 1.793 ms per fragment at 8,523 candidates over ~130 unique
+// haplotypes (twelve runs, residuals under 3.8 s). One locus cannot separate the per-haplotype mass term from
+// the per-candidate-pair term, so the estimate is bracketed: the low end attributes C4's slope entirely to the
+// pair term, the high end entirely to the haplotype-mass term. Neither is a measurement of this locus.
+int preflight(const Args& args) {
+    const std::string reference = args.required("reference");
+    const double depth = std::stod(args.get("depth", "30"));
+    const std::size_t read_length = std::stoul(args.get("read-length", "100"));
+    const std::size_t mosaics = std::stoul(args.get("max-mosaic-candidates", "8"));
+    const std::size_t state_limit = std::stoul(args.get("state-limit", "1024"));
+    const std::size_t min_variant_bp = std::stoul(args.get("min-variant-bp", "50"));
+    const std::uint64_t max_mass_cells = std::stoull(args.get("max-mass-cells", "200000000"));
+    const std::uint64_t max_panel_pair_evaluations = std::stoull(args.get("max-panel-pair-evaluations", "20000000000"));
+    const std::uint64_t max_beam_extensions = std::stoull(args.get("max-beam-extensions", "2000000000"));
+    const std::string stage =
+        (std::filesystem::temp_directory_path() / ("genotype_probe_preflight_" + std::to_string(::getpid()) + ".sorted.gfa")).string();
+    const LoadedModel loaded = load_model(args.required("gfa"), reference, stage, min_variant_bp);
+    std::filesystem::remove(stage);
+    const panvar::PreparedGenotypeModel& model = *loaded.model;
+    const panvar::LocusInputReport& report = loaded.built.report;
+    const panvar::PanelAlleleMatrix& panel = model.panel();
+
+    // Every panel haplotype, spelled once: distinct sequences are what the scorer actually holds.
+    std::set<std::string> distinct;
+    std::size_t total_bp = 0;
+    std::size_t min_bp = std::numeric_limits<std::size_t>::max();
+    std::size_t max_bp = 0;
+    for (std::size_t row = 0; row < panel.template_count(); ++row) {
+        panvar::MosaicPath path;
+        path.alleles.assign(panel.template_alleles[row].begin(), panel.template_alleles[row].end());
+        const std::string bases = panvar::spell_mosaic(model, path).bases;
+        distinct.insert(bases);
+        total_bp += bases.size();
+        min_bp = std::min(min_bp, bases.size());
+        max_bp = std::max(max_bp, bases.size());
+    }
+    const double mean_bp = panel.template_count() == 0 ? 0.0
+                                                       : static_cast<double>(total_bp) / static_cast<double>(panel.template_count());
+    const std::size_t panel_pairs = panvar::panel_diplotypes(panel).size();
+    const panvar::PreparedMarkerPanel markers =
+        panvar::build_marker_panel(model, std::stoul(args.get("kmer", "31")), std::stoul(args.get("syncmer", "15")));
+    std::size_t blocks_without_markers = 0;
+    for (const panvar::BlockMarkerInventory& block : markers.blocks) {
+        if (block.marker_slots.empty()) ++blocks_without_markers;
+    }
+    std::size_t bypass_blocks = 0;
+    for (const panvar::LocusBlockReport& block : report.blocks) {
+        if (block.bypass_templates > 0) ++bypass_blocks;
+    }
+
+    // One fragment covers two mates of read_length on one chromosome copy, and both copies are sequenced.
+    const double fragments = mean_bp * depth / (2.0 * static_cast<double>(read_length));
+    const double unique_haplotypes = static_cast<double>(distinct.size() + 2 * mosaics);
+    const double mass_cells = unique_haplotypes * fragments;
+    const double pair_evaluations = static_cast<double>(panel_pairs + mosaics) * fragments;
+    const double templates = static_cast<double>(panel.template_count());
+    const double beam_extensions =
+        templates * templates * (1.0 + static_cast<double>(model.blocks().size() - 1) * static_cast<double>(state_limit));
+    // C4's measured slope, and the two ways of attributing it.
+    const double c4_fragments = 31358.0;
+    const double c4_slope_seconds = 0.00179283 * c4_fragments;   // per-run cost above the fixed term
+    const double by_pairs = c4_slope_seconds * (pair_evaluations / (8523.0 * c4_fragments));
+    const double by_mass = c4_slope_seconds * (mass_cells * mean_bp) / (130.0 * c4_fragments * 226000.0);
+    const double fixed_seconds = 4.32 + 6.0;   // rescoring intercept plus model, markers, proposal and spelling
+
+    std::ostringstream out;
+    out << std::setprecision(10) << "key\tvalue\n"
+        << "locus\t" << model.locus_id() << "\nreference\t" << reference
+        << "\ntemplates\t" << panel.template_count() << "\ndistinct_template_sequences\t" << distinct.size()
+        << "\npanel_diplotypes\t" << panel_pairs
+        << "\ntemplate_bp_min_mean_max\t" << (panel.template_count() ? min_bp : 0) << "," << mean_bp << "," << max_bp
+        << "\nblocks\t" << model.blocks().size() << "\nvariant_blocks\t" << report.variant_blocks
+        << "\ncontext_blocks\t" << report.context_blocks
+        << "\nsource_alleles\t" << report.total_source_alleles
+        << "\ncanonical_alleles\t" << report.total_canonical_alleles
+        << "\npartial_frames_refused\t" << report.refused_templates.size()
+        << "\nblocks_with_bypass_templates\t" << bypass_blocks
+        << "\nrepresentation_dependent_blocks\t" << report.representation_dependent_blocks.size()
+        << "\nmarker_universe\t" << markers.codes.size() << "\nmarker_anchors\t" << markers.anchor_slots.size()
+        << "\nblocks_without_markers\t" << blocks_without_markers
+        << "\nmarkers_dropped_multiblock\t" << markers.dropped_multiblock_markers
+        << "\nalleles_scored_of_total\t" << markers.scored_alleles << "/" << markers.total_alleles
+        << "\nassumed_depth\t" << depth << "\nassumed_read_length\t" << read_length
+        << "\nmax_mosaic_candidates\t" << mosaics << "\nstate_limit\t" << state_limit
+        << "\npredicted_fragments\t" << fragments
+        << "\npredicted_unique_haplotypes\t" << unique_haplotypes
+        << "\npredicted_mass_cells\t" << mass_cells << "\nmass_cells_cap\t" << max_mass_cells
+        << "\nmass_cells_fraction_of_cap\t" << mass_cells / static_cast<double>(max_mass_cells)
+        << "\npredicted_panel_pair_evaluations\t" << pair_evaluations
+        << "\npanel_pair_evaluations_cap\t" << max_panel_pair_evaluations
+        << "\npanel_pair_evaluations_fraction_of_cap\t" << pair_evaluations / static_cast<double>(max_panel_pair_evaluations)
+        << "\nbeam_extension_upper_bound\t" << beam_extensions << "\nbeam_extensions_cap\t" << max_beam_extensions
+        << "\nbeam_extensions_fraction_of_cap\t" << beam_extensions / static_cast<double>(max_beam_extensions)
+        << "\npredicted_mass_matrix_MB\t" << mass_cells * 8.0 / 1048576.0
+        << "\nestimated_seconds_low\t" << fixed_seconds + std::min(by_pairs, by_mass)
+        << "\nestimated_seconds_high\t" << fixed_seconds + std::max(by_pairs, by_mass)
+        << "\nestimate_basis\tC4 coverage experiment: 4.32 s + 1.793 ms per fragment at 8,523 candidates, ~130 "
+           "haplotypes, 226 kb; low end scales with candidate pairs, high end with haplotypes x length\n";
+    std::cout << out.str();
+    if (!args.get("out", "").empty()) {
+        std::ofstream file(args.get("out", ""));
+        file << out.str();
+    }
+    return 0;
+}
+
+// ------------------------------------------------------------------------------------------------
 // anchors: a donor's invariant-anchor counts, for the depth-fit oracle gate
 // ------------------------------------------------------------------------------------------------
 
@@ -1536,7 +1648,7 @@ int genotype(const Args& args) {
 int main(int argc, char** argv) {
     try {
         if (argc < 2) {
-            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors|subsample --key value ...\n";
+            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors|subsample|preflight --key value ...\n";
             return 2;
         }
         const std::string command = argv[1];
@@ -1549,6 +1661,7 @@ int main(int argc, char** argv) {
         if (command == "trace") return trace(args);
         if (command == "anchors") return anchors(args);
         if (command == "subsample") return subsample(args);
+        if (command == "preflight") return preflight(args);
         std::cerr << "unknown probe command: " << command << '\n';
         return 2;
     } catch (const std::exception& error) {
