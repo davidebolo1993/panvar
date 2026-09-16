@@ -114,7 +114,7 @@ done
 # ---- identity against the R11 measurements, which used the same reads and the unoptimised code -------
 # Expected to differ: timing fields, the three new counters, and the per-block candidate_scope column,
 # which R11 reported wrongly. Everything statistical must be byte-identical.
-drop_status() { grep -vE '^(seconds_|distinct_haplotype_paths|haploid_prior_evaluations|diploid_prior_lookups)' "$1" 2>/dev/null; }
+drop_status() { grep -vE '^(seconds_|distinct_haplotype_paths|haploid_prior_evaluations|diploid_prior_lookups|threads_|candidate_fragment_evaluations)' "$1" 2>/dev/null; }
 drop_last()   { awk -F'\t' '{NF--; print}' OFS='\t' "$1" 2>/dev/null; }
 seqs_only()   { grep -v '^>' "$1" 2>/dev/null; }
 

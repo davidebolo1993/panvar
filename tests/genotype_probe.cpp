@@ -1937,6 +1937,10 @@ int genotype(const Args& args) {
     options.out_prefix = args.required("out-prefix");
     options.proposal_state_limit = std::stoul(args.get("state-limit", "1024"));
     options.phase_audit_candidates = std::stoul(args.get("phase-audit", "0"));
+    // Workers for the diploid combination phase. Absent until now, so the probe accepted --threads as an
+    // unknown key and dropped it: a benchmark invoked with --threads 2 recorded threads_requested 1 and
+    // measured the serial path four times over.
+    options.threads = std::stoul(args.get("threads", "1"));
     for (const std::size_t k : parse_alleles(args.required("prefixes"))) {
         options.development_candidate_prefixes.push_back(k);
     }
