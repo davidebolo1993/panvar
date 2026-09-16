@@ -4,6 +4,234 @@ Companion to `genotype_mosaic.md`, which remains the authoritative contract. Thi
 what is actually built, what its own gates still owe, and the work order to reach the Phase 8
 go/no-go.
 
+## R8. Review round 8 — C4 leave-zero-out by nested coverage
+
+The reviewer accepted round 7 and closed Phase 8: the C4 30× leave-zero-out milestone. The next experiment asks
+a different question — whether the mosaic arm earns its place when coverage is scarce — and no model change was
+made for it.
+
+**Rulings carried into this round.**
+
+- No further model changes for C4 30×; preserve the milestone.
+- Freeze, before running: a new seed, nested coverage levels, the donor split, the two arms, the metrics and
+  plotting code, and any LOWCONF threshold.
+- Build the lower coverages by retaining paired fragments from one maximum-coverage simulation by a
+  deterministic hash, never by resimulating each coverage.
+- Report per arm, never pooled; conditional GQ stays uncalibrated and unthresholded.
+
+### R8.1 What was frozen (commit `2c32c89`)
+
+`tests/genotype_coverage_settings.tsv`, committed before any read of this experiment was simulated:
+
+| Key | Value |
+|---|---|
+| `seed` | 20260916 (new) |
+| `source_coverage`, `coverages` | 30×; 2, 5, 10, 15, 20, 30× |
+| `state_limit` | 1024 |
+| `panel_arm_mosaic_candidates`, `mosaic_arm_mosaic_candidates` | 0, 8 |
+| `phase_audit_candidates` | 256 |
+| `read_length`, `insert_mean_bp`, `insert_sd_bp` | 100, 350, 40 |
+| `lowconf_gq_threshold` | none |
+| `metrics_script`, `plot_script` | `tests/genotype_coverage_c4.sh`, `scripts/plot_genotype_coverage.py` |
+
+The donor split is the existing manifest, unchanged: eight development donors run first, then the 56 held-out
+donors. The 30× milestone settings and every earlier result are untouched; this experiment writes its own
+directories.
+
+### R8.2 Nested coverages, and the defect the gate caught
+
+`genotype_probe subsample` keeps a paired fragment when a hash of its name, as a unit value, falls below
+coverage / source coverage.
+
+- The decision depends only on the name, so the sets are nested: everything kept at 2× is kept at 5×, and so on.
+- The declared fragment-start intensity follows the coverage, so the library the caller is given matches the
+  reads it is given.
+- Resimulating each coverage would confound coverage with a fresh draw.
+
+**The first implementation was biased.** Plain FNV-1a left the high bits poorly mixed for short sequential
+names (`probe_1`…`probe_4000`), and the selector reads exactly those bits: at 20× of 30× it kept 85% of
+fragments instead of 67%. The gate caught it before any experiment ran. The hash now ends with the murmur3
+avalanche.
+
+**Gate** (`tests/genotype_subsample_nested.sh`, in ctest). On 4,000 synthetic pairs:
+
+| Coverage | 30× | 20× | 15× | 10× | 5× | 2× |
+|---|---|---|---|---|---|---|
+| Fragments kept | 4,000 | 2,698 | 2,006 | 1,331 | 668 | 259 |
+| Requested | 4,000 | 2,667 | 2,000 | 1,333 | 667 | 267 |
+
+It also requires: each set a subset of the next, in the same order; mates paired with their suffixes; a rerun
+identical; the same ratio expressed differently (10 of 30, 1 of 3) keeping exactly the same fragments; and the
+declared intensity scaling with coverage.
+
+### R8.3 Development donors (commit `2c32c89`, clean worktree)
+
+Eight development donors, one 30× simulation each, both arms ranked from one proposal and one scoring pass per
+coverage, each evaluated against the donor's truth.
+
+| Coverage | Panel arm: donors exact, blocks exact, distance | Mosaic arm: donors exact, blocks exact, distance |
+|---|---|---|
+| 2× | 7/8, 86/88, 2 | 7/8, 86/88, 2 |
+| 5× | 8/8, 88/88, 0 | 8/8, 88/88, 0 |
+| 10× | 8/8, 88/88, 0 | 8/8, 88/88, 0 |
+| 15× | 8/8, 88/88, 0 | 8/8, 88/88, 0 |
+| 20× | 8/8, 88/88, 0 | 8/8, 88/88, 0 |
+| 30× | 8/8, 88/88, 0 | 8/8, 88/88, 0 |
+
+- **No run failed to call, at any coverage.** Every depth fit converged, down to 2× (about 2,200 fragments).
+- **Every truth was scored from the protected panel baseline** at every coverage.
+- **The arms do not separate on accuracy.** They are identical at every coverage, including where the calls are
+  wrong.
+- **The only errors are HG00733 at 2×:** two context blocks (`ctx:6`, `ctx:8`), each off by one base, in both
+  arms. Their conditional GQ is about 3.03 and 3.05 — the lowest in the whole development run — so the
+  uncertainty is visible where the error is.
+- **Conditional GQ separates the arms sharply**, as in round 7 and for the same reason. At 5×, NA20509 is
+  GQ 11,047 in the panel arm and 41 in the mosaic arm; HG02818 is 3,838 against 47. The panel arm is far more
+  certain because it excludes recombinant alternatives, not because it is more accurate.
+- **Phase.** Almost every call is `PRIOR_ONLY` at every coverage, as at 30×. Exactly one donor holds an audited
+  read claim at each of three coverages — HG02666 at 2×, HG00733 at 5×, HG02818 at 30× — and none at 10×, 15× or
+  20×; the same donor in both arms each time. In the panel arm all eight donors claim read-supported phase
+  *within their candidates* at every coverage, and the K = 256 audit withdraws all but one; the mosaic arm claims
+  fewer within candidates to begin with (three at 2×, four at 5×, two at 30×), because its own eight mosaics
+  already contain phase-swapped rivals.
+- **Every run completed with a converged depth fit and a completed audit**, at every coverage: 96 genotype runs
+  (8 donors × 6 coverages × 2 arms), no refusals, terminations split between `interior_stationary` and
+  `boundary_kkt`.
+- **Cost falls with coverage**, as expected when rescoring dominates and fragments are fewer. One run ranks both
+  arms and the audit:
+
+| Coverage | 2× | 5× | 10× | 15× | 20× | 30× |
+|---|---|---|---|---|---|---|
+| Fragments | 2.2–2.4k | 5.4–6.0k | 10.9–12.0k | 16.2–17.8k | 21.6–23.7k | 32.4–35.7k |
+| Wall, median (max) | 15.3 s (19.6) | 20.2 (24.9) | 30.4 (35.4) | 38.4 (50.0) | 49.0 (59.7) | 70.1 (79.7) |
+| Peak RSS, median (max) | 398 MB (439) | 419 (465) | 462 (507) | 448 (519) | 443 (539) | 560 (615) |
+
+**A second defect, in the plotting code, found by this run.** The plot script reported 0 exact blocks and 0
+no-calls everywhere, while the driver's own summary reported 86–88 exact blocks. pandas 3 types the tables'
+`true`/`false` columns as booleans, and the script compared them against the strings. It now accepts either
+dtype, and its table reproduces the driver's summary exactly (commit `abb35a0`). The driver's summary, computed
+independently in awk, was correct throughout.
+
+### R8.4 Held-out donors (commit `abb35a0`, clean worktree)
+
+The 56 held-out donors, one 30× simulation each with the frozen seed, every lower coverage a nested subset, both
+arms ranked from one proposal and one scoring pass per coverage, each evaluated against the donor's truth. 672
+genotype runs (56 donors × 6 coverages × 2 arms). Output under
+`tests/results/genotype_coverage_c4_held_out_abb35a0/`.
+
+| Coverage | Run no-calls | Donors fully exact | Blocks exact | SV blocks exact | Total distance |
+|---|---|---|---|---|---|
+| 2× | 0 | 55 / 56 | 615 / 616 | 280 / 280 | 1 |
+| 5× | 0 | 55 / 56 | 615 / 616 | 280 / 280 | 1 |
+| 10× | 0 | 56 / 56 | 616 / 616 | 280 / 280 | 0 |
+| 15× | 0 | 56 / 56 | 616 / 616 | 280 / 280 | 0 |
+| 20× | 0 | 56 / 56 | 616 / 616 | 280 / 280 | 0 |
+| 30× | 0 | 56 / 56 | 616 / 616 | 280 / 280 | 0 |
+
+Both arms give exactly these figures at every coverage.
+
+**The arms still do not separate.** Over 3,696 paired block rows, the panel and mosaic arms never differ in truth
+distance, and no run differs in distance or phase support. They differ only in what is conditional:
+
+- **Genotype support** differs on 127 block rows: with eight mosaics in the set, a fragment contender can
+  disagree at a block where the panel alone had none, so `genotype_support` falls to PRIOR_ONLY there.
+- **Conditional GQ** differs by orders of magnitude. Median lowest-block GQ per donor:
+
+| Coverage | 2× | 5× | 10× | 15× | 20× | 30× |
+|---|---|---|---|---|---|---|
+| Panel arm | 1,244 | 4,761 | 11,316 | 16,636 | 22,497 | 33,695 |
+| Mosaic arm | 37 | 63 | 95 | 109 | 125 | 149 |
+
+The panel arm's certainty grows with coverage because nothing in its candidate set competes; the mosaic arm's
+does not, because its own recombinant rivals stay close. Neither is a calibrated error probability, and the arms
+are never pooled.
+
+**The one error, and what GQ said about it.** HG00732's `ctx:2` (a context block) is off by one base at 2× and
+again at 5×, in both arms; everything else is exact. At both coverages, in both arms, that block has the lowest
+conditional GQ of all 616 blocks:
+
+| | Error block GQ | Rank among 616 | 5th percentile | Median |
+|---|---|---|---|---|
+| Panel, 2× | 3.17 | 1 | 207 | 2,678 |
+| Mosaic, 2× | 3.17 | 1 | 32 | 1,243 |
+| Panel, 5× | 7.02 | 1 | 1,091 | 4,094 |
+| Mosaic, 5× | 7.02 | 1 | 53 | 4,094 |
+
+Conditional GQ, uncalibrated as it is, ranked the single wrong call last out of 616 at both coverages and in both
+arms. Over all 3,696 held-out block rows, the two wrong rows at 2× (GQ 3.17) have no exact row below them, and the
+two at 5× (GQ 7.02) have four. Low GQ occurs only at low coverage: seven rows fall below GQ 20 at 2× in each arm
+(six of them exact), and at 5× one does in the panel arm (the wrong one) and three in the mosaic arm (two exact).
+From 10× upward no row in either arm falls below GQ 20. That is a promising signal for a future threshold, but it
+rests on four wrong rows in one locus, so it is not a calibration.
+
+**Phase.** Coverage barely moves it. Between 2 and 5 donors of 56 hold an audited read claim at each coverage
+(panel: 4, 5, 3, 4, 5, 2 from 2× to 30×), identical in both arms; every other call is PRIOR_ONLY. As at 30×, the
+prior decides phase for about 90% of donors whatever the coverage.
+
+**Cost.** One run ranks both arms and the audit:
+
+| Coverage | 2× | 5× | 10× | 15× | 20× | 30× |
+|---|---|---|---|---|---|---|
+| Fragments | 2.0–2.6k | 5.0–6.4k | 10.1–13.0k | 15.0–19.3k | 19.9–25.8k | 29.9–38.8k |
+| Wall, median | 18.2 s | 24.3 s | 33.5 s | 43.7 s | 53.7 s | 74.5 s |
+| Peak RSS, median (max) | 442 MB (480) | 449 (496) | 467 (518) | 481 (547) | 507 (575) | 568 (630) |
+
+**Four runs stalled, and they were contention, not the caller.** Four of the 336 genotype runs took 2,516–3,669 s
+of wall time while using only 57–146 s of CPU, so they were descheduled rather than computing; the stalled stage
+differed between them (rescoring in three, the marker stage in one). Rerun alone from the same build, on the same
+reads and settings, they took 21.5–59.4 s with CPU equal to wall time and produced identical calls:
+
+| Run | Cohort wall | Serial wall (CPU) | Calls identical |
+|---|---|---|---|
+| NA18939 30× | 3,669 s | 59.4 s (58.8) | yes |
+| NA19129 15× | 3,584 s | 27.8 s (27.6) | yes |
+| NA19239 10× | 3,459 s | 21.5 s (21.3) | yes |
+| NA19238 15× | 2,516 s | 30.5 s (30.3) | yes |
+
+The cohort ran four donors at a time on 4 performance and 6 efficiency cores, while this session also built and
+tested in the same tree; the medians above are the honest per-run cost, and the maxima are machine sharing.
+
+**Plots.** `scripts/plot_genotype_coverage.py` wrote `plots/coverage_blocks_held_out.png` (per-block violins of
+true edit distance, one row per arm, with no-call and exact rates per coverage) and
+`plots/coverage_summary_held_out.tsv`, whose numbers reproduce the driver's independent awk summary exactly. At
+every coverage the violins sit on zero except HG00732's `ctx:2` at 2× and 5×, which is the honest picture: at C4,
+leave-zero-out accuracy is already saturated at 2×.
+
+### R8.5 What this experiment establishes, and what it does not
+
+**Established, for C4 leave-zero-out on nested coverages of one simulation per donor.**
+
+- Accuracy is saturated well below 30×. Every held-out donor is called at every coverage, and every block
+  genotype is exact from 10× upward; at 2× and 5× a single context block in one donor is off by one base.
+- The mosaic arm changes no call at any coverage. Over 3,696 paired held-out block rows and 336 paired runs,
+  the panel arm (K = 0) and the mosaic arm (K = 8) never differ in truth distance or phase support.
+- The protected panel baseline carries the result: every truth was scored as a panel diplotype at every
+  coverage, and no depth fit failed down to about 2,000 fragments.
+- What the mosaic arm does change is conditional: genotype support on 127 block rows, and conditional GQ by
+  orders of magnitude. The panel arm's certainty grows with coverage; the mosaic arm's barely moves, because
+  its own recombinant rivals stay close.
+- Conditional GQ pointed at the only error: it ranked that block last of 616 at both coverages and in both
+  arms.
+- Cost scales with fragments, from about 18 s per donor at 2× to 75 s at 30×, both arms and the audit in one
+  run, under 650 MB.
+
+**Not established.**
+
+- That mosaic candidates improve accuracy anywhere. This experiment was designed to give them a chance to, and
+  at C4 they did not.
+- That conditional GQ is calibrated. It separated four wrong rows from 3,692 correct ones at one locus; that is
+  a signal for a future threshold, not a calibration, and no LOWCONF threshold is applied.
+- That phase is read-supported. Two to five donors of 56 hold an audited claim at each coverage, identical in
+  both arms; the prior decides the rest, as at 30×.
+- Anything about other loci, about leave-one-out, or about recombinant recall. The deferred work — the
+  distinct-prefix diversity beam and the marker model — remains untouched and is still required before any
+  LOO or mosaic-recall claim.
+- Publication-quality independence: these donors have now influenced development across rounds 5 to 8.
+
+**Preserved unchanged.** The round-5 frozen diagnostic, the round-6 targeted rerun, the development ladder, the
+round-7 corrected cohort and the 30× milestone settings. This experiment wrote only its own directories, from
+clean worktrees at `2c32c89` (development) and `abb35a0` (held out), with all 19 tests passing in each.
+
 ## R7. Review round 7 — conditional mosaic calls, K = 0, and the corrected LZO cohort
 
 The reviewer accepted round 6. The protected panel baseline repairs the LZO failure structurally: every panel
