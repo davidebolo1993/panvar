@@ -192,14 +192,19 @@ struct FragmentScoringOptions {
     //     consume a full cap -- which is what a circuit breaker is for, and what a per-worker guard
     //     silently gave up. physical_origins is an exact shared counter; piece_hits is published in
     //     batches of piece_hit_publish_batch because it is the hottest counter in the program (320M
-    //     increments on C4 at audit 256), so an exact atomic there would cost more than the threading
-    //     saves. The overshoot that batching admits is bounded and declared: at most
+    //     increments on C4 at audit 256), and batching was chosen to avoid unmeasured contention on a
+    //     shared cache line. Whether an exact atomic would in fact be affordable here has NOT been
+    //     measured. The overshoot that batching admits is bounded and declared: at most
     //     threads * piece_hit_publish_batch beyond the cap, which is 8,192 against a 2,000,000,000
     //     default.
     //
-    //   * The VERDICT is taken once, after the counters are merged, on the exact totals. That is what
-    //     keeps a given input's accept-or-refuse decision identical at any thread count: a total equal
-    //     to the cap accepts, one above refuses, however the work was partitioned.
+    //   * ACCEPTANCE is decided once, after the counters are merged, on the exact totals. A REFUSAL may
+    //     also be raised earlier, by whichever worker observes the shared budget cross the cap -- so it
+    //     is not true that every verdict waits for the merge. Both are sound, and the accept-or-refuse
+    //     answer still does not depend on the thread count: a published total never exceeds the exact
+    //     total, so a run whose exact total is within the cap cannot trip an early refusal, and a run
+    //     that trips one would have exceeded the cap on the merged totals as well. A total equal to the
+    //     cap accepts, one above refuses, however the work was partitioned.
     //
     // max_state_classes is deliberately only a post-merge acceptance cap. It is counted after a
     // fragment's states already exist, so bounding it in flight would limit neither memory nor work.

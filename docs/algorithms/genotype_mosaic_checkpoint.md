@@ -65,11 +65,16 @@ The caps are now **process-wide budgets**, and the two mechanisms are separated 
   performed**. Crossing one cancels every worker promptly. `physical_origins` is an exact shared atomic;
   `piece_hits` is published in batches of `piece_hit_publish_batch`, because it is the hottest counter in the
   program -- **319,588,181** increments on c4 at audit 256 against **9,438,337** physical origins, a factor of 34
-  -- so an exact atomic there would plausibly cost more than the threading saves. The overshoot batching admits is
-  bounded and declared: at most `threads * piece_hit_publish_batch`, which is 8,192 against a 2,000,000,000 cap.
-* The **verdict** is taken once, after the counters are merged, on the exact totals. That is what keeps
-  accept-or-refuse identical at any thread count: a total equal to the cap accepts, one above refuses, however the
-  work was partitioned.
+  -- and batching was chosen to avoid unmeasured contention on a shared cache line. Whether an exact atomic would
+  in fact be affordable has **not** been measured. The overshoot batching admits is bounded and declared: at most
+  `threads * piece_hit_publish_batch`, which is 8,192 against a 2,000,000,000 cap.
+* **Acceptance** is decided once, after the counters are merged, on the exact totals. A **refusal** may also be
+  raised earlier, by whichever worker observes the shared budget cross a cap -- it is not true that every verdict
+  waits for the merge, and an earlier draft of this section said so wrongly. Both are sound, and accept-or-refuse
+  still does not depend on the thread count: a published total never exceeds the exact total, so a run whose exact
+  total is within the cap cannot trip an early refusal, and a run that trips one would have exceeded the cap on
+  the merged totals as well. A total equal to the cap accepts, one above refuses, however the work was
+  partitioned.
 
 `max_state_classes` remains a post-merge acceptance cap only, and the header says so: classes are counted after a
 fragment's states already exist, so bounding them in flight would limit neither memory nor work.
@@ -104,6 +109,32 @@ and 1.52x, RSS +5% and +7%.
 exact-first-then-benchmark; batching was adopted directly on the 34x volume argument above, which is reasoning,
 not measurement. `piece_hit_publish_batch = 1` makes publication exactly per-increment, so the comparison is cheap
 to run, but it is not plumbed to the probe.
+
+### R12.5 Corrections carried out after the round-12 review
+
+The round was accepted, with the exact-atomic comparison reclassified as an optional performance experiment rather
+than a correctness gate -- the bounded overshoot and the measured negligible overhead are sufficient justification
+for batching at 4,096. Three corrections were required, and all three are applied here.
+
+**The unmeasured claim is withdrawn.** The header and the scorer both asserted that an exact atomic on `piece_hits`
+"would cost more than the threading saves." Nothing measured that. Both now say batching was chosen to avoid
+unmeasured contention on a shared cache line, and state plainly that the affordability of an exact atomic has not
+been measured.
+
+**"The verdict is taken once, after the merge" was not true**, and in the one case that matters most it was
+exactly backwards: on a deep-cap refusal the worker that crosses the shared budget throws immediately, which *is*
+a verdict. The claim is replaced by the two statements that are true -- acceptance is decided on the exact merged
+totals, and an early refusal is sound as soon as observed global work exceeds the cap. The reason thread-count
+invariance survives is worth stating rather than assuming: a published total can only undercount the exact total,
+so a run whose exact total is within the cap can never trip an early refusal, and a run that trips one would have
+exceeded the cap on the merged totals as well.
+
+**Cancellation is now prompt in the loops that actually cost.** It was checked only during piece-hit publication
+and at each physical origin. Sorting, deduplication and full-read verification touch neither counter, so a worker
+cancelled by someone else's refusal still paid for a full sort and a full pass of read comparisons before
+noticing. `stop()` is now checked before the sort, after the deduplication, once per full-read verification, and
+at haplotype and fragment boundaries. This is hardening rather than a correctness fix: the refusal was always
+correct, and only the promptness of the abandonment was overstated.
 
 ## R11. Review round 11 — the panel arm runs, and what it actually costs
 

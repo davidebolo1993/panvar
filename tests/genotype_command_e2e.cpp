@@ -1231,10 +1231,15 @@ void test_panel_only_path() {
 
 // Resource caps must not depend on how the work was partitioned. Every cap here is a running total
 // compared as `total > cap`, so the boundary sits exactly at the total a run reaches: a cap equal to it
-// accepts, one below refuses. The two thread counts reach that verdict by genuinely different routes --
-// at one worker the guard inside the placement loop fires mid-run, while at two neither worker alone
-// crosses the cap, so the deferred check after the ordered counter merge is what refuses. Identical
-// verdicts are therefore evidence the merge is correct, not a formality.
+// accepts, one below refuses.
+//
+// The three caps reach that verdict by genuinely different routes, which is what makes their agreement
+// informative rather than a formality -- and the routes are distinguished by CAP, not by thread count.
+// max_piece_hits and max_physical_origins are shared budgets checked in flight, so at every thread count
+// the refusal is raised by whichever worker observes the global total cross; with a cap one below the
+// reached total that happens at the final drain. max_state_classes is never checked in flight, so its
+// refusal can only come from the deferred check after the ordered counter merge. Identical verdicts
+// across both routes, at every thread count, are evidence the shared budget and the merge agree.
 //
 // The totals are measured here rather than written in: they belong to this fixture's graph and reads,
 // and a hardcoded number would sit nowhere near the boundary if either ever changed.

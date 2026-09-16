@@ -356,10 +356,12 @@ std::vector<PieceIndex> build_piece_indexes(
 // every placement worker, so T workers cannot each consume a full cap before anyone refuses -- which is
 // what a per-worker guard silently allowed, and what makes a 64-thread request nearly breaker-free.
 //
-// The verdict is still taken later, on the exact merged totals; this exists to stop the work promptly,
-// not to decide the answer. `cancelled` is what makes "promptly" true: the worker that crosses a cap
-// raises it, and every other worker abandons its range at the next check rather than running to
-// completion.
+// Crossing a cap here DOES decide the answer: the worker that observes it refuses immediately, which is
+// sound because a shared total can only undercount the exact one. Acceptance is the half decided later,
+// on the exact merged totals. `cancelled` is what makes the refusal prompt: the worker that crosses a
+// cap raises it, and every other worker abandons its range at the next check -- in the piece-hit
+// publication, at each physical origin, and at the haplotype, fragment, sort and verification
+// boundaries -- rather than running to completion.
 struct PlacementBudget {
     std::atomic<std::uint64_t> piece_hits{0};
     std::atomic<std::uint64_t> physical_origins{0};
@@ -435,10 +437,12 @@ void collect_form_placements(
                 });
             for (auto it = range.first; it != range.second; ++it) {
                 // The hottest counter in the program -- 320M increments on C4 at audit 256 -- so it is
-                // accumulated locally and published to the shared budget in batches. An exact atomic
-                // here would cost more than the threading saves. The overshoot batching admits is
-                // bounded by threads * publish_batch and declared in the header; the exact verdict is
-                // taken later, from the merged totals.
+                // accumulated locally and published to the shared budget in batches, to avoid unmeasured
+                // contention on a shared cache line; whether an exact atomic would be affordable here
+                // has not been measured. The overshoot batching admits is bounded by
+                // threads * publish_batch and declared in the header. Refusing here is sound the moment
+                // the published global total exceeds the cap, because a published total can only
+                // undercount the exact one; acceptance is still decided later, on the merged totals.
                 ++counters.piece_hits;
                 if (++unpublished_piece_hits >= budget.publish_batch) {
                     const std::uint64_t total =
@@ -468,16 +472,25 @@ void collect_form_placements(
     }
 
     // Drain whatever this haplotype counted below the last batch boundary, so the shared total is the
-    // true total rather than a multiple of publish_batch, and the merged verdict stays exact.
+    // true total rather than a multiple of publish_batch, and the merged totals stay exact.
     publish_piece_hits();
+
+    // Sorting and full-read verification are the rest of this haplotype's cost and neither touches the
+    // budget, so without these checks a worker cancelled by someone else's refusal would still pay for
+    // both before noticing. Prompt cancellation has to mean prompt in the expensive loops too.
+    if (budget.stop()) throw PlacementCancelled();
 
     // Several pieces of one read can rediscover one physical placement. Deduplicate before
     // verifying, so a placement found three ways is verified once and counted once.
     std::sort(proposed.begin(), proposed.end());
     proposed.erase(std::unique(proposed.begin(), proposed.end()), proposed.end());
     counters.unique_starts += proposed.size();
+    if (budget.stop()) throw PlacementCancelled();
 
     for (const auto& item : proposed) {
+        // One relaxed load against a full-read comparison: free at this granularity, and verification is
+        // where a cancelled worker would otherwise spend the longest.
+        if (budget.stop()) throw PlacementCancelled();
         ++counters.full_read_verifications;
         const std::optional<std::size_t> mismatches =
             count_mismatches(haplotype, forms[item.first].bases, item.second, band);
@@ -674,6 +687,10 @@ FragmentScoringResult score_diplotypes(
                                  FragmentScoringCounters& counters) {
     std::map<StateKey, std::uint64_t> states;
     for (std::size_t h = first_h; h < last_h; ++h) {
+        // Haplotype and fragment boundaries are the natural places to notice someone else's refusal:
+        // both are cheap relative to the work they precede, and a worker that has just finished one
+        // haplotype would otherwise start another that can never be used.
+        if (budget.stop()) throw PlacementCancelled();
         const std::string& haplotype = haplotypes.sequences[h];
         if (forms.empty()) continue;
 
@@ -681,6 +698,7 @@ FragmentScoringResult score_diplotypes(
         collect_form_placements(haplotype, forms, indexes, budget, band, placements, counters, options);
 
         for (std::size_t f = 0; f < fragments.size(); ++f) {
+            if (budget.stop()) throw PlacementCancelled();
             const std::size_t first_length = fragments[f].first.bases.size();
             const std::size_t second_length = fragments[f].second.bases.size();
             const InsertSupport& support = support_by_fragment[f];
@@ -728,7 +746,8 @@ FragmentScoringResult score_diplotypes(
                         // Thirty times cooler than piece_hits (9.4M against 320M on C4), so this one
                         // carries an exact shared counter: the work bound is tight, with no batching
                         // overshoot at all. Crossing it cancels every worker rather than letting each
-                        // consume a full cap. The verdict still comes from the merged totals later.
+                        // consume a full cap. Refusing here is exact and immediate; acceptance is still
+                        // decided later, on the merged totals.
                         ++counters.physical_origins;
                         const std::uint64_t origins =
                             budget.physical_origins.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -878,9 +897,12 @@ FragmentScoringResult score_diplotypes(
         }
     }
 
-    // The running-total caps, decided once on the merged totals. Checking them here rather than
-    // mid-loop is what keeps a given input's completion-or-refusal decision the same at any thread
-    // count: the crossing point moves with the partition, the total does not.
+    // The ACCEPTANCE decision, taken once on the merged totals. A refusal may already have been raised
+    // in flight, by a worker that watched the shared budget cross a cap -- so this is not the only place
+    // a verdict is reached, and claiming otherwise would be wrong. That early refusal is sound because a
+    // shared total can only undercount the exact one. What this block settles is the other half: a run
+    // no worker stopped is accepted or refused on exact totals, so the answer is the same at any thread
+    // count -- the crossing point moves with the partition, the total does not.
     if (counters.piece_hits > options.max_piece_hits) {
         note_observed_work();
         throw ResourceExhausted(
