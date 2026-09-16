@@ -275,6 +275,10 @@ if(PANVAR_BUILD_TESTING)
                  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_source_tree_clean.sh)
         set_tests_properties(panvar_genotype_source_tree_clean PROPERTIES DEPENDS
             "panvar_genotype_mosaic_core;panvar_genotype_locus_adapter;panvar_genotype_command_e2e;panvar_genotype_fragment_oracle;panvar_genotype_fragment_scorer;panvar_genotype_mosaic_proposal")
+        # Nested lower-coverage read sets: every fragment kept at a coverage is kept at every higher one.
+        add_test(NAME panvar_genotype_subsample_nested
+                 COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_subsample_nested.sh
+                         ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_BINARY_DIR}/genotype_subsample)
         # The frozen-setting selection rule: stable calls, K reached and the declared phase audit reachable.
         add_test(NAME panvar_genotype_ladder_selection
                  COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_select_ladder_test.py

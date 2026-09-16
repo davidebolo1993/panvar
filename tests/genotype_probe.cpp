@@ -727,6 +727,104 @@ std::vector<panvar::ReadPair> read_pairs(const std::string& first, const std::st
     return out;
 }
 
+// ------------------------------------------------------------------------------------------------
+// subsample: nested lower-coverage read sets from one simulation
+// ------------------------------------------------------------------------------------------------
+
+// Keeps a paired fragment when the unit value of a hash of its name falls below coverage/source_coverage.
+// The decision depends only on the name, so the retained sets are nested: every fragment kept at a coverage is
+// kept at every higher one. Resimulating each coverage independently would not nest, and would confound
+// coverage with a fresh draw.
+std::uint64_t fragment_hash(const std::string& name) {
+    std::uint64_t hash = 1469598103934665603ULL;   // FNV-1a
+    for (const unsigned char byte : name) {
+        hash ^= byte;
+        hash *= 1099511628211ULL;
+    }
+    // FNV-1a alone leaves the high bits poorly mixed for short sequential names, and the selector reads exactly
+    // those: at 20x of 30x it kept 85% of probe_1..probe_4000 instead of 67%. Finalise with the murmur3
+    // avalanche so every output bit depends on every input bit.
+    hash ^= hash >> 33;
+    hash *= 0xff51afd7ed558ccdULL;
+    hash ^= hash >> 33;
+    hash *= 0xc4ceb9fe1a85ec53ULL;
+    hash ^= hash >> 33;
+    return hash;
+}
+
+int subsample(const Args& args) {
+    const std::string out_dir = args.required("out");
+    const double source_coverage = std::stod(args.required("source-coverage"));
+    const double coverage = std::stod(args.required("coverage"));
+    if (!(source_coverage > 0.0) || !(coverage > 0.0) || coverage > source_coverage) {
+        throw std::runtime_error("coverage must be positive and at most the source coverage");
+    }
+    const double fraction = coverage / source_coverage;
+    const std::vector<panvar::ReadPair> fragments =
+        read_pairs(args.required("reads1"), args.required("reads2"));
+
+    std::ofstream r1(out_dir + "/reads_1.fq");
+    std::ofstream r2(out_dir + "/reads_2.fq");
+    std::size_t kept = 0;
+    for (const panvar::ReadPair& fragment : fragments) {
+        // Both mates carry the same fragment name up to its /1 or /2 suffix.
+        std::string name = fragment.first.name;
+        const std::size_t slash = name.rfind('/');
+        if (slash != std::string::npos) name.resize(slash);
+        // The top 53 bits as a unit value: exact in double, and monotone in the hash.
+        const double unit = static_cast<double>(fragment_hash(name) >> 11) * (1.0 / 9007199254740992.0);
+        if (unit >= fraction) continue;
+        ++kept;
+        r1 << '@' << fragment.first.name << '\n' << fragment.first.bases << "\n+\n" << fragment.first.qualities << '\n';
+        r2 << '@' << fragment.second.name << '\n' << fragment.second.bases << "\n+\n" << fragment.second.qualities << '\n';
+    }
+
+    // The declared library follows the coverage: the fragment-start intensity is proportional to it.
+    std::map<std::string, std::string> library;
+    std::vector<std::string> order;
+    {
+        std::ifstream input(args.required("library"));
+        if (!input) throw std::runtime_error("cannot read " + args.required("library"));
+        std::string line;
+        while (std::getline(input, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            std::istringstream fields(line);
+            std::string key, value;
+            if (fields >> key >> value) {
+                if (!library.count(key)) order.push_back(key);
+                library[key] = value;
+            }
+        }
+    }
+    if (!library.count("fragment_start_intensity")) {
+        throw std::runtime_error("the source library must declare fragment_start_intensity");
+    }
+    const double source_lambda = std::stod(library.at("fragment_start_intensity"));
+    {
+        std::ofstream lib(out_dir + "/library.txt");
+        lib << "# declared parameters, genotype_probe subsample to " << coverage << "x of " << source_coverage
+            << "x\n"
+            << std::setprecision(12);
+        for (const std::string& key : order) {
+            if (key == "fragment_start_intensity") continue;
+            lib << key << ' ' << library.at(key) << '\n';
+        }
+        lib << "fragment_start_intensity " << source_lambda * fraction << '\n';
+    }
+    {
+        std::ofstream manifest(out_dir + "/subsample.tsv");
+        manifest << std::setprecision(12) << "key\tvalue\nsource_coverage\t" << source_coverage << "\ncoverage\t"
+                 << coverage << "\nrequested_fraction\t" << fraction << "\nsource_fragments\t" << fragments.size()
+                 << "\nkept_fragments\t" << kept << "\nobserved_fraction\t"
+                 << (fragments.empty() ? 0.0 : static_cast<double>(kept) / static_cast<double>(fragments.size()))
+                 << "\nfragment_start_intensity\t" << source_lambda * fraction
+                 << "\nselector\tFNV-1a of the fragment name, nested across coverages\n";
+    }
+    std::cout << "subsampled " << kept << " of " << fragments.size() << " fragments to " << coverage << "x\n";
+    return 0;
+}
+
+
 panvar::LibraryModel read_library_file(const std::string& file) {
     std::ifstream input(file);
     if (!input) throw std::runtime_error("cannot read " + file);
@@ -1424,7 +1522,7 @@ int genotype(const Args& args) {
 int main(int argc, char** argv) {
     try {
         if (argc < 2) {
-            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors --key value ...\n";
+            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors|subsample --key value ...\n";
             return 2;
         }
         const std::string command = argv[1];
@@ -1436,6 +1534,7 @@ int main(int argc, char** argv) {
         if (command == "genotype") return genotype(args);
         if (command == "trace") return trace(args);
         if (command == "anchors") return anchors(args);
+        if (command == "subsample") return subsample(args);
         std::cerr << "unknown probe command: " << command << '\n';
         return 2;
     } catch (const std::exception& error) {
