@@ -37,6 +37,14 @@ struct MosaicBeamParameters {
     std::optional<std::pair<std::size_t, std::size_t>> trace_templates = std::nullopt;
 };
 
+// The beam's pre-allocation budget: templates^2 for the first block, plus state_limit * templates^2 for
+// every block after it, in integers with every multiplication overflow-checked. Production compares
+// MosaicBeamParameters::max_extension_evaluations against this, so anything that PREDICTS the same work
+// must call it rather than restate the formula -- a second version in floating point is not the same
+// function near the cap, which is the only place the answer decides anything. Throws std::length_error
+// when the bound itself overflows uint64.
+std::uint64_t extension_upper_bound(std::size_t templates, std::size_t blocks, std::size_t state_limit);
+
 // One layer of a trace: what was offered to pruning, what survived, and where the target stood.
 struct MosaicBeamTraceLayer {
     std::size_t block = 0;

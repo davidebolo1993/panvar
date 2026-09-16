@@ -331,8 +331,14 @@ void validate_beam_inputs(
     }
 }
 
+} // namespace
+
+// The one planner. Production checks the beam's pre-allocation budget against this; anything that
+// predicts the same work -- the preflight -- must call it rather than restate it. A second formula in
+// floating point is not the same function near the cap, which is exactly where the answer matters.
 std::uint64_t extension_upper_bound(std::size_t templates, std::size_t blocks, std::size_t limit) {
     const std::uint64_t pairs = static_cast<std::uint64_t>(templates) * templates;
+    if (pairs == 0) return 0;
     if (blocks <= 1) return pairs;
     if (limit > std::numeric_limits<std::uint64_t>::max() / pairs) {
         throw std::length_error("mosaic beam per-block extension bound overflows uint64");
@@ -343,8 +349,6 @@ std::uint64_t extension_upper_bound(std::size_t templates, std::size_t blocks, s
     }
     return pairs + static_cast<std::uint64_t>(blocks - 1) * per_block;
 }
-
-} // namespace
 
 std::vector<MosaicCandidate> panel_diplotypes(const PanelAlleleMatrix& panel) {
     validate_panel(panel);

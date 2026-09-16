@@ -1495,6 +1495,7 @@ int preflight(const Args& args) {
     const double depth = std::stod(args.get("depth", "30"));
     const std::size_t read_length = std::stoul(args.get("read-length", "100"));
     const std::size_t mosaics = std::stoul(args.get("max-mosaic-candidates", "8"));
+    const std::size_t audit = std::stoul(args.get("phase-audit-candidates", "0"));
     const std::size_t state_limit = std::stoul(args.get("state-limit", "1024"));
     const std::size_t min_variant_bp = std::stoul(args.get("min-variant-bp", "50"));
     const std::uint64_t max_mass_cells = std::stoull(args.get("max-mass-cells", "200000000"));
@@ -1536,7 +1537,10 @@ int preflight(const Args& args) {
                 << built.report.variant_blocks << "\ncontext_blocks\t" << built.report.context_blocks
                 << "\ncanonical_alleles\t" << built.report.total_canonical_alleles
                 << "\nrepresentation_dependent_blocks\t" << built.report.representation_dependent_blocks.size()
-                << '\n';
+                // A locus whose model cannot be built runs in no arm. Saying so explicitly beats omitting
+                // the field, which a reader can only interpret as "not measured".
+                << "\nruns_as_is\tfalse\nmodel_runnable\tfalse\npanel_arm_runnable\tfalse"
+                   "\nmosaic_arm_runnable\tfalse\nphase_audit_runnable\tfalse\n";
         for (std::size_t i = 0; i < built.report.refused_templates.size() && i < 10; ++i) {
             refused << "refused_template_" << i << '\t' << built.report.refused_templates[i] << '\n';
         }
@@ -1596,23 +1600,69 @@ int preflight(const Args& args) {
 
     // One fragment covers two mates of read_length on one chromosome copy, and both copies are sequenced.
     const double fragments = mean_bp * depth / (2.0 * static_cast<double>(read_length));
+    // Production scores the LARGER of the primary mosaic set and the phase audit, so whenever the audit
+    // exceeds K it is the audit that sizes the scoring pass. Estimating from K alone understated the
+    // haplotypes, the mass matrix and the runtime of every run that carries an audit.
+    const std::size_t scored_mosaics = std::max(mosaics, audit);
+    // The audit enlarges the CANDIDATE set, not the haplotype pool: candidates are diplotypes drawn
+    // from haplotypes the panel and the beam already supply, so unique haplotypes do not scale with it.
+    // Measured on c4 at 30x, the scored haplotypes are identical at audit 0 and audit 256 (130 in the
+    // panel arm, 140 at K = 8), while the run takes 1.6x as long -- so the audit's cost is its own pass
+    // and is priced below, not folded into the mass matrix.
     const double unique_haplotypes = static_cast<double>(distinct.size() + 2 * mosaics);
     const double mass_cells = unique_haplotypes * fragments;
+    // The primary set only: the audit's candidates are priced by their own term below, and counting
+    // them here as well double-counts them. Measured, the two costs are separable and additive.
     const double pair_evaluations = static_cast<double>(panel_pairs + mosaics) * fragments;
-    const double templates = static_cast<double>(panel.template_count());
-    const double beam_extensions =
-        templates * templates * (1.0 + static_cast<double>(model.blocks().size() - 1) * static_cast<double>(state_limit));
-    // C4's measured slope, and the two ways of attributing it.
+
+    // The same integer, overflow-checked planner production uses, not a second formula in floating point.
+    std::uint64_t beam_extensions = 0;
+    std::string beam_overflow = "no";
+    try {
+        beam_extensions =
+            panvar::extension_upper_bound(panel.template_count(), model.blocks().size(), state_limit);
+    } catch (const std::exception& error) {
+        beam_overflow = error.what();
+        beam_extensions = std::numeric_limits<std::uint64_t>::max();
+    }
+    // C4's measured slope, and the two ways of attributing it. Re-fitted from runs that hold everything
+    // but one variable fixed. The previous constants came from the round 8 cohort, where EVERY run
+    // carried the 256-candidate phase audit, so the audit's cost sat inside the base slope; adding an
+    // audit term on top of that fit double-counted it and predicted 93-99 s for a 46.5 s run.
+    // Base, phase audit off, one donor at three coverages: 7.571 s at 2,073 fragments, 13.790 s at
+    // 10,540 and 29.065 s at 31,358 -- linear to within 5 ms.
     const double c4_fragments = 31358.0;
-    const double c4_slope_seconds = 0.00179283 * c4_fragments;   // per-run cost above the fixed term
+    const double c4_slope_seconds = 0.00073387 * c4_fragments;   // per-run cost above the fixed term
     const double by_pairs = c4_slope_seconds * (pair_evaluations / (8523.0 * c4_fragments));
     const double by_mass = c4_slope_seconds * (mass_cells * mean_bp) / (130.0 * c4_fragments * 226000.0);
-    const double fixed_seconds = 4.32 + 6.0;   // rescoring intercept plus model, markers, proposal and spelling
+    const double fixed_seconds = 6.05;   // model, markers, proposal, spelling and the rescoring intercept
+    // The phase audit is its own pass. It enlarges the CANDIDATE set without enlarging the haplotype
+    // pool -- unique haplotypes are 139-140 at every audit size measured -- so neither term above sees
+    // it, and pricing a run from K alone understated every audited run by more than half.
+    // Two sweeps, each holding the other variable fixed: at 31,358 fragments the cost is affine in the
+    // audit size (29.065 s at 0, then 35.539, 40.253 and 46.475 at 64, 128, 256), and at audit 256 the
+    // cost above that fixed part is proportional to fragments (4.310 s at 2,073, 8.366 at 10,540,
+    // 17.410 at 31,358). Both are reproduced within 0.21 s by a fixed setup plus a term in A x
+    // fragments, which is the form below.
+    const double audit_seconds =
+        audit == 0 ? 0.0
+                   : 3.36 + 0.0558 * static_cast<double>(audit) * (fragments / c4_fragments);
 
-    const bool within_caps = mass_cells <= static_cast<double>(max_mass_cells) &&
-                             pair_evaluations <= static_cast<double>(max_panel_pair_evaluations) &&
-                             beam_extensions <= static_cast<double>(max_beam_extensions);
-    const bool runs_as_is = round_trip == "ok" && representation == "ok" && within_caps;
+    // Each arm is priced on its own candidate set, and reported separately: a beam refusal says nothing
+    // about whether the panel arm can run, and the panel arm does not use the beam at all.
+    const auto arm_fits = [&](std::size_t candidates) {
+        const double cells = static_cast<double>(distinct.size() + 2 * candidates) * fragments;
+        const double pairs = static_cast<double>(panel_pairs + candidates) * fragments;
+        return cells <= static_cast<double>(max_mass_cells) &&
+               pairs <= static_cast<double>(max_panel_pair_evaluations);
+    };
+    const bool beam_fits = beam_overflow == "no" && beam_extensions <= max_beam_extensions;
+    const bool model_runnable = round_trip == "ok" && representation == "ok";
+    const bool panel_arm_runnable = model_runnable && arm_fits(0);
+    const bool mosaic_arm_runnable = model_runnable && beam_fits && arm_fits(mosaics);
+    const bool phase_audit_runnable = model_runnable && beam_fits && arm_fits(audit);
+    const bool within_caps = beam_fits && arm_fits(scored_mosaics);
+    const bool runs_as_is = model_runnable && within_caps;
 
     std::ostringstream out;
     out << std::setprecision(10) << "key\tvalue\n"
@@ -1624,6 +1674,11 @@ int preflight(const Args& args) {
         << "\npanel_round_trip\t" << round_trip << "\nrepresentation_independent\t" << representation
         << "\nruns_as_is\t" << (runs_as_is ? "true" : "false")
         << "\npredicted_work_within_caps\t" << (within_caps ? "true" : "false")
+        << "\nmodel_runnable\t" << (model_runnable ? "true" : "false")
+        << "\npanel_arm_runnable\t" << (panel_arm_runnable ? "true" : "false")
+        << "\nmosaic_arm_runnable\t" << (mosaic_arm_runnable ? "true" : "false")
+        << "\nphase_audit_runnable\t" << (phase_audit_runnable ? "true" : "false")
+        << "\nbeam_extension_overflow\t" << beam_overflow
         << "\nblocks\t" << model.blocks().size() << "\nvariant_blocks\t" << report.variant_blocks
         << "\ncontext_blocks\t" << report.context_blocks
         << "\nsource_alleles\t" << report.total_source_alleles
@@ -1636,7 +1691,8 @@ int preflight(const Args& args) {
         << "\nmarkers_dropped_multiblock\t" << markers.dropped_multiblock_markers
         << "\nalleles_scored_of_total\t" << markers.scored_alleles << "/" << markers.total_alleles
         << "\nassumed_depth\t" << depth << "\nassumed_read_length\t" << read_length
-        << "\nmax_mosaic_candidates\t" << mosaics << "\nstate_limit\t" << state_limit
+        << "\nmax_mosaic_candidates\t" << mosaics << "\nphase_audit_candidates\t" << audit
+        << "\nscored_mosaic_candidates\t" << scored_mosaics << "\nstate_limit\t" << state_limit
         << "\npredicted_fragments\t" << fragments
         << "\npredicted_unique_haplotypes\t" << unique_haplotypes
         << "\npredicted_mass_cells\t" << mass_cells << "\nmass_cells_cap\t" << max_mass_cells
@@ -1647,10 +1703,16 @@ int preflight(const Args& args) {
         << "\nbeam_extension_upper_bound\t" << beam_extensions << "\nbeam_extensions_cap\t" << max_beam_extensions
         << "\nbeam_extensions_fraction_of_cap\t" << beam_extensions / static_cast<double>(max_beam_extensions)
         << "\npredicted_mass_matrix_MB\t" << mass_cells * 8.0 / 1048576.0
-        << "\nestimated_seconds_low\t" << fixed_seconds + std::min(by_pairs, by_mass)
-        << "\nestimated_seconds_high\t" << fixed_seconds + std::max(by_pairs, by_mass)
-        << "\nestimate_basis\tC4 coverage experiment: 4.32 s + 1.793 ms per fragment at 8,523 candidates, ~130 "
-           "haplotypes, 226 kb; low end scales with candidate pairs, high end with haplotypes x length\n";
+        << "\nestimated_audit_seconds\t" << audit_seconds
+        << "\nestimated_seconds_low\t" << fixed_seconds + audit_seconds + std::min(by_pairs, by_mass)
+        << "\nestimated_seconds_high\t" << fixed_seconds + audit_seconds + std::max(by_pairs, by_mass)
+        << "\nestimate_basis\tc4, one donor, cached reads, one variable at a time. Base with the phase audit "
+           "off: 6.05 s + 0.734 ms per fragment at 8,523 candidates, ~130 haplotypes, 226 kb (7.571 / 13.790 / "
+           "29.065 s at 2,073 / 10,540 / 31,358 fragments, linear to 5 ms); the low end scales that with "
+           "candidate pairs, the high end with haplotypes x length. The phase audit is a separate, additive "
+           "term -- 3.36 s plus 55.8 ms per candidate per c4-30x-fragment -- measured over audit 0/64/128/256 "
+           "at one coverage and audit 256 at three, reproduced within 0.21 s. Extrapolation across LOCI is "
+           "untested: every constant here comes from one locus.\n";
     std::cout << out.str();
     if (!args.get("out", "").empty()) {
         std::ofstream file(args.get("out", ""));
