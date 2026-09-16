@@ -252,6 +252,11 @@ struct FragmentScoringResult {
     // What was actually used, which is not what was asked for when there are fewer candidates than
     // workers. Reported so a run can never claim parallelism it did not use.
     std::size_t threads_used_combination = 1;
+    // Workers that actually ran the placement and mass phase. One when a single worker was asked for,
+    // when there are fewer haplotypes than workers, and when full-origin recording is requested --
+    // that diagnostic writes a shared map from the innermost loop and deliberately stays serial rather
+    // than being made deterministic for a path nothing statistical depends on.
+    std::size_t threads_used_placement = 1;
     // candidates x fragments: the work the combination phase performs, independent of thread count.
     std::uint64_t candidate_fragment_evaluations = 0;
     // Filled only when requested in FragmentScoringOptions; same row-major layout as log_mass.

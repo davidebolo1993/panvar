@@ -193,6 +193,9 @@ struct CandidateSetReport {
     // Threading telemetry for the diploid combination phase: what was actually used, which is not what
     // was asked for when there are fewer candidates than workers, and the work done regardless.
     std::size_t threads_used_combination = 1;
+    // Reported separately from combination: the two phases parallelise independently, and placement
+    // falls back to one worker for full-origin recording even when more were asked for.
+    std::size_t threads_used_placement = 1;
     std::uint64_t candidate_fragment_evaluations = 0;
     // True when no beam ran at all: K = 0, no phase audit and no positive development prefix, so the
     // candidate set is exactly the panel and nothing about it is conditional on a search. Reported as
@@ -265,7 +268,8 @@ void write_status(
     // that ran serially. Placement is still serial and says so.
     out << "threads_used_combination\t"
         << (candidate_set != nullptr ? candidate_set->threads_used_combination : 1) << '\n';
-    out << "threads_used_placement\t1\n";
+    out << "threads_used_placement\t"
+        << (candidate_set != nullptr ? candidate_set->threads_used_placement : 1) << '\n';
     out << "max_beam_extensions\t" << options.max_beam_extensions << '\n';
     out << "max_piece_hits\t" << options.max_piece_hits << '\n';
     out << "max_proposed_starts_per_haplotype\t" << options.max_proposed_starts_per_haplotype << '\n';
@@ -794,6 +798,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             timings.rescoring_placement_and_mass = scored.seconds_placement_and_mass;
             timings.rescoring_diploid_combination = scored.seconds_diploid_combination;
             candidate_report.threads_used_combination = scored.threads_used_combination;
+            candidate_report.threads_used_placement = scored.threads_used_placement;
             candidate_report.candidate_fragment_evaluations = scored.candidate_fragment_evaluations;
         } catch (const ResourceExhausted& error) {
             rescore_failure = error.what();

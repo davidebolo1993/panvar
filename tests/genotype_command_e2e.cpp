@@ -271,8 +271,16 @@ void test_end_to_end() {
             const auto threaded_status = read_status(path(name) + ".mosaic_status.tsv");
             require(threaded_status.at("threads_requested") == std::to_string(workers),
                     name + " must record what was asked for");
-            require(threaded_status.at("threads_used_placement") == "1",
-                    "placement is still serial and must say so rather than borrow the requested count");
+            // Placement parallelises over haplotypes, so it may legitimately use fewer workers than
+            // asked for -- but never more, and never one when it could use two. Full-origin recording
+            // is the one case that forces serial, and this fixture does not request it.
+            const std::size_t used_placement = std::stoul(threaded_status.at("threads_used_placement"));
+            require(used_placement >= 1 && used_placement <= workers,
+                    name + " must never claim more placement workers than were requested");
+            if (workers == 2) {
+                require(used_placement == 2,
+                        "placement must actually engage both workers when two are requested");
+            }
         }
 
         // Fewer candidates than workers: the partition must degrade to what exists, not spawn empty
@@ -1214,6 +1222,76 @@ void test_panel_only_path() {
             "panel-only must select exactly the haplotypes the former K=0 path selected");
 }
 
+// Resource caps must not depend on how the work was partitioned. Every cap here is a running total
+// compared as `total > cap`, so the boundary sits exactly at the total a run reaches: a cap equal to it
+// accepts, one below refuses. The two thread counts reach that verdict by genuinely different routes --
+// at one worker the guard inside the placement loop fires mid-run, while at two neither worker alone
+// crosses the cap, so the deferred check after the ordered counter merge is what refuses. Identical
+// verdicts are therefore evidence the merge is correct, not a formality.
+//
+// The totals are measured here rather than written in: they belong to this fixture's graph and reads,
+// and a hardcoded number would sit nowhere near the boundary if either ever changed.
+void test_resource_caps_are_thread_invariant() {
+    const std::string r1 = path("phaseable_r1.fq");
+    const std::string r2 = path("phaseable_r2.fq");
+
+    panvar::GenotypeCommandOptions calibrate =
+        tiny_options("caps_calibrate", r1, r2, "tiny_phaseable.gfa");
+    require(panvar::run_genotype(calibrate) == panvar::GenotypeRunStatus::Complete,
+            "fixture: the calibration run must complete under the default caps");
+    const auto base = read_status(path("caps_calibrate.mosaic_status.tsv"));
+    const std::uint64_t totals[3] = {std::stoull(base.at("piece_hits")),
+                                     std::stoull(base.at("physical_origins")),
+                                     std::stoull(base.at("statistical_state_classes"))};
+    const char* cap_names[3] = {"max_piece_hits", "max_physical_origins", "max_state_classes"};
+    for (const std::uint64_t total : totals) {
+        require(total > 1, "fixture: every calibrated counter must be non-trivial");
+    }
+    const auto apply_cap = [](panvar::GenotypeCommandOptions& options, int which, std::uint64_t value) {
+        if (which == 0) options.max_piece_hits = value;
+        else if (which == 1) options.max_physical_origins = value;
+        else options.max_state_classes = value;
+    };
+
+    for (int which = 0; which < 3; ++which) {
+        std::string accepted_counters[3];
+        for (const std::size_t workers : {std::size_t{1}, std::size_t{2}}) {
+            // Just above: a cap equal to the total accepts, and must still call.
+            const std::string at_name =
+                "caps_at_" + std::to_string(which) + "_t" + std::to_string(workers);
+            panvar::GenotypeCommandOptions at = tiny_options(at_name, r1, r2, "tiny_phaseable.gfa");
+            at.threads = workers;
+            apply_cap(at, which, totals[which]);
+            require(panvar::run_genotype(at) == panvar::GenotypeRunStatus::Complete,
+                    std::string(cap_names[which]) + " at exactly the reached total must accept at " +
+                        std::to_string(workers) + " thread(s)");
+            const auto at_status = read_status(path(at_name) + ".mosaic_status.tsv");
+            accepted_counters[workers] = at_status.at("piece_hits") + "/" +
+                                         at_status.at("physical_origins") + "/" +
+                                         at_status.at("statistical_state_classes");
+
+            // Just below: one less refuses, ends RESCORE_INCOMPLETE, and leaves no ranking or call.
+            const std::string below_name =
+                "caps_below_" + std::to_string(which) + "_t" + std::to_string(workers);
+            panvar::GenotypeCommandOptions below =
+                tiny_options(below_name, r1, r2, "tiny_phaseable.gfa");
+            below.threads = workers;
+            apply_cap(below, which, totals[which] - 1);
+            require(panvar::run_genotype(below) == panvar::GenotypeRunStatus::RescoreIncomplete,
+                    std::string(cap_names[which]) + " one below the reached total must refuse at " +
+                        std::to_string(workers) + " thread(s)");
+            require(read_status(path(below_name) + ".mosaic_status.tsv").at("note").find("resource cap") !=
+                        std::string::npos,
+                    "a refusal must name the exhausted cap");
+            require(no_ranking_or_call(below_name),
+                    "a refused run must leave no partial ranking or call, at any thread count");
+        }
+        require(accepted_counters[1] == accepted_counters[2],
+                std::string("accepted runs must report identical counters at 1 and 2 threads for ") +
+                    cap_names[which] + ": " + accepted_counters[1] + " vs " + accepted_counters[2]);
+    }
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "usage: genotype_command_e2e_test <scratch dir>\n";
@@ -1232,6 +1310,7 @@ int main(int argc, char** argv) {
         test_phase_audit();
         test_candidate_prefixes_match_standalone();
         test_panel_only_path();
+        test_resource_caps_are_thread_invariant();
         std::cout << "genotype command end-to-end: PASS\n";
         return 0;
     } catch (const std::exception& error) {

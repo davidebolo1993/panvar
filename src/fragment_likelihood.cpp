@@ -498,13 +498,24 @@ FragmentScoringResult score_diplotypes(
     const std::size_t band = options.mismatch_band;
     const DiscreteInsertDistribution library_insert = build_library_insert_distribution(library);
 
+    // Filled completely before any worker starts, and read-only thereafter. A lazily-filled shared
+    // cache would be a data race under placement parallelism, and giving each worker its own would
+    // recompute the same handful of values per thread; the set of lengths it can ever be asked for is
+    // exactly the distinct mate lengths of the fragments, which are known here.
     std::map<std::size_t, double> band_mass_by_length;
-    const auto band_mass = [&](std::size_t length) {
+    for (const ReadPair& fragment : fragments) {
+        for (const std::size_t length : {fragment.first.bases.size(), fragment.second.bases.size()}) {
+            if (band_mass_by_length.find(length) == band_mass_by_length.end()) {
+                band_mass_by_length.emplace(length, log_band_mass(length, band, library.substitution_error));
+            }
+        }
+    }
+    const auto band_mass = [&](std::size_t length) -> double {
         const auto found = band_mass_by_length.find(length);
         if (found != band_mass_by_length.end()) return found->second;
-        const double value = log_band_mass(length, band, library.substitution_error);
-        band_mass_by_length.emplace(length, value);
-        return value;
+        // Only reachable if a length appears that no fragment mate carries, which cannot happen for
+        // the calls below; computing it rather than asserting keeps the function total.
+        return log_band_mass(length, band, library.substitution_error);
     };
 
     // Phase 1 of three: per-fragment preparation. Timed so a caller can attribute rescoring rather
@@ -578,8 +589,21 @@ FragmentScoringResult score_diplotypes(
         }
     }
 
+    // Placement and mass construction, partitioned over haplotypes. Every write below is indexed by
+    // this worker's own h -- mass[f * unique + h], exposure[h], origin_summary[f * unique + h] -- so no
+    // two workers touch the same cell, and `forms`, `indexes`, the per-fragment supports and the
+    // sequences are read-only by the time we get here.
+    //
+    // Counters are per worker and merged in thread-index order, so the totals a run reports do not
+    // depend on the schedule. The two running-total caps inside this phase -- physical_origins and
+    // statistical_state_classes -- are therefore checked AFTER the merge rather than mid-loop: their
+    // crossing point moves with the partition, and the declared contract is that a given input either
+    // completes or refuses regardless of thread count. `max_proposed_starts_per_haplotype` is unaffected
+    // and still throws locally, because it tests a per-haplotype vector rather than a running total.
+    const auto place_range = [&](std::size_t first_h, std::size_t last_h,
+                                 FragmentScoringCounters& counters) {
     std::map<StateKey, std::uint64_t> states;
-    for (std::size_t h = 0; h < unique; ++h) {
+    for (std::size_t h = first_h; h < last_h; ++h) {
         const std::string& haplotype = haplotypes.sequences[h];
         if (forms.empty()) continue;
 
@@ -631,6 +655,10 @@ FragmentScoringResult score_diplotypes(
                             start.start, forward_length, it->start, reverse_length, support);
                         if (!insert.has_value()) continue;
                         ++counters.valid_fr_states;
+                        // Accumulated here, decided after the ordered merge. The local guard uses the
+                        // FULL global cap, never a per-worker share: it can therefore never refuse an
+                        // input the serial path would accept, and exists only so a pathological locus
+                        // cannot grow without bound before the merge gets a chance to refuse it.
                         if (++counters.physical_origins > options.max_physical_origins) {
                             throw ResourceExhausted(
                                 "fragment scoring reached its physical-origin cap; no partial "
@@ -671,12 +699,9 @@ FragmentScoringResult score_diplotypes(
                 }
             }
             if (states.empty()) continue;
+            // A pure running total with no memory role, so it is accumulated here and decided once,
+            // after the ordered merge, where the sum is the same at any thread count.
             counters.statistical_state_classes += states.size();
-            if (counters.statistical_state_classes > options.max_state_classes) {
-                throw ResourceExhausted(
-                    "fragment scoring reached its statistical-class cap; no partial ranking is "
-                    "returned");
-            }
 
             double total = kNegInf;
             for (const auto& item : states) {
@@ -697,6 +722,71 @@ FragmentScoringResult score_diplotypes(
             }
             mass[f * unique + h] = total;
         }
+    }
+    };
+
+    // Full-origin recording writes result.recorded_origins, a shared map, from the innermost loop.
+    // Rather than make that deterministic for a diagnostic no score depends on, it forces the serial
+    // path -- and says so in threads_used_placement instead of claiming workers it did not use.
+    const bool origins_force_serial = !options.record_origins_for_fragments.empty();
+    const std::size_t placement_threads =
+        (unique == 0 || origins_force_serial)
+            ? 1
+            : std::max<std::size_t>(1, std::min(options.threads, unique));
+    result.threads_used_placement = placement_threads;
+
+    if (placement_threads <= 1) {
+        place_range(0, unique, counters);
+    } else {
+        const std::size_t span = (unique + placement_threads - 1) / placement_threads;
+        std::vector<FragmentScoringCounters> local(placement_threads);
+        std::vector<std::exception_ptr> failures(placement_threads);
+        std::vector<std::thread> workers;
+        workers.reserve(placement_threads);
+        for (std::size_t t = 0; t < placement_threads; ++t) {
+            const std::size_t first_h = std::min(t * span, unique);
+            const std::size_t last_h = std::min(first_h + span, unique);
+            workers.emplace_back([&, t, first_h, last_h]() {
+                try {
+                    place_range(first_h, last_h, local[t]);
+                } catch (...) {
+                    failures[t] = std::current_exception();
+                }
+            });
+        }
+        for (std::thread& worker : workers) worker.join();
+        for (const std::exception_ptr& failure : failures) {
+            if (failure) std::rethrow_exception(failure);
+        }
+        // Summed in thread-index order, so the totals a run reports are the serial totals exactly.
+        for (const FragmentScoringCounters& part : local) {
+            counters.candidate_bases_scanned += part.candidate_bases_scanned;
+            counters.piece_hits += part.piece_hits;
+            counters.proposed_starts += part.proposed_starts;
+            counters.unique_starts += part.unique_starts;
+            counters.full_read_verifications += part.full_read_verifications;
+            counters.accepted_mate_placements += part.accepted_mate_placements;
+            counters.valid_fr_states += part.valid_fr_states;
+            counters.physical_origins += part.physical_origins;
+            counters.statistical_state_classes += part.statistical_state_classes;
+        }
+    }
+
+    // The running-total caps, decided once on the merged totals. Checking them here rather than
+    // mid-loop is what keeps a given input's completion-or-refusal decision the same at any thread
+    // count: the crossing point moves with the partition, the total does not.
+    if (counters.piece_hits > options.max_piece_hits) {
+        throw ResourceExhausted(
+            "fragment scoring reached its piece-hit cap; the locus is too repetitive for the declared "
+            "caps and no partial ranking is returned");
+    }
+    if (counters.physical_origins > options.max_physical_origins) {
+        throw ResourceExhausted(
+            "fragment scoring reached its physical-origin cap; no partial ranking is returned");
+    }
+    if (counters.statistical_state_classes > options.max_state_classes) {
+        throw ResourceExhausted(
+            "fragment scoring reached its statistical-class cap; no partial ranking is returned");
     }
 
     result.seconds_placement_and_mass =
