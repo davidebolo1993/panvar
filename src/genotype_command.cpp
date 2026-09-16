@@ -26,6 +26,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 
@@ -157,7 +158,9 @@ struct CandidateSetReport {
     std::size_t panel_diplotypes = 0;
     bool panel_baseline_complete = false;
     std::size_t beam_diplotypes_found = 0;   // every diplotype the beam found, panel pairs included
-    // Distinct haplotype sequences scored once for the whole candidate set: what a preflight predicts.
+    // Distinct haplotype sequences in the candidate set this status describes -- the panel's, plus at most two
+    // per mosaic -- which is what a preflight predicts. It is 0 when no set was ranked. The shared scoring pass
+    // may cover more (a prefix scores the union), so this counts the set, not the pass.
     std::size_t unique_haplotypes = 0;
 };
 
@@ -680,7 +683,6 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         }
     }
     const InternedHaplotypes interned = any_ranked ? intern_haplotypes(paths, sequences) : InternedHaplotypes{};
-    candidate_report.unique_haplotypes = interned.sequences.size();
     // Candidates are ranked as unordered pairs of SEQUENCES. Two candidates whose allele paths differ but
     // spell the same two haplotypes are one state to any read-based method.
     const auto sequence_pair = [&](const MosaicCandidate& candidate) {
@@ -900,6 +902,15 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         const std::vector<double>& path_prior = primary.path_prior;
         const CertifiedRanking& ranking = primary.ranking;
         RankingSummary& summary = primary.summary;
+        CandidateSetReport set_report = candidate_report;
+        {
+            std::set<std::size_t> haplotypes;
+            for (const SequenceCandidate& candidate : sequence_candidates) {
+                haplotypes.insert(candidate.first);
+                haplotypes.insert(candidate.second);
+            }
+            set_report.unique_haplotypes = haplotypes.size();
+        }
 
         // Phase support from the declared audit set. A small candidate set can omit the rival that makes phase a
         // fragment tie: in the round-5 held-out cohort nine of ten READS claims at K = 8 vanished at K = 256. The
@@ -1002,7 +1013,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                          library, timings, &built.report, &panel, &beam, &ranking,
                          "the best candidate cannot be separated from every rival by more than "
                          "floating-point error; the equivalence set is reported instead of a call",
-                         &summary, &depth, &candidate_report);
+                         &summary, &depth, &set_report);
             return GenotypeRunStatus::RescoreIncomplete;
         }
 
@@ -1076,7 +1087,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
 
         timings.total = seconds_since(started);
         write_status(status_path, GenotypeRunStatus::Complete, fingerprint, options, library, timings,
-                     &built.report, &panel, &beam, &ranking, "", &summary, &depth, &candidate_report);
+                     &built.report, &panel, &beam, &ranking, "", &summary, &depth, &set_report);
         if (!options.quiet) {
             std::cerr << "[genotype] COMPLETE  fingerprint=" << fingerprint
                       << "  candidates=" << candidates.size()
