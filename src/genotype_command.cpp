@@ -47,8 +47,23 @@ struct StageTimings {
     double proposal = 0.0;
     double spelling = 0.0;
     double rescoring = 0.0;
+    // Accumulated, not assigned: each ranked set -- primary, every development prefix and the phase
+    // audit -- passes through these stages, and a run's cost is their sum over all of them.
+    double candidates = 0.0;   // grouping candidates into sequence-identical classes
+    double prior = 0.0;        // exact path and sequence priors
+    double ranking = 0.0;      // certification, block posteriors and the audit comparison
     double total = 0.0;
 };
+
+// The candidate set's scope, derived ONCE and shared by the status and every per-block row. PANEL_ONLY
+// is not a kind of COMPLETE: both COMPLETE and CONDITIONAL describe what a search returned, and in a
+// panel-only run no search happened. These disagreed until now -- the status said PANEL_ONLY while every
+// block row said CONDITIONAL, taken from the empty beam -- which is harmless to the call and corrupting
+// to anything that summarises the rows.
+const char* candidate_scope_name(bool panel_only, bool candidate_set_conditional) {
+    if (panel_only) return "PANEL_ONLY";
+    return candidate_set_conditional ? "CONDITIONAL" : "COMPLETE";
+}
 
 std::vector<SequencingRead> read_fastq(const std::string& path) {
     GzLineReader reader(path);
@@ -162,6 +177,13 @@ struct CandidateSetReport {
     // per mosaic -- which is what a preflight predicts. It is 0 when no set was ranked. The shared scoring pass
     // may cover more (a prefix scores the union), so this counts the set, not the pass.
     std::size_t unique_haplotypes = 0;
+    // Exact-path prior work, which R11 measured at 24-28 s per run on a 108,000-diplotype panel. The
+    // haploid prior depends only on a complete allele path, so it is computed once per DISTINCT path and
+    // every diplotype is formed from two cached values. `haploid_prior_evaluations` must equal
+    // `distinct_haplotype_paths`; if it exceeds it, the cache is not being shared across ranked sets.
+    std::size_t distinct_haplotype_paths = 0;
+    std::size_t haploid_prior_evaluations = 0;
+    std::size_t diploid_prior_lookups = 0;
     // True when no beam ran at all: K = 0, no phase audit and no positive development prefix, so the
     // candidate set is exactly the panel and nothing about it is conditional on a search. Reported as
     // candidate_scope PANEL_ONLY, which is neither COMPLETE nor CONDITIONAL -- both of those describe
@@ -301,7 +323,6 @@ void write_status(
         // Any ranking over a set that omits candidates is conditional on that set.
         out << "candidate_set_conditional\t" << (beam->candidate_set_conditional ? "true" : "false")
             << '\n';
-        out << "candidate_scope\t" << (beam->candidate_set_conditional ? "CONDITIONAL" : "COMPLETE") << '\n';
         out << "beam_extensions\t" << beam->extensions_evaluated << '\n';
     }
     if (candidate_set != nullptr) {
@@ -311,11 +332,14 @@ void write_status(
         out << "panel_baseline_complete\t" << (candidate_set->panel_baseline_complete ? "true" : "false") << '\n';
         out << "beam_diplotypes_found\t" << candidate_set->beam_diplotypes_found << '\n';
         out << "unique_haplotypes\t" << candidate_set->unique_haplotypes << '\n';
-        if (candidate_set->panel_only) {
-            // No search ran, so neither COMPLETE nor CONDITIONAL applies: both describe what a beam
-            // returned. The candidate set is the panel, entire.
-            out << "candidate_scope\tPANEL_ONLY\n";
-        }
+        out << "distinct_haplotype_paths\t" << candidate_set->distinct_haplotype_paths << '\n';
+        out << "haploid_prior_evaluations\t" << candidate_set->haploid_prior_evaluations << '\n';
+        out << "diploid_prior_lookups\t" << candidate_set->diploid_prior_lookups << '\n';
+        // Derived once, here, and used verbatim by every block row.
+        out << "candidate_scope\t"
+            << candidate_scope_name(candidate_set->panel_only,
+                                    beam != nullptr && beam->candidate_set_conditional)
+            << '\n';
         if (beam != nullptr && candidate_set->panel_baseline_complete) {
             out << "candidates_total\t" << candidate_set->panel_diplotypes + beam->candidates.size() << '\n';
         }
@@ -376,6 +400,9 @@ void write_status(
     out << "seconds_proposal\t" << timings.proposal << '\n';
     out << "seconds_spelling\t" << timings.spelling << '\n';
     out << "seconds_rescoring\t" << timings.rescoring << '\n';
+    out << "seconds_candidates\t" << timings.candidates << '\n';
+    out << "seconds_prior\t" << timings.prior << '\n';
+    out << "seconds_ranking\t" << timings.ranking << '\n';
     out << "seconds_total\t" << timings.total << '\n';
 }
 
@@ -748,6 +775,26 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     }
     timings.rescoring = seconds_since(mark);
 
+    // Exact-path prior cache, shared by every ranked set: the primary one, each development prefix and
+    // the phase audit. The haploid prior is a function of one complete allele path alone, so it is
+    // computed once per distinct path here rather than twice per diplotype inside every ranking -- which
+    // on a 108,000-diplotype panel was 24-28 s per run, a third to a half of the whole thing.
+    //
+    // Keyed on the allele path, NEVER on the spelled sequence: two different paths can spell identical
+    // bytes and must keep distinct path priors, which is exactly the distinction the sequence priors
+    // below are for.
+    std::map<std::vector<std::size_t>, double> haploid_prior_cache;
+    std::size_t haploid_prior_evaluations = 0;
+    std::size_t diploid_prior_lookups = 0;
+    const auto cached_haploid_prior = [&](const MosaicPath& path) {
+        const auto found = haploid_prior_cache.find(path.alleles);
+        if (found != haploid_prior_cache.end()) return found->second;
+        ++haploid_prior_evaluations;
+        const double value = log_haploid_mosaic_prior(model.panel(), path, switch_probability);
+        haploid_prior_cache.emplace(path.alleles, value);
+        return value;
+    };
+
     // Certification of one candidate set -- the panel baseline plus a mosaic prefix -- from the shared scores.
     struct SequenceCandidate {
         std::size_t first = 0;     // interned sequence, first <= second
@@ -769,6 +816,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         std::vector<MosaicCandidate> candidates = panel_candidates;
         candidates.insert(candidates.end(), beam.candidates.begin(), beam.candidates.end());
 
+        const auto candidates_mark = Clock::now();
         std::vector<SequenceCandidate> sequence_candidates;
         std::map<std::pair<std::size_t, std::size_t>, std::size_t> slot_of_sequence_pair;
         std::vector<std::size_t> sequence_candidate_of(candidates.size(), 0);
@@ -784,16 +832,39 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             sequence_candidates[inserted.first->second].members.push_back(i);
             sequence_candidate_of[i] = inserted.first->second;
         }
+        timings.candidates += seconds_since(candidates_mark);
 
         // ---- stage 5: exact prior, recomputed independently of the beam ------------------------------
         // The path prior is a manifest diagnostic; the ranking uses the sequence-pair prior, which decides
         // the log(2) multiplicity on bytes.
+        //
+        // The haploid prior is a function of one complete allele path alone, so it is cached by that path
+        // and each diplotype is formed from two cached values. This is the same arithmetic
+        // log_unordered_diplotype_prior performs -- the -inf short circuit and the log(2) multiplicity on
+        // PATH identity, never on spelled sequence -- and it changes no model. The cache lives outside
+        // this lambda, so the phase audit and every development prefix reuse it instead of repeating a
+        // full set of evaluations.
+        const auto prior_mark = Clock::now();
         std::vector<double> path_prior;
         path_prior.reserve(candidates.size());
         for (const MosaicCandidate& candidate : candidates) {
-            path_prior.push_back(
-                log_unordered_diplotype_prior(model.panel(), candidate.diplotype, switch_probability));
+            ++diploid_prior_lookups;
+            const double first = cached_haploid_prior(candidate.diplotype.first);
+            const double second = cached_haploid_prior(candidate.diplotype.second);
+            const double negative_infinity = -std::numeric_limits<double>::infinity();
+            if (first == negative_infinity || second == negative_infinity) {
+                path_prior.push_back(negative_infinity);
+            } else {
+                path_prior.push_back(
+                    first + second +
+                    (candidate.diplotype.first != candidate.diplotype.second ? std::log(2.0) : 0.0));
+            }
         }
+        timings.prior += seconds_since(prior_mark);
+        candidate_report.distinct_haplotype_paths = haploid_prior_cache.size();
+        candidate_report.haploid_prior_evaluations = haploid_prior_evaluations;
+        candidate_report.diploid_prior_lookups = diploid_prior_lookups;
+        const auto ranking_mark = Clock::now();
         std::vector<double> sequence_prior;
         std::vector<DiplotypeScore> scores;
         for (SequenceCandidate& candidate : sequence_candidates) {
@@ -893,6 +964,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             }
         }
 
+        timings.ranking += seconds_since(ranking_mark);
         SetRanking out;
         out.candidates = std::move(candidates);
         out.sequence_candidates = std::move(sequence_candidates);
@@ -906,6 +978,12 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     // Everything after scoring, for one mosaic target. A standalone run calls it once; the development prefix
     // harness calls it once per prefix of the same proposal and scoring pass, so each prefix is refused,
     // certified and written by exactly the code a standalone run uses.
+    // `finish` takes its StageTimings BY VALUE, so each development prefix reports its own total without
+    // the prefixes after it. That copy is made at the call site, before rank_set runs, so the stages
+    // rank_set accumulates -- candidates, prior, ranking -- are not in it, and every run reported them as
+    // 0.000. They are run-level accumulations, like the shared work counters, so each status refreshes
+    // them from this alias, which names the outer accumulator the parameter below shadows.
+    StageTimings& run_timings = timings;
     const auto finish = [&](const MosaicBeamResult& beam, const GenotypeCommandOptions& options,
                             StageTimings timings) -> GenotypeRunStatus {
         const std::string status_path = options.out_prefix + ".mosaic_status.tsv";
@@ -1042,6 +1120,9 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         }
 
         if (ranking.status != RescoreStatus::Complete) {
+            timings.candidates = run_timings.candidates;
+            timings.prior = run_timings.prior;
+            timings.ranking = run_timings.ranking;
             timings.total = seconds_since(started);
             write_status(status_path, GenotypeRunStatus::RescoreIncomplete, fingerprint, options,
                          library, timings, &built.report, &panel, (panel_only ? nullptr : &beam), &ranking,
@@ -1103,7 +1184,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                     << summary.phase_support << '\t' << std::setprecision(12)
                     << summary.block_genotype_posterior[b] << '\t' << summary.block_genotype_quality[b]
                     << std::setprecision(6) << '\t' << (summary.block_numerically_separated[b] ? "true" : "false")
-                    << '\t' << (beam.candidate_set_conditional ? "CONDITIONAL" : "COMPLETE") << '\n';
+                    << '\t' << candidate_scope_name(panel_only, beam.candidate_set_conditional) << '\n';
             }
         }
         {
@@ -1119,6 +1200,9 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             }
         }
 
+        timings.candidates = run_timings.candidates;
+        timings.prior = run_timings.prior;
+        timings.ranking = run_timings.ranking;
         timings.total = seconds_since(started);
         write_status(status_path, GenotypeRunStatus::Complete, fingerprint, options, library, timings,
                      &built.report, &panel, (panel_only ? nullptr : &beam), &ranking, "", &summary,

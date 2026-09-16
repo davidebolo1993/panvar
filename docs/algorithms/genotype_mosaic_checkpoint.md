@@ -4,6 +4,185 @@ Companion to `genotype_mosaic.md`, which remains the authoritative contract. Thi
 what is actually built, what its own gates still owe, and the work order to reach the Phase 8
 go/no-go.
 
+## R11. Review round 11 — the panel arm runs, and what it actually costs
+
+Round 10 was accepted. The ordered work was: finish the outstanding preflight corrections, implement a true
+panel-only path, run a 2x panel pilot on the three large loci, produce a myom2 coverage-by-boundary table, and
+proceed with the independent housekeeping. All of that is done. Commits: `09e0769`, `cd28721`, `d24e471`,
+`b88a777`.
+
+### R11.1 Preflight corrections (`09e0769`)
+
+**One planner, not two.** `extension_upper_bound` moves out of `mosaic_beam.cpp`'s anonymous namespace into the
+header, so the preflight predicts the beam's pre-allocation work with the same integers and the same overflow
+checks production enforces, instead of restating the formula in floating point -- which is not the same function
+near the cap, the only place the answer decides anything. A zero-template panel returns zero rather than
+dividing by it.
+
+**Runnability is per arm.** `model_runnable`, `panel_arm_runnable`, `mosaic_arm_runnable`,
+`phase_audit_runnable`. A beam refusal said nothing about whether the panel arm could run, and one
+`runs_as_is` could not express that: acot, gstm1 and ankrd36c are all `panel_arm_runnable` with the beam over
+budget. A model-refused locus emits all four as false rather than omitting them.
+
+**The phase audit is priced, and not where it was assumed to be.** Held-fixed measurements on c4 at 30x: 29.065 s
+at audit 0, then 35.539, 40.253 and 46.475 at 64, 128 and 256 -- with `unique_haplotypes` 140 at every one. The
+audit enlarges the *candidate set*, not the haplotype pool, so it is not visible in the mass term, nor
+meaningfully in the pair term (8,515+256 against 8,515+8 is 3%), yet it is 60% of the wall clock. Sizing the
+haplotype pool by `max(K, audit)` instead predicted 316 s for a 46.5 s run. It is now its own additive term.
+
+### R11.2 A true panel-only path (`d24e471`)
+
+With K = 0, no audit and no positive development prefix, the beam can propose nothing that is ever scored, so it
+is not built. Its budget can no longer refuse a call that never needed it -- which is exactly what had kept the
+three large loci from running an arm whose own work sits far inside every cap. Such a run reports
+`candidate_scope PANEL_ONLY` (neither COMPLETE nor CONDITIONAL, both of which describe what a search returned),
+emits no proposal diagnostics, and records `seconds_proposal 0`. Every panel diplotype is still scored.
+
+**The first version tied phase to the wrong thing.** It keyed "report UNRESOLVED" off *no beam was built*, which
+made a standalone K = 0 run and the K = 0 view of a ladder disagree about phase while producing byte-identical
+calls. The prefix-equals-standalone gate caught it. The condition is now on what was **ranked**: a set with no
+off-panel rival and no audit cannot speak to phase, because panel diplotypes are unordered pairs of whole
+templates and switching phase within a pair is not representable without a mosaic. A K = 0 arm carrying an audit
+is unaffected.
+
+Gates: the panel-only contract, and equality of genotypes and selected haplotypes with the former K = 0 path. In
+the prefix ladder, K = 0 alone now compares with the proposal diagnostics dropped -- and that relaxation is
+itself gated, by asserting the two runs demonstrably took different paths.
+
+**The status and the block rows disagreed about scope, and the review caught it.** The status reported
+`PANEL_ONLY` while every row of `block_genotypes.tsv` reported `CONDITIONAL`, because the row derived its value
+from the empty beam instead of the panel-only state. No genotype changed, but anything summarising the rows
+would have been wrong, and the two files contradicted each other on disk. The scope is now derived **once** and
+used by the status and every row alike, with a fixture covering all three states -- `PANEL_ONLY`, `COMPLETE` and
+`CONDITIONAL` -- that asserts every row agrees with the status written beside it. Measured across five runs
+afterwards, it does.
+
+### R11.3 The 2x pilots, and the two terms they exposed
+
+| Locus | pairs | predicted before | **measured** | peak RSS | stage sum | unaccounted |
+|---|---|---|---|---|---|---|
+| acot | 108,811 | 13-28 s | **64.2 s** | 1,539 MB | 40.4 s | 23.8 s (37%) |
+| gstm1 | 108,345 | 12-27 s | **53.0 s** | 1,331 MB | 25.4 s | 27.6 s (52%) |
+| ankrd36c | 107,880 | 33-51 s | **77.8 s** | 2,584 MB | 49.6 s | 28.2 s (36%) |
+
+All three complete, `PANEL_ONLY`, inside the 120 s circuit breaker. **The panel arm runs on loci the beam budget
+used to refuse outright.** That is a statement about runnability and resource use, and nothing more: one donor,
+one coverage, no leave-one-out and no cohort. These pilots establish that the loci can be genotyped at all, not
+that the genotypes are right.
+
+Two models were wrong, and both were corrected by measurement rather than by reading (`b88a777`):
+
+- **The exact-path prior** is computed once per candidate diplotype and does not scale with coverage, so no
+  fragment-proportional term could see it. Sampling the running process put half the late-phase samples in
+  `log_unordered_diplotype_prior`. Across the three loci it is 11.5 / 12.7 / 12.5 us per candidate-block -- flat,
+  though their fragment counts differ by 2x. gstm1 has *fewer* fragments than acot and *more* unaccounted time,
+  which is what rules out a fragment-proportional explanation. On c4 it is 1.1 s and invisible.
+- **Whole-process peak RSS scales with panel bases** -- 13.8 / 12.6 / 11.5 bytes per base across a 2.1x spread
+  in template length, which makes panel bases a good empirical predictor and makes a mass-matrix-only model
+  ~180x low. It does **not** establish where the bytes live: RSS is a whole-process number, and attributing it
+  to the spelled panel would need phase-level measurement after model construction, after spelling and
+  interning, and after scoring. Until then this is a predictor, not an attribution.
+
+After the correction: acot 37-53 (64.2), gstm1 37-52 (53.0), ankrd36c 60-78 (77.8), c4 31-35 at audit 0 (29.1)
+and 50-53 at audit 256 (46.5); memory within 4-12%. **Not a clean bill:** acot is still 21% low, and the large
+loci now under-predict where c4 brackets from above, which is the wrong direction for a budget. Nothing has been
+checked above 2x on a large panel, and `estimate_basis` says so.
+
+### R11.4 myom2 coverage-by-boundary (no boundary selected)
+
+| Cut | Templates retained | Blocks removed | Variant blocks removed |
+|---|---|---|---|
+| `[0,78)` | **322 / 322 (100%)** | 3 | 1 |
+| `[0,79)` | 9 (2.8%) | 2 | 1 |
+| as-is | 1 (0.3%) | 0 | 0 |
+
+The whole coverage failure is confined to the last three blocks: truncating before `ctx:78` recovers every framed
+template while dropping one variant block. `sv:79` is bounded by nodes 79633..79632 -- source above sink -- and
+`ctx:80` has no sink at all, which fits a degenerate terminal bubble reachable by one template. Per the ruling,
+the table is the deliverable; the cut is a separate model decision and is not taken here.
+
+### R11.5 Housekeeping
+
+**Concurrency.** 8 donors at 30x from cached reads: JOBS=1 380 s, JOBS=2 211 s -- **1.80x**, with byte-identical
+call hashes. No sign of the round 8 pathology (42-61 minutes of wall on ~1 minute of CPU), which occurred at
+JOBS=4 with other work running. The harness itself had to be fixed first: under `set -o pipefail`, `head` closing
+the pipe killed `sort` with SIGPIPE and aborted the script before it created anything, printing nothing, while
+the invoking pipeline reported success from `tail` (`cd28721`).
+
+**Disk.** Manifest of 896 read files -- path, size, SHA-256, fragment count -- totalling 3.32 GB and 16,279,464
+fragments. 128 source files compressed and each verified against its recorded hash (0 failures), then 768 derived
+lower-coverage files removed: **2,486 MB freed**, 1,376 status and evaluation files untouched. Regeneration was
+proven first, and the proof carries a caveat worth keeping: those reads reproduce byte-for-byte only from the
+commit that wrote them, because `77e57c7` changed the hashed string from `<name>` to `<salt>/<name>`. HEAD cannot
+reproduce them by any flag. That is the same clean-worktree protocol every frozen run already uses, but it means
+"regenerable" here means "regenerable from `2c32c89`".
+
+### R11.6 The review's corrections, measured
+
+A review of R11 found two things: the panel-only status and its block rows contradicted each other about
+scope, and the newly identified prior cost should be **removed** rather than modelled. Both are done, and the
+measurements below are from one session with the machine otherwise idle.
+
+**The exact-path prior is computed once per distinct allele path.** `log_unordered_diplotype_prior` recomputed
+both haploid priors for every diplotype and repeated that for every prefix and the audit. The haploid prior is
+a function of one complete allele path alone, so it is now cached by that path -- never by spelled sequence,
+since two paths can spell identical bytes and must keep distinct path priors -- and each diplotype is formed
+as `cached(p1) + cached(p2) + (p1 != p2 ? log 2 : 0)`, which is the arithmetic the old function performed,
+including its -inf short circuit.
+
+| Case | Panel pairs | Distinct paths | Haploid evaluations | Diploid lookups | s_prior | s_cand | s_rank | s_total | RSS |
+|---|---|---|---|---|---|---|---|---|---|
+| c4, audit 0 | 8,515 | 130 | **130** | 8,515 | 0.007 | 0.003 | 0.005 | 54.68 | 464 MB |
+| c4, audit 256 | 8,515 | 130 | **130** | 8,515 | 0.015 | 0.006 | 0.011 | 94.11 | 560 MB |
+| acot 2x | 108,811 | 466 | **466** | 108,811 | 0.140 | 0.054 | 0.158 | 79.45 | 1,635 MB |
+| gstm1 2x | 108,345 | 465 | **465** | 108,345 | 0.157 | 0.050 | 0.156 | 50.32 | 1,514 MB |
+| ankrd36c 2x | 107,880 | 464 | **464** | 107,880 | 0.158 | 0.058 | 0.167 | 98.74 | 2,609 MB |
+| c4, audit 0 (repeat) | 8,515 | 130 | **130** | 8,515 | 0.007 | 0.003 | 0.005 | 54.76 | 459 MB |
+
+Haploid evaluations equal distinct paths in every case, against 8,515-108,811 diplotype lookups. The audited
+c4 run evaluates 130 paths while ranking both its primary set and a 256-candidate audit, so **the audit
+triggers no second set of evaluations** -- the cache is genuinely shared across primary, prefix and audit
+rankings.
+
+**It changes nothing statistical.** Against the R11 pilots, on the same frozen reads: genotypes, candidate
+scores with their exact priors, block posteriors and GQ, phase, haplotypes and status are **byte-identical for
+all three loci, 15 comparisons of 15**. Only timings, the three new counters and the corrected
+`candidate_scope` column differ, all of which are expected to.
+
+**Totals are not comparable with R11, and the reason is measurable.** Every stage is ~1.95x slower than in the
+R11 session -- acot model 2.02x, markers 1.90x, rescoring 1.94x; gstm1 1.95x / 1.92x / 1.94x; ankrd36c 1.96x /
+1.89x / 1.97x. A uniform factor across every stage and all three loci is the machine, not the code. Within this
+session the same case run first and last differs by **0.14%** (54.682 s and 54.756 s), so the instrument is
+stable and the cross-session gap is real. R11's totals were therefore measured on a materially faster machine
+and any before/after comparison of totals between sessions is void, including R11's own.
+
+**Against that baseline the fixed cost is gone.** R11 measured 23.8 / 27.6 / 28.2 s of runtime that no stage
+accounted for and attributed it, from a process sample, to the exact-path prior. That work now takes **0.140 /
+0.157 / 0.158 s**. Scaled for the ~1.95x machine factor, the R11 figures correspond to roughly 46-55 s today,
+so essentially all of it is removed rather than moved.
+
+**What the timers now say, and one correction to them.** They first reported 0.000 for every run: `finish`
+takes its `StageTimings` by value, so the copy was taken at the call site before `rank_set` accumulated
+anything, and the three new fields never reached the status. Fixed, and the stages now account for the whole
+run -- residual unattributed time is **0.05-0.73 s**, down from 24-28 s. The dominant cost is now unambiguous:
+**rescoring is 57-93% of every run** -- 93.0% of c4's 54.7 s, 69.4% of acot's 79.4, 57.5% of gstm1's 50.3 and
+69.8% of ankrd36c's 98.7. Candidate combination, prior and ranking together are under 0.4 s.
+
+### R11.7 What remains
+
+cyp2d6's curated-panel experiment is not started: an explicit exclusion of NA18989's incomplete path, recorded in
+a hashed manifest, with no donor evaluated whose truth requires that path, and the curated graph passing the
+round-trip and representation-independence gates upstream of the caller. The 10x and 30x pilots are deliberately
+not run -- the ruling was to stop after 2x and profile first. The distinct-prefix beam remains required before
+any cross-locus mosaic-recall claim, and the mosaic arm on the large loci is still refused by the beam budget at
+state limit 1,024.
+
+This round deliberately stopped short of all of it: no cyp2d6 curation, no 10x or 30x run, no cohort, no new
+reads simulated, no myom2 boundary chosen and no change to the mosaic beam. With the prior cost removed and the
+stages now accounting for the whole run, **rescoring is the only remaining hotspot worth attacking** -- which of
+its parts to attack, and whether by deterministic parallelism or otherwise, is the next decision rather than
+something to pre-empt here.
+
 ## R10. Review round 10 — the coverage audit: "bypass" is not one state
 
 The reviewer accepted the cyp2d6 diagnosis — NA18989 is not a malformed GFA path but a partial whole-locus

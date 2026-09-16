@@ -719,6 +719,25 @@ void test_off_panel_phase_is_not_claimed_from_reads() {
 // finds fewer off-panel mosaics than K still calls, marked CONDITIONAL with the shortfall explicit; K = 0 scores
 // the panel alone; a panel baseline over its budget is refused whole; an exhaustive search with fewer mosaics
 // than requested is complete and unconditional.
+// The candidate scope is ONE value, and the status and every block row must carry it. They disagreed:
+// a panel-only run's status said PANEL_ONLY while every block row said CONDITIONAL, taken from an empty
+// beam. That changes no genotype and corrupts anything that summarises the rows.
+void require_scope_agrees(const std::string& prefix, const std::string& expected) {
+    const auto status = read_status(path(prefix + ".mosaic_status.tsv"));
+    require(status.count("candidate_scope") == 1 && status.at("candidate_scope") == expected,
+            prefix + " must report candidate_scope " + expected + ", got " +
+                (status.count("candidate_scope") ? status.at("candidate_scope") : std::string("(absent)")));
+    std::size_t checked = 0;
+    for (const auto& row : read_rows(path(prefix + ".block_genotypes.tsv"))) {
+        if (row.empty() || row.front() == "block_id") continue;   // header, if read_rows returns one
+        require(row.back() == expected,
+                prefix + " block row " + row.front() + " reports scope " + row.back() +
+                    " while its status reports " + expected);
+        ++checked;
+    }
+    require(checked > 0, prefix + " must emit block rows for the scope check to mean anything");
+}
+
 void test_proposal_status_rules() {
     const std::string r1 = path("phaseable_r1.fq");
     const std::string r2 = path("phaseable_r2.fq");
@@ -798,6 +817,11 @@ void test_proposal_status_rules() {
     require(exhaustive_status.at("marker_background_effective") == exhaustive_status.at("marker_background") &&
                 std::stod(exhaustive_status.at("marker_background_floor")) == panvar::kMarkerBackgroundFloor,
             "the status must report the model floor and the background proposal scoring actually used");
+
+    // One scope, all three states, and every block row agreeing with the status beside it.
+    require_scope_agrees("starved", "CONDITIONAL");
+    require_scope_agrees("panel_only", "PANEL_ONLY");
+    require_scope_agrees("exhaustive", "COMPLETE");
 }
 
 // Prior-only phase. The unphaseable locus with a second carrier of sampleA's haplotype: reads from
@@ -910,7 +934,8 @@ void test_prior_only_phase_is_reported() {
 void test_candidate_prefixes_match_standalone() {
     const std::string r1 = path("phaseable_r1.fq");
     const std::string r2 = path("phaseable_r2.fq");
-    const auto slurp = [](const std::string& file, bool status_file, bool drop_proposal = false) {
+    const auto slurp = [](const std::string& file, bool status_file, bool drop_proposal = false,
+                          bool drop_last_column = false) {
         std::ifstream input(file);
         if (!input) return std::string("<absent>");
         std::string line;
@@ -923,7 +948,13 @@ void test_candidate_prefixes_match_standalone() {
                 static const std::set<std::string> shared_work = {
                     "candidate_bases_scanned", "piece_hits", "proposed_starts", "unique_starts",
                     "full_read_verifications", "accepted_mate_placements", "valid_fr_states",
-                    "physical_origins", "statistical_state_classes"};
+                    "physical_origins", "statistical_state_classes",
+                    // The exact-path prior cache is shared by every ranked set, so a prefix view counts
+                    // the paths interned while ranking the prefixes before it, where a standalone run
+                    // starts empty. Deliberately cumulative: the invariants these prove are run-level --
+                    // evaluations equal distinct paths, and an audit triggers no second full set of them
+                    // -- and a per-set counter would hide exactly the reuse being tested.
+                    "distinct_haplotype_paths", "haploid_prior_evaluations", "diploid_prior_lookups"};
                 if (shared_work.count(key) != 0) continue;
                 // K = 0 alone is asymmetric, and legitimately so: a standalone K = 0 run requests no
                 // mosaics, no audit and no prefix, so it builds no beam at all, while the K = 0 VIEW of a
@@ -936,6 +967,14 @@ void test_candidate_prefixes_match_standalone() {
                     "proposal_final_states", "proposal_states_pruned", "proposal_search_exhaustive",
                     "beam_extensions", "candidates_total", "beam_diplotypes_found"};
                 if (drop_proposal && proposal_diagnostics.count(key) != 0) continue;
+            }
+            if (drop_last_column) {
+                // The per-block candidate_scope column. A standalone K = 0 run is PANEL_ONLY while the
+                // K = 0 view of a ladder shares the beam its larger prefixes needed, so this column
+                // legitimately differs -- and only this column. Everything else on the row, the
+                // genotype, posterior, GQ and phase, must still match byte for byte.
+                const std::size_t last = line.rfind('\t');
+                if (last != std::string::npos) line = line.substr(0, last);
             }
             if (!line.empty() && line[0] == '>') line = line.substr(line.find(' '));   // header names the prefix
             text += line + '\n';
@@ -964,8 +1003,9 @@ void test_candidate_prefixes_match_standalone() {
             for (const std::string suffix : {".genotypes.tsv", ".block_genotypes.tsv", ".mosaic_candidates.tsv",
                                              ".mosaic_scores.tsv", ".mosaic_status.tsv", ".mosaic_haplotypes.fa"}) {
                 const bool status_file = suffix == ".mosaic_status.tsv";
-                require(slurp(extracted + suffix, status_file, k == 0) ==
-                            slurp(path(name) + suffix, status_file, k == 0),
+                const bool block_file = suffix == ".block_genotypes.tsv";
+                require(slurp(extracted + suffix, status_file, k == 0, k == 0 && block_file) ==
+                            slurp(path(name) + suffix, status_file, k == 0, k == 0 && block_file),
                         "prefix K=" + std::to_string(k) + " at state limit " + std::to_string(state_limit) +
                             " must reproduce the standalone " + suffix);
             }
