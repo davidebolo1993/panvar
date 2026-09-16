@@ -16,6 +16,10 @@ OUT="${1:?usage: BUILD=<build> tests/genotype_r12_prior_cache_bench.sh <out-dir>
 PROBE="$BUILD/genotype_probe"
 PILOT="$REPO/tests/results"
 C4_SOURCE="$PILOT/genotype_coverage_c4_held_out_abb35a0/HG00096/source"
+# Workers for the diploid combination phase. One invocation uses one setting, so a 1,2,2,1 ordering is
+# four invocations into four directories -- which exposes machine drift instead of hiding it inside a
+# single run, and the drift is real: this machine has already moved ~1.95x between sessions.
+THREADS="${THREADS:-1}"
 
 mkdir -p "$OUT"
 [ -z "$(ls -A "$OUT" 2>/dev/null)" ] || { echo "$OUT is not empty" >&2; exit 1; }
@@ -26,6 +30,7 @@ mkdir -p "$OUT"
   printf 'git_tree_dirty\t%s\n' "$(git -C "$REPO" status --porcelain | grep -q . && echo true || echo false)"
   printf 'probe_sha256\t%s\n' "$(shasum -a 256 "$PROBE" | cut -d' ' -f1)"
   printf 'script_sha256\t%s\n' "$(shasum -a 256 "${BASH_SOURCE[0]}" | cut -d' ' -f1)"
+  printf 'threads\t%s\n' "$THREADS"
 } > "$OUT/signature.tsv"
 
 # c4 reads live compressed after the R11 disk cleanup; decompress once, into our own directory.
@@ -71,6 +76,7 @@ for spec in "${CASES[@]}"; do
   /usr/bin/time -l "$PROBE" genotype --gfa "$gfa" --reference "$ref" \
     --reads1 "$reads/reads_1.fq" --reads2 "$reads/reads_2.fq" --library "$reads/library.txt" \
     --out-prefix "$OUT/$name/run" --state-limit 1024 --prefixes "$prefixes" --phase-audit "$audit" \
+    --threads "$THREADS" \
     > "$OUT/$name/run.log" 2> "$OUT/$name/time.txt"
   echo "  $name done"
 done

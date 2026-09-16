@@ -190,6 +190,10 @@ struct CandidateSetReport {
     std::size_t distinct_haplotype_paths = 0;
     std::size_t haploid_prior_evaluations = 0;
     std::size_t diploid_prior_lookups = 0;
+    // Threading telemetry for the diploid combination phase: what was actually used, which is not what
+    // was asked for when there are fewer candidates than workers, and the work done regardless.
+    std::size_t threads_used_combination = 1;
+    std::uint64_t candidate_fragment_evaluations = 0;
     // True when no beam ran at all: K = 0, no phase audit and no positive development prefix, so the
     // candidate set is exactly the panel and nothing about it is conditional on a search. Reported as
     // candidate_scope PANEL_ONLY, which is neither COMPLETE nor CONDITIONAL -- both of those describe
@@ -257,7 +261,11 @@ void write_status(
     // meets its performance gate. The requested value is recorded so a run is reproducible.
     // Version one is serial, and a request for more is refused before any work; both are recorded.
     out << "threads_requested\t" << options.threads << '\n';
-    out << "threads_used\t1\n";
+    // Named per phase rather than as one "threads_used": a run must never claim parallelism in a phase
+    // that ran serially. Placement is still serial and says so.
+    out << "threads_used_combination\t"
+        << (candidate_set != nullptr ? candidate_set->threads_used_combination : 1) << '\n';
+    out << "threads_used_placement\t1\n";
     out << "max_beam_extensions\t" << options.max_beam_extensions << '\n';
     out << "max_piece_hits\t" << options.max_piece_hits << '\n';
     out << "max_proposed_starts_per_haplotype\t" << options.max_proposed_starts_per_haplotype << '\n';
@@ -341,6 +349,7 @@ void write_status(
         out << "distinct_haplotype_paths\t" << candidate_set->distinct_haplotype_paths << '\n';
         out << "haploid_prior_evaluations\t" << candidate_set->haploid_prior_evaluations << '\n';
         out << "diploid_prior_lookups\t" << candidate_set->diploid_prior_lookups << '\n';
+        out << "candidate_fragment_evaluations\t" << candidate_set->candidate_fragment_evaluations << '\n';
         // Derived once, here, and used verbatim by every block row.
         out << "candidate_scope\t"
             << candidate_scope_name(candidate_set->panel_only,
@@ -507,8 +516,8 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
 
     // Version one's scorer is serial. The option existed and was silently ignored; a request it cannot honour is
     // now refused rather than reported back as threads_used 1.
-    if (options.threads != 1) {
-        throw std::runtime_error("version one is serial: --threads must be 1");
+    if (options.threads < 1) {
+        throw std::runtime_error("--threads must be at least 1");
     }
 
     if (options.phase_audit_candidates > 0) {
@@ -766,6 +775,9 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
 
     mark = Clock::now();
     FragmentScoringOptions scoring_options;
+    // Candidates partition into fixed contiguous ranges, each worker owning complete score entries, so
+    // the thread count changes the schedule and nothing else. Gated byte-identical at 1, 2 and 4.
+    scoring_options.threads = options.threads;
     scoring_options.mismatch_band = options.mismatch_band;
     scoring_options.minimum_piece_bp = options.minimum_piece_bp;
     scoring_options.max_piece_hits = options.max_piece_hits;
@@ -781,6 +793,8 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             timings.rescoring_fragment_preparation = scored.seconds_fragment_preparation;
             timings.rescoring_placement_and_mass = scored.seconds_placement_and_mass;
             timings.rescoring_diploid_combination = scored.seconds_diploid_combination;
+            candidate_report.threads_used_combination = scored.threads_used_combination;
+            candidate_report.candidate_fragment_evaluations = scored.candidate_fragment_evaluations;
         } catch (const ResourceExhausted& error) {
             rescore_failure = error.what();
         }
@@ -1269,7 +1283,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (flag == "--reference-path" || flag == "-r") options.reference_path = need(i);
         else if (flag == "--out-prefix" || flag == "-o") options.out_prefix = need(i);
         else if (flag == "--library") options.library_path = need(i);
-        else if (flag == "--threads") options.threads = std::stoul(need(i));   // refused unless 1, see run_genotype
+        else if (flag == "--threads") options.threads = std::stoul(need(i));   // workers for diploid combination
         else if (flag == "--max-mosaic-candidates") options.max_mosaic_candidates = std::stoul(need(i));
         else if (flag == "--max-candidates") {
             throw std::runtime_error("--max-candidates is now --max-mosaic-candidates: every panel diplotype is "

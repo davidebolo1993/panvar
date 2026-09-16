@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <exception>
 #include <map>
+#include <thread>
 #include <set>
 #include <tuple>
 #include <type_traits>
@@ -703,26 +705,67 @@ FragmentScoringResult score_diplotypes(
     // panel -- roughly 108,000 candidates on the large loci against 8,515 on c4.
     const auto combination_mark = std::chrono::steady_clock::now();
 
-    for (std::size_t c = 0; c < candidates.size(); ++c) {
-        const std::size_t a = candidates[c].first;
-        const std::size_t b = candidates[c].second;
-        DiplotypeScore& score = result.scores[c];
-        // A homozygote names the same haplotype twice and therefore counts two chromosome copies in
-        // both terms, which is what the fragment contract requires.
-        score.exposure_term = -expected_signal_fragments(exposure[a] + exposure[b], library);
-        score.absolute_term_sum = std::abs(score.exposure_term);
-        double fragment_term = 0.0;
-        for (std::size_t f = 0; f < fragments.size(); ++f) {
-            const double combined =
-                log_add_exp(mass[f * unique + a], mass[f * unique + b]);
-            if (combined != kNegInf) ++score.fragments_with_mass;
-            const double contribution =
-                log_fragment_contribution(combined, background_by_fragment[f], library);
-            fragment_term += contribution;
-            score.absolute_term_sum += std::abs(contribution);
+    // One candidate's score depends on nothing but its own two haplotypes and the shared, now
+    // immutable, mass matrix -- so candidates partition cleanly. Each worker takes a fixed contiguous
+    // range and writes only its own complete DiplotypeScore entries; within a candidate the fragment
+    // order is exactly the serial order, and no value is accumulated across threads. There is
+    // therefore no floating-point reduction whose order could change, which is what makes this
+    // bit-for-bit identical at any thread count rather than merely close.
+    const auto combine_range = [&](std::size_t begin, std::size_t end) {
+        for (std::size_t c = begin; c < end; ++c) {
+            const std::size_t a = candidates[c].first;
+            const std::size_t b = candidates[c].second;
+            DiplotypeScore& score = result.scores[c];
+            // A homozygote names the same haplotype twice and therefore counts two chromosome copies
+            // in both terms, which is what the fragment contract requires.
+            score.exposure_term = -expected_signal_fragments(exposure[a] + exposure[b], library);
+            score.absolute_term_sum = std::abs(score.exposure_term);
+            double fragment_term = 0.0;
+            for (std::size_t f = 0; f < fragments.size(); ++f) {
+                const double combined =
+                    log_add_exp(mass[f * unique + a], mass[f * unique + b]);
+                if (combined != kNegInf) ++score.fragments_with_mass;
+                const double contribution =
+                    log_fragment_contribution(combined, background_by_fragment[f], library);
+                fragment_term += contribution;
+                score.absolute_term_sum += std::abs(contribution);
+            }
+            score.fragment_term = fragment_term;
+            score.log_likelihood = score.exposure_term + fragment_term;
         }
-        score.fragment_term = fragment_term;
-        score.log_likelihood = score.exposure_term + fragment_term;
+    };
+
+    const std::size_t combination_threads =
+        candidates.empty() ? 1
+                           : std::max<std::size_t>(1, std::min(options.threads, candidates.size()));
+    result.threads_used_combination = combination_threads;
+    result.candidate_fragment_evaluations =
+        static_cast<std::uint64_t>(candidates.size()) * static_cast<std::uint64_t>(fragments.size());
+
+    if (combination_threads <= 1) {
+        combine_range(0, candidates.size());
+    } else {
+        const std::size_t span = (candidates.size() + combination_threads - 1) / combination_threads;
+        std::vector<std::exception_ptr> failures(combination_threads);
+        std::vector<std::thread> workers;
+        workers.reserve(combination_threads);
+        for (std::size_t t = 0; t < combination_threads; ++t) {
+            const std::size_t begin = std::min(t * span, candidates.size());
+            const std::size_t end = std::min(begin + span, candidates.size());
+            workers.emplace_back([&, t, begin, end]() {
+                try {
+                    combine_range(begin, end);
+                } catch (...) {
+                    failures[t] = std::current_exception();
+                }
+            });
+        }
+        for (std::thread& worker : workers) worker.join();
+        // Every worker is joined before anything is rethrown, and the rethrow walks thread order, so
+        // which worker happened to fail first cannot change which refusal the caller sees.
+        for (const std::exception_ptr& failure : failures) {
+            if (failure) std::rethrow_exception(failure);
+        }
     }
     result.seconds_diploid_combination =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - combination_mark).count();

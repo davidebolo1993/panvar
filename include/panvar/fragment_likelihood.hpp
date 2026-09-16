@@ -193,6 +193,11 @@ struct FragmentScoringOptions {
     // and for the listed fragments every accepted origin.
     bool record_origin_summary = false;
     std::vector<std::size_t> record_origins_for_fragments;
+    // Workers for the diploid combination phase. Candidates are partitioned into fixed contiguous
+    // ranges and each worker writes only its own complete DiplotypeScore entries, so the result does
+    // not depend on the thread count: no cross-thread floating-point reduction exists to reorder.
+    // Defaults to serial, so every existing caller keeps its behaviour without being touched.
+    std::size_t threads = 1;
 };
 
 struct OriginSummary {
@@ -244,6 +249,11 @@ struct FragmentScoringResult {
     double seconds_fragment_preparation = 0.0;
     double seconds_placement_and_mass = 0.0;
     double seconds_diploid_combination = 0.0;
+    // What was actually used, which is not what was asked for when there are fewer candidates than
+    // workers. Reported so a run can never claim parallelism it did not use.
+    std::size_t threads_used_combination = 1;
+    // candidates x fragments: the work the combination phase performs, independent of thread count.
+    std::uint64_t candidate_fragment_evaluations = 0;
     // Filled only when requested in FragmentScoringOptions; same row-major layout as log_mass.
     std::vector<OriginSummary> origin_summary;
     // (fragment, haplotype) -> every accepted origin, for record_origins_for_fragments only.

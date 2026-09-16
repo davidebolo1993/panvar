@@ -170,7 +170,7 @@ target_compile_options(panvarlib
 # PRIVATE: edlib is an implementation detail of align.cpp, not part of panvarlib's
 # public interface. For a static lib CMake still propagates the symbols to the final
 # executable link, while keeping edlib out of the installed export set.
-target_link_libraries(panvarlib PRIVATE edlib abpoa minigraph ZLIB::ZLIB)
+target_link_libraries(panvarlib PRIVATE edlib abpoa minigraph ZLIB::ZLIB Threads::Threads)
 
 add_executable(panvar
     src/main.cpp

@@ -231,21 +231,63 @@ void test_end_to_end() {
             "the run must record a model fingerprint");
     require(std::stod(reported.at("numeric_separation_gap")) > 0.0,
             "a COMPLETE run must carry a positive numerical separation gap");
-    require(reported.at("threads_used") == "1",
-            "version one is serial; a threads_used above one would contradict the contract");
+    require(reported.at("threads_used_combination") == "1" &&
+                reported.at("threads_used_placement") == "1",
+            "a one-thread run must report one worker in every phase");
     {
-        // The option cannot be honoured, so it is refused rather than accepted and ignored.
-        panvar::GenotypeCommandOptions threaded = options;
-        threaded.threads = 2;
-        threaded.out_prefix = path("threaded");
-        bool refused = false;
-        try {
-            panvar::run_genotype(threaded);
-        } catch (const std::runtime_error&) {
-            refused = true;
+        // Diploid combination is parallel over fixed contiguous candidate ranges, each worker owning
+        // complete score entries and no value accumulated across threads. The thread count is therefore
+        // a scheduling choice and must not be visible in any number the run produces. Compared against
+        // the one-thread run above, byte for byte.
+        const auto slurp_run = [](const std::string& file, bool status_file) {
+            std::ifstream input(file);
+            if (!input) return std::string("<absent>");
+            std::string line;
+            std::string text;
+            while (std::getline(input, line)) {
+                // Timings and the thread counters are exactly what a thread count may change.
+                if (status_file && (line.rfind("seconds_", 0) == 0 || line.rfind("threads_", 0) == 0)) {
+                    continue;
+                }
+                if (!line.empty() && line[0] == '>') line = line.substr(line.find(' '));
+                text += line + '\n';
+            }
+            return text;
+        };
+        for (const std::size_t workers : {std::size_t{2}, std::size_t{4}}) {
+            panvar::GenotypeCommandOptions threaded = options;
+            threaded.threads = workers;
+            const std::string name = "threads" + std::to_string(workers);
+            threaded.out_prefix = path(name);
+            require(panvar::run_genotype(threaded) == panvar::GenotypeRunStatus::Complete,
+                    name + " must complete");
+            for (const char* suffix : {".genotypes.tsv", ".block_genotypes.tsv", ".mosaic_scores.tsv",
+                                       ".mosaic_status.tsv", ".mosaic_haplotypes.fa"}) {
+                const bool status_file = std::string(suffix) == ".mosaic_status.tsv";
+                require(slurp_run(path("run") + suffix, status_file) ==
+                            slurp_run(path(name) + suffix, status_file),
+                        name + " must reproduce the one-thread run exactly: " + suffix);
+            }
+            const auto threaded_status = read_status(path(name) + ".mosaic_status.tsv");
+            require(threaded_status.at("threads_requested") == std::to_string(workers),
+                    name + " must record what was asked for");
+            require(threaded_status.at("threads_used_placement") == "1",
+                    "placement is still serial and must say so rather than borrow the requested count");
         }
-        require(refused && !exists(path("threaded.mosaic_status.tsv")),
-                "a run asking for more than one thread must be refused before it does any work");
+
+        // Fewer candidates than workers: the partition must degrade to what exists, not spawn empty
+        // workers or divide by zero, and must still report only the threads it actually used.
+        panvar::GenotypeCommandOptions starved_threads = options;
+        starved_threads.threads = 64;
+        starved_threads.max_mosaic_candidates = 0;
+        starved_threads.phase_audit_candidates = 0;
+        starved_threads.out_prefix = path("threads_starved");
+        require(panvar::run_genotype(starved_threads) == panvar::GenotypeRunStatus::Complete,
+                "a run with more workers than candidates must still complete");
+        const auto starved_status = read_status(path("threads_starved.mosaic_status.tsv"));
+        require(std::stoul(starved_status.at("threads_used_combination")) <=
+                    std::stoul(starved_status.at("candidate_fragment_evaluations")),
+                "a run cannot use more combination workers than it has candidate work");
     }
 
     // The called haplotypes must be the simulated truth, in either chain orientation.
@@ -954,7 +996,11 @@ void test_candidate_prefixes_match_standalone() {
                     // starts empty. Deliberately cumulative: the invariants these prove are run-level --
                     // evaluations equal distinct paths, and an audit triggers no second full set of them
                     // -- and a per-set counter would hide exactly the reuse being tested.
-                    "distinct_haplotype_paths", "haploid_prior_evaluations", "diploid_prior_lookups"};
+                    "distinct_haplotype_paths", "haploid_prior_evaluations", "diploid_prior_lookups",
+                    // candidates x fragments of the SHARED scoring pass, which covers the union of every
+                    // prefix. A standalone run of one K scores only its own set, so this differs for
+                    // every prefix, not just K = 0 -- it describes the pass, not the candidate set.
+                    "candidate_fragment_evaluations"};
                 if (shared_work.count(key) != 0) continue;
                 // K = 0 alone is asymmetric, and legitimately so: a standalone K = 0 run requests no
                 // mosaics, no audit and no prefix, so it builds no beam at all, while the K = 0 VIEW of a
