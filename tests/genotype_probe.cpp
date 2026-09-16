@@ -1635,7 +1635,26 @@ int preflight(const Args& args) {
     const double c4_slope_seconds = 0.00073387 * c4_fragments;   // per-run cost above the fixed term
     const double by_pairs = c4_slope_seconds * (pair_evaluations / (8523.0 * c4_fragments));
     const double by_mass = c4_slope_seconds * (mass_cells * mean_bp) / (130.0 * c4_fragments * 226000.0);
-    const double fixed_seconds = 6.05;   // model, markers, proposal, spelling and the rescoring intercept
+    // Re-derived with c4's own prior cost (below) removed, so the two do not double-count: c4's
+    // audit-off points become 6.427 / 12.646 / 27.921 s, which refit to this intercept and the slope above.
+    const double fixed_seconds = 4.91;   // model, markers, proposal, spelling and the rescoring intercept
+    // The exact-path prior is computed once per candidate diplotype and does NOT scale with coverage, so
+    // neither term above can see it. On c4 it is 1.1 s and invisible; on a 108,000-diplotype panel it is
+    // a third to a half of the whole run, which is why constants fitted on c4 alone under-predicted acot
+    // by 2.3x. Measured at 2x on three loci, panel-only: acot 23.8 s over 2.07M candidate-blocks, gstm1
+    // 27.6 s over 2.17M, ankrd36c 28.2 s over 2.27M -- 11.5, 12.7 and 12.5 us each, flat within
+    // single-run noise, and confirmed by sampling the running process (log_unordered_diplotype_prior).
+    const double prior_seconds =
+        12.2e-6 * static_cast<double>(panel_pairs + mosaics) * static_cast<double>(model.blocks().size());
+
+    // Peak memory is dominated by the spelled panel, not by the mass matrix: every template is held as
+    // bases, so it scales with templates x length and not with coverage at all. Pricing only the mass
+    // matrix was ~180x low on these loci. Measured at 2x, panel-only: 1,539 MB over 111.6 Mbp of panel
+    // (acot), 1,331 over 105.4 (gstm1), 2,584 over 225.6 (ankrd36c) -- 13.8, 12.6 and 11.5 bytes per
+    // panel base, flat within 9% across a 2.1x spread in template length. The mass matrix is added on
+    // top of it because that is the part which grows with depth.
+    const double panel_memory_MB =
+        12.6 * static_cast<double>(panel.template_count()) * mean_bp / 1048576.0;
     // The phase audit is its own pass. It enlarges the CANDIDATE set without enlarging the haplotype
     // pool -- unique haplotypes are 139-140 at every audit size measured -- so neither term above sees
     // it, and pricing a run from K alone understated every audited run by more than half.
@@ -1703,16 +1722,26 @@ int preflight(const Args& args) {
         << "\nbeam_extension_upper_bound\t" << beam_extensions << "\nbeam_extensions_cap\t" << max_beam_extensions
         << "\nbeam_extensions_fraction_of_cap\t" << beam_extensions / static_cast<double>(max_beam_extensions)
         << "\npredicted_mass_matrix_MB\t" << mass_cells * 8.0 / 1048576.0
+        << "\npredicted_panel_memory_MB\t" << panel_memory_MB
+        << "\npredicted_peak_rss_MB\t" << panel_memory_MB + mass_cells * 8.0 / 1048576.0
         << "\nestimated_audit_seconds\t" << audit_seconds
-        << "\nestimated_seconds_low\t" << fixed_seconds + audit_seconds + std::min(by_pairs, by_mass)
-        << "\nestimated_seconds_high\t" << fixed_seconds + audit_seconds + std::max(by_pairs, by_mass)
-        << "\nestimate_basis\tc4, one donor, cached reads, one variable at a time. Base with the phase audit "
-           "off: 6.05 s + 0.734 ms per fragment at 8,523 candidates, ~130 haplotypes, 226 kb (7.571 / 13.790 / "
-           "29.065 s at 2,073 / 10,540 / 31,358 fragments, linear to 5 ms); the low end scales that with "
-           "candidate pairs, the high end with haplotypes x length. The phase audit is a separate, additive "
-           "term -- 3.36 s plus 55.8 ms per candidate per c4-30x-fragment -- measured over audit 0/64/128/256 "
-           "at one coverage and audit 256 at three, reproduced within 0.21 s. Extrapolation across LOCI is "
-           "untested: every constant here comes from one locus.\n";
+        << "\nestimated_prior_seconds\t" << prior_seconds
+        << "\nestimated_seconds_low\t"
+        << fixed_seconds + audit_seconds + prior_seconds + std::min(by_pairs, by_mass)
+        << "\nestimated_seconds_high\t"
+        << fixed_seconds + audit_seconds + prior_seconds + std::max(by_pairs, by_mass)
+        << "\nestimate_basis\tFour terms, each measured with the others held fixed. (1) Base, phase audit "
+           "off, on c4: 4.91 s + 0.734 ms per fragment at 8,523 candidates, ~130 haplotypes, 226 kb, scaled by "
+           "candidate pairs at the low end and haplotypes x length at the high end; fitted to 7.571 / 13.790 / "
+           "29.065 s at 2,073 / 10,540 / 31,358 fragments with c4's own prior cost removed so (3) does not "
+           "double-count. (2) Phase audit: 3.36 s + 55.8 ms per candidate per c4-30x-fragment, over audit "
+           "0/64/128/256 at one coverage and audit 256 at three, within 0.21 s. (3) Exact-path prior: 12.2 us "
+           "per candidate-block, INDEPENDENT of coverage -- 1.1 s on c4 and a third to a half of the run on a "
+           "108,000-diplotype panel; measured on acot/gstm1/ankrd36c at 2x as 11.5/12.7/12.5 us and confirmed "
+           "by sampling the running process. (4) Memory: 12.6 bytes per panel base for the spelled panel "
+           "(13.8/12.6/11.5 measured), plus the mass matrix, which is the part that grows with depth. "
+           "Constants for (1) and (2) still come from c4 alone; (3) and (4) come from three large loci at 2x, "
+           "and no term has been checked above 2x on a large panel.\n";
     std::cout << out.str();
     if (!args.get("out", "").empty()) {
         std::ofstream file(args.get("out", ""));
