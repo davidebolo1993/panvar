@@ -488,6 +488,41 @@ LocusInputResult build_locus_input(
         result.input.blocks.push_back(std::move(out));
     }
 
+    // Classify every block a template does not simply traverse, now that the whole chain is known.
+    // A block the template does not walk is an admissible deletion only when the template is observed
+    // on BOTH sides of it: the path brackets the missing region, so the region really is absent from
+    // that haplotype. With no observation on one side the path stops short, and the block is
+    // uncovered -- the template never said anything about it. Reporting only, for now.
+    for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
+        if (!orientations[pi].has_value()) continue;
+        const std::vector<std::string>& sources = allele_source_by_template[pi];
+        for (std::size_t bi = 0; bi < sources.size() && bi < report.blocks.size(); ++bi) {
+            if (sources[bi] != "bypass" && sources[bi] != "empty") continue;
+            TemplateBlockCoverage row;
+            row.template_name = graph.paths[pi].name;
+            row.block_id = report.blocks[bi].block_id;
+            if (sources[bi] == "empty") {
+                row.coverage = BlockCoverage::EmptyInterior;
+            } else {
+                bool observed_left = false;
+                bool observed_right = false;
+                for (std::size_t j = 0; j < bi; ++j) {
+                    if (sources[j] != "bypass") { observed_left = true; break; }
+                }
+                for (std::size_t j = bi + 1; j < sources.size(); ++j) {
+                    if (sources[j] != "bypass") { observed_right = true; break; }
+                }
+                if (observed_left && observed_right) {
+                    row.coverage = BlockCoverage::BridgedBypass;
+                } else {
+                    row.coverage = BlockCoverage::Uncovered;
+                    row.uncovered_on_left = !observed_left;
+                }
+            }
+            report.non_traversing_coverage.push_back(std::move(row));
+        }
+    }
+
     for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
         PanelTemplateInput out;
         out.name = graph.paths[pi].name;
@@ -507,6 +542,16 @@ LocusInputResult build_locus_input(
         result.authoritative.push_back(std::move(authoritative));
     }
     return result;
+}
+
+const char* block_coverage_label(BlockCoverage coverage, bool uncovered_on_left) {
+    switch (coverage) {
+        case BlockCoverage::Traversing: return "traversing";
+        case BlockCoverage::EmptyInterior: return "empty_between_boundaries";
+        case BlockCoverage::BridgedBypass: return "bridged_bypass";
+        case BlockCoverage::Uncovered: return uncovered_on_left ? "uncovered_left" : "uncovered_right";
+    }
+    return "unknown";
 }
 
 void require_representation_independent(const LocusInputReport& report) {

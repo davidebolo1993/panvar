@@ -41,6 +41,29 @@ struct LocusBlockReport {
     bool representation_dependent = false;
 };
 
+// How one template covers one block. This replaces a boolean `traverses`, which conflated two states
+// that are not alike: a template that walks PAST a block still has the block's neighbours on either
+// side and has genuinely deleted the region, while a template whose path ENDS before the block never
+// observed it at all. Both spell zero bases, so the second silently drops the bases the path does
+// carry there, and the blocks stop tiling the haplotype.
+enum class BlockCoverage {
+    Traversing,      // walks the block and spells its allele
+    EmptyInterior,   // walks both boundaries with nothing strictly between them
+    BridgedBypass,   // does not walk it, but is observed on BOTH sides: an admissible deletion
+    Uncovered,       // does not walk it and is not observed on one side: absent coverage, not a deletion
+};
+
+struct TemplateBlockCoverage {
+    std::string template_name;
+    std::string block_id;
+    BlockCoverage coverage = BlockCoverage::Traversing;
+    // Meaningful for Uncovered only: the side the template has no observation on.
+    bool uncovered_on_left = false;
+};
+
+// "uncovered_left" / "uncovered_right" for Uncovered, the classification name otherwise.
+const char* block_coverage_label(BlockCoverage coverage, bool uncovered_on_left);
+
 struct LocusInputReport {
     std::size_t variant_blocks = 0;
     std::size_t context_blocks = 0;
@@ -62,6 +85,10 @@ struct LocusInputReport {
     // how many bytes sit in it and in both neighbours.
     std::vector<std::string> representation_dependent_blocks;
     std::vector<LocusBlockReport> blocks;
+    // Every (template, block) pair the template does not simply traverse, in chain order. Only the
+    // non-traversing pairs are kept: they are the interesting ones and the full cross product is
+    // templates x blocks. Reporting only -- no allele, refusal or fingerprint depends on it.
+    std::vector<TemplateBlockCoverage> non_traversing_coverage;
 };
 
 struct LocusInputResult {

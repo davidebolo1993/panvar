@@ -4,6 +4,119 @@ Companion to `genotype_mosaic.md`, which remains the authoritative contract. Thi
 what is actually built, what its own gates still owe, and the work order to reach the Phase 8
 go/no-go.
 
+## R10. Review round 10 — the coverage audit: "bypass" is not one state
+
+The reviewer accepted the cyp2d6 diagnosis — NA18989 is not a malformed GFA path but a partial whole-locus
+template — and ruled that the caller must not read missing locus coverage as a zero-length deletion allele. The
+ordered work is: run and freeze a per-block, per-template coverage audit first, then implement coverage-aware
+frame classification as a separate commit. This section is the frozen audit. **No model behaviour changed:** the
+same alleles, the same refusals, the same fingerprints, 19/19 enabled tests.
+
+### R10.1 What the cyp2d6 round trip was reporting
+
+One template of 127 fails, and it fails as a pure truncation: `NA18989#1#haplotype1-0000031`, reverse-oriented,
+spells 205,236 bytes against an authoritative 207,214, and **every spelled byte is correct** — the chain simply
+stops 1,978 short. Three independent observations pin it:
+
+- The graph is complete. Every one of the 127 paths spells exactly its own coordinate span (node-length sum
+  equals the span in the path name, checked from the GFA alone). The authoritative side of the round trip is
+  itself spelled from the graph's path steps, so both sides come from the same GFA: the loss is entirely ours.
+- NA18989's path spans nodes 205–5763; the other 126 span 1–5763. Its last 29 steps, nodes 246 down to 205,
+  total **exactly 1,978 bp** — the whole shortfall, contiguous, ending on a step boundary.
+- Its first three blocks — `ctx:0`, `sv:1`, `ctx:2` — spell nothing from a walk. They are recorded as bypasses.
+
+`walk_block` cannot find a boundary node the path never visits, its primitives return `nullopt`, `traverses` is
+false, and the block becomes a **bypass** — which spells zero bases. But this template did not delete that
+region; its path ends there. The bases it does carry belong to no block, the blocks stop tiling the haplotype,
+and the round trip catches it afterwards. The boolean `traverses` conflates *walks past* with *ends before*.
+
+Ruled out, each on evidence: contained-bubble removal (chain-level, would hit all 127; 126 pass), the divergence
+trim (length-conserving by construction, and it does not run on a block carrying a bypass), orientation handling
+(orientation was derived correctly as reverse), and a truncated panel path (the path is complete for its own
+interval). The condition is *short relative to the locus*, and nothing tested it: `frame_status` is `Partial`
+only when `template_orientation()` returns `nullopt`, which tests direction, never coverage.
+
+One detail reconciles two outputs that look contradictory. `ctx:2` spells 109 bases for NA18989 although it is
+uncovered: those bases were appended by `sv:3`'s divergence trim, which moves each variant block's common flanks
+into its neighbours for every allele. The trim only runs on a block no template bypasses, so every template
+genuinely has the bases it moves — including this one, which does traverse `sv:3`. The uncovered run therefore
+spans three blocks, not two.
+
+### R10.2 The classification
+
+`traverses` is replaced, for reporting, by an explicit state per (template, block):
+
+| State | Meaning |
+|---|---|
+| `traversing` | walks the block and spells its allele |
+| `empty_between_boundaries` | walks both boundaries with nothing strictly between them |
+| `bridged_bypass` | does not walk it, but is observed on **both** sides: an admissible deletion |
+| `uncovered_left` / `uncovered_right` | does not walk it and is unobserved on one side: absent coverage |
+
+The rule is the reviewer's: a missing block is a deletion only when the path demonstrably brackets it. This
+commit only records the classification; it emits no refusal and changes no allele.
+
+### R10.3 The frozen audit — every locus, every block
+
+| Locus | Templates | Blocks | Uncovered templates | Bridged bypass | Templates with an empty allele | Representation-dependent |
+|---|---|---|---|---|---|---|
+| c4 | 131 | 11 | 0 | 0 | 0 | none |
+| cyp2d6 | 127 | 19 | **1** | 0 | 0 | `ctx:0, sv:1, ctx:2` |
+| acot | 467 | 19 | 0 | 0 | 0 | none |
+| gstm1 | 466 | 20 | 0 | 0 | 179 | none |
+| ankrd36c | 465 | 21 | 0 | 0 | 0 | none |
+| myom2 | 322 framed, 63 refused | 81 | **321** | 0 | 286 | `ctx:78, sv:79, ctx:80` |
+
+Per-block detail where anything is not traversing:
+
+| Locus | Block | Kind | Traversing | Empty | Bridged | Uncovered left | Uncovered right |
+|---|---|---|---|---|---|---|---|
+| cyp2d6 | `ctx:0` | context | 126 | 0 | 0 | **1** | 0 |
+| cyp2d6 | `sv:1` | variant | 126 | 0 | 0 | **1** | 0 |
+| cyp2d6 | `ctx:2` | context | 126 | 0 | 0 | **1** | 0 |
+| gstm1 | `ctx:11` | context | 287 | 179 | 0 | 0 | 0 |
+| myom2 | `ctx:17` | context | 219 | 103 | 0 | 0 | 0 |
+| myom2 | `ctx:46` | context | 50 | 272 | 0 | 0 | 0 |
+| myom2 | `ctx:78` | context | 9 | 0 | 0 | 0 | **313** |
+| myom2 | `sv:79` | variant | 1 | 0 | 0 | 0 | **321** |
+| myom2 | `ctx:80` | context | 1 | 0 | 0 | 0 | **321** |
+
+### R10.4 What the audit establishes
+
+**cyp2d6 is one template.** NA18989 is the only non-traversing template at the locus, and there is no
+`bridged_bypass` — no CYP2D6\*5-like deletion template in this panel. Both failures, the round trip and the three
+representation-dependent blocks, have the same single cause. The locus reduces to one explicit partial-template
+curation decision, and the reviewer's first branch applies.
+
+**myom2 is the same defect at the other terminal, at panel scale.** Its trailing anchor is reachable by almost
+nothing: `sv:79` and `ctx:80` are traversed by **1** of 322 framed templates, `ctx:78` by 9. 321 framed templates
+are `uncovered_right`. Under the coverage rule those become Partial, and with the 63 already refused for
+orientation that leaves **1 usable template of 385**. So myom2 is not a 63-template curation question: its block
+chain extends past where essentially every assembly's path ends, which is a locus-boundary problem upstream of
+the genotyper.
+
+**No panel exercises `bridged_bypass`.** Across all six loci, zero. The branch the bypass state was written to
+protect does not occur in this data, while the state that does occur — uncovered terminal coverage — is silently
+folded into it. That is what made both failures invisible until the round trip.
+
+**The empty allele is real and must stay distinct.** gstm1 has 179 templates with an empty allele at `ctx:11`,
+myom2 286 across `ctx:17` and `ctx:46`. These templates walk both boundaries and find nothing between them; they
+are not bypasses and must not be refused.
+
+### R10.5 Next
+
+The behavioural commit follows separately: `Uncovered` makes the whole template's frame Partial, it emits no
+allele and contributes no bypass count or representation-dependence flag, the refusal is specific
+(`locus_coverage_partial`, naming the missing terminal span), and the byte-for-byte round trip stays as an
+independent backstop. Fixtures owed: a forward path ending before the first bubble; the reverse case; a path
+missing the trailing end; a genuine bracketed internal deletion, which must stay valid; a traversing empty
+allele; a mutation restoring uncovered to bypass, which must fail; and the real cyp2d6 check — NA18989 turns
+Partial, its 1,978 missing bases are reported, it contributes no alleles.
+
+This will not make cyp2d6 runnable: a partial template still fails model construction closed, which is correct.
+No template is to be dropped silently; any curated-panel experiment records the excluded template and does not
+evaluate that donor as a leave-one-out truth.
+
 ## R9. Review round 9 — harness cleanup, and what the other loci cost
 
 The reviewer accepted round 8, closed the C4 leave-zero-out milestone, and set a sequence: fix four harness

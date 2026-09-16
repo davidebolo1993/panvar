@@ -1344,6 +1344,148 @@ int compare(const Args& args) {
 // haplotypes (twelve runs, residuals under 3.8 s). One locus cannot separate the per-haplotype mass term from
 // the per-candidate-pair term, so the estimate is bracketed: the low end attributes C4's slope entirely to the
 // pair term, the high end entirely to the haplotype-mass term. Neither is a measurement of this locus.
+// Every panel template respelled from the chain and compared against the graph's own path bytes, without
+// stopping at the first disagreement. The round-trip gate throws on one template and says nothing about the
+// rest or about where the bases went; this reports the shape of every failure: which end, how much, and
+// whether the prefix agrees byte for byte (sequence lost from the tiling) or diverges inside (a wrong walk).
+int respell(const Args& args) {
+    const std::string reference = args.required("reference");
+    const std::size_t min_variant_bp = std::stoul(args.get("min-variant-bp", "50"));
+    const std::string stage =
+        (std::filesystem::temp_directory_path() / ("genotype_probe_respell_" + std::to_string(::getpid()) + ".sorted.gfa")).string();
+    LoadedModel loaded = load_model(args.required("gfa"), reference, stage, min_variant_bp);
+    std::filesystem::remove(stage);
+
+    const panvar::PreparedGenotypeModel& model = *loaded.model;
+    const panvar::PanelAlleleMatrix& panel = model.panel();
+    std::map<std::string, const std::string*> authoritative_by_name;
+    for (const panvar::AuthoritativePanelSequence& sequence : loaded.built.authoritative) {
+        authoritative_by_name.emplace(sequence.template_name, &sequence.source_frame_bases);
+    }
+
+    std::ostringstream out;
+    out << "template\torientation\tspelled_bp\tauthoritative_bp\tdelta\tfirst_diff_source\tshape\n";
+    std::size_t failing = 0;
+    std::size_t first_failing = panel.template_count();
+    for (std::size_t t = 0; t < panel.template_count(); ++t) {
+        const std::string& name = panel.template_names[t];
+        const auto found = authoritative_by_name.find(name);
+        if (found == authoritative_by_name.end()) continue;
+        const panvar::HaplotypeSequence spelled = panvar::spell_panel_template(model, t);
+        const panvar::ChainOrientation orientation = model.template_source_orientations()[t];
+        const std::string source_frame = panvar::sequence_in_source_frame(spelled.bases, orientation);
+        const std::string& authoritative = *found->second;
+        if (source_frame == authoritative) continue;
+        if (first_failing == panel.template_count()) first_failing = t;
+        ++failing;
+
+        const std::size_t common = std::min(source_frame.size(), authoritative.size());
+        std::size_t at = 0;
+        while (at < common && source_frame[at] == authoritative[at]) ++at;
+        // A pure truncation means every spelled byte is right and the chain simply stops: bases the blocks
+        // never claimed. An internal difference means a block walked somewhere the path did not.
+        const std::string shape = at == common
+            ? (source_frame.size() < authoritative.size() ? "truncated_in_source_frame"
+                                                          : "overlong_in_source_frame")
+            : "internal_difference";
+        out << name << '\t'
+            << (orientation == panvar::ChainOrientation::Forward ? "forward" : "reverse") << '\t'
+            << source_frame.size() << '\t' << authoritative.size() << '\t'
+            << static_cast<long long>(source_frame.size()) - static_cast<long long>(authoritative.size())
+            << '\t' << at << '\t' << shape << '\n';
+    }
+    out << "#templates\t" << panel.template_count() << "\n#failing\t" << failing << '\n';
+
+    // The per-block breakdown of one failure. In chain frame a reverse template's source-frame tail is its
+    // head, so naming the chain block that abuts the loss is what points at the primitive responsible.
+    if (first_failing < panel.template_count()) {
+        const panvar::HaplotypeSequence spelled = panvar::spell_panel_template(model, first_failing);
+        out << "#blocks_of\t" << panel.template_names[first_failing] << '\n'
+            << "block\tkind\tbp\tchain_begin\tchain_end\n";
+        for (std::size_t bi = 0; bi < model.blocks().size(); ++bi) {
+            const panvar::SequenceInterval interval = spelled.block_intervals[bi];
+            out << model.blocks()[bi].block_id << '\t'
+                << (model.blocks()[bi].kind == panvar::GenotypeBlockKind::Variant ? "variant" : "context")
+                << '\t' << interval.size() << '\t' << interval.begin << '\t' << interval.end << '\n';
+        }
+    }
+
+    std::cout << out.str();
+    if (!args.get("out", "").empty()) {
+        std::ofstream file(args.get("out", ""));
+        file << out.str();
+    }
+    return 0;
+}
+
+// Per (block, template) coverage audit. Built from the locus input alone, never from a prepared
+// model, so a locus whose model is refused is still auditable. "Bypass" is not one state: this
+// separates a bracketed deletion from absent coverage at a terminal anchor.
+int coverage_audit(const Args& args) {
+    const std::string reference = args.required("reference");
+    const std::size_t min_variant_bp = std::stoul(args.get("min-variant-bp", "50"));
+    const std::string stage =
+        (std::filesystem::temp_directory_path() / ("genotype_probe_coverage_" + std::to_string(::getpid()) + ".sorted.gfa")).string();
+    const SortedGraph sorted = load_sorted(args.required("gfa"), reference, stage);
+    std::filesystem::remove(stage);
+
+    panvar::BubbleCallOptions bubble_options;
+    bubble_options.reference_path = sorted.resolved;
+    bubble_options.quiet = true;
+    bubble_options.min_variant_bp = min_variant_bp;
+    bubble_options.snarl_pairs_override =
+        panvar::find_top_level_snarls_cactus(panvar::snarl_input_from_model(sorted.gfa));
+    bubble_options.snarl_source_supplied = true;
+    panvar::LocusInputOptions locus_options;
+    locus_options.locus_id = sorted.resolved;
+    locus_options.reference_path_name = sorted.resolved;
+    const panvar::LocusInputResult built = panvar::build_locus_input(
+        sorted.graph, panvar::call_bubbles(sorted.graph, bubble_options), locus_options);
+    const panvar::LocusInputReport& report = built.report;
+    const std::size_t framed = report.forward_templates + report.reverse_templates;
+
+    std::map<std::string, std::map<std::string, std::size_t>> by_block;
+    std::ostringstream out;
+    out << "block\ttemplate\tclassification\n";
+    for (const panvar::TemplateBlockCoverage& row : report.non_traversing_coverage) {
+        const char* label = panvar::block_coverage_label(row.coverage, row.uncovered_on_left);
+        out << row.block_id << '\t' << row.template_name << '\t' << label << '\n';
+        ++by_block[row.block_id][label];
+    }
+
+    out << "#block\tkind\ttraversing\tempty_between_boundaries\tbridged_bypass\tuncovered_left\tuncovered_right\n";
+    for (const panvar::LocusBlockReport& block : report.blocks) {
+        const auto found = by_block.find(block.block_id);
+        const auto count = [&](const char* label) -> std::size_t {
+            if (found == by_block.end()) return 0;
+            const auto at = found->second.find(label);
+            return at == found->second.end() ? 0 : at->second;
+        };
+        const std::size_t empty = count("empty_between_boundaries");
+        const std::size_t bridged = count("bridged_bypass");
+        const std::size_t left = count("uncovered_left");
+        const std::size_t right = count("uncovered_right");
+        out << block.block_id << '\t'
+            << (block.kind == panvar::GenotypeBlockKind::Variant ? "variant" : "context") << '\t'
+            << framed - empty - bridged - left - right << '\t' << empty << '\t' << bridged << '\t'
+            << left << '\t' << right << '\n';
+    }
+    out << "#templates_framed\t" << framed << "\n#templates_refused\t" << report.refused_templates.size()
+        << "\n#blocks\t" << report.blocks.size() << "\n#representation_dependent_blocks\t";
+    for (std::size_t i = 0; i < report.representation_dependent_blocks.size(); ++i) {
+        out << (i ? "," : "") << report.representation_dependent_blocks[i];
+    }
+    if (report.representation_dependent_blocks.empty()) out << "none";
+    out << '\n';
+
+    std::cout << out.str();
+    if (!args.get("out", "").empty()) {
+        std::ofstream file(args.get("out", ""));
+        file << out.str();
+    }
+    return 0;
+}
+
 int preflight(const Args& args) {
     const std::string reference = args.required("reference");
     const double depth = std::stod(args.get("depth", "30"));
@@ -1728,6 +1870,8 @@ int main(int argc, char** argv) {
         if (command == "anchors") return anchors(args);
         if (command == "subsample") return subsample(args);
         if (command == "preflight") return preflight(args);
+        if (command == "respell") return respell(args);
+        if (command == "coverage-audit") return coverage_audit(args);
         std::cerr << "unknown probe command: " << command << '\n';
         return 2;
     } catch (const std::exception& error) {
