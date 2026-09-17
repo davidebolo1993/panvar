@@ -227,10 +227,11 @@ struct CandidateSetReport {
     // falls back to one worker for full-origin recording even when more were asked for.
     std::size_t threads_used_placement = 1;
     std::uint64_t candidate_fragment_evaluations = 0;
-    // Work actually performed when a cap refused the run. Without it a refusal reports nothing, and a
-    // breaker that stopped at the cap is indistinguishable from one that stopped long past it.
-    FragmentScoringCounters observed_counters;
-    bool observed_counters_valid = false;
+    // Work actually performed when a cap refused the run: counters, the workers that ran, and the
+    // phase timings up to the refusal. Without it a refusal reports nothing, and a breaker that
+    // stopped at the cap is indistinguishable from one that stopped long past it.
+    FragmentScoringObservation observed;
+    bool observed_valid = false;
     // True when no beam ran at all: K = 0, no phase audit and no positive development prefix, so the
     // candidate set is exactly the panel and nothing about it is conditional on a search. Reported as
     // candidate_scope PANEL_ONLY, which is neither COMPLETE nor CONDITIONAL -- both of those describe
@@ -326,6 +327,9 @@ void write_status(
         out << "templates_refused\t" << model_report->refused_templates.size() << '\n';
         // A curated panel must announce itself. Without these a run on a curated panel and a run on the
         // whole panel differ only in the fingerprint, which says they differ but not how.
+        out << "panel_curation_manifest\t"
+            << (options.curation_manifest_path.empty() ? "none" : options.curation_manifest_path)
+            << '\n';
         out << "templates_curated_out\t" << model_report->curated_exclusions.size() << '\n';
         out << "curation_digest\t"
             << (model_report->curation_digest.empty() ? "none" : model_report->curation_digest) << '\n';
@@ -396,12 +400,17 @@ void write_status(
         out << "haploid_prior_evaluations\t" << candidate_set->haploid_prior_evaluations << '\n';
         out << "diploid_prior_lookups\t" << candidate_set->diploid_prior_lookups << '\n';
         out << "candidate_fragment_evaluations\t" << candidate_set->candidate_fragment_evaluations << '\n';
-        if (candidate_set->observed_counters_valid) {
+        if (candidate_set->observed_valid) {
             // A refused run reports the work it performed, so the breaker can be held to a bound rather
-            // than merely to a verdict.
-            out << "observed_piece_hits\t" << candidate_set->observed_counters.piece_hits << '\n';
-            out << "observed_physical_origins\t" << candidate_set->observed_counters.physical_origins
+            // than merely to a verdict -- and the workers and phase timings with it, so the refusal can
+            // be diagnosed rather than only believed.
+            out << "observed_piece_hits\t" << candidate_set->observed.counters.piece_hits << '\n';
+            out << "observed_physical_origins\t" << candidate_set->observed.counters.physical_origins
                 << '\n';
+            out << "observed_threads_used_placement\t" << candidate_set->observed.threads_used_placement
+                << '\n';
+            out << "observed_threads_used_combination\t"
+                << candidate_set->observed.threads_used_combination << '\n';
         }
         // Derived once, here, and used verbatim by every block row.
         out << "candidate_scope\t"
@@ -846,7 +855,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     if (any_ranked) {
         try {
             scored = score_diplotypes(interned, scored_pairs, fragments, library, scoring_options,
-                                      &candidate_report.observed_counters);
+                                      &candidate_report.observed);
             timings.rescoring_fragment_preparation = scored.seconds_fragment_preparation;
             timings.rescoring_placement_and_mass = scored.seconds_placement_and_mass;
             timings.rescoring_diploid_combination = scored.seconds_diploid_combination;
@@ -855,7 +864,21 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             candidate_report.candidate_fragment_evaluations = scored.candidate_fragment_evaluations;
         } catch (const ResourceExhausted& error) {
             rescore_failure = error.what();
-            candidate_report.observed_counters_valid = true;
+            candidate_report.observed_valid = true;
+            // The phases that did run, up to the refusal. Without these a refused run reports its
+            // whole duration under seconds_rescoring and 0.000 for each of the three parts, which is
+            // precisely the breakdown a refusal needs.
+            timings.rescoring_fragment_preparation =
+                candidate_report.observed.seconds_fragment_preparation;
+            timings.rescoring_placement_and_mass = candidate_report.observed.seconds_placement_and_mass;
+            timings.rescoring_diploid_combination =
+                candidate_report.observed.seconds_diploid_combination;
+            // And the worker counts, so one status file does not report 1 here and 2 under observed_.
+            // Two authoritative-looking answers to the same question are worse than the understatement
+            // they replaced: a reader can take either, and nothing in the file says which is right.
+            candidate_report.threads_used_placement = candidate_report.observed.threads_used_placement;
+            candidate_report.threads_used_combination =
+                candidate_report.observed.threads_used_combination;
         }
     }
     timings.rescoring = seconds_since(mark);
@@ -1343,6 +1366,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
         else if (flag == "--out-prefix" || flag == "-o") options.out_prefix = need(i);
         else if (flag == "--library") options.library_path = need(i);
         else if (flag == "--threads") options.threads = std::stoul(need(i));   // workers for diploid combination
+        else if (flag == "--panel-curation") options.curation_manifest_path = need(i);
         else if (flag == "--max-mosaic-candidates") options.max_mosaic_candidates = std::stoul(need(i));
         else if (flag == "--max-candidates") {
             throw std::runtime_error("--max-candidates is now --max-mosaic-candidates: every panel diplotype is "
@@ -1355,7 +1379,7 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 "  panvar genotype --gfa <graph.gfa> --reference-path <name> \\\n"
                 "                  --reads1 <r1.fq> --reads2 <r2.fq> --library <params.txt> \\\n"
                 "                  [--bubbles <bubbles.csv>] [--out-prefix <prefix>] \\\n"
-                "                  [--max-mosaic-candidates <K>]\n\n"
+                "                  [--max-mosaic-candidates <K>] [--panel-curation <manifest.tsv>]\n\n"
                 "Calls a pair of whole-locus mosaic haplotypes and projects them to one allele\n"
                 "pair per SV block. Paired reads only.\n\n"
                 "Every unordered pair of panel haplotypes is always a candidate. --max-mosaic-candidates\n"
@@ -1366,6 +1390,13 @@ int run_genotype_command(const std::vector<std::string>& args) {
                 ".mosaic_status.tsv and .mosaic_haplotypes.fa. An incomplete run emits its\n"
                 "diagnostics and says so in the status file; it never presents a partial ranking\n"
                 "as a result.\n\n"
+                "--panel-curation takes a manifest of panel templates to exclude: one template name\n"
+                "per line, '#' opening a comment line. Curation is the only sanctioned way a template\n"
+                "leaves the panel -- a partial chain frame still refuses the model outright -- and it\n"
+                "is recorded rather than silent: the status names each excluded template with the\n"
+                "reason it would otherwise have carried, the manifest path, and a digest of the\n"
+                "decision, and the model fingerprint changes because the panel did. A manifest naming\n"
+                "a template the graph does not have is refused, not ignored.\n\n"
                 "--library declares insert_mean_bp, insert_sd_bp, support_sigmas,\n"
                 "substitution_error, outlier_weight and fragment_start_intensity, one per line,\n"
                 "and optionally marker_background (estimated from invariant anchors when absent).\n"

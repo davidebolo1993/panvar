@@ -4,6 +4,106 @@ Companion to `genotype_mosaic.md`, which remains the authoritative contract. Thi
 what is actually built, what its own gates still owe, and the work order to reach the Phase 8
 go/no-go.
 
+## R14. Review round 14 — making round 13's results reproducible, and measuring before optimising
+
+Round 13 was accepted as trustworthy evidence, with four rulings: the ACOT 30x refusal is valid, the cyp2d6
+curation makes the model structurally buildable, the global cap must NOT simply be raised, and cyp2d6 is not yet
+a production or accuracy result. The ordered batch below follows from that.
+
+### R14.1 A refused run now reports who ran and where the time went
+
+The 30x ACOT refusal reported `threads_used_placement 1` while its own CPU time -- 215.91 s against 114.11 s of
+wall clock -- proved it had used two, and attributed its whole 102 s to no phase at all. Both fields were left at
+their success-path defaults because the result object carrying them is discarded when the scorer throws.
+
+`score_diplotypes` now fills a `FragmentScoringObservation` on refusal: counters, the workers that actually ran,
+and the phase timings as they stood. Measured on the same ACOT 30x input, before and after:
+
+| field | before | after |
+|---|---|---|
+| `seconds_rescoring_fragment_preparation` | 0.000 | 0.176 |
+| `seconds_rescoring_placement_and_mass` | 0.000 | **101.118** |
+| `seconds_rescoring_diploid_combination` | 0.000 | 0.000 (never ran) |
+| `observed_threads_used_placement` | absent | **2** |
+| `observed_threads_used_combination` | absent | 0 |
+
+The parts now account for the whole: 0.176 + 101.118 = 101.294 against `seconds_rescoring` 101.296.
+
+**Reading that output found a second defect, introduced by the first fix.** The refused run reported the legacy
+`threads_used_placement 1` *beside* the new `observed_threads_used_placement 2` -- one file asserting two values
+for the same quantity, both looking authoritative. That is worse than the understatement it replaced, because a
+reader can take either and nothing says which is right. The success-path fields are now filled from the
+observation on a refusal too, so the file says one thing.
+
+`threads_used_combination` is reported as **0** on a placement refusal rather than defaulting to 1: claiming a
+worker for a phase that never ran is the whole class of defect here. The deep-cap fixtures now assert all of it
+-- that a parallel refusal reports more than one placement worker, that it never reports the serial default, and
+that combination reports zero -- so this cannot regress unnoticed, which is how it survived round 12 in the first
+place.
+
+### R14.2 Curation is reproducible through the production CLI
+
+Round 13's curated cyp2d6 run used the production algorithm but could not be reproduced through the production
+CLI: `--panel-curation` existed only on the developer probe. `panvar genotype --panel-curation <manifest.tsv>` now
+exists, with help text, and the probe's flag was renamed to match so there is one name for one thing. The status
+records `panel_curation_manifest` beside the digest and the per-template exclusion records, so a curated run
+carries its own provenance rather than depending on how it happened to be invoked.
+
+### R14.3 The curation contract is gated where the code lives
+
+`test_locus_coverage_partial` in the adapter tests already built partial-template fixtures; it now curates its
+uncovered template and asserts the whole contract: the template disappears from the panel, is recorded exactly
+once as curated and **not** as refused, keeps its `locus_coverage_partial` reason and which terminal anchor it
+missed, carries a digest, lets the remaining model build where the uncurated panel refuses, and that a manifest
+naming an absent template refuses and names it.
+
+The "no allele came from it" check is written as an **equivalence**: a curated panel must produce the same allele
+census as one the template never entered. The obvious form -- searching the census for the template name -- would
+have passed no matter what curation did, because allele source ids are block-local identifiers and never template
+names. External cyp2d6 is no longer the only gate for this path.
+
+### R14.4 HG00097 is frozen as an ACOT development donor
+
+Round 13 recorded that ACOT had no donor-role manifest and that HG00097 was chosen by prior use. That is now
+frozen in `tests/genotype_acot_development_donors.tsv`: pool 232 samples with both haplotypes in the ACOT graph,
+HG00097 `development`, selection `prior-use`, first used by the round-11 2x pilot. It is explicitly **not** the
+hashed draw the C4 manifest documents, and the file says so, so it cannot later be mistaken for one or presented
+as held-out validation.
+
+### R14.5 Curated cyp2d6 against HG00096 truth: 19 of 19 blocks exact
+
+`evaluate` rebuilds the model and requires it to reproduce the run's fingerprint, so a curated run could not be
+evaluated at all until `--panel-curation` reached it: an uncurated rebuild produces a different fingerprint and
+refuses. Curation applies to the **model** graph only -- truth loads separately and keeps every path, including
+the curated one, so the donor is evaluated against full truth rather than a curated view of it.
+
+All 19 blocks (9 SV, 10 context) are exact: `unordered_distance 0` at every block, `blocks_exact 19`, both truth
+alleles available at every block, every block `genotype_support READS`, and the donor's two truth rows reproduce
+their model rows exactly -- which is the check that the projection frame is the model frame.
+
+**This is unordered genotype accuracy, not phased accuracy.** `phase_support` is `UNRESOLVED`, as expected for a
+K = 0 panel-only run with no audit: a set with no off-panel rival and no audit cannot speak to phase. The nine
+SV block genotypes are exactly right; nothing here claims which haplotype carries which.
+
+### R14.6 The unique-form measurement, before any optimisation
+
+Deduplicating oriented read forms was to be measured before being built. The read-derived half, on the nested
+ACOT series:
+
+| coverage | fragments | oriented forms | unique forms | collapse | identical read pairs |
+|---|---|---|---|---|---|
+| 2x | 2,734 | 10,936 | 10,852 | 0.8% | 0 |
+| 10x | 13,230 | 52,920 | 51,034 | 3.6% | 0 |
+| 30x | 39,999 | 159,996 | 144,362 | **9.8%** | 4 |
+
+Collapse grows with depth, as it must -- more reads from one locus means more repeated 100-mers -- but at 30x it
+is 9.8%, well under the 20% bar set for implementing the cache. **This does not settle the question.** It counts
+FORMS, and the quantity that matters is PIECE HITS: duplicate forms are plausibly the repetitive ones that
+contribute disproportionately many hits, so the weighted saving could be larger or smaller than 9.8%. The exact
+prediction is `sum over codes of occurrences[code] x entries[code]` before and after collapse, which needs a
+diagnostic export because `PieceIndex` is internal to the scorer. That measurement is outstanding, and no
+conclusion about deduplication should be drawn from the table above alone.
+
 ## R13. Review round 13 — the coverage ceiling, and a curated panel
 
 Round 12 was accepted, with the exact-atomic comparison reclassified as optional performance work. The ordered

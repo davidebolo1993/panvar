@@ -297,17 +297,34 @@ struct FragmentScoringResult {
 
 // Scores exactly the requested candidates and nothing else. The raw score of a candidate does not
 // depend on which other candidates were requested, on their order, or on any proposal score.
-// `observed_on_failure`, when given, receives the counters as they stood when a cap was reached, so a
-// refused run can report the work it actually performed rather than nothing at all. Without it a
-// refusal is unfalsifiable: there is no way to tell a breaker that stopped at the cap from one that
-// stopped long after it.
+// What a refused run actually did, as it stood when a cap was reached. A refusal that reports nothing
+// is unfalsifiable -- a breaker that stopped at its cap cannot be told from one that stopped long past
+// it -- and reporting only counters loses the rest: which workers ran, and where the time went. Both
+// were previously left at their success-path defaults on a refusal, so a refused run claimed one
+// placement thread however many it used, and attributed its whole duration to no phase at all.
+struct FragmentScoringObservation {
+    FragmentScoringCounters counters;
+    // Workers that actually ran placement, not the number requested.
+    std::size_t threads_used_placement = 1;
+    // Zero when the phase never ran, which is the usual case for a placement refusal. Deliberately not
+    // defaulted to one: claiming a worker for a phase that did not happen is the defect this replaces.
+    std::size_t threads_used_combination = 0;
+    // The phases up to the refusal. Preparation is complete by then, placement is however far it got,
+    // and combination has usually not started.
+    double seconds_fragment_preparation = 0.0;
+    double seconds_placement_and_mass = 0.0;
+    double seconds_diploid_combination = 0.0;
+};
+
+// `observed_on_failure`, when given, receives the work performed when a cap was reached, so a refused
+// run can report what it actually did rather than nothing at all.
 FragmentScoringResult score_diplotypes(
     const InternedHaplotypes& haplotypes,
     const std::vector<HaplotypeCandidate>& candidates,
     const std::vector<ReadPair>& fragments,
     const LibraryModel& library,
     const FragmentScoringOptions& options,
-    FragmentScoringCounters* observed_on_failure = nullptr);
+    FragmentScoringObservation* observed_on_failure = nullptr);
 
 // ---------------------------------------------------------------------------------------------
 // Certification.

@@ -615,7 +615,8 @@ void test_locus_coverage_partial() {
         std::vector<std::string> nodes;
         bool reverse = false;
     };
-    const auto build = [&](const std::vector<FixtureTemplate>& templates, const std::string& tag) {
+    const auto build = [&](const std::vector<FixtureTemplate>& templates, const std::string& tag,
+                           const std::vector<std::string>& curated = {}) {
         const std::string file =
             (std::filesystem::temp_directory_path() / ("genotype_coverage_" + tag + ".gfa")).string();
         {
@@ -655,6 +656,7 @@ void test_locus_coverage_partial() {
         panvar::LocusInputOptions options;
         options.locus_id = "coverage-fixture";
         options.reference_path_name = "A#1#x";
+        options.excluded_templates = curated;
         panvar::LocusInputResult built = panvar::build_locus_input(graph, bubbles, options);
         std::filesystem::remove(file);
         return built;
@@ -723,6 +725,62 @@ void test_locus_coverage_partial() {
     require(uncovered_of(right_gap, "F#1#x").uncovered_blocks ==
                 std::vector<std::string>({"ctx:4", "sv:5", "ctx:6"}),
             "the uncovered trailing blocks must be named exactly");
+
+    // 3b. Curating the uncovered template away. Round 13 shipped this path with external cyp2d6 as its
+    //     only gate -- a whole pipeline away from the adapter that implements it, and unavailable to
+    //     anyone without that graph. The contract belongs here, where the code is.
+    const panvar::LocusInputResult curated = build(
+        {{"A#1#x", full_a, false}, {"B#1#x", full_b, false}, {"F#1#x", no_right_terminal, false}},
+        "curated", {"F#1#x"});
+
+    // It disappears from the panel.
+    require(curated.input.templates.size() == 2, "a curated panel keeps exactly the other templates");
+    for (const auto& item : curated.input.templates) {
+        require(item.name != "F#1#x", "a curated template must not remain a panel template");
+    }
+
+    // It is recorded once, as curated and NOT as refused. Both headings would say the panel lost two
+    // templates, and worse, that a partial frame reached a model that never saw it.
+    require(curated.report.curated_exclusions.size() == 1 &&
+                curated.report.curated_exclusions.front().template_name == "F#1#x",
+            "the curated template must be recorded exactly once, by name");
+    require(curated.report.refused_templates.empty(),
+            "a curated template must not also be counted refused: one template, one heading");
+    require(uncovered_of(curated, "F#1#x").name.empty(),
+            "a curated template must leave no partial-template report behind either");
+
+    // Its reason survives, so the record can be audited instead of trusted.
+    const std::string reason = curated.report.curated_exclusions.front().reason;
+    require(reason.find("locus_coverage_partial") != std::string::npos,
+            "the curated record must keep the locus_coverage_partial reason");
+    require(reason.find("right") != std::string::npos,
+            "the curated record must keep which terminal anchor the template failed to reach");
+    require(!curated.report.curation_digest.empty(), "a curated panel must carry a curation digest");
+
+    // The remaining model builds, where the same panel uncurated refuses.
+    require(refusal_message(right_gap.input).find("locus_coverage_partial") != std::string::npos,
+            "fixture: uncurated, this same panel must refuse");
+    require(refusal_message(curated.input).empty(),
+            "the curated panel must build where the uncurated one refused");
+
+    // No allele came from it. Checked as equivalence rather than by name -- allele source ids are
+    // block-local, not template names, so searching for the name would pass whatever curation did.
+    // A curated panel must be indistinguishable from one the template never entered.
+    const panvar::LocusInputResult absent =
+        build({{"A#1#x", full_a, false}, {"B#1#x", full_b, false}}, "absent");
+    require(allele_census(curated) == allele_census(absent),
+            "a curated panel must be identical to one where the template was never present");
+    require(curated.report.blocks.size() == absent.report.blocks.size(),
+            "curation must not change the block chain");
+
+    // A manifest that has drifted from its graph is refused, never quietly ignored.
+    bool drifted = false;
+    try {
+        build({{"A#1#x", full_a, false}, {"B#1#x", full_b, false}}, "drift", {"Z#1#x"});
+    } catch (const std::invalid_argument& error) {
+        drifted = std::string(error.what()).find("Z#1#x") != std::string::npos;
+    }
+    require(drifted, "curation naming a template the graph does not have must refuse, and name it");
 
     // 4. A genuine internal deletion, bracketed on both sides, stays a valid bypass. No real locus
     //    of the six exercises this, and the branch must survive anyway: future loci will.

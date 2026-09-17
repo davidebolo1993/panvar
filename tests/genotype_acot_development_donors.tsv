@@ -1,0 +1,19 @@
+# Frozen development-donor manifest for ACOT (tests/real_data/acot.gfa.gz).
+#
+# Pool: every sample with both haplotypes present in the ACOT graph -- 232 samples.
+#
+# This manifest exists because round 13 discovered ACOT had none. The C4 manifest
+# (tests/genotype_development_donors.tsv) is C4-only: its pool is the samples in c4.gfa.gz, it does not
+# contain HG00097, and nothing outside its own simulation.tsv recorded which donor the ACOT pilots had
+# been using. A donor that has been looked at repeatedly during development cannot later be presented
+# as held-out validation, so the fact is frozen here instead of being reconstructed later.
+#
+# HOW HG00097 WAS CHOSEN, precisely: it was not drawn. It is the donor the round-11 2x ACOT pilot used
+# and the round-13 2x/10x/30x coverage pilots reused, so its truth has already influenced development
+# decisions. Recording it as `development` with selection `prior-use` states that honestly. This is
+# NOT the hashed draw the C4 manifest documents, and it must not be described as one.
+#
+# Every other sample in the pool is held out and is not listed. Adding a donor here after its truth
+# has been examined is the failure this file prevents; adding one before is a decision to record.
+donor	role	selection	first_used
+HG00097	development	prior-use	round-11 2x ACOT pilot (tests/results/genotype_pilot_acot_2x_d24e471)

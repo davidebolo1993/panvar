@@ -148,8 +148,29 @@ struct LoadedModel {
     std::string fingerprint;
 };
 
+// Mirrors read_curation_manifest in src/genotype_command.cpp: one template name per line, '#' opening
+// a comment only when it OPENS the line, because template names contain '#' themselves. Duplicated
+// rather than exported because the production parser is internal to the command; the rule that matters
+// -- comments only at line start -- is gated on the production side by test_curated_panel. If the two
+// ever disagree, a run and its evaluation would disagree about which panel was scored.
+std::vector<std::string> read_panel_curation(const std::string& path) {
+    std::ifstream file(path);
+    if (!file) throw std::runtime_error("panel curation manifest could not be opened: " + path);
+    std::vector<std::string> names;
+    std::string line;
+    while (std::getline(file, line)) {
+        const std::size_t first = line.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos || line[first] == '#') continue;
+        const std::size_t last = line.find_last_not_of(" \t\r\n");
+        names.push_back(line.substr(first, last - first + 1));
+    }
+    if (names.empty()) throw std::runtime_error("panel curation manifest names no templates: " + path);
+    return names;
+}
+
 LoadedModel load_model(const std::string& gfa_path, const std::string& reference,
-                       const std::string& stage_path, std::size_t min_variant_bp) {
+                       const std::string& stage_path, std::size_t min_variant_bp,
+                       const std::vector<std::string>& curated = {}) {
     LoadedModel out;
     out.sorted = load_sorted(gfa_path, reference, stage_path);
     panvar::validate_graph_paths(out.sorted.graph, "genotype_probe", true, true);
@@ -164,6 +185,11 @@ LoadedModel load_model(const std::string& gfa_path, const std::string& reference
     panvar::LocusInputOptions locus_options;
     locus_options.locus_id = out.sorted.resolved;
     locus_options.reference_path_name = out.sorted.resolved;
+    // A curated run scored a curated model, so rebuilding it here without the same curation produces a
+    // different fingerprint and every fingerprint check downstream refuses. Curation belongs to the
+    // MODEL graph only -- truth is loaded separately and keeps every path, which is what lets a donor
+    // be evaluated against full truth rather than against a curated view of it.
+    locus_options.excluded_templates = curated;
     out.built = panvar::build_locus_input(out.sorted.graph, out.bubbles, locus_options);
     out.model.emplace(panvar::prepare_genotype_model(out.built.input));
     out.fingerprint = panvar::model_fingerprint(*out.model);
@@ -431,11 +457,19 @@ int evaluate(const Args& args) {
         summary << key << '\t' << (found == status.end() ? "NA" : found->second) << '\n';
     }
 
-    const LoadedModel loaded = load_model(args.required("model-gfa"), reference,
-                                          out + ".model.sorted.gfa", 50);
+    const std::string curation_path = args.get("panel-curation", "");
+    const LoadedModel loaded =
+        load_model(args.required("model-gfa"), reference, out + ".model.sorted.gfa", 50,
+                   curation_path.empty() ? std::vector<std::string>{}
+                                         : read_panel_curation(curation_path));
     if (status.count("model_fingerprint") == 0 || status.at("model_fingerprint") != loaded.fingerprint) {
-        throw std::runtime_error("the rebuilt model does not reproduce the run's model fingerprint");
+        throw std::runtime_error("the rebuilt model does not reproduce the run's model fingerprint" +
+                                 std::string(curation_path.empty()
+                                                 ? "; if the run was curated, pass the same "
+                                                   "--panel-curation manifest"
+                                                 : " even with the curation manifest given"));
     }
+    summary << "panel_curation\t" << (curation_path.empty() ? "none" : curation_path) << '\n';
     const panvar::PreparedGenotypeModel& model = *loaded.model;
 
     // Truth comes from the full graph. Sorting depends only on the reference path, so a node id names
@@ -1943,7 +1977,7 @@ int genotype(const Args& args) {
     options.threads = std::stoul(args.get("threads", "1"));
     // Optional curation manifest. The curated panel is a different model and says so: the status
     // records which templates left, why, and a digest of the decision, and the fingerprint changes.
-    options.curation_manifest_path = args.get("curation-manifest", "");
+    options.curation_manifest_path = args.get("panel-curation", "");
     for (const std::size_t k : parse_alleles(args.required("prefixes"))) {
         options.development_candidate_prefixes.push_back(k);
     }

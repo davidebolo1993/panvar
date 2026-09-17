@@ -550,7 +550,7 @@ FragmentScoringResult score_diplotypes(
     const std::vector<ReadPair>& fragments,
     const LibraryModel& library,
     const FragmentScoringOptions& options,
-    FragmentScoringCounters* observed_on_failure) {
+    FragmentScoringObservation* observed_on_failure) {
     validate_library_model(library);
     if (options.minimum_piece_bp == 0) {
         throw std::invalid_argument("minimum indexable piece length must be positive");
@@ -836,11 +836,21 @@ FragmentScoringResult score_diplotypes(
     // the worker path the other fields stay zero: they are per-range sums that were never merged.
     const auto note_observed_work = [&]() {
         if (observed_on_failure == nullptr) return;
-        *observed_on_failure = counters;
-        observed_on_failure->piece_hits =
+        observed_on_failure->counters = counters;
+        observed_on_failure->counters.piece_hits =
             std::max(counters.piece_hits, budget.piece_hits.load(std::memory_order_relaxed));
-        observed_on_failure->physical_origins = std::max(
+        observed_on_failure->counters.physical_origins = std::max(
             counters.physical_origins, budget.physical_origins.load(std::memory_order_relaxed));
+        // The workers that actually ran, and the phases as they stand at the refusal: preparation is
+        // complete, placement is however far it got, combination has not started. Reporting the
+        // placement elapsed rather than zero is the point -- a refused run's time is not
+        // unattributable, and it is exactly when knowing where the time went matters most.
+        observed_on_failure->threads_used_placement = placement_threads;
+        observed_on_failure->threads_used_combination = 0;
+        observed_on_failure->seconds_fragment_preparation = result.seconds_fragment_preparation;
+        observed_on_failure->seconds_placement_and_mass =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - placement_mark).count();
+        observed_on_failure->seconds_diploid_combination = 0.0;
     };
 
     if (placement_threads <= 1) {

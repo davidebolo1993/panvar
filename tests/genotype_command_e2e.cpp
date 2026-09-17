@@ -1453,6 +1453,23 @@ void test_resource_caps_are_thread_invariant() {
                             cap_names[which] + " at " + std::to_string(workers) +
                             " thread(s): " + std::to_string(observed) + " > " +
                             std::to_string(deep + workers * unit));
+
+                // A refusal must also report WHO ran, not only how much work was done. Both fields were
+                // previously left at their success-path defaults, so a refused run claimed a single
+                // placement thread however many it actually used -- which is how a 30x ACOT refusal came
+                // to report one worker while its own CPU time proved it had used two.
+                const std::size_t reported_threads =
+                    std::stoul(status.at("observed_threads_used_placement"));
+                require(reported_threads >= 1 && reported_threads <= workers,
+                        "a refusal must report a placement thread count it could actually have used");
+                if (workers > 1) {
+                    require(reported_threads > 1,
+                            "a parallel refusal must not report the serial default: reporting one worker "
+                            "for a run that used several is the defect this field replaces");
+                }
+                require(status.at("observed_threads_used_combination") == "0",
+                        "a placement refusal must report zero combination workers rather than a default "
+                        "of one: that phase never ran");
             }
         }
     }
