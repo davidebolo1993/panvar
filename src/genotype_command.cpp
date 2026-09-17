@@ -39,6 +39,36 @@ double seconds_since(Clock::time_point from) {
     return std::chrono::duration<double>(Clock::now() - from).count();
 }
 
+// One panel template name per line; '#' begins a comment and blank lines are ignored. Deliberately
+// the dumbest format that can be reviewed in a diff and hashed: a curation decision is a fact about a
+// panel, and it should be readable by whoever has to defend it later. A manifest that cannot be opened
+// is an error rather than an empty curation -- the alternative silently scores the uncurated panel.
+std::vector<std::string> read_curation_manifest(const std::string& path) {
+    std::ifstream file(path);
+    if (!file) {
+        throw std::invalid_argument("curation manifest could not be opened: " + path);
+    }
+    std::vector<std::string> names;
+    std::string line;
+    while (std::getline(file, line)) {
+        const std::size_t first = line.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) continue;
+        // A '#' comments out a line only when it OPENS the line. Panel template names contain '#'
+        // themselves -- sampleD#1#chr1:0-100, NA18989#1#haplotype1-0000031:36617797-36825011 -- so
+        // stripping from the first '#' anywhere truncates every real name to its sample and the
+        // manifest then names nothing that exists.
+        if (line[first] == '#') continue;
+        const std::size_t last = line.find_last_not_of(" \t\r\n");
+        names.push_back(line.substr(first, last - first + 1));
+    }
+    if (names.empty()) {
+        throw std::invalid_argument(
+            "curation manifest names no templates: " + path +
+            "; an empty manifest is indistinguishable from no curation and must not be passed");
+    }
+    return names;
+}
+
 // Named stage timings, because "it took 90 seconds" is not a performance result: the go/no-go gate
 // asks which stage spent them.
 struct StageTimings {
@@ -294,6 +324,14 @@ void write_status(
         out << "templates_forward\t" << model_report->forward_templates << '\n';
         out << "templates_reverse\t" << model_report->reverse_templates << '\n';
         out << "templates_refused\t" << model_report->refused_templates.size() << '\n';
+        // A curated panel must announce itself. Without these a run on a curated panel and a run on the
+        // whole panel differ only in the fingerprint, which says they differ but not how.
+        out << "templates_curated_out\t" << model_report->curated_exclusions.size() << '\n';
+        out << "curation_digest\t"
+            << (model_report->curation_digest.empty() ? "none" : model_report->curation_digest) << '\n';
+        for (const LocusInputReport::CuratedExclusion& excluded : model_report->curated_exclusions) {
+            out << "curated_exclusion\t" << excluded.template_name << '\t' << excluded.reason << '\n';
+        }
         out << "boundary_bases_moved_to_context\t"
             << model_report->boundary_bases_moved_to_context << '\n';
         std::string dependent;
@@ -595,6 +633,9 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         // scored the same model.
         locus_options.locus_id = resolved;
         locus_options.reference_path_name = resolved;
+        if (!options.curation_manifest_path.empty()) {
+            locus_options.excluded_templates = read_curation_manifest(options.curation_manifest_path);
+        }
         built = build_locus_input(graph, bubbles, locus_options);
         prepared.emplace(prepare_genotype_model(built.input));
         // The authoritative check, on real input, before any statistic is computed from these blocks.

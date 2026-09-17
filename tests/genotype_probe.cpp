@@ -1941,6 +1941,9 @@ int genotype(const Args& args) {
     // unknown key and dropped it: a benchmark invoked with --threads 2 recorded threads_requested 1 and
     // measured the serial path four times over.
     options.threads = std::stoul(args.get("threads", "1"));
+    // Optional curation manifest. The curated panel is a different model and says so: the status
+    // records which templates left, why, and a digest of the decision, and the fingerprint changes.
+    options.curation_manifest_path = args.get("curation-manifest", "");
     for (const std::size_t k : parse_alleles(args.required("prefixes"))) {
         options.development_candidate_prefixes.push_back(k);
     }

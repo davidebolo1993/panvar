@@ -1229,6 +1229,70 @@ void test_panel_only_path() {
             "panel-only must select exactly the haplotypes the former K=0 path selected");
 }
 
+// A panel template leaves the panel only by an explicit, recorded decision. The curated model is a
+// DIFFERENT model and has to say so: a different fingerprint, the excluded template named with the
+// reason it would otherwise have carried, and a digest of the decision. A manifest that no longer
+// matches its graph is refused rather than quietly ignored -- that silence is exactly how a stale
+// manifest would travel with a changed graph and curate nothing while appearing to curate.
+void test_curated_panel() {
+    const std::string r1 = path("phaseable_r1.fq");
+    const std::string r2 = path("phaseable_r2.fq");
+
+    panvar::GenotypeCommandOptions whole = tiny_options("curate_whole", r1, r2, "tiny_phaseable.gfa");
+    require(panvar::run_genotype(whole) == panvar::GenotypeRunStatus::Complete,
+            "the uncurated panel must complete");
+    const auto whole_status = read_status(path("curate_whole.mosaic_status.tsv"));
+    require(whole_status.at("templates_curated_out") == "0" &&
+                whole_status.at("curation_digest") == "none",
+            "a run with no manifest must report no curation, not an absent field");
+
+    // sampleD, not sampleA: sampleA is this fixture's reference path, and curating it out would remove
+    // the coordinate frame rather than a panel row.
+    const std::string manifest = path("curation.tsv");
+    {
+        std::ofstream file(manifest);
+        file << "# one template, excluded deliberately\nsampleD#1#chr1:0-100\n";
+    }
+    panvar::GenotypeCommandOptions curated = tiny_options("curate_one", r1, r2, "tiny_phaseable.gfa");
+    curated.curation_manifest_path = manifest;
+    require(panvar::run_genotype(curated) == panvar::GenotypeRunStatus::Complete,
+            "the curated panel must complete");
+    const auto curated_status = read_status(path("curate_one.mosaic_status.tsv"));
+    require(curated_status.at("templates_curated_out") == "1",
+            "the curated run must count the exclusion");
+    require(curated_status.at("curated_exclusion").rfind("sampleD#1#chr1:0-100", 0) == 0,
+            "the curated run must name the excluded template");
+    require(curated_status.at("curation_digest") != "none" &&
+                curated_status.at("curation_digest").size() == 16,
+            "a curated run must carry a digest of the curation decision");
+    require(curated_status.at("model_fingerprint") != whole_status.at("model_fingerprint"),
+            "curating a template out must change the model fingerprint: it is a different panel, and a "
+            "fingerprint that did not move would make the two runs indistinguishable");
+
+    // Drift between a manifest and its graph is an error, not a no-op.
+    const std::string stale = path("curation_stale.tsv");
+    {
+        std::ofstream file(stale);
+        file << "sampleZ#1#chr1:0-100\n";
+    }
+    panvar::GenotypeCommandOptions drifted = tiny_options("curate_stale", r1, r2, "tiny_phaseable.gfa");
+    drifted.curation_manifest_path = stale;
+    require(panvar::run_genotype(drifted) == panvar::GenotypeRunStatus::ModelIncomplete,
+            "a manifest naming a template the graph does not have must refuse");
+    require(no_ranking_or_call("curate_stale"), "a refused curation must leave no ranking or call");
+
+    // An empty manifest is indistinguishable from no curation at all, so passing one is an error.
+    const std::string empty = path("curation_empty.tsv");
+    {
+        std::ofstream file(empty);
+        file << "# nothing but a comment\n";
+    }
+    panvar::GenotypeCommandOptions blank = tiny_options("curate_empty", r1, r2, "tiny_phaseable.gfa");
+    blank.curation_manifest_path = empty;
+    require(panvar::run_genotype(blank) == panvar::GenotypeRunStatus::ModelIncomplete,
+            "an empty curation manifest must refuse rather than score the uncurated panel");
+}
+
 // Resource caps must not depend on how the work was partitioned. Every cap here is a running total
 // compared as `total > cap`, so the boundary sits exactly at the total a run reaches: a cap equal to it
 // accepts, one below refuses.
@@ -1412,6 +1476,7 @@ int main(int argc, char** argv) {
         test_phase_audit();
         test_candidate_prefixes_match_standalone();
         test_panel_only_path();
+        test_curated_panel();
         test_resource_caps_are_thread_invariant();
         std::cout << "genotype command end-to-end: PASS\n";
         return 0;

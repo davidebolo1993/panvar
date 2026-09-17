@@ -607,9 +607,39 @@ LocusInputResult build_locus_input(
         }
     }
 
+    // Curation is applied at the one boundary where graph paths become panel templates. A curated
+    // template contributes neither a panel row nor an authoritative sequence, so the round trip
+    // verifies exactly the panel the model scores. It cannot be done later: a partial frame fails
+    // model construction closed, which is the behaviour that must stay intact.
+    const std::set<std::string> excluded(options.excluded_templates.begin(),
+                                         options.excluded_templates.end());
+    std::set<std::string> excluded_matched;
+
     for (std::size_t pi = 0; pi < graph.paths.size(); ++pi) {
         PanelTemplateInput out;
         out.name = graph.paths[pi].name;
+        if (excluded.count(out.name) != 0) {
+            excluded_matched.insert(out.name);
+            LocusInputReport::CuratedExclusion record;
+            record.template_name = out.name;
+            record.reason = complete[pi] ? std::string("complete frame, excluded by curation")
+                                         : partial_reason_by_template[pi];
+            report.curated_exclusions.push_back(std::move(record));
+            // The frame pass above already recorded this template as refused, because it runs before
+            // curation does. Leaving both records reports one template twice under two headings -- one
+            // refused AND one curated -- from which a reader concludes the panel lost two rows, and
+            // worse, that a partial frame survived into a model that in fact never saw it.
+            report.refused_templates.erase(
+                std::remove(report.refused_templates.begin(), report.refused_templates.end(), out.name),
+                report.refused_templates.end());
+            report.partial_templates.erase(
+                std::remove_if(report.partial_templates.begin(), report.partial_templates.end(),
+                               [&out](const PartialTemplateReport& partial) {
+                                   return partial.name == out.name;
+                               }),
+                report.partial_templates.end());
+            continue;
+        }
         if (!complete[pi]) {
             out.frame_status = TemplateFrameStatus::Partial;
             out.partial_reason = partial_reason_by_template[pi];
@@ -625,6 +655,29 @@ LocusInputResult build_locus_input(
         authoritative.template_name = graph.paths[pi].name;
         authoritative.source_frame_bases = spell_path_steps_sequence(graph, graph.paths[pi].steps);
         result.authoritative.push_back(std::move(authoritative));
+    }
+
+    // A manifest naming a template this graph does not have is refused, never ignored. Silently
+    // curating nothing is the failure mode that would let a stale manifest travel with a changed graph
+    // and quietly stop excluding the template it was written for.
+    if (excluded_matched.size() != excluded.size()) {
+        std::string missing;
+        for (const std::string& name : excluded) {
+            if (excluded_matched.count(name) != 0) continue;
+            if (!missing.empty()) missing += ", ";
+            missing += name;
+        }
+        throw std::invalid_argument(
+            "curation names templates that are not paths of this graph: " + missing +
+            "; a manifest that has drifted from its graph must be corrected, not ignored");
+    }
+    if (!report.curated_exclusions.empty()) {
+        // Ordered by the set, so the digest depends on which templates were curated and not on the
+        // order they were listed in.
+        Digest digest;
+        digest.add(excluded.size());
+        for (const std::string& name : excluded) digest.add(name);
+        report.curation_digest = digest.hex();
     }
     return result;
 }

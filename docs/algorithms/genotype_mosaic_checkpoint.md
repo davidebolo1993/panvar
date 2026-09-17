@@ -4,6 +4,129 @@ Companion to `genotype_mosaic.md`, which remains the authoritative contract. Thi
 what is actually built, what its own gates still owe, and the work order to reach the Phase 8
 go/no-go.
 
+## R13. Review round 13 — the coverage ceiling, and a curated panel
+
+Round 12 was accepted, with the exact-atomic comparison reclassified as optional performance work. The ordered
+work was: apply the three review corrections, then run the curated cyp2d6 experiment and one ACOT development
+donor at 2x, 10x and 30x, and report before any cohort or LOO claim.
+
+### R13.1 ACOT at 2x, 10x and 30x — the cap is reached before the coverage is
+
+**Protocol.** One simulation at the source coverage, subsampled down, so the three depths are nested subsets of a
+single draw rather than three independent ones: 39,999 fragments at 30x, 13,230 at 10x, 2,734 at 2x. Donor
+HG00097, the frozen settings (seed 20260916 salted with the donor, 100 bp reads, insert 350 +/- 40, 4 sigmas,
+substitution error 0.002, outlier weight 0.001), effective seed 3411624200207820717 -- the same stream the frozen
+2x pilot drew from. Two threads throughout.
+
+**A protocol gap worth recording rather than glossing.** ACOT has no frozen donor-role manifest.
+`tests/genotype_development_donors.tsv` is C4-only -- its pool is every sample with both haplotypes in
+`c4.gfa.gz` -- and contains no HG00097. The 2x pilot's donor choice is recorded nowhere but its own
+`simulation.tsv`. Continuing with HG00097 is the defensible choice because it keeps the same donor as the frozen
+pilot, but it is a choice made here, not one inherited from a committed manifest.
+
+| coverage | fragments | total s | rescoring s | placement s | combination s | wall s | user s | RSS MB | status |
+|---|---|---|---|---|---|---|---|---|---|
+| 2x  | 2,734  | 52.59  | 28.50  | 21.31 | 7.17  | 52.66  | 79.71  | 1,625 | COMPLETE |
+| 10x | 13,230 | 87.81  | 65.18  | 45.09 | 19.97 | 87.87  | 151.38 | 1,727 | COMPLETE |
+| 30x | 39,999 | 114.06 | 102.52 | --    | --    | 114.11 | 215.91 | 2,028 | **RESCORE_INCOMPLETE** |
+
+**30x does not run. It refuses, and it refuses correctly.** Piece hits are linear in depth -- 149,814,247 at 2x
+and 751,854,315 at 10x, a factor of 5.02 for five times the reads -- which puts 30x at roughly 2.25 billion
+against a `max_piece_hits` of 2,000,000,000. The run stopped at **2,000,003,518** observed piece hits: an
+overshoot of **3,518** against the declared bound of `threads * piece_hit_publish_batch` = 8,192. That is the
+first confirmation of round 12's resource contract at production scale rather than on a fixture, and it is the
+answer to the question the 30x run was commissioned to settle: on a large locus the caller reaches its declared
+work cap before it reaches 30x. Either the cap rises with a justification, or placement gets cheaper. No partial
+ranking was written.
+
+**Two reporting gaps the refusal exposes.** A refused run reports `threads_used_placement 1` -- the field is only
+assigned on success -- although 215.91 s of user time against 114.11 s of wall clock shows 1.89x parallelism, so
+it plainly ran on two threads. And `seconds_rescoring` is 102.521 with all three sub-phase timings at 0.000: the
+split is recorded only on the success path, so a refusal loses exactly the breakdown that would say where the
+work went. Neither affects a call. Both make a refused run harder to diagnose than it should be.
+
+**The calls, and the one that moved.** Eight of nine blocks are identical at 2x and 10x. `sv:13` is not: allele2
+is 305 at 2x and 307 at 10x. The interesting part is what a second 2x draw says. The frozen 2x pilot -- a
+different draw, 2,660 fragments simulated directly at depth 2 -- calls **307** there, agreeing with 10x, while
+this nested 2x subset calls **305**. So this is not depth changing a call; it is one unstable block whose 2x
+answer depends on which reads were drawn.
+
+The confidence measure identified it without being asked to. Conditional GQ at `sv:13` is **3.04** in the nested
+2x run, against 1,156 in the frozen 2x draw and 8,562 at 10x, with every other block in the thousands at every
+depth. The single call that moved between draws is precisely the one the caller marked as nearly worthless. That
+is the behaviour a GQ is for, and it is the first time it has been checked against two independent draws of the
+same donor at the same depth.
+
+### R13.2 The curated cyp2d6 panel — one template, recorded, and a model that builds
+
+cyp2d6 has been unrunnable since R10, and correctly so: `NA18989#1#haplotype1-0000031` is a partial whole-locus
+template, and a partial frame fails model construction closed. R10 ruled that the locus was "one explicit
+curation decision about one template", and that no template may be dropped silently.
+
+**The mechanism.** Curation is applied at the one boundary where graph paths become panel templates. A curated
+template contributes neither a panel row nor an authoritative sequence, so the round trip verifies exactly the
+panel the model scores. It cannot be done later -- `prepare_genotype_model` refuses a partial frame, which is the
+behaviour that must stay intact -- and it is not a way to launder one: the manifest is an explicit, reviewable
+list, committed as `tests/genotype_cyp2d6_curation.tsv`, and a manifest naming a template the graph does not have
+is **refused**, never ignored.
+
+**The result.** The same reads (HG00096 at 30x, frozen settings, two threads) against the same graph:
+
+| | uncurated | curated |
+|---|---|---|
+| status | `MODEL_INCOMPLETE` | `COMPLETE` |
+| model fingerprint | `NA` -- no model exists | `2a5b720a1c5bf669` |
+| templates refused | 1 | 0 |
+| templates curated out | 0 | 1 |
+| curation digest | none | `ee2c6126f412d2b7` |
+| representation-dependent blocks | none | none |
+| panel rows / distinct paths | -- | 126 |
+| blocks called | none | 9 |
+
+The panel is 126 rows from 127 graph paths, `panel_diplotypes` 8,001 = 126 x 127 / 2 exactly, collapsing to 124
+unique haplotypes because two pairs of paths spell identical bytes. 9 variant and 10 context blocks. 17.91 s wall
+against 33.17 s user -- 1.85x on two threads -- and 519 MB peak RSS, with 225,277,138 piece hits and 4,032,695
+physical origins, both far inside their caps. The round trip and the representation-independence gate both pass
+upstream of the caller, which is what R11 required before this experiment could count.
+
+The status names what left and why: `curated_exclusion NA18989#1#haplotype1-0000031:36617797-36825011
+locus_coverage_partial: missing right-terminal coverage at ctx:16, sv:17, ctx:18`. (Right-terminal here where
+R10 recorded left-terminal at `ctx:0, sv:1, ctx:2`; the frame is anchored on `grch38#1#chr22:42031864-42245566`,
+a different reference than that round used, and the chain orientation follows it.)
+
+**NA18989 must not be evaluated as a leave-one-out truth against this panel.** Its truth requires the path the
+manifest deletes, so any accuracy it produced would be meaningless. The constraint is written into the manifest
+beside the name, where it travels with the decision rather than living only in a review.
+
+### R13.3 Two defects this experiment found in its own machinery
+
+**The manifest parser truncated every name it was given.** It stripped from the first `#` anywhere in a line, and
+panel template names contain `#`: `NA18989#1#haplotype1-0000031:...` became `NA18989`, and the fixture's
+`sampleD#1#chr1:0-100` became `sampleD`. Neither matches a path. The only reason this surfaced immediately is
+that a manifest naming an absent template refuses -- had it been a silent no-op, both the cyp2d6 run and the new
+fixture would have passed while curating nothing, scoring the uncurated panel and reporting success. A comment
+now requires `#` to open the line.
+
+**The status double-counted the curated template.** It reported `templates_refused 1` alongside
+`templates_curated_out 1`, both meaning NA18989: the frame pass records refusals before curation runs, so the
+curated template stayed on the refused list. A reader would conclude the panel lost two rows, and worse, that a
+partial frame had survived into the model. The curated name is now removed from both the refused list and the
+partial-template reports. The model fingerprint is byte-identical either side of that fix, which is the evidence
+it changed reporting and not a statistic.
+
+`templates_forward` and `templates_reverse` still sum to 127 rather than 126, and deliberately: they count graph
+paths with a consistent chain frame, which is a property of the graph, and `preflight` reports that same sum as
+`templates_in_graph`. `templates_refused` is different -- it makes a claim about the panel -- which is why only
+that one was corrected.
+
+**What the fixture does and does not cover.** `test_curated_panel` gates the whole contract on a tiny locus: the
+curated run completes, counts and names the exclusion, carries a digest, and produces a **different model
+fingerprint** from the uncurated run; a manifest naming an absent template refuses with no ranking or call; an
+empty manifest refuses rather than silently scoring the uncurated panel. It does **not** cover curating a
+*partial* template, because no fixture in the suite has one -- the tiny locus's four templates all have complete
+frames, so `templates_refused` is 0 there either way and an assertion on it would be vacuous. The cyp2d6 run is
+the evidence for that path, and it is a real run rather than a fixture.
+
 ## R12. Review round 12 — what the run costs, and making it parallel without making it approximate
 
 Round 11 was accepted. The ordered work was: correct the reporting defects the review named, remove the fixed

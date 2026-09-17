@@ -23,6 +23,11 @@ struct GenotypeCommandOptions {
     // Declared library parameters. Version one does not estimate the insert distribution from the
     // data, so this is required and its provenance is recorded in the status file.
     std::string library_path;
+    // Optional. A curation manifest: one panel template name per line, '#' comments ignored. Named
+    // templates are removed from the panel before the model is built, and the run records which and
+    // why. Curation is the only sanctioned way a template leaves the panel -- a partial frame still
+    // fails model construction closed -- and a manifest naming an absent template is refused.
+    std::string curation_manifest_path;
     std::size_t threads = 1;
     // Off-panel mosaic diplotypes added to the protected panel baseline; 0 scores the panel alone. Every
     // unordered panel diplotype is always a candidate and is not counted here.

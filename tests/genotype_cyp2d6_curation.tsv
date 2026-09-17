@@ -1,0 +1,20 @@
+# Curation manifest for cyp2d6 (tests/real_data/cyp2d6.gfa.gz), committed before the curated panel was
+# scored. One panel template name per line, exactly as the graph spells it; '#' begins a comment.
+#
+# NA18989#1#haplotype1-0000031 is a partial whole-locus template, not a malformed path. Its path spans
+# nodes 205-5763 where the other 126 span 1-5763: it holds ctx:2's sink but not its source, so it
+# reaches neither terminal anchor of the modeled block chain, and its last 29 steps account for exactly
+# the 1,978 bases by which it falls short of the authoritative sequence. A truncated assembly, in other
+# words -- and the caller must never read its missing left terminal as a zero-length deletion allele.
+#
+# Excluding it is a PANEL decision and not a scoring one. The remaining 126 templates are complete, and
+# the model built from them is a different model: it carries a different fingerprint, and the status of
+# any run using this manifest records the exclusion, its reason, and a digest of this decision.
+#
+# Two constraints travel with this file:
+#   * NA18989 must not be evaluated as a leave-one-out truth against a panel curated to remove it. Its
+#     truth requires the path this manifest deletes, so any accuracy it produced would be meaningless.
+#   * The name below is the graph's own path name, including the coordinate suffix. Earlier prose
+#     records this template as `NA18989#1#haplotype1-0000031`, without the suffix; that shorter form
+#     matches no path, and a manifest naming an absent template is refused rather than ignored.
+NA18989#1#haplotype1-0000031:36617797-36825011

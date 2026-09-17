@@ -22,6 +22,13 @@ struct LocusInputOptions {
     // Reference path name, already resolved against the graph. It fixes the chain's coordinate frame
     // and therefore which templates count as antiparallel; it is not otherwise privileged.
     std::string reference_path_name;
+    // Panel templates removed by an explicit curation decision, by graph path name. A curated template
+    // contributes no panel row and no authoritative sequence, so the round trip verifies exactly what
+    // the model scores. This is the ONLY way a template may leave the panel: a partial frame still
+    // fails model construction closed, because silently completing it is the defect this guards.
+    // A name that matches no path in the graph is refused rather than ignored -- a manifest that has
+    // drifted from its graph must say so, not quietly curate nothing.
+    std::vector<std::string> excluded_templates;
 };
 
 struct LocusBlockReport {
@@ -109,6 +116,18 @@ struct LocusInputReport {
     // Every template refused a complete frame, with the reason. Parallel in content to
     // `refused_templates`, which keeps only the names.
     std::vector<PartialTemplateReport> partial_templates;
+    // Templates removed from the panel by an explicit curation decision, each with the reason it would
+    // otherwise have carried. A curated panel has to be auditable: the record says what left and why,
+    // never merely that the panel is smaller than the graph.
+    struct CuratedExclusion {
+        std::string template_name;
+        std::string reason;
+    };
+    std::vector<CuratedExclusion> curated_exclusions;
+    // Digest over the curated names, so a status can identify which curation produced a model without
+    // quoting the whole list. Empty when nothing was curated. The model fingerprint changes
+    // independently of this, because the panel rows it hashes no longer contain the excluded template.
+    std::string curation_digest;
 };
 
 struct LocusInputResult {
