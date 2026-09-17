@@ -4,6 +4,132 @@ Companion to `genotype_mosaic.md`, which remains the authoritative contract. Thi
 what is actually built, what its own gates still owe, and the work order to reach the Phase 8
 go/no-go.
 
+## R15. Review round 15 — the experiment on a harness, and what clean reads change
+
+Round 14's mosaic measurements were void: reads simulated from a broken staged graph were scored against
+a truth projected from the fixed one. The replacement runs come from
+`tests/genotype_c4_mosaic_experiment.sh`, which stages graphs and simulates reads as ordered stages of a
+single harness, so a regenerated graph cannot keep stale reads beside it. `r15_exp/consistency.tsv` binds
+each plan's staged graph, both read files, the truth FASTA and the truth haplotype lengths in one row --
+the artifact whose absence let the contamination pass unnoticed.
+
+### R15.1 The model-equivalence gate, proven rather than assumed
+
+Adding two synthetic mosaic paths renumbers C4's nodes wholesale, so the staged graph has to be shown to
+leave the MODEL untouched once the mosaics are curated out. On all five plans it does, exactly:
+fingerprint `d2b8c6c2e0b4079d`, 8,515 panel diplotypes, 5 variant and 6 context blocks, 2 templates
+curated. Identical to ordinary C4 on every field. The gate is committed with the harness and fails the
+run rather than reporting a discrepancy, and its expected values are declared constants, so a change to
+the graph or the bubble caller breaks it loudly instead of being updated away.
+
+### R15.2 Clean reads are far less decisive than the contaminated ones appeared
+
+| plan | K = 0 | K = 8 | separation gap | phase | mosaics found |
+|---|---|---|---|---|---|
+| one_switch | COMPLETE | COMPLETE | **0.401** | PRIOR_ONLY | 596 |
+| bridgeable | COMPLETE | COMPLETE | **0.358** | PRIOR_ONLY | 892 |
+| unbridgeable | COMPLETE | **RESCORE_INCOMPLETE** | -- | -- | 716 |
+| three_switches | COMPLETE | **RESCORE_INCOMPLETE** | -- | -- | 562 |
+| every_block | COMPLETE | **RESCORE_INCOMPLETE** | -- | -- | 776 |
+
+Three of five plans now refuse at K = 8, and all three refuse for the same reason: *the best candidate
+cannot be separated from every rival by more than floating-point error*. These are **not** resource
+refusals -- `observed_piece_hits` is absent, which is the field a cap refusal fills, and piece hits run
+176-196 million against a 2,000,000,000 cap.
+
+The two plans that do complete are barely separated either: gaps of 0.401 and 0.358, with phase
+`PRIOR_ONLY`. On the contaminated reads the same two plans reported gaps of 123.6 and 171.8 with
+`READS_WITHIN_CANDIDATES`. The apparent confidence of the voided results was itself an artifact of
+scoring reads against a truth they did not come from. Correct data makes this locus look harder, not
+easier, which is the direction a contamination fix should move the answer.
+
+### R15.3 The equivalence sets agree on every block
+
+Sol's question was whether a certified equivalence set, having refused a whole-locus winner, nonetheless
+agrees block by block. On clean reads it does, on all five plans: 11 of 11 blocks unanimous.
+
+| plan | winner-set size | blocks agreeing |
+|---|---|---|
+| unbridgeable | 2 | 11/11 |
+| three_switches | 2 | 11/11 |
+| every_block | 8 | 11/11 |
+| one_switch | 1 | 11/11 (trivial) |
+| bridgeable | 1 | 11/11 (trivial) |
+
+Only the three refused plans carry evidence: a winner set of one agrees with itself by construction and
+proves nothing. Among the three that tie, every tied candidate assigns the same unordered allele pair at
+every block -- including `every_block`, whose eight tied candidates disagree about the whole-locus
+haplotype pair while agreeing about all eleven block genotypes.
+
+So the refusal is right at the level it refuses: the whole-locus phase genuinely is unresolved. A
+block-consensus call would have been statistically supported in all three cases. **No calling behaviour
+is changed on this evidence** -- five plans on one locus with one donor pair is not a basis for a new
+contract, and the point of the certification gate is that it does not quietly start answering a question
+it was built to decline.
+
+### R15.4 Where the truth is lost — and the round-14 conclusion reversed
+
+The diagnostic searches the COMPLETE final beam, before `candidate_prefix()` truncates it, and follows the
+truth through every layer using the beam's existing `trace_target` machinery. Proposal only; nothing is
+rescored.
+
+| plan | limit | truth in full beam | full-beam rank | candidates found | first block not retained |
+|---|---|---|---|---|---|
+| one_switch | 1,024 | false | -- | 596 | **sv:5** |
+| one_switch | 4,096 | **true** | **6** | 2,510 | never |
+| bridgeable | 1,024 | **true** | **6** | 892 | never |
+| bridgeable | 4,096 | true | 6 | 3,278 | never |
+| unbridgeable | 1,024 | **true** | **2** | 716 | never |
+| unbridgeable | 4,096 | true | 2 | 2,832 | never |
+| three_switches | 1,024 | **true** | **20** | 562 | never |
+| three_switches | 4,096 | true | **8** | 2,566 | never |
+| every_block | 1,024 | false | -- | 776 | **ctx:4** |
+| every_block | 4,096 | false | -- | 3,568 | **sv:9** |
+
+**Round 14's conclusion was wrong, not merely unsupported.** It said the proposal never offers the truth.
+The proposal offers it on three of five plans at the default state limit, at ranks 2, 6 and 20 -- near the
+top of the beam. The claim was drawn from a metric that could only see the written K-prefix, on reads that
+did not match their truth; both defects pointed the same way, and the correction moves in both directions
+at once.
+
+Reading each case against the branches the diagnostic was built to separate:
+
+* **bridgeable, unbridgeable, three_switches**: the truth is retained through every layer and ranks highly.
+  There is no proposal failure here at all.
+* **one_switch**: lost at `sv:5` at 1,024, retained to the end at 4,096 and ranked 6. A beam-width and
+  crowding problem, exactly the signature the two limits exist to distinguish.
+* **every_block**: lost at both widths, but the loss point moves from `ctx:4` to `sv:9` as the beam widens.
+  Ten switches over eleven blocks is the stress case, and the truth is being crowded out progressively
+  later rather than never generated.
+
+The beam is also not saturating on clean reads -- 562 to 892 candidates found against a 1,024 limit -- so
+round 14's "the beam saturates" observation was another artifact of the contaminated inputs.
+
+### R15.5 The first successful mosaic recovery, and where the difficulty actually sits
+
+| plan | K | status | truth in ranked prefix | rank | blocks exact | phase |
+|---|---|---|---|---|---|---|
+| one_switch | 0 / 8 | COMPLETE | false / false | -- | 3 → **10** | PRIOR_ONLY |
+| bridgeable | 0 / 8 | COMPLETE | false / **true** | **6** | 9 → **11/11** | PRIOR_ONLY |
+| unbridgeable | 0 / 8 | COMPLETE / REFUSED | false / -- | -- | 2 → -- | UNRESOLVED |
+| three_switches | 0 / 8 | COMPLETE / REFUSED | false / -- | -- | 3 → -- | UNRESOLVED |
+| every_block | 0 / 8 | COMPLETE / REFUSED | false / -- | -- | 7 → -- | UNRESOLVED |
+
+**bridgeable at K = 8 recovers the mosaic exactly**: the truth enters the scored prefix at rank 6 and all
+eleven blocks are called correctly, for a donor whose two haplotypes exist in no panel row. That is the
+first demonstration that proposal and scoring together recover a mosaic on a real repetitive locus, and
+round 14 reported the opposite.
+
+Mosaic candidates now change calls, which round 14 explicitly denied: block accuracy rises from 3 to 10
+on one_switch and from 9 to 11 on bridgeable when K goes from 0 to 8. On one_switch the improvement comes
+*without* the truth being a candidate at all -- a near neighbour of the truth carries it to 10 of 11.
+
+So the open question has moved. It is no longer "does the proposal offer the truth" -- it does, at good
+rank. It is that three of five plans, with the truth available and often highly ranked, end in an
+equivalence set the scorer cannot separate by more than floating-point error, and the two that do complete
+separate by 0.401 and 0.358. The difficulty is in **separation**, downstream of proposal. That is a
+different investigation, and nothing here licenses changing the beam, the caps or the calling contract.
+
 ## R14. Review round 14 — making round 13's results reproducible, and measuring before optimising
 
 Round 13 was accepted as trustworthy evidence, with four rulings: the ACOT 30x refusal is valid, the cyp2d6
@@ -129,7 +255,29 @@ cap would obtain the complete 30x baseline that the production cap currently pre
 run, to learn what a full-coverage large locus costs. It is not a production cap change, and the linear scaling
 it would expose is the actual problem -- one that neither a higher cap nor an exact form cache addresses.
 
-### R14.7 The C4 synthetic-mosaic experiment — the proposal does not deliver the truth
+### R14.7 The C4 synthetic-mosaic experiment — machinery built, first measurements void
+
+> **VOID: every number in this section was measured against the wrong truth.** The staged graphs were
+> first built with a node-id-space defect, reads were simulated from those broken haplotypes, and when
+> the defect was fixed only `staged.gfa` was regenerated -- the reads were not. Every subsequent call and
+> evaluation therefore scored reads drawn from one pair of haplotypes against a truth projected from a
+> different pair. Confirmed rather than suspected: for the same plan, the same seed
+> (`10379067894318520190`) and a byte-identical staged graph (`22f15798c55e09c8`), the truth haplotypes
+> are 206,452 / 221,151 bp as simulated and 226,376 / 252,700 bp as later projected.
+>
+> Void: `blocks_exact` 1-9 of 11, truth absent from the ranked prefix at K = 0, 8 and 256, the 6-136 bp
+> nearest-candidate distances, the sv:1 loss at rank 557,093 with "locally competitive emission", and the
+> 11/11 equivalence-set concordance. None of them may be quoted.
+>
+> Not void, because none of it depended on those reads: the mosaic-truth builder and its two-route
+> cross-check, the `trace` extension to non-panel donors, the segfault guard, the
+> `truth_in_ranked_prefix` rename, and the model-equivalence gate.
+>
+> `tests/genotype_c4_mosaic_experiment.sh` now stages graphs and simulates reads as ordered stages of one
+> harness, so a regenerated graph cannot silently keep stale reads beside it. The replacement
+> measurements are recorded in R15.
+
+### R14.7a What the section claimed before it was voided
 
 The off-panel fixture proves the machinery can recover a mosaic on a tiny locus. Every large-locus
 experiment so far used donors whose haplotypes were intact panel rows, so the correct answer needed zero
@@ -142,7 +290,7 @@ Donors HG02666 x NA19240, 30x, two threads, five switch plans over C4's 11 block
 from the staged graph; the call is made against that same graph with the two mosaics **curated out**, so
 the panel is the 131 real templates and the truth exists in no panel row.
 
-| case | switches | blocks exact (of 11) | truth in candidates | nearest candidate | phase at K=8 |
+| case | switches | blocks exact (of 11) | truth in ranked prefix | nearest candidate | phase at K=8 |
 |---|---|---|---|---|---|
 | one_switch | 1 (sv:5) | 3 | **false** | 52 bp | READS_WITHIN_CANDIDATES |
 | bridgeable | 2 (sv:3, sv:5) | 9 | **false** | 6 bp | READS_WITHIN_CANDIDATES |
@@ -150,15 +298,25 @@ the panel is the 131 real templates and the truth exists in no panel row.
 | three_switches | 3 (sv:3, ctx:6, sv:9) | 1 | **false** | 107 bp | PRIOR_ONLY |
 | every_block | 10 (all) | 7 | **false** | 136 bp | READS_WITHIN_CANDIDATES |
 
-**Both truth alleles are available at all 11 blocks in every case.** The model can spell the truth; the
-candidate set never contains it. This is a proposal failure, not a ranking or representability failure,
-and `blocks_exact` merely records how close the nearest scored candidate happened to fall.
+**Both truth alleles are available at all 11 blocks in every case.** The model can spell the truth, and
+no ranked prefix tested contains it, so `blocks_exact` merely records how close the nearest scored
+candidate happened to fall.
+
+**Correction, round 14 review.** An earlier version of this section claimed the candidate set "never
+contains" the truth and that this was "a proposal failure". Both are withdrawn: the measurement cannot
+support them. `candidate_prefix()` truncates the beam to K before `mosaic_candidates.tsv` is written,
+and the evaluator searches only that file, so an `absent` verdict means **absent from the top K rows
+written for this run** and nothing more. It does not distinguish a truth ranked 257-1,024 in the final
+beam, one pruned at an earlier layer, and one never generated. The defensible statement is the narrow
+one: the truth is absent from every ranked prefix tested, through K = 256. That is still a real result,
+but it does not yet locate the failure.
 
 **The budget is not the explanation, as far as it was tested.** K = 8 scored 8 of the 628-1,024 mosaics
 the beam found, so the obvious suspicion was that the truth was proposed and truncated away. Raising
 bridgeable to K = 256 -- 32 times the budget, 256 of 1,024 found mosaics scored -- changed **nothing**:
-`truth_in_candidates` false, nearest candidate still 6 bp, `blocks_exact` still 9, `phase_switch_blocks`
-still 0, every metric identical. `truth_proposal_rank` is `absent`, not merely unscored.
+truth absent from the prefix, nearest candidate still 6 bp, `blocks_exact` still 9,
+`phase_switch_blocks` still 0, every metric identical. What that rules out is truncation **at 256**; it
+says nothing about ranks 257-1,024, which were never written or searched.
 
 This is not yet conclusive, and should not be quoted as if it were. `mosaic_candidates_found` reaches
 exactly 1,024 on two cases, which is the proposal state limit: the beam is saturating, so what it
@@ -178,8 +336,10 @@ off-panel rival and cannot speak to phase. At K = 8 the cases with a mosaic in t
 phasing introduces no switch error over what the unordered call already costs.
 
 **What this establishes, stated narrowly.** The caller does not recover a synthetic mosaic on C4 under
-any budget tried, because the proposal never offers it. No mosaic-recall claim -- on C4 or across loci
--- is supportable from these runs, and none should be made. What the experiment does establish is that
+any budget tried, and the truth is absent from every ranked prefix tested. WHERE it is lost -- final
+truncation, beam width, an intermediate layer, or the proposal model itself -- is not established by
+these runs, and the next diagnostic exists to find out. No mosaic-recall claim, on C4 or across loci, is
+supportable from these runs, and none should be made. What the experiment does establish is that
 the machinery to test the question now exists and is honest: truth built two ways and cross-checked,
 sources reported as equivalence classes rather than named samples, and a caller that refuses rather than
 guesses when its candidates are inseparable.

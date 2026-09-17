@@ -696,9 +696,18 @@ int evaluate(const Args& args) {
                 }
             }
         }
-        summary << "truth_in_candidates\t" << (truth_proposal_rank != "absent" ? "true" : "false")
+        // Named for what it actually measures. candidate_prefix() truncates the beam to K BEFORE
+        // mosaic_candidates.tsv is written, and the loop above searches only that file, so an "absent"
+        // verdict means absent from the K rows written for this run. It cannot distinguish a truth
+        // ranked beyond K in the final beam, one pruned at an earlier layer, and one never generated.
+        // The former name, truth_in_candidates, invited exactly that conflation: a round-14 conclusion
+        // was drawn from it and had to be withdrawn.
+        summary << "truth_in_ranked_prefix\t" << (truth_proposal_rank != "absent" ? "true" : "false")
+                << "\ntruth_ranked_prefix_limit\t"
+                << (status.count("max_mosaic_candidates") ? status.at("max_mosaic_candidates")
+                                                          : std::string("NA"))
                 << "\ntruth_candidate_source\t" << truth_source
-                << "\ntruth_proposal_rank\t" << truth_proposal_rank
+                << "\ntruth_ranked_prefix_rank\t" << truth_proposal_rank
                 << "\ntruth_fragment_score_rank\t" << truth_score_rank << '\n';
 
         // Availability diagnostics -- evaluation only: they read the truth and never feed a call. The
@@ -2128,7 +2137,11 @@ int trace(const Args& args) {
     const std::string run = args.required("run");
     const std::size_t state_limit = std::stoul(args.get("state-limit", "1024"));
     const std::size_t target = std::stoul(args.get("candidates", "256"));
-    const LoadedModel loaded = load_model(args.required("gfa"), reference, out + ".model.sorted.gfa", 50);
+    const std::string curation_path = args.get("panel-curation", "");
+    const LoadedModel loaded =
+        load_model(args.required("gfa"), reference, out + ".model.sorted.gfa", 50,
+                   curation_path.empty() ? std::vector<std::string>{}
+                                         : read_panel_curation(curation_path));
     const panvar::PreparedGenotypeModel& model = *loaded.model;
     if (read_key_values(run + ".mosaic_status.tsv").at("model_fingerprint") != loaded.fingerprint) {
         throw std::runtime_error("the run was not scored on the rebuilt model");
@@ -2141,10 +2154,59 @@ int trace(const Args& args) {
     std::sort(rows.begin(), rows.end(), [&](std::size_t lhs, std::size_t rhs) {
         return panel.template_names[lhs] < panel.template_names[rhs];
     });
-    if (rows.size() != 2) throw std::runtime_error("a leave-zero-out trace needs both donor haplotypes as panel rows");
-    const panvar::MosaicDiplotype truth{
-        panvar::MosaicPath{std::vector<std::size_t>(panel.template_alleles[rows[0]].begin(), panel.template_alleles[rows[0]].end())},
-        panvar::MosaicPath{std::vector<std::size_t>(panel.template_alleles[rows[1]].begin(), panel.template_alleles[rows[1]].end())}};
+
+    // Two ways to name the target. A leave-zero-out donor IS two panel rows, and its alleles are read
+    // straight off them. A synthetic mosaic is deliberately in no panel row -- that is the whole point
+    // of the experiment -- so its target comes from projecting the truth paths onto the block chain,
+    // exactly as evaluate derives truth, and there are no declared templates to follow alongside it.
+    panvar::MosaicDiplotype truth;
+    if (rows.size() == 2) {
+        truth = panvar::MosaicDiplotype{
+            panvar::MosaicPath{std::vector<std::size_t>(panel.template_alleles[rows[0]].begin(),
+                                                        panel.template_alleles[rows[0]].end())},
+            panvar::MosaicPath{std::vector<std::size_t>(panel.template_alleles[rows[1]].begin(),
+                                                        panel.template_alleles[rows[1]].end())}};
+    } else {
+        const std::string truth_gfa = args.get("truth-gfa", "");
+        if (truth_gfa.empty()) {
+            throw std::runtime_error("donor " + donor + " has " + std::to_string(rows.size()) +
+                                     " panel rows; pass --truth-gfa to trace a donor that is not in "
+                                     "the panel, such as a curated-out synthetic mosaic");
+        }
+        const SortedGraph truth_graph = load_sorted(truth_gfa, reference, out + ".truth.sorted.gfa");
+        const std::vector<const panvar::PathRecord*> paths = donor_paths(truth_graph.graph, donor);
+        std::vector<panvar::MosaicPath> built;
+        for (const panvar::PathRecord* path : paths) {
+            const auto projection = panvar::project_path_onto_locus(
+                truth_graph.graph, loaded.bubbles, loaded.built.report, path->name);
+            if (!projection.has_value()) {
+                throw std::runtime_error("truth path " + path->name + " does not span the block chain");
+            }
+            panvar::MosaicPath spelled;
+            for (std::size_t b = 0; b < model.blocks().size(); ++b) {
+                if (!projection->blocks[b].has_value()) {
+                    throw std::runtime_error("truth path " + path->name + " has no allele at block " +
+                                             model.blocks()[b].block_id);
+                }
+                const auto& alleles = model.blocks()[b].alleles;
+                std::size_t found = alleles.size();
+                for (std::size_t a = 0; a < alleles.size(); ++a) {
+                    if (alleles[a].sequence == *projection->blocks[b]) {
+                        found = a;
+                        break;
+                    }
+                }
+                if (found == alleles.size()) {
+                    throw std::runtime_error("truth allele at " + model.blocks()[b].block_id +
+                                             " is not an allele of the model: the target cannot be "
+                                             "traced through a beam that could never spell it");
+                }
+                spelled.alleles.push_back(found);
+            }
+            built.push_back(std::move(spelled));
+        }
+        truth = panvar::MosaicDiplotype{built[0], built[1]};
+    }
     const auto winner = winner_paths(run);
     const panvar::MosaicDiplotype winner_diplotype{panvar::MosaicPath{winner.first}, panvar::MosaicPath{winner.second}};
 
@@ -2174,7 +2236,8 @@ int trace(const Args& args) {
     parameters.state_limit = state_limit;
     parameters.max_extension_evaluations = 2000000000ULL;
     parameters.trace_target = truth;
-    parameters.trace_templates = std::make_pair(rows[0], rows[1]);
+    // Only a panel donor has declared templates to follow; a curated-out mosaic has none.
+    if (rows.size() == 2) parameters.trace_templates = std::make_pair(rows[0], rows[1]);
     const panvar::MosaicBeamResult result =
         panvar::propose_mosaic_diplotypes(panel, emissions, switches, parameters);
 
@@ -2238,13 +2301,34 @@ int trace(const Args& args) {
             truth_proposed = true;
         }
     }
+    // The truth's rank in the FULL final beam, which is the question a ranked prefix cannot answer:
+    // candidate_prefix() truncates to K before the run's manifest is written, so "absent from the
+    // manifest" conflates ranked-beyond-K, pruned-at-a-layer, and never-generated. This scans
+    // result.candidates, the complete retained set, in the beam's own order.
+    std::string truth_full_beam_rank = "absent";
+    for (const auto& candidate : result.candidates) {
+        const auto& d = candidate.diplotype;
+        if ((d.first == truth.first && d.second == truth.second) ||
+            (d.first == truth.second && d.second == truth.first)) {
+            truth_full_beam_rank = std::to_string(candidate.unique_rank);
+            break;
+        }
+    }
+
     std::ofstream summary(out + ".trace.summary.tsv");
     summary << std::setprecision(12) << "key\tvalue\ndonor\t" << donor << "\nstate_limit\t" << state_limit
             << "\ncandidate_target\t" << target << "\nunique_candidates_found\t" << result.unique_candidates_found
             << "\nstates_pruned\t" << result.states_pruned << "\nproposal_matches_run\t"
             << (matches_run ? "true" : "false") << "\ncandidates_compared_with_run\t" << compared
-            << "\ntruth_templates\t" << panel.template_names[rows[0]] << ',' << panel.template_names[rows[1]]
-            << "\ntruth_proposed\t" << (truth_proposed ? "true" : "false") << "\nfirst_block_truth_not_retained\t"
+            // Empty for a synthetic mosaic: it is curated out of the panel by construction, so it has no
+            // panel rows. Indexing rows[0] here regardless is what segfaulted the first mosaic trace --
+            // an out-of-bounds read on an empty vector, silent, with no exception to catch.
+            << "\ntruth_templates\t"
+            << (rows.size() == 2 ? panel.template_names[rows[0]] + "," + panel.template_names[rows[1]]
+                                 : std::string("none: donor is not a panel row"))
+            << "\ntruth_in_full_beam\t" << (truth_proposed ? "true" : "false")
+            << "\ntruth_full_beam_rank\t" << truth_full_beam_rank
+            << "\nfirst_block_truth_not_retained\t"
             << first_loss << "\ntruth_emission_total\t" << truth_emission_total << "\nwinner_emission_total\t"
             << winner_emission_total << "\ntruth_path_prior\t"
             << panvar::log_unordered_diplotype_prior(panel, truth, switches) << "\nwinner_path_prior\t"
