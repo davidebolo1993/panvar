@@ -18,7 +18,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD="${BUILD:-$REPO/build}"
 OUT="${1:?usage: BUILD=<build> tests/genotype_c4_mosaic_experiment.sh <out-dir>}"
 PROBE="$BUILD/genotype_probe"
-STAGES="${STAGES:-stage gate reads call trace}"
+STAGES="${STAGES:-stage gate reads call eval concord trace}"
 
 # ---- frozen settings -------------------------------------------------------------------------------
 REFERENCE='HG00096#1#haplotype1-0000024:31848049-32074186'
@@ -107,6 +107,9 @@ if has_stage stage; then
     "$PROBE" mosaic-truth --gfa "$C4" --reference "$REFERENCE" \
       --donor-a "$DONOR_A" --donor-b "$DONOR_B" --switches "$switches" \
       --out-gfa "$d/staged.gfa" --out "$d/truth.tsv" > "$d/stage.log" 2>&1
+    # The signature every later stage binds to.  Reads, calls and evaluations are only meaningful
+    # against the graph that produced the truth they are scored on.
+    shasum -a 256 "$d/staged.gfa" | cut -d' ' -f1 > "$d/staged.gfa.sha"
     printf '  %-16s %s\n' "$name" "$(tail -1 "$d/stage.log")"
   done
 fi
@@ -151,12 +154,32 @@ if has_stage reads; then
   echo "=== simulating reads ==="
   for spec in "${PLANS[@]}"; do
     name="${spec%%:*}"; d="$OUT/$name"
-    if [ -f "$d/source/reads_1.fq" ]; then printf '  %-16s reused\n' "$name"; continue; fi
+    # Reads may be reused ONLY when they were drawn from the staged graph that is there now.  Reusing on
+    # mere existence is what produced round 14's false conclusion: the graph was regenerated after a
+    # fix, the FASTQs were not, and every later call scored reads from one pair of haplotypes against a
+    # truth projected from another.  Silence was the whole problem, so a mismatch is loud and re-draws.
+    want="$(cat "$d/staged.gfa.sha")"
+    have="$(cat "$d/source/graph.sha" 2>/dev/null || true)"
+    if [ -f "$d/source/reads_1.fq" ] && [ "$have" = "$want" ]; then
+      printf '  %-16s reused (reads match staged graph %s)\n' "$name" "$(echo "$want" | cut -c1-12)"
+      continue
+    fi
+    if [ -f "$d/source/reads_1.fq" ]; then
+      printf '  %-16s STALE READS: drawn from %s, staged graph is now %s -- re-simulating\n' \
+        "$name" "$(echo "${have:-none}" | cut -c1-12)" "$(echo "$want" | cut -c1-12)"
+    fi
     mkdir -p "$d/source"
     "$PROBE" simulate --gfa "$d/staged.gfa" --reference "$REFERENCE" --donor MOSAIC --depth "$DEPTH" \
       --read-length "$READ_LENGTH" --insert-mean "$INSERT_MEAN" --insert-sd "$INSERT_SD" \
       --sigmas "$SIGMAS" --error "$SUBSTITUTION_ERROR" --outlier "$OUTLIER_WEIGHT" \
       --seed "$SEED" --seed-salt "$name" --out "$d/source" > "$d/sim.log" 2>&1
+    cp "$d/staged.gfa.sha" "$d/source/graph.sha"
+    # The reads' own signature, so a later call can be bound to the exact draw it consumed.  Hashed by
+    # CONTENT, not by `shasum file1 file2`, whose output embeds the file paths: a path-sensitive
+    # signature reports tampering merely because the tree was copied or moved, which is a false alarm
+    # about the one thing these signatures exist to make trustworthy.
+    cat "$d/source/reads_1.fq" "$d/source/reads_2.fq" | shasum -a 256 | cut -d' ' -f1 \
+      > "$d/source/reads.sha"
     printf '  %-16s %s fragments\n' "$name" "$(awk -F'\t' '$1=="fragments_written"{print $2}' "$d/source/simulation.tsv")"
   done
 fi
@@ -171,6 +194,10 @@ if has_stage call; then
       --reads1 "$d/source/reads_1.fq" --reads2 "$d/source/reads_2.fq" --library "$d/source/library.txt" \
       --out-prefix "$d/call" --state-limit 1024 --prefixes "$CALL_PREFIXES" --phase-audit 0 --threads 2 \
       --panel-curation "$CURATION" > "$d/call.log" 2>&1 || true
+    # Bind this call to the exact read draw it consumed, so a later re-simulation cannot leave these
+    # outputs behind to be evaluated against a truth they never saw.  Without this line the check in
+    # check_binding never fires, because there is nothing to compare against.
+    cp "$d/source/reads.sha" "$d/call.reads.sha" 2>/dev/null || true
     if [ ! -f "$d/call.K0.mosaic_status.tsv" ]; then
       printf '  %-16s REFUSED before any K: %s\n' "$name" \
         "$(awk -F'\t' '$1=="note"{print substr($2,1,100)}' "$d/call.mosaic_status.tsv" 2>/dev/null)"
@@ -185,6 +212,92 @@ fi
 # The gate runs AFTER the call stage: it compares the model each call actually built, so it has nothing
 # to check until those statuses exist.
 if has_stage gate; then gate_models; fi
+
+# ---- 4b. eval: accuracy against the truth the reads were actually drawn from -----------------------
+# Every stage below re-checks the read/graph binding.  A call is only interpretable against the graph its
+# reads came from, and that is the invariant round 14 broke.
+check_binding() {
+  local d="$1" name="$2"
+  local want have
+  want="$(cat "$d/staged.gfa.sha" 2>/dev/null || true)"
+  have="$(cat "$d/source/graph.sha" 2>/dev/null || true)"
+  if [ -z "$want" ] || [ "$want" != "$have" ]; then
+    printf '  %-16s BINDING BROKEN: reads came from %s, staged graph is %s -- rerun the reads stage\n' \
+      "$name" "$(echo "${have:-none}" | cut -c1-12)" "$(echo "${want:-none}" | cut -c1-12)"
+    return 1
+  fi
+  # And the calls must belong to the reads they were made from.  Binding reads to their graph is not
+  # enough: re-drawing reads leaves existing call.K* outputs in place, and evaluating them would score a
+  # call made on one read set against a truth measured from another -- round 14's failure, one step
+  # along the chain.  Every link gets a signature, or the chain proves nothing.
+  local reads_now reads_then
+  reads_now="$(cat "$d/source/reads.sha" 2>/dev/null || true)"
+  reads_then="$(cat "$d/call.reads.sha" 2>/dev/null || true)"
+  if [ -n "$reads_then" ] && [ "$reads_now" != "$reads_then" ]; then
+    printf '  %-16s BINDING BROKEN: calls were made on reads %s, reads are now %s -- rerun the call stage\n' \
+      "$name" "$(echo "$reads_then" | cut -c1-12)" "$(echo "${reads_now:-none}" | cut -c1-12)"
+    return 1
+  fi
+  return 0
+}
+
+if has_stage eval; then
+  echo "=== accuracy against truth ==="
+  printf '%-16s %-3s %-20s %-22s %-6s %-13s %s\n' plan K status truth_in_ranked_prefix rank blocks_exact phase
+  for spec in "${PLANS[@]}"; do
+    name="${spec%%:*}"; d="$OUT/$name"
+    check_binding "$d" "$name" || continue
+    for k in ${CALL_PREFIXES//,/ }; do
+      s="$d/call.K$k.mosaic_status.tsv"
+      [ -f "$s" ] || continue
+      st="$(awk -F'\t' '$1=="status"{print $2}' "$s")"
+      if "$PROBE" evaluate --run-prefix "$d/call.K$k" --out "$d/eval.K$k" \
+           --scheme "c4-mosaic-$name-K$k" --donor MOSAIC --reference "$REFERENCE" \
+           --model-gfa "$d/staged.gfa" --truth-gfa "$d/staged.gfa" \
+           --panel-curation "$CURATION" > "$d/eval.K$k.log" 2>&1; then
+        awk -F'\t' -v N="$name" -v K="$k" -v ST="$st" \
+          '$1=="truth_in_ranked_prefix"{t=$2} $1=="truth_ranked_prefix_rank"{r=$2}
+           $1=="blocks_exact"{e=$2} $1=="phase_support"{p=$2}
+           END{printf "%-16s %-3s %-20s %-22s %-6s %-13s %s\n", N, K, ST, t, r, e, p}' "$d/eval.K$k.summary.tsv"
+      else
+        printf '%-16s %-3s %-20s (no call to evaluate)\n' "$name" "$k" "$st"
+      fi
+    done
+  done
+fi
+
+# ---- 4c. concord: do the tied winners agree block by block? ----------------------------------------
+# A refusal declines a whole-locus winner.  Whether the tied candidates nonetheless agree on each block
+# genotype is the measurement that decides whether a block-consensus call would be sound -- so the
+# harness produces it rather than leaving it to a one-off script.
+if has_stage concord; then
+  echo "=== winner-set block concordance ==="
+  for spec in "${PLANS[@]}"; do
+    name="${spec%%:*}"; d="$OUT/$name"
+    check_binding "$d" "$name" || continue
+    for k in ${CALL_PREFIXES//,/ }; do
+      python3 - "$d" "$name" "$k" <<'PY'
+import csv, os, sys
+d, name, k = sys.argv[1], sys.argv[2], sys.argv[3]
+sc, cd = f"{d}/call.K{k}.mosaic_scores.tsv", f"{d}/call.K{k}.mosaic_candidates.tsv"
+if not (os.path.exists(sc) and os.path.exists(cd)):
+    print(f"  {name:<16} K{k:<3} no scores/candidates written"); raise SystemExit
+rows = lambda p: list(csv.DictReader(open(p), delimiter='\t'))
+win = {r["representative_beam_candidate"] for r in rows(sc) if r.get("in_winner_set") == "true"}
+by_id = {c["candidate_id"]: c for c in rows(cd)}
+sel = [by_id[w] for w in win if w in by_id]
+if not sel:
+    print(f"  {name:<16} K{k:<3} winner set {len(win)}, none resolvable"); raise SystemExit
+al = lambda s: [int(x) for x in s.split(",") if x != ""]
+nb = len(al(sel[0]["hap1_alleles"]))
+agree = [b for b in range(nb)
+         if len({tuple(sorted((al(c["hap1_alleles"])[b], al(c["hap2_alleles"])[b]))) for c in sel}) == 1]
+note = "trivial: one winner" if len(sel) == 1 else ("unanimous" if len(agree) == nb else "disagree somewhere")
+print(f"  {name:<16} K{k:<3} winners={len(sel):<3} blocks_agreeing={len(agree)}/{nb}  {note}")
+PY
+    done
+  done
+fi
 
 # ---- 5. trace: the proposal-only diagnostic --------------------------------------------------------
 # Searches the COMPLETE final beam, not the ranked prefix written to mosaic_candidates.tsv.  An absent

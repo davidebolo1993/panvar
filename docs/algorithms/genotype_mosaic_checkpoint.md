@@ -130,6 +130,39 @@ equivalence set the scorer cannot separate by more than floating-point error, an
 separate by 0.401 and 0.358. The difficulty is in **separation**, downstream of proposal. That is a
 different investigation, and nothing here licenses changing the beam, the caps or the calling contract.
 
+### R15.6 Hardening the harness, and two defects found in the guards themselves
+
+Round 15 could not be frozen while the harness could still regenerate a staged graph and reuse whatever
+FASTQs happened to sit beside it, and while the accuracy and concordance tables in this document came
+from one-off scripts rather than from the committed artifact. Both are closed.
+
+**Every link in the chain now carries a signature.** Staging writes `staged.gfa.sha`. The reads stage
+reuses reads only when `source/graph.sha` matches it, and a mismatch is loud and re-draws rather than
+silently continuing -- silence was the whole of round 14's failure. Calling writes `call.reads.sha`, and
+`eval` and `concord` refuse to interpret a call whose reads have moved underneath it. `eval` and
+`concord` are stages of the harness now, so the tables in R15.3 and R15.5 are reproducible rather than
+reconstructed, and the concordance table labels a winner set of one as *trivial* instead of counting it
+as agreement.
+
+**Two defects in the guards, both found by testing them rather than by reading them.**
+
+The first was inert. The check compared `call.reads.sha` against `source/reads.sha`, but nothing ever
+wrote `call.reads.sha`, so the comparison was always against an empty string and could never fire. It
+would have sat in the harness indefinitely, reporting nothing, looking like protection.
+
+The second was worse, because it *did* fire. The signature was computed as
+`shasum -a 256 reads_1 reads_2 | shasum -a 256`, and `shasum`'s output embeds the file paths -- so the
+signature changed when the tree was copied. A deliberate stale-read test appeared to catch a second,
+unplanted case; it had actually caught a moved directory. A guard that fires for the wrong reason is more
+dangerous than one that never fires, because the false positive reads as proof that it works. The
+signature is now taken over content (`cat reads_1 reads_2 | shasum -a 256`).
+
+**Demonstrated, not asserted.** A copied tree raises no alarm. A planted stale graph is caught and
+re-drawn while the other four plans report reuse. A planted stale call is caught. And a re-simulation
+that genuinely reproduces its reads does **not** invalidate the calls made from them -- `simulate` was
+checked directly and is deterministic under identical arguments, so the guard separates *stale* from
+*regenerated* rather than flagging both.
+
 ## R14. Review round 14 — making round 13's results reproducible, and measuring before optimising
 
 Round 13 was accepted as trustworthy evidence, with four rulings: the ACOT 30x refusal is valid, the cyp2d6
