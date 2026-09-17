@@ -129,6 +129,67 @@ cap would obtain the complete 30x baseline that the production cap currently pre
 run, to learn what a full-coverage large locus costs. It is not a production cap change, and the linear scaling
 it would expose is the actual problem -- one that neither a higher cap nor an exact form cache addresses.
 
+### R14.7 The C4 synthetic-mosaic experiment — the proposal does not deliver the truth
+
+The off-panel fixture proves the machinery can recover a mosaic on a tiny locus. Every large-locus
+experiment so far used donors whose haplotypes were intact panel rows, so the correct answer needed zero
+switches and mosaic candidates never changed a call. `genotype_probe mosaic-truth` builds the missing
+input: two development donors, a per-block choice between them, and the result expressed twice by
+independent routes -- an allele path that `spell_mosaic` turns into the truth, and a spliced node walk
+that becomes a real GFA path reads can be simulated from. The two must agree byte for byte.
+
+Donors HG02666 x NA19240, 30x, two threads, five switch plans over C4's 11 blocks. Reads are simulated
+from the staged graph; the call is made against that same graph with the two mosaics **curated out**, so
+the panel is the 131 real templates and the truth exists in no panel row.
+
+| case | switches | blocks exact (of 11) | truth in candidates | nearest candidate | phase at K=8 |
+|---|---|---|---|---|---|
+| one_switch | 1 (sv:5) | 3 | **false** | 52 bp | READS_WITHIN_CANDIDATES |
+| bridgeable | 2 (sv:3, sv:5) | 9 | **false** | 6 bp | READS_WITHIN_CANDIDATES |
+| unbridgeable | 1 (ctx:8) | 6 | **false** | 110 bp | READS_WITHIN_CANDIDATES |
+| three_switches | 3 (sv:3, ctx:6, sv:9) | 1 | **false** | 107 bp | PRIOR_ONLY |
+| every_block | 10 (all) | 7 | **false** | 136 bp | READS_WITHIN_CANDIDATES |
+
+**Both truth alleles are available at all 11 blocks in every case.** The model can spell the truth; the
+candidate set never contains it. This is a proposal failure, not a ranking or representability failure,
+and `blocks_exact` merely records how close the nearest scored candidate happened to fall.
+
+**The budget is not the explanation, as far as it was tested.** K = 8 scored 8 of the 628-1,024 mosaics
+the beam found, so the obvious suspicion was that the truth was proposed and truncated away. Raising
+bridgeable to K = 256 -- 32 times the budget, 256 of 1,024 found mosaics scored -- changed **nothing**:
+`truth_in_candidates` false, nearest candidate still 6 bp, `blocks_exact` still 9, `phase_switch_blocks`
+still 0, every metric identical. `truth_proposal_rank` is `absent`, not merely unscored.
+
+This is not yet conclusive, and should not be quoted as if it were. `mosaic_candidates_found` reaches
+exactly 1,024 on two cases, which is the proposal state limit: the beam is saturating, so what it
+proposes is itself shaped by a cap. Scoring every found mosaic remains untested.
+
+**A second finding, from the same run.** one_switch at K = 256 refuses:
+`the best candidate cannot be separated from every rival by more than floating-point error; the
+equivalence set is reported instead of a call`. Adding 248 candidates produced rivals the caller cannot
+separate, and it declined to call rather than pick one. That is the fail-closed contract working on a
+route the resource caps never reach -- and its phase timings are populated (0.149 / 20.336 / 4.382 s),
+so R14.1's reporting fix covers this refusal path too.
+
+**Phase behaves as the design claims.** Every K = 0 arm reports `UNRESOLVED`: a panel-only set has no
+off-panel rival and cannot speak to phase. At K = 8 the cases with a mosaic in the set report
+`READS_WITHIN_CANDIDATES`, and three_switches reports `PRIOR_ONLY`. Where phase was claimed,
+`phase_switch_blocks` is 0 and `phased_distance_total` equals `unordered_distance_total`, so the claimed
+phasing introduces no switch error over what the unordered call already costs.
+
+**What this establishes, stated narrowly.** The caller does not recover a synthetic mosaic on C4 under
+any budget tried, because the proposal never offers it. No mosaic-recall claim -- on C4 or across loci
+-- is supportable from these runs, and none should be made. What the experiment does establish is that
+the machinery to test the question now exists and is honest: truth built two ways and cross-checked,
+sources reported as equivalence classes rather than named samples, and a caller that refuses rather than
+guesses when its candidates are inseparable.
+
+**An incidental constraint worth recording.** C4 is 71 forward to 60 reverse-oriented templates, and
+three of the eight frozen development donors -- HG00733, HG03371, NA20509 -- are reverse on both
+haplotypes. `mosaic-truth` refuses to splice across orientations rather than silently joining two walks
+that traverse the locus in opposite directions, so only five development donors are currently usable.
+Handling reverse orientation would roughly double the available pairs.
+
 ## R13. Review round 13 — the coverage ceiling, and a curated panel
 
 Round 12 was accepted, with the exact-atomic comparison reclassified as optional performance work. The ordered
