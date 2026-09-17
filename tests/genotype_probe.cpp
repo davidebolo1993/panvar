@@ -1817,6 +1817,231 @@ int anchors(const Args& args) {
 }
 
 // ------------------------------------------------------------------------------------------------
+// mosaic-truth: build a synthetic mosaic donor whose haplotypes are in no panel row
+// ------------------------------------------------------------------------------------------------
+
+// The existing off-panel fixture proves the machinery can recover a mosaic on a tiny locus. It does not
+// show that proposal and scoring recover one on a real repetitive locus, because every large-locus
+// experiment so far used donors whose haplotypes were intact panel rows: the correct answer needed zero
+// switches, and mosaic candidates never changed a call.
+//
+// This builds the missing input. Two development donors, a per-block choice between them, and the
+// result expressed TWICE by independent routes: as an allele path, which spell_mosaic turns into the
+// truth sequence and the per-block truth alleles; and as a spliced node walk, which becomes a real GFA
+// path reads can be simulated from. The two must agree byte for byte. If they do not, the splice is
+// wrong, and the run refuses rather than scoring a truth nobody verified.
+int mosaic_truth(const Args& args) {
+    const std::string reference = args.required("reference");
+    const std::string stage =
+        (std::filesystem::temp_directory_path() /
+         ("genotype_probe_mosaic_" + std::to_string(::getpid()) + ".sorted.gfa")).string();
+    // The staged graph is kept, not deleted here: it is the base the mosaic paths are written onto.
+    // Everything below -- the walks, the node sequences, the boundary nodes -- lives in SORTED node ids,
+    // and reference sorting renumbers nodes, so writing those ids onto the original file would produce
+    // paths whose ids name different nodes. Same id space in, same id space out.
+    const LoadedModel loaded = load_model(args.required("gfa"), reference, stage,
+                                          std::stoul(args.get("min-variant-bp", "50")));
+    const panvar::PreparedGenotypeModel& model = *loaded.model;
+    const std::size_t blocks = model.blocks().size();
+
+    const std::string donor_a = args.required("donor-a");
+    const std::string donor_b = args.required("donor-b");
+
+    // Panel rows of each donor, in name order, so hap 1 and hap 2 are taken consistently.
+    const auto rows_of = [&](const std::string& donor) {
+        std::vector<std::size_t> rows;
+        for (std::size_t r = 0; r < model.panel().template_count(); ++r) {
+            if (model.panel().template_names[r].rfind(donor + "#", 0) == 0) rows.push_back(r);
+        }
+        if (rows.size() != 2) {
+            throw std::runtime_error("donor " + donor + " must have exactly two panel rows, found " +
+                                     std::to_string(rows.size()));
+        }
+        return rows;
+    };
+    const std::vector<std::size_t> rows_a = rows_of(donor_a);
+    const std::vector<std::size_t> rows_b = rows_of(donor_b);
+
+    // A reverse-oriented walk runs opposite to chain order, so splicing it against a forward one at a
+    // shared boundary node would join two walks that traverse the locus in opposite directions. Refused
+    // rather than handled: this experiment does not need it, and a silent wrong splice would look like
+    // a caller failure.
+    for (const std::size_t r : {rows_a[0], rows_a[1], rows_b[0], rows_b[1]}) {
+        if (model.template_source_orientations()[r] != panvar::ChainOrientation::Forward) {
+            throw std::runtime_error("mosaic donors must be forward-oriented; " +
+                                     model.panel().template_names[r] + " is not");
+        }
+    }
+
+    // Switch plan: which donor supplies each block. "every" alternates at every block; otherwise a
+    // comma-separated list of block indices at which the source flips.
+    const std::string spec = args.get("switches", "");
+    std::vector<int> donor_of_block(blocks, 0);
+    if (spec == "every") {
+        for (std::size_t b = 0; b < blocks; ++b) donor_of_block[b] = static_cast<int>(b % 2);
+    } else {
+        std::set<std::size_t> flips;
+        std::stringstream ss(spec);
+        std::string token;
+        while (std::getline(ss, token, ',')) {
+            if (!token.empty()) flips.insert(std::stoul(token));
+        }
+        if (flips.empty()) throw std::runtime_error("--switches must name at least one block, or 'every'");
+        int current = 0;
+        for (std::size_t b = 0; b < blocks; ++b) {
+            if (flips.count(b) != 0) current = 1 - current;
+            donor_of_block[b] = current;
+        }
+    }
+    const std::size_t switches = [&] {
+        std::size_t n = 0;
+        for (std::size_t b = 1; b < blocks; ++b) n += donor_of_block[b] != donor_of_block[b - 1];
+        return n;
+    }();
+    if (switches == 0) throw std::runtime_error("the plan produces no switch: that is not a mosaic");
+
+    // Route one: the allele path, and the truth it defines.
+    std::vector<panvar::MosaicPath> mosaic_paths(2);
+    for (std::size_t h = 0; h < 2; ++h) {
+        mosaic_paths[h].alleles.resize(blocks);
+        for (std::size_t b = 0; b < blocks; ++b) {
+            const std::size_t row = donor_of_block[b] == 0 ? rows_a[h] : rows_b[h];
+            mosaic_paths[h].alleles[b] = model.panel().template_alleles[row][b];
+        }
+    }
+    // Neither mosaic may coincide with a panel row: if it does, the correct answer is reachable without
+    // recombining and the experiment tests nothing it claims to.
+    for (std::size_t h = 0; h < 2; ++h) {
+        for (std::size_t r = 0; r < model.panel().template_count(); ++r) {
+            if (model.panel().template_alleles[r] == mosaic_paths[h].alleles) {
+                throw std::runtime_error("mosaic haplotype " + std::to_string(h + 1) +
+                                         " is exactly panel row " + model.panel().template_names[r] +
+                                         "; choose different donors or switch points");
+            }
+        }
+    }
+
+    // Route two: splice the node walks, block by block, at the boundary nodes every template shares.
+    const auto path_named = [&](const std::string& name) {
+        for (const panvar::PathRecord& path : loaded.sorted.graph.paths) {
+            if (path.name == name) return &path;
+        }
+        throw std::runtime_error("no graph path named " + name);
+        return static_cast<const panvar::PathRecord*>(nullptr);
+    };
+    const auto index_of_node = [](const panvar::PathRecord& path, const std::string& node) {
+        for (std::size_t i = 0; i < path.steps.size(); ++i) {
+            if (path.steps[i].node_id == node) return i;
+        }
+        throw std::runtime_error("path " + path.name + " does not visit boundary node " + node);
+        return std::size_t{0};
+    };
+
+    std::vector<std::vector<panvar::PathStep>> walks(2);
+    for (std::size_t h = 0; h < 2; ++h) {
+        for (std::size_t b = 0; b < blocks; ++b) {
+            const std::size_t row = donor_of_block[b] == 0 ? rows_a[h] : rows_b[h];
+            const panvar::PathRecord& path = *path_named(model.panel().template_names[row]);
+            const std::string& source = loaded.built.report.blocks[b].source_node;
+            const std::string& sink = loaded.built.report.blocks[b].sink_node;
+            const std::size_t from = source.empty() ? 0 : index_of_node(path, source);
+            const std::size_t to = sink.empty() ? path.steps.size() : index_of_node(path, sink);
+            for (std::size_t i = from; i < to; ++i) walks[h].push_back(path.steps[i]);
+        }
+        // Every junction must be a real edge. A splice that is not is not a haplotype.
+        for (std::size_t i = 1; i < walks[h].size(); ++i) {
+            if (!loaded.sorted.graph.has_edge_between(walks[h][i - 1].node_id, walks[h][i].node_id)) {
+                throw std::runtime_error("spliced walk leaves the graph between " +
+                                         walks[h][i - 1].node_id + " and " + walks[h][i].node_id);
+            }
+        }
+    }
+
+    // The two routes must agree. This is the check that the splice reproduces the allele path, rather
+    // than something plausible that merely looks like a haplotype.
+    for (std::size_t h = 0; h < 2; ++h) {
+        std::string walked;
+        for (const panvar::PathStep& step : walks[h]) {
+            const auto found = loaded.sorted.gfa.seq.find(step.node_id);
+            if (found == loaded.sorted.gfa.seq.end()) {
+                throw std::runtime_error("spliced walk names an unknown node " + step.node_id);
+            }
+            walked += found->second;
+        }
+        const std::string spelled = panvar::spell_mosaic(model, mosaic_paths[h]).bases;
+        if (walked != spelled) {
+            throw std::runtime_error(
+                "mosaic haplotype " + std::to_string(h + 1) + ": the spliced walk spells " +
+                std::to_string(walked.size()) + " bases but its allele path spells " +
+                std::to_string(spelled.size()) + "; the splice does not reproduce the truth");
+        }
+    }
+
+    // The staged graph: the original, plus the two mosaic paths, so simulate --donor MOSAIC can draw
+    // reads from haplotypes that exist in no panel row.
+    const std::string out_gfa = args.required("out-gfa");
+    {
+        // The SORTED graph, not the original: the walks above are in sorted node ids. Node 19 is a
+        // different base in the two id spaces, so appending sorted-id paths to the original file
+        // produces a path that leaves the graph at the first renumbered node -- which is exactly how
+        // this failed the first time, with the model refusing "steps from 16+ to 19+ but the graph has
+        // no such link". A later re-sort of this staged file is harmless, because a sort renames S, L
+        // and P lines together.
+        panvar::GzLineReader reader(stage);
+        if (!reader.ok()) throw std::runtime_error("cannot reopen the sorted graph to stage the mosaic");
+        std::ofstream out(out_gfa);
+        std::string line;
+        while (reader.getline(line)) out << line << '\n';
+        for (std::size_t h = 0; h < 2; ++h) {
+            out << "P\tMOSAIC#" << (h + 1) << "#synthetic:0-0\t";
+            for (std::size_t i = 0; i < walks[h].size(); ++i) {
+                out << (i ? "," : "") << walks[h][i].node_id << (walks[h][i].reverse ? '-' : '+');
+            }
+            out << "\t*\n";
+        }
+    }
+    // Scratch, and only needed until the staged copy exists.
+    std::filesystem::remove(stage);
+
+    // The truth table. Source samples are reported as an EQUIVALENCE CLASS of every panel template
+    // carrying that exact block sequence: several samples may carry an identical allele, which makes
+    // the originating sample statistically unidentifiable and a "source sample" column a fiction.
+    std::ostringstream truth;
+    truth << "block_id\tkind\thap1_allele_bp\thap2_allele_bp\thap1_from\thap2_from\t"
+             "hap1_carriers\thap2_carriers\n";
+    for (std::size_t b = 0; b < blocks; ++b) {
+        const panvar::PreparedGenotypeBlock& block = model.blocks()[b];
+        truth << block.block_id << '\t'
+              << (block.kind == panvar::GenotypeBlockKind::Variant ? "SV" : "context");
+        for (std::size_t h = 0; h < 2; ++h) {
+            truth << '\t' << block.alleles[mosaic_paths[h].alleles[b]].sequence.size();
+        }
+        for (std::size_t h = 0; h < 2; ++h) truth << '\t' << (donor_of_block[b] == 0 ? donor_a : donor_b);
+        for (std::size_t h = 0; h < 2; ++h) {
+            std::vector<std::string> carriers;
+            for (std::size_t r = 0; r < model.panel().template_count(); ++r) {
+                if (model.panel().template_alleles[r][b] == mosaic_paths[h].alleles[b]) {
+                    carriers.push_back(model.panel().template_names[r]);
+                }
+            }
+            truth << '\t' << carriers.size() << ":";
+            for (std::size_t i = 0; i < carriers.size() && i < 4; ++i) {
+                truth << (i ? "," : "") << carriers[i];
+            }
+            if (carriers.size() > 4) truth << ",...";
+        }
+        truth << '\n';
+    }
+    const std::string out_truth = args.required("out");
+    { std::ofstream file(out_truth); file << truth.str(); }
+
+    std::cout << "mosaic-truth " << donor_a << " x " << donor_b << ": " << switches
+              << " switch(es) over " << blocks << " blocks; both routes agree; staged " << out_gfa
+              << '\n';
+    return 0;
+}
+
+// ------------------------------------------------------------------------------------------------
 // form-census: how much placement work is spent re-scanning read sequence that already occurred
 // ------------------------------------------------------------------------------------------------
 
@@ -2083,6 +2308,7 @@ int main(int argc, char** argv) {
         if (command == "respell") return respell(args);
         if (command == "coverage-audit") return coverage_audit(args);
         if (command == "form-census") return form_census(args);
+        if (command == "mosaic-truth") return mosaic_truth(args);
         std::cerr << "unknown probe command: " << command << '\n';
         return 2;
     } catch (const std::exception& error) {
