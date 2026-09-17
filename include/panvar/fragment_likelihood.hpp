@@ -316,6 +316,36 @@ struct FragmentScoringObservation {
     double seconds_diploid_combination = 0.0;
 };
 
+// A measurement, not an optimisation. Oriented read forms repeat -- four forms per fragment, and at
+// depth many fragments carry identical sequence -- so their placements could in principle be computed
+// once per distinct sequence and reused. Whether that is worth building depends on the saving in PIECE
+// HITS, not in forms: duplicate forms are plausibly the repetitive ones that contribute
+// disproportionately many hits, so the form-level collapse is not the answer. This reports both, and
+// the exact weighted prediction, so the decision rests on the quantity that actually costs.
+struct PieceHitCensus {
+    std::size_t total_forms = 0;
+    std::size_t unique_forms = 0;
+    // Seed entries across every piece-length bucket, and how many survive a collapse to one form per
+    // distinct sequence.
+    std::uint64_t total_entries = 0;
+    std::uint64_t unique_entries = 0;
+    // The scorer's own scan, counted rather than placed: sum over scanned positions of the entries
+    // matching that seed. `unique` is the same sum counting only the first form of each distinct
+    // sequence, which is exactly what a collapse would leave. Their ratio is the predicted saving.
+    std::uint64_t predicted_piece_hits_all = 0;
+    std::uint64_t predicted_piece_hits_unique = 0;
+    // Distribution, so a mean saving cannot hide a single pathological seed or haplotype.
+    std::uint64_t max_piece_hits_at_one_seed = 0;
+    std::uint64_t max_piece_hits_one_haplotype = 0;
+};
+
+// Builds the same forms and piece indexes the scorer builds and scans the same haplotypes, counting
+// hits instead of placing them. Changes nothing and is never called from scoring.
+PieceHitCensus census_piece_hits(
+    const InternedHaplotypes& haplotypes,
+    const std::vector<ReadPair>& fragments,
+    const FragmentScoringOptions& options);
+
 // `observed_on_failure`, when given, receives the work performed when a cap was reached, so a refused
 // run can report what it actually did rather than nothing at all.
 FragmentScoringResult score_diplotypes(

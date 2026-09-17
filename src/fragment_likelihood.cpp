@@ -507,6 +507,87 @@ void collect_form_placements(
 
 } // namespace
 
+PieceHitCensus census_piece_hits(
+    const InternedHaplotypes& haplotypes,
+    const std::vector<ReadPair>& fragments,
+    const FragmentScoringOptions& options) {
+    PieceHitCensus census;
+    const std::size_t band = options.mismatch_band;
+
+    // The same four oriented forms per fragment the scorer builds.
+    std::vector<ReadForm> forms;
+    forms.reserve(fragments.size() * 4);
+    for (std::size_t f = 0; f < fragments.size(); ++f) {
+        validate_read_pair(fragments[f]);
+        forms.push_back({f, fragments[f].first.bases, true});
+        forms.push_back({f, reverse_complement_read(fragments[f].first.bases), false});
+        forms.push_back({f, fragments[f].second.bases, false});
+        forms.push_back({f, reverse_complement_read(fragments[f].second.bases), true});
+    }
+    census.total_forms = forms.size();
+    if (forms.empty()) return census;
+
+    // A collapse keeps exactly the first form of each distinct sequence; every other form would be
+    // answered from it. Marking them is what makes the prediction exact rather than proportional.
+    std::set<std::string> seen;
+    std::vector<char> first_of_sequence(forms.size(), 0);
+    for (std::size_t i = 0; i < forms.size(); ++i) {
+        if (seen.insert(forms[i].bases).second) first_of_sequence[i] = 1;
+    }
+    census.unique_forms = seen.size();
+
+    const std::vector<PieceIndex> indexes = build_piece_indexes(forms, band, options.minimum_piece_bp);
+    for (const PieceIndex& index : indexes) {
+        census.total_entries += index.entries.size();
+        for (const PieceEntry& entry : index.entries) {
+            census.unique_entries += first_of_sequence[entry.form];
+        }
+    }
+
+    for (const std::string& haplotype : haplotypes.sequences) {
+        std::uint64_t hits_here = 0;
+        for (const PieceIndex& index : indexes) {
+            const std::size_t piece = index.piece_bp;
+            if (piece == 0 || haplotype.size() < piece) continue;
+            const std::uint64_t mask = piece >= 32 ? ~0ULL : ((1ULL << (2 * piece)) - 1);
+            std::uint64_t code = 0;
+            std::size_t valid = 0;
+            for (std::size_t at = 0; at < haplotype.size(); ++at) {
+                const std::uint64_t bits = two_bit(haplotype[at]);
+                if (bits == kNoCode) {
+                    valid = 0;
+                    code = 0;
+                    continue;
+                }
+                code = ((code << 2) | bits) & mask;
+                if (++valid < piece) continue;
+                const auto range = std::equal_range(
+                    index.entries.begin(), index.entries.end(), code,
+                    [](const auto& lhs, const auto& rhs) {
+                        if constexpr (std::is_same_v<std::decay_t<decltype(lhs)>, PieceEntry>) {
+                            return lhs.code < rhs;
+                        } else {
+                            return lhs < rhs.code;
+                        }
+                    });
+                std::uint64_t all = 0;
+                std::uint64_t unique = 0;
+                for (auto it = range.first; it != range.second; ++it) {
+                    ++all;
+                    unique += first_of_sequence[it->form];
+                }
+                census.predicted_piece_hits_all += all;
+                census.predicted_piece_hits_unique += unique;
+                hits_here += all;
+                census.max_piece_hits_at_one_seed = std::max(census.max_piece_hits_at_one_seed, all);
+            }
+        }
+        census.max_piece_hits_one_haplotype =
+            std::max(census.max_piece_hits_one_haplotype, hits_here);
+    }
+    return census;
+}
+
 double FragmentScoringResult::mass_of(std::size_t fragment, std::size_t haplotype) const {
     if (unique_haplotypes == 0 || haplotype >= unique_haplotypes ||
         fragment * unique_haplotypes + haplotype >= log_mass.size()) {

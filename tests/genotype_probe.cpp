@@ -1817,6 +1817,79 @@ int anchors(const Args& args) {
 }
 
 // ------------------------------------------------------------------------------------------------
+// form-census: how much placement work is spent re-scanning read sequence that already occurred
+// ------------------------------------------------------------------------------------------------
+
+// A measurement taken BEFORE deciding whether to deduplicate oriented read forms, and deliberately not
+// the optimisation itself. The tempting number -- what fraction of forms are duplicates -- is the wrong
+// one: what costs is piece hits, and a duplicated form is plausibly a repetitive one contributing far
+// more hits than average. So this reports the form collapse, the seed-entry collapse, and the exact
+// weighted prediction, and lets them disagree.
+int form_census(const Args& args) {
+    const std::string reference = args.required("reference");
+    const std::string stage =
+        (std::filesystem::temp_directory_path() /
+         ("genotype_probe_census_" + std::to_string(::getpid()) + ".sorted.gfa")).string();
+    const std::string curation_path = args.get("panel-curation", "");
+    const LoadedModel loaded =
+        load_model(args.required("gfa"), reference, stage,
+                   std::stoul(args.get("min-variant-bp", "50")),
+                   curation_path.empty() ? std::vector<std::string>{}
+                                         : read_panel_curation(curation_path));
+    std::filesystem::remove(stage);
+    const panvar::PreparedGenotypeModel& model = *loaded.model;
+
+    // The panel is what placement scans: one haplotype per panel row.
+    std::vector<panvar::MosaicPath> paths;
+    std::vector<std::string> sequences;
+    for (std::size_t row = 0; row < model.panel().template_count(); ++row) {
+        paths.push_back(panvar::MosaicPath{model.panel().template_alleles[row]});
+        sequences.push_back(panvar::spell_mosaic(model, paths.back()).bases);
+    }
+    const panvar::InternedHaplotypes interned = panvar::intern_haplotypes(paths, sequences);
+
+    const std::vector<panvar::ReadPair> fragments =
+        read_pairs(args.required("reads1"), args.required("reads2"));
+    panvar::FragmentScoringOptions options;
+    options.mismatch_band = std::stoul(args.get("band", "6"));
+    options.minimum_piece_bp = std::stoul(args.get("minimum-piece-bp", "12"));
+
+    const panvar::PieceHitCensus census = panvar::census_piece_hits(interned, fragments, options);
+
+    const auto saving = [](std::uint64_t kept, std::uint64_t whole) {
+        return whole == 0 ? 0.0
+                          : 100.0 * (1.0 - static_cast<double>(kept) / static_cast<double>(whole));
+    };
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(2);
+    out << "key\tvalue\n"
+        << "locus\t" << loaded.sorted.resolved << '\n'
+        << "panel_curation\t" << (curation_path.empty() ? "none" : curation_path) << '\n'
+        << "panel_rows\t" << model.panel().template_count() << '\n'
+        << "unique_haplotypes\t" << interned.sequences.size() << '\n'
+        << "fragments\t" << fragments.size() << '\n'
+        << "total_forms\t" << census.total_forms << '\n'
+        << "unique_forms\t" << census.unique_forms << '\n'
+        << "form_collapse_percent\t" << saving(census.unique_forms, census.total_forms) << '\n'
+        << "total_seed_entries\t" << census.total_entries << '\n'
+        << "unique_seed_entries\t" << census.unique_entries << '\n'
+        << "seed_entry_collapse_percent\t" << saving(census.unique_entries, census.total_entries) << '\n'
+        << "piece_hits_all_forms\t" << census.predicted_piece_hits_all << '\n'
+        << "piece_hits_unique_forms\t" << census.predicted_piece_hits_unique << '\n'
+        // The number the deduplication decision rests on, and the only one of the three that does.
+        << "predicted_piece_hit_reduction_percent\t"
+        << saving(census.predicted_piece_hits_unique, census.predicted_piece_hits_all) << '\n'
+        << "max_piece_hits_at_one_seed\t" << census.max_piece_hits_at_one_seed << '\n'
+        << "max_piece_hits_one_haplotype\t" << census.max_piece_hits_one_haplotype << '\n';
+    std::cout << out.str();
+    if (!args.get("out", "").empty()) {
+        std::ofstream file(args.get("out", ""));
+        file << out.str();
+    }
+    return 0;
+}
+
+// ------------------------------------------------------------------------------------------------
 // trace: follow the leave-zero-out truth pair through every proposal layer
 // ------------------------------------------------------------------------------------------------
 
@@ -2009,6 +2082,7 @@ int main(int argc, char** argv) {
         if (command == "preflight") return preflight(args);
         if (command == "respell") return respell(args);
         if (command == "coverage-audit") return coverage_audit(args);
+        if (command == "form-census") return form_census(args);
         std::cerr << "unknown probe command: " << command << '\n';
         return 2;
     } catch (const std::exception& error) {

@@ -96,13 +96,38 @@ ACOT series:
 | 10x | 13,230 | 52,920 | 51,034 | 3.6% | 0 |
 | 30x | 39,999 | 159,996 | 144,362 | **9.8%** | 4 |
 
-Collapse grows with depth, as it must -- more reads from one locus means more repeated 100-mers -- but at 30x it
-is 9.8%, well under the 20% bar set for implementing the cache. **This does not settle the question.** It counts
-FORMS, and the quantity that matters is PIECE HITS: duplicate forms are plausibly the repetitive ones that
-contribute disproportionately many hits, so the weighted saving could be larger or smaller than 9.8%. The exact
-prediction is `sum over codes of occurrences[code] x entries[code]` before and after collapse, which needs a
-diagnostic export because `PieceIndex` is internal to the scorer. That measurement is outstanding, and no
-conclusion about deduplication should be drawn from the table above alone.
+Collapse grows with depth, as it must -- more reads from one locus means more repeated 100-mers. But forms are
+not what costs; piece hits are. `census_piece_hits` builds the same forms and indexes the scorer builds, scans
+the same haplotypes, and counts hits instead of placing them, with and without collapsing each distinct sequence
+to its first form. It changes nothing and is never called from scoring. `genotype_probe form-census` reports it.
+
+| coverage | form collapse | seed-entry collapse | piece hits, all forms | piece hits, unique forms | predicted reduction |
+|---|---|---|---|---|---|
+| 2x | 0.77% | 0.77% | 149,814,247 | 148,988,133 | **0.55%** |
+| 10x | 3.56% | 3.56% | 751,854,315 | 727,678,695 | **3.22%** |
+| 30x | 9.77% | 9.77% | 2,255,437,567 | 2,046,971,082 | **9.24%** |
+
+**The hypothesis this measurement was taken to test is refuted.** The argument for measuring piece hits rather
+than forms was that duplicated forms are plausibly the repetitive ones, contributing disproportionately many hits
+and making the weighted saving larger than the form collapse. It is consistently smaller -- 9.24% against 9.77%
+at 30x, and 0.55% against 0.77% at 2x. Duplicated forms contribute slightly FEWER hits than average, so the
+form-level figure was a mild over-estimate of the benefit rather than an under-estimate. Taking the measurement
+still mattered: the reasoning that predicted otherwise was sound, and only the number settles it.
+
+**Deduplication is not worth building, and would not have been sufficient anyway.** 9.24% at 30x is far under the
+20% bar. More decisively, the census computes the complete workload the cap truncates -- **2,255,437,567** piece
+hits, which independently confirms the ~2.25 billion extrapolated from the linear 2x-to-10x scaling -- and even a
+perfect cache leaves **2,046,971,082**, still above the 2,000,000,000 cap. The exact optimisation proposed as the
+alternative to raising the cap would not by itself make ACOT 30x complete.
+
+Nor is the cost concentrated anywhere a targeted fix could reach: the worst single seed accounts for 1,548 hits
+and the worst haplotype for 6,310,047, against 2.26 billion in total. The work is spread, and it scales linearly
+with coverage.
+
+What follows from that is a measurement, not a new default: four threads with a temporary 3-billion diagnostic
+cap would obtain the complete 30x baseline that the production cap currently prevents. That is a setting for one
+run, to learn what a full-coverage large locus costs. It is not a production cap change, and the linear scaling
+it would expose is the actual problem -- one that neither a higher cap nor an exact form cache addresses.
 
 ## R13. Review round 13 — the coverage ceiling, and a curated panel
 
