@@ -265,6 +265,12 @@ struct RankingSummary {
     std::vector<double> block_genotype_posterior;
     std::vector<double> block_genotype_quality;
     std::vector<bool> block_numerically_separated;
+    // Block consensus only, and zero on every other path. When no whole-locus winner can be certified,
+    // these count the blocks on which every tied candidate agreed -- which were called -- and those on
+    // which they disagreed, which were no-called individually. A reader must be able to tell a consensus
+    // run that called ten of eleven blocks from one that called two, without parsing the rows.
+    std::size_t consensus_blocks_called = 0;
+    std::size_t consensus_blocks_no_called = 0;
 };
 
 void write_status(
@@ -439,6 +445,8 @@ void write_status(
             << '\n';
         if (summary != nullptr) {
             out << "sequence_candidates\t" << summary->sequence_candidates << '\n';
+            out << "consensus_blocks_called\t" << summary->consensus_blocks_called << '\n';
+            out << "consensus_blocks_no_called\t" << summary->consensus_blocks_no_called << '\n';
             out << "beam_candidates_collapsed_by_sequence\t" << summary->collapsed_beam_candidates
                 << '\n';
             // Phase the reads did not choose is not reported as read-supported. Unordered block
@@ -495,8 +503,35 @@ const char* genotype_run_status_name(GenotypeRunStatus status) {
         case GenotypeRunStatus::CandidateIncomplete: return "CANDIDATE_INCOMPLETE";
         case GenotypeRunStatus::SpellingIncomplete: return "SPELLING_INCOMPLETE";
         case GenotypeRunStatus::RescoreIncomplete: return "RESCORE_INCOMPLETE";
+        case GenotypeRunStatus::BlockConsensus: return "BLOCK_CONSENSUS";
     }
     return "MODEL_INCOMPLETE";
+}
+
+std::vector<BlockConsensusCall> block_consensus(
+    const std::vector<std::vector<std::pair<std::size_t, std::size_t>>>& tied_genotypes) {
+    if (tied_genotypes.empty()) return {};
+    std::size_t blocks = tied_genotypes.front().size();
+    for (const auto& row : tied_genotypes) blocks = std::min(blocks, row.size());
+    std::vector<BlockConsensusCall> out(blocks);
+    for (std::size_t b = 0; b < blocks; ++b) {
+        const std::pair<std::size_t, std::size_t> here = tied_genotypes.front()[b];
+        bool agreed = true;
+        for (const auto& row : tied_genotypes) {
+            if (row[b] != here) {
+                agreed = false;
+                break;
+            }
+        }
+        out[b].agreed = agreed;
+        // The pair is reported only when it is agreed; an unagreed block has no consensus genotype and
+        // must not be given one that happens to belong to whichever candidate came first.
+        if (agreed) {
+            out[b].allele1 = here.first;
+            out[b].allele2 = here.second;
+        }
+    }
+    return out;
 }
 
 std::string audited_phase_support(const std::string& within_candidates, bool audit_complete, bool same_winner,
@@ -1237,11 +1272,142 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             set_report.distinct_haplotype_paths = candidate_report.distinct_haplotype_paths;
             set_report.haploid_prior_evaluations = candidate_report.haploid_prior_evaluations;
             set_report.diploid_prior_lookups = candidate_report.diploid_prior_lookups;
+            // BLOCK CONSENSUS. Scoring finished; what could not be done is separating a single
+            // whole-locus diplotype. certify_scored_ranking sets RescoreIncomplete in exactly one place
+            // -- more than one candidate inseparable from the best -- and every other incompleteness
+            // (model, resource, candidate construction, spelling) has already returned above. Reaching
+            // here therefore means a numerical tie and nothing else.
+            //
+            // Different phased histories can spell the same unordered genotype at every block, and short
+            // reads may carry no information that separates them. Where every tied candidate agrees on a
+            // block, that block's genotype is supported by the whole tied set and is emitted. Where they
+            // disagree, only that block is no-called. Phase stays UNRESOLVED and no phased haplotype is
+            // written: the reads did not choose one, and inventing it is the error being avoided.
+            //
+            // Refused when the candidate set itself is incomplete. A pruned search omitted candidates it
+            // never proposed, so unanimity among those it happened to retain says nothing about those it
+            // did not -- consensus would be agreement of an unrepresentative sample.
+            const bool candidates_complete = panel_only || !beam.candidate_set_conditional;
+            const std::size_t block_count = model.blocks().size();
+            std::vector<std::vector<std::pair<std::size_t, std::size_t>>> tied_genotypes;
+            if (candidates_complete) {
+                for (const std::size_t id : ranking.winner_set) {
+                    const MosaicDiplotype& tied =
+                        candidates[sequence_candidates[id].representative].diplotype;
+                    std::vector<std::pair<std::size_t, std::size_t>> row(block_count);
+                    for (std::size_t b = 0; b < block_count; ++b) {
+                        row[b] = std::minmax(tied.first.alleles[b], tied.second.alleles[b]);
+                    }
+                    tied_genotypes.push_back(std::move(row));
+                }
+            }
+            // The rule itself is the gated pure function, so what ships is what the fixtures test.
+            const std::vector<BlockConsensusCall> consensus_calls = block_consensus(tied_genotypes);
+            std::vector<std::pair<std::size_t, std::size_t>> consensus(block_count, {0, 0});
+            std::vector<bool> agreed(block_count, false);
+            std::size_t consensus_called = 0;
+            for (std::size_t b = 0; b < block_count && b < consensus_calls.size(); ++b) {
+                agreed[b] = consensus_calls[b].agreed;
+                consensus[b] = {consensus_calls[b].allele1, consensus_calls[b].allele2};
+                consensus_called += agreed[b] ? 1 : 0;
+            }
+
+            if (candidates_complete && consensus_called > 0) {
+                // The reads chose no whole-locus history, so no phase claim survives, whatever the
+                // within-candidate analysis concluded before the tie was known.
+                summary.phase_support = "UNRESOLVED";
+                summary.consensus_blocks_called = consensus_called;
+                summary.consensus_blocks_no_called = block_count - consensus_called;
+                const auto sources_of = [&](const PreparedGenotypeBlock& block, std::size_t id) {
+                    std::string joined;
+                    for (const std::string& source : block.alleles[id].source_ids) {
+                        if (!joined.empty()) joined += ',';
+                        joined += source;
+                    }
+                    return joined;
+                };
+                {
+                    std::ofstream out = open_output(options.out_prefix + ".genotypes.tsv");
+                    out << "block_id\tkind\tallele1\tallele2\tallele1_bp\tallele2_bp\tallele1_sources\t"
+                           "allele2_sources\tzygosity\tconditional_genotype_posterior\tconditional_GQ\n";
+                    for (std::size_t b = 0; b < block_count; ++b) {
+                        const PreparedGenotypeBlock& block = model.blocks()[b];
+                        if (block.kind != GenotypeBlockKind::Variant) continue;
+                        if (!agreed[b]) {
+                            // Emitted as an explicit no-call rather than omitted: a missing row is
+                            // indistinguishable from a block that was never modelled.
+                            out << block.block_id << "\tSV\t.\t.\t.\t.\t.\t.\tNOCALL\tNA\tNA\n";
+                            continue;
+                        }
+                        const std::size_t a1 = consensus[b].first;
+                        const std::size_t a2 = consensus[b].second;
+                        out << block.block_id << "\tSV\t" << a1 << '\t' << a2 << '\t'
+                            << block.alleles[a1].sequence.size() << '\t'
+                            << block.alleles[a2].sequence.size() << '\t' << sources_of(block, a1) << '\t'
+                            << sources_of(block, a2) << '\t' << (a1 == a2 ? "HOM" : "HET") << '\t'
+                            << std::setprecision(12) << summary.block_genotype_posterior[b] << '\t'
+                            << summary.block_genotype_quality[b] << std::setprecision(6) << '\n';
+                    }
+                }
+                {
+                    std::ofstream out = open_output(options.out_prefix + ".block_genotypes.tsv");
+                    out << "block_id\tkind\treportable\tallele1\tallele2\tallele1_bp\tallele2_bp\t"
+                           "zygosity\tprojection_ambiguous\tgenotype_support\tphase_support\t"
+                           "conditional_genotype_posterior\tconditional_GQ\tnumerically_separated\t"
+                           "candidate_scope\n";
+                    for (std::size_t b = 0; b < block_count; ++b) {
+                        const PreparedGenotypeBlock& block = model.blocks()[b];
+                        const bool variant = block.kind == GenotypeBlockKind::Variant;
+                        out << block.block_id << '\t' << (variant ? "SV" : "context") << '\t'
+                            << (variant ? "true" : "false") << '\t';
+                        if (!agreed[b]) {
+                            out << ".\t.\t.\t.\tNOCALL\tfalse\tNOCALL\tUNRESOLVED\tNA\tNA\tfalse\t"
+                                << candidate_scope_name(panel_only, beam.candidate_set_conditional)
+                                << '\n';
+                            continue;
+                        }
+                        const std::size_t a1 = consensus[b].first;
+                        const std::size_t a2 = consensus[b].second;
+                        out << a1 << '\t' << a2 << '\t' << block.alleles[a1].sequence.size() << '\t'
+                            << block.alleles[a2].sequence.size() << '\t' << (a1 == a2 ? "HOM" : "HET")
+                            << "\tfalse\t"
+                            << (summary.block_genotype_read_supported[b] ? "READS" : "PRIOR_ONLY")
+                            << "\tUNRESOLVED\t" << std::setprecision(12)
+                            << summary.block_genotype_posterior[b] << '\t'
+                            << summary.block_genotype_quality[b] << std::setprecision(6) << '\t'
+                            << (summary.block_numerically_separated[b] ? "true" : "false") << '\t'
+                            << candidate_scope_name(panel_only, beam.candidate_set_conditional) << '\n';
+                    }
+                }
+                timings.total = seconds_since(started);
+                write_status(status_path, GenotypeRunStatus::BlockConsensus, fingerprint, options,
+                             library, timings, &built.report, &panel, (panel_only ? nullptr : &beam),
+                             &ranking,
+                             "no whole-locus winner could be separated from its rivals beyond "
+                             "floating-point error; blocks on which every tied candidate agrees are "
+                             "called by consensus and the rest are no-called, with phase UNRESOLVED and "
+                             "no phased haplotype emitted",
+                             &summary, &depth, &set_report);
+                if (!options.quiet) {
+                    std::cerr << "[genotype] BLOCK_CONSENSUS  fingerprint=" << fingerprint
+                              << "  tied=" << ranking.winner_set.size() << "  called=" << consensus_called
+                              << "/" << block_count << "\n";
+                }
+                return GenotypeRunStatus::BlockConsensus;
+            }
+
             timings.total = seconds_since(started);
             write_status(status_path, GenotypeRunStatus::RescoreIncomplete, fingerprint, options,
                          library, timings, &built.report, &panel, (panel_only ? nullptr : &beam), &ranking,
-                         "the best candidate cannot be separated from every rival by more than "
-                         "floating-point error; the equivalence set is reported instead of a call",
+                         std::string("the best candidate cannot be separated from every rival by more "
+                                     "than floating-point error; the equivalence set is reported instead "
+                                     "of a call") +
+                             (candidates_complete
+                                  ? "; no block has the same genotype across every tied candidate, so "
+                                    "there is no block consensus either"
+                                  : "; the candidate set is conditional, so agreement among the "
+                                    "candidates that were retained is not evidence about those that "
+                                    "were not, and no block consensus is offered"),
                          &summary, &depth, &set_report);
             return GenotypeRunStatus::RescoreIncomplete;
         }

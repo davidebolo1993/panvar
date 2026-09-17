@@ -79,6 +79,33 @@ EOF
 
 has_stage() { case " $STAGES " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
+# One canonical signature over everything a call consumes: both read files, the library, the staged
+# graph, the declared simulation parameters with the plan's salt, and the simulator binary itself.
+# ALWAYS recomputed from the files on disk -- a stored signature is only ever compared against, never
+# trusted as a description of what is there now.  That is what makes a changed reads_2.fq, a changed
+# library.txt or a changed simulation parameter detectable even when the staged graph is untouched.
+#
+# Hashed by CONTENT (`shasum < file`), never `shasum file`, whose output embeds the path and would make
+# a copied tree look tampered with.  A missing input yields MISSING:<what>, which cannot equal any
+# stored signature, so absence refuses instead of silently comparing equal.
+input_bundle_signature() {
+  local d="$1" name="$2" f
+  for f in "$d/staged.gfa" "$d/source/reads_1.fq" "$d/source/reads_2.fq" "$d/source/library.txt"; do
+    [ -f "$f" ] || { printf 'MISSING:%s\n' "$(basename "$f")"; return 0; }
+  done
+  [ -f "$PROBE" ] || { printf 'MISSING:probe\n'; return 0; }
+  {
+    shasum -a 256 < "$d/staged.gfa"
+    shasum -a 256 < "$d/source/reads_1.fq"
+    shasum -a 256 < "$d/source/reads_2.fq"
+    shasum -a 256 < "$d/source/library.txt"
+    shasum -a 256 < "$PROBE"
+    printf 'salt=%s seed=%s depth=%s len=%s ins=%s sd=%s sig=%s err=%s out=%s\n' \
+      "$name" "$SEED" "$DEPTH" "$READ_LENGTH" "$INSERT_MEAN" "$INSERT_SD" "$SIGMAS" \
+      "$SUBSTITUTION_ERROR" "$OUTLIER_WEIGHT"
+  } | shasum -a 256 | cut -d' ' -f1
+}
+
 # ---- provenance ------------------------------------------------------------------------------------
 {
   printf 'key\tvalue\n'
@@ -158,28 +185,24 @@ if has_stage reads; then
     # mere existence is what produced round 14's false conclusion: the graph was regenerated after a
     # fix, the FASTQs were not, and every later call scored reads from one pair of haplotypes against a
     # truth projected from another.  Silence was the whole problem, so a mismatch is loud and re-draws.
-    want="$(cat "$d/staged.gfa.sha")"
-    have="$(cat "$d/source/graph.sha" 2>/dev/null || true)"
-    if [ -f "$d/source/reads_1.fq" ] && [ "$have" = "$want" ]; then
-      printf '  %-16s reused (reads match staged graph %s)\n' "$name" "$(echo "$want" | cut -c1-12)"
+    want="$(input_bundle_signature "$d" "$name")"
+    have="$(cat "$d/source/bundle.sha" 2>/dev/null || true)"
+    if [ -f "$d/source/reads_1.fq" ] && [ -n "$have" ] && [ "$have" = "$want" ]; then
+      printf '  %-16s reused (input bundle %s)\n' "$name" "$(echo "$want" | cut -c1-12)"
       continue
     fi
     if [ -f "$d/source/reads_1.fq" ]; then
-      printf '  %-16s STALE READS: drawn from %s, staged graph is now %s -- re-simulating\n' \
-        "$name" "$(echo "${have:-none}" | cut -c1-12)" "$(echo "$want" | cut -c1-12)"
+      printf '  %-16s STALE INPUTS: bundle was %s, is now %s -- re-simulating\n' \
+        "$name" "$(echo "${have:-MISSING}" | cut -c1-12)" "$(echo "$want" | cut -c1-12)"
     fi
     mkdir -p "$d/source"
     "$PROBE" simulate --gfa "$d/staged.gfa" --reference "$REFERENCE" --donor MOSAIC --depth "$DEPTH" \
       --read-length "$READ_LENGTH" --insert-mean "$INSERT_MEAN" --insert-sd "$INSERT_SD" \
       --sigmas "$SIGMAS" --error "$SUBSTITUTION_ERROR" --outlier "$OUTLIER_WEIGHT" \
       --seed "$SEED" --seed-salt "$name" --out "$d/source" > "$d/sim.log" 2>&1
+    # graph.sha is informational provenance only; bundle.sha is what every later stage checks.
     cp "$d/staged.gfa.sha" "$d/source/graph.sha"
-    # The reads' own signature, so a later call can be bound to the exact draw it consumed.  Hashed by
-    # CONTENT, not by `shasum file1 file2`, whose output embeds the file paths: a path-sensitive
-    # signature reports tampering merely because the tree was copied or moved, which is a false alarm
-    # about the one thing these signatures exist to make trustworthy.
-    cat "$d/source/reads_1.fq" "$d/source/reads_2.fq" | shasum -a 256 | cut -d' ' -f1 \
-      > "$d/source/reads.sha"
+    input_bundle_signature "$d" "$name" > "$d/source/bundle.sha"
     printf '  %-16s %s fragments\n' "$name" "$(awk -F'\t' '$1=="fragments_written"{print $2}' "$d/source/simulation.tsv")"
   done
 fi
@@ -190,19 +213,24 @@ if has_stage call; then
   echo "=== calling (staged graph, mosaics curated out) ==="
   for spec in "${PLANS[@]}"; do
     name="${spec%%:*}"; d="$OUT/$name"
+    # Written under a temporary prefix and published only once a new output set exists.  A failed rerun
+    # must never leave last run's outputs beside a signature claiming they match the current inputs:
+    # that combination is indistinguishable from success and is precisely what the signatures exist to
+    # prevent.  The signature is written after publication, never before, and never on the failure path.
+    rm -f "$d"/pending.*
     "$PROBE" genotype --gfa "$d/staged.gfa" --reference "$REFERENCE" \
       --reads1 "$d/source/reads_1.fq" --reads2 "$d/source/reads_2.fq" --library "$d/source/library.txt" \
-      --out-prefix "$d/call" --state-limit 1024 --prefixes "$CALL_PREFIXES" --phase-audit 0 --threads 2 \
-      --panel-curation "$CURATION" > "$d/call.log" 2>&1 || true
-    # Bind this call to the exact read draw it consumed, so a later re-simulation cannot leave these
-    # outputs behind to be evaluated against a truth they never saw.  Without this line the check in
-    # check_binding never fires, because there is nothing to compare against.
-    cp "$d/source/reads.sha" "$d/call.reads.sha" 2>/dev/null || true
-    if [ ! -f "$d/call.K0.mosaic_status.tsv" ]; then
-      printf '  %-16s REFUSED before any K: %s\n' "$name" \
-        "$(awk -F'\t' '$1=="note"{print substr($2,1,100)}' "$d/call.mosaic_status.tsv" 2>/dev/null)"
+      --out-prefix "$d/pending" --state-limit 1024 --prefixes "$CALL_PREFIXES" --phase-audit 0 --threads 2 \
+      --panel-curation "$CURATION" > "$d/pending.log" 2>&1 || true
+    if [ ! -f "$d/pending.K0.mosaic_status.tsv" ]; then
+      printf '  %-16s CALL PRODUCED NO PER-K STATUS: previous outputs and signature left untouched: %s\n' \
+        "$name" "$(awk -F'\t' '$1=="note"{print substr($2,1,90)}' "$d/pending.mosaic_status.tsv" 2>/dev/null)"
+      rm -f "$d"/pending.*
       continue
     fi
+    rm -f "$d"/call.*
+    for f in "$d"/pending.*; do mv "$f" "$d/call.${f##*/pending.}"; done
+    input_bundle_signature "$d" "$name" > "$d/call.bundle.sha"
     printf '  %-16s K0=%s K8=%s\n' "$name" \
       "$(awk -F'\t' '$1=="status"{print $2}' "$d/call.K0.mosaic_status.tsv")" \
       "$(awk -F'\t' '$1=="status"{print $2}' "$d/call.K8.mosaic_status.tsv" 2>/dev/null)"
@@ -217,33 +245,38 @@ if has_stage gate; then gate_models; fi
 # Every stage below re-checks the read/graph binding.  A call is only interpretable against the graph its
 # reads came from, and that is the invariant round 14 broke.
 check_binding() {
-  local d="$1" name="$2"
-  local want have
-  want="$(cat "$d/staged.gfa.sha" 2>/dev/null || true)"
-  have="$(cat "$d/source/graph.sha" 2>/dev/null || true)"
-  if [ -z "$want" ] || [ "$want" != "$have" ]; then
-    printf '  %-16s BINDING BROKEN: reads came from %s, staged graph is %s -- rerun the reads stage\n' \
-      "$name" "$(echo "${have:-none}" | cut -c1-12)" "$(echo "${want:-none}" | cut -c1-12)"
-    return 1
+  local d="$1" name="$2" now stored called
+  now="$(input_bundle_signature "$d" "$name")"
+  case "$now" in
+    MISSING:*) printf '  %-16s INPUT MISSING (%s) -- rerun the reads stage\n' "$name" "$now"; return 1 ;;
+  esac
+  stored="$(cat "$d/source/bundle.sha" 2>/dev/null || true)"
+  # A missing signature is a refusal, not compatibility: unsigned inputs are exactly the state whose
+  # interpretation round 14 got wrong, and defaulting to "probably fine" is how that happened.
+  if [ -z "$stored" ]; then
+    printf '  %-16s NO INPUT SIGNATURE -- rerun the reads stage\n' "$name"; return 1
   fi
-  # And the calls must belong to the reads they were made from.  Binding reads to their graph is not
-  # enough: re-drawing reads leaves existing call.K* outputs in place, and evaluating them would score a
-  # call made on one read set against a truth measured from another -- round 14's failure, one step
-  # along the chain.  Every link gets a signature, or the chain proves nothing.
-  local reads_now reads_then
-  reads_now="$(cat "$d/source/reads.sha" 2>/dev/null || true)"
-  reads_then="$(cat "$d/call.reads.sha" 2>/dev/null || true)"
-  if [ -n "$reads_then" ] && [ "$reads_now" != "$reads_then" ]; then
-    printf '  %-16s BINDING BROKEN: calls were made on reads %s, reads are now %s -- rerun the call stage\n' \
-      "$name" "$(echo "$reads_then" | cut -c1-12)" "$(echo "${reads_now:-none}" | cut -c1-12)"
-    return 1
+  if [ "$now" != "$stored" ]; then
+    printf '  %-16s INPUTS CHANGED since simulation (%s -> %s) -- rerun the reads stage\n' \
+      "$name" "$(echo "$stored" | cut -c1-12)" "$(echo "$now" | cut -c1-12)"; return 1
+  fi
+  called="$(cat "$d/call.bundle.sha" 2>/dev/null || true)"
+  if [ -z "$called" ]; then
+    printf '  %-16s NO CALL SIGNATURE -- rerun the call stage\n' "$name"; return 1
+  fi
+  if [ "$called" != "$now" ]; then
+    printf '  %-16s CALLS MADE ON OTHER INPUTS (%s -> %s) -- rerun the call stage\n' \
+      "$name" "$(echo "$called" | cut -c1-12)" "$(echo "$now" | cut -c1-12)"; return 1
   fi
   return 0
 }
 
 if has_stage eval; then
   echo "=== accuracy against truth ==="
-  printf '%-16s %-3s %-20s %-22s %-6s %-13s %s\n' plan K status truth_in_ranked_prefix rank blocks_exact phase
+  # Truth is evaluation only and never enters consensus: blocks_exact below is scored AFTER the call,
+  # against a truth the caller never saw.
+  printf '%-15s %-2s %-18s %-4s %-7s %-8s %-7s %-12s %s\n' \
+    plan K status tied called nocalled exact phase uniq_hap
   for spec in "${PLANS[@]}"; do
     name="${spec%%:*}"; d="$OUT/$name"
     check_binding "$d" "$name" || continue
@@ -251,17 +284,20 @@ if has_stage eval; then
       s="$d/call.K$k.mosaic_status.tsv"
       [ -f "$s" ] || continue
       st="$(awk -F'\t' '$1=="status"{print $2}' "$s")"
+      ws="$(awk -F'\t' '$1=="winner_set_size"{print $2}' "$s")"
+      cc="$(awk -F'\t' '$1=="consensus_blocks_called"{print $2}' "$s")"
+      cn="$(awk -F'\t' '$1=="consensus_blocks_no_called"{print $2}' "$s")"
+      ph="$(awk -F'\t' '$1=="phase_support"{print $2}' "$s")"
+      fa=no; [ -f "$d/call.K$k.mosaic_haplotypes.fa" ] && fa=yes
+      bx=NA
       if "$PROBE" evaluate --run-prefix "$d/call.K$k" --out "$d/eval.K$k" \
            --scheme "c4-mosaic-$name-K$k" --donor MOSAIC --reference "$REFERENCE" \
            --model-gfa "$d/staged.gfa" --truth-gfa "$d/staged.gfa" \
            --panel-curation "$CURATION" > "$d/eval.K$k.log" 2>&1; then
-        awk -F'\t' -v N="$name" -v K="$k" -v ST="$st" \
-          '$1=="truth_in_ranked_prefix"{t=$2} $1=="truth_ranked_prefix_rank"{r=$2}
-           $1=="blocks_exact"{e=$2} $1=="phase_support"{p=$2}
-           END{printf "%-16s %-3s %-20s %-22s %-6s %-13s %s\n", N, K, ST, t, r, e, p}' "$d/eval.K$k.summary.tsv"
-      else
-        printf '%-16s %-3s %-20s (no call to evaluate)\n' "$name" "$k" "$st"
+        bx="$(awk -F'\t' '$1=="blocks_exact"{print $2}' "$d/eval.K$k.summary.tsv")"
       fi
+      printf '%-15s %-2s %-18s %-4s %-7s %-8s %-7s %-12s %s\n' \
+        "$name" "$k" "$st" "${ws:-NA}" "${cc:-NA}" "${cn:-NA}" "${bx:-NA}" "${ph:-NA}" "$fa"
     done
   done
 fi

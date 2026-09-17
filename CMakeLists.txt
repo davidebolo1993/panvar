@@ -141,6 +141,7 @@ add_library(panvarlib
     src/minimap2_align.cpp
     src/variant_call.cpp
     src/describe.cpp
+    src/cosigt.cpp
     src/panphorte.cpp
     src/poa.cpp
     src/refine.cpp
@@ -275,6 +276,12 @@ if(PANVAR_BUILD_TESTING)
                  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_source_tree_clean.sh)
         set_tests_properties(panvar_genotype_source_tree_clean PROPERTIES DEPENDS
             "panvar_genotype_mosaic_core;panvar_genotype_locus_adapter;panvar_genotype_command_e2e;panvar_genotype_fragment_oracle;panvar_genotype_fragment_scorer;panvar_genotype_mosaic_proposal")
+        # The mosaic experiment's input binding: a changed read file, library or simulation parameter must
+        # be detected, and a missing signature must refuse. Runs on stub files in seconds; it does NOT run
+        # the five-plan C4 experiment, which needs the real graph and takes minutes.
+        add_test(NAME panvar_genotype_mosaic_binding
+                 COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_mosaic_binding.sh
+                         ${CMAKE_CURRENT_BINARY_DIR}/genotype_mosaic_binding)
         # Nested lower-coverage read sets: every fragment kept at a coverage is kept at every higher one.
         add_test(NAME panvar_genotype_subsample_nested
                  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_subsample_nested.sh

@@ -710,11 +710,22 @@ void test_off_panel_phase_is_not_claimed_from_reads() {
     const panvar::GenotypeRunStatus status = panvar::run_genotype(options);
     const std::map<std::string, std::string> reported = read_status(path("unphaseable.mosaic_status.tsv"));
     require(reported.at("proposal_search_exhaustive") == "true", "fixture: the unphaseable search must be exhaustive");
+    // Three admissible outcomes, and the invariant across all of them is that phase is never claimed
+    // from reads that cannot carry it. BLOCK_CONSENSUS is the case this locus now usually reaches: the
+    // two phasings of one genotype are inseparable, so no whole-locus winner is certified, every block
+    // genotype is nonetheless agreed by both, and those blocks are called with phase UNRESOLVED.
     require((status == panvar::GenotypeRunStatus::RescoreIncomplete && reported.at("phase_support") == "UNRESOLVED") ||
+                (status == panvar::GenotypeRunStatus::BlockConsensus && reported.at("phase_support") == "UNRESOLVED") ||
                 (status == panvar::GenotypeRunStatus::Complete && reported.at("phase_support") == "PRIOR_ONLY"),
             std::string("an unphaseable truth must never be reported as read-phased, got ") +
                 panvar::genotype_run_status_name(status) + " with phase support " +
                 (reported.count("phase_support") ? reported.at("phase_support") : "NA"));
+    if (status == panvar::GenotypeRunStatus::BlockConsensus) {
+        require(!exists(path("unphaseable.mosaic_haplotypes.fa")),
+                "a block-consensus run must emit no phased haplotype: the reads chose no phasing");
+        require(std::stoul(reported.at("consensus_blocks_called")) > 0,
+                "a block-consensus run must call the blocks its tied candidates agree on");
+    }
     const TruthFrame frame =
         rebuild_truth_frame(options, reported.at("model_fingerprint"), kTruth1Nodes, kTruth2Nodes);
     const panvar::PreparedGenotypeModel& model = *frame.model;
@@ -1229,6 +1240,117 @@ void test_panel_only_path() {
             "panel-only must select exactly the haplotypes the former K=0 path selected");
 }
 
+// The block-consensus rule, gated where it lives. When no whole-locus winner can be separated, a block
+// is called only when every tied candidate agrees on its unordered allele pair.
+//
+// Tested as a pure function rather than through a contrived run: forcing two DIFFERENT genotypes to tie
+// end to end would need their total scores to coincide within ~1e-9, which on simulated reads is a
+// property of the tie threshold rather than of this rule. The cases that are reachable end to end --
+// two phasings of one genotype (agreement everywhere, no phased haplotype), a resource refusal and an
+// incomplete candidate search -- are asserted in the run-level tests instead:
+// test_off_panel_phase_is_not_claimed_from_reads covers the first, and test_fail_closed_statuses covers
+// the other two, where RescoreIncomplete and CandidateIncomplete exclude BLOCK_CONSENSUS by identity
+// and no_ranking_or_call already requires that nothing was called.
+void test_block_consensus_rule() {
+    using Row = std::vector<std::pair<std::size_t, std::size_t>>;
+
+    // Unanimous at every block: all called.
+    const auto all_agree = panvar::block_consensus({Row{{0, 1}, {2, 2}, {3, 4}},
+                                                    Row{{0, 1}, {2, 2}, {3, 4}}});
+    require(all_agree.size() == 3, "consensus must report one entry per block");
+    for (const auto& call : all_agree) require(call.agreed, "unanimous blocks must all be called");
+    require(all_agree[0].allele1 == 0 && all_agree[0].allele2 == 1 && all_agree[2].allele1 == 3,
+            "an agreed block must carry the pair every tied candidate holds");
+
+    // Disagreement at exactly one block: only that block is no-called.
+    const auto one_differs = panvar::block_consensus({Row{{0, 1}, {2, 2}, {3, 4}},
+                                                      Row{{0, 1}, {2, 5}, {3, 4}}});
+    require(one_differs[0].agreed && !one_differs[1].agreed && one_differs[2].agreed,
+            "only the block on which the tied candidates disagree may be no-called");
+    require(one_differs[1].allele1 == 0 && one_differs[1].allele2 == 0,
+            "a no-called block must carry no genotype, not the first candidate's");
+
+    // Order independence: reversing the candidate list cannot change the answer.
+    const auto reversed = panvar::block_consensus({Row{{0, 1}, {2, 5}, {3, 4}},
+                                                   Row{{0, 1}, {2, 2}, {3, 4}}});
+    require(reversed.size() == one_differs.size(), "reversal must not change the block count");
+    for (std::size_t b = 0; b < reversed.size(); ++b) {
+        require(reversed[b].agreed == one_differs[b].agreed &&
+                    reversed[b].allele1 == one_differs[b].allele1 &&
+                    reversed[b].allele2 == one_differs[b].allele2,
+                "reversing the tied candidate order must give identical consensus");
+    }
+
+    // A single winner agrees with itself: the unique-winner path is unchanged by this rule.
+    const auto single = panvar::block_consensus({Row{{7, 9}, {1, 1}}});
+    require(single.size() == 2 && single[0].agreed && single[1].agreed && single[0].allele1 == 7,
+            "one candidate must agree at every block");
+
+    // No candidates is no consensus, not vacuous agreement.
+    require(panvar::block_consensus({}).empty(), "an empty tied set must report no consensus at all");
+
+    // Three candidates, one dissenting at one block.
+    const auto three = panvar::block_consensus({Row{{0, 0}, {1, 2}}, Row{{0, 0}, {1, 2}},
+                                                Row{{0, 0}, {2, 2}}});
+    require(three[0].agreed && !three[1].agreed,
+            "a single dissenter among three must no-call its block and leave the rest called");
+
+    std::cout << "  block consensus: unanimous called, one dissent no-called, order-independent\n";
+}
+
+// Block consensus, end to end. The pure-function gate above proves the rule; this proves a run can
+// actually reach it, which nothing else does: every large-locus candidate set is CONDITIONAL, and the
+// contract refuses consensus there, so without this fixture the whole path would ship undemonstrated.
+//
+// The precondition is a candidate set that is NOT conditional, which needs an exhaustive search whose
+// every found mosaic is scored -- K above the number found, not the default 16 against 26. That is a
+// real configuration, not a contrivance: it is what "score everything the search produced" means.
+void test_block_consensus_end_to_end() {
+    panvar::GenotypeCommandOptions options = tiny_options(
+        "consensus", path("unphaseable_r1.fq"), path("unphaseable_r2.fq"));
+    options.proposal_state_limit = 1048576;   // exhaustive
+    options.max_mosaic_candidates = 64;       // above the 26 this locus yields, so nothing is truncated
+    const panvar::GenotypeRunStatus status = panvar::run_genotype(options);
+    const auto reported = read_status(path("consensus.mosaic_status.tsv"));
+
+    require(reported.at("candidate_set_conditional") == "false",
+            "fixture: the candidate set must not be conditional, or consensus is refused by contract");
+    require(status == panvar::GenotypeRunStatus::BlockConsensus,
+            std::string("two inseparable phasings of one genotype must reach block consensus, got ") +
+                panvar::genotype_run_status_name(status) + ": " +
+                (reported.count("note") ? reported.at("note") : ""));
+    require(std::stoul(reported.at("winner_set_size")) > 1,
+            "fixture: block consensus requires a genuine tie, not a single winner");
+
+    const std::size_t called = std::stoul(reported.at("consensus_blocks_called"));
+    const std::size_t no_called = std::stoul(reported.at("consensus_blocks_no_called"));
+    require(called > 0, "the tied candidates agree somewhere, so some block must be called");
+    require(reported.at("phase_support") == "UNRESOLVED",
+            "block consensus must report phase UNRESOLVED: the reads chose no whole-locus history");
+
+    // The output contract: genotypes yes, phased haplotype never.
+    require(exists(path("consensus.genotypes.tsv")) && exists(path("consensus.block_genotypes.tsv")),
+            "block consensus must emit its block genotypes");
+    require(!exists(path("consensus.mosaic_haplotypes.fa")),
+            "block consensus must emit no phased haplotype sequence");
+
+    const auto rows = read_rows(path("consensus.block_genotypes.tsv"));
+    require(rows.size() == called + no_called,
+            "every block must appear exactly once, called or explicitly no-called");
+    std::size_t nocall_rows = 0;
+    for (const auto& row : rows) {
+        require(row[10] == "UNRESOLVED", "every block row must carry phase UNRESOLVED under consensus");
+        if (row[3] == ".") {
+            ++nocall_rows;
+            require(row[7] == "NOCALL", "a no-called block must be marked NOCALL, not left blank");
+        }
+    }
+    require(nocall_rows == no_called, "the status and the rows must agree on how many blocks were no-called");
+
+    std::cout << "  block consensus end to end: " << reported.at("winner_set_size") << " tied, " << called
+              << " blocks called, " << no_called << " no-called, no phased haplotype\n";
+}
+
 // A panel template leaves the panel only by an explicit, recorded decision. The curated model is a
 // DIFFERENT model and has to say so: a different fingerprint, the excluded template named with the
 // reason it would otherwise have carried, and a digest of the decision. A manifest that no longer
@@ -1493,6 +1615,8 @@ int main(int argc, char** argv) {
         test_phase_audit();
         test_candidate_prefixes_match_standalone();
         test_panel_only_path();
+        test_block_consensus_rule();
+        test_block_consensus_end_to_end();
         test_curated_panel();
         test_resource_caps_are_thread_invariant();
         std::cout << "genotype command end-to-end: PASS\n";

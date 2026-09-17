@@ -78,6 +78,13 @@ enum class GenotypeRunStatus {
     CandidateIncomplete,
     SpellingIncomplete,
     RescoreIncomplete,
+    // Scoring finished, but no single whole-locus diplotype could be separated from its rivals by more
+    // than floating-point error, and every candidate that could not be separated agrees on at least one
+    // block. Those blocks are called by consensus; blocks where the tied candidates disagree are
+    // no-called individually. Deliberately NOT Complete: no unique whole-locus winner was certified, no
+    // phased haplotype is emitted, and phase is UNRESOLVED. A caller must be able to tell this from a
+    // certified winner without reading the status file.
+    BlockConsensus,
 };
 
 const char* genotype_run_status_name(GenotypeRunStatus status);
@@ -104,6 +111,21 @@ std::vector<BlockGenotypeConfidence> block_genotype_confidence(
     const std::vector<double>& scores,
     const std::vector<double>& error_bounds,
     const std::vector<std::vector<std::pair<std::size_t, std::size_t>>>& genotypes);
+
+// Exposed for its gate. The block-consensus rule, over the candidates that could not be separated from
+// one another: a block is called when every tied candidate carries the same unordered allele pair there,
+// and no-called when they disagree. Deliberately a pure function of the tied genotypes alone -- it reads
+// no score, no prior and no order, so reversing the candidate list cannot change its answer, and the
+// rule can be tested without contriving two candidates whose scores coincide to within 1e-9.
+struct BlockConsensusCall {
+    bool agreed = false;
+    std::size_t allele1 = 0;
+    std::size_t allele2 = 0;
+};
+// `tied_genotypes[c][b]` is candidate c's unordered allele pair at block b, first <= second. An empty
+// set agrees on nothing: with no candidates there is no consensus to report.
+std::vector<BlockConsensusCall> block_consensus(
+    const std::vector<std::vector<std::pair<std::size_t, std::size_t>>>& tied_genotypes);
 
 GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options);
 
