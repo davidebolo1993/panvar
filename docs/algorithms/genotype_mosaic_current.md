@@ -72,6 +72,14 @@ weight 0.001. C4 reference `HG00096#1#haplotype1-0000024:31848049-32074186`.
   rank 6 and never lost at 4,096). `every_block` (10 switches) is crowded out at both widths, with the
   loss point moving later as width grows. The proposal offers the truth at ranks 2, 6 and 20 on three of
   five plans at width 1,024.
+- **The width is not spent on diplotypes.** Measured per layer, proposal only, on all five plans at both
+  widths. Every plan's tightest layer is the same one, `ctx:4`: at width 1,024 it retains 2-4 distinct
+  diplotype prefixes, with one prefix holding up to 1,018 of the 1,024 states. Four times the width does
+  not buy four times the diversity -- `ctx:4` still retains 3-14 prefixes, and on `one_switch` and
+  `unbridgeable` the dominant prefix simply grows to 4,080 and 4,077 of 4,096. Distinct prefixes at the
+  final layer (exactly `unique_candidates_found`) go from 562-892 to 2,510-3,568 while states discarded
+  go from 29-43 million to 129-180 million. What limits diplotype diversity is the selection rule, which
+  ranks template-level states, not the width it is given.
 - **Separation, not proposal, is the current difficulty**: plans that complete separate by gaps of 0.401
   and 0.358; three of five tie outright, and their tied candidates agree on all 11 block genotypes.
 - **Block consensus works, via the audit, and still does not reach C4.** Demonstrated end to end: an
@@ -114,7 +122,9 @@ weight 0.001. C4 reference `HG00096#1#haplotype1-0000024:31848049-32074186`.
 
 - ACOT 30x cannot complete under the frozen cap without a lower-complexity placement algorithm.
 - Dense-switch mosaics need beam diversity work (distinct diplotype prefixes rather than many
-  template-level states representing one prefix), not a larger width.
+  template-level states representing one prefix), not a larger width. Now measured rather than
+  suspected: the tightest layer holds 2-4 prefixes of 1,024 retained states, and quadrupling the width
+  leaves it at 3-14 while the dominant prefix's share quadruples with it.
 - **Block consensus cannot fire on any large locus, because the search is pruned.** The truncation half
   of `candidate_set_conditional` is now handled by the full-beam audit. What remains is the other half:
   C4 discards 29-43 million merged states per plan, so the search is not exhaustive, the audit refuses to
