@@ -1347,8 +1347,15 @@ void test_full_beam_audit() {
     const std::size_t audited = std::stoul(reported.at("candidates_exactly_audited"));
     const std::size_t full_beam = std::stoul(reported.at("full_beam_candidates"));
     const std::size_t prefix_k = std::stoul(reported.at("primary_prefix_k"));
+    const std::size_t panel = std::stoul(reported.at("panel_diplotypes"));
     require(full_beam > prefix_k, "fixture: the full beam must exceed K");
-    require(audited >= full_beam, "the audited set must contain the whole beam, plus the panel baseline");
+    // An identity, not an inequality: the audited set is exactly the panel baseline plus every mosaic
+    // the beam retained. `>=` would also be satisfied by an audit that scored the panel twice, or that
+    // covered only part of the beam and made the count up elsewhere.
+    require(audited == panel + full_beam,
+            "the audited set must be exactly the panel baseline plus the whole retained beam, got " +
+                std::to_string(audited) + " against " + std::to_string(panel) + " + " +
+                std::to_string(full_beam));
     require(read_rows(path("audit.mosaic_candidates.tsv")).size() == audited,
             "the candidate table must list the audited set, not the top-K prefix");
 
@@ -1368,6 +1375,37 @@ void test_full_beam_audit() {
         require(exists(path("audit.mosaic_haplotypes.fa")),
                 "a uniquely audited winner is an ordinary complete call, phased haplotype included");
     }
+
+    // A unique primary winner is left alone. This is the case the audit must NOT touch: the search is
+    // exhaustive and the prefix IS truncated, so both of the audit's other preconditions hold and only
+    // separation keeps it from running. Without this fixture, "the audit changes nothing when the
+    // primary winner is unique" would rest on reading the condition rather than on running it.
+    panvar::GenotypeCommandOptions separated = tiny_options(
+        "audit_separated", path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa");
+    separated.proposal_state_limit = 1048576;   // exhaustive
+    separated.max_mosaic_candidates = 1;        // below what this locus yields, so the prefix truncates
+    const panvar::GenotypeRunStatus separated_status = panvar::run_genotype(separated);
+    const auto separated_reported = read_status(path("audit_separated.mosaic_status.tsv"));
+    require(separated_reported.at("proposal_search_exhaustive") == "true" &&
+                separated_reported.at("primary_prefix_truncated") == "true",
+            "fixture: this case is only informative while the search is exhaustive AND K truncates");
+    require(separated_status == panvar::GenotypeRunStatus::Complete,
+            "fixture: the separated locus must still produce a unique winner");
+    require(separated_reported.at("full_beam_audit_attempted") == "false",
+            "a uniquely separated primary winner must not be audited: there is no tie to resolve");
+    require(separated_reported.at("candidates_exactly_audited") == "0" &&
+                separated_reported.at("audit_completed") == "false",
+            "an audit that never ran must report no audited candidates, not a silent full-beam pass");
+    // ...and the original, pre-audit result stands: the PREFIX decided, so the tables describe the
+    // prefix and the scope reported is the prefix's own.
+    require(separated_reported.at("final_candidate_scope") == "CONDITIONAL",
+            "with the prefix deciding, the final scope is the prefix's own conditional scope");
+    require(read_rows(path("audit_separated.mosaic_candidates.tsv")).size() ==
+                std::stoul(separated_reported.at("panel_diplotypes")) +
+                    std::stoul(separated_reported.at("primary_prefix_k")),
+            "an unaudited run must list the top-K prefix, exactly as it did before the audit existed");
+    require(exists(path("audit_separated.mosaic_haplotypes.fa")),
+            "a unique winner is an ordinary complete call, phased haplotype included");
 
     // A non-exhaustive proposal never audits, and never reaches consensus.
     panvar::GenotypeCommandOptions pruned =

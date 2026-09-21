@@ -38,6 +38,13 @@ candidates outside K, the complete retained beam is scored exactly and the outpu
 ranking alone -- candidate and score tables included. It needs no second scoring pass and no new
 parameter: the shared pass already covers the full beam whenever the search is exhaustive.
 
+That is a widened pass, not a free one. The pass runs before the primary ranking exists, so it cannot
+know whether the ranking will tie: on an **exhaustive** search it scores the whole retained beam even
+when the primary winner turns out to be unique and no audit is ever attempted. The extra work is bounded
+by the beam size. Zero added work was *observed* on the five C4 plans, and only because every one of them
+is non-exhaustive, so the widened pass never applied there -- that measurement does not generalise to an
+exhaustive run.
+
 Eight facts are reported separately, and `candidate_set_conditional` is not redefined -- it still
 describes the prefix: `primary_prefix_k`, `full_beam_candidates`, `proposal_search_exhaustive`,
 `primary_prefix_truncated`, `full_beam_audit_attempted`, `candidates_exactly_audited`, `audit_completed`,
