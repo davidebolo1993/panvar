@@ -1939,6 +1939,165 @@ int panel_alleles(const Args& args) {
 }
 
 // ------------------------------------------------------------------------------------------------
+// tied-consensus: what a refused run's tied winners agree on, and how far that agreement is from truth
+// ------------------------------------------------------------------------------------------------
+
+// A RESCORE_INCOMPLETE run emits status only -- no genotypes, no block genotypes, no FASTA -- and that
+// is correct: a tie the scorer cannot separate is not a call. But the tied set itself is on disk
+// (mosaic_scores.tsv flags it, mosaic_candidates.tsv carries the allele paths), so what those
+// candidates agree on, and how far the agreement sits from the truth, is measurable after the fact.
+//
+// Everything this prints is a CONDITIONAL_CONSENSUS_DIAGNOSTIC. It is not a call, it changes no call,
+// and it must never enter a strict call rate or a strict accuracy rate. The command is read-only: it
+// reads a finished run and the model, and writes only its own tables.
+int tied_consensus(const Args& args) {
+    const std::string reference = args.required("reference");
+    const std::string donor = args.required("donor");
+    const std::string run = args.required("run");
+    const std::string out = args.required("out");
+    const std::string curation_path = args.get("panel-curation", "");
+    const LoadedModel loaded = load_model(
+        args.required("gfa"), reference, out + ".model.sorted.gfa", 50,
+        curation_path.empty() ? std::vector<std::string>{} : read_panel_curation(curation_path));
+    const panvar::PreparedGenotypeModel& model = *loaded.model;
+    const std::size_t blocks = model.blocks().size();
+
+    // Truth projected onto the model's block frame, exactly as evaluate does it.
+    const SortedGraph truth_graph =
+        load_sorted(args.required("truth-gfa"), reference, out + ".truth.sorted.gfa");
+    std::vector<panvar::PathProjection> truth;
+    for (const panvar::PathRecord* path : donor_paths(truth_graph.graph, donor)) {
+        const auto projection = panvar::project_path_onto_locus(truth_graph.graph, loaded.bubbles,
+                                                                loaded.built.report, path->name);
+        if (!projection.has_value()) {
+            throw std::runtime_error("truth path " + path->name + " does not span the block chain");
+        }
+        truth.push_back(*projection);
+    }
+    std::filesystem::remove(out + ".model.sorted.gfa");
+    std::filesystem::remove(out + ".truth.sorted.gfa");
+
+    const auto spelling = [&](std::size_t b, std::size_t allele) -> const std::string& {
+        return model.blocks()[b].alleles[allele].sequence;
+    };
+    // The phase-invariant diploid distance at one block: the truth pair is unordered, so the predicted
+    // pair is scored in whichever assignment fits better. -1 means the truth is undefined here, which
+    // is reported as NA and never as zero.
+    const auto block_distance = [&](std::size_t b, std::size_t a1, std::size_t a2) -> long {
+        if (!truth[0].blocks[b].has_value() || !truth[1].blocks[b].has_value()) return -1;
+        const std::string& t1 = *truth[0].blocks[b];
+        const std::string& t2 = *truth[1].blocks[b];
+        return std::min(edit_distance(t1, spelling(b, a1)) + edit_distance(t2, spelling(b, a2)),
+                        edit_distance(t1, spelling(b, a2)) + edit_distance(t2, spelling(b, a1)));
+    };
+
+    std::set<std::string> winners;
+    for (const auto& row : read_table(run + ".mosaic_scores.tsv")) {
+        if (row.at("in_winner_set") == "true") winners.insert(row.at("representative_beam_candidate"));
+    }
+    struct Tied {
+        std::string id;
+        std::vector<std::size_t> hap1;
+        std::vector<std::size_t> hap2;
+    };
+    std::vector<Tied> tied;
+    for (const auto& row : read_table(run + ".mosaic_candidates.tsv")) {
+        if (winners.count(row.at("candidate_id")) == 0) continue;
+        tied.push_back({row.at("candidate_id"), parse_alleles(row.at("hap1_alleles")),
+                        parse_alleles(row.at("hap2_alleles"))});
+    }
+    if (tied.empty()) throw std::runtime_error("no tied winner resolved from " + run);
+
+    // Per candidate: distance to truth, and whether it is exactly right.
+    std::ofstream candidates(out + ".candidates.tsv");
+    candidates << "candidate_id\ttotal_distance\tmax_block_distance\tsv_subtotal\tcontext_subtotal\texact\n";
+    std::vector<long> totals;
+    std::size_t exact_candidates = 0;
+    bool truth_pair_present = false;
+    for (const Tied& candidate : tied) {
+        long total = 0, worst = 0, sv = 0, context = 0;
+        bool defined = true;
+        for (std::size_t b = 0; b < blocks; ++b) {
+            const long d = block_distance(b, candidate.hap1[b], candidate.hap2[b]);
+            if (d < 0) { defined = false; continue; }
+            total += d;
+            worst = std::max(worst, d);
+            (model.blocks()[b].kind == panvar::GenotypeBlockKind::Variant ? sv : context) += d;
+        }
+        if (defined && total == 0) { ++exact_candidates; truth_pair_present = true; }
+        totals.push_back(total);
+        candidates << candidate.id << '\t' << total << '\t' << worst << '\t' << sv << '\t' << context
+                   << '\t' << (defined && total == 0 ? "true" : "false") << '\n';
+    }
+    std::sort(totals.begin(), totals.end());
+    const long median = totals.size() % 2 == 1
+                            ? totals[totals.size() / 2]
+                            : (totals[totals.size() / 2 - 1] + totals[totals.size() / 2]) / 2;
+
+    // Per block: do all tied winners predict the SAME unordered genotype, and how far is it from truth?
+    std::ofstream per_block(out + ".blocks.tsv");
+    per_block << "block_id\tkind\tunanimous\tconsensus_allele1\tconsensus_allele2\tdistance\texact\t"
+                 "truth1_bp\ttruth2_bp\n";
+    std::size_t unanimous_blocks = 0, exact_consensus_blocks = 0, undefined_blocks = 0;
+    long consensus_total = 0, consensus_worst = 0, consensus_sv = 0, consensus_context = 0;
+    for (std::size_t b = 0; b < blocks; ++b) {
+        std::set<std::pair<std::size_t, std::size_t>> genotypes;
+        for (const Tied& candidate : tied) {
+            genotypes.insert(std::minmax(candidate.hap1[b], candidate.hap2[b]));
+        }
+        const bool unanimous = genotypes.size() == 1;
+        const bool variant = model.blocks()[b].kind == panvar::GenotypeBlockKind::Variant;
+        const std::string t1 = truth[0].blocks[b].has_value()
+                                   ? std::to_string(truth[0].blocks[b]->size()) : std::string("NA");
+        const std::string t2 = truth[1].blocks[b].has_value()
+                                   ? std::to_string(truth[1].blocks[b]->size()) : std::string("NA");
+        per_block << model.blocks()[b].block_id << '\t' << (variant ? "SV" : "context") << '\t'
+                  << (unanimous ? "true" : "false");
+        if (!unanimous) {
+            per_block << "\tNA\tNA\tNA\tNA\t" << t1 << '\t' << t2 << '\n';
+            continue;
+        }
+        ++unanimous_blocks;
+        const std::size_t a1 = genotypes.begin()->first;
+        const std::size_t a2 = genotypes.begin()->second;
+        const long d = block_distance(b, a1, a2);
+        per_block << '\t' << a1 << '\t' << a2 << '\t';
+        if (d < 0) {
+            ++undefined_blocks;
+            per_block << "NA\tNA\t" << t1 << '\t' << t2 << '\n';
+            continue;
+        }
+        consensus_total += d;
+        consensus_worst = std::max(consensus_worst, d);
+        (variant ? consensus_sv : consensus_context) += d;
+        if (d == 0) ++exact_consensus_blocks;
+        per_block << d << '\t' << (d == 0 ? "true" : "false") << '\t' << t1 << '\t' << t2 << '\n';
+    }
+
+    std::ofstream summary(out + ".summary.tsv");
+    summary << "key\tvalue\nlabel\tCONDITIONAL_CONSENSUS_DIAGNOSTIC\nrun\t" << run << "\ndonor\t" << donor
+            << "\nwinner_set_size\t" << tied.size()
+            << "\ntrue_pair_in_tied_set\t" << (truth_pair_present ? "true" : "false")
+            << "\nany_tied_candidate_exact\t" << (exact_candidates > 0 ? "true" : "false")
+            << "\nexact_tied_candidates\t" << exact_candidates
+            << "\nmin_whole_locus_distance\t" << totals.front()
+            << "\nmedian_whole_locus_distance\t" << median
+            << "\nmax_whole_locus_distance\t" << totals.back()
+            << "\nblocks\t" << blocks
+            << "\nunanimous_blocks\t" << unanimous_blocks
+            << "\nexact_consensus_blocks\t" << exact_consensus_blocks
+            << "\nconsensus_total_distance\t" << consensus_total
+            << "\nconsensus_max_block_distance\t" << consensus_worst
+            << "\nconsensus_sv_subtotal\t" << consensus_sv
+            << "\nconsensus_context_subtotal\t" << consensus_context
+            << "\nblocks_with_undefined_truth\t" << undefined_blocks << '\n';
+    std::cout << "tied-consensus " << run << ": " << tied.size() << " tied winners, " << unanimous_blocks
+              << "/" << blocks << " blocks unanimous, consensus distance " << consensus_total
+              << " (DIAGNOSTIC, not a call)\n";
+    return 0;
+}
+
+// ------------------------------------------------------------------------------------------------
 // mosaic-truth: build a synthetic mosaic donor whose haplotypes are in no panel row
 // ------------------------------------------------------------------------------------------------
 
@@ -2586,7 +2745,7 @@ int genotype(const Args& args) {
 int main(int argc, char** argv) {
     try {
         if (argc < 2) {
-            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors|subsample|preflight|respell|coverage-audit|form-census|mosaic-truth|orientations|panel-alleles --key value ...\n";
+            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors|subsample|preflight|respell|coverage-audit|form-census|mosaic-truth|orientations|panel-alleles|tied-consensus --key value ...\n";
             return 2;
         }
         const std::string command = argv[1];
@@ -2606,6 +2765,7 @@ int main(int argc, char** argv) {
         if (command == "mosaic-truth") return mosaic_truth(args);
         if (command == "orientations") return orientations(args);
         if (command == "panel-alleles") return panel_alleles(args);
+        if (command == "tied-consensus") return tied_consensus(args);
         std::cerr << "unknown probe command: " << command << '\n';
         return 2;
     } catch (const std::exception& error) {

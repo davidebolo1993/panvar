@@ -376,6 +376,73 @@ on all 50 runs, so **consensus stays refused everywhere**: the strict policy is 
 Cost at the frozen settings: 62-84 s per plan for the whole shared pass, peak RSS 0.70-0.88 GB, of which
 the proposer's own predicted peak is 3.6 MB at width 256 -- 1.4% of the 256 MiB ceiling.
 
+## C4 leave-zero-out result package (2026-09-21)
+
+Attribution: run commit `c8fe2a4`, caller binary `5c3a1525…` (byte-identical across the whole batch, so
+no result moved when the harness was corrected), protocol frozen at `5bb9330` -- manifest, draw rule,
+orientation and panel-allele tables and the graph are all bit-identical to that freeze, and only the
+harness changed. The post-hoc evaluator is a separate read-only binary `cda6273c…`; the frozen run's
+binary was never rebuilt, and all 40 experiment and 40 call signatures re-verified against it.
+
+**Two experiments, reported separately and never pooled**, because their truths are different objects.
+
+**Ordinary LZO** (56 held-out donors, commit `b1684ae`): 55/56 completed (98.2%), one
+`CANDIDATE_INCOMPLETE`. 51 exact of 56 intended (91.1%), 51/55 given a call (92.7%). Mean 10.93/11
+exact blocks and 4.95/5 exact SV blocks; total distance 120 over 55 calls, of which SV 119 and context
+1. Phase: `PRIOR_ONLY` 45, `READS` 10.
+
+**Synthetic-mosaic LZO** (10 plans x 4 coverages = 40 shared runs, 80 arm records). Arms never pooled:
+
+| | K=0 panel arm | K=128 mosaic arm |
+|---|---|---|
+| completed / intended | 40/40 (100%) | 24/40 (60%) |
+| no-call | 0 | 16 (40%) |
+| exact over intended | 8/40 (20%) | 21/40 (52.5%) |
+| exact given a call | 8/40 (20%) | 21/24 (87.5%) |
+| excluding panel controls | 0/32 exact | 13/32 (40.6%), 13/16 given a call (81.2%) |
+| mean exact blocks | 7.95/11 | 10.83/11 |
+| total distance | 54,636 over 40 calls / 440 blocks | 111 over 24 calls / 264 blocks |
+
+Those two distance sums have **different denominators** and must never be compared without them. The
+K=0 exact calls are exactly the two panel controls, which is what a panel-only arm should recover.
+Paired within plan and coverage: 13 improved, 9 unchanged, 2 worsened, 16 refused at K=128.
+
+**Error severity.** Only three K=128 strict calls are inexact, all `one_homologue_once_1`. At 10x and
+5x a single SV block (`sv:3`) is wrong by 49 edits against 488 bp of truth (normalized 0.100) while
+READS-supported at conditional GQ 7,328 and 2,523 -- a confidently wrong block. At 2x two blocks are
+wrong (`ctx:0` 7 edits, `sv:1` 6) under `PRIOR_ONLY` support at GQ ~67. The 10x and 5x cases are
+regressions against K=0 on the same reads (distance 13 -> 49) even though they gain an exact block.
+
+**Conditional consensus diagnostics** (`CONDITIONAL_CONSENSUS_DIAGNOSTIC`, **not calls**, excluded from
+every strict rate): all 16 refused arms are unanimous on 11/11 blocks, so the ties are over
+representation rather than block genotypes. Nine have consensus distance 0; the true pair is in the
+tied set in eight. Winner sets are 2-16. Worst consensus is 26,379 (`three_switches_2` at 2x).
+
+**Phase.** K=0: 40/40 `UNRESOLVED`. K=128: 3 `READS_WITHIN_CANDIDATES`, 21 `PRIOR_ONLY`, 16
+`UNRESOLVED` (the refusals). No `READS_AUDITED` anywhere, because the phase audit is 0 by declaration.
+`PRIOR_ONLY` is **not** read-supported phase. Note that a phased FASTA is emitted for every COMPLETE
+run, including all 40 K=0 runs whose phase is `UNRESOLVED`: that FASTA's phase is not read-supported.
+
+**Runtime**: 40 shared runs, 958.6 s total, peak RSS 0.65 GB (30x mean 50.5 s, 2x mean 9.7 s).
+
+**Tables and plots**: `tests/results/genotype_c4_lzo_c8fe2a4/` -- `runs.tsv` (80 arm records),
+`blocks.tsv` (880 block rows, strict calls and conditional consensus labelled separately), `tied.tsv`,
+`phase.tsv`, `denominators.tsv`, `ordinary_lzo.tsv`, `provenance.tsv`, and seven `plot_*.png` each
+beside the `plot_*.tsv` it was drawn from. Like every other directory under `tests/results/`, it is a
+local artifact and is not tracked in git. Regenerate with `scripts/consolidate_c4_lzo.py`.
+
+**Limitations, and they bound the claim:**
+
+- these are unseen RECOMBINATIONS of previously seen C4 sequences, not unseen haplotypes: every donor
+  was already an ordinary leave-zero-out donor;
+- the search remains pruned and conditional -- `candidate_scope` is `CONDITIONAL` and
+  `proposal_search_exhaustive` is false in all 80 arm records;
+- the consensus diagnostics are not certified calls and may not be counted as calls;
+- conditional GQ is conditional on the scored candidate set and is **not calibrated**; K=0 and K=128
+  GQs are not comparable and are never pooled;
+- this does not establish LOO performance;
+- it does not validate any other locus.
+
 ## Known limitations
 
 - Whole-locus phase is often unidentifiable from short reads; block consensus is the response.

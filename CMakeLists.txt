@@ -304,6 +304,12 @@ if(PANVAR_BUILD_TESTING)
         add_test(NAME panvar_genotype_heldout_binding
                  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_heldout_binding.sh
                          ${CMAKE_CURRENT_BINARY_DIR}/genotype_heldout_binding)
+        # The C4 LZO consolidation's two load-bearing computations: the phase-invariant diploid distance
+        # (known answers plus swap invariance) and the tied-winner consensus invariants. Read-only and
+        # graph-free; the data-dependent halves activate when HELDOUT/<consolidated dir> are supplied.
+        add_test(NAME panvar_genotype_lzo_consolidation
+                 COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_lzo_consolidation.sh
+                         ${CMAKE_CURRENT_BINARY_DIR}/genotype_lzo_consolidation)
         # Nested lower-coverage read sets: every fragment kept at a coverage is kept at every higher one.
         add_test(NAME panvar_genotype_subsample_nested
                  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_subsample_nested.sh
