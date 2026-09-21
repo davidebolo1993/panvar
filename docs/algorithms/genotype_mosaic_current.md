@@ -19,8 +19,16 @@ Run statuses and what each emits:
 
 | status | meaning | emits |
 |---|---|---|
-| `COMPLETE` | one diplotype certified above every rival beyond floating-point error | genotypes, block genotypes, scores, candidates, phased haplotype FASTA |
-| `BLOCK_CONSENSUS` | scoring finished; no whole-locus winner separable, but tied candidates agree on some blocks | genotypes and block genotypes, with disagreeing blocks as explicit `NOCALL` rows; **no** phased FASTA |
+| `COMPLETE` | one diplotype certified above every rival beyond floating-point error | genotypes, block genotypes, scores, candidates, haplotype FASTA (see below) |
+| `BLOCK_CONSENSUS` | scoring finished; no whole-locus winner separable, but tied candidates agree on some blocks | genotypes and block genotypes, with disagreeing blocks as explicit `NOCALL` rows; **no** haplotype FASTA |
+
+The FASTA a `COMPLETE` run emits holds the two members of an **unordered genotype pair**, written in a
+canonical order. `MosaicDiplotype` is a bare `{first, second}` with no ordering invariant, candidates
+are enumerated as unordered pairs throughout, and different phased histories can spell the same
+unordered genotype at every block. So the `hap1`/`hap2` labels assert a phase only where
+`phase_support` is `READS_WITHIN_CANDIDATES` or `READS_AUDITED`; under `PRIOR_ONLY` or `UNRESOLVED`
+they carry no read evidence about which haplotype is which. It is therefore **not** a "phased FASTA"
+in general, and is not described as one anywhere in this document.
 | `MODEL_INCOMPLETE` | the structural model could not be built | status only |
 | `CANDIDATE_INCOMPLETE` | proposal stopped at a declared budget | status only |
 | `SPELLING_INCOMPLETE` | a candidate could not be spelled | status only |
@@ -386,10 +394,33 @@ binary was never rebuilt, and all 40 experiment and 40 call signatures re-verifi
 
 **Two experiments, reported separately and never pooled**, because their truths are different objects.
 
-**Ordinary LZO** (56 held-out donors, commit `b1684ae`): 55/56 completed (98.2%), one
-`CANDIDATE_INCOMPLETE`. 51 exact of 56 intended (91.1%), 51/55 given a call (92.7%). Mean 10.93/11
-exact blocks and 4.95/5 exact SV blocks; total distance 120 over 55 calls, of which SV 119 and context
-1. Phase: `PRIOR_ONLY` 45, `READS` 10.
+**Ordinary LZO at 30x** -- canonical source `tests/results/genotype_cohort_c4_r6_5937384` (round 6,
+commit `5937384`). **In each arm separately**, panel and mosaic: 56/56 donors called, zero no-calls,
+**56/56 fully exact**, **616/616 exact blocks**, **280/280 exact SV blocks**, and **total distance
+zero** -- SV and context distance both zero. Phase in each arm: `PRIOR_ONLY` 51, `READS_AUDITED` 5.
+The paired comparison in that cohort shows no winner changed and no block call changed between arms.
+
+**Ordinary LZO across nested coverages** -- canonical source
+`tests/results/genotype_coverage_c4_held_out_abb35a0` (commit `abb35a0`). Identical in both arms, and
+**zero no-calls at every coverage**:
+
+| coverage | donors fully exact | exact blocks | exact SV blocks | total distance |
+|---|---|---|---|---|
+| 2x | 55/56 | 615/616 | 280/280 | 1 |
+| 5x | 55/56 | 615/616 | 280/280 | 1 |
+| 10x | 56/56 | 616/616 | 280/280 | 0 |
+| 15x | 56/56 | 616/616 | 280/280 | 0 |
+| 20x | 56/56 | 616/616 | 280/280 | 0 |
+| 30x | 56/56 | 616/616 | 280/280 | 0 |
+
+Every figure above is recomputed from the per-donor rows and cross-checked against each source's own
+published summary; a disagreement is a hard failure, not a warning.
+
+**The round-5 cohort `b1684ae` is SUPERSEDED** and is excluded from every current scientific summary.
+It reported 55/56 completed with one `CANDIDATE_INCOMPLETE` and a total distance of 120; those numbers
+are history and must not be quoted as a current result. The directory is retained, marked with a
+`SUPERSEDED.txt`, and `tests/genotype_lzo_consolidation.sh` fails if it is used as a source or cited in
+a consolidated package.
 
 **Synthetic-mosaic LZO** (10 plans x 4 coverages = 40 shared runs, 80 arm records). Arms never pooled:
 
@@ -420,14 +451,17 @@ tied set in eight. Winner sets are 2-16. Worst consensus is 26,379 (`three_switc
 
 **Phase.** K=0: 40/40 `UNRESOLVED`. K=128: 3 `READS_WITHIN_CANDIDATES`, 21 `PRIOR_ONLY`, 16
 `UNRESOLVED` (the refusals). No `READS_AUDITED` anywhere, because the phase audit is 0 by declaration.
-`PRIOR_ONLY` is **not** read-supported phase. Note that a phased FASTA is emitted for every COMPLETE
-run, including all 40 K=0 runs whose phase is `UNRESOLVED`: that FASTA's phase is not read-supported.
+`PRIOR_ONLY` is **not** read-supported phase. A haplotype FASTA is emitted for every COMPLETE run,
+including all 40 K=0 runs whose phase is `UNRESOLVED`; those two records are an unordered genotype pair
+in canonical order, and calling them a phased haplotype pair would assert read evidence that does not
+exist. The package column is `haplotype_fasta_emitted` for that reason.
 
 **Runtime**: 40 shared runs, 958.6 s total, peak RSS 0.65 GB (30x mean 50.5 s, 2x mean 9.7 s).
 
 **Tables and plots**: `tests/results/genotype_c4_lzo_c8fe2a4/` -- `runs.tsv` (80 arm records),
 `blocks.tsv` (880 block rows, strict calls and conditional consensus labelled separately), `tied.tsv`,
-`phase.tsv`, `denominators.tsv`, `ordinary_lzo.tsv`, `provenance.tsv`, and seven `plot_*.png` each
+`phase.tsv`, `denominators.tsv`, `ordinary_lzo.tsv`, `ordinary_lzo_coverage.tsv`, `provenance.tsv`,
+and seven `plot_*.png` each
 beside the `plot_*.tsv` it was drawn from. Like every other directory under `tests/results/`, it is a
 local artifact and is not tracked in git. Regenerate with `scripts/consolidate_c4_lzo.py`.
 

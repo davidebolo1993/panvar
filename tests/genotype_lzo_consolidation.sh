@@ -210,5 +210,114 @@ print(f"  ok    80 run rows, 40 pairs, outcome/paired/per-block tables agree wit
 PY
 fi
 
+echo "=== the ordinary-LZO source is the canonical one, and reproduces its expected counts ==="
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ORDINARY="${ORDINARY:-$REPO/tests/results/genotype_cohort_c4_r6_5937384}"
+ORDINARY_COVERAGE="${ORDINARY_COVERAGE:-$REPO/tests/results/genotype_coverage_c4_held_out_abb35a0}"
+SUPERSEDED_COHORT="$REPO/tests/results/genotype_cohort_c4_b1684ae"
+if [ ! -d "$ORDINARY" ]; then
+  echo "  skipped: $ORDINARY is not present (results directories are local artifacts)"
+else
+  python3 - "$ORDINARY" "$ORDINARY_COVERAGE" "$SUPERSEDED_COHORT" "${CONSOLIDATED:-}" <<'PY' || fail=$((fail + 1))
+import csv, os, sys
+
+ordinary, coverage_dir, superseded, consolidated = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+bad = 0
+
+def kv(path):
+    out = {}
+    if os.path.exists(path):
+        for line in open(path):
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) == 2:
+                out[parts[0]] = parts[1]
+    return out
+
+def tsv(path):
+    if not os.path.exists(path):
+        return []
+    return list(csv.DictReader(open(path), delimiter="\t"))
+
+# 1. The 30x ordinary source must be round 6 (5937384), never the superseded round-5 cohort.
+commit = kv(os.path.join(ordinary, "signature.tsv")).get("git_commit", "")
+if not commit.startswith("5937384"):
+    print(f"  FAIL  ordinary source commit is {commit or 'missing'}, expected 5937384..."); bad += 1
+if commit.startswith("b1684ae"):
+    print("  FAIL  the SUPERSEDED round-5 cohort is being used as the ordinary source"); bad += 1
+
+# 2. Its canonical counts, per arm, recomputed from the per-donor rows.
+rows = tsv(os.path.join(ordinary, "cohort.tsv"))
+if not rows:
+    print("  FAIL  ordinary cohort.tsv is missing or empty"); bad += 1
+arms = sorted({r["arm"] for r in rows})
+if arms != ["mosaic", "panel"]:
+    print(f"  FAIL  ordinary arms are {arms}, expected ['mosaic', 'panel']"); bad += 1
+for arm in arms:
+    subset = [r for r in rows if r["arm"] == arm]
+    complete = [r for r in subset if r["status"] == "COMPLETE"]
+    no_call = [r for r in subset if r["run_no_call"] == "true"]
+    fully = [r for r in complete
+             if int(r["unordered_distance"]) == 0 and int(r["blocks_exact"]) == int(r["blocks"])]
+    got = (len(subset), len(complete), len(no_call), len(fully),
+           sum(int(r["blocks_exact"]) for r in subset), sum(int(r["blocks"]) for r in subset),
+           sum(int(r["sv_blocks_exact"]) for r in subset), sum(int(r["sv_blocks"]) for r in subset),
+           sum(int(r["unordered_distance"]) for r in subset))
+    want = (56, 56, 0, 56, 616, 616, 280, 280, 0)
+    if got != want:
+        print(f"  FAIL  ordinary {arm} arm is {got}, expected {want}"); bad += 1
+    else:
+        print(f"  ok    ordinary {arm}: 56/56 called, 56/56 fully exact, 616/616 blocks, "
+              f"280/280 SV, distance 0")
+
+# 3. The nested-coverage ordinary result, recomputed per arm and coverage.
+expected = {"2": (55, 615), "5": (55, 615), "10": (56, 616),
+            "15": (56, 616), "20": (56, 616), "30": (56, 616)}
+runs = tsv(os.path.join(coverage_dir, "runs.tsv"))
+if not runs:
+    print(f"  FAIL  {coverage_dir}/runs.tsv missing"); bad += 1
+else:
+    cover_commit = kv(os.path.join(coverage_dir, "signature.tsv")).get("git_commit", "")
+    if not cover_commit.startswith("abb35a0"):
+        print(f"  FAIL  nested-coverage commit is {cover_commit or 'missing'}, expected abb35a0..."); bad += 1
+    for arm in sorted({r["arm"] for r in runs}):
+        for cov, (want_donors, want_blocks) in expected.items():
+            subset = [r for r in runs if r["arm"] == arm and r["coverage"] == cov]
+            if len(subset) != 56:
+                print(f"  FAIL  nested {arm} {cov}x has {len(subset)} runs, expected 56"); bad += 1
+                continue
+            no_calls = sum(1 for r in subset if r["run_no_call"] == "true")
+            fully = sum(1 for r in subset
+                        if int(r["unordered_distance"]) == 0 and int(r["blocks_exact"]) == 11)
+            blocks_exact = sum(int(r["blocks_exact"]) for r in subset)
+            if (no_calls, fully, blocks_exact) != (0, want_donors, want_blocks):
+                print(f"  FAIL  nested {arm} {cov}x: no_calls={no_calls} donors={fully} "
+                      f"blocks={blocks_exact}, expected 0/{want_donors}/{want_blocks}"); bad += 1
+    if not bad:
+        print("  ok    nested coverage: 55/56 and 615/616 at 2x and 5x, 56/56 and 616/616 at "
+              "10x-30x, zero no-calls, both arms")
+
+# 4. The round-5 cohort must be marked superseded wherever it still exists.
+if os.path.isdir(superseded) and not os.path.exists(os.path.join(superseded, "SUPERSEDED.txt")):
+    print("  FAIL  the round-5 cohort is present but not marked SUPERSEDED"); bad += 1
+
+# 5. A consolidated package must record the canonical source, and must not cite the superseded one.
+if consolidated and os.path.isdir(consolidated):
+    ordinary_rows = tsv(os.path.join(consolidated, "ordinary_lzo.tsv"))
+    commits = {r["value"] for r in ordinary_rows if r["quantity"] == "source_commit"}
+    if not commits or any(not c.startswith("5937384") for c in commits):
+        print(f"  FAIL  consolidated ordinary_lzo.tsv cites {commits or 'no'} source commit"); bad += 1
+    if not os.path.exists(os.path.join(consolidated, "ordinary_lzo_coverage.tsv")):
+        print("  FAIL  consolidated package has no ordinary_lzo_coverage.tsv"); bad += 1
+    for name in ("ordinary_lzo.tsv", "provenance.tsv"):
+        path = os.path.join(consolidated, name)
+        if os.path.exists(path) and "b1684ae" in open(path).read():
+            print(f"  FAIL  {name} still cites the superseded b1684ae cohort"); bad += 1
+
+if bad:
+    print(f"  {bad} ordinary-LZO provenance failure(s)"); sys.exit(1)
+print("  ok    canonical ordinary-LZO provenance and counts")
+PY
+fi
+
 if [ "$fail" -ne 0 ]; then echo "genotype_lzo_consolidation: $fail gate(s) FAILED"; exit 1; fi
 echo "genotype_lzo_consolidation: all gates passed"

@@ -96,7 +96,7 @@ def plans_of(manifest):
 RUN_HEADER = [
     "plan", "class", "coverage", "arm", "status", "candidate_scope", "final_candidate_scope",
     "search_exhaustive", "tied_winners", "fragments_total", "wall_s", "max_rss_bytes",
-    "phase_support", "phased_haplotype_emitted", "genotype_support", "min_block_gq",
+    "phase_support", "haplotype_fasta_emitted", "genotype_support", "min_block_gq",
     "separation_gap", "exact_blocks", "total_distance", "max_block_distance",
     "exact_sv_blocks", "exact_context_blocks",
 ]
@@ -275,7 +275,10 @@ def build_phase(runs):
             rows.append([arm, category, counts[category], len(arm_runs)])
         if other:
             rows.append([arm, "OTHER", other, len(arm_runs)])
-        rows.append([arm, "phased_haplotype_emitted", emitted, len(arm_runs)])
+        # NOT "phased": the two records are the members of an UNORDERED genotype pair, written in a
+        # canonical order. They assert a phase only where phase_support is READS_*; where it is
+        # UNRESOLVED or PRIOR_ONLY the hap1/hap2 labels carry no read evidence about which is which.
+        rows.append([arm, "haplotype_fasta_emitted", emitted, len(arm_runs)])
     return rows
 
 
@@ -316,34 +319,89 @@ def build_denominators(runs, tied, plans):
     return rows
 
 
-def build_ordinary(path):
-    rows = read_tsv(path)
+def build_ordinary(cohort_dir):
+    """Ordinary 30x LZO, from the round-6 cohort (commit 5937384).
+
+    This is the canonical ordinary-LZO source. The earlier round-5 cohort (b1684ae) is SUPERSEDED and
+    must not be used in a current scientific summary: it is kept only as history. The round-6 cohort
+    reports both arms, so nothing here is pooled across them.
+    """
+    rows = read_tsv(os.path.join(cohort_dir, "cohort.tsv"))
     if not rows:
-        return [], []
-    complete = [r for r in rows if r["status"] == "COMPLETE"]
-    exact = [r for r in complete if number(r["unordered_distance"]) == 0]
-    blocks_exact = [number(r["blocks_exact"]) for r in complete]
-    sv_exact = [number(r["sv_blocks_exact"]) for r in complete]
-    phase = {}
-    for r in complete:
-        phase[r["phase_support"]] = phase.get(r["phase_support"], 0) + 1
-    summary = [
-        ["donors_intended", len(rows), ""],
-        ["completed_runs", len(complete), f"{100 * len(complete) / len(rows):.1f}%"],
-        ["no_call_runs", len(rows) - len(complete), f"{100 * (len(rows) - len(complete)) / len(rows):.1f}%"],
-        ["exact_calls_over_intended", len(exact), f"{100 * len(exact) / len(rows):.1f}%"],
-        ["exact_calls_given_a_call", len(exact), f"{100 * len(exact) / len(complete):.1f}%"],
-        ["mean_exact_blocks_given_a_call", f"{statistics.mean(blocks_exact):.2f}", "of 11"],
-        ["mean_exact_sv_blocks_given_a_call", f"{statistics.mean(sv_exact):.2f}", "of 5"],
-        ["total_distance_given_a_call",
-         int(sum(number(r["unordered_distance"]) for r in complete)),
-         f"over {len(complete)} calls"],
-        ["total_sv_distance", int(sum(number(r["sv_distance"]) for r in complete)), ""],
-        ["total_context_distance", int(sum(number(r["context_distance"]) for r in complete)), ""],
-    ]
-    for key in sorted(phase):
-        summary.append([f"phase_{key}", phase[key], f"of {len(complete)} calls"])
+        raise SystemExit(f"no cohort.tsv under {cohort_dir}")
+    signature = read_kv(os.path.join(cohort_dir, "signature.tsv"))
+    summary = []
+    for arm in sorted({r["arm"] for r in rows}):
+        arm_rows = [r for r in rows if r["arm"] == arm]
+        complete = [r for r in arm_rows if r["status"] == "COMPLETE"]
+        no_call = [r for r in arm_rows if r["run_no_call"] == "true"]
+        # "Fully exact" is the whole locus: zero distance AND every block exact, not one or the other.
+        fully_exact = [r for r in complete
+                       if number(r["unordered_distance"]) == 0
+                       and number(r["blocks_exact"]) == number(r["blocks"])]
+        blocks = int(sum(number(r["blocks"]) for r in arm_rows))
+        blocks_exact = int(sum(number(r["blocks_exact"]) for r in arm_rows))
+        sv_blocks = int(sum(number(r["sv_blocks"]) for r in arm_rows))
+        sv_exact = int(sum(number(r["sv_blocks_exact"]) for r in arm_rows))
+        phase = {}
+        for r in complete:
+            phase[r["phase_support"]] = phase.get(r["phase_support"], 0) + 1
+        summary.extend([
+            [arm, "source_commit", signature.get("git_commit", NA), "canonical ordinary 30x LZO"],
+            [arm, "donors_intended", len(arm_rows), ""],
+            [arm, "completed_runs", len(complete),
+             f"{100 * len(complete) / len(arm_rows):.1f}%" if arm_rows else NA],
+            [arm, "no_call_runs", len(no_call), ""],
+            [arm, "donors_fully_exact", len(fully_exact), f"of {len(arm_rows)}"],
+            [arm, "blocks_exact", blocks_exact, f"of {blocks}"],
+            [arm, "sv_blocks_exact", sv_exact, f"of {sv_blocks}"],
+            [arm, "total_distance", int(sum(number(r["unordered_distance"]) for r in arm_rows)),
+             f"over {len(arm_rows)} runs, {blocks} blocks"],
+            [arm, "sv_distance", int(sum(number(r["sv_distance"]) for r in arm_rows)), ""],
+            [arm, "context_distance", int(sum(number(r["context_distance"]) for r in arm_rows)), ""],
+        ])
+        for key in sorted(phase):
+            summary.append([arm, f"phase_{key}", phase[key], f"of {len(complete)} calls"])
     return summary, rows
+
+
+def build_ordinary_coverage(coverage_dir):
+    """Ordinary LZO across nested coverages (commit abb35a0), recomputed and cross-checked.
+
+    The published summary.tsv is not trusted on its own: every figure is recomputed from runs.tsv and
+    the two must agree, so a stale summary cannot quietly become a reported result.
+    """
+    runs = read_tsv(os.path.join(coverage_dir, "runs.tsv"))
+    published = read_tsv(os.path.join(coverage_dir, "summary.tsv"))
+    if not runs or not published:
+        raise SystemExit(f"missing runs.tsv or summary.tsv under {coverage_dir}")
+    rows = []
+    for record in published:
+        arm, coverage = record["arm"], record["coverage"]
+        subset = [r for r in runs if r["arm"] == arm and r["coverage"] == coverage]
+        no_calls = sum(1 for r in subset if r["run_no_call"] == "true")
+        blocks_exact = int(sum(number(r["blocks_exact"]) for r in subset))
+        sv_exact = int(sum(number(r["sv_blocks_exact"]) for r in subset))
+        distance = int(sum(number(r["unordered_distance"]) for r in subset))
+        fully_exact = sum(1 for r in subset
+                          if number(r["unordered_distance"]) == 0 and number(r["blocks_exact"]) == 11)
+        blocks = 11 * len(subset)
+        for name, recomputed, stated in (
+            ("runs", len(subset), int(record["runs"])),
+            ("run_no_calls", no_calls, int(record["run_no_calls"])),
+            ("donors_fully_exact", fully_exact, int(record["donors_fully_exact"])),
+            ("blocks_exact", blocks_exact, int(record["blocks_exact"])),
+            ("sv_blocks_exact", sv_exact, int(record["sv_blocks_exact"])),
+            ("distance_total", distance, int(record["distance_total"])),
+        ):
+            if recomputed != stated:
+                raise SystemExit(
+                    f"{coverage_dir}: {arm} {coverage}x {name} recomputes to {recomputed}, "
+                    f"but summary.tsv states {stated}")
+        rows.append([arm, coverage, len(subset), no_calls, fully_exact, blocks,
+                     blocks_exact, sv_exact, distance])
+    rows.sort(key=lambda r: (r[0], int(r[1])))
+    return rows
 
 
 # --------------------------------------------------------------------------------------------------
@@ -610,7 +668,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--heldout", required=True)
     parser.add_argument("--manifest", required=True)
-    parser.add_argument("--ordinary", required=True)
+    parser.add_argument("--ordinary", required=True,
+                        help="round-6 ordinary 30x LZO cohort directory (canonical: commit 5937384)")
+    parser.add_argument("--ordinary-coverage", required=True,
+                        help="nested-coverage ordinary LZO directory (canonical: commit abb35a0)")
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
     os.makedirs(args.out, exist_ok=True)
@@ -629,8 +690,12 @@ def main():
               ["population", "arm", "quantity", "value", "note"],
               build_denominators(runs, tied, plans))
     ordinary_summary, ordinary_rows = build_ordinary(args.ordinary)
-    write_tsv(os.path.join(args.out, "ordinary_lzo.tsv"), ["quantity", "value", "note"],
+    write_tsv(os.path.join(args.out, "ordinary_lzo.tsv"), ["arm", "quantity", "value", "note"],
               ordinary_summary)
+    coverage_rows = build_ordinary_coverage(args.ordinary_coverage)
+    write_tsv(os.path.join(args.out, "ordinary_lzo_coverage.tsv"),
+              ["arm", "coverage", "runs", "run_no_calls", "donors_fully_exact", "blocks",
+               "blocks_exact", "sv_blocks_exact", "distance_total"], coverage_rows)
 
     plot_block_distance(blocks, args.out, normalized=False)
     plot_block_distance(blocks, args.out, normalized=True)
