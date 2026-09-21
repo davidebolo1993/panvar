@@ -27,9 +27,21 @@ Run statuses and what each emits:
 | `RESCORE_INCOMPLETE` | a resource cap was reached, or a tie with no block agreement | status only |
 
 Block consensus is **refused**, leaving `RESCORE_INCOMPLETE` with no calls, after model failure, resource
-refusal, an incomplete or conditional candidate set, truncated scoring, or missing provenance. Phase is
-always `UNRESOLVED` under consensus, and no unique phased haplotype is ever emitted there. Confidence is
+refusal, an incomplete candidate set, truncated scoring, or missing provenance. Phase is always
+`UNRESOLVED` under consensus, and no unique phased haplotype is ever emitted there. Confidence is
 conditional on the scored candidate set, never global, unless the search was exhaustive and untruncated.
+
+**A K-truncated prefix is never grounds for consensus.** Candidates below K were constructed and ordered
+by proposal mass but never exactly scored, so their order proves nothing about whether one of them wins
+or disagrees blockwise. When the primary ranking ties, the search was exhaustive, and the beam retained
+candidates outside K, the complete retained beam is scored exactly and the output is derived from that
+ranking alone -- candidate and score tables included. It needs no second scoring pass and no new
+parameter: the shared pass already covers the full beam whenever the search is exhaustive.
+
+Eight facts are reported separately, and `candidate_set_conditional` is not redefined -- it still
+describes the prefix: `primary_prefix_k`, `full_beam_candidates`, `proposal_search_exhaustive`,
+`primary_prefix_truncated`, `full_beam_audit_attempted`, `candidates_exactly_audited`, `audit_completed`,
+`final_candidate_scope` (the scope of the set that actually determined the call).
 
 A refused run reports the work it performed: `observed_piece_hits`, `observed_physical_origins`, the
 placement workers actually used, and the phase timings up to the refusal.
@@ -55,13 +67,16 @@ weight 0.001. C4 reference `HG00096#1#haplotype1-0000024:31848049-32074186`.
   five plans at width 1,024.
 - **Separation, not proposal, is the current difficulty**: plans that complete separate by gaps of 0.401
   and 0.358; three of five tie outright, and their tied candidates agree on all 11 block genotypes.
-- **Block consensus works, and is currently unreachable in production.** Demonstrated end to end on a
-  non-conditional tie: two inseparable phasings of one genotype, 5 of 5 blocks called by consensus, phase
-  `UNRESOLVED`, no phased haplotype emitted. But every candidate set on a large locus is `CONDITIONAL`,
-  and the contract refuses consensus there, so the five frozen C4 plans still end as `RESCORE_INCOMPLETE`
-  with no calls. The gate, not the rule, is the binding constraint, and the cost is measurable: the three
-  tied plans (winner sets 2, 2 and 8) are **unanimous at 11 of 11 blocks**, so each would have produced a
-  complete set of block genotypes had the gate allowed it.
+- **Block consensus works, via the audit, and still does not reach C4.** Demonstrated end to end: an
+  exhaustive search finding 26 mosaics against a K of 16 ties on two phasings of one genotype, the audit
+  scores all 36 candidates exactly (10 panel + 26 mosaic), and the result is `BLOCK_CONSENSUS` with 5 of
+  5 blocks called, phase `UNRESOLVED` and no phased haplotype. `candidate_set_conditional` stays `true`
+  (the prefix was truncated) while `final_candidate_scope` is `COMPLETE` (the audited set decided).
+- **Why C4 is still out of reach, corrected.** The obstacle is not truncation to K. Every C4 plan prunes
+  29-43 million states, so `proposal_search_exhaustive` is `false`, the audit's precondition fails, and
+  no audit is attempted on any of the ten runs. The three ties remain `RESCORE_INCOMPLETE` with no calls,
+  and their tied candidates are still unanimous at 11 of 11 blocks. Reaching them needs an exhaustive
+  search or a different sufficiency argument -- not a wider K and not a relaxed gate.
 - Two independent 2x draws of the same ACOT donor disagree at one block, and the conditional GQ flagged
   exactly that block (3.04 against thousands elsewhere). Development evidence only, not calibration.
 
@@ -93,20 +108,18 @@ weight 0.001. C4 reference `HG00096#1#haplotype1-0000024:31848049-32074186`.
 - ACOT 30x cannot complete under the frozen cap without a lower-complexity placement algorithm.
 - Dense-switch mosaics need beam diversity work (distinct diplotype prefixes rather than many
   template-level states representing one prefix), not a larger width.
-- **Block consensus cannot fire on any large locus.** `candidate_set_conditional` is set by
-  `!search_exhaustive || unique_candidates_found > k`, so it conflates a genuinely incomplete search with
-  a complete search whose result was merely truncated to K. On C4 the second clause is always true, and
-  the contract's refusal after "candidate-construction incompleteness" then blocks consensus everywhere
-  it would matter. Whether truncation-to-K should count as incompleteness is a contract decision, not a
-  code fix: the discarded candidates were constructed and ranked but never exactly scored, so agreement
-  among the retained K is still not evidence about them. Left fail-closed pending review.
+- **Block consensus cannot fire on any large locus, because the search is pruned.** The truncation half
+  of `candidate_set_conditional` is now handled by the full-beam audit. What remains is the other half:
+  C4 discards 29-43 million merged states per plan, so the search is not exhaustive, the audit refuses to
+  run, and consensus is unreachable there. This is the same wall as the beam-diversity problem, seen from
+  the calling side -- a pruned search cannot certify that it omitted nothing, whatever is done downstream.
 
 ## Ordered next work
 
 1. Sol's review of this stop point.
 2. Beam diversity: select distinct diplotype prefixes so one prefix cannot crowd the layer.
-3. Decide whether block consensus should apply to `CONDITIONAL` sets, which currently blocks it on every
-   large locus.
+3. Decided: block consensus never applies to a K-truncated prefix; the full-beam audit supplies the exact
+   scores instead. What remains open is the pruned-search case, which no downstream change can fix.
 4. Lower-complexity placement, required before any 30x large-locus run or cohort.
 5. Reverse-orientation splicing, to widen the synthetic-mosaic donor pool.
 
