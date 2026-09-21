@@ -72,6 +72,15 @@ struct MosaicBeamTraceLayer {
     std::uint64_t target_states_retained = 0;
     double target_best_log_mass = -std::numeric_limits<double>::infinity();
     double target_logsum_log_mass = -std::numeric_limits<double>::infinity();
+    // Diagnostic-only target accounting: the target prefix group's mass as the layer RETAINED it, and
+    // what the layer dropped -- log(offered - retained). Equal offered and retained masses report -inf
+    // lost, which is the honest reading of "nothing was lost".
+    double target_retained_logsum_log_mass = -std::numeric_limits<double>::infinity();
+    double target_lost_log_mass = -std::numeric_limits<double>::infinity();
+    // Rank of the target's prefix GROUP among every group offered, by aggregate group mass -- the
+    // quantity prefix-first selection actually ranks on. 0 when the target was not offered. A rank
+    // among states (offered_above_target_best) cannot stand in for it.
+    std::size_t target_group_rank_by_offered_mass = 0;
     std::uint32_t target_best_template1 = 0;   // templates of the best target state, as stored
     std::uint32_t target_best_template2 = 0;
     // Offered states with strictly more mass than the best target state: its rank minus one.

@@ -2267,7 +2267,8 @@ int trace(const Args& args) {
               "best_emission_in_block\tstates_offered\tstates_retained\tstates_pruned\t"
               "prefix_pairs_offered\tprefix_pairs_retained\tmax_states_per_prefix\tretained_min_log_mass\t"
               "truth_prefixes_present\ttruth_states_offered\ttruth_states_retained\ttruth_best_log_mass\t"
-              "truth_logsum_log_mass\ttruth_rank\tdonor_templates_offered\tdonor_templates_log_mass\t"
+              "truth_logsum_log_mass\ttruth_retained_logsum_log_mass\ttruth_lost_log_mass\t"
+              "truth_group_rank_by_mass\ttruth_rank\tdonor_templates_offered\tdonor_templates_log_mass\t"
               "donor_templates_retained\n";
     double truth_emission_total = 0.0;
     double winner_emission_total = 0.0;
@@ -2292,6 +2293,11 @@ int trace(const Args& args) {
                << (layer.target_prefixes_present ? "true" : "false") << '\t' << layer.target_states_offered << '\t'
                << layer.target_states_retained << '\t' << layer.target_best_log_mass << '\t'
                << layer.target_logsum_log_mass << '\t'
+               << layer.target_retained_logsum_log_mass << '\t' << layer.target_lost_log_mass << '\t'
+               << (layer.target_group_rank_by_offered_mass > 0
+                       ? std::to_string(layer.target_group_rank_by_offered_mass)
+                       : "NA")
+               << '\t'
                << (layer.target_states_offered > 0 ? std::to_string(layer.offered_above_target_best + 1) : "NA")
                << '\t' << (layer.declared_templates_offered ? "true" : "false") << '\t'
                << layer.declared_templates_log_mass << '\t' << (layer.declared_templates_retained ? "true" : "false")

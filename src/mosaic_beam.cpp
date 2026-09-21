@@ -82,6 +82,15 @@ double log_add_exp_local(double lhs, double rhs) {
     return hi + std::log1p(std::exp(std::min(lhs, rhs) - hi));
 }
 
+// Mass offered to a layer that did not survive it: log(exp(high) - exp(low)). Guarded so that a
+// retained mass at or above the offered mass -- which floating point can produce when nothing was lost
+// -- reports -inf rather than a NaN.
+double log_sub_exp_local(double high, double low) {
+    if (low == kNegInf) return high;
+    if (high == kNegInf || low >= high) return kNegInf;
+    return high + std::log1p(-std::exp(low - high));
+}
+
 void add_count(std::uint64_t& total, bool& saturated, std::uint64_t amount, bool amount_saturated) {
     saturated = saturated || amount_saturated;
     if (amount > kCountCap - total) {
@@ -123,11 +132,15 @@ void merge_into(State& into, const State& from) {
 // Keeps at most state_limit states of a layer after every state has been fully merged, PREFIX FIRST.
 //
 // A layer's width is useful only to the extent it holds distinct diplotype prefixes. States sharing a
-// prefix pair differ solely in which templates currently carry that prefix; they are the same history
-// counted many ways, and they rise and fall together when the next block's emission moves. Ranking
-// states alone therefore lets one prefix's template variants take the whole width -- measured at 1,018
-// of 1,024 retained states on C4 ctx:4 -- so a rival prefix is dropped while the leader is held over a
-// thousand times.
+// prefix pair are DIFFERENT latent template histories that spell the SAME allele prefix: they agree on
+// every allele called so far and differ in which template currently carries each haplotype. That
+// difference is real and it is not cosmetic -- the current template is exactly what the next block's
+// transition reads, so two such states extend differently and are not interchangeable. What they share
+// is the allele prefix, and it is the prefix, not the template attribution, that a candidate diplotype
+// is made of. Ranking states alone therefore lets one prefix's template attributions take the whole
+// width -- measured at 1,018 of 1,024 retained states on C4 ctx:4 -- so a rival prefix is dropped while
+// the leader is held over a thousand times. Keeping only the best attribution of a prefix is a real
+// approximation of that prefix's future, not a free deduplication.
 //
 // The rule, with no parameter and no fixed per-prefix cap: group the layer's states by unordered prefix
 // pair, rank groups by aggregate (log-sum-exp) mass, keep the best state of each group in rank order
@@ -147,8 +160,13 @@ void merge_into(State& into, const State& from) {
 // order is total and no tie is left to arrival order.
 class LayerSelector {
 public:
-    explicit LayerSelector(std::size_t limit)
-        : limit_(limit), groups_(worse_group_on_top), remainder_(worse_state_on_top) {}
+    // collect_group_masses is DIAGNOSTIC ONLY and costs one double per offered group for the layer's
+    // lifetime, which is why it is off unless a trace target was declared. It exists so a trace can
+    // report where the target's prefix group ranked among all groups by the aggregate mass this rule
+    // actually ranks on -- a quantity no per-state rank can stand in for.
+    explicit LayerSelector(std::size_t limit, bool collect_group_masses = false)
+        : limit_(limit), collect_group_masses_(collect_group_masses), groups_(worse_group_on_top),
+          remainder_(worse_state_on_top) {}
 
     void offer(const State& state) {
         ++offered_;
@@ -177,6 +195,7 @@ public:
             }
             group.best = pending_[best];
             ++groups_offered_;
+            if (collect_group_masses_) group_masses_.push_back(group.mass);
             // A group evicted here can never be wanted again: eviction only happens once more groups
             // than the limit exist, and that is exactly the case where the top groups fill the width
             // and no remaining state is ever drawn.
@@ -231,6 +250,9 @@ public:
     // here, so the count needs no set over the offered states.
     std::size_t groups_offered() const { return groups_offered_; }
 
+    // Empty unless diagnostics were requested. One entry per group offered, in close order.
+    const std::vector<double>& group_masses() const { return group_masses_; }
+
 private:
     struct Group {
         double mass = kNegInf;
@@ -244,8 +266,10 @@ private:
     static bool worse_state_on_top(const State& lhs, const State& rhs) { return better_state(lhs, rhs); }
 
     std::size_t limit_;
+    bool collect_group_masses_ = false;
     std::uint64_t offered_ = 0;
     std::size_t groups_offered_ = 0;
+    std::vector<double> group_masses_;
     std::vector<State> pending_;   // one parent group's children, never the whole layer
     std::priority_queue<Group, std::vector<Group>, bool (*)(const Group&, const Group&)> groups_;
     std::priority_queue<State, std::vector<State>, bool (*)(const State&, const State&)> remainder_;
@@ -288,7 +312,7 @@ public:
     }
 
     void finish(const std::vector<State>& retained, std::size_t groups_offered,
-                std::vector<MosaicBeamTraceLayer>& out) {
+                const std::vector<double>& group_masses, std::vector<MosaicBeamTraceLayer>& out) {
         if (!on()) return;
         current_.prefix_pairs_offered = groups_offered;
         current_.states_retained = retained.size();
@@ -320,6 +344,8 @@ public:
                                                  : std::min(current_.retained_min_log_mass, state.log_mass);
             if (current_.target_prefixes_present && matches(state)) {
                 ++current_.target_states_retained;
+                current_.target_retained_logsum_log_mass =
+                    log_add_exp_local(current_.target_retained_logsum_log_mass, state.log_mass);
                 if (declared(state)) current_.declared_templates_retained = true;
             }
         }
@@ -327,6 +353,17 @@ public:
             for (const double mass : masses_) {
                 if (mass > current_.target_best_log_mass) ++current_.offered_above_target_best;
             }
+            current_.target_lost_log_mass = log_sub_exp_local(current_.target_logsum_log_mass,
+                                                              current_.target_retained_logsum_log_mass);
+            // Where the target's PREFIX GROUP stood among all groups, by the aggregate mass the rule
+            // ranks on. The group masses are summed by the selector in sorted-key order and this
+            // target sum in offer order, so the two can differ in the last bits; at an exact tie the
+            // rank can therefore be off by one, and it is a diagnostic, not a gate.
+            std::size_t above = 0;
+            for (const double mass : group_masses) {
+                if (mass > current_.target_logsum_log_mass) ++above;
+            }
+            current_.target_group_rank_by_offered_mass = above + 1;
         }
         previous1_ = current_.target_prefixes_present ? std::optional<std::uint32_t>(target1_) : std::nullopt;
         previous2_ = current_.target_prefixes_present ? std::optional<std::uint32_t>(target2_) : std::nullopt;
@@ -553,7 +590,7 @@ MosaicBeamResult propose_mosaic_diplotypes(
         }
         std::sort(initial.begin(), initial.end(),
                   [](const State& lhs, const State& rhs) { return key_of(lhs) < key_of(rhs); });
-        LayerSelector selector(parameters.state_limit);
+        LayerSelector selector(parameters.state_limit, tracer.on());
         tracer.begin(0);
         for (std::size_t i = 0; i < initial.size();) {
             State merged = initial[i];
@@ -565,7 +602,7 @@ MosaicBeamResult propose_mosaic_diplotypes(
         }
         selector.close_group();
         layer = selector.take(result.states_pruned);
-        tracer.finish(layer, selector.groups_offered(), result.trace);
+        tracer.finish(layer, selector.groups_offered(), selector.group_masses(), result.trace);
     }
 
     // ---- blocks 1..B-1: extend each parent prefix-pair group over every ordered template pair ------------
@@ -590,7 +627,7 @@ MosaicBeamResult propose_mosaic_diplotypes(
                    std::tie(rhs.prefix1, rhs.prefix2, rhs.template1, rhs.template2);
         });
 
-        LayerSelector selector(parameters.state_limit);
+        LayerSelector selector(parameters.state_limit, tracer.on());
         tracer.begin(block);
         std::vector<std::uint32_t> child_prefix1(emission.allele_count);
         std::vector<std::uint32_t> child_prefix2(emission.allele_count);
@@ -673,7 +710,7 @@ MosaicBeamResult propose_mosaic_diplotypes(
             g = end;
         }
         layer = selector.take(result.states_pruned);
-        tracer.finish(layer, selector.groups_offered(), result.trace);
+        tracer.finish(layer, selector.groups_offered(), selector.group_masses(), result.trace);
     }
 
     // ---- final collapse: drop templates, merge by unordered pair of complete allele paths ----------------
