@@ -389,12 +389,12 @@ void test_preallocation_is_gated_per_account() {
     // The fixed ceiling: admitted exactly at the predicted peak, refused one byte below it, and the
     // refusal happens before construction so nothing is allocated.
     panvar::MosaicBeamParameters at_ceiling = admitted;
-    at_ceiling.max_proposal_memory_bytes = bounds.total_bytes;
+    at_ceiling.max_proposal_payload_bytes = bounds.total_bytes;
     require(!panvar::propose_mosaic_diplotypes_grouped(panel, emissions, {0.25, 0.6}, at_ceiling)
                  .candidates.empty(),
             "a search admitted exactly at the memory ceiling must run");
     panvar::MosaicBeamParameters below_ceiling = admitted;
-    below_ceiling.max_proposal_memory_bytes = bounds.total_bytes - 1;
+    below_ceiling.max_proposal_payload_bytes = bounds.total_bytes - 1;
     bool ceiling_refused = false;
     try {
         panvar::propose_mosaic_diplotypes_grouped(panel, emissions, {0.25, 0.6}, below_ceiling);
@@ -494,6 +494,81 @@ void test_malformed_input_refuses() {
               << " trace length, index capacity\n";
 }
 
+// The adversarial case for the child bound: the parent layer is AT its width and every allele of the
+// next block is reachable, so the child layer built before selection is parents x alleles -- far larger
+// than the retained count. Bounding children by the retained count passes every ordinary fixture and
+// fails here, which is the point of having this one.
+//
+// Four templates, each spelling its own allele at every block, so every allele class is non-empty and
+// r > 0 makes every child reachable from every parent. A state limit of 2 caps a layer at 2L = 4
+// prefixes, which the 4 block-0 alleles already saturate.
+void test_child_bound_under_saturation() {
+    panvar::PanelAlleleMatrix panel;
+    panel.template_names = {"t0", "t1", "t2", "t3"};
+    panel.template_alleles = {{0, 0, 0}, {1, 1, 1}, {2, 2, 2}, {3, 3, 3}};
+    std::vector<double> table(16, 0.0);
+    for (std::size_t i = 0; i < 4; ++i) {
+        for (std::size_t j = 0; j < 4; ++j) table[i * 4 + j] = -0.1 * static_cast<double>(i + 2 * j);
+    }
+    const panvar::PreparedProposalEmissions emissions = make_emissions({table, table, table}, 4);
+    const std::vector<double> recombination = {0.3, 0.3};
+    const std::vector<std::size_t> alleles = {4, 4, 4};
+    const std::size_t limit = 2;
+
+    const panvar::GroupedAllocationAccounts bounds =
+        panvar::grouped_allocation_bounds(panel.template_count(), panel.block_count(), limit, alleles);
+
+    panvar::MosaicBeamParameters parameters;
+    parameters.unique_candidate_target = 64;
+    parameters.state_limit = limit;
+    const auto ran = panvar::propose_mosaic_diplotypes_grouped(panel, emissions, recombination, parameters);
+
+    // The fixture must actually be adversarial, and the property that matters is that the layer builds
+    // MORE children than it keeps -- that is the case bounding children by the retained count gets
+    // wrong. Measured here: 12 children against 4 retained per layer at L = 2.
+    //
+    // Retained prefixes are deliberately NOT asserted to equal 2L. Compaction keeps only the prefixes
+    // the retained PAIRS name, so a layer can hold fewer; asserting saturation was an assumption about
+    // the fixture rather than a measurement of it, and it was false (9 records, not 12).
+    const std::uint64_t retained_per_layer = ran.allocation_observed.ancestry_records / panel.block_count();
+    require(ran.allocation_observed.child_records > retained_per_layer,
+            "fixture: the pre-compaction child layer must exceed what a layer retains, got " +
+                std::to_string(ran.allocation_observed.child_records) + " children against " +
+                std::to_string(retained_per_layer) + " retained per layer");
+    require(ran.allocation_observed.child_records >= 2 * limit,
+            "fixture: the child layer must reach at least the width it is selected down to");
+
+    require(bounds.child_records >= ran.allocation_observed.child_records,
+            "predicted children " + std::to_string(bounds.child_records) + " must bound the observed " +
+                std::to_string(ran.allocation_observed.child_records));
+    require(bounds.ancestry_records >= ran.allocation_observed.ancestry_records,
+            "predicted ancestry must bound the observed under saturation");
+    require(bounds.index_bytes >= ran.allocation_observed.index_bytes,
+            "predicted index and remap storage must bound the observed under saturation");
+    require(bounds.total_bytes >= ran.allocation_observed.total_bytes,
+            "the predicted payload must bound the observed under saturation");
+
+    panvar::MosaicBeamParameters at_ceiling = parameters;
+    at_ceiling.max_proposal_payload_bytes = bounds.total_bytes;
+    require(!panvar::propose_mosaic_diplotypes_grouped(panel, emissions, recombination, at_ceiling)
+                 .candidates.empty(),
+            "the adversarial case must be admitted exactly at its predicted payload");
+
+    panvar::MosaicBeamParameters below = parameters;
+    below.max_proposal_payload_bytes = bounds.total_bytes - 1;
+    bool refused = false;
+    try {
+        panvar::propose_mosaic_diplotypes_grouped(panel, emissions, recombination, below);
+    } catch (const std::length_error&) {
+        refused = true;
+    }
+    require(refused, "one byte below the predicted payload must refuse the adversarial case");
+
+    std::cout << "  saturated child bound: " << ran.allocation_observed.child_records
+              << " children observed against " << bounds.child_records << " predicted, at 2L = "
+              << 2 * limit << " retained per layer\n";
+}
+
 }   // namespace
 
 int main() {
@@ -502,6 +577,7 @@ int main() {
         test_mutations_are_caught();
         test_preallocation_is_gated_per_account();
         test_malformed_input_refuses();
+        test_child_bound_under_saturation();
         std::cout << "genotype grouped beam: PASS\n";
         return 0;
     } catch (const std::exception& error) {

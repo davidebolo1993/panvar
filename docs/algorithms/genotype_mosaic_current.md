@@ -55,10 +55,11 @@ placement workers actually used, and the phase timings up to the refusal.
 
 ## Frozen defaults
 
-State limit **256** (production) and **1,024** (audit only) -- counted in allele-prefix PAIRS since the
-grouped proposer became production; see the unit change noted below. K (`max_mosaic_candidates`)
-**128**. `phase_audit_candidates` remains 0: nothing in this batch measured the phase audit, every run
-declared `--phase-audit 0`, so it is deliberately not frozen to a value. `max_piece_hits` 2e9, `max_physical_origins` 5e8,
+State limit **256** (production) and **1,024** (diagnostic comparison width) -- counted in allele-prefix
+PAIRS since the grouped proposer became production; see the unit change noted below. The 1,024 figure is
+the width the ladder compares against, NOT a phase audit: `phase_audit_candidates` remains 0, nothing in
+this batch measured the phase audit, and every run declared `--phase-audit 0`. K (`max_mosaic_candidates`)
+**128**. `max_piece_hits` 2e9, `max_physical_origins` 5e8,
 `max_state_classes` 2e8, `max_mass_cells` 2e8, `piece_hit_publish_batch` 4,096. Mismatch band 6, minimum
 piece 12 bp, k-mer 31, syncmer 15, min variant 50 bp, switch probability 0.01. Simulation: seed 20260916
 salted per donor or plan, 100 bp reads, insert 350 +/- 40, 4 sigmas, substitution error 0.002, outlier
@@ -161,8 +162,9 @@ called by the genotyper. Prefix-first is retired entirely.
 counts allele-prefix PAIRS, where it counted `(prefix, template)` states. One prefix pair stands for
 every template attribution of itself, so the same number buys a far wider search: on the small e2e
 locus, 64 went from pruning 264 states and finding 2 mosaics to searching exhaustively and finding 26.
-The frozen default of 1,024 has changed meaning in exactly that way. It is a unit change, not a tuning
-change, and no default was re-tuned to absorb it.
+The then-frozen default of 1,024 changed meaning in exactly that way. It is a unit change, not a tuning
+change, and no default was re-tuned to absorb it. The width has since been re-frozen at 256 by the
+declared ladder rule -- see Frozen defaults above.
 
 **Storage rolls, and is gated as three separate accounts.** Only the parent layer's and the child
 layer's numerical arrays are live; the parent's are released at the boundary. What persists is compact
@@ -270,9 +272,11 @@ the case is hard: it recovers the two plans prefix-first damaged most, and gives
 easy plans (rank 5 to 6, and 4 to 6). Nothing here is a calling result: ranks are proposal ranks, and
 what a caller does with them has not been measured.
 
-**The production resource contract.** One fixed ceiling, `max_proposal_memory_bytes` = 256 MiB, over the
-proposer's WHOLE predicted peak, checked before any construction, so a refusal allocates nothing and
-leaves no ranking and no call. The status reports the ceiling, the predicted total and the observed
+**The production resource contract.** One fixed ceiling, `max_proposal_payload_bytes` = 256 MiB, over the
+proposer's predicted PAYLOAD -- the bytes its own arrays hold -- checked before any construction, so a
+refusal allocates nothing and leaves no ranking and no call. It is deliberately not a claim about
+allocated memory: container capacity slack, allocator rounding and per-vector headers are excluded, and
+the name says so rather than the prediction pretending to an accuracy it does not have. The status reports the ceiling, the predicted total and the observed
 total, plus each account separately, so a prediction is checkable from the run's own output instead of
 being trusted.
 
@@ -293,6 +297,14 @@ whole allele path, which is the entire point of the search. The measured-allocat
 14 ancestry records against a predicted 12, exactly `2 + 4 + 8` for that fixture's allele products -- and
 that is why the gate compares measurement against prediction rather than checking the formula against
 itself.
+
+A layer's PRE-COMPACTION children are a different quantity from what it retains, and the larger one: the
+child layer is built in full and only then selected and compacted, so
+`children_b <= min(parents_{b-1} * A_b, A_0 * ... * A_b)`, with `child_index` literally a
+`[parents][A_b]` table. Bounding children by the retained count instead passes every ordinary fixture
+and understates the peak exactly when the parent layer is at its width and the next block has several
+reachable alleles -- which is why that case now has its own gate rather than relying on loci that happen
+not to saturate.
 
 On the small end-to-end locus the contract predicts 9,126 bytes and the run takes 8,710: admitted exactly
 at the prediction, refused one byte below it, with no partial output either way.
@@ -382,10 +394,9 @@ the proposer's own predicted peak is 3.6 MB at width 256 -- 1.4% of the 256 MiB 
 - Dense-switch mosaics need beam diversity work (distinct diplotype prefixes rather than many
   template-level states representing one prefix), not a larger width. Now measured rather than
   suspected: the tightest layer holds 2-4 prefixes of 1,024 retained states, and quadrupling the width
-  leaves it at 3-14 while the dominant prefix's share quadruples with it. Prefix-first selection now
-  does this and retains the truth on all five plans at both widths -- for 3.4x to 5.3x the runtime, and
-  with `unbridgeable`'s truth falling from rank 2 to 46. Whether that trade is worth taking is an open
-  decision, not a settled improvement.
+  leaves it at 3-14 while the dominant prefix's share quadruples with it. **Resolved, and no longer a
+  blocker**: prefix-first was the first answer to this and is retired; the grouped proposer carries every
+  template attribution exactly, is cheaper, and retains every truth at every layer down to width 256.
 - **Block consensus cannot fire on any large locus, because the search is pruned.** The truncation half
   of `candidate_set_conditional` is now handled by the full-beam audit. What remains is the other half:
   C4 discards 29-43 million merged states per plan (measured in the older `(prefix, template)` unit), so
@@ -418,5 +429,7 @@ by content signature, and asserts the curated staged model reproduces ordinary C
 - Do not re-measure read-form deduplication; it was measured and rejected.
 - Do not re-derive the CYP2D6 partial-template diagnosis; it is settled and curated.
 - Do not raise `max_piece_hits` to make ACOT 30x green; the linear scaling is the problem.
-- Do not change state limit 1,024 or audit width 4,096 without a review decision.
+- Do not change state limit 256, K 128, or the 1,024 diagnostic comparison width without a review
+  decision. The 1,024 and 4,096 figures in the historical sections below are the OLD frozen width and
+  its old comparison width; they are records of past measurements, not current settings.
 - Do not treat node ids as stable across independently sorted graphs.

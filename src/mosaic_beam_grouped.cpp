@@ -238,21 +238,41 @@ GroupedAllocationAccounts grouped_allocation_bounds(std::size_t templates, std::
     // path. That is the point of the search. The measured-allocation gate caught it at 14 ancestry
     // records against a predicted 12, which is exactly 2 + 4 + 8 for that fixture's allele products.
     const std::uint64_t pair_cap = checked_mul(2u, limit);
+    std::uint64_t a_max = 0;
+    for (const std::size_t a : allele_counts) a_max = std::max(a_max, static_cast<std::uint64_t>(a));
+    // The coarsest a child layer can be: every retained parent extended by every allele.
+    const std::uint64_t child_cap = checked_mul(pair_cap, a_max);
+
+    // Retained (post-compaction) and pre-compaction child counts are DIFFERENT quantities and a layer's
+    // children are the larger of the two. Bounding children by the retained count -- as this did -- is
+    // wrong whenever the parent layer is at its width and the next block has several reachable alleles:
+    // the child layer is built in full and only then selected and compacted, so it is
+    //     children_b <= min(parents_{b-1} * A_b, A_0 * ... * A_b)
+    // and child_index is literally a [parents][A_b] table.
     std::uint64_t max_prefixes = 0;
     std::uint64_t max_pairs = 0;
+    std::uint64_t max_children = 0;
+    std::uint64_t max_child_index = 0;
     std::uint64_t ancestry_total = 0;
-    std::uint64_t product = 1;
-    for (const std::size_t a : allele_counts) {
-        // Saturating: once the allele product passes the width, the width is the binding constraint.
-        if (product < pair_cap) {
-            const std::uint64_t scaled = static_cast<std::uint64_t>(a);
-            product = (scaled != 0 && product > pair_cap / scaled) ? pair_cap : product * scaled;
+    std::uint64_t product = 1;    // saturating at child_cap, which is above every bound drawn from it
+    std::uint64_t parents = 0;
+    for (std::size_t b = 0; b < allele_counts.size(); ++b) {
+        const std::uint64_t a = static_cast<std::uint64_t>(allele_counts[b]);
+        if (product < child_cap) {
+            product = (a != 0 && product > child_cap / a) ? child_cap : product * a;
         }
+        const std::uint64_t index_here = b == 0 ? 0 : std::min(child_cap, checked_mul(parents, a));
+        const std::uint64_t children_here =
+            b == 0 ? std::min(pair_cap, product) : std::min(index_here, product);
+        max_child_index = std::max(max_child_index, index_here);
+        max_children = std::max(max_children, children_here);
+        // Retained after compaction: the width, or the allele paths at this depth, whichever binds.
         const std::uint64_t here = std::min(pair_cap, product);
         max_prefixes = std::max(max_prefixes, here);
         ancestry_total = checked_add(ancestry_total, here);
         const std::uint64_t pairs_here = here > 0 ? checked_mul(here, here + 1u) / 2u : 0;
         max_pairs = std::max(max_pairs, std::min(limit, pairs_here));
+        parents = here;
     }
     const std::uint64_t prefixes_per_layer = max_prefixes;
     const std::uint64_t pairs_per_layer = max_pairs;
@@ -271,12 +291,9 @@ GroupedAllocationAccounts grouped_allocation_bounds(std::size_t templates, std::
     // layer's children are formed before they are selected and compacted: the child index, the remap
     // built over that child layer, and the child ancestry itself. A locus with 126 alleles in a block
     // makes these millions of bytes, not a rounding error.
-    std::uint64_t a_max = 0;
-    for (const std::size_t a : allele_counts) a_max = std::max(a_max, static_cast<std::uint64_t>(a));
-    // Children are prefixes too, so the same structural bound caps them before compaction.
-    const std::uint64_t children = prefixes_per_layer;
-    std::uint64_t index = checked_mul(checked_mul(prefixes_per_layer, a_max),
-                                      sizeof(std::uint32_t));                    // child_index
+    const std::uint64_t children = max_children;
+    bounds.child_records = children;
+    std::uint64_t index = checked_mul(max_child_index, sizeof(std::uint32_t));   // child_index
     index = checked_add(index, checked_mul(children, sizeof(std::uint32_t)));    // remap
     index = checked_add(index, checked_mul(children, kAncestryBytes));           // pre-compaction ancestry
     // The allele-class index: each template appears in exactly one class per block.
@@ -333,11 +350,11 @@ MosaicBeamResult propose_mosaic_diplotypes_grouped(const PanelAlleleMatrix& pane
     // The fixed production ceiling, over the whole predicted peak, checked BEFORE construction: no
     // layer, no index and no class table has been built at this point, so a refusal allocates nothing
     // and can leave no partial output behind it.
-    if (bounds.total_bytes > parameters.max_proposal_memory_bytes) {
+    if (bounds.total_bytes > parameters.max_proposal_payload_bytes) {
         throw std::length_error("grouped mosaic beam predicted peak " +
                                 std::to_string(bounds.total_bytes) +
-                                " bytes exceeds the declared proposal memory ceiling of " +
-                                std::to_string(parameters.max_proposal_memory_bytes) + " bytes");
+                                " bytes exceeds the declared proposal payload ceiling of " +
+                                std::to_string(parameters.max_proposal_payload_bytes) + " bytes");
     }
     result.allocation_predicted = bounds;
 
@@ -361,6 +378,7 @@ MosaicBeamResult propose_mosaic_diplotypes_grouped(const PanelAlleleMatrix& pane
     std::uint64_t peak_cells = 0;
     std::uint64_t peak_pairs = 0;
     std::uint64_t peak_index_bytes = 0;
+    std::uint64_t peak_children = 0;
 
     // Compacts a freshly built layer to the prefixes retained pairs reference, remapping the pairs.
     // Indices move only WITHIN this layer; a layer's parent pointers name the previous layer, which was
@@ -627,6 +645,7 @@ MosaicBeamResult propose_mosaic_diplotypes_grouped(const PanelAlleleMatrix& pane
         peak_cells = std::max(peak_cells, parent_vectors.cells() + child_vectors.cells());
         {
             const std::uint64_t kids = static_cast<std::uint64_t>(child_ancestry.size());
+            peak_children = std::max(peak_children, kids);
             const std::uint64_t here =
                 static_cast<std::uint64_t>(parent_vectors.size()) * allele_counts[block] *
                     sizeof(std::uint32_t) +                     // child_index
@@ -770,6 +789,7 @@ MosaicBeamResult propose_mosaic_diplotypes_grouped(const PanelAlleleMatrix& pane
     result.allocation_observed.pair_bytes = peak_pairs * sizeof(PairState);
     const std::uint64_t candidate_path_bytes =
         static_cast<std::uint64_t>(pairs.size()) * 2u * blocks * sizeof(std::size_t);
+    result.allocation_observed.child_records = peak_children;
     result.allocation_observed.index_bytes = peak_index_bytes + candidate_path_bytes;
     result.allocation_observed.total_bytes = result.allocation_observed.rolling_vector_bytes +
                                              result.allocation_observed.ancestry_bytes +

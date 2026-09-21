@@ -54,7 +54,7 @@ struct GenotypeCommandOptions {
     // far below the process budget, so it refuses a configuration that would be absurd rather than
     // one that is merely large. Checked before the proposal is constructed, so a refusal writes no
     // ranking and no call.
-    std::uint64_t max_proposal_memory_bytes = 268435456ULL;   // 256 MiB
+    std::uint64_t max_proposal_payload_bytes = 268435456ULL;   // 256 MiB
     // Merged proposal states retained per block: a resource cap on the grouped-state search. A search
     // that prunes and finds fewer than max_mosaic_candidates off-panel mosaics still calls -- every panel
     // diplotype was evaluated -- and reports mosaic_target_reached false and candidate_scope CONDITIONAL.

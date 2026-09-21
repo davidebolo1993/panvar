@@ -1077,10 +1077,12 @@ void test_candidate_prefixes_match_standalone() {
                     // nothing to gate against the ceiling. Dropped for K = 0 ONLY -- wherever both runs
                     // build a beam these must agree exactly, which is what keeps the contract inside
                     // this gate rather than outside it.
-                    "proposal_memory_ceiling_bytes", "proposal_memory_predicted_bytes",
-                    "proposal_memory_observed_bytes", "proposal_memory_predicted_rolling_bytes",
-                    "proposal_memory_predicted_ancestry_bytes", "proposal_memory_predicted_pair_bytes",
-                    "proposal_memory_predicted_index_bytes"};
+                    "proposal_payload_ceiling_bytes", "proposal_payload_predicted_bytes",
+                    "proposal_payload_observed_bytes", "proposal_payload_predicted_rolling_bytes",
+                    "proposal_payload_predicted_ancestry_bytes", "proposal_payload_predicted_pair_bytes",
+                    "proposal_payload_predicted_index_bytes",
+                    "proposal_payload_predicted_child_records",
+                    "proposal_payload_observed_child_records"};
                 if (drop_proposal && proposal_diagnostics.count(key) != 0) continue;
             }
             if (drop_last_column) {
@@ -1523,7 +1525,7 @@ void test_block_consensus_end_to_end() {
 // refused BEFORE the proposal is constructed. This is the production path, not the library call --
 // what matters is that a refusal leaves no ranking and no call behind it, because a partial output
 // beside a status claiming refusal is indistinguishable from a successful run.
-void test_proposal_memory_ceiling() {
+void test_proposal_payload_ceiling() {
     const std::string r1 = path("phaseable_r1.fq");
     const std::string r2 = path("phaseable_r2.fq");
 
@@ -1533,34 +1535,34 @@ void test_proposal_memory_ceiling() {
     require(panvar::run_genotype(baseline) == panvar::GenotypeRunStatus::Complete,
             "fixture: the baseline run must complete under the frozen ceiling");
     const auto reported = read_status(path("mem_baseline.mosaic_status.tsv"));
-    const std::uint64_t predicted = std::stoull(reported.at("proposal_memory_predicted_bytes"));
-    const std::uint64_t observed = std::stoull(reported.at("proposal_memory_observed_bytes"));
+    const std::uint64_t predicted = std::stoull(reported.at("proposal_payload_predicted_bytes"));
+    const std::uint64_t observed = std::stoull(reported.at("proposal_payload_observed_bytes"));
     require(predicted > 0 && observed > 0, "both predicted and observed bytes must be reported");
     require(observed <= predicted,
             "the observed peak must not exceed the prediction the run refused against");
-    require(std::stoull(reported.at("proposal_memory_ceiling_bytes")) == 268435456ULL,
+    require(std::stoull(reported.at("proposal_payload_ceiling_bytes")) == 268435456ULL,
             "the frozen production ceiling must be reported as declared");
-    require(std::stoull(reported.at("proposal_memory_predicted_index_bytes")) > 0,
+    require(std::stoull(reported.at("proposal_payload_predicted_index_bytes")) > 0,
             "the temporary and index storage must be part of the reported prediction");
 
     // Exactly at the predicted peak: admitted.
     panvar::GenotypeCommandOptions at_ceiling = tiny_options("mem_at", r1, r2, "tiny_phaseable.gfa");
-    at_ceiling.max_proposal_memory_bytes = predicted;
+    at_ceiling.max_proposal_payload_bytes = predicted;
     require(panvar::run_genotype(at_ceiling) == panvar::GenotypeRunStatus::Complete,
             "a ceiling exactly at the predicted peak must admit the run");
 
     // One byte below: refused, with no partial output.
     panvar::GenotypeCommandOptions below = tiny_options("mem_below", r1, r2, "tiny_phaseable.gfa");
-    below.max_proposal_memory_bytes = predicted - 1;
+    below.max_proposal_payload_bytes = predicted - 1;
     require(panvar::run_genotype(below) == panvar::GenotypeRunStatus::CandidateIncomplete,
             "a ceiling one byte below the predicted peak must refuse the run");
     const auto refused = read_status(path("mem_below.mosaic_status.tsv"));
-    require(refused.at("note").find("memory ceiling") != std::string::npos,
+    require(refused.at("note").find("payload ceiling") != std::string::npos,
             "the refusal must name the ceiling it exceeded, got: " + refused.at("note"));
     require(no_ranking_or_call("mem_below"),
             "a run refused at the memory ceiling must leave no ranking and no call");
 
-    std::cout << "  proposal memory ceiling: predicted " << predicted << " B, observed " << observed
+    std::cout << "  proposal payload ceiling: predicted " << predicted << " B, observed " << observed
               << " B; admitted at the prediction, refused one byte below, no partial output\n";
 }
 
@@ -1831,7 +1833,7 @@ int main(int argc, char** argv) {
         test_block_consensus_rule();
         test_block_consensus_end_to_end();
         test_full_beam_audit();
-        test_proposal_memory_ceiling();
+        test_proposal_payload_ceiling();
         test_curated_panel();
         test_resource_caps_are_thread_invariant();
         std::cout << "genotype command end-to-end: PASS\n";

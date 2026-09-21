@@ -40,11 +40,14 @@ struct MosaicBeamParameters {
     std::uint64_t max_rolling_vector_cells = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t max_ancestry_records = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t max_pair_records = std::numeric_limits<std::uint64_t>::max();
-    // The ONE fixed production ceiling, in bytes, over the whole predicted peak. The per-account caps
+    // The ONE fixed production ceiling, in bytes, over the predicted proposer PAYLOAD -- the bytes the
+    // proposer's own arrays hold. It is deliberately not a claim about allocated memory: it excludes
+    // container capacity slack, allocator rounding and per-vector headers. It is what production
+    // declares and refuses against, before any construction. The per-account caps
     // above remain as internal invariants -- they catch an account growing in a way its own formula
     // did not predict -- while this is the contract production declares and refuses against, before
     // any construction.
-    std::uint64_t max_proposal_memory_bytes = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t max_proposal_payload_bytes = std::numeric_limits<std::uint64_t>::max();
     // Diagnostic only: follow one declared diplotype through every layer. Its prefixes are looked up and
     // never interned, so prefix ids, ordering and pruning are identical to an untraced search.
     std::optional<MosaicDiplotype> trace_target = std::nullopt;
@@ -138,6 +141,10 @@ struct GroupedAllocationAccounts {
     std::uint64_t ancestry_bytes = 0;
     std::uint64_t pair_records = 0;
     std::uint64_t pair_bytes = 0;
+    // Prefixes in a layer BEFORE it is selected and compacted. Reported separately from
+    // ancestry_records, which counts what survives: a layer is built in full first, so the child count
+    // is the larger of the two whenever the parent layer is at its width.
+    std::uint64_t child_records = 0;
     // Everything else the proposer owns: the allele-class index, the per-layer child index and its
     // remap, the child layer held before compaction, the per-parent scatter vectors, the dense
     // scratch, and the spelled candidate paths. Several of these scale as 2L * A_max, so they are not

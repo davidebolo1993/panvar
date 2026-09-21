@@ -38,7 +38,8 @@ SIGMAS=4
 SUBSTITUTION_ERROR=0.002
 OUTLIER_WEIGHT=0.001
 # Overridable for a targeted diagnostic run; the committed defaults are what the frozen experiment uses,
-# and they now track the frozen production settings: proposal width 256 (audit width 1,024) and K = 128,
+# and they now track the frozen production settings: proposal width 256 (diagnostic comparison width
+# 1,024, which is NOT a phase audit) and K = 128,
 # chosen by the declared width-ladder and K-ladder rule rather than by preference.
 STATE_LIMITS="${STATE_LIMITS:-256 1024}"
 CALL_PREFIXES="${CALL_PREFIXES:-0,128}"
