@@ -830,7 +830,18 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         beam_parameters.state_limit = options.proposal_state_limit;
         beam_parameters.max_extension_evaluations = options.max_beam_extensions;
         try {
-            beam = propose_mosaic_diplotypes(model.panel(), emissions, switch_probability, beam_parameters);
+            // The grouped-prefix proposer. It carries every template attribution of a prefix exactly
+            // rather than approximating a prefix by its best one, and it is cheaper doing so. The
+            // state-based propose_mosaic_diplotypes is retained as the fixture oracle it is checked
+            // against, and is no longer called here.
+            //
+            // The three storage accounts are left at their defaults on purpose. Capping them from
+            // grouped_allocation_bounds with the same inputs the proposer uses would gate a prediction
+            // against itself and always admit; the accounts have force in the fixture, where the
+            // MEASURED use is compared against the prediction. Work remains governed by
+            // max_beam_extensions, and the rolling storage is small -- about 13 MB at C4 width 1,024.
+            beam = propose_mosaic_diplotypes_grouped(model.panel(), emissions, switch_probability,
+                                                     beam_parameters);
         } catch (const std::length_error& error) {
             timings.proposal = seconds_since(mark);
             timings.total = seconds_since(started);
@@ -1294,7 +1305,12 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         // ---- outputs --------------------------------------------------------------------------------
         {
             std::ofstream out = open_output(options.out_prefix + ".mosaic_candidates.tsv");
-            out << manifest_header;
+            // Full round-trip precision for a double. At C4 these scores are around 1.7e6, so the
+            // stream default of six significant digits rounded them to the nearest ten -- enough to
+            // read, not enough to compare or reproduce. The standalone-versus-production agreement
+            // gate gets its resolution from here, and a result artifact should not lose digits the
+            // search actually computed.
+            out << std::setprecision(17) << manifest_header;
             for (std::size_t i = 0; i < candidates.size(); ++i) {
                 const MosaicCandidate& candidate = candidates[i];
                 out << candidate.candidate_id << '\t';

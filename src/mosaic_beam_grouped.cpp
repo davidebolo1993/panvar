@@ -1,10 +1,10 @@
-// The grouped-prefix proposer. Implemented ALONGSIDE propose_mosaic_diplotypes, which is untouched and
-// is the oracle this is tested against; nothing here is wired into calling.
+// The grouped-prefix proposer. Implemented ALONGSIDE propose_mosaic_diplotypes, which is the fixture
+// oracle this is checked against.
 //
 // The unit of retention is the allele-prefix PAIR, and each pair carries the whole distribution over
-// current template pairs rather than one attribution of it. That is exact where prefix-first selection
-// approximates: states sharing a prefix pair are different latent template histories spelling the same
-// allele prefix, and the current template is what the next block's transition reads.
+// current template pairs rather than one attribution of it. States sharing a prefix pair are different
+// latent template histories spelling the same allele prefix, and the current template is what the next
+// block's transition reads, so dropping all but one of them approximates that prefix's future.
 //
 // It is affordable because the joint factorises. Within a prefix pair every history spells the same
 // alleles, so the diploid emission is a single scalar for the whole group -- and the emission is the
@@ -12,8 +12,7 @@
 //
 //     W_p(i, j) = E(p1, p2) * u_p1(i) * u_p2(j)
 //
-// with u_p(i) the mass of template paths spelling prefix p and ending on template i. A group therefore
-// needs two vectors of length T, each shared by every pair using that haplotype prefix, plus scalars.
+// with u_p(i) the mass of template paths spelling prefix p and ending on template i.
 //
 // Two structural facts keep the cost linear in T rather than A*T:
 //   * Li-Stephens is low rank. Staying costs (1-r) + r/T and moving costs r/T, so
@@ -22,6 +21,10 @@
 //   * Each template spells exactly ONE allele at a block. So a single scan over the T templates
 //     produces every child of a prefix at once, scattered into its allele class, and all A children
 //     together occupy exactly T entries. One scan, not A scans.
+//
+// Storage is split by LIFETIME and each part is predicted and gated separately, because pooling them
+// hides exactly the defect an earlier version of this file had: it kept every layer's numerical arrays
+// alive while claiming a rolling budget, so the real cost was O(B * 2LT) against a claimed O(2LT).
 #include "panvar/mosaic_beam.hpp"
 
 #include <algorithm>
@@ -65,15 +68,11 @@ std::uint64_t mul_sat(std::uint64_t lhs, std::uint64_t rhs, bool& saturated) {
     return lhs * rhs;
 }
 
-// One layer's haplotype prefixes. Vectors are compact: prefix p owns entries
-// [offset[p], offset[p+1]), one per template spelling p's last allele, in template order. All the
-// children of one parent therefore occupy T entries between them, which is what makes the layer
-// O(2 L T) rather than O(2 L A T).
-struct HaploidLayer {
-    std::vector<std::uint32_t> parent;   // index into the previous layer, kNoParent at block 0
-    std::vector<std::uint32_t> allele;
-    std::vector<char> matches_first;     // target's first path, tracked incrementally
-    std::vector<char> matches_second;
+// ROLLING storage: only the parent layer's and the child layer's numerical arrays are ever live, and
+// the parent's are released as soon as the child is complete and compacted. Vectors are compact --
+// prefix p owns entries [offset[p], offset[p+1]), one per template spelling p's last allele, in
+// template order -- so all the children of one parent occupy T entries between them.
+struct PrefixVectors {
     std::vector<std::uint32_t> offset;   // size() + 1 entries
     std::vector<double> sum;             // log u_p(i), sum-product
     std::vector<double> best;            // log max-product over single histories
@@ -82,21 +81,52 @@ struct HaploidLayer {
     std::vector<double> best_total;      // max_i best(i)
     std::vector<std::uint64_t> count_total;
     std::vector<char> count_saturated;
+    std::vector<std::uint32_t> allele;   // last allele, needed to scatter back at the next block
+
+    std::size_t size() const { return allele.size(); }
+    std::uint64_t cells() const { return static_cast<std::uint64_t>(sum.size()); }
+    void reset() {
+        offset.clear();
+        sum.clear();
+        best.clear();
+        count.clear();
+        log_total.clear();
+        best_total.clear();
+        count_total.clear();
+        count_saturated.clear();
+        allele.clear();
+        offset.push_back(0);
+    }
+};
+
+// One rolling cell costs a sum, a max and a count.
+constexpr std::uint64_t kCellBytes = sizeof(double) * 2 + sizeof(std::uint64_t);
+
+// PERSISTENT storage, deliberately minimal: (parent, allele) per retained prefix is all that is needed
+// to spell a candidate's allele path at the end. Compacted after every layer to the prefixes retained
+// pairs actually reference, so it grows by at most 2L records per block.
+struct AncestryLayer {
+    std::vector<std::uint32_t> parent;   // index into the previous layer, kNoParent at block 0
+    std::vector<std::uint32_t> allele;
+    std::vector<char> matches_first;     // target's first path, tracked incrementally
+    std::vector<char> matches_second;
 
     std::size_t size() const { return allele.size(); }
 };
 
+constexpr std::uint64_t kAncestryBytes = sizeof(std::uint32_t) * 2 + sizeof(char) * 2;
+
 // The trace target is an UNORDERED diplotype, and pairs are canonicalised by prefix index, so the
 // target's two prefixes can occupy either slot and the canonical order can flip between layers.
 // Checking a single orientation reports the truth as lost at the first layer where it does.
-bool pair_is_target(const HaploidLayer& layer, std::uint32_t first, std::uint32_t second) {
+bool pair_is_target(const AncestryLayer& layer, std::uint32_t first, std::uint32_t second) {
     return (layer.matches_first[first] != 0 && layer.matches_second[second] != 0) ||
            (layer.matches_second[first] != 0 && layer.matches_first[second] != 0);
 }
 
 // A pair-prefix: the unit this proposer retains and ranks.
 struct PairState {
-    std::uint32_t first = 0;    // index into the current HaploidLayer
+    std::uint32_t first = 0;    // index into the current layer
     std::uint32_t second = 0;   // first <= second, always
     double emission = 0.0;      // sum of diploid emissions along the pair, shared by every history
     double mass = kNegInf;      // sum-product, heterozygous factor of two included
@@ -145,6 +175,7 @@ public:
     }
 
     std::uint64_t offered() const { return offered_; }
+    std::size_t live() const { return heap_.size(); }
 
 private:
     std::size_t limit_;
@@ -153,30 +184,18 @@ private:
         heap_;
 };
 
-void validate(const PanelAlleleMatrix& panel, const PreparedProposalEmissions& emissions,
-              const std::vector<double>& switch_probability, const MosaicBeamParameters& parameters) {
-    if (panel.template_count() == 0 || panel.block_count() == 0) {
-        throw std::invalid_argument("grouped mosaic beam needs a non-empty panel");
+std::uint64_t checked_add(std::uint64_t total, std::uint64_t amount) {
+    if (amount > std::numeric_limits<std::uint64_t>::max() - total) {
+        throw std::length_error("grouped mosaic beam allocation bound overflows uint64");
     }
-    for (const auto& row : panel.template_alleles) {
-        if (row.size() != panel.block_count()) {
-            throw std::invalid_argument("grouped mosaic beam: every template must span every block");
-        }
+    return total + amount;
+}
+
+std::uint64_t checked_mul(std::uint64_t lhs, std::uint64_t rhs) {
+    if (lhs != 0 && rhs > std::numeric_limits<std::uint64_t>::max() / lhs) {
+        throw std::length_error("grouped mosaic beam allocation bound overflows uint64");
     }
-    if (emissions.blocks.size() != panel.block_count()) {
-        throw std::invalid_argument("grouped mosaic beam: one emission table per block is required");
-    }
-    if (switch_probability.size() + 1 != panel.block_count()) {
-        throw std::invalid_argument("grouped mosaic beam: one switch probability per block boundary");
-    }
-    for (const double r : switch_probability) {
-        if (!(r >= 0.0 && r <= 1.0)) {
-            throw std::invalid_argument("grouped mosaic beam: switch probability outside [0, 1]");
-        }
-    }
-    if (parameters.state_limit == 0) {
-        throw std::invalid_argument("grouped mosaic beam: a zero state limit retains nothing");
-    }
+    return lhs * rhs;
 }
 
 }   // namespace
@@ -189,47 +208,43 @@ std::uint64_t grouped_extension_upper_bound(std::size_t templates, std::size_t s
     if (templates == 0 || allele_counts.empty()) return 0;
     const std::uint64_t t = static_cast<std::uint64_t>(templates);
     const std::uint64_t limit = static_cast<std::uint64_t>(state_limit);
-    const auto checked_add = [](std::uint64_t total, std::uint64_t amount) {
-        if (amount > std::numeric_limits<std::uint64_t>::max() - total) {
-            throw std::length_error("grouped mosaic beam work bound overflows uint64");
-        }
-        return total + amount;
-    };
-    const auto checked_mul = [](std::uint64_t lhs, std::uint64_t rhs) {
-        if (lhs != 0 && rhs > std::numeric_limits<std::uint64_t>::max() / lhs) {
-            throw std::length_error("grouped mosaic beam work bound overflows uint64");
-        }
-        return lhs * rhs;
-    };
-
     const std::uint64_t first_alleles = static_cast<std::uint64_t>(allele_counts[0]);
     std::uint64_t total = checked_add(t, checked_mul(first_alleles, first_alleles));
     for (std::size_t b = 1; b < allele_counts.size(); ++b) {
         const std::uint64_t a = static_cast<std::uint64_t>(allele_counts[b]);
-        // One template scan per retained haplotype prefix, of which a layer holds at most two per pair.
         total = checked_add(total, checked_mul(checked_mul(2u, limit), t));
-        // One child per ordered allele pair per retained pair.
         total = checked_add(total, checked_mul(limit, checked_mul(a, a)));
     }
     return total;
 }
 
-// Vector cells held at once: the parent layer and the child layer being built, each at most 2L prefixes
-// whose compact vectors together span the T templates.
-std::uint64_t grouped_prefix_vector_cells(std::size_t templates, std::size_t state_limit) {
+GroupedAllocationAccounts grouped_allocation_bounds(std::size_t templates, std::size_t blocks,
+                                                    std::size_t state_limit,
+                                                    const std::vector<std::size_t>& allele_counts) {
+    GroupedAllocationAccounts bounds;
+    if (templates == 0 || blocks == 0 || allele_counts.empty()) return bounds;
     const std::uint64_t t = static_cast<std::uint64_t>(templates);
     const std::uint64_t limit = static_cast<std::uint64_t>(state_limit);
-    if (limit != 0 && t > std::numeric_limits<std::uint64_t>::max() / (4u * limit)) {
-        throw std::length_error("grouped mosaic beam vector bound overflows uint64");
-    }
-    return 4u * limit * t;
+    // A retained pair names at most two haplotype prefixes, so a layer holds at most 2L of them, and a
+    // prefix's compact vector is at most T cells. Parent and child layers are the only ones live.
+    const std::uint64_t per_layer_cells = checked_mul(checked_mul(2u, limit), t);
+    bounds.rolling_vector_cells = checked_mul(2u, per_layer_cells);
+    bounds.rolling_vector_bytes = checked_mul(bounds.rolling_vector_cells, kCellBytes);
+    // Ancestry persists: one compacted layer per block, each at most 2L records.
+    bounds.ancestry_records = checked_mul(static_cast<std::uint64_t>(blocks), checked_mul(2u, limit));
+    bounds.ancestry_bytes = checked_mul(bounds.ancestry_records, kAncestryBytes);
+    // The retained pairs of the previous layer, and the selector's heap for this one.
+    bounds.pair_records = checked_mul(2u, limit);
+    bounds.pair_bytes = checked_mul(bounds.pair_records, sizeof(PairState));
+    return bounds;
 }
 
 MosaicBeamResult propose_mosaic_diplotypes_grouped(const PanelAlleleMatrix& panel,
                                                    const PreparedProposalEmissions& emissions,
                                                    const std::vector<double>& switch_probability,
                                                    const MosaicBeamParameters& parameters) {
-    validate(panel, emissions, switch_probability, parameters);
+    // The SAME validation the state-based proposer runs, not a second, weaker set.
+    validate_proposal_inputs(panel, emissions, switch_probability, parameters);
     const std::size_t templates = panel.template_count();
     const std::size_t blocks = panel.block_count();
     const double log_templates = std::log(static_cast<double>(templates));
@@ -240,16 +255,23 @@ MosaicBeamResult propose_mosaic_diplotypes_grouped(const PanelAlleleMatrix& pane
     MosaicBeamResult result;
     result.state_limit_used = parameters.state_limit;
 
-    // Transactional refusal: both budgets are computed and checked BEFORE anything is allocated, so a
-    // refused search allocates nothing and leaves no partial state.
+    // Transactional refusal: every budget is computed and checked BEFORE anything is allocated, so a
+    // refused search allocates nothing and leaves no partial state. Each account is gated separately.
     result.extension_upper_bound =
         grouped_extension_upper_bound(templates, parameters.state_limit, allele_counts);
-    const std::uint64_t vector_cells = grouped_prefix_vector_cells(templates, parameters.state_limit);
+    const GroupedAllocationAccounts bounds =
+        grouped_allocation_bounds(templates, blocks, parameters.state_limit, allele_counts);
     if (result.extension_upper_bound > parameters.max_extension_evaluations) {
         throw std::length_error("grouped mosaic beam work exceeds the declared pre-allocation budget");
     }
-    if (vector_cells > parameters.max_prefix_vector_cells) {
-        throw std::length_error("grouped mosaic beam vectors exceed the declared pre-allocation budget");
+    if (bounds.rolling_vector_cells > parameters.max_rolling_vector_cells) {
+        throw std::length_error("grouped mosaic beam rolling vectors exceed the declared budget");
+    }
+    if (bounds.ancestry_records > parameters.max_ancestry_records) {
+        throw std::length_error("grouped mosaic beam ancestry exceeds the declared budget");
+    }
+    if (bounds.pair_records > parameters.max_pair_records) {
+        throw std::length_error("grouped mosaic beam pair records exceed the declared budget");
     }
 
     // Which templates spell each allele, per block: the scatter target of the single template scan.
@@ -269,71 +291,123 @@ MosaicBeamResult propose_mosaic_diplotypes_grouped(const PanelAlleleMatrix& pane
     const MosaicDiplotype empty_target;
     const MosaicDiplotype& target = traced ? *parameters.trace_target : empty_target;
 
+    std::uint64_t peak_cells = 0;
+    std::uint64_t peak_pairs = 0;
+
+    // Compacts a freshly built layer to the prefixes retained pairs reference, remapping the pairs.
+    // Indices move only WITHIN this layer; a layer's parent pointers name the previous layer, which was
+    // compacted before this one was built, so they stay valid. `keep` is ascending, so the remap is
+    // monotonic and each pair's first <= second survives it.
+    const auto compact = [](const AncestryLayer& ancestry_in, const PrefixVectors& vectors_in,
+                            std::vector<PairState>& pairs, AncestryLayer& ancestry_out,
+                            PrefixVectors& vectors_out) {
+        std::vector<std::uint32_t> keep;
+        keep.reserve(pairs.size() * 2);
+        for (const PairState& pair : pairs) {
+            keep.push_back(pair.first);
+            keep.push_back(pair.second);
+        }
+        std::sort(keep.begin(), keep.end());
+        keep.erase(std::unique(keep.begin(), keep.end()), keep.end());
+
+        std::vector<std::uint32_t> remap(ancestry_in.size(), kNoParent);
+        ancestry_out = AncestryLayer{};
+        vectors_out.reset();
+        for (std::size_t n = 0; n < keep.size(); ++n) {
+            const std::uint32_t old = keep[n];
+            remap[old] = static_cast<std::uint32_t>(n);
+            ancestry_out.parent.push_back(ancestry_in.parent[old]);
+            ancestry_out.allele.push_back(ancestry_in.allele[old]);
+            ancestry_out.matches_first.push_back(ancestry_in.matches_first[old]);
+            ancestry_out.matches_second.push_back(ancestry_in.matches_second[old]);
+            for (std::uint32_t e = vectors_in.offset[old]; e < vectors_in.offset[old + 1]; ++e) {
+                vectors_out.sum.push_back(vectors_in.sum[e]);
+                vectors_out.best.push_back(vectors_in.best[e]);
+                vectors_out.count.push_back(vectors_in.count[e]);
+            }
+            vectors_out.offset.push_back(static_cast<std::uint32_t>(vectors_out.sum.size()));
+            vectors_out.log_total.push_back(vectors_in.log_total[old]);
+            vectors_out.best_total.push_back(vectors_in.best_total[old]);
+            vectors_out.count_total.push_back(vectors_in.count_total[old]);
+            vectors_out.count_saturated.push_back(vectors_in.count_saturated[old]);
+            vectors_out.allele.push_back(vectors_in.allele[old]);
+        }
+        for (PairState& pair : pairs) {
+            pair.first = remap[pair.first];
+            pair.second = remap[pair.second];
+        }
+    };
+
     // ---- block 0: one haplotype prefix per allele, every template weighted 1/T ---------------------
-    std::vector<HaploidLayer> layers;
-    layers.reserve(blocks);
+    std::vector<AncestryLayer> ancestry;
+    ancestry.reserve(blocks);
+    PrefixVectors parent_vectors;
+    PrefixVectors child_vectors;
+    PrefixVectors rolled_vectors;
+    AncestryLayer built_ancestry;
+    PrefixVectors built_vectors;
+    built_vectors.reset();
     {
-        HaploidLayer layer;
-        layer.offset.push_back(0);
         for (std::size_t a = 0; a < allele_counts[0]; ++a) {
             const auto& members = class_templates[0][a];
-            layer.parent.push_back(kNoParent);
-            layer.allele.push_back(static_cast<std::uint32_t>(a));
-            layer.matches_first.push_back(traced && target.first.alleles[0] == a ? 1 : 0);
-            layer.matches_second.push_back(traced && target.second.alleles[0] == a ? 1 : 0);
+            built_ancestry.parent.push_back(kNoParent);
+            built_ancestry.allele.push_back(static_cast<std::uint32_t>(a));
+            built_ancestry.matches_first.push_back(traced && target.first.alleles[0] == a ? 1 : 0);
+            built_ancestry.matches_second.push_back(traced && target.second.alleles[0] == a ? 1 : 0);
             double total = kNegInf;
             double best = kNegInf;
             std::uint64_t count = 0;
             bool saturated = false;
-            for (const std::uint32_t member : members) {
-                (void)member;
-                layer.sum.push_back(-log_templates);
-                layer.best.push_back(-log_templates);
-                layer.count.push_back(1);
+            for (std::size_t m = 0; m < members.size(); ++m) {
+                built_vectors.sum.push_back(-log_templates);
+                built_vectors.best.push_back(-log_templates);
+                built_vectors.count.push_back(1);
                 total = log_add(total, -log_templates);
                 best = std::max(best, -log_templates);
                 add_sat(count, saturated, 1, false);
             }
-            layer.offset.push_back(static_cast<std::uint32_t>(layer.sum.size()));
-            layer.log_total.push_back(total);
-            layer.best_total.push_back(best);
-            layer.count_total.push_back(count);
-            layer.count_saturated.push_back(saturated ? 1 : 0);
+            built_vectors.offset.push_back(static_cast<std::uint32_t>(built_vectors.sum.size()));
+            built_vectors.log_total.push_back(total);
+            built_vectors.best_total.push_back(best);
+            built_vectors.count_total.push_back(count);
+            built_vectors.count_saturated.push_back(saturated ? 1 : 0);
+            built_vectors.allele.push_back(static_cast<std::uint32_t>(a));
         }
         result.extensions_evaluated += templates;
-        layers.push_back(std::move(layer));
+        peak_cells = std::max(peak_cells, built_vectors.cells());
     }
 
     // Pairs at block 0: every unordered pair of block-0 alleles.
     std::vector<PairState> pairs;
     {
-        const HaploidLayer& layer = layers.back();
         const BlockProposalEmissions& emission = emissions.blocks[0];
         PairSelector selector(parameters.state_limit);
         MosaicBeamTraceLayer record;
         record.block = 0;
-        for (std::size_t i = 0; i < layer.size(); ++i) {
-            for (std::size_t j = i; j < layer.size(); ++j) {
+        for (std::size_t i = 0; i < built_vectors.size(); ++i) {
+            for (std::size_t j = i; j < built_vectors.size(); ++j) {
                 ++result.extensions_evaluated;
-                if (layer.log_total[i] == kNegInf || layer.log_total[j] == kNegInf) continue;
+                if (built_vectors.log_total[i] == kNegInf || built_vectors.log_total[j] == kNegInf) continue;
                 PairState pair;
                 pair.first = static_cast<std::uint32_t>(i);
                 pair.second = static_cast<std::uint32_t>(j);
-                pair.emission = emission.log_score[layer.allele[i] * emission.allele_count + layer.allele[j]];
+                pair.emission = emission.log_score[built_vectors.allele[i] * emission.allele_count +
+                                                   built_vectors.allele[j]];
                 const bool heterozygous = i != j;
                 // The heterozygous factor of two, in the SELECTION score from the first layer on: an
                 // unordered pair of distinct prefixes stands for two ordered histories.
-                pair.mass = pair.emission + layer.log_total[i] + layer.log_total[j] +
+                pair.mass = pair.emission + built_vectors.log_total[i] + built_vectors.log_total[j] +
                             (heterozygous ? std::log(2.0) : 0.0);
-                pair.best = pair.emission + layer.best_total[i] + layer.best_total[j];
-                pair.best_transition = layer.best_total[i] + layer.best_total[j];
-                bool saturated = layer.count_saturated[i] != 0 || layer.count_saturated[j] != 0;
-                pair.histories = mul_sat(layer.count_total[i], layer.count_total[j], saturated);
+                pair.best = pair.emission + built_vectors.best_total[i] + built_vectors.best_total[j];
+                pair.best_transition = built_vectors.best_total[i] + built_vectors.best_total[j];
+                bool saturated =
+                    built_vectors.count_saturated[i] != 0 || built_vectors.count_saturated[j] != 0;
+                pair.histories =
+                    mul_sat(built_vectors.count_total[i], built_vectors.count_total[j], saturated);
                 if (heterozygous) pair.histories = mul_sat(pair.histories, 2, saturated);
                 pair.saturated = saturated;
                 selector.offer(pair);
-                if (traced && pair_is_target(layer, static_cast<std::uint32_t>(i),
-                                             static_cast<std::uint32_t>(j))) {
+                if (traced && pair_is_target(built_ancestry, pair.first, pair.second)) {
                     record.target_prefixes_present = true;
                     record.target_states_offered = 1;
                     record.target_logsum_log_mass = pair.mass;
@@ -341,6 +415,7 @@ MosaicBeamResult propose_mosaic_diplotypes_grouped(const PanelAlleleMatrix& pane
                 }
             }
         }
+        peak_pairs = std::max<std::uint64_t>(peak_pairs, selector.live());
         pairs = selector.take(result.states_pruned);
         if (traced) {
             record.states_offered = selector.offered();
@@ -353,7 +428,7 @@ MosaicBeamResult propose_mosaic_diplotypes_grouped(const PanelAlleleMatrix& pane
                 std::size_t rank = 1;
                 for (const PairState& kept : pairs) {
                     if (kept.mass > record.target_logsum_log_mass) ++rank;
-                    if (pair_is_target(layers.back(), kept.first, kept.second)) {
+                    if (pair_is_target(built_ancestry, kept.first, kept.second)) {
                         record.target_states_retained = 1;
                         record.target_retained_logsum_log_mass = kept.mass;
                     }
@@ -362,6 +437,9 @@ MosaicBeamResult propose_mosaic_diplotypes_grouped(const PanelAlleleMatrix& pane
             }
             result.trace.push_back(record);
         }
+        AncestryLayer compacted;
+        compact(built_ancestry, built_vectors, pairs, compacted, parent_vectors);
+        ancestry.push_back(std::move(compacted));
     }
 
     // ---- blocks 1..B-1 -----------------------------------------------------------------------------
@@ -375,46 +453,33 @@ MosaicBeamResult propose_mosaic_diplotypes_grouped(const PanelAlleleMatrix& pane
         const double log_other = r > 0.0 ? std::log(r) - log_templates : kNegInf;
         const double log_stay = r < 1.0 ? std::log1p(-r) : kNegInf;
         const BlockProposalEmissions& emission = emissions.blocks[block];
-        const HaploidLayer& parent_layer = layers.back();
+        const AncestryLayer& parent_ancestry = ancestry.back();
 
-        // Which parent prefixes are still referenced, and where each one's children begin.
-        std::vector<std::uint32_t> referenced;
-        referenced.reserve(pairs.size() * 2);
-        for (const PairState& pair : pairs) {
-            referenced.push_back(pair.first);
-            referenced.push_back(pair.second);
-        }
-        std::sort(referenced.begin(), referenced.end());
-        referenced.erase(std::unique(referenced.begin(), referenced.end()), referenced.end());
-
-        HaploidLayer child_layer;
-        child_layer.offset.push_back(0);
-        // child_index[parent slot][allele] -> index in child_layer, or kNoParent when that allele has
-        // no template and therefore no child.
+        AncestryLayer child_ancestry;
+        child_vectors.reset();
+        // child_index[parent][allele] -> index in the child layer, or kNoParent when that allele has no
+        // reachable template. Every parent is referenced: the layer was compacted after its selection.
         std::vector<std::vector<std::uint32_t>> child_index(
-            referenced.size(), std::vector<std::uint32_t>(allele_counts[block], kNoParent));
-        std::vector<std::uint32_t> parent_slot(parent_layer.size(), kNoParent);
-        for (std::size_t s = 0; s < referenced.size(); ++s) parent_slot[referenced[s]] = static_cast<std::uint32_t>(s);
+            parent_vectors.size(), std::vector<std::uint32_t>(allele_counts[block], kNoParent));
 
-        for (std::size_t s = 0; s < referenced.size(); ++s) {
-            const std::uint32_t p = referenced[s];
-            const std::uint32_t from = parent_layer.offset[p];
-            const std::uint32_t to = parent_layer.offset[p + 1];
-            const auto& parent_members = class_templates[block - 1][parent_layer.allele[p]];
+        for (std::size_t p = 0; p < parent_vectors.size(); ++p) {
+            const std::uint32_t from = parent_vectors.offset[p];
+            const std::uint32_t to = parent_vectors.offset[p + 1];
+            const auto& parent_members = class_templates[block - 1][parent_vectors.allele[p]];
 
             // Dense scratch for this parent only, filled and cleared over its own class: O(class size).
             double best_first = kNegInf;
             double best_second = kNegInf;
             for (std::uint32_t e = from; e < to; ++e) {
                 const std::uint32_t i = parent_members[e - from];
-                scratch_sum[i] = parent_layer.sum[e];
-                scratch_best[i] = parent_layer.best[e];
-                scratch_count[i] = parent_layer.count[e];
-                if (parent_layer.best[e] > best_first) {
+                scratch_sum[i] = parent_vectors.sum[e];
+                scratch_best[i] = parent_vectors.best[e];
+                scratch_count[i] = parent_vectors.count[e];
+                if (parent_vectors.best[e] > best_first) {
                     best_second = best_first;
-                    best_first = parent_layer.best[e];
-                } else if (parent_layer.best[e] > best_second) {
-                    best_second = parent_layer.best[e];
+                    best_first = parent_vectors.best[e];
+                } else if (parent_vectors.best[e] > best_second) {
+                    best_second = parent_vectors.best[e];
                 }
             }
 
@@ -427,7 +492,7 @@ MosaicBeamResult propose_mosaic_diplotypes_grouped(const PanelAlleleMatrix& pane
                 // Low-rank Li-Stephens: staying keeps (1-r) of this template's own mass, and the rank-1
                 // jump adds r/T of the prefix's total to every template alike.
                 const double sum_here =
-                    log_add(log_stay + scratch_sum[i], log_other + parent_layer.log_total[p]);
+                    log_add(log_stay + scratch_sum[i], log_other + parent_vectors.log_total[p]);
                 // The max-product cannot use that decomposition: it needs the best OTHER template,
                 // which is the top of the parent's two best values, excluding i itself.
                 const double other_best = (scratch_best[i] == best_first && scratch_best[i] != kNegInf)
@@ -439,7 +504,7 @@ MosaicBeamResult propose_mosaic_diplotypes_grouped(const PanelAlleleMatrix& pane
                 // Every retained path can reach any template when a switch is possible; with r = 0 only
                 // the path already on this template continues.
                 const std::uint64_t count_here =
-                    log_other == kNegInf ? scratch_count[i] : parent_layer.count_total[p];
+                    log_other == kNegInf ? scratch_count[i] : parent_vectors.count_total[p];
                 // Every template of the class is pushed, unreachable ones included. The compact vector
                 // must stay positionally aligned with class_templates, because that is how the NEXT
                 // block scatters back from a compact entry to its template id; skipping a zero here
@@ -464,29 +529,36 @@ MosaicBeamResult propose_mosaic_diplotypes_grouped(const PanelAlleleMatrix& pane
                 // A child none of whose templates is reachable carries no mass and is not a prefix the
                 // search can continue. It is simply never created, and that allele has no child here.
                 if (total == kNegInf) continue;
-                child_index[s][a] = static_cast<std::uint32_t>(child_layer.size());
-                child_layer.parent.push_back(p);
-                child_layer.allele.push_back(static_cast<std::uint32_t>(a));
-                child_layer.matches_first.push_back(
-                    traced && parent_layer.matches_first[p] != 0 && target.first.alleles[block] == a ? 1 : 0);
-                child_layer.matches_second.push_back(
-                    traced && parent_layer.matches_second[p] != 0 && target.second.alleles[block] == a ? 1 : 0);
+                child_index[p][a] = static_cast<std::uint32_t>(child_ancestry.size());
+                child_ancestry.parent.push_back(static_cast<std::uint32_t>(p));
+                child_ancestry.allele.push_back(static_cast<std::uint32_t>(a));
+                child_ancestry.matches_first.push_back(
+                    traced && parent_ancestry.matches_first[p] != 0 && target.first.alleles[block] == a ? 1 : 0);
+                child_ancestry.matches_second.push_back(
+                    traced && parent_ancestry.matches_second[p] != 0 && target.second.alleles[block] == a ? 1 : 0);
                 double best = kNegInf;
                 std::uint64_t count = 0;
-                bool saturated = parent_layer.count_saturated[p] != 0;
+                bool saturated = parent_vectors.count_saturated[p] != 0;
                 for (std::size_t k = 0; k < child_sum[a].size(); ++k) {
-                    child_layer.sum.push_back(child_sum[a][k]);
-                    child_layer.best.push_back(child_best[a][k]);
-                    child_layer.count.push_back(child_count[a][k]);
+                    child_vectors.sum.push_back(child_sum[a][k]);
+                    child_vectors.best.push_back(child_best[a][k]);
+                    child_vectors.count.push_back(child_count[a][k]);
                     best = std::max(best, child_best[a][k]);
                     add_sat(count, saturated, child_count[a][k], false);
                 }
-                child_layer.offset.push_back(static_cast<std::uint32_t>(child_layer.sum.size()));
-                child_layer.log_total.push_back(total);
-                child_layer.best_total.push_back(best);
-                child_layer.count_total.push_back(count);
-                child_layer.count_saturated.push_back(saturated ? 1 : 0);
+                child_vectors.offset.push_back(static_cast<std::uint32_t>(child_vectors.sum.size()));
+                child_vectors.log_total.push_back(total);
+                child_vectors.best_total.push_back(best);
+                child_vectors.count_total.push_back(count);
+                child_vectors.count_saturated.push_back(saturated ? 1 : 0);
+                child_vectors.allele.push_back(static_cast<std::uint32_t>(a));
             }
+        }
+
+        // Both layers are live at exactly this point, which is what the rolling account bounds.
+        peak_cells = std::max(peak_cells, parent_vectors.cells() + child_vectors.cells());
+        if (child_ancestry.size() >= kNoParent) {
+            throw std::length_error("grouped mosaic beam prefix index exceeds uint32");
         }
 
         // Pair extension: two scalar lookups per ordered allele pair, no cell materialised.
@@ -494,39 +566,36 @@ MosaicBeamResult propose_mosaic_diplotypes_grouped(const PanelAlleleMatrix& pane
         MosaicBeamTraceLayer record;
         record.block = block;
         for (const PairState& pair : pairs) {
-            const std::uint32_t slot1 = parent_slot[pair.first];
-            const std::uint32_t slot2 = parent_slot[pair.second];
             const bool symmetric = pair.first == pair.second;
             for (std::size_t a = 0; a < allele_counts[block]; ++a) {
-                const std::uint32_t c1 = child_index[slot1][a];
+                const std::uint32_t c1 = child_index[pair.first][a];
                 if (c1 == kNoParent) continue;
                 // A symmetric parent's (a, b) and (b, a) are one unordered child, so it is formed once.
                 for (std::size_t b = symmetric ? a : 0; b < allele_counts[block]; ++b) {
                     ++result.extensions_evaluated;
-                    const std::uint32_t c2 = child_index[slot2][b];
+                    const std::uint32_t c2 = child_index[pair.second][b];
                     if (c2 == kNoParent) continue;
                     PairState child;
                     child.first = std::min(c1, c2);
                     child.second = std::max(c1, c2);
-                    child.emission =
-                        pair.emission + emission.log_score[a * emission.allele_count + b];
+                    child.emission = pair.emission + emission.log_score[a * emission.allele_count + b];
                     const bool heterozygous = child.first != child.second;
-                    child.mass = child.emission + child_layer.log_total[child.first] +
-                                 child_layer.log_total[child.second] +
+                    child.mass = child.emission + child_vectors.log_total[child.first] +
+                                 child_vectors.log_total[child.second] +
                                  (heterozygous ? std::log(2.0) : 0.0);
-                    child.best = child.emission + child_layer.best_total[child.first] +
-                                 child_layer.best_total[child.second];
+                    child.best = child.emission + child_vectors.best_total[child.first] +
+                                 child_vectors.best_total[child.second];
                     child.best_transition =
-                        child_layer.best_total[child.first] + child_layer.best_total[child.second];
-                    bool saturated = child_layer.count_saturated[child.first] != 0 ||
-                                     child_layer.count_saturated[child.second] != 0;
-                    child.histories = mul_sat(child_layer.count_total[child.first],
-                                              child_layer.count_total[child.second], saturated);
+                        child_vectors.best_total[child.first] + child_vectors.best_total[child.second];
+                    bool saturated = child_vectors.count_saturated[child.first] != 0 ||
+                                     child_vectors.count_saturated[child.second] != 0;
+                    child.histories = mul_sat(child_vectors.count_total[child.first],
+                                              child_vectors.count_total[child.second], saturated);
                     if (heterozygous) child.histories = mul_sat(child.histories, 2, saturated);
                     child.saturated = saturated;
                     if (child.mass == kNegInf) continue;
                     selector.offer(child);
-                    if (traced && pair_is_target(child_layer, child.first, child.second)) {
+                    if (traced && pair_is_target(child_ancestry, child.first, child.second)) {
                         record.target_prefixes_present = true;
                         record.target_states_offered = 1;
                         record.target_logsum_log_mass = child.mass;
@@ -536,6 +605,7 @@ MosaicBeamResult propose_mosaic_diplotypes_grouped(const PanelAlleleMatrix& pane
             }
         }
 
+        peak_pairs = std::max<std::uint64_t>(peak_pairs, pairs.size() + selector.live());
         pairs = selector.take(result.states_pruned);
         if (traced) {
             record.states_offered = selector.offered();
@@ -548,7 +618,7 @@ MosaicBeamResult propose_mosaic_diplotypes_grouped(const PanelAlleleMatrix& pane
                 std::size_t rank = 1;
                 for (const PairState& kept : pairs) {
                     if (kept.mass > record.target_logsum_log_mass) ++rank;
-                    if (pair_is_target(child_layer, kept.first, kept.second)) {
+                    if (pair_is_target(child_ancestry, kept.first, kept.second)) {
                         record.target_states_retained = 1;
                         record.target_retained_logsum_log_mass = kept.mass;
                     }
@@ -557,14 +627,22 @@ MosaicBeamResult propose_mosaic_diplotypes_grouped(const PanelAlleleMatrix& pane
             }
             result.trace.push_back(record);
         }
-        layers.push_back(std::move(child_layer));
+
+        // Compact the child layer to what the retained pairs reference, then ROLL: the child becomes
+        // the parent and the previous parent's numerical arrays are released here, not at the end.
+        AncestryLayer compacted;
+        compact(child_ancestry, child_vectors, pairs, compacted, rolled_vectors);
+        ancestry.push_back(std::move(compacted));
+        parent_vectors = std::move(rolled_vectors);
+        rolled_vectors = PrefixVectors{};
+        child_vectors.reset();
     }
 
     // ---- candidates: every retained pair-prefix IS one diplotype --------------------------------
     const auto spell = [&](std::uint32_t index) {
         std::vector<std::size_t> alleles(blocks, 0);
-        for (std::size_t b = blocks; b > 0; --b) {
-            const HaploidLayer& layer = layers[b - 1];
+        for (std::size_t b = ancestry.size(); b > 0; --b) {
+            const AncestryLayer& layer = ancestry[b - 1];
             alleles[b - 1] = layer.allele[index];
             index = layer.parent[index];
         }
@@ -602,6 +680,15 @@ MosaicBeamResult propose_mosaic_diplotypes_grouped(const PanelAlleleMatrix& pane
         }
         return lhs.diplotype.second.alleles < rhs.diplotype.second.alleles;
     });
+
+    std::uint64_t ancestry_records = 0;
+    for (const AncestryLayer& layer : ancestry) ancestry_records += layer.size();
+    result.allocation_observed.rolling_vector_cells = peak_cells;
+    result.allocation_observed.rolling_vector_bytes = peak_cells * kCellBytes;
+    result.allocation_observed.ancestry_records = ancestry_records;
+    result.allocation_observed.ancestry_bytes = ancestry_records * kAncestryBytes;
+    result.allocation_observed.pair_records = peak_pairs;
+    result.allocation_observed.pair_bytes = peak_pairs * sizeof(PairState);
 
     result.final_states = pairs.size();
     result.unique_candidates_found = candidates.size();

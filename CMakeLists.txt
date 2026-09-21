@@ -280,10 +280,6 @@ if(PANVAR_BUILD_TESTING)
         target_compile_options(genotype_grouped_beam_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME panvar_genotype_grouped_beam COMMAND genotype_grouped_beam_test)
 
-        add_executable(genotype_beam_selector_test tests/genotype_beam_selector.cpp src/genotype_model.cpp)
-        target_include_directories(genotype_beam_selector_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-        target_compile_options(genotype_beam_selector_test PRIVATE -Wall -Wextra -Wpedantic)
-        add_test(NAME panvar_genotype_beam_selector COMMAND genotype_beam_selector_test)
         # Runs after the genotype tests: none of them, nor the developer probes, may leave generated files in
         # the source tree.
         add_test(NAME panvar_genotype_source_tree_clean

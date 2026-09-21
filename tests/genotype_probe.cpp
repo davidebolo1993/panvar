@@ -2242,7 +2242,6 @@ int trace(const Args& args) {
     // return the same MosaicBeamResult, so every summary below is computed the same way; the grouped
     // one fills only the layer fields it can, so its per-layer trace is thinner.
     const bool grouped = args.get("grouped", "0") != "0";
-    parameters.max_prefix_vector_cells = 4ULL * state_limit * panel.template_count();
     const panvar::MosaicBeamResult result =
         grouped ? panvar::propose_mosaic_diplotypes_grouped(panel, emissions, switches, parameters)
                 : panvar::propose_mosaic_diplotypes(panel, emissions, switches, parameters);
@@ -2260,11 +2259,30 @@ int trace(const Args& args) {
         has_source ? panvar::off_panel_mosaics(result, panvar::panel_diplotypes(panel)) : result;
     std::vector<const panvar::MosaicCandidate*> beam_mosaics;
     for (const auto& candidate : compared_beam.candidates) beam_mosaics.push_back(&candidate);
+    // Agreement between this standalone proposal and the production run's own manifest, on all three
+    // of the things that identify a candidate: WHICH diplotype it is, WHERE it ranks (the comparison is
+    // index by index, so agreeing in order is agreeing on rank), and WHAT it scored. Identity and rank
+    // alone would pass an implementation that ordered the same candidates by a different quantity.
+    //
+    // The score is compared with a relative tolerance because the manifest is a written decimal, not
+    // the double the search held; production and this path run the same code on the same inputs, so
+    // anything beyond that tolerance is a real disagreement.
     bool matches_run = !manifest.empty();
+    bool matches_run_score = !manifest.empty();
     const std::size_t compared = std::min(manifest.size(), beam_mosaics.size());
-    for (std::size_t i = 0; i < compared && matches_run; ++i) {
-        matches_run = parse_alleles(manifest[i].at("hap1_alleles")) == beam_mosaics[i]->diplotype.first.alleles &&
-                      parse_alleles(manifest[i].at("hap2_alleles")) == beam_mosaics[i]->diplotype.second.alleles;
+    for (std::size_t i = 0; i < compared; ++i) {
+        const bool same_identity =
+            parse_alleles(manifest[i].at("hap1_alleles")) == beam_mosaics[i]->diplotype.first.alleles &&
+            parse_alleles(manifest[i].at("hap2_alleles")) == beam_mosaics[i]->diplotype.second.alleles;
+        matches_run = matches_run && same_identity;
+        bool same_score = same_identity;
+        if (manifest[i].count("retained_logsum_proposal_score") != 0) {
+            const double run_score = std::stod(manifest[i].at("retained_logsum_proposal_score"));
+            const double here = beam_mosaics[i]->retained_logsum_proposal_score;
+            same_score = same_score &&
+                         std::abs(run_score - here) <= 1e-9 * std::max(1.0, std::abs(here));
+        }
+        matches_run_score = matches_run_score && same_score;
     }
 
     std::ofstream layers(out + ".trace.tsv");
@@ -2336,7 +2354,8 @@ int trace(const Args& args) {
             << "\ncandidate_target\t" << target << "\nunique_candidates_found\t" << result.unique_candidates_found
             << "\nstates_pruned\t" << result.states_pruned
             << "\nextensions_evaluated\t" << result.extensions_evaluated << "\nproposal_matches_run\t"
-            << (matches_run ? "true" : "false") << "\ncandidates_compared_with_run\t" << compared
+            << (matches_run ? "true" : "false") << "\nproposal_matches_run_score\t"
+            << (matches_run_score ? "true" : "false") << "\ncandidates_compared_with_run\t" << compared
             // Empty for a synthetic mosaic: it is curated out of the panel by construction, so it has no
             // panel rows. Indexing rows[0] here regardless is what segfaulted the first mosaic trace --
             // an out-of-bounds read on an empty vector, silent, with no exception to catch.

@@ -29,9 +29,13 @@ struct MosaicBeamParameters {
     // still misses the target is incomplete, however large this is.
     std::size_t state_limit = 0;
     std::uint64_t max_extension_evaluations = std::numeric_limits<std::uint64_t>::max();
-    // Grouped proposer only: haplotype-prefix vector cells held at once. Checked before anything is
-    // allocated, so a refused search allocates nothing.
-    std::uint64_t max_prefix_vector_cells = std::numeric_limits<std::uint64_t>::max();
+    // Grouped proposer only, and gated SEPARATELY because these are accounts of different kinds that
+    // must not be pooled: vector cells roll (only the parent layer and the child being built are
+    // live), ancestry records persist for the whole search, and pair records live for one layer. All
+    // three are checked before anything is allocated.
+    std::uint64_t max_rolling_vector_cells = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t max_ancestry_records = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t max_pair_records = std::numeric_limits<std::uint64_t>::max();
     // Diagnostic only: follow one declared diplotype through every layer. Its prefixes are looked up and
     // never interned, so prefix ids, ordering and pruning are identical to an untraced search.
     std::optional<MosaicDiplotype> trace_target = std::nullopt;
@@ -54,10 +58,10 @@ struct MosaicBeamTraceLayer {
     std::size_t block = 0;
     std::uint64_t states_offered = 0;      // merged states offered to the layer's selection
     std::size_t states_retained = 0;
-    // Distinct allele-prefix pairs among the states OFFERED to this layer's selection: how many
-    // diplotype prefixes the layer had to choose between. Read against prefix_pairs_retained, it
-    // separates a layer that was offered little diversity from one that was offered plenty and kept
-    // little.
+    // Distinct allele-prefix pairs OFFERED to this layer's selection: how many diplotype prefixes the
+    // layer had to choose between. Read against prefix_pairs_retained it separates a layer offered
+    // little diversity from one offered plenty and keeping little. Set by the grouped proposer, whose
+    // unit of selection is the prefix pair; the state-based oracle leaves it 0, not measured.
     std::size_t prefix_pairs_offered = 0;
     // Distinct allele-prefix pairs among the retained states: how many diplotype prefixes the width holds.
     std::size_t prefix_pairs_retained = 0;
@@ -81,9 +85,9 @@ struct MosaicBeamTraceLayer {
     // lost, which is the honest reading of "nothing was lost".
     double target_retained_logsum_log_mass = -std::numeric_limits<double>::infinity();
     double target_lost_log_mass = -std::numeric_limits<double>::infinity();
-    // Rank of the target's prefix GROUP among every group offered, by aggregate group mass -- the
-    // quantity prefix-first selection actually ranks on. 0 when the target was not offered. A rank
-    // among states (offered_above_target_best) cannot stand in for it.
+    // Rank of the target's prefix pair among every pair offered, by the mass the grouped proposer
+    // ranks on. 0 when the target was not offered, or when the state-based oracle ran. A rank among
+    // individual states (offered_above_target_best) cannot stand in for it.
     std::size_t target_group_rank_by_offered_mass = 0;
     std::uint32_t target_best_template1 = 0;   // templates of the best target state, as stored
     std::uint32_t target_best_template2 = 0;
@@ -111,6 +115,20 @@ struct MosaicCandidate {
     bool every_allele_scored = false;
 };
 
+// The grouped proposer's three storage accounts, predicted before the search and measured during it.
+// They are reported and gated separately because they behave differently: rolling cells are bounded by
+// one layer boundary, ancestry records accumulate for the whole search and are what a candidate's
+// allele path is reconstructed from, and pair records plus the selector's temporary storage live for a
+// single layer.
+struct GroupedAllocationAccounts {
+    std::uint64_t rolling_vector_cells = 0;
+    std::uint64_t rolling_vector_bytes = 0;
+    std::uint64_t ancestry_records = 0;
+    std::uint64_t ancestry_bytes = 0;
+    std::uint64_t pair_records = 0;
+    std::uint64_t pair_bytes = 0;
+};
+
 struct MosaicBeamResult {
     std::vector<MosaicCandidate> candidates;   // at most unique_candidate_target, best retained mass first
     std::size_t state_limit_used = 0;
@@ -126,6 +144,8 @@ struct MosaicBeamResult {
     // found than the target -- so any ranking over it is conditional on the candidate set.
     bool candidate_set_conditional = false;
     std::vector<MosaicBeamTraceLayer> trace;   // one per block when a trace target was declared
+    // Grouped proposer only: peak storage actually taken, for comparison against the prediction.
+    GroupedAllocationAccounts allocation_observed;
 };
 
 // The protected panel baseline: every unordered pair of panel templates, deduplicated by allele paths, with
@@ -157,6 +177,18 @@ MosaicBeamResult propose_mosaic_diplotypes_grouped(const PanelAlleleMatrix& pane
 // overflow-checked, and both are checked before anything is allocated.
 std::uint64_t grouped_extension_upper_bound(std::size_t templates, std::size_t state_limit,
                                             const std::vector<std::size_t>& allele_counts);
-std::uint64_t grouped_prefix_vector_cells(std::size_t templates, std::size_t state_limit);
+// The three accounts, predicted from the exact arrays and loops the grouped proposer runs. Integer and
+// overflow-checked; every field is an upper bound the measured account must not exceed.
+GroupedAllocationAccounts grouped_allocation_bounds(std::size_t templates, std::size_t blocks,
+                                                    std::size_t state_limit,
+                                                    const std::vector<std::size_t>& allele_counts);
+
+// The proposer's complete input validation, shared by both implementations so neither can drift into a
+// weaker set of checks: malformed or non-finite emission tables, a zero candidate target or state
+// limit, switch probabilities outside [0, 1], a trace target of the wrong length, and index capacity
+// against uint32.
+void validate_proposal_inputs(const PanelAlleleMatrix& panel, const PreparedProposalEmissions& emissions,
+                              const std::vector<double>& switch_probability,
+                              const MosaicBeamParameters& parameters);
 
 } // namespace panvar

@@ -324,45 +324,142 @@ void test_mutations_are_caught() {
     std::cout << "  mutation gates bite: heterozygous factor of two, and best-attribution-only\n";
 }
 
-// Pre-allocation is transactional: the budgets are computed from the same loops the search runs and are
-// checked before anything is allocated, so a refused search refuses outright.
-void test_preallocation_refuses_before_allocating() {
+// Pre-allocation is transactional and gated per ACCOUNT. The three accounts behave differently --
+// rolling vector cells live for one layer boundary, ancestry persists for the whole search, pair
+// records live for one layer -- so pooling them would let one overrun hide inside another's slack.
+// Each is admitted exactly at its bound and refused one below it.
+void test_preallocation_is_gated_per_account() {
     const panvar::PreparedProposalEmissions emissions = make_emissions(
         {{0.0, -0.2, -0.2, -1.0}, {-0.3, 0.0, 0.0, -0.7}, {-0.6, 0.1, 0.1, -0.4}}, 2);
     const panvar::PanelAlleleMatrix panel = two_allele_panel();
     const std::vector<std::size_t> alleles = {2, 2, 2};
+    const std::size_t limit = 64;
 
-    const std::uint64_t work = panvar::grouped_extension_upper_bound(panel.template_count(), 64, alleles);
-    const std::uint64_t cells = panvar::grouped_prefix_vector_cells(panel.template_count(), 64);
-    require(work > 0 && cells > 0, "both budgets must be positive for a real search");
+    const std::uint64_t work = panvar::grouped_extension_upper_bound(panel.template_count(), limit, alleles);
+    const panvar::GroupedAllocationAccounts bounds = panvar::grouped_allocation_bounds(
+        panel.template_count(), panel.block_count(), limit, alleles);
+    require(work > 0 && bounds.rolling_vector_cells > 0 && bounds.ancestry_records > 0 &&
+                bounds.pair_records > 0,
+            "every account must be positive for a real search");
+    require(bounds.rolling_vector_bytes > bounds.rolling_vector_cells &&
+                bounds.ancestry_bytes > bounds.ancestry_records &&
+                bounds.pair_bytes > bounds.pair_records,
+            "every account must report bytes as well as records");
 
     panvar::MosaicBeamParameters admitted;
     admitted.unique_candidate_target = 8;
-    admitted.state_limit = 64;
+    admitted.state_limit = limit;
     admitted.max_extension_evaluations = work;
-    admitted.max_prefix_vector_cells = cells;
+    admitted.max_rolling_vector_cells = bounds.rolling_vector_cells;
+    admitted.max_ancestry_records = bounds.ancestry_records;
+    admitted.max_pair_records = bounds.pair_records;
     const auto ran = panvar::propose_mosaic_diplotypes_grouped(panel, emissions, {0.25, 0.6}, admitted);
     require(!ran.candidates.empty(), "a search admitted at exactly its budget must run");
+
+    // The measured-allocation gate: what was actually taken, account by account, against what was
+    // predicted. A prediction that is not an upper bound on the measurement is not a prediction.
+    require(ran.allocation_observed.rolling_vector_cells <= bounds.rolling_vector_cells,
+            "measured rolling cells " + std::to_string(ran.allocation_observed.rolling_vector_cells) +
+                " exceeded the predicted " + std::to_string(bounds.rolling_vector_cells));
+    require(ran.allocation_observed.ancestry_records <= bounds.ancestry_records,
+            "measured ancestry records " + std::to_string(ran.allocation_observed.ancestry_records) +
+                " exceeded the predicted " + std::to_string(bounds.ancestry_records));
+    require(ran.allocation_observed.pair_records <= bounds.pair_records,
+            "measured pair records " + std::to_string(ran.allocation_observed.pair_records) +
+                " exceeded the predicted " + std::to_string(bounds.pair_records));
+    require(ran.allocation_observed.rolling_vector_cells > 0 &&
+                ran.allocation_observed.ancestry_records > 0 && ran.allocation_observed.pair_records > 0,
+            "a run that produced candidates must have measured storage in every account");
     require(ran.extensions_evaluated <= work,
             "the work actually done must not exceed the budget computed from the same loops");
 
-    for (const bool starve_work : {true, false}) {
+    // Rolling really rolls: the numerical cells live for one boundary, so the measurement cannot scale
+    // with the number of blocks. Holding every layer, as an earlier version did, would show up here.
+    require(ran.allocation_observed.rolling_vector_cells <=
+                2u * 2u * limit * panel.template_count(),
+            "rolling cells must be bounded by two layers, not by the block count");
+
+    const char* names[] = {"work", "rolling vector cells", "ancestry records", "pair records"};
+    for (int which = 0; which < 4; ++which) {
         panvar::MosaicBeamParameters refused = admitted;
-        if (starve_work) {
-            refused.max_extension_evaluations = work - 1;
-        } else {
-            refused.max_prefix_vector_cells = cells - 1;
-        }
+        if (which == 0) refused.max_extension_evaluations = work - 1;
+        if (which == 1) refused.max_rolling_vector_cells = bounds.rolling_vector_cells - 1;
+        if (which == 2) refused.max_ancestry_records = bounds.ancestry_records - 1;
+        if (which == 3) refused.max_pair_records = bounds.pair_records - 1;
         bool threw = false;
         try {
             panvar::propose_mosaic_diplotypes_grouped(panel, emissions, {0.25, 0.6}, refused);
         } catch (const std::length_error&) {
             threw = true;
         }
-        require(threw, std::string("a budget below the declared ") + (starve_work ? "work" : "vector cells") +
-                           " must refuse before searching");
+        require(threw, std::string("a budget one below the declared ") + names[which] + " must refuse");
     }
-    std::cout << "  pre-allocation: admitted at budget, refused one below, on both counts\n";
+    std::cout << "  pre-allocation: three accounts, each admitted at cap and refused one below;"
+              << " measured within prediction\n";
+}
+
+// Malformed input refuses, through the SAME validation the state-based proposer runs. Each of these
+// would otherwise be read as data: a table of the wrong size, a non-finite score, a target of zero, or
+// an index space too small for the panel.
+void test_malformed_input_refuses() {
+    const panvar::PanelAlleleMatrix panel = two_allele_panel();
+    const auto good = make_emissions(
+        {{0.0, -0.2, -0.2, -1.0}, {-0.3, 0.0, 0.0, -0.7}, {-0.6, 0.1, 0.1, -0.4}}, 2);
+    panvar::MosaicBeamParameters ok;
+    ok.unique_candidate_target = 8;
+    ok.state_limit = 16;
+
+    const auto refuses = [&](const panvar::PreparedProposalEmissions& emissions,
+                             const std::vector<double>& switches,
+                             const panvar::MosaicBeamParameters& parameters, const std::string& what) {
+        bool threw = false;
+        try {
+            panvar::propose_mosaic_diplotypes_grouped(panel, emissions, switches, parameters);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        require(threw, what + " must refuse");
+    };
+
+    // A table whose size does not match its declared allele count.
+    panvar::PreparedProposalEmissions malformed = good;
+    malformed.blocks[1].log_score.pop_back();
+    refuses(malformed, {0.25, 0.6}, ok, "a malformed emission table");
+
+    // A non-finite score, which would silently poison every mass derived from it.
+    panvar::PreparedProposalEmissions infinite = good;
+    infinite.blocks[2].log_score[1] = std::numeric_limits<double>::quiet_NaN();
+    refuses(infinite, {0.25, 0.6}, ok, "a non-finite emission value");
+
+    // A non-finite switch probability, and one outside [0, 1].
+    refuses(good, {std::numeric_limits<double>::infinity(), 0.6}, ok, "a non-finite switch probability");
+    refuses(good, {1.5, 0.6}, ok, "a switch probability outside [0, 1]");
+
+    // A zero candidate target asks for nothing; a zero state limit retains nothing.
+    panvar::MosaicBeamParameters zero_target = ok;
+    zero_target.unique_candidate_target = 0;
+    refuses(good, {0.25, 0.6}, zero_target, "a zero candidate target");
+    panvar::MosaicBeamParameters zero_limit = ok;
+    zero_limit.state_limit = 0;
+    refuses(good, {0.25, 0.6}, zero_limit, "a zero state limit");
+
+    // A trace target that does not span the block chain.
+    panvar::MosaicBeamParameters short_target = ok;
+    short_target.trace_target = panvar::MosaicDiplotype{panvar::MosaicPath{{0, 0}}, panvar::MosaicPath{{0, 0}}};
+    refuses(good, {0.25, 0.6}, short_target, "a trace target of the wrong length");
+
+    // Index capacity: a state limit and template count whose product overflows the account arithmetic
+    // must be refused by the planner rather than wrapping into a small, admissible-looking number.
+    bool overflowed = false;
+    try {
+        panvar::grouped_allocation_bounds(std::numeric_limits<std::size_t>::max() / 2, 8,
+                                          std::numeric_limits<std::size_t>::max() / 2, {2, 2});
+    } catch (const std::length_error&) {
+        overflowed = true;
+    }
+    require(overflowed, "an allocation bound that overflows uint64 must refuse, not wrap");
+    std::cout << "  malformed input refuses: table, non-finite value, switch range, zero target,"
+              << " trace length, index capacity\n";
 }
 
 }   // namespace
@@ -371,7 +468,8 @@ int main() {
     try {
         test_matches_the_oracles();
         test_mutations_are_caught();
-        test_preallocation_refuses_before_allocating();
+        test_preallocation_is_gated_per_account();
+        test_malformed_input_refuses();
         std::cout << "genotype grouped beam: PASS\n";
         return 0;
     } catch (const std::exception& error) {

@@ -55,7 +55,8 @@ placement workers actually used, and the phase timings up to the refusal.
 
 ## Frozen defaults
 
-State limit 1,024 (production) and 4,096 (audit only). `max_piece_hits` 2e9, `max_physical_origins` 5e8,
+State limit 1,024 (production) and 4,096 (audit only) -- counted in allele-prefix PAIRS since the
+grouped proposer became production; see the unit change noted below. `max_piece_hits` 2e9, `max_physical_origins` 5e8,
 `max_state_classes` 2e8, `max_mass_cells` 2e8, `piece_hit_publish_batch` 4,096. Mismatch band 6, minimum
 piece 12 bp, k-mer 31, syncmer 15, min variant 50 bp, switch probability 0.01. Simulation: seed 20260916
 salted per donor or plan, 100 bp reads, insert 350 +/- 40, 4 sigmas, substitution error 0.002, outlier
@@ -111,8 +112,11 @@ weight 0.001. C4 reference `HG00096#1#haplotype1-0000024:31848049-32074186`.
     aggregate was measured inside a prefix-first beam whose parents had already been truncated at every
     preceding layer, so it was never mass-complete. The loss compounds layer over layer.
   - The search is still not exhaustive anywhere, so none of this reaches block consensus.
-  - **Experimental, not frozen.** `954af2f` is an experimental selector under review. No calls and no
-    cohorts have been run on it, and the frozen production width and defaults are unchanged.
+  - **Retired.** `954af2f` is superseded and no longer exists in the tree. The grouped-prefix proposer
+    below carries every template attribution exactly instead of approximating a prefix by its best
+    one, and is both cheaper and better ranked, so prefix-first was removed rather than kept as an
+    option: its selector, its test file and its crowding fixture are gone. The record of what it
+    measured is kept because it is what motivated the grouped design.
   - The states it drops are not duplicates. States sharing a prefix pair are different latent template
     histories spelling the same allele prefix; the current template is what the next block's transition
     reads, so keeping only the best attribution approximates that prefix's future rather than
@@ -145,9 +149,25 @@ weight 0.001. C4 reference `HG00096#1#haplotype1-0000024:31848049-32074186`.
 
 ## The grouped-prefix proposer
 
-Implemented **alongside** `propose_mosaic_diplotypes`, which is untouched and serves as the oracle.
-Nothing here is wired into calling; prefix-first (`954af2f`) remains experimental, and no calls or
-cohorts have been run on either.
+**This is what production proposes with.** `propose_mosaic_diplotypes`, the original state-based
+implementation, is retained unchanged as the fixture oracle it is checked against and is no longer
+called by the genotyper. Prefix-first is retired entirely.
+
+**The state limit changed units, and this is the most consequential thing in this section.** It now
+counts allele-prefix PAIRS, where it counted `(prefix, template)` states. One prefix pair stands for
+every template attribution of itself, so the same number buys a far wider search: on the small e2e
+locus, 64 went from pruning 264 states and finding 2 mosaics to searching exhaustively and finding 26.
+The frozen default of 1,024 has changed meaning in exactly that way. It is a unit change, not a tuning
+change, and no default was re-tuned to absorb it.
+
+**Storage rolls, and is gated as three separate accounts.** Only the parent layer's and the child
+layer's numerical arrays are live; the parent's are released at the boundary. What persists is compact
+`(parent, allele)` ancestry, compacted after every selection to the prefixes retained pairs actually
+reference and remapped. The three accounts -- rolling vector cells, persistent ancestry records, pair
+records and selection storage -- are predicted from the exact loops and gated separately, because
+pooling them would let one overrun hide in another's slack. Each is admitted exactly at its bound and
+refused one below it, before anything is allocated, and a measured-allocation gate checks what was
+actually taken against what was predicted.
 
 **What a group carries.** Within a prefix pair every history spells the same alleles, so the diploid
 emission is one scalar for the group -- and it is the only coupling between the haplotypes. The joint
@@ -245,6 +265,37 @@ The exact proposer is therefore cheaper than the approximate one AND ranks the t
 the case is hard: it recovers the two plans prefix-first damaged most, and gives up a little on the two
 easy plans (rank 5 to 6, and 4 to 6). Nothing here is a calling result: ranks are proposal ranks, and
 what a caller does with them has not been measured.
+
+**Measured in production, C4, width 1,024, one shared scoring pass per plan at K = 0, 8, 128.** The
+standalone and production proposals were required to agree, and do, on candidate identity, rank AND
+score -- the last only after the candidate table was written at full double precision, since the stream
+default of six significant digits had been rounding scores near 1.7e6 to the nearest ten.
+
+| plan | truth proposal rank | exact-score rank, K=8 | K=128 | status K=8 / K=128 | blocks exact K=8 |
+|---|---|---|---|---|---|
+| one_switch | 6 | 2 | 2 | COMPLETE / COMPLETE | 11 of 11 |
+| bridgeable | 6 | 2 | 2 | COMPLETE / COMPLETE | 11 of 11 |
+| unbridgeable | 1 | 1 | 1 | RESCORE_INCOMPLETE, 2 tied | no call |
+| three_switches | 8 | 1 | 1 | RESCORE_INCOMPLETE, 2 tied | no call |
+| every_block | 87 | **absent** | 39 of 8,643 | RESCORE_INCOMPLETE, 8 then 16 tied | no call |
+
+Block edit distance is 0 for the two plans that call (11 of 11 blocks exact, against 3 and 9 at K = 0),
+and undefined for the three that tie, which emit no call. Every winner set is unanimous at 11 of 11
+blocks, so all three ties would call correctly if consensus were permitted -- it is not, because the
+search is still not exhaustive at this width and the candidate scope is `CONDITIONAL` on all fifteen
+runs. Consensus eligibility is therefore unchanged by this work.
+
+`every_block` is the case K = 128 exists to diagnose: at K = 8 its truth is not in the scored set at
+all, since proposal rank 87 falls outside the prefix. K = 128 brings it in at exact rank 39 and the run
+still ties 16 ways, so a wider prefix buys the truth a place in the scored set without resolving the
+tie. **K = 128 is a development diagnostic, not a new default**, and the harness keeps 0,8 as its
+committed default with the wider set available only as an override.
+
+Cost: 49-62 s per plan for the whole shared pass, with the three declared prefixes together adding
+about 0.05 s -- they are one scoring pass, not three. Peak RSS 712 MB across the five-plan run. The
+model-equivalence gate still holds on all five plans (`d2b8c6c2e0b4079d`, 8,515 diplotypes, 2 curated),
+and the simulated reads reproduce byte-for-byte, so the input binding's earlier refusal was a signature
+effect -- the probe binary is part of the bundle by design -- and not drift in the data.
 
 ## Known limitations
 

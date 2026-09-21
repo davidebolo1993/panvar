@@ -627,12 +627,16 @@ void test_off_panel_truth_is_recovered() {
     simulate(truths.first, truths.second, path("phaseable_r1.fq"), path("phaseable_r2.fq"), 123);
     // The crowding fixture. Before equivalence merging, a width of 64 filled with template histories of the
     // two zero-switch phasings and the truth was never offered. Under the same budget of 64 merged states
-    // the truth must now be proposed. The search is still pruned, and every panel diplotype is still
-    // scored, so the run calls and is marked conditional (review round 6) with the truth among what it
-    // proposed. What this budget yields changed with prefix-first selection: each retained state now
-    // carries a distinct diplotype prefix, so 64 states return more off-panel mosaics than K rather than
-    // fewer, and the set is conditional by TRUNCATION to K instead of by a missed target. The starved
-    // case below keeps the missed-target route covered, since the caller branches on it.
+    // the truth must be proposed. Every panel diplotype is still scored, so the run calls and is marked
+    // conditional (review round 6) with the truth among what it proposed.
+    //
+    // What this budget BUYS changed when production moved to the grouped proposer, and the change is a
+    // unit change, not a tuning one: the state limit now counts allele-prefix PAIRS, where it used to
+    // count (prefix, template) states. One prefix pair stands for every template attribution of itself,
+    // so 64 is a far wider search than it was -- wide enough that this small locus is now searched
+    // exhaustively, and its candidate set is conditional only because 26 mosaics were truncated to
+    // K = 16. The starved case below keeps the pruned, missed-target route covered, since the caller
+    // branches on it.
     {
         panvar::GenotypeCommandOptions budget = tiny_options(
             "phaseable_budget", path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa");
@@ -640,11 +644,12 @@ void test_off_panel_truth_is_recovered() {
         require(panvar::run_genotype(budget) == panvar::GenotypeRunStatus::Complete,
                 "a pruned search short of K must still call from the complete panel baseline");
         const auto budget_status = read_status(path("phaseable_budget.mosaic_status.tsv"));
-        require(budget_status.at("proposal_search_exhaustive") == "false",
-                "fixture: 64 merged states must still prune");
+        require(budget_status.at("proposal_search_exhaustive") == "true" &&
+                    budget_status.at("proposal_states_pruned") == "0",
+                "fixture: 64 prefix pairs must search this locus exhaustively under the grouped proposer");
         require(budget_status.at("mosaic_target_reached") == "true" &&
                     std::stoul(budget_status.at("mosaic_candidates_found")) > 16,
-                "fixture: 64 merged states must now reach K=16, finding more mosaics than K");
+                "fixture: 64 prefix pairs must find more mosaics than K=16, so the set is truncated");
         require(budget_status.at("panel_baseline_complete") == "true" &&
                     budget_status.at("candidate_scope") == "CONDITIONAL" && exists(path("phaseable_budget.genotypes.tsv")),
                 "a mosaic-deficient call must be marked conditional and still emit its genotypes");
@@ -711,7 +716,7 @@ void test_off_panel_truth_is_recovered() {
     }
     require(pairing != 0, "fixture: the truth must be heterozygous somewhere, or phase is untested");
     std::cout << "  off-panel truth (phaseable): all " << rows.size()
-              << " blocks called and phased correctly; truth proposed within 64 merged states; phase support READS_WITHIN_CANDIDATES, "
+              << " blocks called and phased correctly; truth proposed within 64 prefix pairs; phase support READS_WITHIN_CANDIDATES, "
               << "fragment gap " << reported.at("fragment_term_gap_to_runner_up") << '\n';
 }
 
@@ -1159,11 +1164,15 @@ void test_phase_audit() {
     }
     check_block_posteriors("audit_phaseable");
 
-    // A claim the audit cannot check is withdrawn: at 64 merged states the phaseable locus has too few off-panel
-    // mosaics for a 64-mosaic audit set, so phase is UNRESOLVED -- while the block genotypes are still emitted.
+    // A claim the audit cannot check is withdrawn. Which width makes the audit unreachable changed with
+    // the grouped proposer, and the new behaviour is better rather than broken: 64 prefix pairs now
+    // searches this locus EXHAUSTIVELY, and an exhaustive search satisfies the audit even when it finds
+    // fewer mosaics than were asked for, because it has proved there are no others to find. Only a
+    // genuinely pruned width leaves the audit unreached, so phase is UNRESOLVED there -- while the
+    // block genotypes are still emitted.
     panvar::GenotypeCommandOptions narrow =
         tiny_options("audit_unreachable", path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa");
-    narrow.proposal_state_limit = 64;
+    narrow.proposal_state_limit = 4;
     narrow.max_mosaic_candidates = 1;
     narrow.phase_audit_candidates = 64;
     require(panvar::run_genotype(narrow) == panvar::GenotypeRunStatus::Complete,

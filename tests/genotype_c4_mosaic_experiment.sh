@@ -32,8 +32,10 @@ INSERT_SD=40
 SIGMAS=4
 SUBSTITUTION_ERROR=0.002
 OUTLIER_WEIGHT=0.001
-STATE_LIMITS="1024 4096"
-CALL_PREFIXES="0,8"
+# Overridable for a targeted diagnostic run; the committed defaults are what the frozen experiment uses.
+# K=128 in particular is a development diagnostic for every_block, NOT a new default.
+STATE_LIMITS="${STATE_LIMITS:-1024 4096}"
+CALL_PREFIXES="${CALL_PREFIXES:-0,8}"
 TRACE_CANDIDATES=256
 
 # Ordinary C4, for the model-equivalence gate: what the model must still be after two synthetic mosaic
@@ -341,14 +343,14 @@ fi
 # truth_in_full_beam and first_block_truth_not_retained can.
 if has_stage trace; then
   echo "=== proposal-only trace ==="
-  printf '%-16s %-7s %-14s %-12s %-8s %-12s %-13s %s\n' \
-    plan limit truth_in_beam full_beam_rank found worst_crowd min_prefixes first_loss
+  printf '%-16s %-7s %-14s %-12s %-8s %-10s %-10s %s\n' \
+    plan limit truth_in_beam full_beam_rank found agrees_id agrees_score first_loss
   for spec in "${PLANS[@]}"; do
     name="${spec%%:*}"; d="$OUT/$name"
     [ -f "$d/call.K8.mosaic_status.tsv" ] || continue
     for limit in $STATE_LIMITS; do
       "$PROBE" trace --gfa "$d/staged.gfa" --reference "$REFERENCE" --donor MOSAIC \
-        --truth-gfa "$d/staged.gfa" --panel-curation "$CURATION" \
+        --truth-gfa "$d/staged.gfa" --panel-curation "$CURATION" --grouped 1 \
         --run "$d/call.K8" --reads1 "$d/source/reads_1.fq" --reads2 "$d/source/reads_2.fq" \
         --library "$d/source/library.txt" --state-limit "$limit" --candidates "$TRACE_CANDIDATES" \
         --out "$d/trace.$limit" > "$d/trace.$limit.log" 2>&1
@@ -357,14 +359,12 @@ if has_stage trace; then
       # the fewest distinct prefixes any layer held.  Columns are looked up by NAME so the report does
       # not silently follow a column that moved.
       t="$d/trace.$limit.trace.tsv"
-      printf '%-16s %-7s %-14s %-12s %-8s %-12s %-13s %s\n' "$name" "$limit" \
+      printf '%-16s %-7s %-14s %-12s %-8s %-10s %-10s %s\n' "$name" "$limit" \
         "$(awk -F'\t' '$1=="truth_in_full_beam"{print $2}' "$f")" \
         "$(awk -F'\t' '$1=="truth_full_beam_rank"{print $2}' "$f")" \
         "$(awk -F'\t' '$1=="unique_candidates_found"{print $2}' "$f")" \
-        "$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
-                       {v=$h["max_states_per_prefix"]+0; if(v>m)m=v} END{print m+0}' "$t")" \
-        "$(awk -F'\t' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i;next}
-                       {v=$h["prefix_pairs_retained"]+0; if(n==""||v<n)n=v} END{print n+0}' "$t")" \
+        "$(awk -F'\t' '$1=="proposal_matches_run"{print $2}' "$f")" \
+        "$(awk -F'\t' '$1=="proposal_matches_run_score"{print $2}' "$f")" \
         "$(awk -F'\t' '$1=="first_block_truth_not_retained"{print $2}' "$f")"
     done
   done
