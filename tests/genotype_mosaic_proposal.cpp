@@ -825,6 +825,92 @@ void test_marker_background_reaches_proposal() {
 // diplotype overall is dropped there by a narrow beam -- the held-out C4 failure -- and can never be
 // recovered by a larger K. The panel baseline contains it by construction, and the off-panel mosaics the
 // beam adds never duplicate a panel pair.
+// Prefix-first selection, the property that motivates it: a second diplotype prefix survives a layer
+// that state-only selection would have given entirely to the first.
+//
+// The fixture is arranged so the counterfactual needs no second implementation. Four templates spell
+// allele 0 at block 0 and one spells allele 1, so block 0 offers three prefix groups: ten states for
+// (A,A), four for (A,B), one for (B,B). Every (A,A) state outscores every state that is not (A,A) --
+// asserted below from the emissions themselves -- and there are ten of them against a width of four.
+// Any rule that ranks states by mass must therefore fill all four slots from (A,A) and return a layer
+// holding exactly one prefix pair. Blocks 1 and 2 have a single allele each, so nothing after block 0
+// can reintroduce what block 0 discarded.
+void test_prefix_first_keeps_a_crowded_out_prefix() {
+    panvar::PanelAlleleMatrix panel;
+    panel.template_names = {"t0", "t1", "t2", "t3", "t4"};
+    panel.template_alleles = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {1, 0, 0}};
+
+    const double shared = 0.0;     // e(0,0): both haplotypes on the crowded prefix
+    const double mixed = -3.0;     // e(0,1) and e(1,0)
+    const double rare = -6.0;      // e(1,1)
+    panvar::PreparedProposalEmissions emissions;
+    emissions.total_alleles = 4;
+    emissions.scored_alleles = 4;
+    emissions.blocks.resize(3);
+    emissions.blocks[0].allele_count = 2;
+    emissions.blocks[0].scored_alleles = 2;
+    emissions.blocks[0].log_score = {shared, mixed, mixed, rare};
+    for (std::size_t b = 1; b < 3; ++b) {
+        emissions.blocks[b].allele_count = 1;
+        emissions.blocks[b].scored_alleles = 1;
+        emissions.blocks[b].log_score = {0.0};
+    }
+
+    // What makes the counterfactual exact. A block-0 state's mass is its emission plus log of the
+    // ordered histories merged into it (one for a template with itself, two otherwise) minus 2 log n.
+    // So the weakest (A,A) state is `shared` and the strongest state outside it is `mixed + log 2`.
+    require(shared > mixed + std::log(2.0) && shared > rare + std::log(2.0),
+            "fixture: every (A,A) state must outscore every state outside it, for any merge multiplicity");
+    require(4 * 5 / 2 >= 4, "fixture: (A,A) must offer at least as many states as the width");
+
+    panvar::MosaicBeamParameters parameters;
+    parameters.unique_candidate_target = 10;
+    parameters.state_limit = 4;
+    const auto beam = panvar::propose_mosaic_diplotypes(panel, emissions, {0.1, 0.1}, parameters);
+
+    require(!beam.search_exhaustive && beam.states_pruned > 0,
+            "fixture: the width must actually be scarce, or the rule is not under test");
+    const panvar::MosaicBeamTraceLayer* first = nullptr;
+    panvar::MosaicBeamParameters traced = parameters;
+    traced.trace_target = panvar::MosaicDiplotype{panvar::MosaicPath{{1, 0, 0}}, panvar::MosaicPath{{1, 0, 0}}};
+    const auto with_trace = panvar::propose_mosaic_diplotypes(panel, emissions, {0.1, 0.1}, traced);
+    first = &with_trace.trace.front();
+    require(first->prefix_pairs_offered == 3,
+            "fixture: block 0 must offer exactly the three prefix pairs (A,A), (A,B) and (B,B)");
+    require(first->states_retained == parameters.state_limit,
+            "the layer must still be filled to the limit, not left short by grouping");
+    require(first->prefix_pairs_retained == 3,
+            "prefix-first selection must keep all three prefix pairs where state-only selection keeps one");
+    require(first->max_states_per_prefix == 2,
+            "with three prefixes in a width of four, the spare slot goes to one prefix and no more");
+
+    // Grouping must not buy diversity by widening the layer. Every layer stays within the limit, every
+    // retained prefix is backed by a retained state, and the work actually done stays inside the bound
+    // production pre-allocates against -- so the resource prediction is unchanged by the new rule.
+    for (const auto& layer : with_trace.trace) {
+        require(layer.states_retained <= traced.state_limit,
+                "no layer may retain more states than the limit");
+        require(layer.prefix_pairs_retained <= layer.states_retained,
+                "a retained prefix must be backed by at least one retained state");
+        require(layer.prefix_pairs_retained <= layer.prefix_pairs_offered,
+                "a layer cannot retain more prefixes than it was offered");
+    }
+    require(with_trace.extensions_evaluated <=
+                panvar::extension_upper_bound(panel.template_count(), panel.block_count(),
+                                              traced.state_limit),
+            "the work done must stay within the bound production pre-allocates against");
+
+    // The point of keeping the prefix: the diplotype built on it reaches the candidate list.
+    bool rare_prefix_survived = false;
+    for (const auto& candidate : beam.candidates) {
+        rare_prefix_survived = rare_prefix_survived ||
+                               candidate.diplotype.first.alleles[0] == 1 ||
+                               candidate.diplotype.second.alleles[0] == 1;
+    }
+    require(rare_prefix_survived,
+            "the surviving second prefix must reach the candidates, not merely the layer");
+}
+
 void test_panel_baseline_retains_a_pruned_pair() {
     panvar::PanelAlleleMatrix panel;
     panel.template_names = {"t0", "t1", "t2", "t3"};
@@ -914,6 +1000,7 @@ int main() {
         test_marker_depth_estimation();
         test_marker_background_reaches_proposal();
         test_depth_fit_matches_profile_oracle();
+        test_prefix_first_keeps_a_crowded_out_prefix();
         test_panel_baseline_retains_a_pruned_pair();
         std::cout << "genotype mosaic proposal: PASS\n";
         return 0;

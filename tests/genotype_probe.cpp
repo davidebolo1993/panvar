@@ -2265,7 +2265,7 @@ int trace(const Args& args) {
     layers << std::setprecision(10)
            << "block\tblock_id\tkind\ttruth_alleles\ttruth_emission\twinner_alleles\twinner_emission\t"
               "best_emission_in_block\tstates_offered\tstates_retained\tstates_pruned\t"
-              "prefix_pairs_retained\tmax_states_per_prefix\tretained_min_log_mass\t"
+              "prefix_pairs_offered\tprefix_pairs_retained\tmax_states_per_prefix\tretained_min_log_mass\t"
               "truth_prefixes_present\ttruth_states_offered\ttruth_states_retained\ttruth_best_log_mass\t"
               "truth_logsum_log_mass\ttruth_rank\tdonor_templates_offered\tdonor_templates_log_mass\t"
               "donor_templates_retained\n";
@@ -2286,7 +2286,8 @@ int trace(const Args& args) {
                << truth.first.alleles[b] << '/' << truth.second.alleles[b] << '\t' << truth_e << '\t'
                << winner.first[b] << '/' << winner.second[b] << '\t' << winner_e << '\t' << best_e << '\t'
                << layer.states_offered << '\t' << layer.states_retained << '\t' << layer.states_pruned << '\t'
-               << layer.prefix_pairs_retained << '\t' << layer.max_states_per_prefix << '\t'
+               << layer.prefix_pairs_offered << '\t' << layer.prefix_pairs_retained << '\t'
+               << layer.max_states_per_prefix << '\t'
                << layer.retained_min_log_mass << '\t'
                << (layer.target_prefixes_present ? "true" : "false") << '\t' << layer.target_states_offered << '\t'
                << layer.target_states_retained << '\t' << layer.target_best_log_mass << '\t'
@@ -2320,7 +2321,8 @@ int trace(const Args& args) {
     std::ofstream summary(out + ".trace.summary.tsv");
     summary << std::setprecision(12) << "key\tvalue\ndonor\t" << donor << "\nstate_limit\t" << state_limit
             << "\ncandidate_target\t" << target << "\nunique_candidates_found\t" << result.unique_candidates_found
-            << "\nstates_pruned\t" << result.states_pruned << "\nproposal_matches_run\t"
+            << "\nstates_pruned\t" << result.states_pruned
+            << "\nextensions_evaluated\t" << result.extensions_evaluated << "\nproposal_matches_run\t"
             << (matches_run ? "true" : "false") << "\ncandidates_compared_with_run\t" << compared
             // Empty for a synthetic mosaic: it is curated out of the panel by construction, so it has no
             // panel rows. Indexing rows[0] here regardless is what segfaulted the first mosaic trace --

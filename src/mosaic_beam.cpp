@@ -120,40 +120,135 @@ void merge_into(State& into, const State& from) {
     add_count(into.histories, into.saturated, from.histories, from.saturated);
 }
 
-// Keeps the state_limit best states of a layer after every state has been fully merged. Children of
-// different parent prefix pairs never share a key, so a group's children are final when offered here.
+// Keeps at most state_limit states of a layer after every state has been fully merged, PREFIX FIRST.
+//
+// A layer's width is useful only to the extent it holds distinct diplotype prefixes. States sharing a
+// prefix pair differ solely in which templates currently carry that prefix; they are the same history
+// counted many ways, and they rise and fall together when the next block's emission moves. Ranking
+// states alone therefore lets one prefix's template variants take the whole width -- measured at 1,018
+// of 1,024 retained states on C4 ctx:4 -- so a rival prefix is dropped while the leader is held over a
+// thousand times.
+//
+// The rule, with no parameter and no fixed per-prefix cap: group the layer's states by unordered prefix
+// pair, rank groups by aggregate (log-sum-exp) mass, keep the best state of each group in rank order
+// until the limit is reached, then spend whatever capacity is left on the best remaining states under
+// the existing state order. Where capacity is not scarce this retains exactly what state-only selection
+// retained; under pressure every prefix gets one slot before any prefix gets two.
+//
+// Memory stays O(limit) because groups close early. A child prefix is interned from exactly one parent
+// prefix, so every state of a child group is offered inside one parent's extension and the group is
+// final the moment that parent group closes -- which is why close_group() exists rather than a map over
+// the whole layer, which would have to hold every one of the tens of millions of states offered.
+//
+// Determinism, on which gate 2 rests: a group's states are sorted by key before its mass is summed, so
+// the aggregate is bitwise independent of the order the states were offered in; groups are ranked by
+// mass, then by their best state under the existing total order, then -- through that order's own key
+// tie-break -- by prefix and template ids. Distinct groups have distinct best-state keys, so the group
+// order is total and no tie is left to arrival order.
 class LayerSelector {
 public:
-    explicit LayerSelector(std::size_t limit) : limit_(limit), heap_(worse_on_top) {}
+    explicit LayerSelector(std::size_t limit)
+        : limit_(limit), groups_(worse_group_on_top), remainder_(worse_state_on_top) {}
 
     void offer(const State& state) {
         ++offered_;
-        if (heap_.size() < limit_) {
-            heap_.push(state);
-        } else if (better_state(state, heap_.top())) {
-            heap_.pop();
-            heap_.push(state);
+        pending_.push_back(state);
+    }
+
+    // Every state of the parent prefix-pair group just extended has now been offered, so each child
+    // group among them is complete and can be reduced to (aggregate mass, best state).
+    void close_group() {
+        if (pending_.empty()) return;
+        std::sort(pending_.begin(), pending_.end(), [](const State& lhs, const State& rhs) {
+            return std::tie(lhs.prefix1, lhs.prefix2, lhs.template1, lhs.template2) <
+                   std::tie(rhs.prefix1, rhs.prefix2, rhs.template1, rhs.template2);
+        });
+        for (std::size_t i = 0; i < pending_.size();) {
+            std::size_t j = i + 1;
+            while (j < pending_.size() && pending_[j].prefix1 == pending_[i].prefix1 &&
+                   pending_[j].prefix2 == pending_[i].prefix2) {
+                ++j;
+            }
+            Group group;
+            std::size_t best = i;
+            for (std::size_t k = i; k < j; ++k) {
+                group.mass = log_add_exp_local(group.mass, pending_[k].log_mass);
+                if (k != i && better_state(pending_[k], pending_[best])) best = k;
+            }
+            group.best = pending_[best];
+            ++groups_offered_;
+            // A group evicted here can never be wanted again: eviction only happens once more groups
+            // than the limit exist, and that is exactly the case where the top groups fill the width
+            // and no remaining state is ever drawn.
+            if (groups_.size() < limit_) {
+                groups_.push(group);
+            } else if (!groups_.empty() && better_group(group, groups_.top())) {
+                groups_.pop();
+                groups_.push(group);
+            }
+            for (std::size_t k = i; k < j; ++k) {
+                if (k == best) continue;
+                if (remainder_.size() < limit_) {
+                    remainder_.push(pending_[k]);
+                } else if (!remainder_.empty() && better_state(pending_[k], remainder_.top())) {
+                    remainder_.pop();
+                    remainder_.push(pending_[k]);
+                }
+            }
+            i = j;
         }
+        pending_.clear();
     }
 
     std::vector<State> take(std::uint64_t& pruned) {
-        pruned += offered_ - heap_.size();
+        close_group();   // the final parent group of the layer, and block 0's single batch
         std::vector<State> out;
-        out.reserve(heap_.size());
-        while (!heap_.empty()) {
-            out.push_back(heap_.top());
-            heap_.pop();
+        out.reserve(std::min<std::size_t>(limit_, static_cast<std::size_t>(offered_)));
+        while (!groups_.empty()) {
+            out.push_back(groups_.top().best);
+            groups_.pop();
         }
+        // Unused capacity goes to the best states left over, which is what makes the rule collapse to
+        // the old one when the width is not scarce. The heap yields its worst first, so it is drained
+        // and ordered before the best are taken.
+        if (out.size() < limit_) {
+            std::vector<State> rest;
+            rest.reserve(remainder_.size());
+            while (!remainder_.empty()) {
+                rest.push_back(remainder_.top());
+                remainder_.pop();
+            }
+            std::sort(rest.begin(), rest.end(), better_state);
+            for (std::size_t i = 0; i < rest.size() && out.size() < limit_; ++i) out.push_back(rest[i]);
+        }
+        pruned += offered_ - out.size();
         std::sort(out.begin(), out.end(),
                   [](const State& lhs, const State& rhs) { return key_of(lhs) < key_of(rhs); });
         return out;
     }
 
+    // Distinct prefix pairs OFFERED to this layer, counted exactly and for free: every group is closed
+    // here, so the count needs no set over the offered states.
+    std::size_t groups_offered() const { return groups_offered_; }
+
 private:
-    static bool worse_on_top(const State& lhs, const State& rhs) { return better_state(lhs, rhs); }
+    struct Group {
+        double mass = kNegInf;
+        State best;
+    };
+    static bool better_group(const Group& lhs, const Group& rhs) {
+        if (lhs.mass != rhs.mass) return lhs.mass > rhs.mass;
+        return better_state(lhs.best, rhs.best);
+    }
+    static bool worse_group_on_top(const Group& lhs, const Group& rhs) { return better_group(lhs, rhs); }
+    static bool worse_state_on_top(const State& lhs, const State& rhs) { return better_state(lhs, rhs); }
+
     std::size_t limit_;
     std::uint64_t offered_ = 0;
-    std::priority_queue<State, std::vector<State>, bool (*)(const State&, const State&)> heap_;
+    std::size_t groups_offered_ = 0;
+    std::vector<State> pending_;   // one parent group's children, never the whole layer
+    std::priority_queue<Group, std::vector<Group>, bool (*)(const Group&, const Group&)> groups_;
+    std::priority_queue<State, std::vector<State>, bool (*)(const State&, const State&)> remainder_;
 };
 
 // Follows a declared diplotype through the layers. It only reads states and the interner.
@@ -192,8 +287,10 @@ public:
         }
     }
 
-    void finish(const std::vector<State>& retained, std::vector<MosaicBeamTraceLayer>& out) {
+    void finish(const std::vector<State>& retained, std::size_t groups_offered,
+                std::vector<MosaicBeamTraceLayer>& out) {
         if (!on()) return;
+        current_.prefix_pairs_offered = groups_offered;
         current_.states_retained = retained.size();
         current_.target_prefixes_present = resolve();
         {
@@ -466,8 +563,9 @@ MosaicBeamResult propose_mosaic_diplotypes(
             tracer.offer(merged);
             i = j;
         }
+        selector.close_group();
         layer = selector.take(result.states_pruned);
-        tracer.finish(layer, result.trace);
+        tracer.finish(layer, selector.groups_offered(), result.trace);
     }
 
     // ---- blocks 1..B-1: extend each parent prefix-pair group over every ordered template pair ------------
@@ -569,10 +667,13 @@ MosaicBeamResult propose_mosaic_diplotypes(
                 cell_saturated[cell] = 0;
             }
             touched.clear();
+            // This parent's children are complete, and no other parent can add to any of their prefix
+            // groups, so the groups can be reduced now and the states released.
+            selector.close_group();
             g = end;
         }
         layer = selector.take(result.states_pruned);
-        tracer.finish(layer, result.trace);
+        tracer.finish(layer, selector.groups_offered(), result.trace);
     }
 
     // ---- final collapse: drop templates, merge by unordered pair of complete allele paths ----------------

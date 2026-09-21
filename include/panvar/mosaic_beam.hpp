@@ -50,6 +50,11 @@ struct MosaicBeamTraceLayer {
     std::size_t block = 0;
     std::uint64_t states_offered = 0;      // merged states offered to the layer's selection
     std::size_t states_retained = 0;
+    // Distinct allele-prefix pairs among the states OFFERED to this layer's selection: how many
+    // diplotype prefixes the layer had to choose between. Read against prefix_pairs_retained, it
+    // separates a layer that was offered little diversity from one that was offered plenty and kept
+    // little.
+    std::size_t prefix_pairs_offered = 0;
     // Distinct allele-prefix pairs among the retained states: how many diplotype prefixes the width holds.
     std::size_t prefix_pairs_retained = 0;
     // The most retained states sharing a single prefix pair. The width is spent on DIPLOTYPE PREFIXES

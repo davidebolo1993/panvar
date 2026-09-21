@@ -80,6 +80,34 @@ weight 0.001. C4 reference `HG00096#1#haplotype1-0000024:31848049-32074186`.
   final layer (exactly `unique_candidates_found`) go from 562-892 to 2,510-3,568 while states discarded
   go from 29-43 million to 129-180 million. What limits diplotype diversity is the selection rule, which
   ranks template-level states, not the width it is given.
+- **Prefix-first selection recovers every truth, and costs more than it looks.** The layer selector now
+  groups merged states by unordered prefix pair, ranks groups by aggregate mass, keeps each top group's
+  best state up to the limit, then fills any spare capacity by the old state order. Parameter-free.
+  Measured on the five plans at both widths, paired back to back against the state-only selector:
+  - Retention: the truth survives **every** layer of **all ten** runs (`first_block_truth_not_retained`
+    is `never` throughout). `every_block`, lost at both widths before (`ctx:4` at 1,024, `sv:9` at
+    4,096), is now retained at full-beam ranks 711 and 783; `one_switch` at 1,024 goes from absent to
+    rank 5.
+  - Ranks move both ways, and this is the finding that matters for calling: `bridgeable` 6 to 4 at both
+    widths and `three_switches` 20 to 12 at 1,024, but `three_switches` 8 to 12 at 4,096 and
+    **`unbridgeable` 2 to 46 at both widths**. Retention is not rank: a truth retained at rank 46 sits
+    outside any K the caller exactly scores, so a case that previously called well can be made worse.
+  - Diversity: at `ctx:4` and `sv:5` the retained prefix count is now the full width and
+    `max_states_per_prefix` is 1, against 2-17 prefixes and 417-4,080 states on the leader before.
+    Final distinct candidates are exactly the width (1,024 / 4,096) against 562-892 / 2,510-3,568.
+  - Cost: with every retained state carrying a distinct prefix, parent groups hold one state each and
+    within-prefix merging stops. States offered per layer become exactly `limit x templates^2`
+    (17,572,864 at width 1,024; 70,291,456 at 4,096) against 68,644-1,029,660 before, and states pruned
+    rise from 29-43 million to 175.7 million at 1,024 and from 129-180 million to 672.3 million at
+    4,096. Runtime is 3.4x to 5.3x (3.8-4.2 s to 13.1-13.6 s at 1,024; 8.1-8.2 s to 43.0-43.4 s at
+    4,096) and peak RSS 1.27x to 1.41x (638-799 MB to 810-814 MB; 1.36-2.01 GB to 1.95-2.05 GB).
+  - `extensions_evaluated` is **identical** between the two selectors at each width (175,745,801 and
+    702,931,721), so the pre-allocation bound production checks against is unaffected.
+  - Not established: only each group's best state survives, so the mass on a prefix's other template
+    attributions is dropped rather than carried, and the surviving candidate's log-sum under-represents
+    its prefix. That is the obvious suspect for `unbridgeable` falling from rank 2 to 46, but it has not
+    been measured and must not be reported as the cause.
+  - The search is still not exhaustive anywhere, so none of this reaches block consensus.
 - **Separation, not proposal, is the current difficulty**: plans that complete separate by gaps of 0.401
   and 0.358; three of five tie outright, and their tied candidates agree on all 11 block genotypes.
 - **Block consensus works, via the audit, and still does not reach C4.** Demonstrated end to end: an
@@ -124,7 +152,10 @@ weight 0.001. C4 reference `HG00096#1#haplotype1-0000024:31848049-32074186`.
 - Dense-switch mosaics need beam diversity work (distinct diplotype prefixes rather than many
   template-level states representing one prefix), not a larger width. Now measured rather than
   suspected: the tightest layer holds 2-4 prefixes of 1,024 retained states, and quadrupling the width
-  leaves it at 3-14 while the dominant prefix's share quadruples with it.
+  leaves it at 3-14 while the dominant prefix's share quadruples with it. Prefix-first selection now
+  does this and retains the truth on all five plans at both widths -- for 3.4x to 5.3x the runtime, and
+  with `unbridgeable`'s truth falling from rank 2 to 46. Whether that trade is worth taking is an open
+  decision, not a settled improvement.
 - **Block consensus cannot fire on any large locus, because the search is pruned.** The truncation half
   of `candidate_set_conditional` is now handled by the full-beam audit. What remains is the other half:
   C4 discards 29-43 million merged states per plan, so the search is not exhaustive, the audit refuses to
