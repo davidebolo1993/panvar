@@ -142,7 +142,6 @@ add_library(panvarlib
     src/minimap2_align.cpp
     src/variant_call.cpp
     src/describe.cpp
-    src/cosigt.cpp
     src/panphorte.cpp
     src/poa.cpp
     src/refine.cpp
