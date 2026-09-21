@@ -62,7 +62,11 @@ check_manifest() {
   # role table or the draw changed, and both invalidate the held-out claim.
   local dev_hits=0 donor
   for donor in $(awk -F'\t' '$2=="development"{print $1}' "$DONORS"); do
-    if plan_rows | cut -f4,5 | grep -qw "$donor"; then
+    # grep -cw, not -qw: -q exits at the first match and can SIGPIPE the producer, and under pipefail
+    # that turns a match into a non-zero pipeline, flipping this branch to "no match" -- silently
+    # under-reporting the very thing the gate exists to catch. -c drains the stream. Not observed to
+    # fire at this stream size; hardened because it is the same class as the crash above.
+    if [ "$(plan_rows | cut -f4,5 | grep -cw "$donor" || true)" -gt 0 ]; then
       echo "  DEVELOPMENT DONOR $donor appears in the held-out draw"
       dev_hits=$((dev_hits + 1))
     fi
@@ -110,7 +114,8 @@ check_manifest() {
   # Four coverages, nested from one simulation at the source coverage, and the source must be among them.
   local covs ncov
   covs="$(setting coverages)"; ncov="$(printf '%s' "$covs" | tr ',' '\n' | grep -c .)"
-  if [ "$ncov" = "4" ] && printf '%s' "$covs" | tr ',' '\n' | grep -qx "$(setting source_coverage)"; then
+  if [ "$ncov" = "4" ] &&
+     [ "$(printf '%s' "$covs" | tr ',' '\n' | grep -cx "$(setting source_coverage)" || true)" -gt 0 ]; then
     echo "  four coverages, source included: $covs"
   else
     echo "  COVERAGE SHAPE WRONG: $covs (source $(setting source_coverage))"; bad=$((bad + 1))
@@ -257,7 +262,8 @@ record_experiment_signature() {
       printf 'plan\t%s\ncoverage\t%s\n' "$name" "$cov"
       printf 'recorded_utc\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
       printf 'git_commit\t%s\n' "$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
-      printf 'git_tree_dirty\t%s\n' "$(git -C "$REPO" status --porcelain 2>/dev/null | grep -q . && echo true || echo false)"
+      printf 'git_tree_dirty\t%s\n' \
+        "$([ -n "$(git -C "$REPO" status --porcelain 2>/dev/null)" ] && echo true || echo false)"
       printf '%s\n' "$components"
     } > "$file.tmp"
     mv "$file.tmp" "$file"
@@ -686,11 +692,29 @@ if has_stage eval; then
           "$(get phase_support "$s")" "$fa"
         # Diagnostics, exactly as frozen in the manifest: reported beside the accuracy above, never
         # merged into it, and with no threshold applied to any of them.
-        min_gq="$(paste <(col reportable "$b") <(col conditional_GQ "$b") |
-                  awk -F'\t' '$1=="true"{ if (n=="" || $2+0 < n+0) n=$2 } END{print (n==""?"NA":n)}')"
-        reportable="$(col reportable "$b" | grep -c '^true$' || true)"
-        support="$(col genotype_support "$b" | sort | uniq -c | awk '{printf "%s%s:%s", (NR>1?",":""), $2, $1}')"
-        frags="$(col fragments_total "$sc" | head -1)"
+        #
+        # Guarded on the block file EXISTING, because for every incomplete status it must not: the
+        # contract is status only, so on those arms there is no GQ, no reportable-block count and no
+        # genotype support to read, and NA is the honest value rather than a number invented from an
+        # absent file. The guard is also what keeps the stage alive: a failing command substitution in
+        # an ASSIGNMENT aborts under set -e (one in argument position does not, and a failing non-final
+        # component of an && list does not -- both measured), so reading a contract-absent file here
+        # would kill the run at the first refused arm, after the complete ones had already reported.
+        if [ -f "$b" ]; then
+          min_gq="$(paste <(col reportable "$b") <(col conditional_GQ "$b") |
+                    awk -F'\t' '$1=="true"{ if (n=="" || $2+0 < n+0) n=$2 } END{print (n==""?"NA":n)}')"
+          reportable="$(col reportable "$b" | grep -c '^true$' || true)"
+          support="$(col genotype_support "$b" | sort | uniq -c | awk '{printf "%s%s:%s", (NR>1?",":""), $2, $1}')"
+        else
+          min_gq=NA; reportable=NA; support=NA
+        fi
+        # NOT `col ... | head -1`. head exits at the first line, the producing awk dies of SIGPIPE, and
+        # under `set -o pipefail` the command substitution fails and set -e kills the run. That is what
+        # stopped this stage at exit 141 after one arm, on an 8,516-row scores file. Draining is not the
+        # only fix and `awk NR==1{print;exit}` is NOT one -- its exit closes the pipe just as head does.
+        # One awk reading the file directly has no upstream producer to signal at all.
+        frags="$(awk -F'\t' -v want=fragments_total \
+                   'NR==1{for(i=1;i<=NF;i++) if($i==want) c=i; next} c{print $c; exit}' "$sc")"
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
           "$name" "$cov" "$k" "${min_gq:-NA}" "${reportable:-0}" "${support:-NA}" \
           "$(get candidate_scope "$s")" "$(get final_candidate_scope "$s")" \
