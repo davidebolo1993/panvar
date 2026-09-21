@@ -218,5 +218,62 @@ refuses "mate names disagree" python3 "$WORK/nested_gate.py" "$nest" p1 "$COVERA
 write_reads "$nest/cov10" 20
 accepts "nesting restored" python3 "$WORK/nested_gate.py" "$nest" p1 "$COVERAGES"
 
+echo "=== the completeness gate follows the declared output contract ==="
+eval "$(awk '/^arm_output_problems\(\) \{/,/^\}/' "$HARNESS")"
+arm="$WORK/arm"; mkdir -p "$arm"
+
+mk_arm() {  # mk_arm <status|-> [output suffixes...]
+  rm -f "$arm"/a.*
+  if [ "$1" != "-" ]; then printf 'key\tvalue\nstatus\t%s\n' "$1" > "$arm/a.mosaic_status.tsv"; fi
+  shift
+  local f
+  for f in "$@"; do printf 'x\n' > "$arm/a.$f"; done
+}
+check_arm() {  # check_arm <name> <ok|fail>
+  local name="$1" want="$2" n
+  n="$(arm_output_problems "$arm/a" | grep -c . || true)"
+  if { [ "$want" = ok ] && [ "$n" -eq 0 ]; } || { [ "$want" = fail ] && [ "$n" -gt 0 ]; }; then
+    printf '  ok    %s (%s problem(s))\n' "$name" "$n"
+  else
+    printf '  FAIL  %s: wanted %s, got %s problem(s)\n' "$name" "$want" "$n"
+    arm_output_problems "$arm/a" | sed 's/^/          /'
+    fail=$((fail + 1))
+  fi
+}
+
+COMPLETE_SET="mosaic_scores.tsv mosaic_candidates.tsv block_genotypes.tsv genotypes.tsv mosaic_haplotypes.fa"
+
+mk_arm COMPLETE $COMPLETE_SET
+check_arm "COMPLETE with every output" ok
+
+# 1. a complete arm missing a block output must fail.
+mk_arm COMPLETE mosaic_scores.tsv mosaic_candidates.tsv genotypes.tsv mosaic_haplotypes.fa
+check_arm "COMPLETE missing block_genotypes" fail
+
+# 2. an incomplete arm without block output must PASS: status only is the contract, and reading that
+#    absence as a missing output is what stopped an experiment in which nothing was missing.
+mk_arm RESCORE_INCOMPLETE mosaic_scores.tsv mosaic_candidates.tsv
+check_arm "RESCORE_INCOMPLETE with status and diagnostics only" ok
+mk_arm CANDIDATE_INCOMPLETE
+check_arm "CANDIDATE_INCOMPLETE with status alone" ok
+
+# 3. an incomplete arm CARRYING a block output must fail: a refused run emitted calls.
+mk_arm RESCORE_INCOMPLETE mosaic_scores.tsv block_genotypes.tsv
+check_arm "RESCORE_INCOMPLETE carrying block_genotypes" fail
+mk_arm MODEL_INCOMPLETE genotypes.tsv
+check_arm "MODEL_INCOMPLETE carrying genotypes" fail
+
+# 4. block consensus carrying a phased FASTA must fail: phase is unresolved under consensus.
+mk_arm BLOCK_CONSENSUS mosaic_scores.tsv mosaic_candidates.tsv block_genotypes.tsv genotypes.tsv
+check_arm "BLOCK_CONSENSUS without FASTA" ok
+mk_arm BLOCK_CONSENSUS $COMPLETE_SET
+check_arm "BLOCK_CONSENSUS carrying phased FASTA" fail
+
+# 5. a missing status must fail, whatever else is present.
+mk_arm - $COMPLETE_SET
+check_arm "missing status file" fail
+printf 'key\tvalue\nnote\tno status key\n' > "$arm/a.mosaic_status.tsv"
+check_arm "status file declaring no status" fail
+
 if [ "$fail" -ne 0 ]; then echo "genotype_heldout_binding: $fail gate(s) FAILED"; exit 1; fi
 echo "genotype_heldout_binding: all gates passed"

@@ -560,34 +560,96 @@ if has_stage call; then
   [ "$call_bad" -eq 0 ] || { echo "call stage FAILED on $call_bad run(s)"; exit 1; }
 fi
 
-# ---- complete: every declared run and output exists -------------------------------------------------
+# What one arm must and must not have written, from the DECLARED output contract. Prints one line per
+# problem and nothing when the arm is contract-correct.
+#
+# The first version of this demanded block_genotypes.tsv from every arm unconditionally, which is not
+# the contract: only COMPLETE and BLOCK_CONSENSUS emit call outputs at all. Every incomplete status
+# emits "status only", so for those the block and genotype files are FORBIDDEN, not required -- their
+# absence is the refusal working, and their presence would mean a refused run had emitted calls. Reading
+# the absence as "missing output" stopped an experiment in which nothing was actually missing.
+#
+# Diagnostics written before a refusal (scores, candidates) may remain: the run did that work and
+# reporting it is required elsewhere, so they are neither required nor forbidden here.
+arm_output_problems() {
+  local prefix="$1" status required forbidden file
+  if [ ! -f "$prefix.mosaic_status.tsv" ]; then
+    printf 'MISSING STATUS: an arm must always write one\n'
+    return 0
+  fi
+  status="$(awk -F'\t' '$1=="status"{print $2; exit}' "$prefix.mosaic_status.tsv")"
+  if [ -z "$status" ]; then
+    printf 'UNREADABLE STATUS: the status file declares no status\n'
+    return 0
+  fi
+  required=""; forbidden=""
+  case "$status" in
+    COMPLETE)
+      required="mosaic_scores.tsv mosaic_candidates.tsv block_genotypes.tsv genotypes.tsv mosaic_haplotypes.fa"
+      ;;
+    BLOCK_CONSENSUS)
+      # Genotypes and block genotypes, with disagreeing blocks as NOCALL rows, and NO phased FASTA:
+      # phase is unresolved under consensus, so a FASTA here would be a haplotype nobody certified.
+      required="mosaic_scores.tsv mosaic_candidates.tsv block_genotypes.tsv genotypes.tsv"
+      forbidden="mosaic_haplotypes.fa"
+      ;;
+    *)
+      forbidden="block_genotypes.tsv genotypes.tsv mosaic_haplotypes.fa"
+      ;;
+  esac
+  for file in $required; do
+    if [ ! -f "$prefix.$file" ]; then
+      printf 'MISSING %s, which status %s must emit\n' "$file" "$status"
+    fi
+  done
+  for file in $forbidden; do
+    if [ -f "$prefix.$file" ]; then
+      printf 'FORBIDDEN %s present, which status %s must not emit\n' "$file" "$status"
+    fi
+  done
+  return 0
+}
+
+# ---- complete: every declared run is present and every arm obeys the output contract ----------------
 # A rate computed over whatever happened to succeed has a denominator nobody declared. The experiment
-# fails on a missing run or output instead.
+# fails on a missing run, a missing status, or an arm that emitted the wrong things for its status.
 if has_stage complete; then
   echo "=== completeness gate ==="
-  runs=0; records=0; missing=0
+  runs=0; records=0; problems=0
+  tally="$OUT/.arm_status_tally"; : > "$tally"
   while IFS='|' read -r _ name _ _ _ _ _ _ _; do
     d="$OUT/$name"
     for cov in $COVERAGES; do
-      if [ -f "$d/call.$cov.signature" ]; then runs=$((runs + 1)); else
-        printf '  %-22s cov%-3s MISSING RUN (no call signature)\n' "$name" "$cov"; missing=$((missing + 1))
+      if [ -f "$d/call.$cov.signature" ]; then
+        runs=$((runs + 1))
+      else
+        printf '  %-22s cov%-3s MISSING RUN (no call signature)\n' "$name" "$cov"
+        problems=$((problems + 1))
       fi
       for k in ${CALL_PREFIXES//,/ }; do
-        for suffix in mosaic_status.tsv mosaic_scores.tsv mosaic_candidates.tsv block_genotypes.tsv; do
-          f="$d/call.$cov.K$k.$suffix"
-          if [ -f "$f" ]; then
-            [ "$suffix" = "mosaic_status.tsv" ] && records=$((records + 1))
-          else
-            printf '  %-22s cov%-3s K%-3s MISSING OUTPUT %s\n' "$name" "$cov" "$k" "$suffix"
-            missing=$((missing + 1))
-          fi
-        done
+        prefix="$d/call.$cov.K$k"
+        if [ -f "$prefix.mosaic_status.tsv" ]; then
+          records=$((records + 1))
+          arm_status="$(awk -F'\t' '$1=="status"{print $2; exit}' "$prefix.mosaic_status.tsv")"
+          printf '%s\n' "${arm_status:-UNREADABLE}" >> "$tally"
+        fi
+        while IFS= read -r problem; do
+          [ -n "$problem" ] || continue
+          printf '  %-22s cov%-3s K%-4s %s\n' "$name" "$cov" "$k" "$problem"
+          problems=$((problems + 1))
+        done < <(arm_output_problems "$prefix")
       done
     done
   done < <(plan_rows | tr '\t' '|')
-  printf '  %s shared runs (want %s), %s K-arm status records (want %s), %s missing output(s)\n' \
-    "$runs" "$EXPECTED_RUNS" "$records" "$EXPECTED_STATUS" "$missing"
-  if [ "$runs" != "$EXPECTED_RUNS" ] || [ "$records" != "$EXPECTED_STATUS" ] || [ "$missing" -ne 0 ]; then
+  emitted="$(grep -c -E '^(COMPLETE|BLOCK_CONSENSUS)$' "$tally" || true)"
+  printf '  %s shared runs (want %s), %s K-arm status records (want %s), %s contract problem(s)\n' \
+    "$runs" "$EXPECTED_RUNS" "$records" "$EXPECTED_STATUS" "$problems"
+  echo "  arm status counts:"
+  sort "$tally" | uniq -c | awk '{printf "    %-22s %s\n", $2, $1}'
+  printf '  %s of %s arms legitimately emitted call outputs (COMPLETE or BLOCK_CONSENSUS)\n' \
+    "$emitted" "$records"
+  rm -f "$tally"
+  if [ "$runs" != "$EXPECTED_RUNS" ] || [ "$records" != "$EXPECTED_STATUS" ] || [ "$problems" -ne 0 ]; then
     echo "completeness gate FAILED: the experiment is incomplete and no rate over it is interpretable"
     exit 1
   fi
