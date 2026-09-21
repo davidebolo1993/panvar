@@ -21,6 +21,10 @@ Run statuses and what each emits:
 |---|---|---|
 | `COMPLETE` | one diplotype certified above every rival beyond floating-point error | genotypes, block genotypes, scores, candidates, haplotype FASTA (see below) |
 | `BLOCK_CONSENSUS` | scoring finished; no whole-locus winner separable, but tied candidates agree on some blocks | genotypes and block genotypes, with disagreeing blocks as explicit `NOCALL` rows; **no** haplotype FASTA |
+| `MODEL_INCOMPLETE` | the structural model could not be built | status only |
+| `CANDIDATE_INCOMPLETE` | proposal stopped at a declared budget | status only |
+| `SPELLING_INCOMPLETE` | a candidate could not be spelled | status only |
+| `RESCORE_INCOMPLETE` | a resource cap was reached, or a tie with no block agreement | status only |
 
 The FASTA a `COMPLETE` run emits holds the two members of an **unordered genotype pair**, written in a
 canonical order. `MosaicDiplotype` is a bare `{first, second}` with no ordering invariant, candidates
@@ -29,10 +33,6 @@ unordered genotype at every block. So the `hap1`/`hap2` labels assert a phase on
 `phase_support` is `READS_WITHIN_CANDIDATES` or `READS_AUDITED`; under `PRIOR_ONLY` or `UNRESOLVED`
 they carry no read evidence about which haplotype is which. It is therefore **not** a "phased FASTA"
 in general, and is not described as one anywhere in this document.
-| `MODEL_INCOMPLETE` | the structural model could not be built | status only |
-| `CANDIDATE_INCOMPLETE` | proposal stopped at a declared budget | status only |
-| `SPELLING_INCOMPLETE` | a candidate could not be spelled | status only |
-| `RESCORE_INCOMPLETE` | a resource cap was reached, or a tie with no block agreement | status only |
 
 Block consensus is **refused**, leaving `RESCORE_INCOMPLETE` with no calls, after model failure, resource
 refusal, an incomplete candidate set, truncated scoring, or missing provenance. Phase is always
