@@ -29,6 +29,9 @@ struct MosaicBeamParameters {
     // still misses the target is incomplete, however large this is.
     std::size_t state_limit = 0;
     std::uint64_t max_extension_evaluations = std::numeric_limits<std::uint64_t>::max();
+    // Grouped proposer only: haplotype-prefix vector cells held at once. Checked before anything is
+    // allocated, so a refused search allocates nothing.
+    std::uint64_t max_prefix_vector_cells = std::numeric_limits<std::uint64_t>::max();
     // Diagnostic only: follow one declared diplotype through every layer. Its prefixes are looked up and
     // never interned, so prefix ids, ordering and pruning are identical to an untraced search.
     std::optional<MosaicDiplotype> trace_target = std::nullopt;
@@ -44,6 +47,7 @@ struct MosaicBeamParameters {
 // function near the cap, which is the only place the answer decides anything. Throws std::length_error
 // when the bound itself overflows uint64.
 std::uint64_t extension_upper_bound(std::size_t templates, std::size_t blocks, std::size_t state_limit);
+
 
 // One layer of a trace: what was offered to pruning, what survived, and where the target stood.
 struct MosaicBeamTraceLayer {
@@ -138,5 +142,21 @@ MosaicBeamResult propose_mosaic_diplotypes(
     const PreparedProposalEmissions& emissions,
     const std::vector<double>& switch_probability,
     const MosaicBeamParameters& parameters);
+// The grouped-prefix proposer: an EXPERIMENTAL second implementation, retaining allele-prefix pairs and
+// carrying each one's whole distribution over current template pairs instead of a single attribution of
+// it. propose_mosaic_diplotypes above is untouched and is the oracle this is tested against; nothing
+// here is wired into calling. Same inputs, same MosaicBeamResult, same candidate ordering.
+MosaicBeamResult propose_mosaic_diplotypes_grouped(const PanelAlleleMatrix& panel,
+                                                   const PreparedProposalEmissions& emissions,
+                                                   const std::vector<double>& switch_probability,
+                                                   const MosaicBeamParameters& parameters);
+
+// The two pre-allocation counts, taken from the exact loops the grouped proposer runs: one template
+// scan per retained haplotype prefix (at most two per retained pair) plus one child per ordered allele
+// pair per retained pair, and the vector cells held across a layer boundary. Both are integer and
+// overflow-checked, and both are checked before anything is allocated.
+std::uint64_t grouped_extension_upper_bound(std::size_t templates, std::size_t state_limit,
+                                            const std::vector<std::size_t>& allele_counts);
+std::uint64_t grouped_prefix_vector_cells(std::size_t templates, std::size_t state_limit);
 
 } // namespace panvar

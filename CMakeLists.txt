@@ -130,6 +130,7 @@ add_library(panvarlib
     src/mosaic_spelling.cpp
     src/marker_model.cpp
     src/mosaic_beam.cpp
+    src/mosaic_beam_grouped.cpp
     src/genotype_locus.cpp
     src/genotype_command.cpp
     src/fragment_likelihood.cpp
@@ -274,6 +275,11 @@ if(PANVAR_BUILD_TESTING)
         # Drives the layer selector directly, which is why it compiles mosaic_beam.cpp into its own
         # translation unit instead of linking panvarlib: the selector has no other reader, and the
         # order states are offered in cannot be varied through the public beam entry point.
+        add_executable(genotype_grouped_beam_test tests/genotype_grouped_beam.cpp)
+        target_link_libraries(genotype_grouped_beam_test PRIVATE panvarlib)
+        target_compile_options(genotype_grouped_beam_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME panvar_genotype_grouped_beam COMMAND genotype_grouped_beam_test)
+
         add_executable(genotype_beam_selector_test tests/genotype_beam_selector.cpp src/genotype_model.cpp)
         target_include_directories(genotype_beam_selector_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
         target_compile_options(genotype_beam_selector_test PRIVATE -Wall -Wextra -Wpedantic)

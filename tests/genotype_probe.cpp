@@ -2238,8 +2238,14 @@ int trace(const Args& args) {
     parameters.trace_target = truth;
     // Only a panel donor has declared templates to follow; a curated-out mosaic has none.
     if (rows.size() == 2) parameters.trace_templates = std::make_pair(rows[0], rows[1]);
+    // --grouped selects the EXPERIMENTAL grouped-prefix proposer instead of the existing one. Both
+    // return the same MosaicBeamResult, so every summary below is computed the same way; the grouped
+    // one fills only the layer fields it can, so its per-layer trace is thinner.
+    const bool grouped = args.get("grouped", "0") != "0";
+    parameters.max_prefix_vector_cells = 4ULL * state_limit * panel.template_count();
     const panvar::MosaicBeamResult result =
-        panvar::propose_mosaic_diplotypes(panel, emissions, switches, parameters);
+        grouped ? panvar::propose_mosaic_diplotypes_grouped(panel, emissions, switches, parameters)
+                : panvar::propose_mosaic_diplotypes(panel, emissions, switches, parameters);
 
     // The traced search must be the run's search.
     // A manifest without a source column predates the panel baseline: every row is a beam candidate, and the
@@ -2325,7 +2331,8 @@ int trace(const Args& args) {
     }
 
     std::ofstream summary(out + ".trace.summary.tsv");
-    summary << std::setprecision(12) << "key\tvalue\ndonor\t" << donor << "\nstate_limit\t" << state_limit
+    summary << std::setprecision(12) << "key\tvalue\nproposer\t" << (grouped ? "grouped" : "state_only")
+            << "\ndonor\t" << donor << "\nstate_limit\t" << state_limit
             << "\ncandidate_target\t" << target << "\nunique_candidates_found\t" << result.unique_candidates_found
             << "\nstates_pruned\t" << result.states_pruned
             << "\nextensions_evaluated\t" << result.extensions_evaluated << "\nproposal_matches_run\t"

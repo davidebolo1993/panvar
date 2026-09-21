@@ -103,10 +103,13 @@ weight 0.001. C4 reference `HG00096#1#haplotype1-0000024:31848049-32074186`.
     4,096) and peak RSS 1.27x to 1.41x (638-799 MB to 810-814 MB; 1.36-2.01 GB to 1.95-2.05 GB).
   - `extensions_evaluated` is **identical** between the two selectors at each width (175,745,801 and
     702,931,721), so the pre-allocation bound production checks against is unaffected.
-  - Not established: only each group's best state survives, so the mass on a prefix's other template
-    attributions is dropped rather than carried, and the surviving candidate's log-sum under-represents
-    its prefix. That is the obvious suspect for `unbridgeable` falling from rank 2 to 46, but it has not
-    been measured and must not be reported as the cause.
+  - **Now measured, and it was the cause.** Only each group's best state survives, so the mass on a
+    prefix's other template attributions is dropped rather than carried. The grouped proposer keeps all
+    of them and returns `unbridgeable`'s truth to rank 1 -- better than the rank 2 the original
+    state-only selector gave and far above the 46 prefix-first gave. An earlier reading of this, that
+    the truth prefix ranked about 33rd "by aggregate mass counting every attribution", was wrong: that
+    aggregate was measured inside a prefix-first beam whose parents had already been truncated at every
+    preceding layer, so it was never mass-complete. The loss compounds layer over layer.
   - The search is still not exhaustive anywhere, so none of this reaches block consensus.
   - **Experimental, not frozen.** `954af2f` is an experimental selector under review. No calls and no
     cohorts have been run on it, and the frozen production width and defaults are unchanged.
@@ -140,65 +143,108 @@ weight 0.001. C4 reference `HG00096#1#haplotype1-0000024:31848049-32074186`.
 - Read-form deduplication was measured and **rejected**: predicted piece-hit reduction 0.55% / 3.22% /
   9.24% at 2x/10x/30x, and even a perfect cache leaves 2,046,971,082 hits, still above the cap.
 
-## Design, not implemented: the grouped-prefix recurrence
+## The grouped-prefix proposer
 
-Prefix-first selection keeps one state per prefix and therefore one template attribution of `T`. The
-exact alternative is to make the prefix itself the unit of retention and carry the whole distribution
-over current templates with it. Nothing about the model changes -- this is a re-indexing of what the
-beam already computes.
+Implemented **alongside** `propose_mosaic_diplotypes`, which is untouched and serves as the oracle.
+Nothing here is wired into calling; prefix-first (`954af2f`) remains experimental, and no calls or
+cohorts have been run on either.
 
-**What a group carries.** A beam state today is a cell `(prefix pair, template pair)` holding mass
-`W_p(i, j)`. Within one prefix pair every state shares the same allele history, so the emission is a
-single scalar for the group, and the only thing that differs is the transition mass. The emission is
-the sole coupling between the two haplotypes, so given the prefix pair the joint factorises:
+**What a group carries.** Within a prefix pair every history spells the same alleles, so the diploid
+emission is one scalar for the group -- and it is the only coupling between the haplotypes. The joint
+therefore factorises, `W_p(i, j) = E(p1, p2) * u_p1(i) * u_p2(j)`, and a group needs two length-`T`
+vectors, each shared by every pair using that haplotype prefix, plus scalars.
 
-    W_p(i, j) = E(p1, p2) * u_p1(i) * u_p2(j)
+**Cost model, corrected.** The earlier note said `O(2LAT)` for vector construction, from scanning the
+templates once per child allele. That was wrong: each template spells exactly ONE allele at a block, so
+a single scan over the `T` templates produces every child at once by scattering each template into its
+own allele class. All `A` children of a prefix together occupy exactly `T` entries. Construction is
+therefore **`O(2LT)` per retained pair-prefix boundary**, independent of `A`.
 
-where `u_p(i)` is the transition mass of the allele prefix `p` over template paths ending on template
-`i`, and `E` is the product of the diploid emissions along the prefix pair. So a group needs **two
-vectors of length `T`**, both shared with every other pair using the same haplotype prefix, plus a
-scalar per pair. The group's total mass is `E * (sum_i u_p1(i)) * (sum_j u_p2(j))`.
+With C4's actual per-block allele counts -- 68, 68, 100, 16, 10, 8, 118, 119, 62, 5, 126 -- at `T` =
+131 and `L` = 1,024:
 
-**Extension, using the low-rank transition.** Li-Stephens is `(1 - r) * identity + (r / T) * ones`, so
-the rank-1 term contributes one scalar -- the prefix's running total -- to every entry:
+| term | per block | total |
+|---|---|---|
+| template scans, `2LT` | 268,288 | 2,682,880 (blocks 1-10) |
+| pair children, `L*A_b^2` | 25,600 to 16,257,024 | 64,382,976 |
+| block 0 (`T` + `A_0^2`) | -- | 4,755 |
+| **grouped total** | | **67,070,611** |
+| existing proposer, `T^2 + 10*L*T^2` | 17,565,164 | **175,746,801** |
 
-    u_{p.a}(i') = [allele(i', b+1) == a] * ( (1 - r) * u_p(i') + (r / T) * sum_i u_p(i) )
+So 2.6x fewer operations, and the correction matters twice: construction drops by a factor of `A`, and
+the **pair term now dominates** -- 64.4M of the 67.1M. The previous estimate used `A` about 20, which
+badly understates the blocks carrying 100, 118, 119 and 126 alleles.
 
-That is `O(T)` per child allele per prefix, not `O(T^2)`.
+**Memory.** Vector cells held across a layer boundary are `4LT` (parent and child layers, at most two
+haplotype prefixes per retained pair): 536,576 cells at width 1,024 and 2,146,304 at 4,096. At three
+arrays of 8 bytes -- sum-product, max-product, and the integer history count -- that is 12.9 MB and
+51.5 MB, against measured peaks of 810 MB and 2.0 GB for the current selector. The `L * A_b^2` children
+of a layer are streamed into a bounded selector and never all materialised; at block 10 that would
+otherwise be 16.3 million records.
 
-**Cost per block**, with `L` the retained pair width, `A` the block's allele count, `T` the templates:
+**The unordered-prefix multiplicity is part of the selection score.** An unordered pair of DISTINCT
+haplotype prefixes stands for two ordered histories and carries a factor of two; identical prefixes do
+not. The factor is applied to the sum-product mass and to the history count at **every** layer, not at
+the final collapse, so it participates in every layer's ranking. It is not applied to the max-product
+score: the swapped history scores the same, so the maximum is unchanged. A mutation omitting it is
+gated.
 
-| quantity | cost |
+**Quantities carried, separately.**
+
+| quantity | definition |
 |---|---|
-| update haplotype-prefix vectors | `O(2L * A * T)` |
-| form child pairs and their masses | `O(L * A^2)` (two scalar lookups each) |
+| sum-product | `E + log T(p1) + log T(p2) + het`, where `T(p) = sum_i u_p(i)` |
+| max-product | `E + max_i m_p1(i) + max_j m_p2(j)`, no `het` |
+| emission component | `E`, shared by every history in the group |
+| transition component | the max-product's two maxima |
+| history multiplicity | `N(p1) * N(p2)`, doubled when the prefixes differ, saturating at `2^64 - 1` |
 
-At C4 (`T = 131`, `A` about 20, `L = 1024`) that is roughly 5.4M + 0.4M against the current
-`L * T^2 = 17.6M` extensions per block -- cheaper than what runs today, and exact in the attribution
-that prefix-first currently drops.
+The max-product cannot use the low-rank decomposition the sum-product uses: it needs the best OTHER
+template, which comes from the parent's top two values excluding the template itself.
 
-**Memory per prefix per layer** is `T` doubles: 1,048 bytes at C4. Distinct haplotype prefixes are at
-most `2L`, so the vector table is `2L * T * 8` bytes, double-buffered across the layer boundary:
+**Deterministic tie-breaking.** Layers rank by sum-product mass, then max-product score, then prefix
+ids -- total, so no tie is left to arrival order. Candidates come back by mass, then witness, then
+allele paths, which is the existing rule unchanged.
 
-| width | vector table | double-buffered | pair records |
-|---|---|---|---|
-| 1,024 | 2.1 MB | 4.3 MB | ~33 KB |
-| 4,096 | 8.6 MB | 17.2 MB | ~131 KB |
+**How close the two implementations are.** Candidate sets, masses, best histories, emission and
+transition components and history multiplicities agree to within 1e-9, and multiplicities agree exactly.
+The residual is one unit in the last place: the two sum the same histories in different association
+orders, so a pair of candidates that ties bitwise in one is separated by an ULP in the other, and the
+documented allele-path tie-break then engages in only one of them. Measured on the two-allele fixture at
+r = 0: the existing implementation separates `011/110` and `000/110` by a single ULP, the grouped one
+computes them bitwise equal. Neither is wrong, so the gates compare candidates by identity rather than
+by position, and assert cross-implementation order only between candidates the data actually separates.
 
-Against the 810 MB and 2.0 GB peaks measured for the current selector, the pre-allocation is
-negligible; the saving comes from never materialising `L * T^2` child cells.
+**Numerical scaling.** Every quantity is held in log space and no linear-space mass is ever formed, so
+nothing can overflow at C4's scale of about 1e6 nats. Each reduction factors out its own maximum before
+summing (`log_add_exp`), which is the only scaling required; the max-product is a plain maximum in log
+space, and multiplicities are integers with saturating add and multiply.
 
-**Refusal limits.** Two declared caps, both checked before the search and both integer and
-overflow-checked, in the style of `extension_upper_bound` -- which must stay the single source of
-truth for any figure production compares against:
+**Refusal is transactional.** Both budgets -- the work bound above and the `4LT` vector cells -- are
+computed from the exact loops the search runs and checked BEFORE anything is allocated, so a refused
+search allocates nothing and leaves no partial state. Both are integer and overflow-checked.
 
-- `prefix_vector_cells = 2 * state_limit * templates`, refused above a declared cap. At width 4,096
-  and `T = 131` this is 1,073,152 cells, three orders below the existing `max_mass_cells` of 2e8.
-- a grouped work bound `sum_b (2 * L * A_b * T + L * A_b^2)`, replacing the per-block `L * T^2` term
-  in the extension budget. It must be computed by one function, not restated in floating point.
+**Measured on C4, proposal only, width 1,024, five frozen plans.** Paired back to back on the same
+binary against the in-tree proposer -- which is prefix-first (`954af2f`), not the original state-only
+selector. No rescoring, no calling, no cohorts.
 
-Unchanged: the unordered canonicalisation, the `log(2)` multiplicity on path identity at the final
-collapse, and the symmetric `p1 == p2` case, which still counts each ordered history once.
+| plan | truth rank, prefix-first | truth rank, grouped | wall (s) | peak RSS (MB) |
+|---|---|---|---|---|
+| one_switch | 5 | 6 | 13.14 -> 2.56 | 772 -> 383 |
+| bridgeable | 4 | 6 | 13.17 -> 2.59 | 776 -> 384 |
+| unbridgeable | 46 | **1** | 13.80 -> 2.85 | 759 -> 382 |
+| three_switches | 12 | **8** | 13.61 -> 2.56 | 771 -> 382 |
+| every_block | 711 | **87** | 13.52 -> 2.59 | 777 -> 386 |
+
+The truth is retained at every layer of all ten runs, and both proposers return 1,024 distinct
+candidates. Operations are 175,745,801 for prefix-first against 64.9-65.1 million for grouped on every
+plan -- 2.7x fewer, and within the 67,070,611 bound derived above, as a bound must be. Wall time is
+5.1x to 5.3x lower and peak RSS about half.
+
+The exact proposer is therefore cheaper than the approximate one AND ranks the truth better wherever
+the case is hard: it recovers the two plans prefix-first damaged most, and gives up a little on the two
+easy plans (rank 5 to 6, and 4 to 6). Nothing here is a calling result: ranks are proposal ranks, and
+what a caller does with them has not been measured.
 
 ## Known limitations
 
