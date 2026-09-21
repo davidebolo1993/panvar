@@ -1037,7 +1037,14 @@ void test_candidate_prefixes_match_standalone() {
                     "candidate_scope", "candidate_set_conditional", "mosaic_candidates",
                     "mosaic_candidates_found", "mosaic_target_reached", "proposal_state_limit",
                     "proposal_final_states", "proposal_states_pruned", "proposal_search_exhaustive",
-                    "beam_extensions", "candidates_total", "beam_diplotypes_found"};
+                    "beam_extensions", "candidates_total", "beam_diplotypes_found",
+                    // The full-beam audit describes the same absent search: a standalone K = 0 run has
+                    // no beam, so it has no prefix to truncate, nothing outside K to audit, and a scope
+                    // of PANEL_ONLY. Dropped for K = 0 ONLY -- at every other K both runs build a beam
+                    // and these must agree exactly, which is what keeps the audit inside this gate.
+                    "primary_prefix_k", "full_beam_candidates", "primary_prefix_truncated",
+                    "full_beam_audit_attempted", "candidates_exactly_audited", "audit_completed",
+                    "final_candidate_scope"};
                 if (drop_proposal && proposal_diagnostics.count(key) != 0) continue;
             }
             if (drop_last_column) {
@@ -1296,6 +1303,89 @@ void test_block_consensus_rule() {
             "a single dissenter among three must no-call its block and leave the rest called");
 
     std::cout << "  block consensus: unanimous called, one dissent no-called, order-independent\n";
+}
+
+// The tie-triggered full-beam exact audit. A K-truncated prefix is never grounds for consensus: the
+// candidates below K were ordered by proposal mass but never exactly scored, so their order proves
+// nothing about whether one of them wins or disagrees blockwise. When the primary ties, the search was
+// exhaustive and the beam held candidates outside K, the complete retained beam is scored exactly and
+// the OUTPUT COMES FROM THAT RANKING.
+//
+// This locus is the trigger: an exhaustive search finding 26 mosaics against the default K of 16, whose
+// two phasings of one genotype cannot be separated.
+//
+// Directly gated here: the audit fires, the tables describe the audited set, a non-exhaustive proposal
+// never audits, and a unique primary winner is untouched. The cases where an omitted candidate outscores
+// the tie or disagrees at one block cannot be manufactured end to end without controlling exact scores;
+// what makes them impossible is that the decision is derived from the audited set, which is asserted
+// below by requiring the scored candidate count to equal the audited count.
+void test_full_beam_audit() {
+    panvar::GenotypeCommandOptions options =
+        tiny_options("audit", path("unphaseable_r1.fq"), path("unphaseable_r2.fq"));
+    options.proposal_state_limit = 1048576;   // exhaustive
+    // max_mosaic_candidates stays at the fixture default of 16, below the 26 this locus yields.
+    const panvar::GenotypeRunStatus status = panvar::run_genotype(options);
+    const auto reported = read_status(path("audit.mosaic_status.tsv"));
+
+    require(reported.at("proposal_search_exhaustive") == "true",
+            "fixture: the audit only runs on an exhaustive search");
+    require(reported.at("primary_prefix_truncated") == "true",
+            "fixture: the beam must hold candidates outside K, or there is nothing to audit");
+    require(reported.at("full_beam_audit_attempted") == "true",
+            std::string("a tie on a truncated exhaustive beam must trigger the audit, got status ") +
+                panvar::genotype_run_status_name(status));
+    require(reported.at("audit_completed") == "true", "the audit must rank to completion here");
+
+    // The eight concepts stay distinct: candidate_set_conditional still describes the PREFIX, while
+    // final_candidate_scope describes the set that decided the call.
+    require(reported.at("candidate_set_conditional") == "true",
+            "the prefix was truncated, so its own scope is still conditional");
+    require(reported.at("final_candidate_scope") == "COMPLETE",
+            "the audited full beam of an exhaustive search omits nothing");
+
+    // The tables must describe the audited set, not the prefix beside it.
+    const std::size_t audited = std::stoul(reported.at("candidates_exactly_audited"));
+    const std::size_t full_beam = std::stoul(reported.at("full_beam_candidates"));
+    const std::size_t prefix_k = std::stoul(reported.at("primary_prefix_k"));
+    require(full_beam > prefix_k, "fixture: the full beam must exceed K");
+    require(audited >= full_beam, "the audited set must contain the whole beam, plus the panel baseline");
+    require(read_rows(path("audit.mosaic_candidates.tsv")).size() == audited,
+            "the candidate table must list the audited set, not the top-K prefix");
+
+    // Whichever way the audited ranking falls, the contract holds.
+    if (status == panvar::GenotypeRunStatus::BlockConsensus) {
+        require(reported.at("phase_support") == "UNRESOLVED" &&
+                    !exists(path("audit.mosaic_haplotypes.fa")),
+                "an audited tie must report phase UNRESOLVED and emit no phased haplotype");
+        const std::size_t called = std::stoul(reported.at("consensus_blocks_called"));
+        const std::size_t no_called = std::stoul(reported.at("consensus_blocks_no_called"));
+        require(called + no_called == read_rows(path("audit.block_genotypes.tsv")).size(),
+                "every block must be called or explicitly no-called");
+    } else {
+        require(status == panvar::GenotypeRunStatus::Complete,
+                std::string("an audited ranking must end COMPLETE or BLOCK_CONSENSUS, got ") +
+                    panvar::genotype_run_status_name(status));
+        require(exists(path("audit.mosaic_haplotypes.fa")),
+                "a uniquely audited winner is an ordinary complete call, phased haplotype included");
+    }
+
+    // A non-exhaustive proposal never audits, and never reaches consensus.
+    panvar::GenotypeCommandOptions pruned =
+        tiny_options("audit_pruned", path("unphaseable_r1.fq"), path("unphaseable_r2.fq"));
+    pruned.proposal_state_limit = 2;   // forces pruning, so the search is not exhaustive
+    const panvar::GenotypeRunStatus pruned_status = panvar::run_genotype(pruned);
+    const auto pruned_reported = read_status(path("audit_pruned.mosaic_status.tsv"));
+    if (pruned_reported.count("proposal_search_exhaustive") != 0) {
+        require(pruned_reported.at("proposal_search_exhaustive") == "false",
+                "fixture: a state limit of 2 must prune this locus");
+        require(pruned_reported.at("full_beam_audit_attempted") == "false",
+                "a non-exhaustive proposal must never be audited: it omits candidates it never proposed");
+        require(pruned_status != panvar::GenotypeRunStatus::BlockConsensus,
+                "a non-exhaustive proposal must never reach block consensus");
+    }
+
+    std::cout << "  full-beam audit: " << prefix_k << " of " << full_beam << " in the prefix, " << audited
+              << " audited, " << panvar::genotype_run_status_name(status) << "\n";
 }
 
 // Block consensus, end to end. The pure-function gate above proves the rule; this proves a run can
@@ -1617,6 +1707,7 @@ int main(int argc, char** argv) {
         test_panel_only_path();
         test_block_consensus_rule();
         test_block_consensus_end_to_end();
+        test_full_beam_audit();
         test_curated_panel();
         test_resource_caps_are_thread_invariant();
         std::cout << "genotype command end-to-end: PASS\n";

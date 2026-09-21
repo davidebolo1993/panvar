@@ -237,6 +237,25 @@ struct CandidateSetReport {
     // candidate_scope PANEL_ONLY, which is neither COMPLETE nor CONDITIONAL -- both of those describe
     // the outcome of a search that did not happen.
     bool panel_only = false;
+    // The tie-triggered full-beam audit. Each of these is a separate fact and they are reported
+    // separately: conflating "the search was exhaustive" with "the prefix was truncated" with "the full
+    // beam was exactly scored" is what made a K-truncated prefix look like grounds for consensus.
+    //
+    // primary_prefix_k          -- K the primary ranking was truncated to
+    // full_beam_candidates      -- off-panel mosaics the beam retained, before truncation
+    // primary_prefix_truncated  -- the primary ranking saw fewer candidates than the beam retained
+    // full_beam_audit_attempted -- the primary tied, the search was exhaustive, and candidates sat
+    //                              outside K, so the complete retained beam was scored exactly
+    // candidates_exactly_audited-- candidates in the audited set, panel baseline included
+    // audit_completed           -- the audit ranked to completion (no resource refusal)
+    // final_candidate_scope     -- the scope of the set that actually DETERMINED the call
+    std::size_t primary_prefix_k = 0;
+    std::size_t full_beam_candidates = 0;
+    bool primary_prefix_truncated = false;
+    bool full_beam_audit_attempted = false;
+    std::size_t candidates_exactly_audited = 0;
+    bool audit_completed = false;
+    std::string final_candidate_scope = "NA";
 };
 
 struct RankingSummary {
@@ -406,6 +425,20 @@ void write_status(
         out << "haploid_prior_evaluations\t" << candidate_set->haploid_prior_evaluations << '\n';
         out << "diploid_prior_lookups\t" << candidate_set->diploid_prior_lookups << '\n';
         out << "candidate_fragment_evaluations\t" << candidate_set->candidate_fragment_evaluations << '\n';
+        // The tie-triggered full-beam audit, reported as separate concepts on purpose. `mosaic_candidates`
+        // and `proposal_search_exhaustive` above describe the PROPOSAL; these describe what was exactly
+        // SCORED. candidate_set_conditional keeps its existing meaning and is not redefined here: a run
+        // whose audit completed is no longer conditional on the prefix, and final_candidate_scope says so
+        // without disturbing the key that describes the prefix.
+        out << "primary_prefix_k\t" << candidate_set->primary_prefix_k << '\n';
+        out << "full_beam_candidates\t" << candidate_set->full_beam_candidates << '\n';
+        out << "primary_prefix_truncated\t"
+            << (candidate_set->primary_prefix_truncated ? "true" : "false") << '\n';
+        out << "full_beam_audit_attempted\t"
+            << (candidate_set->full_beam_audit_attempted ? "true" : "false") << '\n';
+        out << "candidates_exactly_audited\t" << candidate_set->candidates_exactly_audited << '\n';
+        out << "audit_completed\t" << (candidate_set->audit_completed ? "true" : "false") << '\n';
+        out << "final_candidate_scope\t" << candidate_set->final_candidate_scope << '\n';
         if (candidate_set->observed_valid) {
             // A refused run reports the work it performed, so the breaker can be held to a bound rather
             // than merely to a verdict -- and the workers and phase timings with it, so the refusal can
@@ -829,6 +862,18 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     for (const std::size_t k : score_targets) {
         scored_mosaics = std::max(scored_mosaics, candidate_prefix(mosaics, k).candidates.size());
     }
+    // The tie-triggered full-beam audit scores the complete retained beam, and it can only re-rank
+    // candidates this shared pass already scored: rank_set resolves every candidate through slot_of_path
+    // and scored_index, both built from scored_union below, so a candidate outside it would throw rather
+    // than be audited. The set is therefore widened here, where the single scoring pass is defined,
+    // rather than by scoring a second time later.
+    //
+    // Only when an audit could actually be triggered: the search must be exhaustive, or the beam omitted
+    // candidates it never proposed and no audit is offered whatever the ranking does. On a locus whose
+    // search is pruned -- which is every large locus today -- this widens nothing and costs nothing.
+    if (mosaics.search_exhaustive) {
+        scored_mosaics = std::max(scored_mosaics, mosaics.candidates.size());
+    }
     mark = Clock::now();
     std::vector<MosaicPath> paths;
     std::vector<std::string> sequences;
@@ -1150,14 +1195,51 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
         }
 
         SetRanking primary = rank_set(beam);
-        const std::vector<MosaicCandidate>& candidates = primary.candidates;
+
+        // ---- tie-triggered full-beam exact audit -----------------------------------------------------
+        // A K-truncated prefix is not grounds for consensus. The candidates below K were constructed and
+        // ordered by proposal mass, but never exactly scored, so their order is no proof that none of
+        // them wins or disagrees blockwise. When the primary ranking ties, the search was exhaustive, and
+        // the beam retained candidates outside K, the complete retained beam is scored exactly and the
+        // output is derived from THAT ranking alone -- never from the prefix presented beside it.
+        //
+        // No second scoring pass and no new tuning parameter: the shared pass already scored the full
+        // beam whenever the search was exhaustive, so this re-ranks candidates whose scores, sequence
+        // interning and haploid-path priors are all already computed.
+        SetRanking audited;
+        const bool primary_tied = primary.ranking.status != RescoreStatus::Complete;
+        const bool beam_has_more = mosaics.candidates.size() > beam.candidates.size();
+        const bool audit_attempted = primary_tied && mosaics.search_exhaustive && beam_has_more;
+        if (audit_attempted) audited = rank_set(mosaics);
+
+        // A cap reached while scoring the audited set fails closed with no tables, and the gate for that
+        // is the rescore_failure check ABOVE, not one here: score_diplotypes runs once, in the shared
+        // pass, which already covers the full beam whenever the search was exhaustive. rank_set only
+        // re-ranks scores that pass produced, so it cannot reach a cap and cannot set rescore_failure.
+        // A check at this point would never fire -- an inert guard that reads as protection.
+
+        // Everything below reads through these names, so binding them to the audited ranking is what
+        // makes the candidate and score tables describe the set that determined the call.
+        const SetRanking& chosen = audit_attempted ? audited : primary;
+        const std::vector<MosaicCandidate>& candidates = chosen.candidates;
         const std::size_t panel_count = panel_candidates.size();
-        const std::vector<SequenceCandidate>& sequence_candidates = primary.sequence_candidates;
-        const std::vector<std::size_t>& sequence_candidate_of = primary.sequence_candidate_of;
-        const std::vector<double>& path_prior = primary.path_prior;
-        const CertifiedRanking& ranking = primary.ranking;
-        RankingSummary& summary = primary.summary;
+        const std::vector<SequenceCandidate>& sequence_candidates = chosen.sequence_candidates;
+        const std::vector<std::size_t>& sequence_candidate_of = chosen.sequence_candidate_of;
+        const std::vector<double>& path_prior = chosen.path_prior;
+        const CertifiedRanking& ranking = chosen.ranking;
+        RankingSummary& summary = audit_attempted ? audited.summary : primary.summary;
         CandidateSetReport set_report = candidate_report;
+        // Eight separate facts, reported separately. candidate_set_conditional keeps its meaning -- it
+        // describes the PREFIX -- and final_candidate_scope describes the set that decided the outcome.
+        set_report.primary_prefix_k = beam.candidates.size();
+        set_report.full_beam_candidates = mosaics.candidates.size();
+        set_report.primary_prefix_truncated = beam_has_more;
+        set_report.full_beam_audit_attempted = audit_attempted;
+        set_report.candidates_exactly_audited = audit_attempted ? audited.candidates.size() : 0;
+        set_report.audit_completed = audit_attempted;
+        set_report.final_candidate_scope =
+            audit_attempted ? candidate_scope_name(panel_only, false)
+                            : candidate_scope_name(panel_only, beam.candidate_set_conditional);
         {
             std::set<std::size_t> haplotypes;
             for (const SequenceCandidate& candidate : sequence_candidates) {
@@ -1287,7 +1369,10 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             // Refused when the candidate set itself is incomplete. A pruned search omitted candidates it
             // never proposed, so unanimity among those it happened to retain says nothing about those it
             // did not -- consensus would be agreement of an unrepresentative sample.
-            const bool candidates_complete = panel_only || !beam.candidate_set_conditional;
+            // The audited full beam of an exhaustive search omits nothing, so consensus is permitted on
+            // it. A K-truncated prefix is still refused: that is the whole point of auditing first.
+            const bool candidates_complete =
+                panel_only || audit_attempted || !beam.candidate_set_conditional;
             const std::size_t block_count = model.blocks().size();
             std::vector<std::vector<std::pair<std::size_t, std::size_t>>> tied_genotypes;
             if (candidates_complete) {
@@ -1362,7 +1447,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                             << (variant ? "true" : "false") << '\t';
                         if (!agreed[b]) {
                             out << ".\t.\t.\t.\tNOCALL\tfalse\tNOCALL\tUNRESOLVED\tNA\tNA\tfalse\t"
-                                << candidate_scope_name(panel_only, beam.candidate_set_conditional)
+                                << set_report.final_candidate_scope
                                 << '\n';
                             continue;
                         }
@@ -1376,7 +1461,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                             << summary.block_genotype_posterior[b] << '\t'
                             << summary.block_genotype_quality[b] << std::setprecision(6) << '\t'
                             << (summary.block_numerically_separated[b] ? "true" : "false") << '\t'
-                            << candidate_scope_name(panel_only, beam.candidate_set_conditional) << '\n';
+                            << set_report.final_candidate_scope << '\n';
                     }
                 }
                 timings.total = seconds_since(started);
@@ -1464,7 +1549,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
                     << summary.phase_support << '\t' << std::setprecision(12)
                     << summary.block_genotype_posterior[b] << '\t' << summary.block_genotype_quality[b]
                     << std::setprecision(6) << '\t' << (summary.block_numerically_separated[b] ? "true" : "false")
-                    << '\t' << candidate_scope_name(panel_only, beam.candidate_set_conditional) << '\n';
+                    << '\t' << set_report.final_candidate_scope << '\n';
             }
         }
         {
