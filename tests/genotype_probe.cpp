@@ -2264,7 +2264,8 @@ int trace(const Args& args) {
     std::ofstream layers(out + ".trace.tsv");
     layers << std::setprecision(10)
            << "block\tblock_id\tkind\ttruth_alleles\ttruth_emission\twinner_alleles\twinner_emission\t"
-              "best_emission_in_block\tstates_offered\tstates_retained\tprefix_pairs_retained\tretained_min_log_mass\t"
+              "best_emission_in_block\tstates_offered\tstates_retained\tstates_pruned\t"
+              "prefix_pairs_retained\tmax_states_per_prefix\tretained_min_log_mass\t"
               "truth_prefixes_present\ttruth_states_offered\ttruth_states_retained\ttruth_best_log_mass\t"
               "truth_logsum_log_mass\ttruth_rank\tdonor_templates_offered\tdonor_templates_log_mass\t"
               "donor_templates_retained\n";
@@ -2284,7 +2285,8 @@ int trace(const Args& args) {
                << (model.blocks()[b].kind == panvar::GenotypeBlockKind::Variant ? "SV" : "context") << '\t'
                << truth.first.alleles[b] << '/' << truth.second.alleles[b] << '\t' << truth_e << '\t'
                << winner.first[b] << '/' << winner.second[b] << '\t' << winner_e << '\t' << best_e << '\t'
-               << layer.states_offered << '\t' << layer.states_retained << '\t' << layer.prefix_pairs_retained << '\t'
+               << layer.states_offered << '\t' << layer.states_retained << '\t' << layer.states_pruned << '\t'
+               << layer.prefix_pairs_retained << '\t' << layer.max_states_per_prefix << '\t'
                << layer.retained_min_log_mass << '\t'
                << (layer.target_prefixes_present ? "true" : "false") << '\t' << layer.target_states_offered << '\t'
                << layer.target_states_retained << '\t' << layer.target_best_log_mass << '\t'

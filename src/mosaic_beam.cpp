@@ -201,9 +201,22 @@ public:
             pairs.reserve(retained.size());
             for (const State& state : retained) pairs.emplace_back(state.prefix1, state.prefix2);
             std::sort(pairs.begin(), pairs.end());
-            current_.prefix_pairs_retained =
-                static_cast<std::size_t>(std::unique(pairs.begin(), pairs.end()) - pairs.begin());
+            // One pass for both: the number of distinct prefix pairs, and the size of the largest
+            // group sharing one. Run lengths over the sorted pairs give each prefix's share of the
+            // width, so the crowding is measured rather than inferred from the count.
+            std::size_t distinct = 0;
+            std::size_t largest = 0;
+            for (std::size_t i = 0; i < pairs.size();) {
+                std::size_t j = i;
+                while (j < pairs.size() && pairs[j] == pairs[i]) ++j;
+                ++distinct;
+                largest = std::max(largest, j - i);
+                i = j;
+            }
+            current_.prefix_pairs_retained = distinct;
+            current_.max_states_per_prefix = largest;
         }
+        current_.states_pruned = current_.states_offered - static_cast<std::uint64_t>(retained.size());
         for (const State& state : retained) {
             current_.retained_min_log_mass = current_.retained_min_log_mass == kNegInf
                                                  ? state.log_mass

@@ -52,6 +52,14 @@ struct MosaicBeamTraceLayer {
     std::size_t states_retained = 0;
     // Distinct allele-prefix pairs among the retained states: how many diplotype prefixes the width holds.
     std::size_t prefix_pairs_retained = 0;
+    // The most retained states sharing a single prefix pair. The width is spent on DIPLOTYPE PREFIXES
+    // only to the extent this stays small: a layer whose width is largely one prefix's template
+    // variants is exploring one history many times over, which is what prefix_pairs_retained alone
+    // cannot show -- it counts the prefixes present, not how unevenly the width is divided among them.
+    std::size_t max_states_per_prefix = 0;
+    // States this layer's selection discarded: offered minus retained. The result's `states_pruned` is
+    // the sum over blocks and says nothing about WHERE the search narrowed.
+    std::uint64_t states_pruned = 0;
     double retained_min_log_mass = -std::numeric_limits<double>::infinity();
     // Both target prefixes exist as interned prefixes at this layer.
     bool target_prefixes_present = false;
