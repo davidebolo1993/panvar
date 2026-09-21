@@ -387,6 +387,10 @@ def plot_block_distance(blocks, out, normalized=False):
                     for part in body["bodies"]:
                         part.set_facecolor(ARM_COLOUR[arm])
                         part.set_alpha(0.18 if filled else 0.08)
+                    # Otherwise the median bars come out in matplotlib's default colour cycle, which
+                    # reads as a third data series that does not exist.
+                    body["cmedians"].set_color(ARM_COLOUR[arm])
+                    body["cmedians"].set_linewidth(1.0)
                 xs.extend([index + (0.0 if filled else 0.22)] * len(values))
                 ys.extend(values)
             axis.scatter(xs, ys, s=26,
@@ -476,29 +480,44 @@ def plot_paired(runs, tied, out):
                          "no_call", cell(None if consensus is None else int(consensus))])
     write_tsv(os.path.join(out, "plot_paired_k.tsv"), header, rows)
 
-    figure, axis = plt.subplots(figsize=(9, 6))
-    refused_y = 0.4   # a distinct band for refusals, so they cannot vanish from the figure
+    # A log axis cannot place distance 0. Clamping to a floor -- which is what this first did -- put
+    # every EXACT call at the same height as a nearly-exact one and directly beside the refusal band,
+    # so "exactly right", "slightly wrong" and "no call" all looked alike. symlog puts 0 on a real zero
+    # line, and refusals sit in a negative band that no distance can ever occupy, so the three outcomes
+    # cannot be confused with one another.
+    figure, axis = plt.subplots(figsize=(9.5, 6.5))
+    refused_band = -4.0
     for row in rows:
         k0 = number(row[3])
         if k0 is None:
             continue
-        start = max(k0, refused_y)
         if row[5] == "call":
-            end = max(number(row[4]), refused_y)
-            axis.plot([0, 1], [start, end], color="#4D4D4D", alpha=0.5, zorder=1)
-            axis.scatter([1], [end], color=ARM_COLOUR["K128"], s=32, zorder=3)
+            end = number(row[4])
+            axis.plot([0, 1], [k0, end], color="#4D4D4D", alpha=0.45, zorder=1)
+            axis.scatter([1], [end], color=ARM_COLOUR["K128"], s=34, zorder=3)
         else:
-            axis.plot([0, 1], [start, refused_y / 2], color="#B2182B", alpha=0.5,
+            axis.plot([0, 1], [k0, refused_band], color="#B2182B", alpha=0.45,
                       linestyle="--", zorder=1)
-            axis.scatter([1], [refused_y / 2], facecolors="none", edgecolors="#B2182B", s=46, zorder=3)
-        axis.scatter([0], [start], color=ARM_COLOUR["K0"], s=32, zorder=3)
-    axis.set_yscale("log")
+            axis.scatter([1], [refused_band], facecolors="none", edgecolors="#B2182B",
+                         s=52, linewidths=1.4, zorder=3)
+        axis.scatter([0], [k0], color=ARM_COLOUR["K0"], s=34, zorder=3)
+    axis.set_yscale("symlog", linthresh=1)
+    axis.axhline(0, color="#1A9850", linewidth=1.0, alpha=0.7)
+    axis.axhline(refused_band / 2, color="#999999", linewidth=0.8)
+    axis.set_xlim(-0.15, 1.38)
     axis.set_xticks([0, 1])
     axis.set_xticklabels(["K=0 (panel arm)", "K=128 (mosaic arm)"])
-    axis.axhline(refused_y, color="#999999", linewidth=0.8)
-    axis.text(1.02, refused_y / 2, "NO CALL\n(refused)", fontsize=8, color="#B2182B", va="center")
-    axis.set_ylabel("whole-locus phase-invariant distance (log; refusals in their own band)")
-    axis.set_title("Paired K=0 to K=128, same plan and coverage")
+    axis.text(1.04, 0, "exact (0)", fontsize=8, color="#1A9850", va="center")
+    axis.text(1.04, refused_band, "NO CALL\n(refused)", fontsize=8, color="#B2182B", va="center")
+    axis.set_ylabel("whole-locus phase-invariant distance (symlog; 0 drawn as 0)")
+    axis.set_title("Paired K=0 to K=128, same plan and coverage (refusals in their own band)")
+    handles = [
+        plt.Line2D([], [], marker="o", linestyle="", color=ARM_COLOUR["K0"], label="K=0 call"),
+        plt.Line2D([], [], marker="o", linestyle="", color=ARM_COLOUR["K128"], label="K=128 call"),
+        plt.Line2D([], [], marker="o", linestyle="", markerfacecolor="none",
+                   markeredgecolor="#B2182B", label="K=128 refused (not a call)"),
+    ]
+    axis.legend(handles=handles, fontsize=8, loc="upper right")
     axis.grid(alpha=0.25, axis="y")
     figure.tight_layout()
     figure.savefig(os.path.join(out, "plot_paired_k.png"), dpi=150)
