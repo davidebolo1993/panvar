@@ -1546,10 +1546,16 @@ int preflight(const Args& args) {
     const std::uint64_t max_beam_extensions = std::stoull(args.get("max-beam-extensions", "2000000000"));
     const std::string stage =
         (std::filesystem::temp_directory_path() / ("genotype_probe_preflight_" + std::to_string(::getpid()) + ".sorted.gfa")).string();
+    // Curation is part of the MODEL, not a reporting detail: curating two templates out changes the
+    // panel, the diplotype count and the fingerprint. Without it, preflight could only ever describe the
+    // uncurated graph, which is why the curated staged model could not be gated before a call existed.
+    const std::string curation_path = args.get("panel-curation", "");
+    const std::vector<std::string> curated =
+        curation_path.empty() ? std::vector<std::string>{} : read_panel_curation(curation_path);
     LoadedModel loaded;
     std::string model_refusal;
     try {
-        loaded = load_model(args.required("gfa"), reference, stage, min_variant_bp);
+        loaded = load_model(args.required("gfa"), reference, stage, min_variant_bp, curated);
     } catch (const std::exception& error) {
         model_refusal = error.what();
     }
@@ -1731,6 +1737,24 @@ int preflight(const Args& args) {
         << "locus\t" << model.locus_id() << "\nreference\t" << reference
         << "\ntemplates\t" << panel.template_count() << "\ndistinct_template_sequences\t" << distinct.size()
         << "\npanel_diplotypes\t" << panel_pairs
+        // Requested versus actually applied. A curated name that is not a graph path removes nothing,
+        // and a gate comparing only the requested count would not notice.
+        << "\npanel_curation\t" << (curation_path.empty() ? "none" : curation_path)
+        << "\npanel_curation_requested\t" << curated.size()
+        << "\ntemplates_curated_out\t"
+        << [&] {
+               std::size_t applied = 0;
+               for (const std::string& name : curated) {
+                   const bool in_graph =
+                       std::any_of(loaded.sorted.graph.paths.begin(), loaded.sorted.graph.paths.end(),
+                                   [&](const panvar::PathRecord& path) { return path.name == name; });
+                   const bool in_panel =
+                       std::find(panel.template_names.begin(), panel.template_names.end(), name) !=
+                       panel.template_names.end();
+                   if (in_graph && !in_panel) ++applied;
+               }
+               return applied;
+           }()
         << "\ntemplate_bp_min_mean_max\t" << (panel.template_count() ? min_bp : 0) << "," << mean_bp << "," << max_bp
         << "\nmodel_fingerprint\t" << loaded.fingerprint
         << "\npanel_round_trip\t" << round_trip << "\nrepresentation_independent\t" << representation

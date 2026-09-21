@@ -54,6 +54,22 @@
 #     is carried by at least one template of the curated panel. A truth whose alleles the panel cannot
 #     spell would measure representability, not genotyping.
 #
+# WHAT IS ACTUALLY HELD OUT, stated precisely so the result is not over-claimed.
+#
+# Held out: the mosaic PLANS (which donors recombine, where they switch, which homologues pair) and
+# every read simulated under them. None of that existed before this manifest was committed, and no
+# caller setting was selected on it.
+#
+# NOT held out: the donor sequences themselves. The 22 pool donors are C4 panel members, and their
+# haplotypes were already used as ordinary leave-zero-out cohort donors in earlier rounds. So this
+# measures generalisation to UNSEEN RECOMBINATIONS of seen sequences, not to unseen sequences. It cannot
+# support a claim about novel haplotypes, and a reader who wants that needs a different experiment.
+#
+# The panel_control plans use donor A's own two haplotypes as the diploid truth: with no switches on
+# either homologue, both come from donor A's panel rows, and donor B is drawn by the pairing rule but
+# contributes nothing. It is recorded in the plan row anyway so the row stays a product of the draw
+# rather than a special case, and so the control sits at the same place in the donor order as its class.
+#
 key	value
 reference	HG00096#1#haplotype1-0000024:31848049-32074186
 graph	tests/real_data/c4.gfa.gz
@@ -66,6 +82,22 @@ pool_size	22
 pairs_used	10
 unused_remainder	HG02554,HG00732
 min_variant_bp	50
+# Ordinary C4, for the model-equivalence gate. Staging two mosaic P lines renumbers nodes wholesale, so
+# the curated staged model must be SHOWN to still be ordinary C4 rather than assumed to be. These are the
+# constants the development experiment gates against, obtained from a plain-C4 run at commit 9f80baa. If
+# the graph, the bubble caller or the block decomposition changes, these change with them, and the gate
+# failing is the correct outcome rather than a nuisance to be edited away.
+plain_c4_model_fingerprint	d2b8c6c2e0b4079d
+plain_c4_panel_diplotypes	8515
+plain_c4_blocks	11
+plain_c4_variant_blocks	5
+plain_c4_context_blocks	6
+plain_c4_templates_curated_out	2
+# Completeness. Ten plans x four coverages is 40 shared scoring runs, each writing one status record per
+# K arm: 80 in all. The experiment FAILS on any missing run or output rather than reporting a rate over
+# whatever happened to succeed, which would silently change the denominator.
+expected_shared_runs	40
+expected_k_arm_status_records	80
 # Simulation. A NEW seed, so the held-out reads are not drawn from the development stream; salted per
 # plan, so no two plans share a random stream. The library is the frozen one, unchanged from the
 # development experiment, so a difference in results cannot be a difference in read model.
@@ -80,7 +112,7 @@ outlier_weight	0.001
 # subset of that one simulation (genotype_probe subsample keeps a paired fragment when a hash of its
 # name falls below the ratio), so coverage is not confounded with a fresh draw.
 source_coverage	30
-coverages	30,15,10,5
+coverages	30,10,5,2
 # Caller settings, frozen and NOT re-derived here: these are the production defaults selected by the
 # declared width-ladder and K-ladder rule on development data. This protocol consumes them; it does not
 # re-select them, and a held-out result may not be used to change them retroactively.
@@ -114,6 +146,19 @@ metric	phase_switch_blocks	eval.K<k>.summary.tsv	phase_switch_blocks
 metric	phased_distance_total	eval.K<k>.summary.tsv	phased_distance_total
 metric	runtime_seconds	runtime.tsv	wall_s
 metric	peak_rss_bytes	runtime.tsv	max_rss_bytes
+# Diagnostics, frozen with the metrics above and reported alongside them. These are NOT accuracy
+# measures and no threshold is declared on any of them: none has been calibrated on held-out data, and
+# inventing one after seeing results is the failure this freeze exists to prevent. They describe the
+# conditions a call was made under, so a later reader can tell a confident call from a marginal one.
+metric	per_block_gq	call.<cov>.K<k>.block_genotypes.tsv	conditional_GQ
+metric	minimum_gq	derived	min conditional_GQ over reportable blocks of the run
+metric	genotype_support	call.<cov>.K<k>.block_genotypes.tsv	genotype_support
+metric	block_candidate_scope	call.<cov>.K<k>.block_genotypes.tsv	candidate_scope
+metric	candidate_scope	call.<cov>.K<k>.mosaic_status.tsv	candidate_scope
+metric	final_candidate_scope	call.<cov>.K<k>.mosaic_status.tsv	final_candidate_scope
+metric	search_exhaustive	call.<cov>.K<k>.mosaic_status.tsv	proposal_search_exhaustive
+metric	separation_gap	call.<cov>.K<k>.mosaic_status.tsv	numeric_separation_gap
+metric	fragment_count	call.<cov>.K<k>.mosaic_scores.tsv	fragments_total
 #
 # OUTPUT SEPARATION, frozen with the metrics. Certified calls and conditional tied-winner block
 # concordance are reported as two tables and never merged. Concordance is a measurement of what the

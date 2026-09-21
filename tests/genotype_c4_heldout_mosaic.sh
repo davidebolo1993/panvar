@@ -6,10 +6,11 @@
 #
 # THE DEFAULT STAGES DO NOT SIMULATE, CALL OR EVALUATE ANYTHING. They are "manifest stage verify":
 # check that the committed plan table is what the declared draw rule produces, build the ten mosaic
-# truths, and prove each one is admissible. Simulation waits for review, and is reached only by asking
-# for it explicitly:
+# truths, and prove each one is admissible against the frozen ordinary-C4 model. Simulation waits for
+# review, and is reached only by asking for it explicitly:
 #
-#   STAGES="reads call eval concord trace" BUILD=<build> tests/genotype_c4_heldout_mosaic.sh <out-dir>
+#   STAGES="reads nested call complete eval concord trace" BUILD=<build> \
+#     tests/genotype_c4_heldout_mosaic.sh <out-dir>
 #
 # That split is the point of this harness. A protocol that can be half-run by accident is not frozen,
 # and the whole value of held-out data is that nothing touched it before the protocol was fixed.
@@ -20,11 +21,13 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+HARNESS="${BASH_SOURCE[0]}"
 MANIFEST="$REPO/tests/genotype_c4_heldout_mosaic_manifest.tsv"
 ORIENTATION="$REPO/tests/genotype_c4_template_orientation.tsv"
 PANEL_ALLELES="$REPO/tests/genotype_c4_panel_alleles.tsv"
 DONORS="$REPO/tests/genotype_development_donors.tsv"
 DRAW="$REPO/scripts/draw_heldout_mosaic_plans.py"
+GRAPH_GZ="$REPO/tests/real_data/c4.gfa.gz"
 
 setting() { awk -F'\t' -v key="$1" '$1==key{print $2; exit}' "$MANIFEST"; }
 plan_rows() { awk -F'\t' '$1=="plan" && $2!="name"' "$MANIFEST"; }
@@ -104,10 +107,32 @@ check_manifest() {
     echo "  FROZEN SETTINGS CHANGED: width=$width K=$k diagnostic=$diag audit=$audit"; bad=$((bad + 1))
   fi
 
-  # Every metric is declared before any result exists, and each names the file and key it comes from.
+  # Four coverages, nested from one simulation at the source coverage, and the source must be among them.
+  local covs ncov
+  covs="$(setting coverages)"; ncov="$(printf '%s' "$covs" | tr ',' '\n' | grep -c .)"
+  if [ "$ncov" = "4" ] && printf '%s' "$covs" | tr ',' '\n' | grep -qx "$(setting source_coverage)"; then
+    echo "  four coverages, source included: $covs"
+  else
+    echo "  COVERAGE SHAPE WRONG: $covs (source $(setting source_coverage))"; bad=$((bad + 1))
+  fi
+
+  # Completeness is declared here, not inferred later from whatever succeeded.
+  local plans_n want_runs want_status
+  plans_n="$(plan_rows | grep -c .)"
+  want_runs="$(setting expected_shared_runs)"; want_status="$(setting expected_k_arm_status_records)"
+  if [ "$want_runs" = "$((plans_n * ncov))" ] &&
+     [ "$want_status" = "$((plans_n * ncov * $(printf '%s' "$(setting call_prefixes)" | tr ',' '\n' | grep -c .)))" ]; then
+    echo "  completeness declared: $want_runs shared runs, $want_status K-arm status records"
+  else
+    echo "  COMPLETENESS DECLARATION INCONSISTENT: $want_runs runs / $want_status records for"
+    echo "    $plans_n plans x $ncov coverages x $(printf '%s' "$(setting call_prefixes)" | tr ',' '\n' | grep -c .) arms"
+    bad=$((bad + 1))
+  fi
+
+  # Every metric and diagnostic is declared before any result exists, each naming its source key.
   local metrics
   metrics="$(awk -F'\t' '$1=="metric"' "$MANIFEST" | wc -l | tr -d ' ')"
-  if [ "$metrics" -ge 20 ]; then echo "  $metrics metrics frozen, each naming its source key"
+  if [ "$metrics" -ge 30 ]; then echo "  $metrics metrics and diagnostics frozen, each naming its source key"
   else echo "  METRICS MISSING: only $metrics declared"; bad=$((bad + 1)); fi
 
   if [ "$bad" -ne 0 ]; then echo "manifest gate FAILED"; exit 1; fi
@@ -137,10 +162,13 @@ CALL_PREFIXES="$(setting call_prefixes)"
 DIAGNOSTIC_WIDTH="$(setting diagnostic_comparison_width)"
 PHASE_AUDIT="$(setting phase_audit_candidates)"
 TRACE_CANDIDATES="$(setting trace_candidates)"
+MIN_VARIANT_BP="$(setting min_variant_bp)"
+EXPECTED_RUNS="$(setting expected_shared_runs)"
+EXPECTED_STATUS="$(setting expected_k_arm_status_records)"
 
 mkdir -p "$OUT"
 C4="$OUT/c4.gfa"
-[ -f "$C4" ] || gzip -dc "$REPO/tests/real_data/c4.gfa.gz" > "$C4"
+[ -f "$C4" ] || gzip -dc "$GRAPH_GZ" > "$C4"
 CURATION="$OUT/mosaic_exclude.tsv"
 cat > "$CURATION" <<'EOF'
 # The two synthetic mosaics are removed from the PANEL, not from the file: reads are simulated from them
@@ -151,41 +179,129 @@ MOSAIC#1#synthetic:0-0
 MOSAIC#2#synthetic:0-0
 EOF
 
-# One signature over everything a call consumes, always recomputed from the files on disk. A stored
-# signature is only ever compared against, never trusted as a description of what is there now.
-input_bundle_signature() {
-  local d="$1" name="$2" cov="$3" f
-  for f in "$d/staged.gfa" "$d/cov$cov/reads_1.fq" "$d/cov$cov/reads_2.fq" "$d/cov$cov/library.txt"; do
-    [ -f "$f" ] || { printf 'MISSING:%s\n' "$(basename "$f")"; return 0; }
-  done
-  [ -f "$PROBE" ] || { printf 'MISSING:probe\n'; return 0; }
+# =====================================================================================================
+# Signatures.
+#
+# The old provenance file was written fresh on every invocation, so the record of what a result came
+# from was destroyed by the next run that touched the directory -- including a run with different
+# inputs. These are content-addressed instead: the signature IS the hash of the bound content, it is
+# written to a file named by that hash, and an existing file is never rewritten. A changed input
+# produces a different id and a new file beside the old one, so the history of what was run cannot be
+# overwritten, only added to.
+# =====================================================================================================
+
+content_sha() {
+  local file="$1"
+  [ -f "$file" ] || { printf 'MISSING:%s\n' "$(basename "$file")"; return 0; }
+  shasum -a 256 < "$file" | cut -d' ' -f1
+}
+
+# The caller settings a result depends on. A run at another width or K is a different experiment, and
+# must not be able to masquerade as this one.
+caller_settings_blob() {
+  printf 'cov=%s src=%s seed=%s len=%s ins=%s sd=%s sig=%s err=%s out=%s width=%s prefixes=%s audit=%s minvar=%s\n' \
+    "$1" "$SOURCE_COVERAGE" "$SEED" "$READ_LENGTH" "$INSERT_MEAN" "$INSERT_SD" "$SIGMAS" \
+    "$SUBSTITUTION_ERROR" "$OUTLIER_WEIGHT" "$STATE_LIMIT" "$CALL_PREFIXES" "$PHASE_AUDIT" "$MIN_VARIANT_BP"
+}
+
+# Everything a result at (plan, coverage) is conditional on, component by component. ALWAYS recomputed
+# from the files on disk: a stored signature is only ever compared against, never trusted as a
+# description of what is there now.
+experiment_signature() {
+  # Split deliberately. `local a="$1" d="$OUT/$a"` expands every assignment word BEFORE performing any
+  # of the assignments, so $a is still unset there and `set -u` aborts the whole run. None of these
+  # functions runs in the default stages, so the fault would have surfaced at the first simulated run.
+  local name="$1" cov="$2"
+  local d="$OUT/$name"
+  printf 'manifest\t%s\n' "$(content_sha "$MANIFEST")"
+  printf 'harness\t%s\n' "$(content_sha "$HARNESS")"
+  printf 'draw_script\t%s\n' "$(content_sha "$DRAW")"
+  printf 'orientation_table\t%s\n' "$(content_sha "$ORIENTATION")"
+  printf 'panel_allele_table\t%s\n' "$(content_sha "$PANEL_ALLELES")"
+  printf 'graph\t%s\n' "$(content_sha "$GRAPH_GZ")"
+  printf 'curation\t%s\n' "$(content_sha "$CURATION")"
+  printf 'plan_row\t%s\n' "$(plan_rows | awk -F'\t' -v n="$name" '$2==n' | shasum -a 256 | cut -d' ' -f1)"
+  printf 'staged_graph\t%s\n' "$(content_sha "$d/staged.gfa")"
+  printf 'staged_truth\t%s\n' "$(content_sha "$d/truth.tsv")"
+  printf 'reads_1\t%s\n' "$(content_sha "$d/cov$cov/reads_1.fq")"
+  printf 'reads_2\t%s\n' "$(content_sha "$d/cov$cov/reads_2.fq")"
+  printf 'library\t%s\n' "$(content_sha "$d/cov$cov/library.txt")"
+  printf 'binary\t%s\n' "$(content_sha "$PROBE")"
+  printf 'caller_settings\t%s\n' "$(caller_settings_blob "$cov" | shasum -a 256 | cut -d' ' -f1)"
+}
+
+experiment_signature_id() { experiment_signature "$1" "$2" | shasum -a 256 | cut -d' ' -f1; }
+
+# A signature naming a missing component can never equal a stored one, but saying so plainly beats
+# leaving the caller to notice that two opaque hashes differ.
+signature_incomplete() {
+  # Deliberately NOT `experiment_signature ... | grep -q`. Under `set -o pipefail` grep -q exits at the
+  # first match, the producer dies of SIGPIPE, and the pipeline reports 141 -- so a signature naming a
+  # MISSING component came back "complete" and the call stage's input-missing refusal never fired.
+  case "$(experiment_signature "$1" "$2")" in
+    *MISSING:*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+record_experiment_signature() {
+  local name="$1" cov="$2" components id file
+  components="$(experiment_signature "$name" "$cov")"
+  id="$(printf '%s\n' "$components" | shasum -a 256 | cut -d' ' -f1)"
+  mkdir -p "$OUT/signatures"
+  file="$OUT/signatures/$id.tsv"
+  if [ ! -f "$file" ]; then
+    {
+      printf 'key\tvalue\n'
+      printf 'signature_id\t%s\n' "$id"
+      printf 'plan\t%s\ncoverage\t%s\n' "$name" "$cov"
+      printf 'recorded_utc\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      printf 'git_commit\t%s\n' "$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)"
+      printf 'git_tree_dirty\t%s\n' "$(git -C "$REPO" status --porcelain 2>/dev/null | grep -q . && echo true || echo false)"
+      printf '%s\n' "$components"
+    } > "$file.tmp"
+    mv "$file.tmp" "$file"
+    # Advisory only -- it does not stop root or a -f removal, but it does stop the casual overwrite
+    # that destroyed the old provenance file.
+    chmod a-w "$file" 2>/dev/null || true
+    printf '%s\t%s\t%s\t%s\n' "$name" "$cov" "$id" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$OUT/signatures/index.tsv"
+  fi
+  printf '%s\n' "$id"
+}
+
+# The call signature binds the experiment signature to the outputs that call produced. eval, concord and
+# trace all verify it before reading anything: a changed read, curation file, caller setting or binary
+# moves the experiment signature, and a changed call output moves this one, and either refuses
+# interpretation rather than quietly reinterpreting one run's outputs against another run's inputs.
+call_signature() {
+  local name="$1" cov="$2" k
+  local d="$OUT/$name"
   {
-    shasum -a 256 < "$d/staged.gfa"
-    shasum -a 256 < "$d/cov$cov/reads_1.fq"
-    shasum -a 256 < "$d/cov$cov/reads_2.fq"
-    shasum -a 256 < "$d/cov$cov/library.txt"
-    shasum -a 256 < "$PROBE"
-    printf 'salt=%s seed=%s cov=%s src=%s len=%s ins=%s sd=%s sig=%s err=%s out=%s\n' \
-      "$name" "$SEED" "$cov" "$SOURCE_COVERAGE" "$READ_LENGTH" "$INSERT_MEAN" "$INSERT_SD" \
-      "$SIGMAS" "$SUBSTITUTION_ERROR" "$OUTLIER_WEIGHT"
+    printf 'experiment\t%s\n' "$(experiment_signature_id "$name" "$cov")"
+    for k in ${CALL_PREFIXES//,/ }; do
+      printf 'status_K%s\t%s\n' "$k" "$(content_sha "$d/call.$cov.K$k.mosaic_status.tsv")"
+      printf 'scores_K%s\t%s\n' "$k" "$(content_sha "$d/call.$cov.K$k.mosaic_scores.tsv")"
+      printf 'candidates_K%s\t%s\n' "$k" "$(content_sha "$d/call.$cov.K$k.mosaic_candidates.tsv")"
+      printf 'blocks_K%s\t%s\n' "$k" "$(content_sha "$d/call.$cov.K$k.block_genotypes.tsv")"
+    done
   } | shasum -a 256 | cut -d' ' -f1
 }
 
-{
-  printf 'key\tvalue\n'
-  printf 'git_commit\t%s\n' "$(git -C "$REPO" rev-parse HEAD)"
-  printf 'git_tree_dirty\t%s\n' "$(git -C "$REPO" status --porcelain | grep -q . && echo true || echo false)"
-  printf 'probe_sha256\t%s\n' "$([ -f "$PROBE" ] && shasum -a 256 "$PROBE" | cut -d' ' -f1 || echo MISSING)"
-  printf 'script_sha256\t%s\n' "$(shasum -a 256 "${BASH_SOURCE[0]}" | cut -d' ' -f1)"
-  printf 'manifest_sha256\t%s\n' "$(shasum -a 256 "$MANIFEST" | cut -d' ' -f1)"
-  printf 'draw_script_sha256\t%s\n' "$(shasum -a 256 "$DRAW" | cut -d' ' -f1)"
-  printf 'orientation_sha256\t%s\n' "$(shasum -a 256 "$ORIENTATION" | cut -d' ' -f1)"
-  printf 'panel_alleles_sha256\t%s\n' "$(shasum -a 256 "$PANEL_ALLELES" | cut -d' ' -f1)"
-  printf 'c4_gfa_sha256\t%s\n' "$(shasum -a 256 "$REPO/tests/real_data/c4.gfa.gz" | cut -d' ' -f1)"
-  printf 'curation_sha256\t%s\n' "$(shasum -a 256 "$CURATION" | cut -d' ' -f1)"
-  printf 'stages_run\t%s\n' "$STAGES"
-} > "$OUT/signature.tsv"
-echo "signature: $OUT/signature.tsv"
+require_call_signature() {
+  local name="$1" cov="$2" stored now
+  local d="$OUT/$name"
+  stored="$(cat "$d/call.$cov.signature" 2>/dev/null || true)"
+  if [ -z "$stored" ]; then
+    printf '  %-22s cov%-3s NO CALL SIGNATURE -- rerun the call stage\n' "$name" "$cov"; return 1
+  fi
+  now="$(call_signature "$name" "$cov")"
+  if [ "$now" != "$stored" ]; then
+    printf '  %-22s cov%-3s REFUSED: inputs or outputs changed since calling (%s -> %s)\n' \
+      "$name" "$cov" "$(printf '%s' "$stored" | cut -c1-12)" "$(printf '%s' "$now" | cut -c1-12)"
+    return 1
+  fi
+  return 0
+}
 
 if has_stage manifest; then check_manifest; fi
 
@@ -205,24 +321,18 @@ if has_stage stage; then
       --switches-hap1 "$hap1" --switches-hap2 "$hap2" \
       --swap-hap-b "$swap" --require-off-panel "$off_panel" \
       --out-gfa "$d/staged.gfa" --out "$d/truth.tsv" > "$d/stage.log" 2>&1
-    shasum -a 256 "$d/staged.gfa" | cut -d' ' -f1 > "$d/staged.gfa.sha"
     printf '  %-22s %-20s %s\n' "$name" "$class" "$(tail -1 "$d/stage.log")"
   done < <(plan_rows | tr '\t' '|')
 fi
 
-# ---- verify: is every staged truth admissible? ------------------------------------------------------
-# Everything here runs BEFORE any read exists, and refuses rather than reports. What it cannot check
-# yet is the full model-equivalence fingerprint: genotype_probe preflight takes no --panel-curation, so
-# the curated staged model cannot be built without a call. That gate therefore stays where the
-# development harness has it -- at the call stage, before any result is read -- and is NOT claimed here.
+# ---- verify: is every staged model admissible? ------------------------------------------------------
+# Everything here runs BEFORE any read exists, and refuses rather than reports.
 if has_stage verify; then
   echo "=== verify (no reads, no calls) ==="
   bad=0
 
   # 1. Staging added the two mosaic paths and NOTHING else. Each staged graph is the reference-sorted
   # C4 plus two P lines, so stripping those lines must leave every plan holding byte-identical graphs.
-  # A donor-dependent difference here would mean the model each plan is scored against is not the same
-  # model, which would make the ten results incomparable.
   base_sha=""; base_plan=""
   while IFS='|' read -r _ name _ _ _ _ _ _ _; do
     sha="$(grep -v $'^P\tMOSAIC#' "$OUT/$name/staged.gfa" | shasum -a 256 | cut -d' ' -f1)"
@@ -236,7 +346,40 @@ if has_stage verify; then
   done < <(plan_rows | tr '\t' '|')
   [ "$bad" -eq 0 ] && echo "  all plans: staged graph is one shared sorted C4 plus exactly two mosaic paths"
 
-  # 2. The declared off-panel requirement, and how many homologues actually are panel rows. mosaic-truth
+  # 2. THE MODEL-EQUIVALENCE GATE, before simulation. Adding two P lines renumbers nodes wholesale, so
+  # the curated staged model has to be SHOWN to still be ordinary C4. preflight now takes the curation
+  # manifest, so this runs with no reads and no call: it builds each staged model exactly as a run
+  # would, and compares fingerprint, panel diplotypes, block counts and the number of templates actually
+  # curated out against the frozen constants.
+  want_fp="$(setting plain_c4_model_fingerprint)"; want_dip="$(setting plain_c4_panel_diplotypes)"
+  want_blocks="$(setting plain_c4_blocks)"; want_vb="$(setting plain_c4_variant_blocks)"
+  want_cb="$(setting plain_c4_context_blocks)"; want_cur="$(setting plain_c4_templates_curated_out)"
+  while IFS='|' read -r _ name _ _ _ _ _ _ _; do
+    d="$OUT/$name"
+    "$PROBE" preflight --gfa "$d/staged.gfa" --reference "$REFERENCE" \
+      --panel-curation "$CURATION" --min-variant-bp "$MIN_VARIANT_BP" \
+      --state-limit "$STATE_LIMIT" --max-mosaic-candidates "${CALL_PREFIXES##*,}" \
+      --phase-audit-candidates "$PHASE_AUDIT" --out "$d/preflight.tsv" > "$d/preflight.log" 2>&1 || true
+    if [ ! -f "$d/preflight.tsv" ]; then
+      printf '  %-22s PREFLIGHT PRODUCED NOTHING: %s\n' "$name" "$(tail -1 "$d/preflight.log")"
+      bad=$((bad + 1)); continue
+    fi
+    p() { awk -F'\t' -v key="$1" '$1==key{print $2; exit}' "$d/preflight.tsv"; }
+    fp="$(p model_fingerprint)"; dip="$(p panel_diplotypes)"; blocks="$(p blocks)"
+    vb="$(p variant_blocks)"; cb="$(p context_blocks)"; cur="$(p templates_curated_out)"
+    if [ "$fp" = "$want_fp" ] && [ "$dip" = "$want_dip" ] && [ "$blocks" = "$want_blocks" ] &&
+       [ "$vb" = "$want_vb" ] && [ "$cb" = "$want_cb" ] && [ "$cur" = "$want_cur" ]; then
+      printf '  %-22s curated staged model IS ordinary C4: fp=%s diplotypes=%s blocks=%s/%s curated=%s\n' \
+        "$name" "$fp" "$dip" "$vb" "$cb" "$cur"
+    else
+      printf '  %-22s MODEL DIFFERS: fp=%s(want %s) dip=%s(want %s) blocks=%s(want %s) %s/%s(want %s/%s) curated=%s(want %s)\n' \
+        "$name" "$fp" "$want_fp" "$dip" "$want_dip" "$blocks" "$want_blocks" "$vb" "$cb" "$want_vb" "$want_cb" \
+        "$cur" "$want_cur"
+      bad=$((bad + 1))
+    fi
+  done < <(plan_rows | tr '\t' '|')
+
+  # 3. The declared off-panel requirement, and how many homologues actually are panel rows. mosaic-truth
   # refuses the violating cases itself; this asserts the EXACT count each class implies, which is
   # stricter than what the probe enforces and catches a class whose draw degenerated.
   while IFS='|' read -r _ name class _ _ _ _ _ off_panel; do
@@ -255,7 +398,7 @@ if has_stage verify; then
     fi
   done < <(plan_rows | tr '\t' '|')
 
-  # 3. Representability: every block allele of both truth haplotypes must be carried by at least one
+  # 4. Representability: every block allele of both truth haplotypes must be carried by at least one
   # template of the curated panel. Carrier counts come from mosaic-truth, which computed them over the
   # plain C4 panel -- the two MOSAIC paths are not in that model, so these counts are already the
   # curated-panel counts. A truth the panel cannot spell would measure representation, not genotyping.
@@ -274,7 +417,7 @@ if has_stage verify; then
   done < <(plan_rows | tr '\t' '|')
 
   if [ "$bad" -ne 0 ]; then echo "verify FAILED: $bad problem(s); nothing may be simulated"; exit 1; fi
-  echo "verify passed: every staged truth is admissible"
+  echo "verify passed: every staged model is ordinary C4 and every truth is admissible"
 fi
 
 # =====================================================================================================
@@ -282,7 +425,7 @@ fi
 # naming them in STAGES, after the protocol above has been reviewed.
 # =====================================================================================================
 
-# ---- reads: one simulation per plan, then NESTED subsets ---------------------------------------------
+# ---- reads: one simulation per plan, then NESTED subsets --------------------------------------------
 if has_stage reads; then
   echo "=== simulating reads (held-out data) ==="
   while IFS='|' read -r _ name _ _ _ _ _ _ _; do
@@ -301,32 +444,91 @@ if has_stage reads; then
         --source-coverage "$SOURCE_COVERAGE" --coverage "$cov" --name-salt "$name" \
         --out "$d/cov$cov" > "$d/subsample.$cov.log" 2>&1
     done
-    for cov in $COVERAGES; do input_bundle_signature "$d" "$name" "$cov" > "$d/cov$cov/bundle.sha"; done
+    for cov in $COVERAGES; do record_experiment_signature "$name" "$cov" > /dev/null; done
     printf '  %-22s %s fragments at %sx, nested to %s\n' "$name" \
       "$(awk -F'\t' '$1=="fragments_written"{print $2}' "$d/cov$SOURCE_COVERAGE/simulation.tsv")" \
       "$SOURCE_COVERAGE" "$(echo $COVERAGES | tr ' ' ',')"
   done < <(plan_rows | tr '\t' '|')
 fi
 
-check_binding() {
-  local d="$1" name="$2" cov="$3" now stored
-  now="$(input_bundle_signature "$d" "$name" "$cov")"
-  case "$now" in MISSING:*) printf '  %-22s INPUT MISSING (%s)\n' "$name" "$now"; return 1 ;; esac
-  stored="$(cat "$d/cov$cov/bundle.sha" 2>/dev/null || true)"
-  [ -n "$stored" ] || { printf '  %-22s NO INPUT SIGNATURE\n' "$name"; return 1; }
-  [ "$now" = "$stored" ] || { printf '  %-22s INPUTS CHANGED since simulation\n' "$name"; return 1; }
-  return 0
-}
+# ---- nested: prove the subsets really are nested, by read identity ----------------------------------
+# The subsampler's nesting is a property of its selector, and the selector is tested on stubs elsewhere.
+# This checks the ACTUAL read files this experiment will score: mates in step, and every fragment kept
+# at a coverage kept at every higher one. A broken nested subset would make a coverage comparison a
+# comparison of two different draws, which is exactly the confound the nesting exists to remove.
+if has_stage nested; then
+  echo "=== post-subsampling gate: mate synchronisation and nesting ==="
+  nested_bad=0
+  while IFS='|' read -r _ name _ _ _ _ _ _ _; do
+    if ! python3 - "$OUT/$name" "$name" "$COVERAGES" <<'PY'
+import sys
+d, name, covs = sys.argv[1], sys.argv[2], sys.argv[3].split()
+covs = sorted((int(c) for c in covs))
 
-# ---- call: one shared exact-scoring pass per plan and coverage ---------------------------------------
+def names(path):
+    out = []
+    with open(path) as handle:
+        for index, line in enumerate(handle):
+            if index % 4 == 0:
+                label = line[1:].strip()
+                out.append(label.rsplit("/", 1)[0] if "/" in label else label)
+    return out
+
+problems = []
+kept = {}
+for cov in covs:
+    first, second = names(f"{d}/cov{cov}/reads_1.fq"), names(f"{d}/cov{cov}/reads_2.fq")
+    if len(first) != len(second):
+        problems.append(f"cov{cov}: {len(first)} vs {len(second)} records -- mates out of step")
+        continue
+    mismatched = [i for i, (a, b) in enumerate(zip(first, second)) if a != b]
+    if mismatched:
+        problems.append(f"cov{cov}: {len(mismatched)} mate pairs disagree, first at record {mismatched[0]}")
+    if len(set(first)) != len(first):
+        problems.append(f"cov{cov}: duplicate fragment names")
+    kept[cov] = set(first)
+
+for lower, higher in zip(covs, covs[1:]):
+    if lower in kept and higher in kept:
+        escaped = kept[lower] - kept[higher]
+        if escaped:
+            problems.append(f"{lower}x is NOT a subset of {higher}x: {len(escaped)} fragments escaped")
+
+if problems:
+    print(f"  {name:<22} NESTING BROKEN")
+    for problem in problems:
+        print(f"    {problem}")
+    raise SystemExit(1)
+chain = " subset of ".join(f"{c}x({len(kept[c])})" for c in covs)
+print(f"  {name:<22} mates in step; {chain}")
+PY
+    then nested_bad=$((nested_bad + 1)); fi
+  done < <(plan_rows | tr '\t' '|')
+  if [ "$nested_bad" -ne 0 ]; then
+    echo "post-subsampling gate FAILED on $nested_bad plan(s); no coverage comparison is interpretable"
+    exit 1
+  fi
+  echo "post-subsampling gate passed"
+fi
+
+# ---- call: one shared exact-scoring pass per plan and coverage --------------------------------------
 if has_stage call; then
   echo "=== calling (staged graph, mosaics curated out) ==="
-  : > "$OUT/runtime.tsv"; printf 'plan\tcoverage\twall_s\tmax_rss_bytes\n' > "$OUT/runtime.tsv"
+  printf 'plan\tcoverage\twall_s\tmax_rss_bytes\n' > "$OUT/runtime.tsv"
   if /usr/bin/time -l true >/dev/null 2>&1; then TIME_FLAG="-l"; else TIME_FLAG="-v"; fi
+  call_bad=0
   while IFS='|' read -r _ name _ _ _ _ _ _ _; do
     d="$OUT/$name"
     for cov in $COVERAGES; do
-      check_binding "$d" "$name" "$cov" || continue
+      if signature_incomplete "$name" "$cov"; then
+        printf '  %-22s cov%-3s INPUT MISSING -- rerun the reads stage\n' "$name" "$cov"
+        call_bad=$((call_bad + 1)); continue
+      fi
+      # The inputs must still be what they were when the signature was recorded.
+      if [ ! -f "$OUT/signatures/$(experiment_signature_id "$name" "$cov").tsv" ]; then
+        printf '  %-22s cov%-3s INPUTS CHANGED since simulation -- no recorded signature matches\n' "$name" "$cov"
+        call_bad=$((call_bad + 1)); continue
+      fi
       rm -f "$d"/pending.*
       /usr/bin/time $TIME_FLAG -o "$d/time.$cov" \
         "$PROBE" genotype --gfa "$d/staged.gfa" --reference "$REFERENCE" \
@@ -336,11 +538,13 @@ if has_stage call; then
           --threads 2 --panel-curation "$CURATION" > "$d/pending.log" 2>&1 || true
       if [ ! -f "$d/pending.K0.mosaic_status.tsv" ]; then
         printf '  %-22s cov%-3s NO PER-K STATUS; previous outputs untouched\n' "$name" "$cov"
-        rm -f "$d"/pending.*; continue
+        rm -f "$d"/pending.*; call_bad=$((call_bad + 1)); continue
       fi
       rm -f "$d"/call.$cov.*
       for f in "$d"/pending.*; do mv "$f" "$d/call.$cov.${f##*/pending.}"; done
-      input_bundle_signature "$d" "$name" "$cov" > "$d/call.$cov.bundle.sha"
+      # Written only after publication, and never on the failure path: last run's outputs must never sit
+      # beside a signature claiming they match the current inputs.
+      call_signature "$name" "$cov" > "$d/call.$cov.signature"
       if [ "$TIME_FLAG" = "-l" ]; then
         w="$(awk '/ real /{print $1; exit}' "$d/time.$cov")"
         r="$(awk '/maximum resident set size/{print $1}' "$d/time.$cov")"
@@ -353,32 +557,88 @@ if has_stage call; then
         "$(awk -F'\t' '$1=="status"{print $2}' "$d/call.$cov.K0.mosaic_status.tsv")"
     done
   done < <(plan_rows | tr '\t' '|')
+  [ "$call_bad" -eq 0 ] || { echo "call stage FAILED on $call_bad run(s)"; exit 1; }
+fi
+
+# ---- complete: every declared run and output exists -------------------------------------------------
+# A rate computed over whatever happened to succeed has a denominator nobody declared. The experiment
+# fails on a missing run or output instead.
+if has_stage complete; then
+  echo "=== completeness gate ==="
+  runs=0; records=0; missing=0
+  while IFS='|' read -r _ name _ _ _ _ _ _ _; do
+    d="$OUT/$name"
+    for cov in $COVERAGES; do
+      if [ -f "$d/call.$cov.signature" ]; then runs=$((runs + 1)); else
+        printf '  %-22s cov%-3s MISSING RUN (no call signature)\n' "$name" "$cov"; missing=$((missing + 1))
+      fi
+      for k in ${CALL_PREFIXES//,/ }; do
+        for suffix in mosaic_status.tsv mosaic_scores.tsv mosaic_candidates.tsv block_genotypes.tsv; do
+          f="$d/call.$cov.K$k.$suffix"
+          if [ -f "$f" ]; then
+            [ "$suffix" = "mosaic_status.tsv" ] && records=$((records + 1))
+          else
+            printf '  %-22s cov%-3s K%-3s MISSING OUTPUT %s\n' "$name" "$cov" "$k" "$suffix"
+            missing=$((missing + 1))
+          fi
+        done
+      done
+    done
+  done < <(plan_rows | tr '\t' '|')
+  printf '  %s shared runs (want %s), %s K-arm status records (want %s), %s missing output(s)\n' \
+    "$runs" "$EXPECTED_RUNS" "$records" "$EXPECTED_STATUS" "$missing"
+  if [ "$runs" != "$EXPECTED_RUNS" ] || [ "$records" != "$EXPECTED_STATUS" ] || [ "$missing" -ne 0 ]; then
+    echo "completeness gate FAILED: the experiment is incomplete and no rate over it is interpretable"
+    exit 1
+  fi
+  echo "completeness gate passed"
 fi
 
 # ---- eval: accuracy against a truth the caller never saw --------------------------------------------
 if has_stage eval; then
   echo "=== CERTIFIED CALLS: accuracy against truth ==="
-  printf '%-22s %-4s %-2s %-18s %-7s %-7s %-9s %-12s %s\n' \
+  printf 'plan\tcoverage\tK\tmin_gq\tblocks_reportable\tgenotype_support\tcandidate_scope\tfinal_candidate_scope\tsearch_exhaustive\tseparation_gap\tfragments_total\n' \
+    > "$OUT/diagnostics.tsv"
+  printf '%-22s %-4s %-4s %-18s %-7s %-7s %-9s %-12s %s\n' \
     plan cov K status exact dist truth_rank phase uniq_hap
+  eval_bad=0
   while IFS='|' read -r _ name _ _ _ _ _ _ _; do
     d="$OUT/$name"
     for cov in $COVERAGES; do
+      require_call_signature "$name" "$cov" || { eval_bad=$((eval_bad + 1)); continue; }
       for k in ${CALL_PREFIXES//,/ }; do
-        s="$d/call.$cov.K$k.mosaic_status.tsv"; [ -f "$s" ] || continue
+        s="$d/call.$cov.K$k.mosaic_status.tsv"
+        b="$d/call.$cov.K$k.block_genotypes.tsv"
+        sc="$d/call.$cov.K$k.mosaic_scores.tsv"
         "$PROBE" evaluate --run-prefix "$d/call.$cov.K$k" --out "$d/eval.$cov.K$k" \
           --scheme "c4-heldout-$name-cov$cov-K$k" --donor MOSAIC --reference "$REFERENCE" \
           --model-gfa "$d/staged.gfa" --truth-gfa "$d/staged.gfa" \
           --panel-curation "$CURATION" > "$d/eval.$cov.K$k.log" 2>&1 || true
         e="$d/eval.$cov.K$k.summary.tsv"
         get() { awk -F'\t' -v key="$1" '$1==key{print $2; exit}' "$2" 2>/dev/null; }
+        col() { awk -F'\t' -v want="$1" 'NR==1{for(i=1;i<=NF;i++) if($i==want) c=i; next} c{print $c}' "$2" 2>/dev/null; }
         fa=no; [ -f "$d/call.$cov.K$k.mosaic_haplotypes.fa" ] && fa=yes
-        printf '%-22s %-4s %-2s %-18s %-7s %-7s %-9s %-12s %s\n' \
+        printf '%-22s %-4s %-4s %-18s %-7s %-7s %-9s %-12s %s\n' \
           "$name" "$cov" "$k" "$(get status "$s")" "$(get blocks_exact "$e")" \
           "$(get unordered_distance_total "$e")" "$(get truth_fragment_score_rank "$e")" \
           "$(get phase_support "$s")" "$fa"
+        # Diagnostics, exactly as frozen in the manifest: reported beside the accuracy above, never
+        # merged into it, and with no threshold applied to any of them.
+        min_gq="$(paste <(col reportable "$b") <(col conditional_GQ "$b") |
+                  awk -F'\t' '$1=="true"{ if (n=="" || $2+0 < n+0) n=$2 } END{print (n==""?"NA":n)}')"
+        reportable="$(col reportable "$b" | grep -c '^true$' || true)"
+        support="$(col genotype_support "$b" | sort | uniq -c | awk '{printf "%s%s:%s", (NR>1?",":""), $2, $1}')"
+        frags="$(col fragments_total "$sc" | head -1)"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+          "$name" "$cov" "$k" "${min_gq:-NA}" "${reportable:-0}" "${support:-NA}" \
+          "$(get candidate_scope "$s")" "$(get final_candidate_scope "$s")" \
+          "$(get proposal_search_exhaustive "$s")" "$(get numeric_separation_gap "$s")" \
+          "${frags:-NA}" >> "$OUT/diagnostics.tsv"
       done
     done
   done < <(plan_rows | tr '\t' '|')
+  [ "$eval_bad" -eq 0 ] || { echo "eval FAILED: $eval_bad run(s) refused interpretation"; exit 1; }
+  echo "diagnostics: $OUT/diagnostics.tsv"
 fi
 
 # ---- concord: CONDITIONAL tied-winner block concordance ---------------------------------------------
@@ -388,11 +648,12 @@ fi
 # consensus, so on C4 this stays a diagnostic.
 if has_stage concord; then
   echo "=== CONDITIONAL (NOT CALLS): tied-winner block concordance ==="
+  concord_bad=0
   while IFS='|' read -r _ name _ _ _ _ _ _ _; do
     d="$OUT/$name"
     for cov in $COVERAGES; do
+      require_call_signature "$name" "$cov" || { concord_bad=$((concord_bad + 1)); continue; }
       for k in ${CALL_PREFIXES//,/ }; do
-        [ -f "$d/call.$cov.K$k.mosaic_scores.tsv" ] || continue
         python3 - "$d" "$name" "$cov" "$k" <<'PY'
 import csv, os, sys
 d, name, cov, k = sys.argv[1:5]
@@ -415,14 +676,17 @@ PY
       done
     done
   done < <(plan_rows | tr '\t' '|')
+  [ "$concord_bad" -eq 0 ] || { echo "concord FAILED: $concord_bad run(s) refused interpretation"; exit 1; }
 fi
 
-# ---- trace: proposal-only diagnostic, at the frozen width and the comparison width -------------------
+# ---- trace: proposal-only diagnostic, at the frozen width and the comparison width ------------------
 if has_stage trace; then
   echo "=== proposal-only trace ==="
   printf '%-22s %-6s %-14s %-12s %s\n' plan width truth_in_beam full_beam_rank first_loss
+  trace_bad=0
   while IFS='|' read -r _ name _ _ _ _ _ _ _; do
     d="$OUT/$name"
+    require_call_signature "$name" "$SOURCE_COVERAGE" || { trace_bad=$((trace_bad + 1)); continue; }
     for width in "$STATE_LIMIT" "$DIAGNOSTIC_WIDTH"; do
       "$PROBE" trace --gfa "$d/staged.gfa" --reference "$REFERENCE" --donor MOSAIC \
         --truth-gfa "$d/staged.gfa" --panel-curation "$CURATION" --grouped 1 \
@@ -437,6 +701,7 @@ if has_stage trace; then
         "$(awk -F'\t' '$1=="first_block_truth_not_retained"{print $2}' "$f" 2>/dev/null)"
     done
   done < <(plan_rows | tr '\t' '|')
+  [ "$trace_bad" -eq 0 ] || { echo "trace FAILED: $trace_bad plan(s) refused interpretation"; exit 1; }
 fi
 
 echo "done: $OUT"

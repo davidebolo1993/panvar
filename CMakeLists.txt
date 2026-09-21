@@ -299,6 +299,12 @@ if(PANVAR_BUILD_TESTING)
         add_test(NAME panvar_genotype_heldout_mosaic_manifest
                  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_c4_heldout_mosaic.sh
                          --check-manifest)
+        # The held-out harness's refusal machinery: a stale read, a changed caller setting, curation or
+        # binary, a broken nested subset and a missing arm output must each refuse interpretation rather
+        # than be interpreted. Runs on stub files in seconds; it does NOT run the ten-plan experiment.
+        add_test(NAME panvar_genotype_heldout_binding
+                 COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_heldout_binding.sh
+                         ${CMAKE_CURRENT_BINARY_DIR}/genotype_heldout_binding)
         # Nested lower-coverage read sets: every fragment kept at a coverage is kept at every higher one.
         add_test(NAME panvar_genotype_subsample_nested
                  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_subsample_nested.sh
