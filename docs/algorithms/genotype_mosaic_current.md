@@ -407,11 +407,21 @@ the proposer's own predicted peak is 3.6 MB at width 256 -- 1.4% of the 256 MiB 
 ## Ordered next work
 
 1. Sol's review of this stop point.
-2. Beam diversity: select distinct diplotype prefixes so one prefix cannot crowd the layer.
-3. Decided: block consensus never applies to a K-truncated prefix; the full-beam audit supplies the exact
+2. **Resolved, not pending: beam crowding.** The grouped-prefix proposer made the allele-prefix PAIR the
+   unit of retention, so a single diplotype prefix can no longer occupy a layer through many
+   template-level states that all spell it. It carries every template attribution exactly, costs less,
+   and retained every development truth at every layer down to width 256. Distinct-prefix (prefix-first)
+   selection was the first answer to the same problem and is retired. Nothing about beam diversity
+   remains open; what remains open is the pruned search, item 4.
+3. Held-out synthetic-mosaic validation on C4. The protocol is frozen before any of it runs:
+   `tests/genotype_c4_heldout_mosaic_manifest.tsv` fixes the donor draw, the mosaic classes, the
+   simulation settings and the evaluation metrics, and `tests/genotype_c4_heldout_mosaic.sh` drives it.
+   **Nothing has been simulated, called or evaluated under it.**
+4. Decided: block consensus never applies to a K-truncated prefix; the full-beam audit supplies the exact
    scores instead. What remains open is the pruned-search case, which no downstream change can fix.
-4. Lower-complexity placement, required before any 30x large-locus run or cohort.
-5. Reverse-orientation splicing, to widen the synthetic-mosaic donor pool.
+5. Lower-complexity placement, required before any 30x large-locus run or cohort.
+6. Reverse-orientation splicing, to widen the synthetic-mosaic donor pool. Until it exists the held-out
+   draw can only consider donors that are forward on both haplotypes, which is what bounds its pool.
 
 ## Provenance
 

@@ -1826,6 +1826,95 @@ int anchors(const Args& args) {
 }
 
 // ------------------------------------------------------------------------------------------------
+// orientations: which templates the chain can splice, before any donor is drawn
+// ------------------------------------------------------------------------------------------------
+
+// mosaic-truth refuses to splice a reverse-oriented walk against a forward one, so a donor can source a
+// synthetic mosaic only when BOTH of its panel rows are forward. That decides which donors a held-out
+// draw may even consider, and it has to be known BEFORE the draw rather than discovered when staging
+// throws -- a draw that silently skipped its refusals would no longer be the rule it claims to be.
+//
+// respell already computes this, but emits a row only for templates whose round trip FAILS, and on C4
+// none do: it reports 131 templates, 0 failing, and not one orientation. So it cannot answer the
+// question at all. This reports every template, and nothing else.
+int orientations(const Args& args) {
+    const std::string reference = args.required("reference");
+    const std::size_t min_variant_bp = std::stoul(args.get("min-variant-bp", "50"));
+    const std::string stage =
+        (std::filesystem::temp_directory_path() /
+         ("genotype_probe_orient_" + std::to_string(::getpid()) + ".sorted.gfa")).string();
+    const LoadedModel loaded = load_model(args.required("gfa"), reference, stage, min_variant_bp);
+    std::filesystem::remove(stage);
+    const panvar::PanelAlleleMatrix& panel = loaded.model->panel();
+
+    std::ostringstream out;
+    out << "template\torientation\n";
+    std::size_t forward = 0;
+    for (std::size_t t = 0; t < panel.template_count(); ++t) {
+        const bool is_forward =
+            loaded.model->template_source_orientations()[t] == panvar::ChainOrientation::Forward;
+        if (is_forward) ++forward;
+        out << panel.template_names[t] << '\t' << (is_forward ? "forward" : "reverse") << '\n';
+    }
+    out << "#templates\t" << panel.template_count() << "\n#forward\t" << forward << "\n#reverse\t"
+        << panel.template_count() - forward << '\n';
+    if (args.get("out", "").empty()) {
+        std::cout << out.str();
+    } else {
+        std::ofstream file(args.get("out", ""));
+        file << out.str();
+    }
+    std::cout << "orientations: " << forward << " forward, " << panel.template_count() - forward
+              << " reverse, of " << panel.template_count() << " templates\n";
+    return 0;
+}
+
+// ------------------------------------------------------------------------------------------------
+// panel-alleles: the panel allele matrix, so a draw can tell an off-panel plan from a collapsed one
+// ------------------------------------------------------------------------------------------------
+
+// A switch point next to a chain end takes only a block or two from donor A, and if donor B's row
+// carries the same alleles there, the "mosaic" IS donor B's row: mosaic-truth then refuses it, rightly,
+// as an answer reachable without recombining. Whether that happens is a property of the DATA, not of
+// the donor names, so a draw over names alone cannot avoid it and will keep proposing plans that refuse.
+//
+// This dumps the one array the refusal is computed from -- panel().template_alleles -- so the draw can
+// apply exactly the same test before it commits a plan, rather than discovering it at staging time.
+// Frozen alongside the orientation census, for the same reason: a rule that needs the model to be
+// rebuilt before it can be checked is not a rule anyone can check.
+int panel_alleles(const Args& args) {
+    const std::string reference = args.required("reference");
+    const std::size_t min_variant_bp = std::stoul(args.get("min-variant-bp", "50"));
+    const std::string stage =
+        (std::filesystem::temp_directory_path() /
+         ("genotype_probe_alleles_" + std::to_string(::getpid()) + ".sorted.gfa")).string();
+    const LoadedModel loaded = load_model(args.required("gfa"), reference, stage, min_variant_bp);
+    std::filesystem::remove(stage);
+    const panvar::PanelAlleleMatrix& panel = loaded.model->panel();
+
+    std::ostringstream out;
+    out << "template\talleles\n";
+    for (std::size_t t = 0; t < panel.template_count(); ++t) {
+        out << panel.template_names[t] << '\t';
+        for (std::size_t b = 0; b < panel.template_alleles[t].size(); ++b) {
+            out << (b ? "," : "") << panel.template_alleles[t][b];
+        }
+        out << '\n';
+    }
+    out << "#templates\t" << panel.template_count() << "\n#blocks\t"
+        << loaded.model->blocks().size() << '\n';
+    if (args.get("out", "").empty()) {
+        std::cout << out.str();
+    } else {
+        std::ofstream file(args.get("out", ""));
+        file << out.str();
+    }
+    std::cout << "panel-alleles: " << panel.template_count() << " templates over "
+              << loaded.model->blocks().size() << " blocks\n";
+    return 0;
+}
+
+// ------------------------------------------------------------------------------------------------
 // mosaic-truth: build a synthetic mosaic donor whose haplotypes are in no panel row
 // ------------------------------------------------------------------------------------------------
 
@@ -1882,52 +1971,102 @@ int mosaic_truth(const Args& args) {
         }
     }
 
-    // Switch plan: which donor supplies each block. "every" alternates at every block; otherwise a
-    // comma-separated list of block indices at which the source flips.
+    // Which of donor B's rows pairs with donor A's row h. Drawing this bit varies the donor/HAPLOTYPE
+    // combination rather than only the switch points, so two plans over the same two donors need not
+    // recombine the same two pairs of haplotypes.
+    const bool swap_hap_b = args.get("swap-hap-b", "0") == "1";
+    const auto row_of = [&](std::size_t h, int donor) {
+        return donor == 0 ? rows_a[h] : rows_b[swap_hap_b ? 1 - h : h];
+    };
+
+    // Switch plan, PER HOMOLOGUE: which donor supplies each block of each haplotype. "every" alternates
+    // at every block; a comma-separated list names the block indices at which the source flips; empty
+    // leaves that homologue as donor A's row, unswitched. --switches sets both homologues together,
+    // which is what the five development plans used and keeps them byte-identical; --switches-hap1 and
+    // --switches-hap2 set them independently. The lockstep form cannot express a mosaic on one homologue
+    // beside an intact one, which is a class the held-out protocol freezes, so it is not a convenience.
     const std::string spec = args.get("switches", "");
-    std::vector<int> donor_of_block(blocks, 0);
-    if (spec == "every") {
-        for (std::size_t b = 0; b < blocks; ++b) donor_of_block[b] = static_cast<int>(b % 2);
-    } else {
-        std::set<std::size_t> flips;
-        std::stringstream ss(spec);
-        std::string token;
-        while (std::getline(ss, token, ',')) {
-            if (!token.empty()) flips.insert(std::stoul(token));
-        }
-        if (flips.empty()) throw std::runtime_error("--switches must name at least one block, or 'every'");
-        int current = 0;
-        for (std::size_t b = 0; b < blocks; ++b) {
-            if (flips.count(b) != 0) current = 1 - current;
-            donor_of_block[b] = current;
+    const std::string spec_of_hap[2] = {args.get("switches-hap1", spec), args.get("switches-hap2", spec)};
+    std::vector<std::vector<int>> donor_of_block(2, std::vector<int>(blocks, 0));
+    for (std::size_t h = 0; h < 2; ++h) {
+        const std::string& hap_spec = spec_of_hap[h];
+        if (hap_spec == "every") {
+            for (std::size_t b = 0; b < blocks; ++b) donor_of_block[h][b] = static_cast<int>(b % 2);
+        } else if (!hap_spec.empty()) {
+            std::set<std::size_t> flips;
+            std::stringstream ss(hap_spec);
+            std::string token;
+            while (std::getline(ss, token, ',')) {
+                if (!token.empty()) flips.insert(std::stoul(token));
+            }
+            if (flips.empty()) {
+                throw std::runtime_error("a switch spec must name block indices, or 'every', or be empty");
+            }
+            if (*flips.rbegin() >= blocks) {
+                throw std::runtime_error("switch spec names block " + std::to_string(*flips.rbegin()) +
+                                         " but the chain has " + std::to_string(blocks) + " blocks");
+            }
+            int current = 0;
+            for (std::size_t b = 0; b < blocks; ++b) {
+                if (flips.count(b) != 0) current = 1 - current;
+                donor_of_block[h][b] = current;
+            }
         }
     }
-    const std::size_t switches = [&] {
-        std::size_t n = 0;
-        for (std::size_t b = 1; b < blocks; ++b) n += donor_of_block[b] != donor_of_block[b - 1];
-        return n;
-    }();
-    if (switches == 0) throw std::runtime_error("the plan produces no switch: that is not a mosaic");
+    std::size_t switches_of_hap[2] = {0, 0};
+    for (std::size_t h = 0; h < 2; ++h) {
+        for (std::size_t b = 1; b < blocks; ++b) {
+            switches_of_hap[h] += donor_of_block[h][b] != donor_of_block[h][b - 1];
+        }
+    }
+    const std::size_t switches = switches_of_hap[0] + switches_of_hap[1];
+
+    // How much of this diplotype the plan DECLARES to be off-panel, checked rather than assumed.
+    // "both" is the five development plans' guarantee and stays the default: neither homologue is a
+    // panel row. "one" is a switched homologue beside an intact one -- the diplotype is still off-panel,
+    // because a panel diplotype is a pair of panel rows and one of these is not, so the correct answer
+    // is still unreachable without recombining. "none" is the unchanged panel-haplotype control, which
+    // is not a mosaic at all; it is declared, and then required to really be one, rather than being
+    // quietly exempted from the check.
+    const std::string require_off_panel = args.get("require-off-panel", "both");
+    if (require_off_panel != "both" && require_off_panel != "one" && require_off_panel != "none") {
+        throw std::runtime_error("--require-off-panel must be both, one or none");
+    }
+    if (switches == 0 && require_off_panel != "none") {
+        throw std::runtime_error("the plan switches neither homologue: that is not a mosaic");
+    }
 
     // Route one: the allele path, and the truth it defines.
     std::vector<panvar::MosaicPath> mosaic_paths(2);
     for (std::size_t h = 0; h < 2; ++h) {
         mosaic_paths[h].alleles.resize(blocks);
         for (std::size_t b = 0; b < blocks; ++b) {
-            const std::size_t row = donor_of_block[b] == 0 ? rows_a[h] : rows_b[h];
-            mosaic_paths[h].alleles[b] = model.panel().template_alleles[row][b];
+            mosaic_paths[h].alleles[b] =
+                model.panel().template_alleles[row_of(h, donor_of_block[h][b])][b];
         }
     }
-    // Neither mosaic may coincide with a panel row: if it does, the correct answer is reachable without
-    // recombining and the experiment tests nothing it claims to.
+    // Which homologues coincide with a panel row, against what the plan declared.
+    std::size_t on_panel = 0;
+    std::string on_panel_names;
     for (std::size_t h = 0; h < 2; ++h) {
         for (std::size_t r = 0; r < model.panel().template_count(); ++r) {
             if (model.panel().template_alleles[r] == mosaic_paths[h].alleles) {
-                throw std::runtime_error("mosaic haplotype " + std::to_string(h + 1) +
-                                         " is exactly panel row " + model.panel().template_names[r] +
-                                         "; choose different donors or switch points");
+                ++on_panel;
+                if (!on_panel_names.empty()) on_panel_names += ",";
+                on_panel_names += "hap" + std::to_string(h + 1) + "=" + model.panel().template_names[r];
+                break;
             }
         }
+    }
+    if ((require_off_panel == "both" && on_panel != 0) || (require_off_panel == "one" && on_panel == 2)) {
+        throw std::runtime_error("--require-off-panel " + require_off_panel + ", but " +
+                                 std::to_string(on_panel) + " homologue(s) are exactly panel rows (" +
+                                 on_panel_names + "): the correct answer is reachable without recombining");
+    }
+    if (require_off_panel == "none" && on_panel != 2) {
+        throw std::runtime_error("--require-off-panel none declares an unchanged panel-haplotype control, "
+                                 "but only " + std::to_string(on_panel) +
+                                 " of 2 homologues are panel rows; that is not a control");
     }
 
     // Route two: splice the node walks, block by block, at the boundary nodes every template shares.
@@ -1949,7 +2088,7 @@ int mosaic_truth(const Args& args) {
     std::vector<std::vector<panvar::PathStep>> walks(2);
     for (std::size_t h = 0; h < 2; ++h) {
         for (std::size_t b = 0; b < blocks; ++b) {
-            const std::size_t row = donor_of_block[b] == 0 ? rows_a[h] : rows_b[h];
+            const std::size_t row = row_of(h, donor_of_block[h][b]);
             const panvar::PathRecord& path = *path_named(model.panel().template_names[row]);
             const std::string& source = loaded.built.report.blocks[b].source_node;
             const std::string& sink = loaded.built.report.blocks[b].sink_node;
@@ -2025,7 +2164,9 @@ int mosaic_truth(const Args& args) {
         for (std::size_t h = 0; h < 2; ++h) {
             truth << '\t' << block.alleles[mosaic_paths[h].alleles[b]].sequence.size();
         }
-        for (std::size_t h = 0; h < 2; ++h) truth << '\t' << (donor_of_block[b] == 0 ? donor_a : donor_b);
+        for (std::size_t h = 0; h < 2; ++h) {
+            truth << '\t' << (donor_of_block[h][b] == 0 ? donor_a : donor_b);
+        }
         for (std::size_t h = 0; h < 2; ++h) {
             std::vector<std::string> carriers;
             for (std::size_t r = 0; r < model.panel().template_count(); ++r) {
@@ -2044,9 +2185,10 @@ int mosaic_truth(const Args& args) {
     const std::string out_truth = args.required("out");
     { std::ofstream file(out_truth); file << truth.str(); }
 
-    std::cout << "mosaic-truth " << donor_a << " x " << donor_b << ": " << switches
-              << " switch(es) over " << blocks << " blocks; both routes agree; staged " << out_gfa
-              << '\n';
+    std::cout << "mosaic-truth " << donor_a << " x " << donor_b << ": " << switches_of_hap[0] << "+"
+              << switches_of_hap[1] << " switch(es) over " << blocks << " blocks, " << on_panel
+              << " homologue(s) on panel (declared " << require_off_panel
+              << "); both routes agree; staged " << out_gfa << '\n';
     return 0;
 }
 
@@ -2420,7 +2562,7 @@ int genotype(const Args& args) {
 int main(int argc, char** argv) {
     try {
         if (argc < 2) {
-            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors|subsample|preflight --key value ...\n";
+            std::cerr << "usage: genotype_probe simulate|loo-gfa|evaluate|compare|genotype|trace|anchors|subsample|preflight|respell|coverage-audit|form-census|mosaic-truth|orientations|panel-alleles --key value ...\n";
             return 2;
         }
         const std::string command = argv[1];
@@ -2438,6 +2580,8 @@ int main(int argc, char** argv) {
         if (command == "coverage-audit") return coverage_audit(args);
         if (command == "form-census") return form_census(args);
         if (command == "mosaic-truth") return mosaic_truth(args);
+        if (command == "orientations") return orientations(args);
+        if (command == "panel-alleles") return panel_alleles(args);
         std::cerr << "unknown probe command: " << command << '\n';
         return 2;
     } catch (const std::exception& error) {

@@ -292,6 +292,13 @@ if(PANVAR_BUILD_TESTING)
         add_test(NAME panvar_genotype_mosaic_binding
                  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_mosaic_binding.sh
                          ${CMAKE_CURRENT_BINARY_DIR}/genotype_mosaic_binding)
+        # The held-out mosaic protocol's manifest gate: the committed plan table must be exactly what the
+        # declared draw rule re-derives, no development donor may appear in it, and no plan may repeat a
+        # development switch plan. Runs in a second against two committed tables; it does NOT stage,
+        # simulate, call or evaluate anything.
+        add_test(NAME panvar_genotype_heldout_mosaic_manifest
+                 COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_c4_heldout_mosaic.sh
+                         --check-manifest)
         # Nested lower-coverage read sets: every fragment kept at a coverage is kept at every higher one.
         add_test(NAME panvar_genotype_subsample_nested
                  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_subsample_nested.sh
