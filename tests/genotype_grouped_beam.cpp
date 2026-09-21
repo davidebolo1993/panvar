@@ -370,6 +370,38 @@ void test_preallocation_is_gated_per_account() {
     require(ran.allocation_observed.rolling_vector_cells > 0 &&
                 ran.allocation_observed.ancestry_records > 0 && ran.allocation_observed.pair_records > 0,
             "a run that produced candidates must have measured storage in every account");
+
+    // The index/temporary account, and the single total production gates on. A total that omitted the
+    // temporaries would be a partial account of the peak, so it must exceed the three named accounts.
+    require(bounds.index_bytes > 0 && ran.allocation_observed.index_bytes > 0,
+            "the index and temporary account must be predicted and measured, not omitted");
+    require(bounds.total_bytes > bounds.rolling_vector_bytes + bounds.ancestry_bytes + bounds.pair_bytes,
+            "the predicted total must include the temporary and index storage, not just the three "
+            "named accounts");
+    require(ran.allocation_predicted.total_bytes == bounds.total_bytes,
+            "the run must report the same prediction the planner makes");
+    require(ran.allocation_observed.total_bytes <= ran.allocation_predicted.total_bytes,
+            "measured peak " + std::to_string(ran.allocation_observed.total_bytes) +
+                " exceeded the predicted " + std::to_string(ran.allocation_predicted.total_bytes));
+    require(ran.allocation_observed.index_bytes <= bounds.index_bytes,
+            "measured index storage exceeded its prediction");
+
+    // The fixed ceiling: admitted exactly at the predicted peak, refused one byte below it, and the
+    // refusal happens before construction so nothing is allocated.
+    panvar::MosaicBeamParameters at_ceiling = admitted;
+    at_ceiling.max_proposal_memory_bytes = bounds.total_bytes;
+    require(!panvar::propose_mosaic_diplotypes_grouped(panel, emissions, {0.25, 0.6}, at_ceiling)
+                 .candidates.empty(),
+            "a search admitted exactly at the memory ceiling must run");
+    panvar::MosaicBeamParameters below_ceiling = admitted;
+    below_ceiling.max_proposal_memory_bytes = bounds.total_bytes - 1;
+    bool ceiling_refused = false;
+    try {
+        panvar::propose_mosaic_diplotypes_grouped(panel, emissions, {0.25, 0.6}, below_ceiling);
+    } catch (const std::length_error&) {
+        ceiling_refused = true;
+    }
+    require(ceiling_refused, "a ceiling one byte below the predicted peak must refuse");
     require(ran.extensions_evaluated <= work,
             "the work actually done must not exceed the budget computed from the same loops");
 

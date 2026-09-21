@@ -2353,7 +2353,14 @@ int trace(const Args& args) {
             << "\ndonor\t" << donor << "\nstate_limit\t" << state_limit
             << "\ncandidate_target\t" << target << "\nunique_candidates_found\t" << result.unique_candidates_found
             << "\nstates_pruned\t" << result.states_pruned
-            << "\nextensions_evaluated\t" << result.extensions_evaluated << "\nproposal_matches_run\t"
+            << "\nextensions_evaluated\t" << result.extensions_evaluated
+            << "\nproposal_memory_predicted_bytes\t" << result.allocation_predicted.total_bytes
+            << "\nproposal_memory_observed_bytes\t" << result.allocation_observed.total_bytes
+            << "\nproposal_memory_predicted_rolling_bytes\t" << result.allocation_predicted.rolling_vector_bytes
+            << "\nproposal_memory_predicted_ancestry_bytes\t" << result.allocation_predicted.ancestry_bytes
+            << "\nproposal_memory_predicted_pair_bytes\t" << result.allocation_predicted.pair_bytes
+            << "\nproposal_memory_predicted_index_bytes\t" << result.allocation_predicted.index_bytes
+            << "\nproposal_matches_run\t"
             << (matches_run ? "true" : "false") << "\nproposal_matches_run_score\t"
             << (matches_run_score ? "true" : "false") << "\ncandidates_compared_with_run\t" << compared
             // Empty for a synthetic mosaic: it is curated out of the panel by construction, so it has no

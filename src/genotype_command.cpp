@@ -404,6 +404,17 @@ void write_status(
     if (beam != nullptr) {
         out << "proposal_state_limit\t" << beam->state_limit_used << '\n';
         out << "proposal_final_states\t" << beam->final_states << '\n';
+        // The production resource contract, reported as predicted against observed so the prediction is
+        // checkable from the run's own output rather than taken on trust.
+        out << "proposal_memory_ceiling_bytes\t" << options.max_proposal_memory_bytes << '\n';
+        out << "proposal_memory_predicted_bytes\t" << beam->allocation_predicted.total_bytes << '\n';
+        out << "proposal_memory_observed_bytes\t" << beam->allocation_observed.total_bytes << '\n';
+        out << "proposal_memory_predicted_rolling_bytes\t" << beam->allocation_predicted.rolling_vector_bytes
+            << '\n';
+        out << "proposal_memory_predicted_ancestry_bytes\t" << beam->allocation_predicted.ancestry_bytes
+            << '\n';
+        out << "proposal_memory_predicted_pair_bytes\t" << beam->allocation_predicted.pair_bytes << '\n';
+        out << "proposal_memory_predicted_index_bytes\t" << beam->allocation_predicted.index_bytes << '\n';
         out << "mosaic_candidates\t" << beam->candidates.size() << '\n';
         out << "mosaic_candidates_found\t" << beam->unique_candidates_found << '\n';
         out << "proposal_states_pruned\t" << beam->states_pruned << '\n';
@@ -784,7 +795,8 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     // Every unordered pair of panel templates is a candidate, whatever the beam retains. In leave-zero-out the
     // truth is such a pair, and the beam can prune it before later informative blocks: on four held-out C4
     // donors the true pair was dropped where template copies of a few locally better prefixes filled all 1024
-    // merged states. The beam now supplies only recombinant mosaics beyond the panel, and K counts those.
+    // selection units. The beam now supplies only recombinant mosaics beyond the panel, and K counts
+    // those; the grouped proposer's own unit is the allele-prefix pair.
     std::vector<MosaicCandidate> panel_candidates = panel_diplotypes(model.panel());
     for (MosaicCandidate& candidate : panel_candidates) candidate.every_allele_scored = emissions.every_allele_scored();
     CandidateSetReport candidate_report;
@@ -829,6 +841,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
             std::max(options.proposal_state_limit, options.max_mosaic_candidates + panel_candidates.size());
         beam_parameters.state_limit = options.proposal_state_limit;
         beam_parameters.max_extension_evaluations = options.max_beam_extensions;
+        beam_parameters.max_proposal_memory_bytes = options.max_proposal_memory_bytes;
         try {
             // The grouped-prefix proposer. It carries every template attribution of a prefix exactly
             // rather than approximating a prefix by its best one, and it is cheaper doing so. The

@@ -10,8 +10,13 @@
 #   1. stage   -- build the five mosaic truths and their staged graphs
 #   2. gate    -- the curated staged model must reproduce ORDINARY C4 exactly
 #   3. reads   -- simulate 30x from each staged mosaic
-#   4. call    -- genotype against the staged graph with the mosaics curated out, K = 0 and 8
-#   5. trace   -- proposal-only diagnostic at state limits 1024 and 4096
+#   4. call    -- genotype against the staged graph with the mosaics curated out, at CALL_PREFIXES
+#                 (default 0,8) in ONE shared exact-scoring pass, not one pass per K
+#   5. trace   -- proposal-only diagnostic at STATE_LIMITS (default 1024 4096), using the grouped
+#                 proposer, which is what production proposes with
+#
+# CALL_PREFIXES and STATE_LIMITS are overridable for targeted diagnostics; the defaults above are the
+# frozen experiment. A wider K or width passed in is a diagnostic, never a new default.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -32,10 +37,14 @@ INSERT_SD=40
 SIGMAS=4
 SUBSTITUTION_ERROR=0.002
 OUTLIER_WEIGHT=0.001
-# Overridable for a targeted diagnostic run; the committed defaults are what the frozen experiment uses.
-# K=128 in particular is a development diagnostic for every_block, NOT a new default.
-STATE_LIMITS="${STATE_LIMITS:-1024 4096}"
-CALL_PREFIXES="${CALL_PREFIXES:-0,8}"
+# Overridable for a targeted diagnostic run; the committed defaults are what the frozen experiment uses,
+# and they now track the frozen production settings: proposal width 256 (audit width 1,024) and K = 128,
+# chosen by the declared width-ladder and K-ladder rule rather than by preference.
+STATE_LIMITS="${STATE_LIMITS:-256 1024}"
+CALL_PREFIXES="${CALL_PREFIXES:-0,128}"
+# The width the CALL stage scores at. It was hardcoded to 1024 in the call invocation, which meant the
+# frozen width could not be expressed here at all and a width change would have been silently ignored.
+CALL_STATE_LIMIT="${CALL_STATE_LIMIT:-256}"
 TRACE_CANDIDATES=256
 
 # Ordinary C4, for the model-equivalence gate: what the model must still be after two synthetic mosaic
@@ -122,7 +131,7 @@ input_bundle_signature() {
   printf 'seed\t%s\ndepth\t%s\nread_length\t%s\n' "$SEED" "$DEPTH" "$READ_LENGTH"
   printf 'insert_mean_bp\t%s\ninsert_sd_bp\t%s\nsupport_sigmas\t%s\n' "$INSERT_MEAN" "$INSERT_SD" "$SIGMAS"
   printf 'substitution_error\t%s\noutlier_weight\t%s\n' "$SUBSTITUTION_ERROR" "$OUTLIER_WEIGHT"
-  printf 'state_limits\t%s\ncall_prefixes\t%s\ntrace_candidates\t%s\n' "$STATE_LIMITS" "$CALL_PREFIXES" "$TRACE_CANDIDATES"
+  printf 'state_limits\t%s\ncall_state_limit\t%s\ncall_prefixes\t%s\ntrace_candidates\t%s\n' "$STATE_LIMITS" "$CALL_STATE_LIMIT" "$CALL_PREFIXES" "$TRACE_CANDIDATES"
   for spec in "${PLANS[@]}"; do printf 'plan\t%s\n' "$spec"; done
 } > "$OUT/manifest.tsv"
 echo "manifest: $OUT/manifest.tsv"
@@ -222,7 +231,8 @@ if has_stage call; then
     rm -f "$d"/pending.*
     "$PROBE" genotype --gfa "$d/staged.gfa" --reference "$REFERENCE" \
       --reads1 "$d/source/reads_1.fq" --reads2 "$d/source/reads_2.fq" --library "$d/source/library.txt" \
-      --out-prefix "$d/pending" --state-limit 1024 --prefixes "$CALL_PREFIXES" --phase-audit 0 --threads 2 \
+      --out-prefix "$d/pending" --state-limit "$CALL_STATE_LIMIT" --prefixes "$CALL_PREFIXES" \
+      --phase-audit 0 --threads 2 \
       --panel-curation "$CURATION" > "$d/pending.log" 2>&1 || true
     if [ ! -f "$d/pending.K0.mosaic_status.tsv" ]; then
       printf '  %-16s CALL PRODUCED NO PER-K STATUS: previous outputs and signature left untouched: %s\n' \
@@ -338,6 +348,10 @@ PY
 fi
 
 # ---- 5. trace: the proposal-only diagnostic --------------------------------------------------------
+# agrees_id / agrees_score compare this proposal against the manifest of the run named by --run, which
+# is the call made at the CALL stage's width. They are therefore only meaningful at that width: at any
+# other width the two proposals are legitimately different searches, and disagreement there is expected
+# rather than a fault.
 # Searches the COMPLETE final beam, not the ranked prefix written to mosaic_candidates.tsv.  An absent
 # verdict from the prefix cannot distinguish ranked-beyond-K, pruned-at-a-layer and never-generated;
 # truth_in_full_beam and first_block_truth_not_retained can.

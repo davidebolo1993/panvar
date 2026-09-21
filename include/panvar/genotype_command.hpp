@@ -31,7 +31,11 @@ struct GenotypeCommandOptions {
     std::size_t threads = 1;
     // Off-panel mosaic diplotypes added to the protected panel baseline; 0 scores the panel alone. Every
     // unordered panel diplotype is always a candidate and is not counted here.
-    std::size_t max_mosaic_candidates = 64;
+    // FROZEN at 128 by the declared selection rule (width ladder + K ladder, five frozen C4 plans):
+    // the smallest K that exactly scores every development truth, gives the same block calls or
+    // tied-winner block consensus as K = 256, and is stable at the next larger proposal width. K = 8,
+    // 32 and 64 all fail the first clause alone, because every_block's truth sits at proposal rank 87.
+    std::size_t max_mosaic_candidates = 128;
 
     std::size_t kmer_size = 31;
     std::size_t syncmer_s = 15;
@@ -44,10 +48,22 @@ struct GenotypeCommandOptions {
     // Declared resource budgets. Reaching one ends the run incomplete with no ranking and no call; the
     // values are recorded in the status file. Not command-line options: the public surface is fixed.
     std::uint64_t max_beam_extensions = 2000000000ULL;
+    // The fixed production ceiling on proposer-owned memory, over the WHOLE predicted peak: rolling
+    // vectors, persistent ancestry, pair records and every material temporary and index. 256 MiB is
+    // well above what the frozen widths predict (about 18 MB at 1,024 and 72 MB at 4,096 on C4) and
+    // far below the process budget, so it refuses a configuration that would be absurd rather than
+    // one that is merely large. Checked before the proposal is constructed, so a refusal writes no
+    // ranking and no call.
+    std::uint64_t max_proposal_memory_bytes = 268435456ULL;   // 256 MiB
     // Merged proposal states retained per block: a resource cap on the grouped-state search. A search
     // that prunes and finds fewer than max_mosaic_candidates off-panel mosaics still calls -- every panel
     // diplotype was evaluated -- and reports mosaic_target_reached false and candidate_scope CONDITIONAL.
-    std::size_t proposal_state_limit = 1024;
+    // FROZEN at 256, the smallest plausible width: on all five frozen C4 plans the truth is retained at
+    // every layer and its proposal rank is unchanged across 256, 512, 1,024, 2,048 and 4,096 (ranks
+    // 6, 6, 1, 8, 87), so width is not the binding constraint there. Counted in allele-prefix PAIRS.
+    // This is measured on five synthetic plans at one locus; it is not evidence that 256 suffices
+    // everywhere.
+    std::size_t proposal_state_limit = 256;
     // Panel pairs times fragments: the predicted diploid-combination work of the protected panel baseline.
     // A baseline over this is refused whole, never scored partially.
     std::uint64_t max_panel_pair_fragment_evaluations = 20000000000ULL;

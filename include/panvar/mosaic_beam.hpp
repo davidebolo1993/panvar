@@ -12,6 +12,10 @@
 
 namespace panvar {
 
+// FIXTURE-ONLY ORACLE. This is the original state-based proposer. Production proposes with
+// propose_mosaic_diplotypes_grouped (below); this implementation is retained unchanged because the
+// grouped proposer is checked against it, and must therefore not be "improved".
+//
 // Deterministic top-K mosaic proposal with equivalence merging in every layer.
 //
 // Two template histories that have spelled the same allele prefix on a homologue and sit on the same
@@ -36,6 +40,11 @@ struct MosaicBeamParameters {
     std::uint64_t max_rolling_vector_cells = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t max_ancestry_records = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t max_pair_records = std::numeric_limits<std::uint64_t>::max();
+    // The ONE fixed production ceiling, in bytes, over the whole predicted peak. The per-account caps
+    // above remain as internal invariants -- they catch an account growing in a way its own formula
+    // did not predict -- while this is the contract production declares and refuses against, before
+    // any construction.
+    std::uint64_t max_proposal_memory_bytes = std::numeric_limits<std::uint64_t>::max();
     // Diagnostic only: follow one declared diplotype through every layer. Its prefixes are looked up and
     // never interned, so prefix ids, ordering and pruning are identical to an untraced search.
     std::optional<MosaicDiplotype> trace_target = std::nullopt;
@@ -56,7 +65,9 @@ std::uint64_t extension_upper_bound(std::size_t templates, std::size_t blocks, s
 // One layer of a trace: what was offered to pruning, what survived, and where the target stood.
 struct MosaicBeamTraceLayer {
     std::size_t block = 0;
-    std::uint64_t states_offered = 0;      // merged states offered to the layer's selection
+    // Units differ by proposer: merged (prefix, template) states for the state-based oracle,
+    // allele-prefix PAIRS for the grouped proposer that production uses.
+    std::uint64_t states_offered = 0;
     std::size_t states_retained = 0;
     // Distinct allele-prefix pairs OFFERED to this layer's selection: how many diplotype prefixes the
     // layer had to choose between. Read against prefix_pairs_retained it separates a layer offered
@@ -127,6 +138,14 @@ struct GroupedAllocationAccounts {
     std::uint64_t ancestry_bytes = 0;
     std::uint64_t pair_records = 0;
     std::uint64_t pair_bytes = 0;
+    // Everything else the proposer owns: the allele-class index, the per-layer child index and its
+    // remap, the child layer held before compaction, the per-parent scatter vectors, the dense
+    // scratch, and the spelled candidate paths. Several of these scale as 2L * A_max, so they are not
+    // a rounding error at a locus with 126 alleles in a block -- omitting them would make the peak a
+    // partial account of what the search actually takes.
+    std::uint64_t index_bytes = 0;
+    // The single number production gates on: every account above, summed.
+    std::uint64_t total_bytes = 0;
 };
 
 struct MosaicBeamResult {
@@ -134,17 +153,19 @@ struct MosaicBeamResult {
     std::size_t state_limit_used = 0;
     std::size_t final_states = 0;
     std::size_t unique_candidates_found = 0;   // distinct diplotypes among final states, before truncation
-    std::uint64_t states_pruned = 0;           // merged states discarded, summed over every block
+    std::uint64_t states_pruned = 0;           // discarded selection units, summed over every block
     std::uint64_t extensions_evaluated = 0;
     std::uint64_t extension_upper_bound = 0;
-    // No merged state was ever pruned, so every diplotype with positive proposal mass was found.
+    // Nothing was ever pruned, so every diplotype with positive proposal mass was found.
     bool search_exhaustive = false;
     bool unique_target_reached = false;
     // The returned set omits candidates -- because states were pruned, or because more diplotypes were
     // found than the target -- so any ranking over it is conditional on the candidate set.
     bool candidate_set_conditional = false;
     std::vector<MosaicBeamTraceLayer> trace;   // one per block when a trace target was declared
-    // Grouped proposer only: peak storage actually taken, for comparison against the prediction.
+    // Grouped proposer only: what the contract PREDICTED before construction, and the peak actually
+    // taken. Reported together so a prediction can be checked against the run rather than trusted.
+    GroupedAllocationAccounts allocation_predicted;
     GroupedAllocationAccounts allocation_observed;
 };
 
@@ -164,8 +185,11 @@ MosaicBeamResult propose_mosaic_diplotypes(
     const MosaicBeamParameters& parameters);
 // The grouped-prefix proposer: an EXPERIMENTAL second implementation, retaining allele-prefix pairs and
 // carrying each one's whole distribution over current template pairs instead of a single attribution of
-// it. propose_mosaic_diplotypes above is untouched and is the oracle this is tested against; nothing
-// here is wired into calling. Same inputs, same MosaicBeamResult, same candidate ordering.
+// it. THIS IS WHAT PRODUCTION PROPOSES WITH. propose_mosaic_diplotypes above is untouched and is the
+// fixture oracle this is tested against. Same inputs, same MosaicBeamResult, same candidate ordering.
+//
+// Its state_limit counts allele-prefix PAIRS, not (prefix, template) states: one pair stands for every
+// template attribution of itself, so the same number is a far wider search than it was.
 MosaicBeamResult propose_mosaic_diplotypes_grouped(const PanelAlleleMatrix& panel,
                                                    const PreparedProposalEmissions& emissions,
                                                    const std::vector<double>& switch_probability,

@@ -626,7 +626,7 @@ void test_off_panel_truth_is_recovered() {
     const auto truths = spell_truths(locus);
     simulate(truths.first, truths.second, path("phaseable_r1.fq"), path("phaseable_r2.fq"), 123);
     // The crowding fixture. Before equivalence merging, a width of 64 filled with template histories of the
-    // two zero-switch phasings and the truth was never offered. Under the same budget of 64 merged states
+    // two zero-switch phasings and the truth was never offered. Under the same budget of 64 selection units
     // the truth must be proposed. Every panel diplotype is still scored, so the run calls and is marked
     // conditional (review round 6) with the truth among what it proposed.
     //
@@ -670,13 +670,13 @@ void test_off_panel_truth_is_recovered() {
         const auto starved_status = read_status(path("phaseable_starved.mosaic_status.tsv"));
         require(starved_status.at("proposal_search_exhaustive") == "false" &&
                     starved_status.at("mosaic_target_reached") == "false",
-                "fixture: 4 merged states must prune and miss K=16");
+                "fixture: 4 prefix pairs must prune and miss K=16");
         require(starved_status.at("panel_baseline_complete") == "true" &&
                     starved_status.at("candidate_scope") == "CONDITIONAL",
                 "a search that misses K must be conditional and still carry the complete panel baseline");
     }
 
-    // Recovery, with a budget above every reachable merged state.
+    // Recovery, with a budget above every reachable prefix pair.
     panvar::GenotypeCommandOptions options =
         tiny_options("phaseable", path("phaseable_r1.fq"), path("phaseable_r2.fq"), "tiny_phaseable.gfa");
     options.proposal_state_limit = 1048576;
@@ -733,7 +733,7 @@ void test_off_panel_phase_is_not_claimed_from_reads() {
     simulate(truths.first, truths.second, path("unphaseable_r1.fq"), path("unphaseable_r2.fq"), 123);
     panvar::GenotypeCommandOptions options =
         tiny_options("unphaseable", path("unphaseable_r1.fq"), path("unphaseable_r2.fq"));
-    options.proposal_state_limit = 1048576;   // far above every reachable merged state: exhaustive
+    options.proposal_state_limit = 1048576;   // far above every reachable prefix pair: exhaustive
     const panvar::GenotypeRunStatus status = panvar::run_genotype(options);
     const std::map<std::string, std::string> reported = read_status(path("unphaseable.mosaic_status.tsv"));
     require(reported.at("proposal_search_exhaustive") == "true", "fixture: the unphaseable search must be exhaustive");
@@ -1071,7 +1071,16 @@ void test_candidate_prefixes_match_standalone() {
                     // and these must agree exactly, which is what keeps the audit inside this gate.
                     "primary_prefix_k", "full_beam_candidates", "primary_prefix_truncated",
                     "full_beam_audit_attempted", "candidates_exactly_audited", "audit_completed",
-                    "final_candidate_scope"};
+                    "final_candidate_scope",
+                    // The proposal resource contract describes the same absent search. A standalone
+                    // K = 0 run builds no proposer, so it has no predicted peak, no observed peak and
+                    // nothing to gate against the ceiling. Dropped for K = 0 ONLY -- wherever both runs
+                    // build a beam these must agree exactly, which is what keeps the contract inside
+                    // this gate rather than outside it.
+                    "proposal_memory_ceiling_bytes", "proposal_memory_predicted_bytes",
+                    "proposal_memory_observed_bytes", "proposal_memory_predicted_rolling_bytes",
+                    "proposal_memory_predicted_ancestry_bytes", "proposal_memory_predicted_pair_bytes",
+                    "proposal_memory_predicted_index_bytes"};
                 if (drop_proposal && proposal_diagnostics.count(key) != 0) continue;
             }
             if (drop_last_column) {
@@ -1134,7 +1143,7 @@ void test_candidate_prefixes_match_standalone() {
                 "every prefix, K = 0 and mosaic-deficient ones included, must call from the complete panel");
         if (state_limit == 64) {
             require(read_status(path(base + ".K64.mosaic_status.tsv")).at("mosaic_target_reached") == "false",
-                    "fixture: at 64 merged states the largest prefix must be mosaic-deficient");
+                    "fixture: at 64 prefix pairs the largest prefix must be mosaic-deficient");
         }
         std::cout << "  candidate prefixes at state limit " << state_limit << ": " << complete << " complete, "
                   << refused << " refused, each identical to its standalone run\n";
@@ -1510,6 +1519,51 @@ void test_block_consensus_end_to_end() {
               << " blocks called, " << no_called << " no-called, no phased haplotype\n";
 }
 
+// The production resource contract: one fixed ceiling over the proposer's whole predicted peak,
+// refused BEFORE the proposal is constructed. This is the production path, not the library call --
+// what matters is that a refusal leaves no ranking and no call behind it, because a partial output
+// beside a status claiming refusal is indistinguishable from a successful run.
+void test_proposal_memory_ceiling() {
+    const std::string r1 = path("phaseable_r1.fq");
+    const std::string r2 = path("phaseable_r2.fq");
+
+    // What the contract predicts for this locus, read from a run under the frozen ceiling.
+    panvar::GenotypeCommandOptions baseline =
+        tiny_options("mem_baseline", r1, r2, "tiny_phaseable.gfa");
+    require(panvar::run_genotype(baseline) == panvar::GenotypeRunStatus::Complete,
+            "fixture: the baseline run must complete under the frozen ceiling");
+    const auto reported = read_status(path("mem_baseline.mosaic_status.tsv"));
+    const std::uint64_t predicted = std::stoull(reported.at("proposal_memory_predicted_bytes"));
+    const std::uint64_t observed = std::stoull(reported.at("proposal_memory_observed_bytes"));
+    require(predicted > 0 && observed > 0, "both predicted and observed bytes must be reported");
+    require(observed <= predicted,
+            "the observed peak must not exceed the prediction the run refused against");
+    require(std::stoull(reported.at("proposal_memory_ceiling_bytes")) == 268435456ULL,
+            "the frozen production ceiling must be reported as declared");
+    require(std::stoull(reported.at("proposal_memory_predicted_index_bytes")) > 0,
+            "the temporary and index storage must be part of the reported prediction");
+
+    // Exactly at the predicted peak: admitted.
+    panvar::GenotypeCommandOptions at_ceiling = tiny_options("mem_at", r1, r2, "tiny_phaseable.gfa");
+    at_ceiling.max_proposal_memory_bytes = predicted;
+    require(panvar::run_genotype(at_ceiling) == panvar::GenotypeRunStatus::Complete,
+            "a ceiling exactly at the predicted peak must admit the run");
+
+    // One byte below: refused, with no partial output.
+    panvar::GenotypeCommandOptions below = tiny_options("mem_below", r1, r2, "tiny_phaseable.gfa");
+    below.max_proposal_memory_bytes = predicted - 1;
+    require(panvar::run_genotype(below) == panvar::GenotypeRunStatus::CandidateIncomplete,
+            "a ceiling one byte below the predicted peak must refuse the run");
+    const auto refused = read_status(path("mem_below.mosaic_status.tsv"));
+    require(refused.at("note").find("memory ceiling") != std::string::npos,
+            "the refusal must name the ceiling it exceeded, got: " + refused.at("note"));
+    require(no_ranking_or_call("mem_below"),
+            "a run refused at the memory ceiling must leave no ranking and no call");
+
+    std::cout << "  proposal memory ceiling: predicted " << predicted << " B, observed " << observed
+              << " B; admitted at the prediction, refused one byte below, no partial output\n";
+}
+
 // A panel template leaves the panel only by an explicit, recorded decision. The curated model is a
 // DIFFERENT model and has to say so: a different fingerprint, the excluded template named with the
 // reason it would otherwise have carried, and a digest of the decision. A manifest that no longer
@@ -1777,6 +1831,7 @@ int main(int argc, char** argv) {
         test_block_consensus_rule();
         test_block_consensus_end_to_end();
         test_full_beam_audit();
+        test_proposal_memory_ceiling();
         test_curated_panel();
         test_resource_caps_are_thread_invariant();
         std::cout << "genotype command end-to-end: PASS\n";

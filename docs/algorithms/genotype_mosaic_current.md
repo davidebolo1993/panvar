@@ -55,8 +55,10 @@ placement workers actually used, and the phase timings up to the refusal.
 
 ## Frozen defaults
 
-State limit 1,024 (production) and 4,096 (audit only) -- counted in allele-prefix PAIRS since the
-grouped proposer became production; see the unit change noted below. `max_piece_hits` 2e9, `max_physical_origins` 5e8,
+State limit **256** (production) and **1,024** (audit only) -- counted in allele-prefix PAIRS since the
+grouped proposer became production; see the unit change noted below. K (`max_mosaic_candidates`)
+**128**. `phase_audit_candidates` remains 0: nothing in this batch measured the phase audit, every run
+declared `--phase-audit 0`, so it is deliberately not frozen to a value. `max_piece_hits` 2e9, `max_physical_origins` 5e8,
 `max_state_classes` 2e8, `max_mass_cells` 2e8, `piece_hit_publish_batch` 4,096. Mismatch band 6, minimum
 piece 12 bp, k-mer 31, syncmer 15, min variant 50 bp, switch probability 0.01. Simulation: seed 20260916
 salted per donor or plan, 100 bp reads, insert 350 +/- 40, 4 sigmas, substitution error 0.002, outlier
@@ -81,8 +83,10 @@ weight 0.001. C4 reference `HG00096#1#haplotype1-0000024:31848049-32074186`.
   final layer (exactly `unique_candidates_found`) go from 562-892 to 2,510-3,568 while states discarded
   go from 29-43 million to 129-180 million. What limits diplotype diversity is the selection rule, which
   ranks template-level states, not the width it is given.
-- **Prefix-first selection recovers every truth, and costs more than it looks.** The layer selector now
-  groups merged states by unordered prefix pair, ranks groups by aggregate mass, keeps each top group's
+- **Prefix-first selection recovers every truth, and costs more than it looks.** *Historical: measured
+  before the grouped proposer existed, with the state limit still counting `(prefix, template)` states
+  rather than allele-prefix pairs. Kept because it is what motivated the grouped design.* The layer
+  selector grouped merged states by unordered prefix pair, ranks groups by aggregate mass, keeps each top group's
   best state up to the limit, then fills any spare capacity by the old state order. Parameter-free.
   Measured on the five plans at both widths, paired back to back against the state-only selector:
   - Retention: the truth survives **every** layer of **all ten** runs (`first_block_truth_not_retained`
@@ -266,6 +270,33 @@ the case is hard: it recovers the two plans prefix-first damaged most, and gives
 easy plans (rank 5 to 6, and 4 to 6). Nothing here is a calling result: ranks are proposal ranks, and
 what a caller does with them has not been measured.
 
+**The production resource contract.** One fixed ceiling, `max_proposal_memory_bytes` = 256 MiB, over the
+proposer's WHOLE predicted peak, checked before any construction, so a refusal allocates nothing and
+leaves no ranking and no call. The status reports the ceiling, the predicted total and the observed
+total, plus each account separately, so a prediction is checkable from the run's own output instead of
+being trusted.
+
+Four accounts are predicted and kept as separate internal invariants, because pooling them would let one
+overrun hide in another's slack: rolling vector cells (parent and child layers, the only ones live),
+persistent ancestry records, pair records and selection storage, and -- added here -- every material
+proposer-owned temporary and index: the allele-class index, the per-layer child index and its remap, the
+child layer held before compaction, the per-parent scatter vectors, the dense scratch, and the spelled
+candidate paths. Several of those scale with the layer width times the largest allele count, so omitting
+them made the "peak" a partial account of what the search takes.
+
+**What bounds a layer.** A prefix at block `b` is an allele PATH, so a layer holds at most
+`min(2L, A_0 * ... * A_b)` haplotype prefixes, and the prediction sums that per block rather than
+assuming the width everywhere. An earlier version of this bound argued instead that a prefix exists only
+where some template spells it, hence at most `T` prefixes per layer. That is false for a MOSAIC proposer:
+whenever `r > 0` the rank-1 jump term gives a child positive mass even when no single template spells its
+whole allele path, which is the entire point of the search. The measured-allocation gate caught it --
+14 ancestry records against a predicted 12, exactly `2 + 4 + 8` for that fixture's allele products -- and
+that is why the gate compares measurement against prediction rather than checking the formula against
+itself.
+
+On the small end-to-end locus the contract predicts 9,126 bytes and the run takes 8,710: admitted exactly
+at the prediction, refused one byte below it, with no partial output either way.
+
 **Measured in production, C4, width 1,024, one shared scoring pass per plan at K = 0, 8, 128.** The
 standalone and production proposals were required to agree, and do, on candidate identity, rank AND
 score -- the last only after the candidate table was written at full double precision, since the stream
@@ -297,6 +328,42 @@ model-equivalence gate still holds on all five plans (`d2b8c6c2e0b4079d`, 8,515 
 and the simulated reads reproduce byte-for-byte, so the input binding's earlier refusal was a signature
 effect -- the probe binary is part of the bundle by design -- and not drift in the data.
 
+**The width ladder, and why 256.** Proposal only, grouped proposer, five frozen plans, existing reads,
+at 256 / 512 / 1,024 / 2,048 / 4,096. The truth is retained at **every layer of all 25 runs**, and the
+proposal rank is identical at every width: 6, 6, 1, 8, 87. The width is genuinely applied -- candidates
+found track it exactly (256 to 4,096), predicted bytes scale 3.6 to 57.7 MB, wall time 4.7 to 6.6 s --
+so the flatness is real, not an ignored flag. A rank is a position in a mass-ordered list, and widening
+appends lower-mass candidates below the truth without displacing it.
+
+So width is not the binding constraint on these plans, and 256 is the smallest plausible width, leaving
+about 3x headroom over the worst truth rank of 87. **This is five synthetic plans at one locus with one
+donor pair. It is not evidence that 256 suffices anywhere else**, and dense-switch recall was exactly
+where retention used to fail before the grouped proposer.
+
+**The K ladder, and the declared rule.** At width 256, one shared exact-scoring pass per plan through
+K = 256, deriving K = 8, 32, 64, 128, 256 as prefixes of that one pass; repeated at 512 for stability.
+
+| K | truth exactly scored | calls / tied-winner consensus == K=256 | stable at 512 |
+|---|---|---|---|
+| 8 | **no** | yes | yes |
+| 32 | **no** | yes | yes |
+| 64 | **no** | yes | yes |
+| 128 | yes | yes | yes |
+| 256 | yes | reference | yes |
+
+**K = 128** is the smallest K satisfying every clause. The rule is decided entirely by the first one:
+`every_block`'s truth sits at proposal rank 87, so K = 8, 32 and 64 never score it at all. The second
+clause never discriminates here -- block calls and tied-winner consensus are identical to K = 256 at
+every K and both widths -- and the third never discriminates either. That is worth recording plainly:
+one clause did the work, and a rule that looked like three tests was effectively one.
+
+`every_block`'s winner set grows from 8 to 16 tied candidates between K = 8 and K = 32 and then holds,
+unanimous at 11 of 11 blocks throughout. Scope is `CONDITIONAL` and `proposal_search_exhaustive` false
+on all 50 runs, so **consensus stays refused everywhere**: the strict policy is unchanged by this batch.
+
+Cost at the frozen settings: 62-84 s per plan for the whole shared pass, peak RSS 0.70-0.88 GB, of which
+the proposer's own predicted peak is 3.6 MB at width 256 -- 1.4% of the 256 MiB ceiling.
+
 ## Known limitations
 
 - Whole-locus phase is often unidentifiable from short reads; block consensus is the response.
@@ -321,7 +388,8 @@ effect -- the probe binary is part of the bundle by design -- and not drift in t
   decision, not a settled improvement.
 - **Block consensus cannot fire on any large locus, because the search is pruned.** The truncation half
   of `candidate_set_conditional` is now handled by the full-beam audit. What remains is the other half:
-  C4 discards 29-43 million merged states per plan, so the search is not exhaustive, the audit refuses to
+  C4 discards 29-43 million merged states per plan (measured in the older `(prefix, template)` unit), so
+  the search is not exhaustive, the audit refuses to
   run, and consensus is unreachable there. This is the same wall as the beam-diversity problem, seen from
   the calling side -- a pruned search cannot certify that it omitted nothing, whatever is done downstream.
 
