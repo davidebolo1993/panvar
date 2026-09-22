@@ -325,6 +325,13 @@ if(PANVAR_BUILD_TESTING)
         add_test(NAME panvar_genotype_loo_development_gates
                  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_loo_c4_development_gates.sh
                          ${CMAKE_CURRENT_BINARY_DIR}/genotype_loo_dev_gates)
+        # The bounded --pair override: one differing block, a refusal when an allele is out of range,
+        # and the complete likelihood reported rather than its fragment-term summand alone. Comparing
+        # two runs' winners does not isolate a block, and reading a fragment-term gap as the model's
+        # preference inverted that preference once already.
+        add_test(NAME panvar_genotype_pair_override
+                 COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_pair_override.sh
+                         ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_BINARY_DIR}/genotype_pair_override)
 
         # Fast, dependency-free smoke on a tiny hand-built graph that exercises every
         # call event type + confounders with exact-record assertions (no vg needed).

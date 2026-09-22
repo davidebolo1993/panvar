@@ -1195,20 +1195,70 @@ int compare(const Args& args) {
     const std::string reference = args.required("reference");
     const std::string block_id = args.required("block");
     const std::size_t band = std::stoul(args.get("band", "6"));
+    // The staged sorted graphs are an implementation detail of loading, not a result, and they are
+    // 3.3 MB each. tied-consensus removes its own; compare did not, so every invocation left them
+    // beside its output, and pointing --out at a results directory filled it with exactly the
+    // redundant material such a directory exists to exclude.
+    //
+    // A guard rather than a call at the end of the function: every argument refusal below throws
+    // AFTER the model graph has been staged, so a success-path cleanup still leaks one file per
+    // rejected invocation -- measured, two leaked graphs from the two refusal cases alone. The
+    // error_code overload is deliberate: a destructor that throws while an exception is unwinding
+    // calls std::terminate, and unwinding is the case this guard exists for.
+    struct StagedGraphs {
+        std::string prefix;
+        ~StagedGraphs() {
+            std::error_code ignored;
+            std::filesystem::remove(prefix + ".model.sorted.gfa", ignored);
+            std::filesystem::remove(prefix + ".truth.sorted.gfa", ignored);
+        }
+    } staged_graphs{out};
     const LoadedModel loaded = load_model(args.required("model-gfa"), reference, out + ".model.sorted.gfa", 50);
     const panvar::PreparedGenotypeModel& model = *loaded.model;
-    for (const char* run : {"run-a", "run-b"}) {
-        if (read_key_values(args.required(run) + ".mosaic_status.tsv").at("model_fingerprint") != loaded.fingerprint) {
-            throw std::runtime_error(std::string(run) + " was not scored on the rebuilt model");
+    // --run-b is optional: with --alleles-b the second pair is the first one with a single block
+    // replaced, which is the only way to attribute a score difference to one block.
+    const std::string run_b_path = args.get("run-b", "");
+    for (const std::string& run : {std::string("run-a"), std::string("run-b")}) {
+        const std::string path = run == "run-a" ? args.required("run-a") : run_b_path;
+        if (path.empty()) continue;
+        if (read_key_values(path + ".mosaic_status.tsv").at("model_fingerprint") != loaded.fingerprint) {
+            throw std::runtime_error(run + " was not scored on the rebuilt model");
         }
     }
-    const auto a = winner_paths(args.required("run-a"));
-    const auto b = winner_paths(args.required("run-b"));
+    auto a = winner_paths(args.required("run-a"));
+    auto b = run_b_path.empty() ? a : winner_paths(run_b_path);
     std::size_t block = model.blocks().size();
     for (std::size_t i = 0; i < model.blocks().size(); ++i) {
         if (model.blocks()[i].block_id == block_id) block = i;
     }
     if (block == model.blocks().size()) throw std::runtime_error("unknown block " + block_id);
+
+    // Bounded single-block override. Comparing two runs' winners does NOT isolate a block: the
+    // HG04036 10x-versus-30x comparison differed in seven of eleven, so attributing its 2126-nat
+    // fragment-term gap to the sv:7 substitution alone was never established by that artifact.
+    // Replacing only this block's two alleles on a common base pair leaves every other block
+    // identical, so differing_blocks contains exactly one entry and the attribution is sound.
+    const auto override_block = [&](const char* option,
+                                    std::pair<std::vector<std::size_t>, std::vector<std::size_t>>& pair) {
+        const std::string spec = args.get(option, "");
+        if (spec.empty()) return std::string("none");
+        const std::size_t comma = spec.find(',');
+        if (comma == std::string::npos) {
+            throw std::runtime_error(std::string(option) + " expects <allele1>,<allele2>");
+        }
+        const std::size_t first = std::stoul(spec.substr(0, comma));
+        const std::size_t second = std::stoul(spec.substr(comma + 1));
+        const std::size_t alleles = model.blocks()[block].alleles.size();
+        if (first >= alleles || second >= alleles) {
+            throw std::runtime_error(std::string(option) + " names an allele outside block " + block_id +
+                                     ", which has " + std::to_string(alleles) + " alleles");
+        }
+        pair.first[block] = first;
+        pair.second[block] = second;
+        return spec;
+    };
+    const std::string overrode_a = override_block("alleles-a", a);
+    const std::string overrode_b = override_block("alleles-b", b);
 
     std::ofstream summary(out + ".summary.tsv");
     summary << std::setprecision(12) << "key\tvalue\n";
@@ -1257,6 +1307,17 @@ int compare(const Args& args) {
             << together.scores[1].fragment_term << "\nfragments_with_mass_a\t" << together.scores[0].fragments_with_mass
             << "\nfragments_with_mass_b\t" << together.scores[1].fragments_with_mass << "\nexposure_term_a\t"
             << together.scores[0].exposure_term << "\nexposure_term_b\t" << together.scores[1].exposure_term << '\n';
+    // The COMPLETE likelihood, not its observed-fragment summand. The exposure term is
+    // candidate-dependent whenever two diplotypes differ in length, so a comparison reported as a
+    // fragment-term gap alone can invert the model's actual preference -- which is exactly how the
+    // HG04036 calibration was misread as a scorer inconsistency.
+    summary << "log_likelihood_a\t" << together.scores[0].log_likelihood << "\nlog_likelihood_b\t"
+            << together.scores[1].log_likelihood << "\ntotal_gap_b_minus_a\t"
+            << (together.scores[1].log_likelihood - together.scores[0].log_likelihood)
+            << "\nexposure_gap_b_minus_a\t"
+            << (together.scores[1].exposure_term - together.scores[0].exposure_term)
+            << "\nalleles_a_override\t" << overrode_a << "\nalleles_b_override\t" << overrode_b
+            << "\nrun_b\t" << (run_b_path.empty() ? "none" : run_b_path) << '\n';
 
     // ---- 3. per-fragment decomposition ------------------------------------------------------------------
     const std::size_t u = together.unique_haplotypes;
@@ -1369,6 +1430,37 @@ int compare(const Args& args) {
         const auto projection = panvar::project_path_onto_locus(truth_graph.graph, loaded.bubbles, loaded.built.report, path->name);
         if (!projection.has_value() || !projection->blocks[block].has_value()) throw std::runtime_error("truth has no frame at the block");
         truth_blocks.push_back(*projection->blocks[block]);
+    }
+
+    // Every allele in this block against each truth haplotype, so the availability-floor alleles are
+    // read off the data instead of guessed. Without this a --pair comparison has to be told which
+    // alleles to use, and the obvious way to obtain them -- reading a run's winner -- can only ever
+    // name alleles the caller already chose.
+    {
+        std::ofstream table(out + ".alleles.tsv");
+        table << "allele\tbp";
+        for (std::size_t t = 0; t < truth_blocks.size(); ++t) table << "\tdistance_to_truth" << t + 1;
+        table << '\n';
+        std::vector<long> floor_distance(truth_blocks.size(), -1);
+        std::vector<std::size_t> floor_allele(truth_blocks.size(), 0);
+        for (std::size_t i = 0; i < model.blocks()[block].alleles.size(); ++i) {
+            const std::string& sequence = model.blocks()[block].alleles[i].sequence;
+            table << i << '\t' << sequence.size();
+            for (std::size_t t = 0; t < truth_blocks.size(); ++t) {
+                const long d = edit_distance(truth_blocks[t], sequence);
+                table << '\t' << d;
+                if (floor_distance[t] < 0 || d < floor_distance[t]) {
+                    floor_distance[t] = d;
+                    floor_allele[t] = i;
+                }
+            }
+            table << '\n';
+        }
+        summary << "block_alleles\t" << model.blocks()[block].alleles.size() << '\n';
+        for (std::size_t t = 0; t < truth_blocks.size(); ++t) {
+            summary << "floor_allele_truth" << t + 1 << '\t' << floor_allele[t]
+                    << "\nfloor_distance_truth" << t + 1 << '\t' << floor_distance[t] << '\n';
+        }
     }
     std::size_t truth_index = 0;
     long best_distance = -1;
@@ -1524,6 +1616,7 @@ int compare(const Args& args) {
                 << "\nband_" << trial << "_fragments_with_mass_a\t" << scored.scores[0].fragments_with_mass
                 << "\nband_" << trial << "_fragments_with_mass_b\t" << scored.scores[1].fragments_with_mass << '\n';
     }
+    // The staged graphs are removed by StagedGraphs above, on every exit path rather than this one.
     std::cout << "compared " << block_id << ": gap " << gap << ", decomposition residual " << delta_sum - gap << '\n';
     return 0;
 }
