@@ -41,6 +41,7 @@
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -122,6 +123,8 @@ struct SortedGraph {
     std::string resolved;
     panvar::GfaModel gfa;
     panvar::Graph graph;
+    // input id -> sorted id, kept so a second graph can be renumbered into this one's frame.
+    std::unordered_map<std::string, std::string> id_remap;
 };
 
 SortedGraph load_sorted(const std::string& gfa_path, const std::string& reference,
@@ -131,8 +134,80 @@ SortedGraph load_sorted(const std::string& gfa_path, const std::string& referenc
     panvar::GraphSortOptions sort_options;
     sort_options.reference_path = reference;
     sort_options.flip = true;
-    out.resolved = panvar::sort_graph_reference(out.gfa, sort_options).resolved_reference;
+    const panvar::GraphSortResult sort_result = panvar::sort_graph_reference(out.gfa, sort_options);
+    out.resolved = sort_result.resolved_reference;
+    out.id_remap = sort_result.id_remap;
     panvar::write_gfa_model(stage_path, out.gfa);
+    panvar::ParseGfaOptions parse_options;
+    out.graph = panvar::parse_gfa(stage_path, parse_options);
+    return out;
+}
+
+// Truth is a different graph from the model -- under leave-one-out it still carries the donor's two
+// paths, which is exactly what makes the scheme leave-one-out -- but every truth projection runs
+// through the MODEL's bubbles and block report, so the two graphs must number nodes identically.
+//
+// They do not do so by construction. sort_graph_reference builds its topological order from arcs
+// taken off every path walk, so dropping a donor's two P lines removes arcs, changes in-degrees, and
+// can change the order Kahn emits -- and with it the 1..N renumbering. On the C4 development panel
+// this shifted 2926 of 4740 node ids for HG02818 while leaving HG00733 untouched: whether a donor
+// moves the frame depends on whether a removed arc frees a node early enough to beat the numeric-id
+// tie-break, so it cannot be predicted per donor. Leave-zero-out never exposed it because model and
+// truth were then the same file.
+//
+// Everything else about the two sorts agrees -- same segments, same links, same reference path, so
+// the same flip set and the same sequences -- which leaves the frames differing only by a
+// permutation of ids. Recover the model's numbering by composing the two remaps:
+// truth sorted id -> input id -> model sorted id.
+SortedGraph load_truth_in_model_frame(const std::string& gfa_path, const std::string& reference,
+                                      const SortedGraph& model_sorted, const std::string& stage_path) {
+    SortedGraph out = load_sorted(gfa_path, reference, stage_path);
+    std::unordered_map<std::string, std::string> to_model;
+    to_model.reserve(out.id_remap.size() * 2);
+    for (const auto& [input_id, truth_id] : out.id_remap) {
+        const auto found = model_sorted.id_remap.find(input_id);
+        if (found == model_sorted.id_remap.end()) {
+            throw std::runtime_error("truth graph node " + input_id +
+                                     " is absent from the model graph, so truth cannot be placed in "
+                                     "the model's node frame");
+        }
+        to_model.emplace(truth_id, found->second);
+    }
+    const auto rm = [&](const std::string& id) -> std::string {
+        const auto it = to_model.find(id);
+        return it != to_model.end() ? it->second : id;
+    };
+
+    panvar::GfaModel& gfa = out.gfa;
+    std::unordered_map<std::string, std::string> new_seq;
+    new_seq.reserve(gfa.seq.size() * 2);
+    for (const auto& [id, sequence] : gfa.seq) new_seq[rm(id)] = sequence;
+    gfa.seq = std::move(new_seq);
+    for (panvar::GfaEdge& e : gfa.edges) {
+        e.from = rm(e.from);
+        e.to = rm(e.to);
+    }
+    for (panvar::GfaPath& p : gfa.paths) {
+        for (panvar::PathStep& s : p.steps) s.node_id = rm(s.node_id);
+    }
+    // node_order must stay the sorted order, which after renumbering is ascending id.
+    gfa.node_order.clear();
+    gfa.node_order.reserve(gfa.seq.size());
+    for (const auto& [id, sequence] : gfa.seq) {
+        (void)sequence;
+        gfa.node_order.push_back(id);
+    }
+    std::sort(gfa.node_order.begin(), gfa.node_order.end(),
+              [](const std::string& a, const std::string& b) {
+                  return std::stoull(a) < std::stoull(b);
+              });
+    for (auto& [input_id, truth_id] : out.id_remap) {
+        (void)input_id;
+        truth_id = rm(truth_id);
+    }
+
+    // Re-stage so the written graph and the parsed one both carry the model's frame.
+    panvar::write_gfa_model(stage_path, gfa);
     panvar::ParseGfaOptions parse_options;
     out.graph = panvar::parse_gfa(stage_path, parse_options);
     return out;
@@ -472,10 +547,11 @@ int evaluate(const Args& args) {
     summary << "panel_curation\t" << (curation_path.empty() ? "none" : curation_path) << '\n';
     const panvar::PreparedGenotypeModel& model = *loaded.model;
 
-    // Truth comes from the full graph. Sorting depends only on the reference path, so a node id names
-    // the same sequence in both graphs; that is checked here rather than assumed.
-    const SortedGraph truth_graph =
-        load_sorted(args.required("truth-gfa"), reference, out + ".truth.sorted.gfa");
+    // Truth comes from the full graph, placed in the model's node frame -- left to sort itself it does
+    // not land in the same frame once the donor's paths are gone. The check below then confirms the
+    // frame rather than discovering it is broken.
+    const SortedGraph truth_graph = load_truth_in_model_frame(
+        args.required("truth-gfa"), reference, loaded.sorted, out + ".truth.sorted.gfa");
     for (const auto& item : loaded.sorted.gfa.seq) {
         const auto found = truth_graph.gfa.seq.find(item.first);
         if (found == truth_graph.gfa.seq.end() || found->second != item.second) {
@@ -1286,7 +1362,8 @@ int compare(const Args& args) {
     }
     const std::string& seq_a = model.blocks()[block].alleles[allele_a].sequence;
     const std::string& seq_b = model.blocks()[block].alleles[allele_b].sequence;
-    const SortedGraph truth_graph = load_sorted(args.required("truth-gfa"), reference, out + ".truth.sorted.gfa");
+    const SortedGraph truth_graph = load_truth_in_model_frame(
+        args.required("truth-gfa"), reference, loaded.sorted, out + ".truth.sorted.gfa");
     std::vector<std::string> truth_blocks;
     for (const panvar::PathRecord* path : donor_paths(truth_graph.graph, args.required("donor"))) {
         const auto projection = panvar::project_path_onto_locus(truth_graph.graph, loaded.bubbles, loaded.built.report, path->name);
@@ -2026,9 +2103,10 @@ int tied_consensus(const Args& args) {
     const panvar::PreparedGenotypeModel& model = *loaded.model;
     const std::size_t blocks = model.blocks().size();
 
-    // Truth projected onto the model's block frame, exactly as evaluate does it.
-    const SortedGraph truth_graph =
-        load_sorted(args.required("truth-gfa"), reference, out + ".truth.sorted.gfa");
+    // Truth projected onto the model's block frame, exactly as evaluate does it -- which includes
+    // placing the truth graph in the model's node frame before projecting anything.
+    const SortedGraph truth_graph = load_truth_in_model_frame(
+        args.required("truth-gfa"), reference, loaded.sorted, out + ".truth.sorted.gfa");
     std::vector<panvar::PathProjection> truth;
     for (const panvar::PathRecord* path : donor_paths(truth_graph.graph, donor)) {
         const auto projection = panvar::project_path_onto_locus(truth_graph.graph, loaded.bubbles,
@@ -2562,7 +2640,8 @@ int trace(const Args& args) {
                                      " panel rows; pass --truth-gfa to trace a donor that is not in "
                                      "the panel, such as a curated-out synthetic mosaic");
         }
-        const SortedGraph truth_graph = load_sorted(truth_gfa, reference, out + ".truth.sorted.gfa");
+        const SortedGraph truth_graph =
+            load_truth_in_model_frame(truth_gfa, reference, loaded.sorted, out + ".truth.sorted.gfa");
         const std::vector<const panvar::PathRecord*> paths = donor_paths(truth_graph.graph, donor);
         std::vector<panvar::MosaicPath> built;
         for (const panvar::PathRecord* path : paths) {

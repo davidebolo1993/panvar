@@ -1,0 +1,100 @@
+# Frozen settings for the C4 development-donor LEAVE-ONE-OUT campaign. Committed before any donor of
+# this campaign is run, and bound into every run's signature.
+#
+# TWO LINEAGES MEET HERE, and both are recorded rather than collapsed into one number:
+#
+#   READS come from the ordinary-LZO lineage (tests/genotype_coverage_settings.tsv): seed 20260916,
+#   UNSALTED. That is the stream the eight frozen development sources under
+#   tests/results/genotype_coverage_c4_development_2c32c89 were drawn from. Regeneration under the
+#   current probe is byte-identical to those sources -- verified for NA19240, uncompressed content
+#   sha256 r1 64b908d4d0e4c401e1d6a78b85c146037e9bd21326fbab5fc796a1d3b1398e9f and r2
+#   d2cff2441f02fc40743f35c8a3ece8ea5fead05fd025d1effdd8626b23adb937 -- so the donor PRESENT in the
+#   panel and the same donor REMOVED from it are compared on identical input. That paired comparison
+#   is the whole reason for reusing this seed rather than the grouped-prefix one.
+#
+#   CALLER SETTINGS come from the grouped-prefix lineage
+#   (tests/genotype_c4_heldout_mosaic_manifest.tsv): proposal width 256, arms K=0 and K=128, phase
+#   audit 0, diagnostic comparison width 1024.
+#
+# The round-7 combination -- proposal width 1024, mosaic K 8, phase audit 256 -- is REJECTED by name
+# in the manifest gate. NA19240 reaches the blockwise availability floor only at K=128 (distance 4,
+# against 6 for the whole panel at K=0), so a K=8 cohort measures a different question.
+#
+# The scorer caps and cache budget below are EXPERIMENTAL overrides for this campaign, passed
+# explicitly and bound into provenance. The global defaults are unchanged: 2e9 piece hits, 5e8
+# physical origins, 2e8 state classes, 2e8 mass cells, 2e9 latent pairs, and no emission cache.
+key	value
+campaign	c4-development-loo
+reads_lineage	tests/genotype_coverage_settings.tsv
+caller_settings_lineage	tests/genotype_c4_heldout_mosaic_manifest.tsv
+frozen_reads_root	tests/results/genotype_coverage_c4_development_2c32c89
+reference	HG00096#1#haplotype1-0000024:31848049-32074186
+graph	tests/real_data/c4.gfa.gz
+donor_manifest	tests/genotype_development_donors.tsv
+role	development
+scheme	loo
+seed	20260916
+seed_salt	none
+source_coverage	30
+coverages	2,5,10,30
+read_length	100
+insert_mean_bp	350
+insert_sd_bp	40
+support_sigmas	4
+substitution_error	0.002
+outlier_weight	0.001
+proposal_state_limit	256
+call_prefixes	0,128
+max_mosaic_candidates	128
+phase_audit_candidates	0
+diagnostic_comparison_width	1024
+max_state_classes	600000000
+max_physical_origins	700000000
+emission_cache_bytes	536870912
+threads	8
+expected_donors	8
+expected_shared_runs	32
+expected_k_arm_status_records	64
+rejected_proposal_state_limit	1024
+rejected_max_mosaic_candidates	8
+rejected_phase_audit_candidates	256
+acceptance	NA19240_K0_distance	6
+acceptance	NA19240_K128_distance	4
+acceptance	NA19240_K128_attains_availability_floor	true
+acceptance	max_30x_seconds	360
+acceptance	max_rss_bytes	2147483648
+metric	call_status	call.<cov>.K<k>.mosaic_status.tsv	status
+metric	no_call	eval.<cov>.K<k>.summary.tsv	run_no_call
+metric	exact_blocks	eval.<cov>.K<k>.summary.tsv	blocks_exact
+metric	exact_sv_blocks	eval.<cov>.K<k>.summary.tsv	sv_blocks_exact
+metric	per_block_edit_distance	eval.<cov>.K<k>.blocks.tsv	unordered_distance
+metric	block_distance_total	eval.<cov>.K<k>.summary.tsv	unordered_distance_total
+metric	whole_panel_diplotype_floor	eval.<cov>.K0.summary.tsv	minimum_candidate_distance
+metric	blockwise_retained_allele_floor	eval.<cov>.K<k>.summary.tsv	availability_floor_total
+metric	proposed_and_scored_floor	eval.<cov>.K<k>.summary.tsv	minimum_candidate_distance
+metric	floor_attained	eval.<cov>.K<k>.summary.tsv	floor_attained_in_candidates
+metric	excess_over_floor	eval.<cov>.K<k>.summary.tsv	excess_over_floor_total
+metric	winner_excess_over_floor	eval.<cov>.K<k>.summary.tsv	winner_excess_over_floor
+metric	truth_hap1_spellable	eval.<cov>.K<k>.summary.tsv	truth_hap1_spellable
+metric	truth_hap2_spellable	eval.<cov>.K<k>.summary.tsv	truth_hap2_spellable
+metric	truth_in_ranked_prefix	eval.<cov>.K<k>.summary.tsv	truth_in_ranked_prefix
+metric	truth_ranked_prefix_rank	eval.<cov>.K<k>.summary.tsv	truth_ranked_prefix_rank
+metric	truth_fragment_score_rank	eval.<cov>.K<k>.summary.tsv	truth_fragment_score_rank
+metric	closest_candidate_proposal_rank	eval.<cov>.K<k>.summary.tsv	closest_candidate_proposal_rank
+metric	genotype_support	call.<cov>.K<k>.block_genotypes.tsv	genotype_support
+metric	phase_support	call.<cov>.K<k>.mosaic_status.tsv	phase_support
+metric	phase_support_within_candidates	call.<cov>.K<k>.mosaic_status.tsv	phase_support_within_candidates
+metric	candidate_scope	call.<cov>.K<k>.mosaic_status.tsv	candidate_scope
+metric	final_candidate_scope	call.<cov>.K<k>.mosaic_status.tsv	final_candidate_scope
+metric	conditional_gq	call.<cov>.K<k>.block_genotypes.tsv	conditional_GQ
+metric	numeric_separation_gap	call.<cov>.K<k>.mosaic_status.tsv	numeric_separation_gap
+metric	runtime_seconds	resources.<cov>.tsv	wall_seconds
+metric	peak_rss_bytes	resources.<cov>.tsv	peak_rss_bytes
+metric	dp_cache_hits	call.<cov>.K<k>.mosaic_status.tsv	emission_cache_dp_hits
+metric	dp_cache_misses	call.<cov>.K<k>.mosaic_status.tsv	emission_cache_dp_misses
+metric	executed_prefilters	call.<cov>.K<k>.mosaic_status.tsv	emission_cache_executed_prefilters
+metric	executed_dps	call.<cov>.K<k>.mosaic_status.tsv	emission_cache_executed_dps
+metric	cache_entries	call.<cov>.K<k>.mosaic_status.tsv	emission_cache_entries
+metric	cache_payload_bytes	call.<cov>.K<k>.mosaic_status.tsv	emission_cache_payload_bytes
+metric	physical_origins	call.<cov>.K<k>.mosaic_status.tsv	physical_origins
+metric	statistical_state_classes	call.<cov>.K<k>.mosaic_status.tsv	statistical_state_classes
