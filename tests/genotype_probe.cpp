@@ -1496,10 +1496,22 @@ int compare(const Args& args) {
         const auto reads = simulate_from(item.second, library, depth, fragments.front().first.bases.size(),
                                          item.first == "from_a" ? 811 : 812);
         const auto scored = panvar::score_diplotypes(all, {cand_a, cand_b}, reads, library, options);
-        const double calibration_gap = scored.scores[1].fragment_term - scored.scores[0].fragment_term;
-        const bool expected = item.first == "from_a" ? calibration_gap < 0.0 : calibration_gap > 0.0;
+        const double fragment_gap =
+            scored.scores[1].fragment_term - scored.scores[0].fragment_term;
+        const double exposure_gap =
+            scored.scores[1].exposure_term - scored.scores[0].exposure_term;
+        const double total_gap =
+            scored.scores[1].log_likelihood - scored.scores[0].log_likelihood;
+        // Generator preference is a statement about the declared point-process likelihood, not
+        // merely its observed-fragment summand.  The exposure term is candidate-dependent whenever
+        // the two diplotypes have different lengths; omitting it made reads generated from the
+        // shorter HG04036 candidate appear to prefer the longer candidate even though the complete
+        // likelihood favoured their own generator by roughly 1,800 nats at 30x.
+        const bool expected = item.first == "from_a" ? total_gap < 0.0 : total_gap > 0.0;
         summary << "calibration_" << item.first << "_fragments\t" << reads.size() << "\ncalibration_" << item.first
-                << "_gap_b_minus_a\t" << calibration_gap << "\ncalibration_" << item.first << "_prefers_generator\t"
+                << "_fragment_gap_b_minus_a\t" << fragment_gap << "\ncalibration_" << item.first
+                << "_exposure_gap_b_minus_a\t" << exposure_gap << "\ncalibration_" << item.first
+                << "_total_gap_b_minus_a\t" << total_gap << "\ncalibration_" << item.first << "_prefers_generator\t"
                 << (expected ? "true" : "false") << '\n';
     }
 
