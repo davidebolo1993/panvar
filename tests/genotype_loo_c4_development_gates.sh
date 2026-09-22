@@ -192,6 +192,32 @@ check_manifest > "$WORK/round7.log" 2>&1; refused "the round-7 combination" $?
 grep -q "ROUND-7 SETTINGS DETECTED" "$WORK/round7.log"
 same "round-7 is refused by name" "$?" "0"
 
+echo "== the frozen-source check separates a clean checkout from a broken one =="
+restore_real
+SAVED_FROZEN="$FROZEN_ROOT"
+# tests/results is gitignored, so a clean checkout legitimately has no reads. An earlier revision of
+# this gate conflated that with a fault and failed on every fresh checkout and in CI.
+FROZEN_ROOT="$WORK/no-such-root"
+REQUIRE_FROZEN_SOURCES=0 check_manifest > "$WORK/absent.log" 2>&1
+accepted "settings alone, with no reads on the machine" $?
+# The run path is about to score reads, so there the same absence is fatal.
+REQUIRE_FROZEN_SOURCES=1 check_manifest > "$WORK/absent_strict.log" 2>&1
+refused "a campaign run with no reads on the machine" $?
+# A root that exists but is missing a donor is a fault in either mode: that is a broken checkout, not
+# an absent one, and it is how a campaign silently scores seven donors while claiming eight.
+PARTIAL="$WORK/partial"; mkdir -p "$PARTIAL"
+skipped=""
+for d in $DONORS; do
+  if [ -z "$skipped" ]; then skipped="$d"; continue; fi
+  mkdir -p "$PARTIAL/$d/source"; : > "$PARTIAL/$d/source/reads_1.fq.gz"
+done
+FROZEN_ROOT="$PARTIAL"
+REQUIRE_FROZEN_SOURCES=0 check_manifest > "$WORK/partial.log" 2>&1
+refused "a frozen root missing one donor" $?
+grep -q "FROZEN SOURCES MISSING: 1 of 8" "$WORK/partial.log"
+same "the missing donor is counted, not just noticed" "$?" "0"
+FROZEN_ROOT="$SAVED_FROZEN"
+
 echo
 if [ "$fail" -ne 0 ]; then echo "LOO development gates FAILED"; exit 1; fi
 echo "LOO development gates passed"

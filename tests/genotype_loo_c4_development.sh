@@ -43,7 +43,13 @@ MAX_STATE_CLASSES="$(setting max_state_classes)"
 MAX_PHYSICAL_ORIGINS="$(setting max_physical_origins)"
 EMISSION_CACHE_BYTES="$(setting emission_cache_bytes)"
 THREADS="$(setting threads)"
-FROZEN_ROOT="$REPO/$(setting frozen_reads_root)"
+# tests/results is gitignored (245 MB of frozen FASTQs), so a clean checkout -- a detached worktree
+# for a reviewer-facing run, or CI -- has no read sources. The root is therefore overridable, the way
+# the sibling harnesses take BUILD, DONORS and JOBS, so a run from a clean worktree can point at the
+# frozen sources without the campaign's code being dirty. Whatever it points at is gated by content:
+# every source hash is checked against the settings before a read is scored, and bound into the
+# signature afterwards, so an override changes where the reads are read from and not which reads they are.
+FROZEN_ROOT="${FROZEN_ROOT:-$REPO/$(setting frozen_reads_root)}"
 DONOR_MANIFEST="$REPO/$(setting donor_manifest)"
 ROLE="$(setting role)"
 DONORS="${DONORS:-$(awk -F'\t' -v r="$ROLE" '$2==r{print $1}' "$DONOR_MANIFEST")}"
@@ -315,10 +321,22 @@ check_manifest() {
         echo "  NO FROZEN SUBSET COUNT: $d ${cov}x"; bad=$((bad + 1)); }
     done
   done
-  if [ "$missing" = "0" ] && [ "$donors_n" = "$(setting expected_donors)" ]; then
-    echo "  $donors_n development donors, every frozen source present and expected"
+  # Two different questions, and conflating them made this gate fail on every clean checkout: whether
+  # the SETTINGS are consistent is a property of the manifest, while whether the READS are on this
+  # machine is a property of the machine. The run path demands both; a settings check demands only the
+  # first. A root that exists but is missing some donors is a real fault either way.
+  if [ "$donors_n" != "$(setting expected_donors)" ]; then
+    echo "  DONOR COUNT WRONG: $donors_n, expected $(setting expected_donors)"; bad=$((bad + 1))
+  elif [ ! -d "$FROZEN_ROOT" ]; then
+    if [ "${REQUIRE_FROZEN_SOURCES:-0}" = "1" ]; then
+      echo "  FROZEN SOURCES ABSENT: $FROZEN_ROOT"; bad=$((bad + 1))
+    else
+      echo "  $donors_n donors declared; frozen sources not on this machine, settings checked alone"
+    fi
+  elif [ "$missing" != "0" ]; then
+    echo "  FROZEN SOURCES MISSING: $missing of $donors_n under $FROZEN_ROOT"; bad=$((bad + 1))
   else
-    echo "  FROZEN SOURCES MISSING: $missing of $donors_n"; bad=$((bad + 1))
+    echo "  $donors_n development donors, every frozen source present and expected"
   fi
 
   # Both source lineages bound by content.
@@ -368,6 +386,8 @@ OUT="${1:?usage: BUILD=<build> tests/genotype_loo_c4_development.sh <out-dir>}"
 BUILD="${BUILD:-$REPO/build}"
 PROBE="$BUILD/genotype_probe"
 [ -x "$PROBE" ] || { echo "genotype_probe not built at $PROBE" >&2; exit 1; }
+# About to score reads, so their absence is fatal here even though it is not when checking settings.
+REQUIRE_FROZEN_SOURCES=1
 check_manifest
 mkdir -p "$OUT"
 [ -z "$(ls -A "$OUT" 2>/dev/null)" ] || { echo "$OUT is not empty" >&2; exit 1; }
