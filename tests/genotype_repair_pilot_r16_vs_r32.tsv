@@ -1,0 +1,50 @@
+item	value	provenance
+comparison	R=32 winner vs R=16 winner	instrumented run
+r16_winner_entry	8814	prefixes.tsv
+r32_winner_entry	8542	prefixes.tsv
+r16_source	repair	candidates.tsv
+r32_source	repair	candidates.tsv
+r16_seed	329	candidates.tsv
+r32_seed	329	candidates.tsv
+r16_repaired_block	sv:7	candidates.tsv
+r32_repaired_block	ctx:2	candidates.tsv
+r16_local_pair_rank	1	candidates.tsv
+r32_local_pair_rank	17	candidates.tsv
+present_at_R17	true	r32 rank is exactly 17
+first_prefix_where_r32_winner_appears	17	candidates.tsv
+r16_homologue_assignment	0	candidates.tsv
+r32_homologue_assignment	1	candidates.tsv
+r16_repaired_allele_pair	(11,108)	candidates.tsv
+r32_repaired_allele_pair	(37,87)	candidates.tsv
+differing_blocks	2	candidates.tsv
+differing_block_1	ctx:2 R16=(6,41) R32=(37,87)	candidates.tsv
+differing_block_2	sv:7 R16=(11,108) R32=(11,112)	candidates.tsv
+ctx2_distance_r16	31	truth.tsv
+ctx2_distance_r32	18	truth.tsv
+ctx2_floor	11	truth.tsv
+sv7_distance_r16	25	truth.tsv
+sv7_distance_r32	6404	truth.tsv
+sv7_floor	25	truth.tsv
+r16_achieves_sv7_floor	true	distance 25 equals floor 25
+fragment_term_delta	200.440132	prefixes.tsv r32-r16
+exposure_term_delta	-159.400053	prefixes.tsv r32-r16
+prior_delta	-18.215622	prefixes.tsv r32-r16
+component_sum	22.824457	derived
+total_delta	22.824458	prefixes.tsv r32-r16
+reconciliation_residual	-8.0e-07	RECONCILES
+r16_total_distance	147	prefixes.tsv
+r32_total_distance	6513	prefixes.tsv
+availability_floor	91	prefixes.tsv
+r16_excess	56	prefixes.tsv
+r32_excess	6422	prefixes.tsv
+phase_support_all_prefixes	PRIOR_ONLY	prefixes.tsv
+fragment_contenders_r8_r16_r32	8,10,1	prefixes.tsv
+genuinely_different_block_genotype	true	two blocks differ
+phase_or_history_alternative	false	two blocks differ in unordered genotype
+ctx2_posterior_r32	0.653445525079	truth.tsv
+ctx2_GQ_r32	4.60228488907	truth.tsv
+sv7_posterior_r32	0.99999999991	truth.tsv
+sv7_GQ_r32	100.461176643	truth.tsv
+originals_reproduce	true	8384 compared, 0 mismatched, worst delta 0
+order_invariant	true	pilot gate
+swap_invariant	true	pilot gate

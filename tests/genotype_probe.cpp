@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -2667,6 +2668,621 @@ int mosaic_truth(const Args& args) {
 }
 
 // ------------------------------------------------------------------------------------------------
+// repair-pilot: post-ranking block repair, scored in ONE pass over the union
+//
+// EXPERIMENTAL EVALUATION PATH, not the production caller. Production would need a persistent scoring
+// context owning stable read forms, indices, haplotype buffers and cache across incremental scoring;
+// this deliberately does not approximate that by keeping a pointer-based cache alive between calls.
+// There is exactly one score_diplotypes invocation here, over the union of the original candidates and
+// the repairs, which is why no cache has to survive anything.
+//
+// Seeds come from the SIGNATURE-BOUND campaign outputs rather than from a preliminary in-run ranking:
+// the best panel candidate, and every member of the numerical winner-equivalence set. Reading them off
+// disk is what dissolves the circularity -- seeds normally require a ranking, and a ranking requires
+// the scores this pass produces.
+//
+// TRUTH IS NOT IN SCOPE during repair construction. The repairs are built from the model, the block
+// proposal emissions and the campaign tables alone, in a scope entered before the truth graph is
+// loaded, so "no truth field is reachable by the construction" is a property of the code's shape
+// rather than a promise. Truth is loaded afterwards, and only to score the outcome.
+int repair_pilot(const Args& args) {
+    const std::string out = args.required("out");
+    struct StagedGraphs {
+        std::string prefix;
+        ~StagedGraphs() {
+            std::error_code ignored;
+            std::filesystem::remove(prefix + ".model.sorted.gfa", ignored);
+            std::filesystem::remove(prefix + ".truth.sorted.gfa", ignored);
+        }
+    } staged_graphs{out};
+    const std::string reference = args.required("reference");
+    const std::string donor = args.required("donor");
+    const std::string run = args.required("run");
+    const std::size_t local_pairs = std::stoul(args.get("local-pairs", "32"));
+    const double switch_probability = std::stod(args.get("switch-probability", "0.01"));
+    const std::uint64_t declared_cap = std::stoull(args.get("max-repair-candidates", "0"));
+
+    const LoadedModel loaded =
+        load_model(args.required("model-gfa"), reference, out + ".model.sorted.gfa", 50);
+    const panvar::PreparedGenotypeModel& model = *loaded.model;
+    const std::size_t blocks = model.blocks().size();
+    const auto status = read_key_values(run + ".mosaic_status.tsv");
+    if (status.at("model_fingerprint") != loaded.fingerprint) {
+        throw std::runtime_error("the run was not scored on the rebuilt model");
+    }
+
+    const panvar::LibraryModel library = read_library_file(args.required("library"));
+    const std::vector<panvar::ReadPair> fragments =
+        read_pairs(args.required("reads1"), args.required("reads2"));
+
+    // Block proposal emissions, rebuilt exactly as the run built them. The fitted background is not
+    // declared in these libraries, so the fit runs; its rate and background are checked against the
+    // run's recorded values, because emissions that differ would rank a different set of local pairs.
+    const panvar::PreparedMarkerPanel markers = panvar::build_marker_panel(model, 31, 15);
+    const panvar::MarkerObservations observations = panvar::count_marker_observations(markers, fragments);
+    std::optional<double> declared_background;
+    {
+        std::ifstream file(args.required("library"));
+        std::string key;
+        double value = 0.0;
+        for (std::string line; std::getline(file, line);) {
+            std::istringstream fields(line);
+            if (fields >> key >> value && key == "marker_background") declared_background = value;
+        }
+    }
+    const panvar::MarkerDepthEstimate depth =
+        panvar::estimate_marker_depth(markers, observations, declared_background);
+    if (!depth.converged) throw std::runtime_error("the marker depth fit did not converge");
+    const panvar::PreparedProposalEmissions emissions = panvar::build_proposal_emissions(
+        markers, observations, panvar::proposal_marker_parameters(depth, 31, 15));
+
+    std::ofstream summary(out + ".summary.tsv");
+    summary << std::setprecision(12) << "key\tvalue\n";
+    summary << "donor\t" << donor << "\nrun\t" << run << "\nlocal_pairs\t" << local_pairs << '\n';
+    summary << "marker_depth_rate_per_copy\t" << depth.rate_per_copy << "\nmarker_background\t"
+            << depth.background << "\nmarker_depth_termination\t" << depth.termination << '\n';
+    summary << "recorded_marker_depth_rate_per_copy\t" << status.at("marker_depth_rate_per_copy")
+            << "\nrecorded_marker_background\t" << status.at("marker_background") << '\n';
+
+    // ---- the campaign's candidate set, read back ---------------------------------------------------
+    struct Original {
+        std::vector<std::size_t> first;
+        std::vector<std::size_t> second;
+        std::string source;
+        // The row's own sequence-candidate id. The reproduction guard below compares each original
+        // against ITS OWN recorded score: matching against the nearest score anywhere in the table
+        // would pass whenever a candidate happened to coincide with some other candidate's value.
+        std::string sequence_candidate_id;
+    };
+    std::vector<Original> originals;
+    std::map<std::string, std::size_t> original_of_id;
+    for (const auto& row : read_table(run + ".mosaic_candidates.tsv")) {
+        Original entry;
+        entry.first = parse_alleles(row.at("hap1_alleles"));
+        entry.second = parse_alleles(row.at("hap2_alleles"));
+        entry.source = row.count("source") != 0 ? row.at("source") : std::string("unknown");
+        entry.sequence_candidate_id =
+            row.count("sequence_candidate_id") != 0 ? row.at("sequence_candidate_id") : std::string();
+        original_of_id.emplace(row.at("candidate_id"), originals.size());
+        originals.push_back(std::move(entry));
+    }
+    if (originals.empty()) throw std::runtime_error("the run has no candidates");
+
+    // Seeds: the best panel candidate, and every member of the winner-equivalence set.
+    std::vector<std::size_t> seeds;
+    std::set<std::size_t> seen_seed;
+    std::string best_panel_id;
+    double best_panel_score = 0.0;
+    bool have_panel = false;
+    std::map<std::string, double> recorded_score;
+    for (const auto& row : read_table(run + ".mosaic_scores.tsv")) {
+        const std::string rep = row.at("representative_beam_candidate");
+        const double score = std::stod(row.at("score"));
+        recorded_score.emplace(row.at("sequence_candidate_id"), score);
+        const auto found = original_of_id.find(rep);
+        if (found == original_of_id.end()) continue;
+        if (originals[found->second].source == "panel" && (!have_panel || score > best_panel_score)) {
+            have_panel = true;
+            best_panel_score = score;
+            best_panel_id = rep;
+        }
+        if (row.at("in_winner_set") == "true" && seen_seed.insert(found->second).second) {
+            seeds.push_back(found->second);
+        }
+    }
+    if (have_panel) {
+        const std::size_t slot = original_of_id.at(best_panel_id);
+        if (seen_seed.insert(slot).second) seeds.push_back(slot);
+    }
+    summary << "seeds\t" << seeds.size() << "\nbest_panel_candidate\t"
+            << (have_panel ? best_panel_id : std::string("none")) << '\n';
+
+    // ---- the declared bound, computed from the block shape rather than assumed ----------------------
+    // Sum over blocks of min(local_pairs, unordered pairs available), times two homologue assignments,
+    // times the seeds. A block with few alleles cannot supply local_pairs, so a flat seeds x blocks x
+    // local_pairs x 2 would name a number no configuration can reach.
+    std::uint64_t cap = 0;
+    for (std::size_t b = 0; b < blocks; ++b) {
+        const std::uint64_t a = model.blocks()[b].alleles.size();
+        const std::uint64_t available = a * (a + 1) / 2;
+        cap += std::min<std::uint64_t>(local_pairs, available) * 2;
+    }
+    cap *= seeds.size();
+    summary << "repair_cap\t" << cap << "\ndeclared_cap\t" << declared_cap << '\n';
+    if (declared_cap != 0 && cap > declared_cap) {
+        summary << "refused\ttrue\nrefusal\tthe repair construction exceeds its declared bound\n";
+        std::cout << "repair-pilot " << donor << ": REFUSED before allocation, " << cap
+                  << " repair candidates exceeds the declared " << declared_cap << '\n';
+        return 3;
+    }
+    // ---- repair construction. TRUTH IS NOT IN SCOPE: nothing below reads it, and the truth graph is
+    // ---- not loaded until every repair has been built and scored.
+    const std::vector<double> switches(blocks - 1, switch_probability);
+    std::vector<panvar::MosaicPath> paths;
+    std::vector<std::string> sequences;
+    std::map<std::vector<std::size_t>, std::size_t> slot_of_path;
+    const auto slot_for = [&](const std::vector<std::size_t>& alleles) {
+        const auto found = slot_of_path.find(alleles);
+        if (found != slot_of_path.end()) return found->second;
+        const std::size_t slot = paths.size();
+        slot_of_path.emplace(alleles, slot);
+        paths.push_back(panvar::MosaicPath{alleles});
+        sequences.push_back(panvar::spell_mosaic(model, panvar::MosaicPath{alleles}).bases);
+        return slot;
+    };
+    struct Entry {
+        std::size_t first_slot = 0;
+        std::size_t second_slot = 0;
+        std::size_t rank = 0;      // 0 for originals; the local-pair rank that admitted a repair
+        bool repair = false;
+        // Self-description, so a candidate table needs nothing reconstructed later. The previous
+        // revision recorded only per-prefix outcomes, which made the R=16/R=32 comparison impossible
+        // to answer from its own outputs.
+        std::string seed_id;       // sequence-candidate id of the seed this repair came from
+        std::size_t block = 0;     // the repaired block
+        int assignment = 0;        // 0: (x,y) onto (hap1,hap2); 1: the swap
+        std::size_t allele_x = 0;
+        std::size_t allele_y = 0;
+    };
+    std::vector<Entry> entries;
+    // Parallel to `entries` for the originals only: the sequence-candidate id each one was read from,
+    // captured here because originals are deduplicated by allele-path pair on the way in, so indexing
+    // `originals` afterwards would not line up.
+    std::vector<std::string> original_entry_id;
+    std::set<std::pair<std::vector<std::size_t>, std::vector<std::size_t>>> seen_path_pair;
+    const auto key_of = [](const std::vector<std::size_t>& a, const std::vector<std::size_t>& b) {
+        return a <= b ? std::make_pair(a, b) : std::make_pair(b, a);
+    };
+    for (const Original& entry : originals) {
+        if (!seen_path_pair.insert(key_of(entry.first, entry.second)).second) continue;
+        entries.push_back({slot_for(entry.first), slot_for(entry.second), 0, false, std::string(), 0, 0,
+                           0, 0});
+        original_entry_id.push_back(entry.sequence_candidate_id);
+    }
+    const std::size_t original_entries = entries.size();
+
+    std::uint64_t generated = 0;
+    std::uint64_t rejected_prior = 0;
+    std::uint64_t duplicate = 0;
+    for (const std::size_t seed : seeds) {
+        const Original& base = originals[seed];
+        for (std::size_t b = 0; b < blocks; ++b) {
+            const panvar::BlockProposalEmissions& emission = emissions.blocks[b];
+            const std::size_t alleles = emission.allele_count;
+            std::vector<std::pair<double, std::pair<std::size_t, std::size_t>>> ranked;
+            ranked.reserve(alleles * (alleles + 1) / 2);
+            for (std::size_t x = 0; x < alleles; ++x) {
+                for (std::size_t y = x; y < alleles; ++y) {
+                    ranked.push_back({emission.at(x, y), {x, y}});
+                }
+            }
+            // Deterministic: emission descending, then allele indices, so no tie depends on sort order.
+            std::sort(ranked.begin(), ranked.end(),
+                      [](const auto& lhs, const auto& rhs) {
+                          if (lhs.first != rhs.first) return lhs.first > rhs.first;
+                          return lhs.second < rhs.second;
+                      });
+            const std::size_t take = std::min(local_pairs, ranked.size());
+            for (std::size_t r = 0; r < take; ++r) {
+                const std::size_t x = ranked[r].second.first;
+                const std::size_t y = ranked[r].second.second;
+                for (int assignment = 0; assignment < 2; ++assignment) {
+                    if (assignment == 1 && x == y) continue;   // the swap is the same diplotype
+                    std::vector<std::size_t> first = base.first;
+                    std::vector<std::size_t> second = base.second;
+                    first[b] = assignment == 0 ? x : y;
+                    second[b] = assignment == 0 ? y : x;
+                    ++generated;
+                    if (!seen_path_pair.insert(key_of(first, second)).second) {
+                        ++duplicate;
+                        continue;
+                    }
+                    const std::size_t s1 = slot_for(first);
+                    const std::size_t s2 = slot_for(second);
+                    // A finite switching prior is required: -inf means no allele path spells it.
+                    const double prior = panvar::log_unordered_sequence_pair_prior(
+                        model, sequences[s1], sequences[s2], switches);
+                    if (!std::isfinite(prior)) {
+                        ++rejected_prior;
+                        continue;
+                    }
+                    entries.push_back({s1, s2, r + 1, true, base.sequence_candidate_id, b,
+                                       assignment, x, y});
+                }
+            }
+        }
+    }
+    const std::size_t repair_entries = entries.size() - original_entries;
+    summary << "repairs_generated\t" << generated << "\nrepairs_duplicate\t" << duplicate
+            << "\nrepairs_rejected_infinite_prior\t" << rejected_prior << "\nrepairs_kept\t"
+            << repair_entries << "\noriginal_entries\t" << original_entries << '\n';
+
+    // ---- ONE scoring pass over the union -----------------------------------------------------------
+    const panvar::InternedHaplotypes interned = panvar::intern_haplotypes(paths, sequences);
+    std::map<std::pair<std::size_t, std::size_t>, std::size_t> scored_index;
+    std::vector<panvar::HaplotypeCandidate> scored_pairs;
+    std::vector<std::size_t> pair_of_entry(entries.size(), 0);
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        std::size_t x = interned.index_of[entries[i].first_slot];
+        std::size_t y = interned.index_of[entries[i].second_slot];
+        if (y < x) std::swap(x, y);
+        const auto inserted = scored_index.emplace(std::make_pair(x, y), scored_pairs.size());
+        if (inserted.second) scored_pairs.push_back({x, y});
+        pair_of_entry[i] = inserted.first->second;
+    }
+    summary << "unique_haplotypes\t" << interned.sequences.size() << "\nscored_pairs\t"
+            << scored_pairs.size() << '\n';
+
+    panvar::FragmentScoringOptions scoring;
+    scoring.threads = std::stoul(args.get("threads", "8"));
+    scoring.mismatch_band = std::stoul(status.at("mismatch_band"));
+    scoring.minimum_piece_bp = 12;
+    scoring.max_piece_hits = std::stoull(status.at("max_piece_hits"));
+    scoring.max_proposed_starts_per_haplotype = std::stoull(status.at("max_proposed_starts_per_haplotype"));
+    scoring.max_physical_origins = std::stoull(status.at("max_physical_origins"));
+    scoring.max_state_classes = std::stoull(status.at("max_state_classes"));
+    scoring.max_mass_cells = std::stoull(status.at("max_mass_cells"));
+    scoring.emission_cache_bytes = static_cast<std::size_t>(std::stoull(status.at("emission_cache_bytes")));
+    const auto scoring_mark = std::chrono::steady_clock::now();
+    const panvar::FragmentScoringResult scored =
+        panvar::score_diplotypes(interned, scored_pairs, fragments, library, scoring);
+    const double scoring_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - scoring_mark).count();
+    summary << "scoring_seconds\t" << scoring_seconds << "\nemission_cache_dp_hits\t"
+            << scored.emission_cache.dp_cache_hits << "\nemission_cache_dp_misses\t"
+            << scored.emission_cache.dp_cache_misses << "\nemission_cache_executed_dps\t"
+            << scored.emission_cache.executed_dps << "\nemission_cache_entries\t"
+            << scored.emission_cache.entries << '\n';
+
+    // Per-entry complete score. certify_scored_ranking adds the prior itself, so the reproduction
+    // check below compares log_likelihood + prior -- adding the certified score would count it twice.
+    // Once per SCORED PAIR, not once per entry: thousands of entries collapse onto far fewer pairs,
+    // and this prior is a forward recursion over the panel, not a lookup.
+    std::vector<double> prior_of_pair(scored_pairs.size(), 0.0);
+    for (std::size_t slot = 0; slot < scored_pairs.size(); ++slot) {
+        prior_of_pair[slot] = panvar::log_unordered_sequence_pair_prior(
+            model, interned.sequences[scored_pairs[slot].first],
+            interned.sequences[scored_pairs[slot].second], switches);
+    }
+
+    // ---- the guard: every ORIGINAL score must reproduce before any repair is interpreted -----------
+    std::size_t compared = 0;
+    std::size_t mismatched = 0;
+    double worst = 0.0;
+    std::size_t unkeyed = 0;
+    for (std::size_t i = 0; i < original_entries; ++i) {
+        const std::size_t slot = pair_of_entry[i];
+        const double mine = scored.scores[slot].log_likelihood + prior_of_pair[slot];
+        // Each original against ITS OWN recorded row, keyed by sequence-candidate id. Matching against
+        // the nearest value anywhere in the table would pass whenever a candidate coincided with some
+        // other candidate's score, and would cost 8,384^2 comparisons to do it.
+        const auto found = recorded_score.find(original_entry_id[i]);
+        ++compared;
+        if (found == recorded_score.end()) {
+            ++unkeyed;
+            ++mismatched;
+            continue;
+        }
+        const double delta = std::fabs(found->second - mine);
+        if (delta > 1e-6) {
+            ++mismatched;
+            worst = std::max(worst, delta);
+        }
+    }
+    summary << "originals_unkeyed\t" << unkeyed << '\n';
+    summary << "originals_compared\t" << compared << "\noriginals_mismatched\t" << mismatched
+            << "\nworst_original_delta\t" << worst << "\noriginals_reproduce\t"
+            << (mismatched == 0 ? "true" : "false") << '\n';
+    if (mismatched != 0) {
+        summary << "refused\ttrue\nrefusal\toriginal scores did not reproduce; repairs not interpreted\n";
+        std::cout << "repair-pilot " << donor << ": REFUSED, " << mismatched
+                  << " original scores did not reproduce (worst delta " << worst << ")\n";
+        return 4;
+    }
+
+    // ---- nested prefixes, all certified from the one scoring pass. NO TRUTH IN SCOPE YET. ----------
+    std::vector<std::size_t> prefixes;
+    {
+        std::stringstream spec(args.get("prefixes", "8,16,32"));
+        for (std::string cell; std::getline(spec, cell, ',');) prefixes.push_back(std::stoul(cell));
+    }
+    struct PrefixResult {
+        std::size_t prefix = 0;
+        std::size_t candidates = 0;
+        std::size_t repairs_included = 0;
+        std::size_t winner_entry = 0;
+        bool complete = false;
+        double winner_score = 0.0;
+        double separation = 0.0;
+        std::size_t fragment_contenders = 0;
+        std::string phase_support;
+        std::vector<std::pair<double, double>> block_confidence;   // posterior, GQ
+        std::vector<bool> block_read_supported;
+        std::vector<bool> block_separated;
+    };
+    // Certify one prefix from the shared scores. `order` lets the candidate-order invariance gate
+    // re-certify a permuted presentation without a single new likelihood call.
+    const auto certify_prefix = [&](std::size_t prefix, bool reversed) {
+        std::vector<std::size_t> chosen;
+        for (std::size_t i = 0; i < entries.size(); ++i) {
+            if (!entries[i].repair || entries[i].rank <= prefix) chosen.push_back(i);
+        }
+        if (reversed) std::reverse(chosen.begin(), chosen.end());
+        std::map<std::size_t, std::size_t> slot_of_local;
+        std::vector<panvar::DiplotypeScore> scores;
+        std::vector<double> priors;
+        std::vector<std::size_t> entry_of_local;
+        for (const std::size_t i : chosen) {
+            const std::size_t slot = pair_of_entry[i];
+            if (slot_of_local.count(slot) != 0) continue;
+            slot_of_local.emplace(slot, scores.size());
+            scores.push_back(scored.scores[slot]);
+            priors.push_back(prior_of_pair[slot]);
+            entry_of_local.push_back(i);
+        }
+        const panvar::CertifiedRanking ranking = panvar::certify_scored_ranking(
+            scores, fragments.size(), scoring.mismatch_band, scored.counters,
+            panvar::CertificationOptions{}, priors);
+        PrefixResult result;
+        result.prefix = prefix;
+        result.candidates = scores.size();
+        for (const std::size_t i : chosen) result.repairs_included += entries[i].repair ? 1 : 0;
+        result.winner_entry = entry_of_local[ranking.winner_set.front()];
+        result.complete = ranking.status == panvar::RescoreStatus::Complete;
+        result.winner_score = ranking.candidates.front().score;
+        result.separation = ranking.certified_gap;
+
+        // Ranked order, winner first: block_genotype_confidence compares every row against row 0.
+        std::vector<double> ranked_scores;
+        std::vector<double> ranked_bounds;
+        std::vector<std::vector<std::pair<std::size_t, std::size_t>>> ranked_genotypes;
+        const auto genotype_row = [&](std::size_t entry) {
+            const std::vector<std::size_t>& a = paths[entries[entry].first_slot].alleles;
+            const std::vector<std::size_t>& b2 = paths[entries[entry].second_slot].alleles;
+            std::vector<std::pair<std::size_t, std::size_t>> row(blocks);
+            for (std::size_t b = 0; b < blocks; ++b) row[b] = std::minmax(a[b], b2[b]);
+            return row;
+        };
+        for (const panvar::CertifiedCandidate& candidate : ranking.candidates) {
+            ranked_scores.push_back(candidate.score);
+            ranked_bounds.push_back(candidate.numeric_error_bound);
+            ranked_genotypes.push_back(genotype_row(entry_of_local[candidate.candidate_id]));
+        }
+        const std::vector<panvar::BlockGenotypeConfidence> confidence =
+            panvar::block_genotype_confidence(ranked_scores, ranked_bounds, ranked_genotypes);
+        result.block_read_supported.assign(blocks, true);
+        for (const auto& item : confidence) {
+            result.block_confidence.push_back({item.posterior, item.quality});
+            result.block_separated.push_back(item.numerically_separated);
+        }
+        // A fragment contender is a rival the READS do not put below the winner, which is production's
+        // condition verbatim; a block on which any contender disagrees is not read-supported.
+        const panvar::CertifiedCandidate& best = ranking.candidates.front();
+        for (std::size_t c = 1; c < ranking.candidates.size(); ++c) {
+            const panvar::CertifiedCandidate& rival = ranking.candidates[c];
+            if (rival.fragment_term + rival.numeric_error_bound <
+                best.fragment_term - best.numeric_error_bound) {
+                continue;
+            }
+            ++result.fragment_contenders;
+            for (std::size_t b = 0; b < blocks; ++b) {
+                if (ranked_genotypes[c][b] != ranked_genotypes[0][b]) result.block_read_supported[b] = false;
+            }
+        }
+        result.phase_support = !result.complete ? "UNRESOLVED"
+                               : result.fragment_contenders == 0 ? "READS_WITHIN_CANDIDATES"
+                                                                 : "PRIOR_ONLY";
+        return result;
+    };
+
+    std::vector<PrefixResult> results;
+    for (const std::size_t prefix : prefixes) results.push_back(certify_prefix(prefix, false));
+
+    // ---- invariance gates, both from the already-computed scores: no new likelihood call ------------
+    // Candidate order: the same prefix presented back to front must certify the same winner and score.
+    bool order_invariant = true;
+    for (const PrefixResult& forward : results) {
+        const PrefixResult back = certify_prefix(forward.prefix, true);
+        const std::vector<std::size_t>& f1 = paths[entries[forward.winner_entry].first_slot].alleles;
+        const std::vector<std::size_t>& f2 = paths[entries[forward.winner_entry].second_slot].alleles;
+        const std::vector<std::size_t>& b1 = paths[entries[back.winner_entry].first_slot].alleles;
+        const std::vector<std::size_t>& b2 = paths[entries[back.winner_entry].second_slot].alleles;
+        if (back.candidates != forward.candidates || back.winner_score != forward.winner_score ||
+            std::minmax(f1, f2) != std::minmax(b1, b2)) {
+            order_invariant = false;
+        }
+    }
+    // Homologue swap: rebuilding the construction with each seed's two haplotypes exchanged must yield
+    // the same candidate key set, because both assignments are generated for every local pair.
+    bool swap_invariant = true;
+    {
+        std::set<std::pair<std::vector<std::size_t>, std::vector<std::size_t>>> swapped;
+        for (const std::size_t seed : seeds) {
+            const Original& base = originals[seed];
+            for (std::size_t b = 0; b < blocks; ++b) {
+                const panvar::BlockProposalEmissions& emission = emissions.blocks[b];
+                const std::size_t alleles = emission.allele_count;
+                std::vector<std::pair<double, std::pair<std::size_t, std::size_t>>> ranked;
+                for (std::size_t x = 0; x < alleles; ++x) {
+                    for (std::size_t y = x; y < alleles; ++y) ranked.push_back({emission.at(x, y), {x, y}});
+                }
+                std::sort(ranked.begin(), ranked.end(), [](const auto& lhs, const auto& rhs) {
+                    if (lhs.first != rhs.first) return lhs.first > rhs.first;
+                    return lhs.second < rhs.second;
+                });
+                const std::size_t take = std::min(local_pairs, ranked.size());
+                for (std::size_t r = 0; r < take; ++r) {
+                    const std::size_t x = ranked[r].second.first;
+                    const std::size_t y = ranked[r].second.second;
+                    for (int assignment = 0; assignment < 2; ++assignment) {
+                        if (assignment == 1 && x == y) continue;
+                        std::vector<std::size_t> first = base.second;   // homologues exchanged
+                        std::vector<std::size_t> second = base.first;
+                        first[b] = assignment == 0 ? x : y;
+                        second[b] = assignment == 0 ? y : x;
+                        swapped.insert(key_of(first, second));
+                    }
+                }
+            }
+        }
+        std::set<std::pair<std::vector<std::size_t>, std::vector<std::size_t>>> forward;
+        for (std::size_t i = original_entries; i < entries.size(); ++i) {
+            forward.insert(key_of(paths[entries[i].first_slot].alleles,
+                                  paths[entries[i].second_slot].alleles));
+        }
+        for (const auto& key : forward) {
+            if (swapped.count(key) == 0) swap_invariant = false;
+        }
+    }
+    summary << "order_invariant\t" << (order_invariant ? "true" : "false") << "\nswap_invariant\t"
+            << (swap_invariant ? "true" : "false") << '\n';
+
+    // ---- the candidate table: TRUTH-FREE, and written before truth is loaded -----------------------
+    {
+        std::ofstream candidates(out + ".candidates.tsv");
+        candidates << std::setprecision(12)
+                   << "candidate_index\tsource\tseed_id\trepaired_block\tlocal_pair_rank\tassignment\t"
+                      "allele_x\tallele_y\thap1_alleles\thap2_alleles\tfragment_term\texposure_term\t"
+                      "prior\ttotal";
+        for (const PrefixResult& r : results) candidates << "\tin_R" << r.prefix;
+        for (const PrefixResult& r : results) candidates << "\twinner_R" << r.prefix;
+        candidates << '\n';
+        const auto join = [](const std::vector<std::size_t>& v) {
+            std::string text;
+            for (std::size_t i = 0; i < v.size(); ++i) {
+                if (i != 0) text += ',';
+                text += std::to_string(v[i]);
+            }
+            return text;
+        };
+        for (std::size_t i = 0; i < entries.size(); ++i) {
+            const Entry& entry = entries[i];
+            const std::size_t slot = pair_of_entry[i];
+            const double total = scored.scores[slot].log_likelihood + prior_of_pair[slot];
+            candidates << i << '\t' << (entry.repair ? "repair" : "original") << '\t'
+                       // original_entry_id holds only the originals prefix, so bound the index
+                       // explicitly rather than leaning on the ternary's short circuit.
+                       << (entry.repair || i >= original_entry_id.size() ? entry.seed_id
+                                                                        : original_entry_id[i])
+                       << '\t'
+                       << (entry.repair ? model.blocks()[entry.block].block_id : std::string("NA")) << '\t'
+                       << (entry.repair ? std::to_string(entry.rank) : std::string("NA")) << '\t'
+                       << (entry.repair ? std::to_string(entry.assignment) : std::string("NA")) << '\t'
+                       << (entry.repair ? std::to_string(entry.allele_x) : std::string("NA")) << '\t'
+                       << (entry.repair ? std::to_string(entry.allele_y) : std::string("NA")) << '\t'
+                       << join(paths[entry.first_slot].alleles) << '\t'
+                       << join(paths[entry.second_slot].alleles) << '\t'
+                       << scored.scores[slot].fragment_term << '\t' << scored.scores[slot].exposure_term
+                       << '\t' << prior_of_pair[slot] << '\t' << total;
+            for (const PrefixResult& r : results) {
+                candidates << '\t' << ((!entry.repair || entry.rank <= r.prefix) ? "true" : "false");
+            }
+            for (const PrefixResult& r : results) {
+                candidates << '\t' << (r.winner_entry == i ? "true" : "false");
+            }
+            candidates << '\n';
+        }
+    }
+
+    // ---- truth enters ONLY here, after every candidate is built, scored and written ----------------
+    const SortedGraph truth_graph = load_truth_in_model_frame(
+        args.required("truth-gfa"), reference, loaded.sorted, out + ".truth.sorted.gfa");
+    std::vector<panvar::PathProjection> truth;
+    for (const panvar::PathRecord* path : donor_paths(truth_graph.graph, donor)) {
+        const auto projection = panvar::project_path_onto_locus(truth_graph.graph, loaded.bubbles,
+                                                                loaded.built.report, path->name);
+        if (!projection.has_value()) throw std::runtime_error("truth does not span the block chain");
+        truth.push_back(*projection);
+    }
+    const auto spelling = [&](std::size_t b, std::size_t allele) -> const std::string& {
+        return model.blocks()[b].alleles[allele].sequence;
+    };
+    const auto block_distance = [&](std::size_t b, std::size_t a1, std::size_t a2) -> long {
+        if (!truth[0].blocks[b].has_value() || !truth[1].blocks[b].has_value()) return -1;
+        const std::string& t1 = *truth[0].blocks[b];
+        const std::string& t2 = *truth[1].blocks[b];
+        return std::min(edit_distance(t1, spelling(b, a1)) + edit_distance(t2, spelling(b, a2)),
+                        edit_distance(t1, spelling(b, a2)) + edit_distance(t2, spelling(b, a1)));
+    };
+    std::vector<long> block_floor(blocks, 0);
+    long floor_total = 0;
+    for (std::size_t b = 0; b < blocks; ++b) {
+        if (!truth[0].blocks[b].has_value() || !truth[1].blocks[b].has_value()) continue;
+        bool available = false;
+        block_floor[b] = closest_allele_distance(*truth[0].blocks[b], model.blocks()[b], available) +
+                         closest_allele_distance(*truth[1].blocks[b], model.blocks()[b], available);
+        floor_total += block_floor[b];
+    }
+    summary << "availability_floor_total\t" << floor_total << '\n';
+
+    std::ofstream table(out + ".prefixes.tsv");
+    table << std::setprecision(12)
+          << "local_pairs\tcandidates\trepairs_included\tstatus\twinner_is_repair\twinner_entry\t"
+             "winner_score\tfragment_term\texposure_term\tprior\tseparation\tfragment_contenders\t"
+             "phase_support\tdistance\tfloor\texcess\n";
+    std::ofstream per_block(out + ".truth.tsv");
+    per_block << std::setprecision(12)
+              << "local_pairs\tblock\tblock_id\tkind\twinner_allele1\twinner_allele2\tblock_distance\t"
+                 "block_floor\tblock_excess\tgenotype_support\tposterior\tGQ\tnumerically_separated\n";
+    for (const PrefixResult& r : results) {
+        const std::size_t slot = pair_of_entry[r.winner_entry];
+        const std::vector<std::size_t>& w1 = paths[entries[r.winner_entry].first_slot].alleles;
+        const std::vector<std::size_t>& w2 = paths[entries[r.winner_entry].second_slot].alleles;
+        long distance = 0;
+        bool defined = true;
+        for (std::size_t b = 0; b < blocks; ++b) {
+            const long d = block_distance(b, w1[b], w2[b]);
+            if (d < 0) {
+                defined = false;
+                continue;
+            }
+            distance += d;
+            per_block << r.prefix << '\t' << b << '\t' << model.blocks()[b].block_id << '\t'
+                      << (model.blocks()[b].kind == panvar::GenotypeBlockKind::Variant ? "SV" : "context")
+                      << '\t' << w1[b] << '\t' << w2[b] << '\t' << d << '\t' << block_floor[b] << '\t'
+                      << (d - block_floor[b]) << '\t'
+                      << (r.block_read_supported[b] ? "READS" : "PRIOR_ONLY") << '\t'
+                      << r.block_confidence[b].first << '\t' << r.block_confidence[b].second << '\t'
+                      << (r.block_separated[b] ? "true" : "false") << '\n';
+        }
+        table << r.prefix << '\t' << r.candidates << '\t' << r.repairs_included << '\t'
+              << (r.complete ? "COMPLETE" : "RESCORE_INCOMPLETE") << '\t'
+              << (entries[r.winner_entry].repair ? "true" : "false") << '\t' << r.winner_entry << '\t'
+              << r.winner_score << '\t' << scored.scores[slot].fragment_term << '\t'
+              << scored.scores[slot].exposure_term << '\t' << prior_of_pair[slot] << '\t' << r.separation
+              << '\t' << r.fragment_contenders << '\t' << r.phase_support << '\t'
+              << (defined ? std::to_string(distance) : std::string("NA")) << '\t' << floor_total << '\t'
+              << (defined ? std::to_string(distance - floor_total) : std::string("NA")) << '\n';
+    }
+    std::cout << "repair-pilot " << donor << ": " << repair_entries << " repairs kept of " << generated
+              << " generated, " << scored_pairs.size() << " scored pairs, "
+              << interned.sequences.size() << " unique haplotypes, " << scoring_seconds
+              << "s scoring, order_invariant=" << (order_invariant ? "true" : "false")
+              << " swap_invariant=" << (swap_invariant ? "true" : "false") << '\n';
+    return 0;
+}
+
+// ------------------------------------------------------------------------------------------------
 // form-census: how much placement work is spent re-scanning read sequence that already occurred
 // ------------------------------------------------------------------------------------------------
 
@@ -3167,6 +3783,7 @@ int main(int argc, char** argv) {
         if (command == "orientations") return orientations(args);
         if (command == "panel-alleles") return panel_alleles(args);
         if (command == "tied-consensus") return tied_consensus(args);
+        if (command == "repair-pilot") return repair_pilot(args);
         std::cerr << "unknown probe command: " << command << '\n';
         return 2;
     } catch (const std::exception& error) {

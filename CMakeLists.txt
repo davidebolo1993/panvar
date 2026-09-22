@@ -332,6 +332,13 @@ if(PANVAR_BUILD_TESTING)
         add_test(NAME panvar_genotype_pair_override
                  COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_pair_override.sh
                          ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_BINARY_DIR}/genotype_pair_override)
+        # repair-pilot's construction and certification must not depend on candidate order or on which
+        # homologue of a seed is written first. Both are checked from the scores its single pass already
+        # produced, so neither costs an extra likelihood call.
+        add_test(NAME panvar_genotype_repair_pilot_invariance
+                 COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/genotype_repair_pilot_invariance.sh
+                         ${CMAKE_CURRENT_BINARY_DIR}
+                         ${CMAKE_CURRENT_BINARY_DIR}/genotype_repair_pilot_invariance)
 
         # Fast, dependency-free smoke on a tiny hand-built graph that exercises every
         # call event type + confounders with exact-record assertions (no vg needed).
