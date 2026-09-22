@@ -510,6 +510,13 @@ MosaicBeamResult propose_mosaic_diplotypes_grouped(const PanelAlleleMatrix& pane
             record.prefix_pairs_retained = pairs.size();
             record.max_states_per_prefix = pairs.empty() ? 0 : 1;
             record.states_pruned = selector.offered() - pairs.size();
+            // The weakest pair this layer kept: take() sorts by better_pair descending, so the last
+            // retained pair IS the cut line. Without it a pruned target has no measurable margin.
+            // target_group_rank_by_offered_mass walks only the RETAINED pairs, so a pruned target
+            // always reports pairs.size() + 1 -- a sentinel meaning "not retained", not a distance,
+            // and it reads as "missed by one" at every width, which it is not. Diagnostic only: this
+            // sits inside the traced branch and an untraced search computes and stores nothing.
+            record.retained_min_log_mass = pairs.empty() ? kNegInf : pairs.back().mass;
             if (record.target_states_offered > 0) {
                 std::size_t rank = 1;
                 for (const PairState& kept : pairs) {
@@ -712,6 +719,13 @@ MosaicBeamResult propose_mosaic_diplotypes_grouped(const PanelAlleleMatrix& pane
             record.prefix_pairs_retained = pairs.size();
             record.max_states_per_prefix = pairs.empty() ? 0 : 1;
             record.states_pruned = selector.offered() - pairs.size();
+            // The weakest pair this layer kept: take() sorts by better_pair descending, so the last
+            // retained pair IS the cut line. Without it a pruned target has no measurable margin.
+            // target_group_rank_by_offered_mass walks only the RETAINED pairs, so a pruned target
+            // always reports pairs.size() + 1 -- a sentinel meaning "not retained", not a distance,
+            // and it reads as "missed by one" at every width, which it is not. Diagnostic only: this
+            // sits inside the traced branch and an untraced search computes and stores nothing.
+            record.retained_min_log_mass = pairs.empty() ? kNegInf : pairs.back().mass;
             if (record.target_states_offered > 0) {
                 std::size_t rank = 1;
                 for (const PairState& kept : pairs) {

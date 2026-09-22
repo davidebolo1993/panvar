@@ -1283,6 +1283,25 @@ int compare(const Args& args) {
     const panvar::InternedHaplotypes all = panvar::intern_haplotypes(paths, sequences);
     const panvar::HaplotypeCandidate cand_a{all.index_of[0], all.index_of[1]};
     const panvar::HaplotypeCandidate cand_b{all.index_of[2], all.index_of[3]};
+
+    // The prior is part of the score, and it differs between candidates because the Li-Stephens
+    // switching path differs. A comparison reporting only fragment and exposure is not the model's
+    // preference, which is the same mistake as reporting a fragment term alone. The pair prior is
+    // taken from the same function the command uses, so the log(2) for two distinct sequences is
+    // applied identically rather than reconstructed here.
+    //
+    // A haploid prior of -inf means no allele path spells that haplotype: blockwise spellability
+    // asked exactly the way the model asks it, rather than as a separate reimplemented check.
+    const double switch_probability = std::stod(args.get("switch-probability", "0.01"));
+    const std::vector<double> switches_for_prior(model.blocks().size() - 1, switch_probability);
+    const double prior_a =
+        panvar::log_unordered_sequence_pair_prior(model, sequences[0], sequences[1], switches_for_prior);
+    const double prior_b =
+        panvar::log_unordered_sequence_pair_prior(model, sequences[2], sequences[3], switches_for_prior);
+    double haploid_prior[4];
+    for (std::size_t i = 0; i < 4; ++i) {
+        haploid_prior[i] = panvar::log_haploid_sequence_prior(model, sequences[i], switches_for_prior);
+    }
     const panvar::LibraryModel library = read_library_file(args.required("library"));
     const std::vector<panvar::ReadPair> fragments = read_pairs(args.required("reads1"), args.required("reads2"));
     panvar::FragmentScoringOptions options;
@@ -1318,6 +1337,31 @@ int compare(const Args& args) {
             << (together.scores[1].exposure_term - together.scores[0].exposure_term)
             << "\nalleles_a_override\t" << overrode_a << "\nalleles_b_override\t" << overrode_b
             << "\nrun_b\t" << (run_b_path.empty() ? "none" : run_b_path) << '\n';
+    // DiplotypeScore::log_likelihood carries fragment + exposure; the prior is added at certification.
+    // The COMPLETE score is therefore log_likelihood + pair prior, and that is what decides a ranking.
+    summary << std::setprecision(12) << "switch_probability\t" << switch_probability
+            << "\nprior_a\t" << prior_a << "\nprior_b\t" << prior_b
+            << "\nprior_gap_b_minus_a\t" << (prior_b - prior_a)
+            << "\ncomplete_score_a\t" << (together.scores[0].log_likelihood + prior_a)
+            << "\ncomplete_score_b\t" << (together.scores[1].log_likelihood + prior_b)
+            << "\ncomplete_score_gap_b_minus_a\t"
+            << ((together.scores[1].log_likelihood + prior_b) -
+                (together.scores[0].log_likelihood + prior_a))
+            << "\nb_outscores_a\t"
+            << (((together.scores[1].log_likelihood + prior_b) >
+                 (together.scores[0].log_likelihood + prior_a))
+                    ? "true"
+                    : "false")
+            << '\n';
+    // Blockwise spellability, asked as the model asks it: -inf means no allele path spells that
+    // haplotype, so the panel cannot represent it at all.
+    summary << "hap_a1_prior\t" << haploid_prior[0] << "\nhap_a2_prior\t" << haploid_prior[1]
+            << "\nhap_b1_prior\t" << haploid_prior[2] << "\nhap_b2_prior\t" << haploid_prior[3]
+            << "\na_spellable\t"
+            << ((std::isfinite(haploid_prior[0]) && std::isfinite(haploid_prior[1])) ? "true" : "false")
+            << "\nb_spellable\t"
+            << ((std::isfinite(haploid_prior[2]) && std::isfinite(haploid_prior[3])) ? "true" : "false")
+            << '\n';
 
     // ---- 3. per-fragment decomposition ------------------------------------------------------------------
     const std::size_t u = together.unique_haplotypes;
@@ -2704,6 +2748,18 @@ int form_census(const Args& args) {
 // search (gated): its candidates are compared with the run's manifest.
 int trace(const Args& args) {
     const std::string out = args.required("out");
+    // Same staging leak compare had: the sorted graphs are an artefact of loading, 3.3 MB each, and
+    // trace removed neither. A guard rather than a call at the end, because the target and fingerprint
+    // checks below throw after the model graph is staged. (evaluate leaks these too, deliberately left
+    // alone: its staged truth graph is the evidence a node-frame diagnosis reads.)
+    struct StagedGraphs {
+        std::string prefix;
+        ~StagedGraphs() {
+            std::error_code ignored;
+            std::filesystem::remove(prefix + ".model.sorted.gfa", ignored);
+            std::filesystem::remove(prefix + ".truth.sorted.gfa", ignored);
+        }
+    } staged_graphs{out};
     const std::string reference = args.required("reference");
     const std::string donor = args.required("donor");
     const std::string run = args.required("run");
@@ -2732,7 +2788,34 @@ int trace(const Args& args) {
     // of the experiment -- so its target comes from projecting the truth paths onto the block chain,
     // exactly as evaluate derives truth, and there are no declared templates to follow alongside it.
     panvar::MosaicDiplotype truth;
-    if (rows.size() == 2) {
+    // A declared target, given as "<hap1 allele list>|<hap2 allele list>". Needed to trace a candidate
+    // that is not the donor's truth -- a repaired candidate, for instance, which is the winner with one
+    // block replaced. It also sidesteps two dead ends for a leave-one-out donor: its panel rows are
+    // gone, so rows.size() is 0 rather than 2, and the truth branch refuses outright when a projected
+    // allele is not an allele of the model ("the target cannot be traced through a beam that could
+    // never spell it"), which is exactly the case for a donor whose truth the panel cannot spell.
+    const std::string target_spec = args.get("target-alleles", "");
+    if (!target_spec.empty()) {
+        const std::size_t bar = target_spec.find('|');
+        if (bar == std::string::npos) {
+            throw std::runtime_error("--target-alleles expects \"<hap1 alleles>|<hap2 alleles>\"");
+        }
+        panvar::MosaicPath first{parse_alleles(target_spec.substr(0, bar))};
+        panvar::MosaicPath second{parse_alleles(target_spec.substr(bar + 1))};
+        const std::size_t blocks = model.blocks().size();
+        if (first.alleles.size() != blocks || second.alleles.size() != blocks) {
+            throw std::runtime_error("--target-alleles needs one allele per block (" +
+                                     std::to_string(blocks) + " per haplotype)");
+        }
+        for (std::size_t b = 0; b < blocks; ++b) {
+            const std::size_t count = model.blocks()[b].alleles.size();
+            if (first.alleles[b] >= count || second.alleles[b] >= count) {
+                throw std::runtime_error("--target-alleles names an allele outside block " +
+                                         model.blocks()[b].block_id);
+            }
+        }
+        truth = panvar::MosaicDiplotype{std::move(first), std::move(second)};
+    } else if (rows.size() == 2) {
         truth = panvar::MosaicDiplotype{
             panvar::MosaicPath{std::vector<std::size_t>(panel.template_alleles[rows[0]].begin(),
                                                         panel.template_alleles[rows[0]].end())},
@@ -2866,7 +2949,9 @@ int trace(const Args& args) {
               "truth_prefixes_present\ttruth_states_offered\ttruth_states_retained\ttruth_best_log_mass\t"
               "truth_logsum_log_mass\ttruth_retained_logsum_log_mass\ttruth_lost_log_mass\t"
               "truth_group_rank_by_mass\ttruth_rank\tdonor_templates_offered\tdonor_templates_log_mass\t"
-              "donor_templates_retained\n";
+              "donor_templates_retained\ttruth_pair_local_rank\tlocal_pairs_ranked\t"
+              "truth_allele1_local_rank\ttruth_allele2_local_rank\tlocal_alleles\t"
+              "local_alleles_scored\n";
     double truth_emission_total = 0.0;
     double winner_emission_total = 0.0;
     std::string first_loss = "never";
@@ -2878,6 +2963,35 @@ int trace(const Args& args) {
         truth_emission_total += truth_e;
         winner_emission_total += winner_e;
         const double best_e = *std::max_element(emission.log_score.begin(), emission.log_score.end());
+        // The TRUTH-FREE local standing of the declared target's alleles in this block. Nothing here
+        // reads truth: it ranks the target's allele pair among every unordered pair the block offers,
+        // by the same proposal emission the beam ranks on, and ranks each of its two alleles by the
+        // best pairing that allele can reach. That is what a generic block-diversity rule would have to
+        // see to reach these alleles without being told the answer.
+        //
+        // log_score is a symmetric allele_count x allele_count matrix, so best_e above is a PAIR score
+        // and is commensurable with truth_e. Unscored alleles keep 0.0, which at these magnitudes ranks
+        // them last rather than first; local_alleles_scored is reported so that stays auditable.
+        const std::size_t local_alleles = emission.allele_count;
+        std::size_t pair_rank = 1;
+        std::size_t pairs_ranked = 0;
+        std::vector<double> allele_best(local_alleles, -std::numeric_limits<double>::infinity());
+        for (std::size_t x = 0; x < local_alleles; ++x) {
+            for (std::size_t y = x; y < local_alleles; ++y) {
+                const double e = emission.at(x, y);
+                ++pairs_ranked;
+                if (e > truth_e) ++pair_rank;
+                if (e > allele_best[x]) allele_best[x] = e;
+                if (e > allele_best[y]) allele_best[y] = e;
+            }
+        }
+        const auto marginal_rank = [&](std::size_t allele) {
+            std::size_t rank = 1;
+            for (std::size_t x = 0; x < local_alleles; ++x) {
+                if (allele_best[x] > allele_best[allele]) ++rank;
+            }
+            return rank;
+        };
         if (first_loss == "never" && layer.target_states_retained == 0) first_loss = model.blocks()[b].block_id;
         layers << b << '\t' << model.blocks()[b].block_id << '\t'
                << (model.blocks()[b].kind == panvar::GenotypeBlockKind::Variant ? "SV" : "context") << '\t'
@@ -2898,6 +3012,10 @@ int trace(const Args& args) {
                << (layer.target_states_offered > 0 ? std::to_string(layer.offered_above_target_best + 1) : "NA")
                << '\t' << (layer.declared_templates_offered ? "true" : "false") << '\t'
                << layer.declared_templates_log_mass << '\t' << (layer.declared_templates_retained ? "true" : "false")
+               << '\t' << pair_rank << '\t' << pairs_ranked << '\t'
+               << marginal_rank(truth.first.alleles[b]) << '\t'
+               << marginal_rank(truth.second.alleles[b]) << '\t' << local_alleles << '\t'
+               << emission.scored_alleles
                << '\n';
     }
     bool truth_proposed = false;
