@@ -212,6 +212,90 @@ struct GappedEmissionCounters {
 
 GappedEmissionCounters take_gapped_emission_counters();
 
+// A census of the verification stream, for deciding whether exact reuse is worth building at all.
+// Off by default; when off it costs one relaxed bool test per emission.
+//
+// An emission KEY is exactly (oriented read bytes, the target window the recursion can touch). Three
+// things deliberately do NOT enter it:
+//
+//   * the haplotype identity or the start offset -- two windows with the same bytes give the same
+//     answer, which is the whole point, and is what lets reuse cross haplotypes rather than only
+//     repeat within one;
+//   * the available length at a boundary -- the window's LENGTH already carries it. The recursion
+//     consumes at most read_length + max_gap_bp bases, so every start with at least that much
+//     remaining yields a full-length window and an identical computation, while a start nearer the
+//     end yields a shorter window and is a genuinely different key;
+//   * direction -- reverse-role forms are already reversed against a reversed haplotype before the
+//     emission sees them, so the convention is normalised by the sequence itself.
+//
+// Band and library parameters are fixed within a scoring run and so are not part of the key.
+struct EmissionCensus {
+    std::uint64_t requests = 0;                    // total verification requests
+    std::uint64_t distinct = 0;                    // distinct exact keys
+    std::uint64_t prefilter_refusal_requests = 0;  // answered by the prefilter, no recursion
+    std::uint64_t prefilter_refusal_distinct = 0;
+    std::uint64_t dp_requests = 0;                 // requests that executed the recursion
+    std::uint64_t dp_distinct = 0;
+    std::uint64_t key_bytes = 0;                   // predicted cache payload: keys ...
+    std::uint64_t value_bytes = 0;                 // ... and the values they would hold
+};
+
+// Census hashing is 128-bit. A collision would MERGE two distinct keys and therefore UNDER-count
+// distinctness, which biases the census against building the cache rather than for it.
+void begin_emission_census();
+EmissionCensus end_emission_census();
+
+// ---------------------------------------------------------------------------------------------
+// Exact reuse of identical emission calculations.
+//
+// The census measured 81x repetition among DP-evaluated requests and 55x among prefilter refusals
+// on NA19240 2x, because the panel's 129 haplotypes share most local windows at homologous
+// positions. Reuse is therefore CROSS-HAPLOTYPE and long range: a key recurs about once per
+// haplotype pass. That rules out per-thread caches (each worker owns a disjoint slice of the
+// haplotypes, so it would see a fraction of the repetition) and rules out eviction under a cyclic
+// access pattern, which is LRU's worst case.
+//
+// The two streams are budgeted differently because the census says they differ by two orders of
+// magnitude in both size and value: at 30x the DP set projects to ~1.0M keys costing ~26us each to
+// recompute, while the refusal set projects to ~8.7M keys costing ~1.6us each. So DP results are
+// always retained, and refusals are retained while the declared budget allows. Exhaustion falls
+// back to uncached exact computation -- never eviction -- which changes nothing observable because
+// every cached value is an exact function of its key.
+struct EmissionCacheCounters {
+    std::uint64_t requests = 0;              // emission requests reaching the cache
+    std::uint64_t hits = 0;
+    std::uint64_t misses = 0;
+    std::uint64_t executed_prefilters = 0;   // prefilters actually run
+    std::uint64_t executed_dps = 0;          // recursions actually run
+    std::uint64_t payload_bytes = 0;         // key and value bytes retained
+    std::uint64_t entries = 0;
+    std::uint64_t refusals_not_retained = 0; // refusals the declared budget declined to hold
+};
+
+// `budget_bytes` bounds what refusal entries may occupy; zero disables the cache entirely, which is
+// the default and reproduces the uncached implementation exactly. The cache lives for one scoring
+// pass: keys reference the caller's form and haplotype buffers, which must outlive it.
+// TEST ONLY. Forces every emission key's hash to zero, so every distinct key collides into one
+// shard and byte equality is the sole thing separating them. A real 128-bit collision cannot be
+// manufactured to order; collapsing the hash exercises the same code path, harder, on every key
+// rather than on one contrived pair. Never set on a production path.
+void set_emission_cache_hash_collapse(bool collapse);
+
+void begin_emission_cache(std::size_t budget_bytes);
+
+// The live counters, without disarming or discarding anything. Separate from end_emission_cache so
+// that a caller can record what the cache did while the cache is still in use -- the teardown
+// belongs to whichever scope owns the buffers the keys point into, and doing both in one call meant
+// whoever read first silently disarmed it for everyone else.
+EmissionCacheCounters read_emission_cache_counters();
+
+EmissionCacheCounters end_emission_cache();
+
+// What the most recently completed scoring pass's cache did. end_emission_cache() tears the table
+// down before any status writer runs, so the figures are retained here rather than recovered by
+// threading the scoring result through every caller that wants to report them.
+EmissionCacheCounters last_emission_cache_counters();
+
 // The same emission, anchored at the read's RIGHT endpoint instead of at its start.
 //
 // An FR pair is sequenced from both ends of ONE template: the forward mate is read rightward from
@@ -408,6 +492,11 @@ struct FragmentScoringOptions {
     // as the geometry is tested, and a running per-worker crossing point would move with the
     // partition. The default holds the same headroom over C4 that the origin cap does.
     std::uint64_t max_latent_alignment_pairs = 2000000000ULL;
+    // Bytes the exact emission cache may spend retaining prefilter refusals. Zero -- the default --
+    // disables the cache and reproduces the uncached path exactly, so no existing caller changes
+    // behaviour by upgrading. DP results are retained regardless of this budget: the census shows
+    // them to be both far fewer and far dearer to recompute.
+    std::size_t emission_cache_bytes = 0;
     // Diagnostics only; nothing here enters a score or a ranking. When set, the result carries for
     // every (fragment, haplotype) the accepted physical-origin count and the single highest-mass origin,
     // and for the listed fragments every accepted origin.
@@ -499,6 +588,10 @@ struct FragmentScoringResult {
     std::size_t threads_used_placement = 1;
     // candidates x fragments: the work the combination phase performs, independent of thread count.
     std::uint64_t candidate_fragment_evaluations = 0;
+    // Work the exact emission cache did, if it was armed. Deliberately NOT part of
+    // FragmentScoringCounters: those count logical events and must stay identical between a cached
+    // and an uncached run of the same input, which is what makes the two comparable at all.
+    EmissionCacheCounters emission_cache;
     // Filled only when requested in FragmentScoringOptions; same row-major layout as log_mass.
     std::vector<OriginSummary> origin_summary;
     // (fragment, haplotype) -> every accepted origin, for record_origins_for_fragments only.

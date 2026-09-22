@@ -342,6 +342,116 @@ void test_both_span_paths_agree_with_the_oracle() {
     }
 }
 
+// The exact emission cache must be exactly that: a run with it armed and a run without it must
+// agree on every score, every mass and every LOGICAL counter, at any thread count. The cache is
+// shared across haplotypes and filled concurrently, so this is also where a dangling window
+// pointer or a shallow component copy would surface -- both would be silent otherwise.
+void test_emission_cache_is_exact() {
+    std::mt19937_64 rng(606);
+    // Repeated units, so one read form meets identical windows on several haplotypes and the cache
+    // is genuinely exercised rather than merely present.
+    const std::string unit = random_bases(rng, 180);
+    const std::string spacer = random_bases(rng, 60);
+    const std::string a = spacer + unit + spacer + unit + spacer;
+    std::string b = a;
+    for (int edit = 0; edit < 15; ++edit) b[rng() % b.size()] = "ACGT"[rng() % 4];
+    std::string c = a;
+    c.insert(c.begin() + 250, 'A');          // a one-base indel between panel members
+    c.resize(a.size());
+
+    std::vector<panvar::ReadPair> fragments;
+    for (std::size_t start : {30, 120, 210, 300, 390}) {
+        if (start + 130 > a.size()) continue;
+        fragments.push_back({read("f/1", a.substr(start, 60)),
+                             read("f/2", revcomp(a.substr(start + 70, 60)))});
+    }
+    require(!fragments.empty(), "fixture: the sweep must produce fragments");
+
+    const panvar::InternedHaplotypes interned = intern({a, b, c});
+    const panvar::LibraryModel model = library();
+    std::vector<panvar::HaplotypeCandidate> candidates;
+    for (std::size_t x = 0; x < 3; ++x) {
+        for (std::size_t y = x; y < 3; ++y) candidates.push_back({x, y});
+    }
+
+    panvar::FragmentScoringOptions uncached;
+    uncached.mismatch_band = 3;
+    uncached.minimum_piece_bp = 8;
+    uncached.threads = 1;
+    uncached.emission_cache_bytes = 0;
+    const panvar::FragmentScoringResult reference =
+        panvar::score_diplotypes(interned, candidates, fragments, model, uncached);
+    require(reference.emission_cache.requests == 0,
+            "a zero budget must leave the cache disarmed, not merely empty");
+
+    std::uint64_t total_hits = 0;
+    double worst_mass = 0.0;
+    double worst_score = 0.0;
+    for (std::size_t threads : {1, 2, 4, 8}) {
+        panvar::FragmentScoringOptions cached = uncached;
+        cached.threads = threads;
+        cached.emission_cache_bytes = 1u << 22;   // 4 MB: ample for this fixture
+        const panvar::FragmentScoringResult actual =
+            panvar::score_diplotypes(interned, candidates, fragments, model, cached);
+
+        for (std::size_t f = 0; f < fragments.size(); ++f) {
+            for (std::size_t h = 0; h < interned.sequences.size(); ++h) {
+                const double want = reference.mass_of(f, h);
+                const double got = actual.mass_of(f, h);
+                if (want == -std::numeric_limits<double>::infinity() ||
+                    got == -std::numeric_limits<double>::infinity()) {
+                    require(want == got,
+                            "a cached run must place exactly the fragments an uncached run places");
+                    continue;
+                }
+                worst_mass = std::max(worst_mass, std::abs(want - got));
+            }
+        }
+        for (std::size_t k = 0; k < candidates.size(); ++k) {
+            worst_score = std::max(worst_score, std::abs(reference.scores[k].log_likelihood -
+                                                         actual.scores[k].log_likelihood));
+            require(reference.scores[k].fragments_with_mass == actual.scores[k].fragments_with_mass,
+                    "fragment disposition must not depend on the cache");
+        }
+        // The LOGICAL counters describe what the model did, not what the machine avoided, so they
+        // must be untouched by caching or by the thread count. This is the check that would catch a
+        // cache that quietly changed which placements were found.
+        const panvar::FragmentScoringCounters& want = reference.counters;
+        const panvar::FragmentScoringCounters& got = actual.counters;
+        // One require per counter, not a ten-way conjunction. A bundled assertion names only the
+        // bundle when it fails, which sends the reader hunting for which member broke -- the same
+        // "evidence you cannot read" fault this suite rejects elsewhere.
+        const auto same = [&](const char* name, std::uint64_t expected, std::uint64_t actual_value) {
+            require(expected == actual_value,
+                    std::string("logical counter ") + name + " must be identical with and without "
+                    "the cache at threads=" + std::to_string(threads) + ": uncached=" +
+                    std::to_string(expected) + " cached=" + std::to_string(actual_value));
+        };
+        same("full_read_verifications", want.full_read_verifications, got.full_read_verifications);
+        same("dp_evaluations", want.dp_evaluations, got.dp_evaluations);
+        same("prefilter_rejections", want.prefilter_rejections, got.prefilter_rejections);
+        same("accepted_mate_placements", want.accepted_mate_placements, got.accepted_mate_placements);
+        same("valid_fr_states", want.valid_fr_states, got.valid_fr_states);
+        same("latent_alignment_pairs", want.latent_alignment_pairs, got.latent_alignment_pairs);
+        same("physical_origins", want.physical_origins, got.physical_origins);
+        same("statistical_state_classes", want.statistical_state_classes,
+             got.statistical_state_classes);
+        same("proposed_starts", want.proposed_starts, got.proposed_starts);
+        same("unique_starts", want.unique_starts, got.unique_starts);
+        // ... while the WORK counters must show the cache actually did something.
+        require(actual.emission_cache.hits > 0,
+                "fixture: the cache must actually hit, or this gate proves only that an unused "
+                "cache is harmless");
+        require(actual.emission_cache.executed_dps < got.dp_evaluations,
+                "executed recursions must fall below the logical count once reuse is captured");
+        total_hits += actual.emission_cache.hits;
+    }
+    require(worst_mass <= 1e-9 && worst_score <= 1e-9,
+            "cached and uncached scores must agree within the declared tolerance");
+    std::cout << "  emission cache exact at 1/2/4/8 threads: worst mass delta " << worst_mass
+              << ", worst score delta " << worst_score << ", " << total_hits << " hits\n";
+}
+
 void test_homozygote_counts_two_copies() {
     std::mt19937_64 rng(555);
     const std::string a = random_bases(rng, 380);
@@ -950,6 +1060,7 @@ int main() {
         test_orientation_roles_are_symmetric();
         test_multiplicity_counts_places_not_alignments();
         test_both_span_paths_agree_with_the_oracle();
+        test_emission_cache_is_exact();
         test_homozygote_counts_two_copies();
         test_exposure_uses_read_length_distribution();
         test_refusals();

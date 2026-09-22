@@ -334,6 +334,23 @@ void write_status(
     out << "max_piece_hits\t" << options.max_piece_hits << '\n';
     out << "max_proposed_starts_per_haplotype\t" << options.max_proposed_starts_per_haplotype << '\n';
     out << "max_physical_origins\t" << options.max_physical_origins << '\n';
+    // Declared here so an overridden cap or an armed cache is part of what the run is, not a flag
+    // someone has to remember was passed.
+    out << "emission_cache_bytes\t" << options.emission_cache_bytes << '\n';
+    if (options.emission_cache_bytes > 0) {
+        // What the cache actually did, as distinct from the logical work counters below, which stay
+        // identical whether or not it was armed. `payload_bytes` is what the declared budget is
+        // spent against and is the figure to size a larger run from.
+        const EmissionCacheCounters cache = last_emission_cache_counters();
+        out << "emission_cache_requests\t" << cache.requests << '\n';
+        out << "emission_cache_hits\t" << cache.hits << '\n';
+        out << "emission_cache_misses\t" << cache.misses << '\n';
+        out << "emission_cache_entries\t" << cache.entries << '\n';
+        out << "emission_cache_payload_bytes\t" << cache.payload_bytes << '\n';
+        out << "emission_cache_executed_prefilters\t" << cache.executed_prefilters << '\n';
+        out << "emission_cache_executed_dps\t" << cache.executed_dps << '\n';
+        out << "emission_cache_refusals_not_retained\t" << cache.refusals_not_retained << '\n';
+    }
     out << "max_state_classes\t" << options.max_state_classes << '\n';
     out << "max_mass_cells\t" << options.max_mass_cells << '\n';
     out << "library_provenance\t" << library.provenance << '\n';
@@ -964,6 +981,7 @@ GenotypeRunStatus run_genotype(const GenotypeCommandOptions& options) {
     scoring_options.max_physical_origins = options.max_physical_origins;
     scoring_options.max_state_classes = options.max_state_classes;
     scoring_options.max_mass_cells = options.max_mass_cells;
+    scoring_options.emission_cache_bytes = options.emission_cache_bytes;
     FragmentScoringResult scored;
     std::string rescore_failure;
     if (any_ranked) {

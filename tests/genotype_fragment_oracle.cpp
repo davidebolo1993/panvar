@@ -1209,9 +1209,111 @@ void test_scaled_emission_matches_the_reference() {
               << ", worst total delta " << worst_total << '\n';
 }
 
+// The cache must answer exactly what the reference computes, including when every key collides.
+// Byte equality is the only thing that separates keys under the collapse, so if the comparison were
+// wrong -- or if a component copy were a view into an arena another insert reallocated -- this is
+// where it shows. Each key is requested twice so the second request is served from the cache.
+void test_emission_cache_matches_the_reference_under_hash_collapse() {
+    std::string haplotype(300, 'A');
+    for (std::size_t i = 0; i < haplotype.size(); ++i) haplotype[i] = "ACGT"[(i * 5 + 1) % 4];
+    haplotype.replace(120, 9, std::string(9, 'T'));       // a homopolymer for real indel ambiguity
+
+    // Held alive for the whole cached section: keys reference these buffers.
+    std::vector<std::string> reads;
+    std::vector<std::size_t> starts;
+    for (std::size_t start : {0, 44, 118, 121, 200, 240}) {
+        if (start + 50 > haplotype.size()) continue;
+        for (std::size_t edits = 0; edits <= 3; ++edits) {
+            std::string bases = haplotype.substr(start, 50);
+            for (std::size_t e = 0; e < edits; ++e) {
+                const std::size_t at = (e * 11 + 2) % bases.size();
+                bases[at] = bases[at] == 'A' ? 'C' : 'A';
+            }
+            reads.push_back(bases);
+            starts.push_back(start);
+        }
+        // The NA19240 mechanism itself, through the cache: one extra base, and one missing.
+        std::string inserted = haplotype.substr(start, 50);
+        inserted.insert(inserted.begin() + 5, inserted[5]);
+        inserted.resize(50);
+        reads.push_back(inserted);
+        starts.push_back(start);
+        std::string deleted = haplotype.substr(start, 51);
+        deleted.erase(deleted.begin() + 5);
+        deleted.resize(50);
+        reads.push_back(deleted);
+        starts.push_back(start);
+        // Unrelated sequence, far outside any band. Without these the sweep refuses nothing once
+        // the displacement band opens -- the indel-bearing reads that a gapless model turned away
+        // now place -- and the CACHED REFUSAL path would go untested at exactly the settings that
+        // matter. Derived deterministically from the start so the fixture stays reproducible.
+        std::string unrelated(50, 'A');
+        for (std::size_t i = 0; i < unrelated.size(); ++i) {
+            unrelated[i] = "ACGT"[(start * 7 + i * 3 + 1) % 4];
+        }
+        reads.push_back(unrelated);
+        starts.push_back(start);
+    }
+
+    for (std::size_t max_gap : {0, 2, 3}) {
+        const panvar::LibraryModel model = gap_library(0.002, max_gap);
+        const std::size_t band = 6;
+        std::vector<std::optional<panvar::GappedFit>> expected;
+        expected.reserve(reads.size());
+        for (std::size_t i = 0; i < reads.size(); ++i) {
+            expected.push_back(
+                panvar::gapped_emission_reference(haplotype, reads[i], starts[i], model, band));
+        }
+
+        panvar::set_emission_cache_hash_collapse(true);
+        panvar::begin_emission_cache(1u << 20);
+        std::size_t accepted = 0;
+        std::size_t refused = 0;
+        double worst = 0.0;
+        for (int pass = 0; pass < 2; ++pass) {     // second pass must come from the cache
+            for (std::size_t i = 0; i < reads.size(); ++i) {
+                const auto got =
+                    panvar::gapped_emission(haplotype, reads[i], starts[i], model, band);
+                require(got.has_value() == expected[i].has_value(),
+                        "a totally collided cache must still accept and refuse exactly as the "
+                        "reference does");
+                if (!got.has_value()) { if (pass == 0) ++refused; continue; }
+                if (pass == 0) ++accepted;
+                require(got->components.size() == expected[i]->components.size(),
+                        "consumed-span components must survive the cache intact");
+                for (std::size_t c = 0; c < got->components.size(); ++c) {
+                    require(got->components[c].consumed_bp == expected[i]->components[c].consumed_bp &&
+                                got->components[c].edits == expected[i]->components[c].edits,
+                            "component spans and edit counts must be identical");
+                    worst = std::max(worst, std::abs(got->components[c].log_emission -
+                                                     expected[i]->components[c].log_emission));
+                }
+                require(got->consumed_bp == expected[i]->consumed_bp,
+                        "the highest-mass span must be identical");
+                worst = std::max(worst, std::abs(got->log_emission - expected[i]->log_emission));
+            }
+        }
+        const panvar::EmissionCacheCounters counters = panvar::end_emission_cache();
+        panvar::set_emission_cache_hash_collapse(false);
+
+        require(worst < 1e-9, "a cached emission must match the reference within the tolerance");
+        require(accepted > 0 && refused > 0,
+                "fixture: the sweep must both accept and refuse, or the collision path is only "
+                "half exercised");
+        require(counters.hits >= reads.size(),
+                "the second pass must be served from the cache, or nothing was reused");
+        require(counters.executed_dps + counters.executed_prefilters < counters.requests,
+                "reuse must have avoided work, not merely recorded it");
+        std::cout << "  hash-collapsed cache matches the reference at max_gap=" << max_gap << ": "
+                  << accepted << " accepted, " << refused << " refused, " << counters.hits
+                  << " hits, worst delta " << worst << '\n';
+    }
+}
+
 int main() {
     try {
         test_scaled_emission_matches_the_reference();
+        test_emission_cache_matches_the_reference_under_hash_collapse();
         test_gapped_reduces_to_substitution_model();
         test_gapped_emission_normalises();
         test_one_base_homopolymer_insertion();

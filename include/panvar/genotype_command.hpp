@@ -72,6 +72,10 @@ struct GenotypeCommandOptions {
     std::uint64_t max_physical_origins = 500000000ULL;
     std::uint64_t max_state_classes = 200000000ULL;
     std::uint64_t max_mass_cells = 200000000ULL;
+    // Bytes the exact emission cache may spend retaining prefilter refusals; zero disables it and
+    // reproduces the uncached path exactly. Accepted fits are retained regardless, being far fewer
+    // and far dearer to recompute. Bound into the run signature, like every cap above.
+    std::size_t emission_cache_bytes = 0;
     bool quiet = false;
     // Development harness only; not a command-line option. When non-empty (strictly increasing, the
     // last equal to max_mosaic_candidates), the model, markers and proposal are computed once, and each prefix

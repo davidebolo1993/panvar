@@ -1053,7 +1053,21 @@ void test_candidate_prefixes_match_standalone() {
                     "candidate_fragment_evaluations",
                     // Only a refused run emits these, and they measure the work the shared budget
                     // allowed before it stopped -- a property of the pass, not of the candidate set.
-                    "observed_piece_hits", "observed_physical_origins"};
+                    "observed_piece_hits", "observed_physical_origins",
+                    // How the shared pass's verifications split between the pair-HMM and the exact
+                    // feasibility prefilter. Same reasoning as full_read_verifications above: the
+                    // ladder's pass covers the union of every prefix, so it verifies roughly twice
+                    // what a standalone K = 0 run does (26,412 against 13,186 on this fixture), and
+                    // the split moves with it. The CALL must still be identical, which is what the
+                    // rest of this comparison checks.
+                    "dp_evaluations", "prefilter_rejections",
+                    // Likewise the exact emission cache's work counters, whenever one is armed.
+                    // emission_cache_bytes is deliberately NOT here: that is a declared option and
+                    // both runs must agree on it.
+                    "emission_cache_requests", "emission_cache_hits", "emission_cache_misses",
+                    "emission_cache_entries", "emission_cache_payload_bytes",
+                    "emission_cache_executed_prefilters", "emission_cache_executed_dps",
+                    "emission_cache_refusals_not_retained"};
                 if (shared_work.count(key) != 0) continue;
                 // K = 0 alone is asymmetric, and legitimately so: a standalone K = 0 run requests no
                 // mosaics, no audit and no prefix, so it builds no beam at all, while the K = 0 VIEW of a

@@ -9,8 +9,12 @@
 #include <set>
 #include <tuple>
 #include <type_traits>
+#include <array>
 #include <cmath>
+#include <cstring>
+#include <mutex>
 #include <stdexcept>
+#include <unordered_map>
 
 #include "edlib.h"
 
@@ -377,6 +381,250 @@ EmissionWork& emission_work() {
     return work;
 }
 
+// ---- verification-stream census (opt-in; see EmissionCensus in the header) --------------------
+struct CensusKey {
+    std::uint64_t a = 0;
+    std::uint64_t b = 0;
+    bool operator==(const CensusKey& other) const noexcept {
+        return a == other.a && b == other.b;
+    }
+};
+struct CensusKeyHash {
+    std::size_t operator()(const CensusKey& key) const noexcept {
+        return static_cast<std::size_t>(key.a ^ (key.b * 0x9e3779b97f4a7c15ULL));
+    }
+};
+struct CensusEntry {
+    std::uint32_t requests = 0;
+    std::uint16_t value_bytes = 0;
+    bool executed_dp = false;
+};
+
+std::mutex& census_mutex() { static std::mutex guard; return guard; }
+std::atomic<bool>& census_active() { static std::atomic<bool> active{false}; return active; }
+std::unordered_map<CensusKey, CensusEntry, CensusKeyHash>& census_map() {
+    static std::unordered_map<CensusKey, CensusEntry, CensusKeyHash> table;
+    return table;
+}
+std::uint64_t& census_key_bytes() { static std::uint64_t total = 0; return total; }
+
+// 128 bits over (read bytes, separator, window bytes). Two independent mixers, so a collision needs
+// both to agree; at ~4e7 keys that probability is negligible, and it would under-count distinctness.
+CensusKey census_key_of(const std::string& read, const char* window, std::size_t window_length) {
+    std::uint64_t a = 1469598103934665603ULL;
+    std::uint64_t b = 0x2545f4914f6cdd1dULL;
+    const auto mix = [&](unsigned char value) {
+        a = (a ^ value) * 1099511628211ULL;
+        b = (b + value) * 0x9e3779b97f4a7c15ULL;
+        b ^= b >> 29;
+    };
+    for (const char c : read) mix(static_cast<unsigned char>(c));
+    mix(0xff);                                    // separator: (read, window) is not (read||window)
+    for (std::size_t i = 0; i < window_length; ++i) mix(static_cast<unsigned char>(window[i]));
+    return CensusKey{a, b};
+}
+
+// ---- exact emission cache (see EmissionCacheCounters in the header) --------------------------
+//
+// Keys hold POINTERS into the caller's form and haplotype buffers rather than copies: storing the
+// ~203 key bytes per entry would cost 1.96GB at 30x, against ~48 by reference. The referenced
+// buffers must outlive the scoring pass, which is why the reversed haplotypes are precomputed once
+// below rather than rebuilt per haplotype iteration.
+struct CacheKey {
+    std::uint64_t h0 = 0;
+    std::uint64_t h1 = 0;
+    const char* read = nullptr;
+    const char* window = nullptr;
+    std::uint32_t read_length = 0;
+    std::uint32_t window_length = 0;
+
+    // Hashes only accelerate the lookup. BYTE EQUALITY decides, so a collision costs a comparison
+    // and never a wrong answer.
+    bool operator==(const CacheKey& other) const noexcept {
+        return h0 == other.h0 && h1 == other.h1 && read_length == other.read_length &&
+               window_length == other.window_length &&
+               std::memcmp(read, other.read, read_length) == 0 &&
+               std::memcmp(window, other.window, window_length) == 0;
+    }
+};
+struct CacheKeyHash {
+    std::size_t operator()(const CacheKey& key) const noexcept {
+        return static_cast<std::size_t>(key.h0 ^ (key.h1 * 0x9e3779b97f4a7c15ULL));
+    }
+};
+// Components live in a per-shard arena, so an entry is a fixed 32 bytes whether it holds a refusal
+// or a seven-component fit. Entries are never removed, so arena offsets stay valid.
+// A cached answer records WHICH logical outcome the uncached run would have recorded, not merely
+// whether it accepted. Refusals arrive from two places -- the prefilter, and a recursion that ran
+// and found nothing -- and the uncached path counts those differently. Collapsing them to one
+// "refused" flag made a later cache hit count a post-recursion refusal as a prefilter rejection,
+// which moved 25 requests between two logical counters on the diagnostic fixture while every
+// placement counter stayed identical. Logical counters have to be invariant, so the distinction is
+// carried in the value.
+enum class CacheOutcome : std::uint8_t { Accepted, RefusedByPrefilter, RefusedAfterRecursion };
+
+struct CacheValue {
+    double log_emission = 0.0;
+    std::uint32_t consumed_bp = 0;
+    std::uint32_t edits = 0;
+    std::uint32_t component_offset = 0;
+    std::uint16_t component_count = 0;
+    CacheOutcome outcome = CacheOutcome::RefusedByPrefilter;
+};
+
+struct CacheShard {
+    std::mutex guard;
+    std::unordered_map<CacheKey, CacheValue, CacheKeyHash> table;
+    std::vector<GappedComponent> arena;
+};
+
+constexpr std::size_t kCacheShards = 64;   // 560M lookups must not serialise on one mutex
+
+struct EmissionCache {
+    std::array<CacheShard, kCacheShards> shards;
+    std::atomic<bool> active{false};
+    std::atomic<std::size_t> refusal_budget_bytes{0};
+    std::atomic<std::size_t> refusal_bytes_used{0};
+    std::atomic<std::uint64_t> requests{0};
+    std::atomic<std::uint64_t> hits{0};
+    std::atomic<std::uint64_t> misses{0};
+    std::atomic<std::uint64_t> executed_prefilters{0};
+    std::atomic<std::uint64_t> executed_dps{0};
+    std::atomic<std::uint64_t> entries{0};
+    std::atomic<std::uint64_t> payload_bytes{0};
+    std::atomic<std::uint64_t> refusals_not_retained{0};
+};
+
+EmissionCache& emission_cache() {
+    static EmissionCache cache;
+    return cache;
+}
+
+std::atomic<bool>& cache_hash_collapse() {
+    static std::atomic<bool> collapse{false};
+    return collapse;
+}
+
+CacheKey cache_key_of(const std::string& read, const char* window, std::size_t window_length) {
+    std::uint64_t a = 1469598103934665603ULL;
+    std::uint64_t b = 0x2545f4914f6cdd1dULL;
+    const auto mix = [&](unsigned char value) {
+        a = (a ^ value) * 1099511628211ULL;
+        b = (b + value) * 0x9e3779b97f4a7c15ULL;
+        b ^= b >> 29;
+    };
+    for (const char c : read) mix(static_cast<unsigned char>(c));
+    mix(0xff);
+    for (std::size_t i = 0; i < window_length; ++i) mix(static_cast<unsigned char>(window[i]));
+    CacheKey key;
+    // Under the test collapse every key hashes alike, so the table degenerates to one bucket in one
+    // shard and every lookup must be decided by memcmp. The answers may not change.
+    const bool collapse = cache_hash_collapse().load(std::memory_order_relaxed);
+    key.h0 = collapse ? 0 : a;
+    key.h1 = collapse ? 0 : b;
+    key.read = read.data();
+    key.read_length = static_cast<std::uint32_t>(read.size());
+    key.window = window;
+    key.window_length = static_cast<std::uint32_t>(window_length);
+    return key;
+}
+
+// Declared per-entry cost: the key, the value, and a conservative allowance for the hash table's
+// own node and bucket overhead. Used to hold the refusal budget to a byte figure a caller declared,
+// not to a guess about container internals.
+constexpr std::size_t kCacheEntryBytes = sizeof(CacheKey) + sizeof(CacheValue) + 48;
+
+enum class CacheProbe { Disabled, Miss, HitAccepted, HitRefusedByPrefilter, HitRefusedAfterRecursion };
+
+CacheProbe cache_lookup(const CacheKey& key, GappedFit* out) {
+    EmissionCache& cache = emission_cache();
+    if (!cache.active.load(std::memory_order_relaxed)) return CacheProbe::Disabled;
+    cache.requests.fetch_add(1, std::memory_order_relaxed);
+    CacheShard& shard = cache.shards[key.h0 % kCacheShards];
+    const std::lock_guard<std::mutex> guard(shard.guard);
+    const auto found = shard.table.find(key);
+    if (found == shard.table.end()) {
+        cache.misses.fetch_add(1, std::memory_order_relaxed);
+        return CacheProbe::Miss;
+    }
+    cache.hits.fetch_add(1, std::memory_order_relaxed);
+    const CacheValue& value = found->second;
+    if (value.outcome == CacheOutcome::RefusedByPrefilter) return CacheProbe::HitRefusedByPrefilter;
+    if (value.outcome == CacheOutcome::RefusedAfterRecursion) {
+        return CacheProbe::HitRefusedAfterRecursion;
+    }
+    // Copied out under the shard lock: a concurrent insert into this shard may reallocate the arena.
+    out->log_emission = value.log_emission;
+    out->consumed_bp = value.consumed_bp;
+    out->edits = value.edits;
+    out->components.assign(shard.arena.begin() + value.component_offset,
+                           shard.arena.begin() + value.component_offset + value.component_count);
+    return CacheProbe::HitAccepted;
+}
+
+void cache_store_refusal(const CacheKey& key, CacheOutcome outcome) {
+    EmissionCache& cache = emission_cache();
+    if (!cache.active.load(std::memory_order_relaxed)) return;
+    // The declared bound applies to refusals only. Crossing it stops RETENTION, never correctness:
+    // the next request for this key recomputes it exactly, which is the same answer more slowly.
+    const std::size_t used =
+        cache.refusal_bytes_used.fetch_add(kCacheEntryBytes, std::memory_order_relaxed) +
+        kCacheEntryBytes;
+    if (used > cache.refusal_budget_bytes.load(std::memory_order_relaxed)) {
+        cache.refusal_bytes_used.fetch_sub(kCacheEntryBytes, std::memory_order_relaxed);
+        cache.refusals_not_retained.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    CacheShard& shard = cache.shards[key.h0 % kCacheShards];
+    const std::lock_guard<std::mutex> guard(shard.guard);
+    CacheValue value;
+    value.outcome = outcome;
+    if (!shard.table.emplace(key, value).second) {
+        cache.refusal_bytes_used.fetch_sub(kCacheEntryBytes, std::memory_order_relaxed);
+        return;   // another worker got there first; the budget is not spent twice
+    }
+    cache.entries.fetch_add(1, std::memory_order_relaxed);
+    cache.payload_bytes.fetch_add(kCacheEntryBytes, std::memory_order_relaxed);
+}
+
+void cache_store_fit(const CacheKey& key, const GappedFit& fit) {
+    EmissionCache& cache = emission_cache();
+    if (!cache.active.load(std::memory_order_relaxed)) return;
+    CacheShard& shard = cache.shards[key.h0 % kCacheShards];
+    const std::lock_guard<std::mutex> guard(shard.guard);
+    if (shard.table.find(key) != shard.table.end()) return;
+    CacheValue value;
+    value.outcome = CacheOutcome::Accepted;
+    value.log_emission = fit.log_emission;
+    value.consumed_bp = static_cast<std::uint32_t>(fit.consumed_bp);
+    value.edits = static_cast<std::uint32_t>(fit.edits);
+    value.component_offset = static_cast<std::uint32_t>(shard.arena.size());
+    value.component_count = static_cast<std::uint16_t>(fit.components.size());
+    shard.arena.insert(shard.arena.end(), fit.components.begin(), fit.components.end());
+    shard.table.emplace(key, value);
+    cache.entries.fetch_add(1, std::memory_order_relaxed);
+    // Accepted fits are retained unconditionally: the census puts them at a fiftieth of the refusal
+    // population and sixteen times the recomputation cost, so they are the cheap half to hold and
+    // the dear half to lose.
+    cache.payload_bytes.fetch_add(
+        kCacheEntryBytes + fit.components.size() * sizeof(GappedComponent),
+        std::memory_order_relaxed);
+}
+
+void census_record(const std::string& read, const char* window, std::size_t window_length,
+                   bool executed_dp, std::size_t value_bytes) {
+    if (!census_active().load(std::memory_order_relaxed)) return;
+    const CensusKey key = census_key_of(read, window, window_length);
+    const std::lock_guard<std::mutex> guard(census_mutex());
+    CensusEntry& entry = census_map()[key];
+    if (entry.requests == 0) {
+        entry.executed_dp = executed_dp;
+        entry.value_bytes = static_cast<std::uint16_t>(value_bytes);
+        census_key_bytes() += read.size() + window_length;
+    }
+    ++entry.requests;
+}
+
 // The contract REFUSES a non-ACGT base rather than scoring it as a mismatch, and the prefilter must
 // not quietly turn that refusal into an absence -- edlib would simply find an N-bearing read
 // infeasible and the placement would vanish instead of throwing. So the window the recursion can
@@ -651,6 +899,99 @@ double gap_recursion_scaled(
 
 } // namespace
 
+void set_emission_cache_hash_collapse(bool collapse) {
+    cache_hash_collapse().store(collapse, std::memory_order_relaxed);
+}
+
+void begin_emission_cache(std::size_t budget_bytes) {
+    EmissionCache& cache = emission_cache();
+    cache.active.store(false, std::memory_order_relaxed);
+    for (CacheShard& shard : cache.shards) {
+        const std::lock_guard<std::mutex> guard(shard.guard);
+        shard.table.clear();
+        shard.arena.clear();
+    }
+    cache.refusal_budget_bytes.store(budget_bytes, std::memory_order_relaxed);
+    cache.refusal_bytes_used.store(0, std::memory_order_relaxed);
+    cache.requests.store(0, std::memory_order_relaxed);
+    cache.hits.store(0, std::memory_order_relaxed);
+    cache.misses.store(0, std::memory_order_relaxed);
+    cache.executed_prefilters.store(0, std::memory_order_relaxed);
+    cache.executed_dps.store(0, std::memory_order_relaxed);
+    cache.entries.store(0, std::memory_order_relaxed);
+    cache.payload_bytes.store(0, std::memory_order_relaxed);
+    cache.refusals_not_retained.store(0, std::memory_order_relaxed);
+    // Zero is off, and off reproduces the uncached path exactly rather than approximately.
+    cache.active.store(budget_bytes > 0, std::memory_order_relaxed);
+}
+
+EmissionCacheCounters read_emission_cache_counters() {
+    EmissionCache& cache = emission_cache();
+    EmissionCacheCounters out;
+    out.requests = cache.requests.load(std::memory_order_relaxed);
+    out.hits = cache.hits.load(std::memory_order_relaxed);
+    out.misses = cache.misses.load(std::memory_order_relaxed);
+    out.executed_prefilters = cache.executed_prefilters.load(std::memory_order_relaxed);
+    out.executed_dps = cache.executed_dps.load(std::memory_order_relaxed);
+    out.payload_bytes = cache.payload_bytes.load(std::memory_order_relaxed);
+    out.entries = cache.entries.load(std::memory_order_relaxed);
+    out.refusals_not_retained = cache.refusals_not_retained.load(std::memory_order_relaxed);
+    return out;
+}
+
+EmissionCacheCounters& last_emission_cache_slot() {
+    static EmissionCacheCounters last;
+    return last;
+}
+
+EmissionCacheCounters last_emission_cache_counters() { return last_emission_cache_slot(); }
+
+EmissionCacheCounters end_emission_cache() {
+    EmissionCache& cache = emission_cache();
+    cache.active.store(false, std::memory_order_relaxed);
+    // One aggregation path, shared with the non-destructive read, so the two cannot drift.
+    const EmissionCacheCounters out = read_emission_cache_counters();
+    // Retained past the teardown so a status writer can report the pass that just finished.
+    last_emission_cache_slot() = out;
+    // Keys point into the caller's buffers, so nothing may survive the pass that owns them.
+    for (CacheShard& shard : cache.shards) {
+        const std::lock_guard<std::mutex> guard(shard.guard);
+        shard.table.clear();
+        shard.arena.clear();
+    }
+    return out;
+}
+
+void begin_emission_census() {
+    const std::lock_guard<std::mutex> guard(census_mutex());
+    census_map().clear();
+    census_key_bytes() = 0;
+    census_active().store(true, std::memory_order_relaxed);
+}
+
+EmissionCensus end_emission_census() {
+    census_active().store(false, std::memory_order_relaxed);
+    const std::lock_guard<std::mutex> guard(census_mutex());
+    EmissionCensus out;
+    out.distinct = census_map().size();
+    out.key_bytes = census_key_bytes();
+    for (const auto& item : census_map()) {
+        const CensusEntry& entry = item.second;
+        out.requests += entry.requests;
+        out.value_bytes += entry.value_bytes;
+        if (entry.executed_dp) {
+            out.dp_requests += entry.requests;
+            ++out.dp_distinct;
+        } else {
+            out.prefilter_refusal_requests += entry.requests;
+            ++out.prefilter_refusal_distinct;
+        }
+    }
+    census_map().clear();
+    census_key_bytes() = 0;
+    return out;
+}
+
 GappedEmissionCounters take_gapped_emission_counters() {
     EmissionWork& work = emission_work();
     GappedEmissionCounters out;
@@ -743,19 +1084,61 @@ std::optional<GappedFit> gapped_emission(
     require_acgt_window(haplotype, start, window, read);
 
     EmissionWork& work = emission_work();
+    EmissionCache& cache = emission_cache();
+    // The key hashes ~203 bytes, so it is formed only when the cache is armed: an uncached run must
+    // not pay for a cache it is not using.
+    const bool caching = cache.active.load(std::memory_order_relaxed);
+    CacheKey key;
+    if (caching) {
+        key = cache_key_of(read, haplotype.data() + start, window);
+        GappedFit cached;
+        switch (cache_lookup(key, &cached)) {
+            case CacheProbe::HitRefusedByPrefilter:
+                // LOGICAL counters, incremented whether or not the work ran, so they stay
+                // comparable with an uncached run of the same input. Which counter a hit replays is
+                // decided by what the ORIGINAL computation did, not by the fact that it refused.
+                ++work.prefilter_rejections;
+                census_record(read, haplotype.data() + start, window, false, sizeof(double));
+                return std::nullopt;
+            case CacheProbe::HitRefusedAfterRecursion:
+                ++work.dp_evaluations;
+                census_record(read, haplotype.data() + start, window, true, sizeof(double));
+                return std::nullopt;
+            case CacheProbe::HitAccepted:
+                ++work.dp_evaluations;
+                census_record(read, haplotype.data() + start, window, true, sizeof(double));
+                return cached;
+            default:
+                break;
+        }
+    }
+
     // Exact, and it decides only impossibility: anything it admits is still scored by the recursion.
+    cache.executed_prefilters.fetch_add(1, std::memory_order_relaxed);
     if (!feasible_within_band(haplotype, start, window, read, mismatch_band)) {
         ++work.prefilter_rejections;
+        if (caching) cache_store_refusal(key, CacheOutcome::RefusedByPrefilter);
+        // A refusal is a cacheable answer too: repeating it costs a prefilter, and the census has to
+        // say whether those repeat often enough to be worth holding.
+        census_record(read, haplotype.data() + start, window, false, sizeof(double));
         return std::nullopt;
     }
     ++work.dp_evaluations;
+    cache.executed_dps.fetch_add(1, std::memory_order_relaxed);
 
     GappedFit fit;
     // Filled in place rather than through a scratch vector, so an accepted placement costs one
     // allocation instead of two.
     const double raw_total = gap_recursion_scaled(&haplotype, &read, start, read.size(), available,
                                                   mismatch_band, library, true, &fit.components);
-    if (raw_total == kNegInf || fit.components.empty()) return std::nullopt;
+    if (raw_total == kNegInf || fit.components.empty()) {
+        // The recursion RAN and found nothing. That is still work a cache would avoid, so it counts
+        // against the DP stream rather than the prefilter's -- and it is retained as a refusal,
+        // because recomputing it costs a whole recursion.
+        if (caching) cache_store_refusal(key, CacheOutcome::RefusedAfterRecursion);
+        census_record(read, haplotype.data() + start, window, true, sizeof(double));
+        return std::nullopt;
+    }
     const double shapes = log_gap_shape_mass(read.size(), available, mismatch_band, library);
 
     // Every component is divided by the SAME normaliser, so their sum is the whole read's emission
@@ -770,6 +1153,12 @@ std::optional<GappedFit> gapped_emission(
             fit.edits = component.edits;
         }
     }
+    // What a cache would hold for an accepted fit: the whole-read emission, the best consumed span
+    // and edit count, and one entry per consumed-span component.
+    census_record(read, haplotype.data() + start, window, true,
+                  3 * sizeof(double) + fit.components.size() * (2 * sizeof(std::size_t) +
+                                                                sizeof(double)));
+    if (caching) cache_store_fit(key, fit);
     return fit;
 }
 
@@ -1627,6 +2016,28 @@ FragmentScoringResult score_diplotypes(
     // and still throws locally, because it tests a per-haplotype vector rather than a running total.
     // One budget for every worker: these two caps bound the work performed, not merely the answer, so
     // they cannot be per worker without letting T workers each consume a full cap.
+    // Reversed haplotypes for the reverse-role scan, built once for the whole pass. They used to be
+    // per-iteration locals inside place_range; the emission cache stores pointers into the window it
+    // is handed, so a local would dangle the moment its haplotype iteration ended. 129 x 226kb is
+    // about 29MB, which is cheap against the alternative of copying key bytes per entry.
+    std::vector<std::string> reversed_sequences;
+    reversed_sequences.reserve(unique);
+    for (const std::string& sequence : haplotypes.sequences) {
+        reversed_sequences.emplace_back(sequence.rbegin(), sequence.rend());
+    }
+
+    // The exact emission cache lives exactly as long as this scoring pass, because its keys point
+    // into `forms` and `reversed_sequences` above. score_diplotypes leaves by eleven paths -- four
+    // returns and seven ResourceExhausted throws -- so disarming is a destructor's job, not a
+    // statement before each exit.
+    struct EmissionCacheScope {
+        explicit EmissionCacheScope(std::size_t bytes) { begin_emission_cache(bytes); }
+        ~EmissionCacheScope() { counters = end_emission_cache(); }
+        EmissionCacheScope(const EmissionCacheScope&) = delete;
+        EmissionCacheScope& operator=(const EmissionCacheScope&) = delete;
+        EmissionCacheCounters counters;
+    } emission_cache_scope(options.emission_cache_bytes);
+
     PlacementBudget budget;
     budget.max_piece_hits = options.max_piece_hits;
     budget.max_physical_origins = options.max_physical_origins;
@@ -1634,6 +2045,13 @@ FragmentScoringResult score_diplotypes(
 
     const auto place_range = [&](std::size_t first_h, std::size_t last_h,
                                  FragmentScoringCounters& counters) {
+    // Discard whatever this thread accumulated before the pass began. The emission's work counters
+    // live in a thread_local that ANY caller dirties -- the exhaustive oracle, the probe's compare
+    // and scan diagnostics, the census -- and collect_form_placements drains that thread_local into
+    // the pass's totals. Without this, a scoring pass silently absorbs the residue of whatever ran
+    // on its thread beforehand: measured at dp=397 pf=1949 against a clean 369/53, with the
+    // verification count unchanged, which is the signature of counting work nobody in this pass did.
+    (void)take_gapped_emission_counters();
     std::map<StateKey, std::uint64_t> states;
     // Right endpoints reachable from one left endpoint, reused across groups to keep the allocation
     // out of the inner loop.
@@ -1651,8 +2069,10 @@ FragmentScoringResult score_diplotypes(
                                 budget, band, library, forward_placements, counters, options);
 
         // The reverse-role scan runs against the reversed haplotype, which anchors those mates at
-        // their right endpoints. One reversal per haplotype, not per verification.
-        const std::string reversed_haplotype(haplotype.rbegin(), haplotype.rend());
+        // their right endpoints. Precomputed once for the whole pass rather than rebuilt here: the
+        // emission cache stores POINTERS into the window it was given, and a per-iteration local
+        // would dangle the instant this haplotype's iteration ended.
+        const std::string& reversed_haplotype = reversed_sequences[h];
         std::vector<std::vector<FormPlacement>> reverse_placements(reverse_forms.size());
         collect_form_placements(reversed_haplotype, reverse_forms, reverse_componentise,
                                 reverse_indexes, budget, band, library, reverse_placements, counters,
@@ -2017,6 +2437,10 @@ FragmentScoringResult score_diplotypes(
         std::chrono::duration<double>(std::chrono::steady_clock::now() - combination_mark).count();
     result.log_mass = std::move(mass);
     result.exposure = std::move(exposure);
+    // Teardown belongs to the scope alone -- it is the only path that covers the seven throws as
+    // well as the returns -- so this reads the live counters and leaves the disarming to it. Calling
+    // end_emission_cache() here as well would disarm early and hand the destructor zeroes.
+    result.emission_cache = read_emission_cache_counters();
     return result;
 }
 

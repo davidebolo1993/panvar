@@ -2794,13 +2794,48 @@ int genotype(const Args& args) {
     // Optional curation manifest. The curated panel is a different model and says so: the status
     // records which templates left, why, and a digest of the decision, and the fingerprint changes.
     options.curation_manifest_path = args.get("panel-curation", "");
+    // Explicit scorer-cap overrides. The defaults are unchanged and stay the defaults; these exist
+    // so a declared performance experiment can raise them without moving them for everyone, and
+    // every value lands in the status so the run signature records what it actually ran under.
+    options.max_state_classes = std::stoull(args.get("max-state-classes", "200000000"));
+    options.max_physical_origins = std::stoull(args.get("max-physical-origins", "500000000"));
+    options.emission_cache_bytes = std::stoull(args.get("emission-cache-bytes", "0"));
     for (const std::size_t k : parse_alleles(args.required("prefixes"))) {
         options.development_candidate_prefixes.push_back(k);
     }
     if (options.development_candidate_prefixes.empty()) throw std::runtime_error("--prefixes is empty");
     options.max_mosaic_candidates = options.development_candidate_prefixes.back();
     options.quiet = true;
+    // Opt-in census of the verification stream. It answers one question -- would exact reuse of
+    // identical emission calculations pay -- and is off unless a destination is named.
+    const std::string census_path = args.get("emission-census", "");
+    if (!census_path.empty()) panvar::begin_emission_census();
     const panvar::GenotypeRunStatus status = panvar::run_genotype(options);
+    if (!census_path.empty()) {
+        const panvar::EmissionCensus census = panvar::end_emission_census();
+        const auto ratio = [](std::uint64_t requests, std::uint64_t distinct) {
+            return distinct == 0 ? 0.0 : static_cast<double>(requests) / static_cast<double>(distinct);
+        };
+        std::ofstream out(census_path);
+        out << std::setprecision(6) << "key\tvalue\n"
+            << "emission_requests\t" << census.requests << '\n'
+            << "distinct_emission_keys\t" << census.distinct << '\n'
+            << "reuse_factor_all\t" << ratio(census.requests, census.distinct) << '\n'
+            << "prefilter_refusal_requests\t" << census.prefilter_refusal_requests << '\n'
+            << "prefilter_refusal_distinct\t" << census.prefilter_refusal_distinct << '\n'
+            << "reuse_factor_prefilter_refusals\t"
+            << ratio(census.prefilter_refusal_requests, census.prefilter_refusal_distinct) << '\n'
+            << "dp_requests\t" << census.dp_requests << '\n'
+            << "dp_distinct\t" << census.dp_distinct << '\n'
+            // The decision number: the factor by which exact reuse would reduce executed DP calls.
+            << "reuse_factor_dp\t" << ratio(census.dp_requests, census.dp_distinct) << '\n'
+            << "predicted_key_bytes\t" << census.key_bytes << '\n'
+            << "predicted_value_bytes\t" << census.value_bytes << '\n'
+            << "predicted_cache_payload_bytes\t" << census.key_bytes + census.value_bytes << '\n';
+        std::cout << "emission census: " << census.requests << " requests, " << census.distinct
+                  << " distinct (reuse " << ratio(census.requests, census.distinct)
+                  << "x; DP reuse " << ratio(census.dp_requests, census.dp_distinct) << "x)\n";
+    }
     std::cout << "genotype " << options.out_prefix << " state limit " << options.proposal_state_limit
               << ": largest prefix " << panvar::genotype_run_status_name(status) << '\n';
     return 0;
